@@ -3,7 +3,7 @@ import type { EffectTranscript } from "../core/effect-transcript";
 import type { SerializedObject } from "../core/repository";
 import type { ShadowStatePage } from "../core/shadow-state-pages";
 import type { ShadowCommitAccepted, ShadowScopeHead } from "../core/shadow-commit-scope";
-import { applyShadowScopeProjectionPatch, shadowStateTransferCacheDigest, type ShadowExecutableStateTransferRequest, type ShadowLiveEvent, type ShadowTurnIntentRequest } from "../core/shadow-browser-node";
+import { applyShadowScopeProjectionPatch, shadowStateTransferCacheDigest, type ShadowExecutableStateTransferRequest, type ShadowLiveEvent, type ShadowTransportHello, type ShadowTurnIntentRequest } from "../core/shadow-browser-node";
 import {
   shadowCellPageTransferAtomTurnKey,
   validateShadowExecutionCapsuleTransfer,
@@ -273,9 +273,13 @@ async function handleCommand(command: V2WorkerCommand): Promise<void> {
 }
 
 async function connectTo(next: { token: string; node: string; scope: string; actor?: string; session?: string }): Promise<void> {
-  const changed = current !== null
-    && (current.token !== next.token || current.node !== next.node || current.scope !== next.scope || current.actor !== next.actor || current.session !== next.session);
+  const previous = current;
+  const changed = previous !== null
+    && (previous.token !== next.token || previous.node !== next.node || previous.scope !== next.scope || previous.actor !== next.actor || previous.session !== next.session);
+  const executionAuthorityChanged = previous !== null
+    && (previous.node !== next.node || previous.actor !== next.actor || (previous.session ?? null) !== (next.session ?? null));
   current = next;
+  if (executionAuthorityChanged) await purgeStaleExecutableStateForCurrentAuthority("connect_authority_changed");
   await postCachedProjection(current.scope);
   await replayOptimisticProposalOverlays(current.scope);
   if (changed) {
@@ -544,6 +548,7 @@ async function receiveFrame(encoded: string): Promise<void> {
     const receivedCompleteCheckpointTail = receivedCheckpointTail && checkpointTailOpenTransferIsComplete(envelope.body);
     const receivedExecutableStateTransfer = receivedStateTransfer && isExecutableStateTransfer(envelope.body);
     const receivedExecutionAd = envelope.type === "woo.exec_capability_ad.shadow.v1";
+    if (envelope.type === "woo.transport.hello.v1") await reconcileTransportHello(envelope.body);
     if (receivedStateTransfer) validateStateTransferEnvelope(envelope as ShadowEnvelope<ShadowStateTransfer>);
     if (envelope.type === "woo.turn.exec.reply.shadow.v1") {
       envelope = await envelopeWithValidatedTurnExecStateTransfer(envelope as ShadowEnvelope<ShadowTurnExecReply>) as ShadowEnvelope;
@@ -643,6 +648,27 @@ function checkpointTailOpenTransferIsComplete(body: unknown): boolean {
   return !("continuation" in transfer);
 }
 
+async function reconcileTransportHello(body: unknown): Promise<void> {
+  if (!current) return;
+  if (!body || typeof body !== "object" || Array.isArray(body) || (body as { kind?: unknown }).kind !== "woo.transport.hello.v1") {
+    throw new Error("invalid TransportHello");
+  }
+  const hello = body as ShadowTransportHello;
+  if (typeof hello.actor !== "string" || typeof hello.session !== "string") {
+    throw new Error("TransportHello missing actor/session");
+  }
+  const helloSession = hello.session || null;
+  const changed = current.actor !== hello.actor || (current.session ?? null) !== helloSession;
+  if (changed) {
+    current = {
+      ...current,
+      actor: hello.actor,
+      session: helloSession ?? undefined
+    };
+  }
+  await purgeStaleExecutableStateForCurrentAuthority(changed ? "transport_hello_authority_changed" : "transport_hello");
+}
+
 async function replayPending(): Promise<void> {
   // Pending turn envelopes are already idempotency-keyed by (from, id), so
   // reconnect replay is a transport retry rather than a second durable action.
@@ -656,11 +682,13 @@ async function replayPending(): Promise<void> {
 
 function pendingMatchesCurrentSession(pending: PendingEnvelope): boolean {
   if (!current) return false;
-  if (pending.auth_token) return pending.auth_token === current.token;
   try {
     const envelope = decodeEnvelope(pending.encoded);
-    if (envelope.auth.mode === "session") return envelope.auth.token === current.token;
-    return envelope.from === current.node;
+    if (pending.auth_token && pending.auth_token !== current.token) return false;
+    if (envelope.auth.mode === "session" && envelope.auth.token !== current.token) return false;
+    if (envelope.from !== current.node) return false;
+    if (envelope.actor !== current.actor) return false;
+    return (envelope.session ?? null) === (current.session ?? null);
   } catch {
     return false;
   }
@@ -2019,6 +2047,47 @@ async function allExecutionTransfers(): Promise<V2ExecutableTransferRecord[]> {
   return await tx<V2ExecutableTransferRecord[]>(EXECUTION_TRANSFER_STORE, "readonly", (store) => store.getAll());
 }
 
+async function purgeStaleExecutableStateForCurrentAuthority(reason: string): Promise<void> {
+  if (!current?.actor) return;
+  const records = await allExecutionTransfers();
+  const stale = records.filter((record) => !executionTransferMatchesCurrentAuthority(record));
+  if (stale.length === 0) return;
+  const staleIds = new Set(stale.map((record) => record.id));
+  const remaining = records.filter((record) => !staleIds.has(record.id));
+  const referencedPageHashes = new Set<string>();
+  for (const record of remaining) {
+    for (const ref of record.transfer.page_refs) referencedPageHashes.add(ref.hash);
+  }
+  const statePageKeys = await cachedStatePageHashes();
+  const staleStatePageKeys = statePageKeys.filter((key) => !referencedPageHashes.has(key));
+  const staleScopes = Array.from(new Set(stale.map((record) => record.scope)));
+  await deleteStoreKeys(EXECUTION_TRANSFER_STORE, Array.from(staleIds));
+  await deleteStoreKeys(STATE_PAGE_STORE, staleStatePageKeys);
+  await deleteStoreKeys(EXECUTION_CHECKPOINT_STORE, staleScopes);
+  promotedAcceptedTranscriptHashes.clear();
+  postBrowserActivity({
+    phase: "execution_cache_purge",
+    path: reason,
+    scope: current.scope,
+    ms: 0,
+    status: "ok",
+    records: stale.length,
+    count: staleStatePageKeys.length
+  });
+}
+
+function executionTransferMatchesCurrentAuthority(record: V2ExecutableTransferRecord): boolean {
+  if (!current?.actor) return false;
+  const capsule = record.transfer.capsule;
+  if (!capsule) return false;
+  if (capsule.recipient !== "*" && capsule.recipient !== current.node) return false;
+  // Accepted write-cell transfers are already sequenced scope state; they may
+  // carry another actor's transcript while remaining valid for this holder.
+  if (record.transfer.purpose === "accepted_write_cells") return true;
+  if (capsule.actor !== current.actor) return false;
+  return (capsule.session ?? null) === (current.session ?? null);
+}
+
 async function transcriptRowsForScope(scope: string): Promise<TranscriptTailRow[]> {
   const rows = await tx<TranscriptTailRow[]>(TRANSCRIPT_STORE, "readonly", (store) => store.getAll());
   return rows
@@ -2108,7 +2177,9 @@ async function executionCacheForScope(
   try {
     const sourceRecords = records ?? await allExecutionTransfers();
     const checkpoint = options.skip_checkpoint_build ? undefined : await getExecutionCheckpoint(scope);
-    const scopedRecords = sourceRecords.filter((record) => record.scope === scope);
+    const scopedRecords = sourceRecords
+      .filter((record) => record.scope === scope)
+      .filter(executionTransferMatchesCurrentAuthority);
     scopedRecordCount = scopedRecords.length;
     const recordsToInstall = checkpoint
       ? scopedRecords.filter((record) => record.received_at > checkpoint.transfer_high_watermark)

@@ -2107,6 +2107,193 @@ describe("v2 browser worker integration", () => {
     });
   });
 
+  it("purges auth-bound executable state when the browser actor/session changes", async () => {
+    const posted: unknown[] = [];
+    const scope = new FakeWorkerScope();
+    vi.stubGlobal("self", scope);
+    vi.stubGlobal("postMessage", (message: unknown) => posted.push(message));
+    vi.stubGlobal("indexedDB", new FakeIndexedDBFactory());
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+
+    await import("../src/client/v2-browser-worker");
+
+    const world = createWorld();
+    const firstSession = browserWorkerSession(world, "guest:v2-browser-worker-auth-cache-a");
+    const secondSession = browserWorkerSession(world, "guest:v2-browser-worker-auth-cache-b");
+    world.setProp("the_dubspace", "operators", [firstSession.actor, secondSession.actor]);
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-auth-cache",
+      scope: "the_dubspace",
+      serialized: world.exportWorld()
+    });
+    const firstBrowser = createShadowBrowserClient({
+      node: "browser:v2-worker-auth-cache",
+      scope: "the_dubspace",
+      actor: firstSession.actor,
+      session: firstSession.id,
+      relay,
+      token: "token:v2-worker-auth-cache-a"
+    });
+    const firstOpened = await openShadowBrowserScope(firstBrowser);
+
+    scope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-auth-cache-a",
+      node: firstBrowser.node,
+      scope: firstBrowser.scope,
+      actor: firstBrowser.actor,
+      session: firstSession.id
+    });
+    const firstSocket = await waitForSocket();
+    firstSocket.open();
+    firstSocket.receive(encodeEnvelope(relayEnvelope(firstBrowser, "hello-auth-cache-a", "woo.transport.hello.v1", shadowBrowserTransportHello(firstBrowser))));
+    firstSocket.receive(encodeEnvelope(relayEnvelope(firstBrowser, "transfer-auth-cache-a", firstOpened.transfer.kind, firstOpened.transfer)));
+    firstSocket.receive(encodeEnvelope(relayEnvelope(firstBrowser, "exec-auth-cache-a", firstOpened.executable_transfer.kind, firstOpened.executable_transfer)));
+    firstSocket.receive(encodeEnvelope(relayEnvelope(firstBrowser, "ad-auth-cache-a", "woo.exec_capability_ad.shadow.v1", firstOpened.ads[0])));
+    await waitForMessage(posted, (message) => isReadyStatus(message));
+    const warmStatusCursor = posted.filter((message) => isKind(message, "status")).length;
+    scope.dispatch({ kind: "cache_status" });
+    expect(await waitFor(() => posted.filter((message) => isKind(message, "status")).slice(warmStatusCursor)[0])).toMatchObject({
+      status: {
+        execution_transfers: 1,
+        local_execution_ready: true
+      }
+    });
+
+    const secondBrowser = createShadowBrowserClient({
+      node: firstBrowser.node,
+      scope: "the_dubspace",
+      actor: secondSession.actor,
+      session: secondSession.id,
+      relay,
+      token: "token:v2-worker-auth-cache-b"
+    });
+    posted.length = 0;
+    scope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-auth-cache-b",
+      node: secondBrowser.node,
+      scope: secondBrowser.scope,
+      actor: secondBrowser.actor,
+      session: secondSession.id
+    });
+    const secondSocket = await waitForSocket(1);
+    expect(secondSocket.url).not.toContain("executable_seed_digest=");
+    secondSocket.open();
+    secondSocket.receive(encodeEnvelope(relayEnvelope(secondBrowser, "hello-auth-cache-b", "woo.transport.hello.v1", shadowBrowserTransportHello(secondBrowser))));
+    expect(await waitForMessage(posted, (message) => browserMetric(message)?.phase === "execution_cache_purge")).toMatchObject({
+      metric: {
+        phase: "execution_cache_purge",
+        path: "connect_authority_changed",
+        records: 1
+      }
+    });
+    const coldStatusCursor = posted.filter((message) => isKind(message, "status")).length;
+    scope.dispatch({ kind: "cache_status" });
+    expect(await waitFor(() => posted.filter((message) => isKind(message, "status")).slice(coldStatusCursor)[0])).toMatchObject({
+      status: {
+        execution_transfers: 0,
+        state_pages: 0,
+        local_execution_ready: false
+      }
+    });
+    const disconnectCursor = posted.length;
+    scope.dispatch({ kind: "disconnect" });
+    await waitForMessageFrom(posted, disconnectCursor, (message) =>
+      browserMetric(message)?.phase === "command" &&
+      browserMetric(message)?.path === "disconnect"
+    );
+  });
+
+  it("replays only pending envelopes for the active token actor session and sender", async () => {
+    const indexedDB = new FakeIndexedDBFactory();
+    const world = createWorld();
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-pending-replay-a");
+    const otherSession = browserWorkerSession(world, "guest:v2-browser-worker-pending-replay-b");
+    world.setProp("the_dubspace", "operators", [session.actor, otherSession.actor]);
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-pending-replay",
+      scope: "the_dubspace",
+      serialized: world.exportWorld()
+    });
+    const browser = createShadowBrowserClient({
+      node: "browser:v2-worker-pending-replay",
+      scope: "the_dubspace",
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: "token:v2-worker-pending-replay"
+    });
+    const opened = await openShadowBrowserScope(browser);
+
+    const journaledPosted: unknown[] = [];
+    const journalScope = new FakeWorkerScope();
+    vi.stubGlobal("self", journalScope);
+    vi.stubGlobal("postMessage", (message: unknown) => journaledPosted.push(message));
+    vi.stubGlobal("indexedDB", indexedDB);
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+    await import("../src/client/v2-browser-worker");
+
+    const pending = [
+      pendingReplayEnvelope(browser, { id: "pending-current" }),
+      pendingReplayEnvelope(browser, { id: "pending-wrong-token", token: "token:wrong" }),
+      pendingReplayEnvelope(browser, { id: "pending-wrong-sender", from: "browser:v2-worker-pending-replay-old" }),
+      pendingReplayEnvelope(browser, { id: "pending-wrong-actor", actor: otherSession.actor, session: otherSession.id }),
+      pendingReplayEnvelope(browser, { id: "pending-wrong-session", session: "session:wrong" })
+    ];
+    for (const envelope of pending) journalScope.dispatch({ kind: "send", envelope });
+    await waitFor(() =>
+      journaledPosted.filter((message) =>
+        browserMetric(message)?.phase === "command" &&
+        browserMetric(message)?.path === "send"
+      ).length === pending.length
+        ? true
+        : undefined
+    );
+
+    vi.resetModules();
+    FakeWebSocket.instances.length = 0;
+    const replayedPosted: unknown[] = [];
+    const replayScope = new FakeWorkerScope();
+    vi.stubGlobal("self", replayScope);
+    vi.stubGlobal("postMessage", (message: unknown) => replayedPosted.push(message));
+    vi.stubGlobal("indexedDB", indexedDB);
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+    await import("../src/client/v2-browser-worker");
+
+    replayScope.dispatch({
+      kind: "connect",
+      token: browser.session_token ?? "",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    const socket = await waitForSocket();
+    socket.open();
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "hello-pending-replay", "woo.transport.hello.v1", shadowBrowserTransportHello(browser))));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "exec-pending-replay", opened.executable_transfer.kind, opened.executable_transfer)));
+    await waitForMessage(replayedPosted, (message) =>
+      browserMetric(message)?.phase === "frame_process" &&
+      browserMetric(message)?.path === "woo.state.transfer.shadow.v1"
+    );
+
+    const sentIds = socket.sent
+      .map((encoded) => decodeEnvelope(encoded))
+      .map((envelope) => envelope.id);
+    expect(sentIds).toEqual(["pending-current"]);
+
+    const disconnectCursor = replayedPosted.length;
+    replayScope.dispatch({ kind: "disconnect" });
+    await waitForMessageFrom(replayedPosted, disconnectCursor, (message) =>
+      browserMetric(message)?.phase === "command" &&
+      browserMetric(message)?.path === "disconnect"
+    );
+  });
+
   it("drains out-of-order accepted transcripts into write-cell transfers before later local compose", async () => {
     const posted: unknown[] = [];
     const scope = new FakeWorkerScope();
@@ -2120,7 +2307,8 @@ describe("v2 browser worker integration", () => {
 
     const world = createWorld();
     const session = browserWorkerSession(world, "guest:v2-browser-worker-checkpoint");
-    world.setProp("the_dubspace", "operators", [session.actor]);
+    const remoteSession = browserWorkerSession(world, "guest:v2-browser-worker-checkpoint-remote");
+    world.setProp("the_dubspace", "operators", [session.actor, remoteSession.actor]);
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-checkpoint",
       scope: "the_dubspace",
@@ -2154,7 +2342,7 @@ describe("v2 browser worker integration", () => {
 
     for (const seq of [1, 3]) {
       const accepted = syntheticAccepted("the_dubspace", seq);
-      const transcript = syntheticCheckpointTranscript("the_dubspace", session.actor, session.id, seq);
+      const transcript = syntheticCheckpointTranscript("the_dubspace", remoteSession.actor, remoteSession.id, seq);
       socket.receive(encodeEnvelope(relayEnvelope(browser, `accepted-checkpoint-${seq}`, "woo.turn.exec.reply.shadow.v1", {
         kind: "woo.turn.exec.reply.shadow.v1",
         ok: true,
@@ -2176,7 +2364,7 @@ describe("v2 browser worker integration", () => {
     });
 
     const accepted2 = syntheticAccepted("the_dubspace", 2);
-    const transcript2 = syntheticCheckpointTranscript("the_dubspace", session.actor, session.id, 2);
+    const transcript2 = syntheticCheckpointTranscript("the_dubspace", remoteSession.actor, remoteSession.id, 2);
     socket.receive(encodeEnvelope(relayEnvelope(browser, "accepted-checkpoint-2", "woo.turn.exec.reply.shadow.v1", {
       kind: "woo.turn.exec.reply.shadow.v1",
       ok: true,
@@ -2371,6 +2559,23 @@ function relayEnvelope<T>(
     auth: { mode: "session", token: browser.session_token ?? "" },
     body
   } as ShadowEnvelope<T>;
+}
+
+function pendingReplayEnvelope(
+  browser: ReturnType<typeof createShadowBrowserClient>,
+  overrides: { id: string; token?: string; from?: string; actor?: string; session?: string }
+): ShadowEnvelope<Record<string, unknown>> {
+  return {
+    v: 2,
+    type: "woo.turn.exec.request.shadow.v1",
+    id: overrides.id,
+    from: overrides.from ?? browser.node,
+    to: browser.relay.node,
+    actor: overrides.actor ?? browser.actor,
+    ...(overrides.session !== undefined ? { session: overrides.session } : browser.session ? { session: browser.session } : {}),
+    auth: { mode: "session", token: overrides.token ?? browser.session_token ?? "" },
+    body: { kind: "woo.turn.exec.request.shadow.v1" }
+  };
 }
 
 function syntheticAccepted(scope: string, seq: number): ShadowCommitAccepted {

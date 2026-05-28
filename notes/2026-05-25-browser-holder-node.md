@@ -86,6 +86,12 @@ Implementation checklist, current as of 2026-05-27:
    signed `accepted_write_cells` execution transfer instead of entering the
    replay tail. When an out-of-order gap closes, the worker drains any now-
    contiguous transcript-tail rows into store 2 before later local composition.
+7. Done: reconnect/cold-open authority reconciliation validates the
+   `TransportHello` actor/session, treats that actor/session as authoritative
+   for the worker, filters executable transfers by capsule recipient and active
+   actor/session before VM composition, purges stale executable transfers/pages
+   when authority changes, and replays pending envelopes only when token,
+   actor, session, and sender still match.
 
 ### One receiver profile, applied across the whole transfer family
 

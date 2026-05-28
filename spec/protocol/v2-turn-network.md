@@ -1756,10 +1756,13 @@ cached display state, then opens the v2 transport and waits for
 `TransportHello` plus projection/delta catch-up before replaying pending
 authority-bearing envelopes. It then:
 
-1. validates that `TransportHello.actor` matches the cached actor;
-2. discards executable pages bound to stale actor/session/epoch authority;
+1. treats `TransportHello.actor` and `TransportHello.session` as the
+   authoritative browser identity for the opened transport;
+2. discards auth-bound executable transfers, pages, and checkpoints whose
+   capsule recipient/actor/session no longer match that identity;
 3. installs the initial projection/delta transfer for the opened scope;
-4. replays pending envelopes whose auth token and actor/session still match;
+4. replays pending envelopes only when auth token, sender node, actor, and
+   session still match the opened transport;
 5. rebuilds execution nodes lazily for the next local turn.
 
 If a pending optimistic turn predates a projection fallback, the worker MUST
@@ -1806,8 +1809,11 @@ state transfers into projection, applied-frame, and transcript-tail stores, can
 apply a browser-profiled `woo.open.checkpoint_tail.v1` into projection-row and
 projection stores once that receiver profile is enabled,
 persists executable state pages from verified `cell_pages` execution capsule
-transfers, replays pending envelopes after reconnect, and marks
-reset/catch-up-needed state when the relay reports reset. The browser worker
+transfers, reconciles `TransportHello` actor/session authority before local
+execution, purges stale auth-bound executable cache records when that authority
+changes, replays only pending envelopes whose token/actor/session/sender still
+match after reconnect, and marks reset/catch-up-needed state when the relay
+reports reset. The browser worker
 bundles into the SPA on every deployment and the UI consumes applied frames that
 arrive from the v2 worker. Catalogs can move their own controls to v2 by
 submitting `woo.turn.intent.request.v1` through the shared browser helper. The
