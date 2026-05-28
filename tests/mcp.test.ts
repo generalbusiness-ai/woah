@@ -302,6 +302,76 @@ describe("McpHost", () => {
     expect(Object.keys(teachProperties)).toEqual(["phrase"]);
   });
 
+  // Regression for the tool-surface verb cache (notes/2026-05-28-...): a $space
+  // full of same-class items (an outline whose nodes live in its contents) must
+  // not recompute the verb surface once per item. Before the cache,
+  // enumerateLocalToolDescriptors over the_outline ran obviousCommandVerbs per
+  // node, was O(items x ancestry x verbs), and blew the 5s host read budget —
+  // the scope then contributed zero tools and `enter` resolved as E_VERBNF.
+  it("collapses the obvious verb surface across same-class space contents and invalidates on edit", async () => {
+    const world = bootstrapWorld();
+    const session = world.auth("guest:tool-surface-cache");
+    const host = new McpHost(world);
+    host.bindSession(session.id, session.actor);
+
+    // A space whose children are all instances of one item class, mirroring an
+    // outline whose nodes moveto into the outliner's contents.
+    world.createObject({ id: "cache_space", name: "Cache Space", parent: "$space", owner: "$wiz" });
+    world.createObject({ id: "cache_item", name: "Cache Item Class", parent: "$thing", owner: "$wiz" });
+    expect(installVerb(world, "cache_item", "poke", `verb :poke() rxd {
+  return "poked";
+}`, null).ok).toBe(true);
+    const pokeVerb = world.ownVerb("cache_item", "poke");
+    expect(pokeVerb).toBeDefined();
+    if (pokeVerb) pokeVerb.arg_spec = { ...pokeVerb.arg_spec, command: { dobj: "this", prep: "none", iobj: "none", args_from: [] } };
+
+    const itemCount = 60;
+    for (let i = 0; i < itemCount; i++) {
+      world.createObject({ id: `cache_item_${i}`, name: `Item ${i}`, parent: "cache_item", owner: "$wiz", location: "cache_space" });
+    }
+
+    const request: RemoteToolRequest = { id: "cache_space", projection: "tools", expandContents: true, contentsProjection: "obvious" };
+    const surfaceSpy = vi.spyOn(world, "obviousCommandVerbs");
+
+    const first = host.enumerateLocalToolDescriptors(session.actor, [request]);
+
+    // Correctness: every item advertises poke, and each descriptor carries its
+    // OWN object id and source-row authority scope — not the first item's, which
+    // would happen if the per-object owner default were baked into the cache.
+    for (let i = 0; i < itemCount; i++) {
+      const descriptor = first.find((d) => d.object === `cache_item_${i}` && d.verb === "poke");
+      expect(descriptor).toBeDefined();
+      expect(descriptor!.source_rows?.every((row) => row.authority_scope === `cache_item_${i}`)).toBe(true);
+    }
+
+    // Collapse: 60 same-class items share one obvious-verb walk. (The space id
+    // itself uses the tools projection, which does not call obviousCommandVerbs.)
+    expect(surfaceSpy.mock.calls.length).toBe(1);
+
+    // Cross-call hold: a second identical enumeration with no intervening world
+    // mutation reuses the cache and does not recompute.
+    surfaceSpy.mockClear();
+    const second = host.enumerateLocalToolDescriptors(session.actor, [request]);
+    expect(second.filter((d) => d.verb === "poke").length).toBe(itemCount);
+    expect(surfaceSpy.mock.calls.length).toBe(0);
+
+    // Invalidation: editing a verb on the item class bumps the world mutation
+    // version, which drops the cache, so the next enumeration both recomputes
+    // and reflects the new verb on every item.
+    surfaceSpy.mockClear();
+    expect(installVerb(world, "cache_item", "prod", `verb :prod() rxd {
+  return "prodded";
+}`, null).ok).toBe(true);
+    const prodVerb = world.ownVerb("cache_item", "prod");
+    if (prodVerb) prodVerb.arg_spec = { ...prodVerb.arg_spec, command: { dobj: "this", prep: "none", iobj: "none", args_from: [] } };
+
+    const third = host.enumerateLocalToolDescriptors(session.actor, [request]);
+    expect(surfaceSpy.mock.calls.length).toBe(1);
+    expect(third.filter((d) => d.verb === "prod").length).toBe(itemCount);
+    expect(third.filter((d) => d.verb === "poke").length).toBe(itemCount);
+    surfaceSpy.mockRestore();
+  });
+
   it("exposes verb editor tools after the programmer enters the editor room", async () => {
     const world = bootstrapWorld();
     // The verb editor exit-to-$nowhere assertion below assumes the actor had
