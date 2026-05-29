@@ -7032,6 +7032,22 @@ export class WooWorld {
     if (propName === "subscribers" || propName === "session_subscribers") this.invalidatePresenceIndex();
   }
 
+  // Clone a verb's mutable wrapper fields (aliases, arg_spec, source, line_map,
+  // calls, …) while sharing its bytecode by reference. Bytecode is immutable
+  // after compilation, so deep-cloning ops+literals on every serialize/snapshot
+  // is pure waste — it was the single largest chunk of cold-boot clone cost.
+  // freeze-once + share is the dual of importBytecode: export, the boot-snapshot
+  // cache, and import all reuse one frozen bytecode object per verb. Native verbs
+  // carry no bytecode and clone normally.
+  private cloneVerbSharingBytecode(verb: VerbDef): VerbDef {
+    if (verb.kind !== "bytecode") return cloneValue(verb as unknown as WooValue) as unknown as VerbDef;
+    const { bytecode, ...rest } = verb;
+    return {
+      ...(cloneValue(rest as unknown as WooValue) as unknown as Record<string, unknown>),
+      bytecode: freezeTinyBytecode(bytecode)
+    } as unknown as VerbDef;
+  }
+
   private serializeObject(obj: WooObject): SerializedObject {
     return {
       id: obj.id,
@@ -7046,7 +7062,7 @@ export class WooWorld {
       propertyDefs: Array.from(obj.propertyDefs.values()).map((def) => ({ ...def, defaultValue: cloneValue(def.defaultValue) })),
       properties: Array.from(obj.properties.entries()).map(([name, value]) => [name, cloneValue(value)]),
       propertyVersions: Array.from(obj.propertyVersions.entries()),
-      verbs: obj.verbs.map((verb) => cloneValue(verb as unknown as WooValue) as unknown as VerbDef),
+      verbs: obj.verbs.map((verb) => this.cloneVerbSharingBytecode(verb)),
       children: Array.from(obj.children),
       contents: Array.from(obj.contents),
       eventSchemas: Array.from(obj.eventSchemas.entries()).map(([type, schema]) => [type, cloneValue(schema as WooValue) as Record<string, WooValue>])
@@ -8955,7 +8971,7 @@ export class WooWorld {
       propertyDefs: new Map(Array.from(obj.propertyDefs.entries()).map(([name, def]) => [name, { ...def, defaultValue: cloneValue(def.defaultValue) }])),
       properties: new Map(Array.from(obj.properties.entries()).map(([name, value]) => [name, cloneValue(value)])),
       propertyVersions: new Map(obj.propertyVersions),
-      verbs: obj.verbs.map((verb) => cloneValue(verb as unknown as WooValue) as unknown as VerbDef),
+      verbs: obj.verbs.map((verb) => this.cloneVerbSharingBytecode(verb)),
       children: new Set(obj.children),
       contents: new Set(obj.contents),
       eventSchemas: new Map(Array.from(obj.eventSchemas.entries()).map(([type, schema]) => [type, cloneValue(schema as unknown as WooValue) as Record<string, WooValue>]))

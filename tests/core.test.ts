@@ -1716,11 +1716,15 @@ describe("woo core", () => {
     expect(probeVerb?.kind).toBe("bytecode");
     if (probeVerb?.kind !== "bytecode") return;
 
-    // Shallow freeze: top frozen, ops/literals still mutable — and NOT branded
-    // by our deepFreezePlainValue.
-    Object.freeze(probeVerb.bytecode);
+    // exportWorld now returns deep-frozen (branded) bytecode, which is safe to
+    // share. To exercise the "merely shallow-frozen, NOT branded" path, swap in a
+    // fresh plain copy whose top object is Object.frozen but whose ops/literals
+    // stay mutable — exactly the shape importBytecode must clone rather than share.
+    const shallowFrozen = JSON.parse(JSON.stringify(probeVerb.bytecode));
+    Object.freeze(shallowFrozen);
+    (probeVerb as { bytecode: unknown }).bytecode = shallowFrozen;
     expect(Object.isFrozen(probeVerb.bytecode)).toBe(true);
-    expect(Object.isFrozen(probeVerb.bytecode.ops)).toBe(false);
+    expect(Object.isFrozen((probeVerb.bytecode as { ops: unknown }).ops)).toBe(false);
 
     const worldA = createWorldFromSerialized(serialized, { persist: false });
     const worldB = createWorldFromSerialized(serialized, { persist: false });
@@ -1742,6 +1746,40 @@ describe("woo core", () => {
     const opCountBefore = b.bytecode.ops.length;
     expect(() => { (a.bytecode.ops as unknown[]).push(["NOOP"]); }).toThrow();
     expect(pingOf(worldB)!.bytecode.ops.length).toBe(opCountBefore);
+  });
+
+  it("exportWorld shares immutable bytecode by reference but still clones mutable verb fields", () => {
+    const world = createWorld({ catalogs: false });
+    world.createObject({ id: "export_probe", name: "Probe", parent: "$thing", owner: "$wiz" });
+    expect(installVerb(world, "export_probe", "ping", `verb :ping(arg) rxd {
+  return arg;
+}`, null).ok).toBe(true);
+    const liveVerb = world.object("export_probe").verbs.find((verb) => verb.name === "ping");
+    expect(liveVerb?.kind).toBe("bytecode");
+    if (liveVerb?.kind !== "bytecode") return;
+
+    const exported = world.exportWorld();
+    const exportedVerb = exported.objects.find((obj) => obj.id === "export_probe")?.verbs.find((verb) => verb.name === "ping");
+    expect(exportedVerb?.kind).toBe("bytecode");
+    if (exportedVerb?.kind !== "bytecode") return;
+
+    // Bytecode is immutable: shared by reference (no deep clone) and frozen.
+    expect(exportedVerb.bytecode).toBe(liveVerb.bytecode);
+    expect(Object.isFrozen(exportedVerb.bytecode)).toBe(true);
+    // A second export reuses the same frozen object — no re-clone, no re-freeze churn.
+    const exported2 = world.exportWorld();
+    const exportedVerb2 = exported2.objects.find((obj) => obj.id === "export_probe")?.verbs.find((verb) => verb.name === "ping");
+    expect(exportedVerb2?.kind === "bytecode" && exportedVerb2.bytecode).toBe(liveVerb.bytecode);
+
+    // Mutable wrapper fields are still cloned (export must be safe to mutate).
+    expect(exportedVerb.arg_spec).not.toBe(liveVerb.arg_spec);
+    expect(exportedVerb.aliases).not.toBe(liveVerb.aliases);
+    expect(exportedVerb).toEqual(expect.objectContaining({ name: "ping", source: liveVerb.source }));
+
+    // The exported world still imports and executes correctly.
+    const reloaded = createWorldFromSerialized(exported, { persist: false });
+    const reVerb = reloaded.object("export_probe").verbs.find((verb) => verb.name === "ping");
+    expect(reVerb?.kind).toBe("bytecode");
   });
 
   it("does not share cached boot snapshot cells across createWorld calls", () => {

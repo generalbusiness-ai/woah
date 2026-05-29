@@ -480,8 +480,63 @@ export function wooError(code: string, message?: string, value?: WooValue): Erro
   return { code, message, value };
 }
 
+// Guarded recursive clone for plain JSON-shaped data. This is the hot clone
+// path: `cloneValue` runs on every property write, verb install, VM literal
+// push, and frame snapshot, and bootstrap/import fan out through it. It replaces
+// `structuredClone`, whose worker-transfer serializer dominated localdev cost —
+// ~2.6s of a ~3s cold `createWorld` was inside structuredClone (see
+// notes/2026-05-29-clone-plain-data.md).
+//
+// The data woo clones is plain: WooValue, plus structurally-plain runtime records
+// cast through `cloneValue` (VerbDef, TinyBytecode, Message, observations, VM
+// handlers, ParkedTaskRecord, SpaceLogEntry). For that, a direct recursive copy
+// is ~50x cheaper than structuredClone. Unlike structuredClone it deliberately
+// does NOT support Date, Map, Set, RegExp, class instances, functions, or cyclic
+// references — none are valid woo data, so we THROW rather than silently emit a
+// `{}` or loop forever, surfacing a bad caller immediately. Primitives (including
+// `undefined`) pass through unchanged, and the result is always freshly mutable —
+// callers like the VM's literal push rely on a mutable copy even of frozen
+// bytecode literals.
+export function clonePlainData<T>(value: T): T {
+  return clonePlainDataRecursive(value, undefined);
+}
+
+function clonePlainDataRecursive<T>(value: T, path: Set<object> | undefined): T {
+  if (value === null) return value;
+  const type = typeof value;
+  if (type !== "object") {
+    if (type === "function" || type === "symbol") {
+      throw new TypeError(`clonePlainData: cannot clone a ${type}`);
+    }
+    return value;
+  }
+  const node = value as unknown as object;
+  if (path?.has(node)) throw new TypeError("clonePlainData: cannot clone a cyclic structure");
+  // Lazily allocate the DFS path set so cloning scalars/shallow data stays
+  // allocation-free; deleting on unwind makes this detect true cycles without
+  // rejecting a shared (non-cyclic) sub-object reached by two paths.
+  const ancestors = path ?? new Set<object>();
+  ancestors.add(node);
+  let out: unknown;
+  if (Array.isArray(value)) {
+    out = value.map((item) => clonePlainDataRecursive(item, ancestors));
+  } else {
+    const proto = Object.getPrototypeOf(node);
+    if (proto !== Object.prototype && proto !== null) {
+      throw new TypeError(`clonePlainData: cannot clone non-plain object (${node.constructor?.name ?? "unknown prototype"})`);
+    }
+    const copy: Record<string, unknown> = {};
+    for (const key of Object.keys(node as Record<string, unknown>)) {
+      copy[key] = clonePlainDataRecursive((node as Record<string, unknown>)[key], ancestors);
+    }
+    out = copy;
+  }
+  ancestors.delete(node);
+  return out as T;
+}
+
 export function cloneValue<T extends WooValue>(value: T): T {
-  return structuredClone(value);
+  return clonePlainData(value);
 }
 
 // Brand of values this module deep-froze. `Object.isFrozen` is NOT a safe
