@@ -128,7 +128,10 @@ export class DirectoryDO {
           wrote = this.registerSession({
             session_id: String(body.session_id ?? ""),
             actor: String(body.actor ?? "") as ObjRef,
-            started: finitePositiveNumber(body.started) ?? Date.now(),
+            // Zero means "caller did not provide started"; registerSession
+            // preserves the existing row's started time so legacy callers do
+            // not turn every location refresh into a write.
+            started: finitePositiveNumber(body.started) ?? 0,
             display_name: stringOrNull(body.display_name),
             expires_at: Number(body.expires_at ?? 0),
             token_class: body.token_class === "guest" || body.token_class === "apikey" ? body.token_class : "bearer",
@@ -357,10 +360,13 @@ export class DirectoryDO {
       "SELECT actor, started, display_name, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list FROM session_route WHERE session_id = ?",
       session.session_id
     ));
+    const started = session.started > 0
+      ? session.started
+      : finitePositiveNumber(existing?.started) ?? Date.now();
     const encodedFocusList = JSON.stringify(session.focus_list);
     if (existing
       && String(existing.actor) === session.actor
-      && Number(existing.started ?? 0) === session.started
+      && Number(existing.started ?? 0) === started
       && (existing.display_name === null ? null : String(existing.display_name)) === session.display_name
       && Number(existing.expires_at) === session.expires_at
       && String(existing.token_class) === session.token_class
@@ -374,7 +380,7 @@ export class DirectoryDO {
       "INSERT OR REPLACE INTO session_route(session_id, actor, started, display_name, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       session.session_id,
       session.actor,
-      session.started,
+      started,
       session.display_name,
       session.expires_at,
       session.token_class,

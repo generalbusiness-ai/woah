@@ -4796,6 +4796,7 @@ function testStableHash(input: string): number {
 describe("PersistentObjectDO Directory presence lookups", () => {
   type PresenceHelper = {
     loadDirectorySessionsForScopes(scopes: readonly ObjRef[]): Promise<Array<{ id: string; actor: ObjRef; focusList?: ObjRef[] }>>;
+    directoryScopeSessionsCache: Map<string, { expiresAt: number }>;
   };
 
   function jsonResponse(body: unknown): Response {
@@ -4850,6 +4851,9 @@ describe("PersistentObjectDO Directory presence lookups", () => {
     try {
       const first = helper.loadDirectorySessionsForScopes(["the_deck", "the_chatroom", "the_deck"] as ObjRef[]);
       await firstFetchStarted;
+      const inFlightEntry = helper.directoryScopeSessionsCache.get("the_chatroom\nthe_deck");
+      expect(inFlightEntry).toBeTruthy();
+      if (inFlightEntry) inFlightEntry.expiresAt = Date.now() - 1;
       const second = helper.loadDirectorySessionsForScopes(["the_chatroom", "the_deck"] as ObjRef[]);
       expect(fetches).toBe(1);
       release();

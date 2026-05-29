@@ -83,11 +83,74 @@ function makeDirectory(): { directory: DirectoryDO; cleanup: () => void } {
   return { directory, cleanup: () => state.close() };
 }
 
+function sessionRouteColumns(state: FakeDirectoryState): string[] {
+  return state.storage.sql.exec("PRAGMA table_info(session_route)")
+    .toArray()
+    .map((row) => String(row.name ?? ""))
+    .filter(Boolean)
+    .sort();
+}
+
 const T0 = 1_700_000_000_000;
 const FAR_FUTURE = T0 + 60 * 60 * 1000;
 
 describe("DirectoryDO register-session dedup", () => {
   afterEach(() => { vi.useRealTimers(); });
+
+  it("migrates legacy session_route columns idempotently", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const state = new FakeDirectoryState();
+    state.storage.sql.exec(`CREATE TABLE session_route (
+      session_id TEXT PRIMARY KEY,
+      actor TEXT NOT NULL,
+      expires_at INTEGER NOT NULL,
+      token_class TEXT NOT NULL,
+      current_location TEXT,
+      apikey_id TEXT,
+      mcp_shard TEXT,
+      updated_at INTEGER NOT NULL
+    )`);
+    try {
+      expect(sessionRouteColumns(state)).not.toContain("started");
+      expect(sessionRouteColumns(state)).not.toContain("display_name");
+      expect(sessionRouteColumns(state)).not.toContain("focus_list");
+
+      const directory = new DirectoryDO(state as unknown as DurableObjectState, env);
+      const payload = {
+        session_id: "legacy_sess",
+        actor: "$legacy_actor",
+        started: T0 - 10_000,
+        display_name: "Legacy Actor",
+        expires_at: FAR_FUTURE,
+        token_class: "guest",
+        active_scope: "$lobby",
+        mcp_shard: "mcp-gateway-7",
+        focus_list: ["$pinboard"]
+      };
+      expect(await postRegister(directory, payload)).toEqual({ ok: true, wrote: true });
+
+      const migratedColumns = sessionRouteColumns(state);
+      expect(migratedColumns).toEqual(expect.arrayContaining(["started", "display_name", "focus_list"]));
+      const resolved = await resolve(directory, "legacy_sess");
+      expect(resolved).toMatchObject({
+        session_id: "legacy_sess",
+        actor: "$legacy_actor",
+        started: T0 - 10_000,
+        display_name: "Legacy Actor",
+        active_scope: "$lobby",
+        current_location: "$lobby",
+        mcp_shard: "mcp-gateway-7",
+        focus_list: ["$pinboard"]
+      });
+
+      const directoryAfterEviction = new DirectoryDO(state as unknown as DurableObjectState, env);
+      expect(await postRegister(directoryAfterEviction, payload)).toEqual({ ok: true, wrote: false });
+      expect(sessionRouteColumns(state)).toEqual(migratedColumns);
+    } finally {
+      state.close();
+    }
+  });
 
   it("skips the row write when every persisted column matches", async () => {
     vi.useFakeTimers();

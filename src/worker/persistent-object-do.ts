@@ -1732,10 +1732,8 @@ export class PersistentObjectDO {
     const cacheKey = requested.join("\n");
     const now = Date.now();
     const cached = this.directoryScopeSessionsCache.get(cacheKey);
-    if (cached && cached.expiresAt > now) {
-      if (cached.value) return cloneDirectorySerializedSessions(cached.value);
-      if (cached.promise) return cloneDirectorySerializedSessions(await cached.promise);
-    }
+    if (cached?.promise) return cloneDirectorySerializedSessions(await cached.promise);
+    if (cached?.value && cached.expiresAt > now) return cloneDirectorySerializedSessions(cached.value);
 
     const startedAt = Date.now();
     let failed = false;
