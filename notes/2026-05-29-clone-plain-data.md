@@ -40,15 +40,33 @@ Verified the one risky caller, `tiny-vm.ts:252 cloneValue(error as WooValue)`:
 are converted via `wooError()` before reaching it, so no native `Error` is ever
 cloned here.
 
+## Second change: share immutable bytecode on serialize (the A2 dual)
+
+Re-profiling after the `cloneValue` swap showed `clonePlainData` was still the
+cold-boot tentpole (982ms), because `serializeObject` (`world.ts`) and the
+`cloneObject` savepoint path deep-cloned every verb's *bytecode* (ops+literals)
+for ~900 verbs — yet bytecode is immutable (A2). Added `cloneVerbSharingBytecode`:
+clone the mutable verb wrapper fields (aliases, arg_spec, source, line_map,
+calls) but share `freezeTinyBytecode(verb.bytecode)` by reference. This is the
+dual of A2's `importBytecode`: export, the boot-snapshot cache, and import now
+reuse one frozen bytecode object per verb. (`addVerb` only shallow-spreads, so
+install never deep-cloned bytecode — these two serializers were the only ones.)
+
+Behavior note: `exportWorld` now deep-freezes (brands) the live world's bytecode
+as a benign side effect — bytecode is immutable, nothing mutates it in place
+(A2), and after the first export both re-export and import share with no clone.
+The A2 "merely shallow-frozen" guard test was updated to build its shallow-frozen
+input explicitly, since exportWorld no longer yields non-deep-frozen bytecode.
+
 ## Result (measured, in-memory)
 
-| path | before (structuredClone) | after (clonePlainData) |
-|---|---:|---:|
-| cold `createWorld()` | 2801 ms | **1341 ms** (−52%) |
-| `exportWorld()` | 15.3 ms | **5.8 ms** (−62%) |
-| warm `createWorld()` | 10.7 ms | 10.1 ms (unchanged — snapshot-clone path) |
+| path | original (structuredClone) | + cloneValue swap | + share bytecode on serialize |
+|---|---:|---:|---:|
+| cold `createWorld()` | 2801 ms | 1341 ms (−52%) | **~1000 ms** (−64% total) |
+| `exportWorld()` | 15.3 ms | 5.8 ms | **3.6 ms** (−76% total) |
+| warm `createWorld()` | 10.7 ms | 10.1 ms | 10.1 ms (snapshot-clone path) |
 
-The exportWorld win also lands on the prod cold-load (`init/world` /
+The `exportWorld` win also lands on the prod cold-load (`init/world` /
 host-seed / snapshot paths all serialize through it).
 
 ## Tests
@@ -59,8 +77,13 @@ bigint passthrough, null-proto allowed, cycle rejection, shared-non-cyclic
 sub-object allowed, rejection of Date/Map/Set/RegExp/class/function/symbol
 (incl. nested), and the freeze→fresh-mutable contract the VM relies on.
 
-Validated with the full `test:full` sweep because `cloneValue`'s blast radius is
-the whole engine.
+`tests/core.test.ts` gains "exportWorld shares immutable bytecode by reference
+but still clones mutable verb fields" (shared frozen bytecode by identity, second
+export reuses it, wrapper fields still cloned, reload still executes); the A2
+shallow-frozen guard test was updated for the new exportWorld behavior.
+
+Validated with the full `test:full` sweep because `cloneValue` + the serialize
+path's blast radius is the whole engine (export, host-seed, snapshot, persist).
 
 ## Follow-up (not done here)
 
