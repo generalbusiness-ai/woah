@@ -50,8 +50,11 @@
 //     garden hop.
 
 import { randomUUID } from "node:crypto";
+import { pathToFileURL } from "node:url";
 
 type StepResult = { name: string; ok: boolean; ms: number; detail?: string };
+type StepContext = { signal: AbortSignal };
+type SessionPair = { alice: McpSession; bob: McpSession; generation: number };
 
 const args = parseArgs(process.argv.slice(2));
 const baseUrl = args.base.replace(/\/+$/, "");
@@ -70,14 +73,12 @@ async function main(): Promise<void> {
   // Open sessions inside try/finally so a partial open still runs cleanup on
   // whatever did succeed. Without this, a failing bob.open() leaks alice's
   // session for the remainder of the MCP idle timeout.
-  let alice: McpSession | null = null;
-  let bob: McpSession | null = null;
+  let sessions: SessionPair | null = null;
   try {
-    alice = await McpSession.open(`guest:walkthrough-alice-${runId}`, "alice");
-    bob = await McpSession.open(`guest:walkthrough-bob-${runId}`, "bob");
-    await runWalkthrough(alice, bob);
+    sessions = await openSessionPair(0);
+    await runWalkthrough(sessions);
   } finally {
-    await Promise.allSettled([alice?.close(), bob?.close()]);
+    await closeSessionPair(sessions);
   }
 
   const passed = results.filter((r) => r.ok).length;
@@ -90,26 +91,41 @@ async function main(): Promise<void> {
   }
 }
 
-async function runWalkthrough(alice: McpSession, bob: McpSession): Promise<void> {
+async function runWalkthrough(sessions: SessionPair): Promise<void> {
+  const smokeStep = async (
+    name: string,
+    body: (ctx: StepContext, pair: SessionPair) => Promise<void>
+  ): Promise<boolean> => {
+    const ok = await step(name, (ctx) => body(ctx, sessions));
+    if (!ok) {
+      try {
+        await resetSessionPair(sessions, name);
+      } catch (err) {
+        console.error(`  WARN  session reset after "${name}" failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    return ok;
+  };
+
   // Both guests start in the_chatroom on the deployed demo world. Calling
   // :enter is defensively idempotent; an actor already there receives no
   // observation, an actor elsewhere is moved in.
-  await step("enter:chatroom (alice)", async () => {
-    await alice.call("the_chatroom", "enter", []);
+  await smokeStep("enter:chatroom (alice)", async (ctx, { alice }) => {
+    await alice.call("the_chatroom", "enter", [], ctx.signal);
   });
-  await step("enter:chatroom (bob)", async () => {
-    await bob.call("the_chatroom", "enter", []);
+  await smokeStep("enter:chatroom (bob)", async (ctx, { bob }) => {
+    await bob.call("the_chatroom", "enter", [], ctx.signal);
   });
-  await drain(alice);
-  await drain(bob);
+  await drain(sessions.alice);
+  await drain(sessions.bob);
 
   // Same-scope durable verb. Pre-presence-work this was the only thing
   // smoke:mcp asserted; we keep it as a baseline because a regression here
   // means the whole cross-actor path is broken.
-  await step("chat:say reaches peer", async () => {
+  await smokeStep("chat:say reaches peer", async (ctx, { alice, bob }) => {
     const text = `walkthrough-say-${runId}`;
-    await alice.call("the_chatroom", "say", [text]);
-    await waitFor(bob, (obs) => obs.type === "said" && typeof obs.text === "string" && obs.text.includes(text));
+    await alice.call("the_chatroom", "say", [text], ctx.signal);
+    await waitFor(bob, (obs) => obs.type === "said" && typeof obs.text === "string" && obs.text.includes(text), 5000, ctx.signal);
   });
 
   // Cross-scope move out. Alice leaves the_chatroom for the_deck; Bob (still
@@ -118,8 +134,8 @@ async function runWalkthrough(alice: McpSession, bob: McpSession): Promise<void>
   // `:move` reached via the catalog's obvious-verb wiring; MCP dispatches it
   // when the actor is in the source room. Latency in prod can run several
   // seconds for the durable round-trip, so we widen the wait.
-  await step("move:southeast emits `left` to bob (origin room)", async () => {
-    await alice.call("the_chatroom", "southeast", []);
+  await smokeStep("move:southeast emits `left` to bob (origin room)", async (ctx, { alice, bob }) => {
+    await alice.call("the_chatroom", "southeast", [], ctx.signal);
     // Tighter predicate: only the `left` that actually came from this move.
     // A loose `type === "left"` would also satisfy itself with a stale
     // departure event from earlier navigation or a peer in this scope.
@@ -129,7 +145,7 @@ async function runWalkthrough(alice: McpSession, bob: McpSession): Promise<void>
       obs.source === "the_chatroom" &&
       obs.destination === "the_deck" &&
       obs.exit === "southeast",
-    10_000);
+    10_000, ctx.signal);
   });
 
   // The other side of the move: alice is now in the_deck (her commit scope).
@@ -137,15 +153,15 @@ async function runWalkthrough(alice: McpSession, bob: McpSession): Promise<void>
   // session is still in the_chatroom. Before Bug A / Bug C this delivery
   // path returned nothing — the gateway-owned commit fan-out across affected
   // scopes is what makes it work.
-  await step("move:west emits `entered` to bob (destination room)", async () => {
-    await alice.call("the_deck", "west", []);
+  await smokeStep("move:west emits `entered` to bob (destination room)", async (ctx, { alice, bob }) => {
+    await alice.call("the_deck", "west", [], ctx.signal);
     await waitFor(bob, (obs) =>
       obs.type === "entered" &&
       obs.actor === alice.actor &&
       obs.source === "the_chatroom" &&
       obs.origin === "the_deck" &&
       obs.exit === "west",
-    10_000);
+    10_000, ctx.signal);
   });
 
   // Tool-space tests: each tool space (pinboard, outliner, taskboard) is
@@ -157,33 +173,34 @@ async function runWalkthrough(alice: McpSession, bob: McpSession): Promise<void>
   // Pinboard is mounted in the_deck. Bring bob alongside alice (alice came
   // back to the_chatroom after the `entered` step) and walk both into the
   // pinboard.
-  await step("pinboard:add_note reaches peer", async () => {
-    await alice.call("the_chatroom", "southeast", []);
-    await bob.call("the_chatroom", "southeast", []);
-    await drain(alice);
-    await drain(bob);
+  await smokeStep("pinboard:add_note reaches peer", async (ctx, { alice, bob }) => {
+    await alice.call("the_chatroom", "southeast", [], ctx.signal);
+    await bob.call("the_chatroom", "southeast", [], ctx.signal);
+    await drain(alice, ctx.signal);
+    await drain(bob, ctx.signal);
     // `the_deck:enter the_pinboard` is the cross-room-enter form; it can
     // fail with scope_mismatch if the actor's session isn't routed for the
     // sequenced enter (see memory: cross_scope_enter_route_sequenced).
     // The `pinboard:enter` below is the canonical entry, so we tolerate
     // this opportunistic warm-up failing but log it instead of swallowing.
     try {
-      await alice.call("the_deck", "enter", ["the_pinboard"]);
+      await alice.call("the_deck", "enter", ["the_pinboard"], ctx.signal);
     } catch (err) {
       console.warn(`alice deck:enter the_pinboard warm-up failed: ${(err as Error).message}`);
     }
-    await alice.call("the_pinboard", "enter", []);
-    await bob.call("the_pinboard", "enter", []);
-    await drain(alice);
-    await drain(bob);
+    await alice.call("the_pinboard", "enter", [], ctx.signal);
+    await bob.call("the_pinboard", "enter", [], ctx.signal);
+    await drain(alice, ctx.signal);
+    await drain(bob, ctx.signal);
     const text = `pinboard-${runId}`;
-    await alice.call("the_pinboard", "add_note", [text, "yellow", 32, 32, 200, 120]);
+    await alice.call("the_pinboard", "add_note", [text, "yellow", 32, 32, 200, 120], ctx.signal);
     await waitFor(bob, (obs) =>
       obs.type === "note_added" &&
       isRecord(obs.note) &&
       typeof obs.note.text === "string" &&
       obs.note.text.includes(text),
-      10_000
+      10_000,
+      ctx.signal
     );
   });
 
@@ -191,21 +208,21 @@ async function runWalkthrough(alice: McpSession, bob: McpSession): Promise<void>
   // (deck → chatroom). The `:enter` reply returns the roster directly, so
   // we assert the row shape on its result rather than calling :room_roster
   // (which is direct_callable but intentionally not tool_exposed).
-  await step("outliner:enter result includes a roster row for alice", async () => {
+  await smokeStep("outliner:enter result includes a roster row for alice", async (ctx, { alice, bob }) => {
     // Only call leave if the actor is actually in the pinboard right now —
     // see McpSession.leaveIfIn. If the upstream `pinboard:enter` failed,
     // they're not in the pinboard, and calling leave from the wrong room
     // (silently swallowed by the old .catch) masked a real E_VERBNF.
-    await alice.leaveIfIn("the_pinboard");
-    await bob.leaveIfIn("the_pinboard");
+    await alice.leaveIfIn("the_pinboard", ctx.signal);
+    await bob.leaveIfIn("the_pinboard", ctx.signal);
     // Similarly: only walk west if we're actually on the deck. If we never
     // made it onto the deck, we're (probably) still in the chatroom — skip
     // the move so the smoke doesn't generate a stale E_VERBNF here.
-    if (alice.currentRoom === "the_deck") await alice.call("the_deck", "west", []);
-    if (bob.currentRoom === "the_deck") await bob.call("the_deck", "west", []);
-    await drain(alice);
-    await drain(bob);
-    const aliceEnter = await alice.call("the_outline", "enter", []);
+    if (alice.currentRoom === "the_deck") await alice.call("the_deck", "west", [], ctx.signal);
+    if (bob.currentRoom === "the_deck") await bob.call("the_deck", "west", [], ctx.signal);
+    await drain(alice, ctx.signal);
+    await drain(bob, ctx.signal);
+    const aliceEnter = await alice.call("the_outline", "enter", [], ctx.signal);
     if (!isRecord(aliceEnter) || !Array.isArray(aliceEnter.roster)) {
       throw new Error(`expected roster array on the_outline:enter result; got ${JSON.stringify(aliceEnter).slice(0, 200)}`);
     }
@@ -221,13 +238,13 @@ async function runWalkthrough(alice: McpSession, bob: McpSession): Promise<void>
     }
   });
 
-  await step("outliner:add_item reaches peer", async () => {
-    await bob.call("the_outline", "enter", []);
-    await drain(alice);
-    await drain(bob);
+  await smokeStep("outliner:add_item reaches peer", async (ctx, { alice, bob }) => {
+    await bob.call("the_outline", "enter", [], ctx.signal);
+    await drain(alice, ctx.signal);
+    await drain(bob, ctx.signal);
     const text = `outline-${runId}`;
-    await alice.call("the_outline", "add_item", [text]);
-    await waitFor(bob, (obs) => obs.type === "outline_item_added" && obs.text === text, 10_000);
+    await alice.call("the_outline", "add_item", [text], ctx.signal);
+    await waitFor(bob, (obs) => obs.type === "outline_item_added" && obs.text === text, 10_000, ctx.signal);
   });
 
   // Taskboard navigation: chatroom -> southeast -> the_deck -> south toward
@@ -235,37 +252,77 @@ async function runWalkthrough(alice: McpSession, bob: McpSession): Promise<void>
   // the_garden, while production may route directly to the workshop registry.
   // The helper follows the extra garden hop only when the first move lands
   // there, then asserts the actor reached the taskboard.
-  await step("tasks: cross-room `entered` reaches peer", async () => {
+  await smokeStep("tasks: cross-room `entered` reaches peer", async (ctx, { alice, bob }) => {
     // Same guard pattern as outliner:enter — only leave if we're in the
     // outline; only southeast if we're in the chatroom. Without these
     // guards a transient failure in the previous step cascades into
     // E_VERBNF on the wrong-room verb here, which masks the real cause.
-    await alice.leaveIfIn("the_outline");
-    await bob.leaveIfIn("the_outline");
-    if (alice.currentRoom === "the_chatroom") await alice.call("the_chatroom", "southeast", []);
-    if (bob.currentRoom === "the_chatroom") await bob.call("the_chatroom", "southeast", []);
-    await walkSouthToTaskboard(alice);
-    await drain(alice);
-    await drain(bob);
-    await walkSouthToTaskboard(bob);
+    await alice.leaveIfIn("the_outline", ctx.signal);
+    await bob.leaveIfIn("the_outline", ctx.signal);
+    if (alice.currentRoom === "the_chatroom") await alice.call("the_chatroom", "southeast", [], ctx.signal);
+    if (bob.currentRoom === "the_chatroom") await bob.call("the_chatroom", "southeast", [], ctx.signal);
+    await walkSouthToTaskboard(alice, ctx.signal);
+    await drain(alice, ctx.signal);
+    await drain(bob, ctx.signal);
+    await walkSouthToTaskboard(bob, ctx.signal);
     await waitFor(alice, (obs) =>
       obs.type === "entered" &&
       obs.actor === bob.actor &&
       obs.source === "the_taskboard",
-    10_000);
+    10_000, ctx.signal);
   });
 }
 
-async function walkSouthToTaskboard(session: McpSession): Promise<void> {
+async function walkSouthToTaskboard(session: McpSession, signal?: AbortSignal): Promise<void> {
   if (session.currentRoom !== "the_deck") {
     throw new Error(`${session.label} expected on the_deck before south; at=${session.currentRoom}`);
   }
-  await session.call("the_deck", "south", []);
-  if (session.currentRoom === "the_garden") {
-    await session.call("the_garden", "south", []);
+  await session.call("the_deck", "south", [], signal);
+  const roomAfterSouth: string | null = session.currentRoom;
+  if (roomAfterSouth === "the_garden") {
+    await session.call("the_garden", "south", [], signal);
   }
-  if (session.currentRoom !== "the_taskboard") {
+  const finalRoom: string | null = session.currentRoom;
+  if (finalRoom !== "the_taskboard") {
     throw new Error(`${session.label} expected on the_taskboard after south path; at=${session.currentRoom}`);
+  }
+}
+
+async function openSessionPair(generation: number): Promise<SessionPair> {
+  const suffix = generation === 0 ? "" : `-recovery-${generation}`;
+  let alice: McpSession | null = null;
+  let bob: McpSession | null = null;
+  try {
+    alice = await McpSession.open(`guest:walkthrough-alice-${runId}${suffix}`, `alice${suffix}`);
+    bob = await McpSession.open(`guest:walkthrough-bob-${runId}${suffix}`, `bob${suffix}`);
+    return { alice, bob, generation };
+  } catch (err) {
+    await Promise.allSettled([alice?.close(), bob?.close()]);
+    throw err;
+  }
+}
+
+async function closeSessionPair(pair: SessionPair | null): Promise<void> {
+  if (!pair) return;
+  await Promise.allSettled([pair.alice.close(), pair.bob.close()]);
+}
+
+async function resetSessionPair(pair: SessionPair, failedStep: string): Promise<void> {
+  const nextGeneration = pair.generation + 1;
+  console.warn(`  WARN  resetting MCP sessions after failed step "${failedStep}"`);
+  await closeSessionPair(pair);
+  const next = await openSessionPair(nextGeneration);
+  pair.alice = next.alice;
+  pair.bob = next.bob;
+  pair.generation = nextGeneration;
+  try {
+    await pair.alice.call("the_chatroom", "enter", []);
+    await pair.bob.call("the_chatroom", "enter", []);
+    await drain(pair.alice);
+    await drain(pair.bob);
+  } catch (err) {
+    await closeSessionPair(pair);
+    throw err;
   }
 }
 
@@ -273,31 +330,44 @@ async function walkSouthToTaskboard(session: McpSession): Promise<void> {
 // that loops over many short calls could still drift long. The watchdog is
 // the hard upper bound and aborts the body if the step itself is stuck.
 const STEP_TIMEOUT_MS = 60_000;
-async function step(name: string, body: () => Promise<void>): Promise<void> {
+async function step(name: string, body: (ctx: StepContext) => Promise<void>): Promise<boolean> {
   const startedAt = Date.now();
   try {
-    await raceWithTimeout(
-      body(),
+    await raceWithAbort(
+      (signal) => body({ signal }),
       STEP_TIMEOUT_MS,
       `step "${name}" exceeded ${STEP_TIMEOUT_MS}ms watchdog`
     );
     const ms = Date.now() - startedAt;
     results.push({ name, ok: true, ms });
     console.log(`  ok    ${name} (${ms}ms)`);
+    return true;
   } catch (err) {
     const ms = Date.now() - startedAt;
     const detail = err instanceof Error ? err.message : String(err);
     results.push({ name, ok: false, ms, detail });
     console.error(`  FAIL  ${name} (${ms}ms): ${detail}`);
+    return false;
   }
 }
 
-function raceWithTimeout<T>(work: Promise<T>, ms: number, message: string): Promise<T> {
+export async function raceWithAbort<T>(
+  work: (signal: AbortSignal) => Promise<T>,
+  ms: number,
+  message: string
+): Promise<T> {
   let handle: ReturnType<typeof setTimeout> | undefined;
+  const controller = new AbortController();
+  const workPromise = work(controller.signal);
+  workPromise.catch(() => undefined);
   const timeout = new Promise<never>((_, reject) => {
-    handle = setTimeout(() => reject(new Error(message)), ms);
+    handle = setTimeout(() => {
+      const err = new Error(message);
+      controller.abort(err);
+      reject(err);
+    }, ms);
   });
-  return Promise.race([work, timeout]).finally(() => {
+  return await Promise.race([workPromise, timeout]).finally(() => {
     if (handle) clearTimeout(handle);
   });
 }
@@ -310,15 +380,17 @@ function raceWithTimeout<T>(work: Promise<T>, ms: number, message: string): Prom
 // best-effort cleanup and must not fail a step.
 const DRAIN_TOTAL_BUDGET_MS = 3000;
 const DRAIN_POLL_MS = 500;
-async function drain(session: McpSession): Promise<void> {
+async function drain(session: McpSession, signal?: AbortSignal): Promise<void> {
   const started = Date.now();
   while (Date.now() - started < DRAIN_TOTAL_BUDGET_MS) {
     try {
-      const result = await session.callTool("woo_wait", { timeout_ms: DRAIN_POLL_MS, limit: 100 });
+      throwIfAborted(signal);
+      const result = await session.callTool("woo_wait", { timeout_ms: DRAIN_POLL_MS, limit: 100 }, { signal });
       const obs = waitObservationsOf(result);
       if (obs.length === 0) return;
       if (verbose) console.log(`    [${session.label}] drained ${obs.length} stale obs: ${obs.map((o: any) => o.type).join(",")}`);
     } catch {
+      throwIfAborted(signal);
       return;
     }
   }
@@ -331,12 +403,14 @@ async function drain(session: McpSession): Promise<void> {
 async function waitFor(
   session: McpSession,
   match: (obs: Record<string, any>) => boolean,
-  totalTimeoutMs = 5000
+  totalTimeoutMs = 5000,
+  signal?: AbortSignal
 ): Promise<Record<string, any>> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < totalTimeoutMs) {
+    throwIfAborted(signal);
     const remaining = totalTimeoutMs - (Date.now() - startedAt);
-    const result = await session.callTool("woo_wait", { timeout_ms: Math.min(remaining, 1000), limit: 100 });
+    const result = await session.callTool("woo_wait", { timeout_ms: Math.min(remaining, 1000), limit: 100 }, { signal });
     const observations = waitObservationsOf(result);
     if (verbose && observations.length) {
       console.log(`    [${session.label}] received ${observations.length} obs: ${observations.map((o: any) => o.type).join(",")}`);
@@ -407,8 +481,8 @@ class McpSession {
     return session;
   }
 
-  async call(object: string, verb: string, verbArgs: unknown[]): Promise<unknown> {
-    const result = unwrap(await this.callRaw(object, verb, verbArgs));
+  async call(object: string, verb: string, verbArgs: unknown[], signal?: AbortSignal): Promise<unknown> {
+    const result = unwrap(await this.callRaw(object, verb, verbArgs, signal));
     // Move/enter/leave responses carry `room` in structuredContent.result.
     // Update tracked room from every successful call so guarded helpers
     // below can avoid calling leave/direction verbs from the wrong room.
@@ -421,10 +495,10 @@ class McpSession {
   // an earlier `enter` may have failed; calling the leave verb from a room
   // we never reached generates a confusing E_VERBNF that masks the real
   // upstream failure. Returns true if the leave actually fired.
-  async leaveIfIn(space: string): Promise<boolean> {
+  async leaveIfIn(space: string, signal?: AbortSignal): Promise<boolean> {
     if (this.currentRoom !== space) return false;
     try {
-      await this.call(space, "leave", []);
+      await this.call(space, "leave", [], signal);
       return true;
     } catch (err) {
       // Surface (don't swallow) — a leave that fails despite our location
@@ -434,15 +508,21 @@ class McpSession {
     }
   }
 
-  async callRaw(object: string, verb: string, verbArgs: unknown[]): Promise<any> {
-    return await this.callTool("woo_call", { object, verb, args: verbArgs });
+  async callRaw(object: string, verb: string, verbArgs: unknown[], signal?: AbortSignal): Promise<any> {
+    return await this.callTool("woo_call", { object, verb, args: verbArgs }, { signal });
   }
 
-  async callTool(name: string, params: Record<string, unknown>): Promise<any> {
+  async callTool(
+    name: string,
+    params: Record<string, unknown>,
+    options: { signal?: AbortSignal; timeoutMs?: number } = {}
+  ): Promise<any> {
     const response = await mcpFetch({
       method: "POST",
       headers: { "mcp-session-id": this.sessionId },
-      body: rpc(this.nextId++, "tools/call", { name, arguments: params })
+      body: rpc(this.nextId++, "tools/call", { name, arguments: params }),
+      signal: options.signal,
+      timeoutMs: options.timeoutMs
     });
     if (!response.ok) throw new Error(`tools/call ${name} ${response.status}: ${await response.text().catch(() => "")}`);
     const body = await parseMcpResponse(response);
@@ -460,7 +540,8 @@ class McpSession {
   async close(): Promise<void> {
     await mcpFetch({
       method: "DELETE",
-      headers: { "mcp-session-id": this.sessionId }
+      headers: { "mcp-session-id": this.sessionId },
+      timeoutMs: 3000
     }).catch(() => undefined);
   }
 }
@@ -541,6 +622,12 @@ function mergeSignals(a: AbortSignal | undefined, b: AbortSignal): AbortSignal {
   return merged.signal;
 }
 
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (!signal?.aborted) return;
+  const reason = signal.reason;
+  throw reason instanceof Error ? reason : new Error("operation aborted");
+}
+
 async function parseMcpResponse(response: Response): Promise<any> {
   if (response.status === 202 || response.status === 204) return null;
   const contentType = response.headers.get("content-type") ?? "";
@@ -598,7 +685,14 @@ function parseArgs(argv: string[]): { base: string; runId: string; verbose: bool
   return { base, runId, verbose };
 }
 
-main().catch((err) => {
-  console.error("walkthrough crashed:", err instanceof Error ? err.stack ?? err.message : err);
-  process.exit(2);
-});
+if (isMainModule()) {
+  main().catch((err) => {
+    console.error("walkthrough crashed:", err instanceof Error ? err.stack ?? err.message : err);
+    process.exit(2);
+  });
+}
+
+function isMainModule(): boolean {
+  const entry = process.argv[1];
+  return Boolean(entry && import.meta.url === pathToFileURL(entry).href);
+}
