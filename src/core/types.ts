@@ -484,6 +484,36 @@ export function cloneValue<T extends WooValue>(value: T): T {
   return structuredClone(value);
 }
 
+// Recursively freeze a JSON-shaped value in place. `Object.isFrozen` is the
+// stop signal: by contract anything frozen by this helper is frozen all the way
+// down, so a frozen subtree is never re-walked. Used to make compiled bytecode
+// immutable so worlds can share one object by reference instead of deep-cloning
+// it on every import (see freezeTinyBytecode).
+export function deepFreezePlainValue<T>(value: T): T {
+  if (value === null || typeof value !== "object") return value;
+  if (Object.isFrozen(value)) return value;
+  Object.freeze(value);
+  if (Array.isArray(value)) {
+    for (const item of value) deepFreezePlainValue(item);
+  } else {
+    for (const key of Object.keys(value as Record<string, unknown>)) {
+      deepFreezePlainValue((value as Record<string, unknown>)[key]);
+    }
+  }
+  return value;
+}
+
+// Compiled bytecode is immutable after compilation: a verb edit builds a fresh
+// bytecode object, the VM reads ops/literals read-only, and PUSH_LIT clones
+// literals via cloneValue before they reach the stack. Deep-freezing it once
+// (at reservoir build / install / import) lets every world share the same
+// object by reference with no defensive per-import clone, and turns any
+// accidental future in-place mutation into a thrown error rather than silent
+// cross-world corruption.
+export function freezeTinyBytecode(bytecode: TinyBytecode): TinyBytecode {
+  return deepFreezePlainValue(bytecode);
+}
+
 export function valuesEqual(left: WooValue, right: WooValue): boolean {
   if (left === right) return true;
   if (typeof left !== typeof right) return false;

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { createWorld } from "../src/core/bootstrap";
 import { createSerializedTinyVmTask, runSerializedTinyVmTask, type SerializedVmTask } from "../src/core/tiny-vm";
-import type { Message, TinyBytecode, VerbDef } from "../src/core/types";
+import { freezeTinyBytecode, type Message, type TinyBytecode, type VerbDef } from "../src/core/types";
 
 function message(actor: string, target: string, verb: string, args: unknown[] = []): Message {
   return { actor, target, verb, args: args as any[] };
@@ -117,6 +117,43 @@ describe("v0.5 in-memory VM", () => {
       "sum_to",
       [5]
     )).toBe(15);
+  });
+
+  it("executes on frozen (shared) bytecode without mutating its literal source", async () => {
+    // Bytecode is shared by reference across worlds and deep-frozen. The VM's
+    // safety depends on PUSH_LIT cloning each literal (via cloneValue) before it
+    // reaches the stack, so a verb that mutates a list built from a literal must
+    // (a) not throw against the frozen literal and (b) leave the frozen source
+    // untouched. If PUSH_LIT ever stopped cloning, LIST_APPEND would try to
+    // mutate the frozen literal in place and throw — this test pins that.
+    const { world, actor } = authedWorld();
+    const bytecode = freezeTinyBytecode({
+      literals: [["seed"], "added"],
+      num_locals: 0,
+      max_stack: 4,
+      version: 1,
+      ops: [
+        ["PUSH_LIT", 0],
+        ["PUSH_LIT", 1],
+        ["LIST_APPEND"],
+        ["RETURN"]
+      ]
+    });
+    expect(Object.isFrozen(bytecode)).toBe(true);
+    world.addVerb("delay_1", addBytecodeVerb("append_to_literal", bytecode));
+
+    const result = await world.dispatch(
+      vmCtx(world, actor, "delay_1", "append_to_literal"),
+      "delay_1",
+      "append_to_literal",
+      []
+    );
+
+    expect(result).toEqual(["seed", "added"]);
+    // The frozen literal source is intact: the VM mutated a per-run clone, not
+    // the shared bytecode.
+    expect(bytecode.literals[0]).toEqual(["seed"]);
+    expect(Object.isFrozen(bytecode.literals[0])).toBe(true);
   });
 
   it("runs nested CALL_VERB and inherited PASS", async () => {
