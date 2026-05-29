@@ -31,7 +31,12 @@ const CLASSIFICATION = {
   authority_slice_omitted: {
     bucket: "network_policy",
     signal: "host and object_count",
-    endState: "Tail/checkpoint transfer should make omission policy explicit and rare."
+    endState: "Legacy omission event; current policy should prefer authority_slice_stale_fallback."
+  },
+  authority_slice_stale_fallback: {
+    bucket: "network_policy",
+    signal: "host, object_count, and reason",
+    endState: "Owner read was skipped/timed out; local last-known rows kept so commit validation arbitrates freshness."
   },
   authority_tail: {
     bucket: "authority_append",

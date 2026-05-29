@@ -13,7 +13,7 @@
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import type { EffectTranscript } from "../core/effect-transcript";
-import { serializedWorldFromAuthoritySlice } from "../core/authority-slice";
+import { buildSerializedAuthorityCellSlice, combineSerializedAuthoritySlices, serializedWorldFromAuthoritySlice } from "../core/authority-slice";
 import { wooError, type AppliedFrame, type DirectResultFrame, type ErrorFrame, type ErrorValue, type Message, type ObjRef, type Session, type WooValue } from "../core/types";
 import type { WooWorld } from "../core/world";
 import type { SerializedAuthoritySlice } from "../core/repository";
@@ -606,8 +606,11 @@ export class McpGateway {
           directorySessionScopes: options.directorySessionScopes ?? []
         });
         const client = this.v2Scopes.get(scope);
-        if (client) this.mergeV2AuthorityIntoScopeClient(client, payload.authority);
-        return payload;
+        const authorityPayload = client && (payload.staleFallbackCount ?? 0) > 0
+          ? this.withRelaySnapshotAuthorityFallback(client, payload)
+          : payload;
+        if (client) this.mergeV2AuthorityIntoScopeClient(client, authorityPayload.authority);
+        return authorityPayload;
       },
       submitEnvelope: async (submitScope, body) => {
         const envelopeBody = this.withExecutionCapsule(
@@ -792,6 +795,33 @@ export class McpGateway {
     // against pre-refresh pages.
     mergeExecutorAuthority(serializedFor(client.relay.commit_scope, { reason: "mcp_authority_merge" }), authority);
     markShadowBrowserRelaySerializedChanged(client.relay);
+  }
+
+  private withRelaySnapshotAuthorityFallback(
+    client: V2ScopeClient,
+    payload: ReturnType<typeof executorAuthorityPayload>
+  ): ReturnType<typeof executorAuthorityPayload> {
+    if ((payload.staleFallbackCount ?? 0) <= 0) return payload;
+    // The PersistentObjectDO authority hook marks actual cold-owner degrade
+    // paths with staleFallbackCount. Only then do we pay to include this MCP
+    // shard's last successfully seeded view for the scope; fresh owner rows
+    // still override stale values because the payload is combined last.
+    const serialized = serializedFor(client.relay.commit_scope, { reason: "mcp_authority_stale_fallback" });
+    if (serialized.objects.length === 0) return payload;
+    const relayAuthority = buildSerializedAuthorityCellSlice({
+      sessions: [],
+      objects: serialized.objects,
+      counters: {
+        objectCounter: serialized.objectCounter,
+        parkedTaskCounter: serialized.parkedTaskCounter,
+        sessionCounter: serialized.sessionCounter
+      },
+      tombstones: serialized.tombstones
+    });
+    return {
+      ...payload,
+      authority: combineSerializedAuthoritySlices(payload.sessions, [relayAuthority, payload.authority])
+    };
   }
 
   private acceptV2Commit(

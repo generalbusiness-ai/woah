@@ -2340,6 +2340,12 @@ export class PersistentObjectDO {
       return cached;
     }
     if (localRoute) return await this.adoptLocalObjectRoute(localRoute);
+    const host = await this.fetchDirectoryObjectHost(id, fallbackHost);
+    if (host) this.routeCache.set(id, host);
+    return host;
+  }
+
+  private async fetchDirectoryObjectHost(id: ObjRef, fallbackHost: string): Promise<string> {
     try {
       const directoryId = this.env.DIRECTORY.idFromName(DIRECTORY_HOST);
       const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/resolve-object`, {
@@ -2350,7 +2356,6 @@ export class PersistentObjectDO {
       const response = await this.env.DIRECTORY.get(directoryId).fetch(request);
       const body = await response.json() as Record<string, unknown>;
       const host = typeof body.host === "string" ? body.host : fallbackHost;
-      this.routeCache.set(id, host);
       return host;
     } catch {
       return fallbackHost;
@@ -4316,6 +4321,7 @@ export class PersistentObjectDO {
       : [];
     const local = executorAuthorityPayload(world, ids);
     const localObjectIds = authoritySliceObjectIds(local.authority);
+    const mcpGatewayShard = isMcpGatewayShardHost(localHost);
     const routesById = isMcpGatewayShardHost(localHost)
       ? new Map<ObjRef, { id: ObjRef; host: string; anchor: ObjRef | null }>()
       : new Map(world.objectRoutes().map((route) => [route.id, route] as const));
@@ -4331,69 +4337,55 @@ export class PersistentObjectDO {
         return localRoute.host;
       }
       const cached = this.routeCache.get(id);
-      if (cached) return cached;
+      if (cached && (!mcpGatewayShard || cached !== WORLD_HOST)) return cached;
+      if (mcpGatewayShard) {
+        // Sparse MCP shards can carry a stale `id -> world` cache entry from an
+        // earlier fallback route. For authority refresh, Directory is the
+        // routing authority: an unresolved non-$ id should use the local
+        // last-known row, not wake the world singleton as a guessed owner.
+        const directoryHost = await this.fetchDirectoryObjectHost(id, "");
+        if (directoryHost) {
+          this.routeCache.set(id, directoryHost);
+          return directoryHost;
+        }
+        return "";
+      }
       return await this.resolveObjectHostForWorld(null, id, fallbackHost);
     };
 
     const resolvedIds = await Promise.all(ids.map(async (id) => [id, await resolveHost(id, WORLD_HOST)] as const));
+    const localActorAuthorityRoots = localActorAuthorityRootIds(world, ids);
     const byHost = new Map<string, Set<ObjRef>>();
     for (const [id, host] of resolvedIds) {
+      if (localActorAuthorityRoots.has(id)) continue;
       if (!host || host === localHost) continue;
       const list = byHost.get(host) ?? new Set<ObjRef>();
       list.add(id);
       byHost.set(host, list);
     }
-    // To make an omitted remote slice genuinely fall back to the CommitScopeDO's
-    // durable snapshot (rather than leaking stale gateway-local copies of that
-    // host's cells), we need to know which cells in `local.authority` belong to
-    // a host whose remote fetch we attempted-and-omitted. exportAuthoritySlice
-    // expands the request through parent chain, contents, value-refs, and verb
-    // bytecode literals, so `local.authority` carries far more than the
-    // explicit `ids`: requesting a room also pulls in its exit objects,
-    // destination rooms surfaced through exit.dest, etc.
-    // We classify every object in `local.authority` by host, then drop only
-    // those whose host appears in `omittedHosts` (populated below from
-    // tolerated remote-fetch timeouts or commit-scope snapshot fallback).
-    // Transitively-reachable cells for hosts we never asked stay in the slice,
-    // preserving the existing
-    // behavior of using the gateway's local view for second-degree cells.
-    const localAuthorityObjectIds = Array.from(authoritySliceObjectIds(local.authority));
-    const localAuthorityHosts = await Promise.all(localAuthorityObjectIds.map(
-      async (id) => [id, await resolveHost(id, WORLD_HOST)] as const
-    ));
-    const localObjectHostMap = new Map<ObjRef, string>();
-    for (const [id, host] of localAuthorityHosts) {
-      if (host) localObjectHostMap.set(id, host);
-    }
-
-    // Remote authority-slice fetches can time out on cold satellites. When
-    // that happens we deliberately OMIT that host's fresh slice from the
-    // combined authority rather than substituting the gateway's local view
-    // of those objects: the gateway copy can be stale in ways stale_head
-    // does not fully repair (the authority merge overwrites cached cells;
-    // direct/live planning paths may not get a clean sequenced repair).
-    // The downstream CommitScopeDO uses its existing durable snapshot for
-    // anything not present in the combined slice; if cells it needs are
-    // genuinely missing, dispatch raises missing_state / E_OBJNF and the
-    // caller retries against what is now a warm satellite.
-    const omittedHosts = new Set<string>();
-    const localActorAuthorityIds = localActorAuthorityPreserveIds(world, ids);
+    // Remote authority-slice fetches can time out on cold satellites. Per-turn
+    // refreshes already have a CommitScopeDO snapshot behind them, but relying
+    // only on that snapshot turns cold-owner misses into hard E_OBJNF when the
+    // snapshot lacks a transitive row (for example an exit destination reached
+    // from a room's `exits` map). Keep the gateway's last-known local rows as a
+    // stale fallback; if they are out of date, the transcript's cell-version
+    // validation rejects the write with a normal retryable mismatch.
     const remoteSlices: Array<{ host: string; response: { authority: SerializedAuthoritySlice } | null; error: { code: string } | null }> = [];
+    let staleFallbackCount = 0;
     if (options.useCommitScopeSnapshotForRemoteAuthority) {
       // MCP per-envelope refresh happens only after ensureV2ScopeSessionOpen has
       // established the CommitScopeDO's durable planning snapshot. Re-waking
       // every remote owner here reintroduces the cold-open fanout that the
-      // snapshot is meant to avoid; omit those rows and let the scope snapshot
-      // provide execution state. The actor row is preserved below because a new
-      // session actor may not exist in the snapshot yet.
+      // snapshot is meant to avoid; send the local stale rows instead and let
+      // commit validation arbitrate freshness.
       for (const [host, objects] of byHost) {
         world.recordMetric({
-          kind: "authority_slice_omitted",
+          kind: "authority_slice_stale_fallback",
           host,
           object_count: objects.size,
           reason: "snapshot_fallback"
         });
-        omittedHosts.add(host);
+        staleFallbackCount += 1;
         remoteSlices.push({ host, response: null, error: null });
       }
     } else {
@@ -4414,32 +4406,19 @@ export class PersistentObjectDO {
           // fail loudly instead of persisting a partial seed.
           if (error.code === "E_TIMEOUT" && options.tolerateRemoteFailures) {
             world.recordMetric({
-              kind: "authority_slice_omitted",
+              kind: "authority_slice_stale_fallback",
               host,
               object_count: objects.size,
               reason: "timeout"
             });
-            omittedHosts.add(host);
+            staleFallbackCount += 1;
             return { host, response: null, error };
           }
           throw err;
         }
       })));
     }
-    // Strip the gateway's local cells for hosts we attempted-and-omitted.
-    // The one deliberate exception is the explicit actor authority root: a
-    // new MCP/REST actor may not exist in the CommitScopeDO snapshot yet, so
-    // omitting its local row turns a timeout fallback into "actor not found".
-    // Keep that actor's class chain for type/permission checks, but continue
-    // stripping stale local target/scope cells for omitted hosts.
-    const localOnlyAuthority = omittedHosts.size === 0
-      ? local.authority
-      : filterSerializedAuthoritySliceObjects(local.authority, (id) => {
-          if (localActorAuthorityIds.has(id)) return true;
-          const host = localObjectHostMap.get(id);
-          return host === undefined || !omittedHosts.has(host);
-        });
-    const slices: SerializedAuthoritySlice[] = [localOnlyAuthority];
+    const slices: SerializedAuthoritySlice[] = [local.authority];
     if (directoryScopeSessions.length > 0) {
       // Sparse MCP shard worlds intentionally do not mirror every co-present
       // session. For room-level reads such as `who`, recover the Directory
@@ -4477,7 +4456,8 @@ export class PersistentObjectDO {
     return {
       sessions: filteredAuthority.sessions,
       session_objects: [],
-      authority: filteredAuthority
+      authority: filteredAuthority,
+      staleFallbackCount
     };
   }
 
@@ -6023,21 +6003,14 @@ function v2SocketEnvelopeAuthorityObjectIds(encoded: string, fallbackScope: ObjR
   }
 }
 
-function localActorAuthorityPreserveIds(world: WooWorld, explicitIds: readonly ObjRef[]): Set<ObjRef> {
-  const preserve = new Set<ObjRef>();
+function localActorAuthorityRootIds(world: WooWorld, explicitIds: readonly ObjRef[]): Set<ObjRef> {
+  const roots = new Set<ObjRef>();
   const sessionActors = new Set(Array.from(world.sessions.values(), (session) => session.actor));
   for (const id of explicitIds) {
     if (!world.objects.has(id)) continue;
-    if (!sessionActors.has(id) && !world.isDescendantOf(id, "$actor")) continue;
-    let cursor: ObjRef | null = id;
-    const seen = new Set<ObjRef>();
-    while (cursor && world.objects.has(cursor) && !seen.has(cursor)) {
-      seen.add(cursor);
-      preserve.add(cursor);
-      cursor = world.object(cursor).parent;
-    }
+    if (sessionActors.has(id) || world.isDescendantOf(id, "$actor")) roots.add(id);
   }
-  return preserve;
+  return roots;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

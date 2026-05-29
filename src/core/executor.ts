@@ -44,6 +44,8 @@ export type ExecutorAuthorityPayload = {
   /** Legacy fallback for pre-authority callers. Authority-bearing payloads MUST leave this empty. */
   session_objects: SerializedObject[];
   authority: SerializedAuthoritySlice;
+  /** Internal planning metadata; executorEnvelopeBody deliberately does not serialize it. */
+  staleFallbackCount?: number;
 };
 
 export type ExecutionCapsule = {

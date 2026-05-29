@@ -700,7 +700,8 @@ describe("gateway projection cache", () => {
 
   it("preserves explicit actor authority when tolerated owner refresh times out", async () => {
     const state = new FakeDurableObjectState("mcp-gateway-0");
-    const world = createWorld();
+    const metrics: MetricEvent[] = [];
+    const world = createWorld({ metricsHook: (event) => metrics.push(event) });
     const session = world.auth("guest:authority-actor-preserve");
     const actorParent = world.object(session.actor).parent;
     const po = new PersistentObjectDO(state as unknown as DurableObjectState, env()) as unknown as {
@@ -709,8 +710,10 @@ describe("gateway projection cache", () => {
         extraObjectIds: ObjRef[],
         options: { tolerateRemoteFailures?: boolean }
       ) => Promise<{ authority: SerializedAuthoritySlice }>;
+      routeCache: Map<ObjRef, string>;
       forwardInternalReadChecked: () => Promise<never>;
     };
+    po.routeCache.set("the_chatroom", "the_chatroom");
     po.forwardInternalReadChecked = async () => {
       throw wooError("E_TIMEOUT", "owner refresh timeout");
     };
@@ -720,10 +723,15 @@ describe("gateway projection cache", () => {
 
     expect(ids.has(session.actor)).toBe(true);
     if (actorParent) expect(ids.has(actorParent)).toBe(true);
-    expect(ids.has("the_chatroom")).toBe(false);
+    expect(ids.has("the_chatroom")).toBe(true);
+    expect(metrics).toContainEqual(expect.objectContaining({
+      kind: "authority_slice_stale_fallback",
+      host: "the_chatroom",
+      reason: "timeout"
+    }));
   });
 
-  it("uses the commit-scope snapshot for MCP per-envelope remote authority refresh", async () => {
+  it("uses local stale rows for MCP per-envelope remote authority refresh", async () => {
     const state = new FakeDurableObjectState("mcp-gateway-0");
     const metrics: MetricEvent[] = [];
     const world = createWorld({ metricsHook: (event) => metrics.push(event) });
@@ -736,8 +744,10 @@ describe("gateway projection cache", () => {
         extraObjectIds: ObjRef[],
         options: { tolerateRemoteFailures?: boolean; useCommitScopeSnapshotForRemoteAuthority?: boolean }
       ) => Promise<{ authority: SerializedAuthoritySlice }>;
+      routeCache: Map<ObjRef, string>;
       forwardInternalReadChecked: () => Promise<never>;
     };
+    po.routeCache.set("the_chatroom", "the_chatroom");
     po.forwardInternalReadChecked = async () => {
       ownerReads += 1;
       throw new Error("owner should not be read for snapshot fallback");
@@ -752,12 +762,83 @@ describe("gateway projection cache", () => {
     expect(ownerReads).toBe(0);
     expect(ids.has(session.actor)).toBe(true);
     if (actorParent) expect(ids.has(actorParent)).toBe(true);
-    expect(ids.has("the_chatroom")).toBe(false);
+    expect(ids.has("the_chatroom")).toBe(true);
     expect(metrics).toContainEqual(expect.objectContaining({
-      kind: "authority_slice_omitted",
-      host: "world",
+      kind: "authority_slice_stale_fallback",
+      host: "the_chatroom",
       reason: "snapshot_fallback"
     }));
+  });
+
+  it("keeps transitive movement destinations when owner refresh falls back to stale rows", async () => {
+    const state = new FakeDurableObjectState("mcp-gateway-0");
+    const metrics: MetricEvent[] = [];
+    const world = createWorld({
+      catalogs: ["chat", "demoworld", "tasks", "blocks-demo"],
+      metricsHook: (event) => metrics.push(event)
+    });
+    const po = new PersistentObjectDO(state as unknown as DurableObjectState, env()) as unknown as {
+      v2GatewayAuthorityPayload: (
+        world: ReturnType<typeof createWorld>,
+        extraObjectIds: ObjRef[],
+        options: { tolerateRemoteFailures?: boolean; useCommitScopeSnapshotForRemoteAuthority?: boolean }
+      ) => Promise<{ authority: SerializedAuthoritySlice }>;
+      routeCache: Map<ObjRef, string>;
+      forwardInternalReadChecked: () => Promise<never>;
+    };
+    po.routeCache.set("the_deck", "the_deck");
+    po.forwardInternalReadChecked = async () => {
+      throw new Error("owner should not be read for snapshot fallback");
+    };
+
+    const payload = await po.v2GatewayAuthorityPayload(world, ["the_deck"], {
+      tolerateRemoteFailures: true,
+      useCommitScopeSnapshotForRemoteAuthority: true
+    });
+    const ids = authoritySliceObjectIds(payload.authority);
+
+    expect(ids.has("the_deck")).toBe(true);
+    expect(ids.has("exit_deck_south")).toBe(true);
+    expect(ids.has("the_garden")).toBe(true);
+    expect(metrics).toContainEqual(expect.objectContaining({
+      kind: "authority_slice_stale_fallback",
+      host: "the_deck",
+      reason: "snapshot_fallback"
+    }));
+  });
+
+  it("does not fetch world for unresolved ids or locally-live actors on sparse MCP shards", async () => {
+    const state = new FakeDurableObjectState("mcp-gateway-0");
+    const world = createWorld();
+    const session = world.auth("guest:authority-no-world-guess");
+    const reads: string[] = [];
+    const po = new PersistentObjectDO(state as unknown as DurableObjectState, env({
+      DIRECTORY: new FakeDurableObjectNamespace(() => ({
+        fetch: async (request: Request) => {
+          const body = await request.json() as { id?: string };
+          return new Response(JSON.stringify({ id: body.id, host: body.id === session.actor ? "world" : "", anchor: null }), {
+            headers: { "content-type": "application/json" }
+          });
+        }
+      })) as unknown as DurableObjectNamespace
+    })) as unknown as {
+      v2GatewayAuthorityPayload: (
+        world: ReturnType<typeof createWorld>,
+        extraObjectIds: ObjRef[],
+        options: { tolerateRemoteFailures?: boolean }
+      ) => Promise<{ authority: SerializedAuthoritySlice }>;
+      routeCache: Map<ObjRef, string>;
+      forwardInternalReadChecked: (host: string, path: string, body: { objects?: ObjRef[] }) => Promise<{ authority: SerializedAuthoritySlice }>;
+    };
+    po.routeCache.set("the_chatroom", "the_chatroom");
+    po.forwardInternalReadChecked = async (host, _path, body) => {
+      reads.push(host);
+      return { authority: world.exportAuthoritySlice([], body.objects ?? []) };
+    };
+
+    await po.v2GatewayAuthorityPayload(world, ["the_chatroom", session.actor], { tolerateRemoteFailures: true });
+
+    expect(reads).toEqual(["the_chatroom"]);
   });
 
   it("omits session rows whose actor row is absent from the authority slice", async () => {

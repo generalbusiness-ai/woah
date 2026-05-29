@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { createWorld } from "../src/core/bootstrap";
 import { executorAuthorityPayload } from "../src/core/executor";
+import { authoritySliceObjectIds, filterSerializedAuthoritySliceObjects, serializedWorldFromAuthoritySlice } from "../src/core/authority-slice";
 import { encodeEnvelope, type ShadowEnvelope } from "../src/core/shadow-envelope";
+import { createShadowBrowserRelayShim } from "../src/core/shadow-browser-node";
 import type { ShadowTurnExecReply } from "../src/core/shadow-turn-exec";
 import type { ObjRef } from "../src/core/types";
 import { McpGateway, type McpV2EnvelopeBody, type McpV2OpenBody } from "../src/mcp/gateway";
@@ -116,7 +118,7 @@ describe("v2 MCP e2e", () => {
 
     try {
       const session = await initializeMcp(gateway, "guest:v2-mcp-authority-snapshot", 1);
-      const result = await mcp(gateway, session, 2, "tools/call", {
+      const result = await mcp(gateway, session, 4, "tools/call", {
         name: "woo_call",
         arguments: { object: "the_chatroom", verb: "enter", args: [] }
       });
@@ -127,6 +129,99 @@ describe("v2 MCP e2e", () => {
     } finally {
       scopeState.close();
     }
+  });
+
+  it("carries relay snapshot rows when snapshot-fallback authority is sparse", async () => {
+    const world = createWorld({ catalogs: ["chat", "demoworld", "tasks", "blocks-demo"] });
+    const scopeStates = new Map<string, FakeDurableObjectState>();
+    const env = { WOO_INTERNAL_SECRET: "v2-mcp-secret" };
+    const scopes = new Map<string, CommitScopeDO>();
+    const scopeFor = (commitScope: ObjRef): CommitScopeDO => {
+      let scope = scopes.get(commitScope);
+      if (!scope) {
+        const state = new FakeDurableObjectState(commitScope);
+        scopeStates.set(commitScope, state);
+        scope = new CommitScopeDO(state as unknown as ConstructorParameters<typeof CommitScopeDO>[0], env);
+        scopes.set(commitScope, scope);
+      }
+      return scope;
+    };
+    const envelopeAuthorityIds: ObjRef[][] = [];
+    const gateway = new McpGateway(world, {
+      v2: {
+        open: async (commitScope, body) => await postCommitScope(scopeFor(commitScope), env, commitScope, "/v2/open", body),
+        authorityPayload: async (extraObjectIds, options) => {
+          const payload = executorAuthorityPayload(world, extraObjectIds);
+          if (options?.useCommitScopeSnapshotForRemoteAuthority !== true) return payload;
+          return {
+            ...payload,
+            authority: filterSerializedAuthoritySliceObjects(payload.authority, (id) => id !== "the_garden"),
+            staleFallbackCount: 1
+          };
+        },
+        envelope: async (commitScope, body) => {
+          if (commitScope === "the_deck") envelopeAuthorityIds.push(Array.from(authoritySliceObjectIds(body.authority!)));
+          return await postCommitScope(scopeFor(commitScope), env, commitScope, "/v2/envelope", body);
+        }
+      }
+    });
+
+    try {
+      const session = await initializeMcp(gateway, "guest:v2-mcp-relay-stale-fallback", 1);
+      await mcp(gateway, session, 2, "tools/call", {
+        name: "woo_call",
+        arguments: { object: "the_chatroom", verb: "enter", args: [] }
+      });
+      await mcp(gateway, session, 3, "tools/call", {
+        name: "woo_call",
+        arguments: { object: "the_chatroom", verb: "southeast", args: [] }
+      });
+      const result = await mcp(gateway, session, 4, "tools/call", {
+        name: "woo_call",
+        arguments: { object: "the_deck", verb: "look", args: [] }
+      });
+
+      expect(result.result.isError, JSON.stringify(result.result.structuredContent)).not.toBe(true);
+      expect(envelopeAuthorityIds[0]).toContain("the_garden");
+    } finally {
+      for (const state of scopeStates.values()) state.close();
+    }
+  });
+
+  it("skips the relay snapshot merge when authority did not degrade", () => {
+    const world = createWorld({ catalogs: ["chat", "demoworld", "tasks", "blocks-demo"] });
+    const session = world.auth("guest:v2-mcp-no-stale-fallback");
+    const relaySeed = executorAuthorityPayload(world, ["the_deck", session.actor]);
+    const freshPayload = executorAuthorityPayload(world, ["the_chatroom", session.actor]);
+    expect(authoritySliceObjectIds(relaySeed.authority).has("the_garden")).toBe(true);
+    expect(authoritySliceObjectIds(freshPayload.authority).has("the_garden")).toBe(false);
+
+    const gateway = new McpGateway(world);
+    const client = {
+      scope: "the_deck",
+      relay: createShadowBrowserRelayShim({
+        node: "mcp-v2-relay:test",
+        scope: "the_deck",
+        serialized: serializedWorldFromAuthoritySlice(relaySeed.authority)
+      }),
+      openedSessions: new Set<string>(),
+      openingSessions: new Map<string, Promise<void>>()
+    };
+    const helper = gateway as unknown as {
+      withRelaySnapshotAuthorityFallback(
+        client: unknown,
+        payload: typeof freshPayload
+      ): typeof freshPayload;
+    };
+
+    const warm = helper.withRelaySnapshotAuthorityFallback(client, freshPayload);
+    expect(authoritySliceObjectIds(warm.authority).has("the_garden")).toBe(false);
+
+    const degraded = helper.withRelaySnapshotAuthorityFallback(client, {
+      ...freshPayload,
+      staleFallbackCount: 1
+    });
+    expect(authoritySliceObjectIds(degraded.authority).has("the_garden")).toBe(true);
   });
 
   it("keeps MCP session authority coherent after cross-scope room moves", async () => {

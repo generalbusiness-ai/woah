@@ -336,14 +336,16 @@ export type MetricEvent =
   // Logged when a cross-host RPC fires (the `cross_host_rpc` end event only
   // logs on settle, so a wedged fetch leaves no trace at all).
   | { kind: "cross_host_rpc_start"; route: string; host: string; rpc_id?: string }
-  // Emitted by v2GatewayAuthorityPayload when a per-envelope refresh's
-  // /__internal/authority-slice fetch to a remote host timed out and we
-  // chose to omit that host's slice from the combined authority. The
-  // sender already records a `cross_host_rpc{status:"timeout", rpc_id}`
-  // for the underlying RPC; this distinct event captures the higher-level
-  // decision so cross_host_rpc latency stats stay clean and policy
-  // changes are easy to grep for.
+  // Legacy event emitted by the former timeout policy that omitted remote rows
+  // outright. Kept in the union so log-analysis scripts can parse older tails.
   | { kind: "authority_slice_omitted"; host: string; object_count: number; reason?: "timeout" | "snapshot_fallback" }
+  // Emitted by v2GatewayAuthorityPayload when a per-envelope refresh's
+  // /__internal/authority-slice fetch to a remote host timed out and we chose
+  // to fall back to the gateway's last-known authority rows. The sender
+  // already records a `cross_host_rpc{status:"timeout", rpc_id}` for the
+  // underlying RPC; this distinct event captures the higher-level policy
+  // decision so cross_host_rpc latency stats stay clean.
+  | { kind: "authority_slice_stale_fallback"; host: string; object_count: number; reason: "timeout" | "snapshot_fallback" }
   // Fires once per reapExpiredSessions sweep only when at least one session is
   // actually reaped. This keeps background sweep noise out of data-path tails
   // while preserving enough volume information for retention debugging.
