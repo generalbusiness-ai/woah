@@ -4,6 +4,7 @@ import {
   assertString,
   cloneValue,
   freezeTinyBytecode,
+  isDeeplyFrozen,
   directedRecipients,
   isErrorValue,
   valuesEqual,
@@ -11312,16 +11313,19 @@ function cloneImportedVerb(verb: VerbDef, slot: number): VerbDef {
 }
 
 // Bytecode is immutable after compilation, so the live world can share one
-// frozen object across imports instead of deep-copying ops+literals every time
-// (the cold-load hot path: KV restore hands us frozen reservoir bytecode). A
-// frozen input is already isolated — reuse it by reference. An UNfrozen input
-// came from arbitrary serialized state the caller may still hold and mutate, so
-// clone once for isolation and freeze the copy; the live world's bytecode is
-// then stable and any later in-place mutation throws instead of corrupting a
-// peer world that shares the same source. Mutable VerbDef wrapper fields
-// (aliases, arg_spec, line_map, calls) are still cloned by cloneImportedVerb.
+// deep-frozen object across imports instead of deep-copying ops+literals every
+// time (the cold-load hot path: KV restore hands us deep-frozen reservoir
+// bytecode). Share ONLY a value branded by our own deep-freeze (isDeeplyFrozen)
+// — never trust a bare Object.isFrozen, which a caller could set by
+// shallow-freezing the top while ops/literals stay mutable; sharing that would
+// leak mutable state across worlds. Any other input (unfrozen, or merely
+// shallow-frozen) came from arbitrary serialized state the caller may still
+// hold and mutate, so clone once for isolation and deep-freeze the copy; the
+// live world's bytecode is then stable and any later in-place mutation throws
+// instead of corrupting a peer world. Mutable VerbDef wrapper fields (aliases,
+// arg_spec, line_map, calls) are still cloned by cloneImportedVerb.
 function importBytecode(bytecode: BytecodeVerbDef["bytecode"]): BytecodeVerbDef["bytecode"] {
-  if (Object.isFrozen(bytecode)) return bytecode;
+  if (isDeeplyFrozen(bytecode)) return bytecode;
   return freezeTinyBytecode({
     ...bytecode,
     ops: bytecode.ops.map((op) => cloneImportedPlainData(op) as BytecodeVerbDef["bytecode"]["ops"][number]),

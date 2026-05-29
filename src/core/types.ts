@@ -484,14 +484,30 @@ export function cloneValue<T extends WooValue>(value: T): T {
   return structuredClone(value);
 }
 
-// Recursively freeze a JSON-shaped value in place. `Object.isFrozen` is the
-// stop signal: by contract anything frozen by this helper is frozen all the way
-// down, so a frozen subtree is never re-walked. Used to make compiled bytecode
-// immutable so worlds can share one object by reference instead of deep-cloning
-// it on every import (see freezeTinyBytecode).
+// Brand of values this module deep-froze. `Object.isFrozen` is NOT a safe
+// "deep-frozen" signal — a caller can shallow-freeze the top of an object while
+// its arrays/children stay mutable. We therefore track our own deep-freezes in
+// a WeakSet so the recursion stop and the share-by-reference gate trust only
+// freezes we performed, never an arbitrary external freeze.
+const deeplyFrozenValues = new WeakSet<object>();
+
+// True only for values deep-frozen by deepFreezePlainValue. Sharing a bytecode
+// object by reference (instead of cloning) is safe ONLY when this returns true;
+// an externally shallow-frozen object reports `Object.isFrozen === true` but is
+// not safe to share.
+export function isDeeplyFrozen(value: unknown): boolean {
+  return typeof value === "object" && value !== null && deeplyFrozenValues.has(value as object);
+}
+
+// Recursively freeze a JSON-shaped value in place and brand it. The stop signal
+// is our own brand (deeplyFrozenValues), not Object.isFrozen — a shallow-frozen
+// subtree must still be walked and its children frozen. Used to make compiled
+// bytecode immutable so worlds can share one object by reference instead of
+// deep-cloning it on every import (see freezeTinyBytecode / importBytecode).
 export function deepFreezePlainValue<T>(value: T): T {
   if (value === null || typeof value !== "object") return value;
-  if (Object.isFrozen(value)) return value;
+  if (deeplyFrozenValues.has(value as object)) return value;
+  deeplyFrozenValues.add(value as object);
   Object.freeze(value);
   if (Array.isArray(value)) {
     for (const item of value) deepFreezePlainValue(item);
@@ -505,11 +521,12 @@ export function deepFreezePlainValue<T>(value: T): T {
 
 // Compiled bytecode is immutable after compilation: a verb edit builds a fresh
 // bytecode object, the VM reads ops/literals read-only, and PUSH_LIT clones
-// literals via cloneValue before they reach the stack. Deep-freezing it once
-// (at reservoir build / install / import) lets every world share the same
-// object by reference with no defensive per-import clone, and turns any
-// accidental future in-place mutation into a thrown error rather than silent
-// cross-world corruption.
+// literals via cloneValue before they reach the stack. Deep-freezing it once on
+// the restore/import paths (reservoir build, KV restore, importWorld) lets every
+// world share the same branded object by reference with no defensive per-import
+// clone, and turns any accidental future in-place mutation into a thrown error
+// rather than silent cross-world corruption. (Verbs installed at runtime via
+// addVerb are NOT frozen here — only the import/restore paths that share.)
 export function freezeTinyBytecode(bytecode: TinyBytecode): TinyBytecode {
   return deepFreezePlainValue(bytecode);
 }

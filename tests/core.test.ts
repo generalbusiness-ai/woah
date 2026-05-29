@@ -1702,6 +1702,48 @@ describe("woo core", () => {
     expect(pingOf(worldB)!.bytecode.ops.length).toBe(opCountBefore);
   });
 
+  it("does not share a merely shallow-frozen bytecode across imported worlds", () => {
+    // A shallow Object.freeze leaves ops/literals mutable. Trusting bare
+    // Object.isFrozen would share such an object by reference and let one world
+    // corrupt another's ops; importBytecode must instead clone+deep-freeze it.
+    const live = createWorld({ catalogs: false });
+    live.createObject({ id: "shallow_probe", name: "Probe", parent: "$thing", owner: "$wiz" });
+    expect(installVerb(live, "shallow_probe", "ping", `verb :ping() rxd {
+  return "pong";
+}`, null).ok).toBe(true);
+    const serialized = live.exportWorld();
+    const probeVerb = serialized.objects.find((obj) => obj.id === "shallow_probe")?.verbs.find((verb) => verb.name === "ping");
+    expect(probeVerb?.kind).toBe("bytecode");
+    if (probeVerb?.kind !== "bytecode") return;
+
+    // Shallow freeze: top frozen, ops/literals still mutable — and NOT branded
+    // by our deepFreezePlainValue.
+    Object.freeze(probeVerb.bytecode);
+    expect(Object.isFrozen(probeVerb.bytecode)).toBe(true);
+    expect(Object.isFrozen(probeVerb.bytecode.ops)).toBe(false);
+
+    const worldA = createWorldFromSerialized(serialized, { persist: false });
+    const worldB = createWorldFromSerialized(serialized, { persist: false });
+    const pingOf = (world: WooWorld) => {
+      const verb = world.object("shallow_probe").verbs.find((candidate) => candidate.name === "ping");
+      return verb?.kind === "bytecode" ? verb : null;
+    };
+    const a = pingOf(worldA);
+    const b = pingOf(worldB);
+    expect(a).toBeTruthy();
+    expect(b).toBeTruthy();
+    if (!a || !b) return;
+
+    // Each world got its own deep-frozen clone — the shallow-frozen source is
+    // never shared, and the two worlds do not alias each other.
+    expect(a.bytecode).not.toBe(probeVerb.bytecode);
+    expect(a.bytecode).not.toBe(b.bytecode);
+    expect(Object.isFrozen(a.bytecode.ops)).toBe(true);
+    const opCountBefore = b.bytecode.ops.length;
+    expect(() => { (a.bytecode.ops as unknown[]).push(["NOOP"]); }).toThrow();
+    expect(pingOf(worldB)!.bytecode.ops.length).toBe(opCountBefore);
+  });
+
   it("does not share cached boot snapshot cells across createWorld calls", () => {
     const first = createWorld({ catalogs: false });
     const firstRoot = first.object("$root");
