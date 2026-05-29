@@ -112,9 +112,11 @@ type McpVerbInfo = {
   owner?: ObjRef;
 };
 
-// One cached verb surface for a (projection, actor, class) identity. `obvious`
-// holds the raw obviousCommandVerbs result; `tooled` holds the collected
-// {verb, owner} pairs from computeTooledVerbs. Both are class-stable: the
+// One cached verb surface for a (projection, actor, surface-identity) key —
+// shared across same-parent objects with no own verbs, but object-unique for an
+// object that defines its own (see verbSurfaceClassKey). `obvious` holds the raw
+// obviousCommandVerbs result; `tooled` holds the collected {verb, owner} pairs
+// from computeTooledVerbs. Every field stored is stable for that key: the
 // per-object `owner` default for the obvious projection is re-applied by
 // obviousVerbsFor on each call, never baked into the cached array. Entry
 // validity is governed by the cache-wide mutation-version epoch, not per entry.
@@ -141,14 +143,16 @@ export class McpHost {
   // enumeration O(items x ancestry x verbs) and pushed large shared scopes
   // (the_outline) past the 5s host read-RPC budget, yielding zero tools and a
   // downstream E_VERBNF. The surface is fully determined by (projection, actor,
-  // the object's class lineage + its own verbs/features); same-class items share
-  // it, so we key the cache by that identity. The whole cache is valid only for
-  // a single world mutation-version epoch (same idiom as world.hostSeedCache):
-  // any mutation clears it, so a verb/perm/feature/actor edit is always observed
-  // and entries never linger stale. Within one synchronous enumerate the version
-  // is fixed, so same-class items collapse to one walk; across calls the cache
-  // also holds until the next mutation. A coarse cap guards a pathological epoch
-  // that touches a very large number of distinct (actor, class) pairs.
+  // the object's class lineage + its own verbs/features), so same-parent items
+  // with no own verbs share one key (the outline fan-out collapses); an object
+  // that defines its own verbs keys uniquely (see verbSurfaceClassKey). The
+  // whole cache is valid only for a single world mutation-version epoch (same
+  // idiom as world.hostSeedCache): any mutation clears it, so a verb/perm/
+  // feature/actor edit is always observed and entries never linger stale. Within
+  // one synchronous enumerate the version is fixed, so same-class items collapse
+  // to one walk; across calls the cache also holds until the next mutation. A
+  // coarse cap guards a pathological epoch that touches a very large number of
+  // distinct keys.
   private verbSurfaceCache = new Map<string, VerbSurfaceCacheEntry>();
   private verbSurfaceCacheVersion = -1;
   private static readonly VERB_SURFACE_CACHE_MAX = 16384;
@@ -910,14 +914,18 @@ export class McpHost {
   private tooledVerbsFor(actor: ObjRef, id: ObjRef): McpVerbInfo[] {
     const cached = this.cachedVerbSurface(actor, id, "tools");
     if (!cached.tooled) cached.tooled = this.computeTooledVerbs(actor, id);
-    // owner is the defining ancestor (class-stable), so the cached entries are
-    // reused verbatim; the spread produces a fresh object per call.
+    // owner is the defining object (an ancestor, or `id` itself for an own
+    // verb). It is stable for the cache key — own-verb objects key uniquely on
+    // their id — so the cached entries are reused verbatim; the spread produces
+    // a fresh object per call.
     return cached.tooled.map((entry) => ({ ...entry.verb, owner: entry.owner }));
   }
 
   // The uncached ancestry + feature walk behind tooledVerbsFor. Returns
-  // {verb, owner} pairs where owner is the defining object — all class-level,
-  // safe to cache across same-class objects.
+  // {verb, owner} pairs where owner is the defining object — an ancestor, or
+  // `id` itself for a verb defined directly on this object. Safe to cache under
+  // the surface key: own-verb-free objects share on the parent, and any object
+  // that contributes its own verbs (owner === id) keys uniquely on its id.
   private computeTooledVerbs(actor: ObjRef, id: ObjRef): TooledVerbEntry[] {
     const seen = new Set<string>();
     const out: TooledVerbEntry[] = [];

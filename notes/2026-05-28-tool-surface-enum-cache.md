@@ -66,15 +66,23 @@ per-object source rows).
 
 ## Tests
 
-`tests/mcp.test.ts` — new case
-"collapses the obvious verb surface across same-class space contents and
-invalidates on edit": 60 same-class items in a space, asserts (1) per-object
-descriptor correctness incl. `source_rows.authority_scope`, (2) exactly one
-`obviousCommandVerbs` walk for 60 items (collapse), (3) zero walks on a second
-mutation-free enumerate (cross-call hold), (4) recompute + new verb visible on
-every item after a class verb edit (invalidation). All 60 mcp tests +
-v2-mcp-e2e + gateway-projection-cache + catalogs (128) pass; `npm test` (229),
-both typechecks, and all guards green.
+`tests/mcp.test.ts` — two new cases:
+
+1. "collapses the obvious verb surface across same-class space contents and
+   invalidates on edit": 60 same-class items in a space, asserts (a) per-object
+   descriptor correctness incl. `source_rows.authority_scope`, (b) exactly one
+   `obviousCommandVerbs` walk for 60 items (collapse), (c) zero walks on a second
+   mutation-free enumerate (cross-call hold), (d) recompute + new verb visible on
+   every item after a class verb edit (invalidation).
+2. "does not alias same-named instance-owned verbs across same-parent objects":
+   two same-parent objects each define their own `:zap` with different
+   params/bodies; asserts under both the tools and obvious-contents projections
+   that each keeps its own `source`, a distinct `arg_spec`, and own-object
+   `source_rows`. Verified red against the name-only key before the `self:<id>`
+   fix.
+
+All 61 mcp tests + v2-mcp-e2e + gateway-projection-cache + catalogs (128) pass;
+`npm test` (229), both typechecks, and all guards green.
 
 ## Not in scope / follow-ups
 
