@@ -977,16 +977,23 @@ export class McpHost {
 
   // Identity that two objects must share to have the same verb surface. Under
   // single inheritance the immediate parent fully determines the inherited
-  // ancestry and inherited feature list, so same-parent siblings collapse to one
-  // key. The object's own verbs and own `features` value are the only per-object
-  // additions; the tools projection additionally depends on whether the object
-  // is a block or is the actor itself (inherited $actor-tool suppression).
+  // ancestry and inherited feature list, so same-parent siblings with no own
+  // definitions collapse to one key — the hot outline case. An object that
+  // defines its OWN verbs cannot share: those verbs contribute per-object
+  // content (arg_spec, source, perms, owner, exposure flags), not just names, so
+  // we make the key object-unique whenever own verbs exist rather than try to
+  // fingerprint every field. The own `features` value also varies the surface
+  // and is keyed by value; the tools projection additionally depends on whether
+  // the object is a block or is the actor itself (inherited $actor-tool
+  // suppression).
   private verbSurfaceClassKey(actor: ObjRef, id: ObjRef, projection: "tools" | "obvious"): string {
     const obj = this.world.object(id);
-    const ownVerbs = Array.from(obj.verbs, (verb) => verb.name).sort().join(",");
+    // `self:<id>` makes objects with their own verbs unique; `shared` lets
+    // own-verb-free siblings reuse one entry keyed on the parent.
+    const ownIdentity = obj.verbs.length > 0 ? `self:${id}` : "shared";
     const ownFeatures = JSON.stringify(this.world.propOrNull(id, "features") ?? null);
     const tooledDiscriminator = projection === "tools" ? `${id === actor}:${this.isBlockObject(id)}` : "";
-    return `${projection}|${actor}|p:${obj.parent ?? ""}|v:${ownVerbs}|f:${ownFeatures}|t:${tooledDiscriminator}`;
+    return `${projection}|${actor}|p:${obj.parent ?? ""}|own:${ownIdentity}|f:${ownFeatures}|t:${tooledDiscriminator}`;
   }
 
   private toolSurfaceSourceRows(object: ObjRef, owner: ObjRef | undefined): RemoteToolDescriptor["source_rows"] {

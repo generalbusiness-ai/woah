@@ -29,10 +29,18 @@ object *name* into display text; it never changes which verbs are included.
 and `canBypassPerms(actor)` — so the cache keys on the actor.
 
 - Added `verbSurfaceCache`, keyed by a class-identity string
-  (`verbSurfaceClassKey`: projection | actor | immediate parent | own verb names
-  | own `features` value | tools-projection block/self discriminators). Under
-  single inheritance the immediate parent fully determines the inherited
-  ancestry and feature list, so same-parent siblings collapse to one key.
+  (`verbSurfaceClassKey`: projection | actor | immediate parent | own-verb
+  identity | own `features` value | tools-projection block/self discriminators).
+  Under single inheritance the immediate parent fully determines the inherited
+  ancestry and feature list, so same-parent siblings with no own definitions
+  collapse to one key.
+- Own-verb keying: an object that defines its OWN verbs gets an object-unique
+  key (`self:<id>`), never shared. Own verbs contribute per-object content
+  (arg_spec, source, perms, owner, exposure flags), not just names — keying them
+  by name alone aliased two same-parent objects that each define `:zap`, so the
+  second was emitted with the first's schema/source and source_rows (caught in
+  review; regression test added). Own-verb-free siblings (the hot outline case)
+  still collapse via the `shared` marker.
 - Invalidation uses the existing `world.mutationVersion()` epoch idiom (same as
   `world.hostSeedCache`): the whole cache is dropped when the global mutation
   version advances. Any verb/perm/feature/actor edit bumps it (verb installs go
