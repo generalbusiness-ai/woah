@@ -34,6 +34,7 @@ import {
   filterSerializedAuthoritySliceObjects,
   serializedWorldFromAuthoritySlice
 } from "../core/authority-slice";
+import { shadowObjectLineagePage, shadowObjectLivePage, shadowStatePageRef, type ShadowStatePage } from "../core/shadow-state-pages";
 import type { EffectTranscript } from "../core/effect-transcript";
 import { installLocalCatalogs, localCatalogBundleFingerprint, parseAutoInstallCatalogs, runHostScopedLocalCatalogLifecycle } from "../core/local-catalogs";
 import {
@@ -46,7 +47,7 @@ import {
 import type { ErrorValue, MetricEvent, ObjRef, Observation, RemoteToolDescriptor, RemoteToolRequest, Session, TinyBytecode, VerbDef, WooValue } from "../core/types";
 import { directedRecipients, freezeTinyBytecode, publicAppliedFrame, sessionActiveScopeFromRecord, wooError } from "../core/types";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, LiveEventFrame, Message } from "../core/types";
-import type { SeedWorld, SerializedAuthoritySlice, SerializedObject, SerializedWorld, TombstoneRecord } from "../core/repository";
+import type { SeedWorld, SerializedAuthorityCellSlice, SerializedAuthoritySlice, SerializedObject, SerializedSession, SerializedWorld, TombstoneRecord } from "../core/repository";
 import { createHostOperationMemo, normalizeError } from "../core/world";
 import { installGitHubTap, updateGitHubTap, type CatalogTapLogEvent } from "../core/catalog-taps";
 import type { ShadowCapabilityAd } from "../core/capability-ad";
@@ -217,6 +218,17 @@ type BrowserMetricSessionCounter = {
   lastSeen: number;
 };
 
+type DirectorySerializedSession = SerializedSession & {
+  displayName?: string | null;
+  focusList?: ObjRef[];
+};
+
+type DirectoryScopeSessionsCacheEntry = {
+  expiresAt: number;
+  value?: DirectorySerializedSession[];
+  promise?: Promise<DirectorySerializedSession[]>;
+};
+
 type V2SocketAttachment = {
   sessionId: string;
   actor: ObjRef;
@@ -232,6 +244,7 @@ type V2SocketAttachment = {
 const WORLD_HOST = "world";
 const MCP_GATEWAY_SHARD_PREFIX = "mcp-gateway-";
 const DEFAULT_MCP_GATEWAY_SHARDS = 32;
+const MCP_GATEWAY_ACTOR_SUPPORT_IDS = new Set<ObjRef>(["$root", "$thing", "$actor", "$player"]);
 const DEFAULT_TOOL_SURFACE_SOURCE_INDEX_MAX_SCOPE_ROWS = 10_000;
 const DEFAULT_TOOL_SURFACE_SOURCE_INDEX_MAX_SHARD_ROWS = 40_000;
 const MAX_REST_V2_RELAY_CLIENTS = 64;
@@ -239,7 +252,6 @@ const DIRECTORY_HOST = "directory";
 const INTERNAL_ORIGIN = "https://woo.internal";
 const MAX_JSON_BODY_BYTES = 1 * 1024 * 1024;
 const HOST_SEED_KV_KIND = "woo.host_seed.kv.bytecode_free.v1";
-const MCP_GATEWAY_WORLD_KV_KIND = "woo.mcp_gateway_world.kv.bytecode_free.v1";
 const MAX_BROWSER_METRICS_BATCH = 200;
 const MAX_BROWSER_METRIC_STRING = 160;
 const BROWSER_METRICS_SESSION_BUDGET = 60;
@@ -264,6 +276,12 @@ const HOST_READ_RPC_TIMEOUT_MS = 5000;
 // unresponsive). Most operations on this codebase are inherently
 // idempotent (set_property, observe, mirror-contents).
 const HOST_WRITE_RPC_TIMEOUT_MS = 30_000;
+// Directory-backed room presence is a live hint used to make sparse MCP
+// shards render roster reads. Keep the cache deliberately short: enough to
+// collapse duplicate who/look planning reads in one burst without making
+// a moved/disconnected actor linger in user-visible room text.
+const DIRECTORY_SCOPE_SESSIONS_TTL_MS = 1_000;
+const DIRECTORY_SCOPE_SESSIONS_CACHE_MAX = 128;
 // Cap on concurrent DO->DO fetch() subrequests issued by this isolate. The
 // Workers runtime enforces its own ~6-slot limit; we self-limit slightly under
 // that and queue the overflow so cold-start fan-outs (compose_look hitting 4
@@ -382,6 +400,11 @@ export class PersistentObjectDO {
   private repo: CFObjectRepository;
   private world: WooWorld | null = null;
   private routeCache = new Map<ObjRef, string>();
+  private localRouteSnapshot: {
+    hostKey: string;
+    version: number;
+    routes: Map<ObjRef, { id: ObjRef; host: string; anchor: ObjRef | null }>;
+  } | null = null;
   private publishedRoutes = new Map<ObjRef, string>();
   private routesRegistered = false;
   private mcpGateway: McpGateway | null = null;
@@ -414,6 +437,11 @@ export class PersistentObjectDO {
   // `${host}\n${path}\n${bodyStr}`; value is the in-flight Promise. Cleared on
   // settle (resolve or reject) so the next call recomputes against fresh state.
   private outFetchInflight = new Map<string, Promise<unknown>>();
+  // Short-lived single-flight cache for Directory session lookups used by
+  // sparse MCP shard presence reads. Directory is a singleton; without this,
+  // back-to-back roster verbs can add synchronous singleton pressure during
+  // the post-deploy cold-load window.
+  private directoryScopeSessionsCache = new Map<string, DirectoryScopeSessionsCacheEntry>();
   // Per spec/semantics/recycle.md §RC11. Cached host_state — null means
   // "not yet read this lifetime"; afterwards the cached string is "live"
   // or "tearing_down". Resets on DO eviction.
@@ -875,6 +903,7 @@ export class PersistentObjectDO {
           aliases: verb.aliases ?? [],
           arg_spec: verb.arg_spec ?? {},
           direct: verb.direct === true,
+          ...(verb.reads_room_presence === true ? { reads_room_presence: true } : {}),
           source: verb.source ?? "",
           enclosingSpace: verb.enclosingSpace ?? row.scope,
           source_rows: row.source_rows
@@ -982,6 +1011,7 @@ export class PersistentObjectDO {
             aliases: descriptor.aliases,
             arg_spec: descriptor.arg_spec,
             direct: descriptor.direct,
+            ...(descriptor.reads_room_presence === true ? { reads_room_presence: true } : {}),
             source: descriptor.source,
             enclosingSpace: descriptor.enclosingSpace
           })),
@@ -1091,7 +1121,7 @@ export class PersistentObjectDO {
       if (worldGatewayHost && request.method === "POST" && pathname === "/v2/session/mint") {
         const body = await readJsonBody(request);
         const session = this.authenticateToken(world, String(body.token ?? ""));
-        await this.registerSessionRoute(session);
+        await this.registerSessionRoute(session, {}, world);
         return jsonResponse({
           token: shadowBrowserSessionBearer(session),
           claims: shadowBrowserSessionClaimsValue(session, "shadow-local", [session.actor])
@@ -1148,7 +1178,7 @@ export class PersistentObjectDO {
         authenticateToken: (token) => this.authenticateToken(world, token),
         requireSession: () => this.requireRestSession(world, request),
         verifyTurnstile: (token, protocolRequest) => this.verifyTurnstile(token, protocolRequest),
-        onAuthenticated: (session) => this.registerSessionRoute(session),
+        onAuthenticated: (session) => this.registerSessionRoute(session, {}, world),
         onSessionEnded: (session) => {
           this.browserMetricSessionCounters.delete(session.id);
           return this.unregisterSessionRoute(session.id);
@@ -1447,7 +1477,10 @@ export class PersistentObjectDO {
           authorityPayload: async (extraObjectIds, authorityOptions) =>
             await this.v2GatewayAuthorityPayload(world, extraObjectIds, {
               tolerateRemoteFailures: true,
-              useCommitScopeSnapshotForRemoteAuthority: authorityOptions?.useCommitScopeSnapshotForRemoteAuthority === true
+              useCommitScopeSnapshotForRemoteAuthority:
+                authorityOptions?.useCommitScopeSnapshotForRemoteAuthority === true &&
+                !isMcpGatewayShardHost(this.durableHostKey()),
+              directorySessionScopes: authorityOptions?.directorySessionScopes
             }),
           executionCapsuleOpen: envFlag(this.env.WOO_V2_EXECUTION_CAPSULE)
         },
@@ -1472,14 +1505,16 @@ export class PersistentObjectDO {
       // session resume. Until that happens, peer-shard fanout to this shard
       // for the actor's session is dropped (queues_scanned=0 in the
       // mcp_observation_routed metric — see commit 9316122). Rebind every
-      // persisted session in world.sessions whose shard hash points at this
-      // gateway shard. The queue starts empty; observations land in it
-      // immediately; the next woo_wait drain returns them.
+      // persisted session in world.sessions. Sparse shard worlds are already
+      // filtered by Directory's mcp_shard row, so re-hashing here would make a
+      // shard-count change or stale row silently drop queues after cold-load.
+      // The queue starts empty; observations land in it immediately; the next
+      // woo_wait drain returns them.
       const localShard = this.durableHostKey();
       let rebound = 0;
       const reboundStart = Date.now();
       for (const session of world.sessions.values()) {
-        if (mcpGatewayShardHost(this.env, session.id) === localShard) {
+        if (isMcpGatewayShardHost(localShard) || mcpGatewayShardHost(this.env, session.id) === localShard) {
           this.mcpGateway.host.bindSession(session.id, session.actor);
           rebound += 1;
         }
@@ -1555,15 +1590,11 @@ export class PersistentObjectDO {
             this.crossHostPropCache.clear();
             changed = true;
           }
+          // Fresh seeds are already gateway-authoritative for foreign support
+          // rows, and the host lifecycle runs in covered mode below. Re-merging
+          // the same seed after lifecycle would export and scan the whole slice
+          // again on every hot deploy repair without adding authority.
           runHostScopedLocalCatalogLifecycle(world, hostKey, { freshSeed: true });
-          const exported = world.exportWorld();
-          const seeded = mergeHostScopedSeedWithStatus(exported, fetched.seed, hostKey as ObjRef);
-          if (seeded.changed) {
-            this.logHostSeedMergeDiff(hostKey as ObjRef, "catalog_bundle_repair_post_lifecycle", exported, fetched.seed, seeded.reasons);
-            world.importWorld(seeded.world);
-            this.crossHostPropCache.clear();
-            changed = true;
-          }
           if (changed) world.persistFullSnapshot();
           if (fetched.digest) this.repo.saveMeta(HOST_SEED_DIGEST_META_KEY, fetched.digest);
         } else {
@@ -1624,9 +1655,10 @@ export class PersistentObjectDO {
     if (hostKey === WORLD_HOST) {
       await this.registerObjectRoutes(world);
     } else if (isMcpGatewayShardHost(hostKey)) {
-      for (const route of world.objectRoutes()) {
-        this.routeCache.set(route.id, route.host);
-      }
+      // MCP shard worlds are deliberately stubbed from Directory session rows.
+      // Do not publish or cache routes from those stubs; object ownership is
+      // resolved lazily through Directory/owner hosts when tools or turns need
+      // real authority.
     } else {
       // Satellite cold-load: prime `routeCache` from the local slice so
       // `resolveObjectHostForWorld` can answer locally without firing a
@@ -1647,68 +1679,142 @@ export class PersistentObjectDO {
   }
 
   private async createMcpGatewayShardWorld(hostKey: string, metricsHook: (event: MetricEvent) => void): Promise<WooWorld> {
-    // KV fast path: WORLD publishes a bytecode-free exportWorld to a
-    // bundled-catalog-namespaced current pointer and content key on every
-    // snapshot request. The reader restores exact bytecode
-    // from local/catalog reservoirs by hash; if any verb cannot be
-    // restored it falls through to WORLD's authoritative full snapshot.
-    // The bytes are otherwise identical across all gateway shards
-    // (the handler doesn't shard on the body), so a single KV value
-    // serves every shard's cold-load and the edge cache benefits
-    // compound across shards.
-    if (this.env.HOST_SEED_KV) {
-      const kvStartedAt = Date.now();
+    // MCP shards are transport/session routers, not world owners. Their cold
+    // state is the Directory's live session rows for this shard; object
+    // authority is fetched lazily through v2GatewayAuthorityPayload when a turn
+    // actually needs it. Loading a full gateway SerializedWorld here was the
+    // A3 cold-start cliff: every established MCP request imported all objects
+    // just to rebind queues.
+    const startedAt = Date.now();
+    const sessions = await this.loadMcpGatewayShardSessions(hostKey);
+    const snapshot = mcpGatewayShardSerializedWorld(sessions);
+    this.emitMetric({
+      kind: "startup_storage",
+      phase: "mcp_gateway_snapshot_fetch",
+      ms: Date.now() - startedAt,
+      status: "ok",
+      objects: snapshot.objects.length,
+      sessions: snapshot.sessions.length,
+      source: "directory"
+    }, hostKey);
+    return createWorldFromSerialized(snapshot, { repository: this.repo, metricsHook, persist: false });
+  }
+
+  private async loadMcpGatewayShardSessions(hostKey: string): Promise<DirectorySerializedSession[]> {
+    if (!isMcpGatewayShardHost(hostKey)) return [];
+    const id = this.env.DIRECTORY.idFromName(DIRECTORY_HOST);
+    const sessions: DirectorySerializedSession[] = [];
+    let afterSessionId = "";
+    for (let page = 0; page < 256; page += 1) {
+      const directoryRequest = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/mcp-sessions-for-shard`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json; charset=utf-8"
+        },
+        body: JSON.stringify({ shard: hostKey, after_session_id: afterSessionId })
+      }));
+      const response = await this.env.DIRECTORY.get(id).fetch(directoryRequest);
+      const body = await response.json().catch(() => null) as { sessions?: unknown; next_after_session_id?: unknown } | null;
+      if (!response.ok || !body || !Array.isArray(body.sessions)) {
+        throw wooError("E_STORAGE", `failed to load MCP gateway shard sessions for ${hostKey}`, body as WooValue);
+      }
+      sessions.push(...body.sessions.map(serializedSessionFromDirectoryRoute).filter((session): session is DirectorySerializedSession => session !== null));
+      const next = typeof body.next_after_session_id === "string" ? body.next_after_session_id : "";
+      if (!next) return sessions;
+      afterSessionId = next;
+    }
+    throw wooError("E_STORAGE", `too many MCP gateway shard session pages for ${hostKey}`, hostKey);
+  }
+
+  private async loadDirectorySessionsForScopes(scopes: readonly ObjRef[]): Promise<DirectorySerializedSession[]> {
+    const requested = Array.from(new Set(scopes.filter((scope) => typeof scope === "string" && scope.length > 0))).sort();
+    if (requested.length === 0) return [];
+    const cacheKey = requested.join("\n");
+    const now = Date.now();
+    const cached = this.directoryScopeSessionsCache.get(cacheKey);
+    if (cached && cached.expiresAt > now) {
+      if (cached.value) return cloneDirectorySerializedSessions(cached.value);
+      if (cached.promise) return cloneDirectorySerializedSessions(await cached.promise);
+    }
+
+    const startedAt = Date.now();
+    let failed = false;
+    const promise = this.fetchDirectorySessionsForScopes(requested).catch((err) => {
+      failed = true;
+      const error = normalizeError(err);
+      this.world?.recordMetric({
+        kind: "directory_sessions_for_scopes",
+        scopes: requested.length,
+        sessions: 0,
+        ms: Date.now() - startedAt,
+        status: error.code === "E_TIMEOUT" ? "timeout" : "error",
+        error: error.code
+      });
+      return [];
+    });
+    this.directoryScopeSessionsCache.set(cacheKey, { expiresAt: now + DIRECTORY_SCOPE_SESSIONS_TTL_MS, promise });
+    this.trimDirectoryScopeSessionsCache();
+    const sessions = await promise;
+    this.directoryScopeSessionsCache.set(cacheKey, {
+      expiresAt: Date.now() + DIRECTORY_SCOPE_SESSIONS_TTL_MS,
+      value: cloneDirectorySerializedSessions(sessions)
+    });
+    this.trimDirectoryScopeSessionsCache();
+    if (!failed) {
+      this.world?.recordMetric({
+        kind: "directory_sessions_for_scopes",
+        scopes: requested.length,
+        sessions: sessions.length,
+        ms: Date.now() - startedAt,
+        status: "ok"
+      });
+    }
+    return cloneDirectorySerializedSessions(sessions);
+  }
+
+  private async fetchDirectorySessionsForScopes(requested: readonly ObjRef[]): Promise<DirectorySerializedSession[]> {
+    const id = this.env.DIRECTORY.idFromName(DIRECTORY_HOST);
+    const sessions: DirectorySerializedSession[] = [];
+    let afterSessionId = "";
+    for (let page = 0; page < 256; page += 1) {
+      const controller = new AbortController();
+      const timeoutMs = this.hostReadRpcTimeoutMs();
+      const timeout = setTimeout(() => {
+        controller.abort(wooError("E_TIMEOUT", "Directory sessions-for-scopes timed out", { timeout_ms: timeoutMs, scopes: requested.length }));
+      }, timeoutMs);
       try {
-        let missReason: HostSeedKvRestoreMissReason | null = null;
-        const pointer = await this.env.HOST_SEED_KV.get(mcpGatewayWorldPointerKey(this.env), "text");
-        if (pointer && pointer.length > 0) {
-          const raw = await this.env.HOST_SEED_KV.get(mcpGatewayWorldBytesKey(this.env, pointer), "text");
-          if (raw) {
-            try {
-              const parsed = JSON.parse(raw) as unknown;
-              const restored = restoreMcpGatewayWorldKvPayload(parsed, pointer, this.repo.load(), this.env, (event) => this.emitMetric(event, hostKey));
-              if (restored.ok) {
-                this.emitMetric({ kind: "startup_storage", phase: "mcp_gateway_snapshot_fetch", ms: Date.now() - kvStartedAt, status: "ok", objects: restored.value.objects.length, source: "kv" }, hostKey);
-                return createWorldFromSerialized(restored.value, { repository: this.repo, metricsHook, persist: false });
-              }
-              missReason = restored.reason;
-            } catch (err) {
-              if (err instanceof SyntaxError) {
-                missReason = "invalid_payload";
-              } else {
-                throw err;
-              }
-            }
-          } else {
-            missReason = "no_entry";
-          }
-        } else {
-          missReason = "no_pointer";
+        const signedRequest = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/sessions-for-scopes`, {
+          method: "POST",
+          headers: { "content-type": "application/json; charset=utf-8" },
+          body: JSON.stringify({ scopes: requested, after_session_id: afterSessionId })
+        }));
+        const directoryRequest = new Request(signedRequest, { signal: controller.signal });
+        const response = await raceAgainstAbort(this.env.DIRECTORY.get(id).fetch(directoryRequest), controller.signal);
+        const body = await response.json().catch(() => null) as { sessions?: unknown; next_after_session_id?: unknown } | null;
+        if (!response.ok || !body || !Array.isArray(body.sessions)) {
+          throw wooError("E_STORAGE", "Directory sessions-for-scopes failed", { status: response.status });
         }
-        this.emitMetric({ kind: "host_seed_kv_restore_miss", cache: "mcp_gateway_world", host: hostKey, reason: missReason ?? "invalid_payload", ms: Date.now() - kvStartedAt }, hostKey);
-        this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch_kv_miss", ms: Date.now() - kvStartedAt, status: "ok" }, hostKey);
-      } catch (err) {
-        this.emitMetric({ kind: "startup_storage", phase: "host_seed_fetch_kv_miss", ms: Date.now() - kvStartedAt, status: "error", ...metricErrorFields(err) }, hostKey);
-        // fall through to DO RPC
+        sessions.push(...body.sessions.map(serializedSessionFromDirectoryRoute).filter((session): session is DirectorySerializedSession => session !== null));
+        const next = typeof body.next_after_session_id === "string" ? body.next_after_session_id : "";
+        if (!next) return sessions;
+        afterSessionId = next;
+      } finally {
+        clearTimeout(timeout);
       }
     }
-    const startedAt = Date.now();
-    const id = this.env.WOO.idFromName(WORLD_HOST);
-    const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/__internal/mcp-gateway-world`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json; charset=utf-8",
-        "x-woo-host-key": WORLD_HOST
-      },
-      body: JSON.stringify({ shard: hostKey })
-    }));
-    const response = await this.env.WOO.get(id).fetch(request);
-    const body = await response.json().catch(() => null);
-    if (!response.ok || !isSerializedWorld(body)) {
-      throw wooError("E_STORAGE", `failed to load MCP gateway shard snapshot for ${hostKey}`, body as WooValue);
+    return sessions;
+  }
+
+  private trimDirectoryScopeSessionsCache(): void {
+    const now = Date.now();
+    for (const [key, entry] of this.directoryScopeSessionsCache) {
+      if (entry.expiresAt <= now) this.directoryScopeSessionsCache.delete(key);
     }
-    this.emitMetric({ kind: "startup_storage", phase: "mcp_gateway_snapshot_fetch", ms: Date.now() - startedAt, status: "ok", objects: body.objects.length, source: "do" }, hostKey);
-    return createWorldFromSerialized(body, { repository: this.repo, metricsHook, persist: false });
+    while (this.directoryScopeSessionsCache.size > DIRECTORY_SCOPE_SESSIONS_CACHE_MAX) {
+      const oldest = this.directoryScopeSessionsCache.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.directoryScopeSessionsCache.delete(oldest);
+    }
   }
 
   private async createHostScopedWorld(hostKey: ObjRef, metricsHook: (event: MetricEvent) => void): Promise<WooWorld> {
@@ -1811,19 +1917,11 @@ export class PersistentObjectDO {
     const world = createWorldFromSerialized(scoped, { repository: this.repo, metricsHook, persist: stored === null });
     // A successful seed fetch is the gateway-authoritative schema repair for
     // foreign-hosted catalog support rows. Running host schema repair on those
-    // rows after the merge re-adds local-only catalog fields that the
-    // post-lifecycle seed merge then deletes, causing a full snapshot on every
-    // satellite wake. Host-owned data migrations still run below.
+    // rows after the merge would re-add local-only catalog fields. The
+    // fresh-seed lifecycle mode records the gateway-covered plan instead, so a
+    // second post-lifecycle export/merge/import is duplicate full-slice work.
+    // Host-owned data migrations still run below and persist incrementally.
     runHostScopedLocalCatalogLifecycle(world, hostKey, { freshSeed: freshSeed !== null || seedDigestHit });
-    if (freshSeed) {
-      const exported = world.exportWorld();
-      const seeded = mergeHostScopedSeedWithStatus(exported, freshSeed, hostKey);
-      if (seeded.changed) {
-        this.logHostSeedMergeDiff(hostKey, "post_lifecycle", exported, freshSeed, seeded.reasons);
-        world.importWorld(seeded.world);
-        seedMergeChanged = true;
-      }
-    }
     // With content-addressed KV keys (Lever B), a successful KV read
     // returns bytes whose digest matches the requested pointer — the
     // bytes are self-consistent and either current or a frozen past
@@ -2208,7 +2306,22 @@ export class PersistentObjectDO {
   }
 
   private localObjectRoute(world: WooWorld | null | undefined, id: ObjRef): { id: ObjRef; host: string; anchor: ObjRef | null } | null {
-    return world?.objectRoutes().find((route) => route.id === id) ?? null;
+    if (isMcpGatewayShardHost(this.durableHostKey())) return null;
+    if (!world) return null;
+    const hostKey = this.durableHostKey();
+    const version = world.mutationVersion();
+    if (!this.localRouteSnapshot || this.localRouteSnapshot.hostKey !== hostKey || this.localRouteSnapshot.version !== version) {
+      // objectRoutes() walks every object and anchor chain. Host routing reads
+      // call this path for many VM property/object operations, so cache the
+      // route map for the current world mutation epoch instead of rebuilding it
+      // per cell. Route-affecting writes bump mutationVersion.
+      this.localRouteSnapshot = {
+        hostKey,
+        version,
+        routes: new Map(world.objectRoutes().map((route) => [route.id, route] as const))
+      };
+    }
+    return this.localRouteSnapshot.routes.get(id) ?? null;
   }
 
   private async adoptLocalObjectRoute(route: { id: ObjRef; host: string; anchor: ObjRef | null }): Promise<string> {
@@ -2280,7 +2393,8 @@ export class PersistentObjectDO {
 
   private installExecutorContext(world: WooWorld, localHost: string): void {
     const hostForObjectUncached = async (id: ObjRef): Promise<string | null> => {
-      const resolved = await this.resolveObjectHostForWorld(world, id, "");
+      const fallbackHost = isMcpGatewayShardHost(localHost) ? WORLD_HOST : "";
+      const resolved = await this.resolveObjectHostForWorld(world, id, fallbackHost);
       return resolved || null;
     };
     const hostForObject = async (id: ObjRef, memo?: HostOperationMemo): Promise<string | null> => {
@@ -2775,12 +2889,13 @@ export class PersistentObjectDO {
               const response = await this.forwardInternalReadChecked<{ tools: RemoteToolDescriptor[] }>(host, "/__internal/enumerate-tools", { actor, requests: hostRequests });
               const tools = response.tools ?? [];
               this.storeGatewayToolSurfacesForRequests(hostRequests, tools);
-              // Returned descriptors include runtime-minted objects (tasks
-              // created on the cluster) that the directory may not know about
-              // yet. Record the responding host as their route so a follow-up
-              // tool call dispatches without an extra lookup.
+              const exactRequestIds = new Set(hostRequests.map((request) => request.id));
+              // Cache only the exact ids whose owner we just resolved. Expanded
+              // content descriptors can include mounted/self-hosted objects
+              // represented as stubs in the responding host's slice; caching
+              // those to the scope host poisons later authority fetches.
               for (const tool of tools) {
-                if (!this.routeCache.has(tool.object)) this.routeCache.set(tool.object, host);
+                if (exactRequestIds.has(tool.object) && !this.routeCache.has(tool.object)) this.routeCache.set(tool.object, host);
               }
               return tools;
             } catch {
@@ -2897,6 +3012,7 @@ export class PersistentObjectDO {
       space: ctx.space,
       seq: ctx.seq,
       session: ctx.session,
+      session_started: session?.started ?? null,
       session_active_scope: session?.activeScope ?? null,
       session_current_location: session?.activeScope ?? null,
       session_expires_at: session?.expiresAt ?? null,
@@ -2924,39 +3040,13 @@ export class PersistentObjectDO {
 
       if (request.method === "POST" && pathname === "/__internal/mcp-gateway-world") {
         if (hostKey !== WORLD_HOST) throw wooError("E_NOTAPPLICABLE", "MCP gateway snapshots are served only by the world host");
-        const exported = world.exportWorld();
-        // KV publish (Lever B extension): the MCP gateway snapshot is
-        // identical across all gateway shards (the handler ignores the
-        // body.shard hint), so a single KV value serves every shard's
-        // cold-load. The KV payload strips verb.bytecode and stores
-        // per-verb hashes; shard cold-load restores matching bytecode
-        // from local/catalog reservoirs or falls through to this full
-        // DO response. Content-addressed by hash of the full serialized
-        // world so a new commit or bytecode change produces a new key
-        // automatically. Keys are salted by the bundled catalog fingerprint
-        // so deploys that change catalog verb source miss stale pointers.
-        // Pointer moves last. Read path is in createMcpGatewayShardWorld.
-        //
-        // Measurement before this commit (Lever B host-seed only):
-        //   mcp_gateway_snapshot_fetch avg 1183ms, max 6647ms
-        // Expected after: KV reads ~50-200ms when fresh, falls through
-        // to DO RPC on miss (e.g., right after a content change before
-        // the waitUntil write lands).
-        if (this.env.HOST_SEED_KV && typeof this.state.waitUntil === "function") {
-          const fullBody = JSON.stringify(exported);
-          const digest = hashSource(fullBody);
-          const bytesKey = mcpGatewayWorldBytesKey(this.env, digest);
-          const pointerKey = mcpGatewayWorldPointerKey(this.env);
-          const payload = JSON.stringify(bytecodeFreeMcpGatewayWorldKvPayload(exported, digest));
-          this.state.waitUntil((async () => {
-            try {
-              await this.env.HOST_SEED_KV!.put(bytesKey, payload, { expirationTtl: 7 * 24 * 3600 });
-              await this.env.HOST_SEED_KV!.put(pointerKey, digest);
-            } catch (err) {
-              console.warn("woo.mcp_gateway_world_kv_put.failed", { digest, error: normalizeError(err) });
-            }
-          })());
-        }
+        const shard = typeof body.shard === "string" ? body.shard : "";
+        if (!isMcpGatewayShardHost(shard)) throw wooError("E_INVARG", "mcp-gateway-world requires a shard host");
+        // Compatibility/diagnostic route only. Shards no longer call WORLD to
+        // cold-load; they read Directory session rows directly. Keep this
+        // endpoint bounded so old probes cannot accidentally request a full
+        // world materialization from the gateway.
+        const exported = mcpGatewayShardSerializedWorld(await this.loadMcpGatewayShardSessions(shard));
         return jsonResponse(exported);
       }
 
@@ -3105,6 +3195,7 @@ export class PersistentObjectDO {
         this.routesRegistered = false;
         this.publishedRoutes.clear();
         this.routeCache.clear();
+        this.localRouteSnapshot = null;
         this.crossHostPropCache.clear();
         this.mcpGateway = null;
         return jsonResponse({ ok: true, host: hostKey, ms: Date.now() - wipeStart });
@@ -3158,7 +3249,8 @@ export class PersistentObjectDO {
           Number(body.expires_at ?? 0),
           body.token_class,
           sessionActiveScope(body),
-          typeof body.apikey_id === "string" ? body.apikey_id : null
+          typeof body.apikey_id === "string" ? body.apikey_id : null,
+          Number(body.started ?? 0)
         );
         const space = String(body.space ?? "") as ObjRef;
         if (!world.hasPresence(session.actor, space)) throw wooError("E_PERM", `${session.actor} is not present in ${space}`);
@@ -3343,7 +3435,8 @@ export class PersistentObjectDO {
               active_scope: rawCtx.session_active_scope,
               current_location: rawCtx.session_current_location
             }),
-            typeof rawCtx.session_apikey_id === "string" ? rawCtx.session_apikey_id : null
+            typeof rawCtx.session_apikey_id === "string" ? rawCtx.session_apikey_id : null,
+            Number(rawCtx.session_started ?? 0)
           );
         }
         const message = rawCtx.message && typeof rawCtx.message === "object" && !Array.isArray(rawCtx.message)
@@ -3489,13 +3582,22 @@ export class PersistentObjectDO {
     expiresAt: number,
     rawTokenClass: unknown,
     activeScope?: ObjRef | null,
-    apikeyId?: string | null
+    apikeyId?: string | null,
+    started?: number
   ): Session {
     if (!sessionId || !actor) throw wooError("E_NOSESSION", "internal forwarded call requires session and actor");
     this.ensureInternalActor(world, actor);
     const tokenClass: Session["tokenClass"] = rawTokenClass === "guest" || rawTokenClass === "apikey" ? rawTokenClass : "bearer";
     const apikeyIdValue = typeof apikeyId === "string" && apikeyId.length > 0 ? apikeyId : undefined;
-    return world.ensureSessionForActor(sessionId, actor, tokenClass, Number.isFinite(expiresAt) && expiresAt > 0 ? expiresAt : undefined, activeScope, apikeyIdValue);
+    return world.ensureSessionForActor(
+      sessionId,
+      actor,
+      tokenClass,
+      Number.isFinite(expiresAt) && expiresAt > 0 ? expiresAt : undefined,
+      activeScope,
+      apikeyIdValue,
+      Number.isFinite(started ?? 0) && (started ?? 0) > 0 ? started : undefined
+    );
   }
 
   private ensureForwardedMcpSession(world: WooWorld, request: Request): void {
@@ -3512,8 +3614,14 @@ export class PersistentObjectDO {
         active_scope: request.headers.get("x-woo-internal-active-scope"),
         current_location: request.headers.get("x-woo-internal-current-location")
       }),
-      request.headers.get("x-woo-internal-apikey-id")
+      request.headers.get("x-woo-internal-apikey-id"),
+      Number(request.headers.get("x-woo-internal-started") ?? 0)
     );
+    const displayName = request.headers.get("x-woo-internal-display-name");
+    if (displayName && world.objects.has(actor as ObjRef) && world.object(actor as ObjRef).name === actor) {
+      world.object(actor as ObjRef).name = displayName;
+      world.markObjectChanged(actor as ObjRef);
+    }
   }
 
   private ensureInternalActor(world: WooWorld, actor: ObjRef): void {
@@ -3533,7 +3641,7 @@ export class PersistentObjectDO {
     return world.auth(token);
   }
 
-  private async registerSessionRoute(session: Session, options: { mcpShard?: string | null } = {}): Promise<void> {
+  private async registerSessionRoute(session: Session, options: { mcpShard?: string | null } = {}, world: WooWorld | null = this.world): Promise<void> {
     try {
       const id = this.env.DIRECTORY.idFromName(DIRECTORY_HOST);
       const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/register-session`, {
@@ -3542,12 +3650,15 @@ export class PersistentObjectDO {
         body: JSON.stringify({
           session_id: session.id,
           actor: session.actor,
+          started: session.started,
           expires_at: session.expiresAt,
           token_class: session.tokenClass,
           active_scope: session.activeScope,
           current_location: session.activeScope,
           apikey_id: session.apikeyId ?? null,
-          mcp_shard: options.mcpShard ?? null
+          mcp_shard: options.mcpShard ?? null,
+          display_name: displayNameForDirectorySession(world, session.actor),
+          focus_list: focusListForDirectorySession(world, session.actor)
         })
       }));
       await this.env.DIRECTORY.get(id).fetch(request);
@@ -3573,7 +3684,7 @@ export class PersistentObjectDO {
     const sessionId = response.headers.get("mcp-session-id") ?? request.headers.get("mcp-session-id");
     if (!sessionId) return;
     const session = world.sessions.get(sessionId);
-    if (session) await this.registerSessionRoute(session, { mcpShard });
+    if (session) await this.registerSessionRoute(session, { mcpShard }, world);
   }
 
   private async unregisterSessionRoute(sessionId: string): Promise<void> {
@@ -3650,7 +3761,7 @@ export class PersistentObjectDO {
         const session = world.sessions.get(sessionId);
         if (!session) return;
         this.mirrorResultRoomToSession(world, session, result);
-        await this.registerSessionRoute(session);
+        await this.registerSessionRoute(session, {}, world);
       }
     };
   }
@@ -3680,7 +3791,8 @@ export class PersistentObjectDO {
           active_scope: request.headers.get("x-woo-internal-active-scope"),
           current_location: request.headers.get("x-woo-internal-current-location")
         }) as ObjRef | null,
-        request.headers.get("x-woo-internal-apikey-id")
+        request.headers.get("x-woo-internal-apikey-id"),
+        Number(request.headers.get("x-woo-internal-started") ?? 0)
       );
     }
     const header = request.headers.get("authorization") ?? "";
@@ -4189,7 +4301,7 @@ export class PersistentObjectDO {
   private async v2GatewayAuthorityPayload(
     world: WooWorld,
     extraObjectIds: Iterable<ObjRef>,
-    options: { tolerateRemoteFailures?: boolean; useCommitScopeSnapshotForRemoteAuthority?: boolean } = {}
+    options: { tolerateRemoteFailures?: boolean; useCommitScopeSnapshotForRemoteAuthority?: boolean; directorySessionScopes?: readonly ObjRef[] } = {}
   ): Promise<ReturnType<typeof executorAuthorityPayload>> {
     // `tolerateRemoteFailures: true` allows the per-envelope refresh path to
     // omit slices for cold/unreachable remote hosts and rely on the
@@ -4199,10 +4311,16 @@ export class PersistentObjectDO {
     // warm opens). Open paths instead let the timeout propagate so the
     // caller fails loudly and the client retries against a warm satellite.
     const ids = Array.from(new Set(Array.from(extraObjectIds).filter((id): id is ObjRef => typeof id === "string" && id.length > 0)));
+    const localHost = this.durableHostKey();
+    const directorySessionScopes = options.directorySessionScopes ?? [];
+    const directoryScopeSessions = isMcpGatewayShardHost(localHost)
+      ? await this.loadDirectorySessionsForScopes(directorySessionScopes)
+      : [];
     const local = executorAuthorityPayload(world, ids);
     const localObjectIds = authoritySliceObjectIds(local.authority);
-    const localHost = this.durableHostKey();
-    const routesById = new Map(world.objectRoutes().map((route) => [route.id, route] as const));
+    const routesById = isMcpGatewayShardHost(localHost)
+      ? new Map<ObjRef, { id: ObjRef; host: string; anchor: ObjRef | null }>()
+      : new Map(world.objectRoutes().map((route) => [route.id, route] as const));
     const resolveHost = async (id: ObjRef, fallbackHost: string): Promise<string> => {
       const localRoute = routesById.get(id) ?? null;
       if (localRoute) {
@@ -4324,6 +4442,15 @@ export class PersistentObjectDO {
           return host === undefined || !omittedHosts.has(host);
         });
     const slices: SerializedAuthoritySlice[] = [localOnlyAuthority];
+    if (directoryScopeSessions.length > 0) {
+      // Sparse MCP shard worlds intentionally do not mirror every co-present
+      // session. For room-level reads such as `who`, recover the Directory
+      // session set and patch only actor stubs plus scope live/contents cells.
+      // Scope lineage/verbs must stay owner authority: a full scope stub here
+      // would overwrite `$chatroom` with sparse `$space` and erase inherited
+      // direction verbs on the real satellite.
+      slices.push(mcpGatewayDirectorySessionCellSlice(directoryScopeSessions));
+    }
     for (const { host, response } of remoteSlices) {
       if (!response) continue;
       const accepted = new Set<ObjRef>();
@@ -4336,7 +4463,10 @@ export class PersistentObjectDO {
       }
       slices.push(filterSerializedAuthoritySliceObjects(response.authority, (id) => accepted.has(id)));
     }
-    const authority = combineSerializedAuthoritySlices(local.authority.sessions, slices);
+    const authority = combineSerializedAuthoritySlices(
+      mergeSerializedSessions(local.authority.sessions, directoryScopeSessions),
+      slices
+    );
     // Session rows are live authority too: if we ship a session whose actor row
     // is absent from the same merged slice, CommitScopeDO replaces its session
     // set with a presence entry that catalog roster verbs cannot dereference.
@@ -4554,7 +4684,7 @@ export class PersistentObjectDO {
     const session = world.sessions.get(sessionId);
     if (session) {
       this.mirrorResultRoomToSession(world, session, reply.body.outcome.result ?? reply.body.transcript.result);
-      await this.registerSessionRoute(session);
+      await this.registerSessionRoute(session, {}, world);
     }
     world.recordMetric({
       kind: "gateway_projection_apply",
@@ -5579,30 +5709,12 @@ function hostSeedBytesKey(env: Env, host: ObjRef, digest: string): string {
   return `seed:${hostSeedKvNamespace(env)}:${host}:${digest}`;
 }
 
-function mcpGatewayWorldPointerKey(env: Env): string {
-  return `mcp-gateway-world-current:${hostSeedKvNamespace(env)}`;
-}
-
-function mcpGatewayWorldBytesKey(env: Env, digest: string): string {
-  return `mcp-gateway-world:${hostSeedKvNamespace(env)}:${digest}`;
-}
-
 function bytecodeFreeHostSeedKvPayload(seed: SeedWorld, digest: string): Record<string, unknown> {
   const stripped = stripBytecodeForKv(seed);
   return {
     kind: HOST_SEED_KV_KIND,
     digest,
     seed: stripped.world,
-    bytecode_hashes: stripped.bytecodeHashes
-  };
-}
-
-function bytecodeFreeMcpGatewayWorldKvPayload(world: SerializedWorld, digest: string): Record<string, unknown> {
-  const stripped = stripBytecodeForKv(world);
-  return {
-    kind: MCP_GATEWAY_WORLD_KV_KIND,
-    digest,
-    world: stripped.world,
     bytecode_hashes: stripped.bytecodeHashes
   };
 }
@@ -5629,26 +5741,6 @@ function restoreHostSeedKvPayload(
       : { ok: false, reason: "incomplete_legacy_bytecode" };
   }
   return { ok: false, reason: "invalid_payload" };
-}
-
-function restoreMcpGatewayWorldKvPayload(
-  value: unknown,
-  expectedDigest: string,
-  localSeedSource: SerializedWorld | null,
-  env: Env,
-  emitMetric?: (event: MetricEvent) => void
-): KvRestoreResult<SerializedWorld> {
-  if (isSerializedWorld(value)) {
-    return serializedWorldHasCompleteBytecode(value)
-      ? { ok: true, value }
-      : { ok: false, reason: "incomplete_legacy_bytecode" };
-  }
-  if (!isPlainRecord(value)) return { ok: false, reason: "invalid_payload" };
-  if (value.kind !== MCP_GATEWAY_WORLD_KV_KIND) return { ok: false, reason: "invalid_payload" };
-  if (value.digest !== expectedDigest) return { ok: false, reason: "digest_mismatch" };
-  if (!isSerializedWorld(value.world)) return { ok: false, reason: "invalid_payload" };
-  if (!isBytecodeHashEntries(value.bytecode_hashes)) return { ok: false, reason: "invalid_bytecode_hashes" };
-  return restoreBytecodeFreeWorld(value.world, value.bytecode_hashes, localSeedSource, env, emitMetric);
 }
 
 function stripBytecodeForKv<T extends SerializedWorld>(world: T): { world: T; bytecodeHashes: BytecodeHashEntry[] } {
@@ -5935,8 +6027,10 @@ function v2SocketEnvelopeAuthorityObjectIds(encoded: string, fallbackScope: ObjR
 
 function localActorAuthorityPreserveIds(world: WooWorld, explicitIds: readonly ObjRef[]): Set<ObjRef> {
   const preserve = new Set<ObjRef>();
+  const sessionActors = new Set(Array.from(world.sessions.values(), (session) => session.actor));
   for (const id of explicitIds) {
-    if (!world.objects.has(id) || !world.isDescendantOf(id, "$actor")) continue;
+    if (!world.objects.has(id)) continue;
+    if (!sessionActors.has(id) && !world.isDescendantOf(id, "$actor")) continue;
     let cursor: ObjRef | null = id;
     const seen = new Set<ObjRef>();
     while (cursor && world.objects.has(cursor) && !seen.has(cursor)) {
@@ -5972,6 +6066,231 @@ function mcpGatewayShardHost(env: Env, sessionId: string): string {
 function mcpGatewayShardCount(env: Env): number {
   const raw = Number(env.WOO_MCP_GATEWAY_SHARDS ?? DEFAULT_MCP_GATEWAY_SHARDS);
   return Number.isInteger(raw) && raw > 0 && raw <= 256 ? raw : DEFAULT_MCP_GATEWAY_SHARDS;
+}
+
+let mcpGatewayActorSupportObjectsCache: SerializedObject[] | null = null;
+
+function mcpGatewayActorSupportObjects(): SerializedObject[] {
+  if (!mcpGatewayActorSupportObjectsCache) {
+    const snapshot = createWorld({ catalogs: false }).exportWorld();
+    mcpGatewayActorSupportObjectsCache = snapshot.objects
+      .filter((obj) => MCP_GATEWAY_ACTOR_SUPPORT_IDS.has(obj.id))
+      .map((obj) => {
+        const clone = structuredClone(obj) as SerializedObject;
+        clone.children = clone.children.filter((id) => MCP_GATEWAY_ACTOR_SUPPORT_IDS.has(id));
+        clone.contents = [];
+        return clone;
+      })
+      .sort((a, b) => a.id.localeCompare(b.id));
+  }
+  return mcpGatewayActorSupportObjectsCache.map((obj) => structuredClone(obj) as SerializedObject);
+}
+
+function mcpGatewayShardSerializedWorld(sessions: readonly DirectorySerializedSession[]): SerializedWorld {
+  const now = Date.now();
+  const objects = new Map<ObjRef, SerializedObject>();
+  // Shards must expose the actor's own MCP control tools (wait/focus/list)
+  // immediately after cold-load. Carry only the universal actor lineage that
+  // defines those verbs, not the full gateway world.
+  for (const obj of mcpGatewayActorSupportObjects()) objects.set(obj.id, obj);
+  const scopeContents = new Map<ObjRef, Set<ObjRef>>();
+  const actors = new Map<ObjRef, { activeScope: ObjRef | null; displayName: string | null; focusList: ObjRef[]; primaryStarted: number; primarySession: string }>();
+  for (const session of sessions) {
+    const activeScope = session.activeScope ?? session.currentLocation ?? null;
+    const actor = actors.get(session.actor) ?? { activeScope, displayName: session.displayName ?? null, focusList: [], primaryStarted: session.started, primarySession: session.id };
+    if (!actor.displayName && session.displayName) actor.displayName = session.displayName;
+    for (const id of session.focusList ?? []) {
+      if (!actor.focusList.includes(id) && actor.focusList.length < 32) actor.focusList.push(id);
+    }
+    if (session.started < actor.primaryStarted || (session.started === actor.primaryStarted && session.id < actor.primarySession)) {
+      actor.activeScope = activeScope;
+      actor.primaryStarted = session.started;
+      actor.primarySession = session.id;
+    }
+    actors.set(session.actor, actor);
+    if (activeScope) {
+      const contents = scopeContents.get(activeScope) ?? new Set<ObjRef>();
+      contents.add(session.actor);
+      scopeContents.set(activeScope, contents);
+    }
+  }
+  for (const [actor, stub] of actors) {
+    objects.set(actor, mcpGatewayStubObject({
+      id: actor,
+      name: stub.displayName ?? actor,
+      parent: "$player",
+      owner: actor,
+      location: stub.activeScope,
+      properties: stub.focusList.length > 0 ? [["focus_list", stub.focusList]] : [],
+      now
+    }));
+  }
+  for (const [scope, contents] of scopeContents) {
+    if (objects.has(scope)) continue;
+    objects.set(scope, mcpGatewayStubObject({
+      id: scope,
+      name: scope,
+      parent: "$space",
+      owner: "$wiz",
+      location: null,
+      contents: Array.from(contents).sort(),
+      now
+    }));
+  }
+  return {
+    version: 1,
+    objectCounter: 1,
+    parkedTaskCounter: 1,
+    sessionCounter: 1,
+    objects: Array.from(objects.values()).sort((a, b) => a.id.localeCompare(b.id)),
+    sessions: sessions.map((session) => structuredClone(session) as SerializedSession),
+    logs: [],
+    snapshots: [],
+    parkedTasks: [],
+    tombstones: []
+  };
+}
+
+function mcpGatewayDirectorySessionCellSlice(sessions: readonly DirectorySerializedSession[]): SerializedAuthorityCellSlice {
+  const snapshot = mcpGatewayShardSerializedWorld(sessions);
+  const sessionActors = new Set<ObjRef>(sessions.map((session) => session.actor));
+  const actorObjects = snapshot.objects.filter((obj) => sessionActors.has(obj.id));
+  const actorLineagePages: ShadowStatePage[] = actorObjects.map((obj) => shadowObjectLineagePage(obj));
+  const scopeLivePages: ShadowStatePage[] = snapshot.objects
+    .filter((obj) => !sessionActors.has(obj.id) && obj.contents.length > 0)
+    .map((obj) => shadowObjectLivePage(obj));
+  const inlinePages = [...actorLineagePages, ...scopeLivePages];
+  return {
+    kind: "woo.authority_slice.cells.shadow.v1",
+    sessions: [],
+    page_refs: inlinePages.map((page) => shadowStatePageRef(page, true)),
+    inline_pages: inlinePages,
+    counters: {
+      objectCounter: 1,
+      parkedTaskCounter: 1,
+      sessionCounter: 1
+    },
+    tombstones: [],
+    source_object_count: actorObjects.length + scopeLivePages.length
+  };
+}
+
+function mcpGatewayStubObject(input: {
+  id: ObjRef;
+  name: string;
+  parent: ObjRef | null;
+  owner: ObjRef;
+  location: ObjRef | null;
+  contents?: ObjRef[];
+  properties?: [string, WooValue][];
+  now: number;
+}): SerializedObject {
+  return {
+    id: input.id,
+    name: input.name,
+    parent: input.parent,
+    owner: input.owner,
+    location: input.location,
+    anchor: null,
+    flags: {},
+    created: input.now,
+    modified: input.now,
+    propertyDefs: [],
+    properties: input.properties ?? [],
+    propertyVersions: input.properties?.map(([name], index) => [name, index + 1] as [string, number]) ?? [],
+    verbs: [],
+    children: [],
+    contents: input.contents ?? [],
+    eventSchemas: []
+  };
+}
+
+function mergeSerializedSessions(
+  base: readonly SerializedSession[],
+  overlay: readonly SerializedSession[]
+): SerializedSession[] {
+  const byId = new Map<string, SerializedSession>();
+  for (const session of base) byId.set(session.id, structuredClone(session) as SerializedSession);
+  for (const session of overlay) byId.set(session.id, structuredClone(session) as SerializedSession);
+  return Array.from(byId.values()).sort((a, b) => a.id.localeCompare(b.id));
+}
+
+function cloneDirectorySerializedSessions(sessions: readonly DirectorySerializedSession[]): DirectorySerializedSession[] {
+  return sessions.map((session) => ({
+    ...session,
+    ...(session.displayName !== undefined ? { displayName: session.displayName } : {}),
+    ...(session.focusList ? { focusList: [...session.focusList] } : {})
+  }));
+}
+
+function serializedSessionFromDirectoryRoute(value: unknown): DirectorySerializedSession | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const id = typeof record.session_id === "string"
+    ? record.session_id
+    : typeof record.id === "string"
+      ? record.id
+      : "";
+  const actor = typeof record.actor === "string" ? record.actor as ObjRef : null;
+  const expiresAt = Number(record.expires_at ?? record.expiresAt ?? 0);
+  if (!id || !actor || !Number.isFinite(expiresAt) || expiresAt <= 0) return null;
+  const activeScope = sessionActiveScopeFromRecord({
+    active_scope: record.active_scope,
+    current_location: record.current_location,
+    activeScope: record.activeScope,
+    currentLocation: record.currentLocation
+  });
+  return {
+    id,
+    actor,
+    started: finitePositiveNumber(record.started) ?? finitePositiveNumber(record.updated_at) ?? Date.now(),
+    expiresAt,
+    lastDetachAt: null,
+    tokenClass: record.token_class === "guest" || record.token_class === "apikey" ? record.token_class : "bearer",
+    activeScope,
+    currentLocation: activeScope,
+    ...(typeof record.apikey_id === "string" && record.apikey_id.length > 0 ? { apikeyId: record.apikey_id } : {}),
+    displayName: typeof record.display_name === "string" && record.display_name.length > 0 ? record.display_name : null,
+    focusList: focusListFromUnknown(record.focus_list)
+  };
+}
+
+function displayNameForDirectorySession(world: WooWorld | null, actor: ObjRef): string | null {
+  if (!world?.objects.has(actor)) return null;
+  const propName = world.propOrNull(actor, "name");
+  if (typeof propName === "string" && propName.length > 0) return propName;
+  const objectName = world.object(actor).name;
+  return objectName && objectName !== actor ? objectName : null;
+}
+
+function focusListForDirectorySession(world: WooWorld | null, actor: ObjRef): ObjRef[] {
+  if (!world?.objects.has(actor)) return [];
+  const raw = world.propOrNull(actor, "focus_list");
+  return focusListFromUnknown(raw);
+}
+
+function focusListFromUnknown(value: unknown): ObjRef[] {
+  let raw: unknown = value;
+  if (typeof value === "string") {
+    try {
+      raw = JSON.parse(value) as unknown;
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(raw)) return [];
+  const out: ObjRef[] = [];
+  for (const item of raw) {
+    if (typeof item !== "string" || item.length === 0 || out.includes(item as ObjRef)) continue;
+    out.push(item as ObjRef);
+    if (out.length >= 32) break;
+  }
+  return out;
+}
+
+function finitePositiveNumber(value: unknown): number | null {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : null;
 }
 
 function stableHash(input: string): number {

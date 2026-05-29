@@ -81,7 +81,7 @@ CREATE TABLE verb (
   bytecode     TEXT,               -- JSON TinyBytecode; NULL when kind="native"
   native       TEXT,               -- handler key for native verbs; NULL otherwise
   line_map     TEXT NOT NULL,      -- JSON
-  flags        TEXT NOT NULL,      -- JSON {direct_callable?, skip_presence_check?}
+  flags        TEXT NOT NULL,      -- JSON {direct_callable?, skip_presence_check?, tool_exposed?, reads_room_presence?}
   version      INTEGER NOT NULL DEFAULT 1,
   PRIMARY KEY (object_id, slot)
 );

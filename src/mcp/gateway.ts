@@ -83,7 +83,7 @@ export type McpV2ClientHooks = {
   envelope: (scope: ObjRef, body: McpV2EnvelopeBody) => Promise<McpV2EnvelopeResult>;
   authorityPayload?: (
     extraObjectIds: ObjRef[],
-    options?: { useCommitScopeSnapshotForRemoteAuthority?: boolean }
+    options?: { useCommitScopeSnapshotForRemoteAuthority?: boolean; directorySessionScopes?: ObjRef[] }
   ) => Promise<ReturnType<typeof executorAuthorityPayload>>;
   executionCapsuleOpen?: boolean;
 };
@@ -180,8 +180,8 @@ export class McpGateway {
 
   constructor(private world: WooWorld, private options: McpGatewayOptions = {}) {
     const dispatch = options.v2 ? {
-      direct: async (sessionId: string, actor: ObjRef, target: ObjRef, verb: string, args: WooValue[], scope?: ObjRef | null, persistence?: "durable" | "live") =>
-        await this.invokeV2Direct(sessionId, actor, target, verb, args, scope, persistence),
+      direct: async (sessionId: string, actor: ObjRef, target: ObjRef, verb: string, args: WooValue[], scope?: ObjRef | null, persistence?: "durable" | "live", options?: { directorySessionScopes?: ObjRef[] }) =>
+        await this.invokeV2Direct(sessionId, actor, target, verb, args, scope, persistence, options),
       call: async (sessionId: string, actor: ObjRef, space: ObjRef, message: Message) =>
         await this.invokeV2Call(sessionId, actor, space, message)
     } satisfies McpDispatchHooks : options.dispatch;
@@ -540,12 +540,13 @@ export class McpGateway {
     verb: string,
     args: WooValue[],
     scope?: ObjRef | null,
-    persistence: "durable" | "live" = "durable"
+    persistence: "durable" | "live" = "durable",
+    options: { directorySessionScopes?: ObjRef[] } = {}
   ): Promise<DirectResultFrame | ErrorFrame> {
     // Direct calls record under their live audience when there is one, and
     // under the shadow direct-call scope (`#-1`) otherwise. McpHost passes the
     // tool's enclosing scope so the CommitScopeDO route matches the transcript.
-    const frame = await this.invokeV2(sessionId, actor, "direct", target, verb, args, scope ?? "#-1", persistence);
+    const frame = await this.invokeV2(sessionId, actor, "direct", target, verb, args, scope ?? "#-1", persistence, options);
     if (frame.op === "applied") throw new Error(`v2 direct call returned applied frame: ${target}:${verb}`);
     return frame;
   }
@@ -569,7 +570,8 @@ export class McpGateway {
     verb: string,
     args: WooValue[],
     explicitScope?: ObjRef | null,
-    persistence: "durable" | "live" = "durable"
+    persistence: "durable" | "live" = "durable",
+    options: { directorySessionScopes?: ObjRef[] } = {}
   ): Promise<AppliedFrame | DirectResultFrame | ErrorFrame> {
     const hooks = this.options.v2;
     if (!hooks) throw new Error("MCP v2 client hooks are not configured");
@@ -599,7 +601,10 @@ export class McpGateway {
       authorityPayload: async (_submitScope, extraObjectIds) => {
         const useCommitScopeSnapshotForRemoteAuthority = authorityRefreshAttempts === 0;
         authorityRefreshAttempts += 1;
-        const payload = await this.v2AuthorityPayload(extraObjectIds, { useCommitScopeSnapshotForRemoteAuthority });
+        const payload = await this.v2AuthorityPayload(extraObjectIds, {
+          useCommitScopeSnapshotForRemoteAuthority,
+          directorySessionScopes: options.directorySessionScopes ?? []
+        });
         const client = this.v2Scopes.get(scope);
         if (client) this.mergeV2AuthorityIntoScopeClient(client, payload.authority);
         return payload;
@@ -766,7 +771,7 @@ export class McpGateway {
 
   private async v2AuthorityPayload(
     extraObjectIds: ObjRef[],
-    options: { useCommitScopeSnapshotForRemoteAuthority?: boolean } = {}
+    options: { useCommitScopeSnapshotForRemoteAuthority?: boolean; directorySessionScopes?: ObjRef[] } = {}
   ): Promise<ReturnType<typeof executorAuthorityPayload>> {
     return await (
       this.options.v2?.authorityPayload?.(extraObjectIds, options)

@@ -38,6 +38,7 @@ export type ToolSurfaceProjectionRow = {
     aliases?: string[];
     arg_spec?: Record<string, WooValue>;
     direct?: boolean;
+    reads_room_presence?: boolean;
     source?: string;
     enclosingSpace?: ObjRef | null;
   }>;
@@ -598,6 +599,7 @@ function browserToolRow(row: ToolSurfaceProjectionRow, head: ShadowScopeHead): B
       aliases: verb.aliases ?? [],
       arg_spec: verb.arg_spec ?? {},
       direct: verb.direct === true,
+      ...(verb.reads_room_presence === true ? { reads_room_presence: true } : {}),
       source: verb.source ?? "projection",
       enclosingSpace: verb.enclosingSpace ?? null,
       source_rows: row.source_rows

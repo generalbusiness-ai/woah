@@ -370,7 +370,9 @@ Repair/update remains an explicit sequenced operation through
 Catalog `perms` use the same authoring shorthand as source: `rxd` means install
 with normalized `perms: "rx"` and `direct_callable: true`. Catalogs may also set
 `direct_callable` explicitly; the explicit metadata field is the authoritative
-stored form after install.
+stored form after install. Catalogs may also set `reads_room_presence: true` on
+verbs that render room/workspace roster state; MCP sparse gateway shards use
+that metadata to seed live Directory presence without hardcoding command names.
 
 Class and feature objects may declare lifecycle `flags` for ordinary
 authoring/template behavior. `fertile: true` means instances may be created
@@ -522,6 +524,11 @@ A verb is exposed as an agent tool only if **either**:
 
 - The catalog's `agent_manifest.json` lists it explicitly with a description and input schema, or
 - The verb metadata carries `tool_exposed: true` (a separate flag from `direct_callable`). Catalogs that prefer per-verb annotation over a separate manifest opt in this way; the runtime then auto-generates a tool manifest entry from the verb's `arg_spec` and accompanying doc-comment.
+
+`reads_room_presence: true` is orthogonal to exposure. It does not advertise a
+tool or grant authority; it only says the verb's execution reads roster
+presence and therefore needs a sparse gateway to include current session stubs
+for the relevant room scopes.
 
 A catalog with neither `agent_manifest.json` nor any `tool_exposed: true` verbs is invisible to agent tool discovery — that's the safe default. Operators who want to expose a catalog's tools but lack publisher cooperation can install a thin local catalog that wraps the upstream's verbs with `tool_exposed: true` annotations.
 

@@ -1165,7 +1165,9 @@ describe("McpHost", () => {
 
     await host.invokeTool(session.actor, session.id, tool, []);
 
-    expect(direct).toHaveBeenCalledWith(session.id, session.actor, session.actor, "focus_list", [], "the_chatroom", "durable");
+    expect(direct).toHaveBeenCalledWith(session.id, session.actor, session.actor, "focus_list", [], "the_chatroom", "durable", {
+      directorySessionScopes: []
+    });
     expect(refreshSpy).toHaveBeenCalledTimes(1);
     expect(metrics).toContainEqual(expect.objectContaining({
       kind: "mcp_tool_refresh_taken",

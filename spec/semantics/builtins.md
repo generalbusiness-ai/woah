@@ -62,12 +62,12 @@ deliberate woo extensions. The differences:
   list-shaped so callers can walk uniformly.
 - **`verb_info(obj, descriptor)`** returns an *extended* map with
   `{definer, slot, name, aliases, owner, perms, arg_spec, version,
-  direct_callable, tool_exposed, source_hash}`. LambdaMOO's
+  direct_callable, tool_exposed, reads_room_presence, source_hash}`. LambdaMOO's
   `{owner, perms, names}` is folded in (woo splits `name` + `aliases` rather
   than encoding them as a single space-separated string), and
   woo-specific verb fields (`arg_spec`, `direct_callable`, `tool_exposed`,
-  `version`, `source_hash`) appear alongside. There is no separate
-  `verb_args` / `verb_meta` primitive — woo combines info+args into one map.
+  `reads_room_presence`, `version`, `source_hash`) appear alongside. There is no
+  separate `verb_args` / `verb_meta` primitive — woo combines info+args into one map.
 - **`add_verb(obj, info)`** and **`set_verb_info(obj, descriptor, info)`**
   take a single `info` map covering both LambdaMOO's `info` (owner, perms,
   names) and `args` (arg_spec). `name` in info is required for `add_verb`

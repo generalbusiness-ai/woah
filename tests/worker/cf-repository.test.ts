@@ -152,8 +152,6 @@ function createHostSeedKvHarness() {
   const kvNamespace = (): string => `${localCatalogBundleFingerprint(parseAutoInstallCatalogs(env.WOO_AUTO_INSTALL_CATALOGS))}:${LOCAL_CATALOG_BUNDLE_REPAIR_EPOCH}`;
   const hostSeedPointerKey = (host: string): string => `seed-current:${kvNamespace()}:${host}`;
   const hostSeedBytesKey = (host: string, digest: string): string => `seed:${kvNamespace()}:${host}:${digest}`;
-  const mcpGatewayPointerKey = (): string => `mcp-gateway-world-current:${kvNamespace()}`;
-  const mcpGatewayBytesKey = (digest: string): string => `mcp-gateway-world:${kvNamespace()}:${digest}`;
 
   const drain = async (name: string): Promise<void> => {
     await wooStates.get(name)?.drainWaitUntil();
@@ -179,26 +177,6 @@ function createHostSeedKvHarness() {
     return { pointer: pointer!, bytesKey, payload: JSON.parse(raw!) as Record<string, unknown> };
   };
 
-  const publishMcpGatewayWorld = async (shard: string): Promise<{ pointer: string; bytesKey: string; payload: Record<string, unknown> }> => {
-    const request = await signInternalRequest(env, new Request("https://woo.internal/__internal/mcp-gateway-world", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-woo-host-key": "world"
-      },
-      body: JSON.stringify({ shard })
-    }));
-    const response = await wooNamespace.get({ name: "world" }).fetch(request);
-    if (!response.ok) throw new Error(`mcp gateway snapshot publish failed: ${response.status} ${await response.text()}`);
-    await drain("world");
-    const pointer = await kv.get(mcpGatewayPointerKey(), "text");
-    expect(pointer).toBeTruthy();
-    const bytesKey = mcpGatewayBytesKey(pointer!);
-    const raw = await kv.get(bytesKey, "text");
-    expect(raw).toBeTruthy();
-    return { pointer: pointer!, bytesKey, payload: JSON.parse(raw!) as Record<string, unknown> };
-  };
-
   const close = (): void => {
     directoryState.close();
     for (const state of wooStates.values()) state.close();
@@ -212,7 +190,7 @@ function createHostSeedKvHarness() {
     return object;
   };
 
-  return { env, kv, wooNamespace, wooObjects, hostSeedFetches, mcpGatewayWorldFetches, drain, publishHostSeed, publishMcpGatewayWorld, reloadHost, close };
+  return { env, kv, directoryState, wooNamespace, wooObjects, hostSeedFetches, mcpGatewayWorldFetches, drain, publishHostSeed, reloadHost, close };
 }
 
 describe("v2 Worker fan-out helpers", () => {
@@ -2935,6 +2913,26 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(who.result.isError, JSON.stringify(who.result.structuredContent)).not.toBe(true);
       const rosterIds = (who.result.structuredContent.result as Array<{ id?: unknown }>).map((row) => row.id);
       expect(rosterIds, JSON.stringify(who.result.structuredContent)).toEqual(expect.arrayContaining([aliceActor, bobActor]));
+      const rosterById = new Map((who.result.structuredContent.result as Array<{ id?: unknown; name?: unknown }>).map((row) => [row.id, row.name]));
+      expect(rosterById.get(aliceActor), JSON.stringify(who.result.structuredContent)).not.toBe(aliceActor);
+      expect(rosterById.get(bobActor), JSON.stringify(who.result.structuredContent)).not.toBe(bobActor);
+
+      const looked = await mcp({
+        jsonrpc: "2.0",
+        id: 33,
+        method: "tools/call",
+        params: {
+          name: "woo_call",
+          arguments: { object: "the_deck", verb: "look", args: [] }
+        }
+      }, { "mcp-session-id": alice });
+      expect(looked.result.isError, JSON.stringify(looked.result.structuredContent)).not.toBe(true);
+      const lookResult = looked.result.structuredContent.result as { roster?: Array<{ id?: unknown; name?: unknown }> };
+      const lookRoster = Array.isArray(lookResult.roster) ? lookResult.roster : [];
+      const lookRosterById = new Map(lookRoster.map((row) => [row.id, row.name]));
+      expect(Array.from(lookRosterById.keys()), JSON.stringify(looked.result.structuredContent)).toEqual(expect.arrayContaining([aliceActor, bobActor]));
+      expect(lookRosterById.get(aliceActor), JSON.stringify(looked.result.structuredContent)).not.toBe(aliceActor);
+      expect(lookRosterById.get(bobActor), JSON.stringify(looked.result.structuredContent)).not.toBe(bobActor);
     } finally {
       logSpy.mockRestore();
       directoryState.close();
@@ -4014,30 +4012,139 @@ describe("CFObjectRepository production-shape coverage", () => {
     }
   });
 
-  it("stores MCP gateway snapshot KV entries without bytecode and restores from the local catalog reservoir", async () => {
+  it("cold-loads MCP gateway shards from Directory session rows without a world snapshot", async () => {
     const harness = createHostSeedKvHarness();
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     try {
-      const { payload } = await harness.publishMcpGatewayWorld("mcp-gateway-0");
-      expect(payload).toMatchObject({
-        kind: "woo.mcp_gateway_world.kv.bytecode_free.v1",
-        digest: expect.any(String),
-        world: expect.any(Object),
-        bytecode_hashes: expect.any(Array)
-      });
-      expect(payload.bytecode_hashes as unknown[]).not.toHaveLength(0);
-      expect(hasJsonKey(payload.world, "bytecode")).toBe(false);
+      const shard = "mcp-gateway-0";
+      const actor = "cf_mcp_directory_actor" as ObjRef;
+      const oldSessionId = "z-cf-mcp-directory-old";
+      const newSessionId = "a-cf-mcp-directory-new";
+      const expiresAt = Date.now() + 60_000;
+      const register = await signInternalRequest(harness.env, new Request("https://woo.internal/register-session", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          session_id: oldSessionId,
+          actor,
+          started: 1_000,
+          expires_at: expiresAt,
+          token_class: "guest",
+          active_scope: "the_deck",
+          current_location: "the_deck",
+          mcp_shard: shard,
+          display_name: "Directory Actor",
+          focus_list: ["the_pinboard"]
+        })
+      }));
+      const registered = await harness.env.DIRECTORY.get(harness.env.DIRECTORY.idFromName("directory")).fetch(register);
+      expect(registered.ok, await registered.clone().text()).toBe(true);
+      const registerNewer = await signInternalRequest(harness.env, new Request("https://woo.internal/register-session", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          session_id: newSessionId,
+          actor,
+          started: 2_000,
+          expires_at: expiresAt,
+          token_class: "guest",
+          active_scope: "the_deck",
+          current_location: "the_deck",
+          mcp_shard: shard,
+          display_name: "Directory Actor",
+          focus_list: ["the_pinboard"]
+        })
+      }));
+      const registeredNewer = await harness.env.DIRECTORY.get(harness.env.DIRECTORY.idFromName("directory")).fetch(registerNewer);
+      expect(registeredNewer.ok, await registeredNewer.clone().text()).toBe(true);
+      const fillerActor = "cf_mcp_directory_filler" as ObjRef;
+      for (let i = 0; i < 2050; i += 1) {
+        harness.directoryState.storage.sql.exec(
+          "INSERT OR REPLACE INTO session_route(session_id, actor, started, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          `bulk-cf-mcp-directory-${String(i).padStart(4, "0")}`,
+          fillerActor,
+          10_000 + i,
+          expiresAt,
+          "guest",
+          "the_deck",
+          null,
+          shard,
+          "[]",
+          Date.now()
+        );
+      }
+      const directoryIndexes = harness.directoryState.storage.sql.exec("PRAGMA index_list(session_route)").toArray().map((row) => String(row.name ?? ""));
+      expect(directoryIndexes).toContain("session_route_mcp_shard_session_id");
 
       harness.mcpGatewayWorldFetches.length = 0;
-      const healthz = await harness.wooNamespace.get({ name: "mcp-gateway-0" }).fetch(await signInternalRequest(harness.env, new Request("https://woo.internal/healthz", {
-        headers: { "x-woo-host-key": "mcp-gateway-0" }
+      const healthz = await harness.wooNamespace.get({ name: shard }).fetch(await signInternalRequest(harness.env, new Request("https://woo.internal/healthz", {
+        headers: { "x-woo-host-key": shard }
       })));
       expect(healthz.ok).toBe(true);
       expect(harness.mcpGatewayWorldFetches).toEqual([]);
-      const shardWorld = await (harness.wooObjects.get("mcp-gateway-0") as any).getWorld("mcp-gateway-0") as WooWorld;
-      const verb = firstBytecodeVerb(shardWorld);
-      expect(verb?.kind).toBe("bytecode");
-      if (verb?.kind === "bytecode") expect(verb.bytecode.ops.length).toBeGreaterThan(0);
+      const shardObject = harness.wooObjects.get(shard) as any;
+      const shardWorld = await shardObject.getWorld(shard) as WooWorld;
+      expect(shardWorld.sessions.size).toBe(2052);
+      expect(shardWorld.objects.size).toBe(7);
+      expect(Array.from(shardWorld.objects.keys()).sort()).toEqual(["$actor", "$player", "$root", "$thing", "cf_mcp_directory_actor", "cf_mcp_directory_filler", "the_deck"]);
+      expect(shardWorld.sessions.get(oldSessionId)).toMatchObject({ actor, started: 1_000, activeScope: "the_deck" });
+      expect(shardWorld.sessions.get(newSessionId)).toMatchObject({ actor, started: 2_000, activeScope: "the_deck" });
+      expect(shardWorld.primarySessionForActor(actor)?.id).toBe(oldSessionId);
+      expect(shardWorld.object(actor).name).toBe("Directory Actor");
+      expect(shardWorld.propOrNull(actor, "focus_list")).toEqual(["the_pinboard"]);
+      const gateway = shardObject.getMcpGateway(shardWorld) as any;
+      expect(gateway.host.queueCount()).toBe(2052);
+      await expect(gateway.host.listTools(actor, { scope: "active", limit: 100, sessionId: oldSessionId })).resolves.toMatchObject({
+        tools: expect.arrayContaining([
+          expect.objectContaining({ object: actor, verb: "wait" }),
+          expect.objectContaining({ object: actor, verb: "focus_list" })
+        ])
+      });
+      await expect(gateway.host.listTools(actor, { scope: "focus", limit: 100, sessionId: oldSessionId })).resolves.toMatchObject({
+        tools: expect.arrayContaining([
+          expect.objectContaining({ object: "the_pinboard" })
+        ])
+      });
+
+      const transcript = {
+        kind: "woo.effect_transcript.shadow.v1",
+        id: "cf-mcp-directory-live",
+        route: "direct",
+        scope: "the_deck",
+        seq: 0,
+        session: null,
+        call: { actor: "cf_mcp_speaker", target: "the_deck", verb: "say", args: ["hello"] },
+        reads: [],
+        writes: [],
+        creates: [],
+        moves: [],
+        observations: [{ type: "said", source: "the_deck", text: "hello from directory shard" }],
+        logicalInputs: [],
+        untrackedEffects: [],
+        complete: true,
+        incompleteReasons: [],
+        hash: "cf-mcp-directory-live"
+      };
+      const fanout = await signInternalRequest(harness.env, new Request("https://woo.internal/__internal/mcp-live-fanout", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-woo-host-key": shard
+        },
+        body: JSON.stringify({ scope: "the_deck", transcript })
+      }));
+      const fanoutResponse = await harness.wooNamespace.get({ name: shard }).fetch(fanout);
+      expect(fanoutResponse.ok, await fanoutResponse.clone().text()).toBe(true);
+      expect(shardObject.mcpGateway.host.queueCount()).toBe(2052);
+      expect(shardObject.mcpGateway.host.queues.get(oldSessionId).observations).toEqual([
+        expect.objectContaining({ type: "said", text: "hello from directory shard" })
+      ]);
+      expect(metricEvents(logSpy, "startup_storage")).toContainEqual(expect.objectContaining({
+        phase: "mcp_gateway_snapshot_fetch",
+        source: "directory",
+        objects: 7,
+        sessions: 2052
+      }));
     } finally {
       logSpy.mockRestore();
       harness.close();
@@ -4685,6 +4792,103 @@ function testStableHash(input: string): number {
   }
   return hash >>> 0;
 }
+
+describe("PersistentObjectDO Directory presence lookups", () => {
+  type PresenceHelper = {
+    loadDirectorySessionsForScopes(scopes: readonly ObjRef[]): Promise<Array<{ id: string; actor: ObjRef; focusList?: ObjRef[] }>>;
+  };
+
+  function jsonResponse(body: unknown): Response {
+    return new Response(JSON.stringify(body), {
+      headers: { "content-type": "application/json; charset=utf-8" }
+    });
+  }
+
+  function buildPresenceDO(opts: {
+    fetchHandler: (request: Request) => Promise<Response> | Response;
+    readTimeoutMs?: string;
+  }): { helper: PresenceHelper; cleanup: () => void } {
+    const state = new FakeDurableObjectState("mcp-gateway-presence-test");
+    const env = {
+      WOO_INITIAL_WIZARD_TOKEN: "presence-test-token",
+      WOO_INTERNAL_SECRET: "presence-test-secret",
+      WOO_AUTO_INSTALL_CATALOGS: "",
+      ...(opts.readTimeoutMs !== undefined ? { WOO_HOST_READ_TIMEOUT_MS: opts.readTimeoutMs } : {}),
+      DIRECTORY: new FakeDurableObjectNamespace(() => ({ fetch: opts.fetchHandler })),
+      WOO: new FakeDurableObjectNamespace(() => ({ fetch: () => jsonResponse({ ok: true }) }))
+    } as unknown as Env;
+    const po = new PersistentObjectDO(state as unknown as DurableObjectState, env);
+    return { helper: po as unknown as PresenceHelper, cleanup: () => state.close() };
+  }
+
+  it("coalesces identical in-flight scope-session reads and caches a defensive copy briefly", async () => {
+    let fetches = 0;
+    let started!: () => void;
+    let release!: () => void;
+    const firstFetchStarted = new Promise<void>((resolve) => { started = resolve; });
+    const unblockFetch = new Promise<void>((resolve) => { release = resolve; });
+    const { helper, cleanup } = buildPresenceDO({
+      fetchHandler: async () => {
+        fetches += 1;
+        started();
+        await unblockFetch;
+        return jsonResponse({
+          sessions: [{
+            session_id: "session-presence-a",
+            actor: "guest_presence_a",
+            started: 1,
+            expires_at: Date.now() + 60_000,
+            token_class: "guest",
+            current_location: "the_deck",
+            display_name: "Presence A",
+            focus_list: ["the_pinboard"]
+          }],
+          next_after_session_id: null
+        });
+      }
+    });
+    try {
+      const first = helper.loadDirectorySessionsForScopes(["the_deck", "the_chatroom", "the_deck"] as ObjRef[]);
+      await firstFetchStarted;
+      const second = helper.loadDirectorySessionsForScopes(["the_chatroom", "the_deck"] as ObjRef[]);
+      expect(fetches).toBe(1);
+      release();
+
+      const [firstSessions, secondSessions] = await Promise.all([first, second]);
+      expect(fetches).toBe(1);
+      expect(firstSessions).toEqual(secondSessions);
+      firstSessions[0]?.focusList?.push("mutated_focus" as ObjRef);
+
+      const cached = await helper.loadDirectorySessionsForScopes(["the_deck", "the_chatroom"] as ObjRef[]);
+      expect(fetches).toBe(1);
+      expect(cached[0]?.focusList).toEqual(["the_pinboard"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("uses the read RPC timeout for Directory presence and degrades to an empty roster", async () => {
+    let fetches = 0;
+    let observedAbort = false;
+    const { helper, cleanup } = buildPresenceDO({
+      readTimeoutMs: "5",
+      fetchHandler: (request) => {
+        fetches += 1;
+        request.signal.addEventListener("abort", () => { observedAbort = true; });
+        return new Promise<Response>(() => {});
+      }
+    });
+    try {
+      const startedAt = Date.now();
+      await expect(helper.loadDirectorySessionsForScopes(["the_deck"] as ObjRef[])).resolves.toEqual([]);
+      expect(fetches).toBe(1);
+      expect(observedAbort).toBe(true);
+      expect(Date.now() - startedAt).toBeLessThan(1_000);
+    } finally {
+      cleanup();
+    }
+  });
+});
 
 // Focused regressions for the outbound-fetch limiter introduced to mitigate
 // the Workers ~6-slot subrequest cap. These bypass routed worker.fetch() and

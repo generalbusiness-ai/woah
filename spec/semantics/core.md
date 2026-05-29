@@ -390,6 +390,10 @@ This gate applies to **external ingress**, not to VM-to-VM `CALL_VERB` inside an
 
 Reads and live-only interaction verbs (`:describe`, `:look`, `:who`, `:say`, `:typing`, dubspace `:preview_control`) are typical `direct_callable: true` verbs. Mutating shared-state verbs default to `false` so clients and agents must route them through a space.
 
+Roster-rendering verbs may additionally carry `reads_room_presence: true`. That
+flag has no permission meaning; it is a read-dependency hint used by sparse
+transport gateways to seed current room/session presence before dispatch.
+
 ---
 
 ## C13. Call discipline

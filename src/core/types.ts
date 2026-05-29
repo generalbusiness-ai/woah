@@ -44,6 +44,7 @@ export type RemoteToolDescriptor = {
   aliases: string[];
   arg_spec: Record<string, WooValue>;
   direct: boolean;
+  reads_room_presence?: boolean;
   source: string;
   enclosingSpace: ObjRef | null;
   source_rows?: Array<{ table: "objects"; authority_scope: ObjRef; key: ObjRef }>;
@@ -167,6 +168,10 @@ export type VerbDef =
       direct_callable?: boolean;
       skip_presence_check?: boolean;
       tool_exposed?: boolean;
+      // Catalog metadata for sparse gateways: this verb renders or otherwise
+      // depends on a room/workspace roster, so a gateway that only holds
+      // session stubs must seed current Directory presence for candidate rooms.
+      reads_room_presence?: boolean;
       // Declares the verb performs no observable state mutation: no property
       // writes, no moveto, no observe-with-side-effects, no recycle, no host
       // effects. May be set by the static analyzer (derived from bytecode +
@@ -203,6 +208,7 @@ export type VerbDef =
       direct_callable?: boolean;
       skip_presence_check?: boolean;
       tool_exposed?: boolean;
+      reads_room_presence?: boolean;
       pure?: boolean;
       pure_declared?: boolean;
       calls?: VerbCallSite[];
@@ -277,6 +283,7 @@ export type MetricEvent =
   | { kind: "mcp_request"; method: string; tool?: string; ms: number; status: "ok" | "error" }
   | { kind: "mcp_tool_refresh_taken"; actor: ObjRef; source: "invoke" | "accepted_frame"; reason: string; transcript: boolean; session_id?: string; active_scope?: ObjRef | null }
   | { kind: "mcp_tool_refresh_skipped"; actor: ObjRef; source: "invoke" | "accepted_frame"; reason: string; transcript: boolean; session_id?: string; active_scope?: ObjRef | null }
+  | { kind: "directory_sessions_for_scopes"; scopes: number; sessions: number; ms: number; status: "ok" | "error" | "timeout"; error?: string }
   // Tool-resolution diagnostic: emitted by createMcpServer's findReachableTool
   // whenever a tools/call requests a specific (object, verb). Captures the
   // gateway's view of the actor's session at decision time so a miss can be
@@ -311,7 +318,7 @@ export type MetricEvent =
   | { kind: "v2_host_apply_fanout"; scope: ObjRef; hosts: number; touched: number; ms: number; status: "ok" | "error"; error?: string }
   | { kind: "mcp_fanout"; scope: ObjRef; shards: number; observations: number; affected_scopes?: number; scoped_shards?: number; subscriber_shards?: number; local_suppressed?: boolean; origin_session?: string | null }
   | { kind: "init"; phase: "world" | "mcp_gateway"; ms: number }
-  | { kind: "startup_storage"; phase: "cf_repository_migrate" | "cf_repository_load" | "cf_repository_save" | "host_seed_fetch" | "host_seed_fetch_kv_miss" | "mcp_gateway_snapshot_fetch" | "directory_schema" | "directory_register_objects" | "directory_register_objects_skip" | "directory_register_session" | "directory_inherit_tombstones"; ms: number; status: "ok" | "error"; objects?: number; properties?: number; sessions?: number; logs?: number; snapshots?: number; tasks?: number; routes?: number; writes?: number; statements?: number; stored?: boolean; error?: string; error_detail?: string; count?: number; inserted?: number; routes_removed?: number; batch_seq?: number; final?: boolean; source?: "kv" | "do" | "digest_hit" }
+  | { kind: "startup_storage"; phase: "cf_repository_migrate" | "cf_repository_load" | "cf_repository_save" | "host_seed_fetch" | "host_seed_fetch_kv_miss" | "mcp_gateway_snapshot_fetch" | "directory_schema" | "directory_register_objects" | "directory_register_objects_skip" | "directory_register_session" | "directory_inherit_tombstones"; ms: number; status: "ok" | "error"; objects?: number; properties?: number; sessions?: number; logs?: number; snapshots?: number; tasks?: number; routes?: number; writes?: number; statements?: number; stored?: boolean; error?: string; error_detail?: string; count?: number; inserted?: number; routes_removed?: number; batch_seq?: number; final?: boolean; source?: "kv" | "do" | "digest_hit" | "directory" }
   | { kind: "state_projection"; ms: number; objects: number; remote_hosts: number }
   | { kind: "host_schema_sync"; host: string; planned: number; skipped: number; ms: number }
   // Diagnostic events for the host-task serialization queue (world.ts
@@ -381,7 +388,7 @@ export type MetricEvent =
   // or no_entry is normal during rollout/TTL churn; hash_mismatch means the
   // local/catalog bytecode reservoir no longer matches WORLD's authoritative
   // bytecode hash and the reader fell back to the signed DO response.
-  | { kind: "host_seed_kv_restore_miss"; cache: "host_seed" | "mcp_gateway_world"; host: string; reason: "no_pointer" | "no_entry" | "invalid_payload" | "digest_mismatch" | "invalid_bytecode_hashes" | "duplicate_bytecode_hash" | "missing_bytecode_hash" | "inline_hash_mismatch" | "hash_mismatch" | "reservoir_miss" | "incomplete_legacy_bytecode"; ms: number }
+  | { kind: "host_seed_kv_restore_miss"; cache: "host_seed"; host: string; reason: "no_pointer" | "no_entry" | "invalid_payload" | "digest_mismatch" | "invalid_bytecode_hashes" | "duplicate_bytecode_hash" | "missing_bytecode_hash" | "inline_hash_mismatch" | "hash_mismatch" | "reservoir_miss" | "incomplete_legacy_bytecode"; ms: number }
   // One-time per Worker isolate and auto-install catalog configuration when a
   // bytecode-free KV entry cannot be restored from local SQL alone.
   | { kind: "kv_catalog_reservoir_build"; catalog_key: string; ms: number; status: "ok" | "error"; objects?: number; verbs?: number; error?: string; error_detail?: string }

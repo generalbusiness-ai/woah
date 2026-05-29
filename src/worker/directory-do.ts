@@ -23,6 +23,8 @@ type ObjectRoute = {
 type SessionRoute = {
   session_id: string;
   actor: ObjRef;
+  started: number;
+  display_name: string | null;
   expires_at: number;
   token_class: Session["tokenClass"];
   active_scope: ObjRef | null;
@@ -34,11 +36,14 @@ type SessionRoute = {
    * guest/bearer-class sessions. */
   apikey_id: string | null;
   mcp_shard: string | null;
+  focus_list: ObjRef[];
   updated_at: number;
 };
 
 const WORLD_HOST = "world";
 const MAX_JSON_BODY_BYTES = 1 * 1024 * 1024;
+const DIRECTORY_SESSION_PAGE_LIMIT = 1024;
+const DIRECTORY_FOCUS_LIST_CAP = 32;
 // Per spec/semantics/recycle.md §RC11.3 step 2: inherit-tombstones batches are
 // capped at 512 KiB to leave headroom under the 1 MiB worker limit. Hosts
 // chunk a long roster into multiple batches.
@@ -70,11 +75,11 @@ export class DirectoryDO {
       if (!this.schemaEnsured) {
         const schemaStartedAt = Date.now();
         try {
-          this.ensureSchema();
+          const statements = this.ensureSchema();
           this.schemaEnsured = true;
-          this.emitMetric({ kind: "startup_storage", phase: "directory_schema", ms: Date.now() - schemaStartedAt, status: "ok", statements: 6 });
+          this.emitMetric({ kind: "startup_storage", phase: "directory_schema", ms: Date.now() - schemaStartedAt, status: "ok", statements });
         } catch (err) {
-          this.emitMetric({ kind: "startup_storage", phase: "directory_schema", ms: Date.now() - schemaStartedAt, status: "error", statements: 6, ...metricErrorFields(err) });
+          this.emitMetric({ kind: "startup_storage", phase: "directory_schema", ms: Date.now() - schemaStartedAt, status: "error", statements: 8, ...metricErrorFields(err) });
           throw err;
         }
       }
@@ -123,12 +128,15 @@ export class DirectoryDO {
           wrote = this.registerSession({
             session_id: String(body.session_id ?? ""),
             actor: String(body.actor ?? "") as ObjRef,
+            started: finitePositiveNumber(body.started) ?? Date.now(),
+            display_name: stringOrNull(body.display_name),
             expires_at: Number(body.expires_at ?? 0),
             token_class: body.token_class === "guest" || body.token_class === "apikey" ? body.token_class : "bearer",
             active_scope: sessionActiveScope(body),
             current_location: sessionActiveScope(body),
             apikey_id: typeof body.apikey_id === "string" && body.apikey_id.length > 0 ? body.apikey_id : null,
             mcp_shard: typeof body.mcp_shard === "string" && body.mcp_shard.length > 0 ? body.mcp_shard : null,
+            focus_list: focusListFromUnknown(body.focus_list),
             updated_at: Date.now()
           });
           this.emitMetric({ kind: "startup_storage", phase: "directory_register_session", ms: Date.now() - startedAt, status: "ok", writes: wrote ? 1 : 0 });
@@ -160,6 +168,27 @@ export class DirectoryDO {
         const body = await readJson(request);
         const scopes = Array.isArray(body.scopes) ? body.scopes : [];
         return json({ shards: this.mcpShardsForScopes(scopes) });
+      }
+
+      if (request.method === "POST" && url.pathname === "/mcp-sessions-for-shard") {
+        const body = await readJson(request);
+        const page = this.mcpSessionsForShard(
+          String(body.shard ?? ""),
+          typeof body.after_session_id === "string" ? body.after_session_id : "",
+          pageLimit(body.limit)
+        );
+        return json(page);
+      }
+
+      if (request.method === "POST" && url.pathname === "/sessions-for-scopes") {
+        const body = await readJson(request);
+        const scopes = Array.isArray(body.scopes) ? body.scopes : [];
+        const page = this.sessionsForScopes(
+          scopes,
+          typeof body.after_session_id === "string" ? body.after_session_id : "",
+          pageLimit(body.limit)
+        );
+        return json(page);
       }
 
       if (request.method === "POST" && url.pathname === "/__internal/inherit-tombstones") {
@@ -197,7 +226,8 @@ export class DirectoryDO {
     }
   }
 
-  private ensureSchema(): void {
+  private ensureSchema(): number {
+    let statements = 0;
     for (const stmt of [
       `CREATE TABLE IF NOT EXISTS object_route (
         id TEXT PRIMARY KEY,
@@ -208,11 +238,14 @@ export class DirectoryDO {
       `CREATE TABLE IF NOT EXISTS session_route (
         session_id TEXT PRIMARY KEY,
         actor TEXT NOT NULL,
+        started INTEGER,
+        display_name TEXT,
         expires_at INTEGER NOT NULL,
         token_class TEXT NOT NULL,
         current_location TEXT,
         apikey_id TEXT,
         mcp_shard TEXT,
+        focus_list TEXT,
         updated_at INTEGER NOT NULL
       )`,
       `CREATE TABLE IF NOT EXISTS directory_meta (
@@ -228,10 +261,38 @@ export class DirectoryDO {
       `CREATE INDEX IF NOT EXISTS inherited_tombstone_former_host
         ON inherited_tombstone(former_host)`,
       `CREATE INDEX IF NOT EXISTS session_route_current_location_mcp_shard
-        ON session_route(current_location, mcp_shard, expires_at)`
+        ON session_route(current_location, mcp_shard, expires_at)`,
+      `CREATE INDEX IF NOT EXISTS session_route_mcp_shard_session_id
+        ON session_route(mcp_shard, session_id, expires_at)`
     ]) {
       this.state.storage.sql.exec(stmt);
+      statements += 1;
     }
+    statements += this.ensureSessionRouteColumns();
+    return statements;
+  }
+
+  private ensureSessionRouteColumns(): number {
+    const columns = new Set(
+      this.state.storage.sql.exec("PRAGMA table_info(session_route)")
+        .toArray()
+        .map((row) => String((row as { name?: unknown }).name ?? ""))
+        .filter(Boolean)
+    );
+    let statements = 0;
+    if (!columns.has("started")) {
+      this.state.storage.sql.exec("ALTER TABLE session_route ADD COLUMN started INTEGER");
+      statements += 1;
+    }
+    if (!columns.has("display_name")) {
+      this.state.storage.sql.exec("ALTER TABLE session_route ADD COLUMN display_name TEXT");
+      statements += 1;
+    }
+    if (!columns.has("focus_list")) {
+      this.state.storage.sql.exec("ALTER TABLE session_route ADD COLUMN focus_list TEXT");
+      statements += 1;
+    }
+    return statements;
   }
 
   private registerObject(id: ObjRef, host: string, anchor: ObjRef | null): boolean {
@@ -293,27 +354,34 @@ export class DirectoryDO {
     // singleton. Compare every column except updated_at; an unchanged row
     // is a no-op.
     const existing = firstRow(this.state.storage.sql.exec(
-      "SELECT actor, expires_at, token_class, current_location, apikey_id, mcp_shard FROM session_route WHERE session_id = ?",
+      "SELECT actor, started, display_name, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list FROM session_route WHERE session_id = ?",
       session.session_id
     ));
+    const encodedFocusList = JSON.stringify(session.focus_list);
     if (existing
       && String(existing.actor) === session.actor
+      && Number(existing.started ?? 0) === session.started
+      && (existing.display_name === null ? null : String(existing.display_name)) === session.display_name
       && Number(existing.expires_at) === session.expires_at
       && String(existing.token_class) === session.token_class
       && (existing.current_location === null ? null : String(existing.current_location)) === session.active_scope
       && (existing.apikey_id === null ? null : String(existing.apikey_id)) === session.apikey_id
-      && (existing.mcp_shard === null ? null : String(existing.mcp_shard)) === session.mcp_shard) {
+      && (existing.mcp_shard === null ? null : String(existing.mcp_shard)) === session.mcp_shard
+      && (existing.focus_list === null ? "[]" : String(existing.focus_list)) === encodedFocusList) {
       return false;
     }
     this.state.storage.sql.exec(
-      "INSERT OR REPLACE INTO session_route(session_id, actor, expires_at, token_class, current_location, apikey_id, mcp_shard, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT OR REPLACE INTO session_route(session_id, actor, started, display_name, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       session.session_id,
       session.actor,
+      session.started,
+      session.display_name,
       session.expires_at,
       session.token_class,
       session.active_scope,
       session.apikey_id,
       session.mcp_shard,
+      encodedFocusList,
       Date.now()
     );
     return true;
@@ -337,7 +405,7 @@ export class DirectoryDO {
   private resolveSession(sessionId: string): SessionRoute | null {
     if (!sessionId) return null;
     const row = firstRow(this.state.storage.sql.exec(
-      "SELECT session_id, actor, expires_at, token_class, current_location, apikey_id, mcp_shard, updated_at FROM session_route WHERE session_id = ?",
+      "SELECT session_id, actor, started, display_name, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list, updated_at FROM session_route WHERE session_id = ?",
       sessionId
     ));
     if (!row) return null;
@@ -349,12 +417,15 @@ export class DirectoryDO {
     return {
       session_id: String(row.session_id),
       actor: String(row.actor),
+      started: finitePositiveNumber(row.started) ?? Number(row.updated_at),
+      display_name: stringOrNull(row.display_name),
       expires_at: expiresAt,
       token_class: row.token_class === "guest" || row.token_class === "apikey" ? row.token_class : "bearer",
       active_scope: typeof row.current_location === "string" ? row.current_location as ObjRef : null,
       current_location: typeof row.current_location === "string" ? row.current_location as ObjRef : null,
       apikey_id: typeof row.apikey_id === "string" && row.apikey_id.length > 0 ? row.apikey_id : null,
       mcp_shard: typeof row.mcp_shard === "string" && row.mcp_shard.length > 0 ? row.mcp_shard : null,
+      focus_list: focusListFromUnknown(row.focus_list),
       updated_at: Number(row.updated_at)
     };
   }
@@ -381,6 +452,55 @@ export class DirectoryDO {
       Date.now()
     ).toArray() as Array<{ mcp_shard?: unknown }>;
     return rows.map((row) => String(row.mcp_shard)).filter(Boolean);
+  }
+
+  private mcpSessionsForShard(shard: string, afterSessionId: string, limit: number): { sessions: SessionRoute[]; next_after_session_id: string | null } {
+    if (!shard) return { sessions: [], next_after_session_id: null };
+    const rows = this.state.storage.sql.exec(
+      `SELECT session_id, actor, started, display_name, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list, updated_at
+        FROM session_route
+        WHERE mcp_shard = ?
+          AND session_id > ?
+          AND expires_at > ?
+        ORDER BY session_id
+        LIMIT ?`,
+      shard,
+      afterSessionId,
+      Date.now(),
+      limit + 1
+    ).toArray() as Array<Record<string, unknown>>;
+    const pageRows = rows.slice(0, limit);
+    return {
+      sessions: pageRows.map(sessionRouteFromRow),
+      next_after_session_id: rows.length > limit ? String(pageRows.at(-1)?.session_id ?? "") || null : null
+    };
+  }
+
+  private sessionsForScopes(values: unknown[], afterSessionId: string, limit: number): { sessions: SessionRoute[]; next_after_session_id: string | null } {
+    const requestedScopes = Array.from(new Set(
+      values.filter((value): value is string => typeof value === "string" && value.length > 0)
+    )).sort();
+    const scopes = requestedScopes.slice(0, 128);
+    if (scopes.length === 0) return { sessions: [], next_after_session_id: null };
+    const placeholders = scopes.map(() => "?").join(", ");
+    const rows = this.state.storage.sql.exec(
+      `SELECT session_id, actor, started, display_name, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list, updated_at
+        FROM session_route
+        WHERE current_location IN (${placeholders})
+          AND session_id > ?
+          AND expires_at > ?
+        ORDER BY session_id
+        LIMIT ?`,
+      ...scopes,
+      afterSessionId,
+      Date.now(),
+      limit + 1
+    ).toArray() as Array<Record<string, unknown>>;
+    const pageRows = rows.slice(0, limit);
+    return {
+      sessions: pageRows.map(sessionRouteFromRow),
+      next_after_session_id: rows.length > limit ? String(pageRows.at(-1)?.session_id ?? "") || null : null
+    };
   }
 
   private async handleInheritTombstones(request: Request): Promise<Response> {
@@ -557,6 +677,58 @@ function json(body: unknown, status = 200): Response {
 
 function sessionActiveScope(record: Record<string, unknown>): ObjRef | null {
   return sessionActiveScopeFromRecord(record) as ObjRef | null;
+}
+
+function sessionRouteFromRow(row: Record<string, unknown>): SessionRoute {
+  const updatedAt = finitePositiveNumber(row.updated_at) ?? Date.now();
+  return {
+    session_id: String(row.session_id),
+    actor: String(row.actor) as ObjRef,
+    started: finitePositiveNumber(row.started) ?? updatedAt,
+    display_name: stringOrNull(row.display_name),
+    expires_at: Number(row.expires_at),
+    token_class: row.token_class === "guest" || row.token_class === "apikey" ? row.token_class : "bearer",
+    active_scope: typeof row.current_location === "string" ? row.current_location as ObjRef : null,
+    current_location: typeof row.current_location === "string" ? row.current_location as ObjRef : null,
+    apikey_id: typeof row.apikey_id === "string" && row.apikey_id.length > 0 ? row.apikey_id : null,
+    mcp_shard: typeof row.mcp_shard === "string" && row.mcp_shard.length > 0 ? row.mcp_shard : null,
+    focus_list: focusListFromUnknown(row.focus_list),
+    updated_at: updatedAt
+  };
+}
+
+function finitePositiveNumber(value: unknown): number | null {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : null;
+}
+
+function pageLimit(value: unknown): number {
+  const number = Math.floor(Number(value));
+  if (!Number.isFinite(number) || number <= 0) return DIRECTORY_SESSION_PAGE_LIMIT;
+  return Math.min(number, DIRECTORY_SESSION_PAGE_LIMIT);
+}
+
+function stringOrNull(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function focusListFromUnknown(value: unknown): ObjRef[] {
+  let raw: unknown = value;
+  if (typeof value === "string") {
+    try {
+      raw = JSON.parse(value) as unknown;
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(raw)) return [];
+  const out: ObjRef[] = [];
+  for (const item of raw) {
+    if (typeof item !== "string" || item.length === 0 || out.includes(item as ObjRef)) continue;
+    out.push(item as ObjRef);
+    if (out.length >= DIRECTORY_FOCUS_LIST_CAP) break;
+  }
+  return out;
 }
 
 async function readJson(request: Request, maxBytes: number = MAX_JSON_BODY_BYTES): Promise<Record<string, unknown>> {

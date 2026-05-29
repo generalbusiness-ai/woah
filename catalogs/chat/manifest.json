@@ -199,6 +199,7 @@
           "name": "look_self",
           "perms": "rxd",
           "direct_callable": true,
+          "reads_room_presence": true,
           "arg_spec": {
             "args": []
           },
@@ -745,6 +746,7 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "tool_exposed": true,
+          "reads_room_presence": true,
           "arg_spec": {
             "args": []
             ,
@@ -763,6 +765,7 @@
           "perms": "rxd",
           "direct_callable": true,
           "skip_presence_check": true,
+          "reads_room_presence": true,
           "arg_spec": {
             "args": [
               "target"
@@ -776,6 +779,7 @@
           "perms": "rxd",
           "direct_callable": true,
           "tool_exposed": true,
+          "reads_room_presence": true,
           "arg_spec": {
             "args": []
             ,
@@ -788,6 +792,7 @@
           "perms": "rxd",
           "direct_callable": true,
           "skip_presence_check": true,
+          "reads_room_presence": true,
           "arg_spec": {
             "args": []
           },

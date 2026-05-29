@@ -238,11 +238,13 @@ async function withDirectorySession(env: Env, request: Request): Promise<Request
 
 function withSessionHeaders(
   request: Request,
-  session: { session_id: string; actor: string; expires_at: number; token_class: string; active_scope?: string | null; apikey_id?: string | null }
+  session: { session_id: string; actor: string; started?: number | null; display_name?: string | null; expires_at: number; token_class: string; active_scope?: string | null; apikey_id?: string | null; focus_list?: string[] }
 ): Request {
   const headers = cleanInternalHeaders(request.headers);
   headers.set("x-woo-internal-session", session.session_id);
   headers.set("x-woo-internal-actor", session.actor);
+  if (Number.isFinite(session.started) && session.started && session.started > 0) headers.set("x-woo-internal-started", String(session.started));
+  if (session.display_name) headers.set("x-woo-internal-display-name", session.display_name);
   headers.set("x-woo-internal-expires-at", String(session.expires_at));
   headers.set("x-woo-internal-token-class", session.token_class);
   if (session.active_scope) headers.set("x-woo-internal-active-scope", session.active_scope);
@@ -259,6 +261,8 @@ async function registerAuthResponse(env: Env, response: Response): Promise<void>
     await directoryPost(env, "/register-session", {
       session_id: body.session,
       actor: body.actor,
+      started: Number.isFinite(Number(body.started)) && Number(body.started) > 0 ? Number(body.started) : null,
+      display_name: typeof body.display_name === "string" && body.display_name.length > 0 ? body.display_name : null,
       expires_at: Number(body.expires_at ?? Date.now() + 5 * 60_000),
       token_class: body.token_class === "guest" || body.token_class === "apikey" ? body.token_class : "bearer",
       active_scope: sessionActiveScope(body),
@@ -329,11 +333,14 @@ async function registerSessionLocationFromCall(env: Env, request: Request, body:
   await directoryPost(env, "/register-session", {
     session_id: session.session_id,
     actor: session.actor,
+    started: session.started ?? null,
+    display_name: session.display_name ?? null,
     expires_at: session.expires_at,
     token_class: session.token_class,
     active_scope: room,
     current_location: room,
-    apikey_id: session.apikey_id ?? null
+    apikey_id: session.apikey_id ?? null,
+    focus_list: session.focus_list ?? []
   });
 }
 
@@ -356,14 +363,14 @@ async function registerObjectsFromApplied(env: Env, _frame: Record<string, unkno
   if (routes.length > 0) await directoryPost(env, "/register-objects", { routes });
 }
 
-async function resolveRequestSession(env: Env, request: Request): Promise<{ session_id: string; actor: string; expires_at: number; token_class: string; active_scope?: string | null; current_location?: string | null; apikey_id?: string | null } | null> {
+async function resolveRequestSession(env: Env, request: Request): Promise<{ session_id: string; actor: string; started?: number | null; display_name?: string | null; expires_at: number; token_class: string; active_scope?: string | null; current_location?: string | null; apikey_id?: string | null; focus_list?: string[] } | null> {
   const header = request.headers.get("authorization") ?? "";
   const match = /^Session\s+(.+)$/i.exec(header.trim());
   if (!match) return null;
   return resolveSessionId(env, match[1]);
 }
 
-async function resolveSessionId(env: Env, sessionId: string): Promise<{ session_id: string; actor: string; expires_at: number; token_class: string; active_scope?: string | null; current_location?: string | null; apikey_id?: string | null } | null> {
+async function resolveSessionId(env: Env, sessionId: string): Promise<{ session_id: string; actor: string; started?: number | null; display_name?: string | null; expires_at: number; token_class: string; active_scope?: string | null; current_location?: string | null; apikey_id?: string | null; focus_list?: string[] } | null> {
   try {
     const body = await directoryPost(env, "/resolve-session", { session_id: sessionId }) as Record<string, unknown>;
     const session = body.session;
@@ -374,11 +381,16 @@ async function resolveSessionId(env: Env, sessionId: string): Promise<{ session_
     return {
       session_id: record.session_id,
       actor: record.actor,
+      started: Number.isFinite(Number(record.started)) && Number(record.started) > 0 ? Number(record.started) : null,
+      display_name: typeof record.display_name === "string" && record.display_name.length > 0 ? record.display_name : null,
       expires_at: Number(record.expires_at ?? 0),
       token_class: typeof record.token_class === "string" ? record.token_class : "bearer",
       active_scope: activeScope,
       current_location: activeScope,
-      apikey_id: typeof record.apikey_id === "string" && record.apikey_id.length > 0 ? record.apikey_id : null
+      apikey_id: typeof record.apikey_id === "string" && record.apikey_id.length > 0 ? record.apikey_id : null,
+      focus_list: Array.isArray(record.focus_list)
+        ? record.focus_list.filter((item): item is string => typeof item === "string" && item.length > 0)
+        : []
     };
   } catch {
     return null;

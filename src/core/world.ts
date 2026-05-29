@@ -1744,6 +1744,7 @@ export class WooWorld {
       version: verb.version,
       direct_callable: verb.direct_callable === true,
       tool_exposed: verb.tool_exposed === true,
+      reads_room_presence: verb.reads_room_presence === true,
       source_hash: verb.source_hash ?? ""
     };
   }
@@ -2865,11 +2866,16 @@ export class WooWorld {
     tokenClass: Session["tokenClass"] = "bearer",
     expiresAt?: number,
     activeScope?: ObjRef | null,
-    apikeyId?: string
+    apikeyId?: string,
+    startedAt?: number
   ): Session {
     const existing = this.sessions.get(id);
     if (existing) {
       let changed = false;
+      if (Number.isFinite(startedAt) && startedAt !== undefined && startedAt > 0 && existing.started !== startedAt) {
+        existing.started = startedAt;
+        changed = true;
+      }
       if (Number.isFinite(expiresAt) && expiresAt !== undefined && expiresAt > existing.expiresAt) {
         existing.expiresAt = expiresAt;
         changed = true;
@@ -2890,10 +2896,11 @@ export class WooWorld {
     }
     this.object(actor);
     const now = Date.now();
+    const started = Number.isFinite(startedAt) && startedAt !== undefined && startedAt > 0 ? startedAt : now;
     const session: Session = {
       id,
       actor,
-      started: now,
+      started,
       expiresAt: expiresAt ?? now + this.sessionTtl(tokenClass),
       lastDetachAt: null,
       tokenClass,
@@ -5156,6 +5163,7 @@ export class WooWorld {
       version: verb.version,
       direct_callable: verb.direct_callable === true,
       tool_exposed: verb.tool_exposed === true,
+      reads_room_presence: verb.reads_room_presence === true,
       readable
     };
     if (readable && options.includeSource) {
@@ -11313,6 +11321,7 @@ function cloneImportedVerb(verb: VerbDef, slot: number): VerbDef {
     ...(verb.calls !== undefined ? { calls: verb.calls.map((call) => ({ ...call })) } : {}),
     perms: parsedPerms.perms,
     direct_callable: parsedPerms.directCallable,
+    reads_room_presence: verb.reads_room_presence === true ? true : undefined,
     slot
   };
   if (verb.kind === "bytecode") {

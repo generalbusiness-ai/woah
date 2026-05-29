@@ -52,6 +52,7 @@ export type McpTool = {
   inputSchema: Record<string, unknown>;
   direct: boolean;
   persistence: "durable" | "live";
+  readsRoomPresence?: boolean;
   enclosingSpace: ObjRef | null;
   descriptor?: RemoteToolDescriptor;
 };
@@ -85,7 +86,7 @@ export type McpInvocationResult = {
 };
 
 export type McpDispatchHooks = {
-  direct?: (sessionId: string, actor: ObjRef, target: ObjRef, verb: string, args: WooValue[], scope?: ObjRef | null, persistence?: "durable" | "live") => McpDirectDispatchFrame | ErrorFrame | Promise<McpDirectDispatchFrame | ErrorFrame>;
+  direct?: (sessionId: string, actor: ObjRef, target: ObjRef, verb: string, args: WooValue[], scope?: ObjRef | null, persistence?: "durable" | "live", options?: { directorySessionScopes?: ObjRef[] }) => McpDirectDispatchFrame | ErrorFrame | Promise<McpDirectDispatchFrame | ErrorFrame>;
   call?: (sessionId: string, actor: ObjRef, space: ObjRef, message: Message) => McpAppliedDispatchFrame | ErrorFrame | Promise<McpAppliedDispatchFrame | ErrorFrame>;
 };
 
@@ -108,6 +109,7 @@ type McpVerbInfo = {
   direct_callable?: boolean;
   perms: string;
   tool_exposed?: boolean;
+  reads_room_presence?: boolean;
   source?: string;
   owner?: ObjRef;
 };
@@ -491,6 +493,7 @@ export class McpHost {
           aliases: verb.aliases,
           arg_spec: verb.arg_spec,
           direct: verb.direct_callable === true,
+          ...(verb.reads_room_presence === true ? { reads_room_presence: true } : {}),
           source: verb.source ?? "",
           enclosingSpace: this.enclosingSpaceFor(id)
         }, usedNames);
@@ -646,6 +649,7 @@ export class McpHost {
           aliases: verb.aliases,
           arg_spec: verb.arg_spec,
           direct: verb.direct_callable === true,
+          ...(verb.reads_room_presence === true ? { reads_room_presence: true } : {}),
           source: verb.source ?? "",
           enclosingSpace: this.enclosingSpaceFor(id),
           source_rows: this.toolSurfaceSourceRows(id, verb.owner)
@@ -670,6 +674,7 @@ export class McpHost {
       aliases: string[];
       arg_spec: Record<string, WooValue>;
       direct: boolean;
+      reads_room_presence?: boolean;
       source: string;
       enclosingSpace: ObjRef | null;
       source_rows?: RemoteToolDescriptor["source_rows"];
@@ -694,6 +699,7 @@ export class McpHost {
       inputSchema: argSpecToJsonSchema(spec.arg_spec),
       direct: spec.direct,
       persistence: mcpToolPersistence(spec.arg_spec),
+      ...(spec.reads_room_presence === true ? { readsRoomPresence: true } : {}),
       enclosingSpace: spec.enclosingSpace,
       descriptor: {
         object,
@@ -701,6 +707,7 @@ export class McpHost {
         aliases: spec.aliases,
         arg_spec: spec.arg_spec,
         direct: spec.direct,
+        ...(spec.reads_room_presence === true ? { reads_room_presence: true } : {}),
         source: spec.source,
         enclosingSpace: spec.enclosingSpace,
         ...(spec.source_rows ? { source_rows: spec.source_rows } : {}),
@@ -828,7 +835,17 @@ export class McpHost {
       if (descriptors.length === 0 && sessionId) {
         descriptors = await this.sessionManifestDescriptors(sessionId, remoteFailed ? "owner_timeout" : "cache_miss");
       }
-      const descriptor = descriptors.find((candidate) => candidate.object === object && candidate.verb === verbName);
+      let descriptor = descriptors.find((candidate) => candidate.object === object && candidate.verb === verbName);
+      if (!descriptor && projection === "tools" && object === this.world.activeScopeForSession(sessionId)) {
+        try {
+          const obvious = await bridge.enumerateRemoteTools(actor, [{ id: object, projection: "obvious" }]);
+          descriptor = obvious.find((candidate) => candidate.object === object && candidate.verb === verbName);
+        } catch {
+          // The tools projection already failed to resolve this verb. Preserve
+          // the normal miss path if the narrower obvious-command fallback is
+          // unavailable too.
+        }
+      }
       return descriptor ? this.assembleTool(descriptor.object, descriptor, new Set()) : null;
     }
     if (locallyReachable) {
@@ -839,6 +856,7 @@ export class McpHost {
         aliases: verb.aliases,
         arg_spec: verb.arg_spec,
         direct: verb.direct_callable === true,
+        ...(verb.reads_room_presence === true ? { reads_room_presence: true } : {}),
         source: verb.source ?? "",
         enclosingSpace: this.enclosingSpaceFor(object)
       }, new Set());
@@ -859,10 +877,40 @@ export class McpHost {
       remoteFailed = true;
       descriptors = [];
     }
-    if (descriptors.length === 0 && sessionId) {
-      descriptors = await this.sessionManifestDescriptors(sessionId, remoteFailed ? "owner_timeout" : "cache_miss");
+    let descriptor = descriptors.find((candidate) => candidate.object === object && candidate.verb === verbName);
+    if (!descriptor) {
+      try {
+        // Sparse gateway shards may not locally know that the requested object
+        // is a content of the active remote scope. Keep the retry bounded to
+        // the same reachable remote scopes, but ask owners for the fuller
+        // content tool surface when the obvious projection missed the exact
+        // woo_call target.
+        const expanded = await bridge.enumerateRemoteTools(actor, remoteScopeIds.map((id) => ({
+          id,
+          projection: "tools" as const,
+          expandContents: true,
+          contentsProjection: "tools" as const
+        })));
+        descriptor = expanded.find((candidate) => candidate.object === object && candidate.verb === verbName);
+      } catch {
+        // Fall through to the session manifest fallback below.
+      }
+      try {
+        // Some mounted tools are visible by id but are not physically present
+        // in the active room's contents set. After the scope-bounded expansion
+        // misses, ask the owner for the exact requested object and still let
+        // remote actorCanSee/verb permission checks decide whether it is
+        // callable.
+        const exact = await bridge.enumerateRemoteTools(actor, [{ id: object, projection: "tools" as const }]);
+        descriptor = exact.find((candidate) => candidate.object === object && candidate.verb === verbName);
+      } catch {
+        // Fall through to the session manifest fallback below.
+      }
     }
-    const descriptor = descriptors.find((candidate) => candidate.object === object && candidate.verb === verbName);
+    if (!descriptor && sessionId) {
+      descriptor = (await this.sessionManifestDescriptors(sessionId, remoteFailed ? "owner_timeout" : "cache_miss"))
+        .find((candidate) => candidate.object === object && candidate.verb === verbName);
+    }
     return descriptor ? this.assembleTool(descriptor.object, descriptor, new Set()) : null;
   }
 
@@ -1114,7 +1162,11 @@ export class McpHost {
           return { result: await this.drainWait(sessionId, args), observations: [] };
         }
         const result = this.dispatchHooks.direct
-          ? await this.dispatchHooks.direct(sessionId, actor, tool.object, tool.verb, args, liveEnclosing, tool.persistence)
+          ? await this.dispatchHooks.direct(sessionId, actor, tool.object, tool.verb, args, liveEnclosing, tool.persistence, {
+              directorySessionScopes: tool.readsRoomPresence === true
+                ? roomPresenceCandidateScopes(tool.object, args, liveEnclosing)
+                : []
+            })
           : await this.world.directCall(undefined, actor, tool.object, tool.verb, args, { sessionId });
         if (result.op === "error") throw fromError(result.error);
         // Self observations are returned in the call result; do NOT route them
@@ -1328,6 +1380,16 @@ function filterTools(tools: McpTool[], query: string | undefined): McpTool[] {
   });
 }
 
+function roomPresenceCandidateScopes(object: ObjRef, args: readonly WooValue[], enclosingSpace: ObjRef | null): ObjRef[] {
+  const out = new Set<ObjRef>();
+  out.add(object);
+  if (enclosingSpace) out.add(enclosingSpace);
+  for (const arg of args) {
+    if (typeof arg === "string" && arg.length > 0) out.add(arg as ObjRef);
+  }
+  return Array.from(out).sort();
+}
+
 function parseCursor(cursor: string | undefined): number {
   if (!cursor) return 0;
   const parsed = Number.parseInt(cursor, 10);
@@ -1412,6 +1474,7 @@ function descriptorFromTool(tool: McpTool): RemoteToolDescriptor {
     aliases: tool.aliases,
     arg_spec: {},
     direct: tool.direct,
+    ...(tool.readsRoomPresence === true ? { reads_room_presence: true } : {}),
     source: "",
     enclosingSpace: tool.enclosingSpace
   };

@@ -64,6 +64,7 @@ type CatalogVerbDef = {
   direct_callable?: boolean;
   skip_presence_check?: boolean;
   tool_exposed?: boolean;
+  reads_room_presence?: boolean;
   pure?: boolean;
   implementation?: { kind: "native"; handler: string };
 };
@@ -1222,6 +1223,7 @@ function installVerbDef(world: WooWorld, obj: ObjRef, def: CatalogVerbDef, owner
         direct_callable: parsedPerms.directCallable,
         skip_presence_check: existing.skip_presence_check || def.skip_presence_check === true,
         tool_exposed: existing.tool_exposed || def.tool_exposed === true,
+        reads_room_presence: existing.reads_room_presence || def.reads_room_presence === true,
         // pure_declared mirrors the manifest assertion exactly — declarations
         // can be added or removed without changing source. The derived `pure`
         // is left to propagation.
@@ -1234,6 +1236,7 @@ function installVerbDef(world: WooWorld, obj: ObjRef, def: CatalogVerbDef, owner
         next.direct_callable !== existing.direct_callable ||
         next.skip_presence_check !== existing.skip_presence_check ||
         next.tool_exposed !== existing.tool_exposed ||
+        next.reads_room_presence !== existing.reads_room_presence ||
         next.pure_declared !== existing.pure_declared ||
         stableStringify(next.aliases ?? []) !== stableStringify(existing.aliases ?? []) ||
         stableStringify(next.arg_spec ?? {}) !== stableStringify(existing.arg_spec ?? {})
@@ -1252,6 +1255,7 @@ function installVerbDef(world: WooWorld, obj: ObjRef, def: CatalogVerbDef, owner
       (existing.direct_callable === true) !== (repaired.direct_callable === true) ||
       (existing.skip_presence_check === true) !== (repaired.skip_presence_check === true) ||
       (existing.tool_exposed === true) !== (repaired.tool_exposed === true) ||
+      (existing.reads_room_presence === true) !== (repaired.reads_room_presence === true) ||
       (existing.pure_declared === true) !== (repaired.pure_declared === true) ||
       (
         repaired.kind !== "native" &&
@@ -1292,7 +1296,8 @@ function compileCatalogVerbDef(obj: ObjRef, def: CatalogVerbDef, owner: ObjRef, 
     line_map: {},
     direct_callable: parsedPerms.directCallable,
     skip_presence_check: def.skip_presence_check === true,
-    tool_exposed: def.tool_exposed === true
+    tool_exposed: def.tool_exposed === true,
+    reads_room_presence: def.reads_room_presence === true
   };
 
   if (allowImplementationHints && def.implementation?.kind === "native") {
@@ -1344,6 +1349,7 @@ function compileCatalogVerb(obj: ObjRef, def: CatalogVerbDef, owner: ObjRef, ver
     direct_callable: parsedPerms.directCallable,
     skip_presence_check: def.skip_presence_check === true,
     tool_exposed: def.tool_exposed === true,
+    reads_room_presence: def.reads_room_presence === true,
     pure: pure || undefined,
     pure_declared: def.pure === true ? true : undefined,
     calls
@@ -1868,6 +1874,7 @@ function catalogVerbDrift(actual: VerbDef, expected: VerbDef): string[] {
   if ((actual.direct_callable === true) !== (expected.direct_callable === true)) drift.push("direct_callable");
   if ((actual.skip_presence_check === true) !== (expected.skip_presence_check === true)) drift.push("skip_presence_check");
   if ((actual.tool_exposed === true) !== (expected.tool_exposed === true)) drift.push("tool_exposed");
+  if ((actual.reads_room_presence === true) !== (expected.reads_room_presence === true)) drift.push("reads_room_presence");
   // Drift on the manifest-declared bit only. The derived `pure` flag is
   // owned by propagation and may diverge from a freshly-compiled expected
   // (because expected hasn't been propagated against the world). Comparing
@@ -1898,6 +1905,7 @@ function catalogVerbSummary(verb: VerbDef): Record<string, WooValue> {
     direct_callable: verb.direct_callable === true,
     skip_presence_check: verb.skip_presence_check === true,
     tool_exposed: verb.tool_exposed === true,
+    reads_room_presence: verb.reads_room_presence === true,
     pure: verb.pure === true,
     pure_declared: verb.pure_declared === true,
     source_hash: verb.source_hash,

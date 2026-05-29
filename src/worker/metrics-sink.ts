@@ -85,6 +85,8 @@ function primaryCount(event: MetricEvent): number {
       return typeof e.observations === "number" ? e.observations : 0;
     case "mcp_fanout":
       return typeof e.observations === "number" ? e.observations : 0;
+    case "directory_sessions_for_scopes":
+      return typeof e.sessions === "number" ? e.sessions : 0;
     case "v2_envelope":
       return typeof e.fanout === "number" ? e.fanout : 0;
     case "v2_host_apply_fanout":

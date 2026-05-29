@@ -61,3 +61,49 @@ is the wall.
 Caveat: measured immediately post-deploy (all caches cold) = worst case; warm
 re-runs will be faster, but the cross-room timeouts persisted into run 2, so the
 wall is not purely first-touch.
+
+## A3 implementation note
+
+The first A3 cut removes the full-world MCP gateway snapshot from shard
+cold-load. Established MCP traffic is already routed by Directory, and fanout
+selection is already driven by Directory's `(current_location, mcp_shard)` rows,
+so shards now cold-load only their live Directory session rows and rebind queues
+from that bounded set, plus the four universal actor-support rows needed to
+list the session actor's own MCP control tools (`wait`, `focus`,
+`focus_list`). Object authority is fetched lazily through the v2
+authority-slice path when a turn/list operation needs it. This converts
+`mcp_gateway_snapshot_fetch` from WORLD full-snapshot import into a small
+Directory read. Satellite host-seed merge/import was the next direct target and
+is addressed by the second cut below.
+
+The second A3 cut removes the satellite post-lifecycle seed re-merge. Fresh
+host seeds are merged before the world import, and
+`runHostScopedLocalCatalogLifecycle(..., { freshSeed: true })` records the
+gateway-covered schema plan instead of re-running host schema repair against
+foreign support rows. The old post-lifecycle pass exported the whole slice,
+merged the same seed again, and sometimes imported again; that was defensive
+before fresh-seed lifecycle mode existed, but is duplicate O(slice) work on the
+deploy cold path now. Host-owned data migrations still run after import and
+persist incrementally. The same cut memoizes local object-route maps per
+`WooWorld.mutationVersion()` so a cold request's many authority/property reads
+do not rebuild `objectRoutes()` once per cell.
+
+Sparse gateway shards also have two correctness constraints. First, their local
+scope/actor stubs are transport state, not owner authority; remote turn planning
+must fetch owner authority slices rather than using a `CommitScopeDO` snapshot
+built from those stubs. Second, expanded tool enumeration can return mounted or
+self-hosted content descriptors that are only represented as stubs in the scope
+host slice. The shard may cache tool descriptors from that response, but it must
+only cache route ownership for exact ids it asked Directory to resolve; caching
+incidental expanded content to the scope host poisons later authority fetches.
+
+The shard-session Directory path must be complete, not "best effort." The A3
+implementation now adds a leading `mcp_shard` index, pages session rows instead
+of hard-capping at 2048, and rebinds every session returned by Directory rather
+than re-hashing the session id after the load. Directory also carries the
+session's original `started` value, actor display name, and the actor's MCP
+`focus_list` so sparse reloads do not perturb primary-session ordering, degrade
+roster names to ids, or drop focused tool surfaces. Roster recovery is driven by
+the verb metadata flag `reads_room_presence`, not a hardcoded `who` command
+word, so `look` and other catalog roster surfaces get the same sparse-shard
+presence seed.

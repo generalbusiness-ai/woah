@@ -475,16 +475,15 @@ the gateway's `$system.applied_migrations` ledger may be copied into a
 host seed, but it does not prove the host's local instance data was
 converted.
 
-When `HOST_SEED_KV` is configured, the Worker writes a content-addressed
-cache entry for host seeds and MCP gateway snapshots. The KV bytes omit
-`verb.bytecode` and include per-verb bytecode hashes; cold readers
-restore exact bytecode from local SQL or bundled-catalog reservoirs
-before using the cache. A missing or mismatched hash is a cache miss and
-falls back to the signed DO response, which still carries full
-bytecode. The cold reader emits `kv_catalog_reservoir_build` when it
-has to build the per-isolate bundled-catalog reservoir and
-`host_seed_kv_restore_miss` when a KV entry is absent or cannot be
-restored.
+When `HOST_SEED_KV` is configured, the Worker writes content-addressed
+cache entries for host seeds. The KV bytes omit `verb.bytecode` and
+include per-verb bytecode hashes; cold readers restore exact bytecode
+from local SQL or bundled-catalog reservoirs before using the cache. A
+missing or mismatched hash is a cache miss and falls back to the signed
+DO response, which still carries full bytecode. The cold reader emits
+`kv_catalog_reservoir_build` when it has to build the per-isolate
+bundled-catalog reservoir and `host_seed_kv_restore_miss` when a KV
+entry is absent or cannot be restored.
 
 Host-seed KV pointer and bytes keys are also namespaced by the bundled local
 catalog fingerprint. The content digest alone is not sufficient across deploys:
@@ -739,9 +738,23 @@ MCP streamable-HTTP traffic is deliberately not pinned to the singleton
 yet and may mint a woo session, so it runs on `world`. Once the client presents
 `Mcp-Session-Id`, the Worker resolves the Directory session record, forwards
 that authority in signed internal headers, and stable-hashes the MCP session id
-to `mcp-gateway-<n>`. A shard cold-loads a signed gateway snapshot from `world`
-and resumes the MCP transport from the forwarded session, while actual durable
-turn execution still commits through `CommitScopeDO`.
+to `mcp-gateway-<n>`. A shard cold-loads only the Directory session rows whose
+`mcp_shard` matches its host key plus the universal actor-support lineage needed
+for the session actor's own MCP control tools. The Directory query is indexed
+and paged by `mcp_shard`; a shard must rebind every returned live session, not
+re-hash the id and silently discard rows it just loaded. Directory session rows
+preserve the original session start time, actor display name, and the actor's
+MCP `focus_list`, so a sparse reload does not change primary-session ordering,
+degrade roster names to ids, or drop focused tool surfaces. It rebinds MCP
+queues from those rows and fetches object authority lazily through the v2
+authority-slice path when a turn actually needs it. Verbs that render room
+presence declare `reads_room_presence: true`; sparse shards consult that verb
+metadata to request Directory session rows for candidate room scopes rather than
+branching on catalog command words. It must not import a full `world` snapshot
+to resume transport state, and it must not publish or cache object routes from
+those sparse rows except for exact ids whose owner was resolved through
+Directory. Actual durable turn execution still
+commits through `CommitScopeDO`.
 
 `CommitScopeDO` is the durable authority for v2 scope heads. On first open for
 a scope it materializes the gateway-supplied authority seed into row-shaped DO

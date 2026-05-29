@@ -711,7 +711,7 @@ function normalizeFlagsForCompare(flags: Record<string, unknown> | undefined): R
 function normalizeVerbForCompare(verb: VerbDef): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(verb as Record<string, unknown>)) {
-    if (k === "direct_callable" || k === "skip_presence_check" || k === "tool_exposed" || k === "pure" || k === "pure_declared") {
+    if (k === "direct_callable" || k === "skip_presence_check" || k === "tool_exposed" || k === "reads_room_presence" || k === "pure" || k === "pure_declared") {
       if (v === true) out[k] = true;
       continue;
     }
@@ -768,6 +768,7 @@ function verbMetadataDiff(a: VerbDef, b: VerbDef): string | null {
   if ((a.direct_callable === true) !== (b.direct_callable === true)) return "direct_callable";
   if ((a.skip_presence_check === true) !== (b.skip_presence_check === true)) return "skip_presence_check";
   if ((a.tool_exposed === true) !== (b.tool_exposed === true)) return "tool_exposed";
+  if ((a.reads_room_presence === true) !== (b.reads_room_presence === true)) return "reads_room_presence";
   if ((a.pure === true) !== (b.pure === true)) return "pure";
   if ((a.pure_declared === true) !== (b.pure_declared === true)) return "pure_declared";
   if (a.kind !== b.kind) return "kind";
@@ -1313,7 +1314,7 @@ function reparentSeed(world: WooWorld, obj: ObjRef, parent: ObjRef): void {
   world.markObjectChanged(parent);
 }
 
-function sourceVerb(world: WooWorld, obj: ObjRef, name: string, source: string, options: { directCallable?: boolean; skipPresenceCheck?: boolean; toolExposed?: boolean; perms?: string; argSpec?: Record<string, WooValue>; aliases?: string[] } = {}): void {
+function sourceVerb(world: WooWorld, obj: ObjRef, name: string, source: string, options: { directCallable?: boolean; skipPresenceCheck?: boolean; toolExposed?: boolean; readsRoomPresence?: boolean; perms?: string; argSpec?: Record<string, WooValue>; aliases?: string[] } = {}): void {
   const compiled = compileVerb(source);
   if (!compiled.ok || !compiled.bytecode) {
     throw new Error(`bootstrap source verb failed to compile: ${obj}:${name}`);
@@ -1322,6 +1323,7 @@ function sourceVerb(world: WooWorld, obj: ObjRef, name: string, source: string, 
   const existingDirectCallable = existing?.direct_callable === true;
   const existingSkipPresenceCheck = existing?.skip_presence_check === true;
   const existingToolExposed = existing?.tool_exposed === true;
+  const existingReadsRoomPresence = existing?.reads_room_presence === true;
   const parsedPerms = normalizeVerbPerms(options.perms ?? compiled.metadata?.perms ?? existing?.perms ?? "rx", options.directCallable === true);
   const next = {
     kind: "bytecode" as const,
@@ -1337,7 +1339,8 @@ function sourceVerb(world: WooWorld, obj: ObjRef, name: string, source: string, 
     line_map: compiled.line_map ?? {},
     direct_callable: parsedPerms.directCallable,
     skip_presence_check: existingSkipPresenceCheck || options.skipPresenceCheck === true,
-    tool_exposed: existingToolExposed || options.toolExposed === true
+    tool_exposed: existingToolExposed || options.toolExposed === true,
+    reads_room_presence: existingReadsRoomPresence || options.readsRoomPresence === true
   };
   if (
     existing &&
@@ -1347,18 +1350,20 @@ function sourceVerb(world: WooWorld, obj: ObjRef, name: string, source: string, 
     existingDirectCallable === next.direct_callable &&
     existingSkipPresenceCheck === next.skip_presence_check &&
     existingToolExposed === next.tool_exposed &&
+    existingReadsRoomPresence === next.reads_room_presence &&
     JSON.stringify(existing.aliases ?? []) === JSON.stringify(next.aliases ?? []) &&
     valuesEqual((existing.arg_spec ?? {}) as WooValue, (next.arg_spec ?? {}) as WooValue)
   ) return;
   world.addVerb(obj, next);
 }
 
-function native(world: WooWorld, obj: ObjRef, name: string, handler: string, source: string, options: { directCallable?: boolean; skipPresenceCheck?: boolean; toolExposed?: boolean; perms?: string; argSpec?: Record<string, WooValue>; aliases?: string[] } = {}): void {
+function native(world: WooWorld, obj: ObjRef, name: string, handler: string, source: string, options: { directCallable?: boolean; skipPresenceCheck?: boolean; toolExposed?: boolean; readsRoomPresence?: boolean; perms?: string; argSpec?: Record<string, WooValue>; aliases?: string[] } = {}): void {
   const existing = world.ownVerbExact(obj, name);
   if (existing) {
     const existingDirectCallable = existing.direct_callable === true;
     const existingSkipPresenceCheck = existing.skip_presence_check === true;
     const existingToolExposed = existing.tool_exposed === true;
+    const existingReadsRoomPresence = existing.reads_room_presence === true;
     const parsedPerms = normalizeVerbPerms(options.perms ?? existing.perms, existingDirectCallable || options.directCallable === true);
     const aliases = options.aliases ?? existing.aliases;
     const argSpec = options.argSpec ?? existing.arg_spec;
@@ -1368,6 +1373,7 @@ function native(world: WooWorld, obj: ObjRef, name: string, handler: string, sou
       direct_callable: parsedPerms.directCallable,
       skip_presence_check: existingSkipPresenceCheck || options.skipPresenceCheck === true,
       tool_exposed: existingToolExposed || options.toolExposed === true,
+      reads_room_presence: existingReadsRoomPresence || options.readsRoomPresence === true,
       aliases,
       arg_spec: argSpec
     };
@@ -1376,6 +1382,7 @@ function native(world: WooWorld, obj: ObjRef, name: string, handler: string, sou
       next.direct_callable !== existingDirectCallable ||
       next.skip_presence_check !== existingSkipPresenceCheck ||
       next.tool_exposed !== existingToolExposed ||
+      next.reads_room_presence !== existingReadsRoomPresence ||
       JSON.stringify(next.aliases ?? []) !== JSON.stringify(existing.aliases ?? []) ||
       !valuesEqual((next.arg_spec ?? {}) as WooValue, (existing.arg_spec ?? {}) as WooValue)
     ) world.addVerb(obj, next);
@@ -1396,7 +1403,8 @@ function native(world: WooWorld, obj: ObjRef, name: string, handler: string, sou
     native: handler,
     direct_callable: parsedPerms.directCallable,
     skip_presence_check: options.skipPresenceCheck === true,
-    tool_exposed: options.toolExposed === true
+    tool_exposed: options.toolExposed === true,
+    reads_room_presence: options.readsRoomPresence === true
   });
 }
 

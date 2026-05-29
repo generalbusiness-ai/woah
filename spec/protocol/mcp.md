@@ -78,6 +78,13 @@ The tool's shape:
 | `description` | The verb's docstring (first paragraph of `source` block comment, or empty). Followed by the canonical call form `<object>:<verb>(args)` and the alias list. |
 | `inputSchema` | JSON Schema generated from the verb's `arg_spec`. Optional args become optional schema properties. Type hints from `arg_spec.types` map to JSON Schema types when available; otherwise `unknown`. |
 
+Catalog verbs that render a room/workspace roster declare
+`reads_room_presence: true`. Sparse MCP gateway shards use that metadata to
+seed current Directory presence for the target room and object-reference
+arguments before dispatch. The flag is verb metadata, not a command-word table:
+`look`, `who`, `room_roster`, and catalog-specific workspace roster surfaces
+all use the same mechanism.
+
 ### M2.2 Invocation route — direct vs sequenced
 
 **Tools are not direct-only.** The gateway picks the invocation route per call from the verb's metadata:
@@ -339,6 +346,22 @@ client ← server: tools/call result { structuredContent: { result: { observatio
 ```
 
 Disconnect: the MCP transport closes; the woo session may persist per session-grace rules ([identity.md §I6](../semantics/identity.md#i6-disconnect-and-reap-lifecycle)). Reconnect re-authenticates with the same token, refreshes `tools/list`, and drains `wait` to resync — the queue is session-scoped (§M4.1), so observations enqueued during the disconnect window are still there on reconnect within the grace period.
+
+In the Cloudflare deployment, established MCP sessions may be stable-hashed to
+gateway shard DOs. A shard's cold-load state is the Directory session rows for
+that shard plus the universal actor-support lineage needed to expose the
+session actor's own control tools (`wait`, `focus`, `focus_list`), not a
+full-world snapshot. Directory shard-session reads are paged by `mcp_shard` so a
+busy shard must not silently omit live sessions during rebind. The rows preserve
+the original session start time and the actor's MCP `focus_list`, which is the
+minimum session-local state needed to keep primary-session ordering and focused
+tool surfaces stable across shard hibernation. Those bounded rows are enough to
+rebind queues, route directed/current-scope observations, and resume the MCP
+transport. Tool enumeration and invocation fetch object authority lazily from
+the owning host or from the shard's durable projection/tool-surface caches. A
+shard MUST treat its local actor/scope rows as transport stubs only: they cannot
+replace owner authority for turn planning, route publication, or ownership
+caching of incidental objects returned by expanded tool enumeration.
 
 ---
 

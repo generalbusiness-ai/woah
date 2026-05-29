@@ -755,7 +755,7 @@ describe("gateway projection cache", () => {
     expect(ids.has("the_chatroom")).toBe(false);
     expect(metrics).toContainEqual(expect.objectContaining({
       kind: "authority_slice_omitted",
-      host: "the_chatroom",
+      host: "world",
       reason: "snapshot_fallback"
     }));
   });

@@ -203,6 +203,7 @@ export function verbFromSqlRow(row: SqlRow): VerbDef {
     direct_callable: flags.direct_callable === true ? true : undefined,
     skip_presence_check: flags.skip_presence_check === true ? true : undefined,
     tool_exposed: flags.tool_exposed === true ? true : undefined,
+    reads_room_presence: flags.reads_room_presence === true ? true : undefined,
     pure: flags.pure === true ? true : undefined,
     pure_declared: flags.pure_declared === true ? true : undefined,
     calls: Array.isArray(flags.calls) ? flags.calls as VerbDef extends { calls?: infer C } ? C : never : undefined
@@ -216,6 +217,7 @@ export function verbFlagsJson(verb: VerbDef): string {
   if (verb.direct_callable === true) flags.direct_callable = true;
   if (verb.skip_presence_check === true) flags.skip_presence_check = true;
   if (verb.tool_exposed === true) flags.tool_exposed = true;
+  if (verb.reads_room_presence === true) flags.reads_room_presence = true;
   if (verb.pure === true) flags.pure = true;
   if (verb.pure_declared === true) flags.pure_declared = true;
   // Always persist the calls array when defined, even empty: an empty array
