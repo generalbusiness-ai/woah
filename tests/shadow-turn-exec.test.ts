@@ -693,6 +693,42 @@ describe("shadow turn execution", () => {
     expect(committed.getProp("merge_box", "feedback")).toBe(0.37);
   });
 
+  it("installs cell-page transfers without building object-record cache entries", async () => {
+    const anchor = createWorld();
+    const session = anchor.auth("guest:shadow-cell-page-cache");
+    const actor = session.actor;
+    anchor.createObject({ id: "cell_page_box", name: "Cell Page Box", parent: "$thing", owner: actor });
+    anchor.defineProperty("cell_page_box", { name: "wet", defaultValue: 0, owner: actor, perms: "rw", typeHint: "num" });
+    expect(installVerb(anchor, "cell_page_box", "set_wet", `verb :set_wet(value) rxd {
+      this.wet = value;
+      return this.wet;
+    }`, null).ok).toBe(true);
+
+    const serializedBefore = anchor.exportWorld();
+    const call: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "shadow-cell-page-cache-set",
+      route: "direct",
+      scope: "cell_page_box",
+      session: session.id,
+      actor,
+      target: "cell_page_box",
+      verb: "set_wet",
+      args: [0.42]
+    };
+    const planned = await runShadowTurnCall(serializedBefore, call);
+    const key = shadowTurnKeyFromTranscript(planned.transcript);
+    const transfer = buildShadowCellPageTransfer({ serialized: serializedBefore, key });
+    const node = createShadowExecutionNode({ node: "cell-page-cache-node", scope: key.scope });
+
+    expect(transfer.source_page_count).toBe(transfer.page_refs.length);
+    installShadowStateTransfer(node, transfer);
+
+    expect(node.object_cache.size).toBe(0);
+    expect(node.page_cache.size).toBe(transfer.inline_pages.length);
+    expect(node.page_hashes.size).toBe(transfer.page_refs.length);
+  });
+
   it("applies durable commits through indexed scope state without full array indexing phases", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:shadow-indexed-commit");

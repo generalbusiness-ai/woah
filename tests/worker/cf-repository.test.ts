@@ -3935,6 +3935,40 @@ describe("CFObjectRepository production-shape coverage", () => {
     }
   });
 
+  it("skips host-seed body restore when the local slice already has the current KV digest", async () => {
+    const harness = createHostSeedKvHarness();
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const { bytesKey, payload } = await harness.publishHostSeed("the_chatroom");
+      const loadHost = async (): Promise<void> => {
+        const healthz = await harness.wooNamespace.get({ name: "the_chatroom" }).fetch(await signInternalRequest(harness.env, new Request("https://woo.internal/healthz", {
+          headers: { "x-woo-host-key": "the_chatroom" }
+        })));
+        expect(healthz.ok).toBe(true);
+      };
+      await loadHost();
+
+      const hashes = payload.bytecode_hashes as Array<Record<string, unknown>>;
+      expect(hashes.length).toBeGreaterThan(0);
+      hashes[0] = { ...hashes[0]!, hash: "digest-hit-should-not-read-seed-body" };
+      await harness.kv.put(bytesKey, JSON.stringify(payload));
+      logSpy.mockClear();
+      harness.hostSeedFetches.length = 0;
+      harness.reloadHost("the_chatroom");
+
+      await loadHost();
+
+      expect(harness.hostSeedFetches).toEqual([]);
+      expect(metricEvents(logSpy, "host_seed_kv_restore_miss")).toEqual([]);
+      expect(metricEvents(logSpy, "startup_storage")).toContainEqual(
+        expect.objectContaining({ phase: "host_seed_fetch", source: "digest_hit", status: "ok" })
+      );
+    } finally {
+      logSpy.mockRestore();
+      harness.close();
+    }
+  });
+
   it("falls back to the authoritative host seed when stripped KV bytecode hashes cannot be restored", async () => {
     const harness = createHostSeedKvHarness();
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});

@@ -456,12 +456,10 @@ export function buildShadowCellPageTransfer(input: {
     page_refs: pageRefs,
     inline_pages: inlinePages,
     ...shadowTransferWorldTail(input.serialized, input.key, input.session),
-    // Empty transfers are signed freshness/readiness markers. Counting every
-    // source page would rebuild page objects without granting executable
-    // material, which defeats the open-time cache-hit fast path.
-    source_page_count: selected.length === 0
-      ? 0
-      : input.serialized.objects.reduce((sum, obj) => sum + shadowStatePagesForObject(obj).length, 0),
+    // Count the selected executable closure, not every possible source page in
+    // the snapshot. This is diagnostic/proof material only; rebuilding pages for
+    // untouched objects puts whole-snapshot work back on cold open.
+    source_page_count: requiredPages.length,
     ...(input.capsule ? {
       capsule: shadowExecutionCapsuleMetadata({
         scope: input.key.scope,
@@ -618,7 +616,6 @@ export function installShadowStateTransfer(node: ShadowExecutionNode, transfer: 
     // before recording the retry transcript.
     node.world = undefined;
     for (const ref of transfer.page_refs) node.page_hashes.add(ref.hash);
-    cacheShadowObjectsById(node, new Set(transfer.page_refs.map((ref) => ref.object)));
     return;
   }
   node.serialized = mergeObjectRecordTransfer(node.serialized, transfer, node.object_cache);
@@ -1485,20 +1482,26 @@ function mergeCellPageTransfer(
 ): SerializedWorld {
   const base = current ? structuredClone(current) as SerializedWorld : emptySerializedWorld(transfer);
   const incomingPages: ShadowStatePage[] = [];
+  const inlineRefHashes = new Set(transfer.page_refs.filter((ref) => ref.inline === true).map((ref) => ref.hash));
   for (const page of transfer.inline_pages) {
     const hash = shadowStatePageHash(page);
-    const ref = transfer.page_refs.find((item) => item.hash === hash);
-    if (!ref || ref.inline !== true) throw new Error(`inline shadow state page has no inline page ref: ${hash}`);
+    if (!inlineRefHashes.has(hash)) throw new Error(`inline shadow state page has no inline page ref: ${hash}`);
     pageCache.set(hash, structuredClone(page) as ShadowStatePage);
   }
 
-  const currentPages = new Map<string, ShadowStatePage>();
-  for (const obj of base.objects) {
-    for (const page of shadowStatePagesForObject(obj)) currentPages.set(shadowStatePageHash(page), page);
-  }
+  let currentPages: Map<string, ShadowStatePage> | null = null;
+  const currentPage = (hash: string): ShadowStatePage | undefined => {
+    if (!currentPages) {
+      currentPages = new Map();
+      for (const obj of base.objects) {
+        for (const page of shadowStatePagesForObject(obj)) currentPages.set(shadowStatePageHash(page), page);
+      }
+    }
+    return currentPages.get(hash);
+  };
 
   for (const ref of transfer.page_refs) {
-    const page = pageCache.get(ref.hash) ?? currentPages.get(ref.hash);
+    const page = pageCache.get(ref.hash) ?? currentPage(ref.hash);
     if (!page) throw new Error(`missing cached shadow state page: ${ref.object}:${ref.page}@${ref.hash}`);
     const actualRef = shadowStatePageRef(page, ref.inline);
     if (actualRef.object !== ref.object || actualRef.page !== ref.page || actualRef.name !== ref.name) {

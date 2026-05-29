@@ -1123,6 +1123,12 @@ Wrangler/Cloudflare deploy output. Woo catalog installs and updates have their
 own runtime audit path through `$catalog_registry`; CF DO class migrations are a
 separate platform ledger.
 
+Deploy postflight SHOULD warm `world`, MCP gateway shards, and a bounded sample
+of routed catalog instance hosts before running cross-actor smoke. This is not a
+substitute for measuring cold-start cost; it prevents the smoke's behavioral
+assertions from consuming the deployment's first serialized Durable Object
+activation while still improving the first-user path after a successful deploy.
+
 ### R14.7 Failure modes
 
 A misconfigured deploy must fail loudly, not silently. The Worker's startup check:

@@ -589,6 +589,9 @@ CREATE TABLE gateway_tool_surface_source (
   PRIMARY KEY(scope, source_table, source_authority_scope, source_key, object)
 );
 
+CREATE INDEX gateway_tool_surface_source_lookup
+  ON gateway_tool_surface_source(source_table, source_authority_scope, source_key);
+
 CREATE TABLE gateway_tool_surface_scope (
   scope            TEXT PRIMARY KEY,
   saturated        INTEGER NOT NULL DEFAULT 0,

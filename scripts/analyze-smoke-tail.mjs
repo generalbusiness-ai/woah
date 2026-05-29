@@ -273,8 +273,9 @@ function reportColdStart(metrics) {
 
 function reportSeedDelivery(metrics) {
   section("Seed delivery (cold-load fast path)");
-  // host_seed_fetch with source=kv|do reflects whether the KV cache
-  // (Lever B) is serving cold-load seeds vs the DO RPC fallback.
+  // host_seed_fetch with source=kv|digest_hit|do reflects whether the
+  // KV cache (Lever B) is serving cold-load seeds, the local slice was
+  // already current, or the DO RPC fallback was needed.
   // mcp_gateway_snapshot_fetch is the analogous metric for MCP shards.
   const byBucket = new Map();
   for (const m of metrics) {

@@ -231,6 +231,13 @@ repair can add local-only foreign-row fields that the post-lifecycle
 re-merge immediately deletes, forcing a full snapshot on every
 quiescent wake.
 
+When the receiver has a trusted host-scoped slice and its persisted
+`host_seed_digest` matches the current content-addressed KV pointer for
+that host, cold-load MAY skip the seed body fetch and both seed merges.
+It MUST still run host-owned data migrations, and MUST treat the digest
+hit as a fresh gateway seed for host schema repair so foreign-hosted
+support rows are not locally rewritten.
+
 Live refresh (wizard-triggered, see
 [../reference/cloudflare.md §R9.1](../reference/cloudflare.md#r91-first-request-path))
 runs the merge without lifecycle.

@@ -25,6 +25,21 @@ function rows<T>(state: FakeDurableObjectState, query: string, ...params: unknow
 }
 
 describe("gateway projection cache", () => {
+  it("creates a reverse lookup index for tool-surface source invalidation", () => {
+    const state = new FakeDurableObjectState("mcp-gateway-0");
+    try {
+      new PersistentObjectDO(state as unknown as DurableObjectState, env());
+
+      const indexNames = rows<{ name: string }>(
+        state,
+        "PRAGMA index_list('gateway_tool_surface_source')"
+      ).map((row) => row.name);
+      expect(indexNames).toContain("gateway_tool_surface_source_lookup");
+    } finally {
+      state.close();
+    }
+  });
+
   it("persists accepted object projection rows and evicts them on delete", () => {
     const state = new FakeDurableObjectState("mcp-gateway-0");
     const objectRow = createWorld().exportObjects(["the_chatroom"])[0]!;

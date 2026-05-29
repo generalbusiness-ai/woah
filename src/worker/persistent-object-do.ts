@@ -510,6 +510,12 @@ export class PersistentObjectDO {
       object TEXT NOT NULL,
       PRIMARY KEY(scope, source_table, source_authority_scope, source_key, object)
     )`);
+    // Invalidation looks up every cached tool surface that depended on a changed
+    // authority row. The primary key is scope-first for descriptor reads; this
+    // reverse index keeps fanout apply from scanning all source rows on each
+    // object write.
+    sql.exec(`CREATE INDEX IF NOT EXISTS gateway_tool_surface_source_lookup
+      ON gateway_tool_surface_source(source_table, source_authority_scope, source_key)`);
     // A saturated scope is read as a cache miss so MCP can fall back to the
     // session manifest or owner refresh instead of serving a partial tool list.
     sql.exec(`CREATE TABLE IF NOT EXISTS gateway_tool_surface_scope (
@@ -1727,8 +1733,10 @@ export class PersistentObjectDO {
     // 2026-04-30 catalog-placement migration (no host_placement marker on
     // any object in the slice) — that's the original recovery path.
     let scoped: SerializedWorld | null;
+    let trustedStoredHostScoped = false;
     if (stored && storedSliceIsHostScoped(stored, hostKey)) {
       scoped = stored;
+      trustedStoredHostScoped = true;
     } else {
       scoped = stored ? nonEmptyHostScopedWorld(stored, hostKey) : null;
       if (stored && !scoped) {
@@ -1741,37 +1749,50 @@ export class PersistentObjectDO {
         });
       }
     }
-    // The cold-load path stays a single signed RPC: the satellite
-    // always fetches the full seed and runs the pre/post-lifecycle
-    // merges. The seed body now carries an x-woo-seed-digest response
-    // header and the satellite persists it as host_seed_digest after
-    // each successful merge so a future change can build a
-    // probe-then-skip path on top of it — that promotion needs to
-    // either make runHostScopedLocalCatalogLifecycle
-    // gateway-authority-aware (so foreign-hosted writes from the
-    // lifecycle don't survive the skip and break the next admin push)
-    // or cache the seed body locally so the post-lifecycle merge can
-    // run without an RPC. Adding a probe round-trip ahead of the same
-    // full fetch would be pure overhead until one of those lands.
+    // The content-addressed KV pointer doubles as a cheap freshness probe. If
+    // this DO already persisted a host-scoped slice merged from that exact seed
+    // digest, the next cold-load can skip the seed body restore and both seed
+    // merges. We still run host-owned data migrations below, but mark the seed
+    // as covering foreign support rows so schema repair does not rewrite rows
+    // the gateway seed already owns.
     let freshSeed: SeedWorld | null = null;
     let freshSeedDigest: string | null = null;
-    // Track whether the fresh seed came from KV (cache) or DO RPC
-    // (authoritative). Only DO-sourced seeds are allowed to drive
-    // persistFullSnapshot — see the v1 KV stale-data poisoning
-    // incident on 2026-05-22 (notes/2026-05-22-decomposed-kv-seed-cache.md).
-    let freshSeedSource: "kv" | "do" = "do";
+    let seedDigestHit = false;
     try {
-      // Use the gateway's seed verbatim — re-scoping via
-      // nonEmptyHostScopedWorld would import-then-re-export, which
-      // recomputes objectHosts from the fresh world's anchor chain
-      // and discards any gateway-supplied routing metadata (per
-      // spec/protocol/host-seeds.md §HS1, objectHosts is the only
-      // routing input the merge needs and must come from the
-      // gateway's batched directory view).
-      const fetched = await this.fetchHostSeed(hostKey, scoped);
-      freshSeed = fetched.seed.objects.length > 0 ? fetched.seed : null;
-      freshSeedDigest = fetched.digest;
-      freshSeedSource = fetched.source;
+      const storedSeedDigest = this.repo.loadMeta(HOST_SEED_DIGEST_META_KEY);
+      if (this.env.HOST_SEED_KV && trustedStoredHostScoped && scoped && storedSeedDigest) {
+        const probeStartedAt = Date.now();
+        try {
+          const pointer = await this.env.HOST_SEED_KV.get(hostSeedPointerKey(this.env, hostKey), "text");
+          if (pointer && pointer === storedSeedDigest) {
+            freshSeedDigest = pointer;
+            seedDigestHit = true;
+            this.emitMetric({
+              kind: "startup_storage",
+              phase: "host_seed_fetch",
+              ms: Date.now() - probeStartedAt,
+              status: "ok",
+              objects: scoped.objects.length,
+              source: "digest_hit"
+            }, hostKey);
+          }
+        } catch {
+          // A probe failure must not strand a satellite on its local slice; the
+          // normal fetch path below has the full KV-miss/DO-fallback behavior.
+        }
+      }
+      if (!seedDigestHit) {
+        // Use the gateway's seed verbatim — re-scoping via
+        // nonEmptyHostScopedWorld would import-then-re-export, which
+        // recomputes objectHosts from the fresh world's anchor chain
+        // and discards any gateway-supplied routing metadata (per
+        // spec/protocol/host-seeds.md §HS1, objectHosts is the only
+        // routing input the merge needs and must come from the
+        // gateway's batched directory view).
+        const fetched = await this.fetchHostSeed(hostKey, scoped);
+        freshSeed = fetched.seed.objects.length > 0 ? fetched.seed : null;
+        freshSeedDigest = fetched.digest;
+      }
     } catch (err) {
       if (!scoped) throw err;
       console.warn("woo.cluster_seed_refresh_failed", { host: hostKey, error: normalizeError(err) });
@@ -1793,7 +1814,7 @@ export class PersistentObjectDO {
     // rows after the merge re-adds local-only catalog fields that the
     // post-lifecycle seed merge then deletes, causing a full snapshot on every
     // satellite wake. Host-owned data migrations still run below.
-    runHostScopedLocalCatalogLifecycle(world, hostKey, { freshSeed: freshSeed !== null });
+    runHostScopedLocalCatalogLifecycle(world, hostKey, { freshSeed: freshSeed !== null || seedDigestHit });
     if (freshSeed) {
       const exported = world.exportWorld();
       const seeded = mergeHostScopedSeedWithStatus(exported, freshSeed, hostKey);

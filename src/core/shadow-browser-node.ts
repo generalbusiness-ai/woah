@@ -702,11 +702,11 @@ export async function openShadowBrowserScope(
     if (executableSeedDigest) {
       rememberShadowBrowserOpenExecutableSeedDigest(browser.relay, openSeedCacheKey, executableSeedDigest);
     }
-    // The execution node and browser cache are separate stores: the former runs
-    // local turns, while the latter persists transfer pages through IndexedDB.
+    // The execution node and browser cache are separate stores: install the
+    // executable pages into the node here, then let applyShadowBrowserTransfer
+    // cache the same transfer once for the browser-visible store below.
     const installStartedAt = metricNow();
     installShadowStateTransfer(browser.execution_node, fullExecutableTransfer);
-    cacheStatePages(browser.cache, fullExecutableTransfer.mode === "cell_pages" ? fullExecutableTransfer.inline_pages : []);
     emitV2OpenStep(options, browser, "open_seed_install", installStartedAt, {
       executable_transfer_cache: "miss",
       count: fullExecutableTransfer.mode === "cell_pages" ? fullExecutableTransfer.inline_pages.length : 1

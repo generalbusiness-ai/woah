@@ -32,6 +32,8 @@ DRY_RUN=0
 EXPECTED_BRANCH="main"
 WORKER_URL="${WOO_WORKER_URL:-https://woah1.generalbusiness.ai}"
 POSTFLIGHT_TIMEOUT="${WOO_POSTFLIGHT_TIMEOUT:-45}"
+POSTFLIGHT_WARM_OBJECT_LIMIT="${WOO_DEPLOY_WARM_OBJECT_LIMIT:-8}"
+POSTFLIGHT_WARM_TIMEOUT="${WOO_DEPLOY_WARM_TIMEOUT:-8}"
 # --no-install forces resolution to the project-local wrangler pinned in
 # package.json/package-lock.json. Without it, npx silently downloads whatever
 # wrangler version is current at execution time, which can change deploy
@@ -292,6 +294,47 @@ state_body=$(curl -sS --max-time "$POSTFLIGHT_TIMEOUT" \
 [[ "${state_body:0:1}" == "{" ]] \
   || fail "/api/state did not return JSON: $(printf '%s' "$state_body" | head -c 200)"
 ok "/api/state: 200 ($(printf '%s' "$state_body" | wc -c | tr -d ' ') bytes)"
+
+# Warm a bounded set of catalog instance hosts before the heavier cross-actor
+# smoke. A Worker deploy cold-starts Durable Objects; without this, the smoke
+# often measures serialized first activation of WORLD + satellites rather than
+# the behavior it is supposed to validate. These are best-effort GETs against
+# already-authenticated object describe routes, not correctness gates.
+if [[ "$POSTFLIGHT_WARM_OBJECT_LIMIT" =~ ^[0-9]+$ && "$POSTFLIGHT_WARM_OBJECT_LIMIT" -gt 0 ]]; then
+  warm_targets=$(WOO_DEPLOY_WARM_OBJECT_LIMIT="$POSTFLIGHT_WARM_OBJECT_LIMIT" node -e '
+    const limit = Number(process.env.WOO_DEPLOY_WARM_OBJECT_LIMIT || "8");
+    let body = "";
+    process.stdin.on("data", d => body += d).on("end", () => {
+      try {
+        const state = JSON.parse(body);
+        const actor = state.actor ?? null;
+        const ids = Object.keys(state.objects ?? {})
+          .filter(id => !id.startsWith("$") && id !== actor)
+          .sort()
+          .slice(0, Math.max(0, limit));
+        for (const id of ids) console.log(encodeURIComponent(id));
+      } catch {}
+    });
+  ' <<< "$state_body" || true)
+  warmed=0
+  warm_failed=0
+  while IFS= read -r target_path; do
+    [[ -n "$target_path" ]] || continue
+    if curl -sS --max-time "$POSTFLIGHT_WARM_TIMEOUT" \
+        "$WORKER_URL/api/objects/$target_path" -H "authorization: Session $sid" >/dev/null 2>&1; then
+      warmed=$((warmed + 1))
+    else
+      warm_failed=$((warm_failed + 1))
+    fi
+  done <<< "$warm_targets"
+  if [[ "$warmed" -gt 0 || "$warm_failed" -gt 0 ]]; then
+    if [[ "$warm_failed" -gt 0 ]]; then
+      warn "warm objects: $warmed ok, $warm_failed timed out/failed (best effort)"
+    else
+      ok "warm objects: $warmed"
+    fi
+  fi
+fi
 
 # universal-class describe via gateway (no catalog assumption)
 wiz_body=$(curl -sS --max-time "$POSTFLIGHT_TIMEOUT" "$WORKER_URL/api/objects/\$wiz" \
