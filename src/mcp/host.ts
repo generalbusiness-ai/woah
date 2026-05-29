@@ -112,6 +112,17 @@ type McpVerbInfo = {
   owner?: ObjRef;
 };
 
+// One cached verb surface for a (projection, actor, surface-identity) key —
+// shared across same-parent objects with no own verbs, but object-unique for an
+// object that defines its own (see verbSurfaceClassKey). `obvious` holds the raw
+// obviousCommandVerbs result; `tooled` holds the collected {verb, owner} pairs
+// from computeTooledVerbs. Every field stored is stable for that key: the
+// per-object `owner` default for the obvious projection is re-applied by
+// obviousVerbsFor on each call, never baked into the cached array. Entry
+// validity is governed by the cache-wide mutation-version epoch, not per entry.
+type TooledVerbEntry = { verb: McpVerbInfo; owner: ObjRef };
+type VerbSurfaceCacheEntry = { obvious?: McpVerbInfo[]; tooled?: TooledVerbEntry[] };
+
 // `actor_wait` runs through the standard verb-dispatch path, which doesn't
 // thread the MCP session id through CallContext. McpHost.invokeTool sets this
 // before dispatching the wait verb so the native handler can find the right
@@ -123,6 +134,28 @@ export class McpHost {
   private listChangedListeners = new Set<(actor: ObjRef) => void>();
   private toolListSnapshot = new Map<string, string>();
   private sessionToolManifests = new Map<string, SessionToolManifest>();
+
+  // Tool-surface verb cache. Computing the obvious/tooled verb surface for an
+  // object walks its full ancestry + feature chain and runs a permission check
+  // per verb (obviousCommandVerbs / computeTooledVerbs). enumerateLocalToolDescriptors
+  // does this for EVERY child of a $space under expandContents — e.g. every node
+  // in an outline whose items live in the space's contents — which made
+  // enumeration O(items x ancestry x verbs) and pushed large shared scopes
+  // (the_outline) past the 5s host read-RPC budget, yielding zero tools and a
+  // downstream E_VERBNF. The surface is fully determined by (projection, actor,
+  // the object's class lineage + its own verbs/features), so same-parent items
+  // with no own verbs share one key (the outline fan-out collapses); an object
+  // that defines its own verbs keys uniquely (see verbSurfaceClassKey). The
+  // whole cache is valid only for a single world mutation-version epoch (same
+  // idiom as world.hostSeedCache): any mutation clears it, so a verb/perm/
+  // feature/actor edit is always observed and entries never linger stale. Within
+  // one synchronous enumerate the version is fixed, so same-class items collapse
+  // to one walk; across calls the cache also holds until the next mutation. A
+  // coarse cap guards a pathological epoch that touches a very large number of
+  // distinct keys.
+  private verbSurfaceCache = new Map<string, VerbSurfaceCacheEntry>();
+  private verbSurfaceCacheVersion = -1;
+  private static readonly VERB_SURFACE_CACHE_MAX = 16384;
 
   private broadcasts: McpBroadcastHooks = {};
 
@@ -879,8 +912,23 @@ export class McpHost {
   }
 
   private tooledVerbsFor(actor: ObjRef, id: ObjRef): McpVerbInfo[] {
+    const cached = this.cachedVerbSurface(actor, id, "tools");
+    if (!cached.tooled) cached.tooled = this.computeTooledVerbs(actor, id);
+    // owner is the defining object (an ancestor, or `id` itself for an own
+    // verb). It is stable for the cache key — own-verb objects key uniquely on
+    // their id — so the cached entries are reused verbatim; the spread produces
+    // a fresh object per call.
+    return cached.tooled.map((entry) => ({ ...entry.verb, owner: entry.owner }));
+  }
+
+  // The uncached ancestry + feature walk behind tooledVerbsFor. Returns
+  // {verb, owner} pairs where owner is the defining object — an ancestor, or
+  // `id` itself for a verb defined directly on this object. Safe to cache under
+  // the surface key: own-verb-free objects share on the parent, and any object
+  // that contributes its own verbs (owner === id) keys uniquely on its id.
+  private computeTooledVerbs(actor: ObjRef, id: ObjRef): TooledVerbEntry[] {
     const seen = new Set<string>();
-    const out: McpVerbInfo[] = [];
+    const out: TooledVerbEntry[] = [];
     const collect = (start: ObjRef): void => {
       let cursor: ObjRef | null = start;
       while (cursor && this.world.objects.has(cursor)) {
@@ -891,7 +939,7 @@ export class McpHost {
           if (this.isSuppressedInheritedActorTool(actor, id, cursor)) continue;
           if (verb.tool_exposed !== true) continue;
           if (!this.world.canExecuteVerb(actor, verb)) continue;
-          out.push({ ...(verb as unknown as Omit<McpVerbInfo, "owner">), owner: cursor });
+          out.push({ verb: verb as unknown as McpVerbInfo, owner: cursor });
         }
         cursor = obj.parent;
       }
@@ -903,8 +951,57 @@ export class McpHost {
   }
 
   private obviousVerbsFor(actor: ObjRef, id: ObjRef): McpVerbInfo[] {
-    return (this.world.obviousCommandVerbs(id, { actor, executableOnly: true }) as unknown as McpVerbInfo[])
-      .map((verb) => ({ ...verb, owner: verb.owner ?? id }));
+    const cached = this.cachedVerbSurface(actor, id, "obvious");
+    if (!cached.obvious) cached.obvious = this.world.obviousCommandVerbs(id, { actor, executableOnly: true }) as unknown as McpVerbInfo[];
+    // The obvious projection leaves `owner` unset on class verbs; default it to
+    // the object itself per call (drives toolSurfaceSourceRows). This default is
+    // per-object, so it is applied here and never written into the cached array.
+    return cached.obvious.map((verb) => ({ ...verb, owner: verb.owner ?? id }));
+  }
+
+  // Returns the cache entry for this (actor, object, projection) verb surface,
+  // creating an empty one (filled lazily by the caller) on a miss. The whole
+  // cache is dropped when the world's mutation version has advanced since it was
+  // last populated, so an entry is only ever read within the epoch that produced
+  // it — no per-entry staleness is possible.
+  private cachedVerbSurface(actor: ObjRef, id: ObjRef, projection: "tools" | "obvious"): VerbSurfaceCacheEntry {
+    const version = this.world.mutationVersion();
+    if (version !== this.verbSurfaceCacheVersion) {
+      this.verbSurfaceCache.clear();
+      this.verbSurfaceCacheVersion = version;
+    } else if (this.verbSurfaceCache.size >= McpHost.VERB_SURFACE_CACHE_MAX) {
+      // A single epoch touching this many distinct (actor, class) pairs is
+      // pathological; drop the cache rather than grow without bound.
+      this.verbSurfaceCache.clear();
+    }
+    const key = this.verbSurfaceClassKey(actor, id, projection);
+    let entry = this.verbSurfaceCache.get(key);
+    if (!entry) {
+      entry = {};
+      this.verbSurfaceCache.set(key, entry);
+    }
+    return entry;
+  }
+
+  // Identity that two objects must share to have the same verb surface. Under
+  // single inheritance the immediate parent fully determines the inherited
+  // ancestry and inherited feature list, so same-parent siblings with no own
+  // definitions collapse to one key — the hot outline case. An object that
+  // defines its OWN verbs cannot share: those verbs contribute per-object
+  // content (arg_spec, source, perms, owner, exposure flags), not just names, so
+  // we make the key object-unique whenever own verbs exist rather than try to
+  // fingerprint every field. The own `features` value also varies the surface
+  // and is keyed by value; the tools projection additionally depends on whether
+  // the object is a block or is the actor itself (inherited $actor-tool
+  // suppression).
+  private verbSurfaceClassKey(actor: ObjRef, id: ObjRef, projection: "tools" | "obvious"): string {
+    const obj = this.world.object(id);
+    // `self:<id>` makes objects with their own verbs unique; `shared` lets
+    // own-verb-free siblings reuse one entry keyed on the parent.
+    const ownIdentity = obj.verbs.length > 0 ? `self:${id}` : "shared";
+    const ownFeatures = JSON.stringify(this.world.propOrNull(id, "features") ?? null);
+    const tooledDiscriminator = projection === "tools" ? `${id === actor}:${this.isBlockObject(id)}` : "";
+    return `${projection}|${actor}|p:${obj.parent ?? ""}|own:${ownIdentity}|f:${ownFeatures}|t:${tooledDiscriminator}`;
   }
 
   private toolSurfaceSourceRows(object: ObjRef, owner: ObjRef | undefined): RemoteToolDescriptor["source_rows"] {

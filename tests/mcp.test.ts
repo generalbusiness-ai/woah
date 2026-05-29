@@ -302,6 +302,133 @@ describe("McpHost", () => {
     expect(Object.keys(teachProperties)).toEqual(["phrase"]);
   });
 
+  // Regression for the tool-surface verb cache (notes/2026-05-28-...): a $space
+  // full of same-class items (an outline whose nodes live in its contents) must
+  // not recompute the verb surface once per item. Before the cache,
+  // enumerateLocalToolDescriptors over the_outline ran obviousCommandVerbs per
+  // node, was O(items x ancestry x verbs), and blew the 5s host read budget —
+  // the scope then contributed zero tools and `enter` resolved as E_VERBNF.
+  it("collapses the obvious verb surface across same-class space contents and invalidates on edit", async () => {
+    const world = bootstrapWorld();
+    const session = world.auth("guest:tool-surface-cache");
+    const host = new McpHost(world);
+    host.bindSession(session.id, session.actor);
+
+    // A space whose children are all instances of one item class, mirroring an
+    // outline whose nodes moveto into the outliner's contents.
+    world.createObject({ id: "cache_space", name: "Cache Space", parent: "$space", owner: "$wiz" });
+    world.createObject({ id: "cache_item", name: "Cache Item Class", parent: "$thing", owner: "$wiz" });
+    expect(installVerb(world, "cache_item", "poke", `verb :poke() rxd {
+  return "poked";
+}`, null).ok).toBe(true);
+    const pokeVerb = world.ownVerb("cache_item", "poke");
+    expect(pokeVerb).toBeDefined();
+    if (pokeVerb) pokeVerb.arg_spec = { ...pokeVerb.arg_spec, command: { dobj: "this", prep: "none", iobj: "none", args_from: [] } };
+
+    const itemCount = 60;
+    for (let i = 0; i < itemCount; i++) {
+      world.createObject({ id: `cache_item_${i}`, name: `Item ${i}`, parent: "cache_item", owner: "$wiz", location: "cache_space" });
+    }
+
+    const request: RemoteToolRequest = { id: "cache_space", projection: "tools", expandContents: true, contentsProjection: "obvious" };
+    const surfaceSpy = vi.spyOn(world, "obviousCommandVerbs");
+
+    const first = host.enumerateLocalToolDescriptors(session.actor, [request]);
+
+    // Correctness: every item advertises poke, and each descriptor carries its
+    // OWN object id and source-row authority scope — not the first item's, which
+    // would happen if the per-object owner default were baked into the cache.
+    for (let i = 0; i < itemCount; i++) {
+      const descriptor = first.find((d) => d.object === `cache_item_${i}` && d.verb === "poke");
+      expect(descriptor).toBeDefined();
+      expect(descriptor!.source_rows?.every((row) => row.authority_scope === `cache_item_${i}`)).toBe(true);
+    }
+
+    // Collapse: 60 same-class items share one obvious-verb walk. (The space id
+    // itself uses the tools projection, which does not call obviousCommandVerbs.)
+    expect(surfaceSpy.mock.calls.length).toBe(1);
+
+    // Cross-call hold: a second identical enumeration with no intervening world
+    // mutation reuses the cache and does not recompute.
+    surfaceSpy.mockClear();
+    const second = host.enumerateLocalToolDescriptors(session.actor, [request]);
+    expect(second.filter((d) => d.verb === "poke").length).toBe(itemCount);
+    expect(surfaceSpy.mock.calls.length).toBe(0);
+
+    // Invalidation: editing a verb on the item class bumps the world mutation
+    // version, which drops the cache, so the next enumeration both recomputes
+    // and reflects the new verb on every item.
+    surfaceSpy.mockClear();
+    expect(installVerb(world, "cache_item", "prod", `verb :prod() rxd {
+  return "prodded";
+}`, null).ok).toBe(true);
+    const prodVerb = world.ownVerb("cache_item", "prod");
+    if (prodVerb) prodVerb.arg_spec = { ...prodVerb.arg_spec, command: { dobj: "this", prep: "none", iobj: "none", args_from: [] } };
+
+    const third = host.enumerateLocalToolDescriptors(session.actor, [request]);
+    expect(surfaceSpy.mock.calls.length).toBe(1);
+    expect(third.filter((d) => d.verb === "prod").length).toBe(itemCount);
+    expect(third.filter((d) => d.verb === "poke").length).toBe(itemCount);
+    surfaceSpy.mockRestore();
+  });
+
+  // Regression: the verb-surface cache key must NOT collapse two objects that
+  // share a parent but each define their OWN verb of the same name. Keying own
+  // verbs by name alone aliased their distinct arg_spec/source/owner, so the
+  // second object was emitted with the first's schema and source_rows.
+  it("does not alias same-named instance-owned verbs across same-parent objects", async () => {
+    const world = bootstrapWorld();
+    const session = world.auth("guest:tool-surface-own-verbs");
+    const host = new McpHost(world);
+    host.bindSession(session.id, session.actor);
+
+    world.createObject({ id: "own_space", name: "Own Space", parent: "$space", owner: "$wiz" });
+    world.createObject({ id: "tool_a", name: "Tool A", parent: "$thing", owner: "$wiz", location: "own_space" });
+    world.createObject({ id: "tool_b", name: "Tool B", parent: "$thing", owner: "$wiz", location: "own_space" });
+
+    // Same verb name, different parameters and bodies — defined directly on each
+    // instance, so neither is inherited from the shared $thing parent.
+    expect(installVerb(world, "tool_a", "zap", `verb :zap(alpha) rxd {
+  return alpha;
+}`, null).ok).toBe(true);
+    expect(installVerb(world, "tool_b", "zap", `verb :zap(beta, gamma) rxd {
+  return beta;
+}`, null).ok).toBe(true);
+    for (const id of ["tool_a", "tool_b"]) {
+      const verb = world.ownVerb(id, "zap")!;
+      verb.tool_exposed = true;
+      verb.arg_spec = { ...verb.arg_spec, command: { dobj: "this", prep: "none", iobj: "none", args_from: [] } };
+    }
+
+    // tools projection (direct per-object requests). Under the aliasing bug,
+    // tool_b's zap was emitted with tool_a's source, arg_spec, and source_rows.
+    const tooled = host.enumerateLocalToolDescriptors(session.actor, [
+      { id: "tool_a", projection: "tools" },
+      { id: "tool_b", projection: "tools" }
+    ]);
+    const aTools = tooled.find((d) => d.object === "tool_a" && d.verb === "zap")!;
+    const bTools = tooled.find((d) => d.object === "tool_b" && d.verb === "zap")!;
+    expect(aTools).toBeDefined();
+    expect(bTools).toBeDefined();
+    expect(aTools.source).toContain("return alpha");
+    expect(bTools.source).toContain("return beta");
+    expect(aTools.arg_spec).not.toEqual(bTools.arg_spec);
+    expect(aTools.source_rows?.every((row) => row.authority_scope === "tool_a")).toBe(true);
+    expect(bTools.source_rows?.every((row) => row.authority_scope === "tool_b")).toBe(true);
+
+    // obvious contents projection (the outline-shaped fan-out path).
+    const obvious = host.enumerateLocalToolDescriptors(session.actor, [
+      { id: "own_space", projection: "tools", expandContents: true, contentsProjection: "obvious" }
+    ]);
+    const aObv = obvious.find((d) => d.object === "tool_a" && d.verb === "zap")!;
+    const bObv = obvious.find((d) => d.object === "tool_b" && d.verb === "zap")!;
+    expect(aObv).toBeDefined();
+    expect(bObv).toBeDefined();
+    expect(aObv.source).toContain("return alpha");
+    expect(bObv.source).toContain("return beta");
+    expect(aObv.arg_spec).not.toEqual(bObv.arg_spec);
+  });
+
   it("exposes verb editor tools after the programmer enters the editor room", async () => {
     const world = bootstrapWorld();
     // The verb editor exit-to-$nowhere assertion below assumes the actor had
