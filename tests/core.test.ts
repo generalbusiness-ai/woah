@@ -4,7 +4,7 @@ import { bootstrap, createWorld, createWorldFromSerialized, mergeHostScopedSeed,
 import { bundledCatalogAliases, installLocalCatalogs } from "../src/core/local-catalogs";
 import type { ParkedTaskRecord, SerializedWorld } from "../src/core/repository";
 import type { CallContext, WooWorld } from "../src/core/world";
-import type { MetricEvent, ObjRef, WooValue } from "../src/core/types";
+import { freezeTinyBytecode, type MetricEvent, type ObjRef, type TinyBytecode, type WooValue } from "../src/core/types";
 import {
   authedWorld,
   bytecodeVerb,
@@ -1611,8 +1611,13 @@ describe("woo core", () => {
     setNestedMarker(liveVerb.arg_spec.command, "after-world");
     setNestedMarker(liveVerb.line_map, "after-world");
     liveVerb.calls![0].name = "after-world";
-    setNestedMarker(liveByteVerb.bytecode.ops[0][1], "after-world");
-    setNestedMarker(liveByteVerb.bytecode.literals[0], "after-world");
+    // Bytecode is immutable and shared by reference across worlds, so the live
+    // world holds a deeply-frozen object: an in-place mutation throws instead of
+    // silently editing a peer world that shares the same source. (Mutable verb
+    // wrapper fields above remain per-world isolated.)
+    expect(Object.isFrozen(liveByteVerb.bytecode)).toBe(true);
+    expect(() => setNestedMarker(liveByteVerb.bytecode.ops[0][1], "after-world")).toThrow();
+    expect(() => setNestedMarker(liveByteVerb.bytecode.literals[0], "after-world")).toThrow();
     setNestedMarker(liveRoot.eventSchemas.get("isolation_event")!, "after-world");
     const liveLog = reloaded.logs.get("$nowhere")![0];
     setNestedMarker(liveLog.message.args[0], "after-world");
@@ -1636,6 +1641,107 @@ describe("woo core", () => {
     expect(nestedMarker(logEntry.error!.value!)).toBe("after-input");
     expect(nestedMarker(snapshot.state)).toBe("after-input");
     expect(nestedMarker(task.serialized)).toBe("after-input");
+  });
+
+  it("deep-freezes bytecode so a shared copy cannot be mutated in place", () => {
+    const bytecode = freezeTinyBytecode({
+      ops: [["PUSH_LIT", 0]],
+      literals: [{ nested: { marker: "x" } }],
+      num_locals: 0,
+      max_stack: 1,
+      version: 1
+    });
+    expect(Object.isFrozen(bytecode)).toBe(true);
+    expect(Object.isFrozen(bytecode.ops)).toBe(true);
+    expect(Object.isFrozen(bytecode.ops[0])).toBe(true);
+    expect(Object.isFrozen(bytecode.literals)).toBe(true);
+    expect(Object.isFrozen(bytecode.literals[0])).toBe(true);
+    expect(Object.isFrozen(((bytecode.literals[0] as Record<string, WooValue>).nested))).toBe(true);
+    expect(() => { ((bytecode.literals[0] as Record<string, Record<string, string>>).nested).marker = "y"; }).toThrow();
+  });
+
+  it("shares frozen bytecode by reference across imported worlds without cloning or cross-world corruption", () => {
+    // A bytecode verb whose body we can identify after export.
+    const live = createWorld({ catalogs: false });
+    live.createObject({ id: "freeze_probe", name: "Probe", parent: "$thing", owner: "$wiz" });
+    expect(installVerb(live, "freeze_probe", "ping", `verb :ping() rxd {
+  return "pong";
+}`, null).ok).toBe(true);
+    const serialized = live.exportWorld();
+
+    // Freeze the verb's bytecode in the serialized source, mimicking the
+    // module-global KV reservoir: bytecode is frozen once, then every world
+    // restored in the isolate shares that one object by reference.
+    const probe = serialized.objects.find((obj) => obj.id === "freeze_probe");
+    const probeVerb = probe?.verbs.find((verb) => verb.name === "ping");
+    expect(probeVerb?.kind).toBe("bytecode");
+    if (probeVerb?.kind !== "bytecode") return;
+    const frozenBytecode: TinyBytecode = freezeTinyBytecode(probeVerb.bytecode);
+
+    const worldA = createWorldFromSerialized(serialized, { persist: false });
+    const worldB = createWorldFromSerialized(serialized, { persist: false });
+    const pingOf = (world: WooWorld) => {
+      const verb = world.object("freeze_probe").verbs.find((candidate) => candidate.name === "ping");
+      return verb?.kind === "bytecode" ? verb : null;
+    };
+    const a = pingOf(worldA);
+    const b = pingOf(worldB);
+    expect(a).toBeTruthy();
+    expect(b).toBeTruthy();
+    if (!a || !b) return;
+
+    // Shared by reference — no per-import deep clone of ops/literals.
+    expect(a.bytecode).toBe(frozenBytecode);
+    expect(b.bytecode).toBe(frozenBytecode);
+    expect(Object.isFrozen(a.bytecode)).toBe(true);
+
+    // An attempted in-place mutation throws, so one world can never corrupt the
+    // bytecode another world shares.
+    const opCountBefore = b.bytecode.ops.length;
+    expect(() => { (a.bytecode.ops as unknown[]).push(["NOOP"]); }).toThrow();
+    expect(pingOf(worldB)!.bytecode.ops.length).toBe(opCountBefore);
+  });
+
+  it("does not share a merely shallow-frozen bytecode across imported worlds", () => {
+    // A shallow Object.freeze leaves ops/literals mutable. Trusting bare
+    // Object.isFrozen would share such an object by reference and let one world
+    // corrupt another's ops; importBytecode must instead clone+deep-freeze it.
+    const live = createWorld({ catalogs: false });
+    live.createObject({ id: "shallow_probe", name: "Probe", parent: "$thing", owner: "$wiz" });
+    expect(installVerb(live, "shallow_probe", "ping", `verb :ping() rxd {
+  return "pong";
+}`, null).ok).toBe(true);
+    const serialized = live.exportWorld();
+    const probeVerb = serialized.objects.find((obj) => obj.id === "shallow_probe")?.verbs.find((verb) => verb.name === "ping");
+    expect(probeVerb?.kind).toBe("bytecode");
+    if (probeVerb?.kind !== "bytecode") return;
+
+    // Shallow freeze: top frozen, ops/literals still mutable — and NOT branded
+    // by our deepFreezePlainValue.
+    Object.freeze(probeVerb.bytecode);
+    expect(Object.isFrozen(probeVerb.bytecode)).toBe(true);
+    expect(Object.isFrozen(probeVerb.bytecode.ops)).toBe(false);
+
+    const worldA = createWorldFromSerialized(serialized, { persist: false });
+    const worldB = createWorldFromSerialized(serialized, { persist: false });
+    const pingOf = (world: WooWorld) => {
+      const verb = world.object("shallow_probe").verbs.find((candidate) => candidate.name === "ping");
+      return verb?.kind === "bytecode" ? verb : null;
+    };
+    const a = pingOf(worldA);
+    const b = pingOf(worldB);
+    expect(a).toBeTruthy();
+    expect(b).toBeTruthy();
+    if (!a || !b) return;
+
+    // Each world got its own deep-frozen clone — the shallow-frozen source is
+    // never shared, and the two worlds do not alias each other.
+    expect(a.bytecode).not.toBe(probeVerb.bytecode);
+    expect(a.bytecode).not.toBe(b.bytecode);
+    expect(Object.isFrozen(a.bytecode.ops)).toBe(true);
+    const opCountBefore = b.bytecode.ops.length;
+    expect(() => { (a.bytecode.ops as unknown[]).push(["NOOP"]); }).toThrow();
+    expect(pingOf(worldB)!.bytecode.ops.length).toBe(opCountBefore);
   });
 
   it("does not share cached boot snapshot cells across createWorld calls", () => {

@@ -44,7 +44,7 @@ import {
   type RestProtocolRequest
 } from "../core/protocol";
 import type { ErrorValue, MetricEvent, ObjRef, Observation, RemoteToolDescriptor, RemoteToolRequest, Session, TinyBytecode, VerbDef, WooValue } from "../core/types";
-import { directedRecipients, publicAppliedFrame, sessionActiveScopeFromRecord, wooError } from "../core/types";
+import { directedRecipients, freezeTinyBytecode, publicAppliedFrame, sessionActiveScopeFromRecord, wooError } from "../core/types";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, LiveEventFrame, Message } from "../core/types";
 import type { SeedWorld, SerializedAuthoritySlice, SerializedObject, SerializedWorld, TombstoneRecord } from "../core/repository";
 import { createHostOperationMemo, normalizeError } from "../core/world";
@@ -5682,12 +5682,17 @@ function restoreBytecodeFreeWorldFromReservoirs<T extends SerializedWorld>(
       if (!expected) return { ok: false, reason: "missing_bytecode_hash" };
       if (isTinyBytecode(raw.bytecode)) {
         if (hashTinyBytecode(raw.bytecode) !== expected) return { ok: false, reason: "inline_hash_mismatch" };
-        verbs.push({ ...verb, line_map, bytecode: structuredClone(raw.bytecode) } as VerbDef);
+        // Inline bytecode is owned by this freshly-parsed payload; freeze it in
+        // place and share rather than clone (bytecode is immutable; importWorld
+        // shares frozen bytecode by reference instead of deep-copying it).
+        verbs.push({ ...verb, line_map, bytecode: freezeTinyBytecode(raw.bytecode) } as VerbDef);
         continue;
       }
       const lookup = findReservoirBytecode(reservoirs, obj.id, name, expected);
       if (!lookup.ok) return { ok: false, reason: lookup.reason };
-      verbs.push({ ...verb, line_map, bytecode: structuredClone(lookup.bytecode) } as VerbDef);
+      // Reservoir bytecode is already frozen at reservoir-build time and shared
+      // across every world restored in this isolate — hand back the reference.
+      verbs.push({ ...verb, line_map, bytecode: lookup.bytecode } as VerbDef);
     }
     objects.push({ ...obj, verbs });
   }
@@ -5705,7 +5710,10 @@ function bytecodeReservoirFromSerializedWorld(world: SerializedWorld | null): By
         objectVerbs = new Map();
         reservoir.set(obj.id, objectVerbs);
       }
-      objectVerbs.set(verb.name, { hash: hashTinyBytecode(verb.bytecode), bytecode: verb.bytecode });
+      // Freeze once at reservoir-build time so every world that restores from
+      // this module-global reservoir can share the bytecode object by reference
+      // without a defensive clone, and so accidental mutation throws.
+      objectVerbs.set(verb.name, { hash: hashTinyBytecode(verb.bytecode), bytecode: freezeTinyBytecode(verb.bytecode) });
     }
   }
   return reservoir;
