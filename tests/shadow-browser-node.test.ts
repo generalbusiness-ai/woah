@@ -1673,7 +1673,7 @@ describe("shadow browser node shim", () => {
     expect(worldFor(browser).getProp("delay_1", "wet")).toBe(0.37);
   });
 
-  it("executes default server-assisted intents with one authoritative VM run", async () => {
+  it("executes default server-assisted intents through the guarded relay executor", async () => {
     const { browser } = await browserForScope("the_dubspace", "guest:browser-authoritative-intent", async (world, session) => {
       world.setProp("the_dubspace", "operators", [session.actor]);
     });
@@ -1703,6 +1703,41 @@ describe("shadow browser node shim", () => {
     expect(reply?.body.state_transfer).toBeUndefined();
     expect(metrics.filter((event) => event.kind === "applied" && event.verb === "set_control")).toHaveLength(1);
     expect(worldFor(browser).getProp("delay_1", "wet")).toBe(0.38);
+  });
+
+  it("reports a transitive object miss from default server-assisted intents as missing_state", async () => {
+    const { browser, actor } = await browserForScope("the_deck", "guest:browser-guarded-intent-miss");
+    const serialized = serializedFor(browser.relay.commit_scope);
+    serialized.objects = serialized.objects.filter((obj) =>
+      !["the_garden", "exit_garden_north", "exit_garden_south"].includes(obj.id)
+    );
+    markShadowBrowserRelaySerializedChanged(browser.relay);
+
+    const envelope = shadowBrowserEnvelope(browser, "woo.turn.intent.request.shadow.v1", {
+      kind: "woo.turn.intent.request.shadow.v1" as const,
+      id: "browser-guarded-intent-south",
+      route: "sequenced" as const,
+      scope: "the_deck",
+      target: "the_deck",
+      verb: "south",
+      args: [],
+      persistence: "durable" as const
+    }, "browser-guarded-intent-miss-env");
+
+    const reply = await handleShadowBrowserTurnExecEnvelope(
+      browser,
+      receiveShadowBrowserEnvelopeReceipt(browser, encodeEnvelope(envelope))
+    );
+
+    expect(reply?.body).toMatchObject({
+      kind: "woo.turn.exec.reply.shadow.v1",
+      ok: false,
+      reason: "missing_state"
+    });
+    const missing = reply?.body.ok === false ? reply.body.missing_atoms ?? [] : [];
+    expect(missing.some((atom) => atom.preimage === "read:cell:lifecycle:the_garden")).toBe(true);
+    expect(reply?.body.commit).toBeUndefined();
+    expect(worldFor(browser).allLocationsForActor(actor)).toEqual(["the_deck"]);
   });
 
   it("carries selected delegated executors through server-assisted intent planning", async () => {

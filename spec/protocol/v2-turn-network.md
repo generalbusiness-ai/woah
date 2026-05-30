@@ -943,6 +943,14 @@ missing. If missing state is discovered during execution, the executor MUST
 abort without commit and return `missing_state`. Partial transcripts from such
 runs are diagnostics only.
 
+Server-assisted intent execution MAY start from a static call key that contains
+only routing and acceptance atoms (actor, target, scope, call). Such a request
+MUST run on a guarded executor, not on an authoritative fast path. The guarded
+executor may pre-authorize the atoms for cells already materialized in its
+serialized slice so a complete slice still executes in one VM pass; any cell or
+object not covered by that materialized set remains a `missing_state` miss that
+the caller hydrates and retries as a whole turn.
+
 ### VTN10.1 Object lookup misses are materialization misses
 
 Under guarded (sparse, non-authoritative) execution, an object lookup for an id
@@ -1002,6 +1010,14 @@ before normal turn recording opens, guarded implementations must either precheck
 preamble atoms or translate preamble `E_OBJNF` misses into the same
 `missing_state` lifecycle atom. Recorded-turn replay helpers remain diagnostic
 preflight harnesses only.
+
+Cell-page transfer MUST NOT mark a read lifecycle atom covered when the anchor
+snapshot cannot provide that object. Negative cells that are genuinely
+materialized as absence (for example an inherited verb lookup that misses on an
+intermediate class) may be granted as covered, but a missing object lifecycle
+read requires owner/anchor hydration before retry. Write lifecycle atoms are
+different: object creation writes may legitimately name an object absent from
+the pre-turn snapshot.
 
 The production execution helper receives a `TurnCall`, executes it fresh on the
 selected node, returns a `TurnExecReply`, and can submit the fresh transcript to

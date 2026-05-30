@@ -1,3 +1,4 @@
+import type { SerializedObject, SerializedWorld } from "./repository";
 import type { ObjRef } from "./types";
 import type { EffectTranscript, TranscriptCell } from "./effect-transcript";
 import { hashSource } from "./source-hash";
@@ -74,6 +75,111 @@ export function shadowTurnKeyFromTranscript(transcript: EffectTranscript): Shado
     accept_preimages: sortedAccepts,
     accept_atom_hashes: sortedAccepts.map((preimage) => shadowAtomHash(preimage))
   };
+}
+
+export function shadowTurnKeyFromCall(call: {
+  scope: ObjRef;
+  actor: ObjRef;
+  target: ObjRef;
+  verb: string;
+}): ShadowTurnKey {
+  // Static intent keys deliberately name only the routing/acceptance atoms known
+  // before VM execution. Sparse executors then discover the real read/write
+  // closure by guarded execution: each missing dispatch/property/object cell
+  // becomes `missing_state`, the caller hydrates, and the whole turn retries.
+  const preimages = new Set<string>();
+  const acceptPreimages = new Set<string>();
+  for (const preimage of [
+    `actor:${call.actor}`,
+    `target:${call.target}`,
+    `scope:${call.scope}`
+  ]) preimages.add(preimage);
+  for (const preimage of [
+    `scope:${call.scope}`,
+    `target:${call.target}`,
+    `call:${call.target}:${call.verb}`
+  ]) {
+    acceptPreimages.add(preimage);
+    preimages.add(preimage);
+  }
+  const sorted = Array.from(preimages).sort();
+  const sortedAccepts = Array.from(acceptPreimages).sort();
+  return {
+    kind: "woo.turn_key.shadow.v1",
+    scope: call.scope,
+    actor: call.actor,
+    target: call.target,
+    verb: call.verb,
+    preimages: sorted,
+    atom_hashes: sorted.map((preimage) => shadowAtomHash(preimage)),
+    read_preimages: [],
+    read_atom_hashes: [],
+    write_preimages: [],
+    write_atom_hashes: [],
+    accept_preimages: sortedAccepts,
+    accept_atom_hashes: sortedAccepts.map((preimage) => shadowAtomHash(preimage))
+  };
+}
+
+export function shadowMaterializedAtomHashesFromSerialized(serialized: SerializedWorld): string[] {
+  return shadowMaterializedCellPreimagesFromSerialized(serialized).map((preimage) => shadowAtomHash(preimage));
+}
+
+export function shadowMaterializedCellPreimagesFromSerialized(serialized: SerializedWorld): string[] {
+  const preimages = new Set<string>();
+  const byId = new Map(serialized.objects.map((obj) => [obj.id, obj] as const));
+  for (const obj of serialized.objects) {
+    for (const preimage of shadowMaterializedCellPreimagesForObject(byId, obj)) preimages.add(preimage);
+  }
+  return Array.from(preimages).sort();
+}
+
+function shadowMaterializedCellPreimagesForObject(
+  byId: ReadonlyMap<ObjRef, SerializedObject>,
+  obj: SerializedObject
+): string[] {
+  // These atoms represent what the serialized slice actually materializes, not
+  // what a turn is statically predicted to touch. A guarded whole-scope
+  // executor can therefore run once when its slice is complete, while an
+  // absent object still becomes a lifecycle materialization miss.
+  const preimages = new Set<string>();
+  preimages.add(`read:cell:lifecycle:${obj.id}`);
+  preimages.add(`read:cell:location:${obj.id}`);
+  preimages.add(`write:cell:location:${obj.id}`);
+  preimages.add(`read:cell:contents:${obj.id}`);
+  preimages.add(`write:cell:contents:${obj.id}`);
+
+  const propNames = materializedPropertyNamesForObject(byId, obj);
+  for (const name of Array.from(propNames).sort()) {
+    preimages.add(`read:cell:prop:${obj.id}.${name}`);
+    if (name !== "owner") preimages.add(`write:cell:prop:${obj.id}.${name}`);
+  }
+
+  for (const verb of obj.verbs) {
+    preimages.add(`read:cell:verb:${obj.id}:${verb.name}`);
+    preimages.add(`write:cell:verb:${obj.id}:${verb.name}`);
+  }
+  return Array.from(preimages).sort();
+}
+
+function materializedPropertyNamesForObject(
+  byId: ReadonlyMap<ObjRef, SerializedObject>,
+  obj: SerializedObject
+): Set<string> {
+  const names = new Set<string>(["name", "owner"]);
+  for (const def of obj.propertyDefs) names.add(def.name);
+  for (const [name] of obj.properties) names.add(name);
+  for (const [name] of obj.propertyVersions) names.add(name);
+  const seen = new Set<ObjRef>();
+  let parent = obj.parent;
+  while (parent && !seen.has(parent)) {
+    seen.add(parent);
+    const ancestor = byId.get(parent);
+    if (!ancestor) break;
+    for (const def of ancestor.propertyDefs) names.add(def.name);
+    parent = ancestor.parent;
+  }
+  return names;
 }
 
 export function shadowAtomHash(preimage: string): string {

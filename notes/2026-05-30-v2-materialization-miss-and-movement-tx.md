@@ -19,8 +19,14 @@ text is in `spec/protocol/v2-turn-network.md` §VTN8.1 and §VTN10.1.
   transcript to a caller-selected transaction scope after fresh planning, while
   keeping `TurnKey.scope` as the VM execution scope and seeding authority for
   the fenced cells.
-- **NEXT:** Wire that transaction scope into the non-browser executor path, then
-  fanout.
+- **DONE as an executor seam:** default durable intent envelopes now execute as
+  guarded exec requests with static call keys instead of the authoritative
+  relay fast path. `missing_state` replies feed the next authority refresh by
+  extracting object ids from missing atom preimages, so a transitive
+  materialization miss can drive an outer hydrate/retry instead of committing a
+  buried `E_OBJNF`.
+- **NEXT:** Wire the placement transaction selector into the production
+  non-browser movement path, then fanout.
 
 ## The proof (conclusive, in-process)
 
@@ -111,17 +117,37 @@ The production boundary that remains is **wire-in**, not core validation:
 non-browser submissions still need to choose/open the placement transaction
 scope when a fresh execution reveals movement writes.
 
+## Non-browser guarded intent seam
+
+The durable intent path no longer executes default server-assisted intents
+through the authoritative relay fast path. It builds a static `TurnKey` from
+the call's routing/acceptance atoms and runs it through the normal exec-request
+path with the atom guard active. To avoid turning every complete-slice turn into
+a repair round, the relay executor pre-authorizes the atoms represented by the
+serialized slice it actually materializes; absent referenced objects still
+surface as lifecycle `missing_state`.
+
+Two subtleties are now pinned by tests:
+
+- Negative materialized cells (for example an inherited verb lookup that misses
+  on an intermediate class) can be granted by cell-page repair; they are real
+  absence facts for cells on objects the slice has.
+- A read lifecycle atom for an object absent from the anchor cannot be granted
+  without pages. Cell-page transfer filters that atom out and the network
+  returns `missing_state` to the caller. Write lifecycle atoms remain grantable
+  for object creation, where the new object is absent from pre-turn state by
+  design.
+
 ## Remaining sequence (in order)
 
 1. **MV-A production selector.** The core transaction boundary and planned-exec
    seam exist; the next production step is to decide and enable the placement
    authority selector for non-browser submissions, then carry that accepted
    transaction scope through user-visible frame/fanout routing.
-2. **Non-browser executor path.** Make MCP/agent turns execute whole on a
-   capable scope/commit executor with guarded materialization repair. Gateway
-   stops assembling executable authority; it supplies session/auth/live routing
-   only. This is where the perf wall (resolve-object storms, authority-slice
-   fan-in) is actually removed.
+2. **Non-browser executor path completion.** The default intent envelope now
+   uses guarded execution and outer authority repair, but production movement
+   still needs the transaction selector above before the deck->garden class of
+   moves can be considered fixed end-to-end.
 3. **Fanout (P2).** Build the §VTN12 audience session-table delivery path; remove
    Directory `current_location` as the hot-path delivery key for movement
    observations (`subscriber_shards: 0` is the symptom the audience table was
@@ -135,4 +161,7 @@ scope when a fresh execution reveals movement writes.
   missing-fence rejection tests.
 - `spec/protocol/v2-turn-network.md` §VTN8.1, §VTN10.1.
 - `src/core/world.ts`, `src/core/shadow-turn-call.ts` — the VTN10.1 fix.
-- `src/core/executor.ts` — planned-exec transaction-scope seam.
+- `src/core/executor.ts` — planned-exec transaction-scope seam and
+  missing-state authority retry.
+- `src/core/shadow-browser-node.ts`, `src/core/turn-key.ts` — static intent key
+  plus guarded default relay executor.

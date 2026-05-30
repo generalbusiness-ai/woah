@@ -234,6 +234,11 @@ export type ShadowTurnExecRequest = {
     atom_hashes?: string[];
     max_bytes?: number;
   };
+  // Server-assisted sparse turns use a static key and must discover the true
+  // closure under the atom guard. The relay may hold a serialized slice, but it
+  // must not mark that slice authoritative: absent referenced objects have to
+  // surface as `missing_state`, not as catalog-level E_OBJNF observations.
+  guarded_execution?: boolean;
   max_transfer_bytes?: number;
   persistence?: "durable" | "live";
 };
@@ -436,7 +441,7 @@ export function buildShadowCellPageTransfer(input: {
     keyMode?: "request" | "transfer_atoms";
   };
 } & ShadowTransferSigning): ShadowCellPageTransfer {
-  const selected = selectedTransferAtoms(input.key, input.atom_hashes, input.missing_atoms);
+  let selected = selectedTransferAtoms(input.key, input.atom_hashes, input.missing_atoms);
   // VTN10.1: ONLY a lifecycle atom that arrives via
   // `missing_atoms` represents a bare-object materialization miss. Lifecycle
   // atoms also appear in full executable seeds and other ordinary closures; those
@@ -446,6 +451,16 @@ export function buildShadowCellPageTransfer(input: {
   const lifecycleObjects = lifecycleClosureObjectsFromPreimages(
     (input.missing_atoms ?? []).flatMap((atom) => typeof atom.preimage === "string" ? [atom.preimage] : [])
   );
+  const serializedObjectIds = new Set(input.serialized.objects.map((obj) => obj.id));
+  selected = selected.filter((item) => {
+    const lifecycle = lifecycleObjectFromTurnKeyPreimage(item.preimage);
+    // A READ lifecycle miss for an object absent from the anchor is a real
+    // materialization miss that this transfer cannot satisfy; do not mark it
+    // covered without pages, or the retry can fall through to E_OBJNF. A WRITE
+    // lifecycle atom is different: creates legitimately write an object that
+    // was absent from the pre-turn anchor.
+    return !lifecycle || !item.preimage.startsWith("read:") || serializedObjectIds.has(lifecycle);
+  });
   const requiredPages = pageClosureForPreimages(input.serialized, selected.map((item) => item.preimage), {
     fullLifecycleObjects: lifecycleObjects
   });

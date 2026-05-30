@@ -31,7 +31,7 @@ import {
 } from "./shadow-browser-node";
 import { decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "./shadow-envelope";
 import { runShadowTurnCallTranscript, type ShadowTurnCall, type ShadowTurnCallTranscriptRun } from "./shadow-turn-call";
-import type { ShadowTurnExecReply, ShadowTurnExecRequest } from "./shadow-turn-exec";
+import type { ShadowMissingAtom, ShadowTurnExecReply, ShadowTurnExecRequest } from "./shadow-turn-exec";
 import {
   shadowPlacementTransactionForTranscript,
   type ShadowCommitTransaction,
@@ -242,6 +242,48 @@ export function executorReplyNeedsRepair(reply: ShadowTurnExecReply): boolean {
   return reply.reason === "commit_rejected" && reply.commit?.reason === "stale_head";
 }
 
+export function executorObjectIdsFromMissingState(reply: ShadowTurnExecReply): ObjRef[] {
+  if (reply.ok || reply.reason !== "missing_state") return [];
+  const ids: ObjRef[] = [];
+  const seen = new Set<ObjRef>();
+  const push = (id: ObjRef | null): void => {
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    ids.push(id);
+  };
+  for (const atom of reply.missing_atoms ?? []) push(executorObjectIdFromMissingAtom(atom));
+  return ids;
+}
+
+function executorObjectIdFromMissingAtom(atom: ShadowMissingAtom): ObjRef | null {
+  const preimage = atom.preimage;
+  if (typeof preimage !== "string" || preimage.length === 0) return null;
+  if (preimage.startsWith("actor:")) return preimage.slice("actor:".length) as ObjRef;
+  if (preimage.startsWith("target:")) return preimage.slice("target:".length) as ObjRef;
+  if (preimage.startsWith("scope:")) return preimage.slice("scope:".length) as ObjRef;
+  if (preimage.startsWith("call:")) {
+    const rest = preimage.slice("call:".length);
+    const split = rest.lastIndexOf(":");
+    return (split > 0 ? rest.slice(0, split) : rest) as ObjRef;
+  }
+
+  const cell = preimage.replace(/^(?:read|write):/, "");
+  for (const prefix of ["cell:location:", "cell:contents:", "cell:lifecycle:"]) {
+    if (cell.startsWith(prefix)) return cell.slice(prefix.length) as ObjRef;
+  }
+  if (cell.startsWith("cell:prop:")) {
+    const rest = cell.slice("cell:prop:".length);
+    const split = rest.lastIndexOf(".");
+    return (split > 0 ? rest.slice(0, split) : rest) as ObjRef;
+  }
+  if (cell.startsWith("cell:verb:")) {
+    const rest = cell.slice("cell:verb:".length);
+    const split = rest.lastIndexOf(":");
+    return (split > 0 ? rest.slice(0, split) : rest) as ObjRef;
+  }
+  return null;
+}
+
 export function executorEnvelopeId(
   turnId: string,
   attempt: number,
@@ -338,6 +380,7 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
 ): Promise<SubmitTurnIntentResult<Client, Result>> {
   const maxAttempts = options.maxAttempts ?? 1;
   const shouldRetry = options.shouldRetry ?? executorReplyNeedsRepair;
+  let repairObjectIds: ObjRef[] = [];
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     if (options.strategy === "intent") {
       const client = await options.ensureClient(options.input.scope, attempt);
@@ -348,8 +391,11 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
         turnId,
         envelopeId: options.envelopeId?.(turnId, attempt)
       });
-      const authorityObjectIds = options.authorityObjectIds?.(options.input, options.input.scope)
-        ?? executorAuthorityObjectIds(options.input);
+      const authorityObjectIds = mergeExecutorObjectIds(
+        options.authorityObjectIds?.(options.input, options.input.scope)
+          ?? executorAuthorityObjectIds(options.input),
+        repairObjectIds
+      );
       const authority = await options.authorityPayload(options.input.scope, authorityObjectIds);
       const result = await options.submitEnvelope(options.input.scope, executorEnvelopeBody({
         scope: options.input.scope,
@@ -359,7 +405,10 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
         envelope
       }));
       const replyEnvelope = decodeExecutorReply(result.reply);
-      if (replyEnvelope?.body && attempt + 1 < maxAttempts && shouldRetry(replyEnvelope.body)) continue;
+      if (replyEnvelope?.body && attempt + 1 < maxAttempts && shouldRetry(replyEnvelope.body)) {
+        repairObjectIds = mergeExecutorObjectIds(repairObjectIds, executorObjectIdsFromMissingState(replyEnvelope.body));
+        continue;
+      }
       return {
         kind: "submitted",
         scope: options.input.scope,
@@ -414,6 +463,7 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     const authorityObjectIds = mergeExecutorObjectIds(
       options.authorityObjectIds?.(options.input, commitScope)
         ?? executorAuthorityObjectIds(options.input, commitScope),
+      repairObjectIds,
       executorTransactionObjectIds(transactionScope ? transaction : null)
     );
     const authority = await options.authorityPayload(commitScope, authorityObjectIds);
@@ -425,7 +475,10 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       envelope
     }));
     const replyEnvelope = decodeExecutorReply(result.reply);
-    if (replyEnvelope?.body && attempt + 1 < maxAttempts && shouldRetry(replyEnvelope.body)) continue;
+    if (replyEnvelope?.body && attempt + 1 < maxAttempts && shouldRetry(replyEnvelope.body)) {
+      repairObjectIds = mergeExecutorObjectIds(repairObjectIds, executorObjectIdsFromMissingState(replyEnvelope.body));
+      continue;
+    }
     return {
       kind: "submitted",
       scope: options.input.scope,

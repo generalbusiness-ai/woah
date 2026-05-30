@@ -7,6 +7,7 @@ import { decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "../src/core
 import type { ShadowScopeHead } from "../src/core/shadow-commit-scope";
 import { runShadowTurnCall } from "../src/core/shadow-turn-call";
 import type { ShadowTurnExecReply, ShadowTurnExecRequest } from "../src/core/shadow-turn-exec";
+import { shadowAtomHash, shadowTurnKeyFromCall } from "../src/core/turn-key";
 import {
   mergeExecutorAuthority,
   submitTurnIntent,
@@ -14,6 +15,7 @@ import {
   executorEnvelopeId,
   executorAuthorityObjectIds,
   executorTransactionObjectIds,
+  executorObjectIdsFromMissingState,
   executorReplyNeedsRepair,
   type ExecutorEnvelopeBody
 } from "../src/core/executor";
@@ -96,6 +98,41 @@ describe("v2 turn gateway", () => {
       }
     })).toBe(true);
     expect(executorReplyNeedsRepair(okReply("turn"))).toBe(false);
+  });
+
+  it("builds static intent keys from only routing and acceptance atoms", () => {
+    const key = shadowTurnKeyFromCall({
+      scope: "$room" as ObjRef,
+      actor: "$actor" as ObjRef,
+      target: "$target" as ObjRef,
+      verb: "look"
+    });
+
+    expect(key.scope).toBe("$room");
+    expect(key.preimages).toEqual([
+      "actor:$actor",
+      "call:$target:look",
+      "scope:$room",
+      "target:$target"
+    ]);
+    expect(key.read_preimages).toEqual([]);
+    expect(key.write_preimages).toEqual([]);
+    expect(key.accept_preimages).toEqual([
+      "call:$target:look",
+      "scope:$room",
+      "target:$target"
+    ]);
+  });
+
+  it("extracts object ids from missing-state atom preimages for authority repair", () => {
+    expect(executorObjectIdsFromMissingState(missingStateReply("turn", [
+      "read:cell:lifecycle:$missing",
+      "write:cell:contents:$room",
+      "read:cell:prop:$thing.name",
+      "read:cell:verb:$tool:use",
+      "scope:$scope",
+      "call:$target:look"
+    ]))).toEqual(["$missing", "$room", "$thing", "$tool", "$scope", "$target"]);
   });
 
   it("merges versioned authority cells into serialized state without duplicating objects", () => {
@@ -210,7 +247,11 @@ describe("v2 turn gateway", () => {
       }),
       submitEnvelope: async (_scope, body) => {
         envelopes.push(body);
-        return { reply: encodeEnvelope(replyEnvelope(envelopes.length === 1 ? missingStateReply("turn-1") : okReply("turn-1"))) };
+        return {
+          reply: encodeEnvelope(replyEnvelope(envelopes.length === 1
+            ? missingStateReply("turn-1", ["read:cell:lifecycle:$remote_room"])
+            : okReply("turn-1")))
+        };
       }
     });
 
@@ -221,7 +262,7 @@ describe("v2 turn gateway", () => {
     expect(envelopes.map((body) => body.node)).toEqual(["client-0", "client-1"]);
     expect(envelopes.map((body) => authorityObjectIds(body.authority))).toEqual([
       ["$room", "$target", "$actor"],
-      ["$room", "$target", "$actor"]
+      ["$room", "$target", "$actor", "$remote_room"]
     ]);
   });
 
@@ -512,12 +553,15 @@ function receipt(accepted: boolean) {
   };
 }
 
-function missingStateReply(id: string): ShadowTurnExecReply {
+function missingStateReply(id: string, missingPreimages: string[] = []): ShadowTurnExecReply {
   return {
     kind: "woo.turn.exec.reply.shadow.v1",
     ok: false,
     id,
-    reason: "missing_state"
+    reason: "missing_state",
+    ...(missingPreimages.length > 0 ? {
+      missing_atoms: missingPreimages.map((preimage) => ({ hash: shadowAtomHash(preimage), preimage }))
+    } : {})
   };
 }
 
