@@ -4,6 +4,7 @@ import { executorAuthorityPayload } from "../src/core/executor";
 import { authoritySliceObjectIds, filterSerializedAuthoritySliceObjects, serializedWorldFromAuthoritySlice } from "../src/core/authority-slice";
 import { encodeEnvelope, type ShadowEnvelope } from "../src/core/shadow-envelope";
 import { createShadowBrowserRelayShim } from "../src/core/shadow-browser-node";
+import { SHADOW_PLACEMENT_TRANSACTION_SCOPE } from "../src/core/shadow-commit-scope";
 import type { ShadowTurnExecReply } from "../src/core/shadow-turn-exec";
 import type { ObjRef } from "../src/core/types";
 import { McpGateway, type McpV2EnvelopeBody, type McpV2OpenBody } from "../src/mcp/gateway";
@@ -14,13 +15,29 @@ import { FakeDurableObjectState } from "./worker/fake-do";
 describe("v2 MCP e2e", () => {
   it("routes MCP live tool calls through CommitScopeDO and fans observations to MCP waiters", async () => {
     const world = createWorld();
-    const scopeState = new FakeDurableObjectState("the_chatroom");
     const env = { WOO_INTERNAL_SECRET: "v2-mcp-secret" };
-    const scope = new CommitScopeDO(scopeState as unknown as ConstructorParameters<typeof CommitScopeDO>[0], env);
+    const scopeStates = new Map<ObjRef, FakeDurableObjectState>();
+    const scopes = new Map<ObjRef, CommitScopeDO>();
+    const stateFor = (commitScope: ObjRef): FakeDurableObjectState => {
+      let state = scopeStates.get(commitScope);
+      if (!state) {
+        state = new FakeDurableObjectState(commitScope);
+        scopeStates.set(commitScope, state);
+      }
+      return state;
+    };
+    const scopeFor = (commitScope: ObjRef): CommitScopeDO => {
+      let scope = scopes.get(commitScope);
+      if (!scope) {
+        scope = new CommitScopeDO(stateFor(commitScope) as unknown as ConstructorParameters<typeof CommitScopeDO>[0], env);
+        scopes.set(commitScope, scope);
+      }
+      return scope;
+    };
     const gateway = new McpGateway(world, {
       v2: {
-        open: async (commitScope, body) => await postCommitScope(scope, env, commitScope, "/v2/open", body),
-        envelope: async (commitScope, body) => await postCommitScope(scope, env, commitScope, "/v2/envelope", body)
+        open: async (commitScope, body) => await postCommitScope(scopeFor(commitScope), env, commitScope, "/v2/open", body),
+        envelope: async (commitScope, body) => await postCommitScope(scopeFor(commitScope), env, commitScope, "/v2/envelope", body)
       }
     });
 
@@ -50,7 +67,7 @@ describe("v2 MCP e2e", () => {
         expect.objectContaining({ type: "said", text: expect.stringContaining("hello from v2 MCP") })
       ]));
 
-      const accepted = sqlRows<{ body: string }>(scopeState.storage.sql.exec("SELECT body FROM v2_commit_scope_accepted_frame"));
+      const accepted = sqlRows<{ body: string }>(stateFor("the_chatroom").storage.sql.exec("SELECT body FROM v2_commit_scope_accepted_frame"));
       expect(accepted).toHaveLength(0);
 
       const aliceActor = world.sessions.get(alice)?.actor;
@@ -79,29 +96,40 @@ describe("v2 MCP e2e", () => {
         arguments: { object: "the_chatroom", verb: "enter", args: [] }
       });
       expect(entered.result.isError).not.toBe(true);
-      const beforeWait = sqlRows<{ n: number }>(scopeState.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_accepted_frame"))[0]?.n;
+      const placementState = stateFor(SHADOW_PLACEMENT_TRANSACTION_SCOPE);
+      const beforeWait = sqlRows<{ n: number }>(placementState.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_accepted_frame"))[0]?.n;
 
       await mcp(gateway, alice, 3, "tools/call", {
         name: "woo_wait",
         arguments: { timeout_ms: 0, limit: 10 }
       });
-      const afterWait = sqlRows<{ n: number }>(scopeState.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_accepted_frame"))[0]?.n;
+      const afterWait = sqlRows<{ n: number }>(placementState.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_accepted_frame"))[0]?.n;
       expect(afterWait).toBe(beforeWait);
     } finally {
-      scopeState.close();
+      for (const state of scopeStates.values()) state.close();
     }
   });
 
   it("uses snapshot authority only for the first MCP envelope attempt", async () => {
     const world = createWorld();
-    const scopeState = new FakeDurableObjectState("the_chatroom");
     const env = { WOO_INTERNAL_SECRET: "v2-mcp-secret" };
-    const scope = new CommitScopeDO(scopeState as unknown as ConstructorParameters<typeof CommitScopeDO>[0], env);
+    const scopeStates = new Map<ObjRef, FakeDurableObjectState>();
+    const scopes = new Map<ObjRef, CommitScopeDO>();
+    const scopeFor = (commitScope: ObjRef): CommitScopeDO => {
+      let scope = scopes.get(commitScope);
+      if (!scope) {
+        const state = new FakeDurableObjectState(commitScope);
+        scopeStates.set(commitScope, state);
+        scope = new CommitScopeDO(state as unknown as ConstructorParameters<typeof CommitScopeDO>[0], env);
+        scopes.set(commitScope, scope);
+      }
+      return scope;
+    };
     const authoritySnapshotFlags: boolean[] = [];
     let envelopeCalls = 0;
     const gateway = new McpGateway(world, {
       v2: {
-        open: async (commitScope, body) => await postCommitScope(scope, env, commitScope, "/v2/open", body),
+        open: async (commitScope, body) => await postCommitScope(scopeFor(commitScope), env, commitScope, "/v2/open", body),
         authorityPayload: async (extraObjectIds, options) => {
           authoritySnapshotFlags.push(options?.useCommitScopeSnapshotForRemoteAuthority === true);
           return executorAuthorityPayload(world, extraObjectIds);
@@ -111,7 +139,7 @@ describe("v2 MCP e2e", () => {
           if (envelopeCalls === 1) {
             return { ok: true, reply: encodeEnvelope(replyEnvelope(missingStateReply("mcp-snapshot-retry"))) };
           }
-          return await postCommitScope(scope, env, commitScope, "/v2/envelope", body);
+          return await postCommitScope(scopeFor(commitScope), env, commitScope, "/v2/envelope", body);
         }
       }
     });
@@ -125,9 +153,9 @@ describe("v2 MCP e2e", () => {
 
       expect(result.result.isError, JSON.stringify(result.result.structuredContent)).not.toBe(true);
       expect(envelopeCalls).toBe(2);
-      expect(authoritySnapshotFlags).toEqual([false, true, false]);
+      expect(authoritySnapshotFlags).toEqual([false, false, true, false]);
     } finally {
-      scopeState.close();
+      for (const state of scopeStates.values()) state.close();
     }
   });
 
@@ -383,9 +411,25 @@ describe("v2 MCP e2e", () => {
 
   it("serializes concurrent MCP v2 intents without stale-head rejects", async () => {
     const world = createWorld();
-    const scopeState = new FakeDurableObjectState("the_chatroom");
     const env = { WOO_INTERNAL_SECRET: "v2-mcp-secret" };
-    const scope = new CommitScopeDO(scopeState as unknown as ConstructorParameters<typeof CommitScopeDO>[0], env);
+    const scopeStates = new Map<ObjRef, FakeDurableObjectState>();
+    const scopes = new Map<ObjRef, CommitScopeDO>();
+    const stateFor = (commitScope: ObjRef): FakeDurableObjectState => {
+      let state = scopeStates.get(commitScope);
+      if (!state) {
+        state = new FakeDurableObjectState(commitScope);
+        scopeStates.set(commitScope, state);
+      }
+      return state;
+    };
+    const scopeFor = (commitScope: ObjRef): CommitScopeDO => {
+      let scope = scopes.get(commitScope);
+      if (!scope) {
+        scope = new CommitScopeDO(stateFor(commitScope) as unknown as ConstructorParameters<typeof CommitScopeDO>[0], env);
+        scopes.set(commitScope, scope);
+      }
+      return scope;
+    };
     const concurrentCalls = 4;
     const openBodies: McpV2OpenBody[] = [];
     const pendingEnvelopes: Array<() => void> = [];
@@ -397,7 +441,7 @@ describe("v2 MCP e2e", () => {
       v2: {
         open: async (commitScope, body) => {
           openBodies.push(body);
-          return await postCommitScope(scope, env, commitScope, "/v2/open", body);
+          return await postCommitScope(scopeFor(commitScope), env, commitScope, "/v2/open", body);
         },
         envelope: async (commitScope, body) => {
           // Hold the first batch until every caller has locally reached the
@@ -410,7 +454,7 @@ describe("v2 MCP e2e", () => {
               if (pendingEnvelopes.length === concurrentCalls) releaseEnvelopeBatch();
             });
           }
-          return await postCommitScope(scope, env, commitScope, "/v2/envelope", body);
+          return await postCommitScope(scopeFor(commitScope), env, commitScope, "/v2/envelope", body);
         }
       }
     });
@@ -432,16 +476,16 @@ describe("v2 MCP e2e", () => {
           `call ${index} failed: ${JSON.stringify(result.result.structuredContent)}`
         ).not.toBe(true);
       }
-      const accepted = sqlRows<{ body: string }>(scopeState.storage.sql.exec("SELECT body FROM v2_commit_scope_accepted_frame ORDER BY seq"));
+      const accepted = sqlRows<{ body: string }>(stateFor(SHADOW_PLACEMENT_TRANSACTION_SCOPE).storage.sql.exec("SELECT body FROM v2_commit_scope_accepted_frame ORDER BY seq"));
       expect(accepted).toHaveLength(concurrentCalls);
       expect(accepted.map((row) => JSON.parse(row.body).position.seq)).toEqual([1, 2, 3, 4]);
-      expect(openBodies).toHaveLength(concurrentCalls);
+      expect(openBodies.filter((body) => body.scope === SHADOW_PLACEMENT_TRANSACTION_SCOPE)).toHaveLength(concurrentCalls);
       expect(openBodies.every((body) => !Object.prototype.hasOwnProperty.call(body, "serialized"))).toBe(true);
       expect(openBodies.every((body) => Array.isArray(body.session_objects) && body.session_objects.length === 0)).toBe(true);
       expect(openBodies.every((body) => body.authority?.kind === "woo.authority_slice.cells.shadow.v1")).toBe(true);
     } finally {
       releaseEnvelopeBatch();
-      scopeState.close();
+      for (const state of scopeStates.values()) state.close();
     }
   });
 });

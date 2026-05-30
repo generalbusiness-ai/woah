@@ -22,6 +22,7 @@ import type { ShadowCapabilityAd } from "./capability-ad";
 import {
   serializedFor,
   shadowCommitScopeObject,
+  shadowPlacementTransactionForTranscript,
   submitShadowCommit,
   transcriptTouchedObjectIds,
   type ShadowCommitAccepted,
@@ -233,6 +234,11 @@ export type ShadowTurnExecRequest = {
     atom_hashes?: string[];
     max_bytes?: number;
   };
+  // Server-assisted sparse turns use a static key and must discover the true
+  // closure under the atom guard. The relay may hold a serialized slice, but it
+  // must not mark that slice authoritative: absent referenced objects have to
+  // surface as `missing_state`, not as catalog-level E_OBJNF observations.
+  guarded_execution?: boolean;
   max_transfer_bytes?: number;
   persistence?: "durable" | "live";
 };
@@ -435,9 +441,32 @@ export function buildShadowCellPageTransfer(input: {
     keyMode?: "request" | "transfer_atoms";
   };
 } & ShadowTransferSigning): ShadowCellPageTransfer {
-  const selected = selectedTransferAtoms(input.key, input.atom_hashes, input.missing_atoms);
-  const requiredPages = pageClosureForPreimages(input.serialized, selected.map((item) => item.preimage));
-  const granted = transferAtomsForPages(selected, requiredPages);
+  let selected = selectedTransferAtoms(input.key, input.atom_hashes, input.missing_atoms);
+  // VTN10.1: ONLY a lifecycle atom that arrives via
+  // `missing_atoms` represents a bare-object materialization miss. Lifecycle
+  // atoms also appear in full executable seeds and other ordinary closures; those
+  // must not expand into full read/write grants or they bloat every browser
+  // envelope. Scoped this way, object-lookup repair converges without changing
+  // normal transfer sizing.
+  const lifecycleObjects = lifecycleClosureObjectsFromPreimages(
+    (input.missing_atoms ?? []).flatMap((atom) => typeof atom.preimage === "string" ? [atom.preimage] : [])
+  );
+  const serializedObjectIds = new Set(input.serialized.objects.map((obj) => obj.id));
+  selected = selected.filter((item) => {
+    const lifecycle = lifecycleObjectFromTurnKeyPreimage(item.preimage);
+    // A READ lifecycle miss for an object absent from the anchor is a real
+    // materialization miss that this transfer cannot satisfy; do not mark it
+    // covered without pages, or the retry can fall through to E_OBJNF. A WRITE
+    // lifecycle atom is different: creates legitimately write an object that
+    // was absent from the pre-turn anchor.
+    return !lifecycle || !item.preimage.startsWith("read:") || serializedObjectIds.has(lifecycle);
+  });
+  const requiredPages = pageClosureForPreimages(input.serialized, selected.map((item) => item.preimage), {
+    fullLifecycleObjects: lifecycleObjects
+  });
+  const closureAtomPreimages = fullObjectClosureAtomPreimages(input.serialized, lifecycleObjects);
+  const lookupAtomPreimages = lookupClosureAtomPreimages(input.serialized, selected.map((item) => item.preimage));
+  const granted = transferAtomsForPages(selected, requiredPages, [...closureAtomPreimages, ...lookupAtomPreimages]);
   const knownPageHashes = new Set(input.known_page_hashes ?? []);
   const pageRefs = requiredPages.map((page) => {
     const ref = shadowStatePageRef(page, true);
@@ -708,12 +737,14 @@ export async function executeAuthoritativeShadowTurnCall(
     expected: input.expected ?? input.commitScope.head,
     persistence: "durable"
   };
+  const commitTransaction = shadowPlacementTransactionForTranscript(run.transcript) ?? undefined;
   const commit = submitShadowCommit(input.commitScope, {
     kind: "woo.commit.submit.shadow.v1",
     id: request.id ?? input.call.id,
-    scope: input.call.scope,
+    scope: commitTransaction ? input.commitScope.scope : run.transcript.scope,
     expected: request.expected ?? input.commitScope.head,
     transcript: run.transcript,
+    ...(commitTransaction ? { transaction: commitTransaction } : {}),
     executor: node.node,
     profile: input.profile,
     metric: input.metric
@@ -822,6 +853,22 @@ export async function executeShadowTurnCallOrNeedState(
     // If VM execution throws outside the normal ErrorFrame path, discard the
     // mutable cache and rebuild from node.serialized on the next attempt.
     node.world = undefined;
+    // VTN10.1: a guarded sequenced-call PREAMBLE materialization
+    // miss surfaces as a thrown E_NEED_STATE (no transcript was recorded — the
+    // miss happened before the recorder opened). Convert it to the same clean
+    // `missing_state` the in-run probe path produces, so the repair loop pages
+    // the absent object in and retries instead of propagating an uncaught
+    // throw. Any non-E_NEED_STATE throw is a real fault and re-propagates.
+    const needState = missingAtomsFromThrownNeedState(err);
+    if (needState) {
+      return {
+        ok: false,
+        reason: "missing_state",
+        attempted: false,
+        missing_atoms: needState,
+        reply: missingStateReply(request, needState)
+      };
+    }
     throw err;
   }
   if (!skipAtomChecks) {
@@ -839,7 +886,7 @@ export async function executeShadowTurnCallOrNeedState(
       };
     }
     const actualKey = shadowTurnKeyFromTranscript(run.transcript);
-    const unmaterialized = missingActualAtoms(actualKey, node.atom_hashes);
+    const unmaterialized = missingActualAtoms(actualKey, node.atom_hashes, run.transcript);
     if (unmaterialized.length > 0) {
       node.world = undefined;
       return {
@@ -855,13 +902,17 @@ export async function executeShadowTurnCallOrNeedState(
   }
 
   const livePersistence = request.persistence === "live";
+  const commitTransaction = options.commitScope
+    ? shadowPlacementTransactionForTranscript(run.transcript) ?? undefined
+    : undefined;
   const commit = options.commitScope && !livePersistence
     ? submitShadowCommit(options.commitScope, {
         kind: "woo.commit.submit.shadow.v1",
         id: request.id ?? request.call.id,
-        scope: request.key.scope,
+        scope: commitTransaction ? options.commitScope.scope : run.transcript.scope,
         expected: request.expected ?? options.commitScope.head,
         transcript: run.transcript,
+        ...(commitTransaction ? { transaction: commitTransaction } : {}),
         executor: node.node,
         profile: options.profile,
         metric: options.metric
@@ -964,7 +1015,12 @@ function selectedTransferAtoms(
 
 function transferAtomsForPages(
   selected: Array<{ hash: string; preimage: string }>,
-  pages: readonly ShadowStatePage[]
+  pages: readonly ShadowStatePage[],
+  // VTN10.1: extra read/write preimages granted for objects
+  // materialized by a bare-object lifecycle miss (their full own-cell closure).
+  // Empty for ordinary cell-page transfers, so their granted atom set is
+  // unchanged.
+  extraAtomPreimages: readonly string[] = []
 ): Array<{ hash: string; preimage: string }> {
   const byPreimage = new Map<string, { hash: string; preimage: string }>();
   for (const item of selected) byPreimage.set(item.preimage, item);
@@ -972,6 +1028,9 @@ function transferAtomsForPages(
     for (const preimage of readPreimagesForStatePage(page)) {
       byPreimage.set(preimage, { preimage, hash: shadowAtomHash(preimage) });
     }
+  }
+  for (const preimage of extraAtomPreimages) {
+    byPreimage.set(preimage, { preimage, hash: shadowAtomHash(preimage) });
   }
   return Array.from(byPreimage.values()).sort((a, b) => a.hash.localeCompare(b.hash));
 }
@@ -983,6 +1042,134 @@ function readPreimagesForStatePage(page: ShadowStatePage): string[] {
     default:
       return [];
   }
+}
+
+// A guarded executor can miss a negative lookup cell while walking an
+// inheritance chain. The transfer selected by the first miss already carries
+// the authoritative lineage pages for that walk, so grant the specific read
+// atoms for the rest of the lookup path too. Otherwise sparse execution stalls
+// one repair round per ancestor before it can reach feature verbs or conclude
+// the lookup is absent.
+function lookupClosureAtomPreimages(serialized: SerializedWorld, preimages: readonly string[]): string[] {
+  const byId = new Map(serialized.objects.map((obj) => [obj.id, obj] as const));
+  const out = new Set<string>();
+  const verbMatches = (obj: SerializedObject, name: string): boolean =>
+    obj.verbs.some((verb) => verb.name === name || verb.aliases.includes(name));
+  const addVerbChain = (start: ObjRef, name: string): boolean => {
+    let current: ObjRef | null | undefined = start;
+    while (current) {
+      const obj = byId.get(current);
+      if (!obj) return false;
+      out.add(`read:cell:verb:${current}:${name}`);
+      if (verbMatches(obj, name)) return true;
+      current = obj.parent;
+    }
+    return false;
+  };
+  const addVerbLookup = (start: ObjRef, name: string): void => {
+    if (addVerbChain(start, name)) return;
+    const obj = byId.get(start);
+    if (!obj) return;
+    for (const feature of serializedFeatureRefs(obj)) {
+      if (addVerbChain(feature, name)) return;
+    }
+  };
+  const addPropLookup = (start: ObjRef, name: string): void => {
+    let current: ObjRef | null | undefined = start;
+    while (current) {
+      const obj = byId.get(current);
+      if (!obj) return;
+      out.add(`read:cell:prop:${current}.${name}`);
+      if (objectHasPropertyCell(obj, name)) return;
+      current = obj.parent;
+    }
+  };
+  for (const preimage of preimages) {
+    if (!preimage.startsWith("read:")) continue;
+    const verb = verbCellFromTurnKeyPreimage(preimage);
+    if (verb) {
+      addVerbLookup(verb.object, verb.name);
+      continue;
+    }
+    const prop = propCellFromTurnKeyPreimage(preimage);
+    if (prop) addPropLookup(prop.object, prop.name);
+  }
+  return Array.from(out).sort();
+}
+
+// VTN10.1: for objects pulled in by a bare-object materialization
+// miss (a `lifecycle:<id>` probe), grant the FULL set of read/write atoms for
+// that object's own materialized cells — lifecycle, every own property, every
+// own verb, and the structural location/contents cells — so the next guarded
+// re-run does not re-miss a cell whose page is now installed. This is coverage,
+// not write authority; commit validation remains the authority gate. It is the
+// difference between "one transitively-referenced object = one repair round"
+// and a per-cell stall.
+//
+// Scoped ONLY to the lifecycle-closure objects (passed in `fullClosureObjects`),
+// it does NOT broaden the read atoms granted for ordinary location/contents/
+// property/verb cell-page transfers. Other transfer modes are unchanged: their
+// granted atoms remain exactly the selected missing atoms plus verb-page reads,
+// which keeps commit-time touched-cell validation intact.
+function fullObjectClosureAtomPreimages(
+  serialized: SerializedWorld,
+  ids: Iterable<ObjRef>
+): string[] {
+  const byId = new Map(serialized.objects.map((obj) => [obj.id, obj] as const));
+  const preimages: string[] = [];
+  for (const id of ids) {
+    const obj = byId.get(id);
+    if (!obj) continue;
+    preimages.push(`read:cell:lifecycle:${id}`);
+    preimages.push(`read:cell:location:${id}`);
+    preimages.push(`write:cell:location:${id}`);
+    preimages.push(`read:cell:contents:${id}`);
+    preimages.push(`write:cell:contents:${id}`);
+    for (const name of materializedPropertyNamesForObject(byId, obj)) {
+      preimages.push(`read:cell:prop:${id}.${name}`);
+      if (name !== "owner") preimages.push(`write:cell:prop:${id}.${name}`);
+    }
+    for (const page of shadowStatePagesForObject(obj)) {
+      if (page.page === "verb_bytecode") {
+        preimages.push(`read:cell:verb:${id}:${page.name}`);
+        preimages.push(`write:cell:verb:${id}:${page.name}`);
+      }
+    }
+  }
+  return preimages;
+}
+
+// VTN10.1: the set of objects a transfer materialized via a
+// lifecycle (bare-object) miss. Used to grant those objects' full read-atom
+// closure (see fullObjectClosureAtomPreimages) so a reduced-key repair
+// converges in one round per transitive object instead of stalling per cell.
+function lifecycleClosureObjectsFromPreimages(preimages: string[]): Set<ObjRef> {
+  const ids = new Set<ObjRef>();
+  for (const preimage of preimages) {
+    const id = lifecycleObjectFromTurnKeyPreimage(preimage);
+    if (id) ids.add(id);
+  }
+  return ids;
+}
+
+function materializedPropertyNamesForObject(
+  byId: ReadonlyMap<ObjRef, SerializedObject>,
+  obj: SerializedObject
+): Set<string> {
+  const names = new Set<string>(["name", "owner"]);
+  for (const def of obj.propertyDefs) names.add(def.name);
+  for (const [name] of obj.properties) names.add(name);
+  for (const [name] of obj.propertyVersions) names.add(name);
+  const seen = new Set<ObjRef>();
+  let parent = obj.parent;
+  while (parent && !seen.has(parent)) {
+    seen.add(parent);
+    const ancestor = byId.get(parent);
+    if (!ancestor) break;
+    for (const def of ancestor.propertyDefs) names.add(def.name);
+    parent = ancestor.parent;
+  }
+  return names;
 }
 
 function trustedTransferAuthorities(input: Record<string, string> | undefined): Map<string, string> {
@@ -1133,18 +1320,55 @@ function cacheShadowObjectRecord(cache: Map<string, SerializedObject>, obj: Seri
   cache.set(shadowObjectRecordHash(obj), structuredClone(obj) as SerializedObject);
 }
 
-function missingActualAtoms(actual: ShadowTurnKey, materialized: Set<string>): ShadowMissingAtom[] {
+function missingActualAtoms(actual: ShadowTurnKey, materialized: Set<string>, transcript?: EffectTranscript): ShadowMissingAtom[] {
+  const createdObjects = new Set((transcript?.creates ?? []).map((create) => create.object));
   const missing: ShadowMissingAtom[] = [];
   for (let i = 0; i < actual.atom_hashes.length; i++) {
     const hash = actual.atom_hashes[i];
+    const preimage = actual.preimages[i];
+    if (createdObjects.size > 0 && createdObjectOwnsAtomPreimage(preimage, createdObjects)) continue;
     if (!materialized.has(hash)) missing.push({ hash, preimage: actual.preimages[i] });
   }
   return missing;
 }
 
+function createdObjectOwnsAtomPreimage(preimage: string | undefined, createdObjects: ReadonlySet<ObjRef>): boolean {
+  if (!preimage) return false;
+  const cell = preimage.replace(/^(?:read|write):/, "");
+  for (const prefix of ["cell:location:", "cell:contents:", "cell:lifecycle:"]) {
+    if (cell.startsWith(prefix)) return createdObjects.has(cell.slice(prefix.length) as ObjRef);
+  }
+  if (cell.startsWith("cell:prop:")) {
+    const rest = cell.slice("cell:prop:".length);
+    const split = rest.lastIndexOf(".");
+    return split > 0 && createdObjects.has(rest.slice(0, split) as ObjRef);
+  }
+  if (cell.startsWith("cell:verb:")) {
+    const rest = cell.slice("cell:verb:".length);
+    const split = rest.lastIndexOf(":");
+    return split > 0 && createdObjects.has(rest.slice(0, split) as ObjRef);
+  }
+  return false;
+}
+
 function missingAtomsFromNeedStateTranscript(transcript: EffectTranscript): ShadowMissingAtom[] {
   if (transcript.error?.code !== "E_NEED_STATE") return [];
-  const raw = transcript.error.value;
+  return missingAtomsFromNeedStateValue(transcript.error.value);
+}
+
+// VTN10.1: a guarded preamble materialization miss is thrown as a
+// raw E_NEED_STATE wooError (no transcript, because the recorder had not opened
+// yet). Extract its `missing_atoms` so the executor can return a clean
+// `missing_state`. Returns null when `err` is not an E_NEED_STATE carrying
+// usable missing atoms, so the caller re-propagates genuine faults.
+function missingAtomsFromThrownNeedState(err: unknown): ShadowMissingAtom[] | null {
+  const error = err as { code?: string; value?: WooValue } | null;
+  if (!error || error.code !== "E_NEED_STATE") return null;
+  const atoms = missingAtomsFromNeedStateValue(error.value);
+  return atoms.length > 0 ? atoms : null;
+}
+
+function missingAtomsFromNeedStateValue(raw: WooValue | undefined): ShadowMissingAtom[] {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
   const missing = (raw as Record<string, WooValue>).missing_atoms;
   if (!Array.isArray(missing)) return [];
@@ -1232,7 +1456,11 @@ function objectClosureForPreimages(serialized: SerializedWorld, preimages: strin
   return objectIds;
 }
 
-function pageClosureForPreimages(serialized: SerializedWorld, preimages: string[]): ShadowStatePage[] {
+function pageClosureForPreimages(
+  serialized: SerializedWorld,
+  preimages: string[],
+  options: { fullLifecycleObjects?: ReadonlySet<ObjRef> } = {}
+): ShadowStatePage[] {
   if (preimages.length === 0) return [];
   const byId = new Map(serialized.objects.map((obj) => [obj.id, obj] as const));
   const catalogObjects = serialized.objects
@@ -1288,6 +1516,24 @@ function pageClosureForPreimages(serialized: SerializedWorld, preimages: string[
       if (page.page === "property_cell") addPage(page);
     }
   };
+  // VTN10.1: a bare-object materialization miss (a `lifecycle:<id>` probe
+  // emitted by `WooWorld.object()` for an id not in the executor slice)
+  // must grant the FULL OBJECT CLOSURE for that id in one repair round:
+  // lineage + live + every own property cell + the object's own verb
+  // cells. Granting only the structural scaffold (lineage+live) would
+  // stall the loop one cell per round — the next re-run would re-miss
+  // `prop:<id>.<name>` or `verb:<id>:<name>`. With the full closure the
+  // executor materializes a complete object, so "one transitively-
+  // referenced object = one repair round". (Location/contents cell misses
+  // keep granting only the structural scaffold; see the loop below.)
+  const addFullObjectClosure = (id: ObjRef): void => {
+    const obj = byId.get(id);
+    if (!obj) return;
+    for (const page of shadowStatePagesForObject(obj)) addPage(page);
+    for (const name of materializedPropertyNamesForObject(byId, obj)) {
+      addPropertyLookupPages(id, name);
+    }
+  };
   const addVerbLookupClosure = (object: ObjRef, name: string): void => {
     const lookupKey = `${object}:${name}`;
     if (visitedLookups.has(lookupKey)) return;
@@ -1334,6 +1580,15 @@ function pageClosureForPreimages(serialized: SerializedWorld, preimages: string[
     if (prop) addPropertyLookupPages(prop.object, prop.name);
     const verb = verbCellFromTurnKeyPreimage(preimage);
     if (verb) addVerbLookupClosure(verb.object, verb.name);
+    // VTN10.1: a lifecycle miss is the materialization probe for a bare
+    // object lookup ONLY when it came from `missing_atoms`; full executable
+    // seeds also contain lifecycle preimages and must keep the old lightweight
+    // scaffold behavior. location/contents misses remain scaffold-only.
+    const lifecycle = lifecycleObjectFromTurnKeyPreimage(preimage);
+    if (lifecycle) {
+      if (options.fullLifecycleObjects?.has(lifecycle)) addFullObjectClosure(lifecycle);
+      else addObjectScaffold(lifecycle);
+    }
     const structural = structuralObjectFromTurnKeyPreimage(preimage);
     if (structural) addObjectScaffold(structural);
   }
@@ -1364,8 +1619,22 @@ function verbCellFromTurnKeyPreimage(preimage: string): { object: ObjRef; name: 
 }
 
 function structuralObjectFromTurnKeyPreimage(preimage: string): ObjRef | null {
-  const structural = preimage.match(/^(?:read|write):cell:(?:location|contents|lifecycle):(.+)$/);
+  // Only location/contents cell misses grant the structural scaffold
+  // (lineage+live for the touched object). Lifecycle is handled separately
+  // by `lifecycleObjectFromTurnKeyPreimage` so the materialization-probe
+  // case can grant the FULL object closure (VTN10.1) without
+  // double-counting it here.
+  const structural = preimage.match(/^(?:read|write):cell:(?:location|contents):(.+)$/);
   return structural ? structural[1] as ObjRef : null;
+}
+
+// VTN10.1: a `lifecycle:<id>` preimage is the materialization probe that
+// `WooWorld.object()` emits when an id is absent from a guarded executor's
+// slice. Distinguished from location/contents so the page closure can grant
+// the object's full closure in one repair round (see addFullObjectClosure).
+function lifecycleObjectFromTurnKeyPreimage(preimage: string): ObjRef | null {
+  const lifecycle = preimage.match(/^(?:read|write):cell:lifecycle:(.+)$/);
+  return lifecycle ? lifecycle[1] as ObjRef : null;
 }
 
 function preambleRootObjectFromTurnKeyPreimage(preimage: string): ObjRef | null {

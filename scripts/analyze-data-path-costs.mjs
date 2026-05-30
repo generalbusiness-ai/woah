@@ -83,6 +83,11 @@ const CLASSIFICATION = {
     signal: "start, missing, tombstoned",
     endState: "Repair orphaned projection rows through migration/cleanup, not hot-path fallback."
   },
+  directory_sessions_for_scopes: {
+    bucket: "session_binding",
+    signal: "scopes, sessions, ms, status",
+    endState: "Presence recovery reads bounded Directory session rows; failures should degrade to stale or empty rosters, not block commits."
+  },
   do_constructor: {
     bucket: "cold_activation",
     signal: "class and ms",

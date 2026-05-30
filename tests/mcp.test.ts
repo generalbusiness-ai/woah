@@ -1140,6 +1140,74 @@ describe("McpHost", () => {
     }));
   });
 
+  it("routes accepted-frame observations by session audience when local session scope is stale", async () => {
+    const world = bootstrapWorld();
+    world.setProp("$system", "guest_initial_room", null);
+    const alice = world.auth("guest:mcp-v2-audience-origin");
+    const bob = world.auth("guest:mcp-v2-audience-recipient");
+    world.object(alice.actor).location = "the_chatroom";
+    world.object(bob.actor).location = "the_chatroom";
+    const bobSession = world.sessions.get(bob.id);
+    expect(bobSession).toBeTruthy();
+    bobSession!.activeScope = "$nowhere";
+    const metrics: MetricEvent[] = [];
+    world.setMetricsHook((event) => metrics.push(event));
+    const host = new McpHost(world);
+    host.bindSession(bob.id, bob.actor);
+    const transcript = mcpTestTranscript({
+      id: "mcp-v2-session-audience",
+      session: alice.id,
+      call: { actor: alice.actor, target: "the_chatroom", verb: "enter", args: [] },
+      observations: [{ type: "entered", actor: alice.actor, room: "the_chatroom", source: "the_chatroom", text: "Alice entered.", ts: 1 }],
+      hash: "mcp-v2-session-audience"
+    });
+
+    host.routeShadowAcceptedFrame({
+      kind: "woo.commit.accepted.shadow.v1",
+      id: "mcp-v2-session-audience",
+      position: { kind: "woo.scope_head.shadow.v1", scope: "the_chatroom", epoch: 1, seq: 1, hash: "head" },
+      transcript_hash: "mcp-v2-session-audience",
+      post_state_hash: "post",
+      observations: transcript.observations,
+      receipt: {
+        kind: "woo.commit_receipt.shadow.v1",
+        id: "mcp-v2-session-audience",
+        route: "direct",
+        scope: "the_chatroom",
+        seq: -1,
+        transcript_hash: "mcp-v2-session-audience",
+        pre_state_hash: "pre",
+        post_state_hash: "post",
+        accepted: true,
+        errors: []
+      }
+    }, alice.id, transcript, {
+      audienceSessions: [bob.id],
+      observationSessionAudiences: [[bob.id]]
+    });
+
+    const waitTool: McpTool = {
+      name: `${bob.actor}__wait`,
+      object: bob.actor,
+      verb: "wait",
+      aliases: [],
+      description: "",
+      inputSchema: {},
+      direct: true,
+      persistence: "durable",
+      enclosingSpace: "the_chatroom"
+    };
+    const drained = await host.invokeTool(bob.actor, bob.id, waitTool, [0, 10]);
+
+    expect((drained.result as { observations?: Observation[] }).observations).toEqual(transcript.observations);
+    expect(metrics).toContainEqual(expect.objectContaining({
+      kind: "mcp_observation_routed",
+      route: "accepted",
+      queues_scanned: 1,
+      deliveries: 1
+    }));
+  });
+
   it("routes actor focus-list reads through direct dispatch hooks", async () => {
     const world = bootstrapWorld();
     const session = world.auth("guest:mcp-focus-list-dispatch");
@@ -1862,6 +1930,76 @@ describe("McpHost", () => {
     // A duplicate seq 6 is deduped before application: no re-persist.
     gateway.acceptRemoteV2Commit("the_chatroom", commit(6), transcript(6, "six-duplicate"));
     expect(persisted).toEqual([5, 6]);
+  });
+
+  it("routes audience-addressed commit observations even when projection sequencing has a gap", async () => {
+    // MCP observation delivery is audience-filtered: a shard can legitimately
+    // receive placement seq N without seq N-1 because the missing commit had no
+    // observations for local sessions. Queue delivery must not wait for the
+    // projection-cache sequencer, but durable projection persistence still must.
+    const world = bootstrapWorld();
+    const alice = world.auth("guest:mcp-v2-audience-gap-alice");
+    const durableHead = new Map<string, number>([["#placement", 22]]);
+    const persisted: number[] = [];
+    const gateway = new McpGateway(world, {
+      durableProjectionHeadSeq: (scope) => durableHead.get(scope) ?? null,
+      persistAcceptedProjection: (commit) => {
+        persisted.push(commit.position.seq);
+        durableHead.set(commit.position.scope, commit.position.seq);
+      }
+    });
+    gateway.bindActorSession(alice.id, alice.actor);
+    const observation: Observation = {
+      type: "entered",
+      source: "the_taskboard",
+      actor: "guest_gap_peer",
+      room: "the_taskboard",
+      text: "Guest Gap Peer arrives at the workshop.",
+      ts: 24
+    };
+    const transcript = (seq: number, observations: Observation[] = []): EffectTranscript => mcpTestTranscript({
+      id: `audience-gap-${seq}`,
+      route: "sequenced",
+      scope: "the_garden",
+      seq,
+      session: null,
+      call: { actor: "guest_gap_peer", target: "the_garden", verb: "south", args: [] },
+      observations,
+      hash: `audience-gap-${seq}`
+    });
+    const commit = (seq: number, observations: Observation[] = []): ShadowCommitAccepted => ({
+      kind: "woo.commit.accepted.shadow.v1",
+      id: `audience-gap-${seq}`,
+      position: { kind: "woo.scope_head.shadow.v1", scope: "#placement", epoch: 1, seq, hash: `head-${seq}` },
+      transcript_hash: `audience-gap-${seq}`,
+      post_state_hash: `post-${seq}`,
+      observations,
+      receipt: {
+        kind: "woo.commit_receipt.shadow.v1",
+        id: `audience-gap-${seq}`,
+        route: "sequenced",
+        scope: "the_garden",
+        seq,
+        transcript_hash: `audience-gap-${seq}`,
+        pre_state_hash: `pre-${seq}`,
+        post_state_hash: `post-${seq}`,
+        accepted: true,
+        errors: []
+      }
+    });
+
+    gateway.acceptRemoteV2Commit("#placement", commit(24, [observation]), transcript(24, [observation]), "origin-session", {
+      audienceSessions: [alice.id],
+      observationSessionAudiences: [[alice.id]]
+    });
+    const firstDrain = await (gateway.host as unknown as { drainWait(sessionId: string, args: WooValue[]): Promise<{ observations: Observation[] }> }).drainWait(alice.id, [0, 10]);
+    expect(firstDrain.observations).toEqual([expect.objectContaining({ type: "entered", actor: "guest_gap_peer", source: "the_taskboard" })]);
+    expect(persisted).toEqual([]);
+
+    gateway.acceptRemoteV2Commit("#placement", commit(23), transcript(23), "origin-session");
+    expect(persisted).toEqual([23, 24]);
+    const secondDrain = await (gateway.host as unknown as { drainWait(sessionId: string, args: WooValue[]): Promise<{ observations: Observation[] }> }).drainWait(alice.id, [0, 10]);
+    expect(secondDrain.observations).toEqual([]);
   });
 
   it("sequences fanout against the durable head when a cold shard has no relay", () => {

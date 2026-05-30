@@ -461,7 +461,10 @@ export function restFrameFromTurnReply(scope: ObjRef, reply: ShadowTurnExecReply
     return {
       op: "applied",
       id: reply.id,
-      space: reply.commit.position.scope,
+      // MV-A placement commits may be fenced through a generic commit scope
+      // such as #placement. REST's AppliedFrame.space is the caller-visible
+      // turn/log scope, not the internal transaction authority.
+      space: reply.transcript.scope,
       // REST AppliedFrame.seq names the user-visible sequenced log row, not
       // the v2 commit-scope head. Clients use it with /api/objects/:id/log.
       seq: Number(reply.transcript.seq),

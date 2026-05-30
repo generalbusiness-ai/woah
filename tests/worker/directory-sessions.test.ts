@@ -115,6 +115,7 @@ describe("DirectoryDO register-session dedup", () => {
       expect(sessionRouteColumns(state)).not.toContain("started");
       expect(sessionRouteColumns(state)).not.toContain("display_name");
       expect(sessionRouteColumns(state)).not.toContain("focus_list");
+      expect(sessionRouteColumns(state)).not.toContain("actor_props");
 
       const directory = new DirectoryDO(state as unknown as DurableObjectState, env);
       const payload = {
@@ -126,12 +127,13 @@ describe("DirectoryDO register-session dedup", () => {
         token_class: "guest",
         active_scope: "$lobby",
         mcp_shard: "mcp-gateway-7",
-        focus_list: ["$pinboard"]
+        focus_list: ["$pinboard"],
+        actor_props: [{ name: "home", value: "$nowhere", version: 1 }]
       };
       expect(await postRegister(directory, payload)).toEqual({ ok: true, wrote: true });
 
       const migratedColumns = sessionRouteColumns(state);
-      expect(migratedColumns).toEqual(expect.arrayContaining(["started", "display_name", "focus_list"]));
+      expect(migratedColumns).toEqual(expect.arrayContaining(["started", "display_name", "focus_list", "actor_props"]));
       const resolved = await resolve(directory, "legacy_sess");
       expect(resolved).toMatchObject({
         session_id: "legacy_sess",
@@ -141,7 +143,8 @@ describe("DirectoryDO register-session dedup", () => {
         active_scope: "$lobby",
         current_location: "$lobby",
         mcp_shard: "mcp-gateway-7",
-        focus_list: ["$pinboard"]
+        focus_list: ["$pinboard"],
+        actor_props: [{ name: "home", value: "$nowhere", version: 1 }]
       });
 
       const directoryAfterEviction = new DirectoryDO(state as unknown as DurableObjectState, env);

@@ -176,6 +176,37 @@ export function filterSerializedAuthoritySliceObjects(
   };
 }
 
+export function filterSerializedAuthoritySlicePages(
+  authority: MergeSerializedAuthorityInput,
+  include: (ref: SerializedAuthorityCellSlice["page_refs"][number]) => boolean
+): SerializedAuthoritySlice {
+  if (!isAuthorityCellSlice(authority)) {
+    return {
+      kind: "woo.authority_slice.shadow.v1",
+      sessions: authority.sessions.map((session) => structuredClone(session) as SerializedSession),
+      objects: authority.objects
+        .filter((obj) => shadowStatePagesForObject(obj).some((page) => include(shadowStatePageRef(page, true))))
+        .map((obj) => structuredClone(obj) as SerializedObject)
+    };
+  }
+  const pageRefs = authority.page_refs
+    .filter(include)
+    .map((ref) => structuredClone(ref) as ShadowStatePageRef);
+  const keptHashes = new Set(pageRefs.map((ref) => ref.hash));
+  const keptObjects = new Set(pageRefs.map((ref) => ref.object));
+  return {
+    ...authority,
+    sessions: authority.sessions.map((session) => structuredClone(session) as SerializedSession),
+    page_refs: pageRefs,
+    inline_pages: authority.inline_pages
+      .filter((page) => keptHashes.has(shadowStatePageHash(page)))
+      .map((page) => structuredClone(page) as ShadowStatePage),
+    tombstones: [...authority.tombstones],
+    counters: { ...authority.counters },
+    source_object_count: keptObjects.size
+  };
+}
+
 export function authoritySliceObjectIds(authority: MergeSerializedAuthorityInput): Set<ObjRef> {
   if (!isAuthorityCellSlice(authority)) return new Set(authority.objects.map((obj) => obj.id));
   return new Set(authority.page_refs.map((ref) => ref.object));

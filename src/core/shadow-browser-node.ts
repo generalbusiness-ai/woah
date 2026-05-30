@@ -14,7 +14,6 @@ import {
 import {
   buildShadowCellPageTransfer,
   createShadowExecutionNode,
-  executeAuthoritativeShadowTurnCall,
   installShadowCachedObjectRecords,
   installShadowStateTransfer,
   shadowObjectRecordHash,
@@ -29,7 +28,7 @@ import {
 import { shadowStatePageHash, shadowStatePagesForObject, type ShadowStatePage } from "./shadow-state-pages";
 import { runShadowTurnCall, runShadowTurnCallTranscript, type ShadowTurnCall } from "./shadow-turn-call";
 import { buildShadowScopeTurnExecAd, buildShadowTurnExecAd, buildShadowTurnExecAdFromNode, executeShadowTurnCallAcrossInProcessNetwork, type ShadowInProcessNetworkResult } from "./shadow-turn-network";
-import { shadowAtomHash, shadowTurnKeyFromTranscript, type ShadowTurnKey } from "./turn-key";
+import { shadowAtomHash, shadowMaterializedAtomHashesFromSerialized, shadowTurnKeyFromCall, shadowTurnKeyFromTranscript, type ShadowTurnKey } from "./turn-key";
 import type { EffectTranscript } from "./effect-transcript";
 import type { ShadowCapabilityAd } from "./capability-ad";
 import { stableShadowJson } from "./shadow-cell-version";
@@ -1738,17 +1737,8 @@ export async function handleShadowBrowserTurnExecEnvelope(
         persistence: "live"
       };
     } else if (!intent.selected_ad) {
-      const result = await executeShadowBrowserAuthoritativeIntent(browser, call, options);
-      if (!result.transcript) throw new Error("authoritative shadow intent completed without a transcript");
-      reply = result.reply;
-      request = {
-        kind: "woo.turn.exec.request.shadow.v1",
-        id: call.id,
-        call,
-        key: shadowTurnKeyFromTranscript(result.transcript),
-        expected: browser.relay.commit_scope.head,
-        persistence: "durable"
-      };
+      request = shadowGuardedTurnExecRequestFromIntent(browser, intent, call);
+      reply = (await executeShadowBrowserTurnExecRequest(browser, request, options)).reply;
     } else {
       request = await shadowTurnExecRequestFromIntent(browser, intent, options.onMetric, call);
       reply = (await executeShadowBrowserTurnExecRequest(browser, request, options)).reply;
@@ -1907,6 +1897,29 @@ async function shadowTurnExecRequestFromIntent(
   };
 }
 
+function shadowGuardedTurnExecRequestFromIntent(
+  browser: ShadowBrowserNode,
+  intent: ShadowTurnIntentRequest,
+  call = shadowTurnCallFromIntent(browser, intent)
+): ShadowTurnExecRequest {
+  // Non-browser/MCP clients submit intents, not locally planned exec requests.
+  // Planning those intents by gathering remote authority at the gateway is the
+  // sparse-executor anti-pattern VTN10.1 fixes: transitive object misses must be
+  // discovered by a guarded executor and retried with hydrated state. The static
+  // key names only the call's acceptance/routing atoms; the executor advertises
+  // the cells already materialized in its serialized slice and reports any
+  // absent object as `missing_state`.
+  return {
+    kind: "woo.turn.exec.request.shadow.v1",
+    id: call.id,
+    call,
+    key: shadowTurnKeyFromCall(call),
+    expected: browser.relay.commit_scope.head,
+    persistence: intent.persistence ?? "durable",
+    guarded_execution: true
+  };
+}
+
 function shadowTurnCallFromIntent(browser: ShadowBrowserNode, intent: ShadowTurnIntentRequest): ShadowTurnCall {
   return {
     kind: "woo.turn_call.shadow.v1",
@@ -1941,6 +1954,7 @@ async function executeShadowBrowserTurnExecRequest(
       serialized: serializedFor(browser.relay.commit_scope, { reason: "turn_exec_anchor" })
     },
     commitScope: browser.relay.commit_scope,
+    ...(request.guarded_execution === true ? { maxTransfers: 8 } : {}),
     profile: options.profile,
     metric: options.onMetric
   });
@@ -1948,7 +1962,8 @@ async function executeShadowBrowserTurnExecRequest(
   for (const transfer of network.transfers) applyShadowBrowserTransfer(browser, transfer);
   if (network.result.ok) {
     const selectedExecutor = browser.relay.executors.find((node) => node.node === network.selected_node);
-    if (selectedExecutor) {
+    const acceptedKey = shadowTurnKeyFromTranscript(network.result.transcript);
+    if (selectedExecutor && request.guarded_execution !== true && request.persistence !== "live") {
       // A delegated success must also warm the actor-side executable cache.
       // Projection deltas update display state, but only execution transfers
       // let the browser plan the next related turn locally.
@@ -1970,8 +1985,14 @@ async function executeShadowBrowserTurnExecRequest(
       });
       if (network.result.reply) {
         network.result.reply.state_transfer = stateTransfer;
-        network.result.reply.ads = [buildShadowTurnExecAdFromNode({ node: selectedExecutor, accepts: request.key, factor: 0.1 })];
+        network.result.reply.ads = [buildShadowTurnExecAdFromNode({ node: selectedExecutor, accepts: acceptedKey, factor: 0.1 })];
       }
+    } else if (selectedExecutor && network.result.reply) {
+      // Guarded default intent execution is already running on the relay's own
+      // materialized slice. Keep the reply lean (no per-turn executable page
+      // transfer), but still advertise the actual accepted closure for clients
+      // that can use the hint on a later locally-planned turn.
+      network.result.reply.ads = [buildShadowTurnExecAdFromNode({ node: selectedExecutor, accepts: acceptedKey, factor: 0.1 })];
     }
     if (network.result.commit) noteShadowBrowserRelayCommitAccepted(browser.relay);
     executor.committed_head_hash = browser.relay.commit_scope.head.hash;
@@ -1987,39 +2008,6 @@ async function executeShadowBrowserTurnExecRequest(
   return network.result;
 }
 
-async function executeShadowBrowserAuthoritativeIntent(
-  browser: ShadowBrowserNode,
-  call: ShadowTurnCall,
-  options: Pick<ShadowBrowserTurnExecEnvelopeOptions, "profile" | "onMetric"> = {}
-): Promise<ShadowTurnExecutionResult> {
-  validateShadowBrowserNodeAuth(browser);
-  const executor = shadowRelayAuthoritativeExecutorForScope(browser.relay, call.scope);
-  const result = await executeAuthoritativeShadowTurnCall(executor, {
-    id: call.id,
-    call,
-    expected: browser.relay.commit_scope.head,
-    persistence: "durable",
-    commitScope: browser.relay.commit_scope,
-    profile: options.profile,
-    metric: options.onMetric
-  });
-  if (result.ok) {
-    const key = shadowTurnKeyFromTranscript(result.transcript);
-    if (result.commit) noteShadowBrowserRelayCommitAccepted(browser.relay);
-    executor.committed_head_hash = browser.relay.commit_scope.head.hash;
-    executor.serialized_generation = browser.relay.serialized_generation;
-    if (result.reply) {
-      // The fast path intentionally does not build a state transfer on every
-      // default relay turn; that transfer walks closure pages and is only needed
-      // when warming a delegated/local executor cache. Display state still fans
-      // out through the accepted-frame plane below.
-      result.reply.ads = [buildShadowTurnExecAdFromNode({ node: executor, accepts: key, factor: 0.1 })];
-    }
-    if (result.commit) publishShadowBrowserAcceptedFrame(browser.relay, result.commit, result.transcript);
-  }
-  return result;
-}
-
 function shadowRelayExecutorForRequest(relay: ShadowBrowserRelayShim, request: ShadowTurnExecRequest): ShadowExecutionNode {
   const selected = request.selected_ad
     ? relay.executors.find((node) => node.node === request.selected_ad && node.scope === request.key.scope)
@@ -2030,33 +2018,51 @@ function shadowRelayExecutorForRequest(relay: ShadowBrowserRelayShim, request: S
   // missing_state.
   if (selected) return selected;
 
-  const executor = shadowRelayAuthoritativeExecutorForScope(relay, request.key.scope);
-  // The relay executor has the authoritative scope state locally. The atom set
-  // still feeds downstream executable-cache ads and state-transfer replies.
+  const executor = request.guarded_execution === true
+    ? shadowRelayMaterializedExecutorForScope(relay, request.key.scope)
+    : shadowRelayAuthoritativeExecutorForScope(relay, request.key.scope);
+  // The relay executor either owns authoritative state or a guarded
+  // materialized slice. The request key still feeds capability ads and lets the
+  // pre-run coverage check pass for static intent keys.
   for (const hash of request.key.atom_hashes) executor.atom_hashes.add(hash);
   return executor;
 }
 
 function shadowRelayAuthoritativeExecutorForScope(relay: ShadowBrowserRelayShim, scope: ObjRef): ShadowExecutionNode {
+  return shadowRelayExecutorForScopeMode(relay, scope, true);
+}
+
+function shadowRelayMaterializedExecutorForScope(relay: ShadowBrowserRelayShim, scope: ObjRef): ShadowExecutionNode {
+  return shadowRelayExecutorForScopeMode(relay, scope, false);
+}
+
+function shadowRelayExecutorForScopeMode(
+  relay: ShadowBrowserRelayShim,
+  scope: ObjRef,
+  authoritative: boolean
+): ShadowExecutionNode {
   const nodeId = shadowRelayDefaultExecutorNode(relay);
   let executor = relay.executors.find((node) => node.node === nodeId);
   const needsRefresh = !executor ||
     executor.scope !== scope ||
     executor.committed_head_hash !== relay.commit_scope.head.hash ||
-    executor.serialized_generation !== relay.serialized_generation;
+    executor.serialized_generation !== relay.serialized_generation ||
+    (executor.authoritative_state === true) !== authoritative;
   if (needsRefresh) {
+    const serialized = serializedFor(relay.commit_scope, { reason: authoritative ? "authoritative_executor" : "guarded_executor" });
     const fresh = createShadowExecutionNode({
       node: nodeId,
       scope,
-      serialized: serializedFor(relay.commit_scope, { reason: "authoritative_executor" }),
-      // The relay-default executor owns the full authoritative serialized
-      // state for its commit scope. Marking it authoritative disables the
-      // atom-guard that exists to detect partial-cache misses on delegate
-      // executors — without this, a browser-built request whose planned key
-      // omits cells the verb's actual run touches drives the network-side
-      // repair loop to its bound and returns `missing_state` to the browser
-      // even though the cells exist in serialized.
-      authoritative_state: true
+      serialized,
+      ...(authoritative ? {} : { atom_hashes: shadowMaterializedAtomHashesFromSerialized(serialized) }),
+      // Authoritative mode is reserved for already-planned/browser exec
+      // requests. Guarded intent mode intentionally leaves the atom guard on,
+      // but pre-authorizes the cells present in this serialized slice. A
+      // create-bearing turn can still discover a fresh lifecycle/write atom and
+      // pay one bounded in-process repair/re-run; that is the price of using
+      // the same sparse-executor guard for browser and server-assisted intents
+      // instead of silently trusting an incomplete planned key.
+      ...(authoritative ? { authoritative_state: true } : {})
     });
     fresh.committed_head_hash = relay.commit_scope.head.hash;
     fresh.serialized_generation = relay.serialized_generation;

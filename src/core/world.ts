@@ -34,6 +34,7 @@ import { normalizeVerbPerms } from "./verb-perms";
 import { analyzeBytecodePurity, combineVerbPurity, compileVerb, propagateVerbPurity } from "./authoring";
 import { hashSource, randomHex, constantTimeEqual } from "./source-hash";
 import { shadowOwnerCellVersion, shadowStructuralCellVersion, type ShadowStructuralCellKind } from "./shadow-cell-version";
+import { shadowAtomHash } from "./turn-key";
 import { objectCreateEvent, type ActiveTurnRecorder, type RecordedCell, type RecordedWriteAuthority, type TurnRecorder, type TurnRecorderEvent, type TurnStart } from "./turn-recorder";
 import { remoteBridgeUntrackedEffect } from "./remote-bridge-transcript-policy";
 import { readObjectPropertyValue } from "./property-read";
@@ -526,6 +527,17 @@ export class WooWorld {
 
   private turnRecorder: TurnRecorder | null;
   private activeTurnRecorder: ActiveTurnRecorder | null = null;
+  // VTN10.1: true while a sparse, guarded shadow executor is installed.
+  // When true, an `object(id)` miss is treated as a *materialization* miss
+  // rather than a semantic absence: before throwing E_OBJNF we emit a
+  // lifecycle materialization probe for the absent id, which the guard
+  // recorder rejects with E_NEED_STATE (the absent object's
+  // `cell:lifecycle:<id>` atom is not in the allowed set), driving the
+  // missing_state -> cell_pages -> retry repair loop. Authoritative
+  // full-slice executors and plain diagnostic recorder runs leave this
+  // false; a genuine miss still throws E_OBJNF there.
+  // See spec/protocol/v2-turn-network.md §VTN10.1.
+  private shadowExecutionGuardActive = false;
   private currentTurnWriter: RecordedWriteAuthority | null = null;
   private logicalInputReplay: Map<string, WooValue[]> | null = null;
 
@@ -538,6 +550,52 @@ export class WooWorld {
 
   setTurnRecorder(recorder: TurnRecorder | null): void {
     this.turnRecorder = recorder;
+  }
+
+  /**
+   * Toggle the sparse-shadow-execution guard (VTN10.1). The
+   * shadow-turn-call entry point sets this true only when running with an
+   * allowed-atom-hash set (guarded mode), and clears it in a finally so
+   * it never leaks into a subsequent authoritative run on the same world.
+   * See spec/protocol/v2-turn-network.md §VTN10.1.
+   */
+  setShadowExecutionGuard(active: boolean): void {
+    this.shadowExecutionGuardActive = active;
+  }
+
+  /**
+   * VTN10.1: run a sequenced-call PREAMBLE step under the
+   * materialization guard. The preamble (space lookup, verb resolution,
+   * presence authorization, sequencer read) runs BEFORE `withTurnRecording`
+   * opens the recorder, so the `object(id)` probe path cannot fire there —
+   * `activeTurnRecorder` is still null. A sparse guarded executor whose slice
+   * is missing an object needed in the preamble would therefore throw raw
+   * `E_OBJNF` with no transcript and no repair.
+   *
+   * Rather than open recording around the preamble (which would add the
+   * preamble's reads to the committed transcript's read-set and change the
+   * normal full-state path), we narrowly translate a preamble `E_OBJNF` into
+   * the same `E_NEED_STATE` the in-run probe would have produced: a single
+   * missing `lifecycle:<id>` atom for the absent id. The repair loop then
+   * pages that object in and re-runs the whole turn. Gated entirely on the
+   * guard flag, so the authoritative/normal path is byte-for-byte unchanged.
+   * See spec/protocol/v2-turn-network.md §VTN10.1.
+   */
+  private guardedPreamble<T>(fn: () => T): T {
+    if (!this.shadowExecutionGuardActive) return fn();
+    try {
+      return fn();
+    } catch (err) {
+      const error = err as { code?: string; value?: unknown };
+      if (error?.code === "E_OBJNF" && typeof error.value === "string") {
+        const id = error.value;
+        const preimage = `read:cell:lifecycle:${id}`;
+        throw wooError("E_NEED_STATE", "shadow turn preamble touched unmaterialized object", {
+          missing_atoms: [{ hash: shadowAtomHash(preimage), preimage }]
+        });
+      }
+      throw err;
+    }
   }
 
   private async withTurnRecording<T>(turn: TurnStart, fn: (active: ActiveTurnRecorder) => Promise<T>): Promise<T> {
@@ -953,7 +1011,20 @@ export class WooWorld {
 
   object(id: ObjRef): WooObject {
     const obj = this.objects.get(id);
-    if (!obj) throw wooError("E_OBJNF", `object not found: ${id}`, id);
+    if (!obj) {
+      // VTN10.1: under a sparse guarded shadow executor, an absent id is
+      // a materialization miss, not a semantic absence. Emit a lifecycle
+      // probe for the id first. The guard recorder will reject the probe
+      // with E_NEED_STATE (its `cell:lifecycle:<id>` atom is not in the
+      // allowed set), so that throw — not the E_OBJNF below — propagates
+      // and drives the repair loop. The throw below stays as the
+      // fallthrough for the non-guarded case (authoritative/diagnostic),
+      // where the probe records harmlessly and E_OBJNF is the truth.
+      if (this.shadowExecutionGuardActive && this.activeTurnRecorder) {
+        this.recordTurnStateProbe({ kind: "lifecycle", object: id });
+      }
+      throw wooError("E_OBJNF", `object not found: ${id}`, id);
+    }
     return obj;
   }
 
@@ -3521,7 +3592,15 @@ export class WooWorld {
     const startedAt = Date.now();
     const frame = await this.withPersistencePaused(async () => {
       this.validateMessage(message);
-      const space = this.object(spaceRef);
+      // VTN10.1: the sequenced-call preamble (space lookup, verb
+      // resolution, presence authorization, sequencer read) runs BEFORE
+      // `withTurnRecording` opens the recorder, so an `object(id)` miss here
+      // cannot fire the in-run lifecycle probe. Run these materialization-
+      // sensitive lookups under `guardedPreamble`, which (only when the shadow
+      // guard is armed) converts a preamble `E_OBJNF` into the same repairable
+      // `E_NEED_STATE` the in-run probe would emit. Off-guard this is a plain
+      // passthrough, so the normal path is unchanged.
+      const space = this.guardedPreamble(() => this.object(spaceRef));
       // Sequenced calls use the same catalog-level presence override as
       // direct calls. The check runs before the recorder opens, so ignoring
       // skip_presence_check here would make v2 commit-scope turns fail with no
@@ -3534,9 +3613,9 @@ export class WooWorld {
         // where they become applied $error observations and still consume seq.
       }
       if (!skipPresenceCheck) {
-        this.authorizePresence(message.actor, spaceRef, sessionId);
+        this.guardedPreamble(() => this.authorizePresence(message.actor, spaceRef, sessionId));
       }
-      const nextSeq = Number(this.getProp(spaceRef, "next_seq"));
+      const nextSeq = Number(this.guardedPreamble(() => this.getProp(spaceRef, "next_seq")));
       const seq = nextSeq;
       this.setProp(spaceRef, "next_seq", nextSeq + 1);
 

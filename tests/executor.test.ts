@@ -7,12 +7,15 @@ import { decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "../src/core
 import type { ShadowScopeHead } from "../src/core/shadow-commit-scope";
 import { runShadowTurnCall } from "../src/core/shadow-turn-call";
 import type { ShadowTurnExecReply, ShadowTurnExecRequest } from "../src/core/shadow-turn-exec";
+import { shadowAtomHash, shadowTurnKeyFromCall } from "../src/core/turn-key";
 import {
   mergeExecutorAuthority,
   submitTurnIntent,
   executorAuthorityPayload,
   executorEnvelopeId,
   executorAuthorityObjectIds,
+  executorTransactionObjectIds,
+  executorObjectIdsFromMissingState,
   executorReplyNeedsRepair,
   type ExecutorEnvelopeBody
 } from "../src/core/executor";
@@ -95,6 +98,41 @@ describe("v2 turn gateway", () => {
       }
     })).toBe(true);
     expect(executorReplyNeedsRepair(okReply("turn"))).toBe(false);
+  });
+
+  it("builds static intent keys from only routing and acceptance atoms", () => {
+    const key = shadowTurnKeyFromCall({
+      scope: "$room" as ObjRef,
+      actor: "$actor" as ObjRef,
+      target: "$target" as ObjRef,
+      verb: "look"
+    });
+
+    expect(key.scope).toBe("$room");
+    expect(key.preimages).toEqual([
+      "actor:$actor",
+      "call:$target:look",
+      "scope:$room",
+      "target:$target"
+    ]);
+    expect(key.read_preimages).toEqual([]);
+    expect(key.write_preimages).toEqual([]);
+    expect(key.accept_preimages).toEqual([
+      "call:$target:look",
+      "scope:$room",
+      "target:$target"
+    ]);
+  });
+
+  it("extracts object ids from missing-state atom preimages for authority repair", () => {
+    expect(executorObjectIdsFromMissingState(missingStateReply("turn", [
+      "read:cell:lifecycle:$missing",
+      "write:cell:contents:$room",
+      "read:cell:prop:$thing.name",
+      "read:cell:verb:$tool:use",
+      "scope:$scope",
+      "call:$target:look"
+    ]))).toEqual(["$missing", "$room", "$thing", "$tool", "$scope", "$target"]);
   });
 
   it("merges versioned authority cells into serialized state without duplicating objects", () => {
@@ -209,7 +247,11 @@ describe("v2 turn gateway", () => {
       }),
       submitEnvelope: async (_scope, body) => {
         envelopes.push(body);
-        return { reply: encodeEnvelope(replyEnvelope(envelopes.length === 1 ? missingStateReply("turn-1") : okReply("turn-1"))) };
+        return {
+          reply: encodeEnvelope(replyEnvelope(envelopes.length === 1
+            ? missingStateReply("turn-1", ["read:cell:lifecycle:$remote_room"])
+            : okReply("turn-1")))
+        };
       }
     });
 
@@ -220,7 +262,7 @@ describe("v2 turn gateway", () => {
     expect(envelopes.map((body) => body.node)).toEqual(["client-0", "client-1"]);
     expect(envelopes.map((body) => authorityObjectIds(body.authority))).toEqual([
       ["$room", "$target", "$actor"],
-      ["$room", "$target", "$actor"]
+      ["$room", "$target", "$actor", "$remote_room"]
     ]);
   });
 
@@ -331,6 +373,70 @@ describe("v2 turn gateway", () => {
     ]);
     expect(result.reply?.ok).toBe(true);
   });
+
+  it("routes planned movement through an explicit placement transaction scope", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:v2-placement-planned");
+    const entered = await world.call("placement-enter", session.id, "the_chatroom", {
+      actor: session.actor,
+      target: "the_chatroom",
+      verb: "enter",
+      args: []
+    });
+    expect(entered.op).toBe("applied");
+    const harness = makePlannedExecHarness(world.exportWorld());
+
+    const result = await submitTurnIntent({
+      input: {
+        id: "planned-placement-southeast",
+        route: "sequenced",
+        scope: "the_chatroom",
+        session: session.id,
+        actor: session.actor,
+        target: "the_chatroom",
+        verb: "southeast",
+        args: [],
+        persistence: "durable",
+        token: "token"
+      },
+      strategy: "planned-exec",
+      maxAttempts: 1,
+      transactionScopeForTranscript: ({ transaction }) => {
+        expect(executorTransactionObjectIds(transaction)).toEqual(expect.arrayContaining([
+          session.actor,
+          "the_chatroom",
+          "the_deck"
+        ]));
+        return "#placement" as ObjRef;
+      },
+      ...harness.options
+    });
+
+    expect(result.kind).toBe("submitted");
+    if (result.kind !== "submitted") throw new Error("expected planned submission");
+    expect(result.scope).toBe("the_chatroom");
+    expect(result.commitScope).toBe("#placement");
+    expect(harness.ensureScopes).toEqual(["the_chatroom", "#placement"]);
+    expect(harness.submissions).toHaveLength(1);
+    const submitted = harness.submissions[0];
+    expect(submitted.scope).toBe("#placement");
+    expect(submitted.body.scope).toBe("#placement");
+    expect(submitted.body.node).toBe("node:#placement");
+    expect(submitted.request.key.scope).toBe("the_chatroom");
+    expect(submitted.request.expected).toEqual(scopeHead("#placement"));
+    expect(harness.authorityRequests.at(-1)).toEqual(expect.arrayContaining([
+      "#placement",
+      "the_chatroom",
+      "the_deck",
+      session.actor
+    ]));
+    expect(authorityObjectIds(submitted.body.authority)).toEqual(expect.arrayContaining([
+      "the_chatroom",
+      "the_deck",
+      session.actor
+    ]));
+    expect(result.reply?.ok).toBe(true);
+  });
 });
 
 type PlannedGatewayClient = {
@@ -351,6 +457,7 @@ function makePlannedExecHarness(serialized: SerializedWorld) {
   const clients = new Map<ObjRef, PlannedGatewayClient>();
   const ensureScopes: ObjRef[] = [];
   const submissions: PlannedGatewaySubmission[] = [];
+  const authorityRequests: ObjRef[][] = [];
   const knownObjectIds = new Set(serialized.objects.map((obj) => obj.id));
   const clientFor = (scope: ObjRef): PlannedGatewayClient => {
     let client = clients.get(scope);
@@ -364,6 +471,7 @@ function makePlannedExecHarness(serialized: SerializedWorld) {
   return {
     ensureScopes,
     submissions,
+    authorityRequests,
     options: {
       ensureClient: async (scope: ObjRef) => {
         ensureScopes.push(scope);
@@ -373,17 +481,20 @@ function makePlannedExecHarness(serialized: SerializedWorld) {
       clientHead: (client: PlannedGatewayClient) => client.head,
       clientSerialized: (client: PlannedGatewayClient) => client.serialized,
       nextTurnId: () => { throw new Error("planned gateway tests use explicit ids"); },
-      authorityPayload: (_scope: ObjRef, extraObjectIds: ObjRef[]) => ({
-        sessions: [],
-        session_objects: [],
-        authority: {
-          kind: "woo.authority_slice.shadow.v1" as const,
+      authorityPayload: (_scope: ObjRef, extraObjectIds: ObjRef[]) => {
+        authorityRequests.push(extraObjectIds);
+        return {
           sessions: [],
-          objects: extraObjectIds
-            .filter((id) => knownObjectIds.has(id))
-            .map((id, index) => serializedObject(id, id, index))
-        }
-      }),
+          session_objects: [],
+          authority: {
+            kind: "woo.authority_slice.shadow.v1" as const,
+            sessions: [],
+            objects: extraObjectIds
+              .filter((id) => knownObjectIds.has(id))
+              .map((id, index) => serializedObject(id, id, index))
+          }
+        };
+      },
       submitEnvelope: async (scope: ObjRef, body: ExecutorEnvelopeBody) => {
         const envelope = decodeEnvelope<ShadowTurnExecRequest>(body.envelope);
         submissions.push({ scope, body, envelope, request: envelope.body });
@@ -442,12 +553,15 @@ function receipt(accepted: boolean) {
   };
 }
 
-function missingStateReply(id: string): ShadowTurnExecReply {
+function missingStateReply(id: string, missingPreimages: string[] = []): ShadowTurnExecReply {
   return {
     kind: "woo.turn.exec.reply.shadow.v1",
     ok: false,
     id,
-    reason: "missing_state"
+    reason: "missing_state",
+    ...(missingPreimages.length > 0 ? {
+      missing_atoms: missingPreimages.map((preimage) => ({ hash: shadowAtomHash(preimage), preimage }))
+    } : {})
   };
 }
 

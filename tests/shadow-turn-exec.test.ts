@@ -3,7 +3,7 @@ import { installVerb } from "../src/core/authoring";
 import { createWorld, createWorldFromSerialized } from "../src/core/bootstrap";
 import { capabilityAdProbablyCoversTurn } from "../src/core/capability-ad";
 import { effectTranscriptFromRecordedTurn } from "../src/core/effect-transcript";
-import { createShadowCommitScope, serializedFor, submitShadowCommit } from "../src/core/shadow-commit-scope";
+import { createShadowCommitScope, serializedFor, shadowPlacementTransactionForTranscript, submitShadowCommit } from "../src/core/shadow-commit-scope";
 import {
   buildShadowCellPageTransfer,
   buildShadowClosureTransfer,
@@ -20,7 +20,7 @@ import { shadowObjectLivePage, shadowStatePageHash } from "../src/core/shadow-st
 import { runShadowTurnCall, runShadowTurnCallTranscript, type ShadowTurnCall } from "../src/core/shadow-turn-call";
 import { buildShadowTurnExecAd, buildShadowTurnExecAdFromNode, executeShadowTurnCallAcrossInProcessNetwork } from "../src/core/shadow-turn-network";
 import { InMemoryTurnRecorder } from "../src/core/turn-recorder";
-import { shadowTurnKeyFromTranscript, type ShadowTurnKey } from "../src/core/turn-key";
+import { shadowAtomHash, shadowTurnKeyFromCall, shadowTurnKeyFromTranscript, type ShadowTurnKey } from "../src/core/turn-key";
 import type { MetricEvent } from "../src/core/types";
 
 describe("shadow turn execution", () => {
@@ -185,7 +185,8 @@ describe("shadow turn execution", () => {
       id: "shadow-hot-tub-enter",
       scope: "the_hot_tub",
       expected: structuredClone(commitScope.head),
-      transcript: enterTub.transcript
+      transcript: enterTub.transcript,
+      transaction: shadowPlacementTransactionForTranscript(enterTub.transcript) ?? undefined
     });
     expect(accepted).toMatchObject({ kind: "woo.commit.accepted.shadow.v1" });
 
@@ -211,7 +212,8 @@ describe("shadow turn execution", () => {
       id: "shadow-hot-tub-out",
       scope: "the_hot_tub",
       expected: structuredClone(commitScope.head),
-      transcript: exitTub.transcript
+      transcript: exitTub.transcript,
+      transaction: shadowPlacementTransactionForTranscript(exitTub.transcript) ?? undefined
     });
     expect(acceptedExit).toMatchObject({ kind: "woo.commit.accepted.shadow.v1" });
     expect(createWorldFromSerialized(serializedFor(commitScope), { persist: false }).getProp("the_hot_tub", "next_seq")).toBe(3);
@@ -1430,6 +1432,29 @@ describe("shadow turn execution", () => {
     expect(routed.result).toMatchObject({ ok: true, attempted: true });
     if (!routed.result.ok) throw new Error(`read-time retry failed: ${routed.result.reason}`);
     expect(createWorldFromSerialized(routed.result.serializedAfter, { persist: false }).getProp("delay_1", "wet")).toBe(0.67);
+  });
+
+  it("grants negative verb lookup atoms for the inherited lookup path in one cell-page repair", () => {
+    const anchor = createWorld();
+    const key = shadowTurnKeyFromCall({
+      scope: "the_chatroom",
+      actor: "$wiz",
+      target: "the_chatroom",
+      verb: "enter"
+    });
+    const firstMiss = "read:cell:verb:$space:enter";
+    const transfer = buildShadowCellPageTransfer({
+      serialized: anchor.exportWorld(),
+      key,
+      missing_atoms: [{ hash: shadowAtomHash(firstMiss), preimage: firstMiss }],
+      recipient: "actor-node"
+    });
+
+    expect(transfer.preimages).toEqual(expect.arrayContaining([
+      firstMiss,
+      "read:cell:verb:$sequenced_log:enter",
+      "read:cell:verb:$root:enter"
+    ]));
   });
 
   it("forwards engine metrics from the ephemeral executor world when onMetric is supplied", async () => {

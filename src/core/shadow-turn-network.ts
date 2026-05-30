@@ -140,6 +140,7 @@ export async function executeShadowTurnCallAcrossInProcessNetwork(input: {
             session: activeRequest.call.session,
             recipient: selected.node
           });
+      if (shadowTransferServesNoAtoms(transfer)) break;
       installShadowStateTransfer(selected, transfer);
       transfers.push(transfer);
     } else if (result.reason === "commit_rejected" && result.commit?.reason === "stale_head") {
@@ -186,4 +187,11 @@ export async function executeShadowTurnCallAcrossInProcessNetwork(input: {
     transfers,
     result
   };
+}
+
+function shadowTransferServesNoAtoms(transfer: ShadowStateTransfer): boolean {
+  if (transfer.atom_hashes.length > 0) return false;
+  if (transfer.mode === "cell_pages") return transfer.page_refs.length === 0 && transfer.inline_pages.length === 0;
+  if (transfer.mode === "object_records") return transfer.object_pages.length === 0 && transfer.objects.length === 0;
+  return false;
 }
