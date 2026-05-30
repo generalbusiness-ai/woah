@@ -42,9 +42,15 @@ export type ShadowCommitSubmit = {
   scope: ObjRef;
   expected: ShadowScopeHead;
   transcript: EffectTranscript;
+  transaction?: ShadowCommitTransaction;
   executor?: string;
   profile?: (event: MetricEvent & { kind: "shadow_apply_step" }) => void;
   metric?: (event: MetricEvent) => void;
+};
+
+export type ShadowCommitTransaction = {
+  kind: "placement";
+  cells: TranscriptCell[];
 };
 
 export type ShadowCommitAccepted = {
@@ -364,7 +370,12 @@ export function shadowCommitScopeSession(scope: ShadowCommitScope, id: string, a
 
 function shadowCommitEnvelopeErrors(scope: ShadowCommitScope, submit: ShadowCommitSubmit, validation?: TranscriptValidation): string[] {
   const errors: string[] = [];
-  if (submit.scope !== scope.scope || submit.transcript.scope !== scope.scope) {
+  if (submit.scope !== scope.scope) {
+    errors.push(`scope_mismatch: submit=${submit.scope} scope=${scope.scope}`);
+  }
+  if (submit.transaction) {
+    errors.push(...validateShadowCommitTransaction(submit));
+  } else if (submit.transcript.scope !== scope.scope) {
     errors.push(`scope_mismatch: submit=${submit.scope} transcript=${submit.transcript.scope} scope=${scope.scope}`);
   }
   if (!sameShadowHead(submit.expected, scope.head)) {
@@ -376,6 +387,53 @@ function shadowCommitEnvelopeErrors(scope: ShadowCommitScope, submit: ShadowComm
   const checked = validation ?? validateTranscriptAgainstSerializedWorld(serializedFor(scope, { reason: "legacy_validation" }), submit.transcript);
   for (const error of checked.errors) errors.push(error);
   return errors;
+}
+
+function validateShadowCommitTransaction(submit: ShadowCommitSubmit): string[] {
+  const errors: string[] = [];
+  if (!submit.transaction) return errors;
+  if (submit.transaction.kind !== "placement") {
+    errors.push(`write_fence_missing: unsupported transaction kind ${(submit.transaction as { kind?: string }).kind ?? "unknown"}`);
+    return errors;
+  }
+  const required = shadowPlacementTransactionForTranscript(submit.transcript);
+  if (!required) {
+    errors.push("write_fence_missing: placement transaction supplied for transcript with no movement");
+    return errors;
+  }
+  const provided = new Set(submit.transaction.cells.map(cellKey));
+  for (const cell of required.cells) {
+    if (!provided.has(cellKey(cell))) errors.push(`write_fence_missing: ${cellLabel(cell)}`);
+  }
+  return errors;
+}
+
+export function shadowPlacementTransactionForTranscript(transcript: EffectTranscript): ShadowCommitTransaction | null {
+  if (transcript.moves.length === 0) return null;
+  const cells = new Map<string, TranscriptCell>();
+  const add = (cell: TranscriptCell): void => {
+    cells.set(cellKey(cell), cell);
+  };
+  const movedContainers = new Set<ObjRef>();
+  for (const move of transcript.moves) {
+    add({ kind: "location", object: move.object });
+    if (move.from) {
+      add({ kind: "contents", object: move.from });
+      movedContainers.add(move.from);
+    }
+    add({ kind: "contents", object: move.to });
+    movedContainers.add(move.to);
+  }
+  // Presence rows are ordinary properties today, but for movement they are part
+  // of the same placement transaction: an accepted move must not publish a body
+  // location that races separately from the room subscriber mirror.
+  for (const write of transcript.writes) {
+    if (write.cell.kind !== "prop") continue;
+    if (write.cell.name !== "subscribers" && write.cell.name !== "session_subscribers") continue;
+    if (!movedContainers.has(write.cell.object)) continue;
+    add(write.cell);
+  }
+  return { kind: "placement", cells: Array.from(cells.values()).sort(compareTranscriptCells) };
 }
 
 function validateShadowPostState(reader: TranscriptCellReader, transcript: EffectTranscript): string[] {
@@ -1278,6 +1336,7 @@ function lastMoveForObject(transcript: EffectTranscript, object: ObjRef): { obje
 function shadowConflictReason(errors: string[]): ShadowCommitConflict["reason"] {
   if (errors.some((error) => error.startsWith("stale_head"))) return "stale_head";
   if (errors.some((error) => error.startsWith("scope_mismatch"))) return "scope_mismatch";
+  if (errors.some((error) => error.startsWith("write_fence_missing"))) return "write_fence_missing";
   if (errors.some((error) => error.startsWith("permission_denied"))) return "permission_denied";
   if (errors.some((error) => error.startsWith("post_state_mismatch"))) return "post_state_mismatch";
   if (errors.some((error) => error.startsWith("incomplete"))) return "incomplete_transcript";
@@ -1306,4 +1365,8 @@ function cellLabel(cell: TranscriptCell): string {
 
 function cellKey(cell: TranscriptCell): string {
   return stableShadowJson(cell as unknown as WooValue);
+}
+
+function compareTranscriptCells(a: TranscriptCell, b: TranscriptCell): number {
+  return cellKey(a).localeCompare(cellKey(b));
 }

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createWorld, createWorldFromSerialized } from "../src/core/bootstrap";
+import { createShadowCommitScope } from "../src/core/shadow-commit-scope";
 import { createShadowExecutionNode } from "../src/core/shadow-turn-exec";
 import { runShadowTurnCall, type ShadowTurnCall } from "../src/core/shadow-turn-call";
 import {
@@ -30,12 +31,9 @@ import type { ShadowTurnKey } from "../src/core/turn-key";
 // cross-room move *materializes* in the executor (no silent E_OBJNF, the
 // actor walks into the_garden in the executor's own frame).
 //
-// NOTE (scope of this branch): §VTN10.1 makes the miss VISIBLE and
-// REPAIRABLE. The durable commit may still be rejected with a cross-scope
-// version conflict, because writing `contents` on two rooms touches two
-// commit scopes — that is §VTN8.1 (movement-as-transaction) territory,
-// staged separately. CASE B therefore asserts the materialization recovery
-// (the property §VTN10.1 owns), not the cross-scope commit outcome.
+// CASE B now also runs through the §VTN8.1 placement transaction fence: after
+// the materialization repair, the move commits against a transaction scope that
+// validates the moved actor's location and both rooms' contents cells together.
 // See notes/2026-05-30-v2-materialization-miss-and-movement-tx.md.
 
 // Build the post-deck serialized world once. Shared by all cases.
@@ -150,7 +148,7 @@ describe("scope-executor garden probe", () => {
     }
   });
 
-  it("CASE B: sparse atom-guarded executor missing the_garden recovers the materialization via the §VTN10.1 lifecycle probe", async () => {
+  it("CASE B: sparse atom-guarded executor missing the_garden repairs and commits through the §VTN8.1 placement transaction", async () => {
     const { fullSerialized, actor, sessionId } = await setupOnDeck();
 
     const call: ShadowTurnCall = {
@@ -229,7 +227,12 @@ describe("scope-executor garden probe", () => {
       ads: [buildShadowTurnExecAd({ node: "deck-exec", scope: realScope, key: reducedKey, factor: 0.1 })],
       // Anchor HAS the_garden, so repair fetches it when the loop asks.
       anchor: { node: "anchor", serialized: fullSerialized },
-      transferMode: "cell_pages"
+      transferMode: "cell_pages",
+      commitScope: createShadowCommitScope({
+        node: "placement-authority",
+        scope: "#placement",
+        serialized: fullSerialized
+      })
     });
 
     // ---- §VTN10.1 CONVERGENCE BUDGET ----
@@ -283,62 +286,17 @@ describe("scope-executor garden probe", () => {
     );
     expect(enteredGarden).toBe(true);
 
-    // ---- §VTN8.1 BOUNDARY (NOT asserted here) ----
+    // ---- §VTN8.1 PLACEMENT TRANSACTION ----
     //
-    // The durable commit may still be rejected: the move writes `contents` on
-    // both the_deck and the_garden, touching two commit scopes whose cell
-    // versions differ at the authority (the executor reconstructed the_garden
-    // cells fresh at version 0; the anchor holds them at version 1+). That
-    // cross-scope reconciliation is movement-as-transaction (§VTN8.1) and is
-    // staged separately. We therefore allow EITHER outcome for the commit and
-    // only document what happened, so this test stays green when §VTN8.1
-    // lands and flips it to ok.
-    if (result.result.ok) {
-      // If/when §VTN8.1 lands, the cross-scope commit succeeds and the actor
-      // ends up in the_garden. Assert that stronger property when available.
-      const after = createWorldFromSerialized(
-        (result.result as { serializedAfter: SerializedWorld }).serializedAfter,
-        { persist: false }
-      );
-      expect(after.allLocationsForActor(actor)).toEqual(["the_garden"]);
-    } else {
-      // Until §VTN8.1 lands, the only allowed non-ok outcome is a cross-scope
-      // commit conflict — NOT a missing_state (that would mean repair never
-      // healed the materialization) and NOT a silent applied frame.
-      const rejected = result.result as { reason?: string; commit?: { errors?: string[] } };
-      expect(rejected.reason).toBe("commit_rejected");
-
-      // §VTN8.1 BOUNDARY — pinned to the EXACT cell-level cause, not a generic
-      // commit_rejected. The MV-A implementer must know which conflict class
-      // this is: it is stale STRUCTURAL VERSIONS on the freshly-paged
-      // destination room (the executor rebuilt the_garden's cells at version 0
-      // while the anchor holds them at version >=1), NOT placement-authority
-      // denial, NOT a session/activeScope conflict, NOT a transfer/
-      // reconstruction failure. If this set ever changes, MV-A's design
-      // assumptions changed and this test must be revisited.
-      const errors = rejected.commit?.errors ?? [];
-      expect(errors.length).toBeGreaterThan(0);
-
-      // Every reported error is a the_garden read/write version-or-value/prior
-      // mismatch — the destination-room structural staleness MV-A must fence.
-      const gardenStructuralConflict =
-        /^(read|write) (version|value|prior) mismatch the_garden\./;
-      expect(errors.every((e) => gardenStructuralConflict.test(e))).toBe(true);
-
-      // Specifically the destination room's contents/subscribers placement cell
-      // is among the conflicts — this is the cell MV-A's transaction must own.
-      expect(errors.some((e) => /the_garden\.subscribers/.test(e))).toBe(true);
-
-      // Negative guards: the rejection is NOT any other conflict class. These
-      // would each point MV-A at the wrong problem.
-      expect(errors.some((e) => /stale_head/.test(e))).toBe(false);
-      expect(errors.some((e) => /permission|E_PERM|authority|denied/i.test(e))).toBe(false);
-      expect(errors.some((e) => /session|active_?scope/i.test(e))).toBe(false);
-      expect(errors.some((e) => /missing|unavailable|not found|E_OBJNF|E_NEED_STATE|incomplete/i.test(e))).toBe(false);
-      // The conflict is on the destination room, not the source room — the
-      // source scope is the executor's own and its cells are current.
-      expect(errors.some((e) => /the_deck\./.test(e))).toBe(false);
-    }
+    // The repaired cross-room move now commits under the placement transaction
+    // authority instead of being rejected by destination-room structural
+    // versions. A regression here means the repair loop is visible but still
+    // not usable for durable movement.
+    expect(result.result.ok).toBe(true);
+    if (!result.result.ok) throw new Error(`expected accepted placement commit, got ${result.result.reason}`);
+    expect(result.result.commit?.position.scope).toBe("#placement");
+    const after = createWorldFromSerialized(result.result.serializedAfter, { persist: false });
+    expect(after.allLocationsForActor(actor)).toEqual(["the_garden"]);
   });
 
   it("CASE C: §VTN10.1 sparse guarded executor missing an object needed in the sequenced-call PREAMBLE returns missing_state, not a raw E_OBJNF / uncaught throw", async () => {

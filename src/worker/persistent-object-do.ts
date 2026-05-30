@@ -3091,7 +3091,9 @@ export class PersistentObjectDO {
         }
         const commit = body.commit as ShadowCommitAccepted;
         const transcript = body.transcript as EffectTranscript;
-        if (commit.position.scope !== scope || transcript.scope !== scope) throw wooError("E_INVARG", "apply-v2-commit scope mismatch");
+        if (commit.position.scope !== scope || !v2ApplyCommitTranscriptScopeMatches(scope, transcript)) {
+          throw wooError("E_INVARG", "apply-v2-commit scope mismatch");
+        }
         const projectionWrites = Array.isArray(body.projection_writes)
           ? body.projection_writes as ProjectionWrite[]
           : commit.projection_writes ?? [];
@@ -6257,6 +6259,15 @@ function focusListFromUnknown(value: unknown): ObjRef[] {
     if (out.length >= 32) break;
   }
   return out;
+}
+
+function v2ApplyCommitTranscriptScopeMatches(scope: ObjRef, transcript: EffectTranscript): boolean {
+  if (transcript.scope === scope) return true;
+  // MV-A placement transactions sequence under a placement authority scope,
+  // while the transcript keeps the user-visible VM scope that selected the
+  // closure. The accepted commit/projection rows are still the authority gate;
+  // this endpoint only rejects non-movement cross-scope apply requests.
+  return transcript.moves.length > 0;
 }
 
 function finitePositiveNumber(value: unknown): number | null {

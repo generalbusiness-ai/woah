@@ -13,6 +13,7 @@ import {
   executorAuthorityPayload,
   executorEnvelopeId,
   executorAuthorityObjectIds,
+  executorTransactionObjectIds,
   executorReplyNeedsRepair,
   type ExecutorEnvelopeBody
 } from "../src/core/executor";
@@ -331,6 +332,70 @@ describe("v2 turn gateway", () => {
     ]);
     expect(result.reply?.ok).toBe(true);
   });
+
+  it("routes planned movement through an explicit placement transaction scope", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:v2-placement-planned");
+    const entered = await world.call("placement-enter", session.id, "the_chatroom", {
+      actor: session.actor,
+      target: "the_chatroom",
+      verb: "enter",
+      args: []
+    });
+    expect(entered.op).toBe("applied");
+    const harness = makePlannedExecHarness(world.exportWorld());
+
+    const result = await submitTurnIntent({
+      input: {
+        id: "planned-placement-southeast",
+        route: "sequenced",
+        scope: "the_chatroom",
+        session: session.id,
+        actor: session.actor,
+        target: "the_chatroom",
+        verb: "southeast",
+        args: [],
+        persistence: "durable",
+        token: "token"
+      },
+      strategy: "planned-exec",
+      maxAttempts: 1,
+      transactionScopeForTranscript: ({ transaction }) => {
+        expect(executorTransactionObjectIds(transaction)).toEqual(expect.arrayContaining([
+          session.actor,
+          "the_chatroom",
+          "the_deck"
+        ]));
+        return "#placement" as ObjRef;
+      },
+      ...harness.options
+    });
+
+    expect(result.kind).toBe("submitted");
+    if (result.kind !== "submitted") throw new Error("expected planned submission");
+    expect(result.scope).toBe("the_chatroom");
+    expect(result.commitScope).toBe("#placement");
+    expect(harness.ensureScopes).toEqual(["the_chatroom", "#placement"]);
+    expect(harness.submissions).toHaveLength(1);
+    const submitted = harness.submissions[0];
+    expect(submitted.scope).toBe("#placement");
+    expect(submitted.body.scope).toBe("#placement");
+    expect(submitted.body.node).toBe("node:#placement");
+    expect(submitted.request.key.scope).toBe("the_chatroom");
+    expect(submitted.request.expected).toEqual(scopeHead("#placement"));
+    expect(harness.authorityRequests.at(-1)).toEqual(expect.arrayContaining([
+      "#placement",
+      "the_chatroom",
+      "the_deck",
+      session.actor
+    ]));
+    expect(authorityObjectIds(submitted.body.authority)).toEqual(expect.arrayContaining([
+      "the_chatroom",
+      "the_deck",
+      session.actor
+    ]));
+    expect(result.reply?.ok).toBe(true);
+  });
 });
 
 type PlannedGatewayClient = {
@@ -351,6 +416,7 @@ function makePlannedExecHarness(serialized: SerializedWorld) {
   const clients = new Map<ObjRef, PlannedGatewayClient>();
   const ensureScopes: ObjRef[] = [];
   const submissions: PlannedGatewaySubmission[] = [];
+  const authorityRequests: ObjRef[][] = [];
   const knownObjectIds = new Set(serialized.objects.map((obj) => obj.id));
   const clientFor = (scope: ObjRef): PlannedGatewayClient => {
     let client = clients.get(scope);
@@ -364,6 +430,7 @@ function makePlannedExecHarness(serialized: SerializedWorld) {
   return {
     ensureScopes,
     submissions,
+    authorityRequests,
     options: {
       ensureClient: async (scope: ObjRef) => {
         ensureScopes.push(scope);
@@ -373,17 +440,20 @@ function makePlannedExecHarness(serialized: SerializedWorld) {
       clientHead: (client: PlannedGatewayClient) => client.head,
       clientSerialized: (client: PlannedGatewayClient) => client.serialized,
       nextTurnId: () => { throw new Error("planned gateway tests use explicit ids"); },
-      authorityPayload: (_scope: ObjRef, extraObjectIds: ObjRef[]) => ({
-        sessions: [],
-        session_objects: [],
-        authority: {
-          kind: "woo.authority_slice.shadow.v1" as const,
+      authorityPayload: (_scope: ObjRef, extraObjectIds: ObjRef[]) => {
+        authorityRequests.push(extraObjectIds);
+        return {
           sessions: [],
-          objects: extraObjectIds
-            .filter((id) => knownObjectIds.has(id))
-            .map((id, index) => serializedObject(id, id, index))
-        }
-      }),
+          session_objects: [],
+          authority: {
+            kind: "woo.authority_slice.shadow.v1" as const,
+            sessions: [],
+            objects: extraObjectIds
+              .filter((id) => knownObjectIds.has(id))
+              .map((id, index) => serializedObject(id, id, index))
+          }
+        };
+      },
       submitEnvelope: async (scope: ObjRef, body: ExecutorEnvelopeBody) => {
         const envelope = decodeEnvelope<ShadowTurnExecRequest>(body.envelope);
         submissions.push({ scope, body, envelope, request: envelope.body });

@@ -9,12 +9,18 @@ text is in `spec/protocol/v2-turn-network.md` §VTN8.1 and §VTN10.1.
 ## Status (this branch: scope-executor-atomguard)
 
 - **DONE & verified:** §VTN8.1 + §VTN10.1 spec text; the materialization-miss
-  fix; the regression test. This is a correctness checkpoint, not a smoke fix:
-  it is **NOT deployed**, the non-browser executor and live fanout paths are not
-  wired yet, and production movement still needs the §VTN8.1 / MV-A transaction
-  rule below.
-- **NEXT:** MV-A (movement as one fenced placement transaction), then the
-  non-browser executor path, then fanout.
+  fix; the regression tests. This is a correctness checkpoint, not a smoke fix:
+  it is **NOT deployed**, and the non-browser executor and live fanout paths are
+  not wired yet.
+- **DONE in-process:** MV-A: explicit placement transaction fences let a
+  movement transcript commit under a transaction scope different from
+  `transcript.scope`, with stale plans rejected at the transaction head.
+- **DONE as a transport seam:** planned-exec submission can route a movement
+  transcript to a caller-selected transaction scope after fresh planning, while
+  keeping `TurnKey.scope` as the VM execution scope and seeding authority for
+  the fenced cells.
+- **NEXT:** Wire that transaction scope into the non-browser executor path, then
+  fanout.
 
 ## The proof (conclusive, in-process)
 
@@ -90,29 +96,27 @@ non-browser (MCP/agent) path A3 created.
 Verified: garden-probe passes with three cases. CASE B now uses a genuinely
 reduced key and sparse destination subtree; it repairs in three bounded rounds
 (`the_garden`, `exit_garden_north`, `exit_garden_south`), has no silent E_OBJNF,
-and the executor frame enters `the_garden`. CASE C proves a preamble miss returns
+the executor frame enters `the_garden`, and the repaired turn commits under an
+explicit `#placement` transaction scope. CASE C proves a preamble miss returns
 structured `missing_state` instead of a raw E_OBJNF/no-recording throw.
 
 ## The §VTN8.1 boundary, made exact by the fix
 
 After VTN10.1 heals materialization and cell-page repair carries the current
-property versions, the in-process harness can commit the move under today's
-single-scope behavior. That is useful for proving materialization, but it is
-**not** the production movement rule: the transcript still writes
-`contents:the_deck`, `contents:the_garden`, actor location, and placement
-subscriber cells across two rooms. Without MV-A fencing, two concurrent moves
-touching the same destination can still lose or misorder destination membership.
-CASE B therefore pins the materialization property and allows either `ok` or a
-structured `commit_rejected`; MV-A remains the production correctness boundary.
+property versions, MV-A gives the commit plane the missing concurrency token:
+the transaction scope's head. The in-process harness now commits the repaired
+deck->garden move under `#placement`; without the explicit fence, the same
+cross-scope submit is rejected before it can publish unfenced placement writes.
+The production boundary that remains is **wire-in**, not core validation:
+non-browser submissions still need to choose/open the placement transaction
+scope when a fresh execution reveals movement writes.
 
 ## Remaining sequence (in order)
 
-1. **MV-A in-process.** `the_deck:south` after repair must commit atomically
-   over `location:actor`, `contents:the_deck`, `contents:the_garden`, plus
-   session/presence placement state — one fenced placement transaction across
-   the two room scopes. Add a **contention test**: two actors moving into/out of
-   the same destination from stale heads either serialize or get a clean
-   retryable conflict, never lost destination membership.
+1. **MV-A production selector.** The core transaction boundary and planned-exec
+   seam exist; the next production step is to decide and enable the placement
+   authority selector for non-browser submissions, then carry that accepted
+   transaction scope through user-visible frame/fanout routing.
 2. **Non-browser executor path.** Make MCP/agent turns execute whole on a
    capable scope/commit executor with guarded materialization repair. Gateway
    stops assembling executable authority; it supplies session/auth/live routing
@@ -126,6 +130,9 @@ structured `commit_rejected`; MV-A remains the production correctness boundary.
 ## Artifacts
 
 - `tests/scope-executor-garden-probe.test.ts` — CASE A (multi-scope proof) +
-  CASE B (VTN10.1 recovery + VTN8.1 commit boundary).
+  CASE B (VTN10.1 recovery + MV-A commit acceptance).
+- `tests/shadow-placement-transaction.test.ts` — MV-A stale-head contention and
+  missing-fence rejection tests.
 - `spec/protocol/v2-turn-network.md` §VTN8.1, §VTN10.1.
 - `src/core/world.ts`, `src/core/shadow-turn-call.ts` — the VTN10.1 fix.
+- `src/core/executor.ts` — planned-exec transaction-scope seam.

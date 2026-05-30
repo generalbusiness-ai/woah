@@ -22,6 +22,7 @@ import type { ShadowCapabilityAd } from "./capability-ad";
 import {
   serializedFor,
   shadowCommitScopeObject,
+  shadowPlacementTransactionForTranscript,
   submitShadowCommit,
   transcriptTouchedObjectIds,
   type ShadowCommitAccepted,
@@ -720,12 +721,16 @@ export async function executeAuthoritativeShadowTurnCall(
     expected: input.expected ?? input.commitScope.head,
     persistence: "durable"
   };
+  const commitTransaction = input.commitScope.scope !== run.transcript.scope
+    ? shadowPlacementTransactionForTranscript(run.transcript) ?? undefined
+    : undefined;
   const commit = submitShadowCommit(input.commitScope, {
     kind: "woo.commit.submit.shadow.v1",
     id: request.id ?? input.call.id,
-    scope: input.call.scope,
+    scope: commitTransaction ? input.commitScope.scope : run.transcript.scope,
     expected: request.expected ?? input.commitScope.head,
     transcript: run.transcript,
+    ...(commitTransaction ? { transaction: commitTransaction } : {}),
     executor: node.node,
     profile: input.profile,
     metric: input.metric
@@ -883,13 +888,17 @@ export async function executeShadowTurnCallOrNeedState(
   }
 
   const livePersistence = request.persistence === "live";
+  const commitTransaction = options.commitScope && options.commitScope.scope !== run.transcript.scope
+    ? shadowPlacementTransactionForTranscript(run.transcript) ?? undefined
+    : undefined;
   const commit = options.commitScope && !livePersistence
     ? submitShadowCommit(options.commitScope, {
         kind: "woo.commit.submit.shadow.v1",
         id: request.id ?? request.call.id,
-        scope: request.key.scope,
+        scope: commitTransaction ? options.commitScope.scope : run.transcript.scope,
         expected: request.expected ?? options.commitScope.head,
         transcript: run.transcript,
+        ...(commitTransaction ? { transaction: commitTransaction } : {}),
         executor: node.node,
         profile: options.profile,
         metric: options.metric

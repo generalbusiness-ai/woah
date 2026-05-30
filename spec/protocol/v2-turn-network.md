@@ -690,6 +690,22 @@ choice of MV-A vs MV-B does not change VTN10.1: the destination room must still
 be *materialized* (via the lookup-miss probe and cell-page repair) before its
 `contents` cell can be read or written, under either rule.
 
+The MV-A commit contract is explicit. A movement transcript may commit under a
+transaction scope different from `transcript.scope` only when the submit envelope
+carries a placement transaction fence naming every moved object's `location`
+cell and every source/destination room `contents` cell touched by the transcript
+(plus movement-coupled presence cells such as `subscribers` /
+`session_subscribers` when present). Without that fence, a cross-scope movement
+submit is rejected as `scope_mismatch` / `write_fence_missing`. With the fence,
+the transaction scope's head is the concurrency token: stale movement plans
+against the same placement authority must serialize by advancing that head or
+return a clean retryable `stale_head` conflict. They must never be accepted as
+independent single-scope row replacements that can lose destination membership.
+The `TurnKey.scope` remains the execution scope that selected the VM closure;
+the movement transaction scope is chosen after fresh execution reveals the
+actual movement write set, and the submit envelope carries both the original
+transcript scope and the placement fence.
+
 ## VTN9. Catch-up and applied frames
 
 Subscribers consume committed state through applied frames.

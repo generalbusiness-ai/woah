@@ -32,7 +32,11 @@ import {
 import { decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "./shadow-envelope";
 import { runShadowTurnCallTranscript, type ShadowTurnCall, type ShadowTurnCallTranscriptRun } from "./shadow-turn-call";
 import type { ShadowTurnExecReply, ShadowTurnExecRequest } from "./shadow-turn-exec";
-import { type ShadowScopeHead } from "./shadow-commit-scope";
+import {
+  shadowPlacementTransactionForTranscript,
+  type ShadowCommitTransaction,
+  type ShadowScopeHead
+} from "./shadow-commit-scope";
 import { shadowTurnKeyFromTranscript } from "./turn-key";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, MetricEvent, ObjRef, WooValue } from "./types";
 import type { WooWorld } from "./world";
@@ -125,6 +129,11 @@ export type SubmitTurnIntentOptions<Client, Result extends ExecutorEnvelopeResul
   authorityPayload(scope: ObjRef, extraObjectIds: ObjRef[]): ExecutorAuthorityPayload | Promise<ExecutorAuthorityPayload>;
   submitEnvelope(scope: ObjRef, body: ExecutorEnvelopeBody): Promise<Result>;
   authorityObjectIds?(input: ExecutorCallInput, commitScope: ObjRef): ObjRef[];
+  transactionScopeForTranscript?(input: {
+    turn: ExecutorCallInput;
+    planned: ShadowTurnCallTranscriptRun;
+    transaction: ShadowCommitTransaction;
+  }): ObjRef | null | undefined;
   shouldRetry?(reply: ShadowTurnExecReply): boolean;
   // Forwarder for engine metric events recorded during planning-phase
   // verb execution (the ephemeral world built from clientSerialized).
@@ -212,6 +221,18 @@ export function executorAuthorityObjectIds(
   push(input.actor);
   pushValueRefs(input.args ?? []);
   pushValueRefs(input.body ?? {});
+  return ids;
+}
+
+export function executorTransactionObjectIds(transaction: ShadowCommitTransaction | null | undefined): ObjRef[] {
+  if (!transaction) return [];
+  const ids: ObjRef[] = [];
+  const seen = new Set<ObjRef>();
+  for (const cell of transaction.cells) {
+    if (seen.has(cell.object)) continue;
+    seen.add(cell.object);
+    ids.push(cell.object);
+  }
   return ids;
 }
 
@@ -360,7 +381,11 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     if (planned.frame.op === "error") return { kind: "local_frame", frame: planned.frame, call, planned };
 
     const key = shadowTurnKeyFromTranscript(planned.transcript);
-    const commitScope = key.scope;
+    const transaction = shadowPlacementTransactionForTranscript(planned.transcript);
+    const transactionScope = transaction
+      ? options.transactionScopeForTranscript?.({ turn: options.input, planned, transaction }) ?? null
+      : null;
+    const commitScope = transactionScope ?? key.scope;
     const commitClient = commitScope === options.input.scope
       ? planningClient
       : await options.ensureClient(commitScope, attempt);
@@ -386,8 +411,11 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       envelopeId: options.envelopeId?.(turnId, attempt),
       request
     });
-    const authorityObjectIds = options.authorityObjectIds?.(options.input, commitScope)
-      ?? executorAuthorityObjectIds(options.input, commitScope);
+    const authorityObjectIds = mergeExecutorObjectIds(
+      options.authorityObjectIds?.(options.input, commitScope)
+        ?? executorAuthorityObjectIds(options.input, commitScope),
+      executorTransactionObjectIds(transactionScope ? transaction : null)
+    );
     const authority = await options.authorityPayload(commitScope, authorityObjectIds);
     const result = await options.submitEnvelope(commitScope, executorEnvelopeBody({
       scope: commitScope,
@@ -411,4 +439,17 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     };
   }
   throw new Error("v2 turn gateway retry loop exhausted");
+}
+
+function mergeExecutorObjectIds(...lists: ObjRef[][]): ObjRef[] {
+  const ids: ObjRef[] = [];
+  const seen = new Set<ObjRef>();
+  for (const list of lists) {
+    for (const id of list) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      ids.push(id);
+    }
+  }
+  return ids;
 }
