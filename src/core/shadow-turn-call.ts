@@ -90,24 +90,42 @@ export async function runShadowTurnCallOnWorldTranscript(
 ): Promise<ShadowTurnCallTranscriptRun> {
   if (options.onMetric) world.setMetricsHook(options.onMetric);
   const recorder = new InMemoryTurnRecorder();
-  world.setTurnRecorder(options.allowed_atom_hashes
+  const guarded = options.allowed_atom_hashes != null;
+  world.setTurnRecorder(guarded
     ? new ShadowStateGuardTurnRecorder(recorder, new Set(options.allowed_atom_hashes))
     : recorder);
 
+  // VTN10.1: arm the object-lookup materialization probe ONLY in guarded
+  // mode (allowed_atom_hashes present). In this mode an `object(id)` miss
+  // emits a lifecycle probe that the guard recorder rejects with
+  // E_NEED_STATE, turning a missing-slice dereference into a repairable
+  // missing_state instead of a semantic E_OBJNF. Authoritative/diagnostic
+  // runs (no allowed set) leave the guard off so a genuine miss still
+  // surfaces as E_OBJNF. The flag is always cleared in the finally below,
+  // even on throw, so it never leaks into a later run on the same world.
+  // The throw of E_NEED_STATE must propagate out (it becomes the recorded
+  // turn's turn_finish error -> transcript.error -> repair); the finally
+  // only clears the flag, it never swallows.
+  if (guarded) world.setShadowExecutionGuard(true);
+
   let frame: AppliedFrame | DirectResultFrame | ErrorFrame;
-  if (call.route === "direct") {
-    frame = await world.directCall(call.id, call.actor, call.target, call.verb, call.args, { sessionId: call.session ?? null });
-  } else {
-    const message: Message = {
-      actor: call.actor,
-      target: call.target,
-      verb: call.verb,
-      args: call.args,
-      body: call.body
-    };
-    frame = call.session
-      ? await world.call(call.id, call.session, call.scope, message)
-      : await world.applyCall(call.id, call.scope, message, null);
+  try {
+    if (call.route === "direct") {
+      frame = await world.directCall(call.id, call.actor, call.target, call.verb, call.args, { sessionId: call.session ?? null });
+    } else {
+      const message: Message = {
+        actor: call.actor,
+        target: call.target,
+        verb: call.verb,
+        args: call.args,
+        body: call.body
+      };
+      frame = call.session
+        ? await world.call(call.id, call.session, call.scope, message)
+        : await world.applyCall(call.id, call.scope, message, null);
+    }
+  } finally {
+    if (guarded) world.setShadowExecutionGuard(false);
   }
 
   const recorded = recorder.turns[0];

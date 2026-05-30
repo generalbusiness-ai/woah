@@ -647,6 +647,49 @@ transcript cells but are not yet materialized by the shared applier; callers
 that need those effects must still treat the commit scope's serialized state as
 authoritative until the applier grows those cell kinds.
 
+### VTN8.1 Movement is a placement transaction
+
+Moving an actor or object between rooms is not a single-cell write. The
+prototype confirms it touches at least three cells across two scopes: the
+moved object's `location`, the source room's `contents`, and the destination
+room's `contents` (plus any presence/subscriber bookkeeping each room keeps).
+The destination is frequently a *transitively-referenced* object — reached
+through an exit's `dest` property rather than named in the call — so the
+write set spans a scope the turn did not nominate.
+
+This is a multi-scope commit and MUST be made explicit rather than left as an
+implicit "the source scope writes the destination's contents" rule. Writing a
+foreign room's `contents` cell from the source room's commit scope, with no
+fence on the destination, is a latent lost-update/ordering hazard the moment two
+actors move in or out of the same destination concurrently. A spec that ships
+that implicitly is shipping the race.
+
+For the current prototype phase, an implementation MUST choose one of the
+following explicit rules and state which it uses:
+
+- **(MV-A) Combined movement scope.** The turn acquires write authority/fences
+  for the source-contents, destination-contents, and actor-location cells before
+  it commits, and commits them as one atomic placement transaction under a
+  commit scope whose validation covers all three cells. This is the correct
+  end-state: movement is one transaction over the placement cells regardless of
+  which rooms own them.
+- **(MV-B) Stated temporary single-scope rule, with known limits.** The turn
+  commits under the source room's scope and writes the destination's `contents`
+  cell as part of that single-scope commit. This is permitted only as a
+  documented interim with explicitly acknowledged race limits: concurrent moves
+  into or out of the same destination room are not serialized against each other,
+  so destination `contents` can lose an update under contention. An
+  implementation using MV-B MUST record the limitation in its operational notes
+  and MUST NOT represent it as race-safe.
+
+The default direction of travel is MV-A. MV-B is acceptable to unblock the
+materialization-miss fix (VTN10.1) and the non-browser executor path, because
+those are correctness-independent of which placement rule is chosen, but a
+production movement path MUST be MV-A or an equivalently fenced transaction. The
+choice of MV-A vs MV-B does not change VTN10.1: the destination room must still
+be *materialized* (via the lookup-miss probe and cell-page repair) before its
+`contents` cell can be read or written, under either rule.
+
 ## VTN9. Catch-up and applied frames
 
 Subscribers consume committed state through applied frames.
@@ -884,11 +927,57 @@ missing. If missing state is discovered during execution, the executor MUST
 abort without commit and return `missing_state`. Partial transcripts from such
 runs are diagnostics only.
 
+### VTN10.1 Object lookup misses are materialization misses
+
+Under guarded (sparse, non-authoritative) execution, an object lookup for an id
+that is absent from the executor's materialized slice MUST be treated as a
+**materialization miss**, not as a semantic `E_OBJNF`. The executor MUST abort
+the turn without commit and return `missing_state` naming the missing object's
+lifecycle atom, so the state plane (VTN12) can transfer the object's
+`object_lineage`/`object_live` cell pages and the caller can retry the whole
+turn. A semantic `E_OBJNF` (the object truly does not exist, or the actor is not
+authorized to observe it) may only be concluded after state repair has proven
+the absence against the object's owning scope/anchor authority — never from the
+mere fact that a sparse executor's local slice lacks the id.
+
+This closes a hole the prototype exposed: a transitively-referenced object (for
+example a room reached through an exit's `dest`) is not named in the explicit
+`TurnKey.atoms` and is only discovered when the VM dereferences it mid-run. If
+the bare lookup throws `E_OBJNF` *before* any read event reaches the atom guard,
+the miss never becomes `missing_state`; worse, when catalog code wraps the verb
+error into an observation the turn can still commit as `applied` with the move
+silently dropped. The normative rule is therefore: a lookup miss under guarded
+execution MUST emit a lifecycle materialization probe (a recorder-visible read
+of the object's lifecycle/lineage cell) that the atom guard converts to
+`missing_state`, before any `E_OBJNF` is raised. The probe carries the missing
+id so cell-page selection can fetch exactly that object's lineage and live
+pages. **Full-closure authoritative executors are exempt**: an executor that
+holds the entire closure the turn can reach (the browser-edge path, or an
+anchor that owns every reachable cell) treats a lookup miss as a genuine
+`E_OBJNF`, because there is no further authority to repair from. The exemption
+is keyed on owning the full *closure*, not the full *scope slice*: a source-scope
+executor can be complete for its own scope (every cell of `the_deck`) and still
+legitimately miss a transitively-referenced object in another scope
+(`the_garden`, reached via `exit_deck_south.dest`). Such an executor is NOT
+exempt — its miss is a materialization miss that MUST repair, not a semantic
+absence.
+
+The probe is a generic substrate behavior keyed on "id not in materialized
+slice during a recorded turn." It MUST NOT depend on the verb being a movement,
+on catalog object identities, or on any catalog-specific shape. Predicting
+transitive move targets into the `TurnKey` ahead of execution is an optional
+routing optimization that can reduce repair round-trips, but it is not the
+invariant and MUST NOT be the only mechanism — the materialization probe is what
+makes the loop correct for any verb that dereferences a property-held object
+ref.
+
 The v2 execution implementation covers this for fresh `TurnCall` execution in
 two places: a predicted TurnKey is compared with a local atom cache before
 running, and the turn recorder enforces an `E_NEED_STATE` guard when dispatch,
 property, or structural cell events touch an atom outside the materialized set.
-Recorded-turn replay helpers remain diagnostic preflight harnesses only.
+The lifecycle materialization probe of VTN10.1 extends that guard to bare object
+lookups, which previously bypassed it. Recorded-turn replay helpers remain
+diagnostic preflight harnesses only.
 
 The production execution helper receives a `TurnCall`, executes it fresh on the
 selected node, returns a `TurnExecReply`, and can submit the fresh transcript to

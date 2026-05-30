@@ -526,6 +526,17 @@ export class WooWorld {
 
   private turnRecorder: TurnRecorder | null;
   private activeTurnRecorder: ActiveTurnRecorder | null = null;
+  // VTN10.1: true while a sparse, guarded shadow executor is installed.
+  // When true, an `object(id)` miss is treated as a *materialization* miss
+  // rather than a semantic absence: before throwing E_OBJNF we emit a
+  // lifecycle materialization probe for the absent id, which the guard
+  // recorder rejects with E_NEED_STATE (the absent object's
+  // `cell:lifecycle:<id>` atom is not in the allowed set), driving the
+  // missing_state -> cell_pages -> retry repair loop. Authoritative
+  // full-slice executors and plain diagnostic recorder runs leave this
+  // false; a genuine miss still throws E_OBJNF there.
+  // See spec/protocol/v2-turn-network.md §VTN10.1.
+  private shadowExecutionGuardActive = false;
   private currentTurnWriter: RecordedWriteAuthority | null = null;
   private logicalInputReplay: Map<string, WooValue[]> | null = null;
 
@@ -538,6 +549,17 @@ export class WooWorld {
 
   setTurnRecorder(recorder: TurnRecorder | null): void {
     this.turnRecorder = recorder;
+  }
+
+  /**
+   * Toggle the sparse-shadow-execution guard (VTN10.1). The
+   * shadow-turn-call entry point sets this true only when running with an
+   * allowed-atom-hash set (guarded mode), and clears it in a finally so
+   * it never leaks into a subsequent authoritative run on the same world.
+   * See spec/protocol/v2-turn-network.md §VTN10.1.
+   */
+  setShadowExecutionGuard(active: boolean): void {
+    this.shadowExecutionGuardActive = active;
   }
 
   private async withTurnRecording<T>(turn: TurnStart, fn: (active: ActiveTurnRecorder) => Promise<T>): Promise<T> {
@@ -953,7 +975,20 @@ export class WooWorld {
 
   object(id: ObjRef): WooObject {
     const obj = this.objects.get(id);
-    if (!obj) throw wooError("E_OBJNF", `object not found: ${id}`, id);
+    if (!obj) {
+      // VTN10.1: under a sparse guarded shadow executor, an absent id is
+      // a materialization miss, not a semantic absence. Emit a lifecycle
+      // probe for the id first. The guard recorder will reject the probe
+      // with E_NEED_STATE (its `cell:lifecycle:<id>` atom is not in the
+      // allowed set), so that throw — not the E_OBJNF below — propagates
+      // and drives the repair loop. The throw below stays as the
+      // fallthrough for the non-guarded case (authoritative/diagnostic),
+      // where the probe records harmlessly and E_OBJNF is the truth.
+      if (this.shadowExecutionGuardActive && this.activeTurnRecorder) {
+        this.recordTurnStateProbe({ kind: "lifecycle", object: id });
+      }
+      throw wooError("E_OBJNF", `object not found: ${id}`, id);
+    }
     return obj;
   }
 
