@@ -210,6 +210,7 @@ type V2LocalHostMaterialization = {
 
 type V2FanoutDelivery = {
   localHostMaterialized: V2LocalHostMaterialization;
+  mcpAudience?: McpFanoutAudience;
 };
 
 type BrowserMetricSessionCounter = {
@@ -221,6 +222,13 @@ type BrowserMetricSessionCounter = {
 type DirectorySerializedSession = SerializedSession & {
   displayName?: string | null;
   focusList?: ObjRef[];
+};
+
+type McpFanoutAudience = {
+  audienceActors?: ObjRef[];
+  observationAudiences?: ObjRef[][];
+  audienceSessions?: string[];
+  observationSessionAudiences?: string[][];
 };
 
 type DirectoryScopeSessionsCacheEntry = {
@@ -1467,7 +1475,11 @@ export class PersistentObjectDO {
             const result = await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(scope, "/v2/envelope", body as unknown as Record<string, unknown>);
             const delivery = await this.deliverV2Fanout(world, scope, result, body.session, body.node, { localMcpLiveHandled: true });
             this.applyGatewayProjectionCacheFromReply(result.reply, "mcp");
-            return { ...result, local_host_materialized: delivery.localHostMaterialized };
+            return {
+              ...result,
+              local_host_materialized: delivery.localHostMaterialized,
+              ...(delivery.mcpAudience ? { accepted_audience: delivery.mcpAudience } : {})
+            };
           },
           // tolerateRemoteFailures: this is the per-envelope refresh callback
           // for an already-opened MCP session; the CommitScopeDO has a durable
@@ -3061,13 +3073,14 @@ export class PersistentObjectDO {
           throw wooError("E_INVARG", "mcp-commit-fanout requires transcript");
         }
         const originSession = typeof body.origin_session === "string" ? body.origin_session : null;
+        const audience = mcpFanoutAudienceFromBody(body);
         // The durable projection-cache write is NOT done here: a fanout frame
         // may arrive out of scope-sequence order, and writing it before
         // sequencing would advance the cache head past a not-yet-seen earlier
         // frame, dropping that frame at the head-idempotency guard. The gateway
         // applies the SQL write via the persistAcceptedProjection hook, in
         // contiguous order, as it accepts/drains each frame.
-        this.getMcpGateway(world).acceptRemoteV2Commit(scope, body.commit, body.transcript as EffectTranscript, originSession);
+        this.getMcpGateway(world).acceptRemoteV2Commit(scope, body.commit, body.transcript as EffectTranscript, originSession, audience);
         return jsonResponse({ ok: true });
       }
 
@@ -4341,6 +4354,17 @@ export class PersistentObjectDO {
       const cached = this.routeCache.get(id);
       if (cached && (!mcpGatewayShard || cached !== WORLD_HOST)) return cached;
       if (mcpGatewayShard) {
+        if (id.startsWith("$")) {
+          // Sparse MCP shards do not publish every bootstrap/catalog support
+          // object they may inherit from during guarded repair. These `$`
+          // rows are the small universal support graph, so falling back to the
+          // world host is the right repair path; the non-$ branch below keeps
+          // arbitrary instance misses from waking the singleton speculatively.
+          const directoryHost = await this.fetchDirectoryObjectHost(id, WORLD_HOST);
+          const host = directoryHost || WORLD_HOST;
+          this.routeCache.set(id, host);
+          return host;
+        }
         // Sparse MCP shards can carry a stale `id -> world` cache entry from an
         // earlier fallback route. For authority refresh, Directory is the
         // routing authority: an unresolved non-$ id should use the local
@@ -4764,9 +4788,10 @@ export class PersistentObjectDO {
     const observations = "observations" in frame && frame.observations.length > 0
       ? frame.observations
       : reply.commit.observations;
+    const mcpAudience = await this.mcpFanoutAudience(world, reply.commit.position.scope, reply.transcript, observations);
     await this.sendV2CommitTranscriptFanout(world, turnReplyEnvelope, deliveredNodes, originNode ?? null);
-    await this.deliverMcpCommitFanout(world, scope, fanout, { ...reply.commit, observations }, reply.transcript, originSessionId ?? null);
-    return { localHostMaterialized };
+    await this.deliverMcpCommitFanout(world, scope, fanout, { ...reply.commit, observations }, reply.transcript, originSessionId ?? null, mcpAudience);
+    return { localHostMaterialized, mcpAudience };
   }
 
   private async sendV2CommitTranscriptFanout(
@@ -4885,6 +4910,18 @@ export class PersistentObjectDO {
         this.sendV2LiveEvent(ws, att, from, event);
       }
     }
+  }
+
+  private async mcpFanoutAudience(
+    world: WooWorld,
+    scope: ObjRef,
+    transcript: EffectTranscript,
+    observations: readonly Observation[]
+  ): Promise<McpFanoutAudience> {
+    const directorySessions = await this.loadDirectorySessionsForScopes(affectedMcpFanoutScopes(scope, transcript));
+    const fallback = await world.computeDirectLiveAudiences(scope, structuredClone(observations) as Observation[]);
+    const directoryAudience = mcpFanoutAudienceFromDirectorySessions(scope, observations, directorySessions);
+    return mergeMcpFanoutAudience(fallback, directoryAudience);
   }
 
   private async deliverMcpLiveFanout(
@@ -5070,7 +5107,8 @@ export class PersistentObjectDO {
     fanout: Array<{ node: string; envelope: string }>,
     commit: ShadowCommitAccepted,
     transcript: EffectTranscript,
-    originSessionId: string | null
+    originSessionId: string | null,
+    audience: McpFanoutAudience
   ): Promise<void> {
     // Query Directory freshly for scopes whose presence/contents changed so
     // co-present MCP sessions receive the accepted transcript before they plan
@@ -5079,8 +5117,15 @@ export class PersistentObjectDO {
     // discard the replay, and that turns one room commit into deployment-wide
     // cold-start work.
     const affectedScopes = affectedMcpFanoutScopes(scope, transcript);
-    const scopedHosts = await this.mcpShardHostsForScopes(affectedScopes);
+    const audienceSessions = mcpFanoutAudienceSessionIds(audience);
+    const audienceShardSet = new Set<string>();
+    for (const sessionId of audienceSessions) {
+      if (originSessionId && sessionId === originSessionId) continue;
+      audienceShardSet.add(mcpGatewayShardHost(this.env, sessionId));
+    }
+    const scopedHosts = audienceShardSet.size > 0 ? [] : await this.mcpShardHostsForScopes(affectedScopes);
     const hosts = new Set(scopedHosts);
+    for (const host of audienceShardSet) hosts.add(host);
     const localHost = this.durableHostKey();
     // The commit scope's durable fanout list names sessions that subscribed to
     // this scope explicitly (e.g. through a v2 open). Those recipients may not
@@ -5104,7 +5149,8 @@ export class PersistentObjectDO {
       scope,
       origin_session: originSessionId,
       commit: commit as unknown as WooValue,
-      transcript: transcript as unknown as WooValue
+      transcript: transcript as unknown as WooValue,
+      ...mcpFanoutAudienceBody(audience)
     };
     if (hosts.size > 0) {
       await Promise.all(Array.from(hosts, async (host) => {
@@ -5122,6 +5168,7 @@ export class PersistentObjectDO {
       observations: commit.observations.length,
       affected_scopes: affectedScopes.length,
       scoped_shards: scopedHosts.length,
+      audience_session_shards: audienceShardSet.size,
       subscriber_shards: subscriberShardSet.size,
       local_suppressed: localSuppressed,
       origin_session: originSessionId
@@ -6268,6 +6315,127 @@ function v2ApplyCommitTranscriptScopeMatches(scope: ObjRef, transcript: EffectTr
   // closure. The accepted commit/projection rows are still the authority gate;
   // this endpoint only rejects non-movement cross-scope apply requests.
   return transcript.moves.length > 0;
+}
+
+function mcpFanoutAudienceFromDirectorySessions(
+  fallbackScope: ObjRef,
+  observations: readonly Observation[],
+  sessions: readonly DirectorySerializedSession[]
+): McpFanoutAudience {
+  const now = Date.now();
+  const liveSessions = sessions.filter((session) => typeof session.expiresAt !== "number" || session.expiresAt > now);
+  const allActors = new Set<ObjRef>();
+  const allSessions = new Set<string>();
+  const observationAudiences: ObjRef[][] = [];
+  const observationSessionAudiences: string[][] = [];
+  for (const observation of observations) {
+    const actorTargets = mcpObservationActorTargets(observation);
+    const sourceScope = typeof observation.source === "string" ? observation.source as ObjRef : fallbackScope;
+    const scopeAudience = actorTargets.size === 0 ? sourceScope : null;
+    const actors = new Set<ObjRef>();
+    const sessionIds: string[] = [];
+    for (const session of liveSessions) {
+      const actorMatches = actorTargets.size > 0 && actorTargets.has(session.actor);
+      const scopeMatches = scopeAudience !== null && (session.activeScope ?? session.currentLocation ?? null) === scopeAudience;
+      if (!actorMatches && !scopeMatches) continue;
+      if (mcpObservationExcludesActor(observation, session.actor)) continue;
+      actors.add(session.actor);
+      sessionIds.push(session.id);
+      allActors.add(session.actor);
+      allSessions.add(session.id);
+    }
+    observationAudiences.push(Array.from(actors).sort());
+    observationSessionAudiences.push(Array.from(new Set(sessionIds)).sort());
+  }
+  return {
+    audienceActors: allActors.size > 0 ? Array.from(allActors).sort() : undefined,
+    observationAudiences: observations.length > 0 ? observationAudiences : undefined,
+    audienceSessions: allSessions.size > 0 ? Array.from(allSessions).sort() : undefined,
+    observationSessionAudiences: observations.length > 0 ? observationSessionAudiences : undefined
+  };
+}
+
+function mcpObservationActorTargets(observation: Observation): Set<ObjRef> {
+  const actors = new Set<ObjRef>();
+  if ((observation.type === "looked" || observation.type === "who") && typeof observation.to === "string") {
+    actors.add(observation.to as ObjRef);
+  }
+  if (typeof observation.target === "string") actors.add(observation.target as ObjRef);
+  const directed = directedRecipients(observation);
+  if (directed.to) actors.add(directed.to);
+  if (directed.from) actors.add(directed.from);
+  return actors;
+}
+
+function mcpObservationExcludesActor(observation: Observation, actor: ObjRef): boolean {
+  return (observation.type === "entered" || observation.type === "left" || observation.type === "taken" || observation.type === "dropped") &&
+    typeof observation.actor === "string" &&
+    observation.actor === actor;
+}
+
+function mergeMcpFanoutAudience(primary: McpFanoutAudience, secondary: McpFanoutAudience): McpFanoutAudience {
+  return {
+    audienceActors: mergeStringList(primary.audienceActors, secondary.audienceActors) as ObjRef[] | undefined,
+    audienceSessions: mergeStringList(primary.audienceSessions, secondary.audienceSessions),
+    observationAudiences: mergeNestedStringLists(primary.observationAudiences, secondary.observationAudiences) as ObjRef[][] | undefined,
+    observationSessionAudiences: mergeNestedStringLists(primary.observationSessionAudiences, secondary.observationSessionAudiences)
+  };
+}
+
+function mergeStringList(a: readonly string[] | undefined, b: readonly string[] | undefined): string[] | undefined {
+  const merged = Array.from(new Set([...(a ?? []), ...(b ?? [])].filter((item) => item.length > 0))).sort();
+  return merged.length > 0 ? merged : undefined;
+}
+
+function mergeNestedStringLists(a: readonly (readonly string[])[] | undefined, b: readonly (readonly string[])[] | undefined): string[][] | undefined {
+  const length = Math.max(a?.length ?? 0, b?.length ?? 0);
+  if (length === 0) return undefined;
+  const out: string[][] = [];
+  for (let i = 0; i < length; i += 1) {
+    out.push(mergeStringList(a?.[i], b?.[i]) ?? []);
+  }
+  return out;
+}
+
+function mcpFanoutAudienceSessionIds(audience: McpFanoutAudience): string[] {
+  const ids = new Set<string>();
+  for (const session of audience.audienceSessions ?? []) ids.add(session);
+  for (const list of audience.observationSessionAudiences ?? []) {
+    for (const session of list) ids.add(session);
+  }
+  return Array.from(ids).sort();
+}
+
+function mcpFanoutAudienceBody(audience: McpFanoutAudience): Record<string, WooValue> {
+  return {
+    ...(audience.audienceActors?.length ? { audience_actors: audience.audienceActors as unknown as WooValue } : {}),
+    ...(audience.observationAudiences?.length ? { observation_audiences: audience.observationAudiences as unknown as WooValue } : {}),
+    ...(audience.audienceSessions?.length ? { audience_sessions: audience.audienceSessions as unknown as WooValue } : {}),
+    ...(audience.observationSessionAudiences?.length ? { observation_session_audiences: audience.observationSessionAudiences as unknown as WooValue } : {})
+  };
+}
+
+function mcpFanoutAudienceFromBody(body: Record<string, unknown>): McpFanoutAudience | undefined {
+  const audience: McpFanoutAudience = {
+    audienceActors: stringListFromUnknown(body.audience_actors) as ObjRef[] | undefined,
+    observationAudiences: nestedStringListFromUnknown(body.observation_audiences) as ObjRef[][] | undefined,
+    audienceSessions: stringListFromUnknown(body.audience_sessions),
+    observationSessionAudiences: nestedStringListFromUnknown(body.observation_session_audiences)
+  };
+  return audience.audienceActors || audience.observationAudiences || audience.audienceSessions || audience.observationSessionAudiences
+    ? audience
+    : undefined;
+}
+
+function stringListFromUnknown(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out = Array.from(new Set(value.filter((item): item is string => typeof item === "string" && item.length > 0))).sort();
+  return out.length > 0 ? out : undefined;
+}
+
+function nestedStringListFromUnknown(value: unknown): string[][] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value.map((item) => stringListFromUnknown(item) ?? []);
 }
 
 function finitePositiveNumber(value: unknown): number | null {

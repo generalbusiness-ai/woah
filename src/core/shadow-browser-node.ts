@@ -1954,6 +1954,7 @@ async function executeShadowBrowserTurnExecRequest(
       serialized: serializedFor(browser.relay.commit_scope, { reason: "turn_exec_anchor" })
     },
     commitScope: browser.relay.commit_scope,
+    ...(request.guarded_execution === true ? { maxTransfers: 8 } : {}),
     profile: options.profile,
     metric: options.onMetric
   });

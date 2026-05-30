@@ -1140,6 +1140,74 @@ describe("McpHost", () => {
     }));
   });
 
+  it("routes accepted-frame observations by session audience when local session scope is stale", async () => {
+    const world = bootstrapWorld();
+    world.setProp("$system", "guest_initial_room", null);
+    const alice = world.auth("guest:mcp-v2-audience-origin");
+    const bob = world.auth("guest:mcp-v2-audience-recipient");
+    world.object(alice.actor).location = "the_chatroom";
+    world.object(bob.actor).location = "the_chatroom";
+    const bobSession = world.sessions.get(bob.id);
+    expect(bobSession).toBeTruthy();
+    bobSession!.activeScope = "$nowhere";
+    const metrics: MetricEvent[] = [];
+    world.setMetricsHook((event) => metrics.push(event));
+    const host = new McpHost(world);
+    host.bindSession(bob.id, bob.actor);
+    const transcript = mcpTestTranscript({
+      id: "mcp-v2-session-audience",
+      session: alice.id,
+      call: { actor: alice.actor, target: "the_chatroom", verb: "enter", args: [] },
+      observations: [{ type: "entered", actor: alice.actor, room: "the_chatroom", source: "the_chatroom", text: "Alice entered.", ts: 1 }],
+      hash: "mcp-v2-session-audience"
+    });
+
+    host.routeShadowAcceptedFrame({
+      kind: "woo.commit.accepted.shadow.v1",
+      id: "mcp-v2-session-audience",
+      position: { kind: "woo.scope_head.shadow.v1", scope: "the_chatroom", epoch: 1, seq: 1, hash: "head" },
+      transcript_hash: "mcp-v2-session-audience",
+      post_state_hash: "post",
+      observations: transcript.observations,
+      receipt: {
+        kind: "woo.commit_receipt.shadow.v1",
+        id: "mcp-v2-session-audience",
+        route: "direct",
+        scope: "the_chatroom",
+        seq: -1,
+        transcript_hash: "mcp-v2-session-audience",
+        pre_state_hash: "pre",
+        post_state_hash: "post",
+        accepted: true,
+        errors: []
+      }
+    }, alice.id, transcript, {
+      audienceSessions: [bob.id],
+      observationSessionAudiences: [[bob.id]]
+    });
+
+    const waitTool: McpTool = {
+      name: `${bob.actor}__wait`,
+      object: bob.actor,
+      verb: "wait",
+      aliases: [],
+      description: "",
+      inputSchema: {},
+      direct: true,
+      persistence: "durable",
+      enclosingSpace: "the_chatroom"
+    };
+    const drained = await host.invokeTool(bob.actor, bob.id, waitTool, [0, 10]);
+
+    expect((drained.result as { observations?: Observation[] }).observations).toEqual(transcript.observations);
+    expect(metrics).toContainEqual(expect.objectContaining({
+      kind: "mcp_observation_routed",
+      route: "accepted",
+      queues_scanned: 1,
+      deliveries: 1
+    }));
+  });
+
   it("routes actor focus-list reads through direct dispatch hooks", async () => {
     const world = bootstrapWorld();
     const session = world.auth("guest:mcp-focus-list-dispatch");

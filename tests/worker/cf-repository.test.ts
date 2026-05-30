@@ -2763,6 +2763,7 @@ describe("CFObjectRepository production-shape coverage", () => {
     const wooStates = new Map<string, FakeDurableObjectState>();
     const wooObjects = new Map<string, PersistentObjectDO>();
     const fanoutHosts: string[] = [];
+    const fanoutRequests: Array<{ host: string; body: Record<string, unknown> }> = [];
     let env: Env;
     const wooNamespace = new FakeDurableObjectNamespace((name) => {
       let object = wooObjects.get(name);
@@ -2776,6 +2777,7 @@ describe("CFObjectRepository production-shape coverage", () => {
         fetch: async (request: Request): Promise<Response> => {
           if (new URL(request.url).pathname === "/__internal/mcp-commit-fanout") {
             fanoutHosts.push(name);
+            fanoutRequests.push({ host: name, body: await request.clone().json() as Record<string, unknown> });
           }
           return await object.fetch(request);
         }
@@ -2885,10 +2887,18 @@ describe("CFObjectRepository production-shape coverage", () => {
       const aliceActor = aliceObject.world?.sessions.get(alice)?.actor;
       expect(bobActor).toBeTruthy();
       expect(aliceActor).toBeTruthy();
+      const aliceSession = aliceObject.world?.sessions.get(alice);
+      expect(aliceSession).toBeTruthy();
+      // Simulate the production race: the receiving shard hosts Alice's queue
+      // but its local session.activeScope is briefly stale. Accepted-frame
+      // delivery must use the fanout body session audience, not recompute
+      // presence from this local field.
+      aliceSession!.activeScope = "$nowhere";
 
       // Reset setup fanout; Bob's move must discover Alice's destination
       // shard from Directory's scoped session index.
       fanoutHosts.length = 0;
+      fanoutRequests.length = 0;
       const bobMove = await mcp({
         jsonrpc: "2.0",
         id: 31,
@@ -2900,6 +2910,24 @@ describe("CFObjectRepository production-shape coverage", () => {
       }, { "mcp-session-id": bob });
       expect(bobMove.result.isError, JSON.stringify(bobMove.result.structuredContent)).not.toBe(true);
       expect(fanoutHosts, JSON.stringify({ aliceShard, bobShard, fanoutHosts })).toContain(aliceShard);
+      const aliceFanout = fanoutRequests.find((item) => item.host === aliceShard);
+      expect(aliceFanout, JSON.stringify({ aliceShard, fanoutRequests })).toBeTruthy();
+      expect(JSON.stringify(aliceFanout!.body.observation_session_audiences ?? []), JSON.stringify(aliceFanout!.body)).toContain(alice);
+
+      const waited = await mcp({
+        jsonrpc: "2.0",
+        id: 310,
+        method: "tools/call",
+        params: {
+          name: "woo_wait",
+          arguments: { timeout_ms: 0, limit: 10 }
+        }
+      }, { "mcp-session-id": alice });
+      expect(waited.result.isError, JSON.stringify(waited.result.structuredContent)).not.toBe(true);
+      expect(waited.result.structuredContent.result.observations, JSON.stringify(waited)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: "entered", actor: bobActor })
+      ]));
+      aliceSession!.activeScope = "the_deck";
 
       const who = await mcp({
         jsonrpc: "2.0",

@@ -951,6 +951,14 @@ serialized slice so a complete slice still executes in one VM pass; any cell or
 object not covered by that materialized set remains a `missing_state` miss that
 the caller hydrates and retries as a whole turn.
 
+Cell-page repair for a lookup miss MUST grant the specific negative lookup
+atoms proven by the transferred lookup path. For example, when an inherited
+verb lookup misses on `$chatroom:enter`, the transfer may carry lineage pages
+for `$room`, `$space`, and `$sequenced_log`; it MUST also grant the corresponding
+`read:cell:verb:<ancestor>:enter` atoms for that authoritative path. Otherwise
+a sparse executor can consume one repair round per ancestor before it can reach
+feature verbs or conclude absence, which violates the bounded-repair contract.
+
 ### VTN10.1 Object lookup misses are materialization misses
 
 Under guarded (sparse, non-authoritative) execution, an object lookup for an id
@@ -1342,7 +1350,12 @@ volatile subscriber maps inside a commit-scope relay. The gateway computes the
 transcript's affected scopes from the commit scope, move endpoints, create
 locations, contents writes, and subscriber writes; then it delivers only
 observations whose per-observation audience contains the recipient session or
-actor. A recipient attached to the commit scope also receives a recipient-bound
+actor. Accepted-frame fanout bodies MUST carry the computed session/actor
+audience (`audience_sessions` and/or per-observation session audiences) so a
+receiving shard routes by session id first; it MUST NOT recompute movement
+delivery solely from its local `activeScope`, because that field can be stale
+during the same move that produced the observation. A recipient attached to the
+commit scope also receives a recipient-bound
 projection transfer for that scope, built and signed by the commit-scope/state
 authority. Recipients attached to other affected scopes receive live
 observations only; a state transfer for those scopes MUST be served by that

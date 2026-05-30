@@ -20,7 +20,7 @@ import { shadowObjectLivePage, shadowStatePageHash } from "../src/core/shadow-st
 import { runShadowTurnCall, runShadowTurnCallTranscript, type ShadowTurnCall } from "../src/core/shadow-turn-call";
 import { buildShadowTurnExecAd, buildShadowTurnExecAdFromNode, executeShadowTurnCallAcrossInProcessNetwork } from "../src/core/shadow-turn-network";
 import { InMemoryTurnRecorder } from "../src/core/turn-recorder";
-import { shadowTurnKeyFromTranscript, type ShadowTurnKey } from "../src/core/turn-key";
+import { shadowAtomHash, shadowTurnKeyFromCall, shadowTurnKeyFromTranscript, type ShadowTurnKey } from "../src/core/turn-key";
 import type { MetricEvent } from "../src/core/types";
 
 describe("shadow turn execution", () => {
@@ -1430,6 +1430,29 @@ describe("shadow turn execution", () => {
     expect(routed.result).toMatchObject({ ok: true, attempted: true });
     if (!routed.result.ok) throw new Error(`read-time retry failed: ${routed.result.reason}`);
     expect(createWorldFromSerialized(routed.result.serializedAfter, { persist: false }).getProp("delay_1", "wet")).toBe(0.67);
+  });
+
+  it("grants negative verb lookup atoms for the inherited lookup path in one cell-page repair", () => {
+    const anchor = createWorld();
+    const key = shadowTurnKeyFromCall({
+      scope: "the_chatroom",
+      actor: "$wiz",
+      target: "the_chatroom",
+      verb: "enter"
+    });
+    const firstMiss = "read:cell:verb:$space:enter";
+    const transfer = buildShadowCellPageTransfer({
+      serialized: anchor.exportWorld(),
+      key,
+      missing_atoms: [{ hash: shadowAtomHash(firstMiss), preimage: firstMiss }],
+      recipient: "actor-node"
+    });
+
+    expect(transfer.preimages).toEqual(expect.arrayContaining([
+      firstMiss,
+      "read:cell:verb:$sequenced_log:enter",
+      "read:cell:verb:$root:enter"
+    ]));
   });
 
   it("forwards engine metrics from the ephemeral executor world when onMetric is supplied", async () => {

@@ -131,12 +131,31 @@ Two subtleties are now pinned by tests:
 
 - Negative materialized cells (for example an inherited verb lookup that misses
   on an intermediate class) can be granted by cell-page repair; they are real
-  absence facts for cells on objects the slice has.
+  absence facts for cells on objects the slice has. Repair now grants the
+  negative lookup atoms for the inherited lookup path in one transfer, rather
+  than spending one transfer round per ancestor before feature verbs can run.
 - A read lifecycle atom for an object absent from the anchor cannot be granted
   without pages. Cell-page transfer filters that atom out and the network
   returns `missing_state` to the caller. Write lifecycle atoms remain grantable
   for object creation, where the new object is absent from pre-turn state by
   design.
+
+MCP guarded intents also use fresh envelope ids for authority-repair retries.
+Without that, CommitScopeDO's idempotency cache replays the first
+`missing_state` reply and the caller never observes the repaired authority.
+Guarded intent execution has a larger but still bounded in-process state
+transfer budget than browser planned-exec, because it starts from a static call
+key and discovers catalog dispatch/properties while it runs.
+
+## MCP accepted-frame audience delivery
+
+Accepted-frame fanout now carries the computed session/actor audience in the
+fanout body and returns the same audience to the origin gateway's local
+accepted-frame router. Receiving MCP shards route by explicit session id first,
+so a peer session still receives movement observations when its local
+`session.activeScope` is briefly stale. The CF regression test forces that
+stale local state and asserts both the fanout body audience and the queued
+`entered` observation.
 
 ## Remaining sequence (in order)
 
@@ -148,10 +167,10 @@ Two subtleties are now pinned by tests:
    uses guarded execution and outer authority repair, but production movement
    still needs the transaction selector above before the deck->garden class of
    moves can be considered fixed end-to-end.
-3. **Fanout (P2).** Build the §VTN12 audience session-table delivery path; remove
-   Directory `current_location` as the hot-path delivery key for movement
-   observations (`subscriber_shards: 0` is the symptom the audience table was
-   specified but never built).
+3. **Fanout follow-through.** MCP accepted-frame routing now uses explicit
+   session audiences, but full §VTN12 convergence still needs the browser/live
+   socket side and any remaining Directory-backed audience selection tightened
+   after the production movement selector lands.
 
 ## Artifacts
 
@@ -165,3 +184,6 @@ Two subtleties are now pinned by tests:
   missing-state authority retry.
 - `src/core/shadow-browser-node.ts`, `src/core/turn-key.ts` — static intent key
   plus guarded default relay executor.
+- `tests/mcp.test.ts`, `tests/worker/cf-repository.test.ts` — explicit
+  session-audience accepted-frame routing, including stale receiving-shard
+  session state.

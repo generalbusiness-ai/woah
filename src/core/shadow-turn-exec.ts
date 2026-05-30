@@ -465,7 +465,8 @@ export function buildShadowCellPageTransfer(input: {
     fullLifecycleObjects: lifecycleObjects
   });
   const closureAtomPreimages = fullObjectClosureAtomPreimages(input.serialized, lifecycleObjects);
-  const granted = transferAtomsForPages(selected, requiredPages, closureAtomPreimages);
+  const lookupAtomPreimages = lookupClosureAtomPreimages(input.serialized, selected.map((item) => item.preimage));
+  const granted = transferAtomsForPages(selected, requiredPages, [...closureAtomPreimages, ...lookupAtomPreimages]);
   const knownPageHashes = new Set(input.known_page_hashes ?? []);
   const pageRefs = requiredPages.map((page) => {
     const ref = shadowStatePageRef(page, true);
@@ -1043,6 +1044,59 @@ function readPreimagesForStatePage(page: ShadowStatePage): string[] {
     default:
       return [];
   }
+}
+
+// A guarded executor can miss a negative lookup cell while walking an
+// inheritance chain. The transfer selected by the first miss already carries
+// the authoritative lineage pages for that walk, so grant the specific read
+// atoms for the rest of the lookup path too. Otherwise sparse execution stalls
+// one repair round per ancestor before it can reach feature verbs or conclude
+// the lookup is absent.
+function lookupClosureAtomPreimages(serialized: SerializedWorld, preimages: readonly string[]): string[] {
+  const byId = new Map(serialized.objects.map((obj) => [obj.id, obj] as const));
+  const out = new Set<string>();
+  const verbMatches = (obj: SerializedObject, name: string): boolean =>
+    obj.verbs.some((verb) => verb.name === name || verb.aliases.includes(name));
+  const addVerbChain = (start: ObjRef, name: string): boolean => {
+    let current: ObjRef | null | undefined = start;
+    while (current) {
+      const obj = byId.get(current);
+      if (!obj) return false;
+      out.add(`read:cell:verb:${current}:${name}`);
+      if (verbMatches(obj, name)) return true;
+      current = obj.parent;
+    }
+    return false;
+  };
+  const addVerbLookup = (start: ObjRef, name: string): void => {
+    if (addVerbChain(start, name)) return;
+    const obj = byId.get(start);
+    if (!obj) return;
+    for (const feature of serializedFeatureRefs(obj)) {
+      if (addVerbChain(feature, name)) return;
+    }
+  };
+  const addPropLookup = (start: ObjRef, name: string): void => {
+    let current: ObjRef | null | undefined = start;
+    while (current) {
+      const obj = byId.get(current);
+      if (!obj) return;
+      out.add(`read:cell:prop:${current}.${name}`);
+      if (objectHasPropertyCell(obj, name)) return;
+      current = obj.parent;
+    }
+  };
+  for (const preimage of preimages) {
+    if (!preimage.startsWith("read:")) continue;
+    const verb = verbCellFromTurnKeyPreimage(preimage);
+    if (verb) {
+      addVerbLookup(verb.object, verb.name);
+      continue;
+    }
+    const prop = propCellFromTurnKeyPreimage(preimage);
+    if (prop) addPropLookup(prop.object, prop.name);
+  }
+  return Array.from(out).sort();
 }
 
 // VTN10.1: for objects pulled in by a bare-object materialization

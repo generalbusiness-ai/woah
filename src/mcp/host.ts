@@ -22,6 +22,13 @@ export type McpBroadcastHooks = {
   broadcastLiveEvents?: (result: DirectResultFrame, originSessionId?: string | null) => void | Promise<void>;
 };
 
+export type McpAcceptedFrameAudience = {
+  audienceActors?: ObjRef[];
+  observationAudiences?: ObjRef[][];
+  audienceSessions?: string[];
+  observationSessionAudiences?: string[][];
+};
+
 const QUEUE_HARD_CAP = 4096;
 const DEFAULT_LIMIT = 64;
 const MAX_LIMIT = 256;
@@ -290,10 +297,16 @@ export class McpHost {
     }
   }
 
-  // v2 commit-scope accepted frames are the pure-v2 observation source. They
-  // do not carry legacy AppliedFrame audience metadata, so route by directed
-  // observation recipients first and then by scope subscription/presence.
-  routeShadowAcceptedFrame(frame: ShadowCommitAccepted, originSessionId?: string | null, transcript?: EffectTranscript): void {
+  // v2 commit-scope accepted frames are the pure-v2 observation source.
+  // Prefer the commit gateway's session audience because receiving shards can
+  // be behind on session.activeScope during the move that produced the frame.
+  // Older frames fall back to actor/direct/scope routing.
+  routeShadowAcceptedFrame(
+    frame: ShadowCommitAccepted,
+    originSessionId?: string | null,
+    transcript?: EffectTranscript,
+    audience?: McpAcceptedFrameAudience
+  ): void {
     if (!frame.observations.length) return;
     const refreshSessions = new Set<string>();
     const refreshDecisionByActor = new Map<ObjRef, McpToolRefreshDecision>();
@@ -305,23 +318,50 @@ export class McpHost {
       this.recordToolRefreshDecision(actor, "accepted_frame", decision);
       return decision;
     };
-    for (const observation of frame.observations) {
+    for (let index = 0; index < frame.observations.length; index += 1) {
+      const observation = frame.observations[index];
+      const sessionAudience = audience?.observationSessionAudiences?.[index] ?? audience?.audienceSessions ?? null;
+      const actorAudience = audience?.observationAudiences?.[index] ?? audience?.audienceActors ?? null;
       const directed = directedRecipients(observation);
       const directedActors = new Set<ObjRef>();
       if (directed.to) directedActors.add(directed.to);
       if (directed.from) directedActors.add(directed.from);
       let queuesScanned = 0;
       let deliveries = 0;
+      if (sessionAudience) {
+        const sessionSet = new Set(sessionAudience);
+        for (const sessionId of sessionSet) {
+          queuesScanned += 1;
+          if (originSessionId && sessionId === originSessionId) continue;
+          const queue = this.queues.get(sessionId);
+          if (!queue) continue;
+          this.enqueueFor(sessionId, observation);
+          deliveries += 1;
+          if (refreshDecisionForActor(queue.actor).refresh) refreshSessions.add(sessionId);
+        }
+        this.world.recordMetric({
+          kind: "mcp_observation_routed",
+          scope: frame.position.scope,
+          observation_type: String(observation.type ?? ""),
+          queues_scanned: queuesScanned,
+          deliveries,
+          route: "accepted"
+        });
+        continue;
+      }
+      const actorAudienceSet = actorAudience ? new Set(actorAudience) : null;
       for (const [sessionId, queue] of this.queues) {
         queuesScanned += 1;
         if (originSessionId && sessionId === originSessionId) continue;
         const sessionLocation = this.world.activeScopeForSession(sessionId);
         const sourceScope = typeof observation.source === "string" ? observation.source : null;
-        const shouldDeliver = directedActors.size > 0
-          ? directedActors.has(queue.actor)
-          : this.actorSubscribes(queue.actor, frame.position.scope) ||
-            sessionLocation === frame.position.scope ||
-            (sourceScope !== null && (this.actorSubscribes(queue.actor, sourceScope) || sessionLocation === sourceScope));
+        const shouldDeliver = actorAudienceSet
+          ? actorAudienceSet.has(queue.actor)
+          : directedActors.size > 0
+            ? directedActors.has(queue.actor)
+            : this.actorSubscribes(queue.actor, frame.position.scope) ||
+              sessionLocation === frame.position.scope ||
+              (sourceScope !== null && (this.actorSubscribes(queue.actor, sourceScope) || sessionLocation === sourceScope));
         if (shouldDeliver) {
           this.enqueueFor(sessionId, observation);
           deliveries += 1;

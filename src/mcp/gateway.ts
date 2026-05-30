@@ -19,7 +19,7 @@ import type { WooWorld } from "../core/world";
 import type { SerializedAuthoritySlice } from "../core/repository";
 import { projectionDeltaMissingWrites, type ProjectionWrite } from "../core/projection-delta";
 import { createMcpServer } from "./server";
-import { McpHost, type McpBroadcastHooks, type McpDispatchHooks, type McpToolManifestHooks } from "./host";
+import { McpHost, type McpAcceptedFrameAudience, type McpBroadcastHooks, type McpDispatchHooks, type McpToolManifestHooks } from "./host";
 import {
   createShadowBrowserRelayShim,
   markShadowBrowserRelaySerializedChanged,
@@ -31,6 +31,7 @@ import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import {
   V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED,
   buildExecutionCapsule,
+  executorEnvelopeId,
   mergeExecutorAuthority,
   submitTurnIntent,
   executorAuthorityPayload,
@@ -128,6 +129,7 @@ export type McpV2EnvelopeResult = {
     hostKey: string;
     gatewayHost?: boolean;
   } | null;
+  accepted_audience?: McpAcceptedFrameAudience;
 };
 
 type V2ScopeClient = {
@@ -141,6 +143,7 @@ type RemoteAcceptedCommit = {
   commit: ShadowCommitAccepted;
   transcript: EffectTranscript;
   originSessionId: string | null;
+  audience?: McpAcceptedFrameAudience;
   receivedAt: number;
 };
 
@@ -299,7 +302,13 @@ export class McpGateway {
     this.host.bindSession(sessionId, actor);
   }
 
-  acceptRemoteV2Commit(scope: ObjRef, commit: ShadowCommitAccepted, transcript: EffectTranscript, originSessionId?: string | null): void {
+  acceptRemoteV2Commit(
+    scope: ObjRef,
+    commit: ShadowCommitAccepted,
+    transcript: EffectTranscript,
+    originSessionId?: string | null,
+    audience?: McpAcceptedFrameAudience
+  ): void {
     const commitScope = commit.position.scope;
     const key = remoteAcceptedKey(commit);
     // Diagnostic: log every entry to acceptRemoteV2Commit so we can see whether
@@ -322,7 +331,7 @@ export class McpGateway {
     if (pending?.has(commit.position.seq)) return;
 
     this.pruneRemotePending();
-    const entry = { commit, transcript, originSessionId: originSessionId ?? null, receivedAt: Date.now() };
+    const entry = { commit, transcript, originSessionId: originSessionId ?? null, audience, receivedAt: Date.now() };
     const expectedSeq = this.remoteExpectedSeq(commitScope);
     if (expectedSeq === null) {
       this.applyRemoteAccepted(scope, entry);
@@ -394,7 +403,7 @@ export class McpGateway {
       this.world.applyCommittedShadowTranscript(entry.transcript);
     }
     this.propagateTranscriptToOtherScopes(entry.commit.position.scope, entry.transcript);
-    this.host.routeShadowAcceptedFrame(entry.commit, entry.originSessionId, entry.transcript);
+    this.host.routeShadowAcceptedFrame(entry.commit, entry.originSessionId, entry.transcript, entry.audience);
   }
 
   private drainRemoteAccepted(scope: ObjRef, commitScope: ObjRef): void {
@@ -598,6 +607,7 @@ export class McpGateway {
       ensureClient: async (submitScope) => await this.ensureV2ScopeClient(entry, submitScope),
       clientNode: () => this.v2NodeFor(entry),
       nextTurnId: () => id,
+      envelopeId: (turnId, attempt) => executorEnvelopeId(turnId, attempt, () => Math.random().toString(36).slice(2, 10)),
       authorityPayload: async (_submitScope, extraObjectIds) => {
         const useCommitScopeSnapshotForRemoteAuthority = authorityRefreshAttempts === 0;
         authorityRefreshAttempts += 1;
@@ -652,7 +662,7 @@ export class McpGateway {
       return { op: "error", id, error: { code: reply.reason, message: reply.reason, value: reply as unknown as WooValue } };
     }
     if (reply.commit) {
-      this.acceptV2Commit(client, reply, sessionId, result.local_host_materialized ?? null);
+      this.acceptV2Commit(client, reply, sessionId, result.local_host_materialized ?? null, result.accepted_audience);
     }
     const frame = mcpFrameFromTurnReply(scope, reply);
     if (!reply.commit && frame.op === "result") this.host.routeLiveEvents(frame, sessionId);
@@ -828,7 +838,8 @@ export class McpGateway {
     client: V2ScopeClient,
     reply: Extract<ShadowTurnExecReply, { ok: true }>,
     originSessionId: string,
-    localHostMaterialized: McpV2EnvelopeResult["local_host_materialized"] = null
+    localHostMaterialized: McpV2EnvelopeResult["local_host_materialized"] = null,
+    audience?: McpAcceptedFrameAudience
   ): void {
     if (!reply.commit || !reply.transcript) return;
     applyAcceptedShadowFrame(client.relay.commit_scope, reply.commit, reply.transcript);
@@ -850,7 +861,7 @@ export class McpGateway {
         : {});
     }
     this.propagateTranscriptToOtherScopes(reply.commit.position.scope, reply.transcript);
-    this.host.routeShadowAcceptedFrame(reply.commit, originSessionId, reply.transcript);
+    this.host.routeShadowAcceptedFrame(reply.commit, originSessionId, reply.transcript, audience);
   }
 
   // The commit happened in `originScope`; that scope's V2 client has had the
