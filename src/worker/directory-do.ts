@@ -1,4 +1,4 @@
-import { sessionActiveScopeFromRecord, wooError, type MetricEvent, type ObjRef, type Session } from "../core/types";
+import { sessionActiveScopeFromRecord, wooError, type MetricEvent, type ObjRef, type Session, type WooValue } from "../core/types";
 import { verifyInternalRequest, type InternalAuthEnv } from "./internal-auth";
 import { metricErrorFields } from "./metric-errors";
 import { writeMetricToAnalytics, writeConstructorMetricToAnalytics } from "./metrics-sink";
@@ -37,7 +37,14 @@ type SessionRoute = {
   apikey_id: string | null;
   mcp_shard: string | null;
   focus_list: ObjRef[];
+  actor_props: DirectorySessionActorProp[];
   updated_at: number;
+};
+
+type DirectorySessionActorProp = {
+  name: string;
+  value: WooValue;
+  version: number;
 };
 
 const WORLD_HOST = "world";
@@ -140,6 +147,7 @@ export class DirectoryDO {
             apikey_id: typeof body.apikey_id === "string" && body.apikey_id.length > 0 ? body.apikey_id : null,
             mcp_shard: typeof body.mcp_shard === "string" && body.mcp_shard.length > 0 ? body.mcp_shard : null,
             focus_list: focusListFromUnknown(body.focus_list),
+            actor_props: actorPropsFromUnknown(body.actor_props),
             updated_at: Date.now()
           });
           this.emitMetric({ kind: "startup_storage", phase: "directory_register_session", ms: Date.now() - startedAt, status: "ok", writes: wrote ? 1 : 0 });
@@ -249,6 +257,7 @@ export class DirectoryDO {
         apikey_id TEXT,
         mcp_shard TEXT,
         focus_list TEXT,
+        actor_props TEXT,
         updated_at INTEGER NOT NULL
       )`,
       `CREATE TABLE IF NOT EXISTS directory_meta (
@@ -293,6 +302,10 @@ export class DirectoryDO {
     }
     if (!columns.has("focus_list")) {
       this.state.storage.sql.exec("ALTER TABLE session_route ADD COLUMN focus_list TEXT");
+      statements += 1;
+    }
+    if (!columns.has("actor_props")) {
+      this.state.storage.sql.exec("ALTER TABLE session_route ADD COLUMN actor_props TEXT");
       statements += 1;
     }
     return statements;
@@ -357,13 +370,14 @@ export class DirectoryDO {
     // singleton. Compare every column except updated_at; an unchanged row
     // is a no-op.
     const existing = firstRow(this.state.storage.sql.exec(
-      "SELECT actor, started, display_name, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list FROM session_route WHERE session_id = ?",
+      "SELECT actor, started, display_name, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list, actor_props FROM session_route WHERE session_id = ?",
       session.session_id
     ));
     const started = session.started > 0
       ? session.started
       : finitePositiveNumber(existing?.started) ?? Date.now();
     const encodedFocusList = JSON.stringify(session.focus_list);
+    const encodedActorProps = encodeActorProps(session.actor_props);
     if (existing
       && String(existing.actor) === session.actor
       && Number(existing.started ?? 0) === started
@@ -373,11 +387,12 @@ export class DirectoryDO {
       && (existing.current_location === null ? null : String(existing.current_location)) === session.active_scope
       && (existing.apikey_id === null ? null : String(existing.apikey_id)) === session.apikey_id
       && (existing.mcp_shard === null ? null : String(existing.mcp_shard)) === session.mcp_shard
-      && (existing.focus_list === null ? "[]" : String(existing.focus_list)) === encodedFocusList) {
+      && (existing.focus_list === null ? "[]" : String(existing.focus_list)) === encodedFocusList
+      && (existing.actor_props === null ? "[]" : String(existing.actor_props)) === encodedActorProps) {
       return false;
     }
     this.state.storage.sql.exec(
-      "INSERT OR REPLACE INTO session_route(session_id, actor, started, display_name, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT OR REPLACE INTO session_route(session_id, actor, started, display_name, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list, actor_props, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       session.session_id,
       session.actor,
       started,
@@ -388,6 +403,7 @@ export class DirectoryDO {
       session.apikey_id,
       session.mcp_shard,
       encodedFocusList,
+      encodedActorProps,
       Date.now()
     );
     return true;
@@ -411,7 +427,7 @@ export class DirectoryDO {
   private resolveSession(sessionId: string): SessionRoute | null {
     if (!sessionId) return null;
     const row = firstRow(this.state.storage.sql.exec(
-      "SELECT session_id, actor, started, display_name, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list, updated_at FROM session_route WHERE session_id = ?",
+      "SELECT session_id, actor, started, display_name, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list, actor_props, updated_at FROM session_route WHERE session_id = ?",
       sessionId
     ));
     if (!row) return null;
@@ -432,6 +448,7 @@ export class DirectoryDO {
       apikey_id: typeof row.apikey_id === "string" && row.apikey_id.length > 0 ? row.apikey_id : null,
       mcp_shard: typeof row.mcp_shard === "string" && row.mcp_shard.length > 0 ? row.mcp_shard : null,
       focus_list: focusListFromUnknown(row.focus_list),
+      actor_props: actorPropsFromUnknown(row.actor_props),
       updated_at: Number(row.updated_at)
     };
   }
@@ -463,7 +480,7 @@ export class DirectoryDO {
   private mcpSessionsForShard(shard: string, afterSessionId: string, limit: number): { sessions: SessionRoute[]; next_after_session_id: string | null } {
     if (!shard) return { sessions: [], next_after_session_id: null };
     const rows = this.state.storage.sql.exec(
-      `SELECT session_id, actor, started, display_name, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list, updated_at
+      `SELECT session_id, actor, started, display_name, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list, actor_props, updated_at
         FROM session_route
         WHERE mcp_shard = ?
           AND session_id > ?
@@ -490,7 +507,7 @@ export class DirectoryDO {
     if (scopes.length === 0) return { sessions: [], next_after_session_id: null };
     const placeholders = scopes.map(() => "?").join(", ");
     const rows = this.state.storage.sql.exec(
-      `SELECT session_id, actor, started, display_name, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list, updated_at
+      `SELECT session_id, actor, started, display_name, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list, actor_props, updated_at
         FROM session_route
         WHERE current_location IN (${placeholders})
           AND session_id > ?
@@ -699,6 +716,7 @@ function sessionRouteFromRow(row: Record<string, unknown>): SessionRoute {
     apikey_id: typeof row.apikey_id === "string" && row.apikey_id.length > 0 ? row.apikey_id : null,
     mcp_shard: typeof row.mcp_shard === "string" && row.mcp_shard.length > 0 ? row.mcp_shard : null,
     focus_list: focusListFromUnknown(row.focus_list),
+    actor_props: actorPropsFromUnknown(row.actor_props),
     updated_at: updatedAt
   };
 }
@@ -735,6 +753,40 @@ function focusListFromUnknown(value: unknown): ObjRef[] {
     if (out.length >= DIRECTORY_FOCUS_LIST_CAP) break;
   }
   return out;
+}
+
+function actorPropsFromUnknown(value: unknown): DirectorySessionActorProp[] {
+  let raw: unknown = value;
+  if (typeof value === "string") {
+    try {
+      raw = JSON.parse(value) as unknown;
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(raw)) return [];
+  const byName = new Map<string, DirectorySessionActorProp>();
+  for (const item of raw) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const record = item as Record<string, unknown>;
+    const name = typeof record.name === "string" ? record.name : "";
+    const version = Number(record.version);
+    if (!name || !Number.isInteger(version) || version < 0) continue;
+    byName.set(name, {
+      name,
+      value: cloneJsonValue(record.value) as WooValue,
+      version
+    });
+  }
+  return Array.from(byName.values()).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function encodeActorProps(props: readonly DirectorySessionActorProp[]): string {
+  return JSON.stringify(actorPropsFromUnknown(props));
+}
+
+function cloneJsonValue(value: unknown): unknown {
+  return value === undefined ? null : JSON.parse(JSON.stringify(value));
 }
 
 async function readJson(request: Request, maxBytes: number = MAX_JSON_BODY_BYTES): Promise<Record<string, unknown>> {

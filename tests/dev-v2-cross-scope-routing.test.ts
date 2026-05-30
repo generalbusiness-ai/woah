@@ -126,14 +126,10 @@ describe("dev v2 cross-scope WS routing", () => {
     expect(reply.body.transcript?.call).toMatchObject({ target: targetScope, verb: "enter" });
   });
 
-  it("would be rejected by the chatroom relay without routing — regression guard", async () => {
-    // Pins the failure mode the routing fix exists to avoid: if the dev WS
-    // submits a chat-issued `enter dubspace` against the WS-bound chatroom
-    // relay (instead of routing to the dubspace relay), the commit comes
-    // back as `commit_rejected` with `scope_mismatch`. If this test starts
-    // returning `ok: true`, the routing fix is no longer needed and the WS
-    // handler can simplify; if it changes shape, the routing helper must
-    // be updated to match.
+  it("fences a chatroom-relay cross-scope durable move with a placement transaction", async () => {
+    // Pins the lower-level guard beneath the dev WS router: a relay may accept
+    // a cross-scope movement only when the executor auto-arms the placement
+    // fence, never as an ordinary unfenced source-scope commit.
     const world = createWorld();
     const session = world.auth("guest:cross-scope-regression");
     await world.directCall("setup:enter-chatroom-regression", session.actor, "the_chatroom", "enter", [], { sessionId: session.id });
@@ -177,9 +173,9 @@ describe("dev v2 cross-scope WS routing", () => {
       browser,
       receiveShadowBrowserEnvelopeReceipt(browser, encodeEnvelope(intent))
     );
-    expect(reply?.body).toMatchObject({ ok: false, reason: "commit_rejected" });
-    if (!reply || reply.body.ok !== false) return;
-    expect(reply.body.commit?.errors ?? []).toEqual(expect.arrayContaining([expect.stringContaining("scope_mismatch")]));
+    expect(reply?.body).toMatchObject({ ok: true });
+    if (!reply || reply.body.ok !== true) return;
+    expect(reply.body.commit?.transaction).toMatchObject({ kind: "placement" });
   });
 
   it("commits an outliner 'add' intent end-to-end through the same WS handler logic the SPA uses", async () => {

@@ -62,6 +62,7 @@ export type ShadowCommitAccepted = {
   post_state_hash: string;
   observations: EffectTranscript["observations"];
   receipt: ShadowCommitReceipt;
+  transaction?: ShadowCommitTransaction;
   projection_delta?: ProjectionDeltaSummary;
   projection_writes?: ProjectionWrite[];
 };
@@ -88,6 +89,8 @@ export type ShadowCommitConflict = {
 };
 
 export type ShadowCommitResult = ShadowCommitAccepted | ShadowCommitConflict;
+
+export const SHADOW_PLACEMENT_TRANSACTION_SCOPE = "#placement" as ObjRef;
 
 export type ShadowCommitScope = {
   kind: "woo.commit_scope.shadow.v1";
@@ -268,6 +271,7 @@ export function submitShadowCommit(scope: ShadowCommitScope, submit: ShadowCommi
     post_state_hash: receipt.post_state_hash,
     observations: submit.transcript.observations,
     receipt,
+    ...(submit.transaction ? { transaction: structuredClone(submit.transaction) as ShadowCommitTransaction } : {}),
     projection_delta: applied.projection_delta,
     projection_writes: applied.projection_writes
   };
@@ -373,9 +377,8 @@ function shadowCommitEnvelopeErrors(scope: ShadowCommitScope, submit: ShadowComm
   if (submit.scope !== scope.scope) {
     errors.push(`scope_mismatch: submit=${submit.scope} scope=${scope.scope}`);
   }
-  if (submit.transaction) {
-    errors.push(...validateShadowCommitTransaction(submit));
-  } else if (submit.transcript.scope !== scope.scope) {
+  errors.push(...validateShadowCommitTransaction(submit));
+  if (!submit.transaction && submit.transcript.scope !== scope.scope) {
     errors.push(`scope_mismatch: submit=${submit.scope} transcript=${submit.transcript.scope} scope=${scope.scope}`);
   }
   if (!sameShadowHead(submit.expected, scope.head)) {
@@ -391,7 +394,13 @@ function shadowCommitEnvelopeErrors(scope: ShadowCommitScope, submit: ShadowComm
 
 function validateShadowCommitTransaction(submit: ShadowCommitSubmit): string[] {
   const errors: string[] = [];
-  if (!submit.transaction) return errors;
+  if (!submit.transaction) {
+    const required = shadowPlacementTransactionForTranscript(submit.transcript);
+    if (required && placementTransactionTouchesForeignContents(required, submit.transcript.scope)) {
+      errors.push("write_fence_missing: placement transaction required for cross-scope movement");
+    }
+    return errors;
+  }
   if (submit.transaction.kind !== "placement") {
     errors.push(`write_fence_missing: unsupported transaction kind ${(submit.transaction as { kind?: string }).kind ?? "unknown"}`);
     return errors;
@@ -408,8 +417,22 @@ function validateShadowCommitTransaction(submit: ShadowCommitSubmit): string[] {
   return errors;
 }
 
+export function shadowCommitTransactionCoversTranscript(
+  transaction: ShadowCommitTransaction | null | undefined,
+  transcript: EffectTranscript
+): boolean {
+  if (!transaction || transaction.kind !== "placement") return false;
+  const required = shadowPlacementTransactionForTranscript(transcript);
+  if (!required) return false;
+  const provided = new Set(transaction.cells.map(cellKey));
+  return required.cells.every((cell) => provided.has(cellKey(cell)));
+}
+
+function placementTransactionTouchesForeignContents(transaction: ShadowCommitTransaction, scope: ObjRef): boolean {
+  return transaction.cells.some((cell) => cell.kind === "contents" && cell.object !== scope);
+}
+
 export function shadowPlacementTransactionForTranscript(transcript: EffectTranscript): ShadowCommitTransaction | null {
-  if (transcript.moves.length === 0) return null;
   const cells = new Map<string, TranscriptCell>();
   const add = (cell: TranscriptCell): void => {
     cells.set(cellKey(cell), cell);
@@ -424,6 +447,17 @@ export function shadowPlacementTransactionForTranscript(transcript: EffectTransc
     add({ kind: "contents", object: move.to });
     movedContainers.add(move.to);
   }
+  for (const write of transcript.writes) {
+    if (write.cell.kind === "location") {
+      add(write.cell);
+      continue;
+    }
+    if (write.cell.kind === "contents") {
+      add(write.cell);
+      movedContainers.add(write.cell.object);
+    }
+  }
+  if (cells.size === 0) return null;
   // Presence rows are ordinary properties today, but for movement they are part
   // of the same placement transaction: an accepted move must not publish a body
   // location that races separately from the room subscriber mirror.

@@ -2057,7 +2057,11 @@ function shadowRelayExecutorForScopeMode(
       ...(authoritative ? {} : { atom_hashes: shadowMaterializedAtomHashesFromSerialized(serialized) }),
       // Authoritative mode is reserved for already-planned/browser exec
       // requests. Guarded intent mode intentionally leaves the atom guard on,
-      // but pre-authorizes the cells present in this serialized slice.
+      // but pre-authorizes the cells present in this serialized slice. A
+      // create-bearing turn can still discover a fresh lifecycle/write atom and
+      // pay one bounded in-process repair/re-run; that is the price of using
+      // the same sparse-executor guard for browser and server-assisted intents
+      // instead of silently trusting an incomplete planned key.
       ...(authoritative ? { authoritative_state: true } : {})
     });
     fresh.committed_head_hash = relay.commit_scope.head.hash;

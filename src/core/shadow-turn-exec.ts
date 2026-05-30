@@ -737,9 +737,7 @@ export async function executeAuthoritativeShadowTurnCall(
     expected: input.expected ?? input.commitScope.head,
     persistence: "durable"
   };
-  const commitTransaction = input.commitScope.scope !== run.transcript.scope
-    ? shadowPlacementTransactionForTranscript(run.transcript) ?? undefined
-    : undefined;
+  const commitTransaction = shadowPlacementTransactionForTranscript(run.transcript) ?? undefined;
   const commit = submitShadowCommit(input.commitScope, {
     kind: "woo.commit.submit.shadow.v1",
     id: request.id ?? input.call.id,
@@ -888,7 +886,7 @@ export async function executeShadowTurnCallOrNeedState(
       };
     }
     const actualKey = shadowTurnKeyFromTranscript(run.transcript);
-    const unmaterialized = missingActualAtoms(actualKey, node.atom_hashes);
+    const unmaterialized = missingActualAtoms(actualKey, node.atom_hashes, run.transcript);
     if (unmaterialized.length > 0) {
       node.world = undefined;
       return {
@@ -904,7 +902,7 @@ export async function executeShadowTurnCallOrNeedState(
   }
 
   const livePersistence = request.persistence === "live";
-  const commitTransaction = options.commitScope && options.commitScope.scope !== run.transcript.scope
+  const commitTransaction = options.commitScope
     ? shadowPlacementTransactionForTranscript(run.transcript) ?? undefined
     : undefined;
   const commit = options.commitScope && !livePersistence
@@ -1322,13 +1320,35 @@ function cacheShadowObjectRecord(cache: Map<string, SerializedObject>, obj: Seri
   cache.set(shadowObjectRecordHash(obj), structuredClone(obj) as SerializedObject);
 }
 
-function missingActualAtoms(actual: ShadowTurnKey, materialized: Set<string>): ShadowMissingAtom[] {
+function missingActualAtoms(actual: ShadowTurnKey, materialized: Set<string>, transcript?: EffectTranscript): ShadowMissingAtom[] {
+  const createdObjects = new Set((transcript?.creates ?? []).map((create) => create.object));
   const missing: ShadowMissingAtom[] = [];
   for (let i = 0; i < actual.atom_hashes.length; i++) {
     const hash = actual.atom_hashes[i];
+    const preimage = actual.preimages[i];
+    if (createdObjects.size > 0 && createdObjectOwnsAtomPreimage(preimage, createdObjects)) continue;
     if (!materialized.has(hash)) missing.push({ hash, preimage: actual.preimages[i] });
   }
   return missing;
+}
+
+function createdObjectOwnsAtomPreimage(preimage: string | undefined, createdObjects: ReadonlySet<ObjRef>): boolean {
+  if (!preimage) return false;
+  const cell = preimage.replace(/^(?:read|write):/, "");
+  for (const prefix of ["cell:location:", "cell:contents:", "cell:lifecycle:"]) {
+    if (cell.startsWith(prefix)) return createdObjects.has(cell.slice(prefix.length) as ObjRef);
+  }
+  if (cell.startsWith("cell:prop:")) {
+    const rest = cell.slice("cell:prop:".length);
+    const split = rest.lastIndexOf(".");
+    return split > 0 && createdObjects.has(rest.slice(0, split) as ObjRef);
+  }
+  if (cell.startsWith("cell:verb:")) {
+    const rest = cell.slice("cell:verb:".length);
+    const split = rest.lastIndexOf(":");
+    return split > 0 && createdObjects.has(rest.slice(0, split) as ObjRef);
+  }
+  return false;
 }
 
 function missingAtomsFromNeedStateTranscript(transcript: EffectTranscript): ShadowMissingAtom[] {

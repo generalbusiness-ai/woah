@@ -3,7 +3,7 @@ import { installVerb } from "../src/core/authoring";
 import { createWorld, createWorldFromSerialized } from "../src/core/bootstrap";
 import { capabilityAdProbablyCoversTurn } from "../src/core/capability-ad";
 import { effectTranscriptFromRecordedTurn } from "../src/core/effect-transcript";
-import { createShadowCommitScope, serializedFor, submitShadowCommit } from "../src/core/shadow-commit-scope";
+import { createShadowCommitScope, serializedFor, shadowPlacementTransactionForTranscript, submitShadowCommit } from "../src/core/shadow-commit-scope";
 import {
   buildShadowCellPageTransfer,
   buildShadowClosureTransfer,
@@ -185,7 +185,8 @@ describe("shadow turn execution", () => {
       id: "shadow-hot-tub-enter",
       scope: "the_hot_tub",
       expected: structuredClone(commitScope.head),
-      transcript: enterTub.transcript
+      transcript: enterTub.transcript,
+      transaction: shadowPlacementTransactionForTranscript(enterTub.transcript) ?? undefined
     });
     expect(accepted).toMatchObject({ kind: "woo.commit.accepted.shadow.v1" });
 
@@ -211,7 +212,8 @@ describe("shadow turn execution", () => {
       id: "shadow-hot-tub-out",
       scope: "the_hot_tub",
       expected: structuredClone(commitScope.head),
-      transcript: exitTub.transcript
+      transcript: exitTub.transcript,
+      transaction: shadowPlacementTransactionForTranscript(exitTub.transcript) ?? undefined
     });
     expect(acceptedExit).toMatchObject({ kind: "woo.commit.accepted.shadow.v1" });
     expect(createWorldFromSerialized(serializedFor(commitScope), { persist: false }).getProp("the_hot_tub", "next_seq")).toBe(3);

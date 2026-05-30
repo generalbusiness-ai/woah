@@ -154,6 +154,8 @@ export async function runShadowTurnCallOnWorldTranscript(
 }
 
 class ShadowStateGuardTurnRecorder implements TurnRecorder {
+  private readonly createdObjects = new Set<ObjRef>();
+
   constructor(
     private readonly inner: TurnRecorder,
     private readonly allowedAtomHashes: Set<string>
@@ -163,13 +165,14 @@ class ShadowStateGuardTurnRecorder implements TurnRecorder {
     const active = this.inner.startTurn(turn);
     return {
       event: (event) => {
-        const missing = missingAtomsForRecorderEvent(event, this.allowedAtomHashes);
+        const missing = missingAtomsForRecorderEvent(event, this.allowedAtomHashes, this.createdObjects);
         if (missing.length > 0) {
           throw wooError("E_NEED_STATE", "shadow turn touched state outside the materialized atom set", {
             missing_atoms: missing
           });
         }
         active.event(event);
+        if (event.kind === "object_create") this.createdObjects.add(event.object);
       }
     };
   }
@@ -177,15 +180,37 @@ class ShadowStateGuardTurnRecorder implements TurnRecorder {
 
 function missingAtomsForRecorderEvent(
   event: TurnRecorderEvent,
-  allowedAtomHashes: Set<string>
+  allowedAtomHashes: Set<string>,
+  createdObjects: ReadonlySet<ObjRef> = new Set()
 ): Array<{ hash: string; preimage: string }> {
+  if (event.kind === "object_create") return [];
   const preimages = shadowAtomPreimagesForRecorderEvent(event);
   const missing: Array<{ hash: string; preimage: string }> = [];
   for (const preimage of preimages) {
+    if (createdObjectOwnsRecorderAtom(preimage, createdObjects)) continue;
     const hash = shadowAtomHash(preimage);
     if (!allowedAtomHashes.has(hash)) missing.push({ hash, preimage });
   }
   return missing;
+}
+
+function createdObjectOwnsRecorderAtom(preimage: string, createdObjects: ReadonlySet<ObjRef>): boolean {
+  if (createdObjects.size === 0) return false;
+  const cell = preimage.replace(/^(?:read|write):/, "");
+  for (const prefix of ["cell:location:", "cell:contents:", "cell:lifecycle:"]) {
+    if (cell.startsWith(prefix)) return createdObjects.has(cell.slice(prefix.length) as ObjRef);
+  }
+  if (cell.startsWith("cell:prop:")) {
+    const rest = cell.slice("cell:prop:".length);
+    const split = rest.lastIndexOf(".");
+    return split > 0 && createdObjects.has(rest.slice(0, split) as ObjRef);
+  }
+  if (cell.startsWith("cell:verb:")) {
+    const rest = cell.slice("cell:verb:".length);
+    const split = rest.lastIndexOf(":");
+    return split > 0 && createdObjects.has(rest.slice(0, split) as ObjRef);
+  }
+  return false;
 }
 
 function shadowAtomPreimagesForRecorderEvent(event: TurnRecorderEvent): string[] {

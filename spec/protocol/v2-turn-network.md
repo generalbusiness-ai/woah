@@ -706,6 +706,20 @@ the movement transaction scope is chosen after fresh execution reveals the
 actual movement write set, and the submit envelope carries both the original
 transcript scope and the placement fence.
 
+The current Cloudflare prototype uses one deployment-local movement authority,
+`#placement`, for MV-A. That deliberately serializes all movement through one
+commit scope while the correctness boundary is hardened. It is conservative:
+any two movement transactions with overlapping source, destination, or moved
+object cells share the same head and therefore cannot publish independent
+lost-update commits. A later sharded placement authority is allowed only if it
+preserves that overlap property.
+
+Accepted movement commits that fan out under a transaction scope different from
+`transcript.scope` MUST carry the accepted placement transaction on the commit
+frame. A receiver MUST reject cross-scope apply when the transaction is absent
+or does not cover the transcript's required placement cells; "the transcript has
+movement" alone is not an apply authority.
+
 ## VTN9. Catch-up and applied frames
 
 Subscribers consume committed state through applied frames.

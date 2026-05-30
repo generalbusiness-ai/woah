@@ -31,10 +31,10 @@ import { createWorld, createWorldFromSerialized, mergeHostScopedSeedWithStatus, 
 import {
   authoritySliceObjectIds,
   combineSerializedAuthoritySlices,
-  filterSerializedAuthoritySliceObjects,
+  filterSerializedAuthoritySlicePages,
   serializedWorldFromAuthoritySlice
 } from "../core/authority-slice";
-import { shadowObjectLineagePage, shadowObjectLivePage, shadowStatePageRef, type ShadowStatePage } from "../core/shadow-state-pages";
+import { shadowObjectLineagePage, shadowObjectLivePage, shadowPropertyCellPages, shadowStatePageRef, type ShadowStatePage } from "../core/shadow-state-pages";
 import type { EffectTranscript } from "../core/effect-transcript";
 import { installLocalCatalogs, localCatalogBundleFingerprint, parseAutoInstallCatalogs, runHostScopedLocalCatalogLifecycle } from "../core/local-catalogs";
 import {
@@ -64,7 +64,15 @@ import { parseShadowScopeHeadJson } from "../core/shadow-scope-head";
 import { buildTransportErrorEnvelope, decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
 import type { ShadowStateTransfer, ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import { runShadowTurnCall } from "../core/shadow-turn-call";
-import { applyAcceptedShadowFrame, serializedFor, transcriptTouchedObjectIds, type ShadowCommitAccepted, type ShadowScopeHead } from "../core/shadow-commit-scope";
+import {
+  SHADOW_PLACEMENT_TRANSACTION_SCOPE,
+  applyAcceptedShadowFrame,
+  serializedFor,
+  shadowCommitTransactionCoversTranscript,
+  transcriptTouchedObjectIds,
+  type ShadowCommitAccepted,
+  type ShadowScopeHead
+} from "../core/shadow-commit-scope";
 import { isShadowCommitAccepted, isShadowTurnExecReply } from "../core/v2-reply-predicates";
 import {
   affectedBrowserFanoutScopes,
@@ -222,6 +230,13 @@ type BrowserMetricSessionCounter = {
 type DirectorySerializedSession = SerializedSession & {
   displayName?: string | null;
   focusList?: ObjRef[];
+  actorProps?: DirectorySessionActorProp[];
+};
+
+type DirectorySessionActorProp = {
+  name: string;
+  value: WooValue;
+  version: number;
 };
 
 type McpFanoutAudience = {
@@ -3104,7 +3119,7 @@ export class PersistentObjectDO {
         }
         const commit = body.commit as ShadowCommitAccepted;
         const transcript = body.transcript as EffectTranscript;
-        if (commit.position.scope !== scope || !v2ApplyCommitTranscriptScopeMatches(scope, transcript)) {
+        if (commit.position.scope !== scope || !v2ApplyCommitTranscriptScopeMatches(scope, commit, transcript)) {
           throw wooError("E_INVARG", "apply-v2-commit scope mismatch");
         }
         const projectionWrites = Array.isArray(body.projection_writes)
@@ -3676,7 +3691,8 @@ export class PersistentObjectDO {
           apikey_id: session.apikeyId ?? null,
           mcp_shard: options.mcpShard ?? null,
           display_name: displayNameForDirectorySession(world, session.actor),
-          focus_list: focusListForDirectorySession(world, session.actor)
+          focus_list: focusListForDirectorySession(world, session.actor),
+          actor_props: actorPropsForDirectorySession(world, session.actor)
         })
       }));
       await this.env.DIRECTORY.get(id).fetch(request);
@@ -4379,12 +4395,12 @@ export class PersistentObjectDO {
       return await this.resolveObjectHostForWorld(null, id, fallbackHost);
     };
 
-    const resolvedIds = await Promise.all(ids.map(async (id) => [id, await resolveHost(id, WORLD_HOST)] as const));
     const localActorAuthorityRoots = localActorAuthorityRootIds(world, ids);
+    const resolvedIds = await Promise.all(ids.map(async (id) => [id, await resolveHost(id, WORLD_HOST)] as const));
     const byHost = new Map<string, Set<ObjRef>>();
     for (const [id, host] of resolvedIds) {
-      if (localActorAuthorityRoots.has(id)) continue;
       if (!host || host === localHost) continue;
+      if (localActorAuthorityRoots.has(id) && localObjectIds.has(id)) continue;
       const list = byHost.get(host) ?? new Set<ObjRef>();
       list.add(id);
       byHost.set(host, list);
@@ -4445,6 +4461,10 @@ export class PersistentObjectDO {
       })));
     }
     const slices: SerializedAuthoritySlice[] = [local.authority];
+    if (mcpGatewayShard && localActorAuthorityRoots.size > 0) {
+      const actorCells = mcpGatewayLocalActorPropertyCellSlice(world, localActorAuthorityRoots);
+      if (actorCells.page_refs.length > 0) slices.push(actorCells);
+    }
     if (directoryScopeSessions.length > 0) {
       // Sparse MCP shard worlds intentionally do not mirror every co-present
       // session. For room-level reads such as `who`, recover the Directory
@@ -4464,7 +4484,9 @@ export class PersistentObjectDO {
       for (const [id, objectHost] of objectHosts) {
         if (objectHost === host || !localObjectIds.has(id)) accepted.add(id);
       }
-      slices.push(filterSerializedAuthoritySliceObjects(response.authority, (id) => accepted.has(id)));
+      slices.push(filterSerializedAuthoritySlicePages(response.authority, (ref) =>
+        accepted.has(ref.object) && !(localActorAuthorityRoots.has(ref.object) && ref.page === "object_live")
+      ));
     }
     const authority = combineSerializedAuthoritySlices(
       mergeSerializedSessions(local.authority.sessions, directoryScopeSessions),
@@ -4529,17 +4551,22 @@ export class PersistentObjectDO {
         persistence: input.persistence,
         token
       },
-      // Live verbs took the "intent" strategy until commit (TBD). They now
-      // bypass this code path entirely via the early return above, so the
-      // remaining branch is durable → planned-exec.
+      // Durable REST turns use planned-exec when the local relay can produce a
+      // transcript. If sparse local planning fails, submitTurnIntent falls back
+      // to a guarded intent at the placement authority; placement-bearing
+      // transcripts commit there with the MV-A fence.
       strategy: "planned-exec",
-      maxAttempts: 2,
+      maxAttempts: 8,
+      intentScope: (turn) => turn.persistence === "durable"
+        ? SHADOW_PLACEMENT_TRANSACTION_SCOPE
+        : turn.scope,
       ensureClient: async (scope, attempt) => await this.ensureRestV2Relay(world, input, scope, token, attempt > 0),
       clientNode: (client) => client.node,
       clientHead: (client) => client.relay.commit_scope.head,
       clientSerialized: (client) => serializedFor(client.relay.commit_scope, { reason: "rest_turn_plan", metric: (event) => world.recordMetric(event) }),
       nextTurnId: (client) => `${client.node}:turn:${client.nextTurn++}:${crypto.randomUUID()}`,
       envelopeId: (id, attempt) => executorEnvelopeId(id, attempt, () => crypto.randomUUID()),
+      transactionScopeForTranscript: () => SHADOW_PLACEMENT_TRANSACTION_SCOPE,
       // Per-turn authority refresh against an already-opened relay; the
       // CommitScopeDO has a durable snapshot so a cold satellite's slice
       // can be safely omitted. See comment on v2GatewayAuthorityPayload.
@@ -6114,10 +6141,25 @@ function mcpGatewayShardSerializedWorld(sessions: readonly DirectorySerializedSe
   // defines those verbs, not the full gateway world.
   for (const obj of mcpGatewayActorSupportObjects()) objects.set(obj.id, obj);
   const scopeContents = new Map<ObjRef, Set<ObjRef>>();
-  const actors = new Map<ObjRef, { activeScope: ObjRef | null; displayName: string | null; focusList: ObjRef[]; primaryStarted: number; primarySession: string }>();
+  const actors = new Map<ObjRef, {
+    activeScope: ObjRef | null;
+    actorProps: DirectorySessionActorProp[];
+    displayName: string | null;
+    focusList: ObjRef[];
+    primaryStarted: number;
+    primarySession: string;
+  }>();
   for (const session of sessions) {
     const activeScope = session.activeScope ?? session.currentLocation ?? null;
-    const actor = actors.get(session.actor) ?? { activeScope, displayName: session.displayName ?? null, focusList: [], primaryStarted: session.started, primarySession: session.id };
+    const actor = actors.get(session.actor) ?? {
+      activeScope,
+      actorProps: [],
+      displayName: session.displayName ?? null,
+      focusList: [],
+      primaryStarted: session.started,
+      primarySession: session.id
+    };
+    actor.actorProps = mergeDirectoryActorProps(actor.actorProps, session.actorProps ?? []);
     if (!actor.displayName && session.displayName) actor.displayName = session.displayName;
     for (const id of session.focusList ?? []) {
       if (!actor.focusList.includes(id) && actor.focusList.length < 32) actor.focusList.push(id);
@@ -6141,7 +6183,7 @@ function mcpGatewayShardSerializedWorld(sessions: readonly DirectorySerializedSe
       parent: "$player",
       owner: actor,
       location: stub.activeScope,
-      properties: stub.focusList.length > 0 ? [["focus_list", stub.focusList]] : [],
+      properties: mcpGatewayActorStubProperties(actor, stub),
       now
     }));
   }
@@ -6175,7 +6217,10 @@ function mcpGatewayDirectorySessionCellSlice(sessions: readonly DirectorySeriali
   const snapshot = mcpGatewayShardSerializedWorld(sessions);
   const sessionActors = new Set<ObjRef>(sessions.map((session) => session.actor));
   const actorObjects = snapshot.objects.filter((obj) => sessionActors.has(obj.id));
-  const actorLineagePages: ShadowStatePage[] = actorObjects.map((obj) => shadowObjectLineagePage(obj));
+  const actorLineagePages: ShadowStatePage[] = actorObjects.flatMap((obj) => [
+    shadowObjectLineagePage(obj),
+    ...shadowPropertyCellPages(obj)
+  ]);
   const scopeLivePages: ShadowStatePage[] = snapshot.objects
     .filter((obj) => !sessionActors.has(obj.id) && obj.contents.length > 0)
     .map((obj) => shadowObjectLivePage(obj));
@@ -6202,7 +6247,7 @@ function mcpGatewayStubObject(input: {
   owner: ObjRef;
   location: ObjRef | null;
   contents?: ObjRef[];
-  properties?: [string, WooValue][];
+  properties?: DirectorySessionActorProp[];
   now: number;
 }): SerializedObject {
   return {
@@ -6216,8 +6261,8 @@ function mcpGatewayStubObject(input: {
     created: input.now,
     modified: input.now,
     propertyDefs: [],
-    properties: input.properties ?? [],
-    propertyVersions: input.properties?.map(([name], index) => [name, index + 1] as [string, number]) ?? [],
+    properties: input.properties?.map((prop) => [prop.name, structuredClone(prop.value) as WooValue] as [string, WooValue]) ?? [],
+    propertyVersions: input.properties?.map((prop) => [prop.name, prop.version] as [string, number]) ?? [],
     verbs: [],
     children: [],
     contents: input.contents ?? [],
@@ -6239,7 +6284,8 @@ function cloneDirectorySerializedSessions(sessions: readonly DirectorySerialized
   return sessions.map((session) => ({
     ...session,
     ...(session.displayName !== undefined ? { displayName: session.displayName } : {}),
-    ...(session.focusList ? { focusList: [...session.focusList] } : {})
+    ...(session.focusList ? { focusList: [...session.focusList] } : {}),
+    ...(session.actorProps ? { actorProps: cloneDirectoryActorProps(session.actorProps) } : {})
   }));
 }
 
@@ -6271,7 +6317,8 @@ function serializedSessionFromDirectoryRoute(value: unknown): DirectorySerialize
     currentLocation: activeScope,
     ...(typeof record.apikey_id === "string" && record.apikey_id.length > 0 ? { apikeyId: record.apikey_id } : {}),
     displayName: typeof record.display_name === "string" && record.display_name.length > 0 ? record.display_name : null,
-    focusList: focusListFromUnknown(record.focus_list)
+    focusList: focusListFromUnknown(record.focus_list),
+    actorProps: actorPropsFromUnknown(record.actor_props)
   };
 }
 
@@ -6287,6 +6334,25 @@ function focusListForDirectorySession(world: WooWorld | null, actor: ObjRef): Ob
   if (!world?.objects.has(actor)) return [];
   const raw = world.propOrNull(actor, "focus_list");
   return focusListFromUnknown(raw);
+}
+
+function actorPropsForDirectorySession(world: WooWorld | null, actor: ObjRef): DirectorySessionActorProp[] {
+  if (!world?.objects.has(actor)) return [];
+  const obj = world.object(actor);
+  const out: DirectorySessionActorProp[] = [];
+  // Sparse MCP shards are restored from Directory without waking the actor's
+  // owner. Carry the small actor-local property cells that catalog leave/focus
+  // verbs read, including their versions, so placement commits validate against
+  // the same actor authority the planner saw.
+  for (const name of ["home", "focus_list"] as const) {
+    if (!obj.properties.has(name)) continue;
+    out.push({
+      name,
+      value: structuredClone(obj.properties.get(name)!) as WooValue,
+      version: obj.propertyVersions.get(name) ?? 0
+    });
+  }
+  return out.sort((a, b) => a.name.localeCompare(b.name));
 }
 
 function focusListFromUnknown(value: unknown): ObjRef[] {
@@ -6308,13 +6374,113 @@ function focusListFromUnknown(value: unknown): ObjRef[] {
   return out;
 }
 
-function v2ApplyCommitTranscriptScopeMatches(scope: ObjRef, transcript: EffectTranscript): boolean {
+function actorPropsFromUnknown(value: unknown): DirectorySessionActorProp[] {
+  let raw: unknown = value;
+  if (typeof value === "string") {
+    try {
+      raw = JSON.parse(value) as unknown;
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(raw)) return [];
+  return cloneDirectoryActorProps(raw.filter(isDirectoryActorProp));
+}
+
+function isDirectoryActorProp(value: unknown): value is DirectorySessionActorProp {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  const version = Number(record.version);
+  return typeof record.name === "string" &&
+    record.name.length > 0 &&
+    Number.isInteger(version) &&
+    version >= 0;
+}
+
+function cloneDirectoryActorProps(props: readonly DirectorySessionActorProp[]): DirectorySessionActorProp[] {
+  const byName = new Map<string, DirectorySessionActorProp>();
+  for (const prop of props) {
+    if (!prop.name || !Number.isInteger(prop.version) || prop.version < 0) continue;
+    byName.set(prop.name, {
+      name: prop.name,
+      value: structuredClone(prop.value) as WooValue,
+      version: prop.version
+    });
+  }
+  return Array.from(byName.values()).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function mergeDirectoryActorProps(
+  existing: readonly DirectorySessionActorProp[],
+  incoming: readonly DirectorySessionActorProp[]
+): DirectorySessionActorProp[] {
+  const byName = new Map<string, DirectorySessionActorProp>();
+  for (const prop of cloneDirectoryActorProps(existing)) byName.set(prop.name, prop);
+  for (const prop of cloneDirectoryActorProps(incoming)) {
+    const current = byName.get(prop.name);
+    if (!current || prop.version >= current.version) byName.set(prop.name, prop);
+  }
+  return Array.from(byName.values()).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function mcpGatewayActorStubProperties(
+  actor: ObjRef,
+  stub: { actorProps: readonly DirectorySessionActorProp[]; focusList: readonly ObjRef[] }
+): DirectorySessionActorProp[] {
+  const props = mergeDirectoryActorProps([], stub.actorProps);
+  const names = new Set(props.map((prop) => prop.name));
+  if (!names.has("focus_list") && stub.focusList.length > 0) {
+    props.push({ name: "focus_list", value: [...stub.focusList] as WooValue, version: 1 });
+  }
+  // Legacy Directory rows predate actor_props. Seeded guest actors have an own
+  // home property at version 1; preserving that default avoids a sparse shard
+  // planning against inherited version 0 while another relay still has the
+  // versioned actor row.
+  if (!names.has("home") && /^guest_\d+$/.test(actor)) {
+    props.push({ name: "home", value: "$nowhere", version: 1 });
+  }
+  return props.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function mcpGatewayLocalActorPropertyCellSlice(
+  world: WooWorld,
+  actors: ReadonlySet<ObjRef>
+): SerializedAuthorityCellSlice {
+  const inlinePages: ShadowStatePage[] = [];
+  for (const obj of world.exportObjects(actors)) {
+    inlinePages.push(...shadowPropertyCellPages(withMcpGatewayActorFallbackProperties(obj)));
+  }
+  return {
+    kind: "woo.authority_slice.cells.shadow.v1",
+    sessions: [],
+    page_refs: inlinePages.map((page) => shadowStatePageRef(page, true)),
+    inline_pages: inlinePages,
+    counters: {
+      objectCounter: 1,
+      parkedTaskCounter: 1,
+      sessionCounter: 1
+    },
+    tombstones: [],
+    source_object_count: new Set(inlinePages.map((page) => page.object)).size
+  };
+}
+
+function withMcpGatewayActorFallbackProperties(obj: SerializedObject): SerializedObject {
+  const clone = structuredClone(obj) as SerializedObject;
+  if (/^guest_\d+$/.test(clone.id) && !clone.properties.some(([name]) => name === "home")) {
+    clone.properties.push(["home", "$nowhere"]);
+    clone.propertyVersions.push(["home", 1]);
+  }
+  return clone;
+}
+
+function v2ApplyCommitTranscriptScopeMatches(scope: ObjRef, commit: ShadowCommitAccepted, transcript: EffectTranscript): boolean {
   if (transcript.scope === scope) return true;
-  // MV-A placement transactions sequence under a placement authority scope,
+  // MV-A placement transactions sequence under a placement authority scope
   // while the transcript keeps the user-visible VM scope that selected the
-  // closure. The accepted commit/projection rows are still the authority gate;
-  // this endpoint only rejects non-movement cross-scope apply requests.
-  return transcript.moves.length > 0;
+  // closure. Cross-scope apply is allowed only for accepted commits carrying
+  // the validated placement fence; movement alone is not sufficient.
+  return scope === commit.position.scope && shadowCommitTransactionCoversTranscript(commit.transaction, transcript);
 }
 
 function mcpFanoutAudienceFromDirectorySessions(

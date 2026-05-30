@@ -592,7 +592,9 @@ export class CommitScopeDO {
     if (options.mergeSerialized === false) return;
     if (authority) {
       const serialized = serializedFor(relay.commit_scope, { reason: "commit_scope_authority_merge", metric: (event) => this.emitMetric(event) });
+      const preservedActorLive = preserveSessionActorLiveCells(serialized, sessionRows);
       if (mergeSerializedAuthoritySlice(serialized, authority, { clone: true })) {
+        restoreSessionActorLiveCells(serialized, preservedActorLive);
         markShadowBrowserRelaySerializedChanged(relay);
       }
       return;
@@ -2431,6 +2433,48 @@ function shadowScopeHeadFromUnknown(value: unknown): ShadowScopeHead | null {
 
 function shadowScopeHeadsEqual(left: ShadowScopeHead, right: ShadowScopeHead): boolean {
   return left.scope === right.scope && left.epoch === right.epoch && left.seq === right.seq && left.hash === right.hash;
+}
+
+type PreservedActorLiveCells = {
+  location: SerializedObject["location"];
+  children: SerializedObject["children"];
+  contents: SerializedObject["contents"];
+};
+
+function preserveSessionActorLiveCells(
+  serialized: Pick<SerializedWorld, "objects">,
+  sessions: readonly SerializedSession[]
+): Map<ObjRef, PreservedActorLiveCells> {
+  const actors = new Set(sessions.map((session) => session.actor));
+  const preserved = new Map<ObjRef, PreservedActorLiveCells>();
+  for (const obj of serialized.objects) {
+    if (!actors.has(obj.id)) continue;
+    preserved.set(obj.id, {
+      location: obj.location,
+      children: obj.children.slice(),
+      contents: obj.contents.slice()
+    });
+  }
+  return preserved;
+}
+
+function restoreSessionActorLiveCells(
+  serialized: Pick<SerializedWorld, "objects">,
+  preserved: ReadonlyMap<ObjRef, PreservedActorLiveCells>
+): void {
+  if (preserved.size === 0) return;
+  for (const obj of serialized.objects) {
+    const live = preserved.get(obj.id);
+    if (!live) continue;
+    // The commit scope's accepted placement snapshot is the authority for
+    // actor location/inventory. Per-envelope authority refreshes may arrive
+    // from a sparse routed host whose actor row is stale; keep those refreshes
+    // from erasing already-committed movement state while still allowing
+    // lineage/properties/session auth to refresh normally.
+    obj.location = live.location;
+    obj.children = live.children.slice();
+    obj.contents = live.contents.slice();
+  }
 }
 
 function acceptedFrameForTransfer(frame: ShadowCommitAccepted): ShadowCommitAccepted {

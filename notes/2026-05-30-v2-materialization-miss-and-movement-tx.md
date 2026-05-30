@@ -159,10 +159,11 @@ stale local state and asserts both the fanout body audience and the queued
 
 ## Remaining sequence (in order)
 
-1. **MV-A production selector.** The core transaction boundary and planned-exec
-   seam exist; the next production step is to decide and enable the placement
-   authority selector for non-browser submissions, then carry that accepted
-   transaction scope through user-visible frame/fanout routing.
+1. **MV-A production selector.** The prototype selector is the deployment-local
+   `#placement` commit scope. Non-browser planned-exec submissions route
+   movement transcripts there after fresh execution reveals the placement fence,
+   and accepted commits carry that fence so cross-scope fanout/apply can reject
+   unfenced movement.
 2. **Non-browser executor path completion.** The default intent envelope now
    uses guarded execution and outer authority repair, but production movement
    still needs the transaction selector above before the deck->garden class of

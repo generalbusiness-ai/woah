@@ -16,7 +16,7 @@ import type { EffectTranscript } from "../core/effect-transcript";
 import { buildSerializedAuthorityCellSlice, combineSerializedAuthoritySlices, serializedWorldFromAuthoritySlice } from "../core/authority-slice";
 import { wooError, type AppliedFrame, type DirectResultFrame, type ErrorFrame, type ErrorValue, type Message, type ObjRef, type Session, type WooValue } from "../core/types";
 import type { WooWorld } from "../core/world";
-import type { SerializedAuthoritySlice } from "../core/repository";
+import type { SerializedAuthoritySlice, SerializedObject, SerializedSession, SerializedWorld } from "../core/repository";
 import { projectionDeltaMissingWrites, type ProjectionWrite } from "../core/projection-delta";
 import { createMcpServer } from "./server";
 import { McpHost, type McpAcceptedFrameAudience, type McpBroadcastHooks, type McpDispatchHooks, type McpToolManifestHooks } from "./host";
@@ -26,7 +26,14 @@ import {
   type ShadowBrowserRelayShim
 } from "../core/shadow-browser-node";
 import type { ShadowTurnCall } from "../core/shadow-turn-call";
-import { applyAcceptedShadowFrame, applyShadowTranscriptToCommitScopeCache, serializedFor, type ShadowCommitAccepted, type ShadowScopeHead } from "../core/shadow-commit-scope";
+import {
+  SHADOW_PLACEMENT_TRANSACTION_SCOPE,
+  applyAcceptedShadowFrame,
+  applyShadowTranscriptToCommitScopeCache,
+  serializedFor,
+  type ShadowCommitAccepted,
+  type ShadowScopeHead
+} from "../core/shadow-commit-scope";
 import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import {
   V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED,
@@ -145,6 +152,7 @@ type RemoteAcceptedCommit = {
   originSessionId: string | null;
   audience?: McpAcceptedFrameAudience;
   receivedAt: number;
+  routed?: boolean;
 };
 
 export type McpGatewayOptions = {
@@ -331,7 +339,7 @@ export class McpGateway {
     if (pending?.has(commit.position.seq)) return;
 
     this.pruneRemotePending();
-    const entry = { commit, transcript, originSessionId: originSessionId ?? null, audience, receivedAt: Date.now() };
+    const entry: RemoteAcceptedCommit = { commit, transcript, originSessionId: originSessionId ?? null, audience, receivedAt: Date.now() };
     const expectedSeq = this.remoteExpectedSeq(commitScope);
     if (expectedSeq === null) {
       this.applyRemoteAccepted(scope, entry);
@@ -342,6 +350,10 @@ export class McpGateway {
       return;
     }
     if (commit.position.seq > expectedSeq) {
+      if (entry.audience) {
+        this.routeRemoteAcceptedFrame(entry);
+        entry.routed = true;
+      }
       this.queueRemoteAccepted(commitScope, entry);
       return;
     }
@@ -403,6 +415,10 @@ export class McpGateway {
       this.world.applyCommittedShadowTranscript(entry.transcript);
     }
     this.propagateTranscriptToOtherScopes(entry.commit.position.scope, entry.transcript);
+    if (!entry.routed) this.routeRemoteAcceptedFrame(entry);
+  }
+
+  private routeRemoteAcceptedFrame(entry: RemoteAcceptedCommit): void {
     this.host.routeShadowAcceptedFrame(entry.commit, entry.originSessionId, entry.transcript, entry.audience);
   }
 
@@ -602,20 +618,26 @@ export class McpGateway {
         persistence,
         token: entry.v2Token
       },
-      strategy: "intent",
-      maxAttempts: 2,
+      strategy: "planned-exec",
+      maxAttempts: 8,
+      intentScope: (turn) => turn.persistence === "durable"
+        ? SHADOW_PLACEMENT_TRANSACTION_SCOPE
+        : turn.scope,
       ensureClient: async (submitScope) => await this.ensureV2ScopeClient(entry, submitScope),
       clientNode: () => this.v2NodeFor(entry),
+      clientHead: (client) => client.relay.commit_scope.head,
+      clientSerialized: (client) => serializedFor(client.relay.commit_scope, { reason: "mcp_turn_plan", metric: (event) => this.world.recordMetric(event) }),
       nextTurnId: () => id,
       envelopeId: (turnId, attempt) => executorEnvelopeId(turnId, attempt, () => Math.random().toString(36).slice(2, 10)),
-      authorityPayload: async (_submitScope, extraObjectIds) => {
+      transactionScopeForTranscript: () => SHADOW_PLACEMENT_TRANSACTION_SCOPE,
+      authorityPayload: async (submitScope, extraObjectIds) => {
         const useCommitScopeSnapshotForRemoteAuthority = authorityRefreshAttempts === 0;
         authorityRefreshAttempts += 1;
         const payload = await this.v2AuthorityPayload(extraObjectIds, {
           useCommitScopeSnapshotForRemoteAuthority,
           directorySessionScopes: options.directorySessionScopes ?? []
         });
-        const client = this.v2Scopes.get(scope);
+        const client = this.v2Scopes.get(submitScope) ?? this.v2Scopes.get(scope);
         const authorityPayload = client && (payload.staleFallbackCount ?? 0) > 0
           ? this.withRelaySnapshotAuthorityFallback(client, payload)
           : payload;
@@ -803,7 +825,10 @@ export class McpGateway {
     // with fresh session/actor authority. Relay-level cache generation must
     // move with that snapshot or open executable seed digests can validate
     // against pre-refresh pages.
-    mergeExecutorAuthority(serializedFor(client.relay.commit_scope, { reason: "mcp_authority_merge" }), authority);
+    const serialized = serializedFor(client.relay.commit_scope, { reason: "mcp_authority_merge" });
+    const preservedActorLive = preserveSessionActorLiveCells(serialized, authority.sessions);
+    mergeExecutorAuthority(serialized, authority);
+    restoreSessionActorLiveCells(serialized, preservedActorLive);
     markShadowBrowserRelaySerializedChanged(client.relay);
   }
 
@@ -1102,6 +1127,46 @@ function synthesizeInitializeRequest(): Request {
       }
     })
   });
+}
+
+type PreservedActorLiveCells = {
+  location: SerializedObject["location"];
+  children: SerializedObject["children"];
+  contents: SerializedObject["contents"];
+};
+
+function preserveSessionActorLiveCells(
+  serialized: Pick<SerializedWorld, "objects">,
+  sessions: readonly SerializedSession[]
+): Map<ObjRef, PreservedActorLiveCells> {
+  const actors = new Set(sessions.map((session) => session.actor));
+  const preserved = new Map<ObjRef, PreservedActorLiveCells>();
+  for (const obj of serialized.objects) {
+    if (!actors.has(obj.id)) continue;
+    preserved.set(obj.id, {
+      location: obj.location,
+      children: obj.children.slice(),
+      contents: obj.contents.slice()
+    });
+  }
+  return preserved;
+}
+
+function restoreSessionActorLiveCells(
+  serialized: Pick<SerializedWorld, "objects">,
+  preserved: ReadonlyMap<ObjRef, PreservedActorLiveCells>
+): void {
+  if (preserved.size === 0) return;
+  for (const obj of serialized.objects) {
+    const live = preserved.get(obj.id);
+    if (!live) continue;
+    // Per-turn authority refreshes may source an actor row from a sparse owner
+    // snapshot. Keep the gateway relay's accepted placement live cells while
+    // allowing actor lineage and property cells to refresh.
+    obj.location = live.location;
+    obj.children = live.children.slice();
+    obj.contents = live.contents.slice();
+  }
 }
 
 export type { ObjRef };

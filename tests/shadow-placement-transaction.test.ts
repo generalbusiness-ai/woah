@@ -94,6 +94,8 @@ describe("shadow placement transactions", () => {
       transaction: transactionA ?? undefined
     });
     expect(acceptedA).toMatchObject({ kind: "woo.commit.accepted.shadow.v1" });
+    if (acceptedA.kind !== "woo.commit.accepted.shadow.v1") throw new Error("expected accepted move-a");
+    expect(acceptedA.transaction).toEqual(transactionA);
 
     const staleB = submitShadowCommit(placementScope, {
       kind: "woo.commit.submit.shadow.v1",

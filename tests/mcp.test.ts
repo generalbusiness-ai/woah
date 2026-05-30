@@ -1932,6 +1932,76 @@ describe("McpHost", () => {
     expect(persisted).toEqual([5, 6]);
   });
 
+  it("routes audience-addressed commit observations even when projection sequencing has a gap", async () => {
+    // MCP observation delivery is audience-filtered: a shard can legitimately
+    // receive placement seq N without seq N-1 because the missing commit had no
+    // observations for local sessions. Queue delivery must not wait for the
+    // projection-cache sequencer, but durable projection persistence still must.
+    const world = bootstrapWorld();
+    const alice = world.auth("guest:mcp-v2-audience-gap-alice");
+    const durableHead = new Map<string, number>([["#placement", 22]]);
+    const persisted: number[] = [];
+    const gateway = new McpGateway(world, {
+      durableProjectionHeadSeq: (scope) => durableHead.get(scope) ?? null,
+      persistAcceptedProjection: (commit) => {
+        persisted.push(commit.position.seq);
+        durableHead.set(commit.position.scope, commit.position.seq);
+      }
+    });
+    gateway.bindActorSession(alice.id, alice.actor);
+    const observation: Observation = {
+      type: "entered",
+      source: "the_taskboard",
+      actor: "guest_gap_peer",
+      room: "the_taskboard",
+      text: "Guest Gap Peer arrives at the workshop.",
+      ts: 24
+    };
+    const transcript = (seq: number, observations: Observation[] = []): EffectTranscript => mcpTestTranscript({
+      id: `audience-gap-${seq}`,
+      route: "sequenced",
+      scope: "the_garden",
+      seq,
+      session: null,
+      call: { actor: "guest_gap_peer", target: "the_garden", verb: "south", args: [] },
+      observations,
+      hash: `audience-gap-${seq}`
+    });
+    const commit = (seq: number, observations: Observation[] = []): ShadowCommitAccepted => ({
+      kind: "woo.commit.accepted.shadow.v1",
+      id: `audience-gap-${seq}`,
+      position: { kind: "woo.scope_head.shadow.v1", scope: "#placement", epoch: 1, seq, hash: `head-${seq}` },
+      transcript_hash: `audience-gap-${seq}`,
+      post_state_hash: `post-${seq}`,
+      observations,
+      receipt: {
+        kind: "woo.commit_receipt.shadow.v1",
+        id: `audience-gap-${seq}`,
+        route: "sequenced",
+        scope: "the_garden",
+        seq,
+        transcript_hash: `audience-gap-${seq}`,
+        pre_state_hash: `pre-${seq}`,
+        post_state_hash: `post-${seq}`,
+        accepted: true,
+        errors: []
+      }
+    });
+
+    gateway.acceptRemoteV2Commit("#placement", commit(24, [observation]), transcript(24, [observation]), "origin-session", {
+      audienceSessions: [alice.id],
+      observationSessionAudiences: [[alice.id]]
+    });
+    const firstDrain = await (gateway.host as unknown as { drainWait(sessionId: string, args: WooValue[]): Promise<{ observations: Observation[] }> }).drainWait(alice.id, [0, 10]);
+    expect(firstDrain.observations).toEqual([expect.objectContaining({ type: "entered", actor: "guest_gap_peer", source: "the_taskboard" })]);
+    expect(persisted).toEqual([]);
+
+    gateway.acceptRemoteV2Commit("#placement", commit(23), transcript(23), "origin-session");
+    expect(persisted).toEqual([23, 24]);
+    const secondDrain = await (gateway.host as unknown as { drainWait(sessionId: string, args: WooValue[]): Promise<{ observations: Observation[] }> }).drainWait(alice.id, [0, 10]);
+    expect(secondDrain.observations).toEqual([]);
+  });
+
   it("sequences fanout against the durable head when a cold shard has no relay", () => {
     // Hibernation window: a peer shard with durable session presence can receive
     // fanout before its v2 relay re-opens, so v2Scopes has no entry and the
