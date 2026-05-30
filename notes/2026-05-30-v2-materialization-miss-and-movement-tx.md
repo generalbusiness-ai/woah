@@ -9,9 +9,10 @@ text is in `spec/protocol/v2-turn-network.md` §VTN8.1 and §VTN10.1.
 ## Status (this branch: scope-executor-atomguard)
 
 - **DONE & verified:** §VTN8.1 + §VTN10.1 spec text; the materialization-miss
-  fix; the regression test. Checkpoint commit follows. **NOT deployed** — it is
-  a correctness checkpoint, not a smoke fix (the move still cannot durably
-  commit; see §VTN8.1 / MV-A below).
+  fix; the regression test. This is a correctness checkpoint, not a smoke fix:
+  it is **NOT deployed**, the non-browser executor and live fanout paths are not
+  wired yet, and production movement still needs the §VTN8.1 / MV-A transaction
+  rule below.
 - **NEXT:** MV-A (movement as one fenced placement transaction), then the
   non-browser executor path, then fanout.
 
@@ -49,8 +50,10 @@ non-browser (MCP/agent) path A3 created.
    authoritative executors are exempt (note: keyed on owning the full *closure*,
    not the full *scope slice* — a source-scope executor complete for `the_deck`
    still legitimately misses `the_garden` and is NOT exempt). Probe is generic
-   substrate behavior, NOT move-specific, NOT catalog-aware. Transitive
-   move-target prediction is an optional routing optimization only.
+   substrate behavior, NOT move-specific, NOT catalog-aware. A lifecycle repair
+   transfers the object's full materialization closure and grants read/write atom
+   coverage for the installed cells; this is coverage, not write authority.
+   Transitive move-target prediction is an optional routing optimization only.
 
 2. **§VTN8.1 — movement is a placement transaction.** A move touches
    `location:actor` + `contents:source` + `contents:dest` across two scopes; the
@@ -66,31 +69,41 @@ non-browser (MCP/agent) path A3 created.
 - `src/core/world.ts`: `shadowExecutionGuardActive` flag + `setShadowExecutionGuard()`;
   `object(id)` miss branch emits `recordTurnStateProbe({kind:"lifecycle", object:id})`
   before throwing, **only** when `shadowExecutionGuardActive && activeTurnRecorder`.
+- `src/core/world.ts`: guarded sequenced-call preamble lookups translate
+  pre-recording `E_OBJNF` into the same lifecycle `E_NEED_STATE`, so a missing
+  scope/actor object does not escape as "fresh turn produced no recording".
 - `src/core/shadow-turn-call.ts`: `runShadowTurnCallOnWorldTranscript` arms the
   flag only in guarded mode (`allowed_atom_hashes` present) and clears it in a
   `finally` (never leaks to a later authoritative run; never swallows the
   propagating `E_NEED_STATE`).
+- `src/core/shadow-turn-exec.ts`: lifecycle cell-page repair materializes the
+  full object closure (lineage/live, own property cells, own verb cells,
+  inherited property definition pages) and grants read/write atom coverage for
+  those installed cells. This prevents reduced-key repair from stalling one cell
+  at a time.
 - A thrown in-run `E_NEED_STATE` reaches `transcript.error` via
   `withTurnRecording`'s catch → `turn_finish{ok:false,error}` →
   `effectTranscriptFromRecordedTurn` → `missingAtomsFromNeedStateTranscript`.
   (Spec calls this recorder event `outcome`; the code calls it `turn_finish` —
   equivalent wiring.)
 
-Verified: garden-probe 2 passed (CASE B: 1 repair round, transfer preimage
-exactly `read:cell:lifecycle:the_garden`, no silent E_OBJNF, executor frame
-enters `the_garden`); shadow-turn-exec 25 passed; shadow-browser-node 49 passed
-(authoritative path unaffected — flag never leaks); typecheck clean.
+Verified: garden-probe passes with three cases. CASE B now uses a genuinely
+reduced key and sparse destination subtree; it repairs in three bounded rounds
+(`the_garden`, `exit_garden_north`, `exit_garden_south`), has no silent E_OBJNF,
+and the executor frame enters `the_garden`. CASE C proves a preamble miss returns
+structured `missing_state` instead of a raw E_OBJNF/no-recording throw.
 
 ## The §VTN8.1 boundary, made exact by the fix
 
-After VTN10.1 heals materialization, the durable commit of the move is
-**`commit_rejected`** (NOT `ok`, NOT `missing_state`, NOT silent applied) with
-`read/write version mismatch the_garden.* transcript=0 actual=1`: the executor
-rebuilt `the_garden`'s freshly-paged cells at version 0 while the anchor holds
-them at v1+. This is exactly the cross-scope placement-transaction problem MV-A
-addresses. CASE B pins this boundary: it permits `ok` (forward-compatible for
-when MV-A lands) but, while not-ok, requires `commit_rejected` — forbidding
-regression to `missing_state` or a silent applied frame.
+After VTN10.1 heals materialization and cell-page repair carries the current
+property versions, the in-process harness can commit the move under today's
+single-scope behavior. That is useful for proving materialization, but it is
+**not** the production movement rule: the transcript still writes
+`contents:the_deck`, `contents:the_garden`, actor location, and placement
+subscriber cells across two rooms. Without MV-A fencing, two concurrent moves
+touching the same destination can still lose or misorder destination membership.
+CASE B therefore pins the materialization property and allows either `ok` or a
+structured `commit_rejected`; MV-A remains the production correctness boundary.
 
 ## Remaining sequence (in order)
 

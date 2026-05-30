@@ -130,6 +130,18 @@ export async function runShadowTurnCallOnWorldTranscript(
 
   const recorded = recorder.turns[0];
   if (!recorded) {
+    // VTN10.1: a guarded materialization miss in the sequenced-call
+    // PREAMBLE (space lookup / presence / sequencer read) is translated by
+    // `world.guardedPreamble` into an E_NEED_STATE that the call path catches
+    // into an error frame BEFORE the recorder ever opens — so there is no
+    // recorded turn to fold the missing atoms out of. Re-throw that E_NEED_STATE
+    // so the executor (`executeShadowTurnCallOrNeedState`) converts it to a
+    // clean `missing_state` and the repair loop pages in the absent object,
+    // instead of failing with an opaque "no recording" error. Any other
+    // no-recording error is still a genuine bug and propagates as before.
+    if (guarded && frame.op === "error" && frame.error.code === "E_NEED_STATE") {
+      throw frame.error;
+    }
     const suffix = frame.op === "error" ? `: ${frame.error.code} ${frame.error.message}` : "";
     throw new Error(`fresh turn produced no recording: ${call.target}:${call.verb}${suffix}`);
   }

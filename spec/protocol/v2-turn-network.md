@@ -933,9 +933,13 @@ Under guarded (sparse, non-authoritative) execution, an object lookup for an id
 that is absent from the executor's materialized slice MUST be treated as a
 **materialization miss**, not as a semantic `E_OBJNF`. The executor MUST abort
 the turn without commit and return `missing_state` naming the missing object's
-lifecycle atom, so the state plane (VTN12) can transfer the object's
-`object_lineage`/`object_live` cell pages and the caller can retry the whole
-turn. A semantic `E_OBJNF` (the object truly does not exist, or the actor is not
+lifecycle atom. The state plane (VTN12) then transfers the object's
+materialization closure: lineage/live pages, own property cells, own verb pages,
+and any inherited property definition pages needed to read the object's
+catalog-defined defaults. The transfer's granted atom set MUST cover the
+read/write atoms for those installed object cells. This grant is materialization
+coverage, not write authority; commit validation remains the authority gate. A
+semantic `E_OBJNF` (the object truly does not exist, or the actor is not
 authorized to observe it) may only be concluded after state repair has proven
 the absence against the object's owning scope/anchor authority — never from the
 mere fact that a sparse executor's local slice lacks the id.
@@ -950,8 +954,9 @@ silently dropped. The normative rule is therefore: a lookup miss under guarded
 execution MUST emit a lifecycle materialization probe (a recorder-visible read
 of the object's lifecycle/lineage cell) that the atom guard converts to
 `missing_state`, before any `E_OBJNF` is raised. The probe carries the missing
-id so cell-page selection can fetch exactly that object's lineage and live
-pages. **Full-closure authoritative executors are exempt**: an executor that
+id so cell-page selection can fetch exactly that object's materialization
+closure in one bounded repair round. **Full-closure authoritative executors are
+exempt**: an executor that
 holds the entire closure the turn can reach (the browser-edge path, or an
 anchor that owns every reachable cell) treats a lookup miss as a genuine
 `E_OBJNF`, because there is no further authority to repair from. The exemption
@@ -976,8 +981,11 @@ two places: a predicted TurnKey is compared with a local atom cache before
 running, and the turn recorder enforces an `E_NEED_STATE` guard when dispatch,
 property, or structural cell events touch an atom outside the materialized set.
 The lifecycle materialization probe of VTN10.1 extends that guard to bare object
-lookups, which previously bypassed it. Recorded-turn replay helpers remain
-diagnostic preflight harnesses only.
+lookups, which previously bypassed it. Because the sequenced-call preamble runs
+before normal turn recording opens, guarded implementations must either precheck
+preamble atoms or translate preamble `E_OBJNF` misses into the same
+`missing_state` lifecycle atom. Recorded-turn replay helpers remain diagnostic
+preflight harnesses only.
 
 The production execution helper receives a `TurnCall`, executes it fresh on the
 selected node, returns a `TurnExecReply`, and can submit the fresh transcript to
