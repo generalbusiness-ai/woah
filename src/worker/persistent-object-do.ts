@@ -286,7 +286,12 @@ const DEFAULT_MCP_GATEWAY_SHARDS = 32;
 // authority and arrives via the room's authority slice (see
 // mcpGatewayDirectorySessionCellSlice), so a sparse `$space` stub never
 // overwrites a real `$chatroom`.
-const MCP_GATEWAY_ACTOR_SUPPORT_ROOTS: readonly ObjRef[] = ["$actor", "$thing"];
+// Exported for the cf-local regression guard, which asserts (a) the seed-derived
+// closure of these roots is carried with zero dangling ancestors, and (b) these
+// roots contain NO scope/catalog class (e.g. $space, $chatroom) — so the
+// remaining scope-lineage dangle can never be "fixed" by broadening the
+// universal support set instead of by the authority slice (perf-plan step 2).
+export const MCP_GATEWAY_ACTOR_SUPPORT_ROOTS: readonly ObjRef[] = ["$actor", "$thing"];
 const DEFAULT_TOOL_SURFACE_SOURCE_INDEX_MAX_SCOPE_ROWS = 10_000;
 const DEFAULT_TOOL_SURFACE_SOURCE_INDEX_MAX_SHARD_ROWS = 40_000;
 const MAX_REST_V2_RELAY_CLIENTS = 64;

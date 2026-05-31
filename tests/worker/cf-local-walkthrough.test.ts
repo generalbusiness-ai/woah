@@ -3,8 +3,35 @@ import { describe, expect, it, vi } from "vitest";
 import worker from "../../src/worker/index";
 import { CommitScopeDO } from "../../src/worker/commit-scope-do";
 import { DirectoryDO } from "../../src/worker/directory-do";
-import { PersistentObjectDO, type Env } from "../../src/worker/persistent-object-do";
+import { MCP_GATEWAY_ACTOR_SUPPORT_ROOTS, PersistentObjectDO, type Env } from "../../src/worker/persistent-object-do";
+import { createWorld } from "../../src/core/bootstrap";
+import type { ObjRef } from "../../src/core/types";
 import { FakeDurableObjectNamespace, FakeDurableObjectState } from "./fake-do";
+
+// Derive the universal actor/thing lineage the gateway-shard support set MUST
+// carry, the same way production does: the parent-closure of
+// MCP_GATEWAY_ACTOR_SUPPORT_ROOTS over the bootstrap seed (no catalogs). Derived,
+// not hardcoded, so the guard tracks the seed lineage if it changes.
+function seedDerivedUniversalLineage(): Set<ObjRef> {
+  const snapshot = createWorld({ catalogs: false }).exportWorld();
+  const byId = new Map(snapshot.objects.map((obj) => [obj.id, obj] as const));
+  const ids = new Set<ObjRef>();
+  const subtree = [...MCP_GATEWAY_ACTOR_SUPPORT_ROOTS];
+  while (subtree.length > 0) {
+    const id = subtree.pop()!;
+    if (ids.has(id)) continue;
+    ids.add(id);
+    for (const child of byId.get(id)?.children ?? []) subtree.push(child);
+  }
+  for (const root of MCP_GATEWAY_ACTOR_SUPPORT_ROOTS) {
+    let current: ObjRef | null = byId.get(root)?.parent ?? null;
+    while (current && !ids.has(current)) {
+      ids.add(current);
+      current = byId.get(current)?.parent ?? null;
+    }
+  }
+  return ids;
+}
 
 vi.setConfig({ testTimeout: 180_000 });
 
@@ -71,9 +98,7 @@ describe("CF-local smoke walkthrough", () => {
       // room's authority slice (perf-plan step 2 / CA12). This guard
       // deliberately scopes to the universal bootstrap lineage so step 1 is
       // independently verifiable; step 2 will tighten it to zero overall.
-      const UNIVERSAL_ACTOR_LINEAGE = new Set([
-        "$system", "$root", "$actor", "$player", "$guest", "$human", "$agent", "$thing"
-      ]);
+      const UNIVERSAL_ACTOR_LINEAGE = seedDerivedUniversalLineage();
       const universalLineageDangles = logSpy.mock.calls
         .map((args) => args.map((arg) => (typeof arg === "string" ? arg : JSON.stringify(arg))).join(" "))
         .filter((line) => line.includes("dangling_parent_ref"))
@@ -88,6 +113,25 @@ describe("CF-local smoke walkthrough", () => {
       warnSpy.mockRestore();
       logSpy.mockRestore();
       harness.close();
+    }
+  });
+
+  it("gateway-shard support roots carry actor/thing lineage but never scope/catalog classes", () => {
+    // The universal support set exists for actor/thing lineage only. Scope/room
+    // class lineage ($space and catalog scope classes like $chatroom) stays owner
+    // authority and must arrive via the room's authority slice (perf-plan step 2).
+    // This guards against "fixing" a scope-lineage dangle by broadening the
+    // universal support roots — which would re-import the sparse-stub-overwrites-
+    // real-scope hazard the support set deliberately avoids.
+    const lineage = seedDerivedUniversalLineage();
+    // Positive: the actor/thing chain to the top is fully covered.
+    for (const id of ["$system", "$root", "$actor", "$player", "$guest", "$human", "$agent", "$thing"]) {
+      expect(lineage.has(id as ObjRef), `universal lineage must include ${id}`).toBe(true);
+    }
+    // Negative: roots and derived closure exclude scope/catalog lineage.
+    for (const id of ["$space", "$chatroom", "$sequenced_log"]) {
+      expect(MCP_GATEWAY_ACTOR_SUPPORT_ROOTS, `roots must not include scope class ${id}`).not.toContain(id);
+      expect(lineage.has(id as ObjRef), `universal lineage must not include scope class ${id}`).toBe(false);
     }
   });
 });
