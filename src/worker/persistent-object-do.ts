@@ -279,6 +279,7 @@ type V2SocketAttachment = {
   openedAt?: number;
   stateHead?: ShadowScopeHead;
 };
+type ActiveV2SocketAttachment = V2SocketAttachment & { protocol: "v2-turn-network"; node: string };
 
 const WORLD_HOST = "world";
 const MCP_GATEWAY_SHARD_PREFIX = "mcp-gateway-";
@@ -4486,7 +4487,7 @@ export class PersistentObjectDO {
     reconstructionScope: ObjRef,
     authority: SerializedAuthoritySlice,
     directoryScopeSessions: readonly DirectorySerializedSession[],
-    reason: AuthorityReconstructionReason | "warm_checkpoint_hit" | "warm_checkpoint_repaired"
+    reason: AuthorityReconstructionReason | "warm_checkpoint_hit" | "warm_checkpoint_repaired" | "warm_checkpoint_seeded"
   ): ExecutorAuthorityPayload {
     const sessionActors = new Set<ObjRef>(
       authority.sessions
@@ -4495,10 +4496,7 @@ export class PersistentObjectDO {
     );
     const slices: SerializedAuthoritySlice[] = [authority];
     if (sessionActors.size > 0) {
-      const localActorLive = filterSerializedAuthoritySlicePages(
-        executorAuthorityPayload(world, sessionActors).authority,
-        (ref) => sessionActors.has(ref.object) && ref.page === "object_live"
-      );
+      const localActorLive = mcpGatewayLocalActorLiveCellSlice(world, sessionActors);
       if (authoritySlicePageCount(localActorLive) > 0) slices.push(localActorLive);
     }
     if (directoryScopeSessions.length > 0) slices.push(mcpGatewayDirectorySessionCellSlice(directoryScopeSessions));
@@ -4646,7 +4644,10 @@ export class PersistentObjectDO {
     }
     const repairIds = checkpointLookup ? checkpointLookup.missingIds : null;
     const requestedIds = repairIds ?? ids;
-    const local = executorAuthorityPayload(world, requestedIds);
+    const localActorAuthorityRoots = localActorAuthorityRootIds(world, requestedIds, { sessionActorsOnly: mcpGatewayShard });
+    const local = mcpGatewayShard
+      ? mcpGatewayLocalAuthorityPayload(world, requestedIds, localActorAuthorityRoots)
+      : executorAuthorityPayload(world, requestedIds);
     const localObjectIds = authoritySliceObjectIds(local.authority);
     const preservedObjectIds = new Set<ObjRef>(localObjectIds);
     if (checkpointLookup) {
@@ -4697,7 +4698,6 @@ export class PersistentObjectDO {
       return await this.resolveObjectHostForWorld(null, id, fallbackHost);
     };
 
-    const localActorAuthorityRoots = localActorAuthorityRootIds(world, requestedIds);
     const resolvedIds = await Promise.all(requestedIds.map(async (id) => {
       // Sparse MCP shards own the live session actor stubs they loaded from
       // Directory. Do not wake the world host just because Directory also knows
@@ -4805,7 +4805,11 @@ export class PersistentObjectDO {
     if (staleFallbackCount === 0 && checkpointSeq !== null) {
       checkpointStored = this.storeAuthorityCheckpoint(reconstructionScope, filteredAuthority, checkpointSeq);
     }
-    const reason = checkpointLookup && checkpointStored ? "warm_checkpoint_repaired" : reconstructionReason;
+    const reason = checkpointLookup && checkpointStored
+      ? "warm_checkpoint_repaired"
+      : !checkpointLookup && checkpointStored && reconstructionReason === "warm_turn_refresh"
+        ? "warm_checkpoint_seeded"
+        : reconstructionReason;
     return {
       ...this.authorityPayloadFromCachedAuthority(world, reconstructionScope, filteredAuthority, directoryScopeSessions, reason),
       staleFallbackCount
@@ -5154,6 +5158,12 @@ export class PersistentObjectDO {
     const commitScope = reply.commit.position.scope;
     const from = replyEnvelope.from || this.durableHostKey();
     const observations = structuredClone(reply.transcript.observations) as Observation[];
+    const sockets = this.state.getWebSockets()
+      .map((ws) => ({ ws, att: this.attachment(ws) }))
+      .filter((entry): entry is { ws: WebSocket; att: ActiveV2SocketAttachment } =>
+        !!entry.att?.node && entry.att.protocol === "v2-turn-network"
+      );
+    if (sockets.length === 0) return;
     const audiences = await world.computeDirectLiveAudiences(commitScope, observations);
     const eventTranscript = { ...reply.transcript, observations } as EffectTranscript;
     const events = shadowLiveEventsForTranscriptRelay(from, eventTranscript)
@@ -5165,10 +5175,8 @@ export class PersistentObjectDO {
       .filter((event): event is ShadowLiveEvent => event !== null);
     const affectedScopes = new Set(affectedBrowserFanoutScopes(commitScope, reply.transcript, (object, property) => world.isPresenceProjectionProperty(object, property)));
     if (events.length === 0 && affectedScopes.size === 0) return;
-    const stateTargets = new Map<string, { ws: WebSocket; att: V2SocketAttachment }>();
-    for (const ws of this.state.getWebSockets()) {
-      const att = this.attachment(ws);
-      if (!att?.node || att.protocol !== "v2-turn-network") continue;
+    const stateTargets = new Map<string, { ws: WebSocket; att: ActiveV2SocketAttachment }>();
+    for (const { ws, att } of sockets) {
       if (att.node === originNode || alreadyDeliveredNodes.has(att.node)) continue;
       const matching = events.filter((event) => shadowLiveEventMatchesPeerScope(event, att));
       // Projection transfers are scoped to the relay head that signs them. Peer
@@ -5268,7 +5276,13 @@ export class PersistentObjectDO {
     observations: readonly Observation[]
   ): Promise<McpFanoutAudience> {
     const directorySessions = await this.loadDirectorySessionsForScopes(affectedMcpFanoutScopes(scope, transcript, (object, property) => world.isPresenceProjectionProperty(object, property)));
-    const fallback = await world.computeDirectLiveAudiences(scope, structuredClone(observations) as Observation[]);
+    // MCP gateway shards are intentionally sparse. Directory is the live
+    // session table for MCP fanout, so recomputing audiences from local room
+    // lineage on those shards both duplicates the route source of truth and
+    // walks stale scope stubs before owner authority is present.
+    const fallback = isMcpGatewayShardHost(this.durableHostKey())
+      ? {}
+      : await world.computeDirectLiveAudiences(scope, structuredClone(observations) as Observation[]);
     const directoryAudience = mcpFanoutAudienceFromDirectorySessions(scope, observations, directorySessions);
     return mergeMcpFanoutAudience(fallback, directoryAudience);
   }
@@ -6402,14 +6416,59 @@ function v2SocketEnvelopeAuthorityObjectIds(encoded: string, fallbackScope: ObjR
   }
 }
 
-function localActorAuthorityRootIds(world: WooWorld, explicitIds: readonly ObjRef[]): Set<ObjRef> {
+function localActorAuthorityRootIds(world: WooWorld, explicitIds: readonly ObjRef[], options: { sessionActorsOnly?: boolean } = {}): Set<ObjRef> {
   const roots = new Set<ObjRef>();
   const sessionActors = new Set(Array.from(world.sessions.values(), (session) => session.actor));
   for (const id of explicitIds) {
     if (!world.objects.has(id)) continue;
-    if (sessionActors.has(id) || world.isDescendantOf(id, "$actor")) roots.add(id);
+    if (sessionActors.has(id)) {
+      roots.add(id);
+      continue;
+    }
+    // Sparse MCP gateway shards carry room/scope stubs before owner authority
+    // arrives. Walking their catalog lineage just to ask "is this an actor?"
+    // records noisy dangling_parent_ref metrics and can misclassify stale rows.
+    // Session actors are the only live cells the shard owns; non-session actor
+    // discovery remains available to full hosts where the lineage is complete.
+    if (!options.sessionActorsOnly && world.isDescendantOf(id, "$actor")) roots.add(id);
   }
   return roots;
+}
+
+function mcpGatewayLocalAuthorityPayload(
+  world: WooWorld,
+  explicitIds: readonly ObjRef[],
+  actorRoots: ReadonlySet<ObjRef>
+): ExecutorAuthorityPayload {
+  const localIds = new Set<ObjRef>(actorRoots);
+  for (const id of explicitIds) {
+    // Bootstrap actor/thing support rows are deliberately resident on every
+    // MCP shard. Scope/room rows are not: their catalog lineage belongs to the
+    // owner slice, and exporting a stale local stub before owner repair is the
+    // dangling_parent_ref storm this path is designed to avoid.
+    if (id.startsWith("$") && world.objects.has(id)) localIds.add(id);
+    else if (localObjectLineageIsComplete(world, id)) localIds.add(id);
+  }
+  const sessions = world.exportSessions();
+  const authority = world.exportAuthoritySlice([], localIds);
+  return {
+    sessions,
+    session_objects: [],
+    authority: { ...authority, sessions }
+  };
+}
+
+function localObjectLineageIsComplete(world: WooWorld, id: ObjRef): boolean {
+  let current: ObjRef | null = id;
+  const seen = new Set<ObjRef>();
+  while (current) {
+    if (seen.has(current)) return false;
+    seen.add(current);
+    const obj = world.objects.get(current);
+    if (!obj) return false;
+    current = obj.parent;
+  }
+  return true;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -6804,6 +6863,26 @@ function mcpGatewayLocalActorPropertyCellSlice(
     },
     tombstones: [],
     source_object_count: new Set(inlinePages.map((page) => page.object)).size
+  };
+}
+
+function mcpGatewayLocalActorLiveCellSlice(
+  world: WooWorld,
+  actors: ReadonlySet<ObjRef>
+): SerializedAuthorityCellSlice {
+  const inlinePages: ShadowStatePage[] = world.exportObjects(actors).map((obj) => shadowObjectLivePage(obj));
+  return {
+    kind: "woo.authority_slice.cells.shadow.v1",
+    sessions: [],
+    page_refs: inlinePages.map((page) => shadowStatePageRef(page, true)),
+    inline_pages: inlinePages,
+    counters: {
+      objectCounter: 1,
+      parkedTaskCounter: 1,
+      sessionCounter: 1
+    },
+    tombstones: [],
+    source_object_count: inlinePages.length
   };
 }
 

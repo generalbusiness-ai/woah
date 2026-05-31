@@ -91,6 +91,20 @@ storm against incomplete executor slices.
      timeout/stale fallback, or the repaired union exceeds the per-checkpoint
      object budget, the served payload may still use those rows for that
      attempt, but it is not stored as the next checkpoint.
+   - **Pre-plan authority gate. [implemented in this branch for MCP planned-exec]**
+     Sparse gateway shards must refresh/repair authority before local VM
+     planning, not only before commit submission. Otherwise a stale relay
+     snapshot can raise `E_VERBNF`/`E_OBJNF` locally before the checkpoint repair
+     path can act. The pre-plan refresh is MCP-only and does not consume the
+     first envelope snapshot-fallback slot. First warm refreshes that
+     successfully seed a bounded checkpoint emit `warm_checkpoint_seeded`, so a
+     sticky seed is not confused with repeated `warm_turn_refresh` fan-in.
+     On MCP gateway shards, local authority export is also restricted to rows
+     whose lineage is complete plus this shard's session actor live cells;
+     sparse room stubs are routing/cache hints, not authority rows. MCP live
+     fanout audience is read from Directory rather than recomputed from the
+     sparse local room graph, so movement observations do not reintroduce the
+     same incomplete-lineage walk after commit.
    - **2e — gate then delete the old per-turn full-slice reconstruction path.**
      Gate behind a flag first so 2a instrumentation proves it's no longer hit on
      warm turns, then remove. **Not yet implemented.**

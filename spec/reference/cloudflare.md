@@ -596,7 +596,9 @@ healthy warm turns should move from `warm_turn_refresh` to
 `warm_checkpoint_hit`, same-scope projection tails should emit
 `warm_checkpoint_caught_up`, checkpoint coverage misses should emit
 `warm_checkpoint_repaired` only when the repaired checkpoint is stored and will
-turn the next matching request into `warm_checkpoint_hit`, and
+turn the next matching request into `warm_checkpoint_hit`, first warm
+refreshes that seed a bounded checkpoint should emit
+`warm_checkpoint_seeded`, and
 stale-fallback/timeout/over-budget rows must not be stored as checkpoints.
 
 #### Sampling

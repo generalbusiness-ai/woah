@@ -129,7 +129,16 @@ export type SubmitTurnIntentOptions<Client, Result extends ExecutorEnvelopeResul
   clientSerialized?(client: Client): SerializedWorld;
   nextTurnId(client: Client, attempt: number): string;
   envelopeId?(turnId: string, attempt: number): string;
-  authorityPayload(scope: ObjRef, extraObjectIds: ObjRef[]): ExecutorAuthorityPayload | Promise<ExecutorAuthorityPayload>;
+  authorityPayload(
+    scope: ObjRef,
+    extraObjectIds: ObjRef[],
+    context?: { phase: "intent" | "pre_plan" | "commit" }
+  ): ExecutorAuthorityPayload | Promise<ExecutorAuthorityPayload>;
+  // `planned-exec` normally plans from the caller's cached relay view, then
+  // refreshes authority for commit. Sparse gateway shards need the reverse for
+  // local planning: repair/merge the known authority first so catalog lineage
+  // and transitive refs are present before the VM can fail locally.
+  prePlanAuthority?: boolean;
   submitEnvelope(scope: ObjRef, body: ExecutorEnvelopeBody): Promise<Result>;
   applyAuthority?(client: Client, authority: SerializedAuthoritySlice): void;
   authorityObjectIds?(input: ExecutorCallInput, commitScope: ObjRef): ObjRef[];
@@ -419,7 +428,7 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
           ?? executorAuthorityObjectIds(options.input, submitScope),
         repairObjectIds
       );
-      const authority = await options.authorityPayload(submitScope, authorityObjectIds);
+      const authority = await options.authorityPayload(submitScope, authorityObjectIds, { phase: "intent" });
       options.applyAuthority?.(client, authority.authority);
       const result = await options.submitEnvelope(submitScope, executorEnvelopeBody({
         scope: submitScope,
@@ -473,6 +482,15 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     const planningClient = await options.ensureClient(planningScope, attempt);
     const turnId = options.input.id ?? options.nextTurnId(planningClient, attempt);
     const call = buildExecutorCall(options.input, turnId);
+    if (options.prePlanAuthority) {
+      const prePlanAuthorityObjectIds = mergeExecutorObjectIds(
+        options.authorityObjectIds?.(options.input, planningScope)
+          ?? executorAuthorityObjectIds(options.input, planningScope),
+        repairObjectIds
+      );
+      const prePlanAuthority = await options.authorityPayload(planningScope, prePlanAuthorityObjectIds, { phase: "pre_plan" });
+      options.applyAuthority?.(planningClient, prePlanAuthority.authority);
+    }
     const serialized = options.clientSerialized?.(planningClient);
     if (!serialized) throw new Error("planned v2 turn gateway submission requires clientSerialized");
     let planned: ShadowTurnCallTranscriptRun;
@@ -508,7 +526,7 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       executorTranscriptObjectIds(planned.transcript),
       executorTransactionObjectIds(transactionScope ? transaction : null)
     );
-    let authority = await options.authorityPayload(commitScope, authorityObjectIds);
+    let authority = await options.authorityPayload(commitScope, authorityObjectIds, { phase: "commit" });
     options.applyAuthority?.(commitClient, authority.authority);
     if (commitClient !== planningClient) options.applyAuthority?.(planningClient, authority.authority);
     if (transactionScope) {
@@ -550,7 +568,7 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       );
       if (!sameExecutorObjectIds(refreshedAuthorityObjectIds, authorityObjectIds)) {
         authorityObjectIds = refreshedAuthorityObjectIds;
-        authority = await options.authorityPayload(commitScope, authorityObjectIds);
+        authority = await options.authorityPayload(commitScope, authorityObjectIds, { phase: "commit" });
         options.applyAuthority?.(commitClient, authority.authority);
         if (commitClient !== planningClient) options.applyAuthority?.(planningClient, authority.authority);
         const reserialized = options.clientSerialized?.(commitClient);

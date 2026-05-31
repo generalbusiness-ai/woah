@@ -624,6 +624,7 @@ export class McpGateway {
         token: entry.v2Token
       },
       strategy: "planned-exec",
+      prePlanAuthority: true,
       maxAttempts: 8,
       intentScope: (turn) => turn.persistence === "durable"
         ? turn.scope
@@ -634,9 +635,13 @@ export class McpGateway {
       clientSerialized: (client) => serializedFor(client.relay.commit_scope, { reason: "mcp_turn_plan", metric: (event) => this.world.recordMetric(event) }),
       nextTurnId: () => id,
       envelopeId: (turnId, attempt) => executorEnvelopeId(turnId, attempt, () => Math.random().toString(36).slice(2, 10)),
-      authorityPayload: async (submitScope, extraObjectIds) => {
-        const useCommitScopeSnapshotForRemoteAuthority = authorityRefreshAttempts === 0;
-        authorityRefreshAttempts += 1;
+      authorityPayload: async (submitScope, extraObjectIds, context) => {
+        // Pre-plan authority repairs the local relay view before VM planning.
+        // It must not consume the first envelope snapshot fallback slot: that
+        // fallback is for commit submission after a durable snapshot exists.
+        const isPrePlan = context?.phase === "pre_plan";
+        const useCommitScopeSnapshotForRemoteAuthority = !isPrePlan && authorityRefreshAttempts === 0;
+        if (!isPrePlan) authorityRefreshAttempts += 1;
         const payload = await this.v2AuthorityPayload(extraObjectIds, {
           useCommitScopeSnapshotForRemoteAuthority,
           directorySessionScopes: options.directorySessionScopes ?? [],

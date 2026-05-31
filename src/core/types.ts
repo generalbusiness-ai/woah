@@ -416,12 +416,17 @@ export type MetricEvent =
   //                            stored and will make the next matching warm turn
   //                            a checkpoint hit; degraded or over-budget repairs
   //                            stay in the caller's reconstruction bucket.
+  //  - "warm_checkpoint_seeded" — a warm per-turn refresh with no existing
+  //                            checkpoint that successfully stores a bounded
+  //                            checkpoint for future turns. This is still a
+  //                            full refresh, but it is a one-time seed rather
+  //                            than repeated warm-path fan-in.
   // `scope` is the commit/turn scope being reconstructed (`$nowhere` when no
   // scope is in hand, e.g. the source-host handler). `object_count` and
   // `page_count` size the slice — page_count counts cell pages for the new
   // cell-slice representation (CA12), or object rows for the legacy slice.
   // `source_host` is the host that did the reconstruction.
-  | { kind: "authority_slice_reconstructed"; reason: "warm_turn_refresh" | "cold_open" | "missing_state_repair" | "slice_served" | "warm_checkpoint_hit" | "warm_checkpoint_caught_up" | "warm_checkpoint_repaired"; scope: ObjRef; object_count: number; page_count: number; source_host: string }
+  | { kind: "authority_slice_reconstructed"; reason: "warm_turn_refresh" | "cold_open" | "missing_state_repair" | "slice_served" | "warm_checkpoint_hit" | "warm_checkpoint_caught_up" | "warm_checkpoint_repaired" | "warm_checkpoint_seeded"; scope: ObjRef; object_count: number; page_count: number; source_host: string }
   // Fires once per reapExpiredSessions sweep only when at least one session is
   // actually reaped. This keeps background sweep noise out of data-path tails
   // while preserving enough volume information for retention debugging.

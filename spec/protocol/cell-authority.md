@@ -411,6 +411,15 @@ planning cache, not a new authority source:
   SHOULD repair only the missing cell/object ids and merge them into the
   checkpoint cache. It MUST NOT fall back to a full per-turn authority slice
   merely because the checkpoint is incomplete.
+- A warm request that has no existing checkpoint MAY perform one full
+  authority refresh to seed the checkpoint. Health metrics MUST distinguish this
+  sticky seed from repeated `warm_turn_refresh` reconstruction so operators can
+  tell a one-time warmup from continued per-turn fan-in.
+- A sparse transport gateway that executes a local planning VM MUST perform the
+  applicable checkpoint hit/repair/seed before VM planning begins, not only
+  before commit submission. Local routing stubs whose parent/class lineage is
+  incomplete are cache hints, not authority rows; serving them as authority can
+  convert a repairable missing page into a local `E_OBJNF`/`E_VERBNF`.
 - The checkpoint MUST also be bounded by retained cell/object count, not only
   by checkpoint count. If a repair would push the checkpoint beyond that local
   budget, the gateway may serve the repaired payload for the current attempt,

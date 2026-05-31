@@ -964,6 +964,11 @@ describe("gateway projection cache", () => {
         reconstructionScope: "the_chatroom",
         checkpointHead: chatroomHead
       });
+      expect(metrics).toContainEqual(expect.objectContaining({
+        kind: "authority_slice_reconstructed",
+        reason: "warm_checkpoint_seeded",
+        scope: "the_chatroom"
+      }));
       metrics.length = 0;
 
       const served = await po.v2GatewayAuthorityPayload(world, ["the_chatroom"], {

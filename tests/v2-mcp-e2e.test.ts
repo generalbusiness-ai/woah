@@ -2,8 +2,9 @@ import { describe, expect, it } from "vitest";
 import { createWorld } from "../src/core/bootstrap";
 import { executorAuthorityPayload } from "../src/core/executor";
 import { authoritySliceObjectIds, filterSerializedAuthoritySliceObjects, serializedWorldFromAuthoritySlice } from "../src/core/authority-slice";
+import { serializedFor } from "../src/core/shadow-commit-scope";
 import { encodeEnvelope, type ShadowEnvelope } from "../src/core/shadow-envelope";
-import { createShadowBrowserRelayShim } from "../src/core/shadow-browser-node";
+import { createShadowBrowserRelayShim, markShadowBrowserRelaySerializedChanged } from "../src/core/shadow-browser-node";
 import type { ShadowTurnExecReply } from "../src/core/shadow-turn-exec";
 import type { ObjRef } from "../src/core/types";
 import { McpGateway, type McpV2EnvelopeBody, type McpV2OpenBody } from "../src/mcp/gateway";
@@ -110,6 +111,113 @@ describe("v2 MCP e2e", () => {
     }
   });
 
+  it("repairs stale relay lineage before MCP local planning", async () => {
+    const world = createWorld({ catalogs: ["chat", "demoworld", "tasks", "blocks-demo"] });
+    const env = { WOO_INTERNAL_SECRET: "v2-mcp-secret" };
+    const scopeStates = new Map<ObjRef, FakeDurableObjectState>();
+    const scopes = new Map<ObjRef, CommitScopeDO>();
+    const scopeFor = (commitScope: ObjRef): CommitScopeDO => {
+      let scope = scopes.get(commitScope);
+      if (!scope) {
+        const state = new FakeDurableObjectState(commitScope);
+        scopeStates.set(commitScope, state);
+        scope = new CommitScopeDO(state as unknown as ConstructorParameters<typeof CommitScopeDO>[0], env);
+        scopes.set(commitScope, scope);
+      }
+      return scope;
+    };
+    const authorityPhases: string[] = [];
+    const gateway = new McpGateway(world, {
+      v2: {
+        open: async (commitScope, body) => await postCommitScope(scopeFor(commitScope), env, commitScope, "/v2/open", body),
+        authorityPayload: async (extraObjectIds, options) => {
+          authorityPhases.push(options?.useCommitScopeSnapshotForRemoteAuthority === true ? "snapshot" : "fresh");
+          return executorAuthorityPayload(world, extraObjectIds);
+        },
+        envelope: async (commitScope, body) => await postCommitScope(scopeFor(commitScope), env, commitScope, "/v2/envelope", body)
+      }
+    });
+
+    try {
+      const session = await initializeMcp(gateway, "guest:v2-mcp-preplan-lineage", 1);
+      const entered = await mcp(gateway, session, 2, "tools/call", {
+        name: "woo_call",
+        arguments: { object: "the_chatroom", verb: "enter", args: [] }
+      });
+      expect(entered.result.isError, JSON.stringify(entered.result.structuredContent)).not.toBe(true);
+
+      removeObjectsFromMcpScope(gateway, "the_chatroom", ["$chatroom", "$space"]);
+      authorityPhases.length = 0;
+
+      const looked = await mcp(gateway, session, 3, "tools/call", {
+        name: "woo_call",
+        arguments: { object: "the_chatroom", verb: "look", args: [] }
+      });
+
+      expect(looked.result.isError, JSON.stringify(looked.result.structuredContent)).not.toBe(true);
+      expect(authorityPhases[0]).toBe("fresh");
+      expect(mcpScopeObjectIds(gateway, "the_chatroom")).toEqual(expect.arrayContaining(["$chatroom", "$space"]));
+    } finally {
+      for (const state of scopeStates.values()) state.close();
+    }
+  });
+
+  it("repairs stale relay transitive refs before MCP movement planning", async () => {
+    const world = createWorld({ catalogs: ["chat", "demoworld", "tasks", "blocks-demo"] });
+    const env = { WOO_INTERNAL_SECRET: "v2-mcp-secret" };
+    const scopeStates = new Map<ObjRef, FakeDurableObjectState>();
+    const scopes = new Map<ObjRef, CommitScopeDO>();
+    const scopeFor = (commitScope: ObjRef): CommitScopeDO => {
+      let scope = scopes.get(commitScope);
+      if (!scope) {
+        const state = new FakeDurableObjectState(commitScope);
+        scopeStates.set(commitScope, state);
+        scope = new CommitScopeDO(state as unknown as ConstructorParameters<typeof CommitScopeDO>[0], env);
+        scopes.set(commitScope, scope);
+      }
+      return scope;
+    };
+    const gateway = new McpGateway(world, {
+      v2: {
+        open: async (commitScope, body) => await postCommitScope(scopeFor(commitScope), env, commitScope, "/v2/open", body),
+        authorityPayload: async (extraObjectIds) => executorAuthorityPayload(world, extraObjectIds),
+        envelope: async (commitScope, body) => await postCommitScope(scopeFor(commitScope), env, commitScope, "/v2/envelope", body)
+      }
+    });
+
+    try {
+      const session = await initializeMcp(gateway, "guest:v2-mcp-preplan-garden", 1);
+      for (const [id, object, verb] of [
+        [2, "the_chatroom", "enter"],
+        [3, "the_chatroom", "southeast"]
+      ] as const) {
+        const result = await mcp(gateway, session, id, "tools/call", {
+          name: "woo_call",
+          arguments: { object, verb, args: [] }
+        });
+        expect(result.result.isError, `${object}:${verb} failed: ${JSON.stringify(result.result.structuredContent)}`).not.toBe(true);
+      }
+      const look = await mcp(gateway, session, 4, "tools/call", {
+        name: "woo_call",
+        arguments: { object: "the_deck", verb: "look", args: [] }
+      });
+      expect(look.result.isError, JSON.stringify(look.result.structuredContent)).not.toBe(true);
+
+      removeObjectsFromMcpScope(gateway, "the_deck", ["the_garden"]);
+
+      const south = await mcp(gateway, session, 5, "tools/call", {
+        name: "woo_call",
+        arguments: { object: "the_deck", verb: "south", args: [] }
+      });
+
+      expect(south.result.isError, JSON.stringify(south.result.structuredContent)).not.toBe(true);
+      expect(world.activeScopeForSession(session)).toBe("the_garden");
+      expect(mcpScopeObjectIds(gateway, "the_deck")).toContain("the_garden");
+    } finally {
+      for (const state of scopeStates.values()) state.close();
+    }
+  });
+
   it("uses snapshot authority only for the first MCP envelope attempt", async () => {
     const world = createWorld();
     const env = { WOO_INTERNAL_SECRET: "v2-mcp-secret" };
@@ -153,7 +261,7 @@ describe("v2 MCP e2e", () => {
 
       expect(result.result.isError, JSON.stringify(result.result.structuredContent)).not.toBe(true);
       expect(envelopeCalls).toBe(2);
-      expect(authoritySnapshotFlags).toEqual([false, false, true, false]);
+      expect(authoritySnapshotFlags).toEqual([false, false, false, true, false, false]);
     } finally {
       for (const state of scopeStates.values()) state.close();
     }
@@ -575,6 +683,30 @@ function acceptedFramesForState(state: FakeDurableObjectState): Array<{ position
     if (err instanceof Error && /no such table/.test(err.message)) return [];
     throw err;
   }
+}
+
+function mcpScopeObjectIds(gateway: McpGateway, scope: ObjRef): ObjRef[] {
+  const client = mcpScopeClient(gateway, scope);
+  return serializedFor(client.relay.commit_scope, { reason: "test_inspect_mcp_scope" })
+    .objects
+    .map((obj) => obj.id);
+}
+
+function removeObjectsFromMcpScope(gateway: McpGateway, scope: ObjRef, ids: ObjRef[]): void {
+  const client = mcpScopeClient(gateway, scope);
+  const remove = new Set(ids);
+  const serialized = serializedFor(client.relay.commit_scope, { reason: "test_corrupt_mcp_scope" });
+  serialized.objects = serialized.objects.filter((obj) => !remove.has(obj.id));
+  markShadowBrowserRelaySerializedChanged(client.relay);
+}
+
+function mcpScopeClient(gateway: McpGateway, scope: ObjRef): {
+  relay: Parameters<typeof markShadowBrowserRelaySerializedChanged>[0];
+} {
+  const scopes = (gateway as unknown as { v2Scopes: Map<ObjRef, { relay: Parameters<typeof markShadowBrowserRelaySerializedChanged>[0] }> }).v2Scopes;
+  const client = scopes.get(scope);
+  expect(client, `expected MCP v2 scope client for ${scope}`).toBeDefined();
+  return client!;
 }
 
 function missingStateReply(id: string): ShadowTurnExecReply {
