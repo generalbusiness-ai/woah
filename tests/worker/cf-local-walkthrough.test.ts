@@ -56,6 +56,33 @@ describe("CF-local smoke walkthrough", () => {
       alice = await LocalMcpSession.open(harness, `guest:cf-local-alice-${runId}`, "alice", runId);
       bob = await openOnDifferentShard(harness, alice, runId);
       await runWalkthrough(alice, bob);
+      // Regression guard for the gateway-shard UNIVERSAL ACTOR LINEAGE gap
+      // (perf-plan step 1): every gateway-shard world MUST carry the full
+      // bootstrap actor/thing lineage closure ($system, $root, $actor, $player,
+      // $guest, $human, $agent, $thing). Omitting any of these made the
+      // corresponding ancestry walk dangle on gateway shards — a
+      // `dangling_parent_ref` storm (~one per resolution per turn) that silently
+      // degraded verb/property resolution and forced per-turn authority-slice
+      // fan-in. A correct shard world emits none for these universal ancestors.
+      //
+      // NOTE: dangles whose missing id is a CATALOG scope class (e.g.
+      // `the_chatroom -> $chatroom`) are a DIFFERENT, still-open problem —
+      // scope/room class lineage is owner authority and must arrive via the
+      // room's authority slice (perf-plan step 2 / CA12). This guard
+      // deliberately scopes to the universal bootstrap lineage so step 1 is
+      // independently verifiable; step 2 will tighten it to zero overall.
+      const UNIVERSAL_ACTOR_LINEAGE = new Set([
+        "$system", "$root", "$actor", "$player", "$guest", "$human", "$agent", "$thing"
+      ]);
+      const universalLineageDangles = logSpy.mock.calls
+        .map((args) => args.map((arg) => (typeof arg === "string" ? arg : JSON.stringify(arg))).join(" "))
+        .filter((line) => line.includes("dangling_parent_ref"))
+        .map((line) => /"missing":"([^"]+)"/.exec(line)?.[1])
+        .filter((missing): missing is string => !!missing && UNIVERSAL_ACTOR_LINEAGE.has(missing));
+      expect(
+        universalLineageDangles.length,
+        `gateway-shard slice missing a universal bootstrap ancestor (step 1 regression): ${JSON.stringify(universalLineageDangles.slice(0, 5))}`
+      ).toBe(0);
     } finally {
       await Promise.allSettled([alice?.close(), bob?.close()]);
       warnSpy.mockRestore();
