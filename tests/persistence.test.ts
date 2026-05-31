@@ -283,6 +283,69 @@ describe("sqlite persistence", () => {
     }
   });
 
+  it("persists property presence-projection metadata across SQLite reload", () => {
+    const { dir, path } = tempDb();
+    try {
+      const firstRepo = new LocalSQLiteRepository(path);
+      const firstWorld = createWorld({ repository: firstRepo });
+      firstWorld.createObject({ id: "presence_meta_room", name: "Presence Metadata Room", parent: "$space", owner: "$wiz" });
+      firstWorld.defineProperty("presence_meta_room", {
+        name: "occupant_rows",
+        defaultValue: [],
+        owner: "$wiz",
+        perms: "r",
+        typeHint: "list<map>",
+        presenceProjection: { kind: "presence", key: "session", sessionField: "sid", actorField: "who" }
+      });
+      firstRepo.close();
+
+      const secondRepo = new LocalSQLiteRepository(path);
+      const secondWorld = createWorld({ repository: secondRepo });
+      expect(secondWorld.object("presence_meta_room").propertyDefs.get("occupant_rows")?.presenceProjection).toEqual({
+        kind: "presence",
+        key: "session",
+        sessionField: "sid",
+        actorField: "who"
+      });
+      secondRepo.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("adds property_def metadata column to existing SQLite schemas", () => {
+    const { dir, path } = tempDb();
+    try {
+      const db = new DatabaseSync(path);
+      db.exec(`
+        PRAGMA user_version = 1;
+        CREATE TABLE property_def (
+          object_id TEXT NOT NULL,
+          name TEXT NOT NULL,
+          default_val TEXT NOT NULL,
+          type_hint TEXT,
+          owner TEXT NOT NULL,
+          perms TEXT NOT NULL,
+          version INTEGER NOT NULL DEFAULT 1,
+          PRIMARY KEY (object_id, name)
+        )
+      `);
+      db.close();
+
+      const repo = new LocalSQLiteRepository(path);
+      const check = new DatabaseSync(path);
+      const columns = (check.prepare("PRAGMA table_info(property_def)").all() as Array<{ name: string }>).map((row) => row.name);
+      const metadataColumn = check.prepare("SELECT dflt_value, \"notnull\" FROM pragma_table_info('property_def') WHERE name = 'metadata'").get() as { dflt_value: string; notnull: number } | undefined;
+      check.close();
+
+      expect(columns).toContain("metadata");
+      expect(metadataColumn).toEqual({ dflt_value: "'{}'", notnull: 1 });
+      repo.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("coalesces deferred property writes to one dirty property save", () => {
     const { dir, path } = tempDb();
     try {

@@ -212,7 +212,7 @@ describe("v2 browser local turn planning", () => {
     });
   });
 
-  it("preserves stale subscriber rows while recording local enter presence writes", async () => {
+  it("preserves stale subscriber rows without authoring derived enter presence writes", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:v2-browser-local-outliner-scrub");
     anchor.setProp("the_outline", "session_subscribers", [{ session: "expired:test", actor: "stale_actor" }]);
@@ -254,18 +254,21 @@ describe("v2 browser local turn planning", () => {
       }
     });
     if (!local.ok) throw new Error("expected local outliner enter plan");
-    expect(local.transcript.writes).toEqual(expect.arrayContaining([
+    expect(local.transcript.reads).toEqual(expect.arrayContaining([
       expect.objectContaining({
         cell: { kind: "prop", object: "the_outline", name: "session_subscribers" },
         value: expect.arrayContaining([
-          expect.objectContaining({ session: "expired:test", actor: "stale_actor" }),
-          expect.objectContaining({ session: session.id, actor: session.actor })
+          expect.objectContaining({ session: "expired:test", actor: "stale_actor" })
         ])
       }),
       expect.objectContaining({
         cell: { kind: "prop", object: "the_outline", name: "subscribers" },
-        value: expect.arrayContaining(["stale_actor", session.actor])
+        value: expect.arrayContaining(["stale_actor"])
       })
+    ]));
+    expect(local.transcript.writes).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ cell: { kind: "prop", object: "the_outline", name: "session_subscribers" } }),
+      expect.objectContaining({ cell: { kind: "prop", object: "the_outline", name: "subscribers" } })
     ]));
   });
 

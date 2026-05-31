@@ -17,8 +17,14 @@
 // retries) — not via per-envelope authority refresh.
 
 import { describe, expect, it } from "vitest";
-import { authoritySliceObjectIds } from "../src/core/authority-slice";
+import {
+  authoritySliceObjectIds,
+  buildSerializedAuthorityCellSlice,
+  combineSerializedAuthoritySlices,
+  serializedWorldFromAuthoritySlice
+} from "../src/core/authority-slice";
 import { createWorld } from "../src/core/bootstrap";
+import type { SerializedObject } from "../src/core/repository";
 
 describe("WooWorld.exportAuthoritySlice content contract", () => {
   it("includes the explicit root plus its parent class chain", () => {
@@ -117,4 +123,47 @@ describe("WooWorld.exportAuthoritySlice content contract", () => {
     const ids = new Set(authoritySliceObjectIds(slice));
     expect(ids.has("$dubspace")).toBe(true);
   });
+
+  it("lets later cell-page slices override earlier legacy object slices", () => {
+    // Mixed-format authority payloads happen when a sparse gateway contributes
+    // a local legacy row and a remote owner contributes newer cell pages. The
+    // combiner's precedence rule is slice order, not representation: the later
+    // owner row must win or movement planning can run against stale room
+    // contents while the commit authority validates against the fresh row.
+    const staleDeck = objectRecord("the_deck", ["the_hot_tub"]);
+    const freshDeck = objectRecord("the_deck", ["the_hot_tub", "the_towel", "the_pinboard", "the_horoscope"]);
+    const combined = combineSerializedAuthoritySlices([], [
+      { kind: "woo.authority_slice.shadow.v1", sessions: [], objects: [staleDeck] },
+      buildSerializedAuthorityCellSlice({
+        sessions: [],
+        objects: [freshDeck],
+        counters: { objectCounter: 1, parkedTaskCounter: 1, sessionCounter: 1 }
+      })
+    ]);
+    const serialized = serializedWorldFromAuthoritySlice(combined);
+    // Room contents are a derived set projection; merge precedence is about
+    // membership, not the array order chosen by the serialized view.
+    expect([...(serialized.objects.find((obj) => obj.id === "the_deck")?.contents ?? [])].sort()).toEqual([...freshDeck.contents].sort());
+  });
 });
+
+function objectRecord(id: string, contents: string[]): SerializedObject {
+  return {
+    id,
+    name: id,
+    parent: null,
+    anchor: null,
+    owner: "$wiz",
+    location: null,
+    flags: {},
+    created: 0,
+    modified: 0,
+    propertyDefs: [],
+    properties: [],
+    propertyVersions: [],
+    verbs: [],
+    children: [],
+    contents,
+    eventSchemas: []
+  };
+}

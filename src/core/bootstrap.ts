@@ -2,7 +2,7 @@ import { compileVerb } from "./authoring";
 import { installLocalCatalogs } from "./local-catalogs";
 import type { ObjectRepository, SeedWorld, SerializedObject, SerializedWorld, WorldRepository } from "./repository";
 import { hashSource } from "./source-hash";
-import type { MetricEvent, ObjRef, VerbDef, WooValue } from "./types";
+import type { MetricEvent, ObjRef, PresenceProjectionDef, VerbDef, WooValue } from "./types";
 import { valuesEqual } from "./types";
 import { normalizeVerbPerms } from "./verb-perms";
 import { WooWorld } from "./world";
@@ -809,14 +809,15 @@ function eventSchemasEqualIgnoringOrder(
  * the seed merge non-idempotent on production satellites whose stored defs
  * had bumped past the gateway's authoritative version. */
 function propertyDefEqualIgnoringVersion(
-  a: { name: string; owner: string; perms: string; typeHint?: string; defaultValue: WooValue },
-  b: { name: string; owner: string; perms: string; typeHint?: string; defaultValue: WooValue }
+  a: { name: string; owner: string; perms: string; typeHint?: string; defaultValue: WooValue; presenceProjection?: PresenceProjectionDef },
+  b: { name: string; owner: string; perms: string; typeHint?: string; defaultValue: WooValue; presenceProjection?: PresenceProjectionDef }
 ): boolean {
   if (a.name !== b.name) return false;
   if (a.owner !== b.owner) return false;
   if (a.perms !== b.perms) return false;
   if ((a.typeHint ?? null) !== (b.typeHint ?? null)) return false;
   if (!valuesEqual(a.defaultValue, b.defaultValue)) return false;
+  if (!valuesEqual((a.presenceProjection ?? null) as unknown as WooValue, (b.presenceProjection ?? null) as unknown as WooValue)) return false;
   return true;
 }
 
@@ -1090,8 +1091,8 @@ function seedUniversal(world: WooWorld): void {
   // a one-shot migration drops any own def/values on $player and its
   // descendants for upgraded worlds.
   define(world, "$space", "next_seq", 1, "int", "r");
-  define(world, "$space", "session_subscribers", [], "list<map>", "r");
-  define(world, "$space", "subscribers", [], "list<obj>", "r");
+  define(world, "$space", "session_subscribers", [], "list<map>", "r", { kind: "presence", key: "session", sessionField: "session", actorField: "actor" });
+  define(world, "$space", "subscribers", [], "list<obj>", "r", { kind: "presence", key: "actor" });
   define(world, "$space", "last_snapshot_seq", 0, "int", "r");
   define(world, "$space", "features", [], "list<obj>", "r");
   define(world, "$space", "features_version", 0, "int", "r");
@@ -1265,11 +1266,29 @@ function seedGuests(world: WooWorld): void {
   }
 }
 
-function define(world: WooWorld, obj: ObjRef, name: string, defaultValue: WooValue, typeHint: string, perms = "rw"): void {
+function define(
+  world: WooWorld,
+  obj: ObjRef,
+  name: string,
+  defaultValue: WooValue,
+  typeHint: string,
+  perms = "rw",
+  presenceProjection?: PresenceProjectionDef
+): void {
   const existing = world.object(obj).propertyDefs.get(name);
   if (existing) {
-    if (existing.typeHint !== typeHint || existing.perms !== perms) {
-      world.defineProperty(obj, { ...existing, typeHint, perms, version: existing.version + 1 });
+    if (
+      existing.typeHint !== typeHint ||
+      existing.perms !== perms ||
+      !valuesEqual((existing.presenceProjection ?? null) as unknown as WooValue, (presenceProjection ?? null) as unknown as WooValue)
+    ) {
+      world.defineProperty(obj, {
+        ...existing,
+        typeHint,
+        perms,
+        ...(presenceProjection ? { presenceProjection } : { presenceProjection: undefined }),
+        version: existing.version + 1
+      });
     }
     return;
   }
@@ -1278,7 +1297,8 @@ function define(world: WooWorld, obj: ObjRef, name: string, defaultValue: WooVal
     defaultValue,
     typeHint,
     owner: "$wiz",
-    perms
+    perms,
+    ...(presenceProjection ? { presenceProjection } : {})
   });
 }
 

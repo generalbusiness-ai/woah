@@ -33,7 +33,9 @@ import { decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "./shadow-en
 import { runShadowTurnCallTranscript, type ShadowTurnCall, type ShadowTurnCallTranscriptRun } from "./shadow-turn-call";
 import type { ShadowMissingAtom, ShadowTurnExecReply, ShadowTurnExecRequest } from "./shadow-turn-exec";
 import {
+  shadowLocationCommitScopeForTranscript,
   shadowPlacementTransactionForTranscript,
+  transcriptTouchedObjectIds,
   type ShadowCommitTransaction,
   type ShadowScopeHead
 } from "./shadow-commit-scope";
@@ -90,6 +92,7 @@ export type ExecutorEnvelopeBody = {
   authority: SerializedAuthoritySlice;
   envelope: string;
   execution_capsule?: ExecutionCapsule;
+  planned_transcript_commit?: boolean;
 };
 
 export type ExecutorEnvelopeResult = {
@@ -128,6 +131,7 @@ export type SubmitTurnIntentOptions<Client, Result extends ExecutorEnvelopeResul
   envelopeId?(turnId: string, attempt: number): string;
   authorityPayload(scope: ObjRef, extraObjectIds: ObjRef[]): ExecutorAuthorityPayload | Promise<ExecutorAuthorityPayload>;
   submitEnvelope(scope: ObjRef, body: ExecutorEnvelopeBody): Promise<Result>;
+  applyAuthority?(client: Client, authority: SerializedAuthoritySlice): void;
   authorityObjectIds?(input: ExecutorCallInput, commitScope: ObjRef): ObjRef[];
   intentScope?(input: ExecutorCallInput): ObjRef;
   planningScope?(input: ExecutorCallInput): ObjRef;
@@ -238,10 +242,17 @@ export function executorTransactionObjectIds(transaction: ShadowCommitTransactio
   return ids;
 }
 
+function executorTranscriptObjectIds(transcript: ShadowTurnCallTranscriptRun["transcript"]): ObjRef[] {
+  return Array.from(transcriptTouchedObjectIds(transcript)).sort();
+}
+
 export function executorReplyNeedsRepair(reply: ShadowTurnExecReply): boolean {
   if (reply.ok === true) return false;
   if (reply.reason === "missing_state") return true;
-  return reply.reason === "commit_rejected" && reply.commit?.reason === "stale_head";
+  if (reply.reason !== "commit_rejected") return false;
+  return reply.commit?.reason === "stale_head" ||
+    reply.commit?.reason === "read_version_mismatch" ||
+    reply.commit?.reason === "nondeterministic";
 }
 
 export function executorObjectIdsFromMissingState(reply: ShadowTurnExecReply): ObjRef[] {
@@ -255,6 +266,12 @@ export function executorObjectIdsFromMissingState(reply: ShadowTurnExecReply): O
   };
   for (const atom of reply.missing_atoms ?? []) push(executorObjectIdFromMissingAtom(atom));
   return ids;
+}
+
+function sameExecutorObjectIds(left: ObjRef[], right: ObjRef[]): boolean {
+  if (left.length !== right.length) return false;
+  const rightSet = new Set(right);
+  return left.every((id) => rightSet.has(id));
 }
 
 function executorObjectIdFromMissingAtom(atom: ShadowMissingAtom): ObjRef | null {
@@ -359,6 +376,7 @@ export function executorEnvelopeBody(input: {
   turn: ExecutorCallInput;
   authority: ExecutorAuthorityPayload;
   envelope: string;
+  plannedTranscriptCommit?: boolean;
 }): ExecutorEnvelopeBody {
   return {
     scope: input.scope,
@@ -369,7 +387,8 @@ export function executorEnvelopeBody(input: {
     sessions: input.authority.sessions,
     session_objects: input.authority.session_objects,
     authority: input.authority.authority,
-    envelope: input.envelope
+    envelope: input.envelope,
+    ...(input.plannedTranscriptCommit ? { planned_transcript_commit: true } : {})
   };
 }
 
@@ -401,6 +420,7 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
         repairObjectIds
       );
       const authority = await options.authorityPayload(submitScope, authorityObjectIds);
+      options.applyAuthority?.(client, authority.authority);
       const result = await options.submitEnvelope(submitScope, executorEnvelopeBody({
         scope: submitScope,
         node: options.clientNode(client),
@@ -471,15 +491,96 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       return await submitTurnIntent({ ...options, strategy: "intent" });
     }
 
-    const key = shadowTurnKeyFromTranscript(planned.transcript);
-    const transaction = shadowPlacementTransactionForTranscript(planned.transcript);
-    const transactionScope = transaction
+    let key = shadowTurnKeyFromTranscript(planned.transcript);
+    let transaction = shadowPlacementTransactionForTranscript(planned.transcript);
+    let locationCommitScope = shadowLocationCommitScopeForTranscript(planned.transcript);
+    let transactionScope = transaction
       ? options.transactionScopeForTranscript?.({ turn: options.input, planned, transaction }) ?? null
       : null;
-    const commitScope = transactionScope ?? key.scope;
-    const commitClient = commitScope === planningScope
+    let commitScope = transactionScope ?? locationCommitScope ?? key.scope;
+    let commitClient = commitScope === planningScope
       ? planningClient
       : await options.ensureClient(commitScope, attempt);
+    let authorityObjectIds = mergeExecutorObjectIds(
+      options.authorityObjectIds?.(options.input, commitScope)
+        ?? executorAuthorityObjectIds(options.input, commitScope),
+      repairObjectIds,
+      executorTranscriptObjectIds(planned.transcript),
+      executorTransactionObjectIds(transactionScope ? transaction : null)
+    );
+    let authority = await options.authorityPayload(commitScope, authorityObjectIds);
+    options.applyAuthority?.(commitClient, authority.authority);
+    if (commitClient !== planningClient) options.applyAuthority?.(planningClient, authority.authority);
+    if (transactionScope) {
+      // Legacy planned-transcript transaction path. The current movement model
+      // commits actor/object location cells directly, but the hook remains for
+      // older tests and future explicit multi-cell transactions.
+      const refreshedSerialized = options.clientSerialized?.(commitClient);
+      if (!refreshedSerialized) throw new Error("planned v2 turn gateway submission requires clientSerialized");
+      try {
+        planned = await runShadowTurnCallTranscript(refreshedSerialized, call, { onMetric: options.onMetric });
+      } catch (err) {
+        if (options.intentScope && options.intentScope(options.input) !== options.input.scope) {
+          return await submitTurnIntent({ ...options, strategy: "intent" });
+        }
+        throw err;
+      }
+      if (planned.frame.op === "error") {
+        return { kind: "local_frame", frame: planned.frame, call, planned };
+      }
+      if (planned.transcript.error && options.intentScope && options.intentScope(options.input) !== options.input.scope) {
+        return await submitTurnIntent({ ...options, strategy: "intent" });
+      }
+      key = shadowTurnKeyFromTranscript(planned.transcript);
+      transaction = shadowPlacementTransactionForTranscript(planned.transcript);
+      locationCommitScope = shadowLocationCommitScopeForTranscript(planned.transcript);
+      transactionScope = transaction
+        ? options.transactionScopeForTranscript?.({ turn: options.input, planned, transaction }) ?? null
+        : null;
+      commitScope = transactionScope ?? locationCommitScope ?? key.scope;
+      commitClient = commitScope === planningScope
+        ? planningClient
+        : await options.ensureClient(commitScope, attempt);
+      const refreshedAuthorityObjectIds = mergeExecutorObjectIds(
+        options.authorityObjectIds?.(options.input, commitScope)
+          ?? executorAuthorityObjectIds(options.input, commitScope),
+        repairObjectIds,
+        executorTranscriptObjectIds(planned.transcript),
+        executorTransactionObjectIds(transactionScope ? transaction : null)
+      );
+      if (!sameExecutorObjectIds(refreshedAuthorityObjectIds, authorityObjectIds)) {
+        authorityObjectIds = refreshedAuthorityObjectIds;
+        authority = await options.authorityPayload(commitScope, authorityObjectIds);
+        options.applyAuthority?.(commitClient, authority.authority);
+        if (commitClient !== planningClient) options.applyAuthority?.(planningClient, authority.authority);
+        const reserialized = options.clientSerialized?.(commitClient);
+        if (!reserialized) throw new Error("planned v2 turn gateway submission requires clientSerialized");
+        try {
+          planned = await runShadowTurnCallTranscript(reserialized, call, { onMetric: options.onMetric });
+        } catch (err) {
+          if (options.intentScope && options.intentScope(options.input) !== options.input.scope) {
+            return await submitTurnIntent({ ...options, strategy: "intent" });
+          }
+          throw err;
+        }
+        if (planned.frame.op === "error") {
+          return { kind: "local_frame", frame: planned.frame, call, planned };
+        }
+        if (planned.transcript.error && options.intentScope && options.intentScope(options.input) !== options.input.scope) {
+          return await submitTurnIntent({ ...options, strategy: "intent" });
+        }
+        key = shadowTurnKeyFromTranscript(planned.transcript);
+        transaction = shadowPlacementTransactionForTranscript(planned.transcript);
+        locationCommitScope = shadowLocationCommitScopeForTranscript(planned.transcript);
+        transactionScope = transaction
+          ? options.transactionScopeForTranscript?.({ turn: options.input, planned, transaction }) ?? null
+          : null;
+        commitScope = transactionScope ?? locationCommitScope ?? key.scope;
+        commitClient = commitScope === planningScope
+          ? planningClient
+          : await options.ensureClient(commitScope, attempt);
+      }
+    }
     const head = options.clientHead?.(commitClient);
     if (!head) throw new Error("planned v2 turn gateway submission requires clientHead");
     const request: ShadowTurnExecRequest = {
@@ -493,7 +594,11 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
         actor: options.input.actor,
         session: options.input.session
       },
-      persistence: options.input.persistence
+      persistence: options.input.persistence,
+      ...(transactionScope ? {
+        planned_transcript: planned.transcript,
+        planned_frame: planned.frame
+      } : {})
     };
     const envelope = encodeExecutorExecEnvelope({
       node: options.clientNode(commitClient),
@@ -502,19 +607,13 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       envelopeId: options.envelopeId?.(turnId, attempt),
       request
     });
-    const authorityObjectIds = mergeExecutorObjectIds(
-      options.authorityObjectIds?.(options.input, commitScope)
-        ?? executorAuthorityObjectIds(options.input, commitScope),
-      repairObjectIds,
-      executorTransactionObjectIds(transactionScope ? transaction : null)
-    );
-    const authority = await options.authorityPayload(commitScope, authorityObjectIds);
     const result = await options.submitEnvelope(commitScope, executorEnvelopeBody({
       scope: commitScope,
       node: options.clientNode(commitClient),
       turn: options.input,
       authority,
-      envelope
+      envelope,
+      plannedTranscriptCommit: Boolean(transactionScope || commitScope !== key.scope)
     }));
     const replyEnvelope = decodeExecutorReply(result.reply);
     if (replyEnvelope?.body && attempt + 1 < maxAttempts && shouldRetry(replyEnvelope.body)) {

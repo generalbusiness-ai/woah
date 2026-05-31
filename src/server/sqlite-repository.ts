@@ -19,6 +19,8 @@ import {
   flagsToSqlInt as flagsToInt,
   logEntryFromSqlRow as logEntryFromRow,
   parseSqlValue as parseValue,
+  propertyDefFromSqlRow,
+  propertyDefMetadataJson,
   sessionFromSqlRow as sessionFromRow,
   snapshotFromSqlRow as snapshotFromRow,
   SQL_DELETE_TABLES,
@@ -76,14 +78,7 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
       flags: flagsFromInt(Number(row.flags)),
       created: Number(row.created),
       modified: Number(row.modified),
-      propertyDefs: (propertyDefs.get(row.id) ?? []).map((def) => ({
-        name: def.name,
-        defaultValue: parseValue(def.default_val),
-        typeHint: def.type_hint ?? undefined,
-        owner: def.owner,
-        perms: def.perms,
-        version: Number(def.version)
-      })),
+      propertyDefs: (propertyDefs.get(row.id) ?? []).map((def) => propertyDefFromSqlRow(def)),
       properties: (propertyValues.get(row.id) ?? []).map((value) => [value.name, parseValue(value.value)]),
       propertyVersions: (propertyVersions.get(row.id) ?? []).map((version) => [version.name, Number(version.version)]),
       verbs: (verbs.get(row.id) ?? []).map(verbFromRow),
@@ -134,7 +129,7 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
       insertMeta.run("sessionCounter", String(world.sessionCounter));
 
       const insertObject = this.db.prepare("INSERT INTO object(id, name, parent, owner, location, anchor, flags, created, modified) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
-      const insertDef = this.db.prepare("INSERT INTO property_def(object_id, name, default_val, type_hint, owner, perms, version) VALUES (?, ?, ?, ?, ?, ?, ?)");
+      const insertDef = this.db.prepare("INSERT INTO property_def(object_id, name, default_val, type_hint, owner, perms, version, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
       const insertValue = this.db.prepare("INSERT INTO property_value(object_id, name, value) VALUES (?, ?, ?)");
       const insertVersion = this.db.prepare("INSERT INTO property_version(object_id, name, version) VALUES (?, ?, ?)");
       const insertVerb = this.db.prepare("INSERT INTO verb(object_id, slot, name, kind, aliases, owner, perms, arg_spec, source, source_hash, version, line_map, native, bytecode, flags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
@@ -144,7 +139,7 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
 
       for (const obj of world.objects) {
         insertObject.run(obj.id, obj.name, obj.parent, obj.owner, obj.location, obj.anchor, flagsToInt(obj.flags), obj.created, obj.modified);
-        for (const def of obj.propertyDefs) insertDef.run(obj.id, def.name, stringifyValue(def.defaultValue), def.typeHint ?? null, def.owner, def.perms, def.version);
+        for (const def of obj.propertyDefs) insertDef.run(obj.id, def.name, stringifyValue(def.defaultValue), def.typeHint ?? null, def.owner, def.perms, def.version, propertyDefMetadataJson(def));
         for (const [name, value] of obj.properties) insertValue.run(obj.id, name, stringifyValue(value));
         for (const [name, version] of obj.propertyVersions) insertVersion.run(obj.id, name, version);
         for (const [index, verb] of obj.verbs.entries()) insertVerb.run(obj.id, verb.slot ?? index + 1, verb.name, verb.kind, stringifyValue(verb.aliases), verb.owner, verb.perms, stringifyValue(verb.arg_spec), verb.source, verb.source_hash, verb.version, stringifyValue(verb.line_map), verb.kind === "native" ? verb.native : null, verb.kind === "bytecode" ? stringifyValue(verb.bytecode as unknown as WooValue) : null, verbFlagsJson(verb));
@@ -214,14 +209,7 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
       flags: flagsFromInt(Number(row.flags)),
       created: Number(row.created),
       modified: Number(row.modified),
-      propertyDefs: (this.db.prepare("SELECT * FROM property_def WHERE object_id = ? ORDER BY name").all(id) as Row[]).map((def) => ({
-        name: def.name,
-        defaultValue: parseValue(def.default_val),
-        typeHint: def.type_hint ?? undefined,
-        owner: def.owner,
-        perms: def.perms,
-        version: Number(def.version)
-      })),
+      propertyDefs: (this.db.prepare("SELECT * FROM property_def WHERE object_id = ? ORDER BY name").all(id) as Row[]).map((def) => propertyDefFromSqlRow(def)),
       properties: (this.db.prepare("SELECT * FROM property_value WHERE object_id = ? ORDER BY name").all(id) as Row[]).map((value) => [value.name, parseValue(value.value)]),
       propertyVersions: (this.db.prepare("SELECT * FROM property_version WHERE object_id = ? ORDER BY name").all(id) as Row[]).map((version) => [version.name, Number(version.version)]),
       verbs: (this.db.prepare("SELECT * FROM verb WHERE object_id = ? ORDER BY slot").all(id) as Row[]).map(verbFromRow),
@@ -239,8 +227,8 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
         .run(obj.id, obj.name, obj.parent, obj.owner, obj.location, obj.anchor, flagsToInt(obj.flags), obj.created, obj.modified);
       for (const def of obj.propertyDefs) {
         this.db
-          .prepare("INSERT INTO property_def(object_id, name, default_val, type_hint, owner, perms, version) VALUES (?, ?, ?, ?, ?, ?, ?)")
-          .run(obj.id, def.name, stringifyValue(def.defaultValue), def.typeHint ?? null, def.owner, def.perms, def.version);
+          .prepare("INSERT INTO property_def(object_id, name, default_val, type_hint, owner, perms, version, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+          .run(obj.id, def.name, stringifyValue(def.defaultValue), def.typeHint ?? null, def.owner, def.perms, def.version, propertyDefMetadataJson(def));
       }
       for (const [name, value] of obj.properties) this.db.prepare("INSERT INTO property_value(object_id, name, value) VALUES (?, ?, ?)").run(obj.id, name, stringifyValue(value));
       for (const [name, version] of obj.propertyVersions) this.db.prepare("INSERT INTO property_version(object_id, name, version) VALUES (?, ?, ?)").run(obj.id, name, version);
@@ -268,12 +256,7 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
       name,
       def: def
         ? {
-            name,
-            defaultValue: parseValue(def.default_val),
-            typeHint: def.type_hint ?? undefined,
-            owner: def.owner,
-            perms: def.perms,
-            version: Number(def.version)
+            ...propertyDefFromSqlRow(def, name)
           }
         : null,
       value: value ? parseValue(value.value) : undefined,
@@ -285,8 +268,8 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
     this.ensureHostedObject(id);
     if (prop.def) {
       this.db
-        .prepare("INSERT OR REPLACE INTO property_def(object_id, name, default_val, type_hint, owner, perms, version) VALUES (?, ?, ?, ?, ?, ?, ?)")
-        .run(id, prop.name, stringifyValue(prop.def.defaultValue), prop.def.typeHint ?? null, prop.def.owner, prop.def.perms, prop.def.version);
+        .prepare("INSERT OR REPLACE INTO property_def(object_id, name, default_val, type_hint, owner, perms, version, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+        .run(id, prop.name, stringifyValue(prop.def.defaultValue), prop.def.typeHint ?? null, prop.def.owner, prop.def.perms, prop.def.version, propertyDefMetadataJson(prop.def));
     } else {
       this.db.prepare("DELETE FROM property_def WHERE object_id = ? AND name = ?").run(id, prop.name);
     }
@@ -553,7 +536,15 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
       this.recreateLocalDatabase(tables);
     }
     this.db.exec(SQL_SCHEMA_SCRIPT);
+    this.ensurePropertyDefMetadataColumn();
     this.db.exec(`PRAGMA user_version = ${LOCAL_SQLITE_SCHEMA_VERSION}`);
+  }
+
+  private ensurePropertyDefMetadataColumn(): void {
+    const columns = (this.db.prepare("PRAGMA table_info(property_def)").all() as Row[]).map((row) => String(row.name));
+    if (!columns.includes("metadata")) {
+      this.db.exec("ALTER TABLE property_def ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'");
+    }
   }
 
   private userTableNames(): string[] {

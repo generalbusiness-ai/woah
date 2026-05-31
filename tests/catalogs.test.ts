@@ -528,6 +528,39 @@ describe("local catalogs", () => {
     });
   });
 
+  it("installs presence projection property metadata from catalog manifests", () => {
+    const world = createWorld({ catalogs: false });
+    const manifest: RuntimeCatalogManifest = {
+      name: "presence-projection-demo",
+      version: "1.0.0",
+      spec_version: "v1",
+      classes: [
+        {
+          local_name: "$presence_projection_probe",
+          parent: "$space",
+          properties: [
+            {
+              name: "custom_session_roster",
+              type: "list<map>",
+              default: [],
+              perms: "r",
+              presence_projection: { key: "session", session_field: "sid", actor_field: "who" }
+            }
+          ]
+        }
+      ]
+    };
+
+    installCatalogManifest(world, manifest, { tap: "@local", alias: "presence-projection-demo" });
+
+    expect(world.object("$presence_projection_probe").propertyDefs.get("custom_session_roster")?.presenceProjection).toEqual({
+      kind: "presence",
+      key: "session",
+      sessionField: "sid",
+      actorField: "who"
+    });
+  });
+
   it("gates major catalog updates behind explicit migration input", async () => {
     const world = createWorld({ catalogs: false });
     const v1: RuntimeCatalogManifest = {

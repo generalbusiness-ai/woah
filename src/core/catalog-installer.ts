@@ -1,6 +1,6 @@
 import { analyzeBytecodePurity, combineVerbPurity, compileVerb, findUnresolvedThisCalls, propagateVerbPurity } from "./authoring";
 import { hashSource } from "./source-hash";
-import { wooError, type ErrorValue, type ObjRef, type TinyBytecode, type VerbCallSite, type VerbDef, type WooValue } from "./types";
+import { wooError, type ErrorValue, type ObjRef, type PresenceProjectionDef, type TinyBytecode, type VerbCallSite, type VerbDef, type WooValue } from "./types";
 import { normalizeVerbPerms } from "./verb-perms";
 import type { WooWorld } from "./world";
 
@@ -53,7 +53,12 @@ type CatalogPropertyDef = {
   type?: string;
   default?: WooValue;
   perms?: string;
+  presence_projection?: CatalogPresenceProjectionDef;
 };
+
+type CatalogPresenceProjectionDef =
+  | { key: "actor" }
+  | { key: "session"; session_field?: string; actor_field?: string };
 
 type CatalogVerbDef = {
   name: string;
@@ -344,10 +349,12 @@ export function catalogManifestStatus(world: WooWorld, manifest: CatalogManifest
         continue;
       }
       const expectedDefault = property.default ?? null;
+      const expectedPresenceProjection = catalogPresenceProjection(property);
       if (
         actual.perms !== (property.perms ?? "rw") ||
         actual.typeHint !== (property.type ?? null) ||
-        stableStringify(actual.defaultValue) !== stableStringify(expectedDefault)
+        stableStringify(actual.defaultValue) !== stableStringify(expectedDefault) ||
+        stableStringify(actual.presenceProjection ?? null) !== stableStringify(expectedPresenceProjection ?? null)
       ) {
         issues.push({
           severity: "warning",
@@ -355,8 +362,8 @@ export function catalogManifestStatus(world: WooWorld, manifest: CatalogManifest
           object: def.local_name,
           property: property.name,
         message: `${def.local_name}.${property.name} property definition differs from manifest`,
-          expected: { perms: property.perms ?? "rw", type_hint: property.type ?? null, default: expectedDefault } as WooValue,
-          actual: { perms: actual.perms, type_hint: actual.typeHint ?? null, default: actual.defaultValue } as WooValue
+          expected: { perms: property.perms ?? "rw", type_hint: property.type ?? null, default: expectedDefault, presence_projection: expectedPresenceProjection ?? null } as WooValue,
+          actual: { perms: actual.perms, type_hint: actual.typeHint ?? null, default: actual.defaultValue, presence_projection: actual.presenceProjection ?? null } as WooValue
         });
       }
     }
@@ -1005,13 +1012,15 @@ function applyCatalogSchemaPlanStep(
 function upsertPropertyDef(world: WooWorld, obj: ObjRef, property: CatalogPropertyDef, owner: ObjRef): void {
   const target = world.object(obj);
   const expectedDefault = property.default ?? null;
+  const presenceProjection = catalogPresenceProjection(property);
   const existing = target.propertyDefs.get(property.name);
   if (
     existing &&
     existing.owner === owner &&
     existing.perms === (property.perms ?? "rw") &&
     (existing.typeHint ?? null) === (property.type ?? null) &&
-    stableStringify(existing.defaultValue) === stableStringify(expectedDefault)
+    stableStringify(existing.defaultValue) === stableStringify(expectedDefault) &&
+    stableStringify(existing.presenceProjection ?? null) === stableStringify(presenceProjection ?? null)
   ) return;
   world.defineProperty(obj, {
     name: property.name,
@@ -1019,8 +1028,24 @@ function upsertPropertyDef(world: WooWorld, obj: ObjRef, property: CatalogProper
     typeHint: property.type,
     owner,
     perms: property.perms ?? "rw",
-    version: existing ? existing.version + 1 : 1
+    version: existing ? existing.version + 1 : 1,
+    ...(presenceProjection ? { presenceProjection } : {})
   });
+}
+
+function catalogPresenceProjection(property: CatalogPropertyDef): PresenceProjectionDef | undefined {
+  const raw = property.presence_projection;
+  if (!raw) return undefined;
+  if (raw.key === "actor") return { kind: "presence", key: "actor" };
+  if (raw.key === "session") {
+    return {
+      kind: "presence",
+      key: "session",
+      sessionField: raw.session_field ?? "session",
+      actorField: raw.actor_field ?? "actor"
+    };
+  }
+  return undefined;
 }
 
 function catalogSchemaStepTarget(step: CatalogSchemaPlanStep): string {
@@ -1202,12 +1227,14 @@ function isStringMap(value: WooValue): value is Record<string, WooValue> {
 function installProperty(world: WooWorld, obj: ObjRef, property: CatalogPropertyDef, owner: ObjRef): void {
   const target = world.object(obj);
   if (target.propertyDefs.has(property.name)) return;
+  const presenceProjection = catalogPresenceProjection(property);
   world.defineProperty(obj, {
     name: property.name,
     defaultValue: property.default ?? null,
     typeHint: property.type,
     owner,
-    perms: property.perms ?? "rw"
+    perms: property.perms ?? "rw",
+    ...(presenceProjection ? { presenceProjection } : {})
   });
 }
 

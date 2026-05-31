@@ -61,6 +61,18 @@ export type RemoteToolRequest = {
   contentsProjection?: RemoteToolProjection;
 };
 
+export type PresenceProjectionDef =
+  | {
+      kind: "presence";
+      key: "actor";
+    }
+  | {
+      kind: "presence";
+      key: "session";
+      sessionField: string;
+      actorField: string;
+    };
+
 // Per spec/semantics/events.md §12.7.1, directed observations route by an
 // explicit recipient field rather than by audience-space presence. The set
 // is closed in v1; additions here require a spec update so transports stay
@@ -221,6 +233,7 @@ export type PropertyDef = {
   owner: ObjRef;
   perms: string;
   version: number;
+  presenceProjection?: PresenceProjectionDef;
 };
 
 export type WooObject = {

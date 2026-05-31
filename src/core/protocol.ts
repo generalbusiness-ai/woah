@@ -461,9 +461,9 @@ export function restFrameFromTurnReply(scope: ObjRef, reply: ShadowTurnExecReply
     return {
       op: "applied",
       id: reply.id,
-      // MV-A placement commits may be fenced through a generic commit scope
-      // such as #placement. REST's AppliedFrame.space is the caller-visible
-      // turn/log scope, not the internal transaction authority.
+      // REST's AppliedFrame.space is the caller-visible turn/log scope, not
+      // necessarily the internal commit authority (for example, actor-location
+      // movement commits).
       space: reply.transcript.scope,
       // REST AppliedFrame.seq names the user-visible sequenced log row, not
       // the v2 commit-scope head. Clients use it with /api/objects/:id/log.
@@ -506,7 +506,11 @@ function turnReplyError(reply: ShadowTurnExecReply): ErrorValue {
   if (commitReason === "stale_head") {
     return wooError("E_CONFLICT", "v2 REST turn conflicted with the current scope head", { reason: commitReason });
   }
-  return wooError("E_INTERNAL", `v2 REST turn failed: ${reply.reason}`, { reason: reply.reason, commit_reason: commitReason ?? null });
+  return wooError("E_INTERNAL", `v2 REST turn failed: ${reply.reason}`, {
+    reason: reply.reason,
+    commit_reason: commitReason ?? null,
+    ...(reply.reason === "commit_rejected" && reply.commit ? { errors: reply.commit.errors } : {})
+  });
 }
 
 function jsonProtocol(body: unknown, status = 200, headers?: Record<string, string>): RestProtocolResult {

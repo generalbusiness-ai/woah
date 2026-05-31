@@ -38,6 +38,8 @@ import {
   flagsToSqlInt as flagsToInt,
   logEntryFromSqlRow as logEntryFromRow,
   parseSqlValue as parseValue,
+  propertyDefFromSqlRow,
+  propertyDefMetadataJson,
   sessionFromSqlRow as sessionFromRow,
   snapshotFromSqlRow as snapshotFromRow,
   SQL_DELETE_TABLES,
@@ -129,14 +131,7 @@ export class CFObjectRepository implements ObjectRepository, WorldRepository {
         flags: flagsFromInt(Number(row.flags)),
         created: Number(row.created),
         modified: Number(row.modified),
-        propertyDefs: (propertyDefs.get(String(row.id)) ?? []).map((def) => ({
-          name: String(def.name),
-          defaultValue: parseValue(String(def.default_val)),
-          typeHint: def.type_hint == null ? undefined : String(def.type_hint),
-          owner: String(def.owner),
-          perms: String(def.perms),
-          version: Number(def.version)
-        })),
+        propertyDefs: (propertyDefs.get(String(row.id)) ?? []).map((def) => propertyDefFromSqlRow(def)),
         properties: (propertyValues.get(String(row.id)) ?? []).map(
           (value) => [String(value.name), parseValue(String(value.value))] as [string, WooValue]
         ),
@@ -309,14 +304,7 @@ export class CFObjectRepository implements ObjectRepository, WorldRepository {
       flags: flagsFromInt(Number(row.flags)),
       created: Number(row.created),
       modified: Number(row.modified),
-      propertyDefs: this.all("SELECT * FROM property_def WHERE object_id = ? ORDER BY name", id).map((def) => ({
-        name: String(def.name),
-        defaultValue: parseValue(String(def.default_val)),
-        typeHint: def.type_hint == null ? undefined : String(def.type_hint),
-        owner: String(def.owner),
-        perms: String(def.perms),
-        version: Number(def.version)
-      })),
+      propertyDefs: this.all("SELECT * FROM property_def WHERE object_id = ? ORDER BY name", id).map((def) => propertyDefFromSqlRow(def)),
       properties: this.all("SELECT * FROM property_value WHERE object_id = ? ORDER BY name", id).map(
         (value) => [String(value.name), parseValue(String(value.value))] as [string, WooValue]
       ),
@@ -341,8 +329,8 @@ export class CFObjectRepository implements ObjectRepository, WorldRepository {
       );
       for (const def of obj.propertyDefs) {
         this.sql.exec(
-          "INSERT INTO property_def(object_id, name, default_val, type_hint, owner, perms, version) VALUES (?, ?, ?, ?, ?, ?, ?)",
-          obj.id, def.name, stringifyValue(def.defaultValue), def.typeHint ?? null, def.owner, def.perms, def.version
+          "INSERT INTO property_def(object_id, name, default_val, type_hint, owner, perms, version, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          obj.id, def.name, stringifyValue(def.defaultValue), def.typeHint ?? null, def.owner, def.perms, def.version, propertyDefMetadataJson(def)
         );
       }
       for (const [name, value] of obj.properties) {
@@ -377,12 +365,7 @@ export class CFObjectRepository implements ObjectRepository, WorldRepository {
       name,
       def: def
         ? {
-            name,
-            defaultValue: parseValue(String(def.default_val)),
-            typeHint: def.type_hint == null ? undefined : String(def.type_hint),
-            owner: String(def.owner),
-            perms: String(def.perms),
-            version: Number(def.version)
+            ...propertyDefFromSqlRow(def, name)
           }
         : null,
       value: value ? parseValue(String(value.value)) : undefined,
@@ -394,8 +377,8 @@ export class CFObjectRepository implements ObjectRepository, WorldRepository {
     this.ensureHostedObject(id);
     if (prop.def) {
       this.sql.exec(
-        "INSERT OR REPLACE INTO property_def(object_id, name, default_val, type_hint, owner, perms, version) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        id, prop.name, stringifyValue(prop.def.defaultValue), prop.def.typeHint ?? null, prop.def.owner, prop.def.perms, prop.def.version
+        "INSERT OR REPLACE INTO property_def(object_id, name, default_val, type_hint, owner, perms, version, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        id, prop.name, stringifyValue(prop.def.defaultValue), prop.def.typeHint ?? null, prop.def.owner, prop.def.perms, prop.def.version, propertyDefMetadataJson(prop.def)
       );
     } else {
       this.sql.exec("DELETE FROM property_def WHERE object_id = ? AND name = ?", id, prop.name);
@@ -751,6 +734,14 @@ export class CFObjectRepository implements ObjectRepository, WorldRepository {
     // CF Workers SQL doesn't support multi-statement exec in one call, so each
     // CREATE TABLE / CREATE INDEX runs separately.
     for (const stmt of SQL_SCHEMA_STATEMENTS) this.sql.exec(stmt);
+    this.ensurePropertyDefMetadataColumn();
+  }
+
+  private ensurePropertyDefMetadataColumn(): void {
+    const columns = this.all("PRAGMA table_info(property_def)").map((row) => String(row.name));
+    if (!columns.includes("metadata")) {
+      this.sql.exec("ALTER TABLE property_def ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'");
+    }
   }
 
   private emitMetric(event: MetricEvent): void {

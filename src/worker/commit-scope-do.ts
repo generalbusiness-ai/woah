@@ -54,6 +54,8 @@ import { hashSource } from "../core/source-hash";
 import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import type { MetricEvent, ObjRef, WooValue } from "../core/types";
 import { wooError } from "../core/types";
+import { statusForError } from "../core/protocol";
+import { normalizeError } from "../core/world";
 import {
   browserProfileOpenTransferFromAuthority,
   browserProfileProjectionContext,
@@ -490,7 +492,8 @@ export class CommitScopeDO {
       const fields = metricErrorFields(err);
       handlerError = fields.error;
       handlerErrorDetail = fields.error_detail;
-      throw err;
+      const error = normalizeError(err);
+      return jsonResponse({ error }, statusForError(error));
     } finally {
       this.emitMetric({
         kind: "do_handler",

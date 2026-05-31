@@ -16,6 +16,7 @@ import {
   type MetricEvent,
   type Observation,
   type ObjRef,
+  type PresenceProjectionDef,
   type PropertyDef,
   type RemoteToolDescriptor,
   type RemoteToolRequest,
@@ -78,6 +79,7 @@ type ShadowGatewayApplyOptions = {
 
 type ProjectionApplyOptions = {
   persist?: boolean;
+  persistCreated?: boolean;
   transcript?: EffectTranscript;
 };
 
@@ -1181,7 +1183,7 @@ export class WooWorld {
       // Catalog migrations that add presence properties with a
       // non-empty default would otherwise bypass setPropLocal. Invalidate
       // rather than incrementally updating.
-      if (property.name === "subscribers" || property.name === "session_subscribers") {
+      if (property.presenceProjection) {
         this.invalidatePresenceIndex();
       }
     }
@@ -1214,38 +1216,43 @@ export class WooWorld {
     const before = obj.properties.get(name);
     const hadValue = obj.properties.has(name);
     const beforeVersion = this.propertyVersionForRecording(objRef, name);
+    const presenceProjection = this.presenceProjectionForProperty(objRef, name);
     if (obj.properties.has(name) && valuesEqual(before as WooValue, value)) {
-      this.recordTurnEvent({
-        kind: "prop_write",
-        object: objRef,
-        name,
-        hadValue,
-        before: cloneValue(before as WooValue),
-        after: cloneValue(value),
-        changed: false,
-        beforeVersion,
-        afterVersion: beforeVersion
-      });
+      if (!presenceProjection) {
+        this.recordTurnEvent({
+          kind: "prop_write",
+          object: objRef,
+          name,
+          hadValue,
+          before: cloneValue(before as WooValue),
+          after: cloneValue(value),
+          changed: false,
+          beforeVersion,
+          afterVersion: beforeVersion
+        });
+      }
       return false;
     }
     obj.properties.set(name, cloneValue(value));
     obj.propertyVersions.set(name, (obj.propertyVersions.get(name) ?? 0) + 1);
     const afterVersion = this.propertyVersionForRecording(objRef, name);
     obj.modified = Date.now();
-    if (name === "subscribers" || name === "session_subscribers") {
+    if (presenceProjection) {
       this.invalidatePresenceIndex();
     }
-    this.recordTurnEvent({
-      kind: "prop_write",
-      object: objRef,
-      name,
-      hadValue,
-      ...(hadValue ? { before: cloneValue(before as WooValue) } : {}),
-      after: cloneValue(value),
-      changed: true,
-      beforeVersion,
-      afterVersion
-    });
+    if (!presenceProjection) {
+      this.recordTurnEvent({
+        kind: "prop_write",
+        object: objRef,
+        name,
+        hadValue,
+        ...(hadValue ? { before: cloneValue(before as WooValue) } : {}),
+        after: cloneValue(value),
+        changed: true,
+        beforeVersion,
+        afterVersion
+      });
+    }
     return true;
   }
 
@@ -1260,6 +1267,20 @@ export class WooWorld {
     this.actorPresenceIndex.clear();
     this.sessionSubscribersIndex.clear();
     this.sessionSpacesIndex.clear();
+  }
+
+  private presenceProjectionForProperty(objRef: ObjRef, name: string): PresenceProjectionDef | null {
+    return this.presenceProjectionForObjectRecord(this.object(objRef), name);
+  }
+
+  private presenceProjectionForObjectRecord(obj: WooObject, name: string): PresenceProjectionDef | null {
+    let current: WooObject | null = obj;
+    while (current) {
+      const def = current.propertyDefs.get(name);
+      if (def?.presenceProjection) return def.presenceProjection;
+      current = current.parent ? this.objects.get(current.parent) ?? null : null;
+    }
+    return null;
   }
 
   private ensurePresenceIndex(): void {
@@ -1309,6 +1330,7 @@ export class WooWorld {
   deleteProp(objRef: ObjRef, name: string): boolean {
     this.assertOrdinaryPropertyName(name);
     const obj = this.object(objRef);
+    const wasPresenceProjection = this.presenceProjectionForObjectRecord(obj, name) !== null;
     const hadDef = obj.propertyDefs.delete(name);
     const hadValue = obj.properties.delete(name);
     const hadVersion = obj.propertyVersions.delete(name);
@@ -1316,7 +1338,7 @@ export class WooWorld {
     if (!hadProperty) return false;
     obj.modified = Date.now();
     this.deletePersistedProperty(objRef, name);
-    if (name === "subscribers" || name === "session_subscribers") {
+    if (wasPresenceProjection) {
       this.invalidatePresenceIndex();
     }
     this.persist();
@@ -5650,17 +5672,9 @@ export class WooWorld {
    */
   mirrorContents(containerRef: ObjRef, objRef: ObjRef, present: boolean): void {
     const container = this.object(containerRef);
-    const prior = this.structuralVersionForRecording("contents", containerRef);
     if (present) container.contents.add(objRef);
     else container.contents.delete(objRef);
     container.modified = Date.now();
-    this.recordTurnEvent({
-      kind: "cell_write",
-      cell: { kind: "contents", object: containerRef },
-      value: Array.from(container.contents),
-      op: present ? "add" : "remove",
-      prior
-    });
     this.persistObject(containerRef);
     this.persist();
   }
@@ -5672,31 +5686,15 @@ export class WooWorld {
     // hot, maintain a local contents reverse index instead.
     for (const obj of this.objects.values()) {
       if (!obj.contents.delete(objRef)) continue;
-      const prior = this.structuralVersionForRecording("contents", obj.id);
       obj.modified = Date.now();
-      this.recordTurnEvent({
-        kind: "cell_write",
-        cell: { kind: "contents", object: obj.id },
-        value: Array.from(obj.contents),
-        op: "remove",
-        prior
-      });
       this.persistObject(obj.id);
       changed = true;
     }
     if (this.objects.has(targetRef)) {
       const target = this.object(targetRef);
       if (!target.contents.has(objRef)) {
-        const prior = this.structuralVersionForRecording("contents", targetRef);
         target.contents.add(objRef);
         target.modified = Date.now();
-        this.recordTurnEvent({
-          kind: "cell_write",
-          cell: { kind: "contents", object: targetRef },
-          value: Array.from(target.contents),
-          op: "add",
-          prior
-        });
         this.persistObject(targetRef);
         changed = true;
       }
@@ -6644,8 +6642,9 @@ export class WooWorld {
             const object = this.objectFromSerializedRow(write.row);
             if (existing && options.transcript) this.mergeScopedProjectionObject(object, existing, write.key, options.transcript);
             this.objects.set(write.key, object);
-            if (persist) this.persistProjectionObjectWrite(write.key, options.transcript, existing === undefined);
+            if (persist || (existing === undefined && options.persistCreated === true)) this.persistProjectionObjectWrite(write.key, options.transcript, existing === undefined);
             else this.invalidateProjectionObjectCache(write.key);
+            if (existing === undefined) result.creates += 1;
           }
           result.objects += 1;
           break;
@@ -6722,7 +6721,13 @@ export class WooWorld {
       sawContentsWrite = true;
       contents = applyTranscriptContentsWriteRefs(contents, write, transcript, (event) => this.recordMetric(event));
     }
-    target.contents = new Set(sawContentsWrite ? contents : Array.from(existing.contents));
+    if (!sawContentsWrite) {
+      for (const move of transcript.moves) {
+        if (move.from === id && move.from !== move.to) contents = contents.filter((member) => member !== move.object);
+        if (move.to === id && !contents.includes(move.object)) contents = [...contents, move.object].sort();
+      }
+    }
+    target.contents = new Set(contents);
 
     const children = new Set(existing.children);
     for (const create of transcript.creates) {
@@ -6976,6 +6981,16 @@ export class WooWorld {
       this.applyTranscriptWriteInPlace(write, objectTimestamp, transcript);
       touchedObjects.add(write.cell.object);
     }
+    for (const move of transcript.moves) {
+      if (move.from && move.from !== move.to && !skippedHostPredicates?.belongsHere(move.from)) {
+        this.objects.get(move.from)?.contents.delete(move.object);
+        touchedObjects.add(move.from);
+      }
+      if (!skippedHostPredicates?.belongsHere(move.to)) {
+        this.objects.get(move.to)?.contents.add(move.object);
+        touchedObjects.add(move.to);
+      }
+    }
     profile?.("apply_writes", stepStartedAt);
 
     // Export paths sort object/log rows for deterministic snapshots. Keep the
@@ -7098,11 +7113,12 @@ export class WooWorld {
     // Keep this parallel with applyPropWrite in shadow-commit-scope.ts.
     if (write.cell.kind !== "prop") return;
     const propName = write.cell.name;
+    const presenceProjection = this.presenceProjectionForObjectRecord(target, propName);
     if (write.op === "remove") {
       target.properties.delete(propName);
       target.propertyVersions.delete(propName);
       target.modified = objectTimestamp;
-      if (propName === "subscribers" || propName === "session_subscribers") this.invalidatePresenceIndex();
+      if (presenceProjection) this.invalidatePresenceIndex();
       return;
     }
     const value = cloneValue(write.value);
@@ -7116,7 +7132,7 @@ export class WooWorld {
     target.propertyVersions.set(propName, version);
     target.propertyVersions = sortedMap(target.propertyVersions);
     target.modified = objectTimestamp;
-    if (propName === "subscribers" || propName === "session_subscribers") this.invalidatePresenceIndex();
+    if (presenceProjection) this.invalidatePresenceIndex();
   }
 
   // Clone a verb's mutable wrapper fields (aliases, arg_spec, source, line_map,
@@ -8041,16 +8057,13 @@ export class WooWorld {
     this.object(targetRef);
     const oldLocation = obj.location;
     const locationPrior = this.structuralVersionForRecording("location", objRef);
-    let oldContentsPrior: string | undefined;
     if (oldLocation && this.objects.has(oldLocation)) {
       const oldContainer = this.object(oldLocation);
-      oldContentsPrior = this.structuralVersionForRecording("contents", oldLocation);
       oldContainer.contents.delete(objRef);
       oldContainer.modified = Date.now();
     }
     obj.location = targetRef;
     const target = this.object(targetRef);
-    const targetContentsPrior = this.structuralVersionForRecording("contents", targetRef);
     target.contents.add(objRef);
     target.modified = Date.now();
     obj.modified = Date.now();
@@ -8064,22 +8077,6 @@ export class WooWorld {
       value: targetRef,
       op: "move",
       prior: locationPrior
-    });
-    if (oldLocation && oldContentsPrior !== undefined) {
-      this.recordTurnEvent({
-        kind: "cell_write",
-        cell: { kind: "contents", object: oldLocation },
-        value: Array.from(this.object(oldLocation).contents),
-        op: "remove",
-        prior: oldContentsPrior
-      });
-    }
-    this.recordTurnEvent({
-      kind: "cell_write",
-      cell: { kind: "contents", object: targetRef },
-      value: Array.from(target.contents),
-      op: "add",
-      prior: targetContentsPrior
     });
   }
 

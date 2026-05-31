@@ -649,6 +649,16 @@ authoritative until the applier grows those cell kinds.
 
 ### VTN8.1 Movement is a placement transaction
 
+> **SUPERSEDED — do not implement.** The MV-A fenced placement transaction and
+> the synthetic `#placement` commit scope below are withdrawn. They produced a
+> production regression (a commit scope with no durable snapshot) and, more
+> fundamentally, kept room membership as one mutable shared cell that many
+> actors must write — a serialization point outside the room and actor
+> sequencers. The replacement is [cell-authority.md](cell-authority.md):
+> `live:location:<object>` is the single authoritative movement write, owned by
+> the moved object's home; room contents are a per-member projection. This
+> subsection is retained only as a record of the withdrawn approach.
+
 Moving an actor or object between rooms is not a single-cell write. The
 prototype confirms it touches at least three cells across two scopes: the
 moved object's `location`, the source room's `contents`, and the destination
