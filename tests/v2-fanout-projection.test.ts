@@ -55,19 +55,24 @@ describe("affectedTranscriptScopes", () => {
     expect(affectedTranscriptScopes("origin_scope", transcript)).toContain("the_pinboard");
   });
 
-  it("adds contents-write objects and subscriber-prop objects, ignores unrelated prop writes", () => {
+  it("adds contents writes and metadata-declared presence projection props, ignores unrelated prop writes", () => {
     const transcript = makeTranscript({
       writes: [
         { cell: { kind: "contents", object: "the_lobby" }, value: [] } as unknown as EffectTranscript["writes"][number],
-        { cell: { kind: "prop", object: "the_chatroom", name: "session_subscribers" }, value: [] } as unknown as EffectTranscript["writes"][number],
-        { cell: { kind: "prop", object: "the_deck", name: "subscribers" }, value: [] } as unknown as EffectTranscript["writes"][number],
+        { cell: { kind: "prop", object: "the_chatroom", name: "custom_session_roster" }, value: [] } as unknown as EffectTranscript["writes"][number],
+        { cell: { kind: "prop", object: "the_deck", name: "custom_actor_roster" }, value: [] } as unknown as EffectTranscript["writes"][number],
+        { cell: { kind: "prop", object: "legacy_room", name: "subscribers" }, value: [] } as unknown as EffectTranscript["writes"][number],
         { cell: { kind: "prop", object: "guest_1", name: "name" }, value: "Alice" } as unknown as EffectTranscript["writes"][number]
       ]
     });
-    const result = affectedTranscriptScopes("origin_scope", transcript);
+    const result = affectedTranscriptScopes("origin_scope", transcript, (object, property) =>
+      (object === "the_chatroom" && property === "custom_session_roster") ||
+      (object === "the_deck" && property === "custom_actor_roster")
+    );
     expect(result).toContain("the_lobby");
     expect(result).toContain("the_chatroom");
     expect(result).toContain("the_deck");
+    expect(result).not.toContain("legacy_room");
     expect(result).not.toContain("guest_1");
   });
 

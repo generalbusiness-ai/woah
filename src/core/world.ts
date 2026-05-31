@@ -914,6 +914,14 @@ export class WooWorld {
     return DEFAULT_OBJECT_HOST;
   }
 
+  /** O(depth) authority-host classification for transport code that is
+   * labeling exported cell pages. This is intentionally read-only and
+   * event-free; callers must not use objectRoutes() on hot authority paths just
+   * to decide whether an exported page is owner-sourced or a cached fallback. */
+  objectHostKey(id: ObjRef): string {
+    return this.hostKeyForObject(id);
+  }
+
   /** Drop one host's cached seed without bumping the global cache version.
    * Used by per-object persist paths that know which host's slice changed:
    * the next host-seed request for `host` will rebuild, but other hosts'
@@ -1272,6 +1280,11 @@ export class WooWorld {
 
   private presenceProjectionForProperty(objRef: ObjRef, name: string): PresenceProjectionDef | null {
     return this.presenceProjectionForObjectRecord(this.object(objRef), name);
+  }
+
+  isPresenceProjectionProperty(objRef: ObjRef, name: string): boolean {
+    const obj = this.objects.get(objRef);
+    return obj ? this.presenceProjectionForObjectRecord(obj, name) !== null : false;
   }
 
   private presenceProjectionForObjectRecord(obj: WooObject, name: string): PresenceProjectionDef | null {

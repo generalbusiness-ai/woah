@@ -25,21 +25,57 @@ export type MergeSerializedAuthorityOptions = {
   clone?: boolean;
 };
 
+export type AuthorityPageProvenance = Pick<ShadowStatePageRef, "source" | "source_host">;
+
 export function buildSerializedAuthorityCellSlice(input: {
   sessions: readonly SerializedSession[];
   objects: readonly SerializedObject[];
   counters: Pick<SerializedWorld, "objectCounter" | "parkedTaskCounter" | "sessionCounter">;
   tombstones?: readonly ObjRef[];
+  pageProvenance?: (page: ShadowStatePage) => AuthorityPageProvenance | null | undefined;
 }): SerializedAuthorityCellSlice {
   const pages = input.objects.flatMap((obj) => shadowStatePagesForObject(obj));
   return {
     kind: "woo.authority_slice.cells.shadow.v1",
     sessions: structuredClone(input.sessions) as SerializedSession[],
-    page_refs: pages.map((page) => shadowStatePageRef(page, true)),
+    page_refs: pages.map((page) => authorityPageRefWithProvenance(shadowStatePageRef(page, true), input.pageProvenance?.(page))),
     inline_pages: pages.map((page) => structuredClone(page) as ShadowStatePage),
     counters: { ...input.counters },
     tombstones: [...(input.tombstones ?? [])].sort(),
     source_object_count: input.objects.length
+  };
+}
+
+export function authorityPageRefWithProvenance(
+  ref: ShadowStatePageRef,
+  provenance: AuthorityPageProvenance | null | undefined
+): ShadowStatePageRef {
+  if (!provenance?.source) return ref;
+  return {
+    ...ref,
+    source: provenance.source,
+    ...(provenance.source_host ? { source_host: provenance.source_host } : {})
+  };
+}
+
+export function withAuthorityPageProvenance(
+  authority: SerializedAuthoritySlice,
+  provenance: (ref: ShadowStatePageRef) => AuthorityPageProvenance | null | undefined
+): SerializedAuthoritySlice {
+  if (!isAuthorityCellSlice(authority)) {
+    return {
+      kind: "woo.authority_slice.shadow.v1",
+      sessions: authority.sessions.map((session) => structuredClone(session) as SerializedSession),
+      objects: authority.objects.map((obj) => structuredClone(obj) as SerializedObject)
+    };
+  }
+  return {
+    ...authority,
+    sessions: authority.sessions.map((session) => structuredClone(session) as SerializedSession),
+    page_refs: authority.page_refs.map((ref) => authorityPageRefWithProvenance(structuredClone(ref) as ShadowStatePageRef, provenance(ref))),
+    inline_pages: authority.inline_pages.map((page) => structuredClone(page) as ShadowStatePage),
+    counters: { ...authority.counters },
+    tombstones: [...authority.tombstones]
   };
 }
 
@@ -223,6 +259,17 @@ export function filterSerializedAuthoritySlicePages(
 export function authoritySliceObjectIds(authority: MergeSerializedAuthorityInput): Set<ObjRef> {
   if (!isAuthorityCellSlice(authority)) return new Set(authority.objects.map((obj) => obj.id));
   return new Set(authority.page_refs.map((ref) => ref.object));
+}
+
+// Count the cell pages a slice carries, for instrumentation that sizes a
+// reconstruction (step 2a). For the cell-slice representation (CA12) this is
+// the number of page refs; for the legacy object-row representation there are
+// no cell pages, so the page count is the object-row count (each object row is
+// the indivisible unit transferred). This stays in core so the metric site
+// never has to branch on the slice's representation kind.
+export function authoritySlicePageCount(authority: MergeSerializedAuthorityInput): number {
+  if (!isAuthorityCellSlice(authority)) return authority.objects.length;
+  return authority.page_refs.length;
 }
 
 export function pruneSerializedSessionsWithoutActorRows(serialized: { sessions: SerializedSession[]; objects: SerializedObject[] }): boolean {

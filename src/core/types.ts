@@ -359,6 +359,69 @@ export type MetricEvent =
   // underlying RPC; this distinct event captures the higher-level policy
   // decision so cross_host_rpc latency stats stay clean.
   | { kind: "authority_slice_stale_fallback"; host: string; object_count: number; reason: "timeout" | "snapshot_fallback" }
+  // Emitted every time an authority slice is reconstructed on the turn path
+  // (step 2a of the cell-authority perf plan, notes/2026-05-31-...). This is
+  // the measurement that lets 2b–2e prove they remove per-turn reconstruction
+  // and that lets warm-turn cost be tracked SEPARATELY from cold-open and from
+  // genuine missing-state repair (plan §"Success metrics — warm vs cold").
+  //
+  // `reason` is the bucket that keeps those apart; it MUST distinguish:
+  //  - "warm_turn_refresh"   — per-envelope / per-turn authority refresh against
+  //                            an already-open scope. This is the bucket step 2
+  //                            must drive toward zero; a healthy steady state has
+  //                            none of these.
+  //  - "cold_open"           — first-open seeding of a scope (session open /
+  //                            relay creation). A bounded, expected cost.
+  //  - "missing_state_repair"— a CommitScopeDO snapshot-required reseed after a
+  //                            genuine miss (E_SNAPSHOT_REQUIRED). Expected and
+  //                            healthy; tracked as its own bucket so it never
+  //                            reads as a warm-turn regression.
+  //  - "slice_served"        — the source-host /__internal/authority-slice
+  //                            handler assembling and returning a slice to a
+  //                            requesting gateway. `source_host` is the local
+  //                            (serving) host here; the assembly buckets above
+  //                            report the assembling gateway's own host.
+  //  - "warm_checkpoint_hit" — step 2b: a warm per-turn refresh that was served
+  //                            from the per-scope authority checkpoint built at
+  //                            open/cold-load, so it did NOT reconstruct a slice
+  //                            (no resolve-host storm, no remote fetch). This is
+  //                            the bucket that PROVES 2b: every warm turn that
+  //                            would have emitted "warm_turn_refresh" now emits
+  //                            this instead. The checkpoint is a `cache`-source
+  //                            artifact (CA11) held only in DO memory; it is
+  //                            never persisted as authority, and commit
+  //                            validation still arbitrates write freshness, so
+  //                            serving it for planning is safe.
+  //  - "warm_checkpoint_caught_up" — step 2c: an accepted commit fanned out and
+  //                            advanced state for objects/sessions a checkpoint
+  //                            already covered, and the checkpoint was brought
+  //                            forward by applying that commit's bounded
+  //                            projection-write tail IN PLACE (idempotent by the
+  //                            commit `seq` watermark, monotonic) instead of
+  //                            being discarded and rebuilt on the next warm turn.
+  //                            This is the bucket that PROVES 2c: a stale
+  //                            checkpoint catches up from the retained tail
+  //                            rather than triggering a full-slice reconstruction.
+  //                            Still `source:"cache"` (CA11) and never persisted
+  //                            as authority. `object_count`/`page_count` size the
+  //                            caught-up slice; `source_host` is this DO's host.
+  //  - "warm_checkpoint_repaired" — step 2d: a warm per-turn refresh whose
+  //                            request reaches beyond the checkpoint's coverage
+  //                            and repairs only the true missing ids instead of
+  //                            falling through to a full authority-slice
+  //                            reconstruction. Owner page provenance lets this
+  //                            path trust owner-sourced remote pages without
+  //                            re-resolving every returned object via Directory.
+  //                            Emitted only when the repaired checkpoint is
+  //                            stored and will make the next matching warm turn
+  //                            a checkpoint hit; degraded or over-budget repairs
+  //                            stay in the caller's reconstruction bucket.
+  // `scope` is the commit/turn scope being reconstructed (`$nowhere` when no
+  // scope is in hand, e.g. the source-host handler). `object_count` and
+  // `page_count` size the slice — page_count counts cell pages for the new
+  // cell-slice representation (CA12), or object rows for the legacy slice.
+  // `source_host` is the host that did the reconstruction.
+  | { kind: "authority_slice_reconstructed"; reason: "warm_turn_refresh" | "cold_open" | "missing_state_repair" | "slice_served" | "warm_checkpoint_hit" | "warm_checkpoint_caught_up" | "warm_checkpoint_repaired"; scope: ObjRef; object_count: number; page_count: number; source_host: string }
   // Fires once per reapExpiredSessions sweep only when at least one session is
   // actually reaped. This keeps background sweep noise out of data-path tails
   // while preserving enough volume information for retention debugging.

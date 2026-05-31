@@ -90,7 +90,13 @@ export type McpV2ClientHooks = {
   envelope: (scope: ObjRef, body: McpV2EnvelopeBody) => Promise<McpV2EnvelopeResult>;
   authorityPayload?: (
     extraObjectIds: ObjRef[],
-    options?: { useCommitScopeSnapshotForRemoteAuthority?: boolean; directorySessionScopes?: ObjRef[] }
+    options?: {
+      useCommitScopeSnapshotForRemoteAuthority?: boolean;
+      directorySessionScopes?: ObjRef[];
+      reconstructionReason?: "warm_turn_refresh" | "cold_open" | "missing_state_repair";
+      reconstructionScope?: ObjRef;
+      checkpointHead?: ShadowScopeHead | null;
+    }
   ) => Promise<ReturnType<typeof executorAuthorityPayload>>;
   executionCapsuleOpen?: boolean;
 };
@@ -633,7 +639,10 @@ export class McpGateway {
         authorityRefreshAttempts += 1;
         const payload = await this.v2AuthorityPayload(extraObjectIds, {
           useCommitScopeSnapshotForRemoteAuthority,
-          directorySessionScopes: options.directorySessionScopes ?? []
+          directorySessionScopes: options.directorySessionScopes ?? [],
+          reconstructionReason: "warm_turn_refresh",
+          reconstructionScope: submitScope,
+          checkpointHead: this.v2Scopes.get(submitScope)?.relay.commit_scope.head ?? null
         });
         const fallbackClient = this.v2Scopes.get(scope) ?? this.v2Scopes.get(submitScope);
         const authorityPayload = fallbackClient && (payload.staleFallbackCount ?? 0) > 0
@@ -807,7 +816,13 @@ export class McpGateway {
 
   private async v2AuthorityPayload(
     extraObjectIds: ObjRef[],
-    options: { useCommitScopeSnapshotForRemoteAuthority?: boolean; directorySessionScopes?: ObjRef[] } = {}
+    options: {
+      useCommitScopeSnapshotForRemoteAuthority?: boolean;
+      directorySessionScopes?: ObjRef[];
+      reconstructionReason?: "warm_turn_refresh" | "cold_open" | "missing_state_repair";
+      reconstructionScope?: ObjRef;
+      checkpointHead?: ShadowScopeHead | null;
+    } = {}
   ): Promise<ReturnType<typeof executorAuthorityPayload>> {
     return await (
       this.options.v2?.authorityPayload?.(extraObjectIds, options)

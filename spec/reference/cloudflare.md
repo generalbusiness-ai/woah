@@ -585,6 +585,20 @@ The canonical event union is `MetricEvent` in `src/core/types.ts`. That
 union is the source of truth for which kinds exist and which fields they
 carry; this spec only describes how those fields project onto AE slots.
 
+`authority_slice_reconstructed` partitions the authority-slice planning cost
+that used to appear as opaque `/mcp` wall time. Its `reason` value is written to
+`blobs[15]` and MUST distinguish warm turn refresh, cold open, missing-state
+repair, source-host slice service, warm checkpoint hit, warm checkpoint
+catch-up, and warm checkpoint repair. `object_count` and `page_count` size the
+served slice; the primary AE count slot uses the object count. This event is the
+gate for [cell-authority.md §CA11.1](../protocol/cell-authority.md#ca111-gateway-authority-checkpoints):
+healthy warm turns should move from `warm_turn_refresh` to
+`warm_checkpoint_hit`, same-scope projection tails should emit
+`warm_checkpoint_caught_up`, checkpoint coverage misses should emit
+`warm_checkpoint_repaired` only when the repaired checkpoint is stored and will
+turn the next matching request into `warm_checkpoint_hit`, and
+stale-fallback/timeout/over-budget rows must not be stored as checkpoints.
+
 #### Sampling
 
 Console-tail is unaffected (it sees every emission). AE-side sampling:

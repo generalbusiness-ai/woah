@@ -152,6 +152,23 @@ describe("metrics-sink", () => {
       expect(calls[0]!.doubles?.[DBL_COUNT]).toBe(3);
     });
 
+    it("stores authority reconstruction reason and object count", () => {
+      const { binding, calls } = fakeAnalytics();
+      const event: MetricEvent = {
+        kind: "authority_slice_reconstructed",
+        reason: "warm_checkpoint_hit",
+        scope: "the_chatroom",
+        object_count: 12,
+        page_count: 36,
+        source_host: "mcp-gateway-0"
+      };
+      writeMetricToAnalytics(event, "mcp-gateway-0", binding);
+      expect(calls[0]!.blobs?.[SLOT_KIND]).toBe("authority_slice_reconstructed");
+      expect(calls[0]!.blobs?.[SLOT_SCOPE]).toBe("the_chatroom");
+      expect(calls[0]!.blobs?.[SLOT_REASON]).toBe("warm_checkpoint_hit");
+      expect(calls[0]!.doubles?.[DBL_COUNT]).toBe(12);
+    });
+
     it("stores open executable seed bytes as the primary count", () => {
       const { binding, calls } = fakeAnalytics();
       const event: MetricEvent = {
