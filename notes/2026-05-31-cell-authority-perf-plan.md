@@ -81,10 +81,16 @@ storm against incomplete executor slices.
      is scope-local. Checkpoint hits also overlay this shard's current live
      actor cells before serving, so a local session-location rebase is not
      hidden behind an older cached slice.
-   - **2d — cell-keyed materialization repair only on real misses** (a cell the
-     checkpoint+tail genuinely lack), reusing the VTN10.1 path. **Not yet
-     implemented.** Current checkpoint coverage misses still fall through to the
-     existing full refresh path.
+   - **2d — cell-keyed materialization repair only on real misses. [implemented
+     in this branch for checkpoint coverage misses]** When a warm request names
+     ids beyond a checkpoint's coverage, the gateway repairs only those missing
+     ids and merges them into the checkpoint. The path emits
+     `warm_checkpoint_repaired` only when the repaired checkpoint is stored, so
+     the next identical warm turn becomes a checkpoint hit. It does not
+     reconstruct the already-covered slice. If the repair degrades to
+     timeout/stale fallback, or the repaired union exceeds the per-checkpoint
+     object budget, the served payload may still use those rows for that
+     attempt, but it is not stored as the next checkpoint.
    - **2e — gate then delete the old per-turn full-slice reconstruction path.**
      Gate behind a flag first so 2a instrumentation proves it's no longer hit on
      warm turns, then remove. **Not yet implemented.**
@@ -94,13 +100,15 @@ storm against incomplete executor slices.
      authority** — this is the direct guard against the earlier KV stale-byte
      corruption class (stale bytes written through as truth). Checkpoint/tail
      install paths assert this.
-   - **Carry source/owner provenance ON the pages (review pt 4):** today the
-     gateway filters authority-slice pages by resolving every returned object's
-     host via Directory — a large slice of the resolve-object storm. With
-     per-page owner/source provenance, owner-sourced pages are trusted without a
-     per-object Directory lookup. This removes the storm's structural cause here,
-     so step 3 is only the *remaining* route-resolution batching, not cleanup
-     after a new path repeats the same mistake.
+   - **Carry source/owner provenance ON the pages (review pt 4). [implemented in
+     this branch for authority-slice pages]** The source host labels
+     owner-sourced page refs as `source:"authoritative"` and inherited/cache rows
+     as `source:"cache"`. Gateways trust owner-sourced pages from the responding
+     host without resolving every returned object's host via Directory; cache
+     pages can fill local gaps but do not override local rows. This removes the
+     storm's structural cause here, so step 3 is only the *remaining*
+     route-resolution batching, not cleanup after a new path repeats the same
+     mistake.
    - **Layering cleanup folded into this step:** fanout projection routing no
      longer hardcodes `subscribers` / `session_subscribers` in
      `src/core/v2-fanout-projection.ts`; it accepts a presence-projection

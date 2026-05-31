@@ -405,13 +405,17 @@ export type MetricEvent =
   //                            Still `source:"cache"` (CA11) and never persisted
   //                            as authority. `object_count`/`page_count` size the
   //                            caught-up slice; `source_host` is this DO's host.
-  //  - "warm_checkpoint_repaired" — reserved for step 2d: a warm per-turn
-  //                            refresh whose request reaches beyond the
-  //                            checkpoint's coverage and repairs only the true
-  //                            missing ids instead of falling through to a full
-  //                            authority-slice reconstruction. This branch does
-  //                            not emit that reason yet; coverage misses still
-  //                            use the existing full-refresh path.
+  //  - "warm_checkpoint_repaired" — step 2d: a warm per-turn refresh whose
+  //                            request reaches beyond the checkpoint's coverage
+  //                            and repairs only the true missing ids instead of
+  //                            falling through to a full authority-slice
+  //                            reconstruction. Owner page provenance lets this
+  //                            path trust owner-sourced remote pages without
+  //                            re-resolving every returned object via Directory.
+  //                            Emitted only when the repaired checkpoint is
+  //                            stored and will make the next matching warm turn
+  //                            a checkpoint hit; degraded or over-budget repairs
+  //                            stay in the caller's reconstruction bucket.
   // `scope` is the commit/turn scope being reconstructed (`$nowhere` when no
   // scope is in hand, e.g. the source-host handler). `object_count` and
   // `page_count` size the slice — page_count counts cell pages for the new

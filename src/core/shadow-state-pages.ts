@@ -61,6 +61,12 @@ export type ShadowStatePageRef = {
   hash: string;
   bytes: number;
   inline: boolean;
+  /** Optional authority/projection provenance. Execution transfers omit this;
+   * authority-slice payloads set it so gateways can decide whether a page is
+   * owner-sourced or merely a cache/fallback row without re-resolving every
+   * object through Directory. */
+  source?: "authoritative" | "projection" | "fallback" | "cache" | "gossip";
+  source_host?: string;
 };
 
 export function shadowStatePagesForObject(obj: SerializedObject): ShadowStatePage[] {

@@ -22,7 +22,8 @@ import {
   buildSerializedAuthorityCellSlice,
   combineSerializedAuthoritySlices,
   mergeSerializedAuthoritySlice,
-  serializedWorldFromAuthoritySlice
+  serializedWorldFromAuthoritySlice,
+  withAuthorityPageProvenance
 } from "../src/core/authority-slice";
 import { createWorld } from "../src/core/bootstrap";
 import { executorAuthorityPayload } from "../src/core/executor";
@@ -146,6 +147,31 @@ describe("WooWorld.exportAuthoritySlice content contract", () => {
     // Room contents are a derived set projection; merge precedence is about
     // membership, not the array order chosen by the serialized view.
     expect([...(serialized.objects.find((obj) => obj.id === "the_deck")?.contents ?? [])].sort()).toEqual([...freshDeck.contents].sort());
+  });
+
+  it("carries optional authority-page provenance without changing materialization", () => {
+    const room = objectRecord("room_owner", ["item_a"]);
+    const item = objectRecord("item_a", []);
+    const slice = buildSerializedAuthorityCellSlice({
+      sessions: [],
+      objects: [room, item],
+      counters: { objectCounter: 1, parkedTaskCounter: 1, sessionCounter: 1 },
+      pageProvenance: (page) => ({
+        source: page.object === "room_owner" ? "authoritative" : "cache",
+        source_host: "room_owner"
+      })
+    });
+
+    expect(slice.page_refs.every((ref) => ref.source_host === "room_owner")).toBe(true);
+    expect(slice.page_refs.filter((ref) => ref.object === "room_owner").every((ref) => ref.source === "authoritative")).toBe(true);
+    expect(slice.page_refs.filter((ref) => ref.object === "item_a").every((ref) => ref.source === "cache")).toBe(true);
+    expect(new Set(serializedWorldFromAuthoritySlice(slice).objects.map((obj) => obj.id))).toEqual(new Set(["room_owner", "item_a"]));
+
+    const fallback = withAuthorityPageProvenance(slice, () => ({ source: "fallback", source_host: "mcp-gateway-0" }));
+    expect(fallback.kind).toBe("woo.authority_slice.cells.shadow.v1");
+    if (fallback.kind === "woo.authority_slice.cells.shadow.v1") {
+      expect(fallback.page_refs.every((ref) => ref.source === "fallback" && ref.source_host === "mcp-gateway-0")).toBe(true);
+    }
   });
 
   it("does not report no-op cell-page order normalization as an authority change", () => {

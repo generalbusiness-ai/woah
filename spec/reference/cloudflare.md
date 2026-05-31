@@ -594,8 +594,10 @@ served slice; the primary AE count slot uses the object count. This event is the
 gate for [cell-authority.md §CA11.1](../protocol/cell-authority.md#ca111-gateway-authority-checkpoints):
 healthy warm turns should move from `warm_turn_refresh` to
 `warm_checkpoint_hit`, same-scope projection tails should emit
-`warm_checkpoint_caught_up`, and stale-fallback/timeout rows must not be stored
-as checkpoints.
+`warm_checkpoint_caught_up`, checkpoint coverage misses should emit
+`warm_checkpoint_repaired` only when the repaired checkpoint is stored and will
+turn the next matching request into `warm_checkpoint_hit`, and
+stale-fallback/timeout/over-budget rows must not be stored as checkpoints.
 
 #### Sampling
 

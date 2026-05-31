@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { authoritySliceObjectIds, serializedWorldFromAuthoritySlice } from "../../src/core/authority-slice";
+import { authoritySliceObjectIds, buildSerializedAuthorityCellSlice, serializedWorldFromAuthoritySlice } from "../../src/core/authority-slice";
 import { createWorld } from "../../src/core/bootstrap";
 import type { EffectTranscript } from "../../src/core/effect-transcript";
 import type { ProjectionDeltaSummary, ProjectionWrite, SessionToolManifest } from "../../src/core/projection-delta";
-import type { SerializedAuthoritySlice, SerializedSession } from "../../src/core/repository";
+import type { SerializedAuthoritySlice, SerializedObject, SerializedSession } from "../../src/core/repository";
 import { encodeEnvelope } from "../../src/core/shadow-envelope";
 import { wooError, type MetricEvent, type ObjRef, type RemoteToolDescriptor, type RemoteToolRequest } from "../../src/core/types";
 import type { ShadowCommitAccepted, ShadowScopeHead } from "../../src/core/shadow-commit-scope";
@@ -22,6 +22,27 @@ function env(overrides: Partial<Env> = {}): Env {
 
 function rows<T>(state: FakeDurableObjectState, query: string, ...params: unknown[]): T[] {
   return state.storage.sql.exec(query, ...params).toArray() as T[];
+}
+
+function serializedObject(id: ObjRef, parent: ObjRef | null, name = id): SerializedObject {
+  return {
+    id,
+    name,
+    parent,
+    anchor: null,
+    owner: "$wiz",
+    location: null,
+    flags: {},
+    created: 0,
+    modified: 0,
+    propertyDefs: [],
+    properties: [],
+    propertyVersions: [],
+    verbs: [],
+    children: [],
+    contents: [],
+    eventSchemas: []
+  };
 }
 
 describe("gateway projection cache", () => {
@@ -906,9 +927,9 @@ describe("gateway projection cache", () => {
     // The DO host is a sparse MCP gateway shard (the warm-checkpoint subject) and
     // the scope's authority is served from the local world (no remote owner), so
     // a warm reconstruction populates a checkpoint deterministically.
-    function harness(world: ReturnType<typeof createWorld>): { state: FakeDurableObjectState; po: CatchUpHarness } {
+    function harness(world: ReturnType<typeof createWorld>, overrides: Partial<Env> = {}): { state: FakeDurableObjectState; po: CatchUpHarness } {
       const state = new FakeDurableObjectState("mcp-gateway-0");
-      const po = new PersistentObjectDO(state as unknown as DurableObjectState, env()) as unknown as CatchUpHarness;
+      const po = new PersistentObjectDO(state as unknown as DurableObjectState, env(overrides)) as unknown as CatchUpHarness;
       // Resolve every object to the local host so the warm reconstruction stays
       // local and captures a checkpoint without a remote fetch.
       po.forwardInternalReadChecked = async (_host, _path, body) => ({ authority: world.exportAuthoritySlice([], body.objects ?? []) });
@@ -960,6 +981,178 @@ describe("gateway projection cache", () => {
       }));
       expect(serialized.sessions.map((session) => session.id)).toContain(directorySession.id);
       expect(serialized.objects.find((obj) => obj.id === directorySession.actor)?.name).toBe("Directory Live");
+    });
+
+    it("repairs only missing checkpoint ids and trusts owner page provenance", async () => {
+      const metrics: MetricEvent[] = [];
+      const world = createWorld({ metricsHook: (event) => metrics.push(event) });
+      let directoryReads = 0;
+      const { state, po } = harness(world, {
+        DIRECTORY: new FakeDurableObjectNamespace(() => ({
+          fetch: async () => {
+            directoryReads += 1;
+            return new Response(JSON.stringify({ host: "", anchor: null }), { headers: { "content-type": "application/json" } });
+          }
+        })) as unknown as DurableObjectNamespace
+      });
+      const chatroomHead = scopeHead("the_chatroom", 11, "chatroom-11");
+      await po.v2GatewayAuthorityPayload(world, ["the_chatroom"], {
+        reconstructionReason: "warm_turn_refresh",
+        reconstructionScope: "the_chatroom",
+        checkpointHead: chatroomHead
+      });
+      metrics.length = 0;
+      directoryReads = 0;
+      const remoteRequests: Array<{ host: string; objects: ObjRef[] }> = [];
+      const remoteObject = serializedObject("remote_repair" as ObjRef, "$thing", "Remote Repair");
+      const supportObject = world.exportObjects(["$thing"])[0]!;
+      po.routeCache.set("remote_repair" as ObjRef, "remote-host");
+      po.forwardInternalReadChecked = async (host, _path, body) => {
+        remoteRequests.push({ host, objects: body.objects ?? [] });
+        return {
+          authority: buildSerializedAuthorityCellSlice({
+            sessions: [],
+            objects: [remoteObject, supportObject],
+            counters: { objectCounter: 1, parkedTaskCounter: 1, sessionCounter: 1 },
+            pageProvenance: (page) => ({
+              source: page.object === "remote_repair" ? "authoritative" : "cache",
+              source_host: host
+            })
+          })
+        };
+      };
+
+      const served = await po.v2GatewayAuthorityPayload(world, ["the_chatroom", "remote_repair" as ObjRef], {
+        reconstructionReason: "warm_turn_refresh",
+        reconstructionScope: "the_chatroom",
+        checkpointHead: chatroomHead
+      });
+      const ids = authoritySliceObjectIds(served.authority);
+
+      expect(remoteRequests).toEqual([{ host: "remote-host", objects: ["remote_repair"] }]);
+      expect(directoryReads, "provenanced remote pages must not be re-resolved through Directory").toBe(0);
+      expect(ids.has("the_chatroom")).toBe(true);
+      expect(ids.has("remote_repair" as ObjRef)).toBe(true);
+      expect(po.authorityCheckpoints.get("the_chatroom")?.coveredObjectIds.has("remote_repair" as ObjRef)).toBe(true);
+      expect(metrics).toContainEqual(expect.objectContaining({
+        kind: "authority_slice_reconstructed",
+        reason: "warm_checkpoint_repaired",
+        scope: "the_chatroom"
+      }));
+
+      metrics.length = 0;
+      const servedAgain = await po.v2GatewayAuthorityPayload(world, ["the_chatroom", "remote_repair" as ObjRef], {
+        reconstructionReason: "warm_turn_refresh",
+        reconstructionScope: "the_chatroom",
+        checkpointHead: chatroomHead
+      });
+      expect(authoritySliceObjectIds(servedAgain.authority).has("remote_repair" as ObjRef)).toBe(true);
+      expect(remoteRequests, "stored repair must make the next identical turn a checkpoint hit").toHaveLength(1);
+      expect(metrics).toContainEqual(expect.objectContaining({
+        kind: "authority_slice_reconstructed",
+        reason: "warm_checkpoint_hit",
+        scope: "the_chatroom"
+      }));
+
+      const reloaded = new PersistentObjectDO(state as unknown as DurableObjectState, env()) as unknown as CatchUpHarness;
+      expect(reloaded.authorityCheckpoints.size, "authority checkpoints are in-memory only, not durable DO storage").toBe(0);
+    });
+
+    it("does not label degraded checkpoint repair as repaired or store it", async () => {
+      const metrics: MetricEvent[] = [];
+      const world = createWorld({ metricsHook: (event) => metrics.push(event) });
+      const { po } = harness(world);
+      const chatroomHead = scopeHead("the_chatroom", 12, "chatroom-12");
+      await po.v2GatewayAuthorityPayload(world, ["the_chatroom"], {
+        reconstructionReason: "warm_turn_refresh",
+        reconstructionScope: "the_chatroom",
+        checkpointHead: chatroomHead
+      });
+      metrics.length = 0;
+      let remoteReads = 0;
+      po.routeCache.set("remote_timeout" as ObjRef, "remote-host");
+      po.forwardInternalReadChecked = async () => {
+        remoteReads += 1;
+        throw wooError("E_TIMEOUT", "owner refresh timeout");
+      };
+
+      await po.v2GatewayAuthorityPayload(world, ["the_chatroom", "remote_timeout" as ObjRef], {
+        tolerateRemoteFailures: true,
+        reconstructionReason: "warm_turn_refresh",
+        reconstructionScope: "the_chatroom",
+        checkpointHead: chatroomHead
+      });
+      await po.v2GatewayAuthorityPayload(world, ["the_chatroom", "remote_timeout" as ObjRef], {
+        tolerateRemoteFailures: true,
+        reconstructionReason: "warm_turn_refresh",
+        reconstructionScope: "the_chatroom",
+        checkpointHead: chatroomHead
+      });
+
+      expect(remoteReads, "degraded repair must not widen the checkpoint and hide the next miss").toBe(2);
+      expect(po.authorityCheckpoints.get("the_chatroom")?.coveredObjectIds.has("remote_timeout" as ObjRef)).toBe(false);
+      expect(metrics).toContainEqual(expect.objectContaining({
+        kind: "authority_slice_stale_fallback",
+        host: "remote-host",
+        reason: "timeout"
+      }));
+      expect(metrics).not.toContainEqual(expect.objectContaining({
+        kind: "authority_slice_reconstructed",
+        reason: "warm_checkpoint_repaired",
+        scope: "the_chatroom"
+      }));
+      expect(metrics).toContainEqual(expect.objectContaining({
+        kind: "authority_slice_reconstructed",
+        reason: "warm_turn_refresh",
+        scope: "the_chatroom"
+      }));
+    });
+
+    it("drops an oversized repaired checkpoint instead of growing it without bound", async () => {
+      const metrics: MetricEvent[] = [];
+      const world = createWorld({ metricsHook: (event) => metrics.push(event) });
+      const { po } = harness(world);
+      const chatroomHead = scopeHead("the_chatroom", 13, "chatroom-13");
+      await po.v2GatewayAuthorityPayload(world, ["the_chatroom"], {
+        reconstructionReason: "warm_turn_refresh",
+        reconstructionScope: "the_chatroom",
+        checkpointHead: chatroomHead
+      });
+      metrics.length = 0;
+      const remoteBulk = "remote_bulk" as ObjRef;
+      const filler = Array.from({ length: 260 }, (_, index) => serializedObject(`remote_support_${index}` as ObjRef, "$thing", `Remote Support ${index}`));
+      po.routeCache.set(remoteBulk, "remote-host");
+      po.forwardInternalReadChecked = async (host, _path, body) => ({
+        authority: buildSerializedAuthorityCellSlice({
+          sessions: [],
+          objects: [serializedObject(remoteBulk, "$thing", "Remote Bulk"), ...filler],
+          counters: { objectCounter: 1, parkedTaskCounter: 1, sessionCounter: 1 },
+          pageProvenance: (page) => ({
+            source: page.object === remoteBulk ? "authoritative" : "cache",
+            source_host: host
+          })
+        })
+      });
+
+      const served = await po.v2GatewayAuthorityPayload(world, ["the_chatroom", remoteBulk], {
+        reconstructionReason: "warm_turn_refresh",
+        reconstructionScope: "the_chatroom",
+        checkpointHead: chatroomHead
+      });
+
+      expect(authoritySliceObjectIds(served.authority).has(remoteBulk)).toBe(true);
+      expect(authoritySliceObjectIds(served.authority).size).toBeGreaterThan(256);
+      expect(po.authorityCheckpoints.has("the_chatroom"), "oversized repaired union must not remain as an unbounded hot-scope checkpoint").toBe(false);
+      expect(metrics).not.toContainEqual(expect.objectContaining({
+        kind: "authority_slice_reconstructed",
+        reason: "warm_checkpoint_repaired",
+        scope: "the_chatroom"
+      }));
+      expect(metrics).toContainEqual(expect.objectContaining({
+        kind: "authority_slice_reconstructed",
+        reason: "warm_turn_refresh",
+        scope: "the_chatroom"
+      }));
     });
 
     it("catches a stale own-scope checkpoint up from the accepted commit tail, idempotently", async () => {

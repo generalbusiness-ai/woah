@@ -34,6 +34,8 @@ import {
   buildSerializedAuthorityCellSlice,
   combineSerializedAuthoritySlices,
   filterSerializedAuthoritySlicePages,
+  isAuthorityCellSlice,
+  withAuthorityPageProvenance,
   serializedWorldFromAuthoritySlice
 } from "../core/authority-slice";
 import { shadowObjectLineagePage, shadowObjectLivePage, shadowPropertyCellPages, shadowStatePageRef, type ShadowStatePage } from "../core/shadow-state-pages";
@@ -93,6 +95,7 @@ import {
   executorAuthorityObjectIds,
   executorAuthorityPayload,
   executorEnvelopeId,
+  type ExecutorAuthorityPayload,
   type ExecutorEnvelopeBody
 } from "../core/executor";
 import { CFObjectRepository } from "./cf-repository";
@@ -307,6 +310,7 @@ const DEFAULT_TOOL_SURFACE_SOURCE_INDEX_MAX_SCOPE_ROWS = 10_000;
 const DEFAULT_TOOL_SURFACE_SOURCE_INDEX_MAX_SHARD_ROWS = 40_000;
 const MAX_REST_V2_RELAY_CLIENTS = 64;
 const MAX_AUTHORITY_CHECKPOINTS = 64;
+const MAX_AUTHORITY_CHECKPOINT_OBJECTS = 256;
 const DIRECTORY_HOST = "directory";
 const INTERNAL_ORIGIN = "https://woo.internal";
 const MAX_JSON_BODY_BYTES = 1 * 1024 * 1024;
@@ -838,7 +842,7 @@ export class PersistentObjectDO {
       serialized.objects.sort((a, b) => a.id.localeCompare(b.id));
       serialized.sessions.sort((a, b) => a.id.localeCompare(b.id));
       const authority = this.checkpointSliceFromSerialized(serialized);
-      this.storeAuthorityCheckpoint(scope, authority, position.seq);
+      if (!this.storeAuthorityCheckpoint(scope, authority, position.seq)) continue;
       this.emitMetric({
         kind: "authority_slice_reconstructed",
         reason: "warm_checkpoint_caught_up",
@@ -3290,7 +3294,13 @@ export class PersistentObjectDO {
         const objects = Array.isArray(body.objects)
           ? body.objects.filter((item): item is ObjRef => typeof item === "string" && item.length > 0)
           : [];
-        const authority = world.exportAuthoritySlice([], objects);
+        const authority = withAuthorityPageProvenance(
+          world.exportAuthoritySlice([], objects),
+          (ref) => ({
+            source: world.objectHostKey(ref.object) === hostKey ? "authoritative" : "cache",
+            source_host: hostKey
+          })
+        );
         this.emitMetric({
           kind: "authority_slice_reconstructed",
           reason: "slice_served",
@@ -4455,34 +4465,91 @@ export class PersistentObjectDO {
     return { serialized, authority };
   }
 
-  private authorityCheckpointHit(scope: ObjRef, ids: readonly ObjRef[]): AuthorityCheckpoint | null {
+  private authorityCheckpointLookup(scope: ObjRef, ids: readonly ObjRef[]): { checkpoint: AuthorityCheckpoint; missingIds: ObjRef[] } | null {
     const checkpoint = this.authorityCheckpoints.get(scope);
     if (!checkpoint) return null;
-    for (const id of ids) {
-      if (!checkpoint.coveredObjectIds.has(id)) return null;
-    }
+    const missingIds = ids.filter((id) => !checkpoint.coveredObjectIds.has(id));
     this.authorityCheckpoints.delete(scope);
     this.authorityCheckpoints.set(scope, checkpoint);
     return {
-      ...checkpoint,
-      authority: structuredClone(checkpoint.authority) as SerializedAuthoritySlice,
-      coveredObjectIds: new Set(checkpoint.coveredObjectIds)
+      checkpoint: {
+        ...checkpoint,
+        authority: structuredClone(checkpoint.authority) as SerializedAuthoritySlice,
+        coveredObjectIds: new Set(checkpoint.coveredObjectIds)
+      },
+      missingIds
     };
   }
 
-  private storeAuthorityCheckpoint(scope: ObjRef, authority: SerializedAuthoritySlice, appliedSeq: number): void {
+  private authorityPayloadFromCachedAuthority(
+    world: WooWorld,
+    reconstructionScope: ObjRef,
+    authority: SerializedAuthoritySlice,
+    directoryScopeSessions: readonly DirectorySerializedSession[],
+    reason: AuthorityReconstructionReason | "warm_checkpoint_hit" | "warm_checkpoint_repaired"
+  ): ExecutorAuthorityPayload {
+    const sessionActors = new Set<ObjRef>(
+      authority.sessions
+        .map((session) => session.actor)
+        .filter((actor) => world.objects.has(actor))
+    );
+    const slices: SerializedAuthoritySlice[] = [authority];
+    if (sessionActors.size > 0) {
+      const localActorLive = filterSerializedAuthoritySlicePages(
+        executorAuthorityPayload(world, sessionActors).authority,
+        (ref) => sessionActors.has(ref.object) && ref.page === "object_live"
+      );
+      if (authoritySlicePageCount(localActorLive) > 0) slices.push(localActorLive);
+    }
+    if (directoryScopeSessions.length > 0) slices.push(mcpGatewayDirectorySessionCellSlice(directoryScopeSessions));
+    let mergedAuthority: SerializedAuthoritySlice;
+    if (slices.length > 1) {
+      mergedAuthority = combineSerializedAuthoritySlices(mergeSerializedSessions(authority.sessions, directoryScopeSessions), slices);
+    } else if (directoryScopeSessions.length > 0) {
+      mergedAuthority = { ...authority, sessions: mergeSerializedSessions(authority.sessions, directoryScopeSessions) };
+    } else {
+      mergedAuthority = authority;
+    }
+    const authorityObjectIds = authoritySliceObjectIds(mergedAuthority);
+    const authoritySessions = mergedAuthority.sessions.filter((session) => authorityObjectIds.has(session.actor));
+    const filteredAuthority: SerializedAuthoritySlice = mergedAuthority.sessions.length === authoritySessions.length
+      ? mergedAuthority
+      : { ...mergedAuthority, sessions: authoritySessions };
+    world.recordMetric({
+      kind: "authority_slice_reconstructed",
+      reason,
+      scope: reconstructionScope,
+      object_count: authoritySliceObjectIds(filteredAuthority).size,
+      page_count: authoritySlicePageCount(filteredAuthority),
+      source_host: this.durableHostKey()
+    });
+    return {
+      sessions: filteredAuthority.sessions,
+      session_objects: [],
+      authority: filteredAuthority
+    };
+  }
+
+  private storeAuthorityCheckpoint(scope: ObjRef, authority: SerializedAuthoritySlice, appliedSeq: number): boolean {
+    const cachedAuthority = withAuthorityPageProvenance(authority, () => ({ source: "cache", source_host: this.durableHostKey() }));
+    const coveredObjectIds = authoritySliceObjectIds(cachedAuthority);
+    if (coveredObjectIds.size > MAX_AUTHORITY_CHECKPOINT_OBJECTS) {
+      this.authorityCheckpoints.delete(scope);
+      return false;
+    }
     this.authorityCheckpoints.delete(scope);
     this.authorityCheckpoints.set(scope, {
       source: "cache",
-      authority: structuredClone(authority) as SerializedAuthoritySlice,
+      authority: structuredClone(cachedAuthority) as SerializedAuthoritySlice,
       appliedSeq,
-      coveredObjectIds: authoritySliceObjectIds(authority)
+      coveredObjectIds
     });
     while (this.authorityCheckpoints.size > MAX_AUTHORITY_CHECKPOINTS) {
       const oldest = this.authorityCheckpoints.keys().next().value;
       if (oldest === undefined) break;
       this.authorityCheckpoints.delete(oldest);
     }
+    return true;
   }
 
   private checkpointSliceFromSerialized(serialized: SerializedWorld): SerializedAuthoritySlice {
@@ -4494,13 +4561,46 @@ export class PersistentObjectDO {
         parkedTaskCounter: serialized.parkedTaskCounter,
         sessionCounter: serialized.sessionCounter
       },
-      tombstones: serialized.tombstones ?? []
+      tombstones: serialized.tombstones ?? [],
+      pageProvenance: () => ({ source: "cache", source_host: this.durableHostKey() })
     });
   }
 
   private authorityCheckpointAppliedSeq(scope: ObjRef, head: ShadowScopeHead | null | undefined): number | null {
     if (head?.scope === scope) return head.seq;
     return this.gatewayProjectionHeadSeq(scope);
+  }
+
+  private async filterRemoteAuthoritySliceForGateway(
+    authority: SerializedAuthoritySlice,
+    host: string,
+    localObjectIds: ReadonlySet<ObjRef>,
+    localActorAuthorityRoots: ReadonlySet<ObjRef>,
+    resolveHost: (id: ObjRef, fallbackHost: string) => Promise<string>
+  ): Promise<SerializedAuthoritySlice> {
+    const rejectLocalActorLive = (ref: { object: ObjRef; page: string }): boolean =>
+      localActorAuthorityRoots.has(ref.object) && ref.page === "object_live";
+    if (isAuthorityCellSlice(authority) && authority.page_refs.some((ref) => ref.source || ref.source_host)) {
+      return filterSerializedAuthoritySlicePages(authority, (ref) => {
+        if (rejectLocalActorLive(ref)) return false;
+        if (ref.source === "authoritative" && ref.source_host === host) return true;
+        // Non-owner rows from the remote slice are cache/projection/fallback
+        // material. They are useful as support rows only when the gateway has
+        // no local row to preserve; otherwise owner/local rows win.
+        return !localObjectIds.has(ref.object);
+      });
+    }
+    const accepted = new Set<ObjRef>();
+    const responseObjectIds = Array.from(authoritySliceObjectIds(authority));
+    const objectHosts = await Promise.all(responseObjectIds.map(
+      async (id) => [id, await resolveHost(id, WORLD_HOST)] as const
+    ));
+    for (const [id, objectHost] of objectHosts) {
+      if (objectHost === host || !localObjectIds.has(id)) accepted.add(id);
+    }
+    return filterSerializedAuthoritySlicePages(authority, (ref) =>
+      accepted.has(ref.object) && !rejectLocalActorLive(ref)
+    );
   }
 
   private async v2GatewayAuthorityPayload(
@@ -4531,48 +4631,27 @@ export class PersistentObjectDO {
     const directoryScopeSessions = mcpGatewayShard && directorySessionScopes.length > 0
       ? await this.loadDirectorySessionsForScopes(directorySessionScopes)
       : [];
+    let checkpointLookup: { checkpoint: AuthorityCheckpoint; missingIds: ObjRef[] } | null = null;
     if (reconstructionReason === "warm_turn_refresh") {
-      const cached = this.authorityCheckpointHit(reconstructionScope, ids);
-      if (cached) {
-        const sessionActors = new Set<ObjRef>(
-          cached.authority.sessions
-            .map((session) => session.actor)
-            .filter((actor) => world.objects.has(actor))
+      checkpointLookup = this.authorityCheckpointLookup(reconstructionScope, ids);
+      if (checkpointLookup && checkpointLookup.missingIds.length === 0) {
+        return this.authorityPayloadFromCachedAuthority(
+          world,
+          reconstructionScope,
+          checkpointLookup.checkpoint.authority,
+          directoryScopeSessions,
+          "warm_checkpoint_hit"
         );
-        const slices: SerializedAuthoritySlice[] = [cached.authority];
-        if (sessionActors.size > 0) {
-          const localActorLive = filterSerializedAuthoritySlicePages(
-            executorAuthorityPayload(world, sessionActors).authority,
-            (ref) => sessionActors.has(ref.object) && ref.page === "object_live"
-          );
-          if (authoritySlicePageCount(localActorLive) > 0) slices.push(localActorLive);
-        }
-        if (directoryScopeSessions.length > 0) slices.push(mcpGatewayDirectorySessionCellSlice(directoryScopeSessions));
-        const authority = slices.length > 1
-          ? combineSerializedAuthoritySlices(mergeSerializedSessions(cached.authority.sessions, directoryScopeSessions), slices)
-          : cached.authority;
-        const authorityObjectIds = authoritySliceObjectIds(authority);
-        const authoritySessions = authority.sessions.filter((session) => authorityObjectIds.has(session.actor));
-        const filteredAuthority: SerializedAuthoritySlice = authority.sessions.length === authoritySessions.length
-          ? authority
-          : { ...authority, sessions: authoritySessions };
-        world.recordMetric({
-          kind: "authority_slice_reconstructed",
-          reason: "warm_checkpoint_hit",
-          scope: reconstructionScope,
-          object_count: authoritySliceObjectIds(filteredAuthority).size,
-          page_count: authoritySlicePageCount(filteredAuthority),
-          source_host: this.durableHostKey()
-        });
-        return {
-          sessions: filteredAuthority.sessions,
-          session_objects: [],
-          authority: filteredAuthority
-        };
       }
     }
-    const local = executorAuthorityPayload(world, ids);
+    const repairIds = checkpointLookup ? checkpointLookup.missingIds : null;
+    const requestedIds = repairIds ?? ids;
+    const local = executorAuthorityPayload(world, requestedIds);
     const localObjectIds = authoritySliceObjectIds(local.authority);
+    const preservedObjectIds = new Set<ObjRef>(localObjectIds);
+    if (checkpointLookup) {
+      for (const id of authoritySliceObjectIds(checkpointLookup.checkpoint.authority)) preservedObjectIds.add(id);
+    }
     const routesById = isMcpGatewayShardHost(localHost)
       ? new Map<ObjRef, { id: ObjRef; host: string; anchor: ObjRef | null }>()
       : new Map(world.objectRoutes().map((route) => [route.id, route] as const));
@@ -4618,8 +4697,8 @@ export class PersistentObjectDO {
       return await this.resolveObjectHostForWorld(null, id, fallbackHost);
     };
 
-    const localActorAuthorityRoots = localActorAuthorityRootIds(world, ids);
-    const resolvedIds = await Promise.all(ids.map(async (id) => {
+    const localActorAuthorityRoots = localActorAuthorityRootIds(world, requestedIds);
+    const resolvedIds = await Promise.all(requestedIds.map(async (id) => {
       // Sparse MCP shards own the live session actor stubs they loaded from
       // Directory. Do not wake the world host just because Directory also knows
       // the actor's canonical owner; the local actor cells are patched below.
@@ -4688,36 +4767,28 @@ export class PersistentObjectDO {
         }
       })));
     }
-    const slices: SerializedAuthoritySlice[] = [local.authority];
+    const slices: SerializedAuthoritySlice[] = checkpointLookup
+      ? [checkpointLookup.checkpoint.authority, local.authority]
+      : [local.authority];
     if (mcpGatewayShard && localActorAuthorityRoots.size > 0) {
       const actorCells = mcpGatewayLocalActorPropertyCellSlice(world, localActorAuthorityRoots);
       if (actorCells.page_refs.length > 0) slices.push(actorCells);
     }
-    if (directoryScopeSessions.length > 0) {
-      // Sparse MCP shard worlds intentionally do not mirror every co-present
-      // session. For room-level reads such as `who`, recover the Directory
-      // session set and patch only actor stubs plus scope live/contents cells.
-      // Scope lineage/verbs must stay owner authority: a full scope stub here
-      // would overwrite `$chatroom` with sparse `$space` and erase inherited
-      // direction verbs on the real satellite.
-      slices.push(mcpGatewayDirectorySessionCellSlice(directoryScopeSessions));
-    }
     for (const { host, response } of remoteSlices) {
       if (!response) continue;
-      const accepted = new Set<ObjRef>();
-      const responseObjectIds = Array.from(authoritySliceObjectIds(response.authority));
-      const objectHosts = await Promise.all(responseObjectIds.map(
-        async (id) => [id, await resolveHost(id, WORLD_HOST)] as const
-      ));
-      for (const [id, objectHost] of objectHosts) {
-        if (objectHost === host || !localObjectIds.has(id)) accepted.add(id);
-      }
-      slices.push(filterSerializedAuthoritySlicePages(response.authority, (ref) =>
-        accepted.has(ref.object) && !(localActorAuthorityRoots.has(ref.object) && ref.page === "object_live")
+      slices.push(await this.filterRemoteAuthoritySliceForGateway(
+        response.authority,
+        host,
+        preservedObjectIds,
+        localActorAuthorityRoots,
+        resolveHost
       ));
     }
+    const baseSessions = checkpointLookup
+      ? mergeSerializedSessions(checkpointLookup.checkpoint.authority.sessions, local.authority.sessions)
+      : local.authority.sessions;
     const authority = combineSerializedAuthoritySlices(
-      mergeSerializedSessions(local.authority.sessions, directoryScopeSessions),
+      baseSessions,
       slices
     );
     // Session rows are live authority too: if we ship a session whose actor row
@@ -4729,22 +4800,14 @@ export class PersistentObjectDO {
     const filteredAuthority: SerializedAuthoritySlice = authority.sessions.length === authoritySessions.length
       ? authority
       : { ...authority, sessions: authoritySessions };
-    world.recordMetric({
-      kind: "authority_slice_reconstructed",
-      reason: reconstructionReason,
-      scope: reconstructionScope,
-      object_count: authoritySliceObjectIds(filteredAuthority).size,
-      page_count: authoritySlicePageCount(filteredAuthority),
-      source_host: localHost
-    });
-    const checkpointSeq = this.authorityCheckpointAppliedSeq(reconstructionScope, options.checkpointHead);
+    const checkpointSeq = this.authorityCheckpointAppliedSeq(reconstructionScope, options.checkpointHead) ?? checkpointLookup?.checkpoint.appliedSeq ?? null;
+    let checkpointStored = false;
     if (staleFallbackCount === 0 && checkpointSeq !== null) {
-      this.storeAuthorityCheckpoint(reconstructionScope, filteredAuthority, checkpointSeq);
+      checkpointStored = this.storeAuthorityCheckpoint(reconstructionScope, filteredAuthority, checkpointSeq);
     }
+    const reason = checkpointLookup && checkpointStored ? "warm_checkpoint_repaired" : reconstructionReason;
     return {
-      sessions: filteredAuthority.sessions,
-      session_objects: [],
-      authority: filteredAuthority,
+      ...this.authorityPayloadFromCachedAuthority(world, reconstructionScope, filteredAuthority, directoryScopeSessions, reason),
       staleFallbackCount
     };
   }

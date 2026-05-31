@@ -25,21 +25,57 @@ export type MergeSerializedAuthorityOptions = {
   clone?: boolean;
 };
 
+export type AuthorityPageProvenance = Pick<ShadowStatePageRef, "source" | "source_host">;
+
 export function buildSerializedAuthorityCellSlice(input: {
   sessions: readonly SerializedSession[];
   objects: readonly SerializedObject[];
   counters: Pick<SerializedWorld, "objectCounter" | "parkedTaskCounter" | "sessionCounter">;
   tombstones?: readonly ObjRef[];
+  pageProvenance?: (page: ShadowStatePage) => AuthorityPageProvenance | null | undefined;
 }): SerializedAuthorityCellSlice {
   const pages = input.objects.flatMap((obj) => shadowStatePagesForObject(obj));
   return {
     kind: "woo.authority_slice.cells.shadow.v1",
     sessions: structuredClone(input.sessions) as SerializedSession[],
-    page_refs: pages.map((page) => shadowStatePageRef(page, true)),
+    page_refs: pages.map((page) => authorityPageRefWithProvenance(shadowStatePageRef(page, true), input.pageProvenance?.(page))),
     inline_pages: pages.map((page) => structuredClone(page) as ShadowStatePage),
     counters: { ...input.counters },
     tombstones: [...(input.tombstones ?? [])].sort(),
     source_object_count: input.objects.length
+  };
+}
+
+export function authorityPageRefWithProvenance(
+  ref: ShadowStatePageRef,
+  provenance: AuthorityPageProvenance | null | undefined
+): ShadowStatePageRef {
+  if (!provenance?.source) return ref;
+  return {
+    ...ref,
+    source: provenance.source,
+    ...(provenance.source_host ? { source_host: provenance.source_host } : {})
+  };
+}
+
+export function withAuthorityPageProvenance(
+  authority: SerializedAuthoritySlice,
+  provenance: (ref: ShadowStatePageRef) => AuthorityPageProvenance | null | undefined
+): SerializedAuthoritySlice {
+  if (!isAuthorityCellSlice(authority)) {
+    return {
+      kind: "woo.authority_slice.shadow.v1",
+      sessions: authority.sessions.map((session) => structuredClone(session) as SerializedSession),
+      objects: authority.objects.map((obj) => structuredClone(obj) as SerializedObject)
+    };
+  }
+  return {
+    ...authority,
+    sessions: authority.sessions.map((session) => structuredClone(session) as SerializedSession),
+    page_refs: authority.page_refs.map((ref) => authorityPageRefWithProvenance(structuredClone(ref) as ShadowStatePageRef, provenance(ref))),
+    inline_pages: authority.inline_pages.map((page) => structuredClone(page) as ShadowStatePage),
+    counters: { ...authority.counters },
+    tombstones: [...authority.tombstones]
   };
 }
 
