@@ -22,6 +22,7 @@ import type { ShadowCapabilityAd } from "./capability-ad";
 import {
   serializedFor,
   shadowCommitScopeObject,
+  shadowLocationCommitScopeForTranscript,
   shadowPlacementTransactionForTranscript,
   submitShadowCommit,
   transcriptTouchedObjectIds,
@@ -222,6 +223,11 @@ export type ShadowTurnExecRequest = {
   id?: string;
   call: ShadowTurnCall;
   key: ShadowTurnKey;
+  // A server-side planner may already have executed the turn to discover the
+  // commit authority. Alternate commit authorities validate and commit that
+  // transcript; they must not re-run the VM just to sequence the write.
+  planned_transcript?: EffectTranscript;
+  planned_frame?: AppliedFrame | DirectResultFrame | ErrorFrame;
   expected?: ShadowScopeHead;
   auth?: {
     mode: "shadow_local";
@@ -268,6 +274,7 @@ export type ShadowTurnExecReply =
 
 export type ShadowTurnExecutionOptions = {
   commitScope?: ShadowCommitScope;
+  commitScopeForTranscript?: (transcript: EffectTranscript) => ShadowCommitScope | null | undefined;
   profile?: (event: MetricEvent & { kind: "shadow_apply_step" }) => void;
   metric?: (event: MetricEvent) => void;
 };
@@ -738,10 +745,11 @@ export async function executeAuthoritativeShadowTurnCall(
     persistence: "durable"
   };
   const commitTransaction = shadowPlacementTransactionForTranscript(run.transcript) ?? undefined;
+  const locationCommitScope = shadowLocationCommitScopeForTranscript(run.transcript);
   const commit = submitShadowCommit(input.commitScope, {
     kind: "woo.commit.submit.shadow.v1",
     id: request.id ?? input.call.id,
-    scope: commitTransaction ? input.commitScope.scope : run.transcript.scope,
+    scope: commitTransaction || locationCommitScope === input.commitScope.scope ? input.commitScope.scope : run.transcript.scope,
     expected: request.expected ?? input.commitScope.head,
     transcript: run.transcript,
     ...(commitTransaction ? { transaction: commitTransaction } : {}),
@@ -902,15 +910,24 @@ export async function executeShadowTurnCallOrNeedState(
   }
 
   const livePersistence = request.persistence === "live";
-  const commitTransaction = options.commitScope
+  const selectedCommitScope = !livePersistence
+    ? options.commitScopeForTranscript?.(run.transcript) ?? options.commitScope
+    : options.commitScope;
+  const commitTransaction = selectedCommitScope
     ? shadowPlacementTransactionForTranscript(run.transcript) ?? undefined
     : undefined;
-  const commit = options.commitScope && !livePersistence
-    ? submitShadowCommit(options.commitScope, {
+  const locationCommitScope = selectedCommitScope
+    ? shadowLocationCommitScopeForTranscript(run.transcript)
+    : null;
+  const expected = selectedCommitScope && request.expected?.scope === selectedCommitScope.scope
+    ? request.expected
+    : selectedCommitScope?.head;
+  const commit = selectedCommitScope && !livePersistence
+    ? submitShadowCommit(selectedCommitScope, {
         kind: "woo.commit.submit.shadow.v1",
         id: request.id ?? request.call.id,
-        scope: commitTransaction ? options.commitScope.scope : run.transcript.scope,
-        expected: request.expected ?? options.commitScope.head,
+        scope: commitTransaction || locationCommitScope === selectedCommitScope.scope ? selectedCommitScope.scope : run.transcript.scope,
+        expected: expected ?? selectedCommitScope.head,
         transcript: run.transcript,
         ...(commitTransaction ? { transaction: commitTransaction } : {}),
         executor: node.node,
@@ -955,7 +972,7 @@ export async function executeShadowTurnCallOrNeedState(
   }
 
   const serializedAfter = commit?.kind === "woo.commit.accepted.shadow.v1"
-    ? options.commitScope ? serializedFor(options.commitScope, { reason: "turn_exec_result" }) : requireSerializedAfter(run)
+    ? selectedCommitScope ? serializedFor(selectedCommitScope, { reason: "turn_exec_result" }) : requireSerializedAfter(run)
     : livePersistence
       ? serializedBefore
       : requireSerializedAfter(run);
@@ -970,7 +987,7 @@ export async function executeShadowTurnCallOrNeedState(
   // inspects the node after the turn.
   const acceptedKey = shadowTurnKeyFromTranscript(run.transcript);
   for (const hash of acceptedKey.atom_hashes) node.atom_hashes.add(hash);
-  if (!livePersistence) cacheShadowTranscriptObjects(node, run.transcript, options.commitScope);
+  if (!livePersistence) cacheShadowTranscriptObjects(node, run.transcript, selectedCommitScope);
   return {
     ok: true,
     attempted: true,

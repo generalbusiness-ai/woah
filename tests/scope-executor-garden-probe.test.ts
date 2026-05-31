@@ -31,10 +31,10 @@ import type { ShadowTurnKey } from "../src/core/turn-key";
 // cross-room move *materializes* in the executor (no silent E_OBJNF, the
 // actor walks into the_garden in the executor's own frame).
 //
-// CASE B now also runs through the §VTN8.1 placement transaction fence: after
-// the materialization repair, the move commits against a transaction scope that
-// validates the moved actor's location and both rooms' contents cells together.
-// See notes/2026-05-30-v2-materialization-miss-and-movement-tx.md.
+// CASE B now runs through the cell-authority movement model: after the
+// materialization repair, the move commits at the moved actor's location
+// authority. Source/destination contents are derived projections of that
+// accepted location write, not fenced room-membership writes.
 
 // Build the post-deck serialized world once. Shared by all cases.
 async function setupOnDeck(): Promise<{
@@ -148,7 +148,7 @@ describe("scope-executor garden probe", () => {
     }
   });
 
-  it("CASE B: sparse atom-guarded executor missing the_garden repairs and commits through the §VTN8.1 placement transaction", async () => {
+  it("CASE B: sparse atom-guarded executor missing the_garden repairs and commits at the actor location authority", async () => {
     const { fullSerialized, actor, sessionId } = await setupOnDeck();
 
     const call: ShadowTurnCall = {
@@ -229,8 +229,8 @@ describe("scope-executor garden probe", () => {
       anchor: { node: "anchor", serialized: fullSerialized },
       transferMode: "cell_pages",
       commitScope: createShadowCommitScope({
-        node: "placement-authority",
-        scope: "#placement",
+        node: "actor-location-authority",
+        scope: actor,
         serialized: fullSerialized
       })
     });
@@ -286,15 +286,14 @@ describe("scope-executor garden probe", () => {
     );
     expect(enteredGarden).toBe(true);
 
-    // ---- §VTN8.1 PLACEMENT TRANSACTION ----
+    // ---- CA3 ACTOR-ANCHORED MOVEMENT COMMIT ----
     //
-    // The repaired cross-room move now commits under the placement transaction
-    // authority instead of being rejected by destination-room structural
-    // versions. A regression here means the repair loop is visible but still
-    // not usable for durable movement.
+    // The repaired cross-room move now commits at the actor's location
+    // authority. Room contents are updated as projection state, not as a
+    // fenced placement write.
     expect(result.result.ok).toBe(true);
-    if (!result.result.ok) throw new Error(`expected accepted placement commit, got ${result.result.reason}`);
-    expect(result.result.commit?.position.scope).toBe("#placement");
+    if (!result.result.ok) throw new Error(`expected accepted actor-location commit, got ${result.result.reason}`);
+    expect(result.result.commit?.position.scope).toBe(actor);
     const after = createWorldFromSerialized(result.result.serializedAfter, { persist: false });
     expect(after.allLocationsForActor(actor)).toEqual(["the_garden"]);
   });

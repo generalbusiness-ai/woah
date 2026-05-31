@@ -27,7 +27,6 @@ import {
 } from "../core/shadow-browser-node";
 import type { ShadowTurnCall } from "../core/shadow-turn-call";
 import {
-  SHADOW_PLACEMENT_TRANSACTION_SCOPE,
   applyAcceptedShadowFrame,
   applyShadowTranscriptToCommitScopeCache,
   serializedFor,
@@ -621,7 +620,7 @@ export class McpGateway {
       strategy: "planned-exec",
       maxAttempts: 8,
       intentScope: (turn) => turn.persistence === "durable"
-        ? SHADOW_PLACEMENT_TRANSACTION_SCOPE
+        ? turn.scope
         : turn.scope,
       ensureClient: async (submitScope) => await this.ensureV2ScopeClient(entry, submitScope),
       clientNode: () => this.v2NodeFor(entry),
@@ -629,7 +628,6 @@ export class McpGateway {
       clientSerialized: (client) => serializedFor(client.relay.commit_scope, { reason: "mcp_turn_plan", metric: (event) => this.world.recordMetric(event) }),
       nextTurnId: () => id,
       envelopeId: (turnId, attempt) => executorEnvelopeId(turnId, attempt, () => Math.random().toString(36).slice(2, 10)),
-      transactionScopeForTranscript: () => SHADOW_PLACEMENT_TRANSACTION_SCOPE,
       authorityPayload: async (submitScope, extraObjectIds) => {
         const useCommitScopeSnapshotForRemoteAuthority = authorityRefreshAttempts === 0;
         authorityRefreshAttempts += 1;
@@ -637,12 +635,14 @@ export class McpGateway {
           useCommitScopeSnapshotForRemoteAuthority,
           directorySessionScopes: options.directorySessionScopes ?? []
         });
-        const client = this.v2Scopes.get(submitScope) ?? this.v2Scopes.get(scope);
-        const authorityPayload = client && (payload.staleFallbackCount ?? 0) > 0
-          ? this.withRelaySnapshotAuthorityFallback(client, payload)
+        const fallbackClient = this.v2Scopes.get(scope) ?? this.v2Scopes.get(submitScope);
+        const authorityPayload = fallbackClient && (payload.staleFallbackCount ?? 0) > 0
+          ? this.withRelaySnapshotAuthorityFallback(fallbackClient, payload)
           : payload;
-        if (client) this.mergeV2AuthorityIntoScopeClient(client, authorityPayload.authority);
         return authorityPayload;
+      },
+      applyAuthority: (client, authority) => {
+        this.mergeV2AuthorityIntoScopeClient(client, authority);
       },
       submitEnvelope: async (submitScope, body) => {
         const envelopeBody = this.withExecutionCapsule(
@@ -789,6 +789,7 @@ export class McpGateway {
     target: ObjRef,
     verb: string
   ): McpV2EnvelopeBody {
+    if ((body as { planned_transcript_commit?: unknown }).planned_transcript_commit === true) return body;
     if (!hooks.executionCapsuleOpen || !body.authority || !head) return body;
     return {
       ...body,
@@ -1161,8 +1162,8 @@ function restoreSessionActorLiveCells(
     const live = preserved.get(obj.id);
     if (!live) continue;
     // Per-turn authority refreshes may source an actor row from a sparse owner
-    // snapshot. Keep the gateway relay's accepted placement live cells while
-    // allowing actor lineage and property cells to refresh.
+    // snapshot. Keep the gateway relay's accepted derived live projection
+    // cells while allowing actor lineage and property cells to refresh.
     obj.location = live.location;
     obj.children = live.children.slice();
     obj.contents = live.contents.slice();

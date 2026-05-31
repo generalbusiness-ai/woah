@@ -1,4 +1,5 @@
 import { buildShadowCapabilityAd, rankCapabilityAdsForTurn, type ShadowCapabilityAd } from "./capability-ad";
+import type { EffectTranscript } from "./effect-transcript";
 import type { SerializedWorld } from "./repository";
 import { createShadowCommitScope, serializedFor, type ShadowCommitScope } from "./shadow-commit-scope";
 import {
@@ -80,6 +81,7 @@ export async function executeShadowTurnCallAcrossInProcessNetwork(input: {
   maxTransfers?: number;
   maxStaleHeadRetries?: number;
   commitScope?: ShadowCommitScope;
+  commitScopeForTranscript?: (transcript: EffectTranscript) => ShadowCommitScope | null | undefined;
   profile?: (event: MetricEvent & { kind: "shadow_apply_step" }) => void;
   metric?: (event: MetricEvent) => void;
 }): Promise<ShadowInProcessNetworkResult> {
@@ -102,7 +104,12 @@ export async function executeShadowTurnCallAcrossInProcessNetwork(input: {
   // Cloning the request lets us bump `expected` per retry without mutating the
   // caller's input.
   let activeRequest: ShadowTurnExecRequest = input.request;
-  const first = await executeShadowTurnCallOrNeedState(selected, activeRequest, { commitScope, profile: input.profile, metric: input.metric });
+  const first = await executeShadowTurnCallOrNeedState(selected, activeRequest, {
+    commitScope,
+    commitScopeForTranscript: input.commitScopeForTranscript,
+    profile: input.profile,
+    metric: input.metric
+  });
   let result = first;
   const transfers: ShadowStateTransfer[] = [];
   const maxTransfers = input.maxTransfers ?? 3;
@@ -168,7 +175,12 @@ export async function executeShadowTurnCallAcrossInProcessNetwork(input: {
     } else {
       break;
     }
-    result = await executeShadowTurnCallOrNeedState(selected, activeRequest, { commitScope, profile: input.profile, metric: input.metric });
+    result = await executeShadowTurnCallOrNeedState(selected, activeRequest, {
+      commitScope,
+      commitScopeForTranscript: input.commitScopeForTranscript,
+      profile: input.profile,
+      metric: input.metric
+    });
   }
 
   if (transfers.length === 0) {

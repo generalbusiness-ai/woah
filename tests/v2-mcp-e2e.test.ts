@@ -4,7 +4,6 @@ import { executorAuthorityPayload } from "../src/core/executor";
 import { authoritySliceObjectIds, filterSerializedAuthoritySliceObjects, serializedWorldFromAuthoritySlice } from "../src/core/authority-slice";
 import { encodeEnvelope, type ShadowEnvelope } from "../src/core/shadow-envelope";
 import { createShadowBrowserRelayShim } from "../src/core/shadow-browser-node";
-import { SHADOW_PLACEMENT_TRANSACTION_SCOPE } from "../src/core/shadow-commit-scope";
 import type { ShadowTurnExecReply } from "../src/core/shadow-turn-exec";
 import type { ObjRef } from "../src/core/types";
 import { McpGateway, type McpV2EnvelopeBody, type McpV2OpenBody } from "../src/mcp/gateway";
@@ -96,14 +95,15 @@ describe("v2 MCP e2e", () => {
         arguments: { object: "the_chatroom", verb: "enter", args: [] }
       });
       expect(entered.result.isError).not.toBe(true);
-      const placementState = stateFor(SHADOW_PLACEMENT_TRANSACTION_SCOPE);
-      const beforeWait = sqlRows<{ n: number }>(placementState.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_accepted_frame"))[0]?.n;
+      const charlieActor = world.sessions.get(charlie)?.actor;
+      expect(charlieActor).toBeTruthy();
+      const beforeWait = acceptedFramesForState(stateFor(charlieActor!)).length;
 
       await mcp(gateway, alice, 3, "tools/call", {
         name: "woo_wait",
         arguments: { timeout_ms: 0, limit: 10 }
       });
-      const afterWait = sqlRows<{ n: number }>(placementState.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_accepted_frame"))[0]?.n;
+      const afterWait = acceptedFramesForState(stateFor(charlieActor!)).length;
       expect(afterWait).toBe(beforeWait);
     } finally {
       for (const state of scopeStates.values()) state.close();
@@ -476,13 +476,19 @@ describe("v2 MCP e2e", () => {
           `call ${index} failed: ${JSON.stringify(result.result.structuredContent)}`
         ).not.toBe(true);
       }
-      const accepted = sqlRows<{ body: string }>(stateFor(SHADOW_PLACEMENT_TRANSACTION_SCOPE).storage.sql.exec("SELECT body FROM v2_commit_scope_accepted_frame ORDER BY seq"));
+      const actorScopes = sessions
+        .map((session) => world.sessions.get(session)?.actor)
+        .filter((actor): actor is ObjRef => Boolean(actor));
+      expect(actorScopes).toHaveLength(concurrentCalls);
+      const accepted = actorScopes.flatMap((actor) => acceptedFramesForState(stateFor(actor)));
       expect(accepted).toHaveLength(concurrentCalls);
-      expect(accepted.map((row) => JSON.parse(row.body).position.seq)).toEqual([1, 2, 3, 4]);
-      expect(openBodies.filter((body) => body.scope === SHADOW_PLACEMENT_TRANSACTION_SCOPE)).toHaveLength(concurrentCalls);
-      expect(openBodies.every((body) => !Object.prototype.hasOwnProperty.call(body, "serialized"))).toBe(true);
-      expect(openBodies.every((body) => Array.isArray(body.session_objects) && body.session_objects.length === 0)).toBe(true);
-      expect(openBodies.every((body) => body.authority?.kind === "woo.authority_slice.cells.shadow.v1")).toBe(true);
+      expect(accepted.map((frame) => frame.position.scope).sort()).toEqual([...actorScopes].sort());
+      expect(accepted.map((frame) => frame.position.seq)).toEqual([1, 1, 1, 1]);
+      const actorOpenBodies = openBodies.filter((body) => actorScopes.includes(body.scope));
+      expect(actorOpenBodies).toHaveLength(concurrentCalls);
+      expect(actorOpenBodies.every((body) => !Object.prototype.hasOwnProperty.call(body, "serialized"))).toBe(true);
+      expect(actorOpenBodies.every((body) => Array.isArray(body.session_objects) && body.session_objects.length === 0)).toBe(true);
+      expect(actorOpenBodies.every((body) => body.authority?.kind === "woo.authority_slice.cells.shadow.v1")).toBe(true);
     } finally {
       releaseEnvelopeBatch();
       for (const state of scopeStates.values()) state.close();
@@ -559,6 +565,16 @@ function sqlRows<T>(cursor: unknown): T[] {
     return cursor.toArray() as T[];
   }
   return Array.from(cursor as Iterable<T>);
+}
+
+function acceptedFramesForState(state: FakeDurableObjectState): Array<{ position: { scope: ObjRef; seq: number } }> {
+  try {
+    return sqlRows<{ body: string }>(state.storage.sql.exec("SELECT body FROM v2_commit_scope_accepted_frame ORDER BY seq"))
+      .map((row) => JSON.parse(row.body) as { position: { scope: ObjRef; seq: number } });
+  } catch (err) {
+    if (err instanceof Error && /no such table/.test(err.message)) return [];
+    throw err;
+  }
 }
 
 function missingStateReply(id: string): ShadowTurnExecReply {

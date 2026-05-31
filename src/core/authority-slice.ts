@@ -48,6 +48,7 @@ export function serializedWorldFromAuthoritySlice(authority: MergeSerializedAuth
     const referenced = new Set(authority.page_refs.map((ref) => ref.hash));
     const pages = authority.inline_pages.filter((page) => referenced.has(shadowStatePageHash(page)));
     const serialized = mergeShadowStatePagesIntoSerialized(emptySerializedWorldFromAuthority(authority), pages, () => emptySerializedWorldFromAuthority(authority));
+    repairDerivedContentsProjection(serialized);
     pruneSerializedSessionsWithoutActorRows(serialized);
     return serialized;
   }
@@ -63,6 +64,7 @@ export function serializedWorldFromAuthoritySlice(authority: MergeSerializedAuth
     parkedTasks: [],
     tombstones: []
   };
+  repairDerivedContentsProjection(serialized);
   pruneSerializedSessionsWithoutActorRows(serialized);
   return serialized;
 }
@@ -79,6 +81,7 @@ export function mergeSerializedAuthoritySlice(
   } else {
     changed = mergeAuthorityObjectRows(serialized, authority.objects, options) || changed;
   }
+  changed = repairDerivedContentsProjection(serialized) || changed;
   changed = pruneSerializedSessionsWithoutActorRows(serialized) || changed;
   return changed;
 }
@@ -87,6 +90,7 @@ export function combineSerializedAuthoritySlices(
   sessions: readonly SerializedSession[],
   slices: readonly MergeSerializedAuthorityInput[]
 ): SerializedAuthoritySlice {
+  const emitCellSlice = slices.some(isAuthorityCellSlice);
   const lastPageByKey = new Map<string, ShadowStatePageRef>();
   const inlineByHash = new Map<string, ShadowStatePage>();
   const legacyObjects = new Map<ObjRef, SerializedObject>();
@@ -97,11 +101,9 @@ export function combineSerializedAuthoritySlices(
   };
   const tombstones = new Set<ObjRef>();
   let sourceObjectCount = 0;
-  let sawCellSlice = false;
 
   for (const slice of slices) {
     if (isAuthorityCellSlice(slice)) {
-      sawCellSlice = true;
       counters = {
         objectCounter: Math.max(counters.objectCounter, slice.counters.objectCounter),
         parkedTaskCounter: Math.max(counters.parkedTaskCounter, slice.counters.parkedTaskCounter),
@@ -113,25 +115,30 @@ export function combineSerializedAuthoritySlices(
       for (const ref of slice.page_refs) lastPageByKey.set(authorityPageRefKey(ref), structuredClone(ref) as ShadowStatePageRef);
       continue;
     }
+    if (emitCellSlice) {
+      // Preserve slice precedence across both legacy object slices and cell-page
+      // slices. Deferring legacy objects until after all cell slices makes stale
+      // local rows override fresher remote rows solely because of representation.
+      for (const obj of slice.objects) {
+        const pages = shadowStatePagesForObject(obj);
+        sourceObjectCount += 1;
+        for (const page of pages) {
+          const ref = shadowStatePageRef(page, true);
+          inlineByHash.set(ref.hash, structuredClone(page) as ShadowStatePage);
+          lastPageByKey.set(authorityPageRefKey(ref), ref);
+        }
+      }
+      continue;
+    }
     for (const obj of slice.objects) legacyObjects.set(obj.id, structuredClone(obj) as SerializedObject);
   }
 
-  if (!sawCellSlice) {
+  if (!emitCellSlice) {
     return {
       kind: "woo.authority_slice.shadow.v1",
       sessions: sessions.map((session) => structuredClone(session) as SerializedSession),
       objects: Array.from(legacyObjects.values()).sort((a, b) => a.id.localeCompare(b.id))
     };
-  }
-
-  for (const obj of legacyObjects.values()) {
-    const pages = shadowStatePagesForObject(obj);
-    sourceObjectCount += 1;
-    for (const page of pages) {
-      const ref = shadowStatePageRef(page, true);
-      inlineByHash.set(ref.hash, structuredClone(page) as ShadowStatePage);
-      lastPageByKey.set(authorityPageRefKey(ref), ref);
-    }
   }
 
   return {
@@ -333,6 +340,43 @@ function mergeAuthorityMetadata(
       serialized.tombstones = next;
       changed = true;
     }
+  }
+  return changed;
+}
+
+function repairDerivedContentsProjection(serialized: { objects: SerializedObject[] }): boolean {
+  // CA3/CA4: `location` is the authoritative movement cell; `contents` is a
+  // derived compatibility projection. Sparse authority merges often carry both
+  // a moved object and its current container, so repair that per-member index
+  // locally without requiring a second authoritative room write.
+  const byId = new Map(serialized.objects.map((obj) => [obj.id, obj] as const));
+  const desiredByContainer = new Map<ObjRef, Set<ObjRef>>();
+  for (const obj of serialized.objects) {
+    if (!obj.location || !byId.has(obj.location)) continue;
+    let members = desiredByContainer.get(obj.location);
+    if (!members) {
+      members = new Set();
+      desiredByContainer.set(obj.location, members);
+    }
+    members.add(obj.id);
+  }
+
+  let changed = false;
+  for (const container of serialized.objects) {
+    const next = new Set<ObjRef>();
+    for (const member of container.contents) {
+      const memberRow = byId.get(member);
+      if (memberRow && memberRow.location !== container.id) {
+        changed = true;
+        continue;
+      }
+      next.add(member);
+    }
+    for (const member of desiredByContainer.get(container.id) ?? []) next.add(member);
+    const contents = Array.from(next).sort();
+    if (stableShadowJson(contents as unknown as WooValue) === stableShadowJson(container.contents as unknown as WooValue)) continue;
+    container.contents = contents;
+    changed = true;
   }
   return changed;
 }

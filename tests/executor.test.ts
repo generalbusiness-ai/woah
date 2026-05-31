@@ -14,7 +14,6 @@ import {
   executorAuthorityPayload,
   executorEnvelopeId,
   executorAuthorityObjectIds,
-  executorTransactionObjectIds,
   executorObjectIdsFromMissingState,
   executorReplyNeedsRepair,
   type ExecutorEnvelopeBody
@@ -374,7 +373,7 @@ describe("v2 turn gateway", () => {
     expect(result.reply?.ok).toBe(true);
   });
 
-  it("routes planned movement through an explicit placement transaction scope", async () => {
+  it("routes planned movement to the moved object's location authority", async () => {
     const world = createWorld();
     const session = world.auth("guest:v2-placement-planned");
     const entered = await world.call("placement-enter", session.id, "the_chatroom", {
@@ -401,34 +400,25 @@ describe("v2 turn gateway", () => {
       },
       strategy: "planned-exec",
       maxAttempts: 1,
-      transactionScopeForTranscript: ({ transaction }) => {
-        expect(executorTransactionObjectIds(transaction)).toEqual(expect.arrayContaining([
-          session.actor,
-          "the_chatroom",
-          "the_deck"
-        ]));
-        return "#placement" as ObjRef;
-      },
       ...harness.options
     });
 
     expect(result.kind).toBe("submitted");
     if (result.kind !== "submitted") throw new Error("expected planned submission");
     expect(result.scope).toBe("the_chatroom");
-    expect(result.commitScope).toBe("#placement");
-    expect(harness.ensureScopes).toEqual(["the_chatroom", "#placement"]);
+    expect(result.commitScope).toBe(session.actor);
+    expect(harness.ensureScopes).toEqual(["the_chatroom", session.actor]);
     expect(harness.submissions).toHaveLength(1);
     const submitted = harness.submissions[0];
-    expect(submitted.scope).toBe("#placement");
-    expect(submitted.body.scope).toBe("#placement");
-    expect(submitted.body.node).toBe("node:#placement");
+    expect(submitted.scope).toBe(session.actor);
+    expect(submitted.body.scope).toBe(session.actor);
+    expect(submitted.body.node).toBe(`node:${session.actor}`);
     expect(submitted.request.key.scope).toBe("the_chatroom");
-    expect(submitted.request.expected).toEqual(scopeHead("#placement"));
+    expect(submitted.request.expected).toEqual(scopeHead(session.actor));
     expect(harness.authorityRequests.at(-1)).toEqual(expect.arrayContaining([
-      "#placement",
+      session.actor,
       "the_chatroom",
-      "the_deck",
-      session.actor
+      "the_deck"
     ]));
     expect(authorityObjectIds(submitted.body.authority)).toEqual(expect.arrayContaining([
       "the_chatroom",

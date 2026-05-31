@@ -4,7 +4,7 @@ import type {
   SerializedSession,
   SpaceSnapshotRecord
 } from "./repository";
-import { wooError, type ErrorValue, type Message, type Observation, type SpaceLogEntry, type VerbDef, type WooValue } from "./types";
+import { wooError, type ErrorValue, type Message, type Observation, type PresenceProjectionDef, type PropertyDef, type SpaceLogEntry, type VerbDef, type WooValue } from "./types";
 
 export type SqlRow = Record<string, unknown>;
 
@@ -45,6 +45,7 @@ export const SQL_SCHEMA_STATEMENTS = [
     owner TEXT NOT NULL,
     perms TEXT NOT NULL,
     version INTEGER NOT NULL DEFAULT 1,
+    metadata TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY (object_id, name)
   )`,
   `CREATE TABLE IF NOT EXISTS property_value (
@@ -173,6 +174,50 @@ export function parseSqlValue(value: unknown): WooValue {
   } catch (err) {
     throw wooError("E_STORAGE", "invalid JSON value in SQL repository", err instanceof Error ? err.message : String(err));
   }
+}
+
+export function propertyDefFromSqlRow(row: SqlRow, name = String(row.name)): PropertyDef {
+  const metadata = row.metadata == null ? {} : parseSqlValue(row.metadata);
+  const presenceProjection = presenceProjectionFromMetadata(metadata);
+  return {
+    name,
+    defaultValue: parseSqlValue(String(row.default_val)),
+    typeHint: row.type_hint == null ? undefined : String(row.type_hint),
+    owner: String(row.owner),
+    perms: String(row.perms),
+    version: Number(row.version),
+    ...(presenceProjection ? { presenceProjection } : {})
+  };
+}
+
+export function propertyDefMetadataJson(def: PropertyDef): string {
+  const metadata: Record<string, WooValue> = {};
+  if (def.presenceProjection) metadata.presenceProjection = def.presenceProjection as unknown as WooValue;
+  return stringifySqlValue(metadata);
+}
+
+export function presenceProjectionFromMetadata(metadata: unknown): PresenceProjectionDef | undefined {
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return undefined;
+  const raw = (metadata as Record<string, unknown>).presenceProjection;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const record = raw as Record<string, unknown>;
+  if (record.kind !== "presence") return undefined;
+  if (record.key === "actor") return { kind: "presence", key: "actor" };
+  if (
+    record.key === "session" &&
+    typeof record.sessionField === "string" &&
+    record.sessionField.length > 0 &&
+    typeof record.actorField === "string" &&
+    record.actorField.length > 0
+  ) {
+    return {
+      kind: "presence",
+      key: "session",
+      sessionField: record.sessionField,
+      actorField: record.actorField
+    };
+  }
+  return undefined;
 }
 
 export function flagsToSqlInt(flags: SerializedObject["flags"]): number {

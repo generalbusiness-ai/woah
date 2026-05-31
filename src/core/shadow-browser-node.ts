@@ -3,8 +3,12 @@ import {
   createShadowCommitScope,
   isShadowCommitScopeSerializedDirty,
   markShadowCommitScopeSerializedChanged,
+  applyShadowTranscriptToCommitScopeCache,
   shadowCommitScopeSerializedRef,
+  shadowLocationCommitScopeForTranscript,
+  shadowPlacementTransactionForTranscript,
   serializedFor,
+  submitShadowCommit,
   transcriptTouchedObjectIds,
   type ShadowCommitAccepted,
   type ShadowCommitConflict,
@@ -220,6 +224,7 @@ export type ShadowBrowserRelayShim = {
   node: string;
   deployment: string;
   commit_scope: ShadowCommitScope;
+  commit_scopes: Map<ObjRef, ShadowCommitScope>;
   executors: ShadowExecutionNode[];
   subscriptions: Map<ObjRef, Set<string>>;
   browsers: Map<string, ShadowBrowserNode>;
@@ -454,15 +459,17 @@ export function createShadowBrowserRelayShim(input: {
     deployment,
     session_revs: input.session_revs
   });
+  const commitScope = createShadowCommitScope({
+    node: input.node,
+    scope: input.scope,
+    serialized: input.serialized
+  });
   return {
     kind: "woo.browser_relay.shadow.v1",
     node: input.node,
     deployment,
-    commit_scope: createShadowCommitScope({
-      node: input.node,
-      scope: input.scope,
-      serialized: input.serialized
-    }),
+    commit_scope: commitScope,
+    commit_scopes: new Map([[input.scope, commitScope]]),
     executors: input.executors ?? [],
     subscriptions: new Map(),
     browsers: new Map(),
@@ -551,6 +558,24 @@ function noteShadowBrowserRelayCommitAccepted(relay: ShadowBrowserRelayShim): vo
   // pre-commit pages.
   relay.serialized_generation++;
   relay.open_executable_seed_cache.clear();
+}
+
+function shadowBrowserRelayCommitScopeForTranscript(relay: ShadowBrowserRelayShim, transcript: EffectTranscript): ShadowCommitScope {
+  const locationScope = shadowLocationCommitScopeForTranscript(transcript);
+  return shadowBrowserRelayCommitScopeFor(relay, locationScope ?? transcript.scope);
+}
+
+function shadowBrowserRelayCommitScopeFor(relay: ShadowBrowserRelayShim, scope: ObjRef): ShadowCommitScope {
+  if (scope === relay.commit_scope.scope) return relay.commit_scope;
+  const existing = relay.commit_scopes.get(scope);
+  if (existing) return existing;
+  const commitScope = createShadowCommitScope({
+    node: `${relay.node}:${scope}`,
+    scope,
+    serialized: serializedFor(relay.commit_scope, { reason: "foreign_commit_scope_seed" })
+  });
+  relay.commit_scopes.set(scope, commitScope);
+  return commitScope;
 }
 
 export function createShadowBrowserNode(input: {
@@ -1591,6 +1616,12 @@ export function publishShadowBrowserAcceptedFrame(
   accepted: ShadowCommitAccepted,
   transcript: EffectTranscript
 ): void {
+  if (accepted.position.scope !== relay.commit_scope.scope) {
+    // A browser may execute while subscribed to a room but commit movement at
+    // the moved object's natural authority. Keep the relay's subscribed-scope
+    // projection cache current without advancing that room's sequencer head.
+    applyShadowTranscriptToCommitScopeCache(relay.commit_scope, transcript);
+  }
   rememberShadowBrowserAcceptedFrame(relay, accepted, transcript);
   // Drop per-session live snapshots so the next live/direct call rebases on
   // the freshly committed scope state instead of a stale pre-commit view.
@@ -1941,6 +1972,9 @@ async function executeShadowBrowserTurnExecRequest(
   options: Pick<ShadowBrowserTurnExecEnvelopeOptions, "profile" | "onMetric"> = {}
 ): Promise<ShadowTurnExecutionResult> {
   validateShadowBrowserNodeAuth(browser);
+  if (request.planned_transcript) {
+    return commitShadowBrowserPlannedTranscript(browser, request, options);
+  }
   const executor = shadowRelayExecutorForRequest(browser.relay, request);
   const network = await executeShadowTurnCallAcrossInProcessNetwork({
     request,
@@ -1954,6 +1988,7 @@ async function executeShadowBrowserTurnExecRequest(
       serialized: serializedFor(browser.relay.commit_scope, { reason: "turn_exec_anchor" })
     },
     commitScope: browser.relay.commit_scope,
+    commitScopeForTranscript: (transcript) => shadowBrowserRelayCommitScopeForTranscript(browser.relay, transcript),
     ...(request.guarded_execution === true ? { maxTransfers: 8 } : {}),
     profile: options.profile,
     metric: options.onMetric
@@ -2006,6 +2041,82 @@ async function executeShadowBrowserTurnExecRequest(
     applyShadowBrowserConflict(browser, network.result.commit);
   }
   return network.result;
+}
+
+function commitShadowBrowserPlannedTranscript(
+  browser: ShadowBrowserNode,
+  request: ShadowTurnExecRequest,
+  options: Pick<ShadowBrowserTurnExecEnvelopeOptions, "profile" | "onMetric"> = {}
+): ShadowTurnExecutionResult {
+  const transcript = request.planned_transcript;
+  if (!transcript) throw new Error("planned transcript commit requires transcript");
+  if (!request.planned_frame) throw new Error("planned transcript commit requires frame");
+  const actualKey = shadowTurnKeyFromTranscript(transcript);
+  if (stableShadowJson(actualKey as unknown as WooValue) !== stableShadowJson(request.key as unknown as WooValue)) {
+    throw new Error("planned transcript key mismatch");
+  }
+  const transaction = shadowPlacementTransactionForTranscript(transcript) ?? undefined;
+  const commitScope = shadowBrowserRelayCommitScopeForTranscript(browser.relay, transcript);
+  const expected = request.expected?.scope === commitScope.scope ? request.expected : commitScope.head;
+  const locationCommitScope = shadowLocationCommitScopeForTranscript(transcript);
+  const commit = submitShadowCommit(commitScope, {
+    kind: "woo.commit.submit.shadow.v1",
+    id: request.id ?? request.call.id,
+    scope: transaction || locationCommitScope === commitScope.scope ? commitScope.scope : transcript.scope,
+    expected,
+    transcript,
+    ...(transaction ? { transaction } : {}),
+    executor: browser.node,
+    profile: options.profile,
+    metric: options.onMetric
+  });
+  const receipt = commit.receipt;
+  if (!receipt.accepted) {
+    const conflict = commit.kind === "woo.commit.conflict.shadow.v1" ? commit : undefined;
+    const reply: ShadowTurnExecReply = {
+      kind: "woo.turn.exec.reply.shadow.v1",
+      ok: false,
+      id: request.id ?? request.call.id,
+      reason: "commit_rejected",
+      transcript,
+      commit: conflict
+    };
+    return {
+      ok: false,
+      reason: "commit_rejected",
+      attempted: true,
+      transcript,
+      receipt,
+      commit: conflict,
+      frame: request.planned_frame,
+      reply
+    };
+  }
+  if (commit.kind !== "woo.commit.accepted.shadow.v1") {
+    throw new Error("planned transcript commit returned a conflict result after accepted receipt");
+  }
+  noteShadowBrowserRelayCommitAccepted(browser.relay);
+  publishShadowBrowserAcceptedFrame(browser.relay, commit, transcript);
+  const reply: ShadowTurnExecReply = {
+    kind: "woo.turn.exec.reply.shadow.v1",
+    ok: true,
+    id: request.id ?? request.call.id,
+    outcome: transcript.error
+      ? { error: transcript.error as unknown as WooValue }
+      : { result: transcript.result },
+    transcript,
+    commit
+  };
+  return {
+    ok: true,
+    attempted: true,
+    transcript,
+    receipt,
+    commit,
+    frame: request.planned_frame,
+    serializedAfter: serializedFor(browser.relay.commit_scope, { reason: "planned_transcript_commit" }),
+    reply
+  };
 }
 
 function shadowRelayExecutorForRequest(relay: ShadowBrowserRelayShim, request: ShadowTurnExecRequest): ShadowExecutionNode {

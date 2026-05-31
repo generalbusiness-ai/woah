@@ -1,7 +1,7 @@
 import type { SerializedWorld } from "./repository";
 import { shadowOwnerCellVersion, shadowStructuralCellVersion, stableShadowJson } from "./shadow-cell-version";
 import { hashSource } from "./source-hash";
-import type { ErrorValue, ObjRef, Observation, WooValue } from "./types";
+import type { ErrorValue, ObjRef, Observation, PresenceProjectionDef, WooValue } from "./types";
 import type { RecordedCell, RecordedCellWriteOp, RecordedProjectionWrite, RecordedTurn, RecordedWriteAuthority, TurnStart } from "./turn-recorder";
 import { nativePrimitiveContractValue, nativePrimitiveIsTranscriptTracked } from "./native-primitive-contract";
 import { readObjectPropertyValue, type PropertyReadableObject } from "./property-read";
@@ -270,6 +270,8 @@ export function validateTranscriptWithCellReader(reader: TranscriptCellReader, t
       continue;
     }
     if (readMatchesSequencedAllocation(transcript, read, actual)) continue;
+    if (readMatchesSameTurnMovementProjection(transcript, read, actual)) continue;
+    if (readMatchesSameTurnPresenceProjection(reader, transcript, read, actual)) continue;
     const readMatchesOwnWrite = sameTurn.reason === "own_write_mismatch" ? false : sameTurnReadMatchesOwnWrite(transcript, read);
     if (!readMatchesOwnWrite && read.version !== actual.version) {
       errors.push(`read version mismatch ${cellLabel(read.cell)}: transcript=${read.version ?? "none"} actual=${actual.version ?? "none"}`);
@@ -326,6 +328,106 @@ function projectionWriteShapeError(write: RecordedProjectionWrite): string | nul
     default:
       return `projection_write unsupported table ${(write as { table?: string }).table ?? "unknown"}`;
   }
+}
+
+function readMatchesSameTurnPresenceProjection(
+  reader: TranscriptCellReader,
+  transcript: EffectTranscript,
+  read: TranscriptRead,
+  actual: TranscriptCellRead
+): boolean {
+  if (read.cell.kind !== "prop" || !actual.ok) return false;
+  const projection = presenceProjectionForCell(reader, read.cell.object, read.cell.name);
+  if (!projection) return false;
+  if (!Array.isArray(actual.value) || !Array.isArray(read.value)) return false;
+  const session = transcript.session ?? null;
+  let touched = false;
+  if (projection.key === "actor") {
+    const projected = new Set(actual.value.filter((item): item is ObjRef => typeof item === "string"));
+    for (const move of transcript.moves) {
+      if (move.from === read.cell.object) {
+        projected.delete(move.object);
+        touched = true;
+      }
+      if (move.to === read.cell.object) {
+        projected.add(move.object);
+        touched = true;
+      }
+    }
+    return touched && sameStringSet(Array.from(projected), read.value);
+  }
+  if (!session) return false;
+  const projected = new Map<string, Record<string, WooValue>>();
+  for (const item of actual.value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const row = item as Record<string, unknown>;
+    const key = row[projection.sessionField];
+    if (typeof key === "string") {
+      projected.set(key, row as Record<string, WooValue>);
+    }
+  }
+  for (const move of transcript.moves) {
+    if (move.from === read.cell.object) {
+      projected.delete(session);
+      touched = true;
+    }
+    if (move.to === read.cell.object) {
+      projected.set(session, {
+        [projection.sessionField]: session,
+        [projection.actorField]: move.object
+      });
+      touched = true;
+    }
+  }
+  return touched && stableJson(canonicalPresenceRows(Array.from(projected.values()), projection) as unknown as WooValue) ===
+    stableJson(canonicalPresenceRows(read.value, projection) as unknown as WooValue);
+}
+
+function presenceProjectionForCell(
+  reader: TranscriptCellReader,
+  object: ObjRef,
+  name: string
+): PresenceProjectionDef | null {
+  let current = serializedObject(reader, object);
+  while (current) {
+    const def = readerPropertyDefs(reader, current).get(name);
+    if (def?.presenceProjection) return def.presenceProjection;
+    current = current.parent ? serializedObject(reader, current.parent) : undefined;
+  }
+  return null;
+}
+
+function canonicalPresenceRows(value: readonly unknown[], projection: Extract<PresenceProjectionDef, { key: "session" }>): Array<Record<string, string>> {
+  return value
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === "object" && !Array.isArray(item))
+    .map((item) => ({
+      [projection.sessionField]: String(item[projection.sessionField] ?? ""),
+      [projection.actorField]: String(item[projection.actorField] ?? "")
+    }))
+    .filter((item) => item[projection.sessionField].length > 0 && item[projection.actorField].length > 0)
+    .sort((a, b) =>
+      a[projection.sessionField].localeCompare(b[projection.sessionField]) ||
+      a[projection.actorField].localeCompare(b[projection.actorField])
+    );
+}
+
+function readMatchesSameTurnMovementProjection(transcript: EffectTranscript, read: TranscriptRead, actual: TranscriptCellRead): boolean {
+  if (read.cell.kind !== "contents" || !actual.ok) return false;
+  if (!Array.isArray(actual.value) || !Array.isArray(read.value)) return false;
+  let touched = false;
+  const projected = new Set(actual.value.filter((item): item is ObjRef => typeof item === "string"));
+  for (const move of transcript.moves) {
+    if (move.from === read.cell.object) {
+      projected.delete(move.object);
+      touched = true;
+    }
+    if (move.to === read.cell.object) {
+      projected.add(move.object);
+      touched = true;
+    }
+  }
+  if (!touched) return false;
+  return sameStringSet(Array.from(projected), read.value);
 }
 
 function readMatchesSequencedAllocation(transcript: EffectTranscript, read: TranscriptRead, actual: TranscriptCellRead): boolean {
@@ -652,4 +754,10 @@ function transcriptReadValuesMatch(cell: TranscriptCell, actual: WooValue, recor
 
 function canonicalContentsValue(value: WooValue): WooValue {
   return Array.isArray(value) ? [...value].sort() : value;
+}
+
+function sameStringSet(left: readonly unknown[], right: readonly unknown[]): boolean {
+  const l = left.filter((item): item is string => typeof item === "string").sort();
+  const r = right.filter((item): item is string => typeof item === "string").sort();
+  return stableJson(l as WooValue) === stableJson(r as WooValue);
 }

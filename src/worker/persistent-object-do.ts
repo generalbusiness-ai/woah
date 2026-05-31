@@ -53,6 +53,8 @@ import { installGitHubTap, updateGitHubTap, type CatalogTapLogEvent } from "../c
 import type { ShadowCapabilityAd } from "../core/capability-ad";
 import {
   createShadowBrowserRelayShim,
+  markShadowBrowserRelaySerializedChanged,
+  publishShadowBrowserAcceptedFrame,
   shadowLiveEventsForTranscriptRelay,
   shadowBrowserSessionBearer,
   shadowBrowserSessionClaimsValue,
@@ -65,10 +67,10 @@ import { buildTransportErrorEnvelope, decodeEnvelope, encodeEnvelope, type Shado
 import type { ShadowStateTransfer, ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import { runShadowTurnCall } from "../core/shadow-turn-call";
 import {
-  SHADOW_PLACEMENT_TRANSACTION_SCOPE,
   applyAcceptedShadowFrame,
+  applyShadowTranscriptToCommitScopeCache,
   serializedFor,
-  shadowCommitTransactionCoversTranscript,
+  shadowLocationCommitScopeForTranscript,
   transcriptTouchedObjectIds,
   type ShadowCommitAccepted,
   type ShadowScopeHead
@@ -2111,14 +2113,21 @@ export class PersistentObjectDO {
           // Authoritative def fields only — match the merge's
           // propertyDefEqualIgnoringVersion semantics so cosmetic version
           // drift doesn't appear as a diff.
-          const aDefs = new Map(((a as Array<{ name: string; owner: string; perms: string; typeHint?: string; defaultValue: unknown }>) ?? []).map((d) => [d.name, d]));
-          const bDefs = new Map(((b as Array<{ name: string; owner: string; perms: string; typeHint?: string; defaultValue: unknown }>) ?? []).map((d) => [d.name, d]));
+          const aDefs = new Map(((a as Array<{ name: string; owner: string; perms: string; typeHint?: string; defaultValue: unknown; presenceProjection?: unknown }>) ?? []).map((d) => [d.name, d]));
+          const bDefs = new Map(((b as Array<{ name: string; owner: string; perms: string; typeHint?: string; defaultValue: unknown; presenceProjection?: unknown }>) ?? []).map((d) => [d.name, d]));
           const names = new Set<string>([...aDefs.keys(), ...bDefs.keys()]);
           let recorded = false;
           for (const n of names) {
             const ad = aDefs.get(n);
             const bd = bDefs.get(n);
-            if (ad && bd && ad.owner === bd.owner && ad.perms === bd.perms && (ad.typeHint ?? null) === (bd.typeHint ?? null) && JSON.stringify(ad.defaultValue) === JSON.stringify(bd.defaultValue)) continue;
+            if (
+              ad && bd &&
+              ad.owner === bd.owner &&
+              ad.perms === bd.perms &&
+              (ad.typeHint ?? null) === (bd.typeHint ?? null) &&
+              JSON.stringify(ad.defaultValue) === JSON.stringify(bd.defaultValue) &&
+              JSON.stringify(ad.presenceProjection ?? null) === JSON.stringify(bd.presenceProjection ?? null)
+            ) continue;
             if (!ad && !bd) continue;
             diffs.push({ id: seedObj.id, field: `propertyDefs.${n}`, detail: ad && bd ? "shape changed" : ad ? "stored only" : "seed only" });
             recorded = true;
@@ -3127,7 +3136,9 @@ export class PersistentObjectDO {
           : commit.projection_writes ?? [];
         if (projectionWrites.length > 0 || commit.projection_delta) {
           this.requireProjectionWritesComplete(scope, commit.projection_delta, projectionWrites, "host_apply");
-          return jsonResponse(world.applyProjectionWrites(projectionWrites, { transcript }));
+          const applied = world.applyProjectionWrites(projectionWrites, { transcript });
+          if (applied.creates > 0) await this.registerIncrementalObjectRoutes(world);
+          return jsonResponse(applied);
         }
         // Satellite write-through: apply to the local host slice. The
         // ShadowApplyTarget abstraction supplies only `applyTranscript`
@@ -3705,7 +3716,16 @@ export class PersistentObjectDO {
       // see review finding "P1: Plug cold auth can overwrite the new
       // self-host route back to world."
       const actorRoute = this.world?.objectRoutes().find((route) => route.id === session.actor);
-      await this.registerRoutes([{ id: session.actor, host: actorRoute?.host ?? WORLD_HOST, anchor: actorRoute?.anchor ?? null }]);
+      const hostKey = this.durableHostKey();
+      // Session routes are live presence and can be registered by any gateway
+      // that handles the session. Object routes are authority ownership: a
+      // satellite may hold only a projected actor row, so it must not republish
+      // that actor as locally owned. WORLD may publish default/self-hosted actor
+      // routes from its authoritative route table; a self-hosted actor may also
+      // publish itself.
+      if (hostKey === WORLD_HOST || actorRoute?.host === session.actor) {
+        await this.registerRoutes([{ id: session.actor, host: actorRoute?.host ?? WORLD_HOST, anchor: actorRoute?.anchor ?? null }]);
+      }
     } catch {
       // Directory registration accelerates cross-DO routing. The local auth
       // result remains authoritative for this host; routed object calls fail
@@ -4296,7 +4316,7 @@ export class PersistentObjectDO {
       return client;
     }
     this.rememberRestV2Relay(scope, client);
-    mergeExecutorAuthority(serializedFor(client.relay.commit_scope, { reason: "rest_authority_merge", metric: (event) => world.recordMetric(event) }), seeded.authority.authority, { clone: true });
+    this.mergeRestPlanningAuthority(world, client, seeded.authority.authority);
     return client;
   }
 
@@ -4310,6 +4330,7 @@ export class PersistentObjectDO {
     target: ObjRef,
     verb: string
   ): ExecutorEnvelopeBody {
+    if (body.planned_transcript_commit === true) return body;
     if (!this.restExecutionCapsuleEnabled() || !client) return body;
     return {
       ...body,
@@ -4323,6 +4344,15 @@ export class PersistentObjectDO {
         authority: body.authority
       })
     };
+  }
+
+  private mergeRestPlanningAuthority(
+    world: WooWorld,
+    client: RestV2RelayClient,
+    authority: SerializedAuthoritySlice
+  ): void {
+    const serialized = serializedFor(client.relay.commit_scope, { reason: "rest_planning_authority_merge", metric: (event) => world.recordMetric(event) });
+    mergeExecutorAuthority(serialized, authority, { clone: true });
   }
 
   private async v2GatewayState(world: WooWorld, extraObjectIds: Iterable<ObjRef>): Promise<{ serialized: SerializedWorld; authority: ReturnType<typeof executorAuthorityPayload> }> {
@@ -4347,12 +4377,12 @@ export class PersistentObjectDO {
     const ids = Array.from(new Set(Array.from(extraObjectIds).filter((id): id is ObjRef => typeof id === "string" && id.length > 0)));
     const localHost = this.durableHostKey();
     const directorySessionScopes = options.directorySessionScopes ?? [];
-    const directoryScopeSessions = isMcpGatewayShardHost(localHost)
-      ? await this.loadDirectorySessionsForScopes(directorySessionScopes)
-      : [];
     const local = executorAuthorityPayload(world, ids);
     const localObjectIds = authoritySliceObjectIds(local.authority);
     const mcpGatewayShard = isMcpGatewayShardHost(localHost);
+    const directoryScopeSessions = mcpGatewayShard && directorySessionScopes.length > 0
+      ? await this.loadDirectorySessionsForScopes(directorySessionScopes)
+      : [];
     const routesById = isMcpGatewayShardHost(localHost)
       ? new Map<ObjRef, { id: ObjRef; host: string; anchor: ObjRef | null }>()
       : new Map(world.objectRoutes().map((route) => [route.id, route] as const));
@@ -4360,12 +4390,15 @@ export class PersistentObjectDO {
       const localRoute = routesById.get(id) ?? null;
       if (localRoute) {
         // This is classification for an authority payload, not route
-        // publication. Publishing every transitive local route here turns a
-        // cheap authority refresh into directory fanout, especially on cold
-        // MCP gateway shards; the normal route registration paths keep the
-        // directory current.
-        this.routeCache.set(id, localRoute.host);
-        return localRoute.host;
+        // publication. A satellite can hold projected rows for foreign objects;
+        // those rows participate in objectRoutes(), but they are not proof that
+        // the satellite owns the object's authority. Directory is the route
+        // authority here; the local route is only a fallback if Directory is not
+        // reachable.
+        const directoryHost = await this.fetchDirectoryObjectHost(id, localRoute.host || WORLD_HOST);
+        const host = directoryHost || localRoute.host;
+        if (host) this.routeCache.set(id, host);
+        return host;
       }
       const cached = this.routeCache.get(id);
       if (cached && (!mcpGatewayShard || cached !== WORLD_HOST)) return cached;
@@ -4400,7 +4433,6 @@ export class PersistentObjectDO {
     const byHost = new Map<string, Set<ObjRef>>();
     for (const [id, host] of resolvedIds) {
       if (!host || host === localHost) continue;
-      if (localActorAuthorityRoots.has(id) && localObjectIds.has(id)) continue;
       const list = byHost.get(host) ?? new Set<ObjRef>();
       list.add(id);
       byHost.set(host, list);
@@ -4553,12 +4585,12 @@ export class PersistentObjectDO {
       },
       // Durable REST turns use planned-exec when the local relay can produce a
       // transcript. If sparse local planning fails, submitTurnIntent falls back
-      // to a guarded intent at the placement authority; placement-bearing
-      // transcripts commit there with the MV-A fence.
+      // to a guarded intent at the turn scope; movement no longer routes
+      // through the withdrawn #placement authority.
       strategy: "planned-exec",
       maxAttempts: 8,
       intentScope: (turn) => turn.persistence === "durable"
-        ? SHADOW_PLACEMENT_TRANSACTION_SCOPE
+        ? turn.scope
         : turn.scope,
       ensureClient: async (scope, attempt) => await this.ensureRestV2Relay(world, input, scope, token, attempt > 0),
       clientNode: (client) => client.node,
@@ -4566,12 +4598,18 @@ export class PersistentObjectDO {
       clientSerialized: (client) => serializedFor(client.relay.commit_scope, { reason: "rest_turn_plan", metric: (event) => world.recordMetric(event) }),
       nextTurnId: (client) => `${client.node}:turn:${client.nextTurn++}:${crypto.randomUUID()}`,
       envelopeId: (id, attempt) => executorEnvelopeId(id, attempt, () => crypto.randomUUID()),
-      transactionScopeForTranscript: () => SHADOW_PLACEMENT_TRANSACTION_SCOPE,
       // Per-turn authority refresh against an already-opened relay; the
       // CommitScopeDO has a durable snapshot so a cold satellite's slice
       // can be safely omitted. See comment on v2GatewayAuthorityPayload.
       authorityPayload: async (_scope, extraObjectIds) =>
-        await this.v2GatewayAuthorityPayload(world, extraObjectIds, { tolerateRemoteFailures: true }),
+        await this.v2GatewayAuthorityPayload(world, extraObjectIds, {
+          tolerateRemoteFailures: true,
+          directorySessionScopes: extraObjectIds
+        }),
+      applyAuthority: (client, authority) => {
+        this.mergeRestPlanningAuthority(world, client, authority);
+        markShadowBrowserRelaySerializedChanged(client.relay);
+      },
       submitEnvelope: async (scope, body) => {
         const client = this.restV2Relays.get(scope);
         const capsuleBody = this.withRestExecutionCapsule(client, body, input.target, input.verb);
@@ -4688,14 +4726,11 @@ export class PersistentObjectDO {
     if (!isShadowTurnExecReply(reply.body)) return;
     if (reply.body.ok !== true || !reply.body.commit || !reply.body.transcript) return;
     const restRelay = this.restV2Relays.get(reply.body.commit.position.scope);
-    if (restRelay) applyAcceptedShadowFrame(restRelay.relay.commit_scope, reply.body.commit, reply.body.transcript);
-    // Direct calls can plan against one object scope and commit to another
-    // generic scope such as #-1. A planning-only relay cannot be advanced with
-    // the commit scope head, so reopen it from the gateway if it is used again.
-    const callScope = "scope" in reply.body.transcript.call && typeof reply.body.transcript.call.scope === "string"
-      ? reply.body.transcript.call.scope as ObjRef
-      : null;
-    if (callScope && callScope !== reply.body.commit.position.scope) this.restV2Relays.delete(callScope);
+    if (restRelay) {
+      applyAcceptedShadowFrame(restRelay.relay.commit_scope, reply.body.commit, reply.body.transcript);
+      publishShadowBrowserAcceptedFrame(restRelay.relay, reply.body.commit, reply.body.transcript);
+    }
+    this.propagateRestTranscriptToOtherRelays(reply.body.commit.position.scope, reply.body.transcript);
     const projectionWrites = reply.body.commit.projection_writes ?? [];
     const projectionDelta = reply.body.commit.projection_delta;
     // The gateway maintains its projection-row cache from the accepted commit's
@@ -4709,7 +4744,8 @@ export class PersistentObjectDO {
     const revokedBefore = projectionWrites.length ? this.revokedApiKeyIds(world) : null;
     this.applyGatewayProjectionWrites(reply.body.commit.position, projectionWrites, "rest", projectionDelta);
     if (projectionWrites.length) {
-      world.applyProjectionWrites(projectionWrites, { persist: false, transcript: reply.body.transcript });
+      const applied = world.applyProjectionWrites(projectionWrites, { persist: false, persistCreated: true, transcript: reply.body.transcript });
+      if (applied.creates > 0) await this.registerIncrementalObjectRoutes(world);
     }
     if (revokedBefore) await this.cleanupNewlyRevokedApiKeys(world, revokedBefore);
     const session = world.sessions.get(sessionId);
@@ -4724,6 +4760,18 @@ export class PersistentObjectDO {
       projection_bytes: projectionDelta.projection_bytes,
       source: "rest"
     });
+  }
+
+  private propagateRestTranscriptToOtherRelays(originScope: ObjRef, transcript: EffectTranscript): void {
+    // REST relays are cached per planning scope. A movement turn may plan under a
+    // room scope and commit under the moved object's location authority, so every
+    // cached planning relay must see the accepted writes even though only the
+    // authority relay advances its head.
+    for (const [scope, client] of this.restV2Relays) {
+      if (scope === originScope) continue;
+      applyShadowTranscriptToCommitScopeCache(client.relay.commit_scope, transcript);
+      markShadowBrowserRelaySerializedChanged(client.relay);
+    }
   }
 
   private applyGatewayProjectionCacheFromReply(replyText: string | null, source: "rest" | "mcp" | "fanout"): void {
@@ -5057,7 +5105,8 @@ export class PersistentObjectDO {
     const localWrites = byHost.get(localHost) ?? [];
     let localApplied = false;
     if (localWrites.length > 0) {
-      world.applyProjectionWrites(localWrites, { transcript });
+      const applied = world.applyProjectionWrites(localWrites, { transcript });
+      if (applied.creates > 0) await this.registerIncrementalObjectRoutes(world);
       byHost.delete(localHost);
       localApplied = true;
     }
@@ -6476,11 +6525,11 @@ function withMcpGatewayActorFallbackProperties(obj: SerializedObject): Serialize
 
 function v2ApplyCommitTranscriptScopeMatches(scope: ObjRef, commit: ShadowCommitAccepted, transcript: EffectTranscript): boolean {
   if (transcript.scope === scope) return true;
-  // MV-A placement transactions sequence under a placement authority scope
+  // Actor-anchored movement commits at the moved object's location authority,
   // while the transcript keeps the user-visible VM scope that selected the
-  // closure. Cross-scope apply is allowed only for accepted commits carrying
-  // the validated placement fence; movement alone is not sufficient.
-  return scope === commit.position.scope && shadowCommitTransactionCoversTranscript(commit.transaction, transcript);
+  // closure. Cross-scope apply is allowed only for that single-location CA3
+  // commit owner; ordinary movement no longer uses a placement fence.
+  return scope === commit.position.scope && shadowLocationCommitScopeForTranscript(transcript) === scope;
 }
 
 function mcpFanoutAudienceFromDirectorySessions(

@@ -126,10 +126,11 @@ describe("dev v2 cross-scope WS routing", () => {
     expect(reply.body.transcript?.call).toMatchObject({ target: targetScope, verb: "enter" });
   });
 
-  it("fences a chatroom-relay cross-scope durable move with a placement transaction", async () => {
-    // Pins the lower-level guard beneath the dev WS router: a relay may accept
-    // a cross-scope movement only when the executor auto-arms the placement
-    // fence, never as an ordinary unfenced source-scope commit.
+  it("routes a chatroom-relay cross-scope durable move to the transcript authority", async () => {
+    // Pins the lower-level guard beneath the dev WS router: a relay connected
+    // to one room may execute a cross-scope turn, but it must submit the
+    // accepted transcript to the authority revealed by that transcript rather
+    // than the stale source-room relay scope.
     const world = createWorld();
     const session = world.auth("guest:cross-scope-regression");
     await world.directCall("setup:enter-chatroom-regression", session.actor, "the_chatroom", "enter", [], { sessionId: session.id });
@@ -175,7 +176,8 @@ describe("dev v2 cross-scope WS routing", () => {
     );
     expect(reply?.body).toMatchObject({ ok: true });
     if (!reply || reply.body.ok !== true) return;
-    expect(reply.body.commit?.transaction).toMatchObject({ kind: "placement" });
+    expect(reply.body.commit?.position.scope).toBe("the_dubspace");
+    expect(reply.body.commit).not.toHaveProperty("transaction");
   });
 
   it("commits an outliner 'add' intent end-to-end through the same WS handler logic the SPA uses", async () => {

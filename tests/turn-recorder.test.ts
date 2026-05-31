@@ -3,7 +3,7 @@ import { installVerb } from "../src/core/authoring";
 import { createWorld } from "../src/core/bootstrap";
 import { buildShadowCapabilityAd, capabilityAdProbablyCoversTurn, rankCapabilityAdsForTurn } from "../src/core/capability-ad";
 import { installCatalogManifest } from "../src/core/catalog-installer";
-import { effectTranscriptFromRecordedTurn, transcriptTouchedStateHash, validateTranscriptAgainstSerializedWorld } from "../src/core/effect-transcript";
+import { effectTranscriptFromRecordedTurn, transcriptTouchedStateHash, validateTranscriptAgainstSerializedWorld, type EffectTranscript } from "../src/core/effect-transcript";
 import { remoteBridgeEffectName } from "../src/core/remote-bridge-transcript-policy";
 import { transcriptTouchedObjectIds } from "../src/core/shadow-commit-scope";
 import { shadowCommitReceipt } from "../src/core/turn-commit";
@@ -251,6 +251,84 @@ describe("turn recorder", () => {
     expect(serializedRoom.contents).not.toEqual(contentsRead?.value);
 
     expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [] });
+  });
+
+  it("reconciles same-turn presence projection reads from property metadata", () => {
+    const world = createWorld();
+    const session = world.auth("guest:turn-recorder-presence-projection");
+    const actor = session.actor;
+
+    world.createObject({ id: "custom_presence_room", name: "Custom Presence", parent: "$space", owner: "$wiz" });
+    world.defineProperty("custom_presence_room", {
+      name: "occupant_actor_ids",
+      defaultValue: [],
+      owner: "$wiz",
+      perms: "r",
+      typeHint: "list<obj>",
+      presenceProjection: { kind: "presence", key: "actor" }
+    });
+    world.defineProperty("custom_presence_room", {
+      name: "occupant_session_rows",
+      defaultValue: [],
+      owner: "$wiz",
+      perms: "r",
+      typeHint: "list<map>",
+      presenceProjection: { kind: "presence", key: "session", sessionField: "sid", actorField: "who" }
+    });
+    world.defineProperty("custom_presence_room", {
+      name: "looks_like_presence_but_is_plain",
+      defaultValue: [],
+      owner: "$wiz",
+      perms: "r",
+      typeHint: "list<obj>"
+    });
+
+    const before = world.exportWorld();
+    const baseTranscript = {
+      kind: "woo.effect_transcript.shadow.v1",
+      route: "sequenced",
+      scope: "custom_presence_room",
+      seq: 1,
+      session: session.id,
+      call: { actor, target: "custom_presence_room", verb: "metadata_presence_probe", args: [] },
+      writes: [],
+      creates: [],
+      moves: [{ object: actor, from: "the_chatroom", to: "custom_presence_room" }],
+      observations: [],
+      logicalInputs: [],
+      untrackedEffects: [],
+      complete: true,
+      incompleteReasons: [],
+      hash: "metadata-presence-projection"
+    } satisfies Omit<EffectTranscript, "reads">;
+
+    const actorProjection = {
+      ...baseTranscript,
+      reads: [{ cell: { kind: "prop", object: "custom_presence_room", name: "occupant_actor_ids" }, version: "2", value: [actor] }]
+    } satisfies EffectTranscript;
+    expect(validateTranscriptAgainstSerializedWorld(before, actorProjection)).toEqual({ ok: true, errors: [] });
+
+    const sessionProjection = {
+      ...baseTranscript,
+      reads: [{
+        cell: { kind: "prop", object: "custom_presence_room", name: "occupant_session_rows" },
+        version: "2",
+        value: [{ sid: session.id, who: actor }]
+      }]
+    } satisfies EffectTranscript;
+    expect(validateTranscriptAgainstSerializedWorld(before, sessionProjection)).toEqual({ ok: true, errors: [] });
+
+    const plainProperty = {
+      ...baseTranscript,
+      reads: [{ cell: { kind: "prop", object: "custom_presence_room", name: "looks_like_presence_but_is_plain" }, version: "2", value: [actor] }]
+    } satisfies EffectTranscript;
+    expect(validateTranscriptAgainstSerializedWorld(before, plainProperty)).toEqual({
+      ok: false,
+      errors: [
+        "read version mismatch custom_presence_room.looks_like_presence_but_is_plain: transcript=2 actual=1",
+        "read value mismatch custom_presence_room.looks_like_presence_but_is_plain"
+      ]
+    });
   });
 
   it("keeps Tier 1 look and describe verbs in bytecode transcripts", async () => {
@@ -815,7 +893,7 @@ describe("turn recorder", () => {
     expect(receipt.errors).toContain(`incomplete:${remoteBridgeEffectName("dispatch")}`);
   });
 
-  it("records placement writes for authored moves", async () => {
+  it("records authored moves as a single authoritative location write", async () => {
     const world = createWorld();
     const actor = "$wiz";
 
@@ -845,8 +923,7 @@ describe("turn recorder", () => {
     const transcript = effectTranscriptFromRecordedTurn(recorder.turns[0]);
     expect(transcript.complete).toBe(true);
     expect(transcript.writes).toContainEqual(expect.objectContaining({ cell: { kind: "location", object: "move_item" }, value: "move_b", op: "move" }));
-    expect(transcript.writes).toContainEqual(expect.objectContaining({ cell: { kind: "contents", object: "move_a" }, value: [], op: "remove" }));
-    expect(transcript.writes).toContainEqual(expect.objectContaining({ cell: { kind: "contents", object: "move_b" }, value: ["move_item"], op: "add" }));
+    expect(transcript.writes.filter((write) => write.cell.kind === "contents")).toEqual([]);
     expect(transcript.reads).toContainEqual(expect.objectContaining({ cell: { kind: "location", object: "move_item" }, value: "move_b" }));
     expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [] });
     const replayA = await replayRecordedTurn(before, recorder.turns[0]);

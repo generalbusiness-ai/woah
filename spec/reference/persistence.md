@@ -51,6 +51,7 @@ CREATE TABLE property_def (
   owner       TEXT NOT NULL,
   perms       TEXT NOT NULL,       -- string flags, e.g. "rw", "rwc"
   version     INTEGER NOT NULL DEFAULT 1,
+  metadata    TEXT NOT NULL DEFAULT '{}', -- JSON property metadata
   PRIMARY KEY (object_id, name)
 );
 

@@ -1934,12 +1934,13 @@ describe("McpHost", () => {
 
   it("routes audience-addressed commit observations even when projection sequencing has a gap", async () => {
     // MCP observation delivery is audience-filtered: a shard can legitimately
-    // receive placement seq N without seq N-1 because the missing commit had no
+    // receive durable seq N without seq N-1 because the missing commit had no
     // observations for local sessions. Queue delivery must not wait for the
     // projection-cache sequencer, but durable projection persistence still must.
     const world = bootstrapWorld();
     const alice = world.auth("guest:mcp-v2-audience-gap-alice");
-    const durableHead = new Map<string, number>([["#placement", 22]]);
+    const fanoutScope = "#audience-gap";
+    const durableHead = new Map<string, number>([[fanoutScope, 22]]);
     const persisted: number[] = [];
     const gateway = new McpGateway(world, {
       durableProjectionHeadSeq: (scope) => durableHead.get(scope) ?? null,
@@ -1970,7 +1971,7 @@ describe("McpHost", () => {
     const commit = (seq: number, observations: Observation[] = []): ShadowCommitAccepted => ({
       kind: "woo.commit.accepted.shadow.v1",
       id: `audience-gap-${seq}`,
-      position: { kind: "woo.scope_head.shadow.v1", scope: "#placement", epoch: 1, seq, hash: `head-${seq}` },
+      position: { kind: "woo.scope_head.shadow.v1", scope: fanoutScope, epoch: 1, seq, hash: `head-${seq}` },
       transcript_hash: `audience-gap-${seq}`,
       post_state_hash: `post-${seq}`,
       observations,
@@ -1988,7 +1989,7 @@ describe("McpHost", () => {
       }
     });
 
-    gateway.acceptRemoteV2Commit("#placement", commit(24, [observation]), transcript(24, [observation]), "origin-session", {
+    gateway.acceptRemoteV2Commit(fanoutScope, commit(24, [observation]), transcript(24, [observation]), "origin-session", {
       audienceSessions: [alice.id],
       observationSessionAudiences: [[alice.id]]
     });
@@ -1996,7 +1997,7 @@ describe("McpHost", () => {
     expect(firstDrain.observations).toEqual([expect.objectContaining({ type: "entered", actor: "guest_gap_peer", source: "the_taskboard" })]);
     expect(persisted).toEqual([]);
 
-    gateway.acceptRemoteV2Commit("#placement", commit(23), transcript(23), "origin-session");
+    gateway.acceptRemoteV2Commit(fanoutScope, commit(23), transcript(23), "origin-session");
     expect(persisted).toEqual([23, 24]);
     const secondDrain = await (gateway.host as unknown as { drainWait(sessionId: string, args: WooValue[]): Promise<{ observations: Observation[] }> }).drainWait(alice.id, [0, 10]);
     expect(secondDrain.observations).toEqual([]);

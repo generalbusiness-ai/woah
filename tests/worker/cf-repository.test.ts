@@ -641,7 +641,55 @@ describe("v2 Worker fan-out helpers", () => {
           session_objects: []
         })
       }));
-      await expect(target.fetch(request)).rejects.toThrow(/state transfer scope mismatch/);
+      const response = await target.fetch(request);
+      expect(response.ok).toBe(false);
+      const body = await response.json() as { error?: { code?: string; message?: string } };
+      expect(body.error).toMatchObject({
+        code: "E_PROTOCOL",
+        message: expect.stringContaining("state transfer scope mismatch")
+      });
+    } finally {
+      state.close();
+    }
+  });
+
+  it("returns structured snapshot-required errors for cold execution capsules", async () => {
+    const secret = "cf-test-secret";
+    const state = new FakeDurableObjectState("#cold-capsule");
+    const target = new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: secret });
+    try {
+      const request = await signInternalRequest({ WOO_INTERNAL_SECRET: secret }, new Request("https://woo.internal/v2/envelope", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          scope: "#cold-capsule",
+          node: "mcp:cold-capsule-test",
+          token: "token:cold-capsule-test",
+          session: "session:cold-capsule-test",
+          actor: "guest_1",
+          sessions: [],
+          session_objects: [],
+          execution_capsule: {
+            kind: "woo.execution_capsule.v1",
+            scope: "#cold-capsule",
+            head: { kind: "woo.scope_head.shadow.v1", scope: "#cold-capsule", epoch: 1, seq: 0, hash: "cold" },
+            actor: "guest_1",
+            session: "session:cold-capsule-test",
+            target: "the_chatroom",
+            verb: "enter",
+            authority: { kind: "woo.authority_slice.cells.shadow.v1", sessions: [], page_refs: [], inline_pages: [], counters: { objectCounter: 1, parkedTaskCounter: 1, sessionCounter: 1 }, tombstones: [], source_object_count: 0 },
+            expires_at_ms: Date.now() + 30_000
+          },
+          envelope: "not-read-before-relay-init"
+        })
+      }));
+      const response = await target.fetch(request);
+      expect(response.ok).toBe(false);
+      const body = await response.json() as { error?: { code?: string; message?: string } };
+      expect(body.error).toMatchObject({
+        code: "E_SNAPSHOT_REQUIRED",
+        message: expect.stringContaining("no durable snapshot for execution capsule")
+      });
     } finally {
       state.close();
     }
@@ -1047,6 +1095,14 @@ function fakeCommitScopeNamespace(
   }) as unknown as DurableObjectNamespace;
 }
 
+function actorForSession(objects: Map<string, PersistentObjectDO>, sessionId: string): ObjRef {
+  for (const object of objects.values()) {
+    const actor = (object as unknown as { world?: WooWorld }).world?.sessions.get(sessionId)?.actor;
+    if (actor) return actor;
+  }
+  throw new Error(`session ${sessionId} has no visible actor in test PersistentObjectDOs`);
+}
+
 function message(actor: string, target: string, verb: string, args: WooValue[] = []): Message {
   return { actor, target, verb, args };
 }
@@ -1203,6 +1259,56 @@ class FakeExecutorContext implements ExecutorContext {
 }
 
 describe("CFObjectRepository production-shape coverage", () => {
+  it("persists property presence-projection metadata across CF repository reload", () => {
+    const harness = makeCfHarness();
+    try {
+      harness.world.createObject({ id: "cf_presence_meta_room", name: "CF Presence Metadata Room", parent: "$space", owner: "$wiz" });
+      harness.world.defineProperty("cf_presence_meta_room", {
+        name: "occupant_ids",
+        defaultValue: [],
+        owner: "$wiz",
+        perms: "r",
+        typeHint: "list<obj>",
+        presenceProjection: { kind: "presence", key: "actor" }
+      });
+
+      const restarted = harness.restart();
+      expect(restarted.object("cf_presence_meta_room").propertyDefs.get("occupant_ids")?.presenceProjection).toEqual({
+        kind: "presence",
+        key: "actor"
+      });
+    } finally {
+      harness.cleanup();
+    }
+  });
+
+  it("adds property_def metadata column to existing CF repository schemas", () => {
+    const state = new FakeDurableObjectState();
+    try {
+      state.storage.sql.exec(`
+        CREATE TABLE property_def (
+          object_id TEXT NOT NULL,
+          name TEXT NOT NULL,
+          default_val TEXT NOT NULL,
+          type_hint TEXT,
+          owner TEXT NOT NULL,
+          perms TEXT NOT NULL,
+          version INTEGER NOT NULL DEFAULT 1,
+          PRIMARY KEY (object_id, name)
+        )
+      `);
+
+      new CFObjectRepository(state as unknown as DurableObjectState);
+      const columns = sqlRows<{ name: string }>(state.storage.sql.exec("PRAGMA table_info(property_def)")).map((row) => row.name);
+      const metadataColumn = sqlRows<{ dflt_value: string; notnull: number }>(state.storage.sql.exec("SELECT dflt_value, \"notnull\" FROM pragma_table_info('property_def') WHERE name = 'metadata'"))[0];
+
+      expect(columns).toContain("metadata");
+      expect(metadataColumn).toEqual({ dflt_value: "'{}'", notnull: 1 });
+    } finally {
+      state.close();
+    }
+  });
+
   it("reserves the v2 session mint endpoint with shadow-local claims", async () => {
     const directoryState = new FakeDurableObjectState("directory");
     const gatewayState = new FakeDurableObjectState("world");
@@ -2456,8 +2562,10 @@ describe("CFObjectRepository production-shape coverage", () => {
 
       const firstEnter = await post("/api/objects/the_chatroom/calls/enter", { args: [] }, session);
       expect(firstEnter.status, JSON.stringify(firstEnter.body)).toBe(200);
-      expect((await post("/api/objects/the_chatroom/calls/enter", { args: [] }, session)).status).toBe(200);
-      expect((await post("/api/objects/the_chatroom/calls/southeast", { args: [] }, session)).status).toBe(200);
+      const secondEnter = await post("/api/objects/the_chatroom/calls/enter", { args: [] }, session);
+      expect(secondEnter.status, JSON.stringify(secondEnter.body)).toBe(200);
+      const goDeck = await post("/api/objects/the_chatroom/calls/southeast", { args: [] }, session);
+      expect(goDeck.status, JSON.stringify(goDeck.body)).toBe(200);
 
       const tubPlan = await post("/api/objects/the_deck/calls/command_plan", { args: ["enter tub"] }, session);
       expect(tubPlan.status).toBe(200);
@@ -2499,6 +2607,7 @@ describe("CFObjectRepository production-shape coverage", () => {
       WOO_INTERNAL_SECRET: "cf-test-secret",
       WOO_AUTO_INSTALL_CATALOGS: "chat,demoworld,pinboard",
       WOO_MCP_GATEWAY_SHARDS: "4",
+      WOO_V2_EXECUTION_CAPSULE: "1",
       DIRECTORY: new FakeDurableObjectNamespace((name) => {
         if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
         return directory;
@@ -2920,17 +3029,23 @@ describe("CFObjectRepository production-shape coverage", () => {
         }
       }, { "mcp-session-id": bob });
       expect(bobMove.result.isError, JSON.stringify(bobMove.result.structuredContent)).not.toBe(true);
-      const placementEnvelopes = commitPosts.filter((post) => post.scope === "#placement" && post.path === "/v2/envelope");
-      expect(placementEnvelopes.length, JSON.stringify(commitPosts.map((post) => ({ scope: post.scope, path: post.path })))).toBeGreaterThan(0);
+      const movementEnvelopes = commitPosts.filter((post) => post.scope === bobActor && post.path === "/v2/envelope");
+      expect(movementEnvelopes.length, JSON.stringify(commitPosts.map((post) => ({ scope: post.scope, path: post.path })))).toBeGreaterThan(0);
+      expect(movementEnvelopes.every((post) => post.body.planned_transcript_commit === true), JSON.stringify(movementEnvelopes)).toBe(true);
+      expect(movementEnvelopes.every((post) => !Object.prototype.hasOwnProperty.call(post.body, "execution_capsule")), JSON.stringify(movementEnvelopes)).toBe(true);
+      for (const post of movementEnvelopes) {
+        const envelope = decodeEnvelope(String(post.body.envelope));
+        expect((envelope.body as { kind?: unknown }).kind).toBe("woo.turn.exec.request.shadow.v1");
+      }
       expect(fanoutHosts, JSON.stringify({ aliceShard, bobShard, fanoutHosts })).toContain(aliceShard);
       const aliceFanout = fanoutRequests.find((item) => item.host === aliceShard);
       expect(aliceFanout, JSON.stringify({ aliceShard, fanoutRequests })).toBeTruthy();
-      expect(aliceFanout!.body.scope).toBe("#placement");
+      expect(aliceFanout!.body.scope).toBe(bobActor);
       expect(aliceFanout!.body.commit).toMatchObject({
         kind: "woo.commit.accepted.shadow.v1",
-        position: expect.objectContaining({ scope: "#placement" }),
-        transaction: expect.objectContaining({ kind: "placement" })
+        position: expect.objectContaining({ scope: bobActor })
       });
+      expect((aliceFanout!.body.commit as { transaction?: unknown }).transaction).toBeUndefined();
       expect(JSON.stringify(aliceFanout!.body.observation_session_audiences ?? []), JSON.stringify(aliceFanout!.body)).toContain(alice);
 
       const waited = await mcp({
@@ -3179,21 +3294,22 @@ describe("CFObjectRepository production-shape coverage", () => {
       const auth = await post("/api/auth", { token: "guest:cf-rest-relay" });
       expect(auth.status).toBe(200);
       const session = String(auth.body.session);
+      const actorScope = actorForSession(wooObjects, session);
 
       const firstEnter = await post("/api/objects/the_chatroom/calls/enter", { args: [] }, session);
       expect(firstEnter.status, JSON.stringify(firstEnter.body)).toBe(200);
       const secondEnter = await post("/api/objects/the_chatroom/calls/enter", { args: [] }, session);
       expect(secondEnter.status, JSON.stringify(secondEnter.body)).toBe(200);
 
-      const placementOpens = commitPosts.filter((post) => post.scope === "#placement" && post.path === "/v2/open");
-      const placementEnvelopes = commitPosts.filter((post) => post.scope === "#placement" && post.path === "/v2/envelope");
-      expect(placementOpens).toHaveLength(1);
-      expect(placementOpens[0].body).not.toHaveProperty("serialized");
-      expect(placementOpens[0].body.session_objects).toEqual([]);
-      expect((placementOpens[0].body.authority as { kind?: string } | undefined)?.kind).toBe("woo.authority_slice.cells.shadow.v1");
-      expect(placementEnvelopes).toHaveLength(2);
-      expect(placementEnvelopes.every((post) => !Object.prototype.hasOwnProperty.call(post.body, "serialized"))).toBe(true);
-      expect(placementEnvelopes.every((post) => Array.isArray(post.body.session_objects) && post.body.session_objects.length === 0)).toBe(true);
+      const actorOpens = commitPosts.filter((post) => post.scope === actorScope && post.path === "/v2/open");
+      const actorEnvelopes = commitPosts.filter((post) => post.scope === actorScope && post.path === "/v2/envelope");
+      expect(actorOpens).toHaveLength(1);
+      expect(actorOpens[0].body).not.toHaveProperty("serialized");
+      expect(actorOpens[0].body.session_objects).toEqual([]);
+      expect((actorOpens[0].body.authority as { kind?: string } | undefined)?.kind).toBe("woo.authority_slice.cells.shadow.v1");
+      expect(actorEnvelopes).toHaveLength(2);
+      expect(actorEnvelopes.every((post) => !Object.prototype.hasOwnProperty.call(post.body, "serialized"))).toBe(true);
+      expect(actorEnvelopes.every((post) => Array.isArray(post.body.session_objects) && post.body.session_objects.length === 0)).toBe(true);
     } finally {
       logSpy.mockRestore();
       directoryState.close();
@@ -3252,31 +3368,43 @@ describe("CFObjectRepository production-shape coverage", () => {
     }
 
     try {
-      const auth = await post("/api/auth", { token: "guest:cf-rest-capsule" });
+      const auth = await post("/api/auth", { token: "wizard:cf-command-token" });
       expect(auth.status).toBe(200);
       const session = String(auth.body.session);
+      commitPosts.length = 0;
 
-      const firstEnter = await post("/api/objects/the_chatroom/calls/enter", { args: [] }, session);
-      expect(firstEnter.status, JSON.stringify(firstEnter.body)).toBe(200);
-      const firstPlacementOpens = commitPosts.filter((post) => post.scope === "#placement" && post.path === "/v2/open");
-      const firstPlacementEnvelopes = commitPosts.filter((post) => post.scope === "#placement" && post.path === "/v2/envelope");
-      expect(firstPlacementOpens).toHaveLength(1);
-      expect(firstPlacementOpens[0].body).toHaveProperty("serialized");
-      expect(firstPlacementEnvelopes).toHaveLength(2);
-      expect(firstPlacementEnvelopes[0].body.execution_capsule).toMatchObject({ kind: "woo.execution_capsule.v1" });
-      expect(firstPlacementEnvelopes[1].body).not.toHaveProperty("execution_capsule");
+      const firstMint = await post("/api/objects/%24system/calls/create_api_key", { args: ["$wiz", "first-capsule-turn"] }, session);
+      expect(firstMint.status, JSON.stringify(firstMint.body)).toBe(200);
+      const firstCapsuleEnvelopes = commitPosts.filter((post) =>
+        post.path === "/v2/envelope" &&
+        (post.body.execution_capsule as { kind?: unknown } | undefined)?.kind === "woo.execution_capsule.v1"
+      );
+      expect(firstCapsuleEnvelopes, JSON.stringify(commitPosts.map((post) => ({
+        scope: post.scope,
+        path: post.path,
+        hasCapsule: Object.prototype.hasOwnProperty.call(post.body, "execution_capsule"),
+        plannedTranscriptCommit: post.body.planned_transcript_commit === true,
+        hasAuthority: Object.prototype.hasOwnProperty.call(post.body, "authority")
+      })))).toHaveLength(1);
+      const capsuleScope = firstCapsuleEnvelopes[0].scope;
+      const firstCapsuleScopeOpens = commitPosts.filter((post) => post.scope === capsuleScope && post.path === "/v2/open");
+      const firstCapsuleScopeEnvelopes = commitPosts.filter((post) => post.scope === capsuleScope && post.path === "/v2/envelope");
+      expect(firstCapsuleScopeOpens).toHaveLength(1);
+      expect(firstCapsuleScopeOpens[0].body).toHaveProperty("serialized");
+      expect(firstCapsuleScopeEnvelopes).toHaveLength(2);
+      expect(firstCapsuleScopeEnvelopes[1].body).not.toHaveProperty("execution_capsule");
 
       wooObjects.delete("world");
       commitPosts.length = 0;
 
-      const secondEnter = await post("/api/objects/the_chatroom/calls/enter", { args: [] }, session);
-      expect(secondEnter.status, JSON.stringify(secondEnter.body)).toBe(200);
-      const secondPlacementOpens = commitPosts.filter((post) => post.scope === "#placement" && post.path === "/v2/open");
-      const secondPlacementEnvelopes = commitPosts.filter((post) => post.scope === "#placement" && post.path === "/v2/envelope");
-      expect(secondPlacementOpens).toHaveLength(0);
-      expect(secondPlacementEnvelopes).toHaveLength(1);
-      expect(secondPlacementEnvelopes[0].body.execution_capsule).toMatchObject({ kind: "woo.execution_capsule.v1" });
-      expect(secondPlacementEnvelopes[0].body).not.toHaveProperty("serialized");
+      const secondMint = await post("/api/objects/%24system/calls/create_api_key", { args: ["$wiz", "second-capsule-turn"] }, session);
+      expect(secondMint.status, JSON.stringify(secondMint.body)).toBe(200);
+      const secondCapsuleScopeOpens = commitPosts.filter((post) => post.scope === capsuleScope && post.path === "/v2/open");
+      const secondCapsuleScopeEnvelopes = commitPosts.filter((post) => post.scope === capsuleScope && post.path === "/v2/envelope");
+      expect(secondCapsuleScopeOpens).toHaveLength(0);
+      expect(secondCapsuleScopeEnvelopes).toHaveLength(1);
+      expect(secondCapsuleScopeEnvelopes[0].body.execution_capsule).toMatchObject({ kind: "woo.execution_capsule.v1" });
+      expect(secondCapsuleScopeEnvelopes[0].body).not.toHaveProperty("serialized");
     } finally {
       logSpy.mockRestore();
       directoryState.close();
@@ -3293,6 +3421,7 @@ describe("CFObjectRepository production-shape coverage", () => {
     const staleEnvelopeIds = new Set<string>();
     let rejectNextChatEnvelope = false;
     let staleReplies = 0;
+    let actorScope: ObjRef | null = null;
     let env: Env;
     const wooNamespace = new FakeDurableObjectNamespace((name) => {
       let object = wooObjects.get(name);
@@ -3304,13 +3433,13 @@ describe("CFObjectRepository production-shape coverage", () => {
       }
       return object;
     });
-    const staleHeadResponse = (id: string): Response => new Response(JSON.stringify({
+    const staleHeadResponse = (id: string, scope: ObjRef): Response => new Response(JSON.stringify({
       ok: true,
       reply: encodeEnvelope({
         v: 2,
         type: "woo.turn.exec.reply.shadow.v1",
         id: `forced-stale:${id}`,
-        from: "node:commit-scope:#placement",
+        from: `node:commit-scope:${scope}`,
         auth: { mode: "same_deployment_mac", mac: "forced-test-reply" },
         body: {
           kind: "woo.turn.exec.reply.shadow.v1",
@@ -3319,8 +3448,8 @@ describe("CFObjectRepository production-shape coverage", () => {
           reason: "commit_rejected",
           commit: {
             kind: "woo.commit.conflict.shadow.v1",
-            scope: "#placement",
-            current: { kind: "woo.scope_head.shadow.v1", scope: "#placement", epoch: 0, seq: 99, hash: "forced-stale" },
+            scope,
+            current: { kind: "woo.scope_head.shadow.v1", scope, epoch: 0, seq: 99, hash: "forced-stale" },
             reason: "stale_head",
             errors: ["forced stale head for REST relay repair test"],
             receipt: {}
@@ -3343,17 +3472,17 @@ describe("CFObjectRepository production-shape coverage", () => {
         if (!body || typeof body !== "object" || Array.isArray(body)) return;
         const post = { scope, path, body: body as Record<string, unknown> };
         commitPosts.push(post);
-        if (scope !== "#placement" || path !== "/v2/envelope" || typeof post.body.envelope !== "string") return;
+        if (scope !== actorScope || path !== "/v2/envelope" || typeof post.body.envelope !== "string") return;
         const envelope = decodeEnvelope(post.body.envelope);
         if (staleEnvelopeIds.has(envelope.id)) {
           staleReplies += 1;
-          return staleHeadResponse(envelope.id);
+          return staleHeadResponse(envelope.id, scope as ObjRef);
         }
         if (rejectNextChatEnvelope) {
           rejectNextChatEnvelope = false;
           staleEnvelopeIds.add(envelope.id);
           staleReplies += 1;
-          return staleHeadResponse(envelope.id);
+          return staleHeadResponse(envelope.id, scope as ObjRef);
         }
       })
     } as unknown as Env;
@@ -3375,6 +3504,7 @@ describe("CFObjectRepository production-shape coverage", () => {
       const auth = await post("/api/auth", { token: "guest:cf-rest-relay-repair" });
       expect(auth.status).toBe(200);
       const session = String(auth.body.session);
+      actorScope = actorForSession(wooObjects, session);
 
       const firstEnter = await post("/api/objects/the_chatroom/calls/enter", { args: [] }, session);
       expect(firstEnter.status, JSON.stringify(firstEnter.body)).toBe(200);
@@ -3384,13 +3514,13 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(repairedEnter.status, JSON.stringify(repairedEnter.body)).toBe(200);
       expect(staleReplies).toBe(1);
 
-      const placementOpens = commitPosts.filter((post) => post.scope === "#placement" && post.path === "/v2/open");
-      const placementEnvelopes = commitPosts.filter((post) => post.scope === "#placement" && post.path === "/v2/envelope");
-      expect(placementOpens).toHaveLength(2);
-      expect(placementOpens.filter((post) => Object.prototype.hasOwnProperty.call(post.body, "serialized"))).toHaveLength(0);
-      expect(placementOpens[1].body).not.toHaveProperty("serialized");
-      expect(placementEnvelopes).toHaveLength(3);
-      expect(new Set(placementEnvelopes.map((post) => decodeEnvelope(String(post.body.envelope)).id)).size).toBe(3);
+      const actorOpens = commitPosts.filter((post) => post.scope === actorScope && post.path === "/v2/open");
+      const actorEnvelopes = commitPosts.filter((post) => post.scope === actorScope && post.path === "/v2/envelope");
+      expect(actorOpens).toHaveLength(2);
+      expect(actorOpens.filter((post) => Object.prototype.hasOwnProperty.call(post.body, "serialized"))).toHaveLength(0);
+      expect(actorOpens[1].body).not.toHaveProperty("serialized");
+      expect(actorEnvelopes).toHaveLength(3);
+      expect(new Set(actorEnvelopes.map((post) => decodeEnvelope(String(post.body.envelope)).id)).size).toBe(3);
     } finally {
       logSpy.mockRestore();
       directoryState.close();
@@ -3609,8 +3739,8 @@ describe("CFObjectRepository production-shape coverage", () => {
         space: "the_deck",
         args: [deliveredNote]
       }, session);
-      expect(lookDeliveredNote.status).toBe(200);
-      expect(lookDeliveredNote.body.result).toMatchObject({ id: deliveredNote });
+      expect(lookDeliveredNote.status, JSON.stringify(lookDeliveredNote.body)).toBe(200);
+      expect(lookDeliveredNote.body.result, JSON.stringify(lookDeliveredNote.body)).toMatchObject({ id: deliveredNote });
 
       const deckState = await worker.fetch(new Request("https://woo.test/api/me", {
         headers: { authorization: `Session ${session}` }
@@ -3621,12 +3751,12 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(deckStateBody.session?.current_location).toBe("the_deck");
 
       const takeTowel = await post("/api/objects/the_deck/calls/take", { args: ["towel"] }, session);
-      expect(takeTowel.status).toBe(200);
+      expect(takeTowel.status, JSON.stringify(takeTowel.body)).toBe(200);
       expect(takeTowel.body.result).toMatchObject({ item: "the_towel" });
       expect(takeTowel.body.observations).toContainEqual(expect.objectContaining({ type: "taken", item: "the_towel" }));
 
       const enterTub = await post("/api/objects/the_hot_tub/calls/enter", { args: [] }, session);
-      expect(enterTub.status).toBe(200);
+      expect(enterTub.status, JSON.stringify(enterTub.body)).toBe(200);
       expect(enterTub.body.result).toMatchObject({ room: "the_hot_tub", look_deferred: true });
       expect(enterTub.body.observations).toContainEqual(expect.objectContaining({ type: "entered", room: "the_hot_tub", origin: "the_deck" }));
       const tubState = await worker.fetch(new Request("https://woo.test/api/me", {
@@ -3671,7 +3801,7 @@ describe("CFObjectRepository production-shape coverage", () => {
         space: "the_pinboard",
         args: ["CF smoke edited"]
       }, session);
-      expect(editNote.status).toBe(200);
+      expect(editNote.status, JSON.stringify(editNote.body)).toBe(200);
       expect(editNote.body.observations).toContainEqual(expect.objectContaining({ type: "note_edited", note: pin, text: "CF smoke edited" }));
 
       const listed = await post("/api/objects/the_pinboard/calls/list_notes", { args: [] }, session);

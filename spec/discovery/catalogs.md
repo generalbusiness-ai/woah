@@ -374,6 +374,25 @@ stored form after install. Catalogs may also set `reads_room_presence: true` on
 verbs that render room/workspace roster state; MCP sparse gateway shards use
 that metadata to seed live Directory presence without hardcoding command names.
 
+Property definitions may carry substrate metadata when the property is a
+catalog-visible compatibility surface for a projection. Presence projections use
+`presence_projection`:
+
+```jsonc
+{
+  "name": "custom_session_roster",
+  "type": "list<map>",
+  "default": [],
+  "perms": "r",
+  "presence_projection": {"key": "session", "session_field": "sid", "actor_field": "who"}
+}
+```
+
+`{"key": "actor"}` declares a list of actor/object ids. `{"key": "session"}`
+declares row objects, with field names supplied by the catalog or defaulting to
+`session` and `actor`. Runtime core consults this metadata, not property names,
+when treating a property as a movement-coupled projection.
+
 Class and feature objects may declare lifecycle `flags` for ordinary
 authoring/template behavior. `fertile: true` means instances may be created
 under the catalog class by actors who do not own the class object; deployed

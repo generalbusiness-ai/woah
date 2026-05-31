@@ -90,8 +90,6 @@ export type ShadowCommitConflict = {
 
 export type ShadowCommitResult = ShadowCommitAccepted | ShadowCommitConflict;
 
-export const SHADOW_PLACEMENT_TRANSACTION_SCOPE = "#placement" as ObjRef;
-
 export type ShadowCommitScope = {
   kind: "woo.commit_scope.shadow.v1";
   node: string;
@@ -291,6 +289,7 @@ export function applyAcceptedShadowFrame(
   const authorityProjectionWrites = projectionWrites.length > 0 && projectionWritesAreAuthorityRows(projectionWrites);
   if (authorityProjectionWrites) {
     applyProjectionWritesToCommitScopeCache(scope, projectionWrites);
+    applyMovementProjectionToCommitScopeCache(scope, transcript);
   } else {
     // Browser-profiled projection rows are display material only. They must
     // never become VM-readable SerializedWorld rows, so authority caches replay
@@ -378,7 +377,8 @@ function shadowCommitEnvelopeErrors(scope: ShadowCommitScope, submit: ShadowComm
     errors.push(`scope_mismatch: submit=${submit.scope} scope=${scope.scope}`);
   }
   errors.push(...validateShadowCommitTransaction(submit));
-  if (!submit.transaction && submit.transcript.scope !== scope.scope) {
+  const locationCommitScope = shadowLocationCommitScopeForTranscript(submit.transcript);
+  if (!submit.transaction && submit.transcript.scope !== scope.scope && locationCommitScope !== scope.scope) {
     errors.push(`scope_mismatch: submit=${submit.scope} transcript=${submit.transcript.scope} scope=${scope.scope}`);
   }
   if (!sameShadowHead(submit.expected, scope.head)) {
@@ -428,46 +428,29 @@ export function shadowCommitTransactionCoversTranscript(
   return required.cells.every((cell) => provided.has(cellKey(cell)));
 }
 
+export function shadowLocationCommitScopeForTranscript(transcript: EffectTranscript): ObjRef | null {
+  if (transcript.moves.length === 0) return null;
+  const moved = new Set(transcript.moves.map((move) => move.object));
+  if (moved.size !== 1) return null;
+  const [object] = Array.from(moved);
+  if (transcript.creates.length > 0) return null;
+  for (const write of transcript.writes) {
+    if (write.cell.kind === "location" && write.cell.object === object) continue;
+    // A movement transcript may include duplicate location writes: one from
+    // the object_move event and one from the lower-level cell_write. Any other
+    // authoritative write means this is not the single-location CA3 path.
+    return null;
+  }
+  return object;
+}
+
 function placementTransactionTouchesForeignContents(transaction: ShadowCommitTransaction, scope: ObjRef): boolean {
   return transaction.cells.some((cell) => cell.kind === "contents" && cell.object !== scope);
 }
 
 export function shadowPlacementTransactionForTranscript(transcript: EffectTranscript): ShadowCommitTransaction | null {
-  const cells = new Map<string, TranscriptCell>();
-  const add = (cell: TranscriptCell): void => {
-    cells.set(cellKey(cell), cell);
-  };
-  const movedContainers = new Set<ObjRef>();
-  for (const move of transcript.moves) {
-    add({ kind: "location", object: move.object });
-    if (move.from) {
-      add({ kind: "contents", object: move.from });
-      movedContainers.add(move.from);
-    }
-    add({ kind: "contents", object: move.to });
-    movedContainers.add(move.to);
-  }
-  for (const write of transcript.writes) {
-    if (write.cell.kind === "location") {
-      add(write.cell);
-      continue;
-    }
-    if (write.cell.kind === "contents") {
-      add(write.cell);
-      movedContainers.add(write.cell.object);
-    }
-  }
-  if (cells.size === 0) return null;
-  // Presence rows are ordinary properties today, but for movement they are part
-  // of the same placement transaction: an accepted move must not publish a body
-  // location that races separately from the room subscriber mirror.
-  for (const write of transcript.writes) {
-    if (write.cell.kind !== "prop") continue;
-    if (write.cell.name !== "subscribers" && write.cell.name !== "session_subscribers") continue;
-    if (!movedContainers.has(write.cell.object)) continue;
-    add(write.cell);
-  }
-  return { kind: "placement", cells: Array.from(cells.values()).sort(compareTranscriptCells) };
+  void transcript;
+  return null;
 }
 
 function validateShadowPostState(reader: TranscriptCellReader, transcript: EffectTranscript): string[] {
@@ -697,6 +680,7 @@ export function applyShadowTranscriptToIndexedState(
     const target = mutableObject(write.cell.object);
     if (target) applyTranscriptWriteToSerializedObject(target, write, transcript, options);
   }
+  applyMovementProjectionToIndexedState(transcript, mutableObject, options.objectTimestamp);
   profile("apply_writes", stepStartedAt);
   stepStartedAt = Date.now();
   applyTranscriptSessionLocationToState(next, transcript);
@@ -716,6 +700,31 @@ export function applyShadowTranscriptToIndexedState(
     projection_delta: projectionDeltaWithToolSurfaceSourceMarkers(summarizeProjectionWrites(projectionWrites), transcript.scope),
     projection_writes: projectionWrites
   };
+}
+
+function applyMovementProjectionToIndexedState(
+  transcript: EffectTranscript,
+  mutableObject: (id: ObjRef) => SerializedObject | null,
+  objectTimestamp: number | undefined
+): void {
+  // CA3/CA4: location is the authoritative movement write; object.contents is
+  // a compatibility projection. Accepted location moves update any materialized
+  // source/destination projection rows here without making contents a validated
+  // write cell in the transcript.
+  for (const move of transcript.moves) {
+    if (move.from && move.from !== move.to) {
+      const from = mutableObject(move.from);
+      if (from) {
+        from.contents = from.contents.filter((id) => id !== move.object);
+        touchSerializedObject(from, objectTimestamp);
+      }
+    }
+    const to = mutableObject(move.to);
+    if (to && !to.contents.includes(move.object)) {
+      to.contents = [...to.contents, move.object].sort();
+      touchSerializedObject(to, objectTimestamp);
+    }
+  }
 }
 
 function projectionWritesForIndexedApply(
@@ -878,12 +887,40 @@ function applyProjectionWritesToCommitScopeCache(scope: ShadowCommitScope, write
   commitShadowCommitScopeState(scope, next);
 }
 
+function applyMovementProjectionToCommitScopeCache(scope: ShadowCommitScope, transcript: EffectTranscript): void {
+  if (transcript.moves.length === 0) return;
+  const next = cloneShadowCommitScopeState(ensureShadowCommitScopeState(scope));
+  const mutableObjects = new Set<ObjRef>();
+  const mutableObject = (id: ObjRef): SerializedObject | null => {
+    const existing = next.objectsById.get(id);
+    if (!existing) return null;
+    if (mutableObjects.has(id)) return existing;
+    const clone = structuredClone(existing) as SerializedObject;
+    next.objectsById.set(id, clone);
+    mutableObjects.add(id);
+    return clone;
+  };
+  applyMovementProjectionToIndexedState(transcript, mutableObject, undefined);
+  commitShadowCommitScopeState(scope, next);
+}
+
 function applyProjectionWritesToCommitScopeState(next: ShadowCommitScopeState, writes: readonly ProjectionWrite[]): void {
   for (const write of coalesceProjectionWrites(writes)) {
     switch (write.table) {
       case "objects":
         if (write.op === "delete") next.objectsById.delete(write.key);
-        else next.objectsById.set(write.key, structuredClone(write.row) as SerializedObject);
+        else {
+          const row = structuredClone(write.row) as SerializedObject;
+          const existing = next.objectsById.get(write.key);
+          if (existing) {
+            // CA3/CA4: object.contents is a derived room-membership projection.
+            // Whole-row projection writes are snapshots from one accepted frame;
+            // preserving the receiver's current projection avoids replacing
+            // disjoint member updates from other actors.
+            row.contents = existing.contents.slice();
+          }
+          next.objectsById.set(write.key, row);
+        }
         break;
       case "sessions":
         if (write.op === "delete") next.sessionsById.delete(write.key);
@@ -1034,6 +1071,11 @@ export function transcriptTouchedObjectIds(transcript: EffectTranscript): Set<Ob
     // Projection summaries include object metadata and inherited definitions,
     // so every written cell can change this object or a descendant summary.
     ids.add(write.cell.object);
+  }
+  for (const move of transcript.moves) {
+    ids.add(move.object);
+    if (move.from) ids.add(move.from);
+    ids.add(move.to);
   }
   return ids;
 }
