@@ -1274,6 +1274,11 @@ export class WooWorld {
     return this.presenceProjectionForObjectRecord(this.object(objRef), name);
   }
 
+  isPresenceProjectionProperty(objRef: ObjRef, name: string): boolean {
+    const obj = this.objects.get(objRef);
+    return obj ? this.presenceProjectionForObjectRecord(obj, name) !== null : false;
+  }
+
   private presenceProjectionForObjectRecord(obj: WooObject, name: string): PresenceProjectionDef | null {
     let current: WooObject | null = obj;
     while (current) {

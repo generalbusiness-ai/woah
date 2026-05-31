@@ -29,7 +29,9 @@
 
 import { createWorld, createWorldFromSerialized, mergeHostScopedSeedWithStatus, nonEmptyHostScopedWorld } from "../core/bootstrap";
 import {
+  authoritySlicePageCount,
   authoritySliceObjectIds,
+  buildSerializedAuthorityCellSlice,
   combineSerializedAuthoritySlices,
   filterSerializedAuthoritySlicePages,
   serializedWorldFromAuthoritySlice
@@ -213,6 +215,15 @@ type RestV2RelayClient = {
   nextTurn: number;
 };
 
+type AuthorityCheckpoint = {
+  source: "cache";
+  authority: SerializedAuthoritySlice;
+  appliedSeq: number;
+  coveredObjectIds: Set<ObjRef>;
+};
+
+type AuthorityReconstructionReason = "warm_turn_refresh" | "cold_open" | "missing_state_repair";
+
 type V2LocalHostMaterialization = {
   hostKey: string;
   gatewayHost: boolean;
@@ -295,6 +306,7 @@ export const MCP_GATEWAY_ACTOR_SUPPORT_ROOTS: readonly ObjRef[] = ["$actor", "$t
 const DEFAULT_TOOL_SURFACE_SOURCE_INDEX_MAX_SCOPE_ROWS = 10_000;
 const DEFAULT_TOOL_SURFACE_SOURCE_INDEX_MAX_SHARD_ROWS = 40_000;
 const MAX_REST_V2_RELAY_CLIENTS = 64;
+const MAX_AUTHORITY_CHECKPOINTS = 64;
 const DIRECTORY_HOST = "directory";
 const INTERNAL_ORIGIN = "https://woo.internal";
 const MAX_JSON_BODY_BYTES = 1 * 1024 * 1024;
@@ -447,6 +459,7 @@ export class PersistentObjectDO {
   private repo: CFObjectRepository;
   private world: WooWorld | null = null;
   private routeCache = new Map<ObjRef, string>();
+  private authorityCheckpoints = new Map<ObjRef, AuthorityCheckpoint>();
   private localRouteSnapshot: {
     hostKey: string;
     version: number;
@@ -778,6 +791,7 @@ export class PersistentObjectDO {
         }
       }
     });
+    this.updateAuthorityCheckpointsFromProjectionWrites(position, writes);
     this.emitMetric({
       kind: "gateway_projection_cache_write",
       scope: authorityScope,
@@ -789,6 +803,51 @@ export class PersistentObjectDO {
       source
     }, this.durableHostKey());
     return { rows, bytes };
+  }
+
+  private updateAuthorityCheckpointsFromProjectionWrites(position: ShadowScopeHead, writes: readonly ProjectionWrite[]): void {
+    const touchedObjects = new Set<ObjRef>();
+    const touchedSessions = new Set<string>();
+    for (const write of writes) {
+      if (write.table === "objects") touchedObjects.add(write.key);
+      if (write.table === "sessions") touchedSessions.add(write.key);
+    }
+    if (touchedObjects.size === 0 && touchedSessions.size === 0) return;
+    for (const [scope, checkpoint] of Array.from(this.authorityCheckpoints)) {
+      const checkpointSessionIds = new Set(checkpoint.authority.sessions.map((session) => session.id));
+      const touchesCheckpoint = Array.from(touchedObjects).some((id) => checkpoint.coveredObjectIds.has(id)) ||
+        Array.from(touchedSessions).some((id) => checkpointSessionIds.has(id));
+      if (!touchesCheckpoint) continue;
+      if (scope !== position.scope) {
+        this.authorityCheckpoints.delete(scope);
+        continue;
+      }
+      if (position.seq <= checkpoint.appliedSeq) continue;
+      const serialized = serializedWorldFromAuthoritySlice(checkpoint.authority);
+      for (const write of writes) {
+        if (write.table === "objects") {
+          serialized.objects = write.op === "delete"
+            ? serialized.objects.filter((obj) => obj.id !== write.key)
+            : [...serialized.objects.filter((obj) => obj.id !== write.key), structuredClone(write.row) as SerializedObject];
+        } else if (write.table === "sessions") {
+          serialized.sessions = write.op === "delete"
+            ? serialized.sessions.filter((session) => session.id !== write.key)
+            : [...serialized.sessions.filter((session) => session.id !== write.key), structuredClone(write.row) as SerializedSession];
+        }
+      }
+      serialized.objects.sort((a, b) => a.id.localeCompare(b.id));
+      serialized.sessions.sort((a, b) => a.id.localeCompare(b.id));
+      const authority = this.checkpointSliceFromSerialized(serialized);
+      this.storeAuthorityCheckpoint(scope, authority, position.seq);
+      this.emitMetric({
+        kind: "authority_slice_reconstructed",
+        reason: "warm_checkpoint_caught_up",
+        scope,
+        object_count: authoritySliceObjectIds(authority).size,
+        page_count: authoritySlicePageCount(authority),
+        source_host: this.durableHostKey()
+      }, this.durableHostKey());
+    }
   }
 
   private requireProjectionWritesComplete(
@@ -1531,7 +1590,10 @@ export class PersistentObjectDO {
               useCommitScopeSnapshotForRemoteAuthority:
                 authorityOptions?.useCommitScopeSnapshotForRemoteAuthority === true &&
                 !isMcpGatewayShardHost(this.durableHostKey()),
-              directorySessionScopes: authorityOptions?.directorySessionScopes
+              directorySessionScopes: authorityOptions?.directorySessionScopes,
+              reconstructionReason: authorityOptions?.reconstructionReason,
+              reconstructionScope: authorityOptions?.reconstructionScope,
+              checkpointHead: authorityOptions?.checkpointHead
             }),
           executionCapsuleOpen: envFlag(this.env.WOO_V2_EXECUTION_CAPSULE)
         },
@@ -3228,7 +3290,16 @@ export class PersistentObjectDO {
         const objects = Array.isArray(body.objects)
           ? body.objects.filter((item): item is ObjRef => typeof item === "string" && item.length > 0)
           : [];
-        return jsonResponse({ authority: world.exportAuthoritySlice([], objects) });
+        const authority = world.exportAuthoritySlice([], objects);
+        this.emitMetric({
+          kind: "authority_slice_reconstructed",
+          reason: "slice_served",
+          scope: "$nowhere",
+          object_count: authoritySliceObjectIds(authority).size,
+          page_count: authoritySlicePageCount(authority),
+          source_host: hostKey
+        }, hostKey);
+        return jsonResponse({ authority });
       }
 
       if (request.method === "POST" && pathname === "/__internal/apply-host-seed") {
@@ -4019,7 +4090,7 @@ export class PersistentObjectDO {
     try {
       const seedObjectIds = [commitScope, session.actor];
       let phaseStartedAt = metricNow();
-      const authority = await this.v2GatewayAuthorityPayload(world, seedObjectIds);
+      const authority = await this.v2GatewayAuthorityPayload(world, seedObjectIds, { reconstructionReason: "cold_open", reconstructionScope: commitScope });
       this.emitV2OpenStep("gateway_authority", phaseStartedAt, { scope: commitScope, node, actor: session.actor, count: seedObjectIds.length });
       phaseStartedAt = metricNow();
       const openBody = {
@@ -4379,15 +4450,70 @@ export class PersistentObjectDO {
 
   private async v2GatewayState(world: WooWorld, extraObjectIds: Iterable<ObjRef>): Promise<{ serialized: SerializedWorld; authority: ReturnType<typeof executorAuthorityPayload> }> {
     const ids = Array.from(extraObjectIds);
-    const authority = await this.v2GatewayAuthorityPayload(world, ids);
+    const authority = await this.v2GatewayAuthorityPayload(world, ids, { reconstructionReason: "cold_open", reconstructionScope: ids[0] ?? "$nowhere" });
     const serialized = serializedWorldFromAuthoritySlice(authority.authority);
     return { serialized, authority };
+  }
+
+  private authorityCheckpointHit(scope: ObjRef, ids: readonly ObjRef[]): AuthorityCheckpoint | null {
+    const checkpoint = this.authorityCheckpoints.get(scope);
+    if (!checkpoint) return null;
+    for (const id of ids) {
+      if (!checkpoint.coveredObjectIds.has(id)) return null;
+    }
+    this.authorityCheckpoints.delete(scope);
+    this.authorityCheckpoints.set(scope, checkpoint);
+    return {
+      ...checkpoint,
+      authority: structuredClone(checkpoint.authority) as SerializedAuthoritySlice,
+      coveredObjectIds: new Set(checkpoint.coveredObjectIds)
+    };
+  }
+
+  private storeAuthorityCheckpoint(scope: ObjRef, authority: SerializedAuthoritySlice, appliedSeq: number): void {
+    this.authorityCheckpoints.delete(scope);
+    this.authorityCheckpoints.set(scope, {
+      source: "cache",
+      authority: structuredClone(authority) as SerializedAuthoritySlice,
+      appliedSeq,
+      coveredObjectIds: authoritySliceObjectIds(authority)
+    });
+    while (this.authorityCheckpoints.size > MAX_AUTHORITY_CHECKPOINTS) {
+      const oldest = this.authorityCheckpoints.keys().next().value;
+      if (oldest === undefined) break;
+      this.authorityCheckpoints.delete(oldest);
+    }
+  }
+
+  private checkpointSliceFromSerialized(serialized: SerializedWorld): SerializedAuthoritySlice {
+    return buildSerializedAuthorityCellSlice({
+      sessions: serialized.sessions,
+      objects: serialized.objects,
+      counters: {
+        objectCounter: serialized.objectCounter,
+        parkedTaskCounter: serialized.parkedTaskCounter,
+        sessionCounter: serialized.sessionCounter
+      },
+      tombstones: serialized.tombstones ?? []
+    });
+  }
+
+  private authorityCheckpointAppliedSeq(scope: ObjRef, head: ShadowScopeHead | null | undefined): number | null {
+    if (head?.scope === scope) return head.seq;
+    return this.gatewayProjectionHeadSeq(scope);
   }
 
   private async v2GatewayAuthorityPayload(
     world: WooWorld,
     extraObjectIds: Iterable<ObjRef>,
-    options: { tolerateRemoteFailures?: boolean; useCommitScopeSnapshotForRemoteAuthority?: boolean; directorySessionScopes?: readonly ObjRef[] } = {}
+    options: {
+      tolerateRemoteFailures?: boolean;
+      useCommitScopeSnapshotForRemoteAuthority?: boolean;
+      directorySessionScopes?: readonly ObjRef[];
+      reconstructionReason?: AuthorityReconstructionReason;
+      reconstructionScope?: ObjRef;
+      checkpointHead?: ShadowScopeHead | null;
+    } = {}
   ): Promise<ReturnType<typeof executorAuthorityPayload>> {
     // `tolerateRemoteFailures: true` allows the per-envelope refresh path to
     // omit slices for cold/unreachable remote hosts and rely on the
@@ -4397,14 +4523,56 @@ export class PersistentObjectDO {
     // warm opens). Open paths instead let the timeout propagate so the
     // caller fails loudly and the client retries against a warm satellite.
     const ids = Array.from(new Set(Array.from(extraObjectIds).filter((id): id is ObjRef => typeof id === "string" && id.length > 0)));
-    const localHost = this.durableHostKey();
     const directorySessionScopes = options.directorySessionScopes ?? [];
-    const local = executorAuthorityPayload(world, ids);
-    const localObjectIds = authoritySliceObjectIds(local.authority);
+    const reconstructionReason = options.reconstructionReason ?? (options.tolerateRemoteFailures || options.useCommitScopeSnapshotForRemoteAuthority ? "warm_turn_refresh" : "cold_open");
+    const reconstructionScope = options.reconstructionScope ?? ids[0] ?? "$nowhere";
+    const localHost = this.durableHostKey();
     const mcpGatewayShard = isMcpGatewayShardHost(localHost);
     const directoryScopeSessions = mcpGatewayShard && directorySessionScopes.length > 0
       ? await this.loadDirectorySessionsForScopes(directorySessionScopes)
       : [];
+    if (reconstructionReason === "warm_turn_refresh") {
+      const cached = this.authorityCheckpointHit(reconstructionScope, ids);
+      if (cached) {
+        const sessionActors = new Set<ObjRef>(
+          cached.authority.sessions
+            .map((session) => session.actor)
+            .filter((actor) => world.objects.has(actor))
+        );
+        const slices: SerializedAuthoritySlice[] = [cached.authority];
+        if (sessionActors.size > 0) {
+          const localActorLive = filterSerializedAuthoritySlicePages(
+            executorAuthorityPayload(world, sessionActors).authority,
+            (ref) => sessionActors.has(ref.object) && ref.page === "object_live"
+          );
+          if (authoritySlicePageCount(localActorLive) > 0) slices.push(localActorLive);
+        }
+        if (directoryScopeSessions.length > 0) slices.push(mcpGatewayDirectorySessionCellSlice(directoryScopeSessions));
+        const authority = slices.length > 1
+          ? combineSerializedAuthoritySlices(mergeSerializedSessions(cached.authority.sessions, directoryScopeSessions), slices)
+          : cached.authority;
+        const authorityObjectIds = authoritySliceObjectIds(authority);
+        const authoritySessions = authority.sessions.filter((session) => authorityObjectIds.has(session.actor));
+        const filteredAuthority: SerializedAuthoritySlice = authority.sessions.length === authoritySessions.length
+          ? authority
+          : { ...authority, sessions: authoritySessions };
+        world.recordMetric({
+          kind: "authority_slice_reconstructed",
+          reason: "warm_checkpoint_hit",
+          scope: reconstructionScope,
+          object_count: authoritySliceObjectIds(filteredAuthority).size,
+          page_count: authoritySlicePageCount(filteredAuthority),
+          source_host: this.durableHostKey()
+        });
+        return {
+          sessions: filteredAuthority.sessions,
+          session_objects: [],
+          authority: filteredAuthority
+        };
+      }
+    }
+    const local = executorAuthorityPayload(world, ids);
+    const localObjectIds = authoritySliceObjectIds(local.authority);
     const routesById = isMcpGatewayShardHost(localHost)
       ? new Map<ObjRef, { id: ObjRef; host: string; anchor: ObjRef | null }>()
       : new Map(world.objectRoutes().map((route) => [route.id, route] as const));
@@ -4561,6 +4729,18 @@ export class PersistentObjectDO {
     const filteredAuthority: SerializedAuthoritySlice = authority.sessions.length === authoritySessions.length
       ? authority
       : { ...authority, sessions: authoritySessions };
+    world.recordMetric({
+      kind: "authority_slice_reconstructed",
+      reason: reconstructionReason,
+      scope: reconstructionScope,
+      object_count: authoritySliceObjectIds(filteredAuthority).size,
+      page_count: authoritySlicePageCount(filteredAuthority),
+      source_host: localHost
+    });
+    const checkpointSeq = this.authorityCheckpointAppliedSeq(reconstructionScope, options.checkpointHead);
+    if (staleFallbackCount === 0 && checkpointSeq !== null) {
+      this.storeAuthorityCheckpoint(reconstructionScope, filteredAuthority, checkpointSeq);
+    }
     return {
       sessions: filteredAuthority.sessions,
       session_objects: [],
@@ -4632,7 +4812,10 @@ export class PersistentObjectDO {
       authorityPayload: async (_scope, extraObjectIds) =>
         await this.v2GatewayAuthorityPayload(world, extraObjectIds, {
           tolerateRemoteFailures: true,
-          directorySessionScopes: extraObjectIds
+          directorySessionScopes: extraObjectIds,
+          reconstructionReason: "warm_turn_refresh",
+          reconstructionScope: _scope,
+          checkpointHead: this.restV2Relays.get(_scope)?.relay.commit_scope.head ?? null
         }),
       applyAuthority: (client, authority) => {
         this.mergeRestPlanningAuthority(world, client, authority);
@@ -4917,7 +5100,7 @@ export class PersistentObjectDO {
         audiences.observationSessionAudiences?.[index] ?? []
       ))
       .filter((event): event is ShadowLiveEvent => event !== null);
-    const affectedScopes = new Set(affectedBrowserFanoutScopes(commitScope, reply.transcript));
+    const affectedScopes = new Set(affectedBrowserFanoutScopes(commitScope, reply.transcript, (object, property) => world.isPresenceProjectionProperty(object, property)));
     if (events.length === 0 && affectedScopes.size === 0) return;
     const stateTargets = new Map<string, { ws: WebSocket; att: V2SocketAttachment }>();
     for (const ws of this.state.getWebSockets()) {
@@ -5021,7 +5204,7 @@ export class PersistentObjectDO {
     transcript: EffectTranscript,
     observations: readonly Observation[]
   ): Promise<McpFanoutAudience> {
-    const directorySessions = await this.loadDirectorySessionsForScopes(affectedMcpFanoutScopes(scope, transcript));
+    const directorySessions = await this.loadDirectorySessionsForScopes(affectedMcpFanoutScopes(scope, transcript, (object, property) => world.isPresenceProjectionProperty(object, property)));
     const fallback = await world.computeDirectLiveAudiences(scope, structuredClone(observations) as Observation[]);
     const directoryAudience = mcpFanoutAudienceFromDirectorySessions(scope, observations, directorySessions);
     return mergeMcpFanoutAudience(fallback, directoryAudience);
@@ -5038,7 +5221,7 @@ export class PersistentObjectDO {
     // observations to MCP wait queues at the gateway layer, using the same
     // Directory shard discovery as durable commit fanout.
     if (!localAlreadyHandled) this.mcpGateway?.acceptRemoteV2Live(scope, transcript, originSessionId);
-    const affectedScopes = affectedMcpFanoutScopes(scope, transcript);
+    const affectedScopes = affectedMcpFanoutScopes(scope, transcript, (object, property) => world.isPresenceProjectionProperty(object, property));
     const scopedHosts = await this.mcpShardHostsForScopes(affectedScopes);
     const hosts = new Set(scopedHosts);
     const localHost = this.durableHostKey();
@@ -5220,7 +5403,7 @@ export class PersistentObjectDO {
     // a cold unrelated shard has to hydrate a gateway snapshot before it can
     // discard the replay, and that turns one room commit into deployment-wide
     // cold-start work.
-    const affectedScopes = affectedMcpFanoutScopes(scope, transcript);
+    const affectedScopes = affectedMcpFanoutScopes(scope, transcript, (object, property) => world.isPresenceProjectionProperty(object, property));
     const audienceSessions = mcpFanoutAudienceSessionIds(audience);
     const audienceShardSet = new Set<string>();
     for (const sessionId of audienceSessions) {

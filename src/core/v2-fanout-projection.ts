@@ -16,6 +16,8 @@ import type { EffectTranscript } from "./effect-transcript";
 import type { ShadowLiveAudience, ShadowLiveEvent } from "./shadow-browser-node";
 import type { ObjRef } from "./types";
 
+export type PresenceProjectionPredicate = (object: ObjRef, property: string) => boolean;
+
 // A peer descriptor: enough state to decide whether a fan-out event should
 // be delivered to a single client. WS attachments and REST relays both
 // satisfy this shape today; the field set is deliberately small so future
@@ -31,7 +33,7 @@ export type ShadowLivePeerScope = {
 // creates with a location, and contents/subscriber writes contribute their
 // own scopes so co-present sessions on other shards/hosts still see the
 // fanout.
-export function affectedTranscriptScopes(scope: ObjRef, transcript: EffectTranscript): ObjRef[] {
+export function affectedTranscriptScopes(scope: ObjRef, transcript: EffectTranscript, isPresenceProjection?: PresenceProjectionPredicate): ObjRef[] {
   const scopes = new Set<ObjRef>([scope]);
   const add = (value: ObjRef | null | undefined): void => {
     if (value) scopes.add(value);
@@ -46,7 +48,7 @@ export function affectedTranscriptScopes(scope: ObjRef, transcript: EffectTransc
   for (const write of transcript.writes) {
     const cell = write.cell;
     if (cell.kind === "contents") add(cell.object);
-    if (cell.kind === "prop" && (cell.name === "session_subscribers" || cell.name === "subscribers")) {
+    if (cell.kind === "prop" && isPresenceProjection?.(cell.object, cell.name) === true) {
       add(cell.object);
     }
   }
@@ -57,12 +59,12 @@ export function affectedTranscriptScopes(scope: ObjRef, transcript: EffectTransc
 // transports, different recipient discovery) but currently project from
 // the transcript identically. Kept as named exports so call sites read
 // intent-first and future divergence is a localized change.
-export function affectedMcpFanoutScopes(scope: ObjRef, transcript: EffectTranscript): ObjRef[] {
-  return affectedTranscriptScopes(scope, transcript);
+export function affectedMcpFanoutScopes(scope: ObjRef, transcript: EffectTranscript, isPresenceProjection?: PresenceProjectionPredicate): ObjRef[] {
+  return affectedTranscriptScopes(scope, transcript, isPresenceProjection);
 }
 
-export function affectedBrowserFanoutScopes(scope: ObjRef, transcript: EffectTranscript): ObjRef[] {
-  return affectedTranscriptScopes(scope, transcript);
+export function affectedBrowserFanoutScopes(scope: ObjRef, transcript: EffectTranscript, isPresenceProjection?: PresenceProjectionPredicate): ObjRef[] {
+  return affectedTranscriptScopes(scope, transcript, isPresenceProjection);
 }
 
 // Build a `ShadowLiveAudience` record from raw actor/session id lists.

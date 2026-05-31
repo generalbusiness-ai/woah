@@ -225,6 +225,17 @@ export function authoritySliceObjectIds(authority: MergeSerializedAuthorityInput
   return new Set(authority.page_refs.map((ref) => ref.object));
 }
 
+// Count the cell pages a slice carries, for instrumentation that sizes a
+// reconstruction (step 2a). For the cell-slice representation (CA12) this is
+// the number of page refs; for the legacy object-row representation there are
+// no cell pages, so the page count is the object-row count (each object row is
+// the indivisible unit transferred). This stays in core so the metric site
+// never has to branch on the slice's representation kind.
+export function authoritySlicePageCount(authority: MergeSerializedAuthorityInput): number {
+  if (!isAuthorityCellSlice(authority)) return authority.objects.length;
+  return authority.page_refs.length;
+}
+
 export function pruneSerializedSessionsWithoutActorRows(serialized: { sessions: SerializedSession[]; objects: SerializedObject[] }): boolean {
   const objectIds = new Set(serialized.objects.map((obj) => obj.id));
   const sessions = serialized.sessions.filter((session) => objectIds.has(session.actor));

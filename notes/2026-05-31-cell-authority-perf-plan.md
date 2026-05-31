@@ -60,18 +60,34 @@ storm against incomplete executor slices.
    cell-keyed reads (CA12).** Bulk of the ~10s/turn, and owner of the remaining
    `the_chatroom -> $chatroom` scope-lineage dangle. Split into verifiable
    sub-steps, each landed and harness-checked before the next:
-   - **2a — instrument.** Record every authority-slice reconstruction by
+   - **2a — instrument. [implemented in this branch]** Record every
+     authority-slice reconstruction by
      `{reason, scope, object_count, page_count, source_host}`. Nothing else
      changes; this makes 2b–2e measurable and gives the warm-vs-cold split (3).
-   - **2b — reusable scope authority checkpoint** built at open/cold-load, so a
-     warm turn reads a checkpoint rather than reconstructing a slice.
-   - **2c — catch-up by retained accepted-frame/transcript tail** when the
-     checkpoint is stale, instead of rebuilding the whole slice.
+   - **2b — reusable scope authority checkpoint. [implemented in this branch,
+     in-memory/checkpoint-hit only]** A warm turn may read an in-memory
+     per-scope authority checkpoint rather than reconstructing a slice. MCP
+     reads that need live Directory session overlays still hit the checkpoint
+     and merge fresh Directory session rows into the returned payload; the
+     volatile session overlay is not persisted into the checkpoint. Checkpoints
+     are bounded by an LRU cap and carry a concrete head sequence watermark;
+     degraded stale-fallback payloads are served once but are not stored.
+   - **2c — catch-up by retained accepted-frame/transcript tail. [implemented in
+     this branch for projection-write fanout]** When an accepted commit touches
+     objects/sessions covered by a checkpoint at the same scope, the checkpoint
+     is advanced in place from the bounded projection-write tail. Replayed or
+     older sequence rows are idempotent/no-op. A commit at a different scope
+     that touches covered rows invalidates the checkpoint because the watermark
+     is scope-local. Checkpoint hits also overlay this shard's current live
+     actor cells before serving, so a local session-location rebase is not
+     hidden behind an older cached slice.
    - **2d — cell-keyed materialization repair only on real misses** (a cell the
-     checkpoint+tail genuinely lack), reusing the VTN10.1 path.
+     checkpoint+tail genuinely lack), reusing the VTN10.1 path. **Not yet
+     implemented.** Current checkpoint coverage misses still fall through to the
+     existing full refresh path.
    - **2e — gate then delete the old per-turn full-slice reconstruction path.**
      Gate behind a flag first so 2a instrumentation proves it's no longer hit on
-     warm turns, then remove.
+     warm turns, then remove. **Not yet implemented.**
    - **Provenance is a 2-wide invariant (review pt 5):** every installed
      cell/page carries `source: authoritative | projection | fallback | cache`
      plus owner/head. **Fallback/cache cells MUST NOT be persisted as
@@ -85,6 +101,12 @@ storm against incomplete executor slices.
      per-object Directory lookup. This removes the storm's structural cause here,
      so step 3 is only the *remaining* route-resolution batching, not cleanup
      after a new path repeats the same mistake.
+   - **Layering cleanup folded into this step:** fanout projection routing no
+     longer hardcodes `subscribers` / `session_subscribers` in
+     `src/core/v2-fanout-projection.ts`; it accepts a presence-projection
+     predicate supplied from runtime catalog metadata. This keeps core fanout
+     scope derivation in the same metadata-declared model as the transcript
+     reconciliation work.
 3. **Bound the remaining resolve-object route resolution** — batch per-turn route
    lookups; the bulk of the storm should already be gone via 2's page provenance.
 4. **Formalize the multi-DO harness (CA16).** `cf-local-walkthrough` already runs
@@ -133,3 +155,19 @@ next. Prod stays at `b7915524` (no users) until step 2 demonstrably improves the
 profile without authority corruption. Do not re-run the CF smoke for its own
 sake — re-measure with `smoke-with-tail.sh` only when a step should move a
 specific metric.
+
+## Separate baseline test debt
+
+Two non-gated/order-dependent failures were confirmed against pristine baseline
+`4f5062e` and are tracked separately from this branch's acceptance:
+
+- `tests/worker/gateway-projection-cache.test.ts` — "does not fetch world for
+  unresolved ids or locally-live actors on sparse MCP shards" still reads
+  `["the_chatroom", "world"]` rather than only `["the_chatroom"]`.
+- `tests/worker/v2-cost-budget.test.ts` — "returns a compact executable seed
+  marker when the open digest matches" can return a full `open_executable_seed`
+  transfer instead of the compact cache-hit marker.
+
+Do not use either as evidence for or against the Step 2 checkpoint/fanout
+metadata patch until the baseline ordering failures are fixed in their own
+change.

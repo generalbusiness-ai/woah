@@ -386,6 +386,33 @@ version, not present the projection as the truth. Provenance is the first
 shippable increment (CA16) and is what makes failures legible — the withdrawn
 `#placement` failure surfaced only as `E_INTERNAL "#<Object>"` for lack of it.
 
+### CA11.1 Gateway authority checkpoints
+
+An implementation MAY keep an in-memory per-scope authority checkpoint to avoid
+reconstructing a full planning slice on every warm turn. Such a checkpoint is a
+planning cache, not a new authority source:
+
+- The checkpoint MUST carry `source: "cache"` provenance and a non-null owner
+  head sequence for the scope it represents.
+- The checkpoint MUST NOT be stored or refreshed from a degraded slice that used
+  `fallback`, `gossip`, or timeout-derived rows. Stale rows may be served for a
+  single planning attempt, but they do not become the next warm checkpoint.
+- Accepted same-scope projection tails MAY advance a checkpoint only when the
+  accepted sequence is strictly greater than the checkpoint watermark. Older or
+  duplicate tails are no-ops.
+- Accepted writes from a different scope that touch any covered cell MUST
+  invalidate the checkpoint unless exact per-cell route epochs prove the write
+  is irrelevant. A scope-local sequence number is not meaningful for a foreign
+  scope.
+- A checkpoint hit MAY merge fresh volatile overlays, such as Directory session
+  rows or the local session actor's live cell, into the served planning payload.
+  These overlays MUST NOT be persisted back into the checkpoint.
+- Implementations MUST bound checkpoint count by memory policy, for example an
+  LRU cap. A gateway must never accumulate one full slice per scope forever.
+
+Commit validation remains authoritative: a write planned from a checkpoint can
+still be rejected by the owner head/cell-version checks.
+
 ## CA12. Representation alignment
 
 One primary key shape MUST span layers: route records, SQL rows, state-transfer

@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { authoritySliceObjectIds } from "../../src/core/authority-slice";
+import { authoritySliceObjectIds, serializedWorldFromAuthoritySlice } from "../../src/core/authority-slice";
 import { createWorld } from "../../src/core/bootstrap";
 import type { EffectTranscript } from "../../src/core/effect-transcript";
 import type { ProjectionDeltaSummary, ProjectionWrite, SessionToolManifest } from "../../src/core/projection-delta";
-import type { SerializedAuthoritySlice } from "../../src/core/repository";
+import type { SerializedAuthoritySlice, SerializedSession } from "../../src/core/repository";
 import { encodeEnvelope } from "../../src/core/shadow-envelope";
 import { wooError, type MetricEvent, type ObjRef, type RemoteToolDescriptor, type RemoteToolRequest } from "../../src/core/types";
 import type { ShadowCommitAccepted, ShadowScopeHead } from "../../src/core/shadow-commit-scope";
@@ -742,8 +742,9 @@ describe("gateway projection cache", () => {
       v2GatewayAuthorityPayload: (
         world: ReturnType<typeof createWorld>,
         extraObjectIds: ObjRef[],
-        options: { tolerateRemoteFailures?: boolean; useCommitScopeSnapshotForRemoteAuthority?: boolean }
+        options: { tolerateRemoteFailures?: boolean; useCommitScopeSnapshotForRemoteAuthority?: boolean; checkpointHead?: ShadowScopeHead | null; reconstructionReason?: "warm_turn_refresh"; reconstructionScope?: ObjRef }
       ) => Promise<{ authority: SerializedAuthoritySlice }>;
+      authorityCheckpoints: Map<ObjRef, { source: string; authority: SerializedAuthoritySlice; appliedSeq: number; coveredObjectIds: Set<ObjRef> }>;
       routeCache: Map<ObjRef, string>;
       forwardInternalReadChecked: () => Promise<never>;
     };
@@ -755,7 +756,10 @@ describe("gateway projection cache", () => {
 
     const payload = await po.v2GatewayAuthorityPayload(world, ["the_chatroom", session.actor], {
       tolerateRemoteFailures: true,
-      useCommitScopeSnapshotForRemoteAuthority: true
+      useCommitScopeSnapshotForRemoteAuthority: true,
+      reconstructionReason: "warm_turn_refresh",
+      reconstructionScope: "the_chatroom",
+      checkpointHead: { kind: "woo.scope_head.shadow.v1", scope: "the_chatroom", epoch: 1, seq: 7, hash: "chatroom-7" }
     });
     const ids = authoritySliceObjectIds(payload.authority);
 
@@ -768,6 +772,7 @@ describe("gateway projection cache", () => {
       host: "the_chatroom",
       reason: "snapshot_fallback"
     }));
+    expect(po.authorityCheckpoints.has("the_chatroom"), "stale fallback rows must not become a warm authority checkpoint").toBe(false);
   });
 
   it("keeps transitive movement destinations when owner refresh falls back to stale rows", async () => {
@@ -865,5 +870,270 @@ describe("gateway projection cache", () => {
     expect(ids.has(stale.actor)).toBe(false);
     expect(payload.authority.sessions.map((session) => session.id)).toContain(live.id);
     expect(payload.authority.sessions.map((session) => session.id)).not.toContain(stale.id);
+  });
+
+  // Step 2c (cell-authority perf plan): when the per-scope authority checkpoint
+  // is stale relative to an accepted commit at its OWN scope, it catches up from
+  // the commit's retained object tail instead of being discarded + rebuilt. The
+  // catch-up must be idempotent (replay is a no-op), monotonic (older seq never
+  // rolls it back), preserve provenance (still source:"cache", never persisted),
+  // and a CROSS-scope commit touching covered objects must invalidate (the seq
+  // watermark is per-scope, so a foreign sequence cannot be folded).
+  // Each case uses fresh FakeDO state and a fresh world; the baseline route-cache
+  // order dependence in this file is tracked separately from these guards.
+  describe("step 2c authority checkpoint tail catch-up", () => {
+    type CatchUpHarness = {
+      v2GatewayAuthorityPayload: (
+        world: ReturnType<typeof createWorld>,
+        extraObjectIds: ObjRef[],
+        options: {
+          tolerateRemoteFailures?: boolean;
+          useCommitScopeSnapshotForRemoteAuthority?: boolean;
+          directorySessionScopes?: readonly ObjRef[];
+          reconstructionReason?: "warm_turn_refresh" | "cold_open" | "missing_state_repair";
+          reconstructionScope?: ObjRef;
+          checkpointHead?: ShadowScopeHead | null;
+        }
+      ) => Promise<{ authority: SerializedAuthoritySlice }>;
+      applyGatewayProjectionWrites: (head: ShadowScopeHead, writes: ProjectionWrite[], source: "fanout", delta?: ProjectionDeltaSummary) => { rows: number; bytes: number };
+      authorityCheckpoints: Map<ObjRef, { source: string; authority: SerializedAuthoritySlice; appliedSeq: number; coveredObjectIds: Set<ObjRef> }>;
+      routeCache: Map<ObjRef, string>;
+      loadDirectorySessionsForScopes: (scopes: readonly ObjRef[]) => Promise<Array<SerializedSession & { displayName?: string | null }>>;
+      forwardInternalReadChecked: (host: string, path: string, body: { objects?: ObjRef[] }) => Promise<{ authority: SerializedAuthoritySlice }>;
+      emitMetric: (event: MetricEvent, host?: string) => void;
+    };
+
+    // The DO host is a sparse MCP gateway shard (the warm-checkpoint subject) and
+    // the scope's authority is served from the local world (no remote owner), so
+    // a warm reconstruction populates a checkpoint deterministically.
+    function harness(world: ReturnType<typeof createWorld>): { state: FakeDurableObjectState; po: CatchUpHarness } {
+      const state = new FakeDurableObjectState("mcp-gateway-0");
+      const po = new PersistentObjectDO(state as unknown as DurableObjectState, env()) as unknown as CatchUpHarness;
+      // Resolve every object to the local host so the warm reconstruction stays
+      // local and captures a checkpoint without a remote fetch.
+      po.forwardInternalReadChecked = async (_host, _path, body) => ({ authority: world.exportAuthoritySlice([], body.objects ?? []) });
+      return { state, po };
+    }
+
+    function objectLocation(authority: SerializedAuthoritySlice, id: ObjRef): ObjRef | null | undefined {
+      const sw = serializedWorldFromAuthoritySlice(authority);
+      return sw.objects.find((obj) => obj.id === id)?.location ?? null;
+    }
+
+    function scopeHead(scope: ObjRef, seq = 0, hash = `${scope}:${seq}`): ShadowScopeHead {
+      return { kind: "woo.scope_head.shadow.v1", scope, epoch: 1, seq, hash };
+    }
+
+    it("serves checkpoint hits with fresh Directory session overlays", async () => {
+      const metrics: MetricEvent[] = [];
+      const world = createWorld({ metricsHook: (event) => metrics.push(event) });
+      const { po } = harness(world);
+      const directorySession: SerializedSession & { displayName: string } = {
+        id: "session-directory-live",
+        actor: "guest_directory_live",
+        started: 1,
+        activeScope: "the_chatroom",
+        displayName: "Directory Live"
+      };
+      po.loadDirectorySessionsForScopes = async () => [directorySession];
+
+      const chatroomHead = scopeHead("the_chatroom");
+      await po.v2GatewayAuthorityPayload(world, ["the_chatroom"], {
+        reconstructionReason: "warm_turn_refresh",
+        reconstructionScope: "the_chatroom",
+        checkpointHead: chatroomHead
+      });
+      metrics.length = 0;
+
+      const served = await po.v2GatewayAuthorityPayload(world, ["the_chatroom"], {
+        directorySessionScopes: ["the_chatroom"],
+        reconstructionReason: "warm_turn_refresh",
+        reconstructionScope: "the_chatroom",
+        checkpointHead: chatroomHead
+      });
+      const serialized = serializedWorldFromAuthoritySlice(served.authority);
+
+      expect(metrics).toContainEqual(expect.objectContaining({
+        kind: "authority_slice_reconstructed",
+        reason: "warm_checkpoint_hit",
+        scope: "the_chatroom"
+      }));
+      expect(serialized.sessions.map((session) => session.id)).toContain(directorySession.id);
+      expect(serialized.objects.find((obj) => obj.id === directorySession.actor)?.name).toBe("Directory Live");
+    });
+
+    it("catches a stale own-scope checkpoint up from the accepted commit tail, idempotently", async () => {
+      const metrics: MetricEvent[] = [];
+      const world = createWorld({ metricsHook: (event) => metrics.push(event) });
+      const session = world.auth("guest:catchup-own-scope");
+      const actor = session.actor;
+      const { po } = harness(world);
+      const emitted: MetricEvent[] = [];
+      po.emitMetric = (event) => {
+        emitted.push(event);
+      };
+
+      // Capture a checkpoint at the actor's home scope via a warm reconstruction.
+      await po.v2GatewayAuthorityPayload(world, [actor], {
+        reconstructionReason: "warm_turn_refresh",
+        reconstructionScope: actor,
+        checkpointHead: scopeHead(actor)
+      });
+      const checkpoint = po.authorityCheckpoints.get(actor)!;
+      expect(checkpoint, "warm reconstruction must capture a checkpoint at the actor scope").toBeDefined();
+      // PROVENANCE INVARIANT (CA11): the checkpoint is a cache artifact.
+      expect(checkpoint.source).toBe("cache");
+      expect(checkpoint.appliedSeq).toBe(0);
+
+      // The owner accepts a commit at the actor's OWN scope that rewrites the
+      // actor's location (the movement cell). The post-commit row is the tail.
+      const movedRow = { ...world.exportObjects([actor])[0]!, location: "the_chatroom" as ObjRef };
+      const head: ShadowScopeHead = { kind: "woo.scope_head.shadow.v1", scope: actor, epoch: 1, seq: 1, hash: "c1" };
+      po.applyGatewayProjectionWrites(head, [{ table: "objects", key: actor, op: "upsert", row: movedRow, bytes: 64 }], "fanout");
+
+      // The catch-up fired (not a discard): the checkpoint is still present and
+      // its watermark advanced to the commit seq.
+      expect(po.authorityCheckpoints.has(actor), "own-scope catch-up must keep the checkpoint").toBe(true);
+      expect(po.authorityCheckpoints.get(actor)?.appliedSeq).toBe(1);
+      expect(emitted).toContainEqual(expect.objectContaining({
+        kind: "authority_slice_reconstructed",
+        reason: "warm_checkpoint_caught_up",
+        scope: actor
+      }));
+
+      // A subsequent warm turn is served the CAUGHT-UP location from the checkpoint.
+      metrics.length = 0;
+      const served = await po.v2GatewayAuthorityPayload(world, [actor], { reconstructionReason: "warm_turn_refresh", reconstructionScope: actor });
+      expect(metrics).toContainEqual(expect.objectContaining({ kind: "authority_slice_reconstructed", reason: "warm_checkpoint_hit", scope: actor }));
+      expect(objectLocation(served.authority, actor)).toBe("the_chatroom");
+
+      // IDEMPOTENT: replaying the same accepted commit is a no-op (watermark
+      // unchanged, served state unchanged). MONOTONIC: an older seq cannot roll
+      // the checkpoint back to a stale location.
+      po.applyGatewayProjectionWrites(head, [{ table: "objects", key: actor, op: "upsert", row: movedRow, bytes: 64 }], "fanout");
+      po.applyGatewayProjectionWrites({ ...head, seq: 0, hash: "c0" }, [{ table: "objects", key: actor, op: "upsert", row: { ...movedRow, location: "stale_room" as ObjRef }, bytes: 64 }], "fanout");
+      expect(po.authorityCheckpoints.get(actor)?.appliedSeq).toBe(1);
+      const reserved = await po.v2GatewayAuthorityPayload(world, [actor], { reconstructionReason: "warm_turn_refresh", reconstructionScope: actor });
+      expect(objectLocation(reserved.authority, actor)).toBe("the_chatroom");
+    });
+
+    it("invalidates a checkpoint when a cross-scope commit changes a covered object", async () => {
+      const world = createWorld();
+      const session = world.auth("guest:catchup-cross-scope");
+      const actor = session.actor;
+      const { po } = harness(world);
+
+      // Capture a ROOM-scoped checkpoint that covers the actor (a member).
+      await po.v2GatewayAuthorityPayload(world, ["the_chatroom", actor], {
+        reconstructionReason: "warm_turn_refresh",
+        reconstructionScope: "the_chatroom",
+        checkpointHead: scopeHead("the_chatroom")
+      });
+      const checkpoint = po.authorityCheckpoints.get("the_chatroom")!;
+      expect(checkpoint).toBeDefined();
+      expect(checkpoint.coveredObjectIds.has(actor)).toBe(true);
+
+      // A commit at the ACTOR's own scope (not the_chatroom) changes the covered
+      // actor. The room checkpoint cannot reconcile a foreign sequence, so it is
+      // invalidated — the next warm turn rebuilds it cleanly.
+      const movedRow = { ...world.exportObjects([actor])[0]!, location: "the_deck" as ObjRef };
+      const head: ShadowScopeHead = { kind: "woo.scope_head.shadow.v1", scope: actor, epoch: 1, seq: 1, hash: "x1" };
+      po.applyGatewayProjectionWrites(head, [{ table: "objects", key: actor, op: "upsert", row: movedRow, bytes: 64 }], "fanout");
+
+      expect(po.authorityCheckpoints.has("the_chatroom"), "cross-scope commit touching a covered object must invalidate the checkpoint").toBe(false);
+    });
+
+    it("does not roll a freshly reconstructed checkpoint back below its head watermark", async () => {
+      const world = createWorld();
+      const session = world.auth("guest:checkpoint-watermark");
+      const actor = session.actor;
+      world.object(actor).location = "the_chatroom";
+      const { po } = harness(world);
+
+      await po.v2GatewayAuthorityPayload(world, [actor], {
+        reconstructionReason: "warm_turn_refresh",
+        reconstructionScope: actor,
+        checkpointHead: scopeHead(actor, 5, "actor-5")
+      });
+      expect(po.authorityCheckpoints.get(actor)?.appliedSeq).toBe(5);
+
+      const staleRow = { ...world.exportObjects([actor])[0]!, location: "stale_room" as ObjRef };
+      po.applyGatewayProjectionWrites(scopeHead(actor, 4, "actor-4"), [{
+        table: "objects",
+        key: actor,
+        op: "upsert",
+        row: staleRow,
+        bytes: 64
+      }], "fanout");
+
+      expect(po.authorityCheckpoints.get(actor)?.appliedSeq).toBe(5);
+      const served = await po.v2GatewayAuthorityPayload(world, [actor], {
+        reconstructionReason: "warm_turn_refresh",
+        reconstructionScope: actor,
+        checkpointHead: scopeHead(actor, 5, "actor-5")
+      });
+      expect(objectLocation(served.authority, actor)).toBe("the_chatroom");
+    });
+
+    it("bounds authority checkpoints with least-recently-used eviction", async () => {
+      const world = createWorld();
+      const { po } = harness(world);
+
+      for (let i = 0; i < 65; i += 1) {
+        const scope = `checkpoint_scope_${i}` as ObjRef;
+        await po.v2GatewayAuthorityPayload(world, ["the_chatroom"], {
+          reconstructionReason: "warm_turn_refresh",
+          reconstructionScope: scope,
+          checkpointHead: scopeHead(scope, 0, `scope-${i}`)
+        });
+      }
+
+      expect(po.authorityCheckpoints.size).toBe(64);
+      expect(po.authorityCheckpoints.has("checkpoint_scope_0" as ObjRef)).toBe(false);
+      expect(po.authorityCheckpoints.has("checkpoint_scope_64" as ObjRef)).toBe(true);
+
+      await po.v2GatewayAuthorityPayload(world, ["the_chatroom"], {
+        reconstructionReason: "warm_turn_refresh",
+        reconstructionScope: "checkpoint_scope_1" as ObjRef,
+        checkpointHead: scopeHead("checkpoint_scope_1" as ObjRef)
+      });
+      await po.v2GatewayAuthorityPayload(world, ["the_chatroom"], {
+        reconstructionReason: "warm_turn_refresh",
+        reconstructionScope: "checkpoint_scope_65" as ObjRef,
+        checkpointHead: scopeHead("checkpoint_scope_65" as ObjRef)
+      });
+
+      expect(po.authorityCheckpoints.has("checkpoint_scope_1" as ObjRef)).toBe(true);
+      expect(po.authorityCheckpoints.has("checkpoint_scope_2" as ObjRef)).toBe(false);
+      expect(po.authorityCheckpoints.has("checkpoint_scope_65" as ObjRef)).toBe(true);
+    });
+
+    it("overlays local live actor cells on checkpoint hits", async () => {
+      const world = createWorld();
+      const session = world.auth("guest:checkpoint-live-overlay");
+      const actor = session.actor;
+      world.object(actor).location = "the_chatroom";
+      const { po } = harness(world);
+
+      await po.v2GatewayAuthorityPayload(world, [actor], {
+        reconstructionReason: "warm_turn_refresh",
+        reconstructionScope: actor,
+        checkpointHead: scopeHead(actor)
+      });
+      expect(objectLocation(po.authorityCheckpoints.get(actor)!.authority, actor)).toBe("the_chatroom");
+
+      // Simulate a local live-session rebase that this shard observed through
+      // the session table but did not receive as a same-scope projection write.
+      world.object(actor).location = "the_deck";
+
+      const served = await po.v2GatewayAuthorityPayload(world, [actor], {
+        reconstructionReason: "warm_turn_refresh",
+        reconstructionScope: actor,
+        checkpointHead: scopeHead(actor)
+      });
+
+      expect(objectLocation(served.authority, actor)).toBe("the_deck");
+      expect(objectLocation(po.authorityCheckpoints.get(actor)!.authority, actor)).toBe("the_chatroom");
+    });
   });
 });
