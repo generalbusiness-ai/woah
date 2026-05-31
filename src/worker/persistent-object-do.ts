@@ -269,7 +269,24 @@ type V2SocketAttachment = {
 const WORLD_HOST = "world";
 const MCP_GATEWAY_SHARD_PREFIX = "mcp-gateway-";
 const DEFAULT_MCP_GATEWAY_SHARDS = 32;
-const MCP_GATEWAY_ACTOR_SUPPORT_IDS = new Set<ObjRef>(["$root", "$thing", "$actor", "$player"]);
+// Roots of the universal actor/thing lineage carried into every MCP gateway-shard
+// world so verb / property resolution can walk the ancestor chain locally. The
+// carried set is the COMPLETE closure of these roots (their full class subtree
+// plus every ancestor up to `$system`, the lineage top with parent:null) —
+// computed from the seed in mcpGatewayActorSupportObjects(), not hand-listed.
+//
+// A hand-maintained id list was wrong twice: it omitted `$system` (so every
+// `$root -> $system` walk dangled) and `$guest`/`$human`/`$agent` (so every
+// guest/human/agent actor's `<actor> -> $<class>` walk dangled) — a
+// `dangling_parent_ref` storm (~one per resolution per turn) that silently
+// degraded resolution and forced per-turn authority-slice fan-in. Closing over
+// the roots makes the set self-maintaining as the seed lineage evolves.
+//
+// Scope lineage (`$space`) is intentionally NOT a root here — it stays owner
+// authority and arrives via the room's authority slice (see
+// mcpGatewayDirectorySessionCellSlice), so a sparse `$space` stub never
+// overwrites a real `$chatroom`.
+const MCP_GATEWAY_ACTOR_SUPPORT_ROOTS: readonly ObjRef[] = ["$actor", "$thing"];
 const DEFAULT_TOOL_SURFACE_SOURCE_INDEX_MAX_SCOPE_ROWS = 10_000;
 const DEFAULT_TOOL_SURFACE_SOURCE_INDEX_MAX_SHARD_ROWS = 40_000;
 const MAX_REST_V2_RELAY_CLIENTS = 64;
@@ -6169,11 +6186,30 @@ let mcpGatewayActorSupportObjectsCache: SerializedObject[] | null = null;
 function mcpGatewayActorSupportObjects(): SerializedObject[] {
   if (!mcpGatewayActorSupportObjectsCache) {
     const snapshot = createWorld({ catalogs: false }).exportWorld();
+    const byId = new Map(snapshot.objects.map((obj) => [obj.id, obj] as const));
+    // Closure of MCP_GATEWAY_ACTOR_SUPPORT_ROOTS: each root's full class subtree
+    // (so any actor subclass an actor instance is parented at resolves) plus the
+    // ancestor chain to the lineage top (so the chain never dangles partway).
+    const ids = new Set<ObjRef>();
+    const subtree = [...MCP_GATEWAY_ACTOR_SUPPORT_ROOTS];
+    while (subtree.length > 0) {
+      const id = subtree.pop()!;
+      if (ids.has(id)) continue;
+      ids.add(id);
+      for (const child of byId.get(id)?.children ?? []) subtree.push(child);
+    }
+    for (const root of MCP_GATEWAY_ACTOR_SUPPORT_ROOTS) {
+      let current: ObjRef | null = byId.get(root)?.parent ?? null;
+      while (current && !ids.has(current)) {
+        ids.add(current);
+        current = byId.get(current)?.parent ?? null;
+      }
+    }
     mcpGatewayActorSupportObjectsCache = snapshot.objects
-      .filter((obj) => MCP_GATEWAY_ACTOR_SUPPORT_IDS.has(obj.id))
+      .filter((obj) => ids.has(obj.id))
       .map((obj) => {
         const clone = structuredClone(obj) as SerializedObject;
-        clone.children = clone.children.filter((id) => MCP_GATEWAY_ACTOR_SUPPORT_IDS.has(id));
+        clone.children = clone.children.filter((id) => ids.has(id));
         clone.contents = [];
         return clone;
       })
