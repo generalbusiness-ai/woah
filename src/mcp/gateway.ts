@@ -623,11 +623,7 @@ export class McpGateway {
         persistence,
         token: entry.v2Token
       },
-      strategy: "planned-exec",
       maxAttempts: 8,
-      intentScope: (turn) => turn.persistence === "durable"
-        ? turn.scope
-        : turn.scope,
       ensureClient: async (submitScope) => await this.ensureV2ScopeClient(entry, submitScope),
       clientNode: () => this.v2NodeFor(entry),
       clientHead: (client) => client.relay.commit_scope.head,

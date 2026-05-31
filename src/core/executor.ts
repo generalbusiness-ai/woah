@@ -119,7 +119,6 @@ export type SubmitTurnIntentResult<Client, Result extends ExecutorEnvelopeResult
 
 export type SubmitTurnIntentOptions<Client, Result extends ExecutorEnvelopeResult> = {
   input: ExecutorCallInput;
-  strategy: "intent" | "planned-exec";
   maxAttempts?: number;
   ensureClient(scope: ObjRef, attempt: number): Promise<Client>;
   clientNode(client: Client): string;
@@ -131,7 +130,6 @@ export type SubmitTurnIntentOptions<Client, Result extends ExecutorEnvelopeResul
   submitEnvelope(scope: ObjRef, body: ExecutorEnvelopeBody): Promise<Result>;
   applyAuthority?(client: Client, authority: SerializedAuthoritySlice): void;
   authorityObjectIds?(input: ExecutorCallInput, commitScope: ObjRef): ObjRef[];
-  intentScope?(input: ExecutorCallInput): ObjRef;
   planningScope?(input: ExecutorCallInput): ObjRef;
   shouldRetry?(reply: ShadowTurnExecReply): boolean;
   // Forwarder for engine metric events recorded during planning-phase
@@ -377,93 +375,16 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
   const maxAttempts = options.maxAttempts ?? 1;
   const shouldRetry = options.shouldRetry ?? executorReplyNeedsRepair;
   let repairObjectIds: ObjRef[] = [];
-  let forceInputScope = false;
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    if (options.strategy === "intent") {
-      const submitScope = forceInputScope ? options.input.scope : options.intentScope?.(options.input) ?? options.input.scope;
-      const client = await options.ensureClient(submitScope, attempt);
-      const turnId = options.input.id ?? options.nextTurnId(client, attempt);
-      const envelope = encodeExecutorIntentEnvelope({
-        node: options.clientNode(client),
-        turn: options.input,
-        turnId,
-        envelopeId: options.envelopeId?.(turnId, attempt)
-      });
-      const authorityObjectIds = mergeExecutorObjectIds(
-        options.authorityObjectIds?.(options.input, submitScope)
-          ?? executorAuthorityObjectIds(options.input, submitScope),
-        repairObjectIds
-      );
-      const authority = await options.authorityPayload(submitScope, authorityObjectIds);
-      options.applyAuthority?.(client, authority.authority);
-      const result = await options.submitEnvelope(submitScope, executorEnvelopeBody({
-        scope: submitScope,
-        node: options.clientNode(client),
-        turn: options.input,
-        authority,
-        envelope
-      }));
-      const replyEnvelope = decodeExecutorReply(result.reply);
-      if (
-        replyEnvelope?.body &&
-        attempt + 1 < maxAttempts &&
-        submitScope !== options.input.scope &&
-        replyEnvelope.body.ok === false &&
-        replyEnvelope.body.reason === "commit_rejected" &&
-        replyEnvelope.body.commit?.reason === "scope_mismatch"
-      ) {
-        forceInputScope = true;
-        continue;
-      }
-      if (replyEnvelope?.body && attempt + 1 < maxAttempts && shouldRetry(replyEnvelope.body)) {
-        const missingObjectIds = executorObjectIdsFromMissingState(replyEnvelope.body);
-        const repeatedMissingObjects = missingObjectIds.length > 0 && missingObjectIds.every((id) => repairObjectIds.includes(id));
-        if (
-          submitScope !== options.input.scope &&
-          replyEnvelope.body.ok === false &&
-          replyEnvelope.body.reason === "missing_state" &&
-          (missingObjectIds.length === 0 || repeatedMissingObjects)
-        ) {
-          forceInputScope = true;
-          continue;
-        }
-        repairObjectIds = mergeExecutorObjectIds(repairObjectIds, missingObjectIds);
-        continue;
-      }
-      return {
-        kind: "submitted",
-        scope: options.input.scope,
-        commitScope: replyEnvelope?.body?.ok === true && replyEnvelope.body.commit
-          ? replyEnvelope.body.commit.position.scope
-          : submitScope,
-        client,
-        result,
-        replyEnvelope,
-        reply: replyEnvelope?.body ?? null,
-        call: buildExecutorCall(options.input, turnId)
-      };
-    }
-
     const planningScope = options.planningScope?.(options.input) ?? options.input.scope;
     const planningClient = await options.ensureClient(planningScope, attempt);
     const turnId = options.input.id ?? options.nextTurnId(planningClient, attempt);
     const call = buildExecutorCall(options.input, turnId);
     const serialized = options.clientSerialized?.(planningClient);
     if (!serialized) throw new Error("planned v2 turn gateway submission requires clientSerialized");
-    let planned: ShadowTurnCallTranscriptRun;
-    try {
-      planned = await runShadowTurnCallTranscript(serialized, call, { onMetric: options.onMetric });
-    } catch (err) {
-      if (options.intentScope && options.intentScope(options.input) !== options.input.scope) {
-        return await submitTurnIntent({ ...options, strategy: "intent" });
-      }
-      throw err;
-    }
+    const planned: ShadowTurnCallTranscriptRun = await runShadowTurnCallTranscript(serialized, call, { onMetric: options.onMetric });
     if (planned.frame.op === "error") {
       return { kind: "local_frame", frame: planned.frame, call, planned };
-    }
-    if (planned.transcript.error && options.intentScope && options.intentScope(options.input) !== options.input.scope) {
-      return await submitTurnIntent({ ...options, strategy: "intent" });
     }
 
     const key = shadowTurnKeyFromTranscript(planned.transcript);
