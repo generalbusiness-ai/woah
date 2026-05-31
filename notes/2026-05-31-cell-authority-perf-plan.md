@@ -39,9 +39,15 @@ storm against incomplete executor slices.
    dangle `guest_1 -> $guest` ×1344). Replaced with a self-maintaining **closure**
    of `MCP_GATEWAY_ACTOR_SUPPORT_ROOTS = [$actor, $thing]`: each root's full class
    subtree + ancestors to `$system`. Regression guard added to
-   `tests/worker/cf-local-walkthrough.test.ts` (universal-lineage dangles == 0;
-   red before fix, green after). NOT yet re-measured on prod — do that only after
-   step 2, to avoid a deploy-just-to-measure.
+   `tests/worker/cf-local-walkthrough.test.ts`. The guard DERIVES the expected
+   universal lineage from the bootstrap seed (parent-closure of the exported
+   `MCP_GATEWAY_ACTOR_SUPPORT_ROOTS`), not a hardcoded id list, and a companion
+   structural test asserts the roots/closure carry the actor/thing chain but
+   exclude scope/catalog classes (`$space`, `$chatroom`, `$sequenced_log`) — so a
+   scope-lineage dangle can never be "fixed" by broadening the universal set. Red
+   before the fix (caught `$system` and `$guest`), green after. NOT yet
+   re-measured on prod — do that only after step 2, to avoid a deploy-just-to-
+   measure.
 
    **New finding promoted to step 2:** with step 1 fixed, the remaining cf-local
    dangle is `the_chatroom -> $chatroom` — a SCOPE INSTANCE whose parent is a
@@ -50,17 +56,80 @@ storm against incomplete executor slices.
    deliberately excludes scope lineage so a sparse `$space` stub never overwrites
    a real `$chatroom`). So scope-lineage completeness is an authority-slice
    problem → step 2.
-2. **Kill authority-slice reconstruction on the turn path** → checkpoint/tail
-   transfer + cell-keyed reads (CA12). Bulk of the ~10s/turn.
-3. **Bound the resolve-object storm** — cache/batch route resolution per turn.
-4. **Multi-DO authority harness (CA16)** with these metrics as assertions:
-   dangling_parent_ref == 0, authority-slice reconstructions/turn == 0,
-   resolve-object calls bounded, no SerializedWorld materialization on the
-   commit path. This is what catches the class locally instead of via prod smoke.
+2. **Replace per-turn authority-slice reconstruction with checkpoint/tail +
+   cell-keyed reads (CA12).** Bulk of the ~10s/turn, and owner of the remaining
+   `the_chatroom -> $chatroom` scope-lineage dangle. Split into verifiable
+   sub-steps, each landed and harness-checked before the next:
+   - **2a — instrument.** Record every authority-slice reconstruction by
+     `{reason, scope, object_count, page_count, source_host}`. Nothing else
+     changes; this makes 2b–2e measurable and gives the warm-vs-cold split (3).
+   - **2b — reusable scope authority checkpoint** built at open/cold-load, so a
+     warm turn reads a checkpoint rather than reconstructing a slice.
+   - **2c — catch-up by retained accepted-frame/transcript tail** when the
+     checkpoint is stale, instead of rebuilding the whole slice.
+   - **2d — cell-keyed materialization repair only on real misses** (a cell the
+     checkpoint+tail genuinely lack), reusing the VTN10.1 path.
+   - **2e — gate then delete the old per-turn full-slice reconstruction path.**
+     Gate behind a flag first so 2a instrumentation proves it's no longer hit on
+     warm turns, then remove.
+   - **Provenance is a 2-wide invariant (review pt 5):** every installed
+     cell/page carries `source: authoritative | projection | fallback | cache`
+     plus owner/head. **Fallback/cache cells MUST NOT be persisted as
+     authority** — this is the direct guard against the earlier KV stale-byte
+     corruption class (stale bytes written through as truth). Checkpoint/tail
+     install paths assert this.
+   - **Carry source/owner provenance ON the pages (review pt 4):** today the
+     gateway filters authority-slice pages by resolving every returned object's
+     host via Directory — a large slice of the resolve-object storm. With
+     per-page owner/source provenance, owner-sourced pages are trusted without a
+     per-object Directory lookup. This removes the storm's structural cause here,
+     so step 3 is only the *remaining* route-resolution batching, not cleanup
+     after a new path repeats the same mistake.
+3. **Bound the remaining resolve-object route resolution** — batch per-turn route
+   lookups; the bulk of the storm should already be gone via 2's page provenance.
+4. **Formalize the multi-DO harness (CA16).** `cf-local-walkthrough` already runs
+   separate PersistentObjectDO/CommitScopeDO/DirectoryDO instances and captures
+   the dangling metric; extend its assertions to the budgets below rather than
+   building a new harness.
+
+## Success metrics — warm vs cold are tracked SEPARATELY (review pt 3)
+
+"authority-slice reconstructions/turn == 0" and "no SerializedWorld
+materialization" mean **steady-state warm turns**. Cold open and *genuine*
+missing-state repair may still fetch bounded cells/checkpoint data — that is a
+healthy path and MUST be tracked as a distinct bucket so it never reads as a
+regression. The 2a instrumentation's `reason` field is what separates them.
+
+## Fanout is an acceptance gate, not just latency (review pt 6)
+
+Removing latency is insufficient: the smoke is INVALID if movement observations
+are dropped. `cf-local-walkthrough` MUST assert, for movement turns:
+- intended audience sessions computed;
+- selected gateway shards;
+- delivered local queues;
+- dropped-reason count == 0;
+- no `mcp-commit-fanout` timeout.
+
+## Budgets — loose first, tighten as steps land (review pt 7)
+
+- After step 1: zero universal-lineage dangles. **[met]**
+- After step 2: zero total `dangling_parent_ref`; no full `SerializedWorld`
+  materialization on a warm MCP turn; bounded Directory `resolve-object` calls
+  per walkthrough/turn.
+- Tracked separately, tightened over time: p95 local MCP step wall time; CPU
+  budget per turn (warm vs cold buckets).
+
+## The next proof (review, agreed)
+
+Step 1 is NOT deployed alone. The important proof is that **step 2 removes the
+`$chatroom` lineage dangle and the per-turn fan-in WITHOUT reintroducing
+sparse-slice authority corruption** (hence the provenance invariant). Verify on
+the harness + a single tail measurement once 2 lands — not per sub-step.
 
 ## Discipline
 
-Each step verified against the multi-DO harness and a local measurement before
-the next. Prod stays at `b7915524` (no users) until a step demonstrably improves
-the profile. Do not re-run the CF smoke for its own sake — re-measure with
-`smoke-with-tail.sh` only when a step should move a specific metric.
+Each (sub-)step verified against the harness and local measurement before the
+next. Prod stays at `b7915524` (no users) until step 2 demonstrably improves the
+profile without authority corruption. Do not re-run the CF smoke for its own
+sake — re-measure with `smoke-with-tail.sh` only when a step should move a
+specific metric.
