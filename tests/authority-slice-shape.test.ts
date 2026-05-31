@@ -21,9 +21,11 @@ import {
   authoritySliceObjectIds,
   buildSerializedAuthorityCellSlice,
   combineSerializedAuthoritySlices,
+  mergeSerializedAuthoritySlice,
   serializedWorldFromAuthoritySlice
 } from "../src/core/authority-slice";
 import { createWorld } from "../src/core/bootstrap";
+import { executorAuthorityPayload } from "../src/core/executor";
 import type { SerializedObject } from "../src/core/repository";
 
 describe("WooWorld.exportAuthoritySlice content contract", () => {
@@ -144,6 +146,18 @@ describe("WooWorld.exportAuthoritySlice content contract", () => {
     // Room contents are a derived set projection; merge precedence is about
     // membership, not the array order chosen by the serialized view.
     expect([...(serialized.objects.find((obj) => obj.id === "the_deck")?.contents ?? [])].sort()).toEqual([...freshDeck.contents].sort());
+  });
+
+  it("does not report no-op cell-page order normalization as an authority change", () => {
+    // The CommitScope executable-seed cache is invalidated from this merge
+    // return value. A raw world export and a repaired sparse snapshot can name
+    // the same contents set in different array order; that must not clear the
+    // open-seed digest when the final repaired state is unchanged.
+    const world = createWorld();
+    const session = world.auth("guest:slice-order-noop");
+    const authority = executorAuthorityPayload(world, ["the_dubspace", session.actor]).authority;
+    const serialized = serializedWorldFromAuthoritySlice(authority);
+    expect(mergeSerializedAuthoritySlice(serialized, authority, { clone: true })).toBe(false);
   });
 });
 

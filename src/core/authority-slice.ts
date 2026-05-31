@@ -74,16 +74,22 @@ export function mergeSerializedAuthoritySlice(
   authority: MergeSerializedAuthorityInput,
   options: MergeSerializedAuthorityOptions = {}
 ): boolean {
-  let changed = mergeAuthoritySessions(serialized, authority.sessions, options);
+  // Cell-page authority can carry set-equivalent children/contents arrays in a
+  // different order than this sparse snapshot. The merge may temporarily apply
+  // those pages and then normalize them back to the same final state; callers
+  // use this boolean for cache invalidation, so report only durable state
+  // changes that remain after all repairs.
+  const before = authorityMergeFingerprint(serialized);
+  mergeAuthoritySessions(serialized, authority.sessions, options);
   if (isAuthorityCellSlice(authority)) {
-    changed = mergeAuthorityCellPages(serialized, authority, options) || changed;
-    changed = mergeAuthorityMetadata(serialized, authority) || changed;
+    mergeAuthorityCellPages(serialized, authority, options);
+    mergeAuthorityMetadata(serialized, authority);
   } else {
-    changed = mergeAuthorityObjectRows(serialized, authority.objects, options) || changed;
+    mergeAuthorityObjectRows(serialized, authority.objects, options);
   }
-  changed = repairDerivedContentsProjection(serialized) || changed;
-  changed = pruneSerializedSessionsWithoutActorRows(serialized) || changed;
-  return changed;
+  repairDerivedContentsProjection(serialized);
+  pruneSerializedSessionsWithoutActorRows(serialized);
+  return authorityMergeFingerprint(serialized) !== before;
 }
 
 export function combineSerializedAuthoritySlices(
@@ -242,6 +248,19 @@ function mergeAuthoritySessions(
   if (stableShadowJson(next as unknown as WooValue) === stableShadowJson(serialized.sessions as unknown as WooValue)) return false;
   serialized.sessions = next;
   return true;
+}
+
+function authorityMergeFingerprint(
+  serialized: { sessions: SerializedSession[]; objects: SerializedObject[] } & Partial<Pick<SerializedWorld, "objectCounter" | "parkedTaskCounter" | "sessionCounter" | "tombstones">>
+): string {
+  return stableShadowJson({
+    sessions: serialized.sessions,
+    objects: serialized.objects,
+    objectCounter: serialized.objectCounter ?? null,
+    parkedTaskCounter: serialized.parkedTaskCounter ?? null,
+    sessionCounter: serialized.sessionCounter ?? null,
+    tombstones: serialized.tombstones ?? null
+  } as unknown as WooValue);
 }
 
 function mergeAuthorityObjectRows(

@@ -95,6 +95,8 @@ export function shadowObjectLivePage(obj: SerializedObject): ShadowObjectLivePag
     page: "object_live",
     object: obj.id,
     location: obj.location,
+    // Preserve serialized order. The contents cell's version hash treats the
+    // collection as a set, but the VM records read values in iteration order.
     children: [...obj.children],
     contents: [...obj.contents]
   };

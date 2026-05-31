@@ -407,7 +407,7 @@ export function restPropertyInfo(world: WooWorld, obj: ObjRef, name: string): Re
     return {
       name,
       owner: target.owner,
-      perms: "r",
+      perms: "",
       defined_on: obj,
       type_hint: null,
       version: target.propertyVersions.get(name) ?? 1,

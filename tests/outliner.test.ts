@@ -294,6 +294,19 @@ describe("outliner catalog: not portable / defensive recycle", () => {
 });
 
 describe("outliner catalog: single-level undo", () => {
+  it("does not expose private undo capture as a direct callable helper", async () => {
+    const world = setupWorld();
+    const owner = world.auth("guest:capture-owner");
+    const outsider = world.auth("guest:capture-outsider");
+    await expectResult(call(world, owner.actor, "the_outline", "enter", []));
+    const secret = await addItem(world, owner.actor, "private capture text");
+
+    const denied = await call(world, outsider.actor, "the_outline", "_capture_item", [secret]);
+
+    expect(denied.op).toBe("error");
+    if (denied.op === "error") expect(denied.error.code).toBe("E_DIRECT_DENIED");
+  });
+
   it("undo of add_item recycles the row", async () => {
     const world = setupWorld();
     const session = world.auth("guest:undo-add");

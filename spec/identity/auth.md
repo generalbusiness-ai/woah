@@ -43,7 +43,7 @@ This separation lets credential management live alongside the runtime (where it 
 
 Extending [identity.md §I3](../semantics/identity.md#i3-auth-guest-baseline):
 
-- **`bearer:<token>`** — a bearer issued by the world's auth service or a delegated IdP. A Cloudflare production issuer may use a signed JWT with claims `iss`, `sub`, `exp`, `aud`, `actor` (objref), and `scope`, verified against a published JWK set. The local v1 issuer may instead use an opaque unguessable handle stored in `$system.bearer_tokens`; it must still carry the same effective actor, scope, and expiry semantics and reject expired, revoked, wrong-audience, or unknown tokens.
+- **`bearer:<token>`** — a bearer issued by the world's auth service or a delegated IdP. A Cloudflare production issuer may use a signed JWT with claims `iss`, `sub`, `exp`, `aud`, `actor` (objref), and `scope`, verified against a published JWK set. The local v1 issuer may instead use an opaque unguessable handle whose verifier record is stored in `$system.bearer_tokens` under a token hash, never under the replayable token itself; it must still carry the same effective actor, scope, and expiry semantics and reject expired, revoked, wrong-audience, or unknown tokens.
 
 - **`oauth_code:<provider>:<code>`** — a single-use OAuth/OIDC authorization code from a known external provider. The runtime exchanges with the provider's token endpoint, validates the resulting id_token, looks up the bound account by `(iss, sub)`, creates a session.
 

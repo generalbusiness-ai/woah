@@ -1,6 +1,7 @@
 import { compileVerb } from "./authoring";
 import { installLocalCatalogs } from "./local-catalogs";
 import type { ObjectRepository, SeedWorld, SerializedObject, SerializedWorld, WorldRepository } from "./repository";
+import { isSensitiveSerializedPropertyName, redactSensitiveSerializedPropertyValues } from "./sensitive-serialization";
 import { hashSource } from "./source-hash";
 import type { MetricEvent, ObjRef, PresenceProjectionDef, VerbDef, WooValue } from "./types";
 import { valuesEqual } from "./types";
@@ -586,20 +587,21 @@ export function mergeHostScopedSeedWithStatus(stored: SerializedWorld, seed: See
 
   for (const seedObj of seed.objects) {
     if (storedTombstones.has(seedObj.id)) continue;
+    const redactedSeedObj = redactSensitiveSerializedPropertyValues(seedObj);
     const current = storedById.get(seedObj.id);
     if (!current) {
-      additions.push(cloneSerializedObject(seedObj));
+      additions.push(cloneSerializedObject(redactedSeedObj));
       changed = true;
-      reasonLog.push({ id: seedObj.id, reasons: ["<add>"] });
+      reasonLog.push({ id: redactedSeedObj.id, reasons: ["<add>"] });
       continue;
     }
     if (seed.objectHosts[seedObj.id] === receiverHost) continue;
     const probe = cloneSerializedObject(current);
     const objReasons: string[] = [];
-    if (mergeSeedObject(probe, seedObj, objReasons)) {
-      replacements.set(seedObj.id, probe);
+    if (mergeSeedObject(probe, redactedSeedObj, objReasons)) {
+      replacements.set(redactedSeedObj.id, probe);
       changed = true;
-      if (objReasons.length > 0) reasonLog.push({ id: seedObj.id, reasons: objReasons });
+      if (objReasons.length > 0) reasonLog.push({ id: redactedSeedObj.id, reasons: objReasons });
     }
   }
 
@@ -645,6 +647,7 @@ export function mergeHostScopedSeedWithStatus(stored: SerializedWorld, seed: See
 
 export function bootstrap(world: WooWorld, options: BootstrapOptions = {}): WooWorld {
   seedUniversal(world);
+  world.gcPendingCredentials();
   if (options.catalogs !== false) installLocalCatalogs(world, options.catalogs);
   seedGuests(world);
   world.rebuildGuestPool();
@@ -665,21 +668,7 @@ const DYNAMIC_HOST_SEED_PROPERTIES = new Set([
   // Per-host one-shot scrub marker (set by scrubStaleSubscribersOnce on
   // the receiver's local copy of $space-descendants); the gateway never
   // sees it, so the merge must not propagate-delete it from stored.
-  "_subscribers_scrubbed_v1",
-  // Gateway-only auth state. Read exclusively by `authApiKey` /
-  // `createApiKeyRecord` / `revokeApiKey` (all on the gateway entry
-  // path); satellites never authenticate independently — they receive
-  // sessions stamped by the gateway. `touchApiKeyLastSeen` rewrites the
-  // map on every API-key auth, so propagating it to satellites turned
-  // every poller's auth call into a satellite snapshot. Treat it as
-  // receiver-authoritative on satellites: first cold-load takes the
-  // gateway's view, subsequent cold-loads skip even if the gateway has
-  // bumped last_seen_at.
-  "api_keys",
-  "bearer_tokens",
-  "pending_email_verifications",
-  "signup_invites",
-  "provision_state_nonces"
+  "_subscribers_scrubbed_v1"
 ]);
 
 /** Drop "phantom" boolean fields whose persistent encoding represents
@@ -918,6 +907,7 @@ function mergeSeedObject(current: SerializedObject, seed: SerializedObject, reas
   const versions = new Map(current.propertyVersions);
   const seedProperties = new Map(seed.properties);
   const seedVersions = new Map(seed.propertyVersions);
+  const deletedSensitiveProperties = new Set<string>();
 
   // HS2.2 take-seed pass. Only the value gate is authoritative; the
   // version is bookkeeping that follows the value. If gateway-side code
@@ -958,6 +948,11 @@ function mergeSeedObject(current: SerializedObject, seed: SerializedObject, reas
   for (const name of Array.from(properties.keys())) {
     if (DYNAMIC_HOST_SEED_PROPERTIES.has(name)) continue;
     if (seedProperties.has(name)) continue;
+    if (isSensitiveSerializedPropertyName(current, name)) {
+      const storedValue = properties.get(name);
+      if (isEmptySensitiveSerializedPropertyValue(storedValue)) continue;
+      deletedSensitiveProperties.add(name);
+    }
     properties.delete(name);
     changed = true;
     note(`properties.${name}(delete)`);
@@ -965,6 +960,7 @@ function mergeSeedObject(current: SerializedObject, seed: SerializedObject, reas
   for (const name of Array.from(versions.keys())) {
     if (DYNAMIC_HOST_SEED_PROPERTIES.has(name)) continue;
     if (seedProperties.has(name) || seedVersions.has(name)) continue;
+    if (isSensitiveSerializedPropertyName(current, name) && !deletedSensitiveProperties.has(name)) continue;
     versions.delete(name);
     changed = true;
     note(`propertyVersions.${name}(delete)`);
@@ -977,6 +973,12 @@ function mergeSeedObject(current: SerializedObject, seed: SerializedObject, reas
 
   // Children/contents/modified explicitly NOT merged (HS2.2 skip-list).
   return changed;
+}
+
+function isEmptySensitiveSerializedPropertyValue(value: WooValue | undefined): boolean {
+  if (Array.isArray(value)) return value.length === 0;
+  if (value && typeof value === "object") return Object.keys(value as Record<string, WooValue>).length === 0;
+  return false;
 }
 
 function cloneSerializedObject(value: SerializedObject): SerializedObject {
@@ -1045,13 +1047,13 @@ function seedUniversal(world: WooWorld): void {
   seedProp(world, "$system", "bootstrap_token_used", false);
   seedProp(world, "$system", "applied_migrations", []);
   seedProp(world, "$system", "catalog_migration_records", []);
-  seedProp(world, "$system", "api_keys", {});
-  seedProp(world, "$system", "bearer_tokens", {});
-  seedProp(world, "$system", "pending_email_verifications", []);
-  seedProp(world, "$system", "signup_invites", []);
+  define(world, "$system", "api_keys", {}, "map", "");
+  define(world, "$system", "bearer_tokens", {}, "map", "");
+  define(world, "$system", "pending_email_verifications", [], "list<map>", "");
+  define(world, "$system", "signup_invites", [], "list<map>", "");
   seedProp(world, "$system", "signup_invite_required", false);
   seedProp(world, "$system", "allowed_provision_return_schemes", ["hermes://"]);
-  seedProp(world, "$system", "provision_state_nonces", []);
+  define(world, "$system", "provision_state_nonces", [], "list<map>", "");
   seedProp(world, "$system", "mcp_endpoint_url", "/mcp");
   seedProp(world, "$system", "default_agent_quota", 5);
   seedProp(world, "$system", "default_programmer_grant_quota", 0);
@@ -1063,9 +1065,9 @@ function seedUniversal(world: WooWorld): void {
   define(world, "$player", "home", "$nowhere", "obj|null");
   define(world, "$account", "email", "", "str", "r");
   define(world, "$account", "email_verified_at", null, "int|null", "r");
-  define(world, "$account", "password_hash", null, "str|null", "r");
-  define(world, "$account", "password_salt", null, "str|null", "r");
-  define(world, "$account", "oauth_identities", [], "list<map>", "r");
+  define(world, "$account", "password_hash", null, "str|null", "");
+  define(world, "$account", "password_salt", null, "str|null", "");
+  define(world, "$account", "oauth_identities", [], "list<map>", "");
   define(world, "$account", "actors", [], "list<obj>", "r");
   define(world, "$account", "primary_actor", null, "obj|null", "r");
   define(world, "$account", "agent_quota", 5, "int", "r");

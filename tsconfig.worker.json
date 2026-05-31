@@ -12,7 +12,7 @@
     "noFallthroughCasesInSwitch": true,
     "skipLibCheck": true,
     "noEmit": true,
-    "types": ["@cloudflare/workers-types", "node"]
+    "types": ["@cloudflare/workers-types/2023-07-01", "node"]
   },
   "include": ["src/worker", "tests/worker"]
 }

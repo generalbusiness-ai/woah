@@ -2029,7 +2029,7 @@ export class PersistentObjectDO {
       "next_seq", "subscribers", "operators", "last_snapshot_seq", "focus_list",
       "bootstrap_token_used", "wizard_actions", "applied_migrations",
       "catalog_migration_records", "installed_catalogs",
-      "_subscribers_scrubbed_v1", "api_keys"
+      "_subscribers_scrubbed_v1"
     ]);
     const stored = new Map(storedWorld.objects.map((o) => [o.id, o]));
     // Only fields the merge actually compares (HS2.2). children/contents
@@ -4451,7 +4451,13 @@ export class PersistentObjectDO {
     };
 
     const localActorAuthorityRoots = localActorAuthorityRootIds(world, ids);
-    const resolvedIds = await Promise.all(ids.map(async (id) => [id, await resolveHost(id, WORLD_HOST)] as const));
+    const resolvedIds = await Promise.all(ids.map(async (id) => {
+      // Sparse MCP shards own the live session actor stubs they loaded from
+      // Directory. Do not wake the world host just because Directory also knows
+      // the actor's canonical owner; the local actor cells are patched below.
+      if (mcpGatewayShard && localActorAuthorityRoots.has(id)) return [id, localHost] as const;
+      return [id, await resolveHost(id, WORLD_HOST)] as const;
+    }));
     const byHost = new Map<string, Set<ObjRef>>();
     for (const [id, host] of resolvedIds) {
       if (!host || host === localHost) continue;

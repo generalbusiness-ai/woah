@@ -300,7 +300,9 @@ of `$system.signup_invites = [{code, expires_at, used_by}]`; redeeming
 a code marks it used and proceeds. Expired unused invites and used
 records older than the audit-retention window are removed by
 `$system:gc_pending_credentials()`. Codes are issued by wizards via
-`$system:issue_signup_invite(quantity, expires_at)`. Useful for
+`$system:issue_signup_invite(quantity, expires_at)`. Invite codes are
+replayable bearer-like secrets while unused, so the ledger is
+gateway-local and redacted from host/shadow seed transfers. Useful for
 early-stage waitlists; flip the flag to `false` for open signup.
 
 **What v1 does *not* require.** Phone verification, payment, identity

@@ -681,7 +681,7 @@ Wizards aggregate via `wiz:world_metrics()` which fans out via Directory + prese
 
 Every `is_wizard` bypass site emits a `wizard_action` event (§R10.1) AND a structured log line at `info` level. Bypass sites covered:
 - `X-Woo-Force-Direct: 1` header
-- `X-Woo-Impersonate-Actor` header
+- `X-Woo-Impersonate-Actor` header on trusted internal DO requests; the public gateway strips this header and public REST uses the body `actor` field instead
 - Wizard force-recycle of forbidden objects
 - Wizard force-set-status (workflow gate bypass)
 - Manual `$system:rebuild_seeds`

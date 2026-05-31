@@ -151,6 +151,14 @@ satellite may need account identity/quota metadata for object graph
 consistency, but it must not receive reusable password or OAuth
 material through host-seed propagation.
 
+Credential-bearing `$system` ledgers are redacted before delivery as
+well: `api_keys`, `bearer_tokens`, `pending_email_verifications`,
+`signup_invites`, and `provision_state_nonces` are omitted from
+`properties` and `propertyVersions`. Satellites receive already-minted
+session metadata from the gateway and must not receive credential
+verifier maps, invite codes, or replay-protection nonces through
+host-seed propagation.
+
 **Deletions.** The seed's per-object property loop only adds and
 updates. To propagate gateway-side deletes/renames, after applying the
 table above, for each foreign-hosted `S`:
@@ -159,6 +167,13 @@ table above, for each foreign-hosted `S`:
   `seed.properties[S]`: delete from stored unless `name` is dynamic
   (dynamic names are receiver-authoritative). Counts as changed.
 - Same rule for `stored.propertyVersions[S]` and `stored.propertyDefs[S]`.
+
+Sensitive redacted names override the dynamic carve-out: a stored
+non-empty or malformed credential/provision ledger on a foreign-hosted
+subject is deleted even though the seed omits the name. Empty default
+ledgers MAY remain in stored slices because they contain no secret
+material and deleting them would turn otherwise-clean cold-loads into
+snapshot writes.
 
 `verbs` and `eventSchemas` are deletion-safe through the deep-equal
 rule above (a removed entry breaks equality).
@@ -178,7 +193,6 @@ without subsequent merges stomping receiver-side ledger writes.
 |---|---|---|
 | `next_seq`, `subscribers`, `operators`, `focus_list`, `last_snapshot_seq` | `$space` instances / actors | per-host live state |
 | `bootstrap_token_used`, `wizard_actions`, `applied_migrations`, `catalog_migration_records`, `installed_catalogs` | `$system` | per-host ledger |
-| `api_keys` | `$system` | gateway-only auth state. Read by `authApiKey` / `createApiKeyRecord` / `revokeApiKey`, all of which run on the gateway; satellites never authenticate independently. `touchApiKeyLastSeen` rewrites the map on every API-key auth, so propagating it would make every poller's auth call burn a satellite snapshot. First cold-load takes the gateway's view, subsequent cold-loads skip. |
 | `_subscribers_scrubbed_v1` | `$space` descendants the receiver hosts a local copy of | per-host one-shot scrub marker (host-side scrub of stale subscribers, gated to fire once per object) |
 
 Adding to this set is a behavior change: it stops the gateway from

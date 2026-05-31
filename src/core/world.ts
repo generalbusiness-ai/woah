@@ -39,6 +39,7 @@ import { shadowAtomHash } from "./turn-key";
 import { objectCreateEvent, type ActiveTurnRecorder, type RecordedCell, type RecordedWriteAuthority, type TurnRecorder, type TurnRecorderEvent, type TurnStart } from "./turn-recorder";
 import { remoteBridgeUntrackedEffect } from "./remote-bridge-transcript-policy";
 import { readObjectPropertyValue } from "./property-read";
+import { redactSensitiveSerializedPropertyValues } from "./sensitive-serialization";
 import type { EffectTranscript, TranscriptWrite } from "./effect-transcript";
 import {
   applyTranscriptContentsWriteRefs,
@@ -2237,7 +2238,7 @@ export class WooWorld {
       return {
         name,
         owner: target.owner,
-        perms: "r",
+        perms: "",
         defined_on: objRef,
         type_hint: null,
         version: valueVersion,
@@ -2332,16 +2333,28 @@ export class WooWorld {
     this.gcPendingCredentials();
       const raw = this.propOrNull("$system", "bearer_tokens");
       const map = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, WooValue> : {};
-      const record = map[token];
+      const tokenHash = this.bearerTokenHash(token);
+      let record = map[tokenHash];
+      let storageKey = tokenHash;
+      if (!record && map[token]) {
+        record = map[token];
+        storageKey = token;
+      }
       if (!record || typeof record !== "object" || Array.isArray(record)) throw wooError("E_NOSESSION", "bearer token is expired or unknown");
       const r = record as Record<string, WooValue>;
       const actor = String(r.actor ?? "");
       const expiresAt = Number(r.expires_at ?? 0);
       if (!actor || !this.objects.has(actor) || expiresAt <= Date.now()) {
-        this.setProp("$system", "bearer_tokens", Object.fromEntries(Object.entries(map).filter(([key]) => key !== token)) as WooValue);
+        this.setProp("$system", "bearer_tokens", Object.fromEntries(Object.entries(map).filter(([key]) => key !== storageKey)) as WooValue);
         throw wooError("E_NOSESSION", "bearer token is expired or unknown");
       }
       if (!this.actorCanAuthenticate(actor)) throw wooError("E_NOSESSION", "bearer actor is deactivated");
+      if (storageKey !== tokenHash || r.token_hash !== tokenHash) {
+        const migrated = { ...map };
+        delete migrated[storageKey];
+        migrated[tokenHash] = { ...r, token_hash: tokenHash } as WooValue;
+        this.setProp("$system", "bearer_tokens", migrated as WooValue);
+      }
       return this.createSessionForActor(actor, "bearer");
     }
 
@@ -2639,12 +2652,17 @@ export class WooWorld {
   private issueBearerToken(actor: ObjRef, account: ObjRef): string {
     this.gcPendingCredentials();
     const token = randomHex(32);
+    const tokenHash = this.bearerTokenHash(token);
     const expiresAt = Date.now() + 60 * 60_000;
     const raw = this.propOrNull("$system", "bearer_tokens");
     const map = raw && typeof raw === "object" && !Array.isArray(raw) ? { ...(raw as Record<string, WooValue>) } : {};
-    map[token] = { actor, account, expires_at: expiresAt, created_at: Date.now() } as WooValue;
+    map[tokenHash] = { token_hash: tokenHash, actor, account, expires_at: expiresAt, created_at: Date.now() } as WooValue;
     this.setProp("$system", "bearer_tokens", map as WooValue);
     return `bearer:${token}`;
+  }
+
+  private bearerTokenHash(token: string): string {
+    return hashSource(`bearer:${token}`);
   }
 
   private actorCanAuthenticate(actor: ObjRef): boolean {
@@ -2667,10 +2685,24 @@ export class WooWorld {
     let changed = false;
     const bearerRaw = this.propOrNull("$system", "bearer_tokens");
     if (bearerRaw && typeof bearerRaw === "object" && !Array.isArray(bearerRaw)) {
-      const next = Object.fromEntries(Object.entries(bearerRaw as Record<string, WooValue>).filter(([, record]) => {
-        return !!(record && typeof record === "object" && !Array.isArray(record) && Number((record as Record<string, WooValue>).expires_at ?? 0) > now);
-      }));
-      if (Object.keys(next).length !== Object.keys(bearerRaw as Record<string, WooValue>).length) {
+      const next: Record<string, WooValue> = {};
+      for (const [key, record] of Object.entries(bearerRaw as Record<string, WooValue>)) {
+        if (!record || typeof record !== "object" || Array.isArray(record)) {
+          changed = true;
+          continue;
+        }
+        const r = record as Record<string, WooValue>;
+        if (Number(r.expires_at ?? 0) <= now) {
+          changed = true;
+          continue;
+        }
+        const tokenHash = typeof r.token_hash === "string" && r.token_hash
+          ? r.token_hash
+          : this.bearerTokenHash(key);
+        if (tokenHash !== key || r.token_hash !== tokenHash) changed = true;
+        next[tokenHash] = { ...r, token_hash: tokenHash } as WooValue;
+      }
+      if (changed || Object.keys(next).length !== Object.keys(bearerRaw as Record<string, WooValue>).length) {
         this.setProp("$system", "bearer_tokens", next as WooValue);
         changed = true;
       }
@@ -11176,15 +11208,10 @@ function nextScopedObjectCounter(ids: Iterable<ObjRef>): number {
 // (bootstrap.ts:normalizeVerbForCompare). See buildHostSeedForDelivery for the
 // full rationale and the degradation contract for non-bundled-catalog verbs.
 function stripAuthoringMetadataFromObject(obj: SerializedObject): SerializedObject {
-  const stripped: SerializedObject = {
+  const stripped = redactSensitiveSerializedPropertyValues({
     ...obj,
     verbs: obj.verbs.map((verb) => ({ ...verb, line_map: {} }))
-  };
-  if (obj.parent === "$account") {
-    const sensitive = new Set(["password_hash", "password_salt", "oauth_identities"]);
-    stripped.properties = stripped.properties.filter(([name]) => !sensitive.has(name));
-    stripped.propertyVersions = stripped.propertyVersions.filter(([name]) => !sensitive.has(name));
-  }
+  });
   return stripped;
 }
 

@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { createWorld, createWorldFromSerialized } from "../src/core/bootstrap";
+import { createWorld, createWorldFromSerialized, mergeHostScopedSeedWithStatus, nonEmptyHostScopedWorld } from "../src/core/bootstrap";
+import { buildShadowBrowserOpenExecutableSeedTransfer, createShadowBrowserRelayShim } from "../src/core/shadow-browser-node";
+import type { ShadowPropertyCellPage } from "../src/core/shadow-state-pages";
 
 let nextId = 1;
 function makeActor(world: ReturnType<typeof createWorld>, parent: string = "$player"): string {
@@ -19,6 +21,119 @@ function expectError(fn: () => unknown, code: string): void {
 }
 
 describe("auth credentials: $system:set_object_flags / mint_session_for / api keys", () => {
+  it("keeps def-less values owner-only instead of synthesizing public read perms", () => {
+    const world = createWorld({ catalogs: false });
+    world.createObject({ id: "legacy_secret_box", name: "Legacy Secret Box", parent: "$thing", owner: "$wiz", location: null });
+    world.setProp("legacy_secret_box", "legacy_secret", "sealed");
+    const guest = world.auth("guest:legacy-secret-reader").actor;
+
+    expect(world.propertyInfo("legacy_secret_box", "legacy_secret")).toMatchObject({ owner: "$wiz", perms: "" });
+    expect(world.getPropForActor("$wiz", "legacy_secret_box", "legacy_secret")).toBe("sealed");
+    expectError(() => world.getPropForActor(guest, "legacy_secret_box", "legacy_secret"), "E_PERM");
+  });
+
+  it("keeps $system credential maps unreadable to programmer-flagged non-wizards", () => {
+    const world = createWorld({ catalogs: false });
+    const programmer = world.auth("guest:credential-map-reader").actor;
+    world.object(programmer).flags.programmer = true;
+    world.createApiKey("$wiz", "$wiz", "system-map-test");
+
+    expect(world.propertyInfo("$system", "api_keys")).toMatchObject({ owner: "$wiz", perms: "" });
+    expect(world.propertyInfo("$system", "bearer_tokens")).toMatchObject({ owner: "$wiz", perms: "" });
+    expectError(() => world.getPropForActor(programmer, "$system", "api_keys"), "E_PERM");
+    expectError(() => world.getPropForActor(programmer, "$system", "bearer_tokens"), "E_PERM");
+  });
+
+  it("redacts $system credential map values from browser executable seeds", () => {
+    const world = createWorld({ catalogs: false });
+    world.setProp("$system", "api_keys", { leaked: { hash: "raw-api-secret", salt: "raw-api-salt" } });
+    world.setProp("$system", "bearer_tokens", { "raw-bearer-token": { actor: "$wiz", expires_at: Date.now() + 60_000 } });
+    const relay = createShadowBrowserRelayShim({
+      node: "node:credential-seed-redaction",
+      scope: "$nowhere",
+      serialized: world.exportWorld()
+    });
+
+    const transfer = buildShadowBrowserOpenExecutableSeedTransfer(relay, "$nowhere", "browser:credential-seed-redaction", "$wiz", null);
+    const encoded = JSON.stringify(transfer);
+    const sensitivePages = transfer.inline_pages
+      .filter((page): page is ShadowPropertyCellPage => page.object === "$system" && page.page === "property_cell" && (page.name === "api_keys" || page.name === "bearer_tokens"))
+      .map((page) => ({ name: page.name, hasValue: page.has_value, value: page.value, version: page.version }));
+
+    expect(encoded).not.toContain("raw-api-secret");
+    expect(encoded).not.toContain("raw-api-salt");
+    expect(encoded).not.toContain("raw-bearer-token");
+    expect(sensitivePages).toEqual([
+      { name: "api_keys", hasValue: false, value: undefined, version: 0 },
+      { name: "bearer_tokens", hasValue: false, value: undefined, version: 0 }
+    ]);
+  });
+
+  it("redacts signup invite codes from host seeds and browser executable seeds", () => {
+    const world = createWorld();
+    world.setProp("$system", "signup_invites", [{ code: "invite-secret", expires_at: Date.now() + 60_000, used_by: null }]);
+
+    const hostSeed = world.buildHostSeedForDelivery("the_deck");
+    const hostEncoded = JSON.stringify(hostSeed);
+    const systemEntry = hostSeed.objects.find((obj) => obj.id === "$system");
+    expect(hostEncoded).not.toContain("invite-secret");
+    expect(systemEntry?.properties.map(([name]) => name)).not.toContain("signup_invites");
+    expect(systemEntry?.propertyVersions.map(([name]) => name)).not.toContain("signup_invites");
+
+    const relay = createShadowBrowserRelayShim({
+      node: "node:invite-seed-redaction",
+      scope: "the_deck",
+      serialized: world.exportWorld()
+    });
+    const transfer = buildShadowBrowserOpenExecutableSeedTransfer(relay, "the_deck", "browser:invite-seed-redaction", "$wiz", null);
+    const transferEncoded = JSON.stringify(transfer);
+    const invitePages = transfer.inline_pages
+      .filter((page): page is ShadowPropertyCellPage => page.object === "$system" && page.page === "property_cell" && page.name === "signup_invites")
+      .map((page) => ({ hasValue: page.has_value, value: page.value, version: page.version }));
+
+    expect(transferEncoded).not.toContain("invite-secret");
+    expect(invitePages).toEqual([{ hasValue: false, value: undefined, version: 0 }]);
+  });
+
+  it("scrubs already-stored $system credential ledgers from satellite host slices", () => {
+    const gateway = createWorld();
+    const seed = gateway.buildHostSeedForDelivery("the_deck");
+    const stored = createWorld();
+    stored.setProp("$system", "api_keys", { copied: { hash: "stored-api-hash", salt: "stored-api-salt" } });
+    stored.setProp("$system", "bearer_tokens", { "legacy-raw-bearer": { actor: "$wiz", expires_at: Date.now() + 60_000 } });
+    stored.setProp("$system", "pending_email_verifications", [{ token_hash: "stored-verification-hash", account_id: "$account", expires_at: Date.now() + 60_000 }]);
+    stored.setProp("$system", "signup_invites", [{ code: "stored-invite-code", expires_at: Date.now() + 60_000, used_by: null }]);
+    stored.setProp("$system", "provision_state_nonces", [{ state_hash: "stored-state-hash", issued_at: Date.now() }]);
+    const storedSlice = nonEmptyHostScopedWorld(stored.exportWorld(), "the_deck");
+    expect(storedSlice).not.toBeNull();
+
+    const merged = mergeHostScopedSeedWithStatus(storedSlice!, seed, "the_deck");
+    const systemEntry = merged.world.objects.find((obj) => obj.id === "$system");
+    const encoded = JSON.stringify(merged.world);
+
+    expect(merged.changed).toBe(true);
+    expect(encoded).not.toContain("stored-api-hash");
+    expect(encoded).not.toContain("legacy-raw-bearer");
+    expect(encoded).not.toContain("stored-verification-hash");
+    expect(encoded).not.toContain("stored-invite-code");
+    expect(encoded).not.toContain("stored-state-hash");
+    expect(systemEntry?.properties.map(([name]) => name)).not.toEqual(expect.arrayContaining([
+      "api_keys",
+      "bearer_tokens",
+      "pending_email_verifications",
+      "signup_invites",
+      "provision_state_nonces"
+    ]));
+    expect(systemEntry?.propertyVersions.map(([name]) => name)).not.toEqual(expect.arrayContaining([
+      "api_keys",
+      "bearer_tokens",
+      "pending_email_verifications",
+      "signup_invites",
+      "provision_state_nonces"
+    ]));
+    expect(mergeHostScopedSeedWithStatus(merged.world, seed, "the_deck").changed).toBe(false);
+  });
+
   it("sets and clears authority flags via the wizard-only mutator", () => {
     const world = createWorld({ catalogs: false });
     const target = makeActor(world);

@@ -321,11 +321,9 @@
         },
         {
           "name": "_capture_item",
-          "perms": "rxd",
-          "direct_callable": true,
-          "skip_presence_check": true,
+          "perms": "rx",
           "arg_spec": { "args": ["item"] },
-          "source": "verb :_capture_item(item) rxd {\n  let siblings = this:_siblings_ordered(item.parent);\n  let idx = 0; let i = 1;\n  for it in siblings { if (it == item) { idx = i - 1; } i = i + 1; }\n  let kids = this:_siblings_ordered(item);\n  let kid_entries = [];\n  for kid in kids {\n    let kpos = 0;\n    try { kpos = kid.position; } except err { kpos = 0; }\n    kid_entries = kid_entries + [{ item: kid, position: kpos }];\n  }\n  let text = \"\";\n  try { text = item.text; } except err { text = \"\"; }\n  let writers = [];\n  try { writers = item.writers; } except err { writers = []; }\n  let hidden = false;\n  try { hidden = item.hidden; } except err { hidden = false; }\n  return {\n    text: text,\n    name: item.name,\n    description: item.description,\n    writers: writers,\n    hidden: hidden,\n    owner: item.owner,\n    parent_id: item.parent,\n    index: idx,\n    children: kid_entries\n  };\n}"
+          "source": "verb :_capture_item(item) rx {\n  let siblings = this:_siblings_ordered(item.parent);\n  let idx = 0; let i = 1;\n  for it in siblings { if (it == item) { idx = i - 1; } i = i + 1; }\n  let kids = this:_siblings_ordered(item);\n  let kid_entries = [];\n  for kid in kids {\n    let kpos = 0;\n    try { kpos = kid.position; } except err { kpos = 0; }\n    kid_entries = kid_entries + [{ item: kid, position: kpos }];\n  }\n  let text = \"\";\n  try { text = item.text; } except err { text = \"\"; }\n  let writers = [];\n  try { writers = item.writers; } except err { writers = []; }\n  let hidden = false;\n  try { hidden = item.hidden; } except err { hidden = false; }\n  return {\n    text: text,\n    name: item.name,\n    description: item.description,\n    writers: writers,\n    hidden: hidden,\n    owner: item.owner,\n    parent_id: item.parent,\n    index: idx,\n    children: kid_entries\n  };\n}"
         },
         {
           "name": "undo",

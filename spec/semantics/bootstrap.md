@@ -86,13 +86,13 @@ has no ordinary parent chain; `$nowhere` inherits descriptive slots from
 | `applied_migrations` | list<str> | `[]` | Idempotency ledger for deployment-local boot migrations, including local catalog repair migrations. See [catalogs.md §CT5.4.1](../discovery/catalogs.md#ct541-local-boot-migrations). |
 | `catalog_migration_records` | list<map> | `[]` | Trace ledger for content-addressed catalog schema/data plans. Records plan id, catalog, manifest hash, scope, host, steps, status, and postcondition issues. |
 | `help_dbs` | list<obj> | `[]` | Global in-world help database list. The bundled help catalog appends `$help` here with a generic `set_property` catalog hook; future catalogs can append additional DBs without runtime object-name knowledge. |
-| `api_keys` | map | `{}` | API-key records keyed by key id. Cleartext secrets are returned only once; stored records carry hashes and actor bindings. |
-| `bearer_tokens` | map | `{}` | Short-lived credentialed session tokens issued by signup verification and password auth. |
-| `pending_email_verifications` | list<map> | `[]` | Single-use signup verification records with token hashes, account ids, and expiry timestamps. Expired entries are swept by `$system:gc_pending_credentials()`. |
-| `signup_invites` | list<map> | `[]` | Optional invite-gate codes issued by wizards and consumed by signup. Expired unused invites and old used invites are swept by `$system:gc_pending_credentials()`. |
+| `api_keys` | map | `{}` | Owner-only gateway-local API-key records keyed by key id. Cleartext secrets are returned only once; stored records carry hashes and actor bindings. Redacted from host/shadow seed transfers. |
+| `bearer_tokens` | map | `{}` | Owner-only gateway-local short-lived credentialed session records issued by signup verification and password auth. Records are keyed by token hash, not by the replayable bearer token. Redacted from host/shadow seed transfers. |
+| `pending_email_verifications` | list<map> | `[]` | Owner-only gateway-local single-use signup verification records with token hashes, account ids, and expiry timestamps. Expired entries are swept by `$system:gc_pending_credentials()`. Redacted from host/shadow seed transfers. |
+| `signup_invites` | list<map> | `[]` | Owner-only gateway-local invite-gate records containing replayable codes issued by wizards and consumed by signup. Expired unused invites and old used invites are swept by `$system:gc_pending_credentials()`. Redacted from host/shadow seed transfers. |
 | `signup_invite_required` | bool | false | When true, signup requires an unused invite code. |
 | `allowed_provision_return_schemes` | list<str> | `["hermes://"]` | Exact scheme prefixes allowed for `/connect` credential return redirects. |
-| `provision_state_nonces` | list<map> | `[]` | Single-use `/connect` state nonces used for Hermes-style onboarding replay protection. Expired entries are swept by `$system:gc_pending_credentials()`. |
+| `provision_state_nonces` | list<map> | `[]` | Owner-only gateway-local single-use `/connect` state nonces used for Hermes-style onboarding replay protection. Expired entries are swept by `$system:gc_pending_credentials()`. Redacted from host/shadow seed transfers. |
 | `mcp_endpoint_url` | str | `"/mcp"` | MCP endpoint URL advertised in agent provisioning and `/connect` responses. |
 | `default_agent_quota` | int | 5 | Initial per-account quota for self-service human-owned agents. |
 | `default_programmer_grant_quota` | int | 0 | Initial per-account quota for human-owned agents carrying `programmer=true`. |
@@ -165,9 +165,9 @@ Session lifecycle is **not** carried on the player. Live session data lives only
 |---|---|---|---|
 | `email` | str | `""` | Normalized account email. |
 | `email_verified_at` | str \| null | null | Set when signup verification succeeds. |
-| `password_hash` | str | `""` | Stored PBKDF2 verifier (`pbkdf2-sha256:<iterations>:<salt_hex>:<digest_hex>`). Cleartext passwords never enter object state. Stripped from delivered host seeds. |
-| `password_salt` | str | `""` | Per-account salt used by the local password verifier. Stripped from delivered host seeds. |
-| `oauth_identities` | list<map> | `[]` | Reserved for OAuth/OIDC account bindings. Stripped from delivered host seeds. |
+| `password_hash` | str | `""` | Owner-only stored PBKDF2 verifier (`pbkdf2-sha256:<iterations>:<salt_hex>:<digest_hex>`). Cleartext passwords never enter object state. Stripped from delivered host seeds. |
+| `password_salt` | str | `""` | Owner-only per-account salt used by the local password verifier. Stripped from delivered host seeds. |
+| `oauth_identities` | list<map> | `[]` | Owner-only reserved OAuth/OIDC account bindings. Stripped from delivered host seeds. |
 | `actors` | list<obj> | `[]` | Bound `$player` descendants for this account. |
 | `primary_actor` | obj \| null | null | Default `$human` actor for password and bearer auth. |
 | `agent_quota` | int | 5 | Maximum active human-owned agents for this account. |

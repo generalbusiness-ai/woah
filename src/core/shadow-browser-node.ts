@@ -38,6 +38,7 @@ import type { ShadowCapabilityAd } from "./capability-ad";
 import { stableShadowJson } from "./shadow-cell-version";
 import { decodeEnvelope, type ShadowEnvelope, type ShadowEnvelopeAuth } from "./shadow-envelope";
 import { constantTimeEqual, hashSource } from "./source-hash";
+import { redactSensitiveSerializedPropertyValues } from "./sensitive-serialization";
 import type { MetricEvent, ObjRef, Observation, PropertyDef, WooValue } from "./types";
 import { cloneValue, directedRecipients } from "./types";
 import type { ScopedObjectSummary } from "./world";
@@ -1112,6 +1113,7 @@ function shadowBrowserOpenExecutableSeedSerialized(
     // every kept row here only duplicates work on the cold /v2/open path.
     objects: serialized.objects
       .filter((obj) => keep.has(obj.id))
+      .map((obj) => redactSensitiveSerializedPropertyValues(obj))
       .sort((a, b) => a.id.localeCompare(b.id)),
     sessions: serialized.sessions
       .filter((session) => session.actor === actor)

@@ -56,13 +56,30 @@ describe("onboarding provisioning", () => {
     const world = createWorld({ catalogs: false });
     const started = await world.beginSignup("Person@Example.COM", "correct horse battery staple");
     const verified = world.verifySignup(started.verification_token);
+    const rawBearer = verified.bearer.slice("bearer:".length);
+    const bearerStore = world.getProp("$system", "bearer_tokens") as Record<string, Record<string, WooValue>>;
 
     expect(world.getProp(verified.account, "email")).toBe("person@example.com");
     expect(String(world.getProp(verified.account, "password_hash"))).toMatch(/^pbkdf2-sha256:600000:/);
     expect(world.getProp(verified.account, "primary_actor")).toBe(verified.actor);
     expect(world.getProp(verified.actor, "account")).toBe(verified.account);
     expect(world.auth(verified.bearer).actor).toBe(verified.actor);
+    expect(Object.keys(bearerStore)).not.toContain(rawBearer);
+    expect(JSON.stringify(bearerStore)).not.toContain(rawBearer);
     expectError(() => world.verifySignup(started.verification_token), "E_NOSESSION");
+  });
+
+  it("keeps account credential fields unreadable to non-wizard actors", async () => {
+    const world = createWorld({ catalogs: false });
+    const { account, actor } = await signup(world, "account-secrets@example.com");
+    const stranger = world.auth("guest:account-secret-reader").actor;
+
+    expect(world.propertyInfo(account, "password_hash")).toMatchObject({ owner: "$wiz", perms: "" });
+    expect(world.propertyInfo(account, "password_salt")).toMatchObject({ owner: "$wiz", perms: "" });
+    expect(world.propertyInfo(account, "oauth_identities")).toMatchObject({ owner: "$wiz", perms: "" });
+    expectError(() => world.getPropForActor(actor, account, "password_hash"), "E_PERM");
+    expectError(() => world.getPropForActor(stranger, account, "password_hash"), "E_PERM");
+    expect(world.getPropForActor("$wiz", account, "password_hash")).toBe(world.getProp(account, "password_hash"));
   });
 
   it("promotes a same-session guest to $human during email verification", async () => {
@@ -80,13 +97,27 @@ describe("onboarding provisioning", () => {
   it("strips account credential material from delivered host seeds", async () => {
     const world = createWorld({ catalogs: false });
     const { account, actor } = await signup(world, "seed-safety@example.com");
+    world.createApiKey("$wiz", actor, "seed-safety");
     world.setProp(actor, "host_placement", "self");
     const seed = world.buildHostSeedForDelivery(actor);
     const accountEntry = seed.objects.find((obj) => obj.id === account);
+    const systemEntry = seed.objects.find((obj) => obj.id === "$system");
     expect(accountEntry).toBeDefined();
     expect(accountEntry?.properties.map(([name]) => name)).not.toContain("password_hash");
     expect(accountEntry?.properties.map(([name]) => name)).not.toContain("password_salt");
     expect(accountEntry?.properties.map(([name]) => name)).not.toContain("oauth_identities");
+    expect(systemEntry).toBeDefined();
+    const sensitiveSystemNames = [
+      "api_keys",
+      "bearer_tokens",
+      "pending_email_verifications",
+      "signup_invites",
+      "provision_state_nonces"
+    ];
+    for (const name of sensitiveSystemNames) {
+      expect(systemEntry?.properties.map(([propName]) => propName)).not.toContain(name);
+      expect(systemEntry?.propertyVersions.map(([propName]) => propName)).not.toContain(name);
+    }
   });
 
   it("lets humans provision, list, rotate, authenticate, and revoke owned agents within quota", async () => {
@@ -183,6 +214,20 @@ describe("onboarding provisioning", () => {
     expect(world.getProp("$system", "pending_email_verifications")).toEqual([]);
     expect(world.getProp("$system", "provision_state_nonces")).toEqual([]);
     expect(world.getProp("$system", "signup_invites")).toEqual([]);
+  });
+
+  it("migrates legacy plaintext-keyed bearer records to hashed keys on use", () => {
+    const world = createWorld({ catalogs: false });
+    const legacyToken = "legacy-bearer-token";
+    world.setProp("$system", "bearer_tokens", {
+      [legacyToken]: { actor: "$wiz", account: "$account", expires_at: Date.now() + 60_000, created_at: Date.now() }
+    });
+
+    expect(world.auth(`bearer:${legacyToken}`).actor).toBe("$wiz");
+    const stored = world.getProp("$system", "bearer_tokens") as Record<string, Record<string, WooValue>>;
+    expect(Object.keys(stored)).not.toContain(legacyToken);
+    expect(JSON.stringify(stored)).not.toContain(legacyToken);
+    expect(Object.values(stored)[0]).toMatchObject({ actor: "$wiz", token_hash: expect.any(String) });
   });
 
   it("exposes signup, password, bearer auth, and connect through REST protocol", async () => {

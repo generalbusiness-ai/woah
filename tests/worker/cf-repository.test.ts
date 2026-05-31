@@ -20,7 +20,7 @@ import { CommitScopeDO } from "../../src/worker/commit-scope-do";
 import { DirectoryDO } from "../../src/worker/directory-do";
 import worker from "../../src/worker/index";
 import { signInternalRequest } from "../../src/worker/internal-auth";
-import { LOCAL_CATALOG_BUNDLE_REPAIR_EPOCH, PersistentObjectDO, v2FanoutEnvelopesByNode, type Env } from "../../src/worker/persistent-object-do";
+import { LOCAL_CATALOG_BUNDLE_REPAIR_EPOCH, MCP_GATEWAY_ACTOR_SUPPORT_ROOTS, PersistentObjectDO, v2FanoutEnvelopesByNode, type Env } from "../../src/worker/persistent-object-do";
 import { FakeDurableObjectNamespace, FakeDurableObjectState } from "./fake-do";
 
 // These are production-shape Worker integration tests; under full-suite CPU
@@ -67,6 +67,27 @@ function metricEvents(logSpy: { mock: { calls: unknown[][] } }, kind: string): A
     }
   }
   return events;
+}
+
+function mcpGatewayActorSupportObjectIds(): Set<ObjRef> {
+  const snapshot = createWorld({ catalogs: false }).exportWorld();
+  const byId = new Map(snapshot.objects.map((obj) => [obj.id, obj] as const));
+  const ids = new Set<ObjRef>();
+  const subtree = [...MCP_GATEWAY_ACTOR_SUPPORT_ROOTS];
+  while (subtree.length > 0) {
+    const id = subtree.pop()!;
+    if (ids.has(id)) continue;
+    ids.add(id);
+    for (const child of byId.get(id)?.children ?? []) subtree.push(child);
+  }
+  for (const root of MCP_GATEWAY_ACTOR_SUPPORT_ROOTS) {
+    let current: ObjRef | null = byId.get(root)?.parent ?? null;
+    while (current && !ids.has(current)) {
+      ids.add(current);
+      current = byId.get(current)?.parent ?? null;
+    }
+  }
+  return ids;
 }
 
 function firstBytecodeVerb(world: WooWorld): VerbDef | null {
@@ -4274,8 +4295,13 @@ describe("CFObjectRepository production-shape coverage", () => {
       const shardObject = harness.wooObjects.get(shard) as any;
       const shardWorld = await shardObject.getWorld(shard) as WooWorld;
       expect(shardWorld.sessions.size).toBe(2052);
-      expect(shardWorld.objects.size).toBe(7);
-      expect(Array.from(shardWorld.objects.keys()).sort()).toEqual(["$actor", "$player", "$root", "$thing", "cf_mcp_directory_actor", "cf_mcp_directory_filler", "the_deck"]);
+      const expectedShardObjects = new Set<ObjRef>([
+        ...mcpGatewayActorSupportObjectIds(),
+        "cf_mcp_directory_actor" as ObjRef,
+        "cf_mcp_directory_filler" as ObjRef,
+        "the_deck" as ObjRef
+      ]);
+      expect(new Set(shardWorld.objects.keys())).toEqual(expectedShardObjects);
       expect(shardWorld.sessions.get(oldSessionId)).toMatchObject({ actor, started: 1_000, activeScope: "the_deck" });
       expect(shardWorld.sessions.get(newSessionId)).toMatchObject({ actor, started: 2_000, activeScope: "the_deck" });
       expect(shardWorld.primarySessionForActor(actor)?.id).toBe(oldSessionId);
@@ -4333,7 +4359,7 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(metricEvents(logSpy, "startup_storage")).toContainEqual(expect.objectContaining({
         phase: "mcp_gateway_snapshot_fetch",
         source: "directory",
-        objects: 7,
+        objects: expectedShardObjects.size,
         sessions: 2052
       }));
     } finally {

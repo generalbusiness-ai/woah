@@ -160,7 +160,7 @@ A small reserved set of corenames are *dynamic*: their resolution depends on the
 - **`$me`** — the actor making the current call. Resolves to the bearer's actor in REST requests ([rest.md §R9](../protocol/rest.md#r9-me-resolution)), to the frame's `actor` field in verb bodies, and is unset (raises `E_VARNF`) outside any call context. Equivalent to writing `actor` in a verb body; the dynamic corename gives the same identity a name in REST and tooling contexts.
 - **`$peer`** — reserved for the calling peer in cross-world contexts ([federation-early.md](../deferred/federation-early.md)). Inactive in single-operator deployments.
 
-Dynamic corenames may not be assigned via `set_corename`; the runtime owns their resolution. A wizard with the `impersonate` capability may override `$me` for a single call (REST: `X-Woo-Impersonate-Actor: <ref>` header; verb code: `wiz:as_actor(...)`); the impersonation is logged as a wizard action.
+Dynamic corenames may not be assigned via `set_corename`; the runtime owns their resolution. A wizard with the `impersonate` capability may override `$me` for a single call (public REST: request body `actor` field; trusted internal DO REST: `X-Woo-Impersonate-Actor: <ref>` header; verb code: `wiz:as_actor(...)`); the impersonation is logged as a wizard action.
 
 ### 5.4 Federated origins (reserved)
 

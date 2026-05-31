@@ -273,7 +273,7 @@ durable gap recovery belongs to `/api/objects/{id-or-name}/log`.
 
 - In REST: `$me` = the actor in the bearer token's `actor` claim.
 - In verb bodies (the wire's call path): `$me` = the calling frame's `actor` field. Equivalent to writing `actor` directly in source.
-- A wizard with the `impersonate` capability may override `$me` for a single call (via `X-Woo-Impersonate-Actor: <ref>` header on REST or `wiz:as_actor(...)` in user code); the impersonation is logged as a wizard action.
+- A wizard with the `impersonate` capability may override `$me` for a single call via the request body `actor` field. Internal DO protocol code still recognizes `X-Woo-Impersonate-Actor: <ref>` for trusted internal callers, but the public Cloudflare gateway strips that header before routing; public clients must not rely on ambient headers for impersonation. Impersonation is logged as a wizard action.
 
 `$me` is reserved alongside the static corename namespace. See [objects.md §5.3.1](../semantics/objects.md#531-dynamic-corenames).
 
