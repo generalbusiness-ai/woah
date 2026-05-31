@@ -1,17 +1,26 @@
 # 2026-05-30 — v2 materialization-miss + movement-as-transaction
 
+> **PARTIALLY SUPERSEDED (2026-05-31).** The **VTN10.1 materialization-miss**
+> work below is still valid and landed. The **MV-A / `#placement` movement**
+> portions are **withdrawn** — `#placement` had no durable snapshot and broke
+> prod, and more fundamentally it kept room membership as one shared cell.
+> Movement is replaced by `spec/protocol/cell-authority.md` (location-as-truth,
+> per-member contents projection); see
+> `notes/2026-05-30-cell-authority-convergence.md` and the remediation plan in
+> `notes/2026-05-31-cell-authority-perf-plan.md`. Read the `#placement` sections
+> here as historical record only.
+
 Origin: the cross-actor MCP smoke `the_garden` `E_OBJNF` failure, traced to a
 real invariant hole in the v2 sparse-executor / missing_state repair loop. This
-note records the proof, the spec decisions, what has LANDED on this branch, and
-the remaining sequence. It is a work description, not normative — the normative
-text is in `spec/protocol/v2-turn-network.md` §VTN8.1 and §VTN10.1.
+note records the proof, the spec decisions, what has landed on main, and the
+remaining sequence. It is a work description, not normative — the normative text
+is in `spec/protocol/v2-turn-network.md` §VTN8.1 and §VTN10.1.
 
-## Status (this branch: scope-executor-atomguard)
+## Status (main after `6d6f2b5`)
 
 - **DONE & verified:** §VTN8.1 + §VTN10.1 spec text; the materialization-miss
-  fix; the regression tests. This is a correctness checkpoint, not a smoke fix:
-  it is **NOT deployed**, and the non-browser executor and live fanout paths are
-  not wired yet.
+  fix; the regression tests. This is a correctness checkpoint and measurement
+  deploy candidate, not the final placement architecture.
 - **DONE in-process:** MV-A: explicit placement transaction fences let a
   movement transcript commit under a transaction scope different from
   `transcript.scope`, with stale plans rejected at the transaction head.
@@ -25,8 +34,16 @@ text is in `spec/protocol/v2-turn-network.md` §VTN8.1 and §VTN10.1.
   extracting object ids from missing atom preimages, so a transitive
   materialization miss can drive an outer hydrate/retry instead of committing a
   buried `E_OBJNF`.
-- **NEXT:** Wire the placement transaction selector into the production
-  non-browser movement path, then fanout.
+- **DONE as production-shaped wiring:** MCP and REST non-browser durable
+  movement paths use planned-exec, route placement-bearing transcripts through
+  the deployment-local `#placement` commit scope, and carry the accepted
+  placement fence so cross-scope fanout/apply rejects unfenced movement.
+- **CURRENT LIMIT:** `#placement` is intentionally one global movement
+  authority. It is the simplest correct MV-A prototype and a useful measurement
+  checkpoint, but it is not the scalable end-state.
+- **NEXT:** measure the global `#placement` path in the deployed smoke, then
+  tighten §VTN12 live delivery and implement the overlap-preserving sharded
+  placement plan below only if the global authority becomes a measured limit.
 
 ## The proof (conclusive, in-process)
 
@@ -113,9 +130,10 @@ property versions, MV-A gives the commit plane the missing concurrency token:
 the transaction scope's head. The in-process harness now commits the repaired
 deck->garden move under `#placement`; without the explicit fence, the same
 cross-scope submit is rejected before it can publish unfenced placement writes.
-The production boundary that remains is **wire-in**, not core validation:
-non-browser submissions still need to choose/open the placement transaction
-scope when a fresh execution reveals movement writes.
+The production-shaped MCP and REST paths now choose/open that transaction scope
+after fresh execution reveals movement writes. The remaining boundary is scale
+and live delivery: `#placement` serializes correctly, but deliberately serializes
+all movement through one authority while §VTN12 delivery is still converging.
 
 ## Non-browser guarded intent seam
 
@@ -159,19 +177,233 @@ stale local state and asserts both the fanout body audience and the queued
 
 ## Remaining sequence (in order)
 
-1. **MV-A production selector.** The prototype selector is the deployment-local
-   `#placement` commit scope. Non-browser planned-exec submissions route
-   movement transcripts there after fresh execution reveals the placement fence,
-   and accepted commits carry that fence so cross-scope fanout/apply can reject
-   unfenced movement.
-2. **Non-browser executor path completion.** The default intent envelope now
-   uses guarded execution and outer authority repair, but production movement
-   still needs the transaction selector above before the deck->garden class of
-   moves can be considered fixed end-to-end.
-3. **Fanout follow-through.** MCP accepted-frame routing now uses explicit
+1. **Measurement deploy readout.** Use the deployed smoke to measure
+   `#placement` open/envelope CPU, queueing, stale-head retry rate, repair
+   attempts, commit rejection reasons, and movement fanout delivery. Do not
+   infer scalability from local tests alone.
+2. **Fanout follow-through.** MCP accepted-frame routing now uses explicit
    session audiences, but full §VTN12 convergence still needs the browser/live
-   socket side and any remaining Directory-backed audience selection tightened
-   after the production movement selector lands.
+   socket side and any remaining Directory-backed audience selection tightened.
+3. **Placement overlap sharding.** Keep global `#placement` until metrics justify
+   sharding. When they do, implement the overlap-preserving plan below. Do not
+   replace `#placement` with a naive hash of the moved actor, source, or
+   destination; those selectors lose the required overlap property.
+
+## Placement overlap/shard implementation plan
+
+### Non-negotiable invariant
+
+For every placement transaction, define its placement cells as:
+
+- every moved object's `location` cell;
+- every source room `contents` cell;
+- every destination room `contents` cell;
+- movement-coupled presence cells such as `subscribers` and
+  `session_subscribers` when the transcript writes them.
+
+Any two accepted placement transactions that touch at least one identical
+placement cell MUST be serialized by a common authority/fence before either
+commit is published. A conflict must surface as a retryable `stale_head` /
+prepared-transaction conflict, never as a successful independent commit that can
+drop a room membership.
+
+This makes several tempting shard selectors invalid:
+
+- shard by moved object: two actors entering the same destination do not share a
+  moved object, but they do share `contents:destination`;
+- shard by destination: two actors leaving the same source for different
+  destinations share `contents:source`;
+- shard by source: two actors entering the same destination from different
+  sources share `contents:destination`;
+- shard by unordered `(source,destination)` pair: transactions `A->B` and
+  `B->C` share `contents:B` but would route to different pair shards.
+
+A single-shard selector that preserves arbitrary endpoint overlap degenerates
+to connected placement components. That is safe, but in a connected world it is
+equivalent to global `#placement`. Real sharding therefore needs either
+component authorities with explicit component-merge semantics, or a
+multi-participant transaction protocol over per-cell/bucket authorities.
+
+### Chosen direction
+
+Use a staged path:
+
+1. Keep global `#placement` as the deployed correctness baseline.
+2. Add a selector abstraction while it still returns global `#placement`.
+3. Add a multi-participant placement transaction model behind a feature flag.
+4. Only then shard placement cells into participant buckets.
+
+This avoids a hidden correctness regression while letting the code and spec move
+toward a scalable authority layout.
+
+### Phase 0 — instrument the global authority
+
+Add or confirm metrics on every placement-bearing submit:
+
+- `placement_tx` with transaction id, scope, cell count, moved object count,
+  source count, destination count, presence-cell count, attempt, and accepted /
+  conflict status;
+- `placement_tx_latency` split by open, plan, repair, envelope, commit apply,
+  fanout, and projection write;
+- `placement_tx_conflict` with `stale_head`, `write_fence_missing`,
+  `read_version_mismatch`, and retry-exhausted buckets;
+- `placement_tx_queue` / DO overload indicators for `#placement`;
+- p50/p95/max for `#placement` `/v2/open` and `/v2/envelope`.
+
+Exit criteria before sharding work starts: at least one smoke/tail run shows
+`#placement` is a material cost or contention source. If it is not, spend the
+next engineering cycle on §VTN12 and gateway authority assembly instead.
+
+### Phase 1 — selector abstraction, no behavior change
+
+Introduce a transport-neutral selector:
+
+```ts
+type PlacementAuthorityPlan =
+  | { mode: "single"; scope: ObjRef }
+  | { mode: "participants"; coordinator: ObjRef; participants: PlacementParticipant[] };
+```
+
+For now:
+
+- `selectPlacementAuthority(transaction)` always returns
+  `{ mode: "single", scope: "#placement" }`;
+- MCP/REST planned-exec and in-process executor paths call the selector instead
+  of directly referencing `SHADOW_PLACEMENT_TRANSACTION_SCOPE`;
+- accepted commits continue to carry the exact transaction cells;
+- tests assert the selector is invoked after fresh execution, not before, so it
+  sees the actual placement write set.
+
+This phase is a refactor only. Any behavior change here is a bug.
+
+### Phase 2 — spec the participant transaction shape
+
+Extend §VTN8.1 before implementation:
+
+- current single-authority `#placement` remains valid;
+- a participant transaction carries:
+  - a stable transaction id;
+  - the complete placement cell list;
+  - the participant bucket for each cell;
+  - the expected head/version for each participant bucket;
+  - the accepted participant positions after commit;
+- receivers reject cross-scope apply if any required placement cell is absent
+  from the transaction or if participant evidence is incomplete.
+
+Keep `TurnKey.scope` as the execution scope. Placement authority remains a
+post-execution commit decision because the complete write set is known only
+after the VM runs and repair converges.
+
+### Phase 3 — participant bucket model
+
+Map each placement cell key to a bucket:
+
+```text
+bucket = #placement-bucket:<stable-hash(cellKey) % N>
+```
+
+The bucket, not the room or actor, owns the serialization fence for that cell.
+Transactions touching multiple placement cells therefore touch multiple buckets.
+This preserves overlap because two transactions sharing a cell always share that
+cell's bucket. Hash collisions only over-serialize, which is safe.
+
+Start with a small fixed `N` behind configuration. Do not change `N` without a
+migration plan; bucket id is part of the durable authority identity.
+
+### Phase 4 — durable coordinator protocol
+
+Implement participant mode as a real transaction protocol, not best-effort
+multi-apply:
+
+1. Coordinator receives the fully planned transcript and placement transaction.
+2. Coordinator computes participant buckets and writes a durable coordinator row
+   with status `preparing`, transcript hash, placement cells, and participant
+   list.
+3. Coordinator sends `prepare(txn)` to participants in sorted bucket order.
+4. Each participant validates its expected head and the subset of cells it owns,
+   then records a durable prepared row with expiry and returns a reservation.
+5. If any participant rejects, coordinator sends `abort(txn)` to prepared
+   participants and returns a retryable conflict.
+6. After all prepare responses are present, coordinator marks the transaction
+   `committing`.
+7. Coordinator sends `commit(txn)` to every participant. Participants advance
+   their bucket heads exactly once for that transaction id and record the
+   participant accepted position idempotently.
+8. Coordinator records `accepted` only after all participant commits are durable,
+   then publishes the accepted frame/fanout/projection.
+9. Recovery on coordinator restart resumes `preparing` / `committing`
+   transactions from durable rows. Prepared participant rows expire only if the
+   coordinator never entered `committing`; once `committing`, recovery must
+   finish commit, not abort.
+
+No accepted frame is emitted until all participant commits are durable. That is
+the line that prevents partial movement publication.
+
+### Phase 5 — apply/fanout compatibility
+
+Accepted frames must remain consumable by existing clients:
+
+- single-authority commits carry the current `position` and `transaction`;
+- participant commits carry a coordinator `position` plus participant positions;
+- `shadowCommitTransactionCoversTranscript` grows a participant-aware check;
+- gateway projection cache and browser holder install use the accepted frame's
+  transaction evidence, not the current host's local guess;
+- fanout audience remains transcript-derived and does not route by placement
+  bucket.
+
+The live plane should not depend on where the movement transaction committed.
+That keeps §VTN12 separable from placement sharding.
+
+### Phase 6 — rollout and migration
+
+Roll out in one-way guarded stages:
+
+1. Ship selector abstraction returning global `#placement`.
+2. Ship participant schema and no-op read paths while writes still use
+   `#placement`.
+3. Enable participant mode in local/dev only; run contention and smoke suites.
+4. Enable participant mode for a small test world or admin-only token class.
+5. Enable participant mode for production with a kill switch that returns the
+   selector to global `#placement`.
+
+Do not attempt to migrate historical `#placement` accepted frames. They remain
+valid under the single-authority transaction shape. New participant frames start
+at participant bucket seq 1 and carry their own evidence. Replay/apply code must
+accept both shapes.
+
+### Phase 7 — required tests
+
+Tests must fail under naive sharding:
+
+- two actors enter the same destination from different sources concurrently;
+- two actors leave the same source for different destinations concurrently;
+- one actor receives two concurrent movement plans through different exits;
+- `A->B` and `B->C` overlap on `contents:B` and serialize;
+- participant prepare conflict aborts all prepared participants with no accepted
+  frame;
+- coordinator crash after prepare but before commit recovers by aborting;
+- coordinator crash after marking `committing` recovers by finishing commit;
+- duplicate commit messages to participants are idempotent;
+- cross-scope apply rejects participant frames missing a required cell;
+- browser, MCP, and REST all consume both single-authority and participant
+  accepted frames.
+
+Cloud-shaped tests must include Durable Object re-instantiation between prepare
+and commit to prove recovery is durable, not just in-memory.
+
+### Phase 8 — deployment acceptance
+
+Participant sharding is deployable only when:
+
+- full local suite and local smoke pass;
+- CF smoke is at least as stable as global `#placement`;
+- no partial movement frame can be observed in forced-crash tests;
+- `placement_tx_conflict` conflicts are retryable and bounded;
+- p95 movement latency improves or `#placement` queue/overload pressure is
+  eliminated enough to justify the added protocol complexity.
+
+If the metrics do not justify that complexity, keep global `#placement` and
+spend the next work on live delivery and gateway authority removal.
 
 ## Artifacts
 
@@ -183,6 +415,8 @@ stale local state and asserts both the fanout body audience and the queued
 - `src/core/world.ts`, `src/core/shadow-turn-call.ts` — the VTN10.1 fix.
 - `src/core/executor.ts` — planned-exec transaction-scope seam and
   missing-state authority retry.
+- `src/mcp/gateway.ts`, `src/worker/persistent-object-do.ts` — production-shaped
+  MCP/REST planned-exec wiring through `#placement`.
 - `src/core/shadow-browser-node.ts`, `src/core/turn-key.ts` — static intent key
   plus guarded default relay executor.
 - `tests/mcp.test.ts`, `tests/worker/cf-repository.test.ts` — explicit
