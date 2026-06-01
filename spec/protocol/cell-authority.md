@@ -477,11 +477,12 @@ planning cache, not a new authority source:
   records provenance on every authority merge AND on accepted-frame application, so
   it enforces missing_provenance; any residual under-tagged cell self-heals on first
   touch (the repair's refreshed authority records its provenance, so it converges)
-  rather than serving silently. A path without universal coverage (e.g. the browser
-  holder relay, which materializes from accepted frames without recording per-cell
-  provenance) keeps missing_provenance observe-only until its recording lands.
-  Substrate refs (the `$`-prefixed namespace) are named by their ref by convention
-  and are not presentation stubs.
+  rather than serving silently. The browser holder relay likewise records per-cell
+  provenance — comprehensively at seed and incrementally on accepted-frame
+  application — and so also enforces missing_provenance. A path that is authoritative
+  by construction (owner full-state / bootstrap snapshot) declares its cells trusted
+  and is not subject to missing_provenance. Substrate refs (the `$`-prefixed
+  namespace) are named by their ref by convention and are not presentation stubs.
 - Implementations MUST bound checkpoint count by memory policy, for example an
   LRU cap. A gateway must never accumulate one full slice per scope forever.
 

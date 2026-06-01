@@ -282,3 +282,38 @@ Gates: typecheck 0 · npm test 274/274 · test:worker 202 passed/5 skipped ·
 gate:authority 2/2 · planning-world 14/14 · authority-slice-shape 12/12.
 (Pre-existing test:full failures unrelated to this work — stale analyzer metric-kind
 list + dev-server materialization — predate session start 82b4148.)
+
+## Update (2026-06-01 — review P1 (tracked-cell coverage) + #11/#12/#13 COMPLETE)
+
+Review P1: collectPlanningWorldViolations now iterates ALL tracked pages — missing_provenance
+is reported for object_lineage AND object_live (stub classification stays lineage-only).
+(planning-world 16/16; lineage-only provenance still reports missing object_live; allow-listing
+a live key suppresses it.)
+
+#13 (gateway cross-shard coverage) — DONE: `recordGatewayRelayAcceptedProvenance` stamps the
+affected objects' lineage+live cells `cache` (set-if-absent) at all three gateway accepted-frame
+apply sites. The previously-untagged catalog instances (obj_the_outline_2, obj_the_pinboard_1)
+and residual live cells are now tagged or self-heal via repair.
+
+#12 (browser holder coverage) — DONE: `recordBrowserCommitScopeCellProvenance` tags the browser
+relay's tracked cells `cache` comprehensively at seed (every seeded object) and incrementally on
+accepted-frame application (publishShadowBrowserAcceptedFrame). Browser planning now opts IN to
+enforceMissingProvenance. The 22 browser tests that broke under a blanket flip now pass.
+
+#11 (missing_provenance → fatal) — DONE for both sparse holder planning paths: the gateway
+(submitTurnIntent) and the browser hold enforceMissingProvenance:true; an untagged tracked cell
+raises a repairable E_NEED_STATE (gateway repairs via submitTurnIntent; both converge — coverage
+is now universal on these paths so it effectively never fires). Authoritative paths trust their
+cells (defaultProvenanceSource); the CommitScopeDO is enforced at its merge layer. The presentation
+-stub rule remains always-fatal on every gated path.
+
+Validation: typecheck 0 · npm test 276/276 · test:worker 202 passed/5 skipped · gate:authority 2/2
+(x3 convergent) · planning-world 16/16 · authority-slice-shape 12/12 · test:full 1378 passed, only
+the 3 PRE-EXISTING failures (analyzer metric-kind list + dev-server materialization) that predate
+session start 82b4148 — zero new failures from this work.
+
+Phase-A admission hardening (P1–P4 + #9–#13) is complete: the PlanningWorld brand makes a raw
+SerializedWorld unrepresentable at the VM boundary; the single admission constructors enforce the
+stub rule (always) and missing_provenance (on the universally-tagged gateway + browser paths) via
+repair; coverage is recorded at merge, seed, and accepted-frame application across gateway,
+CommitScopeDO, and browser.

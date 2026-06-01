@@ -30,14 +30,28 @@ import {
 } from "./shadow-turn-exec";
 import { shadowStatePageHash, shadowStatePagesForObject, type ShadowStatePage } from "./shadow-state-pages";
 import { runShadowTurnCall, runShadowTurnCallTranscript, type ShadowTurnCall } from "./shadow-turn-call";
-import { buildPlanningWorld } from "./planning-world";
+import { buildPlanningWorld, planningCellKey } from "./planning-world";
 
-// Browser holder planning is gated for the load-bearing presentation-stub rule.
-// missing_provenance enforcement stays OFF here (the buildPlanningWorld default):
-// the browser relay does not yet record per-cell provenance (it materializes from
-// accepted frames/transcripts, not a provenance-bearing authority-slice merge), so
-// enabling it would reject every untagged tracked cell. Browser-relay provenance
-// recording is the Phase-A coverage follow-up that would let it opt in.
+// Browser holder planning is gated for the load-bearing presentation-stub rule, and
+// opts IN to missing_provenance enforcement (#12): the relay records per-cell
+// provenance for every tracked cell — comprehensively at seed
+// (recordBrowserSeedCellProvenance) and incrementally on accepted-frame application
+// (recordBrowserAcceptedCellProvenance) — so its planning worlds are universally
+// tagged. A residual untagged cell raises a repairable E_NEED_STATE.
+const BROWSER_ADMISSION_OPTS = { enforceMissingProvenance: true } as const;
+
+// Tag a commit scope's tracked cells (object_lineage + object_live) `cache` for the
+// given object ids — set-if-absent, so a merge-recorded source is never downgraded.
+// The browser relay is a derived holder view, so `cache` is the honest source.
+function recordBrowserCommitScopeCellProvenance(scope: ShadowCommitScope, objectIds: Iterable<string>): void {
+  const prov = (scope.cellProvenance ??= new Map());
+  for (const id of objectIds) {
+    for (const page of ["object_lineage", "object_live"] as const) {
+      const key = planningCellKey(id, page);
+      if (!prov.has(key)) prov.set(key, { source: "cache" });
+    }
+  }
+}
 import { buildShadowScopeTurnExecAd, buildShadowTurnExecAd, buildShadowTurnExecAdFromNode, executeShadowTurnCallAcrossInProcessNetwork, type ShadowInProcessNetworkResult } from "./shadow-turn-network";
 import { shadowAtomHash, shadowMaterializedAtomHashesFromSerialized, shadowTurnKeyFromCall, shadowTurnKeyFromTranscript, type ShadowTurnKey } from "./turn-key";
 import type { EffectTranscript } from "./effect-transcript";
@@ -472,6 +486,9 @@ export function createShadowBrowserRelayShim(input: {
     scope: input.scope,
     serialized: input.serialized
   });
+  // Comprehensive seed coverage: tag every seeded object's tracked cells so the
+  // browser relay's planning worlds are universally provenance-tagged from open.
+  recordBrowserCommitScopeCellProvenance(commitScope, input.serialized.objects.map((obj) => obj.id));
   return {
     kind: "woo.browser_relay.shadow.v1",
     node: input.node,
@@ -1361,7 +1378,7 @@ export async function executeShadowBrowserTurn(
     body: input.body
   };
   const planned = await runShadowTurnCallTranscript(
-    buildPlanningWorld(serializedFor(browser.relay.commit_scope, { reason: "browser_turn_plan" }), browser.relay.commit_scope.cellProvenance ?? new Map()),
+    buildPlanningWorld(serializedFor(browser.relay.commit_scope, { reason: "browser_turn_plan" }), browser.relay.commit_scope.cellProvenance ?? new Map(), BROWSER_ADMISSION_OPTS),
     call);
   const key = shadowTurnKeyFromTranscript(planned.transcript);
   const pending: ShadowBrowserPendingTurn = {
@@ -1633,6 +1650,9 @@ export function publishShadowBrowserAcceptedFrame(
     // projection cache current without advancing that room's sequencer head.
     applyShadowTranscriptToCommitScopeCache(relay.commit_scope, transcript);
   }
+  // Incremental coverage: an accepted frame mutates the relay's tracked cells
+  // without a provenance-recording merge, so tag the touched objects' cells.
+  recordBrowserCommitScopeCellProvenance(relay.commit_scope, transcriptTouchedObjectIds(transcript));
   rememberShadowBrowserAcceptedFrame(relay, accepted, transcript);
   // Drop per-session live snapshots so the next live/direct call rebases on
   // the freshly committed scope state instead of a stale pre-commit view.
@@ -1890,7 +1910,7 @@ async function executeShadowBrowserLivePersistenceCall(
   const sessionKey = call.session ?? call.actor;
   const serializedBefore = browser.relay.live_session_serialized.get(sessionKey) ?? serializedFor(browser.relay.commit_scope, { reason: "live_persistence_base" });
   const headHashBefore = browser.relay.commit_scope.head.hash;
-  const run = await runShadowTurnCall(buildPlanningWorld(serializedBefore, browser.relay.commit_scope.cellProvenance ?? new Map()), call, { onMetric });
+  const run = await runShadowTurnCall(buildPlanningWorld(serializedBefore, browser.relay.commit_scope.cellProvenance ?? new Map(), BROWSER_ADMISSION_OPTS), call, { onMetric });
   // A live/direct read may be started by UI hydration immediately after a
   // fire-and-forget sequenced write. If that read finishes after the write
   // commits, caching its pre-commit post-state would resurrect a stale live
@@ -1927,7 +1947,7 @@ async function shadowTurnExecRequestFromIntent(
   const serialized = intent.persistence === "live"
     ? browser.relay.live_session_serialized.get(call.session ?? call.actor) ?? serializedFor(browser.relay.commit_scope, { reason: "intent_live_plan" })
     : serializedFor(browser.relay.commit_scope, { reason: "intent_plan" });
-  const planned = await runShadowTurnCallTranscript(buildPlanningWorld(serialized, browser.relay.commit_scope.cellProvenance ?? new Map()), call, { onMetric });
+  const planned = await runShadowTurnCallTranscript(buildPlanningWorld(serialized, browser.relay.commit_scope.cellProvenance ?? new Map(), BROWSER_ADMISSION_OPTS), call, { onMetric });
   return {
     kind: "woo.turn.exec.request.shadow.v1",
     id: call.id,
