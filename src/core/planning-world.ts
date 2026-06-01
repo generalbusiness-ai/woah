@@ -77,12 +77,18 @@ export type PlanningAdmissibilityOptions = {
   allow?: ReadonlySet<string>;
 };
 
-// Is this object's lineage a presentation stub — `name === id` — rather than a
-// real identity? Some bootstrap/support objects legitimately have `name === id`
-// (their seeded name is their id), so this predicate is only a *signal*; the gate
-// treats it as a violation solely when the cell's provenance is not authoritative.
+// Is this object's lineage a presentation stub — `name === id` synthesized because
+// the real display name was unknown — rather than a real identity? Substrate refs
+// (the `$`-prefixed namespace: system singletons, catalog classes) are named by
+// their ref *by convention*, so `name === id` there is legitimate, not a stub; the
+// gate excludes that whole namespace rather than branch on any specific bootstrap
+// object (which would violate core's catalog-agnostic layering). For ordinary
+// objects (actors, instances) `name === id` means identity was never resolved.
+// Even then this is only a *signal*: the gate treats it as a violation solely when
+// the cell's provenance is not authoritative (an owner may legitimately set such a
+// name; a derived copy may not).
 function isStubLineage(obj: SerializedObject): boolean {
-  return obj.name === obj.id;
+  return obj.name === obj.id && !obj.id.startsWith("$");
 }
 
 // Collect every admissibility violation in a world+provenance pair. Pure and

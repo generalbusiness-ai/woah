@@ -31,6 +31,7 @@ import {
 } from "./shadow-browser-node";
 import { decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "./shadow-envelope";
 import { runShadowTurnCallTranscript, type ShadowTurnCall, type ShadowTurnCallTranscriptRun } from "./shadow-turn-call";
+import type { PlanningAdmissibilityViolation, PlanningWorldProvenance } from "./planning-world";
 import type { ShadowMissingAtom, ShadowTurnExecReply, ShadowTurnExecRequest } from "./shadow-turn-exec";
 import {
   shadowLocationCommitScopeForTranscript,
@@ -124,6 +125,12 @@ export type SubmitTurnIntentOptions<Client, Result extends ExecutorEnvelopeResul
   clientNode(client: Client): string;
   clientHead?(client: Client): ShadowScopeHead;
   clientSerialized?(client: Client): SerializedWorld;
+  // A3.2 PlanningWorld admission gate (discovery wiring): the planning client's
+  // per-cell provenance for the world `clientSerialized` returns. When present,
+  // the VM-boundary admissibility check runs and reports violations via
+  // `onAdmissionViolation` (no throw yet — enforcement is the P4 flip).
+  clientPlanningProvenance?(client: Client): PlanningWorldProvenance;
+  onAdmissionViolation?(violations: PlanningAdmissibilityViolation[]): void;
   nextTurnId(client: Client, attempt: number): string;
   envelopeId?(turnId: string, attempt: number): string;
   authorityPayload(
@@ -465,8 +472,12 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     if (!serialized) throw new Error("planned v2 turn gateway submission requires clientSerialized");
     let planned: ShadowTurnCallTranscriptRun;
     try {
+      const planningProvenance = options.clientPlanningProvenance?.(planningClient);
       planned = await runShadowTurnCallTranscript(serialized, call, {
-        ...(options.onMetric ? { onMetric: options.onMetric } : {})
+        ...(options.onMetric ? { onMetric: options.onMetric } : {}),
+        ...(planningProvenance && options.onAdmissionViolation
+          ? { planningProvenance, onAdmissionViolation: options.onAdmissionViolation }
+          : {})
       });
     } catch (err) {
       // Sparse MCP planning can discover a transitive object before the commit

@@ -132,3 +132,46 @@ Same rule as the A-sequence: the allow-list may only SHRINK; every step keeps
   `shadow-commit-scope.ts`, `mcp/gateway.ts`, `worker/commit-scope-do.ts`.
 - Layer-2 Directory preserve: `directory-do.ts`.
 - typecheck 0; `npm test` 260/260. `who` test still red (layer 3 → P2). All probes reverted.
+
+## Update (2026-06-01 — review findings addressed; P3 runtime wiring in discovery mode)
+
+Reviewer findings on the landed fix, both addressed:
+
+**Finding 1 (merge asymmetry) — FIXED.** `mergeAuthorityCellPages` handled only the
+repair direction (current stub → incoming named) and `authorityPageMayReplaceCurrent`
+used `>=`, so an equal-rank projection *stub* could overwrite a named lineage. Added
+the symmetric inverse guard: a non-authoritative incoming `object_lineage` page whose
+`name===id` never displaces a named current cell. Now symmetric with the combine
+tiebreak. Tests: tests/authority-slice-shape.test.ts +2 (stub-incoming refused;
+named repairs unknown-provenance stub).
+
+**Finding 2 (gate was test-only) — runtime wiring landed (discovery mode).**
+`assertPlanningWorldAdmissible`/`collectPlanningWorldViolations` now RUN at the VM
+boundary: `runShadowTurnCallTranscript` takes optional `planningProvenance` +
+`onAdmissionViolation`; `submitTurnIntent` threads `clientPlanningProvenance`; the MCP
+gateway supplies `client.relay.commit_scope.cellProvenance` and logs violations
+(`woo.planning_world_inadmissible`). So the gate is no longer test-only — it observes
+real planning.
+
+Discovery findings:
+- The stub rule had a false-positive class: `$`-prefixed substrate refs (system
+  singletons, catalog classes) are named by their ref by convention, so `name===id`
+  there is legitimate. Refined `isStubLineage` to exclude the `$` namespace (a
+  convention-level check, not a per-object branch — layering-clean). After this,
+  the worker lane reports ZERO admission violations.
+- Attempting to ENFORCE (throw on `presentation_stub_lineage`) failed 1 worker test
+  + gate:authority, even though the discovery pass was clean — because a stub
+  admission is TRANSIENT (shard-ordering dependent) and REPAIRABLE: the
+  submitTurnIntent retry loop refreshes authority and re-plans. A hard throw at the
+  boundary pre-empts that repair and converts a repairable transient into a failure.
+
+**Therefore P4 enforcement requirement (now explicit and required, per the reviewer):**
+inadmissibility must drive REPAIR (treated like `E_NEED_STATE`: refresh authority,
+retry), NOT a hard fail. Enforcement = route `presentation_stub_lineage` through the
+repair loop, then flip; `missing_provenance` enforcement waits on universal per-cell
+provenance coverage across all seed/snapshot paths. Until P4, the invariant is
+OBSERVED at runtime (discovery) but not yet CONTINUALLY ENFORCED — stated plainly.
+
+Gates (discovery mode): typecheck 0 · npm test 267/267 · cf-repository 63/63 ·
+test:worker 202 passed/5 skipped · gate:authority 2/2 · planning-world 8/8 ·
+authority-slice-shape 12/12.

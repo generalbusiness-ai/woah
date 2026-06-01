@@ -67,6 +67,17 @@ describe("PlanningWorld admission gate", () => {
     expect(collectPlanningWorldViolations(world, prov)).toHaveLength(0);
   });
 
+  // Substrate refs (the `$`-prefixed namespace: system singletons, catalog classes)
+  // are named by their ref by convention, so name===id is legitimate there even at
+  // non-authoritative (e.g. cache, on a sparse shard) provenance — it is NOT a
+  // presentation stub. Without this exclusion the gate floods with false positives
+  // for $block/$chatroom/etc.
+  it("does not flag a $-prefixed substrate ref whose name===id at cache provenance", () => {
+    const world = { objects: [obj("$block", "$block", { parent: null, owner: "$wiz" })] };
+    const prov = provenance([[lineageKey("$block"), { source: "cache", source_host: "world" }]]);
+    expect(collectPlanningWorldViolations(world, prov)).toHaveLength(0);
+  });
+
   // A tracked cell with no provenance means it bypassed the admission gate.
   it("rejects a tracked lineage cell that carries no provenance", () => {
     const world = { objects: [obj("guest_1", "Guest 1")] };

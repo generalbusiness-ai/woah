@@ -631,6 +631,16 @@ export class McpGateway {
       clientNode: () => this.v2NodeFor(entry),
       clientHead: (client) => client.relay.commit_scope.head,
       clientSerialized: (client) => serializedFor(client.relay.commit_scope, { reason: "mcp_turn_plan", metric: (event) => this.world.recordMetric(event) }),
+      // A3.2 admission gate, runtime discovery: thread the relay's per-cell
+      // provenance so the VM boundary checks admissibility. Discovery-only for now
+      // (logs an inadmissible planning cell, e.g. a presentation stub winning
+      // identity); the P4 flip turns this into a hard reject once the debt is empty.
+      clientPlanningProvenance: (client) => client.relay.commit_scope.cellProvenance ?? new Map(),
+      onAdmissionViolation: (violations) => {
+        for (const v of violations) {
+          console.warn("woo.planning_world_inadmissible", { where: "mcp_turn_plan", scope, kind: v.kind, object: v.object, page: v.page, detail: v.detail });
+        }
+      },
       nextTurnId: () => id,
       envelopeId: (turnId, attempt) => executorEnvelopeId(turnId, attempt, () => Math.random().toString(36).slice(2, 10)),
       authorityPayload: async (submitScope, extraObjectIds, context) => {

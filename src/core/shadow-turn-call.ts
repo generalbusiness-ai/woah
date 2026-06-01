@@ -1,5 +1,6 @@
 import { createWorldFromSerialized } from "./bootstrap";
 import { effectTranscriptFromRecordedTurn, type EffectTranscript } from "./effect-transcript";
+import { collectPlanningWorldViolations, type PlanningAdmissibilityViolation, type PlanningWorldProvenance } from "./planning-world";
 import type { SerializedWorld } from "./repository";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, Message, MetricEvent, ObjRef, WooValue } from "./types";
 import { wooError } from "./types";
@@ -39,6 +40,16 @@ export type ShadowTurnCallTranscriptRun = Omit<ShadowTurnCallRun, "serializedAft
 
 export type ShadowTurnCallOptions = {
   allowed_atom_hashes?: Iterable<string>;
+  // A3.2 PlanningWorld admission gate, runtime wiring (discovery mode). When a
+  // caller threads the planning world's per-cell provenance here,
+  // runShadowTurnCallTranscript runs the admissibility check at the VM boundary —
+  // the single point where a SerializedWorld becomes the VM's readable world — and
+  // reports any inadmissible cell (e.g. a presentation stub winning identity) to
+  // `onAdmissionViolation`. It does NOT throw yet: enforcement (reject the world)
+  // is the P4 flip, gated on emptying the discovered debt. Callers that omit this
+  // get the prior behavior, so no path is forced through the gate before P4.
+  planningProvenance?: PlanningWorldProvenance;
+  onAdmissionViolation?: (violations: PlanningAdmissibilityViolation[]) => void;
   // Optional forwarder for engine metric events. The ephemeral executor
   // world has no metrics hook by default, so events like `direct_call`,
   // `applied`, and `dispatch_resolved` get dropped on the v2 hot path
@@ -66,6 +77,18 @@ export async function runShadowTurnCallTranscript(
   // Durable commit scopes apply transcripts authoritatively, so planning and
   // commit-scope execution should not pay for a full executor post-state export
   // unless a caller explicitly needs that snapshot.
+  if (options.planningProvenance && options.onAdmissionViolation) {
+    // Runtime admission gate, DISCOVERY mode: report any inadmissible planning cell
+    // (a presentation stub winning identity, or an untagged tracked cell) at the VM
+    // boundary, but do NOT throw. Enforcement is deferred to P4 because a transient
+    // stub admission is repairable — the submitTurnIntent retry loop refreshes
+    // authority and re-plans — so the gate must drive REPAIR (like E_NEED_STATE),
+    // not a hard fail that pre-empts the retry. Hard-throwing here was observed to
+    // convert a repairable transient into a turn failure (test:worker / gate:authority).
+    // Wiring inadmissibility into the repair loop is the P4 enforcement step.
+    const violations = collectPlanningWorldViolations(serializedBefore, options.planningProvenance);
+    if (violations.length > 0) options.onAdmissionViolation(violations);
+  }
   const world = createWorldFromSerialized(serializedBefore, { persist: false });
   if (options.onMetric) world.setMetricsHook(options.onMetric);
   return await runShadowTurnCallOnWorldTranscript(world, call, options);
