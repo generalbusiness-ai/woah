@@ -684,7 +684,18 @@ function projectionWritesForIndexedApply(
   explicitProjectionWrites: readonly ProjectionWrite[] = []
 ): ProjectionWrite[] {
   const writes: ProjectionWrite[] = [...explicitProjectionWrites];
-  for (const id of Array.from(touchedObjectIds).sort()) {
+  // CA5 / VTN10.1 movement materialization: an accepted move records only
+  // `transcript.moves` and a `live:location` authority write; the moved object's
+  // OWN row is not otherwise touched (applyMovementProjectionToIndexedState only
+  // mutates the source/destination contents projections). Without the moved
+  // object's row in projection_writes, a sparse destination shard receiving this
+  // commit's fanout knows the member is present (via the room's contents row) but
+  // has no authoritative lineage/name cell for it, so `who`/roster renders the
+  // raw object id instead of the display name. Emit the authoritative moved-object
+  // row alongside the touched set so the destination materializes it.
+  const emitObjectIds = new Set<ObjRef>(touchedObjectIds);
+  for (const move of transcript.moves) emitObjectIds.add(move.object);
+  for (const id of Array.from(emitObjectIds).sort()) {
     const row = next.objectsById.get(id);
     if (row) {
       const clone = structuredClone(row) as SerializedObject;

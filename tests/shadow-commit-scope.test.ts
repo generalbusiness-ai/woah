@@ -171,6 +171,60 @@ describe("shadow commit scope", () => {
     expect(applied.state.parkedTasks).toContainEqual(parkedTask);
     expect(applied.state.tombstones).toContain("recycled_new");
   });
+
+  it("emits an authoritative object upsert for a move-only transcript (CA5 materialization)", () => {
+    // Regression: a cross-scope move records only `moves` + a `live:location`
+    // authority write; the moved object's own row is not otherwise touched. The
+    // accepted commit MUST still carry an objects-projection upsert for the moved
+    // object, with its REAL authoritative row (name "Mover", not a synthetic id
+    // row), so a sparse destination shard materializes its lineage/name cell and
+    // `who`/roster resolves a display name instead of the raw id.
+    const before: SerializedWorld = {
+      version: 1,
+      objectCounter: 1,
+      parkedTaskCounter: 1,
+      sessionCounter: 1,
+      objects: [
+        objectRecord("mover", "Mover", "room", []),
+        objectRecord("room", "Room", null, ["mover"]),
+        objectRecord("dest", "Dest", null, [])
+      ],
+      sessions: [],
+      logs: [],
+      snapshots: [],
+      parkedTasks: [],
+      tombstones: []
+    };
+    const transcript: EffectTranscript = {
+      kind: "woo.effect_transcript.shadow.v1",
+      id: "move-only",
+      route: "sequenced",
+      scope: "mover",
+      seq: 0,
+      session: "session-mover",
+      call: { actor: "mover", target: "room", verb: "go", args: [], body: undefined },
+      reads: [],
+      writes: [{ cell: { kind: "location", object: "mover" }, value: "dest", op: "move" }],
+      creates: [],
+      moves: [{ object: "mover", from: "room", to: "dest" }],
+      observations: [],
+      logicalInputs: [],
+      untrackedEffects: [],
+      complete: true,
+      incompleteReasons: [],
+      hash: "transcript:move-only"
+    };
+
+    const scope = createShadowCommitScope({ node: "scope:test", scope: "mover", serialized: before });
+    const applied = applyShadowTranscriptToIndexedState(scope.state, transcript, { objectTimestamp: 1 });
+    const moverUpsert = applied.projection_writes.find(
+      (write) => write.table === "objects" && write.key === "mover" && write.op === "upsert"
+    );
+    expect(moverUpsert, JSON.stringify(applied.projection_writes.map((w) => ({ table: w.table, key: w.key, op: w.op })))).toBeTruthy();
+    const row = (moverUpsert as { row?: SerializedObject }).row;
+    expect(row?.name).toBe("Mover");
+    expect(row?.location).toBe("dest");
+  });
 });
 
 function addChildTranscript(): EffectTranscript {
