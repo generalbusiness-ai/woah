@@ -871,7 +871,12 @@ export class McpGateway {
         parkedTaskCounter: serialized.parkedTaskCounter,
         sessionCounter: serialized.sessionCounter
       },
-      tombstones: serialized.tombstones
+      tombstones: serialized.tombstones,
+      // A3: this is the MCP shard's last-known relay view, included only on a
+      // cold-owner degrade (staleFallbackCount > 0). It is a fallback derivation,
+      // never the owner's authoritative row — fresh owner rows override it
+      // because the payload is combined last.
+      pageProvenance: () => ({ source: "fallback" })
     });
     return {
       ...payload,

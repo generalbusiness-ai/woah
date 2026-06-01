@@ -150,7 +150,8 @@ describe("v2 turn gateway", () => {
         serializedObject("$three", "three", 3)
       ],
       counters: { objectCounter: 44, parkedTaskCounter: 1, sessionCounter: 9 },
-      tombstones: ["$gone" as ObjRef]
+      tombstones: ["$gone" as ObjRef],
+      pageProvenance: () => ({ source: "authoritative" as const })
     });
     mergeExecutorAuthority(serialized, authority);
 
@@ -178,7 +179,8 @@ describe("v2 turn gateway", () => {
         { id: "kept", actor: "$kept_actor" as ObjRef, started: 2, lastDetachAt: null, tokenClass: "guest" as const, activeScope: "$room" as ObjRef }
       ],
       objects: [serializedObject("$room", "room", 2)],
-      counters: { objectCounter: 44, parkedTaskCounter: 1, sessionCounter: 9 }
+      counters: { objectCounter: 44, parkedTaskCounter: 1, sessionCounter: 9 },
+      pageProvenance: () => ({ source: "authoritative" as const })
     });
 
     mergeExecutorAuthority(serialized, authority);

@@ -425,11 +425,17 @@ planning cache, not a new authority source:
   budget, the gateway may serve the repaired payload for the current attempt,
   but it MUST NOT store the oversized union or emit a sticky-repair health
   signal.
-- Authority-slice page references SHOULD carry page-level `source` and
-  `source_host` provenance. A gateway may trust a remote page as owner-sourced
-  when `source == "authoritative"` and `source_host` is the responding owner;
-  cache/fallback/projection pages can fill local gaps for planning, but they
-  must not override local or fresher owner rows.
+- Authority-slice page references MUST carry a page-level `source` discriminator
+  (A3): the authority-slice builder cannot construct a slice without declaring,
+  per page, whether it is the owner's authoritative row or a
+  cache/projection/fallback/gossip derivation. A gateway TRUSTS a remote page as
+  authority ONLY when `source == "authoritative"` and `source_host` is the
+  responding owner. Cache/fallback/projection/gossip pages MAY fill a local gap
+  for planning, but MUST NOT override a local or fresher owner row and MUST NOT
+  be treated as a write-authority source. This is the typed enforcement of CA2's
+  "a projection cell MUST NOT be used as a write-authority source": provenance is
+  load-bearing, not advisory. (A3.2 extends the same refusal into the VM planning
+  read path; A3.1 establishes it at the authority-slice merge boundary.)
 - Implementations MUST bound checkpoint count by memory policy, for example an
   LRU cap. A gateway must never accumulate one full slice per scope forever.
 

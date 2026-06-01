@@ -4578,13 +4578,21 @@ export class PersistentObjectDO {
   ): Promise<SerializedAuthoritySlice> {
     const rejectLocalActorLive = (ref: { object: ObjRef; page: string }): boolean =>
       localActorAuthorityRoots.has(ref.object) && ref.page === "object_live";
-    if (isAuthorityCellSlice(authority) && authority.page_refs.some((ref) => ref.source || ref.source_host)) {
+    // A3: provenance is now load-bearing. Every authority cell slice page carries
+    // a `source` (the builder requires it). The gateway TRUSTS a page as authority
+    // only when it is the owner's authoritative row from the responding host;
+    // every other source (cache/projection/fallback/gossip) is support material
+    // that may fill a gap but MUST NOT override a locally-preserved row. This is
+    // the typed refusal that replaces the old "if any ref happens to carry
+    // provenance" optimization: a non-authoritative page can never masquerade as
+    // authority for an id the gateway already holds.
+    if (isAuthorityCellSlice(authority)) {
       return filterSerializedAuthoritySlicePages(authority, (ref) => {
         if (rejectLocalActorLive(ref)) return false;
-        if (ref.source === "authoritative" && ref.source_host === host) return true;
-        // Non-owner rows from the remote slice are cache/projection/fallback
-        // material. They are useful as support rows only when the gateway has
-        // no local row to preserve; otherwise owner/local rows win.
+        const ownerSourced = ref.source === "authoritative" && ref.source_host === host;
+        if (ownerSourced) return true;
+        // Not owner-authoritative: admit only to fill a gap the gateway lacks
+        // locally; never to overwrite a local/owner row.
         return !localObjectIds.has(ref.object);
       });
     }

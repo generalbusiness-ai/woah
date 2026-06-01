@@ -27,18 +27,27 @@ export type MergeSerializedAuthorityOptions = {
 
 export type AuthorityPageProvenance = Pick<ShadowStatePageRef, "source" | "source_host">;
 
+// A3 (mobile-heap sequence): every authority cell page MUST declare a `source`.
+// Provenance is no longer a decorative optional field — the gateway merge path
+// REFUSES to trust a non-"authoritative" page as authority (see
+// filterRemoteAuthoritySliceForGateway), so a page with no declared source would
+// be silently un-trustable. `pageProvenance` is therefore required and MUST
+// return a provenance whose `source` is set. This is the type-level half of
+// VTN0's "a derived copy is never a write-authority source": a builder cannot
+// produce an authority slice without saying, per page, whether it is the owner's
+// authoritative row or a cache/projection/fallback derivation.
 export function buildSerializedAuthorityCellSlice(input: {
   sessions: readonly SerializedSession[];
   objects: readonly SerializedObject[];
   counters: Pick<SerializedWorld, "objectCounter" | "parkedTaskCounter" | "sessionCounter">;
   tombstones?: readonly ObjRef[];
-  pageProvenance?: (page: ShadowStatePage) => AuthorityPageProvenance | null | undefined;
+  pageProvenance: (page: ShadowStatePage) => AuthorityPageProvenance & { source: NonNullable<AuthorityPageProvenance["source"]> };
 }): SerializedAuthorityCellSlice {
   const pages = input.objects.flatMap((obj) => shadowStatePagesForObject(obj));
   return {
     kind: "woo.authority_slice.cells.shadow.v1",
     sessions: structuredClone(input.sessions) as SerializedSession[],
-    page_refs: pages.map((page) => authorityPageRefWithProvenance(shadowStatePageRef(page, true), input.pageProvenance?.(page))),
+    page_refs: pages.map((page) => authorityPageRefWithProvenance(shadowStatePageRef(page, true), input.pageProvenance(page))),
     inline_pages: pages.map((page) => structuredClone(page) as ShadowStatePage),
     counters: { ...input.counters },
     tombstones: [...(input.tombstones ?? [])].sort(),

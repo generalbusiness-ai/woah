@@ -6468,7 +6468,11 @@ export class WooWorld {
         parkedTaskCounter: this.parkedTaskCounter,
         sessionCounter: this.sessionCounter
       },
-      tombstones: Array.from(this.tombstones)
+      tombstones: Array.from(this.tombstones),
+      // A3: a world exporting its own resident rows is the authoritative source
+      // for them. (Per-page owner-host stamping is added where the slice is
+      // assembled for a specific host; here the role is unambiguous.)
+      pageProvenance: () => ({ source: "authoritative" })
     });
   }
 

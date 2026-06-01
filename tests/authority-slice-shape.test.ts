@@ -140,7 +140,8 @@ describe("WooWorld.exportAuthoritySlice content contract", () => {
       buildSerializedAuthorityCellSlice({
         sessions: [],
         objects: [freshDeck],
-        counters: { objectCounter: 1, parkedTaskCounter: 1, sessionCounter: 1 }
+        counters: { objectCounter: 1, parkedTaskCounter: 1, sessionCounter: 1 },
+        pageProvenance: () => ({ source: "authoritative" as const })
       })
     ]);
     const serialized = serializedWorldFromAuthoritySlice(combined);
