@@ -5,8 +5,9 @@ import {
   planningCellKey,
   type PlanningWorldProvenance
 } from "../src/core/planning-world";
+import { runShadowTurnCallTranscript, type ShadowTurnCall } from "../src/core/shadow-turn-call";
 import type { AuthorityPageProvenance } from "../src/core/shadow-state-pages";
-import type { SerializedObject } from "../src/core/repository";
+import type { SerializedObject, SerializedWorld } from "../src/core/repository";
 
 // Minimal serialized object; only the cells the admission gate inspects matter.
 function obj(id: string, name: string, extra: Partial<SerializedObject> = {}): SerializedObject {
@@ -108,5 +109,39 @@ describe("PlanningWorld admission gate", () => {
       [lineageKey("$player"), { source: "authoritative" }]
     ]);
     expect(() => assertPlanningWorldAdmissible(world, prov, "unit-test")).not.toThrow();
+  });
+});
+
+describe("PlanningWorld admission gate — runtime enforcement at the VM boundary", () => {
+  function world(objects: SerializedObject[]): SerializedWorld {
+    return { version: 1, objectCounter: 1, parkedTaskCounter: 1, sessionCounter: 1, objects, sessions: [], logs: [], snapshots: [], parkedTasks: [], tombstones: [] };
+  }
+  const call: ShadowTurnCall = { kind: "woo.turn_call.shadow.v1", route: "direct", scope: "#-1", actor: "guest_1", target: "guest_1", verb: "noop", args: [] };
+
+  // P4 enforcement: when a planning world carries a presentation stub, the VM
+  // boundary raises a REPAIRABLE missing-state (E_NEED_STATE) naming the stubbed
+  // object — BEFORE the VM runs — so the submitTurnIntent repair loop refreshes its
+  // authority and re-plans against the named identity. The gate fires only when the
+  // caller threads planningProvenance (the gateway/commit-scope planning paths).
+  it("raises a repairable E_NEED_STATE for a stub at the boundary", async () => {
+    const serialized = world([obj("guest_1", "guest_1", { owner: "guest_1" })]);
+    const planningProvenance = provenance([[lineageKey("guest_1"), { source: "cache", source_host: "the_deck" }]]);
+    let thrown: unknown;
+    await runShadowTurnCallTranscript(serialized, call, { planningProvenance }).catch((err) => { thrown = err; });
+    expect(thrown).toMatchObject({ code: "E_NEED_STATE" });
+    const atoms = (thrown as { value?: { missing_atoms?: Array<{ preimage?: string }> } }).value?.missing_atoms ?? [];
+    expect(atoms.some((a) => a.preimage?.includes("guest_1"))).toBe(true);
+  });
+
+  // No provenance threaded → gate does not run (prior behavior preserved); a named
+  // cell never trips it either.
+  it("does not raise when provenance is not threaded", async () => {
+    const serialized = world([obj("guest_1", "guest_1", { owner: "guest_1" })]);
+    // No planningProvenance: the boundary skips the gate. The VM may still fail for
+    // unrelated reasons (no such verb), so only assert it is NOT an admission raise.
+    let thrown: unknown;
+    await runShadowTurnCallTranscript(serialized, call, {}).catch((err) => { thrown = err; });
+    const code = (thrown as { code?: string } | undefined)?.code;
+    expect(code).not.toBe("E_NEED_STATE");
   });
 });

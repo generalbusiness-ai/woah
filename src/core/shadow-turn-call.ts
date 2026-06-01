@@ -77,17 +77,32 @@ export async function runShadowTurnCallTranscript(
   // Durable commit scopes apply transcripts authoritatively, so planning and
   // commit-scope execution should not pay for a full executor post-state export
   // unless a caller explicitly needs that snapshot.
-  if (options.planningProvenance && options.onAdmissionViolation) {
-    // Runtime admission gate, DISCOVERY mode: report any inadmissible planning cell
-    // (a presentation stub winning identity, or an untagged tracked cell) at the VM
-    // boundary, but do NOT throw. Enforcement is deferred to P4 because a transient
-    // stub admission is repairable — the submitTurnIntent retry loop refreshes
-    // authority and re-plans — so the gate must drive REPAIR (like E_NEED_STATE),
-    // not a hard fail that pre-empts the retry. Hard-throwing here was observed to
-    // convert a repairable transient into a turn failure (test:worker / gate:authority).
-    // Wiring inadmissibility into the repair loop is the P4 enforcement step.
+  if (options.planningProvenance) {
+    // Runtime admission gate (P4 enforcement, repair-driven). Inspect the planning
+    // world at the VM boundary — the single point where a SerializedWorld becomes
+    // the VM's readable world.
     const violations = collectPlanningWorldViolations(serializedBefore, options.planningProvenance);
-    if (violations.length > 0) options.onAdmissionViolation(violations);
+    if (violations.length > 0) {
+      options.onAdmissionViolation?.(violations);
+      // A presentation stub winning planning identity is inadmissible. Enforce it
+      // NOT by a hard fail (a stub admission is typically transient and repairable),
+      // but by raising a repairable missing-state for the stubbed objects: the
+      // submitTurnIntent retry loop refreshes those objects' authority and re-plans
+      // against the named identity. Only a persistent, unrepairable stub (the bounded
+      // repair retry exhausts) fails the turn — which is the correct loud signal that
+      // an identity genuinely cannot be resolved, never a silently-served id-as-name.
+      // `missing_provenance` stays non-fatal (reported via onAdmissionViolation) until
+      // per-cell provenance coverage is universal across every seed/snapshot path.
+      const stubs = violations.filter((v) => v.kind === "presentation_stub_lineage");
+      if (stubs.length > 0) {
+        throw wooError("E_NEED_STATE", "planning world admitted a presentation stub; repair identity", {
+          missing_atoms: stubs.map((stub) => {
+            const preimage = `read:cell:lifecycle:${stub.object}`;
+            return { hash: shadowAtomHash(preimage), preimage };
+          })
+        });
+      }
+    }
   }
   const world = createWorldFromSerialized(serializedBefore, { persist: false });
   if (options.onMetric) world.setMetricsHook(options.onMetric);

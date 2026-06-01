@@ -175,3 +175,51 @@ OBSERVED at runtime (discovery) but not yet CONTINUALLY ENFORCED — stated plai
 Gates (discovery mode): typecheck 0 · npm test 267/267 · cf-repository 63/63 ·
 test:worker 202 passed/5 skipped · gate:authority 2/2 · planning-world 8/8 ·
 authority-slice-shape 12/12.
+
+## Update (2026-06-01 — P4 COMPLETE: runtime enforcement is repair-driven and live)
+
+Enforcement landed, and crucially NOT as a hard fail (which the discovery pass proved
+breaks repairable transients). The VM boundary `runShadowTurnCallTranscript`, when a
+caller threads `planningProvenance`, now:
+- reports every admission violation (observability), and
+- for a `presentation_stub_lineage`, RAISES a repairable `E_NEED_STATE` naming the
+  stubbed object BEFORE the VM runs. The `submitTurnIntent` repair loop extracts the
+  id (`cell:lifecycle:<id>` preimage), refreshes that object's authority, and
+  re-plans against the named identity. Only a stub surviving the bounded repair
+  retry fails the turn (correct loud signal). `missing_provenance` stays non-fatal
+  (reported) until universal per-cell provenance coverage.
+
+Why repair-driven, not hard-fail: a hard throw failed test:worker + gate:authority
+on a transient (shard-ordering) stub admission, because the throw pre-empted the
+retry that would have repaired it. Routing through `E_NEED_STATE` makes the
+transient self-heal while a genuine unresolvable identity still fails loudly.
+
+Validation:
+- Deterministic proof: tests/planning-world.test.ts +2 — a stub planning world makes
+  the boundary raise E_NEED_STATE naming the object; no-provenance threading is inert.
+- Stress: cf-repository who 6×, gate:authority 8×, all green under enforcement
+  (where the hard-throw variant had failed). test:worker 202 passed/5 skipped.
+- Spec: cell-authority CA11 now states boundary enforcement is repair-driven, the
+  missing_provenance non-fatal carve-out, and the `$`-namespace exclusion.
+
+Gates: typecheck 0 · npm test 270/270 · cf-repository 63/63 · test:worker 202/5-skip ·
+gate:authority 2/2 (×8) · planning-world 10/10 · authority-slice-shape 12/12.
+
+### Status of the architecture (P1–P4)
+- P1 (gate module + invariant tests) — DONE.
+- P2 (provenance carried through combine/merge/seed; layer-3 fixed) — DONE.
+- P3 (runtime wiring at the boundary; provenance threaded gateway→submitTurnIntent→
+  boundary) — DONE. NOT done: branding the boundary type so `runShadowTurnCallTranscript`
+  accepts only a `PlanningWorld` produced by a single `buildPlanningWorld` (compile-time
+  forcing of all callers). The runtime gate already enforces the load-bearing class;
+  the nominal brand is additional defense-in-depth, deferred as optional hardening.
+- P4 (enforce + CI + spec) — DONE (repair-driven enforcement, gated, spec aligned).
+
+### Remaining optional hardening (not required for the invariant to be enforced)
+1. Compile-time brand: `runShadowTurnCallTranscript(world: PlanningWorld)` + a single
+   `buildPlanningWorld` constructor, so no path can pass a raw SerializedWorld.
+2. `missing_provenance` → fatal once every seed/snapshot path records per-cell
+   provenance (universal coverage). Today only the relay merge/seed paths do.
+3. Thread `planningProvenance` into the CommitScopeDO's own VM-execution path (it is
+   threaded on the gateway planning path; the commit executor relies on the
+   already-repaired authority it receives).

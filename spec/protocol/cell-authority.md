@@ -461,6 +461,19 @@ planning cache, not a new authority source:
   relay/commit-scope world directly from a serialized snapshot MUST capture the
   per-cell provenance of that seed's authority slice, so a seeded stub does not
   default to protected-authority and block its own repair.
+- The admission rule is ENFORCED at the planning/VM boundary — the single point
+  where a materialized world becomes the VM's readable world — not merely at the
+  merge. When the planning world carries a presentation stub for a tracked identity
+  cell, the boundary MUST refuse it. Refusal is by REPAIR, not a hard fail: the
+  boundary raises a repairable missing-state (`E_NEED_STATE`) naming the stubbed
+  object so the turn-submission retry loop refreshes that object's authority and
+  re-plans against the named identity. Only a stub that survives the bounded repair
+  retry (identity genuinely unresolvable) fails the turn — which is the correct loud
+  signal, never a silently-served id-as-name. A non-stub cell whose provenance is
+  merely unknown (`missing_provenance`) is reported for observability but is NOT yet
+  fatal, pending universal per-cell provenance coverage across all seed/snapshot
+  paths. Substrate refs (the `$`-prefixed namespace) are named by their ref by
+  convention and are not presentation stubs.
 - Implementations MUST bound checkpoint count by memory policy, for example an
   LRU cap. A gateway must never accumulate one full slice per scope forever.
 
