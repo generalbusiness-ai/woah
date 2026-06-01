@@ -6,7 +6,6 @@ import {
   applyShadowTranscriptToCommitScopeCache,
   shadowCommitScopeSerializedRef,
   shadowLocationCommitScopeForTranscript,
-  shadowPlacementTransactionForTranscript,
   serializedFor,
   submitShadowCommit,
   transcriptTouchedObjectIds,
@@ -2057,17 +2056,17 @@ function commitShadowBrowserPlannedTranscript(
   if (stableShadowJson(actualKey as unknown as WooValue) !== stableShadowJson(request.key as unknown as WooValue)) {
     throw new Error("planned transcript key mismatch");
   }
-  const transaction = shadowPlacementTransactionForTranscript(transcript) ?? undefined;
   const commitScope = shadowBrowserRelayCommitScopeForTranscript(browser.relay, transcript);
   const expected = request.expected?.scope === commitScope.scope ? request.expected : commitScope.head;
   const locationCommitScope = shadowLocationCommitScopeForTranscript(transcript);
   const commit = submitShadowCommit(commitScope, {
     kind: "woo.commit.submit.shadow.v1",
     id: request.id ?? request.call.id,
-    scope: transaction || locationCommitScope === commitScope.scope ? commitScope.scope : transcript.scope,
+    // CA3 location-as-truth: commit at the moved object's location authority
+    // when it owns this commit scope; otherwise at the transcript's own scope.
+    scope: locationCommitScope === commitScope.scope ? commitScope.scope : transcript.scope,
     expected,
     transcript,
-    ...(transaction ? { transaction } : {}),
     executor: browser.node,
     profile: options.profile,
     metric: options.onMetric

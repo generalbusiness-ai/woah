@@ -42,15 +42,9 @@ export type ShadowCommitSubmit = {
   scope: ObjRef;
   expected: ShadowScopeHead;
   transcript: EffectTranscript;
-  transaction?: ShadowCommitTransaction;
   executor?: string;
   profile?: (event: MetricEvent & { kind: "shadow_apply_step" }) => void;
   metric?: (event: MetricEvent) => void;
-};
-
-export type ShadowCommitTransaction = {
-  kind: "placement";
-  cells: TranscriptCell[];
 };
 
 export type ShadowCommitAccepted = {
@@ -62,7 +56,6 @@ export type ShadowCommitAccepted = {
   post_state_hash: string;
   observations: EffectTranscript["observations"];
   receipt: ShadowCommitReceipt;
-  transaction?: ShadowCommitTransaction;
   projection_delta?: ProjectionDeltaSummary;
   projection_writes?: ProjectionWrite[];
 };
@@ -77,7 +70,6 @@ export type ShadowCommitConflict = {
   reason:
     | "stale_head"
     | "read_version_mismatch"
-    | "write_fence_missing"
     | "permission_denied"
     | "bytecode_mismatch"
     | "nondeterministic"
@@ -269,7 +261,6 @@ export function submitShadowCommit(scope: ShadowCommitScope, submit: ShadowCommi
     post_state_hash: receipt.post_state_hash,
     observations: submit.transcript.observations,
     receipt,
-    ...(submit.transaction ? { transaction: structuredClone(submit.transaction) as ShadowCommitTransaction } : {}),
     projection_delta: applied.projection_delta,
     projection_writes: applied.projection_writes
   };
@@ -376,9 +367,12 @@ function shadowCommitEnvelopeErrors(scope: ShadowCommitScope, submit: ShadowComm
   if (submit.scope !== scope.scope) {
     errors.push(`scope_mismatch: submit=${submit.scope} scope=${scope.scope}`);
   }
-  errors.push(...validateShadowCommitTransaction(submit));
+  // CA3 location-as-truth: a transcript may legitimately commit at the moved
+  // object's location authority (its actor/object scope) rather than the
+  // transcript's own scope. Accept either the transcript scope or the
+  // single-location commit scope; anything else is a genuine scope mismatch.
   const locationCommitScope = shadowLocationCommitScopeForTranscript(submit.transcript);
-  if (!submit.transaction && submit.transcript.scope !== scope.scope && locationCommitScope !== scope.scope) {
+  if (submit.transcript.scope !== scope.scope && locationCommitScope !== scope.scope) {
     errors.push(`scope_mismatch: submit=${submit.scope} transcript=${submit.transcript.scope} scope=${scope.scope}`);
   }
   if (!sameShadowHead(submit.expected, scope.head)) {
@@ -390,42 +384,6 @@ function shadowCommitEnvelopeErrors(scope: ShadowCommitScope, submit: ShadowComm
   const checked = validation ?? validateTranscriptAgainstSerializedWorld(serializedFor(scope, { reason: "legacy_validation" }), submit.transcript);
   for (const error of checked.errors) errors.push(error);
   return errors;
-}
-
-function validateShadowCommitTransaction(submit: ShadowCommitSubmit): string[] {
-  const errors: string[] = [];
-  if (!submit.transaction) {
-    const required = shadowPlacementTransactionForTranscript(submit.transcript);
-    if (required && placementTransactionTouchesForeignContents(required, submit.transcript.scope)) {
-      errors.push("write_fence_missing: placement transaction required for cross-scope movement");
-    }
-    return errors;
-  }
-  if (submit.transaction.kind !== "placement") {
-    errors.push(`write_fence_missing: unsupported transaction kind ${(submit.transaction as { kind?: string }).kind ?? "unknown"}`);
-    return errors;
-  }
-  const required = shadowPlacementTransactionForTranscript(submit.transcript);
-  if (!required) {
-    errors.push("write_fence_missing: placement transaction supplied for transcript with no movement");
-    return errors;
-  }
-  const provided = new Set(submit.transaction.cells.map(cellKey));
-  for (const cell of required.cells) {
-    if (!provided.has(cellKey(cell))) errors.push(`write_fence_missing: ${cellLabel(cell)}`);
-  }
-  return errors;
-}
-
-export function shadowCommitTransactionCoversTranscript(
-  transaction: ShadowCommitTransaction | null | undefined,
-  transcript: EffectTranscript
-): boolean {
-  if (!transaction || transaction.kind !== "placement") return false;
-  const required = shadowPlacementTransactionForTranscript(transcript);
-  if (!required) return false;
-  const provided = new Set(transaction.cells.map(cellKey));
-  return required.cells.every((cell) => provided.has(cellKey(cell)));
 }
 
 export function shadowLocationCommitScopeForTranscript(transcript: EffectTranscript): ObjRef | null {
@@ -442,15 +400,6 @@ export function shadowLocationCommitScopeForTranscript(transcript: EffectTranscr
     return null;
   }
   return object;
-}
-
-function placementTransactionTouchesForeignContents(transaction: ShadowCommitTransaction, scope: ObjRef): boolean {
-  return transaction.cells.some((cell) => cell.kind === "contents" && cell.object !== scope);
-}
-
-export function shadowPlacementTransactionForTranscript(transcript: EffectTranscript): ShadowCommitTransaction | null {
-  void transcript;
-  return null;
 }
 
 function validateShadowPostState(reader: TranscriptCellReader, transcript: EffectTranscript): string[] {
@@ -1412,7 +1361,6 @@ function lastMoveForObject(transcript: EffectTranscript, object: ObjRef): { obje
 function shadowConflictReason(errors: string[]): ShadowCommitConflict["reason"] {
   if (errors.some((error) => error.startsWith("stale_head"))) return "stale_head";
   if (errors.some((error) => error.startsWith("scope_mismatch"))) return "scope_mismatch";
-  if (errors.some((error) => error.startsWith("write_fence_missing"))) return "write_fence_missing";
   if (errors.some((error) => error.startsWith("permission_denied"))) return "permission_denied";
   if (errors.some((error) => error.startsWith("post_state_mismatch"))) return "post_state_mismatch";
   if (errors.some((error) => error.startsWith("incomplete"))) return "incomplete_transcript";
@@ -1441,8 +1389,4 @@ function cellLabel(cell: TranscriptCell): string {
 
 function cellKey(cell: TranscriptCell): string {
   return stableShadowJson(cell as unknown as WooValue);
-}
-
-function compareTranscriptCells(a: TranscriptCell, b: TranscriptCell): number {
-  return cellKey(a).localeCompare(cellKey(b));
 }

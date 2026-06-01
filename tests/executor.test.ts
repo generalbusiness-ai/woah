@@ -214,57 +214,6 @@ describe("v2 turn gateway", () => {
     })).toEqual(["$room", "$tool", "$actor", "$arg_obj", "plain text", "$nested_arg", "$body_obj", "$nested_body"]);
   });
 
-  it("submits intent turns through one retry loop with refreshed authority", async () => {
-    const envelopes: ExecutorEnvelopeBody[] = [];
-    const attempts: number[] = [];
-    const result = await submitTurnIntent({
-      input: {
-        id: "turn-1",
-        route: "direct",
-        scope: "$room" as ObjRef,
-        session: "s1",
-        actor: "$actor" as ObjRef,
-        target: "$target" as ObjRef,
-        verb: "look",
-        args: [],
-        persistence: "durable",
-        token: "token"
-      },
-      strategy: "intent",
-      maxAttempts: 2,
-      ensureClient: async (_scope, attempt) => {
-        attempts.push(attempt);
-        return { node: `client-${attempt}` };
-      },
-      clientNode: (client) => client.node,
-      nextTurnId: () => { throw new Error("explicit test turn id should be reused"); },
-      envelopeId: (turnId, attempt) => executorEnvelopeId(turnId, attempt, () => "retry"),
-      authorityPayload: (_scope, extraObjectIds) => ({
-        sessions: [],
-        session_objects: [],
-        authority: { kind: "woo.authority_slice.shadow.v1", sessions: [], objects: extraObjectIds.map((id) => serializedObject(id, id, 0)) }
-      }),
-      submitEnvelope: async (_scope, body) => {
-        envelopes.push(body);
-        return {
-          reply: encodeEnvelope(replyEnvelope(envelopes.length === 1
-            ? missingStateReply("turn-1", ["read:cell:lifecycle:$remote_room"])
-            : okReply("turn-1")))
-        };
-      }
-    });
-
-    expect(result.kind).toBe("submitted");
-    if (result.kind !== "submitted") throw new Error("expected submitted result");
-    expect(result.reply?.ok).toBe(true);
-    expect(attempts).toEqual([0, 1]);
-    expect(envelopes.map((body) => body.node)).toEqual(["client-0", "client-1"]);
-    expect(envelopes.map((body) => authorityObjectIds(body.authority))).toEqual([
-      ["$room", "$target", "$actor"],
-      ["$room", "$target", "$actor", "$remote_room"]
-    ]);
-  });
-
   it("plans and submits a durable exec request through the planned-exec strategy", async () => {
     const world = createWorld();
     const session = world.auth("guest:v2-gateway-planned");
@@ -284,7 +233,6 @@ describe("v2 turn gateway", () => {
         persistence: "durable",
         token: "token"
       },
-      strategy: "planned-exec",
       maxAttempts: 1,
       ...harness.options
     });
@@ -336,7 +284,6 @@ describe("v2 turn gateway", () => {
         persistence: "durable",
         token: "token"
       },
-      strategy: "planned-exec",
       maxAttempts: 1,
       ...harness.options
     });
@@ -398,7 +345,6 @@ describe("v2 turn gateway", () => {
         persistence: "durable",
         token: "token"
       },
-      strategy: "planned-exec",
       maxAttempts: 1,
       ...harness.options
     });

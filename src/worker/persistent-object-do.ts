@@ -4858,15 +4858,10 @@ export class PersistentObjectDO {
         persistence: input.persistence,
         token
       },
-      // Durable REST turns use planned-exec when the local relay can produce a
-      // transcript. If sparse local planning fails, submitTurnIntent falls back
-      // to a guarded intent at the turn scope; movement no longer routes
-      // through the withdrawn #placement authority.
-      strategy: "planned-exec",
+      // Durable REST turns plan locally on the relay and submit a planned
+      // exec request. Movement commits at the moved object's location
+      // authority (CA3), not through the withdrawn #placement authority.
       maxAttempts: 8,
-      intentScope: (turn) => turn.persistence === "durable"
-        ? turn.scope
-        : turn.scope,
       ensureClient: async (scope, attempt) => await this.ensureRestV2Relay(world, input, scope, token, attempt > 0),
       clientNode: (client) => client.node,
       clientHead: (client) => client.relay.commit_scope.head,

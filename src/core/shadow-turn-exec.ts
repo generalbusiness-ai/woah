@@ -23,7 +23,6 @@ import {
   serializedFor,
   shadowCommitScopeObject,
   shadowLocationCommitScopeForTranscript,
-  shadowPlacementTransactionForTranscript,
   submitShadowCommit,
   transcriptTouchedObjectIds,
   type ShadowCommitAccepted,
@@ -744,15 +743,15 @@ export async function executeAuthoritativeShadowTurnCall(
     expected: input.expected ?? input.commitScope.head,
     persistence: "durable"
   };
-  const commitTransaction = shadowPlacementTransactionForTranscript(run.transcript) ?? undefined;
   const locationCommitScope = shadowLocationCommitScopeForTranscript(run.transcript);
   const commit = submitShadowCommit(input.commitScope, {
     kind: "woo.commit.submit.shadow.v1",
     id: request.id ?? input.call.id,
-    scope: commitTransaction || locationCommitScope === input.commitScope.scope ? input.commitScope.scope : run.transcript.scope,
+    // CA3 location-as-truth: commit at the moved object's location authority
+    // when it owns this commit scope; otherwise at the transcript's own scope.
+    scope: locationCommitScope === input.commitScope.scope ? input.commitScope.scope : run.transcript.scope,
     expected: request.expected ?? input.commitScope.head,
     transcript: run.transcript,
-    ...(commitTransaction ? { transaction: commitTransaction } : {}),
     executor: node.node,
     profile: input.profile,
     metric: input.metric
@@ -913,9 +912,6 @@ export async function executeShadowTurnCallOrNeedState(
   const selectedCommitScope = !livePersistence
     ? options.commitScopeForTranscript?.(run.transcript) ?? options.commitScope
     : options.commitScope;
-  const commitTransaction = selectedCommitScope
-    ? shadowPlacementTransactionForTranscript(run.transcript) ?? undefined
-    : undefined;
   const locationCommitScope = selectedCommitScope
     ? shadowLocationCommitScopeForTranscript(run.transcript)
     : null;
@@ -926,10 +922,11 @@ export async function executeShadowTurnCallOrNeedState(
     ? submitShadowCommit(selectedCommitScope, {
         kind: "woo.commit.submit.shadow.v1",
         id: request.id ?? request.call.id,
-        scope: commitTransaction || locationCommitScope === selectedCommitScope.scope ? selectedCommitScope.scope : run.transcript.scope,
+        // CA3 location-as-truth: commit at the moved object's location authority
+        // when it owns this commit scope; otherwise at the transcript's scope.
+        scope: locationCommitScope === selectedCommitScope.scope ? selectedCommitScope.scope : run.transcript.scope,
         expected: expected ?? selectedCommitScope.head,
         transcript: run.transcript,
-        ...(commitTransaction ? { transaction: commitTransaction } : {}),
         executor: node.node,
         profile: options.profile,
         metric: options.metric
