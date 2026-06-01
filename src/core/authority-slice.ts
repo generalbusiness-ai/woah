@@ -372,6 +372,17 @@ function mergeAuthorityCellPages(
     const key = authorityPageRefKey(ref);
     const current = currentPages.get(key);
     if (current?.hash === ref.hash) continue;
+    // A3.2: provenance is enforced at the boundary where a transferred cell page
+    // becomes a row in the materialized planning world the VM reads from. The
+    // planning world carries no per-cell provenance, so we use the equivalent
+    // CI-safe rule: an `authoritative` page may overwrite freely (it is the
+    // owner's truth); a non-authoritative page (cache/projection/fallback/gossip,
+    // or an untagged execution page) may only FILL a cell the planning world
+    // lacks — it must never overwrite an existing cell. This makes "a derived
+    // copy is never a write-authority source" (VTN0) a property of the merge
+    // primitive itself, so every caller (gateway, REST, browser, warm-checkpoint
+    // install) inherits the refusal — not just the one gateway filter (A3.1).
+    if (ref.source !== "authoritative" && current) continue;
     const incoming = incomingByHash.get(ref.hash);
     if (!incoming) {
       throw new Error(`authority cell page missing inline value: ${ref.object}:${ref.page}${ref.name ? `:${ref.name}` : ""}@${ref.hash}`);
