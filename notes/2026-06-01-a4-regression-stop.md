@@ -94,3 +94,51 @@ destination world, and the stub path is the reader regardless.
 
 Validate the eventual fix with: focused cf-repository test, npm run test:worker,
 gate:authority.
+
+## Update (2026-06-01, third pass — read-through attempt, MEASURED dead-ends)
+
+Attempted the user-directed read-through (gateway projection-cache rows preferred
+over Directory stubs in mcpGatewayDirectorySessionCellSlice / v2GatewayAuthorityPayload).
+Built it, it typechecks — but PROBES proved it is NOT on the path the cf-repository
+`who` exercises, so it does not move the test. REVERTED it (persistent-object-do.ts
+back to HEAD) to avoid carrying unvalidated code. The committed producer fix
+(9aec612, moved-object row in projection_writes) remains.
+
+### Measured facts (console.log probes, focused cf-repository test)
+1. `gatewayProjectionObjectRows` (my read-through reader): **0 calls** during the
+   whole test. The read-through I added is never reached.
+2. `v2GatewayAuthorityPayload`: **0 calls** during the whole test. So the stale
+   actor name does NOT flow through that function in this harness — the user's
+   pointer (Directory session slice at ~6480, reached via v2GatewayAuthorityPayload)
+   is not the reader for THIS failure.
+3. The live `who` turn (persistence:"live", route:"direct") goes
+   invokeV2Direct → invokeV2 → submitTurnIntent with prePlanAuthority:true, and
+   PLANS against `serializedFor(client.relay.commit_scope)` (gateway.ts:631) — the
+   per-scope RELAY world, not `this.world` and not v2GatewayAuthorityPayload.
+4. Fanout: `applyRemoteAccepted` (gateway.ts:399-411) applies the accepted frame to
+   `client.relay.commit_scope` ONLY when `this.v2Scopes.get(scope)` exists. The
+   move's accepted frame is scoped to the MOVER's own scope (bobActor). Alice's
+   shard has a relay open for `the_deck` (where she is), NOT for bobActor, so the
+   move frame finds no matching relay and never updates the_deck's relay world.
+   The unconditional `applyGatewayProjectionWrites` (411) updates `this.world` (so
+   `this.world` does get "Guest 1"), but the_deck RELAY world that `who` reads
+   does not.
+
+### Therefore the real reader/gap (next focused pass should target exactly this)
+The live turn plans against `serializedFor(the_deck relay.commit_scope)`. That
+relay world is updated by accepted frames for the_deck's scope, but a cross-scope
+MOVE commits under the moved actor's scope, so the destination relay never learns
+the moved actor's authoritative row. Fix options to evaluate:
+  (a) On fanout, when an accepted frame's projection_writes touch an actor that is
+      a member of another OPEN relay's scope on this shard, apply those object rows
+      into that relay's commit_scope world too (not just this.world).
+  (b) Make `serializedFor(relay.commit_scope)` for the plan overlay this.world's
+      fanout-updated rows / the gateway projection cache for member actors
+      (read-through at the relay-plan boundary, gateway.ts:631).
+Option (a) keeps one writer per relay world; option (b) is a read-through. Either
+must keep provenance non-authoritative and not override an owner row. Validate
+with the focused cf-repository test FIRST (it does exercise this path), then
+test:worker, then gate:authority.
+
+### Status correction
+A5 IS committed (2ded457) — earlier note text saying "A5 uncommitted" is stale.
