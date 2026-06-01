@@ -256,6 +256,69 @@ export function executorObjectIdsFromMissingState(reply: ShadowTurnExecReply): O
   return ids;
 }
 
+function executorObjectIdsFromNeedStateError(err: unknown): ObjRef[] {
+  const error = err as { code?: string; value?: WooValue } | null;
+  return error?.code === "E_NEED_STATE"
+    ? executorObjectIdsFromNeedStateValue(error.value)
+    : [];
+}
+
+function executorObjectIdsFromNeedStateFrame(frame: ErrorFrame): ObjRef[] {
+  return frame.error.code === "E_NEED_STATE"
+    ? executorObjectIdsFromNeedStateValue(frame.error.value)
+    : [];
+}
+
+function executorObjectIdsFromObjectNotFoundError(err: unknown): ObjRef[] {
+  const error = err as { code?: string; value?: WooValue } | null;
+  return error?.code === "E_OBJNF" && typeof error.value === "string"
+    ? [error.value]
+    : [];
+}
+
+function executorObjectIdsFromObjectNotFoundFrame(frame: ErrorFrame): ObjRef[] {
+  return frame.error.code === "E_OBJNF" && typeof frame.error.value === "string"
+    ? [frame.error.value]
+    : [];
+}
+
+function executorObjectIdsFromLocalPlanningError(err: unknown): ObjRef[] {
+  return mergeExecutorObjectIds(
+    executorObjectIdsFromNeedStateError(err),
+    executorObjectIdsFromObjectNotFoundError(err)
+  );
+}
+
+function executorObjectIdsFromLocalPlanningFrame(frame: ErrorFrame): ObjRef[] {
+  return mergeExecutorObjectIds(
+    executorObjectIdsFromNeedStateFrame(frame),
+    executorObjectIdsFromObjectNotFoundFrame(frame)
+  );
+}
+
+function executorObjectIdsFromNeedStateValue(raw: WooValue | undefined): ObjRef[] {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+  const missing = (raw as Record<string, WooValue>).missing_atoms;
+  if (!Array.isArray(missing)) return [];
+  const ids: ObjRef[] = [];
+  const seen = new Set<ObjRef>();
+  const push = (id: ObjRef | null): void => {
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    ids.push(id);
+  };
+  for (const item of missing) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const map = item as Record<string, WooValue>;
+    if (typeof map.hash !== "string") continue;
+    push(executorObjectIdFromMissingAtom({
+      hash: map.hash,
+      ...(typeof map.preimage === "string" ? { preimage: map.preimage } : {})
+    }));
+  }
+  return ids;
+}
+
 function executorObjectIdFromMissingAtom(atom: ShadowMissingAtom): ObjRef | null {
   const preimage = atom.preimage;
   if (typeof preimage !== "string" || preimage.length === 0) return null;
@@ -400,8 +463,35 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     }
     const serialized = options.clientSerialized?.(planningClient);
     if (!serialized) throw new Error("planned v2 turn gateway submission requires clientSerialized");
-    const planned: ShadowTurnCallTranscriptRun = await runShadowTurnCallTranscript(serialized, call, { onMetric: options.onMetric });
+    let planned: ShadowTurnCallTranscriptRun;
+    try {
+      planned = await runShadowTurnCallTranscript(serialized, call, {
+        ...(options.onMetric ? { onMetric: options.onMetric } : {})
+      });
+    } catch (err) {
+      // Sparse MCP planning can discover a transitive object before the commit
+      // executor sees it; repair that materialization miss and rerun the turn.
+      const missingObjectIds = options.prePlanAuthority
+        ? executorObjectIdsFromLocalPlanningError(err)
+        : [];
+      const nextRepairObjectIds = mergeExecutorObjectIds(repairObjectIds, missingObjectIds);
+      if (attempt + 1 < maxAttempts && nextRepairObjectIds.length > repairObjectIds.length) {
+        repairObjectIds = nextRepairObjectIds;
+        continue;
+      }
+      throw err;
+    }
     if (planned.frame.op === "error") {
+      // Catalog code may wrap the same materialization miss into a local error
+      // frame. Treat it like guarded execution, but only for pre-plan repair.
+      const missingObjectIds = options.prePlanAuthority
+        ? executorObjectIdsFromLocalPlanningFrame(planned.frame)
+        : [];
+      const nextRepairObjectIds = mergeExecutorObjectIds(repairObjectIds, missingObjectIds);
+      if (attempt + 1 < maxAttempts && nextRepairObjectIds.length > repairObjectIds.length) {
+        repairObjectIds = nextRepairObjectIds;
+        continue;
+      }
       return { kind: "local_frame", frame: planned.frame, call, planned };
     }
 

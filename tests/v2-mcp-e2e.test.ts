@@ -126,12 +126,15 @@ describe("v2 MCP e2e", () => {
       }
       return scope;
     };
-    const authorityPhases: string[] = [];
+    const authorityCalls: Array<{ snapshot: boolean; tolerate: boolean }> = [];
     const gateway = new McpGateway(world, {
       v2: {
         open: async (commitScope, body) => await postCommitScope(scopeFor(commitScope), env, commitScope, "/v2/open", body),
         authorityPayload: async (extraObjectIds, options) => {
-          authorityPhases.push(options?.useCommitScopeSnapshotForRemoteAuthority === true ? "snapshot" : "fresh");
+          authorityCalls.push({
+            snapshot: options?.useCommitScopeSnapshotForRemoteAuthority === true,
+            tolerate: options?.tolerateRemoteFailures === true
+          });
           return executorAuthorityPayload(world, extraObjectIds);
         },
         envelope: async (commitScope, body) => await postCommitScope(scopeFor(commitScope), env, commitScope, "/v2/envelope", body)
@@ -147,7 +150,7 @@ describe("v2 MCP e2e", () => {
       expect(entered.result.isError, JSON.stringify(entered.result.structuredContent)).not.toBe(true);
 
       removeObjectsFromMcpScope(gateway, "the_chatroom", ["$chatroom", "$space"]);
-      authorityPhases.length = 0;
+      authorityCalls.length = 0;
 
       const looked = await mcp(gateway, session, 3, "tools/call", {
         name: "woo_call",
@@ -155,7 +158,7 @@ describe("v2 MCP e2e", () => {
       });
 
       expect(looked.result.isError, JSON.stringify(looked.result.structuredContent)).not.toBe(true);
-      expect(authorityPhases[0]).toBe("fresh");
+      expect(authorityCalls[0]).toEqual({ snapshot: false, tolerate: true });
       expect(mcpScopeObjectIds(gateway, "the_chatroom")).toEqual(expect.arrayContaining(["$chatroom", "$space"]));
     } finally {
       for (const state of scopeStates.values()) state.close();
@@ -177,10 +180,24 @@ describe("v2 MCP e2e", () => {
       }
       return scope;
     };
+    const authorityRequests: ObjRef[][] = [];
+    const gardenClosure = new Set<ObjRef>(["the_garden", "exit_garden_north", "exit_garden_south"]);
     const gateway = new McpGateway(world, {
       v2: {
         open: async (commitScope, body) => await postCommitScope(scopeFor(commitScope), env, commitScope, "/v2/open", body),
-        authorityPayload: async (extraObjectIds) => executorAuthorityPayload(world, extraObjectIds),
+        authorityPayload: async (extraObjectIds) => {
+          authorityRequests.push([...extraObjectIds]);
+          const payload = executorAuthorityPayload(world, extraObjectIds);
+          // Prod owner slices are partitioned: asking for `the_deck` brings the
+          // exit whose `dest` names `the_garden`, but not the destination room's
+          // authority rows. The second attempt must request the missing room id
+          // explicitly before the owner can return its closure.
+          if (extraObjectIds.includes("the_garden")) return payload;
+          return {
+            ...payload,
+            authority: filterSerializedAuthoritySliceObjects(payload.authority, (id) => !gardenClosure.has(id))
+          };
+        },
         envelope: async (commitScope, body) => await postCommitScope(scopeFor(commitScope), env, commitScope, "/v2/envelope", body)
       }
     });
@@ -211,6 +228,7 @@ describe("v2 MCP e2e", () => {
       });
 
       expect(south.result.isError, JSON.stringify(south.result.structuredContent)).not.toBe(true);
+      expect(authorityRequests.some((ids) => ids.includes("the_garden"))).toBe(true);
       expect(world.activeScopeForSession(session)).toBe("the_garden");
       expect(mcpScopeObjectIds(gateway, "the_deck")).toContain("the_garden");
     } finally {

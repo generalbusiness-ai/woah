@@ -104,7 +104,17 @@ storm against incomplete executor slices.
      sparse room stubs are routing/cache hints, not authority rows. MCP live
      fanout audience is read from Directory rather than recomputed from the
      sparse local room graph, so movement observations do not reintroduce the
-     same incomplete-lineage walk after commit.
+     same incomplete-lineage walk after commit. Follow-up P0: MCP local
+     planning now treats a local missing-object frame as a VTN10.1
+     materialization miss when pre-plan authority is enabled. A transitive
+     object miss (for example `exit_deck_south.dest -> the_garden`) therefore
+     repairs the missing id and retries the whole turn instead of surfacing
+     local `E_OBJNF`. The first cf-local validation caught a same-turn contents
+     mismatch on `the_chatroom:enter`: the verb returns `room_roster()`, so it
+     must be declared `reads_room_presence` and hydrate Directory presence before
+     pre-plan authority is merged. That metadata is now explicit, and pre-plan
+     remote authority requests tolerate cold-owner read timeouts so stale
+     planning can still reach the bounded materialization-repair path.
    - **2e — gate then delete the old per-turn full-slice reconstruction path.**
      Gate behind a flag first so 2a instrumentation proves it's no longer hit on
      warm turns, then remove. **Not yet implemented.**

@@ -92,6 +92,7 @@ export type McpV2ClientHooks = {
     extraObjectIds: ObjRef[],
     options?: {
       useCommitScopeSnapshotForRemoteAuthority?: boolean;
+      tolerateRemoteFailures?: boolean;
       directorySessionScopes?: ObjRef[];
       reconstructionReason?: "warm_turn_refresh" | "cold_open" | "missing_state_repair";
       reconstructionScope?: ObjRef;
@@ -640,6 +641,7 @@ export class McpGateway {
         if (!isPrePlan) authorityRefreshAttempts += 1;
         const payload = await this.v2AuthorityPayload(extraObjectIds, {
           useCommitScopeSnapshotForRemoteAuthority,
+          tolerateRemoteFailures: isPrePlan,
           directorySessionScopes: options.directorySessionScopes ?? [],
           reconstructionReason: "warm_turn_refresh",
           reconstructionScope: submitScope,
@@ -819,6 +821,7 @@ export class McpGateway {
     extraObjectIds: ObjRef[],
     options: {
       useCommitScopeSnapshotForRemoteAuthority?: boolean;
+      tolerateRemoteFailures?: boolean;
       directorySessionScopes?: ObjRef[];
       reconstructionReason?: "warm_turn_refresh" | "cold_open" | "missing_state_repair";
       reconstructionScope?: ObjRef;

@@ -986,6 +986,19 @@ preamble atoms or translate preamble `E_OBJNF` misses into the same
 `missing_state` lifecycle atom. Recorded-turn replay helpers remain diagnostic
 preflight harnesses only.
 
+Gateway-assisted non-browser executors that plan against a sparse relay snapshot
+are guarded executors for object materialization purposes. They MUST repair and
+retry when local planning reports a missing object id that could be absent only
+because the relay snapshot is partitioned. An implementation may do this through
+the full allowed-atom guard above, or through an equivalent bounded local
+`E_OBJNF`/lifecycle-miss repair before returning the frame to the client. A
+gateway MAY prefetch authority before planning, but that prefetch is a
+performance hint; it MUST NOT turn a transitive miss in a partitioned owner
+slice into a semantic `E_OBJNF` until repair has been attempted. A read-timeout
+from an owner during this prefetch SHOULD degrade to planning against the
+best-known relay snapshot and the same bounded repair loop; it is not itself a
+semantic turn failure.
+
 Cell-page transfer MUST NOT mark a read lifecycle atom covered when the anchor
 snapshot cannot provide that object. Negative cells that are genuinely
 materialized as absence (for example an inherited verb lookup that misses on an

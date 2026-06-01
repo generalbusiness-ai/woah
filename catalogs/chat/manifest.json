@@ -820,6 +820,7 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "tool_exposed": true,
+          "reads_room_presence": true,
           "arg_spec": {
             "args": [
               "actor?"
