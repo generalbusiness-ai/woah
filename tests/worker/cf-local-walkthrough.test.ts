@@ -100,6 +100,56 @@ describe("CF-local smoke walkthrough", () => {
         danglingParentRefs.length,
         `gateway-shard planning emitted dangling_parent_ref after pre-plan authority repair: ${JSON.stringify(danglingParentRefs.slice(0, 5))}`
       ).toBe(0);
+
+      // A1 — coherence-invariant (CI) gate for the mobile-heap target.
+      // VTN0.Conformance: every node's derived view of a touched cell must equal
+      // the committed authority at the same head; no two copies of a cell may be
+      // mutated by independent write paths. A CI violation surfaces as a commit
+      // rejection logged by CommitScopeDO ("woo.commit_rejected.errors", each
+      // error naming the diverged `<object>.<cell>`). The step-level walkthrough
+      // MASKS these: the turn retries and eventually succeeds, so the step passes
+      // while a derived view silently disagreed with authority. This assertion is
+      // the structural teeth VTN0 promises — it fails on "two copies disagreed"
+      // by signature, even when retry papers over the symptom.
+      //
+      // RATCHET, not zero-tolerance-yet. The current base has ONE known CI-debt
+      // class: the presence/containment PROJECTION cells (`subscribers`,
+      // `session_subscribers`, `contents`) still sit on the commit-validation
+      // path, so a cross-room turn can plan them stale and get rejected (e.g.
+      // `the_outline:leave` rejecting on `the_chatroom.subscribers`). Step A4
+      // (contents/presence-as-projection, off the validation path) RETIRES this
+      // class; when A4 lands, KNOWN_CI_DEBT_CELLS empties and this becomes
+      // zero-tolerance. Until then the gate fails on ANY OTHER diverged cell — a
+      // real authoritative cell (a property value, lineage, location), a
+      // post_state_mismatch, or an incomplete_transcript — so it cannot be used
+      // to launder NEW multiplication. The allow-list MUST only ever shrink.
+      const KNOWN_CI_DEBT_CELLS = new Set<string>([
+        "subscribers",
+        "session_subscribers",
+        "contents"
+      ]);
+      const allDiagnostics = logSpy.mock.calls
+        .map((args) => args.map((arg) => (typeof arg === "string" ? arg : JSON.stringify(arg))).join(" "));
+      // Pull every diverged `<object>.<cell>` from read-version/value-mismatch
+      // lines; classify post_state_mismatch / incomplete_transcript as
+      // never-excusable (they imply a second writer, not a stale projection).
+      const ciOffenders: string[] = [];
+      for (const line of allDiagnostics) {
+        if (line.includes("post_state_mismatch") || line.includes("incomplete_transcript")) {
+          ciOffenders.push(line.slice(0, 400));
+          continue;
+        }
+        const cellMatches = line.matchAll(/read (?:version|value) mismatch ([^.\s]+)\.([A-Za-z0-9_]+)/g);
+        for (const m of cellMatches) {
+          const cell = m[2];
+          if (!KNOWN_CI_DEBT_CELLS.has(cell)) ciOffenders.push(`${m[1]}.${cell} :: ${line.slice(0, 240)}`);
+        }
+      }
+      expect(
+        ciOffenders.length,
+        `coherence-invariant violation during cross-shard walkthrough (VTN0): a derived view of a cell NOT in the known A4 projection-debt allow-list diverged from committed authority. ` +
+        `This is new multiplication and must be fixed, not allow-listed. First offenders:\n${ciOffenders.slice(0, 3).join("\n")}`
+      ).toBe(0);
     } finally {
       await Promise.allSettled([alice?.close(), bob?.close()]);
       warnSpy.mockRestore();

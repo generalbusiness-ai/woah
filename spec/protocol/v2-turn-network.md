@@ -34,6 +34,76 @@ old local names at module boundaries while the code is being renamed.
 
 ---
 
+## VTN0. Target architecture and the coherence invariant
+
+This section is normative and governs the others. It names the architecture v2
+is built toward and the single invariant every other section preserves.
+
+**Target: a gossip-routed, actor-local mobile object heap.** The slogan is
+*deterministic VM turns over a mobile, actor-local object heap.* The five
+load-bearing claims:
+
+1. **Authority is the ordered effect-transcript stream, not an object's
+   location.** A committed turn produces an effect transcript (call identity,
+   logical inputs, versioned read set, write set, observations, result,
+   before/after hashes). All durable state is a deterministic function of that
+   stream. Object placement carries no semantic meaning; the system MAY move,
+   copy, evict, split, or merge materialized state freely without changing
+   object identity or user-visible behavior.
+2. **The VM turn is the unit of atomicity** — not the object, not the user task.
+   A turn commits or rolls back as a whole; it is never half-local, half-remote.
+   A state miss is a pre-execution failure: abort before committing, acquire
+   state, retry the whole turn.
+3. **The commit scope is chosen by the turn's write set**, not by a fixed home
+   host. It is the smallest ordering authority that makes this turn's writes
+   atomic, with epoch fencing and explicit rules for multi-scope turns.
+4. **Routing is capability gossip, not a location oracle.** Nodes advertise
+   executable capability (`covers`/`accepts` over typed atoms, an opaque
+   `factor`, scope/epoch/head, TTL); the actor node matches a `TurnKey` and ranks
+   candidates. Ads route work; they never prove authority.
+5. **Remote execution returns state as verifiable cache-fill.** A reply carries
+   the transcript plus content-addressed, receiver-authorization-filtered state
+   transfer. State transfer never grants write authority.
+
+**The coherence invariant (CI) — the one rule that makes the above safe.**
+
+> For every durable cell there is **exactly one authority** (the committing
+> commit-scope head). Every other materialization of that cell — execution
+> cache, projection row, edge mirror, browser holder — is a **derived
+> projection**: content-addressed, carrying explicit `source` provenance, and a
+> pure read-through of the transcript stream at a known `source_head`. No two
+> copies of a cell may be mutated by independent write paths. A derived copy is
+> never used as a write-authority source.
+
+A mobile heap has *many* materializations by design; the CI is what keeps them
+from disagreeing. Every recurring v2 defect to date — per-turn authority
+reconstruction storms, checkpoint staleness, movement `read_version_mismatch`,
+peer-not-seeing-observation — is a CI violation: two copies of one cell mutated
+independently, or a cache hint read as authority. Sections below MUST NOT
+introduce a mechanism that creates a second write path to a cell or that lets a
+non-`authoritative` projection satisfy a plan/commit read.
+
+**Current deployment is a partial realization, not the target.** The shipped
+profile (Cloudflare DO-per-scope authority + sparse MCP gateway shards as
+read-through caches) realizes claims 1–2 and a fixed-assignment special case of
+claim 3, with a static route table standing in for claim 4's gossip and bounded
+transfer modes for claim 5. The mobility of claims 3–5 (write-set-chosen scopes,
+capability gossip, multi-executor placement, the full transfer-mode set) is the
+remaining work. The distinguishing bet of the target is that **execution
+locality is discovered and may migrate**; the current deployment assigns and
+fixes it. Implementation proceeds by strengthening the CI first (so the many
+copies cannot disagree) and then generalizing assignment into mobility. Code or
+spec that hardens fixed assignment in a way that blocks later mobility is a
+regression against this section.
+
+**Conformance.** The CI is machine-checkable on the multi-node test topology: a
+post-turn assertion that every node's derived view of a touched cell equals the
+committed authority at the same head (see the authority/cache gate in
+`tests/worker/`). No change to the authority, cache, fanout, or routing paths is
+conformant unless that gate is green.
+
+---
+
 ## VTN1. Scope and compatibility
 
 The v2 protocol defines node-to-node and browser-node-to-relay messages for a

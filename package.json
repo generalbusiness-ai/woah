@@ -31,6 +31,7 @@
     "smoke:walkthrough": "tsx scripts/smoke-walkthrough.ts",
     "smoke:walkthrough:tail": "scripts/smoke-with-tail.sh",
     "smoke:cf-local": "vitest run --reporter=dot tests/worker/cf-local-walkthrough.test.ts",
+    "gate:authority": "vitest run --reporter=dot tests/worker/cf-local-walkthrough.test.ts",
     "smoke:analyze-tail": "node scripts/analyze-smoke-tail.mjs",
     "smoke:mcp": "vitest run tests/smoke/v2-mcp-smoke.test.ts --reporter=dot",
     "smoke:mcp:stdio": "tsx scripts/smoke-mcp-stdio.ts",
