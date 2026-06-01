@@ -27,12 +27,14 @@ import {
 } from "../core/shadow-browser-node";
 import type { ShadowTurnCall } from "../core/shadow-turn-call";
 import {
+  applyAcceptedProjectionToCommitScopeCache,
   applyAcceptedShadowFrame,
   applyShadowTranscriptToCommitScopeCache,
   serializedFor,
   type ShadowCommitAccepted,
   type ShadowScopeHead
 } from "../core/shadow-commit-scope";
+import { affectedTranscriptScopes } from "../core/v2-fanout-projection";
 import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import {
   V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED,
@@ -419,7 +421,7 @@ export class McpGateway {
     } else {
       this.world.applyCommittedShadowTranscript(entry.transcript);
     }
-    this.propagateTranscriptToOtherScopes(entry.commit.position.scope, entry.transcript);
+    this.propagateTranscriptToOtherScopes(entry.commit.position.scope, entry.commit, entry.transcript);
     if (!entry.routed) this.routeRemoteAcceptedFrame(entry);
   }
 
@@ -907,7 +909,7 @@ export class McpGateway {
         ? { skipObjectHost: { hostKey: localHostMaterialized.hostKey, gatewayHost: localHostMaterialized.gatewayHost === true } }
         : {});
     }
-    this.propagateTranscriptToOtherScopes(reply.commit.position.scope, reply.transcript);
+    this.propagateTranscriptToOtherScopes(reply.commit.position.scope, reply.commit, reply.transcript);
     this.host.routeShadowAcceptedFrame(reply.commit, originSessionId, reply.transcript, audience);
   }
 
@@ -920,10 +922,39 @@ export class McpGateway {
   // the deck client's snapshot but the chatroom client's snapshot still has
   // actor.location=the_deck, and the very next actor verb routed to the
   // chatroom scope reads the stale location.
-  private propagateTranscriptToOtherScopes(originScope: ObjRef, transcript: EffectTranscript): void {
+  // An accepted commit under `originScope` can affect objects/actors that a
+  // DIFFERENT open relay plans against — most importantly a cross-scope MOVE,
+  // which commits under the moved object's own scope but changes the source and
+  // destination rooms' membership and the moved actor's row. Those other relays
+  // must learn the authoritative rows from the accepted transcript stream, or a
+  // live read (e.g. `who`) planning against a stale relay snapshot renders the
+  // moved actor with no materialized name/lineage. This is derived materialization
+  // from the accepted stream (VTN0) — NOT a head advance and NOT a second
+  // authority: the target relay's head belongs to its own commit sequence, so we
+  // apply projection rows + movement projection WITHOUT touching head.
+  //
+  // Bounded to the transcript's affected scopes (move from/to, creates with a
+  // location, contents/presence writes); we do not touch every open relay.
+  private propagateTranscriptToOtherScopes(
+    originScope: ObjRef,
+    accepted: ShadowCommitAccepted,
+    transcript: EffectTranscript
+  ): void {
+    const affected = new Set(affectedTranscriptScopes(
+      originScope,
+      transcript,
+      (object, property) => this.world.isPresenceProjectionProperty(object, property)
+    ));
     for (const [scope, client] of this.v2Scopes) {
       if (scope === originScope) continue;
-      applyShadowTranscriptToCommitScopeCache(client.relay.commit_scope, transcript);
+      if (!affected.has(scope)) continue;
+      // Materialize the accepted authority rows + movement projection (carries the
+      // moved actor's real lineage/name) without advancing this relay's head. If
+      // the frame carried no authority rows (receiver-profiled, display-only),
+      // fall back to transcript replay, as before.
+      if (!applyAcceptedProjectionToCommitScopeCache(client.relay.commit_scope, accepted, transcript)) {
+        applyShadowTranscriptToCommitScopeCache(client.relay.commit_scope, transcript);
+      }
       markShadowBrowserRelaySerializedChanged(client.relay);
     }
   }

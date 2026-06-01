@@ -841,6 +841,31 @@ function isAuthorityToolSurfaceRow(value: unknown): boolean {
   return isRecord(value) && value.kind === "woo.tool_surface_projection.v1";
 }
 
+// Materialize an accepted commit's row-body-complete projection writes (and its
+// movement projection) into a relay's commit-scope cache WITHOUT advancing that
+// cache's head. This is the cross-scope-fanout companion to applyAcceptedShadowFrame:
+// when a commit accepted under scope S affects an actor/object that a DIFFERENT
+// open relay (scope T) plans against, T must learn the authoritative row from the
+// accepted transcript stream — but T's head belongs to T's own commit sequence,
+// not S's, so it MUST NOT advance. This is derived materialization from the
+// accepted stream (VTN0), not a second authority and not a head move. Browser-
+// profiled (non-authority) projection rows are display-only and are skipped here;
+// the affected relay will replay the transcript through the normal path if needed.
+// Returns true if it materialized authority rows (the caller then skips transcript
+// replay); false if the accepted frame carried no authority rows (the caller
+// should replay the transcript for display-only state).
+export function applyAcceptedProjectionToCommitScopeCache(
+  scope: ShadowCommitScope,
+  accepted: ShadowCommitAccepted,
+  transcript: EffectTranscript
+): boolean {
+  const projectionWrites = accepted.projection_writes ?? [];
+  if (projectionWrites.length === 0 || !projectionWritesAreAuthorityRows(projectionWrites)) return false;
+  applyProjectionWritesToCommitScopeCache(scope, projectionWrites);
+  applyMovementProjectionToCommitScopeCache(scope, transcript);
+  return true;
+}
+
 function applyProjectionWritesToCommitScopeCache(scope: ShadowCommitScope, writes: ProjectionWrite[]): void {
   const next = cloneShadowCommitScopeState(ensureShadowCommitScopeState(scope));
   applyProjectionWritesToCommitScopeState(next, writes);

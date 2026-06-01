@@ -142,3 +142,59 @@ test:worker, then gate:authority.
 
 ### Status correction
 A5 IS committed (2ded457) — earlier note text saying "A5 uncommitted" is stale.
+
+## Update (2026-06-01, fourth pass — option (a) implemented; upstream delivery gap found)
+
+Implemented option (a) per direction: accepted frames now materialize their
+row-body-complete projection_writes + movement projection into AFFECTED open relay
+caches WITHOUT advancing those relays' heads.
+- New `applyAcceptedProjectionToCommitScopeCache(scope, accepted, transcript)` in
+  shadow-commit-scope.ts (returns true if it applied authority rows; no head move).
+- `McpGateway.propagateTranscriptToOtherScopes` now takes the accepted commit,
+  bounds targets to `affectedTranscriptScopes(...)` (move from/to, creates,
+  contents/presence), and applies projection rows via the new helper (falling
+  back to transcript replay only when the frame carries no authority rows).
+- Both callers (applyRemoteAccepted, handleAcceptedReply) pass the accepted commit.
+- Kept the existing this.world projection apply; this is the relay-cache companion.
+
+Gates with option (a): typecheck 0, npm test 260, gate:authority green. It breaks
+nothing. But it does NOT move the cf-repository cross-scope `who` test, and probes
+show why: the propagation never runs for that test.
+
+### Evidence map (console.log probes, focused cf-repository test) — paths ELIMINATED
+All of these recorded **0 calls** during the failing `who` test:
+1. `gatewayProjectionObjectRows` (3rd-pass read-through) — 0.
+2. `v2GatewayAuthorityPayload` — 0. (so the stale name is NOT via the authority
+   slice / Directory-session slice path the earlier direction targeted.)
+3. `McpGateway.propagateTranscriptToOtherScopes` (option a, gateway relays) — 0.
+4. `McpGateway.acceptRemoteV2Commit` — 0.
+5. worker `/__internal/mcp-commit-fanout` handler (persistent-object-do.ts:3124) — 0.
+
+### The real upstream gap (next pass starts HERE)
+The test's WOO namespace stub (cf-repository.test.ts ~2905) records every
+`/__internal/mcp-commit-fanout` request (fanoutHosts/fanoutRequests) AND delegates
+to the real `object.fetch`. The test asserts `fanoutHosts` contains aliceShard, so
+the move's commit fanout IS sent to Alice's shard. Yet the receiving DO's
+`/__internal/mcp-commit-fanout` handler logs 0 calls. So between "fanout request
+recorded by the stub" and "handler 3124 executes on the receiver" the request is
+not reaching the handler (candidate causes to probe next, in order):
+  - internal-auth rejection of the signed fanout request on the receiver,
+  - the move commit fanout being sent but the receiver routing it elsewhere
+    (different pathname / method), or
+  - the assertion's aliceShard fanout being an EARLIER non-move fanout, with the
+    move's commit fanout never selecting aliceShard as a target (audience vs
+    affected-scope selection in deliverMcpCommitFanout:5353 —
+    `audienceShardSet.size > 0 ? [] : mcpShardHostsForScopes(affectedScopes)`:
+    when an audience exists it fans out ONLY to audience shards and SKIPS the
+    affected room shards; if Alice is not in the move-observation audience, her
+    destination-room shard never gets the move commit).
+The last bullet is the leading hypothesis: probe deliverMcpCommitFanout's `hosts`
+set for the move commit and confirm whether aliceShard is included.
+
+### Decision
+Option (a) is correct, on-design, and gate-clean, so it is COMMITTED (flagged)
+rather than reverted — it is the consumer half and will be needed once the
+upstream delivery reaches the receiver. The cf-repository test remains red pending
+the upstream fanout-target/delivery fix. This is the same "necessary but not
+sufficient" situation as the producer fix: two correct halves, one upstream
+delivery gap still open.
