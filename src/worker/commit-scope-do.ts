@@ -8,7 +8,7 @@
 
 import type { EffectTranscript } from "../core/effect-transcript";
 import type { ShadowCapabilityAd } from "../core/capability-ad";
-import { mergeSerializedAuthoritySlice, pruneSerializedSessionsWithoutActorRows, serializedWorldFromAuthoritySlice } from "../core/authority-slice";
+import { cellProvenanceFromAuthoritySlice, mergeSerializedAuthoritySlice, pruneSerializedSessionsWithoutActorRows, serializedWorldFromAuthoritySlice } from "../core/authority-slice";
 import { createWorldFromSerialized } from "../core/bootstrap";
 import { localCatalogBundleFingerprint, parseAutoInstallCatalogs, runHostScopedLocalCatalogLifecycle } from "../core/local-catalogs";
 import type { SerializedAuthoritySlice, SerializedObject, SerializedSession, SerializedWorld } from "../core/repository";
@@ -557,6 +557,17 @@ export class CommitScopeDO {
       scope: input.scope,
       serialized
     });
+    // A3.2 provenance retrofit: the relay is seeded directly from the serialized
+    // world (bypassing the provenance-recording merge), so capture per-cell
+    // provenance from the seed authority slice. Without this, a seeded identity
+    // stub (e.g. a cross-host `cache` `name=id` row) has unknown provenance,
+    // defaults to authoritative-protected, and refuses a later fresh `projection`
+    // repair — the cross-scope `who` defect. A direct `serialized` seed (no
+    // authority slice) yields an empty map; those cells stay conservatively
+    // protected, matching prior behavior.
+    if (input.authority) {
+      relay.commit_scope.cellProvenance = cellProvenanceFromAuthoritySlice(input.authority);
+    }
     this.relay = relay;
     this.needsFullSave = true;
     return relay;

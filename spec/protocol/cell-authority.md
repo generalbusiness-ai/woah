@@ -444,6 +444,23 @@ planning cache, not a new authority source:
   non-authoritative source (e.g. `fallback`) rather than fabricate
   `authoritative`; the page can still fill a planning gap but is never trusted
   as write-authority.
+- Authority-slice combination and merge MUST resolve a per-cell contest by
+  provenance precedence, NOT by slice arrival order: rank
+  `authoritative > projection > cache > fallback > gossip`. An authoritative cell
+  is never displaced by a derived page; among equal-rank derived pages a later
+  (fresher) contribution wins. Additionally, a **presentation stub** — an
+  `object_lineage` page whose `name` equals its object id — is never admissible as
+  planning identity for a real object: it MUST NOT win a contest against a named
+  page of equal rank, and a named lineage page (any source) MUST repair a current
+  `name===id` cell whose recorded provenance is not `authoritative`, even when that
+  cell entered the planning world via a non-provenance-recording seed (its
+  provenance is then unknown and treated as repairable, not as protected
+  authority). This is the combine/merge expression of "a derived copy is never a
+  write-authority source" (CA2/VTN0) and of the PlanningWorld admission rule
+  (presentation stubs are inadmissible). A planning materialization that seeds a
+  relay/commit-scope world directly from a serialized snapshot MUST capture the
+  per-cell provenance of that seed's authority slice, so a seeded stub does not
+  default to protected-authority and block its own repair.
 - Implementations MUST bound checkpoint count by memory policy, for example an
   LRU cap. A gateway must never accumulate one full slice per scope forever.
 

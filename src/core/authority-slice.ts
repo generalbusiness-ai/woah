@@ -76,6 +76,34 @@ function authorityPageMayReplaceCurrent(
   return AUTHORITY_SOURCE_RANK[incoming] >= AUTHORITY_SOURCE_RANK[currentSource];
 }
 
+// Is this page_ref an `object_lineage` whose resolved name equals its object id —
+// i.e. a presentation stub rather than a real identity? Resolved via the inline
+// page (the ref itself carries no name for lineage cells). A page absent from the
+// inline map (a remote ref) cannot be proven a stub, so it is treated as named.
+function pageRefIsStubLineage(ref: AuthorityPageRef, inlineByHash: ReadonlyMap<string, ShadowStatePage>): boolean {
+  if (ref.page !== "object_lineage") return false;
+  const page = inlineByHash.get(ref.hash);
+  return page?.page === "object_lineage" && page.name === ref.object;
+}
+
+// Precedence for combining two page_refs for the same cell key. Higher provenance
+// rank always wins (authoritative never displaced by a derived page). Among equal
+// rank, a presentation stub never displaces a named lineage page; otherwise the
+// later (candidate) slice wins, preserving slice order as the freshness signal.
+function pageRefShouldReplace(
+  existing: AuthorityPageRef,
+  candidate: AuthorityPageRef,
+  inlineByHash: ReadonlyMap<string, ShadowStatePage>
+): boolean {
+  const existingRank = AUTHORITY_SOURCE_RANK[existing.source];
+  const candidateRank = AUTHORITY_SOURCE_RANK[candidate.source];
+  if (candidateRank !== existingRank) return candidateRank > existingRank;
+  const existingStub = pageRefIsStubLineage(existing, inlineByHash);
+  const candidateStub = pageRefIsStubLineage(candidate, inlineByHash);
+  if (existingStub !== candidateStub) return existingStub; // keep the named page; replace only if the existing one is the stub
+  return true;
+}
+
 function recordCellProvenanceIfStronger(
   map: Map<string, AuthorityPageProvenance>,
   key: string,
@@ -228,6 +256,23 @@ export function combineSerializedAuthoritySlices(
   const tombstones = new Set<ObjRef>();
   let sourceObjectCount = 0;
 
+  // Choose the winning page_ref per cell key by provenance, not raw slice order.
+  // An authoritative page is never displaced by a derived one; among equal-rank
+  // derived pages a later slice wins (slice order still encodes freshness), EXCEPT
+  // that a presentation stub (`object_lineage` whose name === object id) never
+  // displaces a named page of the same rank. This makes the combine consistent
+  // with the merge-primitive precedence (mergeAuthorityCellPages) and the
+  // PlanningWorld admission rules: a stale `name=id` lineage page can no longer
+  // win admission over the fresh named/authoritative row purely because it was
+  // ordered last (the cross-scope `who` "layer 3" defect — see
+  // notes/2026-06-01-planning-world-admission.md).
+  const considerPageRef = (ref: AuthorityPageRef): void => {
+    const key = authorityPageRefKey(ref);
+    const existing = lastPageByKey.get(key);
+    if (existing && !pageRefShouldReplace(existing, ref, inlineByHash)) return;
+    lastPageByKey.set(key, ref);
+  };
+
   for (const slice of slices) {
     if (isAuthorityCellSlice(slice)) {
       counters = {
@@ -237,29 +282,27 @@ export function combineSerializedAuthoritySlices(
       };
       for (const id of slice.tombstones) tombstones.add(id);
       sourceObjectCount += slice.source_object_count;
+      // Inline pages must be present before ref precedence runs: the stub tiebreak
+      // resolves a ref to its inline page by hash to read the lineage name.
       for (const page of slice.inline_pages) inlineByHash.set(shadowStatePageHash(page), structuredClone(page) as ShadowStatePage);
-      for (const ref of slice.page_refs) lastPageByKey.set(authorityPageRefKey(ref), structuredClone(ref) as AuthorityPageRef);
+      for (const ref of slice.page_refs) considerPageRef(structuredClone(ref) as AuthorityPageRef);
       continue;
     }
     if (emitCellSlice) {
-      // Preserve slice precedence across both legacy object slices and cell-page
-      // slices. Deferring legacy objects until after all cell slices makes stale
-      // local rows override fresher remote rows solely because of representation.
-      //
       // A3: a legacy object slice carries no per-page provenance, and this
       // representation bridge cannot verify the rows are an owner's current
       // authoritative state — it has no owning host in hand. We therefore stamp
       // the converted pages "fallback": they MAY fill a planning gap, but the
-      // gateway/VM read path MUST NOT treat them as a write-authority source. A
-      // fresher "authoritative" cell page for the same key still wins by slice
-      // order, exactly as before.
+      // gateway/VM read path MUST NOT treat them as a write-authority source.
+      // Under provenance-ranked precedence a fresher authoritative/projection page
+      // for the same key wins regardless of slice order.
       for (const obj of slice.objects) {
         const pages = shadowStatePagesForObject(obj);
         sourceObjectCount += 1;
         for (const page of pages) {
           const ref = stampAuthorityPageRef(page, true, LEGACY_OBJECT_SLICE_PROVENANCE);
           inlineByHash.set(ref.hash, structuredClone(page) as ShadowStatePage);
-          lastPageByKey.set(authorityPageRefKey(ref), ref);
+          considerPageRef(ref);
         }
       }
       continue;
@@ -434,7 +477,9 @@ function mergeAuthorityCellPages(
   if (authority.page_refs.length === 0) return false;
   const incomingByHash = new Map(authority.inline_pages.map((page) => [shadowStatePageHash(page), page] as const));
   const currentPages = new Map<string, { hash: string; page: ShadowStatePage }>();
+  const objectsById = new Map<ObjRef, SerializedObject>();
   for (const obj of serialized.objects) {
+    objectsById.set(obj.id, obj);
     for (const page of shadowStatePagesForObject(obj)) currentPages.set(authorityPageKey(page), { hash: shadowStatePageHash(page), page });
   }
 
@@ -462,9 +507,25 @@ function mergeAuthorityCellPages(
     // copy is never a write-authority source" (VTN0) stays a property of the merge
     // primitive, inherited by every caller (gateway, REST, browser, checkpoint).
     if (current) {
-      const mayReplace = tracked
+      let mayReplace = tracked
         ? authorityPageMayReplaceCurrent(ref.source, cellProvenance!.get(key))
         : ref.source === "authoritative";
+      // Stub repair: a `name===id` presentation stub whose recorded provenance is
+      // not authoritative is never legitimate identity for a real object; a NAMED
+      // lineage page (any source) repairs it. This closes the case where a stub
+      // entered the planning world via a non-provenance-recording seed (so its
+      // provenance is unknown and would otherwise default to authoritative-protected)
+      // — the same admission rule the PlanningWorld gate enforces, applied in the
+      // merge so the VM never plans against the id-as-name stub.
+      if (!mayReplace && tracked && ref.page === "object_lineage") {
+        const curObj = objectsById.get(ref.object);
+        const incomingPage = incomingByHash.get(ref.hash);
+        const incomingNamed = incomingPage?.page === "object_lineage" && incomingPage.name !== ref.object;
+        const currentAuthoritative = cellProvenance!.get(key)?.source === "authoritative";
+        if (curObj && curObj.name === ref.object && incomingNamed && !currentAuthoritative) {
+          mayReplace = true;
+        }
+      }
       if (!mayReplace) continue;
     }
     const incoming = incomingByHash.get(ref.hash);

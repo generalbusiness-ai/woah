@@ -78,9 +78,9 @@ export type PlanningAdmissibilityOptions = {
 };
 
 // Is this object's lineage a presentation stub — `name === id` — rather than a
-// real identity? Bootstrap/support objects legitimately have `name === id`
-// (e.g. "$player"), so this predicate is only a *signal*; the gate treats it as a
-// violation solely when the cell's provenance is not authoritative.
+// real identity? Some bootstrap/support objects legitimately have `name === id`
+// (their seeded name is their id), so this predicate is only a *signal*; the gate
+// treats it as a violation solely when the cell's provenance is not authoritative.
 function isStubLineage(obj: SerializedObject): boolean {
   return obj.name === obj.id;
 }

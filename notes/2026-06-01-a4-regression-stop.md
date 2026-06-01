@@ -378,3 +378,37 @@ State on worktree (uncommitted): layer-1 retrofit (authority-slice.ts, executor.
 shadow-commit-scope.ts, mcp/gateway.ts, worker/commit-scope-do.ts) + layer-2
 (directory-do.ts). All probes reverted. Needs a layer-3 decision before the test
 can pass; then test:worker + gate:authority + provenance unit tests + spec.
+
+## Update (2026-06-01, eighth pass — RESOLVED; cross-scope `who` green, gates green)
+
+The cf-repository cross-scope `who` test PASSES (63/63). Full fix = the provenance
+architecture across all three layers + two plumbing fixes the trace exposed:
+
+1. Layer 1 — `mergeAuthorityCellPages` provenance precedence (cellProvenance on
+   ShadowCommitScope; authoritative never displaced; non-auth replaces non-auth by rank).
+2. Layer 2 — Directory `registerSession` preserves a non-null `display_name` across
+   a sparse-shard null update.
+3. Layer 3 — `combineSerializedAuthoritySlices` now resolves per-cell contests by
+   provenance RANK (not slice order), with a presentation-stub tiebreak: a named
+   lineage page beats an equal-rank `name=id` stub.
+4. Seed provenance capture — the CommitScopeDO relay is seeded directly via
+   `createShadowBrowserRelayShim` (bypassing the recording merge); `initializeRelay`
+   now captures `cellProvenance` from the seed authority slice, so a seeded
+   `name=id` cache stub records `cache` (repairable) instead of defaulting to
+   protected-authority.
+5. Stub-repair clause — in `mergeAuthorityCellPages`, a NAMED `object_lineage` page
+   repairs a current `name===id` stub whose recorded provenance is not authoritative
+   (covers the unknown-provenance seed case). This is the merge-side form of the
+   PlanningWorld admission rule.
+
+Gates: typecheck 0 · `npm test` 267/267 (planning-world.test.ts added to the curated
+list) · `tests/worker/cf-repository.test.ts` 63/63 · `npm run test:worker` 202 passed
+/5 skipped · `gate:authority` 2/2. Spec CA11 updated with the provenance-precedence +
+stub-inadmissibility + seed-capture rules.
+
+Architecture status: P1 (admission gate module + invariant tests) committed; P2's
+behavioral core (provenance-ranked combine/merge, seed capture, stub repair) done and
+green. Remaining (P3 brand-enforce the VM boundary + miss-is-default escape-hatch
+removal; P4 flip `assertPlanningWorldAdmissible` to hard-fail + wire into CI + full
+spec/VTN0 alignment) tracked as follow-up tasks — they harden the invariant but are
+not required for the regression fix, which is complete and gated.
