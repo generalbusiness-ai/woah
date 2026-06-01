@@ -218,13 +218,6 @@ type RestV2RelayClient = {
   nextTurn: number;
 };
 
-type AuthorityCheckpoint = {
-  source: "cache";
-  authority: SerializedAuthoritySlice;
-  appliedSeq: number;
-  coveredObjectIds: Set<ObjRef>;
-};
-
 type AuthorityReconstructionReason = "warm_turn_refresh" | "cold_open" | "missing_state_repair";
 
 type V2LocalHostMaterialization = {
@@ -310,8 +303,6 @@ export const MCP_GATEWAY_ACTOR_SUPPORT_ROOTS: readonly ObjRef[] = ["$actor", "$t
 const DEFAULT_TOOL_SURFACE_SOURCE_INDEX_MAX_SCOPE_ROWS = 10_000;
 const DEFAULT_TOOL_SURFACE_SOURCE_INDEX_MAX_SHARD_ROWS = 40_000;
 const MAX_REST_V2_RELAY_CLIENTS = 64;
-const MAX_AUTHORITY_CHECKPOINTS = 64;
-const MAX_AUTHORITY_CHECKPOINT_OBJECTS = 256;
 const DIRECTORY_HOST = "directory";
 const INTERNAL_ORIGIN = "https://woo.internal";
 const MAX_JSON_BODY_BYTES = 1 * 1024 * 1024;
@@ -464,7 +455,6 @@ export class PersistentObjectDO {
   private repo: CFObjectRepository;
   private world: WooWorld | null = null;
   private routeCache = new Map<ObjRef, string>();
-  private authorityCheckpoints = new Map<ObjRef, AuthorityCheckpoint>();
   private localRouteSnapshot: {
     hostKey: string;
     version: number;
@@ -796,7 +786,6 @@ export class PersistentObjectDO {
         }
       }
     });
-    this.updateAuthorityCheckpointsFromProjectionWrites(position, writes);
     this.emitMetric({
       kind: "gateway_projection_cache_write",
       scope: authorityScope,
@@ -808,51 +797,6 @@ export class PersistentObjectDO {
       source
     }, this.durableHostKey());
     return { rows, bytes };
-  }
-
-  private updateAuthorityCheckpointsFromProjectionWrites(position: ShadowScopeHead, writes: readonly ProjectionWrite[]): void {
-    const touchedObjects = new Set<ObjRef>();
-    const touchedSessions = new Set<string>();
-    for (const write of writes) {
-      if (write.table === "objects") touchedObjects.add(write.key);
-      if (write.table === "sessions") touchedSessions.add(write.key);
-    }
-    if (touchedObjects.size === 0 && touchedSessions.size === 0) return;
-    for (const [scope, checkpoint] of Array.from(this.authorityCheckpoints)) {
-      const checkpointSessionIds = new Set(checkpoint.authority.sessions.map((session) => session.id));
-      const touchesCheckpoint = Array.from(touchedObjects).some((id) => checkpoint.coveredObjectIds.has(id)) ||
-        Array.from(touchedSessions).some((id) => checkpointSessionIds.has(id));
-      if (!touchesCheckpoint) continue;
-      if (scope !== position.scope) {
-        this.authorityCheckpoints.delete(scope);
-        continue;
-      }
-      if (position.seq <= checkpoint.appliedSeq) continue;
-      const serialized = serializedWorldFromAuthoritySlice(checkpoint.authority);
-      for (const write of writes) {
-        if (write.table === "objects") {
-          serialized.objects = write.op === "delete"
-            ? serialized.objects.filter((obj) => obj.id !== write.key)
-            : [...serialized.objects.filter((obj) => obj.id !== write.key), structuredClone(write.row) as SerializedObject];
-        } else if (write.table === "sessions") {
-          serialized.sessions = write.op === "delete"
-            ? serialized.sessions.filter((session) => session.id !== write.key)
-            : [...serialized.sessions.filter((session) => session.id !== write.key), structuredClone(write.row) as SerializedSession];
-        }
-      }
-      serialized.objects.sort((a, b) => a.id.localeCompare(b.id));
-      serialized.sessions.sort((a, b) => a.id.localeCompare(b.id));
-      const authority = this.checkpointSliceFromSerialized(serialized);
-      if (!this.storeAuthorityCheckpoint(scope, authority, position.seq)) continue;
-      this.emitMetric({
-        kind: "authority_slice_reconstructed",
-        reason: "warm_checkpoint_caught_up",
-        scope,
-        object_count: authoritySliceObjectIds(authority).size,
-        page_count: authoritySlicePageCount(authority),
-        source_host: this.durableHostKey()
-      }, this.durableHostKey());
-    }
   }
 
   private requireProjectionWritesComplete(
@@ -1597,8 +1541,7 @@ export class PersistentObjectDO {
                 !isMcpGatewayShardHost(this.durableHostKey()),
               directorySessionScopes: authorityOptions?.directorySessionScopes,
               reconstructionReason: authorityOptions?.reconstructionReason,
-              reconstructionScope: authorityOptions?.reconstructionScope,
-              checkpointHead: authorityOptions?.checkpointHead
+              reconstructionScope: authorityOptions?.reconstructionScope
             }),
           executionCapsuleOpen: envFlag(this.env.WOO_V2_EXECUTION_CAPSULE)
         },
@@ -4466,28 +4409,12 @@ export class PersistentObjectDO {
     return { serialized, authority };
   }
 
-  private authorityCheckpointLookup(scope: ObjRef, ids: readonly ObjRef[]): { checkpoint: AuthorityCheckpoint; missingIds: ObjRef[] } | null {
-    const checkpoint = this.authorityCheckpoints.get(scope);
-    if (!checkpoint) return null;
-    const missingIds = ids.filter((id) => !checkpoint.coveredObjectIds.has(id));
-    this.authorityCheckpoints.delete(scope);
-    this.authorityCheckpoints.set(scope, checkpoint);
-    return {
-      checkpoint: {
-        ...checkpoint,
-        authority: structuredClone(checkpoint.authority) as SerializedAuthoritySlice,
-        coveredObjectIds: new Set(checkpoint.coveredObjectIds)
-      },
-      missingIds
-    };
-  }
-
   private authorityPayloadFromCachedAuthority(
     world: WooWorld,
     reconstructionScope: ObjRef,
     authority: SerializedAuthoritySlice,
     directoryScopeSessions: readonly DirectorySerializedSession[],
-    reason: AuthorityReconstructionReason | "warm_checkpoint_hit" | "warm_checkpoint_repaired" | "warm_checkpoint_seeded"
+    reason: AuthorityReconstructionReason
   ): ExecutorAuthorityPayload {
     const sessionActors = new Set<ObjRef>(
       authority.sessions
@@ -4526,47 +4453,6 @@ export class PersistentObjectDO {
       session_objects: [],
       authority: filteredAuthority
     };
-  }
-
-  private storeAuthorityCheckpoint(scope: ObjRef, authority: SerializedAuthoritySlice, appliedSeq: number): boolean {
-    const cachedAuthority = withAuthorityPageProvenance(authority, () => ({ source: "cache", source_host: this.durableHostKey() }));
-    const coveredObjectIds = authoritySliceObjectIds(cachedAuthority);
-    if (coveredObjectIds.size > MAX_AUTHORITY_CHECKPOINT_OBJECTS) {
-      this.authorityCheckpoints.delete(scope);
-      return false;
-    }
-    this.authorityCheckpoints.delete(scope);
-    this.authorityCheckpoints.set(scope, {
-      source: "cache",
-      authority: structuredClone(cachedAuthority) as SerializedAuthoritySlice,
-      appliedSeq,
-      coveredObjectIds
-    });
-    while (this.authorityCheckpoints.size > MAX_AUTHORITY_CHECKPOINTS) {
-      const oldest = this.authorityCheckpoints.keys().next().value;
-      if (oldest === undefined) break;
-      this.authorityCheckpoints.delete(oldest);
-    }
-    return true;
-  }
-
-  private checkpointSliceFromSerialized(serialized: SerializedWorld): SerializedAuthoritySlice {
-    return buildSerializedAuthorityCellSlice({
-      sessions: serialized.sessions,
-      objects: serialized.objects,
-      counters: {
-        objectCounter: serialized.objectCounter,
-        parkedTaskCounter: serialized.parkedTaskCounter,
-        sessionCounter: serialized.sessionCounter
-      },
-      tombstones: serialized.tombstones ?? [],
-      pageProvenance: () => ({ source: "cache", source_host: this.durableHostKey() })
-    });
-  }
-
-  private authorityCheckpointAppliedSeq(scope: ObjRef, head: ShadowScopeHead | null | undefined): number | null {
-    if (head?.scope === scope) return head.seq;
-    return this.gatewayProjectionHeadSeq(scope);
   }
 
   private async filterRemoteAuthoritySliceForGateway(
@@ -4618,7 +4504,6 @@ export class PersistentObjectDO {
       directorySessionScopes?: readonly ObjRef[];
       reconstructionReason?: AuthorityReconstructionReason;
       reconstructionScope?: ObjRef;
-      checkpointHead?: ShadowScopeHead | null;
     } = {}
   ): Promise<ReturnType<typeof executorAuthorityPayload>> {
     // `tolerateRemoteFailures: true` allows the per-envelope refresh path to
@@ -4637,30 +4522,21 @@ export class PersistentObjectDO {
     const directoryScopeSessions = mcpGatewayShard && directorySessionScopes.length > 0
       ? await this.loadDirectorySessionsForScopes(directorySessionScopes)
       : [];
-    let checkpointLookup: { checkpoint: AuthorityCheckpoint; missingIds: ObjRef[] } | null = null;
-    if (reconstructionReason === "warm_turn_refresh") {
-      checkpointLookup = this.authorityCheckpointLookup(reconstructionScope, ids);
-      if (checkpointLookup && checkpointLookup.missingIds.length === 0) {
-        return this.authorityPayloadFromCachedAuthority(
-          world,
-          reconstructionScope,
-          checkpointLookup.checkpoint.authority,
-          directoryScopeSessions,
-          "warm_checkpoint_hit"
-        );
-      }
-    }
-    const repairIds = checkpointLookup ? checkpointLookup.missingIds : null;
-    const requestedIds = repairIds ?? ids;
+    // A5: the in-memory per-scope authority checkpoint is removed. A warm turn
+    // reconstructs from local rows + owner slices (the authoritative path); the
+    // durable gateway projection cache remains the cross-turn read model. The
+    // checkpoint was a second, divergent materialization of the projection cache
+    // (its own apply path was the CI hazard removed in applyGatewayProjectionWrites)
+    // and prod measurement showed it was not delivering warm hits. A read-through
+    // over the projection cache to restore warm-hit latency is a separate,
+    // deploy-measured step; correctness here rests on full reconstruction.
+    const requestedIds = ids;
     const localActorAuthorityRoots = localActorAuthorityRootIds(world, requestedIds, { sessionActorsOnly: mcpGatewayShard });
     const local = mcpGatewayShard
       ? mcpGatewayLocalAuthorityPayload(world, requestedIds, localActorAuthorityRoots)
       : executorAuthorityPayload(world, requestedIds);
     const localObjectIds = authoritySliceObjectIds(local.authority);
     const preservedObjectIds = new Set<ObjRef>(localObjectIds);
-    if (checkpointLookup) {
-      for (const id of authoritySliceObjectIds(checkpointLookup.checkpoint.authority)) preservedObjectIds.add(id);
-    }
     const routesById = isMcpGatewayShardHost(localHost)
       ? new Map<ObjRef, { id: ObjRef; host: string; anchor: ObjRef | null }>()
       : new Map(world.objectRoutes().map((route) => [route.id, route] as const));
@@ -4775,9 +4651,7 @@ export class PersistentObjectDO {
         }
       })));
     }
-    const slices: SerializedAuthoritySlice[] = checkpointLookup
-      ? [checkpointLookup.checkpoint.authority, local.authority]
-      : [local.authority];
+    const slices: SerializedAuthoritySlice[] = [local.authority];
     if (mcpGatewayShard && localActorAuthorityRoots.size > 0) {
       const actorCells = mcpGatewayLocalActorPropertyCellSlice(world, localActorAuthorityRoots, this.durableHostKey());
       if (actorCells.page_refs.length > 0) slices.push(actorCells);
@@ -4792,11 +4666,8 @@ export class PersistentObjectDO {
         resolveHost
       ));
     }
-    const baseSessions = checkpointLookup
-      ? mergeSerializedSessions(checkpointLookup.checkpoint.authority.sessions, local.authority.sessions)
-      : local.authority.sessions;
     const authority = combineSerializedAuthoritySlices(
-      baseSessions,
+      local.authority.sessions,
       slices
     );
     // Session rows are live authority too: if we ship a session whose actor row
@@ -4808,18 +4679,8 @@ export class PersistentObjectDO {
     const filteredAuthority: SerializedAuthoritySlice = authority.sessions.length === authoritySessions.length
       ? authority
       : { ...authority, sessions: authoritySessions };
-    const checkpointSeq = this.authorityCheckpointAppliedSeq(reconstructionScope, options.checkpointHead) ?? checkpointLookup?.checkpoint.appliedSeq ?? null;
-    let checkpointStored = false;
-    if (staleFallbackCount === 0 && checkpointSeq !== null) {
-      checkpointStored = this.storeAuthorityCheckpoint(reconstructionScope, filteredAuthority, checkpointSeq);
-    }
-    const reason = checkpointLookup && checkpointStored
-      ? "warm_checkpoint_repaired"
-      : !checkpointLookup && checkpointStored && reconstructionReason === "warm_turn_refresh"
-        ? "warm_checkpoint_seeded"
-        : reconstructionReason;
     return {
-      ...this.authorityPayloadFromCachedAuthority(world, reconstructionScope, filteredAuthority, directoryScopeSessions, reason),
+      ...this.authorityPayloadFromCachedAuthority(world, reconstructionScope, filteredAuthority, directoryScopeSessions, reconstructionReason),
       staleFallbackCount
     };
   }
@@ -4884,8 +4745,7 @@ export class PersistentObjectDO {
           tolerateRemoteFailures: true,
           directorySessionScopes: extraObjectIds,
           reconstructionReason: "warm_turn_refresh",
-          reconstructionScope: _scope,
-          checkpointHead: this.restV2Relays.get(_scope)?.relay.commit_scope.head ?? null
+          reconstructionScope: _scope
         }),
       applyAuthority: (client, authority) => {
         this.mergeRestPlanningAuthority(world, client, authority);

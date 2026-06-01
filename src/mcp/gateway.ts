@@ -96,7 +96,6 @@ export type McpV2ClientHooks = {
       directorySessionScopes?: ObjRef[];
       reconstructionReason?: "warm_turn_refresh" | "cold_open" | "missing_state_repair";
       reconstructionScope?: ObjRef;
-      checkpointHead?: ShadowScopeHead | null;
     }
   ) => Promise<ReturnType<typeof executorAuthorityPayload>>;
   executionCapsuleOpen?: boolean;
@@ -644,8 +643,7 @@ export class McpGateway {
           tolerateRemoteFailures: isPrePlan,
           directorySessionScopes: options.directorySessionScopes ?? [],
           reconstructionReason: "warm_turn_refresh",
-          reconstructionScope: submitScope,
-          checkpointHead: this.v2Scopes.get(submitScope)?.relay.commit_scope.head ?? null
+          reconstructionScope: submitScope
         });
         const fallbackClient = this.v2Scopes.get(scope) ?? this.v2Scopes.get(submitScope);
         const authorityPayload = fallbackClient && (payload.staleFallbackCount ?? 0) > 0
@@ -825,7 +823,6 @@ export class McpGateway {
       directorySessionScopes?: ObjRef[];
       reconstructionReason?: "warm_turn_refresh" | "cold_open" | "missing_state_repair";
       reconstructionScope?: ObjRef;
-      checkpointHead?: ShadowScopeHead | null;
     } = {}
   ): Promise<ReturnType<typeof executorAuthorityPayload>> {
     return await (

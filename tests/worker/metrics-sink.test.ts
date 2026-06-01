@@ -156,7 +156,7 @@ describe("metrics-sink", () => {
       const { binding, calls } = fakeAnalytics();
       const event: MetricEvent = {
         kind: "authority_slice_reconstructed",
-        reason: "warm_checkpoint_hit",
+        reason: "warm_turn_refresh",
         scope: "the_chatroom",
         object_count: 12,
         page_count: 36,
@@ -165,7 +165,7 @@ describe("metrics-sink", () => {
       writeMetricToAnalytics(event, "mcp-gateway-0", binding);
       expect(calls[0]!.blobs?.[SLOT_KIND]).toBe("authority_slice_reconstructed");
       expect(calls[0]!.blobs?.[SLOT_SCOPE]).toBe("the_chatroom");
-      expect(calls[0]!.blobs?.[SLOT_REASON]).toBe("warm_checkpoint_hit");
+      expect(calls[0]!.blobs?.[SLOT_REASON]).toBe("warm_turn_refresh");
       expect(calls[0]!.doubles?.[DBL_COUNT]).toBe(12);
     });
 
