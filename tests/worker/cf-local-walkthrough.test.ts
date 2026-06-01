@@ -112,23 +112,17 @@ describe("CF-local smoke walkthrough", () => {
       // the structural teeth VTN0 promises — it fails on "two copies disagreed"
       // by signature, even when retry papers over the symptom.
       //
-      // RATCHET, not zero-tolerance-yet. The current base has ONE known CI-debt
-      // class: the presence/containment PROJECTION cells (`subscribers`,
-      // `session_subscribers`, `contents`) still sit on the commit-validation
-      // path, so a cross-room turn can plan them stale and get rejected (e.g.
-      // `the_outline:leave` rejecting on `the_chatroom.subscribers`). Step A4
-      // (contents/presence-as-projection, off the validation path) RETIRES this
-      // class; when A4 lands, KNOWN_CI_DEBT_CELLS empties and this becomes
-      // zero-tolerance. Until then the gate fails on ANY OTHER rejection error —
-      // a real authoritative cell (a property value, lineage, location), a verb
-      // cell (`$tool:look`), a write-prior mismatch, a post_state_mismatch, or an
-      // incomplete_transcript — so it cannot be used to launder NEW
-      // multiplication. The allow-list MUST only ever shrink.
-      const KNOWN_CI_DEBT_CELLS = new Set<string>([
-        "subscribers",
-        "session_subscribers",
-        "contents"
-      ]);
+      // ZERO-TOLERANCE as of A4. The presence/containment PROJECTION cells
+      // (`subscribers`, `session_subscribers`, `contents`) used to sit on the
+      // commit-validation path, so a cross-room turn could plan them stale and get
+      // rejected (e.g. `the_outline:leave` rejecting on `the_chatroom.subscribers`).
+      // A4 (cell-authority CA2/CA4) took them OFF the validation path: a read of a
+      // projection cell is no longer a consistency dependency, because its truth is
+      // each member's own `live:location` authoritative cell. The allow-list is now
+      // EMPTY — the gate fails on ANY commit-rejection error of any kind. The
+      // allow-list MUST only ever shrink (it is now at its floor); re-adding an
+      // entry is re-introducing multiplication and is forbidden.
+      const KNOWN_CI_DEBT_CELLS = new Set<string>([]);
       // VTN0 conformance: parse the STRUCTURED commit-rejection log rather than
       // string-scanning the joined diagnostics. CommitScopeDO logs every
       // rejection as `console.log("woo.commit_rejected.errors", JSON)` whose

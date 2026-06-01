@@ -272,6 +272,15 @@ export function validateTranscriptWithCellReader(reader: TranscriptCellReader, t
     if (readMatchesSequencedAllocation(transcript, read, actual)) continue;
     if (readMatchesSameTurnMovementProjection(transcript, read, actual)) continue;
     if (readMatchesSameTurnPresenceProjection(reader, transcript, read, actual)) continue;
+    // A4 (cell-authority CA2/CA4): contents and presence-projection cells are
+    // PROJECTIONS, not authority. Their truth is each member's own
+    // `live:location` authoritative cell, validated independently. A read of a
+    // projection cell is therefore NOT a consistency dependency: a stale
+    // cross-room view of a room's contents / presence roster must NOT reject the
+    // commit (that was the masked CI debt the conformance gate allow-listed).
+    // Movement still serializes at the moved object's location owner; this only
+    // stops a derived read model from gating an unrelated turn.
+    if (isProjectionReadCell(reader, read.cell)) continue;
     const readMatchesOwnWrite = sameTurn.reason === "own_write_mismatch" ? false : sameTurnReadMatchesOwnWrite(transcript, read);
     if (!readMatchesOwnWrite && read.version !== actual.version) {
       errors.push(`read version mismatch ${cellLabel(read.cell)}: transcript=${read.version ?? "none"} actual=${actual.version ?? "none"}`);
@@ -381,6 +390,18 @@ function readMatchesSameTurnPresenceProjection(
   }
   return touched && stableJson(canonicalPresenceRows(Array.from(projected.values()), projection) as unknown as WooValue) ===
     stableJson(canonicalPresenceRows(read.value, projection) as unknown as WooValue);
+}
+
+// A4: is this read cell a derived projection (never a consistency dependency)?
+// A `contents` cell is the canonical container projection (CA4 — derived from
+// members' `live:location`). A `prop` cell is a projection only when its
+// property def declares a presence projection (CA4 PresenceProjectionDef) — an
+// ordinary list-valued property with no declaration stays an order-sensitive
+// authoritative cell and is still validated.
+function isProjectionReadCell(reader: TranscriptCellReader, cell: TranscriptCell): boolean {
+  if (cell.kind === "contents") return true;
+  if (cell.kind === "prop") return presenceProjectionForCell(reader, cell.object, cell.name) !== null;
+  return false;
 }
 
 function presenceProjectionForCell(
