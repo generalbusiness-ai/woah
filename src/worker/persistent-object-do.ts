@@ -38,7 +38,7 @@ import {
   withAuthorityPageProvenance,
   serializedWorldFromAuthoritySlice
 } from "../core/authority-slice";
-import { shadowObjectLineagePage, shadowObjectLivePage, shadowPropertyCellPages, shadowStatePageRef, type ShadowStatePage } from "../core/shadow-state-pages";
+import { shadowObjectLineagePage, shadowObjectLivePage, shadowPropertyCellPages, stampAuthorityPageRef, type AuthorityPageProvenance, type ShadowStatePage } from "../core/shadow-state-pages";
 import type { EffectTranscript } from "../core/effect-transcript";
 import { installLocalCatalogs, localCatalogBundleFingerprint, parseAutoInstallCatalogs, runHostScopedLocalCatalogLifecycle } from "../core/local-catalogs";
 import {
@@ -4496,10 +4496,10 @@ export class PersistentObjectDO {
     );
     const slices: SerializedAuthoritySlice[] = [authority];
     if (sessionActors.size > 0) {
-      const localActorLive = mcpGatewayLocalActorLiveCellSlice(world, sessionActors);
+      const localActorLive = mcpGatewayLocalActorLiveCellSlice(world, sessionActors, this.durableHostKey());
       if (authoritySlicePageCount(localActorLive) > 0) slices.push(localActorLive);
     }
-    if (directoryScopeSessions.length > 0) slices.push(mcpGatewayDirectorySessionCellSlice(directoryScopeSessions));
+    if (directoryScopeSessions.length > 0) slices.push(mcpGatewayDirectorySessionCellSlice(directoryScopeSessions, this.durableHostKey()));
     let mergedAuthority: SerializedAuthoritySlice;
     if (slices.length > 1) {
       mergedAuthority = combineSerializedAuthoritySlices(mergeSerializedSessions(authority.sessions, directoryScopeSessions), slices);
@@ -4779,7 +4779,7 @@ export class PersistentObjectDO {
       ? [checkpointLookup.checkpoint.authority, local.authority]
       : [local.authority];
     if (mcpGatewayShard && localActorAuthorityRoots.size > 0) {
-      const actorCells = mcpGatewayLocalActorPropertyCellSlice(world, localActorAuthorityRoots);
+      const actorCells = mcpGatewayLocalActorPropertyCellSlice(world, localActorAuthorityRoots, this.durableHostKey());
       if (actorCells.page_refs.length > 0) slices.push(actorCells);
     }
     for (const { host, response } of remoteSlices) {
@@ -6617,7 +6617,7 @@ function mcpGatewayShardSerializedWorld(sessions: readonly DirectorySerializedSe
   };
 }
 
-function mcpGatewayDirectorySessionCellSlice(sessions: readonly DirectorySerializedSession[]): SerializedAuthorityCellSlice {
+function mcpGatewayDirectorySessionCellSlice(sessions: readonly DirectorySerializedSession[], hostKey: string): SerializedAuthorityCellSlice {
   const snapshot = mcpGatewayShardSerializedWorld(sessions);
   const sessionActors = new Set<ObjRef>(sessions.map((session) => session.actor));
   const actorObjects = snapshot.objects.filter((obj) => sessionActors.has(obj.id));
@@ -6629,10 +6629,16 @@ function mcpGatewayDirectorySessionCellSlice(sessions: readonly DirectorySeriali
     .filter((obj) => !sessionActors.has(obj.id) && obj.contents.length > 0)
     .map((obj) => shadowObjectLivePage(obj));
   const inlinePages = [...actorLineagePages, ...scopeLivePages];
+  // A3: these pages are synthesized from Directory route records, not from the
+  // object owner's live state — Directory publishes session/presence/projection
+  // rows (CA12.1). They are "projection" provenance: a sparse shard MAY plan
+  // against them to fill a gap the owner has not yet repaired, but they MUST NOT
+  // override an owner's authoritative row or be used as a write-authority source.
+  const provenance: AuthorityPageProvenance = { source: "projection", source_host: hostKey };
   return {
     kind: "woo.authority_slice.cells.shadow.v1",
     sessions: [],
-    page_refs: inlinePages.map((page) => shadowStatePageRef(page, true)),
+    page_refs: inlinePages.map((page) => stampAuthorityPageRef(page, true, provenance)),
     inline_pages: inlinePages,
     counters: {
       objectCounter: 1,
@@ -6848,16 +6854,23 @@ function mcpGatewayActorStubProperties(
 
 function mcpGatewayLocalActorPropertyCellSlice(
   world: WooWorld,
-  actors: ReadonlySet<ObjRef>
+  actors: ReadonlySet<ObjRef>,
+  hostKey: string
 ): SerializedAuthorityCellSlice {
   const inlinePages: ShadowStatePage[] = [];
   for (const obj of world.exportObjects(actors)) {
     inlinePages.push(...shadowPropertyCellPages(withMcpGatewayActorFallbackProperties(obj)));
   }
+  // A3: `actors` are the gateway shard's local actor authority roots — under
+  // actor-anchored movement (CA3) the shard owns these session actors' cells.
+  // These are the owner's authoritative property rows (including the seeded
+  // guest `home` fallback the shard asserts for its own actor), so fresh remote
+  // rows never override them; they are stamped "authoritative" from this host.
+  const provenance: AuthorityPageProvenance = { source: "authoritative", source_host: hostKey };
   return {
     kind: "woo.authority_slice.cells.shadow.v1",
     sessions: [],
-    page_refs: inlinePages.map((page) => shadowStatePageRef(page, true)),
+    page_refs: inlinePages.map((page) => stampAuthorityPageRef(page, true, provenance)),
     inline_pages: inlinePages,
     counters: {
       objectCounter: 1,
@@ -6871,13 +6884,18 @@ function mcpGatewayLocalActorPropertyCellSlice(
 
 function mcpGatewayLocalActorLiveCellSlice(
   world: WooWorld,
-  actors: ReadonlySet<ObjRef>
+  actors: ReadonlySet<ObjRef>,
+  hostKey: string
 ): SerializedAuthorityCellSlice {
   const inlinePages: ShadowStatePage[] = world.exportObjects(actors).map((obj) => shadowObjectLivePage(obj));
+  // A3: the live (location) cell of a local session actor is exactly the cell
+  // the gateway shard owns under actor-anchored movement (CA3). It is the
+  // owner's authoritative row, stamped from this host.
+  const provenance: AuthorityPageProvenance = { source: "authoritative", source_host: hostKey };
   return {
     kind: "woo.authority_slice.cells.shadow.v1",
     sessions: [],
-    page_refs: inlinePages.map((page) => shadowStatePageRef(page, true)),
+    page_refs: inlinePages.map((page) => stampAuthorityPageRef(page, true, provenance)),
     inline_pages: inlinePages,
     counters: {
       objectCounter: 1,

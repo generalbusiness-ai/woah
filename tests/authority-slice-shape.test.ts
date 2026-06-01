@@ -150,6 +150,36 @@ describe("WooWorld.exportAuthoritySlice content contract", () => {
     expect([...(serialized.objects.find((obj) => obj.id === "the_deck")?.contents ?? [])].sort()).toEqual([...freshDeck.contents].sort());
   });
 
+  it("stamps mandatory provenance on every page, including legacy-object conversions (A3)", () => {
+    // A3: a SerializedAuthorityCellSlice cannot carry a page without a `source`.
+    // The risky case is the representation bridge: a legacy object-row slice
+    // reaching combine has no per-page provenance, yet combine emits cell pages.
+    // Those converted pages must be stamped — and conservatively, since combine
+    // cannot verify the legacy rows are an owner's authoritative state — so the
+    // downstream gateway/VM read path never mistakes them for write-authority.
+    const legacyRoom = objectRecord("legacy_room", ["legacy_item"]);
+    const ownerItem = objectRecord("legacy_item", []);
+    const combined = combineSerializedAuthoritySlices([], [
+      { kind: "woo.authority_slice.shadow.v1", sessions: [], objects: [legacyRoom] },
+      buildSerializedAuthorityCellSlice({
+        sessions: [],
+        objects: [ownerItem],
+        counters: { objectCounter: 1, parkedTaskCounter: 1, sessionCounter: 1 },
+        pageProvenance: () => ({ source: "authoritative" as const })
+      })
+    ]);
+    expect(combined.kind).toBe("woo.authority_slice.cells.shadow.v1");
+    if (combined.kind !== "woo.authority_slice.cells.shadow.v1") return;
+    // Every page carries a source — no undefined slips through.
+    expect(combined.page_refs.every((ref) => typeof ref.source === "string")).toBe(true);
+    // The converted legacy-room pages are conservatively non-authoritative.
+    const legacyRefs = combined.page_refs.filter((ref) => ref.object === "legacy_room");
+    expect(legacyRefs.length).toBeGreaterThan(0);
+    expect(legacyRefs.every((ref) => ref.source === "fallback")).toBe(true);
+    // The owner cell slice keeps its declared authoritative provenance.
+    expect(combined.page_refs.filter((ref) => ref.object === "legacy_item").every((ref) => ref.source === "authoritative")).toBe(true);
+  });
+
   it("carries optional authority-page provenance without changing materialization", () => {
     const room = objectRecord("room_owner", ["item_a"]);
     const item = objectRecord("item_a", []);

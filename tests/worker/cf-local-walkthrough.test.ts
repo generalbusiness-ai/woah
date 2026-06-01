@@ -119,36 +119,59 @@ describe("CF-local smoke walkthrough", () => {
       // `the_outline:leave` rejecting on `the_chatroom.subscribers`). Step A4
       // (contents/presence-as-projection, off the validation path) RETIRES this
       // class; when A4 lands, KNOWN_CI_DEBT_CELLS empties and this becomes
-      // zero-tolerance. Until then the gate fails on ANY OTHER diverged cell — a
-      // real authoritative cell (a property value, lineage, location), a
-      // post_state_mismatch, or an incomplete_transcript — so it cannot be used
-      // to launder NEW multiplication. The allow-list MUST only ever shrink.
+      // zero-tolerance. Until then the gate fails on ANY OTHER rejection error —
+      // a real authoritative cell (a property value, lineage, location), a verb
+      // cell (`$tool:look`), a write-prior mismatch, a post_state_mismatch, or an
+      // incomplete_transcript — so it cannot be used to launder NEW
+      // multiplication. The allow-list MUST only ever shrink.
       const KNOWN_CI_DEBT_CELLS = new Set<string>([
         "subscribers",
         "session_subscribers",
         "contents"
       ]);
-      const allDiagnostics = logSpy.mock.calls
-        .map((args) => args.map((arg) => (typeof arg === "string" ? arg : JSON.stringify(arg))).join(" "));
-      // Pull every diverged `<object>.<cell>` from read-version/value-mismatch
-      // lines; classify post_state_mismatch / incomplete_transcript as
-      // never-excusable (they imply a second writer, not a stale projection).
+      // VTN0 conformance: parse the STRUCTURED commit-rejection log rather than
+      // string-scanning the joined diagnostics. CommitScopeDO logs every
+      // rejection as `console.log("woo.commit_rejected.errors", JSON)` whose
+      // `errors` array carries one string per diverged cell (effect-transcript /
+      // shadow-commit-scope `cellLabel`: `<object>.<cell>` for property/location/
+      // contents/lifecycle, `<object>:<verb>` for verb cells). The gate fails on
+      // EVERY error except a read/write-version mismatch on an allow-listed
+      // projection cell — so write-prior mismatches, verb-cell divergence,
+      // post_state_mismatch, incomplete_transcript, and any unrecognized error
+      // string can no longer slip through a dot-form regex.
+      const isAllowlistedProjectionMismatch = (error: string): boolean => {
+        // Only read/write version/value mismatches name a cell as
+        // `<object>.<cell>` with a dot. post_state_mismatch, incomplete_transcript,
+        // and verb-cell (`<object>:<verb>`) errors never match this shape and so
+        // are never excused. The object id carries no dot or colon, so the first
+        // dot delimits the cell name.
+        const m = /^(?:read (?:version|value) mismatch|write prior mismatch) [^\s:]+\.([A-Za-z0-9_]+)(?::|$)/.exec(error);
+        return m !== null && KNOWN_CI_DEBT_CELLS.has(m[1]);
+      };
       const ciOffenders: string[] = [];
-      for (const line of allDiagnostics) {
-        if (line.includes("post_state_mismatch") || line.includes("incomplete_transcript")) {
-          ciOffenders.push(line.slice(0, 400));
+      for (const call of logSpy.mock.calls) {
+        if (call[0] !== "woo.commit_rejected.errors" || typeof call[1] !== "string") continue;
+        let parsed: { errors?: unknown; scope?: unknown; verb?: unknown; target?: unknown; actor?: unknown };
+        try {
+          parsed = JSON.parse(call[1]) as typeof parsed;
+        } catch {
+          // A rejection line the gate cannot read is itself a failure: never let
+          // an unparseable commit_rejected entry pass silently.
+          ciOffenders.push(`unparseable woo.commit_rejected.errors: ${call[1].slice(0, 240)}`);
           continue;
         }
-        const cellMatches = line.matchAll(/read (?:version|value) mismatch ([^.\s]+)\.([A-Za-z0-9_]+)/g);
-        for (const m of cellMatches) {
-          const cell = m[2];
-          if (!KNOWN_CI_DEBT_CELLS.has(cell)) ciOffenders.push(`${m[1]}.${cell} :: ${line.slice(0, 240)}`);
+        const errors = Array.isArray(parsed.errors)
+          ? parsed.errors.filter((entry): entry is string => typeof entry === "string")
+          : [];
+        const context = `${String(parsed.verb ?? "?")} ${String(parsed.target ?? "?")} @ ${String(parsed.scope ?? "?")}`;
+        for (const error of errors) {
+          if (!isAllowlistedProjectionMismatch(error)) ciOffenders.push(`${error} :: ${context}`);
         }
       }
       expect(
         ciOffenders.length,
-        `coherence-invariant violation during cross-shard walkthrough (VTN0): a derived view of a cell NOT in the known A4 projection-debt allow-list diverged from committed authority. ` +
-        `This is new multiplication and must be fixed, not allow-listed. First offenders:\n${ciOffenders.slice(0, 3).join("\n")}`
+        `coherence-invariant violation during cross-shard walkthrough (VTN0): a commit rejection reported an error that is NOT an allow-listed A4 projection-cell mismatch. ` +
+        `This is new multiplication / a masked rejection and must be fixed, not allow-listed. First offenders:\n${ciOffenders.slice(0, 3).join("\n")}`
       ).toBe(0);
     } finally {
       await Promise.allSettled([alice?.close(), bob?.close()]);

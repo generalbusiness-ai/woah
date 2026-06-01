@@ -8,10 +8,14 @@ import type {
 } from "./repository";
 import { stableShadowJson } from "./shadow-cell-version";
 import {
+  applyAuthorityPageProvenance,
   mergeShadowStatePagesIntoSerialized,
   shadowStatePageHash,
   shadowStatePageRef,
   shadowStatePagesForObject,
+  stampAuthorityPageRef,
+  type AuthorityPageProvenance,
+  type AuthorityPageRef,
   type ShadowStatePage,
   type ShadowStatePageRef
 } from "./shadow-state-pages";
@@ -25,8 +29,6 @@ export type MergeSerializedAuthorityOptions = {
   clone?: boolean;
 };
 
-export type AuthorityPageProvenance = Pick<ShadowStatePageRef, "source" | "source_host">;
-
 // A3 (mobile-heap sequence): every authority cell page MUST declare a `source`.
 // Provenance is no longer a decorative optional field — the gateway merge path
 // REFUSES to trust a non-"authoritative" page as authority (see
@@ -35,19 +37,21 @@ export type AuthorityPageProvenance = Pick<ShadowStatePageRef, "source" | "sourc
 // return a provenance whose `source` is set. This is the type-level half of
 // VTN0's "a derived copy is never a write-authority source": a builder cannot
 // produce an authority slice without saying, per page, whether it is the owner's
-// authoritative row or a cache/projection/fallback derivation.
+// authoritative row or a cache/projection/fallback derivation. `AuthorityPageRef`
+// (the page_refs element type) makes that requirement load-bearing — the only
+// way to mint one is through `stampAuthorityPageRef` / `applyAuthorityPageProvenance`.
 export function buildSerializedAuthorityCellSlice(input: {
   sessions: readonly SerializedSession[];
   objects: readonly SerializedObject[];
   counters: Pick<SerializedWorld, "objectCounter" | "parkedTaskCounter" | "sessionCounter">;
   tombstones?: readonly ObjRef[];
-  pageProvenance: (page: ShadowStatePage) => AuthorityPageProvenance & { source: NonNullable<AuthorityPageProvenance["source"]> };
+  pageProvenance: (page: ShadowStatePage) => AuthorityPageProvenance;
 }): SerializedAuthorityCellSlice {
   const pages = input.objects.flatMap((obj) => shadowStatePagesForObject(obj));
   return {
     kind: "woo.authority_slice.cells.shadow.v1",
     sessions: structuredClone(input.sessions) as SerializedSession[],
-    page_refs: pages.map((page) => authorityPageRefWithProvenance(shadowStatePageRef(page, true), input.pageProvenance(page))),
+    page_refs: pages.map((page) => stampAuthorityPageRef(page, true, input.pageProvenance(page))),
     inline_pages: pages.map((page) => structuredClone(page) as ShadowStatePage),
     counters: { ...input.counters },
     tombstones: [...(input.tombstones ?? [])].sort(),
@@ -55,21 +59,9 @@ export function buildSerializedAuthorityCellSlice(input: {
   };
 }
 
-export function authorityPageRefWithProvenance(
-  ref: ShadowStatePageRef,
-  provenance: AuthorityPageProvenance | null | undefined
-): ShadowStatePageRef {
-  if (!provenance?.source) return ref;
-  return {
-    ...ref,
-    source: provenance.source,
-    ...(provenance.source_host ? { source_host: provenance.source_host } : {})
-  };
-}
-
 export function withAuthorityPageProvenance(
   authority: SerializedAuthoritySlice,
-  provenance: (ref: ShadowStatePageRef) => AuthorityPageProvenance | null | undefined
+  provenance: (ref: AuthorityPageRef) => AuthorityPageProvenance | null | undefined
 ): SerializedAuthoritySlice {
   if (!isAuthorityCellSlice(authority)) {
     return {
@@ -81,7 +73,14 @@ export function withAuthorityPageProvenance(
   return {
     ...authority,
     sessions: authority.sessions.map((session) => structuredClone(session) as SerializedSession),
-    page_refs: authority.page_refs.map((ref) => authorityPageRefWithProvenance(structuredClone(ref) as ShadowStatePageRef, provenance(ref))),
+    // A null/undefined override keeps the page's existing (already mandatory)
+    // provenance; a non-null override re-stamps it. Either way the result is a
+    // well-formed AuthorityPageRef.
+    page_refs: authority.page_refs.map((ref) => {
+      const cloned = structuredClone(ref) as AuthorityPageRef;
+      const override = provenance(ref);
+      return override?.source ? applyAuthorityPageProvenance(cloned, override) : cloned;
+    }),
     inline_pages: authority.inline_pages.map((page) => structuredClone(page) as ShadowStatePage),
     counters: { ...authority.counters },
     tombstones: [...authority.tombstones]
@@ -137,12 +136,17 @@ export function mergeSerializedAuthoritySlice(
   return authorityMergeFingerprint(serialized) !== before;
 }
 
+// Provenance stamped onto pages synthesized from a legacy (object-row) slice
+// during representation bridging. See the rationale at the conversion site in
+// combineSerializedAuthoritySlices.
+const LEGACY_OBJECT_SLICE_PROVENANCE: AuthorityPageProvenance = { source: "fallback" };
+
 export function combineSerializedAuthoritySlices(
   sessions: readonly SerializedSession[],
   slices: readonly MergeSerializedAuthorityInput[]
 ): SerializedAuthoritySlice {
   const emitCellSlice = slices.some(isAuthorityCellSlice);
-  const lastPageByKey = new Map<string, ShadowStatePageRef>();
+  const lastPageByKey = new Map<string, AuthorityPageRef>();
   const inlineByHash = new Map<string, ShadowStatePage>();
   const legacyObjects = new Map<ObjRef, SerializedObject>();
   let counters: Pick<SerializedWorld, "objectCounter" | "parkedTaskCounter" | "sessionCounter"> = {
@@ -163,18 +167,26 @@ export function combineSerializedAuthoritySlices(
       for (const id of slice.tombstones) tombstones.add(id);
       sourceObjectCount += slice.source_object_count;
       for (const page of slice.inline_pages) inlineByHash.set(shadowStatePageHash(page), structuredClone(page) as ShadowStatePage);
-      for (const ref of slice.page_refs) lastPageByKey.set(authorityPageRefKey(ref), structuredClone(ref) as ShadowStatePageRef);
+      for (const ref of slice.page_refs) lastPageByKey.set(authorityPageRefKey(ref), structuredClone(ref) as AuthorityPageRef);
       continue;
     }
     if (emitCellSlice) {
       // Preserve slice precedence across both legacy object slices and cell-page
       // slices. Deferring legacy objects until after all cell slices makes stale
       // local rows override fresher remote rows solely because of representation.
+      //
+      // A3: a legacy object slice carries no per-page provenance, and this
+      // representation bridge cannot verify the rows are an owner's current
+      // authoritative state — it has no owning host in hand. We therefore stamp
+      // the converted pages "fallback": they MAY fill a planning gap, but the
+      // gateway/VM read path MUST NOT treat them as a write-authority source. A
+      // fresher "authoritative" cell page for the same key still wins by slice
+      // order, exactly as before.
       for (const obj of slice.objects) {
         const pages = shadowStatePagesForObject(obj);
         sourceObjectCount += 1;
         for (const page of pages) {
-          const ref = shadowStatePageRef(page, true);
+          const ref = stampAuthorityPageRef(page, true, LEGACY_OBJECT_SLICE_PROVENANCE);
           inlineByHash.set(ref.hash, structuredClone(page) as ShadowStatePage);
           lastPageByKey.set(authorityPageRefKey(ref), ref);
         }
@@ -218,7 +230,7 @@ export function filterSerializedAuthoritySliceObjects(
   }
   const pageRefs = authority.page_refs
     .filter((ref) => include(ref.object))
-    .map((ref) => structuredClone(ref) as ShadowStatePageRef);
+    .map((ref) => structuredClone(ref) as AuthorityPageRef);
   const keptHashes = new Set(pageRefs.map((ref) => ref.hash));
   const keptObjects = new Set(pageRefs.map((ref) => ref.object));
   return {
@@ -243,13 +255,13 @@ export function filterSerializedAuthoritySlicePages(
       kind: "woo.authority_slice.shadow.v1",
       sessions: authority.sessions.map((session) => structuredClone(session) as SerializedSession),
       objects: authority.objects
-        .filter((obj) => shadowStatePagesForObject(obj).some((page) => include(shadowStatePageRef(page, true))))
+        .filter((obj) => shadowStatePagesForObject(obj).some((page) => include(stampAuthorityPageRef(page, true, LEGACY_OBJECT_SLICE_PROVENANCE))))
         .map((obj) => structuredClone(obj) as SerializedObject)
     };
   }
   const pageRefs = authority.page_refs
     .filter(include)
-    .map((ref) => structuredClone(ref) as ShadowStatePageRef);
+    .map((ref) => structuredClone(ref) as AuthorityPageRef);
   const keptHashes = new Set(pageRefs.map((ref) => ref.hash));
   const keptObjects = new Set(pageRefs.map((ref) => ref.object));
   return {

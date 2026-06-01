@@ -65,8 +65,35 @@ export type ShadowStatePageRef = {
    * authority-slice payloads set it so gateways can decide whether a page is
    * owner-sourced or merely a cache/fallback row without re-resolving every
    * object through Directory. */
-  source?: "authoritative" | "projection" | "fallback" | "cache" | "gossip";
+  source?: AuthorityPageSource;
   source_host?: string;
+};
+
+/** The provenance vocabulary for an authority page. `authoritative` is the
+ * owner's live row; every other value is a non-authoritative derivation that
+ * MAY fill a planning gap but MUST NOT be trusted as a write-authority source
+ * (CA2 / A3). */
+export type AuthorityPageSource = "authoritative" | "projection" | "fallback" | "cache" | "gossip";
+
+export type AuthorityPageProvenance = {
+  source: AuthorityPageSource;
+  source_host?: string;
+};
+
+/** A3: an authority-slice page ref with MANDATORY provenance. Unlike an
+ * execution-transfer page ref (`ShadowStatePageRef`, whose `source` is
+ * optional because the transfer carries no authority claim), every page in a
+ * `SerializedAuthorityCellSlice` MUST declare, per page, whether it is the
+ * owner's authoritative row or a cache/projection/fallback/gossip derivation.
+ * The gateway merge path refuses to trust a page as write-authority unless
+ * `source === "authoritative"` and `source_host` is the responding owner (see
+ * `filterRemoteAuthoritySliceForGateway`), and A3.2 extends the same refusal
+ * into the VM read path. Making the field required at the type level means a
+ * builder cannot construct an authority slice without declaring provenance —
+ * every constructor must go through `stampAuthorityPageRef` /
+ * `applyAuthorityPageProvenance`. */
+export type AuthorityPageRef = ShadowStatePageRef & {
+  source: AuthorityPageSource;
 };
 
 export function shadowStatePagesForObject(obj: SerializedObject): ShadowStatePage[] {
@@ -169,6 +196,32 @@ export function shadowStatePageRef(page: ShadowStatePage, inline: boolean): Shad
     bytes: utf8ByteLength(json),
     inline
   };
+}
+
+/** Apply mandatory authority provenance to a page ref, yielding an
+ * `AuthorityPageRef`. This is the only sanctioned way to add a `source` to a
+ * ref that belongs in an authority slice; routing every constructor through it
+ * is what makes A3's "every authority page carries source" a type-level
+ * guarantee rather than a convention. */
+export function applyAuthorityPageProvenance(
+  ref: ShadowStatePageRef,
+  provenance: AuthorityPageProvenance
+): AuthorityPageRef {
+  return {
+    ...ref,
+    source: provenance.source,
+    ...(provenance.source_host ? { source_host: provenance.source_host } : {})
+  };
+}
+
+/** Build an `AuthorityPageRef` directly from a page, stamping mandatory
+ * provenance. The authority-slice equivalent of `shadowStatePageRef`. */
+export function stampAuthorityPageRef(
+  page: ShadowStatePage,
+  inline: boolean,
+  provenance: AuthorityPageProvenance
+): AuthorityPageRef {
+  return applyAuthorityPageProvenance(shadowStatePageRef(page, inline), provenance);
 }
 
 export function cacheShadowStatePages(cache: Map<string, ShadowStatePage>, pages: ShadowStatePage[]): void {

@@ -436,6 +436,14 @@ planning cache, not a new authority source:
   "a projection cell MUST NOT be used as a write-authority source": provenance is
   load-bearing, not advisory. (A3.2 extends the same refusal into the VM planning
   read path; A3.1 establishes it at the authority-slice merge boundary.)
+  The `source` field is mandatory at the type level on an authority page ref
+  (distinct from an execution-transfer page ref, which omits it), so EVERY
+  constructor — including the bridge that converts a legacy object-row slice
+  into cell pages — must stamp provenance. A bridge or merge step that cannot
+  prove a page is the owner's current authoritative row MUST stamp a
+  non-authoritative source (e.g. `fallback`) rather than fabricate
+  `authoritative`; the page can still fill a planning gap but is never trusted
+  as write-authority.
 - Implementations MUST bound checkpoint count by memory policy, for example an
   LRU cap. A gateway must never accumulate one full slice per scope forever.
 
