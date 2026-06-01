@@ -526,6 +526,20 @@ function mergeAuthorityCellPages(
           mayReplace = true;
         }
       }
+      // Inverse stub guard (symmetric with the combine tiebreak): a
+      // non-authoritative incoming presentation stub (`name===id`) must NEVER
+      // displace a NAMED current lineage, even at equal-or-higher derived rank.
+      // Only the owner's authoritative page may set an identity to its id. Without
+      // this, an equal-rank projection stub could overwrite the resolved name (the
+      // reverse of the repair direction above) — see cell-authority CA11.
+      if (mayReplace && ref.source !== "authoritative" && ref.page === "object_lineage") {
+        const curObj = objectsById.get(ref.object);
+        const incomingPage = incomingByHash.get(ref.hash);
+        const incomingStub = incomingPage?.page === "object_lineage" && incomingPage.name === ref.object;
+        if (incomingStub && curObj && curObj.name !== ref.object) {
+          mayReplace = false;
+        }
+      }
       if (!mayReplace) continue;
     }
     const incoming = incomingByHash.get(ref.hash);

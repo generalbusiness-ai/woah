@@ -20,6 +20,7 @@ import { describe, expect, it } from "vitest";
 import {
   authoritySliceObjectIds,
   buildSerializedAuthorityCellSlice,
+  cellProvenanceFromAuthoritySlice,
   combineSerializedAuthoritySlices,
   mergeSerializedAuthoritySlice,
   serializedWorldFromAuthoritySlice,
@@ -203,6 +204,56 @@ describe("WooWorld.exportAuthoritySlice content contract", () => {
     if (fallback.kind === "woo.authority_slice.cells.shadow.v1") {
       expect(fallback.page_refs.every((ref) => ref.source === "fallback" && ref.source_host === "mcp-gateway-0")).toBe(true);
     }
+  });
+
+  it("refuses a non-authoritative projection stub from overwriting a named lineage (CA11 symmetric stub guard)", () => {
+    // Reverse of stub-repair: when the planning world already holds the resolved
+    // identity ("Guest 1", projection) and an equal-rank projection page arrives
+    // carrying the id-as-name stub, the stub MUST NOT win. Only the owner's
+    // authoritative page may set an identity to its id.
+    const named: SerializedObject = { ...objectRecord("guest_1", []), name: "Guest 1", parent: "$player", owner: "guest_1" };
+    const stub: SerializedObject = { ...objectRecord("guest_1", []), name: "guest_1", parent: "$player", owner: "guest_1" };
+    const namedSlice = buildSerializedAuthorityCellSlice({
+      sessions: [],
+      objects: [named],
+      counters: { objectCounter: 1, parkedTaskCounter: 1, sessionCounter: 1 },
+      pageProvenance: () => ({ source: "projection" as const, source_host: "mcp-gateway-2" })
+    });
+    const serialized = serializedWorldFromAuthoritySlice(namedSlice);
+    const cellProvenance = cellProvenanceFromAuthoritySlice(namedSlice);
+    const stubSlice = buildSerializedAuthorityCellSlice({
+      sessions: [],
+      objects: [stub],
+      counters: { objectCounter: 1, parkedTaskCounter: 1, sessionCounter: 1 },
+      pageProvenance: () => ({ source: "projection" as const, source_host: "the_deck" })
+    });
+    mergeSerializedAuthoritySlice(serialized, stubSlice, { clone: true, cellProvenance });
+    expect(serialized.objects.find((obj) => obj.id === "guest_1")?.name).toBe("Guest 1");
+  });
+
+  it("repairs a non-authoritative id-as-name stub with a named projection page (CA11 stub repair)", () => {
+    // Forward direction: a seeded `cache` stub (name===id) is repaired by a fresh
+    // named projection, even when the stub's provenance is unknown at the merge.
+    const stub: SerializedObject = { ...objectRecord("guest_1", []), name: "guest_1", parent: "$player", owner: "guest_1" };
+    const named: SerializedObject = { ...objectRecord("guest_1", []), name: "Guest 1", parent: "$player", owner: "guest_1" };
+    const stubSlice = buildSerializedAuthorityCellSlice({
+      sessions: [],
+      objects: [stub],
+      counters: { objectCounter: 1, parkedTaskCounter: 1, sessionCounter: 1 },
+      pageProvenance: () => ({ source: "cache" as const, source_host: "the_deck" })
+    });
+    const serialized = serializedWorldFromAuthoritySlice(stubSlice);
+    // Empty provenance map simulates a seed that bypassed the recording merge:
+    // the stub's provenance is unknown, yet a named page must still repair it.
+    const cellProvenance = cellProvenanceFromAuthoritySlice({ kind: "woo.authority_slice.cells.shadow.v1", sessions: [], page_refs: [], inline_pages: [], counters: { objectCounter: 1, parkedTaskCounter: 1, sessionCounter: 1 }, tombstones: [], source_object_count: 0 });
+    const namedSlice = buildSerializedAuthorityCellSlice({
+      sessions: [],
+      objects: [named],
+      counters: { objectCounter: 1, parkedTaskCounter: 1, sessionCounter: 1 },
+      pageProvenance: () => ({ source: "projection" as const, source_host: "mcp-gateway-2" })
+    });
+    mergeSerializedAuthoritySlice(serialized, namedSlice, { clone: true, cellProvenance });
+    expect(serialized.objects.find((obj) => obj.id === "guest_1")?.name).toBe("Guest 1");
   });
 
   it("does not report no-op cell-page order normalization as an authority change", () => {
