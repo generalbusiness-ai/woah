@@ -1,4 +1,4 @@
-import { authoritativePlanningWorld } from "../src/core/planning-world";
+import { authoritativePlanningWorld, planningCellKey } from "../src/core/planning-world";
 import { describe, expect, it, vi } from "vitest";
 import { createWorld, createWorldFromSerialized } from "../src/core/bootstrap";
 import { decodeEnvelope, encodeEnvelope } from "../src/core/shadow-envelope";
@@ -1867,6 +1867,45 @@ describe("shadow browser node shim", () => {
       args: [],
       persistence: "durable" as const
     })).not.toThrow();
+  });
+});
+
+describe("shadow browser relay seed provenance (A3.2)", () => {
+  // P1b (review): createShadowBrowserRelayShim is generic across holders and must NOT
+  // impose a `cache` default — an authority-derived seed keeps its real per-cell
+  // provenance, the browser-holder factory stamps cache, and a no-seed direct world
+  // is left empty (unknown).
+  function seedObjectId() {
+    const serialized = createWorld().exportWorld();
+    return { serialized, id: serialized.objects[0].id };
+  }
+
+  it("preserves an authority-derived seed's provenance instead of flattening to cache", () => {
+    const { serialized, id } = seedObjectId();
+    const seed = new Map([[planningCellKey(id, "object_lineage"), { source: "authoritative" as const }]]);
+    const relay = createShadowBrowserRelayShim({ node: "n", scope: "$system", serialized, seedCellProvenance: seed });
+    expect(relay.commit_scope.cellProvenance?.get(planningCellKey(id, "object_lineage"))).toEqual({ source: "authoritative" });
+  });
+
+  it("leaves seed provenance empty when no seed is declared (no constructor default)", () => {
+    const { serialized } = seedObjectId();
+    const relay = createShadowBrowserRelayShim({ node: "n", scope: "$system", serialized });
+    expect(relay.commit_scope.cellProvenance === undefined || relay.commit_scope.cellProvenance.size === 0).toBe(true);
+  });
+
+  it("createShadowBrowserNode stamps cache for the holder's seed (derived view)", () => {
+    const { serialized, id } = seedObjectId();
+    const relay = createShadowBrowserRelayShim({ node: "n", scope: "$system", serialized });
+    createShadowBrowserNode({ node: "browser", scope: "$system", actor: "$wiz", relay });
+    expect(relay.commit_scope.cellProvenance?.get(planningCellKey(id, "object_lineage"))).toEqual({ source: "cache" });
+  });
+
+  it("createShadowBrowserNode does not downgrade an authority seed to cache (record-if-stronger)", () => {
+    const { serialized, id } = seedObjectId();
+    const seed = new Map([[planningCellKey(id, "object_lineage"), { source: "authoritative" as const }]]);
+    const relay = createShadowBrowserRelayShim({ node: "n", scope: "$system", serialized, seedCellProvenance: seed });
+    createShadowBrowserNode({ node: "browser", scope: "$system", actor: "$wiz", relay });
+    expect(relay.commit_scope.cellProvenance?.get(planningCellKey(id, "object_lineage"))).toEqual({ source: "authoritative" });
   });
 });
 

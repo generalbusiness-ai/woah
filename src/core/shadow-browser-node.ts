@@ -32,7 +32,7 @@ import {
 } from "./shadow-turn-exec";
 import { shadowStatePageHash, shadowStatePagesForObject, type ShadowStatePage } from "./shadow-state-pages";
 import { runShadowTurnCall, runShadowTurnCallTranscript, type ShadowTurnCall } from "./shadow-turn-call";
-import { buildPlanningWorld } from "./planning-world";
+import { buildPlanningWorld, type PlanningWorldProvenance } from "./planning-world";
 
 // Browser holder planning is gated for the load-bearing presentation-stub rule, and
 // opts IN to missing_provenance enforcement (#12): the relay records per-cell
@@ -463,6 +463,14 @@ export function createShadowBrowserRelayShim(input: {
   deployment?: string;
   session_revs?: Record<string, number>;
   idempotency_window_ms?: number;
+  // Per-cell provenance for the seed (A3.2). The constructor is generic across
+  // holders (gateway / REST / CommitScopeDO / browser / dev), so it imposes NO
+  // default: each caller declares its seed's true provenance — an authority-derived
+  // seed passes `cellProvenanceFromAuthoritySlice(slice)` (preserving
+  // authoritative/projection/cache per page), the browser holder factory stamps
+  // `cache`, and a direct/no-authority serialized seed leaves it empty (unknown).
+  // Flattening every seed to `cache` here would mislabel real authority rows.
+  seedCellProvenance?: PlanningWorldProvenance;
 }): ShadowBrowserRelayShim {
   const deployment = input.deployment ?? DEFAULT_SHADOW_DEPLOYMENT;
   const auth = buildShadowBrowserSessionAuth({
@@ -476,9 +484,7 @@ export function createShadowBrowserRelayShim(input: {
     scope: input.scope,
     serialized: input.serialized
   });
-  // Comprehensive seed coverage: tag every seeded object's tracked cells so the
-  // browser relay's planning worlds are universally provenance-tagged from open.
-  recordCommitScopeCellProvenance(commitScope, input.serialized.objects.map((obj) => obj.id), "cache");
+  if (input.seedCellProvenance) commitScope.cellProvenance = new Map(input.seedCellProvenance);
   return {
     kind: "woo.browser_relay.shadow.v1",
     node: input.node,
@@ -609,6 +615,15 @@ export function createShadowBrowserNode(input: {
   });
   const cache = createShadowBrowserNodeCache();
   cacheObjectPages(cache, input.cached_objects ?? []);
+  // Browser-holder seed provenance (A3.2 #12): the relay is a DERIVED holder view,
+  // so its seed cells are `cache` (record-if-stronger, so a relay seeded from an
+  // authority slice keeps its stronger provenance). Stamped here in the browser
+  // factory rather than the generic relay constructor, which must stay holder-neutral.
+  recordCommitScopeCellProvenance(
+    input.relay.commit_scope,
+    serializedFor(input.relay.commit_scope, { reason: "browser_seed_provenance" }).objects.map((obj) => obj.id),
+    "cache"
+  );
   const sessionToken = input.session ? shadowBrowserSessionBearer({
     id: input.session,
     actor: input.actor

@@ -13,7 +13,7 @@
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import type { EffectTranscript } from "../core/effect-transcript";
-import { buildSerializedAuthorityCellSlice, combineSerializedAuthoritySlices, serializedWorldFromAuthoritySlice } from "../core/authority-slice";
+import { buildSerializedAuthorityCellSlice, cellProvenanceFromAuthoritySlice, combineSerializedAuthoritySlices, serializedWorldFromAuthoritySlice } from "../core/authority-slice";
 import { wooError, type AppliedFrame, type DirectResultFrame, type ErrorFrame, type ErrorValue, type Message, type ObjRef, type Session, type WooValue } from "../core/types";
 import type { WooWorld } from "../core/world";
 import type { SerializedAuthoritySlice, SerializedObject, SerializedSession, SerializedWorld } from "../core/repository";
@@ -748,7 +748,10 @@ export class McpGateway {
         relay: createShadowBrowserRelayShim({
           node: `mcp-v2-relay:${scope}`,
           scope,
-          serialized: seeded.serialized
+          serialized: seeded.serialized,
+          // Authority-derived seed: carry the slice's real per-cell provenance
+          // (authoritative/projection/cache per page), not a flat `cache`.
+          seedCellProvenance: cellProvenanceFromAuthoritySlice(seeded.authority.authority)
         }),
         openedSessions: new Set(),
         openingSessions: new Map()

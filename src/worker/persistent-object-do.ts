@@ -32,6 +32,7 @@ import {
   authoritySlicePageCount,
   authoritySliceObjectIds,
   buildSerializedAuthorityCellSlice,
+  cellProvenanceFromAuthoritySlice,
   combineSerializedAuthoritySlices,
   filterSerializedAuthoritySlicePages,
   isAuthorityCellSlice,
@@ -72,6 +73,7 @@ import type { ShadowStateTransfer, ShadowTurnExecReply } from "../core/shadow-tu
 import { runShadowTurnCall } from "../core/shadow-turn-call";
 import { authoritativePlanningWorld } from "../core/planning-world";
 import {
+  applyAcceptedProjectionToCommitScopeCache,
   applyAcceptedShadowFrame,
   applyShadowTranscriptToCommitScopeCache,
   recordAcceptedCommitScopeCellProvenance,
@@ -4343,7 +4345,11 @@ export class PersistentObjectDO {
         relay: createShadowBrowserRelayShim({
           node: `${this.durableHostKey()}:rest-relay:${scope}`,
           scope,
-          serialized: seeded.serialized
+          serialized: seeded.serialized,
+          // Authority-derived seed: carry the slice's real per-cell provenance so a
+          // first-open turn that plans before mergeRestPlanningAuthority still sees
+          // tagged cells (not flattened to cache).
+          seedCellProvenance: cellProvenanceFromAuthoritySlice(seeded.authority.authority)
         }),
         openedAt: Date.now(),
         nextTurn: 0
@@ -4894,7 +4900,7 @@ export class PersistentObjectDO {
       applyAcceptedShadowFrame(restRelay.relay.commit_scope, reply.body.commit, reply.body.transcript);
       publishShadowBrowserAcceptedFrame(restRelay.relay, reply.body.commit, reply.body.transcript);
     }
-    this.propagateRestTranscriptToOtherRelays(reply.body.commit.position.scope, reply.body.transcript);
+    this.propagateRestTranscriptToOtherRelays(reply.body.commit.position.scope, reply.body.commit, reply.body.transcript);
     const projectionWrites = reply.body.commit.projection_writes ?? [];
     const projectionDelta = reply.body.commit.projection_delta;
     // The gateway maintains its projection-row cache from the accepted commit's
@@ -4926,17 +4932,24 @@ export class PersistentObjectDO {
     });
   }
 
-  private propagateRestTranscriptToOtherRelays(originScope: ObjRef, transcript: EffectTranscript): void {
+  private propagateRestTranscriptToOtherRelays(originScope: ObjRef, accepted: ShadowCommitAccepted, transcript: EffectTranscript): void {
     // REST relays are cached per planning scope. A movement turn may plan under a
     // room scope and commit under the moved object's location authority, so every
     // cached planning relay must see the accepted writes even though only the
-    // authority relay advances its head.
+    // authority relay advances its head. Mirror the MCP gateway
+    // (propagateTranscriptToOtherScopes): materialize the accepted authority
+    // projection_writes object rows when present (so a moved object's real
+    // lineage/live row lands, not just contents membership), falling back to
+    // transcript replay only for receiver-profiled frames that carry no authority rows.
     for (const [scope, client] of this.restV2Relays) {
       if (scope === originScope) continue;
-      applyShadowTranscriptToCommitScopeCache(client.relay.commit_scope, transcript);
-      // Record provenance for the cells this propagation just wrote, so the
-      // admission gate does not flag them missing on this other relay's next plan.
-      recordAcceptedCommitScopeCellProvenance(client.relay.commit_scope, transcript, undefined, "cache");
+      if (!applyAcceptedProjectionToCommitScopeCache(client.relay.commit_scope, accepted, transcript)) {
+        applyShadowTranscriptToCommitScopeCache(client.relay.commit_scope, transcript);
+      }
+      // Record provenance for the cells this propagation just wrote (transcript +
+      // authority projection_writes), so the admission gate does not flag them
+      // missing on this other relay's next plan.
+      recordAcceptedCommitScopeCellProvenance(client.relay.commit_scope, transcript, accepted, "cache");
       markShadowBrowserRelaySerializedChanged(client.relay);
     }
   }

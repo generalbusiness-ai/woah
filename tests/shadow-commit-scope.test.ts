@@ -4,6 +4,7 @@ import type { EffectTranscript } from "../src/core/effect-transcript";
 import type { SerializedObject, SerializedWorld } from "../src/core/repository";
 import {
   acceptedFrameTrackedObjectIds,
+  applyAcceptedProjectionToCommitScopeCache,
   applyShadowTranscriptToCommitScopeCache,
   applyShadowTranscriptToIndexedState,
   createShadowCommitScope,
@@ -270,6 +271,35 @@ describe("shadow commit scope", () => {
     recordAcceptedCommitScopeCellProvenance(scope, emptyTranscript, accepted, "cache");
     expect(scope.cellProvenance?.get(planningCellKey("remote_widget", "object_lineage"))).toEqual({ source: "cache" });
     expect(scope.cellProvenance?.get(planningCellKey("remote_widget", "object_live"))).toEqual({ source: "cache" });
+  });
+
+  // P1a (review): MCP/REST cross-relay parity. applyAcceptedProjectionToCommitScopeCache
+  // materializes the authority projection_writes object rows (a moved object's real
+  // lineage/live), which transcript-only replay (applyShadowTranscriptToCommitScopeCache)
+  // does NOT — that drift left a relay with room.contents=["actor"] but no actor row.
+  it("materializes authority projection_writes object rows (not just transcript replay)", () => {
+    const accepted = {
+      projection_writes: [
+        { table: "objects", op: "upsert", key: "remote_widget", row: objectRecord("remote_widget", "Remote Widget", "room", []) }
+      ]
+    } as unknown as ShadowCommitAccepted;
+    const emptyTranscript: EffectTranscript = {
+      kind: "woo.effect_transcript.shadow.v1", id: "frame-only", route: "sequenced", scope: "room", seq: 0,
+      session: "session-1", call: { actor: "actor", target: "room", verb: "noop", args: [], body: undefined },
+      reads: [], writes: [], creates: [], moves: [], observations: [], logicalInputs: [], untrackedEffects: [],
+      complete: true, incompleteReasons: [], hash: "transcript:frame-only"
+    };
+
+    // Transcript replay alone (no creates) does not materialize the row.
+    const replayScope = createShadowCommitScope({ node: "scope:test", scope: "room", serialized: serializedWorld() });
+    applyShadowTranscriptToCommitScopeCache(replayScope, emptyTranscript);
+    expect(serializedFor(replayScope).objects.some((o) => o.id === "remote_widget")).toBe(false);
+
+    // The MCP/REST projection apply materializes the authority row.
+    const projScope = createShadowCommitScope({ node: "scope:test", scope: "room", serialized: serializedWorld() });
+    expect(applyAcceptedProjectionToCommitScopeCache(projScope, accepted, emptyTranscript)).toBe(true);
+    const widget = serializedFor(projScope).objects.find((o) => o.id === "remote_widget");
+    expect(widget?.name).toBe("Remote Widget");
   });
 
   // record-if-stronger (review): a derived `cache` stamp never downgrades a stronger

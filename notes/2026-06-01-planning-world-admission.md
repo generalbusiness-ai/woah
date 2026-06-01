@@ -354,3 +354,37 @@ Validation: typecheck 0 · npm test 276→ (with shadow-commit-scope added) · t
 PRE-EXISTING failures (predate session start 82b4148). Missing_provenance is now
 enforced (repair-driven, record-if-stronger) across MCP gateway + REST + browser; the
 accepted-frame provenance set matches the applier exactly via one shared core helper.
+
+## Update (2026-06-01 — review P1a/P1b: REST parity + per-caller seed provenance)
+
+P1a (REST cross-relay propagation diverged from MCP): propagateRestTranscriptToOtherRelays
+now takes the accepted commit and mirrors the MCP gateway —
+applyAcceptedProjectionToCommitScopeCache(...accepted...) || applyShadowTranscriptToCommitScopeCache(...),
+then recordAcceptedCommitScopeCellProvenance(..., accepted, "cache"). A propagated move now
+materializes the moved object's authority projection_writes row (real lineage/live), not just
+contents membership. Test: shadow-commit-scope "materializes authority projection_writes object
+rows (not just transcript replay)".
+
+P1b (createShadowBrowserRelayShim hardcoded cache for every seed): removed the unconditional
+stamp from the generic relay constructor (it is shared by gateway/REST/CommitScopeDO/browser/dev
+and was flattening real authoritative/projection seeds to cache). Seed provenance is now explicit
+per caller:
+- generic constructor takes optional seedCellProvenance (no default);
+- gateway + REST authority-derived seeds pass cellProvenanceFromAuthoritySlice(slice) — so a
+  first-open turn that plans before the planning-authority merge still sees real provenance;
+- CommitScopeDO sets cellProvenanceFromAuthoritySlice(input.authority) after creation (empty for
+  no-authority seeds — correct per its CA12 comment);
+- the browser-holder factory createShadowBrowserNode stamps `cache` (record-if-stronger) for the
+  holder's seed — the right source for a derived holder, centralized in the browser factory rather
+  than the holder-neutral constructor;
+- durable-snapshot restore (loadRowSnapshot) and the dev full-world seed leave it empty (unknown ⇒
+  merge-protected ⇒ effectively authoritative — correct for owner/full state).
+Tests: shadow-browser-node "seed provenance" describe (authority seed preserved; no-seed empty;
+browser factory stamps cache; record-if-stronger does not downgrade authority).
+
+Validation: typecheck 0 · npm test 290/290 · test:worker 202 passed/5 skipped · gate:authority 2/2
+· test:full 1380 passed (only the 3 pre-existing inherited failures predating merge-base 846d0a8).
+
+A3.2 is now as-built complete: the admission gate's accepted-frame provenance recording is one
+shared core helper (recordAcceptedCommitScopeCellProvenance, includes projection_writes), seed
+provenance is honest per holder, and all three sparse cloud planning paths enforce uniformly.
