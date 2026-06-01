@@ -115,33 +115,38 @@ export function collectPlanningWorldViolations(
     : undefined;
   const violations: PlanningAdmissibilityViolation[] = [];
   for (const obj of serialized.objects) {
-    const lineageKey = planningCellKey(obj.id, "object_lineage");
-    if (allow.has(lineageKey)) continue;
-    const lineageProv = provenance.get(lineageKey) ?? fallbackProv;
-    const isAuthoritative = lineageProv?.source === "authoritative";
-    // Stub-ness is classified INDEPENDENTLY of provenance: a `name===id` lineage
-    // (outside the `$`-namespace) is a presentation stub unless it is the owner's
-    // authoritative row — whether its provenance is recorded non-authoritative OR
-    // absent entirely. An absent-provenance stub must still enter repair (it is the
-    // exact id-as-name leak), so it is classified as presentation_stub_lineage, NOT
-    // demoted to the non-fatal missing_provenance bucket. missing_provenance is
-    // reserved for NON-stub cells whose provenance simply was not recorded.
-    if (isStubLineage(obj) && !isAuthoritative) {
-      violations.push({
-        kind: "presentation_stub_lineage",
-        object: obj.id,
-        page: "object_lineage",
-        detail: `name===id stub for ${obj.id} admitted as planning lineage with source=${lineageProv?.source ?? "<absent>"} (not authoritative)`
-      });
-      continue;
-    }
-    if (!lineageProv) {
-      violations.push({
-        kind: "missing_provenance",
-        object: obj.id,
-        page: "object_lineage",
-        detail: `object_lineage for ${obj.id} reached the planning world without provenance`
-      });
+    // Every tracked page is inspected for missing provenance — not lineage alone.
+    // The presentation-stub classification is lineage-only (it is about identity),
+    // but provenance coverage is required on each tracked cell (e.g. object_live's
+    // location/contents) or the cell silently bypassed the admission gate.
+    for (const page of TRACKED_PAGES) {
+      const key = planningCellKey(obj.id, page);
+      if (allow.has(key)) continue;
+      const prov = provenance.get(key) ?? fallbackProv;
+      // Stub-ness is classified INDEPENDENTLY of provenance, on the lineage cell
+      // only: a `name===id` lineage (outside the `$`-namespace) is a presentation
+      // stub unless it is the owner's authoritative row — whether its provenance is
+      // recorded non-authoritative OR absent. An absent-provenance stub must still
+      // enter repair (the id-as-name leak), so it is presentation_stub_lineage, NOT
+      // demoted to non-fatal missing_provenance.
+      if (page === "object_lineage" && isStubLineage(obj) && prov?.source !== "authoritative") {
+        violations.push({
+          kind: "presentation_stub_lineage",
+          object: obj.id,
+          page,
+          detail: `name===id stub for ${obj.id} admitted as planning lineage with source=${prov?.source ?? "<absent>"} (not authoritative)`
+        });
+        continue;
+      }
+      // missing_provenance: a tracked cell with no recorded (or defaulted) provenance.
+      if (!prov) {
+        violations.push({
+          kind: "missing_provenance",
+          object: obj.id,
+          page,
+          detail: `${page} for ${obj.id} reached the planning world without provenance`
+        });
+      }
     }
   }
   return violations;
