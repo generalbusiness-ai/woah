@@ -45,7 +45,7 @@ export type MergeSerializedAuthorityOptions = {
 // reflects confidence: a Directory-published `projection` of a present session
 // is fresher than a non-owner host's stored `cache` row, which beats a
 // representation-bridge `fallback`, which beats opportunistic `gossip`.
-const AUTHORITY_SOURCE_RANK: Record<AuthorityPageSource, number> = {
+export const AUTHORITY_SOURCE_RANK: Record<AuthorityPageSource, number> = {
   authoritative: 4,
   projection: 3,
   cache: 2,

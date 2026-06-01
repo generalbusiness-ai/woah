@@ -74,6 +74,7 @@ import { authoritativePlanningWorld } from "../core/planning-world";
 import {
   applyAcceptedShadowFrame,
   applyShadowTranscriptToCommitScopeCache,
+  recordAcceptedCommitScopeCellProvenance,
   serializedFor,
   shadowLocationCommitScopeForTranscript,
   transcriptTouchedObjectIds,
@@ -4400,7 +4401,11 @@ export class PersistentObjectDO {
     authority: SerializedAuthoritySlice
   ): void {
     const serialized = serializedFor(client.relay.commit_scope, { reason: "rest_planning_authority_merge", metric: (event) => world.recordMetric(event) });
-    mergeExecutorAuthority(serialized, authority, { clone: true });
+    // A3.2: carry the REST relay's per-cell provenance through the merge (mirrors the
+    // MCP gateway's mergeV2AuthorityIntoScopeClient), so the same provenance precedence
+    // + stub-repair apply and the admission gate can enforce on this sparse path.
+    const cellProvenance = (client.relay.commit_scope.cellProvenance ??= new Map());
+    mergeExecutorAuthority(serialized, authority, { clone: true, cellProvenance });
   }
 
   private async v2GatewayState(world: WooWorld, extraObjectIds: Iterable<ObjRef>): Promise<{ serialized: SerializedWorld; authority: ReturnType<typeof executorAuthorityPayload> }> {
@@ -4736,6 +4741,18 @@ export class PersistentObjectDO {
       clientNode: (client) => client.node,
       clientHead: (client) => client.relay.commit_scope.head,
       clientSerialized: (client) => serializedFor(client.relay.commit_scope, { reason: "rest_turn_plan", metric: (event) => world.recordMetric(event) }),
+      // A3.2 admission gate (mirrors the MCP gateway): the REST durable planning path
+      // is sparse cloud planning too. Thread the relay's per-cell provenance and opt
+      // IN to fatal missing_provenance enforcement; a presentation stub / untagged
+      // cell raises a repairable E_NEED_STATE that this submitTurnIntent repair loop
+      // resolves. onAdmissionViolation observes.
+      clientPlanningProvenance: (client) => client.relay.commit_scope.cellProvenance ?? new Map(),
+      enforceMissingProvenance: true,
+      onAdmissionViolation: (violations) => {
+        for (const v of violations) {
+          console.warn("woo.planning_world_inadmissible", { where: "rest_turn_plan", scope: input.scope, kind: v.kind, object: v.object, page: v.page, detail: v.detail });
+        }
+      },
       nextTurnId: (client) => `${client.node}:turn:${client.nextTurn++}:${crypto.randomUUID()}`,
       envelopeId: (id, attempt) => executorEnvelopeId(id, attempt, () => crypto.randomUUID()),
       // Per-turn authority refresh against an already-opened relay; the
@@ -4778,7 +4795,10 @@ export class PersistentObjectDO {
             serialized: seeded.serialized
           });
           if (opened.head) client.relay.commit_scope.head = opened.head;
-          mergeExecutorAuthority(serializedFor(client.relay.commit_scope, { reason: "rest_capsule_open_seed", metric: (event) => world.recordMetric(event) }), seeded.authority.authority, { clone: true });
+          mergeExecutorAuthority(
+            serializedFor(client.relay.commit_scope, { reason: "rest_capsule_open_seed", metric: (event) => world.recordMetric(event) }),
+            seeded.authority.authority,
+            { clone: true, cellProvenance: (client.relay.commit_scope.cellProvenance ??= new Map()) });
           const { execution_capsule, ...legacyBody } = capsuleBody;
           void execution_capsule;
           return await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(scope, "/v2/envelope", legacyBody);
@@ -4914,6 +4934,9 @@ export class PersistentObjectDO {
     for (const [scope, client] of this.restV2Relays) {
       if (scope === originScope) continue;
       applyShadowTranscriptToCommitScopeCache(client.relay.commit_scope, transcript);
+      // Record provenance for the cells this propagation just wrote, so the
+      // admission gate does not flag them missing on this other relay's next plan.
+      recordAcceptedCommitScopeCellProvenance(client.relay.commit_scope, transcript, undefined, "cache");
       markShadowBrowserRelaySerializedChanged(client.relay);
     }
   }

@@ -28,6 +28,9 @@ import {
   type ProjectionDeltaSummary,
   type ProjectionWrite
 } from "./projection-delta";
+import { AUTHORITY_SOURCE_RANK } from "./authority-slice";
+import { PLANNING_TRACKED_PAGES, planningCellKey } from "./planning-world";
+import type { AuthorityPageSource } from "./shadow-state-pages";
 
 export type ShadowScopeHead = {
   kind: "woo.scope_head.shadow.v1";
@@ -1071,6 +1074,54 @@ export function transcriptTouchedObjectIds(transcript: EffectTranscript): Set<Ob
     ids.add(move.to);
   }
   return ids;
+}
+
+// A3.2 coverage: record per-cell provenance for the tracked cells (object_lineage +
+// object_live) of `objectIds` on a commit-scope's provenance side-table. Used by the
+// derived-holder caches (gateway relay, browser relay) when they materialize cells
+// outside the provenance-recording authority merge — at seed and on accepted-frame
+// application — so the admission gate does not flag those cells missing. Recorded
+// record-if-stronger: a higher-ranked recorded source (e.g. an owner `authoritative`
+// or a `projection` from a merge) is never downgraded by a derived `cache` stamp.
+export function recordCommitScopeCellProvenance(
+  scope: ShadowCommitScope,
+  objectIds: Iterable<ObjRef>,
+  source: AuthorityPageSource
+): void {
+  const prov = (scope.cellProvenance ??= new Map<string, AuthorityPageProvenance>());
+  const rank = AUTHORITY_SOURCE_RANK[source];
+  for (const id of objectIds) {
+    for (const page of PLANNING_TRACKED_PAGES) {
+      const key = planningCellKey(id, page);
+      const existing = prov.get(key);
+      if (existing && AUTHORITY_SOURCE_RANK[existing.source] > rank) continue;
+      prov.set(key, { source });
+    }
+  }
+}
+
+// The object set an accepted frame materializes into a commit-scope cache: the
+// transcript-touched ids PLUS the authority object rows carried in
+// `projection_writes` (which `applyAcceptedShadowFrame` materializes directly, and
+// which transcriptTouchedObjectIds does NOT include). Both gateway and browser use
+// this so the recorded provenance set matches exactly what the applier wrote.
+export function acceptedFrameTrackedObjectIds(transcript: EffectTranscript, accepted?: ShadowCommitAccepted): Set<ObjRef> {
+  const ids = transcriptTouchedObjectIds(transcript);
+  for (const write of accepted?.projection_writes ?? []) {
+    if (write.table === "objects" && typeof write.key === "string") ids.add(write.key as ObjRef);
+  }
+  return ids;
+}
+
+// Record provenance for every object an accepted frame materialized (transcript +
+// authority projection_writes). The single helper the gateway and browser both call.
+export function recordAcceptedCommitScopeCellProvenance(
+  scope: ShadowCommitScope,
+  transcript: EffectTranscript,
+  accepted: ShadowCommitAccepted | undefined,
+  source: AuthorityPageSource
+): void {
+  recordCommitScopeCellProvenance(scope, acceptedFrameTrackedObjectIds(transcript, accepted), source);
 }
 
 function serializedObjectFromCreate(create: TranscriptCreate, objectTimestamp: number | undefined): SerializedObject {

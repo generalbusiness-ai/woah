@@ -317,3 +317,40 @@ SerializedWorld unrepresentable at the VM boundary; the single admission constru
 stub rule (always) and missing_provenance (on the universally-tagged gateway + browser paths) via
 repair; coverage is recorded at merge, seed, and accepted-frame application across gateway,
 CommitScopeDO, and browser.
+
+## Update (2026-06-01 — review fixes: REST on the provenance contract; centralized accepted-frame recording)
+
+Two review findings, both fixed:
+
+P1a (REST durable planning was off the contract): mirrored the MCP gateway on the REST
+v2 turn path (persistent-object-do):
+- submitTurnIntent now passes clientPlanningProvenance (relay.commit_scope.cellProvenance)
+  + enforceMissingProvenance: true + onAdmissionViolation logging.
+- mergeRestPlanningAuthority and the capsule-reopen seed merge pass cellProvenance.
+- propagateRestTranscriptToOtherRelays records provenance for the cells it propagates.
+- REST relay seed (shared createShadowBrowserRelayShim) and accepted-frame apply
+  (shared publishShadowBrowserAcceptedFrame) already record provenance.
+So all three sparse cloud planning paths — MCP gateway, REST, browser — now enforce.
+
+P1b (browser recorded a different set than the applier): centralized in core.
+- `acceptedFrameTrackedObjectIds(transcript, accepted)` = transcript-touched ids PLUS
+  the authority `projection_writes` object rows the applier materializes (which
+  transcriptTouchedObjectIds omits).
+- `recordCommitScopeCellProvenance(scope, ids, source)` / `recordAcceptedCommitScopeCellProvenance`
+  record record-if-stronger (a derived `cache` never downgrades a merge-recorded
+  authoritative/projection), exported from shadow-commit-scope and used by BOTH gateway
+  and browser (replacing the two divergent local helpers). Also tightened from
+  set-if-absent to record-if-stronger to match authority-merge semantics.
+- The browser seed + accepted-frame paths now use the shared helper, so a
+  projection_writes-materialized row (the reviewer's `remote_widget`) is tagged.
+
+Also: collectPlanningWorldViolations review fix (object_live coverage) confirmed.
+
+Tests: shadow-commit-scope +2 (projection_writes object rows tracked; cache never
+downgrades authoritative) — added to the curated npm test gate. planning-world 16/16.
+
+Validation: typecheck 0 · npm test 276→ (with shadow-commit-scope added) · test:worker
+202 passed/5 skipped · gate:authority 2/2 · test:full 1378 passed, only the 3
+PRE-EXISTING failures (predate session start 82b4148). Missing_provenance is now
+enforced (repair-driven, record-if-stronger) across MCP gateway + REST + browser; the
+accepted-frame provenance set matches the applier exactly via one shared core helper.

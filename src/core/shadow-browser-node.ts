@@ -4,6 +4,8 @@ import {
   isShadowCommitScopeSerializedDirty,
   markShadowCommitScopeSerializedChanged,
   applyShadowTranscriptToCommitScopeCache,
+  recordAcceptedCommitScopeCellProvenance,
+  recordCommitScopeCellProvenance,
   shadowCommitScopeSerializedRef,
   shadowLocationCommitScopeForTranscript,
   serializedFor,
@@ -30,28 +32,16 @@ import {
 } from "./shadow-turn-exec";
 import { shadowStatePageHash, shadowStatePagesForObject, type ShadowStatePage } from "./shadow-state-pages";
 import { runShadowTurnCall, runShadowTurnCallTranscript, type ShadowTurnCall } from "./shadow-turn-call";
-import { buildPlanningWorld, planningCellKey } from "./planning-world";
+import { buildPlanningWorld } from "./planning-world";
 
 // Browser holder planning is gated for the load-bearing presentation-stub rule, and
 // opts IN to missing_provenance enforcement (#12): the relay records per-cell
 // provenance for every tracked cell — comprehensively at seed
-// (recordBrowserSeedCellProvenance) and incrementally on accepted-frame application
-// (recordBrowserAcceptedCellProvenance) — so its planning worlds are universally
-// tagged. A residual untagged cell raises a repairable E_NEED_STATE.
+// (recordCommitScopeCellProvenance) and incrementally on accepted-frame application
+// (recordAcceptedCommitScopeCellProvenance, which includes the authority
+// projection_writes object rows the applier materializes) — so its planning worlds
+// are universally tagged. A residual untagged cell raises a repairable E_NEED_STATE.
 const BROWSER_ADMISSION_OPTS = { enforceMissingProvenance: true } as const;
-
-// Tag a commit scope's tracked cells (object_lineage + object_live) `cache` for the
-// given object ids — set-if-absent, so a merge-recorded source is never downgraded.
-// The browser relay is a derived holder view, so `cache` is the honest source.
-function recordBrowserCommitScopeCellProvenance(scope: ShadowCommitScope, objectIds: Iterable<string>): void {
-  const prov = (scope.cellProvenance ??= new Map());
-  for (const id of objectIds) {
-    for (const page of ["object_lineage", "object_live"] as const) {
-      const key = planningCellKey(id, page);
-      if (!prov.has(key)) prov.set(key, { source: "cache" });
-    }
-  }
-}
 import { buildShadowScopeTurnExecAd, buildShadowTurnExecAd, buildShadowTurnExecAdFromNode, executeShadowTurnCallAcrossInProcessNetwork, type ShadowInProcessNetworkResult } from "./shadow-turn-network";
 import { shadowAtomHash, shadowMaterializedAtomHashesFromSerialized, shadowTurnKeyFromCall, shadowTurnKeyFromTranscript, type ShadowTurnKey } from "./turn-key";
 import type { EffectTranscript } from "./effect-transcript";
@@ -488,7 +478,7 @@ export function createShadowBrowserRelayShim(input: {
   });
   // Comprehensive seed coverage: tag every seeded object's tracked cells so the
   // browser relay's planning worlds are universally provenance-tagged from open.
-  recordBrowserCommitScopeCellProvenance(commitScope, input.serialized.objects.map((obj) => obj.id));
+  recordCommitScopeCellProvenance(commitScope, input.serialized.objects.map((obj) => obj.id), "cache");
   return {
     kind: "woo.browser_relay.shadow.v1",
     node: input.node,
@@ -1651,8 +1641,9 @@ export function publishShadowBrowserAcceptedFrame(
     applyShadowTranscriptToCommitScopeCache(relay.commit_scope, transcript);
   }
   // Incremental coverage: an accepted frame mutates the relay's tracked cells
-  // without a provenance-recording merge, so tag the touched objects' cells.
-  recordBrowserCommitScopeCellProvenance(relay.commit_scope, transcriptTouchedObjectIds(transcript));
+  // (transcript writes AND authority projection_writes object rows) without a
+  // provenance-recording merge, so tag exactly that object set.
+  recordAcceptedCommitScopeCellProvenance(relay.commit_scope, transcript, accepted, "cache");
   rememberShadowBrowserAcceptedFrame(relay, accepted, transcript);
   // Drop per-session live snapshots so the next live/direct call rebases on
   // the freshly committed scope state instead of a stale pre-commit view.

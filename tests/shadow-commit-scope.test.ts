@@ -3,12 +3,16 @@ import { describe, expect, it } from "vitest";
 import type { EffectTranscript } from "../src/core/effect-transcript";
 import type { SerializedObject, SerializedWorld } from "../src/core/repository";
 import {
+  acceptedFrameTrackedObjectIds,
   applyShadowTranscriptToCommitScopeCache,
   applyShadowTranscriptToIndexedState,
   createShadowCommitScope,
+  recordAcceptedCommitScopeCellProvenance,
   serializedFor,
-  transcriptTouchedObjectIds
+  transcriptTouchedObjectIds,
+  type ShadowCommitAccepted
 } from "../src/core/shadow-commit-scope";
+import { planningCellKey } from "../src/core/planning-world";
 import type { MetricEvent } from "../src/core/types";
 
 describe("shadow commit scope", () => {
@@ -224,6 +228,59 @@ describe("shadow commit scope", () => {
     const row = (moverUpsert as { row?: SerializedObject }).row;
     expect(row?.name).toBe("Mover");
     expect(row?.location).toBe("dest");
+  });
+
+  // P1b (review): an accepted frame can materialize authority rows via
+  // projection_writes that the transcript does not touch. The provenance-recording
+  // set MUST include those object keys, or a relay caches a row with no provenance
+  // and the admission gate flags it missing. acceptedFrameTrackedObjectIds (shared by
+  // gateway + browser) covers transcript-touched ids PLUS projection_writes objects.
+  it("tracks projection_writes object rows an accepted frame materializes, not just transcript-touched ids", () => {
+    const emptyTranscript: EffectTranscript = {
+      kind: "woo.effect_transcript.shadow.v1",
+      id: "frame-only",
+      route: "sequenced",
+      scope: "room",
+      seq: 0,
+      session: "session-1",
+      call: { actor: "actor", target: "room", verb: "noop", args: [], body: undefined },
+      reads: [],
+      writes: [],
+      creates: [],
+      moves: [],
+      observations: [],
+      logicalInputs: [],
+      untrackedEffects: [],
+      complete: true,
+      incompleteReasons: [],
+      hash: "transcript:frame-only"
+    };
+    const accepted = {
+      projection_writes: [
+        { table: "objects", op: "upsert", key: "remote_widget", row: objectRecord("remote_widget", "Remote Widget", "room", []) }
+      ]
+    } as unknown as ShadowCommitAccepted;
+
+    // The transcript alone touches nothing; the helper must still surface the
+    // projection_writes object row.
+    expect(transcriptTouchedObjectIds(emptyTranscript).has("remote_widget")).toBe(false);
+    expect(acceptedFrameTrackedObjectIds(emptyTranscript, accepted).has("remote_widget")).toBe(true);
+
+    const scope = createShadowCommitScope({ node: "scope:test", scope: "room", serialized: serializedWorld() });
+    recordAcceptedCommitScopeCellProvenance(scope, emptyTranscript, accepted, "cache");
+    expect(scope.cellProvenance?.get(planningCellKey("remote_widget", "object_lineage"))).toEqual({ source: "cache" });
+    expect(scope.cellProvenance?.get(planningCellKey("remote_widget", "object_live"))).toEqual({ source: "cache" });
+  });
+
+  // record-if-stronger (review): a derived `cache` stamp never downgrades a stronger
+  // recorded source (e.g. an owner authoritative row from a merge).
+  it("does not downgrade a stronger recorded provenance with a cache stamp", () => {
+    const scope = createShadowCommitScope({ node: "scope:test", scope: "room", serialized: serializedWorld() });
+    // "room" is in addChildTranscript's touched set (its contents cell is written),
+    // so the cache stamp would apply — but a recorded authoritative source must win.
+    (scope.cellProvenance ??= new Map()).set(planningCellKey("room", "object_lineage"), { source: "authoritative" });
+    recordAcceptedCommitScopeCellProvenance(scope, addChildTranscript(), undefined, "cache");
+    expect(scope.cellProvenance?.get(planningCellKey("room", "object_lineage"))).toEqual({ source: "authoritative" });
   });
 });
 

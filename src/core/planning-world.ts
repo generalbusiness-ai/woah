@@ -45,7 +45,8 @@ export type PlanningWorldProvenance = Map<string, AuthorityPageProvenance>;
 // slice — identity and live cells, matching the merge-layer scope). Property and
 // verb cells are admitted without provenance enforcement for now; widening the set
 // is a later increment that must only ever ADD page kinds.
-const TRACKED_PAGES: ReadonlySet<ShadowStatePage["page"]> = new Set(["object_lineage", "object_live"]);
+export const PLANNING_TRACKED_PAGES: ReadonlySet<ShadowStatePage["page"]> = new Set(["object_lineage", "object_live"]);
+const TRACKED_PAGES = PLANNING_TRACKED_PAGES;
 
 // Key a tracked cell for the provenance map. Identity/live cells have no name
 // component; property/verb cells (not yet tracked) would carry their name. Kept
