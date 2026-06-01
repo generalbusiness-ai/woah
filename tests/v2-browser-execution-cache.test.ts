@@ -1,3 +1,4 @@
+import { authoritativePlanningWorld } from "../src/core/planning-world";
 import { describe, expect, it } from "vitest";
 
 import { createWorld } from "../src/core/bootstrap";
@@ -60,7 +61,7 @@ describe("v2 browser executable cache", () => {
       verb: "set_control",
       args: ["delay_1", "wet", 0.42]
     };
-    const planned = await runShadowTurnCall(serialized, call);
+    const planned = await runShadowTurnCall(authoritativePlanningWorld(serialized), call);
     const key = shadowTurnKeyFromTranscript(planned.transcript);
     const fullTransfer = buildShadowCellPageTransfer({ serialized, key, session: session.id });
     const compactTransfer = buildShadowCellPageTransfer({

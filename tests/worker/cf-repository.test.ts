@@ -1,3 +1,4 @@
+import { authoritativePlanningWorld } from "../../src/core/planning-world";
 import { describe, expect, it, vi } from "vitest";
 import { installVerb } from "../../src/core/authoring";
 import { createWorld } from "../../src/core/bootstrap";
@@ -769,7 +770,7 @@ describe("v2 Worker fan-out helpers", () => {
         verb: "set_control",
         args: ["delay_1", "wet", 0.62]
       };
-      const planned = await runShadowTurnCall(serializedFor(localRelay.commit_scope), call);
+      const planned = await runShadowTurnCall(authoritativePlanningWorld(serializedFor(localRelay.commit_scope)), call);
       const turnRequest = {
         kind: "woo.turn.exec.request.shadow.v1" as const,
         id: call.id,
@@ -1957,7 +1958,7 @@ describe("CFObjectRepository production-shape coverage", () => {
         verb: "set_value",
         args: [67]
       };
-      const planned = await runShadowTurnCall(serializedFor(browser.relay.commit_scope), call);
+      const planned = await runShadowTurnCall(authoritativePlanningWorld(serializedFor(browser.relay.commit_scope)), call);
       const request = {
         kind: "woo.turn.exec.request.shadow.v1" as const,
         id: call.id,
@@ -2160,7 +2161,7 @@ describe("CFObjectRepository production-shape coverage", () => {
         verb: "southeast",
         args: []
       };
-      const planned = await runShadowTurnCall(serializedFor(browser.relay.commit_scope), call);
+      const planned = await runShadowTurnCall(authoritativePlanningWorld(serializedFor(browser.relay.commit_scope)), call);
       const request = {
         kind: "woo.turn.exec.request.shadow.v1" as const,
         id: call.id,

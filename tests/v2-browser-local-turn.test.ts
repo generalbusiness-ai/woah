@@ -1,3 +1,4 @@
+import { authoritativePlanningWorld } from "../src/core/planning-world";
 import { describe, expect, it, vi } from "vitest";
 
 import { planV2BrowserLocalTurn } from "../src/client/v2-browser-local-turn";
@@ -67,7 +68,7 @@ describe("v2 browser local turn planning", () => {
     anchor.setProp("the_dubspace", "operators", [session.actor]);
     const serialized = anchor.exportWorld();
     const call = dubspaceCall(session.id, session.actor, 0.42);
-    const planned = await runShadowTurnCall(serialized, call);
+    const planned = await runShadowTurnCall(authoritativePlanningWorld(serialized), call);
     const key = shadowTurnKeyFromTranscript(planned.transcript);
     const actorNode = createShadowExecutionNode({ node: "browser:test", scope: key.scope });
     const routed = await executeShadowTurnCallAcrossInProcessNetwork({
@@ -139,7 +140,7 @@ describe("v2 browser local turn planning", () => {
       });
       const transfer = buildShadowBrowserOpenExecutableSeedTransfer(relay, scope, `browser:${scope}`, session.actor);
       const tentative_transcripts = tentative
-        ? [(await runShadowTurnCall(serialized, {
+        ? [(await runShadowTurnCall(authoritativePlanningWorld(serialized), {
           kind: "woo.turn_call.shadow.v1",
           id: `${scope}:enter`,
           route: "sequenced",
@@ -277,7 +278,7 @@ describe("v2 browser local turn planning", () => {
     const first = anchor.auth("guest:v2-browser-local-peer-enter-a");
     const second = anchor.auth("guest:v2-browser-local-peer-enter-b");
     const serialized = anchor.exportWorld();
-    const firstEntered = await runShadowTurnCall(serialized, {
+    const firstEntered = await runShadowTurnCall(authoritativePlanningWorld(serialized), {
       kind: "woo.turn_call.shadow.v1",
       id: "pinboard-peer-enter-a",
       route: "sequenced",
@@ -342,7 +343,7 @@ describe("v2 browser local turn planning", () => {
       serialized
     });
     const transfer = buildShadowBrowserOpenExecutableSeedTransfer(relay, "the_pinboard", "browser:pinboard-tail", session.actor);
-    const entered = await runShadowTurnCall(serialized, {
+    const entered = await runShadowTurnCall(authoritativePlanningWorld(serialized), {
       kind: "woo.turn_call.shadow.v1",
       id: "pinboard-tail-enter",
       route: "sequenced",
@@ -353,7 +354,7 @@ describe("v2 browser local turn planning", () => {
       verb: "enter",
       args: []
     });
-    const added = await runShadowTurnCall(entered.serializedAfter, {
+    const added = await runShadowTurnCall(authoritativePlanningWorld(entered.serializedAfter), {
       kind: "woo.turn_call.shadow.v1",
       id: "pinboard-tail-add",
       route: "sequenced",
@@ -433,7 +434,7 @@ describe("v2 browser local turn planning", () => {
       serialized
     });
     const transfer = buildShadowBrowserOpenExecutableSeedTransfer(relay, "the_outline", "browser:outline-tail", session.actor);
-    const entered = await runShadowTurnCall(serialized, {
+    const entered = await runShadowTurnCall(authoritativePlanningWorld(serialized), {
       kind: "woo.turn_call.shadow.v1",
       id: "outline-tail-enter",
       route: "sequenced",
@@ -444,7 +445,7 @@ describe("v2 browser local turn planning", () => {
       verb: "enter",
       args: []
     });
-    const added = await runShadowTurnCall(entered.serializedAfter, {
+    const added = await runShadowTurnCall(authoritativePlanningWorld(entered.serializedAfter), {
       kind: "woo.turn_call.shadow.v1",
       id: "outline-tail-add",
       route: "sequenced",
@@ -527,7 +528,7 @@ describe("v2 browser local turn planning", () => {
       serialized
     });
     const seed = buildShadowBrowserOpenExecutableSeedTransfer(relay, "the_outline", "browser:outline-tentative-text", session.actor);
-    const entered = await runShadowTurnCall(serialized, {
+    const entered = await runShadowTurnCall(authoritativePlanningWorld(serialized), {
       kind: "woo.turn_call.shadow.v1",
       id: "outline-tentative-enter-reference",
       route: "sequenced",
@@ -538,7 +539,7 @@ describe("v2 browser local turn planning", () => {
       verb: "enter",
       args: []
     });
-    const added = await runShadowTurnCall(entered.serializedAfter, {
+    const added = await runShadowTurnCall(authoritativePlanningWorld(entered.serializedAfter), {
       kind: "woo.turn_call.shadow.v1",
       id: "outline-tentative-add-reference",
       route: "sequenced",
@@ -660,7 +661,7 @@ describe("v2 browser local turn planning", () => {
       verb: "enter",
       args: []
     };
-    const entered = await runShadowTurnCall(serialized, enterCall);
+    const entered = await runShadowTurnCall(authoritativePlanningWorld(serialized), enterCall);
     const addCall: ShadowTurnCall = {
       kind: "woo.turn_call.shadow.v1",
       id: "pinboard-add",
@@ -672,7 +673,7 @@ describe("v2 browser local turn planning", () => {
       verb: "add_note",
       args: ["journal note", "yellow", 48, 48, 180, 110]
     };
-    const added = await runShadowTurnCall(entered.serializedAfter, addCall);
+    const added = await runShadowTurnCall(authoritativePlanningWorld(entered.serializedAfter), addCall);
     const enterKey = shadowTurnKeyFromTranscript(entered.transcript);
     const addKey = shadowTurnKeyFromTranscript(added.transcript);
     const enterTransfer = buildShadowCellPageTransfer({
@@ -766,7 +767,7 @@ describe("v2 browser local turn planning", () => {
         `browser:${scenario.scope}:one-repair`,
         session.actor
       );
-      const entered = await runShadowTurnCall(serialized, {
+      const entered = await runShadowTurnCall(authoritativePlanningWorld(serialized), {
         kind: "woo.turn_call.shadow.v1",
         id: `${scenario.scope}:one-repair-enter`,
         route: "sequenced",
@@ -836,7 +837,7 @@ describe("v2 browser local turn planning", () => {
     anchor.setProp("the_dubspace", "operators", [session.actor]);
     const serialized = anchor.exportWorld();
     const call = dubspaceCall(session.id, session.actor, 0.57);
-    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(serialized, call)).transcript);
+    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(authoritativePlanningWorld(serialized), call)).transcript);
     const relay = createShadowBrowserRelayShim({
       node: "relay:dubspace-missing-state",
       scope: "the_dubspace",
@@ -913,7 +914,7 @@ async function expectLocalTranscriptToMatchServer(scenario: LocalTranscriptParit
     verb: scenario.verb,
     args: scenario.args
   };
-  const server = await runShadowTurnCall(serialized, call);
+  const server = await runShadowTurnCall(authoritativePlanningWorld(serialized), call);
   const key = shadowTurnKeyFromTranscript(server.transcript);
   // The open executable seed carries shared runtime objects such as $wiz; the
   // turn-specific transfer carries the exact cells selected for this call.

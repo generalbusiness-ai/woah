@@ -30,6 +30,7 @@ import {
 } from "./shadow-turn-exec";
 import { shadowStatePageHash, shadowStatePagesForObject, type ShadowStatePage } from "./shadow-state-pages";
 import { runShadowTurnCall, runShadowTurnCallTranscript, type ShadowTurnCall } from "./shadow-turn-call";
+import { buildPlanningWorld } from "./planning-world";
 import { buildShadowScopeTurnExecAd, buildShadowTurnExecAd, buildShadowTurnExecAdFromNode, executeShadowTurnCallAcrossInProcessNetwork, type ShadowInProcessNetworkResult } from "./shadow-turn-network";
 import { shadowAtomHash, shadowMaterializedAtomHashesFromSerialized, shadowTurnKeyFromCall, shadowTurnKeyFromTranscript, type ShadowTurnKey } from "./turn-key";
 import type { EffectTranscript } from "./effect-transcript";
@@ -1352,7 +1353,9 @@ export async function executeShadowBrowserTurn(
     args: input.args ?? [],
     body: input.body
   };
-  const planned = await runShadowTurnCallTranscript(serializedFor(browser.relay.commit_scope, { reason: "browser_turn_plan" }), call);
+  const planned = await runShadowTurnCallTranscript(
+    buildPlanningWorld(serializedFor(browser.relay.commit_scope, { reason: "browser_turn_plan" }), browser.relay.commit_scope.cellProvenance ?? new Map()),
+    call);
   const key = shadowTurnKeyFromTranscript(planned.transcript);
   const pending: ShadowBrowserPendingTurn = {
     id,
@@ -1880,7 +1883,7 @@ async function executeShadowBrowserLivePersistenceCall(
   const sessionKey = call.session ?? call.actor;
   const serializedBefore = browser.relay.live_session_serialized.get(sessionKey) ?? serializedFor(browser.relay.commit_scope, { reason: "live_persistence_base" });
   const headHashBefore = browser.relay.commit_scope.head.hash;
-  const run = await runShadowTurnCall(serializedBefore, call, { onMetric });
+  const run = await runShadowTurnCall(buildPlanningWorld(serializedBefore, browser.relay.commit_scope.cellProvenance ?? new Map()), call, { onMetric });
   // A live/direct read may be started by UI hydration immediately after a
   // fire-and-forget sequenced write. If that read finishes after the write
   // commits, caching its pre-commit post-state would resurrect a stale live
@@ -1917,7 +1920,7 @@ async function shadowTurnExecRequestFromIntent(
   const serialized = intent.persistence === "live"
     ? browser.relay.live_session_serialized.get(call.session ?? call.actor) ?? serializedFor(browser.relay.commit_scope, { reason: "intent_live_plan" })
     : serializedFor(browser.relay.commit_scope, { reason: "intent_plan" });
-  const planned = await runShadowTurnCallTranscript(serialized, call, { onMetric });
+  const planned = await runShadowTurnCallTranscript(buildPlanningWorld(serialized, browser.relay.commit_scope.cellProvenance ?? new Map()), call, { onMetric });
   return {
     kind: "woo.turn.exec.request.shadow.v1",
     id: call.id,

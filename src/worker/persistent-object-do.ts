@@ -70,6 +70,7 @@ import { parseShadowScopeHeadJson } from "../core/shadow-scope-head";
 import { buildTransportErrorEnvelope, decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
 import type { ShadowStateTransfer, ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import { runShadowTurnCall } from "../core/shadow-turn-call";
+import { authoritativePlanningWorld } from "../core/planning-world";
 import {
   applyAcceptedShadowFrame,
   applyShadowTranscriptToCommitScopeCache,
@@ -4812,7 +4813,9 @@ export class PersistentObjectDO {
   }
 
   private async restV2TurnInProcess(world: WooWorld, input: Parameters<NonNullable<RestProtocolHost["executeTurn"]>>[0]): Promise<AppliedFrame | DirectResultFrame | ErrorFrame> {
-    const snapshot = world.exportWorld();
+    // The in-process REST fallback plans against this host's OWN full world
+    // export — authoritative by construction, not a sparse cross-host projection.
+    const snapshot = authoritativePlanningWorld(world.exportWorld());
     const run = await runShadowTurnCall(snapshot, {
       kind: "woo.turn_call.shadow.v1",
       id: input.id,

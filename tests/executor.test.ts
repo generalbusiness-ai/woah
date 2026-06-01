@@ -1,3 +1,4 @@
+import { authoritativePlanningWorld } from "../src/core/planning-world";
 import { describe, expect, it } from "vitest";
 import { authoritySliceObjectIds, buildSerializedAuthorityCellSlice } from "../src/core/authority-slice";
 import { createWorld } from "../src/core/bootstrap";
@@ -42,7 +43,7 @@ describe("v2 turn gateway", () => {
       expect(ids.has(id)).toBe(true);
     }
 
-    const look = await runShadowTurnCall(serialized, {
+    const look = await runShadowTurnCall(authoritativePlanningWorld(serialized), {
       kind: "woo.turn_call.shadow.v1",
       id: "authority-look-room",
       route: "direct",
@@ -60,7 +61,7 @@ describe("v2 turn gateway", () => {
       contents: expect.arrayContaining([expect.objectContaining({ id: "the_outline" })])
     });
 
-    const lookOutline = await runShadowTurnCall(serialized, {
+    const lookOutline = await runShadowTurnCall(authoritativePlanningWorld(serialized), {
       kind: "woo.turn_call.shadow.v1",
       id: "authority-look-outline",
       route: "direct",

@@ -1,3 +1,4 @@
+import { authoritativePlanningWorld } from "../src/core/planning-world";
 import { describe, expect, it } from "vitest";
 
 import { selectV2DelegatedExecutor, selectV2DelegatedScopeExecutor, v2ExecutionAdRecord } from "../src/client/v2-browser-delegation";
@@ -63,5 +64,5 @@ async function plannedDubspaceKey() {
     verb: "set_control",
     args: ["delay_1", "wet", 0.31]
   };
-  return shadowTurnKeyFromTranscript((await runShadowTurnCall(world.exportWorld(), call)).transcript);
+  return shadowTurnKeyFromTranscript((await runShadowTurnCall(authoritativePlanningWorld(world.exportWorld()), call)).transcript);
 }

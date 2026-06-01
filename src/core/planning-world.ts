@@ -20,7 +20,10 @@
 // is never an admissible planning cell at all.
 
 import type { SerializedObject, SerializedWorld } from "./repository";
-import type { AuthorityPageProvenance, ShadowStatePage } from "./shadow-state-pages";
+import type { AuthorityPageProvenance, AuthorityPageSource, ShadowStatePage } from "./shadow-state-pages";
+import { shadowAtomHash } from "./turn-key";
+import { wooError } from "./types";
+import type { ErrorValue } from "./types";
 
 // A nominal brand so a raw `SerializedWorld` cannot be passed where a vetted
 // planning world is required. The brand is a phantom field — it never exists at
@@ -75,6 +78,12 @@ export type PlanningAdmissibilityOptions = {
   // `buildPlanningWorld`. This set may only SHRINK; when it empties the gate is
   // unconditional. Mirrors the gate:authority KNOWN_CI_DEBT_CELLS ratchet.
   allow?: ReadonlySet<string>;
+  // Source assumed for a tracked cell that carries NO recorded provenance. An
+  // authoritative caller (owner full-state, bootstrap snapshot) passes
+  // "authoritative" so its untagged cells are trusted — never flagged
+  // missing_provenance, and a legitimate `name===id` is not a stub. Sparse/
+  // projection callers omit it: an untagged tracked cell is missing_provenance.
+  defaultProvenanceSource?: AuthorityPageSource;
 };
 
 // Is this object's lineage a presentation stub — `name === id` synthesized because
@@ -101,11 +110,14 @@ export function collectPlanningWorldViolations(
   options: PlanningAdmissibilityOptions = {}
 ): PlanningAdmissibilityViolation[] {
   const allow = options.allow ?? EMPTY_ALLOW;
+  const fallbackProv: AuthorityPageProvenance | undefined = options.defaultProvenanceSource
+    ? { source: options.defaultProvenanceSource }
+    : undefined;
   const violations: PlanningAdmissibilityViolation[] = [];
   for (const obj of serialized.objects) {
     const lineageKey = planningCellKey(obj.id, "object_lineage");
     if (allow.has(lineageKey)) continue;
-    const lineageProv = provenance.get(lineageKey);
+    const lineageProv = provenance.get(lineageKey) ?? fallbackProv;
     const isAuthoritative = lineageProv?.source === "authoritative";
     // Stub-ness is classified INDEPENDENTLY of provenance: a `name===id` lineage
     // (outside the `$`-namespace) is a presentation stub unless it is the owner's
@@ -156,10 +168,76 @@ export function assertPlanningWorldAdmissible(
   );
 }
 
-// Brand a vetted SerializedWorld as a PlanningWorld. ONLY the admission gate calls
-// this; everything else receives the branded type and cannot reconstruct it. The
-// cast is the single sanctioned widening — it is the type-system seam where
-// "admissible" is asserted.
-export function markPlanningWorld(serialized: SerializedWorld): PlanningWorld {
+// Brand a vetted SerializedWorld as a PlanningWorld. INTERNAL — only the
+// constructors below call it. The cast is the single sanctioned widening: the
+// type-system seam where "admissible" is asserted. Callers cannot reconstruct the
+// brand, so the only way to obtain a PlanningWorld is through a constructor that
+// ran the gate.
+function markPlanningWorld(serialized: SerializedWorld): PlanningWorld {
   return serialized as PlanningWorld;
 }
+
+// Build the repairable missing-state error for inadmissible cells. The repair loop
+// (`submitTurnIntent`) extracts the named objects from the `cell:lifecycle:<id>`
+// preimages, refreshes their authority, and re-plans against the named identity.
+// A caller without a repair loop propagates this as a turn failure — the correct
+// loud signal that an identity is genuinely unresolvable, never an id-as-name.
+function planningInadmissibleNeedState(violations: readonly PlanningAdmissibilityViolation[]): ErrorValue {
+  return wooError("E_NEED_STATE", "planning world admitted an inadmissible cell; repair identity", {
+    missing_atoms: violations.map((v) => {
+      const preimage = `read:cell:lifecycle:${v.object}`;
+      return { hash: shadowAtomHash(preimage), preimage };
+    })
+  });
+}
+
+export type BuildPlanningWorldOptions = {
+  allow?: ReadonlySet<string>;
+  // Untagged tracked cells are treated as this source (see
+  // PlanningAdmissibilityOptions.defaultProvenanceSource).
+  defaultProvenanceSource?: AuthorityPageSource;
+  // When true, an untagged tracked cell (missing_provenance) is fatal-by-repair too,
+  // not only reported. Presentation stubs are always fatal-by-repair regardless.
+  enforceMissingProvenance?: boolean;
+  // Optional observability sink for every violation (fatal or not). Independent of
+  // enforcement — enforcement depends on the violation kinds + flags above, never on
+  // whether this is supplied.
+  onViolation?: (violations: PlanningAdmissibilityViolation[]) => void;
+};
+
+// THE admission point. Every SerializedWorld that will reach the VM boundary
+// (`runShadowTurnCallTranscript` / `runShadowTurnCall`) MUST pass through here (or
+// `authoritativePlanningWorld`). It runs the gate, raises a repairable
+// `E_NEED_STATE` for inadmissible cells, and returns the branded world. The brand
+// makes "went through the gate" a type-level fact: the boundary cannot be called
+// with a raw SerializedWorld.
+export function buildPlanningWorld(
+  serialized: SerializedWorld,
+  provenance: PlanningWorldProvenance,
+  options: BuildPlanningWorldOptions = {}
+): PlanningWorld {
+  const violations = collectPlanningWorldViolations(serialized, provenance, {
+    ...(options.allow ? { allow: options.allow } : {}),
+    ...(options.defaultProvenanceSource ? { defaultProvenanceSource: options.defaultProvenanceSource } : {})
+  });
+  if (violations.length > 0) {
+    options.onViolation?.(violations);
+    const fatal = violations.filter((v) =>
+      v.kind === "presentation_stub_lineage" ||
+      (options.enforceMissingProvenance === true && v.kind === "missing_provenance"));
+    if (fatal.length > 0) throw planningInadmissibleNeedState(fatal);
+  }
+  return markPlanningWorld(serialized);
+}
+
+// Admission for an AUTHORITATIVE world: the owner's full state, a bootstrap
+// snapshot, or any materialization that is authoritative by construction. Every
+// untagged cell is trusted (`defaultProvenanceSource: "authoritative"`), so no
+// cell is flagged missing_provenance and a legitimate `name===id` is not a stub.
+// This is the type-safe way for an owner/authoritative path to reach the VM
+// boundary without threading per-cell provenance it does not need.
+export function authoritativePlanningWorld(serialized: SerializedWorld): PlanningWorld {
+  return buildPlanningWorld(serialized, EMPTY_PROVENANCE, { defaultProvenanceSource: "authoritative" });
+}
+
+const EMPTY_PROVENANCE: PlanningWorldProvenance = new Map();

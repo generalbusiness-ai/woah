@@ -31,7 +31,7 @@ import {
 } from "./shadow-browser-node";
 import { decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "./shadow-envelope";
 import { runShadowTurnCallTranscript, type ShadowTurnCall, type ShadowTurnCallTranscriptRun } from "./shadow-turn-call";
-import type { PlanningAdmissibilityViolation, PlanningWorldProvenance } from "./planning-world";
+import { buildPlanningWorld, type PlanningAdmissibilityViolation, type PlanningWorldProvenance } from "./planning-world";
 import type { ShadowMissingAtom, ShadowTurnExecReply, ShadowTurnExecRequest } from "./shadow-turn-exec";
 import {
   shadowLocationCommitScopeForTranscript,
@@ -472,14 +472,17 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     if (!serialized) throw new Error("planned v2 turn gateway submission requires clientSerialized");
     let planned: ShadowTurnCallTranscriptRun;
     try {
-      const planningProvenance = options.clientPlanningProvenance?.(planningClient);
-      planned = await runShadowTurnCallTranscript(serialized, call, {
-        ...(options.onMetric ? { onMetric: options.onMetric } : {}),
-        // Enforcement depends ONLY on planningProvenance. onAdmissionViolation is
-        // optional observability; a caller that supplies provenance but no logger
-        // still gets the runtime gate (it must not be silently skippable).
-        ...(planningProvenance ? { planningProvenance } : {}),
-        ...(options.onAdmissionViolation ? { onAdmissionViolation: options.onAdmissionViolation } : {})
+      // Admit the planning world through the gate, then run the VM against the
+      // branded result. A presentation stub (or, where enforced, an untagged cell)
+      // raises a repairable E_NEED_STATE here — caught by this try's repair branch,
+      // which refreshes the named object's authority and retries. Sparse planning
+      // always passes through the gate; provenance defaults to empty when a caller
+      // does not thread it (still enforced — onAdmissionViolation is only logging).
+      const planningProvenance = options.clientPlanningProvenance?.(planningClient) ?? new Map();
+      const planningWorld = buildPlanningWorld(serialized, planningProvenance,
+        options.onAdmissionViolation ? { onViolation: options.onAdmissionViolation } : {});
+      planned = await runShadowTurnCallTranscript(planningWorld, call, {
+        ...(options.onMetric ? { onMetric: options.onMetric } : {})
       });
     } catch (err) {
       // Sparse MCP planning can discover a transitive object before the commit

@@ -1,6 +1,6 @@
 import { createWorldFromSerialized } from "./bootstrap";
 import { effectTranscriptFromRecordedTurn, type EffectTranscript } from "./effect-transcript";
-import { collectPlanningWorldViolations, type PlanningAdmissibilityViolation, type PlanningWorldProvenance } from "./planning-world";
+import type { PlanningWorld } from "./planning-world";
 import type { SerializedWorld } from "./repository";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, Message, MetricEvent, ObjRef, WooValue } from "./types";
 import { wooError } from "./types";
@@ -40,16 +40,6 @@ export type ShadowTurnCallTranscriptRun = Omit<ShadowTurnCallRun, "serializedAft
 
 export type ShadowTurnCallOptions = {
   allowed_atom_hashes?: Iterable<string>;
-  // A3.2 PlanningWorld admission gate, runtime wiring (discovery mode). When a
-  // caller threads the planning world's per-cell provenance here,
-  // runShadowTurnCallTranscript runs the admissibility check at the VM boundary —
-  // the single point where a SerializedWorld becomes the VM's readable world — and
-  // reports any inadmissible cell (e.g. a presentation stub winning identity) to
-  // `onAdmissionViolation`. It does NOT throw yet: enforcement (reject the world)
-  // is the P4 flip, gated on emptying the discovered debt. Callers that omit this
-  // get the prior behavior, so no path is forced through the gate before P4.
-  planningProvenance?: PlanningWorldProvenance;
-  onAdmissionViolation?: (violations: PlanningAdmissibilityViolation[]) => void;
   // Optional forwarder for engine metric events. The ephemeral executor
   // world has no metrics hook by default, so events like `direct_call`,
   // `applied`, and `dispatch_resolved` get dropped on the v2 hot path
@@ -59,54 +49,33 @@ export type ShadowTurnCallOptions = {
   onMetric?: (event: MetricEvent) => void;
 };
 
+// The VM-execution boundary. Accepts ONLY a `PlanningWorld` — a SerializedWorld
+// that has passed the admission gate via `buildPlanningWorld` /
+// `authoritativePlanningWorld`. The brand makes "went through the gate" a
+// compile-time fact: no path can run the VM against a raw SerializedWorld, so a
+// presentation stub or untagged cell is refused (repair-routed) before it reaches
+// the VM. Enforcement lives in the constructor, not here.
 export async function runShadowTurnCall(
-  serializedBefore: SerializedWorld,
+  world: PlanningWorld,
   call: ShadowTurnCall,
   options: ShadowTurnCallOptions = {}
 ): Promise<ShadowTurnCallRun> {
-  const world = createWorldFromSerialized(serializedBefore, { persist: false });
-  world.setMetricsHook(options.onMetric ?? null);
-  return await runShadowTurnCallOnWorld(world, call, options);
+  const built = createWorldFromSerialized(world, { persist: false });
+  built.setMetricsHook(options.onMetric ?? null);
+  return await runShadowTurnCallOnWorld(built, call, options);
 }
 
 export async function runShadowTurnCallTranscript(
-  serializedBefore: SerializedWorld,
+  world: PlanningWorld,
   call: ShadowTurnCall,
   options: ShadowTurnCallOptions = {}
 ): Promise<ShadowTurnCallTranscriptRun> {
   // Durable commit scopes apply transcripts authoritatively, so planning and
   // commit-scope execution should not pay for a full executor post-state export
   // unless a caller explicitly needs that snapshot.
-  if (options.planningProvenance) {
-    // Runtime admission gate (P4 enforcement, repair-driven). Inspect the planning
-    // world at the VM boundary — the single point where a SerializedWorld becomes
-    // the VM's readable world.
-    const violations = collectPlanningWorldViolations(serializedBefore, options.planningProvenance);
-    if (violations.length > 0) {
-      options.onAdmissionViolation?.(violations);
-      // A presentation stub winning planning identity is inadmissible. Enforce it
-      // NOT by a hard fail (a stub admission is typically transient and repairable),
-      // but by raising a repairable missing-state for the stubbed objects: the
-      // submitTurnIntent retry loop refreshes those objects' authority and re-plans
-      // against the named identity. Only a persistent, unrepairable stub (the bounded
-      // repair retry exhausts) fails the turn — which is the correct loud signal that
-      // an identity genuinely cannot be resolved, never a silently-served id-as-name.
-      // `missing_provenance` stays non-fatal (reported via onAdmissionViolation) until
-      // per-cell provenance coverage is universal across every seed/snapshot path.
-      const stubs = violations.filter((v) => v.kind === "presentation_stub_lineage");
-      if (stubs.length > 0) {
-        throw wooError("E_NEED_STATE", "planning world admitted a presentation stub; repair identity", {
-          missing_atoms: stubs.map((stub) => {
-            const preimage = `read:cell:lifecycle:${stub.object}`;
-            return { hash: shadowAtomHash(preimage), preimage };
-          })
-        });
-      }
-    }
-  }
-  const world = createWorldFromSerialized(serializedBefore, { persist: false });
-  if (options.onMetric) world.setMetricsHook(options.onMetric);
-  return await runShadowTurnCallOnWorldTranscript(world, call, options);
+  const built = createWorldFromSerialized(world, { persist: false });
+  if (options.onMetric) built.setMetricsHook(options.onMetric);
+  return await runShadowTurnCallOnWorldTranscript(built, call, options);
 }
 
 export async function runShadowTurnCallOnWorld(

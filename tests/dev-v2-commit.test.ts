@@ -1,3 +1,4 @@
+import { authoritativePlanningWorld } from "../src/core/planning-world";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,7 +17,7 @@ describe("dev v2 commit materialization", () => {
     try {
       const world = createWorld({ repository: repo });
       const session = world.auth("guest:dev-v2-commit");
-      const entered = await runShadowTurnCall(world.exportWorld(), {
+      const entered = await runShadowTurnCall(authoritativePlanningWorld(world.exportWorld()), {
         kind: "woo.turn_call.shadow.v1",
         id: "dev-v2-outline-enter",
         route: "sequenced",
@@ -29,7 +30,7 @@ describe("dev v2 commit materialization", () => {
       });
       materializeDevV2CommitLocally(world, "the_outline", entered.transcript);
 
-      const added = await runShadowTurnCall(world.exportWorld(), {
+      const added = await runShadowTurnCall(authoritativePlanningWorld(world.exportWorld()), {
         kind: "woo.turn_call.shadow.v1",
         id: "dev-v2-outline-add",
         route: "sequenced",
@@ -62,7 +63,7 @@ describe("dev v2 commit materialization", () => {
     try {
       const world = createWorld({ repository: repo });
       const session = world.auth("guest:dev-v2-pinboard");
-      const entered = await runShadowTurnCall(world.exportWorld(), {
+      const entered = await runShadowTurnCall(authoritativePlanningWorld(world.exportWorld()), {
         kind: "woo.turn_call.shadow.v1",
         id: "dev-v2-pinboard-enter",
         route: "sequenced",
@@ -75,7 +76,7 @@ describe("dev v2 commit materialization", () => {
       });
       materializeDevV2CommitLocally(world, "the_pinboard", entered.transcript);
 
-      const added = await runShadowTurnCall(world.exportWorld(), {
+      const added = await runShadowTurnCall(authoritativePlanningWorld(world.exportWorld()), {
         kind: "woo.turn_call.shadow.v1",
         id: "dev-v2-pinboard-add",
         route: "sequenced",
@@ -106,7 +107,7 @@ describe("dev v2 commit materialization", () => {
     const first = world.auth("guest:dev-v2-contents-a");
     const second = world.auth("guest:dev-v2-contents-b");
     const initial = world.exportWorld();
-    const firstEnter = await runShadowTurnCall(initial, {
+    const firstEnter = await runShadowTurnCall(authoritativePlanningWorld(initial), {
       kind: "woo.turn_call.shadow.v1",
       id: "dev-v2-pinboard-enter-a",
       route: "sequenced",
@@ -117,7 +118,7 @@ describe("dev v2 commit materialization", () => {
       verb: "enter",
       args: []
     });
-    const secondEnter = await runShadowTurnCall(initial, {
+    const secondEnter = await runShadowTurnCall(authoritativePlanningWorld(initial), {
       kind: "woo.turn_call.shadow.v1",
       id: "dev-v2-pinboard-enter-b",
       route: "sequenced",
