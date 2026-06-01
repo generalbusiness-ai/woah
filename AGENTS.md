@@ -165,6 +165,9 @@ Use Git worktrees for isolation.  Every subagent must work in .claude/worktrees/
 - Are migrations needed?  Use the decision table below.
 - If migrations are used, they must be test-run on a local Sqlite woo.
 
+Commit to *worktree* after every major task, inlcuding a description
+of the change and its effects on the system.
+
 **Smoke-test discipline**
 
 Cloudflare full smoke-test is *the most expensive* validation step.
