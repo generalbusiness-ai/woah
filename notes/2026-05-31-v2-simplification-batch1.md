@@ -21,10 +21,12 @@ gate-validated subset of the simplification review in this session. Net
    `"intent"` branch was never entered. Collapsed `submitTurnIntent` to a single
    strategy; dropped the `strategy`/`intentScope` options and their no-op args.
 3. `1cc9a09` **Delete prototype-only gossip profiler.** Removed
-   `shadow-gossip-profile.ts`, its test, `scripts/profile-shadow-turn-network.ts`,
-   and the `v2:profile` npm script — none on the production graph. (`turn-replay.ts`
-   was KEPT: it is imported by `shadow-turn-exec.ts`, contradicting the original
-   "test-only" assumption.)
+   `shadow-gossip-profile.ts`, its test, and `scripts/profile-shadow-turn-network.ts`
+   — none on the production graph. (`turn-replay.ts` was KEPT: it is imported by
+   `shadow-turn-exec.ts`, contradicting the original "test-only" assumption.)
+   NOTE: this commit deleted the profiler script file but left the `v2:profile`
+   entry in `package.json` pointing at it (an orphaned npm script — green because
+   typecheck/test don't validate package.json). Fixed in `6ca7129`.
 4. `9009630` **Demote MV-A/#placement spec to historical pointer.** Replaced the
    ~70-line withdrawn MV-A contract in `spec/protocol/v2-turn-network.md` §VTN8.1
    with a one-paragraph record, and removed `write_fence_missing` from the protocol
