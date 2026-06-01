@@ -6,7 +6,6 @@ import {
   createShadowCommitScope,
   serializedFor,
   shadowLocationCommitScopeForTranscript,
-  shadowPlacementTransactionForTranscript,
   submitShadowCommit
 } from "../src/core/shadow-commit-scope";
 import { runShadowTurnCallTranscript, type ShadowTurnCall } from "../src/core/shadow-turn-call";
@@ -59,7 +58,6 @@ describe("actor-anchored movement projection", () => {
 
     const planned = await runShadowTurnCallTranscript(world.exportWorld(), movementCall(alice, "mv_src_a", "move-a"));
     expect(planned.frame).toMatchObject({ op: "applied" });
-    expect(shadowPlacementTransactionForTranscript(planned.transcript)).toBeNull();
     expect(shadowLocationCommitScopeForTranscript(planned.transcript)).toBe(alice.actor);
     expect(planned.transcript.writes.filter((write) => write.cell.kind === "contents")).toEqual([]);
     expect(planned.transcript.writes).toContainEqual(expect.objectContaining({

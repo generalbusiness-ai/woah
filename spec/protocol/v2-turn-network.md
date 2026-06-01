@@ -565,7 +565,6 @@ type CommitConflict = {
   reason:
     | "stale_head"
     | "read_version_mismatch"
-    | "write_fence_missing"
     | "permission_denied"
     | "bytecode_mismatch"
     | "nondeterministic"
@@ -657,78 +656,22 @@ authoritative until the applier grows those cell kinds.
 > sequencers. The replacement is [cell-authority.md](cell-authority.md):
 > `live:location:<object>` is the single authoritative movement write, owned by
 > the moved object's home; room contents are a per-member projection. This
-> subsection is retained only as a record of the withdrawn approach.
+> subsection is retained only as a one-paragraph record of the withdrawn
+> approach.
 
-Moving an actor or object between rooms is not a single-cell write. The
-prototype confirms it touches at least three cells across two scopes: the
-moved object's `location`, the source room's `contents`, and the destination
-room's `contents` (plus any presence/subscriber bookkeeping each room keeps).
-The destination is frequently a *transitively-referenced* object — reached
-through an exit's `dest` property rather than named in the call — so the
-write set spans a scope the turn did not nominate.
-
-This is a multi-scope commit and MUST be made explicit rather than left as an
-implicit "the source scope writes the destination's contents" rule. Writing a
-foreign room's `contents` cell from the source room's commit scope, with no
-fence on the destination, is a latent lost-update/ordering hazard the moment two
-actors move in or out of the same destination concurrently. A spec that ships
-that implicitly is shipping the race.
-
-For the current prototype phase, an implementation MUST choose one of the
-following explicit rules and state which it uses:
-
-- **(MV-A) Combined movement scope.** The turn acquires write authority/fences
-  for the source-contents, destination-contents, and actor-location cells before
-  it commits, and commits them as one atomic placement transaction under a
-  commit scope whose validation covers all three cells. This is the correct
-  end-state: movement is one transaction over the placement cells regardless of
-  which rooms own them.
-- **(MV-B) Stated temporary single-scope rule, with known limits.** The turn
-  commits under the source room's scope and writes the destination's `contents`
-  cell as part of that single-scope commit. This is permitted only as a
-  documented interim with explicitly acknowledged race limits: concurrent moves
-  into or out of the same destination room are not serialized against each other,
-  so destination `contents` can lose an update under contention. An
-  implementation using MV-B MUST record the limitation in its operational notes
-  and MUST NOT represent it as race-safe.
-
-The default direction of travel is MV-A. MV-B is acceptable to unblock the
-materialization-miss fix (VTN10.1) and the non-browser executor path, because
-those are correctness-independent of which placement rule is chosen, but a
-production movement path MUST be MV-A or an equivalently fenced transaction. The
-choice of MV-A vs MV-B does not change VTN10.1: the destination room must still
-be *materialized* (via the lookup-miss probe and cell-page repair) before its
-`contents` cell can be read or written, under either rule.
-
-The MV-A commit contract is explicit. A movement transcript may commit under a
-transaction scope different from `transcript.scope` only when the submit envelope
-carries a placement transaction fence naming every moved object's `location`
-cell and every source/destination room `contents` cell touched by the transcript
-(plus movement-coupled presence cells such as `subscribers` /
-`session_subscribers` when present). Without that fence, a cross-scope movement
-submit is rejected as `scope_mismatch` / `write_fence_missing`. With the fence,
-the transaction scope's head is the concurrency token: stale movement plans
-against the same placement authority must serialize by advancing that head or
-return a clean retryable `stale_head` conflict. They must never be accepted as
-independent single-scope row replacements that can lose destination membership.
-The `TurnKey.scope` remains the execution scope that selected the VM closure;
-the movement transaction scope is chosen after fresh execution reveals the
-actual movement write set, and the submit envelope carries both the original
-transcript scope and the placement fence.
-
-The current Cloudflare prototype uses one deployment-local movement authority,
-`#placement`, for MV-A. That deliberately serializes all movement through one
-commit scope while the correctness boundary is hardened. It is conservative:
-any two movement transactions with overlapping source, destination, or moved
-object cells share the same head and therefore cannot publish independent
-lost-update commits. A later sharded placement authority is allowed only if it
-preserves that overlap property.
-
-Accepted movement commits that fan out under a transaction scope different from
-`transcript.scope` MUST carry the accepted placement transaction on the commit
-frame. A receiver MUST reject cross-scope apply when the transaction is absent
-or does not cover the transcript's required placement cells; "the transcript has
-movement" alone is not an apply authority.
+The withdrawn MV-A design treated movement as a multi-scope *placement
+transaction*: a fence naming the moved object's `location` cell plus every
+source/destination room `contents` cell, committed atomically under a synthetic
+`#placement` commit scope that serialized all movement. It was withdrawn because
+(1) the synthetic scope had no durable snapshot, which regressed production, and
+(2) it kept room membership as one mutable shared `contents` cell that every
+co-present actor must write — a serialization point outside the room and actor
+sequencers. The placement-transaction / `write_fence_missing` / `#placement`
+machinery has been **removed from the implementation**; the normative movement
+contract is [cell-authority.md](cell-authority.md) §CA3 (location-as-truth,
+contents-as-projection). The materialization-miss requirement that the
+destination room be hydrated before its cells are read survives unchanged as
+VTN10.1.
 
 ## VTN9. Catch-up and applied frames
 
