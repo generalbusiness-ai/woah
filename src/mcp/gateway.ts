@@ -631,10 +631,14 @@ export class McpGateway {
       clientNode: () => this.v2NodeFor(entry),
       clientHead: (client) => client.relay.commit_scope.head,
       clientSerialized: (client) => serializedFor(client.relay.commit_scope, { reason: "mcp_turn_plan", metric: (event) => this.world.recordMetric(event) }),
-      // A3.2 admission gate, runtime discovery: thread the relay's per-cell
-      // provenance so the VM boundary checks admissibility. Discovery-only for now
-      // (logs an inadmissible planning cell, e.g. a presentation stub winning
-      // identity); the P4 flip turns this into a hard reject once the debt is empty.
+      // A3.2 admission gate (ENFORCED at the VM boundary via buildPlanningWorld):
+      // thread the relay's per-cell provenance. A presentation stub raises a
+      // repairable E_NEED_STATE (the repair loop refreshes the named object and
+      // re-plans). missing_provenance enforcement is NOT opted in: the cross-shard
+      // walkthrough still surfaces tracked cells whose provenance is not recorded by
+      // every seed/fanout source, so a blanket flip would reject valid cold cells.
+      // Closing those recording gaps (and the browser relay's) is the remaining
+      // Phase-A coverage work that lets #11 flip on. onAdmissionViolation observes.
       clientPlanningProvenance: (client) => client.relay.commit_scope.cellProvenance ?? new Map(),
       onAdmissionViolation: (violations) => {
         for (const v of violations) {

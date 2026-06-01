@@ -238,3 +238,47 @@ Phase-A hardening backlog (close before relying on the gate permanently):
 3. **`missing_provenance` → fatal** once every seed/snapshot path records per-cell
    provenance. Today only the relay merge/seed paths do, so the non-stub coverage
    rule stays observe-only to avoid false rejects of untagged-but-valid cold cells.
+
+## Update (2026-06-01 — review P1/P2 + hardening #9/#10 done; #11 mechanism done, flip coverage-gated)
+
+Review items fixed:
+- P1: stub-ness is now classified independently of provenance — an unprovenanced
+  `name===id` (non-`$`) lineage is `presentation_stub_lineage` (enters repair), not
+  demoted to non-fatal missing_provenance.
+- P2: submitTurnIntent enforcement depends ONLY on planningProvenance;
+  onAdmissionViolation is independent optional observability.
+
+#9 + #10 (brand + coverage) — DONE:
+- `runShadowTurnCallTranscript`/`runShadowTurnCall` accept ONLY a branded
+  `PlanningWorld`; the sole producers are `buildPlanningWorld` (gated) and
+  `authoritativePlanningWorld` (owner/local; untagged cells trusted via
+  defaultProvenanceSource). `markPlanningWorld` is module-private. No path can run the
+  VM against a raw SerializedWorld — a type-level guarantee.
+- Every serialized→VM caller routed: gateway planning (gated + repair loop), browser
+  holder planning (gated, stub-only), client local turn + REST in-process
+  (authoritative), all test call sites (authoritative). CommitScopeDO execution runs
+  on a pre-built world; its authority ENTERS via refreshSessionAuth's provenance-aware
+  merge (stub-repair), so it is enforced at the merge layer.
+- Stub rule (the bug class) is now fatal-by-repair on EVERY gated path.
+
+#11 (missing_provenance → fatal) — MECHANISM DONE; flip COVERAGE-GATED (off):
+- `buildPlanningWorld({ enforceMissingProvenance })` + a `submitTurnIntent` /
+  gateway pass-through implement the flip per-path. Default OFF.
+- Enabling it empirically proved universal coverage is NOT yet achieved:
+  * browser holder relay records no per-cell provenance (materializes from accepted
+    frames, not a provenance-bearing merge) — 22 browser tests would reject;
+  * the 4-shard `cf-local-walkthrough` surfaces a tracked cell whose provenance is
+    not recorded by every seed/fanout source even after repair — gate:authority would
+    reject.
+- Therefore the flip stays OFF (per the task's own "after universal coverage"
+  condition). The remaining coverage work (the prerequisite to flip #11 on):
+  1. Record per-cell provenance on the browser relay's frame/seed materialization.
+  2. Close the cross-shard seed/fanout provenance-recording gap the walkthrough
+     surfaces (a tracked cell reaching a gateway plan untagged).
+  Once both land, flip by setting `enforceMissingProvenance: true` on the gateway
+  submitTurnIntent (and browser) — no other change.
+
+Gates: typecheck 0 · npm test 274/274 · test:worker 202 passed/5 skipped ·
+gate:authority 2/2 · planning-world 14/14 · authority-slice-shape 12/12.
+(Pre-existing test:full failures unrelated to this work — stale analyzer metric-kind
+list + dev-server materialization — predate session start 82b4148.)

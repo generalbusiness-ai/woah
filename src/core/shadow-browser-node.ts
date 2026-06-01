@@ -31,6 +31,13 @@ import {
 import { shadowStatePageHash, shadowStatePagesForObject, type ShadowStatePage } from "./shadow-state-pages";
 import { runShadowTurnCall, runShadowTurnCallTranscript, type ShadowTurnCall } from "./shadow-turn-call";
 import { buildPlanningWorld } from "./planning-world";
+
+// Browser holder planning is gated for the load-bearing presentation-stub rule.
+// missing_provenance enforcement stays OFF here (the buildPlanningWorld default):
+// the browser relay does not yet record per-cell provenance (it materializes from
+// accepted frames/transcripts, not a provenance-bearing authority-slice merge), so
+// enabling it would reject every untagged tracked cell. Browser-relay provenance
+// recording is the Phase-A coverage follow-up that would let it opt in.
 import { buildShadowScopeTurnExecAd, buildShadowTurnExecAd, buildShadowTurnExecAdFromNode, executeShadowTurnCallAcrossInProcessNetwork, type ShadowInProcessNetworkResult } from "./shadow-turn-network";
 import { shadowAtomHash, shadowMaterializedAtomHashesFromSerialized, shadowTurnKeyFromCall, shadowTurnKeyFromTranscript, type ShadowTurnKey } from "./turn-key";
 import type { EffectTranscript } from "./effect-transcript";

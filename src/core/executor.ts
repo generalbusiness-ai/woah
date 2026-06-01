@@ -131,6 +131,11 @@ export type SubmitTurnIntentOptions<Client, Result extends ExecutorEnvelopeResul
   // `onAdmissionViolation` (no throw yet — enforcement is the P4 flip).
   clientPlanningProvenance?(client: Client): PlanningWorldProvenance;
   onAdmissionViolation?(violations: PlanningAdmissibilityViolation[]): void;
+  // Opt IN to fatal missing_provenance enforcement (#11). A caller sets this only on
+  // a path whose planning worlds are universally per-cell provenance-tagged (the
+  // sparse gateway relay, which records provenance on every authority merge). Off by
+  // default so callers planning against authoritative/untagged worlds are unaffected.
+  enforceMissingProvenance?: boolean;
   nextTurnId(client: Client, attempt: number): string;
   envelopeId?(turnId: string, attempt: number): string;
   authorityPayload(
@@ -479,8 +484,10 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       // always passes through the gate; provenance defaults to empty when a caller
       // does not thread it (still enforced — onAdmissionViolation is only logging).
       const planningProvenance = options.clientPlanningProvenance?.(planningClient) ?? new Map();
-      const planningWorld = buildPlanningWorld(serialized, planningProvenance,
-        options.onAdmissionViolation ? { onViolation: options.onAdmissionViolation } : {});
+      const planningWorld = buildPlanningWorld(serialized, planningProvenance, {
+        ...(options.onAdmissionViolation ? { onViolation: options.onAdmissionViolation } : {}),
+        ...(options.enforceMissingProvenance ? { enforceMissingProvenance: true } : {})
+      });
       planned = await runShadowTurnCallTranscript(planningWorld, call, {
         ...(options.onMetric ? { onMetric: options.onMetric } : {})
       });

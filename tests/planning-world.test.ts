@@ -164,9 +164,10 @@ describe("PlanningWorld admission gate — buildPlanningWorld enforcement", () =
     expect(built.objects.find((o) => o.id === "guest_1")?.name).toBe("Guest 1");
   });
 
-  // missing_provenance on a non-stub cell is non-fatal by default, but fatal-by-repair
-  // when enforceMissingProvenance is set (the #11 flip, per-call).
-  it("enforces missing_provenance only when requested", () => {
+  // missing_provenance on a non-stub cell is observe-only by default (coverage is
+  // not yet universal); a path with proven coverage opts IN with
+  // enforceMissingProvenance:true to make it fatal-by-repair (the #11 flip).
+  it("enforces missing_provenance only when the caller opts in", () => {
     const serialized = world([obj("guest_1", "Guest 1", { owner: "guest_1" })]);
     expect(() => buildPlanningWorld(serialized, new Map())).not.toThrow();
     expect(() => buildPlanningWorld(serialized, new Map(), { enforceMissingProvenance: true })).toThrow(/repair identity/);

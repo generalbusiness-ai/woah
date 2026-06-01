@@ -222,9 +222,19 @@ export function buildPlanningWorld(
   });
   if (violations.length > 0) {
     options.onViolation?.(violations);
+    // Presentation stubs are ALWAYS fatal-by-repair (the bug class — enforced on
+    // every gated path). missing_provenance is fatal-by-repair only when a caller
+    // opts IN (enforceMissingProvenance: true) — the #11 flip, which is correct only
+    // on a path whose per-cell provenance recording is universal. It stays OFF by
+    // default because coverage is not yet universal (the browser holder relay
+    // materializes from accepted frames without provenance, and not every gateway
+    // planning world is fully tagged), so a blanket flip would reject valid untagged
+    // cold-load cells. Authoritative paths never reach here with a missing cell
+    // (defaultProvenanceSource tags them).
+    const enforceMissing = options.enforceMissingProvenance === true;
     const fatal = violations.filter((v) =>
       v.kind === "presentation_stub_lineage" ||
-      (options.enforceMissingProvenance === true && v.kind === "missing_provenance"));
+      (enforceMissing && v.kind === "missing_provenance"));
     if (fatal.length > 0) throw planningInadmissibleNeedState(fatal);
   }
   return markPlanningWorld(serialized);
