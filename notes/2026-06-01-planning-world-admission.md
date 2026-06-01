@@ -209,17 +209,32 @@ gate:authority 2/2 (×8) · planning-world 10/10 · authority-slice-shape 12/12.
 - P1 (gate module + invariant tests) — DONE.
 - P2 (provenance carried through combine/merge/seed; layer-3 fixed) — DONE.
 - P3 (runtime wiring at the boundary; provenance threaded gateway→submitTurnIntent→
-  boundary) — DONE. NOT done: branding the boundary type so `runShadowTurnCallTranscript`
-  accepts only a `PlanningWorld` produced by a single `buildPlanningWorld` (compile-time
-  forcing of all callers). The runtime gate already enforces the load-bearing class;
-  the nominal brand is additional defense-in-depth, deferred as optional hardening.
-- P4 (enforce + CI + spec) — DONE (repair-driven enforcement, gated, spec aligned).
+  boundary) — DONE for the gateway planning path.
+- P4 (repair-driven enforcement + CI + spec) — DONE for the gateway planning path:
+  `presentation_stub_lineage` enters the repair loop as `E_NEED_STATE`; the residual
+  unrepairable stub hard-fails. This is the step "enter the repair loop like
+  E_NEED_STATE, then the gate can flip to hard-fail" — landed in `867bfa1`.
 
-### Remaining optional hardening (not required for the invariant to be enforced)
-1. Compile-time brand: `runShadowTurnCallTranscript(world: PlanningWorld)` + a single
-   `buildPlanningWorld` constructor, so no path can pass a raw SerializedWorld.
-2. `missing_provenance` → fatal once every seed/snapshot path records per-cell
-   provenance (universal coverage). Today only the relay merge/seed paths do.
-3. Thread `planningProvenance` into the CommitScopeDO's own VM-execution path (it is
-   threaded on the gateway planning path; the commit executor relies on the
-   already-repaired authority it receives).
+### The regression-fixed bar is met; the continual-guarantee bar is NOT yet
+Enforcement is real but **path-scoped**: it fires only where a caller threads
+`planningProvenance` (today: the gateway planning pass via `submitTurnIntent`). It is
+therefore NOT yet a universal/permanent invariant gate. Per review direction this is
+**Phase-A hardening** — required before leaning on the gate as a continual guarantee,
+and an explicit prerequisite before Phase B (B6–B10) builds on top of it. No Phase-A
+redesign and no Phase-B reordering; only this prerequisite is made explicit:
+
+> Phase B MUST NOT start on top of discovery-only / path-scoped admission. Before
+> B6/B7/B8, the PlanningWorld admission-violation path must drive repair/retry (DONE
+> on the gateway path) AND the boundary must be enforceable across every VM-execution
+> entry point (REMAINING below).
+
+Phase-A hardening backlog (close before relying on the gate permanently):
+1. **Coverage**: thread `planningProvenance` into every VM-execution entry point, not
+   just the gateway planning pass — the CommitScopeDO's own execution, REST, and the
+   browser node. Until then the gate is blind on those paths.
+2. **Compile-time brand**: `runShadowTurnCallTranscript(world: PlanningWorld)` + a
+   single `buildPlanningWorld` constructor, so no path can pass a raw `SerializedWorld`
+   (turns "threaded everywhere" from a convention into a type guarantee).
+3. **`missing_provenance` → fatal** once every seed/snapshot path records per-cell
+   provenance. Today only the relay merge/seed paths do, so the non-stub coverage
+   rule stays observe-only to avoid false rejects of untagged-but-valid cold cells.
