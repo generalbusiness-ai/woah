@@ -43,12 +43,14 @@ import { redactSensitiveSerializedPropertyValues } from "./sensitive-serializati
 import type { EffectTranscript, TranscriptWrite } from "./effect-transcript";
 import {
   applyTranscriptContentsWriteRefs,
+  applyTranscriptPropWrite,
   finalWritesByCell,
   mergeTranscriptLogEntry,
   nextObjectCounterForCreates,
   serializedObjectForTranscriptCreate,
   transcriptLogEntry,
-  transcriptSessionActiveScope
+  transcriptSessionActiveScope,
+  type TranscriptPropTarget
 } from "./shadow-commit-scope";
 import { projectionRowBytes, type ProjectionWrite } from "./projection-delta";
 
@@ -7124,9 +7126,12 @@ export class WooWorld {
   private applyTranscriptWriteInPlace(write: TranscriptWrite, objectTimestamp: number, transcript: EffectTranscript): void {
     const target = this.objects.get(write.cell.object);
     if (!target) return;
-    // Keep this live-object materializer parallel with
-    // applyTranscriptWriteToSerializedObject in shadow-commit-scope.ts. The
-    // Map/Set storage shapes differ, but transcript semantics must not.
+    // A2: the `prop` arm now delegates to the single shared applier
+    // (applyTranscriptPropWrite). The remaining `location`/`contents` arms still
+    // mirror applyTranscriptWriteToSerializedObject by storage shape; the
+    // `contents` arm collapses at A4 (contents leaves the validation/applier path
+    // entirely), after which this whole switch and its serialized twin reduce to
+    // the shared prop/location core.
     switch (write.cell.kind) {
       case "prop":
         this.applyTranscriptPropWriteInPlace(target, write, objectTimestamp);
@@ -7155,29 +7160,39 @@ export class WooWorld {
   }
 
   private applyTranscriptPropWriteInPlace(target: WooObject, write: TranscriptWrite, objectTimestamp: number): void {
-    // Keep this parallel with applyPropWrite in shadow-commit-scope.ts.
+    // A2: delegate the accepted-transcript prop-write semantics to the single
+    // shared applier in shadow-commit-scope.ts via a WooObject-shaped target.
+    // The live graph keeps two live-only side effects the serialized authority
+    // row does not have — the `modified` timestamp and presence-index
+    // invalidation — applied here around the shared write.
     if (write.cell.kind !== "prop") return;
     const propName = write.cell.name;
     const presenceProjection = this.presenceProjectionForObjectRecord(target, propName);
-    if (write.op === "remove") {
-      target.properties.delete(propName);
-      target.propertyVersions.delete(propName);
-      target.modified = objectTimestamp;
-      if (presenceProjection) this.invalidatePresenceIndex();
-      return;
-    }
-    const value = cloneValue(write.value);
-    target.properties.set(propName, value);
-    target.properties = sortedMap(target.properties);
-    if (propName === "name" && typeof value === "string") target.name = value;
-    const parsedVersion = write.next === undefined ? null : Number(write.next);
-    const version = parsedVersion !== null && Number.isInteger(parsedVersion) && parsedVersion >= 0
-      ? parsedVersion
-      : (target.propertyVersions.get(propName) ?? 0) + 1;
-    target.propertyVersions.set(propName, version);
-    target.propertyVersions = sortedMap(target.propertyVersions);
+    applyTranscriptPropWrite(this.wooObjectPropTarget(target), write);
     target.modified = objectTimestamp;
     if (presenceProjection) this.invalidatePresenceIndex();
+  }
+
+  // Adapter: the live executable WooObject graph (Map/Set storage). Pairs with
+  // serializedObjectPropTarget in shadow-commit-scope.ts so both materializations
+  // are the same function of the transcript (VTN0 coherence invariant).
+  private wooObjectPropTarget(target: WooObject): TranscriptPropTarget {
+    return {
+      propertyVersion: (name) => target.propertyVersions.get(name),
+      setProperty: (name, value) => {
+        target.properties.set(name, cloneValue(value));
+        target.properties = sortedMap(target.properties);
+      },
+      removeProperty: (name) => {
+        target.properties.delete(name);
+        target.propertyVersions.delete(name);
+      },
+      setPropertyVersion: (name, version) => {
+        target.propertyVersions.set(name, version);
+        target.propertyVersions = sortedMap(target.propertyVersions);
+      },
+      setObjectName: (name) => { target.name = name; }
+    };
   }
 
   // Clone a verb's mutable wrapper fields (aliases, arg_spec, source, line_map,

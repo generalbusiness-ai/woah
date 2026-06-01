@@ -1192,19 +1192,67 @@ function touchSerializedObject(target: SerializedObject, objectTimestamp: number
   if (objectTimestamp !== undefined) target.modified = objectTimestamp;
 }
 
-function applyPropWrite(target: SerializedObject, write: TranscriptWrite): void {
-  // Keep this parallel with WooWorld.applyTranscriptPropWriteInPlace.
+// A2 (mobile-heap sequence): the single source of accepted-transcript property
+// -write semantics. Both the serialized-row authority applier
+// (applyPropWrite, below) and the live-graph executable applier
+// (WooWorld.applyTranscriptPropWriteInPlace) delegate here through a thin
+// per-storage-shape target, so there is exactly one place that decides what a
+// prop write means. There is no longer a "keep this parallel" twin to drift.
+// VTN0 coherence invariant: the executable mirror and the projection row are the
+// same function of the transcript.
+export interface TranscriptPropTarget {
+  /** Current stored version for `name`, before this write is applied. */
+  propertyVersion(name: string): number | undefined;
+  setProperty(name: string, value: WooValue): void;
+  removeProperty(name: string): void;
+  setPropertyVersion(name: string, version: number): void;
+  /** Mirror a write to the `name` property onto the object's display name. */
+  setObjectName(name: string): void;
+}
+
+// The accepted-transcript next-version rule: trust an explicit, well-formed
+// `next` from the transcript; otherwise monotonically bump the stored version.
+// One definition for both appliers (previously copied in two places).
+export function nextPropertyVersion(rawNext: string | undefined, currentVersion: number | undefined): number {
+  const parsed = rawNext === undefined ? null : Number(rawNext);
+  return parsed !== null && Number.isInteger(parsed) && parsed >= 0
+    ? parsed
+    : (currentVersion ?? 0) + 1;
+}
+
+export function applyTranscriptPropWrite(target: TranscriptPropTarget, write: TranscriptWrite): void {
   if (write.cell.kind !== "prop") return;
   const propName = write.cell.name;
   if (write.op === "remove") {
-    target.properties = target.properties.filter(([name]) => name !== propName);
-    target.propertyVersions = target.propertyVersions.filter(([name]) => name !== propName);
+    target.removeProperty(propName);
     return;
   }
-  const value = structuredClone(write.value) as WooValue;
-  setSerializedProperty(target, propName, value);
-  if (propName === "name" && typeof value === "string") target.name = value;
-  setSerializedPropertyVersion(target, propName, write.next);
+  // `setProperty` clones into the target's storage shape (each adapter keeps its
+  // own cloner — structuredClone for serialized rows, clonePlainData for the live
+  // graph — so A2 changes no value semantics). `write.value` is read raw here only
+  // for the name-mirror type check, which does not store it.
+  const next = nextPropertyVersion(write.next, target.propertyVersion(propName));
+  target.setProperty(propName, write.value);
+  if (propName === "name" && typeof write.value === "string") target.setObjectName(write.value);
+  target.setPropertyVersion(propName, next);
+}
+
+function applyPropWrite(target: SerializedObject, write: TranscriptWrite): void {
+  applyTranscriptPropWrite(serializedObjectPropTarget(target), write);
+}
+
+// Adapter: the commit-scope authority's plain SerializedObject row.
+function serializedObjectPropTarget(target: SerializedObject): TranscriptPropTarget {
+  return {
+    propertyVersion: (name) => target.propertyVersions.find(([prop]) => prop === name)?.[1],
+    setProperty: (name, value) => setSerializedProperty(target, name, structuredClone(value) as WooValue),
+    removeProperty: (name) => {
+      target.properties = target.properties.filter(([prop]) => prop !== name);
+      target.propertyVersions = target.propertyVersions.filter(([prop]) => prop !== name);
+    },
+    setPropertyVersion: (name, version) => setSerializedPropertyVersionValue(target, name, version),
+    setObjectName: (name) => { target.name = name; }
+  };
 }
 
 function setSerializedProperty(target: SerializedObject, name: string, value: WooValue): void {
@@ -1214,11 +1262,18 @@ function setSerializedProperty(target: SerializedObject, name: string, value: Wo
   target.properties.sort(([a], [b]) => a.localeCompare(b));
 }
 
+// Parse a raw transcript `next` and store the resulting version. Used by the
+// sequencer `next_seq` write; the per-prop applier path resolves the version via
+// the shared `nextPropertyVersion` and calls the value setter directly.
 function setSerializedPropertyVersion(target: SerializedObject, name: string, version: string | undefined): void {
-  const parsed = version === undefined ? null : Number(version);
-  const nextVersion: number = parsed !== null && Number.isInteger(parsed) && parsed >= 0
-    ? parsed
-    : (target.propertyVersions.find(([prop]) => prop === name)?.[1] ?? 0) + 1;
+  setSerializedPropertyVersionValue(
+    target,
+    name,
+    nextPropertyVersion(version, target.propertyVersions.find(([prop]) => prop === name)?.[1])
+  );
+}
+
+function setSerializedPropertyVersionValue(target: SerializedObject, name: string, nextVersion: number): void {
   const index = target.propertyVersions.findIndex(([prop]) => prop === name);
   if (index >= 0) target.propertyVersions[index] = [name, nextVersion];
   else target.propertyVersions.push([name, nextVersion]);
