@@ -469,11 +469,19 @@ planning cache, not a new authority source:
   object so the turn-submission retry loop refreshes that object's authority and
   re-plans against the named identity. Only a stub that survives the bounded repair
   retry (identity genuinely unresolvable) fails the turn — which is the correct loud
-  signal, never a silently-served id-as-name. A non-stub cell whose provenance is
-  merely unknown (`missing_provenance`) is reported for observability but is NOT yet
-  fatal, pending universal per-cell provenance coverage across all seed/snapshot
-  paths. Substrate refs (the `$`-prefixed namespace) are named by their ref by
-  convention and are not presentation stubs.
+  signal, never a silently-served id-as-name. The refusal covers EVERY tracked cell
+  (object_lineage AND object_live), not lineage alone. A non-stub cell whose
+  provenance is unknown (`missing_provenance`) is likewise refused-by-repair on any
+  path that opts in (`enforceMissingProvenance`) — required of a path whose planning
+  worlds are universally provenance-tagged. The sparse gateway is such a path: it
+  records provenance on every authority merge AND on accepted-frame application, so
+  it enforces missing_provenance; any residual under-tagged cell self-heals on first
+  touch (the repair's refreshed authority records its provenance, so it converges)
+  rather than serving silently. A path without universal coverage (e.g. the browser
+  holder relay, which materializes from accepted frames without recording per-cell
+  provenance) keeps missing_provenance observe-only until its recording lands.
+  Substrate refs (the `$`-prefixed namespace) are named by their ref by convention
+  and are not presentation stubs.
 - Implementations MUST bound checkpoint count by memory policy, for example an
   LRU cap. A gateway must never accumulate one full slice per scope forever.
 

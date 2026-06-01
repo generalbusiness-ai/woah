@@ -31,9 +31,11 @@ import {
   applyAcceptedShadowFrame,
   applyShadowTranscriptToCommitScopeCache,
   serializedFor,
+  transcriptTouchedObjectIds,
   type ShadowCommitAccepted,
   type ShadowScopeHead
 } from "../core/shadow-commit-scope";
+import { planningCellKey } from "../core/planning-world";
 import { affectedTranscriptScopes } from "../core/v2-fanout-projection";
 import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import {
@@ -77,6 +79,31 @@ function assertProjectionWritesComplete(
     source,
     missing
   });
+}
+
+// A3.2 coverage (#13): the gateway relay is a DERIVED view of accepted commits.
+// Applying an accepted frame (transcript replay or authority-row projection) mutates
+// the relay's commit-scope cells WITHOUT going through the provenance-recording
+// authority merge, so those identity/live cells would reach a plan untagged and the
+// admission gate would flag them missing. Stamp the affected objects' tracked cells
+// `cache` (the gateway's accepted-but-derived view) — set-if-absent, so a stronger
+// recorded provenance (authoritative/projection from a merge) is never downgraded.
+function recordGatewayRelayAcceptedProvenance(
+  relay: ShadowBrowserRelayShim,
+  transcript: EffectTranscript,
+  accepted?: ShadowCommitAccepted
+): void {
+  const prov = (relay.commit_scope.cellProvenance ??= new Map());
+  const ids = new Set<ObjRef>(transcriptTouchedObjectIds(transcript));
+  for (const write of accepted?.projection_writes ?? []) {
+    if (write.table === "objects" && typeof write.key === "string") ids.add(write.key as ObjRef);
+  }
+  for (const id of ids) {
+    for (const page of ["object_lineage", "object_live"] as const) {
+      const key = planningCellKey(id, page);
+      if (!prov.has(key)) prov.set(key, { source: "cache" });
+    }
+  }
 }
 
 type SessionEntry = {
@@ -401,6 +428,7 @@ export class McpGateway {
     const client = this.v2Scopes.get(scope);
     if (client) {
       applyAcceptedShadowFrame(client.relay.commit_scope, entry.commit, entry.transcript);
+      recordGatewayRelayAcceptedProvenance(client.relay, entry.transcript, entry.commit);
       markShadowBrowserRelaySerializedChanged(client.relay);
     }
     if (entry.commit.projection_delta) {
@@ -634,12 +662,14 @@ export class McpGateway {
       // A3.2 admission gate (ENFORCED at the VM boundary via buildPlanningWorld):
       // thread the relay's per-cell provenance. A presentation stub raises a
       // repairable E_NEED_STATE (the repair loop refreshes the named object and
-      // re-plans). missing_provenance enforcement is NOT opted in: the cross-shard
-      // walkthrough still surfaces tracked cells whose provenance is not recorded by
-      // every seed/fanout source, so a blanket flip would reject valid cold cells.
-      // Closing those recording gaps (and the browser relay's) is the remaining
-      // Phase-A coverage work that lets #11 flip on. onAdmissionViolation observes.
+      // re-plans). The gateway relay records provenance on every authority merge
+      // AND on accepted-frame application (recordGatewayRelayAcceptedProvenance), so
+      // it opts IN to fatal missing_provenance enforcement (#11): an untagged tracked
+      // cell raises a repairable E_NEED_STATE that the repair loop resolves (and the
+      // refreshed authority records its provenance, so it converges). Any residual
+      // under-tagged cell self-heals on first touch rather than serving silently.
       clientPlanningProvenance: (client) => client.relay.commit_scope.cellProvenance ?? new Map(),
+      enforceMissingProvenance: true,
       onAdmissionViolation: (violations) => {
         for (const v of violations) {
           console.warn("woo.planning_world_inadmissible", { where: "mcp_turn_plan", scope, kind: v.kind, object: v.object, page: v.page, detail: v.detail });
@@ -911,6 +941,7 @@ export class McpGateway {
   ): void {
     if (!reply.commit || !reply.transcript) return;
     applyAcceptedShadowFrame(client.relay.commit_scope, reply.commit, reply.transcript);
+    recordGatewayRelayAcceptedProvenance(client.relay, reply.transcript, reply.commit);
     markShadowBrowserRelaySerializedChanged(client.relay);
     const projectionWrites = reply.commit.projection_writes ?? [];
     if (reply.commit.projection_delta) {
@@ -974,6 +1005,7 @@ export class McpGateway {
       if (!applyAcceptedProjectionToCommitScopeCache(client.relay.commit_scope, accepted, transcript)) {
         applyShadowTranscriptToCommitScopeCache(client.relay.commit_scope, transcript);
       }
+      recordGatewayRelayAcceptedProvenance(client.relay, transcript, accepted);
       markShadowBrowserRelaySerializedChanged(client.relay);
     }
   }
