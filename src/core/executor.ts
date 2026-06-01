@@ -24,7 +24,7 @@
 // home and the place future symmetrization should live.
 
 import type { SerializedAuthoritySlice, SerializedObject, SerializedSession, SerializedWorld } from "./repository";
-import { mergeSerializedAuthoritySlice, type MergeSerializedAuthorityInput } from "./authority-slice";
+import { mergeSerializedAuthoritySlice, type MergeSerializedAuthorityInput, type MergeSerializedAuthorityOptions } from "./authority-slice";
 import {
   buildShadowTurnExecEnvelope,
   buildShadowTurnIntentEnvelope
@@ -192,7 +192,7 @@ export function buildExecutionCapsule(input: {
 export function mergeExecutorAuthority(
   serialized: { sessions: SerializedSession[]; objects: SerializedObject[] },
   authority: MergeSerializedAuthorityInput,
-  options: { clone?: boolean } = {}
+  options: MergeSerializedAuthorityOptions = {}
 ): void {
   mergeSerializedAuthoritySlice(serialized, authority, options);
 }

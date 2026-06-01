@@ -16,6 +16,7 @@ import {
   stampAuthorityPageRef,
   type AuthorityPageProvenance,
   type AuthorityPageRef,
+  type AuthorityPageSource,
   type ShadowStatePage,
   type ShadowStatePageRef
 } from "./shadow-state-pages";
@@ -27,7 +28,77 @@ export type MergeSerializedAuthorityInput =
 
 export type MergeSerializedAuthorityOptions = {
   clone?: boolean;
+  // A3.2 provenance retrofit (mobile-heap sequence): when present, the merge
+  // records and consults per-cell provenance for the tracked identity/live cells
+  // (PROVENANCE_TRACKED_PAGES) so a fresher non-authoritative page may repair a
+  // staler non-authoritative cell, while an authoritative cell is never
+  // overwritten by a derived one. Callers that own a durable planning cache (the
+  // gateway relay commit-scope) pass their cell-provenance side-table here; the
+  // map is mutated in place. Callers that omit it keep the original CI-safe rule
+  // (an existing cell is protected from any non-authoritative page), so no
+  // behavior changes for legacy/one-shot merges.
+  cellProvenance?: Map<string, AuthorityPageProvenance>;
 };
+
+// Precedence among authority page sources. Higher wins. `authoritative` is the
+// owner's truth and is never displaced by a derived copy. The remaining order
+// reflects confidence: a Directory-published `projection` of a present session
+// is fresher than a non-owner host's stored `cache` row, which beats a
+// representation-bridge `fallback`, which beats opportunistic `gossip`.
+const AUTHORITY_SOURCE_RANK: Record<AuthorityPageSource, number> = {
+  authoritative: 4,
+  projection: 3,
+  cache: 2,
+  fallback: 1,
+  gossip: 0
+};
+
+// The immediate slice of the provenance retrofit: identity (`object_lineage`,
+// carrying `name`/parent/owner) and `object_live` (location/contents). These are
+// the cells roster/`who`/name resolution read, and the ones a stale cross-host
+// `cache` stub blocks repair on. Other page kinds keep the original rule.
+const PROVENANCE_TRACKED_PAGES = new Set<ShadowStatePage["page"]>(["object_lineage", "object_live"]);
+
+// Whether an incoming page is allowed to overwrite an existing tracked cell given
+// that cell's currently-recorded provenance. An `authoritative` page always lands
+// (owner truth). A non-authoritative page may land only over a strictly-or-equally
+// weaker non-authoritative cell; an authoritative (or unknown, hence conservatively
+// protected) current cell is never displaced by a derived page. This is the
+// merge-primitive form of VTN0 "a derived copy is never a write-authority source"
+// that still permits projection→cache repair.
+function authorityPageMayReplaceCurrent(
+  incoming: AuthorityPageSource,
+  current: AuthorityPageProvenance | undefined
+): boolean {
+  if (incoming === "authoritative") return true;
+  const currentSource = current?.source ?? "authoritative";
+  if (currentSource === "authoritative") return false;
+  return AUTHORITY_SOURCE_RANK[incoming] >= AUTHORITY_SOURCE_RANK[currentSource];
+}
+
+function recordCellProvenanceIfStronger(
+  map: Map<string, AuthorityPageProvenance>,
+  key: string,
+  ref: AuthorityPageRef
+): void {
+  const existing = map.get(key);
+  if (existing && AUTHORITY_SOURCE_RANK[ref.source] < AUTHORITY_SOURCE_RANK[existing.source]) return;
+  map.set(key, ref.source_host !== undefined ? { source: ref.source, source_host: ref.source_host } : { source: ref.source });
+}
+
+// Build the initial cell-provenance side-table for a planning cache seeded from an
+// authority slice. Only the tracked identity/live cells are captured; a legacy
+// object slice (no per-page provenance) yields an empty map, so its cells stay
+// conservatively protected.
+export function cellProvenanceFromAuthoritySlice(authority: MergeSerializedAuthorityInput): Map<string, AuthorityPageProvenance> {
+  const map = new Map<string, AuthorityPageProvenance>();
+  if (!isAuthorityCellSlice(authority)) return map;
+  for (const ref of authority.page_refs) {
+    if (!PROVENANCE_TRACKED_PAGES.has(ref.page)) continue;
+    recordCellProvenanceIfStronger(map, authorityPageRefKey(ref), ref);
+  }
+  return map;
+}
 
 // A3 (mobile-heap sequence): every authority cell page MUST declare a `source`.
 // Provenance is no longer a decorative optional field — the gateway merge path
@@ -367,22 +438,35 @@ function mergeAuthorityCellPages(
     for (const page of shadowStatePagesForObject(obj)) currentPages.set(authorityPageKey(page), { hash: shadowStatePageHash(page), page });
   }
 
+  const cellProvenance = options.cellProvenance;
   const changedPages: ShadowStatePage[] = [];
   for (const ref of authority.page_refs) {
     const key = authorityPageRefKey(ref);
     const current = currentPages.get(key);
-    if (current?.hash === ref.hash) continue;
+    const tracked = cellProvenance !== undefined && PROVENANCE_TRACKED_PAGES.has(ref.page);
+    if (current?.hash === ref.hash) {
+      // Value already matches; still let the recorded provenance strengthen
+      // (e.g. an owner-authoritative confirmation of a value first seen as a
+      // `cache` stub), so a later stale page cannot displace a now-confirmed cell.
+      if (tracked) recordCellProvenanceIfStronger(cellProvenance!, key, ref);
+      continue;
+    }
     // A3.2: provenance is enforced at the boundary where a transferred cell page
-    // becomes a row in the materialized planning world the VM reads from. The
-    // planning world carries no per-cell provenance, so we use the equivalent
-    // CI-safe rule: an `authoritative` page may overwrite freely (it is the
-    // owner's truth); a non-authoritative page (cache/projection/fallback/gossip,
-    // or an untagged execution page) may only FILL a cell the planning world
-    // lacks — it must never overwrite an existing cell. This makes "a derived
-    // copy is never a write-authority source" (VTN0) a property of the merge
-    // primitive itself, so every caller (gateway, REST, browser, warm-checkpoint
-    // install) inherits the refusal — not just the one gateway filter (A3.1).
-    if (ref.source !== "authoritative" && current) continue;
+    // becomes a row in the materialized planning world the VM reads from. For the
+    // tracked identity/live cells (when the caller supplies a provenance table),
+    // the decision uses the cell's RECORDED provenance: an authoritative cell is
+    // never displaced by a derived page, but a fresher derived page MAY repair a
+    // staler derived cell (projection→cache). Otherwise we fall back to the
+    // original CI-safe rule — a non-authoritative page may only FILL a cell the
+    // planning world lacks, never overwrite an existing one. Either way "a derived
+    // copy is never a write-authority source" (VTN0) stays a property of the merge
+    // primitive, inherited by every caller (gateway, REST, browser, checkpoint).
+    if (current) {
+      const mayReplace = tracked
+        ? authorityPageMayReplaceCurrent(ref.source, cellProvenance!.get(key))
+        : ref.source === "authoritative";
+      if (!mayReplace) continue;
+    }
     const incoming = incomingByHash.get(ref.hash);
     if (!incoming) {
       throw new Error(`authority cell page missing inline value: ${ref.object}:${ref.page}${ref.name ? `:${ref.name}` : ""}@${ref.hash}`);
@@ -392,6 +476,10 @@ function mergeAuthorityCellPages(
       throw new Error(`authority cell page ref mismatch: ${ref.object}:${ref.page}${ref.name ? `:${ref.name}` : ""}`);
     }
     changedPages.push(options.clone ? structuredClone(incoming) as ShadowStatePage : incoming);
+    // The cell now holds the incoming value, so its provenance is the incoming
+    // page's. The replace guard already required incoming rank >= current rank,
+    // so this never downgrades a tracked cell below what protected it.
+    if (tracked) cellProvenance!.set(key, ref.source_host !== undefined ? { source: ref.source, source_host: ref.source_host } : { source: ref.source });
   }
   if (changedPages.length === 0) return false;
 

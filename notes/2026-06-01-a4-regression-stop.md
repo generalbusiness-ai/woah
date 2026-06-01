@@ -198,3 +198,183 @@ upstream delivery reaches the receiver. The cf-repository test remains red pendi
 the upstream fanout-target/delivery fix. This is the same "necessary but not
 sufficient" situation as the producer fix: two correct halves, one upstream
 delivery gap still open.
+
+## Update (2026-06-01, fifth pass — ROOT CAUSE FOUND; prior plan invalidated)
+
+Ran fresh probes (reverted) on the failing `cf-repository` cross-scope `who` test
+at tip `82b4148`. The probes OVERTURN the 3rd/4th-pass conclusions and the handoff
+plan. **Everything upstream is correct; the name is lost in the relay MERGE.**
+
+### Measured facts (console.error probes, focused cf-repository test)
+1. `v2GatewayAuthorityPayload` is called MANY times for the who turn — NOT 0. The
+   4th-pass "0 calls" measurement was simply wrong (probed a stale build/symbol).
+   The who turn DOES flow: host.ts `direct(directorySessionScopes=[the_deck])`
+   (reads_room_presence) → gateway `v2AuthorityPayload` → DO hook (POD:1536) →
+   `v2GatewayAuthorityPayload` → `authorityPayloadFromCachedAuthority` →
+   `mcpGatewayDirectorySessionCellSlice`.
+2. On Alice's shard (mcp-gateway-2) at the who turn:
+   - Directory session for guest_1 (Bob) HAS `displayName:"Guest 1"`, scope the_deck. ✅
+   - `mcpGatewayDirectorySessionCellSlice` emits guest_1 lineage with `name:"Guest 1"`. ✅
+   - `this.world` has guest_1 as `name:"Guest 1"`, loc the_deck. ✅
+   So the directory-stub-name hypothesis (handoff) is FALSE: the slice already
+   carries the correct name. The proposed overlay-from-projection fix changes nothing.
+3. `mergeV2AuthorityIntoScopeClient` for the_deck relay: `beforeName:"guest_1"`,
+   authority carries guest_1 `object_lineage`, `afterName:"guest_1"`. The correct
+   lineage page is REFUSED by the merge.
+4. The pre-existing relay stub: `{name:"guest_1", parent:"$player", owner:"guest_1",
+   location:"the_deck", props:[] then [["home","$nowhere"]]}` — the
+   `mcpGatewayStubObject` signature. Note props gap-FILL works (home appears) while
+   the lineage cell does NOT — refusal is per-cell on the already-present lineage.
+
+### ROOT CAUSE (confirmed in code)
+`mergeAuthorityCellPages` (src/core/authority-slice.ts:385):
+```
+if (ref.source !== "authoritative" && current) continue;
+```
+The directory cell slice stamps lineage `source:"projection"` (POD:6497). The relay
+already holds a stale `guest_1` stub (`current` present), so the A3.2 refusal blocks
+the correct "Guest 1" lineage. The rule "projection MUST NOT override existing" is
+treating a stale PROJECTION-sourced stub as if it were authoritative — the planning
+world carries no per-cell provenance, so the merge can't tell stub from owner.
+
+Two coupled defects:
+(a) UPSTREAM: a `name=id` lineage stub gets seeded into the_deck relay (from an
+    earlier directory gap-fill / contents materialization before displayName was
+    available), and
+(b) the refusal then makes that stub permanently un-repairable by a fresher
+    projection lineage carrying the real name.
+
+### Why the 2nd-pass "directory preserve display_name" revert was premature
+That fix targets (a)'s symptom but the test still fails because (b) blocks repair
+once ANY stub exists. Fixing only one half cannot turn the test green.
+
+### Fix options (architecturally significant — STOPPED for guidance)
+- **Opt 1 (narrow, upstream):** never seed a `name=id` lineage stub — ensure the
+  first materialization of guest_1@the_deck carries displayName (move
+  re-registration must resolve/preserve the actor's real name even on a sparse
+  world). If no stub is ever seeded, the refusal never triggers. Needs to confirm
+  the exact first-seed moment.
+- **Opt 2 (relax refusal / A3.2 retrofit):** track per-cell provenance in the
+  planning world so a projection page may overwrite an existing NON-authoritative
+  cell (only `authoritative` is immutable-from-projection). Correct long-term;
+  this is the explicitly-deferred large retrofit; touches the CI-load-bearing
+  merge primitive (blast radius across gateway/REST/browser/checkpoint).
+- **Opt 3:** make `mcpGatewayStubObject` emit a lineage whose name, when no
+  displayName is known, is marked so a real lineage can replace it — but the
+  refusal keys on cell PRESENCE, so this still needs a merge change.
+
+Leaning Opt 1 (keep the merge primitive intact), but the choice depends on whether
+the stub's first seed can be made always-correct without the provenance retrofit.
+
+## Update (2026-06-01, sixth pass — FULL causal chain pinned; it's a stale "cache" stub, not a missing seed)
+
+Probed the exact seed origin (all probes reverted, tree clean). The stale name is
+NOT a first-seed of a missing cell and NOT from the Directory stub path
+(`mcpGatewayShardSerializedWorld` was NEVER called for guest_1 without displayName).
+It is a stale **cross-host "cache"** row admitted at relay-open.
+
+### Complete chain (deck-scoped probes)
+1. the_deck's OWNER host holds a stale guest_1 stub (name=id). Its
+   `/__internal/authority-slice` handler (persistent-object-do.ts:3244) stamps every
+   non-owned page `source: world.objectHostKey(ref.object) === hostKey ? "authoritative" : "cache"`
+   → guest_1 ships as **`source:"cache"`, name="guest_1"**.
+2. Relay open: the who turn's `ensureV2ScopeClient` → `initializeV2ScopeClient`
+   (gateway.ts:744) → `v2SerializedWorld([the_deck, guest_2])` (NO directorySessionScopes)
+   → `v2GatewayAuthorityPayload(world,[the_deck,guest_2],{})`. Probe at the return:
+   `g1Name:"guest_1", g1Source:"cache", localSliceHasG1:false` — guest_1 comes from
+   the REMOTE owner slice (gap-fill, not this shard's this.world, which has "Guest 1").
+3. `createShadowCommitScope({node:"mcp-v2-relay:the_deck", serialized})` is BORN with
+   guest_1 name="guest_1" (confirmed via createShadowCommitScope probe + stack).
+4. who-turn prePlan refresh (directorySessionScopes=[the_deck]) builds the directory
+   slice with guest_1 `source:"projection"`, name="Guest 1" (correct).
+5. `mergeAuthorityCellPages:385` `ref.source(projection)!=="authoritative" && current` →
+   REFUSE. Stale "cache" name survives; `who` renders `guest_1`.
+
+Notably: option-(a) `applyProjectionWrites`/`applyMovementProjection` and
+`commitShadowCommitScopeState` NEVER fired for the_deck with the bad name — so the
+bad row is established purely at the relay-open SEED, by direct serialized
+materialization (`serializedWorldFromAuthoritySlice`), not by any post-open apply.
+
+### What this sharpens about the fix (user-approved Opt 2 scoped provenance retrofit)
+The precedence rule must order **cache vs projection**, not just projection-vs-projection:
+- The relay cell's recorded provenance at seed = **"cache"** (stale cross-host copy).
+- The repair page = **"projection"** (live Directory presence assertion, CA12.1).
+- Required ranking: authoritative > projection > cache > fallback > gossip/unknown.
+  authoritative is never overwritten by non-auth; a non-auth page replaces an
+  existing non-auth cell iff rank(incoming) >= rank(current) and hashes differ.
+- Provenance must be CAPTURED at BOTH cell-materialization entry points for the relay,
+  because `serializedWorldFromAuthoritySlice` drops `AuthorityPageRef.source`:
+    (i) `createShadowCommitScope` seed — capture from the slice's page_refs;
+    (ii) `mergeAuthorityCellPages` — record from `ref.source`;
+   (plus own-scope accepted commits = authoritative; option-(a) applies = their write provenance).
+  With both captured, default-unknown can stay conservative (authoritative-protected)
+  without re-blocking this bug.
+
+### Task #1 (pin first-seed) — DONE. Proceeding to implement the scoped retrofit (object_lineage + object_live).
+
+## Update (2026-06-01, seventh pass — IMPLEMENTED the provenance retrofit; cross-scope `who` is a 3-LAYER bug)
+
+User approved Opt 2 as a *scoped provenance retrofit*. Implemented it, plus a
+Directory hardening fix. typecheck 0; `npm test` 260/260 (no regressions). BUT the
+focused `cf-repository` cross-scope `who` test is STILL red — single-run tracing
+proved the bug has THREE independent layers; the retrofit fixes layer 1 only.
+
+### Layer 1 — provenance refusal in the planning-world merge (FIXED, on-design)
+`mergeAuthorityCellPages` (authority-slice.ts:385) refused a `projection` lineage
+from repairing a stale `cache` stub because the planning world carried no per-cell
+provenance. Implemented the approved retrofit:
+- `MergeSerializedAuthorityOptions.cellProvenance?: Map<cellKey, AuthorityPageProvenance>`
+  (optional; omitted callers keep the original CI-safe rule).
+- `ShadowCommitScope.cellProvenance` field; rank authoritative>projection>cache>fallback>gossip;
+  `authorityPageMayReplaceCurrent` (never non-auth over authoritative; non-auth
+  replaces non-auth only at >= rank); unknown current defaults to authoritative
+  (protected). Scoped to object_lineage+object_live (`cellProvenanceFromAuthoritySlice` exported).
+- Wired the relay merges that own a durable planning cache: gateway
+  `mergeV2AuthorityIntoScopeClient` and CommitScopeDO `refreshSessionAuth`.
+Verified: when a relay holds a stale `cache` stub and a `projection` "Guest 1"
+arrives, the relay now applies "Guest 1" (FIXDBG2). This is correct and necessary.
+
+### Layer 2 — Directory null-overwrite of display_name (FIXED, hardening)
+directory-do.ts `registerSession` did `INSERT OR REPLACE` with the incoming
+`display_name`, so a re-registration resolved on a SPARSE shard (null) erased a
+good name. Now preserves an existing non-null name across a null update
+(`effectiveDisplayName`). Confirmed Directory ends with guest_1 "Guest 1"@the_deck.
+(Necessary correctness fix; insufficient alone.)
+
+### Layer 3 — authority-COMBINE picks the stale-named page (NOT YET FIXED; the live blocker)
+Decisive single-run trace (probes reverted):
+- Directory row: "Guest 1"@the_deck ✅. Wire `/sessions-for-scopes`: delivers "Guest 1" ✅.
+- `mcpGatewayDirectorySessionCellSlice` emits guest_1 = "Guest 1" (projection) ✅.
+- BUT the final `v2GatewayAuthorityPayload` output for the_deck has TWO guest_1
+  object_lineage inline pages — `["guest_1","Guest 1"]` — and the WINNING
+  `page_ref` (source projection) points to **"guest_1"**. The executor (CommitScopeDO)
+  therefore plans against name="guest_1" and `room_roster` (reads `item.name`)
+  renders the id.
+- `combineSerializedAuthoritySlices` dedups page_refs by key with LAST-slice-wins
+  (slice order), keeping all inline pages by hash. A stale-named guest_1 lineage
+  page is ordered after the fresh directory "Guest 1" for this cell key, so the
+  stale ref wins. The merge-layer provenance rank does NOT apply here — combine is
+  ordered, not provenance-ranked.
+
+### Why the retrofit alone can't be green
+The VM executes against the CommitScopeDO relay seeded/merged from the COMBINED
+authority. If the combined authority's winning guest_1 lineage ref is the stale
+"guest_1" page (layer 3), the merge never sees a "Guest 1" page to prefer. Layers
+1+2 are real and fixed; layer 3 gates the test.
+
+### Options for layer 3 (decision needed — beyond the approved scoped retrofit)
+(a) Make `combineSerializedAuthoritySlices` provenance/quality-aware per cell key
+    (prefer authoritative>projection>cache>fallback; among equal, a deterministic
+    freshness/tiebreak) instead of pure slice-order last-wins. Unifies with layer 1
+    but touches the shared combine primitive (gateway/REST/browser/checkpoint).
+(b) Fix slice ORDER so the fresh directory projection is combined after the stale
+    cache/remote contribution for actor identity cells (narrower, but order-coupling
+    is fragile).
+(c) Eliminate the stale `name=id` guest_1 lineage from the assembled authority at
+    source (don't admit a `cache`/stub identity page for an actor the directory
+    projection already names).
+
+State on worktree (uncommitted): layer-1 retrofit (authority-slice.ts, executor.ts,
+shadow-commit-scope.ts, mcp/gateway.ts, worker/commit-scope-do.ts) + layer-2
+(directory-do.ts). All probes reverted. Needs a layer-3 decision before the test
+can pass; then test:worker + gate:authority + provenance unit tests + spec.

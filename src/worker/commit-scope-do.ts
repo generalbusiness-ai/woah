@@ -596,7 +596,13 @@ export class CommitScopeDO {
     if (authority) {
       const serialized = serializedFor(relay.commit_scope, { reason: "commit_scope_authority_merge", metric: (event) => this.emitMetric(event) });
       const preservedActorLive = preserveSessionActorLiveCells(serialized, sessionRows);
-      if (mergeSerializedAuthoritySlice(serialized, authority, { clone: true })) {
+      // A3.2 provenance retrofit: the commit scope's relay is the world the VM
+      // plans/executes against, so it carries the same per-cell provenance table
+      // as the gateway relay. A fresher projection page repairs a stale cross-host
+      // `cache` identity/live stub (the cross-scope `who` name bug) while an
+      // authoritative cell is never displaced by a derived page.
+      const cellProvenance = (relay.commit_scope.cellProvenance ??= new Map());
+      if (mergeSerializedAuthoritySlice(serialized, authority, { clone: true, cellProvenance })) {
         restoreSessionActorLiveCells(serialized, preservedActorLive);
         markShadowBrowserRelaySerializedChanged(relay);
       }

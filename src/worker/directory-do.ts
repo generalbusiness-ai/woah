@@ -376,12 +376,22 @@ export class DirectoryDO {
     const started = session.started > 0
       ? session.started
       : finitePositiveNumber(existing?.started) ?? Date.now();
+    // Preserve a previously-registered display name across a null update. A
+    // gateway resolves display_name from its local world (displayNameForDirectorySession);
+    // a re-registration that runs on a SPARSE shard — one that holds only a
+    // routed stub of the actor and not its named row — resolves null and would
+    // otherwise erase the good name a name-bearing shard already published. A
+    // genuine rename still lands (it carries a non-null value). This keeps the
+    // moved actor's display name in the scoped session index so roster/`who`
+    // name resolution on the destination shard does not fall back to the raw id.
+    const effectiveDisplayName = session.display_name
+      ?? (existing && existing.display_name !== null ? String(existing.display_name) : null);
     const encodedFocusList = JSON.stringify(session.focus_list);
     const encodedActorProps = encodeActorProps(session.actor_props);
     if (existing
       && String(existing.actor) === session.actor
       && Number(existing.started ?? 0) === started
-      && (existing.display_name === null ? null : String(existing.display_name)) === session.display_name
+      && (existing.display_name === null ? null : String(existing.display_name)) === effectiveDisplayName
       && Number(existing.expires_at) === session.expires_at
       && String(existing.token_class) === session.token_class
       && (existing.current_location === null ? null : String(existing.current_location)) === session.active_scope
@@ -396,7 +406,7 @@ export class DirectoryDO {
       session.session_id,
       session.actor,
       started,
-      session.display_name,
+      effectiveDisplayName,
       session.expires_at,
       session.token_class,
       session.active_scope,

@@ -846,7 +846,12 @@ export class McpGateway {
     // against pre-refresh pages.
     const serialized = serializedFor(client.relay.commit_scope, { reason: "mcp_authority_merge" });
     const preservedActorLive = preserveSessionActorLiveCells(serialized, authority.sessions);
-    mergeExecutorAuthority(serialized, authority);
+    // A3.2 provenance retrofit: carry the relay's per-cell provenance table through
+    // the merge so a fresher projection page repairs a stale cross-host `cache`
+    // stub for the tracked identity/live cells (the cross-scope `who` name bug),
+    // while an authoritative cell is still never displaced by a derived page.
+    const cellProvenance = (client.relay.commit_scope.cellProvenance ??= new Map());
+    mergeExecutorAuthority(serialized, authority, { cellProvenance });
     restoreSessionActorLiveCells(serialized, preservedActorLive);
     markShadowBrowserRelaySerializedChanged(client.relay);
   }

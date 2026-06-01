@@ -14,6 +14,7 @@ import {
   type TranscriptWrite
 } from "./effect-transcript";
 import { stableShadowJson } from "./shadow-cell-version";
+import type { AuthorityPageProvenance } from "./shadow-state-pages";
 import { hashSource } from "./source-hash";
 import { shadowCommitReceipt, shadowCommitReceiptFromTouchedStateHashes, type ShadowCommitReceipt } from "./turn-commit";
 import type { RecordedWriteAuthority } from "./turn-recorder";
@@ -92,6 +93,13 @@ export type ShadowCommitScope = {
   serializedDirty: boolean;
   state: ShadowCommitScopeState;
   submissions: Map<string, ShadowCommitResult>;
+  // A3.2 provenance retrofit: per-cell provenance for the tracked identity/live
+  // cells (see authority-slice PROVENANCE_TRACKED_PAGES), maintained by the
+  // authority merge so a stale cross-host `cache` stub can be repaired by a
+  // fresher `projection`/`authoritative` page while an authoritative cell is
+  // never displaced. Lazily created by the gateway relay merge; absent for
+  // commit scopes that do not carry a durable planning cache.
+  cellProvenance?: Map<string, AuthorityPageProvenance>;
 };
 
 export type ShadowCommitScopeState = {
