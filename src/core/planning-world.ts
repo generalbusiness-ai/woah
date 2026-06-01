@@ -106,21 +106,29 @@ export function collectPlanningWorldViolations(
     const lineageKey = planningCellKey(obj.id, "object_lineage");
     if (allow.has(lineageKey)) continue;
     const lineageProv = provenance.get(lineageKey);
+    const isAuthoritative = lineageProv?.source === "authoritative";
+    // Stub-ness is classified INDEPENDENTLY of provenance: a `name===id` lineage
+    // (outside the `$`-namespace) is a presentation stub unless it is the owner's
+    // authoritative row — whether its provenance is recorded non-authoritative OR
+    // absent entirely. An absent-provenance stub must still enter repair (it is the
+    // exact id-as-name leak), so it is classified as presentation_stub_lineage, NOT
+    // demoted to the non-fatal missing_provenance bucket. missing_provenance is
+    // reserved for NON-stub cells whose provenance simply was not recorded.
+    if (isStubLineage(obj) && !isAuthoritative) {
+      violations.push({
+        kind: "presentation_stub_lineage",
+        object: obj.id,
+        page: "object_lineage",
+        detail: `name===id stub for ${obj.id} admitted as planning lineage with source=${lineageProv?.source ?? "<absent>"} (not authoritative)`
+      });
+      continue;
+    }
     if (!lineageProv) {
       violations.push({
         kind: "missing_provenance",
         object: obj.id,
         page: "object_lineage",
         detail: `object_lineage for ${obj.id} reached the planning world without provenance`
-      });
-      continue;
-    }
-    if (isStubLineage(obj) && lineageProv.source !== "authoritative") {
-      violations.push({
-        kind: "presentation_stub_lineage",
-        object: obj.id,
-        page: "object_lineage",
-        detail: `name===id stub for ${obj.id} admitted as planning lineage with source=${lineageProv.source} (not authoritative)`
       });
     }
   }

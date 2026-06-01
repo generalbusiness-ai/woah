@@ -79,12 +79,22 @@ describe("PlanningWorld admission gate", () => {
     expect(collectPlanningWorldViolations(world, prov)).toHaveLength(0);
   });
 
-  // A tracked cell with no provenance means it bypassed the admission gate.
-  it("rejects a tracked lineage cell that carries no provenance", () => {
+  // A NON-stub tracked cell with no provenance is missing_provenance (non-fatal).
+  it("reports a non-stub tracked lineage cell with no provenance as missing_provenance", () => {
     const world = { objects: [obj("guest_1", "Guest 1")] };
     const violations = collectPlanningWorldViolations(world, provenance([]));
     expect(violations).toHaveLength(1);
     expect(violations[0].kind).toBe("missing_provenance");
+  });
+
+  // P1 fix: stub-ness is independent of provenance. An unprovenanced name===id stub
+  // must be presentation_stub_lineage (enters repair), NOT demoted to the non-fatal
+  // missing_provenance bucket — otherwise the id-as-name leak slips through.
+  it("classifies an unprovenanced name===id stub as presentation_stub_lineage", () => {
+    const world = { objects: [obj("guest_1", "guest_1")] };
+    const violations = collectPlanningWorldViolations(world, provenance([]));
+    expect(violations).toHaveLength(1);
+    expect(violations[0].kind).toBe("presentation_stub_lineage");
   });
 
   // The ratchet: a known-debt cell key is allow-listed so the gate can run during
@@ -131,6 +141,15 @@ describe("PlanningWorld admission gate — runtime enforcement at the VM boundar
     expect(thrown).toMatchObject({ code: "E_NEED_STATE" });
     const atoms = (thrown as { value?: { missing_atoms?: Array<{ preimage?: string }> } }).value?.missing_atoms ?? [];
     expect(atoms.some((a) => a.preimage?.includes("guest_1"))).toBe(true);
+  });
+
+  // P1 at the boundary: an unprovenanced stub (empty provenance map) must STILL
+  // raise the repairable E_NEED_STATE, not fall through to a normal VM run.
+  it("raises E_NEED_STATE for an unprovenanced stub at the boundary", async () => {
+    const serialized = world([obj("guest_1", "guest_1", { owner: "guest_1" })]);
+    let thrown: unknown;
+    await runShadowTurnCallTranscript(serialized, call, { planningProvenance: provenance([]) }).catch((err) => { thrown = err; });
+    expect(thrown).toMatchObject({ code: "E_NEED_STATE" });
   });
 
   // No provenance threaded → gate does not run (prior behavior preserved); a named

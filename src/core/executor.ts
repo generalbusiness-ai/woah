@@ -475,9 +475,11 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       const planningProvenance = options.clientPlanningProvenance?.(planningClient);
       planned = await runShadowTurnCallTranscript(serialized, call, {
         ...(options.onMetric ? { onMetric: options.onMetric } : {}),
-        ...(planningProvenance && options.onAdmissionViolation
-          ? { planningProvenance, onAdmissionViolation: options.onAdmissionViolation }
-          : {})
+        // Enforcement depends ONLY on planningProvenance. onAdmissionViolation is
+        // optional observability; a caller that supplies provenance but no logger
+        // still gets the runtime gate (it must not be silently skippable).
+        ...(planningProvenance ? { planningProvenance } : {}),
+        ...(options.onAdmissionViolation ? { onAdmissionViolation: options.onAdmissionViolation } : {})
       });
     } catch (err) {
       // Sparse MCP planning can discover a transitive object before the commit
