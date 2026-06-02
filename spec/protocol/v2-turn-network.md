@@ -1336,6 +1336,26 @@ Lower rank scores are better. `factor` is an opaque cost contribution, not a
 quality score; a larger factor makes an otherwise equivalent candidate less
 preferred.
 
+> **Status (B8): implemented as the in-process routing layer.** The ad model
+> (`covers`/`accepts` Bloom, `factor`, `latency_ms`/`transfer_cost`/
+> `failure_penalty`, head, TTL), the ranking score
+> (`latency + factor + transfer_cost + failure_penalty`, lower-is-better, with
+> TTL expiry), and TurnKey-driven candidate selection are implemented and route
+> every in-process/relay turn (the ranked-candidate selector drives the
+> in-process turn network). A Bloom false positive is
+> refused cheaply: the executor returns `missing_state`, the caller warms it by
+> bounded transfer and retries, never corrupting state. Riding on B7 warm
+> cache-fill, this yields execution **migration**: a cold turn runs at the owner
+> and warms the actor node; the next same-object turn ranks the now-warm node
+> best (transfer_cost ≈ 0, latency ≈ 0) and routes local with no further
+> transfer. Gated by `tests/v2-capability-gossip-routing.test.ts`.
+>
+> **Deferred:** retiring the production worker's static scope-submission *behind*
+> this layer (so the deployed gateway ranks gossiped ads instead of submitting to
+> a fixed commit scope) is the highest-reach change and rides on smoke
+> validation, not the local gate. Until then the gossip layer is the in-process
+> router and the static route is the production bootstrap.
+
 Ads are advisory. Commit receipts and state proofs are authoritative.
 
 When an ad is carried inside an `Envelope`, omitted `ExecCapabilityAd.auth`

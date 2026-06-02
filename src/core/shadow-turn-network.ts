@@ -23,18 +23,31 @@ export type ShadowInProcessNetworkResult = {
   result: ShadowTurnExecutionResult;
 };
 
+// B8 routing-cost fields a builder may carry onto the ad so the consumer can
+// rank by `latency + factor + transfer_cost + failure_penalty` (and expire by
+// TTL). All optional; omitting them reproduces factor-only ranking.
+export type ShadowAdRoutingCost = {
+  head?: string;
+  latency_ms?: number;
+  transfer_cost?: number;
+  failure_penalty?: number;
+  issued_at_ms?: number;
+  ttl_ms?: number;
+};
+
 export function buildShadowTurnExecAd(input: {
   node: string;
   scope: ObjRef;
   key: ShadowTurnKey;
   factor?: number;
-}): ShadowCapabilityAd {
+} & ShadowAdRoutingCost): ShadowCapabilityAd {
   return buildShadowCapabilityAd({
     node: input.node,
     scope: input.scope,
     atom_hashes: input.key.atom_hashes,
     accepts_atom_hashes: input.key.accept_atom_hashes,
-    factor: input.factor
+    factor: input.factor,
+    ...adRoutingCost(input)
   });
 }
 
@@ -58,14 +71,26 @@ export function buildShadowTurnExecAdFromNode(input: {
   node: ShadowExecutionNode;
   accepts: ShadowTurnKey;
   factor?: number;
-}): ShadowCapabilityAd {
+} & ShadowAdRoutingCost): ShadowCapabilityAd {
   return buildShadowCapabilityAd({
     node: input.node.node,
     scope: input.node.scope,
     atom_hashes: Array.from(input.node.atom_hashes).sort(),
     accepts_atom_hashes: input.accepts.accept_atom_hashes,
-    factor: input.factor
+    factor: input.factor,
+    ...adRoutingCost(input)
   });
+}
+
+function adRoutingCost(input: ShadowAdRoutingCost): ShadowAdRoutingCost {
+  const cost: ShadowAdRoutingCost = {};
+  if (input.head !== undefined) cost.head = input.head;
+  if (input.latency_ms !== undefined) cost.latency_ms = input.latency_ms;
+  if (input.transfer_cost !== undefined) cost.transfer_cost = input.transfer_cost;
+  if (input.failure_penalty !== undefined) cost.failure_penalty = input.failure_penalty;
+  if (input.issued_at_ms !== undefined) cost.issued_at_ms = input.issued_at_ms;
+  if (input.ttl_ms !== undefined) cost.ttl_ms = input.ttl_ms;
+  return cost;
 }
 
 export async function executeShadowTurnCallAcrossInProcessNetwork(input: {
