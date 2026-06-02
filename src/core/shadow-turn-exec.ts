@@ -10,7 +10,7 @@ import { effectTranscriptFromRecordedTurn, type EffectTranscript } from "./effec
 import { shadowCommitReceipt, type ShadowCommitReceipt } from "./turn-commit";
 import { replayRecordedTurn } from "./turn-replay";
 import type { RecordedTurn } from "./turn-recorder";
-import { shadowAtomHash, shadowTurnKeyFromTranscript, type ShadowTurnKey } from "./turn-key";
+import { SHADOW_EPOCH_WILDCARD, shadowAtomHash, shadowTurnKeyFromTranscript, type ShadowTurnKey } from "./turn-key";
 import {
   runShadowTurnCallOnWorld,
   runShadowTurnCallOnWorldTranscript,
@@ -532,9 +532,13 @@ function shadowTransferAtomTurnKey(
   return {
     kind: "woo.turn_key.shadow.v1",
     scope,
+    // A transfer-atom key is a capsule-binding artifact, not a routing key, so it
+    // carries the wildcard epoch and claims no effects.
+    epoch: SHADOW_EPOCH_WILDCARD,
     actor: input.actor,
     target: input.target,
     verb: input.verb,
+    effects: 0,
     preimages,
     atom_hashes: atomHashes,
     read_preimages: preimages,

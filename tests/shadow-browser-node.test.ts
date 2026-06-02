@@ -66,7 +66,11 @@ describe("shadow browser node shim", () => {
         kind: "woo.exec_capability_ad.shadow.v1",
         node: "browser-relay:executor",
         scope: "the_dubspace",
-        epoch: expect.stringMatching(/^[a-f0-9]{64}$/)
+        // CA10.1: `epoch` is the scope generation (a numeric string), `head` is
+        // the value-head hash — distinct fields. (Previously the scope ad put the
+        // head hash in `epoch`; that conflation is fixed.)
+        epoch: expect.stringMatching(/^\d+$/),
+        head: expect.stringMatching(/^[a-f0-9]{64}$/)
       })
     ]);
     expect(turn.network.first).toMatchObject({ ok: false, reason: "missing_state", attempted: false });

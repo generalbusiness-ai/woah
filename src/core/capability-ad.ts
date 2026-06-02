@@ -1,6 +1,6 @@
 import { hashSource } from "./source-hash";
 import type { ObjRef } from "./types";
-import type { ShadowTurnKey } from "./turn-key";
+import { SHADOW_EFFECTS_ALL, SHADOW_EPOCH_WILDCARD, type ShadowTurnKey } from "./turn-key";
 
 export type ShadowBloomFilter = {
   m: number;
@@ -63,11 +63,14 @@ export function buildShadowCapabilityAd(input: {
     kind: "woo.exec_capability_ad.shadow.v1",
     node: input.node,
     scope: input.scope,
-    epoch: input.epoch ?? "shadow",
+    epoch: input.epoch ?? SHADOW_EPOCH_WILDCARD,
     ...(input.head !== undefined ? { head: input.head } : {}),
     covers,
     accepts,
-    effects: input.effects ?? 0,
+    // An ad that does not specify its accepted effect classes is treated as a
+    // full-capability executor (accepts every class). A constrained node sets a
+    // narrower mask explicitly.
+    effects: input.effects ?? SHADOW_EFFECTS_ALL,
     factor: input.factor ?? 1,
     ...(input.latency_ms !== undefined ? { latency_ms: input.latency_ms } : {}),
     ...(input.transfer_cost !== undefined ? { transfer_cost: input.transfer_cost } : {}),
@@ -79,7 +82,19 @@ export function buildShadowCapabilityAd(input: {
 
 export function capabilityAdProbablyCoversTurn(ad: ShadowCapabilityAd, key: ShadowTurnKey): boolean {
   if (ad.scope !== key.scope) return false;
+  // VTN11 scope-generation match: wildcard on either side matches (the
+  // pre-migration single-generation case); otherwise the generations must be
+  // equal, so a stale-generation ad cannot route a turn planned at a newer epoch.
+  if (!capabilityAdEpochMatches(ad.epoch, key.epoch)) return false;
+  // VTN11 effect-mask: the turn's effect classes must be a SUBSET of the ad's.
+  // (`key.effects ?? 0` keeps a hand-built partial key — tests — unconstrained;
+  // `ad.effects ?? ALL` treats an unspecified ad as full-capability.)
+  if (((key.effects ?? 0) & ~(ad.effects ?? SHADOW_EFFECTS_ALL)) !== 0) return false;
   return bloomContainsAll(ad.covers, key.atom_hashes) && bloomContainsAll(ad.accepts, key.accept_atom_hashes);
+}
+
+export function capabilityAdEpochMatches(adEpoch: string, keyEpoch: string): boolean {
+  return adEpoch === SHADOW_EPOCH_WILDCARD || keyEpoch === SHADOW_EPOCH_WILDCARD || adEpoch === keyEpoch;
 }
 
 // B8 candidate ranking score: lower is better. The full formula the target

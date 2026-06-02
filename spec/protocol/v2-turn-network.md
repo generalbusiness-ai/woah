@@ -1326,10 +1326,10 @@ Candidate selection:
 ```text
 ad not expired                                              # implemented (TTL)
 ad.scope match the TurnKey                                  # implemented
-ad.epoch match the TurnKey                                  # DEFERRED (see below)
+ad.epoch match the TurnKey                                  # implemented (wildcard-aware)
 all TurnKey atoms are probably in ad.covers                 # implemented (Bloom)
 turn-shape atoms are probably in ad.accepts                 # implemented (Bloom)
-TurnKey effects are a subset of ad.effects                  # DEFERRED (see below)
+TurnKey effects are a subset of ad.effects                  # implemented (effect mask)
 rank by observed latency + ad.factor + estimated transfer cost + failure penalty  # implemented
 ```
 
@@ -1357,15 +1357,23 @@ preferred.
 > validation, not the local gate. Until then the gossip layer is the in-process
 > router and the static route is the production bootstrap.
 >
-> **Deferred — epoch / effect-mask selection.** The two `# DEFERRED` predicate
-> lines above are specified but not yet implemented. The implemented `TurnKey`
-> carries no `epoch` or `effects` field, and the coverage predicate matches only
-> `scope` + Bloom coverage; `ad.effects` is always `0` today. The implemented
-> selector is: TTL freshness + scope match + Bloom `covers`/`accepts` coverage +
-> the routing score. Adding epoch/effect-mask selection requires defining the
-> effect-bit taxonomy and extracting it onto the key during TurnKey derivation
-> (plus an epoch token on the key), and is deferred with the production
-> route-table retirement.
+> **Epoch / effect-mask selection — implemented.** The `TurnKey` carries an
+> `epoch` (scope generation) and an `effects` mask (bitwise-OR of the turn's
+> effect classes: read / prop-write / verb-write / move / create / lifecycle /
+> observe / sequenced, derived from the transcript). The coverage predicate
+> enforces both:
+> - **Effect mask:** a turn routes to an ad only when its `effects` are a SUBSET
+>   of the ad's. An ad that does not specify accepted effects is a
+>   full-capability executor (accepts all classes); a constrained node (e.g. a
+>   read-only edge) advertises a narrower mask and will not be selected for a
+>   write/move turn.
+> - **Epoch (wildcard-aware):** a wildcard epoch on either side matches; otherwise
+>   the generations must be equal, so a stale-generation ad cannot route a turn
+>   planned at a newer epoch. Concrete generations are minted by route-epoch
+>   migration (CA10), which is deferred — until then keys and in-process ads carry
+>   the wildcard, so this check is a no-op that becomes load-bearing the moment a
+>   migration stamps a concrete generation. (Per CA10.1, `epoch` is the scope
+>   generation and is kept distinct from the value `head`.)
 
 Ads are advisory. Commit receipts and state proofs are authoritative.
 

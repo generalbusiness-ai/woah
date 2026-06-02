@@ -3,12 +3,37 @@ import type { ObjRef } from "./types";
 import type { EffectTranscript, TranscriptCell } from "./effect-transcript";
 import { hashSource } from "./source-hash";
 
+// VTN11 effect mask: the classes of effect a turn performs. An executor's ad
+// advertises the classes it `accepts` (ad.effects); a turn routes to an ad only
+// when the turn's effects are a SUBSET of the ad's. A turn whose effect mask is
+// not covered must not route there even if the Bloom atoms appear covered.
+export const SHADOW_EFFECT_READ = 1 << 0;
+export const SHADOW_EFFECT_PROP_WRITE = 1 << 1;
+export const SHADOW_EFFECT_VERB_WRITE = 1 << 2;
+export const SHADOW_EFFECT_MOVE = 1 << 3;       // location writes / object moves
+export const SHADOW_EFFECT_CREATE = 1 << 4;
+export const SHADOW_EFFECT_LIFECYCLE = 1 << 5;  // recycle / delete
+export const SHADOW_EFFECT_OBSERVE = 1 << 6;
+export const SHADOW_EFFECT_SEQUENCED = 1 << 7;
+// Full capability: a node that owns/holds the scope state accepts every class.
+export const SHADOW_EFFECTS_ALL = (1 << 8) - 1;
+// Wildcard scope generation: matches any key/ad epoch. Concrete epochs are
+// minted by route-epoch migration (CA10), which is deferred; until then keys and
+// in-process ads carry the wildcard so epoch selection is a no-op that becomes
+// load-bearing the moment a migration stamps a concrete generation.
+export const SHADOW_EPOCH_WILDCARD = "shadow";
+
 export type ShadowTurnKey = {
   kind: "woo.turn_key.shadow.v1";
   scope: ObjRef;
+  // VTN11 scope generation this key planned against (SHADOW_EPOCH_WILDCARD until
+  // route-epoch migration stamps concrete generations).
+  epoch: string;
   actor: ObjRef;
   target: ObjRef;
   verb: string;
+  // VTN11 effect mask of the turn (bitwise-OR of SHADOW_EFFECT_*).
+  effects: number;
   preimages: string[];
   atom_hashes: string[];
   read_preimages: string[];
@@ -18,6 +43,27 @@ export type ShadowTurnKey = {
   accept_preimages: string[];
   accept_atom_hashes: string[];
 };
+
+export function shadowTurnEffectsFromTranscript(transcript: EffectTranscript): number {
+  let effects = 0;
+  if (transcript.reads.length > 0 || (transcript.stateProbes?.length ?? 0) > 0) effects |= SHADOW_EFFECT_READ;
+  for (const write of transcript.writes) {
+    switch (write.cell.kind) {
+      case "prop": effects |= SHADOW_EFFECT_PROP_WRITE; break;
+      case "verb": effects |= SHADOW_EFFECT_VERB_WRITE; break;
+      case "location": effects |= SHADOW_EFFECT_MOVE; break;
+      case "lifecycle": effects |= SHADOW_EFFECT_LIFECYCLE; break;
+      // `contents` is a per-member projection (A4), not an authoritative effect
+      // class that constrains executor capability — excluded from the mask.
+      case "contents": break;
+    }
+  }
+  if (transcript.moves.length > 0) effects |= SHADOW_EFFECT_MOVE;
+  if (transcript.creates.length > 0) effects |= SHADOW_EFFECT_CREATE;
+  if (transcript.observations.length > 0) effects |= SHADOW_EFFECT_OBSERVE;
+  if (transcript.route === "sequenced") effects |= SHADOW_EFFECT_SEQUENCED;
+  return effects;
+}
 
 export function shadowTurnKeyFromTranscript(transcript: EffectTranscript): ShadowTurnKey {
   const preimages = new Set<string>();
@@ -63,9 +109,11 @@ export function shadowTurnKeyFromTranscript(transcript: EffectTranscript): Shado
   return {
     kind: "woo.turn_key.shadow.v1",
     scope: transcript.scope,
+    epoch: SHADOW_EPOCH_WILDCARD,
     actor: transcript.call.actor,
     target: transcript.call.target,
     verb: transcript.call.verb,
+    effects: shadowTurnEffectsFromTranscript(transcript),
     preimages: sorted,
     atom_hashes: sorted.map((preimage) => shadowAtomHash(preimage)),
     read_preimages: sortedReads,
@@ -107,9 +155,14 @@ export function shadowTurnKeyFromCall(call: {
   return {
     kind: "woo.turn_key.shadow.v1",
     scope: call.scope,
+    epoch: SHADOW_EPOCH_WILDCARD,
     actor: call.actor,
     target: call.target,
     verb: call.verb,
+    // A static pre-execution intent key does not yet know its effect closure;
+    // claiming no effects (0) imposes no effect-subset constraint on routing —
+    // the executor proves the real closure by executing or returning missing_state.
+    effects: 0,
     preimages: sorted,
     atom_hashes: sorted.map((preimage) => shadowAtomHash(preimage)),
     read_preimages: [],

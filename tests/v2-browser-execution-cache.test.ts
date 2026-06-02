@@ -155,9 +155,11 @@ function turnKey(scope: string): ShadowTurnKey {
   return {
     kind: "woo.turn_key.shadow.v1",
     scope,
+    epoch: "shadow",
     actor: "#actor",
     target: scope,
     verb: "look",
+    effects: 0,
     preimages,
     atom_hashes: preimages.map(shadowAtomHash),
     read_preimages: preimages,

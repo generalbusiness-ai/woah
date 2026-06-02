@@ -50,7 +50,7 @@ import {
 // are universally tagged. A residual untagged cell raises a repairable E_NEED_STATE.
 const BROWSER_ADMISSION_OPTS = { enforceMissingProvenance: true } as const;
 import { buildShadowScopeTurnExecAd, buildShadowTurnExecAd, buildShadowTurnExecAdFromNode, executeShadowTurnCallAcrossInProcessNetwork, type ShadowInProcessNetworkResult } from "./shadow-turn-network";
-import { shadowAtomHash, shadowMaterializedAtomHashesFromSerialized, shadowTurnKeyFromCall, shadowTurnKeyFromTranscript, type ShadowTurnKey } from "./turn-key";
+import { SHADOW_EPOCH_WILDCARD, shadowAtomHash, shadowMaterializedAtomHashesFromSerialized, shadowTurnKeyFromCall, shadowTurnKeyFromTranscript, type ShadowTurnKey } from "./turn-key";
 import type { EffectTranscript } from "./effect-transcript";
 import type { ShadowCapabilityAd } from "./capability-ad";
 import { stableShadowJson } from "./shadow-cell-version";
@@ -895,9 +895,13 @@ export function buildShadowBrowserOpenExecutableSeedTransfer(
   const key: ShadowTurnKey = {
     kind: "woo.turn_key.shadow.v1",
     scope,
+    // Synthetic seed key (coarse coverage hint, not a routing key): wildcard
+    // epoch, no effect claim.
+    epoch: SHADOW_EPOCH_WILDCARD,
     actor: actor ?? "",
     target: scope,
     verb: "__open_executable_seed__",
+    effects: 0,
     preimages,
     atom_hashes: preimages.map(shadowAtomHash),
     read_preimages: preimages,
@@ -935,9 +939,11 @@ function buildShadowBrowserOpenExecutableSeedCacheHitTransfer(
   const key: ShadowTurnKey = {
     kind: "woo.turn_key.shadow.v1",
     scope,
+    epoch: SHADOW_EPOCH_WILDCARD,
     actor: actor ?? "",
     target: scope,
     verb: "__open_executable_seed_cache_hit__",
+    effects: 0,
     preimages: [],
     atom_hashes: [],
     read_preimages: [],
@@ -1179,7 +1185,10 @@ export function shadowBrowserScopeExecutionAds(relay: ShadowBrowserRelayShim, sc
   return [buildShadowScopeTurnExecAd({
     node: shadowRelayDefaultExecutorNode(relay),
     scope,
-    epoch: relay.commit_scope.head.hash,
+    // CA10.1: epoch is the scope GENERATION, head is the value version — keep
+    // them distinct. (The prior code put head.hash in epoch.)
+    epoch: String(relay.commit_scope.head.epoch),
+    head: relay.commit_scope.head.hash,
     factor: 1
   })];
 }

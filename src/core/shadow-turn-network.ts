@@ -44,8 +44,11 @@ export function buildShadowTurnExecAd(input: {
   return buildShadowCapabilityAd({
     node: input.node,
     scope: input.scope,
+    epoch: input.key.epoch,
     atom_hashes: input.key.atom_hashes,
     accepts_atom_hashes: input.key.accept_atom_hashes,
+    // An optimistic from-key ad claims exactly this turn's effect classes.
+    effects: input.key.effects,
     factor: input.factor,
     ...adRoutingCost(input)
   });
@@ -55,12 +58,14 @@ export function buildShadowScopeTurnExecAd(input: {
   node: string;
   scope: ObjRef;
   epoch?: string;
+  head?: string;
   factor?: number;
 }): ShadowCapabilityAd {
   return buildShadowCapabilityAd({
     node: input.node,
     scope: input.scope,
     epoch: input.epoch,
+    ...(input.head !== undefined ? { head: input.head } : {}),
     atom_hashes: [],
     accepts_atom_hashes: [],
     factor: input.factor
@@ -75,8 +80,11 @@ export function buildShadowTurnExecAdFromNode(input: {
   return buildShadowCapabilityAd({
     node: input.node.node,
     scope: input.node.scope,
+    epoch: input.accepts.epoch,
     atom_hashes: Array.from(input.node.atom_hashes).sort(),
     accepts_atom_hashes: input.accepts.accept_atom_hashes,
+    // A node holding the scope closure is a full-capability executor — it leaves
+    // `effects` at the builder default (SHADOW_EFFECTS_ALL).
     factor: input.factor,
     ...adRoutingCost(input)
   });

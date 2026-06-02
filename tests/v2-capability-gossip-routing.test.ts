@@ -4,9 +4,11 @@ import { authoritativePlanningWorld } from "../src/core/planning-world";
 import { createWorld } from "../src/core/bootstrap";
 import {
   buildShadowCapabilityAd,
+  capabilityAdProbablyCoversTurn,
   capabilityAdRoutingScore,
   rankCapabilityAdsForTurn
 } from "../src/core/capability-ad";
+import { SHADOW_EFFECT_MOVE, SHADOW_EFFECT_READ, type ShadowTurnKey } from "../src/core/turn-key";
 import { createShadowCommitScope } from "../src/core/shadow-commit-scope";
 import {
   createShadowExecutionNode,
@@ -74,6 +76,47 @@ describe("B8 capability gossip routing", () => {
     const adC = buildShadowCapabilityAd({ node: "busy-room-C", scope: "s", atom_hashes: ["y"], accepts_atom_hashes: ["y"], factor: 9 });
     const ranked = rankCapabilityAdsForTurn([adA, adC], keyY);
     expect(ranked.map((ad) => ad.node)).toEqual(["busy-room-C"]); // A does not cover; C wins despite worse factor
+  });
+
+  function keyWith(parts: { epoch: string; effects: number; atoms: string[]; accepts: string[] }): ShadowTurnKey {
+    return {
+      kind: "woo.turn_key.shadow.v1",
+      scope: "s",
+      epoch: parts.epoch,
+      actor: "a",
+      target: "s",
+      verb: "v",
+      effects: parts.effects,
+      preimages: [],
+      atom_hashes: parts.atoms,
+      read_preimages: [],
+      read_atom_hashes: [],
+      write_preimages: [],
+      write_atom_hashes: [],
+      accept_preimages: [],
+      accept_atom_hashes: parts.accepts
+    };
+  }
+
+  it("VTN11 effect mask: a move turn does not route to a read-only executor", () => {
+    const key = keyWith({ epoch: "shadow", effects: SHADOW_EFFECT_MOVE, atoms: ["m"], accepts: ["x"] });
+    const full = buildShadowCapabilityAd({ node: "full", scope: "s", atom_hashes: ["m"], accepts_atom_hashes: ["x"] }); // default ALL effects
+    const readOnly = buildShadowCapabilityAd({ node: "read-only", scope: "s", atom_hashes: ["m"], accepts_atom_hashes: ["x"], effects: SHADOW_EFFECT_READ });
+
+    expect(capabilityAdProbablyCoversTurn(full, key)).toBe(true);
+    expect(capabilityAdProbablyCoversTurn(readOnly, key)).toBe(false); // MOVE not in the ad's accepted effects
+    expect(rankCapabilityAdsForTurn([readOnly, full], key).map((ad) => ad.node)).toEqual(["full"]);
+  });
+
+  it("VTN11 epoch: a stale-generation ad does not route; same-generation and wildcard do", () => {
+    const key = keyWith({ epoch: "7", effects: 0, atoms: ["m"], accepts: ["x"] });
+    const same = buildShadowCapabilityAd({ node: "same", scope: "s", epoch: "7", atom_hashes: ["m"], accepts_atom_hashes: ["x"] });
+    const stale = buildShadowCapabilityAd({ node: "stale", scope: "s", epoch: "6", atom_hashes: ["m"], accepts_atom_hashes: ["x"] });
+    const wild = buildShadowCapabilityAd({ node: "wild", scope: "s", epoch: "shadow", atom_hashes: ["m"], accepts_atom_hashes: ["x"] });
+
+    expect(capabilityAdProbablyCoversTurn(same, key)).toBe(true);
+    expect(capabilityAdProbablyCoversTurn(stale, key)).toBe(false); // different scope generation
+    expect(capabilityAdProbablyCoversTurn(wild, key)).toBe(true);   // wildcard matches any generation
   });
 
   it("execution migrates: cold turn runs remote+warms the actor, next turn routes local with no fetch", async () => {
