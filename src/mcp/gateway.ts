@@ -16,20 +16,19 @@ import type { EffectTranscript } from "../core/effect-transcript";
 import { buildSerializedAuthorityCellSlice, cellProvenanceFromAuthoritySlice, combineSerializedAuthoritySlices, serializedWorldFromAuthoritySlice } from "../core/authority-slice";
 import { wooError, type AppliedFrame, type DirectResultFrame, type ErrorFrame, type ErrorValue, type Message, type ObjRef, type Session, type WooValue } from "../core/types";
 import type { WooWorld } from "../core/world";
-import type { SerializedAuthoritySlice, SerializedObject, SerializedSession, SerializedWorld } from "../core/repository";
+import type { SerializedAuthoritySlice } from "../core/repository";
 import { projectionDeltaMissingWrites, type ProjectionWrite } from "../core/projection-delta";
 import { createMcpServer } from "./server";
 import { McpHost, type McpAcceptedFrameAudience, type McpBroadcastHooks, type McpDispatchHooks, type McpToolManifestHooks } from "./host";
+import { createShadowBrowserRelayShim } from "../core/shadow-browser-node";
 import {
   applyAcceptedFrameToDerivedRelayCache,
-  createShadowBrowserRelayShim,
-  markShadowBrowserRelaySerializedChanged,
-  type ShadowBrowserRelayShim
-} from "../core/shadow-browser-node";
+  applyAcceptedFrameToRelayCache,
+  mergeAuthorityIntoRelayCache,
+  type ShadowRelayCache
+} from "../core/shadow-relay-cache";
 import type { ShadowTurnCall } from "../core/shadow-turn-call";
 import {
-  applyAcceptedShadowFrame,
-  recordAcceptedCommitScopeCellProvenance,
   serializedFor,
   type ShadowCommitAccepted,
   type ShadowScopeHead
@@ -40,7 +39,6 @@ import {
   V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED,
   buildExecutionCapsule,
   executorEnvelopeId,
-  mergeExecutorAuthority,
   submitTurnIntent,
   executorAuthorityPayload,
   type ExecutionCapsule
@@ -148,7 +146,7 @@ export type McpV2EnvelopeResult = {
 
 type V2ScopeClient = {
   scope: ObjRef;
-  relay: ShadowBrowserRelayShim;
+  relay: ShadowRelayCache;
   openedSessions: Set<string>;
   openingSessions: Map<string, Promise<void>>;
 };
@@ -400,9 +398,8 @@ export class McpGateway {
     this.rememberRemoteAccepted(remoteAcceptedKey(entry.commit));
     const client = this.v2Scopes.get(scope);
     if (client) {
-      applyAcceptedShadowFrame(client.relay.commit_scope, entry.commit, entry.transcript);
-      recordAcceptedCommitScopeCellProvenance(client.relay.commit_scope, entry.transcript, entry.commit, "cache");
-      markShadowBrowserRelaySerializedChanged(client.relay);
+      // This relay OWNS the frame's scope (fanout for its own commit) — advance head.
+      applyAcceptedFrameToRelayCache(client.relay, entry.commit, entry.transcript, { advanceHead: true });
     }
     if (entry.commit.projection_delta) {
       // Worker gateways persist accepted fanout into SQL before calling this
@@ -860,20 +857,12 @@ export class McpGateway {
   }
 
   private mergeV2AuthorityIntoScopeClient(client: V2ScopeClient, authority: SerializedAuthoritySlice): void {
-    // The gateway keeps one relay per scope and mutates its serialized snapshot
-    // with fresh session/actor authority. Relay-level cache generation must
-    // move with that snapshot or open executable seed digests can validate
-    // against pre-refresh pages.
-    const serialized = serializedFor(client.relay.commit_scope, { reason: "mcp_authority_merge" });
-    const preservedActorLive = preserveSessionActorLiveCells(serialized, authority.sessions);
-    // A3.2 provenance retrofit: carry the relay's per-cell provenance table through
-    // the merge so a fresher projection page repairs a stale cross-host `cache`
-    // stub for the tracked identity/live cells (the cross-scope `who` name bug),
-    // while an authoritative cell is still never displaced by a derived page.
-    const cellProvenance = (client.relay.commit_scope.cellProvenance ??= new Map());
-    mergeExecutorAuthority(serialized, authority, { cellProvenance });
-    restoreSessionActorLiveCells(serialized, preservedActorLive);
-    markShadowBrowserRelaySerializedChanged(client.relay);
+    // The gateway keeps one relay per scope and mutates its serialized snapshot with
+    // fresh session/actor authority. The shared relay-cache merge carries the relay's
+    // per-cell provenance (so the admission gate / merge precedence apply uniformly),
+    // preserves the session actors' live cells across the refresh, and bumps the
+    // relay-cache generation when the snapshot changed.
+    mergeAuthorityIntoRelayCache(client.relay, authority, { preserveSessionActorLive: true, reason: "mcp_authority_merge" });
   }
 
   private withRelaySnapshotAuthorityFallback(
@@ -916,9 +905,8 @@ export class McpGateway {
     audience?: McpAcceptedFrameAudience
   ): void {
     if (!reply.commit || !reply.transcript) return;
-    applyAcceptedShadowFrame(client.relay.commit_scope, reply.commit, reply.transcript);
-    recordAcceptedCommitScopeCellProvenance(client.relay.commit_scope, reply.transcript, reply.commit, "cache");
-    markShadowBrowserRelaySerializedChanged(client.relay);
+    // This relay OWNS the committed scope — advance head via the shared applier.
+    applyAcceptedFrameToRelayCache(client.relay, reply.commit, reply.transcript, { advanceHead: true });
     const projectionWrites = reply.commit.projection_writes ?? [];
     if (reply.commit.projection_delta) {
       assertProjectionWritesComplete(reply.commit.projection_delta, projectionWrites, reply.commit.position.scope, "mcp");
@@ -1201,46 +1189,6 @@ function synthesizeInitializeRequest(): Request {
       }
     })
   });
-}
-
-type PreservedActorLiveCells = {
-  location: SerializedObject["location"];
-  children: SerializedObject["children"];
-  contents: SerializedObject["contents"];
-};
-
-function preserveSessionActorLiveCells(
-  serialized: Pick<SerializedWorld, "objects">,
-  sessions: readonly SerializedSession[]
-): Map<ObjRef, PreservedActorLiveCells> {
-  const actors = new Set(sessions.map((session) => session.actor));
-  const preserved = new Map<ObjRef, PreservedActorLiveCells>();
-  for (const obj of serialized.objects) {
-    if (!actors.has(obj.id)) continue;
-    preserved.set(obj.id, {
-      location: obj.location,
-      children: obj.children.slice(),
-      contents: obj.contents.slice()
-    });
-  }
-  return preserved;
-}
-
-function restoreSessionActorLiveCells(
-  serialized: Pick<SerializedWorld, "objects">,
-  preserved: ReadonlyMap<ObjRef, PreservedActorLiveCells>
-): void {
-  if (preserved.size === 0) return;
-  for (const obj of serialized.objects) {
-    const live = preserved.get(obj.id);
-    if (!live) continue;
-    // Per-turn authority refreshes may source an actor row from a sparse owner
-    // snapshot. Keep the gateway relay's accepted derived live projection
-    // cells while allowing actor lineage and property cells to refresh.
-    obj.location = live.location;
-    obj.children = live.children.slice();
-    obj.contents = live.contents.slice();
-  }
 }
 
 export type { ObjRef };

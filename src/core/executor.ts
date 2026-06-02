@@ -125,16 +125,24 @@ export type SubmitTurnIntentOptions<Client, Result extends ExecutorEnvelopeResul
   clientNode(client: Client): string;
   clientHead?(client: Client): ShadowScopeHead;
   clientSerialized?(client: Client): SerializedWorld;
-  // A3.2 PlanningWorld admission gate (discovery wiring): the planning client's
-  // per-cell provenance for the world `clientSerialized` returns. When present,
-  // the VM-boundary admissibility check runs and reports violations via
-  // `onAdmissionViolation` (no throw yet — enforcement is the P4 flip).
+  // PlanningWorld admission gate — the guarded-executor policy. The planning world
+  // returned by `clientSerialized` is admitted through `buildPlanningWorld` before
+  // it reaches the VM (see submitTurnIntent below). These options thread the per-cell
+  // provenance the gate consumes:
+  //   - `clientPlanningProvenance` supplies the planning client's per-cell provenance.
+  //     A presentation stub (name===id lineage that is not authoritative) is ALWAYS
+  //     fatal-by-repair: the gate raises a repairable `E_NEED_STATE`, caught and
+  //     retried locally. When omitted, provenance defaults to empty (the gate still
+  //     runs; the stub class is still enforced).
+  //   - `onAdmissionViolation` is an observability sink for every violation, fatal or
+  //     not. It never changes enforcement — it is logging only.
   clientPlanningProvenance?(client: Client): PlanningWorldProvenance;
   onAdmissionViolation?(violations: PlanningAdmissibilityViolation[]): void;
-  // Opt IN to fatal missing_provenance enforcement (#11). A caller sets this only on
-  // a path whose planning worlds are universally per-cell provenance-tagged (the
-  // sparse gateway relay, which records provenance on every authority merge). Off by
-  // default so callers planning against authoritative/untagged worlds are unaffected.
+  // Opt IN to fatal missing_provenance enforcement. A caller sets this only on a
+  // sparse-planning path whose planning worlds are universally per-cell
+  // provenance-tagged (gateway/REST/browser, which record provenance on every
+  // authority merge, seed, and accepted-frame application). Off by default so callers
+  // planning against authoritative/untagged worlds are unaffected.
   enforceMissingProvenance?: boolean;
   nextTurnId(client: Client, attempt: number): string;
   envelopeId?(turnId: string, attempt: number): string;

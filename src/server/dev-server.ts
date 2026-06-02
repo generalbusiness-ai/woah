@@ -4,7 +4,6 @@ import { parse } from "node:url";
 import { createServer as createViteServer } from "vite";
 import { WebSocket, WebSocketServer } from "ws";
 import { compileVerb, definePropertyVersionedAs, installVerbAs, setPropertyValueVersionedAs } from "../core/authoring";
-import { mergeSerializedAuthoritySlice } from "../core/authority-slice";
 import { createWorld } from "../core/bootstrap";
 import { parseAutoInstallCatalogs } from "../core/local-catalogs";
 import { handleRestProtocolRequest, restFrameFromTurnReply, type RestProtocolHost, type RestProtocolRequest } from "../core/protocol";
@@ -33,16 +32,19 @@ import {
   disposeShadowBrowserNode,
   handleShadowBrowserStateTransferEnvelope,
   handleShadowBrowserTurnExecEnvelope,
-  markShadowBrowserRelaySerializedChanged,
   openShadowBrowserScope,
   receiveShadowBrowserEnvelopeReceipt,
   shadowBrowserSessionBearer,
   shadowBrowserSessionClaimsValue,
   shadowLiveEventMatchesBrowser,
   shadowLiveEventsForTranscript,
-  shadowBrowserTransportHello,
-  type ShadowBrowserRelayShim
+  shadowBrowserTransportHello
 } from "../core/shadow-browser-node";
+import {
+  markShadowBrowserRelaySerializedChanged,
+  mergeAuthorityIntoRelayCache,
+  type ShadowRelayCache
+} from "../core/shadow-relay-cache";
 import { buildTransportErrorEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
 import {
   buildVerbThrewReplyEnvelope,
@@ -69,7 +71,7 @@ ensureLocaldevWizardApiKey();
 if (process.env.WOO_METRICS !== "off") {
   world.setMetricsHook(emitDevMetric);
 }
-const v2RelaysByScope = new Map<ObjRef, ShadowBrowserRelayShim>();
+const v2RelaysByScope = new Map<ObjRef, ShadowRelayCache>();
 const v2SocketsByNode = new Map<string, WebSocket>();
 const mcpGateway = new McpGateway(world, {
   serverName: "woo-dev",
@@ -441,7 +443,7 @@ function v2ShadowBrowser(node: string, token: string, session: Session, scope: O
   });
 }
 
-function v2RelayForScope(scope: ObjRef): ShadowBrowserRelayShim {
+function v2RelayForScope(scope: ObjRef): ShadowRelayCache {
   let relay = v2RelaysByScope.get(scope);
   if (!relay) {
     relay = createShadowBrowserRelayShim({
@@ -460,7 +462,7 @@ function v2RelayForScope(scope: ObjRef): ShadowBrowserRelayShim {
   return relay;
 }
 
-function refreshDevV2RelaySessions(relay: ShadowBrowserRelayShim, extraObjectIds: Iterable<ObjRef> = []): void {
+function refreshDevV2RelaySessions(relay: ShadowRelayCache, extraObjectIds: Iterable<ObjRef> = []): void {
   const { authority } = executorAuthorityPayload(world, extraObjectIds);
   const auth = buildShadowBrowserSessionAuth({
     sessions: authority.sessions,
@@ -474,12 +476,17 @@ function refreshDevV2RelaySessions(relay: ShadowBrowserRelayShim, extraObjectIds
     const claims = relay.session_auth.get(shadowBrowserSessionBearer({ id: browser.session, actor: browser.actor }));
     if (claims) relay.session_auth.set(browser.session_token, claims);
   }
-  if (mergeSerializedAuthoritySlice(serializedFor(relay.commit_scope, { reason: "dev_authority_merge" }), authority, { clone: true })) {
-    markShadowBrowserRelaySerializedChanged(relay);
-  }
+  // Parity with MCP/REST/CommitScopeDO: the shared holder-neutral merge carries
+  // per-cell provenance, preserves the session actors' live cells, and bumps the
+  // generation, so local dev exercises exactly the same semantics as cloud.
+  mergeAuthorityIntoRelayCache(relay, authority, {
+    preserveSessionActorLive: true,
+    clone: true,
+    reason: "dev_authority_merge"
+  });
 }
 
-function ensureDevV2SerializedSession(relay: ShadowBrowserRelayShim, session: Session): void {
+function ensureDevV2SerializedSession(relay: ShadowRelayCache, session: Session): void {
   // Existing dev relays can outlive the local world snapshot they were opened
   // with. The accepted socket session must be present in the scope snapshot
   // before planning, or the turn fails before the recorder can produce a
@@ -515,13 +522,13 @@ function ensureDevV2SerializedSession(relay: ShadowBrowserRelayShim, session: Se
   refreshDevV2SerializedSessionActor(relay, session.actor);
 }
 
-function refreshDevV2SerializedSessionActor(relay: ShadowBrowserRelayShim, actor: ObjRef): void {
+function refreshDevV2SerializedSessionActor(relay: ShadowRelayCache, actor: ObjRef): void {
   const [record] = world.exportObjects([actor]);
   if (!record) return;
   refreshDevV2SerializedObjects(relay, [record]);
 }
 
-function refreshDevV2SerializedObjects(relay: ShadowBrowserRelayShim, objects: ReturnType<typeof world.exportObjects>): void {
+function refreshDevV2SerializedObjects(relay: ShadowRelayCache, objects: ReturnType<typeof world.exportObjects>): void {
   if (objects.length === 0) return;
   const snapshot = serializedFor(relay.commit_scope, { reason: "dev_object_merge" });
   const byId = new Map(snapshot.objects.map((obj, index) => [obj.id, index] as const));

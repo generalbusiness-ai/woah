@@ -1,0 +1,221 @@
+// Holder-neutral relay/cache substrate.
+//
+// A `ShadowRelayCache` (historically `ShadowBrowserRelayShim`) is the per-commit-scope
+// relay + read-through cache that EVERY holder runs: the MCP gateway, the REST
+// PersistentObjectDO, the CommitScopeDO, the dev server, and the in-process browser
+// node. It is not browser-specific — the browser is just one client that attaches to
+// it. The cache MECHANICS therefore live here, at the level shared by all holders:
+//   - the relay-cache shape and its serialized-world index cache,
+//   - generation bump + index/seed-cache eviction on mutation,
+//   - the one authority-merge-into-cache recipe,
+//   - the one accepted-frame application helper (head-advancing vs derived).
+//
+// Browser-specific concerns (live events, projection transfers, the browser node and
+// its publish/subscribe path, session-auth construction) stay in `shadow-browser-node`,
+// which imports this module's values. To keep the relay shape's mutually-recursive
+// reference to `ShadowBrowserNode` (the `browsers` map) working without a runtime
+// import cycle, this module imports the browser-local field TYPES with `import type`
+// only — those imports are erased at runtime, so the value dependency is strictly
+// browser-node → relay-cache.
+import type { SerializedAuthoritySlice, SerializedObject, SerializedSession, SerializedWorld } from "./repository";
+import { mergeSerializedAuthoritySlice } from "./authority-slice";
+import {
+  applyAcceptedProjectionToCommitScopeCache,
+  applyAcceptedShadowFrame,
+  applyShadowTranscriptToCommitScopeCache,
+  isShadowCommitScopeSerializedDirty,
+  markShadowCommitScopeSerializedChanged,
+  recordAcceptedCommitScopeCellProvenance,
+  serializedFor,
+  shadowCommitScopeSerializedRef,
+  type ShadowCommitAccepted,
+  type ShadowCommitScope
+} from "./shadow-commit-scope";
+import type { ShadowExecutionNode } from "./shadow-turn-exec";
+import type { EffectTranscript } from "./effect-transcript";
+import type { ShadowEnvelope } from "./shadow-envelope";
+import type { MetricEvent, ObjRef, PropertyDef, WooValue } from "./types";
+// Browser-local field types — type-only import (no runtime dependency back on the
+// browser module, so the value-import direction stays one-way: browser → relay-cache).
+import type {
+  ShadowBrowserNode,
+  ShadowBrowserSessionClaims,
+  ShadowBrowserStateSigning,
+  ShadowLiveEvent
+} from "./shadow-browser-node";
+
+// THE relay/cache substrate. One per commit scope; many clients (gateway sockets, REST
+// relays, browser nodes) attach to it. The neutral fields are the cache itself; the
+// `browsers`/`subscriptions`/`live_*` fields are the browser attachment surface, owned
+// by `shadow-browser-node` but carried here because the shape is shared.
+export type ShadowRelayCache = {
+  kind: "woo.browser_relay.shadow.v1";
+  node: string;
+  deployment: string;
+  commit_scope: ShadowCommitScope;
+  commit_scopes: Map<ObjRef, ShadowCommitScope>;
+  executors: ShadowExecutionNode[];
+  subscriptions: Map<ObjRef, Set<string>>;
+  browsers: Map<string, ShadowBrowserNode>;
+  session_auth: Map<string, ShadowBrowserSessionClaims>;
+  session_revs: Map<string, number>;
+  serialized_generation: number;
+  open_executable_seed_cache: Map<string, { generation: number; digest: string }>;
+  idempotency_window_ms: number;
+  recently_seen: Map<string, number>;
+  recent_replies: Map<string, ShadowEnvelope>;
+  live_session_serialized: Map<string, SerializedWorld>;
+  accepted_frames: ShadowCommitAccepted[];
+  transcript_tail: EffectTranscript[];
+  live_events: ShadowLiveEvent[];
+  state_signing: ShadowBrowserStateSigning;
+};
+
+// A read-built index over a serialized world: id→record maps plus per-object property
+// maps. Cached per `SerializedWorld` instance (WeakMap) so repeated projection/read
+// passes over the same snapshot do not rebuild it. Mutating a snapshot in place (e.g.
+// an authority merge) must evict the stale entry — see markRelayCacheSerializedChanged.
+export type ShadowSerializedIndex = {
+  objects: Map<ObjRef, SerializedObject>;
+  sessions: Map<string, SerializedSession>;
+  indexedObjects: Map<ObjRef, ShadowIndexedObject>;
+  logSeqBySpace: Map<ObjRef, number>;
+};
+
+export type ShadowIndexedObject = {
+  record: SerializedObject;
+  properties: Map<string, WooValue>;
+  propertyDefs: Map<string, PropertyDef>;
+};
+
+const SHADOW_SERIALIZED_INDEX_CACHE = new WeakMap<SerializedWorld, ShadowSerializedIndex>();
+
+export function shadowSerializedIndex(serialized: SerializedWorld): ShadowSerializedIndex {
+  const cached = SHADOW_SERIALIZED_INDEX_CACHE.get(serialized);
+  if (cached) return cached;
+  const indexedObjects = new Map<ObjRef, ShadowIndexedObject>();
+  for (const obj of serialized.objects) {
+    indexedObjects.set(obj.id, {
+      record: obj,
+      properties: new Map(obj.properties),
+      propertyDefs: new Map(obj.propertyDefs.map((def) => [def.name, def] as const))
+    });
+  }
+  const index = {
+    objects: new Map(serialized.objects.map((obj) => [obj.id, obj])),
+    sessions: new Map(serialized.sessions.map((session) => [session.id, session])),
+    indexedObjects,
+    logSeqBySpace: new Map(serialized.logs.map(([space, entries]) => [
+      space,
+      entries.reduce((max, entry) => Math.max(max, entry.seq), 0)
+    ] as const))
+  };
+  SHADOW_SERIALIZED_INDEX_CACHE.set(serialized, index);
+  return index;
+}
+
+// Mutating the relay's serialized snapshot invalidates anything keyed off the
+// pre-mutation state: the commit-scope serialized export, the browser-facing
+// generation (open-time executable seed digests must not validate against
+// pre-commit pages), and the read-index cache for the snapshot object.
+export function markShadowBrowserRelaySerializedChanged(relay: ShadowRelayCache): void {
+  if (!isShadowCommitScopeSerializedDirty(relay.commit_scope)) {
+    markShadowCommitScopeSerializedChanged(relay.commit_scope);
+  }
+  relay.serialized_generation++;
+  relay.open_executable_seed_cache.clear();
+  SHADOW_SERIALIZED_INDEX_CACHE.delete(shadowCommitScopeSerializedRef(relay.commit_scope));
+}
+
+// THE accepted-frame-into-relay-cache helper across every transport. `advanceHead:true`
+// for an OWNING-scope frame (the head-advancing commit), `advanceHead:false` for a
+// DERIVED/cross-scope frame projected into a relay subscribed elsewhere. Either way it
+// records the derived view's provenance (`cache`) and bumps the relay-cache generation.
+export function applyAcceptedFrameToRelayCache(
+  relay: ShadowRelayCache,
+  accepted: ShadowCommitAccepted,
+  transcript: EffectTranscript,
+  options: { advanceHead: boolean }
+): void {
+  if (options.advanceHead) {
+    // applyAcceptedShadowFrame materializes authority projection rows (or replays)
+    // AND advances the head to the accepted position.
+    applyAcceptedShadowFrame(relay.commit_scope, accepted, transcript);
+  } else if (!applyAcceptedProjectionToCommitScopeCache(relay.commit_scope, accepted, transcript)) {
+    applyShadowTranscriptToCommitScopeCache(relay.commit_scope, transcript);
+  }
+  recordAcceptedCommitScopeCellProvenance(relay.commit_scope, transcript, accepted, "cache");
+  markShadowBrowserRelaySerializedChanged(relay);
+}
+
+// Derived/cross-scope convenience (advanceHead: false) — the common case for a relay
+// projecting another scope's accepted commit.
+export function applyAcceptedFrameToDerivedRelayCache(
+  relay: ShadowRelayCache,
+  accepted: ShadowCommitAccepted,
+  transcript: EffectTranscript
+): void {
+  applyAcceptedFrameToRelayCache(relay, accepted, transcript, { advanceHead: false });
+}
+
+type PreservedRelayActorLiveCells = {
+  location: SerializedObject["location"];
+  children: SerializedObject["children"];
+  contents: SerializedObject["contents"];
+};
+
+// Snapshot the live (location/children/contents) cells of the relay's session actors
+// before an authority merge. Per-turn authority refreshes can source an actor row
+// from a sparse owner snapshot; the relay's accepted derived live projection for its
+// own session actors must survive the merge while lineage/property cells refresh.
+function preserveRelayActorLiveCells(
+  serialized: Pick<SerializedWorld, "objects">,
+  sessions: readonly SerializedSession[]
+): Map<ObjRef, PreservedRelayActorLiveCells> {
+  const actors = new Set(sessions.map((session) => session.actor));
+  const preserved = new Map<ObjRef, PreservedRelayActorLiveCells>();
+  for (const obj of serialized.objects) {
+    if (!actors.has(obj.id)) continue;
+    preserved.set(obj.id, { location: obj.location, children: obj.children.slice(), contents: obj.contents.slice() });
+  }
+  return preserved;
+}
+
+function restoreRelayActorLiveCells(
+  serialized: Pick<SerializedWorld, "objects">,
+  preserved: ReadonlyMap<ObjRef, PreservedRelayActorLiveCells>
+): void {
+  if (preserved.size === 0) return;
+  for (const obj of serialized.objects) {
+    const live = preserved.get(obj.id);
+    if (!live) continue;
+    obj.location = live.location;
+    obj.children = live.children.slice();
+    obj.contents = live.contents.slice();
+  }
+}
+
+// THE one authority-merge-into-relay-cache helper across MCP / REST / CommitScopeDO /
+// dev. Materializes a fresh authority slice into the relay's planning snapshot with
+// the relay's per-cell provenance (so the admission gate / merge precedence apply
+// uniformly), optionally preserving the session actors' live cells across the merge,
+// and bumps the relay-cache generation when the snapshot actually changed. Returns
+// whether the merge changed durable state.
+export function mergeAuthorityIntoRelayCache(
+  relay: ShadowRelayCache,
+  authority: SerializedAuthoritySlice,
+  options: { preserveSessionActorLive?: boolean; clone?: boolean; reason?: string; metric?: (event: MetricEvent) => void } = {}
+): boolean {
+  const serialized = serializedFor(relay.commit_scope, {
+    reason: options.reason ?? "authority_merge",
+    ...(options.metric ? { metric: options.metric } : {})
+  });
+  const preserved = options.preserveSessionActorLive
+    ? preserveRelayActorLiveCells(serialized, authority.sessions)
+    : null;
+  const cellProvenance = (relay.commit_scope.cellProvenance ??= new Map());
+  const changed = mergeSerializedAuthoritySlice(serialized, authority, { clone: options.clone === true, cellProvenance });
+  if (preserved) restoreRelayActorLiveCells(serialized, preserved);
+  if (changed) markShadowBrowserRelaySerializedChanged(relay);
+  return changed;
+}

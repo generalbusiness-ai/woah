@@ -57,24 +57,27 @@ import { createHostOperationMemo, normalizeError } from "../core/world";
 import { installGitHubTap, updateGitHubTap, type CatalogTapLogEvent } from "../core/catalog-taps";
 import type { ShadowCapabilityAd } from "../core/capability-ad";
 import {
-  applyAcceptedFrameToDerivedRelayCache,
   createShadowBrowserRelayShim,
-  markShadowBrowserRelaySerializedChanged,
   publishShadowBrowserAcceptedFrame,
   shadowLiveEventsForTranscriptRelay,
   shadowBrowserSessionBearer,
   shadowBrowserSessionClaimsValue,
   type ShadowLiveEvent,
-  type ShadowBrowserRelayShim,
   type ShadowBrowserStateTransfer
 } from "../core/shadow-browser-node";
+import {
+  applyAcceptedFrameToDerivedRelayCache,
+  applyAcceptedFrameToRelayCache,
+  markShadowBrowserRelaySerializedChanged,
+  mergeAuthorityIntoRelayCache,
+  type ShadowRelayCache
+} from "../core/shadow-relay-cache";
 import { parseShadowScopeHeadJson } from "../core/shadow-scope-head";
 import { buildTransportErrorEnvelope, decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
 import type { ShadowStateTransfer, ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import { runShadowTurnCall } from "../core/shadow-turn-call";
 import { authoritativePlanningWorld } from "../core/planning-world";
 import {
-  applyAcceptedShadowFrame,
   serializedFor,
   shadowLocationCommitScopeForTranscript,
   transcriptTouchedObjectIds,
@@ -93,7 +96,6 @@ import { runShadowApply, type ShadowApplyTarget } from "../core/v2-shadow-apply"
 import {
   V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED,
   buildExecutionCapsule,
-  mergeExecutorAuthority,
   submitTurnIntent,
   executorAuthorityObjectIds,
   executorAuthorityPayload,
@@ -216,7 +218,7 @@ type CommitScopeStateTransferResponse = {
 type RestV2RelayClient = {
   scope: ObjRef;
   node: string;
-  relay: ShadowBrowserRelayShim;
+  relay: ShadowRelayCache;
   openedAt: number;
   nextTurn: number;
 };
@@ -4405,12 +4407,17 @@ export class PersistentObjectDO {
     client: RestV2RelayClient,
     authority: SerializedAuthoritySlice
   ): void {
-    const serialized = serializedFor(client.relay.commit_scope, { reason: "rest_planning_authority_merge", metric: (event) => world.recordMetric(event) });
-    // A3.2: carry the REST relay's per-cell provenance through the merge (mirrors the
-    // MCP gateway's mergeV2AuthorityIntoScopeClient), so the same provenance precedence
-    // + stub-repair apply and the admission gate can enforce on this sparse path.
-    const cellProvenance = (client.relay.commit_scope.cellProvenance ??= new Map());
-    mergeExecutorAuthority(serialized, authority, { clone: true, cellProvenance });
+    // Shared holder-neutral merge, mirroring the MCP gateway's
+    // mergeV2AuthorityIntoScopeClient exactly: provenance-aware precedence +
+    // stub-repair apply (so the admission gate can enforce on this sparse path),
+    // session-actor live-cell preservation, and the generation bump that
+    // invalidates stale seed caches.
+    mergeAuthorityIntoRelayCache(client.relay, authority, {
+      preserveSessionActorLive: true,
+      clone: true,
+      reason: "rest_planning_authority_merge",
+      metric: (event) => world.recordMetric(event)
+    });
   }
 
   private async v2GatewayState(world: WooWorld, extraObjectIds: Iterable<ObjRef>): Promise<{ serialized: SerializedWorld; authority: ReturnType<typeof executorAuthorityPayload> }> {
@@ -4800,10 +4807,12 @@ export class PersistentObjectDO {
             serialized: seeded.serialized
           });
           if (opened.head) client.relay.commit_scope.head = opened.head;
-          mergeExecutorAuthority(
-            serializedFor(client.relay.commit_scope, { reason: "rest_capsule_open_seed", metric: (event) => world.recordMetric(event) }),
-            seeded.authority.authority,
-            { clone: true, cellProvenance: (client.relay.commit_scope.cellProvenance ??= new Map()) });
+          mergeAuthorityIntoRelayCache(client.relay, seeded.authority.authority, {
+            preserveSessionActorLive: true,
+            clone: true,
+            reason: "rest_capsule_open_seed",
+            metric: (event) => world.recordMetric(event)
+          });
           const { execution_capsule, ...legacyBody } = capsuleBody;
           void execution_capsule;
           return await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(scope, "/v2/envelope", legacyBody);
@@ -4896,7 +4905,9 @@ export class PersistentObjectDO {
     if (reply.body.ok !== true || !reply.body.commit || !reply.body.transcript) return;
     const restRelay = this.restV2Relays.get(reply.body.commit.position.scope);
     if (restRelay) {
-      applyAcceptedShadowFrame(restRelay.relay.commit_scope, reply.body.commit, reply.body.transcript);
+      // Owning-scope frame: advance the head and apply via the shared helper, then
+      // publish (provenance re-tag is idempotent; publish also fans out + rebases live).
+      applyAcceptedFrameToRelayCache(restRelay.relay, reply.body.commit, reply.body.transcript, { advanceHead: true });
       publishShadowBrowserAcceptedFrame(restRelay.relay, reply.body.commit, reply.body.transcript);
     }
     this.propagateRestTranscriptToOtherRelays(reply.body.commit.position.scope, reply.body.commit, reply.body.transcript, world);

@@ -420,3 +420,55 @@ Tests: shadow-turn-exec +1 (sparse node stamps cache, authoritative does not);
 shadow-browser-node +1 (shared applier materializes projection rows + provenance, no head
 advance). Validation: typecheck 0 · npm test 292/292 · test:worker 202 passed/5 skipped ·
 gate:authority 2/2 · test:full 1385 passed (only the 3 pre-existing inherited failures).
+
+## A3.3 as-built — wrong-level factoring (2026-06-01)
+
+Six "right-level" factorings applied before smoke, all behaviour-preserving except
+where noted; net −95 LOC over the touched files plus one new module.
+
+1. **Holder-neutral relay/cache module.** `ShadowBrowserRelayShim` is the relay +
+   read-through cache that *every* holder runs (MCP gateway, REST DO, CommitScopeDO,
+   dev, browser), not a browser thing. The substrate moved to
+   `src/core/shadow-relay-cache.ts`: the relay shape (now `ShadowRelayCache`, with
+   `ShadowBrowserRelayShim` kept as a back-compat alias so the ~170 existing
+   references are untouched), the serialized-world index cache
+   (`shadowSerializedIndex` + WeakMap), generation-bump/eviction
+   (`markShadowBrowserRelaySerializedChanged`), the accepted-frame applier, and the
+   authority-merge recipe. Direction is one-way: `shadow-browser-node` imports
+   *values* from the neutral module; the neutral module imports only *types* from
+   `shadow-browser-node` (the recursive `browsers: Map<…, ShadowBrowserNode>` field),
+   so there is no runtime import cycle. The browser-flavoured constructor
+   (`createShadowBrowserRelayShim`, entangled with session-auth defaults) and all
+   live/publish/projection/client code stay in `shadow-browser-node`. Cloud modules
+   now import the substrate from `shadow-relay-cache`, not the browser module.
+2. **One accepted-frame applier with explicit mode.** `applyAcceptedFrameToRelayCache(relay, accepted, transcript, { advanceHead })`
+   — `advanceHead:true` for an owning-scope frame (head-advancing commit),
+   `false` for a derived/cross-scope projection. Owns transcript/projection apply,
+   `cache` provenance recording, head advancement, generation bump. Wired into MCP
+   (`applyRemoteAccepted`, `acceptV2Commit`) and REST (`applyV2CommittedTranscript`,
+   owning scope).
+4. **One authority-merge recipe.** `mergeAuthorityIntoRelayCache(relay, authority, { preserveSessionActorLive, clone, reason, metric })`
+   replaces the hand-rolled merge + actor-live preserve/restore previously duplicated
+   in MCP, REST, CommitScopeDO and dev. *Behaviour fix:* the REST planning merge
+   previously skipped both the actor-live preservation and the generation bump while
+   its comment claimed to "mirror the MCP gateway" — it now actually does.
+3. **Execution-node provenance from installed pages, not the serialized scan.**
+   `recordExecutionNodeCellProvenance(node, touchedKeys)` now tags only the tracked
+   cells a transfer genuinely delivered. A cell-page transfer derives keys from its
+   `page_refs`; full-record installs (closure / object-record / cached / initial
+   serialized) tag both tracked pages of the affected objects. This stops a
+   lineage-only transfer from claiming a `cache` copy of the default `object_live`
+   cells that `mergeShadowStatePagesIntoSerialized` synthesises (location:null, empty
+   children/contents) — those stay untagged → `missing_provenance` for the
+   atom-guard/repair, which is the honest state.
+5. **Dev parity.** `refreshDevV2RelaySessions` uses the shared
+   `mergeAuthorityIntoRelayCache` (provenance + actor-live preserve + generation
+   bump), matching cloud exactly.
+6. **Stale comments.** `SubmitTurnIntentOptions` and `buildPlanningWorld` no longer
+   describe the gate as "discovery/no-throw/P4-future" or claim browser/gateway
+   coverage is not yet universal; both reflect the landed enforcement (presentation
+   stubs always fatal-by-repair; sparse paths record provenance universally and opt
+   into `missing_provenance`).
+
+Validation: typecheck 0 · npm test 292/292 · test:worker 202 passed/5 skipped ·
+gate:authority 2/2. Not merged to main, not deployed.

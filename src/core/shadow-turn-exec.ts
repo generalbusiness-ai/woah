@@ -331,7 +331,9 @@ export function createShadowExecutionNode(input: {
     serialized,
     ...(input.authoritative_state === true ? { authoritative_state: true } : {})
   };
-  recordExecutionNodeCellProvenance(node);
+  // The initial serialized world (+ any cached object records merged above) are full
+  // object records: both tracked cells are honestly held.
+  recordExecutionNodeCellProvenance(node, trackedCellKeysForFullObjects(node.serialized?.objects ?? []));
   return node;
 }
 
@@ -339,7 +341,8 @@ export function installShadowCachedObjectRecords(node: ShadowExecutionNode, obje
   for (const obj of objects) cacheShadowMaterializedObject(node, obj);
   if (objects.length > 0) {
     node.serialized = mergeCachedObjectRecords(node.serialized, objects);
-    recordExecutionNodeCellProvenance(node);
+    // Full object records: tag exactly the objects this install delivered.
+    recordExecutionNodeCellProvenance(node, trackedCellKeysForFullObjects(objects));
   }
 }
 
@@ -655,7 +658,8 @@ export function installShadowStateTransfer(node: ShadowExecutionNode, transfer: 
     node.serialized = structuredClone(transfer.serialized) as SerializedWorld;
     node.world = undefined;
     for (const obj of node.serialized.objects) cacheShadowMaterializedObject(node, obj);
-    recordExecutionNodeCellProvenance(node);
+    // Closure transfers carry the full world as object records: both tracked cells held.
+    recordExecutionNodeCellProvenance(node, trackedCellKeysForFullObjects(node.serialized.objects));
     return;
   }
   if (transfer.mode === "cell_pages") {
@@ -665,14 +669,21 @@ export function installShadowStateTransfer(node: ShadowExecutionNode, transfer: 
     // before recording the retry transcript.
     node.world = undefined;
     for (const ref of transfer.page_refs) node.page_hashes.add(ref.hash);
-    recordExecutionNodeCellProvenance(node);
+    // Tag only the tracked pages the refs actually delivered — not the live cells
+    // synthesized as defaults for a lineage-only object.
+    recordExecutionNodeCellProvenance(node, trackedCellKeysFromPageRefs(transfer.page_refs));
     return;
   }
+  const transferredIds = new Set(transfer.object_pages.map((page) => page.id));
   node.serialized = mergeObjectRecordTransfer(node.serialized, transfer, node.object_cache);
   node.world = undefined;
   for (const page of transfer.object_pages) node.object_hashes.add(page.hash);
-  cacheShadowObjectsById(node, new Set(transfer.object_pages.map((page) => page.id)));
-  recordExecutionNodeCellProvenance(node);
+  cacheShadowObjectsById(node, transferredIds);
+  // Object-record transfers carry full records for the transferred ids: both cells held.
+  recordExecutionNodeCellProvenance(
+    node,
+    trackedCellKeysForFullObjects(node.serialized.objects.filter((obj) => transferredIds.has(obj.id)))
+  );
 }
 
 export async function executeShadowRecordedTurnOrNeedState(
@@ -1013,20 +1024,47 @@ export async function executeShadowTurnCallOrNeedState(
   };
 }
 
-// Tag a derived execution node's tracked cells `cache` (set-if-absent) — the honest
-// source for a holder/cache view composed from transfers. Skipped for an
+// Tag the tracked cells a transfer/install GENUINELY delivered `cache` (set-if-absent)
+// — the honest source for a holder/cache view composed from transfers. Skipped for an
 // authoritative_state node, which owns the full authority and is trusted by
 // capability (its planning world is admitted without the gate). This is what lets
 // browser-local planning + sparse executors run the admission gate by PROOF.
-function recordExecutionNodeCellProvenance(node: ShadowExecutionNode): void {
+//
+// `touchedKeys` are the planning-cell keys (see `planningCellKey`) the caller actually
+// installed — derived from the installed pages/transfers, NOT by re-scanning the
+// serialized result. Scanning the result over-claims: `mergeShadowStatePagesIntoSerialized`
+// synthesizes default `object_live` fields (location:null, empty children/contents) for
+// an object materialized from a lineage-only page, so a scan would stamp a `cache` copy
+// of live cells the node never received. An untagged synthetic-default `object_live`
+// is correctly left as `missing_provenance` for the atom-guard / repair to resolve.
+function recordExecutionNodeCellProvenance(node: ShadowExecutionNode, touchedKeys: Iterable<string>): void {
   if (node.authoritative_state || !node.serialized) return;
   const prov = (node.cellProvenance ??= new Map());
-  for (const obj of node.serialized.objects) {
-    for (const page of PLANNING_TRACKED_PAGES) {
-      const key = planningCellKey(obj.id, page);
-      if (!prov.has(key)) prov.set(key, { source: "cache" });
-    }
+  for (const key of touchedKeys) {
+    if (!prov.has(key)) prov.set(key, { source: "cache" });
   }
+}
+
+// Tracked-cell keys for objects held as FULL records (initial serialized, closure
+// transfer, object-record transfer, cached object records): both tracked pages are
+// genuinely materialized from the record, so both are honestly `cache`.
+function trackedCellKeysForFullObjects(objects: Iterable<SerializedObject>): string[] {
+  const keys: string[] = [];
+  for (const obj of objects) {
+    for (const page of PLANNING_TRACKED_PAGES) keys.push(planningCellKey(obj.id, page));
+  }
+  return keys;
+}
+
+// Tracked-cell keys for a cell-page transfer: ONLY the tracked pages the transfer's
+// refs actually carry. A lineage-only transfer must not claim the synthesized
+// default `object_live` it never delivered (see recordExecutionNodeCellProvenance).
+function trackedCellKeysFromPageRefs(refs: Iterable<ShadowStatePageRef>): string[] {
+  const keys: string[] = [];
+  for (const ref of refs) {
+    if (PLANNING_TRACKED_PAGES.has(ref.page)) keys.push(planningCellKey(ref.object, ref.page, ref.name));
+  }
+  return keys;
 }
 
 function shadowExecutionWorld(node: ShadowExecutionNode): WooWorld {
