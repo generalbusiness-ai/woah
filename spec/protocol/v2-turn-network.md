@@ -2343,7 +2343,10 @@ spreading.
 3. **IndexedDB execution cache.** The browser worker persists verified
    executable pages with proof metadata, installs an open-time executable seed
    for the current scope, reconstructs an execution node from IndexedDB, and
-   refuses to use projection rows for VM reads. Contiguous accepted transcripts
+   refuses to use projection rows for VM reads. The open-time seed covers the
+   scope's lineage, located contents, and the objects anchored to that scope
+   because anchor-cluster objects such as room exits can be referenced from
+   scope properties without appearing in `contents`. Contiguous accepted transcripts
    are materialized into accepted write-cell pages; accepted transcript-tail
    replay is not a VM-read fallback. Transcript replay remains only for
    tentative overlays and write-cell promotion materialization.

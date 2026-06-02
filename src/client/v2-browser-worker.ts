@@ -12,6 +12,7 @@ import {
   type ShadowTurnExecReply,
   type ShadowTurnExecRequest
 } from "../core/shadow-turn-exec";
+import { shadowTurnKeyFromTranscript } from "../core/turn-key";
 import type { ObjRef, WooValue } from "../core/types";
 import type {
   CheckpointTailOpenTransfer
@@ -1246,15 +1247,22 @@ async function validateTurnExecReplyStateTransfer(envelope: ShadowEnvelope<Shado
   if (!envelope.reply_to) throw new Error("turn execution state transfer is missing reply_to");
   const request = pendingTurnExecRequests.get(envelope.reply_to) ?? await pendingTurnExecRequest(envelope.reply_to);
   if (!request) throw new Error("turn execution state transfer has no pending request");
+  const acceptedKey = reply.ok === true && reply.transcript
+    ? shadowTurnKeyFromTranscript(reply.transcript)
+    : request.key;
+  // A server-repaired or server-planned turn may accept a fuller closure than
+  // the request key the browser originally persisted. The bundled cache-warm
+  // transfer is authored from that accepted transcript, so validate the capsule
+  // against the accepted key while retaining the pending request for correlation.
   validateShadowExecutionCapsuleTransfer({
     node: current?.node ?? "",
     transfer: reply.state_transfer,
-    scope: request.key.scope,
-    key: request.key,
-    actor: request.call.actor,
+    scope: acceptedKey.scope,
+    key: acceptedKey,
+    actor: acceptedKey.actor,
     session: request.call.session ?? null,
-    target: request.call.target,
-    verb: request.call.verb
+    target: acceptedKey.target,
+    verb: acceptedKey.verb
   });
 }
 

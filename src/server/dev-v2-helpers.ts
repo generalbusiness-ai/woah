@@ -25,6 +25,14 @@
 import type { EffectTranscript } from "../core/effect-transcript";
 import { serializedFor, transcriptSessionActiveScope, transcriptTouchedObjectIds, type ShadowCommitAccepted } from "../core/shadow-commit-scope";
 import {
+  browserProfileProjectionContext,
+  browserProfileProjectionWriteFromAuthority,
+  summarizeProjectionWrites,
+  type BrowserProfile,
+  type ProjectionDeltaSummary,
+  type ProjectionWrite
+} from "../core/projection-delta";
+import {
   buildV2FanoutLiveEvents,
   planV2BrowserFanout,
   type V2FanoutPeer
@@ -460,10 +468,57 @@ async function computeDevV2DurableTurnWsReply(input: DevV2DurableWsReplyInput): 
   if (submitted.reply.ok && submitted.reply.commit && submitted.reply.transcript) {
     materializeDevV2CommitLocally(input.world, submitted.reply.commit.position.scope, submitted.reply.transcript);
   }
+  const receiverReply = devV2BrowserProfileTurnReply({
+    reply: submitted.reply,
+    browser: input.browser,
+    commitRelayForScope: input.commitRelayForScope
+  });
   // Accepted OR a !ok reply (commit_rejected / missing_state) — wrap it for the
   // WS client; the socket addressing + reply_to come from the original receipt,
   // not the primitive's internally-addressed reply.
-  return { reply: shadowBrowserReplyEnvelopeForReceipt(input.browser, input.receipt, submitted.reply), submitted };
+  return { reply: shadowBrowserReplyEnvelopeForReceipt(input.browser, input.receipt, receiverReply), submitted };
+}
+
+export function devV2BrowserProfileTurnReply(input: {
+  reply: ShadowTurnExecReply;
+  browser: ShadowBrowserNode;
+  commitRelayForScope: (scope: ObjRef) => ShadowRelayCache;
+}): ShadowTurnExecReply {
+  const reply = input.reply;
+  if (reply.ok !== true || !reply.commit) return reply;
+  const authorityWrites = reply.commit.projection_writes ?? [];
+  if (authorityWrites.length === 0 && !reply.commit.projection_delta) return reply;
+  const commitRelay = input.commitRelayForScope(reply.commit.position.scope);
+  const context = browserProfileProjectionContext(serializedFor(commitRelay.commit_scope, { reason: "dev_ws_browser_profile_reply" }));
+  const browserWrites = authorityWrites
+    .map((write) => browserProfileProjectionWriteFromAuthority({
+      write,
+      context,
+      scope: reply.commit!.position.scope,
+      head: reply.commit!.position,
+      viewer: { actor: input.browser.actor, session: input.browser.session }
+    }))
+    .filter((write): write is ProjectionWrite<BrowserProfile> => write !== null);
+  const projectionDelta = devV2BrowserProjectionDeltaFromWrites(browserWrites, reply.commit.projection_delta);
+  return {
+    ...reply,
+    commit: {
+      ...reply.commit,
+      projection_delta: projectionDelta,
+      projection_writes: browserWrites
+    }
+  } as ShadowTurnExecReply;
+}
+
+function devV2BrowserProjectionDeltaFromWrites(
+  writes: ProjectionWrite<BrowserProfile>[],
+  authorityDelta: ProjectionDeltaSummary | undefined
+): ProjectionDeltaSummary {
+  const delta = summarizeProjectionWrites(writes as ProjectionWrite[]);
+  if (authorityDelta?.tool_surface_sources?.length) {
+    delta.tool_surface_sources = structuredClone(authorityDelta.tool_surface_sources);
+  }
+  return delta;
 }
 
 export function directAudienceForTarget(world: WooWorld, target: ObjRef): ObjRef | null {

@@ -50,6 +50,7 @@ import {
   buildVerbThrewReplyEnvelope,
   decodeTurnIntentCall,
   decodeTurnIntentForRecovery,
+  devV2BrowserProfileTurnReply,
   executeDevV2DurableTurnFrame,
   executeDevV2DurableTurnWsReply,
   materializeDevV2CommitLocally,
@@ -784,12 +785,24 @@ async function handleV2ShadowFrame(
       return;
     }
     const reply = await handleShadowBrowserTurnExecEnvelope(turnBrowser, receipt, { onMetric: emitDevMetric });
+    // Legacy exec envelopes are still browser-directed WS replies. Keep their
+    // projection rows in the same receiver profile as the durable-intent path.
+    const receiverReply = reply
+      ? {
+        ...reply,
+        body: devV2BrowserProfileTurnReply({
+          reply: reply.body,
+          browser: turnBrowser,
+          commitRelayForScope: v2RelayForScope
+        })
+      }
+      : null;
     if (reply?.body.ok === true && reply.body.commit && reply.body.transcript) {
       materializeDevV2CommitLocally(world, reply.body.commit.position.scope, reply.body.transcript);
     }
-    if (reply) {
-      ws.send(encodeEnvelope(reply));
-      await sendDevV2Fanout(turnBrowser, reply);
+    if (receiverReply) {
+      ws.send(encodeEnvelope(receiverReply));
+      await sendDevV2Fanout(turnBrowser, receiverReply);
     }
   } catch (err) {
     // Pre-recording throws (the substrate's presence/permission gates fire

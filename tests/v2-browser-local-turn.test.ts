@@ -213,6 +213,135 @@ describe("v2 browser local turn planning", () => {
     });
   });
 
+  it("open executable seed carries anchored exits and repairs cold room movement to a real move", async () => {
+    const anchor = createWorld();
+    const session = anchor.auth("guest:v2-browser-exit-seed");
+    const serialized = anchor.exportWorld();
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:exit-seed",
+      scope: "the_chatroom",
+      serialized
+    });
+    const openTransfer = buildShadowBrowserOpenExecutableSeedTransfer(
+      relay,
+      "the_chatroom",
+      "browser:exit-seed",
+      session.actor
+    );
+    expect(openTransfer.mode).toBe("cell_pages");
+    if (openTransfer.mode !== "cell_pages") throw new Error("expected cell_pages open seed");
+    const pages = [...openTransfer.page_refs, ...openTransfer.inline_pages];
+    const hasCell = (object: string, page: string, name?: string): boolean =>
+      pages.some((p) => {
+        const rec = p as { object?: string; page?: string; name?: string };
+        return rec.object === object && rec.page === page && (name === undefined || rec.name === name);
+      });
+    for (const exit of ["exit_living_room_southeast", "exit_living_room_south"]) {
+      expect(hasCell(exit, "object_lineage"), `${exit} lineage`).toBe(true);
+    }
+    expect(hasCell("exit_living_room_southeast", "property_cell", "source")).toBe(true);
+    expect(hasCell("exit_living_room_southeast", "property_cell", "dest")).toBe(true);
+
+    const common = {
+      node: "browser:exit-seed",
+      actor: session.actor,
+      session: session.id,
+      head: { kind: "woo.scope_head.shadow.v1" as const, scope: "the_chatroom", epoch: 1, seq: 0, hash: "root" },
+      id: "browser-local-southeast",
+      route: "direct" as const,
+      scope: "the_chatroom",
+      target: "the_chatroom",
+      verb: "southeast",
+      args: [],
+      persistence: "durable" as const
+    };
+    const transfers = [v2ExecutableTransferRecord(openTransfer, 1)];
+    let repaired = await planV2BrowserLocalTurn({ ...common, transfers });
+    for (let attempt = 0; attempt < 8 && !repaired.ok; attempt += 1) {
+      expect(repaired).toMatchObject({ reason: "missing_state" });
+      if (!repaired.key) throw new Error("expected repairable southeast plan");
+      const repairTransfer = buildShadowCellPageTransfer({
+        serialized,
+        key: repaired.key,
+        atom_hashes: repaired.missing_atoms?.map((atom) => atom.hash),
+        missing_atoms: repaired.missing_atoms
+      });
+      transfers.push(v2ExecutableTransferRecord(repairTransfer, attempt + 2));
+      repaired = await planV2BrowserLocalTurn({ ...common, transfers });
+    }
+    expect(repaired).toMatchObject({
+      ok: true,
+      optimistic_frame: {
+        op: "result",
+        result: { room: "the_deck", from: "the_chatroom", exit: "southeast" }
+      }
+    });
+    if (!repaired.ok) throw new Error("expected repaired southeast plan");
+    expect(repaired.transcript.error).toBeUndefined();
+    expect(repaired.transcript.moves).toContainEqual(expect.objectContaining({
+      object: session.actor,
+      from: "the_chatroom",
+      to: "the_deck"
+    }));
+  });
+
+  it("classifies local E_OBJNF as repairable missing state instead of a successful proposal", async () => {
+    const anchor = createWorld();
+    const session = anchor.auth("guest:v2-browser-exit-miss");
+    const serialized = {
+      ...anchor.exportWorld(),
+      objects: anchor.exportWorld().objects.filter((obj) => obj.id !== "exit_living_room_southeast")
+    };
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:exit-miss",
+      scope: "the_chatroom",
+      serialized
+    });
+    const openTransfer = buildShadowBrowserOpenExecutableSeedTransfer(
+      relay,
+      "the_chatroom",
+      "browser:exit-miss",
+      session.actor
+    );
+    const common = {
+      node: "browser:exit-miss",
+      actor: session.actor,
+      session: session.id,
+      head: { kind: "woo.scope_head.shadow.v1" as const, scope: "the_chatroom", epoch: 1, seq: 0, hash: "root" },
+      id: "browser-local-southeast-missing-exit",
+      route: "direct" as const,
+      scope: "the_chatroom",
+      target: "the_chatroom",
+      verb: "southeast",
+      args: [],
+      persistence: "durable" as const
+    };
+    const first = await planV2BrowserLocalTurn({
+      ...common,
+      transfers: [v2ExecutableTransferRecord(openTransfer, 1)]
+    });
+    if (first.ok || !first.key) throw new Error("expected first southeast miss to need verb repair");
+    const repairTransfer = buildShadowCellPageTransfer({
+      serialized,
+      key: first.key,
+      atom_hashes: first.missing_atoms?.map((atom) => atom.hash),
+      missing_atoms: first.missing_atoms
+    });
+    const repaired = await planV2BrowserLocalTurn({
+      ...common,
+      transfers: [v2ExecutableTransferRecord(openTransfer, 1), v2ExecutableTransferRecord(repairTransfer, 2)]
+    });
+    expect(repaired).toMatchObject({
+      ok: false,
+      reason: "missing_state",
+      request: { call: { target: "the_chatroom", verb: "southeast" } }
+    });
+    if (repaired.ok) throw new Error("expected missing_state for absent exit object");
+    expect(repaired.missing_atoms).toContainEqual(expect.objectContaining({
+      preimage: "read:cell:lifecycle:exit_living_room_southeast"
+    }));
+  });
+
   it("preserves stale subscriber rows without authoring derived enter presence writes", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:v2-browser-local-outliner-scrub");

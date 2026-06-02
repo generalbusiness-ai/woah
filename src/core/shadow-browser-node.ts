@@ -980,6 +980,16 @@ function shadowBrowserOpenExecutableSeedPreimages(serialized: SerializedWorld, s
   add(`target:${scope}`);
   if (actor) add(`actor:${actor}`);
   for (const id of byId.get(scope)?.contents ?? []) add(`target:${id}`);
+  // A scope's exits and other anchor-cluster objects are not in `contents`
+  // (anchor=scope, location=null), but parser verbs can resolve refs to them
+  // from scope properties and then dispatch on those objects. Seed their own
+  // cells so a first local command does not turn an anchor-cluster miss into an
+  // optimistic E_OBJNF while the authority succeeds.
+  for (const obj of serialized.objects) {
+    if (obj.anchor !== scope) continue;
+    add(`target:${obj.id}`);
+    addOpenSeedObjectCells(obj, add);
+  }
 
   const scopeObj = byId.get(scope);
   const actorObj = actor ? byId.get(actor) : undefined;
@@ -1117,6 +1127,12 @@ function shadowBrowserOpenExecutableSeedSerialized(
   addWithLineage(scope);
   addWithLineage(actor);
   for (const content of byId.get(scope)?.contents ?? []) addWithLineage(content);
+  // Anchor-cluster objects are owned with the scope even when not located in
+  // it. A room's exits are the common case: the room's `exits` map names them,
+  // but they never appear in `contents`.
+  for (const obj of serialized.objects) {
+    if (obj.anchor === scope) addWithLineage(obj.id);
+  }
   for (const linked of openSeedLinkedObjectRefs(serialized, scope, actor)) addWithLineage(linked);
   return {
     version: serialized.version,

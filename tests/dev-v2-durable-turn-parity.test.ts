@@ -3,12 +3,13 @@ import { describe, expect, it } from "vitest";
 import { authoritativePlanningWorld } from "../src/core/planning-world";
 import { installVerb } from "../src/core/authoring";
 import { createWorld, createWorldFromSerialized } from "../src/core/bootstrap";
-import { buildShadowTurnIntentEnvelope, createShadowBrowserClient, createShadowBrowserRelayShim, receiveShadowBrowserEnvelopeReceipt, shadowBrowserSessionBearer } from "../src/core/shadow-browser-node";
+import { buildShadowTurnIntentEnvelope, createShadowBrowserClient, createShadowBrowserRelayShim, handleShadowBrowserTurnExecEnvelope, receiveShadowBrowserEnvelopeReceipt, shadowBrowserEnvelope, shadowBrowserSessionBearer } from "../src/core/shadow-browser-node";
 import { encodeEnvelope } from "../src/core/shadow-envelope";
 import { serializedFor } from "../src/core/shadow-commit-scope";
 import { runShadowTurnCall, type ShadowTurnCall } from "../src/core/shadow-turn-call";
 import { encodeExecutorIntentEnvelope } from "../src/core/executor";
-import { decodeTurnIntentCall, executeDevV2DurableTurnFrame, executeDevV2DurableTurnWsReply, executeInProcessV2DurableTurn } from "../src/server/dev-v2-helpers";
+import { decodeTurnIntentCall, devV2BrowserProfileTurnReply, executeDevV2DurableTurnFrame, executeDevV2DurableTurnWsReply, executeInProcessV2DurableTurn } from "../src/server/dev-v2-helpers";
+import { shadowTurnKeyFromTranscript } from "../src/core/turn-key";
 import type { ExecutorCallInput } from "../src/core/executor";
 import type { ShadowRelayCache } from "../src/core/shadow-relay-cache";
 import type { ObjRef } from "../src/core/types";
@@ -313,7 +314,56 @@ describe("dev v2 durable turn — CF contract parity", () => {
     expect(reply.body.ok).toBe(true);
     if (reply.body.ok !== true) throw new Error("expected ok reply");
     expect(reply.body.commit).toBeTruthy();
+    const objectWrites = reply.body.commit?.projection_writes?.filter((write) => write.table === "objects" && write.op === "upsert") ?? [];
+    expect(objectWrites.length).toBeGreaterThan(0);
+    expect(objectWrites.every((write) => (write.row as { kind?: unknown }).kind === "woo.browser_object_row.v1")).toBe(true);
     expect(h.world.getProp("delay_1", "wet")).toBe(0.27);  // write-through happened
+  });
+
+  it("dev browser-profile conversion also covers legacy WS exec replies", async () => {
+    const h = wsReplyHarness(true, "set_control", "dev-ws-legacy-profile");
+    const call: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: h.call.id,
+      route: "sequenced",
+      scope: "the_dubspace",
+      session: h.wsBrowser.session,
+      actor: h.wsBrowser.actor,
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.31]
+    };
+    const planned = await runShadowTurnCall(authoritativePlanningWorld(serializedFor(h.commitRelay.commit_scope)), call);
+    const request = {
+      kind: "woo.turn.exec.request.shadow.v1" as const,
+      id: h.call.id,
+      call,
+      key: shadowTurnKeyFromTranscript(planned.transcript),
+      expected: h.commitRelay.commit_scope.head,
+      auth: { mode: "shadow_local" as const, actor: h.wsBrowser.actor, session: h.wsBrowser.session },
+      persistence: "durable" as const
+    };
+    const envelope = shadowBrowserEnvelope(h.wsBrowser, request.kind, request, "dev-ws-legacy-profile-env");
+    const reply = await handleShadowBrowserTurnExecEnvelope(
+      h.wsBrowser,
+      receiveShadowBrowserEnvelopeReceipt(h.wsBrowser, encodeEnvelope(envelope))
+    );
+    expect(reply?.body.ok).toBe(true);
+    if (!reply || reply.body.ok !== true) throw new Error("expected accepted legacy reply");
+
+    const converted = devV2BrowserProfileTurnReply({
+      reply: reply.body,
+      browser: h.wsBrowser,
+      commitRelayForScope: (scope) => {
+        if (scope !== "the_dubspace") throw new Error(`unexpected commit scope ${scope}`);
+        return h.commitRelay;
+      }
+    });
+    expect(converted.ok).toBe(true);
+    if (converted.ok !== true) throw new Error("expected converted accepted reply");
+    const objectWrites = converted.commit?.projection_writes?.filter((write) => write.table === "objects" && write.op === "upsert") ?? [];
+    expect(objectWrites.length).toBeGreaterThan(0);
+    expect(objectWrites.every((write) => (write.row as { kind?: unknown }).kind === "woo.browser_object_row.v1")).toBe(true);
   });
 
   it("WS durable verb-error reply STILL drains (reply_to = intent id, ok:false) instead of throwing", async () => {
