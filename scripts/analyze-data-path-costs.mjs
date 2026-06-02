@@ -248,6 +248,16 @@ const CLASSIFICATION = {
     signal: "scope, reason",
     endState: "Rejected frames remain control-plane events; successful commits append accepted frames."
   },
+  commit_scope_multi: {
+    bucket: "routing",
+    signal: "scope, owners, verb",
+    endState: "B6 flags a turn whose write set spans >=2 distinct non-planning authority owners; it commits at the planning scope for now and is counted here. B8 route homes decide combined/minted scope vs clean retryable conflict."
+  },
+  authority_slice_reconstructed: {
+    bucket: "seed_cache",
+    signal: "reason, scope, object_count, page_count, source_host",
+    endState: "Per-turn authority-slice reconstruction (warm_turn_refresh) is replaced by content-addressed read-through warm cache-fill (B7) plus checkpoint/tail catch-up; steady-state warm turns reconstruct nothing."
+  },
   shadow_gateway_apply_step: {
     bucket: "compat_transform",
     signal: "phase, objects, properties, writes",
