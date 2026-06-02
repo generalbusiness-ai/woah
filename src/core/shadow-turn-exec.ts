@@ -60,16 +60,6 @@ export type ShadowMissingAtom = {
   preimage?: string;
 };
 
-export type ShadowClosureTransfer = {
-  kind: "woo.state.transfer.shadow.v1";
-  mode: "closure";
-  scope: ObjRef;
-  atom_hashes: string[];
-  preimages?: string[];
-  serialized: SerializedWorld;
-  proof: ShadowStateProof;
-};
-
 export type ShadowObjectRecordTransfer = {
   kind: "woo.state.transfer.shadow.v1";
   mode: "object_records";
@@ -147,7 +137,10 @@ export type ShadowStateProof = {
   signature: string;
 };
 
-export type ShadowStateTransferMode = "closure" | "object_records" | "cell_pages";
+// B7 retired the `closure` mode (a whole-serialized-world bundle) in favor of
+// content-addressed `cell_pages`. `object_records` remains as the full-record
+// fallback used during executor repair when page-level closure is unavailable.
+export type ShadowStateTransferMode = "object_records" | "cell_pages";
 
 export type ShadowTransferSigning = {
   authority?: string;
@@ -156,7 +149,7 @@ export type ShadowTransferSigning = {
   recipient?: string;
 };
 
-export type ShadowStateTransfer = ShadowClosureTransfer | ShadowObjectRecordTransfer | ShadowCellPageTransfer;
+export type ShadowStateTransfer = ShadowObjectRecordTransfer | ShadowCellPageTransfer;
 
 export type ShadowExecutionNode = {
   kind: "woo.execution_node.shadow.v1";
@@ -356,29 +349,6 @@ export function missingAtomsForShadowTurn(node: ShadowExecutionNode, key: Shadow
     if (!node.atom_hashes.has(hash)) missing.push({ hash, preimage: key.preimages[i] });
   }
   return missing;
-}
-
-export function buildShadowClosureTransfer(input: {
-  serialized: SerializedWorld;
-  key: ShadowTurnKey;
-  atom_hashes?: string[];
-} & ShadowTransferSigning): ShadowClosureTransfer {
-  const requested = new Set(input.atom_hashes ?? input.key.atom_hashes);
-  const preimages = input.key.preimages.filter((_, index) => requested.has(input.key.atom_hashes[index]));
-  const transfer = {
-    kind: "woo.state.transfer.shadow.v1",
-    mode: "closure",
-    scope: input.key.scope,
-    atom_hashes: input.key.atom_hashes.filter((hash) => requested.has(hash)),
-    preimages,
-    // Shadow transfer intentionally moves a full serialized pre-turn world.
-    // Later state-plane work can replace this with page-level closure export.
-    serialized: structuredClone(input.serialized) as SerializedWorld
-  } satisfies Omit<ShadowClosureTransfer, "proof">;
-  return {
-    ...transfer,
-    proof: signShadowStateTransfer(transfer, input)
-  };
 }
 
 export function buildShadowObjectRecordTransfer(input: {
@@ -644,9 +614,6 @@ function shadowTurnKeyHash(key: ShadowTurnKey): string {
 }
 
 export function installShadowStateTransfer(node: ShadowExecutionNode, transfer: ShadowStateTransfer): void {
-  if (transfer.mode === "closure" && node.scope !== transfer.scope) {
-    throw new Error(`state transfer scope mismatch: node=${node.scope} transfer=${transfer.scope}`);
-  }
   // Object-record transfers are content-addressed pages for whatever atom was
   // missing during retry. Their proof still binds transfer.scope, but the
   // receiving execution node may be installing dependency pages such as catalog
@@ -654,14 +621,6 @@ export function installShadowStateTransfer(node: ShadowExecutionNode, transfer: 
   // scope.
   verifyShadowStateTransferProof(node, transfer);
   for (const hash of transfer.atom_hashes) node.atom_hashes.add(hash);
-  if (transfer.mode === "closure") {
-    node.serialized = structuredClone(transfer.serialized) as SerializedWorld;
-    node.world = undefined;
-    for (const obj of node.serialized.objects) cacheShadowMaterializedObject(node, obj);
-    // Closure transfers carry the full world as object records: both tracked cells held.
-    recordExecutionNodeCellProvenance(node, trackedCellKeysForFullObjects(node.serialized.objects));
-    return;
-  }
   if (transfer.mode === "cell_pages") {
     node.serialized = mergeCellPageTransfer(node.serialized, transfer, node.page_cache);
     // Cell pages replace individual serialized cells. Any already-unpacked
@@ -1280,7 +1239,6 @@ function trustedTransferAuthorities(input: Record<string, string> | undefined): 
 }
 
 type UnsignedShadowStateTransfer =
-  | Omit<ShadowClosureTransfer, "proof">
   | Omit<ShadowObjectRecordTransfer, "proof">
   | Omit<ShadowCellPageTransfer, "proof">;
 
@@ -1335,27 +1293,22 @@ function shadowStateTransferRoot(
     atom_hashes: transfer.atom_hashes,
     preimages: transfer.preimages ?? []
   };
-  const material = transfer.mode === "closure"
+  const material = transfer.mode === "cell_pages"
     ? {
         ...base,
-        serialized_hash: hashSource(stableShadowJson(transfer.serialized as unknown as WooValue))
+        ...(transfer.purpose ? { purpose: transfer.purpose } : {}),
+        ...(transfer.capsule ? { capsule: transfer.capsule } : {}),
+        page_refs: transfer.page_refs,
+        inline_page_hashes: transfer.inline_pages.map(shadowStatePageHash),
+        sessions: transfer.sessions,
+        logs: transfer.logs,
+        snapshots: transfer.snapshots,
+        parkedTasks: transfer.parkedTasks,
+        tombstones: transfer.tombstones,
+        counters: transfer.counters,
+        source_object_count: transfer.source_object_count,
+        source_page_count: transfer.source_page_count
       }
-    : transfer.mode === "cell_pages"
-      ? {
-          ...base,
-          ...(transfer.purpose ? { purpose: transfer.purpose } : {}),
-          ...(transfer.capsule ? { capsule: transfer.capsule } : {}),
-          page_refs: transfer.page_refs,
-          inline_page_hashes: transfer.inline_pages.map(shadowStatePageHash),
-          sessions: transfer.sessions,
-          logs: transfer.logs,
-          snapshots: transfer.snapshots,
-          parkedTasks: transfer.parkedTasks,
-          tombstones: transfer.tombstones,
-          counters: transfer.counters,
-          source_object_count: transfer.source_object_count,
-          source_page_count: transfer.source_page_count
-        }
     : {
         ...base,
         object_pages: transfer.object_pages,

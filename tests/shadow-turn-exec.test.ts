@@ -7,7 +7,6 @@ import { effectTranscriptFromRecordedTurn } from "../src/core/effect-transcript"
 import { createShadowCommitScope, serializedFor, submitShadowCommit } from "../src/core/shadow-commit-scope";
 import {
   buildShadowCellPageTransfer,
-  buildShadowClosureTransfer,
   buildShadowObjectRecordTransfer,
   createShadowExecutionNode,
   executeAuthoritativeShadowTurnCall,
@@ -25,7 +24,7 @@ import { shadowAtomHash, shadowTurnKeyFromCall, shadowTurnKeyFromTranscript, typ
 import type { MetricEvent } from "../src/core/types";
 
 describe("shadow turn execution", () => {
-  it("refuses missing state, installs a closure transfer, and retries the whole turn", async () => {
+  it("refuses missing state, installs a cell-page transfer, and retries the whole turn", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:shadow-retry");
     const actor = session.actor;
@@ -59,14 +58,14 @@ describe("shadow turn execution", () => {
     if (!refused.ok && refused.reason === "missing_state") expect(refused.missing_atoms.map((atom) => atom.preimage)).toEqual(turnKey.preimages);
     expect(actorNode.serialized).toBeUndefined();
 
-    const transfer = buildShadowClosureTransfer({
+    const transfer = buildShadowCellPageTransfer({
       serialized: serializedBefore,
       key: turnKey,
-      atom_hashes: missingAtomsForShadowTurn(actorNode, turnKey).map((atom) => atom.hash)
+      missing_atoms: missingAtomsForShadowTurn(actorNode, turnKey)
     });
-    expect(transfer).toMatchObject({ kind: "woo.state.transfer.shadow.v1", mode: "closure", scope: turnKey.scope });
-    expect(transfer.atom_hashes).toEqual(turnKey.atom_hashes);
+    expect(transfer).toMatchObject({ kind: "woo.state.transfer.shadow.v1", mode: "cell_pages", scope: turnKey.scope });
     installShadowStateTransfer(actorNode, transfer);
+    expect(missingAtomsForShadowTurn(actorNode, turnKey)).toEqual([]);
 
     const retry = await executeShadowRecordedTurnOrNeedState(actorNode, recorder.turns[0], turnKey);
 

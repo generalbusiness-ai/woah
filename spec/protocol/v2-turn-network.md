@@ -1358,7 +1358,7 @@ authority.
 
 ```ts
 type TransferRequest = {
-  mode: "projection" | "delta" | "closure" | "cell_pages";
+  mode: "projection" | "delta" | "cell_pages";  // `closure` retired (B7)
   base?: ScopeHead;
   max_bytes?: number;
   atoms?: string[];
@@ -1366,7 +1366,7 @@ type TransferRequest = {
 
 type StateTransfer = {
   kind: "woo.state.transfer.v1";
-  mode: "projection" | "delta" | "closure" | "cell_pages";
+  mode: "projection" | "delta" | "cell_pages";  // `closure` retired (B7)
   scope?: ScopeRef;
   base?: ScopeHead;
   to?: ScopeHead;
@@ -1421,10 +1421,16 @@ Transfer modes:
 - `projection`: enough for display and command planning, not authoritative
   execution unless marked as a semantic read by a later committed turn;
 - `delta`: applied frames or transcript tail since a known head;
-- `closure`: legacy executable state bundle for a predicted turn, including
-  cells, parent/feature/verb metadata, bytecode hashes, and permission facts;
 - `cell_pages`: executable state pages selected by `TurnKey` atom preimages,
   with capsule metadata bound into the transfer proof.
+
+> **Retired mode — `closure`.** B7 retired the `closure` mode: a whole-serialized-
+> world bundle for a predicted turn. It is superseded by `cell_pages`, which ships
+> only the touched closure as content-addressed pages (no whole-world copy). The
+> execution path no longer produces `closure`; an executable cache that receives a
+> `closure` transfer from a pre-B7 peer ignores it and requests `cell_pages`. (An
+> `object_records` full-record mode also exists as the executor-repair fallback
+> when page-level closure is unavailable; it is internal and not a planning mode.)
 
 State transfers use `kind: "woo.state.transfer.v1"`. The default fresh-call
 network path uses `mode: "cell_pages"` with content-addressed pages selected

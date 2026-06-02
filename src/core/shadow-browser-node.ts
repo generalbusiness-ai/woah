@@ -834,16 +834,6 @@ function rememberShadowBrowserOpenExecutableSeedDigest(relay: ShadowBrowserRelay
 }
 
 export function shadowStateTransferCacheDigest(transfer: ShadowStateTransfer): string | null {
-  if (transfer.mode === "closure") {
-    return hashSource(stableShadowJson({
-      kind: "woo.state_transfer_cache_digest.shadow.v1",
-      mode: transfer.mode,
-      scope: transfer.scope,
-      atom_hashes: transfer.atom_hashes,
-      preimages: transfer.preimages ?? [],
-      serialized_hash: hashSource(stableShadowJson(transfer.serialized as unknown as WooValue))
-    } as unknown as WooValue));
-  }
   if (transfer.mode === "object_records") {
     if (transfer.object_pages.length === 0) return null;
     return hashSource(stableShadowJson({
@@ -2264,12 +2254,9 @@ export function applyShadowBrowserTransfer(browser: ShadowBrowserNode, transfer:
       }
       for (const accepted of transfer.applied) applyShadowBrowserAcceptedFrame(browser, accepted);
       return;
-    case "closure":
-      // Closure and object-record transfers keep the execution-plane
-      // shadow.anchor_mac.v1 proof; this browser cache path only stores pages.
-      cacheObjectPages(browser.cache, transfer.serialized.objects);
-      return;
     case "object_records":
+      // Object-record transfers keep the execution-plane anchor_mac.v1 proof;
+      // this browser cache path only stores pages.
       cacheObjectPages(browser.cache, transfer.objects);
       return;
     case "cell_pages":

@@ -4,7 +4,6 @@ import type { SerializedWorld } from "./repository";
 import { createShadowCommitScope, serializedFor, type ShadowCommitScope } from "./shadow-commit-scope";
 import {
   buildShadowCellPageTransfer,
-  buildShadowClosureTransfer,
   buildShadowObjectRecordTransfer,
   executeShadowTurnCallOrNeedState,
   installShadowStateTransfer,
@@ -77,7 +76,7 @@ export async function executeShadowTurnCallAcrossInProcessNetwork(input: {
     node: string;
     serialized: SerializedWorld;
   };
-  transferMode?: "closure" | "object_records" | "cell_pages";
+  transferMode?: "object_records" | "cell_pages";
   maxTransfers?: number;
   maxStaleHeadRetries?: number;
   commitScope?: ShadowCommitScope;
@@ -123,15 +122,8 @@ export async function executeShadowTurnCallAcrossInProcessNetwork(input: {
       if (missingStateRounds >= maxTransfers) break;
       missingStateRounds += 1;
       const missingAtoms = result.missing_atoms;
-      const transfer = transferMode === "closure"
-        ? buildShadowClosureTransfer({
-            serialized: input.anchor.serialized,
-            key: activeRequest.key,
-            atom_hashes: missingAtoms.map((atom) => atom.hash),
-            recipient: selected.node
-          })
-        : transferMode === "object_records"
-          ? buildShadowObjectRecordTransfer({
+      const transfer = transferMode === "object_records"
+        ? buildShadowObjectRecordTransfer({
             serialized: input.anchor.serialized,
             key: activeRequest.key,
             missing_atoms: missingAtoms,
@@ -139,7 +131,7 @@ export async function executeShadowTurnCallAcrossInProcessNetwork(input: {
             session: activeRequest.call.session,
             recipient: selected.node
           })
-          : buildShadowCellPageTransfer({
+        : buildShadowCellPageTransfer({
             serialized: input.anchor.serialized,
             key: activeRequest.key,
             missing_atoms: missingAtoms,
