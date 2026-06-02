@@ -1442,6 +1442,27 @@ advertised page hashes and verifies a state-transfer proof scoped to an anchor
 authority and recipient node. State transfer is driven by exact post-selection
 inventory gaps instead of copying the whole world or whole object records.
 
+### VTN12.1 Commit-reply warm cache-fill (B7)
+
+State transfer is not only a pre-execution repair (filling an executor that
+returned `missing_state`); it is also the post-execution **warm cache-fill** that
+makes "warm the caller" structural rather than a checkpoint hack. After an
+accepted durable commit, an authoritative executor attaches a `cell_pages`
+transfer of the committed turn's closure (`purpose: "accepted_write_cells"`,
+selected on the turn's full `TurnKey` atom set) to the success reply. The caller
+installs it as `source: "cache"` (CA11 / VTN0 CI): a content-addressed,
+provenance-tagged read-through at the post-commit head. The next same-object turn
+then plans locally against the warm cache **without a second remote state
+fetch**; it still commits at the owner's commit scope, because a `source:"cache"`
+cell can never satisfy a commit-validation read (the warmed copy carries no write
+authority). Only an authoritative executor — one that owns the committed
+post-state — produces the warm transfer; a sparse executor returns none. The
+transfer is verifiable (anchor-MAC proof, recipient `"*"` or the caller node) and
+measurable, which is what B8's `estimated_transfer_cost` ranking consumes. The
+two-node conformance case (remote execute → install reply transfer → next turn
+local with zero further transfers) is gated by
+`tests/v2-state-transfer-warmfill.test.ts`.
+
 Browser relays also implement `mode: "projection"` and `mode: "delta"` for
 display/cache catch-up. Opening a scope installs a projection transfer instead
 of directly mutating the browser projection cache. After an accepted commit,

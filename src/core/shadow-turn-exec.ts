@@ -814,6 +814,8 @@ export async function executeAuthoritativeShadowTurnCall(
   node.serialized = serializedFor(input.commitScope, { reason: "authoritative_turn_result" });
   for (const hash of key.atom_hashes) node.atom_hashes.add(hash);
   cacheShadowTranscriptObjects(node, run.transcript, input.commitScope);
+  // B7: warm the caller with the committed turn's closure (post-commit head).
+  const warmTransfer = buildShadowCommitWarmTransfer(node, run.transcript, input.commitScope.head, input.call.session);
   return {
     ok: true,
     attempted: true,
@@ -822,7 +824,7 @@ export async function executeAuthoritativeShadowTurnCall(
     receipt,
     commit,
     serializedAfter: node.serialized,
-    reply: successReply(request, run.transcript, commit)
+    reply: successReply(request, run.transcript, commit, warmTransfer)
   };
 }
 
@@ -1012,15 +1014,22 @@ export async function executeShadowTurnCallOrNeedState(
   const acceptedKey = shadowTurnKeyFromTranscript(run.transcript);
   for (const hash of acceptedKey.atom_hashes) node.atom_hashes.add(hash);
   if (!livePersistence) cacheShadowTranscriptObjects(node, run.transcript, selectedCommitScope);
+  const acceptedCommit = commit?.kind === "woo.commit.accepted.shadow.v1" ? commit : undefined;
+  // B7: an authoritative executor warms the caller with the committed turn's
+  // closure. Durable accepted commits only — a live turn is not a durable state
+  // transition, and a sparse executor returns undefined from the helper.
+  const warmTransfer = (!livePersistence && acceptedCommit && selectedCommitScope)
+    ? buildShadowCommitWarmTransfer(node, run.transcript, selectedCommitScope.head, request.call.session)
+    : undefined;
   return {
     ok: true,
     attempted: true,
     frame: run.frame,
     transcript: run.transcript,
     receipt,
-    commit: commit?.kind === "woo.commit.accepted.shadow.v1" ? commit : undefined,
+    commit: acceptedCommit,
     serializedAfter,
-    reply: successReply(request, run.transcript, commit?.kind === "woo.commit.accepted.shadow.v1" ? commit : undefined)
+    reply: successReply(request, run.transcript, acceptedCommit, warmTransfer)
   };
 }
 
@@ -1508,7 +1517,8 @@ function commitRejectedReply(
 function successReply(
   request: ShadowTurnExecRequest,
   transcript: EffectTranscript,
-  commit?: ShadowCommitAccepted
+  commit?: ShadowCommitAccepted,
+  stateTransfer?: ShadowCellPageTransfer
 ): ShadowTurnExecReply {
   const outcome = transcript.error
     ? { error: transcript.error as unknown as WooValue }
@@ -1519,8 +1529,49 @@ function successReply(
     id: request.id ?? request.call.id,
     outcome,
     transcript,
-    commit
+    commit,
+    ...(stateTransfer ? { state_transfer: stateTransfer } : {})
   };
+}
+
+// B7 (VTN0 claim 5 / VTN12): after an accepted durable commit, an authoritative
+// executor returns a content-addressed `cell_pages` transfer of the committed
+// turn's closure so the CALLER's execution cache warms — the next same-object
+// turn then plans locally without a second remote state fetch. The transfer is
+// verifiable (proof, recipient "*") and is installed as `source:"cache"`; it
+// carries no write authority, so it can never satisfy a commit-validation read
+// (the warmed caller still commits at the owner's scope). Only an
+// `authoritative_state` executor can build it — it owns the committed post-state
+// to warm from; a sparse executor returns undefined. Selected on the turn's full
+// `atom_hashes` closure so a single install covers the next same-turn replan.
+function buildShadowCommitWarmTransfer(
+  node: ShadowExecutionNode,
+  transcript: EffectTranscript,
+  head: ShadowScopeHead,
+  session?: string | null
+): ShadowCellPageTransfer | undefined {
+  if (node.authoritative_state !== true || !node.serialized) return undefined;
+  const key = shadowTurnKeyFromTranscript(transcript);
+  if (key.atom_hashes.length === 0) return undefined;
+  const transfer = buildShadowCellPageTransfer({
+    serialized: node.serialized,
+    key,
+    atom_hashes: key.atom_hashes,
+    session,
+    purpose: "accepted_write_cells",
+    capsule: {
+      head,
+      actor: key.actor,
+      session,
+      target: key.target,
+      verb: key.verb,
+      recipient: "*"
+    }
+  });
+  if (transfer.atom_hashes.length === 0 && transfer.page_refs.length === 0 && transfer.inline_pages.length === 0) {
+    return undefined;
+  }
+  return transfer;
 }
 
 function objectClosureForPreimages(serialized: SerializedWorld, preimages: string[]): Set<ObjRef> {
