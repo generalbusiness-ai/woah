@@ -10,6 +10,7 @@ import {
   buildShadowBrowserProjectionTransfer,
   createShadowBrowserNode,
   createShadowBrowserRelayShim,
+  shadowBrowserScopeExecutionAds,
   disposeShadowBrowserNode,
   emitShadowBrowserLiveEvent,
   executeShadowBrowserTurn,
@@ -1879,6 +1880,55 @@ describe("shadow browser node shim", () => {
       args: [],
       persistence: "durable" as const
     })).not.toThrow();
+  });
+
+  // B9 (VTN0 / VTN14): the browser is a narrow-authority node, NOT a divergent
+  // holder. It may execute optimistically for its actor, but every durable
+  // commit is server-validated and there is no second write path — its
+  // authoritative view IS the server commit scope. Two browsers racing the same
+  // cell converge to that single authority (no divergent holder state); the
+  // browser advertises no broad ExecCapabilityAd.
+  it("B9: browser commits are server-validated and converge to one authority (no divergent holder)", async () => {
+    const anchor = createWorld();
+    const sessionA = anchor.auth("guest:b9-a");
+    const sessionB = anchor.auth("guest:b9-b");
+    await anchor.directCall("b9-a-enter", sessionA.actor, "the_dubspace", "enter", [], { sessionId: sessionA.id });
+    await anchor.directCall("b9-b-enter", sessionB.actor, "the_dubspace", "enter", [], { sessionId: sessionB.id });
+    const relay = createShadowBrowserRelayShim({ node: "b9-relay", scope: "the_dubspace", serialized: anchor.exportWorld() });
+    const a = createShadowBrowserNode({ node: "b9-a", scope: "the_dubspace", actor: sessionA.actor, session: sessionA.id, relay });
+    const b = createShadowBrowserNode({ node: "b9-b", scope: "the_dubspace", actor: sessionB.actor, session: sessionB.id, relay });
+    await openShadowBrowserScope(a, { preseed_catalog_pages: true });
+    await openShadowBrowserScope(b, { preseed_catalog_pages: true });
+
+    // The browser MUST NOT advertise a broad capability — only a narrow
+    // session-local scope ad with empty coverage (VTN14: MUST NOT advertise
+    // broad ExecCapabilityAds).
+    for (const ad of shadowBrowserScopeExecutionAds(relay, "the_dubspace")) {
+      expect(/^0*$/.test(ad.covers.bits_hex)).toBe(true);
+      expect(/^0*$/.test(ad.accepts.bits_hex)).toBe(true);
+    }
+
+    const turnA = await executeShadowBrowserTurn(a, {
+      id: "b9-a-set", target: "the_dubspace", verb: "set_control", args: ["delay_1", "wet", 0.41]
+    });
+    expect(turnA.result.ok).toBe(true);
+    if (!turnA.result.ok) throw new Error(`A failed: ${turnA.result.reason}`);
+    // Server-validated: the commit landed at the server commit scope, not a
+    // browser-local authority.
+    expect(turnA.result.commit?.position.scope).toBe("the_dubspace");
+
+    const turnB = await executeShadowBrowserTurn(b, {
+      id: "b9-b-set", target: "the_dubspace", verb: "set_control", args: ["delay_1", "wet", 0.42]
+    });
+    expect(turnB.result.ok).toBe(true);
+
+    // No divergent holder: both browsers' authoritative view is the single server
+    // commit scope, which holds the last committed value. There is no separate
+    // browser-held committed state to diverge.
+    expect(worldFor(a).getProp("delay_1", "wet")).toBe(0.42);
+    expect(worldFor(b).getProp("delay_1", "wet")).toBe(0.42);
+    expect(serializedFor(relay.commit_scope).objects.find((o) => o.id === "delay_1")
+      ?.properties.find(([name]) => name === "wet")?.[1]).toBe(0.42);
   });
 });
 

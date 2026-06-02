@@ -8,9 +8,19 @@ status: legacy
 > Part of the [woo specification](../../SPEC.md). Layer: **protocol**.
 
 Historical v1 wire-level interaction between a player host and a browser tab
-hosting transient objects. The current browser transport is
-[v2-turn-network.md](v2-turn-network.md); browser-hosted execution nodes will be
-respecified on that substrate before implementation.
+hosting transient objects.
+
+> **Folded into VTN14 (B9).** The normative browser model is the **browser node
+> profile** in [v2-turn-network.md §VTN14](v2-turn-network.md#vtn14-browser-node):
+> a narrow-authority node on the Execution and Live planes that may execute
+> optimistically for its authenticated actor but **MUST NOT commit without
+> server-side scope validation**, receives only authorized `source:"cache"`
+> transfers, and advertises no broad capability (at most one narrow session-local
+> ad). It inherits B6 write-set commit-scope selection, B7 warm cache-fill, and
+> B8 gossip ranking rather than re-implementing them. This closes the "browser is
+> a divergent holder protocol" fork: the browser has no second write path — its
+> authoritative view *is* the server commit scope. The v1 bootstrap below is
+> retained only as historical record.
 
 ---
 

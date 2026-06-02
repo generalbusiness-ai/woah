@@ -1644,6 +1644,17 @@ live/direct safe. A live/direct-safe verb:
 A browser node is a v2 node running inside a browser, normally as a Web Worker.
 It is not just a renderer.
 
+> **Status (B9): this is the normative browser profile.** It subsumes the legacy
+> standalone [browser-host.md](browser-host.md) bootstrap protocol and closes the
+> "browser is a divergent holder" fork — the browser has no second write path,
+> only optimistic execution plus server-validated commits, so its authoritative
+> view is the server commit scope. The browser node inherits the general
+> machinery rather than re-implementing it: commit-scope selection by write set
+> (VTN8.2 / B6), warm cache-fill from the commit reply (VTN12.1 / B7), and
+> capability-gossip ranking for its narrow session-local ad (VTN11 / B8). Gated by
+> the browser-node server-validation / no-divergent-holder case in the browser-node
+> test suite plus the optimistic-reconciliation cases in the v2 browser suite.
+
 Required browser-node components:
 
 - worker-hosted VM/runtime subset;
