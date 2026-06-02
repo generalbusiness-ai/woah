@@ -49,6 +49,7 @@ import { buildTransportErrorEnvelope, encodeEnvelope, type ShadowEnvelope } from
 import {
   buildVerbThrewReplyEnvelope,
   decodeTurnIntentForRecovery,
+  executeDevV2DurableTurnFrame,
   materializeDevV2CommitLocally,
   resolveTurnEnvelopeRouting
 } from "./dev-v2-helpers";
@@ -72,6 +73,13 @@ if (process.env.WOO_METRICS !== "off") {
   world.setMetricsHook(emitDevMetric);
 }
 const v2RelaysByScope = new Map<ObjRef, ShadowRelayCache>();
+// Sparse gateway relays (one per scope), distinct from the authoritative
+// commit relays in v2RelaysByScope. Durable REST turns plan here through the CF
+// submitTurnIntent contract: the sparse seed forces the PlanningWorld admission
+// gate + authority repair loop to fire (the coverage the old full-world dev path
+// lacked), and commit lands on the authoritative relay. See dev-v2-helpers
+// executeInProcessV2DurableTurn.
+const v2GatewayRelaysByScope = new Map<ObjRef, ShadowRelayCache>();
 const v2SocketsByNode = new Map<string, WebSocket>();
 const mcpGateway = new McpGateway(world, {
   serverName: "woo-dev",
@@ -547,7 +555,75 @@ function refreshDevV2SerializedObjects(relay: ShadowRelayCache, objects: ReturnT
   if (changed) markShadowBrowserRelaySerializedChanged(relay);
 }
 
+// Lazily-built sparse seed for gateway relays: the bootstrap seed graph only
+// (no catalogs), so a fresh gateway must repair its turn closure from authority.
+let devGatewaySparseSeed: ReturnType<typeof world.exportWorld> | undefined;
+function v2GatewayRelayForScope(scope: ObjRef): ShadowRelayCache {
+  let relay = v2GatewayRelaysByScope.get(scope);
+  if (!relay) {
+    if (!devGatewaySparseSeed) devGatewaySparseSeed = createWorld({ catalogs: false }).exportWorld();
+    relay = createShadowBrowserRelayShim({
+      node: "node:dev:gateway",
+      scope,
+      serialized: devGatewaySparseSeed,
+      deployment: "local-dev"
+    });
+    v2GatewayRelaysByScope.set(scope, relay);
+  }
+  return relay;
+}
+
 async function devRestV2Turn(input: Parameters<NonNullable<RestProtocolHost["executeTurn"]>>[0]): Promise<AppliedFrame | DirectResultFrame> {
+  // Live turns are read-only (no durable commit); keep them on the in-process
+  // browser-relay path, exactly as CF routes live to its in-process fallback.
+  if (input.persistence === "live") return devRestV2LiveTurn(input);
+
+  // Durable turns use the CF commit contract (submitTurnIntent → sparse-gateway
+  // planning + admission gate + repair loop → commit-scope envelope → accepted
+  // commit), then write-through to the dev world and fan out to peer sockets.
+  const token = shadowBrowserSessionBearer(input.session);
+  const scope = input.scope;
+  const node = `node:dev:rest:${input.id ?? randomUUID()}`;
+  const commitRelay = v2RelayForScope(scope);
+  ensureDevV2SerializedSession(commitRelay, input.session);
+  const gatewayRelay = v2GatewayRelayForScope(scope);
+  // Warm the gateway's session_auth + explicit scope/target/actor rows (parity
+  // with the worker's per-turn relay refresh); cells outside this set still
+  // repair through submitTurnIntent.
+  refreshDevV2RelaySessions(gatewayRelay, [scope, input.target, input.actor]);
+  ensureDevV2SerializedSession(gatewayRelay, input.session);
+
+  const { frame, submitted } = await executeDevV2DurableTurnFrame({
+    world,
+    gatewayRelay,
+    commitRelay,
+    node,
+    onMetric: emitDevMetric,
+    call: {
+      id: input.id,
+      route: input.route,
+      scope,
+      session: input.session.id,
+      actor: input.actor,
+      target: input.target,
+      verb: input.verb,
+      args: input.args,
+      body: input.body,
+      persistence: input.persistence,
+      token
+    }
+  });
+
+  // Fan the accepted delta to peer sockets subscribed on the commit relay.
+  if (submitted.kind === "submitted" && submitted.replyEnvelope) {
+    const origin = v2ShadowBrowser(node, token, input.session, scope);
+    sendDevV2Fanout(origin, submitted.replyEnvelope);
+  }
+  return frame;
+}
+
+// Live (non-durable) REST turns: in-process browser-relay execution, no commit.
+async function devRestV2LiveTurn(input: Parameters<NonNullable<RestProtocolHost["executeTurn"]>>[0]): Promise<AppliedFrame | DirectResultFrame> {
   const token = shadowBrowserSessionBearer(input.session);
   const browser = v2ShadowBrowser(`node:dev:rest:${input.id ?? randomUUID()}`, token, input.session, input.scope);
   refreshDevV2RelaySessions(browser.relay, [input.scope, input.target, input.actor]);
@@ -572,9 +648,6 @@ async function devRestV2Turn(input: Parameters<NonNullable<RestProtocolHost["exe
   const receipt = receiveShadowBrowserEnvelopeReceipt(browser, encoded);
   const reply = await handleShadowBrowserTurnExecEnvelope(browser, receipt, { onMetric: emitDevMetric });
   if (!reply) throw wooError("E_INTERNAL", "v2 REST turn produced no reply");
-  if (reply.body.ok === true && reply.body.commit && reply.body.transcript) {
-    materializeDevV2CommitLocally(world, reply.body.commit.position.scope, reply.body.transcript);
-  }
   sendDevV2Fanout(browser, reply);
   return restFrameFromTurnReply(input.scope, reply.body);
 }

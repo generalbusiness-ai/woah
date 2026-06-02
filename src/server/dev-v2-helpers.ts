@@ -44,7 +44,8 @@ import {
   receiveShadowBrowserEnvelopeReceipt
 } from "../core/shadow-browser-node";
 import type { PlanningAdmissibilityViolation } from "../core/planning-world";
-import type { MetricEvent, ObjRef } from "../core/types";
+import { restFrameFromTurnReply } from "../core/protocol";
+import { wooError, type AppliedFrame, type DirectResultFrame, type MetricEvent, type ObjRef } from "../core/types";
 import type { WooWorld } from "../core/world";
 
 const DEV_WORLD_HOST = "world";
@@ -156,6 +157,42 @@ export async function executeInProcessV2DurableTurn(input: {
     },
     ...(input.onMetric ? { onMetric: input.onMetric } : {})
   });
+}
+
+// Durable-turn → REST frame, with the local dev write-through. Wraps
+// `executeInProcessV2DurableTurn` (the CF commit contract) and applies the
+// accepted transcript to the dev `world` (per-host materialization), returning
+// the same AppliedFrame/DirectResultFrame shape the legacy dev REST path
+// produced. Error contract matches the legacy path: a planning error or a
+// rejected commit THROWS (the REST handler maps the throw to an error
+// response), rather than returning an error frame. This is the testable seam
+// `devRestV2Turn` delegates to.
+export async function executeDevV2DurableTurnFrame(input: {
+  world: WooWorld;
+  gatewayRelay: ShadowRelayCache;
+  commitRelay: ShadowRelayCache;
+  call: ExecutorCallInput;
+  node: string;
+  onMetric?: (event: MetricEvent) => void;
+  onAdmissionViolation?: (violations: PlanningAdmissibilityViolation[]) => void;
+}): Promise<{
+  frame: AppliedFrame | DirectResultFrame;
+  submitted: SubmitTurnIntentResult<DevV2GatewayClient, ExecutorEnvelopeResult>;
+}> {
+  const submitted = await executeInProcessV2DurableTurn(input);
+  if (submitted.kind === "local_frame") {
+    // Planning produced an error frame (the verb raised before commit). The
+    // legacy path surfaced this as a thrown turn error; preserve the contract.
+    if (submitted.frame.op === "error") throw submitted.frame.error;
+    throw wooError("E_INTERNAL", "dev v2 durable turn produced an unexpected non-error local frame");
+  }
+  if (!submitted.reply) throw wooError("E_INTERNAL", "dev v2 durable turn produced no reply");
+  if (submitted.reply.ok && submitted.reply.commit && submitted.reply.transcript) {
+    materializeDevV2CommitLocally(input.world, submitted.reply.commit.position.scope, submitted.reply.transcript);
+  }
+  // restFrameFromTurnReply throws turnReplyError on a rejected commit / !ok,
+  // matching the legacy dev REST path.
+  return { frame: restFrameFromTurnReply(input.call.scope, submitted.reply), submitted };
 }
 
 export function directAudienceForTarget(world: WooWorld, target: ObjRef): ObjRef | null {
