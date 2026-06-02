@@ -3,6 +3,7 @@ import {
   createShadowCommitScope,
   isShadowCommitScopeSerializedDirty,
   markShadowCommitScopeSerializedChanged,
+  applyAcceptedProjectionToCommitScopeCache,
   applyShadowTranscriptToCommitScopeCache,
   recordAcceptedCommitScopeCellProvenance,
   recordCommitScopeCellProvenance,
@@ -1644,21 +1645,44 @@ function shadowBrowserTransferBodyByteLength(
   return SHADOW_BROWSER_TRANSFER_ENCODER.encode(JSON.stringify(transfer)).byteLength;
 }
 
+// THE shared "apply an accepted commit frame to a DERIVED relay cache" helper —
+// used by every transport (MCP gateway, REST, browser) for the cross-scope
+// projection a relay holds without owning. It materializes the authority
+// projection_writes object rows + movement projection (so a moved object's real
+// lineage/live lands), falls back to transcript replay only for receiver-profiled
+// frames carrying no authority rows, records per-cell provenance ('cache', the
+// derived view) for exactly the applied object set, and marks the relay's
+// serialized view dirty. It does NOT advance the relay head — the head belongs to
+// the relay's own commit sequence. One implementation so no transport drifts to
+// plain replay (which would miss authority rows while recording as if materialized).
+export function applyAcceptedFrameToDerivedRelayCache(
+  relay: ShadowBrowserRelayShim,
+  accepted: ShadowCommitAccepted,
+  transcript: EffectTranscript
+): void {
+  if (!applyAcceptedProjectionToCommitScopeCache(relay.commit_scope, accepted, transcript)) {
+    applyShadowTranscriptToCommitScopeCache(relay.commit_scope, transcript);
+  }
+  recordAcceptedCommitScopeCellProvenance(relay.commit_scope, transcript, accepted, "cache");
+  markShadowBrowserRelaySerializedChanged(relay);
+}
+
 export function publishShadowBrowserAcceptedFrame(
   relay: ShadowBrowserRelayShim,
   accepted: ShadowCommitAccepted,
   transcript: EffectTranscript
 ): void {
   if (accepted.position.scope !== relay.commit_scope.scope) {
-    // A browser may execute while subscribed to a room but commit movement at
-    // the moved object's natural authority. Keep the relay's subscribed-scope
-    // projection cache current without advancing that room's sequencer head.
-    applyShadowTranscriptToCommitScopeCache(relay.commit_scope, transcript);
+    // A browser may execute while subscribed to a room but commit movement at the
+    // moved object's natural authority. Keep the relay's subscribed-scope cache
+    // current (authority rows + movement projection) without advancing that room's
+    // sequencer head — the same derived-cache application every transport uses.
+    applyAcceptedFrameToDerivedRelayCache(relay, accepted, transcript);
+  } else {
+    // Same-scope: the head-advancing commit already applied these cells; just tag
+    // the derived view's provenance (transcript writes AND authority projection_writes).
+    recordAcceptedCommitScopeCellProvenance(relay.commit_scope, transcript, accepted, "cache");
   }
-  // Incremental coverage: an accepted frame mutates the relay's tracked cells
-  // (transcript writes AND authority projection_writes object rows) without a
-  // provenance-recording merge, so tag exactly that object set.
-  recordAcceptedCommitScopeCellProvenance(relay.commit_scope, transcript, accepted, "cache");
   rememberShadowBrowserAcceptedFrame(relay, accepted, transcript);
   // Drop per-session live snapshots so the next live/direct call rebases on
   // the freshly committed scope state instead of a stale pre-commit view.

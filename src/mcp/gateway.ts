@@ -21,15 +21,14 @@ import { projectionDeltaMissingWrites, type ProjectionWrite } from "../core/proj
 import { createMcpServer } from "./server";
 import { McpHost, type McpAcceptedFrameAudience, type McpBroadcastHooks, type McpDispatchHooks, type McpToolManifestHooks } from "./host";
 import {
+  applyAcceptedFrameToDerivedRelayCache,
   createShadowBrowserRelayShim,
   markShadowBrowserRelaySerializedChanged,
   type ShadowBrowserRelayShim
 } from "../core/shadow-browser-node";
 import type { ShadowTurnCall } from "../core/shadow-turn-call";
 import {
-  applyAcceptedProjectionToCommitScopeCache,
   applyAcceptedShadowFrame,
-  applyShadowTranscriptToCommitScopeCache,
   recordAcceptedCommitScopeCellProvenance,
   serializedFor,
   type ShadowCommitAccepted,
@@ -975,15 +974,9 @@ export class McpGateway {
     for (const [scope, client] of this.v2Scopes) {
       if (scope === originScope) continue;
       if (!affected.has(scope)) continue;
-      // Materialize the accepted authority rows + movement projection (carries the
-      // moved actor's real lineage/name) without advancing this relay's head. If
-      // the frame carried no authority rows (receiver-profiled, display-only),
-      // fall back to transcript replay, as before.
-      if (!applyAcceptedProjectionToCommitScopeCache(client.relay.commit_scope, accepted, transcript)) {
-        applyShadowTranscriptToCommitScopeCache(client.relay.commit_scope, transcript);
-      }
-      recordAcceptedCommitScopeCellProvenance(client.relay.commit_scope, transcript, accepted, "cache");
-      markShadowBrowserRelaySerializedChanged(client.relay);
+      // The one shared derived-cache application (authority rows + movement
+      // projection + provenance + dirty-mark, no head advance).
+      applyAcceptedFrameToDerivedRelayCache(client.relay, accepted, transcript);
     }
   }
 

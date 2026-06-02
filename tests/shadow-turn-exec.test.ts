@@ -1,4 +1,4 @@
-import { authoritativePlanningWorld } from "../src/core/planning-world";
+import { authoritativePlanningWorld, planningCellKey } from "../src/core/planning-world";
 import { describe, expect, it } from "vitest";
 import { installVerb } from "../src/core/authoring";
 import { createWorld, createWorldFromSerialized } from "../src/core/bootstrap";
@@ -1507,6 +1507,22 @@ describe("shadow turn execution", () => {
     expect(directCall, "expected a direct_call event from the executor world").toBeDefined();
     expect(directCall?.verb).toBe("bump");
     expect(directCall?.target).toBe("metric_box");
+  });
+
+  // Finding 1 (review): a derived (sparse) execution node carries per-cell provenance
+  // so its serialized state can be admitted by PROOF at the VM boundary, while an
+  // authoritative_state node owns the full authority and is trusted by capability
+  // (no provenance scan on the hot authority path).
+  it("stamps cache cell-provenance on a sparse execution node, not an authoritative one", () => {
+    const serialized = createWorld().exportWorld();
+    const id = serialized.objects[0].id;
+
+    const sparse = createShadowExecutionNode({ node: "sparse", scope: "$system", serialized });
+    expect(sparse.cellProvenance?.get(planningCellKey(id, "object_lineage"))).toEqual({ source: "cache" });
+    expect(sparse.cellProvenance?.get(planningCellKey(id, "object_live"))).toEqual({ source: "cache" });
+
+    const authoritative = createShadowExecutionNode({ node: "auth", scope: "$system", serialized, authoritative_state: true });
+    expect(authoritative.cellProvenance === undefined || authoritative.cellProvenance.size === 0).toBe(true);
   });
 });
 

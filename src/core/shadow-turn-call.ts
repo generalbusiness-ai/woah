@@ -78,6 +78,13 @@ export async function runShadowTurnCallTranscript(
   return await runShadowTurnCallOnWorldTranscript(built, call, options);
 }
 
+// TRUSTED execution-world capability (A3.2): runs the VM against an already-built
+// WooWorld. This is POST-admission — every path that reaches it first admitted the
+// source: the serialized-boundary runners above build from a branded PlanningWorld,
+// and the executor (shadow-turn-exec `shadowExecutionWorld`) builds its WooWorld via
+// buildPlanningWorld (sparse) or by the authoritative_state capability. Do NOT call
+// these with a WooWorld assembled from un-admitted serialized state — that would
+// reintroduce the bypass the brand exists to close.
 export async function runShadowTurnCallOnWorld(
   world: WooWorld,
   call: ShadowTurnCall,

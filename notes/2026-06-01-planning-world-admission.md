@@ -388,3 +388,35 @@ Validation: typecheck 0 · npm test 290/290 · test:worker 202 passed/5 skipped 
 A3.2 is now as-built complete: the admission gate's accepted-frame provenance recording is one
 shared core helper (recordAcceptedCommitScopeCellProvenance, includes projection_writes), seed
 provenance is honest per holder, and all three sparse cloud planning paths enforce uniformly.
+
+## Update (2026-06-01 — review: true VM boundary + one shared derived-cache applier)
+
+Finding 1 (admission was not at the true VM boundary — browser-local bypassed by
+declaration): execution nodes now carry provenance and the gate runs by PROOF.
+- ShadowExecutionNode gains cellProvenance; recordExecutionNodeCellProvenance stamps
+  the derived holder's tracked cells `cache` (set-if-absent) at createShadowExecutionNode,
+  installShadowStateTransfer (all modes), and installShadowCachedObjectRecords. An
+  authoritative_state node is skipped (owns full authority; trusted by capability).
+- shadowExecutionWorld (the executor's serialized→WooWorld build) is now gated:
+  authoritative_state → trusted (no per-object admission scan on the hot authority
+  path); sparse → createWorldFromSerialized(buildPlanningWorld(serialized, node.cellProvenance))
+  so a presentation stub is refused (repairable). missing stays the atom-guard's job there.
+- v2-browser-local-turn no longer declares authoritativePlanningWorld; it calls
+  buildPlanningWorld(executionNode.serialized, executionNode.cellProvenance, { enforceMissingProvenance: true }).
+- runShadowTurnCallOnWorld* documented as the TRUSTED post-admission execution-world
+  capability: both callers (the branded serialized-boundary runners; the executor via
+  shadowExecutionWorld) admit the source first.
+
+Finding 2 (accepted-frame derived-cache application was transport-specific): one shared
+core helper applyAcceptedFrameToDerivedRelayCache(relay, accepted, transcript) —
+applyAcceptedProjectionToCommitScopeCache(...accepted...) || transcript replay, then
+recordAcceptedCommitScopeCellProvenance, then markShadowBrowserRelaySerializedChanged, no
+head advance. MCP (propagateTranscriptToOtherScopes), REST (propagateRestTranscriptToOtherRelays,
+now also affected-scope-bound like MCP), and browser (publishShadowBrowserAcceptedFrame
+cross-scope) all call it. Browser cross-scope no longer does plain replay (which missed
+authority projection_writes object rows while recording as if materialized).
+
+Tests: shadow-turn-exec +1 (sparse node stamps cache, authoritative does not);
+shadow-browser-node +1 (shared applier materializes projection rows + provenance, no head
+advance). Validation: typecheck 0 · npm test 292/292 · test:worker 202 passed/5 skipped ·
+gate:authority 2/2 · test:full 1385 passed (only the 3 pre-existing inherited failures).

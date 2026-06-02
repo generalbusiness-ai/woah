@@ -1,5 +1,5 @@
 import { runShadowTurnCallTranscript } from "../core/shadow-turn-call";
-import { authoritativePlanningWorld } from "../core/planning-world";
+import { buildPlanningWorld } from "../core/planning-world";
 import type { EffectTranscript } from "../core/effect-transcript";
 import type { ShadowScopeHead } from "../core/shadow-commit-scope";
 import { executeShadowTurnCallOrNeedState, missingAtomsForShadowTurn, type ShadowMissingAtom, type ShadowTurnExecRequest } from "../core/shadow-turn-exec";
@@ -79,10 +79,13 @@ export async function planV2BrowserLocalTurn(input: V2BrowserLocalTurnInput): Pr
     args: input.args,
     body: input.body
   };
-  // The client's own execution node is locally-authoritative state (the holder's
-  // optimistic world), not a cross-host sparse projection, so it is admitted as
-  // authoritative rather than gated against per-cell provenance it does not carry.
-  const planned = await runShadowTurnCallTranscript(authoritativePlanningWorld(executionNode.serialized), call);
+  // A3.2 true VM boundary: the client execution node is a DERIVED holder view
+  // composed from transfers, so it is admitted by PROOF, not by declaration — the
+  // gate runs against the node's recorded per-cell provenance (installShadowStateTransfer
+  // stamps it) and a presentation stub / untagged cell is refused (repairable).
+  const planned = await runShadowTurnCallTranscript(
+    buildPlanningWorld(executionNode.serialized, executionNode.cellProvenance ?? new Map(), { enforceMissingProvenance: true }),
+    call);
   const key = shadowTurnKeyFromTranscript(planned.transcript);
   const request: ShadowTurnExecRequest = {
     kind: "woo.turn.exec.request.shadow.v1",

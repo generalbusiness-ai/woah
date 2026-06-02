@@ -57,6 +57,7 @@ import { createHostOperationMemo, normalizeError } from "../core/world";
 import { installGitHubTap, updateGitHubTap, type CatalogTapLogEvent } from "../core/catalog-taps";
 import type { ShadowCapabilityAd } from "../core/capability-ad";
 import {
+  applyAcceptedFrameToDerivedRelayCache,
   createShadowBrowserRelayShim,
   markShadowBrowserRelaySerializedChanged,
   publishShadowBrowserAcceptedFrame,
@@ -73,10 +74,7 @@ import type { ShadowStateTransfer, ShadowTurnExecReply } from "../core/shadow-tu
 import { runShadowTurnCall } from "../core/shadow-turn-call";
 import { authoritativePlanningWorld } from "../core/planning-world";
 import {
-  applyAcceptedProjectionToCommitScopeCache,
   applyAcceptedShadowFrame,
-  applyShadowTranscriptToCommitScopeCache,
-  recordAcceptedCommitScopeCellProvenance,
   serializedFor,
   shadowLocationCommitScopeForTranscript,
   transcriptTouchedObjectIds,
@@ -87,6 +85,7 @@ import { isShadowCommitAccepted, isShadowTurnExecReply } from "../core/v2-reply-
 import {
   affectedBrowserFanoutScopes,
   affectedMcpFanoutScopes,
+  affectedTranscriptScopes,
   shadowLiveEventMatchesPeerScope,
   withComputedLiveAudience
 } from "../core/v2-fanout-projection";
@@ -4900,7 +4899,7 @@ export class PersistentObjectDO {
       applyAcceptedShadowFrame(restRelay.relay.commit_scope, reply.body.commit, reply.body.transcript);
       publishShadowBrowserAcceptedFrame(restRelay.relay, reply.body.commit, reply.body.transcript);
     }
-    this.propagateRestTranscriptToOtherRelays(reply.body.commit.position.scope, reply.body.commit, reply.body.transcript);
+    this.propagateRestTranscriptToOtherRelays(reply.body.commit.position.scope, reply.body.commit, reply.body.transcript, world);
     const projectionWrites = reply.body.commit.projection_writes ?? [];
     const projectionDelta = reply.body.commit.projection_delta;
     // The gateway maintains its projection-row cache from the accepted commit's
@@ -4932,25 +4931,23 @@ export class PersistentObjectDO {
     });
   }
 
-  private propagateRestTranscriptToOtherRelays(originScope: ObjRef, accepted: ShadowCommitAccepted, transcript: EffectTranscript): void {
+  private propagateRestTranscriptToOtherRelays(originScope: ObjRef, accepted: ShadowCommitAccepted, transcript: EffectTranscript, world: WooWorld): void {
     // REST relays are cached per planning scope. A movement turn may plan under a
     // room scope and commit under the moved object's location authority, so every
-    // cached planning relay must see the accepted writes even though only the
-    // authority relay advances its head. Mirror the MCP gateway
-    // (propagateTranscriptToOtherScopes): materialize the accepted authority
-    // projection_writes object rows when present (so a moved object's real
-    // lineage/live row lands, not just contents membership), falling back to
-    // transcript replay only for receiver-profiled frames that carry no authority rows.
+    // cached planning relay in an AFFECTED scope must see the accepted writes even
+    // though only the authority relay advances its head. Mirrors the MCP gateway
+    // exactly: bound to the transcript's affected scopes, and route every affected
+    // relay through the one shared derived-cache applier (authority projection_writes
+    // rows + movement projection + provenance + dirty-mark, no head advance).
+    const affected = new Set(affectedTranscriptScopes(
+      originScope,
+      transcript,
+      (object, property) => world.isPresenceProjectionProperty(object, property)
+    ));
     for (const [scope, client] of this.restV2Relays) {
       if (scope === originScope) continue;
-      if (!applyAcceptedProjectionToCommitScopeCache(client.relay.commit_scope, accepted, transcript)) {
-        applyShadowTranscriptToCommitScopeCache(client.relay.commit_scope, transcript);
-      }
-      // Record provenance for the cells this propagation just wrote (transcript +
-      // authority projection_writes), so the admission gate does not flag them
-      // missing on this other relay's next plan.
-      recordAcceptedCommitScopeCellProvenance(client.relay.commit_scope, transcript, accepted, "cache");
-      markShadowBrowserRelaySerializedChanged(client.relay);
+      if (!affected.has(scope)) continue;
+      applyAcceptedFrameToDerivedRelayCache(client.relay, accepted, transcript);
     }
   }
 

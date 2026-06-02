@@ -4,6 +4,7 @@ import { createWorld, createWorldFromSerialized } from "../src/core/bootstrap";
 import { decodeEnvelope, encodeEnvelope } from "../src/core/shadow-envelope";
 import { stableShadowJson } from "../src/core/shadow-cell-version";
 import {
+  applyAcceptedFrameToDerivedRelayCache,
   applyShadowBrowserTransfer,
   buildShadowBrowserSessionAuth,
   buildShadowBrowserProjectionTransfer,
@@ -39,6 +40,7 @@ import {
 } from "../src/core/shadow-browser-node";
 import { hashSource } from "../src/core/source-hash";
 import type { MetricEvent, ObjRef, WooValue } from "../src/core/types";
+import type { SerializedObject } from "../src/core/repository";
 import { runShadowTurnCall, runShadowTurnCallTranscript, type ShadowTurnCall } from "../src/core/shadow-turn-call";
 import { shadowTurnKeyFromTranscript } from "../src/core/turn-key";
 import type { EffectTranscript } from "../src/core/effect-transcript";
@@ -1906,6 +1908,35 @@ describe("shadow browser relay seed provenance (A3.2)", () => {
     const relay = createShadowBrowserRelayShim({ node: "n", scope: "$system", serialized, seedCellProvenance: seed });
     createShadowBrowserNode({ node: "browser", scope: "$system", actor: "$wiz", relay });
     expect(relay.commit_scope.cellProvenance?.get(planningCellKey(id, "object_lineage"))).toEqual({ source: "authoritative" });
+  });
+
+  // Finding 2 (review): the ONE shared derived-cache applier materializes the authority
+  // projection_writes object rows (a moved object's real lineage/live), records their
+  // provenance, and does NOT advance the relay head. Used by MCP/REST/browser alike.
+  it("applyAcceptedFrameToDerivedRelayCache materializes projection rows + provenance, no head advance", () => {
+    const { serialized } = seedObjectId();
+    const relay = createShadowBrowserRelayShim({ node: "derived", scope: "room", serialized });
+    const headBefore = relay.commit_scope.head.hash;
+    const widget: SerializedObject = {
+      id: "remote_widget", name: "Remote Widget", parent: "$thing", anchor: null, owner: "$wiz",
+      location: "room", flags: {}, created: 0, modified: 0, propertyDefs: [], properties: [],
+      propertyVersions: [], verbs: [], children: [], contents: [], eventSchemas: []
+    };
+    const accepted = {
+      position: { kind: "woo.scope_head.shadow.v1", scope: "other", epoch: 1, seq: 1, hash: "h" },
+      projection_writes: [{ table: "objects", op: "upsert", key: "remote_widget", row: widget }]
+    } as unknown as ShadowCommitAccepted;
+    const emptyTranscript: EffectTranscript = {
+      kind: "woo.effect_transcript.shadow.v1", id: "f", route: "sequenced", scope: "room", seq: 0,
+      session: "s", call: { actor: "a", target: "room", verb: "noop", args: [], body: undefined },
+      reads: [], writes: [], creates: [], moves: [], observations: [], logicalInputs: [], untrackedEffects: [],
+      complete: true, incompleteReasons: [], hash: "t:f"
+    };
+
+    applyAcceptedFrameToDerivedRelayCache(relay, accepted, emptyTranscript);
+    expect(serializedFor(relay.commit_scope).objects.find((o) => o.id === "remote_widget")?.name).toBe("Remote Widget");
+    expect(relay.commit_scope.cellProvenance?.get(planningCellKey("remote_widget", "object_lineage"))).toEqual({ source: "cache" });
+    expect(relay.commit_scope.head.hash).toBe(headBefore);
   });
 });
 

@@ -34,6 +34,7 @@ import {
 import { constantTimeEqual, hashSource, utf8ByteLength } from "./source-hash";
 import { stableShadowJson } from "./shadow-cell-version";
 import { createWorldFromSerialized } from "./bootstrap";
+import { buildPlanningWorld, planningCellKey, PLANNING_TRACKED_PAGES, type PlanningWorldProvenance } from "./planning-world";
 import type { WooWorld } from "./world";
 import {
   cacheShadowStatePages,
@@ -169,6 +170,13 @@ export type ShadowExecutionNode = {
   trusted_transfer_authorities: Map<string, string>;
   serialized?: SerializedWorld;
   world?: WooWorld;
+  // A3.2: per-cell provenance for `serialized` (the derived holder/cache view this
+  // execution node composes from transfers). Lets the planning admission gate run by
+  // PROOF (buildPlanningWorld) rather than by declaration when this node's serialized
+  // state crosses the VM boundary (sparse executors + browser-local planning). An
+  // `authoritative_state` node owns the full authority and is trusted by capability,
+  // so it does not consult this.
+  cellProvenance?: PlanningWorldProvenance;
   committed_head_hash?: string;
   serialized_generation?: number;
   // When true, the executor owns the full authoritative scope state and the
@@ -310,7 +318,7 @@ export function createShadowExecutionNode(input: {
   for (const obj of cachedObjects) cacheShadowStatePages(pageCache, shadowStatePagesForObject(obj));
   cacheShadowStatePages(pageCache, input.cached_pages ?? []);
   if (cachedObjects.length > 0) serialized = mergeCachedObjectRecords(serialized, cachedObjects);
-  return {
+  const node: ShadowExecutionNode = {
     kind: "woo.execution_node.shadow.v1",
     node: input.node,
     scope: input.scope,
@@ -323,11 +331,16 @@ export function createShadowExecutionNode(input: {
     serialized,
     ...(input.authoritative_state === true ? { authoritative_state: true } : {})
   };
+  recordExecutionNodeCellProvenance(node);
+  return node;
 }
 
 export function installShadowCachedObjectRecords(node: ShadowExecutionNode, objects: SerializedObject[]): void {
   for (const obj of objects) cacheShadowMaterializedObject(node, obj);
-  if (objects.length > 0) node.serialized = mergeCachedObjectRecords(node.serialized, objects);
+  if (objects.length > 0) {
+    node.serialized = mergeCachedObjectRecords(node.serialized, objects);
+    recordExecutionNodeCellProvenance(node);
+  }
 }
 
 export function missingAtomsForShadowTurn(node: ShadowExecutionNode, key: ShadowTurnKey): ShadowMissingAtom[] {
@@ -642,6 +655,7 @@ export function installShadowStateTransfer(node: ShadowExecutionNode, transfer: 
     node.serialized = structuredClone(transfer.serialized) as SerializedWorld;
     node.world = undefined;
     for (const obj of node.serialized.objects) cacheShadowMaterializedObject(node, obj);
+    recordExecutionNodeCellProvenance(node);
     return;
   }
   if (transfer.mode === "cell_pages") {
@@ -651,12 +665,14 @@ export function installShadowStateTransfer(node: ShadowExecutionNode, transfer: 
     // before recording the retry transcript.
     node.world = undefined;
     for (const ref of transfer.page_refs) node.page_hashes.add(ref.hash);
+    recordExecutionNodeCellProvenance(node);
     return;
   }
   node.serialized = mergeObjectRecordTransfer(node.serialized, transfer, node.object_cache);
   node.world = undefined;
   for (const page of transfer.object_pages) node.object_hashes.add(page.hash);
   cacheShadowObjectsById(node, new Set(transfer.object_pages.map((page) => page.id)));
+  recordExecutionNodeCellProvenance(node);
 }
 
 export async function executeShadowRecordedTurnOrNeedState(
@@ -997,9 +1013,35 @@ export async function executeShadowTurnCallOrNeedState(
   };
 }
 
+// Tag a derived execution node's tracked cells `cache` (set-if-absent) — the honest
+// source for a holder/cache view composed from transfers. Skipped for an
+// authoritative_state node, which owns the full authority and is trusted by
+// capability (its planning world is admitted without the gate). This is what lets
+// browser-local planning + sparse executors run the admission gate by PROOF.
+function recordExecutionNodeCellProvenance(node: ShadowExecutionNode): void {
+  if (node.authoritative_state || !node.serialized) return;
+  const prov = (node.cellProvenance ??= new Map());
+  for (const obj of node.serialized.objects) {
+    for (const page of PLANNING_TRACKED_PAGES) {
+      const key = planningCellKey(obj.id, page);
+      if (!prov.has(key)) prov.set(key, { source: "cache" });
+    }
+  }
+}
+
 function shadowExecutionWorld(node: ShadowExecutionNode): WooWorld {
   if (!node.serialized) throw new Error(`shadow executor has no serialized state: ${node.node}`);
-  if (!node.world) node.world = createWorldFromSerialized(node.serialized, { persist: false });
+  if (!node.world) {
+    // A3.2 true VM boundary. An authoritative_state executor owns the full
+    // authority — trusted by capability, admitted without the gate (and without
+    // paying per-object admission scan on the hot authority path). A sparse/derived
+    // executor is admitted by PROOF: buildPlanningWorld refuses a presentation stub
+    // (→ repairable E_NEED_STATE) using the node's recorded provenance. missing
+    // provenance stays the atom-guard's job here, so it is not separately enforced.
+    node.world = node.authoritative_state
+      ? createWorldFromSerialized(node.serialized, { persist: false })
+      : createWorldFromSerialized(buildPlanningWorld(node.serialized, node.cellProvenance ?? new Map()), { persist: false });
+  }
   return node.world;
 }
 
