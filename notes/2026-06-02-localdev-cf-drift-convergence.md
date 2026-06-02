@@ -86,10 +86,42 @@ routing, item #2), then `restFrameFromTurnReply`.
 5. Negative: a cold gateway with NO authority source fails as missing_state
    (proves sparseness is real, not a hidden full-world seed).
 
-## Then swap (only after the primitive is green)
+## #1a DONE (commit 1b8f71e): primitive built + tested in isolation.
 
-Route `devRestV2Turn` and `handleV2ShadowFrame` through the primitive; delete the
-browser-relay-direct + `materializeDevV2CommitLocally`-as-simulation wiring.
+## Then swap (#1b) — careful, enumerate every branch; NOT rushed
+
+The swap is NOT purely mechanical. Each branch is correctness-sensitive and
+`devRestV2Turn`/`handleV2ShadowFrame` have **no direct test coverage** (test:full
+does not hit them), so the swap must land with a tested apply-wrapper, not on
+test:full alone.
+
+**Add infra:** `v2GatewayRelaysByScope` map + `v2GatewayRelayForScope(scope)`
+seeded SPARSE (bootstrap-only), distinct from the authoritative
+`v2RelayForScope`. Plus a tested wrapper `executeDevV2DurableTurnFrame`
+(= primitive + write-through → frame) so the apply path is unit-tested.
+
+**REST (`devRestV2Turn`) branches:**
+- `persistence: "live"` → must NOT go through the committing primitive (CF routes
+  live to `restV2TurnInProcess`). Keep a live branch on the existing in-process
+  path (no commit).
+- durable → `executeDevV2DurableTurnFrame(world, gatewayRelay, commitRelay, call,
+  node)`; then fanout via a **commit-relay-bound** origin browser
+  (`sendDevV2Fanout(origin, submitted.replyEnvelope)`).
+- `submitted.kind === "local_frame"` (planning error) → the old path threw via
+  `restFrameFromTurnReply` (!ok); preserve that (throw, REST handler maps to error).
+- `submitted` with null reply → throw E_INTERNAL (mirror CF).
+- commit_rejected reply → `restFrameFromTurnReply` throws; preserve.
+
+**WS (`handleV2ShadowFrame`) — the SUBTLE one:** the reply sent back over the
+socket carries a `reply_to` the SPA uses to drain `pendingNetworkTurns`. The
+primitive's `submitEnvelope` builds its OWN exec envelope internally, so the
+reply's `reply_to` would reference that exec envelope, NOT the original WS intent
+envelope id — the SPA would spin forever. The WS swap MUST re-thread the original
+receipt id onto the returned reply (or keep the reply derivation tied to the WS
+receipt). Test the SPA-drain contract (reply_to === original intent envelope id)
+before swapping WS. Until then WS stays on the existing path.
+
 Keep `gate:authority` + `test:full` green throughout. Then items #2 (fanout) and
 #3 (write-through) refine the post-commit half toward CF's affected-scope/session
-routing and object-host write-through abstraction.
+routing and object-host write-through abstraction; #4 reconnect/idempotency;
+#5 browser.
