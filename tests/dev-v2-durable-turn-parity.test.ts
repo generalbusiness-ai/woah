@@ -2,10 +2,11 @@ import { describe, expect, it } from "vitest";
 
 import { authoritativePlanningWorld } from "../src/core/planning-world";
 import { createWorld, createWorldFromSerialized } from "../src/core/bootstrap";
-import { createShadowBrowserRelayShim, shadowBrowserSessionBearer } from "../src/core/shadow-browser-node";
+import { createShadowBrowserClient, createShadowBrowserRelayShim, receiveShadowBrowserEnvelopeReceipt, shadowBrowserSessionBearer } from "../src/core/shadow-browser-node";
 import { serializedFor } from "../src/core/shadow-commit-scope";
 import { runShadowTurnCall, type ShadowTurnCall } from "../src/core/shadow-turn-call";
-import { executeDevV2DurableTurnFrame, executeInProcessV2DurableTurn } from "../src/server/dev-v2-helpers";
+import { encodeExecutorIntentEnvelope } from "../src/core/executor";
+import { decodeTurnIntentCall, executeDevV2DurableTurnFrame, executeDevV2DurableTurnWsReply, executeInProcessV2DurableTurn } from "../src/server/dev-v2-helpers";
 import type { ExecutorCallInput } from "../src/core/executor";
 import type { ObjRef } from "../src/core/types";
 
@@ -162,6 +163,94 @@ describe("dev v2 durable turn — CF contract parity", () => {
     expect(world.getProp("delay_1", "wet")).toBe(0.22);
     // The commit head advanced (the warm gateway committed at the new head, not a stale one).
     expect(commitRelay.commit_scope.head.seq).toBeGreaterThan(headAfterFirst);
+  });
+
+  // WS drain contract: the socket reply MUST be addressed to the WS client and
+  // carry reply_to = the original intent envelope id, or the SPA's pending-turn
+  // set never drains (the wait cursor spins forever). True for BOTH a committed
+  // turn and a verb that raised.
+  function wsReplyHarness(actorAllowed: boolean, verb: string, id: string) {
+    const world = createWorld();
+    const session = world.auth(`guest:dev-ws-${id}`);
+    if (actorAllowed) world.setProp("the_dubspace", "operators", [session.actor]);
+    const gatewayRelay = createShadowBrowserRelayShim({ node: `dev:gw-ws-${id}`, scope: "the_dubspace", serialized: createWorld({ catalogs: false }).exportWorld(), deployment: "local-dev" });
+    const commitRelay = createShadowBrowserRelayShim({ node: `dev:commit-ws-${id}`, scope: "the_dubspace", serialized: world.exportWorld(), deployment: "local-dev" });
+    const token = shadowBrowserSessionBearer({ id: session.id, actor: session.actor });
+    const wsBrowser = createShadowBrowserClient({ node: `browser:ws-${id}`, scope: "the_dubspace", actor: session.actor, session: session.id, relay: commitRelay, token });
+    const call = {
+      id, route: "sequenced" as const, scope: "the_dubspace" as ObjRef, session: session.id, actor: session.actor,
+      target: "the_dubspace" as ObjRef, verb, args: verb === "set_control" ? ["delay_1", "wet", 0.27] : [], persistence: "durable" as const, token
+    };
+    const encoded = encodeExecutorIntentEnvelope({ node: wsBrowser.node, turn: { ...call }, turnId: id });
+    const receipt = receiveShadowBrowserEnvelopeReceipt(wsBrowser, encoded);
+    return { world, gatewayRelay, commitRelay, wsBrowser, receipt, call };
+  }
+
+  it("WS durable success reply is socket-addressed and drains (reply_to = intent id, ok)", async () => {
+    const h = wsReplyHarness(true, "set_control", "dev-ws-ok");
+    const { reply } = await executeDevV2DurableTurnWsReply({
+      world: h.world, gatewayRelay: h.gatewayRelay, commitRelay: h.commitRelay,
+      browser: h.wsBrowser, receipt: h.receipt, call: h.call, node: `dev:exec-${h.call.id}`
+    });
+    expect(reply.reply_to).toBe(h.receipt.envelope.id);   // SPA drains on this
+    expect(reply.to).toBe(h.wsBrowser.node);               // addressed to the WS client
+    expect(reply.body.ok).toBe(true);
+    if (reply.body.ok !== true) throw new Error("expected ok reply");
+    expect(reply.body.commit).toBeTruthy();
+    expect(h.world.getProp("delay_1", "wet")).toBe(0.27);  // write-through happened
+  });
+
+  it("WS durable verb-error reply STILL drains (reply_to = intent id, ok:false) instead of throwing", async () => {
+    const h = wsReplyHarness(true, "__parity_no_such_verb__", "dev-ws-err");
+    const { reply } = await executeDevV2DurableTurnWsReply({
+      world: h.world, gatewayRelay: h.gatewayRelay, commitRelay: h.commitRelay,
+      browser: h.wsBrowser, receipt: h.receipt, call: h.call, node: `dev:exec-${h.call.id}`
+    });
+    // Unlike the REST wrapper, the WS path never throws — the SPA must get a
+    // drainable reply even on error.
+    expect(reply.reply_to).toBe(h.receipt.envelope.id);
+    expect(reply.to).toBe(h.wsBrowser.node);
+    expect(reply.body.ok).toBe(false);
+  });
+
+  it("WS durable reply is idempotent: a replayed intent does NOT re-execute (no double commit)", async () => {
+    const h = wsReplyHarness(true, "set_control", "dev-ws-idem");
+    const args = {
+      world: h.world, gatewayRelay: h.gatewayRelay, commitRelay: h.commitRelay,
+      browser: h.wsBrowser, call: h.call, node: "dev:exec-idem"
+    };
+    const first = await executeDevV2DurableTurnWsReply({ ...args, receipt: h.receipt });
+    expect(first.reply.body.ok).toBe(true);
+    const headAfterFirst = h.commitRelay.commit_scope.head.seq;
+    expect(h.world.getProp("delay_1", "wet")).toBe(0.27);
+
+    // Replay the SAME intent envelope: the second receipt is not fresh, so the
+    // cached reply is returned without re-executing.
+    const replayEncoded = encodeExecutorIntentEnvelope({ node: h.wsBrowser.node, turn: { ...h.call }, turnId: h.call.id });
+    const replayReceipt = receiveShadowBrowserEnvelopeReceipt(h.wsBrowser, replayEncoded);
+    expect(replayReceipt.fresh).toBe(false);
+    const second = await executeDevV2DurableTurnWsReply({ ...args, receipt: replayReceipt });
+    expect(second.reply.body.ok).toBe(true);
+    // No second commit: the scope head did not advance again.
+    expect(h.commitRelay.commit_scope.head.seq).toBe(headAfterFirst);
+  });
+
+  it("decodeTurnIntentCall extracts the call and preserves live vs durable", () => {
+    const session = "s:decode";
+    const token = "t:decode";
+    const durable = encodeExecutorIntentEnvelope({
+      node: "n", turnId: "d1",
+      turn: { id: "d1", route: "sequenced", scope: "the_dubspace" as ObjRef, session, actor: "#a" as ObjRef, target: "the_dubspace" as ObjRef, verb: "set_control", args: ["delay_1", "wet", 0.3], persistence: "durable", token }
+    });
+    const call = decodeTurnIntentCall(durable, session, token);
+    expect(call).toMatchObject({ verb: "set_control", scope: "the_dubspace", actor: "#a", target: "the_dubspace", persistence: "durable", session });
+    expect(call?.args).toEqual(["delay_1", "wet", 0.3]);
+
+    const live = encodeExecutorIntentEnvelope({
+      node: "n", turnId: "l1",
+      turn: { id: "l1", route: "direct", scope: "the_dubspace" as ObjRef, session, actor: "#a" as ObjRef, target: "the_dubspace" as ObjRef, verb: "look", args: [], persistence: "live", token }
+    });
+    expect(decodeTurnIntentCall(live, session, token)?.persistence).toBe("live");
   });
 
   it("a cold gateway whose authority source lacks the target cannot fabricate state (sparseness is real)", async () => {

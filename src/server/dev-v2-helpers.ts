@@ -41,11 +41,14 @@ import {
 import {
   createShadowBrowserClient,
   handleShadowBrowserTurnExecEnvelope,
-  receiveShadowBrowserEnvelopeReceipt
+  receiveShadowBrowserEnvelopeReceipt,
+  shadowBrowserReplyEnvelopeForReceipt,
+  type ShadowBrowserEnvelopeReceipt,
+  type ShadowBrowserNode
 } from "../core/shadow-browser-node";
 import type { PlanningAdmissibilityViolation } from "../core/planning-world";
 import { restFrameFromTurnReply } from "../core/protocol";
-import { wooError, type AppliedFrame, type DirectResultFrame, type MetricEvent, type ObjRef } from "../core/types";
+import { wooError, type AppliedFrame, type DirectResultFrame, type MetricEvent, type ObjRef, type WooValue } from "../core/types";
 import type { WooWorld } from "../core/world";
 
 const DEV_WORLD_HOST = "world";
@@ -195,6 +198,165 @@ export async function executeDevV2DurableTurnFrame(input: {
   return { frame: restFrameFromTurnReply(input.call.scope, submitted.reply), submitted };
 }
 
+// A verb that raised (before/at recording) has no useful transcript; the SPA
+// still needs a drainable reply. Shape it as a commit_rejected/permission_denied
+// conflict so the SPA's E_V2_COMMIT_REJECTED path fires with the substrate error.
+// Shared by the WS pre-recording-throw recovery and the durable-WS local-frame
+// (verb-raised) path.
+export function verbThrewReplyBody(input: {
+  id: string;
+  scope: ObjRef;
+  route: "direct" | "sequenced";
+  error: { code: string; message?: string };
+}): ShadowTurnExecReply {
+  const errors = [`${input.error.code}: ${input.error.message ?? ""}`];
+  return {
+    kind: "woo.turn.exec.reply.shadow.v1",
+    ok: false,
+    id: input.id,
+    reason: "commit_rejected",
+    commit: {
+      kind: "woo.commit.conflict.shadow.v1",
+      id: input.id,
+      scope: input.scope,
+      current: { kind: "woo.scope_head.shadow.v1", scope: input.scope, epoch: 1, seq: 0, hash: "" },
+      reason: "permission_denied",
+      errors,
+      receipt: {
+        kind: "woo.commit_receipt.shadow.v1",
+        id: input.id,
+        route: input.route,
+        scope: input.scope,
+        seq: 0,
+        transcript_hash: "",
+        pre_state_hash: "",
+        post_state_hash: "",
+        accepted: false,
+        errors
+      }
+    }
+  };
+}
+
+// Durable WS turn → a socket-addressed reply the SPA can drain. Runs the CF
+// commit contract (executeInProcessV2DurableTurn) + write-through, then wraps the
+// result into a reply addressed to `browser` with `reply_to = receipt.envelope.id`
+// (the original WS intent id). Unlike the REST wrapper this NEVER throws — every
+// outcome (accepted, commit-rejected, verb-raised) returns a reply envelope, so
+// the SPA's pending-turn set always drains. This is the testable seam the WS
+// handler delegates to.
+// Decode an inbound WS turn-intent envelope into an ExecutorCallInput so the dev
+// WS handler can route durable turns through the CF commit contract. Returns null
+// when the envelope is not a decodable turn intent (the caller falls back to the
+// legacy browser-relay path). persistence defaults to "durable" only when absent;
+// an explicit "live" is preserved so the caller keeps live turns off the
+// committing path.
+export function decodeTurnIntentCall(encoded: string, sessionId: string, token: string): ExecutorCallInput | null {
+  try {
+    const env = decodeEnvelope<{
+      id?: unknown; route?: unknown; scope?: unknown; target?: unknown;
+      verb?: unknown; args?: unknown; body?: unknown; persistence?: unknown;
+    }>(encoded);
+    if (env.type !== "woo.turn.intent.request.shadow.v1") return null;
+    const b = env.body;
+    // The call's actor is carried on the ENVELOPE (env.actor), not in the intent
+    // body; scope/target/verb/args are in the body.
+    const actor = typeof env.actor === "string" ? env.actor : null;
+    if (!actor || typeof b?.verb !== "string" || typeof b?.target !== "string" || typeof b?.scope !== "string") return null;
+    return {
+      id: typeof b.id === "string" ? b.id : undefined,
+      route: b.route === "direct" ? "direct" : "sequenced",
+      scope: b.scope as ObjRef,
+      session: sessionId,
+      actor: actor as ObjRef,
+      target: b.target as ObjRef,
+      verb: b.verb,
+      args: Array.isArray(b.args) ? b.args : [],
+      ...(b.body && typeof b.body === "object" ? { body: b.body as Record<string, WooValue> } : {}),
+      persistence: b.persistence === "live" ? "live" : "durable",
+      token
+    };
+  } catch {
+    return null;
+  }
+}
+
+export type DevV2DurableWsReplyInput = {
+  world: WooWorld;
+  gatewayRelay: ShadowRelayCache;
+  commitRelay: ShadowRelayCache;
+  browser: ShadowBrowserNode;
+  receipt: ShadowBrowserEnvelopeReceipt;
+  call: ExecutorCallInput;
+  node: string;
+  onMetric?: (event: MetricEvent) => void;
+  onAdmissionViolation?: (violations: PlanningAdmissibilityViolation[]) => void;
+};
+
+export type DevV2DurableWsReplyResult = {
+  reply: ShadowEnvelope<ShadowTurnExecReply>;
+  submitted?: SubmitTurnIntentResult<DevV2GatewayClient, ExecutorEnvelopeResult>;
+};
+
+export async function executeDevV2DurableTurnWsReply(input: DevV2DurableWsReplyInput): Promise<DevV2DurableWsReplyResult> {
+  // Idempotency: a replayed intent (the relay already saw this idempotency key)
+  // returns the cached WS reply WITHOUT re-executing — otherwise a retried
+  // durable turn commits twice (a real regression for create verbs). Mirrors
+  // handleShadowBrowserTurnExecEnvelope's recent_replies behavior, which the
+  // legacy dev WS path relied on.
+  if (!input.receipt.fresh) {
+    const cached = input.commitRelay.recent_replies.get(input.receipt.idempotency_key);
+    if (cached) return { reply: structuredClone(cached) as ShadowEnvelope<ShadowTurnExecReply> };
+  }
+  const computed = await computeDevV2DurableTurnWsReply(input);
+  input.commitRelay.recent_replies.set(input.receipt.idempotency_key, structuredClone(computed.reply));
+  return computed;
+}
+
+async function computeDevV2DurableTurnWsReply(input: DevV2DurableWsReplyInput): Promise<DevV2DurableWsReplyResult> {
+  const turnId = input.call.id ?? input.receipt.envelope.id;
+  let submitted: SubmitTurnIntentResult<DevV2GatewayClient, ExecutorEnvelopeResult>;
+  try {
+    submitted = await executeInProcessV2DurableTurn({
+      world: input.world,
+      gatewayRelay: input.gatewayRelay,
+      commitRelay: input.commitRelay,
+      call: input.call,
+      node: input.node,
+      ...(input.onMetric ? { onMetric: input.onMetric } : {}),
+      ...(input.onAdmissionViolation ? { onAdmissionViolation: input.onAdmissionViolation } : {})
+    });
+  } catch (err) {
+    // Pre-recording substrate throws (presence/permission gates, unknown verb)
+    // escape submitTurnIntent without a local_frame. The WS path MUST still
+    // answer with a drainable reply, or the SPA's pending-turn set spins forever.
+    const e = err as { code?: unknown; message?: unknown };
+    const error = typeof e?.code === "string"
+      ? { code: e.code, message: typeof e.message === "string" ? e.message : undefined }
+      : { code: "E_INTERNAL", message: err instanceof Error ? err.message : String(err) };
+    const body = verbThrewReplyBody({ id: turnId, scope: input.call.scope, route: input.call.route, error });
+    return { reply: shadowBrowserReplyEnvelopeForReceipt(input.browser, input.receipt, body) };
+  }
+  if (submitted.kind === "local_frame") {
+    const error = submitted.frame.op === "error"
+      ? submitted.frame.error
+      : { code: "E_INTERNAL", message: "dev v2 durable turn produced an unexpected non-error local frame" };
+    const body = verbThrewReplyBody({ id: turnId, scope: input.call.scope, route: input.call.route, error });
+    return { reply: shadowBrowserReplyEnvelopeForReceipt(input.browser, input.receipt, body), submitted };
+  }
+  if (!submitted.reply) {
+    const body = verbThrewReplyBody({ id: turnId, scope: input.call.scope, route: input.call.route, error: { code: "E_INTERNAL", message: "dev v2 durable turn produced no reply" } });
+    return { reply: shadowBrowserReplyEnvelopeForReceipt(input.browser, input.receipt, body), submitted };
+  }
+  if (submitted.reply.ok && submitted.reply.commit && submitted.reply.transcript) {
+    materializeDevV2CommitLocally(input.world, submitted.reply.commit.position.scope, submitted.reply.transcript);
+  }
+  // Accepted OR a !ok reply (commit_rejected / missing_state) — wrap it for the
+  // WS client; the socket addressing + reply_to come from the original receipt,
+  // not the primitive's internally-addressed reply.
+  return { reply: shadowBrowserReplyEnvelopeForReceipt(input.browser, input.receipt, submitted.reply), submitted };
+}
+
 export function directAudienceForTarget(world: WooWorld, target: ObjRef): ObjRef | null {
   // Mirrors WooWorld.directAudience synchronously so the WS frame handler
   // can pick the right per-scope relay without re-entering async dispatch.
@@ -302,33 +464,12 @@ export function buildVerbThrewReplyEnvelope(input: {
   // drain and the wait cursor spins forever. Shape the reply as a
   // commit_rejected/permission_denied conflict so the SPA's
   // E_V2_COMMIT_REJECTED error path fires with the substrate error.
-  const errors = [`${input.error.code}: ${input.error.message ?? ""}`];
-  const replyBody: ShadowTurnExecReply = {
-    kind: "woo.turn.exec.reply.shadow.v1",
-    ok: false,
+  const replyBody = verbThrewReplyBody({
     id: input.intent.id,
-    reason: "commit_rejected",
-    commit: {
-      kind: "woo.commit.conflict.shadow.v1",
-      id: input.intent.id,
-      scope: input.intent.scope,
-      current: { kind: "woo.scope_head.shadow.v1", scope: input.intent.scope, epoch: 1, seq: 0, hash: "" },
-      reason: "permission_denied",
-      errors,
-      receipt: {
-        kind: "woo.commit_receipt.shadow.v1",
-        id: input.intent.id,
-        route: input.intent.route,
-        scope: input.intent.scope,
-        seq: 0,
-        transcript_hash: "",
-        pre_state_hash: "",
-        post_state_hash: "",
-        accepted: false,
-        errors
-      }
-    }
-  };
+    scope: input.intent.scope,
+    route: input.intent.route,
+    error: input.error
+  });
   const envelope: ShadowEnvelope<ShadowTurnExecReply> = {
     v: 2,
     type: replyBody.kind,

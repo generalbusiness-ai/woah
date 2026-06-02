@@ -48,8 +48,10 @@ import {
 import { buildTransportErrorEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
 import {
   buildVerbThrewReplyEnvelope,
+  decodeTurnIntentCall,
   decodeTurnIntentForRecovery,
   executeDevV2DurableTurnFrame,
+  executeDevV2DurableTurnWsReply,
   materializeDevV2CommitLocally,
   resolveTurnEnvelopeRouting
 } from "./dev-v2-helpers";
@@ -719,6 +721,31 @@ async function handleV2ShadowFrame(
     const stateReply = handleShadowBrowserStateTransferEnvelope(turnBrowser, receipt);
     if (stateReply) {
       ws.send(encodeEnvelope(stateReply));
+      return;
+    }
+    // Durable turns go through the CF commit contract (sparse gateway →
+    // admission gate + repair loop → commit-scope envelope), reconstructing a
+    // socket-addressed reply with reply_to = the original intent id (the SPA
+    // drains on it). Live and undecodable turns stay on the legacy in-process
+    // browser-relay path. The durable reply is idempotent + write-through inside
+    // executeDevV2DurableTurnWsReply.
+    const durableCall = decodeTurnIntentCall(encoded, session.id, token);
+    if (durableCall && durableCall.persistence === "durable") {
+      const gatewayRelay = v2GatewayRelayForScope(durableCall.scope);
+      refreshDevV2RelaySessions(gatewayRelay, explicitRows);
+      ensureDevV2SerializedSession(gatewayRelay, session);
+      const { reply: wsReply } = await executeDevV2DurableTurnWsReply({
+        world,
+        gatewayRelay,
+        commitRelay: turnBrowser.relay,
+        browser: turnBrowser,
+        receipt,
+        call: durableCall,
+        node: `${turnBrowser.node}:exec`,
+        onMetric: emitDevMetric
+      });
+      ws.send(encodeEnvelope(wsReply));
+      sendDevV2Fanout(turnBrowser, wsReply);
       return;
     }
     const reply = await handleShadowBrowserTurnExecEnvelope(turnBrowser, receipt, { onMetric: emitDevMetric });

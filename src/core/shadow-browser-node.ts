@@ -1889,11 +1889,26 @@ function shadowBrowserTurnExecReplyEnvelope(
   request: ShadowTurnExecRequest,
   reply: ShadowTurnExecReply
 ): ShadowEnvelope<ShadowTurnExecReply> {
+  void request;
+  return shadowBrowserReplyEnvelopeForReceipt(browser, receipt, reply);
+}
+
+// Wrap a turn-exec reply BODY into a socket-addressed envelope for `browser`,
+// carrying `reply_to = receipt.envelope.id` (the original intent id the SPA
+// drains its pending-turn set on). Exported so a caller that produced the reply
+// through a different execution path (e.g. the dev sparse-gateway primitive,
+// whose own reply is addressed to internal nodes) can still hand the WS client a
+// correctly-addressed, correctly-correlated reply.
+export function shadowBrowserReplyEnvelopeForReceipt(
+  browser: ShadowBrowserNode,
+  receipt: ShadowBrowserEnvelopeReceipt,
+  reply: ShadowTurnExecReply
+): ShadowEnvelope<ShadowTurnExecReply> {
   const body = shadowBrowserWireTurnExecReply(reply);
   const envelope: ShadowEnvelope<ShadowTurnExecReply> = {
     v: 2,
     type: body.kind,
-    id: `${browser.relay.node}:reply:${request.id ?? request.call.id ?? receipt.envelope.id}`,
+    id: `${browser.relay.node}:reply:${reply.id ?? receipt.envelope.id}`,
     from: browser.relay.node,
     to: browser.node,
     actor: browser.actor,
