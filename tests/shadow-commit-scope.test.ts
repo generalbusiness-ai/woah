@@ -10,9 +10,12 @@ import {
   createShadowCommitScope,
   recordAcceptedCommitScopeCellProvenance,
   serializedFor,
+  shadowCommitScopeForTranscript,
+  shadowLocationCommitScopeForTranscript,
   transcriptTouchedObjectIds,
   type ShadowCommitAccepted
 } from "../src/core/shadow-commit-scope";
+import type { TranscriptCreate, TranscriptMove, TranscriptWrite } from "../src/core/effect-transcript";
 import { planningCellKey } from "../src/core/planning-world";
 import type { MetricEvent } from "../src/core/types";
 
@@ -395,3 +398,138 @@ function objectRecord(id: string, name: string, location: string | null, content
     eventSchemas: []
   };
 }
+
+// --- B6: write-set-derived commit scope selection -------------------------
+
+function selectionTranscript(parts: {
+  scope: string;
+  writes?: TranscriptWrite[];
+  moves?: TranscriptMove[];
+  creates?: TranscriptCreate[];
+  verb?: string;
+}): EffectTranscript {
+  return {
+    kind: "woo.effect_transcript.shadow.v1",
+    id: "b6-sel",
+    route: "sequenced",
+    scope: parts.scope,
+    seq: 0,
+    session: "session-1",
+    call: { actor: "actor", target: parts.scope, verb: parts.verb ?? "do", args: [], body: undefined },
+    reads: [],
+    writes: parts.writes ?? [],
+    creates: parts.creates ?? [],
+    moves: parts.moves ?? [],
+    observations: [],
+    logicalInputs: [],
+    untrackedEffects: [],
+    complete: true,
+    incompleteReasons: [],
+    hash: "transcript:b6-sel"
+  };
+}
+
+function locationWrite(object: string): TranscriptWrite {
+  return { cell: { kind: "location", object }, value: "room", op: "set" };
+}
+
+function propWrite(object: string, name = "p"): TranscriptWrite {
+  return { cell: { kind: "prop", object, name }, value: 1, op: "set" };
+}
+
+describe("B6 commit scope selection", () => {
+  it("relocation: a pure single-object move commits at the moved object's scope (CA3)", () => {
+    const transcript = selectionTranscript({
+      scope: "room",
+      verb: "enter",
+      moves: [{ object: "actor", from: "hall", to: "room" }],
+      writes: [locationWrite("actor")]
+    });
+    const selection = shadowCommitScopeForTranscript(transcript);
+    expect(selection.basis).toBe("relocation");
+    expect(selection.scope).toBe("actor");
+    expect(selection.owners).toEqual(["actor"]);
+  });
+
+  it("planning: a move plus a room-owned write commits at the planning scope", () => {
+    // `enter` that also stamps a roster prop on the room: the room is the single
+    // ordering authority that serializes the shared cell; the actor-location
+    // write rides along atomically.
+    const transcript = selectionTranscript({
+      scope: "the_outline",
+      verb: "enter",
+      moves: [{ object: "guest", from: "hall", to: "the_outline" }],
+      writes: [locationWrite("guest"), propWrite("the_outline", "roster")]
+    });
+    const selection = shadowCommitScopeForTranscript(transcript);
+    expect(selection.basis).toBe("planning");
+    expect(selection.scope).toBe("the_outline");
+    expect(new Set(selection.owners)).toEqual(new Set(["guest", "the_outline"]));
+  });
+
+  it("planning: a write set of only scope-owned props commits at the planning scope", () => {
+    const transcript = selectionTranscript({
+      scope: "the_outline",
+      verb: "add_item",
+      writes: [propWrite("the_outline", "items"), propWrite("the_outline", "rev")]
+    });
+    const selection = shadowCommitScopeForTranscript(transcript);
+    expect(selection.basis).toBe("planning");
+    expect(selection.scope).toBe("the_outline");
+  });
+
+  it("planning: object creation is owned by the minting (planning) scope", () => {
+    const transcript = selectionTranscript({
+      scope: "the_pinboard",
+      verb: "add_note",
+      writes: [locationWrite("note_1"), propWrite("note_1", "text")],
+      creates: [{ object: "note_1", name: "Note", parent: "$note", owner: "actor", anchor: null, location: "the_pinboard", flags: {} }]
+    });
+    const selection = shadowCommitScopeForTranscript(transcript);
+    // location:note_1 → owner note_1; prop + create → owner the_pinboard.
+    // Planning scope present → commit there (the room serializes the new object).
+    expect(selection.basis).toBe("planning");
+    expect(selection.scope).toBe("the_pinboard");
+  });
+
+  it("multi: two objects relocating with no shared-scope write is flagged multi-scope", () => {
+    const transcript = selectionTranscript({
+      scope: "room",
+      verb: "swap",
+      moves: [{ object: "item_a", from: "room", to: "bag" }, { object: "item_b", from: "bag", to: "room" }],
+      writes: [locationWrite("item_a"), locationWrite("item_b")]
+    });
+    const selection = shadowCommitScopeForTranscript(transcript);
+    expect(selection.basis).toBe("multi");
+    // Behavior preserved: commit at the planning scope until B8 route homes
+    // can prove a write crosses a home boundary (reject vs. mint).
+    expect(selection.scope).toBe("room");
+    expect(new Set(selection.owners)).toEqual(new Set(["item_a", "item_b"]));
+  });
+
+  it("contents writes are excluded from owner derivation (projection, off validation since A4)", () => {
+    const transcript = selectionTranscript({
+      scope: "room",
+      verb: "noop",
+      writes: [{ cell: { kind: "contents", object: "room" }, value: [], op: "set" }]
+    });
+    const selection = shadowCommitScopeForTranscript(transcript);
+    expect(selection.basis).toBe("planning");
+    expect(selection.scope).toBe("room");
+    expect(selection.owners).toEqual([]);
+  });
+
+  it("selector scope is identical to the legacy binary rule for every shape", () => {
+    const cases: EffectTranscript[] = [
+      selectionTranscript({ scope: "room", moves: [{ object: "actor", from: "h", to: "room" }], writes: [locationWrite("actor")] }),
+      selectionTranscript({ scope: "room", moves: [{ object: "actor", from: "h", to: "room" }], writes: [locationWrite("actor"), propWrite("room")] }),
+      selectionTranscript({ scope: "room", writes: [propWrite("room")] }),
+      selectionTranscript({ scope: "room", moves: [{ object: "a", from: "room", to: "bag" }, { object: "b", from: "bag", to: "room" }], writes: [locationWrite("a"), locationWrite("b")] }),
+      selectionTranscript({ scope: "room", writes: [] })
+    ];
+    for (const transcript of cases) {
+      const legacy = shadowLocationCommitScopeForTranscript(transcript) ?? transcript.scope;
+      expect(shadowCommitScopeForTranscript(transcript).scope).toBe(legacy);
+    }
+  });
+});

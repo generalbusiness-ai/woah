@@ -283,6 +283,48 @@ async function runWalkthrough(alice: LocalMcpSession, bob: LocalMcpSession): Pro
     await waitFor(bob, (obs) => obs.type === "said" && typeof obs.text === "string" && obs.text.includes(text));
   });
 
+  // B6 / CA14.3: two actors moving through the same destination concurrently
+  // must both commit independently (each at its own actor-location authority,
+  // off the room sequencer) and both retain membership — no lost destination
+  // membership, no read_version_mismatch. The CI ratchet in this file already
+  // fails on any read_version_mismatch; this step additionally proves both
+  // memberships survive a concurrent enter by requiring bidirectional delivery.
+  await step("B6: concurrent move through shared destination keeps both memberships", async () => {
+    // Both start co-located in the_chatroom (prior steps). Move both out to the
+    // shared the_deck concurrently, then back into the_chatroom concurrently.
+    await Promise.all([
+      alice.call("the_chatroom", "southeast", []),
+      bob.call("the_chatroom", "southeast", [])
+    ]);
+    await drain(alice);
+    await drain(bob);
+    // Read into fresh locals so each assertion sees the full room-name union
+    // (the getter would otherwise stay flow-narrowed across the awaits below).
+    const aliceAfterOut: string | null = alice.currentRoom;
+    const bobAfterOut: string | null = bob.currentRoom;
+    if (aliceAfterOut !== "the_deck" || bobAfterOut !== "the_deck") {
+      throw new Error(`expected both on the_deck after concurrent move; alice=${aliceAfterOut} bob=${bobAfterOut}`);
+    }
+    await Promise.all([
+      alice.call("the_deck", "west", []),
+      bob.call("the_deck", "west", [])
+    ]);
+    await drain(alice);
+    await drain(bob);
+    const aliceBack: string | null = alice.currentRoom;
+    const bobBack: string | null = bob.currentRoom;
+    if (aliceBack !== "the_chatroom" || bobBack !== "the_chatroom") {
+      throw new Error(`expected both back in the_chatroom; alice=${aliceBack} bob=${bobBack}`);
+    }
+    // Membership is intact iff each actor's utterance reaches the other.
+    const aliceText = `b6-concurrent-alice-${alice.runId}`;
+    await alice.call("the_chatroom", "say", [aliceText]);
+    await waitFor(bob, (obs) => obs.type === "said" && typeof obs.text === "string" && obs.text.includes(aliceText), 10_000);
+    const bobText = `b6-concurrent-bob-${bob.runId}`;
+    await bob.call("the_chatroom", "say", [bobText]);
+    await waitFor(alice, (obs) => obs.type === "said" && typeof obs.text === "string" && obs.text.includes(bobText), 10_000);
+  });
+
   await step("move:southeast emits `left` to bob (origin room)", async () => {
     await alice.call("the_chatroom", "southeast", []);
     await waitFor(bob, (obs) =>

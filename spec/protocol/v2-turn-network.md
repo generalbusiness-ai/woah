@@ -743,6 +743,56 @@ contents-as-projection). The materialization-miss requirement that the
 destination room be hydrated before its cells are read survives unchanged as
 VTN10.1.
 
+### VTN8.2 Commit scope chosen by the turn's write set
+
+> **Status: implemented** (the selection rule; route-home *enforcement* of
+> genuine multi-scope turns is deferred — see below). Spec for VTN0 claim 3.
+
+The commit scope is not a fixed home host. It is **derived from the turn's
+authoritative write set** as the smallest single ordering authority that makes
+those writes atomic. Define the authority owner of each authoritative write
+cell:
+
+- `location:<obj>` — owned by the moved object (`<obj>`). Location authority
+  follows the object (CA3 actor-anchored movement), so a relocation commits off
+  the room sequencer.
+- `prop:<obj>` / `verb:<obj>` / `lifecycle:<obj>`, and any object **creation** —
+  owned by the **planning scope** (the turn's active scope). This is the current
+  deployment's fixed-assignment realization of claim 3: the active scope owns the
+  shared and newly-minted cells reachable in the turn.
+- `contents:<obj>` — **excluded**. Since CA4/A4 it is a per-member projection off
+  the commit-validation path, never an authority cell.
+
+The selection over the distinct owner set is:
+
+| Write-set owners | Basis | Commit scope |
+|---|---|---|
+| exactly one object `X` (only its own `location` writes) | `relocation` | `X` (CA3, off the room) |
+| includes the planning scope (room write, creation, or move + room write) | `planning` | the planning scope |
+| ≥2 distinct **non-planning** owners (e.g. two objects relocating with no shared write) | `multi` | the planning scope *(provisional — see enforcement)* |
+
+The `relocation` and `planning` bases are the complete, exhaustive behavior of
+the shipped profile: every turn in the current catalogs reduces to one ordering
+authority. A `multi` turn is the genuine multi-scope case VTN0 claim 3 calls out
+("epoch fencing and explicit rules for multi-scope turns").
+
+**Enforcement of `multi` is deferred to ride on the route-home model (B8 /
+CA10.2).** The current substrate tracks no explicit per-cell home, so it cannot
+distinguish a benign same-scope multi-object move from a true cross-home one.
+Until route homes exist, a `multi` turn keeps the historical planning-scope
+commit and is emitted as a `commit_scope_multi` metric so the multi-scope rate
+is measurable. Once route homes can prove a write crosses a home boundary, a
+genuine cross-home turn MUST be resolved by one of: acquiring a combined/minted
+scope under an epoch fence, routing to a contested executor, or rejection as a
+**clean retryable conflict** (`CommitConflict.reason = "scope_mismatch"`) — never
+a silent accept that drops a cell's distinct authority.
+
+The selection is a single pure function of the effect transcript. Its
+`relocation`-owner sub-decision (the CA3 single-object case) is reused unchanged
+by the general selector, so the chosen commit scope is provably identical to the
+pre-B6 binary rule for every `relocation` and `planning` turn; only the `multi`
+classification and its observability metric are new.
+
 ## VTN9. Catch-up and applied frames
 
 Subscribers consume committed state through applied frames.

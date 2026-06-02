@@ -413,6 +413,70 @@ export function shadowLocationCommitScopeForTranscript(transcript: EffectTranscr
   return object;
 }
 
+// B6 (VTN0 claim 3 / VTN8.2): the commit scope is chosen by the turn's write
+// set, not by a fixed home host. `basis` records *why* a scope was chosen so the
+// decision is observable and so later phases (B7 transfer, B8 gossip) have a
+// stable selection contract to target.
+//
+//   - "relocation": the write set is purely one object's own location authority
+//     (the CA3 actor-anchored move). It commits at that object's scope, off the
+//     room sequencer (CA13.2) — this is `shadowLocationCommitScopeForTranscript`.
+//   - "planning":   the write set touches cells owned by the active/planning
+//     scope (room props, created-object lifecycle, or a move *plus* a room
+//     write). The planning scope is the single ordering authority that already
+//     serializes those cells; an actor-location write in the same turn rides
+//     along atomically. This is the common case.
+//   - "multi":      the write set reduces to two or more distinct *non-planning*
+//     owners (e.g. two objects relocating with no shared-scope write). This is
+//     the genuine multi-scope turn. The current substrate cannot yet tell a
+//     benign same-scope multi-move from a true cross-home one — that needs B8's
+//     route-home model — so we preserve the historical planning-scope commit and
+//     flag the turn for observability. Enforcement (clean retryable conflict vs.
+//     minted combined scope) lands once route homes exist to prove a write
+//     crosses a home boundary.
+export type ShadowCommitScopeBasis = "planning" | "relocation" | "multi";
+
+export type ShadowCommitScopeSelection = {
+  scope: ObjRef;
+  basis: ShadowCommitScopeBasis;
+  // Distinct authoritative-write owners under the B6 owner model: a `location`
+  // write is owned by the moved object; every other authoritative cell
+  // (prop/verb/lifecycle) and any object creation is owned by the planning
+  // scope. `contents` writes are excluded — they are per-member projections off
+  // the commit-validation path since A4.
+  owners: ObjRef[];
+};
+
+export function shadowCommitScopeForTranscript(
+  transcript: EffectTranscript,
+  planningScope: ObjRef = transcript.scope
+): ShadowCommitScopeSelection {
+  // The relocation owner is the load-bearing CA3 sub-decision; reuse it verbatim
+  // so the chosen scope is provably identical to the pre-B6 binary rule for
+  // every relocation turn.
+  const relocation = shadowLocationCommitScopeForTranscript(transcript);
+  if (relocation !== null) {
+    return { scope: relocation, basis: "relocation", owners: [relocation] };
+  }
+
+  const owners = new Set<ObjRef>();
+  for (const write of transcript.writes) {
+    if (write.cell.kind === "contents") continue; // projection, off validation (A4)
+    if (write.cell.kind === "location") owners.add(write.cell.object);
+    else owners.add(planningScope); // prop / verb / lifecycle on any object
+  }
+  if (transcript.creates.length > 0) owners.add(planningScope); // minting scope owns new lifecycle
+
+  const nonPlanning = Array.from(owners).filter((owner) => owner !== planningScope);
+  if (!owners.has(planningScope) && nonPlanning.length >= 2) {
+    // Genuine multi-scope write set. Behavior is preserved (commit at the
+    // planning scope) but the turn is flagged so the multi-scope rate is
+    // measurable before B8 wires real route-home enforcement.
+    return { scope: planningScope, basis: "multi", owners: Array.from(owners) };
+  }
+  return { scope: planningScope, basis: "planning", owners: Array.from(owners) };
+}
+
 function validateShadowPostState(reader: TranscriptCellReader, transcript: EffectTranscript): string[] {
   const errors: string[] = [];
   const finalWrites = finalWritesByCell(transcript);

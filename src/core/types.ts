@@ -327,6 +327,10 @@ export type MetricEvent =
   | { kind: "browser_activity"; phase: string; source: "v2_browser_worker" | "main"; scope?: ObjRef; node?: string; actor?: ObjRef; route?: string; method?: string; path?: string; what?: string; reason?: string; ms: number; status: "ok" | "error"; count?: number; bytes?: number; records?: number; transfer_mode?: string; executable_transfer_cache?: "hit" | "miss"; error?: string; error_detail?: string }
   | { kind: "rest_v2_in_process_fallback"; reason: "no_commit_scope"; scope: ObjRef; target: ObjRef; verb: string; route: "direct" | "sequenced"; persistence: "durable" | "live" }
   | { kind: "shadow_commit_accepted"; scope: ObjRef; seq: number; node?: string; id?: string; fanout?: number }
+  // B6: a turn whose write set reduced to two or more distinct non-planning
+  // authority owners (a genuine multi-scope turn). Emitted so the multi-scope
+  // rate is measurable before B8 route-home enforcement decides reject-vs-mint.
+  | { kind: "commit_scope_multi"; scope: ObjRef; owners: number; verb?: string }
   | { kind: "shadow_commit_rejected"; scope?: ObjRef; node?: string; id?: string; reason: string }
   | { kind: "v2_host_apply_fanout"; scope: ObjRef; hosts: number; touched: number; ms: number; status: "ok" | "error"; error?: string }
   | { kind: "mcp_fanout"; scope: ObjRef; shards: number; observations: number; affected_scopes?: number; scoped_shards?: number; audience_session_shards?: number; subscriber_shards?: number; local_suppressed?: boolean; origin_session?: string | null }

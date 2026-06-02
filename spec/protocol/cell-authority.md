@@ -102,6 +102,15 @@ The move's authority owner MAY change only through the general migration
 protocol (CA10); ordinary movement of an object between parents does **not**
 migrate the object's location authority — that authority follows the object.
 
+CA3 is the `relocation` case of the **general write-set-derived commit-scope
+selection** ([v2-turn-network.md §VTN8.2](v2-turn-network.md#vtn82-commit-scope-chosen-by-the-turns-write-set)).
+A pure single-object move (the write set is only that object's `location` cells)
+commits at the object's own scope, off the room sequencer. A turn that also
+writes a room-owned cell commits at the planning scope, which serializes that
+shared cell; the actor-location write rides along atomically. Conformance CA14.3
+(two actors entering one room both retain membership) is exercised concurrently
+by the `gate:authority` walkthrough's B6 step.
+
 ## CA4. Contents as a per-member projection
 
 Room (and container) contents are derived:
