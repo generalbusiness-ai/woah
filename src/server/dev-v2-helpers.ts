@@ -23,10 +23,28 @@
 // CommitScopeDO surface.
 
 import type { EffectTranscript } from "../core/effect-transcript";
-import { transcriptSessionActiveScope, transcriptTouchedObjectIds } from "../core/shadow-commit-scope";
-import { decodeEnvelope, type ShadowEnvelope, type ShadowEnvelopeAuth } from "../core/shadow-envelope";
+import { serializedFor, transcriptSessionActiveScope, transcriptTouchedObjectIds } from "../core/shadow-commit-scope";
+import { decodeEnvelope, encodeEnvelope, type ShadowEnvelope, type ShadowEnvelopeAuth } from "../core/shadow-envelope";
 import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
-import type { ObjRef } from "../core/types";
+import {
+  executorAuthorityPayload,
+  submitTurnIntent,
+  type ExecutorCallInput,
+  type ExecutorEnvelopeResult,
+  type SubmitTurnIntentResult
+} from "../core/executor";
+import {
+  markShadowBrowserRelaySerializedChanged,
+  mergeAuthorityIntoRelayCache,
+  type ShadowRelayCache
+} from "../core/shadow-relay-cache";
+import {
+  createShadowBrowserClient,
+  handleShadowBrowserTurnExecEnvelope,
+  receiveShadowBrowserEnvelopeReceipt
+} from "../core/shadow-browser-node";
+import type { PlanningAdmissibilityViolation } from "../core/planning-world";
+import type { MetricEvent, ObjRef } from "../core/types";
 import type { WooWorld } from "../core/world";
 
 const DEV_WORLD_HOST = "world";
@@ -60,6 +78,84 @@ export function materializeDevV2CommitLocally(
   for (const host of Array.from(hosts).sort()) {
     world.applyCommittedShadowTranscriptToHost(host, transcript, { gatewayHost: host === DEV_WORLD_HOST });
   }
+}
+
+export type DevV2GatewayClient = {
+  node: string;
+  relay: ShadowRelayCache;
+  nextTurn: number;
+};
+
+// In-process equivalent of the Cloudflare durable-turn contract (the worker's
+// restV2Turn → submitTurnIntent → CommitScopeDO chain), so localdev exercises the
+// SAME sparse/repair/admission/cross-scope machinery as cloud instead of the
+// full-world browser-relay shortcut. The chain:
+//   - Plan on a SPARSE `gatewayRelay` through `submitTurnIntent`: the
+//     PlanningWorld admission gate (enforceMissingProvenance) + the authority
+//     repair loop fire because the gateway does not hold the full world.
+//   - Commit through an in-process `submitEnvelope` that runs the CommitScopeDO
+//     `/v2/envelope` sequence (receiveShadowBrowserEnvelopeReceipt +
+//     handleShadowBrowserTurnExecEnvelope) on the AUTHORITATIVE `commitRelay`.
+// Authority for the repair loop is sourced from `world` (the local durable
+// authority), mirroring the worker's v2GatewayAuthorityPayload.
+export async function executeInProcessV2DurableTurn(input: {
+  world: WooWorld;
+  gatewayRelay: ShadowRelayCache;
+  commitRelay: ShadowRelayCache;
+  call: ExecutorCallInput;
+  node: string;
+  maxAttempts?: number;
+  onMetric?: (event: MetricEvent) => void;
+  onAdmissionViolation?: (violations: PlanningAdmissibilityViolation[]) => void;
+}): Promise<SubmitTurnIntentResult<DevV2GatewayClient, ExecutorEnvelopeResult>> {
+  const client: DevV2GatewayClient = { node: input.node, relay: input.gatewayRelay, nextTurn: 0 };
+  return submitTurnIntent<DevV2GatewayClient, ExecutorEnvelopeResult>({
+    input: input.call,
+    maxAttempts: input.maxAttempts ?? 8,
+    // The dev gateway relay is truly sparse (like the MCP gateway, unlike a warm
+    // CommitScopeDO-backed REST relay), so repair authority BEFORE planning and
+    // extract missing-object ids from planning-phase admission errors.
+    prePlanAuthority: true,
+    ensureClient: async () => {
+      // CF "open" head sync: plan against the commit scope's current head so the
+      // expected-head check at commit matches the authority's head.
+      client.relay.commit_scope.head = input.commitRelay.commit_scope.head;
+      return client;
+    },
+    clientNode: (c) => c.node,
+    clientHead: (c) => c.relay.commit_scope.head,
+    clientSerialized: (c) => serializedFor(c.relay.commit_scope, {
+      reason: "dev_turn_plan",
+      ...(input.onMetric ? { metric: input.onMetric } : {})
+    }),
+    clientPlanningProvenance: (c) => c.relay.commit_scope.cellProvenance ?? new Map(),
+    enforceMissingProvenance: true,
+    ...(input.onAdmissionViolation ? { onAdmissionViolation: input.onAdmissionViolation } : {}),
+    nextTurnId: (c) => `${c.node}:turn:${c.nextTurn++}`,
+    authorityPayload: (_scope, extraObjectIds) => executorAuthorityPayload(input.world, extraObjectIds),
+    applyAuthority: (c, authority) => {
+      mergeAuthorityIntoRelayCache(c.relay, authority, { preserveSessionActorLive: true, clone: true, reason: "dev_gateway_authority" });
+      markShadowBrowserRelaySerializedChanged(c.relay);
+    },
+    submitEnvelope: async (scope, body) => {
+      // In-process CommitScopeDO: apply the submitted authority slice to the
+      // authoritative commit relay, then run the turn through the same
+      // browser-relay machinery the worker's /v2/envelope handler uses.
+      mergeAuthorityIntoRelayCache(input.commitRelay, body.authority, { preserveSessionActorLive: true, clone: true, reason: "dev_commit_authority" });
+      const commitBrowser = createShadowBrowserClient({
+        node: input.node,
+        scope,
+        actor: input.call.actor,
+        session: input.call.session,
+        relay: input.commitRelay,
+        token: input.call.token
+      });
+      const receipt = receiveShadowBrowserEnvelopeReceipt(commitBrowser, body.envelope);
+      const reply = await handleShadowBrowserTurnExecEnvelope(commitBrowser, receipt, input.onMetric ? { onMetric: input.onMetric } : {});
+      return { reply: reply ? encodeEnvelope(reply) : null, head: input.commitRelay.commit_scope.head };
+    },
+    ...(input.onMetric ? { onMetric: input.onMetric } : {})
+  });
 }
 
 export function directAudienceForTarget(world: WooWorld, target: ObjRef): ObjRef | null {
