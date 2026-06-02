@@ -213,48 +213,6 @@ describe("v2 browser local turn planning", () => {
     });
   });
 
-  // Regression: a room's exits are anchored to the room (anchor=scope,
-  // location=null), so they are NOT in the room's `contents`. The open
-  // executable seed must still carry them, because `go`/`se`/direction verbs read
-  // the exit ref from the room's `exits` map and then call `exit_obj:invoke()`,
-  // which reads the exit's own lineage and source/dest cells. When the exit
-  // objects were omitted, the browser optimistic plan threw E_OBJNF ("object not
-  // found: exit_living_room_southeast") after the direction-verb bytecode was
-  // repaired, while server dispatch (which owns the whole anchor cluster) kept
-  // working — which is exactly why every server-dispatched smoke/integration move
-  // passed and the client `se` path was never covered.
-  it("open executable seed carries a room's anchored exits (lineage + source/dest)", () => {
-    const anchor = createWorld();
-    const session = anchor.auth("guest:v2-browser-exit-seed");
-    const relay = createShadowBrowserRelayShim({
-      node: "relay:exit-seed",
-      scope: "the_chatroom",
-      serialized: anchor.exportWorld()
-    });
-    const openTransfer = buildShadowBrowserOpenExecutableSeedTransfer(
-      relay,
-      "the_chatroom",
-      "browser:exit-seed",
-      session.actor
-    );
-    expect(openTransfer.mode).toBe("cell_pages");
-    if (openTransfer.mode !== "cell_pages") throw new Error("expected cell_pages open seed");
-    const pages = [...openTransfer.page_refs, ...openTransfer.inline_pages];
-    const hasCell = (object: string, page: string, name?: string): boolean =>
-      pages.some((p) => {
-        const rec = p as { object?: string; page?: string; name?: string };
-        return rec.object === object && rec.page === page && (name === undefined || rec.name === name);
-      });
-    // Both of the living room's exits travel — this is general to anchored
-    // objects, not a single hand-listed exit.
-    for (const exit of ["exit_living_room_southeast", "exit_living_room_south"]) {
-      expect(hasCell(exit, "object_lineage"), `${exit} lineage`).toBe(true);
-    }
-    // `:move` reads this.source / this.dest, so those property cells must be there.
-    expect(hasCell("exit_living_room_southeast", "property_cell", "source")).toBe(true);
-    expect(hasCell("exit_living_room_southeast", "property_cell", "dest")).toBe(true);
-  });
-
   it("preserves stale subscriber rows without authoring derived enter presence writes", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:v2-browser-local-outliner-scrub");

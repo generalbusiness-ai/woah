@@ -980,19 +980,6 @@ function shadowBrowserOpenExecutableSeedPreimages(serialized: SerializedWorld, s
   add(`target:${scope}`);
   if (actor) add(`actor:${actor}`);
   for (const id of byId.get(scope)?.contents ?? []) add(`target:${id}`);
-  // A scope's exits (and anything else anchored to it) are not in `contents`
-  // (anchor=scope, location=null). A `go`/`se`/direction verb reads the exit ref
-  // from the room's `exits` map and then calls `exit_obj:invoke()`, which needs
-  // the exit's own lineage and `source`/`dest`/message cells. Without them the
-  // browser plans the move locally against an absent object and fails optimistically
-  // with "object not found: exit_<room>_<dir>" (the server, owning the whole anchor
-  // cluster, succeeds — which is why server-dispatched smoke moves never caught it).
-  // Verb bytecode for the exit's class lineage arrives via the catalog cells below.
-  for (const obj of serialized.objects) {
-    if (obj.anchor !== scope) continue;
-    add(`target:${obj.id}`);
-    addOpenSeedObjectCells(obj, add);
-  }
 
   const scopeObj = byId.get(scope);
   const actorObj = actor ? byId.get(actor) : undefined;
@@ -1130,17 +1117,6 @@ function shadowBrowserOpenExecutableSeedSerialized(
   addWithLineage(scope);
   addWithLineage(actor);
   for (const content of byId.get(scope)?.contents ?? []) addWithLineage(content);
-  // A scope's exits — and anything else anchored to the scope — belong in its
-  // executable closure even though they are not in `contents` (an exit has
-  // anchor=scope, location=null, so the room's `contents` never lists it).
-  // Without the exit object's own cells the browser receives the room's `exits`
-  // map but cannot resolve `exit_obj:invoke()`, so `go`/`se`/direction verbs fail
-  // optimistically with "object not found: exit_<room>_<dir>" while the server —
-  // which owns the whole anchor cluster — succeeds. The host already owns the rows
-  // for its anchor cluster, so this seeds exactly the set the scope authority holds.
-  for (const obj of serialized.objects) {
-    if (obj.anchor === scope) addWithLineage(obj.id);
-  }
   for (const linked of openSeedLinkedObjectRefs(serialized, scope, actor)) addWithLineage(linked);
   return {
     version: serialized.version,
