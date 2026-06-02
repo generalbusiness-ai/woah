@@ -94,7 +94,12 @@ describe("dev v2 commit materialization", () => {
       repo.close();
       repo = new LocalSQLiteRepository(path);
       const reloaded = createWorld({ repository: repo });
-      expect(Array.from(reloaded.object("the_pinboard").contents)).toContain(pin);
+      // Post-A4 the note is placed by `moveto`, so its placement is the
+      // authoritative `live:location:<pin>` cell — the board's `contents` is a
+      // per-member projection assembled from member location cells, not a
+      // materialized cell maintained by movement. Assert the authoritative
+      // location and the durable note text survive the SQLite restart.
+      expect(reloaded.object(pin).location).toBe("the_pinboard");
       expect(reloaded.getProp(pin, "text")).toBe("durable dev pin");
     } finally {
       repo?.close();
@@ -102,7 +107,7 @@ describe("dev v2 commit materialization", () => {
     }
   });
 
-  it("merges host contents writes as deltas when materializing accepted commits", async () => {
+  it("materializes each entrant's actor-anchored location (contents is a per-member projection)", async () => {
     const world = createWorld();
     const first = world.auth("guest:dev-v2-contents-a");
     const second = world.auth("guest:dev-v2-contents-b");
@@ -133,8 +138,12 @@ describe("dev v2 commit materialization", () => {
     materializeDevV2CommitLocally(world, "the_pinboard", firstEnter.transcript);
     materializeDevV2CommitLocally(world, "the_pinboard", secondEnter.transcript);
 
-    const contents = Array.from(world.object("the_pinboard").contents);
-    expect(contents).toContain(first.actor);
-    expect(contents).toContain(second.actor);
+    // Post-A4 each enter commits the actor's own authoritative `live:location`
+    // cell (actor-anchored movement), and both entrants' commits materialize
+    // independently. Room membership is the per-member projection over those
+    // location cells, not a single mutable `contents` cell. Assert the
+    // authoritative locations both landed.
+    expect(world.object(first.actor).location).toBe("the_pinboard");
+    expect(world.object(second.actor).location).toBe("the_pinboard");
   });
 });
