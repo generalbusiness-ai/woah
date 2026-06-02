@@ -112,14 +112,21 @@ seeded SPARSE (bootstrap-only), distinct from the authoritative
 - `submitted` with null reply → throw E_INTERNAL (mirror CF).
 - commit_rejected reply → `restFrameFromTurnReply` throws; preserve.
 
-**WS (`handleV2ShadowFrame`) — the SUBTLE one:** the reply sent back over the
-socket carries a `reply_to` the SPA uses to drain `pendingNetworkTurns`. The
-primitive's `submitEnvelope` builds its OWN exec envelope internally, so the
-reply's `reply_to` would reference that exec envelope, NOT the original WS intent
-envelope id — the SPA would spin forever. The WS swap MUST re-thread the original
-receipt id onto the returned reply (or keep the reply derivation tied to the WS
-receipt). Test the SPA-drain contract (reply_to === original intent envelope id)
-before swapping WS. Until then WS stays on the existing path.
+**WS (`handleV2ShadowFrame`) — the SUBTLE one (NOT yet swapped; REST done at 52aefdc).**
+The reply sent back over the socket is a `ShadowEnvelope<ShadowTurnExecReply>`
+addressed to the WS client: `to: node`, `from: relay`, `auth: { session token }`,
+and crucially `reply_to` = the **original WS intent envelope id** (the SPA drains
+`pendingNetworkTurns` on it). The primitive's `submitEnvelope` builds its OWN exec
+envelope internally and returns a reply addressed to internal nodes with
+`reply_to` = that exec envelope — wrong addressing AND wrong reply_to for the WS
+client. So the WS swap must **reconstruct** the socket reply from
+`submitted.reply` (the body) + WS addressing + the original intent id, not forward
+`submitted.replyEnvelope`. Plus the WS path has the state-transfer
+(`handleShadowBrowserStateTransferEnvelope`) and cross-scope routing branches to
+preserve. **Gate before swapping:** a test asserting the WS-bound reply has
+`reply_to === original intent envelope id` and correct addressing (the SPA-drain
+contract), since a bug here hangs the live SPA's wait cursor. Until then WS stays
+on the existing browser-relay path.
 
 Keep `gate:authority` + `test:full` green throughout. Then items #2 (fanout) and
 #3 (write-through) refine the post-commit half toward CF's affected-scope/session
