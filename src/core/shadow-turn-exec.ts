@@ -20,6 +20,7 @@ import {
 } from "./shadow-turn-call";
 import type { ShadowCapabilityAd } from "./capability-ad";
 import {
+  selectCommitScopeForTranscript,
   serializedFor,
   shadowCommitScopeObject,
   shadowLocationCommitScopeForTranscript,
@@ -897,6 +898,12 @@ export async function executeShadowTurnCallOrNeedState(
   }
 
   const livePersistence = request.persistence === "live";
+  // B6: emit the multi-scope metric at this in-process/relay commit boundary so
+  // the basis/metric contract holds here too (covers the browser relay delegated
+  // path and the in-process network), not only at the gateway. The submit scope
+  // VALUE is chosen by commitScopeForTranscript below (relay sub-scope routing);
+  // this call single-sources the rule and the metric.
+  if (!livePersistence) selectCommitScopeForTranscript(run.transcript, run.transcript.scope, options.metric);
   const selectedCommitScope = !livePersistence
     ? options.commitScopeForTranscript?.(run.transcript) ?? options.commitScope
     : options.commitScope;

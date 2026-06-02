@@ -477,6 +477,30 @@ export function shadowCommitScopeForTranscript(
   return { scope: planningScope, basis: "planning", owners: Array.from(owners) };
 }
 
+// B6: the single boundary that turns a transcript into a commit-scope decision
+// AND emits the multi-scope observability metric. Every commit-scope decision
+// site (gateway executor, in-process/relay executor, browser planned-transcript
+// commit) routes through this so the basis/metric contract is enforced
+// uniformly, not only at the gateway. The chosen `scope` is identical to
+// `shadowCommitScopeForTranscript`; this wrapper only adds the `commit_scope_multi`
+// emission so callers don't each re-implement (and drift on) it.
+export function selectCommitScopeForTranscript(
+  transcript: EffectTranscript,
+  planningScope: ObjRef,
+  metric?: (event: MetricEvent) => void
+): ShadowCommitScopeSelection {
+  const selection = shadowCommitScopeForTranscript(transcript, planningScope);
+  if (selection.basis === "multi") {
+    metric?.({
+      kind: "commit_scope_multi",
+      scope: selection.scope,
+      owners: selection.owners.length,
+      verb: transcript.call?.verb
+    });
+  }
+  return selection;
+}
+
 function validateShadowPostState(reader: TranscriptCellReader, transcript: EffectTranscript): string[] {
   const errors: string[] = [];
   const finalWrites = finalWritesByCell(transcript);

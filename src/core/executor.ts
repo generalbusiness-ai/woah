@@ -34,7 +34,7 @@ import { runShadowTurnCallTranscript, type ShadowTurnCall, type ShadowTurnCallTr
 import { buildPlanningWorld, type PlanningAdmissibilityViolation, type PlanningWorldProvenance } from "./planning-world";
 import type { ShadowMissingAtom, ShadowTurnExecReply, ShadowTurnExecRequest } from "./shadow-turn-exec";
 import {
-  shadowCommitScopeForTranscript,
+  selectCommitScopeForTranscript,
   transcriptTouchedObjectIds,
   type ShadowScopeHead
 } from "./shadow-commit-scope";
@@ -536,16 +536,8 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     // differing commitScope drives the planned-transcript commit path below so
     // the authority replays the planned transcript rather than re-running the
     // verb in a foreign scope.
-    const commitSelection = shadowCommitScopeForTranscript(planned.transcript, key.scope);
+    const commitSelection = selectCommitScopeForTranscript(planned.transcript, key.scope, options.onMetric);
     const commitScope = commitSelection.scope;
-    if (commitSelection.basis === "multi") {
-      options.onMetric?.({
-        kind: "commit_scope_multi",
-        scope: commitScope,
-        owners: commitSelection.owners.length,
-        verb: planned.transcript.call?.verb
-      });
-    }
     const commitClient = commitScope === planningScope
       ? planningClient
       : await options.ensureClient(commitScope, attempt);

@@ -1670,9 +1670,19 @@ describe("shadow browser node shim", () => {
 
     expect(reply?.body).toMatchObject({
       ok: true,
-      state_transfer: { kind: "woo.state.transfer.shadow.v1", mode: "cell_pages", scope: "the_dubspace" },
+      // B7 / VTN12.1: the delegated commit reply is a warm cache-fill and MUST
+      // carry purpose accepted_write_cells — the browser worker's accepted-write
+      // high-watermark keys on it. The capsule head is the post-commit head.
+      state_transfer: {
+        kind: "woo.state.transfer.shadow.v1",
+        mode: "cell_pages",
+        scope: "the_dubspace",
+        purpose: "accepted_write_cells"
+      },
       ads: [expect.objectContaining({ node: "near-executor" })]
     });
+    const warm = reply?.body.ok ? reply.body.state_transfer : undefined;
+    expect(warm?.mode === "cell_pages" ? warm.capsule?.head.scope : undefined).toBe("the_dubspace");
     expect(worldFor(browser).getProp("delay_1", "wet")).toBe(0.37);
   });
 

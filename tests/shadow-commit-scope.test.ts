@@ -9,6 +9,7 @@ import {
   applyShadowTranscriptToIndexedState,
   createShadowCommitScope,
   recordAcceptedCommitScopeCellProvenance,
+  selectCommitScopeForTranscript,
   serializedFor,
   shadowCommitScopeForTranscript,
   shadowLocationCommitScopeForTranscript,
@@ -517,6 +518,35 @@ describe("B6 commit scope selection", () => {
     expect(selection.basis).toBe("planning");
     expect(selection.scope).toBe("room");
     expect(selection.owners).toEqual([]);
+  });
+
+  it("selectCommitScopeForTranscript emits commit_scope_multi only for a multi turn (shared boundary)", () => {
+    const multi = selectionTranscript({
+      scope: "room",
+      verb: "swap",
+      moves: [{ object: "item_a", from: "room", to: "bag" }, { object: "item_b", from: "bag", to: "room" }],
+      writes: [locationWrite("item_a"), locationWrite("item_b")]
+    });
+    const planning = selectionTranscript({ scope: "room", verb: "add_item", writes: [propWrite("room")] });
+    const relocation = selectionTranscript({
+      scope: "room",
+      verb: "enter",
+      moves: [{ object: "actor", from: "hall", to: "room" }],
+      writes: [locationWrite("actor")]
+    });
+
+    const events: MetricEvent[] = [];
+    const sink = (event: MetricEvent): void => { events.push(event); };
+
+    const multiSelection = selectCommitScopeForTranscript(multi, "room", sink);
+    expect(multiSelection.basis).toBe("multi");
+    expect(multiSelection.scope).toBe("room"); // same chosen scope as the bare selector
+    selectCommitScopeForTranscript(planning, "room", sink);
+    selectCommitScopeForTranscript(relocation, "room", sink);
+
+    const multiEvents = events.filter((event) => event.kind === "commit_scope_multi");
+    expect(multiEvents).toHaveLength(1);
+    expect(multiEvents[0]).toMatchObject({ kind: "commit_scope_multi", scope: "room", owners: 2, verb: "swap" });
   });
 
   it("selector scope is identical to the legacy binary rule for every shape", () => {

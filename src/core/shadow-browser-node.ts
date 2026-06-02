@@ -3,6 +3,8 @@ import {
   createShadowCommitScope,
   recordAcceptedCommitScopeCellProvenance,
   recordCommitScopeCellProvenance,
+  selectCommitScopeForTranscript,
+  shadowCommitScopeForTranscript,
   shadowLocationCommitScopeForTranscript,
   serializedFor,
   submitShadowCommit,
@@ -566,8 +568,12 @@ function noteShadowBrowserRelayCommitAccepted(relay: ShadowBrowserRelayShim): vo
 }
 
 function shadowBrowserRelayCommitScopeForTranscript(relay: ShadowBrowserRelayShim, transcript: EffectTranscript): ShadowCommitScope {
-  const locationScope = shadowLocationCommitScopeForTranscript(transcript);
-  return shadowBrowserRelayCommitScopeFor(relay, locationScope ?? transcript.scope);
+  // B6: relay commit-scope routing uses the same write-set selector as the
+  // gateway (the chosen scope is identical to the prior `relocation ?? planning`
+  // rule). No metric here — the delegated path emits commit_scope_multi at the
+  // shared in-process boundary (executeShadowTurnCallOrNeedState); the
+  // planned-transcript path emits it in commitBrowserPlannedTranscript.
+  return shadowBrowserRelayCommitScopeFor(relay, shadowCommitScopeForTranscript(transcript).scope);
 }
 
 function shadowBrowserRelayCommitScopeFor(relay: ShadowBrowserRelayShim, scope: ObjRef): ShadowCommitScope {
@@ -2029,17 +2035,25 @@ async function executeShadowBrowserTurnExecRequest(
       // let the browser plan the next related turn locally.
       const stateTransfer = buildShadowCellPageTransfer({
         serialized: serializedFor(browser.relay.commit_scope, { reason: "delegated_state_transfer" }),
-        key: request.key,
-        atom_hashes: request.key.atom_hashes,
+        // Describe the ACCEPTED closure (not the planned key) so the warm
+        // transfer matches the advertised accepted ad below and the core B7
+        // contract; recipient/known_page_hashes stay browser-specific.
+        key: acceptedKey,
+        atom_hashes: acceptedKey.atom_hashes,
         known_page_hashes: browser.execution_node.page_hashes,
         session: request.call.session,
+        // B7 / VTN12.1: this is the commit-reply warm cache-fill. The purpose is
+        // load-bearing — the browser worker's accepted-write high-watermark
+        // (acceptedWriteTransferHighWatermark) only counts cell_pages transfers
+        // tagged accepted_write_cells. Dropping it diverges from the B7 contract.
+        purpose: "accepted_write_cells",
         recipient: browser.node,
         capsule: {
           head: browser.relay.commit_scope.head,
-          actor: request.key.actor,
+          actor: acceptedKey.actor,
           session: request.call.session,
-          target: request.key.target,
-          verb: request.key.verb,
+          target: acceptedKey.target,
+          verb: acceptedKey.verb,
           recipient: browser.node
         }
       });
@@ -2080,6 +2094,10 @@ function commitShadowBrowserPlannedTranscript(
   if (stableShadowJson(actualKey as unknown as WooValue) !== stableShadowJson(request.key as unknown as WooValue)) {
     throw new Error("planned transcript key mismatch");
   }
+  // B6: the planned-transcript commit is a distinct commit boundary (it does not
+  // pass through executeShadowTurnCallOrNeedState), so emit the multi-scope
+  // metric here too.
+  selectCommitScopeForTranscript(transcript, transcript.scope, options.onMetric);
   const commitScope = shadowBrowserRelayCommitScopeForTranscript(browser.relay, transcript);
   const expected = request.expected?.scope === commitScope.scope ? request.expected : commitScope.head;
   const locationCommitScope = shadowLocationCommitScopeForTranscript(transcript);
