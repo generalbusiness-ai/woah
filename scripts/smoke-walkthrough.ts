@@ -164,6 +164,40 @@ async function runWalkthrough(sessions: SessionPair): Promise<void> {
     10_000, ctx.signal);
   });
 
+  // take/drop with cross-actor fanout: alice takes the mug, then drops it; bob,
+  // co-located in the_chatroom, must see both `taken` and `dropped` (the actor is
+  // excluded from those room broadcasts, so a peer is the right observer). This is
+  // the only walkthrough step that exercises take/drop at all — every other move
+  // dispatches a navigation verb, never an item pickup. Idempotent against the
+  // persistent prod world: the mug is taken from and dropped back into its home
+  // (the_chatroom) and neither actor moves, so reruns keep finding it here.
+  //
+  // NOTE: this is deliberately a SAME-ROOM take/drop. Carrying an item ACROSS a
+  // room boundary (take here, move, drop there) does not yet work on the
+  // distributed path — the carried object's cell authority stays in the source
+  // room's shard and is not migrated with the actor, so the destination shard
+  // reports "not carrying". That is the mobile-object-heap / cross-scope
+  // `contents` migration target, not a regression; add a cross-room carry step
+  // when that lands.
+  await smokeStep("take/drop: alice takes then drops the mug; bob in the room sees `taken` and `dropped`", async (ctx, { alice, bob }) => {
+    // Both co-located in the_chatroom after move:west; the mug lives here.
+    await alice.call("the_chatroom", "take", ["mug"], ctx.signal);
+    await waitFor(bob, (obs) =>
+      obs.type === "taken" && obs.actor === alice.actor && obs.item === "the_mug",
+    10_000, ctx.signal);
+    await drain(bob, ctx.signal);
+    // Drop returns the mug to its home room, keeping the step idempotent.
+    await alice.call("the_chatroom", "drop", ["mug"], ctx.signal);
+    await waitFor(bob, (obs) =>
+      obs.type === "dropped" &&
+      obs.actor === alice.actor &&
+      obs.item === "the_mug" &&
+      obs.room === "the_chatroom",
+    10_000, ctx.signal);
+    await drain(alice, ctx.signal);
+    await drain(bob, ctx.signal);
+  });
+
   // Tool-space tests: each tool space (pinboard, outliner, taskboard) is
   // mounted in a specific room. The MCP reachability gate hides the tool's
   // `enter` verb until the actor is physically in that room — `woo_focus`

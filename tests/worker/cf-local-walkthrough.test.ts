@@ -347,6 +347,21 @@ async function runWalkthrough(alice: LocalMcpSession, bob: LocalMcpSession): Pro
     10_000);
   });
 
+  // NOTE — take/drop is NOT yet exercised in this gated walkthrough, by design.
+  // The prod MCP smoke (scripts/smoke-walkthrough.ts) carries a same-room take/drop
+  // step (alice takes then drops the mug; bob sees `taken`/`dropped`). It is held
+  // out HERE because this gate also asserts `dangling_parent_ref == 0`, and a
+  // take/drop turn exposes a real gap in that family: the gateway-shard authority
+  // slice ships actor/thing support lineage but NOT the `$portable` catalog-class
+  // lineage of the item being acted on, so planning a `take` on a $portable object
+  // emits dangling_parent_ref (the turn still completes via authority repair and the
+  // cross-actor fanout is correct — only the zero-dangling guard fires). Add the
+  // step here once $portable (and the other contents-object catalog classes) reach
+  // the gateway-shard slice. Carrying an item ACROSS a room boundary is a further
+  // step still: the carried object's cell authority is not migrated with the actor,
+  // so the destination shard reports "not carrying" — the mobile-object-heap /
+  // cross-scope contents-migration target.
+
   await step("pinboard:add_note reaches peer", async () => {
     await alice.call("the_chatroom", "southeast", []);
     await bob.call("the_chatroom", "southeast", []);
