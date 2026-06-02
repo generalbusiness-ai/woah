@@ -463,11 +463,14 @@ function v2RelayForScope(scope: ObjRef): ShadowRelayCache {
       deployment: "local-dev"
     });
     v2RelaysByScope.set(scope, relay);
-    return relay;
   }
   // Dev mirrors the Worker/CommitScopeDO lifetime: one relay per commit scope,
-  // many browser sockets. Refresh the same authority slice the Worker sends
-  // to CommitScopeDO so local testing catches cross-scope drift.
+  // many browser sockets. Refresh the same authority slice the Worker sends to
+  // CommitScopeDO so local testing catches cross-scope drift. This runs on
+  // first create too: a fresh commit relay (e.g. the object-scope relay a B6
+  // relocation turn commits to) must have its session_auth built before the
+  // commit browser can authenticate, exactly as CF's ensureRestV2Relay warms
+  // the DO it opens.
   refreshDevV2RelaySessions(relay);
   return relay;
 }
@@ -586,19 +589,29 @@ async function devRestV2Turn(input: Parameters<NonNullable<RestProtocolHost["exe
   const token = shadowBrowserSessionBearer(input.session);
   const scope = input.scope;
   const node = `node:dev:rest:${input.id ?? randomUUID()}`;
-  const commitRelay = v2RelayForScope(scope);
-  ensureDevV2SerializedSession(commitRelay, input.session);
-  const gatewayRelay = v2GatewayRelayForScope(scope);
-  // Warm the gateway's session_auth + explicit scope/target/actor rows (parity
-  // with the worker's per-turn relay refresh); cells outside this set still
-  // repair through submitTurnIntent.
-  refreshDevV2RelaySessions(gatewayRelay, [scope, input.target, input.actor]);
-  ensureDevV2SerializedSession(gatewayRelay, input.session);
+  // Scope-aware relay resolvers, the dev analog of CF's ensureRestV2Relay /
+  // v2CommitScopePost: a relocation turn (B6) plans in `scope` but commits at
+  // the moved object's scope, so the primitive resolves — and warms — the
+  // gateway/commit relay for whatever scope it asks for. Warm the gateway with
+  // the explicit scope/target/actor rows (parity with the worker's per-turn
+  // relay refresh); cells outside this set still repair through submitTurnIntent.
+  const explicitRows: ObjRef[] = [scope, input.target, input.actor];
+  const gatewayRelayForScope = (s: ObjRef): ShadowRelayCache => {
+    const relay = v2GatewayRelayForScope(s);
+    refreshDevV2RelaySessions(relay, explicitRows);
+    ensureDevV2SerializedSession(relay, input.session);
+    return relay;
+  };
+  const commitRelayForScope = (s: ObjRef): ShadowRelayCache => {
+    const relay = v2RelayForScope(s);
+    ensureDevV2SerializedSession(relay, input.session);
+    return relay;
+  };
 
   const { frame, submitted } = await executeDevV2DurableTurnFrame({
     world,
-    gatewayRelay,
-    commitRelay,
+    gatewayRelayForScope,
+    commitRelayForScope,
     node,
     onMetric: emitDevMetric,
     call: {
@@ -731,13 +744,24 @@ async function handleV2ShadowFrame(
     // executeDevV2DurableTurnWsReply.
     const durableCall = decodeTurnIntentCall(encoded, session.id, token);
     if (durableCall && durableCall.persistence === "durable") {
-      const gatewayRelay = v2GatewayRelayForScope(durableCall.scope);
-      refreshDevV2RelaySessions(gatewayRelay, explicitRows);
-      ensureDevV2SerializedSession(gatewayRelay, session);
+      // Scope-aware resolvers (parity with CF + the REST path): the B6-selected
+      // commit scope may differ from the planning scope, so warm/resolve the
+      // gateway and commit relay per scope rather than binding turnBrowser.relay.
+      const durableGatewayForScope = (s: ObjRef): ShadowRelayCache => {
+        const relay = v2GatewayRelayForScope(s);
+        refreshDevV2RelaySessions(relay, explicitRows);
+        ensureDevV2SerializedSession(relay, session);
+        return relay;
+      };
+      const durableCommitForScope = (s: ObjRef): ShadowRelayCache => {
+        const relay = v2RelayForScope(s);
+        ensureDevV2SerializedSession(relay, session);
+        return relay;
+      };
       const { reply: wsReply } = await executeDevV2DurableTurnWsReply({
         world,
-        gatewayRelay,
-        commitRelay: turnBrowser.relay,
+        gatewayRelayForScope: durableGatewayForScope,
+        commitRelayForScope: durableCommitForScope,
         browser: turnBrowser,
         receipt,
         call: durableCall,

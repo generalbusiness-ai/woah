@@ -104,15 +104,25 @@ export type DevV2GatewayClient = {
 // authority), mirroring the worker's v2GatewayAuthorityPayload.
 export async function executeInProcessV2DurableTurn(input: {
   world: WooWorld;
-  gatewayRelay: ShadowRelayCache;
-  commitRelay: ShadowRelayCache;
+  // Scope-aware relay resolvers, mirroring CF's per-scope ensureRestV2Relay /
+  // v2CommitScopePost. A turn can PLAN in one scope and COMMIT in another (B6
+  // relocation moves the commit to the moved object's scope), so the primitive
+  // must resolve the gateway/commit relay for whatever scope submitTurnIntent
+  // asks for, not bind a single fixed pair. The resolvers are responsible for
+  // warming the relay they return (sessions/authority), exactly as CF's
+  // ensureRestV2Relay warms the DO it opens.
+  gatewayRelayForScope: (scope: ObjRef) => ShadowRelayCache;
+  commitRelayForScope: (scope: ObjRef) => ShadowRelayCache;
   call: ExecutorCallInput;
   node: string;
   maxAttempts?: number;
   onMetric?: (event: MetricEvent) => void;
   onAdmissionViolation?: (violations: PlanningAdmissibilityViolation[]) => void;
 }): Promise<SubmitTurnIntentResult<DevV2GatewayClient, ExecutorEnvelopeResult>> {
-  const client: DevV2GatewayClient = { node: input.node, relay: input.gatewayRelay, nextTurn: 0 };
+  // One gateway client per scope. submitTurnIntent calls ensureClient for the
+  // planning scope and again for the (possibly different) commit scope; each
+  // needs its own sparse gateway relay + turn counter.
+  const clients = new Map<ObjRef, DevV2GatewayClient>();
   return submitTurnIntent<DevV2GatewayClient, ExecutorEnvelopeResult>({
     input: input.call,
     maxAttempts: input.maxAttempts ?? 8,
@@ -120,10 +130,18 @@ export async function executeInProcessV2DurableTurn(input: {
     // CommitScopeDO-backed REST relay), so repair authority BEFORE planning and
     // extract missing-object ids from planning-phase admission errors.
     prePlanAuthority: true,
-    ensureClient: async () => {
+    ensureClient: async (scope) => {
+      const gatewayRelay = input.gatewayRelayForScope(scope);
+      let client = clients.get(scope);
+      if (!client) {
+        client = { node: input.node, relay: gatewayRelay, nextTurn: 0 };
+        clients.set(scope, client);
+      } else {
+        client.relay = gatewayRelay;
+      }
       // CF "open" head sync: plan against the commit scope's current head so the
       // expected-head check at commit matches the authority's head.
-      client.relay.commit_scope.head = input.commitRelay.commit_scope.head;
+      client.relay.commit_scope.head = input.commitRelayForScope(scope).commit_scope.head;
       return client;
     },
     clientNode: (c) => c.node,
@@ -142,21 +160,29 @@ export async function executeInProcessV2DurableTurn(input: {
       markShadowBrowserRelaySerializedChanged(c.relay);
     },
     submitEnvelope: async (scope, body) => {
-      // In-process CommitScopeDO: apply the submitted authority slice to the
-      // authoritative commit relay, then run the turn through the same
-      // browser-relay machinery the worker's /v2/envelope handler uses.
-      mergeAuthorityIntoRelayCache(input.commitRelay, body.authority, { preserveSessionActorLive: true, clone: true, reason: "dev_commit_authority" });
+      // In-process CommitScopeDO: resolve the commit relay for the B6-selected
+      // commit scope (which may differ from the planning scope), apply the
+      // submitted authority slice, then run the turn through the same
+      // browser-relay machinery the worker's /v2/envelope handler uses. The
+      // scope assertion is the dev analog of v2CommitScopePost routing to the
+      // CommitScopeDO whose id IS the scope: a mismatch means the resolver
+      // returned the wrong DO and the commit would land on the wrong head.
+      const commitRelay = input.commitRelayForScope(scope);
+      if (commitRelay.commit_scope.scope !== scope) {
+        throw wooError("E_INTERNAL", `dev commit relay scope mismatch: relay=${commitRelay.commit_scope.scope} envelope=${scope}`);
+      }
+      mergeAuthorityIntoRelayCache(commitRelay, body.authority, { preserveSessionActorLive: true, clone: true, reason: "dev_commit_authority" });
       const commitBrowser = createShadowBrowserClient({
         node: input.node,
         scope,
         actor: input.call.actor,
         session: input.call.session,
-        relay: input.commitRelay,
+        relay: commitRelay,
         token: input.call.token
       });
       const receipt = receiveShadowBrowserEnvelopeReceipt(commitBrowser, body.envelope);
       const reply = await handleShadowBrowserTurnExecEnvelope(commitBrowser, receipt, input.onMetric ? { onMetric: input.onMetric } : {});
-      return { reply: reply ? encodeEnvelope(reply) : null, head: input.commitRelay.commit_scope.head };
+      return { reply: reply ? encodeEnvelope(reply) : null, head: commitRelay.commit_scope.head };
     },
     ...(input.onMetric ? { onMetric: input.onMetric } : {})
   });
@@ -172,8 +198,8 @@ export async function executeInProcessV2DurableTurn(input: {
 // `devRestV2Turn` delegates to.
 export async function executeDevV2DurableTurnFrame(input: {
   world: WooWorld;
-  gatewayRelay: ShadowRelayCache;
-  commitRelay: ShadowRelayCache;
+  gatewayRelayForScope: (scope: ObjRef) => ShadowRelayCache;
+  commitRelayForScope: (scope: ObjRef) => ShadowRelayCache;
   call: ExecutorCallInput;
   node: string;
   onMetric?: (event: MetricEvent) => void;
@@ -256,9 +282,18 @@ export function decodeTurnIntentCall(encoded: string, sessionId: string, token: 
     const env = decodeEnvelope<{
       id?: unknown; route?: unknown; scope?: unknown; target?: unknown;
       verb?: unknown; args?: unknown; body?: unknown; persistence?: unknown;
+      selected_ad?: unknown;
     }>(encoded);
     if (env.type !== "woo.turn.intent.request.shadow.v1") return null;
     const b = env.body;
+    // A selected-ad intent (B8 gossip delegation: the browser pre-selected an
+    // executor ad on the wire body) must NOT be flattened into an
+    // ExecutorCallInput — the sparse-gateway primitive plans the turn locally
+    // and has no concept of a pre-selected executor, so the delegation would be
+    // silently dropped. Returning null routes the caller to the legacy
+    // handleShadowBrowserTurnExecEnvelope path, which honors selected_ad exactly
+    // as CF forwards the original encoded envelope to the CommitScopeDO.
+    if (typeof (b as { selected_ad?: unknown })?.selected_ad === "string") return null;
     // The call's actor is carried on the ENVELOPE (env.actor), not in the intent
     // body; scope/target/verb/args are in the body.
     const actor = typeof env.actor === "string" ? env.actor : null;
@@ -283,8 +318,8 @@ export function decodeTurnIntentCall(encoded: string, sessionId: string, token: 
 
 export type DevV2DurableWsReplyInput = {
   world: WooWorld;
-  gatewayRelay: ShadowRelayCache;
-  commitRelay: ShadowRelayCache;
+  gatewayRelayForScope: (scope: ObjRef) => ShadowRelayCache;
+  commitRelayForScope: (scope: ObjRef) => ShadowRelayCache;
   browser: ShadowBrowserNode;
   receipt: ShadowBrowserEnvelopeReceipt;
   call: ExecutorCallInput;
@@ -303,13 +338,16 @@ export async function executeDevV2DurableTurnWsReply(input: DevV2DurableWsReplyI
   // returns the cached WS reply WITHOUT re-executing — otherwise a retried
   // durable turn commits twice (a real regression for create verbs). Mirrors
   // handleShadowBrowserTurnExecEnvelope's recent_replies behavior, which the
-  // legacy dev WS path relied on.
+  // legacy dev WS path relied on. The cache lives on the WS-bound relay
+  // (browser.relay) — where the SPA's retries actually arrive and where the
+  // receipt's idempotency_key was minted — NOT on a commit relay (which the
+  // B6-selected commit scope may differ from for a relocation turn).
   if (!input.receipt.fresh) {
-    const cached = input.commitRelay.recent_replies.get(input.receipt.idempotency_key);
+    const cached = input.browser.relay.recent_replies.get(input.receipt.idempotency_key);
     if (cached) return { reply: structuredClone(cached) as ShadowEnvelope<ShadowTurnExecReply> };
   }
   const computed = await computeDevV2DurableTurnWsReply(input);
-  input.commitRelay.recent_replies.set(input.receipt.idempotency_key, structuredClone(computed.reply));
+  input.browser.relay.recent_replies.set(input.receipt.idempotency_key, structuredClone(computed.reply));
   return computed;
 }
 
@@ -319,8 +357,8 @@ async function computeDevV2DurableTurnWsReply(input: DevV2DurableWsReplyInput): 
   try {
     submitted = await executeInProcessV2DurableTurn({
       world: input.world,
-      gatewayRelay: input.gatewayRelay,
-      commitRelay: input.commitRelay,
+      gatewayRelayForScope: input.gatewayRelayForScope,
+      commitRelayForScope: input.commitRelayForScope,
       call: input.call,
       node: input.node,
       ...(input.onMetric ? { onMetric: input.onMetric } : {}),
