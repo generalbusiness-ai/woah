@@ -1324,12 +1324,13 @@ not advertise, or they advertise narrowly with a worse opaque `factor`.
 Candidate selection:
 
 ```text
-ad not expired
-ad.scope and ad.epoch match the TurnKey
-all TurnKey atoms are probably in ad.covers
-turn-shape atoms are probably in ad.accepts
-TurnKey effects are a subset of ad.effects
-rank by observed latency + ad.factor + estimated transfer cost + failure penalty
+ad not expired                                              # implemented (TTL)
+ad.scope match the TurnKey                                  # implemented
+ad.epoch match the TurnKey                                  # DEFERRED (see below)
+all TurnKey atoms are probably in ad.covers                 # implemented (Bloom)
+turn-shape atoms are probably in ad.accepts                 # implemented (Bloom)
+TurnKey effects are a subset of ad.effects                  # DEFERRED (see below)
+rank by observed latency + ad.factor + estimated transfer cost + failure penalty  # implemented
 ```
 
 Lower rank scores are better. `factor` is an opaque cost contribution, not a
@@ -1355,6 +1356,16 @@ preferred.
 > a fixed commit scope) is the highest-reach change and rides on smoke
 > validation, not the local gate. Until then the gossip layer is the in-process
 > router and the static route is the production bootstrap.
+>
+> **Deferred — epoch / effect-mask selection.** The two `# DEFERRED` predicate
+> lines above are specified but not yet implemented. The implemented `TurnKey`
+> carries no `epoch` or `effects` field, and the coverage predicate matches only
+> `scope` + Bloom coverage; `ad.effects` is always `0` today. The implemented
+> selector is: TTL freshness + scope match + Bloom `covers`/`accepts` coverage +
+> the routing score. Adding epoch/effect-mask selection requires defining the
+> effect-bit taxonomy and extracting it onto the key during TurnKey derivation
+> (plus an epoch token on the key), and is deferred with the production
+> route-table retirement.
 
 Ads are advisory. Commit receipts and state proofs are authoritative.
 

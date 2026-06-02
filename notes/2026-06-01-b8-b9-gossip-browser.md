@@ -62,10 +62,30 @@ typecheck clean; `npm test` 306/306; `gate:authority` 2/2; browser-node suite
 56/56; spec guard green (no "shadow" token in the v2 spec). Comprehensive local
 smoke: `npm run test:full` + `npm run smoke:cf-local` (recorded at session end).
 
-## Phase B status
+## Phase B status — NOT complete; B10 is BLOCKED
 
-B6–B9 landed (the distinguishing claims 3–5 + browser node). Remaining: **B10**
-(retire the compensating mechanisms — preplan-authority pre-step, the
-checkpoint→catch-up→repair→seed ladder, the static route table) once the deferred
-production wirings (B7 install, B8 route-table retirement) are validated by smoke
-and promoted from in-process to the deployed worker path.
+Be precise about what this branch is: a **solid B6/B7 base** (production-relevant
+substrate: write-set commit-scope selection, warm cache-fill, closure retirement)
+**plus a B8/B9 local + spec slice**. It is **not** a finished Phase B base.
+
+The canonical plan (`notes/2026-06-01-a0-a1-landed.md`) defines B8 as *retiring the
+static route table behind gossip* and B10 as *deleting the compensating
+mechanisms once B6–B9 hold*. Two production wirings are explicitly **deferred**
+and are therefore **not done**:
+
+- **B8 — production static-route retirement.** The deployed worker gateway still
+  submits to a statically-selected commit scope; gossip ranking is load-bearing
+  only on the in-process/relay + browser-delegation paths. The static route table
+  is **not** retired in production.
+- **B7 — production warm-transfer install.** The authoritative reply carries the
+  verifiable warm transfer, but the deployed MCP/REST gateway does not yet install
+  it into its relay client (the install target should be the B8 gossip-selected
+  node).
+
+**Therefore B10 is blocked.** B10 deletes scaffolding (preplan-authority pre-step,
+the checkpoint→catch-up→repair→seed ladder, the static route table) — but those
+only become safe to delete once B8/B7's production wirings replace them on the
+deployed path and a real Cloudflare smoke validates it. Deleting them now would
+remove the mechanisms still carrying production. The next step is **not** B10; it
+is promoting the two deferred wirings to the worker path and smoke-validating
+them.

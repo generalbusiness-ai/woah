@@ -107,6 +107,21 @@ export function rankCapabilityAdsForTurn(
     .sort((a, b) => capabilityAdRoutingScore(a) - capabilityAdRoutingScore(b) || a.node.localeCompare(b.node));
 }
 
+// B8 scope-level routing: a cold caller without an exact TurnKey ranks ads for a
+// scope. It uses the SAME freshness (TTL) and routing-score discipline as the
+// exact-key path — only the per-atom Bloom coverage check is dropped (there is
+// no key yet). The selected executor still proves exact coverage by executing or
+// returning missing_state.
+export function rankCapabilityAdsForScope(
+  ads: ShadowCapabilityAd[],
+  scope: ObjRef,
+  options?: { now?: number }
+): ShadowCapabilityAd[] {
+  return ads
+    .filter((ad) => ad.scope === scope && !capabilityAdExpired(ad, options?.now))
+    .sort((a, b) => capabilityAdRoutingScore(a) - capabilityAdRoutingScore(b) || a.node.localeCompare(b.node));
+}
+
 function buildBloom(atomHashes: string[], m: number, k: number): ShadowBloomFilter {
   const bytes = new Uint8Array(Math.ceil(m / 8));
   for (const atomHash of atomHashes) {
