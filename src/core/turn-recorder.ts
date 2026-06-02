@@ -47,6 +47,12 @@ export type TurnRecorderEvent =
   | { kind: "prop_write"; object: ObjRef; name: string; hadValue: boolean; before?: WooValue; after: WooValue; changed: boolean; beforeVersion?: number | string; afterVersion?: number | string; writer?: RecordedWriteAuthority }
   | { kind: "object_create"; object: ObjRef; name: string; parent: ObjRef | null; owner: ObjRef; anchor: ObjRef | null; location: ObjRef | null; flags: WooObject["flags"]; writer?: RecordedWriteAuthority }
   | { kind: "object_move"; object: ObjRef; from: ObjRef | null; to: ObjRef; writer?: RecordedWriteAuthority }
+  // A session's active scope changed (the actor entered/left a space). This is a
+  // first-class routing/presence effect, distinct from the physical
+  // `object_move`: it is recorded even when the actor's physical location does
+  // not change (a no-op enter while already in the room), and it drives the live
+  // presence projections + session-row materialization. See cell-authority CA8.
+  | { kind: "session_scope"; session: string; actor: ObjRef; from: ObjRef | null; to: ObjRef | null }
   | { kind: "projection_write"; write: RecordedProjectionWrite }
   | { kind: "observe"; observation: Observation }
   | { kind: "dispatch"; target: ObjRef; verb: string; startAt?: ObjRef | null; definer: ObjRef; implementation: "bytecode" | "native"; owner: ObjRef; version?: number; source_hash?: string; direct_callable?: boolean; native?: string }

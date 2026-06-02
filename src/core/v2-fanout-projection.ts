@@ -43,6 +43,13 @@ export function affectedTranscriptScopes(scope: ObjRef, transcript: EffectTransc
     add(move.from);
     add(move.to);
   }
+  // CA8: a session active-scope transition affects the source/destination rooms'
+  // presence projections even when there is no physical move (a no-op enter), so
+  // co-present peers on those rooms' shards still receive the fanout.
+  if (transcript.sessionScopeTransition) {
+    add(transcript.sessionScopeTransition.from);
+    add(transcript.sessionScopeTransition.to);
+  }
   for (const create of transcript.creates) {
     add(create.location);
   }

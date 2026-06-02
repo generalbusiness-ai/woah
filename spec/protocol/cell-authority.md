@@ -236,6 +236,36 @@ globally promote movement to room-anchored.
 
 ## CA8. Live delivery and transitive presence
 
+Two distinct accepted-transcript effects drive distinct projections. A physical
+`object_move` (the actor's `live:location` write) drives **containment**
+projections (`object.contents`). A first-class **session active-scope
+transition** drives **presence** projections (the session/actor subscriber lists)
+and session-row materialization. Presence is keyed by *session placement*, not
+physical containment, so the transition is recorded whenever a session's active
+scope changes — **including a no-op physical enter** (the actor was already in the
+room) — and its reliable `from`/`to` replace a possibly-sparse move's `from`:
+
+```ts
+type SessionScopeTransition = {
+  session: string;
+  actor: ObjRef;
+  from: ObjRef | null;
+  to: ObjRef | null;
+};
+```
+
+The transition is **implemented** (`TranscriptSessionScopeTransition` on the
+effect transcript): recorded by the substrate on every active-scope change,
+carried in the transcript hash, included in affected fanout scopes and projection
+write-through, and applied by every materializer (indexed commit-scope state,
+per-host object slice, in-place gateway). It is validation-exempt from CA3
+object-cell write authority (routing/presence state, not an authoritative cell)
+but **not** trust-exempt: it is validated structurally (it must name the turn's
+session and actor, and its `from` must agree with authoritative session pre-state
+where locally knowable). A move alone no longer drives presence; presence
+projections are recomputed per-shard from the transition, so a peer's partial
+whole-row snapshot can never clobber another shard's disjoint presence rows.
+
 A movement commit emits a durable movement event carrying enough for both
 projection owners and gateway session tables:
 
@@ -254,7 +284,11 @@ type MovementCommitted = {
 - Live routing MUST use the VTN12/VTN13 session/audience table, not Directory
   `current_location` as the hot-path fanout key. The movement event is precisely
   the change that invalidates location-derived routing, so routing MUST NOT
-  depend on a globally consistent current-location read at fanout time.
+  depend on a globally consistent current-location read at fanout time. The
+  audience for a space is therefore the live sessions whose `activeScope` equals
+  that space (the session table), unioned with the durable presence projection
+  for back-compat — a session born in its home room with no enter turn is present
+  via the session table even though no transition ever wrote its projection row.
 - **Transitive presence** (a player inside a vehicle inside a room) MUST be
   resolved through the session table's cached effective-room, updated on
   movement, NOT by walking `live:location` cells across homes per delivered
