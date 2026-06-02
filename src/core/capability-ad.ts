@@ -8,6 +8,16 @@ export type ShadowBloomFilter = {
   bits_hex: string;
 };
 
+// The transitional realization of the normative `ExecCapabilityAd`
+// (`woo.exec.ad.v1`, spec/protocol/v2-turn-network.md §VTN11). Field mapping for
+// the next reader: `kind` is the browser-migration spelling; `epoch` is the
+// scope GENERATION and `head` the value-version hash (together they pin the
+// normative `ScopeHead`, whose `seq` is not needed for routing); `covers`/
+// `accepts` use hex `bits_hex` rather than base64url `bits`; `expires_at` is
+// carried as the `issued_at_ms` + `ttl_ms` pair below; and the `ad` id is
+// computed at the persistence layer (`v2ExecutionAdId`), not stored here. The
+// spec permits each of these representations; the direction of travel is toward
+// the normative kind.
 export type ShadowCapabilityAd = {
   kind: "woo.exec_capability_ad.shadow.v1";
   node: string;

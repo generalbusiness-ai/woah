@@ -1162,6 +1162,21 @@ type ExecCapabilityAd = {
 };
 ```
 
+`expires_at` is freshness metadata. An implementation MAY transmit it as an
+absolute timestamp or as an equivalent `issued_at` + `ttl` pair; the two carry
+the same meaning and a consumer evaluating freshness against a clock MUST drop
+the ad once it has expired. Freshness is OPTIONAL for in-process/test ads that do
+not stamp time, but any ad that is gossiped or persisted — in particular the
+scope-open cold-start ad below — MUST carry it, so that a stale ad (for example
+one naming an executor reachable only on a prior connection) cannot remain
+selectable across reconnects. The B8 ranking score adds optional `latency_ms`,
+`transfer_cost`, and `failure_penalty` cost components to `factor`
+(`latency_ms + factor + transfer_cost + failure_penalty`); all default to 0, so
+an ad that sets only `factor` ranks as before. An implementation MAY carry `head`
+as the value-version hash alone when `scope` and `epoch` already pin the rest of
+the `ScopeHead`, and MAY compute the `ad` id at its persistence layer rather than
+storing it on the ad object.
+
 During the browser migration, a relay MAY also accept, behind an explicit
 compatibility flag,
 `woo.turn.intent.request.v1` from a browser node. The intent contains `id`,

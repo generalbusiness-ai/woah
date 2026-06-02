@@ -1178,10 +1178,25 @@ function serializedFeatureRefs(obj: SerializedObject): ObjRef[] {
   return value.filter((item): item is ObjRef => typeof item === "string");
 }
 
-export function shadowBrowserScopeExecutionAds(relay: ShadowBrowserRelayShim, scope: ObjRef): ShadowCapabilityAd[] {
+// A scope ad is re-emitted on every scope open, then gossiped to and persisted
+// by browser nodes and read back on the cold delegation fallback via
+// allExecutionAds(). Without a TTL a stale scope ad — e.g. one naming an executor
+// node id from a prior connection — would stay selectable indefinitely across
+// reconnects. Five minutes is comfortably longer than the reconnect cadence that
+// refreshes the ad, and warm local execution never depends on it, so the TTL only
+// ever expires genuinely stale hints.
+const SHADOW_SCOPE_AD_TTL_MS = 5 * 60_000;
+
+export function shadowBrowserScopeExecutionAds(
+  relay: ShadowBrowserRelayShim,
+  scope: ObjRef,
+  now: number = Date.now()
+): ShadowCapabilityAd[] {
   // A scope ad is a cold-start routing hint only. Its empty Bloom filters are
   // intentionally unusable for exact-key local delegation; after relay-side
   // planning, the selected executor still has to execute or return missing_state.
+  // It carries issued_at_ms/ttl_ms in the same Date.now() domain the routing
+  // reader (selectV2DelegatedScopeExecutor) passes, so freshness is enforced.
   return [buildShadowScopeTurnExecAd({
     node: shadowRelayDefaultExecutorNode(relay),
     scope,
@@ -1189,7 +1204,9 @@ export function shadowBrowserScopeExecutionAds(relay: ShadowBrowserRelayShim, sc
     // them distinct. (The prior code put head.hash in epoch.)
     epoch: String(relay.commit_scope.head.epoch),
     head: relay.commit_scope.head.hash,
-    factor: 1
+    factor: 1,
+    issued_at_ms: now,
+    ttl_ms: SHADOW_SCOPE_AD_TTL_MS
   })];
 }
 

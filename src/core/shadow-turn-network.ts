@@ -60,6 +60,11 @@ export function buildShadowScopeTurnExecAd(input: {
   epoch?: string;
   head?: string;
   factor?: number;
+  // A scope ad is gossiped and persisted, then read on the cold delegation
+  // fallback; without freshness it would stay selectable forever. The emitter
+  // stamps issued_at_ms/ttl_ms so the routing reader can expire a stale hint.
+  issued_at_ms?: number;
+  ttl_ms?: number;
 }): ShadowCapabilityAd {
   return buildShadowCapabilityAd({
     node: input.node,
@@ -68,7 +73,9 @@ export function buildShadowScopeTurnExecAd(input: {
     ...(input.head !== undefined ? { head: input.head } : {}),
     atom_hashes: [],
     accepts_atom_hashes: [],
-    factor: input.factor
+    factor: input.factor,
+    ...(input.issued_at_ms !== undefined ? { issued_at_ms: input.issued_at_ms } : {}),
+    ...(input.ttl_ms !== undefined ? { ttl_ms: input.ttl_ms } : {})
   });
 }
 

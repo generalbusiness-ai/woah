@@ -39,6 +39,7 @@ import {
   type ShadowBrowserNode,
   type ShadowLiveEvent
 } from "../src/core/shadow-browser-node";
+import { rankCapabilityAdsForScope } from "../src/core/capability-ad";
 import { hashSource } from "../src/core/source-hash";
 import type { MetricEvent, ObjRef, WooValue } from "../src/core/types";
 import type { SerializedObject } from "../src/core/repository";
@@ -1933,6 +1934,33 @@ describe("shadow browser node shim", () => {
     expect(worldFor(b).getProp("delay_1", "wet")).toBe(0.42);
     expect(serializedFor(relay.commit_scope).objects.find((o) => o.id === "delay_1")
       ?.properties.find(([name]) => name === "wet")?.[1]).toBe(0.42);
+  });
+
+  // Regression: a scope ad is a cold-start routing hint that gets gossiped and
+  // persisted, then read back via allExecutionAds() on the cold delegation
+  // fallback. It MUST carry freshness — without issued_at_ms/ttl_ms a stale ad
+  // (e.g. one naming an executor node id from a prior connection) stays
+  // selectable indefinitely across reconnects, because capabilityAdExpired only
+  // drops ads that stamp both fields. Pin that the emitter stamps a TTL in the
+  // same Date.now() domain the routing reader uses, and that expiry is enforced.
+  it("scope ad carries a TTL so a stale hint is dropped by the routing reader", () => {
+    const relay = createShadowBrowserRelayShim({
+      node: "ttl-relay", scope: "the_dubspace", serialized: createWorld().exportWorld()
+    });
+    const issuedAt = 1_000_000;
+    const ads = shadowBrowserScopeExecutionAds(relay, "the_dubspace", issuedAt);
+    expect(ads).toHaveLength(1);
+    const [ad] = ads;
+    // Freshness fields are present and stamped in the supplied clock domain.
+    expect(ad.issued_at_ms).toBe(issuedAt);
+    expect(ad.ttl_ms).toBeGreaterThan(0);
+
+    // Fresh and just-before-expiry: the ad routes. Past issued_at_ms + ttl_ms:
+    // the reader drops it (whereas before the fix, with no TTL, it never expired).
+    const ttl = ad.ttl_ms!;
+    expect(rankCapabilityAdsForScope(ads, "the_dubspace", { now: issuedAt }).map((a) => a.node)).toEqual([ad.node]);
+    expect(rankCapabilityAdsForScope(ads, "the_dubspace", { now: issuedAt + ttl }).map((a) => a.node)).toEqual([ad.node]);
+    expect(rankCapabilityAdsForScope(ads, "the_dubspace", { now: issuedAt + ttl + 1 }).map((a) => a.node)).toEqual([]);
   });
 });
 
