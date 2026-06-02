@@ -89,8 +89,9 @@ import {
   affectedBrowserFanoutScopes,
   affectedMcpFanoutScopes,
   affectedTranscriptScopes,
-  shadowLiveEventMatchesPeerScope,
-  withComputedLiveAudience
+  buildV2FanoutLiveEvents,
+  planV2BrowserFanout,
+  shadowLiveEventMatchesPeerScope
 } from "../core/v2-fanout-projection";
 import { runShadowApply, type ShadowApplyTarget } from "../core/v2-shadow-apply";
 import {
@@ -5076,27 +5077,32 @@ export class PersistentObjectDO {
     if (sockets.length === 0) return;
     const audiences = await world.computeDirectLiveAudiences(commitScope, observations);
     const eventTranscript = { ...reply.transcript, observations } as EffectTranscript;
-    const events = shadowLiveEventsForTranscriptRelay(from, eventTranscript)
-      .map((event, index) => withComputedLiveAudience(
-        event,
-        audiences.observationAudiences?.[index] ?? [],
-        audiences.observationSessionAudiences?.[index] ?? []
-      ))
-      .filter((event): event is ShadowLiveEvent => event !== null);
+    // Recipient routing is the shared `planV2BrowserFanout` decision (also used
+    // by localdev) so the two paths cannot drift: a peer receives events its
+    // (session, actor, scope) matches, and a commit-scope peer also re-syncs its
+    // projection. Projection transfers are scoped to the relay head that signs
+    // them; peer scopes receive live events only until their own scope DO can
+    // build a self-consistent catch-up transfer.
+    const events = buildV2FanoutLiveEvents(from, eventTranscript, audiences);
     const affectedScopes = new Set(affectedBrowserFanoutScopes(commitScope, reply.transcript, (object, property) => world.isPresenceProjectionProperty(object, property)));
     if (events.length === 0 && affectedScopes.size === 0) return;
-    const stateTargets = new Map<string, { ws: WebSocket; att: ActiveV2SocketAttachment }>();
-    for (const { ws, att } of sockets) {
-      if (att.node === originNode || alreadyDeliveredNodes.has(att.node)) continue;
-      const matching = events.filter((event) => shadowLiveEventMatchesPeerScope(event, att));
-      // Projection transfers are scoped to the relay head that signs them. Peer
-      // scopes receive live events only until their own scope DO can build a
-      // self-consistent catch-up transfer.
-      if (att.scope === commitScope) stateTargets.set(att.node, { ws, att });
-      if (matching.length === 0) continue;
-      for (const event of matching) this.sendV2LiveEvent(ws, att, from, event);
+    const socketByNode = new Map(sockets.map(({ ws, att }) => [att.node, { ws, att }] as const));
+    const plan = planV2BrowserFanout({
+      events,
+      commitScope,
+      peers: sockets.map(({ att }) => ({ node: att.node, sessionId: att.sessionId, actor: att.actor, scope: att.scope })),
+      originNode,
+      alreadyDeliveredNodes
+    });
+    for (const { node, events: peerEvents } of plan.liveDeliveries) {
+      const entry = socketByNode.get(node);
+      if (!entry) continue;
+      for (const event of peerEvents) this.sendV2LiveEvent(entry.ws, entry.att, from, event);
     }
-    await Promise.all(Array.from(stateTargets.values(), ({ ws, att }) => this.sendV2ProjectionStateTransfer(world, ws, att, commitScope, from)));
+    await Promise.all(plan.stateTransferNodes.map((node) => {
+      const entry = socketByNode.get(node);
+      return entry ? this.sendV2ProjectionStateTransfer(world, entry.ws, entry.att, commitScope, from) : Promise.resolve();
+    }));
   }
 
   private sendV2LiveEvent(ws: WebSocket, att: V2SocketAttachment, from: string, event: ShadowLiveEvent): void {

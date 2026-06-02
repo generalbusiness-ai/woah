@@ -36,10 +36,10 @@ import {
   receiveShadowBrowserEnvelopeReceipt,
   shadowBrowserSessionBearer,
   shadowBrowserSessionClaimsValue,
-  shadowLiveEventMatchesBrowser,
-  shadowLiveEventsForTranscript,
-  shadowBrowserTransportHello
+  shadowBrowserTransportHello,
+  type ShadowLiveEvent
 } from "../core/shadow-browser-node";
+import type { V2FanoutPeer } from "../core/v2-fanout-projection";
 import {
   markShadowBrowserRelaySerializedChanged,
   mergeAuthorityIntoRelayCache,
@@ -53,10 +53,11 @@ import {
   executeDevV2DurableTurnFrame,
   executeDevV2DurableTurnWsReply,
   materializeDevV2CommitLocally,
+  planDevV2BrowserFanout,
   resolveTurnEnvelopeRouting
 } from "./dev-v2-helpers";
 import { stableShadowJson } from "../core/shadow-cell-version";
-import { serializedFor, type ShadowCommitAccepted } from "../core/shadow-commit-scope";
+import { serializedFor } from "../core/shadow-commit-scope";
 import { parseShadowScopeHeadJson } from "../core/shadow-scope-head";
 import {
   encodeExecutorIntentEnvelope,
@@ -83,6 +84,12 @@ const v2RelaysByScope = new Map<ObjRef, ShadowRelayCache>();
 // executeInProcessV2DurableTurn.
 const v2GatewayRelaysByScope = new Map<ObjRef, ShadowRelayCache>();
 const v2SocketsByNode = new Map<string, WebSocket>();
+// All connected v2 browser nodes, keyed by node. Browser fanout iterates this
+// (NOT a single commit-scope relay's subscriptions) so it can route each
+// transcript observation to co-present peers across EVERY scope — the localdev
+// single-process equivalent of the worker's per-DO + cross-shard delivery. Each
+// browser's `scope` is its bound "shard" (the room it is viewing).
+const v2BrowsersByNode = new Map<string, ReturnType<typeof createShadowBrowserClient>>();
 const mcpGateway = new McpGateway(world, {
   serverName: "woo-dev",
   broadcasts: {
@@ -304,6 +311,7 @@ v2wss.on("connection", (ws, req) => {
   const browser = v2ShadowBrowser(node, token, session, scope || session.actor);
   ensureDevV2SerializedSession(browser.relay, session);
   v2SocketsByNode.set(browser.node, ws);
+  v2BrowsersByNode.set(browser.node, browser);
   const hello = shadowBrowserTransportHello(browser);
   ws.send(encodeEnvelope({
     v: 2,
@@ -407,6 +415,7 @@ v2wss.on("connection", (ws, req) => {
     // scope socket can close after the replacement socket has registered, so
     // only remove the node mapping if this close still owns it.
     if (v2SocketsByNode.get(browser.node) === ws) v2SocketsByNode.delete(browser.node);
+    if (v2BrowsersByNode.get(browser.node) === browser) v2BrowsersByNode.delete(browser.node);
     disposeShadowBrowserNode(browser);
   });
 });
@@ -629,10 +638,12 @@ async function devRestV2Turn(input: Parameters<NonNullable<RestProtocolHost["exe
     }
   });
 
-  // Fan the accepted delta to peer sockets subscribed on the commit relay.
+  // Fan the accepted turn out to co-present peer sockets (live events) and
+  // re-sync commit-scope peers' projections — the CF-shaped affected-scope
+  // recipient routing.
   if (submitted.kind === "submitted" && submitted.replyEnvelope) {
     const origin = v2ShadowBrowser(node, token, input.session, scope);
-    sendDevV2Fanout(origin, submitted.replyEnvelope);
+    await sendDevV2Fanout(origin, submitted.replyEnvelope);
   }
   return frame;
 }
@@ -663,7 +674,7 @@ async function devRestV2LiveTurn(input: Parameters<NonNullable<RestProtocolHost[
   const receipt = receiveShadowBrowserEnvelopeReceipt(browser, encoded);
   const reply = await handleShadowBrowserTurnExecEnvelope(browser, receipt, { onMetric: emitDevMetric });
   if (!reply) throw wooError("E_INTERNAL", "v2 REST turn produced no reply");
-  sendDevV2Fanout(browser, reply);
+  await sendDevV2Fanout(browser, reply);
   return restFrameFromTurnReply(input.scope, reply.body);
 }
 
@@ -769,7 +780,7 @@ async function handleV2ShadowFrame(
         onMetric: emitDevMetric
       });
       ws.send(encodeEnvelope(wsReply));
-      sendDevV2Fanout(turnBrowser, wsReply);
+      await sendDevV2Fanout(turnBrowser, wsReply);
       return;
     }
     const reply = await handleShadowBrowserTurnExecEnvelope(turnBrowser, receipt, { onMetric: emitDevMetric });
@@ -778,7 +789,7 @@ async function handleV2ShadowFrame(
     }
     if (reply) {
       ws.send(encodeEnvelope(reply));
-      sendDevV2Fanout(turnBrowser, reply);
+      await sendDevV2Fanout(turnBrowser, reply);
     }
   } catch (err) {
     // Pre-recording throws (the substrate's presence/permission gates fire
@@ -817,61 +828,79 @@ async function handleV2ShadowFrame(
   }
 }
 
-function sendDevV2Fanout(
+// Every connected v2 browser as a fanout candidate, each peer's bound scope
+// being its shard. The worker builds the equivalent list from its socket
+// attachments; localdev being one process iterates them all so cross-scope
+// peers are reached directly rather than via cross-shard fanout.
+function devV2FanoutPeers(): V2FanoutPeer[] {
+  const peers: V2FanoutPeer[] = [];
+  for (const browser of v2BrowsersByNode.values()) {
+    peers.push({ node: browser.node, sessionId: browser.session ?? "", actor: browser.actor, scope: browser.scope });
+  }
+  return peers;
+}
+
+// Deliver one live event to a single connected peer (no-op if the socket is
+// gone). `fromNode` is stamped as the event origin.
+function sendDevV2LiveEventToPeer(fromNode: string, node: string, event: ShadowLiveEvent): void {
+  const browser = v2BrowsersByNode.get(node);
+  const socket = v2SocketsByNode.get(node);
+  if (!browser || !socket || socket.readyState !== WebSocket.OPEN) return;
+  socket.send(encodeEnvelope({
+    v: 2,
+    type: event.kind,
+    id: `${event.id}:${node}`,
+    from: fromNode,
+    to: node,
+    actor: browser.actor,
+    ...(browser.session ? { session: browser.session } : {}),
+    auth: { mode: "session", token: browser.session_token ?? "" },
+    body: event
+  } satisfies ShadowEnvelope<typeof event>));
+}
+
+async function sendDevV2Fanout(
   origin: ReturnType<typeof createShadowBrowserClient>,
   reply: NonNullable<Awaited<ReturnType<typeof handleShadowBrowserTurnExecEnvelope>>>
-): void {
-  const body = reply.body;
-  if (body.ok !== true || !body.transcript) return;
-  if (!body.commit) {
-    sendDevV2LiveFanout(origin, reply);
-    return;
+): Promise<void> {
+  // CF-shaped fanout: the recipient-routing decision is the shared
+  // planDevV2BrowserFanout (same primitives the worker uses), run over EVERY
+  // connected peer (dev being one process reaches cross-scope peers directly).
+  // dev-server only performs the resulting socket I/O. The previous dev path
+  // delivered ONLY a projection delta to commit-scope subscribers and emitted
+  // no live events for committed turns, so a co-present peer in another
+  // affected room (e.g. a move's entered/left) saw nothing.
+  const plan = await planDevV2BrowserFanout({
+    world,
+    reply: reply.body,
+    fromNode: origin.relay.node,
+    peers: devV2FanoutPeers(),
+    originNode: origin.node
+  });
+  for (const { node, events } of plan.liveDeliveries) {
+    for (const event of events) sendDevV2LiveEventToPeer(origin.relay.node, node, event);
   }
-  for (const browser of origin.relay.browsers.values()) {
-    if (browser.node === origin.node) continue;
-    if (origin.relay.subscriptions.get(body.commit.position.scope)?.has(browser.node) !== true) continue;
-    const socket = v2SocketsByNode.get(browser.node);
-    if (!socket || socket.readyState !== WebSocket.OPEN) continue;
-    const transfer = buildShadowBrowserDeltaTransferForBrowser(origin.relay, browser, body.commit as ShadowCommitAccepted, body.transcript);
+  const transcript = reply.body.ok === true ? reply.body.transcript : undefined;
+  if (!plan.commit || !transcript) return;
+  for (const node of plan.stateTransferNodes) {
+    const browser = v2BrowsersByNode.get(node);
+    const socket = v2SocketsByNode.get(node);
+    if (!browser || !socket || socket.readyState !== WebSocket.OPEN) continue;
+    // The peer is bound to the commit scope, so its own relay IS the relay the
+    // commit landed on; build the catch-up delta from there.
+    const transfer = buildShadowBrowserDeltaTransferForBrowser(browser.relay, browser, plan.commit, transcript);
     socket.send(encodeEnvelope({
       v: 2,
       type: transfer.kind,
-      id: `${origin.relay.node}:state:${body.commit.position.seq}:${browser.node}`,
-      from: origin.relay.node,
-      to: browser.node,
+      id: `${browser.relay.node}:state:${plan.commit.position.seq}:${node}`,
+      from: browser.relay.node,
+      to: node,
       actor: browser.actor,
       ...(browser.session ? { session: browser.session } : {}),
       auth: { mode: "session", token: browser.session_token ?? "" },
       body: transfer
     } satisfies ShadowEnvelope<typeof transfer>));
     applyShadowBrowserTransfer(browser, transfer);
-  }
-}
-
-function sendDevV2LiveFanout(
-  origin: ReturnType<typeof createShadowBrowserClient>,
-  reply: NonNullable<Awaited<ReturnType<typeof handleShadowBrowserTurnExecEnvelope>>>
-): void {
-  const body = reply.body;
-  if (body.ok !== true || !body.transcript) return;
-  for (const event of shadowLiveEventsForTranscript(origin, body.transcript)) {
-    for (const browser of origin.relay.browsers.values()) {
-      if (browser.node === origin.node) continue;
-      if (!shadowLiveEventMatchesBrowser(origin.relay, browser, event)) continue;
-      const socket = v2SocketsByNode.get(browser.node);
-      if (!socket || socket.readyState !== WebSocket.OPEN) continue;
-      socket.send(encodeEnvelope({
-        v: 2,
-        type: event.kind,
-        id: `${event.id}:${browser.node}`,
-        from: origin.relay.node,
-        to: browser.node,
-        actor: browser.actor,
-        ...(browser.session ? { session: browser.session } : {}),
-        auth: { mode: "session", token: browser.session_token ?? "" },
-        body: event
-      } satisfies ShadowEnvelope<typeof event>));
-    }
   }
 }
 
