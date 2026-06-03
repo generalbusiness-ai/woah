@@ -94,6 +94,7 @@ import {
   shadowLiveEventMatchesPeerScope
 } from "../core/v2-fanout-projection";
 import { runShadowApply, type ShadowApplyTarget } from "../core/v2-shadow-apply";
+import { fanOutHostWrites } from "../core/object-host-write-through";
 import {
   V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED,
   buildExecutionCapsule,
@@ -5261,86 +5262,71 @@ export class PersistentObjectDO {
     commit: ShadowCommitAccepted,
     transcript: EffectTranscript
   ): Promise<V2LocalHostMaterialization> {
-    const startedAt = Date.now();
     if (commit.projection_delta) {
-      return await this.writeThroughProjectionWritesToObjectHosts(world, scope, commit, transcript, startedAt);
+      return await this.writeThroughProjectionWritesToObjectHosts(world, scope, commit, transcript);
     }
     const touched = transcriptTouchedObjectIds(transcript);
     touched.add(scope);
     const localHost = this.durableHostKey();
-    const hosts = new Set<string>();
-    let localApplied = false;
-    try {
-      for (const id of touched) {
-        const host = await this.resolveObjectHostForWorld(world, id, localHost);
-        if (host) hosts.add(host);
-      }
-      if (hosts.has(localHost)) {
-        await runShadowApply(transcript, this.buildHostApplyTarget(world, localHost));
-        hosts.delete(localHost);
-        localApplied = true;
-      }
-      await Promise.all(Array.from(hosts, (host) => this.forwardInternalChecked<{ ok: true }>(host, "/__internal/apply-v2-commit", {
+    // Partition: every touched host receives the same transcript slice. The
+    // shared fan-out applies the local slice and forwards the rest as RPCs.
+    const slicesByHost = new Map<string, EffectTranscript>();
+    for (const id of touched) {
+      const host = await this.resolveObjectHostForWorld(world, id, localHost);
+      if (host) slicesByHost.set(host, transcript);
+    }
+    return await fanOutHostWrites<EffectTranscript>({
+      localHostKey: localHost,
+      isGatewayHost: (host) => host === WORLD_HOST,
+      slicesByHost,
+      scope,
+      touched: touched.size,
+      retryMessage: "v2 commit accepted but object-host write-through failed",
+      onMetric: (event) => world.recordMetric(event),
+      applyLocal: (slice) => runShadowApply(slice, this.buildHostApplyTarget(world, localHost)),
+      forwardRemote: (host, slice) => this.forwardInternalChecked<{ ok: true }>(host, "/__internal/apply-v2-commit", {
         scope,
         commit: commit as unknown as WooValue,
-        transcript: transcript as unknown as WooValue
-      }, { timeoutMs: this.hostWriteRpcTimeoutMs() })));
-      world.recordMetric({ kind: "v2_host_apply_fanout", scope, hosts: hosts.size + (localApplied ? 1 : 0), touched: touched.size, ms: Date.now() - startedAt, status: "ok" });
-      return localApplied ? { hostKey: localHost, gatewayHost: localHost === WORLD_HOST } : null;
-    } catch (err) {
-      const error = normalizeError(err);
-      world.recordMetric({ kind: "v2_host_apply_fanout", scope, hosts: hosts.size, touched: touched.size, ms: Date.now() - startedAt, status: "error", error: error.code });
-      console.warn("woo.v2_host_apply_fanout.failed", { scope, error });
-      throw wooError("E_RETRY", `v2 commit accepted but object-host write-through failed: ${error.message}`, { scope, error });
-    }
+        transcript: slice as unknown as WooValue
+      }, { timeoutMs: this.hostWriteRpcTimeoutMs() }).then(() => undefined)
+    });
   }
 
   private async writeThroughProjectionWritesToObjectHosts(
     world: WooWorld,
     scope: ObjRef,
     commit: ShadowCommitAccepted,
-    transcript: EffectTranscript,
-    startedAt: number
+    transcript: EffectTranscript
   ): Promise<V2LocalHostMaterialization> {
     const localHost = this.durableHostKey();
     const projectionWrites = commit.projection_writes ?? [];
     this.requireProjectionWritesComplete(scope, commit.projection_delta, projectionWrites, "host_write_through");
-    const byHost = await this.projectionWritesByHost(world, scope, projectionWrites, localHost);
-    const localWrites = byHost.get(localHost) ?? [];
-    let localApplied = false;
-    if (localWrites.length > 0) {
-      const applied = world.applyProjectionWrites(localWrites, { transcript });
-      if (applied.creates > 0) await this.registerIncrementalObjectRoutes(world);
-      byHost.delete(localHost);
-      localApplied = true;
-    }
-    try {
-      await Promise.all(Array.from(byHost, ([host, projectionWrites]) => this.forwardInternalChecked<{ ok: true }>(host, "/__internal/apply-v2-commit", {
+    // Partition: each host gets only the projection rows it owns. The shared
+    // fan-out applies the local host's rows and forwards the rest as RPCs.
+    const slicesByHost = await this.projectionWritesByHost(world, scope, projectionWrites, localHost);
+    return await fanOutHostWrites<ProjectionWrite[]>({
+      localHostKey: localHost,
+      isGatewayHost: (host) => host === WORLD_HOST,
+      slicesByHost,
+      scope,
+      touched: projectionWrites.length,
+      retryMessage: "v2 commit accepted but object-host projection write-through failed",
+      onMetric: (event) => world.recordMetric(event),
+      applyLocal: async (writes) => {
+        const applied = world.applyProjectionWrites(writes, { transcript });
+        if (applied.creates > 0) await this.registerIncrementalObjectRoutes(world);
+      },
+      forwardRemote: (host, writes) => this.forwardInternalChecked<{ ok: true }>(host, "/__internal/apply-v2-commit", {
         scope,
         commit: {
           ...commit,
-          projection_delta: summarizeProjectionWrites(projectionWrites),
-          projection_writes: projectionWrites
+          projection_delta: summarizeProjectionWrites(writes),
+          projection_writes: writes
         } as unknown as WooValue,
         transcript: transcript as unknown as WooValue,
-        projection_writes: projectionWrites as unknown as WooValue
-      }, { timeoutMs: this.hostWriteRpcTimeoutMs() })));
-      const remoteRows = Array.from(byHost.values()).reduce((sum, rows) => sum + rows.length, 0);
-      world.recordMetric({
-        kind: "v2_host_apply_fanout",
-        scope,
-        hosts: byHost.size + (localApplied ? 1 : 0),
-        touched: remoteRows + localWrites.length,
-        ms: Date.now() - startedAt,
-        status: "ok"
-      });
-      return localApplied ? { hostKey: localHost, gatewayHost: localHost === WORLD_HOST } : null;
-    } catch (err) {
-      const error = normalizeError(err);
-      world.recordMetric({ kind: "v2_host_apply_fanout", scope, hosts: byHost.size, touched: commit.projection_writes?.length ?? 0, ms: Date.now() - startedAt, status: "error", error: error.code });
-      console.warn("woo.v2_host_apply_fanout.failed", { scope, error });
-      throw wooError("E_RETRY", `v2 commit accepted but object-host projection write-through failed: ${error.message}`, { scope, error });
-    }
+        projection_writes: writes as unknown as WooValue
+      }, { timeoutMs: this.hostWriteRpcTimeoutMs() }).then(() => undefined)
+    });
   }
 
   private async projectionWritesByHost(

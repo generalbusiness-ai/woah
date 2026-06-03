@@ -28,7 +28,7 @@ describe("dev v2 commit materialization", () => {
         verb: "enter",
         args: []
       });
-      materializeDevV2CommitLocally(world, "the_outline", entered.transcript);
+      await materializeDevV2CommitLocally(world, "the_outline", entered.transcript);
 
       const added = await runShadowTurnCall(authoritativePlanningWorld(world.exportWorld()), {
         kind: "woo.turn_call.shadow.v1",
@@ -41,7 +41,7 @@ describe("dev v2 commit materialization", () => {
         verb: "add",
         args: ["durable dev outline"]
       });
-      materializeDevV2CommitLocally(world, "the_outline", added.transcript);
+      await materializeDevV2CommitLocally(world, "the_outline", added.transcript);
       const item = added.transcript.creates[0]?.object;
       if (!item) throw new Error("expected add to create an outline item");
 
@@ -74,7 +74,7 @@ describe("dev v2 commit materialization", () => {
         verb: "enter",
         args: []
       });
-      materializeDevV2CommitLocally(world, "the_pinboard", entered.transcript);
+      await materializeDevV2CommitLocally(world, "the_pinboard", entered.transcript);
 
       const added = await runShadowTurnCall(authoritativePlanningWorld(world.exportWorld()), {
         kind: "woo.turn_call.shadow.v1",
@@ -87,7 +87,7 @@ describe("dev v2 commit materialization", () => {
         verb: "add_note",
         args: ["durable dev pin", "yellow", 48, 48, 180, 110]
       });
-      materializeDevV2CommitLocally(world, "the_pinboard", added.transcript);
+      await materializeDevV2CommitLocally(world, "the_pinboard", added.transcript);
       const pin = added.transcript.creates[0]?.object;
       if (!pin) throw new Error("expected add_note to create a pin");
 
@@ -135,8 +135,8 @@ describe("dev v2 commit materialization", () => {
       args: []
     });
 
-    materializeDevV2CommitLocally(world, "the_pinboard", firstEnter.transcript);
-    materializeDevV2CommitLocally(world, "the_pinboard", secondEnter.transcript);
+    await materializeDevV2CommitLocally(world, "the_pinboard", firstEnter.transcript);
+    await materializeDevV2CommitLocally(world, "the_pinboard", secondEnter.transcript);
 
     // Post-A4 each enter commits the actor's own authoritative `live:location`
     // cell (actor-anchored movement), and both entrants' commits materialize

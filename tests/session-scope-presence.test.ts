@@ -24,7 +24,7 @@ describe("session-scope presence (CA8)", () => {
     const s = await executeInProcessV2DurableTurn({ world, gatewayRelayForScope: r.gatewayRelayForScope, commitRelayForScope: r.commitRelayForScope, node: `gw-${c.id}`,
       call: { ...c, route: "sequenced", persistence: "durable", token: shadowBrowserSessionBearer({ id: c.session, actor: c.actor }) } });
     if (s.kind !== "submitted" || !s.reply?.ok) throw new Error(`turn ${c.id} failed`);
-    if (s.reply.commit && s.reply.transcript) materializeDevV2CommitLocally(world, s.reply.commit.position.scope, s.reply.transcript);
+    if (s.reply.commit && s.reply.transcript) await materializeDevV2CommitLocally(world, s.reply.commit.position.scope, s.reply.transcript);
     return s.reply;
   }
 

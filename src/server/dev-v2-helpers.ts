@@ -24,6 +24,7 @@
 
 import type { EffectTranscript } from "../core/effect-transcript";
 import { serializedFor, transcriptSessionActiveScope, transcriptTouchedObjectIds, type ShadowCommitAccepted } from "../core/shadow-commit-scope";
+import { fanOutHostWrites } from "../core/object-host-write-through";
 import {
   browserProfileProjectionContext,
   browserProfileProjectionWriteFromAuthority,
@@ -68,11 +69,22 @@ import type { WooWorld } from "../core/world";
 
 const DEV_WORLD_HOST = "world";
 
-export function materializeDevV2CommitLocally(
+// Test/diagnostic hook: localdev shares the CF object-host write-through fan-out
+// (src/core/object-host-write-through.ts) so it exercises the same local-apply +
+// remote-forward + E_RETRY path. `onRemoteForward` is invoked before each remote
+// host's in-process apply; throwing from it simulates an object-host RPC failure
+// (timeout/rejection) so tests can drive the partial-fanout / E_RETRY contract
+// without Cloudflare.
+export type DevHostWriteThroughOptions = {
+  onRemoteForward?: (hostKey: string) => void | Promise<void>;
+};
+
+export async function materializeDevV2CommitLocally(
   world: WooWorld,
   scope: ObjRef,
-  transcript: EffectTranscript
-): void {
+  transcript: EffectTranscript,
+  options: DevHostWriteThroughOptions = {}
+): Promise<void> {
   const routeHost = new Map(world.objectRoutes().map((route) => [route.id, route.host] as const));
   const createdIds = new Set(transcript.creates.map((create) => create.object));
   const hosts = new Set<string>();
@@ -94,9 +106,29 @@ export function materializeDevV2CommitLocally(
     hosts.add(host);
   }
   if (transcriptSessionActiveScope(transcript)) hosts.add(DEV_WORLD_HOST);
-  for (const host of Array.from(hosts).sort()) {
+
+  // The scope's host plays the "local" DO; every other touched host is reached
+  // through an in-process forward, mirroring CF's local-apply + RPC-fanout shape.
+  const localHostKey = routeHost.get(scope) ?? DEV_WORLD_HOST;
+  const slicesByHost = new Map<string, EffectTranscript>();
+  for (const host of Array.from(hosts).sort()) slicesByHost.set(host, transcript);
+  const applyToHost = (host: string): void => {
     world.applyCommittedShadowTranscriptToHost(host, transcript, { gatewayHost: host === DEV_WORLD_HOST });
-  }
+  };
+  await fanOutHostWrites<EffectTranscript>({
+    localHostKey,
+    isGatewayHost: (host) => host === DEV_WORLD_HOST,
+    slicesByHost,
+    scope,
+    touched: hosts.size,
+    retryMessage: "v2 commit accepted but localdev object-host write-through failed",
+    onMetric: (event) => world.recordMetric(event),
+    applyLocal: () => applyToHost(localHostKey),
+    forwardRemote: async (host) => {
+      if (options.onRemoteForward) await options.onRemoteForward(host);
+      applyToHost(host);
+    }
+  });
 }
 
 // Sentinel commit scope for the live (non-durable) fanout decision: no real
@@ -296,7 +328,7 @@ export async function executeDevV2DurableTurnFrame(input: {
   }
   if (!submitted.reply) throw wooError("E_INTERNAL", "dev v2 durable turn produced no reply");
   if (submitted.reply.ok && submitted.reply.commit && submitted.reply.transcript) {
-    materializeDevV2CommitLocally(input.world, submitted.reply.commit.position.scope, submitted.reply.transcript);
+    await materializeDevV2CommitLocally(input.world, submitted.reply.commit.position.scope, submitted.reply.transcript);
   }
   // restFrameFromTurnReply throws turnReplyError on a rejected commit / !ok,
   // matching the legacy dev REST path.
@@ -466,7 +498,7 @@ async function computeDevV2DurableTurnWsReply(input: DevV2DurableWsReplyInput): 
     return { reply: shadowBrowserReplyEnvelopeForReceipt(input.browser, input.receipt, body), submitted };
   }
   if (submitted.reply.ok && submitted.reply.commit && submitted.reply.transcript) {
-    materializeDevV2CommitLocally(input.world, submitted.reply.commit.position.scope, submitted.reply.transcript);
+    await materializeDevV2CommitLocally(input.world, submitted.reply.commit.position.scope, submitted.reply.transcript);
   }
   const receiverReply = devV2BrowserProfileTurnReply({
     reply: submitted.reply,
