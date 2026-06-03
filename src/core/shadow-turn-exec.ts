@@ -1602,14 +1602,15 @@ export function buildShadowReadMismatchRepairTransfer(
   const serialized = serializedFor(commitScope, { reason: "version_mismatch_repair" });
   if (serialized.objects.length === 0) return undefined;
   const key = shadowTurnKeyFromTranscript(transcript);
-  // Drive the page closure from the EXACT mismatched read cells (as read-atom
-  // preimages), not just the turn key: the turn key carries routing/acceptance
-  // atoms, which need not include an ordinary property read like the actor's
-  // `name`. Passing the mismatched cells as `missing_atoms` guarantees their
-  // current pages are in the transfer (selectedTransferAtoms always unions
-  // missing_atoms, and pageClosureForPreimages selects pages by preimage). The
-  // key is still threaded so the closure also carries the lineage/support pages
-  // the planning world needs to remain admissible after install.
+  // Drive the page closure from ONLY the EXACT mismatched read cells (as read-atom
+  // preimages) — NOT the turn key's full read/write closure. Two reasons: (1) the
+  // turn key carries routing/acceptance atoms, which need not include an ordinary
+  // property read like the actor's `name`, so missing_atoms guarantees the right
+  // pages; (2) including the whole closure would drag in unrelated commit-scope
+  // support/cache pages that we would then stamp authoritative (see below) and
+  // poison the caller's relay cache with non-owner rows. The caller already holds
+  // lineage/support pages (the install MERGES into its existing relay), so a
+  // minimal transfer of just the mismatched cells is sufficient and safe.
   const repairAtoms: ShadowMissingAtom[] = mismatched.map((cell) => {
     const preimage = readPreimageForCell(cell);
     return { hash: shadowAtomHash(preimage), preimage };
@@ -1617,31 +1618,58 @@ export function buildShadowReadMismatchRepairTransfer(
   const transfer = buildShadowCellPageTransfer({
     serialized,
     key,
-    atom_hashes: key.atom_hashes,
+    // No atom_hashes: missing_atoms alone drives the closure to the mismatched cells.
     missing_atoms: repairAtoms,
     session: transcript.session,
     purpose: "version_mismatch_repair_cells"
   });
   if (transfer.page_refs.length === 0 && transfer.inline_pages.length === 0) return undefined;
-  // Stamp the transfer's pages as the owner's authoritative rows so the caller's
-  // authority merge treats them as commit-authority truth (overriding a stale
-  // self-certified shard stub), not as a derived cache copy that the merge would
-  // refuse to land over an existing cell.
-  return stampShadowCellPageTransferAuthority(transfer, commitScope.node);
+  // Stamp ONLY the pages that ARE one of the mismatched cells as the owner's
+  // authoritative rows (so the caller's authority merge lets them override a stale
+  // self-certified stub). Any incidental closure page (e.g. a parent-class lineage
+  // page pulled in by the page closure) keeps its natural (no) source, so the merge
+  // treats it as fill-only and can never overwrite a current cell with a non-owner
+  // row. This is the guard against cache poisoning from over-broad stamping.
+  return stampShadowCellPageTransferAuthority(transfer, commitScope.node, mismatched);
 }
 
-// Re-stamp every page ref of a cell-page transfer with a single provenance
-// (source + source_host). Used by the read-mismatch repair transfer to assert
-// the committing scope's authoritative provenance, since `buildShadowCellPageTransfer`
-// emits execution-transfer refs with no `source` (they carry no authority claim).
+// Stamp the page refs that correspond to `cells` with the committing scope's
+// authoritative provenance (source + source_host). Refs that are not one of the
+// named cells are left untouched (no authority claim), so a refresh transfer
+// asserts owner-truth ONLY for the cells the commit scope actually validated as
+// mismatched — never for incidental support/cache pages in the closure.
 function stampShadowCellPageTransferAuthority(
   transfer: ShadowCellPageTransfer,
-  sourceHost: string
+  sourceHost: string,
+  cells: readonly TranscriptCell[]
 ): ShadowCellPageTransfer {
   return {
     ...transfer,
-    page_refs: transfer.page_refs.map((ref) => ({ ...ref, source: "authoritative" as const, source_host: sourceHost }))
+    page_refs: transfer.page_refs.map((ref) =>
+      cells.some((cell) => cellMatchesPageRef(cell, ref))
+        ? { ...ref, source: "authoritative" as const, source_host: sourceHost }
+        : ref
+    )
   };
+}
+
+// Whether a page ref is the page that backs a recorded cell. The cell→page
+// mapping mirrors the page model in shadow-state-pages: a property cell is a
+// named `property_cell`, a verb cell a named `verb_bytecode`, location/contents
+// live on the object's `object_live` page, and lifecycle is `object_lineage`.
+function cellMatchesPageRef(cell: TranscriptCell, ref: ShadowStatePageRef): boolean {
+  if (ref.object !== cell.object) return false;
+  switch (cell.kind) {
+    case "prop":
+      return ref.page === "property_cell" && ref.name === cell.name;
+    case "verb":
+      return ref.page === "verb_bytecode" && ref.name === cell.name;
+    case "location":
+    case "contents":
+      return ref.page === "object_live";
+    case "lifecycle":
+      return ref.page === "object_lineage";
+  }
 }
 
 // The read-atom preimage for a recorded cell, in the SAME form the turn key /
