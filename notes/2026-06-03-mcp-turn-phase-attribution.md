@@ -139,3 +139,27 @@ Artifacts: `.woo/smoke-measurements/deploy-f9e509c7-20260603T144736Z/`.
 Follow-up polish: `analyze-data-path-costs.mjs` still lists `turn_phase_timing`
 / `mcp_dispatch_timing` as UNCLASSIFIED (only `analyze-smoke-tail.mjs` was
 taught the new kinds); classify them there too when convenient.
+
+## Slice 2 progress — head fix deployed (88751797), deeper layer found
+
+Deployed branch through f9e509c7 → 511215ff → 88751797 (all instrumentation +
+the head fix + review fixes). Tail-smoke after 88751797 still fails (2 enter
+timeouts, halted). Phase data shows the head fix WORKS for its layer but a
+second layer remains:
+
+- Layer 1 (FIXED): stale_head. expected@0 now appears once per scope, not 8×.
+  submitTurnIntent adopts the conflict's `current` head on retry (applyHead).
+- Layer 2 (STILL FAILING): `read version mismatch guest_N.name: transcript=0
+  actual=1` — 61/run — drives the remaining 8-attempt grind. The planning world
+  reads the ACTOR's own name@0 while the commit scope has @1. Cross-shard
+  authority freshness: the actor's display name was committed via one gateway
+  shard; this enter lands on a different shard whose reconstructed authority
+  slice for the actor lags at @0. The repair refetches via the authority-slice
+  reconstruction (a lagging owner/projection source), NOT the commit scope's
+  committed cell versions, so it never converges.
+
+This is the core B7 warm-fill / authority-source problem: the gateway must plan
+against authority sourced from (or warm-filled by) the commit scope, not a
+reconstruction that lags it. Tasks #1–#3 are layers of ONE authority-freshness
+problem, deeper than the initial framing. Layer 2 is the real remaining work and
+is architecturally significant — paused for direction before a large change.
