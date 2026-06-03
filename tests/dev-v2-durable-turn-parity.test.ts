@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { authoritativePlanningWorld } from "../src/core/planning-world";
 import { installVerb } from "../src/core/authoring";
 import { createWorld, createWorldFromSerialized } from "../src/core/bootstrap";
-import { buildShadowBrowserCatchupTransferForBrowser, buildShadowTurnIntentEnvelope, createShadowBrowserClient, createShadowBrowserRelayShim, handleShadowBrowserTurnExecEnvelope, receiveShadowBrowserEnvelopeReceipt, shadowBrowserEnvelope, shadowBrowserSessionBearer } from "../src/core/shadow-browser-node";
+import { buildShadowBrowserCatchupTransferForBrowser, buildShadowTurnIntentEnvelope, createShadowBrowserClient, createShadowBrowserRelayShim, handleShadowBrowserStateTransferEnvelope, handleShadowBrowserTurnExecEnvelope, receiveShadowBrowserEnvelopeReceipt, shadowBrowserEnvelope, shadowBrowserSessionBearer } from "../src/core/shadow-browser-node";
 import { encodeEnvelope } from "../src/core/shadow-envelope";
 import { serializedFor } from "../src/core/shadow-commit-scope";
 import { runShadowTurnCall, type ShadowTurnCall } from "../src/core/shadow-turn-call";
@@ -527,6 +527,78 @@ describe("dev v2 durable turn — CF contract parity", () => {
     expect(transfer.mode).toBe("delta");
     if (transfer.mode !== "delta") throw new Error("expected a delta (frame-replay) transfer");
     expect(transfer.applied.map((frame) => frame.position.seq)).toContain(head2.seq);
+    repo.close();
+  });
+
+  it("state-transfer reply idempotency survives relay eviction (dev WS state-transfer persists its tail)", async () => {
+    // Item-4 hardening for the 4a finding-2 fix: the dev WS state-transfer branch
+    // now persists the relay tail (dev-server.ts) so a cell-page repair reply —
+    // cached in recent_replies — is returned verbatim after a dev-server restart
+    // instead of rebuilt. The turn-exec eviction case above does NOT exercise the
+    // state-transfer envelope type, and the type matters: serializeShadowRelayTail
+    // casts recent_replies as turn-exec envelopes (shadow-relay-tail.ts), so a
+    // state-transfer reply (a different body shape) must still JSON-round-trip
+    // through persist+hydrate and replay from the rehydrated cache.
+    const repo = new LocalSQLiteRepository(":memory:");
+    const world = createWorld({ repository: repo });
+    const session = world.auth("guest:dev-state-tail");
+    world.setProp("the_dubspace", "operators", [session.actor]);
+    const token = shadowBrowserSessionBearer({ id: session.id, actor: session.actor });
+
+    // The relay is seeded full-world so the cell-page transfer builder finds the
+    // atoms the planned key references; rebuilt identically on the "restart".
+    const makeCommitRelay = () => createShadowBrowserRelayShim({
+      node: "dev:commit-state-tail", scope: "the_dubspace", serialized: world.exportWorld(), deployment: "local-dev"
+    });
+    // The SPA keeps its node identity across reconnect, so both receipts carry the
+    // same idempotency key (`${from} ${id}`); reuse one node string.
+    const browserFor = (relay: ShadowRelayCache) => createShadowBrowserClient({
+      node: "browser:state-tail", scope: "the_dubspace", actor: session.actor, session: session.id, relay, token
+    });
+
+    let commitRelay = makeCommitRelay();
+    const call: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1", id: "state-xfer-1", route: "sequenced",
+      scope: "the_dubspace", session: session.id, actor: session.actor,
+      target: "the_dubspace", verb: "set_control", args: ["delay_1", "wet", 0.42]
+    };
+    const planned = await runShadowTurnCall(authoritativePlanningWorld(serializedFor(commitRelay.commit_scope)), call);
+    const key = shadowTurnKeyFromTranscript(planned.transcript);
+    const request = {
+      kind: "woo.state.transfer.request.shadow.v1" as const,
+      id: "state-xfer-req-1",
+      scope: "the_dubspace" as ObjRef,
+      key,
+      atom_hashes: key.atom_hashes
+    };
+
+    // Build the cell-page repair reply on the live relay and cache it.
+    const liveBrowser = browserFor(commitRelay);
+    const envelope = shadowBrowserEnvelope(liveBrowser, request.kind, request, "state-xfer-env-1");
+    const firstReceipt = receiveShadowBrowserEnvelopeReceipt(liveBrowser, encodeEnvelope(envelope));
+    expect(firstReceipt.fresh).toBe(true);
+    const firstReply = handleShadowBrowserStateTransferEnvelope(liveBrowser, firstReceipt);
+    if (!firstReply) throw new Error("expected a state-transfer reply");
+    expect(commitRelay.recent_replies.has(firstReceipt.idempotency_key)).toBe(true);
+
+    // Persist the tail (as the dev WS state-transfer branch now does) and EVICT
+    // (the restart): rebuild a fresh relay and rehydrate its tail from the store.
+    repo.saveRelayTail("the_dubspace", JSON.stringify(serializeShadowRelayTail(commitRelay)));
+    commitRelay = makeCommitRelay();
+    const persisted = repo.loadRelayTail("the_dubspace");
+    expect(persisted).not.toBeNull();
+    hydrateShadowRelayTail(commitRelay, JSON.parse(persisted!) as SerializedShadowRelayTail);
+    // The state-transfer-shaped reply survived the JSON round-trip into the cache.
+    expect(commitRelay.recent_replies.has(firstReceipt.idempotency_key)).toBe(true);
+
+    // Replay the SAME request after the restart: the receipt is a known duplicate
+    // (fresh === false routes to the cached branch, a structural no-rebuild
+    // guarantee), and the returned reply equals the original.
+    const reconnected = browserFor(commitRelay);
+    const replayReceipt = receiveShadowBrowserEnvelopeReceipt(reconnected, encodeEnvelope(envelope));
+    expect(replayReceipt.fresh).toBe(false);
+    const replayReply = handleShadowBrowserStateTransferEnvelope(reconnected, replayReceipt);
+    expect(replayReply).toEqual(firstReply);
     repo.close();
   });
 
