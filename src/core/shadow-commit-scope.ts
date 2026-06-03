@@ -85,6 +85,16 @@ export type ShadowCommitConflict = {
     | "post_state_mismatch";
   errors: string[];
   receipt: ShadowCommitReceipt;
+  // Structured cell refs for the reads whose pre-state version/value did not
+  // match this commit scope's authoritative cells (the `read version mismatch`
+  // / `read value mismatch` errors above, in cell form). The authoritative
+  // commit path uses these to build a targeted cell-page refresh transfer from
+  // the commit scope's CURRENT state, attached to the turn-exec reply so a
+  // stale caller (e.g. an MCP gateway shard holding a `name@0` actor stub while
+  // the commit scope is at `name@1`) can install the fresh cells and converge
+  // on the next repair attempt instead of grinding the retry budget. Only set
+  // for read-mismatch rejections; omitted otherwise.
+  mismatched_read_cells?: TranscriptCell[];
 };
 
 export type ShadowCommitResult = ShadowCommitAccepted | ShadowCommitConflict;
@@ -240,14 +250,22 @@ export function submitShadowCommit(scope: ShadowCommitScope, submit: ShadowCommi
     validation
   );
   if (!receipt.accepted) {
+    const reason = shadowConflictReason(receipt.errors);
     const conflict: ShadowCommitConflict = {
       kind: "woo.commit.conflict.shadow.v1",
       id: submissionId,
       scope: submit.scope,
       current: scope.head,
-      reason: shadowConflictReason(receipt.errors),
+      reason,
       errors: receipt.errors,
-      receipt
+      receipt,
+      // Carry the mismatched read cells for a read-version/value rejection so the
+      // authoritative reply builder can refresh exactly those cells from this
+      // scope's current state (DESIGN A layer-2 fix). Other reasons (stale_head,
+      // permission, post-state) need no per-cell transfer here.
+      ...(reason === "read_version_mismatch" && validation.mismatchedReadCells.length > 0
+        ? { mismatched_read_cells: validation.mismatchedReadCells }
+        : {})
     };
     // `stale_head` is a transient conflict: the same submission id can succeed
     // on a later retry once the caller resubmits against the new head (or the

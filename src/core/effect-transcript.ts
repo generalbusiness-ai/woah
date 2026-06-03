@@ -97,6 +97,14 @@ export type EffectTranscript = {
 export type TranscriptValidation = {
   ok: boolean;
   errors: string[];
+  // Structured cell refs for the reads whose pre-state version/value did not
+  // match the authoritative cell (the same mismatches the `read version
+  // mismatch` / `read value mismatch` error STRINGS describe). The repair path
+  // turns these into a targeted cell-page transfer so a stale planning view can
+  // be refreshed with the commit-authority's current cells and converge on the
+  // next attempt, instead of re-planning against the same stale rows and
+  // grinding the whole retry budget. Empty when no read mismatched.
+  mismatchedReadCells: TranscriptCell[];
 };
 
 export type TranscriptCellRead = { ok: true; version?: string; value: WooValue } | { ok: false; error: string };
@@ -288,6 +296,14 @@ export function validateTranscriptAgainstSerializedWorld(serializedBefore: Seria
 
 export function validateTranscriptWithCellReader(reader: TranscriptCellReader, transcript: EffectTranscript): TranscriptValidation {
   const errors: string[] = [];
+  // Cells whose recorded read version/value disagreed with the authoritative
+  // cell. Collected alongside the existing error STRINGS so the repair path can
+  // build a targeted refresh transfer (see TranscriptValidation.mismatchedReadCells).
+  const mismatchedReadCells: TranscriptCell[] = [];
+  const recordMismatch = (cell: TranscriptCell): void => {
+    if (mismatchedReadCells.some((existing) => sameCell(existing, cell))) return;
+    mismatchedReadCells.push(cell);
+  };
 
   for (const read of transcript.reads) {
     const sameTurn = sameTurnRead(transcript, read);
@@ -310,9 +326,11 @@ export function validateTranscriptWithCellReader(reader: TranscriptCellReader, t
     const readMatchesOwnWrite = sameTurn.reason === "own_write_mismatch" ? false : sameTurnReadMatchesOwnWrite(transcript, read);
     if (!readMatchesOwnWrite && read.version !== actual.version) {
       errors.push(`read version mismatch ${cellLabel(read.cell)}: transcript=${read.version ?? "none"} actual=${actual.version ?? "none"}`);
+      recordMismatch(read.cell);
     }
     if (!readMatchesOwnWrite && !transcriptReadValuesMatch(read.cell, actual.value, read.value)) {
       errors.push(`read value mismatch ${cellLabel(read.cell)}`);
+      recordMismatch(read.cell);
     }
   }
 
@@ -358,7 +376,7 @@ export function validateTranscriptWithCellReader(reader: TranscriptCellReader, t
     }
   }
 
-  return { ok: errors.length === 0, errors };
+  return { ok: errors.length === 0, errors, mismatchedReadCells };
 }
 
 function projectionWriteShapeError(write: RecordedProjectionWrite): string | null {

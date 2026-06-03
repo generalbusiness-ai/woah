@@ -48,6 +48,7 @@ import {
   type SubmitTurnIntentResult
 } from "../core/executor";
 import {
+  installShadowCellPageTransferAsAuthority,
   markShadowBrowserRelaySerializedChanged,
   mergeAuthorityIntoRelayCache,
   type ShadowRelayCache
@@ -289,6 +290,13 @@ export async function executeInProcessV2DurableTurn(input: {
     // cell versions but never advances the head). See gateway.ts applyHead.
     applyHead: (c, head) => {
       c.relay.commit_scope.head = structuredClone(head);
+    },
+    // DESIGN A layer-2 (mirrors gateway.ts/REST): install the committing scope's
+    // fresh mismatched cells (carried on a read-version-mismatch conflict) so the
+    // next repair attempt plans against current versions and converges.
+    applyStateTransfer: (c, transfer) => {
+      if (transfer.mode !== "cell_pages") return;
+      installShadowCellPageTransferAsAuthority(c.relay, transfer, { reason: "dev_version_mismatch_repair" });
     },
     submitEnvelope: async (scope, body) => {
       // In-process CommitScopeDO: resolve the commit relay for the B6-selected

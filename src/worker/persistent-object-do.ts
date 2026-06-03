@@ -68,6 +68,7 @@ import {
 import {
   applyAcceptedFrameToDerivedRelayCache,
   applyAcceptedFrameToRelayCache,
+  installShadowCellPageTransferAsAuthority,
   markShadowBrowserRelaySerializedChanged,
   mergeAuthorityIntoRelayCache,
   type ShadowRelayCache
@@ -4836,6 +4837,14 @@ export class PersistentObjectDO {
       // updates cell versions but never advances the head). See gateway.ts.
       applyHead: (client, head) => {
         client.relay.commit_scope.head = structuredClone(head);
+      },
+      // DESIGN A layer-2 (mirrors gateway.ts): install the committing scope's
+      // fresh mismatched cells, carried on a read-version-mismatch conflict, so
+      // the next repair attempt plans against current versions and converges
+      // instead of re-submitting the same stale rows.
+      applyStateTransfer: (client, transfer) => {
+        if (transfer.mode !== "cell_pages") return;
+        installShadowCellPageTransferAsAuthority(client.relay, transfer, { reason: "rest_version_mismatch_repair" });
       },
       submitEnvelope: async (scope, body) => {
         const client = this.restV2Relays.get(scope);

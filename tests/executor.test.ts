@@ -7,7 +7,7 @@ import type { SerializedObject, SerializedSession, SerializedWorld } from "../sr
 import { decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "../src/core/shadow-envelope";
 import type { ShadowScopeHead } from "../src/core/shadow-commit-scope";
 import { runShadowTurnCall } from "../src/core/shadow-turn-call";
-import type { ShadowTurnExecReply, ShadowTurnExecRequest } from "../src/core/shadow-turn-exec";
+import type { ShadowStateTransfer, ShadowTurnExecReply, ShadowTurnExecRequest } from "../src/core/shadow-turn-exec";
 import { shadowAtomHash, shadowTurnKeyFromCall } from "../src/core/turn-key";
 import {
   mergeExecutorAuthority,
@@ -382,6 +382,78 @@ describe("v2 turn gateway", () => {
     expect(second.request.expected).toBeDefined();
     expect(second.request.expected?.seq).toBe(5);
     expect(second.request.expected?.hash).toBe(authorityCurrentHead.hash);
+  });
+
+  it("installs a read-version-mismatch repair transfer and converges on the next attempt", async () => {
+    // DESIGN A layer-2: a read-version-mismatch conflict carries a cell-page
+    // transfer of the committing scope's CURRENT mismatched cells. submitTurnIntent
+    // must install it (applyStateTransfer) before re-plan so the caller refreshes
+    // its stale cells (e.g. a self-certified actor stub) and converges — instead
+    // of re-submitting the same stale rows and grinding the retry budget.
+    const world = createWorld();
+    const session = world.auth("guest:v2-gateway-version-mismatch");
+    world.setProp("the_dubspace", "operators", [session.actor]);
+    const harness = makePlannedExecHarness(world.exportWorld());
+
+    // Minimal transfer; the executor only checks presence and forwards it to
+    // applyStateTransfer (the relay-cache install is exercised by integration/
+    // worker tests). Cast avoids constructing the full cell-page envelope here.
+    const repairTransfer = {
+      kind: "woo.state.transfer.shadow.v1",
+      mode: "cell_pages",
+      scope: "the_dubspace",
+      purpose: "version_mismatch_repair_cells"
+    } as unknown as ShadowStateTransfer;
+    const installed: ShadowStateTransfer[] = [];
+    let submitCount = 0;
+
+    const result = await submitTurnIntent({
+      input: {
+        id: "version-mismatch-turn",
+        route: "sequenced",
+        scope: "the_dubspace",
+        session: session.id,
+        actor: session.actor,
+        target: "the_dubspace",
+        verb: "set_control",
+        args: ["delay_1", "wet", 0.6],
+        persistence: "durable",
+        token: "token"
+      },
+      maxAttempts: 8,
+      ...harness.options,
+      applyStateTransfer: (_client: PlannedGatewayClient, transfer: ShadowStateTransfer) => { installed.push(transfer); },
+      submitEnvelope: async (scope: ObjRef, body: ExecutorEnvelopeBody) => {
+        const envelope = decodeEnvelope<ShadowTurnExecRequest>(body.envelope);
+        harness.submissions.push({ scope, body, envelope, request: envelope.body });
+        submitCount += 1;
+        if (submitCount === 1) {
+          return { reply: encodeEnvelope(replyEnvelope({
+            kind: "woo.turn.exec.reply.shadow.v1",
+            ok: false,
+            id: envelope.body.id,
+            reason: "commit_rejected",
+            commit: {
+              kind: "woo.commit.conflict.shadow.v1",
+              id: envelope.body.id ?? "turn",
+              scope: "the_dubspace",
+              current: scopeHead("the_dubspace", 3),
+              reason: "read_version_mismatch",
+              errors: ["read version mismatch delay_1.wet: transcript=0 actual=1"],
+              receipt: receipt(false)
+            },
+            state_transfer: repairTransfer
+          })) };
+        }
+        return { reply: encodeEnvelope(replyEnvelope(okReplyForExecRequest(envelope.body))) };
+      }
+    });
+
+    expect(result.kind).toBe("submitted");
+    expect(submitCount).toBe(2); // converged after one repair, not the 8-attempt ceiling
+    expect(installed).toHaveLength(1);
+    // The transfer round-trips through the reply envelope, so compare by value.
+    expect(installed[0]).toEqual(repairTransfer);
   });
 
   it("charges a throwing phase and still emits turn_phase_timing with error outcome", async () => {

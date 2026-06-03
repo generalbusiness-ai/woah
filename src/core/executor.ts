@@ -32,7 +32,7 @@ import {
 import { decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "./shadow-envelope";
 import { runShadowTurnCallTranscript, type ShadowTurnCall, type ShadowTurnCallTranscriptRun } from "./shadow-turn-call";
 import { buildPlanningWorld, type PlanningAdmissibilityViolation, type PlanningWorldProvenance } from "./planning-world";
-import type { ShadowMissingAtom, ShadowTurnExecReply, ShadowTurnExecRequest } from "./shadow-turn-exec";
+import type { ShadowMissingAtom, ShadowStateTransfer, ShadowTurnExecReply, ShadowTurnExecRequest } from "./shadow-turn-exec";
 import {
   selectCommitScopeForTranscript,
   transcriptTouchedObjectIds,
@@ -166,6 +166,16 @@ export type SubmitTurnIntentOptions<Client, Result extends ExecutorEnvelopeResul
   // non-authoritative executors) and grinds the full retry budget on every
   // contended/first-turn-on-scope commit. See the conflict's `commit.current`.
   applyHead?(client: Client, head: ShadowScopeHead): void;
+  // Install a cell-page transfer carried on a read-version-mismatch conflict
+  // reply into the caller's planning cache before the next repair attempt
+  // (DESIGN A layer-2). The committing scope already validated against its
+  // CURRENT cells and serves exactly the mismatched ones, stamped
+  // authoritative; installing them lets the next attempt plan against fresh
+  // versions and converge — instead of re-planning the same stale rows and
+  // grinding the retry budget. Distributed callers (gateway/REST/dev) wire this
+  // to their relay-cache install; a caller that omits it falls back to the
+  // pre-fix authority-refetch path (slower, may still loop).
+  applyStateTransfer?(client: Client, transfer: ShadowStateTransfer): void;
   authorityObjectIds?(input: ExecutorCallInput, commitScope: ObjRef): ObjRef[];
   planningScope?(input: ExecutorCallInput): ObjRef;
   shouldRetry?(reply: ShadowTurnExecReply): boolean;
@@ -667,6 +677,18 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       if (body.ok === false && body.commit?.current) {
         options.applyHead?.(commitClient, body.commit.current);
         if (commitClient !== planningClient) options.applyHead?.(planningClient, body.commit.current);
+      }
+      // DESIGN A layer-2: a read-version-mismatch conflict carries a cell-page
+      // transfer of the mismatched cells at the committing scope's CURRENT
+      // versions. Install it into the planning cache so the next attempt plans
+      // against the fresh cells and converges — the head adoption above is not
+      // enough on its own when the stale row is a cell value/version (e.g. a
+      // self-certified actor stub) rather than the scope head. Install on the
+      // commit client and, when distinct, the planning client (the planner is
+      // what re-runs the verb next round).
+      if (body.ok === false && body.state_transfer) {
+        options.applyStateTransfer?.(commitClient, body.state_transfer);
+        if (commitClient !== planningClient) options.applyStateTransfer?.(planningClient, body.state_transfer);
       }
       repairObjectIds = mergeExecutorObjectIds(
         repairObjectIds,

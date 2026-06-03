@@ -24,6 +24,7 @@ import { createShadowBrowserRelayShim } from "../core/shadow-browser-node";
 import {
   applyAcceptedFrameToDerivedRelayCache,
   applyAcceptedFrameToRelayCache,
+  installShadowCellPageTransferAsAuthority,
   mergeAuthorityIntoRelayCache,
   type ShadowRelayCache
 } from "../core/shadow-relay-cache";
@@ -677,6 +678,18 @@ export class McpGateway {
       // attempt. structuredClone keeps the reply's head object out of our cache.
       applyHead: (client, head) => {
         client.relay.commit_scope.head = structuredClone(head);
+      },
+      // DESIGN A layer-2: install the committing scope's fresh mismatched cells
+      // (carried on a read-version-mismatch conflict) into this relay's planning
+      // cache. The shard self-certifies its session-actor stub as authoritative
+      // (so a remote owner refetch is skipped), which means without this the
+      // next attempt re-plans against the SAME stale stub and the commit
+      // re-rejects until the retry budget is exhausted. The transfer's pages are
+      // stamped authoritative by the owner, so the standard authority-merge
+      // precedence + version gate let them override the stub.
+      applyStateTransfer: (client, transfer) => {
+        if (transfer.mode !== "cell_pages") return;
+        installShadowCellPageTransferAsAuthority(client.relay, transfer, { reason: "mcp_version_mismatch_repair" });
       },
       submitEnvelope: async (submitScope, body) => {
         const envelopeBody = this.withExecutionCapsule(
