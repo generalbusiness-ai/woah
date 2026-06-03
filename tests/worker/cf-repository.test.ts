@@ -1838,10 +1838,14 @@ describe("CFObjectRepository production-shape coverage", () => {
 
   it("handles v2 turn requests through the Worker WebSocket message path", async () => {
     const directoryState = new FakeDurableObjectState("directory");
-    const gatewayState = new FakeDurableObjectState("world");
+    const gatewayState = new WaitUntilDurableObjectState("world");
     const commitStates = new Map<string, FakeDurableObjectState>();
     const envelopeBodies: Array<Record<string, unknown>> = [];
     const mcpFanoutHosts: string[] = [];
+    let releaseMcpFanout = (): void => {};
+    const mcpFanoutGate = new Promise<void>((resolve) => {
+      releaseMcpFanout = resolve;
+    });
     const logs: string[] = [];
     const consoleLog = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
       logs.push(args.map(String).join(" "));
@@ -1860,7 +1864,10 @@ describe("CFObjectRepository production-shape coverage", () => {
         if (name.startsWith("mcp-gateway-")) {
           return {
             async fetch(request: Request): Promise<Response> {
-              if (new URL(request.url).pathname === "/__internal/mcp-commit-fanout") mcpFanoutHosts.push(name);
+              if (new URL(request.url).pathname === "/__internal/mcp-commit-fanout") {
+                mcpFanoutHosts.push(name);
+                await mcpFanoutGate;
+              }
               return new Response(JSON.stringify({ ok: true }), {
                 status: 200,
                 headers: { "content-type": "application/json; charset=utf-8" }
@@ -2008,6 +2015,9 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(sqlRows(scopeState!.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_transcript_tail"))[0]).toMatchObject({ n: 1 });
       expect(sqlRows(scopeState!.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_reply"))[0]).toMatchObject({ n: 1 });
       expect(mcpFanoutHosts).toEqual(["mcp-gateway-0"]);
+      expect(gatewayState.waitUntilPromises).toHaveLength(1);
+      releaseMcpFanout();
+      await gatewayState.drainWaitUntil();
       const metrics = logs
         .filter((line) => line.startsWith("woo.metric "))
         .map((line) => JSON.parse(line.slice("woo.metric ".length)) as Record<string, unknown>);
@@ -2071,6 +2081,8 @@ describe("CFObjectRepository production-shape coverage", () => {
       const writesAfterReplay = scopeState!.storage.sql.execLog.filter((entry) => /^(INSERT|DELETE|UPDATE)\b/i.test(entry.query.trim())).length;
       expect(writesAfterReplay).toBe(writesBeforeReplay);
     } finally {
+      releaseMcpFanout();
+      await gatewayState.drainWaitUntil();
       directoryState.close();
       gatewayState.close();
       for (const state of commitStates.values()) state.close();

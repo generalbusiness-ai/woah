@@ -807,11 +807,17 @@ Per-envelope authority refresh may fall back to the gateway's last-known rows
 when a remote owner times out. This is a stale-read fallback, not an authority
 promotion: if the stale rows drive a write or conflict-sensitive read, the
 transcript's version checks produce the normal stale/mismatch retry path. The
-gateway must still include the submitting actor's local authority row and
-actor-class ancestry when those rows are explicit request roots; a new session
-actor might not be present in the target CommitScopeDO snapshot yet, and
-omitting it turns a read timeout into a false `permission_denied: actor not
-found` rejection.
+gateway may still include the submitting actor's local authority row and
+actor-class ancestry when those rows are explicit request roots and the gateway
+is the actor's Directory-resolved owner. Sparse MCP gateway shards are the
+exception: they MUST NOT self-certify a locally loaded actor stub as owner
+authority for identity/name or ordinary property cells. They route explicit
+actor roots to the Directory-resolved owner for current cells, preserve only
+their local session actor `object_live` page as shard-owned live state, and may
+carry bounded actor-local support properties such as `home` and `focus_list` as
+non-authoritative projection material. If the owner is unreachable, the stale
+fallback remains retryable through transcript version checks rather than being
+promoted to owner truth.
 For MCP sessions whose scope has already completed `/v2/open`, the gateway may
 take the same stale-row fallback proactively: it sends live session/actor
 authority and local last-known object-owner rows instead of waking those owners
@@ -857,7 +863,14 @@ transcript}`. `commit` is a `woo.commit.accepted.shadow.v1`; `transcript` is
 the matching `woo.effect_transcript.shadow.v1`. Affected shards include
 CommitScope fanout recipients and shards with sessions in scopes touched by
 transcript moves, creates, contents writes, or presence-list writes. Remote
-shards consume `commit.projection_writes` into their gateway projection cache
+MCP shard delivery is outside the submit critical path: after the accepted
+commit is durable and local write-through/fanout has completed, the origin may
+schedule `/__internal/mcp-commit-fanout` with Durable Object `waitUntil`.
+Runtimes without a background-lifetime primitive may fall back to synchronous
+delivery, but they must not weaken the durable object-host write-through rule
+above. Failed remote MCP fanout is logged and retried by later replay/open
+paths; it does not roll back the accepted commit.
+Remote shards consume `commit.projection_writes` into their gateway projection cache
 when present and expand `commit.projection_delta.tool_surface_sources` against
 their local tool-surface reverse index to evict stale descriptor cache rows.
 They must also apply those row-body-complete projection writes to their

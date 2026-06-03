@@ -4651,13 +4651,7 @@ export class PersistentObjectDO {
       return await this.resolveObjectHostForWorld(null, id, fallbackHost);
     };
 
-    const resolvedIds = await Promise.all(requestedIds.map(async (id) => {
-      // Sparse MCP shards own the live session actor stubs they loaded from
-      // Directory. Do not wake the world host just because Directory also knows
-      // the actor's canonical owner; the local actor cells are patched below.
-      if (mcpGatewayShard && localActorAuthorityRoots.has(id)) return [id, localHost] as const;
-      return [id, await resolveHost(id, WORLD_HOST)] as const;
-    }));
+    const resolvedIds = await Promise.all(requestedIds.map(async (id) => [id, await resolveHost(id, WORLD_HOST)] as const));
     const byHost = new Map<string, Set<ObjRef>>();
     for (const [id, host] of resolvedIds) {
       if (!host || host === localHost) continue;
@@ -5452,15 +5446,6 @@ export class PersistentObjectDO {
       transcript: transcript as unknown as WooValue,
       ...mcpFanoutAudienceBody(audience)
     };
-    if (hosts.size > 0) {
-      await Promise.all(Array.from(hosts, async (host) => {
-        try {
-          await this.forwardInternalChecked<{ ok: true }>(host, "/__internal/mcp-commit-fanout", body, { timeoutMs: this.hostReadRpcTimeoutMs() });
-        } catch (err) {
-          console.warn("woo.mcp_fanout.failed", { host, scope, error: normalizeError(err) });
-        }
-      }));
-    }
     world.recordMetric({
       kind: "mcp_fanout",
       scope,
@@ -5473,6 +5458,25 @@ export class PersistentObjectDO {
       local_suppressed: localSuppressed,
       origin_session: originSessionId
     });
+    if (hosts.size > 0) {
+      const task = Promise.all(Array.from(hosts, async (host) => {
+        try {
+          await this.forwardInternalChecked<{ ok: true }>(host, "/__internal/mcp-commit-fanout", body, { timeoutMs: this.hostReadRpcTimeoutMs() });
+        } catch (err) {
+          console.warn("woo.mcp_fanout.failed", { host, scope, error: normalizeError(err) });
+        }
+      })).then(() => undefined);
+      // Durable commit fanout is necessary for remote MCP queues, but the
+      // originator's accepted commit is already durable at this point. Run the
+      // cross-shard replay after the response so slow/cold subscriber shards do
+      // not sit on the submit critical path.
+      const waitUntil = (this.state as { waitUntil?: (promise: Promise<unknown>) => void }).waitUntil;
+      if (typeof waitUntil === "function") {
+        waitUntil.call(this.state, task);
+      } else {
+        await task;
+      }
+    }
   }
 
   private async mcpShardHostsForScopes(scopes: ObjRef[]): Promise<string[]> {
@@ -6376,8 +6380,12 @@ function mcpGatewayLocalAuthorityPayload(
   explicitIds: readonly ObjRef[],
   actorRoots: ReadonlySet<ObjRef>
 ): ExecutorAuthorityPayload {
-  const localIds = new Set<ObjRef>(actorRoots);
+  const localIds = new Set<ObjRef>();
   for (const id of explicitIds) {
+    // Session actor stubs on sparse MCP shards are not owner authority for
+    // identity/name/property cells. They are patched below as live/projection
+    // support; the explicit actor root must still resolve through Directory.
+    if (actorRoots.has(id)) continue;
     // Bootstrap actor/thing support rows are deliberately resident on every
     // MCP shard. Scope/room rows are not: their catalog lineage belongs to the
     // owner slice, and exporting a stale local stub before owner repair is the
@@ -6792,14 +6800,13 @@ function mcpGatewayLocalActorPropertyCellSlice(
 ): SerializedAuthorityCellSlice {
   const inlinePages: ShadowStatePage[] = [];
   for (const obj of world.exportObjects(actors)) {
-    inlinePages.push(...shadowPropertyCellPages(withMcpGatewayActorFallbackProperties(obj)));
+    inlinePages.push(...shadowPropertyCellPages(withMcpGatewayActorLocalProperties(obj)));
   }
-  // A3: `actors` are the gateway shard's local actor authority roots — under
-  // actor-anchored movement (CA3) the shard owns these session actors' cells.
-  // These are the owner's authoritative property rows (including the seeded
-  // guest `home` fallback the shard asserts for its own actor), so fresh remote
-  // rows never override them; they are stamped "authoritative" from this host.
-  const provenance: AuthorityPageProvenance = { source: "authoritative", source_host: hostKey };
+  // Sparse MCP shards carry a small Directory-derived actor stub so leave/focus
+  // verbs can plan before the owner slice arrives. These cells are support
+  // material, not owner truth: actor identity/name and ordinary properties must
+  // come from the actor's Directory-resolved owner when available.
+  const provenance: AuthorityPageProvenance = { source: "projection", source_host: hostKey };
   return {
     kind: "woo.authority_slice.cells.shadow.v1",
     sessions: [],
@@ -6840,8 +6847,12 @@ function mcpGatewayLocalActorLiveCellSlice(
   };
 }
 
-function withMcpGatewayActorFallbackProperties(obj: SerializedObject): SerializedObject {
+function withMcpGatewayActorLocalProperties(obj: SerializedObject): SerializedObject {
   const clone = structuredClone(obj) as SerializedObject;
+  const localNames = new Set(["home", "focus_list"]);
+  clone.propertyDefs = clone.propertyDefs.filter((def) => localNames.has(def.name));
+  clone.properties = clone.properties.filter(([name]) => localNames.has(name));
+  clone.propertyVersions = clone.propertyVersions.filter(([name]) => localNames.has(name));
   if (/^guest_\d+$/.test(clone.id) && !clone.properties.some(([name]) => name === "home")) {
     clone.properties.push(["home", "$nowhere"]);
     clone.propertyVersions.push(["home", 1]);
