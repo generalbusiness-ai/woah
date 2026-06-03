@@ -437,6 +437,14 @@ describe("dev v2 durable turn — CF contract parity", () => {
     // Reconnect already at the current head → no frames to replay.
     const current = buildShadowBrowserCatchupTransferForBrowser(h.wsBrowser, "the_dubspace", head2);
     if (current.mode === "delta") expect(current.applied).toHaveLength(0);
+
+    // A fresh open with no known head (or a head the retained tail can't bridge)
+    // falls back to a full projection transfer — the CF checkpoint vs frame-tail
+    // decision, exercised in-process.
+    const fresh = buildShadowBrowserCatchupTransferForBrowser(h.wsBrowser, "the_dubspace");
+    expect(fresh.mode).toBe("projection");
+    const staleEpoch = buildShadowBrowserCatchupTransferForBrowser(h.wsBrowser, "the_dubspace", { ...head1, epoch: head1.epoch + 1 });
+    expect(staleEpoch.mode).toBe("projection");
   });
 
   it("decodeTurnIntentCall extracts the call and preserves live vs durable", () => {
