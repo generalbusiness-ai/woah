@@ -1,8 +1,9 @@
 import { runShadowTurnCallTranscript } from "../core/shadow-turn-call";
+import { buildPlanningWorld } from "../core/planning-world";
 import type { EffectTranscript } from "../core/effect-transcript";
 import type { ShadowScopeHead } from "../core/shadow-commit-scope";
 import { executeShadowTurnCallOrNeedState, missingAtomsForShadowTurn, type ShadowMissingAtom, type ShadowTurnExecRequest } from "../core/shadow-turn-exec";
-import { shadowTurnKeyFromTranscript } from "../core/turn-key";
+import { shadowAtomHash, shadowTurnKeyFromTranscript } from "../core/turn-key";
 import type { ShadowTurnKey } from "../core/turn-key";
 import type { SerializedObject } from "../core/repository";
 import type { ShadowStatePage } from "../core/shadow-state-pages";
@@ -78,7 +79,13 @@ export async function planV2BrowserLocalTurn(input: V2BrowserLocalTurnInput): Pr
     args: input.args,
     body: input.body
   };
-  const planned = await runShadowTurnCallTranscript(executionNode.serialized, call);
+  // A3.2 true VM boundary: the client execution node is a DERIVED holder view
+  // composed from transfers, so it is admitted by PROOF, not by declaration — the
+  // gate runs against the node's recorded per-cell provenance (installShadowStateTransfer
+  // stamps it) and a presentation stub / untagged cell is refused (repairable).
+  const planned = await runShadowTurnCallTranscript(
+    buildPlanningWorld(executionNode.serialized, executionNode.cellProvenance ?? new Map(), { enforceMissingProvenance: true }),
+    call);
   const key = shadowTurnKeyFromTranscript(planned.transcript);
   const request: ShadowTurnExecRequest = {
     kind: "woo.turn.exec.request.shadow.v1",
@@ -100,6 +107,10 @@ export async function planV2BrowserLocalTurn(input: V2BrowserLocalTurnInput): Pr
     if (executed.reason === "missing_state") return { ok: false, reason: "missing_state", missing_atoms: executed.missing_atoms, key, request };
     return { ok: false, reason: "commit_rejected" };
   }
+  const materializationMiss = missingObjectAtomsFromErrorFrame(executed.frame);
+  if (materializationMiss.length > 0) {
+    return { ok: false, reason: "missing_state", missing_atoms: materializationMiss, key, request };
+  }
   return {
     ok: true,
     request,
@@ -109,6 +120,14 @@ export async function planV2BrowserLocalTurn(input: V2BrowserLocalTurnInput): Pr
     observation_count: executed.transcript.observations.length,
     result_known: executed.transcript.result !== undefined || executed.transcript.error !== undefined
   };
+}
+
+function missingObjectAtomsFromErrorFrame(frame: AppliedFrame | DirectResultFrame | ErrorFrame): ShadowMissingAtom[] {
+  if (frame.op !== "error") return [];
+  const value = frame.error.value;
+  if (frame.error.code !== "E_OBJNF" || typeof value !== "string" || value.length === 0) return [];
+  const preimage = `read:cell:lifecycle:${value}`;
+  return [{ hash: shadowAtomHash(preimage), preimage }];
 }
 
 function optimisticTurnResultFrame(

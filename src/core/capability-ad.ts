@@ -1,6 +1,6 @@
 import { hashSource } from "./source-hash";
 import type { ObjRef } from "./types";
-import type { ShadowTurnKey } from "./turn-key";
+import { SHADOW_EFFECTS_ALL, SHADOW_EPOCH_WILDCARD, type ShadowTurnKey } from "./turn-key";
 
 export type ShadowBloomFilter = {
   m: number;
@@ -8,25 +8,60 @@ export type ShadowBloomFilter = {
   bits_hex: string;
 };
 
+// The transitional realization of the normative `ExecCapabilityAd`
+// (`woo.exec.ad.v1`, spec/protocol/v2-turn-network.md §VTN11). Field mapping for
+// the next reader: `kind` is the browser-migration spelling; `epoch` is the
+// scope GENERATION and `head` the value-version hash (together they pin the
+// normative `ScopeHead`, whose `seq` is not needed for routing); `covers`/
+// `accepts` use hex `bits_hex` rather than base64url `bits`; `expires_at` is
+// carried as the `issued_at_ms` + `ttl_ms` pair below; and the `ad` id is
+// computed at the persistence layer (`v2ExecutionAdId`), not stored here. The
+// spec permits each of these representations; the direction of travel is toward
+// the normative kind.
 export type ShadowCapabilityAd = {
   kind: "woo.exec_capability_ad.shadow.v1";
   node: string;
   scope: ObjRef;
   epoch: string;
+  // B8: the owner head hash this ad reflects. A consumer prefers an ad whose
+  // head matches the scope it is routing for; a stale-head ad still routes (the
+  // commit validates authority anyway) but ranks no better than a fresh one.
+  head?: string;
   covers: ShadowBloomFilter;
   accepts: ShadowBloomFilter;
   effects: number;
+  // B8 routing-cost components. `factor` is the node's own opaque self-cost
+  // estimate (load/proximity); the others let a caller rank candidates by
+  // expected total cost: latency to reach the node, the state-transfer cost to
+  // warm a turn there (derived from B7's measurable cell_pages transfer — a
+  // node already holding the closure advertises ~0), and a penalty accrued from
+  // recent false-positive refusals so a lying Bloom is deprioritised. All
+  // default to 0 so an ad that sets only `factor` ranks exactly as before.
   factor: number;
+  latency_ms?: number;
+  transfer_cost?: number;
+  failure_penalty?: number;
+  // B8 freshness. When both are set, a consumer passing `now` drops the ad once
+  // `issued_at_ms + ttl_ms < now`. Absent → the ad never expires (the in-process
+  // and test paths that do not stamp time).
+  issued_at_ms?: number;
+  ttl_ms?: number;
 };
 
 export function buildShadowCapabilityAd(input: {
   node: string;
   scope: ObjRef;
   epoch?: string;
+  head?: string;
   atom_hashes: string[];
   accepts_atom_hashes?: string[];
   effects?: number;
   factor?: number;
+  latency_ms?: number;
+  transfer_cost?: number;
+  failure_penalty?: number;
+  issued_at_ms?: number;
+  ttl_ms?: number;
   m?: number;
   k?: number;
 }): ShadowCapabilityAd {
@@ -38,23 +73,78 @@ export function buildShadowCapabilityAd(input: {
     kind: "woo.exec_capability_ad.shadow.v1",
     node: input.node,
     scope: input.scope,
-    epoch: input.epoch ?? "shadow",
+    epoch: input.epoch ?? SHADOW_EPOCH_WILDCARD,
+    ...(input.head !== undefined ? { head: input.head } : {}),
     covers,
     accepts,
-    effects: input.effects ?? 0,
-    factor: input.factor ?? 1
+    // An ad that does not specify its accepted effect classes is treated as a
+    // full-capability executor (accepts every class). A constrained node sets a
+    // narrower mask explicitly.
+    effects: input.effects ?? SHADOW_EFFECTS_ALL,
+    factor: input.factor ?? 1,
+    ...(input.latency_ms !== undefined ? { latency_ms: input.latency_ms } : {}),
+    ...(input.transfer_cost !== undefined ? { transfer_cost: input.transfer_cost } : {}),
+    ...(input.failure_penalty !== undefined ? { failure_penalty: input.failure_penalty } : {}),
+    ...(input.issued_at_ms !== undefined ? { issued_at_ms: input.issued_at_ms } : {}),
+    ...(input.ttl_ms !== undefined ? { ttl_ms: input.ttl_ms } : {})
   };
 }
 
 export function capabilityAdProbablyCoversTurn(ad: ShadowCapabilityAd, key: ShadowTurnKey): boolean {
   if (ad.scope !== key.scope) return false;
+  // VTN11 scope-generation match: wildcard on either side matches (the
+  // pre-migration single-generation case); otherwise the generations must be
+  // equal, so a stale-generation ad cannot route a turn planned at a newer epoch.
+  if (!capabilityAdEpochMatches(ad.epoch, key.epoch)) return false;
+  // VTN11 effect-mask: the turn's effect classes must be a SUBSET of the ad's.
+  // (`key.effects ?? 0` keeps a hand-built partial key — tests — unconstrained;
+  // `ad.effects ?? ALL` treats an unspecified ad as full-capability.)
+  if (((key.effects ?? 0) & ~(ad.effects ?? SHADOW_EFFECTS_ALL)) !== 0) return false;
   return bloomContainsAll(ad.covers, key.atom_hashes) && bloomContainsAll(ad.accepts, key.accept_atom_hashes);
 }
 
-export function rankCapabilityAdsForTurn(ads: ShadowCapabilityAd[], key: ShadowTurnKey): ShadowCapabilityAd[] {
+export function capabilityAdEpochMatches(adEpoch: string, keyEpoch: string): boolean {
+  return adEpoch === SHADOW_EPOCH_WILDCARD || keyEpoch === SHADOW_EPOCH_WILDCARD || adEpoch === keyEpoch;
+}
+
+// B8 candidate ranking score: lower is better. The full formula the target
+// names — latency + factor + transfer_cost + failure_penalty — collapses to
+// `factor` alone when the cost components are unset, so existing factor-only
+// ranking is unchanged. This is the single source of truth for "which covering
+// node should run this turn"; ads route, the commit still proves authority.
+export function capabilityAdRoutingScore(ad: ShadowCapabilityAd): number {
+  return (ad.latency_ms ?? 0) + ad.factor + (ad.transfer_cost ?? 0) + (ad.failure_penalty ?? 0);
+}
+
+function capabilityAdExpired(ad: ShadowCapabilityAd, now?: number): boolean {
+  if (now === undefined) return false;
+  if (ad.issued_at_ms === undefined || ad.ttl_ms === undefined) return false;
+  return ad.issued_at_ms + ad.ttl_ms < now;
+}
+
+export function rankCapabilityAdsForTurn(
+  ads: ShadowCapabilityAd[],
+  key: ShadowTurnKey,
+  options?: { now?: number }
+): ShadowCapabilityAd[] {
   return ads
-    .filter((ad) => capabilityAdProbablyCoversTurn(ad, key))
-    .sort((a, b) => a.factor - b.factor || a.node.localeCompare(b.node));
+    .filter((ad) => !capabilityAdExpired(ad, options?.now) && capabilityAdProbablyCoversTurn(ad, key))
+    .sort((a, b) => capabilityAdRoutingScore(a) - capabilityAdRoutingScore(b) || a.node.localeCompare(b.node));
+}
+
+// B8 scope-level routing: a cold caller without an exact TurnKey ranks ads for a
+// scope. It uses the SAME freshness (TTL) and routing-score discipline as the
+// exact-key path — only the per-atom Bloom coverage check is dropped (there is
+// no key yet). The selected executor still proves exact coverage by executing or
+// returning missing_state.
+export function rankCapabilityAdsForScope(
+  ads: ShadowCapabilityAd[],
+  scope: ObjRef,
+  options?: { now?: number }
+): ShadowCapabilityAd[] {
+  return ads
+    .filter((ad) => ad.scope === scope && !capabilityAdExpired(ad, options?.now))
+    .sort((a, b) => capabilityAdRoutingScore(a) - capabilityAdRoutingScore(b) || a.node.localeCompare(b.node));
 }
 
 function buildBloom(atomHashes: string[], m: number, k: number): ShadowBloomFilter {

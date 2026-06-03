@@ -1,4 +1,4 @@
-import type { ShadowStatePage, ShadowStatePageRef } from "./shadow-state-pages";
+import type { AuthorityPageRef, ShadowStatePage } from "./shadow-state-pages";
 import type { ErrorValue, Message, ObjRef, Observation, PropertyDef, SpaceLogEntry, VerbDef, WooObject, WooValue } from "./types";
 
 export type SerializedObject = {
@@ -47,7 +47,11 @@ export type SerializedAuthorityObjectSlice = {
 export type SerializedAuthorityCellSlice = {
   kind: "woo.authority_slice.cells.shadow.v1";
   sessions: SerializedSession[];
-  page_refs: ShadowStatePageRef[];
+  // A3: authority cell pages carry MANDATORY provenance. `AuthorityPageRef`
+  // requires `source`, so the type system refuses any builder that would emit
+  // a page without declaring whether it is the owner's authoritative row or a
+  // cache/projection/fallback/gossip derivation.
+  page_refs: AuthorityPageRef[];
   inline_pages: ShadowStatePage[];
   counters: Pick<SerializedWorld, "objectCounter" | "parkedTaskCounter" | "sessionCounter">;
   tombstones: ObjRef[];

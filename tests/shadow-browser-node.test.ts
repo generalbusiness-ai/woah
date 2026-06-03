@@ -1,13 +1,16 @@
+import { authoritativePlanningWorld, planningCellKey } from "../src/core/planning-world";
 import { describe, expect, it, vi } from "vitest";
 import { createWorld, createWorldFromSerialized } from "../src/core/bootstrap";
 import { decodeEnvelope, encodeEnvelope } from "../src/core/shadow-envelope";
 import { stableShadowJson } from "../src/core/shadow-cell-version";
 import {
+  applyAcceptedFrameToDerivedRelayCache,
   applyShadowBrowserTransfer,
   buildShadowBrowserSessionAuth,
   buildShadowBrowserProjectionTransfer,
   createShadowBrowserNode,
   createShadowBrowserRelayShim,
+  shadowBrowserScopeExecutionAds,
   disposeShadowBrowserNode,
   emitShadowBrowserLiveEvent,
   executeShadowBrowserTurn,
@@ -36,8 +39,10 @@ import {
   type ShadowBrowserNode,
   type ShadowLiveEvent
 } from "../src/core/shadow-browser-node";
+import { rankCapabilityAdsForScope } from "../src/core/capability-ad";
 import { hashSource } from "../src/core/source-hash";
 import type { MetricEvent, ObjRef, WooValue } from "../src/core/types";
+import type { SerializedObject } from "../src/core/repository";
 import { runShadowTurnCall, runShadowTurnCallTranscript, type ShadowTurnCall } from "../src/core/shadow-turn-call";
 import { shadowTurnKeyFromTranscript } from "../src/core/turn-key";
 import type { EffectTranscript } from "../src/core/effect-transcript";
@@ -62,7 +67,11 @@ describe("shadow browser node shim", () => {
         kind: "woo.exec_capability_ad.shadow.v1",
         node: "browser-relay:executor",
         scope: "the_dubspace",
-        epoch: expect.stringMatching(/^[a-f0-9]{64}$/)
+        // CA10.1: `epoch` is the scope generation (a numeric string), `head` is
+        // the value-head hash — distinct fields. (Previously the scope ad put the
+        // head hash in `epoch`; that conflation is fixed.)
+        epoch: expect.stringMatching(/^\d+$/),
+        head: expect.stringMatching(/^[a-f0-9]{64}$/)
       })
     ]);
     expect(turn.network.first).toMatchObject({ ok: false, reason: "missing_state", attempted: false });
@@ -840,7 +849,7 @@ describe("shadow browser node shim", () => {
       verb: "set_control",
       args: ["delay_1", "wet", 0.73]
     };
-    const planned = await runShadowTurnCallTranscript(serializedFor(relay.commit_scope), call);
+    const planned = await runShadowTurnCallTranscript(authoritativePlanningWorld(serializedFor(relay.commit_scope)), call);
     const accepted = submitShadowCommit(relay.commit_scope, {
       kind: "woo.commit.submit.shadow.v1",
       id: call.id,
@@ -1030,7 +1039,7 @@ describe("shadow browser node shim", () => {
       verb: "set_control",
       args: ["delay_1", "wet", 0.61]
     };
-    const planned = await runShadowTurnCall(serializedFor(browser.relay.commit_scope), call);
+    const planned = await runShadowTurnCall(authoritativePlanningWorld(serializedFor(browser.relay.commit_scope)), call);
     const request = {
       kind: "woo.turn.exec.request.shadow.v1" as const,
       id: "wire-state-wet",
@@ -1644,7 +1653,7 @@ describe("shadow browser node shim", () => {
       verb: "set_control",
       args: ["delay_1", "wet", 0.37]
     };
-    const planned = await runShadowTurnCall(serializedFor(browser.relay.commit_scope), call);
+    const planned = await runShadowTurnCall(authoritativePlanningWorld(serializedFor(browser.relay.commit_scope)), call);
     const key = shadowTurnKeyFromTranscript(planned.transcript);
     browser.relay.executors.push(createShadowExecutionNode({
       node: "near-executor",
@@ -1667,9 +1676,19 @@ describe("shadow browser node shim", () => {
 
     expect(reply?.body).toMatchObject({
       ok: true,
-      state_transfer: { kind: "woo.state.transfer.shadow.v1", mode: "cell_pages", scope: "the_dubspace" },
+      // B7 / VTN12.1: the delegated commit reply is a warm cache-fill and MUST
+      // carry purpose accepted_write_cells — the browser worker's accepted-write
+      // high-watermark keys on it. The capsule head is the post-commit head.
+      state_transfer: {
+        kind: "woo.state.transfer.shadow.v1",
+        mode: "cell_pages",
+        scope: "the_dubspace",
+        purpose: "accepted_write_cells"
+      },
       ads: [expect.objectContaining({ node: "near-executor" })]
     });
+    const warm = reply?.body.ok ? reply.body.state_transfer : undefined;
+    expect(warm?.mode === "cell_pages" ? warm.capsule?.head.scope : undefined).toBe("the_dubspace");
     expect(worldFor(browser).getProp("delay_1", "wet")).toBe(0.37);
   });
 
@@ -1755,7 +1774,7 @@ describe("shadow browser node shim", () => {
       verb: "set_control",
       args: ["delay_1", "wet", 0.39]
     };
-    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(serializedFor(browser.relay.commit_scope), planningCall)).transcript);
+    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(authoritativePlanningWorld(serializedFor(browser.relay.commit_scope)), planningCall)).transcript);
     browser.relay.executors.push(createShadowExecutionNode({
       node: "near-intent-executor",
       scope: key.scope,
@@ -1799,7 +1818,7 @@ describe("shadow browser node shim", () => {
       verb: "set_control",
       args: ["delay_1", "wet", 0.41]
     };
-    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(serializedFor(browser.relay.commit_scope), call)).transcript);
+    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(authoritativePlanningWorld(serializedFor(browser.relay.commit_scope)), call)).transcript);
     const envelope = shadowBrowserEnvelope(browser, "woo.state.transfer.request.shadow.v1", {
       kind: "woo.state.transfer.request.shadow.v1" as const,
       id: "browser-state-repair-request",
@@ -1866,6 +1885,150 @@ describe("shadow browser node shim", () => {
       args: [],
       persistence: "durable" as const
     })).not.toThrow();
+  });
+
+  // B9 (VTN0 / VTN14): the browser is a narrow-authority node, NOT a divergent
+  // holder. It may execute optimistically for its actor, but every durable
+  // commit is server-validated and there is no second write path — its
+  // authoritative view IS the server commit scope. Two browsers racing the same
+  // cell converge to that single authority (no divergent holder state); the
+  // browser advertises no broad ExecCapabilityAd.
+  it("B9: browser commits are server-validated and converge to one authority (no divergent holder)", async () => {
+    const anchor = createWorld();
+    const sessionA = anchor.auth("guest:b9-a");
+    const sessionB = anchor.auth("guest:b9-b");
+    await anchor.directCall("b9-a-enter", sessionA.actor, "the_dubspace", "enter", [], { sessionId: sessionA.id });
+    await anchor.directCall("b9-b-enter", sessionB.actor, "the_dubspace", "enter", [], { sessionId: sessionB.id });
+    const relay = createShadowBrowserRelayShim({ node: "b9-relay", scope: "the_dubspace", serialized: anchor.exportWorld() });
+    const a = createShadowBrowserNode({ node: "b9-a", scope: "the_dubspace", actor: sessionA.actor, session: sessionA.id, relay });
+    const b = createShadowBrowserNode({ node: "b9-b", scope: "the_dubspace", actor: sessionB.actor, session: sessionB.id, relay });
+    await openShadowBrowserScope(a, { preseed_catalog_pages: true });
+    await openShadowBrowserScope(b, { preseed_catalog_pages: true });
+
+    // The browser MUST NOT advertise a broad capability — only a narrow
+    // session-local scope ad with empty coverage (VTN14: MUST NOT advertise
+    // broad ExecCapabilityAds).
+    for (const ad of shadowBrowserScopeExecutionAds(relay, "the_dubspace")) {
+      expect(/^0*$/.test(ad.covers.bits_hex)).toBe(true);
+      expect(/^0*$/.test(ad.accepts.bits_hex)).toBe(true);
+    }
+
+    const turnA = await executeShadowBrowserTurn(a, {
+      id: "b9-a-set", target: "the_dubspace", verb: "set_control", args: ["delay_1", "wet", 0.41]
+    });
+    expect(turnA.result.ok).toBe(true);
+    if (!turnA.result.ok) throw new Error(`A failed: ${turnA.result.reason}`);
+    // Server-validated: the commit landed at the server commit scope, not a
+    // browser-local authority.
+    expect(turnA.result.commit?.position.scope).toBe("the_dubspace");
+
+    const turnB = await executeShadowBrowserTurn(b, {
+      id: "b9-b-set", target: "the_dubspace", verb: "set_control", args: ["delay_1", "wet", 0.42]
+    });
+    expect(turnB.result.ok).toBe(true);
+
+    // No divergent holder: both browsers' authoritative view is the single server
+    // commit scope, which holds the last committed value. There is no separate
+    // browser-held committed state to diverge.
+    expect(worldFor(a).getProp("delay_1", "wet")).toBe(0.42);
+    expect(worldFor(b).getProp("delay_1", "wet")).toBe(0.42);
+    expect(serializedFor(relay.commit_scope).objects.find((o) => o.id === "delay_1")
+      ?.properties.find(([name]) => name === "wet")?.[1]).toBe(0.42);
+  });
+
+  // Regression: a scope ad is a cold-start routing hint that gets gossiped and
+  // persisted, then read back via allExecutionAds() on the cold delegation
+  // fallback. It MUST carry freshness — without issued_at_ms/ttl_ms a stale ad
+  // (e.g. one naming an executor node id from a prior connection) stays
+  // selectable indefinitely across reconnects, because capabilityAdExpired only
+  // drops ads that stamp both fields. Pin that the emitter stamps a TTL in the
+  // same Date.now() domain the routing reader uses, and that expiry is enforced.
+  it("scope ad carries a TTL so a stale hint is dropped by the routing reader", () => {
+    const relay = createShadowBrowserRelayShim({
+      node: "ttl-relay", scope: "the_dubspace", serialized: createWorld().exportWorld()
+    });
+    const issuedAt = 1_000_000;
+    const ads = shadowBrowserScopeExecutionAds(relay, "the_dubspace", issuedAt);
+    expect(ads).toHaveLength(1);
+    const [ad] = ads;
+    // Freshness fields are present and stamped in the supplied clock domain.
+    expect(ad.issued_at_ms).toBe(issuedAt);
+    expect(ad.ttl_ms).toBeGreaterThan(0);
+
+    // Fresh and just-before-expiry: the ad routes. Past issued_at_ms + ttl_ms:
+    // the reader drops it (whereas before the fix, with no TTL, it never expired).
+    const ttl = ad.ttl_ms!;
+    expect(rankCapabilityAdsForScope(ads, "the_dubspace", { now: issuedAt }).map((a) => a.node)).toEqual([ad.node]);
+    expect(rankCapabilityAdsForScope(ads, "the_dubspace", { now: issuedAt + ttl }).map((a) => a.node)).toEqual([ad.node]);
+    expect(rankCapabilityAdsForScope(ads, "the_dubspace", { now: issuedAt + ttl + 1 }).map((a) => a.node)).toEqual([]);
+  });
+});
+
+describe("shadow browser relay seed provenance (A3.2)", () => {
+  // P1b (review): createShadowBrowserRelayShim is generic across holders and must NOT
+  // impose a `cache` default — an authority-derived seed keeps its real per-cell
+  // provenance, the browser-holder factory stamps cache, and a no-seed direct world
+  // is left empty (unknown).
+  function seedObjectId() {
+    const serialized = createWorld().exportWorld();
+    return { serialized, id: serialized.objects[0].id };
+  }
+
+  it("preserves an authority-derived seed's provenance instead of flattening to cache", () => {
+    const { serialized, id } = seedObjectId();
+    const seed = new Map([[planningCellKey(id, "object_lineage"), { source: "authoritative" as const }]]);
+    const relay = createShadowBrowserRelayShim({ node: "n", scope: "$system", serialized, seedCellProvenance: seed });
+    expect(relay.commit_scope.cellProvenance?.get(planningCellKey(id, "object_lineage"))).toEqual({ source: "authoritative" });
+  });
+
+  it("leaves seed provenance empty when no seed is declared (no constructor default)", () => {
+    const { serialized } = seedObjectId();
+    const relay = createShadowBrowserRelayShim({ node: "n", scope: "$system", serialized });
+    expect(relay.commit_scope.cellProvenance === undefined || relay.commit_scope.cellProvenance.size === 0).toBe(true);
+  });
+
+  it("createShadowBrowserNode stamps cache for the holder's seed (derived view)", () => {
+    const { serialized, id } = seedObjectId();
+    const relay = createShadowBrowserRelayShim({ node: "n", scope: "$system", serialized });
+    createShadowBrowserNode({ node: "browser", scope: "$system", actor: "$wiz", relay });
+    expect(relay.commit_scope.cellProvenance?.get(planningCellKey(id, "object_lineage"))).toEqual({ source: "cache" });
+  });
+
+  it("createShadowBrowserNode does not downgrade an authority seed to cache (record-if-stronger)", () => {
+    const { serialized, id } = seedObjectId();
+    const seed = new Map([[planningCellKey(id, "object_lineage"), { source: "authoritative" as const }]]);
+    const relay = createShadowBrowserRelayShim({ node: "n", scope: "$system", serialized, seedCellProvenance: seed });
+    createShadowBrowserNode({ node: "browser", scope: "$system", actor: "$wiz", relay });
+    expect(relay.commit_scope.cellProvenance?.get(planningCellKey(id, "object_lineage"))).toEqual({ source: "authoritative" });
+  });
+
+  // Finding 2 (review): the ONE shared derived-cache applier materializes the authority
+  // projection_writes object rows (a moved object's real lineage/live), records their
+  // provenance, and does NOT advance the relay head. Used by MCP/REST/browser alike.
+  it("applyAcceptedFrameToDerivedRelayCache materializes projection rows + provenance, no head advance", () => {
+    const { serialized } = seedObjectId();
+    const relay = createShadowBrowserRelayShim({ node: "derived", scope: "room", serialized });
+    const headBefore = relay.commit_scope.head.hash;
+    const widget: SerializedObject = {
+      id: "remote_widget", name: "Remote Widget", parent: "$thing", anchor: null, owner: "$wiz",
+      location: "room", flags: {}, created: 0, modified: 0, propertyDefs: [], properties: [],
+      propertyVersions: [], verbs: [], children: [], contents: [], eventSchemas: []
+    };
+    const accepted = {
+      position: { kind: "woo.scope_head.shadow.v1", scope: "other", epoch: 1, seq: 1, hash: "h" },
+      projection_writes: [{ table: "objects", op: "upsert", key: "remote_widget", row: widget }]
+    } as unknown as ShadowCommitAccepted;
+    const emptyTranscript: EffectTranscript = {
+      kind: "woo.effect_transcript.shadow.v1", id: "f", route: "sequenced", scope: "room", seq: 0,
+      session: "s", call: { actor: "a", target: "room", verb: "noop", args: [], body: undefined },
+      reads: [], writes: [], creates: [], moves: [], observations: [], logicalInputs: [], untrackedEffects: [],
+      complete: true, incompleteReasons: [], hash: "t:f"
+    };
+
+    applyAcceptedFrameToDerivedRelayCache(relay, accepted, emptyTranscript);
+    expect(serializedFor(relay.commit_scope).objects.find((o) => o.id === "remote_widget")?.name).toBe("Remote Widget");
+    expect(relay.commit_scope.cellProvenance?.get(planningCellKey("remote_widget", "object_lineage"))).toEqual({ source: "cache" });
+    expect(relay.commit_scope.head.hash).toBe(headBefore);
   });
 });
 

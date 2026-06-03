@@ -4,7 +4,6 @@ import type { SerializedWorld } from "./repository";
 import { createShadowCommitScope, serializedFor, type ShadowCommitScope } from "./shadow-commit-scope";
 import {
   buildShadowCellPageTransfer,
-  buildShadowClosureTransfer,
   buildShadowObjectRecordTransfer,
   executeShadowTurnCallOrNeedState,
   installShadowStateTransfer,
@@ -24,18 +23,34 @@ export type ShadowInProcessNetworkResult = {
   result: ShadowTurnExecutionResult;
 };
 
+// B8 routing-cost fields a builder may carry onto the ad so the consumer can
+// rank by `latency + factor + transfer_cost + failure_penalty` (and expire by
+// TTL). All optional; omitting them reproduces factor-only ranking.
+export type ShadowAdRoutingCost = {
+  head?: string;
+  latency_ms?: number;
+  transfer_cost?: number;
+  failure_penalty?: number;
+  issued_at_ms?: number;
+  ttl_ms?: number;
+};
+
 export function buildShadowTurnExecAd(input: {
   node: string;
   scope: ObjRef;
   key: ShadowTurnKey;
   factor?: number;
-}): ShadowCapabilityAd {
+} & ShadowAdRoutingCost): ShadowCapabilityAd {
   return buildShadowCapabilityAd({
     node: input.node,
     scope: input.scope,
+    epoch: input.key.epoch,
     atom_hashes: input.key.atom_hashes,
     accepts_atom_hashes: input.key.accept_atom_hashes,
-    factor: input.factor
+    // An optimistic from-key ad claims exactly this turn's effect classes.
+    effects: input.key.effects,
+    factor: input.factor,
+    ...adRoutingCost(input)
   });
 }
 
@@ -43,15 +58,24 @@ export function buildShadowScopeTurnExecAd(input: {
   node: string;
   scope: ObjRef;
   epoch?: string;
+  head?: string;
   factor?: number;
+  // A scope ad is gossiped and persisted, then read on the cold delegation
+  // fallback; without freshness it would stay selectable forever. The emitter
+  // stamps issued_at_ms/ttl_ms so the routing reader can expire a stale hint.
+  issued_at_ms?: number;
+  ttl_ms?: number;
 }): ShadowCapabilityAd {
   return buildShadowCapabilityAd({
     node: input.node,
     scope: input.scope,
     epoch: input.epoch,
+    ...(input.head !== undefined ? { head: input.head } : {}),
     atom_hashes: [],
     accepts_atom_hashes: [],
-    factor: input.factor
+    factor: input.factor,
+    ...(input.issued_at_ms !== undefined ? { issued_at_ms: input.issued_at_ms } : {}),
+    ...(input.ttl_ms !== undefined ? { ttl_ms: input.ttl_ms } : {})
   });
 }
 
@@ -59,14 +83,29 @@ export function buildShadowTurnExecAdFromNode(input: {
   node: ShadowExecutionNode;
   accepts: ShadowTurnKey;
   factor?: number;
-}): ShadowCapabilityAd {
+} & ShadowAdRoutingCost): ShadowCapabilityAd {
   return buildShadowCapabilityAd({
     node: input.node.node,
     scope: input.node.scope,
+    epoch: input.accepts.epoch,
     atom_hashes: Array.from(input.node.atom_hashes).sort(),
     accepts_atom_hashes: input.accepts.accept_atom_hashes,
-    factor: input.factor
+    // A node holding the scope closure is a full-capability executor — it leaves
+    // `effects` at the builder default (SHADOW_EFFECTS_ALL).
+    factor: input.factor,
+    ...adRoutingCost(input)
   });
+}
+
+function adRoutingCost(input: ShadowAdRoutingCost): ShadowAdRoutingCost {
+  const cost: ShadowAdRoutingCost = {};
+  if (input.head !== undefined) cost.head = input.head;
+  if (input.latency_ms !== undefined) cost.latency_ms = input.latency_ms;
+  if (input.transfer_cost !== undefined) cost.transfer_cost = input.transfer_cost;
+  if (input.failure_penalty !== undefined) cost.failure_penalty = input.failure_penalty;
+  if (input.issued_at_ms !== undefined) cost.issued_at_ms = input.issued_at_ms;
+  if (input.ttl_ms !== undefined) cost.ttl_ms = input.ttl_ms;
+  return cost;
 }
 
 export async function executeShadowTurnCallAcrossInProcessNetwork(input: {
@@ -77,7 +116,7 @@ export async function executeShadowTurnCallAcrossInProcessNetwork(input: {
     node: string;
     serialized: SerializedWorld;
   };
-  transferMode?: "closure" | "object_records" | "cell_pages";
+  transferMode?: "object_records" | "cell_pages";
   maxTransfers?: number;
   maxStaleHeadRetries?: number;
   commitScope?: ShadowCommitScope;
@@ -123,15 +162,8 @@ export async function executeShadowTurnCallAcrossInProcessNetwork(input: {
       if (missingStateRounds >= maxTransfers) break;
       missingStateRounds += 1;
       const missingAtoms = result.missing_atoms;
-      const transfer = transferMode === "closure"
-        ? buildShadowClosureTransfer({
-            serialized: input.anchor.serialized,
-            key: activeRequest.key,
-            atom_hashes: missingAtoms.map((atom) => atom.hash),
-            recipient: selected.node
-          })
-        : transferMode === "object_records"
-          ? buildShadowObjectRecordTransfer({
+      const transfer = transferMode === "object_records"
+        ? buildShadowObjectRecordTransfer({
             serialized: input.anchor.serialized,
             key: activeRequest.key,
             missing_atoms: missingAtoms,
@@ -139,7 +171,7 @@ export async function executeShadowTurnCallAcrossInProcessNetwork(input: {
             session: activeRequest.call.session,
             recipient: selected.node
           })
-          : buildShadowCellPageTransfer({
+        : buildShadowCellPageTransfer({
             serialized: input.anchor.serialized,
             key: activeRequest.key,
             missing_atoms: missingAtoms,

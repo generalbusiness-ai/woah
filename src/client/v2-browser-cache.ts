@@ -101,9 +101,11 @@ function stateTransferMutations(transfer: ShadowBrowserStateTransfer): V2Browser
     ];
   }
   // Browser executable cache is store-2 cell pages only. The worker rejects
-  // legacy `closure`/`object_records` before mutation; returning no mutation
-  // here keeps direct cache tests and future callers on the same boundary.
-  if (transfer.mode === "closure" || transfer.mode === "object_records") return [];
+  // legacy `object_records` (and the retired pre-B7 `closure`) before mutation;
+  // returning no mutation here keeps direct cache tests and future callers on the
+  // same boundary. Any non-projection/delta mode (a `closure` from an old peer)
+  // also falls through to the no-mutation guard below.
+  if (transfer.mode === "object_records") return [];
   if (transfer.mode !== "projection" && transfer.mode !== "delta") return [];
   const projectionMutation: V2BrowserCacheMutation | null = transfer.mode === "delta" && transfer.projection_patch
     ? { kind: "projection_patch", scope: transfer.scope, head: transfer.to, patch: transfer.projection_patch }

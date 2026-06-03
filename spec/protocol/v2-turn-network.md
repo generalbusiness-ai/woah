@@ -34,6 +34,76 @@ old local names at module boundaries while the code is being renamed.
 
 ---
 
+## VTN0. Target architecture and the coherence invariant
+
+This section is normative and governs the others. It names the architecture v2
+is built toward and the single invariant every other section preserves.
+
+**Target: a gossip-routed, actor-local mobile object heap.** The slogan is
+*deterministic VM turns over a mobile, actor-local object heap.* The five
+load-bearing claims:
+
+1. **Authority is the ordered effect-transcript stream, not an object's
+   location.** A committed turn produces an effect transcript (call identity,
+   logical inputs, versioned read set, write set, observations, result,
+   before/after hashes). All durable state is a deterministic function of that
+   stream. Object placement carries no semantic meaning; the system MAY move,
+   copy, evict, split, or merge materialized state freely without changing
+   object identity or user-visible behavior.
+2. **The VM turn is the unit of atomicity** — not the object, not the user task.
+   A turn commits or rolls back as a whole; it is never half-local, half-remote.
+   A state miss is a pre-execution failure: abort before committing, acquire
+   state, retry the whole turn.
+3. **The commit scope is chosen by the turn's write set**, not by a fixed home
+   host. It is the smallest ordering authority that makes this turn's writes
+   atomic, with epoch fencing and explicit rules for multi-scope turns.
+4. **Routing is capability gossip, not a location oracle.** Nodes advertise
+   executable capability (`covers`/`accepts` over typed atoms, an opaque
+   `factor`, scope/epoch/head, TTL); the actor node matches a `TurnKey` and ranks
+   candidates. Ads route work; they never prove authority.
+5. **Remote execution returns state as verifiable cache-fill.** A reply carries
+   the transcript plus content-addressed, receiver-authorization-filtered state
+   transfer. State transfer never grants write authority.
+
+**The coherence invariant (CI) — the one rule that makes the above safe.**
+
+> For every durable cell there is **exactly one authority** (the committing
+> commit-scope head). Every other materialization of that cell — execution
+> cache, projection row, edge mirror, browser holder — is a **derived
+> projection**: content-addressed, carrying explicit `source` provenance, and a
+> pure read-through of the transcript stream at a known `source_head`. No two
+> copies of a cell may be mutated by independent write paths. A derived copy is
+> never used as a write-authority source.
+
+A mobile heap has *many* materializations by design; the CI is what keeps them
+from disagreeing. Every recurring v2 defect to date — per-turn authority
+reconstruction storms, checkpoint staleness, movement `read_version_mismatch`,
+peer-not-seeing-observation — is a CI violation: two copies of one cell mutated
+independently, or a cache hint read as authority. Sections below MUST NOT
+introduce a mechanism that creates a second write path to a cell or that lets a
+non-`authoritative` projection satisfy a plan/commit read.
+
+**Current deployment is a partial realization, not the target.** The shipped
+profile (Cloudflare DO-per-scope authority + sparse MCP gateway shards as
+read-through caches) realizes claims 1–2 and a fixed-assignment special case of
+claim 3, with a static route table standing in for claim 4's gossip and bounded
+transfer modes for claim 5. The mobility of claims 3–5 (write-set-chosen scopes,
+capability gossip, multi-executor placement, the full transfer-mode set) is the
+remaining work. The distinguishing bet of the target is that **execution
+locality is discovered and may migrate**; the current deployment assigns and
+fixes it. Implementation proceeds by strengthening the CI first (so the many
+copies cannot disagree) and then generalizing assignment into mobility. Code or
+spec that hardens fixed assignment in a way that blocks later mobility is a
+regression against this section.
+
+**Conformance.** The CI is machine-checkable on the multi-node test topology: a
+post-turn assertion that every node's derived view of a touched cell equals the
+committed authority at the same head (see the authority/cache gate in
+`tests/worker/`). No change to the authority, cache, fanout, or routing paths is
+conformant unless that gate is green.
+
+---
+
 ## VTN1. Scope and compatibility
 
 The v2 protocol defines node-to-node and browser-node-to-relay messages for a
@@ -673,6 +743,56 @@ contents-as-projection). The materialization-miss requirement that the
 destination room be hydrated before its cells are read survives unchanged as
 VTN10.1.
 
+### VTN8.2 Commit scope chosen by the turn's write set
+
+> **Status: implemented** (the selection rule; route-home *enforcement* of
+> genuine multi-scope turns is deferred — see below). Spec for VTN0 claim 3.
+
+The commit scope is not a fixed home host. It is **derived from the turn's
+authoritative write set** as the smallest single ordering authority that makes
+those writes atomic. Define the authority owner of each authoritative write
+cell:
+
+- `location:<obj>` — owned by the moved object (`<obj>`). Location authority
+  follows the object (CA3 actor-anchored movement), so a relocation commits off
+  the room sequencer.
+- `prop:<obj>` / `verb:<obj>` / `lifecycle:<obj>`, and any object **creation** —
+  owned by the **planning scope** (the turn's active scope). This is the current
+  deployment's fixed-assignment realization of claim 3: the active scope owns the
+  shared and newly-minted cells reachable in the turn.
+- `contents:<obj>` — **excluded**. Since CA4/A4 it is a per-member projection off
+  the commit-validation path, never an authority cell.
+
+The selection over the distinct owner set is:
+
+| Write-set owners | Basis | Commit scope |
+|---|---|---|
+| exactly one object `X` (only its own `location` writes) | `relocation` | `X` (CA3, off the room) |
+| includes the planning scope (room write, creation, or move + room write) | `planning` | the planning scope |
+| ≥2 distinct **non-planning** owners (e.g. two objects relocating with no shared write) | `multi` | the planning scope *(provisional — see enforcement)* |
+
+The `relocation` and `planning` bases are the complete, exhaustive behavior of
+the shipped profile: every turn in the current catalogs reduces to one ordering
+authority. A `multi` turn is the genuine multi-scope case VTN0 claim 3 calls out
+("epoch fencing and explicit rules for multi-scope turns").
+
+**Enforcement of `multi` is deferred to ride on the route-home model (B8 /
+CA10.2).** The current substrate tracks no explicit per-cell home, so it cannot
+distinguish a benign same-scope multi-object move from a true cross-home one.
+Until route homes exist, a `multi` turn keeps the historical planning-scope
+commit and is emitted as a `commit_scope_multi` metric so the multi-scope rate
+is measurable. Once route homes can prove a write crosses a home boundary, a
+genuine cross-home turn MUST be resolved by one of: acquiring a combined/minted
+scope under an epoch fence, routing to a contested executor, or rejection as a
+**clean retryable conflict** (`CommitConflict.reason = "scope_mismatch"`) — never
+a silent accept that drops a cell's distinct authority.
+
+The selection is a single pure function of the effect transcript. Its
+`relocation`-owner sub-decision (the CA3 single-object case) is reused unchanged
+by the general selector, so the chosen commit scope is provably identical to the
+pre-B6 binary rule for every `relocation` and `planning` turn; only the `multi`
+classification and its observability metric are new.
+
 ## VTN9. Catch-up and applied frames
 
 Subscribers consume committed state through applied frames.
@@ -1042,6 +1162,21 @@ type ExecCapabilityAd = {
 };
 ```
 
+`expires_at` is freshness metadata. An implementation MAY transmit it as an
+absolute timestamp or as an equivalent `issued_at` + `ttl` pair; the two carry
+the same meaning and a consumer evaluating freshness against a clock MUST drop
+the ad once it has expired. Freshness is OPTIONAL for in-process/test ads that do
+not stamp time, but any ad that is gossiped or persisted — in particular the
+scope-open cold-start ad below — MUST carry it, so that a stale ad (for example
+one naming an executor reachable only on a prior connection) cannot remain
+selectable across reconnects. The B8 ranking score adds optional `latency_ms`,
+`transfer_cost`, and `failure_penalty` cost components to `factor`
+(`latency_ms + factor + transfer_cost + failure_penalty`); all default to 0, so
+an ad that sets only `factor` ranks as before. An implementation MAY carry `head`
+as the value-version hash alone when `scope` and `epoch` already pin the rest of
+the `ScopeHead`, and MAY compute the `ad` id at its persistence layer rather than
+storing it on the ad object.
+
 During the browser migration, a relay MAY also accept, behind an explicit
 compatibility flag,
 `woo.turn.intent.request.v1` from a browser node. The intent contains `id`,
@@ -1204,17 +1339,56 @@ not advertise, or they advertise narrowly with a worse opaque `factor`.
 Candidate selection:
 
 ```text
-ad not expired
-ad.scope and ad.epoch match the TurnKey
-all TurnKey atoms are probably in ad.covers
-turn-shape atoms are probably in ad.accepts
-TurnKey effects are a subset of ad.effects
-rank by observed latency + ad.factor + estimated transfer cost + failure penalty
+ad not expired                                              # implemented (TTL)
+ad.scope match the TurnKey                                  # implemented
+ad.epoch match the TurnKey                                  # implemented (wildcard-aware)
+all TurnKey atoms are probably in ad.covers                 # implemented (Bloom)
+turn-shape atoms are probably in ad.accepts                 # implemented (Bloom)
+TurnKey effects are a subset of ad.effects                  # implemented (effect mask)
+rank by observed latency + ad.factor + estimated transfer cost + failure penalty  # implemented
 ```
 
 Lower rank scores are better. `factor` is an opaque cost contribution, not a
 quality score; a larger factor makes an otherwise equivalent candidate less
 preferred.
+
+> **Status (B8): implemented as the in-process routing layer.** The ad model
+> (`covers`/`accepts` Bloom, `factor`, `latency_ms`/`transfer_cost`/
+> `failure_penalty`, head, TTL), the ranking score
+> (`latency + factor + transfer_cost + failure_penalty`, lower-is-better, with
+> TTL expiry), and TurnKey-driven candidate selection are implemented and route
+> every in-process/relay turn (the ranked-candidate selector drives the
+> in-process turn network). A Bloom false positive is
+> refused cheaply: the executor returns `missing_state`, the caller warms it by
+> bounded transfer and retries, never corrupting state. Riding on B7 warm
+> cache-fill, this yields execution **migration**: a cold turn runs at the owner
+> and warms the actor node; the next same-object turn ranks the now-warm node
+> best (transfer_cost ≈ 0, latency ≈ 0) and routes local with no further
+> transfer. Gated by `tests/v2-capability-gossip-routing.test.ts`.
+>
+> **Deferred:** retiring the production worker's static scope-submission *behind*
+> this layer (so the deployed gateway ranks gossiped ads instead of submitting to
+> a fixed commit scope) is the highest-reach change and rides on smoke
+> validation, not the local gate. Until then the gossip layer is the in-process
+> router and the static route is the production bootstrap.
+>
+> **Epoch / effect-mask selection — implemented.** The `TurnKey` carries an
+> `epoch` (scope generation) and an `effects` mask (bitwise-OR of the turn's
+> effect classes: read / prop-write / verb-write / move / create / lifecycle /
+> observe / sequenced, derived from the transcript). The coverage predicate
+> enforces both:
+> - **Effect mask:** a turn routes to an ad only when its `effects` are a SUBSET
+>   of the ad's. An ad that does not specify accepted effects is a
+>   full-capability executor (accepts all classes); a constrained node (e.g. a
+>   read-only edge) advertises a narrower mask and will not be selected for a
+>   write/move turn.
+> - **Epoch (wildcard-aware):** a wildcard epoch on either side matches; otherwise
+>   the generations must be equal, so a stale-generation ad cannot route a turn
+>   planned at a newer epoch. Concrete generations are minted by route-epoch
+>   migration (CA10), which is deferred — until then keys and in-process ads carry
+>   the wildcard, so this check is a no-op that becomes load-bearing the moment a
+>   migration stamps a concrete generation. (Per CA10.1, `epoch` is the scope
+>   generation and is kept distinct from the value `head`.)
 
 Ads are advisory. Commit receipts and state proofs are authoritative.
 
@@ -1238,7 +1412,7 @@ authority.
 
 ```ts
 type TransferRequest = {
-  mode: "projection" | "delta" | "closure" | "cell_pages";
+  mode: "projection" | "delta" | "cell_pages";  // `closure` retired (B7)
   base?: ScopeHead;
   max_bytes?: number;
   atoms?: string[];
@@ -1246,7 +1420,7 @@ type TransferRequest = {
 
 type StateTransfer = {
   kind: "woo.state.transfer.v1";
-  mode: "projection" | "delta" | "closure" | "cell_pages";
+  mode: "projection" | "delta" | "cell_pages";  // `closure` retired (B7)
   scope?: ScopeRef;
   base?: ScopeHead;
   to?: ScopeHead;
@@ -1301,10 +1475,16 @@ Transfer modes:
 - `projection`: enough for display and command planning, not authoritative
   execution unless marked as a semantic read by a later committed turn;
 - `delta`: applied frames or transcript tail since a known head;
-- `closure`: legacy executable state bundle for a predicted turn, including
-  cells, parent/feature/verb metadata, bytecode hashes, and permission facts;
 - `cell_pages`: executable state pages selected by `TurnKey` atom preimages,
   with capsule metadata bound into the transfer proof.
+
+> **Retired mode — `closure`.** B7 retired the `closure` mode: a whole-serialized-
+> world bundle for a predicted turn. It is superseded by `cell_pages`, which ships
+> only the touched closure as content-addressed pages (no whole-world copy). The
+> execution path no longer produces `closure`; an executable cache that receives a
+> `closure` transfer from a pre-B7 peer ignores it and requests `cell_pages`. (An
+> `object_records` full-record mode also exists as the executor-repair fallback
+> when page-level closure is unavailable; it is internal and not a planning mode.)
 
 State transfers use `kind: "woo.state.transfer.v1"`. The default fresh-call
 network path uses `mode: "cell_pages"` with content-addressed pages selected
@@ -1321,6 +1501,27 @@ unknown pages are inlined. Install verifies inline pages against their
 advertised page hashes and verifies a state-transfer proof scoped to an anchor
 authority and recipient node. State transfer is driven by exact post-selection
 inventory gaps instead of copying the whole world or whole object records.
+
+### VTN12.1 Commit-reply warm cache-fill (B7)
+
+State transfer is not only a pre-execution repair (filling an executor that
+returned `missing_state`); it is also the post-execution **warm cache-fill** that
+makes "warm the caller" structural rather than a checkpoint hack. After an
+accepted durable commit, an authoritative executor attaches a `cell_pages`
+transfer of the committed turn's closure (`purpose: "accepted_write_cells"`,
+selected on the turn's full `TurnKey` atom set) to the success reply. The caller
+installs it as `source: "cache"` (CA11 / VTN0 CI): a content-addressed,
+provenance-tagged read-through at the post-commit head. The next same-object turn
+then plans locally against the warm cache **without a second remote state
+fetch**; it still commits at the owner's commit scope, because a `source:"cache"`
+cell can never satisfy a commit-validation read (the warmed copy carries no write
+authority). Only an authoritative executor — one that owns the committed
+post-state — produces the warm transfer; a sparse executor returns none. The
+transfer is verifiable (anchor-MAC proof, recipient `"*"` or the caller node) and
+measurable, which is what B8's `estimated_transfer_cost` ranking consumes. The
+two-node conformance case (remote execute → install reply transfer → next turn
+local with zero further transfers) is gated by
+`tests/v2-state-transfer-warmfill.test.ts`.
 
 Browser relays also implement `mode: "projection"` and `mode: "delta"` for
 display/cache catch-up. Opening a scope installs a projection transfer instead
@@ -1476,6 +1677,17 @@ live/direct safe. A live/direct-safe verb:
 
 A browser node is a v2 node running inside a browser, normally as a Web Worker.
 It is not just a renderer.
+
+> **Status (B9): this is the normative browser profile.** It subsumes the legacy
+> standalone [browser-host.md](browser-host.md) bootstrap protocol and closes the
+> "browser is a divergent holder" fork — the browser has no second write path,
+> only optimistic execution plus server-validated commits, so its authoritative
+> view is the server commit scope. The browser node inherits the general
+> machinery rather than re-implementing it: commit-scope selection by write set
+> (VTN8.2 / B6), warm cache-fill from the commit reply (VTN12.1 / B7), and
+> capability-gossip ranking for its narrow session-local ad (VTN11 / B8). Gated by
+> the browser-node server-validation / no-divergent-holder case in the browser-node
+> test suite plus the optimistic-reconciliation cases in the v2 browser suite.
 
 Required browser-node components:
 
@@ -2131,7 +2343,10 @@ spreading.
 3. **IndexedDB execution cache.** The browser worker persists verified
    executable pages with proof metadata, installs an open-time executable seed
    for the current scope, reconstructs an execution node from IndexedDB, and
-   refuses to use projection rows for VM reads. Contiguous accepted transcripts
+   refuses to use projection rows for VM reads. The open-time seed covers the
+   scope's lineage, located contents, and the objects anchored to that scope
+   because anchor-cluster objects such as room exits can be referenced from
+   scope properties without appearing in `contents`. Contiguous accepted transcripts
    are materialized into accepted write-cell pages; accepted transcript-tail
    replay is not a VM-read fallback. Transcript replay remains only for
    tentative overlays and write-cell promotion materialization.

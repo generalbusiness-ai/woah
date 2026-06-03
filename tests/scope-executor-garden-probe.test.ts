@@ -1,3 +1,4 @@
+import { authoritativePlanningWorld } from "../src/core/planning-world";
 import { describe, expect, it } from "vitest";
 import { createWorld, createWorldFromSerialized } from "../src/core/bootstrap";
 import { createShadowCommitScope } from "../src/core/shadow-commit-scope";
@@ -113,7 +114,7 @@ describe("scope-executor garden probe", () => {
       args: []
     };
 
-    const planned = await runShadowTurnCall(fullSerialized, call);
+    const planned = await runShadowTurnCall(authoritativePlanningWorld(fullSerialized), call);
 
     const writeObjects = Array.from(
       new Set(
@@ -164,7 +165,7 @@ describe("scope-executor garden probe", () => {
     };
 
     // Plan against full state to get the canonical key.
-    const planned = await runShadowTurnCall(fullSerialized, call);
+    const planned = await runShadowTurnCall(authoritativePlanningWorld(fullSerialized), call);
     const key = shadowTurnKeyFromTranscript(planned.transcript);
     const realScope = key.scope;
 
@@ -313,7 +314,7 @@ describe("scope-executor garden probe", () => {
       args: []
     };
 
-    const planned = await runShadowTurnCall(fullSerialized, call);
+    const planned = await runShadowTurnCall(authoritativePlanningWorld(fullSerialized), call);
     const key = shadowTurnKeyFromTranscript(planned.transcript);
     const realScope = key.scope;
 

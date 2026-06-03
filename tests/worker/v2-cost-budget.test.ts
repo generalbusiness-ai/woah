@@ -1,3 +1,4 @@
+import { authoritativePlanningWorld } from "../../src/core/planning-world";
 import { describe, expect, it, vi } from "vitest";
 import { installVerb } from "../../src/core/authoring";
 import { serializedWorldFromAuthoritySlice } from "../../src/core/authority-slice";
@@ -623,7 +624,7 @@ async function makeCostHarness(): Promise<CostHarness> {
       verb: "set_value",
       args: [67]
     };
-    const planned = await runShadowTurnCall(serializedFor(browser.relay.commit_scope), call);
+    const planned = await runShadowTurnCall(authoritativePlanningWorld(serializedFor(browser.relay.commit_scope)), call);
     const request = {
       kind: "woo.turn.exec.request.shadow.v1" as const,
       id: call.id,

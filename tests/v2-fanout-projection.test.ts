@@ -6,9 +6,12 @@ import {
   affectedBrowserFanoutScopes,
   affectedMcpFanoutScopes,
   affectedTranscriptScopes,
+  buildV2FanoutLiveEvents,
   computedShadowLiveAudience,
+  planV2BrowserFanout,
   shadowLiveEventMatchesPeerScope,
-  withComputedLiveAudience
+  withComputedLiveAudience,
+  type V2FanoutPeer
 } from "../src/core/v2-fanout-projection";
 
 function makeTranscript(partial: Partial<EffectTranscript> = {}): EffectTranscript {
@@ -161,5 +164,100 @@ describe("shadowLiveEventMatchesPeerScope", () => {
     expect(shadowLiveEventMatchesPeerScope(event, peer)).toBe(true);
     const otherScope = { scope: "the_deck" } as unknown as ShadowLiveEvent;
     expect(shadowLiveEventMatchesPeerScope(otherScope, peer)).toBe(false);
+  });
+});
+
+describe("buildV2FanoutLiveEvents", () => {
+  it("recomputes each observation's audience from the host's per-observation lists and drops unaddressable events", () => {
+    const transcript = makeTranscript({
+      scope: "the_chatroom",
+      observations: [
+        { type: "said", source: "the_chatroom", actor: "guest_1", text: "hi" },
+        { type: "secret", source: "the_chatroom", actor: "guest_1", text: "psst" }
+      ] as unknown as EffectTranscript["observations"]
+    });
+    // Observation 0 is heard by guest_2; observation 1 has no present recipient.
+    const events = buildV2FanoutLiveEvents("relay:node", transcript, {
+      observationAudiences: [["guest_2"], []],
+      observationSessionAudiences: [["session_2"], []]
+    });
+    // The unaddressable second observation is dropped entirely.
+    expect(events).toHaveLength(1);
+    expect(events[0].observation).toMatchObject({ type: "said", text: "hi" });
+    // The audience is the recomputed authoritative one, NOT the transcript's
+    // default {scope: source}.
+    expect(events[0].audience).toEqual({ actors: ["guest_2"], sessions: ["session_2"] });
+  });
+
+  it("returns no events when there are no observations", () => {
+    expect(buildV2FanoutLiveEvents("relay:node", makeTranscript(), {})).toEqual([]);
+  });
+});
+
+describe("planV2BrowserFanout", () => {
+  const evChatroom = { id: "e1", scope: "the_chatroom", audience: { scope: "the_chatroom" } } as unknown as ShadowLiveEvent;
+  const evEnteredDeck = { id: "e2", scope: "the_deck", audience: { scope: "the_deck" } } as unknown as ShadowLiveEvent;
+  const evPrivate = { id: "e3", scope: "the_chatroom", audience: { actors: ["guest_named"] } } as unknown as ShadowLiveEvent;
+
+  function peer(node: string, scope: string, actor = `${node}_actor`, sessionId = `${node}_session`): V2FanoutPeer {
+    return { node, sessionId, actor, scope };
+  }
+
+  it("delivers a room event only to peers bound to that room, and flags commit-scope peers for state-transfer", () => {
+    const plan = planV2BrowserFanout({
+      events: [evChatroom],
+      commitScope: "the_chatroom",
+      peers: [peer("a", "the_chatroom"), peer("b", "the_deck")]
+    });
+    // Peer a (in the chatroom) receives the event; peer b (in the deck) does not.
+    expect(plan.liveDeliveries).toEqual([{ node: "a", events: [evChatroom] }]);
+    // Peer a is at the commit scope, so it also re-syncs its projection.
+    expect(plan.stateTransferNodes).toEqual(["a"]);
+  });
+
+  it("routes a cross-room move's per-room events to the right rooms (the drift this fixes)", () => {
+    // A relocation commits at the actor's scope but emits a `left` (source room)
+    // and an `entered` (destination room) observation. A peer in the source
+    // room gets the source event; a peer in the destination room gets the
+    // destination event. The old subscription-of-commit-scope dev path would
+    // deliver NEITHER (nobody subscribes to the actor commit scope).
+    const evLeftChatroom = { id: "left", scope: "the_chatroom", audience: { scope: "the_chatroom" } } as unknown as ShadowLiveEvent;
+    const plan = planV2BrowserFanout({
+      events: [evLeftChatroom, evEnteredDeck],
+      commitScope: "mover_actor", // relocation commit scope = the moved actor
+      peers: [peer("src", "the_chatroom"), peer("dst", "the_deck"), peer("mover", "mover_actor", "mover_actor")],
+      originNode: "mover"
+    });
+    expect(plan.liveDeliveries).toEqual([
+      { node: "src", events: [evLeftChatroom] },
+      { node: "dst", events: [evEnteredDeck] }
+    ]);
+    // The only commit-scope peer is the mover itself, which is the origin and
+    // therefore excluded — so no state-transfer target.
+    expect(plan.stateTransferNodes).toEqual([]);
+  });
+
+  it("keeps a private (actor-audience) event off room peers and delivers it only to the named actor", () => {
+    const plan = planV2BrowserFanout({
+      events: [evPrivate],
+      commitScope: "the_chatroom",
+      peers: [peer("named", "the_chatroom", "guest_named"), peer("other", "the_chatroom", "guest_other")]
+    });
+    expect(plan.liveDeliveries).toEqual([{ node: "named", events: [evPrivate] }]);
+    // Both peers are at the commit scope, so both re-sync regardless of the
+    // private live event.
+    expect(plan.stateTransferNodes).toEqual(["named", "other"]);
+  });
+
+  it("excludes the origin node and already-delivered nodes from BOTH live delivery and state-transfer", () => {
+    const plan = planV2BrowserFanout({
+      events: [evChatroom],
+      commitScope: "the_chatroom",
+      peers: [peer("origin", "the_chatroom"), peer("dup", "the_chatroom"), peer("fresh", "the_chatroom")],
+      originNode: "origin",
+      alreadyDeliveredNodes: new Set(["dup"])
+    });
+    expect(plan.liveDeliveries).toEqual([{ node: "fresh", events: [evChatroom] }]);
+    expect(plan.stateTransferNodes).toEqual(["fresh"]);
   });
 });

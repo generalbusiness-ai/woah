@@ -13,32 +13,32 @@
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import type { EffectTranscript } from "../core/effect-transcript";
-import { buildSerializedAuthorityCellSlice, combineSerializedAuthoritySlices, serializedWorldFromAuthoritySlice } from "../core/authority-slice";
+import { buildSerializedAuthorityCellSlice, cellProvenanceFromAuthoritySlice, combineSerializedAuthoritySlices, serializedWorldFromAuthoritySlice } from "../core/authority-slice";
 import { wooError, type AppliedFrame, type DirectResultFrame, type ErrorFrame, type ErrorValue, type Message, type ObjRef, type Session, type WooValue } from "../core/types";
 import type { WooWorld } from "../core/world";
-import type { SerializedAuthoritySlice, SerializedObject, SerializedSession, SerializedWorld } from "../core/repository";
+import type { SerializedAuthoritySlice } from "../core/repository";
 import { projectionDeltaMissingWrites, type ProjectionWrite } from "../core/projection-delta";
 import { createMcpServer } from "./server";
 import { McpHost, type McpAcceptedFrameAudience, type McpBroadcastHooks, type McpDispatchHooks, type McpToolManifestHooks } from "./host";
+import { createShadowBrowserRelayShim } from "../core/shadow-browser-node";
 import {
-  createShadowBrowserRelayShim,
-  markShadowBrowserRelaySerializedChanged,
-  type ShadowBrowserRelayShim
-} from "../core/shadow-browser-node";
+  applyAcceptedFrameToDerivedRelayCache,
+  applyAcceptedFrameToRelayCache,
+  mergeAuthorityIntoRelayCache,
+  type ShadowRelayCache
+} from "../core/shadow-relay-cache";
 import type { ShadowTurnCall } from "../core/shadow-turn-call";
 import {
-  applyAcceptedShadowFrame,
-  applyShadowTranscriptToCommitScopeCache,
   serializedFor,
   type ShadowCommitAccepted,
   type ShadowScopeHead
 } from "../core/shadow-commit-scope";
+import { affectedTranscriptScopes } from "../core/v2-fanout-projection";
 import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import {
   V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED,
   buildExecutionCapsule,
   executorEnvelopeId,
-  mergeExecutorAuthority,
   submitTurnIntent,
   executorAuthorityPayload,
   type ExecutionCapsule
@@ -96,7 +96,6 @@ export type McpV2ClientHooks = {
       directorySessionScopes?: ObjRef[];
       reconstructionReason?: "warm_turn_refresh" | "cold_open" | "missing_state_repair";
       reconstructionScope?: ObjRef;
-      checkpointHead?: ShadowScopeHead | null;
     }
   ) => Promise<ReturnType<typeof executorAuthorityPayload>>;
   executionCapsuleOpen?: boolean;
@@ -147,7 +146,7 @@ export type McpV2EnvelopeResult = {
 
 type V2ScopeClient = {
   scope: ObjRef;
-  relay: ShadowBrowserRelayShim;
+  relay: ShadowRelayCache;
   openedSessions: Set<string>;
   openingSessions: Map<string, Promise<void>>;
 };
@@ -399,8 +398,8 @@ export class McpGateway {
     this.rememberRemoteAccepted(remoteAcceptedKey(entry.commit));
     const client = this.v2Scopes.get(scope);
     if (client) {
-      applyAcceptedShadowFrame(client.relay.commit_scope, entry.commit, entry.transcript);
-      markShadowBrowserRelaySerializedChanged(client.relay);
+      // This relay OWNS the frame's scope (fanout for its own commit) — advance head.
+      applyAcceptedFrameToRelayCache(client.relay, entry.commit, entry.transcript, { advanceHead: true });
     }
     if (entry.commit.projection_delta) {
       // Worker gateways persist accepted fanout into SQL before calling this
@@ -420,7 +419,7 @@ export class McpGateway {
     } else {
       this.world.applyCommittedShadowTranscript(entry.transcript);
     }
-    this.propagateTranscriptToOtherScopes(entry.commit.position.scope, entry.transcript);
+    this.propagateTranscriptToOtherScopes(entry.commit.position.scope, entry.commit, entry.transcript);
     if (!entry.routed) this.routeRemoteAcceptedFrame(entry);
   }
 
@@ -630,6 +629,22 @@ export class McpGateway {
       clientNode: () => this.v2NodeFor(entry),
       clientHead: (client) => client.relay.commit_scope.head,
       clientSerialized: (client) => serializedFor(client.relay.commit_scope, { reason: "mcp_turn_plan", metric: (event) => this.world.recordMetric(event) }),
+      // A3.2 admission gate (ENFORCED at the VM boundary via buildPlanningWorld):
+      // thread the relay's per-cell provenance. A presentation stub raises a
+      // repairable E_NEED_STATE (the repair loop refreshes the named object and
+      // re-plans). The gateway relay records provenance on every authority merge
+      // AND on accepted-frame application (recordAcceptedCommitScopeCellProvenance), so
+      // it opts IN to fatal missing_provenance enforcement (#11): an untagged tracked
+      // cell raises a repairable E_NEED_STATE that the repair loop resolves (and the
+      // refreshed authority records its provenance, so it converges). Any residual
+      // under-tagged cell self-heals on first touch rather than serving silently.
+      clientPlanningProvenance: (client) => client.relay.commit_scope.cellProvenance ?? new Map(),
+      enforceMissingProvenance: true,
+      onAdmissionViolation: (violations) => {
+        for (const v of violations) {
+          console.warn("woo.planning_world_inadmissible", { where: "mcp_turn_plan", scope, kind: v.kind, object: v.object, page: v.page, detail: v.detail });
+        }
+      },
       nextTurnId: () => id,
       envelopeId: (turnId, attempt) => executorEnvelopeId(turnId, attempt, () => Math.random().toString(36).slice(2, 10)),
       authorityPayload: async (submitScope, extraObjectIds, context) => {
@@ -644,8 +659,7 @@ export class McpGateway {
           tolerateRemoteFailures: isPrePlan,
           directorySessionScopes: options.directorySessionScopes ?? [],
           reconstructionReason: "warm_turn_refresh",
-          reconstructionScope: submitScope,
-          checkpointHead: this.v2Scopes.get(submitScope)?.relay.commit_scope.head ?? null
+          reconstructionScope: submitScope
         });
         const fallbackClient = this.v2Scopes.get(scope) ?? this.v2Scopes.get(submitScope);
         const authorityPayload = fallbackClient && (payload.staleFallbackCount ?? 0) > 0
@@ -730,7 +744,10 @@ export class McpGateway {
         relay: createShadowBrowserRelayShim({
           node: `mcp-v2-relay:${scope}`,
           scope,
-          serialized: seeded.serialized
+          serialized: seeded.serialized,
+          // Authority-derived seed: carry the slice's real per-cell provenance
+          // (authoritative/projection/cache per page), not a flat `cache`.
+          seedCellProvenance: cellProvenanceFromAuthoritySlice(seeded.authority.authority)
         }),
         openedSessions: new Set(),
         openingSessions: new Map()
@@ -825,7 +842,6 @@ export class McpGateway {
       directorySessionScopes?: ObjRef[];
       reconstructionReason?: "warm_turn_refresh" | "cold_open" | "missing_state_repair";
       reconstructionScope?: ObjRef;
-      checkpointHead?: ShadowScopeHead | null;
     } = {}
   ): Promise<ReturnType<typeof executorAuthorityPayload>> {
     return await (
@@ -841,15 +857,12 @@ export class McpGateway {
   }
 
   private mergeV2AuthorityIntoScopeClient(client: V2ScopeClient, authority: SerializedAuthoritySlice): void {
-    // The gateway keeps one relay per scope and mutates its serialized snapshot
-    // with fresh session/actor authority. Relay-level cache generation must
-    // move with that snapshot or open executable seed digests can validate
-    // against pre-refresh pages.
-    const serialized = serializedFor(client.relay.commit_scope, { reason: "mcp_authority_merge" });
-    const preservedActorLive = preserveSessionActorLiveCells(serialized, authority.sessions);
-    mergeExecutorAuthority(serialized, authority);
-    restoreSessionActorLiveCells(serialized, preservedActorLive);
-    markShadowBrowserRelaySerializedChanged(client.relay);
+    // The gateway keeps one relay per scope and mutates its serialized snapshot with
+    // fresh session/actor authority. The shared relay-cache merge carries the relay's
+    // per-cell provenance (so the admission gate / merge precedence apply uniformly),
+    // preserves the session actors' live cells across the refresh, and bumps the
+    // relay-cache generation when the snapshot changed.
+    mergeAuthorityIntoRelayCache(client.relay, authority, { preserveSessionActorLive: true, reason: "mcp_authority_merge" });
   }
 
   private withRelaySnapshotAuthorityFallback(
@@ -871,7 +884,12 @@ export class McpGateway {
         parkedTaskCounter: serialized.parkedTaskCounter,
         sessionCounter: serialized.sessionCounter
       },
-      tombstones: serialized.tombstones
+      tombstones: serialized.tombstones,
+      // A3: this is the MCP shard's last-known relay view, included only on a
+      // cold-owner degrade (staleFallbackCount > 0). It is a fallback derivation,
+      // never the owner's authoritative row — fresh owner rows override it
+      // because the payload is combined last.
+      pageProvenance: () => ({ source: "fallback" })
     });
     return {
       ...payload,
@@ -887,8 +905,8 @@ export class McpGateway {
     audience?: McpAcceptedFrameAudience
   ): void {
     if (!reply.commit || !reply.transcript) return;
-    applyAcceptedShadowFrame(client.relay.commit_scope, reply.commit, reply.transcript);
-    markShadowBrowserRelaySerializedChanged(client.relay);
+    // This relay OWNS the committed scope — advance head via the shared applier.
+    applyAcceptedFrameToRelayCache(client.relay, reply.commit, reply.transcript, { advanceHead: true });
     const projectionWrites = reply.commit.projection_writes ?? [];
     if (reply.commit.projection_delta) {
       assertProjectionWritesComplete(reply.commit.projection_delta, projectionWrites, reply.commit.position.scope, "mcp");
@@ -905,7 +923,7 @@ export class McpGateway {
         ? { skipObjectHost: { hostKey: localHostMaterialized.hostKey, gatewayHost: localHostMaterialized.gatewayHost === true } }
         : {});
     }
-    this.propagateTranscriptToOtherScopes(reply.commit.position.scope, reply.transcript);
+    this.propagateTranscriptToOtherScopes(reply.commit.position.scope, reply.commit, reply.transcript);
     this.host.routeShadowAcceptedFrame(reply.commit, originSessionId, reply.transcript, audience);
   }
 
@@ -918,11 +936,35 @@ export class McpGateway {
   // the deck client's snapshot but the chatroom client's snapshot still has
   // actor.location=the_deck, and the very next actor verb routed to the
   // chatroom scope reads the stale location.
-  private propagateTranscriptToOtherScopes(originScope: ObjRef, transcript: EffectTranscript): void {
+  // An accepted commit under `originScope` can affect objects/actors that a
+  // DIFFERENT open relay plans against — most importantly a cross-scope MOVE,
+  // which commits under the moved object's own scope but changes the source and
+  // destination rooms' membership and the moved actor's row. Those other relays
+  // must learn the authoritative rows from the accepted transcript stream, or a
+  // live read (e.g. `who`) planning against a stale relay snapshot renders the
+  // moved actor with no materialized name/lineage. This is derived materialization
+  // from the accepted stream (VTN0) — NOT a head advance and NOT a second
+  // authority: the target relay's head belongs to its own commit sequence, so we
+  // apply projection rows + movement projection WITHOUT touching head.
+  //
+  // Bounded to the transcript's affected scopes (move from/to, creates with a
+  // location, contents/presence writes); we do not touch every open relay.
+  private propagateTranscriptToOtherScopes(
+    originScope: ObjRef,
+    accepted: ShadowCommitAccepted,
+    transcript: EffectTranscript
+  ): void {
+    const affected = new Set(affectedTranscriptScopes(
+      originScope,
+      transcript,
+      (object, property) => this.world.isPresenceProjectionProperty(object, property)
+    ));
     for (const [scope, client] of this.v2Scopes) {
       if (scope === originScope) continue;
-      applyShadowTranscriptToCommitScopeCache(client.relay.commit_scope, transcript);
-      markShadowBrowserRelaySerializedChanged(client.relay);
+      if (!affected.has(scope)) continue;
+      // The one shared derived-cache application (authority rows + movement
+      // projection + provenance + dirty-mark, no head advance).
+      applyAcceptedFrameToDerivedRelayCache(client.relay, accepted, transcript);
     }
   }
 
@@ -1147,46 +1189,6 @@ function synthesizeInitializeRequest(): Request {
       }
     })
   });
-}
-
-type PreservedActorLiveCells = {
-  location: SerializedObject["location"];
-  children: SerializedObject["children"];
-  contents: SerializedObject["contents"];
-};
-
-function preserveSessionActorLiveCells(
-  serialized: Pick<SerializedWorld, "objects">,
-  sessions: readonly SerializedSession[]
-): Map<ObjRef, PreservedActorLiveCells> {
-  const actors = new Set(sessions.map((session) => session.actor));
-  const preserved = new Map<ObjRef, PreservedActorLiveCells>();
-  for (const obj of serialized.objects) {
-    if (!actors.has(obj.id)) continue;
-    preserved.set(obj.id, {
-      location: obj.location,
-      children: obj.children.slice(),
-      contents: obj.contents.slice()
-    });
-  }
-  return preserved;
-}
-
-function restoreSessionActorLiveCells(
-  serialized: Pick<SerializedWorld, "objects">,
-  preserved: ReadonlyMap<ObjRef, PreservedActorLiveCells>
-): void {
-  if (preserved.size === 0) return;
-  for (const obj of serialized.objects) {
-    const live = preserved.get(obj.id);
-    if (!live) continue;
-    // Per-turn authority refreshes may source an actor row from a sparse owner
-    // snapshot. Keep the gateway relay's accepted derived live projection
-    // cells while allowing actor lineage and property cells to refresh.
-    obj.location = live.location;
-    obj.children = live.children.slice();
-    obj.contents = live.contents.slice();
-  }
 }
 
 export type { ObjRef };

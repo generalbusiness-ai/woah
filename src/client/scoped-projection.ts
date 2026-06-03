@@ -72,8 +72,15 @@ export const scopedModelWithCurrentLocation = scopedModelWithActiveScope;
 export function scopedModelWithMoveResult(model: ScopedProjectionStateModel, result: any): ScopedProjectionStateModel {
   if (!result || typeof result !== "object" || Array.isArray(result)) return model;
   let next = model;
-  if (result.here && typeof result.here === "object" && !Array.isArray(result.here)) next = scopedModelWithHere(next, result.here);
-  if (typeof result.room === "string") next = scopedModelWithActiveScope(next, result.room);
+  const hasHereSnapshot = result.here && typeof result.here === "object" && !Array.isArray(result.here);
+  if (hasHereSnapshot) next = scopedModelWithHere(next, result.here);
+  if (typeof result.room === "string") {
+    next = scopedModelWithActiveScope(next, result.room);
+    const hereId = typeof next.here?.id === "string" ? next.here.id : "";
+    if (!hasHereSnapshot && hereId && hereId !== result.room) {
+      next = scopedModelWithHere(next, null);
+    }
+  }
   return next;
 }
 

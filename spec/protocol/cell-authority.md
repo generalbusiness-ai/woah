@@ -102,6 +102,15 @@ The move's authority owner MAY change only through the general migration
 protocol (CA10); ordinary movement of an object between parents does **not**
 migrate the object's location authority — that authority follows the object.
 
+CA3 is the `relocation` case of the **general write-set-derived commit-scope
+selection** ([v2-turn-network.md §VTN8.2](v2-turn-network.md#vtn82-commit-scope-chosen-by-the-turns-write-set)).
+A pure single-object move (the write set is only that object's `location` cells)
+commits at the object's own scope, off the room sequencer. A turn that also
+writes a room-owned cell commits at the planning scope, which serializes that
+shared cell; the actor-location write rides along atomically. Conformance CA14.3
+(two actors entering one room both retain membership) is exercised concurrently
+by the `gate:authority` walkthrough's B6 step.
+
 ## CA4. Contents as a per-member projection
 
 Room (and container) contents are derived:
@@ -227,6 +236,36 @@ globally promote movement to room-anchored.
 
 ## CA8. Live delivery and transitive presence
 
+Two distinct accepted-transcript effects drive distinct projections. A physical
+`object_move` (the actor's `live:location` write) drives **containment**
+projections (`object.contents`). A first-class **session active-scope
+transition** drives **presence** projections (the session/actor subscriber lists)
+and session-row materialization. Presence is keyed by *session placement*, not
+physical containment, so the transition is recorded whenever a session's active
+scope changes — **including a no-op physical enter** (the actor was already in the
+room) — and its reliable `from`/`to` replace a possibly-sparse move's `from`:
+
+```ts
+type SessionScopeTransition = {
+  session: string;
+  actor: ObjRef;
+  from: ObjRef | null;
+  to: ObjRef | null;
+};
+```
+
+The transition is **implemented** (`TranscriptSessionScopeTransition` on the
+effect transcript): recorded by the substrate on every active-scope change,
+carried in the transcript hash, included in affected fanout scopes and projection
+write-through, and applied by every materializer (indexed commit-scope state,
+per-host object slice, in-place gateway). It is validation-exempt from CA3
+object-cell write authority (routing/presence state, not an authoritative cell)
+but **not** trust-exempt: it is validated structurally (it must name the turn's
+session and actor, and its `from` must agree with authoritative session pre-state
+where locally knowable). A move alone no longer drives presence; presence
+projections are recomputed per-shard from the transition, so a peer's partial
+whole-row snapshot can never clobber another shard's disjoint presence rows.
+
 A movement commit emits a durable movement event carrying enough for both
 projection owners and gateway session tables:
 
@@ -245,7 +284,11 @@ type MovementCommitted = {
 - Live routing MUST use the VTN12/VTN13 session/audience table, not Directory
   `current_location` as the hot-path fanout key. The movement event is precisely
   the change that invalidates location-derived routing, so routing MUST NOT
-  depend on a globally consistent current-location read at fanout time.
+  depend on a globally consistent current-location read at fanout time. The
+  audience for a space is therefore the live sessions whose `activeScope` equals
+  that space (the session table), unioned with the durable presence projection
+  for back-compat — a session born in its home room with no enter turn is present
+  via the session table even though no transition ever wrote its projection row.
 - **Transitive presence** (a player inside a vehicle inside a room) MUST be
   resolved through the session table's cached effective-room, updated on
   movement, NOT by walking `live:location` cells across homes per delivered
@@ -425,11 +468,64 @@ planning cache, not a new authority source:
   budget, the gateway may serve the repaired payload for the current attempt,
   but it MUST NOT store the oversized union or emit a sticky-repair health
   signal.
-- Authority-slice page references SHOULD carry page-level `source` and
-  `source_host` provenance. A gateway may trust a remote page as owner-sourced
-  when `source == "authoritative"` and `source_host` is the responding owner;
-  cache/fallback/projection pages can fill local gaps for planning, but they
-  must not override local or fresher owner rows.
+- Authority-slice page references MUST carry a page-level `source` discriminator
+  (A3): the authority-slice builder cannot construct a slice without declaring,
+  per page, whether it is the owner's authoritative row or a
+  cache/projection/fallback/gossip derivation. A gateway TRUSTS a remote page as
+  authority ONLY when `source == "authoritative"` and `source_host` is the
+  responding owner. Cache/fallback/projection/gossip pages MAY fill a local gap
+  for planning, but MUST NOT override a local or fresher owner row and MUST NOT
+  be treated as a write-authority source. This is the typed enforcement of CA2's
+  "a projection cell MUST NOT be used as a write-authority source": provenance is
+  load-bearing, not advisory. (A3.2 extends the same refusal into the VM planning
+  read path; A3.1 establishes it at the authority-slice merge boundary.)
+  The `source` field is mandatory at the type level on an authority page ref
+  (distinct from an execution-transfer page ref, which omits it), so EVERY
+  constructor — including the bridge that converts a legacy object-row slice
+  into cell pages — must stamp provenance. A bridge or merge step that cannot
+  prove a page is the owner's current authoritative row MUST stamp a
+  non-authoritative source (e.g. `fallback`) rather than fabricate
+  `authoritative`; the page can still fill a planning gap but is never trusted
+  as write-authority.
+- Authority-slice combination and merge MUST resolve a per-cell contest by
+  provenance precedence, NOT by slice arrival order: rank
+  `authoritative > projection > cache > fallback > gossip`. An authoritative cell
+  is never displaced by a derived page; among equal-rank derived pages a later
+  (fresher) contribution wins. Additionally, a **presentation stub** — an
+  `object_lineage` page whose `name` equals its object id — is never admissible as
+  planning identity for a real object: it MUST NOT win a contest against a named
+  page of equal rank, and a named lineage page (any source) MUST repair a current
+  `name===id` cell whose recorded provenance is not `authoritative`, even when that
+  cell entered the planning world via a non-provenance-recording seed (its
+  provenance is then unknown and treated as repairable, not as protected
+  authority). This is the combine/merge expression of "a derived copy is never a
+  write-authority source" (CA2/VTN0) and of the PlanningWorld admission rule
+  (presentation stubs are inadmissible). A planning materialization that seeds a
+  relay/commit-scope world directly from a serialized snapshot MUST capture the
+  per-cell provenance of that seed's authority slice, so a seeded stub does not
+  default to protected-authority and block its own repair.
+- The admission rule is ENFORCED at the planning/VM boundary — the single point
+  where a materialized world becomes the VM's readable world — not merely at the
+  merge. When the planning world carries a presentation stub for a tracked identity
+  cell, the boundary MUST refuse it. Refusal is by REPAIR, not a hard fail: the
+  boundary raises a repairable missing-state (`E_NEED_STATE`) naming the stubbed
+  object so the turn-submission retry loop refreshes that object's authority and
+  re-plans against the named identity. Only a stub that survives the bounded repair
+  retry (identity genuinely unresolvable) fails the turn — which is the correct loud
+  signal, never a silently-served id-as-name. The refusal covers EVERY tracked cell
+  (object_lineage AND object_live), not lineage alone. A non-stub cell whose
+  provenance is unknown (`missing_provenance`) is likewise refused-by-repair on any
+  path that opts in (`enforceMissingProvenance`) — required of a path whose planning
+  worlds are universally provenance-tagged. The sparse gateway is such a path: it
+  records provenance on every authority merge AND on accepted-frame application, so
+  it enforces missing_provenance; any residual under-tagged cell self-heals on first
+  touch (the repair's refreshed authority records its provenance, so it converges)
+  rather than serving silently. The browser holder relay likewise records per-cell
+  provenance — comprehensively at seed and incrementally on accepted-frame
+  application — and so also enforces missing_provenance. A path that is authoritative
+  by construction (owner full-state / bootstrap snapshot) declares its cells trusted
+  and is not subject to missing_provenance. Substrate refs (the `$`-prefixed
+  namespace) are named by their ref by convention and are not presentation stubs.
 - Implementations MUST bound checkpoint count by memory policy, for example an
   LRU cap. A gateway must never accumulate one full slice per scope forever.
 

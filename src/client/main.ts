@@ -3382,12 +3382,14 @@ function receiveChatEvent(observation: any, shouldRender = true, options: { prov
 function applyScopedMoveResult(result: any) {
   if (!result || typeof result !== "object" || Array.isArray(result)) return;
   if (!state.scopedProjection) state.scopedProjection = { inventory: [], overlays: {} };
+  const movedRoom = typeof result.room === "string" ? result.room : "";
   state.scopedProjection = scopedModelWithMoveResult(state.scopedProjection, result);
-  if (typeof result.room === "string" || (result.here && typeof result.here === "object" && !Array.isArray(result.here))) {
+  if (movedRoom || (result.here && typeof result.here === "object" && !Array.isArray(result.here))) {
     scopedProjectionLocalRevision += 1;
-    syncV2BrowserWorkerScope();
+    syncV2BrowserWorkerScope(movedRoom || undefined);
   }
   applyScopedProjectionModel();
+  if (movedRoom && state.tab === "chat") syncUrlFromCurrentState("replace");
 }
 
 function applyScopedProjectionModel() {

@@ -3,12 +3,21 @@ import { describe, expect, it } from "vitest";
 import type { EffectTranscript } from "../src/core/effect-transcript";
 import type { SerializedObject, SerializedWorld } from "../src/core/repository";
 import {
+  acceptedFrameTrackedObjectIds,
+  applyAcceptedProjectionToCommitScopeCache,
   applyShadowTranscriptToCommitScopeCache,
   applyShadowTranscriptToIndexedState,
   createShadowCommitScope,
+  recordAcceptedCommitScopeCellProvenance,
+  selectCommitScopeForTranscript,
   serializedFor,
-  transcriptTouchedObjectIds
+  shadowCommitScopeForTranscript,
+  shadowLocationCommitScopeForTranscript,
+  transcriptTouchedObjectIds,
+  type ShadowCommitAccepted
 } from "../src/core/shadow-commit-scope";
+import type { TranscriptCreate, TranscriptMove, TranscriptWrite } from "../src/core/effect-transcript";
+import { planningCellKey } from "../src/core/planning-world";
 import type { MetricEvent } from "../src/core/types";
 
 describe("shadow commit scope", () => {
@@ -171,6 +180,142 @@ describe("shadow commit scope", () => {
     expect(applied.state.parkedTasks).toContainEqual(parkedTask);
     expect(applied.state.tombstones).toContain("recycled_new");
   });
+
+  it("emits an authoritative object upsert for a move-only transcript (CA5 materialization)", () => {
+    // Regression: a cross-scope move records only `moves` + a `live:location`
+    // authority write; the moved object's own row is not otherwise touched. The
+    // accepted commit MUST still carry an objects-projection upsert for the moved
+    // object, with its REAL authoritative row (name "Mover", not a synthetic id
+    // row), so a sparse destination shard materializes its lineage/name cell and
+    // `who`/roster resolves a display name instead of the raw id.
+    const before: SerializedWorld = {
+      version: 1,
+      objectCounter: 1,
+      parkedTaskCounter: 1,
+      sessionCounter: 1,
+      objects: [
+        objectRecord("mover", "Mover", "room", []),
+        objectRecord("room", "Room", null, ["mover"]),
+        objectRecord("dest", "Dest", null, [])
+      ],
+      sessions: [],
+      logs: [],
+      snapshots: [],
+      parkedTasks: [],
+      tombstones: []
+    };
+    const transcript: EffectTranscript = {
+      kind: "woo.effect_transcript.shadow.v1",
+      id: "move-only",
+      route: "sequenced",
+      scope: "mover",
+      seq: 0,
+      session: "session-mover",
+      call: { actor: "mover", target: "room", verb: "go", args: [], body: undefined },
+      reads: [],
+      writes: [{ cell: { kind: "location", object: "mover" }, value: "dest", op: "move" }],
+      creates: [],
+      moves: [{ object: "mover", from: "room", to: "dest" }],
+      observations: [],
+      logicalInputs: [],
+      untrackedEffects: [],
+      complete: true,
+      incompleteReasons: [],
+      hash: "transcript:move-only"
+    };
+
+    const scope = createShadowCommitScope({ node: "scope:test", scope: "mover", serialized: before });
+    const applied = applyShadowTranscriptToIndexedState(scope.state, transcript, { objectTimestamp: 1 });
+    const moverUpsert = applied.projection_writes.find(
+      (write) => write.table === "objects" && write.key === "mover" && write.op === "upsert"
+    );
+    expect(moverUpsert, JSON.stringify(applied.projection_writes.map((w) => ({ table: w.table, key: w.key, op: w.op })))).toBeTruthy();
+    const row = (moverUpsert as { row?: SerializedObject }).row;
+    expect(row?.name).toBe("Mover");
+    expect(row?.location).toBe("dest");
+  });
+
+  // P1b (review): an accepted frame can materialize authority rows via
+  // projection_writes that the transcript does not touch. The provenance-recording
+  // set MUST include those object keys, or a relay caches a row with no provenance
+  // and the admission gate flags it missing. acceptedFrameTrackedObjectIds (shared by
+  // gateway + browser) covers transcript-touched ids PLUS projection_writes objects.
+  it("tracks projection_writes object rows an accepted frame materializes, not just transcript-touched ids", () => {
+    const emptyTranscript: EffectTranscript = {
+      kind: "woo.effect_transcript.shadow.v1",
+      id: "frame-only",
+      route: "sequenced",
+      scope: "room",
+      seq: 0,
+      session: "session-1",
+      call: { actor: "actor", target: "room", verb: "noop", args: [], body: undefined },
+      reads: [],
+      writes: [],
+      creates: [],
+      moves: [],
+      observations: [],
+      logicalInputs: [],
+      untrackedEffects: [],
+      complete: true,
+      incompleteReasons: [],
+      hash: "transcript:frame-only"
+    };
+    const accepted = {
+      projection_writes: [
+        { table: "objects", op: "upsert", key: "remote_widget", row: objectRecord("remote_widget", "Remote Widget", "room", []) }
+      ]
+    } as unknown as ShadowCommitAccepted;
+
+    // The transcript alone touches nothing; the helper must still surface the
+    // projection_writes object row.
+    expect(transcriptTouchedObjectIds(emptyTranscript).has("remote_widget")).toBe(false);
+    expect(acceptedFrameTrackedObjectIds(emptyTranscript, accepted).has("remote_widget")).toBe(true);
+
+    const scope = createShadowCommitScope({ node: "scope:test", scope: "room", serialized: serializedWorld() });
+    recordAcceptedCommitScopeCellProvenance(scope, emptyTranscript, accepted, "cache");
+    expect(scope.cellProvenance?.get(planningCellKey("remote_widget", "object_lineage"))).toEqual({ source: "cache" });
+    expect(scope.cellProvenance?.get(planningCellKey("remote_widget", "object_live"))).toEqual({ source: "cache" });
+  });
+
+  // P1a (review): MCP/REST cross-relay parity. applyAcceptedProjectionToCommitScopeCache
+  // materializes the authority projection_writes object rows (a moved object's real
+  // lineage/live), which transcript-only replay (applyShadowTranscriptToCommitScopeCache)
+  // does NOT — that drift left a relay with room.contents=["actor"] but no actor row.
+  it("materializes authority projection_writes object rows (not just transcript replay)", () => {
+    const accepted = {
+      projection_writes: [
+        { table: "objects", op: "upsert", key: "remote_widget", row: objectRecord("remote_widget", "Remote Widget", "room", []) }
+      ]
+    } as unknown as ShadowCommitAccepted;
+    const emptyTranscript: EffectTranscript = {
+      kind: "woo.effect_transcript.shadow.v1", id: "frame-only", route: "sequenced", scope: "room", seq: 0,
+      session: "session-1", call: { actor: "actor", target: "room", verb: "noop", args: [], body: undefined },
+      reads: [], writes: [], creates: [], moves: [], observations: [], logicalInputs: [], untrackedEffects: [],
+      complete: true, incompleteReasons: [], hash: "transcript:frame-only"
+    };
+
+    // Transcript replay alone (no creates) does not materialize the row.
+    const replayScope = createShadowCommitScope({ node: "scope:test", scope: "room", serialized: serializedWorld() });
+    applyShadowTranscriptToCommitScopeCache(replayScope, emptyTranscript);
+    expect(serializedFor(replayScope).objects.some((o) => o.id === "remote_widget")).toBe(false);
+
+    // The MCP/REST projection apply materializes the authority row.
+    const projScope = createShadowCommitScope({ node: "scope:test", scope: "room", serialized: serializedWorld() });
+    expect(applyAcceptedProjectionToCommitScopeCache(projScope, accepted, emptyTranscript)).toBe(true);
+    const widget = serializedFor(projScope).objects.find((o) => o.id === "remote_widget");
+    expect(widget?.name).toBe("Remote Widget");
+  });
+
+  // record-if-stronger (review): a derived `cache` stamp never downgrades a stronger
+  // recorded source (e.g. an owner authoritative row from a merge).
+  it("does not downgrade a stronger recorded provenance with a cache stamp", () => {
+    const scope = createShadowCommitScope({ node: "scope:test", scope: "room", serialized: serializedWorld() });
+    // "room" is in addChildTranscript's touched set (its contents cell is written),
+    // so the cache stamp would apply — but a recorded authoritative source must win.
+    (scope.cellProvenance ??= new Map()).set(planningCellKey("room", "object_lineage"), { source: "authoritative" });
+    recordAcceptedCommitScopeCellProvenance(scope, addChildTranscript(), undefined, "cache");
+    expect(scope.cellProvenance?.get(planningCellKey("room", "object_lineage"))).toEqual({ source: "authoritative" });
+  });
 });
 
 function addChildTranscript(): EffectTranscript {
@@ -254,3 +399,167 @@ function objectRecord(id: string, name: string, location: string | null, content
     eventSchemas: []
   };
 }
+
+// --- B6: write-set-derived commit scope selection -------------------------
+
+function selectionTranscript(parts: {
+  scope: string;
+  writes?: TranscriptWrite[];
+  moves?: TranscriptMove[];
+  creates?: TranscriptCreate[];
+  verb?: string;
+}): EffectTranscript {
+  return {
+    kind: "woo.effect_transcript.shadow.v1",
+    id: "b6-sel",
+    route: "sequenced",
+    scope: parts.scope,
+    seq: 0,
+    session: "session-1",
+    call: { actor: "actor", target: parts.scope, verb: parts.verb ?? "do", args: [], body: undefined },
+    reads: [],
+    writes: parts.writes ?? [],
+    creates: parts.creates ?? [],
+    moves: parts.moves ?? [],
+    observations: [],
+    logicalInputs: [],
+    untrackedEffects: [],
+    complete: true,
+    incompleteReasons: [],
+    hash: "transcript:b6-sel"
+  };
+}
+
+function locationWrite(object: string): TranscriptWrite {
+  return { cell: { kind: "location", object }, value: "room", op: "set" };
+}
+
+function propWrite(object: string, name = "p"): TranscriptWrite {
+  return { cell: { kind: "prop", object, name }, value: 1, op: "set" };
+}
+
+describe("B6 commit scope selection", () => {
+  it("relocation: a pure single-object move commits at the moved object's scope (CA3)", () => {
+    const transcript = selectionTranscript({
+      scope: "room",
+      verb: "enter",
+      moves: [{ object: "actor", from: "hall", to: "room" }],
+      writes: [locationWrite("actor")]
+    });
+    const selection = shadowCommitScopeForTranscript(transcript);
+    expect(selection.basis).toBe("relocation");
+    expect(selection.scope).toBe("actor");
+    expect(selection.owners).toEqual(["actor"]);
+  });
+
+  it("planning: a move plus a room-owned write commits at the planning scope", () => {
+    // `enter` that also stamps a roster prop on the room: the room is the single
+    // ordering authority that serializes the shared cell; the actor-location
+    // write rides along atomically.
+    const transcript = selectionTranscript({
+      scope: "the_outline",
+      verb: "enter",
+      moves: [{ object: "guest", from: "hall", to: "the_outline" }],
+      writes: [locationWrite("guest"), propWrite("the_outline", "roster")]
+    });
+    const selection = shadowCommitScopeForTranscript(transcript);
+    expect(selection.basis).toBe("planning");
+    expect(selection.scope).toBe("the_outline");
+    expect(new Set(selection.owners)).toEqual(new Set(["guest", "the_outline"]));
+  });
+
+  it("planning: a write set of only scope-owned props commits at the planning scope", () => {
+    const transcript = selectionTranscript({
+      scope: "the_outline",
+      verb: "add_item",
+      writes: [propWrite("the_outline", "items"), propWrite("the_outline", "rev")]
+    });
+    const selection = shadowCommitScopeForTranscript(transcript);
+    expect(selection.basis).toBe("planning");
+    expect(selection.scope).toBe("the_outline");
+  });
+
+  it("planning: object creation is owned by the minting (planning) scope", () => {
+    const transcript = selectionTranscript({
+      scope: "the_pinboard",
+      verb: "add_note",
+      writes: [locationWrite("note_1"), propWrite("note_1", "text")],
+      creates: [{ object: "note_1", name: "Note", parent: "$note", owner: "actor", anchor: null, location: "the_pinboard", flags: {} }]
+    });
+    const selection = shadowCommitScopeForTranscript(transcript);
+    // location:note_1 → owner note_1; prop + create → owner the_pinboard.
+    // Planning scope present → commit there (the room serializes the new object).
+    expect(selection.basis).toBe("planning");
+    expect(selection.scope).toBe("the_pinboard");
+  });
+
+  it("multi: two objects relocating with no shared-scope write is flagged multi-scope", () => {
+    const transcript = selectionTranscript({
+      scope: "room",
+      verb: "swap",
+      moves: [{ object: "item_a", from: "room", to: "bag" }, { object: "item_b", from: "bag", to: "room" }],
+      writes: [locationWrite("item_a"), locationWrite("item_b")]
+    });
+    const selection = shadowCommitScopeForTranscript(transcript);
+    expect(selection.basis).toBe("multi");
+    // Behavior preserved: commit at the planning scope until B8 route homes
+    // can prove a write crosses a home boundary (reject vs. mint).
+    expect(selection.scope).toBe("room");
+    expect(new Set(selection.owners)).toEqual(new Set(["item_a", "item_b"]));
+  });
+
+  it("contents writes are excluded from owner derivation (projection, off validation since A4)", () => {
+    const transcript = selectionTranscript({
+      scope: "room",
+      verb: "noop",
+      writes: [{ cell: { kind: "contents", object: "room" }, value: [], op: "set" }]
+    });
+    const selection = shadowCommitScopeForTranscript(transcript);
+    expect(selection.basis).toBe("planning");
+    expect(selection.scope).toBe("room");
+    expect(selection.owners).toEqual([]);
+  });
+
+  it("selectCommitScopeForTranscript emits commit_scope_multi only for a multi turn (shared boundary)", () => {
+    const multi = selectionTranscript({
+      scope: "room",
+      verb: "swap",
+      moves: [{ object: "item_a", from: "room", to: "bag" }, { object: "item_b", from: "bag", to: "room" }],
+      writes: [locationWrite("item_a"), locationWrite("item_b")]
+    });
+    const planning = selectionTranscript({ scope: "room", verb: "add_item", writes: [propWrite("room")] });
+    const relocation = selectionTranscript({
+      scope: "room",
+      verb: "enter",
+      moves: [{ object: "actor", from: "hall", to: "room" }],
+      writes: [locationWrite("actor")]
+    });
+
+    const events: MetricEvent[] = [];
+    const sink = (event: MetricEvent): void => { events.push(event); };
+
+    const multiSelection = selectCommitScopeForTranscript(multi, "room", sink);
+    expect(multiSelection.basis).toBe("multi");
+    expect(multiSelection.scope).toBe("room"); // same chosen scope as the bare selector
+    selectCommitScopeForTranscript(planning, "room", sink);
+    selectCommitScopeForTranscript(relocation, "room", sink);
+
+    const multiEvents = events.filter((event) => event.kind === "commit_scope_multi");
+    expect(multiEvents).toHaveLength(1);
+    expect(multiEvents[0]).toMatchObject({ kind: "commit_scope_multi", scope: "room", owners: 2, verb: "swap" });
+  });
+
+  it("selector scope is identical to the legacy binary rule for every shape", () => {
+    const cases: EffectTranscript[] = [
+      selectionTranscript({ scope: "room", moves: [{ object: "actor", from: "h", to: "room" }], writes: [locationWrite("actor")] }),
+      selectionTranscript({ scope: "room", moves: [{ object: "actor", from: "h", to: "room" }], writes: [locationWrite("actor"), propWrite("room")] }),
+      selectionTranscript({ scope: "room", writes: [propWrite("room")] }),
+      selectionTranscript({ scope: "room", moves: [{ object: "a", from: "room", to: "bag" }, { object: "b", from: "bag", to: "room" }], writes: [locationWrite("a"), locationWrite("b")] }),
+      selectionTranscript({ scope: "room", writes: [] })
+    ];
+    for (const transcript of cases) {
+      const legacy = shadowLocationCommitScopeForTranscript(transcript) ?? transcript.scope;
+      expect(shadowCommitScopeForTranscript(transcript).scope).toBe(legacy);
+    }
+  });
+});

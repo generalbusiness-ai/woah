@@ -1,10 +1,10 @@
 import type { SerializedObject, SerializedSession, SerializedWorld } from "./repository";
 import {
   createShadowCommitScope,
-  isShadowCommitScopeSerializedDirty,
-  markShadowCommitScopeSerializedChanged,
-  applyShadowTranscriptToCommitScopeCache,
-  shadowCommitScopeSerializedRef,
+  recordAcceptedCommitScopeCellProvenance,
+  recordCommitScopeCellProvenance,
+  selectCommitScopeForTranscript,
+  shadowCommitScopeForTranscript,
   shadowLocationCommitScopeForTranscript,
   serializedFor,
   submitShadowCommit,
@@ -30,8 +30,27 @@ import {
 } from "./shadow-turn-exec";
 import { shadowStatePageHash, shadowStatePagesForObject, type ShadowStatePage } from "./shadow-state-pages";
 import { runShadowTurnCall, runShadowTurnCallTranscript, type ShadowTurnCall } from "./shadow-turn-call";
+import { buildPlanningWorld, type PlanningWorldProvenance } from "./planning-world";
+import {
+  applyAcceptedFrameToDerivedRelayCache,
+  applyAcceptedFrameToRelayCache,
+  markShadowBrowserRelaySerializedChanged,
+  mergeAuthorityIntoRelayCache,
+  shadowSerializedIndex,
+  type ShadowRelayCache,
+  type ShadowSerializedIndex
+} from "./shadow-relay-cache";
+
+// Browser holder planning is gated for the load-bearing presentation-stub rule, and
+// opts IN to missing_provenance enforcement (#12): the relay records per-cell
+// provenance for every tracked cell — comprehensively at seed
+// (recordCommitScopeCellProvenance) and incrementally on accepted-frame application
+// (recordAcceptedCommitScopeCellProvenance, which includes the authority
+// projection_writes object rows the applier materializes) — so its planning worlds
+// are universally tagged. A residual untagged cell raises a repairable E_NEED_STATE.
+const BROWSER_ADMISSION_OPTS = { enforceMissingProvenance: true } as const;
 import { buildShadowScopeTurnExecAd, buildShadowTurnExecAd, buildShadowTurnExecAdFromNode, executeShadowTurnCallAcrossInProcessNetwork, type ShadowInProcessNetworkResult } from "./shadow-turn-network";
-import { shadowAtomHash, shadowMaterializedAtomHashesFromSerialized, shadowTurnKeyFromCall, shadowTurnKeyFromTranscript, type ShadowTurnKey } from "./turn-key";
+import { SHADOW_EPOCH_WILDCARD, shadowAtomHash, shadowMaterializedAtomHashesFromSerialized, shadowTurnKeyFromCall, shadowTurnKeyFromTranscript, type ShadowTurnKey } from "./turn-key";
 import type { EffectTranscript } from "./effect-transcript";
 import type { ShadowCapabilityAd } from "./capability-ad";
 import { stableShadowJson } from "./shadow-cell-version";
@@ -219,27 +238,15 @@ export type ShadowBrowserPendingTurn = {
   planned_transcript: EffectTranscript;
 };
 
-export type ShadowBrowserRelayShim = {
-  kind: "woo.browser_relay.shadow.v1";
-  node: string;
-  deployment: string;
-  commit_scope: ShadowCommitScope;
-  commit_scopes: Map<ObjRef, ShadowCommitScope>;
-  executors: ShadowExecutionNode[];
-  subscriptions: Map<ObjRef, Set<string>>;
-  browsers: Map<string, ShadowBrowserNode>;
-  session_auth: Map<string, ShadowBrowserSessionClaims>;
-  session_revs: Map<string, number>;
-  serialized_generation: number;
-  open_executable_seed_cache: Map<string, { generation: number; digest: string }>;
-  idempotency_window_ms: number;
-  recently_seen: Map<string, number>;
-  recent_replies: Map<string, ShadowEnvelope>;
-  live_session_serialized: Map<string, SerializedWorld>;
-  accepted_frames: ShadowCommitAccepted[];
-  transcript_tail: EffectTranscript[];
-  live_events: ShadowLiveEvent[];
-  state_signing: ShadowBrowserStateSigning;
+// The relay/cache substrate (`ShadowRelayCache`) and its holder-neutral cache helpers
+// now live in ./shadow-relay-cache. `ShadowBrowserRelayShim` is retained as a
+// back-compat alias for the many existing importers (tests + not-yet-repointed code).
+export type ShadowBrowserRelayShim = ShadowRelayCache;
+export {
+  applyAcceptedFrameToDerivedRelayCache,
+  applyAcceptedFrameToRelayCache,
+  markShadowBrowserRelaySerializedChanged,
+  mergeAuthorityIntoRelayCache
 };
 
 export type ShadowBrowserNode = {
@@ -451,6 +458,14 @@ export function createShadowBrowserRelayShim(input: {
   deployment?: string;
   session_revs?: Record<string, number>;
   idempotency_window_ms?: number;
+  // Per-cell provenance for the seed (A3.2). The constructor is generic across
+  // holders (gateway / REST / CommitScopeDO / browser / dev), so it imposes NO
+  // default: each caller declares its seed's true provenance — an authority-derived
+  // seed passes `cellProvenanceFromAuthoritySlice(slice)` (preserving
+  // authoritative/projection/cache per page), the browser holder factory stamps
+  // `cache`, and a direct/no-authority serialized seed leaves it empty (unknown).
+  // Flattening every seed to `cache` here would mislabel real authority rows.
+  seedCellProvenance?: PlanningWorldProvenance;
 }): ShadowBrowserRelayShim {
   const deployment = input.deployment ?? DEFAULT_SHADOW_DEPLOYMENT;
   const auth = buildShadowBrowserSessionAuth({
@@ -464,6 +479,7 @@ export function createShadowBrowserRelayShim(input: {
     scope: input.scope,
     serialized: input.serialized
   });
+  if (input.seedCellProvenance) commitScope.cellProvenance = new Map(input.seedCellProvenance);
   return {
     kind: "woo.browser_relay.shadow.v1",
     node: input.node,
@@ -542,15 +558,6 @@ export function mergeShadowBrowserAuthoritySessionState(current: readonly Serial
   return Array.from(mergedById.values()).sort((a, b) => a.id.localeCompare(b.id));
 }
 
-export function markShadowBrowserRelaySerializedChanged(relay: ShadowBrowserRelayShim): void {
-  if (!isShadowCommitScopeSerializedDirty(relay.commit_scope)) {
-    markShadowCommitScopeSerializedChanged(relay.commit_scope);
-  }
-  relay.serialized_generation++;
-  relay.open_executable_seed_cache.clear();
-  SHADOW_SERIALIZED_INDEX_CACHE.delete(shadowCommitScopeSerializedRef(relay.commit_scope));
-}
-
 function noteShadowBrowserRelayCommitAccepted(relay: ShadowBrowserRelayShim): void {
   // Accepted commits advance the indexed commit scope without refreshing the
   // legacy serialized export immediately. The browser-facing generation still
@@ -561,8 +568,12 @@ function noteShadowBrowserRelayCommitAccepted(relay: ShadowBrowserRelayShim): vo
 }
 
 function shadowBrowserRelayCommitScopeForTranscript(relay: ShadowBrowserRelayShim, transcript: EffectTranscript): ShadowCommitScope {
-  const locationScope = shadowLocationCommitScopeForTranscript(transcript);
-  return shadowBrowserRelayCommitScopeFor(relay, locationScope ?? transcript.scope);
+  // B6: relay commit-scope routing uses the same write-set selector as the
+  // gateway (the chosen scope is identical to the prior `relocation ?? planning`
+  // rule). No metric here — the delegated path emits commit_scope_multi at the
+  // shared in-process boundary (executeShadowTurnCallOrNeedState); the
+  // planned-transcript path emits it in commitBrowserPlannedTranscript.
+  return shadowBrowserRelayCommitScopeFor(relay, shadowCommitScopeForTranscript(transcript).scope);
 }
 
 function shadowBrowserRelayCommitScopeFor(relay: ShadowBrowserRelayShim, scope: ObjRef): ShadowCommitScope {
@@ -594,6 +605,15 @@ export function createShadowBrowserNode(input: {
   });
   const cache = createShadowBrowserNodeCache();
   cacheObjectPages(cache, input.cached_objects ?? []);
+  // Browser-holder seed provenance (A3.2 #12): the relay is a DERIVED holder view,
+  // so its seed cells are `cache` (record-if-stronger, so a relay seeded from an
+  // authority slice keeps its stronger provenance). Stamped here in the browser
+  // factory rather than the generic relay constructor, which must stay holder-neutral.
+  recordCommitScopeCellProvenance(
+    input.relay.commit_scope,
+    serializedFor(input.relay.commit_scope, { reason: "browser_seed_provenance" }).objects.map((obj) => obj.id),
+    "cache"
+  );
   const sessionToken = input.session ? shadowBrowserSessionBearer({
     id: input.session,
     actor: input.actor
@@ -820,16 +840,6 @@ function rememberShadowBrowserOpenExecutableSeedDigest(relay: ShadowBrowserRelay
 }
 
 export function shadowStateTransferCacheDigest(transfer: ShadowStateTransfer): string | null {
-  if (transfer.mode === "closure") {
-    return hashSource(stableShadowJson({
-      kind: "woo.state_transfer_cache_digest.shadow.v1",
-      mode: transfer.mode,
-      scope: transfer.scope,
-      atom_hashes: transfer.atom_hashes,
-      preimages: transfer.preimages ?? [],
-      serialized_hash: hashSource(stableShadowJson(transfer.serialized as unknown as WooValue))
-    } as unknown as WooValue));
-  }
   if (transfer.mode === "object_records") {
     if (transfer.object_pages.length === 0) return null;
     return hashSource(stableShadowJson({
@@ -885,9 +895,13 @@ export function buildShadowBrowserOpenExecutableSeedTransfer(
   const key: ShadowTurnKey = {
     kind: "woo.turn_key.shadow.v1",
     scope,
+    // Synthetic seed key (coarse coverage hint, not a routing key): wildcard
+    // epoch, no effect claim.
+    epoch: SHADOW_EPOCH_WILDCARD,
     actor: actor ?? "",
     target: scope,
     verb: "__open_executable_seed__",
+    effects: 0,
     preimages,
     atom_hashes: preimages.map(shadowAtomHash),
     read_preimages: preimages,
@@ -925,9 +939,11 @@ function buildShadowBrowserOpenExecutableSeedCacheHitTransfer(
   const key: ShadowTurnKey = {
     kind: "woo.turn_key.shadow.v1",
     scope,
+    epoch: SHADOW_EPOCH_WILDCARD,
     actor: actor ?? "",
     target: scope,
     verb: "__open_executable_seed_cache_hit__",
+    effects: 0,
     preimages: [],
     atom_hashes: [],
     read_preimages: [],
@@ -964,6 +980,16 @@ function shadowBrowserOpenExecutableSeedPreimages(serialized: SerializedWorld, s
   add(`target:${scope}`);
   if (actor) add(`actor:${actor}`);
   for (const id of byId.get(scope)?.contents ?? []) add(`target:${id}`);
+  // A scope's exits and other anchor-cluster objects are not in `contents`
+  // (anchor=scope, location=null), but parser verbs can resolve refs to them
+  // from scope properties and then dispatch on those objects. Seed their own
+  // cells so a first local command does not turn an anchor-cluster miss into an
+  // optimistic E_OBJNF while the authority succeeds.
+  for (const obj of serialized.objects) {
+    if (obj.anchor !== scope) continue;
+    add(`target:${obj.id}`);
+    addOpenSeedObjectCells(obj, add);
+  }
 
   const scopeObj = byId.get(scope);
   const actorObj = actor ? byId.get(actor) : undefined;
@@ -1101,6 +1127,12 @@ function shadowBrowserOpenExecutableSeedSerialized(
   addWithLineage(scope);
   addWithLineage(actor);
   for (const content of byId.get(scope)?.contents ?? []) addWithLineage(content);
+  // Anchor-cluster objects are owned with the scope even when not located in
+  // it. A room's exits are the common case: the room's `exits` map names them,
+  // but they never appear in `contents`.
+  for (const obj of serialized.objects) {
+    if (obj.anchor === scope) addWithLineage(obj.id);
+  }
   for (const linked of openSeedLinkedObjectRefs(serialized, scope, actor)) addWithLineage(linked);
   return {
     version: serialized.version,
@@ -1162,15 +1194,35 @@ function serializedFeatureRefs(obj: SerializedObject): ObjRef[] {
   return value.filter((item): item is ObjRef => typeof item === "string");
 }
 
-export function shadowBrowserScopeExecutionAds(relay: ShadowBrowserRelayShim, scope: ObjRef): ShadowCapabilityAd[] {
+// A scope ad is re-emitted on every scope open, then gossiped to and persisted
+// by browser nodes and read back on the cold delegation fallback via
+// allExecutionAds(). Without a TTL a stale scope ad — e.g. one naming an executor
+// node id from a prior connection — would stay selectable indefinitely across
+// reconnects. Five minutes is comfortably longer than the reconnect cadence that
+// refreshes the ad, and warm local execution never depends on it, so the TTL only
+// ever expires genuinely stale hints.
+const SHADOW_SCOPE_AD_TTL_MS = 5 * 60_000;
+
+export function shadowBrowserScopeExecutionAds(
+  relay: ShadowBrowserRelayShim,
+  scope: ObjRef,
+  now: number = Date.now()
+): ShadowCapabilityAd[] {
   // A scope ad is a cold-start routing hint only. Its empty Bloom filters are
   // intentionally unusable for exact-key local delegation; after relay-side
   // planning, the selected executor still has to execute or return missing_state.
+  // It carries issued_at_ms/ttl_ms in the same Date.now() domain the routing
+  // reader (selectV2DelegatedScopeExecutor) passes, so freshness is enforced.
   return [buildShadowScopeTurnExecAd({
     node: shadowRelayDefaultExecutorNode(relay),
     scope,
-    epoch: relay.commit_scope.head.hash,
-    factor: 1
+    // CA10.1: epoch is the scope GENERATION, head is the value version — keep
+    // them distinct. (The prior code put head.hash in epoch.)
+    epoch: String(relay.commit_scope.head.epoch),
+    head: relay.commit_scope.head.hash,
+    factor: 1,
+    issued_at_ms: now,
+    ttl_ms: SHADOW_SCOPE_AD_TTL_MS
   })];
 }
 
@@ -1352,7 +1404,9 @@ export async function executeShadowBrowserTurn(
     args: input.args ?? [],
     body: input.body
   };
-  const planned = await runShadowTurnCallTranscript(serializedFor(browser.relay.commit_scope, { reason: "browser_turn_plan" }), call);
+  const planned = await runShadowTurnCallTranscript(
+    buildPlanningWorld(serializedFor(browser.relay.commit_scope, { reason: "browser_turn_plan" }), browser.relay.commit_scope.cellProvenance ?? new Map(), BROWSER_ADMISSION_OPTS),
+    call);
   const key = shadowTurnKeyFromTranscript(planned.transcript);
   const pending: ShadowBrowserPendingTurn = {
     id,
@@ -1612,16 +1666,34 @@ function shadowBrowserTransferBodyByteLength(
   return SHADOW_BROWSER_TRANSFER_ENCODER.encode(JSON.stringify(transfer)).byteLength;
 }
 
+// THE one helper for applying an accepted commit frame to a relay cache, across
+// every transport (MCP gateway, REST, CommitScopeDO, browser). It owns:
+// projection-row materialization (authority projection_writes object rows so a moved
+// object's real lineage/live lands) || transcript replay for receiver-profiled
+// frames; per-cell provenance recording ('cache', the derived view) for exactly the
+// applied object set; head advancement; and relay-cache generation/seed-cache
+// invalidation. The `advanceHead` mode is the only difference between the two uses:
+//   advanceHead: true  — this relay OWNS the frame's scope; advance its head.
+//   advanceHead: false — derived/cross-scope projection; hold the head (it belongs
+//                        to the relay's own commit sequence).
+// One implementation so no transport drifts (e.g. to plain replay that misses
+// authority rows while recording provenance as if they were materialized).
+
 export function publishShadowBrowserAcceptedFrame(
   relay: ShadowBrowserRelayShim,
   accepted: ShadowCommitAccepted,
   transcript: EffectTranscript
 ): void {
   if (accepted.position.scope !== relay.commit_scope.scope) {
-    // A browser may execute while subscribed to a room but commit movement at
-    // the moved object's natural authority. Keep the relay's subscribed-scope
-    // projection cache current without advancing that room's sequencer head.
-    applyShadowTranscriptToCommitScopeCache(relay.commit_scope, transcript);
+    // A browser may execute while subscribed to a room but commit movement at the
+    // moved object's natural authority. Keep the relay's subscribed-scope cache
+    // current (authority rows + movement projection) without advancing that room's
+    // sequencer head — the same derived-cache application every transport uses.
+    applyAcceptedFrameToDerivedRelayCache(relay, accepted, transcript);
+  } else {
+    // Same-scope: the head-advancing commit already applied these cells; just tag
+    // the derived view's provenance (transcript writes AND authority projection_writes).
+    recordAcceptedCommitScopeCellProvenance(relay.commit_scope, transcript, accepted, "cache");
   }
   rememberShadowBrowserAcceptedFrame(relay, accepted, transcript);
   // Drop per-session live snapshots so the next live/direct call rebases on
@@ -1850,11 +1922,26 @@ function shadowBrowserTurnExecReplyEnvelope(
   request: ShadowTurnExecRequest,
   reply: ShadowTurnExecReply
 ): ShadowEnvelope<ShadowTurnExecReply> {
+  void request;
+  return shadowBrowserReplyEnvelopeForReceipt(browser, receipt, reply);
+}
+
+// Wrap a turn-exec reply BODY into a socket-addressed envelope for `browser`,
+// carrying `reply_to = receipt.envelope.id` (the original intent id the SPA
+// drains its pending-turn set on). Exported so a caller that produced the reply
+// through a different execution path (e.g. the dev sparse-gateway primitive,
+// whose own reply is addressed to internal nodes) can still hand the WS client a
+// correctly-addressed, correctly-correlated reply.
+export function shadowBrowserReplyEnvelopeForReceipt(
+  browser: ShadowBrowserNode,
+  receipt: ShadowBrowserEnvelopeReceipt,
+  reply: ShadowTurnExecReply
+): ShadowEnvelope<ShadowTurnExecReply> {
   const body = shadowBrowserWireTurnExecReply(reply);
   const envelope: ShadowEnvelope<ShadowTurnExecReply> = {
     v: 2,
     type: body.kind,
-    id: `${browser.relay.node}:reply:${request.id ?? request.call.id ?? receipt.envelope.id}`,
+    id: `${browser.relay.node}:reply:${reply.id ?? receipt.envelope.id}`,
     from: browser.relay.node,
     to: browser.node,
     actor: browser.actor,
@@ -1880,7 +1967,7 @@ async function executeShadowBrowserLivePersistenceCall(
   const sessionKey = call.session ?? call.actor;
   const serializedBefore = browser.relay.live_session_serialized.get(sessionKey) ?? serializedFor(browser.relay.commit_scope, { reason: "live_persistence_base" });
   const headHashBefore = browser.relay.commit_scope.head.hash;
-  const run = await runShadowTurnCall(serializedBefore, call, { onMetric });
+  const run = await runShadowTurnCall(buildPlanningWorld(serializedBefore, browser.relay.commit_scope.cellProvenance ?? new Map(), BROWSER_ADMISSION_OPTS), call, { onMetric });
   // A live/direct read may be started by UI hydration immediately after a
   // fire-and-forget sequenced write. If that read finishes after the write
   // commits, caching its pre-commit post-state would resurrect a stale live
@@ -1917,7 +2004,7 @@ async function shadowTurnExecRequestFromIntent(
   const serialized = intent.persistence === "live"
     ? browser.relay.live_session_serialized.get(call.session ?? call.actor) ?? serializedFor(browser.relay.commit_scope, { reason: "intent_live_plan" })
     : serializedFor(browser.relay.commit_scope, { reason: "intent_plan" });
-  const planned = await runShadowTurnCallTranscript(serialized, call, { onMetric });
+  const planned = await runShadowTurnCallTranscript(buildPlanningWorld(serialized, browser.relay.commit_scope.cellProvenance ?? new Map(), BROWSER_ADMISSION_OPTS), call, { onMetric });
   return {
     kind: "woo.turn.exec.request.shadow.v1",
     id: call.id,
@@ -2005,17 +2092,25 @@ async function executeShadowBrowserTurnExecRequest(
       // let the browser plan the next related turn locally.
       const stateTransfer = buildShadowCellPageTransfer({
         serialized: serializedFor(browser.relay.commit_scope, { reason: "delegated_state_transfer" }),
-        key: request.key,
-        atom_hashes: request.key.atom_hashes,
+        // Describe the ACCEPTED closure (not the planned key) so the warm
+        // transfer matches the advertised accepted ad below and the core B7
+        // contract; recipient/known_page_hashes stay browser-specific.
+        key: acceptedKey,
+        atom_hashes: acceptedKey.atom_hashes,
         known_page_hashes: browser.execution_node.page_hashes,
         session: request.call.session,
+        // B7 / VTN12.1: this is the commit-reply warm cache-fill. The purpose is
+        // load-bearing — the browser worker's accepted-write high-watermark
+        // (acceptedWriteTransferHighWatermark) only counts cell_pages transfers
+        // tagged accepted_write_cells. Dropping it diverges from the B7 contract.
+        purpose: "accepted_write_cells",
         recipient: browser.node,
         capsule: {
           head: browser.relay.commit_scope.head,
-          actor: request.key.actor,
+          actor: acceptedKey.actor,
           session: request.call.session,
-          target: request.key.target,
-          verb: request.key.verb,
+          target: acceptedKey.target,
+          verb: acceptedKey.verb,
           recipient: browser.node
         }
       });
@@ -2056,6 +2151,10 @@ function commitShadowBrowserPlannedTranscript(
   if (stableShadowJson(actualKey as unknown as WooValue) !== stableShadowJson(request.key as unknown as WooValue)) {
     throw new Error("planned transcript key mismatch");
   }
+  // B6: the planned-transcript commit is a distinct commit boundary (it does not
+  // pass through executeShadowTurnCallOrNeedState), so emit the multi-scope
+  // metric here too.
+  selectCommitScopeForTranscript(transcript, transcript.scope, options.onMetric);
   const commitScope = shadowBrowserRelayCommitScopeForTranscript(browser.relay, transcript);
   const expected = request.expected?.scope === commitScope.scope ? request.expected : commitScope.head;
   const locationCommitScope = shadowLocationCommitScopeForTranscript(transcript);
@@ -2230,12 +2329,9 @@ export function applyShadowBrowserTransfer(browser: ShadowBrowserNode, transfer:
       }
       for (const accepted of transfer.applied) applyShadowBrowserAcceptedFrame(browser, accepted);
       return;
-    case "closure":
-      // Closure and object-record transfers keep the execution-plane
-      // shadow.anchor_mac.v1 proof; this browser cache path only stores pages.
-      cacheObjectPages(browser.cache, transfer.serialized.objects);
-      return;
     case "object_records":
+      // Object-record transfers keep the execution-plane anchor_mac.v1 proof;
+      // this browser cache path only stores pages.
       cacheObjectPages(browser.cache, transfer.objects);
       return;
     case "cell_pages":
@@ -2576,45 +2672,6 @@ function shadowScopeHeadsCompatible(left: ShadowCommitAccepted["position"], righ
 
 function shadowValuesEqual(left: unknown, right: unknown): boolean {
   return stableShadowJson(left as WooValue) === stableShadowJson(right as WooValue);
-}
-
-type ShadowSerializedIndex = {
-  objects: Map<ObjRef, SerializedObject>;
-  sessions: Map<string, SerializedSession>;
-  indexedObjects: Map<ObjRef, ShadowIndexedObject>;
-  logSeqBySpace: Map<ObjRef, number>;
-};
-
-type ShadowIndexedObject = {
-  record: SerializedObject;
-  properties: Map<string, WooValue>;
-  propertyDefs: Map<string, PropertyDef>;
-};
-
-const SHADOW_SERIALIZED_INDEX_CACHE = new WeakMap<SerializedWorld, ShadowSerializedIndex>();
-
-function shadowSerializedIndex(serialized: SerializedWorld): ShadowSerializedIndex {
-  const cached = SHADOW_SERIALIZED_INDEX_CACHE.get(serialized);
-  if (cached) return cached;
-  const indexedObjects = new Map<ObjRef, ShadowIndexedObject>();
-  for (const obj of serialized.objects) {
-    indexedObjects.set(obj.id, {
-      record: obj,
-      properties: new Map(obj.properties),
-      propertyDefs: new Map(obj.propertyDefs.map((def) => [def.name, def] as const))
-    });
-  }
-  const index = {
-    objects: new Map(serialized.objects.map((obj) => [obj.id, obj])),
-    sessions: new Map(serialized.sessions.map((session) => [session.id, session])),
-    indexedObjects,
-    logSeqBySpace: new Map(serialized.logs.map(([space, entries]) => [
-      space,
-      entries.reduce((max, entry) => Math.max(max, entry.seq), 0)
-    ] as const))
-  };
-  SHADOW_SERIALIZED_INDEX_CACHE.set(serialized, index);
-  return index;
 }
 
 function shadowProjectionRefs(index: ShadowSerializedIndex, scope: ObjRef, viewer?: ShadowProjectionViewer): ObjRef[] {

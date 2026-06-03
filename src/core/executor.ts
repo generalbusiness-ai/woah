@@ -24,16 +24,17 @@
 // home and the place future symmetrization should live.
 
 import type { SerializedAuthoritySlice, SerializedObject, SerializedSession, SerializedWorld } from "./repository";
-import { mergeSerializedAuthoritySlice, type MergeSerializedAuthorityInput } from "./authority-slice";
+import { mergeSerializedAuthoritySlice, type MergeSerializedAuthorityInput, type MergeSerializedAuthorityOptions } from "./authority-slice";
 import {
   buildShadowTurnExecEnvelope,
   buildShadowTurnIntentEnvelope
 } from "./shadow-browser-node";
 import { decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "./shadow-envelope";
 import { runShadowTurnCallTranscript, type ShadowTurnCall, type ShadowTurnCallTranscriptRun } from "./shadow-turn-call";
+import { buildPlanningWorld, type PlanningAdmissibilityViolation, type PlanningWorldProvenance } from "./planning-world";
 import type { ShadowMissingAtom, ShadowTurnExecReply, ShadowTurnExecRequest } from "./shadow-turn-exec";
 import {
-  shadowLocationCommitScopeForTranscript,
+  selectCommitScopeForTranscript,
   transcriptTouchedObjectIds,
   type ShadowScopeHead
 } from "./shadow-commit-scope";
@@ -124,6 +125,25 @@ export type SubmitTurnIntentOptions<Client, Result extends ExecutorEnvelopeResul
   clientNode(client: Client): string;
   clientHead?(client: Client): ShadowScopeHead;
   clientSerialized?(client: Client): SerializedWorld;
+  // PlanningWorld admission gate — the guarded-executor policy. The planning world
+  // returned by `clientSerialized` is admitted through `buildPlanningWorld` before
+  // it reaches the VM (see submitTurnIntent below). These options thread the per-cell
+  // provenance the gate consumes:
+  //   - `clientPlanningProvenance` supplies the planning client's per-cell provenance.
+  //     A presentation stub (name===id lineage that is not authoritative) is ALWAYS
+  //     fatal-by-repair: the gate raises a repairable `E_NEED_STATE`, caught and
+  //     retried locally. When omitted, provenance defaults to empty (the gate still
+  //     runs; the stub class is still enforced).
+  //   - `onAdmissionViolation` is an observability sink for every violation, fatal or
+  //     not. It never changes enforcement — it is logging only.
+  clientPlanningProvenance?(client: Client): PlanningWorldProvenance;
+  onAdmissionViolation?(violations: PlanningAdmissibilityViolation[]): void;
+  // Opt IN to fatal missing_provenance enforcement. A caller sets this only on a
+  // sparse-planning path whose planning worlds are universally per-cell
+  // provenance-tagged (gateway/REST/browser, which record provenance on every
+  // authority merge, seed, and accepted-frame application). Off by default so callers
+  // planning against authoritative/untagged worlds are unaffected.
+  enforceMissingProvenance?: boolean;
   nextTurnId(client: Client, attempt: number): string;
   envelopeId?(turnId: string, attempt: number): string;
   authorityPayload(
@@ -192,7 +212,7 @@ export function buildExecutionCapsule(input: {
 export function mergeExecutorAuthority(
   serialized: { sessions: SerializedSession[]; objects: SerializedObject[] },
   authority: MergeSerializedAuthorityInput,
-  options: { clone?: boolean } = {}
+  options: MergeSerializedAuthorityOptions = {}
 ): void {
   mergeSerializedAuthoritySlice(serialized, authority, options);
 }
@@ -465,7 +485,18 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     if (!serialized) throw new Error("planned v2 turn gateway submission requires clientSerialized");
     let planned: ShadowTurnCallTranscriptRun;
     try {
-      planned = await runShadowTurnCallTranscript(serialized, call, {
+      // Admit the planning world through the gate, then run the VM against the
+      // branded result. A presentation stub (or, where enforced, an untagged cell)
+      // raises a repairable E_NEED_STATE here — caught by this try's repair branch,
+      // which refreshes the named object's authority and retries. Sparse planning
+      // always passes through the gate; provenance defaults to empty when a caller
+      // does not thread it (still enforced — onAdmissionViolation is only logging).
+      const planningProvenance = options.clientPlanningProvenance?.(planningClient) ?? new Map();
+      const planningWorld = buildPlanningWorld(serialized, planningProvenance, {
+        ...(options.onAdmissionViolation ? { onViolation: options.onAdmissionViolation } : {}),
+        ...(options.enforceMissingProvenance ? { enforceMissingProvenance: true } : {})
+      });
+      planned = await runShadowTurnCallTranscript(planningWorld, call, {
         ...(options.onMetric ? { onMetric: options.onMetric } : {})
       });
     } catch (err) {
@@ -496,13 +527,17 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     }
 
     const key = shadowTurnKeyFromTranscript(planned.transcript);
-    // CA3 location-as-truth: a single-location move commits at the moved
-    // object's location authority; everything else commits at the planned
-    // turn-key scope. A differing commitScope drives the planned-transcript
-    // commit path below so the authority replays the planned transcript rather
-    // than re-running the verb in a foreign scope.
-    const locationCommitScope = shadowLocationCommitScopeForTranscript(planned.transcript);
-    const commitScope = locationCommitScope ?? key.scope;
+    // B6: the commit scope is chosen by the turn's write set (VTN0 claim 3 /
+    // VTN8.2). A "relocation" turn commits at the moved object's location
+    // authority (CA3, off the room sequencer); everything else commits at the
+    // planning/turn-key scope, which already serializes the shared cells the
+    // turn touches. A "multi" turn (>=2 distinct non-planning owners) keeps the
+    // planning-scope commit for now and is flagged for observability. A
+    // differing commitScope drives the planned-transcript commit path below so
+    // the authority replays the planned transcript rather than re-running the
+    // verb in a foreign scope.
+    const commitSelection = selectCommitScopeForTranscript(planned.transcript, key.scope, options.onMetric);
+    const commitScope = commitSelection.scope;
     const commitClient = commitScope === planningScope
       ? planningClient
       : await options.ensureClient(commitScope, attempt);

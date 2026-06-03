@@ -8,7 +8,7 @@
 
 import type { EffectTranscript } from "../core/effect-transcript";
 import type { ShadowCapabilityAd } from "../core/capability-ad";
-import { mergeSerializedAuthoritySlice, pruneSerializedSessionsWithoutActorRows, serializedWorldFromAuthoritySlice } from "../core/authority-slice";
+import { cellProvenanceFromAuthoritySlice, pruneSerializedSessionsWithoutActorRows, serializedWorldFromAuthoritySlice } from "../core/authority-slice";
 import { createWorldFromSerialized } from "../core/bootstrap";
 import { localCatalogBundleFingerprint, parseAutoInstallCatalogs, runHostScopedLocalCatalogLifecycle } from "../core/local-catalogs";
 import type { SerializedAuthoritySlice, SerializedObject, SerializedSession, SerializedWorld } from "../core/repository";
@@ -24,7 +24,6 @@ import {
   MAX_SHADOW_IDEMPOTENCY_ENTRIES,
   MAX_SHADOW_RECENT_REPLIES_ENTRIES,
   MAX_SHADOW_TRANSCRIPT_TAIL,
-  markShadowBrowserRelaySerializedChanged,
   mergeShadowBrowserSessionState,
   openShadowBrowserScope,
   receiveShadowBrowserEnvelopeReceipt,
@@ -34,7 +33,6 @@ import {
   shadowBrowserTransportHello,
   subscribeShadowBrowserNode,
   type ShadowBrowserEnvelopeReceipt,
-  type ShadowBrowserRelayShim,
   type ShadowBrowserStateTransfer,
   type ShadowTransportHello
 } from "../core/shadow-browser-node";
@@ -48,6 +46,11 @@ import {
   type ShadowCommitAccepted,
   type ShadowScopeHead
 } from "../core/shadow-commit-scope";
+import {
+  markShadowBrowserRelaySerializedChanged,
+  mergeAuthorityIntoRelayCache,
+  type ShadowRelayCache
+} from "../core/shadow-relay-cache";
 import { encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
 import { stableShadowJson } from "../core/shadow-cell-version";
 import { hashSource } from "../core/source-hash";
@@ -137,10 +140,10 @@ type LoadedScopeCheckpoint =
     };
 
 export class CommitScopeDO {
-  private relay: ShadowBrowserRelayShim | null = null;
+  private relay: ShadowRelayCache | null = null;
   private snapshotLoaded = false;
   private needsFullSave = false;
-  private relayInitPromise: Promise<ShadowBrowserRelayShim> | null = null;
+  private relayInitPromise: Promise<ShadowRelayCache> | null = null;
   private fullSavePromise: Promise<void> | null = null;
   private checkpointBuildPromise: Promise<void> | null = null;
 
@@ -512,7 +515,7 @@ export class CommitScopeDO {
   private async relayFor(
     input: CommitScopeBaseRequest & { serialized?: SerializedWorld },
     options: { mergeSerializedAuth?: boolean } = {}
-  ): Promise<ShadowBrowserRelayShim> {
+  ): Promise<ShadowRelayCache> {
     if (!this.relay) {
       if (!this.relayInitPromise) {
         const pending = this.initializeRelay(input);
@@ -535,7 +538,7 @@ export class CommitScopeDO {
     return this.relay;
   }
 
-  private async initializeRelay(input: CommitScopeBaseRequest & { serialized?: SerializedWorld }): Promise<ShadowBrowserRelayShim> {
+  private async initializeRelay(input: CommitScopeBaseRequest & { serialized?: SerializedWorld }): Promise<ShadowRelayCache> {
     if (this.relay) return this.relay;
     if (!this.snapshotLoaded) {
       const loaded = await this.loadSnapshot();
@@ -557,6 +560,17 @@ export class CommitScopeDO {
       scope: input.scope,
       serialized
     });
+    // A3.2 provenance retrofit: the relay is seeded directly from the serialized
+    // world (bypassing the provenance-recording merge), so capture per-cell
+    // provenance from the seed authority slice. Without this, a seeded identity
+    // stub (e.g. a cross-host `cache` `name=id` row) has unknown provenance,
+    // defaults to authoritative-protected, and refuses a later fresh `projection`
+    // repair — the cross-scope `who` defect. A direct `serialized` seed (no
+    // authority slice) yields an empty map; those cells stay conservatively
+    // protected, matching prior behavior.
+    if (input.authority) {
+      relay.commit_scope.cellProvenance = cellProvenanceFromAuthoritySlice(input.authority);
+    }
     this.relay = relay;
     this.needsFullSave = true;
     return relay;
@@ -574,7 +588,7 @@ export class CommitScopeDO {
   }
 
   private refreshSessionAuth(
-    relay: ShadowBrowserRelayShim,
+    relay: ShadowRelayCache,
     input: CommitScopeBaseRequest,
     options: { mergeSerialized?: boolean } = {}
   ): void {
@@ -594,12 +608,15 @@ export class CommitScopeDO {
     relay.session_revs = auth.session_revs;
     if (options.mergeSerialized === false) return;
     if (authority) {
-      const serialized = serializedFor(relay.commit_scope, { reason: "commit_scope_authority_merge", metric: (event) => this.emitMetric(event) });
-      const preservedActorLive = preserveSessionActorLiveCells(serialized, sessionRows);
-      if (mergeSerializedAuthoritySlice(serialized, authority, { clone: true })) {
-        restoreSessionActorLiveCells(serialized, preservedActorLive);
-        markShadowBrowserRelaySerializedChanged(relay);
-      }
+      // The commit scope's relay is the world the VM plans/executes against, so it
+      // carries the same per-cell provenance as every other holder. Shared merge:
+      // provenance-aware, preserves the session actors' live cells, bumps generation.
+      mergeAuthorityIntoRelayCache(relay, authority, {
+        preserveSessionActorLive: true,
+        clone: true,
+        reason: "commit_scope_authority_merge",
+        metric: (event) => this.emitMetric(event)
+      });
       return;
     }
     const serialized = serializedFor(relay.commit_scope, { reason: "commit_scope_session_merge", metric: (event) => this.emitMetric(event) });
@@ -611,7 +628,7 @@ export class CommitScopeDO {
     this.refreshSerializedObjects(relay, input.session_objects ?? []);
   }
 
-  private ensureSerializedSession(relay: ShadowBrowserRelayShim, input: CommitScopeBaseRequest): void {
+  private ensureSerializedSession(relay: ShadowRelayCache, input: CommitScopeBaseRequest): void {
     // Commit validation and server-assisted planning read from the scope's
     // serialized world, not only from the transport auth maps. Keep the socket's
     // accepted session row present even when the gateway's narrow session export
@@ -642,7 +659,7 @@ export class CommitScopeDO {
     }
   }
 
-  private refreshSerializedObjects(relay: ShadowBrowserRelayShim, objects: SerializedObject[]): void {
+  private refreshSerializedObjects(relay: ShadowRelayCache, objects: SerializedObject[]): void {
     if (objects.length === 0) return;
     const serialized = serializedFor(relay.commit_scope, { reason: "commit_scope_object_refresh", metric: (event) => this.emitMetric(event) });
     const byId = new Map(serialized.objects.map((obj, index) => [obj.id, index] as const));
@@ -659,7 +676,7 @@ export class CommitScopeDO {
     markShadowBrowserRelaySerializedChanged(relay);
   }
 
-  private browserFor(relay: ShadowBrowserRelayShim, input: CommitScopeBaseRequest) {
+  private browserFor(relay: ShadowRelayCache, input: CommitScopeBaseRequest) {
     return createShadowBrowserClient({
       node: input.node,
       scope: input.scope,
@@ -670,7 +687,7 @@ export class CommitScopeDO {
     });
   }
 
-  private stateTransferBrowserFor(relay: ShadowBrowserRelayShim, input: CommitScopeStateTransferRequest) {
+  private stateTransferBrowserFor(relay: ShadowRelayCache, input: CommitScopeStateTransferRequest) {
     const existing = relay.browsers.get(input.node);
     if (existing && existing.actor === input.actor && existing.session === input.session) {
       setShadowBrowserSessionToken(existing, input.token);
@@ -693,7 +710,7 @@ export class CommitScopeDO {
   }
 
   private checkpointTailOpenResponse(
-    relay: ShadowBrowserRelayShim,
+    relay: ShadowRelayCache,
     input: CommitScopeOpenRequest
   ): CommitScopeOpenCheckpointTailResponse | null {
     const budget = boundedPositiveInteger(input.transfer_budget_bytes, CHECKPOINT_TRANSFER_DEFAULT_BYTES, CHECKPOINT_TRANSFER_MAX_BYTES);
@@ -726,7 +743,7 @@ export class CommitScopeDO {
   }
 
   private openInitialCheckpointTailTransfer(
-    relay: ShadowBrowserRelayShim,
+    relay: ShadowRelayCache,
     input: CommitScopeOpenRequest,
     maxTailFrames: number,
     budget: number
@@ -997,7 +1014,7 @@ export class CommitScopeDO {
     };
   }
 
-  private scheduleCheckpointBuild(relay: ShadowBrowserRelayShim, reason: string): boolean {
+  private scheduleCheckpointBuild(relay: ShadowRelayCache, reason: string): boolean {
     const waitUntil = (this.state as { waitUntil?: (promise: Promise<unknown>) => void }).waitUntil;
     if (typeof waitUntil !== "function") return false;
     if (!this.checkpointBuildPromise) {
@@ -1259,7 +1276,7 @@ export class CommitScopeDO {
   }
 
   private fanoutEnvelopes(
-    relay: ShadowBrowserRelayShim,
+    relay: ShadowRelayCache,
     originNode: string,
     reply: ShadowEnvelope<ShadowEnvelopeReplyBody>
   ): Array<{ node: string; envelope: string }> {
@@ -1275,7 +1292,7 @@ export class CommitScopeDO {
   }
 
   private liveFanoutEnvelopes(
-    relay: ShadowBrowserRelayShim,
+    relay: ShadowRelayCache,
     originNode: string,
     reply: ShadowEnvelope<ShadowEnvelopeReplyBody>
   ): Array<{ node: string; envelope: string }> {
@@ -1407,11 +1424,11 @@ export class CommitScopeDO {
     return String(scope ?? (this.state.id as { name?: string }).name ?? "commit_scope");
   }
 
-  private async loadSnapshot(): Promise<ShadowBrowserRelayShim | null> {
+  private async loadSnapshot(): Promise<ShadowRelayCache | null> {
     return await this.loadRowSnapshot();
   }
 
-  private async loadRowSnapshot(): Promise<ShadowBrowserRelayShim | null> {
+  private async loadRowSnapshot(): Promise<ShadowRelayCache | null> {
     const rows = sqlRows<CommitScopeMetaRow>(this.state.storage.sql.exec(
       "SELECT scope, relay_node, head, idempotency_window_ms, version, object_counter, parked_task_counter, session_counter FROM v2_commit_scope_meta WHERE id = 'current'"
     ));
@@ -1443,7 +1460,7 @@ export class CommitScopeDO {
     return relay;
   }
 
-  private async saveFullIfNeeded(relay: ShadowBrowserRelayShim): Promise<boolean> {
+  private async saveFullIfNeeded(relay: ShadowRelayCache): Promise<boolean> {
     if (this.fullSavePromise) {
       await this.fullSavePromise;
       return false;
@@ -1501,7 +1518,7 @@ export class CommitScopeDO {
     return this.repairLoadedSerializedWorld(serialized, meta.scope as ObjRef);
   }
 
-  private async saveFull(relay: ShadowBrowserRelayShim): Promise<void> {
+  private async saveFull(relay: ShadowRelayCache): Promise<void> {
     // Full saves run only on cold initialization, when the gateway delivered
     // the seed snapshot via /v2/open. Hot envelopes use saveEnvelopeDelta to
     // rewrite only the rows the accepted transcript actually touched.
@@ -1573,7 +1590,7 @@ export class CommitScopeDO {
   }
 
   private async saveEnvelopeDelta(
-    relay: ShadowBrowserRelayShim,
+    relay: ShadowRelayCache,
     receipt: ShadowBrowserEnvelopeReceipt,
     reply: ShadowEnvelope<ShadowEnvelopeReplyBody> | null
   ): Promise<CommitScopeTailStats | null> {
@@ -1630,7 +1647,7 @@ export class CommitScopeDO {
     return tailStats.value;
   }
 
-  private saveMeta(relay: ShadowBrowserRelayShim, now: number): void {
+  private saveMeta(relay: ShadowRelayCache, now: number): void {
     const scopeState = relay.commit_scope.state;
     this.state.storage.sql.exec(
       "INSERT OR REPLACE INTO v2_commit_scope_meta(id, scope, relay_node, head, idempotency_window_ms, version, object_counter, parked_task_counter, session_counter, updated_at) VALUES ('current', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1688,7 +1705,7 @@ export class CommitScopeDO {
     }
   }
 
-  private saveTranscriptDelta(relay: ShadowBrowserRelayShim, transcript: EffectTranscript, now: number, projectionWrites: readonly ProjectionWrite[] = []): void {
+  private saveTranscriptDelta(relay: ShadowRelayCache, transcript: EffectTranscript, now: number, projectionWrites: readonly ProjectionWrite[] = []): void {
     if (projectionWrites.length > 0) {
       this.saveProjectionWrites(projectionWrites, now);
       return;
@@ -1802,7 +1819,7 @@ export class CommitScopeDO {
     );
   }
 
-  private appendAcceptedFrames(relay: ShadowBrowserRelayShim, now: number): number {
+  private appendAcceptedFrames(relay: ShadowRelayCache, now: number): number {
     let written = 0;
     for (const frame of relay.accepted_frames) {
       written += this.saveAcceptedFrame(frame, now);
@@ -1824,7 +1841,7 @@ export class CommitScopeDO {
     return 1;
   }
 
-  private pruneAcceptedFramesByHorizon(relay: ShadowBrowserRelayShim, now: number): number {
+  private pruneAcceptedFramesByHorizon(relay: ShadowRelayCache, now: number): number {
     return this.pruneTailTableByHorizon({
       table: "v2_commit_scope_accepted_frame",
       scope: relay.commit_scope.scope,
@@ -1834,7 +1851,7 @@ export class CommitScopeDO {
     });
   }
 
-  private appendTranscriptTail(relay: ShadowBrowserRelayShim, now: number): number {
+  private appendTranscriptTail(relay: ShadowRelayCache, now: number): number {
     let written = 0;
     for (const transcript of relay.transcript_tail) {
       written += this.saveTranscript(transcript, now);
@@ -1855,7 +1872,7 @@ export class CommitScopeDO {
     return 1;
   }
 
-  private pruneTranscriptTailByHorizon(relay: ShadowBrowserRelayShim, now: number): number {
+  private pruneTranscriptTailByHorizon(relay: ShadowRelayCache, now: number): number {
     return this.pruneTailTableByHorizon({
       table: "v2_commit_scope_transcript_tail",
       scope: relay.commit_scope.scope,
@@ -1956,7 +1973,7 @@ export class CommitScopeDO {
     return { bytes, acceptedFrames: frameRows.length, transcripts: transcriptRows.length };
   }
 
-  private saveSeenKeys(relay: ShadowBrowserRelayShim): void {
+  private saveSeenKeys(relay: ShadowRelayCache): void {
     const live = new Set(relay.recently_seen.keys());
     for (const [key, seenAt] of relay.recently_seen) {
       this.state.storage.sql.exec(
@@ -1978,7 +1995,7 @@ export class CommitScopeDO {
     );
   }
 
-  private pruneSeenAndReplies(relay: ShadowBrowserRelayShim, now: number): void {
+  private pruneSeenAndReplies(relay: ShadowRelayCache, now: number): void {
     const cutoff = now - relay.idempotency_window_ms;
     this.state.storage.sql.exec("DELETE FROM v2_commit_scope_seen WHERE seen_at < ?", cutoff);
     this.state.storage.sql.exec("DELETE FROM v2_commit_scope_reply WHERE idempotency_key NOT IN (SELECT idempotency_key FROM v2_commit_scope_seen)");
@@ -1986,7 +2003,7 @@ export class CommitScopeDO {
     this.state.storage.sql.exec("DELETE FROM v2_commit_scope_reply WHERE idempotency_key NOT IN (SELECT idempotency_key FROM v2_commit_scope_seen)");
   }
 
-  private saveRecentReplies(relay: ShadowBrowserRelayShim, now: number): void {
+  private saveRecentReplies(relay: ShadowRelayCache, now: number): void {
     const live = new Set(relay.recent_replies.keys());
     for (const [key, reply] of relay.recent_replies) {
       this.state.storage.sql.exec(
@@ -2436,48 +2453,6 @@ function shadowScopeHeadFromUnknown(value: unknown): ShadowScopeHead | null {
 
 function shadowScopeHeadsEqual(left: ShadowScopeHead, right: ShadowScopeHead): boolean {
   return left.scope === right.scope && left.epoch === right.epoch && left.seq === right.seq && left.hash === right.hash;
-}
-
-type PreservedActorLiveCells = {
-  location: SerializedObject["location"];
-  children: SerializedObject["children"];
-  contents: SerializedObject["contents"];
-};
-
-function preserveSessionActorLiveCells(
-  serialized: Pick<SerializedWorld, "objects">,
-  sessions: readonly SerializedSession[]
-): Map<ObjRef, PreservedActorLiveCells> {
-  const actors = new Set(sessions.map((session) => session.actor));
-  const preserved = new Map<ObjRef, PreservedActorLiveCells>();
-  for (const obj of serialized.objects) {
-    if (!actors.has(obj.id)) continue;
-    preserved.set(obj.id, {
-      location: obj.location,
-      children: obj.children.slice(),
-      contents: obj.contents.slice()
-    });
-  }
-  return preserved;
-}
-
-function restoreSessionActorLiveCells(
-  serialized: Pick<SerializedWorld, "objects">,
-  preserved: ReadonlyMap<ObjRef, PreservedActorLiveCells>
-): void {
-  if (preserved.size === 0) return;
-  for (const obj of serialized.objects) {
-    const live = preserved.get(obj.id);
-    if (!live) continue;
-    // The commit scope's accepted placement snapshot is the authority for
-    // actor location/inventory. Per-envelope authority refreshes may arrive
-    // from a sparse routed host whose actor row is stale; keep those refreshes
-    // from erasing already-committed movement state while still allowing
-    // lineage/properties/session auth to refresh normally.
-    obj.location = live.location;
-    obj.children = live.children.slice();
-    obj.contents = live.contents.slice();
-  }
 }
 
 function acceptedFrameForTransfer(frame: ShadowCommitAccepted): ShadowCommitAccepted {

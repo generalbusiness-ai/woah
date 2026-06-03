@@ -1,3 +1,4 @@
+import { authoritativePlanningWorld } from "../src/core/planning-world";
 import { describe, expect, it, vi } from "vitest";
 
 import { planV2BrowserLocalTurn } from "../src/client/v2-browser-local-turn";
@@ -67,7 +68,7 @@ describe("v2 browser local turn planning", () => {
     anchor.setProp("the_dubspace", "operators", [session.actor]);
     const serialized = anchor.exportWorld();
     const call = dubspaceCall(session.id, session.actor, 0.42);
-    const planned = await runShadowTurnCall(serialized, call);
+    const planned = await runShadowTurnCall(authoritativePlanningWorld(serialized), call);
     const key = shadowTurnKeyFromTranscript(planned.transcript);
     const actorNode = createShadowExecutionNode({ node: "browser:test", scope: key.scope });
     const routed = await executeShadowTurnCallAcrossInProcessNetwork({
@@ -139,7 +140,7 @@ describe("v2 browser local turn planning", () => {
       });
       const transfer = buildShadowBrowserOpenExecutableSeedTransfer(relay, scope, `browser:${scope}`, session.actor);
       const tentative_transcripts = tentative
-        ? [(await runShadowTurnCall(serialized, {
+        ? [(await runShadowTurnCall(authoritativePlanningWorld(serialized), {
           kind: "woo.turn_call.shadow.v1",
           id: `${scope}:enter`,
           route: "sequenced",
@@ -212,6 +213,135 @@ describe("v2 browser local turn planning", () => {
     });
   });
 
+  it("open executable seed carries anchored exits and repairs cold room movement to a real move", async () => {
+    const anchor = createWorld();
+    const session = anchor.auth("guest:v2-browser-exit-seed");
+    const serialized = anchor.exportWorld();
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:exit-seed",
+      scope: "the_chatroom",
+      serialized
+    });
+    const openTransfer = buildShadowBrowserOpenExecutableSeedTransfer(
+      relay,
+      "the_chatroom",
+      "browser:exit-seed",
+      session.actor
+    );
+    expect(openTransfer.mode).toBe("cell_pages");
+    if (openTransfer.mode !== "cell_pages") throw new Error("expected cell_pages open seed");
+    const pages = [...openTransfer.page_refs, ...openTransfer.inline_pages];
+    const hasCell = (object: string, page: string, name?: string): boolean =>
+      pages.some((p) => {
+        const rec = p as { object?: string; page?: string; name?: string };
+        return rec.object === object && rec.page === page && (name === undefined || rec.name === name);
+      });
+    for (const exit of ["exit_living_room_southeast", "exit_living_room_south"]) {
+      expect(hasCell(exit, "object_lineage"), `${exit} lineage`).toBe(true);
+    }
+    expect(hasCell("exit_living_room_southeast", "property_cell", "source")).toBe(true);
+    expect(hasCell("exit_living_room_southeast", "property_cell", "dest")).toBe(true);
+
+    const common = {
+      node: "browser:exit-seed",
+      actor: session.actor,
+      session: session.id,
+      head: { kind: "woo.scope_head.shadow.v1" as const, scope: "the_chatroom", epoch: 1, seq: 0, hash: "root" },
+      id: "browser-local-southeast",
+      route: "direct" as const,
+      scope: "the_chatroom",
+      target: "the_chatroom",
+      verb: "southeast",
+      args: [],
+      persistence: "durable" as const
+    };
+    const transfers = [v2ExecutableTransferRecord(openTransfer, 1)];
+    let repaired = await planV2BrowserLocalTurn({ ...common, transfers });
+    for (let attempt = 0; attempt < 8 && !repaired.ok; attempt += 1) {
+      expect(repaired).toMatchObject({ reason: "missing_state" });
+      if (!repaired.key) throw new Error("expected repairable southeast plan");
+      const repairTransfer = buildShadowCellPageTransfer({
+        serialized,
+        key: repaired.key,
+        atom_hashes: repaired.missing_atoms?.map((atom) => atom.hash),
+        missing_atoms: repaired.missing_atoms
+      });
+      transfers.push(v2ExecutableTransferRecord(repairTransfer, attempt + 2));
+      repaired = await planV2BrowserLocalTurn({ ...common, transfers });
+    }
+    expect(repaired).toMatchObject({
+      ok: true,
+      optimistic_frame: {
+        op: "result",
+        result: { room: "the_deck", from: "the_chatroom", exit: "southeast" }
+      }
+    });
+    if (!repaired.ok) throw new Error("expected repaired southeast plan");
+    expect(repaired.transcript.error).toBeUndefined();
+    expect(repaired.transcript.moves).toContainEqual(expect.objectContaining({
+      object: session.actor,
+      from: "the_chatroom",
+      to: "the_deck"
+    }));
+  });
+
+  it("classifies local E_OBJNF as repairable missing state instead of a successful proposal", async () => {
+    const anchor = createWorld();
+    const session = anchor.auth("guest:v2-browser-exit-miss");
+    const serialized = {
+      ...anchor.exportWorld(),
+      objects: anchor.exportWorld().objects.filter((obj) => obj.id !== "exit_living_room_southeast")
+    };
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:exit-miss",
+      scope: "the_chatroom",
+      serialized
+    });
+    const openTransfer = buildShadowBrowserOpenExecutableSeedTransfer(
+      relay,
+      "the_chatroom",
+      "browser:exit-miss",
+      session.actor
+    );
+    const common = {
+      node: "browser:exit-miss",
+      actor: session.actor,
+      session: session.id,
+      head: { kind: "woo.scope_head.shadow.v1" as const, scope: "the_chatroom", epoch: 1, seq: 0, hash: "root" },
+      id: "browser-local-southeast-missing-exit",
+      route: "direct" as const,
+      scope: "the_chatroom",
+      target: "the_chatroom",
+      verb: "southeast",
+      args: [],
+      persistence: "durable" as const
+    };
+    const first = await planV2BrowserLocalTurn({
+      ...common,
+      transfers: [v2ExecutableTransferRecord(openTransfer, 1)]
+    });
+    if (first.ok || !first.key) throw new Error("expected first southeast miss to need verb repair");
+    const repairTransfer = buildShadowCellPageTransfer({
+      serialized,
+      key: first.key,
+      atom_hashes: first.missing_atoms?.map((atom) => atom.hash),
+      missing_atoms: first.missing_atoms
+    });
+    const repaired = await planV2BrowserLocalTurn({
+      ...common,
+      transfers: [v2ExecutableTransferRecord(openTransfer, 1), v2ExecutableTransferRecord(repairTransfer, 2)]
+    });
+    expect(repaired).toMatchObject({
+      ok: false,
+      reason: "missing_state",
+      request: { call: { target: "the_chatroom", verb: "southeast" } }
+    });
+    if (repaired.ok) throw new Error("expected missing_state for absent exit object");
+    expect(repaired.missing_atoms).toContainEqual(expect.objectContaining({
+      preimage: "read:cell:lifecycle:exit_living_room_southeast"
+    }));
+  });
+
   it("preserves stale subscriber rows without authoring derived enter presence writes", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:v2-browser-local-outliner-scrub");
@@ -277,7 +407,7 @@ describe("v2 browser local turn planning", () => {
     const first = anchor.auth("guest:v2-browser-local-peer-enter-a");
     const second = anchor.auth("guest:v2-browser-local-peer-enter-b");
     const serialized = anchor.exportWorld();
-    const firstEntered = await runShadowTurnCall(serialized, {
+    const firstEntered = await runShadowTurnCall(authoritativePlanningWorld(serialized), {
       kind: "woo.turn_call.shadow.v1",
       id: "pinboard-peer-enter-a",
       route: "sequenced",
@@ -342,7 +472,7 @@ describe("v2 browser local turn planning", () => {
       serialized
     });
     const transfer = buildShadowBrowserOpenExecutableSeedTransfer(relay, "the_pinboard", "browser:pinboard-tail", session.actor);
-    const entered = await runShadowTurnCall(serialized, {
+    const entered = await runShadowTurnCall(authoritativePlanningWorld(serialized), {
       kind: "woo.turn_call.shadow.v1",
       id: "pinboard-tail-enter",
       route: "sequenced",
@@ -353,7 +483,7 @@ describe("v2 browser local turn planning", () => {
       verb: "enter",
       args: []
     });
-    const added = await runShadowTurnCall(entered.serializedAfter, {
+    const added = await runShadowTurnCall(authoritativePlanningWorld(entered.serializedAfter), {
       kind: "woo.turn_call.shadow.v1",
       id: "pinboard-tail-add",
       route: "sequenced",
@@ -433,7 +563,7 @@ describe("v2 browser local turn planning", () => {
       serialized
     });
     const transfer = buildShadowBrowserOpenExecutableSeedTransfer(relay, "the_outline", "browser:outline-tail", session.actor);
-    const entered = await runShadowTurnCall(serialized, {
+    const entered = await runShadowTurnCall(authoritativePlanningWorld(serialized), {
       kind: "woo.turn_call.shadow.v1",
       id: "outline-tail-enter",
       route: "sequenced",
@@ -444,7 +574,7 @@ describe("v2 browser local turn planning", () => {
       verb: "enter",
       args: []
     });
-    const added = await runShadowTurnCall(entered.serializedAfter, {
+    const added = await runShadowTurnCall(authoritativePlanningWorld(entered.serializedAfter), {
       kind: "woo.turn_call.shadow.v1",
       id: "outline-tail-add",
       route: "sequenced",
@@ -527,7 +657,7 @@ describe("v2 browser local turn planning", () => {
       serialized
     });
     const seed = buildShadowBrowserOpenExecutableSeedTransfer(relay, "the_outline", "browser:outline-tentative-text", session.actor);
-    const entered = await runShadowTurnCall(serialized, {
+    const entered = await runShadowTurnCall(authoritativePlanningWorld(serialized), {
       kind: "woo.turn_call.shadow.v1",
       id: "outline-tentative-enter-reference",
       route: "sequenced",
@@ -538,7 +668,7 @@ describe("v2 browser local turn planning", () => {
       verb: "enter",
       args: []
     });
-    const added = await runShadowTurnCall(entered.serializedAfter, {
+    const added = await runShadowTurnCall(authoritativePlanningWorld(entered.serializedAfter), {
       kind: "woo.turn_call.shadow.v1",
       id: "outline-tentative-add-reference",
       route: "sequenced",
@@ -660,7 +790,7 @@ describe("v2 browser local turn planning", () => {
       verb: "enter",
       args: []
     };
-    const entered = await runShadowTurnCall(serialized, enterCall);
+    const entered = await runShadowTurnCall(authoritativePlanningWorld(serialized), enterCall);
     const addCall: ShadowTurnCall = {
       kind: "woo.turn_call.shadow.v1",
       id: "pinboard-add",
@@ -672,7 +802,7 @@ describe("v2 browser local turn planning", () => {
       verb: "add_note",
       args: ["journal note", "yellow", 48, 48, 180, 110]
     };
-    const added = await runShadowTurnCall(entered.serializedAfter, addCall);
+    const added = await runShadowTurnCall(authoritativePlanningWorld(entered.serializedAfter), addCall);
     const enterKey = shadowTurnKeyFromTranscript(entered.transcript);
     const addKey = shadowTurnKeyFromTranscript(added.transcript);
     const enterTransfer = buildShadowCellPageTransfer({
@@ -766,7 +896,7 @@ describe("v2 browser local turn planning", () => {
         `browser:${scenario.scope}:one-repair`,
         session.actor
       );
-      const entered = await runShadowTurnCall(serialized, {
+      const entered = await runShadowTurnCall(authoritativePlanningWorld(serialized), {
         kind: "woo.turn_call.shadow.v1",
         id: `${scenario.scope}:one-repair-enter`,
         route: "sequenced",
@@ -836,7 +966,7 @@ describe("v2 browser local turn planning", () => {
     anchor.setProp("the_dubspace", "operators", [session.actor]);
     const serialized = anchor.exportWorld();
     const call = dubspaceCall(session.id, session.actor, 0.57);
-    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(serialized, call)).transcript);
+    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(authoritativePlanningWorld(serialized), call)).transcript);
     const relay = createShadowBrowserRelayShim({
       node: "relay:dubspace-missing-state",
       scope: "the_dubspace",
@@ -913,7 +1043,7 @@ async function expectLocalTranscriptToMatchServer(scenario: LocalTranscriptParit
     verb: scenario.verb,
     args: scenario.args
   };
-  const server = await runShadowTurnCall(serialized, call);
+  const server = await runShadowTurnCall(authoritativePlanningWorld(serialized), call);
   const key = shadowTurnKeyFromTranscript(server.transcript);
   // The open executable seed carries shared runtime objects such as $wiz; the
   // turn-specific transfer carries the exact cells selected for this call.

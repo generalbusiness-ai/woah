@@ -1,7 +1,10 @@
 import type { SerializedObject, SerializedWorld } from "./repository";
 import {
+  applyPresenceProjectionRowDelta,
   createTranscriptCellReader,
   createTranscriptCellReaderFromObjectMap,
+  presenceProjectionPropsFromReader,
+  sessionScopePresenceDeltas,
   readTranscriptCell,
   transcriptTouchedStateHashWithReader,
   validateTranscriptAgainstSerializedWorld,
@@ -14,6 +17,7 @@ import {
   type TranscriptWrite
 } from "./effect-transcript";
 import { stableShadowJson } from "./shadow-cell-version";
+import type { AuthorityPageProvenance } from "./shadow-state-pages";
 import { hashSource } from "./source-hash";
 import { shadowCommitReceipt, shadowCommitReceiptFromTouchedStateHashes, type ShadowCommitReceipt } from "./turn-commit";
 import type { RecordedWriteAuthority } from "./turn-recorder";
@@ -27,6 +31,9 @@ import {
   type ProjectionDeltaSummary,
   type ProjectionWrite
 } from "./projection-delta";
+import { AUTHORITY_SOURCE_RANK } from "./authority-slice";
+import { PLANNING_TRACKED_PAGES, planningCellKey } from "./planning-world";
+import type { AuthorityPageSource } from "./shadow-state-pages";
 
 export type ShadowScopeHead = {
   kind: "woo.scope_head.shadow.v1";
@@ -92,6 +99,13 @@ export type ShadowCommitScope = {
   serializedDirty: boolean;
   state: ShadowCommitScopeState;
   submissions: Map<string, ShadowCommitResult>;
+  // A3.2 provenance retrofit: per-cell provenance for the tracked identity/live
+  // cells (see authority-slice PROVENANCE_TRACKED_PAGES), maintained by the
+  // authority merge so a stale cross-host `cache` stub can be repaired by a
+  // fresher `projection`/`authoritative` page while an authoritative cell is
+  // never displaced. Lazily created by the gateway relay merge; absent for
+  // commit scopes that do not carry a durable planning cache.
+  cellProvenance?: Map<string, AuthorityPageProvenance>;
 };
 
 export type ShadowCommitScopeState = {
@@ -402,6 +416,94 @@ export function shadowLocationCommitScopeForTranscript(transcript: EffectTranscr
   return object;
 }
 
+// B6 (VTN0 claim 3 / VTN8.2): the commit scope is chosen by the turn's write
+// set, not by a fixed home host. `basis` records *why* a scope was chosen so the
+// decision is observable and so later phases (B7 transfer, B8 gossip) have a
+// stable selection contract to target.
+//
+//   - "relocation": the write set is purely one object's own location authority
+//     (the CA3 actor-anchored move). It commits at that object's scope, off the
+//     room sequencer (CA13.2) — this is `shadowLocationCommitScopeForTranscript`.
+//   - "planning":   the write set touches cells owned by the active/planning
+//     scope (room props, created-object lifecycle, or a move *plus* a room
+//     write). The planning scope is the single ordering authority that already
+//     serializes those cells; an actor-location write in the same turn rides
+//     along atomically. This is the common case.
+//   - "multi":      the write set reduces to two or more distinct *non-planning*
+//     owners (e.g. two objects relocating with no shared-scope write). This is
+//     the genuine multi-scope turn. The current substrate cannot yet tell a
+//     benign same-scope multi-move from a true cross-home one — that needs B8's
+//     route-home model — so we preserve the historical planning-scope commit and
+//     flag the turn for observability. Enforcement (clean retryable conflict vs.
+//     minted combined scope) lands once route homes exist to prove a write
+//     crosses a home boundary.
+export type ShadowCommitScopeBasis = "planning" | "relocation" | "multi";
+
+export type ShadowCommitScopeSelection = {
+  scope: ObjRef;
+  basis: ShadowCommitScopeBasis;
+  // Distinct authoritative-write owners under the B6 owner model: a `location`
+  // write is owned by the moved object; every other authoritative cell
+  // (prop/verb/lifecycle) and any object creation is owned by the planning
+  // scope. `contents` writes are excluded — they are per-member projections off
+  // the commit-validation path since A4.
+  owners: ObjRef[];
+};
+
+export function shadowCommitScopeForTranscript(
+  transcript: EffectTranscript,
+  planningScope: ObjRef = transcript.scope
+): ShadowCommitScopeSelection {
+  // The relocation owner is the load-bearing CA3 sub-decision; reuse it verbatim
+  // so the chosen scope is provably identical to the pre-B6 binary rule for
+  // every relocation turn.
+  const relocation = shadowLocationCommitScopeForTranscript(transcript);
+  if (relocation !== null) {
+    return { scope: relocation, basis: "relocation", owners: [relocation] };
+  }
+
+  const owners = new Set<ObjRef>();
+  for (const write of transcript.writes) {
+    if (write.cell.kind === "contents") continue; // projection, off validation (A4)
+    if (write.cell.kind === "location") owners.add(write.cell.object);
+    else owners.add(planningScope); // prop / verb / lifecycle on any object
+  }
+  if (transcript.creates.length > 0) owners.add(planningScope); // minting scope owns new lifecycle
+
+  const nonPlanning = Array.from(owners).filter((owner) => owner !== planningScope);
+  if (!owners.has(planningScope) && nonPlanning.length >= 2) {
+    // Genuine multi-scope write set. Behavior is preserved (commit at the
+    // planning scope) but the turn is flagged so the multi-scope rate is
+    // measurable before B8 wires real route-home enforcement.
+    return { scope: planningScope, basis: "multi", owners: Array.from(owners) };
+  }
+  return { scope: planningScope, basis: "planning", owners: Array.from(owners) };
+}
+
+// B6: the single boundary that turns a transcript into a commit-scope decision
+// AND emits the multi-scope observability metric. Every commit-scope decision
+// site (gateway executor, in-process/relay executor, browser planned-transcript
+// commit) routes through this so the basis/metric contract is enforced
+// uniformly, not only at the gateway. The chosen `scope` is identical to
+// `shadowCommitScopeForTranscript`; this wrapper only adds the `commit_scope_multi`
+// emission so callers don't each re-implement (and drift on) it.
+export function selectCommitScopeForTranscript(
+  transcript: EffectTranscript,
+  planningScope: ObjRef,
+  metric?: (event: MetricEvent) => void
+): ShadowCommitScopeSelection {
+  const selection = shadowCommitScopeForTranscript(transcript, planningScope);
+  if (selection.basis === "multi") {
+    metric?.({
+      kind: "commit_scope_multi",
+      scope: selection.scope,
+      owners: selection.owners.length,
+      verb: transcript.call?.verb
+    });
+  }
+  return selection;
+}
+
 function validateShadowPostState(reader: TranscriptCellReader, transcript: EffectTranscript): string[] {
   const errors: string[] = [];
   const finalWrites = finalWritesByCell(transcript);
@@ -630,6 +732,7 @@ export function applyShadowTranscriptToIndexedState(
     if (target) applyTranscriptWriteToSerializedObject(target, write, transcript, options);
   }
   applyMovementProjectionToIndexedState(transcript, mutableObject, options.objectTimestamp);
+  applyMovementPresenceProjectionToIndexedState(next, transcript, mutableObject, options.objectTimestamp);
   profile("apply_writes", stepStartedAt);
   stepStartedAt = Date.now();
   applyTranscriptSessionLocationToState(next, transcript);
@@ -676,6 +779,37 @@ function applyMovementProjectionToIndexedState(
   }
 }
 
+// CA4/CA8 presence projection, sibling of applyMovementProjectionToIndexedState:
+// an accepted session-actor move repairs the source/destination rooms'
+// metadata-declared presence cells (e.g. session_subscribers/subscribers) in the
+// commit-scope state, so the accepted commit's projection_writes carry the
+// repaired room rows to every shard. Location stays the only authoritative write
+// (CA3); presence rows are projections recomputed here, never validated cells.
+function applyMovementPresenceProjectionToIndexedState(
+  next: ShadowCommitScopeState,
+  transcript: EffectTranscript,
+  mutableObject: (id: ObjRef) => SerializedObject | null,
+  objectTimestamp: number | undefined
+): void {
+  const reader = createCommitScopeStateCellReader(next);
+  const deltas = sessionScopePresenceDeltas((room) => presenceProjectionPropsFromReader(reader, room), transcript);
+  for (const delta of deltas) {
+    const room = mutableObject(delta.room);
+    if (!room) continue;
+    const propIndex = room.properties.findIndex(([name]) => name === delta.property);
+    const before = propIndex >= 0 ? room.properties[propIndex][1] : null;
+    const after = applyPresenceProjectionRowDelta(before, delta);
+    if (propIndex >= 0) room.properties[propIndex] = [delta.property, after];
+    else room.properties = [...room.properties, [delta.property, after]];
+    // Bump the property version like setPropLocal so the host-seed merge detects
+    // the change and warm/cold reload converge on the repaired row.
+    const versionIndex = room.propertyVersions.findIndex(([name]) => name === delta.property);
+    if (versionIndex >= 0) room.propertyVersions[versionIndex] = [delta.property, (room.propertyVersions[versionIndex][1] ?? 0) + 1];
+    else room.propertyVersions = [...room.propertyVersions, [delta.property, 1]];
+    touchSerializedObject(room, objectTimestamp);
+  }
+}
+
 function projectionWritesForIndexedApply(
   current: ShadowCommitScopeState,
   next: ShadowCommitScopeState,
@@ -684,7 +818,18 @@ function projectionWritesForIndexedApply(
   explicitProjectionWrites: readonly ProjectionWrite[] = []
 ): ProjectionWrite[] {
   const writes: ProjectionWrite[] = [...explicitProjectionWrites];
-  for (const id of Array.from(touchedObjectIds).sort()) {
+  // CA5 / VTN10.1 movement materialization: an accepted move records only
+  // `transcript.moves` and a `live:location` authority write; the moved object's
+  // OWN row is not otherwise touched (applyMovementProjectionToIndexedState only
+  // mutates the source/destination contents projections). Without the moved
+  // object's row in projection_writes, a sparse destination shard receiving this
+  // commit's fanout knows the member is present (via the room's contents row) but
+  // has no authoritative lineage/name cell for it, so `who`/roster renders the
+  // raw object id instead of the display name. Emit the authoritative moved-object
+  // row alongside the touched set so the destination materializes it.
+  const emitObjectIds = new Set<ObjRef>(touchedObjectIds);
+  for (const move of transcript.moves) emitObjectIds.add(move.object);
+  for (const id of Array.from(emitObjectIds).sort()) {
     const row = next.objectsById.get(id);
     if (row) {
       const clone = structuredClone(row) as SerializedObject;
@@ -830,6 +975,31 @@ function isAuthorityToolSurfaceRow(value: unknown): boolean {
   return isRecord(value) && value.kind === "woo.tool_surface_projection.v1";
 }
 
+// Materialize an accepted commit's row-body-complete projection writes (and its
+// movement projection) into a relay's commit-scope cache WITHOUT advancing that
+// cache's head. This is the cross-scope-fanout companion to applyAcceptedShadowFrame:
+// when a commit accepted under scope S affects an actor/object that a DIFFERENT
+// open relay (scope T) plans against, T must learn the authoritative row from the
+// accepted transcript stream — but T's head belongs to T's own commit sequence,
+// not S's, so it MUST NOT advance. This is derived materialization from the
+// accepted stream (VTN0), not a second authority and not a head move. Browser-
+// profiled (non-authority) projection rows are display-only and are skipped here;
+// the affected relay will replay the transcript through the normal path if needed.
+// Returns true if it materialized authority rows (the caller then skips transcript
+// replay); false if the accepted frame carried no authority rows (the caller
+// should replay the transcript for display-only state).
+export function applyAcceptedProjectionToCommitScopeCache(
+  scope: ShadowCommitScope,
+  accepted: ShadowCommitAccepted,
+  transcript: EffectTranscript
+): boolean {
+  const projectionWrites = accepted.projection_writes ?? [];
+  if (projectionWrites.length === 0 || !projectionWritesAreAuthorityRows(projectionWrites)) return false;
+  applyProjectionWritesToCommitScopeCache(scope, projectionWrites);
+  applyMovementProjectionToCommitScopeCache(scope, transcript);
+  return true;
+}
+
 function applyProjectionWritesToCommitScopeCache(scope: ShadowCommitScope, writes: ProjectionWrite[]): void {
   const next = cloneShadowCommitScopeState(ensureShadowCommitScopeState(scope));
   applyProjectionWritesToCommitScopeState(next, writes);
@@ -837,7 +1007,11 @@ function applyProjectionWritesToCommitScopeCache(scope: ShadowCommitScope, write
 }
 
 function applyMovementProjectionToCommitScopeCache(scope: ShadowCommitScope, transcript: EffectTranscript): void {
-  if (transcript.moves.length === 0) return;
+  // CA4 contents derive from moves; CA8 presence derives from the session-scope
+  // transition (present even for a no-op physical enter). Run whenever either
+  // signal exists so the receiver re-derives its own projections rather than
+  // trusting the committing shard's partial whole-row snapshot.
+  if (transcript.moves.length === 0 && !transcript.sessionScopeTransition) return;
   const next = cloneShadowCommitScopeState(ensureShadowCommitScopeState(scope));
   const mutableObjects = new Set<ObjRef>();
   const mutableObject = (id: ObjRef): SerializedObject | null => {
@@ -850,10 +1024,36 @@ function applyMovementProjectionToCommitScopeCache(scope: ShadowCommitScope, tra
     return clone;
   };
   applyMovementProjectionToIndexedState(transcript, mutableObject, undefined);
+  applyMovementPresenceProjectionToIndexedState(next, transcript, mutableObject, undefined);
   commitShadowCommitScopeState(scope, next);
 }
 
+// Copy the named properties (and their versions) from `existing` onto `row`,
+// so a whole-object snapshot does not overwrite the receiver's locally-derived
+// projection cells. Removes the prop from `row` when `existing` lacks it.
+function preserveSerializedProps(existing: SerializedObject, row: SerializedObject, names: readonly string[]): void {
+  for (const name of names) {
+    const fromIdx = existing.properties.findIndex(([n]) => n === name);
+    const rowIdx = row.properties.findIndex(([n]) => n === name);
+    if (fromIdx >= 0) {
+      if (rowIdx >= 0) row.properties[rowIdx] = [name, existing.properties[fromIdx][1]];
+      else row.properties = [...row.properties, [name, existing.properties[fromIdx][1]]];
+      const fromVer = existing.propertyVersions.find(([n]) => n === name);
+      const rowVerIdx = row.propertyVersions.findIndex(([n]) => n === name);
+      if (fromVer) {
+        if (rowVerIdx >= 0) row.propertyVersions[rowVerIdx] = [name, fromVer[1]];
+        else row.propertyVersions = [...row.propertyVersions, [name, fromVer[1]]];
+      }
+    } else if (rowIdx >= 0) {
+      row.properties = row.properties.filter(([n]) => n !== name);
+      row.propertyVersions = row.propertyVersions.filter(([n]) => n !== name);
+    }
+  }
+}
+
 function applyProjectionWritesToCommitScopeState(next: ShadowCommitScopeState, writes: readonly ProjectionWrite[]): void {
+  let reader: TranscriptCellReader | null = null;
+  const readerFor = (): TranscriptCellReader => (reader ??= createCommitScopeStateCellReader(next));
   for (const write of coalesceProjectionWrites(writes)) {
     switch (write.table) {
       case "objects":
@@ -862,11 +1062,16 @@ function applyProjectionWritesToCommitScopeState(next: ShadowCommitScopeState, w
           const row = structuredClone(write.row) as SerializedObject;
           const existing = next.objectsById.get(write.key);
           if (existing) {
-            // CA3/CA4: object.contents is a derived room-membership projection.
-            // Whole-row projection writes are snapshots from one accepted frame;
-            // preserving the receiver's current projection avoids replacing
-            // disjoint member updates from other actors.
+            // CA3/CA4/CA8: object.contents AND the metadata-declared presence
+            // cells (session_subscribers/subscribers) are derived per-shard
+            // projections, not authority carried in a whole-row snapshot. A
+            // snapshot reflects only the committing shard's partial view, so
+            // preserving the receiver's current projections avoids clobbering
+            // disjoint member/presence rows written by other actors. The
+            // receiver re-derives its own presence delta from the accepted
+            // transcript's session-scope transition (see applyAcceptedShadowFrame).
             row.contents = existing.contents.slice();
+            preserveSerializedProps(existing, row, presenceProjectionPropsFromReader(readerFor(), write.key).map((p) => p.name));
           }
           next.objectsById.set(write.key, row);
         }
@@ -1003,6 +1208,14 @@ function serializedShellFromCommitScopeState(state: ShadowCommitScopeState): Ser
 
 export function transcriptSessionActiveScope(transcript: EffectTranscript): { session: string; actor: ObjRef; activeScope: ObjRef } | null {
   if (!transcript.session) return null;
+  // CA8: the session active-scope transition is the authoritative placement
+  // signal — it is present even for a no-op physical enter, so read it first.
+  const transition = transcript.sessionScopeTransition;
+  if (transition && transition.to) {
+    return { session: transition.session, actor: transition.actor, activeScope: transition.to };
+  }
+  // Legacy fallback for transcripts authored before the transition effect: infer
+  // the new scope from the actor's physical move.
   const actorMove = lastMoveForObject(transcript, transcript.call.actor);
   if (!actorMove) return null;
   return { session: transcript.session, actor: transcript.call.actor, activeScope: actorMove.to };
@@ -1026,7 +1239,64 @@ export function transcriptTouchedObjectIds(transcript: EffectTranscript): Set<Ob
     if (move.from) ids.add(move.from);
     ids.add(move.to);
   }
+  // CA8: a session active-scope transition touches the source/destination rooms'
+  // presence projections (and the actor) even with no physical move, so route
+  // the commit and its projection write-through to those rooms' hosts.
+  const transition = transcript.sessionScopeTransition;
+  if (transition) {
+    ids.add(transition.actor);
+    if (transition.from) ids.add(transition.from);
+    if (transition.to) ids.add(transition.to);
+  }
   return ids;
+}
+
+// A3.2 coverage: record per-cell provenance for the tracked cells (object_lineage +
+// object_live) of `objectIds` on a commit-scope's provenance side-table. Used by the
+// derived-holder caches (gateway relay, browser relay) when they materialize cells
+// outside the provenance-recording authority merge — at seed and on accepted-frame
+// application — so the admission gate does not flag those cells missing. Recorded
+// record-if-stronger: a higher-ranked recorded source (e.g. an owner `authoritative`
+// or a `projection` from a merge) is never downgraded by a derived `cache` stamp.
+export function recordCommitScopeCellProvenance(
+  scope: ShadowCommitScope,
+  objectIds: Iterable<ObjRef>,
+  source: AuthorityPageSource
+): void {
+  const prov = (scope.cellProvenance ??= new Map<string, AuthorityPageProvenance>());
+  const rank = AUTHORITY_SOURCE_RANK[source];
+  for (const id of objectIds) {
+    for (const page of PLANNING_TRACKED_PAGES) {
+      const key = planningCellKey(id, page);
+      const existing = prov.get(key);
+      if (existing && AUTHORITY_SOURCE_RANK[existing.source] > rank) continue;
+      prov.set(key, { source });
+    }
+  }
+}
+
+// The object set an accepted frame materializes into a commit-scope cache: the
+// transcript-touched ids PLUS the authority object rows carried in
+// `projection_writes` (which `applyAcceptedShadowFrame` materializes directly, and
+// which transcriptTouchedObjectIds does NOT include). Both gateway and browser use
+// this so the recorded provenance set matches exactly what the applier wrote.
+export function acceptedFrameTrackedObjectIds(transcript: EffectTranscript, accepted?: ShadowCommitAccepted): Set<ObjRef> {
+  const ids = transcriptTouchedObjectIds(transcript);
+  for (const write of accepted?.projection_writes ?? []) {
+    if (write.table === "objects" && typeof write.key === "string") ids.add(write.key as ObjRef);
+  }
+  return ids;
+}
+
+// Record provenance for every object an accepted frame materialized (transcript +
+// authority projection_writes). The single helper the gateway and browser both call.
+export function recordAcceptedCommitScopeCellProvenance(
+  scope: ShadowCommitScope,
+  transcript: EffectTranscript,
+  accepted: ShadowCommitAccepted | undefined,
+  source: AuthorityPageSource
+): void {
+  recordCommitScopeCellProvenance(scope, acceptedFrameTrackedObjectIds(transcript, accepted), source);
 }
 
 function serializedObjectFromCreate(create: TranscriptCreate, objectTimestamp: number | undefined): SerializedObject {
@@ -1192,19 +1462,67 @@ function touchSerializedObject(target: SerializedObject, objectTimestamp: number
   if (objectTimestamp !== undefined) target.modified = objectTimestamp;
 }
 
-function applyPropWrite(target: SerializedObject, write: TranscriptWrite): void {
-  // Keep this parallel with WooWorld.applyTranscriptPropWriteInPlace.
+// A2 (mobile-heap sequence): the single source of accepted-transcript property
+// -write semantics. Both the serialized-row authority applier
+// (applyPropWrite, below) and the live-graph executable applier
+// (WooWorld.applyTranscriptPropWriteInPlace) delegate here through a thin
+// per-storage-shape target, so there is exactly one place that decides what a
+// prop write means. There is no longer a "keep this parallel" twin to drift.
+// VTN0 coherence invariant: the executable mirror and the projection row are the
+// same function of the transcript.
+export interface TranscriptPropTarget {
+  /** Current stored version for `name`, before this write is applied. */
+  propertyVersion(name: string): number | undefined;
+  setProperty(name: string, value: WooValue): void;
+  removeProperty(name: string): void;
+  setPropertyVersion(name: string, version: number): void;
+  /** Mirror a write to the `name` property onto the object's display name. */
+  setObjectName(name: string): void;
+}
+
+// The accepted-transcript next-version rule: trust an explicit, well-formed
+// `next` from the transcript; otherwise monotonically bump the stored version.
+// One definition for both appliers (previously copied in two places).
+export function nextPropertyVersion(rawNext: string | undefined, currentVersion: number | undefined): number {
+  const parsed = rawNext === undefined ? null : Number(rawNext);
+  return parsed !== null && Number.isInteger(parsed) && parsed >= 0
+    ? parsed
+    : (currentVersion ?? 0) + 1;
+}
+
+export function applyTranscriptPropWrite(target: TranscriptPropTarget, write: TranscriptWrite): void {
   if (write.cell.kind !== "prop") return;
   const propName = write.cell.name;
   if (write.op === "remove") {
-    target.properties = target.properties.filter(([name]) => name !== propName);
-    target.propertyVersions = target.propertyVersions.filter(([name]) => name !== propName);
+    target.removeProperty(propName);
     return;
   }
-  const value = structuredClone(write.value) as WooValue;
-  setSerializedProperty(target, propName, value);
-  if (propName === "name" && typeof value === "string") target.name = value;
-  setSerializedPropertyVersion(target, propName, write.next);
+  // `setProperty` clones into the target's storage shape (each adapter keeps its
+  // own cloner — structuredClone for serialized rows, clonePlainData for the live
+  // graph — so A2 changes no value semantics). `write.value` is read raw here only
+  // for the name-mirror type check, which does not store it.
+  const next = nextPropertyVersion(write.next, target.propertyVersion(propName));
+  target.setProperty(propName, write.value);
+  if (propName === "name" && typeof write.value === "string") target.setObjectName(write.value);
+  target.setPropertyVersion(propName, next);
+}
+
+function applyPropWrite(target: SerializedObject, write: TranscriptWrite): void {
+  applyTranscriptPropWrite(serializedObjectPropTarget(target), write);
+}
+
+// Adapter: the commit-scope authority's plain SerializedObject row.
+function serializedObjectPropTarget(target: SerializedObject): TranscriptPropTarget {
+  return {
+    propertyVersion: (name) => target.propertyVersions.find(([prop]) => prop === name)?.[1],
+    setProperty: (name, value) => setSerializedProperty(target, name, structuredClone(value) as WooValue),
+    removeProperty: (name) => {
+      target.properties = target.properties.filter(([prop]) => prop !== name);
+      target.propertyVersions = target.propertyVersions.filter(([prop]) => prop !== name);
+    },
+    setPropertyVersion: (name, version) => setSerializedPropertyVersionValue(target, name, version),
+    setObjectName: (name) => { target.name = name; }
+  };
 }
 
 function setSerializedProperty(target: SerializedObject, name: string, value: WooValue): void {
@@ -1214,11 +1532,18 @@ function setSerializedProperty(target: SerializedObject, name: string, value: Wo
   target.properties.sort(([a], [b]) => a.localeCompare(b));
 }
 
+// Parse a raw transcript `next` and store the resulting version. Used by the
+// sequencer `next_seq` write; the per-prop applier path resolves the version via
+// the shared `nextPropertyVersion` and calls the value setter directly.
 function setSerializedPropertyVersion(target: SerializedObject, name: string, version: string | undefined): void {
-  const parsed = version === undefined ? null : Number(version);
-  const nextVersion: number = parsed !== null && Number.isInteger(parsed) && parsed >= 0
-    ? parsed
-    : (target.propertyVersions.find(([prop]) => prop === name)?.[1] ?? 0) + 1;
+  setSerializedPropertyVersionValue(
+    target,
+    name,
+    nextPropertyVersion(version, target.propertyVersions.find(([prop]) => prop === name)?.[1])
+  );
+}
+
+function setSerializedPropertyVersionValue(target: SerializedObject, name: string, nextVersion: number): void {
   const index = target.propertyVersions.findIndex(([prop]) => prop === name);
   if (index >= 0) target.propertyVersions[index] = [name, nextVersion];
   else target.propertyVersions.push([name, nextVersion]);

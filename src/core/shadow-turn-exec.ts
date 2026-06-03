@@ -10,7 +10,7 @@ import { effectTranscriptFromRecordedTurn, type EffectTranscript } from "./effec
 import { shadowCommitReceipt, type ShadowCommitReceipt } from "./turn-commit";
 import { replayRecordedTurn } from "./turn-replay";
 import type { RecordedTurn } from "./turn-recorder";
-import { shadowAtomHash, shadowTurnKeyFromTranscript, type ShadowTurnKey } from "./turn-key";
+import { SHADOW_EPOCH_WILDCARD, shadowAtomHash, shadowTurnKeyFromTranscript, type ShadowTurnKey } from "./turn-key";
 import {
   runShadowTurnCallOnWorld,
   runShadowTurnCallOnWorldTranscript,
@@ -20,6 +20,7 @@ import {
 } from "./shadow-turn-call";
 import type { ShadowCapabilityAd } from "./capability-ad";
 import {
+  selectCommitScopeForTranscript,
   serializedFor,
   shadowCommitScopeObject,
   shadowLocationCommitScopeForTranscript,
@@ -34,6 +35,7 @@ import {
 import { constantTimeEqual, hashSource, utf8ByteLength } from "./source-hash";
 import { stableShadowJson } from "./shadow-cell-version";
 import { createWorldFromSerialized } from "./bootstrap";
+import { buildPlanningWorld, planningCellKey, PLANNING_TRACKED_PAGES, type PlanningWorldProvenance } from "./planning-world";
 import type { WooWorld } from "./world";
 import {
   cacheShadowStatePages,
@@ -57,16 +59,6 @@ const SHADOW_EXECUTION_CAPSULE_CLOCK_SKEW_MS = 5_000;
 export type ShadowMissingAtom = {
   hash: string;
   preimage?: string;
-};
-
-export type ShadowClosureTransfer = {
-  kind: "woo.state.transfer.shadow.v1";
-  mode: "closure";
-  scope: ObjRef;
-  atom_hashes: string[];
-  preimages?: string[];
-  serialized: SerializedWorld;
-  proof: ShadowStateProof;
 };
 
 export type ShadowObjectRecordTransfer = {
@@ -146,7 +138,10 @@ export type ShadowStateProof = {
   signature: string;
 };
 
-export type ShadowStateTransferMode = "closure" | "object_records" | "cell_pages";
+// B7 retired the `closure` mode (a whole-serialized-world bundle) in favor of
+// content-addressed `cell_pages`. `object_records` remains as the full-record
+// fallback used during executor repair when page-level closure is unavailable.
+export type ShadowStateTransferMode = "object_records" | "cell_pages";
 
 export type ShadowTransferSigning = {
   authority?: string;
@@ -155,7 +150,7 @@ export type ShadowTransferSigning = {
   recipient?: string;
 };
 
-export type ShadowStateTransfer = ShadowClosureTransfer | ShadowObjectRecordTransfer | ShadowCellPageTransfer;
+export type ShadowStateTransfer = ShadowObjectRecordTransfer | ShadowCellPageTransfer;
 
 export type ShadowExecutionNode = {
   kind: "woo.execution_node.shadow.v1";
@@ -169,6 +164,13 @@ export type ShadowExecutionNode = {
   trusted_transfer_authorities: Map<string, string>;
   serialized?: SerializedWorld;
   world?: WooWorld;
+  // A3.2: per-cell provenance for `serialized` (the derived holder/cache view this
+  // execution node composes from transfers). Lets the planning admission gate run by
+  // PROOF (buildPlanningWorld) rather than by declaration when this node's serialized
+  // state crosses the VM boundary (sparse executors + browser-local planning). An
+  // `authoritative_state` node owns the full authority and is trusted by capability,
+  // so it does not consult this.
+  cellProvenance?: PlanningWorldProvenance;
   committed_head_hash?: string;
   serialized_generation?: number;
   // When true, the executor owns the full authoritative scope state and the
@@ -310,7 +312,7 @@ export function createShadowExecutionNode(input: {
   for (const obj of cachedObjects) cacheShadowStatePages(pageCache, shadowStatePagesForObject(obj));
   cacheShadowStatePages(pageCache, input.cached_pages ?? []);
   if (cachedObjects.length > 0) serialized = mergeCachedObjectRecords(serialized, cachedObjects);
-  return {
+  const node: ShadowExecutionNode = {
     kind: "woo.execution_node.shadow.v1",
     node: input.node,
     scope: input.scope,
@@ -323,11 +325,19 @@ export function createShadowExecutionNode(input: {
     serialized,
     ...(input.authoritative_state === true ? { authoritative_state: true } : {})
   };
+  // The initial serialized world (+ any cached object records merged above) are full
+  // object records: both tracked cells are honestly held.
+  recordExecutionNodeCellProvenance(node, trackedCellKeysForFullObjects(node.serialized?.objects ?? []));
+  return node;
 }
 
 export function installShadowCachedObjectRecords(node: ShadowExecutionNode, objects: SerializedObject[]): void {
   for (const obj of objects) cacheShadowMaterializedObject(node, obj);
-  if (objects.length > 0) node.serialized = mergeCachedObjectRecords(node.serialized, objects);
+  if (objects.length > 0) {
+    node.serialized = mergeCachedObjectRecords(node.serialized, objects);
+    // Full object records: tag exactly the objects this install delivered.
+    recordExecutionNodeCellProvenance(node, trackedCellKeysForFullObjects(objects));
+  }
 }
 
 export function missingAtomsForShadowTurn(node: ShadowExecutionNode, key: ShadowTurnKey): ShadowMissingAtom[] {
@@ -340,29 +350,6 @@ export function missingAtomsForShadowTurn(node: ShadowExecutionNode, key: Shadow
     if (!node.atom_hashes.has(hash)) missing.push({ hash, preimage: key.preimages[i] });
   }
   return missing;
-}
-
-export function buildShadowClosureTransfer(input: {
-  serialized: SerializedWorld;
-  key: ShadowTurnKey;
-  atom_hashes?: string[];
-} & ShadowTransferSigning): ShadowClosureTransfer {
-  const requested = new Set(input.atom_hashes ?? input.key.atom_hashes);
-  const preimages = input.key.preimages.filter((_, index) => requested.has(input.key.atom_hashes[index]));
-  const transfer = {
-    kind: "woo.state.transfer.shadow.v1",
-    mode: "closure",
-    scope: input.key.scope,
-    atom_hashes: input.key.atom_hashes.filter((hash) => requested.has(hash)),
-    preimages,
-    // Shadow transfer intentionally moves a full serialized pre-turn world.
-    // Later state-plane work can replace this with page-level closure export.
-    serialized: structuredClone(input.serialized) as SerializedWorld
-  } satisfies Omit<ShadowClosureTransfer, "proof">;
-  return {
-    ...transfer,
-    proof: signShadowStateTransfer(transfer, input)
-  };
 }
 
 export function buildShadowObjectRecordTransfer(input: {
@@ -545,9 +532,13 @@ function shadowTransferAtomTurnKey(
   return {
     kind: "woo.turn_key.shadow.v1",
     scope,
+    // A transfer-atom key is a capsule-binding artifact, not a routing key, so it
+    // carries the wildcard epoch and claims no effects.
+    epoch: SHADOW_EPOCH_WILDCARD,
     actor: input.actor,
     target: input.target,
     verb: input.verb,
+    effects: 0,
     preimages,
     atom_hashes: atomHashes,
     read_preimages: preimages,
@@ -628,9 +619,6 @@ function shadowTurnKeyHash(key: ShadowTurnKey): string {
 }
 
 export function installShadowStateTransfer(node: ShadowExecutionNode, transfer: ShadowStateTransfer): void {
-  if (transfer.mode === "closure" && node.scope !== transfer.scope) {
-    throw new Error(`state transfer scope mismatch: node=${node.scope} transfer=${transfer.scope}`);
-  }
   // Object-record transfers are content-addressed pages for whatever atom was
   // missing during retry. Their proof still binds transfer.scope, but the
   // receiving execution node may be installing dependency pages such as catalog
@@ -638,12 +626,6 @@ export function installShadowStateTransfer(node: ShadowExecutionNode, transfer: 
   // scope.
   verifyShadowStateTransferProof(node, transfer);
   for (const hash of transfer.atom_hashes) node.atom_hashes.add(hash);
-  if (transfer.mode === "closure") {
-    node.serialized = structuredClone(transfer.serialized) as SerializedWorld;
-    node.world = undefined;
-    for (const obj of node.serialized.objects) cacheShadowMaterializedObject(node, obj);
-    return;
-  }
   if (transfer.mode === "cell_pages") {
     node.serialized = mergeCellPageTransfer(node.serialized, transfer, node.page_cache);
     // Cell pages replace individual serialized cells. Any already-unpacked
@@ -651,12 +633,21 @@ export function installShadowStateTransfer(node: ShadowExecutionNode, transfer: 
     // before recording the retry transcript.
     node.world = undefined;
     for (const ref of transfer.page_refs) node.page_hashes.add(ref.hash);
+    // Tag only the tracked pages the refs actually delivered — not the live cells
+    // synthesized as defaults for a lineage-only object.
+    recordExecutionNodeCellProvenance(node, trackedCellKeysFromPageRefs(transfer.page_refs));
     return;
   }
+  const transferredIds = new Set(transfer.object_pages.map((page) => page.id));
   node.serialized = mergeObjectRecordTransfer(node.serialized, transfer, node.object_cache);
   node.world = undefined;
   for (const page of transfer.object_pages) node.object_hashes.add(page.hash);
-  cacheShadowObjectsById(node, new Set(transfer.object_pages.map((page) => page.id)));
+  cacheShadowObjectsById(node, transferredIds);
+  // Object-record transfers carry full records for the transferred ids: both cells held.
+  recordExecutionNodeCellProvenance(
+    node,
+    trackedCellKeysForFullObjects(node.serialized.objects.filter((obj) => transferredIds.has(obj.id)))
+  );
 }
 
 export async function executeShadowRecordedTurnOrNeedState(
@@ -787,6 +778,8 @@ export async function executeAuthoritativeShadowTurnCall(
   node.serialized = serializedFor(input.commitScope, { reason: "authoritative_turn_result" });
   for (const hash of key.atom_hashes) node.atom_hashes.add(hash);
   cacheShadowTranscriptObjects(node, run.transcript, input.commitScope);
+  // B7: warm the caller with the committed turn's closure (post-commit head).
+  const warmTransfer = buildShadowCommitWarmTransfer(node, run.transcript, input.commitScope.head, input.call.session);
   return {
     ok: true,
     attempted: true,
@@ -795,7 +788,7 @@ export async function executeAuthoritativeShadowTurnCall(
     receipt,
     commit,
     serializedAfter: node.serialized,
-    reply: successReply(request, run.transcript, commit)
+    reply: successReply(request, run.transcript, commit, warmTransfer)
   };
 }
 
@@ -909,6 +902,12 @@ export async function executeShadowTurnCallOrNeedState(
   }
 
   const livePersistence = request.persistence === "live";
+  // B6: emit the multi-scope metric at this in-process/relay commit boundary so
+  // the basis/metric contract holds here too (covers the browser relay delegated
+  // path and the in-process network), not only at the gateway. The submit scope
+  // VALUE is chosen by commitScopeForTranscript below (relay sub-scope routing);
+  // this call single-sources the rule and the metric.
+  if (!livePersistence) selectCommitScopeForTranscript(run.transcript, run.transcript.scope, options.metric);
   const selectedCommitScope = !livePersistence
     ? options.commitScopeForTranscript?.(run.transcript) ?? options.commitScope
     : options.commitScope;
@@ -985,21 +984,81 @@ export async function executeShadowTurnCallOrNeedState(
   const acceptedKey = shadowTurnKeyFromTranscript(run.transcript);
   for (const hash of acceptedKey.atom_hashes) node.atom_hashes.add(hash);
   if (!livePersistence) cacheShadowTranscriptObjects(node, run.transcript, selectedCommitScope);
+  const acceptedCommit = commit?.kind === "woo.commit.accepted.shadow.v1" ? commit : undefined;
+  // B7: an authoritative executor warms the caller with the committed turn's
+  // closure. Durable accepted commits only — a live turn is not a durable state
+  // transition, and a sparse executor returns undefined from the helper.
+  const warmTransfer = (!livePersistence && acceptedCommit && selectedCommitScope)
+    ? buildShadowCommitWarmTransfer(node, run.transcript, selectedCommitScope.head, request.call.session)
+    : undefined;
   return {
     ok: true,
     attempted: true,
     frame: run.frame,
     transcript: run.transcript,
     receipt,
-    commit: commit?.kind === "woo.commit.accepted.shadow.v1" ? commit : undefined,
+    commit: acceptedCommit,
     serializedAfter,
-    reply: successReply(request, run.transcript, commit?.kind === "woo.commit.accepted.shadow.v1" ? commit : undefined)
+    reply: successReply(request, run.transcript, acceptedCommit, warmTransfer)
   };
+}
+
+// Tag the tracked cells a transfer/install GENUINELY delivered `cache` (set-if-absent)
+// — the honest source for a holder/cache view composed from transfers. Skipped for an
+// authoritative_state node, which owns the full authority and is trusted by
+// capability (its planning world is admitted without the gate). This is what lets
+// browser-local planning + sparse executors run the admission gate by PROOF.
+//
+// `touchedKeys` are the planning-cell keys (see `planningCellKey`) the caller actually
+// installed — derived from the installed pages/transfers, NOT by re-scanning the
+// serialized result. Scanning the result over-claims: `mergeShadowStatePagesIntoSerialized`
+// synthesizes default `object_live` fields (location:null, empty children/contents) for
+// an object materialized from a lineage-only page, so a scan would stamp a `cache` copy
+// of live cells the node never received. An untagged synthetic-default `object_live`
+// is correctly left as `missing_provenance` for the atom-guard / repair to resolve.
+function recordExecutionNodeCellProvenance(node: ShadowExecutionNode, touchedKeys: Iterable<string>): void {
+  if (node.authoritative_state || !node.serialized) return;
+  const prov = (node.cellProvenance ??= new Map());
+  for (const key of touchedKeys) {
+    if (!prov.has(key)) prov.set(key, { source: "cache" });
+  }
+}
+
+// Tracked-cell keys for objects held as FULL records (initial serialized, closure
+// transfer, object-record transfer, cached object records): both tracked pages are
+// genuinely materialized from the record, so both are honestly `cache`.
+function trackedCellKeysForFullObjects(objects: Iterable<SerializedObject>): string[] {
+  const keys: string[] = [];
+  for (const obj of objects) {
+    for (const page of PLANNING_TRACKED_PAGES) keys.push(planningCellKey(obj.id, page));
+  }
+  return keys;
+}
+
+// Tracked-cell keys for a cell-page transfer: ONLY the tracked pages the transfer's
+// refs actually carry. A lineage-only transfer must not claim the synthesized
+// default `object_live` it never delivered (see recordExecutionNodeCellProvenance).
+function trackedCellKeysFromPageRefs(refs: Iterable<ShadowStatePageRef>): string[] {
+  const keys: string[] = [];
+  for (const ref of refs) {
+    if (PLANNING_TRACKED_PAGES.has(ref.page)) keys.push(planningCellKey(ref.object, ref.page, ref.name));
+  }
+  return keys;
 }
 
 function shadowExecutionWorld(node: ShadowExecutionNode): WooWorld {
   if (!node.serialized) throw new Error(`shadow executor has no serialized state: ${node.node}`);
-  if (!node.world) node.world = createWorldFromSerialized(node.serialized, { persist: false });
+  if (!node.world) {
+    // A3.2 true VM boundary. An authoritative_state executor owns the full
+    // authority — trusted by capability, admitted without the gate (and without
+    // paying per-object admission scan on the hot authority path). A sparse/derived
+    // executor is admitted by PROOF: buildPlanningWorld refuses a presentation stub
+    // (→ repairable E_NEED_STATE) using the node's recorded provenance. missing
+    // provenance stays the atom-guard's job here, so it is not separately enforced.
+    node.world = node.authoritative_state
+      ? createWorldFromSerialized(node.serialized, { persist: false })
+      : createWorldFromSerialized(buildPlanningWorld(node.serialized, node.cellProvenance ?? new Map()), { persist: false });
+  }
   return node.world;
 }
 
@@ -1191,7 +1250,6 @@ function trustedTransferAuthorities(input: Record<string, string> | undefined): 
 }
 
 type UnsignedShadowStateTransfer =
-  | Omit<ShadowClosureTransfer, "proof">
   | Omit<ShadowObjectRecordTransfer, "proof">
   | Omit<ShadowCellPageTransfer, "proof">;
 
@@ -1246,27 +1304,22 @@ function shadowStateTransferRoot(
     atom_hashes: transfer.atom_hashes,
     preimages: transfer.preimages ?? []
   };
-  const material = transfer.mode === "closure"
+  const material = transfer.mode === "cell_pages"
     ? {
         ...base,
-        serialized_hash: hashSource(stableShadowJson(transfer.serialized as unknown as WooValue))
+        ...(transfer.purpose ? { purpose: transfer.purpose } : {}),
+        ...(transfer.capsule ? { capsule: transfer.capsule } : {}),
+        page_refs: transfer.page_refs,
+        inline_page_hashes: transfer.inline_pages.map(shadowStatePageHash),
+        sessions: transfer.sessions,
+        logs: transfer.logs,
+        snapshots: transfer.snapshots,
+        parkedTasks: transfer.parkedTasks,
+        tombstones: transfer.tombstones,
+        counters: transfer.counters,
+        source_object_count: transfer.source_object_count,
+        source_page_count: transfer.source_page_count
       }
-    : transfer.mode === "cell_pages"
-      ? {
-          ...base,
-          ...(transfer.purpose ? { purpose: transfer.purpose } : {}),
-          ...(transfer.capsule ? { capsule: transfer.capsule } : {}),
-          page_refs: transfer.page_refs,
-          inline_page_hashes: transfer.inline_pages.map(shadowStatePageHash),
-          sessions: transfer.sessions,
-          logs: transfer.logs,
-          snapshots: transfer.snapshots,
-          parkedTasks: transfer.parkedTasks,
-          tombstones: transfer.tombstones,
-          counters: transfer.counters,
-          source_object_count: transfer.source_object_count,
-          source_page_count: transfer.source_page_count
-        }
     : {
         ...base,
         object_pages: transfer.object_pages,
@@ -1428,7 +1481,8 @@ function commitRejectedReply(
 function successReply(
   request: ShadowTurnExecRequest,
   transcript: EffectTranscript,
-  commit?: ShadowCommitAccepted
+  commit?: ShadowCommitAccepted,
+  stateTransfer?: ShadowCellPageTransfer
 ): ShadowTurnExecReply {
   const outcome = transcript.error
     ? { error: transcript.error as unknown as WooValue }
@@ -1439,8 +1493,49 @@ function successReply(
     id: request.id ?? request.call.id,
     outcome,
     transcript,
-    commit
+    commit,
+    ...(stateTransfer ? { state_transfer: stateTransfer } : {})
   };
+}
+
+// B7 (VTN0 claim 5 / VTN12): after an accepted durable commit, an authoritative
+// executor returns a content-addressed `cell_pages` transfer of the committed
+// turn's closure so the CALLER's execution cache warms — the next same-object
+// turn then plans locally without a second remote state fetch. The transfer is
+// verifiable (proof, recipient "*") and is installed as `source:"cache"`; it
+// carries no write authority, so it can never satisfy a commit-validation read
+// (the warmed caller still commits at the owner's scope). Only an
+// `authoritative_state` executor can build it — it owns the committed post-state
+// to warm from; a sparse executor returns undefined. Selected on the turn's full
+// `atom_hashes` closure so a single install covers the next same-turn replan.
+function buildShadowCommitWarmTransfer(
+  node: ShadowExecutionNode,
+  transcript: EffectTranscript,
+  head: ShadowScopeHead,
+  session?: string | null
+): ShadowCellPageTransfer | undefined {
+  if (node.authoritative_state !== true || !node.serialized) return undefined;
+  const key = shadowTurnKeyFromTranscript(transcript);
+  if (key.atom_hashes.length === 0) return undefined;
+  const transfer = buildShadowCellPageTransfer({
+    serialized: node.serialized,
+    key,
+    atom_hashes: key.atom_hashes,
+    session,
+    purpose: "accepted_write_cells",
+    capsule: {
+      head,
+      actor: key.actor,
+      session,
+      target: key.target,
+      verb: key.verb,
+      recipient: "*"
+    }
+  });
+  if (transfer.atom_hashes.length === 0 && transfer.page_refs.length === 0 && transfer.inline_pages.length === 0) {
+    return undefined;
+  }
+  return transfer;
 }
 
 function objectClosureForPreimages(serialized: SerializedWorld, preimages: string[]): Set<ObjRef> {

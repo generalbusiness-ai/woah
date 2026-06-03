@@ -46,6 +46,30 @@ describe("scoped client projection helpers", () => {
     expect(scopedHerePresentActors(next.here)).toEqual(["guest_1", "guest_2"]);
   });
 
+  it("drops stale here snapshots when a move result defers the replacement look", () => {
+    const me = {
+      session: { id: "session_1", actor: "guest_1", active_scope: "room_a", current_location: "room_a", all_locations: ["room_a"] },
+      here: { id: "room_a", name: "Room A", roster: [{ id: "guest_1", name: "Guest One" }] },
+      cursor: { spaces: { room_a: { next_seq: 5 } }, live: { resumable: false } }
+    };
+    const model: ScopedProjectionStateModel = {
+      me,
+      cursor: me.cursor,
+      session: me.session,
+      here: me.here,
+      inventory: [],
+      overlays: {}
+    };
+
+    const next = scopedModelWithMoveResult(model, { room: "room_b", look_deferred: true });
+
+    expect(next.session).toMatchObject({ active_scope: "room_b", current_location: "room_b" });
+    expect(next.me?.session).toMatchObject({ active_scope: "room_b", current_location: "room_b" });
+    expect(next.here).toBeNull();
+    expect(next.me?.here).toBeNull();
+    expect(me.here.id).toBe("room_a");
+  });
+
   it("advances replay cursors monotonically from sequenced frames", () => {
     const cursor = { spaces: { room_a: { next_seq: 5 } }, live: { resumable: false } };
 

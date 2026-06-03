@@ -23,7 +23,8 @@ import {
   type ProjectionWrite
 } from "../src/core/projection-delta";
 import { createShadowCommitScope, serializedFor, type ShadowCommitAccepted } from "../src/core/shadow-commit-scope";
-import type { ShadowTurnExecReply } from "../src/core/shadow-turn-exec";
+import { buildShadowCellPageTransfer, type ShadowTurnExecReply, type ShadowTurnExecRequest } from "../src/core/shadow-turn-exec";
+import { shadowTurnKeyFromCall, shadowTurnKeyFromTranscript } from "../src/core/turn-key";
 
 describe("v2 browser worker integration", () => {
   afterEach(() => {
@@ -918,6 +919,140 @@ describe("v2 browser worker integration", () => {
       }
     });
     expect(posted.filter((message) => isLocalTurnCommitted(message, "bad-bundled-capsule-turn"))).toHaveLength(1);
+  });
+
+  it("validates reply-bundled executable transfers against the accepted transcript key", async () => {
+    const posted: unknown[] = [];
+    const scope = new FakeWorkerScope();
+    vi.stubGlobal("self", scope);
+    vi.stubGlobal("postMessage", (message: unknown) => posted.push(message));
+    vi.stubGlobal("indexedDB", new FakeIndexedDBFactory());
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+
+    await import("../src/client/v2-browser-worker");
+
+    const world = createWorld();
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-accepted-key-transfer");
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-accepted-key-transfer",
+      scope: "the_dubspace",
+      serialized: world.exportWorld()
+    });
+    const browser = createShadowBrowserClient({
+      node: "browser:v2-worker-accepted-key-transfer",
+      scope: "the_dubspace",
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: "token:v2-worker-accepted-key-transfer"
+    });
+    const opened = await openShadowBrowserScope(browser);
+
+    scope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-accepted-key-transfer",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    const socket = await waitForSocket();
+    socket.open();
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "hello-accepted-key-transfer", "woo.transport.hello.v1", shadowBrowserTransportHello(browser))));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "transfer-accepted-key-transfer", opened.transfer.kind, opened.transfer)));
+
+    const call = {
+      kind: "woo.turn_call.shadow.v1" as const,
+      id: "accepted-key-transfer-turn",
+      route: "sequenced" as const,
+      scope: "the_dubspace",
+      session: session.id,
+      actor: session.actor,
+      target: "the_dubspace",
+      verb: "checkpoint_marker",
+      args: [1],
+      body: undefined
+    };
+    const request: ShadowTurnExecRequest = {
+      kind: "woo.turn.exec.request.shadow.v1",
+      id: call.id,
+      call,
+      key: shadowTurnKeyFromCall(call),
+      expected: relay.commit_scope.head,
+      persistence: "durable"
+    };
+    scope.dispatch({
+      kind: "send",
+      envelope: {
+        v: 2,
+        type: request.kind,
+        id: "accepted-key-transfer-request",
+        from: browser.node,
+        actor: browser.actor,
+        session: session.id,
+        auth: { mode: "session", token: "token:v2-worker-accepted-key-transfer" },
+        body: request
+      }
+    });
+    await waitFor(() =>
+      socket.sent.some((encoded) => decodeEnvelope(encoded).id === "accepted-key-transfer-request")
+        ? true
+        : undefined
+    );
+
+    const transcript = syntheticCheckpointTranscript("the_dubspace", session.actor, session.id, 1);
+    const accepted = syntheticAccepted("the_dubspace", 1);
+    const acceptedKey = shadowTurnKeyFromTranscript(transcript);
+    const stateTransfer = buildShadowCellPageTransfer({
+      serialized: serializedFor(relay.commit_scope, { reason: "accepted_key_transfer_test" }),
+      key: acceptedKey,
+      atom_hashes: acceptedKey.atom_hashes,
+      session: session.id,
+      purpose: "accepted_write_cells",
+      recipient: browser.node,
+      capsule: {
+        head: accepted.position,
+        actor: acceptedKey.actor,
+        session: session.id,
+        target: acceptedKey.target,
+        verb: acceptedKey.verb,
+        recipient: browser.node
+      }
+    });
+
+    socket.receive(encodeEnvelope({
+      ...relayEnvelope(browser, "accepted-key-transfer-reply", "woo.turn.exec.reply.shadow.v1", {
+        kind: "woo.turn.exec.reply.shadow.v1",
+        ok: true,
+        id: request.id,
+        outcome: { result: null },
+        transcript,
+        commit: accepted,
+        state_transfer: stateTransfer
+      } satisfies ShadowTurnExecReply),
+      reply_to: "accepted-key-transfer-request"
+    }));
+
+    expect(await waitForMessage(posted, (message) => isKind(message, "applied_frame"))).toMatchObject({
+      kind: "applied_frame"
+    });
+    expect(await waitForMessage(posted, (message) => {
+      if (!isKind(message, "frame")) return false;
+      const envelope = (message as { envelope?: { id?: unknown } }).envelope;
+      return envelope?.id === "accepted-key-transfer-reply";
+    })).toMatchObject({
+      kind: "frame",
+      envelope: {
+        body: {
+          state_transfer: expect.objectContaining({ purpose: "accepted_write_cells" })
+        }
+      }
+    });
+    expect(posted.some((message) =>
+      browserMetric(message)?.phase === "execution_capsule_validate" &&
+      browserMetric(message)?.status === "error"
+    )).toBe(false);
   });
 
   it("replans a needs-replan proposal after a stale-head reply with a fresh envelope id", async () => {

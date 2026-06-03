@@ -12,6 +12,7 @@
 // callback shape: the consumer feeds `actors`/`sessions` arrays and we
 // only assemble the audience record.
 
+import { shadowLiveEventsForTranscriptRelay } from "./shadow-browser-node";
 import type { EffectTranscript } from "./effect-transcript";
 import type { ShadowLiveAudience, ShadowLiveEvent } from "./shadow-browser-node";
 import type { ObjRef } from "./types";
@@ -41,6 +42,13 @@ export function affectedTranscriptScopes(scope: ObjRef, transcript: EffectTransc
   for (const move of transcript.moves) {
     add(move.from);
     add(move.to);
+  }
+  // CA8: a session active-scope transition affects the source/destination rooms'
+  // presence projections even when there is no physical move (a no-op enter), so
+  // co-present peers on those rooms' shards still receive the fanout.
+  if (transcript.sessionScopeTransition) {
+    add(transcript.sessionScopeTransition.from);
+    add(transcript.sessionScopeTransition.to);
   }
   for (const create of transcript.creates) {
     add(create.location);
@@ -105,4 +113,78 @@ export function shadowLiveEventMatchesPeerScope(event: ShadowLiveEvent, peer: Sh
     return typeof audience.scope === "string" && audience.scope === peer.scope;
   }
   return typeof event.scope === "string" && event.scope === peer.scope;
+}
+
+// Per-observation audiences recomputed authoritatively by the host (the
+// `world.computeDirectLiveAudiences` result), index-aligned with
+// `transcript.observations`. The async world walk stays host-side; this module
+// only consumes the resulting arrays.
+export type V2FanoutAudiences = {
+  observationAudiences?: ObjRef[][];
+  observationSessionAudiences?: string[][];
+};
+
+// Build the live events a COMMITTED transcript fans out, with each event's
+// audience recomputed from the host's authoritative per-observation audience
+// lists (replacing the transcript-embedded audience). Events with no
+// addressable recipient are dropped. Shared by the worker and localdev so both
+// decide committed-turn live recipients identically. `from` is the relay/host
+// node stamped as the event origin.
+export function buildV2FanoutLiveEvents(
+  from: string,
+  transcript: EffectTranscript,
+  audiences: V2FanoutAudiences
+): ShadowLiveEvent[] {
+  return shadowLiveEventsForTranscriptRelay(from, transcript)
+    .map((event, index) => withComputedLiveAudience(
+      event,
+      audiences.observationAudiences?.[index] ?? [],
+      audiences.observationSessionAudiences?.[index] ?? []
+    ))
+    .filter((event): event is ShadowLiveEvent => event !== null);
+}
+
+// A peer the fanout may deliver to, identified by its bound scope (its
+// "shard"): the WS attachment scope (worker) or the connected browser's scope
+// (localdev). Same shape as `ShadowLivePeerScope` plus the addressable `node`.
+export type V2FanoutPeer = ShadowLivePeerScope & { node: string };
+
+export type V2BrowserFanoutPlan = {
+  // Per recipient peer: the node and the (non-empty) events it should receive.
+  liveDeliveries: Array<{ node: string; events: ShadowLiveEvent[] }>;
+  // Peers whose bound scope IS the commit scope and therefore need a projection
+  // state-transfer (catch-up) at the new head, in addition to any live events.
+  stateTransferNodes: string[];
+};
+
+// The pure recipient-routing decision for a committed turn's browser fanout,
+// shared by the worker (`sendV2CommitTranscriptFanout`) and localdev
+// (`sendDevV2Fanout`). Given the audience-computed live events and the connected
+// peers, decide who receives which events and who needs a projection catch-up.
+//
+// Origin and already-delivered nodes are excluded. A peer receives every event
+// matching `shadowLiveEventMatchesPeerScope` (by peer.scope, actor, or session).
+// A peer bound to `commitScope` is additionally a state-transfer target — it
+// re-syncs its authoritative projection at the new head even when no live event
+// matched (the commit advanced the head it projects from). This is exactly the
+// worker's per-socket decision; localdev, being one process with one global
+// socket set, runs it over EVERY connected peer so the union of the worker's
+// per-DO + cross-shard delivery is reproduced locally.
+export function planV2BrowserFanout(input: {
+  events: ShadowLiveEvent[];
+  commitScope: ObjRef;
+  peers: Iterable<V2FanoutPeer>;
+  originNode?: string | null;
+  alreadyDeliveredNodes?: ReadonlySet<string>;
+}): V2BrowserFanoutPlan {
+  const liveDeliveries: Array<{ node: string; events: ShadowLiveEvent[] }> = [];
+  const stateTransferNodes: string[] = [];
+  for (const peer of input.peers) {
+    if (input.originNode && peer.node === input.originNode) continue;
+    if (input.alreadyDeliveredNodes?.has(peer.node)) continue;
+    if (peer.scope === input.commitScope) stateTransferNodes.push(peer.node);
+    const matching = input.events.filter((event) => shadowLiveEventMatchesPeerScope(event, peer));
+    if (matching.length > 0) liveDeliveries.push({ node: peer.node, events: matching });
+  }
+  return { liveDeliveries, stateTransferNodes };
 }

@@ -1,3 +1,4 @@
+import { authoritativePlanningWorld } from "../src/core/planning-world";
 import { describe, expect, it } from "vitest";
 import { installVerb } from "../src/core/authoring";
 import { createWorld, createWorldFromSerialized } from "../src/core/bootstrap";
@@ -56,7 +57,7 @@ describe("actor-anchored movement projection", () => {
     const alice = world.auth("guest:movement-a");
     placeSessionActor(world, alice, "mv_src_a");
 
-    const planned = await runShadowTurnCallTranscript(world.exportWorld(), movementCall(alice, "mv_src_a", "move-a"));
+    const planned = await runShadowTurnCallTranscript(authoritativePlanningWorld(world.exportWorld()), movementCall(alice, "mv_src_a", "move-a"));
     expect(planned.frame).toMatchObject({ op: "applied" });
     expect(shadowLocationCommitScopeForTranscript(planned.transcript)).toBe(alice.actor);
     expect(planned.transcript.writes.filter((write) => write.cell.kind === "contents")).toEqual([]);
@@ -74,7 +75,7 @@ describe("actor-anchored movement projection", () => {
     const alice = world.auth("guest:movement-authority");
     placeSessionActor(world, alice, "mv_src_a");
     const before = world.exportWorld();
-    const planned = await runShadowTurnCallTranscript(before, movementCall(alice, "mv_src_a", "move-a"));
+    const planned = await runShadowTurnCallTranscript(authoritativePlanningWorld(before), movementCall(alice, "mv_src_a", "move-a"));
 
     const actorScope = createShadowCommitScope({
       node: "actor-location-authority",
@@ -106,8 +107,8 @@ describe("actor-anchored movement projection", () => {
     placeSessionActor(world, alice, "mv_src_a");
     placeSessionActor(world, bob, "mv_src_b");
     const before = world.exportWorld();
-    const plannedA = await runShadowTurnCallTranscript(before, movementCall(alice, "mv_src_a", "move-a"));
-    const plannedB = await runShadowTurnCallTranscript(before, movementCall(bob, "mv_src_b", "move-b"));
+    const plannedA = await runShadowTurnCallTranscript(authoritativePlanningWorld(before), movementCall(alice, "mv_src_a", "move-a"));
+    const plannedB = await runShadowTurnCallTranscript(authoritativePlanningWorld(before), movementCall(bob, "mv_src_b", "move-b"));
 
     const aliceScope = createShadowCommitScope({ node: "alice-authority", scope: alice.actor, serialized: before });
     const bobScope = createShadowCommitScope({ node: "bob-authority", scope: bob.actor, serialized: before });

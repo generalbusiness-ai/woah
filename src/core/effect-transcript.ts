@@ -45,6 +45,19 @@ export type TranscriptMove = {
   writer?: RecordedWriteAuthority;
 };
 
+// A first-class session active-scope transition (CA8). Distinct from a physical
+// `TranscriptMove`: it is recorded whenever a session's active scope changes —
+// including a no-op physical enter (actor already in the room) — and it is the
+// authoritative input for live presence projections (session_subscribers /
+// subscribers) and session-row materialization. Routing/presence state, not
+// room-membership authority, so it does not count as a CA3 authoritative write.
+export type TranscriptSessionScopeTransition = {
+  session: string;
+  actor: ObjRef;
+  from: ObjRef | null;
+  to: ObjRef | null;
+};
+
 export type TranscriptUntrackedEffect = {
   name: string;
   detail: WooValue | null;
@@ -67,6 +80,9 @@ export type EffectTranscript = {
   writes: TranscriptWrite[];
   creates: TranscriptCreate[];
   moves: TranscriptMove[];
+  // Net session active-scope transition for this turn (coalesced first.from →
+  // last.to). Drives presence projections + session-row materialization. CA8.
+  sessionScopeTransition?: TranscriptSessionScopeTransition;
   projectionWrites?: RecordedProjectionWrite[];
   observations: Observation[];
   logicalInputs: Array<{ name: string; value: WooValue }>;
@@ -100,6 +116,7 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
   const stateProbes: TranscriptCell[] = [];
   const creates: TranscriptCreate[] = [];
   const moves: TranscriptMove[] = [];
+  let sessionScopeTransition: TranscriptSessionScopeTransition | undefined;
   const projectionWrites: RecordedProjectionWrite[] = [];
   const observations: Observation[] = [];
   const logicalInputs: Array<{ name: string; value: WooValue }> = [];
@@ -172,6 +189,16 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
           writer: event.writer
         });
         break;
+      case "session_scope":
+        // Coalesce multiple transitions within one turn to the net first.from →
+        // last.to so the transcript carries a single authoritative placement.
+        sessionScopeTransition = {
+          session: event.session,
+          actor: event.actor,
+          from: sessionScopeTransition ? sessionScopeTransition.from : event.from,
+          to: event.to
+        };
+        break;
       case "projection_write":
         projectionWrites.push(structuredClone(event.write) as RecordedProjectionWrite);
         break;
@@ -238,6 +265,7 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
     writes,
     creates,
     moves,
+    ...(sessionScopeTransition ? { sessionScopeTransition } : {}),
     ...(turnFinishedOk && projectionWrites.length > 0 ? { projectionWrites } : {}),
     observations,
     logicalInputs,
@@ -270,8 +298,15 @@ export function validateTranscriptWithCellReader(reader: TranscriptCellReader, t
       continue;
     }
     if (readMatchesSequencedAllocation(transcript, read, actual)) continue;
-    if (readMatchesSameTurnMovementProjection(transcript, read, actual)) continue;
-    if (readMatchesSameTurnPresenceProjection(reader, transcript, read, actual)) continue;
+    // A4 (cell-authority CA2/CA4): contents and presence-projection cells are
+    // PROJECTIONS, not authority. Their truth is each member's own
+    // `live:location` authoritative cell, validated independently. A read of a
+    // projection cell is therefore NOT a consistency dependency: a stale
+    // cross-room view of a room's contents / presence roster must NOT reject the
+    // commit (that was the masked CI debt the conformance gate allow-listed).
+    // Movement still serializes at the moved object's location owner; this only
+    // stops a derived read model from gating an unrelated turn.
+    if (isProjectionReadCell(reader, read.cell)) continue;
     const readMatchesOwnWrite = sameTurn.reason === "own_write_mismatch" ? false : sameTurnReadMatchesOwnWrite(transcript, read);
     if (!readMatchesOwnWrite && read.version !== actual.version) {
       errors.push(`read version mismatch ${cellLabel(read.cell)}: transcript=${read.version ?? "none"} actual=${actual.version ?? "none"}`);
@@ -299,6 +334,28 @@ export function validateTranscriptWithCellReader(reader: TranscriptCellReader, t
   for (const write of transcript.projectionWrites ?? []) {
     const error = projectionWriteShapeError(write);
     if (error) errors.push(error);
+  }
+
+  // Session active-scope transition (CA8): validation-exempt from object-cell
+  // write authority (it is routing/presence state, not a CA3 authoritative
+  // write), but NOT trust-exempt — check it structurally. It must name this
+  // turn's session and actor, and (when the session's pre-state is readable on
+  // this host) its `from` must agree with the authoritative pre-state scope so a
+  // stale transition cannot silently rewrite presence.
+  const transition = transcript.sessionScopeTransition;
+  if (transition) {
+    if (!transcript.session) {
+      errors.push("session scope transition present but transcript carries no session");
+    } else if (transition.session !== transcript.session) {
+      errors.push(`session scope transition session mismatch: transition=${transition.session} transcript=${transcript.session}`);
+    }
+    if (transition.actor !== transcript.call.actor) {
+      errors.push(`session scope transition actor mismatch: transition=${transition.actor} call=${transcript.call.actor}`);
+    }
+    const priorScope = readerSessionActiveScope(reader, transition.session);
+    if (priorScope !== undefined && (priorScope ?? null) !== (transition.from ?? null)) {
+      errors.push(`session scope transition from mismatch: transition=${transition.from ?? "none"} actual=${priorScope ?? "none"}`);
+    }
   }
 
   return { ok: errors.length === 0, errors };
@@ -330,57 +387,16 @@ function projectionWriteShapeError(write: RecordedProjectionWrite): string | nul
   }
 }
 
-function readMatchesSameTurnPresenceProjection(
-  reader: TranscriptCellReader,
-  transcript: EffectTranscript,
-  read: TranscriptRead,
-  actual: TranscriptCellRead
-): boolean {
-  if (read.cell.kind !== "prop" || !actual.ok) return false;
-  const projection = presenceProjectionForCell(reader, read.cell.object, read.cell.name);
-  if (!projection) return false;
-  if (!Array.isArray(actual.value) || !Array.isArray(read.value)) return false;
-  const session = transcript.session ?? null;
-  let touched = false;
-  if (projection.key === "actor") {
-    const projected = new Set(actual.value.filter((item): item is ObjRef => typeof item === "string"));
-    for (const move of transcript.moves) {
-      if (move.from === read.cell.object) {
-        projected.delete(move.object);
-        touched = true;
-      }
-      if (move.to === read.cell.object) {
-        projected.add(move.object);
-        touched = true;
-      }
-    }
-    return touched && sameStringSet(Array.from(projected), read.value);
-  }
-  if (!session) return false;
-  const projected = new Map<string, Record<string, WooValue>>();
-  for (const item of actual.value) {
-    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
-    const row = item as Record<string, unknown>;
-    const key = row[projection.sessionField];
-    if (typeof key === "string") {
-      projected.set(key, row as Record<string, WooValue>);
-    }
-  }
-  for (const move of transcript.moves) {
-    if (move.from === read.cell.object) {
-      projected.delete(session);
-      touched = true;
-    }
-    if (move.to === read.cell.object) {
-      projected.set(session, {
-        [projection.sessionField]: session,
-        [projection.actorField]: move.object
-      });
-      touched = true;
-    }
-  }
-  return touched && stableJson(canonicalPresenceRows(Array.from(projected.values()), projection) as unknown as WooValue) ===
-    stableJson(canonicalPresenceRows(read.value, projection) as unknown as WooValue);
+// A4: is this read cell a derived projection (never a consistency dependency)?
+// A `contents` cell is the canonical container projection (CA4 — derived from
+// members' `live:location`). A `prop` cell is a projection only when its
+// property def declares a presence projection (CA4 PresenceProjectionDef) — an
+// ordinary list-valued property with no declaration stays an order-sensitive
+// authoritative cell and is still validated.
+function isProjectionReadCell(reader: TranscriptCellReader, cell: TranscriptCell): boolean {
+  if (cell.kind === "contents") return true;
+  if (cell.kind === "prop") return presenceProjectionForCell(reader, cell.object, cell.name) !== null;
+  return false;
 }
 
 function presenceProjectionForCell(
@@ -397,37 +413,101 @@ function presenceProjectionForCell(
   return null;
 }
 
-function canonicalPresenceRows(value: readonly unknown[], projection: Extract<PresenceProjectionDef, { key: "session" }>): Array<Record<string, string>> {
-  return value
-    .filter((item): item is Record<string, unknown> => !!item && typeof item === "object" && !Array.isArray(item))
-    .map((item) => ({
-      [projection.sessionField]: String(item[projection.sessionField] ?? ""),
-      [projection.actorField]: String(item[projection.actorField] ?? "")
-    }))
-    .filter((item) => item[projection.sessionField].length > 0 && item[projection.actorField].length > 0)
-    .sort((a, b) =>
-      a[projection.sessionField].localeCompare(b[projection.sessionField]) ||
-      a[projection.actorField].localeCompare(b[projection.actorField])
-    );
+// Every metadata-declared presence-projection property on `object`, resolved
+// through a transcript cell reader's inheritance chain (presence cells such as
+// the session/actor subscriber lists are declared on the space base class and
+// inherited by each room). Property names closer to the object win, so a
+// subclass override of a presence cell is honoured. Exported so the
+// indexed-state materializer can build the resolver `sessionScopePresenceDeltas`
+// needs; the in-memory world materializer supplies an equivalent resolver over
+// its own object records.
+export function presenceProjectionPropsFromReader(
+  reader: TranscriptCellReader,
+  object: ObjRef
+): Array<{ name: string; def: PresenceProjectionDef }> {
+  const out = new Map<string, PresenceProjectionDef>();
+  let current = serializedObject(reader, object);
+  while (current) {
+    for (const [name, def] of readerPropertyDefs(reader, current)) {
+      if (def.presenceProjection && !out.has(name)) out.set(name, def.presenceProjection);
+    }
+    current = current.parent ? serializedObject(reader, current.parent) : undefined;
+  }
+  return Array.from(out, ([name, def]) => ({ name, def }));
 }
 
-function readMatchesSameTurnMovementProjection(transcript: EffectTranscript, read: TranscriptRead, actual: TranscriptCellRead): boolean {
-  if (read.cell.kind !== "contents" || !actual.ok) return false;
-  if (!Array.isArray(actual.value) || !Array.isArray(read.value)) return false;
-  let touched = false;
-  const projected = new Set(actual.value.filter((item): item is ObjRef => typeof item === "string"));
-  for (const move of transcript.moves) {
-    if (move.from === read.cell.object) {
-      projected.delete(move.object);
-      touched = true;
-    }
-    if (move.to === read.cell.object) {
-      projected.add(move.object);
-      touched = true;
+// A single add/remove against one room's presence-projection cell, emitted by
+// `movementPresenceProjectionDeltas`.
+export type PresenceProjectionRowDelta = {
+  room: ObjRef;
+  property: string;
+  def: PresenceProjectionDef;
+  op: "add" | "remove";
+  actor: ObjRef;
+  session: string;
+};
+
+// Resolver: the metadata-declared presence-projection properties of a room,
+// supplied by the caller so the same reducer serves the serialized commit-scope
+// state and the in-memory world (two different object representations, one
+// inheritance walk each).
+export type PresenceProjectionPropsResolver = (room: ObjRef) => Array<{ name: string; def: PresenceProjectionDef }>;
+
+// Reducer #1 of the projection pipeline (CA4/CA8): an accepted session
+// active-scope transition derives presence-projection row add/removes for the
+// source and destination rooms' metadata-declared presence cells. The input is
+// `transcript.sessionScopeTransition` (NOT `transcript.moves`) — presence is
+// keyed by session placement, not physical containment, so this fires for a
+// no-op physical enter and uses the reliable session from/to rather than a
+// possibly-sparse move's from. Location remains the sole authoritative write
+// (CA3); these rows are local projections every materializer recomputes from the
+// accepted transcript. Live delivery still filters these durable rows through
+// live session state at fanout (CA8), so a stale row is never a live recipient
+// on its own.
+export function sessionScopePresenceDeltas(
+  presenceProjsForRoom: PresenceProjectionPropsResolver,
+  transcript: EffectTranscript
+): PresenceProjectionRowDelta[] {
+  const transition = transcript.sessionScopeTransition;
+  if (!transition || !transition.session || !transition.actor) return [];
+  const { session, actor, from, to } = transition;
+  if (from === to) return [];
+  const deltas: PresenceProjectionRowDelta[] = [];
+  if (from) {
+    for (const { name, def } of presenceProjsForRoom(from)) {
+      deltas.push({ room: from, property: name, def, op: "remove", actor, session });
     }
   }
-  if (!touched) return false;
-  return sameStringSet(Array.from(projected), read.value);
+  if (to) {
+    for (const { name, def } of presenceProjsForRoom(to)) {
+      deltas.push({ room: to, property: name, def, op: "add", actor, session });
+    }
+  }
+  return deltas;
+}
+
+// Apply one presence-projection delta to a cell's current list value, returning
+// the next value. Idempotent and keyed by member (CA4): a session-keyed cell
+// drops any existing row for that session before re-adding, an actor-keyed cell
+// dedupes the actor. The result is sorted for actor-keyed cells so cold reload
+// and warm catch-up agree on row order.
+export function applyPresenceProjectionRowDelta(
+  current: WooValue | null | undefined,
+  delta: PresenceProjectionRowDelta
+): WooValue {
+  const list = Array.isArray(current) ? current : [];
+  if (delta.def.key === "session") {
+    const sessionField = delta.def.sessionField;
+    const actorField = delta.def.actorField;
+    const without = list.filter((row) =>
+      !(row && typeof row === "object" && !Array.isArray(row) && (row as Record<string, WooValue>)[sessionField] === delta.session)
+    );
+    if (delta.op === "remove") return without as WooValue;
+    return [...without, { [sessionField]: delta.session, [actorField]: delta.actor }] as WooValue;
+  }
+  const without = list.filter((row) => row !== delta.actor);
+  if (delta.op === "remove") return without as WooValue;
+  return Array.from(new Set([...without, delta.actor] as ObjRef[])).sort() as unknown as WooValue;
 }
 
 function readMatchesSequencedAllocation(transcript: EffectTranscript, read: TranscriptRead, actual: TranscriptCellRead): boolean {
@@ -611,6 +691,16 @@ function serializedObject(reader: TranscriptCellReader, object: ObjRef): Seriali
   return reader.objectById.get(object);
 }
 
+// The session's active scope in the reader's pre-state, or undefined when the
+// session row is not present on this host (so the caller skips the check rather
+// than treating "absent" as null). Used to validate a session-scope transition's
+// `from` against authoritative pre-state where it is locally knowable.
+function readerSessionActiveScope(reader: TranscriptCellReader, sessionId: string): ObjRef | null | undefined {
+  const session = reader.serialized.sessions.find((row) => row.id === sessionId);
+  if (!session) return undefined;
+  return session.activeScope ?? session.currentLocation ?? null;
+}
+
 function serializedVerb(reader: TranscriptCellReader, object: ObjRef, name: string): SerializedWorld["objects"][number]["verbs"][number] | undefined {
   const obj = serializedObject(reader, object);
   return obj ? readerVerbs(reader, obj).find((verb) => verb.name === name || verb.aliases.includes(name)) : undefined;
@@ -756,8 +846,3 @@ function canonicalContentsValue(value: WooValue): WooValue {
   return Array.isArray(value) ? [...value].sort() : value;
 }
 
-function sameStringSet(left: readonly unknown[], right: readonly unknown[]): boolean {
-  const l = left.filter((item): item is string => typeof item === "string").sort();
-  const r = right.filter((item): item is string => typeof item === "string").sort();
-  return stableJson(l as WooValue) === stableJson(r as WooValue);
-}

@@ -1,5 +1,6 @@
 import { createWorldFromSerialized } from "./bootstrap";
 import { effectTranscriptFromRecordedTurn, type EffectTranscript } from "./effect-transcript";
+import type { PlanningWorld } from "./planning-world";
 import type { SerializedWorld } from "./repository";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, Message, MetricEvent, ObjRef, WooValue } from "./types";
 import { wooError } from "./types";
@@ -48,29 +49,42 @@ export type ShadowTurnCallOptions = {
   onMetric?: (event: MetricEvent) => void;
 };
 
+// The VM-execution boundary. Accepts ONLY a `PlanningWorld` — a SerializedWorld
+// that has passed the admission gate via `buildPlanningWorld` /
+// `authoritativePlanningWorld`. The brand makes "went through the gate" a
+// compile-time fact: no path can run the VM against a raw SerializedWorld, so a
+// presentation stub or untagged cell is refused (repair-routed) before it reaches
+// the VM. Enforcement lives in the constructor, not here.
 export async function runShadowTurnCall(
-  serializedBefore: SerializedWorld,
+  world: PlanningWorld,
   call: ShadowTurnCall,
   options: ShadowTurnCallOptions = {}
 ): Promise<ShadowTurnCallRun> {
-  const world = createWorldFromSerialized(serializedBefore, { persist: false });
-  world.setMetricsHook(options.onMetric ?? null);
-  return await runShadowTurnCallOnWorld(world, call, options);
+  const built = createWorldFromSerialized(world, { persist: false });
+  built.setMetricsHook(options.onMetric ?? null);
+  return await runShadowTurnCallOnWorld(built, call, options);
 }
 
 export async function runShadowTurnCallTranscript(
-  serializedBefore: SerializedWorld,
+  world: PlanningWorld,
   call: ShadowTurnCall,
   options: ShadowTurnCallOptions = {}
 ): Promise<ShadowTurnCallTranscriptRun> {
   // Durable commit scopes apply transcripts authoritatively, so planning and
   // commit-scope execution should not pay for a full executor post-state export
   // unless a caller explicitly needs that snapshot.
-  const world = createWorldFromSerialized(serializedBefore, { persist: false });
-  if (options.onMetric) world.setMetricsHook(options.onMetric);
-  return await runShadowTurnCallOnWorldTranscript(world, call, options);
+  const built = createWorldFromSerialized(world, { persist: false });
+  if (options.onMetric) built.setMetricsHook(options.onMetric);
+  return await runShadowTurnCallOnWorldTranscript(built, call, options);
 }
 
+// TRUSTED execution-world capability (A3.2): runs the VM against an already-built
+// WooWorld. This is POST-admission — every path that reaches it first admitted the
+// source: the serialized-boundary runners above build from a branded PlanningWorld,
+// and the executor (shadow-turn-exec `shadowExecutionWorld`) builds its WooWorld via
+// buildPlanningWorld (sparse) or by the authoritative_state capability. Do NOT call
+// these with a WooWorld assembled from un-admitted serialized state — that would
+// reintroduce the bypass the brand exists to close.
 export async function runShadowTurnCallOnWorld(
   world: WooWorld,
   call: ShadowTurnCall,

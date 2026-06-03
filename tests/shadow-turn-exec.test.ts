@@ -1,3 +1,4 @@
+import { authoritativePlanningWorld, planningCellKey } from "../src/core/planning-world";
 import { describe, expect, it } from "vitest";
 import { installVerb } from "../src/core/authoring";
 import { createWorld, createWorldFromSerialized } from "../src/core/bootstrap";
@@ -6,7 +7,6 @@ import { effectTranscriptFromRecordedTurn } from "../src/core/effect-transcript"
 import { createShadowCommitScope, serializedFor, submitShadowCommit } from "../src/core/shadow-commit-scope";
 import {
   buildShadowCellPageTransfer,
-  buildShadowClosureTransfer,
   buildShadowObjectRecordTransfer,
   createShadowExecutionNode,
   executeAuthoritativeShadowTurnCall,
@@ -24,7 +24,7 @@ import { shadowAtomHash, shadowTurnKeyFromCall, shadowTurnKeyFromTranscript, typ
 import type { MetricEvent } from "../src/core/types";
 
 describe("shadow turn execution", () => {
-  it("refuses missing state, installs a closure transfer, and retries the whole turn", async () => {
+  it("refuses missing state, installs a cell-page transfer, and retries the whole turn", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:shadow-retry");
     const actor = session.actor;
@@ -58,14 +58,14 @@ describe("shadow turn execution", () => {
     if (!refused.ok && refused.reason === "missing_state") expect(refused.missing_atoms.map((atom) => atom.preimage)).toEqual(turnKey.preimages);
     expect(actorNode.serialized).toBeUndefined();
 
-    const transfer = buildShadowClosureTransfer({
+    const transfer = buildShadowCellPageTransfer({
       serialized: serializedBefore,
       key: turnKey,
-      atom_hashes: missingAtomsForShadowTurn(actorNode, turnKey).map((atom) => atom.hash)
+      missing_atoms: missingAtomsForShadowTurn(actorNode, turnKey)
     });
-    expect(transfer).toMatchObject({ kind: "woo.state.transfer.shadow.v1", mode: "closure", scope: turnKey.scope });
-    expect(transfer.atom_hashes).toEqual(turnKey.atom_hashes);
+    expect(transfer).toMatchObject({ kind: "woo.state.transfer.shadow.v1", mode: "cell_pages", scope: turnKey.scope });
     installShadowStateTransfer(actorNode, transfer);
+    expect(missingAtomsForShadowTurn(actorNode, turnKey)).toEqual([]);
 
     const retry = await executeShadowRecordedTurnOrNeedState(actorNode, recorder.turns[0], turnKey);
 
@@ -98,7 +98,7 @@ describe("shadow turn execution", () => {
       verb: "set_control",
       args: ["delay_1", "wet", 0.66]
     };
-    const planned = await runShadowTurnCall(serializedBefore, call);
+    const planned = await runShadowTurnCall(authoritativePlanningWorld(serializedBefore), call);
     expect(planned.frame).toMatchObject({ op: "applied", space: "the_dubspace", seq: 1 });
     expect(planned.transcript.complete).toBe(true);
     const key = shadowTurnKeyFromTranscript(planned.transcript);
@@ -156,7 +156,7 @@ describe("shadow turn execution", () => {
     expect(anchor.getProp("the_hot_tub", "next_seq")).toBe(1);
 
     const serializedBefore = anchor.exportWorld();
-    const enterTub = await runShadowTurnCall(serializedBefore, {
+    const enterTub = await runShadowTurnCall(authoritativePlanningWorld(serializedBefore), {
       kind: "woo.turn_call.shadow.v1",
       id: "shadow-hot-tub-enter",
       route: "sequenced",
@@ -194,7 +194,7 @@ describe("shadow turn execution", () => {
     expect(afterEnter.getProp("the_hot_tub", "next_seq")).toBe(2);
     expect(afterEnter.allLocationsForActor(actor)).toEqual(["the_hot_tub"]);
 
-    const exitTub = await runShadowTurnCall(serializedAfterEnter, {
+    const exitTub = await runShadowTurnCall(authoritativePlanningWorld(serializedAfterEnter), {
       kind: "woo.turn_call.shadow.v1",
       id: "shadow-hot-tub-out",
       route: "sequenced",
@@ -235,7 +235,7 @@ describe("shadow turn execution", () => {
       verb: "set_control",
       args: ["delay_1", "wet", 0.72]
     };
-    const planned = await runShadowTurnCall(serializedBefore, call);
+    const planned = await runShadowTurnCall(authoritativePlanningWorld(serializedBefore), call);
     const key = shadowTurnKeyFromTranscript(planned.transcript);
     const request = { kind: "woo.turn.exec.request.shadow.v1" as const, call, key };
     const writeHash = key.write_atom_hashes[0];
@@ -315,7 +315,7 @@ describe("shadow turn execution", () => {
       verb: "set_control",
       args: ["delay_1", "wet", 0.58]
     };
-    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(serializedBefore, call)).transcript);
+    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(authoritativePlanningWorld(serializedBefore), call)).transcript);
     const routed = await executeShadowTurnCallAcrossInProcessNetwork({
       request: { kind: "woo.turn.exec.request.shadow.v1" as const, call, key, expected: initialHead },
       nodes: [createShadowExecutionNode({ node: "actor-node", scope: key.scope })],
@@ -345,7 +345,7 @@ describe("shadow turn execution", () => {
       verb: "set_control",
       args: ["delay_1", "wet", 0.59]
     };
-    const staleKey = shadowTurnKeyFromTranscript((await runShadowTurnCall(serializedBefore, staleCall)).transcript);
+    const staleKey = shadowTurnKeyFromTranscript((await runShadowTurnCall(authoritativePlanningWorld(serializedBefore), staleCall)).transcript);
     const staleNode = createShadowExecutionNode({
       node: "stale-actor",
       scope: staleKey.scope,
@@ -388,7 +388,7 @@ describe("shadow turn execution", () => {
       verb: "set_control",
       args: ["delay_1", "wet", 0.62]
     };
-    const planned = await runShadowTurnCallTranscript(serializedBefore, call);
+    const planned = await runShadowTurnCallTranscript(authoritativePlanningWorld(serializedBefore), call);
     expect("serializedAfter" in planned).toBe(false);
     const key = shadowTurnKeyFromTranscript(planned.transcript);
     const executorWorld = createWorldFromSerialized(serializedBefore, { persist: false });
@@ -441,7 +441,7 @@ describe("shadow turn execution", () => {
       verb: "set_control",
       args: ["delay_1", "wet", 0.64]
     };
-    const acceptedPlan = await runShadowTurnCallTranscript(serializedBefore, acceptedCall);
+    const acceptedPlan = await runShadowTurnCallTranscript(authoritativePlanningWorld(serializedBefore), acceptedCall);
     const acceptedKey = shadowTurnKeyFromTranscript(acceptedPlan.transcript);
     const acceptedNode = createShadowExecutionNode({
       node: "accepted-node",
@@ -469,7 +469,7 @@ describe("shadow turn execution", () => {
       verb: "set_control",
       args: ["delay_1", "wet", 0.65]
     };
-    const stalePlan = await runShadowTurnCallTranscript(serializedBefore, staleCall);
+    const stalePlan = await runShadowTurnCallTranscript(authoritativePlanningWorld(serializedBefore), staleCall);
     expect("serializedAfter" in stalePlan).toBe(false);
     const staleKey = shadowTurnKeyFromTranscript(stalePlan.transcript);
     const executorWorld = createWorldFromSerialized(serializedBefore, { persist: false });
@@ -653,7 +653,7 @@ describe("shadow turn execution", () => {
       args: [0.44]
     };
     const serializedBefore = anchor.exportWorld();
-    const wetRun = await runShadowTurnCall(serializedBefore, wetCall);
+    const wetRun = await runShadowTurnCall(authoritativePlanningWorld(serializedBefore), wetCall);
     const commitScopeRef = wetRun.transcript.scope;
     const commitScope = createShadowCommitScope({ node: "stable-anchor", scope: commitScopeRef, serialized: serializedBefore });
     const wetAccepted = submitShadowCommit(commitScope, {
@@ -677,7 +677,7 @@ describe("shadow turn execution", () => {
       verb: "set_feedback",
       args: [0.37]
     };
-    const staleFeedbackRun = await runShadowTurnCall(serializedBefore, feedbackCall);
+    const staleFeedbackRun = await runShadowTurnCall(authoritativePlanningWorld(serializedBefore), feedbackCall);
     expect(staleFeedbackRun.transcript.scope).toBe(commitScopeRef);
     const feedbackAccepted = submitShadowCommit(commitScope, {
       kind: "woo.commit.submit.shadow.v1",
@@ -716,7 +716,7 @@ describe("shadow turn execution", () => {
       verb: "set_wet",
       args: [0.42]
     };
-    const planned = await runShadowTurnCall(serializedBefore, call);
+    const planned = await runShadowTurnCall(authoritativePlanningWorld(serializedBefore), call);
     const key = shadowTurnKeyFromTranscript(planned.transcript);
     const transfer = buildShadowCellPageTransfer({ serialized: serializedBefore, key });
     const node = createShadowExecutionNode({ node: "cell-page-cache-node", scope: key.scope });
@@ -757,7 +757,7 @@ describe("shadow turn execution", () => {
       verb: "set_wet",
       args: [0.41]
     };
-    const run = await runShadowTurnCallTranscript(serializedBefore, call);
+    const run = await runShadowTurnCallTranscript(authoritativePlanningWorld(serializedBefore), call);
     const commitScope = createShadowCommitScope({ node: "stable-anchor", scope: run.transcript.scope, serialized: serializedBefore });
     const steps: Array<{ phase: string; objects: number }> = [];
     const metrics: MetricEvent[] = [];
@@ -818,7 +818,7 @@ describe("shadow turn execution", () => {
       args: [1]
     };
     const serializedBefore = anchor.exportWorld();
-    const firstRun = await runShadowTurnCall(serializedBefore, firstCall);
+    const firstRun = await runShadowTurnCall(authoritativePlanningWorld(serializedBefore), firstCall);
     const commitScope = createShadowCommitScope({ node: "stable-anchor", scope: firstRun.transcript.scope, serialized: serializedBefore });
     const firstAccepted = submitShadowCommit(commitScope, {
       kind: "woo.commit.submit.shadow.v1",
@@ -834,7 +834,7 @@ describe("shadow turn execution", () => {
       ...firstCall,
       args: [2]
     };
-    const replayedRun = await runShadowTurnCall(serializedFor(commitScope), replayedCall);
+    const replayedRun = await runShadowTurnCall(authoritativePlanningWorld(serializedFor(commitScope)), replayedCall);
     expect(replayedRun.transcript.hash).not.toBe(firstRun.transcript.hash);
     const replayedAccepted = submitShadowCommit(commitScope, {
       kind: "woo.commit.submit.shadow.v1",
@@ -884,7 +884,7 @@ describe("shadow turn execution", () => {
       verb: "set_value",
       args: [1]
     };
-    const planned = await runShadowTurnCall(serializedBefore, call);
+    const planned = await runShadowTurnCall(authoritativePlanningWorld(serializedBefore), call);
     const tampered = structuredClone(planned.transcript);
     const adminVerb = serializedBefore.objects.find((obj) => obj.id === "admin_box")?.verbs.find((verb) => verb.name === "noop");
     expect(adminVerb).toBeDefined();
@@ -946,7 +946,7 @@ describe("shadow turn execution", () => {
       verb: "set_control",
       args: ["delay_1", "wet", 0.81]
     };
-    const firstPlanned = await runShadowTurnCall(firstSerializedBefore, firstCall);
+    const firstPlanned = await runShadowTurnCall(authoritativePlanningWorld(firstSerializedBefore), firstCall);
     const firstKey = shadowTurnKeyFromTranscript(firstPlanned.transcript);
     const actorNode = createShadowExecutionNode({ node: "actor-node", scope: firstKey.scope });
     const firstRouted = await executeShadowTurnCallAcrossInProcessNetwork({
@@ -971,7 +971,7 @@ describe("shadow turn execution", () => {
       verb: "set_control",
       args: ["delay_1", "feedback", 0.37]
     };
-    const secondPlanned = await runShadowTurnCall(secondSerializedBefore, secondCall);
+    const secondPlanned = await runShadowTurnCall(authoritativePlanningWorld(secondSerializedBefore), secondCall);
     const secondKey = shadowTurnKeyFromTranscript(secondPlanned.transcript);
     expect(missingAtomsForShadowTurn(actorNode, secondKey).map((atom) => atom.preimage)).toEqual([
       "write:cell:prop:delay_1.feedback"
@@ -1024,7 +1024,7 @@ describe("shadow turn execution", () => {
       verb: "set_control",
       args: ["delay_1", "wet", 0.49]
     };
-    const planned = await runShadowTurnCall(serializedBefore, call);
+    const planned = await runShadowTurnCall(authoritativePlanningWorld(serializedBefore), call);
     const key = shadowTurnKeyFromTranscript(planned.transcript);
     const fullTransfer = buildShadowCellPageTransfer({
       serialized: serializedBefore,
@@ -1080,7 +1080,7 @@ describe("shadow turn execution", () => {
       verb: "take",
       args: ["mug"]
     };
-    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(serializedBefore, call)).transcript);
+    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(authoritativePlanningWorld(serializedBefore), call)).transcript);
     const transfer = buildShadowCellPageTransfer({
       serialized: serializedBefore,
       key,
@@ -1109,7 +1109,7 @@ describe("shadow turn execution", () => {
       verb: "set_control",
       args: ["delay_1", "wet", 0.53]
     };
-    const planned = await runShadowTurnCall(serializedBefore, call);
+    const planned = await runShadowTurnCall(authoritativePlanningWorld(serializedBefore), call);
     const key = shadowTurnKeyFromTranscript(planned.transcript);
     const transfer = buildShadowObjectRecordTransfer({
       serialized: serializedBefore,
@@ -1143,7 +1143,7 @@ describe("shadow turn execution", () => {
       verb: "set_control",
       args: ["delay_1", "wet", 0.53]
     };
-    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(serializedBefore, call)).transcript);
+    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(authoritativePlanningWorld(serializedBefore), call)).transcript);
     const transfer = buildShadowCellPageTransfer({
       serialized: serializedBefore,
       key,
@@ -1180,7 +1180,7 @@ describe("shadow turn execution", () => {
       verb: "set_control",
       args: ["delay_1", "wet", 0.57]
     };
-    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(serializedBefore, call)).transcript);
+    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(authoritativePlanningWorld(serializedBefore), call)).transcript);
     const wrongRecipient = buildShadowObjectRecordTransfer({
       serialized: serializedBefore,
       key,
@@ -1222,7 +1222,7 @@ describe("shadow turn execution", () => {
       verb: "set_control",
       args: ["delay_1", "wet", 0.57]
     };
-    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(serializedBefore, call)).transcript);
+    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(authoritativePlanningWorld(serializedBefore), call)).transcript);
     const transfer = buildShadowCellPageTransfer({
       serialized: serializedBefore,
       key,
@@ -1304,7 +1304,7 @@ describe("shadow turn execution", () => {
       verb: "set_control",
       args: ["delay_1", "wet", 0.58]
     };
-    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(serializedBefore, call)).transcript);
+    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(authoritativePlanningWorld(serializedBefore), call)).transcript);
     const transfer = buildShadowCellPageTransfer({
       serialized: serializedBefore,
       key,
@@ -1358,7 +1358,7 @@ describe("shadow turn execution", () => {
       verb: "set_control",
       args: ["delay_1", "wet", 0.63]
     };
-    const planned = await runShadowTurnCall(serializedBefore, call);
+    const planned = await runShadowTurnCall(authoritativePlanningWorld(serializedBefore), call);
     const fullKey = shadowTurnKeyFromTranscript(planned.transcript);
     const predictedKey = shadowTurnKeyWithoutPreimage(fullKey, "write:cell:prop:delay_1.wet");
     const node = createShadowExecutionNode({
@@ -1401,7 +1401,7 @@ describe("shadow turn execution", () => {
       verb: "set_control",
       args: ["delay_1", "wet", 0.67]
     };
-    const fullKey = shadowTurnKeyFromTranscript((await runShadowTurnCall(serializedBefore, call)).transcript);
+    const fullKey = shadowTurnKeyFromTranscript((await runShadowTurnCall(authoritativePlanningWorld(serializedBefore), call)).transcript);
     const predictedKey = shadowTurnKeyWithoutPreimage(fullKey, "write:cell:prop:delay_1.wet");
     const node = createShadowExecutionNode({
       node: "actor-node",
@@ -1491,14 +1491,14 @@ describe("shadow turn execution", () => {
     // and emit `direct_call` via recordMetric; sequenced routes
     // produce an "applied" frame and emit `applied`. We use the
     // direct route here so the metric kind is unambiguous.
-    const _without = await runShadowTurnCallTranscript(serializedBefore, call);
+    const _without = await runShadowTurnCallTranscript(authoritativePlanningWorld(serializedBefore), call);
     expect(_without.frame.op).toBe("result");
 
     // With onMetric, the engine's direct_call event reaches the
     // forwarder. The test would silently regress (with no DOM coverage
     // of the dashboard either) if anyone removed the
     // world.setMetricsHook call from runShadowTurnCallTranscript.
-    const run = await runShadowTurnCallTranscript(serializedBefore, call, {
+    const run = await runShadowTurnCallTranscript(authoritativePlanningWorld(serializedBefore), call, {
       onMetric: (event) => events.push({ kind: event.kind, verb: (event as { verb?: string }).verb, target: (event as { target?: string }).target })
     });
     expect(run.frame.op).toBe("result");
@@ -1506,6 +1506,22 @@ describe("shadow turn execution", () => {
     expect(directCall, "expected a direct_call event from the executor world").toBeDefined();
     expect(directCall?.verb).toBe("bump");
     expect(directCall?.target).toBe("metric_box");
+  });
+
+  // Finding 1 (review): a derived (sparse) execution node carries per-cell provenance
+  // so its serialized state can be admitted by PROOF at the VM boundary, while an
+  // authoritative_state node owns the full authority and is trusted by capability
+  // (no provenance scan on the hot authority path).
+  it("stamps cache cell-provenance on a sparse execution node, not an authoritative one", () => {
+    const serialized = createWorld().exportWorld();
+    const id = serialized.objects[0].id;
+
+    const sparse = createShadowExecutionNode({ node: "sparse", scope: "$system", serialized });
+    expect(sparse.cellProvenance?.get(planningCellKey(id, "object_lineage"))).toEqual({ source: "cache" });
+    expect(sparse.cellProvenance?.get(planningCellKey(id, "object_live"))).toEqual({ source: "cache" });
+
+    const authoritative = createShadowExecutionNode({ node: "auth", scope: "$system", serialized, authoritative_state: true });
+    expect(authoritative.cellProvenance === undefined || authoritative.cellProvenance.size === 0).toBe(true);
   });
 });
 

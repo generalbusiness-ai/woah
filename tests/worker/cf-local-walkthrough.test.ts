@@ -100,6 +100,73 @@ describe("CF-local smoke walkthrough", () => {
         danglingParentRefs.length,
         `gateway-shard planning emitted dangling_parent_ref after pre-plan authority repair: ${JSON.stringify(danglingParentRefs.slice(0, 5))}`
       ).toBe(0);
+
+      // A1 — coherence-invariant (CI) gate for the mobile-heap target.
+      // VTN0.Conformance: every node's derived view of a touched cell must equal
+      // the committed authority at the same head; no two copies of a cell may be
+      // mutated by independent write paths. A CI violation surfaces as a commit
+      // rejection logged by CommitScopeDO ("woo.commit_rejected.errors", each
+      // error naming the diverged `<object>.<cell>`). The step-level walkthrough
+      // MASKS these: the turn retries and eventually succeeds, so the step passes
+      // while a derived view silently disagreed with authority. This assertion is
+      // the structural teeth VTN0 promises — it fails on "two copies disagreed"
+      // by signature, even when retry papers over the symptom.
+      //
+      // ZERO-TOLERANCE as of A4. The presence/containment PROJECTION cells
+      // (`subscribers`, `session_subscribers`, `contents`) used to sit on the
+      // commit-validation path, so a cross-room turn could plan them stale and get
+      // rejected (e.g. `the_outline:leave` rejecting on `the_chatroom.subscribers`).
+      // A4 (cell-authority CA2/CA4) took them OFF the validation path: a read of a
+      // projection cell is no longer a consistency dependency, because its truth is
+      // each member's own `live:location` authoritative cell. The allow-list is now
+      // EMPTY — the gate fails on ANY commit-rejection error of any kind. The
+      // allow-list MUST only ever shrink (it is now at its floor); re-adding an
+      // entry is re-introducing multiplication and is forbidden.
+      const KNOWN_CI_DEBT_CELLS = new Set<string>([]);
+      // VTN0 conformance: parse the STRUCTURED commit-rejection log rather than
+      // string-scanning the joined diagnostics. CommitScopeDO logs every
+      // rejection as `console.log("woo.commit_rejected.errors", JSON)` whose
+      // `errors` array carries one string per diverged cell (effect-transcript /
+      // shadow-commit-scope `cellLabel`: `<object>.<cell>` for property/location/
+      // contents/lifecycle, `<object>:<verb>` for verb cells). The gate fails on
+      // EVERY error except a read/write-version mismatch on an allow-listed
+      // projection cell — so write-prior mismatches, verb-cell divergence,
+      // post_state_mismatch, incomplete_transcript, and any unrecognized error
+      // string can no longer slip through a dot-form regex.
+      const isAllowlistedProjectionMismatch = (error: string): boolean => {
+        // Only read/write version/value mismatches name a cell as
+        // `<object>.<cell>` with a dot. post_state_mismatch, incomplete_transcript,
+        // and verb-cell (`<object>:<verb>`) errors never match this shape and so
+        // are never excused. The object id carries no dot or colon, so the first
+        // dot delimits the cell name.
+        const m = /^(?:read (?:version|value) mismatch|write prior mismatch) [^\s:]+\.([A-Za-z0-9_]+)(?::|$)/.exec(error);
+        return m !== null && KNOWN_CI_DEBT_CELLS.has(m[1]);
+      };
+      const ciOffenders: string[] = [];
+      for (const call of logSpy.mock.calls) {
+        if (call[0] !== "woo.commit_rejected.errors" || typeof call[1] !== "string") continue;
+        let parsed: { errors?: unknown; scope?: unknown; verb?: unknown; target?: unknown; actor?: unknown };
+        try {
+          parsed = JSON.parse(call[1]) as typeof parsed;
+        } catch {
+          // A rejection line the gate cannot read is itself a failure: never let
+          // an unparseable commit_rejected entry pass silently.
+          ciOffenders.push(`unparseable woo.commit_rejected.errors: ${call[1].slice(0, 240)}`);
+          continue;
+        }
+        const errors = Array.isArray(parsed.errors)
+          ? parsed.errors.filter((entry): entry is string => typeof entry === "string")
+          : [];
+        const context = `${String(parsed.verb ?? "?")} ${String(parsed.target ?? "?")} @ ${String(parsed.scope ?? "?")}`;
+        for (const error of errors) {
+          if (!isAllowlistedProjectionMismatch(error)) ciOffenders.push(`${error} :: ${context}`);
+        }
+      }
+      expect(
+        ciOffenders.length,
+        `coherence-invariant violation during cross-shard walkthrough (VTN0): a commit rejection reported an error that is NOT an allow-listed A4 projection-cell mismatch. ` +
+        `This is new multiplication / a masked rejection and must be fixed, not allow-listed. First offenders:\n${ciOffenders.slice(0, 3).join("\n")}`
+      ).toBe(0);
     } finally {
       await Promise.allSettled([alice?.close(), bob?.close()]);
       warnSpy.mockRestore();
@@ -216,6 +283,48 @@ async function runWalkthrough(alice: LocalMcpSession, bob: LocalMcpSession): Pro
     await waitFor(bob, (obs) => obs.type === "said" && typeof obs.text === "string" && obs.text.includes(text));
   });
 
+  // B6 / CA14.3: two actors moving through the same destination concurrently
+  // must both commit independently (each at its own actor-location authority,
+  // off the room sequencer) and both retain membership — no lost destination
+  // membership, no read_version_mismatch. The CI ratchet in this file already
+  // fails on any read_version_mismatch; this step additionally proves both
+  // memberships survive a concurrent enter by requiring bidirectional delivery.
+  await step("B6: concurrent move through shared destination keeps both memberships", async () => {
+    // Both start co-located in the_chatroom (prior steps). Move both out to the
+    // shared the_deck concurrently, then back into the_chatroom concurrently.
+    await Promise.all([
+      alice.call("the_chatroom", "southeast", []),
+      bob.call("the_chatroom", "southeast", [])
+    ]);
+    await drain(alice);
+    await drain(bob);
+    // Read into fresh locals so each assertion sees the full room-name union
+    // (the getter would otherwise stay flow-narrowed across the awaits below).
+    const aliceAfterOut: string | null = alice.currentRoom;
+    const bobAfterOut: string | null = bob.currentRoom;
+    if (aliceAfterOut !== "the_deck" || bobAfterOut !== "the_deck") {
+      throw new Error(`expected both on the_deck after concurrent move; alice=${aliceAfterOut} bob=${bobAfterOut}`);
+    }
+    await Promise.all([
+      alice.call("the_deck", "west", []),
+      bob.call("the_deck", "west", [])
+    ]);
+    await drain(alice);
+    await drain(bob);
+    const aliceBack: string | null = alice.currentRoom;
+    const bobBack: string | null = bob.currentRoom;
+    if (aliceBack !== "the_chatroom" || bobBack !== "the_chatroom") {
+      throw new Error(`expected both back in the_chatroom; alice=${aliceBack} bob=${bobBack}`);
+    }
+    // Membership is intact iff each actor's utterance reaches the other.
+    const aliceText = `b6-concurrent-alice-${alice.runId}`;
+    await alice.call("the_chatroom", "say", [aliceText]);
+    await waitFor(bob, (obs) => obs.type === "said" && typeof obs.text === "string" && obs.text.includes(aliceText), 10_000);
+    const bobText = `b6-concurrent-bob-${bob.runId}`;
+    await bob.call("the_chatroom", "say", [bobText]);
+    await waitFor(alice, (obs) => obs.type === "said" && typeof obs.text === "string" && obs.text.includes(bobText), 10_000);
+  });
+
   await step("move:southeast emits `left` to bob (origin room)", async () => {
     await alice.call("the_chatroom", "southeast", []);
     await waitFor(bob, (obs) =>
@@ -237,6 +346,21 @@ async function runWalkthrough(alice: LocalMcpSession, bob: LocalMcpSession): Pro
       obs.exit === "west",
     10_000);
   });
+
+  // NOTE — take/drop is NOT yet exercised in this gated walkthrough, by design.
+  // The prod MCP smoke (scripts/smoke-walkthrough.ts) carries a same-room take/drop
+  // step (alice takes then drops the mug; bob sees `taken`/`dropped`). It is held
+  // out HERE because this gate also asserts `dangling_parent_ref == 0`, and a
+  // take/drop turn exposes a real gap in that family: the gateway-shard authority
+  // slice ships actor/thing support lineage but NOT the `$portable` catalog-class
+  // lineage of the item being acted on, so planning a `take` on a $portable object
+  // emits dangling_parent_ref (the turn still completes via authority repair and the
+  // cross-actor fanout is correct — only the zero-dangling guard fires). Add the
+  // step here once $portable (and the other contents-object catalog classes) reach
+  // the gateway-shard slice. Carrying an item ACROSS a room boundary is a further
+  // step still: the carried object's cell authority is not migrated with the actor,
+  // so the destination shard reports "not carrying" — the mobile-object-heap /
+  // cross-scope contents-migration target.
 
   await step("pinboard:add_note reaches peer", async () => {
     await alice.call("the_chatroom", "southeast", []);

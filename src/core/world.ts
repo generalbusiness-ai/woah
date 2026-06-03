@@ -40,15 +40,18 @@ import { objectCreateEvent, type ActiveTurnRecorder, type RecordedCell, type Rec
 import { remoteBridgeUntrackedEffect } from "./remote-bridge-transcript-policy";
 import { readObjectPropertyValue } from "./property-read";
 import { redactSensitiveSerializedPropertyValues } from "./sensitive-serialization";
+import { applyPresenceProjectionRowDelta, sessionScopePresenceDeltas } from "./effect-transcript";
 import type { EffectTranscript, TranscriptWrite } from "./effect-transcript";
 import {
   applyTranscriptContentsWriteRefs,
+  applyTranscriptPropWrite,
   finalWritesByCell,
   mergeTranscriptLogEntry,
   nextObjectCounterForCreates,
   serializedObjectForTranscriptCreate,
   transcriptLogEntry,
-  transcriptSessionActiveScope
+  transcriptSessionActiveScope,
+  type TranscriptPropTarget
 } from "./shadow-commit-scope";
 import { projectionRowBytes, type ProjectionWrite } from "./projection-delta";
 
@@ -1295,6 +1298,22 @@ export class WooWorld {
       current = current.parent ? this.objects.get(current.parent) ?? null : null;
     }
     return null;
+  }
+
+  // All metadata-declared presence-projection properties of a room, resolved up
+  // its inheritance chain (names closer to the object win). Mirrors
+  // presenceProjectionPropsFromReader for the in-memory representation so the
+  // shared movement-presence reducer can run against the world materializer.
+  private presenceProjectionPropsForObject(objRef: ObjRef): Array<{ name: string; def: PresenceProjectionDef }> {
+    const out = new Map<string, PresenceProjectionDef>();
+    let current: WooObject | null = this.objects.get(objRef) ?? null;
+    while (current) {
+      for (const [name, def] of current.propertyDefs) {
+        if (def.presenceProjection && !out.has(name)) out.set(name, def.presenceProjection);
+      }
+      current = current.parent ? this.objects.get(current.parent) ?? null : null;
+    }
+    return Array.from(out, ([name, def]) => ({ name, def }));
   }
 
   private ensurePresenceIndex(): void {
@@ -5210,6 +5229,12 @@ export class WooWorld {
     } else if (ctx.session) {
       const session = this.sessions.get(ctx.session);
       if (session && session.actor === actor) {
+        // CA8: record the active-scope transition so presence projections +
+        // session-row materialization follow editor movement, not just physical
+        // room movement (see movetoActorChecked).
+        if (session.activeScope !== destination) {
+          this.recordTurnEvent({ kind: "session_scope", session: session.id, actor, from: session.activeScope ?? null, to: destination });
+        }
         session.activeScope = destination;
         this.persistSession(session);
       }
@@ -5602,6 +5627,14 @@ export class WooWorld {
       }
       if (oldLocation && await this.spaceLikeOrRemote(oldLocation, ctx.hostMemo)) {
         await this.updatePresenceChecked(actor, oldLocation, false, ctx);
+      }
+      // Record the session active-scope transition as a first-class turn effect
+      // (CA8). This fires even when the physical move below is a no-op (the actor
+      // was already in `targetRef`): presence is keyed by session placement, not
+      // physical containment. The accepted transcript carries this so every
+      // materializer can repair the live presence projections + session row.
+      if (oldLocation !== targetRef) {
+        this.recordTurnEvent({ kind: "session_scope", session: session.id, actor, from: oldLocation ?? null, to: targetRef });
       }
       session.activeScope = targetRef;
       this.persistSession(session);
@@ -6466,7 +6499,11 @@ export class WooWorld {
         parkedTaskCounter: this.parkedTaskCounter,
         sessionCounter: this.sessionCounter
       },
-      tombstones: Array.from(this.tombstones)
+      tombstones: Array.from(this.tombstones),
+      // A3: a world exporting its own resident rows is the authoritative source
+      // for them. (Per-page owner-host stamping is added where the slice is
+      // assembled for a specific host; here the role is unambiguous.)
+      pageProvenance: () => ({ source: "authoritative" })
     });
   }
 
@@ -6902,6 +6939,25 @@ export class WooWorld {
       }
     }
 
+    // CA4/CA8 presence projection (per-host slice): an accepted session
+    // active-scope transition repairs the source/destination rooms'
+    // metadata-declared presence cells on whichever host owns each room, so this
+    // host's live-delivery audience (presenceActorsIn) reflects the placement.
+    // Location stays the only authoritative write (CA3); these rows are
+    // recomputed projections, written via setPropLocal (no turn record;
+    // invalidates the presence index).
+    const presenceDeltas = sessionScopePresenceDeltas(
+      (room) => this.presenceProjectionPropsForObject(room),
+      transcript
+    );
+    for (const delta of presenceDeltas) {
+      if (!belongsHere(delta.room)) continue;
+      if (!this.objects.has(delta.room)) continue;
+      const before = this.propOrNull(delta.room, delta.property);
+      const after = applyPresenceProjectionRowDelta(before, delta);
+      if (this.setPropLocal(delta.room, delta.property, after)) markObject(delta.room);
+    }
+
     const sessionUpdate = transcriptSessionActiveScope(transcript);
     if (gatewayHost && sessionUpdate) {
       const session = this.sessions.get(sessionUpdate.session);
@@ -7036,6 +7092,24 @@ export class WooWorld {
         touchedObjects.add(move.to);
       }
     }
+    // CA4/CA8 presence projection: a session active-scope transition also
+    // repairs the source/destination rooms' metadata-declared presence cells
+    // (session_subscribers/subscribers) so this host's live-delivery audience
+    // (presenceActorsIn) reflects the placement. Location remains the sole
+    // authoritative write (CA3); these rows are local projections recomputed
+    // from the accepted transcript, written via setPropLocal (which skips turn
+    // recording and invalidates the presence index for presence cells).
+    const presenceDeltas = sessionScopePresenceDeltas(
+      (room) => this.presenceProjectionPropsForObject(room),
+      transcript
+    );
+    for (const delta of presenceDeltas) {
+      if (skippedHostPredicates?.belongsHere(delta.room)) continue;
+      if (!this.objects.has(delta.room)) continue;
+      const before = this.propOrNull(delta.room, delta.property);
+      const after = applyPresenceProjectionRowDelta(before, delta);
+      if (this.setPropLocal(delta.room, delta.property, after)) touchedObjects.add(delta.room);
+    }
     profile?.("apply_writes", stepStartedAt);
 
     // Export paths sort object/log rows for deterministic snapshots. Keep the
@@ -7124,9 +7198,12 @@ export class WooWorld {
   private applyTranscriptWriteInPlace(write: TranscriptWrite, objectTimestamp: number, transcript: EffectTranscript): void {
     const target = this.objects.get(write.cell.object);
     if (!target) return;
-    // Keep this live-object materializer parallel with
-    // applyTranscriptWriteToSerializedObject in shadow-commit-scope.ts. The
-    // Map/Set storage shapes differ, but transcript semantics must not.
+    // A2: the `prop` arm now delegates to the single shared applier
+    // (applyTranscriptPropWrite). The remaining `location`/`contents` arms still
+    // mirror applyTranscriptWriteToSerializedObject by storage shape; the
+    // `contents` arm collapses at A4 (contents leaves the validation/applier path
+    // entirely), after which this whole switch and its serialized twin reduce to
+    // the shared prop/location core.
     switch (write.cell.kind) {
       case "prop":
         this.applyTranscriptPropWriteInPlace(target, write, objectTimestamp);
@@ -7155,29 +7232,39 @@ export class WooWorld {
   }
 
   private applyTranscriptPropWriteInPlace(target: WooObject, write: TranscriptWrite, objectTimestamp: number): void {
-    // Keep this parallel with applyPropWrite in shadow-commit-scope.ts.
+    // A2: delegate the accepted-transcript prop-write semantics to the single
+    // shared applier in shadow-commit-scope.ts via a WooObject-shaped target.
+    // The live graph keeps two live-only side effects the serialized authority
+    // row does not have — the `modified` timestamp and presence-index
+    // invalidation — applied here around the shared write.
     if (write.cell.kind !== "prop") return;
     const propName = write.cell.name;
     const presenceProjection = this.presenceProjectionForObjectRecord(target, propName);
-    if (write.op === "remove") {
-      target.properties.delete(propName);
-      target.propertyVersions.delete(propName);
-      target.modified = objectTimestamp;
-      if (presenceProjection) this.invalidatePresenceIndex();
-      return;
-    }
-    const value = cloneValue(write.value);
-    target.properties.set(propName, value);
-    target.properties = sortedMap(target.properties);
-    if (propName === "name" && typeof value === "string") target.name = value;
-    const parsedVersion = write.next === undefined ? null : Number(write.next);
-    const version = parsedVersion !== null && Number.isInteger(parsedVersion) && parsedVersion >= 0
-      ? parsedVersion
-      : (target.propertyVersions.get(propName) ?? 0) + 1;
-    target.propertyVersions.set(propName, version);
-    target.propertyVersions = sortedMap(target.propertyVersions);
+    applyTranscriptPropWrite(this.wooObjectPropTarget(target), write);
     target.modified = objectTimestamp;
     if (presenceProjection) this.invalidatePresenceIndex();
+  }
+
+  // Adapter: the live executable WooObject graph (Map/Set storage). Pairs with
+  // serializedObjectPropTarget in shadow-commit-scope.ts so both materializations
+  // are the same function of the transcript (VTN0 coherence invariant).
+  private wooObjectPropTarget(target: WooObject): TranscriptPropTarget {
+    return {
+      propertyVersion: (name) => target.propertyVersions.get(name),
+      setProperty: (name, value) => {
+        target.properties.set(name, cloneValue(value));
+        target.properties = sortedMap(target.properties);
+      },
+      removeProperty: (name) => {
+        target.properties.delete(name);
+        target.propertyVersions.delete(name);
+      },
+      setPropertyVersion: (name, version) => {
+        target.propertyVersions.set(name, version);
+        target.propertyVersions = sortedMap(target.propertyVersions);
+      },
+      setObjectName: (name) => { target.name = name; }
+    };
   }
 
   // Clone a verb's mutable wrapper fields (aliases, arg_spec, source, line_map,
@@ -8351,20 +8438,42 @@ export class WooWorld {
     }
   }
 
+  // CA8: live routing uses the session/audience table — the authoritative
+  // record of which live sessions are placed in a space (session.activeScope),
+  // set the moment a session is created in a room and maintained by every
+  // accepted session-scope transition. This is reliable even when no turn ever
+  // ran (a session born in its home room), which the derived
+  // session_subscribers projection cannot guarantee. Returns the live sessions
+  // and their actors currently scoped to `space`.
+  private sessionTableAudienceIn(space: ObjRef): { sessions: string[]; actors: ObjRef[] } {
+    const now = Date.now();
+    const sessions: string[] = [];
+    const actors = new Set<ObjRef>();
+    for (const session of this.sessions.values()) {
+      if (session.activeScope !== space) continue;
+      if (!this.sessionIsLive(session, now)) continue;
+      sessions.push(session.id);
+      actors.add(session.actor);
+    }
+    return { sessions, actors: Array.from(actors) };
+  }
+
   private liveAudienceActors(space: ObjRef): ObjRef[] | undefined {
-    // New worlds route live delivery through session_subscribers. Fall back
-    // to the legacy actor projection only for old worlds that do not have the
-    // session-keyed property yet.
+    // CA8: prefer the session/audience table (activeScope), unioned with the
+    // durable presence projection for back-compat. The projection alone misses
+    // a session that was born in this room without ever running an enter turn.
+    const tableActors = this.sessionTableAudienceIn(space).actors;
     const rawSessionSubscribers = this.propOrNull(space, "session_subscribers");
     if (Array.isArray(rawSessionSubscribers)) {
       const sessions = this.presenceSessionsIn(space);
-      return sessions ? Array.from(new Set(sessions.values())) : [];
+      const projected = sessions ? Array.from(sessions.values()) : [];
+      return Array.from(new Set([...tableActors, ...projected]));
     }
     const rawLegacySubscribers = this.propOrNull(space, "subscribers");
-    if (!Array.isArray(rawLegacySubscribers)) return undefined;
+    if (!Array.isArray(rawLegacySubscribers)) return tableActors.length > 0 ? tableActors : undefined;
     this.ensurePresenceIndex();
     const subs = this.subscribersIndex.get(space);
-    return subs ? Array.from(subs) : [];
+    return Array.from(new Set([...tableActors, ...(subs ?? [])]));
   }
 
   // Compute the per-observation audience for a direct call from this host's
@@ -8397,8 +8506,14 @@ export class WooWorld {
   }
 
   private appliedFrameAudience(space: ObjRef, observations: Observation[]): { audienceSessions?: string[]; observationSessionAudiences?: string[][] } {
+    // CA8: union the session/audience table (activeScope) with the durable
+    // presence projection, matching the direct-observation path. A session born
+    // in this room with no enter turn is only in the session table, so a
+    // projection-only audience would silently drop it from sequenced frames.
+    const sessionSet = new Set<string>(this.sessionTableAudienceIn(space).sessions);
     const sessionMap = this.presenceSessionsIn(space);
-    const sessions = sessionMap ? Array.from(sessionMap.keys()) : [];
+    if (sessionMap) for (const sessionId of sessionMap.keys()) sessionSet.add(sessionId);
+    const sessions = Array.from(sessionSet);
     return {
       audienceSessions: sessions.length > 0 ? sessions : undefined,
       observationSessionAudiences: observations.length > 0 ? observations.map(() => sessions) : undefined
@@ -8449,15 +8564,24 @@ export class WooWorld {
       : null;
     const audience = source ?? fallbackAudience;
     const sessionMap = audience ? this.presenceSessionsIn(audience) : null;
-    if (sessionMap) {
-      const sessions: string[] = [];
+    if (sessionMap || (audience && this.objects.has(audience) && this.isSpaceLike(audience))) {
+      const sessions = new Set<string>();
       const now = Date.now();
-      for (const [sessionId, actor] of sessionMap) {
+      // CA8: the session/audience table (activeScope) is the authoritative live
+      // routing source — it includes a session born in this room with no enter
+      // turn. Union with the durable presence projection for back-compat.
+      if (audience) {
+        for (const sessionId of this.sessionTableAudienceIn(audience).sessions) {
+          const session = this.sessions.get(sessionId);
+          if (session && actorSet.has(session.actor)) sessions.add(sessionId);
+        }
+      }
+      for (const [sessionId, actor] of sessionMap ?? []) {
         const session = this.sessions.get(sessionId);
         if (!session || session.actor !== actor || !this.sessionIsLive(session, now)) continue;
-        if (actorSet.has(actor)) sessions.push(sessionId);
+        if (actorSet.has(actor)) sessions.add(sessionId);
       }
-      return sessions;
+      return Array.from(sessions);
     }
     if (audience && this.executorContext && await this.remoteHostForObject(audience)) {
       try {
