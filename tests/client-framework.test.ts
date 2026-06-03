@@ -179,6 +179,29 @@ describe("client UI framework projection", () => {
     expect(ui.observe("the_pinboard")?.catalogState.pinboard_layout).toMatchObject({ note_1: { x: 12, y: 24, w: 180, h: 110, z: 3 } });
   });
 
+  it("folds committed pinboard live fanout into canonical catalog state", () => {
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot("overlay:pinboard:the_pinboard", [
+      { id: "the_pinboard", name: "Board", props: { layout: {} } }
+    ]);
+
+    // Co-present peers receive another user's committed board mutation as a live
+    // event, not an applied frame. The pinboard reducer declares
+    // liveProjection:"canonical", so this must survive live-layer pruning.
+    ui.ingestLiveObservation({
+      type: "note_added",
+      board: "the_pinboard",
+      pin: "note_live",
+      note: { id: "note_live", name: "Live Note", text: "peer note", color: "pink", x: 18, y: 26, w: 160, h: 96, z: 5 }
+    });
+
+    expect(ui.observe("note_live")?.catalogState.pinboard_note).toMatchObject({ text: "peer note", color: "pink", x: 18, y: 26 });
+    expect(ui.observe("the_pinboard")?.catalogState.pinboard_layout).toMatchObject({ note_live: { x: 18, y: 26, w: 160, h: 96, z: 5 } });
+
+    ui.prune(Date.now() + 2_000);
+    expect(ui.observe("note_live")?.catalogState.pinboard_note).toMatchObject({ text: "peer note", color: "pink", x: 18, y: 26 });
+  });
+
   it("previews added pinboard notes from optimistic frames and rolls back on error", () => {
     const ui = createWooClientFramework();
     ui.ingestSnapshot("overlay:pinboard:the_pinboard", [
@@ -264,6 +287,39 @@ describe("client UI framework projection", () => {
     ui.failOptimisticCall("call-add-outline");
 
     expect(ui.observe("outline_item_optimistic")).toBeUndefined();
+  });
+
+  it("folds committed outliner live fanout into canonical projection", () => {
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot(v2SnapshotKey("the_outline", 0), [
+      { id: "the_outline", name: "Outline", props: {} }
+    ]);
+
+    // Co-present peers receive committed structural mutations as live events.
+    // The outliner reducer must apply them as canonical state rather than as an
+    // expiring preview.
+    ui.ingestLiveObservation({
+      type: "outline_item_added",
+      outliner: "the_outline",
+      item: "outline_item_live",
+      parent_id: null,
+      index: 0,
+      text: "peer row",
+      actor: "guest_2"
+    });
+
+    expect(ui.observe("outline_item_live")).toMatchObject({
+      parent: "$outline_item",
+      location: "the_outline",
+      props: { text: "peer row", parent: null, position: 0, hidden: false }
+    });
+
+    ui.prune(Date.now() + 2_000);
+    expect(ui.observe("outline_item_live")).toMatchObject({
+      parent: "$outline_item",
+      location: "the_outline",
+      props: { text: "peer row", parent: null, position: 0, hidden: false }
+    });
   });
 
   it("keeps pinboard layout overlays sparse across sequential partial updates", () => {
