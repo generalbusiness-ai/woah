@@ -4810,6 +4810,12 @@ export class PersistentObjectDO {
         this.mergeRestPlanningAuthority(world, client, authority);
         markShadowBrowserRelaySerializedChanged(client.relay);
       },
+      // Adopt the authority's current head on a stale-head/version conflict so the
+      // next attempt does not re-submit a stale `expected` (authority merge
+      // updates cell versions but never advances the head). See gateway.ts.
+      applyHead: (client, head) => {
+        client.relay.commit_scope.head = structuredClone(head);
+      },
       submitEnvelope: async (scope, body) => {
         const client = this.restV2Relays.get(scope);
         const capsuleBody = this.withRestExecutionCapsule(client, body, input.target, input.verb);

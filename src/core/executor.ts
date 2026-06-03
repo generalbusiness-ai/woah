@@ -158,6 +158,14 @@ export type SubmitTurnIntentOptions<Client, Result extends ExecutorEnvelopeResul
   prePlanAuthority?: boolean;
   submitEnvelope(scope: ObjRef, body: ExecutorEnvelopeBody): Promise<Result>;
   applyAuthority?(client: Client, authority: SerializedAuthoritySlice): void;
+  // Adopt the authority's reported current head after a stale-head/version
+  // conflict, so the next attempt plans + submits against the right head instead
+  // of re-submitting the same stale `expected`. Without this, a distributed
+  // caller (gateway/REST) whose executor is a partial relay shard cannot use the
+  // in-process convergence in executeShadowTurnNetwork (which bails for
+  // non-authoritative executors) and grinds the full retry budget on every
+  // contended/first-turn-on-scope commit. See the conflict's `commit.current`.
+  applyHead?(client: Client, head: ShadowScopeHead): void;
   authorityObjectIds?(input: ExecutorCallInput, commitScope: ObjRef): ObjRef[];
   planningScope?(input: ExecutorCallInput): ObjRef;
   shouldRetry?(reply: ShadowTurnExecReply): boolean;
@@ -652,7 +660,23 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     submitMs += Date.now() - submitStartedAt;
     const replyEnvelope = decodeExecutorReply(result.reply);
     if (replyEnvelope?.body && attempt + 1 < maxAttempts && shouldRetry(replyEnvelope.body)) {
-      repairObjectIds = mergeExecutorObjectIds(repairObjectIds, executorObjectIdsFromMissingState(replyEnvelope.body));
+      const body = replyEnvelope.body;
+      // A stale-head / read-version conflict reports the authority's CURRENT
+      // head. Adopt it (mirrors executeShadowTurnNetwork's authoritative-executor
+      // convergence) and re-fetch authority for everything this turn touched, so
+      // the next attempt plans + commits against the right head AND fresh cell
+      // versions — instead of re-submitting the same stale `expected` and burning
+      // the whole retry budget. Without this, a first-turn-on-scope commit whose
+      // relay head is still @0 grinds all maxAttempts and returns an error.
+      if (body.ok === false && body.commit?.current) {
+        options.applyHead?.(commitClient, body.commit.current);
+        if (commitClient !== planningClient) options.applyHead?.(planningClient, body.commit.current);
+      }
+      repairObjectIds = mergeExecutorObjectIds(
+        repairObjectIds,
+        executorObjectIdsFromMissingState(body),
+        executorTranscriptObjectIds(planned.transcript)
+      );
       continue;
     }
     phaseOutcome = "submitted";

@@ -284,6 +284,12 @@ export async function executeInProcessV2DurableTurn(input: {
       mergeAuthorityIntoRelayCache(c.relay, authority, { preserveSessionActorLive: true, clone: true, reason: "dev_gateway_authority" });
       markShadowBrowserRelaySerializedChanged(c.relay);
     },
+    // Adopt the authority's current head on a stale-head/version conflict so the
+    // next attempt does not re-submit a stale `expected` (authority merge updates
+    // cell versions but never advances the head). See gateway.ts applyHead.
+    applyHead: (c, head) => {
+      c.relay.commit_scope.head = structuredClone(head);
+    },
     submitEnvelope: async (scope, body) => {
       // In-process CommitScopeDO: resolve the commit relay for the B6-selected
       // commit scope (which may differ from the planning scope), apply the

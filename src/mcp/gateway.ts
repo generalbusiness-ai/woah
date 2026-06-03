@@ -670,6 +670,14 @@ export class McpGateway {
       applyAuthority: (client, authority) => {
         this.mergeV2AuthorityIntoScopeClient(client, authority);
       },
+      // Adopt the authority's current head reported in a stale-head/version
+      // conflict so the next attempt plans + commits against it. The relay's
+      // authority merge updates cell versions but never advances the head, so
+      // without this a fresh commit-scope relay (head @0) stale-rejects every
+      // attempt. structuredClone keeps the reply's head object out of our cache.
+      applyHead: (client, head) => {
+        client.relay.commit_scope.head = structuredClone(head);
+      },
       submitEnvelope: async (submitScope, body) => {
         const envelopeBody = this.withExecutionCapsule(
           hooks,

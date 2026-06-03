@@ -318,6 +318,72 @@ describe("v2 turn gateway", () => {
     expect(t.authority_calls as number).toBeGreaterThanOrEqual(1);
   });
 
+  it("adopts the authority's current head on a stale-head conflict and converges next attempt", async () => {
+    // Regression for the prod 8-attempt grind: a fresh commit-scope relay plans
+    // against head @0 while the authority is advanced, so every commit
+    // stale-head-rejects. The fix adopts the conflict's reported `current` head
+    // before retry, so the next attempt submits against the right head instead
+    // of burning the whole retry budget.
+    const world = createWorld();
+    const session = world.auth("guest:v2-gateway-stale-head");
+    world.setProp("the_dubspace", "operators", [session.actor]);
+    const harness = makePlannedExecHarness(world.exportWorld());
+
+    const authorityCurrentHead = scopeHead("the_dubspace", 5); // authority is at seq 5; relay starts at @0
+    let submitCount = 0;
+
+    const result = await submitTurnIntent({
+      input: {
+        id: "stale-head-turn",
+        route: "sequenced",
+        scope: "the_dubspace",
+        session: session.id,
+        actor: session.actor,
+        target: "the_dubspace",
+        verb: "set_control",
+        args: ["delay_1", "wet", 0.3],
+        persistence: "durable",
+        token: "token"
+      },
+      maxAttempts: 8,
+      ...harness.options,
+      applyHead: (client: PlannedGatewayClient, head: ShadowScopeHead) => { client.head = head; },
+      submitEnvelope: async (scope: ObjRef, body: ExecutorEnvelopeBody) => {
+        const envelope = decodeEnvelope<ShadowTurnExecRequest>(body.envelope);
+        harness.submissions.push({ scope, body, envelope, request: envelope.body });
+        submitCount += 1;
+        if (submitCount === 1) {
+          // First attempt planned against the relay's stale @0 head.
+          return { reply: encodeEnvelope(replyEnvelope({
+            kind: "woo.turn.exec.reply.shadow.v1",
+            ok: false,
+            id: envelope.body.id,
+            reason: "commit_rejected",
+            commit: {
+              kind: "woo.commit.conflict.shadow.v1",
+              id: envelope.body.id ?? "turn",
+              scope: "the_dubspace",
+              current: authorityCurrentHead,
+              reason: "stale_head",
+              errors: ["stale_head: expected=h@0 current=head:the_dubspace:5@5"],
+              receipt: receipt(false)
+            }
+          })) };
+        }
+        return { reply: encodeEnvelope(replyEnvelope(okReplyForExecRequest(envelope.body))) };
+      }
+    });
+
+    expect(result.kind).toBe("submitted");
+    // Converged on the SECOND attempt, not the 8-attempt ceiling.
+    expect(submitCount).toBe(2);
+    // The second submission must carry the adopted current head as `expected`.
+    const second = harness.submissions[1];
+    expect(second.request.expected).toBeDefined();
+    expect(second.request.expected?.seq).toBe(5);
+    expect(second.request.expected?.hash).toBe(authorityCurrentHead.hash);
+  });
+
   it("routes planned-exec submission to the transcript commit scope, not the caller scope", async () => {
     const world = createWorld();
     const session = world.auth("guest:v2-gateway-cross-scope");
