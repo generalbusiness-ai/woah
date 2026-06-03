@@ -675,6 +675,21 @@ A commit scope validates a `CommitSubmit` in this order:
 If validation fails, no write from the transcript is committed. The executor may
 catch up and retry the whole turn.
 
+Steps 1–9 are evaluable from pre-state alone; only step 10 requires applying the
+transcript, and applying can only *add* a post-state mismatch to the verdict —
+it can never turn a pre-state rejection into an acceptance. An implementation
+therefore MAY reject before step 10 (skipping the apply) when steps 1–9 already
+determine a rejection whose `reason` a post-state mismatch cannot supersede:
+`stale_head`, `scope_mismatch`, and `permission_denied` outrank
+`post_state_mismatch`, and `read_version_mismatch` is convergence-safe to
+short-circuit because the conflict's refreshed `conflicting_cells`/state transfer
+makes the retried attempt's reads current, so its next round re-runs the full
+apply path and surfaces any genuine post-state mismatch. This is an optimization
+for the doomed repair rounds that dominate a contended turn's commit cost; the
+accept/reject verdict and the recorded receipt are unchanged from running every
+step. `incomplete_transcript` and `nondeterministic` are NOT short-circuited, so
+a post-state-mismatch verdict can never be silently relabelled.
+
 Lease acquisition is intentionally minimal in this draft: a commit scope or its
 sequencer issues `LeaseToken`s for cells whose writes require fencing before the
 turn runs. The token is not authority by itself; it is valid only with envelope
