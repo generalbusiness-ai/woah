@@ -6809,6 +6809,16 @@ export class WooWorld {
         if (move.to === id && !contents.includes(move.object)) contents = [...contents, move.object].sort();
       }
     }
+    // A create located in this container is a containment delta too, but it is
+    // neither a `contents` write nor a `move` — so the loops above miss it. Add
+    // freshly-created members here, else an object minted directly into this
+    // container (e.g. a note created in a room/board) is dropped from the
+    // container's contents projection on any host that materializes through
+    // projection rows (CF projection-mode), so `look`/`contents()`/roster reads
+    // there never see it.
+    for (const create of transcript.creates) {
+      if (create.location === id && !contents.includes(create.object)) contents = [...contents, create.object].sort();
+    }
     target.contents = new Set(contents);
 
     const children = new Set(existing.children);
