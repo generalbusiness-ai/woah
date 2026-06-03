@@ -467,7 +467,7 @@ export type MetricEvent =
   // teardown (the worst smoke endpoint at 22s CPU) can be charged to a concrete
   // step instead of guessed. `method` distinguishes POST turns from DELETE
   // teardowns; `forward_ms`/`handle_ms`/`register_ms` split the block.
-  | { kind: "mcp_dispatch_timing"; method: string; host: string; cold_world: boolean; total_ms: number; get_world_ms: number; forward_ms: number; handle_ms: number; register_ms: number }
+  | { kind: "mcp_dispatch_timing"; method: string; host: string; cold_world: boolean; status: "ok" | "error"; total_ms: number; get_world_ms: number; forward_ms: number; handle_ms: number; register_ms: number }
   // Emitted when a parent-chain walk hits a missing intermediate. The parent
   // ref on `start` (or one of its ancestors) points at `missing`, which has
   // no entry in the local objects map. Treated as end-of-chain by the walk

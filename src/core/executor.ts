@@ -513,13 +513,23 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       submit_ms: submitMs
     });
   };
+  // Time a phase and charge its elapsed wall time even when it THROWS — a
+  // throwing authority/VM/submit must show its real cost so the failure-path
+  // diagnosis this metric exists for is not under-reported. `add` accumulates
+  // into the right phase total; works for sync or async phase bodies.
+  const timePhase = async <T>(add: (ms: number) => void, body: () => T | Promise<T>): Promise<T> => {
+    const startedAt = Date.now();
+    try {
+      return await body();
+    } finally {
+      add(Date.now() - startedAt);
+    }
+  };
   try {
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     phaseAttempts = attempt + 1;
     const planningScope = options.planningScope?.(options.input) ?? options.input.scope;
-    const ensureClientStartedAt = Date.now();
-    const planningClient = await options.ensureClient(planningScope, attempt);
-    ensureClientMs += Date.now() - ensureClientStartedAt;
+    const planningClient = await timePhase((ms) => { ensureClientMs += ms; }, () => options.ensureClient(planningScope, attempt));
     const turnId = options.input.id ?? options.nextTurnId(planningClient, attempt);
     const call = buildExecutorCall(options.input, turnId);
     if (options.prePlanAuthority) {
@@ -528,15 +538,11 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
           ?? executorAuthorityObjectIds(options.input, planningScope),
         repairObjectIds
       );
-      const prePlanAuthorityStartedAt = Date.now();
-      const prePlanAuthority = await options.authorityPayload(planningScope, prePlanAuthorityObjectIds, { phase: "pre_plan" });
-      authorityMs += Date.now() - prePlanAuthorityStartedAt;
       authorityCalls += 1;
+      const prePlanAuthority = await timePhase((ms) => { authorityMs += ms; }, () => options.authorityPayload(planningScope, prePlanAuthorityObjectIds, { phase: "pre_plan" }));
       options.applyAuthority?.(planningClient, prePlanAuthority.authority);
     }
-    const serializeStartedAt = Date.now();
-    const serialized = options.clientSerialized?.(planningClient);
-    serializeMs += Date.now() - serializeStartedAt;
+    const serialized = await timePhase((ms) => { serializeMs += ms; }, () => options.clientSerialized?.(planningClient));
     if (!serialized) throw new Error("planned v2 turn gateway submission requires clientSerialized");
     let planned: ShadowTurnCallTranscriptRun;
     try {
@@ -547,17 +553,13 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       // always passes through the gate; provenance defaults to empty when a caller
       // does not thread it (still enforced — onAdmissionViolation is only logging).
       const planningProvenance = options.clientPlanningProvenance?.(planningClient) ?? new Map();
-      const planBuildStartedAt = Date.now();
-      const planningWorld = buildPlanningWorld(serialized, planningProvenance, {
+      const planningWorld = await timePhase((ms) => { planBuildMs += ms; }, () => buildPlanningWorld(serialized, planningProvenance, {
         ...(options.onAdmissionViolation ? { onViolation: options.onAdmissionViolation } : {}),
         ...(options.enforceMissingProvenance ? { enforceMissingProvenance: true } : {})
-      });
-      planBuildMs += Date.now() - planBuildStartedAt;
-      const vmStartedAt = Date.now();
-      planned = await runShadowTurnCallTranscript(planningWorld, call, {
+      }));
+      planned = await timePhase((ms) => { vmMs += ms; }, () => runShadowTurnCallTranscript(planningWorld, call, {
         ...(options.onMetric ? { onMetric: options.onMetric } : {})
-      });
-      vmMs += Date.now() - vmStartedAt;
+      }));
     } catch (err) {
       // Sparse MCP planning can discover a transitive object before the commit
       // executor sees it; repair that materialization miss and rerun the turn.
@@ -603,9 +605,7 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     if (commitScope === planningScope) {
       commitClient = planningClient;
     } else {
-      const commitEnsureStartedAt = Date.now();
-      commitClient = await options.ensureClient(commitScope, attempt);
-      ensureClientMs += Date.now() - commitEnsureStartedAt;
+      commitClient = await timePhase((ms) => { ensureClientMs += ms; }, () => options.ensureClient(commitScope, attempt));
     }
     const authorityObjectIds = mergeExecutorObjectIds(
       options.authorityObjectIds?.(options.input, commitScope)
@@ -613,10 +613,8 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       repairObjectIds,
       executorTranscriptObjectIds(planned.transcript)
     );
-    const commitAuthorityStartedAt = Date.now();
-    const authority = await options.authorityPayload(commitScope, authorityObjectIds, { phase: "commit" });
-    authorityMs += Date.now() - commitAuthorityStartedAt;
     authorityCalls += 1;
+    const authority = await timePhase((ms) => { authorityMs += ms; }, () => options.authorityPayload(commitScope, authorityObjectIds, { phase: "commit" }));
     options.applyAuthority?.(commitClient, authority.authority);
     if (commitClient !== planningClient) options.applyAuthority?.(planningClient, authority.authority);
     const head = options.clientHead?.(commitClient);
@@ -648,16 +646,14 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       envelopeId: options.envelopeId?.(turnId, attempt),
       request
     });
-    const submitStartedAt = Date.now();
-    const result = await options.submitEnvelope(commitScope, executorEnvelopeBody({
+    const result = await timePhase((ms) => { submitMs += ms; }, () => options.submitEnvelope(commitScope, executorEnvelopeBody({
       scope: commitScope,
       node: options.clientNode(commitClient),
       turn: options.input,
       authority,
       envelope,
       plannedTranscriptCommit: commitScope !== key.scope
-    }));
-    submitMs += Date.now() - submitStartedAt;
+    })));
     const replyEnvelope = decodeExecutorReply(result.reply);
     if (replyEnvelope?.body && attempt + 1 < maxAttempts && shouldRetry(replyEnvelope.body)) {
       const body = replyEnvelope.body;

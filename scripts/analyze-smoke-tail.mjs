@@ -411,7 +411,7 @@ function reportMcpDispatchTiming(metrics) {
   const byMethod = new Map();
   for (const m of metrics) {
     if (m.kind !== "mcp_dispatch_timing") continue;
-    const key = `${m.method || "?"}${m.cold_world ? " (cold)" : ""}`;
+    const key = `${m.method || "?"}${m.status === "error" ? " ERR" : ""}${m.cold_world ? " (cold)" : ""}`;
     const bucket = byMethod.get(key) || { total: [], getWorld: [], forward: [], handle: [], register: [] };
     bucket.total.push(m.total_ms || 0);
     bucket.getWorld.push(m.get_world_ms || 0);

@@ -1181,30 +1181,51 @@ export class PersistentObjectDO {
       if (gatewayHost && pathname === "/mcp") {
         // Slice 1 dispatch attribution: split the wrapper steps so a slow
         // DELETE teardown (or POST wrapper overhead outside submitTurnIntent)
-        // is charged to forward/handle/register rather than guessed.
+        // is charged to forward/handle/register rather than guessed. Emitted
+        // finally-style with partial timings + status so an ERROR path (the very
+        // case worth diagnosing) still gets attribution instead of falling back
+        // to coarse do_handler. handle/register record elapsed even on throw.
         const dispatchStartedAt = Date.now();
-        const forwardStartedAt = Date.now();
-        this.ensureForwardedMcpSession(world, request);
-        const forwardMs = Date.now() - forwardStartedAt;
-        const gateway = this.getMcpGateway(world);
-        const handleStartedAt = Date.now();
-        const response = await gateway.handle(request);
-        const handleMs = Date.now() - handleStartedAt;
-        const registerStartedAt = Date.now();
-        await this.registerMcpSessionRoute(world, request, response.clone(), mcpGatewayShard ? hostKey : null);
-        const registerMs = Date.now() - registerStartedAt;
-        world.recordMetric({
-          kind: "mcp_dispatch_timing",
-          method: request.method,
-          host: hostKey,
-          cold_world: mcpWorldWasCold,
-          total_ms: mcpGetWorldMs + (Date.now() - dispatchStartedAt),
-          get_world_ms: mcpGetWorldMs,
-          forward_ms: forwardMs,
-          handle_ms: handleMs,
-          register_ms: registerMs
-        });
-        return response;
+        let forwardMs = 0;
+        let handleMs = 0;
+        let registerMs = 0;
+        let dispatchStatus: "ok" | "error" = "ok";
+        try {
+          const forwardStartedAt = Date.now();
+          this.ensureForwardedMcpSession(world, request);
+          forwardMs = Date.now() - forwardStartedAt;
+          const gateway = this.getMcpGateway(world);
+          const handleStartedAt = Date.now();
+          let response: Response;
+          try {
+            response = await gateway.handle(request);
+          } finally {
+            handleMs = Date.now() - handleStartedAt;
+          }
+          const registerStartedAt = Date.now();
+          try {
+            await this.registerMcpSessionRoute(world, request, response.clone(), mcpGatewayShard ? hostKey : null);
+          } finally {
+            registerMs = Date.now() - registerStartedAt;
+          }
+          return response;
+        } catch (err) {
+          dispatchStatus = "error";
+          throw err;
+        } finally {
+          world.recordMetric({
+            kind: "mcp_dispatch_timing",
+            method: request.method,
+            host: hostKey,
+            cold_world: mcpWorldWasCold,
+            status: dispatchStatus,
+            total_ms: mcpGetWorldMs + (Date.now() - dispatchStartedAt),
+            get_world_ms: mcpGetWorldMs,
+            forward_ms: forwardMs,
+            handle_ms: handleMs,
+            register_ms: registerMs
+          });
+        }
       }
 
       if (worldGatewayHost && request.method === "POST" && pathname === "/v2/session/mint") {

@@ -384,6 +384,47 @@ describe("v2 turn gateway", () => {
     expect(second.request.expected?.hash).toBe(authorityCurrentHead.hash);
   });
 
+  it("charges a throwing phase and still emits turn_phase_timing with error outcome", async () => {
+    // Regression: phase timers must record elapsed even when the awaited phase
+    // THROWS, or the failure-path diagnosis this metric exists for under-reports
+    // exactly the phase that broke. Here submitEnvelope spends time then throws;
+    // the turn_phase_timing must still emit (finally) with submit_ms charged and
+    // outcome "error".
+    const world = createWorld();
+    const session = world.auth("guest:v2-gateway-throwing-phase");
+    world.setProp("the_dubspace", "operators", [session.actor]);
+    const harness = makePlannedExecHarness(world.exportWorld());
+
+    const events: Array<Record<string, unknown>> = [];
+    await expect(submitTurnIntent({
+      input: {
+        id: "throwing-submit-turn",
+        route: "sequenced",
+        scope: "the_dubspace",
+        session: session.id,
+        actor: session.actor,
+        target: "the_dubspace",
+        verb: "set_control",
+        args: ["delay_1", "wet", 0.4],
+        persistence: "durable",
+        token: "token"
+      },
+      maxAttempts: 1,
+      ...harness.options,
+      onMetric: (event) => events.push(event as Record<string, unknown>),
+      submitEnvelope: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        throw new Error("submit boom");
+      }
+    })).rejects.toThrow("submit boom");
+
+    const timing = events.filter((e) => e.kind === "turn_phase_timing");
+    expect(timing).toHaveLength(1);
+    expect(timing[0]!.outcome).toBe("error");
+    // The throwing submit phase is charged, not left at 0.
+    expect(timing[0]!.submit_ms as number).toBeGreaterThan(0);
+  });
+
   it("routes planned-exec submission to the transcript commit scope, not the caller scope", async () => {
     const world = createWorld();
     const session = world.auth("guest:v2-gateway-cross-scope");
