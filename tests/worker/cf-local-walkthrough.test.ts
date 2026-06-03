@@ -167,6 +167,38 @@ describe("CF-local smoke walkthrough", () => {
         `coherence-invariant violation during cross-shard walkthrough (VTN0): a commit rejection reported an error that is NOT an allow-listed A4 projection-cell mismatch. ` +
         `This is new multiplication / a masked rejection and must be fixed, not allow-listed. First offenders:\n${ciOffenders.slice(0, 3).join("\n")}`
       ).toBe(0);
+
+      // Slice 1 instrumentation guard: the phase-attribution metrics must
+      // actually fire on the real worker DO /mcp path, or a deploy ships blind
+      // instruments. Parse the structured woo.metric log lines the DO emits.
+      const parsedMetrics = logSpy.mock.calls
+        .filter((c) => c[0] === "woo.metric" && typeof c[1] === "string")
+        .map((c) => { try { return JSON.parse(c[1] as string) as Record<string, unknown>; } catch { return null; } })
+        .filter((m): m is Record<string, unknown> => m !== null);
+
+      // turn_phase_timing — emitted by submitTurnIntent for every POST turn.
+      const phaseTimings = parsedMetrics.filter((m) => m.kind === "turn_phase_timing");
+      expect(phaseTimings.length, "submitTurnIntent must emit turn_phase_timing on the DO turn path").toBeGreaterThan(0);
+      expect(phaseTimings.some((m) => m.outcome === "submitted"), "at least one turn should commit").toBe(true);
+      // Every phase field must be a finite number so the analyzer never charges NaN.
+      for (const field of ["total_ms", "ensure_client_ms", "authority_ms", "serialize_ms", "plan_build_ms", "vm_ms", "submit_ms", "authority_calls", "attempts"]) {
+        expect(typeof phaseTimings[0]![field], `turn_phase_timing.${field} must be numeric`).toBe("number");
+      }
+
+      // mcp_dispatch_timing (POST) — the /mcp dispatch wrapper outside the turn.
+      const postDispatch = parsedMetrics.filter((m) => m.kind === "mcp_dispatch_timing" && m.method === "POST");
+      expect(postDispatch.length, "the /mcp dispatch wrapper must emit mcp_dispatch_timing for POST").toBeGreaterThan(0);
+
+      // DELETE teardown is the worst smoke endpoint; prove its dispatch metric
+      // fires too. Close alice here (and null it so finally won't double-close).
+      await alice!.close();
+      alice = null;
+      const deleteDispatch = logSpy.mock.calls
+        .filter((c) => c[0] === "woo.metric" && typeof c[1] === "string")
+        .map((c) => { try { return JSON.parse(c[1] as string) as Record<string, unknown>; } catch { return null; } })
+        .filter((m): m is Record<string, unknown> => m !== null)
+        .filter((m) => m.kind === "mcp_dispatch_timing" && m.method === "DELETE");
+      expect(deleteDispatch.length, "the /mcp dispatch wrapper must emit mcp_dispatch_timing for DELETE teardown").toBeGreaterThan(0);
     } finally {
       await Promise.allSettled([alice?.close(), bob?.close()]);
       warnSpy.mockRestore();

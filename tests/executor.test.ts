@@ -268,6 +268,56 @@ describe("v2 turn gateway", () => {
     expect(result.reply?.ok).toBe(true);
   });
 
+  it("emits a turn_phase_timing metric attributing the turn's phases (Slice 1)", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:v2-gateway-phase-timing");
+    world.setProp("the_dubspace", "operators", [session.actor]);
+    const harness = makePlannedExecHarness(world.exportWorld());
+
+    const events: Array<Record<string, unknown>> = [];
+    const result = await submitTurnIntent({
+      input: {
+        id: "phase-timing-set-control",
+        route: "sequenced",
+        scope: "the_dubspace",
+        session: session.id,
+        actor: session.actor,
+        target: "the_dubspace",
+        verb: "set_control",
+        args: ["delay_1", "wet", 0.5],
+        persistence: "durable",
+        token: "token"
+      },
+      maxAttempts: 1,
+      ...harness.options,
+      // onMetric is threaded by the gateway in production; assert the executor
+      // emits exactly one phase-timing summary per turn with the expected shape.
+      onMetric: (event) => events.push(event as Record<string, unknown>)
+    });
+
+    expect(result.kind).toBe("submitted");
+    const timing = events.filter((e) => e.kind === "turn_phase_timing");
+    expect(timing).toHaveLength(1);
+    const t = timing[0];
+    expect(t).toMatchObject({
+      kind: "turn_phase_timing",
+      scope: "the_dubspace",
+      commit_scope: "the_dubspace",
+      target: "the_dubspace",
+      verb: "set_control",
+      route: "sequenced",
+      attempts: 1,
+      outcome: "submitted"
+    });
+    // Every phase field is present and numeric, and at least one authority
+    // payload call (pre-plan + commit) was charged.
+    for (const field of ["total_ms", "ensure_client_ms", "authority_ms", "serialize_ms", "plan_build_ms", "vm_ms", "submit_ms"]) {
+      expect(typeof t[field]).toBe("number");
+      expect(t[field] as number).toBeGreaterThanOrEqual(0);
+    }
+    expect(t.authority_calls as number).toBeGreaterThanOrEqual(1);
+  });
+
   it("routes planned-exec submission to the transcript commit scope, not the caller scope", async () => {
     const world = createWorld();
     const session = world.auth("guest:v2-gateway-cross-scope");

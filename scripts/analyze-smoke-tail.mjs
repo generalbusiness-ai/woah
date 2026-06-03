@@ -166,6 +166,8 @@ function report(metrics, events) {
   reportSeedDelivery(metrics);
   reportCrossHostRpc(metrics);
   reportVerbDispatch(metrics);
+  reportTurnPhaseTiming(metrics);
+  reportMcpDispatchTiming(metrics);
   reportObservationRouting(metrics);
   reportSlowHandlers(metrics);
   reportErrors(metrics);
@@ -337,6 +339,99 @@ function reportVerbDispatch(metrics) {
     .sort((a, b) => b.stats.sum - a.stats.sum);
   for (const row of rows.slice(0, 25)) {
     console.log(`  ${pad(row.key, 55)} ${num(row.stats.count)} ${num(row.errors, 4)} ${num(row.observations, 5)} ${num(row.stats.mean)} ${num(row.stats.p95)} ${num(row.stats.max)}`);
+  }
+}
+
+function reportTurnPhaseTiming(metrics) {
+  section("Turn phase attribution (submitTurnIntent)");
+  // turn_phase_timing (Slice 1) charges each turn's wall time to its phases.
+  // This is the headline for "where does the 14.6s /mcp CPU go": compare the
+  // local-compute phases (serialize + plan_build + vm) against the wall-bound
+  // phases (authority reconstruction/fan-in + submit-envelope RPC). `attempts`
+  // > 1 means the repair loop re-ran and multiplied every phase. `auth#` is the
+  // count of authorityPayload calls (each a potential cross-host slice fetch).
+  const byVerb = new Map();
+  const totals = { total: [], ensure: [], auth: [], serial: [], build: [], vm: [], submit: [], attempts: [], authCalls: [] };
+  for (const m of metrics) {
+    if (m.kind !== "turn_phase_timing") continue;
+    const key = `${m.target || "?"}:${m.verb || "?"} (${m.outcome || "?"})`;
+    const bucket = byVerb.get(key) || { total: [], ensure: [], auth: [], serial: [], build: [], vm: [], submit: [], attempts: [], authCalls: [] };
+    bucket.total.push(m.total_ms || 0);
+    bucket.ensure.push(m.ensure_client_ms || 0);
+    bucket.auth.push(m.authority_ms || 0);
+    bucket.serial.push(m.serialize_ms || 0);
+    bucket.build.push(m.plan_build_ms || 0);
+    bucket.vm.push(m.vm_ms || 0);
+    bucket.submit.push(m.submit_ms || 0);
+    bucket.attempts.push(m.attempts || 0);
+    bucket.authCalls.push(m.authority_calls || 0);
+    byVerb.set(key, bucket);
+    totals.ensure.push(m.ensure_client_ms || 0);
+    totals.auth.push(m.authority_ms || 0);
+    totals.serial.push(m.serialize_ms || 0);
+    totals.build.push(m.plan_build_ms || 0);
+    totals.vm.push(m.vm_ms || 0);
+    totals.submit.push(m.submit_ms || 0);
+  }
+  if (byVerb.size === 0) {
+    console.log("  (no turn_phase_timing metrics — deploy must include Slice 1 instrumentation)");
+    return;
+  }
+  // Columns are mean ms per phase so the dominant phase is obvious at a glance;
+  // total shows mean + p95 so tail turns are visible.
+  console.log(`  ${pad("target:verb (outcome)", 34)} ${pad("n", 4)} ${pad("att", 4)} ${pad("auth#", 5)} ${pad("tot.mean", 8)} ${pad("tot.p95", 7)} ${pad("ensure", 6)} ${pad("auth", 6)} ${pad("serial", 6)} ${pad("build", 6)} ${pad("vm", 6)} ${pad("submit", 6)}`);
+  const rows = Array.from(byVerb.entries())
+    .map(([k, b]) => ({ key: k, b, tot: summarize(b.total) }))
+    .sort((a, b) => b.tot.sum - a.tot.sum);
+  for (const row of rows) {
+    const b = row.b;
+    const mean = (arr) => Math.round(summarize(arr).mean);
+    console.log(`  ${pad(row.key, 34)} ${num(row.tot.count, 4)} ${num(mean(b.attempts), 4)} ${num(mean(b.authCalls), 5)} ${num(row.tot.mean, 8)} ${num(row.tot.p95, 7)} ${num(mean(b.ensure))} ${num(mean(b.auth))} ${num(mean(b.serial))} ${num(mean(b.build))} ${num(mean(b.vm))} ${num(mean(b.submit))}`);
+  }
+  // Aggregate phase share across all turns: which phase owns the wall budget.
+  const sum = (arr) => arr.reduce((a, c) => a + c, 0);
+  const phaseSums = {
+    ensure: sum(totals.ensure), auth: sum(totals.auth), serial: sum(totals.serial),
+    build: sum(totals.build), vm: sum(totals.vm), submit: sum(totals.submit)
+  };
+  const grand = Object.values(phaseSums).reduce((a, c) => a + c, 0) || 1;
+  console.log("");
+  console.log("  phase share of summed turn wall time across all turns:");
+  for (const [k, v] of Object.entries(phaseSums).sort((a, b) => b[1] - a[1])) {
+    console.log(`    ${pad(k, 8)} ${num(v, 8)} ms  ${num(Math.round((v / grand) * 100), 4)}%`);
+  }
+}
+
+function reportMcpDispatchTiming(metrics) {
+  section("MCP dispatch wrapper timing (POST vs DELETE)");
+  // mcp_dispatch_timing (Slice 1) charges the /mcp DO wrapper steps that sit
+  // OUTSIDE submitTurnIntent. For DELETE (teardown, the worst smoke endpoint)
+  // this is the whole cost; for POST it is the cold-load + session-forward +
+  // route-register overhead added on top of the turn itself.
+  const byMethod = new Map();
+  for (const m of metrics) {
+    if (m.kind !== "mcp_dispatch_timing") continue;
+    const key = `${m.method || "?"}${m.cold_world ? " (cold)" : ""}`;
+    const bucket = byMethod.get(key) || { total: [], getWorld: [], forward: [], handle: [], register: [] };
+    bucket.total.push(m.total_ms || 0);
+    bucket.getWorld.push(m.get_world_ms || 0);
+    bucket.forward.push(m.forward_ms || 0);
+    bucket.handle.push(m.handle_ms || 0);
+    bucket.register.push(m.register_ms || 0);
+    byMethod.set(key, bucket);
+  }
+  if (byMethod.size === 0) {
+    console.log("  (no mcp_dispatch_timing metrics — deploy must include Slice 1 instrumentation)");
+    return;
+  }
+  console.log(`  ${pad("method", 16)} ${pad("n", 4)} ${pad("tot.p95", 7)} ${pad("tot.max", 7)} ${pad("getWorld", 8)} ${pad("forward", 7)} ${pad("handle", 7)} ${pad("register", 8)}`);
+  const rows = Array.from(byMethod.entries())
+    .map(([k, b]) => ({ key: k, b, tot: summarize(b.total) }))
+    .sort((a, b) => b.tot.sum - a.tot.sum);
+  for (const row of rows) {
+    const b = row.b;
+    const p95 = (arr) => summarize(arr).p95;
+    console.log(`  ${pad(row.key, 16)} ${num(row.tot.count, 4)} ${num(row.tot.p95, 7)} ${num(row.tot.max, 7)} ${num(p95(b.getWorld), 8)} ${num(p95(b.forward), 7)} ${num(p95(b.handle), 7)} ${num(p95(b.register), 8)}`);
   }
 }
 

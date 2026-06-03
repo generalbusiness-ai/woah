@@ -1153,7 +1153,13 @@ export class PersistentObjectDO {
 
       let postHandlerWorld: WooWorld | null = null;
       try {
+      // Slice 1: time getWorld (cold-init included) for the /mcp dispatch so the
+      // dispatch-timing metric can separate cold-load from the dispatch steps.
+      const mcpDispatchTimed = gatewayHost && pathname === "/mcp";
+      const mcpWorldWasCold = mcpDispatchTimed && !this.world;
+      const getWorldStartedAt = mcpDispatchTimed ? Date.now() : 0;
       const world = await this.getWorld(hostKey);
+      const mcpGetWorldMs = mcpDispatchTimed ? Date.now() - getWorldStartedAt : 0;
       postHandlerWorld = world;
 
       if (internalRequest) {
@@ -1173,10 +1179,31 @@ export class PersistentObjectDO {
       // headers from the Worker so they can resume SDK transport state without
       // becoming the canonical session store.
       if (gatewayHost && pathname === "/mcp") {
+        // Slice 1 dispatch attribution: split the wrapper steps so a slow
+        // DELETE teardown (or POST wrapper overhead outside submitTurnIntent)
+        // is charged to forward/handle/register rather than guessed.
+        const dispatchStartedAt = Date.now();
+        const forwardStartedAt = Date.now();
         this.ensureForwardedMcpSession(world, request);
+        const forwardMs = Date.now() - forwardStartedAt;
         const gateway = this.getMcpGateway(world);
+        const handleStartedAt = Date.now();
         const response = await gateway.handle(request);
+        const handleMs = Date.now() - handleStartedAt;
+        const registerStartedAt = Date.now();
         await this.registerMcpSessionRoute(world, request, response.clone(), mcpGatewayShard ? hostKey : null);
+        const registerMs = Date.now() - registerStartedAt;
+        world.recordMetric({
+          kind: "mcp_dispatch_timing",
+          method: request.method,
+          host: hostKey,
+          cold_world: mcpWorldWasCold,
+          total_ms: mcpGetWorldMs + (Date.now() - dispatchStartedAt),
+          get_world_ms: mcpGetWorldMs,
+          forward_ms: forwardMs,
+          handle_ms: handleMs,
+          register_ms: registerMs
+        });
         return response;
       }
 

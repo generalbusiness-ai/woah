@@ -63,6 +63,32 @@ const verbose = args.verbose;
 
 const results: StepResult[] = [];
 
+// Slice 1 harness hardening: once the gateway is timeout-saturated, every
+// subsequent step times out and its session reset times out too, polluting the
+// run with misleading secondary errors (mug-not-found, tool-not-reachable,
+// no-session). Halt after this many CONSECUTIVE timeout-class step failures so
+// the measurement isolates the primary latency wall from recovery drift. A
+// single cold-start transient (threshold 1) is tolerated; sustained timeouts
+// are not.
+const CASCADE_HALT_THRESHOLD = 2;
+let consecutiveTimeouts = 0;
+
+// A failure whose message indicates a deadline/abort rather than a real
+// protocol error. These are the failures that signal gateway saturation.
+export function isTimeoutDetail(detail: string | undefined): boolean {
+  if (!detail) return false;
+  return /timed out after|exceeded \d+ms|watchdog|deadline|aborted/i.test(detail);
+}
+
+// Thrown by smokeStep to abort the remaining walkthrough once the timeout
+// cascade threshold is reached. Caught in main so the summary still prints.
+export class SmokeCascadeHalt extends Error {
+  constructor(public readonly count: number) {
+    super(`halted after ${count} consecutive timeout-class failures`);
+    this.name = "SmokeCascadeHalt";
+  }
+}
+
 async function main(): Promise<void> {
   console.log(`smoke-walkthrough base=${baseUrl} run=${runId}`);
   // Filter wrangler tail with: `wrangler tail --search=smoke-walkthrough/${runId}`
@@ -74,9 +100,19 @@ async function main(): Promise<void> {
   // whatever did succeed. Without this, a failing bob.open() leaks alice's
   // session for the remainder of the MCP idle timeout.
   let sessions: SessionPair | null = null;
+  let halted: SmokeCascadeHalt | null = null;
   try {
     sessions = await openSessionPair(0);
     await runWalkthrough(sessions);
+  } catch (err) {
+    // A cascade halt is an intentional early stop, not a harness crash — record
+    // it and fall through to the summary so the attempted steps still report.
+    if (err instanceof SmokeCascadeHalt) {
+      halted = err;
+      console.error(`  HALT  ${err.message}; remaining steps not attempted (gateway timeout-saturated)`);
+    } else {
+      throw err;
+    }
   } finally {
     await closeSessionPair(sessions);
   }
@@ -84,7 +120,8 @@ async function main(): Promise<void> {
   const passed = results.filter((r) => r.ok).length;
   const failed = results.length - passed;
   console.log();
-  console.log(`summary: ${passed}/${results.length} steps passed${failed ? `, ${failed} failed` : ""}`);
+  const haltNote = halted ? ` (HALTED after ${halted.count} consecutive timeouts; remaining steps not attempted)` : "";
+  console.log(`summary: ${passed}/${results.length} steps attempted passed${failed ? `, ${failed} failed` : ""}${haltNote}`);
   if (failed > 0) {
     for (const r of results.filter((r) => !r.ok)) console.error(`  FAIL ${r.name}: ${r.detail ?? "(no detail)"}`);
     process.exit(1);
@@ -97,14 +134,26 @@ async function runWalkthrough(sessions: SessionPair): Promise<void> {
     body: (ctx: StepContext, pair: SessionPair) => Promise<void>
   ): Promise<boolean> => {
     const ok = await step(name, (ctx) => body(ctx, sessions));
-    if (!ok) {
-      try {
-        await resetSessionPair(sessions, name);
-      } catch (err) {
-        console.error(`  WARN  session reset after "${name}" failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
+    if (ok) {
+      consecutiveTimeouts = 0;
+      return true;
     }
-    return ok;
+    // The just-pushed result carries the failure detail; classify it.
+    const last = results[results.length - 1];
+    let timeoutFailure = isTimeoutDetail(last?.detail);
+    try {
+      await resetSessionPair(sessions, name);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`  WARN  session reset after "${name}" failed: ${msg}`);
+      // A reset that itself times out is the strongest saturation signal.
+      if (isTimeoutDetail(msg)) timeoutFailure = true;
+    }
+    consecutiveTimeouts = timeoutFailure ? consecutiveTimeouts + 1 : 0;
+    if (consecutiveTimeouts >= CASCADE_HALT_THRESHOLD) {
+      throw new SmokeCascadeHalt(consecutiveTimeouts);
+    }
+    return false;
   };
 
   // Both guests start in the_chatroom on the deployed demo world. Calling

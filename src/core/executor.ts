@@ -467,9 +467,51 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
   const maxAttempts = options.maxAttempts ?? 1;
   const shouldRetry = options.shouldRetry ?? executorReplyNeedsRepair;
   let repairObjectIds: ObjRef[] = [];
+  // Slice 1 phase attribution: charge the turn's wall time to the loop's
+  // phases (client open, authority reconstruction/fan-in, local serialize,
+  // planning-world build, VM run, commit-envelope RPC) so a slow turn can be
+  // diagnosed without guessing. All *_ms sum across repair attempts; one
+  // turn_phase_timing metric is emitted on every exit (commit, local frame, or
+  // throw). Cheap (a handful of Date.now() reads) and generic — every
+  // submitTurnIntent caller (MCP, dev, browser) gets the same breakdown.
+  const turnStartedAt = Date.now();
+  let phaseAttempts = 0;
+  let ensureClientMs = 0;
+  let authorityMs = 0;
+  let authorityCalls = 0;
+  let serializeMs = 0;
+  let planBuildMs = 0;
+  let vmMs = 0;
+  let submitMs = 0;
+  let phaseOutcome: "submitted" | "local_frame" | "error" = "error";
+  let phaseCommitScope: ObjRef | null = null;
+  const emitPhaseTiming = (): void => {
+    options.onMetric?.({
+      kind: "turn_phase_timing",
+      scope: options.input.scope,
+      commit_scope: phaseCommitScope,
+      target: options.input.target,
+      verb: options.input.verb,
+      route: options.input.route,
+      attempts: phaseAttempts,
+      outcome: phaseOutcome,
+      total_ms: Date.now() - turnStartedAt,
+      ensure_client_ms: ensureClientMs,
+      authority_ms: authorityMs,
+      authority_calls: authorityCalls,
+      serialize_ms: serializeMs,
+      plan_build_ms: planBuildMs,
+      vm_ms: vmMs,
+      submit_ms: submitMs
+    });
+  };
+  try {
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    phaseAttempts = attempt + 1;
     const planningScope = options.planningScope?.(options.input) ?? options.input.scope;
+    const ensureClientStartedAt = Date.now();
     const planningClient = await options.ensureClient(planningScope, attempt);
+    ensureClientMs += Date.now() - ensureClientStartedAt;
     const turnId = options.input.id ?? options.nextTurnId(planningClient, attempt);
     const call = buildExecutorCall(options.input, turnId);
     if (options.prePlanAuthority) {
@@ -478,10 +520,15 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
           ?? executorAuthorityObjectIds(options.input, planningScope),
         repairObjectIds
       );
+      const prePlanAuthorityStartedAt = Date.now();
       const prePlanAuthority = await options.authorityPayload(planningScope, prePlanAuthorityObjectIds, { phase: "pre_plan" });
+      authorityMs += Date.now() - prePlanAuthorityStartedAt;
+      authorityCalls += 1;
       options.applyAuthority?.(planningClient, prePlanAuthority.authority);
     }
+    const serializeStartedAt = Date.now();
     const serialized = options.clientSerialized?.(planningClient);
+    serializeMs += Date.now() - serializeStartedAt;
     if (!serialized) throw new Error("planned v2 turn gateway submission requires clientSerialized");
     let planned: ShadowTurnCallTranscriptRun;
     try {
@@ -492,13 +539,17 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       // always passes through the gate; provenance defaults to empty when a caller
       // does not thread it (still enforced — onAdmissionViolation is only logging).
       const planningProvenance = options.clientPlanningProvenance?.(planningClient) ?? new Map();
+      const planBuildStartedAt = Date.now();
       const planningWorld = buildPlanningWorld(serialized, planningProvenance, {
         ...(options.onAdmissionViolation ? { onViolation: options.onAdmissionViolation } : {}),
         ...(options.enforceMissingProvenance ? { enforceMissingProvenance: true } : {})
       });
+      planBuildMs += Date.now() - planBuildStartedAt;
+      const vmStartedAt = Date.now();
       planned = await runShadowTurnCallTranscript(planningWorld, call, {
         ...(options.onMetric ? { onMetric: options.onMetric } : {})
       });
+      vmMs += Date.now() - vmStartedAt;
     } catch (err) {
       // Sparse MCP planning can discover a transitive object before the commit
       // executor sees it; repair that materialization miss and rerun the turn.
@@ -523,6 +574,7 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
         repairObjectIds = nextRepairObjectIds;
         continue;
       }
+      phaseOutcome = "local_frame";
       return { kind: "local_frame", frame: planned.frame, call, planned };
     }
 
@@ -538,16 +590,25 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     // verb in a foreign scope.
     const commitSelection = selectCommitScopeForTranscript(planned.transcript, key.scope, options.onMetric);
     const commitScope = commitSelection.scope;
-    const commitClient = commitScope === planningScope
-      ? planningClient
-      : await options.ensureClient(commitScope, attempt);
+    phaseCommitScope = commitScope;
+    let commitClient: Client;
+    if (commitScope === planningScope) {
+      commitClient = planningClient;
+    } else {
+      const commitEnsureStartedAt = Date.now();
+      commitClient = await options.ensureClient(commitScope, attempt);
+      ensureClientMs += Date.now() - commitEnsureStartedAt;
+    }
     const authorityObjectIds = mergeExecutorObjectIds(
       options.authorityObjectIds?.(options.input, commitScope)
         ?? executorAuthorityObjectIds(options.input, commitScope),
       repairObjectIds,
       executorTranscriptObjectIds(planned.transcript)
     );
+    const commitAuthorityStartedAt = Date.now();
     const authority = await options.authorityPayload(commitScope, authorityObjectIds, { phase: "commit" });
+    authorityMs += Date.now() - commitAuthorityStartedAt;
+    authorityCalls += 1;
     options.applyAuthority?.(commitClient, authority.authority);
     if (commitClient !== planningClient) options.applyAuthority?.(planningClient, authority.authority);
     const head = options.clientHead?.(commitClient);
@@ -579,6 +640,7 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       envelopeId: options.envelopeId?.(turnId, attempt),
       request
     });
+    const submitStartedAt = Date.now();
     const result = await options.submitEnvelope(commitScope, executorEnvelopeBody({
       scope: commitScope,
       node: options.clientNode(commitClient),
@@ -587,11 +649,13 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       envelope,
       plannedTranscriptCommit: commitScope !== key.scope
     }));
+    submitMs += Date.now() - submitStartedAt;
     const replyEnvelope = decodeExecutorReply(result.reply);
     if (replyEnvelope?.body && attempt + 1 < maxAttempts && shouldRetry(replyEnvelope.body)) {
       repairObjectIds = mergeExecutorObjectIds(repairObjectIds, executorObjectIdsFromMissingState(replyEnvelope.body));
       continue;
     }
+    phaseOutcome = "submitted";
     return {
       kind: "submitted",
       scope: options.input.scope,
@@ -605,6 +669,9 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     };
   }
   throw new Error("v2 turn gateway retry loop exhausted");
+  } finally {
+    emitPhaseTiming();
+  }
 }
 
 function mergeExecutorObjectIds(...lists: ObjRef[][]): ObjRef[] {
