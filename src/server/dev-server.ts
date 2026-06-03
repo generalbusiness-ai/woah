@@ -45,6 +45,7 @@ import {
   mergeAuthorityIntoRelayCache,
   type ShadowRelayCache
 } from "../core/shadow-relay-cache";
+import { hydrateShadowRelayTail, serializeShadowRelayTail, type SerializedShadowRelayTail } from "../core/shadow-relay-tail";
 import { buildTransportErrorEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
 import {
   buildVerbThrewReplyEnvelope,
@@ -472,6 +473,13 @@ function v2RelayForScope(scope: ObjRef): ShadowRelayCache {
       serialized: world.exportWorld(),
       deployment: "local-dev"
     });
+    // Rehydrate the relay's durable tail (idempotency seen/reply window + the
+    // accepted-frame/transcript reconnect tail) from the localdev store, the
+    // analogue of a CommitScopeDO rebuilding its tail on cold load. A retried
+    // intent or a reconnect that arrives after a dev-server restart then gets the
+    // cached reply / frame-replay instead of a re-execution or full reseed.
+    const persistedTail = repository.loadRelayTail(scope);
+    if (persistedTail) hydrateShadowRelayTail(relay, JSON.parse(persistedTail) as SerializedShadowRelayTail);
     v2RelaysByScope.set(scope, relay);
   }
   // Dev mirrors the Worker/CommitScopeDO lifetime: one relay per commit scope,
@@ -483,6 +491,22 @@ function v2RelayForScope(scope: ObjRef): ShadowRelayCache {
   // the DO it opens.
   refreshDevV2RelaySessions(relay);
   return relay;
+}
+
+// Persist the commit relay's durable tail after an accepted commit. Reads the
+// already-warm relay from the per-scope map directly (NOT through v2RelayForScope,
+// which would trigger a redundant authority refresh) and writes the shared
+// SerializedShadowRelayTail JSON to the localdev store. Best-effort: a tail
+// failing to persist must not fail the turn the client already saw committed, so
+// it is logged and swallowed.
+function persistDevV2RelayTail(scope: ObjRef): void {
+  const relay = v2RelaysByScope.get(scope);
+  if (!relay) return;
+  try {
+    repository.saveRelayTail(scope, JSON.stringify(serializeShadowRelayTail(relay)));
+  } catch (err) {
+    console.warn("woo.dev_relay_tail_persist_failed", JSON.stringify({ scope, error: normalizeError(err).message }));
+  }
 }
 
 function refreshDevV2RelaySessions(relay: ShadowRelayCache, extraObjectIds: Iterable<ObjRef> = []): void {
@@ -646,6 +670,12 @@ async function devRestV2Turn(input: Parameters<NonNullable<RestProtocolHost["exe
     const origin = v2ShadowBrowser(node, token, input.session, scope);
     await sendDevV2Fanout(origin, submitted.replyEnvelope);
   }
+  // Persist the commit relay's tail after the accepted commit so the idempotency
+  // window + reconnect frame-tail survive a dev-server restart. The commit scope
+  // is the B6-selected scope on the reply, which may differ from `scope`.
+  if (submitted.kind === "submitted" && submitted.reply?.ok && submitted.reply.commit) {
+    persistDevV2RelayTail(submitted.reply.commit.position.scope);
+  }
   return frame;
 }
 
@@ -770,7 +800,7 @@ async function handleV2ShadowFrame(
         ensureDevV2SerializedSession(relay, session);
         return relay;
       };
-      const { reply: wsReply } = await executeDevV2DurableTurnWsReply({
+      const { reply: wsReply, submitted } = await executeDevV2DurableTurnWsReply({
         world,
         gatewayRelayForScope: durableGatewayForScope,
         commitRelayForScope: durableCommitForScope,
@@ -782,6 +812,16 @@ async function handleV2ShadowFrame(
       });
       ws.send(encodeEnvelope(wsReply));
       await sendDevV2Fanout(turnBrowser, wsReply);
+      // Persist two relays' tails: the WS-bound relay holds the reply-idempotency
+      // cache keyed by the SPA's intent id (so a retry after restart does not
+      // re-commit), and the commit-scope relay holds the accepted-frame/transcript
+      // reconnect tail. For a same-scope turn these coincide; a B6 relocation
+      // plans/caches on the call scope but commits at the moved object's scope.
+      const wsTailScopes = new Set<ObjRef>([turnBrowser.relay.commit_scope.scope]);
+      if (submitted?.kind === "submitted" && submitted.reply?.ok && submitted.reply.commit) {
+        wsTailScopes.add(submitted.reply.commit.position.scope);
+      }
+      for (const tailScope of wsTailScopes) persistDevV2RelayTail(tailScope);
       return;
     }
     const reply = await handleShadowBrowserTurnExecEnvelope(turnBrowser, receipt, { onMetric: emitDevMetric });
@@ -799,6 +839,7 @@ async function handleV2ShadowFrame(
       : null;
     if (reply?.body.ok === true && reply.body.commit && reply.body.transcript) {
       await materializeDevV2CommitLocally(world, reply.body.commit.position.scope, reply.body.transcript);
+      persistDevV2RelayTail(reply.body.commit.position.scope);
     }
     if (receiverReply) {
       ws.send(encodeEnvelope(receiverReply));

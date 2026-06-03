@@ -10,6 +10,8 @@ import { runShadowTurnCall, type ShadowTurnCall } from "../src/core/shadow-turn-
 import { encodeExecutorIntentEnvelope } from "../src/core/executor";
 import { decodeTurnIntentCall, devV2BrowserProfileTurnReply, executeDevV2DurableTurnFrame, executeDevV2DurableTurnWsReply, executeInProcessV2DurableTurn } from "../src/server/dev-v2-helpers";
 import { shadowTurnKeyFromTranscript } from "../src/core/turn-key";
+import { hydrateShadowRelayTail, serializeShadowRelayTail, type SerializedShadowRelayTail } from "../src/core/shadow-relay-tail";
+import { LocalSQLiteRepository } from "../src/server/sqlite-repository";
 import type { ExecutorCallInput } from "../src/core/executor";
 import type { ShadowRelayCache } from "../src/core/shadow-relay-cache";
 import type { ObjRef, WooValue } from "../src/core/types";
@@ -445,6 +447,87 @@ describe("dev v2 durable turn — CF contract parity", () => {
     expect(fresh.mode).toBe("projection");
     const staleEpoch = buildShadowBrowserCatchupTransferForBrowser(h.wsBrowser, "the_dubspace", { ...head1, epoch: head1.epoch + 1 });
     expect(staleEpoch.mode).toBe("projection");
+  });
+
+  it("durable tail survives relay eviction via the localdev store (idempotency + reconnect frame-replay rehydrate)", async () => {
+    // Item-4 parity: the CommitScopeDO persists its idempotency window + accepted-
+    // frame/transcript tail to SQL and rebuilds them on cold load; localdev now
+    // persists the same SerializedShadowRelayTail to its SQLite store so a
+    // dev-server restart (modelled here as evicting the relay and rebuilding it)
+    // keeps reply-idempotency and reconnect frame-replay. This drives the SHARED
+    // serialize/hydrate seam through the REAL localdev repository round-trip.
+    const repo = new LocalSQLiteRepository(":memory:");
+    const world = createWorld({ repository: repo });
+    const session = world.auth("guest:dev-tail");
+    world.setProp("the_dubspace", "operators", [session.actor]);
+    const token = shadowBrowserSessionBearer({ id: session.id, actor: session.actor });
+
+    const makeRelays = () => ({
+      gatewayRelay: createShadowBrowserRelayShim({ node: "dev:gw-tail", scope: "the_dubspace", serialized: createWorld({ catalogs: false }).exportWorld(), deployment: "local-dev" }),
+      commitRelay: createShadowBrowserRelayShim({ node: "dev:commit-tail", scope: "the_dubspace", serialized: world.exportWorld(), deployment: "local-dev" })
+    });
+    let { gatewayRelay, commitRelay } = makeRelays();
+    const browserFor = (relay: ShadowRelayCache, id: string) =>
+      createShadowBrowserClient({ node: `browser:tail-${id}`, scope: "the_dubspace", actor: session.actor, session: session.id, relay, token });
+
+    const commit = async (browser: ReturnType<typeof createShadowBrowserClient>, relayGateway: ShadowRelayCache, relayCommit: ShadowRelayCache, id: string, wet: number) => {
+      const call = {
+        id, route: "sequenced" as const, scope: "the_dubspace" as ObjRef, session: session.id,
+        actor: session.actor, target: "the_dubspace" as ObjRef, verb: "set_control",
+        args: ["delay_1", "wet", wet] as WooValue[], persistence: "durable" as const, token
+      };
+      const encoded = encodeExecutorIntentEnvelope({ node: browser.node, turn: { ...call }, turnId: id });
+      const receipt = receiveShadowBrowserEnvelopeReceipt(browser, encoded);
+      const { reply } = await executeDevV2DurableTurnWsReply({ world, ...fixedResolvers("the_dubspace", relayGateway, relayCommit), browser, receipt, call, node: `dev:exec-${id}` });
+      return reply;
+    };
+
+    // Two committed turns build an accepted-frame/transcript tail and seed the
+    // idempotency window on the WS-bound (== commit) relay.
+    const wsBrowser = browserFor(commitRelay, "live");
+    const r1 = await commit(wsBrowser, gatewayRelay, commitRelay, "tail-1", 0.27);
+    const head1 = r1.body.ok === true ? r1.body.commit!.position : (() => { throw new Error("tail-1 not committed"); })();
+    const r2 = await commit(wsBrowser, gatewayRelay, commitRelay, "tail-2", 0.31);
+    const head2 = r2.body.ok === true ? r2.body.commit!.position : (() => { throw new Error("tail-2 not committed"); })();
+    expect(head2.seq).toBeGreaterThan(head1.seq);
+
+    // Persist the relay tail exactly as the dev server does after a commit, then
+    // EVICT the relay (the restart): rebuild a fresh relay from the world snapshot
+    // and rehydrate its tail from the store.
+    repo.saveRelayTail("the_dubspace", JSON.stringify(serializeShadowRelayTail(commitRelay)));
+    const evicted = makeRelays();
+    gatewayRelay = evicted.gatewayRelay;
+    commitRelay = evicted.commitRelay;
+    const persisted = repo.loadRelayTail("the_dubspace");
+    expect(persisted).not.toBeNull();
+    hydrateShadowRelayTail(commitRelay, JSON.parse(persisted!) as SerializedShadowRelayTail);
+
+    // Idempotency survived the eviction: replaying tail-2's intent on a fresh
+    // browser bound to the rehydrated relay returns the cached reply and does NOT
+    // re-commit (the head does not advance).
+    const headAfterRehydrate = commitRelay.commit_scope.head.seq;
+    // The SPA keeps its node identity across a reconnect, so the replay envelope
+    // carries the SAME idempotency key (`${from} ${id}`) the rehydrated
+    // recently_seen/recent_replies remembers. A new node id would be a fresh key
+    // that (correctly) misses the cache, so reuse the original "live" node.
+    const reconnectedBrowser = browserFor(commitRelay, "live");
+    const replayEncoded = encodeExecutorIntentEnvelope({ node: reconnectedBrowser.node, turn: {
+      id: "tail-2", route: "sequenced", scope: "the_dubspace", session: session.id, actor: session.actor,
+      target: "the_dubspace", verb: "set_control", args: ["delay_1", "wet", 0.31], persistence: "durable", token
+    }, turnId: "tail-2" });
+    const replayReceipt = receiveShadowBrowserEnvelopeReceipt(reconnectedBrowser, replayEncoded);
+    expect(replayReceipt.fresh).toBe(false);   // the rehydrated recently_seen remembers it
+    const replay = await commit(reconnectedBrowser, gatewayRelay, commitRelay, "tail-2", 0.31);
+    expect(replay.body.ok).toBe(true);
+    expect(commitRelay.commit_scope.head.seq).toBe(headAfterRehydrate);  // no double commit
+
+    // Reconnect catch-up frame-replays from the rehydrated accepted-frame tail: a
+    // browser that last saw head1 gets a delta transfer replaying tail-2.
+    const transfer = buildShadowBrowserCatchupTransferForBrowser(reconnectedBrowser, "the_dubspace", head1);
+    expect(transfer.mode).toBe("delta");
+    if (transfer.mode !== "delta") throw new Error("expected a delta (frame-replay) transfer");
+    expect(transfer.applied.map((frame) => frame.position.seq)).toContain(head2.seq);
+    repo.close();
   });
 
   it("decodeTurnIntentCall extracts the call and preserves live vs durable", () => {

@@ -51,6 +51,7 @@ import {
   mergeAuthorityIntoRelayCache,
   type ShadowRelayCache
 } from "../core/shadow-relay-cache";
+import { hydrateShadowRelayTail } from "../core/shadow-relay-tail";
 import { encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
 import { stableShadowJson } from "../core/shadow-cell-version";
 import { hashSource } from "../core/source-hash";
@@ -1442,21 +1443,26 @@ export class CommitScopeDO {
       idempotency_window_ms: Number(meta.idempotency_window_ms)
     });
     relay.commit_scope.head = JSON.parse(meta.head) as ShadowScopeHead;
-    relay.accepted_frames = sqlRows<{ body: string }>(this.state.storage.sql.exec(
-      "SELECT body FROM v2_commit_scope_accepted_frame ORDER BY scope, seq"
-    )).map((row) => JSON.parse(row.body) as ShadowCommitAccepted);
-    relay.transcript_tail = sqlRows<{ body: string }>(this.state.storage.sql.exec(
-      "SELECT body FROM v2_commit_scope_transcript_tail ORDER BY scope, seq, hash"
-    )).map((row) => JSON.parse(row.body) as EffectTranscript);
-    relay.recently_seen = new Map(sqlRows<{ idempotency_key: string; seen_at: number }>(this.state.storage.sql.exec(
-      "SELECT idempotency_key, seen_at FROM v2_commit_scope_seen ORDER BY seen_at"
-    )).map((row) => [decodeStorageKey(row.idempotency_key), Number(row.seen_at)]));
-    // Reply envelopes are capped separately from seen keys. Persisting them
-    // costs one hot-path row, but preserves reply-idempotency when a client
+    // Reconstruct the relay's durable tail through the holder-neutral seam, the
+    // same definition localdev rehydrates from. Each field is read from its own
+    // SQL table (the CommitScopeDO transport); the assignment back onto the relay
+    // is shared. Reply envelopes are capped separately from seen keys; persisting
+    // them costs one hot-path row but preserves reply-idempotency when a client
     // retries after the CommitScopeDO hibernates and rehydrates.
-    relay.recent_replies = new Map(sqlRows<{ idempotency_key: string; body: string }>(this.state.storage.sql.exec(
-      "SELECT idempotency_key, body FROM v2_commit_scope_reply ORDER BY updated_at"
-    )).map((row) => [decodeStorageKey(row.idempotency_key), JSON.parse(row.body) as ShadowEnvelope<WooValue>]));
+    hydrateShadowRelayTail(relay, {
+      accepted_frames: sqlRows<{ body: string }>(this.state.storage.sql.exec(
+        "SELECT body FROM v2_commit_scope_accepted_frame ORDER BY scope, seq"
+      )).map((row) => JSON.parse(row.body) as ShadowCommitAccepted),
+      transcript_tail: sqlRows<{ body: string }>(this.state.storage.sql.exec(
+        "SELECT body FROM v2_commit_scope_transcript_tail ORDER BY scope, seq, hash"
+      )).map((row) => JSON.parse(row.body) as EffectTranscript),
+      recently_seen: sqlRows<{ idempotency_key: string; seen_at: number }>(this.state.storage.sql.exec(
+        "SELECT idempotency_key, seen_at FROM v2_commit_scope_seen ORDER BY seen_at"
+      )).map((row) => [decodeStorageKey(row.idempotency_key), Number(row.seen_at)]),
+      recent_replies: sqlRows<{ idempotency_key: string; body: string }>(this.state.storage.sql.exec(
+        "SELECT idempotency_key, body FROM v2_commit_scope_reply ORDER BY updated_at"
+      )).map((row) => [decodeStorageKey(row.idempotency_key), JSON.parse(row.body) as ShadowEnvelope<WooValue>])
+    });
     return relay;
   }
 

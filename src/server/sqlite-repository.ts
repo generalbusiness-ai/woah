@@ -518,6 +518,26 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
     this.db.prepare("INSERT OR REPLACE INTO world_meta(key, value) VALUES (?, ?)").run(key, value);
   }
 
+  // Persist a commit scope's serialized relay tail (the shared
+  // SerializedShadowRelayTail JSON). Replaces any prior row for the scope, so the
+  // stored tail always reflects the latest accepted commit.
+  saveRelayTail(scope: ObjRef, body: string): void {
+    this.db
+      .prepare("INSERT OR REPLACE INTO v2_relay_tail(scope, body, updated_at) VALUES (?, ?, ?)")
+      .run(scope, body, Date.now());
+  }
+
+  // Load a commit scope's persisted relay tail JSON, or null if none stored. The
+  // caller parses it into a SerializedShadowRelayTail and feeds hydrateShadowRelayTail.
+  loadRelayTail(scope: ObjRef): string | null {
+    const row = this.db.prepare("SELECT body FROM v2_relay_tail WHERE scope = ?").get(scope) as Row | undefined;
+    return row?.body ?? null;
+  }
+
+  deleteRelayTail(scope: ObjRef): void {
+    this.db.prepare("DELETE FROM v2_relay_tail WHERE scope = ?").run(scope);
+  }
+
   close(): void {
     this.db.close();
   }
@@ -537,7 +557,21 @@ export class LocalSQLiteRepository implements WorldRepository, ObjectRepository 
     }
     this.db.exec(SQL_SCHEMA_SCRIPT);
     this.ensurePropertyDefMetadataColumn();
+    this.ensureRelayTailTable();
     this.db.exec(`PRAGMA user_version = ${LOCAL_SQLITE_SCHEMA_VERSION}`);
+  }
+
+  // The v2 relay's durable tail (idempotency seen/reply window + the accepted-
+  // frame/transcript reconnect tail) is persisted per commit scope so it survives
+  // a dev-server restart — the localdev analogue of a Cloudflare CommitScopeDO
+  // hibernating and rehydrating. This table is deliberately OUTSIDE the shared
+  // SQL_SCHEMA_SCRIPT (which the Cloudflare cf-repository also runs) and outside
+  // SQL_DELETE_TABLES (so a full `save(world)` snapshot rewrite does not wipe it):
+  // it is localdev-only relay state, not world state.
+  private ensureRelayTailTable(): void {
+    this.db.exec(
+      "CREATE TABLE IF NOT EXISTS v2_relay_tail (scope TEXT PRIMARY KEY, body TEXT NOT NULL, updated_at INTEGER NOT NULL)"
+    );
   }
 
   private ensurePropertyDefMetadataColumn(): void {
