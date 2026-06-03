@@ -773,7 +773,7 @@ export async function executeAuthoritativeShadowTurnCall(
     // on the next attempt instead of grinding the whole repair budget against
     // the same stale rows.
     const repairTransfer = conflict?.reason === "read_version_mismatch"
-      ? buildShadowReadMismatchRepairTransfer(node, run.transcript, conflict, input.commitScope)
+      ? buildShadowReadMismatchRepairTransfer(run.transcript, conflict, input.commitScope)
       : undefined;
     return {
       ok: false,
@@ -977,7 +977,7 @@ export async function executeShadowTurnCallOrNeedState(
     // selection or a missing scope yields no transfer (undefined), preserving
     // the prior behavior for those paths.
     const repairTransfer = conflict?.reason === "read_version_mismatch" && selectedCommitScope
-      ? buildShadowReadMismatchRepairTransfer(node, run.transcript, conflict, selectedCommitScope)
+      ? buildShadowReadMismatchRepairTransfer(run.transcript, conflict, selectedCommitScope)
       : undefined;
     return {
       ok: false,
@@ -1587,13 +1587,16 @@ function buildShadowCommitWarmTransfer(
 // provenance rules apply uniformly. Returns undefined when the scope cannot
 // source the cells (no serialized state / empty closure), leaving the prior
 // loop-until-budget behavior unchanged for those degenerate cases.
-function buildShadowReadMismatchRepairTransfer(
-  node: ShadowExecutionNode,
+// Exported so the planned-transcript commit path (shadow-browser-node, the path
+// the MCP gateway actually uses) can build the SAME owner-current repair transfer
+// as the execution paths here. Both reach a read_version_mismatch conflict from
+// submitShadowCommit; the difference is only whether the verb was re-executed or
+// a planned transcript was validated.
+export function buildShadowReadMismatchRepairTransfer(
   transcript: EffectTranscript,
   conflict: ShadowCommitConflict,
   commitScope: ShadowCommitScope
 ): ShadowCellPageTransfer | undefined {
-  void node;
   const mismatched = conflict.mismatched_read_cells ?? [];
   if (mismatched.length === 0) return undefined;
   const serialized = serializedFor(commitScope, { reason: "version_mismatch_repair" });
