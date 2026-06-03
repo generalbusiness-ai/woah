@@ -383,9 +383,15 @@ function pinboardLayoutState(note: any): Record<string, unknown> {
 }
 
 export function registerWooObservationHandlers(registry: ObservationRegistry): void {
+  // All handlers use route "both" + liveProjection "canonical": a co-present
+  // peer receives another user's committed board mutation as a LIVE fanout
+  // event (not a sequenced applied frame), so a sequenced-only reducer would
+  // never update the peer's board — the cross-user-sharing gap. The mutation is
+  // authoritative, so its live delivery folds into canonical projection.
   registry.observation({
     types: ["pin_moved", "note_moved", "pin_resized", "note_resized"],
-    route: "sequenced",
+    route: "both",
+    liveProjection: "canonical",
     reduce: (draft, envelope) => {
       const obs = envelope.observation;
       const pin = String(obs.pin ?? obs.id ?? "");
@@ -404,7 +410,8 @@ export function registerWooObservationHandlers(registry: ObservationRegistry): v
   });
   registry.observation({
     types: ["pin_recolored", "note_color_changed"],
-    route: "sequenced",
+    route: "both",
+    liveProjection: "canonical",
     reduce: (draft, envelope) => {
       const obs = envelope.observation;
       const pin = String(obs.pin ?? obs.note ?? obs.id ?? "");
@@ -418,7 +425,8 @@ export function registerWooObservationHandlers(registry: ObservationRegistry): v
   // handler so non-board surfaces also see the update.
   registry.observation({
     types: ["note_edited"],
-    route: "sequenced",
+    route: "both",
+    liveProjection: "canonical",
     reduce: (draft, envelope) => {
       const note = String(envelope.observation.note ?? envelope.observation.pin ?? envelope.observation.id ?? "");
       if (note) draft.patchCatalogState(note, "pinboard_note", { text: envelope.observation.text });
@@ -426,7 +434,8 @@ export function registerWooObservationHandlers(registry: ObservationRegistry): v
   });
   registry.observation({
     types: ["note_writers_changed"],
-    route: "sequenced",
+    route: "both",
+    liveProjection: "canonical",
     reduce: (draft, envelope) => {
       const note = String(envelope.observation.note ?? envelope.observation.pin ?? envelope.observation.id ?? "");
       if (!note) return;
@@ -438,7 +447,8 @@ export function registerWooObservationHandlers(registry: ObservationRegistry): v
   });
   registry.observation({
     types: ["note_added"],
-    route: "sequenced",
+    route: "both",
+    liveProjection: "canonical",
     reduce: (draft, envelope) => {
       const note = envelope.observation.note;
       if (!note || typeof note !== "object" || Array.isArray(note)) return;
@@ -457,7 +467,8 @@ export function registerWooObservationHandlers(registry: ObservationRegistry): v
   });
   registry.observation({
     types: ["pin_removed", "note_deleted"],
-    route: "sequenced",
+    route: "both",
+    liveProjection: "canonical",
     reduce: (draft, envelope) => {
       const id = String(envelope.observation.pin ?? envelope.observation.note ?? envelope.observation.id ?? "");
       if (id) {
@@ -470,7 +481,8 @@ export function registerWooObservationHandlers(registry: ObservationRegistry): v
   });
   registry.observation({
     types: ["pinboard_entered", "pinboard_left"],
-    route: "sequenced",
+    route: "both",
+    liveProjection: "canonical",
     reduce: (draft, envelope) => {
       const board = String(envelope.observation.board ?? "");
       const actor = String(envelope.observation.actor ?? "");
@@ -482,7 +494,8 @@ export function registerWooObservationHandlers(registry: ObservationRegistry): v
   });
   registry.observation({
     types: ["notes_cleared"],
-    route: "sequenced",
+    route: "both",
+    liveProjection: "canonical",
     reduce: (draft, envelope) => {
       for (const id of Array.isArray(envelope.observation.notes) ? envelope.observation.notes : []) {
         if (typeof id === "string" && id) draft.clearCatalogState(id, "pinboard_note");

@@ -837,7 +837,13 @@ export function registerWooObservationHandlers(registry: ObservationRegistry): v
   ];
   registry.observation({
     types: STRUCTURAL_TYPES,
-    route: "sequenced",
+    // route "both" + canonical: a co-present peer receives another user's
+    // committed structural mutation as a LIVE fanout event, not a sequenced
+    // applied frame, so a sequenced-only reducer never updates the peer's tree.
+    // The committed mutation is authoritative, so fold the live delivery into
+    // canonical projection (same shape as the pinboard board handlers).
+    route: "both",
+    liveProjection: "canonical",
     reduce: (draft, envelope) => {
       // Keep these projection patches aligned with applyObservation above;
       // optimistic frames use only this path and accepted frames use both.
