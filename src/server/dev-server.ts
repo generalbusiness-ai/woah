@@ -775,6 +775,14 @@ async function handleV2ShadowFrame(
     const receipt = receiveShadowBrowserEnvelopeReceipt(turnBrowser, encoded);
     const stateReply = handleShadowBrowserStateTransferEnvelope(turnBrowser, receipt);
     if (stateReply) {
+      // A state-transfer envelope records itself in the relay's recently_seen /
+      // recent_replies idempotency cache (shadow-browser-node). CommitScopeDO
+      // persists those rows via saveEnvelopeDelta for fresh state-transfer
+      // envelopes; localdev must do the same, or a dev-server restart loses the
+      // seen/reply record and a client retry of the transfer is treated as new.
+      // Persist before acking the client, for the same ordering reason as the
+      // durable-turn path above. Best-effort (persistDevV2RelayTail swallows).
+      persistDevV2RelayTail(turnBrowser.relay.commit_scope.scope);
       ws.send(encodeEnvelope(stateReply));
       return;
     }
@@ -810,18 +818,25 @@ async function handleV2ShadowFrame(
         node: `${turnBrowser.node}:exec`,
         onMetric: emitDevMetric
       });
-      ws.send(encodeEnvelope(wsReply));
-      await sendDevV2Fanout(turnBrowser, wsReply);
       // Persist two relays' tails: the WS-bound relay holds the reply-idempotency
       // cache keyed by the SPA's intent id (so a retry after restart does not
       // re-commit), and the commit-scope relay holds the accepted-frame/transcript
       // reconnect tail. For a same-scope turn these coincide; a B6 relocation
       // plans/caches on the call scope but commits at the moved object's scope.
+      //
+      // Persist BEFORE ws.send / fanout — parity with CommitScopeDO, which saves
+      // (saveFullIfNeeded / saveEnvelopeDelta) ahead of fanout and the response.
+      // The commit is already materialized inside executeDevV2DurableTurnWsReply,
+      // so if we acked the client first (ws.send) and then died before persisting,
+      // a post-restart retry on that intent id would re-commit. Persisting first
+      // closes that window to the I/O-free gap between materialize and persist.
       const wsTailScopes = new Set<ObjRef>([turnBrowser.relay.commit_scope.scope]);
       if (submitted?.kind === "submitted" && submitted.reply?.ok && submitted.reply.commit) {
         wsTailScopes.add(submitted.reply.commit.position.scope);
       }
       for (const tailScope of wsTailScopes) persistDevV2RelayTail(tailScope);
+      ws.send(encodeEnvelope(wsReply));
+      await sendDevV2Fanout(turnBrowser, wsReply);
       return;
     }
     const reply = await handleShadowBrowserTurnExecEnvelope(turnBrowser, receipt, { onMetric: emitDevMetric });

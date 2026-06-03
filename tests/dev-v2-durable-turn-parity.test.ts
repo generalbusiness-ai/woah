@@ -507,7 +507,7 @@ describe("dev v2 durable turn — CF contract parity", () => {
     // re-commit (the head does not advance).
     const headAfterRehydrate = commitRelay.commit_scope.head.seq;
     // The SPA keeps its node identity across a reconnect, so the replay envelope
-    // carries the SAME idempotency key (`${from} ${id}`) the rehydrated
+    // carries the SAME idempotency key (`${from}\u0000${id}`) the rehydrated
     // recently_seen/recent_replies remembers. A new node id would be a fresh key
     // that (correctly) misses the cache, so reuse the original "live" node.
     const reconnectedBrowser = browserFor(commitRelay, "live");
