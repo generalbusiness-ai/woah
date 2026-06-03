@@ -94,7 +94,7 @@ import {
   shadowLiveEventMatchesPeerScope
 } from "../core/v2-fanout-projection";
 import { runShadowApply, type ShadowApplyTarget } from "../core/v2-shadow-apply";
-import { fanOutHostWrites } from "../core/object-host-write-through";
+import { fanOutHostWrites, partitionProjectionWritesByHost } from "../core/object-host-write-through";
 import {
   V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED,
   buildExecutionCapsule,
@@ -5329,42 +5329,13 @@ export class PersistentObjectDO {
     });
   }
 
-  private async projectionWritesByHost(
+  private projectionWritesByHost(
     world: WooWorld,
     scope: ObjRef,
     writes: readonly ProjectionWrite[],
     fallbackHost: string
   ): Promise<Map<string, ProjectionWrite[]>> {
-    const byHost = new Map<string, ProjectionWrite[]>();
-    const add = async (hostKey: string, write: ProjectionWrite): Promise<void> => {
-      if (!hostKey) return;
-      const list = byHost.get(hostKey) ?? [];
-      list.push(write);
-      byHost.set(hostKey, list);
-    };
-    for (const write of writes) {
-      switch (write.table) {
-        case "objects":
-        case "tombstones":
-          await add(await this.resolveObjectHostForWorld(world, write.key, fallbackHost), write);
-          break;
-        case "logs":
-        case "snapshots":
-          await add(await this.resolveObjectHostForWorld(world, write.key.space, fallbackHost), write);
-          break;
-        case "parked_tasks":
-          await add(write.op === "upsert"
-            ? await this.resolveObjectHostForWorld(world, write.row.parked_on, fallbackHost)
-            : await this.resolveObjectHostForWorld(world, scope, fallbackHost), write);
-          break;
-        case "sessions":
-        case "counters":
-        case "tool_surfaces":
-          await add(fallbackHost, write);
-          break;
-      }
-    }
-    return byHost;
+    return partitionProjectionWritesByHost(writes, scope, fallbackHost, (id) => this.resolveObjectHostForWorld(world, id, fallbackHost));
   }
 
   private async deliverMcpCommitFanout(

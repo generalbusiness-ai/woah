@@ -76,6 +76,9 @@ const DEV_WORLD_HOST = "world";
 // (timeout/rejection) so tests can drive the partial-fanout / E_RETRY contract
 // without Cloudflare.
 export type DevHostWriteThroughOptions = {
+  // Invoked before each remote host's in-process apply; throwing simulates an
+  // object-host RPC failure (timeout/rejection) so tests can drive the
+  // partial-fanout / E_RETRY contract without Cloudflare.
   onRemoteForward?: (hostKey: string) => void | Promise<void>;
 };
 
@@ -86,11 +89,22 @@ export async function materializeDevV2CommitLocally(
   options: DevHostWriteThroughOptions = {}
 ): Promise<void> {
   const routeHost = new Map(world.objectRoutes().map((route) => [route.id, route.host] as const));
+  const resolveHost = (id: ObjRef): string => routeHost.get(id) ?? DEV_WORLD_HOST;
+  const localHostKey = resolveHost(scope);
+  const forwardHook = async (host: string): Promise<void> => {
+    if (options.onRemoteForward) await options.onRemoteForward(host);
+  };
+
+  // localdev materializes in transcript mode: apply the accepted transcript per
+  // touched host through the shared fan-out (local apply + in-process forward +
+  // E_RETRY). Projection-mode parity (branching on commit.projection_delta like
+  // CF's writeThroughProjectionWritesToObjectHosts) is deferred — see
+  // notes/2026-06-03-object-host-write-through-seam.md.
   const createdIds = new Set(transcript.creates.map((create) => create.object));
   const hosts = new Set<string>();
   const addHostFor = (id: ObjRef | null | undefined): void => {
     if (!id) return;
-    hosts.add(routeHost.get(id) ?? DEV_WORLD_HOST);
+    hosts.add(resolveHost(id));
   };
 
   addHostFor(scope);
@@ -109,7 +123,6 @@ export async function materializeDevV2CommitLocally(
 
   // The scope's host plays the "local" DO; every other touched host is reached
   // through an in-process forward, mirroring CF's local-apply + RPC-fanout shape.
-  const localHostKey = routeHost.get(scope) ?? DEV_WORLD_HOST;
   const slicesByHost = new Map<string, EffectTranscript>();
   for (const host of Array.from(hosts).sort()) slicesByHost.set(host, transcript);
   const applyToHost = (host: string): void => {
@@ -125,7 +138,7 @@ export async function materializeDevV2CommitLocally(
     onMetric: (event) => world.recordMetric(event),
     applyLocal: () => applyToHost(localHostKey),
     forwardRemote: async (host) => {
-      if (options.onRemoteForward) await options.onRemoteForward(host);
+      await forwardHook(host);
       applyToHost(host);
     }
   });

@@ -42,14 +42,36 @@ runtime-specific transport stays in the caller.
   with the local slice already applied (the "accepted but write-through partially
   failed, retry" shape). See `tests/object-host-write-through.test.ts`.
 
-## Deliberately deferred (follow-ups)
+## Projection-mode parity — partition extracted, branch deferred (2026-06-03)
 
-- **Projection-mode parity in localdev.** localdev still materializes in
-  transcript mode (`applyCommittedShadowTranscriptToHost`) even when the commit
-  carries `projection_delta`; CF takes the projection-writes branch. Aligning
-  localdev to branch on `projection_delta` (and sharing a `projectionWritesByHost`
-  partition) would exercise per-host projection routing locally. Bigger change to
-  materialize semantics — left for a follow-up.
+`projectionWritesByHost` is now shared: `partitionProjectionWritesByHost(writes,
+scope, fallbackHost, resolveHost)` in `object-host-write-through.ts`, and CF's
+`PersistentObjectDO.projectionWritesByHost` delegates to it (byte-identical;
+test:worker 202). This is the partition half of projection-mode parity, ready for
+localdev to use.
+
+**localdev projection-mode branch is NOT landed.** Attempted it (localdev
+branching on `commit.projection_delta` → `world.applyProjectionWrites` fan-out)
+and surfaced two real latent issues to fix first:
+
+1. **`applyProjectionWrites` sessions clobber live sockets.** `hydrateSession`
+   always resets `attachedSockets`/`lastInputAt`; a sessions projection write onto
+   a live session would drop the open WS. Needs: preserve live runtime state when
+   the session already exists, before localdev can use projection-mode.
+2. **`mergeScopedProjectionObject` drops created members from contents.** It
+   rebuilds `contents` from `existing + contents-writes + moves` but never adds
+   `creates` whose `location` is the container (only `children` for
+   `create.parent`). A created note/item is missing from its room's contents
+   projection on a host materializing via projection rows. Latent CF-relevant bug.
+
+**Validation blocker:** the e2e that would prove projection-mode parity for object
+creation — `pinboard shares created notes…` / `outliner shares committed items…`
+— is **pre-existing-failing on main** (`062b2fb` and `f86a2b0`), in transcript
+mode, before any of this work. It cannot currently distinguish a projection-mode
+regression from the standing breakage. That cross-user tool-space sharing failure
+should be triaged (real bug vs stale/flaky — these e2e are not in
+`npm test`/`test:full`) before landing projection-mode parity.
+
 - **Route lag.** `resolveHost` is static in localdev; a time-of-check/time-of-use
   route change mid-fanout is not yet simulated. The `onRemoteForward` hook is the
   place to add it.

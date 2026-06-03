@@ -18,6 +18,54 @@
 
 import { wooError, type MetricEvent, type ObjRef } from "./types";
 import { normalizeError } from "./world";
+import type { ProjectionWrite } from "./projection-delta";
+
+// Resolve the object-host that owns an id. Async on CF (Directory lookup), sync
+// on localdev (route map). The same routing both runtimes use to partition a
+// commit's writes by owning host.
+export type HostResolver = (id: ObjRef) => string | Promise<string>;
+
+// Partition a commit's projection writes by the host that owns each row, so each
+// host receives only the rows it is authoritative for. Mirrors the table→host
+// routing both runtimes need: object/tombstone rows route by their object id;
+// log/snapshot rows by their space; parked tasks by their parked_on (or the
+// scope on delete); sessions/counters/tool-surfaces stay on the fallback
+// (gateway) host. Empty/falsy host keys are dropped.
+export async function partitionProjectionWritesByHost(
+  writes: readonly ProjectionWrite[],
+  scope: ObjRef,
+  fallbackHost: string,
+  resolveHost: HostResolver
+): Promise<Map<string, ProjectionWrite[]>> {
+  const byHost = new Map<string, ProjectionWrite[]>();
+  const add = (hostKey: string, write: ProjectionWrite): void => {
+    if (!hostKey) return;
+    const list = byHost.get(hostKey) ?? [];
+    list.push(write);
+    byHost.set(hostKey, list);
+  };
+  for (const write of writes) {
+    switch (write.table) {
+      case "objects":
+      case "tombstones":
+        add(await resolveHost(write.key), write);
+        break;
+      case "logs":
+      case "snapshots":
+        add(await resolveHost(write.key.space), write);
+        break;
+      case "parked_tasks":
+        add(write.op === "upsert" ? await resolveHost(write.row.parked_on) : await resolveHost(scope), write);
+        break;
+      case "sessions":
+      case "counters":
+      case "tool_surfaces":
+        add(fallbackHost, write);
+        break;
+    }
+  }
+  return byHost;
+}
 
 // The local materialization a write-through reports back to the commit path:
 // the host that applied locally (so the caller can skip re-applying it) plus
