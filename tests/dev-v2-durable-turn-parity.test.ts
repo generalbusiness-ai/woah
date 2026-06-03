@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { authoritativePlanningWorld } from "../src/core/planning-world";
 import { installVerb } from "../src/core/authoring";
 import { createWorld, createWorldFromSerialized } from "../src/core/bootstrap";
-import { buildShadowTurnIntentEnvelope, createShadowBrowserClient, createShadowBrowserRelayShim, handleShadowBrowserTurnExecEnvelope, receiveShadowBrowserEnvelopeReceipt, shadowBrowserEnvelope, shadowBrowserSessionBearer } from "../src/core/shadow-browser-node";
+import { buildShadowBrowserCatchupTransferForBrowser, buildShadowTurnIntentEnvelope, createShadowBrowserClient, createShadowBrowserRelayShim, handleShadowBrowserTurnExecEnvelope, receiveShadowBrowserEnvelopeReceipt, shadowBrowserEnvelope, shadowBrowserSessionBearer } from "../src/core/shadow-browser-node";
 import { encodeEnvelope } from "../src/core/shadow-envelope";
 import { serializedFor } from "../src/core/shadow-commit-scope";
 import { runShadowTurnCall, type ShadowTurnCall } from "../src/core/shadow-turn-call";
@@ -12,7 +12,7 @@ import { decodeTurnIntentCall, devV2BrowserProfileTurnReply, executeDevV2Durable
 import { shadowTurnKeyFromTranscript } from "../src/core/turn-key";
 import type { ExecutorCallInput } from "../src/core/executor";
 import type { ShadowRelayCache } from "../src/core/shadow-relay-cache";
-import type { ObjRef } from "../src/core/types";
+import type { ObjRef, WooValue } from "../src/core/types";
 
 // The dev primitive is scope-aware (matching CF's per-scope ensureRestV2Relay /
 // v2CommitScopePost): it resolves the gateway/commit relay for whatever scope
@@ -399,6 +399,44 @@ describe("dev v2 durable turn — CF contract parity", () => {
     expect(second.reply.body.ok).toBe(true);
     // No second commit: the scope head did not advance again.
     expect(h.commitRelay.commit_scope.head.seq).toBe(headAfterFirst);
+  });
+
+  it("WS reconnect catch-up: a stale lastKnownHead frame-replays the missed turns (delta transfer)", async () => {
+    // Item-4 parity: a reconnecting browser opens with the head it last saw; the
+    // relay must frame-replay the intervening accepted turns from its retained
+    // tail (the CF checkpoint-tail frame-transfer path), not re-send a full
+    // projection. localdev shares buildShadowBrowserCatchupTransfer with CF, so
+    // this exercises the same catch-up decision in-process.
+    const h = wsReplyHarness(true, "set_control", "dev-ws-recon");
+    const resolvers = fixedResolvers("the_dubspace", h.gatewayRelay, h.commitRelay);
+    const token = shadowBrowserSessionBearer({ id: h.wsBrowser.session as string, actor: h.wsBrowser.actor });
+    const commit = async (id: string, wet: number) => {
+      const call = {
+        id, route: "sequenced" as const, scope: "the_dubspace" as ObjRef, session: h.wsBrowser.session as string,
+        actor: h.wsBrowser.actor, target: "the_dubspace" as ObjRef, verb: "set_control",
+        args: ["delay_1", "wet", wet] as WooValue[], persistence: "durable" as const, token
+      };
+      const encoded = encodeExecutorIntentEnvelope({ node: h.wsBrowser.node, turn: { ...call }, turnId: id });
+      const receipt = receiveShadowBrowserEnvelopeReceipt(h.wsBrowser, encoded);
+      const { reply } = await executeDevV2DurableTurnWsReply({ world: h.world, ...resolvers, browser: h.wsBrowser, receipt, call, node: `dev:exec-${id}` });
+      if (reply.body.ok !== true || !reply.body.commit) throw new Error(`commit ${id} failed`);
+      return reply.body.commit.position;
+    };
+    const head1 = await commit("recon-1", 0.27);
+    const head2 = await commit("recon-2", 0.31);
+    expect(head2.seq).toBeGreaterThan(head1.seq);
+
+    // Reconnect knowing only head1 → delta transfer that frame-replays turn 2.
+    const transfer = buildShadowBrowserCatchupTransferForBrowser(h.wsBrowser, "the_dubspace", head1);
+    expect(transfer.mode).toBe("delta");
+    if (transfer.mode !== "delta") throw new Error("expected a delta (frame-replay) transfer");
+    expect(transfer.applied.map((frame) => frame.position.seq)).toContain(head2.seq);
+    expect(transfer.applied.every((frame) => frame.position.seq > head1.seq)).toBe(true);
+    expect(transfer.transcript_tail.length).toBe(transfer.applied.length);
+
+    // Reconnect already at the current head → no frames to replay.
+    const current = buildShadowBrowserCatchupTransferForBrowser(h.wsBrowser, "the_dubspace", head2);
+    if (current.mode === "delta") expect(current.applied).toHaveLength(0);
   });
 
   it("decodeTurnIntentCall extracts the call and preserves live vs durable", () => {
