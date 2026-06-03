@@ -663,18 +663,23 @@ async function devRestV2Turn(input: Parameters<NonNullable<RestProtocolHost["exe
     }
   });
 
+  // Persist the commit relay's tail after the accepted commit so the idempotency
+  // window + reconnect frame-tail survive a dev-server restart. The commit scope
+  // is the B6-selected scope on the reply, which may differ from `scope`.
+  //
+  // Persist BEFORE fanout — parity with CommitScopeDO and the WS durable path:
+  // the commit is already materialized, so persisting first ensures a restart
+  // after fanout (or after returning `frame` to the REST client) cannot lose the
+  // idempotency reply / frame tail for an applied commit and re-commit on retry.
+  if (submitted.kind === "submitted" && submitted.reply?.ok && submitted.reply.commit) {
+    persistDevV2RelayTail(submitted.reply.commit.position.scope);
+  }
   // Fan the accepted turn out to co-present peer sockets (live events) and
   // re-sync commit-scope peers' projections — the CF-shaped affected-scope
   // recipient routing.
   if (submitted.kind === "submitted" && submitted.replyEnvelope) {
     const origin = v2ShadowBrowser(node, token, input.session, scope);
     await sendDevV2Fanout(origin, submitted.replyEnvelope);
-  }
-  // Persist the commit relay's tail after the accepted commit so the idempotency
-  // window + reconnect frame-tail survive a dev-server restart. The commit scope
-  // is the B6-selected scope on the reply, which may differ from `scope`.
-  if (submitted.kind === "submitted" && submitted.reply?.ok && submitted.reply.commit) {
-    persistDevV2RelayTail(submitted.reply.commit.position.scope);
   }
   return frame;
 }
