@@ -30,7 +30,6 @@ import {
   createShadowBrowserClient,
   createShadowBrowserRelayShim,
   disposeShadowBrowserNode,
-  handleShadowBrowserStateTransferEnvelope,
   handleShadowBrowserTurnExecEnvelope,
   openShadowBrowserScope,
   receiveShadowBrowserEnvelopeReceipt,
@@ -52,6 +51,7 @@ import {
   decodeTurnIntentCall,
   decodeTurnIntentForRecovery,
   devV2BrowserProfileTurnReply,
+  executeDevV2StateTransferWsReply,
   executeDevV2DurableTurnFrame,
   executeDevV2DurableTurnWsReply,
   materializeDevV2CommitLocally,
@@ -778,16 +778,12 @@ async function handleV2ShadowFrame(
       ? v2ShadowBrowser(browser.node, token, session, callScope!)
       : browser;
     const receipt = receiveShadowBrowserEnvelopeReceipt(turnBrowser, encoded);
-    const stateReply = handleShadowBrowserStateTransferEnvelope(turnBrowser, receipt);
+    const stateReply = executeDevV2StateTransferWsReply({
+      browser: turnBrowser,
+      receipt,
+      persistRelayTail: persistDevV2RelayTail
+    });
     if (stateReply) {
-      // A state-transfer envelope records itself in the relay's recently_seen /
-      // recent_replies idempotency cache (shadow-browser-node). CommitScopeDO
-      // persists those rows via saveEnvelopeDelta for fresh state-transfer
-      // envelopes; localdev must do the same, or a dev-server restart loses the
-      // seen/reply record and a client retry of the transfer is treated as new.
-      // Persist before acking the client, for the same ordering reason as the
-      // durable-turn path above. Best-effort (persistDevV2RelayTail swallows).
-      persistDevV2RelayTail(turnBrowser.relay.commit_scope.scope);
       ws.send(encodeEnvelope(stateReply));
       return;
     }

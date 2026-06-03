@@ -39,7 +39,7 @@ import {
   type V2FanoutPeer
 } from "../core/v2-fanout-projection";
 import { decodeEnvelope, encodeEnvelope, type ShadowEnvelope, type ShadowEnvelopeAuth } from "../core/shadow-envelope";
-import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
+import type { ShadowStateTransfer, ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import {
   executorAuthorityPayload,
   submitTurnIntent,
@@ -54,6 +54,7 @@ import {
 } from "../core/shadow-relay-cache";
 import {
   createShadowBrowserClient,
+  handleShadowBrowserStateTransferEnvelope,
   handleShadowBrowserTurnExecEnvelope,
   receiveShadowBrowserEnvelopeReceipt,
   shadowBrowserReplyEnvelopeForReceipt,
@@ -456,6 +457,20 @@ export type DevV2DurableWsReplyResult = {
   reply: ShadowEnvelope<ShadowTurnExecReply>;
   submitted?: SubmitTurnIntentResult<DevV2GatewayClient, ExecutorEnvelopeResult>;
 };
+
+export function executeDevV2StateTransferWsReply(input: {
+  browser: ShadowBrowserNode;
+  receipt: ShadowBrowserEnvelopeReceipt;
+  persistRelayTail: (scope: ObjRef) => void;
+}): ShadowEnvelope<ShadowStateTransfer> | null {
+  const reply = handleShadowBrowserStateTransferEnvelope(input.browser, input.receipt);
+  if (!reply) return null;
+  // State-transfer requests update the shared idempotency window/reply cache.
+  // Persist before the socket ack so a restart after the client sees the reply
+  // still replays the same cached transfer instead of treating the retry as new.
+  input.persistRelayTail(input.browser.relay.commit_scope.scope);
+  return reply;
+}
 
 export async function executeDevV2DurableTurnWsReply(input: DevV2DurableWsReplyInput): Promise<DevV2DurableWsReplyResult> {
   // Idempotency: a replayed intent (the relay already saw this idempotency key)

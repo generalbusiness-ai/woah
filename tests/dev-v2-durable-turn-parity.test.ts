@@ -3,12 +3,12 @@ import { describe, expect, it } from "vitest";
 import { authoritativePlanningWorld } from "../src/core/planning-world";
 import { installVerb } from "../src/core/authoring";
 import { createWorld, createWorldFromSerialized } from "../src/core/bootstrap";
-import { buildShadowBrowserCatchupTransferForBrowser, buildShadowTurnIntentEnvelope, createShadowBrowserClient, createShadowBrowserRelayShim, handleShadowBrowserStateTransferEnvelope, handleShadowBrowserTurnExecEnvelope, receiveShadowBrowserEnvelopeReceipt, shadowBrowserEnvelope, shadowBrowserSessionBearer } from "../src/core/shadow-browser-node";
+import { buildShadowBrowserCatchupTransferForBrowser, buildShadowTurnIntentEnvelope, createShadowBrowserClient, createShadowBrowserRelayShim, handleShadowBrowserTurnExecEnvelope, receiveShadowBrowserEnvelopeReceipt, shadowBrowserEnvelope, shadowBrowserSessionBearer } from "../src/core/shadow-browser-node";
 import { encodeEnvelope } from "../src/core/shadow-envelope";
 import { serializedFor } from "../src/core/shadow-commit-scope";
 import { runShadowTurnCall, type ShadowTurnCall } from "../src/core/shadow-turn-call";
 import { encodeExecutorIntentEnvelope } from "../src/core/executor";
-import { decodeTurnIntentCall, devV2BrowserProfileTurnReply, executeDevV2DurableTurnFrame, executeDevV2DurableTurnWsReply, executeInProcessV2DurableTurn } from "../src/server/dev-v2-helpers";
+import { decodeTurnIntentCall, devV2BrowserProfileTurnReply, executeDevV2DurableTurnFrame, executeDevV2DurableTurnWsReply, executeDevV2StateTransferWsReply, executeInProcessV2DurableTurn } from "../src/server/dev-v2-helpers";
 import { shadowTurnKeyFromTranscript } from "../src/core/turn-key";
 import { hydrateShadowRelayTail, serializeShadowRelayTail, type SerializedShadowRelayTail } from "../src/core/shadow-relay-tail";
 import { LocalSQLiteRepository } from "../src/server/sqlite-repository";
@@ -530,15 +530,13 @@ describe("dev v2 durable turn — CF contract parity", () => {
     repo.close();
   });
 
-  it("state-transfer reply idempotency survives relay eviction (dev WS state-transfer persists its tail)", async () => {
+  it("state-transfer WS reply persists its tail before ack and survives relay eviction", async () => {
     // Item-4 hardening for the 4a finding-2 fix: the dev WS state-transfer branch
-    // now persists the relay tail (dev-server.ts) so a cell-page repair reply —
-    // cached in recent_replies — is returned verbatim after a dev-server restart
-    // instead of rebuilt. The turn-exec eviction case above does NOT exercise the
-    // state-transfer envelope type, and the type matters: serializeShadowRelayTail
-    // casts recent_replies as turn-exec envelopes (shadow-relay-tail.ts), so a
-    // state-transfer reply (a different body shape) must still JSON-round-trip
-    // through persist+hydrate and replay from the rehydrated cache.
+    // delegates to executeDevV2StateTransferWsReply, which persists the relay
+    // tail before returning a socket reply for the caller to ack. The turn-exec
+    // eviction case above does NOT exercise the state-transfer envelope type, so
+    // this pins both the persist callback and the JSON round-trip for a cached
+    // cell-page repair reply.
     const repo = new LocalSQLiteRepository(":memory:");
     const world = createWorld({ repository: repo });
     const session = world.auth("guest:dev-state-tail");
@@ -551,7 +549,7 @@ describe("dev v2 durable turn — CF contract parity", () => {
       node: "dev:commit-state-tail", scope: "the_dubspace", serialized: world.exportWorld(), deployment: "local-dev"
     });
     // The SPA keeps its node identity across reconnect, so both receipts carry the
-    // same idempotency key (`${from} ${id}`); reuse one node string.
+    // same idempotency key (`${from}\u0000${id}`); reuse one node string.
     const browserFor = (relay: ShadowRelayCache) => createShadowBrowserClient({
       node: "browser:state-tail", scope: "the_dubspace", actor: session.actor, session: session.id, relay, token
     });
@@ -577,13 +575,21 @@ describe("dev v2 durable turn — CF contract parity", () => {
     const envelope = shadowBrowserEnvelope(liveBrowser, request.kind, request, "state-xfer-env-1");
     const firstReceipt = receiveShadowBrowserEnvelopeReceipt(liveBrowser, encodeEnvelope(envelope));
     expect(firstReceipt.fresh).toBe(true);
-    const firstReply = handleShadowBrowserStateTransferEnvelope(liveBrowser, firstReceipt);
+    const persistedScopes: ObjRef[] = [];
+    const firstReply = executeDevV2StateTransferWsReply({
+      browser: liveBrowser,
+      receipt: firstReceipt,
+      persistRelayTail: (scope) => {
+        persistedScopes.push(scope);
+        repo.saveRelayTail(scope, JSON.stringify(serializeShadowRelayTail(commitRelay)));
+      }
+    });
     if (!firstReply) throw new Error("expected a state-transfer reply");
+    expect(persistedScopes).toEqual(["the_dubspace"]);
     expect(commitRelay.recent_replies.has(firstReceipt.idempotency_key)).toBe(true);
 
-    // Persist the tail (as the dev WS state-transfer branch now does) and EVICT
-    // (the restart): rebuild a fresh relay and rehydrate its tail from the store.
-    repo.saveRelayTail("the_dubspace", JSON.stringify(serializeShadowRelayTail(commitRelay)));
+    // EVICT (the restart): rebuild a fresh relay and rehydrate from the store
+    // populated by the helper's pre-ack persist callback above.
     commitRelay = makeCommitRelay();
     const persisted = repo.loadRelayTail("the_dubspace");
     expect(persisted).not.toBeNull();
@@ -597,7 +603,11 @@ describe("dev v2 durable turn — CF contract parity", () => {
     const reconnected = browserFor(commitRelay);
     const replayReceipt = receiveShadowBrowserEnvelopeReceipt(reconnected, encodeEnvelope(envelope));
     expect(replayReceipt.fresh).toBe(false);
-    const replayReply = handleShadowBrowserStateTransferEnvelope(reconnected, replayReceipt);
+    const replayReply = executeDevV2StateTransferWsReply({
+      browser: reconnected,
+      receipt: replayReceipt,
+      persistRelayTail: (scope) => repo.saveRelayTail(scope, JSON.stringify(serializeShadowRelayTail(commitRelay)))
+    });
     expect(replayReply).toEqual(firstReply);
     repo.close();
   });

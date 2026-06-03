@@ -1,9 +1,9 @@
 # 2026-06-03 — Item 4: reconnect / idempotency / checkpoint-tail (drift convergence #4)
 
-Fourth item of the localdev↔CF drift-convergence sequence
-(see [2026-06-02-localdev-cf-drift-convergence.md](2026-06-02-localdev-cf-drift-convergence.md):
+Fourth item of the localdev↔CF drift-convergence sequence; see
+[2026-06-02-localdev-cf-drift-convergence.md](2026-06-02-localdev-cf-drift-convergence.md):
 1 durable-turn-path, 2 fanout-topology, 3 object-host-write-through, **4 this**,
-5 browser-projection-holder). Goal of the sequence: localdev must exercise the
+5 browser-projection-holder. Goal of the sequence: localdev must exercise the
 same machinery as CF so a bug surfaces in a dev test, not only in a CF smoke run.
 
 ## What item 4 landed
@@ -20,12 +20,11 @@ same machinery as CF so a bug surfaces in a dev test, not only in a CF smoke run
   re-commit on retry.
 - **4 hardening (this work).** Added a dev-parity test for **state-transfer reply
   idempotency across relay eviction** (`tests/dev-v2-durable-turn-parity.test.ts`).
-  The prior eviction test only covered the *turn-exec* envelope type; the
-  state-transfer (cell-page repair) reply is a *different body shape*, and
-  `serializeShadowRelayTail` casts `recent_replies` as turn-exec envelopes — so a
-  state-transfer reply must still JSON-round-trip through persist+hydrate and
-  replay from the rehydrated cache. This is the test the 4a finding-2 fix (persist
-  on the WS state-transfer branch) was missing.
+  The prior eviction test only covered the *turn-exec* reply path. The new test
+  drives the WS state-transfer helper's pre-ack persist callback, then rebuilds
+  the relay from SQLite and proves the cached cell-page repair reply is replayed
+  from the rehydrated `recent_replies` window. This is the test the 4a finding-2
+  fix (persist on the WS state-transfer branch) was missing.
 
 ## What is covered, and where
 
