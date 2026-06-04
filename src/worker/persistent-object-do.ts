@@ -1591,7 +1591,10 @@ export class PersistentObjectDO {
           envelope: async (scope, body): Promise<McpV2EnvelopeResult> => {
             world.touchSessionInput(body.session);
             const result = await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(scope, "/v2/envelope", body as unknown as Record<string, unknown>);
-            const delivery = await this.deliverV2Fanout(world, scope, result, body.session, body.node, { localMcpLiveHandled: true });
+            const delivery = await this.deliverV2Fanout(world, scope, result, body.session, body.node, {
+              localMcpLiveHandled: true,
+              deferMcpCommitFanout: true
+            });
             this.applyGatewayProjectionCacheFromReply(result.reply, "mcp");
             return {
               ...result,
@@ -5229,7 +5232,7 @@ export class PersistentObjectDO {
     result: CommitScopeEnvelopeResponse,
     originSessionId?: string | null,
     originNode?: string | null,
-    options: { localMcpLiveHandled?: boolean } = {}
+    options: { localMcpLiveHandled?: boolean; deferMcpCommitFanout?: boolean } = {}
   ): Promise<V2FanoutDelivery> {
     const fanout = result.fanout ?? [];
     if (!result.reply) {
@@ -5259,9 +5262,14 @@ export class PersistentObjectDO {
     const observations = "observations" in frame && frame.observations.length > 0
       ? frame.observations
       : reply.commit.observations;
-    const mcpAudience = await this.mcpFanoutAudience(world, reply.commit.position.scope, reply.transcript, observations);
     await this.sendV2CommitTranscriptFanout(world, turnReplyEnvelope, deliveredNodes, originNode ?? null);
-    await this.deliverMcpCommitFanout(world, scope, fanout, { ...reply.commit, observations }, reply.transcript, originSessionId ?? null, mcpAudience);
+    const commit = { ...reply.commit, observations };
+    if (options.deferMcpCommitFanout === true) {
+      await this.deferMcpCommitFanout(world, scope, fanout, commit, reply.transcript, originSessionId ?? null, observations);
+      return { localHostMaterialized };
+    }
+    const mcpAudience = await this.mcpFanoutAudience(world, reply.commit.position.scope, reply.transcript, observations);
+    await this.deliverMcpCommitFanout(world, scope, fanout, commit, reply.transcript, originSessionId ?? null, mcpAudience);
     return { localHostMaterialized, mcpAudience };
   }
 
@@ -5551,7 +5559,8 @@ export class PersistentObjectDO {
     commit: ShadowCommitAccepted,
     transcript: EffectTranscript,
     originSessionId: string | null,
-    audience: McpFanoutAudience
+    audience: McpFanoutAudience,
+    options: { deferRemote?: boolean } = {}
   ): Promise<void> {
     // Query Directory freshly for scopes whose presence/contents changed so
     // co-present MCP sessions receive the accepted transcript before they plan
@@ -5615,6 +5624,10 @@ export class PersistentObjectDO {
           console.warn("woo.mcp_fanout.failed", { host, scope, error: normalizeError(err) });
         }
       })).then(() => undefined);
+      if (options.deferRemote === false) {
+        await task;
+        return;
+      }
       // Durable commit fanout is necessary for remote MCP queues, but the
       // originator's accepted commit is already durable at this point. Run the
       // cross-shard replay after the response so slow/cold subscriber shards do
@@ -5626,6 +5639,34 @@ export class PersistentObjectDO {
         await task;
       }
     }
+  }
+
+  private async deferMcpCommitFanout(
+    world: WooWorld,
+    scope: ObjRef,
+    fanout: Array<{ node: string; envelope: string }>,
+    commit: ShadowCommitAccepted,
+    transcript: EffectTranscript,
+    originSessionId: string | null,
+    observations: readonly Observation[]
+  ): Promise<void> {
+    // MCP callers already have their accepted reply once the commit and
+    // object-host write-through are durable. Directory audience lookup is a
+    // best-effort delivery aid for other MCP sessions, and production can spend
+    // seconds or hit the read timeout there under shard churn. Keep it out of
+    // the /mcp response wall; later opens/replays repair missed delivery.
+    const task = (async () => {
+      const audience = await this.mcpFanoutAudience(world, commit.position.scope, transcript, observations);
+      await this.deliverMcpCommitFanout(world, scope, fanout, commit, transcript, originSessionId, audience, { deferRemote: false });
+    })().catch((err) => {
+      console.warn("woo.mcp_fanout.deferred_failed", { scope, error: normalizeError(err) });
+    });
+    const waitUntil = (this.state as { waitUntil?: (promise: Promise<unknown>) => void }).waitUntil;
+    if (typeof waitUntil === "function") {
+      waitUntil.call(this.state, task);
+      return;
+    }
+    await task;
   }
 
   private async mcpShardHostsForScopes(scopes: ObjRef[]): Promise<string[]> {

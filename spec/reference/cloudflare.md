@@ -891,7 +891,8 @@ CommitScope fanout recipients and shards with sessions in scopes touched by
 transcript moves, creates, contents writes, or presence-list writes. Remote
 MCP shard delivery is outside the submit critical path: after the accepted
 commit is durable and local write-through/fanout has completed, the origin may
-schedule `/__internal/mcp-commit-fanout` with Durable Object `waitUntil`.
+schedule the Directory audience/shard lookup and `/__internal/mcp-commit-fanout`
+with Durable Object `waitUntil`.
 Runtimes without a background-lifetime primitive may fall back to synchronous
 delivery, but they must not weaken the durable object-host write-through rule
 above. Failed remote MCP fanout is logged and retried by later replay/open

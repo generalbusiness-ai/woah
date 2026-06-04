@@ -486,6 +486,61 @@ describe("v2 Worker fan-out helpers", () => {
     }
   });
 
+  it("defers MCP commit fanout audience lookup for MCP-origin envelopes", async () => {
+    const gatewayState = new WaitUntilDurableObjectState("mcp-gateway-0");
+    const gateway = Object.create(PersistentObjectDO.prototype) as Record<string, any>;
+    gateway.state = gatewayState as unknown as DurableObjectState;
+    gateway.revokedApiKeyIds = vi.fn(() => new Set<string>());
+    gateway.writeThroughV2CommitToObjectHosts = vi.fn(async () => null);
+    gateway.cleanupNewlyRevokedApiKeys = vi.fn(async () => undefined);
+    gateway.sendV2Fanout = vi.fn(() => new Set<string>());
+    gateway.sendV2CommitTranscriptFanout = vi.fn(async () => undefined);
+    let releaseAudience!: (audience: Record<string, never>) => void;
+    const blockedAudience = new Promise<Record<string, never>>((resolve) => {
+      releaseAudience = resolve;
+    });
+    gateway.mcpFanoutAudience = vi.fn(async () => await blockedAudience);
+    gateway.deliverMcpCommitFanout = vi.fn(async () => undefined);
+
+    const world = createWorld();
+    const alice = world.auth("guest:mcp-defer-alice");
+    const observation = { type: "entered", source: "the_chatroom", actor: alice.actor, ts: 1 };
+    const transcript = durableTranscript("mcp-deferred-fanout-transcript", "the_chatroom", alice.id, alice.actor, [observation]);
+    const reply = encodeEnvelope(durableReplyEnvelope("mcp-deferred-fanout", "the_chatroom", "mcp:alice", alice.id, alice.actor, transcript));
+    const delivery = await (gateway as unknown as {
+      deliverV2Fanout(
+        world: WooWorld,
+        scope: ObjRef,
+        result: { reply: string | null; fanout: Array<{ node: string; envelope: string }> },
+        originSessionId?: string | null,
+        originNode?: string | null,
+        options?: { deferMcpCommitFanout?: boolean }
+      ): Promise<Record<string, unknown>>;
+    }).deliverV2Fanout(world, "the_chatroom", { reply, fanout: [] }, alice.id, "mcp:alice", { deferMcpCommitFanout: true });
+
+    expect(delivery).toEqual({ localHostMaterialized: null });
+    expect(gateway.mcpFanoutAudience).toHaveBeenCalledOnce();
+    expect(gateway.deliverMcpCommitFanout).not.toHaveBeenCalled();
+    expect(gatewayState.waitUntilPromises).toHaveLength(1);
+    let settled = false;
+    gatewayState.waitUntilPromises[0].then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    releaseAudience({});
+    await gatewayState.drainWaitUntil();
+    expect(gateway.deliverMcpCommitFanout).toHaveBeenCalledWith(
+      world,
+      "the_chatroom",
+      [],
+      expect.objectContaining({ kind: "woo.commit.accepted.shadow.v1", observations: [observation] }),
+      transcript,
+      alice.id,
+      {},
+      { deferRemote: false }
+    );
+  });
+
   it("supplements durable same-scope browser fan-out from gateway sockets when commit-scope memory lacks peer nodes", async () => {
     class SocketState extends FakeDurableObjectState {
       override getWebSockets(): WebSocket[] {
