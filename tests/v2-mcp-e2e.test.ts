@@ -6,7 +6,7 @@ import { serializedFor } from "../src/core/shadow-commit-scope";
 import { decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "../src/core/shadow-envelope";
 import { createShadowBrowserRelayShim, markShadowBrowserRelaySerializedChanged } from "../src/core/shadow-browser-node";
 import type { ShadowTurnExecReply } from "../src/core/shadow-turn-exec";
-import type { ObjRef } from "../src/core/types";
+import type { MetricEvent, ObjRef } from "../src/core/types";
 import { McpGateway, type McpV2EnvelopeBody, type McpV2EnvelopeResult, type McpV2OpenBody } from "../src/mcp/gateway";
 import { CommitScopeDO } from "../src/worker/commit-scope-do";
 import { signInternalRequest } from "../src/worker/internal-auth";
@@ -112,7 +112,8 @@ describe("v2 MCP e2e", () => {
   });
 
   it("opens cross-scope planned-transcript commit scopes before building the envelope when capsule open is enabled", async () => {
-    const world = createWorld();
+    const metrics: MetricEvent[] = [];
+    const world = createWorld({ metricsHook: (event) => metrics.push(event) });
     const env = { WOO_INTERNAL_SECRET: "v2-mcp-secret" };
     const scopeStates = new Map<ObjRef, FakeDurableObjectState>();
     const scopes = new Map<ObjRef, CommitScopeDO>();
@@ -217,6 +218,24 @@ describe("v2 MCP e2e", () => {
       expect(expected?.seq).toBe(1);
       expect(actorPosts[actorEnvelopeIndex].body).toHaveProperty("planned_transcript_commit", true);
       expect(actorPosts[actorEnvelopeIndex].body).not.toHaveProperty("execution_capsule");
+      const enterTimings = metrics.filter((event): event is Extract<MetricEvent, { kind: "turn_phase_timing" }> =>
+        event.kind === "turn_phase_timing" &&
+        event.commit_scope === secondActor &&
+        event.target === "the_chatroom" &&
+        event.verb === "enter"
+      );
+      const secondEnterTiming = enterTimings[enterTimings.length - 1];
+      expect(secondEnterTiming?.ensure_detail_ms).toMatchObject({ "commit.session_open_cached": 0 });
+      expect(metrics).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          kind: "mcp_relocation_prewarm",
+          scope: "the_chatroom",
+          commit_scope: secondActor,
+          target: "the_chatroom",
+          verb: "enter",
+          status: "ok"
+        })
+      ]));
     } finally {
       for (const state of scopeStates.values()) state.close();
     }

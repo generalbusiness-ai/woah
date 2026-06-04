@@ -44,6 +44,21 @@ describe("analyze-data-path-costs", () => {
     expect(result.stdout).toContain("| commit_reply_replay | 1 | idempotency |");
   });
 
+  it("classifies MCP relocation prewarm metrics", () => {
+    const result = runAnalyzer({
+      kind: "mcp_relocation_prewarm",
+      scope: "the_chatroom",
+      commit_scope: "guest_1",
+      target: "the_chatroom",
+      verb: "enter",
+      ms: 12,
+      status: "ok"
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("| mcp_relocation_prewarm | 1 | request_wall_time |");
+  });
+
   it("classifies sampled browser metric logs as instrumentation volume", () => {
     const result = runAnalyzer({
       kind: "browser_metrics_log_sampled",
