@@ -63,8 +63,21 @@ describe("woo core", () => {
   it("exposes catalog-generic presentation builtins with substrate-only facts", async () => {
     const { world, session, actor } = authedWorld();
     const other = world.auth("guest:builtin-other");
+    const observer = world.auth("guest:builtin-observer");
+    world.sessions.get(observer.id)!.activeScope = "the_deck";
+    world.object(observer.actor).location = "the_deck";
+    world.object("the_chatroom").contents.delete(observer.actor);
+    world.object("the_deck").contents.add(observer.actor);
     await world.directCall("builtin-actor-enter", actor, "the_chatroom", "enter", [], { sessionId: session.id });
     await world.directCall("builtin-other-enter", other.actor, "the_chatroom", "enter", [], { sessionId: other.id });
+    world.setProp("the_chatroom", "session_subscribers", [
+      ...(world.getProp("the_chatroom", "session_subscribers") as WooValue[]),
+      { session: observer.id, actor: observer.actor } as unknown as WooValue
+    ]);
+    world.setProp("the_chatroom", "subscribers", [
+      ...(world.getProp("the_chatroom", "subscribers") as WooValue[]),
+      observer.actor
+    ]);
 
     world.createObject({ id: "builtin_visible_box", name: "Visible Box", parent: "$thing", owner: "$wiz", location: "the_chatroom" });
     world.setProp("builtin_visible_box", "description", "Visible to room look.");
@@ -79,6 +92,7 @@ describe("woo core", () => {
     expect(installVerb(world, actor, "builtin_probe", `verb :builtin_probe() rxd {
       return {
         present: present_actors("the_chatroom"),
+        active: active_actors("the_chatroom"),
         players: connected_players(),
         meta: session_metadata(actor),
         visible: visible_contents("the_chatroom"),
@@ -90,7 +104,9 @@ describe("woo core", () => {
     expect(probed.op).toBe("result");
     if (probed.op !== "result") return;
     const result = probed.result as Record<string, unknown>;
-    expect(result.present).toEqual(expect.arrayContaining([actor, other.actor]));
+    expect(result.present).toEqual(expect.arrayContaining([actor, other.actor, observer.actor]));
+    expect(result.active).toEqual(expect.arrayContaining([actor, other.actor]));
+    expect(result.active).not.toContain(observer.actor);
     expect(result.players).toEqual(expect.arrayContaining([actor, other.actor]));
     expect(result.visible).toEqual(expect.arrayContaining(["builtin_visible_box", "builtin_verb_box"]));
     expect(result.meta).toMatchObject({ connected: true });
@@ -1335,7 +1351,7 @@ describe("woo core", () => {
     const beforeRoster = before.seed.objects
       .find((obj) => obj.id === "$conversational")
       ?.verbs.find((verb) => verb.name === "room_roster");
-    expect(beforeRoster?.source).toContain("contents(this)");
+    expect(beforeRoster?.source).toContain("active_actors(this)");
 
     const current = gateway.ownVerbExact("$conversational", "room_roster");
     expect(current).toBeTruthy();

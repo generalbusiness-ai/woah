@@ -56,11 +56,15 @@ durable cells (`enter`, `go`/directions, `take`, `drop`, `give`) request
 resulting object/session location.
 
 `$room:room_roster()` is the catalog-facing answer to "who appears here" for
-embodied chat rooms. It lists actors physically contained by the room and
-enriches each row with the shared roster shape `{id, name, presence,
-idle_seconds?}`. `$room:live_audience(observation?)` is the separate delivery
-answer; it delegates to the substrate's observation audience rules and returns
-live subscribed session ids. Render/API code should use `room_roster()`, not
+embodied chat rooms. It lists actors with live sessions actively scoped to the
+room and enriches each row with the shared roster shape `{id, name, presence,
+idle_seconds?}`. Physical `contents` remains object placement, not the roster
+source, because projected room contents can retain stale disconnected guests;
+subscriber rows are delivery audience state and can include observers who are
+not visibly in the room.
+`$room:live_audience(observation?)` is the separate delivery answer; it
+delegates to the substrate's observation audience rules and returns live
+subscribed session ids. Render/API code should use `room_roster()`, not
 `subscribers`, for presentation.
 
 **Why direct, not sequenced.** Real-time chat is fire-and-forget; replaying the log to reconstruct utterances would impose a coordinated-write cost on every message. The space's sequenced log remains for state mutations that *do* need replay (a tasks catalog's `:claim`, `:transition_intent`); chat traffic flows past it.
@@ -89,7 +93,7 @@ A feature object (per [features.md](../../spec/semantics/features.md)) carrying 
 | `:look()` rxd | — | Thin wrapper over `this:look_at(this)`. The target owns `:look_self()`; the chat feature owns the private `looked` observation and text rendering. |
 | `:look_at(target)` rxd | obj | Dispatches `target:look_self()`, emits private `looked` to the caller, and returns the structured view. `look <target>` routes here even when the target has no `:look` wrapper. The `looked.room` field is the command room so clients route the output to the room panel; `looked.target` carries the object actually inspected. |
 | `:who()` rxd | — | Returns canonical roster rows and emits a private `who` observation to the caller with `roster`. |
-| `:room_roster()` rxd | — | Returns canonical room roster rows for embodied chat: physical occupants plus awake/idle/sleeping status. |
+| `:room_roster()` rxd | — | Returns canonical room roster rows for embodied chat: live active-scope occupants plus awake/idle/sleeping status. |
 | `:live_audience(observation?)` rxd | map? | Returns the live session audience for delivery using the substrate observation routing rules. |
 | `:enter(actor?)` | obj? | Moves the calling session into the room; when the room is itself contained in another room, `enter tub` resolves the contained room object and invokes this verb on it. Emits room-originated `entered` to the entered room and, when moving from another room, room-originated `left` to the old room. |
 | `:leave(actor?)` | obj? | Moves the calling session home and emits room-originated `left`. |

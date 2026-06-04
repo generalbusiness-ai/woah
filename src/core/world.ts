@@ -10103,6 +10103,28 @@ export class WooWorld {
     return Array.from(actors).sort();
   }
 
+  activeActorsIn(space: ObjRef): ObjRef[] {
+    const actors = new Set<ObjRef>();
+    const now = Date.now();
+    for (const session of this.sessions.values()) {
+      if (session.activeScope !== space) continue;
+      if (this.sessionExpired(session, now)) continue;
+      if (!this.objects.has(session.actor)) continue;
+      actors.add(session.actor);
+    }
+    const projected = this.presenceSessionsIn(space);
+    if (projected) {
+      const room = this.objects.get(space);
+      for (const [sessionId, actor] of projected) {
+        const session = this.sessions.get(sessionId);
+        if (!session || session.actor !== actor || this.sessionExpired(session, now)) continue;
+        if (!this.objects.has(actor) || !room?.contents.has(actor)) continue;
+        actors.add(actor);
+      }
+    }
+    return Array.from(actors).sort();
+  }
+
   async visibleContentsForActor(ctx: CallContext, objRef: ObjRef): Promise<ObjRef[]> {
     const items = await this.objectContents(objRef, ctx.hostMemo);
     const out: ObjRef[] = [];

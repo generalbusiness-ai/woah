@@ -624,6 +624,7 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
 
       const tubOutEffects: DeferredHostEffect[] = [];
       const tubOut = await roomB.directCall("tub-out", actor, "the_hot_tub", "out", [], {
+        sessionId: session.id,
         deferHostEffect: (effect) => tubOutEffects.push(effect)
       });
       expect(tubOut.op).toBe("result");
@@ -634,6 +635,7 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
 
       const westEffects: DeferredHostEffect[] = [];
       const west = await roomB.directCall("walk-west", actor, "the_deck", "west", [], {
+        sessionId: session.id,
         deferHostEffect: (effect) => westEffects.push(effect)
       });
       expect(west.op).toBe("result");
@@ -656,7 +658,7 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
         expect(observations.find((o) => o.type === "looked" && o.room === "the_chatroom")).toBeUndefined();
       }
 
-      const look = await roomA.directCall("look-after-west", actor, "the_chatroom", "look", []);
+      const look = await roomA.directCall("look-after-west", actor, "the_chatroom", "look", [], { sessionId: session.id });
       expect(look.op).toBe("result");
       if (look.op === "result") {
         const looked = look.observations.find((o) => o.type === "looked" && o.room === "the_chatroom");
@@ -1070,6 +1072,31 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       expect(world.getProp("the_chatroom", "subscribers")).toEqual([live.actor]);
       const rows = world.getProp("the_chatroom", "session_subscribers") as Array<{ actor: string }>;
       expect(rows.map((row) => row.actor)).toEqual([live.actor]);
+    } finally {
+      harness.cleanup();
+    }
+  });
+
+  it("omits disconnected guests from chat room roster even if contents are stale", async () => {
+    const harness = make();
+    try {
+      const world = harness.world;
+      const stale = world.auth("guest:conf-roster-stale");
+      const live = world.auth("guest:conf-roster-live");
+      await world.directCall("enter-stale-roster", stale.actor, "the_chatroom", "enter", [], { sessionId: stale.id });
+      await world.directCall("enter-live-roster", live.actor, "the_chatroom", "enter", [], { sessionId: live.id });
+
+      // Simulate the production failure mode: the physical room contents mirror
+      // still names an old guest, but its session row has gone away.
+      world.sessions.delete(stale.id);
+      expect(world.contentsOf("the_chatroom")).toContain(stale.actor);
+
+      const roster = await world.directCall("roster-stale-contents", live.actor, "the_chatroom", "room_roster", [], { sessionId: live.id });
+      expect(roster.op).toBe("result");
+      if (roster.op !== "result") return;
+      const ids = (roster.result as Array<{ id: string }>).map((row) => row.id);
+      expect(ids).toContain(live.actor);
+      expect(ids).not.toContain(stale.actor);
     } finally {
       harness.cleanup();
     }

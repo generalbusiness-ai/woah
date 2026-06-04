@@ -930,6 +930,7 @@ const VALID_BUILTINS = new Set([
   "idle_seconds",
   "describe_object",
   "present_actors",
+  "active_actors",
   "connected_players",
   "session_metadata",
   "visible_contents",
