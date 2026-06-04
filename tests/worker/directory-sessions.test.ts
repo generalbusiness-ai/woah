@@ -340,7 +340,7 @@ describe("DirectoryDO register-session dedup", () => {
     }
   });
 
-  it("purges stale MCP guest routes without deleting fresh or non-MCP sessions", async () => {
+  it("purges stale guest routes across transports without deleting fresh or non-guest sessions", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(T0);
     const { directory, cleanup } = makeDirectory();
@@ -378,11 +378,11 @@ describe("DirectoryDO register-session dedup", () => {
         mcp_shard: "mcp-gateway-2"
       });
 
-      const purged = await directory.fetch(await signed("/purge-stale-mcp-guest-sessions", { updated_before: T0 + 60_000 }));
+      const purged = await directory.fetch(await signed("/purge-stale-guest-sessions", { updated_before: T0 + 60_000 }));
       expect(purged.ok).toBe(true);
-      expect(await purged.json()).toMatchObject({ ok: true, removed: 1 });
+      expect(await purged.json()).toMatchObject({ ok: true, removed: 2 });
       expect(await resolve(directory, "sess_old_mcp_guest")).toBeNull();
-      expect(await resolve(directory, "sess_old_rest_guest")).toMatchObject({ actor: "$old_rest_guest" });
+      expect(await resolve(directory, "sess_old_rest_guest")).toBeNull();
       expect(await resolve(directory, "sess_old_mcp_bearer")).toMatchObject({ actor: "$old_bearer" });
       expect(await resolve(directory, "sess_fresh_mcp_guest")).toMatchObject({ actor: "$fresh_guest" });
     } finally {

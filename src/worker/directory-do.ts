@@ -174,10 +174,10 @@ export class DirectoryDO {
         return json({ ok: true, removed: this.purgeExpiredSessions(Date.now()) });
       }
 
-      if (request.method === "POST" && url.pathname === "/purge-stale-mcp-guest-sessions") {
+      if (request.method === "POST" && (url.pathname === "/purge-stale-guest-sessions" || url.pathname === "/purge-stale-mcp-guest-sessions")) {
         const body = await readJson(request);
         const updatedBefore = finitePositiveNumber(body.updated_before) ?? Date.now();
-        return json({ ok: true, removed: this.purgeStaleMcpGuestSessions(updatedBefore) });
+        return json({ ok: true, removed: this.purgeStaleGuestSessions(updatedBefore) });
       }
 
       if (request.method === "POST" && url.pathname === "/resolve-session") {
@@ -454,12 +454,10 @@ export class DirectoryDO {
     return before;
   }
 
-  private purgeStaleMcpGuestSessions(updatedBefore: number): number {
+  private purgeStaleGuestSessions(updatedBefore: number): number {
     const before = Number(firstValue(this.state.storage.sql.exec(
       `SELECT COUNT(*) AS count FROM session_route
         WHERE token_class = 'guest'
-          AND mcp_shard IS NOT NULL
-          AND mcp_shard != ''
           AND updated_at <= ?`,
       updatedBefore
     )) ?? 0);
@@ -467,8 +465,6 @@ export class DirectoryDO {
     this.state.storage.sql.exec(
       `DELETE FROM session_route
         WHERE token_class = 'guest'
-          AND mcp_shard IS NOT NULL
-          AND mcp_shard != ''
           AND updated_at <= ?`,
       updatedBefore
     );

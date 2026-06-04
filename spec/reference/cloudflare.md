@@ -785,11 +785,12 @@ wizard-gated `POST /api/admin/purge-inactive-guests` or Basic-auth-gated
 `POST /admin/purge-inactive-guests`; both run the same WORLD lifecycle reset
 and delete expired Directory session routes. Because MCP smoke and other
 stateless clients can strand unexpired guest rows after a client timeout, the
-operator purge also uses a short inactivity cutoff for detached MCP guest
-sessions: WORLD reaps matching guest sessions and Directory deletes matching
-`session_route` rows whose `updated_at` is older than the cutoff. This stricter
-rule is limited to the operator recovery path; normal request/session liveness
-continues to use the guest TTL and grace windows.
+operator purge also uses a short inactivity cutoff for detached guest sessions:
+WORLD reaps matching guest sessions and Directory deletes guest `session_route`
+rows whose `updated_at` is older than the cutoff, regardless of the transport
+that first registered the row. This stricter rule is limited to the operator
+recovery path; normal request/session liveness continues to use the guest TTL
+and grace windows.
 
 Sparse MCP session projection may include Directory-derived actor
 lineage/properties and scope presence rows as `projection` authority pages. It
