@@ -16,6 +16,7 @@ import {
 } from "./shadow-commit-scope";
 import {
   buildShadowCellPageTransfer,
+  buildShadowCommitWarmTransferFromSerialized,
   buildShadowReadMismatchRepairTransfer,
   createShadowExecutionNode,
   installShadowCachedObjectRecords,
@@ -2209,6 +2210,17 @@ function commitShadowBrowserPlannedTranscript(
   }
   noteShadowBrowserRelayCommitAccepted(browser.relay);
   publishShadowBrowserAcceptedFrame(browser.relay, commit, transcript);
+  // B7 / VTN12.1: planned-transcript commits are authoritative commit-scope
+  // accepts too. MCP/REST gateways commonly plan in one scope and commit at the
+  // actor/location owner; the accepted reply must therefore carry the same
+  // verifiable cache-fill as an executor-run accept, or the caller never warms
+  // its planning relay from this success path.
+  const warmTransfer = buildShadowCommitWarmTransferFromSerialized(
+    serializedFor(browser.relay.commit_scope, { reason: "planned_transcript_warm_transfer" }),
+    transcript,
+    commitScope.head,
+    request.call.session
+  );
   const reply: ShadowTurnExecReply = {
     kind: "woo.turn.exec.reply.shadow.v1",
     ok: true,
@@ -2217,7 +2229,8 @@ function commitShadowBrowserPlannedTranscript(
       ? { error: transcript.error as unknown as WooValue }
       : { result: transcript.result },
     transcript,
-    commit
+    commit,
+    ...(warmTransfer ? { state_transfer: warmTransfer } : {})
   };
   return {
     ok: true,

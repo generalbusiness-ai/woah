@@ -1553,6 +1553,17 @@ two-node conformance case (remote execute → install reply transfer → next tu
 local with zero further transfers) is gated by
 `tests/v2-state-transfer-warmfill.test.ts`.
 
+Server-side gateways that submit planned transcripts are part of the same
+contract. A planned-transcript commit accepted by its commit scope MUST attach
+the accepted-write `cell_pages` transfer, and MCP/REST gateways MUST install that
+transfer into their relay cache as `source:"cache"` before the next turn plans.
+MCP planning is warm-cache-first: it does not perform an unconditional pre-plan
+authority refresh on every turn. If the admission gate or local verb lookup
+proves the cache is missing state, the gateway performs a bounded pre-plan repair
+and retries; commit submission still carries a bounded authority payload for
+validation, usually sourced from the opened CommitScopeDO snapshot on the first
+envelope attempt.
+
 Browser relays also implement `mode: "projection"` and `mode: "delta"` for
 display/cache catch-up. Opening a scope installs a projection transfer instead
 of directly mutating the browser projection cache. After an accepted commit,

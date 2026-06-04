@@ -1545,22 +1545,34 @@ function buildShadowCommitWarmTransfer(
   session?: string | null
 ): ShadowCellPageTransfer | undefined {
   if (node.authoritative_state !== true || !node.serialized) return undefined;
+  return buildShadowCommitWarmTransferFromSerialized(node.serialized, transcript, head, session);
+}
+
+export function buildShadowCommitWarmTransferFromSerialized(
+  serialized: SerializedWorld,
+  transcript: EffectTranscript,
+  head: ShadowScopeHead,
+  session?: string | null
+): ShadowCellPageTransfer | undefined {
   const key = shadowTurnKeyFromTranscript(transcript);
   if (key.atom_hashes.length === 0) return undefined;
+  const capsule = head.scope === key.scope
+    ? {
+        head,
+        actor: key.actor,
+        session,
+        target: key.target,
+        verb: key.verb,
+        recipient: "*"
+      }
+    : undefined;
   const transfer = buildShadowCellPageTransfer({
-    serialized: node.serialized,
+    serialized,
     key,
     atom_hashes: key.atom_hashes,
     session,
     purpose: "accepted_write_cells",
-    capsule: {
-      head,
-      actor: key.actor,
-      session,
-      target: key.target,
-      verb: key.verb,
-      recipient: "*"
-    }
+    ...(capsule ? { capsule } : {})
   });
   if (transfer.atom_hashes.length === 0 && transfer.page_refs.length === 0 && transfer.inline_pages.length === 0) {
     return undefined;

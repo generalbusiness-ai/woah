@@ -7,7 +7,7 @@ import { decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "../src/core
 import { createShadowBrowserRelayShim, markShadowBrowserRelaySerializedChanged } from "../src/core/shadow-browser-node";
 import type { ShadowTurnExecReply } from "../src/core/shadow-turn-exec";
 import type { ObjRef } from "../src/core/types";
-import { McpGateway, type McpV2EnvelopeBody, type McpV2OpenBody } from "../src/mcp/gateway";
+import { McpGateway, type McpV2EnvelopeBody, type McpV2EnvelopeResult, type McpV2OpenBody } from "../src/mcp/gateway";
 import { CommitScopeDO } from "../src/worker/commit-scope-do";
 import { signInternalRequest } from "../src/worker/internal-auth";
 import { FakeDurableObjectState } from "./worker/fake-do";
@@ -117,6 +117,7 @@ describe("v2 MCP e2e", () => {
     const scopeStates = new Map<ObjRef, FakeDurableObjectState>();
     const scopes = new Map<ObjRef, CommitScopeDO>();
     const commitPosts: Array<{ scope: ObjRef; path: "/v2/open" | "/v2/envelope"; body: Record<string, unknown> }> = [];
+    const commitReplies: ShadowTurnExecReply[] = [];
     const stateFor = (commitScope: ObjRef): FakeDurableObjectState => {
       let state = scopeStates.get(commitScope);
       if (!state) {
@@ -154,7 +155,9 @@ describe("v2 MCP e2e", () => {
         },
         envelope: async (commitScope, body) => {
           commitPosts.push({ scope: commitScope, path: "/v2/envelope", body: body as unknown as Record<string, unknown> });
-          return await postCommitScope(scopeFor(commitScope), env, commitScope, "/v2/envelope", body);
+          const result = await postCommitScope<McpV2EnvelopeResult>(scopeFor(commitScope), env, commitScope, "/v2/envelope", body);
+          if (result.reply) commitReplies.push(decodeEnvelope(result.reply).body as ShadowTurnExecReply);
+          return result;
         }
       }
     });
@@ -183,6 +186,16 @@ describe("v2 MCP e2e", () => {
         arguments: { object: "the_chatroom", verb: "enter", args: [] }
       });
       expect(secondEnter.result.isError, JSON.stringify(secondEnter.result.structuredContent)).not.toBe(true);
+      const acceptedReply = commitReplies.find((reply) =>
+        reply.ok === true &&
+        reply.commit?.position.scope === secondActor &&
+        reply.transcript.call.verb === "enter"
+      );
+      expect(acceptedReply?.state_transfer).toMatchObject({
+        kind: "woo.state.transfer.shadow.v1",
+        mode: "cell_pages",
+        purpose: "accepted_write_cells"
+      });
 
       const actorPosts = commitPosts.filter((post) => post.scope === secondActor);
       const actorOpenIndex = actorPosts.findIndex((post) => post.path === "/v2/open");
@@ -373,7 +386,10 @@ describe("v2 MCP e2e", () => {
 
       expect(result.result.isError, JSON.stringify(result.result.structuredContent)).not.toBe(true);
       expect(envelopeCalls).toBe(2);
-      expect(authoritySnapshotFlags).toEqual([false, false, false, true, false, false]);
+      // B7 warm-cache-first MCP planning no longer pays the two unconditional
+      // pre-plan authority refreshes. The first commit refresh may use the
+      // CommitScopeDO snapshot fallback; the repair attempt must not reuse it.
+      expect(authoritySnapshotFlags).toEqual([false, false, true, false]);
     } finally {
       for (const state of scopeStates.values()) state.close();
     }

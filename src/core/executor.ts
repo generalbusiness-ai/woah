@@ -164,6 +164,12 @@ export type SubmitTurnIntentOptions<Client, Result extends ExecutorEnvelopeResul
   // local planning: repair/merge the known authority first so catalog lineage
   // and transitive refs are present before the VM can fail locally.
   prePlanAuthority?: boolean;
+  // B7 warm-cache-first callers do not pay the unconditional pre-plan refresh on
+  // every turn. They still need the same local planning repair when the
+  // admission gate or VM proves a missing object/cell (`E_NEED_STATE`/`E_OBJNF`)
+  // or sparse class/verb lineage (`E_VERBNF`).
+  // This keeps warm turns local while preserving bounded cold-miss repair.
+  repairPlanningAuthority?: boolean;
   submitEnvelope(scope: ObjRef, body: ExecutorEnvelopeBody): Promise<Result>;
   applyAuthority?(client: Client, authority: SerializedAuthoritySlice): void;
   // Adopt the authority's reported current head after a stale-head/version
@@ -342,6 +348,22 @@ function executorObjectIdsFromLocalPlanningFrame(frame: ErrorFrame): ObjRef[] {
   );
 }
 
+function isRepairableLocalPlanningLookupError(err: unknown): boolean {
+  const coded = err as { code?: unknown; message?: unknown } | null;
+  if (coded?.code === "E_VERBNF") return true;
+  const message = err instanceof Error
+    ? err.message
+    : typeof coded?.message === "string"
+    ? coded.message
+    : "";
+  return message.includes("E_VERBNF");
+}
+
+function isRepairableLocalPlanningLookupFrame(frame: ErrorFrame): boolean {
+  return frame.error.code === "E_VERBNF" ||
+    (frame.error.code === "E_INTERNAL" && (frame.error.message ?? "").includes("E_VERBNF"));
+}
+
 function executorObjectIdsFromNeedStateValue(raw: WooValue | undefined): ObjRef[] {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
   const missing = (raw as Record<string, WooValue>).missing_atoms;
@@ -511,6 +533,7 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
   let submitMs = 0;
   let phaseOutcome: "submitted" | "local_frame" | "error" = "error";
   let phaseCommitScope: ObjRef | null = null;
+  const repairPlanningAuthority = options.repairPlanningAuthority ?? options.prePlanAuthority === true;
   const emitPhaseTiming = (): void => {
     options.onMetric?.({
       kind: "turn_phase_timing",
@@ -543,6 +566,18 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       add(Date.now() - startedAt);
     }
   };
+  const basePlanningAuthorityObjectIds = (planningScope: ObjRef): ObjRef[] =>
+    options.authorityObjectIds?.(options.input, planningScope)
+      ?? executorAuthorityObjectIds(options.input, planningScope);
+  const planningAuthorityObjectIds = (planningScope: ObjRef): ObjRef[] => mergeExecutorObjectIds(
+    basePlanningAuthorityObjectIds(planningScope),
+    repairObjectIds
+  );
+  const refreshPlanningAuthority = async (planningScope: ObjRef, planningClient: Client): Promise<void> => {
+    authorityCalls += 1;
+    const authority = await timePhase((ms) => { authorityMs += ms; }, () => options.authorityPayload(planningScope, planningAuthorityObjectIds(planningScope), { phase: "pre_plan" }));
+    options.applyAuthority?.(planningClient, authority.authority);
+  };
   try {
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     phaseAttempts = attempt + 1;
@@ -555,14 +590,7 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     const turnId = options.input.id ?? options.nextTurnId(planningClient, attempt);
     const call = buildExecutorCall(options.input, turnId);
     if (options.prePlanAuthority) {
-      const prePlanAuthorityObjectIds = mergeExecutorObjectIds(
-        options.authorityObjectIds?.(options.input, planningScope)
-          ?? executorAuthorityObjectIds(options.input, planningScope),
-        repairObjectIds
-      );
-      authorityCalls += 1;
-      const prePlanAuthority = await timePhase((ms) => { authorityMs += ms; }, () => options.authorityPayload(planningScope, prePlanAuthorityObjectIds, { phase: "pre_plan" }));
-      options.applyAuthority?.(planningClient, prePlanAuthority.authority);
+      await refreshPlanningAuthority(planningScope, planningClient);
     }
     const serialized = await timePhase((ms) => { serializeMs += ms; }, () => options.clientSerialized?.(planningClient));
     if (!serialized) throw new Error("planned v2 turn gateway submission requires clientSerialized");
@@ -585,12 +613,18 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     } catch (err) {
       // Sparse MCP planning can discover a transitive object before the commit
       // executor sees it; repair that materialization miss and rerun the turn.
-      const missingObjectIds = options.prePlanAuthority
+      const missingObjectIds = repairPlanningAuthority
         ? executorObjectIdsFromLocalPlanningError(err)
         : [];
-      const nextRepairObjectIds = mergeExecutorObjectIds(repairObjectIds, missingObjectIds);
+      const repairIds = missingObjectIds.length > 0
+        ? missingObjectIds
+        : repairPlanningAuthority && isRepairableLocalPlanningLookupError(err)
+        ? basePlanningAuthorityObjectIds(planningScope)
+        : [];
+      const nextRepairObjectIds = mergeExecutorObjectIds(repairObjectIds, repairIds);
       if (attempt + 1 < maxAttempts && nextRepairObjectIds.length > repairObjectIds.length) {
         repairObjectIds = nextRepairObjectIds;
+        if (!options.prePlanAuthority) await refreshPlanningAuthority(planningScope, planningClient);
         continue;
       }
       throw err;
@@ -598,12 +632,18 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     if (planned.frame.op === "error") {
       // Catalog code may wrap the same materialization miss into a local error
       // frame. Treat it like guarded execution, but only for pre-plan repair.
-      const missingObjectIds = options.prePlanAuthority
+      const missingObjectIds = repairPlanningAuthority
         ? executorObjectIdsFromLocalPlanningFrame(planned.frame)
         : [];
-      const nextRepairObjectIds = mergeExecutorObjectIds(repairObjectIds, missingObjectIds);
+      const repairIds = missingObjectIds.length > 0
+        ? missingObjectIds
+        : repairPlanningAuthority && isRepairableLocalPlanningLookupFrame(planned.frame)
+        ? basePlanningAuthorityObjectIds(planningScope)
+        : [];
+      const nextRepairObjectIds = mergeExecutorObjectIds(repairObjectIds, repairIds);
       if (attempt + 1 < maxAttempts && nextRepairObjectIds.length > repairObjectIds.length) {
         repairObjectIds = nextRepairObjectIds;
+        if (!options.prePlanAuthority) await refreshPlanningAuthority(planningScope, planningClient);
         continue;
       }
       phaseOutcome = "local_frame";

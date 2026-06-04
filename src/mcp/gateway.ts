@@ -24,6 +24,7 @@ import { createShadowBrowserRelayShim } from "../core/shadow-browser-node";
 import {
   applyAcceptedFrameToDerivedRelayCache,
   applyAcceptedFrameToRelayCache,
+  installShadowAcceptedWriteTransferIntoRelayCache,
   installShadowCellPageTransferAsAuthority,
   mergeAuthorityIntoRelayCache,
   type ShadowRelayCache
@@ -657,7 +658,8 @@ export class McpGateway {
         persistence,
         token: entry.v2Token
       },
-      prePlanAuthority: true,
+      prePlanAuthority: false,
+      repairPlanningAuthority: true,
       maxAttempts: 8,
       ensureClient: async (submitScope, _attempt, context) => await this.ensureV2ScopeClient(entry, submitScope, {
         requireCommitScopeOpen: context.phase === "commit" && context.plannedTranscriptCommit
@@ -769,6 +771,9 @@ export class McpGateway {
     }
     if (reply.commit) {
       this.acceptV2Commit(client, reply, sessionId, result.local_host_materialized ?? null, result.accepted_audience);
+    }
+    if (reply.state_transfer?.mode === "cell_pages") {
+      installShadowAcceptedWriteTransferIntoRelayCache(client.relay, reply.state_transfer, { reason: "mcp_accepted_write_cache" });
     }
     const frame = mcpFrameFromTurnReply(scope, reply);
     if (!reply.commit && frame.op === "result") this.host.routeLiveEvents(frame, sessionId);

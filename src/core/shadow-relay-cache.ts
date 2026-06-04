@@ -260,3 +260,32 @@ export function installShadowCellPageTransferAsAuthority(
     clone: true
   });
 }
+
+// B7 / VTN12.1 accepted-write cache fill. Unlike the read-mismatch repair path
+// above, an accepted commit reply is a derived read-through for the caller. It
+// warms the next planning turn, but it MUST NOT become write authority. Stamp
+// every transferred page as `cache` and merge through the same provenance-aware
+// boundary used by authority slices.
+export function installShadowAcceptedWriteTransferIntoRelayCache(
+  relay: ShadowRelayCache,
+  transfer: ShadowCellPageTransfer,
+  options: { reason?: string } = {}
+): boolean {
+  if (transfer.purpose !== "accepted_write_cells") return false;
+  const slice: SerializedAuthorityCellSlice = {
+    kind: "woo.authority_slice.cells.shadow.v1",
+    sessions: transfer.sessions,
+    page_refs: transfer.page_refs.map((ref) => ({
+      ...structuredClone(ref),
+      source: "cache" as const
+    })),
+    inline_pages: transfer.inline_pages,
+    counters: transfer.counters,
+    tombstones: transfer.tombstones,
+    source_object_count: transfer.source_object_count
+  };
+  return mergeAuthorityIntoRelayCache(relay, slice, {
+    reason: options.reason ?? "accepted_write_cells_cache",
+    clone: true
+  });
+}

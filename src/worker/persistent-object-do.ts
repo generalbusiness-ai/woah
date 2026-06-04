@@ -68,6 +68,7 @@ import {
 import {
   applyAcceptedFrameToDerivedRelayCache,
   applyAcceptedFrameToRelayCache,
+  installShadowAcceptedWriteTransferIntoRelayCache,
   installShadowCellPageTransferAsAuthority,
   markShadowBrowserRelaySerializedChanged,
   mergeAuthorityIntoRelayCache,
@@ -1611,8 +1612,7 @@ export class PersistentObjectDO {
             await this.v2GatewayAuthorityPayload(world, extraObjectIds, {
               tolerateRemoteFailures: true,
               useCommitScopeSnapshotForRemoteAuthority:
-                authorityOptions?.useCommitScopeSnapshotForRemoteAuthority === true &&
-                !isMcpGatewayShardHost(this.durableHostKey()),
+                authorityOptions?.useCommitScopeSnapshotForRemoteAuthority === true,
               directorySessionScopes: authorityOptions?.directorySessionScopes,
               scopeContentExpansionRoots: authorityOptions?.scopeContentExpansionRoots,
               reconstructionReason: authorityOptions?.reconstructionReason,
@@ -4946,6 +4946,7 @@ export class PersistentObjectDO {
       // exec request. Movement commits at the moved object's location
       // authority (CA3), not through the withdrawn #placement authority.
       maxAttempts: 8,
+      repairPlanningAuthority: true,
       ensureClient: async (scope, attempt) => await this.ensureRestV2Relay(world, input, scope, token, attempt > 0),
       clientNode: (client) => client.node,
       clientHead: (client) => client.relay.commit_scope.head,
@@ -5034,6 +5035,9 @@ export class PersistentObjectDO {
       onMetric: (event) => world.recordMetric(event)
     });
     if (submitted.kind === "local_frame") return submitted.frame;
+    if (submitted.reply?.state_transfer?.mode === "cell_pages") {
+      installShadowAcceptedWriteTransferIntoRelayCache(submitted.client.relay, submitted.reply.state_transfer, { reason: "rest_accepted_write_cache" });
+    }
     await this.deliverV2Fanout(world, submitted.commitScope, submitted.result, input.session.id, submitted.client.node);
     if (!submitted.result.reply || !submitted.reply) throw wooError("E_INTERNAL", "v2 REST turn produced no reply");
     await this.applyV2CommittedTranscript(world, submitted.result.reply, input.session.id);

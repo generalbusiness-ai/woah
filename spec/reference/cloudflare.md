@@ -585,21 +585,23 @@ The canonical event union is `MetricEvent` in `src/core/types.ts`. That
 union is the source of truth for which kinds exist and which fields they
 carry; this spec only describes how those fields project onto AE slots.
 
-`authority_slice_reconstructed` partitions the authority-slice planning cost
-that used to appear as opaque `/mcp` wall time. Its `reason` value is written to
-`blobs[15]` and MUST distinguish warm turn refresh, cold open, missing-state
-repair, source-host slice service, warm checkpoint hit, warm checkpoint
-catch-up, and warm checkpoint repair. `object_count` and `page_count` size the
-served slice; the primary AE count slot uses the object count. This event is the
-gate for [cell-authority.md §CA11.1](../protocol/cell-authority.md#ca111-gateway-authority-checkpoints):
-healthy warm turns should move from `warm_turn_refresh` to
-`warm_checkpoint_hit`, same-scope projection tails should emit
-`warm_checkpoint_caught_up`, checkpoint coverage misses should emit
-`warm_checkpoint_repaired` only when the repaired checkpoint is stored and will
-turn the next matching request into `warm_checkpoint_hit`, first warm
-refreshes that seed a bounded checkpoint should emit
-`warm_checkpoint_seeded`, and
-stale-fallback/timeout/over-budget rows must not be stored as checkpoints.
+`authority_slice_reconstructed` partitions the authority-slice cost that used to
+appear as opaque `/mcp` wall time. Its `reason` value is written to `blobs[15]`
+and MUST distinguish warm turn refresh, cold open, missing-state repair,
+source-host slice service, warm checkpoint hit, warm checkpoint catch-up, and
+warm checkpoint repair. `object_count` and `page_count` size the served slice;
+the primary AE count slot uses the object count. After B7, warm MCP planning
+SHOULD NOT emit owner-fan-in `warm_turn_refresh` work before every turn; a
+one-attempt warm turn should have at most the bounded commit-refresh authority
+payload, usually with snapshot fallback on the first envelope attempt. This
+event remains the gate for [cell-authority.md §CA11.1](../protocol/cell-authority.md#ca111-gateway-authority-checkpoints):
+healthy warm turns should move away from repeated pre-plan `warm_turn_refresh`
+fan-in, same-scope projection tails should emit `warm_checkpoint_caught_up`,
+checkpoint coverage misses should emit `warm_checkpoint_repaired` only when the
+repaired checkpoint is stored and will turn the next matching request into
+`warm_checkpoint_hit`, first warm refreshes that seed a bounded checkpoint
+should emit `warm_checkpoint_seeded`, and stale-fallback/timeout/over-budget
+rows must not be stored as checkpoints.
 
 #### Sampling
 
@@ -792,11 +794,17 @@ owner live row has not been fetched, shards may include an empty actor
 and owner-authoritative rows outrank that placeholder and replace it before any
 durable movement state is trusted.
 
-During MCP pre-plan authority refresh, a sparse gateway shard may expand a
-target scope's direct `contents` to fetch owner authority for those contained
-objects, capped at 128 objects. This is a bounded identity/read repair for
-room-roster planning surfaces such as occupant names; it must not become global
-enumeration, and it is not applied to commit-refresh fan-in.
+MCP turns plan warm-cache-first. A sparse gateway shard does not perform an
+unconditional pre-plan authority refresh on every turn. When the PlanningWorld
+admission gate or local verb lookup proves the relay cache is missing state, the
+repair path may expand a target scope's direct `contents` to fetch owner
+authority for those contained objects, capped at 128 objects. This is a bounded
+identity/read repair for room-roster planning surfaces such as occupant names;
+it must not become global enumeration, and it is not applied to commit-refresh
+fan-in. After an accepted MCP or REST commit, the gateway installs any
+`accepted_write_cells` `cell_pages` transfer from the reply into the relay cache
+as `source:"cache"` so the following turn can plan from the accepted state
+without pre-plan owner fan-in.
 
 `CommitScopeDO` is the durable authority for v2 scope heads. On first open for
 a scope it materializes the gateway-supplied authority seed into row-shaped DO

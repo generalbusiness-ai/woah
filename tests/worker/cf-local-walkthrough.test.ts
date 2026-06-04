@@ -204,6 +204,13 @@ describe("CF-local smoke walkthrough", () => {
         repairedInitialEnters,
         `initial cross-shard chatroom enters must converge on the first attempt; repair rounds reproduce the prod 20s timeout wall. Admission violations: ${admissionViolations.slice(0, 6).join(" | ")}`
       ).toEqual([]);
+      const prePlanRefreshInitialEnters = initialChatroomEnters
+        .filter((m) => Number(m.authority_calls) !== 1)
+        .map((m) => `${String(m.target)}:${String(m.verb)} attempts=${String(m.attempts)} auth_calls=${String(m.authority_calls)} total=${String(m.total_ms)}ms`);
+      expect(
+        prePlanRefreshInitialEnters,
+        "B7 warm-cache-first MCP turns must not pay both pre-plan and commit authority refresh; a one-attempt enter should need exactly the commit refresh"
+      ).toEqual([]);
       // Every phase field must be a finite number so the analyzer never charges NaN.
       for (const field of ["total_ms", "ensure_client_ms", "authority_ms", "serialize_ms", "plan_build_ms", "vm_ms", "submit_ms", "authority_calls", "attempts"]) {
         expect(typeof phaseTimings[0]![field], `turn_phase_timing.${field} must be numeric`).toBe("number");
