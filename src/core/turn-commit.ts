@@ -37,7 +37,7 @@ export function shadowCommitReceiptFromTouchedStateHashes(
   preStateHash: string,
   postStateHash: string,
   extraErrors: string[] = [],
-  precomputedValidation: TranscriptValidation = { ok: true, errors: [] }
+  precomputedValidation: TranscriptValidation = { ok: true, errors: [], mismatchedReadCells: [] }
 ): ShadowCommitReceipt {
   const errors = [
     ...precomputedValidation.errors,

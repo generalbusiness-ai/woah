@@ -772,6 +772,32 @@ those sparse rows except for exact ids whose owner was resolved through
 Directory. Actual durable turn execution still
 commits through `CommitScopeDO`.
 
+`DELETE /mcp` is a session end, not a heartbeat. When an established MCP session
+is routed to a shard, the shard closes the local transport queue, drops local
+session/tool cache rows, forwards a signed internal end-session request to
+`world`, and unregisters the Directory `session_route`. The `/mcp` wrapper must
+not run the normal post-response `register-session` path for that 204 response:
+doing so would resurrect a closed route and leave temporary guest actors in
+durable room contents until a later reap. Operators may use either
+wizard-gated `POST /api/admin/purge-inactive-guests` or Basic-auth-gated
+`POST /admin/purge-inactive-guests`; both run the same WORLD lifecycle reset
+and delete expired Directory session routes.
+
+Sparse MCP session projection may include Directory-derived actor
+lineage/properties and scope presence rows as `projection` authority pages. It
+must not treat Directory's `current_location` as actor movement truth. To satisfy
+planning admission for peer session actors whose identity is present but whose
+owner live row has not been fetched, shards may include an empty actor
+`object_live` placeholder stamped only as `fallback`; accepted-frame cache rows
+and owner-authoritative rows outrank that placeholder and replace it before any
+durable movement state is trusted.
+
+During MCP pre-plan authority refresh, a sparse gateway shard may expand a
+target scope's direct `contents` to fetch owner authority for those contained
+objects, capped at 128 objects. This is a bounded identity/read repair for
+room-roster planning surfaces such as occupant names; it must not become global
+enumeration, and it is not applied to commit-refresh fan-in.
+
 `CommitScopeDO` is the durable authority for v2 scope heads. On first open for
 a scope it materializes the gateway-supplied authority seed into row-shaped DO
 SQLite state: one row per materialized object, one row per session, one row per
@@ -807,11 +833,17 @@ Per-envelope authority refresh may fall back to the gateway's last-known rows
 when a remote owner times out. This is a stale-read fallback, not an authority
 promotion: if the stale rows drive a write or conflict-sensitive read, the
 transcript's version checks produce the normal stale/mismatch retry path. The
-gateway must still include the submitting actor's local authority row and
-actor-class ancestry when those rows are explicit request roots; a new session
-actor might not be present in the target CommitScopeDO snapshot yet, and
-omitting it turns a read timeout into a false `permission_denied: actor not
-found` rejection.
+gateway may still include the submitting actor's local authority row and
+actor-class ancestry when those rows are explicit request roots and the gateway
+is the actor's Directory-resolved owner. Sparse MCP gateway shards are the
+exception: they MUST NOT self-certify a locally loaded actor stub as owner
+authority for identity/name or ordinary property cells. They route explicit
+actor roots to the Directory-resolved owner for current cells, preserve only
+their local session actor `object_live` page as shard-owned live state, and may
+carry bounded actor-local support properties such as `home` and `focus_list` as
+non-authoritative projection material. If the owner is unreachable, the stale
+fallback remains retryable through transcript version checks rather than being
+promoted to owner truth.
 For MCP sessions whose scope has already completed `/v2/open`, the gateway may
 take the same stale-row fallback proactively: it sends live session/actor
 authority and local last-known object-owner rows instead of waking those owners
@@ -857,7 +889,15 @@ transcript}`. `commit` is a `woo.commit.accepted.shadow.v1`; `transcript` is
 the matching `woo.effect_transcript.shadow.v1`. Affected shards include
 CommitScope fanout recipients and shards with sessions in scopes touched by
 transcript moves, creates, contents writes, or presence-list writes. Remote
-shards consume `commit.projection_writes` into their gateway projection cache
+MCP shard delivery is outside the submit critical path: after the accepted
+commit is durable and local write-through/fanout has completed, the origin may
+schedule the Directory audience/shard lookup and `/__internal/mcp-commit-fanout`
+with Durable Object `waitUntil`.
+Runtimes without a background-lifetime primitive may fall back to synchronous
+delivery, but they must not weaken the durable object-host write-through rule
+above. Failed remote MCP fanout is logged and retried by later replay/open
+paths; it does not roll back the accepted commit.
+Remote shards consume `commit.projection_writes` into their gateway projection cache
 when present and expand `commit.projection_delta.tool_surface_sources` against
 their local tool-surface reverse index to evict stale descriptor cache rows.
 They must also apply those row-body-complete projection writes to their
@@ -921,7 +961,13 @@ legacy executable `/v2/open`. If the matching `CommitScopeDO` has no durable
 snapshot, it returns `E_SNAPSHOT_REQUIRED`; rollout callers then perform the
 legacy seed bootstrap and retry without the capsule. This flag does not change
 checkpoint/tail projection catch-up and does not add a Cloudflare Durable Object
-class migration.
+class migration. Planned-transcript commits are not eligible for this shortcut:
+when the chosen commit scope differs from the planned transcript's turn-key
+scope, the gateway must first open the chosen scope, adopt its current head, and
+submit the transcript envelope without `execution_capsule`. The open/envelope
+payload must include the bound MCP session row in the request `sessions` field
+and in `authority.sessions`; otherwise the selected CommitScopeDO cannot derive
+the browser-session auth claim for a session that only the gateway shard has seen.
 
 Live no-commit v2 transcripts follow the same MCP shard discovery and are sent
 through signed `POST /__internal/mcp-live-fanout` with `{scope,

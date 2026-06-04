@@ -7,7 +7,7 @@ import type { SerializedObject, SerializedSession, SerializedWorld } from "../sr
 import { decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "../src/core/shadow-envelope";
 import type { ShadowScopeHead } from "../src/core/shadow-commit-scope";
 import { runShadowTurnCall } from "../src/core/shadow-turn-call";
-import type { ShadowTurnExecReply, ShadowTurnExecRequest } from "../src/core/shadow-turn-exec";
+import type { ShadowStateTransfer, ShadowTurnExecReply, ShadowTurnExecRequest } from "../src/core/shadow-turn-exec";
 import { shadowAtomHash, shadowTurnKeyFromCall } from "../src/core/turn-key";
 import {
   mergeExecutorAuthority,
@@ -266,6 +266,235 @@ describe("v2 turn gateway", () => {
     });
     expect(authorityObjectIds(submitted.body.authority)).toEqual(["the_dubspace", session.actor, "delay_1"]);
     expect(result.reply?.ok).toBe(true);
+  });
+
+  it("emits a turn_phase_timing metric attributing the turn's phases (Slice 1)", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:v2-gateway-phase-timing");
+    world.setProp("the_dubspace", "operators", [session.actor]);
+    const harness = makePlannedExecHarness(world.exportWorld());
+
+    const events: Array<Record<string, unknown>> = [];
+    const result = await submitTurnIntent({
+      input: {
+        id: "phase-timing-set-control",
+        route: "sequenced",
+        scope: "the_dubspace",
+        session: session.id,
+        actor: session.actor,
+        target: "the_dubspace",
+        verb: "set_control",
+        args: ["delay_1", "wet", 0.5],
+        persistence: "durable",
+        token: "token"
+      },
+      maxAttempts: 1,
+      ...harness.options,
+      // onMetric is threaded by the gateway in production; assert the executor
+      // emits exactly one phase-timing summary per turn with the expected shape.
+      onMetric: (event) => events.push(event as Record<string, unknown>)
+    });
+
+    expect(result.kind).toBe("submitted");
+    const timing = events.filter((e) => e.kind === "turn_phase_timing");
+    expect(timing).toHaveLength(1);
+    const t = timing[0];
+    expect(t).toMatchObject({
+      kind: "turn_phase_timing",
+      scope: "the_dubspace",
+      commit_scope: "the_dubspace",
+      target: "the_dubspace",
+      verb: "set_control",
+      route: "sequenced",
+      attempts: 1,
+      outcome: "submitted"
+    });
+    // Every phase field is present and numeric, and at least one authority
+    // payload call (pre-plan + commit) was charged.
+    for (const field of ["total_ms", "ensure_client_ms", "authority_ms", "serialize_ms", "plan_build_ms", "vm_ms", "submit_ms"]) {
+      expect(typeof t[field]).toBe("number");
+      expect(t[field] as number).toBeGreaterThanOrEqual(0);
+    }
+    expect(t.authority_calls as number).toBeGreaterThanOrEqual(1);
+  });
+
+  it("adopts the authority's current head on a stale-head conflict and converges next attempt", async () => {
+    // Regression for the prod 8-attempt grind: a fresh commit-scope relay plans
+    // against head @0 while the authority is advanced, so every commit
+    // stale-head-rejects. The fix adopts the conflict's reported `current` head
+    // before retry, so the next attempt submits against the right head instead
+    // of burning the whole retry budget.
+    const world = createWorld();
+    const session = world.auth("guest:v2-gateway-stale-head");
+    world.setProp("the_dubspace", "operators", [session.actor]);
+    const harness = makePlannedExecHarness(world.exportWorld());
+
+    const authorityCurrentHead = scopeHead("the_dubspace", 5); // authority is at seq 5; relay starts at @0
+    let submitCount = 0;
+
+    const result = await submitTurnIntent({
+      input: {
+        id: "stale-head-turn",
+        route: "sequenced",
+        scope: "the_dubspace",
+        session: session.id,
+        actor: session.actor,
+        target: "the_dubspace",
+        verb: "set_control",
+        args: ["delay_1", "wet", 0.3],
+        persistence: "durable",
+        token: "token"
+      },
+      maxAttempts: 8,
+      ...harness.options,
+      applyHead: (client: PlannedGatewayClient, head: ShadowScopeHead) => { client.head = head; },
+      submitEnvelope: async (scope: ObjRef, body: ExecutorEnvelopeBody) => {
+        const envelope = decodeEnvelope<ShadowTurnExecRequest>(body.envelope);
+        harness.submissions.push({ scope, body, envelope, request: envelope.body });
+        submitCount += 1;
+        if (submitCount === 1) {
+          // First attempt planned against the relay's stale @0 head.
+          return { reply: encodeEnvelope(replyEnvelope({
+            kind: "woo.turn.exec.reply.shadow.v1",
+            ok: false,
+            id: envelope.body.id,
+            reason: "commit_rejected",
+            commit: {
+              kind: "woo.commit.conflict.shadow.v1",
+              id: envelope.body.id ?? "turn",
+              scope: "the_dubspace",
+              current: authorityCurrentHead,
+              reason: "stale_head",
+              errors: ["stale_head: expected=h@0 current=head:the_dubspace:5@5"],
+              receipt: receipt(false)
+            }
+          })) };
+        }
+        return { reply: encodeEnvelope(replyEnvelope(okReplyForExecRequest(envelope.body))) };
+      }
+    });
+
+    expect(result.kind).toBe("submitted");
+    // Converged on the SECOND attempt, not the 8-attempt ceiling.
+    expect(submitCount).toBe(2);
+    // The second submission must carry the adopted current head as `expected`.
+    const second = harness.submissions[1];
+    expect(second.request.expected).toBeDefined();
+    expect(second.request.expected?.seq).toBe(5);
+    expect(second.request.expected?.hash).toBe(authorityCurrentHead.hash);
+  });
+
+  it("installs a read-version-mismatch repair transfer and converges on the next attempt", async () => {
+    // DESIGN A layer-2: a read-version-mismatch conflict carries a cell-page
+    // transfer of the committing scope's CURRENT mismatched cells. submitTurnIntent
+    // must install it (applyStateTransfer) before re-plan so the caller refreshes
+    // its stale cells (e.g. a self-certified actor stub) and converges — instead
+    // of re-submitting the same stale rows and grinding the retry budget.
+    const world = createWorld();
+    const session = world.auth("guest:v2-gateway-version-mismatch");
+    world.setProp("the_dubspace", "operators", [session.actor]);
+    const harness = makePlannedExecHarness(world.exportWorld());
+
+    // Minimal transfer; the executor only checks presence and forwards it to
+    // applyStateTransfer (the relay-cache install is exercised by integration/
+    // worker tests). Cast avoids constructing the full cell-page envelope here.
+    const repairTransfer = {
+      kind: "woo.state.transfer.shadow.v1",
+      mode: "cell_pages",
+      scope: "the_dubspace",
+      purpose: "version_mismatch_repair_cells"
+    } as unknown as ShadowStateTransfer;
+    const installed: ShadowStateTransfer[] = [];
+    let submitCount = 0;
+
+    const result = await submitTurnIntent({
+      input: {
+        id: "version-mismatch-turn",
+        route: "sequenced",
+        scope: "the_dubspace",
+        session: session.id,
+        actor: session.actor,
+        target: "the_dubspace",
+        verb: "set_control",
+        args: ["delay_1", "wet", 0.6],
+        persistence: "durable",
+        token: "token"
+      },
+      maxAttempts: 8,
+      ...harness.options,
+      applyStateTransfer: (_client: PlannedGatewayClient, transfer: ShadowStateTransfer) => { installed.push(transfer); },
+      submitEnvelope: async (scope: ObjRef, body: ExecutorEnvelopeBody) => {
+        const envelope = decodeEnvelope<ShadowTurnExecRequest>(body.envelope);
+        harness.submissions.push({ scope, body, envelope, request: envelope.body });
+        submitCount += 1;
+        if (submitCount === 1) {
+          return { reply: encodeEnvelope(replyEnvelope({
+            kind: "woo.turn.exec.reply.shadow.v1",
+            ok: false,
+            id: envelope.body.id,
+            reason: "commit_rejected",
+            commit: {
+              kind: "woo.commit.conflict.shadow.v1",
+              id: envelope.body.id ?? "turn",
+              scope: "the_dubspace",
+              current: scopeHead("the_dubspace", 3),
+              reason: "read_version_mismatch",
+              errors: ["read version mismatch delay_1.wet: transcript=0 actual=1"],
+              receipt: receipt(false)
+            },
+            state_transfer: repairTransfer
+          })) };
+        }
+        return { reply: encodeEnvelope(replyEnvelope(okReplyForExecRequest(envelope.body))) };
+      }
+    });
+
+    expect(result.kind).toBe("submitted");
+    expect(submitCount).toBe(2); // converged after one repair, not the 8-attempt ceiling
+    expect(installed).toHaveLength(1);
+    // The transfer round-trips through the reply envelope, so compare by value.
+    expect(installed[0]).toEqual(repairTransfer);
+  });
+
+  it("charges a throwing phase and still emits turn_phase_timing with error outcome", async () => {
+    // Regression: phase timers must record elapsed even when the awaited phase
+    // THROWS, or the failure-path diagnosis this metric exists for under-reports
+    // exactly the phase that broke. Here submitEnvelope spends time then throws;
+    // the turn_phase_timing must still emit (finally) with submit_ms charged and
+    // outcome "error".
+    const world = createWorld();
+    const session = world.auth("guest:v2-gateway-throwing-phase");
+    world.setProp("the_dubspace", "operators", [session.actor]);
+    const harness = makePlannedExecHarness(world.exportWorld());
+
+    const events: Array<Record<string, unknown>> = [];
+    await expect(submitTurnIntent({
+      input: {
+        id: "throwing-submit-turn",
+        route: "sequenced",
+        scope: "the_dubspace",
+        session: session.id,
+        actor: session.actor,
+        target: "the_dubspace",
+        verb: "set_control",
+        args: ["delay_1", "wet", 0.4],
+        persistence: "durable",
+        token: "token"
+      },
+      maxAttempts: 1,
+      ...harness.options,
+      onMetric: (event) => events.push(event as Record<string, unknown>),
+      submitEnvelope: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        throw new Error("submit boom");
+      }
+    })).rejects.toThrow("submit boom");
+
+    const timing = events.filter((e) => e.kind === "turn_phase_timing");
+    expect(timing).toHaveLength(1);
+    expect(timing[0]!.outcome).toBe("error");
+    // The throwing submit phase is charged, not left at 0.
+    expect(timing[0]!.submit_ms as number).toBeGreaterThan(0);
   });
 
   it("routes planned-exec submission to the transcript commit scope, not the caller scope", async () => {

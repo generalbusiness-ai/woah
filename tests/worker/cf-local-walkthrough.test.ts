@@ -74,12 +74,15 @@ type CfSmokeHarness = {
 describe("CF-local smoke walkthrough", () => {
   it("covers cross-shard MCP movement and tool-space fanout through Worker Durable Object shape", async () => {
     const harness = createCfSmokeHarness();
-    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const runId = `cf-local-${Date.now()}-${randomUUID().slice(0, 8)}`;
+    let logSpy: ReturnType<typeof vi.spyOn> | null = null;
+    let warnSpy: ReturnType<typeof vi.spyOn> | null = null;
     let alice: LocalMcpSession | null = null;
     let bob: LocalMcpSession | null = null;
     try {
+      await seedClosedChatroomOccupant(harness, runId);
+      logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
       alice = await LocalMcpSession.open(harness, `guest:cf-local-alice-${runId}`, "alice", runId);
       bob = await openOnDifferentShard(harness, alice, runId);
       await runWalkthrough(alice, bob);
@@ -167,10 +170,73 @@ describe("CF-local smoke walkthrough", () => {
         `coherence-invariant violation during cross-shard walkthrough (VTN0): a commit rejection reported an error that is NOT an allow-listed A4 projection-cell mismatch. ` +
         `This is new multiplication / a masked rejection and must be fixed, not allow-listed. First offenders:\n${ciOffenders.slice(0, 3).join("\n")}`
       ).toBe(0);
+
+      // Slice 1 instrumentation guard: the phase-attribution metrics must
+      // actually fire on the real worker DO /mcp path, or a deploy ships blind
+      // instruments. Parse the structured woo.metric log lines the DO emits.
+      const parsedMetrics = logSpy.mock.calls
+        .filter((c) => c[0] === "woo.metric" && typeof c[1] === "string")
+        .map((c) => { try { return JSON.parse(c[1] as string) as Record<string, unknown>; } catch { return null; } })
+        .filter((m): m is Record<string, unknown> => m !== null);
+
+      // turn_phase_timing — emitted by submitTurnIntent for every POST turn.
+      const phaseTimings = parsedMetrics.filter((m) => m.kind === "turn_phase_timing");
+      expect(phaseTimings.length, "submitTurnIntent must emit turn_phase_timing on the DO turn path").toBeGreaterThan(0);
+      expect(phaseTimings.some((m) => m.outcome === "submitted"), "at least one turn should commit").toBe(true);
+      const initialChatroomEnters = phaseTimings
+        .filter((m) => m.target === "the_chatroom" && m.verb === "enter" && m.route === "direct")
+        .slice(0, 2);
+      expect(initialChatroomEnters.length, "both initial chatroom enters must emit phase timing").toBe(2);
+      const contentExpansions = parsedMetrics
+        .filter((m) => m.kind === "authority_slice_content_expansion")
+        .filter((m) => Number(m.objects) > 0);
+      expect(
+        contentExpansions.length,
+        "stale pre-existing room occupants must trigger bounded pre-plan contents authority expansion"
+      ).toBeGreaterThan(0);
+      const admissionViolations = warnSpy.mock.calls
+        .filter((call) => call[0] === "woo.planning_world_inadmissible")
+        .map((call) => JSON.stringify(call[1] ?? {}));
+      const repairedInitialEnters = initialChatroomEnters
+        .filter((m) => Number(m.attempts) !== 1)
+        .map((m) => `${String(m.target)}:${String(m.verb)} attempts=${String(m.attempts)} auth_calls=${String(m.authority_calls)} total=${String(m.total_ms)}ms`);
+      expect(
+        repairedInitialEnters,
+        `initial cross-shard chatroom enters must converge on the first attempt; repair rounds reproduce the prod 20s timeout wall. Admission violations: ${admissionViolations.slice(0, 6).join(" | ")}`
+      ).toEqual([]);
+      // Every phase field must be a finite number so the analyzer never charges NaN.
+      for (const field of ["total_ms", "ensure_client_ms", "authority_ms", "serialize_ms", "plan_build_ms", "vm_ms", "submit_ms", "authority_calls", "attempts"]) {
+        expect(typeof phaseTimings[0]![field], `turn_phase_timing.${field} must be numeric`).toBe("number");
+      }
+
+      // mcp_dispatch_timing (POST) — the /mcp dispatch wrapper outside the turn.
+      const postDispatch = parsedMetrics.filter((m) => m.kind === "mcp_dispatch_timing" && m.method === "POST");
+      expect(postDispatch.length, "the /mcp dispatch wrapper must emit mcp_dispatch_timing for POST").toBeGreaterThan(0);
+
+      // DELETE teardown is the worst smoke endpoint; prove its dispatch metric
+      // fires too. Close alice here (and null it so finally won't double-close).
+      const closedAliceSessionId = alice!.sessionId;
+      await alice!.close();
+      const staleAfterClose = await mcpFetch(harness, {
+        method: "POST",
+        headers: { "mcp-session-id": closedAliceSessionId },
+        body: rpc(999, "tools/list", {})
+      });
+      expect(
+        staleAfterClose.ok,
+        "DELETE /mcp must end the Woo session and unregister Directory so a stale MCP session id cannot be resumed"
+      ).toBe(false);
+      alice = null;
+      const deleteDispatch = logSpy.mock.calls
+        .filter((c) => c[0] === "woo.metric" && typeof c[1] === "string")
+        .map((c) => { try { return JSON.parse(c[1] as string) as Record<string, unknown>; } catch { return null; } })
+        .filter((m): m is Record<string, unknown> => m !== null)
+        .filter((m) => m.kind === "mcp_dispatch_timing" && m.method === "DELETE");
+      expect(deleteDispatch.length, "the /mcp dispatch wrapper must emit mcp_dispatch_timing for DELETE teardown").toBeGreaterThan(0);
     } finally {
       await Promise.allSettled([alice?.close(), bob?.close()]);
-      warnSpy.mockRestore();
-      logSpy.mockRestore();
+      warnSpy?.mockRestore();
+      logSpy?.mockRestore();
       harness.close();
     }
   });
@@ -255,6 +321,15 @@ function createCfSmokeHarness(): CfSmokeHarness {
       for (const state of commitStates.values()) state.close();
     }
   };
+}
+
+async function seedClosedChatroomOccupant(harness: CfSmokeHarness, runId: string): Promise<void> {
+  const session = await LocalMcpSession.open(harness, `guest:cf-local-stale-${runId}`, "stale", runId);
+  try {
+    await session.call("the_chatroom", "enter", []);
+  } finally {
+    await session.close();
+  }
 }
 
 async function openOnDifferentShard(harness: CfSmokeHarness, alice: LocalMcpSession, runId: string): Promise<LocalMcpSession> {

@@ -16,6 +16,7 @@ import {
 } from "./shadow-commit-scope";
 import {
   buildShadowCellPageTransfer,
+  buildShadowReadMismatchRepairTransfer,
   createShadowExecutionNode,
   installShadowCachedObjectRecords,
   installShadowStateTransfer,
@@ -2173,13 +2174,24 @@ function commitShadowBrowserPlannedTranscript(
   const receipt = commit.receipt;
   if (!receipt.accepted) {
     const conflict = commit.kind === "woo.commit.conflict.shadow.v1" ? commit : undefined;
+    // DESIGN A layer-2: the planned-transcript commit is the path the MCP gateway
+    // uses (it plans locally and sends the transcript). A read-version-mismatch
+    // here means the caller's planning view is staler than this scope's committed
+    // cells, so serve the mismatched cells from the local (authoritative) commit
+    // scope on the reply. Without this the caller re-plans against the same stale
+    // rows and grinds the retry budget (the execution paths already do this; this
+    // path did not, which is why the fix appeared inert in the first smoke).
+    const repairTransfer = conflict?.reason === "read_version_mismatch"
+      ? buildShadowReadMismatchRepairTransfer(transcript, conflict, commitScope)
+      : undefined;
     const reply: ShadowTurnExecReply = {
       kind: "woo.turn.exec.reply.shadow.v1",
       ok: false,
       id: request.id ?? request.call.id,
       reason: "commit_rejected",
       transcript,
-      commit: conflict
+      commit: conflict,
+      ...(repairTransfer ? { state_transfer: repairTransfer } : {})
     };
     return {
       ok: false,

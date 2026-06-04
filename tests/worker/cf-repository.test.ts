@@ -486,6 +486,61 @@ describe("v2 Worker fan-out helpers", () => {
     }
   });
 
+  it("defers MCP commit fanout audience lookup for MCP-origin envelopes", async () => {
+    const gatewayState = new WaitUntilDurableObjectState("mcp-gateway-0");
+    const gateway = Object.create(PersistentObjectDO.prototype) as Record<string, any>;
+    gateway.state = gatewayState as unknown as DurableObjectState;
+    gateway.revokedApiKeyIds = vi.fn(() => new Set<string>());
+    gateway.writeThroughV2CommitToObjectHosts = vi.fn(async () => null);
+    gateway.cleanupNewlyRevokedApiKeys = vi.fn(async () => undefined);
+    gateway.sendV2Fanout = vi.fn(() => new Set<string>());
+    gateway.sendV2CommitTranscriptFanout = vi.fn(async () => undefined);
+    let releaseAudience!: (audience: Record<string, never>) => void;
+    const blockedAudience = new Promise<Record<string, never>>((resolve) => {
+      releaseAudience = resolve;
+    });
+    gateway.mcpFanoutAudience = vi.fn(async () => await blockedAudience);
+    gateway.deliverMcpCommitFanout = vi.fn(async () => undefined);
+
+    const world = createWorld();
+    const alice = world.auth("guest:mcp-defer-alice");
+    const observation = { type: "entered", source: "the_chatroom", actor: alice.actor, ts: 1 };
+    const transcript = durableTranscript("mcp-deferred-fanout-transcript", "the_chatroom", alice.id, alice.actor, [observation]);
+    const reply = encodeEnvelope(durableReplyEnvelope("mcp-deferred-fanout", "the_chatroom", "mcp:alice", alice.id, alice.actor, transcript));
+    const delivery = await (gateway as unknown as {
+      deliverV2Fanout(
+        world: WooWorld,
+        scope: ObjRef,
+        result: { reply: string | null; fanout: Array<{ node: string; envelope: string }> },
+        originSessionId?: string | null,
+        originNode?: string | null,
+        options?: { deferMcpCommitFanout?: boolean }
+      ): Promise<Record<string, unknown>>;
+    }).deliverV2Fanout(world, "the_chatroom", { reply, fanout: [] }, alice.id, "mcp:alice", { deferMcpCommitFanout: true });
+
+    expect(delivery).toEqual({ localHostMaterialized: null });
+    expect(gateway.mcpFanoutAudience).toHaveBeenCalledOnce();
+    expect(gateway.deliverMcpCommitFanout).not.toHaveBeenCalled();
+    expect(gatewayState.waitUntilPromises).toHaveLength(1);
+    let settled = false;
+    gatewayState.waitUntilPromises[0].then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    releaseAudience({});
+    await gatewayState.drainWaitUntil();
+    expect(gateway.deliverMcpCommitFanout).toHaveBeenCalledWith(
+      world,
+      "the_chatroom",
+      [],
+      expect.objectContaining({ kind: "woo.commit.accepted.shadow.v1", observations: [observation] }),
+      transcript,
+      alice.id,
+      {},
+      { deferRemote: false }
+    );
+  });
+
   it("supplements durable same-scope browser fan-out from gateway sockets when commit-scope memory lacks peer nodes", async () => {
     class SocketState extends FakeDurableObjectState {
       override getWebSockets(): WebSocket[] {
@@ -1838,10 +1893,14 @@ describe("CFObjectRepository production-shape coverage", () => {
 
   it("handles v2 turn requests through the Worker WebSocket message path", async () => {
     const directoryState = new FakeDurableObjectState("directory");
-    const gatewayState = new FakeDurableObjectState("world");
+    const gatewayState = new WaitUntilDurableObjectState("world");
     const commitStates = new Map<string, FakeDurableObjectState>();
     const envelopeBodies: Array<Record<string, unknown>> = [];
     const mcpFanoutHosts: string[] = [];
+    let releaseMcpFanout = (): void => {};
+    const mcpFanoutGate = new Promise<void>((resolve) => {
+      releaseMcpFanout = resolve;
+    });
     const logs: string[] = [];
     const consoleLog = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
       logs.push(args.map(String).join(" "));
@@ -1860,7 +1919,10 @@ describe("CFObjectRepository production-shape coverage", () => {
         if (name.startsWith("mcp-gateway-")) {
           return {
             async fetch(request: Request): Promise<Response> {
-              if (new URL(request.url).pathname === "/__internal/mcp-commit-fanout") mcpFanoutHosts.push(name);
+              if (new URL(request.url).pathname === "/__internal/mcp-commit-fanout") {
+                mcpFanoutHosts.push(name);
+                await mcpFanoutGate;
+              }
               return new Response(JSON.stringify({ ok: true }), {
                 status: 200,
                 headers: { "content-type": "application/json; charset=utf-8" }
@@ -2008,6 +2070,9 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(sqlRows(scopeState!.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_transcript_tail"))[0]).toMatchObject({ n: 1 });
       expect(sqlRows(scopeState!.storage.sql.exec("SELECT COUNT(*) AS n FROM v2_commit_scope_reply"))[0]).toMatchObject({ n: 1 });
       expect(mcpFanoutHosts).toEqual(["mcp-gateway-0"]);
+      expect(gatewayState.waitUntilPromises).toHaveLength(1);
+      releaseMcpFanout();
+      await gatewayState.drainWaitUntil();
       const metrics = logs
         .filter((line) => line.startsWith("woo.metric "))
         .map((line) => JSON.parse(line.slice("woo.metric ".length)) as Record<string, unknown>);
@@ -2071,6 +2136,8 @@ describe("CFObjectRepository production-shape coverage", () => {
       const writesAfterReplay = scopeState!.storage.sql.execLog.filter((entry) => /^(INSERT|DELETE|UPDATE)\b/i.test(entry.query.trim())).length;
       expect(writesAfterReplay).toBe(writesBeforeReplay);
     } finally {
+      releaseMcpFanout();
+      await gatewayState.drainWaitUntil();
       directoryState.close();
       gatewayState.close();
       for (const state of commitStates.values()) state.close();

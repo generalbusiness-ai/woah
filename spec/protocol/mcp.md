@@ -204,7 +204,15 @@ When an MCP call executes through v2 and the gateway already holds a local
 execution view for the commit scope, it may send a one-turn
 `ExecutionCapsule` on `/v2/envelope` instead of reopening the scope. The capsule
 does not make descriptor projection data authoritative; permission and VM
-execution still go through the CommitScopeDO authority path.
+execution still go through the CommitScopeDO authority path. If the selected
+commit scope differs from the planned transcript's turn-key scope, the gateway
+MUST perform a real commit-scope open before building the envelope; planned
+transcript commits cannot use the capsule shortcut because they are replaying a
+caller-planned transcript, not executing from the capsule's local view. That
+open and the following envelope MUST carry the gateway-authenticated MCP session
+row in both the request `sessions` list and the authority slice's `sessions`
+list, even when sparse authority reconstruction omitted the session row, so the
+CommitScopeDO can derive and validate the browser-session token.
 
 ### M3.1 Working set: `$actor:focus`
 
@@ -345,7 +353,15 @@ client → server: tools/call { name: "actor__wait", arguments: { timeout_ms: 10
 client ← server: tools/call result { structuredContent: { result: { observations, more, queue_depth } } }
 ```
 
-Disconnect: the MCP transport closes; the woo session may persist per session-grace rules ([identity.md §I6](../semantics/identity.md#i6-disconnect-and-reap-lifecycle)). Reconnect re-authenticates with the same token, refreshes `tools/list`, and drains `wait` to resync — the queue is session-scoped (§M4.1), so observations enqueued during the disconnect window are still there on reconnect within the grace period.
+Passive disconnect: the MCP transport drops without an explicit close; the woo
+session may persist per session-grace rules ([identity.md §I6](../semantics/identity.md#i6-disconnect-and-reap-lifecycle)).
+Reconnect re-authenticates with the same token, refreshes `tools/list`, and
+drains `wait` to resync — the queue is session-scoped (§M4.1), so observations
+enqueued during the disconnect window are still there on reconnect within the
+grace period. Explicit MCP session close (`DELETE /mcp` with
+`Mcp-Session-Id`) is different: it ends the woo session, reaps the session
+queue, and for guest actors runs the normal disconnect reset so durable room
+contents do not retain closed temporary actors.
 
 In the Cloudflare deployment, established MCP sessions may be stable-hashed to
 gateway shard DOs. A shard's cold-load state is the Directory session rows for
@@ -358,6 +374,9 @@ minimum session-local state needed to keep primary-session ordering and focused
 tool surfaces stable across shard hibernation. Those bounded rows are enough to
 rebind queues, route directed/current-scope observations, and resume the MCP
 transport. Tool enumeration and invocation fetch object authority lazily from
+the owning hosts. `DELETE /mcp` on a shard must not register a fresh Directory
+heartbeat; it must unregister the Directory session row and ask the authoritative
+`world` gateway to end the canonical woo session.
 the owning host or from the shard's durable projection/tool-surface caches. A
 shard MUST treat its local actor/scope rows as transport stubs only: they cannot
 replace owner authority for turn planning, route publication, or ownership
@@ -371,7 +390,7 @@ MCP is an agent-oriented deployment surface. The MCP gateway is separate from th
 
 A second-implementation conformance suite for MCP follows the broader conformance plan ([tooling/conformance.md](../tooling/conformance.md)) and is deferred until at least one alternative MCP gateway exists.
 
-The MCP gateway is the first consumer of the v2 turn-network protocol ([v2-turn-network.md](v2-turn-network.md)). On a separate Cloudflare namespace that does not maintain v1 compatibility, the gateway is a pure v2 client for world/object verb invocation: it forwards calls as v2 turn-network envelopes through `CommitScopeDO`, so the authority plans each turn against the live commit head, and routes v2 accepted-frame and live observations to MCP queues rather than consuming v1 applied-frames. MCP is not a browser execution-cache node, so it currently uses the server-assisted intent profile defined by the v2 turn-network spec rather than browser-local optimistic execution. When the `WOO_V2_EXECUTION_CAPSULE` rollout flag is enabled, a warm MCP v2 scope client can skip executable `/v2/open` and submit a capsule-bearing `/v2/envelope`; cold-cold scopes still retry legacy seed bootstrap on `E_SNAPSHOT_REQUIRED`. MCP queue/focus controls remain gateway-local protocol controls because they manage session attention and observation drainage, not durable world commits. The MCP wire contract above (tools, notifications, queues) is unchanged; only the gateway's internal observation source and call path are rerouted. The legacy production namespace continues to drive MCP through the v1 path described in §M3–§M6. See [notes/2026-05-13-mcp-first-v2.md](../../notes/2026-05-13-mcp-first-v2.md) for the migration plan and implementation status.
+The MCP gateway is the first consumer of the v2 turn-network protocol ([v2-turn-network.md](v2-turn-network.md)). On a separate Cloudflare namespace that does not maintain v1 compatibility, the gateway is a pure v2 client for world/object verb invocation: it forwards calls as v2 turn-network envelopes through `CommitScopeDO`, so the authority plans each turn against the live commit head, and routes v2 accepted-frame and live observations to MCP queues rather than consuming v1 applied-frames. MCP is not a browser execution-cache node, so it currently uses the server-assisted intent profile defined by the v2 turn-network spec rather than browser-local optimistic execution. When the `WOO_V2_EXECUTION_CAPSULE` rollout flag is enabled, a warm MCP v2 scope client can skip executable `/v2/open` and submit a capsule-bearing `/v2/envelope`; cold-cold scopes still retry legacy seed bootstrap on `E_SNAPSHOT_REQUIRED`. Planned-transcript commits are the exception: before submitting one, the gateway opens the selected commit scope to adopt its current head, then submits the transcript envelope without an execution capsule. MCP queue/focus controls remain gateway-local protocol controls because they manage session attention and observation drainage, not durable world commits. The MCP wire contract above (tools, notifications, queues) is unchanged; only the gateway's internal observation source and call path are rerouted. The legacy production namespace continues to drive MCP through the v1 path described in §M3–§M6. See [notes/2026-05-13-mcp-first-v2.md](../../notes/2026-05-13-mcp-first-v2.md) for the migration plan and implementation status.
 
 ---
 

@@ -32,7 +32,7 @@ import {
 import { decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "./shadow-envelope";
 import { runShadowTurnCallTranscript, type ShadowTurnCall, type ShadowTurnCallTranscriptRun } from "./shadow-turn-call";
 import { buildPlanningWorld, type PlanningAdmissibilityViolation, type PlanningWorldProvenance } from "./planning-world";
-import type { ShadowMissingAtom, ShadowTurnExecReply, ShadowTurnExecRequest } from "./shadow-turn-exec";
+import type { ShadowMissingAtom, ShadowStateTransfer, ShadowTurnExecReply, ShadowTurnExecRequest } from "./shadow-turn-exec";
 import {
   selectCommitScopeForTranscript,
   transcriptTouchedObjectIds,
@@ -121,7 +121,15 @@ export type SubmitTurnIntentResult<Client, Result extends ExecutorEnvelopeResult
 export type SubmitTurnIntentOptions<Client, Result extends ExecutorEnvelopeResult> = {
   input: ExecutorCallInput;
   maxAttempts?: number;
-  ensureClient(scope: ObjRef, attempt: number): Promise<Client>;
+  ensureClient(
+    scope: ObjRef,
+    attempt: number,
+    context: {
+      phase: "planning" | "commit";
+      planningScope: ObjRef;
+      plannedTranscriptCommit: boolean;
+    }
+  ): Promise<Client>;
   clientNode(client: Client): string;
   clientHead?(client: Client): ShadowScopeHead;
   clientSerialized?(client: Client): SerializedWorld;
@@ -158,6 +166,24 @@ export type SubmitTurnIntentOptions<Client, Result extends ExecutorEnvelopeResul
   prePlanAuthority?: boolean;
   submitEnvelope(scope: ObjRef, body: ExecutorEnvelopeBody): Promise<Result>;
   applyAuthority?(client: Client, authority: SerializedAuthoritySlice): void;
+  // Adopt the authority's reported current head after a stale-head/version
+  // conflict, so the next attempt plans + submits against the right head instead
+  // of re-submitting the same stale `expected`. Without this, a distributed
+  // caller (gateway/REST) whose executor is a partial relay shard cannot use the
+  // in-process convergence in executeShadowTurnNetwork (which bails for
+  // non-authoritative executors) and grinds the full retry budget on every
+  // contended/first-turn-on-scope commit. See the conflict's `commit.current`.
+  applyHead?(client: Client, head: ShadowScopeHead): void;
+  // Install a cell-page transfer carried on a read-version-mismatch conflict
+  // reply into the caller's planning cache before the next repair attempt
+  // (DESIGN A layer-2). The committing scope already validated against its
+  // CURRENT cells and serves exactly the mismatched ones, stamped
+  // authoritative; installing them lets the next attempt plan against fresh
+  // versions and converge — instead of re-planning the same stale rows and
+  // grinding the retry budget. Distributed callers (gateway/REST/dev) wire this
+  // to their relay-cache install; a caller that omits it falls back to the
+  // pre-fix authority-refetch path (slower, may still loop).
+  applyStateTransfer?(client: Client, transfer: ShadowStateTransfer): void;
   authorityObjectIds?(input: ExecutorCallInput, commitScope: ObjRef): ObjRef[];
   planningScope?(input: ExecutorCallInput): ObjRef;
   shouldRetry?(reply: ShadowTurnExecReply): boolean;
@@ -467,9 +493,65 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
   const maxAttempts = options.maxAttempts ?? 1;
   const shouldRetry = options.shouldRetry ?? executorReplyNeedsRepair;
   let repairObjectIds: ObjRef[] = [];
+  // Slice 1 phase attribution: charge the turn's wall time to the loop's
+  // phases (client open, authority reconstruction/fan-in, local serialize,
+  // planning-world build, VM run, commit-envelope RPC) so a slow turn can be
+  // diagnosed without guessing. All *_ms sum across repair attempts; one
+  // turn_phase_timing metric is emitted on every exit (commit, local frame, or
+  // throw). Cheap (a handful of Date.now() reads) and generic — every
+  // submitTurnIntent caller (MCP, dev, browser) gets the same breakdown.
+  const turnStartedAt = Date.now();
+  let phaseAttempts = 0;
+  let ensureClientMs = 0;
+  let authorityMs = 0;
+  let authorityCalls = 0;
+  let serializeMs = 0;
+  let planBuildMs = 0;
+  let vmMs = 0;
+  let submitMs = 0;
+  let phaseOutcome: "submitted" | "local_frame" | "error" = "error";
+  let phaseCommitScope: ObjRef | null = null;
+  const emitPhaseTiming = (): void => {
+    options.onMetric?.({
+      kind: "turn_phase_timing",
+      scope: options.input.scope,
+      commit_scope: phaseCommitScope,
+      target: options.input.target,
+      verb: options.input.verb,
+      route: options.input.route,
+      attempts: phaseAttempts,
+      outcome: phaseOutcome,
+      total_ms: Date.now() - turnStartedAt,
+      ensure_client_ms: ensureClientMs,
+      authority_ms: authorityMs,
+      authority_calls: authorityCalls,
+      serialize_ms: serializeMs,
+      plan_build_ms: planBuildMs,
+      vm_ms: vmMs,
+      submit_ms: submitMs
+    });
+  };
+  // Time a phase and charge its elapsed wall time even when it THROWS — a
+  // throwing authority/VM/submit must show its real cost so the failure-path
+  // diagnosis this metric exists for is not under-reported. `add` accumulates
+  // into the right phase total; works for sync or async phase bodies.
+  const timePhase = async <T>(add: (ms: number) => void, body: () => T | Promise<T>): Promise<T> => {
+    const startedAt = Date.now();
+    try {
+      return await body();
+    } finally {
+      add(Date.now() - startedAt);
+    }
+  };
+  try {
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    phaseAttempts = attempt + 1;
     const planningScope = options.planningScope?.(options.input) ?? options.input.scope;
-    const planningClient = await options.ensureClient(planningScope, attempt);
+    const planningClient = await timePhase((ms) => { ensureClientMs += ms; }, () => options.ensureClient(planningScope, attempt, {
+      phase: "planning",
+      planningScope,
+      plannedTranscriptCommit: false
+    }));
     const turnId = options.input.id ?? options.nextTurnId(planningClient, attempt);
     const call = buildExecutorCall(options.input, turnId);
     if (options.prePlanAuthority) {
@@ -478,10 +560,11 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
           ?? executorAuthorityObjectIds(options.input, planningScope),
         repairObjectIds
       );
-      const prePlanAuthority = await options.authorityPayload(planningScope, prePlanAuthorityObjectIds, { phase: "pre_plan" });
+      authorityCalls += 1;
+      const prePlanAuthority = await timePhase((ms) => { authorityMs += ms; }, () => options.authorityPayload(planningScope, prePlanAuthorityObjectIds, { phase: "pre_plan" }));
       options.applyAuthority?.(planningClient, prePlanAuthority.authority);
     }
-    const serialized = options.clientSerialized?.(planningClient);
+    const serialized = await timePhase((ms) => { serializeMs += ms; }, () => options.clientSerialized?.(planningClient));
     if (!serialized) throw new Error("planned v2 turn gateway submission requires clientSerialized");
     let planned: ShadowTurnCallTranscriptRun;
     try {
@@ -492,13 +575,13 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       // always passes through the gate; provenance defaults to empty when a caller
       // does not thread it (still enforced — onAdmissionViolation is only logging).
       const planningProvenance = options.clientPlanningProvenance?.(planningClient) ?? new Map();
-      const planningWorld = buildPlanningWorld(serialized, planningProvenance, {
+      const planningWorld = await timePhase((ms) => { planBuildMs += ms; }, () => buildPlanningWorld(serialized, planningProvenance, {
         ...(options.onAdmissionViolation ? { onViolation: options.onAdmissionViolation } : {}),
         ...(options.enforceMissingProvenance ? { enforceMissingProvenance: true } : {})
-      });
-      planned = await runShadowTurnCallTranscript(planningWorld, call, {
+      }));
+      planned = await timePhase((ms) => { vmMs += ms; }, () => runShadowTurnCallTranscript(planningWorld, call, {
         ...(options.onMetric ? { onMetric: options.onMetric } : {})
-      });
+      }));
     } catch (err) {
       // Sparse MCP planning can discover a transitive object before the commit
       // executor sees it; repair that materialization miss and rerun the turn.
@@ -523,6 +606,7 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
         repairObjectIds = nextRepairObjectIds;
         continue;
       }
+      phaseOutcome = "local_frame";
       return { kind: "local_frame", frame: planned.frame, call, planned };
     }
 
@@ -538,16 +622,23 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     // verb in a foreign scope.
     const commitSelection = selectCommitScopeForTranscript(planned.transcript, key.scope, options.onMetric);
     const commitScope = commitSelection.scope;
-    const commitClient = commitScope === planningScope
+    phaseCommitScope = commitScope;
+    const plannedTranscriptCommit = commitScope !== key.scope;
+    const commitClient = commitScope === planningScope && !plannedTranscriptCommit
       ? planningClient
-      : await options.ensureClient(commitScope, attempt);
+      : await timePhase((ms) => { ensureClientMs += ms; }, () => options.ensureClient(commitScope, attempt, {
+        phase: "commit",
+        planningScope,
+        plannedTranscriptCommit
+      }));
     const authorityObjectIds = mergeExecutorObjectIds(
       options.authorityObjectIds?.(options.input, commitScope)
         ?? executorAuthorityObjectIds(options.input, commitScope),
       repairObjectIds,
       executorTranscriptObjectIds(planned.transcript)
     );
-    const authority = await options.authorityPayload(commitScope, authorityObjectIds, { phase: "commit" });
+    authorityCalls += 1;
+    const authority = await timePhase((ms) => { authorityMs += ms; }, () => options.authorityPayload(commitScope, authorityObjectIds, { phase: "commit" }));
     options.applyAuthority?.(commitClient, authority.authority);
     if (commitClient !== planningClient) options.applyAuthority?.(planningClient, authority.authority);
     const head = options.clientHead?.(commitClient);
@@ -567,7 +658,7 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       // Cross-scope commits (commitScope differs from the planned turn-key
       // scope) carry the planned transcript + frame so the location authority
       // commits the browser-planned result instead of re-running the verb.
-      ...(commitScope !== key.scope ? {
+      ...(plannedTranscriptCommit ? {
         planned_transcript: planned.transcript,
         planned_frame: planned.frame
       } : {})
@@ -579,19 +670,48 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       envelopeId: options.envelopeId?.(turnId, attempt),
       request
     });
-    const result = await options.submitEnvelope(commitScope, executorEnvelopeBody({
+    const result = await timePhase((ms) => { submitMs += ms; }, () => options.submitEnvelope(commitScope, executorEnvelopeBody({
       scope: commitScope,
       node: options.clientNode(commitClient),
       turn: options.input,
       authority,
       envelope,
-      plannedTranscriptCommit: commitScope !== key.scope
-    }));
+      plannedTranscriptCommit
+    })));
     const replyEnvelope = decodeExecutorReply(result.reply);
     if (replyEnvelope?.body && attempt + 1 < maxAttempts && shouldRetry(replyEnvelope.body)) {
-      repairObjectIds = mergeExecutorObjectIds(repairObjectIds, executorObjectIdsFromMissingState(replyEnvelope.body));
+      const body = replyEnvelope.body;
+      // A stale-head / read-version conflict reports the authority's CURRENT
+      // head. Adopt it (mirrors executeShadowTurnNetwork's authoritative-executor
+      // convergence) and re-fetch authority for everything this turn touched, so
+      // the next attempt plans + commits against the right head AND fresh cell
+      // versions — instead of re-submitting the same stale `expected` and burning
+      // the whole retry budget. Without this, a first-turn-on-scope commit whose
+      // relay head is still @0 grinds all maxAttempts and returns an error.
+      if (body.ok === false && body.commit?.current) {
+        options.applyHead?.(commitClient, body.commit.current);
+        if (commitClient !== planningClient) options.applyHead?.(planningClient, body.commit.current);
+      }
+      // DESIGN A layer-2: a read-version-mismatch conflict carries a cell-page
+      // transfer of the mismatched cells at the committing scope's CURRENT
+      // versions. Install it into the planning cache so the next attempt plans
+      // against the fresh cells and converges — the head adoption above is not
+      // enough on its own when the stale row is a cell value/version (e.g. a
+      // self-certified actor stub) rather than the scope head. Install on the
+      // commit client and, when distinct, the planning client (the planner is
+      // what re-runs the verb next round).
+      if (body.ok === false && body.state_transfer) {
+        options.applyStateTransfer?.(commitClient, body.state_transfer);
+        if (commitClient !== planningClient) options.applyStateTransfer?.(planningClient, body.state_transfer);
+      }
+      repairObjectIds = mergeExecutorObjectIds(
+        repairObjectIds,
+        executorObjectIdsFromMissingState(body),
+        executorTranscriptObjectIds(planned.transcript)
+      );
       continue;
     }
+    phaseOutcome = "submitted";
     return {
       kind: "submitted",
       scope: options.input.scope,
@@ -605,6 +725,9 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     };
   }
   throw new Error("v2 turn gateway retry loop exhausted");
+  } finally {
+    emitPhaseTiming();
+  }
 }
 
 function mergeExecutorObjectIds(...lists: ObjRef[][]): ObjRef[] {

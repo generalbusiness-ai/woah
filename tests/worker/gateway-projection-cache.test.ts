@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { authoritySliceObjectIds, buildSerializedAuthorityCellSlice, serializedWorldFromAuthoritySlice } from "../../src/core/authority-slice";
+import { authoritySliceObjectIds, buildSerializedAuthorityCellSlice, serializedWorldFromAuthoritySlice, withAuthorityPageProvenance } from "../../src/core/authority-slice";
 import { createWorld } from "../../src/core/bootstrap";
 import type { EffectTranscript } from "../../src/core/effect-transcript";
 import type { ProjectionDeltaSummary, ProjectionWrite, SessionToolManifest } from "../../src/core/projection-delta";
@@ -22,6 +22,16 @@ function env(overrides: Partial<Env> = {}): Env {
 
 function rows<T>(state: FakeDurableObjectState, query: string, ...params: unknown[]): T[] {
   return state.storage.sql.exec(query, ...params).toArray() as T[];
+}
+
+function authorityFromHost(world: ReturnType<typeof createWorld>, host: string, objects: readonly ObjRef[]): SerializedAuthoritySlice {
+  return withAuthorityPageProvenance(
+    world.exportAuthoritySlice([], objects),
+    (ref) => ({
+      source: world.objectHostKey(ref.object) === host ? "authoritative" : "cache",
+      source_host: host
+    })
+  );
 }
 
 function serializedObject(id: ObjRef, parent: ObjRef | null, name = id): SerializedObject {
@@ -830,7 +840,58 @@ describe("gateway projection cache", () => {
     }));
   });
 
-  it("does not fetch world for unresolved ids or locally-live actors on sparse MCP shards", async () => {
+  it("fetches owner-current actor name cells on sparse MCP shards", async () => {
+    const state = new FakeDurableObjectState("mcp-gateway-0");
+    const localWorld = createWorld();
+    const ownerWorld = createWorld();
+    const session = localWorld.auth("guest:authority-owner-current");
+    const localActor = localWorld.object(session.actor);
+    localActor.properties.set("name", "Stale Guest");
+    localActor.propertyVersions.set("name", 0);
+    ownerWorld.setProp(session.actor, "name", "Guest 1");
+    const ownerName = ownerWorld.propOrNull(session.actor, "name");
+    expect(ownerName).toBe("Guest 1");
+    const reads: Array<{ host: string; objects: ObjRef[] }> = [];
+    const po = new PersistentObjectDO(state as unknown as DurableObjectState, env({
+      DIRECTORY: new FakeDurableObjectNamespace(() => ({
+        fetch: async (request: Request) => {
+          const body = await request.json() as { id?: string; fallback_host?: string };
+          return new Response(JSON.stringify({
+            id: body.id,
+            host: body.id === session.actor ? "world" : body.fallback_host ?? "",
+            anchor: null
+          }), {
+            headers: { "content-type": "application/json" }
+          });
+        }
+      })) as unknown as DurableObjectNamespace
+    })) as unknown as {
+      v2GatewayAuthorityPayload: (
+        world: ReturnType<typeof createWorld>,
+        extraObjectIds: ObjRef[],
+        options: { tolerateRemoteFailures?: boolean }
+      ) => Promise<{ authority: SerializedAuthoritySlice }>;
+      routeCache: Map<ObjRef, string>;
+      forwardInternalReadChecked: (host: string, path: string, body: { objects?: ObjRef[] }) => Promise<{ authority: SerializedAuthoritySlice }>;
+    };
+    po.routeCache.set("the_chatroom", "the_chatroom");
+    po.forwardInternalReadChecked = async (host, _path, body) => {
+      const objects = body.objects ?? [];
+      reads.push({ host, objects });
+      return { authority: authorityFromHost(host === "world" ? ownerWorld : localWorld, host, objects) };
+    };
+
+    const payload = await po.v2GatewayAuthorityPayload(localWorld, ["the_chatroom", session.actor], { tolerateRemoteFailures: true });
+    const actor = serializedWorldFromAuthoritySlice(payload.authority).objects.find((obj) => obj.id === session.actor);
+
+    expect(reads).toEqual(expect.arrayContaining([
+      expect.objectContaining({ host: "world", objects: expect.arrayContaining([session.actor]) })
+    ]));
+    expect(actor?.properties.find(([name]) => name === "name")?.[1]).toBe("Guest 1");
+    expect(actor?.propertyVersions.find(([name]) => name === "name")?.[1]).toBe(1);
+  });
+
+  it("does not guess world for unresolved ids but follows actor owner routes on sparse MCP shards", async () => {
     const state = new FakeDurableObjectState("mcp-gateway-0");
     const world = createWorld();
     const session = world.auth("guest:authority-no-world-guess");
@@ -856,12 +917,12 @@ describe("gateway projection cache", () => {
     po.routeCache.set("the_chatroom", "the_chatroom");
     po.forwardInternalReadChecked = async (host, _path, body) => {
       reads.push(host);
-      return { authority: world.exportAuthoritySlice([], body.objects ?? []) };
+      return { authority: authorityFromHost(world, host, body.objects ?? []) };
     };
 
     await po.v2GatewayAuthorityPayload(world, ["the_chatroom", session.actor], { tolerateRemoteFailures: true });
 
-    expect(reads).toEqual(["the_chatroom"]);
+    expect(reads).toEqual(["the_chatroom", "world"]);
   });
 
   it("omits session rows whose actor row is absent from the authority slice", async () => {

@@ -6,7 +6,7 @@ import type {
   SpaceSnapshotRecord
 } from "./repository";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, MetricEvent, ObjRef, WooValue } from "./types";
-import { effectTranscriptFromRecordedTurn, type EffectTranscript } from "./effect-transcript";
+import { effectTranscriptFromRecordedTurn, type EffectTranscript, type TranscriptCell } from "./effect-transcript";
 import { shadowCommitReceipt, type ShadowCommitReceipt } from "./turn-commit";
 import { replayRecordedTurn } from "./turn-replay";
 import type { RecordedTurn } from "./turn-recorder";
@@ -83,6 +83,10 @@ export type ShadowCellPageTransferPurpose =
   | "open_executable_seed"
   | "open_executable_seed_cache_hit"
   | "state_repair"
+  // DESIGN A layer-2: cells served by a committing scope alongside a
+  // `read_version_mismatch` rejection so a stale caller can refresh exactly the
+  // mismatched cells and converge on the next repair attempt.
+  | "version_mismatch_repair_cells"
   | "accepted_write_cells";
 
 export type ShadowCellPageTransfer = {
@@ -760,6 +764,17 @@ export async function executeAuthoritativeShadowTurnCall(
         errors: receipt.errors
       }));
     }
+    // DESIGN A layer-2 fix: a read-version/value rejection means this scope's
+    // committed cells are FRESHER than the caller's planning view (e.g. an MCP
+    // gateway shard holding a `name@0` actor stub while we committed `name@1`).
+    // We already validated the transcript against our current cells, so we can
+    // hand the caller the exact mismatched cells, sourced from THIS scope's
+    // authoritative state. The caller installs them before re-plan and converges
+    // on the next attempt instead of grinding the whole repair budget against
+    // the same stale rows.
+    const repairTransfer = conflict?.reason === "read_version_mismatch"
+      ? buildShadowReadMismatchRepairTransfer(run.transcript, conflict, input.commitScope)
+      : undefined;
     return {
       ok: false,
       reason: "commit_rejected",
@@ -768,7 +783,7 @@ export async function executeAuthoritativeShadowTurnCall(
       transcript: run.transcript,
       receipt,
       commit: conflict,
-      reply: commitRejectedReply(request, run.transcript, conflict)
+      reply: commitRejectedReply(request, run.transcript, conflict, repairTransfer)
     };
   }
   if (commit.kind !== "woo.commit.accepted.shadow.v1") {
@@ -938,7 +953,7 @@ export async function executeShadowTurnCallOrNeedState(
       // sequenced route to reuse catalog behavior, but its writes are discarded
       // below. Validate transcript completeness, not durable read versions that
       // include ephemeral sequencer bookkeeping from this same live turn.
-      ? shadowCommitReceipt(serializedBefore, requireSerializedAfter(run), run.transcript, [], { ok: true, errors: [] })
+      ? shadowCommitReceipt(serializedBefore, requireSerializedAfter(run), run.transcript, [], { ok: true, errors: [], mismatchedReadCells: [] })
       : shadowCommitReceipt(serializedBefore, requireSerializedAfter(run), run.transcript);
   if (!receipt.accepted) {
     node.world = undefined;
@@ -955,6 +970,15 @@ export async function executeShadowTurnCallOrNeedState(
         errors: receipt.errors
       }));
     }
+    // DESIGN A layer-2 fix (same rationale as the authoritative fast path):
+    // refresh the caller's stale cells from the committing scope's current
+    // state so a read-version rejection converges in one repair round. Only an
+    // owning commit scope can source the fresh cells; a derived/cross-scope
+    // selection or a missing scope yields no transfer (undefined), preserving
+    // the prior behavior for those paths.
+    const repairTransfer = conflict?.reason === "read_version_mismatch" && selectedCommitScope
+      ? buildShadowReadMismatchRepairTransfer(run.transcript, conflict, selectedCommitScope)
+      : undefined;
     return {
       ok: false,
       reason: "commit_rejected",
@@ -963,7 +987,7 @@ export async function executeShadowTurnCallOrNeedState(
       transcript: run.transcript,
       receipt,
       commit: conflict,
-      reply: commitRejectedReply(request, run.transcript, conflict)
+      reply: commitRejectedReply(request, run.transcript, conflict, repairTransfer)
     };
   }
 
@@ -1466,7 +1490,8 @@ function missingStateReply(
 function commitRejectedReply(
   request: ShadowTurnExecRequest,
   transcript: EffectTranscript,
-  commit?: ShadowCommitConflict
+  commit?: ShadowCommitConflict,
+  stateTransfer?: ShadowCellPageTransfer
 ): ShadowTurnExecReply {
   return {
     kind: "woo.turn.exec.reply.shadow.v1",
@@ -1474,7 +1499,12 @@ function commitRejectedReply(
     id: request.id ?? request.call.id,
     reason: "commit_rejected",
     transcript,
-    commit
+    commit,
+    // For a read-version rejection the committing scope attaches a cell-page
+    // transfer of the mismatched cells (their CURRENT authoritative values) so
+    // the caller can refresh its planning view and converge on the next repair
+    // attempt. Absent for other reasons.
+    ...(stateTransfer ? { state_transfer: stateTransfer } : {})
   };
 }
 
@@ -1536,6 +1566,130 @@ function buildShadowCommitWarmTransfer(
     return undefined;
   }
   return transfer;
+}
+
+// DESIGN A layer-2 repair transfer. When a commit is rejected because the
+// caller's planning view read a STALER version of a cell than this scope's
+// committed truth (`read_version_mismatch`), build a cell-page transfer of the
+// mismatched cells sourced from the COMMIT SCOPE's current serialized state.
+//
+// Why keyed on the turn's transcript key: the rejecting turn READ the
+// mismatched cells, so their atoms/preimages are already in the turn key. The
+// page-closure builder therefore includes exactly the mismatched property /
+// lineage / live pages (e.g. the `guest_N.name` property cell at its committed
+// version). We do not re-run any planning — we serve the cells we just
+// validated against.
+//
+// The page refs are stamped `authoritative` with `source_host = commitScope.node`
+// because they ARE the owner's committed truth. The install path
+// (installShadowCellPageTransferAsAuthority) merges them through the SAME
+// authority-merge precedence as a remote owner slice, so the version gate and
+// provenance rules apply uniformly. Returns undefined when the scope cannot
+// source the cells (no serialized state / empty closure), leaving the prior
+// loop-until-budget behavior unchanged for those degenerate cases.
+// Exported so the planned-transcript commit path (shadow-browser-node, the path
+// the MCP gateway actually uses) can build the SAME owner-current repair transfer
+// as the execution paths here. Both reach a read_version_mismatch conflict from
+// submitShadowCommit; the difference is only whether the verb was re-executed or
+// a planned transcript was validated.
+export function buildShadowReadMismatchRepairTransfer(
+  transcript: EffectTranscript,
+  conflict: ShadowCommitConflict,
+  commitScope: ShadowCommitScope
+): ShadowCellPageTransfer | undefined {
+  const mismatched = conflict.mismatched_read_cells ?? [];
+  if (mismatched.length === 0) return undefined;
+  const serialized = serializedFor(commitScope, { reason: "version_mismatch_repair" });
+  if (serialized.objects.length === 0) return undefined;
+  const key = shadowTurnKeyFromTranscript(transcript);
+  // Drive the page closure from ONLY the EXACT mismatched read cells (as read-atom
+  // preimages) — NOT the turn key's full read/write closure. Two reasons: (1) the
+  // turn key carries routing/acceptance atoms, which need not include an ordinary
+  // property read like the actor's `name`, so missing_atoms guarantees the right
+  // pages; (2) including the whole closure would drag in unrelated commit-scope
+  // support/cache pages that we would then stamp authoritative (see below) and
+  // poison the caller's relay cache with non-owner rows. The caller already holds
+  // lineage/support pages (the install MERGES into its existing relay), so a
+  // minimal transfer of just the mismatched cells is sufficient and safe.
+  const repairAtoms: ShadowMissingAtom[] = mismatched.map((cell) => {
+    const preimage = readPreimageForCell(cell);
+    return { hash: shadowAtomHash(preimage), preimage };
+  });
+  const transfer = buildShadowCellPageTransfer({
+    serialized,
+    key,
+    // No atom_hashes: missing_atoms alone drives the closure to the mismatched cells.
+    missing_atoms: repairAtoms,
+    session: transcript.session,
+    purpose: "version_mismatch_repair_cells"
+  });
+  if (transfer.page_refs.length === 0 && transfer.inline_pages.length === 0) return undefined;
+  // Stamp ONLY the pages that ARE one of the mismatched cells as the owner's
+  // authoritative rows (so the caller's authority merge lets them override a stale
+  // self-certified stub). Any incidental closure page (e.g. a parent-class lineage
+  // page pulled in by the page closure) keeps its natural (no) source, so the merge
+  // treats it as fill-only and can never overwrite a current cell with a non-owner
+  // row. This is the guard against cache poisoning from over-broad stamping.
+  return stampShadowCellPageTransferAuthority(transfer, commitScope.node, mismatched);
+}
+
+// Stamp the page refs that correspond to `cells` with the committing scope's
+// authoritative provenance (source + source_host). Refs that are not one of the
+// named cells are left untouched (no authority claim), so a refresh transfer
+// asserts owner-truth ONLY for the cells the commit scope actually validated as
+// mismatched — never for incidental support/cache pages in the closure.
+function stampShadowCellPageTransferAuthority(
+  transfer: ShadowCellPageTransfer,
+  sourceHost: string,
+  cells: readonly TranscriptCell[]
+): ShadowCellPageTransfer {
+  return {
+    ...transfer,
+    page_refs: transfer.page_refs.map((ref) =>
+      cells.some((cell) => cellMatchesPageRef(cell, ref))
+        ? { ...ref, source: "authoritative" as const, source_host: sourceHost }
+        : ref
+    )
+  };
+}
+
+// Whether a page ref is the page that backs a recorded cell. The cell→page
+// mapping mirrors the page model in shadow-state-pages: a property cell is a
+// named `property_cell`, a verb cell a named `verb_bytecode`, location/contents
+// live on the object's `object_live` page, and lifecycle is `object_lineage`.
+function cellMatchesPageRef(cell: TranscriptCell, ref: ShadowStatePageRef): boolean {
+  if (ref.object !== cell.object) return false;
+  switch (cell.kind) {
+    case "prop":
+      return ref.page === "property_cell" && ref.name === cell.name;
+    case "verb":
+      return ref.page === "verb_bytecode" && ref.name === cell.name;
+    case "location":
+    case "contents":
+      return ref.page === "object_live";
+    case "lifecycle":
+      return ref.page === "object_lineage";
+  }
+}
+
+// The read-atom preimage for a recorded cell, in the SAME form the turn key /
+// page-closure builders use (`read:cell:<kind>:<object>[.|:<name>]`). Used by the
+// read-mismatch repair transfer to target exactly the mismatched cells' pages so
+// the refresh does not depend on the turn key happening to include an ordinary
+// property read.
+function readPreimageForCell(cell: TranscriptCell): string {
+  switch (cell.kind) {
+    case "prop":
+      return `read:cell:prop:${cell.object}.${cell.name}`;
+    case "verb":
+      return `read:cell:verb:${cell.object}:${cell.name}`;
+    case "location":
+      return `read:cell:location:${cell.object}`;
+    case "contents":
+      return `read:cell:contents:${cell.object}`;
+    case "lifecycle":
+      return `read:cell:lifecycle:${cell.object}`;
+  }
 }
 
 function objectClosureForPreimages(serialized: SerializedWorld, preimages: string[]): Set<ObjRef> {

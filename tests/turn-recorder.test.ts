@@ -200,7 +200,7 @@ describe("turn recorder", () => {
     }));
     expect(transcript.reads).toContainEqual(expect.objectContaining({ cell: { kind: "location", object: "cell_room" }, value: "$nowhere" }));
     expect(transcript.reads).toContainEqual(expect.objectContaining({ cell: { kind: "contents", object: "cell_room" }, value: ["cell_item"] }));
-    expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [] });
+    expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [], mismatchedReadCells: [] });
   });
 
   it("accepts a contents read whose order differs from the serialized authority (contents is a versioned set)", async () => {
@@ -250,7 +250,7 @@ describe("turn recorder", () => {
     serializedRoom.contents = [...serializedRoom.contents].reverse();
     expect(serializedRoom.contents).not.toEqual(contentsRead?.value);
 
-    expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [] });
+    expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [], mismatchedReadCells: [] });
   });
 
   it("reconciles same-turn presence projection reads from property metadata", () => {
@@ -306,7 +306,7 @@ describe("turn recorder", () => {
       ...baseTranscript,
       reads: [{ cell: { kind: "prop", object: "custom_presence_room", name: "occupant_actor_ids" }, version: "2", value: [actor] }]
     } satisfies EffectTranscript;
-    expect(validateTranscriptAgainstSerializedWorld(before, actorProjection)).toEqual({ ok: true, errors: [] });
+    expect(validateTranscriptAgainstSerializedWorld(before, actorProjection)).toEqual({ ok: true, errors: [], mismatchedReadCells: [] });
 
     const sessionProjection = {
       ...baseTranscript,
@@ -316,7 +316,7 @@ describe("turn recorder", () => {
         value: [{ sid: session.id, who: actor }]
       }]
     } satisfies EffectTranscript;
-    expect(validateTranscriptAgainstSerializedWorld(before, sessionProjection)).toEqual({ ok: true, errors: [] });
+    expect(validateTranscriptAgainstSerializedWorld(before, sessionProjection)).toEqual({ ok: true, errors: [], mismatchedReadCells: [] });
 
     const plainProperty = {
       ...baseTranscript,
@@ -327,6 +327,12 @@ describe("turn recorder", () => {
       errors: [
         "read version mismatch custom_presence_room.looks_like_presence_but_is_plain: transcript=2 actual=1",
         "read value mismatch custom_presence_room.looks_like_presence_but_is_plain"
+      ],
+      // The mismatched read cell is surfaced structurally (deduped across the
+      // version + value errors for the same cell) so the repair path can build a
+      // targeted refresh transfer (DESIGN A layer-2).
+      mismatchedReadCells: [
+        { kind: "prop", object: "custom_presence_room", name: "looks_like_presence_but_is_plain" }
       ]
     });
   });
@@ -359,7 +365,7 @@ describe("turn recorder", () => {
         cell: expect.objectContaining({ kind: "verb", name: call.verb }),
         value: expect.objectContaining({ implementation: "bytecode", native: null })
       }));
-      expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [] });
+      expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [], mismatchedReadCells: [] });
     }
 
     world.createObject({ id: "private_desc_box", name: "Private Desc Box", parent: "$thing", owner: "$wiz" });
@@ -400,7 +406,7 @@ describe("turn recorder", () => {
         cell: expect.objectContaining({ kind: "verb", name: call.verb }),
         value: expect.objectContaining({ implementation: "bytecode", native: null })
       }));
-      expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [] });
+      expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [], mismatchedReadCells: [] });
     }
   });
 
@@ -430,7 +436,7 @@ describe("turn recorder", () => {
       cell: { kind: "verb", object: "native_box", name: "native_probe" },
       value: expect.objectContaining({ implementation: "native", owner: actor, direct_callable: true, native_contract: null })
     }));
-    expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [] });
+    expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [], mismatchedReadCells: [] });
     const receipt = shadowCommitReceipt(before, world.exportWorld(), transcript);
     expect(receipt).toMatchObject({
       kind: "woo.commit_receipt.shadow.v1",
@@ -484,7 +490,7 @@ describe("turn recorder", () => {
       })
     }));
     expect(transcript.writes).toContainEqual(expect.objectContaining({ cell: { kind: "location", object: "native_move_item" }, value: "native_move_b", op: "move" }));
-    expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [] });
+    expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [], mismatchedReadCells: [] });
   });
 
   it("keeps create_api_key transcript complete and records the contract", async () => {
@@ -522,7 +528,7 @@ describe("turn recorder", () => {
         })
       })
     }));
-    expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [] });
+    expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [], mismatchedReadCells: [] });
   });
 
   it("keeps create_api_key_for_owner transcript complete and records the contract", async () => {
@@ -561,7 +567,7 @@ describe("turn recorder", () => {
         })
       })
     }));
-    expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [] });
+    expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [], mismatchedReadCells: [] });
   });
 
   it("keeps catalog_registry_install transcript complete and records the contract", async () => {
@@ -925,7 +931,7 @@ describe("turn recorder", () => {
     expect(transcript.writes).toContainEqual(expect.objectContaining({ cell: { kind: "location", object: "move_item" }, value: "move_b", op: "move" }));
     expect(transcript.writes.filter((write) => write.cell.kind === "contents")).toEqual([]);
     expect(transcript.reads).toContainEqual(expect.objectContaining({ cell: { kind: "location", object: "move_item" }, value: "move_b" }));
-    expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [] });
+    expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [], mismatchedReadCells: [] });
     const replayA = await replayRecordedTurn(before, recorder.turns[0]);
     const replayB = await replayRecordedTurn(before, recorder.turns[0]);
     expect(effectTranscriptFromRecordedTurn(replayA.recorded)).toEqual(transcript);
@@ -999,7 +1005,7 @@ describe("turn recorder", () => {
     const transcript = effectTranscriptFromRecordedTurn(recorder.turns[0]);
     const ownerRead = transcript.reads.find((read) => read.cell.kind === "prop" && read.cell.object === "owner_box" && read.cell.name === "owner");
     expect(ownerRead?.version).toMatch(/^[a-f0-9]{64}$/);
-    expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [] });
+    expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [], mismatchedReadCells: [] });
 
     const stale = structuredClone(before);
     const staleObject = stale.objects.find((obj) => obj.id === "owner_box");
@@ -1046,7 +1052,7 @@ describe("turn recorder", () => {
     expect(comparableTurnEvents(replay.recorded.events)).toEqual(comparableTurnEvents(recorder.turns[0].events));
     const transcript = effectTranscriptFromRecordedTurn(recorder.turns[0]);
     expect(effectTranscriptFromRecordedTurn(replay.recorded)).toEqual(transcript);
-    expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [] });
+    expect(validateTranscriptAgainstSerializedWorld(before, transcript)).toEqual({ ok: true, errors: [], mismatchedReadCells: [] });
     const preStateHash = transcriptTouchedStateHash(before, transcript);
     const postStateHash = transcriptTouchedStateHash(replay.serializedAfter, transcript);
     expect(preStateHash).toMatch(/^[a-f0-9]{64}$/);

@@ -85,6 +85,16 @@ export type ShadowCommitConflict = {
     | "post_state_mismatch";
   errors: string[];
   receipt: ShadowCommitReceipt;
+  // Structured cell refs for the reads whose pre-state version/value did not
+  // match this commit scope's authoritative cells (the `read version mismatch`
+  // / `read value mismatch` errors above, in cell form). The authoritative
+  // commit path uses these to build a targeted cell-page refresh transfer from
+  // the commit scope's CURRENT state, attached to the turn-exec reply so a
+  // stale caller (e.g. an MCP gateway shard holding a `name@0` actor stub while
+  // the commit scope is at `name@1`) can install the fresh cells and converge
+  // on the next repair attempt instead of grinding the retry budget. Only set
+  // for read-mismatch rejections; omitted otherwise.
+  mismatched_read_cells?: TranscriptCell[];
 };
 
 export type ShadowCommitResult = ShadowCommitAccepted | ShadowCommitConflict;
@@ -215,6 +225,60 @@ function shadowScopeHeadForAcceptedCommit(
   };
 }
 
+// Reasons whose verdict cannot be superseded by the post-apply
+// `post_state_mismatch` check, so a submission carrying one can be rejected
+// before paying commit-apply. stale_head/scope_mismatch/permission_denied
+// outrank post_state_mismatch; read_version_mismatch is convergence-safe to
+// short-circuit (the repair transfer refreshes the cells, the next attempt runs
+// the full path). incomplete_transcript / nondeterministic are intentionally
+// absent — see the gate in `submitShadowCommit`.
+const PRE_APPLY_REJECT_REASONS: ReadonlySet<ShadowCommitConflict["reason"]> = new Set([
+  "stale_head",
+  "scope_mismatch",
+  "permission_denied",
+  "read_version_mismatch"
+]);
+
+// Build (and conditionally cache) the conflict for a rejected commit. Shared by
+// the pre-apply gate and the post-apply path so both produce a byte-identical
+// conflict shape and obey the same caching rule.
+function rejectShadowCommit(
+  scope: ShadowCommitScope,
+  submit: ShadowCommitSubmit,
+  submissionId: string | undefined,
+  submissionCacheKey: string | undefined,
+  receipt: ShadowCommitReceipt,
+  validation: TranscriptValidation
+): ShadowCommitConflict {
+  const reason = shadowConflictReason(receipt.errors);
+  const conflict: ShadowCommitConflict = {
+    kind: "woo.commit.conflict.shadow.v1",
+    id: submissionId,
+    scope: submit.scope,
+    current: scope.head,
+    reason,
+    errors: receipt.errors,
+    receipt,
+    // Carry the mismatched read cells for a read-version/value rejection so the
+    // authoritative reply builder can refresh exactly those cells from this
+    // scope's current state (DESIGN A layer-2 fix). Other reasons (stale_head,
+    // permission, post-state) need no per-cell transfer here.
+    ...(reason === "read_version_mismatch" && validation.mismatchedReadCells.length > 0
+      ? { mismatched_read_cells: validation.mismatchedReadCells }
+      : {})
+  };
+  // `stale_head` is a transient conflict: the same submission id can succeed
+  // on a later retry once the caller resubmits against the new head (or the
+  // relay's `executeShadowTurnCallAcrossInProcessNetwork` re-runs the verb
+  // and updates `expected` automatically). Caching the rejection by id would
+  // serve the stale conflict to every retry, which makes the convergence
+  // loop fail even though the underlying transcript would commit. Permanent
+  // rejections (post-state mismatch, permission, invariant) stay cached so
+  // re-submissions don't retry doomed work.
+  if (submissionCacheKey && conflict.reason !== "stale_head") scope.submissions.set(submissionCacheKey, conflict);
+  return conflict;
+}
+
 export function submitShadowCommit(scope: ShadowCommitScope, submit: ShadowCommitSubmit): ShadowCommitResult {
   const submissionId = shadowSubmissionId(submit);
   const submissionCacheKey = shadowSubmissionCacheKey(submit);
@@ -226,39 +290,69 @@ export function submitShadowCommit(scope: ShadowCommitScope, submit: ShadowCommi
   const stateBefore = ensureShadowCommitScopeState(scope);
   const beforeReader = createCommitScopeStateCellReader(stateBefore);
   const validation = validateTranscriptWithCellReader(beforeReader, submit.transcript);
+  const preStateHash = transcriptTouchedStateHashWithReader(beforeReader, submit.transcript);
+
+  // P1.1 pre-apply rejection gate. Every commit error EXCEPT post_state_mismatch
+  // is knowable from the pre-state: `shadowCommitEnvelopeErrors` (stale_head /
+  // scope_mismatch / incomplete_transcript, plus the read/value/prior mismatches
+  // carried in `validation`) and `validateShadowWriteAuthorityIndex`
+  // (permission_denied). The ONLY thing applying the transcript can ADD is a
+  // `post_state_mismatch` (validateShadowPostState emits nothing else). So when
+  // the pre-state already names a doomed reason that a post_state_mismatch
+  // cannot outrank, reject WITHOUT paying commit-apply + post-state-reader
+  // construction — the bulk of a turn's commit CPU. This is the hot path for the
+  // stale-head and read-version-mismatch repair rounds, which are
+  // doomed-by-construction yet otherwise pay full apply cost on every attempt.
+  // Applying does not mutate `stateBefore` (it builds a discarded clone and only
+  // `commitShadowCommitScopeState` below installs it), so skipping it on a
+  // rejection has no state side-effect.
+  const envelopeErrors = shadowCommitEnvelopeErrors(scope, submit, validation);
+  const writeAuthorityErrors = validateShadowWriteAuthorityIndex(
+    serializedAuthorityIndexFromState(stateBefore),
+    submit.transcript
+  );
+  const preApplyErrors = [...envelopeErrors, ...writeAuthorityErrors];
+  const preApplyReason = preApplyErrors.length > 0 ? shadowConflictReason(preApplyErrors) : null;
+  // stale_head / scope_mismatch / permission_denied outrank post_state_mismatch
+  // (priority 4), so their reason is identical with or without apply.
+  // read_version_mismatch is lower priority, but short-circuiting it is
+  // convergence-safe: the DESIGN A repair transfer refreshes exactly the
+  // mismatched cells, and the next attempt — reads no longer stale — runs the
+  // full apply+post-state path and surfaces any genuine post_state_mismatch.
+  // incomplete_transcript / nondeterministic are deliberately NOT short-circuited
+  // so a post_state_mismatch verdict can never be silently downgraded.
+  if (preApplyReason && PRE_APPLY_REJECT_REASONS.has(preApplyReason)) {
+    // Nothing is applied, so the touched cells' post image equals their pre
+    // image: reuse preStateHash for both receipt hashes.
+    const receipt = shadowCommitReceiptFromTouchedStateHashes(
+      submit.transcript,
+      preStateHash,
+      preStateHash,
+      preApplyErrors,
+      validation
+    );
+    return rejectShadowCommit(scope, submit, submissionId, submissionCacheKey, receipt, validation);
+  }
+
   const applied = applyShadowTranscriptToIndexedState(stateBefore, submit.transcript, { profile: submit.profile, metric: submit.metric });
   const afterReader = createCommitScopeStateCellReader(applied.state);
-  const extraErrors = shadowCommitEnvelopeErrors(scope, submit, validation);
-  extraErrors.push(...validateShadowPostState(afterReader, submit.transcript));
-  extraErrors.push(...validateShadowWriteAuthorityIndex(serializedAuthorityIndexFromState(stateBefore), submit.transcript));
+  // Preserve the historical error ordering (envelope, post-state, write-authority)
+  // for callers/logs that read `receipt.errors` as an ordered list.
+  const extraErrors = [
+    ...envelopeErrors,
+    ...validateShadowPostState(afterReader, submit.transcript),
+    ...writeAuthorityErrors
+  ];
 
   const receipt = shadowCommitReceiptFromTouchedStateHashes(
     submit.transcript,
-    transcriptTouchedStateHashWithReader(beforeReader, submit.transcript),
+    preStateHash,
     transcriptTouchedStateHashWithReader(afterReader, submit.transcript),
     extraErrors,
     validation
   );
   if (!receipt.accepted) {
-    const conflict: ShadowCommitConflict = {
-      kind: "woo.commit.conflict.shadow.v1",
-      id: submissionId,
-      scope: submit.scope,
-      current: scope.head,
-      reason: shadowConflictReason(receipt.errors),
-      errors: receipt.errors,
-      receipt
-    };
-    // `stale_head` is a transient conflict: the same submission id can succeed
-    // on a later retry once the caller resubmits against the new head (or the
-    // relay's `executeShadowTurnCallAcrossInProcessNetwork` re-runs the verb
-    // and updates `expected` automatically). Caching the rejection by id would
-    // serve the stale conflict to every retry, which makes the convergence
-    // loop fail even though the underlying transcript would commit. Permanent
-    // rejections (post-state mismatch, permission, invariant) stay cached so
-    // re-submissions don't retry doomed work.
-    if (submissionCacheKey && conflict.reason !== "stale_head") scope.submissions.set(submissionCacheKey, conflict);
-    return conflict;
+    return rejectShadowCommit(scope, submit, submissionId, submissionCacheKey, receipt, validation);
   }
 
   commitShadowCommitScopeState(scope, applied.state);

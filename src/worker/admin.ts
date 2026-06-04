@@ -8,6 +8,8 @@
 // Endpoints:
 //   GET /admin/              — HTML page (HTTP Basic gated)
 //   GET /admin/series        — JSON time-series, proxies AE SQL API
+//   POST /admin/purge-inactive-guests
+//                            — operator-triggered lifecycle cleanup
 //
 // Auth model: HTTP Basic, single user `admin`, password from
 // `env.ADMIN_PASSWORD`. Fails closed when the secret is unset (503).
@@ -18,9 +20,12 @@
 // notes/2026-05-17-admin-stats.md (the step-by-step plan).
 
 import type { Env } from "./persistent-object-do";
+import { signInternalRequest } from "./internal-auth";
 
 const REALM = "woah-admin";
 const ADMIN_USER = "admin";
+const WORLD_HOST = "world";
+const INTERNAL_ORIGIN = "https://woo.internal";
 
 export async function handleAdmin(request: Request, env: Env, url: URL): Promise<Response> {
   // Fail closed when the admin secret isn't set. Surfacing as 503 (not
@@ -58,6 +63,10 @@ export async function handleAdmin(request: Request, env: Env, url: URL): Promise
     return await handleFootprint(request, env, url);
   }
 
+  if (url.pathname === "/admin/purge-inactive-guests") {
+    return await handlePurgeInactiveGuests(request, env);
+  }
+
   return jsonResponse({ error: { code: "E_NOT_FOUND", message: `no /admin/ route for ${url.pathname}` } }, 404);
 }
 
@@ -91,6 +100,37 @@ function constantTimeEqual(a: string, b: string): boolean {
     diff |= (ea[i] ?? 0) ^ (eb[i] ?? 0);
   }
   return diff === 0;
+}
+
+// ─── /admin/purge-inactive-guests ─────────────────────────────────────
+//
+// Operator-only recovery path for stale guest/session projections. The
+// Worker surface stays Basic-auth gated, then signs an internal request to
+// WORLD so the actual purge runs in the same serialized DO context as normal
+// session lifecycle cleanup.
+
+async function handlePurgeInactiveGuests(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") {
+    return jsonResponse({ error: { code: "E_METHOD", message: "use POST /admin/purge-inactive-guests" } }, 405, { allow: "POST" });
+  }
+  if (!env.WOO_INTERNAL_SECRET) {
+    return jsonResponse({ error: { code: "E_BOOTSTRAP_TOKEN_MISSING", message: "set WOO_INTERNAL_SECRET via wrangler secret put" } }, 503);
+  }
+
+  const headers = new Headers({ "content-type": "application/json; charset=utf-8", "x-woo-host-key": WORLD_HOST });
+  const internal = await signInternalRequest(env, new Request(`${INTERNAL_ORIGIN}/__internal/purge-inactive-guests`, {
+    method: "POST",
+    headers,
+    body: "{}"
+  }));
+  const id = env.WOO.idFromName(WORLD_HOST);
+  try {
+    const response = await env.WOO.get(id).fetch(internal);
+    const text = await response.text();
+    return jsonTextResponse(text, response.status, response.headers.get("content-type") ?? "application/json; charset=utf-8");
+  } catch (err) {
+    return jsonResponse({ error: { code: "E_INTERNAL", message: `purge-inactive-guests failed: ${errorMessage(err)}` } }, 502);
+  }
 }
 
 // ─── /admin/series ─────────────────────────────────────────────────────
@@ -450,10 +490,18 @@ async function safeText(response: Response): Promise<string> {
   }
 }
 
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function jsonResponse(body: unknown, status = 200, extraHeaders?: Record<string, string>): Response {
+  return jsonTextResponse(JSON.stringify(body), status, "application/json; charset=utf-8", extraHeaders);
+}
+
+function jsonTextResponse(body: string, status = 200, contentType = "application/json; charset=utf-8", extraHeaders?: Record<string, string>): Response {
+  return new Response(body, {
     status,
-    headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }
+    headers: { "content-type": contentType, "cache-control": "no-store", ...(extraHeaders ?? {}) }
   });
 }
 

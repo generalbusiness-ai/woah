@@ -1525,6 +1525,109 @@ describe("shadow turn execution", () => {
   });
 });
 
+describe("submitShadowCommit pre-apply rejection (P1.1)", () => {
+  // Plan a real set_control turn on the_dubspace and return the pre-state plus
+  // its transcript. Used to drive submitShadowCommit down the accept and the two
+  // short-circuited reject paths.
+  async function planControlTurn(id: string, value: number) {
+    const anchor = createWorld();
+    const session = anchor.auth(`guest:preapply-${id}`);
+    const actor = session.actor;
+    anchor.setProp("the_dubspace", "operators", [actor]);
+    const serializedBefore = anchor.exportWorld();
+    const planned = await runShadowTurnCall(authoritativePlanningWorld(serializedBefore), {
+      kind: "woo.turn_call.shadow.v1",
+      id,
+      route: "sequenced",
+      scope: "the_dubspace",
+      session: session.id,
+      actor,
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", value]
+    });
+    expect(planned.transcript.complete).toBe(true);
+    return { serializedBefore, transcript: planned.transcript };
+  }
+
+  // shadow_apply_step events fire only from inside applyShadowTranscriptToIndexedState,
+  // so an empty collector proves commit-apply was skipped.
+  function collectApplySteps(): { profile: (event: MetricEvent & { kind: "shadow_apply_step" }) => void; phases: string[] } {
+    const phases: string[] = [];
+    return { profile: (event) => { phases.push(event.phase); }, phases };
+  }
+
+  it("runs commit-apply only on the accept path, not on stale_head", async () => {
+    const { serializedBefore, transcript } = await planControlTurn("stale", 0.5);
+    const commitScope = createShadowCommitScope({ node: "stable-anchor", scope: "the_dubspace", serialized: serializedBefore });
+    const genesisHead = structuredClone(commitScope.head);
+
+    // Accept: apply runs, so apply-step events are emitted and the head advances.
+    const accept = collectApplySteps();
+    const accepted = submitShadowCommit(commitScope, {
+      kind: "woo.commit.submit.shadow.v1",
+      id: "preapply-accept",
+      scope: "the_dubspace",
+      expected: structuredClone(commitScope.head),
+      transcript,
+      profile: accept.profile
+    });
+    expect(accepted.kind).toBe("woo.commit.accepted.shadow.v1");
+    expect(accept.phases).toContain("apply_writes");
+
+    // Resubmit against the now-stale genesis head. stale_head outranks every
+    // other reason, so the round is doomed pre-apply and must NOT pay commit-apply.
+    const stale = collectApplySteps();
+    const rejected = submitShadowCommit(commitScope, {
+      kind: "woo.commit.submit.shadow.v1",
+      id: "preapply-stale",
+      scope: "the_dubspace",
+      expected: genesisHead,
+      transcript,
+      profile: stale.profile
+    });
+    expect(rejected.kind).toBe("woo.commit.conflict.shadow.v1");
+    if (rejected.kind !== "woo.commit.conflict.shadow.v1") throw new Error("expected stale_head conflict");
+    expect(rejected.reason).toBe("stale_head");
+    expect(stale.phases).toEqual([]);
+    // The receipt is still well-formed; with nothing applied, post == pre.
+    expect(rejected.receipt.post_state_hash).toBe(rejected.receipt.pre_state_hash);
+  });
+
+  it("rejects a read_version_mismatch before commit-apply and still carries the repair cells", async () => {
+    const { serializedBefore, transcript } = await planControlTurn("readmismatch", 0.5);
+    // Tamper a recorded prop read's version so it disagrees with the committed
+    // cell. Writes stay untouched (no post_state error to mask the verdict).
+    const tampered = structuredClone(transcript);
+    const propRead = tampered.reads.find((read) => read.cell.kind === "prop" && read.version !== undefined);
+    expect(propRead, "set_control transcript should record a versioned prop read").toBeDefined();
+    propRead!.version = String(Number(propRead!.version) + 7);
+
+    const commitScope = createShadowCommitScope({ node: "stable-anchor", scope: "the_dubspace", serialized: serializedBefore });
+    const probe = collectApplySteps();
+    const rejected = submitShadowCommit(commitScope, {
+      kind: "woo.commit.submit.shadow.v1",
+      id: "preapply-readmismatch",
+      scope: "the_dubspace",
+      expected: structuredClone(commitScope.head),
+      transcript: tampered,
+      profile: probe.profile
+    });
+
+    expect(rejected.kind).toBe("woo.commit.conflict.shadow.v1");
+    if (rejected.kind !== "woo.commit.conflict.shadow.v1") throw new Error("expected read_version_mismatch conflict");
+    expect(rejected.reason).toBe("read_version_mismatch");
+    // Commit-apply skipped entirely on the doomed round.
+    expect(probe.phases).toEqual([]);
+    // DESIGN A repair data survives the pre-apply path: the mismatched cell is
+    // handed back so the caller can refresh it and converge on the next attempt.
+    expect(rejected.mismatched_read_cells?.length).toBeGreaterThan(0);
+    expect(rejected.mismatched_read_cells).toContainEqual(propRead!.cell);
+    // Nothing applied: the scope head did not advance.
+    expect(commitScope.head).toEqual(createShadowCommitScope({ node: "stable-anchor", scope: "the_dubspace", serialized: serializedBefore }).head);
+  });
+});
+
 function shadowTurnKeyWithoutPreimage(key: ShadowTurnKey, removed: string): ShadowTurnKey {
   const remove = (preimages: string[], hashes: string[]) => {
     const nextPreimages: string[] = [];

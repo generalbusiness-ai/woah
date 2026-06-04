@@ -17,8 +17,10 @@
 // import cycle, this module imports the browser-local field TYPES with `import type`
 // only — those imports are erased at runtime, so the value dependency is strictly
 // browser-node → relay-cache.
-import type { SerializedAuthoritySlice, SerializedObject, SerializedSession, SerializedWorld } from "./repository";
+import type { SerializedAuthorityCellSlice, SerializedAuthoritySlice, SerializedObject, SerializedSession, SerializedWorld } from "./repository";
 import { mergeSerializedAuthoritySlice } from "./authority-slice";
+import type { ShadowCellPageTransfer } from "./shadow-turn-exec";
+import type { AuthorityPageRef } from "./shadow-state-pages";
 import {
   applyAcceptedProjectionToCommitScopeCache,
   applyAcceptedShadowFrame,
@@ -218,4 +220,43 @@ export function mergeAuthorityIntoRelayCache(
   if (preserved) restoreRelayActorLiveCells(serialized, preserved);
   if (changed) markShadowBrowserRelaySerializedChanged(relay);
   return changed;
+}
+
+// DESIGN A layer-2 install path. A `read_version_mismatch` rejection from the
+// committing scope carries a `version_mismatch_repair_cells` cell-page transfer
+// of the cells the caller planned against staler versions of. Install it into
+// the relay's planning cache so the next repair attempt plans against the fresh
+// committed cells and converges, instead of re-submitting the same stale rows.
+//
+// The transfer's page refs are stamped `authoritative` by the committing scope,
+// so converting it to a cell-authority slice and going through the ONE
+// authority-merge recipe means the standard precedence + version gate apply: an
+// owner-authoritative cell overrides a self-certified shard stub, and the
+// version gate refuses to install a row older than the cached one. We do NOT
+// preserve session-actor live cells here: the whole point is to refresh the
+// mismatched cells (commonly an actor identity/property), and location/contents
+// projections still come from the authoritative live page in the transfer.
+// Returns whether the merge changed durable cache state.
+export function installShadowCellPageTransferAsAuthority(
+  relay: ShadowRelayCache,
+  transfer: ShadowCellPageTransfer,
+  options: { reason?: string } = {}
+): boolean {
+  // The transfer is a content-addressed cell-page bundle whose shape is a
+  // superset of a cell-authority slice. The repair builder already stamped each
+  // page ref `source: "authoritative"` (a well-formed AuthorityPageRef), so this
+  // is a structural reinterpretation, not a re-derivation.
+  const slice: SerializedAuthorityCellSlice = {
+    kind: "woo.authority_slice.cells.shadow.v1",
+    sessions: transfer.sessions,
+    page_refs: transfer.page_refs as AuthorityPageRef[],
+    inline_pages: transfer.inline_pages,
+    counters: transfer.counters,
+    tombstones: transfer.tombstones,
+    source_object_count: transfer.source_object_count
+  };
+  return mergeAuthorityIntoRelayCache(relay, slice, {
+    reason: options.reason ?? "version_mismatch_repair",
+    clone: true
+  });
 }

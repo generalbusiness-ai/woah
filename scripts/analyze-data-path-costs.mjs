@@ -18,6 +18,16 @@ const CLASSIFICATION = {
     signal: "space, seq, verb, ms",
     endState: "Catalog log/application event; accepted frame remains the durable authority."
   },
+  turn_phase_timing: {
+    bucket: "request_wall_time",
+    signal: "attempts, authority_calls, and per-phase ms (ensure/authority/serialize/plan_build/vm/submit)",
+    endState: "Phase attribution for a turn; steady state is attempts=1 with authority+submit bounded by the turn's write set, local compute (serialize/plan_build/vm) negligible."
+  },
+  mcp_dispatch_timing: {
+    bucket: "request_wall_time",
+    signal: "method, cold_world, and per-step ms (get_world/forward/handle/register)",
+    endState: "/mcp wrapper steps outside the turn; warm dispatch is small, DELETE teardown is best-effort, and a slow DELETE is contention behind a slow POST, not intrinsic cost."
+  },
   broadcast: {
     bucket: "fanout",
     signal: "obs_count and audience_size",
@@ -37,6 +47,11 @@ const CLASSIFICATION = {
     bucket: "network_policy",
     signal: "host, object_count, and reason",
     endState: "Owner read was skipped/timed out; local last-known rows kept so commit validation arbitrates freshness."
+  },
+  authority_slice_content_expansion: {
+    bucket: "seed_cache",
+    signal: "roots, objects, hosts, cap",
+    endState: "Bounded pre-plan identity expansion from direct scope contents; replace with B7/projection warm-fill once steady-state warm turns need no reconstruction."
   },
   authority_tail: {
     bucket: "authority_append",

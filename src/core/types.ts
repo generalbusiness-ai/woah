@@ -362,7 +362,11 @@ export type MetricEvent =
   // already records a `cross_host_rpc{status:"timeout", rpc_id}` for the
   // underlying RPC; this distinct event captures the higher-level policy
   // decision so cross_host_rpc latency stats stay clean.
-  | { kind: "authority_slice_stale_fallback"; host: string; object_count: number; reason: "timeout" | "snapshot_fallback" }
+  | { kind: "authority_slice_stale_fallback"; host: string; object_count: number; reason: "timeout" | "snapshot_fallback" | "content_expansion_timeout" }
+  // Sparse MCP gateway pre-plan expansion from a requested scope's direct
+  // contents to the contained objects' owner authority. This is bounded identity
+  // repair for roster/name reads, not global enumeration.
+  | { kind: "authority_slice_content_expansion"; roots: number; objects: number; hosts: number; cap: number }
   // Emitted every time an authority slice is reconstructed on the turn path
   // (step 2a of the cell-authority perf plan, notes/2026-05-31-...). This is
   // the measurement that lets 2b–2e prove they remove per-turn reconstruction
@@ -451,6 +455,23 @@ export type MetricEvent =
   // "mutating" for a remote impure verb (forwardInternalChecked, no
   // timeout). Critical for diagnosing wedges that previously left no trail.
   | { kind: "dispatch_resolved"; target: ObjRef; verb: string; host: string; path: "local" | "read" | "mutating"; pure: boolean }
+  // Phase attribution for a single submitTurnIntent turn (Slice 1). Splits the
+  // turn's wall time across the loop's phases so a slow /mcp POST can be charged
+  // to authority reconstruction/fan-in vs local serialize/plan-build/VM compute
+  // vs the commit-envelope RPC, and so the repair loop's amplification is
+  // visible (`attempts` > 1 multiplies every phase). Each *_ms field sums across
+  // attempts; `authority_calls` counts authorityPayload invocations (each a
+  // potential cross-host authority-slice round trip). `outcome` distinguishes a
+  // committed turn from a local error frame that never reached submitEnvelope.
+  | { kind: "turn_phase_timing"; scope: ObjRef; commit_scope: ObjRef | null; target: ObjRef; verb: string; route: string; attempts: number; outcome: "submitted" | "local_frame" | "error"; total_ms: number; ensure_client_ms: number; authority_ms: number; authority_calls: number; serialize_ms: number; plan_build_ms: number; vm_ms: number; submit_ms: number }
+  // Phase attribution for the PersistentObjectDO `/mcp` dispatch wrapper (Slice
+  // 1). Covers the steps OUTSIDE submitTurnIntent — session forwarding, the SDK
+  // transport handle (which for POST contains the turn, for DELETE is just
+  // closeSession), and Directory route (de)registration — so a slow DELETE
+  // teardown (the worst smoke endpoint at 22s CPU) can be charged to a concrete
+  // step instead of guessed. `method` distinguishes POST turns from DELETE
+  // teardowns; `forward_ms`/`handle_ms`/`register_ms` split the block.
+  | { kind: "mcp_dispatch_timing"; method: string; host: string; cold_world: boolean; status: "ok" | "error"; total_ms: number; get_world_ms: number; forward_ms: number; handle_ms: number; register_ms: number }
   // Emitted when a parent-chain walk hits a missing intermediate. The parent
   // ref on `start` (or one of its ancestors) points at `missing`, which has
   // no entry in the local objects map. Treated as end-of-chain by the walk

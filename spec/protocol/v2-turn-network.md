@@ -675,6 +675,21 @@ A commit scope validates a `CommitSubmit` in this order:
 If validation fails, no write from the transcript is committed. The executor may
 catch up and retry the whole turn.
 
+Steps 1–9 are evaluable from pre-state alone; only step 10 requires applying the
+transcript, and applying can only *add* a post-state mismatch to the verdict —
+it can never turn a pre-state rejection into an acceptance. An implementation
+therefore MAY reject before step 10 (skipping the apply) when steps 1–9 already
+determine a rejection whose `reason` a post-state mismatch cannot supersede:
+`stale_head`, `scope_mismatch`, and `permission_denied` outrank
+`post_state_mismatch`, and `read_version_mismatch` is convergence-safe to
+short-circuit because the conflict's refreshed `conflicting_cells`/state transfer
+makes the retried attempt's reads current, so its next round re-runs the full
+apply path and surfaces any genuine post-state mismatch. This is an optimization
+for the doomed repair rounds that dominate a contended turn's commit cost; the
+accept/reject verdict and the recorded receipt are unchanged from running every
+step. `incomplete_transcript` and `nondeterministic` are NOT short-circuited, so
+a post-state-mismatch verdict can never be silently relabelled.
+
 Lease acquisition is intentionally minimal in this draft: a commit scope or its
 sequencer issues `LeaseToken`s for cells whose writes require fencing before the
 turn runs. The token is not authority by itself; it is valid only with envelope
@@ -1253,6 +1268,11 @@ cross-scope move accepted in one scope can leave another scope planning against
 stale presence. `session_objects` is a compatibility request field for older
 callers that do not send `authority`; authority-bearing requests MUST leave it
 empty, including when the authority itself is a legacy object-row slice.
+An internal open/envelope MUST carry the request's already-authenticated session
+row in both the request `sessions` list and the authority slice's `sessions`
+list. Sparse gateway authority reconstruction MAY omit unrelated sessions, but
+it MUST NOT omit the bound caller session; the CommitScopeDO derives
+browser-session claims from that row before validating the request token.
 After a client has opened a scope and the CommitScopeDO has a durable planning
 snapshot, an MCP per-envelope refresh MAY omit remote object-owner rows and
 fall back to that snapshot for execution state. The request MUST still carry
@@ -1288,6 +1308,16 @@ durable snapshot MUST reject capsule-only execution with `E_SNAPSHOT_REQUIRED`;
 rollout callers may then perform the legacy seed bootstrap and retry the
 envelope without the capsule. If the capsule's head is behind the scope head,
 the ordinary stale-head repair path applies.
+
+The capsule shortcut applies only when the commit scope will execute the turn
+from the caller's local execution view. If the executor has already planned a
+transcript for one turn-key scope and the selector chooses a different commit
+scope, the envelope is a planned-transcript commit. The caller MUST open the
+selected commit scope first and adopt its current head before building the
+envelope, then submit the planned transcript without an execution capsule. That
+open and envelope still obey the session-row rule above; a capsule-disabled
+planned-transcript commit is not allowed to rely on gateway-local session state
+that the selected CommitScopeDO has never seen.
 
 Executable cell-page transfers served for browser execution use the same
 `woo.state.transfer.v1` `cell_pages` transfer, with recipient-bound capsule
