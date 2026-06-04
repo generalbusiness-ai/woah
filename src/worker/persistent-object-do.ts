@@ -4613,6 +4613,8 @@ export class PersistentObjectDO {
     );
     const slices: SerializedAuthoritySlice[] = [authority];
     if (sessionActors.size > 0) {
+      const localActorLineage = mcpGatewayLocalActorLineageCellSlice(world, sessionActors, this.durableHostKey());
+      if (authoritySlicePageCount(localActorLineage) > 0) slices.push(localActorLineage);
       const localActorLive = mcpGatewayLocalActorLiveCellSlice(world, sessionActors, this.durableHostKey());
       if (authoritySlicePageCount(localActorLive) > 0) slices.push(localActorLive);
     }
@@ -4838,6 +4840,8 @@ export class PersistentObjectDO {
     }
     const slices: SerializedAuthoritySlice[] = [local.authority];
     if (mcpGatewayShard && localActorAuthorityRoots.size > 0) {
+      const actorLineage = mcpGatewayLocalActorLineageCellSlice(world, localActorAuthorityRoots, this.durableHostKey());
+      if (actorLineage.page_refs.length > 0) slices.push(actorLineage);
       const actorLive = mcpGatewayLocalActorLiveCellSlice(world, localActorAuthorityRoots, this.durableHostKey());
       if (actorLive.page_refs.length > 0) slices.push(actorLive);
       const actorCells = mcpGatewayLocalActorPropertyCellSlice(world, localActorAuthorityRoots, this.durableHostKey());
@@ -6841,6 +6845,11 @@ function directContentIdsFromAuthoritySlice(
   const visitContents = (contents: readonly ObjRef[]): boolean => {
     for (const id of contents) {
       if (seen.has(id)) continue;
+      // Guest actors are ephemeral transport identities. Active guests reach MCP
+      // planning through the session/Directory projection path above; stale guest
+      // ids left in a room's derived contents mirror must not trigger owner
+      // authority fan-in or presentation-stub repair loops.
+      if (isGuestActorRef(id)) continue;
       seen.add(id);
       ids.push(id);
       if (ids.length >= limit) return false;
@@ -6859,6 +6868,10 @@ function directContentIdsFromAuthoritySlice(
     if (!visitContents(obj.contents)) return ids;
   }
   return ids;
+}
+
+function isGuestActorRef(id: ObjRef): boolean {
+  return /^guest_\d+$/.test(id);
 }
 
 function mcpGatewayStubObject(input: {
@@ -7089,6 +7102,37 @@ function mcpGatewayLocalActorPropertyCellSlice(
     },
     tombstones: [],
     source_object_count: new Set(inlinePages.map((page) => page.object)).size
+  };
+}
+
+function mcpGatewayLocalActorLineageCellSlice(
+  world: WooWorld,
+  actors: ReadonlySet<ObjRef>,
+  hostKey: string
+): SerializedAuthorityCellSlice {
+  const inlinePages: ShadowStatePage[] = [];
+  for (const obj of world.exportObjects(actors)) {
+    // A sparse shard's first-touch actor row starts as a presentation stub
+    // (`name === id`). Do not export that as identity. Once Directory/forwarded
+    // session headers have installed a real display name, the row is a valid
+    // session projection and can repair older cache stubs without claiming owner
+    // authority.
+    if (obj.name === obj.id) continue;
+    inlinePages.push(shadowObjectLineagePage(obj));
+  }
+  const provenance: AuthorityPageProvenance = { source: "projection", source_host: hostKey };
+  return {
+    kind: "woo.authority_slice.cells.shadow.v1",
+    sessions: [],
+    page_refs: inlinePages.map((page) => stampAuthorityPageRef(page, true, provenance)),
+    inline_pages: inlinePages,
+    counters: {
+      objectCounter: 1,
+      parkedTaskCounter: 1,
+      sessionCounter: 1
+    },
+    tombstones: [],
+    source_object_count: inlinePages.length
   };
 }
 

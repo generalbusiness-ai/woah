@@ -191,12 +191,16 @@ describe("CF-local smoke walkthrough", () => {
         .filter((m) => m.kind === "authority_slice_content_expansion")
         .filter((m) => Number(m.objects) > 0);
       expect(
-        contentExpansions.length,
-        "stale pre-existing room occupants must trigger bounded pre-plan contents authority expansion"
-      ).toBeGreaterThan(0);
+        contentExpansions,
+        "stale guest room contents must not trigger pre-plan contents authority expansion; active guests arrive through Directory/session projection"
+      ).toEqual([]);
       const admissionViolations = warnSpy.mock.calls
         .filter((call) => call[0] === "woo.planning_world_inadmissible")
         .map((call) => JSON.stringify(call[1] ?? {}));
+      expect(
+        admissionViolations,
+        "stale room guest contents must not enter MCP planning as presentation stubs; active peer actors arrive through Directory/session projection"
+      ).toEqual([]);
       const repairedInitialEnters = initialChatroomEnters
         .filter((m) => Number(m.attempts) !== 1)
         .map((m) => `${String(m.target)}:${String(m.verb)} attempts=${String(m.attempts)} auth_calls=${String(m.authority_calls)} total=${String(m.total_ms)}ms`);

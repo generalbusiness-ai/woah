@@ -179,6 +179,17 @@ function serializedSessionForMcpEntry(entry: SessionEntry): SerializedSession {
   };
 }
 
+function mcpDirectorySessionScopesForAuthority(entry: SessionEntry, ...scopes: Array<ObjRef | null | undefined>): ObjRef[] {
+  const out = new Set<ObjRef>();
+  const add = (scope: ObjRef | null | undefined): void => {
+    if (!scope || scope === "#-1") return;
+    out.add(scope);
+  };
+  add(entry.woo.activeScope ?? null);
+  for (const scope of scopes) add(scope);
+  return Array.from(out).sort();
+}
+
 function ensureSerializedSession(sessions: readonly SerializedSession[], session: SerializedSession): SerializedSession[] {
   const out = sessions.map((item) => structuredClone(item) as SerializedSession);
   const existing = out.find((item) => item.id === session.id);
@@ -692,11 +703,17 @@ export class McpGateway {
         const isPrePlan = context?.phase === "pre_plan";
         const useCommitScopeSnapshotForRemoteAuthority = !isPrePlan && authorityRefreshAttempts === 0;
         if (!isPrePlan) authorityRefreshAttempts += 1;
+        const contentExpansionRoots = isPrePlan ? [submitScope, target] : [];
         const payload = await this.v2AuthorityPayload(extraObjectIds, {
           useCommitScopeSnapshotForRemoteAuthority,
           tolerateRemoteFailures: isPrePlan,
-          directorySessionScopes: options.directorySessionScopes ?? [],
-          ...(isPrePlan ? { scopeContentExpansionRoots: [submitScope, target] } : {}),
+          directorySessionScopes: mcpDirectorySessionScopesForAuthority(
+            entry,
+            submitScope,
+            ...contentExpansionRoots,
+            ...(options.directorySessionScopes ?? [])
+          ),
+          ...(contentExpansionRoots.length > 0 ? { scopeContentExpansionRoots: contentExpansionRoots } : {}),
           reconstructionReason: "warm_turn_refresh",
           reconstructionScope: submitScope
         });
@@ -810,7 +827,9 @@ export class McpGateway {
     // materialized /v2/open retry. Coalesce it per scope so parallel sessions
     // do not each build and post the same seed.
     const initializer = (async () => {
-      const seeded = await this.v2SerializedWorld([scope, entry.woo.actor]);
+      const seeded = await this.v2SerializedWorld([scope, entry.woo.actor], {
+        directorySessionScopes: mcpDirectorySessionScopesForAuthority(entry, scope)
+      });
       const client: V2ScopeClient = {
         scope,
         relay: createShadowBrowserRelayShim({
@@ -856,7 +875,9 @@ export class McpGateway {
     const pending = (async () => {
       const authority = this.withMcpSessionAuthority(
         entry,
-        seeded?.authority ?? await this.v2AuthorityPayload([client.scope, entry.woo.actor])
+        seeded?.authority ?? await this.v2AuthorityPayload([client.scope, entry.woo.actor], {
+          directorySessionScopes: mcpDirectorySessionScopesForAuthority(entry, client.scope)
+        })
       );
       this.mergeV2AuthorityIntoScopeClient(client, authority.authority);
       if (hooks.executionCapsuleOpen && !requireCommitScopeOpen) {
@@ -931,8 +952,11 @@ export class McpGateway {
     );
   }
 
-  private async v2SerializedWorld(extraObjectIds: ObjRef[]): Promise<{ serialized: ReturnType<WooWorld["exportWorld"]>; authority: ReturnType<typeof executorAuthorityPayload> }> {
-    const authority = await this.v2AuthorityPayload(extraObjectIds);
+  private async v2SerializedWorld(
+    extraObjectIds: ObjRef[],
+    options: { directorySessionScopes?: ObjRef[] } = {}
+  ): Promise<{ serialized: ReturnType<WooWorld["exportWorld"]>; authority: ReturnType<typeof executorAuthorityPayload> }> {
+    const authority = await this.v2AuthorityPayload(extraObjectIds, options);
     const serialized = serializedWorldFromAuthoritySlice(authority.authority);
     return { serialized, authority };
   }
