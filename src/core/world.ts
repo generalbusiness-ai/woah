@@ -3195,6 +3195,51 @@ export class WooWorld {
     return true;
   }
 
+  // Operator cleanup for guests stranded by missed lifecycle cleanup: reap
+  // expired sessions first, then reset only guest instances with no live
+  // session. Room contents are repaired by moving the actor, never by editing a
+  // room's contents cache directly.
+  purgeInactiveGuests(now = Date.now()): {
+    inspected: number;
+    reaped_sessions: string[];
+    reset_actors: ObjRef[];
+  } {
+    const reapedSessions = this.reapExpiredSessions(now);
+    const liveGuestActors = new Set<ObjRef>();
+    for (const session of this.sessions.values()) {
+      if (!this.inheritsFrom(session.actor, "$guest")) continue;
+      if (!this.sessionExpired(session, now)) liveGuestActors.add(session.actor);
+    }
+
+    let inspected = 0;
+    const resetActors: ObjRef[] = [];
+    for (const actor of Array.from(this.objects.keys()).sort() as ObjRef[]) {
+      if (!actor.startsWith("guest_") || !this.inheritsFrom(actor, "$guest")) continue;
+      inspected += 1;
+      if (liveGuestActors.has(actor)) continue;
+      let changed = false;
+      for (const obj of this.objects.values()) {
+        if (this.propOrNull(obj.id, "subscribers") === null && this.propOrNull(obj.id, "session_subscribers") === null) continue;
+        if (this.dropAllSubscriberRowsForActor(obj.id, actor)) changed = true;
+      }
+      const guest = this.object(actor);
+      const needsReset =
+        guest.location !== "$nowhere" ||
+        guest.contents.size > 0 ||
+        (Array.isArray(this.propOrNull(actor, "aliases")) && (this.propOrNull(actor, "aliases") as WooValue[]).length > 0) ||
+        (Array.isArray(this.propOrNull(actor, "features")) && (this.propOrNull(actor, "features") as WooValue[]).length > 0);
+      if (needsReset) {
+        this.resetGuestOnDisconnect(actor);
+        changed = true;
+      } else {
+        this.returnGuest(actor);
+      }
+      if (changed) resetActors.push(actor);
+    }
+    if (reapedSessions.length > 0 || resetActors.length > 0) this.persist(true);
+    return { inspected, reaped_sessions: reapedSessions, reset_actors: resetActors };
+  }
+
   /**
    * Returns true iff `actor` has at least one live session. Used by recycle
    * pre-flight (§RC6) to decide whether an actor is currently bound and

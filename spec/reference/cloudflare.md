@@ -772,6 +772,17 @@ those sparse rows except for exact ids whose owner was resolved through
 Directory. Actual durable turn execution still
 commits through `CommitScopeDO`.
 
+`DELETE /mcp` is a session end, not a heartbeat. When an established MCP session
+is routed to a shard, the shard closes the local transport queue, drops local
+session/tool cache rows, forwards a signed internal end-session request to
+`world`, and unregisters the Directory `session_route`. The `/mcp` wrapper must
+not run the normal post-response `register-session` path for that 204 response:
+doing so would resurrect a closed route and leave temporary guest actors in
+durable room contents until a later reap. Operators may use
+`POST /api/admin/purge-inactive-guests` to run the same guest reset lifecycle
+for already-accumulated inactive guests and to delete expired Directory session
+routes.
+
 Sparse MCP session projection may include Directory-derived actor
 lineage/properties and scope presence rows as `projection` authority pages. It
 must not treat Directory's `current_location` as actor movement truth. To satisfy

@@ -1048,6 +1048,27 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
     }
   });
 
+  it("purges inactive guest actors without moving live guests", async () => {
+    const harness = make();
+    try {
+      const world = harness.world;
+      const stale = world.auth("guest:conf-purge-stale");
+      const live = world.auth("guest:conf-purge-live");
+      await world.directCall("enter-stale-chat", stale.actor, "the_chatroom", "enter", []);
+      await world.directCall("enter-live-chat", live.actor, "the_chatroom", "enter", []);
+      world.endSession(stale.id);
+
+      const result = world.purgeInactiveGuests();
+      expect(result.reset_actors).not.toContain(live.actor);
+      expect(world.object(stale.actor).location).toBe("$nowhere");
+      expect(world.object(live.actor).location).toBe("the_chatroom");
+      expect(world.contentsOf("the_chatroom")).toContain(live.actor);
+      expect(world.contentsOf("the_chatroom")).not.toContain(stale.actor);
+    } finally {
+      harness.cleanup();
+    }
+  });
+
   it("resumes delayed FORK work through a new sequenced frame", async () => {
     const harness = make();
     try {

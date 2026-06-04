@@ -345,7 +345,15 @@ client → server: tools/call { name: "actor__wait", arguments: { timeout_ms: 10
 client ← server: tools/call result { structuredContent: { result: { observations, more, queue_depth } } }
 ```
 
-Disconnect: the MCP transport closes; the woo session may persist per session-grace rules ([identity.md §I6](../semantics/identity.md#i6-disconnect-and-reap-lifecycle)). Reconnect re-authenticates with the same token, refreshes `tools/list`, and drains `wait` to resync — the queue is session-scoped (§M4.1), so observations enqueued during the disconnect window are still there on reconnect within the grace period.
+Passive disconnect: the MCP transport drops without an explicit close; the woo
+session may persist per session-grace rules ([identity.md §I6](../semantics/identity.md#i6-disconnect-and-reap-lifecycle)).
+Reconnect re-authenticates with the same token, refreshes `tools/list`, and
+drains `wait` to resync — the queue is session-scoped (§M4.1), so observations
+enqueued during the disconnect window are still there on reconnect within the
+grace period. Explicit MCP session close (`DELETE /mcp` with
+`Mcp-Session-Id`) is different: it ends the woo session, reaps the session
+queue, and for guest actors runs the normal disconnect reset so durable room
+contents do not retain closed temporary actors.
 
 In the Cloudflare deployment, established MCP sessions may be stable-hashed to
 gateway shard DOs. A shard's cold-load state is the Directory session rows for
@@ -358,6 +366,9 @@ minimum session-local state needed to keep primary-session ordering and focused
 tool surfaces stable across shard hibernation. Those bounded rows are enough to
 rebind queues, route directed/current-scope observations, and resume the MCP
 transport. Tool enumeration and invocation fetch object authority lazily from
+the owning hosts. `DELETE /mcp` on a shard must not register a fresh Directory
+heartbeat; it must unregister the Directory session row and ask the authoritative
+`world` gateway to end the canonical woo session.
 the owning host or from the shard's durable projection/tool-surface caches. A
 shard MUST treat its local actor/scope rows as transport stubs only: they cannot
 replace owner authority for turn planning, route publication, or ownership

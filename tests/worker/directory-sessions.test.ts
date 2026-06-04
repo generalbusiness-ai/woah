@@ -309,4 +309,34 @@ describe("DirectoryDO register-session dedup", () => {
       cleanup();
     }
   });
+
+  it("purges expired session routes in one signed cleanup call", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const { directory, cleanup } = makeDirectory();
+    try {
+      await postRegister(directory, {
+        session_id: "sess_expired",
+        actor: "$expired",
+        expires_at: T0 - 1,
+        token_class: "guest",
+        active_scope: "$lobby"
+      });
+      await postRegister(directory, {
+        session_id: "sess_live",
+        actor: "$live",
+        expires_at: FAR_FUTURE,
+        token_class: "guest",
+        active_scope: "$lobby"
+      });
+
+      const purged = await directory.fetch(await signed("/purge-expired-sessions", {}));
+      expect(purged.ok).toBe(true);
+      expect(await purged.json()).toMatchObject({ ok: true, removed: 1 });
+      expect(await resolve(directory, "sess_expired")).toBeNull();
+      expect(await resolve(directory, "sess_live")).toMatchObject({ actor: "$live" });
+    } finally {
+      cleanup();
+    }
+  });
 });

@@ -170,6 +170,10 @@ export class DirectoryDO {
         return json({ ok: true, removed });
       }
 
+      if (request.method === "POST" && url.pathname === "/purge-expired-sessions") {
+        return json({ ok: true, removed: this.purgeExpiredSessions(Date.now()) });
+      }
+
       if (request.method === "POST" && url.pathname === "/resolve-session") {
         const body = await readJson(request);
         return json({ session: this.resolveSession(String(body.session_id ?? "")) });
@@ -432,6 +436,16 @@ export class DirectoryDO {
     ).toArray()[0] as { count?: number } | undefined;
     this.state.storage.sql.exec("DELETE FROM session_route WHERE apikey_id = ?", apikeyId);
     return Number(before?.count ?? 0);
+  }
+
+  private purgeExpiredSessions(now: number): number {
+    const before = Number(firstValue(this.state.storage.sql.exec(
+      "SELECT COUNT(*) AS count FROM session_route WHERE expires_at <= ?",
+      now
+    )) ?? 0);
+    if (before <= 0) return 0;
+    this.state.storage.sql.exec("DELETE FROM session_route WHERE expires_at <= ?", now);
+    return before;
   }
 
   private resolveSession(sessionId: string): SessionRoute | null {

@@ -183,6 +183,7 @@ export type McpGatewayOptions = {
   // in arrival order, letting persistAcceptedProjection write seq N+1 before
   // seq N and drop seq N at the cache's head-idempotency guard.
   durableProjectionHeadSeq?: (scope: ObjRef) => number | null;
+  onSessionClosed?: (sessionId: string) => void | Promise<void>;
   v2?: McpV2ClientHooks;
 };
 
@@ -218,7 +219,10 @@ export class McpGateway {
 
     if (request.method === "DELETE") {
       const id = headers.get(MCP_SESSION_HEADER);
-      if (id) this.closeSession(id);
+      if (id) {
+        this.closeSession(id);
+        await this.options.onSessionClosed?.(id);
+      }
       this.world.recordMetric({ kind: "mcp_request", method: "session_delete", ms: Date.now() - startedAt, status: "ok" });
       return new Response(null, { status: 204 });
     }

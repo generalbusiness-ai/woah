@@ -2559,7 +2559,8 @@ describe("McpHost", () => {
 describe("McpGateway", () => {
   it("initializes a session via Mcp-Token, lists tools, and calls a verb", async () => {
     const world = bootstrapWorld();
-    const gateway = new McpGateway(world);
+    const closedSessions: string[] = [];
+    const gateway = new McpGateway(world, { onSessionClosed: (sessionId) => { closedSessions.push(sessionId); } });
     const sessionsBeforeInit = new Set(world.sessions.keys());
 
     // 1) initialize
@@ -2623,6 +2624,7 @@ describe("McpGateway", () => {
       headers: { "mcp-session-id": sessionId! }
     }));
     expect(closed.status).toBe(204);
+    expect(closedSessions).toEqual([sessionId]);
   });
 
   it("advertises woo_call positional args as arbitrary JSON values", async () => {

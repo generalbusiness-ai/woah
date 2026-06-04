@@ -1206,7 +1206,15 @@ export class PersistentObjectDO {
           }
           const registerStartedAt = Date.now();
           try {
-            await this.registerMcpSessionRoute(world, request, response.clone(), mcpGatewayShard ? hostKey : null);
+            if (request.method === "DELETE") {
+              // DELETE /mcp is a session lifecycle boundary, not another
+              // activity heartbeat. Registering its 204 response would
+              // resurrect the Directory route we just closed and leave the
+              // guest actor in room contents until TTL/reap. The gateway hook
+              // below performs the durable cleanup.
+            } else {
+              await this.registerMcpSessionRoute(world, request, response.clone(), mcpGatewayShard ? hostKey : null);
+            }
           } finally {
             registerMs = Date.now() - registerStartedAt;
           }
@@ -1283,6 +1291,17 @@ export class PersistentObjectDO {
           }
         }
         return jsonResponse({ ok: results.every((r) => r.ok !== false), results });
+      }
+
+      if (worldGatewayHost && request.method === "POST" && pathname === "/api/admin/purge-inactive-guests") {
+        const session = this.requireRestSession(world, request);
+        if (!world.object(session.actor).flags.wizard) throw wooError("E_PERM", "wizard authority required");
+        const result = world.purgeInactiveGuests();
+        for (const sessionId of result.reaped_sessions) {
+          await this.unregisterSessionRoute(sessionId);
+        }
+        const directory_expired_sessions_removed = await this.purgeExpiredDirectorySessions();
+        return jsonResponse({ ok: true, ...result, directory_expired_sessions_removed });
       }
 
       const protocol = await handleRestProtocolRequest(workerRestRequest(request, pathname), {
@@ -1616,6 +1635,7 @@ export class PersistentObjectDO {
         // sequence against the durable projection-cache head so frames drain in
         // order instead of applying (and persisting) in arrival order.
         durableProjectionHeadSeq: (scope) => this.gatewayProjectionHeadSeq(scope),
+        onSessionClosed: (sessionId) => this.closeMcpWooSession(world, sessionId, this.durableHostKey()),
         broadcasts: {}
       });
       // On cold-load (DO rehydrate after hibernation), McpHost.queues is empty.
@@ -3350,6 +3370,13 @@ export class PersistentObjectDO {
         return jsonResponse({ ok: true, host: hostKey, ms: Date.now() - wipeStart });
       }
 
+      if (request.method === "POST" && pathname === "/__internal/end-session") {
+        const sessionId = String(body.session_id ?? "");
+        if (!sessionId) throw wooError("E_INVARG", "end-session requires session_id");
+        const ended = world.endSession(sessionId);
+        return jsonResponse({ ok: true, ended });
+      }
+
       if (request.method === "POST" && pathname === "/__internal/broadcast-applied") {
         const frame = body.frame && typeof body.frame === "object" && !Array.isArray(body.frame)
           ? body.frame as AppliedFrame
@@ -3846,6 +3873,38 @@ export class PersistentObjectDO {
     if (session) await this.registerSessionRoute(session, { mcpShard }, world);
   }
 
+  private async closeMcpWooSession(world: WooWorld, sessionId: string, hostKey: string): Promise<void> {
+    if (!sessionId) return;
+    this.deleteLocalGatewaySessionCache(sessionId);
+    if (hostKey === WORLD_HOST) {
+      world.endSession(sessionId);
+    } else {
+      // MCP shard worlds are sparse transport projections. They can drop the
+      // local session row, but WORLD owns the guest object and must run the
+      // authoritative guest reset that moves the actor back to $nowhere.
+      world.sessions.delete(sessionId);
+      await this.forwardInternalChecked<{ ok: true; ended: boolean }>(
+        WORLD_HOST,
+        "/__internal/end-session",
+        { session_id: sessionId },
+        { timeoutMs: this.hostReadRpcTimeoutMs() }
+      );
+    }
+    await this.unregisterSessionRoute(sessionId);
+  }
+
+  private deleteLocalGatewaySessionCache(sessionId: string): void {
+    try {
+      const sql = this.state.storage.sql;
+      sql.exec("DELETE FROM gateway_projection_session WHERE session_id = ?", sessionId);
+      sql.exec("DELETE FROM gateway_session_tool_manifest WHERE session_id = ?", sessionId);
+    } catch {
+      // These tables exist on current deployments but are cache-only. Session
+      // lifecycle cleanup must not fail because an old shard has not migrated a
+      // cache table yet.
+    }
+  }
+
   private async unregisterSessionRoute(sessionId: string): Promise<void> {
     try {
       const id = this.env.DIRECTORY.idFromName(DIRECTORY_HOST);
@@ -3875,6 +3934,23 @@ export class PersistentObjectDO {
       // Revocation is authoritative in the gateway world. Directory cleanup
       // prevents stale routed REST sessions from being resurrected through
       // x-woo-internal-session before the normal expiry window.
+    }
+  }
+
+  private async purgeExpiredDirectorySessions(): Promise<number> {
+    try {
+      const id = this.env.DIRECTORY.idFromName(DIRECTORY_HOST);
+      const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/purge-expired-sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json; charset=utf-8" },
+        body: "{}"
+      }));
+      const response = await this.env.DIRECTORY.get(id).fetch(request);
+      if (!response.ok) return 0;
+      const body = await response.json().catch(() => null) as { removed?: unknown } | null;
+      return Number(body?.removed ?? 0);
+    } catch {
+      return 0;
     }
   }
 

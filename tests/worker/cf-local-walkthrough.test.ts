@@ -215,7 +215,17 @@ describe("CF-local smoke walkthrough", () => {
 
       // DELETE teardown is the worst smoke endpoint; prove its dispatch metric
       // fires too. Close alice here (and null it so finally won't double-close).
+      const closedAliceSessionId = alice!.sessionId;
       await alice!.close();
+      const staleAfterClose = await mcpFetch(harness, {
+        method: "POST",
+        headers: { "mcp-session-id": closedAliceSessionId },
+        body: rpc(999, "tools/list", {})
+      });
+      expect(
+        staleAfterClose.ok,
+        "DELETE /mcp must end the Woo session and unregister Directory so a stale MCP session id cannot be resumed"
+      ).toBe(false);
       alice = null;
       const deleteDispatch = logSpy.mock.calls
         .filter((c) => c[0] === "woo.metric" && typeof c[1] === "string")
