@@ -202,12 +202,16 @@ describe("v2 MCP e2e", () => {
       const actorEnvelopeIndex = actorPosts.findIndex((post) => post.path === "/v2/envelope");
       expect(actorOpenIndex, JSON.stringify(actorPosts.map((post) => post.path))).toBeGreaterThanOrEqual(0);
       expect(actorEnvelopeIndex, JSON.stringify(actorPosts.map((post) => post.path))).toBeGreaterThan(actorOpenIndex);
-      for (const body of [actorPosts[actorOpenIndex].body, actorPosts[actorEnvelopeIndex].body]) {
-        const sessions = body.sessions as Array<{ id?: string; actor?: string }>;
-        const authoritySessions = (body.authority as { sessions?: Array<{ id?: string; actor?: string }> }).sessions ?? [];
-        expect(sessions).toEqual(expect.arrayContaining([expect.objectContaining({ id: secondSession, actor: secondActor })]));
-        expect(authoritySessions).toEqual(expect.arrayContaining([expect.objectContaining({ id: secondSession, actor: secondActor })]));
-      }
+      const openBody = actorPosts[actorOpenIndex].body;
+      expect(openBody).toMatchObject({ open_protocol: "head_session.v1" });
+      expect(openBody).not.toHaveProperty("authority");
+      expect(openBody).not.toHaveProperty("serialized");
+      expect(openBody.sessions).toEqual(expect.arrayContaining([expect.objectContaining({ id: secondSession, actor: secondActor })]));
+      const envelopeBody = actorPosts[actorEnvelopeIndex].body;
+      const envelopeSessions = envelopeBody.sessions as Array<{ id?: string; actor?: string }>;
+      const authoritySessions = (envelopeBody.authority as { sessions?: Array<{ id?: string; actor?: string }> }).sessions ?? [];
+      expect(envelopeSessions).toEqual(expect.arrayContaining([expect.objectContaining({ id: secondSession, actor: secondActor })]));
+      expect(authoritySessions).toEqual(expect.arrayContaining([expect.objectContaining({ id: secondSession, actor: secondActor })]));
       const envelope = decodeEnvelope(String(actorPosts[actorEnvelopeIndex].body.envelope));
       const expected = (envelope.body as { expected?: { seq?: unknown } }).expected;
       expect(expected?.seq).toBe(1);
@@ -722,10 +726,17 @@ describe("v2 MCP e2e", () => {
       expect(accepted.map((frame) => frame.position.scope).sort()).toEqual([...actorScopes].sort());
       expect(accepted.map((frame) => frame.position.seq)).toEqual([1, 1, 1, 1]);
       const actorOpenBodies = openBodies.filter((body) => actorScopes.includes(body.scope));
-      expect(actorOpenBodies).toHaveLength(concurrentCalls);
-      expect(actorOpenBodies.every((body) => !Object.prototype.hasOwnProperty.call(body, "serialized"))).toBe(true);
-      expect(actorOpenBodies.every((body) => Array.isArray(body.session_objects) && body.session_objects.length === 0)).toBe(true);
-      expect(actorOpenBodies.every((body) => body.authority?.kind === "woo.authority_slice.cells.shadow.v1")).toBe(true);
+      expect(actorOpenBodies).toHaveLength(concurrentCalls * 2);
+      const tinyOpens = actorOpenBodies.filter((body) => !Object.prototype.hasOwnProperty.call(body, "authority"));
+      const seededOpens = actorOpenBodies.filter((body) => Object.prototype.hasOwnProperty.call(body, "authority"));
+      expect(tinyOpens).toHaveLength(concurrentCalls);
+      expect(seededOpens).toHaveLength(concurrentCalls);
+      expect(tinyOpens.every((body) => body.open_protocol === "head_session.v1")).toBe(true);
+      expect(tinyOpens.every((body) => !Object.prototype.hasOwnProperty.call(body, "serialized"))).toBe(true);
+      expect(tinyOpens.every((body) => Array.isArray(body.session_objects) && body.session_objects.length === 0)).toBe(true);
+      expect(seededOpens.every((body) => body.open_protocol === "head_session.v1")).toBe(true);
+      expect(seededOpens.every((body) => Object.prototype.hasOwnProperty.call(body, "serialized"))).toBe(true);
+      expect(seededOpens.every((body) => body.authority?.kind === "woo.authority_slice.cells.shadow.v1")).toBe(true);
     } finally {
       releaseEnvelopeBatch();
       for (const state of scopeStates.values()) state.close();
@@ -793,7 +804,13 @@ async function postCommitScope<T>(
     body: JSON.stringify(body)
   }));
   const response = await scope.fetch(request);
-  expect(response.ok).toBe(true);
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null) as { error?: { code?: string; message?: string } } | null;
+    const error = new Error(payload?.error?.message ?? `CommitScopeDO ${path} failed: ${response.status}`) as Error & { code?: string; value?: unknown };
+    error.code = payload?.error?.code;
+    error.value = payload;
+    throw error;
+  }
   return await response.json() as T;
 }
 

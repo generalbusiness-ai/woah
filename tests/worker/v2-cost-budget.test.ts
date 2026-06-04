@@ -307,6 +307,83 @@ describe("v2 CommitScopeDO cost budget", () => {
     }
   });
 
+  it("opens a planned-transcript commit scope with a head/session boundary instead of an executable seed", async () => {
+    const world = createWorld();
+    const first = world.auth("guest:cf-v2-head-session-open-a");
+    const scopeState = new FakeDurableObjectState("the_chatroom");
+    const commitScope = new CommitScopeDO(scopeState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-test-secret" });
+    const env = { WOO_INTERNAL_SECRET: "cf-test-secret" };
+    const metrics: Record<string, unknown>[] = [];
+    const logSpy = vi.spyOn(console, "log").mockImplementation((label: unknown, payload: unknown) => {
+      if (label === "woo.metric" && typeof payload === "string") {
+        metrics.push(JSON.parse(payload) as Record<string, unknown>);
+      }
+    });
+    const open = async (body: Record<string, unknown>): Promise<Record<string, any>> => {
+      const request = await signInternalRequest(env, new Request("https://woo.internal/v2/open", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body)
+      }));
+      const response = await commitScope.fetch(request);
+      expect(response.ok, await response.clone().text()).toBe(true);
+      return await response.json() as Record<string, any>;
+    };
+
+    try {
+      const seedAuthority = executorAuthorityPayload(world, ["the_chatroom", first.actor]);
+      await open({
+        scope: "the_chatroom",
+        node: "mcp:head-session-seed",
+        token: "guest:cf-v2-head-session-open-a",
+        session: first.id,
+        actor: first.actor,
+        ...seedAuthority
+      });
+      world.endSession(first.id);
+      const second = world.auth("guest:cf-v2-head-session-open-b");
+      expect(second.actor).toBe(first.actor);
+
+      resetStateCostLog(scopeState);
+      const metricStart = metrics.length;
+      const sessionAuthority = executorAuthorityPayload(world, ["the_chatroom", second.actor]);
+      const opened = await open({
+        scope: "the_chatroom",
+        node: "mcp:head-session-open",
+        token: "guest:cf-v2-head-session-open-b",
+        session: second.id,
+        actor: second.actor,
+        open_protocol: "head_session.v1",
+        known_head: null,
+        sessions: sessionAuthority.sessions,
+        session_objects: []
+      });
+      const newMetrics = metrics.slice(metricStart);
+
+      expect(opened).toMatchObject({
+        ok: true,
+        open_protocol: "head_session.v1",
+        relay: "node:commit-scope:the_chatroom",
+        head: expect.objectContaining({ scope: "the_chatroom" })
+      });
+      expect(opened).not.toHaveProperty("transfer");
+      expect(opened).not.toHaveProperty("executable_transfer");
+      expect(newMetrics.some((metric) => metric.kind === "shadow_open_executable_seed_bytes")).toBe(false);
+      expect(lastMetric(newMetrics, "v2_open")).toMatchObject({
+        transfer_mode: "head_session",
+        executable_transfer_bytes: 0,
+        executable_transfer_pages: 0
+      });
+      expect(writeRowsByTable(scopeState)).toEqual({
+        v2_commit_scope_meta: 1,
+        v2_commit_scope_session: 1
+      });
+    } finally {
+      logSpy.mockRestore();
+      scopeState.close();
+    }
+  });
+
   it("returns a compact executable seed marker when the open digest matches", async () => {
     const world = createWorld();
     const session = world.auth("guest:cf-v2-open-seed-cache");

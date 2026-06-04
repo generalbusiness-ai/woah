@@ -1315,9 +1315,14 @@ transcript for one turn-key scope and the selector chooses a different commit
 scope, the envelope is a planned-transcript commit. The caller MUST open the
 selected commit scope first and adopt its current head before building the
 envelope, then submit the planned transcript without an execution capsule. That
-open and envelope still obey the session-row rule above; a capsule-disabled
-planned-transcript commit is not allowed to rely on gateway-local session state
-that the selected CommitScopeDO has never seen.
+open MAY use `open_protocol: "head_session.v1"`: the request carries the
+authenticated session rows and receives the current commit-scope head, but does
+not request browser executable state. If the selected CommitScopeDO has no
+durable snapshot, it MUST reject the tiny head/session open with
+`E_SNAPSHOT_REQUIRED`; rollout callers may retry `head_session.v1` with a seed
+snapshot or authority slice. The open and envelope still obey the session-row
+rule above; a capsule-disabled planned-transcript commit is not allowed to rely
+on gateway-local session state that the selected CommitScopeDO has never seen.
 
 Executable cell-page transfers served for browser execution use the same
 `woo.state.transfer.v1` `cell_pages` transfer, with recipient-bound capsule

@@ -240,6 +240,44 @@ export class CommitScopeDO {
           phaseStartedAt = metricNow();
           const relay = await this.relayFor(input, { mergeSerializedAuth: input.open_protocol !== "checkpoint_tail.v1" });
           this.emitV2OpenStep("relay_for", phaseStartedAt, { scope, node });
+          if (input.open_protocol === "head_session.v1") {
+            // MCP planned-transcript commits execute from the transcript, not a
+            // browser-local VM. They must observe the current head and bind the
+            // session, but they must not build an executable open seed.
+            phaseStartedAt = metricNow();
+            this.ensureSerializedSession(relay, input);
+            this.emitV2OpenStep("ensure_session", phaseStartedAt, { scope, node, count: input.sessions.length });
+            phaseStartedAt = metricNow();
+            fullSave = await this.saveFullIfNeeded(relay);
+            let sessionSaved = false;
+            if (!fullSave) sessionSaved = this.saveHeadSessionOpenBoundary(relay, input);
+            this.emitV2OpenStep("head_session_persist", phaseStartedAt, {
+              scope,
+              node,
+              full_save: fullSave,
+              count: fullSave || sessionSaved ? 1 : 0
+            });
+            this.emitMetric({
+              kind: "v2_open",
+              scope,
+              node,
+              ms: metricElapsed(startedAt),
+              status: "ok",
+              transfer_mode: "head_session",
+              executable_transfer_cache: "hit",
+              executable_transfer_bytes: 0,
+              executable_transfer_pages: 0,
+              executable_transfer_inline_pages: 0,
+              preseeded_objects: 0,
+              full_save: fullSave
+            });
+            return jsonResponse({
+              ok: true,
+              open_protocol: "head_session.v1",
+              relay: relay.node,
+              head: relay.commit_scope.head
+            });
+          }
           if (input.open_protocol === "checkpoint_tail.v1") {
             phaseStartedAt = metricNow();
             fullSave = await this.saveFullIfNeeded(relay);
@@ -1495,6 +1533,31 @@ export class CommitScopeDO {
     }
   }
 
+  private saveHeadSessionOpenBoundary(relay: ShadowRelayCache, input: CommitScopeBaseRequest): boolean {
+    // A warm head/session open should persist at most the caller's session row.
+    // Cold relays are handled by saveFullIfNeeded above.
+    const session = shadowCommitScopeSession(relay.commit_scope, input.session, input.actor);
+    const actor = shadowCommitScopeObject(relay.commit_scope, input.actor);
+    if (!session || !actor) return false;
+    const body = JSON.stringify(session);
+    const existing = sqlRows<{ body: string }>(this.state.storage.sql.exec(
+      "SELECT body FROM v2_commit_scope_session WHERE id = ? LIMIT 1",
+      session.id
+    ))[0] ?? null;
+    if (existing?.body === body) return false;
+    const now = Date.now();
+    this.state.storage.transactionSync(() => {
+      this.saveMeta(relay, now);
+      this.state.storage.sql.exec(
+        "INSERT OR REPLACE INTO v2_commit_scope_session(id, body, updated_at) VALUES (?, ?, ?)",
+        session.id,
+        body,
+        now
+      );
+    });
+    return true;
+  }
+
   private loadSerializedWorld(meta: CommitScopeMetaRow): SerializedWorld {
     const objectRows = sqlRows<{ body: string }>(this.state.storage.sql.exec(
       "SELECT body FROM v2_commit_scope_object ORDER BY id"
@@ -2077,7 +2140,7 @@ type CommitScopeBaseRequest = {
 type CommitScopeOpenRequest = CommitScopeBaseRequest & {
   serialized?: SerializedWorld;
   last_known_head?: ShadowScopeHead;
-  open_protocol?: "checkpoint_tail.v1";
+  open_protocol?: "checkpoint_tail.v1" | "head_session.v1";
   known_head?: ShadowScopeHead | null;
   transfer_budget_bytes?: number;
   max_tail_frames?: number;

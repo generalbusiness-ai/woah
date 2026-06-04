@@ -111,6 +111,7 @@ export type McpV2OpenBody = {
   token: string;
   session: string;
   actor: ObjRef;
+  open_protocol?: "head_session.v1";
   known_head?: ShadowScopeHead | null;
   sessions: ReturnType<WooWorld["exportSessions"]>;
   session_objects: ReturnType<WooWorld["exportObjects"]>;
@@ -884,6 +885,10 @@ export class McpGateway {
         client.openedSessions.add(entry.woo.id);
         return;
       }
+      // Planned-transcript commits only need the selected commit scope's head
+      // and authenticated session row; shipping executable pages here puts
+      // every cross-scope MCP turn back on the legacy open hot path.
+      const headSessionOpen = options.forceLegacyOpen !== true && options.requireCommitScopeOpen === true;
       const openBody: McpV2OpenBody = {
         scope: client.scope,
         node: this.v2NodeFor(entry),
@@ -891,14 +896,26 @@ export class McpGateway {
         session: entry.woo.id,
         actor: entry.woo.actor,
         known_head: client.relay.commit_scope.head,
-        ...authority
+        ...(headSessionOpen ? {
+          open_protocol: "head_session.v1" as const,
+          sessions: authority.sessions,
+          session_objects: authority.session_objects
+        } : authority)
       };
       let opened: McpV2OpenResult;
       try {
         opened = await hooks.open(client.scope, openBody);
       } catch (err) {
-        if (!seeded || !isV2CommitScopeSnapshotRequiredError(err)) throw err;
-        opened = await hooks.open(client.scope, { ...openBody, serialized: seeded.serialized });
+        if (!isV2CommitScopeSnapshotRequiredError(err)) throw err;
+        const retrySeed = seeded ?? await this.v2SerializedWorld([client.scope, entry.woo.actor], {
+          directorySessionScopes: mcpDirectorySessionScopesForAuthority(entry, client.scope)
+        });
+        opened = await hooks.open(client.scope, {
+          ...openBody,
+          ...authority,
+          ...(headSessionOpen ? { open_protocol: "head_session.v1" as const } : {}),
+          serialized: retrySeed.serialized
+        });
       }
       if (opened.head) client.relay.commit_scope.head = opened.head;
       client.openedSessions.add(entry.woo.id);

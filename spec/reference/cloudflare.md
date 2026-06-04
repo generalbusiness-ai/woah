@@ -647,9 +647,10 @@ diagnostics beyond the local hard cap.
 
 `v2_open_step` splits aggregate `/v2/open` wall time across both authority
 planes. CommitScopeDO phases cover request verification/read, relay lookup,
-session seeding, browser relay construction, shadow open, executable seed
-construction/digest/install, full-save, checkpoint/tail packaging, checkpoint
-continuation stale, checkpoint pending, asynchronous checkpoint build, and response encoding. The gateway
+session seeding, head/session persistence, browser relay construction, shadow
+open, executable seed construction/digest/install, full-save, checkpoint/tail
+packaging, checkpoint continuation stale, checkpoint pending, asynchronous
+checkpoint build, and response encoding. The gateway
 WebSocket phases cover authority payload construction, CommitScopeDO open RPC,
 and WebSocket frame encoding/sends for hello, legacy display transfer,
 checkpoint/tail transfer chunks, executable transfer, and ads.
@@ -984,10 +985,13 @@ legacy seed bootstrap and retry without the capsule. This flag does not change
 checkpoint/tail projection catch-up and does not add a Cloudflare Durable Object
 class migration. Planned-transcript commits are not eligible for this shortcut:
 when the chosen commit scope differs from the planned transcript's turn-key
-scope, the gateway must first open the chosen scope, adopt its current head, and
-submit the transcript envelope without `execution_capsule`. The open/envelope
-payload must include the bound MCP session row in the request `sessions` field
-and in `authority.sessions`; otherwise the selected CommitScopeDO cannot derive
+scope, the gateway must first open the chosen scope with
+`open_protocol: "head_session.v1"`, adopt its current head, and submit the
+transcript envelope without `execution_capsule`. Warm head/session opens carry
+only session rows and never build executable seed transfers; cold scopes may
+retry the same protocol with a seed snapshot. The envelope payload must include
+the bound MCP session row in the request `sessions` field and in
+`authority.sessions`; otherwise the selected CommitScopeDO cannot derive
 the browser-session auth claim for a session that only the gateway shard has seen.
 
 Live no-commit v2 transcripts follow the same MCP shard discovery and are sent
