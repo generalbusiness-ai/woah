@@ -16,7 +16,7 @@ import type { EffectTranscript } from "../core/effect-transcript";
 import { buildSerializedAuthorityCellSlice, cellProvenanceFromAuthoritySlice, combineSerializedAuthoritySlices, serializedWorldFromAuthoritySlice } from "../core/authority-slice";
 import { wooError, type AppliedFrame, type DirectResultFrame, type ErrorFrame, type ErrorValue, type Message, type ObjRef, type Session, type WooValue } from "../core/types";
 import type { WooWorld } from "../core/world";
-import type { SerializedAuthoritySlice } from "../core/repository";
+import type { SerializedAuthoritySlice, SerializedSession } from "../core/repository";
 import { projectionDeltaMissingWrites, type ProjectionWrite } from "../core/projection-delta";
 import { createMcpServer } from "./server";
 import { McpHost, type McpAcceptedFrameAudience, type McpBroadcastHooks, type McpDispatchHooks, type McpToolManifestHooks } from "./host";
@@ -42,7 +42,8 @@ import {
   executorEnvelopeId,
   submitTurnIntent,
   executorAuthorityPayload,
-  type ExecutionCapsule
+  type ExecutionCapsule,
+  type ExecutorAuthorityPayload
 } from "../core/executor";
 
 const MCP_TOKEN_HEADER = "mcp-token";
@@ -162,6 +163,32 @@ type RemoteAcceptedCommit = {
   receivedAt: number;
   routed?: boolean;
 };
+
+function serializedSessionForMcpEntry(entry: SessionEntry): SerializedSession {
+  const session = entry.woo;
+  return {
+    id: session.id,
+    actor: session.actor,
+    started: session.started,
+    expiresAt: session.expiresAt,
+    lastDetachAt: session.lastDetachAt,
+    tokenClass: session.tokenClass,
+    activeScope: session.activeScope,
+    ...(session.apikeyId !== undefined ? { apikeyId: session.apikeyId } : {})
+  };
+}
+
+function ensureSerializedSession(sessions: readonly SerializedSession[], session: SerializedSession): SerializedSession[] {
+  const out = sessions.map((item) => structuredClone(item) as SerializedSession);
+  const existing = out.find((item) => item.id === session.id);
+  if (!existing) {
+    out.push(structuredClone(session) as SerializedSession);
+  } else if (existing.actor !== session.actor) {
+    const index = out.indexOf(existing);
+    out[index] = structuredClone(session) as SerializedSession;
+  }
+  return out.sort((a, b) => a.id.localeCompare(b.id));
+}
 
 export type McpGatewayOptions = {
   serverName?: string;
@@ -675,7 +702,7 @@ export class McpGateway {
         const authorityPayload = fallbackClient && (payload.staleFallbackCount ?? 0) > 0
           ? this.withRelaySnapshotAuthorityFallback(fallbackClient, payload)
           : payload;
-        return authorityPayload;
+        return this.withMcpSessionAuthority(entry, authorityPayload);
       },
       applyAuthority: (client, authority) => {
         this.mergeV2AuthorityIntoScopeClient(client, authority);
@@ -822,7 +849,10 @@ export class McpGateway {
       return;
     }
     const pending = (async () => {
-      const authority = seeded?.authority ?? await this.v2AuthorityPayload([client.scope, entry.woo.actor]);
+      const authority = this.withMcpSessionAuthority(
+        entry,
+        seeded?.authority ?? await this.v2AuthorityPayload([client.scope, entry.woo.actor])
+      );
       this.mergeV2AuthorityIntoScopeClient(client, authority.authority);
       if (hooks.executionCapsuleOpen && !requireCommitScopeOpen) {
         client.openedSessions.add(entry.woo.id);
@@ -900,6 +930,20 @@ export class McpGateway {
     const authority = await this.v2AuthorityPayload(extraObjectIds);
     const serialized = serializedWorldFromAuthoritySlice(authority.authority);
     return { serialized, authority };
+  }
+
+  private withMcpSessionAuthority(entry: SessionEntry, payload: ExecutorAuthorityPayload): ExecutorAuthorityPayload {
+    const session = serializedSessionForMcpEntry(entry);
+    const sessions = ensureSerializedSession(payload.sessions, session);
+    const authoritySessions = ensureSerializedSession(payload.authority.sessions, session);
+    return {
+      ...payload,
+      sessions,
+      authority: {
+        ...payload.authority,
+        sessions: authoritySessions
+      }
+    };
   }
 
   private mergeV2AuthorityIntoScopeClient(client: V2ScopeClient, authority: SerializedAuthoritySlice): void {

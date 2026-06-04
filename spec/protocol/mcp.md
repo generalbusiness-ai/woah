@@ -208,7 +208,11 @@ execution still go through the CommitScopeDO authority path. If the selected
 commit scope differs from the planned transcript's turn-key scope, the gateway
 MUST perform a real commit-scope open before building the envelope; planned
 transcript commits cannot use the capsule shortcut because they are replaying a
-caller-planned transcript, not executing from the capsule's local view.
+caller-planned transcript, not executing from the capsule's local view. That
+open and the following envelope MUST carry the gateway-authenticated MCP session
+row in both the request `sessions` list and the authority slice's `sessions`
+list, even when sparse authority reconstruction omitted the session row, so the
+CommitScopeDO can derive and validate the browser-session token.
 
 ### M3.1 Working set: `$actor:focus`
 

@@ -136,6 +136,18 @@ describe("v2 MCP e2e", () => {
     const gateway = (): McpGateway => new McpGateway(world, {
       v2: {
         executionCapsuleOpen: true,
+        authorityPayload: async (extraObjectIds) => {
+          const payload = executorAuthorityPayload(world, extraObjectIds);
+          // Sparse MCP gateway shards can reconstruct object authority without
+          // carrying the just-bound session row. The gateway must splice its
+          // authenticated MCP session back into the commit-scope open/envelope
+          // payload so CommitScopeDO can derive browser-session claims.
+          return {
+            ...payload,
+            sessions: [],
+            authority: { ...payload.authority, sessions: [] }
+          };
+        },
         open: async (commitScope, body) => {
           commitPosts.push({ scope: commitScope, path: "/v2/open", body: body as unknown as Record<string, unknown> });
           return await postCommitScope(scopeFor(commitScope), env, commitScope, "/v2/open", body);
@@ -177,6 +189,12 @@ describe("v2 MCP e2e", () => {
       const actorEnvelopeIndex = actorPosts.findIndex((post) => post.path === "/v2/envelope");
       expect(actorOpenIndex, JSON.stringify(actorPosts.map((post) => post.path))).toBeGreaterThanOrEqual(0);
       expect(actorEnvelopeIndex, JSON.stringify(actorPosts.map((post) => post.path))).toBeGreaterThan(actorOpenIndex);
+      for (const body of [actorPosts[actorOpenIndex].body, actorPosts[actorEnvelopeIndex].body]) {
+        const sessions = body.sessions as Array<{ id?: string; actor?: string }>;
+        const authoritySessions = (body.authority as { sessions?: Array<{ id?: string; actor?: string }> }).sessions ?? [];
+        expect(sessions).toEqual(expect.arrayContaining([expect.objectContaining({ id: secondSession, actor: secondActor })]));
+        expect(authoritySessions).toEqual(expect.arrayContaining([expect.objectContaining({ id: secondSession, actor: secondActor })]));
+      }
       const envelope = decodeEnvelope(String(actorPosts[actorEnvelopeIndex].body.envelope));
       const expected = (envelope.body as { expected?: { seq?: unknown } }).expected;
       expect(expected?.seq).toBe(1);

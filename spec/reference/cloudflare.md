@@ -963,7 +963,10 @@ checkpoint/tail projection catch-up and does not add a Cloudflare Durable Object
 class migration. Planned-transcript commits are not eligible for this shortcut:
 when the chosen commit scope differs from the planned transcript's turn-key
 scope, the gateway must first open the chosen scope, adopt its current head, and
-submit the transcript envelope without `execution_capsule`.
+submit the transcript envelope without `execution_capsule`. The open/envelope
+payload must include the bound MCP session row in the request `sessions` field
+and in `authority.sessions`; otherwise the selected CommitScopeDO cannot derive
+the browser-session auth claim for a session that only the gateway shard has seen.
 
 Live no-commit v2 transcripts follow the same MCP shard discovery and are sent
 through signed `POST /__internal/mcp-live-fanout` with `{scope,

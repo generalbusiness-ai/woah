@@ -1268,6 +1268,11 @@ cross-scope move accepted in one scope can leave another scope planning against
 stale presence. `session_objects` is a compatibility request field for older
 callers that do not send `authority`; authority-bearing requests MUST leave it
 empty, including when the authority itself is a legacy object-row slice.
+An internal open/envelope MUST carry the request's already-authenticated session
+row in both the request `sessions` list and the authority slice's `sessions`
+list. Sparse gateway authority reconstruction MAY omit unrelated sessions, but
+it MUST NOT omit the bound caller session; the CommitScopeDO derives
+browser-session claims from that row before validating the request token.
 After a client has opened a scope and the CommitScopeDO has a durable planning
 snapshot, an MCP per-envelope refresh MAY omit remote object-owner rows and
 fall back to that snapshot for execution state. The request MUST still carry
@@ -1309,7 +1314,10 @@ from the caller's local execution view. If the executor has already planned a
 transcript for one turn-key scope and the selector chooses a different commit
 scope, the envelope is a planned-transcript commit. The caller MUST open the
 selected commit scope first and adopt its current head before building the
-envelope, then submit the planned transcript without an execution capsule.
+envelope, then submit the planned transcript without an execution capsule. That
+open and envelope still obey the session-row rule above; a capsule-disabled
+planned-transcript commit is not allowed to rely on gateway-local session state
+that the selected CommitScopeDO has never seen.
 
 Executable cell-page transfers served for browser execution use the same
 `woo.state.transfer.v1` `cell_pages` transfer, with recipient-bound capsule
