@@ -3831,7 +3831,7 @@ export class PersistentObjectDO {
     return world.auth(token);
   }
 
-  private async registerSessionRoute(session: Session, options: { mcpShard?: string | null } = {}, world: WooWorld | null = this.world): Promise<void> {
+  private async registerSessionRoute(session: Session, options: { mcpShard?: string | null; touchPresence?: boolean } = {}, world: WooWorld | null = this.world): Promise<void> {
     try {
       const id = this.env.DIRECTORY.idFromName(DIRECTORY_HOST);
       const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/register-session`, {
@@ -3849,7 +3849,13 @@ export class PersistentObjectDO {
           mcp_shard: options.mcpShard ?? null,
           display_name: displayNameForDirectorySession(world, session.actor),
           focus_list: focusListForDirectorySession(world, session.actor),
-          actor_props: actorPropsForDirectorySession(world, session.actor)
+          actor_props: actorPropsForDirectorySession(world, session.actor),
+          // Refresh the Directory presence lease. Defaults to true because every
+          // registerSessionRoute caller today is valid client ingress (an MCP
+          // request, a /v2/session/mint, or a REST auth). A future INTERNAL
+          // re-registration (fanout/replay rewriting a routing column) must pass
+          // touchPresence:false so it cannot extend a stale row's presence.
+          touch_presence: options.touchPresence ?? true
         })
       }));
       await this.env.DIRECTORY.get(id).fetch(request);
