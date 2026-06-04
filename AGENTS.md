@@ -168,6 +168,9 @@ Use Git worktrees for isolation.  Every subagent must work in .claude/worktrees/
 Commit to *worktree* after every major task, inlcuding a description
 of the change and its effects on the system.
 
+Commit messages must include a title that summarizes the change,
+and a body that describes the motivation and any key implementaion details.
+
 **Smoke-test discipline**
 
 Cloudflare full smoke-test is *the most expensive* validation step.
