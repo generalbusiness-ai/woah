@@ -77,6 +77,13 @@ async function mcpShardsForScopes(directory: DirectoryDO, scopes: unknown[]): Pr
   return body.shards as string[];
 }
 
+async function sessionsForScopes(directory: DirectoryDO, scopes: unknown[]): Promise<Record<string, unknown>[]> {
+  const resp = await directory.fetch(await signed("/sessions-for-scopes", { scopes, limit: 1024 }));
+  expect(resp.ok).toBe(true);
+  const body = await resp.json() as Record<string, unknown>;
+  return (body.sessions as Record<string, unknown>[]) ?? [];
+}
+
 function makeDirectory(): { directory: DirectoryDO; cleanup: () => void } {
   const state = new FakeDirectoryState();
   const directory = new DirectoryDO(state as unknown as DurableObjectState, env);
@@ -133,7 +140,7 @@ describe("DirectoryDO register-session dedup", () => {
       expect(await postRegister(directory, payload)).toEqual({ ok: true, wrote: true });
 
       const migratedColumns = sessionRouteColumns(state);
-      expect(migratedColumns).toEqual(expect.arrayContaining(["started", "display_name", "focus_list", "actor_props"]));
+      expect(migratedColumns).toEqual(expect.arrayContaining(["started", "display_name", "focus_list", "actor_props", "last_seen_at"]));
       const resolved = await resolve(directory, "legacy_sess");
       expect(resolved).toMatchObject({
         session_id: "legacy_sess",
@@ -385,6 +392,270 @@ describe("DirectoryDO register-session dedup", () => {
       expect(await resolve(directory, "sess_old_rest_guest")).toBeNull();
       expect(await resolve(directory, "sess_old_mcp_bearer")).toMatchObject({ actor: "$old_bearer" });
       expect(await resolve(directory, "sess_fresh_mcp_guest")).toMatchObject({ actor: "$fresh_guest" });
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// W = PRESENCE_LIVE_WINDOW_MS (5 min) and W/2 throttle, mirrored from
+// directory-do.ts. Kept as literals so the test fails loudly if the window is
+// retuned without revisiting these expectations.
+const PRESENCE_WINDOW_MS = 5 * 60 * 1000;
+const PRESENCE_THROTTLE_MS = PRESENCE_WINDOW_MS / 2;
+
+describe("DirectoryDO presence lease", () => {
+  afterEach(() => { vi.useRealTimers(); });
+
+  it("backfills last_seen_at from updated_at when migrating an existing row", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const state = new FakeDirectoryState();
+    // A legacy row written before the column existed: updated_at is its only
+    // recency signal. The migration must seed last_seen_at from it.
+    state.storage.sql.exec(`CREATE TABLE session_route (
+      session_id TEXT PRIMARY KEY,
+      actor TEXT NOT NULL,
+      started INTEGER,
+      display_name TEXT,
+      expires_at INTEGER NOT NULL,
+      token_class TEXT NOT NULL,
+      current_location TEXT,
+      apikey_id TEXT,
+      mcp_shard TEXT,
+      focus_list TEXT,
+      actor_props TEXT,
+      updated_at INTEGER NOT NULL
+    )`);
+    state.storage.sql.exec(
+      "INSERT INTO session_route(session_id, actor, expires_at, token_class, current_location, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+      "legacy_live", "$leg", FAR_FUTURE, "apikey", "$lobby", T0 - 30_000
+    );
+    try {
+      // Constructing the DO runs the idempotent column migration + backfill.
+      const directory = new DirectoryDO(state as unknown as DurableObjectState, env);
+      const resolved = await resolve(directory, "legacy_live");
+      expect(Number(resolved?.last_seen_at)).toBe(T0 - 30_000);
+    } finally {
+      state.close();
+    }
+  });
+
+  it("excludes stale-but-unexpired routes from scope/shard presence, keeps recent ones", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const { directory, cleanup } = makeDirectory();
+    try {
+      // An apikey route registered long ago: unexpired (24h-class lease) but its
+      // client is gone — exactly the stale row that inflated fanout to 26.
+      await postRegister(directory, {
+        session_id: "sess_stale",
+        actor: "$stale",
+        expires_at: FAR_FUTURE,
+        token_class: "apikey",
+        active_scope: "$lobby",
+        mcp_shard: "mcp-gateway-9"
+      });
+
+      // Advance past the presence window, then register a fresh client at the
+      // same scope (default touch_presence=true).
+      vi.setSystemTime(T0 + PRESENCE_WINDOW_MS + 60_000);
+      await postRegister(directory, {
+        session_id: "sess_fresh",
+        actor: "$fresh",
+        expires_at: FAR_FUTURE,
+        token_class: "apikey",
+        active_scope: "$lobby",
+        mcp_shard: "mcp-gateway-3"
+      });
+
+      // The stale route still RESOLVES (auth validity is unchanged)...
+      expect(await resolve(directory, "sess_stale")).toMatchObject({ actor: "$stale" });
+      // ...but is no longer part of the live presence audience or shard set.
+      const sessions = await sessionsForScopes(directory, ["$lobby"]);
+      expect(sessions.map((s) => s.session_id)).toEqual(["sess_fresh"]);
+      expect(await mcpShardsForScopes(directory, ["$lobby"])).toEqual(["mcp-gateway-3"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("throttles the presence touch to ~W/2 on unchanged client ingress", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const { directory, cleanup } = makeDirectory();
+    try {
+      const payload = {
+        session_id: "sess_touch",
+        actor: "$touch",
+        expires_at: FAR_FUTURE,
+        token_class: "apikey",
+        active_scope: "$lobby"
+      };
+      expect((await postRegister(directory, payload)).wrote).toBe(true);
+      expect(Number((await resolve(directory, "sess_touch"))?.last_seen_at)).toBe(T0);
+
+      // Within the throttle: identical ingress is a no-op, lease unchanged.
+      vi.setSystemTime(T0 + PRESENCE_THROTTLE_MS - 1_000);
+      expect((await postRegister(directory, payload)).wrote).toBe(false);
+      expect(Number((await resolve(directory, "sess_touch"))?.last_seen_at)).toBe(T0);
+
+      // Past the throttle: the lease is refreshed by a targeted touch write.
+      const touchedAt = T0 + PRESENCE_THROTTLE_MS + 1_000;
+      vi.setSystemTime(touchedAt);
+      expect((await postRegister(directory, payload)).wrote).toBe(true);
+      expect(Number((await resolve(directory, "sess_touch"))?.last_seen_at)).toBe(touchedAt);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("backfills a NULL last_seen_at even when the column already exists (P2: unconditional)", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const state = new FakeDirectoryState();
+    try {
+      // Simulate a partial/interrupted migration: the column exists but a row
+      // was left with NULL last_seen_at (e.g. crash between ALTER and backfill,
+      // or a direct write). Such a row must not be hidden from presence forever.
+      const d1 = new DirectoryDO(state as unknown as DurableObjectState, env);
+      // First fetch runs ensureSchema, creating session_route WITH last_seen_at.
+      expect(await resolve(d1, "warm_up_missing")).toBeNull();
+      state.storage.sql.exec(
+        "INSERT INTO session_route(session_id, actor, expires_at, token_class, current_location, updated_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, NULL)",
+        "null_lease", "$leg", FAR_FUTURE, "apikey", "$lobby", T0
+      );
+      // Before re-migration the NULL row is absent from presence.
+      expect(await sessionsForScopes(d1, ["$lobby"])).toEqual([]);
+
+      // A fresh DO over the same storage re-runs ensureSchema; the unconditional
+      // backfill must seed last_seen_at = updated_at and restore presence.
+      const d2 = new DirectoryDO(state as unknown as DurableObjectState, env);
+      const sessions = await sessionsForScopes(d2, ["$lobby"]);
+      expect(sessions.map((s) => s.session_id)).toEqual(["null_lease"]);
+      expect(Number((await resolve(d2, "null_lease"))?.last_seen_at)).toBe(T0);
+    } finally {
+      state.close();
+    }
+  });
+
+  it("does not grant presence to a brand-new route registered with touch_presence:false (P3)", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const { directory, cleanup } = makeDirectory();
+    try {
+      // An internal (non-ingress) creator registers a NEW route. It must not
+      // enter the live fanout audience until real client ingress touches it.
+      const created = await postRegister(directory, {
+        session_id: "sess_internal_new",
+        actor: "$internal",
+        expires_at: FAR_FUTURE,
+        token_class: "apikey",
+        active_scope: "$lobby",
+        mcp_shard: "mcp-gateway-5",
+        touch_presence: false
+      });
+      expect(created.wrote).toBe(true); // the route row is persisted...
+      expect(await resolve(directory, "sess_internal_new")).toMatchObject({ actor: "$internal" }); // ...and resolves for auth
+      // ...but it is NOT present for fanout/roster until a client touches it.
+      expect(await sessionsForScopes(directory, ["$lobby"])).toEqual([]);
+      expect(await mcpShardsForScopes(directory, ["$lobby"])).toEqual([]);
+
+      // First real client ingress (default touch_presence) makes it present.
+      vi.setSystemTime(T0 + 1_000);
+      await postRegister(directory, {
+        session_id: "sess_internal_new",
+        actor: "$internal",
+        expires_at: FAR_FUTURE,
+        token_class: "apikey",
+        active_scope: "$lobby",
+        mcp_shard: "mcp-gateway-5"
+      });
+      expect((await sessionsForScopes(directory, ["$lobby"])).map((s) => s.session_id)).toEqual(["sess_internal_new"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("does not let an internal re-registration (touch_presence:false) refresh a stale lease", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const { directory, cleanup } = makeDirectory();
+    try {
+      await postRegister(directory, {
+        session_id: "sess_int",
+        actor: "$int",
+        expires_at: FAR_FUTURE,
+        token_class: "apikey",
+        active_scope: "$lobby",
+        mcp_shard: "mcp-gateway-1"
+      });
+
+      // Past the window, an INTERNAL re-registration rewrites a routing column
+      // (active_scope) but must NOT extend presence.
+      vi.setSystemTime(T0 + PRESENCE_WINDOW_MS + 60_000);
+      const moved = await postRegister(directory, {
+        session_id: "sess_int",
+        actor: "$int",
+        expires_at: FAR_FUTURE,
+        token_class: "apikey",
+        active_scope: "$garden",
+        mcp_shard: "mcp-gateway-1",
+        touch_presence: false
+      });
+      expect(moved.wrote).toBe(true); // routing column did change
+      // Lease preserved at the original time, so the row stays stale...
+      expect(Number((await resolve(directory, "sess_int"))?.last_seen_at)).toBe(T0);
+      // ...and is therefore absent from the live presence set at its new scope.
+      expect(await sessionsForScopes(directory, ["$garden"])).toEqual([]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  // Regression gate for the smoke finding: two live actors must not yield the
+  // 26-session / 16-17-shard fanout blowup that stale apikey routes caused.
+  it("bounds a two-actor scope to its two live sessions despite many stale routes", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const { directory, cleanup } = makeDirectory();
+    try {
+      // 24 stale apikey routes accumulated at the room across prior runs: each
+      // on its own gateway shard, unexpired but long past the presence window.
+      for (let i = 0; i < 24; i += 1) {
+        await postRegister(directory, {
+          session_id: `stale_${i}`,
+          actor: `$stale_${i}`,
+          expires_at: FAR_FUTURE,
+          token_class: "apikey",
+          active_scope: "$the_chatroom",
+          mcp_shard: `mcp-gateway-${i}`
+        });
+      }
+
+      // Two real actors arrive now, well after those routes went stale.
+      vi.setSystemTime(T0 + PRESENCE_WINDOW_MS + 120_000);
+      await postRegister(directory, {
+        session_id: "alice",
+        actor: "$alice",
+        expires_at: FAR_FUTURE,
+        token_class: "apikey",
+        active_scope: "$the_chatroom",
+        mcp_shard: "mcp-gateway-30"
+      });
+      await postRegister(directory, {
+        session_id: "bob",
+        actor: "$bob",
+        expires_at: FAR_FUTURE,
+        token_class: "apikey",
+        active_scope: "$the_chatroom",
+        mcp_shard: "mcp-gateway-31"
+      });
+
+      const sessions = await sessionsForScopes(directory, ["$the_chatroom"]);
+      expect(sessions.map((s) => s.session_id).sort()).toEqual(["alice", "bob"]);
+      const shards = await mcpShardsForScopes(directory, ["$the_chatroom"]);
+      expect(shards.sort()).toEqual(["mcp-gateway-30", "mcp-gateway-31"]);
     } finally {
       cleanup();
     }

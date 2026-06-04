@@ -39,6 +39,11 @@ type SessionRoute = {
   focus_list: ObjRef[];
   actor_props: DirectorySessionActorProp[];
   updated_at: number;
+  /** Presence lease timestamp: the last time valid client ingress refreshed
+   * this route's liveness. Output-only on reads (computed internally by
+   * registerSession, not supplied by callers). Optional so the register-session
+   * input shape need not carry it. See PRESENCE_LIVE_WINDOW_MS. */
+  last_seen_at?: number;
 };
 
 type DirectorySessionActorProp = {
@@ -55,6 +60,23 @@ const DIRECTORY_FOCUS_LIST_CAP = 32;
 // capped at 512 KiB to leave headroom under the 1 MiB worker limit. Hosts
 // chunk a long roster into multiple batches.
 const MAX_INHERIT_BODY_BYTES = 512 * 1024;
+
+// Presence lease window. A session_route counts as live for room co-presence
+// (roster) and MCP fanout-audience purposes only while its `last_seen_at` is
+// within this window. This is SEPARATE from `expires_at`, which stays the auth
+// validity gate (24h for apikey/bearer). Without this split, a long-lived
+// apikey route lingers as "present" for 24h after its client is gone, which
+// over-broadens fanout (one cold shard woken per stale row) and bloats the
+// turn authority payload. The presence lease is refreshed ONLY by valid client
+// MCP/auth ingress — never by internal fanout/replay, which would let a stale
+// row self-refresh. Matches IDLE_PRESENCE_LIVE_WINDOW_MS in src/core/world.ts
+// so Directory presence agrees with each shard's in-memory liveness window.
+const PRESENCE_LIVE_WINDOW_MS = 5 * 60_000;
+// Throttle presence touches to ~W/2 so an active session rewrites its lease at
+// most once per ~2.5min when no other route column changes — preserving the
+// register-session dedupe's write-storm protection (a past bug wrote ~488
+// rows/hour on an idle singleton before that dedupe existed).
+const PRESENCE_TOUCH_THROTTLE_MS = PRESENCE_LIVE_WINDOW_MS / 2;
 
 export class DirectoryDO {
   private state: DurableObjectState;
@@ -149,7 +171,11 @@ export class DirectoryDO {
             focus_list: focusListFromUnknown(body.focus_list),
             actor_props: actorPropsFromUnknown(body.actor_props),
             updated_at: Date.now()
-          });
+          // touch_presence defaults to true: register-session is reached only
+          // from valid client MCP/auth ingress today. An internal re-registration
+          // (e.g. a future fanout/replay that rewrites a routing column) MUST send
+          // touch_presence:false so it cannot refresh a stale row's presence lease.
+          }, body.touch_presence !== false);
           this.emitMetric({ kind: "startup_storage", phase: "directory_register_session", ms: Date.now() - startedAt, status: "ok", writes: wrote ? 1 : 0 });
         } catch (err) {
           this.emitMetric({ kind: "startup_storage", phase: "directory_register_session", ms: Date.now() - startedAt, status: "error", ...metricErrorFields(err) });
@@ -318,6 +344,27 @@ export class DirectoryDO {
       this.state.storage.sql.exec("ALTER TABLE session_route ADD COLUMN actor_props TEXT");
       statements += 1;
     }
+    if (!columns.has("last_seen_at")) {
+      this.state.storage.sql.exec("ALTER TABLE session_route ADD COLUMN last_seen_at INTEGER");
+      statements += 1;
+    }
+    // Backfill any NULL last_seen_at from updated_at, UNCONDITIONALLY (not only
+    // on the boot that adds the column). A prior crash between the ALTER and the
+    // backfill, or a partial migration that left the column present with NULL
+    // rows, would otherwise hide those rows from the presence readers forever
+    // (NULL fails `last_seen_at > ?`). Running it every ensureSchema is the only
+    // way it is genuinely idempotent; steady state matches zero rows, so the
+    // cost is a single indexed no-op UPDATE per Directory cold boot.
+    this.state.storage.sql.exec("UPDATE session_route SET last_seen_at = updated_at WHERE last_seen_at IS NULL");
+    statements += 1;
+    // Presence-window index. Created here rather than in the CREATE-INDEX block
+    // because it references last_seen_at, which only exists after the ALTER
+    // above on a migrated DB. IF NOT EXISTS keeps it idempotent.
+    this.state.storage.sql.exec(
+      `CREATE INDEX IF NOT EXISTS session_route_presence
+        ON session_route(current_location, expires_at, last_seen_at)`
+    );
+    statements += 1;
     return statements;
   }
 
@@ -370,17 +417,18 @@ export class DirectoryDO {
     return { id, host, anchor: null, updated_at: Date.now() };
   }
 
-  private registerSession(session: SessionRoute): boolean {
+  private registerSession(session: SessionRoute, touchPresence: boolean): boolean {
     if (!session.session_id || !session.actor || !Number.isFinite(session.expires_at)) return false;
+    const now = Date.now();
     // Mirror registerObject's dedup: SELECT-then-skip when every persisted
     // column matches. Without this, callers like the worker entry's
     // registerSessionLocationFromCall (re-run on every successful call POST)
     // and the per-cron auth path turn into a row write per RPC even when
     // nothing changed — observed at ~488 row writes/hour on an idle
-    // singleton. Compare every column except updated_at; an unchanged row
-    // is a no-op.
+    // singleton. Compare every column except updated_at/last_seen_at; an
+    // unchanged row is a no-op (except for the throttled presence touch below).
     const existing = firstRow(this.state.storage.sql.exec(
-      "SELECT actor, started, display_name, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list, actor_props FROM session_route WHERE session_id = ?",
+      "SELECT actor, started, display_name, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list, actor_props, last_seen_at FROM session_route WHERE session_id = ?",
       session.session_id
     ));
     const started = session.started > 0
@@ -409,10 +457,36 @@ export class DirectoryDO {
       && (existing.mcp_shard === null ? null : String(existing.mcp_shard)) === session.mcp_shard
       && (existing.focus_list === null ? "[]" : String(existing.focus_list)) === encodedFocusList
       && (existing.actor_props === null ? "[]" : String(existing.actor_props)) === encodedActorProps) {
+      // No routing column changed. Refresh the presence lease only on a
+      // client-ingress touch AND only when the stored lease is stale enough to
+      // justify a write (W/2 throttle) — otherwise this stays a genuine no-op,
+      // preserving the dedupe's write-storm protection. An internal
+      // re-registration (touchPresence=false) never extends a stale row's lease.
+      if (touchPresence) {
+        const lastSeen = finitePositiveNumber(existing.last_seen_at) ?? 0;
+        if (now - lastSeen >= PRESENCE_TOUCH_THROTTLE_MS) {
+          this.state.storage.sql.exec(
+            "UPDATE session_route SET last_seen_at = ? WHERE session_id = ?",
+            now,
+            session.session_id
+          );
+          return true;
+        }
+      }
       return false;
     }
+    // A routing column changed (or this is a new row): persist it. Only a
+    // client-ingress write (touchPresence) leases presence from now. A
+    // non-ingress write (touchPresence=false) must NOT grant presence — it
+    // preserves an existing lease and, for a brand-new route, leases nothing
+    // (0), so an internal creator cannot inject a row into the live fanout
+    // audience. The row only becomes present once real client ingress touches
+    // it. `?? 0` also covers a NULL lease (partial migration) on the false path.
+    const lastSeenAt = touchPresence
+      ? now
+      : finitePositiveNumber(existing?.last_seen_at) ?? 0;
     this.state.storage.sql.exec(
-      "INSERT OR REPLACE INTO session_route(session_id, actor, started, display_name, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list, actor_props, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT OR REPLACE INTO session_route(session_id, actor, started, display_name, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list, actor_props, updated_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       session.session_id,
       session.actor,
       started,
@@ -424,7 +498,8 @@ export class DirectoryDO {
       session.mcp_shard,
       encodedFocusList,
       encodedActorProps,
-      Date.now()
+      now,
+      lastSeenAt
     );
     return true;
   }
@@ -474,11 +549,15 @@ export class DirectoryDO {
   private resolveSession(sessionId: string): SessionRoute | null {
     if (!sessionId) return null;
     const row = firstRow(this.state.storage.sql.exec(
-      "SELECT session_id, actor, started, display_name, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list, actor_props, updated_at FROM session_route WHERE session_id = ?",
+      "SELECT session_id, actor, started, display_name, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list, actor_props, updated_at, last_seen_at FROM session_route WHERE session_id = ?",
       sessionId
     ));
     if (!row) return null;
     const expiresAt = Number(row.expires_at);
+    // resolveSession gates on expires_at ONLY: this is the auth-validity path,
+    // and a valid-but-idle session (presence lease lapsed) must still resolve
+    // for authentication. Presence recency filters live in the audience/roster
+    // readers, not here.
     if (expiresAt <= Date.now()) {
       this.state.storage.sql.exec("DELETE FROM session_route WHERE session_id = ?", sessionId);
       return null;
@@ -496,7 +575,8 @@ export class DirectoryDO {
       mcp_shard: typeof row.mcp_shard === "string" && row.mcp_shard.length > 0 ? row.mcp_shard : null,
       focus_list: focusListFromUnknown(row.focus_list),
       actor_props: actorPropsFromUnknown(row.actor_props),
-      updated_at: Number(row.updated_at)
+      updated_at: Number(row.updated_at),
+      last_seen_at: finitePositiveNumber(row.last_seen_at) ?? undefined
     };
   }
 
@@ -509,6 +589,7 @@ export class DirectoryDO {
       console.warn("woo.directory.mcp_shards_for_scopes.truncated", { requested: requestedScopes.length, used: scopes.length });
     }
     if (scopes.length === 0) return [];
+    const now = Date.now();
     const placeholders = scopes.map(() => "?").join(", ");
     const rows = this.state.storage.sql.exec(
       `SELECT DISTINCT mcp_shard FROM session_route
@@ -517,26 +598,37 @@ export class DirectoryDO {
           AND mcp_shard IS NOT NULL
           AND mcp_shard != ''
           AND expires_at > ?
+          -- Presence lease: only shards holding a recently-live session for the
+          -- scope are fanout targets. Without this, a stale apikey route (24h
+          -- expires_at) keeps waking its cold shard for every commit. See
+          -- PRESENCE_LIVE_WINDOW_MS.
+          AND last_seen_at > ?
         ORDER BY mcp_shard`,
       ...scopes,
-      Date.now()
+      now,
+      now - PRESENCE_LIVE_WINDOW_MS
     ).toArray() as Array<{ mcp_shard?: unknown }>;
     return rows.map((row) => String(row.mcp_shard)).filter(Boolean);
   }
 
   private mcpSessionsForShard(shard: string, afterSessionId: string, limit: number): { sessions: SessionRoute[]; next_after_session_id: string | null } {
     if (!shard) return { sessions: [], next_after_session_id: null };
+    const now = Date.now();
     const rows = this.state.storage.sql.exec(
-      `SELECT session_id, actor, started, display_name, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list, actor_props, updated_at
+      `SELECT session_id, actor, started, display_name, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list, actor_props, updated_at, last_seen_at
         FROM session_route
         WHERE mcp_shard = ?
           AND session_id > ?
           AND expires_at > ?
+          -- Presence lease (see PRESENCE_LIVE_WINDOW_MS): a shard's live MCP
+          -- session set excludes stale-but-unexpired auth routes.
+          AND last_seen_at > ?
         ORDER BY session_id
         LIMIT ?`,
       shard,
       afterSessionId,
-      Date.now(),
+      now,
+      now - PRESENCE_LIVE_WINDOW_MS,
       limit + 1
     ).toArray() as Array<Record<string, unknown>>;
     const pageRows = rows.slice(0, limit);
@@ -552,18 +644,25 @@ export class DirectoryDO {
     )).sort();
     const scopes = requestedScopes.slice(0, 128);
     if (scopes.length === 0) return { sessions: [], next_after_session_id: null };
+    const now = Date.now();
     const placeholders = scopes.map(() => "?").join(", ");
     const rows = this.state.storage.sql.exec(
-      `SELECT session_id, actor, started, display_name, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list, actor_props, updated_at
+      `SELECT session_id, actor, started, display_name, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list, actor_props, updated_at, last_seen_at
         FROM session_route
         WHERE current_location IN (${placeholders})
           AND session_id > ?
           AND expires_at > ?
+          -- Presence lease (see PRESENCE_LIVE_WINDOW_MS): room co-presence /
+          -- fanout audience is the set of recently-live sessions in the scope,
+          -- NOT every unexpired auth route. This is the fix for the 26-rows-for-
+          -- 2-actors fanout blowup.
+          AND last_seen_at > ?
         ORDER BY session_id
         LIMIT ?`,
       ...scopes,
       afterSessionId,
-      Date.now(),
+      now,
+      now - PRESENCE_LIVE_WINDOW_MS,
       limit + 1
     ).toArray() as Array<Record<string, unknown>>;
     const pageRows = rows.slice(0, limit);
@@ -764,7 +863,8 @@ function sessionRouteFromRow(row: Record<string, unknown>): SessionRoute {
     mcp_shard: typeof row.mcp_shard === "string" && row.mcp_shard.length > 0 ? row.mcp_shard : null,
     focus_list: focusListFromUnknown(row.focus_list),
     actor_props: actorPropsFromUnknown(row.actor_props),
-    updated_at: updatedAt
+    updated_at: updatedAt,
+    last_seen_at: finitePositiveNumber(row.last_seen_at) ?? undefined
   };
 }
 

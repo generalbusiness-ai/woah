@@ -1202,6 +1202,16 @@ export class PersistentObjectDO {
         try {
           const forwardStartedAt = Date.now();
           this.ensureForwardedMcpSession(world, request);
+          // Refresh the Directory presence lease for an ALREADY-ESTABLISHED MCP
+          // session BEFORE dispatching to the transport. gateway.handle() can
+          // block for the full woo_wait window (~30s); if we only refreshed
+          // presence after it returned, a session whose lease had lapsed while
+          // idle would be absent from /mcp-shards-for-scopes for the whole wait.
+          // Live fanout has no durable replay, so a peer's observation during
+          // that window would be silently dropped. New-session creation and
+          // post-turn detail/scope changes are still published by the
+          // post-response registration below.
+          await this.touchEstablishedMcpSessionPresence(world, request, mcpGatewayShard ? hostKey : null);
           forwardMs = Date.now() - forwardStartedAt;
           const gateway = this.getMcpGateway(world);
           const handleStartedAt = Date.now();
@@ -3831,7 +3841,7 @@ export class PersistentObjectDO {
     return world.auth(token);
   }
 
-  private async registerSessionRoute(session: Session, options: { mcpShard?: string | null } = {}, world: WooWorld | null = this.world): Promise<void> {
+  private async registerSessionRoute(session: Session, options: { mcpShard?: string | null; touchPresence?: boolean } = {}, world: WooWorld | null = this.world): Promise<void> {
     try {
       const id = this.env.DIRECTORY.idFromName(DIRECTORY_HOST);
       const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/register-session`, {
@@ -3849,7 +3859,13 @@ export class PersistentObjectDO {
           mcp_shard: options.mcpShard ?? null,
           display_name: displayNameForDirectorySession(world, session.actor),
           focus_list: focusListForDirectorySession(world, session.actor),
-          actor_props: actorPropsForDirectorySession(world, session.actor)
+          actor_props: actorPropsForDirectorySession(world, session.actor),
+          // Refresh the Directory presence lease. Defaults to true because every
+          // registerSessionRoute caller today is valid client ingress (an MCP
+          // request, a /v2/session/mint, or a REST auth). A future INTERNAL
+          // re-registration (fanout/replay rewriting a routing column) must pass
+          // touchPresence:false so it cannot extend a stale row's presence.
+          touch_presence: options.touchPresence ?? true
         })
       }));
       await this.env.DIRECTORY.get(id).fetch(request);
@@ -3885,6 +3901,21 @@ export class PersistentObjectDO {
     if (!sessionId) return;
     const session = world.sessions.get(sessionId);
     if (session) await this.registerSessionRoute(session, { mcpShard }, world);
+  }
+
+  // Ingress-time presence refresh for an already-established MCP session (P1).
+  // Keyed off the forwarded `x-woo-internal-session` (or the client's
+  // `mcp-session-id`); an `initialize` request carries neither yet, so a new
+  // session is left to the post-response registration. DELETE (lifecycle end)
+  // and client-aborted requests must not refresh — they would resurrect or
+  // wrongly extend a route. The Directory-side W/2 throttle keeps this cheap:
+  // an unchanged route within the throttle window is a no-op, not a write.
+  private async touchEstablishedMcpSessionPresence(world: WooWorld, request: Request, mcpShard: string | null): Promise<void> {
+    if (request.method === "DELETE" || request.signal.aborted) return;
+    const sessionId = request.headers.get("x-woo-internal-session") ?? request.headers.get("mcp-session-id");
+    if (!sessionId) return;
+    const session = world.sessions.get(sessionId);
+    if (session) await this.registerSessionRoute(session, { mcpShard, touchPresence: true }, world);
   }
 
   private async closeMcpWooSession(world: WooWorld, sessionId: string, hostKey: string): Promise<void> {
