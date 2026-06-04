@@ -174,6 +174,12 @@ export class DirectoryDO {
         return json({ ok: true, removed: this.purgeExpiredSessions(Date.now()) });
       }
 
+      if (request.method === "POST" && url.pathname === "/purge-stale-mcp-guest-sessions") {
+        const body = await readJson(request);
+        const updatedBefore = finitePositiveNumber(body.updated_before) ?? Date.now();
+        return json({ ok: true, removed: this.purgeStaleMcpGuestSessions(updatedBefore) });
+      }
+
       if (request.method === "POST" && url.pathname === "/resolve-session") {
         const body = await readJson(request);
         return json({ session: this.resolveSession(String(body.session_id ?? "")) });
@@ -445,6 +451,27 @@ export class DirectoryDO {
     )) ?? 0);
     if (before <= 0) return 0;
     this.state.storage.sql.exec("DELETE FROM session_route WHERE expires_at <= ?", now);
+    return before;
+  }
+
+  private purgeStaleMcpGuestSessions(updatedBefore: number): number {
+    const before = Number(firstValue(this.state.storage.sql.exec(
+      `SELECT COUNT(*) AS count FROM session_route
+        WHERE token_class = 'guest'
+          AND mcp_shard IS NOT NULL
+          AND mcp_shard != ''
+          AND updated_at <= ?`,
+      updatedBefore
+    )) ?? 0);
+    if (before <= 0) return 0;
+    this.state.storage.sql.exec(
+      `DELETE FROM session_route
+        WHERE token_class = 'guest'
+          AND mcp_shard IS NOT NULL
+          AND mcp_shard != ''
+          AND updated_at <= ?`,
+      updatedBefore
+    );
     return before;
   }
 

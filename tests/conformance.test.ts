@@ -1077,6 +1077,35 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
     }
   });
 
+  it("operator purge can reap stale guest sessions before guest TTL", async () => {
+    const harness = make();
+    try {
+      const world = harness.world;
+      const stale = world.auth("guest:conf-purge-stale-session");
+      const live = world.auth("guest:conf-purge-live-session");
+      await world.directCall("enter-stale-session-chat", stale.actor, "the_chatroom", "enter", [], { sessionId: stale.id });
+      await world.directCall("enter-live-session-chat", live.actor, "the_chatroom", "enter", [], { sessionId: live.id });
+      const now = Date.now();
+      const staleSession = world.sessions.get(stale.id);
+      expect(staleSession).toBeDefined();
+      staleSession!.started = now - 120_000;
+      staleSession!.expiresAt = now + 180_000;
+
+      const result = world.purgeInactiveGuests(now, { staleGuestSessionMs: 60_000 });
+      expect(result.stale_guest_sessions).toEqual([stale.id]);
+      expect(result.reaped_sessions).toContain(stale.id);
+      expect(result.reset_actors).toContain(stale.actor);
+      expect(world.sessions.has(stale.id)).toBe(false);
+      expect(world.object(stale.actor).location).toBe("$nowhere");
+      expect(world.sessions.has(live.id)).toBe(true);
+      expect(world.object(live.actor).location).toBe("the_chatroom");
+      expect(world.contentsOf("the_chatroom")).toContain(live.actor);
+      expect(world.contentsOf("the_chatroom")).not.toContain(stale.actor);
+    } finally {
+      harness.cleanup();
+    }
+  });
+
   it("omits disconnected guests from chat room roster even if contents are stale", async () => {
     const harness = make();
     try {

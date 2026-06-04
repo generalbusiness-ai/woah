@@ -3196,15 +3196,38 @@ export class WooWorld {
   }
 
   // Operator cleanup for guests stranded by missed lifecycle cleanup: reap
-  // expired sessions first, then reset only guest instances with no live
-  // session. Room contents are repaired by moving the actor, never by editing a
-  // room's contents cache directly.
-  purgeInactiveGuests(now = Date.now()): {
+  // expired sessions first, optionally reap old detached guest sessions even
+  // before TTL, then reset only guest instances with no live session. The stale
+  // cutoff is intentionally opt-in so normal session liveness keeps its relaxed
+  // MCP/REST grace semantics; the operator recovery path needs a stricter
+  // definition of "inactive" to clear historical smoke sessions. Room contents
+  // are repaired by moving the actor, never by editing a room's contents cache
+  // directly.
+  purgeInactiveGuests(now = Date.now(), options: { staleGuestSessionMs?: number } = {}): {
     inspected: number;
     reaped_sessions: string[];
+    stale_guest_sessions: string[];
     reset_actors: ObjRef[];
   } {
     const reapedSessions = this.reapExpiredSessions(now);
+    const staleGuestSessionMs = Number.isFinite(options.staleGuestSessionMs)
+      ? Math.max(0, Math.floor(Number(options.staleGuestSessionMs)))
+      : null;
+    const staleGuestSessions: string[] = [];
+    const resetActorSet = new Set<ObjRef>();
+    if (staleGuestSessionMs !== null) {
+      const staleBefore = now - staleGuestSessionMs;
+      for (const session of Array.from(this.sessions.values()).sort((a, b) => a.id.localeCompare(b.id))) {
+        if (session.tokenClass !== "guest" || !this.inheritsFrom(session.actor, "$guest")) continue;
+        if (session.attachedSockets.size > 0) continue;
+        if (session.started > staleBefore) continue;
+        staleGuestSessions.push(session.id);
+        reapedSessions.push(session.id);
+        resetActorSet.add(session.actor);
+        this.reapSession(session.id);
+      }
+    }
+
     const liveGuestActors = new Set<ObjRef>();
     for (const session of this.sessions.values()) {
       if (!this.inheritsFrom(session.actor, "$guest")) continue;
@@ -3225,7 +3248,6 @@ export class WooWorld {
     // scrubs only spaces that mention that actor in subscribers/session rows.
     if (inactiveGuestActors.length > 0) this.ensurePresenceIndex();
 
-    const resetActors: ObjRef[] = [];
     for (const actor of inactiveGuestActors) {
       let changed = false;
       for (const space of Array.from(this.actorPresenceIndex.get(actor) ?? []).sort() as ObjRef[]) {
@@ -3243,10 +3265,11 @@ export class WooWorld {
       } else {
         this.returnGuest(actor);
       }
-      if (changed) resetActors.push(actor);
+      if (changed) resetActorSet.add(actor);
     }
+    const resetActors = Array.from(resetActorSet).sort() as ObjRef[];
     if (reapedSessions.length > 0 || resetActors.length > 0) this.persist(true);
-    return { inspected, reaped_sessions: reapedSessions, reset_actors: resetActors };
+    return { inspected, reaped_sessions: reapedSessions, stale_guest_sessions: staleGuestSessions, reset_actors: resetActors };
   }
 
   /**

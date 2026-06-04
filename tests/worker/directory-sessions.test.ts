@@ -339,4 +339,54 @@ describe("DirectoryDO register-session dedup", () => {
       cleanup();
     }
   });
+
+  it("purges stale MCP guest routes without deleting fresh or non-MCP sessions", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const { directory, cleanup } = makeDirectory();
+    try {
+      await postRegister(directory, {
+        session_id: "sess_old_mcp_guest",
+        actor: "$old_guest",
+        expires_at: FAR_FUTURE,
+        token_class: "guest",
+        active_scope: "$lobby",
+        mcp_shard: "mcp-gateway-1"
+      });
+      await postRegister(directory, {
+        session_id: "sess_old_rest_guest",
+        actor: "$old_rest_guest",
+        expires_at: FAR_FUTURE,
+        token_class: "guest",
+        active_scope: "$lobby"
+      });
+      await postRegister(directory, {
+        session_id: "sess_old_mcp_bearer",
+        actor: "$old_bearer",
+        expires_at: FAR_FUTURE,
+        token_class: "bearer",
+        active_scope: "$lobby",
+        mcp_shard: "mcp-gateway-1"
+      });
+      vi.setSystemTime(T0 + 120_000);
+      await postRegister(directory, {
+        session_id: "sess_fresh_mcp_guest",
+        actor: "$fresh_guest",
+        expires_at: FAR_FUTURE,
+        token_class: "guest",
+        active_scope: "$lobby",
+        mcp_shard: "mcp-gateway-2"
+      });
+
+      const purged = await directory.fetch(await signed("/purge-stale-mcp-guest-sessions", { updated_before: T0 + 60_000 }));
+      expect(purged.ok).toBe(true);
+      expect(await purged.json()).toMatchObject({ ok: true, removed: 1 });
+      expect(await resolve(directory, "sess_old_mcp_guest")).toBeNull();
+      expect(await resolve(directory, "sess_old_rest_guest")).toMatchObject({ actor: "$old_rest_guest" });
+      expect(await resolve(directory, "sess_old_mcp_bearer")).toMatchObject({ actor: "$old_bearer" });
+      expect(await resolve(directory, "sess_fresh_mcp_guest")).toMatchObject({ actor: "$fresh_guest" });
+    } finally {
+      cleanup();
+    }
+  });
 });

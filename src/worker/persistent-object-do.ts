@@ -316,6 +316,11 @@ const MAX_REST_V2_RELAY_CLIENTS = 64;
 const DIRECTORY_HOST = "directory";
 const INTERNAL_ORIGIN = "https://woo.internal";
 const MAX_JSON_BODY_BYTES = 1 * 1024 * 1024;
+// Operator-only purge cutoff for detached MCP guests. Normal guest sessions keep
+// their longer TTL so active stateless clients survive brief gaps; recovery
+// needs a stricter inactivity window to remove historical smoke routes from
+// Directory-backed room presence before they force authority-slice fan-in.
+const OPERATOR_STALE_MCP_GUEST_SESSION_MS = 60_000;
 const HOST_SEED_KV_KIND = "woo.host_seed.kv.bytecode_free.v1";
 const MAX_BROWSER_METRICS_BATCH = 200;
 const MAX_BROWSER_METRIC_STRING = 160;
@@ -3897,12 +3902,20 @@ export class PersistentObjectDO {
   }
 
   private async purgeInactiveGuests(world: WooWorld): Promise<Record<string, unknown>> {
-    const result = world.purgeInactiveGuests();
+    const now = Date.now();
+    const result = world.purgeInactiveGuests(now, { staleGuestSessionMs: OPERATOR_STALE_MCP_GUEST_SESSION_MS });
     for (const sessionId of result.reaped_sessions) {
       await this.unregisterSessionRoute(sessionId);
     }
     const directory_expired_sessions_removed = await this.purgeExpiredDirectorySessions();
-    return { ok: true, ...result, directory_expired_sessions_removed };
+    const directory_stale_mcp_guest_sessions_removed = await this.purgeStaleMcpGuestDirectorySessions(now - OPERATOR_STALE_MCP_GUEST_SESSION_MS);
+    return {
+      ok: true,
+      ...result,
+      stale_guest_session_ms: OPERATOR_STALE_MCP_GUEST_SESSION_MS,
+      directory_expired_sessions_removed,
+      directory_stale_mcp_guest_sessions_removed
+    };
   }
 
   private deleteLocalGatewaySessionCache(sessionId: string): void {
@@ -3956,6 +3969,23 @@ export class PersistentObjectDO {
         method: "POST",
         headers: { "content-type": "application/json; charset=utf-8" },
         body: "{}"
+      }));
+      const response = await this.env.DIRECTORY.get(id).fetch(request);
+      if (!response.ok) return 0;
+      const body = await response.json().catch(() => null) as { removed?: unknown } | null;
+      return Number(body?.removed ?? 0);
+    } catch {
+      return 0;
+    }
+  }
+
+  private async purgeStaleMcpGuestDirectorySessions(updatedBefore: number): Promise<number> {
+    try {
+      const id = this.env.DIRECTORY.idFromName(DIRECTORY_HOST);
+      const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/purge-stale-mcp-guest-sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json; charset=utf-8" },
+        body: JSON.stringify({ updated_before: updatedBefore })
       }));
       const response = await this.env.DIRECTORY.get(id).fetch(request);
       if (!response.ok) return 0;
