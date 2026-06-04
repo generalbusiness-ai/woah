@@ -799,7 +799,10 @@ planning admission for peer session actors whose identity is present but whose
 owner live row has not been fetched, shards may include an empty actor
 `object_live` placeholder stamped only as `fallback`; accepted-frame cache rows
 and owner-authoritative rows outrank that placeholder and replace it before any
-durable movement state is trusted.
+durable movement state is trusted. A Directory row whose actor identity would be
+only a `name == id` presentation stub MUST NOT be published as projected
+authority or as a projected room-content member; a session row is usable by
+planning only when the same slice carries an admissible actor identity.
 
 MCP turns plan warm-cache-first. A sparse gateway shard does not perform an
 unconditional pre-plan authority refresh on every turn. When the PlanningWorld

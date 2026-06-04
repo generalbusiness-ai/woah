@@ -1219,6 +1219,11 @@ export class PersistentObjectDO {
               // resurrect the Directory route we just closed and leave the
               // guest actor in room contents until TTL/reap. The gateway hook
               // below performs the durable cleanup.
+            } else if (request.signal.aborted) {
+              // A client-side smoke timeout can leave the Worker finishing the
+              // POST after the client has already discarded the session and
+              // issued teardown. Publishing that late active-scope row makes
+              // the next warm turn hydrate stale room presence from Directory.
             } else {
               await this.registerMcpSessionRoute(world, request, response.clone(), mcpGatewayShard ? hostKey : null);
             }
@@ -6791,11 +6796,13 @@ function mcpGatewayDirectorySessionCellSlice(sessions: readonly DirectorySeriali
   const snapshot = mcpGatewayShardSerializedWorld(sessions);
   const sessionActors = new Set<ObjRef>(sessions.map((session) => session.actor));
   const actorObjects = snapshot.objects.filter((obj) => sessionActors.has(obj.id));
-  const actorLineagePages: ShadowStatePage[] = actorObjects.flatMap((obj) => [
+  const projectableActorObjects = actorObjects.filter(mcpGatewaySessionActorIsProjectable);
+  const projectableActors = new Set<ObjRef>(projectableActorObjects.map((obj) => obj.id));
+  const actorLineagePages: ShadowStatePage[] = projectableActorObjects.flatMap((obj) => [
     shadowObjectLineagePage(obj),
     ...shadowPropertyCellPages(obj)
   ]);
-  const actorLivePlaceholders: ShadowStatePage[] = actorObjects.map((obj) => shadowObjectLivePage({
+  const actorLivePlaceholders: ShadowStatePage[] = projectableActorObjects.map((obj) => shadowObjectLivePage({
     ...obj,
     location: null,
     children: [],
@@ -6803,7 +6810,11 @@ function mcpGatewayDirectorySessionCellSlice(sessions: readonly DirectorySeriali
   }));
   const scopeLivePages: ShadowStatePage[] = snapshot.objects
     .filter((obj) => !sessionActors.has(obj.id) && obj.contents.length > 0)
-    .map((obj) => shadowObjectLivePage(obj));
+    .map((obj) => shadowObjectLivePage({
+      ...obj,
+      contents: obj.contents.filter((id) => projectableActors.has(id))
+    }))
+    .filter((page) => page.contents.length > 0);
   const inlinePages = [...actorLineagePages, ...actorLivePlaceholders, ...scopeLivePages];
   // A3: these pages are synthesized from Directory route records, not from the
   // object owner's live state — Directory publishes session/presence/projection
@@ -6811,7 +6822,12 @@ function mcpGatewayDirectorySessionCellSlice(sessions: readonly DirectorySeriali
   // provenance. Actor live pages are only empty fallback placeholders: they let
   // sparse planning admit a peer actor's identity without treating Directory's
   // possibly-stale current-location hint as movement truth. Accepted-frame/cache
-  // rows and owner rows outrank them.
+  // rows and owner rows outrank them. Directory may also retain unexpired rows
+  // for abandoned MCP attempts; if a row lacks a display name then the sparse
+  // transport snapshot can only build a name===id presentation stub. Do not
+  // publish those stubs into authority or room contents: a session row is
+  // visible to planning only when the same slice can dereference a real actor
+  // identity.
   const provenance: AuthorityPageProvenance = { source: "projection", source_host: hostKey };
   const actorLivePlaceholderProvenance: AuthorityPageProvenance = { source: "fallback", source_host: hostKey };
   return {
@@ -6829,8 +6845,12 @@ function mcpGatewayDirectorySessionCellSlice(sessions: readonly DirectorySeriali
       sessionCounter: 1
     },
     tombstones: [],
-    source_object_count: actorObjects.length + scopeLivePages.length
+    source_object_count: projectableActorObjects.length + scopeLivePages.length
   };
+}
+
+function mcpGatewaySessionActorIsProjectable(obj: SerializedObject): boolean {
+  return obj.id.startsWith("$") || obj.name !== obj.id;
 }
 
 function directContentIdsFromAuthoritySlice(

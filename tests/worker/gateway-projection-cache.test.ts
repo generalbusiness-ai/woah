@@ -951,4 +951,87 @@ describe("gateway projection cache", () => {
     expect(payload.authority.sessions.map((session) => session.id)).not.toContain(stale.id);
   });
 
+  it("does not project anonymous Directory guest session stubs into authority", async () => {
+    const state = new FakeDurableObjectState("mcp-gateway-0");
+    const world = createWorld();
+    const live = world.auth("guest:authority-directory-live");
+    const staleSessionId = "directory-stale-anonymous";
+    const namedSessionId = "directory-named-peer";
+    const directorySessions = [{
+      session_id: staleSessionId,
+      actor: "guest_999",
+      started: 1,
+      expires_at: Date.now() + 60_000,
+      token_class: "guest",
+      current_location: "the_chatroom",
+      mcp_shard: "mcp-gateway-1",
+      display_name: null,
+      focus_list: "[]",
+      actor_props: "[]",
+      updated_at: Date.now()
+    }, {
+      session_id: namedSessionId,
+      actor: "guest_998",
+      started: 2,
+      expires_at: Date.now() + 60_000,
+      token_class: "guest",
+      current_location: "the_chatroom",
+      mcp_shard: "mcp-gateway-1",
+      display_name: "Guest 998",
+      focus_list: "[]",
+      actor_props: "[]",
+      updated_at: Date.now()
+    }];
+    const po = new PersistentObjectDO(state as unknown as DurableObjectState, env({
+      DIRECTORY: new FakeDurableObjectNamespace(() => ({
+        fetch: async (request: Request) => {
+          const url = new URL(request.url);
+          if (url.pathname === "/sessions-for-scopes") {
+            return new Response(JSON.stringify({ sessions: directorySessions, next_after_session_id: null }), {
+              headers: { "content-type": "application/json; charset=utf-8" }
+            });
+          }
+          if (url.pathname === "/resolve-object") {
+            const body = await request.json() as { id?: string; fallback_host?: string };
+            return new Response(JSON.stringify({ id: body.id, host: body.fallback_host ?? "", anchor: null }), {
+              headers: { "content-type": "application/json; charset=utf-8" }
+            });
+          }
+          return new Response(JSON.stringify({ error: "unexpected directory path" }), { status: 404 });
+        }
+      })) as unknown as DurableObjectNamespace
+    })) as unknown as {
+      v2GatewayAuthorityPayload: (
+        world: ReturnType<typeof createWorld>,
+        extraObjectIds: ObjRef[],
+        options: {
+          tolerateRemoteFailures?: boolean;
+          useCommitScopeSnapshotForRemoteAuthority?: boolean;
+          directorySessionScopes?: readonly ObjRef[];
+        }
+      ) => Promise<{ authority: SerializedAuthoritySlice }>;
+    };
+
+    const payload = await po.v2GatewayAuthorityPayload(world, ["the_chatroom", live.actor], {
+      tolerateRemoteFailures: true,
+      useCommitScopeSnapshotForRemoteAuthority: true,
+      directorySessionScopes: ["the_chatroom"]
+    });
+    const serialized = serializedWorldFromAuthoritySlice(payload.authority);
+    const objectIds = new Set(serialized.objects.map((obj) => obj.id));
+    const sessionIds = new Set(payload.authority.sessions.map((session) => session.id));
+
+    expect(objectIds.has("guest_999" as ObjRef)).toBe(false);
+    expect(sessionIds.has(staleSessionId)).toBe(false);
+    expect(objectIds.has("guest_998" as ObjRef)).toBe(true);
+    expect(serialized.objects.find((obj) => obj.id === "guest_998")?.name).toBe("Guest 998");
+    expect(sessionIds.has(namedSessionId)).toBe(true);
+    const chatroomLiveContents = payload.authority.kind === "woo.authority_slice.cells.shadow.v1"
+      ? payload.authority.inline_pages.flatMap((page) =>
+        page.page === "object_live" && page.object === "the_chatroom" ? page.contents : []
+      )
+      : [];
+    expect(chatroomLiveContents).not.toContain("guest_999" as ObjRef);
+  });
+
 });
