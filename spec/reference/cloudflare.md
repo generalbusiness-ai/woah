@@ -802,7 +802,10 @@ and owner-authoritative rows outrank that placeholder and replace it before any
 durable movement state is trusted. A Directory row whose actor identity would be
 only a `name == id` presentation stub MUST NOT be published as projected
 authority or as a projected room-content member; a session row is usable by
-planning only when the same slice carries an admissible actor identity.
+planning only when the same slice carries an admissible actor identity. The
+shared relay cache applies the same rule to derived `cache` rows: old
+presentation stubs are pruned from objects, contents, sessions, and cell
+provenance before a planning world is built.
 
 MCP turns plan warm-cache-first. A sparse gateway shard does not perform an
 unconditional pre-plan authority refresh on every turn. When the PlanningWorld

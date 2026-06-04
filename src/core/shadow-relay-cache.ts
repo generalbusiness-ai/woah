@@ -19,6 +19,7 @@
 // browser-node → relay-cache.
 import type { SerializedAuthorityCellSlice, SerializedAuthoritySlice, SerializedObject, SerializedSession, SerializedWorld } from "./repository";
 import { mergeSerializedAuthoritySlice } from "./authority-slice";
+import { planningCellKey } from "./planning-world";
 import type { ShadowCellPageTransfer } from "./shadow-turn-exec";
 import type { AuthorityPageRef } from "./shadow-state-pages";
 import {
@@ -216,10 +217,41 @@ export function mergeAuthorityIntoRelayCache(
     ? preserveRelayActorLiveCells(serialized, authority.sessions)
     : null;
   const cellProvenance = (relay.commit_scope.cellProvenance ??= new Map());
-  const changed = mergeSerializedAuthoritySlice(serialized, authority, { clone: options.clone === true, cellProvenance });
+  let changed = mergeSerializedAuthoritySlice(serialized, authority, { clone: options.clone === true, cellProvenance });
   if (preserved) restoreRelayActorLiveCells(serialized, preserved);
+  if (pruneRelayPresentationStubs(serialized, cellProvenance)) changed = true;
   if (changed) markShadowBrowserRelaySerializedChanged(relay);
   return changed;
+}
+
+function pruneRelayPresentationStubs(
+  serialized: SerializedWorld,
+  cellProvenance: Map<string, { source: string }>
+): boolean {
+  const pruned = new Set<ObjRef>();
+  for (const obj of serialized.objects) {
+    if (obj.id.startsWith("$") || obj.name !== obj.id) continue;
+    const lineageSource = cellProvenance.get(planningCellKey(obj.id, "object_lineage"))?.source;
+    if (lineageSource === "authoritative") continue;
+    pruned.add(obj.id);
+  }
+  if (pruned.size === 0) return false;
+
+  for (const id of pruned) {
+    cellProvenance.delete(planningCellKey(id, "object_lineage"));
+    cellProvenance.delete(planningCellKey(id, "object_live"));
+  }
+  serialized.sessions = serialized.sessions.filter((session) => !pruned.has(session.actor));
+  serialized.objects = serialized.objects
+    .filter((obj) => !pruned.has(obj.id))
+    .map((obj) => {
+      const contents = obj.contents.filter((id) => !pruned.has(id));
+      const children = obj.children.filter((id) => !pruned.has(id));
+      const location = obj.location && pruned.has(obj.location) ? null : obj.location;
+      if (contents.length === obj.contents.length && children.length === obj.children.length && location === obj.location) return obj;
+      return { ...obj, contents, children, location };
+    });
+  return true;
 }
 
 // DESIGN A layer-2 install path. A `read_version_mismatch` rejection from the
