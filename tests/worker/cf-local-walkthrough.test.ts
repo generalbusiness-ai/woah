@@ -191,18 +191,29 @@ describe("CF-local smoke walkthrough", () => {
         .filter((m) => m.kind === "authority_slice_content_expansion")
         .filter((m) => Number(m.objects) > 0);
       expect(
-        contentExpansions.length,
-        "stale pre-existing room occupants must trigger bounded pre-plan contents authority expansion"
-      ).toBeGreaterThan(0);
+        contentExpansions,
+        "stale guest room contents must not trigger pre-plan contents authority expansion; active guests arrive through Directory/session projection"
+      ).toEqual([]);
       const admissionViolations = warnSpy.mock.calls
         .filter((call) => call[0] === "woo.planning_world_inadmissible")
         .map((call) => JSON.stringify(call[1] ?? {}));
+      expect(
+        admissionViolations,
+        "stale room guest contents must not enter MCP planning as presentation stubs; active peer actors arrive through Directory/session projection"
+      ).toEqual([]);
       const repairedInitialEnters = initialChatroomEnters
         .filter((m) => Number(m.attempts) !== 1)
         .map((m) => `${String(m.target)}:${String(m.verb)} attempts=${String(m.attempts)} auth_calls=${String(m.authority_calls)} total=${String(m.total_ms)}ms`);
       expect(
         repairedInitialEnters,
         `initial cross-shard chatroom enters must converge on the first attempt; repair rounds reproduce the prod 20s timeout wall. Admission violations: ${admissionViolations.slice(0, 6).join(" | ")}`
+      ).toEqual([]);
+      const prePlanRefreshInitialEnters = initialChatroomEnters
+        .filter((m) => Number(m.authority_calls) !== 1)
+        .map((m) => `${String(m.target)}:${String(m.verb)} attempts=${String(m.attempts)} auth_calls=${String(m.authority_calls)} total=${String(m.total_ms)}ms`);
+      expect(
+        prePlanRefreshInitialEnters,
+        "B7 warm-cache-first MCP turns must not pay both pre-plan and commit authority refresh; a one-attempt enter should need exactly the commit refresh"
       ).toEqual([]);
       // Every phase field must be a finite number so the analyzer never charges NaN.
       for (const field of ["total_ms", "ensure_client_ms", "authority_ms", "serialize_ms", "plan_build_ms", "vm_ms", "submit_ms", "authority_calls", "attempts"]) {

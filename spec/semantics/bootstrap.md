@@ -531,7 +531,7 @@ All direct-callable (rxd). Observations are live-only by route per [chat DESIGN.
 
 | Verb | Args | Purpose |
 |---|---|---|
-| `:look_self()` | — | Catalog woocode over `visible_contents` and `remote_describe`, composing room title, description, embodied roster rows, and visible contents. `$player` descendants are excluded from the contents list; `$block` descendants are the explicit exception because they are actor-backed appliances and should remain visible in-room. Pure view producer; the chat dispatcher emits private `looked`. |
+| `:look_self()` | — | Catalog woocode over `active_actors`, `visible_contents`, and `remote_describe`, composing room title, description, embodied roster rows, and visible contents. `$player` descendants are excluded from the contents list; `$block` descendants are the explicit exception because they are actor-backed appliances and should remain visible in-room. Pure view producer; the chat dispatcher emits private `looked`. |
 | `:announce(text)` | str | Tell everyone in the room except `actor`. |
 | `:announce_all(text)` | str | Tell every subscribed actor in the room. |
 | `:announce_all_but(ignore, text, origin?)` | list, str, obj? | Tell every subscribed actor except those listed. `origin` is used by transparent nested spaces so parent announcement fan-out does not loop back into the originating child. |

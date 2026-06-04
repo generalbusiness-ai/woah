@@ -1315,9 +1315,14 @@ transcript for one turn-key scope and the selector chooses a different commit
 scope, the envelope is a planned-transcript commit. The caller MUST open the
 selected commit scope first and adopt its current head before building the
 envelope, then submit the planned transcript without an execution capsule. That
-open and envelope still obey the session-row rule above; a capsule-disabled
-planned-transcript commit is not allowed to rely on gateway-local session state
-that the selected CommitScopeDO has never seen.
+open MAY use `open_protocol: "head_session.v1"`: the request carries the
+authenticated session rows and receives the current commit-scope head, but does
+not request browser executable state. If the selected CommitScopeDO has no
+durable snapshot, it MUST reject the tiny head/session open with
+`E_SNAPSHOT_REQUIRED`; rollout callers may retry `head_session.v1` with a seed
+snapshot or authority slice. The open and envelope still obey the session-row
+rule above; a capsule-disabled planned-transcript commit is not allowed to rely
+on gateway-local session state that the selected CommitScopeDO has never seen.
 
 Executable cell-page transfers served for browser execution use the same
 `woo.state.transfer.v1` `cell_pages` transfer, with recipient-bound capsule
@@ -1552,6 +1557,17 @@ measurable, which is what B8's `estimated_transfer_cost` ranking consumes. The
 two-node conformance case (remote execute → install reply transfer → next turn
 local with zero further transfers) is gated by
 `tests/v2-state-transfer-warmfill.test.ts`.
+
+Server-side gateways that submit planned transcripts are part of the same
+contract. A planned-transcript commit accepted by its commit scope MUST attach
+the accepted-write `cell_pages` transfer, and MCP/REST gateways MUST install that
+transfer into their relay cache as `source:"cache"` before the next turn plans.
+MCP planning is warm-cache-first: it does not perform an unconditional pre-plan
+authority refresh on every turn. If the admission gate or local verb lookup
+proves the cache is missing state, the gateway performs a bounded pre-plan repair
+and retries; commit submission still carries a bounded authority payload for
+validation, usually sourced from the opened CommitScopeDO snapshot on the first
+envelope attempt.
 
 Browser relays also implement `mode: "projection"` and `mode: "delta"` for
 display/cache catch-up. Opening a scope installs a projection transfer instead

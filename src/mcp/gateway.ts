@@ -24,6 +24,7 @@ import { createShadowBrowserRelayShim } from "../core/shadow-browser-node";
 import {
   applyAcceptedFrameToDerivedRelayCache,
   applyAcceptedFrameToRelayCache,
+  installShadowAcceptedWriteTransferIntoRelayCache,
   installShadowCellPageTransferAsAuthority,
   mergeAuthorityIntoRelayCache,
   type ShadowRelayCache
@@ -110,6 +111,7 @@ export type McpV2OpenBody = {
   token: string;
   session: string;
   actor: ObjRef;
+  open_protocol?: "head_session.v1";
   known_head?: ShadowScopeHead | null;
   sessions: ReturnType<WooWorld["exportSessions"]>;
   session_objects: ReturnType<WooWorld["exportObjects"]>;
@@ -176,6 +178,17 @@ function serializedSessionForMcpEntry(entry: SessionEntry): SerializedSession {
     activeScope: session.activeScope,
     ...(session.apikeyId !== undefined ? { apikeyId: session.apikeyId } : {})
   };
+}
+
+function mcpDirectorySessionScopesForAuthority(entry: SessionEntry, ...scopes: Array<ObjRef | null | undefined>): ObjRef[] {
+  const out = new Set<ObjRef>();
+  const add = (scope: ObjRef | null | undefined): void => {
+    if (!scope || scope === "#-1") return;
+    out.add(scope);
+  };
+  add(entry.woo.activeScope ?? null);
+  for (const scope of scopes) add(scope);
+  return Array.from(out).sort();
 }
 
 function ensureSerializedSession(sessions: readonly SerializedSession[], session: SerializedSession): SerializedSession[] {
@@ -657,7 +670,8 @@ export class McpGateway {
         persistence,
         token: entry.v2Token
       },
-      prePlanAuthority: true,
+      prePlanAuthority: false,
+      repairPlanningAuthority: true,
       maxAttempts: 8,
       ensureClient: async (submitScope, _attempt, context) => await this.ensureV2ScopeClient(entry, submitScope, {
         requireCommitScopeOpen: context.phase === "commit" && context.plannedTranscriptCommit
@@ -690,11 +704,17 @@ export class McpGateway {
         const isPrePlan = context?.phase === "pre_plan";
         const useCommitScopeSnapshotForRemoteAuthority = !isPrePlan && authorityRefreshAttempts === 0;
         if (!isPrePlan) authorityRefreshAttempts += 1;
+        const contentExpansionRoots = isPrePlan ? [submitScope, target] : [];
         const payload = await this.v2AuthorityPayload(extraObjectIds, {
           useCommitScopeSnapshotForRemoteAuthority,
           tolerateRemoteFailures: isPrePlan,
-          directorySessionScopes: options.directorySessionScopes ?? [],
-          ...(isPrePlan ? { scopeContentExpansionRoots: [submitScope, target] } : {}),
+          directorySessionScopes: mcpDirectorySessionScopesForAuthority(
+            entry,
+            submitScope,
+            ...contentExpansionRoots,
+            ...(options.directorySessionScopes ?? [])
+          ),
+          ...(contentExpansionRoots.length > 0 ? { scopeContentExpansionRoots: contentExpansionRoots } : {}),
           reconstructionReason: "warm_turn_refresh",
           reconstructionScope: submitScope
         });
@@ -770,6 +790,9 @@ export class McpGateway {
     if (reply.commit) {
       this.acceptV2Commit(client, reply, sessionId, result.local_host_materialized ?? null, result.accepted_audience);
     }
+    if (reply.state_transfer?.mode === "cell_pages") {
+      installShadowAcceptedWriteTransferIntoRelayCache(client.relay, reply.state_transfer, { reason: "mcp_accepted_write_cache" });
+    }
     const frame = mcpFrameFromTurnReply(scope, reply);
     if (!reply.commit && frame.op === "result") this.host.routeLiveEvents(frame, sessionId);
     return frame;
@@ -805,7 +828,9 @@ export class McpGateway {
     // materialized /v2/open retry. Coalesce it per scope so parallel sessions
     // do not each build and post the same seed.
     const initializer = (async () => {
-      const seeded = await this.v2SerializedWorld([scope, entry.woo.actor]);
+      const seeded = await this.v2SerializedWorld([scope, entry.woo.actor], {
+        directorySessionScopes: mcpDirectorySessionScopesForAuthority(entry, scope)
+      });
       const client: V2ScopeClient = {
         scope,
         relay: createShadowBrowserRelayShim({
@@ -851,13 +876,19 @@ export class McpGateway {
     const pending = (async () => {
       const authority = this.withMcpSessionAuthority(
         entry,
-        seeded?.authority ?? await this.v2AuthorityPayload([client.scope, entry.woo.actor])
+        seeded?.authority ?? await this.v2AuthorityPayload([client.scope, entry.woo.actor], {
+          directorySessionScopes: mcpDirectorySessionScopesForAuthority(entry, client.scope)
+        })
       );
       this.mergeV2AuthorityIntoScopeClient(client, authority.authority);
       if (hooks.executionCapsuleOpen && !requireCommitScopeOpen) {
         client.openedSessions.add(entry.woo.id);
         return;
       }
+      // Planned-transcript commits only need the selected commit scope's head
+      // and authenticated session row; shipping executable pages here puts
+      // every cross-scope MCP turn back on the legacy open hot path.
+      const headSessionOpen = options.forceLegacyOpen !== true && options.requireCommitScopeOpen === true;
       const openBody: McpV2OpenBody = {
         scope: client.scope,
         node: this.v2NodeFor(entry),
@@ -865,14 +896,26 @@ export class McpGateway {
         session: entry.woo.id,
         actor: entry.woo.actor,
         known_head: client.relay.commit_scope.head,
-        ...authority
+        ...(headSessionOpen ? {
+          open_protocol: "head_session.v1" as const,
+          sessions: authority.sessions,
+          session_objects: authority.session_objects
+        } : authority)
       };
       let opened: McpV2OpenResult;
       try {
         opened = await hooks.open(client.scope, openBody);
       } catch (err) {
-        if (!seeded || !isV2CommitScopeSnapshotRequiredError(err)) throw err;
-        opened = await hooks.open(client.scope, { ...openBody, serialized: seeded.serialized });
+        if (!isV2CommitScopeSnapshotRequiredError(err)) throw err;
+        const retrySeed = seeded ?? await this.v2SerializedWorld([client.scope, entry.woo.actor], {
+          directorySessionScopes: mcpDirectorySessionScopesForAuthority(entry, client.scope)
+        });
+        opened = await hooks.open(client.scope, {
+          ...openBody,
+          ...authority,
+          ...(headSessionOpen ? { open_protocol: "head_session.v1" as const } : {}),
+          serialized: retrySeed.serialized
+        });
       }
       if (opened.head) client.relay.commit_scope.head = opened.head;
       client.openedSessions.add(entry.woo.id);
@@ -926,8 +969,11 @@ export class McpGateway {
     );
   }
 
-  private async v2SerializedWorld(extraObjectIds: ObjRef[]): Promise<{ serialized: ReturnType<WooWorld["exportWorld"]>; authority: ReturnType<typeof executorAuthorityPayload> }> {
-    const authority = await this.v2AuthorityPayload(extraObjectIds);
+  private async v2SerializedWorld(
+    extraObjectIds: ObjRef[],
+    options: { directorySessionScopes?: ObjRef[] } = {}
+  ): Promise<{ serialized: ReturnType<WooWorld["exportWorld"]>; authority: ReturnType<typeof executorAuthorityPayload> }> {
+    const authority = await this.v2AuthorityPayload(extraObjectIds, options);
     const serialized = serializedWorldFromAuthoritySlice(authority.authority);
     return { serialized, authority };
   }

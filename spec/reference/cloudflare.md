@@ -585,21 +585,23 @@ The canonical event union is `MetricEvent` in `src/core/types.ts`. That
 union is the source of truth for which kinds exist and which fields they
 carry; this spec only describes how those fields project onto AE slots.
 
-`authority_slice_reconstructed` partitions the authority-slice planning cost
-that used to appear as opaque `/mcp` wall time. Its `reason` value is written to
-`blobs[15]` and MUST distinguish warm turn refresh, cold open, missing-state
-repair, source-host slice service, warm checkpoint hit, warm checkpoint
-catch-up, and warm checkpoint repair. `object_count` and `page_count` size the
-served slice; the primary AE count slot uses the object count. This event is the
-gate for [cell-authority.md §CA11.1](../protocol/cell-authority.md#ca111-gateway-authority-checkpoints):
-healthy warm turns should move from `warm_turn_refresh` to
-`warm_checkpoint_hit`, same-scope projection tails should emit
-`warm_checkpoint_caught_up`, checkpoint coverage misses should emit
-`warm_checkpoint_repaired` only when the repaired checkpoint is stored and will
-turn the next matching request into `warm_checkpoint_hit`, first warm
-refreshes that seed a bounded checkpoint should emit
-`warm_checkpoint_seeded`, and
-stale-fallback/timeout/over-budget rows must not be stored as checkpoints.
+`authority_slice_reconstructed` partitions the authority-slice cost that used to
+appear as opaque `/mcp` wall time. Its `reason` value is written to `blobs[15]`
+and MUST distinguish warm turn refresh, cold open, missing-state repair,
+source-host slice service, warm checkpoint hit, warm checkpoint catch-up, and
+warm checkpoint repair. `object_count` and `page_count` size the served slice;
+the primary AE count slot uses the object count. After B7, warm MCP planning
+SHOULD NOT emit owner-fan-in `warm_turn_refresh` work before every turn; a
+one-attempt warm turn should have at most the bounded commit-refresh authority
+payload, usually with snapshot fallback on the first envelope attempt. This
+event remains the gate for [cell-authority.md §CA11.1](../protocol/cell-authority.md#ca111-gateway-authority-checkpoints):
+healthy warm turns should move away from repeated pre-plan `warm_turn_refresh`
+fan-in, same-scope projection tails should emit `warm_checkpoint_caught_up`,
+checkpoint coverage misses should emit `warm_checkpoint_repaired` only when the
+repaired checkpoint is stored and will turn the next matching request into
+`warm_checkpoint_hit`, first warm refreshes that seed a bounded checkpoint
+should emit `warm_checkpoint_seeded`, and stale-fallback/timeout/over-budget
+rows must not be stored as checkpoints.
 
 #### Sampling
 
@@ -645,9 +647,10 @@ diagnostics beyond the local hard cap.
 
 `v2_open_step` splits aggregate `/v2/open` wall time across both authority
 planes. CommitScopeDO phases cover request verification/read, relay lookup,
-session seeding, browser relay construction, shadow open, executable seed
-construction/digest/install, full-save, checkpoint/tail packaging, checkpoint
-continuation stale, checkpoint pending, asynchronous checkpoint build, and response encoding. The gateway
+session seeding, head/session persistence, browser relay construction, shadow
+open, executable seed construction/digest/install, full-save, checkpoint/tail
+packaging, checkpoint continuation stale, checkpoint pending, asynchronous
+checkpoint build, and response encoding. The gateway
 WebSocket phases cover authority payload construction, CommitScopeDO open RPC,
 and WebSocket frame encoding/sends for hello, legacy display transfer,
 checkpoint/tail transfer chunks, executable transfer, and ads.
@@ -781,7 +784,14 @@ doing so would resurrect a closed route and leave temporary guest actors in
 durable room contents until a later reap. Operators may use either
 wizard-gated `POST /api/admin/purge-inactive-guests` or Basic-auth-gated
 `POST /admin/purge-inactive-guests`; both run the same WORLD lifecycle reset
-and delete expired Directory session routes.
+and delete expired Directory session routes. Because MCP smoke and other
+stateless clients can strand unexpired guest rows after a client timeout, the
+operator purge also uses a short inactivity cutoff for detached guest sessions:
+WORLD reaps matching guest sessions and Directory deletes guest `session_route`
+rows whose `updated_at` is older than the cutoff, regardless of the transport
+that first registered the row. This stricter rule is limited to the operator
+recovery path; normal request/session liveness continues to use the guest TTL
+and grace windows.
 
 Sparse MCP session projection may include Directory-derived actor
 lineage/properties and scope presence rows as `projection` authority pages. It
@@ -790,13 +800,25 @@ planning admission for peer session actors whose identity is present but whose
 owner live row has not been fetched, shards may include an empty actor
 `object_live` placeholder stamped only as `fallback`; accepted-frame cache rows
 and owner-authoritative rows outrank that placeholder and replace it before any
-durable movement state is trusted.
+durable movement state is trusted. A Directory row whose actor identity would be
+only a `name == id` presentation stub MUST NOT be published as projected
+authority or as a projected room-content member; a session row is usable by
+planning only when the same slice carries an admissible actor identity. The
+shared relay cache applies the same rule to derived `cache` rows: old
+presentation stubs are pruned from objects, contents, sessions, and cell
+provenance before a planning world is built.
 
-During MCP pre-plan authority refresh, a sparse gateway shard may expand a
-target scope's direct `contents` to fetch owner authority for those contained
-objects, capped at 128 objects. This is a bounded identity/read repair for
-room-roster planning surfaces such as occupant names; it must not become global
-enumeration, and it is not applied to commit-refresh fan-in.
+MCP turns plan warm-cache-first. A sparse gateway shard does not perform an
+unconditional pre-plan authority refresh on every turn. When the PlanningWorld
+admission gate or local verb lookup proves the relay cache is missing state, the
+repair path may expand a target scope's direct `contents` to fetch owner
+authority for those contained objects, capped at 128 objects. This is a bounded
+identity/read repair for room-roster planning surfaces such as occupant names;
+it must not become global enumeration, and it is not applied to commit-refresh
+fan-in. After an accepted MCP or REST commit, the gateway installs any
+`accepted_write_cells` `cell_pages` transfer from the reply into the relay cache
+as `source:"cache"` so the following turn can plan from the accepted state
+without pre-plan owner fan-in.
 
 `CommitScopeDO` is the durable authority for v2 scope heads. On first open for
 a scope it materializes the gateway-supplied authority seed into row-shaped DO
@@ -963,10 +985,13 @@ legacy seed bootstrap and retry without the capsule. This flag does not change
 checkpoint/tail projection catch-up and does not add a Cloudflare Durable Object
 class migration. Planned-transcript commits are not eligible for this shortcut:
 when the chosen commit scope differs from the planned transcript's turn-key
-scope, the gateway must first open the chosen scope, adopt its current head, and
-submit the transcript envelope without `execution_capsule`. The open/envelope
-payload must include the bound MCP session row in the request `sessions` field
-and in `authority.sessions`; otherwise the selected CommitScopeDO cannot derive
+scope, the gateway must first open the chosen scope with
+`open_protocol: "head_session.v1"`, adopt its current head, and submit the
+transcript envelope without `execution_capsule`. Warm head/session opens carry
+only session rows and never build executable seed transfers; cold scopes may
+retry the same protocol with a seed snapshot. The envelope payload must include
+the bound MCP session row in the request `sessions` field and in
+`authority.sessions`; otherwise the selected CommitScopeDO cannot derive
 the browser-session auth claim for a session that only the gateway shard has seen.
 
 Live no-commit v2 transcripts follow the same MCP shard discovery and are sent

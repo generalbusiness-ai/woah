@@ -222,6 +222,13 @@ core property.
 verbs decide whether those actors are a room roster, a board roster, an
 audience, or something else.
 
+`active_actors(space)` returns actors with live, unexpired sessions whose
+current active scope is exactly `space`, plus placement-backed live presence
+rows used by distributed room hosts before their session table projection has
+caught up. It is the substrate-owned answer for visible embodied occupancy;
+unlike `present_actors`, it does not include subscriber-only observers that
+receive events for a space while scoped elsewhere.
+
 `visible_contents(obj)` returns `obj.contents` filtered to objects the current
 task authority may inspect. It exists because contents and permission checks are
 substrate-owned; catalog code still chooses how to format or classify those

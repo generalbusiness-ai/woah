@@ -66,15 +66,18 @@ keep their loose-typed literals and still pass.
 
 typecheck clean; `npm test` 301/301 (23 files); `gate:authority` 2/2.
 
-## Deliberately deferred (rides on later steps)
+## Production follow-up (2026-06-04, branch `b7-authority-warmfill`)
 
-- **Production gateway-install wiring.** The warm transfer now exists on the
-  authoritative reply and is verifiable + measurable (which is exactly what B8's
-  `estimated_transfer_cost` ranking needs). Wiring the *production MCP/REST
-  gateway* to install the reply transfer into its relay client (so the deployed
-  warm-turn cost actually drops) is a production hookup validated by smoke, not
-  the local gate — sequenced after B8 routing so the install target is the
-  gossip-selected node, not a fixed shard.
+- **Production gateway-install wiring is now implemented.** MCP and REST install
+  accepted `accepted_write_cells` `cell_pages` transfers into their relay caches
+  as `source:"cache"`. Planned-transcript commits now attach the same warm
+  transfer as executor-run accepts, so cross-scope MCP movement warms the caller
+  after success.
+- **MCP planning is warm-cache-first.** The gateway no longer pays the
+  unconditional pre-plan authority refresh on every turn. Local planning
+  `E_NEED_STATE` / sparse lookup misses still trigger a bounded pre-plan repair;
+  commit submission still carries the bounded validation authority payload and
+  uses CommitScopeDO snapshot fallback on the first envelope attempt.
 - The four transfer *modes* are resolved (projection/delta/cell_pages live;
   closure retired; object_records internal).
 

@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { authoritativePlanningWorld } from "../src/core/planning-world";
+import { authoritativePlanningWorld, planningCellKey } from "../src/core/planning-world";
 import { createWorld, createWorldFromSerialized } from "../src/core/bootstrap";
-import { createShadowCommitScope } from "../src/core/shadow-commit-scope";
+import { createShadowCommitScope, serializedFor } from "../src/core/shadow-commit-scope";
+import { createShadowBrowserRelayShim } from "../src/core/shadow-browser-node";
+import { installShadowAcceptedWriteTransferIntoRelayCache } from "../src/core/shadow-relay-cache";
 import {
   createShadowExecutionNode,
   executeAuthoritativeShadowTurnCall,
@@ -114,6 +116,59 @@ describe("B7 state-transfer warm cache-fill", () => {
     expect(commitScope.head.seq).toBeGreaterThan(headSeqAfterTurn1);
     const afterTurn2 = createWorldFromSerialized(warmRouted.result.serializedAfter, { persist: false });
     expect(afterTurn2.getProp("delay_1", "wet")).toBe(0.5);
+  });
+
+  it("installs accepted write transfers into relay caches as cache, not authority", async () => {
+    const anchor = createWorld();
+    const session = anchor.auth("guest:b7-relay-cache");
+    const actor = session.actor;
+    anchor.setProp("the_dubspace", "operators", [actor]);
+    const serialized = anchor.exportWorld();
+    const owner = createShadowExecutionNode({
+      node: "owner-B",
+      scope: "the_dubspace",
+      serialized,
+      authoritative_state: true
+    });
+    const commitScope = createShadowCommitScope({ node: "owner-B", scope: "the_dubspace", serialized });
+    const accepted = await executeAuthoritativeShadowTurnCall(owner, {
+      id: "b7-relay-cache-turn",
+      call: setControlCall("b7-relay-cache-turn", 0.42, session.id, actor),
+      commitScope
+    });
+    if (!accepted.ok) throw new Error(`turn failed: ${accepted.reason}`);
+    const transfer = accepted.reply?.ok ? accepted.reply.state_transfer : undefined;
+    if (!transfer || transfer.mode !== "cell_pages") throw new Error("accepted reply did not carry a cell-page transfer");
+
+    const relay = createShadowBrowserRelayShim({
+      node: "relay-A",
+      scope: "the_dubspace",
+      serialized: {
+        version: 1,
+        objectCounter: 1,
+        parkedTaskCounter: 1,
+        sessionCounter: 1,
+        objects: [],
+        sessions: [],
+        logs: [],
+        snapshots: [],
+        parkedTasks: [],
+        tombstones: []
+      }
+    });
+
+    const changed = installShadowAcceptedWriteTransferIntoRelayCache(relay, transfer);
+    expect(changed).toBe(true);
+
+    const warmed = serializedFor(relay.commit_scope, { reason: "test_b7_relay_cache" });
+    expect(warmed.objects.map((obj) => obj.id)).toEqual(expect.arrayContaining(["the_dubspace", "delay_1"]));
+    const trackedKeys = transfer.page_refs
+      .filter((ref) => ref.page === "object_lineage" || ref.page === "object_live")
+      .map((ref) => planningCellKey(ref.object, ref.page, ref.name));
+    expect(trackedKeys.length).toBeGreaterThan(0);
+    for (const key of trackedKeys) {
+      expect(relay.commit_scope.cellProvenance?.get(key)?.source).toBe("cache");
+    }
   });
 
   it("a COLD caller needs a remote fetch for the same turn (warm-fill is necessary)", async () => {

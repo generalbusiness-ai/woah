@@ -9,6 +9,31 @@ Not cold-start (`init/world` mean 50ms), not full-world snapshot
 (`serialized_world_materialized` ×7). The per-turn cost is a fan-in / repair
 storm against incomplete executor slices.
 
+## 2026-06-04 deployed B7 measurement — honest claim
+
+B7's deployed claim is now narrower and proven: it removed the measured
+authority/executable-open phase from the MCP turn path, but it did **not** move
+the cold-start turn wall enough to make full deployed smoke pass.
+
+Evidence: commit `15942b1` deployed as Cloudflare version
+`41acd2ce-fb0b-4f75-a03b-edec4da1f854`; tail run
+`deploy-15942b1-b7-head-session-open-20260604T175534Z`. The `head_session.v1`
+open path worked: `/v2/open` request JSON was 19.5 KiB, executable seed bytes
+were 0, pages were 0, and misses were 0/5. For `the_chatroom:enter`, attempts
+fell to 1 and the authority phase was no longer the wall:
+`turn_phase_timing` measured total mean 15.136s / p95 19.335s, with
+`ensure_client_ms` 9.198s avg (61%), `submit_ms` 5.773s avg (38%), and
+`authority_ms` 165ms avg (1%).
+
+The remaining wall is prod-shaped Directory/fanout cold-start pressure, not the
+authority warm-fill problem B7 set out to remove. The same run showed repeated
+Directory `sessions-for-scopes` calls returning 26-29 MCP sessions for a
+two-actor smoke, including 5s timeouts, and each enter selected 16-17
+`audience_session_shards` while `scoped_shards=0` and `subscriber_shards=0`.
+So B7 is accepted as "authority phase removed / executable open removed"; it is
+not accepted as "cold-start wall solved." Next work should make cf-local
+reproduce this Directory/fanout shape before more deployed smoke-driven patches.
+
 ## Confirmed cost drivers (from the tail)
 
 1. **`dangling_parent_ref` ×338 — CONFIRMED ROOT CAUSE.** Every one is
@@ -57,9 +82,13 @@ storm against incomplete executor slices.
    a real `$chatroom`). So scope-lineage completeness is an authority-slice
    problem → step 2.
 2. **Replace per-turn authority-slice reconstruction with checkpoint/tail +
-   cell-keyed reads (CA12).** Bulk of the ~10s/turn, and owner of the remaining
-   `the_chatroom -> $chatroom` scope-lineage dangle. Split into verifiable
-   sub-steps, each landed and harness-checked before the next:
+   cell-keyed reads (CA12). — DEPLOYED/PROVEN FOR THE AUTHORITY PHASE, NOT FOR
+   THE COLD-START TURN WALL.** This removed the authority/executable-open wall
+   on the deployed MCP path, but the same measurement exposed a deeper
+   Directory/fanout cold-start wall. The original framing below remains useful
+   for why B7 existed, but its acceptance claim is now limited to the measured
+   authority phase. Split into verifiable sub-steps, each landed and
+   harness-checked before the next:
    - **2a — instrument. [implemented in this branch]** Record every
      authority-slice reconstruction by
      `{reason, scope, object_count, page_count, source_host}`. Nothing else
@@ -169,24 +198,28 @@ are dropped. `cf-local-walkthrough` MUST assert, for movement turns:
 - After step 1: zero universal-lineage dangles. **[met]**
 - After step 2: zero total `dangling_parent_ref`; no full `SerializedWorld`
   materialization on a warm MCP turn; bounded Directory `resolve-object` calls
-  per walkthrough/turn.
+  per walkthrough/turn. **Deployed B7 met the authority/materialization intent,
+  but did not meet the end-to-end cold-start wall intent.**
 - Tracked separately, tightened over time: p95 local MCP step wall time; CPU
   budget per turn (warm vs cold buckets).
 
 ## The next proof (review, agreed)
 
-Step 1 is NOT deployed alone. The important proof is that **step 2 removes the
-`$chatroom` lineage dangle and the per-turn fan-in WITHOUT reintroducing
-sparse-slice authority corruption** (hence the provenance invariant). Verify on
-the harness + a single tail measurement once 2 lands — not per sub-step.
+Step 1 was not deployed alone. Step 2's deployed proof is now complete only for
+the authority slice claim: it removed the executable/authority warm cost without
+reintroducing sparse-slice authority corruption. The next proof is different:
+cf-local must model the prod Directory/fanout shape that still dominates cold
+turns, then that harness should drive mitigation before any further CF smoke
+loops.
 
 ## Discipline
 
 Each (sub-)step verified against the harness and local measurement before the
-next. Prod stays at `b7915524` (no users) until step 2 demonstrably improves the
-profile without authority corruption. Do not re-run the CF smoke for its own
-sake — re-measure with `smoke-with-tail.sh` only when a step should move a
-specific metric.
+next. B7 did improve the authority/executable-open profile without authority
+corruption, but the deployed full-smoke failure moved the active acceptance
+target to Directory session discovery and cross-shard fanout. Do not re-run the
+CF smoke for its own sake — re-measure with `smoke-with-tail.sh` only when a
+step should move a specific metric.
 
 ## Separate baseline test debt
 

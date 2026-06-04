@@ -4175,7 +4175,7 @@ describe("CFObjectRepository production-shape coverage", () => {
 
       expect(repairedHealthz.ok).toBe(true);
       expect(harness.hostSeedFetches).toContain("the_deck");
-      expect(world.ownVerbExact("$conversational", "room_roster")?.source).toContain("contents(this)");
+      expect(world.ownVerbExact("$conversational", "room_roster")?.source).toContain("active_actors(this)");
       expect(world.ownVerbExact("$conversational", "room_roster")?.source).not.toContain("return [\"stale\"]");
     } finally {
       logSpy.mockRestore();

@@ -48,6 +48,7 @@ import { shadowTurnKeyFromTranscript } from "../src/core/turn-key";
 import type { EffectTranscript } from "../src/core/effect-transcript";
 import { serializedFor, submitShadowCommit, type ShadowCommitAccepted, type ShadowScopeHead } from "../src/core/shadow-commit-scope";
 import { createShadowExecutionNode } from "../src/core/shadow-turn-exec";
+import { mergeAuthorityIntoRelayCache } from "../src/core/shadow-relay-cache";
 
 describe("shadow browser node shim", () => {
   it("opens a browser-style dubspace node and commits a real control action", async () => {
@@ -2000,6 +2001,68 @@ describe("shadow browser relay seed provenance (A3.2)", () => {
     const relay = createShadowBrowserRelayShim({ node: "n", scope: "$system", serialized, seedCellProvenance: seed });
     createShadowBrowserNode({ node: "browser", scope: "$system", actor: "$wiz", relay });
     expect(relay.commit_scope.cellProvenance?.get(planningCellKey(id, "object_lineage"))).toEqual({ source: "authoritative" });
+  });
+
+  it("prunes non-authoritative presentation stubs from the shared relay cache", () => {
+    const serialized = createWorld().exportWorld();
+    const room = serialized.objects.find((obj) => obj.id === "the_chatroom");
+    expect(room).toBeDefined();
+    const staleActor: SerializedObject = {
+      id: "guest_249",
+      name: "guest_249",
+      parent: "$guest",
+      anchor: null,
+      owner: "guest_249",
+      location: "the_chatroom",
+      flags: {},
+      created: 0,
+      modified: 0,
+      propertyDefs: [],
+      properties: [],
+      propertyVersions: [],
+      verbs: [],
+      children: [],
+      contents: [],
+      eventSchemas: []
+    };
+    serialized.objects.push(staleActor);
+    room!.contents = [...room!.contents, staleActor.id].sort();
+    serialized.sessions.push({
+      id: "stale-session",
+      actor: staleActor.id,
+      started: 1,
+      expiresAt: Date.now() + 60_000,
+      lastDetachAt: null,
+      tokenClass: "guest",
+      activeScope: "the_chatroom"
+    });
+    const relay = createShadowBrowserRelayShim({
+      node: "cache-prune",
+      scope: "the_chatroom",
+      serialized,
+      seedCellProvenance: new Map([
+        [planningCellKey(staleActor.id, "object_lineage"), { source: "cache" }],
+        [planningCellKey(staleActor.id, "object_live"), { source: "cache" }]
+      ])
+    });
+
+    const changed = mergeAuthorityIntoRelayCache(relay, {
+      kind: "woo.authority_slice.cells.shadow.v1",
+      sessions: [],
+      page_refs: [],
+      inline_pages: [],
+      counters: { objectCounter: 1, parkedTaskCounter: 1, sessionCounter: 1 },
+      tombstones: [],
+      source_object_count: 0
+    });
+    const after = serializedFor(relay.commit_scope);
+
+    expect(changed).toBe(true);
+    expect(after.objects.some((obj) => obj.id === staleActor.id)).toBe(false);
+    expect(after.sessions.some((session) => session.actor === staleActor.id)).toBe(false);
+    expect(after.objects.find((obj) => obj.id === "the_chatroom")?.contents).not.toContain(staleActor.id);
+    expect(relay.commit_scope.cellProvenance?.has(planningCellKey(staleActor.id, "object_lineage"))).toBe(false);
+    expect(relay.commit_scope.cellProvenance?.has(planningCellKey(staleActor.id, "object_live"))).toBe(false);
   });
 
   // Finding 2 (review): the ONE shared derived-cache applier materializes the authority

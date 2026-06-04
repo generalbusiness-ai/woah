@@ -68,6 +68,7 @@ import {
 import {
   applyAcceptedFrameToDerivedRelayCache,
   applyAcceptedFrameToRelayCache,
+  installShadowAcceptedWriteTransferIntoRelayCache,
   installShadowCellPageTransferAsAuthority,
   markShadowBrowserRelaySerializedChanged,
   mergeAuthorityIntoRelayCache,
@@ -315,6 +316,12 @@ const MAX_REST_V2_RELAY_CLIENTS = 64;
 const DIRECTORY_HOST = "directory";
 const INTERNAL_ORIGIN = "https://woo.internal";
 const MAX_JSON_BODY_BYTES = 1 * 1024 * 1024;
+// Operator-only purge cutoff for detached guests. Normal guest sessions keep
+// their longer TTL so active stateless clients survive brief gaps; recovery
+// needs a stricter inactivity window to remove historical smoke routes across
+// transports from Directory-backed room presence before they force authority-
+// slice fan-in.
+const OPERATOR_STALE_GUEST_SESSION_MS = 60_000;
 const HOST_SEED_KV_KIND = "woo.host_seed.kv.bytecode_free.v1";
 const MAX_BROWSER_METRICS_BATCH = 200;
 const MAX_BROWSER_METRIC_STRING = 160;
@@ -1212,6 +1219,11 @@ export class PersistentObjectDO {
               // resurrect the Directory route we just closed and leave the
               // guest actor in room contents until TTL/reap. The gateway hook
               // below performs the durable cleanup.
+            } else if (request.signal.aborted) {
+              // A client-side smoke timeout can leave the Worker finishing the
+              // POST after the client has already discarded the session and
+              // issued teardown. Publishing that late active-scope row makes
+              // the next warm turn hydrate stale room presence from Directory.
             } else {
               await this.registerMcpSessionRoute(world, request, response.clone(), mcpGatewayShard ? hostKey : null);
             }
@@ -1611,8 +1623,7 @@ export class PersistentObjectDO {
             await this.v2GatewayAuthorityPayload(world, extraObjectIds, {
               tolerateRemoteFailures: true,
               useCommitScopeSnapshotForRemoteAuthority:
-                authorityOptions?.useCommitScopeSnapshotForRemoteAuthority === true &&
-                !isMcpGatewayShardHost(this.durableHostKey()),
+                authorityOptions?.useCommitScopeSnapshotForRemoteAuthority === true,
               directorySessionScopes: authorityOptions?.directorySessionScopes,
               scopeContentExpansionRoots: authorityOptions?.scopeContentExpansionRoots,
               reconstructionReason: authorityOptions?.reconstructionReason,
@@ -3897,12 +3908,20 @@ export class PersistentObjectDO {
   }
 
   private async purgeInactiveGuests(world: WooWorld): Promise<Record<string, unknown>> {
-    const result = world.purgeInactiveGuests();
+    const now = Date.now();
+    const result = world.purgeInactiveGuests(now, { staleGuestSessionMs: OPERATOR_STALE_GUEST_SESSION_MS });
     for (const sessionId of result.reaped_sessions) {
       await this.unregisterSessionRoute(sessionId);
     }
     const directory_expired_sessions_removed = await this.purgeExpiredDirectorySessions();
-    return { ok: true, ...result, directory_expired_sessions_removed };
+    const directory_stale_guest_sessions_removed = await this.purgeStaleGuestDirectorySessions(now - OPERATOR_STALE_GUEST_SESSION_MS);
+    return {
+      ok: true,
+      ...result,
+      stale_guest_session_ms: OPERATOR_STALE_GUEST_SESSION_MS,
+      directory_expired_sessions_removed,
+      directory_stale_guest_sessions_removed
+    };
   }
 
   private deleteLocalGatewaySessionCache(sessionId: string): void {
@@ -3956,6 +3975,23 @@ export class PersistentObjectDO {
         method: "POST",
         headers: { "content-type": "application/json; charset=utf-8" },
         body: "{}"
+      }));
+      const response = await this.env.DIRECTORY.get(id).fetch(request);
+      if (!response.ok) return 0;
+      const body = await response.json().catch(() => null) as { removed?: unknown } | null;
+      return Number(body?.removed ?? 0);
+    } catch {
+      return 0;
+    }
+  }
+
+  private async purgeStaleGuestDirectorySessions(updatedBefore: number): Promise<number> {
+    try {
+      const id = this.env.DIRECTORY.idFromName(DIRECTORY_HOST);
+      const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/purge-stale-guest-sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json; charset=utf-8" },
+        body: JSON.stringify({ updated_before: updatedBefore })
       }));
       const response = await this.env.DIRECTORY.get(id).fetch(request);
       if (!response.ok) return 0;
@@ -4582,6 +4618,8 @@ export class PersistentObjectDO {
     );
     const slices: SerializedAuthoritySlice[] = [authority];
     if (sessionActors.size > 0) {
+      const localActorLineage = mcpGatewayLocalActorLineageCellSlice(world, sessionActors, this.durableHostKey());
+      if (authoritySlicePageCount(localActorLineage) > 0) slices.push(localActorLineage);
       const localActorLive = mcpGatewayLocalActorLiveCellSlice(world, sessionActors, this.durableHostKey());
       if (authoritySlicePageCount(localActorLive) > 0) slices.push(localActorLive);
     }
@@ -4807,6 +4845,8 @@ export class PersistentObjectDO {
     }
     const slices: SerializedAuthoritySlice[] = [local.authority];
     if (mcpGatewayShard && localActorAuthorityRoots.size > 0) {
+      const actorLineage = mcpGatewayLocalActorLineageCellSlice(world, localActorAuthorityRoots, this.durableHostKey());
+      if (actorLineage.page_refs.length > 0) slices.push(actorLineage);
       const actorLive = mcpGatewayLocalActorLiveCellSlice(world, localActorAuthorityRoots, this.durableHostKey());
       if (actorLive.page_refs.length > 0) slices.push(actorLive);
       const actorCells = mcpGatewayLocalActorPropertyCellSlice(world, localActorAuthorityRoots, this.durableHostKey());
@@ -4946,6 +4986,7 @@ export class PersistentObjectDO {
       // exec request. Movement commits at the moved object's location
       // authority (CA3), not through the withdrawn #placement authority.
       maxAttempts: 8,
+      repairPlanningAuthority: true,
       ensureClient: async (scope, attempt) => await this.ensureRestV2Relay(world, input, scope, token, attempt > 0),
       clientNode: (client) => client.node,
       clientHead: (client) => client.relay.commit_scope.head,
@@ -5034,6 +5075,9 @@ export class PersistentObjectDO {
       onMetric: (event) => world.recordMetric(event)
     });
     if (submitted.kind === "local_frame") return submitted.frame;
+    if (submitted.reply?.state_transfer?.mode === "cell_pages") {
+      installShadowAcceptedWriteTransferIntoRelayCache(submitted.client.relay, submitted.reply.state_transfer, { reason: "rest_accepted_write_cache" });
+    }
     await this.deliverV2Fanout(world, submitted.commitScope, submitted.result, input.session.id, submitted.client.node);
     if (!submitted.result.reply || !submitted.reply) throw wooError("E_INTERNAL", "v2 REST turn produced no reply");
     await this.applyV2CommittedTranscript(world, submitted.result.reply, input.session.id);
@@ -6752,11 +6796,13 @@ function mcpGatewayDirectorySessionCellSlice(sessions: readonly DirectorySeriali
   const snapshot = mcpGatewayShardSerializedWorld(sessions);
   const sessionActors = new Set<ObjRef>(sessions.map((session) => session.actor));
   const actorObjects = snapshot.objects.filter((obj) => sessionActors.has(obj.id));
-  const actorLineagePages: ShadowStatePage[] = actorObjects.flatMap((obj) => [
+  const projectableActorObjects = actorObjects.filter(mcpGatewaySessionActorIsProjectable);
+  const projectableActors = new Set<ObjRef>(projectableActorObjects.map((obj) => obj.id));
+  const actorLineagePages: ShadowStatePage[] = projectableActorObjects.flatMap((obj) => [
     shadowObjectLineagePage(obj),
     ...shadowPropertyCellPages(obj)
   ]);
-  const actorLivePlaceholders: ShadowStatePage[] = actorObjects.map((obj) => shadowObjectLivePage({
+  const actorLivePlaceholders: ShadowStatePage[] = projectableActorObjects.map((obj) => shadowObjectLivePage({
     ...obj,
     location: null,
     children: [],
@@ -6764,7 +6810,11 @@ function mcpGatewayDirectorySessionCellSlice(sessions: readonly DirectorySeriali
   }));
   const scopeLivePages: ShadowStatePage[] = snapshot.objects
     .filter((obj) => !sessionActors.has(obj.id) && obj.contents.length > 0)
-    .map((obj) => shadowObjectLivePage(obj));
+    .map((obj) => shadowObjectLivePage({
+      ...obj,
+      contents: obj.contents.filter((id) => projectableActors.has(id))
+    }))
+    .filter((page) => page.contents.length > 0);
   const inlinePages = [...actorLineagePages, ...actorLivePlaceholders, ...scopeLivePages];
   // A3: these pages are synthesized from Directory route records, not from the
   // object owner's live state — Directory publishes session/presence/projection
@@ -6772,7 +6822,12 @@ function mcpGatewayDirectorySessionCellSlice(sessions: readonly DirectorySeriali
   // provenance. Actor live pages are only empty fallback placeholders: they let
   // sparse planning admit a peer actor's identity without treating Directory's
   // possibly-stale current-location hint as movement truth. Accepted-frame/cache
-  // rows and owner rows outrank them.
+  // rows and owner rows outrank them. Directory may also retain unexpired rows
+  // for abandoned MCP attempts; if a row lacks a display name then the sparse
+  // transport snapshot can only build a name===id presentation stub. Do not
+  // publish those stubs into authority or room contents: a session row is
+  // visible to planning only when the same slice can dereference a real actor
+  // identity.
   const provenance: AuthorityPageProvenance = { source: "projection", source_host: hostKey };
   const actorLivePlaceholderProvenance: AuthorityPageProvenance = { source: "fallback", source_host: hostKey };
   return {
@@ -6790,8 +6845,12 @@ function mcpGatewayDirectorySessionCellSlice(sessions: readonly DirectorySeriali
       sessionCounter: 1
     },
     tombstones: [],
-    source_object_count: actorObjects.length + scopeLivePages.length
+    source_object_count: projectableActorObjects.length + scopeLivePages.length
   };
+}
+
+function mcpGatewaySessionActorIsProjectable(obj: SerializedObject): boolean {
+  return obj.id.startsWith("$") || obj.name !== obj.id;
 }
 
 function directContentIdsFromAuthoritySlice(
@@ -6806,6 +6865,11 @@ function directContentIdsFromAuthoritySlice(
   const visitContents = (contents: readonly ObjRef[]): boolean => {
     for (const id of contents) {
       if (seen.has(id)) continue;
+      // Guest actors are ephemeral transport identities. Active guests reach MCP
+      // planning through the session/Directory projection path above; stale guest
+      // ids left in a room's derived contents mirror must not trigger owner
+      // authority fan-in or presentation-stub repair loops.
+      if (isGuestActorRef(id)) continue;
       seen.add(id);
       ids.push(id);
       if (ids.length >= limit) return false;
@@ -6824,6 +6888,10 @@ function directContentIdsFromAuthoritySlice(
     if (!visitContents(obj.contents)) return ids;
   }
   return ids;
+}
+
+function isGuestActorRef(id: ObjRef): boolean {
+  return /^guest_\d+$/.test(id);
 }
 
 function mcpGatewayStubObject(input: {
@@ -7054,6 +7122,37 @@ function mcpGatewayLocalActorPropertyCellSlice(
     },
     tombstones: [],
     source_object_count: new Set(inlinePages.map((page) => page.object)).size
+  };
+}
+
+function mcpGatewayLocalActorLineageCellSlice(
+  world: WooWorld,
+  actors: ReadonlySet<ObjRef>,
+  hostKey: string
+): SerializedAuthorityCellSlice {
+  const inlinePages: ShadowStatePage[] = [];
+  for (const obj of world.exportObjects(actors)) {
+    // A sparse shard's first-touch actor row starts as a presentation stub
+    // (`name === id`). Do not export that as identity. Once Directory/forwarded
+    // session headers have installed a real display name, the row is a valid
+    // session projection and can repair older cache stubs without claiming owner
+    // authority.
+    if (obj.name === obj.id) continue;
+    inlinePages.push(shadowObjectLineagePage(obj));
+  }
+  const provenance: AuthorityPageProvenance = { source: "projection", source_host: hostKey };
+  return {
+    kind: "woo.authority_slice.cells.shadow.v1",
+    sessions: [],
+    page_refs: inlinePages.map((page) => stampAuthorityPageRef(page, true, provenance)),
+    inline_pages: inlinePages,
+    counters: {
+      objectCounter: 1,
+      parkedTaskCounter: 1,
+      sessionCounter: 1
+    },
+    tombstones: [],
+    source_object_count: inlinePages.length
   };
 }
 
