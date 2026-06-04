@@ -1619,14 +1619,27 @@ export class PersistentObjectDO {
             world.touchSessionInput(body.session);
             return await this.v2CommitScopePost<CommitScopeOpenResponse>(scope, "/v2/open", body as unknown as Record<string, unknown>);
           },
-          envelope: async (scope, body): Promise<McpV2EnvelopeResult> => {
+          envelope: async (scope, body, context): Promise<McpV2EnvelopeResult> => {
             world.touchSessionInput(body.session);
-            const result = await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(scope, "/v2/envelope", body as unknown as Record<string, unknown>);
-            const delivery = await this.deliverV2Fanout(world, scope, result, body.session, body.node, {
+            const result = await (context?.timing
+              ? context.timing.time("submit", "worker.commit_scope_envelope_rpc", () => this.v2CommitScopePost<CommitScopeEnvelopeResponse>(scope, "/v2/envelope", body as unknown as Record<string, unknown>))
+              : this.v2CommitScopePost<CommitScopeEnvelopeResponse>(scope, "/v2/envelope", body as unknown as Record<string, unknown>));
+            const delivery = await (context?.timing
+              ? context.timing.time("submit", "worker.post_accept_delivery", () => this.deliverV2Fanout(world, scope, result, body.session, body.node, {
+                localMcpLiveHandled: true,
+                deferMcpCommitFanout: true
+              }))
+              : this.deliverV2Fanout(world, scope, result, body.session, body.node, {
               localMcpLiveHandled: true,
               deferMcpCommitFanout: true
-            });
-            this.applyGatewayProjectionCacheFromReply(result.reply, "mcp");
+            }));
+            if (context?.timing) {
+              await context.timing.time("submit", "worker.gateway_projection_cache_apply", () => {
+                this.applyGatewayProjectionCacheFromReply(result.reply, "mcp");
+              });
+            } else {
+              this.applyGatewayProjectionCacheFromReply(result.reply, "mcp");
+            }
             return {
               ...result,
               local_host_materialized: delivery.localHostMaterialized,

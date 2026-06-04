@@ -79,6 +79,14 @@ describe("CF-local prod-shape structural probes", () => {
         enterTurns.map((m) => ({ attempts: Number(m.attempts), authority_calls: Number(m.authority_calls) })),
         "one-turn smoke should converge without repair-round multiplication"
       ).toEqual([{ attempts: 1, authority_calls: 1 }]);
+      expect(
+        enterTurns.some((m) => m.ensure_detail_ms && typeof m.ensure_detail_ms === "object"),
+        "enter turn should expose ensure subphase detail for prod smoke triage"
+      ).toBe(true);
+      expect(
+        enterTurns.some((m) => m.submit_detail_ms && typeof m.submit_detail_ms === "object" && "worker.commit_scope_envelope_rpc" in m.submit_detail_ms),
+        "enter turn should split submit into commit-scope RPC and post-accept delivery"
+      ).toBe(true);
       expect(maxDirectorySessions, "stale Directory rows must not enter the presence authority payload").toBeLessThanOrEqual(2);
       expect(maxAudienceSessionShards, "stale sessions must not choose one MCP gateway shard each").toBeLessThanOrEqual(2);
       expect(maxFanoutShards, "commit fanout must stay proportional to live audience shards").toBeLessThanOrEqual(2);

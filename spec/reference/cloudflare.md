@@ -906,6 +906,15 @@ authority and local last-known object-owner rows instead of waking those owners
 on every envelope. This optimization is not valid for first-open seeding or any
 path that is still constructing the CommitScopeDO's durable planning snapshot.
 
+For durable MCP calls whose target is exactly the room/scope object and whose
+actor is distinct from that scope, a gateway MAY start a `head_session.v1` open
+for the actor scope before local planning proves a B6 relocation. This is a
+latency overlap only: it does not select the commit scope, does not make the
+actor scope authoritative for the turn, and must be safe to ignore if it fails.
+The normal transcript-based commit-scope selection, authority refresh, expected
+head validation, and retry path still run before any commit is accepted. The
+gateway records the speculative open as `mcp_relocation_prewarm`.
+
 Accepted v2 commits do not rewrite the full world. The commit applies the
 transcript to indexed commit-scope state, marks any legacy `SerializedWorld`
 cache dirty, and the storage transaction upserts only projection rows named by
@@ -969,6 +978,12 @@ transcript/snapshot apply path for materialized rows, but may still consume
 marker-only tool-surface invalidations. This keeps co-present MCP sessions
 observable across shard boundaries without making any shard authoritative for
 durable world state.
+
+MCP submit instrumentation must split the `submit` phase enough to distinguish
+the commit-scope envelope RPC from post-accept delivery and gateway projection
+cache application. In Worker-shaped runtimes these labels are
+`worker.commit_scope_envelope_rpc`, `worker.post_accept_delivery`, and
+`worker.gateway_projection_cache_apply` inside `turn_phase_timing.submit_detail_ms`.
 
 `/v2/open` supports an opt-in checkpoint/tail protocol by request body
 negotiation: `open_protocol: "checkpoint_tail.v1"`, `known_head`, and bounded
