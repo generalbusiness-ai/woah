@@ -4338,7 +4338,11 @@ describe("CFObjectRepository production-shape coverage", () => {
       const fillerActor = "cf_mcp_directory_filler" as ObjRef;
       for (let i = 0; i < 2050; i += 1) {
         harness.directoryState.storage.sql.exec(
-          "INSERT OR REPLACE INTO session_route(session_id, actor, started, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          // last_seen_at is set live (= now) so these scale/paging fillers pass
+          // the presence-lease filter on /mcp-sessions-for-shard; the cold-load
+          // rebind only restores presence-live queues. Omitting it would leave
+          // last_seen_at NULL and the filter would (correctly) drop the row.
+          "INSERT OR REPLACE INTO session_route(session_id, actor, started, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list, updated_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
           `bulk-cf-mcp-directory-${String(i).padStart(4, "0")}`,
           fillerActor,
           10_000 + i,
@@ -4348,6 +4352,7 @@ describe("CFObjectRepository production-shape coverage", () => {
           null,
           shard,
           "[]",
+          Date.now(),
           Date.now()
         );
       }
