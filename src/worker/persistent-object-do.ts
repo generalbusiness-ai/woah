@@ -1296,12 +1296,7 @@ export class PersistentObjectDO {
       if (worldGatewayHost && request.method === "POST" && pathname === "/api/admin/purge-inactive-guests") {
         const session = this.requireRestSession(world, request);
         if (!world.object(session.actor).flags.wizard) throw wooError("E_PERM", "wizard authority required");
-        const result = world.purgeInactiveGuests();
-        for (const sessionId of result.reaped_sessions) {
-          await this.unregisterSessionRoute(sessionId);
-        }
-        const directory_expired_sessions_removed = await this.purgeExpiredDirectorySessions();
-        return jsonResponse({ ok: true, ...result, directory_expired_sessions_removed });
+        return jsonResponse(await this.purgeInactiveGuests(world));
       }
 
       const protocol = await handleRestProtocolRequest(workerRestRequest(request, pathname), {
@@ -3377,6 +3372,11 @@ export class PersistentObjectDO {
         return jsonResponse({ ok: true, ended });
       }
 
+      if (request.method === "POST" && pathname === "/__internal/purge-inactive-guests") {
+        if (hostKey !== WORLD_HOST) throw wooError("E_NOTAPPLICABLE", "purge-inactive-guests runs only on WORLD");
+        return jsonResponse(await this.purgeInactiveGuests(world));
+      }
+
       if (request.method === "POST" && pathname === "/__internal/broadcast-applied") {
         const frame = body.frame && typeof body.frame === "object" && !Array.isArray(body.frame)
           ? body.frame as AppliedFrame
@@ -3891,6 +3891,15 @@ export class PersistentObjectDO {
       );
     }
     await this.unregisterSessionRoute(sessionId);
+  }
+
+  private async purgeInactiveGuests(world: WooWorld): Promise<Record<string, unknown>> {
+    const result = world.purgeInactiveGuests();
+    for (const sessionId of result.reaped_sessions) {
+      await this.unregisterSessionRoute(sessionId);
+    }
+    const directory_expired_sessions_removed = await this.purgeExpiredDirectorySessions();
+    return { ok: true, ...result, directory_expired_sessions_removed };
   }
 
   private deleteLocalGatewaySessionCache(sessionId: string): void {

@@ -1056,7 +1056,10 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       const live = world.auth("guest:conf-purge-live");
       await world.directCall("enter-stale-chat", stale.actor, "the_chatroom", "enter", []);
       await world.directCall("enter-live-chat", live.actor, "the_chatroom", "enter", []);
-      world.endSession(stale.id);
+      // Simulate a missed transport lifecycle close: the session row vanished,
+      // but guest location and room presence rows were left durable.
+      world.sessions.delete(stale.id);
+      expect((world.getProp("the_chatroom", "subscribers") as ObjRef[]).sort()).toEqual([live.actor, stale.actor].sort());
 
       const result = world.purgeInactiveGuests();
       expect(result.reset_actors).not.toContain(live.actor);
@@ -1064,6 +1067,9 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
       expect(world.object(live.actor).location).toBe("the_chatroom");
       expect(world.contentsOf("the_chatroom")).toContain(live.actor);
       expect(world.contentsOf("the_chatroom")).not.toContain(stale.actor);
+      expect(world.getProp("the_chatroom", "subscribers")).toEqual([live.actor]);
+      const rows = world.getProp("the_chatroom", "session_subscribers") as Array<{ actor: string }>;
+      expect(rows.map((row) => row.actor)).toEqual([live.actor]);
     } finally {
       harness.cleanup();
     }

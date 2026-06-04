@@ -778,10 +778,10 @@ session/tool cache rows, forwards a signed internal end-session request to
 `world`, and unregisters the Directory `session_route`. The `/mcp` wrapper must
 not run the normal post-response `register-session` path for that 204 response:
 doing so would resurrect a closed route and leave temporary guest actors in
-durable room contents until a later reap. Operators may use
-`POST /api/admin/purge-inactive-guests` to run the same guest reset lifecycle
-for already-accumulated inactive guests and to delete expired Directory session
-routes.
+durable room contents until a later reap. Operators may use either
+wizard-gated `POST /api/admin/purge-inactive-guests` or Basic-auth-gated
+`POST /admin/purge-inactive-guests`; both run the same WORLD lifecycle reset
+and delete expired Directory session routes.
 
 Sparse MCP session projection may include Directory-derived actor
 lineage/properties and scope presence rows as `projection` authority pages. It

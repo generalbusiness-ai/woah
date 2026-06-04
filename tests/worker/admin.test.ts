@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { handleAdmin } from "../../src/worker/admin";
+import { verifyInternalRequest } from "../../src/worker/internal-auth";
 import type { Env } from "../../src/worker/persistent-object-do";
+import { FakeDurableObjectNamespace } from "./fake-do";
 
 // Tiny stub Env. Tests only set what each case needs.
 function envOf(overrides: Partial<Env>): Env {
@@ -68,6 +70,58 @@ describe("admin auth gate", () => {
       headers: { authorization: basicAuthHeader("admin", "hunter2") }
     });
     expect(res.status).toBe(404);
+  });
+});
+
+describe("/admin/purge-inactive-guests", () => {
+  const authHeaders = { authorization: basicAuthHeader("admin", "hunter2") };
+
+  it("requires POST so crawlers or refreshes cannot mutate lifecycle state", async () => {
+    const res = await call(envOf({ ADMIN_PASSWORD: "hunter2", WOO_INTERNAL_SECRET: "secret" }), "/admin/purge-inactive-guests", {
+      headers: authHeaders
+    });
+    expect(res.status).toBe(405);
+    expect(res.headers.get("allow")).toBe("POST");
+    const body = await res.json() as { error?: { code?: string } };
+    expect(body.error?.code).toBe("E_METHOD");
+  });
+
+  it("forwards a signed internal purge request to WORLD", async () => {
+    const forwarded: Record<string, unknown> = {};
+    const env = envOf({
+      ADMIN_PASSWORD: "hunter2",
+      WOO_INTERNAL_SECRET: "secret",
+      WOO: new FakeDurableObjectNamespace((name) => ({
+        fetch: async (request: Request) => {
+          forwarded.durableName = name;
+          forwarded.path = new URL(request.url).pathname;
+          forwarded.hostHeader = request.headers.get("x-woo-host-key");
+          await verifyInternalRequest(env, request);
+          return new Response(JSON.stringify({
+            ok: true,
+            inspected: 12,
+            reaped_sessions: ["session_1"],
+            reset_actors: ["guest_1"],
+            directory_expired_sessions_removed: 3
+          }), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
+        }
+      })) as unknown as DurableObjectNamespace
+    });
+
+    const res = await call(env, "/admin/purge-inactive-guests", {
+      method: "POST",
+      headers: authHeaders
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as { ok?: boolean; inspected?: number; reset_actors?: string[] };
+    expect(body.ok).toBe(true);
+    expect(body.inspected).toBe(12);
+    expect(body.reset_actors).toEqual(["guest_1"]);
+    expect(forwarded).toMatchObject({
+      durableName: "world",
+      path: "/__internal/purge-inactive-guests",
+      hostHeader: "world"
+    });
   });
 });
 

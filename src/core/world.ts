@@ -3212,15 +3212,24 @@ export class WooWorld {
     }
 
     let inspected = 0;
-    const resetActors: ObjRef[] = [];
+    const inactiveGuestActors: ObjRef[] = [];
     for (const actor of Array.from(this.objects.keys()).sort() as ObjRef[]) {
       if (!actor.startsWith("guest_") || !this.inheritsFrom(actor, "$guest")) continue;
       inspected += 1;
       if (liveGuestActors.has(actor)) continue;
+      inactiveGuestActors.push(actor);
+    }
+
+    // Presence cleanup should stay proportional to actual stale presence rows,
+    // not guests × objects. The index is rebuilt once, then each inactive guest
+    // scrubs only spaces that mention that actor in subscribers/session rows.
+    if (inactiveGuestActors.length > 0) this.ensurePresenceIndex();
+
+    const resetActors: ObjRef[] = [];
+    for (const actor of inactiveGuestActors) {
       let changed = false;
-      for (const obj of this.objects.values()) {
-        if (this.propOrNull(obj.id, "subscribers") === null && this.propOrNull(obj.id, "session_subscribers") === null) continue;
-        if (this.dropAllSubscriberRowsForActor(obj.id, actor)) changed = true;
+      for (const space of Array.from(this.actorPresenceIndex.get(actor) ?? []).sort() as ObjRef[]) {
+        if (this.dropAllSubscriberRowsForActor(space, actor)) changed = true;
       }
       const guest = this.object(actor);
       const needsReset =

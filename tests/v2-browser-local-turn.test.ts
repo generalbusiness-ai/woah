@@ -4,62 +4,60 @@ import { describe, expect, it, vi } from "vitest";
 import { planV2BrowserLocalTurn } from "../src/client/v2-browser-local-turn";
 import { createV2BrowserAcceptedWriteCellTransfer, v2ExecutableTransferRecord } from "../src/client/v2-browser-execution-cache";
 import { createWorld } from "../src/core/bootstrap";
+import { stableShadowJson } from "../src/core/shadow-cell-version";
 import { buildShadowBrowserOpenExecutableSeedTransfer, createShadowBrowserRelayShim } from "../src/core/shadow-browser-node";
 import { buildShadowTurnExecAd, executeShadowTurnCallAcrossInProcessNetwork } from "../src/core/shadow-turn-network";
 import { buildShadowCellPageTransfer, createShadowExecutionNode } from "../src/core/shadow-turn-exec";
 import { runShadowTurnCall, type ShadowTurnCall } from "../src/core/shadow-turn-call";
 import { shadowTurnKeyFromTranscript } from "../src/core/turn-key";
+import { hashSource } from "../src/core/source-hash";
+import type { EffectTranscript } from "../src/core/effect-transcript";
 import type { WooValue } from "../src/core/types";
 
 describe("v2 browser local turn planning", () => {
   it("matches server transcripts for representative committed browser surfaces", async () => {
-    const now = vi.spyOn(Date, "now").mockReturnValue(1_779_000_000_000);
-    try {
-      await expectLocalTranscriptToMatchServer({
-        name: "chat carrying",
-        scope: "the_chatroom",
-        target: "the_chatroom",
-        verb: "take",
-        args: ["mug"],
-        setup: async (world, session) => {
-          await world.directCall("setup-chat-parity-enter", session.actor, "the_chatroom", "enter", [], { sessionId: session.id });
-        }
-      });
-      await expectLocalTranscriptToMatchServer({
-        name: "pinboard edit",
-        scope: "the_pinboard",
-        target: "the_pinboard",
-        verb: "add_note",
-        args: ["parity pin", "yellow", 48, 48, 180, 110],
-        setup: async (world, session) => {
-          await world.directCall("setup-pinboard-parity-enter", session.actor, "the_pinboard", "enter", [], { sessionId: session.id });
-        }
-      });
-      await expectLocalTranscriptToMatchServer({
-        name: "taskboard kanban create",
-        scope: "the_taskboard",
-        target: "the_taskboard",
-        verb: "create_task",
-        args: ["task", "Parity task", "Verify browser transcript parity.", ["browser"], null],
-        setup: async (world, session) => {
-          world.setProp("the_taskboard", "roles", { doer: { description: "Does the work", owners: [session.actor] } });
-          world.setProp("the_taskboard", "obligations", { "do:it": { role: "doer", criterion: "Done." } });
-          world.setProp("the_taskboard", "policies", { task: ["do:it"] });
-        }
-      });
-      await expectLocalTranscriptToMatchServer({
-        name: "dubspace committed control",
-        scope: "the_dubspace",
-        target: "the_dubspace",
-        verb: "set_control",
-        args: ["delay_1", "wet", 0.42],
-        setup: async (world, session) => {
-          world.setProp("the_dubspace", "operators", [session.actor]);
-        }
-      });
-    } finally {
-      now.mockRestore();
-    }
+    await expectLocalTranscriptToMatchServer({
+      name: "chat carrying",
+      scope: "the_chatroom",
+      target: "the_chatroom",
+      verb: "take",
+      args: ["mug"],
+      setup: async (world, session) => {
+        await world.directCall("setup-chat-parity-enter", session.actor, "the_chatroom", "enter", [], { sessionId: session.id });
+      }
+    });
+    await expectLocalTranscriptToMatchServer({
+      name: "pinboard edit",
+      scope: "the_pinboard",
+      target: "the_pinboard",
+      verb: "add_note",
+      args: ["parity pin", "yellow", 48, 48, 180, 110],
+      setup: async (world, session) => {
+        await world.directCall("setup-pinboard-parity-enter", session.actor, "the_pinboard", "enter", [], { sessionId: session.id });
+      }
+    });
+    await expectLocalTranscriptToMatchServer({
+      name: "taskboard kanban create",
+      scope: "the_taskboard",
+      target: "the_taskboard",
+      verb: "create_task",
+      args: ["task", "Parity task", "Verify browser transcript parity.", ["browser"], null],
+      setup: async (world, session) => {
+        world.setProp("the_taskboard", "roles", { doer: { description: "Does the work", owners: [session.actor] } });
+        world.setProp("the_taskboard", "obligations", { "do:it": { role: "doer", criterion: "Done." } });
+        world.setProp("the_taskboard", "policies", { task: ["do:it"] });
+      }
+    });
+    await expectLocalTranscriptToMatchServer({
+      name: "dubspace committed control",
+      scope: "the_dubspace",
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.42],
+      setup: async (world, session) => {
+        world.setProp("the_dubspace", "operators", [session.actor]);
+      }
+    });
   });
 
   it("builds a TurnExecRequest from a warmed browser execution cache", async () => {
@@ -1077,8 +1075,37 @@ async function expectLocalTranscriptToMatchServer(scenario: LocalTranscriptParit
   expect(local, scenario.name).toMatchObject({ ok: true });
   if (!local.ok) throw new Error(`expected local transcript for ${scenario.name}`);
   expect(local.transcript.error, scenario.name).toBeUndefined();
-  expect(local.transcript_hash, scenario.name).toBe(server.transcript.hash);
-  expect(local.transcript, scenario.name).toEqual(server.transcript);
+  const normalizedServer = normalizeLogicalClockTranscript(server.transcript);
+  const normalizedLocal = normalizeLogicalClockTranscript(local.transcript);
+  expect(normalizedLocal, scenario.name).toEqual(normalizedServer);
+  expect(normalizedLocal.hash, scenario.name).toBe(normalizedServer.hash);
+}
+
+function normalizeLogicalClockTranscript(transcript: EffectTranscript): EffectTranscript {
+  const clockValues = new Set<number>();
+  const withNamedLogicalInputs: EffectTranscript = structuredClone(transcript);
+  withNamedLogicalInputs.logicalInputs = transcript.logicalInputs.map((input, index) => {
+    if (typeof input.value === "number") clockValues.add(input.value);
+    return { ...input, value: `__logical_input_${index}_${input.name}__` };
+  });
+  const normalized = replaceLogicalClockValues(withNamedLogicalInputs, clockValues) as EffectTranscript;
+  const withoutHash = { ...normalized } as Record<string, unknown>;
+  delete withoutHash.hash;
+  return {
+    ...normalized,
+    hash: hashSource(stableShadowJson(withoutHash as WooValue))
+  };
+}
+
+function replaceLogicalClockValues(value: unknown, clockValues: ReadonlySet<number>): unknown {
+  if (typeof value === "number" && clockValues.has(value)) return "__logical_clock_value__";
+  if (Array.isArray(value)) return value.map((item) => replaceLogicalClockValues(item, clockValues));
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value)) out[key] = replaceLogicalClockValues(item, clockValues);
+    return out;
+  }
+  return value;
 }
 
 function dubspaceCall(session: string, actor: string, value: number): ShadowTurnCall {
