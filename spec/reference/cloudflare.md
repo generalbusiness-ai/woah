@@ -772,6 +772,15 @@ those sparse rows except for exact ids whose owner was resolved through
 Directory. Actual durable turn execution still
 commits through `CommitScopeDO`.
 
+Sparse MCP session projection may include Directory-derived actor
+lineage/properties and scope presence rows as `projection` authority pages. It
+must not treat Directory's `current_location` as actor movement truth. To satisfy
+planning admission for peer session actors whose identity is present but whose
+owner live row has not been fetched, shards may include an empty actor
+`object_live` placeholder stamped only as `fallback`; accepted-frame cache rows
+and owner-authoritative rows outrank that placeholder and replace it before any
+durable movement state is trusted.
+
 `CommitScopeDO` is the durable authority for v2 scope heads. On first open for
 a scope it materializes the gateway-supplied authority seed into row-shaped DO
 SQLite state: one row per materialized object, one row per session, one row per

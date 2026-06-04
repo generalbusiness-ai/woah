@@ -180,6 +180,20 @@ describe("CF-local smoke walkthrough", () => {
       const phaseTimings = parsedMetrics.filter((m) => m.kind === "turn_phase_timing");
       expect(phaseTimings.length, "submitTurnIntent must emit turn_phase_timing on the DO turn path").toBeGreaterThan(0);
       expect(phaseTimings.some((m) => m.outcome === "submitted"), "at least one turn should commit").toBe(true);
+      const initialChatroomEnters = phaseTimings
+        .filter((m) => m.target === "the_chatroom" && m.verb === "enter" && m.route === "direct")
+        .slice(0, 2);
+      expect(initialChatroomEnters.length, "both initial chatroom enters must emit phase timing").toBe(2);
+      const admissionViolations = warnSpy.mock.calls
+        .filter((call) => call[0] === "woo.planning_world_inadmissible")
+        .map((call) => JSON.stringify(call[1] ?? {}));
+      const repairedInitialEnters = initialChatroomEnters
+        .filter((m) => Number(m.attempts) !== 1)
+        .map((m) => `${String(m.target)}:${String(m.verb)} attempts=${String(m.attempts)} auth_calls=${String(m.authority_calls)} total=${String(m.total_ms)}ms`);
+      expect(
+        repairedInitialEnters,
+        `initial cross-shard chatroom enters must converge on the first attempt; repair rounds reproduce the prod 20s timeout wall. Admission violations: ${admissionViolations.slice(0, 6).join(" | ")}`
+      ).toEqual([]);
       // Every phase field must be a finite number so the analyzer never charges NaN.
       for (const field of ["total_ms", "ensure_client_ms", "authority_ms", "serialize_ms", "plan_build_ms", "vm_ms", "submit_ms", "authority_calls", "attempts"]) {
         expect(typeof phaseTimings[0]![field], `turn_phase_timing.${field} must be numeric`).toBe("number");

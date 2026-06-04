@@ -4716,6 +4716,8 @@ export class PersistentObjectDO {
     }
     const slices: SerializedAuthoritySlice[] = [local.authority];
     if (mcpGatewayShard && localActorAuthorityRoots.size > 0) {
+      const actorLive = mcpGatewayLocalActorLiveCellSlice(world, localActorAuthorityRoots, this.durableHostKey());
+      if (actorLive.page_refs.length > 0) slices.push(actorLive);
       const actorCells = mcpGatewayLocalActorPropertyCellSlice(world, localActorAuthorityRoots, this.durableHostKey());
       if (actorCells.page_refs.length > 0) slices.push(actorCells);
     }
@@ -6566,20 +6568,33 @@ function mcpGatewayDirectorySessionCellSlice(sessions: readonly DirectorySeriali
     shadowObjectLineagePage(obj),
     ...shadowPropertyCellPages(obj)
   ]);
+  const actorLivePlaceholders: ShadowStatePage[] = actorObjects.map((obj) => shadowObjectLivePage({
+    ...obj,
+    location: null,
+    children: [],
+    contents: []
+  }));
   const scopeLivePages: ShadowStatePage[] = snapshot.objects
     .filter((obj) => !sessionActors.has(obj.id) && obj.contents.length > 0)
     .map((obj) => shadowObjectLivePage(obj));
-  const inlinePages = [...actorLineagePages, ...scopeLivePages];
+  const inlinePages = [...actorLineagePages, ...actorLivePlaceholders, ...scopeLivePages];
   // A3: these pages are synthesized from Directory route records, not from the
   // object owner's live state — Directory publishes session/presence/projection
-  // rows (CA12.1). They are "projection" provenance: a sparse shard MAY plan
-  // against them to fill a gap the owner has not yet repaired, but they MUST NOT
-  // override an owner's authoritative row or be used as a write-authority source.
+  // rows (CA12.1). Actor lineage/properties and scope contents are projection
+  // provenance. Actor live pages are only empty fallback placeholders: they let
+  // sparse planning admit a peer actor's identity without treating Directory's
+  // possibly-stale current-location hint as movement truth. Accepted-frame/cache
+  // rows and owner rows outrank them.
   const provenance: AuthorityPageProvenance = { source: "projection", source_host: hostKey };
+  const actorLivePlaceholderProvenance: AuthorityPageProvenance = { source: "fallback", source_host: hostKey };
   return {
     kind: "woo.authority_slice.cells.shadow.v1",
     sessions: [],
-    page_refs: inlinePages.map((page) => stampAuthorityPageRef(page, true, provenance)),
+    page_refs: inlinePages.map((page) => stampAuthorityPageRef(
+      page,
+      true,
+      page.page === "object_live" && sessionActors.has(page.object) ? actorLivePlaceholderProvenance : provenance
+    )),
     inline_pages: inlinePages,
     counters: {
       objectCounter: 1,
