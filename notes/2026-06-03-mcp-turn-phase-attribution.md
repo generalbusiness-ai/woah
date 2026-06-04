@@ -163,3 +163,57 @@ against authority sourced from (or warm-filled by) the commit scope, not a
 reconstruction that lags it. Tasks #1–#3 are layers of ONE authority-freshness
 problem, deeper than the initial framing. Layer 2 is the real remaining work and
 is architecturally significant — paused for direction before a large change.
+
+## 2026-06-04 — Layer-2 architecture slice attempted; CF smoke STILL failing
+
+After the pause above, the large change was attempted across eight commits
+(not previously written up here):
+
+- `7d42847` — actor authority routed through Directory owner instead of
+  self-certified gateway stubs (provenance `authoritative`→`projection`, local
+  cells narrowed to `home`/`focus_list`); commit fanout moved to DO `waitUntil`.
+- `fdf187b` — converge MCP actor authority on the first attempt.
+- `41e0eca` — prefetch scope-occupant authority before planning.
+- `f9fce51` — end MCP sessions on transport close (+ `world.purgeInactiveGuests`).
+- `4c7f402` — Basic-auth `POST /admin/purge-inactive-guests` operator route
+  sharing the WORLD-side purge helper.
+- `a400077` / `3954a1c` / `178fa5f` — open planned commit scopes before submit,
+  carry the MCP session row into planned scopes, defer the fanout lookup.
+
+**Result — NOT resolved.** Every CF smoke run on 2026-06-04 still fails 0/2:
+`enter:chatroom` times out at 20s on the MCP POST. Latest run
+`post-planned-open-tail-20260604T115005Z` (tail did not attach — 0 metrics; the
+verdict is from the smoke log). The earlier instrumented run
+`20260604T014926Z-32017` (post `7d42847`..`f9fce51`) shows WHY: the architecture
+slice **moved the dominant phase from submit (62%) to auth (61%)** —
+
+```
+the_chatroom:enter (submitted)  n=2 att=3 auth#=5  tot.p95 52019
+phase share:  auth 61% | submit 27% | ensure 12% | serial/build/vm 0%
+worst handler: mcp-gateway-24 /mcp = 54106ms
+```
+
+Routing actor authority through the owner was the right direction (don't plan
+against a lagging reconstruction) but it **pushed cost into the authority phase**
+rather than removing it: ~5 authority calls/turn, ~25s, and the repair second
+attempt is NOT eliminated (`att=3`, the stated P1 target was `att→1`). Total
+wall is unchanged (~52s p95), so the turn still blows the 20s gateway timeout.
+
+**Local vs CF gap.** `smoke:cf-local` / `gate:authority` pass 2/2 and the full
+local suite is green (typecheck clean, `npm test` 367/367) — correctness is
+sound. The failure is **distributed latency at scale** (cross-shard authority
+reconstruction over ~10.8k objects), which the in-process shape-test cannot
+reproduce.
+
+**Remaining work (unchanged): B7 commit-scope warm-fill.** Make first-attempt
+authority complete by sourcing/warm-filling it from the commit scope so the
+turn stops re-reconstructing the owner slice per attempt; that collapses the
+repair second attempt (`att→1`) and halves auth+submit. Only then will the CF
+smoke pass.
+
+**Merge status.** Branch `mcp-phase-attrib` was merged to `main` as-is on
+2026-06-04 at explicit user direction, with the latency objective KNOWN-UNMET
+and the CF smoke still 0/2. The merge carries valuable, locally-validated
+groundwork (instrumentation, owner-authority routing, operator-purge,
+session-close) but does **not** make MCP turns usable on prod. NOT deployed.
+Do not deploy this to prod until the B7 warm-fill lands and a CF smoke passes.
