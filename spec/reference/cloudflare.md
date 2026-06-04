@@ -960,7 +960,10 @@ legacy executable `/v2/open`. If the matching `CommitScopeDO` has no durable
 snapshot, it returns `E_SNAPSHOT_REQUIRED`; rollout callers then perform the
 legacy seed bootstrap and retry without the capsule. This flag does not change
 checkpoint/tail projection catch-up and does not add a Cloudflare Durable Object
-class migration.
+class migration. Planned-transcript commits are not eligible for this shortcut:
+when the chosen commit scope differs from the planned transcript's turn-key
+scope, the gateway must first open the chosen scope, adopt its current head, and
+submit the transcript envelope without `execution_capsule`.
 
 Live no-commit v2 transcripts follow the same MCP shard discovery and are sent
 through signed `POST /__internal/mcp-live-fanout` with `{scope,

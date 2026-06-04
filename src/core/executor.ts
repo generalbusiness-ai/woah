@@ -121,7 +121,15 @@ export type SubmitTurnIntentResult<Client, Result extends ExecutorEnvelopeResult
 export type SubmitTurnIntentOptions<Client, Result extends ExecutorEnvelopeResult> = {
   input: ExecutorCallInput;
   maxAttempts?: number;
-  ensureClient(scope: ObjRef, attempt: number): Promise<Client>;
+  ensureClient(
+    scope: ObjRef,
+    attempt: number,
+    context: {
+      phase: "planning" | "commit";
+      planningScope: ObjRef;
+      plannedTranscriptCommit: boolean;
+    }
+  ): Promise<Client>;
   clientNode(client: Client): string;
   clientHead?(client: Client): ShadowScopeHead;
   clientSerialized?(client: Client): SerializedWorld;
@@ -539,7 +547,11 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     phaseAttempts = attempt + 1;
     const planningScope = options.planningScope?.(options.input) ?? options.input.scope;
-    const planningClient = await timePhase((ms) => { ensureClientMs += ms; }, () => options.ensureClient(planningScope, attempt));
+    const planningClient = await timePhase((ms) => { ensureClientMs += ms; }, () => options.ensureClient(planningScope, attempt, {
+      phase: "planning",
+      planningScope,
+      plannedTranscriptCommit: false
+    }));
     const turnId = options.input.id ?? options.nextTurnId(planningClient, attempt);
     const call = buildExecutorCall(options.input, turnId);
     if (options.prePlanAuthority) {
@@ -611,12 +623,14 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     const commitSelection = selectCommitScopeForTranscript(planned.transcript, key.scope, options.onMetric);
     const commitScope = commitSelection.scope;
     phaseCommitScope = commitScope;
-    let commitClient: Client;
-    if (commitScope === planningScope) {
-      commitClient = planningClient;
-    } else {
-      commitClient = await timePhase((ms) => { ensureClientMs += ms; }, () => options.ensureClient(commitScope, attempt));
-    }
+    const plannedTranscriptCommit = commitScope !== key.scope;
+    const commitClient = commitScope === planningScope && !plannedTranscriptCommit
+      ? planningClient
+      : await timePhase((ms) => { ensureClientMs += ms; }, () => options.ensureClient(commitScope, attempt, {
+        phase: "commit",
+        planningScope,
+        plannedTranscriptCommit
+      }));
     const authorityObjectIds = mergeExecutorObjectIds(
       options.authorityObjectIds?.(options.input, commitScope)
         ?? executorAuthorityObjectIds(options.input, commitScope),
@@ -644,7 +658,7 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       // Cross-scope commits (commitScope differs from the planned turn-key
       // scope) carry the planned transcript + frame so the location authority
       // commits the browser-planned result instead of re-running the verb.
-      ...(commitScope !== key.scope ? {
+      ...(plannedTranscriptCommit ? {
         planned_transcript: planned.transcript,
         planned_frame: planned.frame
       } : {})
@@ -662,7 +676,7 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       turn: options.input,
       authority,
       envelope,
-      plannedTranscriptCommit: commitScope !== key.scope
+      plannedTranscriptCommit
     })));
     const replyEnvelope = decodeExecutorReply(result.reply);
     if (replyEnvelope?.body && attempt + 1 < maxAttempts && shouldRetry(replyEnvelope.body)) {

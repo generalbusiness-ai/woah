@@ -3,7 +3,7 @@ import { createWorld } from "../src/core/bootstrap";
 import { executorAuthorityPayload } from "../src/core/executor";
 import { authoritySliceObjectIds, filterSerializedAuthoritySliceObjects, serializedWorldFromAuthoritySlice } from "../src/core/authority-slice";
 import { serializedFor } from "../src/core/shadow-commit-scope";
-import { encodeEnvelope, type ShadowEnvelope } from "../src/core/shadow-envelope";
+import { decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "../src/core/shadow-envelope";
 import { createShadowBrowserRelayShim, markShadowBrowserRelaySerializedChanged } from "../src/core/shadow-browser-node";
 import type { ShadowTurnExecReply } from "../src/core/shadow-turn-exec";
 import type { ObjRef } from "../src/core/types";
@@ -106,6 +106,82 @@ describe("v2 MCP e2e", () => {
       });
       const afterWait = acceptedFramesForState(stateFor(charlieActor!)).length;
       expect(afterWait).toBe(beforeWait);
+    } finally {
+      for (const state of scopeStates.values()) state.close();
+    }
+  });
+
+  it("opens cross-scope planned-transcript commit scopes before building the envelope when capsule open is enabled", async () => {
+    const world = createWorld();
+    const env = { WOO_INTERNAL_SECRET: "v2-mcp-secret" };
+    const scopeStates = new Map<ObjRef, FakeDurableObjectState>();
+    const scopes = new Map<ObjRef, CommitScopeDO>();
+    const commitPosts: Array<{ scope: ObjRef; path: "/v2/open" | "/v2/envelope"; body: Record<string, unknown> }> = [];
+    const stateFor = (commitScope: ObjRef): FakeDurableObjectState => {
+      let state = scopeStates.get(commitScope);
+      if (!state) {
+        state = new FakeDurableObjectState(commitScope);
+        scopeStates.set(commitScope, state);
+      }
+      return state;
+    };
+    const scopeFor = (commitScope: ObjRef): CommitScopeDO => {
+      let scope = scopes.get(commitScope);
+      if (!scope) {
+        scope = new CommitScopeDO(stateFor(commitScope) as unknown as ConstructorParameters<typeof CommitScopeDO>[0], env);
+        scopes.set(commitScope, scope);
+      }
+      return scope;
+    };
+    const gateway = (): McpGateway => new McpGateway(world, {
+      v2: {
+        executionCapsuleOpen: true,
+        open: async (commitScope, body) => {
+          commitPosts.push({ scope: commitScope, path: "/v2/open", body: body as unknown as Record<string, unknown> });
+          return await postCommitScope(scopeFor(commitScope), env, commitScope, "/v2/open", body);
+        },
+        envelope: async (commitScope, body) => {
+          commitPosts.push({ scope: commitScope, path: "/v2/envelope", body: body as unknown as Record<string, unknown> });
+          return await postCommitScope(scopeFor(commitScope), env, commitScope, "/v2/envelope", body);
+        }
+      }
+    });
+
+    try {
+      const firstGateway = gateway();
+      const firstSession = await initializeMcp(firstGateway, "guest:v2-mcp-recycled-head-a", 1);
+      const firstActor = world.sessions.get(firstSession)?.actor;
+      expect(firstActor).toBeTruthy();
+      const firstEnter = await mcp(firstGateway, firstSession, 2, "tools/call", {
+        name: "woo_call",
+        arguments: { object: "the_chatroom", verb: "enter", args: [] }
+      });
+      expect(firstEnter.result.isError, JSON.stringify(firstEnter.result.structuredContent)).not.toBe(true);
+      expect(acceptedFramesForState(stateFor(firstActor!))).toHaveLength(1);
+
+      world.endSession(firstSession);
+      commitPosts.length = 0;
+
+      const secondGateway = gateway();
+      const secondSession = await initializeMcp(secondGateway, "guest:v2-mcp-recycled-head-b", 3);
+      const secondActor = world.sessions.get(secondSession)?.actor;
+      expect(secondActor).toBe(firstActor);
+      const secondEnter = await mcp(secondGateway, secondSession, 4, "tools/call", {
+        name: "woo_call",
+        arguments: { object: "the_chatroom", verb: "enter", args: [] }
+      });
+      expect(secondEnter.result.isError, JSON.stringify(secondEnter.result.structuredContent)).not.toBe(true);
+
+      const actorPosts = commitPosts.filter((post) => post.scope === secondActor);
+      const actorOpenIndex = actorPosts.findIndex((post) => post.path === "/v2/open");
+      const actorEnvelopeIndex = actorPosts.findIndex((post) => post.path === "/v2/envelope");
+      expect(actorOpenIndex, JSON.stringify(actorPosts.map((post) => post.path))).toBeGreaterThanOrEqual(0);
+      expect(actorEnvelopeIndex, JSON.stringify(actorPosts.map((post) => post.path))).toBeGreaterThan(actorOpenIndex);
+      const envelope = decodeEnvelope(String(actorPosts[actorEnvelopeIndex].body.envelope));
+      const expected = (envelope.body as { expected?: { seq?: unknown } }).expected;
+      expect(expected?.seq).toBe(1);
+      expect(actorPosts[actorEnvelopeIndex].body).toHaveProperty("planned_transcript_commit", true);
+      expect(actorPosts[actorEnvelopeIndex].body).not.toHaveProperty("execution_capsule");
     } finally {
       for (const state of scopeStates.values()) state.close();
     }
@@ -358,6 +434,7 @@ describe("v2 MCP e2e", () => {
         scope: "the_deck",
         serialized: serializedWorldFromAuthoritySlice(relaySeed.authority)
       }),
+      commitScopeOpenedSessions: new Set<string>(),
       openedSessions: new Set<string>(),
       openingSessions: new Map<string, Promise<void>>()
     };

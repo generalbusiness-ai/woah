@@ -1304,6 +1304,13 @@ rollout callers may then perform the legacy seed bootstrap and retry the
 envelope without the capsule. If the capsule's head is behind the scope head,
 the ordinary stale-head repair path applies.
 
+The capsule shortcut applies only when the commit scope will execute the turn
+from the caller's local execution view. If the executor has already planned a
+transcript for one turn-key scope and the selector chooses a different commit
+scope, the envelope is a planned-transcript commit. The caller MUST open the
+selected commit scope first and adopt its current head before building the
+envelope, then submit the planned transcript without an execution capsule.
+
 Executable cell-page transfers served for browser execution use the same
 `woo.state.transfer.v1` `cell_pages` transfer, with recipient-bound capsule
 metadata covered by the state proof root:

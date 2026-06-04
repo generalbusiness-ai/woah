@@ -149,6 +149,7 @@ export type McpV2EnvelopeResult = {
 type V2ScopeClient = {
   scope: ObjRef;
   relay: ShadowRelayCache;
+  commitScopeOpenedSessions: Set<string>;
   openedSessions: Set<string>;
   openingSessions: Map<string, Promise<void>>;
 };
@@ -631,7 +632,9 @@ export class McpGateway {
       },
       prePlanAuthority: true,
       maxAttempts: 8,
-      ensureClient: async (submitScope) => await this.ensureV2ScopeClient(entry, submitScope),
+      ensureClient: async (submitScope, _attempt, context) => await this.ensureV2ScopeClient(entry, submitScope, {
+        requireCommitScopeOpen: context.phase === "commit" && context.plannedTranscriptCommit
+      }),
       clientNode: () => this.v2NodeFor(entry),
       clientHead: (client) => client.relay.commit_scope.head,
       clientSerialized: (client) => serializedFor(client.relay.commit_scope, { reason: "mcp_turn_plan", metric: (event) => this.world.recordMetric(event) }),
@@ -712,6 +715,7 @@ export class McpGateway {
           const client = this.v2Scopes.get(submitScope);
           if (!client) throw err;
           client.openedSessions.delete(entry.woo.id);
+          client.commitScopeOpenedSessions.delete(entry.woo.id);
           const seeded = await this.v2SerializedWorld([submitScope, entry.woo.actor]);
           await this.ensureV2ScopeSessionOpen(entry, client, hooks, seeded, { forceLegacyOpen: true });
           const { execution_capsule, ...legacyBody } = envelopeBody;
@@ -744,18 +748,27 @@ export class McpGateway {
     return frame;
   }
 
-  private async ensureV2ScopeClient(entry: SessionEntry, scope: ObjRef): Promise<V2ScopeClient> {
+  private async ensureV2ScopeClient(
+    entry: SessionEntry,
+    scope: ObjRef,
+    options: { requireCommitScopeOpen?: boolean } = {}
+  ): Promise<V2ScopeClient> {
     const hooks = this.options.v2;
     if (!hooks) throw new Error("MCP v2 client hooks are not configured");
     let client = this.v2Scopes.get(scope);
     if (!client) {
-      client = await this.initializeV2ScopeClient(entry, scope, hooks);
+      client = await this.initializeV2ScopeClient(entry, scope, hooks, options);
     }
-    await this.ensureV2ScopeSessionOpen(entry, client, hooks);
+    await this.ensureV2ScopeSessionOpen(entry, client, hooks, undefined, options);
     return client;
   }
 
-  private async initializeV2ScopeClient(entry: SessionEntry, scope: ObjRef, hooks: McpV2ClientHooks): Promise<V2ScopeClient> {
+  private async initializeV2ScopeClient(
+    entry: SessionEntry,
+    scope: ObjRef,
+    hooks: McpV2ClientHooks,
+    options: { requireCommitScopeOpen?: boolean } = {}
+  ): Promise<V2ScopeClient> {
     const existing = this.v2Scopes.get(scope);
     if (existing) return existing;
     const pending = this.v2ScopeInitializers.get(scope);
@@ -776,10 +789,11 @@ export class McpGateway {
           // (authoritative/projection/cache per page), not a flat `cache`.
           seedCellProvenance: cellProvenanceFromAuthoritySlice(seeded.authority.authority)
         }),
+        commitScopeOpenedSessions: new Set(),
         openedSessions: new Set(),
         openingSessions: new Map()
       };
-      await this.ensureV2ScopeSessionOpen(entry, client, hooks, seeded);
+      await this.ensureV2ScopeSessionOpen(entry, client, hooks, seeded, options);
       this.v2Scopes.set(scope, client);
       return client;
     })();
@@ -796,18 +810,21 @@ export class McpGateway {
     client: V2ScopeClient,
     hooks: McpV2ClientHooks,
     seeded?: { serialized: ReturnType<WooWorld["exportWorld"]>; authority: ReturnType<typeof executorAuthorityPayload> },
-    options: { forceLegacyOpen?: boolean } = {}
+    options: { forceLegacyOpen?: boolean; requireCommitScopeOpen?: boolean } = {}
   ): Promise<void> {
-    if (!options.forceLegacyOpen && client.openedSessions.has(entry.woo.id)) return;
-    const existing = client.openingSessions.get(entry.woo.id);
-    if (!options.forceLegacyOpen && existing) {
+    const requireCommitScopeOpen = options.forceLegacyOpen === true || options.requireCommitScopeOpen === true;
+    if (requireCommitScopeOpen && client.commitScopeOpenedSessions.has(entry.woo.id)) return;
+    if (!requireCommitScopeOpen && client.openedSessions.has(entry.woo.id)) return;
+    const openingKey = requireCommitScopeOpen ? `${entry.woo.id}:commit-scope-open` : `${entry.woo.id}:session-open`;
+    const existing = client.openingSessions.get(openingKey);
+    if (existing) {
       await existing;
       return;
     }
     const pending = (async () => {
       const authority = seeded?.authority ?? await this.v2AuthorityPayload([client.scope, entry.woo.actor]);
       this.mergeV2AuthorityIntoScopeClient(client, authority.authority);
-      if (hooks.executionCapsuleOpen && !options.forceLegacyOpen) {
+      if (hooks.executionCapsuleOpen && !requireCommitScopeOpen) {
         client.openedSessions.add(entry.woo.id);
         return;
       }
@@ -829,12 +846,13 @@ export class McpGateway {
       }
       if (opened.head) client.relay.commit_scope.head = opened.head;
       client.openedSessions.add(entry.woo.id);
+      client.commitScopeOpenedSessions.add(entry.woo.id);
     })();
-    client.openingSessions.set(entry.woo.id, pending);
+    client.openingSessions.set(openingKey, pending);
     try {
       await pending;
     } finally {
-      if (client.openingSessions.get(entry.woo.id) === pending) client.openingSessions.delete(entry.woo.id);
+      if (client.openingSessions.get(openingKey) === pending) client.openingSessions.delete(openingKey);
     }
   }
 
