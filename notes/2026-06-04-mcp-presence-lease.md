@@ -43,8 +43,10 @@ Directory routing field refreshed only by valid client ingress.
 - Refreshed only by client ingress: `register-session` carries `touch_presence`
   (default true; `DELETE`/aborted already excluded before the call). Internal
   re-registration must pass `touch_presence:false` → preserves a stale row's
-  lease (can't self-refresh). Touches throttled to ~W/2 (2.5 min) to keep the
-  dedupe write-storm protection.
+  lease (can't self-refresh). Touches are throttled twice: a gateway-local W/2
+  cache avoids a pre-dispatch Directory RPC on every established MCP request,
+  and Directory's durable W/2 throttle keeps the dedupe write-storm protection
+  across DO lifetimes.
 
 ## Why this is the whole fix (#1 and #3 subsumed)
 
@@ -85,8 +87,10 @@ External review found three issues; all fixed.
   replay, so a peer observation during the wait would be silently dropped. Fix:
   `touchEstablishedMcpSessionPresence` refreshes presence at INGRESS (before
   handle) for already-established sessions (keyed off `x-woo-internal-session` /
-  `mcp-session-id`; `initialize`, DELETE, aborted excluded). Post-response
-  registration still handles new sessions + detail/scope changes.
+  `mcp-session-id`; `initialize`, DELETE, aborted excluded), but now consults a
+  small gateway-local W/2 `lastTouchedAt` map first so the correctness touch does
+  not add a per-turn Directory round trip. Post-response registration still
+  handles new sessions + detail/scope changes.
 - **P2 (idempotency):** the `last_seen_at` backfill ran only inside the
   column-add branch, so a partial migration (column present, rows NULL) hid those
   rows from presence forever. Fix: the `UPDATE ... WHERE last_seen_at IS NULL`
@@ -99,8 +103,43 @@ External review found three issues; all fixed.
 
 Tests: directory-sessions.test.ts +2 (P2 unconditional backfill over a NULL row;
 P3 new-route-not-present-until-ingress). 15/15 in file; worker lane 220; npm test
-369; typecheck clean. P1's full outcome test (stale session + fanout-during-wait)
-lands with the cf-local prod-shape harness reconciliation.
+369; typecheck clean.
+
+## Cf-local prod-shape harness reconciliation
+
+Merged into `cf-local-prod-shape` and corrected the stale-session fixture. The
+original harness modeled staleness with old `started`/`expires_at` values, which
+is correct on `main` but false under the presence lease: `register-session` is a
+liveness moment and stamps `last_seen_at = now`. The reconciled gate now:
+
+- registers the 29 seeded MCP Directory rows through the signed internal API
+  (real route shape);
+- directly ages only those rows' `last_seen_at` values in fake Directory storage
+  (the local equivalent of "registered live, then no client ingress for > W"),
+  avoiding fake timers because the walkthrough harness uses real `setTimeout`
+  for request timeouts and optional delay injection;
+- asserts the next two-actor room turn does NOT see `sessions >= 29` and does
+  NOT select `audience_session_shards >= 16`; the maximum observed scoped
+  session and audience-shard counts must stay bounded by the live room set.
+
+Local validation after reconciliation: targeted worker files (Directory,
+CF repository, cf-local walkthrough) passed; `npm run smoke:cf-local` passed;
+`npm run typecheck` passed; `npm test` passed. A full `npm run test:worker`
+run hit two long integration-test timeouts under suite contention, and both
+timeout cases passed when rerun in isolation.
+
+## Ingress-touch throttle correction
+
+The first P1 implementation was semantically correct but added an avoidable
+hot-path dependency: every established MCP request synchronously touched
+Directory before `gateway.handle()`, even when Directory would dedupe the write.
+That doubled the route-registration round trip for warm turns. The correction is
+a per-gateway in-memory `session_id -> last ingress touch` cache, capped and
+cleared on session unregister / force-rebuild. A successful post-response
+registration also refreshes the cache, so the next established request pays only
+the existing post-response registration unless the local lease age has reached
+W/2. The cf-local walkthrough now asserts an established `woo_wait` emits exactly
+one `/register-session` call (post-response), not a second pre-dispatch touch.
 
 ## Not done / next
 

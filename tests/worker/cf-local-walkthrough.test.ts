@@ -7,6 +7,7 @@ import { MCP_GATEWAY_ACTOR_SUPPORT_ROOTS, PersistentObjectDO, type Env } from ".
 import { createWorld } from "../../src/core/bootstrap";
 import type { ObjRef } from "../../src/core/types";
 import { FakeDurableObjectNamespace, FakeDurableObjectState } from "./fake-do";
+import { signInternalRequest } from "../../src/worker/internal-auth";
 
 // Derive the universal actor/thing lineage the gateway-shard support set MUST
 // carry, the same way production does: the parent-closure of
@@ -40,6 +41,7 @@ const RPC_TIMEOUT_MS = 20_000;
 const STEP_TIMEOUT_MS = 60_000;
 const DRAIN_TOTAL_BUDGET_MS = 3000;
 const DRAIN_POLL_MS = 500;
+const DIRECTORY_PRESENCE_WINDOW_MS = 5 * 60_000;
 
 class FakeKVNamespace {
   readonly values = new Map<string, string>();
@@ -67,8 +69,22 @@ class WaitUntilDurableObjectState extends FakeDurableObjectState {
 
 type CfSmokeHarness = {
   env: Env;
+  shards: number;
   request(path: string, init: RequestInit): Promise<Response>;
+  drainWaitUntil(): Promise<void>;
+  setDirectoryLastSeenAt(sessionIds: readonly string[], lastSeenAt: number): void;
+  directoryRequests(path?: string): Array<{ path: string; body: Record<string, unknown> | null }>;
+  clearDirectoryRequests(): void;
   close(): void;
+};
+
+// Optional prod-shape knobs. Defaults stay small and fast for the normal
+// cf-local smoke; focused tests opt into the deployed shard/session pressure.
+type CfSmokeHarnessOptions = {
+  shards?: number;
+  directorySessionsForScopesDelayMs?: number;
+  mcpCommitFanoutDelayMs?: number;
+  hostReadTimeoutMs?: number;
 };
 
 describe("CF-local smoke walkthrough", () => {
@@ -270,15 +286,106 @@ describe("CF-local smoke walkthrough", () => {
       expect(lineage.has(id as ObjRef), `universal lineage must not include scope class ${id}`).toBe(false);
     }
   });
+
+  it("bounds prod-shaped stale MCP Directory audience pressure locally", async () => {
+    const harness = createCfSmokeHarness({ shards: 32 });
+    const runId = `cf-local-prod-shape-${Date.now()}-${randomUUID().slice(0, 8)}`;
+    let logSpy: ReturnType<typeof vi.spyOn> | null = null;
+    let alice: LocalMcpSession | null = null;
+    try {
+      const staleSessionIds = await seedDirectoryMcpAudience(harness, runId, {
+        scope: "the_chatroom",
+        sessions: 29,
+        uniqueShards: 17
+      });
+      // The presence fix treats register-session itself as liveness, so stale
+      // rows must become stale by lease age, not by old started/expires_at
+      // fields. Keep real timers in this walkthrough file and directly age only
+      // the seeded Directory leases; this is the local equivalent of "registered
+      // live in prod, then no client ingress for > W".
+      harness.setDirectoryLastSeenAt(staleSessionIds, Date.now() - DIRECTORY_PRESENCE_WINDOW_MS - 60_000);
+      logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      alice = await LocalMcpSession.open(harness, `guest:cf-local-prod-shape-alice-${runId}`, "alice", runId);
+
+      await alice.call("the_chatroom", "enter", []);
+      await harness.drainWaitUntil();
+
+      const parsedMetrics = metricsFromLogSpy(logSpy);
+      const directoryLookups = parsedMetrics
+        .filter((m) => m.kind === "directory_sessions_for_scopes" && m.status === "ok")
+        .filter((m) => Number(m.scopes) === 1);
+      const directoryPressure = directoryLookups.find((m) => Number(m.sessions) >= 29);
+      expect(
+        directoryPressure,
+        `presence lease must filter the 29 stale Directory rows; saw ${JSON.stringify(directoryLookups)}`
+      ).toBeUndefined();
+      const maxDirectorySessions = Math.max(0, ...directoryLookups.map((m) => Number(m.sessions) || 0));
+      expect(
+        maxDirectorySessions,
+        "stale Directory pressure should collapse to the live room set, not the whole unexpired auth set"
+      ).toBeLessThanOrEqual(2);
+
+      const fanoutMetrics = parsedMetrics.filter((m) => m.kind === "mcp_fanout");
+      // Enter commits at the actor scope, but room/presence fanout is still
+      // visible through affected_scopes plus the selected MCP audience shards.
+      const fanoutPressure = fanoutMetrics
+        .find((m) => Number(m.audience_session_shards) >= 16 && Number(m.affected_scopes) > 0);
+      expect(
+        fanoutPressure,
+        `presence lease must prevent stale Directory rows from selecting prod-scale MCP fanout; saw ${JSON.stringify(fanoutMetrics)}`
+      ).toBeUndefined();
+      const maxAudienceSessionShards = Math.max(0, ...fanoutMetrics.map((m) => Number(m.audience_session_shards) || 0));
+      expect(
+        maxAudienceSessionShards,
+        "stale Directory pressure should not select one gateway shard per old session"
+      ).toBeLessThanOrEqual(2);
+    } finally {
+      await Promise.allSettled([alice?.close(), harness.drainWaitUntil()]);
+      logSpy?.mockRestore();
+      harness.close();
+    }
+  });
+
+  it("throttles established MCP ingress presence touches before dispatch", async () => {
+    const harness = createCfSmokeHarness();
+    const runId = `cf-local-ingress-throttle-${Date.now()}-${randomUUID().slice(0, 8)}`;
+    let session: LocalMcpSession | null = null;
+    try {
+      session = await LocalMcpSession.open(harness, `guest:cf-local-ingress-throttle-${runId}`, "alice", runId);
+
+      harness.clearDirectoryRequests();
+      await session.callTool("woo_wait", { timeout_ms: 1, limit: 1 });
+      await harness.drainWaitUntil();
+      const firstRegistrations = harness.directoryRequests("/register-session");
+      expect(
+        firstRegistrations.map((r) => String(r.body?.session_id ?? "")),
+        "a fresh established MCP request should use only the existing post-response route registration; an extra pre-dispatch ingress touch adds a Directory round-trip to the hot path"
+      ).toEqual([session.sessionId]);
+
+      harness.clearDirectoryRequests();
+      await session.callTool("woo_wait", { timeout_ms: 1, limit: 1 });
+      await harness.drainWaitUntil();
+      const secondRegistrations = harness.directoryRequests("/register-session");
+      expect(
+        secondRegistrations.map((r) => String(r.body?.session_id ?? "")),
+        "the gateway-local W/2 throttle should keep skipping the pre-dispatch Directory touch while the session lease is locally fresh"
+      ).toEqual([session.sessionId]);
+    } finally {
+      await Promise.allSettled([session?.close(), harness.drainWaitUntil()]);
+      harness.close();
+    }
+  });
 });
 
-function createCfSmokeHarness(): CfSmokeHarness {
+function createCfSmokeHarness(options: CfSmokeHarnessOptions = {}): CfSmokeHarness {
+  const shards = options.shards ?? SHARDS;
   const directoryState = new FakeDurableObjectState("directory");
   const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "cf-local-smoke-secret" });
   const wooStates = new Map<string, WaitUntilDurableObjectState>();
   const wooObjects = new Map<string, PersistentObjectDO>();
   const commitStates = new Map<string, FakeDurableObjectState>();
   const commitObjects = new Map<string, CommitScopeDO>();
+  const directoryRequests: Array<{ path: string; body: Record<string, unknown> | null }> = [];
   let env: Env;
 
   const wooNamespace = new FakeDurableObjectNamespace((name) => {
@@ -292,7 +399,14 @@ function createCfSmokeHarness(): CfSmokeHarness {
       object = new PersistentObjectDO(state as unknown as DurableObjectState, env);
       wooObjects.set(name, object);
     }
-    return object;
+    return {
+      fetch: async (request: Request): Promise<Response> => {
+        if (new URL(request.url).pathname === "/__internal/mcp-commit-fanout") {
+          await delayFor(options.mcpCommitFanoutDelayMs, request.signal);
+        }
+        return await object.fetch(request);
+      }
+    };
   });
 
   const commitNamespace = new FakeDurableObjectNamespace((name) => {
@@ -313,10 +427,29 @@ function createCfSmokeHarness(): CfSmokeHarness {
     WOO_INITIAL_WIZARD_TOKEN: "cf-local-smoke-token",
     WOO_INTERNAL_SECRET: "cf-local-smoke-secret",
     WOO_AUTO_INSTALL_CATALOGS: "chat,demoworld,note,blocks-demo",
-    WOO_MCP_GATEWAY_SHARDS: String(SHARDS),
+    WOO_MCP_GATEWAY_SHARDS: String(shards),
+    ...(options.hostReadTimeoutMs !== undefined ? { WOO_HOST_READ_TIMEOUT_MS: String(options.hostReadTimeoutMs) } : {}),
     DIRECTORY: new FakeDurableObjectNamespace((name) => {
       if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
-      return directory;
+      return {
+        fetch: async (request: Request): Promise<Response> => {
+          const pathname = new URL(request.url).pathname;
+          if (pathname === "/register-session") {
+            let body: Record<string, unknown> | null = null;
+            try {
+              const parsed = await request.clone().json();
+              body = isRecord(parsed) ? parsed : null;
+            } catch {
+              body = null;
+            }
+            directoryRequests.push({ path: pathname, body });
+          }
+          if (pathname === "/sessions-for-scopes") {
+            await delayFor(options.directorySessionsForScopesDelayMs, request.signal);
+          }
+          return await directory.fetch(request);
+        }
+      };
     }),
     WOO: wooNamespace,
     COMMIT_SCOPE: commitNamespace,
@@ -325,7 +458,18 @@ function createCfSmokeHarness(): CfSmokeHarness {
 
   return {
     env,
+    shards,
     request: async (path, init) => await worker.fetch(new Request(`https://woo.test${path}`, init), env, {}),
+    drainWaitUntil: async () => {
+      for (const state of wooStates.values()) await state.drainWaitUntil();
+    },
+    setDirectoryLastSeenAt: (sessionIds, lastSeenAt) => {
+      for (const sessionId of sessionIds) {
+        directoryState.storage.sql.exec("UPDATE session_route SET last_seen_at = ? WHERE session_id = ?", lastSeenAt, sessionId);
+      }
+    },
+    directoryRequests: (path) => path ? directoryRequests.filter((entry) => entry.path === path) : [...directoryRequests],
+    clearDirectoryRequests: () => { directoryRequests.length = 0; },
     close: () => {
       directoryState.close();
       for (const state of wooStates.values()) state.close();
@@ -343,11 +487,51 @@ async function seedClosedChatroomOccupant(harness: CfSmokeHarness, runId: string
   }
 }
 
+async function seedDirectoryMcpAudience(
+  harness: CfSmokeHarness,
+  runId: string,
+  options: { scope: ObjRef; sessions: number; uniqueShards: number }
+): Promise<string[]> {
+  // Seed Directory directly through the signed internal API so the harness can
+  // model prod stale MCP rows without manufacturing full live Woo sessions.
+  const shardCount = Math.min(options.uniqueShards, harness.shards);
+  const safeRunId = runId.replace(/[^A-Za-z0-9_]/g, "_");
+  const sessionIds: string[] = [];
+  for (let i = 0; i < options.sessions; i += 1) {
+    const shardIndex = i % shardCount;
+    const sessionId = sessionIdForShard(`stale-prod-${runId}-${i}`, shardIndex, harness.shards);
+    sessionIds.push(sessionId);
+    await registerDirectorySession(harness, {
+      session_id: sessionId,
+      actor: `guest_stale_prod_${safeRunId}_${i}`,
+      started: Date.now() - 60_000,
+      display_name: `stale-prod-${i}`,
+      expires_at: Date.now() + 60 * 60_000,
+      token_class: "guest",
+      active_scope: options.scope,
+      current_location: options.scope,
+      mcp_shard: mcpShardHost(sessionId, harness.shards),
+      focus_list: [options.scope]
+    });
+  }
+  return sessionIds;
+}
+
+async function registerDirectorySession(harness: CfSmokeHarness, payload: Record<string, unknown>): Promise<void> {
+  const request = await signInternalRequest(harness.env, new Request("https://woo.internal/register-session", {
+    method: "POST",
+    headers: { "content-type": "application/json; charset=utf-8" },
+    body: JSON.stringify(payload)
+  }));
+  const response = await harness.env.DIRECTORY.get(harness.env.DIRECTORY.idFromName("directory")).fetch(request);
+  expect(response.ok, await response.clone().text()).toBe(true);
+}
+
 async function openOnDifferentShard(harness: CfSmokeHarness, alice: LocalMcpSession, runId: string): Promise<LocalMcpSession> {
-  const aliceShard = mcpShardHost(alice.sessionId);
+  const aliceShard = mcpShardHost(alice.sessionId, harness.shards);
   for (let i = 0; i < 16; i += 1) {
     const candidate = await LocalMcpSession.open(harness, `guest:cf-local-bob-${runId}-${i}`, "bob", runId);
-    if (mcpShardHost(candidate.sessionId) !== aliceShard) return candidate;
+    if (mcpShardHost(candidate.sessionId, harness.shards) !== aliceShard) return candidate;
     await candidate.close();
   }
   throw new Error(`could not find bob session on a different MCP shard than ${aliceShard}`);
@@ -713,8 +897,44 @@ function isRecord(value: unknown): value is Record<string, any> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function mcpShardHost(sessionId: string): string {
-  return `mcp-gateway-${stableHash(sessionId) % SHARDS}`;
+function metricsFromLogSpy(logSpy: ReturnType<typeof vi.spyOn>): Record<string, unknown>[] {
+  return logSpy.mock.calls
+    .filter((c) => c[0] === "woo.metric" && typeof c[1] === "string")
+    .map((c) => { try { return JSON.parse(c[1] as string) as Record<string, unknown>; } catch { return null; } })
+    .filter((m): m is Record<string, unknown> => m !== null);
+}
+
+async function delayFor(ms: number | undefined, signal?: AbortSignal): Promise<void> {
+  if (!ms || ms <= 0) return;
+  if (signal?.aborted) throw abortReason(signal);
+  await new Promise<void>((resolve, reject) => {
+    let handle: ReturnType<typeof setTimeout> | undefined;
+    const onAbort = () => {
+      if (handle) clearTimeout(handle);
+      reject(abortReason(signal));
+    };
+    handle = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function abortReason(signal: AbortSignal | undefined): unknown {
+  return signal?.reason instanceof Error ? signal.reason : new Error("aborted");
+}
+
+function sessionIdForShard(prefix: string, shardIndex: number, shards: number): string {
+  for (let attempt = 0; attempt < 10_000; attempt += 1) {
+    const candidate = `${prefix}-${attempt}`;
+    if (mcpShardHost(candidate, shards) === `mcp-gateway-${shardIndex}`) return candidate;
+  }
+  throw new Error(`could not construct session id for mcp-gateway-${shardIndex}`);
+}
+
+function mcpShardHost(sessionId: string, shards = SHARDS): string {
+  return `mcp-gateway-${stableHash(sessionId) % shards}`;
 }
 
 function stableHash(input: string): number {
