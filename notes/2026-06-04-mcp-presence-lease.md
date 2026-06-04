@@ -75,6 +75,33 @@ re-registration not refreshing a stale lease, and a **2-actor regression gate**
 (last_seen_at vs expires_at; the three filtered readers; touch_presence
 ingress-only refresh + throttle; delivery-vs-display separation).
 
+## Review fixes (P1–P3)
+
+External review found three issues; all fixed.
+
+- **P1 (correctness):** presence was refreshed only after `gateway.handle()`
+  returned. A stale-but-valid session starting a `woo_wait` (up to 30s) stayed
+  absent from `/mcp-shards-for-scopes` for the whole wait; live fanout has no
+  replay, so a peer observation during the wait would be silently dropped. Fix:
+  `touchEstablishedMcpSessionPresence` refreshes presence at INGRESS (before
+  handle) for already-established sessions (keyed off `x-woo-internal-session` /
+  `mcp-session-id`; `initialize`, DELETE, aborted excluded). Post-response
+  registration still handles new sessions + detail/scope changes.
+- **P2 (idempotency):** the `last_seen_at` backfill ran only inside the
+  column-add branch, so a partial migration (column present, rows NULL) hid those
+  rows from presence forever. Fix: the `UPDATE ... WHERE last_seen_at IS NULL`
+  now runs unconditionally on every `ensureSchema` (no-op when no NULLs).
+- **P3 (contract):** a brand-new route registered with `touch_presence:false`
+  still got `last_seen_at = now` (via `!existing`), so a future internal creator
+  would enter the fanout audience immediately. Fix: lease is `now` only when
+  `touchPresence`; otherwise preserve existing or `0` (new → not present until
+  ingress).
+
+Tests: directory-sessions.test.ts +2 (P2 unconditional backfill over a NULL row;
+P3 new-route-not-present-until-ingress). 15/15 in file; worker lane 220; npm test
+369; typecheck clean. P1's full outcome test (stale session + fanout-during-wait)
+lands with the cf-local prod-shape harness reconciliation.
+
 ## Not done / next
 
 - CF smoke re-run to confirm the 26→~2 / 17→~2 reduction lands on prod and the

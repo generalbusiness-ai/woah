@@ -510,6 +510,73 @@ describe("DirectoryDO presence lease", () => {
     }
   });
 
+  it("backfills a NULL last_seen_at even when the column already exists (P2: unconditional)", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const state = new FakeDirectoryState();
+    try {
+      // Simulate a partial/interrupted migration: the column exists but a row
+      // was left with NULL last_seen_at (e.g. crash between ALTER and backfill,
+      // or a direct write). Such a row must not be hidden from presence forever.
+      const d1 = new DirectoryDO(state as unknown as DurableObjectState, env);
+      // First fetch runs ensureSchema, creating session_route WITH last_seen_at.
+      expect(await resolve(d1, "warm_up_missing")).toBeNull();
+      state.storage.sql.exec(
+        "INSERT INTO session_route(session_id, actor, expires_at, token_class, current_location, updated_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, NULL)",
+        "null_lease", "$leg", FAR_FUTURE, "apikey", "$lobby", T0
+      );
+      // Before re-migration the NULL row is absent from presence.
+      expect(await sessionsForScopes(d1, ["$lobby"])).toEqual([]);
+
+      // A fresh DO over the same storage re-runs ensureSchema; the unconditional
+      // backfill must seed last_seen_at = updated_at and restore presence.
+      const d2 = new DirectoryDO(state as unknown as DurableObjectState, env);
+      const sessions = await sessionsForScopes(d2, ["$lobby"]);
+      expect(sessions.map((s) => s.session_id)).toEqual(["null_lease"]);
+      expect(Number((await resolve(d2, "null_lease"))?.last_seen_at)).toBe(T0);
+    } finally {
+      state.close();
+    }
+  });
+
+  it("does not grant presence to a brand-new route registered with touch_presence:false (P3)", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const { directory, cleanup } = makeDirectory();
+    try {
+      // An internal (non-ingress) creator registers a NEW route. It must not
+      // enter the live fanout audience until real client ingress touches it.
+      const created = await postRegister(directory, {
+        session_id: "sess_internal_new",
+        actor: "$internal",
+        expires_at: FAR_FUTURE,
+        token_class: "apikey",
+        active_scope: "$lobby",
+        mcp_shard: "mcp-gateway-5",
+        touch_presence: false
+      });
+      expect(created.wrote).toBe(true); // the route row is persisted...
+      expect(await resolve(directory, "sess_internal_new")).toMatchObject({ actor: "$internal" }); // ...and resolves for auth
+      // ...but it is NOT present for fanout/roster until a client touches it.
+      expect(await sessionsForScopes(directory, ["$lobby"])).toEqual([]);
+      expect(await mcpShardsForScopes(directory, ["$lobby"])).toEqual([]);
+
+      // First real client ingress (default touch_presence) makes it present.
+      vi.setSystemTime(T0 + 1_000);
+      await postRegister(directory, {
+        session_id: "sess_internal_new",
+        actor: "$internal",
+        expires_at: FAR_FUTURE,
+        token_class: "apikey",
+        active_scope: "$lobby",
+        mcp_shard: "mcp-gateway-5"
+      });
+      expect((await sessionsForScopes(directory, ["$lobby"])).map((s) => s.session_id)).toEqual(["sess_internal_new"]);
+    } finally {
+      cleanup();
+    }
+  });
+
   it("does not let an internal re-registration (touch_presence:false) refresh a stale lease", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(T0);

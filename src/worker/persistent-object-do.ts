@@ -1202,6 +1202,16 @@ export class PersistentObjectDO {
         try {
           const forwardStartedAt = Date.now();
           this.ensureForwardedMcpSession(world, request);
+          // Refresh the Directory presence lease for an ALREADY-ESTABLISHED MCP
+          // session BEFORE dispatching to the transport. gateway.handle() can
+          // block for the full woo_wait window (~30s); if we only refreshed
+          // presence after it returned, a session whose lease had lapsed while
+          // idle would be absent from /mcp-shards-for-scopes for the whole wait.
+          // Live fanout has no durable replay, so a peer's observation during
+          // that window would be silently dropped. New-session creation and
+          // post-turn detail/scope changes are still published by the
+          // post-response registration below.
+          await this.touchEstablishedMcpSessionPresence(world, request, mcpGatewayShard ? hostKey : null);
           forwardMs = Date.now() - forwardStartedAt;
           const gateway = this.getMcpGateway(world);
           const handleStartedAt = Date.now();
@@ -3891,6 +3901,21 @@ export class PersistentObjectDO {
     if (!sessionId) return;
     const session = world.sessions.get(sessionId);
     if (session) await this.registerSessionRoute(session, { mcpShard }, world);
+  }
+
+  // Ingress-time presence refresh for an already-established MCP session (P1).
+  // Keyed off the forwarded `x-woo-internal-session` (or the client's
+  // `mcp-session-id`); an `initialize` request carries neither yet, so a new
+  // session is left to the post-response registration. DELETE (lifecycle end)
+  // and client-aborted requests must not refresh — they would resurrect or
+  // wrongly extend a route. The Directory-side W/2 throttle keeps this cheap:
+  // an unchanged route within the throttle window is a no-op, not a write.
+  private async touchEstablishedMcpSessionPresence(world: WooWorld, request: Request, mcpShard: string | null): Promise<void> {
+    if (request.method === "DELETE" || request.signal.aborted) return;
+    const sessionId = request.headers.get("x-woo-internal-session") ?? request.headers.get("mcp-session-id");
+    if (!sessionId) return;
+    const session = world.sessions.get(sessionId);
+    if (session) await this.registerSessionRoute(session, { mcpShard, touchPresence: true }, world);
   }
 
   private async closeMcpWooSession(world: WooWorld, sessionId: string, hostKey: string): Promise<void> {

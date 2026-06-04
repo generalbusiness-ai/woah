@@ -791,7 +791,16 @@ refreshed ONLY by valid client ingress: `register-session` carries
 `touch_presence` (true for MCP/auth ingress — `DELETE /mcp` and client-aborted
 requests are excluded before that call), and an internal re-registration
 (fanout/replay rewriting a routing column) MUST send `touch_presence: false` so
-it cannot extend a stale row's lease. Touches are throttled to roughly half the
+it cannot extend a stale row's lease — and, for a brand-new route, that
+non-ingress write leases no presence at all (the row becomes present only once
+real ingress touches it). For an ALREADY-ESTABLISHED MCP session the presence
+touch happens at ingress, BEFORE the transport handler runs, not only on the
+post-response registration: `gateway.handle` can block for the whole `woo_wait`
+window, and live (non-durable) fanout has no replay, so a session whose lease
+lapsed while idle must be republished as present before it starts waiting or a
+peer's observation during the wait would be dropped. New-session creation and
+post-turn detail/scope changes are still published by the post-response
+registration. Touches are throttled to roughly half the
 window so an unchanged-route ingress writes at most once per window-half,
 preserving the `register-session` dedupe's write-storm protection. Presence for
 delivery and presence for display stay separate: durable subscribers ride the

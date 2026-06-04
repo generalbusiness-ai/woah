@@ -346,14 +346,17 @@ export class DirectoryDO {
     }
     if (!columns.has("last_seen_at")) {
       this.state.storage.sql.exec("ALTER TABLE session_route ADD COLUMN last_seen_at INTEGER");
-      // Backfill from updated_at so the presence filter has a sane initial
-      // value on existing worlds: genuinely-active rows (recent updated_at)
-      // survive until their next ingress refresh, while long-stale rows fall
-      // out of the presence window immediately — which is the intended
-      // cleanup. Idempotent: re-runs only touch rows still NULL.
-      this.state.storage.sql.exec("UPDATE session_route SET last_seen_at = updated_at WHERE last_seen_at IS NULL");
-      statements += 2;
+      statements += 1;
     }
+    // Backfill any NULL last_seen_at from updated_at, UNCONDITIONALLY (not only
+    // on the boot that adds the column). A prior crash between the ALTER and the
+    // backfill, or a partial migration that left the column present with NULL
+    // rows, would otherwise hide those rows from the presence readers forever
+    // (NULL fails `last_seen_at > ?`). Running it every ensureSchema is the only
+    // way it is genuinely idempotent; steady state matches zero rows, so the
+    // cost is a single indexed no-op UPDATE per Directory cold boot.
+    this.state.storage.sql.exec("UPDATE session_route SET last_seen_at = updated_at WHERE last_seen_at IS NULL");
+    statements += 1;
     // Presence-window index. Created here rather than in the CREATE-INDEX block
     // because it references last_seen_at, which only exists after the ALTER
     // above on a migrated DB. IF NOT EXISTS keeps it idempotent.
@@ -472,14 +475,16 @@ export class DirectoryDO {
       }
       return false;
     }
-    // A routing column changed (or this is a new row): persist it. Refresh the
-    // presence lease on a client-ingress write; on an internal re-registration
-    // (touchPresence=false) preserve the existing lease so a non-ingress write
-    // cannot extend presence for an otherwise-stale row. A brand-new row is a
-    // fresh registration moment, so it leases from now regardless.
-    const lastSeenAt = touchPresence || !existing
+    // A routing column changed (or this is a new row): persist it. Only a
+    // client-ingress write (touchPresence) leases presence from now. A
+    // non-ingress write (touchPresence=false) must NOT grant presence — it
+    // preserves an existing lease and, for a brand-new route, leases nothing
+    // (0), so an internal creator cannot inject a row into the live fanout
+    // audience. The row only becomes present once real client ingress touches
+    // it. `?? 0` also covers a NULL lease (partial migration) on the false path.
+    const lastSeenAt = touchPresence
       ? now
-      : finitePositiveNumber(existing.last_seen_at) ?? now;
+      : finitePositiveNumber(existing?.last_seen_at) ?? 0;
     this.state.storage.sql.exec(
       "INSERT OR REPLACE INTO session_route(session_id, actor, started, display_name, expires_at, token_class, current_location, apikey_id, mcp_shard, focus_list, actor_props, updated_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       session.session_id,
