@@ -781,6 +781,12 @@ owner live row has not been fetched, shards may include an empty actor
 and owner-authoritative rows outrank that placeholder and replace it before any
 durable movement state is trusted.
 
+During MCP pre-plan authority refresh, a sparse gateway shard may expand a
+target scope's direct `contents` to fetch owner authority for those contained
+objects, capped at 128 objects. This is a bounded identity/read repair for
+room-roster planning surfaces such as occupant names; it must not become global
+enumeration, and it is not applied to commit-refresh fan-in.
+
 `CommitScopeDO` is the durable authority for v2 scope heads. On first open for
 a scope it materializes the gateway-supplied authority seed into row-shaped DO
 SQLite state: one row per materialized object, one row per session, one row per

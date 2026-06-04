@@ -95,6 +95,7 @@ export type McpV2ClientHooks = {
       useCommitScopeSnapshotForRemoteAuthority?: boolean;
       tolerateRemoteFailures?: boolean;
       directorySessionScopes?: ObjRef[];
+      scopeContentExpansionRoots?: ObjRef[];
       reconstructionReason?: "warm_turn_refresh" | "cold_open" | "missing_state_repair";
       reconstructionScope?: ObjRef;
     }
@@ -659,6 +660,7 @@ export class McpGateway {
           useCommitScopeSnapshotForRemoteAuthority,
           tolerateRemoteFailures: isPrePlan,
           directorySessionScopes: options.directorySessionScopes ?? [],
+          ...(isPrePlan ? { scopeContentExpansionRoots: [submitScope, target] } : {}),
           reconstructionReason: "warm_turn_refresh",
           reconstructionScope: submitScope
         });
@@ -861,6 +863,7 @@ export class McpGateway {
       useCommitScopeSnapshotForRemoteAuthority?: boolean;
       tolerateRemoteFailures?: boolean;
       directorySessionScopes?: ObjRef[];
+      scopeContentExpansionRoots?: ObjRef[];
       reconstructionReason?: "warm_turn_refresh" | "cold_open" | "missing_state_repair";
       reconstructionScope?: ObjRef;
     } = {}

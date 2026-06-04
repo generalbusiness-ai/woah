@@ -48,6 +48,11 @@ const CLASSIFICATION = {
     signal: "host, object_count, and reason",
     endState: "Owner read was skipped/timed out; local last-known rows kept so commit validation arbitrates freshness."
   },
+  authority_slice_content_expansion: {
+    bucket: "seed_cache",
+    signal: "roots, objects, hosts, cap",
+    endState: "Bounded pre-plan identity expansion from direct scope contents; replace with B7/projection warm-fill once steady-state warm turns need no reconstruction."
+  },
   authority_tail: {
     bucket: "authority_append",
     signal: "tail_rows_written, tail_rows_pruned, tail_bytes_retained",

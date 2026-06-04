@@ -95,6 +95,8 @@ function primaryCount(event: MetricEvent): number {
       return typeof e.rows === "number" ? e.rows : 0;
     case "authority_slice_reconstructed":
       return typeof e.object_count === "number" ? e.object_count : 0;
+    case "authority_slice_content_expansion":
+      return typeof e.objects === "number" ? e.objects : 0;
     case "shadow_open_executable_seed_bytes":
       return typeof e.bytes === "number" ? e.bytes : 0;
     case "v2_open_step":

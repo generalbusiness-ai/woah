@@ -285,6 +285,7 @@ type ActiveV2SocketAttachment = V2SocketAttachment & { protocol: "v2-turn-networ
 const WORLD_HOST = "world";
 const MCP_GATEWAY_SHARD_PREFIX = "mcp-gateway-";
 const DEFAULT_MCP_GATEWAY_SHARDS = 32;
+const MCP_GATEWAY_SCOPE_CONTENT_AUTHORITY_LIMIT = 128;
 // Roots of the universal actor/thing lineage carried into every MCP gateway-shard
 // world so verb / property resolution can walk the ancestor chain locally. The
 // carried set is the COMPLETE closure of these roots (their full class subtree
@@ -1596,6 +1597,7 @@ export class PersistentObjectDO {
                 authorityOptions?.useCommitScopeSnapshotForRemoteAuthority === true &&
                 !isMcpGatewayShardHost(this.durableHostKey()),
               directorySessionScopes: authorityOptions?.directorySessionScopes,
+              scopeContentExpansionRoots: authorityOptions?.scopeContentExpansionRoots,
               reconstructionReason: authorityOptions?.reconstructionReason,
               reconstructionScope: authorityOptions?.reconstructionScope
             }),
@@ -4571,6 +4573,7 @@ export class PersistentObjectDO {
       tolerateRemoteFailures?: boolean;
       useCommitScopeSnapshotForRemoteAuthority?: boolean;
       directorySessionScopes?: readonly ObjRef[];
+      scopeContentExpansionRoots?: readonly ObjRef[];
       reconstructionReason?: AuthorityReconstructionReason;
       reconstructionScope?: ObjRef;
     } = {}
@@ -4730,6 +4733,65 @@ export class PersistentObjectDO {
         localActorAuthorityRoots,
         resolveHost
       ));
+    }
+    if (mcpGatewayShard && options.scopeContentExpansionRoots && options.scopeContentExpansionRoots.length > 0) {
+      const firstPassAuthority = combineSerializedAuthoritySlices(local.authority.sessions, slices);
+      const contentIds = directContentIdsFromAuthoritySlice(
+        firstPassAuthority,
+        options.scopeContentExpansionRoots,
+        MCP_GATEWAY_SCOPE_CONTENT_AUTHORITY_LIMIT
+      );
+      const expansionIds = contentIds.filter((id) => !requestedIds.includes(id));
+      if (expansionIds.length > 0) {
+        const expansionResolved = await Promise.all(expansionIds.map(async (id) => [id, await resolveHost(id, "")] as const));
+        const expansionByHost = new Map<string, Set<ObjRef>>();
+        for (const [id, host] of expansionResolved) {
+          if (!host || host === localHost) continue;
+          const list = expansionByHost.get(host) ?? new Set<ObjRef>();
+          list.add(id);
+          expansionByHost.set(host, list);
+        }
+        const expansionSlices = await Promise.all(Array.from(expansionByHost, async ([host, objects]) => {
+          try {
+            const response = await this.forwardInternalReadChecked<{ authority: SerializedAuthoritySlice }>(
+              host,
+              "/__internal/authority-slice",
+              { objects: Array.from(objects) }
+            );
+            return { host, response };
+          } catch (err) {
+            const error = normalizeError(err);
+            if (error.code === "E_TIMEOUT" && options.tolerateRemoteFailures) {
+              world.recordMetric({
+                kind: "authority_slice_stale_fallback",
+                host,
+                object_count: objects.size,
+                reason: "content_expansion_timeout"
+              });
+              staleFallbackCount += 1;
+              return null;
+            }
+            throw err;
+          }
+        }));
+        for (const item of expansionSlices) {
+          if (!item) continue;
+          slices.push(await this.filterRemoteAuthoritySliceForGateway(
+            item.response.authority,
+            item.host,
+            preservedObjectIds,
+            localActorAuthorityRoots,
+            resolveHost
+          ));
+        }
+        world.recordMetric({
+          kind: "authority_slice_content_expansion",
+          roots: options.scopeContentExpansionRoots.length,
+          objects: expansionIds.length,
+          hosts: expansionByHost.size,
+          cap: MCP_GATEWAY_SCOPE_CONTENT_AUTHORITY_LIMIT
+        });
+      }
     }
     const authority = combineSerializedAuthoritySlices(
       local.authority.sessions,
@@ -6604,6 +6666,38 @@ function mcpGatewayDirectorySessionCellSlice(sessions: readonly DirectorySeriali
     tombstones: [],
     source_object_count: actorObjects.length + scopeLivePages.length
   };
+}
+
+function directContentIdsFromAuthoritySlice(
+  authority: SerializedAuthoritySlice,
+  roots: readonly ObjRef[],
+  limit: number
+): ObjRef[] {
+  const rootSet = new Set<ObjRef>(roots.filter((id): id is ObjRef => typeof id === "string" && id.length > 0));
+  if (rootSet.size === 0 || limit <= 0) return [];
+  const seen = new Set<ObjRef>(rootSet);
+  const ids: ObjRef[] = [];
+  const visitContents = (contents: readonly ObjRef[]): boolean => {
+    for (const id of contents) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      ids.push(id);
+      if (ids.length >= limit) return false;
+    }
+    return true;
+  };
+  if (isAuthorityCellSlice(authority)) {
+    for (const page of authority.inline_pages) {
+      if (page.page !== "object_live" || !rootSet.has(page.object)) continue;
+      if (!visitContents(page.contents)) return ids;
+    }
+    return ids;
+  }
+  for (const obj of authority.objects) {
+    if (!rootSet.has(obj.id)) continue;
+    if (!visitContents(obj.contents)) return ids;
+  }
+  return ids;
 }
 
 function mcpGatewayStubObject(input: {

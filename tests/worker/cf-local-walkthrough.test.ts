@@ -74,12 +74,15 @@ type CfSmokeHarness = {
 describe("CF-local smoke walkthrough", () => {
   it("covers cross-shard MCP movement and tool-space fanout through Worker Durable Object shape", async () => {
     const harness = createCfSmokeHarness();
-    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const runId = `cf-local-${Date.now()}-${randomUUID().slice(0, 8)}`;
+    let logSpy: ReturnType<typeof vi.spyOn> | null = null;
+    let warnSpy: ReturnType<typeof vi.spyOn> | null = null;
     let alice: LocalMcpSession | null = null;
     let bob: LocalMcpSession | null = null;
     try {
+      await seedClosedChatroomOccupant(harness, runId);
+      logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
       alice = await LocalMcpSession.open(harness, `guest:cf-local-alice-${runId}`, "alice", runId);
       bob = await openOnDifferentShard(harness, alice, runId);
       await runWalkthrough(alice, bob);
@@ -184,6 +187,13 @@ describe("CF-local smoke walkthrough", () => {
         .filter((m) => m.target === "the_chatroom" && m.verb === "enter" && m.route === "direct")
         .slice(0, 2);
       expect(initialChatroomEnters.length, "both initial chatroom enters must emit phase timing").toBe(2);
+      const contentExpansions = parsedMetrics
+        .filter((m) => m.kind === "authority_slice_content_expansion")
+        .filter((m) => Number(m.objects) > 0);
+      expect(
+        contentExpansions.length,
+        "stale pre-existing room occupants must trigger bounded pre-plan contents authority expansion"
+      ).toBeGreaterThan(0);
       const admissionViolations = warnSpy.mock.calls
         .filter((call) => call[0] === "woo.planning_world_inadmissible")
         .map((call) => JSON.stringify(call[1] ?? {}));
@@ -215,8 +225,8 @@ describe("CF-local smoke walkthrough", () => {
       expect(deleteDispatch.length, "the /mcp dispatch wrapper must emit mcp_dispatch_timing for DELETE teardown").toBeGreaterThan(0);
     } finally {
       await Promise.allSettled([alice?.close(), bob?.close()]);
-      warnSpy.mockRestore();
-      logSpy.mockRestore();
+      warnSpy?.mockRestore();
+      logSpy?.mockRestore();
       harness.close();
     }
   });
@@ -301,6 +311,15 @@ function createCfSmokeHarness(): CfSmokeHarness {
       for (const state of commitStates.values()) state.close();
     }
   };
+}
+
+async function seedClosedChatroomOccupant(harness: CfSmokeHarness, runId: string): Promise<void> {
+  const session = await LocalMcpSession.open(harness, `guest:cf-local-stale-${runId}`, "stale", runId);
+  try {
+    await session.call("the_chatroom", "enter", []);
+  } finally {
+    await session.close();
+  }
 }
 
 async function openOnDifferentShard(harness: CfSmokeHarness, alice: LocalMcpSession, runId: string): Promise<LocalMcpSession> {

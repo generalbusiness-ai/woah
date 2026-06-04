@@ -362,7 +362,11 @@ export type MetricEvent =
   // already records a `cross_host_rpc{status:"timeout", rpc_id}` for the
   // underlying RPC; this distinct event captures the higher-level policy
   // decision so cross_host_rpc latency stats stay clean.
-  | { kind: "authority_slice_stale_fallback"; host: string; object_count: number; reason: "timeout" | "snapshot_fallback" }
+  | { kind: "authority_slice_stale_fallback"; host: string; object_count: number; reason: "timeout" | "snapshot_fallback" | "content_expansion_timeout" }
+  // Sparse MCP gateway pre-plan expansion from a requested scope's direct
+  // contents to the contained objects' owner authority. This is bounded identity
+  // repair for roster/name reads, not global enumeration.
+  | { kind: "authority_slice_content_expansion"; roots: number; objects: number; hosts: number; cap: number }
   // Emitted every time an authority slice is reconstructed on the turn path
   // (step 2a of the cell-authority perf plan, notes/2026-05-31-...). This is
   // the measurement that lets 2b–2e prove they remove per-turn reconstruction
