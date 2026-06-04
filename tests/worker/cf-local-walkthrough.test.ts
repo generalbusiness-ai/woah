@@ -41,6 +41,7 @@ const RPC_TIMEOUT_MS = 20_000;
 const STEP_TIMEOUT_MS = 60_000;
 const DRAIN_TOTAL_BUDGET_MS = 3000;
 const DRAIN_POLL_MS = 500;
+const DIRECTORY_PRESENCE_WINDOW_MS = 5 * 60_000;
 
 class FakeKVNamespace {
   readonly values = new Map<string, string>();
@@ -71,6 +72,7 @@ type CfSmokeHarness = {
   shards: number;
   request(path: string, init: RequestInit): Promise<Response>;
   drainWaitUntil(): Promise<void>;
+  setDirectoryLastSeenAt(sessionIds: readonly string[], lastSeenAt: number): void;
   close(): void;
 };
 
@@ -283,17 +285,23 @@ describe("CF-local smoke walkthrough", () => {
     }
   });
 
-  it("can reproduce prod-shaped stale MCP Directory audience pressure locally", async () => {
-    const harness = createCfSmokeHarness({ shards: 32, mcpCommitFanoutDelayMs: 5 });
+  it("bounds prod-shaped stale MCP Directory audience pressure locally", async () => {
+    const harness = createCfSmokeHarness({ shards: 32 });
     const runId = `cf-local-prod-shape-${Date.now()}-${randomUUID().slice(0, 8)}`;
     let logSpy: ReturnType<typeof vi.spyOn> | null = null;
     let alice: LocalMcpSession | null = null;
     try {
-      await seedDirectoryMcpAudience(harness, runId, {
+      const staleSessionIds = await seedDirectoryMcpAudience(harness, runId, {
         scope: "the_chatroom",
         sessions: 29,
         uniqueShards: 17
       });
+      // The presence fix treats register-session itself as liveness, so stale
+      // rows must become stale by lease age, not by old started/expires_at
+      // fields. Keep real timers in this walkthrough file and directly age only
+      // the seeded Directory leases; this is the local equivalent of "registered
+      // live in prod, then no client ingress for > W".
+      harness.setDirectoryLastSeenAt(staleSessionIds, Date.now() - DIRECTORY_PRESENCE_WINDOW_MS - 60_000);
       logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
       alice = await LocalMcpSession.open(harness, `guest:cf-local-prod-shape-alice-${runId}`, "alice", runId);
 
@@ -301,13 +309,19 @@ describe("CF-local smoke walkthrough", () => {
       await harness.drainWaitUntil();
 
       const parsedMetrics = metricsFromLogSpy(logSpy);
-      const directoryPressure = parsedMetrics
+      const directoryLookups = parsedMetrics
         .filter((m) => m.kind === "directory_sessions_for_scopes" && m.status === "ok")
-        .find((m) => Number(m.scopes) === 1 && Number(m.sessions) >= 29);
+        .filter((m) => Number(m.scopes) === 1);
+      const directoryPressure = directoryLookups.find((m) => Number(m.sessions) >= 29);
       expect(
         directoryPressure,
-        "prod-shaped harness must expose many Directory sessions for a two-actor room turn"
-      ).toBeTruthy();
+        `presence lease must filter the 29 stale Directory rows; saw ${JSON.stringify(directoryLookups)}`
+      ).toBeUndefined();
+      const maxDirectorySessions = Math.max(0, ...directoryLookups.map((m) => Number(m.sessions) || 0));
+      expect(
+        maxDirectorySessions,
+        "stale Directory pressure should collapse to the live room set, not the whole unexpired auth set"
+      ).toBeLessThanOrEqual(2);
 
       const fanoutMetrics = parsedMetrics.filter((m) => m.kind === "mcp_fanout");
       // Enter commits at the actor scope, but room/presence fanout is still
@@ -316,11 +330,13 @@ describe("CF-local smoke walkthrough", () => {
         .find((m) => Number(m.audience_session_shards) >= 16 && Number(m.affected_scopes) > 0);
       expect(
         fanoutPressure,
-        `prod-shaped harness must expose over-broad MCP audience shard fanout from stale Directory rows; saw ${JSON.stringify(fanoutMetrics)}`
-      ).toBeTruthy();
-      expect(Number(fanoutPressure?.scoped_shards ?? -1), "audience-session fanout should bypass scoped shard fallback").toBe(0);
-      expect(Number(fanoutPressure?.subscriber_shards ?? -1), "stale Directory pressure should not be hidden as durable subscriber fanout").toBe(0);
-      expect(Number(fanoutPressure?.shards ?? 0), "local suppression may remove one selected host, but fanout should still hit prod-scale shard count").toBeGreaterThanOrEqual(16);
+        `presence lease must prevent stale Directory rows from selecting prod-scale MCP fanout; saw ${JSON.stringify(fanoutMetrics)}`
+      ).toBeUndefined();
+      const maxAudienceSessionShards = Math.max(0, ...fanoutMetrics.map((m) => Number(m.audience_session_shards) || 0));
+      expect(
+        maxAudienceSessionShards,
+        "stale Directory pressure should not select one gateway shard per old session"
+      ).toBeLessThanOrEqual(2);
     } finally {
       await Promise.allSettled([alice?.close(), harness.drainWaitUntil()]);
       logSpy?.mockRestore();
@@ -403,6 +419,11 @@ function createCfSmokeHarness(options: CfSmokeHarnessOptions = {}): CfSmokeHarne
     drainWaitUntil: async () => {
       for (const state of wooStates.values()) await state.drainWaitUntil();
     },
+    setDirectoryLastSeenAt: (sessionIds, lastSeenAt) => {
+      for (const sessionId of sessionIds) {
+        directoryState.storage.sql.exec("UPDATE session_route SET last_seen_at = ? WHERE session_id = ?", lastSeenAt, sessionId);
+      }
+    },
     close: () => {
       directoryState.close();
       for (const state of wooStates.values()) state.close();
@@ -424,14 +445,16 @@ async function seedDirectoryMcpAudience(
   harness: CfSmokeHarness,
   runId: string,
   options: { scope: ObjRef; sessions: number; uniqueShards: number }
-): Promise<void> {
+): Promise<string[]> {
   // Seed Directory directly through the signed internal API so the harness can
   // model prod stale MCP rows without manufacturing full live Woo sessions.
   const shardCount = Math.min(options.uniqueShards, harness.shards);
   const safeRunId = runId.replace(/[^A-Za-z0-9_]/g, "_");
+  const sessionIds: string[] = [];
   for (let i = 0; i < options.sessions; i += 1) {
     const shardIndex = i % shardCount;
     const sessionId = sessionIdForShard(`stale-prod-${runId}-${i}`, shardIndex, harness.shards);
+    sessionIds.push(sessionId);
     await registerDirectorySession(harness, {
       session_id: sessionId,
       actor: `guest_stale_prod_${safeRunId}_${i}`,
@@ -445,6 +468,7 @@ async function seedDirectoryMcpAudience(
       focus_list: [options.scope]
     });
   }
+  return sessionIds;
 }
 
 async function registerDirectorySession(harness: CfSmokeHarness, payload: Record<string, unknown>): Promise<void> {

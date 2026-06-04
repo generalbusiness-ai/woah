@@ -99,8 +99,30 @@ External review found three issues; all fixed.
 
 Tests: directory-sessions.test.ts +2 (P2 unconditional backfill over a NULL row;
 P3 new-route-not-present-until-ingress). 15/15 in file; worker lane 220; npm test
-369; typecheck clean. P1's full outcome test (stale session + fanout-during-wait)
-lands with the cf-local prod-shape harness reconciliation.
+369; typecheck clean.
+
+## Cf-local prod-shape harness reconciliation
+
+Merged into `cf-local-prod-shape` and corrected the stale-session fixture. The
+original harness modeled staleness with old `started`/`expires_at` values, which
+is correct on `main` but false under the presence lease: `register-session` is a
+liveness moment and stamps `last_seen_at = now`. The reconciled gate now:
+
+- registers the 29 seeded MCP Directory rows through the signed internal API
+  (real route shape);
+- directly ages only those rows' `last_seen_at` values in fake Directory storage
+  (the local equivalent of "registered live, then no client ingress for > W"),
+  avoiding fake timers because the walkthrough harness uses real `setTimeout`
+  for request timeouts and optional delay injection;
+- asserts the next two-actor room turn does NOT see `sessions >= 29` and does
+  NOT select `audience_session_shards >= 16`; the maximum observed scoped
+  session and audience-shard counts must stay bounded by the live room set.
+
+Local validation after reconciliation: targeted worker files (Directory,
+CF repository, cf-local walkthrough) passed; `npm run smoke:cf-local` passed;
+`npm run typecheck` passed; `npm test` passed. A full `npm run test:worker`
+run hit two long integration-test timeouts under suite contention, and both
+timeout cases passed when rerun in isolation.
 
 ## Not done / next
 
