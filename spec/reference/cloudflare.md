@@ -800,13 +800,14 @@ window, and live (non-durable) fanout has no replay, so a session whose lease
 lapsed while idle must be republished as present before it starts waiting or a
 peer's observation during the wait would be dropped. New-session creation and
 post-turn detail/scope changes are still published by the post-response
-registration. Touches are throttled to roughly half the
-window so an unchanged-route ingress writes at most once per window-half,
-preserving the `register-session` dedupe's write-storm protection. Presence for
-delivery and presence for display stay separate: durable subscribers ride the
-commit-scope subscriber/fanout path and catch up by replay, so an idle-but-live
-session that has fallen out of the presence window is not kept room-present for
-its whole auth lease.
+registration. Touches are throttled at both layers: a gateway-local in-memory
+W/2 cache prevents an established session from paying a pre-dispatch Directory
+RPC on every turn, and Directory's durable W/2 throttle preserves the
+`register-session` dedupe's write-storm protection across DO lifetimes and
+shards. Presence for delivery and presence for display stay separate: durable
+subscribers ride the commit-scope subscriber/fanout path and catch up by replay,
+so an idle-but-live session that has fallen out of the presence window is not
+kept room-present for its whole auth lease.
 
 `DELETE /mcp` is a session end, not a heartbeat. When an established MCP session
 is routed to a shard, the shard closes the local transport queue, drops local

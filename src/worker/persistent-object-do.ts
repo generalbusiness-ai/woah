@@ -353,6 +353,11 @@ const HOST_WRITE_RPC_TIMEOUT_MS = 30_000;
 // a moved/disconnected actor linger in user-visible room text.
 const DIRECTORY_SCOPE_SESSIONS_TTL_MS = 1_000;
 const DIRECTORY_SCOPE_SESSIONS_CACHE_MAX = 128;
+// Mirrors Directory's W/2 presence-write throttle. This one lives on the
+// gateway so an established MCP request does not pay a synchronous Directory
+// ingress-touch RPC when the local DO already refreshed this session recently.
+const MCP_PRESENCE_INGRESS_TOUCH_THROTTLE_MS = 150_000;
+const MCP_PRESENCE_INGRESS_TOUCH_CACHE_MAX = 4096;
 // Cap on concurrent DO->DO fetch() subrequests issued by this isolate. The
 // Workers runtime enforces its own ~6-slot limit; we self-limit slightly under
 // that and queue the overflow so cold-start fan-outs (compose_look hitting 4
@@ -513,6 +518,10 @@ export class PersistentObjectDO {
   // back-to-back roster verbs can add synchronous singleton pressure during
   // the post-deploy cold-load window.
   private directoryScopeSessionsCache = new Map<string, DirectoryScopeSessionsCacheEntry>();
+  // Established MCP ingress must refresh stale presence before a long-polling
+  // handler waits, but not on every turn. This records successful recent local
+  // touches for this hot DO lifetime; Directory remains the durable authority.
+  private mcpPresenceIngressTouchedAt = new Map<string, number>();
   // Per spec/semantics/recycle.md §RC11. Cached host_state — null means
   // "not yet read this lifetime"; afterwards the cached string is "live"
   // or "tearing_down". Resets on DO eviction.
@@ -1326,7 +1335,7 @@ export class PersistentObjectDO {
         authenticateToken: (token) => this.authenticateToken(world, token),
         requireSession: () => this.requireRestSession(world, request),
         verifyTurnstile: (token, protocolRequest) => this.verifyTurnstile(token, protocolRequest),
-        onAuthenticated: (session) => this.registerSessionRoute(session, {}, world),
+        onAuthenticated: async (session) => { await this.registerSessionRoute(session, {}, world); },
         onSessionEnded: (session) => {
           this.browserMetricSessionCounters.delete(session.id);
           return this.unregisterSessionRoute(session.id);
@@ -3386,6 +3395,7 @@ export class PersistentObjectDO {
         this.localRouteSnapshot = null;
         this.crossHostPropCache.clear();
         this.mcpGateway = null;
+        this.mcpPresenceIngressTouchedAt.clear();
         return jsonResponse({ ok: true, host: hostKey, ms: Date.now() - wipeStart });
       }
 
@@ -3841,7 +3851,7 @@ export class PersistentObjectDO {
     return world.auth(token);
   }
 
-  private async registerSessionRoute(session: Session, options: { mcpShard?: string | null; touchPresence?: boolean } = {}, world: WooWorld | null = this.world): Promise<void> {
+  private async registerSessionRoute(session: Session, options: { mcpShard?: string | null; touchPresence?: boolean; rememberMcpPresenceTouch?: boolean } = {}, world: WooWorld | null = this.world): Promise<boolean> {
     try {
       const id = this.env.DIRECTORY.idFromName(DIRECTORY_HOST);
       const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/register-session`, {
@@ -3868,7 +3878,11 @@ export class PersistentObjectDO {
           touch_presence: options.touchPresence ?? true
         })
       }));
-      await this.env.DIRECTORY.get(id).fetch(request);
+      const response = await this.env.DIRECTORY.get(id).fetch(request);
+      const sessionRegistered = response.ok;
+      if (sessionRegistered && options.touchPresence !== false && options.rememberMcpPresenceTouch === true) {
+        this.rememberMcpPresenceIngressTouch(session.id, Date.now());
+      }
       // Register the actor's object route at the actor's actual host,
       // not blindly at WORLD. For newly-minted guests on WORLD this
       // resolves to WORLD (unchanged), but for apikey-bound actors
@@ -3888,10 +3902,12 @@ export class PersistentObjectDO {
       if (hostKey === WORLD_HOST || actorRoute?.host === session.actor) {
         await this.registerRoutes([{ id: session.actor, host: actorRoute?.host ?? WORLD_HOST, anchor: actorRoute?.anchor ?? null }]);
       }
+      return sessionRegistered;
     } catch {
       // Directory registration accelerates cross-DO routing. The local auth
       // result remains authoritative for this host; routed object calls fail
       // closed if the Directory cannot resolve the session.
+      return false;
     }
   }
 
@@ -3900,7 +3916,7 @@ export class PersistentObjectDO {
     const sessionId = response.headers.get("mcp-session-id") ?? request.headers.get("mcp-session-id");
     if (!sessionId) return;
     const session = world.sessions.get(sessionId);
-    if (session) await this.registerSessionRoute(session, { mcpShard }, world);
+    if (session) await this.registerSessionRoute(session, { mcpShard, rememberMcpPresenceTouch: true }, world);
   }
 
   // Ingress-time presence refresh for an already-established MCP session (P1).
@@ -3908,14 +3924,35 @@ export class PersistentObjectDO {
   // `mcp-session-id`); an `initialize` request carries neither yet, so a new
   // session is left to the post-response registration. DELETE (lifecycle end)
   // and client-aborted requests must not refresh — they would resurrect or
-  // wrongly extend a route. The Directory-side W/2 throttle keeps this cheap:
-  // an unchanged route within the throttle window is a no-op, not a write.
+  // wrongly extend a route. A gateway-local W/2 throttle avoids adding a
+  // synchronous Directory RPC to every established MCP request; Directory keeps
+  // the durable write throttle as the authority if another DO instance touches.
   private async touchEstablishedMcpSessionPresence(world: WooWorld, request: Request, mcpShard: string | null): Promise<void> {
     if (request.method === "DELETE" || request.signal.aborted) return;
     const sessionId = request.headers.get("x-woo-internal-session") ?? request.headers.get("mcp-session-id");
     if (!sessionId) return;
     const session = world.sessions.get(sessionId);
-    if (session) await this.registerSessionRoute(session, { mcpShard, touchPresence: true }, world);
+    if (!session) return;
+    const now = Date.now();
+    if (!this.shouldTouchMcpPresenceAtIngress(sessionId, now)) return;
+    this.rememberMcpPresenceIngressTouch(sessionId, now);
+    const touched = await this.registerSessionRoute(session, { mcpShard, touchPresence: true, rememberMcpPresenceTouch: true }, world);
+    if (!touched) this.mcpPresenceIngressTouchedAt.delete(sessionId);
+  }
+
+  private shouldTouchMcpPresenceAtIngress(sessionId: string, now: number): boolean {
+    const lastTouchedAt = this.mcpPresenceIngressTouchedAt.get(sessionId) ?? 0;
+    return now - lastTouchedAt >= MCP_PRESENCE_INGRESS_TOUCH_THROTTLE_MS;
+  }
+
+  private rememberMcpPresenceIngressTouch(sessionId: string, now: number): void {
+    if (this.mcpPresenceIngressTouchedAt.has(sessionId)) this.mcpPresenceIngressTouchedAt.delete(sessionId);
+    this.mcpPresenceIngressTouchedAt.set(sessionId, now);
+    while (this.mcpPresenceIngressTouchedAt.size > MCP_PRESENCE_INGRESS_TOUCH_CACHE_MAX) {
+      const oldest = this.mcpPresenceIngressTouchedAt.keys().next().value;
+      if (typeof oldest !== "string") break;
+      this.mcpPresenceIngressTouchedAt.delete(oldest);
+    }
   }
 
   private async closeMcpWooSession(world: WooWorld, sessionId: string, hostKey: string): Promise<void> {
@@ -3968,6 +4005,7 @@ export class PersistentObjectDO {
   }
 
   private async unregisterSessionRoute(sessionId: string): Promise<void> {
+    this.mcpPresenceIngressTouchedAt.delete(sessionId);
     try {
       const id = this.env.DIRECTORY.idFromName(DIRECTORY_HOST);
       const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/unregister-session`, {

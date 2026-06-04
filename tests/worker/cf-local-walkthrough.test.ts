@@ -73,6 +73,8 @@ type CfSmokeHarness = {
   request(path: string, init: RequestInit): Promise<Response>;
   drainWaitUntil(): Promise<void>;
   setDirectoryLastSeenAt(sessionIds: readonly string[], lastSeenAt: number): void;
+  directoryRequests(path?: string): Array<{ path: string; body: Record<string, unknown> | null }>;
+  clearDirectoryRequests(): void;
   close(): void;
 };
 
@@ -343,6 +345,36 @@ describe("CF-local smoke walkthrough", () => {
       harness.close();
     }
   });
+
+  it("throttles established MCP ingress presence touches before dispatch", async () => {
+    const harness = createCfSmokeHarness();
+    const runId = `cf-local-ingress-throttle-${Date.now()}-${randomUUID().slice(0, 8)}`;
+    let session: LocalMcpSession | null = null;
+    try {
+      session = await LocalMcpSession.open(harness, `guest:cf-local-ingress-throttle-${runId}`, "alice", runId);
+
+      harness.clearDirectoryRequests();
+      await session.callTool("woo_wait", { timeout_ms: 1, limit: 1 });
+      await harness.drainWaitUntil();
+      const firstRegistrations = harness.directoryRequests("/register-session");
+      expect(
+        firstRegistrations.map((r) => String(r.body?.session_id ?? "")),
+        "a fresh established MCP request should use only the existing post-response route registration; an extra pre-dispatch ingress touch adds a Directory round-trip to the hot path"
+      ).toEqual([session.sessionId]);
+
+      harness.clearDirectoryRequests();
+      await session.callTool("woo_wait", { timeout_ms: 1, limit: 1 });
+      await harness.drainWaitUntil();
+      const secondRegistrations = harness.directoryRequests("/register-session");
+      expect(
+        secondRegistrations.map((r) => String(r.body?.session_id ?? "")),
+        "the gateway-local W/2 throttle should keep skipping the pre-dispatch Directory touch while the session lease is locally fresh"
+      ).toEqual([session.sessionId]);
+    } finally {
+      await Promise.allSettled([session?.close(), harness.drainWaitUntil()]);
+      harness.close();
+    }
+  });
 });
 
 function createCfSmokeHarness(options: CfSmokeHarnessOptions = {}): CfSmokeHarness {
@@ -353,6 +385,7 @@ function createCfSmokeHarness(options: CfSmokeHarnessOptions = {}): CfSmokeHarne
   const wooObjects = new Map<string, PersistentObjectDO>();
   const commitStates = new Map<string, FakeDurableObjectState>();
   const commitObjects = new Map<string, CommitScopeDO>();
+  const directoryRequests: Array<{ path: string; body: Record<string, unknown> | null }> = [];
   let env: Env;
 
   const wooNamespace = new FakeDurableObjectNamespace((name) => {
@@ -400,7 +433,18 @@ function createCfSmokeHarness(options: CfSmokeHarnessOptions = {}): CfSmokeHarne
       if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
       return {
         fetch: async (request: Request): Promise<Response> => {
-          if (new URL(request.url).pathname === "/sessions-for-scopes") {
+          const pathname = new URL(request.url).pathname;
+          if (pathname === "/register-session") {
+            let body: Record<string, unknown> | null = null;
+            try {
+              const parsed = await request.clone().json();
+              body = isRecord(parsed) ? parsed : null;
+            } catch {
+              body = null;
+            }
+            directoryRequests.push({ path: pathname, body });
+          }
+          if (pathname === "/sessions-for-scopes") {
             await delayFor(options.directorySessionsForScopesDelayMs, request.signal);
           }
           return await directory.fetch(request);
@@ -424,6 +468,8 @@ function createCfSmokeHarness(options: CfSmokeHarnessOptions = {}): CfSmokeHarne
         directoryState.storage.sql.exec("UPDATE session_route SET last_seen_at = ? WHERE session_id = ?", lastSeenAt, sessionId);
       }
     },
+    directoryRequests: (path) => path ? directoryRequests.filter((entry) => entry.path === path) : [...directoryRequests],
+    clearDirectoryRequests: () => { directoryRequests.length = 0; },
     close: () => {
       directoryState.close();
       for (const state of wooStates.values()) state.close();
