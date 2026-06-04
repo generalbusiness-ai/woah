@@ -178,6 +178,9 @@ Maintain local dirty-state regression tests and run `npm run smoke:cf-local`
 before CF.  If a smoke-test fails: stop, inspect tail/metrics, and only
 re-run when strong new signals will be available.
 
+If the cf-local smoke test succeeds but the full deployed smoke-test fails,
+identify root causes and prioritize their mitigation over patching activity.
+
 **Test selection discipline**
 
 Use targeted Vitest files for the code just changed (`npm run test:files --
