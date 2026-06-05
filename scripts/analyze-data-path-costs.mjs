@@ -273,6 +273,16 @@ const CLASSIFICATION = {
     signal: "reason, scope, object_count, page_count, source_host",
     endState: "Per-turn authority-slice reconstruction (warm_turn_refresh) is replaced by content-addressed read-through warm cache-fill (B7) plus checkpoint/tail catch-up; steady-state warm turns reconstruct nothing."
   },
+  authority_slice_partition: {
+    bucket: "cross_host",
+    signal: "host, reason, object_count, objects",
+    endState: "Ids a turn could not resolve locally, partitioned to a remote owner (real RPC or snapshot fallback). CA11.2 topology pre-seeding drives a served scope's one-hop neighbor lineage OUT of this partition; a residual partition for a neighbor on a cold READ is a pre-seed gap. An occupancy move legitimately partitions its destination once (missing_state_repair)."
+  },
+  scope_topology_seed: {
+    bucket: "seed_cache",
+    signal: "scopes, seeded",
+    endState: "CA11.2 bounded one-hop topology closure merged into a gateway shard's cold world (lineage-only neighbor rooms + full catalog-class chain) so cold moves resolve neighbor lineage locally instead of a cross-host authority-slice. Bounded by served-scope x exit fan-degree; not a steady-state cost."
+  },
   shadow_gateway_apply_step: {
     bucket: "compat_transform",
     signal: "phase, objects, properties, writes",
