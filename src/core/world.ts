@@ -7038,7 +7038,10 @@ export class WooWorld {
       }
       for (const id of touchedContainers) {
         result.objects += 1;
-        if (persist) this.persistProjectionObjectWrite(id, options.transcript, false);
+        // The transcript dirties the moved object's location cell, not the
+        // container's `contents` cell. Force a whole-row save for this repaired
+        // projection or the owner host would update memory but reload stale.
+        if (persist) this.persistProjectionObjectWrite(id, options.transcript, false, true);
         else this.invalidateProjectionObjectCache(id);
       }
     }
@@ -7082,12 +7085,12 @@ export class WooWorld {
     target.children = children;
   }
 
-  private persistProjectionObjectWrite(id: ObjRef, transcript: EffectTranscript | undefined, created: boolean): void {
+  private persistProjectionObjectWrite(id: ObjRef, transcript: EffectTranscript | undefined, created: boolean, forceWholeObjectDirty = false): void {
     if (!transcript) {
       this.persistObject(id);
       return;
     }
-    let wholeObjectDirty = created;
+    let wholeObjectDirty = created || forceWholeObjectDirty;
     const dirtyProps = new Set<string>();
     for (const create of transcript.creates) {
       if (create.object === id || create.parent === id || create.location === id) wholeObjectDirty = true;

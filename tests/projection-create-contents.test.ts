@@ -1,9 +1,37 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createWorld, createWorldFromSerialized } from "../src/core/bootstrap";
 import { executeInProcessV2DurableTurn } from "../src/server/dev-v2-helpers";
 import { createShadowBrowserRelayShim, shadowBrowserSessionBearer } from "../src/core/shadow-browser-node";
+import { LocalSQLiteRepository } from "../src/server/sqlite-repository";
 import type { ShadowRelayCache } from "../src/core/shadow-relay-cache";
+import type { SerializedWorld } from "../src/core/repository";
 import type { ObjRef, WooValue } from "../src/core/types";
+
+class CountingLocalSQLiteRepository extends LocalSQLiteRepository {
+  objectSaves: string[] = [];
+
+  saveObject(obj: Parameters<LocalSQLiteRepository["saveObject"]>[0]): void {
+    this.objectSaves.push(obj.id);
+    super.saveObject(obj);
+  }
+}
+
+function tempDb(): { dir: string; path: string } {
+  const dir = mkdtempSync(join(tmpdir(), "woo-proj-contents-"));
+  return { dir, path: join(dir, "world.sqlite") };
+}
+
+function withoutContent(serialized: SerializedWorld, container: ObjRef, member: ObjRef): SerializedWorld {
+  return {
+    ...serialized,
+    objects: serialized.objects.map((object) => object.id === container
+      ? { ...object, contents: object.contents.filter((id) => id !== member) }
+      : object)
+  };
+}
 
 // Regression: applyProjectionWrites -> mergeScopedProjectionObject must include a
 // member CREATED directly in a container in that container's contents
@@ -78,18 +106,35 @@ describe("projection-mode create contents", () => {
     // the actor is NOT yet in the_chatroom's contents, and the projection-writes
     // slice carries NO full row for the_chatroom (the committing scope didn't emit
     // one). Without the fix, applyProjectionWrites leaves contents stale → drift.
-    const receiver = createWorldFromSerialized(world.exportWorld(), { persist: false });
-    receiver.object("the_chatroom").contents.delete(g.actor);
+    const staleSerialized = withoutContent(world.exportWorld(), "the_chatroom", g.actor);
+    const { dir, path } = tempDb();
     const writes = (move.reply.commit.projection_writes ?? []).filter(
       (w) => !(w.table === "objects" && w.key === "the_chatroom")
     );
+    try {
+      const repo = new CountingLocalSQLiteRepository(path);
+      const receiver = createWorldFromSerialized(staleSerialized, { repository: repo });
+      expect(Array.from(receiver.object("the_chatroom").contents)).not.toContain(g.actor);
+      repo.objectSaves = [];
 
-    // Pass the_chatroom's actual route host so the durable repair's ownership
-    // guard (belongsHere) recognises this receiver as the_chatroom's owner —
-    // exactly the object-host apply path that passes the real hostKey.
-    const chatroomHost = receiver.objectRoutes().find((route) => route.id === "the_chatroom")?.host ?? "the_chatroom";
-    receiver.applyProjectionWrites(writes, { transcript, hostKey: chatroomHost });
+      // Pass the_chatroom's actual route host so the durable repair's ownership
+      // guard (belongsHere) recognises this receiver as the_chatroom's owner —
+      // exactly the object-host apply path that passes the real hostKey.
+      const chatroomHost = receiver.objectRoutes().find((route) => route.id === "the_chatroom")?.host ?? "the_chatroom";
+      receiver.applyProjectionWrites(writes, { transcript, hostKey: chatroomHost });
 
-    expect(Array.from(receiver.object("the_chatroom").contents)).toContain(g.actor);
+      expect(Array.from(receiver.object("the_chatroom").contents)).toContain(g.actor);
+      expect(repo.objectSaves).toContain("the_chatroom");
+      repo.close();
+
+      const reloadedRepo = new LocalSQLiteRepository(path);
+      const stored = reloadedRepo.load();
+      if (!stored) throw new Error("expected persisted receiver world");
+      const reloaded = createWorldFromSerialized(stored, { repository: reloadedRepo, persist: false });
+      expect(Array.from(reloaded.object("the_chatroom").contents)).toContain(g.actor);
+      reloadedRepo.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
