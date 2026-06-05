@@ -96,9 +96,54 @@ gateway then re-resolves). The fix only works if seeding `the_deck` + catalog
 chain makes the classifier treat it local. A reproduction test instruments
 `requestedIds`/`reconstructionReason` to confirm before the larger change.
 
+## Trigger CONFIRMED + a deeper constraint found (first impl attempt)
+
+A first implementation attempt (preserved on branch
+`scope-topology-seed-agent-wip`, commit `33fee81` — harvest-only, not merged)
+confirmed the fetch trigger and surfaced a second-order failure that sharpens
+the design.
+
+**Confirmed:** on a cold `the_chatroom:enter`, `the_deck` is partitioned to a
+remote owner because `localObjectLineageIsComplete(the_deck)` is false (chain
+dangles at the absent `$chatroom`/`$room`/`$space`). New harness-independent
+metric `authority_slice_partition` makes this observable (the cf-local harness
+masks the wire RPC behind a commit-scope snapshot fallback, so the partition
+*decision* is the only reliable signal). Seeding `the_deck` lineage + the shared
+catalog-class chain drives it out of the partition. Confirmed good.
+
+**Deeper constraint (the stall):** a seeded lineage-only `the_deck` is correct
+as a NEIGHBOR, but it **poisons the relay/commit-scope snapshot** once an actor
+later OCCUPIES `the_deck`. When `the_deck` becomes the served/commit scope,
+`mcpGatewayLocalAuthorityPayload` exported the seeded lineage-only row into
+`localIds`; that row (no `exits`) seeded the `the_deck` commit-scope open
+snapshot; a subsequent move *out* of `the_deck` read the exits-less snapshot and
+broke. The first attempt tried per-turn EVICTION of the seeded row — which
+thrashed (seed/evict churn across turns) and stalled.
+
+**Correct rule (now normative in CA11.2):** no eviction. A pre-seeded id that is
+a current served scope (∈ sessions' activeScope) MUST be excluded from local
+authority export, so it is fetched fresh from its owner and the open
+seed/snapshot carries the owner's full `exits`-bearing row. The resident seed row
+may stay (harmless gap-filler for other actors holding it only as a neighbor); it
+simply must never be *exported as authority* for the occupant. This touches the
+A5 relay/commit-scope-snapshot path the in-memory checkpoint was removed from —
+the open seed must not capture a lineage-only pre-seed for a served scope.
+
+## Harvest plan (reimplement clean from 7b4e007)
+
+KEEP from `scope-topology-seed-agent-wip`: `types.ts` metrics
+(`authority_slice_partition`, `scope_topology_seed`); `world.ts`
+`mergeTopologySeedObjects` (never-overwrite, persistence-paused, lineage rows);
+`tests/worker/scope-topology-seed.test.ts` (trigger reproduction). DROP:
+`world.ts evictTopologySeedObject` and all eviction/churn/debug-probe edits in
+`persistent-object-do.ts`. ADD clean: the bundled-topology closure helper; the
+cold-load injection bounded to served scopes; owner-deferring re-stamp at export;
+**served-scope exclusion** in `mcpGatewayLocalAuthorityPayload`; the second guard;
+the 5 conformance tests.
+
 ## Status
 
-- CA11.2 spec delta written; CA11.1 currency note added (A5 removed the
-  in-memory checkpoint).
-- Implementation + the 5 CA11.2 conformance tests pending the fetch-trigger
-  confirmation.
+- CA11.2 spec delta written (incl. the occupancy-transition rule); CA11.1
+  currency note added (A5 removed the in-memory checkpoint).
+- Trigger confirmed; first impl attempt preserved + harvest plan recorded.
+- Clean reimplementation pending.

@@ -589,6 +589,22 @@ governed by the CA11 provenance rules with no exception:
   planning is detected at the owner and returned as `E_STALE_AUTHORITY`
   (CA11), forcing repair-then-replan. A pre-seeded page therefore **never
   produces silent wrong movement** — at worst one retry on the rare edit.
+- **Occupancy transition: a pre-seeded scope that becomes a served/commit scope
+  MUST revert entirely to owner authority for that turn.** A pre-seed carries
+  only the lineage-only neighbor closure (no `exits`/live cells); it is correct
+  for a *neighbor* a turn merely reads, but it MUST NOT stand in for a scope the
+  actor now occupies and commits against. A node MUST NOT export a pre-seeded row
+  as a local authority row for an id that is a current served scope (an actor's
+  active scope): that id is fetched fresh from its owner, so the commit-scope
+  open seed and any planning snapshot carry the owner's full row (with `exits`),
+  never the lineage-only pre-seed. Concretely: a pre-seeded `the_deck` lets a
+  turn *entering `the_chatroom`* resolve `the_deck` locally as a neighbor, but
+  once an actor occupies `the_deck` and moves *out* of it, `the_deck` is a served
+  scope and its authority — including `exits` — comes from its owner. (Eviction
+  of the resident pre-seed is NOT required and is forbidden as a churn source;
+  the resident row may remain as a gap-filler for *other* actors who still hold
+  `the_deck` only as a neighbor — it simply must not be *exported as authority*
+  for the occupant.)
 
 **Accepted bounded read-staleness window.** A pure read that is not a
 version-validated commit — for example listing a room's exits in a `look` — MAY
