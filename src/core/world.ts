@@ -87,6 +87,14 @@ type ProjectionApplyOptions = {
   persist?: boolean;
   persistCreated?: boolean;
   transcript?: EffectTranscript;
+  // When set, the cross-host move contents-projection repair (see
+  // applyProjectionWrites) only touches/persists containers this host durably
+  // owns (per the object route table). Object-row writes are already
+  // host-partitioned by the caller; the transcript's moves are not, so this guard
+  // keeps the move-membership repair from persisting a container a non-owner host
+  // merely caches (which the durable repository rejects as "not hosted here").
+  hostKey?: string;
+  gatewayHost?: boolean;
 };
 
 export type ShadowHostApplyResult = {
@@ -6990,6 +6998,53 @@ export class WooWorld {
           break;
       }
     }
+    // Durable contents projection for a CROSS-HOST move. The committing scope can
+    // only mutate (and emit a full-row projection write for) a container it holds
+    // locally; when a move's source/destination container is owned by a FOREIGN
+    // host, no contents row is emitted, so that owner would otherwise never learn
+    // of the incoming/departing member and its `contents` projection drifts
+    // (CA3/CA4: location is authoritative, contents is the derived index). Apply
+    // the authoritative move additively to any container THIS host owns that did
+    // NOT receive a full-row write here — mirroring the transcript-apply path
+    // (applyCommittedShadowTranscriptToHost, world.ts movement block). Containers
+    // that DID get a full row are already correct (mergeScopedProjectionObject
+    // applied the same deltas); the set ops are idempotent so skipping them avoids
+    // double-touch. The write-through (writeThroughProjectionWritesToObjectHosts)
+    // adds these container owners to the fanout so this runs on the right host.
+    if (options.transcript) {
+      const writtenObjectKeys = new Set(writes.filter((write) => write.table === "objects").map((write) => write.key));
+      // Opt-in: only the durable object-host apply path passes `hostKey`, and the
+      // repair only touches containers that host durably OWNS (per the route
+      // table). Gateway/cache callers omit `hostKey` so this is a no-op for them —
+      // they maintain contents through their own projection-cache path and must not
+      // persist a container they merely cache (the repository rejects that as "not
+      // hosted here").
+      const ownsContainer = options.hostKey
+        ? this.transcriptHostPredicates(options.hostKey, options.gatewayHost ?? false).belongsHere
+        : (_id: ObjRef | null | undefined) => false;
+      const touchedContainers = new Set<ObjRef>();
+      for (const move of options.transcript.moves) {
+        if (move.from && move.from !== move.to && !writtenObjectKeys.has(move.from) && ownsContainer(move.from)) {
+          const from = this.objects.get(move.from);
+          if (from && from.contents.delete(move.object)) touchedContainers.add(move.from);
+        }
+        if (!writtenObjectKeys.has(move.to) && ownsContainer(move.to)) {
+          const to = this.objects.get(move.to);
+          if (to && !to.contents.has(move.object)) {
+            to.contents.add(move.object);
+            touchedContainers.add(move.to);
+          }
+        }
+      }
+      for (const id of touchedContainers) {
+        result.objects += 1;
+        // The transcript dirties the moved object's location cell, not the
+        // container's `contents` cell. Force a whole-row save for this repaired
+        // projection or the owner host would update memory but reload stale.
+        if (persist) this.persistProjectionObjectWrite(id, options.transcript, false, true);
+        else this.invalidateProjectionObjectCache(id);
+      }
+    }
     return result;
   }
 
@@ -7030,12 +7085,12 @@ export class WooWorld {
     target.children = children;
   }
 
-  private persistProjectionObjectWrite(id: ObjRef, transcript: EffectTranscript | undefined, created: boolean): void {
+  private persistProjectionObjectWrite(id: ObjRef, transcript: EffectTranscript | undefined, created: boolean, forceWholeObjectDirty = false): void {
     if (!transcript) {
       this.persistObject(id);
       return;
     }
-    let wholeObjectDirty = created;
+    let wholeObjectDirty = created || forceWholeObjectDirty;
     const dirtyProps = new Set<string>();
     for (const create of transcript.creates) {
       if (create.object === id || create.parent === id || create.location === id) wholeObjectDirty = true;
