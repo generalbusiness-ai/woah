@@ -164,11 +164,6 @@ export class CommitScopeDO {
   private relayInitPromise: Promise<ShadowRelayCache> | null = null;
   private fullSavePromise: Promise<void> | null = null;
   private checkpointBuildPromise: Promise<void> | null = null;
-  // P1′ probe: last head seq we scheduled an on-commit checkpoint for, per scope.
-  // In-memory only — a cold DO starts empty, so the first commit after activation
-  // always checkpoints (bounding worst-case cold-replay to one interval). Used by
-  // maybeCheckpointOnCommit when WOO_V2_CHECKPOINT_BOUNDED is on.
-  private readonly lastCheckpointHeadSeqByScope = new Map<ObjRef, number>();
   // Authority-slimming probe (step 1): how the relay for the current request was
   // obtained — "snapshot" (rehydrated from this DO's own durable storage) or
   // "cold_seed" (built from the request's authority/serialized payload). Combined
@@ -1801,14 +1796,19 @@ export class CommitScopeDO {
     });
   }
 
-  // P1′ probe: decide whether this accepted commit should trigger a checkpoint
-  // rebuild. Default (WOO_V2_CHECKPOINT_BOUNDED unset) = checkpoint every commit,
-  // exactly as before. When bounded mode is on, only checkpoint once the head has
-  // advanced WOO_V2_CHECKPOINT_FRAME_INTERVAL frames past the last on-commit
-  // checkpoint; intervening commits rely on the durable accepted-frame tail for
-  // cold catch-up. This isolates the full ~3MB checkpoint rebuild so a
-  // differential CF cpuTime read attributes how much of the per-turn DO CPU it
-  // costs.
+  // Decide whether this accepted commit should trigger a checkpoint rebuild.
+  // Default (WOO_V2_CHECKPOINT_BOUNDED unset) = checkpoint every commit, exactly
+  // as before. When bounded mode is on, only checkpoint once the head has advanced
+  // WOO_V2_CHECKPOINT_FRAME_INTERVAL frames past the LAST PERSISTED checkpoint;
+  // intervening commits rely on the durable accepted-frame tail for cold catch-up
+  // (the tail self-protects — frames are not pruned until a complete checkpoint
+  // covers them, see pruneTailTableByHorizon).
+  //
+  // The gate reads the persisted checkpoint head (completeCheckpointHeadSeq), NOT
+  // an in-memory counter: this DO reconstructs on essentially every turn in
+  // production, so an in-memory "last checkpoint seq" resets constantly and the
+  // gate would never skip. The persisted seq survives reconstruction, so the
+  // interval is honoured across cold activations.
   private maybeCheckpointOnCommit(relay: ShadowRelayCache): void {
     if (!envFlag(this.env.WOO_V2_CHECKPOINT_BOUNDED)) {
       this.scheduleCheckpointBuild(relay, "accepted_commit");
@@ -1817,8 +1817,8 @@ export class CommitScopeDO {
     const scope = relay.commit_scope.scope;
     const headSeq = relay.commit_scope.head.seq;
     const interval = checkpointFrameInterval(this.env.WOO_V2_CHECKPOINT_FRAME_INTERVAL);
-    const last = this.lastCheckpointHeadSeqByScope.get(scope);
-    const due = last === undefined || headSeq - last >= interval;
+    const checkpointedSeq = this.completeCheckpointHeadSeq(scope);
+    const due = checkpointedSeq === null || headSeq - checkpointedSeq >= interval;
     if (!due) {
       this.emitMetric({
         kind: "v2_open_step",
@@ -1832,9 +1832,7 @@ export class CommitScopeDO {
       });
       return;
     }
-    if (this.scheduleCheckpointBuild(relay, "accepted_commit_bounded")) {
-      this.lastCheckpointHeadSeqByScope.set(scope, headSeq);
-    }
+    this.scheduleCheckpointBuild(relay, "accepted_commit_bounded");
   }
 
   private saveMeta(relay: ShadowRelayCache, now: number): void {

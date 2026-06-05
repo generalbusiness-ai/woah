@@ -323,6 +323,37 @@ describe("CommitScopeDO checkpoint/tail open", () => {
     }
   });
 
+  it("P1′ bounded mode: the skip gate survives DO reconstruction (persisted, not in-memory)", async () => {
+    // Regression guard: production CommitScopeDOs reconstruct on ~every turn, so a
+    // gate keyed on an in-memory last-checkpoint seq resets constantly and never
+    // skips. The gate must read the PERSISTED checkpoint head. Here a fresh DO
+    // instance on the SAME storage (a reconstruction) must still skip an
+    // intra-interval commit it never personally checkpointed.
+    const state = new WaitUntilState("scope-a");
+    const objectRow = createWorld().exportObjects(["the_chatroom"])[0]!;
+    const fakeRelay = (seq: number) => ({ commit_scope: { scope: "scope-a" as ObjRef, head: head("scope-a", seq) } });
+    const env = { WOO_INTERNAL_SECRET: SECRET, WOO_V2_CHECKPOINT_BOUNDED: "1", WOO_V2_CHECKPOINT_FRAME_INTERVAL: "3" };
+    try {
+      // First DO instance persists a checkpoint at seq 1. (Construct before seeding
+      // — the constructor creates the v2_commit_scope_* tables.)
+      const first = new CommitScopeDO(state as unknown as DurableObjectState, env) as unknown as { maybeCheckpointOnCommit: (relay: unknown) => void };
+      seedScopeRows(state, "scope-a", head("scope-a", 1), { objects: [objectRow], frames: [accepted("scope-a", 1)] });
+      first.maybeCheckpointOnCommit(fakeRelay(1));
+      await state.drainWaitUntil();
+      expect(checkpointRows(state)).toBe(1);
+      const scheduledByFirst = state.waitUntilPromises.length;
+
+      // A brand-new instance on the same storage = a reconstruction with empty
+      // in-memory state. An intra-interval commit (gap 1 < 3) must still SKIP
+      // because it reads the persisted checkpoint head, not a per-instance counter.
+      const reconstructed = new CommitScopeDO(state as unknown as DurableObjectState, env) as unknown as { maybeCheckpointOnCommit: (relay: unknown) => void };
+      reconstructed.maybeCheckpointOnCommit(fakeRelay(2));
+      expect(state.waitUntilPromises.length).toBe(scheduledByFirst); // no new build scheduled
+    } finally {
+      state.close();
+    }
+  });
+
   it("returns browser-profile checkpoint pages without authority object bodies", async () => {
     const state = new WaitUntilState("scope-a");
     const target = new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: SECRET });
