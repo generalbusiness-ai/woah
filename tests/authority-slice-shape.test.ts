@@ -22,6 +22,7 @@ import {
   buildSerializedAuthorityCellSlice,
   cellProvenanceFromAuthoritySlice,
   combineSerializedAuthoritySlices,
+  filterSerializedAuthoritySlicePages,
   mergeSerializedAuthoritySlice,
   serializedWorldFromAuthoritySlice,
   withAuthorityPageProvenance
@@ -206,6 +207,36 @@ describe("WooWorld.exportAuthoritySlice content contract", () => {
     }
   });
 
+  it("filterSerializedAuthoritySlicePages keeps each referenced object's lineage page even when the predicate drops it", () => {
+    // Repro for the cross-room-move "state page set missing lineage page" failure
+    // (shadow-state-pages.ts:252). A page-granularity filter (the gateway's
+    // owner-only / gap-fill filter, filterRemoteAuthoritySliceForGateway) can admit
+    // a neighbor object's owner-sourced cell page while dropping its non-owner
+    // object_lineage page. A receiver that lacks the object then cannot reconstruct
+    // it. The lineage page MUST co-travel with any kept page of the same object.
+    const room: SerializedObject = { ...objectRecord("the_deck", []), name: "The Deck", parent: "$room", owner: "the_deck" };
+    const slice = buildSerializedAuthorityCellSlice({
+      sessions: [],
+      objects: [room],
+      counters: { objectCounter: 1, parkedTaskCounter: 1, sessionCounter: 1 },
+      pageProvenance: () => ({ source: "authoritative" as const, source_host: "the_deck" })
+    });
+    expect(slice.page_refs.some((ref) => ref.object === "the_deck" && ref.page === "object_lineage")).toBe(true);
+
+    // A predicate that drops the lineage page (e.g. it was non-owner-sourced) but
+    // keeps the object's other pages — exactly the gateway gap-fill shape.
+    const filtered = filterSerializedAuthoritySlicePages(slice, (ref) => ref.page !== "object_lineage");
+    if (filtered.kind === "woo.authority_slice.cells.shadow.v1") {
+      // The filter must re-add the lineage page so the object remains reconstructable.
+      expect(filtered.page_refs.some((ref) => ref.object === "the_deck" && ref.page === "object_lineage")).toBe(true);
+      expect(filtered.page_refs.find((ref) => ref.object === "the_deck" && ref.page === "object_lineage")?.source_host).toBe("the_deck");
+      expect(filtered.page_refs).toEqual([...filtered.page_refs].sort(compareAuthorityRefsForTest));
+    }
+    // Must not throw "state page set missing lineage page for the_deck".
+    const serialized = serializedWorldFromAuthoritySlice(filtered);
+    expect(serialized.objects.find((obj) => obj.id === "the_deck")?.name).toBe("The Deck");
+  });
+
   it("refuses a non-authoritative projection stub from overwriting a named lineage (CA11 symmetric stub guard)", () => {
     // Reverse of stub-repair: when the planning world already holds the resolved
     // identity ("Guest 1", projection) and an equal-rank projection page arrives
@@ -288,4 +319,11 @@ function objectRecord(id: string, contents: string[]): SerializedObject {
     contents,
     eventSchemas: []
   };
+}
+
+function compareAuthorityRefsForTest(
+  a: { object: string; page: string; name?: string },
+  b: { object: string; page: string; name?: string }
+): number {
+  return a.object.localeCompare(b.object) || a.page.localeCompare(b.page) || (a.name ?? "").localeCompare(b.name ?? "");
 }
