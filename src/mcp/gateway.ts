@@ -111,15 +111,13 @@ export type McpV2ClientHooks = {
     }
   ) => Promise<ReturnType<typeof executorAuthorityPayload>>;
   executionCapsuleOpen?: boolean;
-  // When set, same-scope warm envelopes are sent WITHOUT the ~3MB top-level
-  // authority slice (and session_objects). The CommitScopeDO is the authority for
-  // its own scope and rehydrates from its durable snapshot, so a warm/snapshotted
-  // scope never needs the slice; a truly-cold scope replies E_SNAPSHOT_REQUIRED
-  // and submitEnvelope retries with the full body (same path the capsule cold-miss
-  // already uses). Stale foreign cells converge through the existing
-  // read-version-mismatch → cell-page repair loop, not silent trust. Planned
-  // cross-scope commits keep the full slice (their destination is often cold).
-  // See notes/2026-06-05-commit-apply-is-not-the-cost.md.
+  // When set, envelopes are sent WITHOUT the ~3MB top-level authority slice (and
+  // session_objects). The CommitScopeDO is the authority for its own scope and
+  // rehydrates from its durable snapshot, so a warm/snapshotted scope never needs
+  // the slice; a truly-cold scope replies E_SNAPSHOT_REQUIRED and submitEnvelope
+  // retries with the full body (same path the capsule cold-miss already uses).
+  // Stale foreign cells converge through the existing read-version-mismatch →
+  // cell-page repair loop, not silent trust.
   slimWarmEnvelope?: boolean;
 };
 

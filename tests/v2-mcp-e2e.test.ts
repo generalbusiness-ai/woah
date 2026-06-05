@@ -111,7 +111,7 @@ describe("v2 MCP e2e", () => {
     }
   });
 
-  it("slimWarmEnvelope: same-scope warm turns omit the ~3MB authority slice and still converge", async () => {
+  it("slimWarmEnvelope: MCP envelopes omit the ~3MB authority slice and still converge", async () => {
     const metrics: MetricEvent[] = [];
     const world = createWorld({ metricsHook: (event) => metrics.push(event) });
     const env = { WOO_INTERNAL_SECRET: "v2-mcp-secret" };
@@ -158,10 +158,10 @@ describe("v2 MCP e2e", () => {
       const aliceActor = world.sessions.get(alice)?.actor;
       expect(aliceActor).toBeTruthy();
 
-      // Two same-scope turns. The first opens + seeds the durable snapshot; the
-      // second is a warm turn whose envelope must carry NO authority slice yet
-      // still commit (the CommitScopeDO is authoritative for its own scope and
-      // validates against its durable snapshot).
+      // Two same-scope turns. Opening seeds the durable snapshot, so both
+      // envelopes can carry NO authority slice and still commit: the
+      // CommitScopeDO is authoritative for its own scope and validates against
+      // its durable snapshot.
       const first = await mcp(gateway, alice, 2, "tools/call", {
         name: "woo_call",
         arguments: { object: "the_chatroom", verb: "say", args: ["slim one"] }
@@ -182,18 +182,16 @@ describe("v2 MCP e2e", () => {
       const waited = await mcp(gateway, bob, 11, "tools/call", { name: "woo_wait", arguments: { timeout_ms: 1000 } });
       expect(JSON.stringify(waited.result.structuredContent)).toContain("slim two");
 
-      // A scope's FIRST commit (head.seq 0) keeps the full slice to seed in one
-      // round trip; warm repeats (head.seq >= 1) are slimmed. So at least one
-      // envelope to a repeat-committed scope must carry no authority slice and
-      // empty session_objects (while retaining the tiny session rows).
+      // With slimWarmEnvelope enabled, every first-attempt envelope omits the
+      // authority slice and legacy session_objects while retaining the tiny
+      // session rows. True cold misses are covered by the companion reseed test.
       const envelopes = commitPosts.filter((post) => post.path === "/v2/envelope");
       expect(envelopes.length).toBeGreaterThanOrEqual(2);
-      const slimmed = envelopes.filter((post) => !Object.prototype.hasOwnProperty.call(post.body, "authority"));
       expect(
-        slimmed.length,
+        envelopes.every((post) => !Object.prototype.hasOwnProperty.call(post.body, "authority")),
         JSON.stringify(envelopes.map((post) => ({ scope: post.scope, hasAuthority: Object.prototype.hasOwnProperty.call(post.body, "authority") })))
-      ).toBeGreaterThanOrEqual(1);
-      for (const post of slimmed) {
+      ).toBe(true);
+      for (const post of envelopes) {
         expect(post.body.session_objects ?? []).toEqual([]);
         expect(post.body).toHaveProperty("sessions");
       }

@@ -3530,8 +3530,7 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(secondCapsuleScopeEnvelopes[0].body).not.toHaveProperty("serialized");
       // The capsule must NOT carry an authority slice — it is validated by
       // head/scope/actor/session metadata only, and embedding the ~3MB slice
-      // here just doubled the envelope on capsule turns. Regression guard for
-      // the dead-weight removal (notes/2026-06-05-commit-apply-is-not-the-cost.md).
+      // here just doubled the envelope on capsule turns.
       expect(secondCapsuleScopeEnvelopes[0].body.execution_capsule).not.toHaveProperty("authority");
     } finally {
       logSpy.mockRestore();

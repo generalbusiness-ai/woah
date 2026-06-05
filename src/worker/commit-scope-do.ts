@@ -102,8 +102,7 @@ type CommitScopeEnv = InternalAuthEnv & {
   // checkpoint is only a replay accelerator, so skipping it on most commits is
   // safe and lets us measure how much of the per-turn CommitScopeDO cpuTime the
   // full ~3MB checkpoint rebuild accounts for. Default (unset) preserves the
-  // exact prior behavior (checkpoint every commit). See
-  // notes/2026-06-05-commit-apply-is-not-the-cost.md.
+  // exact prior behavior (checkpoint every commit).
   WOO_V2_CHECKPOINT_BOUNDED?: string;
   // Frames between on-commit checkpoints when WOO_V2_CHECKPOINT_BOUNDED is on.
   // Set very high (e.g. 1000000) to measure the floor (effectively never
@@ -491,14 +490,14 @@ export class CommitScopeDO {
           const fanout = reply ? this.fanoutEnvelopes(relay, input.node, reply) : [];
           const responseReply = reply ? this.replyForReceiverProfile(reply, input) : null;
           // P1′ size proxies: hoist the response encodes so we can measure their
-          // size (and stringify the fanout once) without a second serialization.
-          // Lengths are char-count approximations of byte size — accurate enough
-          // to correlate with the synchronous encode CPU the clock can't see.
+          // size without a second serialization. Lengths are char-count
+          // approximations of byte size — accurate enough to correlate with the
+          // synchronous encode CPU the clock can't see.
           const encodedReply = reply ? encodeEnvelope<ShadowEnvelopeReplyBody>(reply as ShadowEnvelope<ShadowEnvelopeReplyBody>) : null;
           const encodedReceiverReply = (responseReply && responseReply !== reply)
             ? encodeEnvelope<ShadowEnvelopeReplyBody>(responseReply as ShadowEnvelope<ShadowEnvelopeReplyBody>)
             : null;
-          const fanoutBytes = fanout.length ? JSON.stringify(fanout).length : 0;
+          const fanoutBytes = fanout.reduce((total, item) => total + item.node.length + item.envelope.length, 0);
           this.emitMetric({
             kind: "v2_envelope",
             scope,

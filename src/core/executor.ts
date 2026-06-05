@@ -69,7 +69,6 @@ export type ExecutionCapsule = {
 // with a capsule throws E_SNAPSHOT_REQUIRED and is re-seeded from the request's
 // top-level authority via the gateway retry. Carrying the ~3MB slice here only
 // doubled the envelope on capsule turns (measured 6.1MB) for bytes nothing reads.
-// See notes/2026-06-05-commit-apply-is-not-the-cost.md.
 
 export type ExecutorCallInput = {
   id?: string;
