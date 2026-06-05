@@ -270,6 +270,59 @@ describe("CommitScopeDO checkpoint/tail open", () => {
     }
   });
 
+  it("P1′ bounded mode: checkpoints only at the frame interval, default mode every commit", async () => {
+    const objectRow = createWorld().exportObjects(["the_chatroom"])[0]!;
+    // A minimal relay shape: maybeCheckpointOnCommit only reads scope + head.seq;
+    // persistScopeCheckpoint rebuilds from the seeded SQL rows, not the relay.
+    const fakeRelay = (seq: number) => ({ commit_scope: { scope: "scope-a" as ObjRef, head: head("scope-a", seq) } });
+
+    // Bounded mode, interval 3.
+    const bounded = new WaitUntilState("scope-a");
+    const boundedTarget = new CommitScopeDO(
+      bounded as unknown as DurableObjectState,
+      { WOO_INTERNAL_SECRET: SECRET, WOO_V2_CHECKPOINT_BOUNDED: "1", WOO_V2_CHECKPOINT_FRAME_INTERVAL: "3" }
+    ) as unknown as { maybeCheckpointOnCommit: (relay: unknown) => void };
+    seedScopeRows(bounded, "scope-a", head("scope-a", 1), { objects: [objectRow], frames: [accepted("scope-a", 1)] });
+    try {
+      // First commit after a cold activation always checkpoints (last seq unknown),
+      // bounding worst-case cold-replay to one interval.
+      boundedTarget.maybeCheckpointOnCommit(fakeRelay(1));
+      expect(bounded.waitUntilPromises.length).toBe(1);
+      await bounded.drainWaitUntil();
+      expect(checkpointRows(bounded)).toBe(1);
+
+      // seq 2 (gap 1) and seq 3 (gap 2) are within the interval → skipped, no new
+      // checkpoint build scheduled. Durability across the skip rests on the
+      // accepted-frame tail that saveEnvelopeDelta persists before this gate.
+      boundedTarget.maybeCheckpointOnCommit(fakeRelay(2));
+      boundedTarget.maybeCheckpointOnCommit(fakeRelay(3));
+      expect(bounded.waitUntilPromises.length).toBe(1);
+
+      // seq 4 (gap 3 >= interval) → checkpoint again.
+      boundedTarget.maybeCheckpointOnCommit(fakeRelay(4));
+      expect(bounded.waitUntilPromises.length).toBe(2);
+    } finally {
+      bounded.close();
+    }
+
+    // Default mode (flag unset) checkpoints on every commit, exactly as before.
+    const def = new WaitUntilState("scope-a");
+    const defTarget = new CommitScopeDO(
+      def as unknown as DurableObjectState,
+      { WOO_INTERNAL_SECRET: SECRET }
+    ) as unknown as { maybeCheckpointOnCommit: (relay: unknown) => void };
+    seedScopeRows(def, "scope-a", head("scope-a", 1), { objects: [objectRow], frames: [accepted("scope-a", 1)] });
+    try {
+      defTarget.maybeCheckpointOnCommit(fakeRelay(1));
+      await def.drainWaitUntil();
+      defTarget.maybeCheckpointOnCommit(fakeRelay(2));
+      defTarget.maybeCheckpointOnCommit(fakeRelay(3));
+      expect(def.waitUntilPromises.length).toBe(3);
+    } finally {
+      def.close();
+    }
+  });
+
   it("returns browser-profile checkpoint pages without authority object bodies", async () => {
     const state = new WaitUntilState("scope-a");
     const target = new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: SECRET });

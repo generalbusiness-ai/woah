@@ -96,6 +96,19 @@ const COMMIT_SCOPE_SNAPSHOT_REPAIR_EPOCH = "commit-scope-catalog-repair-v1";
 
 type CommitScopeEnv = InternalAuthEnv & {
   WOO_AUTO_INSTALL_CATALOGS?: string;
+  // P1′ probe (2026-06-05): when set, on-commit checkpoint builds are gated by a
+  // frame-count threshold instead of running on EVERY accepted commit. The
+  // durable accepted-frame + transcript tail already covers cold catch-up; the
+  // checkpoint is only a replay accelerator, so skipping it on most commits is
+  // safe and lets us measure how much of the per-turn CommitScopeDO cpuTime the
+  // full ~3MB checkpoint rebuild accounts for. Default (unset) preserves the
+  // exact prior behavior (checkpoint every commit). See
+  // notes/2026-06-05-commit-apply-is-not-the-cost.md.
+  WOO_V2_CHECKPOINT_BOUNDED?: string;
+  // Frames between on-commit checkpoints when WOO_V2_CHECKPOINT_BOUNDED is on.
+  // Set very high (e.g. 1000000) to measure the floor (effectively never
+  // checkpoint on commit); set to a sane value (e.g. 32) as the actual fix.
+  WOO_V2_CHECKPOINT_FRAME_INTERVAL?: string;
 };
 
 type PersistedCheckpointPageRef = {
@@ -147,6 +160,11 @@ export class CommitScopeDO {
   private relayInitPromise: Promise<ShadowRelayCache> | null = null;
   private fullSavePromise: Promise<void> | null = null;
   private checkpointBuildPromise: Promise<void> | null = null;
+  // P1′ probe: last head seq we scheduled an on-commit checkpoint for, per scope.
+  // In-memory only — a cold DO starts empty, so the first commit after activation
+  // always checkpoints (bounding worst-case cold-replay to one interval). Used by
+  // maybeCheckpointOnCommit when WOO_V2_CHECKPOINT_BOUNDED is on.
+  private readonly lastCheckpointHeadSeqByScope = new Map<ObjRef, number>();
 
   constructor(
     private readonly state: CommitScopeDurableState,
@@ -421,6 +439,9 @@ export class CommitScopeDO {
         let node: string | undefined;
         let fullSave = false;
         let tailStats: CommitScopeTailStats | null = null;
+        // P1′ size proxy: request body bytes from the header (clock-free; the
+        // in-DO performance.now() cannot see synchronous parse/serialize CPU).
+        const requestBytes = Number(request.headers.get("content-length") ?? 0) || 0;
         try {
           await verifyInternalRequest(this.env, request);
           const input = await readJson<CommitScopeEnvelopeRequest>(request);
@@ -456,6 +477,15 @@ export class CommitScopeDO {
           });
           const fanout = reply ? this.fanoutEnvelopes(relay, input.node, reply) : [];
           const responseReply = reply ? this.replyForReceiverProfile(reply, input) : null;
+          // P1′ size proxies: hoist the response encodes so we can measure their
+          // size (and stringify the fanout once) without a second serialization.
+          // Lengths are char-count approximations of byte size — accurate enough
+          // to correlate with the synchronous encode CPU the clock can't see.
+          const encodedReply = reply ? encodeEnvelope<ShadowEnvelopeReplyBody>(reply as ShadowEnvelope<ShadowEnvelopeReplyBody>) : null;
+          const encodedReceiverReply = (responseReply && responseReply !== reply)
+            ? encodeEnvelope<ShadowEnvelopeReplyBody>(responseReply as ShadowEnvelope<ShadowEnvelopeReplyBody>)
+            : null;
+          const fanoutBytes = fanout.length ? JSON.stringify(fanout).length : 0;
           this.emitMetric({
             kind: "v2_envelope",
             scope,
@@ -466,6 +496,10 @@ export class CommitScopeDO {
             reply: shadowReplyMetricKind(reply),
             fanout: fanout.length,
             full_save: fullSave,
+            request_bytes: requestBytes,
+            reply_bytes: encodedReply?.length ?? 0,
+            receiver_reply_bytes: encodedReceiverReply?.length ?? 0,
+            fanout_bytes: fanoutBytes,
             ...(tailStats ? {
               tail_rows_written: tailStats.rowsWritten,
               tail_bytes_retained: tailStats.bytesRetained,
@@ -475,9 +509,9 @@ export class CommitScopeDO {
           this.emitShadowCommitMetric(reply, node, fanout.length);
           return jsonResponse({
             ok: true,
-            reply: reply ? encodeEnvelope<ShadowEnvelopeReplyBody>(reply as ShadowEnvelope<ShadowEnvelopeReplyBody>) : null,
-            ...(responseReply && responseReply !== reply ? {
-              receiver_reply: encodeEnvelope<ShadowEnvelopeReplyBody>(responseReply as ShadowEnvelope<ShadowEnvelopeReplyBody>)
+            reply: encodedReply,
+            ...(encodedReceiverReply ? {
+              receiver_reply: encodedReceiverReply
             } : {}),
             head: relay.commit_scope.head,
             fanout
@@ -1711,9 +1745,45 @@ export class CommitScopeDO {
         accepted_frames_retained: tailStats.value.acceptedFramesRetained,
         transcript_tail_retained: tailStats.value.transcriptTailRetained
       });
-      this.scheduleCheckpointBuild(relay, "accepted_commit");
+      this.maybeCheckpointOnCommit(relay);
     }
     return tailStats.value;
+  }
+
+  // P1′ probe: decide whether this accepted commit should trigger a checkpoint
+  // rebuild. Default (WOO_V2_CHECKPOINT_BOUNDED unset) = checkpoint every commit,
+  // exactly as before. When bounded mode is on, only checkpoint once the head has
+  // advanced WOO_V2_CHECKPOINT_FRAME_INTERVAL frames past the last on-commit
+  // checkpoint; intervening commits rely on the durable accepted-frame tail for
+  // cold catch-up. This isolates the full ~3MB checkpoint rebuild so a
+  // differential CF cpuTime read attributes how much of the per-turn DO CPU it
+  // costs.
+  private maybeCheckpointOnCommit(relay: ShadowRelayCache): void {
+    if (!envFlag(this.env.WOO_V2_CHECKPOINT_BOUNDED)) {
+      this.scheduleCheckpointBuild(relay, "accepted_commit");
+      return;
+    }
+    const scope = relay.commit_scope.scope;
+    const headSeq = relay.commit_scope.head.seq;
+    const interval = checkpointFrameInterval(this.env.WOO_V2_CHECKPOINT_FRAME_INTERVAL);
+    const last = this.lastCheckpointHeadSeqByScope.get(scope);
+    const due = last === undefined || headSeq - last >= interval;
+    if (!due) {
+      this.emitMetric({
+        kind: "v2_open_step",
+        phase: "checkpoint_build",
+        scope,
+        reason: "accepted_commit_bounded_skip",
+        ms: 0,
+        status: "ok",
+        count: 0,
+        bytes: 0
+      });
+      return;
+    }
+    if (this.scheduleCheckpointBuild(relay, "accepted_commit_bounded")) {
+      this.lastCheckpointHeadSeqByScope.set(scope, headSeq);
+    }
   }
 
   private saveMeta(relay: ShadowRelayCache, now: number): void {
@@ -2276,6 +2346,17 @@ function boundedPositiveInteger(value: unknown, fallback: number, max: number): 
   return typeof value === "number" && Number.isInteger(value) && value > 0
     ? Math.min(value, max)
     : fallback;
+}
+
+function envFlag(value: string | undefined): boolean {
+  return /^(1|true|yes|on)$/i.test((value ?? "").trim());
+}
+
+// P1′ probe: frames between on-commit checkpoints under WOO_V2_CHECKPOINT_BOUNDED.
+const CHECKPOINT_FRAME_INTERVAL_DEFAULT = 32;
+function checkpointFrameInterval(value: string | undefined): number {
+  const raw = Number((value ?? "").trim());
+  return Number.isInteger(raw) && raw > 0 ? raw : CHECKPOINT_FRAME_INTERVAL_DEFAULT;
 }
 
 function jsonByteLength(value: unknown): number {
