@@ -771,6 +771,41 @@ describe("v2 Worker fan-out helpers", () => {
     }
   });
 
+  it("returns snapshot-required for a slim envelope (no authority, no capsule) on a cold scope", async () => {
+    // The slim warm-envelope path sends NO top-level authority. A scope that has
+    // never persisted a snapshot cannot seed from such a body, so it must reply
+    // E_SNAPSHOT_REQUIRED — the signal the gateway retries on (reseed + full body).
+    const secret = "cf-test-secret";
+    const state = new FakeDurableObjectState("#cold-slim");
+    const target = new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: secret });
+    try {
+      const request = await signInternalRequest({ WOO_INTERNAL_SECRET: secret }, new Request("https://woo.internal/v2/envelope", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          scope: "#cold-slim",
+          node: "mcp:cold-slim-test",
+          token: "token:cold-slim-test",
+          session: "session:cold-slim-test",
+          actor: "guest_1",
+          sessions: [],
+          session_objects: [],
+          // no authority, no execution_capsule — the slim shape.
+          envelope: "not-read-before-relay-init"
+        })
+      }));
+      const response = await target.fetch(request);
+      expect(response.ok).toBe(false);
+      const body = await response.json() as { error?: { code?: string; message?: string } };
+      expect(body.error).toMatchObject({
+        code: "E_SNAPSHOT_REQUIRED",
+        message: expect.stringContaining("no durable snapshot")
+      });
+    } finally {
+      state.close();
+    }
+  });
+
   it("serves Worker state-transfer fan-out as a patch from the socket's last known head", async () => {
     const secret = "cf-test-secret";
     const state = new FakeDurableObjectState("the_dubspace");

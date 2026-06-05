@@ -111,7 +111,27 @@ export type McpV2ClientHooks = {
     }
   ) => Promise<ReturnType<typeof executorAuthorityPayload>>;
   executionCapsuleOpen?: boolean;
+  // When set, same-scope warm envelopes are sent WITHOUT the ~3MB top-level
+  // authority slice (and session_objects). The CommitScopeDO is the authority for
+  // its own scope and rehydrates from its durable snapshot, so a warm/snapshotted
+  // scope never needs the slice; a truly-cold scope replies E_SNAPSHOT_REQUIRED
+  // and submitEnvelope retries with the full body (same path the capsule cold-miss
+  // already uses). Stale foreign cells converge through the existing
+  // read-version-mismatch → cell-page repair loop, not silent trust. Planned
+  // cross-scope commits keep the full slice (their destination is often cold).
+  // See notes/2026-06-05-commit-apply-is-not-the-cost.md.
+  slimWarmEnvelope?: boolean;
 };
+
+// Strip the ~3MB authority slice (and legacy session_objects) from an envelope
+// body for the slim warm path. Keeps scope/session identity, the tiny session
+// rows, the (authority-free) execution capsule, and the envelope itself.
+function slimMcpEnvelopeBody(body: McpV2EnvelopeBody): McpV2EnvelopeBody {
+  const { authority, session_objects, ...rest } = body;
+  void authority;
+  void session_objects;
+  return { ...rest, session_objects: [] };
+}
 
 export type McpV2OpenBody = {
   scope: ObjRef;
@@ -144,6 +164,7 @@ export type McpV2EnvelopeBody = {
   authority?: SerializedAuthoritySlice;
   execution_capsule?: ExecutionCapsule;
   envelope: string;
+  planned_transcript_commit?: boolean;
 };
 
 export type McpV2EnvelopeResult = {
@@ -788,10 +809,20 @@ export class McpGateway {
           target,
           verb
         ));
+        // Slim same-scope warm turns: send without the ~3MB authority slice. Planned
+        // cross-scope commits keep it (their destination scope is often cold and
+        // benefits from seeding in one round trip). The full body (envelopeBody) is
+        // retained for the E_SNAPSHOT_REQUIRED retry below.
+        const slim = hooks.slimWarmEnvelope === true && !envelopeBody.planned_transcript_commit;
+        const firstBody = slim ? slimMcpEnvelopeBody(envelopeBody) : envelopeBody;
+        // A cold scope cannot seed from a slimmed body (no authority) nor from a
+        // capsule body (capsule carries no slice), so both modes must be able to
+        // re-seed and retry with the full body on E_SNAPSHOT_REQUIRED.
+        const reseedEligible = slim || hooks.executionCapsuleOpen === true;
         try {
-          return await hooks.envelope(submitScope, envelopeBody, { timing: context.timing });
+          return await hooks.envelope(submitScope, firstBody, { timing: context.timing });
         } catch (err) {
-          if (!hooks.executionCapsuleOpen || !isV2CommitScopeSnapshotRequiredError(err)) throw err;
+          if (!reseedEligible || !isV2CommitScopeSnapshotRequiredError(err)) throw err;
           const client = this.v2Scopes.get(submitScope);
           if (!client) throw err;
           client.openedSessions.delete(entry.woo.id);
@@ -802,8 +833,15 @@ export class McpGateway {
             timing: context.timing,
             timingLabelPrefix: "submit.snapshot_retry"
           });
+          // Retry with the FULL body (authority retained), capsule stripped — the
+          // re-seed established the durable snapshot, so the cold-miss is resolved.
           const { execution_capsule, ...legacyBody } = envelopeBody;
           void execution_capsule;
+          this.world.recordMetric({
+            kind: "mcp_envelope_slim_reseed",
+            scope: submitScope,
+            mode: slim ? "slim" : "capsule"
+          });
           return await context.timing.time("submit", "mcp.snapshot_retry_envelope_rpc", () => hooks.envelope(submitScope, legacyBody, { timing: context.timing }));
         }
       },

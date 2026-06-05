@@ -111,6 +111,97 @@ describe("v2 MCP e2e", () => {
     }
   });
 
+  it("slimWarmEnvelope: same-scope warm turns omit the ~3MB authority slice and still converge", async () => {
+    const metrics: MetricEvent[] = [];
+    const world = createWorld({ metricsHook: (event) => metrics.push(event) });
+    const env = { WOO_INTERNAL_SECRET: "v2-mcp-secret" };
+    const scopeStates = new Map<ObjRef, FakeDurableObjectState>();
+    const scopes = new Map<ObjRef, CommitScopeDO>();
+    const commitPosts: Array<{ scope: ObjRef; path: "/v2/open" | "/v2/envelope"; body: Record<string, unknown> }> = [];
+    const stateFor = (commitScope: ObjRef): FakeDurableObjectState => {
+      let state = scopeStates.get(commitScope);
+      if (!state) {
+        state = new FakeDurableObjectState(commitScope);
+        scopeStates.set(commitScope, state);
+      }
+      return state;
+    };
+    const scopeFor = (commitScope: ObjRef): CommitScopeDO => {
+      let scope = scopes.get(commitScope);
+      if (!scope) {
+        scope = new CommitScopeDO(stateFor(commitScope) as unknown as ConstructorParameters<typeof CommitScopeDO>[0], env);
+        scopes.set(commitScope, scope);
+      }
+      return scope;
+    };
+    const gateway = new McpGateway(world, {
+      v2: {
+        slimWarmEnvelope: true,
+        authorityPayload: async (extraObjectIds) => {
+          const payload = executorAuthorityPayload(world, extraObjectIds);
+          return { ...payload, sessions: [], authority: { ...payload.authority, sessions: [] } };
+        },
+        open: async (commitScope, body) => {
+          commitPosts.push({ scope: commitScope, path: "/v2/open", body: body as unknown as Record<string, unknown> });
+          return await postCommitScope(scopeFor(commitScope), env, commitScope, "/v2/open", body);
+        },
+        envelope: async (commitScope, body) => {
+          commitPosts.push({ scope: commitScope, path: "/v2/envelope", body: body as unknown as Record<string, unknown> });
+          return await postCommitScope<McpV2EnvelopeResult>(scopeFor(commitScope), env, commitScope, "/v2/envelope", body);
+        }
+      }
+    });
+
+    try {
+      const alice = await initializeMcp(gateway, "guest:v2-mcp-slim-alice", 1);
+      const bob = await initializeMcp(gateway, "guest:v2-mcp-slim-bob", 10);
+      const aliceActor = world.sessions.get(alice)?.actor;
+      expect(aliceActor).toBeTruthy();
+
+      // Two same-scope turns. The first opens + seeds the durable snapshot; the
+      // second is a warm turn whose envelope must carry NO authority slice yet
+      // still commit (the CommitScopeDO is authoritative for its own scope and
+      // validates against its durable snapshot).
+      const first = await mcp(gateway, alice, 2, "tools/call", {
+        name: "woo_call",
+        arguments: { object: "the_chatroom", verb: "say", args: ["slim one"] }
+      });
+      expect(first.result.isError, JSON.stringify(first.result.structuredContent)).not.toBe(true);
+      const second = await mcp(gateway, alice, 3, "tools/call", {
+        name: "woo_call",
+        arguments: { object: "the_chatroom", verb: "say", args: ["slim two"] }
+      });
+      expect(second.result.isError, JSON.stringify(second.result.structuredContent)).not.toBe(true);
+      // Second turn's observation reflects the committed state — proves the DO
+      // converged on the slim path without the gateway pushing authority.
+      expect(second.result.structuredContent.observations).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: "said", text: expect.stringContaining("slim two") })
+      ]));
+
+      // Peer fanout still works on the slim path: bob sees alice's say.
+      const waited = await mcp(gateway, bob, 11, "tools/call", { name: "woo_wait", arguments: { timeout_ms: 1000 } });
+      expect(JSON.stringify(waited.result.structuredContent)).toContain("slim two");
+
+      // Every same-scope (non-planned) envelope must be slimmed: no authority
+      // slice, empty session_objects. (say is same-scope, never planned.)
+      const envelopes = commitPosts.filter((post) => post.path === "/v2/envelope");
+      expect(envelopes.length).toBeGreaterThanOrEqual(2);
+      for (const post of envelopes) {
+        expect(post.body, JSON.stringify(Object.keys(post.body))).not.toHaveProperty("authority");
+        expect(post.body.session_objects ?? []).toEqual([]);
+        // The tiny session rows are retained for auth refresh.
+        expect(post.body).toHaveProperty("sessions");
+      }
+      // Convergence on the slim path is proven above: the second turn's
+      // observation reflects committed state and bob (a peer) received it via the
+      // DO's fanout — all without the gateway pushing the authority slice. (`say`
+      // is a live verb, so there is no durable accepted frame to count; the
+      // companion cold-reseed test below exercises the durable commit retry.)
+    } finally {
+      for (const state of scopeStates.values()) state.close();
+    }
+  });
+
   it("opens cross-scope planned-transcript commit scopes before building the envelope when capsule open is enabled", async () => {
     const metrics: MetricEvent[] = [];
     const world = createWorld({ metricsHook: (event) => metrics.push(event) });
