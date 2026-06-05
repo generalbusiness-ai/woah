@@ -484,6 +484,15 @@ export class PersistentObjectDO {
   private publishedRoutes = new Map<ObjRef, string>();
   private routesRegistered = false;
   private mcpGateway: McpGateway | null = null;
+  // CA11.2: the bounded scope-topology closure this MCP gateway shard pre-seeded
+  // into its cold world (one-hop neighbor-room lineage + shared catalog-class
+  // chain for its served scopes). The export path stamps these ids
+  // owner-deferring (projection, real owner host) so a seeded page is never
+  // trusted as write-authority and an owner row always displaces it (CA11
+  // precedence). Set on cold-load of a gateway shard; null on a non-shard host
+  // or before the shard world is built. Lives on the DO instance because the
+  // export runs on the same instance and the seed is per-shard, not per-turn.
+  private mcpScopeTopologySeed: { seededIds: Set<ObjRef>; ownerHostById: Map<ObjRef, string> } | null = null;
   // Gateway-owned REST relays mirror the browser/MCP open-once shape. Keep a
   // bounded per-DO LRU so agents that touch many scopes do not retain full
   // serialized snapshots for the lifetime of a hot Durable Object instance.
@@ -1854,7 +1863,11 @@ export class PersistentObjectDO {
     // just to rebind queues.
     const startedAt = Date.now();
     const sessions = await this.loadMcpGatewayShardSessions(hostKey);
-    const snapshot = mcpGatewayShardSerializedWorld(sessions);
+    const { world: snapshot, topologySeed } = mcpGatewayShardSerializedWorld(sessions);
+    // Record the CA11.2 seeded-topology ids for the export path's owner-deferring
+    // provenance stamp. Held on the DO instance because the export runs here and
+    // the seed is per-shard, not per-turn.
+    this.mcpScopeTopologySeed = topologySeed.seededIds.size > 0 ? topologySeed : null;
     this.emitMetric({
       kind: "startup_storage",
       phase: "mcp_gateway_snapshot_fetch",
@@ -1865,6 +1878,63 @@ export class PersistentObjectDO {
       source: "directory"
     }, hostKey);
     return createWorldFromSerialized(snapshot, { repository: this.repo, metricsHook, persist: false });
+  }
+
+  // CA11.2: lazily merge the bounded one-hop topology closure for any served
+  // scope among `scopes` into this gateway shard's live world, and record the
+  // seeded ids (with their real owner host) so the authority export stamps them
+  // owner-deferring. Idempotent: the world merge skips ids already resident and
+  // we union into the existing seed set, so repeated turns never re-clobber or
+  // grow unbounded (the closure is bounded by served-scope × exit fan-degree).
+  // This runs scope-driven (per turn) rather than only at cold-load because a
+  // shard's served scope is often unknown at cold-load — the cold world is
+  // built from Directory session rows before any session has an active scope.
+  private ensureMcpScopeTopologySeed(world: WooWorld, scopes: readonly ObjRef[], servedScopeIds: ReadonlySet<ObjRef>): void {
+    // No eviction. A pre-seeded NEIGHBOR that later becomes a served/commit scope
+    // is handled at the authority boundary instead — it is excluded from local
+    // authority export and its owner-authoritative row is force-fetched (not
+    // refresh-suppressed) so it displaces the seeded page by CA11 precedence
+    // (CA11.2 occupancy-transition rule). Mutating the resident world per turn
+    // (the earlier seed/evict approach) thrashed; a resident lineage-only row is
+    // harmless as a gap-filler for OTHER actors that hold it only as a neighbor,
+    // because the export never stamps it authoritative.
+    const topology = mcpGatewayBundledScopeTopologyObjects();
+    const servedTopologyScopes = scopes.filter((id) => topology.byScope.has(id));
+    if (servedTopologyScopes.length === 0) return;
+    const seed = mcpGatewayScopeTopologySeed(servedTopologyScopes);
+    // Never seed a scope that is itself a served scope as a lineage-only
+    // neighbor: it is a commit scope whose dynamic authority (exits/next_seq)
+    // must come from its owner. Such ids are also excluded from local export and
+    // from refresh suppression, so their owner-authoritative row is fetched and
+    // used. A row may be a neighbor-of-A and a served-scope-of-B across
+    // concurrent sessions on a shard; served-scope wins.
+    const seedObjects = seed.objects.filter((row) => !servedScopeIds.has(row.id));
+    if (seedObjects.length === 0) return;
+    const added = world.mergeTopologySeedObjects(seedObjects);
+    if (added.size === 0 && this.mcpScopeTopologySeed) {
+      // Nothing newly added (already resident from a prior turn), but ensure the
+      // provenance record still covers these ids so a re-built world's export
+      // continues to stamp them owner-deferring.
+      for (const id of seed.seededIds) {
+        if (!this.mcpScopeTopologySeed.seededIds.has(id) && world.objects.has(id)) {
+          this.mcpScopeTopologySeed.seededIds.add(id);
+          this.mcpScopeTopologySeed.ownerHostById.set(id, seed.ownerHostById.get(id) ?? WORLD_HOST);
+        }
+      }
+      return;
+    }
+    if (added.size === 0) return;
+    const record = this.mcpScopeTopologySeed ?? { seededIds: new Set<ObjRef>(), ownerHostById: new Map<ObjRef, string>() };
+    for (const id of added) {
+      record.seededIds.add(id);
+      record.ownerHostById.set(id, seed.ownerHostById.get(id) ?? WORLD_HOST);
+    }
+    this.mcpScopeTopologySeed = record;
+    world.recordMetric({
+      kind: "scope_topology_seed",
+      scopes: servedTopologyScopes.length,
+      seeded: added.size
+    });
   }
 
   private async loadMcpGatewayShardSessions(hostKey: string): Promise<DirectorySerializedSession[]> {
@@ -3389,6 +3459,7 @@ export class PersistentObjectDO {
           throw err;
         }
         this.world = null;
+        this.mcpScopeTopologySeed = null;
         this.routesRegistered = false;
         this.publishedRoutes.clear();
         this.routeCache.clear();
@@ -4798,9 +4869,37 @@ export class PersistentObjectDO {
     // over the projection cache to restore warm-hit latency is a separate,
     // deploy-measured step; correctness here rests on full reconstruction.
     const requestedIds = ids;
+    // CA11.2: a scope the actor actually OCCUPIES (its current location, the
+    // reconstruction/commit scope) is NOT a quasi-static neighbor — it is the
+    // commit scope whose dynamic authority (next_seq/subscribers/exits) must come
+    // from its owner. Such a scope must never be seeded as a lineage-only neighbor
+    // page nor have its owner refresh suppressed; otherwise a move OUT of it reads
+    // a stale lineage-only row with no `exits` and silently fails ("can't go that
+    // way"). The served-scope set is `session.activeScope` (the durable routing
+    // truth on sparse MCP shards) plus the explicit reconstruction/commit scope —
+    // deliberately NOT `actor.location`, which is known to lag activeScope on
+    // these shards. It is excluded from the seed, from local authority export,
+    // and from the seed-driven byHost suppression below.
+    const servedScopeIds = new Set<ObjRef>();
+    if (mcpGatewayShard) {
+      if (reconstructionScope && reconstructionScope !== "$nowhere") servedScopeIds.add(reconstructionScope);
+      for (const session of world.sessions.values()) {
+        if (session.activeScope) servedScopeIds.add(session.activeScope);
+      }
+    }
+    // Ensure the bounded one-hop topology closure for the scopes this turn
+    // touches is resident locally before classification, so a served scope's
+    // neighbor rooms (an exit destination reached from a served scope's exit) resolve
+    // locally instead of partitioning to a cross-host authority fetch. Seeding
+    // is lazy and scope-driven (not only cold-load) because a shard's served
+    // scope often becomes known only after the actor enters it. The merge never
+    // overwrites a resident row, and the export stamps the seeded ids
+    // owner-deferring (projection), so this can only ADD quasi-static neighbor
+    // lineage, never displace owner authority.
+    if (mcpGatewayShard) this.ensureMcpScopeTopologySeed(world, requestedIds, servedScopeIds);
     const localActorAuthorityRoots = localActorAuthorityRootIds(world, requestedIds, { sessionActorsOnly: mcpGatewayShard });
     const local = mcpGatewayShard
-      ? mcpGatewayLocalAuthorityPayload(world, requestedIds, localActorAuthorityRoots)
+      ? mcpGatewayLocalAuthorityPayload(world, requestedIds, localActorAuthorityRoots, this.mcpScopeTopologySeed, servedScopeIds)
       : executorAuthorityPayload(world, requestedIds);
     const localObjectIds = authoritySliceObjectIds(local.authority);
     const preservedObjectIds = new Set<ObjRef>(localObjectIds);
@@ -4849,13 +4948,47 @@ export class PersistentObjectDO {
       return await this.resolveObjectHostForWorld(null, id, fallbackHost);
     };
 
-    const resolvedIds = await Promise.all(requestedIds.map(async (id) => [id, await resolveHost(id, WORLD_HOST)] as const));
+    // CA11.2: a pre-seeded topology id is owner-deferring quasi-static lineage
+    // that we DELIBERATELY do not refresh per turn — that synchronous cross-host
+    // authority-slice is exactly the cost the pre-seed removes. It is repaired on
+    // the next move's commit-time read-dependency validation at the owner (which
+    // returns E_STALE_AUTHORITY / read-version on a topology edit), and an
+    // owner-authoritative row, when it arrives by any path, displaces the seeded
+    // page by CA11 precedence. So exclude seeded ids from the remote partition;
+    // the accepted CA6 read-staleness window is the only observable effect.
+    const seededTopologyIds = mcpGatewayShard && this.mcpScopeTopologySeed ? this.mcpScopeTopologySeed.seededIds : null;
+    const resolvedIds = await Promise.all(requestedIds.map(async (id) => {
+      // Suppress the remote refresh only for a pure pre-seeded NEIGHBOR. A served
+      // scope (an actor's active scope / the commit scope) is excluded from
+      // suppression so its owner-authoritative row (with live exits/next_seq) is
+      // fetched and displaces the seeded lineage-only page by CA11 precedence.
+      if (seededTopologyIds?.has(id) && world.objects.has(id) && !servedScopeIds.has(id)) return [id, localHost] as const;
+      return [id, await resolveHost(id, WORLD_HOST)] as const;
+    }));
     const byHost = new Map<string, Set<ObjRef>>();
     for (const [id, host] of resolvedIds) {
       if (!host || host === localHost) continue;
       const list = byHost.get(host) ?? new Set<ObjRef>();
       list.add(id);
       byHost.set(host, list);
+    }
+    // CA11.2 instrumentation: record which object ids could NOT be resolved
+    // locally and were partitioned to a remote owner. This fires whether the
+    // remote resolution is a real authority-slice RPC or a snapshot-fallback
+    // (`useCommitScopeSnapshotForRemoteAuthority`), so the topology pre-seed's
+    // conformance #1 ("a cold turn resolves its one-hop neighbor lineage
+    // locally and performs NO cross-host authority-slice for those neighbors")
+    // is testable by the presence of a neighbor id in this partition. Without
+    // this, the cf-local in-process harness masks the cost: the snapshot
+    // fallback never issues the wire RPC that prod pays on a cold owner.
+    for (const [host, objects] of byHost) {
+      world.recordMetric({
+        kind: "authority_slice_partition",
+        host,
+        reason: reconstructionReason,
+        object_count: objects.size,
+        objects: Array.from(objects).sort()
+      });
     }
     // Remote authority-slice fetches can time out on cold satellites. Per-turn
     // refreshes already have a CommitScopeDO snapshot behind them, but relying
@@ -6681,7 +6814,9 @@ function localActorAuthorityRootIds(world: WooWorld, explicitIds: readonly ObjRe
 function mcpGatewayLocalAuthorityPayload(
   world: WooWorld,
   explicitIds: readonly ObjRef[],
-  actorRoots: ReadonlySet<ObjRef>
+  actorRoots: ReadonlySet<ObjRef>,
+  topologySeed: ScopeTopologySeedInfo | null = null,
+  servedScopeIds: ReadonlySet<ObjRef> = new Set()
 ): ExecutorAuthorityPayload {
   const localIds = new Set<ObjRef>();
   for (const id of explicitIds) {
@@ -6689,15 +6824,48 @@ function mcpGatewayLocalAuthorityPayload(
     // identity/name/property cells. They are patched below as live/projection
     // support; the explicit actor root must still resolve through Directory.
     if (actorRoots.has(id)) continue;
+    // CA11.2 occupancy transition: a pre-seeded neighbor that is now a SERVED
+    // scope (an actor's active scope / the commit scope) must NOT be exported as
+    // a local row. Its lineage-only seed has no `exits`/live cells; exporting it
+    // would seed the relay/commit-scope open snapshot with an exits-less row and
+    // break a move OUT of that scope. Skipping it from localIds (paired with the
+    // byHost force-fetch of served scopes) ensures the owner's authoritative,
+    // exits-bearing row is the only copy of this scope in the slice.
+    if (topologySeed?.seededIds.has(id) && servedScopeIds.has(id)) continue;
     // Bootstrap actor/thing support rows are deliberately resident on every
     // MCP shard. Scope/room rows are not: their catalog lineage belongs to the
     // owner slice, and exporting a stale local stub before owner repair is the
     // dangling_parent_ref storm this path is designed to avoid.
+    //
+    // CA11.2 exception: a one-hop neighbor room (an exit destination) whose lineage
+    // chain was pre-seeded now passes localObjectLineageIsComplete and enters
+    // localIds. That is intentional — it is the whole point of the topology
+    // seed — but its pages MUST be exported owner-deferring (projection), NOT
+    // authoritative. The export below stamps every genuinely-resident row
+    // authoritative (world.ts exportAuthoritySlice), so we re-stamp the seeded
+    // ids afterward.
     if (id.startsWith("$") && world.objects.has(id)) localIds.add(id);
     else if (localObjectLineageIsComplete(world, id)) localIds.add(id);
   }
   const sessions = world.exportSessions();
-  const authority = world.exportAuthoritySlice([], localIds);
+  const exported = world.exportAuthoritySlice([], localIds);
+  // CA11.2 owner-deferring provenance. exportAuthoritySlice stamps every page
+  // `authoritative` because, for genuinely-resident rows, the exporting world
+  // is the authority. But the pre-seeded topology rows are NOT this node's
+  // authority — they are bounded copies of another owner's quasi-static lineage.
+  // Re-stamp every seeded id's pages `projection` with the REAL owner host, so
+  // (a) by CA11 precedence an owner-authoritative row always displaces a seeded
+  // page and a seeded page never displaces an owner row, and (b)
+  // filterRemoteAuthoritySliceForGateway / the VM read path never trust a seeded
+  // page as a write-authority source. A seeded row stamped `authoritative` would
+  // reintroduce exactly the sparse-stub-overwrites-real-scope hazard the
+  // MCP_GATEWAY_ACTOR_SUPPORT_ROOTS guard prevents.
+  const authority = topologySeed && topologySeed.seededIds.size > 0
+    ? withAuthorityPageProvenance(exported, (ref) =>
+        topologySeed.seededIds.has(ref.object)
+          ? { source: "projection", source_host: topologySeed.ownerHostById.get(ref.object) ?? WORLD_HOST }
+          : null)
+    : exported;
   return {
     sessions,
     session_objects: [],
@@ -6781,7 +6949,211 @@ function mcpGatewayActorSupportObjects(): SerializedObject[] {
   return mcpGatewayActorSupportObjectsCache.map((obj) => structuredClone(obj) as SerializedObject);
 }
 
-function mcpGatewayShardSerializedWorld(sessions: readonly DirectorySerializedSession[]): SerializedWorld {
+// CA11.2 quasi-static topology pre-seeding (spec/protocol/cell-authority.md).
+//
+// The bounded one-hop topology closure of every served-scope candidate in the
+// bundled world, computed ONCE and cached. A served scope's `enter`/move turn
+// reads the exit's `dest` and runs `dest:acceptable`/`dest:enterfunc`, which
+// require the one-hop destination room's LINEAGE to be resolvable locally. On a
+// cold gateway the destination is absent and its catalog-class chain
+// ($chatroom/$room/$space/...) is NOT in the universal actor-support set (that
+// set is deliberately kept to $actor/$thing — see MCP_GATEWAY_ACTOR_SUPPORT_ROOTS).
+// So the planning authority refresh partitions the destination to its owner host
+// (the measured ~2.8s cross-host authority-slice on a cold move). Pre-seeding the
+// destination's lineage + the shared class chain makes localObjectLineageIsComplete
+// resolve it locally; the export path stamps these rows owner-deferring
+// (projection) so they are never trusted as write-authority (STEP 3).
+//
+// GENERIC, never a hardcoded room list: a served-scope candidate is any non-`$`
+// object carrying a non-empty `exits` map. The closure for a scope is bounded by
+// its exit fan-degree — the exit objects it names, their one-hop destination
+// rooms, and those rooms' lineage chains to the top. Never transitive (the
+// destination's OWN exits/contents/verbs are not pulled), never global.
+type ScopeTopologyClosure = {
+  // Per served-scope id: the closure rows (exit objects + one-hop destination
+  // room lineage). The caller selects only the scopes its shard serves.
+  byScope: Map<ObjRef, SerializedObject[]>;
+  // The shared catalog-class chain rows (e.g. $chatroom/$room/$space/...),
+  // lineage-only, that every destination room's parent walk needs. Seeded once
+  // per shard regardless of which served scopes are present.
+  classChain: SerializedObject[];
+  // Real owner host of every seeded id, for owner-deferring provenance
+  // (source_host) at export. A seeded page advertises the REAL owner, never the
+  // seeding gateway, so an owner-authoritative row always displaces it (CA11).
+  ownerHostById: Map<ObjRef, string>;
+};
+
+let mcpGatewayBundledScopeTopologyCache: ScopeTopologyClosure | null = null;
+
+// Property cells of an exit object that a move actually reads: the routing
+// endpoints and the movement-message cells. `aliases`/`description` are listing
+// flavour, not movement reads, but they are tiny and the exit's served-scope
+// slice usually carries them anyway; we keep the routing+message cells and drop
+// the rest to honour the spec's "the property cells a move reads" wording.
+const SCOPE_TOPOLOGY_EXIT_PROPERTY_CELLS = new Set<string>([
+  "source", "dest", "leave_msg", "oleave_msg", "arrive_msg", "oarrive_msg", "nogo_msg", "onogo_msg"
+]);
+
+export function mcpGatewayBundledScopeTopologyObjects(): ScopeTopologyClosure {
+  if (mcpGatewayBundledScopeTopologyCache) return mcpGatewayBundledScopeTopologyCache;
+  const world = createWorld({});
+  const snapshot = world.exportWorld();
+  const byId = new Map(snapshot.objects.map((obj) => [obj.id, obj] as const));
+  const routeHostById = new Map(world.objectRoutes().map((route) => [route.id, route.host] as const));
+  const ownerHostById = new Map<ObjRef, string>();
+  const recordOwner = (id: ObjRef): void => {
+    if (!ownerHostById.has(id)) ownerHostById.set(id, routeHostById.get(id) ?? WORLD_HOST);
+  };
+
+  // Lineage-only clone: keep the identity/parent/owner/flags/eventSchemas a
+  // parent-walk and dispatch-identity read need; drop live cells (contents,
+  // children) and ALL property/verb cells. The destination room's own `exits`,
+  // contents, and verb bytecode are explicitly second-hop and NOT seeded.
+  const lineageOnly = (obj: SerializedObject): SerializedObject => {
+    const clone = structuredClone(obj) as SerializedObject;
+    clone.location = null;
+    clone.children = [];
+    clone.contents = [];
+    clone.propertyDefs = [];
+    clone.properties = [];
+    clone.propertyVersions = [];
+    clone.verbs = [];
+    return clone;
+  };
+
+  // Exit clone: lineage + ONLY the move-read property cells (source/dest/msgs).
+  // Exit verb bytecode is NOT seeded — `enter`/move dispatch its bytecode from
+  // the catalog class graph delivered on first open, not from the exit instance.
+  const exitClone = (obj: SerializedObject): SerializedObject => {
+    const clone = lineageOnly(obj);
+    clone.propertyDefs = (structuredClone(obj.propertyDefs) as SerializedObject["propertyDefs"])
+      .filter((def) => SCOPE_TOPOLOGY_EXIT_PROPERTY_CELLS.has(def.name));
+    clone.properties = (structuredClone(obj.properties) as SerializedObject["properties"])
+      .filter(([name]) => SCOPE_TOPOLOGY_EXIT_PROPERTY_CELLS.has(name));
+    clone.propertyVersions = (structuredClone(obj.propertyVersions) as SerializedObject["propertyVersions"])
+      .filter(([name]) => SCOPE_TOPOLOGY_EXIT_PROPERTY_CELLS.has(name));
+    return clone;
+  };
+
+  // The shared catalog-class chain. A class object (a `$`-prefixed row in the
+  // parent walk of any destination room) is collected once and seeded lineage-
+  // only for every shard. localObjectLineageIsComplete walks parent to
+  // parent:null, so the chain must reach the lineage top with no gap.
+  const classChainIds = new Set<ObjRef>();
+  const walkClassChain = (start: ObjRef | null): void => {
+    let current = start;
+    const seen = new Set<ObjRef>();
+    while (current && !seen.has(current)) {
+      seen.add(current);
+      const obj = byId.get(current);
+      if (!obj) break;
+      // Class objects are the `$`-prefixed lineage; an instance reached here
+      // (a contained scope located inside another instance) is handled by
+      // its own served-scope closure, not folded into the shared class chain.
+      if (current.startsWith("$")) classChainIds.add(current);
+      current = obj.parent;
+    }
+  };
+
+  // A served-scope candidate: a non-`$` instance carrying a non-empty exits map.
+  const exitsOf = (obj: SerializedObject): Record<string, ObjRef> | null => {
+    const entry = obj.properties.find(([name]) => name === "exits");
+    const value = entry?.[1];
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const map = value as Record<string, unknown>;
+    const out: Record<string, ObjRef> = {};
+    for (const [dir, ref] of Object.entries(map)) {
+      if (typeof ref === "string" && ref.length > 0) out[dir] = ref as ObjRef;
+    }
+    return Object.keys(out).length > 0 ? out : null;
+  };
+
+  const byScope = new Map<ObjRef, SerializedObject[]>();
+  for (const scope of snapshot.objects) {
+    if (scope.id.startsWith("$")) continue;
+    const exits = exitsOf(scope);
+    if (!exits) continue;
+    const closure: SerializedObject[] = [];
+    const closureIds = new Set<ObjRef>();
+    const addRow = (row: SerializedObject): void => {
+      if (closureIds.has(row.id)) return;
+      closureIds.add(row.id);
+      closure.push(row);
+      recordOwner(row.id);
+    };
+    // De-dup the exit refs (the exits map aliases many keys to one exit id).
+    for (const exitId of new Set(Object.values(exits))) {
+      const exitObj = byId.get(exitId);
+      if (!exitObj) continue;
+      addRow(exitClone(exitObj));
+      // The exit's own lineage chain (e.g. $exit -> ...): a class-chain walk so
+      // the exit's parent never dangles when it lands in the gateway world.
+      walkClassChain(exitObj.parent);
+      // The one-hop destination room reached via this exit. Lineage-only; its
+      // class chain to the top is collected into the shared classChain.
+      const destEntry = exitObj.properties.find(([name]) => name === "dest");
+      const destRef = typeof destEntry?.[1] === "string" ? (destEntry[1] as ObjRef) : null;
+      const destObj = destRef ? byId.get(destRef) : null;
+      if (destObj) {
+        addRow(lineageOnly(destObj));
+        walkClassChain(destObj.parent);
+      }
+    }
+    if (closure.length > 0) byScope.set(scope.id, closure.sort((a, b) => a.id.localeCompare(b.id)));
+  }
+
+  const classChain = Array.from(classChainIds)
+    .map((id) => byId.get(id))
+    .filter((obj): obj is SerializedObject => obj !== undefined)
+    .map(lineageOnly)
+    .sort((a, b) => a.id.localeCompare(b.id));
+  for (const row of classChain) recordOwner(row.id);
+
+  mcpGatewayBundledScopeTopologyCache = { byScope, classChain, ownerHostById };
+  return mcpGatewayBundledScopeTopologyCache;
+}
+
+// Select the bounded topology closure for the SERVED scopes of one shard. The
+// returned rows are lineage-only (+ exit move-read cells); the caller merges
+// them into the shard world and records their ids so the export path stamps
+// them owner-deferring (never authoritative). `ownerHostById` is the real owner
+// host of each seeded id for the provenance source_host.
+export function mcpGatewayScopeTopologySeed(servedScopes: Iterable<ObjRef>): {
+  objects: SerializedObject[];
+  seededIds: Set<ObjRef>;
+  ownerHostById: Map<ObjRef, string>;
+} {
+  const topology = mcpGatewayBundledScopeTopologyObjects();
+  const objects: SerializedObject[] = [];
+  const seededIds = new Set<ObjRef>();
+  const add = (row: SerializedObject): void => {
+    if (seededIds.has(row.id)) return;
+    seededIds.add(row.id);
+    objects.push(structuredClone(row) as SerializedObject);
+  };
+  let anyServed = false;
+  for (const scope of new Set(servedScopes)) {
+    const closure = topology.byScope.get(scope);
+    if (!closure) continue;
+    anyServed = true;
+    for (const row of closure) add(row);
+  }
+  // The shared class chain is only needed when at least one served scope
+  // contributed a destination room whose parent walk uses it. Seeding it
+  // unconditionally would carry catalog-class lineage onto shards with no
+  // topology to serve; bound it to "this shard serves a topology scope".
+  if (anyServed) for (const row of topology.classChain) add(row);
+  return { objects, seededIds, ownerHostById: topology.ownerHostById };
+}
+
+// The seeded scope-topology ids (CA11.2) recorded alongside a shard's
+// serialized world, so the authority-slice export path can stamp them
+// owner-deferring. Empty when the shard serves no topology scope.
+type ScopeTopologySeedInfo = { seededIds: Set<ObjRef>; ownerHostById: Map<ObjRef, string> };
+
+function mcpGatewayShardSerializedWorld(
+  sessions: readonly DirectorySerializedSession[]
+): { world: SerializedWorld; topologySeed: ScopeTopologySeedInfo } {
   const now = Date.now();
   const objects = new Map<ObjRef, SerializedObject>();
   // Shards must expose the actor's own MCP control tools (wait/focus/list)
@@ -6847,22 +7219,45 @@ function mcpGatewayShardSerializedWorld(sessions: readonly DirectorySerializedSe
       now
     }));
   }
+  // CA11.2: merge the bounded one-hop topology closure for the scopes this shard
+  // serves (its sessions' active scopes), so a cold move across a served scope's
+  // exit resolves the neighbor room's lineage locally instead of paying a
+  // cross-host authority-slice. Seeded rows are lineage-only (+ exit move-read
+  // cells) and MUST NOT overwrite actor-support rows, session-actor rows, or the
+  // served-scope stubs above — those carry live/identity cells the seed lacks.
+  // The seeded id set is returned so the export path stamps these rows
+  // owner-deferring (projection); a seeded row stamped authoritative would
+  // reintroduce the sparse-stub-overwrites-real-scope hazard.
+  const topologySeed: ScopeTopologySeedInfo = { seededIds: new Set<ObjRef>(), ownerHostById: new Map<ObjRef, string>() };
+  const seed = mcpGatewayScopeTopologySeed(scopeContents.keys());
+  for (const row of seed.objects) {
+    if (objects.has(row.id)) continue; // never displace support / actor / scope-stub rows
+    objects.set(row.id, row);
+    topologySeed.seededIds.add(row.id);
+  }
+  topologySeed.ownerHostById = seed.ownerHostById;
   return {
-    version: 1,
-    objectCounter: 1,
-    parkedTaskCounter: 1,
-    sessionCounter: 1,
-    objects: Array.from(objects.values()).sort((a, b) => a.id.localeCompare(b.id)),
-    sessions: sessions.map((session) => structuredClone(session) as SerializedSession),
-    logs: [],
-    snapshots: [],
-    parkedTasks: [],
-    tombstones: []
+    world: {
+      version: 1,
+      objectCounter: 1,
+      parkedTaskCounter: 1,
+      sessionCounter: 1,
+      objects: Array.from(objects.values()).sort((a, b) => a.id.localeCompare(b.id)),
+      sessions: sessions.map((session) => structuredClone(session) as SerializedSession),
+      logs: [],
+      snapshots: [],
+      parkedTasks: [],
+      tombstones: []
+    },
+    topologySeed
   };
 }
 
 function mcpGatewayDirectorySessionCellSlice(sessions: readonly DirectorySerializedSession[], hostKey: string): SerializedAuthorityCellSlice {
-  const snapshot = mcpGatewayShardSerializedWorld(sessions);
+  // Only the session-actor rows feed the Directory presence projection here;
+  // the CA11.2 topology seed is irrelevant to this slice (it never publishes
+  // neighbor-room lineage as Directory presence).
+  const { world: snapshot } = mcpGatewayShardSerializedWorld(sessions);
   const sessionActors = new Set<ObjRef>(sessions.map((session) => session.actor));
   const actorObjects = snapshot.objects.filter((obj) => sessionActors.has(obj.id));
   const projectableActorObjects = actorObjects.filter(mcpGatewaySessionActorIsProjectable);

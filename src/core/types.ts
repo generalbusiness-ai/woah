@@ -400,6 +400,22 @@ export type MetricEvent =
   // cell-slice representation (CA12), or object rows for the legacy slice.
   // `source_host` is the host that did the reconstruction.
   | { kind: "authority_slice_reconstructed"; reason: "warm_turn_refresh" | "cold_open" | "missing_state_repair" | "slice_served"; scope: ObjRef; object_count: number; page_count: number; source_host: string }
+  // CA11.2 instrumentation: the set of object ids a gateway turn could NOT
+  // resolve locally and partitioned to a remote owner host. Fires for every
+  // remote host the planning/commit authority refresh touches, whether the
+  // remote resolution is a real /__internal/authority-slice RPC or a
+  // commit-scope snapshot fallback. It exists because the in-process cf-local
+  // harness masks the wire RPC behind the snapshot fallback, so the only
+  // harness-independent signal that a cold turn paid for a neighbor's lineage
+  // is the partition decision itself. Topology pre-seeding (CA11.2) drives a
+  // served scope's one-hop neighbor ids OUT of this partition. `objects` is
+  // the sorted remote-id set for `host`; bounded by the turn's read set.
+  | { kind: "authority_slice_partition"; host: string; reason: "warm_turn_refresh" | "cold_open" | "missing_state_repair"; object_count: number; objects: ObjRef[] }
+  // CA11.2: a gateway shard merged the bounded one-hop topology closure for a
+  // served scope into its live world (lineage-only neighbor rooms + shared
+  // catalog-class chain), so a cold move resolves neighbor lineage locally. Fires
+  // only when at least one row was newly added (idempotent re-runs are silent).
+  | { kind: "scope_topology_seed"; scopes: number; seeded: number }
   // Fires once per reapExpiredSessions sweep only when at least one session is
   // actually reaped. This keeps background sweep noise out of data-path tails
   // while preserving enough volume information for retention debugging.
