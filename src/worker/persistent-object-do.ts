@@ -3362,7 +3362,7 @@ export class PersistentObjectDO {
           : commit.projection_writes ?? [];
         if (projectionWrites.length > 0 || commit.projection_delta) {
           this.requireProjectionWritesComplete(scope, commit.projection_delta, projectionWrites, "host_apply");
-          const applied = world.applyProjectionWrites(projectionWrites, { transcript });
+          const applied = world.applyProjectionWrites(projectionWrites, { transcript, hostKey, gatewayHost: hostKey === WORLD_HOST });
           if (applied.creates > 0) await this.registerIncrementalObjectRoutes(world);
           return jsonResponse(applied);
         }
@@ -5803,6 +5803,20 @@ export class PersistentObjectDO {
     // Partition: each host gets only the projection rows it owns. The shared
     // fan-out applies the local host's rows and forwards the rest as RPCs.
     const slicesByHost = await this.projectionWritesByHost(world, scope, projectionWrites, localHost);
+    // Cross-host move durability: a move's source/destination container `contents`
+    // is a projection on that container's OWNER host. When the container is foreign
+    // to the committing scope, no projection row it owns changed, so it is absent
+    // from the partition above and would never learn of the incoming/departing
+    // member — its contents projection drifts. Add those container owners to the
+    // fan-out (empty slice) so they receive the commit + transcript and rebuild
+    // contents from the authoritative move in applyProjectionWrites. fanOutHostWrites
+    // already makes this durable (any forward failure throws E_RETRY).
+    for (const move of transcript.moves) {
+      for (const container of move.from && move.from !== move.to ? [move.to, move.from] : [move.to]) {
+        const host = await this.resolveObjectHostForWorld(world, container, localHost);
+        if (host && !slicesByHost.has(host)) slicesByHost.set(host, []);
+      }
+    }
     return await fanOutHostWrites<ProjectionWrite[]>({
       localHostKey: localHost,
       isGatewayHost: (host) => host === WORLD_HOST,
@@ -5812,7 +5826,7 @@ export class PersistentObjectDO {
       retryMessage: "v2 commit accepted but object-host projection write-through failed",
       onMetric: (event) => world.recordMetric(event),
       applyLocal: async (writes) => {
-        const applied = world.applyProjectionWrites(writes, { transcript });
+        const applied = world.applyProjectionWrites(writes, { transcript, hostKey: localHost, gatewayHost: localHost === WORLD_HOST });
         if (applied.creates > 0) await this.registerIncrementalObjectRoutes(world);
       },
       forwardRemote: (host, writes) => this.forwardInternalChecked<{ ok: true }>(host, "/__internal/apply-v2-commit", {
