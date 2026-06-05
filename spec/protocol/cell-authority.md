@@ -605,6 +605,35 @@ governed by the CA11 provenance rules with no exception:
   the resident row may remain as a gap-filler for *other* actors who still hold
   `the_deck` only as a neighbor — it simply must not be *exported as authority*
   for the occupant.)
+- **Movement-destination repair (the dual of the occupancy transition).** A scope
+  becomes "served" not only when it is an actor's active scope *before* planning,
+  but also when the VM resolves it as the **movement destination** *during*
+  planning (the destination is `exit.dest`, known only after the VM runs, so it
+  cannot be in the pre-plan served set). A node that pre-seeds topology MUST,
+  before it commits a move, verify the destination's lineage/live provenance: if
+  the destination stands locally only as a non-authoritative pre-seed
+  (`projection`/`cache`/…), the move boundary MUST raise a repairable
+  `E_NEED_STATE` naming the destination, and the repair pass MUST issue an
+  **owner-required** authority refresh (a `missing_state_repair` pass that
+  disables topology refresh-suppression and the seeded-id local-export exclusion
+  for the named ids) so the owner's exits-bearing row is fetched and, by CA11
+  precedence, displaces the pre-seed before the move re-plans. A plain
+  repair that merely re-requests the id is insufficient — without the
+  owner-required refresh the suppression would re-serve the same pre-seed and the
+  move would loop. This check is OPT-IN: only a planning path that *has* the
+  force-owner repair (the gateway) enables it; holder paths that plan
+  optimistically against derived rows and reconcile by their own protocol (the
+  browser, REST relay) attach provenance but do not enforce it.
+- **Catalog classes are seeded FULL; only instances are lineage-only.** The
+  destination *rooms* in the closure are seeded lineage-only (dynamic instances,
+  repaired to owner on the occupancy transition above). But the shared
+  catalog-**class** chain (`$exit`/`$room`/`$chatroom`/`$space`/…) is STATIC graph
+  data whose verbs the planning VM must dispatch (`$exit:invoke`,
+  `$room:acceptable`/`enterfunc`); it MUST be seeded with its verbs (like the
+  universal actor-support closure), or a cold move fails `E_VERBNF` AND the
+  lineage-only seed would suppress the fetch of the real class. The classes remain
+  owner-deferring `projection` provenance (the owner's class row still wins), but
+  carry their verbs so dispatch resolves locally.
 
 **Accepted bounded read-staleness window.** A pure read that is not a
 version-validated commit — for example listing a room's exits in a `look` — MAY
@@ -618,10 +647,17 @@ read against the owner.
 
 **Conformance (CA14).** A node that pre-seeds topology MUST satisfy:
 
-1. A cold turn in a served scope resolves its one-hop neighbor `object_lineage`
-   locally and performs NO cross-host `authority-slice` RPC for those neighbors.
+1. A cold turn that *reads* a served scope's one-hop neighbor `object_lineage`
+   resolves it locally and performs NO cross-host `authority-slice` RPC for that
+   neighbor. (Zero-fetch holds for the cold READ, NOT for the moment of
+   occupancy — see 6.)
 2. An owner-authoritative row for a pre-seeded object displaces the pre-seeded
    page in planning.
+6. A move INTO a pre-seeded neighbor (the occupancy transition) DOES repair that
+   destination to owner authority before commit — a `missing_state_repair`
+   owner-required refresh — so the move uses the owner's real `exits`/hooks. The
+   optimization is for cold topology reads; the moment of occupancy correctly
+   pays one owner fetch.
 3. A pre-seeded page NEVER displaces an owner-authoritative row, and is never
    served as a write-authority source.
 4. A topology edit at the owner produces `E_STALE_AUTHORITY`/read-version retry

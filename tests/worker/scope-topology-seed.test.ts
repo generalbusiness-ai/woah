@@ -310,10 +310,11 @@ function metricsFromLogSpy(logSpy: ReturnType<typeof vi.spyOn>): Metric[] {
 // both real /__internal/authority-slice RPCs and commit-scope snapshot
 // fallbacks (the cf-local in-process harness masks the wire RPC behind the
 // fallback; the partition decision is the harness-independent signal).
-function partitionedRemoteIds(metrics: Metric[]): Map<string, Set<string>> {
+function partitionedRemoteIds(metrics: Metric[], reasonFilter?: (reason: string) => boolean): Map<string, Set<string>> {
   const byHost = new Map<string, Set<string>>();
   for (const m of metrics) {
     if (m.kind !== "authority_slice_partition") continue;
+    if (reasonFilter && !reasonFilter(String(m.reason ?? ""))) continue;
     const host = String(m.host ?? "");
     const set = byHost.get(host) ?? new Set<string>();
     for (const id of Array.isArray(m.objects) ? m.objects : []) {
@@ -324,22 +325,38 @@ function partitionedRemoteIds(metrics: Metric[]): Map<string, Set<string>> {
   return byHost;
 }
 
-function allPartitionedIds(metrics: Metric[]): Set<string> {
-  const all = new Set<string>();
-  for (const set of partitionedRemoteIds(metrics).values()) for (const id of set) all.add(id);
-  return all;
+// Did any authority_slice_partition for `id` carry the given reason? CA11.2
+// occupancy transition: a move INTO a pre-seeded neighbor repairs the destination
+// to owner authority with reason `missing_state_repair`. That partition is the
+// occupancy fetch the spec now permits (zero-fetch holds for cold READS, not the
+// moment of occupancy).
+function partitionedWithReason(metrics: Metric[], id: string, reason: string): boolean {
+  for (const m of metrics) {
+    if (m.kind !== "authority_slice_partition") continue;
+    if (String(m.reason ?? "") !== reason) continue;
+    if ((Array.isArray(m.objects) ? m.objects : []).includes(id)) return true;
+  }
+  return false;
 }
 
 describe("CA11.2 quasi-static topology pre-seeding", () => {
-  // STEP 0 + conformance #1. The turn that reads a served scope's one-hop
-  // neighbor lineage is the MOVE across the exit (CA5.4: a move reads the
-  // exit's `dest` then runs `dest:acceptable` / `dest:enterfunc`, which require
-  // the destination's lineage). On a cold gateway the destination (the_deck) is
-  // not resident, so the planning/commit authority refresh partitions it to its
-  // owner host — `authority_slice_partition{host:"the_deck"}`. After the
-  // topology pre-seed lands, the_deck's lineage is resident locally and that
-  // partition must not occur.
-  it("cold move across the_chatroom's exit performs no cross-host authority fetch for the_deck", async () => {
+  // STEP 0 + conformance #1 (read path) + the occupancy transition.
+  //
+  // A move across an exit has TWO phases for the destination the_deck:
+  //   (a) the cold neighbor READ — the first planning attempt traces the exit's
+  //       `dest` and reads the_deck's lineage to run `dest:acceptable`. This must
+  //       resolve LOCALLY from the pre-seeded topology closure: NO cross-host
+  //       authority fetch on the read path (`warm_turn_refresh`/`cold_open`).
+  //   (b) the OCCUPANCY transition — because this move ENTERS the_deck, the
+  //       movement-boundary guard (CA11.2) repairs the_deck to owner authority
+  //       before commit, so the_deck IS partitioned with reason
+  //       `missing_state_repair`. The zero-fetch optimization holds for cold
+  //       READS, NOT for the moment of occupancy (the entered scope's dynamic
+  //       authority — exits/next_seq — must come from its owner for the commit).
+  //
+  // So: no read-path partition of the_deck, but an occupancy repair-fetch of
+  // the_deck is expected, and the move succeeds.
+  it("cold move across the_chatroom's exit reads the neighbor locally; the occupancy transition repairs to owner", async () => {
     const harness = createHarness();
     let logSpy: ReturnType<typeof vi.spyOn> | null = null;
     let alice: McpSession | null = null;
@@ -355,14 +372,30 @@ describe("CA11.2 quasi-static topology pre-seeding", () => {
       logSpy.mockRestore();
       logSpy = null;
 
-      const partitioned = allPartitionedIds(metrics);
+      // The move must actually enter the_deck.
+      expect(alice.currentRoom, "southeast from the_chatroom should arrive in the_deck").toBe("the_deck");
+
+      // (a) Read path: a cold READ refresh (warm_turn_refresh/cold_open) must NOT
+      // partition the_deck — its lineage is resolved from the pre-seeded closure.
+      const readPartitioned = partitionedRemoteIds(metrics, (reason) => reason !== "missing_state_repair");
+      const readPartitionedIds = new Set<string>();
+      for (const set of readPartitioned.values()) for (const id of set) readPartitionedIds.add(id);
       expect(
-        partitioned.has("the_deck"),
-        `CA11.2 conformance #1: a cold move across the_chatroom's southeast exit must resolve the ` +
-        `one-hop neighbor the_deck's lineage locally (from the pre-seeded topology closure) and must NOT ` +
-        `partition the_deck to a cross-host authority fetch. Partitioned ids: ` +
-        JSON.stringify(Array.from(partitionedRemoteIds(metrics), ([h, s]) => [h, Array.from(s)]))
+        readPartitionedIds.has("the_deck"),
+        `CA11.2 conformance #1 (read path): the cold neighbor READ of the_deck must resolve locally from the ` +
+        `pre-seeded topology closure and must NOT partition the_deck on a warm_turn_refresh/cold_open fetch. ` +
+        `Read-path partitioned ids: ` +
+        JSON.stringify(Array.from(readPartitioned, ([h, s]) => [h, Array.from(s)]))
       ).toBe(false);
+
+      // (b) Occupancy transition: entering the_deck repairs it to owner authority.
+      // The repair fetch is the expected `missing_state_repair` partition of the_deck.
+      expect(
+        partitionedWithReason(metrics, "the_deck", "missing_state_repair"),
+        "CA11.2 occupancy transition: a move INTO the_deck must repair the_deck to owner authority before " +
+        "commit (a missing_state_repair partition of the_deck), so the occupant commits against the owner's " +
+        "exits-bearing row, not the lineage-only neighbor seed"
+      ).toBe(true);
     } finally {
       logSpy?.mockRestore();
       await alice?.close();

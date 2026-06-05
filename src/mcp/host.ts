@@ -1165,11 +1165,43 @@ export class McpHost {
   enclosingSpaceFor(target: ObjRef): ObjRef | null {
     let cursor: ObjRef | null = target;
     while (cursor && this.world.objects.has(cursor)) {
-      if (this.descendsFrom(cursor, "$space")) return cursor;
+      const membership = this.spaceMembership(cursor);
+      if (membership === "yes") return cursor;
+      // CA11.2: do NOT walk past a node whose own $space membership is
+      // INDETERMINATE because its class lineage is incomplete on this sparse
+      // gateway shard (a missing ancestor before `parent:null`). Returning null
+      // here defers to the caller's registration-time `enclosingSpace` hint
+      // (computed against a complete world at listTools time), which is the
+      // correct scope. Walking to this node's `location` would mis-resolve a
+      // tool-space (e.g. `the_pinboard`, anchored in a now-resident `the_deck`
+      // seeded by the topology pre-seed) to its containing room, breaking the
+      // presence check for an actor who occupies the tool-space itself. Only a
+      // node CONCLUSIVELY not a space ("no", complete lineage with no match) may
+      // be walked through to its anchor/location.
+      if (membership === "unknown") return null;
       const obj = this.world.object(cursor);
       cursor = obj.anchor ?? obj.location ?? null;
     }
     return null;
+  }
+
+  // Is `objRef` a descendant of `$space`? Tri-state because a sparse MCP gateway
+  // shard may hold an object whose class lineage is not fully resident: walking
+  // `parent` can hit a MISSING ancestor before reaching either `$space` or
+  // `parent:null`. "yes"/"no" are conclusive; "unknown" means the lineage broke
+  // at an absent ancestor and membership cannot be decided locally.
+  private spaceMembership(objRef: ObjRef): "yes" | "no" | "unknown" {
+    let cursor: ObjRef | null = objRef;
+    const seen = new Set<ObjRef>();
+    while (cursor) {
+      if (cursor === "$space") return "yes";
+      if (seen.has(cursor)) return "no"; // cycle — treat as conclusively non-space
+      seen.add(cursor);
+      const obj = this.world.objects.get(cursor);
+      if (!obj) return "unknown"; // lineage broke at a missing ancestor
+      cursor = obj.parent;
+    }
+    return "no"; // reached parent:null without matching $space
   }
 
   private descendsFrom(objRef: ObjRef, ancestorRef: ObjRef): boolean {

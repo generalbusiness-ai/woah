@@ -21,7 +21,7 @@ import { CommitScopeDO } from "../../src/worker/commit-scope-do";
 import { DirectoryDO } from "../../src/worker/directory-do";
 import worker from "../../src/worker/index";
 import { signInternalRequest } from "../../src/worker/internal-auth";
-import { LOCAL_CATALOG_BUNDLE_REPAIR_EPOCH, MCP_GATEWAY_ACTOR_SUPPORT_ROOTS, PersistentObjectDO, v2FanoutEnvelopesByNode, type Env } from "../../src/worker/persistent-object-do";
+import { LOCAL_CATALOG_BUNDLE_REPAIR_EPOCH, MCP_GATEWAY_ACTOR_SUPPORT_ROOTS, PersistentObjectDO, mcpGatewayScopeTopologySeed, v2FanoutEnvelopesByNode, type Env } from "../../src/worker/persistent-object-do";
 import { FakeDurableObjectNamespace, FakeDurableObjectState } from "./fake-do";
 
 // These are production-shape Worker integration tests; under full-suite CPU
@@ -4368,8 +4368,17 @@ describe("CFObjectRepository production-shape coverage", () => {
       const shardObject = harness.wooObjects.get(shard) as any;
       const shardWorld = await shardObject.getWorld(shard) as WooWorld;
       expect(shardWorld.sessions.size).toBe(2052);
+      // CA11.2 topology pre-seed: the session's activeScope is the_deck, a
+      // topology scope (a room with exits). The cold shard world therefore also
+      // carries the_deck's bounded one-hop neighbor closure + shared catalog-class
+      // chain (owner-deferring lineage). Compute the seeded ids from the seed
+      // itself (the_deck is the served scope here) rather than hardcoding, so this
+      // expectation tracks the closure shape automatically. The_deck itself is
+      // excluded from the seed (it is the served scope, present as its own row).
+      const topologySeedIds = mcpGatewayScopeTopologySeed(["the_deck" as ObjRef]).seededIds;
       const expectedShardObjects = new Set<ObjRef>([
         ...mcpGatewayActorSupportObjectIds(),
+        ...topologySeedIds,
         "cf_mcp_directory_actor" as ObjRef,
         "cf_mcp_directory_filler" as ObjRef,
         "the_deck" as ObjRef
