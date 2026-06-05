@@ -653,17 +653,17 @@ read against the owner.
    occupancy — see 6.)
 2. An owner-authoritative row for a pre-seeded object displaces the pre-seeded
    page in planning.
-6. A move INTO a pre-seeded neighbor (the occupancy transition) DOES repair that
-   destination to owner authority before commit — a `missing_state_repair`
-   owner-required refresh — so the move uses the owner's real `exits`/hooks. The
-   optimization is for cold topology reads; the moment of occupancy correctly
-   pays one owner fetch.
 3. A pre-seeded page NEVER displaces an owner-authoritative row, and is never
    served as a write-authority source.
 4. A topology edit at the owner produces `E_STALE_AUTHORITY`/read-version retry
    (then a correct re-planned move), never a silently-applied wrong move.
 5. The bounded read-staleness window of behavior 4 is the only observable effect
    of a stale pre-seeded page on a pure read; it is repaired by the next move.
+6. A move INTO a pre-seeded neighbor (the occupancy transition) DOES repair that
+   destination to owner authority before commit — a `missing_state_repair`
+   owner-required refresh — so the move uses the owner's real `exits`/hooks. The
+   optimization is for cold topology reads; the moment of occupancy correctly
+   pays one owner fetch.
 
 ## CA12. Representation alignment
 

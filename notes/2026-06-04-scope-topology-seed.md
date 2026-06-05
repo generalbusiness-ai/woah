@@ -84,17 +84,15 @@ the owner detects a topology edit → `E_STALE_AUTHORITY`/read-version retry →
 repair-then-replan. Never silent wrong movement. A pure read may observe stale
 topology until the next move (CA6 quasi-static window) — accepted, specced.
 
-## OPEN before implementation
+## Verification trace
 
-**Pin the exact fetch trigger.** Prereq-2 says `the_deck` enters `requestedIds`
-via the value-trace; the delivery trace says the gateway resolves it via
-Directory → owner → RPC. But the trace reads `world.objects` only, and on a cold
-shard `the_deck` is NOT local — so confirm whether `the_deck` enters
-`requestedIds` from the gateway's own trace (after it has `the_chatroom`) or from
-the `the_chatroom` owner's authority-slice RESPONSE (off-mode lineage ref the
-gateway then re-resolves). The fix only works if seeding `the_deck` + catalog
-chain makes the classifier treat it local. A reproduction test instruments
-`requestedIds`/`reconstructionReason` to confirm before the larger change.
+The branch first pinned the exact fetch trigger. `the_deck` enters
+`requestedIds` through the gateway value-trace once the cold shard has the
+served room row, and `mcpGatewayLocalAuthorityPayload` partitions it remotely
+because `localObjectLineageIsComplete(the_deck)` fails at the absent
+`$chatroom`/`$room`/`$space` chain. Seeding `the_deck` plus the catalog class
+chain makes the classifier treat it local, so the read path performs no
+cross-host `authority-slice` RPC for the neighbor.
 
 ## Trigger CONFIRMED + a deeper constraint found (first impl attempt)
 
@@ -129,21 +127,38 @@ simply must never be *exported as authority* for the occupant. This touches the
 A5 relay/commit-scope-snapshot path the in-memory checkpoint was removed from —
 the open seed must not capture a lineage-only pre-seed for a served scope.
 
-## Harvest plan (reimplement clean from 7b4e007)
+## Implementation result
 
-KEEP from `scope-topology-seed-agent-wip`: `types.ts` metrics
-(`authority_slice_partition`, `scope_topology_seed`); `world.ts`
-`mergeTopologySeedObjects` (never-overwrite, persistence-paused, lineage rows);
-`tests/worker/scope-topology-seed.test.ts` (trigger reproduction). DROP:
-`world.ts evictTopologySeedObject` and all eviction/churn/debug-probe edits in
-`persistent-object-do.ts`. ADD clean: the bundled-topology closure helper; the
-cold-load injection bounded to served scopes; owner-deferring re-stamp at export;
-**served-scope exclusion** in `mcpGatewayLocalAuthorityPayload`; the second guard;
-the 5 conformance tests.
+The clean implementation on `scope-topology-seed` keeps the useful pieces from
+the stalled attempt (`authority_slice_partition`, `scope_topology_seed`,
+`mergeTopologySeedObjects`, and the reproduction test) and drops eviction,
+seed/evict churn, and debug probes. It adds:
+
+- bundled-topology closure discovery, bounded to served scopes;
+- cold-load injection beside the actor-support merge;
+- owner-deferring provenance re-stamp at local export;
+- served-scope exclusion from local export and topology refresh-suppression;
+- movement-destination owner repair (`missing_state_repair`) for a destination
+  that is discovered only while the VM is planning a move;
+- opt-in enforcement only for the gateway path, whose repair pass can force an
+  owner refresh.
+
+The B6 concurrent movement regression exposed the destination-repair half of
+the occupancy rule: bidirectional rooms mean a currently-served room can also be
+a seeded neighbor of the room an actor occupies, and the next destination is not
+known before the VM resolves the exit. `movetoActorChecked` now raises
+repairable `E_NEED_STATE` when a move would enter a projection-sourced scope,
+and the repair pass disables topology suppression for the named missing state so
+the owner row displaces the seed before replanning.
 
 ## Status
 
-- CA11.2 spec delta written (incl. the occupancy-transition rule); CA11.1
-  currency note added (A5 removed the in-memory checkpoint).
-- Trigger confirmed; first impl attempt preserved + harvest plan recorded.
-- Clean reimplementation pending.
+- CA11.2 is aligned with the implementation, including the occupancy-transition
+  rule, movement-destination repair, full class-chain seeding, and opt-in
+  gateway enforcement.
+- Local gates on the branch passed before merge review: `npm run typecheck`,
+  `npm test`, `npm run test:worker`, `npm run gate:authority`, and
+  `npm run test:full`.
+- CF performance measurement remains the acceptance signal for whether the
+  cold neighbor authority-slice fetch was removed in production without adding
+  unacceptable occupancy-repair cost.
