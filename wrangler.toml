@@ -44,6 +44,18 @@ WOO_AUTO_INSTALL_CATALOGS = "chat,demoworld,dubspace,help,note,pinboard,prog,tas
 WOO_AE_DATASET = "woo_v1_prod"
 CF_ACCOUNT_ID = "6e953d231f1c9aadffbf59537a82e13a"
 
+# P1′ probe (2026-06-05, TEMPORARY — remove after cpuTime attribution).
+# On-commit checkpoint rebuild is the leading suspect for ~1s of unattributed
+# per-turn CommitScopeDO CPU (full ~3MB rebuild in waitUntil, invisible to
+# performance.now()). Bounded mode with a very high interval makes most commits
+# skip the rebuild so a differential CF cpuTime read attributes its cost. Safe:
+# the accepted-frame tail self-protects (frames are never pruned until a
+# complete checkpoint covers them — commit-scope-do.ts:2070), so a stale
+# checkpoint only defers compaction, never loses state.
+# See notes/2026-06-05-commit-apply-is-not-the-cost.md.
+WOO_V2_CHECKPOINT_BOUNDED = "1"
+WOO_V2_CHECKPOINT_FRAME_INTERVAL = "1000000"
+
 # Static assets: the bundled SPA is built to dist/ via `npm run build`.
 # The Worker entry routes global API/WS traffic to the gateway DO and object
 # REST routes through Directory; everything else falls through to ASSETS.fetch.
