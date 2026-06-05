@@ -109,6 +109,10 @@ type CommitScopeEnv = InternalAuthEnv & {
   // Set very high (e.g. 1000000) to measure the floor (effectively never
   // checkpoint on commit); set to a sane value (e.g. 32) as the actual fix.
   WOO_V2_CHECKPOINT_FRAME_INTERVAL?: string;
+  // Authority-slimming probe (step 1): when on, emit a v2_envelope_bytes metric
+  // breaking the request into authority / capsule-authority / sessions / envelope
+  // bytes plus relay warmth. Off by default — it re-stringifies the large slice.
+  WOO_V2_ENVELOPE_BYTE_BREAKDOWN?: string;
 };
 
 type PersistedCheckpointPageRef = {
@@ -165,6 +169,13 @@ export class CommitScopeDO {
   // always checkpoints (bounding worst-case cold-replay to one interval). Used by
   // maybeCheckpointOnCommit when WOO_V2_CHECKPOINT_BOUNDED is on.
   private readonly lastCheckpointHeadSeqByScope = new Map<ObjRef, number>();
+  // Authority-slimming probe (step 1): how the relay for the current request was
+  // obtained — "snapshot" (rehydrated from this DO's own durable storage) or
+  // "cold_seed" (built from the request's authority/serialized payload). Combined
+  // with "relay already in memory" at the call site this classifies each envelope
+  // as warm / snapshot-rehydrated / cold-seeded, the axis that decides whether the
+  // ~3MB top-level authority in the request was actually needed.
+  private lastRelayInitSource: "snapshot" | "cold_seed" | null = null;
 
   constructor(
     private readonly state: CommitScopeDurableState,
@@ -447,7 +458,14 @@ export class CommitScopeDO {
           const input = await readJson<CommitScopeEnvelopeRequest>(request);
           scope = input.scope;
           node = input.node;
+          // Authority-slimming probe (step 1): classify how the relay is obtained.
+          // "warm" = already in memory; otherwise relayFor sets lastRelayInitSource
+          // to "snapshot" (our own durable storage) or "cold_seed" (request payload).
+          const relayWasWarm = this.relay !== null;
+          this.lastRelayInitSource = null;
           const relay = await this.relayFor(input);
+          const relayWarmth = relayWasWarm ? "warm" : (this.lastRelayInitSource ?? "unknown");
+          this.emitEnvelopeByteBreakdown(input, requestBytes, relayWarmth);
           this.ensureSerializedSession(relay, input);
           const browser = this.browserFor(relay, input);
           const replayStartedAt = metricNow();
@@ -618,6 +636,7 @@ export class CommitScopeDO {
       this.snapshotLoaded = true;
       if (loaded) {
         this.relay = loaded;
+        this.lastRelayInitSource = "snapshot";
         return loaded;
       }
     }
@@ -645,6 +664,7 @@ export class CommitScopeDO {
       relay.commit_scope.cellProvenance = cellProvenanceFromAuthoritySlice(input.authority);
     }
     this.relay = relay;
+    this.lastRelayInitSource = "cold_seed";
     this.needsFullSave = true;
     return relay;
   }
@@ -1748,6 +1768,35 @@ export class CommitScopeDO {
       this.maybeCheckpointOnCommit(relay);
     }
     return tailStats.value;
+  }
+
+  // Authority-slimming probe (step 1): break the ~3MB envelope request into its
+  // components so we know WHAT to slim. Gated behind WOO_V2_ENVELOPE_BYTE_BREAKDOWN
+  // because measuring sizes re-stringifies the (large) authority slice, which adds
+  // synchronous CPU — we only want that during a composition run, not permanently.
+  // The clean floor cpuTime comes from the non-breakdown deploy; this run answers
+  // "is it top-level authority, double-carried capsule authority, or sessions, and
+  // is the slice even needed (relay warm/snapshot vs cold_seed)".
+  private emitEnvelopeByteBreakdown(
+    input: CommitScopeEnvelopeRequest,
+    requestBytes: number,
+    relayWarmth: string
+  ): void {
+    if (!envFlag(this.env.WOO_V2_ENVELOPE_BYTE_BREAKDOWN)) return;
+    const capsuleAuthority = input.execution_capsule?.authority;
+    this.emitMetric({
+      kind: "v2_envelope_bytes",
+      scope: input.scope,
+      node: input.node,
+      relay_warmth: relayWarmth,
+      request_bytes: requestBytes,
+      authority_bytes: input.authority ? jsonByteLength(input.authority) : 0,
+      capsule_authority_bytes: capsuleAuthority ? jsonByteLength(capsuleAuthority) : 0,
+      capsule_present: Boolean(input.execution_capsule),
+      sessions_bytes: input.sessions ? jsonByteLength(input.sessions) : 0,
+      session_objects_bytes: input.session_objects ? jsonByteLength(input.session_objects) : 0,
+      envelope_bytes: input.envelope ? input.envelope.length : 0
+    });
   }
 
   // P1′ probe: decide whether this accepted commit should trigger a checkpoint
