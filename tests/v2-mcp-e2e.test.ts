@@ -182,14 +182,19 @@ describe("v2 MCP e2e", () => {
       const waited = await mcp(gateway, bob, 11, "tools/call", { name: "woo_wait", arguments: { timeout_ms: 1000 } });
       expect(JSON.stringify(waited.result.structuredContent)).toContain("slim two");
 
-      // Every same-scope (non-planned) envelope must be slimmed: no authority
-      // slice, empty session_objects. (say is same-scope, never planned.)
+      // A scope's FIRST commit (head.seq 0) keeps the full slice to seed in one
+      // round trip; warm repeats (head.seq >= 1) are slimmed. So at least one
+      // envelope to a repeat-committed scope must carry no authority slice and
+      // empty session_objects (while retaining the tiny session rows).
       const envelopes = commitPosts.filter((post) => post.path === "/v2/envelope");
       expect(envelopes.length).toBeGreaterThanOrEqual(2);
-      for (const post of envelopes) {
-        expect(post.body, JSON.stringify(Object.keys(post.body))).not.toHaveProperty("authority");
+      const slimmed = envelopes.filter((post) => !Object.prototype.hasOwnProperty.call(post.body, "authority"));
+      expect(
+        slimmed.length,
+        JSON.stringify(envelopes.map((post) => ({ scope: post.scope, hasAuthority: Object.prototype.hasOwnProperty.call(post.body, "authority") })))
+      ).toBeGreaterThanOrEqual(1);
+      for (const post of slimmed) {
         expect(post.body.session_objects ?? []).toEqual([]);
-        // The tiny session rows are retained for auth refresh.
         expect(post.body).toHaveProperty("sessions");
       }
       // Convergence on the slim path is proven above: the second turn's

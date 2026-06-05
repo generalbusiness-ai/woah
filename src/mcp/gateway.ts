@@ -809,11 +809,15 @@ export class McpGateway {
           target,
           verb
         ));
-        // Slim same-scope warm turns: send without the ~3MB authority slice. Planned
-        // cross-scope commits keep it (their destination scope is often cold and
-        // benefits from seeding in one round trip). The full body (envelopeBody) is
-        // retained for the E_SNAPSHOT_REQUIRED retry below.
-        const slim = hooks.slimWarmEnvelope === true && !envelopeBody.planned_transcript_commit;
+        // Slim every envelope: the gateway always opens (and the open seeds a
+        // durable snapshot on) a scope before enveloping it, so the CommitScopeDO
+        // rehydrates from its own snapshot and never needs the ~3MB slice — probe
+        // 360150d8 measured the relay as warm-or-snapshot on 100% of envelopes,
+        // never cold-seeded. The rare genuine miss (no in-memory relay AND no
+        // durable snapshot, e.g. a DO that lost storage) replies E_SNAPSHOT_REQUIRED
+        // and is resolved by the reseed + full-body retry below. The full body
+        // (envelopeBody) is retained for that retry.
+        const slim = hooks.slimWarmEnvelope === true;
         const firstBody = slim ? slimMcpEnvelopeBody(envelopeBody) : envelopeBody;
         // A cold scope cannot seed from a slimmed body (no authority) nor from a
         // capsule body (capsule carries no slice), so both modes must be able to
