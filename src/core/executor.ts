@@ -61,9 +61,15 @@ export type ExecutionCapsule = {
   session: string;
   target: ObjRef;
   verb: string;
-  authority: SerializedAuthoritySlice;
   expires_at_ms: number;
 };
+// NB: the capsule deliberately carries NO authority slice. The CommitScopeDO
+// validates a capsule by head/scope/actor/session metadata only
+// (validateExecutionCapsule) and never reads an embedded slice; a cold scope
+// with a capsule throws E_SNAPSHOT_REQUIRED and is re-seeded from the request's
+// top-level authority via the gateway retry. Carrying the ~3MB slice here only
+// doubled the envelope on capsule turns (measured 6.1MB) for bytes nothing reads.
+// See notes/2026-06-05-commit-apply-is-not-the-cost.md.
 
 export type ExecutorCallInput = {
   id?: string;
@@ -244,7 +250,6 @@ export function buildExecutionCapsule(input: {
   session: string;
   target: ObjRef;
   verb: string;
-  authority: SerializedAuthoritySlice;
   now?: number;
   ttlMs?: number;
 }): ExecutionCapsule {
@@ -256,7 +261,6 @@ export function buildExecutionCapsule(input: {
     session: input.session,
     target: input.target,
     verb: input.verb,
-    authority: input.authority,
     expires_at_ms: (input.now ?? Date.now()) + Math.max(1, input.ttlMs ?? 30_000)
   };
 }

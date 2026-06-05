@@ -1783,7 +1783,6 @@ export class CommitScopeDO {
     relayWarmth: string
   ): void {
     if (!envFlag(this.env.WOO_V2_ENVELOPE_BYTE_BREAKDOWN)) return;
-    const capsuleAuthority = input.execution_capsule?.authority;
     this.emitMetric({
       kind: "v2_envelope_bytes",
       scope: input.scope,
@@ -1791,7 +1790,10 @@ export class CommitScopeDO {
       relay_warmth: relayWarmth,
       request_bytes: requestBytes,
       authority_bytes: input.authority ? jsonByteLength(input.authority) : 0,
-      capsule_authority_bytes: capsuleAuthority ? jsonByteLength(capsuleAuthority) : 0,
+      // The execution capsule no longer carries an authority slice (removed as
+      // dead weight); kept at 0 so the metric shape is stable for the follow-up
+      // thin-warm-envelope verification.
+      capsule_authority_bytes: 0,
       capsule_present: Boolean(input.execution_capsule),
       sessions_bytes: input.sessions ? jsonByteLength(input.sessions) : 0,
       session_objects_bytes: input.session_objects ? jsonByteLength(input.session_objects) : 0,

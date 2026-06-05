@@ -44,14 +44,9 @@ WOO_AUTO_INSTALL_CATALOGS = "chat,demoworld,dubspace,help,note,pinboard,prog,tas
 WOO_AE_DATASET = "woo_v1_prod"
 CF_ACCOUNT_ID = "6e953d231f1c9aadffbf59537a82e13a"
 
-# Authority-slimming probe (2026-06-05, TEMPORARY — remove after composition run).
-# The first probe (d15cf747) showed checkpoint is only ~333ms of the warm CPU; a
-# ~686ms floor remains and every /v2/envelope request body is ~3MB. This run
-# breaks that body into authority / capsule-authority / sessions / envelope bytes
-# plus relay warmth so we know exactly what to slim. Checkpoint bounded vars are
-# dropped here to remove confounds. See
-# notes/2026-06-05-commit-apply-is-not-the-cost.md.
-WOO_V2_ENVELOPE_BYTE_BREAKDOWN = "1"
+# (P1′ authority-slimming probe vars removed — measurement complete. The
+# v2_envelope size proxies + gated v2_envelope_bytes breakdown remain in code,
+# off by default. See notes/2026-06-05-commit-apply-is-not-the-cost.md.)
 
 # Static assets: the bundled SPA is built to dist/ via `npm run build`.
 # The Worker entry routes global API/WS traffic to the gateway DO and object

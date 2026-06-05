@@ -1066,8 +1066,7 @@ export class McpGateway {
         actor: body.actor,
         session: body.session,
         target,
-        verb,
-        authority: body.authority
+        verb
       })
     };
   }

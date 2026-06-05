@@ -754,7 +754,6 @@ describe("v2 Worker fan-out helpers", () => {
             session: "session:cold-capsule-test",
             target: "the_chatroom",
             verb: "enter",
-            authority: { kind: "woo.authority_slice.cells.shadow.v1", sessions: [], page_refs: [], inline_pages: [], counters: { objectCounter: 1, parkedTaskCounter: 1, sessionCounter: 1 }, tombstones: [], source_object_count: 0 },
             expires_at_ms: Date.now() + 30_000
           },
           envelope: "not-read-before-relay-init"
@@ -3494,6 +3493,11 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(secondCapsuleScopeEnvelopes).toHaveLength(1);
       expect(secondCapsuleScopeEnvelopes[0].body.execution_capsule).toMatchObject({ kind: "woo.execution_capsule.v1" });
       expect(secondCapsuleScopeEnvelopes[0].body).not.toHaveProperty("serialized");
+      // The capsule must NOT carry an authority slice — it is validated by
+      // head/scope/actor/session metadata only, and embedding the ~3MB slice
+      // here just doubled the envelope on capsule turns. Regression guard for
+      // the dead-weight removal (notes/2026-06-05-commit-apply-is-not-the-cost.md).
+      expect(secondCapsuleScopeEnvelopes[0].body.execution_capsule).not.toHaveProperty("authority");
     } finally {
       logSpy.mockRestore();
       directoryState.close();
