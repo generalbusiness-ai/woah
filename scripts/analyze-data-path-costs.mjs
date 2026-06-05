@@ -28,6 +28,11 @@ const CLASSIFICATION = {
     signal: "method, cold_world, and per-step ms (get_world/forward/handle/register)",
     endState: "/mcp wrapper steps outside the turn; warm dispatch is small, DELETE teardown is best-effort, and a slow DELETE is contention behind a slow POST, not intrinsic cost."
   },
+  mcp_relocation_prewarm: {
+    bucket: "request_wall_time",
+    signal: "scope, commit_scope, target, verb, ms, status",
+    endState: "Speculative actor commit-scope head/session open for relocation-shaped MCP turns; normal commit validation remains authoritative."
+  },
   broadcast: {
     bucket: "fanout",
     signal: "obs_count and audience_size",

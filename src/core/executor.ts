@@ -118,6 +118,13 @@ export type SubmitTurnIntentResult<Client, Result extends ExecutorEnvelopeResult
       planned?: ShadowTurnCallTranscriptRun;
     };
 
+export type SubmitTurnTimedPhase = "ensure_client" | "submit";
+
+export type SubmitTurnPhaseTimer = {
+  add(phase: SubmitTurnTimedPhase, label: string, ms: number): void;
+  time<T>(phase: SubmitTurnTimedPhase, label: string, body: () => T | Promise<T>): Promise<T>;
+};
+
 export type SubmitTurnIntentOptions<Client, Result extends ExecutorEnvelopeResult> = {
   input: ExecutorCallInput;
   maxAttempts?: number;
@@ -128,6 +135,7 @@ export type SubmitTurnIntentOptions<Client, Result extends ExecutorEnvelopeResul
       phase: "planning" | "commit";
       planningScope: ObjRef;
       plannedTranscriptCommit: boolean;
+      timing: SubmitTurnPhaseTimer;
     }
   ): Promise<Client>;
   clientNode(client: Client): string;
@@ -182,7 +190,7 @@ export type SubmitTurnIntentOptions<Client, Result extends ExecutorEnvelopeResul
   // or sparse class/verb lineage (`E_VERBNF`).
   // This keeps warm turns local while preserving bounded cold-miss repair.
   repairPlanningAuthority?: boolean;
-  submitEnvelope(scope: ObjRef, body: ExecutorEnvelopeBody): Promise<Result>;
+  submitEnvelope(scope: ObjRef, body: ExecutorEnvelopeBody, context: { timing: SubmitTurnPhaseTimer }): Promise<Result>;
   applyAuthority?(client: Client, authority: SerializedAuthoritySlice): void;
   // Adopt the authority's reported current head after a stale-head/version
   // conflict, so the next attempt plans + submits against the right head instead
@@ -543,10 +551,35 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
   let planBuildMs = 0;
   let vmMs = 0;
   let submitMs = 0;
+  const ensureDetailMs = new Map<string, number>();
+  const submitDetailMs = new Map<string, number>();
   let phaseOutcome: "submitted" | "local_frame" | "error" = "error";
   let phaseCommitScope: ObjRef | null = null;
+  const addDetailMs = (map: Map<string, number>, label: string, ms: number): void => {
+    if (!label) return;
+    map.set(label, (map.get(label) ?? 0) + Math.max(0, Math.round(ms)));
+  };
+  const detailRecord = (map: Map<string, number>): Record<string, number> | undefined => {
+    if (map.size === 0) return undefined;
+    return Object.fromEntries(Array.from(map.entries()).sort(([a], [b]) => a.localeCompare(b)));
+  };
+  const timing: SubmitTurnPhaseTimer = {
+    add: (phase, label, ms) => {
+      addDetailMs(phase === "ensure_client" ? ensureDetailMs : submitDetailMs, label, ms);
+    },
+    time: async <T>(phase: SubmitTurnTimedPhase, label: string, body: () => T | Promise<T>): Promise<T> => {
+      const startedAt = Date.now();
+      try {
+        return await body();
+      } finally {
+        timing.add(phase, label, Date.now() - startedAt);
+      }
+    }
+  };
   const repairPlanningAuthority = options.repairPlanningAuthority ?? options.prePlanAuthority === true;
   const emitPhaseTiming = (): void => {
+    const ensureDetail = detailRecord(ensureDetailMs);
+    const submitDetail = detailRecord(submitDetailMs);
     options.onMetric?.({
       kind: "turn_phase_timing",
       scope: options.input.scope,
@@ -563,7 +596,9 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       serialize_ms: serializeMs,
       plan_build_ms: planBuildMs,
       vm_ms: vmMs,
-      submit_ms: submitMs
+      submit_ms: submitMs,
+      ...(ensureDetail ? { ensure_detail_ms: ensureDetail } : {}),
+      ...(submitDetail ? { submit_detail_ms: submitDetail } : {})
     });
   };
   // Time a phase and charge its elapsed wall time even when it THROWS — a
@@ -597,7 +632,8 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     const planningClient = await timePhase((ms) => { ensureClientMs += ms; }, () => options.ensureClient(planningScope, attempt, {
       phase: "planning",
       planningScope,
-      plannedTranscriptCommit: false
+      plannedTranscriptCommit: false,
+      timing
     }));
     const turnId = options.input.id ?? options.nextTurnId(planningClient, attempt);
     const call = buildExecutorCall(options.input, turnId);
@@ -687,7 +723,8 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       : await timePhase((ms) => { ensureClientMs += ms; }, () => options.ensureClient(commitScope, attempt, {
         phase: "commit",
         planningScope,
-        plannedTranscriptCommit
+        plannedTranscriptCommit,
+        timing
       }));
     const authorityObjectIds = mergeExecutorObjectIds(
       options.authorityObjectIds?.(options.input, commitScope)
@@ -735,7 +772,7 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       authority,
       envelope,
       plannedTranscriptCommit
-    })));
+    }), { timing }));
     const replyEnvelope = decodeExecutorReply(result.reply);
     if (replyEnvelope?.body && attempt + 1 < maxAttempts && shouldRetry(replyEnvelope.body)) {
       const body = replyEnvelope.body;

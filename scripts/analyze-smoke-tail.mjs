@@ -352,6 +352,17 @@ function reportTurnPhaseTiming(metrics) {
   // count of authorityPayload calls (each a potential cross-host slice fetch).
   const byVerb = new Map();
   const totals = { total: [], ensure: [], auth: [], serial: [], build: [], vm: [], submit: [], attempts: [], authCalls: [] };
+  const ensureDetails = new Map();
+  const submitDetails = new Map();
+  const addDetails = (target, details) => {
+    if (!details || typeof details !== "object" || Array.isArray(details)) return;
+    for (const [label, value] of Object.entries(details)) {
+      if (typeof value !== "number" || !Number.isFinite(value)) continue;
+      const bucket = target.get(label) || [];
+      bucket.push(value);
+      target.set(label, bucket);
+    }
+  };
   for (const m of metrics) {
     if (m.kind !== "turn_phase_timing") continue;
     const key = `${m.target || "?"}:${m.verb || "?"} (${m.outcome || "?"})`;
@@ -372,6 +383,8 @@ function reportTurnPhaseTiming(metrics) {
     totals.build.push(m.plan_build_ms || 0);
     totals.vm.push(m.vm_ms || 0);
     totals.submit.push(m.submit_ms || 0);
+    addDetails(ensureDetails, m.ensure_detail_ms);
+    addDetails(submitDetails, m.submit_detail_ms);
   }
   if (byVerb.size === 0) {
     console.log("  (no turn_phase_timing metrics — deploy must include Slice 1 instrumentation)");
@@ -400,6 +413,20 @@ function reportTurnPhaseTiming(metrics) {
   for (const [k, v] of Object.entries(phaseSums).sort((a, b) => b[1] - a[1])) {
     console.log(`    ${pad(k, 8)} ${num(v, 8)} ms  ${num(Math.round((v / grand) * 100), 4)}%`);
   }
+  const printDetail = (title, details) => {
+    if (details.size === 0) return;
+    console.log("");
+    console.log(`  ${title}:`);
+    const rows = Array.from(details.entries())
+      .map(([label, values]) => ({ label, stats: summarize(values) }))
+      .sort((a, b) => b.stats.sum - a.stats.sum)
+      .slice(0, 20);
+    for (const row of rows) {
+      console.log(`    ${pad(row.label, 38)} ${num(row.stats.sum, 8)} ms  mean ${num(row.stats.mean, 6)}  p95 ${num(row.stats.p95, 6)}  n=${row.stats.count}`);
+    }
+  };
+  printDetail("ensure subphase detail", ensureDetails);
+  printDetail("submit subphase detail", submitDetails);
 }
 
 function reportMcpDispatchTiming(metrics) {
