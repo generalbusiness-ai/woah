@@ -376,8 +376,28 @@ export function filterSerializedAuthoritySlicePages(
   const pageRefs = authority.page_refs
     .filter(include)
     .map((ref) => structuredClone(ref) as AuthorityPageRef);
-  const keptHashes = new Set(pageRefs.map((ref) => ref.hash));
   const keptObjects = new Set(pageRefs.map((ref) => ref.object));
+  // Lineage-completeness invariant: mergeShadowStatePagesIntoSerialized
+  // (shadow-state-pages.ts) requires that any object referenced by a kept page
+  // also carries its object_lineage page, so a receiver that lacks the object can
+  // reconstruct it. A page-granularity `include` predicate (e.g. the gateway's
+  // owner-only / gap-fill filter) can admit an object's cell page while dropping
+  // its non-owner lineage page — producing a slice that throws "state page set
+  // missing lineage page" downstream (the cross-room-move failure). Re-add each
+  // kept object's lineage page from the original slice when the filter dropped it.
+  // The page keeps its original provenance, so the merge still refuses to treat a
+  // non-authoritative lineage as write-authority; it only fills the reconstruction
+  // gap. (The legacy-object branch above keeps whole objects, so it is already
+  // lineage-complete.)
+  const objectsWithLineage = new Set(
+    pageRefs.filter((ref) => ref.page === "object_lineage").map((ref) => ref.object)
+  );
+  for (const ref of authority.page_refs) {
+    if (ref.page !== "object_lineage" || objectsWithLineage.has(ref.object) || !keptObjects.has(ref.object)) continue;
+    pageRefs.push(structuredClone(ref) as AuthorityPageRef);
+    objectsWithLineage.add(ref.object);
+  }
+  const keptHashes = new Set(pageRefs.map((ref) => ref.hash));
   return {
     ...authority,
     sessions: authority.sessions.map((session) => structuredClone(session) as SerializedSession),
