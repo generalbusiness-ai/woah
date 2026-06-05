@@ -1082,6 +1082,17 @@ function shadowExecutionWorld(node: ShadowExecutionNode): WooWorld {
     node.world = node.authoritative_state
       ? createWorldFromSerialized(node.serialized, { persist: false })
       : createWorldFromSerialized(buildPlanningWorld(node.serialized, node.cellProvenance ?? new Map()), { persist: false });
+    // CA11.2 occupancy-transition: only the sparse/derived planning path carries
+    // per-cell provenance, and only there can a movement destination be a
+    // non-authoritative topology pre-seed that must repair to owner authority
+    // before commit. Attach it so movetoActorChecked can detect that case. The
+    // authoritative path leaves provenance null (the check becomes a no-op).
+    // (The gateway planning VM reaches the world via runShadowTurnCallTranscript,
+    // which attaches provenance from its own options; this covers the executor's
+    // node-built worlds.)
+    if (!node.authoritative_state && node.cellProvenance) {
+      node.world.setPlanningCellProvenance(node.cellProvenance);
+    }
   }
   return node.world;
 }

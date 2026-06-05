@@ -433,7 +433,12 @@ shippable increment (CA16) and is what makes failures legible — the withdrawn
 
 An implementation MAY keep an in-memory per-scope authority checkpoint to avoid
 reconstructing a full planning slice on every warm turn. Such a checkpoint is a
-planning cache, not a new authority source:
+planning cache, not a new authority source. *(Implementation status: the
+Cloudflare profile removed its in-memory per-scope checkpoint in A5 — measurement
+showed it was not delivering warm hits and it was a second, divergent
+materialization of the durable gateway projection cache, which remains the
+cross-turn read model. The rules below still bind any implementation that keeps
+such a checkpoint.)*
 
 - The checkpoint MUST carry `source: "cache"` provenance and a non-null owner
   head sequence for the scope it represents.
@@ -531,6 +536,134 @@ planning cache, not a new authority source:
 
 Commit validation remains authoritative: a write planned from a checkpoint can
 still be rejected by the owner head/cell-version checks.
+
+### CA11.2 Quasi-static topology pre-seeding (cold-start)
+
+CA5.4 establishes that a move's read dependencies — a room's `exits`, the lineage
+of the objects those exits reference, and the destination's `acceptable` verb —
+are **quasi-static topology**. On a cold transport gateway these dependencies are
+the dominant remaining cost: planning a turn in a served scope traces that scope's
+`exits` property to its one-hop neighbor rooms, finds their `object_lineage`
+absent locally, and pays a synchronous cross-host `authority-slice` RPC per
+neighbor owner (the measured `~2.8s authority-slice → <neighbor>` on a cold
+`enter`). This is not inherent: the topology is known, near-static, and small.
+
+A node MAY **pre-seed the bounded one-hop topology closure** of the scopes it
+serves so that planning resolves these read dependencies locally. The closure is
+defined exactly, and is bounded by a served scope's exit fan-degree — never
+transitive, never global:
+
+- For each served scope `S`: `S`'s own `object_lineage` and its `exits`
+  property cell.
+- The **exit objects** named by `S.exits`: their `object_lineage` and the
+  property cells a move reads (`source`, `dest`, and the movement message
+  cells). Exit *verb bytecode* is NOT included — `enter` does not traverse an
+  exit; it is delivered with the catalog class graph.
+- The **one-hop exit-destination rooms** reached through each exit's `dest`:
+  their `object_lineage` **only**. Their `exits`, `object_live`/contents, and
+  verb bytecode are explicitly NOT pre-seeded — those are second-hop topology
+  the entered turn never reads (the next turn in the neighbor repairs them
+  normally).
+
+This closure is **owner-deferring projection material, never authority.** It is
+governed by the CA11 provenance rules with no exception:
+
+- Each pre-seeded page MUST carry a non-authoritative `source` (`projection` or
+  `cache`) and `source_host` set to the **real owner** of the object, discovered
+  from the catalog topology at seed-build time — never the seeding node. A node
+  MUST NOT advertise a pre-seeded topology page as `authoritative`, and the
+  universal class-lineage support set (`MCP_GATEWAY_ACTOR_SUPPORT_ROOTS`, kept to
+  `$actor`/`$thing` and their closure to the lineage top) MUST NOT be broadened
+  to carry scope or catalog-instance lineage. Scope-instance topology reaches a
+  node ONLY through this owner-deferring path. These are two orthogonal,
+  separately-guarded invariants.
+- By the CA11 precedence ranking (`authoritative > projection > cache > fallback
+  > gossip`), an owner's authoritative row always displaces a pre-seeded page,
+  and a pre-seeded page never displaces an authoritative row. The owner-sourced
+  admission already unconditionally accepts an `authoritative` page from the
+  responding owner even for an id the node already holds, so a repair turn that
+  fetches the owner's row refreshes the pre-seeded page.
+- Each pre-seeded page MUST carry the **cell version it was minted at**. This is
+  the staleness hinge: a move's CA5.4 read-dependency validation runs against the
+  owner, so a topology edit that advanced a pre-seeded cell's version after
+  planning is detected at the owner and returned as `E_STALE_AUTHORITY`
+  (CA11), forcing repair-then-replan. A pre-seeded page therefore **never
+  produces silent wrong movement** — at worst one retry on the rare edit.
+- **Occupancy transition: a pre-seeded scope that becomes a served/commit scope
+  MUST revert entirely to owner authority for that turn.** A pre-seed carries
+  only the lineage-only neighbor closure (no `exits`/live cells); it is correct
+  for a *neighbor* a turn merely reads, but it MUST NOT stand in for a scope the
+  actor now occupies and commits against. A node MUST NOT export a pre-seeded row
+  as a local authority row for an id that is a current served scope (an actor's
+  active scope): that id is fetched fresh from its owner, so the commit-scope
+  open seed and any planning snapshot carry the owner's full row (with `exits`),
+  never the lineage-only pre-seed. Concretely: a pre-seeded `the_deck` lets a
+  turn *entering `the_chatroom`* resolve `the_deck` locally as a neighbor, but
+  once an actor occupies `the_deck` and moves *out* of it, `the_deck` is a served
+  scope and its authority — including `exits` — comes from its owner. (Eviction
+  of the resident pre-seed is NOT required and is forbidden as a churn source;
+  the resident row may remain as a gap-filler for *other* actors who still hold
+  `the_deck` only as a neighbor — it simply must not be *exported as authority*
+  for the occupant.)
+- **Movement-destination repair (the dual of the occupancy transition).** A scope
+  becomes "served" not only when it is an actor's active scope *before* planning,
+  but also when the VM resolves it as the **movement destination** *during*
+  planning (the destination is `exit.dest`, known only after the VM runs, so it
+  cannot be in the pre-plan served set). A node that pre-seeds topology MUST,
+  before it commits a move, verify the destination's lineage/live provenance: if
+  the destination stands locally only as a non-authoritative pre-seed
+  (`projection`/`cache`/…), the move boundary MUST raise a repairable
+  `E_NEED_STATE` naming the destination, and the repair pass MUST issue an
+  **owner-required** authority refresh (a `missing_state_repair` pass that
+  disables topology refresh-suppression and the seeded-id local-export exclusion
+  for the named ids) so the owner's exits-bearing row is fetched and, by CA11
+  precedence, displaces the pre-seed before the move re-plans. A plain
+  repair that merely re-requests the id is insufficient — without the
+  owner-required refresh the suppression would re-serve the same pre-seed and the
+  move would loop. This check is OPT-IN: only a planning path that *has* the
+  force-owner repair (the gateway) enables it; holder paths that plan
+  optimistically against derived rows and reconcile by their own protocol (the
+  browser, REST relay) attach provenance but do not enforce it.
+- **Catalog classes are seeded FULL; only instances are lineage-only.** The
+  destination *rooms* in the closure are seeded lineage-only (dynamic instances,
+  repaired to owner on the occupancy transition above). But the shared
+  catalog-**class** chain (`$exit`/`$room`/`$chatroom`/`$space`/…) is STATIC graph
+  data whose verbs the planning VM must dispatch (`$exit:invoke`,
+  `$room:acceptable`/`enterfunc`); it MUST be seeded with its verbs (like the
+  universal actor-support closure), or a cold move fails `E_VERBNF` AND the
+  lineage-only seed would suppress the fetch of the real class. The classes remain
+  owner-deferring `projection` provenance (the owner's class row still wins), but
+  carry their verbs so dispatch resolves locally.
+
+**Accepted bounded read-staleness window.** A pure read that is not a
+version-validated commit — for example listing a room's exits in a `look` — MAY
+observe a stale pre-seeded topology page between a topology edit and the next
+move that re-validates the dependency at the owner. This window is exactly the
+CA6 quasi-static-topology semantics (read dependencies of movement are validated
+at commit, not on every read) and is a deliberate, accepted behavior, not a
+correctness violation: the very next move repairs it. An implementation MUST NOT
+"fix" this by promoting a pre-seeded page to authority or by validating every
+read against the owner.
+
+**Conformance (CA14).** A node that pre-seeds topology MUST satisfy:
+
+1. A cold turn that *reads* a served scope's one-hop neighbor `object_lineage`
+   resolves it locally and performs NO cross-host `authority-slice` RPC for that
+   neighbor. (Zero-fetch holds for the cold READ, NOT for the moment of
+   occupancy — see 6.)
+2. An owner-authoritative row for a pre-seeded object displaces the pre-seeded
+   page in planning.
+3. A pre-seeded page NEVER displaces an owner-authoritative row, and is never
+   served as a write-authority source.
+4. A topology edit at the owner produces `E_STALE_AUTHORITY`/read-version retry
+   (then a correct re-planned move), never a silently-applied wrong move.
+5. The bounded read-staleness window of behavior 4 is the only observable effect
+   of a stale pre-seeded page on a pure read; it is repaired by the next move.
+6. A move INTO a pre-seeded neighbor (the occupancy transition) DOES repair that
+   destination to owner authority before commit — a `missing_state_repair`
+   owner-required refresh — so the move uses the owner's real `exits`/hooks. The
+   optimization is for cold topology reads; the moment of occupancy correctly
+   pays one owner fetch.
 
 ## CA12. Representation alignment
 

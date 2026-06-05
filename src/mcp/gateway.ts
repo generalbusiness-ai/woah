@@ -701,6 +701,11 @@ export class McpGateway {
       // under-tagged cell self-heals on first touch rather than serving silently.
       clientPlanningProvenance: (client) => client.relay.commit_scope.cellProvenance ?? new Map(),
       enforceMissingProvenance: true,
+      // CA11.2: the gateway is the path WITH a force-owner repair (the
+      // `missing_state_repair` authority refresh), so it opts in to the
+      // movement-destination owner-repair check: a move INTO a scope served only
+      // as a non-authoritative topology pre-seed repairs to owner before commit.
+      enforceMovementOwnerRepair: true,
       onAdmissionViolation: (violations) => {
         for (const v of violations) {
           console.warn("woo.planning_world_inadmissible", { where: "mcp_turn_plan", scope, kind: v.kind, object: v.object, page: v.page, detail: v.detail });
@@ -713,20 +718,37 @@ export class McpGateway {
         // It must not consume the first envelope snapshot fallback slot: that
         // fallback is for commit submission after a durable snapshot exists.
         const isPrePlan = context?.phase === "pre_plan";
+        // CA11.2 occupancy transition: a repair-driven pre-plan refresh (the VM /
+        // admission gate proved a missing/unauthoritative cell, e.g. a move INTO a
+        // scope served only as a topology pre-seed) must force owner authority for
+        // the named ids. Tagging it `missing_state_repair` makes
+        // v2GatewayAuthorityPayload disable topology refresh-suppression and the
+        // seeded-id local-export exclusion for those ids, so the owner's
+        // exits-bearing row is fetched and displaces the seed by CA11 precedence.
+        const isRepair = isPrePlan && context?.repair === true;
         const useCommitScopeSnapshotForRemoteAuthority = !isPrePlan && authorityRefreshAttempts === 0;
         if (!isPrePlan) authorityRefreshAttempts += 1;
-        const contentExpansionRoots = isPrePlan ? [submitScope, target] : [];
+        // Directory/session scopes still include submit+target so routes and
+        // sessions resolve for the destination. But a repair-driven pre-plan
+        // (movement-destination occupancy repair) MUST NOT request scope CONTENTS
+        // expansion: contents arrive through the Directory/session projection, and
+        // a repair pre-plan that expands the destination's (possibly stale) guest
+        // contents re-introduces the pre-plan contents expansion the cf-local gate
+        // forbids. So keep the directory-session scopes but drop the
+        // scopeContentExpansionRoots on the repair pass.
+        const directorySessionScopeRoots = isPrePlan ? [submitScope, target] : [];
+        const contentExpansionRoots = isPrePlan && !isRepair ? [submitScope, target] : [];
         const payload = await this.v2AuthorityPayload(extraObjectIds, {
           useCommitScopeSnapshotForRemoteAuthority,
           tolerateRemoteFailures: isPrePlan,
           directorySessionScopes: mcpDirectorySessionScopesForAuthority(
             entry,
             submitScope,
-            ...contentExpansionRoots,
+            ...directorySessionScopeRoots,
             ...(options.directorySessionScopes ?? [])
           ),
           ...(contentExpansionRoots.length > 0 ? { scopeContentExpansionRoots: contentExpansionRoots } : {}),
-          reconstructionReason: "warm_turn_refresh",
+          reconstructionReason: isRepair ? "missing_state_repair" : "warm_turn_refresh",
           reconstructionScope: submitScope
         });
         const fallbackClient = this.v2Scopes.get(scope) ?? this.v2Scopes.get(submitScope);

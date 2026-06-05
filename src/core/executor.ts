@@ -160,12 +160,24 @@ export type SubmitTurnIntentOptions<Client, Result extends ExecutorEnvelopeResul
   // authority merge, seed, and accepted-frame application). Off by default so callers
   // planning against authoritative/untagged worlds are unaffected.
   enforceMissingProvenance?: boolean;
+  // CA11.2: opt IN to the movement-destination owner-repair check. A caller sets
+  // this only on a path that ALSO drives a force-owner repair refresh (the MCP
+  // gateway's `missing_state_repair` authority pass). The browser holder / REST
+  // relay leave it off: they attach provenance but plan optimistically against
+  // derived rows, so a move into one must not become an unrepairable E_NEED_STATE.
+  enforceMovementOwnerRepair?: boolean;
   nextTurnId(client: Client, attempt: number): string;
   envelopeId?(turnId: string, attempt: number): string;
   authorityPayload(
     scope: ObjRef,
     extraObjectIds: ObjRef[],
-    context?: { phase: "intent" | "pre_plan" | "commit" }
+    // `repair` is set on a pre-plan refresh driven by a repairable planning
+    // failure (E_NEED_STATE / E_OBJNF from the VM or admission gate), as opposed
+    // to the first speculative pre-plan refresh. The gateway uses it to request a
+    // missing_state_repair authority refresh that force-fetches owner authority
+    // for the named ids (CA11.2 occupancy transition), displacing any local
+    // topology pre-seed. Absent / false on the first pre-plan and commit phases.
+    context?: { phase: "intent" | "pre_plan" | "commit"; repair?: boolean }
   ): ExecutorAuthorityPayload | Promise<ExecutorAuthorityPayload>;
   // `planned-exec` normally plans from the caller's cached relay view, then
   // refreshes authority for commit. Sparse gateway shards need the reverse for
@@ -608,9 +620,9 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     basePlanningAuthorityObjectIds(planningScope),
     repairObjectIds
   );
-  const refreshPlanningAuthority = async (planningScope: ObjRef, planningClient: Client): Promise<void> => {
+  const refreshPlanningAuthority = async (planningScope: ObjRef, planningClient: Client, repair = false): Promise<void> => {
     authorityCalls += 1;
-    const authority = await timePhase((ms) => { authorityMs += ms; }, () => options.authorityPayload(planningScope, planningAuthorityObjectIds(planningScope), { phase: "pre_plan" }));
+    const authority = await timePhase((ms) => { authorityMs += ms; }, () => options.authorityPayload(planningScope, planningAuthorityObjectIds(planningScope), { phase: "pre_plan", repair }));
     options.applyAuthority?.(planningClient, authority.authority);
   };
   try {
@@ -644,6 +656,12 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
         ...(options.enforceMissingProvenance ? { enforceMissingProvenance: true } : {})
       }));
       planned = await timePhase((ms) => { vmMs += ms; }, () => runShadowTurnCallTranscript(planningWorld, call, {
+        // CA11.2 occupancy transition: thread the same per-cell provenance the
+        // admission gate used, so the movement-boundary check can recognise a move
+        // DESTINATION served only as a non-authoritative topology pre-seed and
+        // force an owner-authority repair before commit.
+        ...(planningProvenance.size > 0 ? { planning_cell_provenance: planningProvenance } : {}),
+        ...(options.enforceMovementOwnerRepair ? { enforce_movement_owner_repair: true } : {}),
         ...(options.onMetric ? { onMetric: options.onMetric } : {})
       }));
     } catch (err) {
@@ -660,7 +678,7 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       const nextRepairObjectIds = mergeExecutorObjectIds(repairObjectIds, repairIds);
       if (attempt + 1 < maxAttempts && nextRepairObjectIds.length > repairObjectIds.length) {
         repairObjectIds = nextRepairObjectIds;
-        if (!options.prePlanAuthority) await refreshPlanningAuthority(planningScope, planningClient);
+        if (!options.prePlanAuthority) await refreshPlanningAuthority(planningScope, planningClient, true);
         continue;
       }
       throw err;
@@ -679,7 +697,7 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       const nextRepairObjectIds = mergeExecutorObjectIds(repairObjectIds, repairIds);
       if (attempt + 1 < maxAttempts && nextRepairObjectIds.length > repairObjectIds.length) {
         repairObjectIds = nextRepairObjectIds;
-        if (!options.prePlanAuthority) await refreshPlanningAuthority(planningScope, planningClient);
+        if (!options.prePlanAuthority) await refreshPlanningAuthority(planningScope, planningClient, true);
         continue;
       }
       phaseOutcome = "local_frame";

@@ -1,6 +1,6 @@
 import { createWorldFromSerialized } from "./bootstrap";
 import { effectTranscriptFromRecordedTurn, type EffectTranscript } from "./effect-transcript";
-import type { PlanningWorld } from "./planning-world";
+import type { PlanningWorld, PlanningWorldProvenance } from "./planning-world";
 import type { SerializedWorld } from "./repository";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, Message, MetricEvent, ObjRef, WooValue } from "./types";
 import { wooError } from "./types";
@@ -40,6 +40,19 @@ export type ShadowTurnCallTranscriptRun = Omit<ShadowTurnCallRun, "serializedAft
 
 export type ShadowTurnCallOptions = {
   allowed_atom_hashes?: Iterable<string>;
+  // CA11.2 occupancy-transition: the planning world's per-cell provenance, so the
+  // movement-boundary check (world.movetoActorChecked) can tell whether a move
+  // DESTINATION's lineage was admitted from an owner-authoritative row or from a
+  // non-authoritative topology pre-seed (projection/cache/...). Only the sparse
+  // gateway planning path supplies it; authoritative/diagnostic runs omit it and
+  // the destination check is a no-op. It is the SAME map passed to
+  // buildPlanningWorld for this turn.
+  planning_cell_provenance?: PlanningWorldProvenance;
+  // CA11.2: opt-in to the movement-destination owner-repair check. Set only by
+  // the MCP gateway path (it has the force-owner `missing_state_repair` refresh);
+  // the browser holder / REST relay attach provenance but leave this off so an
+  // optimistic move into a derived row is not turned into an unrepairable error.
+  enforce_movement_owner_repair?: boolean;
   // Optional forwarder for engine metric events. The ephemeral executor
   // world has no metrics hook by default, so events like `direct_call`,
   // `applied`, and `dispatch_resolved` get dropped on the v2 hot path
@@ -62,6 +75,8 @@ export async function runShadowTurnCall(
 ): Promise<ShadowTurnCallRun> {
   const built = createWorldFromSerialized(world, { persist: false });
   built.setMetricsHook(options.onMetric ?? null);
+  if (options.planning_cell_provenance) built.setPlanningCellProvenance(options.planning_cell_provenance);
+  if (options.enforce_movement_owner_repair) built.setEnforceMovementOwnerRepair(true);
   return await runShadowTurnCallOnWorld(built, call, options);
 }
 
@@ -75,6 +90,8 @@ export async function runShadowTurnCallTranscript(
   // unless a caller explicitly needs that snapshot.
   const built = createWorldFromSerialized(world, { persist: false });
   if (options.onMetric) built.setMetricsHook(options.onMetric);
+  if (options.planning_cell_provenance) built.setPlanningCellProvenance(options.planning_cell_provenance);
+  if (options.enforce_movement_owner_repair) built.setEnforceMovementOwnerRepair(true);
   return await runShadowTurnCallOnWorldTranscript(built, call, options);
 }
 

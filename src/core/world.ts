@@ -36,6 +36,8 @@ import { analyzeBytecodePurity, combineVerbPurity, compileVerb, propagateVerbPur
 import { hashSource, randomHex, constantTimeEqual } from "./source-hash";
 import { shadowOwnerCellVersion, shadowStructuralCellVersion, type ShadowStructuralCellKind } from "./shadow-cell-version";
 import { shadowAtomHash } from "./turn-key";
+import type { PlanningWorldProvenance } from "./planning-world";
+import { planningCellKey } from "./planning-world";
 import { objectCreateEvent, type ActiveTurnRecorder, type RecordedCell, type RecordedWriteAuthority, type TurnRecorder, type TurnRecorderEvent, type TurnStart } from "./turn-recorder";
 import { remoteBridgeUntrackedEffect } from "./remote-bridge-transcript-policy";
 import { readObjectPropertyValue } from "./property-read";
@@ -546,6 +548,23 @@ export class WooWorld {
   private shadowExecutionGuardActive = false;
   private currentTurnWriter: RecordedWriteAuthority | null = null;
   private logicalInputReplay: Map<string, WooValue[]> | null = null;
+  // CA11.2 occupancy-transition: per-cell provenance for the ephemeral planning
+  // world this WooWorld was built from. Only the sparse gateway planning path
+  // supplies it (via setPlanningCellProvenance); authoritative/cold-load worlds
+  // leave it null, so the movement-boundary check below is a no-op. It lets the
+  // move code recognise a movement DESTINATION whose lineage was served by a
+  // non-authoritative (projection/cache/...) topology pre-seed and force an
+  // owner-authoritative repair before committing a move INTO it.
+  private planningCellProvenance: PlanningWorldProvenance | null = null;
+  // CA11.2: the movement-destination owner-repair is OPT-IN. Only a planning
+  // path that has a force-owner repair mechanism (the MCP gateway, whose repair
+  // pass issues a `missing_state_repair` authority refresh) enables it. Other
+  // provenance-carrying paths — the browser holder and REST relay, which plan
+  // optimistically against `cache` rows and reconcile by their own protocol —
+  // attach provenance for the admission gate but MUST NOT have a move into a
+  // derived row turned into a hard E_NEED_STATE they cannot repair. So the check
+  // requires this flag in addition to non-authoritative provenance.
+  private enforceMovementOwnerRepair = false;
 
   constructor(private repository?: WooRepository, options: { executorContext?: ExecutorContext | null; turnRecorder?: TurnRecorder | null } = {}) {
     this.objectRepository = isObjectRepository(repository) ? repository : null;
@@ -556,6 +575,22 @@ export class WooWorld {
 
   setTurnRecorder(recorder: TurnRecorder | null): void {
     this.turnRecorder = recorder;
+  }
+
+  // CA11.2: attach the planning world's per-cell provenance so the
+  // movement-boundary check in movetoActorChecked can tell whether a movement
+  // destination's lineage was admitted from an owner-authoritative row or from
+  // a non-authoritative topology pre-seed (projection/cache/fallback/gossip).
+  // Only the sparse gateway planning path supplies this; everything else leaves
+  // it null and the destination check is skipped.
+  setPlanningCellProvenance(provenance: PlanningWorldProvenance | null): void {
+    this.planningCellProvenance = provenance;
+  }
+
+  // CA11.2: enable the opt-in movement-destination owner-repair check (gateway
+  // path only — see `enforceMovementOwnerRepair`).
+  setEnforceMovementOwnerRepair(enforce: boolean): void {
+    this.enforceMovementOwnerRepair = enforce;
   }
 
   /**
@@ -5697,6 +5732,21 @@ export class WooWorld {
       const session = this.sessions.get(ctx.session);
       if (!session || session.actor !== actor) throw wooError("E_NOSESSION", "actor moveto requires the calling actor's live session", { actor, session: ctx.session });
       if (!await this.remoteHostForObject(targetRef, ctx.hostMemo)) this.object(targetRef);
+      // CA11.2 occupancy transition. The destination of a move is resolved at the
+      // VM (from an exit's `dest`), so it is not in the authority payload's
+      // served-scope set — the gateway may have served its lineage as a
+      // non-authoritative one-hop topology pre-seed (correct for a NEIGHBOR a turn
+      // merely reads, but NOT for a scope the actor now occupies and commits
+      // against: that seed carries no `exits`/live cells). If the destination is
+      // a LOCAL-resident row whose recorded planning provenance is non-
+      // authoritative, force an owner-authoritative repair before commit: raise a
+      // repairable E_NEED_STATE naming the destination. The repair pass force-
+      // fetches the owner row (reconstructionReason "missing_state_repair"
+      // disables topology refresh-suppression), which displaces the seed by CA11
+      // precedence, and the executor re-plans against the owner's exits-bearing
+      // row. A remote destination has no local seed to displace, and a turn with
+      // no attached planning provenance (authoritative/cold-load) skips the check.
+      this.assertMovementDestinationOwnerAuthority(targetRef);
       await this.invokeAcceptableHook(ctx, targetRef, actor);
       const oldLocation = session.activeScope;
       if (oldLocation && (this.objects.has(oldLocation) || await this.remoteHostForObject(oldLocation, ctx.hostMemo))) {
@@ -5748,6 +5798,35 @@ export class WooWorld {
         await this.invokeContainerHookSwallow(ctx, targetRef, "enterfunc", [actor]);
       }
       return targetRef;
+    }
+
+    // CA11.2 occupancy-transition guard. If `targetRef` is the destination of a
+    // move whose lineage was admitted into this planning world from a
+    // non-authoritative topology pre-seed, throw a repairable E_NEED_STATE so the
+    // executor refreshes the owner row before committing the move. No-op unless
+    // (a) planning provenance was attached (sparse gateway path only), (b) the
+    // target is local-resident (a remote target has no local seed to displace),
+    // and (c) the recorded lineage (or live) provenance is present and NOT
+    // "authoritative". The missing-atom shape matches planningInadmissibleNeedState
+    // so the existing repair loop extracts the target id and re-plans.
+    private assertMovementDestinationOwnerAuthority(targetRef: ObjRef): void {
+      if (!this.enforceMovementOwnerRepair) return;
+      const provenance = this.planningCellProvenance;
+      if (!provenance) return;
+      if (!this.objects.has(targetRef)) return;
+      const lineageProv = provenance.get(planningCellKey(targetRef, "object_lineage"));
+      const liveProv = provenance.get(planningCellKey(targetRef, "object_live"));
+      // A recorded non-authoritative provenance on EITHER tracked cell means the
+      // destination row standing locally is a derived copy (projection/cache/
+      // fallback/gossip), not the owner's authority — it lacks the dynamic
+      // `exits`/live state a move OUT of the now-occupied scope will read.
+      const isNonAuthoritative = (prov: { source?: string } | undefined): boolean =>
+        prov !== undefined && prov.source !== "authoritative";
+      if (!isNonAuthoritative(lineageProv) && !isNonAuthoritative(liveProv)) return;
+      const preimage = `read:cell:lifecycle:${targetRef}`;
+      throw wooError("E_NEED_STATE", "movement destination served from non-authoritative topology pre-seed; repair to owner authority before commit", {
+        missing_atoms: [{ hash: shadowAtomHash(preimage), preimage }]
+      });
     }
 
     private assertCanMoveto(ctx: CallContext, objRef: ObjRef): void {
@@ -6775,6 +6854,52 @@ export class WooWorld {
       this.sessionCounter = serialized.sessionCounter;
       this.rebuildGuestPool();
     });
+  }
+
+  /**
+   * CA11.2 topology pre-seed merge. Insert lineage-only neighbor/class rows into
+   * the live world ONLY for ids not already resident, returning the ids actually
+   * added. This NEVER overwrites an existing row, so a genuinely-resident
+   * authoritative row (an actor, a served scope fetched from its owner, a
+   * support class) always wins; the seed only fills a gap so a one-hop neighbor
+   * room's parent walk resolves locally. The caller stamps the added ids
+   * owner-deferring at export (the world treats them as ordinary resident rows
+   * for value-trace/parent-walk, which read world.objects only).
+   *
+   * Pre-seeded rows carry no live/dynamic cells (the caller passes lineage-only
+   * SerializedObjects); they are quasi-static topology, validated at the owner on
+   * the next move (CA11/CA6). Persistence stays paused: a gateway shard world is
+   * not durable, and these rows must never be written back as authority.
+   */
+  mergeTopologySeedObjects(objects: readonly SerializedObject[]): Set<ObjRef> {
+    const added = new Set<ObjRef>();
+    if (objects.length === 0) return added;
+    this.withPersistencePaused(() => {
+      for (const item of objects) {
+        if (this.objects.has(item.id)) continue;
+        this.objects.set(item.id, {
+          id: item.id,
+          name: item.name,
+          parent: item.parent,
+          owner: item.owner,
+          location: item.location,
+          anchor: item.anchor,
+          flags: { ...(item.flags ?? {}) },
+          created: item.created,
+          modified: item.modified,
+          propertyDefs: new Map(item.propertyDefs.map((def) => [def.name, { ...def, defaultValue: cloneImportedPlainData(def.defaultValue) }])),
+          properties: new Map(item.properties.map(([name, value]) => [name, cloneImportedPlainData(value)])),
+          propertyVersions: new Map(item.propertyVersions),
+          verbs: item.verbs.map((verb, index) => cloneImportedVerb(verb, index + 1)),
+          children: new Set(item.children),
+          contents: new Set(item.contents),
+          eventSchemas: new Map(item.eventSchemas.map(([type, schema]) => [type, cloneImportedPlainData(schema)]))
+        });
+        added.add(item.id);
+      }
+    });
+    if (added.size > 0) this.bumpMutationVersion();
+    return added;
   }
 
   applyProjectionWrites(writes: readonly ProjectionWrite[], options: ProjectionApplyOptions = {}): ShadowHostApplyResult {
