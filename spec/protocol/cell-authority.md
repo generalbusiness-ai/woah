@@ -132,6 +132,15 @@ motivated MV-A cannot occur.
 
 Projection maintenance rules (all MUST):
 
+- **Durable owner delivery.** A movement commit's source and destination
+  container owners MUST receive enough of the accepted movement event to update
+  their contents projections, even when the committing scope emits no full
+  projection row for that foreign container. A projection-write-through path
+  that partitions only by emitted row owner MUST therefore add the move's
+  source/destination container owners to the durable fanout and let each owner
+  rebuild its own membership row from the accepted move. Non-owner hosts may
+  cache such rows, but MUST NOT persist ownership of a container they merely
+  cache.
 - **Idempotent application.** Applying the same accepted movement event twice
   MUST NOT create duplicate membership. Application is keyed by movement event id
   or by the member's `live:location` source version.
@@ -838,7 +847,11 @@ several require a multi-DO harness, CA16):
     `SerializedWorld` or scan all objects in a scope when exact keys are known.
 15. The conformance suite runs with separate DOs for actor homes, room
     projection owners, route homes, and commit scopes — not a single process.
-16. **Hot-room load (CA13).** With many occupants and high enter/leave churn in
+16. Projection-mode write-through of a cross-host move durably repairs the
+    foreign source/destination container owner's `contents` projection from the
+    accepted move, even when that host receives no full object projection row;
+    a non-owner cached copy must remain a no-op for durable persistence.
+17. **Hot-room load (CA13).** With many occupants and high enter/leave churn in
     one room: room-sequencer commit rate stays ≈ the shared-state-mutation rate
     (independent of occupancy, movement, and chat rate); fanout fan-degree scales
     with occupant *shard* count, not occupant count; and no movement, projection,
