@@ -6777,6 +6777,71 @@ export class WooWorld {
     });
   }
 
+  /**
+   * CA11.2 topology pre-seed merge. Insert lineage-only neighbor/class rows into
+   * the live world ONLY for ids not already resident, returning the ids actually
+   * added. This NEVER overwrites an existing row, so a genuinely-resident
+   * authoritative row (an actor, a served scope fetched from its owner, a
+   * support class) always wins; the seed only fills a gap so a one-hop neighbor
+   * room's parent walk resolves locally. The caller stamps the added ids
+   * owner-deferring at export (the world treats them as ordinary resident rows
+   * for value-trace/parent-walk, which read world.objects only).
+   *
+   * Pre-seeded rows carry no live/dynamic cells (the caller passes lineage-only
+   * SerializedObjects); they are quasi-static topology, validated at the owner on
+   * the next move (CA11/CA6). Persistence stays paused: a gateway shard world is
+   * not durable, and these rows must never be written back as authority.
+   */
+  mergeTopologySeedObjects(objects: readonly SerializedObject[]): Set<ObjRef> {
+    const added = new Set<ObjRef>();
+    if (objects.length === 0) return added;
+    this.withPersistencePaused(() => {
+      for (const item of objects) {
+        if (this.objects.has(item.id)) continue;
+        this.objects.set(item.id, {
+          id: item.id,
+          name: item.name,
+          parent: item.parent,
+          owner: item.owner,
+          location: item.location,
+          anchor: item.anchor,
+          flags: { ...(item.flags ?? {}) },
+          created: item.created,
+          modified: item.modified,
+          propertyDefs: new Map(item.propertyDefs.map((def) => [def.name, { ...def, defaultValue: cloneImportedPlainData(def.defaultValue) }])),
+          properties: new Map(item.properties.map(([name, value]) => [name, cloneImportedPlainData(value)])),
+          propertyVersions: new Map(item.propertyVersions),
+          verbs: item.verbs.map((verb, index) => cloneImportedVerb(verb, index + 1)),
+          children: new Set(item.children),
+          contents: new Set(item.contents),
+          eventSchemas: new Map(item.eventSchemas.map(([type, schema]) => [type, cloneImportedPlainData(schema)]))
+        });
+        added.add(item.id);
+      }
+    });
+    if (added.size > 0) this.bumpMutationVersion();
+    return added;
+  }
+
+  /**
+   * CA11.2 topology seed eviction. Drop a previously-seeded lineage-only row so
+   * the normal authority path can re-materialize the object with full dynamic
+   * cells. Used when a pre-seeded NEIGHBOR becomes the actor's OCCUPIED commit
+   * scope: a lineage-only page has no `exits`/`next_seq`, so it must be evicted
+   * and replaced by the owner's authoritative row, not shadow it. Only removes
+   * the row if it is still present; safe to call for an absent id. Returns true
+   * if a row was removed.
+   */
+  evictTopologySeedObject(id: ObjRef): boolean {
+    if (!this.objects.has(id)) return false;
+    let removed = false;
+    this.withPersistencePaused(() => {
+      removed = this.objects.delete(id);
+    });
+    if (removed) this.bumpMutationVersion();
+    return removed;
+  }
+
   applyProjectionWrites(writes: readonly ProjectionWrite[], options: ProjectionApplyOptions = {}): ShadowHostApplyResult {
     const persist = options.persist !== false;
     const result: ShadowHostApplyResult = {
