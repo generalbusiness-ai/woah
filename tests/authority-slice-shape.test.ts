@@ -229,6 +229,8 @@ describe("WooWorld.exportAuthoritySlice content contract", () => {
     if (filtered.kind === "woo.authority_slice.cells.shadow.v1") {
       // The filter must re-add the lineage page so the object remains reconstructable.
       expect(filtered.page_refs.some((ref) => ref.object === "the_deck" && ref.page === "object_lineage")).toBe(true);
+      expect(filtered.page_refs.find((ref) => ref.object === "the_deck" && ref.page === "object_lineage")?.source_host).toBe("the_deck");
+      expect(filtered.page_refs).toEqual([...filtered.page_refs].sort(compareAuthorityRefsForTest));
     }
     // Must not throw "state page set missing lineage page for the_deck".
     const serialized = serializedWorldFromAuthoritySlice(filtered);
@@ -317,4 +319,11 @@ function objectRecord(id: string, contents: string[]): SerializedObject {
     contents,
     eventSchemas: []
   };
+}
+
+function compareAuthorityRefsForTest(
+  a: { object: string; page: string; name?: string },
+  b: { object: string; page: string; name?: string }
+): number {
+  return a.object.localeCompare(b.object) || a.page.localeCompare(b.page) || (a.name ?? "").localeCompare(b.name ?? "");
 }

@@ -397,6 +397,7 @@ export function filterSerializedAuthoritySlicePages(
     pageRefs.push(structuredClone(ref) as AuthorityPageRef);
     objectsWithLineage.add(ref.object);
   }
+  pageRefs.sort(compareAuthorityPageRefs);
   const keptHashes = new Set(pageRefs.map((ref) => ref.hash));
   return {
     ...authority,
