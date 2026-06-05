@@ -149,6 +149,10 @@ export interface Env {
   WOO_V2_BROWSER_CHECKPOINT_TAIL_OPEN?: string;
   WOO_BROWSER_PROJECTION_HOLDER?: string;
   WOO_V2_EXECUTION_CAPSULE?: string;
+  // When set, the MCP gateway sends /v2/envelope turns without the ~3MB
+  // top-level authority slice; the CommitScopeDO rehydrates from its own durable
+  // snapshot and a truly-cold scope falls back via E_SNAPSHOT_REQUIRED.
+  WOO_V2_SLIM_WARM_ENVELOPE?: string;
   // Workers Analytics Engine binding. The metrics-sink module writes every
   // `MetricEvent` here (modulo sampling) so /admin/stats can query historical
   // counts and latencies without depending on tail-time consumption.
@@ -1670,7 +1674,8 @@ export class PersistentObjectDO {
               reconstructionReason: authorityOptions?.reconstructionReason,
               reconstructionScope: authorityOptions?.reconstructionScope
             }),
-          executionCapsuleOpen: envFlag(this.env.WOO_V2_EXECUTION_CAPSULE)
+          executionCapsuleOpen: envFlag(this.env.WOO_V2_EXECUTION_CAPSULE),
+          slimWarmEnvelope: envFlag(this.env.WOO_V2_SLIM_WARM_ENVELOPE)
         },
         toolManifests: {
           staleFallback: true,
@@ -4726,8 +4731,7 @@ export class PersistentObjectDO {
         actor: body.actor,
         session: body.session,
         target,
-        verb,
-        authority: body.authority
+        verb
       })
     };
   }

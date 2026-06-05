@@ -173,6 +173,11 @@ const CLASSIFICATION = {
     signal: "shards, observations, affected_scopes",
     endState: "Fan out accepted frame, ProjectionDeltaSummary, and fanout observations; gateway consumes rows, not executable state."
   },
+  mcp_envelope_slim_reseed: {
+    bucket: "commit_request",
+    signal: "scope and mode",
+    endState: "Slim envelopes should almost never reseed; nonzero counts identify true cold snapshot misses or unsafe slimming."
+  },
   mcp_gateway_rebind: {
     bucket: "session_binding",
     signal: "sessions_rebound",
@@ -340,8 +345,13 @@ const CLASSIFICATION = {
   },
   v2_envelope: {
     bucket: "commit_request",
-    signal: "reply, fanout, full_save, ms, projection_bytes, reply_hit",
-    endState: "Envelope writes accepted frame and touched rows; reply SQL write must be measured or moved off hot path."
+    signal: "reply, fanout, full_save, ms, request/reply bytes, projection_bytes",
+    endState: "Warm envelope request bytes should be KB-scale; accepted turns append frame/tail and touched rows only."
+  },
+  v2_envelope_bytes: {
+    bucket: "known_bytes",
+    signal: "request_bytes, authority_bytes, sessions_bytes, relay_warmth",
+    endState: "Diagnostic only; use to prove authority-slice bytes are absent from warm envelopes, then disable to avoid re-stringify cost."
   },
   v2_host_apply_fanout: {
     bucket: "fanout_apply",

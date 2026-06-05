@@ -96,6 +96,22 @@ const COMMIT_SCOPE_SNAPSHOT_REPAIR_EPOCH = "commit-scope-catalog-repair-v1";
 
 type CommitScopeEnv = InternalAuthEnv & {
   WOO_AUTO_INSTALL_CATALOGS?: string;
+  // P1′ probe (2026-06-05): when set, on-commit checkpoint builds are gated by a
+  // frame-count threshold instead of running on EVERY accepted commit. The
+  // durable accepted-frame + transcript tail already covers cold catch-up; the
+  // checkpoint is only a replay accelerator, so skipping it on most commits is
+  // safe and lets us measure how much of the per-turn CommitScopeDO cpuTime the
+  // full ~3MB checkpoint rebuild accounts for. Default (unset) preserves the
+  // exact prior behavior (checkpoint every commit).
+  WOO_V2_CHECKPOINT_BOUNDED?: string;
+  // Frames between on-commit checkpoints when WOO_V2_CHECKPOINT_BOUNDED is on.
+  // Set very high (e.g. 1000000) to measure the floor (effectively never
+  // checkpoint on commit); set to a sane value (e.g. 32) as the actual fix.
+  WOO_V2_CHECKPOINT_FRAME_INTERVAL?: string;
+  // Authority-slimming probe (step 1): when on, emit a v2_envelope_bytes metric
+  // breaking the request into authority / capsule-authority / sessions / envelope
+  // bytes plus relay warmth. Off by default — it re-stringifies the large slice.
+  WOO_V2_ENVELOPE_BYTE_BREAKDOWN?: string;
 };
 
 type PersistedCheckpointPageRef = {
@@ -147,6 +163,13 @@ export class CommitScopeDO {
   private relayInitPromise: Promise<ShadowRelayCache> | null = null;
   private fullSavePromise: Promise<void> | null = null;
   private checkpointBuildPromise: Promise<void> | null = null;
+  // Authority-slimming probe (step 1): how the relay for the current request was
+  // obtained — "snapshot" (rehydrated from this DO's own durable storage) or
+  // "cold_seed" (built from the request's authority/serialized payload). Combined
+  // with "relay already in memory" at the call site this classifies each envelope
+  // as warm / snapshot-rehydrated / cold-seeded, the axis that decides whether the
+  // ~3MB top-level authority in the request was actually needed.
+  private lastRelayInitSource: "snapshot" | "cold_seed" | null = null;
 
   constructor(
     private readonly state: CommitScopeDurableState,
@@ -421,12 +444,22 @@ export class CommitScopeDO {
         let node: string | undefined;
         let fullSave = false;
         let tailStats: CommitScopeTailStats | null = null;
+        // P1′ size proxy: request body bytes from the header (clock-free; the
+        // in-DO performance.now() cannot see synchronous parse/serialize CPU).
+        const requestBytes = Number(request.headers.get("content-length") ?? 0) || 0;
         try {
           await verifyInternalRequest(this.env, request);
           const input = await readJson<CommitScopeEnvelopeRequest>(request);
           scope = input.scope;
           node = input.node;
+          // Authority-slimming probe (step 1): classify how the relay is obtained.
+          // "warm" = already in memory; otherwise relayFor sets lastRelayInitSource
+          // to "snapshot" (our own durable storage) or "cold_seed" (request payload).
+          const relayWasWarm = this.relay !== null;
+          this.lastRelayInitSource = null;
           const relay = await this.relayFor(input);
+          const relayWarmth = relayWasWarm ? "warm" : (this.lastRelayInitSource ?? "unknown");
+          this.emitEnvelopeByteBreakdown(input, requestBytes, relayWarmth);
           this.ensureSerializedSession(relay, input);
           const browser = this.browserFor(relay, input);
           const replayStartedAt = metricNow();
@@ -456,6 +489,15 @@ export class CommitScopeDO {
           });
           const fanout = reply ? this.fanoutEnvelopes(relay, input.node, reply) : [];
           const responseReply = reply ? this.replyForReceiverProfile(reply, input) : null;
+          // P1′ size proxies: hoist the response encodes so we can measure their
+          // size without a second serialization. Lengths are char-count
+          // approximations of byte size — accurate enough to correlate with the
+          // synchronous encode CPU the clock can't see.
+          const encodedReply = reply ? encodeEnvelope<ShadowEnvelopeReplyBody>(reply as ShadowEnvelope<ShadowEnvelopeReplyBody>) : null;
+          const encodedReceiverReply = (responseReply && responseReply !== reply)
+            ? encodeEnvelope<ShadowEnvelopeReplyBody>(responseReply as ShadowEnvelope<ShadowEnvelopeReplyBody>)
+            : null;
+          const fanoutBytes = fanout.reduce((total, item) => total + item.node.length + item.envelope.length, 0);
           this.emitMetric({
             kind: "v2_envelope",
             scope,
@@ -466,6 +508,10 @@ export class CommitScopeDO {
             reply: shadowReplyMetricKind(reply),
             fanout: fanout.length,
             full_save: fullSave,
+            request_bytes: requestBytes,
+            reply_bytes: encodedReply?.length ?? 0,
+            receiver_reply_bytes: encodedReceiverReply?.length ?? 0,
+            fanout_bytes: fanoutBytes,
             ...(tailStats ? {
               tail_rows_written: tailStats.rowsWritten,
               tail_bytes_retained: tailStats.bytesRetained,
@@ -475,9 +521,9 @@ export class CommitScopeDO {
           this.emitShadowCommitMetric(reply, node, fanout.length);
           return jsonResponse({
             ok: true,
-            reply: reply ? encodeEnvelope<ShadowEnvelopeReplyBody>(reply as ShadowEnvelope<ShadowEnvelopeReplyBody>) : null,
-            ...(responseReply && responseReply !== reply ? {
-              receiver_reply: encodeEnvelope<ShadowEnvelopeReplyBody>(responseReply as ShadowEnvelope<ShadowEnvelopeReplyBody>)
+            reply: encodedReply,
+            ...(encodedReceiverReply ? {
+              receiver_reply: encodedReceiverReply
             } : {}),
             head: relay.commit_scope.head,
             fanout
@@ -584,6 +630,7 @@ export class CommitScopeDO {
       this.snapshotLoaded = true;
       if (loaded) {
         this.relay = loaded;
+        this.lastRelayInitSource = "snapshot";
         return loaded;
       }
     }
@@ -611,6 +658,7 @@ export class CommitScopeDO {
       relay.commit_scope.cellProvenance = cellProvenanceFromAuthoritySlice(input.authority);
     }
     this.relay = relay;
+    this.lastRelayInitSource = "cold_seed";
     this.needsFullSave = true;
     return relay;
   }
@@ -1711,9 +1759,79 @@ export class CommitScopeDO {
         accepted_frames_retained: tailStats.value.acceptedFramesRetained,
         transcript_tail_retained: tailStats.value.transcriptTailRetained
       });
-      this.scheduleCheckpointBuild(relay, "accepted_commit");
+      this.maybeCheckpointOnCommit(relay);
     }
     return tailStats.value;
+  }
+
+  // Authority-slimming probe (step 1): break the ~3MB envelope request into its
+  // components so we know WHAT to slim. Gated behind WOO_V2_ENVELOPE_BYTE_BREAKDOWN
+  // because measuring sizes re-stringifies the (large) authority slice, which adds
+  // synchronous CPU — we only want that during a composition run, not permanently.
+  // The clean floor cpuTime comes from the non-breakdown deploy; this run answers
+  // "is it top-level authority, double-carried capsule authority, or sessions, and
+  // is the slice even needed (relay warm/snapshot vs cold_seed)".
+  private emitEnvelopeByteBreakdown(
+    input: CommitScopeEnvelopeRequest,
+    requestBytes: number,
+    relayWarmth: string
+  ): void {
+    if (!envFlag(this.env.WOO_V2_ENVELOPE_BYTE_BREAKDOWN)) return;
+    this.emitMetric({
+      kind: "v2_envelope_bytes",
+      scope: input.scope,
+      node: input.node,
+      relay_warmth: relayWarmth,
+      request_bytes: requestBytes,
+      authority_bytes: input.authority ? jsonByteLength(input.authority) : 0,
+      // The execution capsule no longer carries an authority slice (removed as
+      // dead weight); kept at 0 so the metric shape is stable for the follow-up
+      // thin-warm-envelope verification.
+      capsule_authority_bytes: 0,
+      capsule_present: Boolean(input.execution_capsule),
+      sessions_bytes: input.sessions ? jsonByteLength(input.sessions) : 0,
+      session_objects_bytes: input.session_objects ? jsonByteLength(input.session_objects) : 0,
+      envelope_bytes: input.envelope ? input.envelope.length : 0
+    });
+  }
+
+  // Decide whether this accepted commit should trigger a checkpoint rebuild.
+  // Default (WOO_V2_CHECKPOINT_BOUNDED unset) = checkpoint every commit, exactly
+  // as before. When bounded mode is on, only checkpoint once the head has advanced
+  // WOO_V2_CHECKPOINT_FRAME_INTERVAL frames past the LAST PERSISTED checkpoint;
+  // intervening commits rely on the durable accepted-frame tail for cold catch-up
+  // (the tail self-protects — frames are not pruned until a complete checkpoint
+  // covers them, see pruneTailTableByHorizon).
+  //
+  // The gate reads the persisted checkpoint head (completeCheckpointHeadSeq), NOT
+  // an in-memory counter: this DO reconstructs on essentially every turn in
+  // production, so an in-memory "last checkpoint seq" resets constantly and the
+  // gate would never skip. The persisted seq survives reconstruction, so the
+  // interval is honoured across cold activations.
+  private maybeCheckpointOnCommit(relay: ShadowRelayCache): void {
+    if (!envFlag(this.env.WOO_V2_CHECKPOINT_BOUNDED)) {
+      this.scheduleCheckpointBuild(relay, "accepted_commit");
+      return;
+    }
+    const scope = relay.commit_scope.scope;
+    const headSeq = relay.commit_scope.head.seq;
+    const interval = checkpointFrameInterval(this.env.WOO_V2_CHECKPOINT_FRAME_INTERVAL);
+    const checkpointedSeq = this.completeCheckpointHeadSeq(scope);
+    const due = checkpointedSeq === null || headSeq - checkpointedSeq >= interval;
+    if (!due) {
+      this.emitMetric({
+        kind: "v2_open_step",
+        phase: "checkpoint_build",
+        scope,
+        reason: "accepted_commit_bounded_skip",
+        ms: 0,
+        status: "ok",
+        count: 0,
+        bytes: 0
+      });
+      return;
+    }
+    this.scheduleCheckpointBuild(relay, "accepted_commit_bounded");
   }
 
   private saveMeta(relay: ShadowRelayCache, now: number): void {
@@ -2276,6 +2394,17 @@ function boundedPositiveInteger(value: unknown, fallback: number, max: number): 
   return typeof value === "number" && Number.isInteger(value) && value > 0
     ? Math.min(value, max)
     : fallback;
+}
+
+function envFlag(value: string | undefined): boolean {
+  return /^(1|true|yes|on)$/i.test((value ?? "").trim());
+}
+
+// P1′ probe: frames between on-commit checkpoints under WOO_V2_CHECKPOINT_BOUNDED.
+const CHECKPOINT_FRAME_INTERVAL_DEFAULT = 32;
+function checkpointFrameInterval(value: string | undefined): number {
+  const raw = Number((value ?? "").trim());
+  return Number.isInteger(raw) && raw > 0 ? raw : CHECKPOINT_FRAME_INTERVAL_DEFAULT;
 }
 
 function jsonByteLength(value: unknown): number {

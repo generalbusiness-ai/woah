@@ -754,7 +754,6 @@ describe("v2 Worker fan-out helpers", () => {
             session: "session:cold-capsule-test",
             target: "the_chatroom",
             verb: "enter",
-            authority: { kind: "woo.authority_slice.cells.shadow.v1", sessions: [], page_refs: [], inline_pages: [], counters: { objectCounter: 1, parkedTaskCounter: 1, sessionCounter: 1 }, tombstones: [], source_object_count: 0 },
             expires_at_ms: Date.now() + 30_000
           },
           envelope: "not-read-before-relay-init"
@@ -766,6 +765,41 @@ describe("v2 Worker fan-out helpers", () => {
       expect(body.error).toMatchObject({
         code: "E_SNAPSHOT_REQUIRED",
         message: expect.stringContaining("no durable snapshot for execution capsule")
+      });
+    } finally {
+      state.close();
+    }
+  });
+
+  it("returns snapshot-required for a slim envelope (no authority, no capsule) on a cold scope", async () => {
+    // The slim warm-envelope path sends NO top-level authority. A scope that has
+    // never persisted a snapshot cannot seed from such a body, so it must reply
+    // E_SNAPSHOT_REQUIRED — the signal the gateway retries on (reseed + full body).
+    const secret = "cf-test-secret";
+    const state = new FakeDurableObjectState("#cold-slim");
+    const target = new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: secret });
+    try {
+      const request = await signInternalRequest({ WOO_INTERNAL_SECRET: secret }, new Request("https://woo.internal/v2/envelope", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          scope: "#cold-slim",
+          node: "mcp:cold-slim-test",
+          token: "token:cold-slim-test",
+          session: "session:cold-slim-test",
+          actor: "guest_1",
+          sessions: [],
+          session_objects: [],
+          // no authority, no execution_capsule — the slim shape.
+          envelope: "not-read-before-relay-init"
+        })
+      }));
+      const response = await target.fetch(request);
+      expect(response.ok).toBe(false);
+      const body = await response.json() as { error?: { code?: string; message?: string } };
+      expect(body.error).toMatchObject({
+        code: "E_SNAPSHOT_REQUIRED",
+        message: expect.stringContaining("no durable snapshot")
       });
     } finally {
       state.close();
@@ -3494,6 +3528,10 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(secondCapsuleScopeEnvelopes).toHaveLength(1);
       expect(secondCapsuleScopeEnvelopes[0].body.execution_capsule).toMatchObject({ kind: "woo.execution_capsule.v1" });
       expect(secondCapsuleScopeEnvelopes[0].body).not.toHaveProperty("serialized");
+      // The capsule must NOT carry an authority slice — it is validated by
+      // head/scope/actor/session metadata only, and embedding the ~3MB slice
+      // here just doubled the envelope on capsule turns.
+      expect(secondCapsuleScopeEnvelopes[0].body.execution_capsule).not.toHaveProperty("authority");
     } finally {
       logSpy.mockRestore();
       directoryState.close();

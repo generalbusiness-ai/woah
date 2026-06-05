@@ -59,6 +59,33 @@ describe("analyze-data-path-costs", () => {
     expect(result.stdout).toContain("| mcp_relocation_prewarm | 1 | request_wall_time |");
   });
 
+  it("classifies slim-envelope sizing and reseed metrics", () => {
+    const result = runAnalyzer(
+      {
+        kind: "v2_envelope_bytes",
+        scope: "the_chatroom",
+        node: "mcp:test",
+        relay_warmth: "snapshot",
+        request_bytes: 50800,
+        authority_bytes: 0,
+        capsule_authority_bytes: 0,
+        capsule_present: false,
+        sessions_bytes: 300,
+        session_objects_bytes: 0,
+        envelope_bytes: 49000
+      },
+      {
+        kind: "mcp_envelope_slim_reseed",
+        scope: "the_chatroom",
+        mode: "slim"
+      }
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("| v2_envelope_bytes | 1 | known_bytes |");
+    expect(result.stdout).toContain("| mcp_envelope_slim_reseed | 1 | commit_request |");
+  });
+
   it("classifies sampled browser metric logs as instrumentation volume", () => {
     const result = runAnalyzer({
       kind: "browser_metrics_log_sampled",
