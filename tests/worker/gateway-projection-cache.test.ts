@@ -24,6 +24,11 @@ function rows<T>(state: FakeDurableObjectState, query: string, ...params: unknow
   return state.storage.sql.exec(query, ...params).toArray() as T[];
 }
 
+function cachedObject(state: FakeDurableObjectState, id: ObjRef): SerializedObject | null {
+  const row = rows<{ body: string }>(state, "SELECT body FROM gateway_projection_object WHERE id = ? ORDER BY authority_scope LIMIT 1", id)[0];
+  return row ? JSON.parse(row.body) as SerializedObject : null;
+}
+
 function authorityFromHost(world: ReturnType<typeof createWorld>, host: string, objects: readonly ObjRef[]): SerializedAuthoritySlice {
   return withAuthorityPageProvenance(
     world.exportAuthoritySlice([], objects),
@@ -52,6 +57,28 @@ function serializedObject(id: ObjRef, parent: ObjRef | null, name = id): Seriali
     children: [],
     contents: [],
     eventSchemas: []
+  };
+}
+
+function transcriptWithMoves(id: string, scope: ObjRef, moves: EffectTranscript["moves"]): EffectTranscript {
+  return {
+    kind: "woo.effect_transcript.shadow.v1",
+    id,
+    route: "sequenced",
+    scope,
+    seq: 1,
+    session: null,
+    call: { actor: "$wiz", target: scope, verb: "test", args: [] },
+    reads: [],
+    writes: [],
+    creates: [],
+    moves,
+    observations: [],
+    logicalInputs: [],
+    untrackedEffects: [],
+    complete: true,
+    incompleteReasons: [],
+    hash: id
   };
 }
 
@@ -129,6 +156,126 @@ describe("gateway projection cache", () => {
       projection_bytes: 123
     })).toThrow(/projection_delta/);
     expect(rows(state, "SELECT scope FROM gateway_projection_scope")).toEqual([]);
+  });
+
+  it("repairs cached room contents from move transcripts even when no full room row is written", () => {
+    const state = new FakeDurableObjectState("mcp-gateway-0");
+    const po = new PersistentObjectDO(state as unknown as DurableObjectState, env()) as unknown as {
+      storeGatewayToolSurfacesFromDescriptors: (scope: ObjRef, authorityScope: ObjRef, descriptors: RemoteToolDescriptor[]) => void;
+      readGatewayToolSurfaceDescriptors: (requests: RemoteToolRequest[]) => RemoteToolDescriptor[];
+      applyGatewayProjectionWrites: (
+        head: ShadowScopeHead,
+        writes: ProjectionWrite[],
+        source: "fanout",
+        delta?: ProjectionDeltaSummary,
+        transcript?: EffectTranscript
+      ) => { rows: number; bytes: number };
+    };
+    const room = {
+      ...serializedObject("remote_room", "$space", "Remote Room"),
+      contents: ["stale_guest"]
+    };
+    const head: ShadowScopeHead = {
+      kind: "woo.scope_head.shadow.v1",
+      scope: "remote_room",
+      epoch: 1,
+      seq: 1,
+      hash: "h1"
+    };
+
+    po.applyGatewayProjectionWrites(head, [{
+      table: "objects",
+      key: "remote_room",
+      op: "upsert",
+      row: room,
+      bytes: 123
+    }], "fanout");
+    po.storeGatewayToolSurfacesFromDescriptors("remote_room", "remote_room", [{
+      object: "stale_guest",
+      verb: "look",
+      aliases: [],
+      arg_spec: {},
+      direct: false,
+      source: "/* stale */",
+      enclosingSpace: "remote_room"
+    }]);
+    expect(po.readGatewayToolSurfaceDescriptors([{ id: "remote_room", projection: "tools", expandContents: true }])).toHaveLength(1);
+
+    const written = po.applyGatewayProjectionWrites(
+      { ...head, seq: 2, hash: "h2" },
+      [],
+      "fanout",
+      { projection_bytes: 0 },
+      transcriptWithMoves("move-cache-repair", "remote_room", [
+        { object: "stale_guest", from: "remote_room", to: "$nowhere" },
+        { object: "the_mug", from: "$nowhere", to: "remote_room" }
+      ])
+    );
+
+    expect(written.rows).toBeGreaterThanOrEqual(2);
+    expect(cachedObject(state, "remote_room")?.contents).toEqual(["the_mug"]);
+    expect(po.readGatewayToolSurfaceDescriptors([{ id: "remote_room", projection: "tools", expandContents: true }])).toEqual([]);
+  });
+
+  it("prunes a closed guest actor from cached room contents and descriptor coverage", () => {
+    const state = new FakeDurableObjectState("mcp-gateway-0");
+    const po = new PersistentObjectDO(state as unknown as DurableObjectState, env()) as unknown as {
+      storeGatewayToolSurfacesFromDescriptors: (scope: ObjRef, authorityScope: ObjRef, descriptors: RemoteToolDescriptor[]) => void;
+      readGatewayToolSurfaceDescriptors: (requests: RemoteToolRequest[]) => RemoteToolDescriptor[];
+      applyGatewayProjectionWrites: (
+        head: ShadowScopeHead,
+        writes: ProjectionWrite[],
+        source: "fanout",
+        delta?: ProjectionDeltaSummary
+      ) => { rows: number; bytes: number };
+      deleteLocalGatewaySessionCache: (sessionId: string) => void;
+    };
+    const head: ShadowScopeHead = {
+      kind: "woo.scope_head.shadow.v1",
+      scope: "remote_room",
+      epoch: 1,
+      seq: 1,
+      hash: "h1"
+    };
+    const room = {
+      ...serializedObject("remote_room", "$space", "Remote Room"),
+      contents: ["guest_999", "the_mug"]
+    };
+    const guest = {
+      ...serializedObject("guest_999", "$guest", "Guest 999"),
+      location: "remote_room"
+    };
+    const session: SerializedSession = {
+      id: "guest-session",
+      actor: "guest_999",
+      started: 1,
+      expiresAt: Date.now() + 60_000,
+      tokenClass: "apikey",
+      activeScope: "remote_room"
+    };
+
+    po.applyGatewayProjectionWrites(head, [
+      { table: "objects", key: "remote_room", op: "upsert", row: room, bytes: 100 },
+      { table: "objects", key: "guest_999", op: "upsert", row: guest, bytes: 100 },
+      { table: "sessions", key: session.id, op: "upsert", row: session, bytes: 100 }
+    ], "fanout");
+    po.storeGatewayToolSurfacesFromDescriptors("remote_room", "remote_room", [{
+      object: "guest_999",
+      verb: "look",
+      aliases: [],
+      arg_spec: {},
+      direct: false,
+      source: "/* stale guest */",
+      enclosingSpace: "remote_room"
+    }]);
+
+    po.deleteLocalGatewaySessionCache("guest-session");
+
+    expect(rows(state, "SELECT session_id FROM gateway_projection_session")).toEqual([]);
+    expect(rows(state, "SELECT id FROM gateway_scope_member WHERE id = ?", "guest_999")).toEqual([]);
+    expect(rows(state, "SELECT id FROM gateway_projection_object WHERE id = ?", "guest_999")).toEqual([]);
+    expect(cachedObject(state, "remote_room")?.contents).toEqual(["the_mug"]);
+    expect(po.readGatewayToolSurfaceDescriptors([{ id: "remote_room", projection: "tools", expandContents: true }])).toEqual([]);
   });
 
   it("does not replay host transcripts for empty projection deltas", async () => {

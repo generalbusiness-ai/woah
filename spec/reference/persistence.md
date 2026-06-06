@@ -604,9 +604,16 @@ CREATE TABLE gateway_tool_surface_scope (
 When an accepted fanout carries projection writes or
 `projection_delta.tool_surface_sources`, a gateway shard upserts or deletes the
 named cache rows, updates `gateway_projection_scope`, and invalidates any
-tool-surface rows whose source index names a changed object row. Descriptor reads
-may use bounded-stale projection rows or a session's last manifest, but auth,
-permissions, and VM execution reads must continue to use authoritative paths.
+tool-surface rows whose source index names a changed object row. The shard also
+uses the accepted transcript's moves and creates to repair `contents` on cached
+container rows that did not receive a full object-row write; this is a cache
+repair only, never authority minting, and it invalidates that container's cached
+tool-surface coverage so the next descriptor read can refresh from the owner.
+Session close/expiry removes the local session cache row and, for sessionless
+guest-pool actors, prunes that actor from the cached active scope's contents.
+Descriptor reads may use bounded-stale projection rows or a session's last
+manifest, but auth, permissions, and VM execution reads must continue to use
+authoritative paths.
 
 The tool-surface source index is capped per gateway scope and per gateway shard.
 If persisting a surface's source rows would exceed either configured cap, the
