@@ -53,6 +53,14 @@ export type ShadowTurnCallOptions = {
   // the browser holder / REST relay attach provenance but leave this off so an
   // optimistic move into a derived row is not turned into an unrepairable error.
   enforce_movement_owner_repair?: boolean;
+  // Sparse MCP gateway planning must not make command-resolution or visibility
+  // decisions from a non-authoritative room `object_live` page. When enabled,
+  // contents reads used by command matching, `visible_contents`, and `contents()`
+  // raise repairable E_NEED_STATE for that container unless the planning
+  // provenance says the live cell came from the owner. This is intentionally
+  // separate from the movement check above: a stale contents cache can fail a
+  // command before any movement boundary is reached.
+  enforce_resolution_owner_repair?: boolean;
   // Optional forwarder for engine metric events. The ephemeral executor
   // world has no metrics hook by default, so events like `direct_call`,
   // `applied`, and `dispatch_resolved` get dropped on the v2 hot path
@@ -77,6 +85,7 @@ export async function runShadowTurnCall(
   built.setMetricsHook(options.onMetric ?? null);
   if (options.planning_cell_provenance) built.setPlanningCellProvenance(options.planning_cell_provenance);
   if (options.enforce_movement_owner_repair) built.setEnforceMovementOwnerRepair(true);
+  if (options.enforce_resolution_owner_repair) built.setEnforceResolutionOwnerRepair(true);
   return await runShadowTurnCallOnWorld(built, call, options);
 }
 
@@ -92,6 +101,7 @@ export async function runShadowTurnCallTranscript(
   if (options.onMetric) built.setMetricsHook(options.onMetric);
   if (options.planning_cell_provenance) built.setPlanningCellProvenance(options.planning_cell_provenance);
   if (options.enforce_movement_owner_repair) built.setEnforceMovementOwnerRepair(true);
+  if (options.enforce_resolution_owner_repair) built.setEnforceResolutionOwnerRepair(true);
   return await runShadowTurnCallOnWorldTranscript(built, call, options);
 }
 
@@ -161,16 +171,13 @@ export async function runShadowTurnCallOnWorldTranscript(
 
   const recorded = recorder.turns[0];
   if (!recorded) {
-    // VTN10.1: a guarded materialization miss in the sequenced-call
-    // PREAMBLE (space lookup / presence / sequencer read) is translated by
-    // `world.guardedPreamble` into an E_NEED_STATE that the call path catches
-    // into an error frame BEFORE the recorder ever opens — so there is no
-    // recorded turn to fold the missing atoms out of. Re-throw that E_NEED_STATE
-    // so the executor (`executeShadowTurnCallOrNeedState`) converts it to a
-    // clean `missing_state` and the repair loop pages in the absent object,
-    // instead of failing with an opaque "no recording" error. Any other
-    // no-recording error is still a genuine bug and propagates as before.
-    if (guarded && frame.op === "error" && frame.error.code === "E_NEED_STATE") {
+    // A repair guard can raise E_NEED_STATE before the turn recorder opens: the
+    // VTN10.1 guarded preamble does this for missing materialization, and the MCP
+    // resolution-owner guard does it for stale projection contents during command
+    // parsing. Preserve that repair signal so the executor can refresh authority
+    // and retry, instead of burying it under an opaque "no recording" error. Any
+    // other no-recording error is still a genuine bug and propagates as before.
+    if (frame.op === "error" && frame.error.code === "E_NEED_STATE") {
       throw frame.error;
     }
     const suffix = frame.op === "error" ? `: ${frame.error.code} ${frame.error.message}` : "";

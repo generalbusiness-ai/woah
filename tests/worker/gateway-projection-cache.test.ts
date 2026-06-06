@@ -1249,6 +1249,11 @@ describe("gateway projection cache", () => {
       )
       : [];
     expect(chatroomLiveContents).not.toContain("guest_999" as ObjRef);
+    const chatroomLiveRefs = payload.authority.kind === "woo.authority_slice.cells.shadow.v1"
+      ? payload.authority.page_refs.filter((ref) => ref.object === "the_chatroom" && ref.page === "object_live")
+      : [];
+    expect(chatroomLiveRefs.length).toBeGreaterThan(0);
+    expect(chatroomLiveRefs.every((ref) => ref.source !== "authoritative")).toBe(true);
   });
 
 });

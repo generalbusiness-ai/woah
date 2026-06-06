@@ -171,6 +171,13 @@ export type SubmitTurnIntentOptions<Client, Result extends ExecutorEnvelopeResul
   // relay leave it off: they attach provenance but plan optimistically against
   // derived rows, so a move into one must not become an unrepairable E_NEED_STATE.
   enforceMovementOwnerRepair?: boolean;
+  // Opt IN to owner repair for resolution-critical contents reads. Sparse MCP
+  // gateways enable this so object matching, `visible_contents`, and `contents()`
+  // do not treat gateway projection cache membership as final execution truth.
+  // The VM raises E_NEED_STATE for the container, and the same repair loop
+  // refreshes its owner authority before retrying. Other holders leave it off
+  // unless they can perform that repair.
+  enforceResolutionOwnerRepair?: boolean;
   nextTurnId(client: Client, attempt: number): string;
   envelopeId?(turnId: string, attempt: number): string;
   authorityPayload(
@@ -665,6 +672,7 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
         // force an owner-authority repair before commit.
         ...(planningProvenance.size > 0 ? { planning_cell_provenance: planningProvenance } : {}),
         ...(options.enforceMovementOwnerRepair ? { enforce_movement_owner_repair: true } : {}),
+        ...(options.enforceResolutionOwnerRepair ? { enforce_resolution_owner_repair: true } : {}),
         ...(options.onMetric ? { onMetric: options.onMetric } : {})
       }));
     } catch (err) {

@@ -1784,7 +1784,8 @@ export class PersistentObjectDO {
               reconstructionScope: authorityOptions?.reconstructionScope
             }),
           executionCapsuleOpen: envFlag(this.env.WOO_V2_EXECUTION_CAPSULE),
-          slimWarmEnvelope: envFlag(this.env.WOO_V2_SLIM_WARM_ENVELOPE)
+          slimWarmEnvelope: envFlag(this.env.WOO_V2_SLIM_WARM_ENVELOPE),
+          enforceResolutionOwnerRepair: true
         },
         toolManifests: {
           staleFallback: true,
@@ -1871,6 +1872,7 @@ export class PersistentObjectDO {
   private async ensureLoadedWorldCatalogBundle(world: WooWorld, hostKey: string): Promise<void> {
     const fingerprint = this.currentLocalCatalogBundleFingerprint();
     if (this.repo.loadMeta(LOCAL_CATALOG_BUNDLE_FINGERPRINT_META_KEY) === fingerprint) return;
+    let persistFullSnapshotAfterRepair = false;
     if (hostKey === WORLD_HOST) {
       installLocalCatalogs(world, parseAutoInstallCatalogs(this.env.WOO_AUTO_INSTALL_CATALOGS));
     } else if (!isMcpGatewayShardHost(hostKey)) {
@@ -1898,7 +1900,7 @@ export class PersistentObjectDO {
           // the same seed after lifecycle would export and scan the whole slice
           // again on every hot deploy repair without adding authority.
           runHostScopedLocalCatalogLifecycle(world, hostKey, { freshSeed: true });
-          if (changed) world.persistFullSnapshot();
+          persistFullSnapshotAfterRepair = changed;
           if (fetched.digest) this.repo.saveMeta(HOST_SEED_DIGEST_META_KEY, fetched.digest);
         } else {
           runHostScopedLocalCatalogLifecycle(world, hostKey);
@@ -1907,6 +1909,13 @@ export class PersistentObjectDO {
         console.warn("woo.local_catalog_bundle_repair_failed", { host: hostKey, error: normalizeError(err) });
         runHostScopedLocalCatalogLifecycle(world, hostKey);
       }
+    }
+    if (!isMcpGatewayShardHost(hostKey)) {
+      const contentsRepair = world.repairDerivedContentsIndex({ persist: !persistFullSnapshotAfterRepair });
+      if (contentsRepair.repaired_containers.length > 0) {
+        console.warn("woo.derived_contents_repaired", { host: hostKey, resident: true, ...contentsRepair });
+      }
+      if (persistFullSnapshotAfterRepair) world.persistFullSnapshot();
     }
     this.repo.saveMeta(LOCAL_CATALOG_BUNDLE_FINGERPRINT_META_KEY, fingerprint);
   }
@@ -5084,7 +5093,7 @@ export class PersistentObjectDO {
     if (mcpGatewayShard) this.ensureMcpScopeTopologySeed(world, requestedIds, servedScopeIds);
     const localActorAuthorityRoots = localActorAuthorityRootIds(world, requestedIds, { sessionActorsOnly: mcpGatewayShard });
     const local = mcpGatewayShard
-      ? mcpGatewayLocalAuthorityPayload(world, requestedIds, localActorAuthorityRoots, this.mcpScopeTopologySeed, servedScopeIds, forceOwnerRefresh)
+      ? mcpGatewayLocalAuthorityPayload(world, requestedIds, localActorAuthorityRoots, localHost, this.mcpScopeTopologySeed, servedScopeIds, forceOwnerRefresh)
       : executorAuthorityPayload(world, requestedIds);
     const localObjectIds = authoritySliceObjectIds(local.authority);
     const preservedObjectIds = new Set<ObjRef>(localObjectIds);
@@ -7063,6 +7072,7 @@ function mcpGatewayLocalAuthorityPayload(
   world: WooWorld,
   explicitIds: readonly ObjRef[],
   actorRoots: ReadonlySet<ObjRef>,
+  hostKey: string,
   topologySeed: ScopeTopologySeedInfo | null = null,
   servedScopeIds: ReadonlySet<ObjRef> = new Set(),
   // CA11.2 occupancy transition: on a `missing_state_repair` pass, every
@@ -7113,12 +7123,21 @@ function mcpGatewayLocalAuthorityPayload(
   // page as a write-authority source. A seeded row stamped `authoritative` would
   // reintroduce exactly the sparse-stub-overwrites-real-scope hazard the
   // MCP_GATEWAY_ACTOR_SUPPORT_ROOTS guard prevents.
-  const authority = topologySeed && topologySeed.seededIds.size > 0
-    ? withAuthorityPageProvenance(exported, (ref) =>
-        topologySeed.seededIds.has(ref.object)
-          ? { source: "projection", source_host: topologySeed.ownerHostById.get(ref.object) ?? WORLD_HOST }
-          : null)
-    : exported;
+  const authority = withAuthorityPageProvenance(exported, (ref) => {
+    if (topologySeed?.seededIds.has(ref.object)) {
+      return { source: "projection", source_host: topologySeed.ownerHostById.get(ref.object) ?? WORLD_HOST };
+    }
+    // Sparse MCP shards synthesize active-scope rows from Directory/session state
+    // and maintain accepted-frame gateway projection caches. Those rows are useful
+    // planning support, but they are not the room owner's truth: in particular
+    // their `object_live.contents` can miss seed fixtures and retain departed
+    // guests. Stamp ordinary instance rows as projection so resolution-critical
+    // reads repair to the owner instead of treating gateway cache state as
+    // execution authority. `$` support rows remain local static substrate/catalog
+    // material, and session actors are supplied by the dedicated actor slices.
+    if (!ref.object.startsWith("$")) return { source: "projection", source_host: hostKey };
+    return null;
+  });
   return {
     sessions,
     session_objects: [],

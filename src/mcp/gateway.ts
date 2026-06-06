@@ -119,6 +119,10 @@ export type McpV2ClientHooks = {
   // Stale foreign cells converge through the existing read-version-mismatch →
   // cell-page repair loop, not silent trust.
   slimWarmEnvelope?: boolean;
+  // Cloudflare sparse MCP shards enable this. Local/dev MCP gateways usually plan
+  // from an authoritative in-process world whose cells do not carry owner
+  // source_host stamps, so the resolution-owner guard stays off by default.
+  enforceResolutionOwnerRepair?: boolean;
 };
 
 // Strip the ~3MB authority slice (and legacy session_objects) from an envelope
@@ -725,6 +729,13 @@ export class McpGateway {
       // movement-destination owner-repair check: a move INTO a scope served only
       // as a non-authoritative topology pre-seed repairs to owner before commit.
       enforceMovementOwnerRepair: true,
+      ...(hooks.enforceResolutionOwnerRepair === true ? {
+        // The same repair mechanism protects room visibility/command resolution:
+        // command matching, `visible_contents`, and `contents()` must not make
+        // final decisions from a gateway projection cache row whose
+        // `object_live.contents` did not come from the room owner.
+        enforceResolutionOwnerRepair: true
+      } : {}),
       onAdmissionViolation: (violations) => {
         for (const v of violations) {
           console.warn("woo.planning_world_inadmissible", { where: "mcp_turn_plan", scope, kind: v.kind, object: v.object, page: v.page, detail: v.detail });
@@ -1227,10 +1238,9 @@ export class McpGateway {
   // cached scope clients also need the transcript's *writes* (without head
   // advancement) so that cross-scope state changes — most importantly an
   // actor's `location` after a room-to-room move — show up in whatever scope
-  // the next call dispatches to. Without this, a `deck:west` commit updates
-  // the deck client's snapshot but the chatroom client's snapshot still has
-  // actor.location=the_deck, and the very next actor verb routed to the
-  // chatroom scope reads the stale location.
+  // the next call dispatches to. Without this, a move accepted by one scope can
+  // leave another open scope's snapshot with the actor in the old room, and the
+  // very next actor verb routed there reads the stale location.
   // An accepted commit under `originScope` can affect objects/actors that a
   // DIFFERENT open relay plans against — most importantly a cross-scope MOVE,
   // which commits under the moved object's own scope but changes the source and

@@ -787,10 +787,14 @@ projection; CA8 fanout). Neither reintroduces a placement-style shared owner.
 
 ### CA13.4 Reads and cold starts
 
-- `look`/`who` and parser resolution MUST be served from the room's local
-  contents projection / edge cache, never by re-reading authoritative location
-  cells across homes and never by `O(world)` scan. A full occupant render is
-  `O(result_size)` and SHOULD be paginatable for very crowded rooms.
+- `look`/`who` and parser resolution MUST be served from a room contents
+  projection / edge cache, never by re-reading authoritative location cells
+  across homes and never by `O(world)` scan. When a sparse execution holder
+  (for example an MCP gateway shard) only has a non-authoritative projection of
+  that contents cell, it MUST repair/fetch the room owner's contents projection
+  before using the cell for a final visibility or object-resolution decision.
+  A full occupant render is `O(result_size)` and SHOULD be paginatable for very
+  crowded rooms.
 - The first interaction with a cold parent pays projection fetch/repair once
   (CA4); steady-state reads take no route-home RPC.
 

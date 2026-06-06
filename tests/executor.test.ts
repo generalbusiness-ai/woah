@@ -1,6 +1,6 @@
 import { authoritativePlanningWorld } from "../src/core/planning-world";
 import { describe, expect, it } from "vitest";
-import { authoritySliceObjectIds, buildSerializedAuthorityCellSlice } from "../src/core/authority-slice";
+import { authoritySliceObjectIds, buildSerializedAuthorityCellSlice, cellProvenanceFromAuthoritySlice, serializedWorldFromAuthoritySlice, withAuthorityPageProvenance } from "../src/core/authority-slice";
 import { createWorld } from "../src/core/bootstrap";
 import type { EffectTranscript } from "../src/core/effect-transcript";
 import type { SerializedObject, SerializedSession, SerializedWorld } from "../src/core/repository";
@@ -266,6 +266,94 @@ describe("v2 turn gateway", () => {
     });
     expect(authorityObjectIds(submitted.body.authority)).toEqual(["the_dubspace", session.actor, "delay_1"]);
     expect(result.reply?.ok).toBe(true);
+  });
+
+  it("repairs non-authoritative room contents before resolving a take target", async () => {
+    const owner = createWorld();
+    const session = owner.auth("guest:v2-resolution-owner-repair");
+    await owner.directCall("resolution-repair-enter", session.actor, "the_chatroom", "enter", [], { sessionId: session.id });
+    expect(owner.contentsOf("the_chatroom")).toContain("the_mug");
+
+    const stale = owner.exportWorld();
+    const staleRoom = stale.objects.find((obj) => obj.id === "the_chatroom");
+    expect(staleRoom).toBeDefined();
+    staleRoom!.contents = staleRoom!.contents
+      .filter((id) => id !== "the_mug")
+      .concat("guest_999" as ObjRef)
+      .sort();
+    const projectionAuthority = buildSerializedAuthorityCellSlice({
+      sessions: stale.sessions,
+      objects: stale.objects,
+      counters: {
+        objectCounter: stale.objectCounter,
+        parkedTaskCounter: stale.parkedTaskCounter,
+        sessionCounter: stale.sessionCounter
+      },
+      tombstones: stale.tombstones,
+      pageProvenance: () => ({ source: "projection", source_host: "mcp-gateway-0" })
+    });
+    const client = {
+      scope: "the_chatroom" as ObjRef,
+      node: "mcp:test-resolution-repair",
+      head: scopeHead("the_chatroom"),
+      serialized: serializedWorldFromAuthoritySlice(projectionAuthority),
+      cellProvenance: cellProvenanceFromAuthoritySlice(projectionAuthority)
+    };
+    const authorityCalls: Array<{ ids: ObjRef[]; phase?: string; repair?: boolean }> = [];
+    const submissions: ShadowTurnExecRequest[] = [];
+
+    const result = await submitTurnIntent({
+      input: {
+        id: "take-mug-repairs-room-contents",
+        route: "direct",
+        scope: "the_chatroom",
+        session: session.id,
+        actor: session.actor,
+        target: "the_chatroom",
+        verb: "take",
+        args: ["mug"],
+        persistence: "durable",
+        token: "token"
+      },
+      maxAttempts: 3,
+      repairPlanningAuthority: true,
+      ensureClient: async () => client,
+      clientNode: () => client.node,
+      clientHead: () => client.head,
+      clientSerialized: () => client.serialized,
+      clientPlanningProvenance: () => client.cellProvenance,
+      enforceMissingProvenance: true,
+      enforceResolutionOwnerRepair: true,
+      nextTurnId: () => { throw new Error("test uses explicit id"); },
+      authorityPayload: (_scope, extraObjectIds, context) => {
+        authorityCalls.push({ ids: [...extraObjectIds], phase: context?.phase, repair: context?.repair });
+        const payload = executorAuthorityPayload(owner, extraObjectIds);
+        return {
+          ...payload,
+          authority: withAuthorityPageProvenance(payload.authority, () => ({ source: "authoritative", source_host: "the_chatroom" }))
+        };
+      },
+      applyAuthority: (_client, authority) => {
+        mergeExecutorAuthority(client.serialized, authority, { clone: true, cellProvenance: client.cellProvenance });
+      },
+      submitEnvelope: async (_scope, body) => {
+        const envelope = decodeEnvelope<ShadowTurnExecRequest>(body.envelope);
+        submissions.push(envelope.body);
+        return { reply: encodeEnvelope(replyEnvelope(okReplyForExecRequest(envelope.body))) };
+      }
+    });
+
+    expect(result.kind).toBe("submitted");
+    expect(authorityCalls).toContainEqual(expect.objectContaining({
+      phase: "pre_plan",
+      repair: true,
+      ids: expect.arrayContaining(["the_chatroom"])
+    }));
+    expect(submissions).toHaveLength(1);
+    expect(result.planned?.frame).toMatchObject({
+      op: "result",
+      result: expect.objectContaining({ item: "the_mug" })
+    });
   });
 
   it("emits a turn_phase_timing metric attributing the turn's phases (Slice 1)", async () => {

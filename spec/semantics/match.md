@@ -57,6 +57,13 @@ object whose storage host differs from the room. Remote lookup uses read-class
 host RPCs for `contents`, display `name`, and `aliases`; it does not dispatch
 object behavior.
 
+On sparse execution holders, a cached or projected `location.contents` row is
+not enough to make a final parser decision. If provenance says the contents cell
+is not owner-authoritative, the holder repairs/fetches that container from the
+owner and retries the match. This keeps stale gateway projections from turning
+seed fixtures into false `$failed_match` results or stale occupants into false
+matches.
+
 Resolution walks six tiers in order, returning at the first non-empty tier.
 The first four tiers mirror LambdaCore's `$string_utils:match_object` so that
 a destructive verb like `@recycle book` resolves to the book the actor is

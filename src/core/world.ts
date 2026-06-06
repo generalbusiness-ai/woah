@@ -581,6 +581,13 @@ export class WooWorld {
   // derived row turned into a hard E_NEED_STATE they cannot repair. So the check
   // requires this flag in addition to non-authoritative provenance.
   private enforceMovementOwnerRepair = false;
+  // Sparse MCP planning also needs an opt-in owner repair for room/container
+  // contents used as a visibility or parser-resolution surface. Gateway
+  // projection rows are allowed as a read cache, but a non-authoritative
+  // `object_live` page must not be the final basis for "object is not here" or
+  // for rendering a stale room. The gateway path has the same force-owner repair
+  // loop as the movement check; other planning holders leave this off.
+  private enforceResolutionOwnerRepair = false;
 
   constructor(private repository?: WooRepository, options: { executorContext?: ExecutorContext | null; turnRecorder?: TurnRecorder | null } = {}) {
     this.objectRepository = isObjectRepository(repository) ? repository : null;
@@ -607,6 +614,28 @@ export class WooWorld {
   // path only — see `enforceMovementOwnerRepair`).
   setEnforceMovementOwnerRepair(enforce: boolean): void {
     this.enforceMovementOwnerRepair = enforce;
+  }
+
+  // Enable the sparse-gateway contents-read repair check. Kept separate from
+  // movement repair because command matching can fail before a move is attempted.
+  setEnforceResolutionOwnerRepair(enforce: boolean): void {
+    this.enforceResolutionOwnerRepair = enforce;
+  }
+
+  private assertResolutionContentsOwnerAuthority(container: ObjRef, surface: "contents" | "match" | "visible_contents"): void {
+    if (!this.enforceResolutionOwnerRepair) return;
+    const provenance = this.planningCellProvenance;
+    if (!provenance || !this.objects.has(container)) return;
+    const liveProv = provenance.get(planningCellKey(container, "object_live"));
+    // Owner slices served over /__internal/authority-slice stamp both
+    // source:"authoritative" and source_host. A missing source_host on a sparse
+    // MCP planning cell is legacy/local provenance and must not be trusted for
+    // room membership decisions.
+    if (liveProv?.source === "authoritative" && typeof liveProv.source_host === "string" && liveProv.source_host.length > 0) return;
+    const preimage = `read:cell:contents:${container}`;
+    throw wooError("E_NEED_STATE", `${surface} needs owner-authoritative contents for ${container}`, {
+      missing_atoms: [{ hash: shadowAtomHash(preimage), preimage }]
+    });
   }
 
   /**
@@ -9635,7 +9664,8 @@ export class WooWorld {
     }
     try {
       if ((await this.objectContents(location, ctx.hostMemo)).includes(actor)) return;
-    } catch {
+    } catch (err) {
+      if (!isReadAvailabilityError(err)) throw err;
       // Missing or unreadable command locations are rejected below.
     }
     throw wooError("E_PERM", `${actor} is not present in ${location}`, { actor, location });
@@ -9662,7 +9692,7 @@ export class WooWorld {
     add(actor);
     if (location) {
       add(location);
-      for (const id of await this.objectContents(location, ctx.hostMemo).catch((err) => {
+      for (const id of await this.objectContents(location, ctx.hostMemo, "visible_contents").catch((err) => {
         if (isReadAvailabilityError(err)) return [];
         throw err;
       })) add(id);
@@ -9682,7 +9712,7 @@ export class WooWorld {
     if ((await this.commandVisibleCandidates(ctx, ctx.actor, location)).includes(target)) return true;
     const caller = ctx.caller;
     if (typeof caller === "string" && caller.length > 0 && this.objects.has(caller) && this.inheritsFrom(caller, "$space")) {
-      const callerContents = await this.objectContents(caller, ctx.hostMemo).catch((err): ObjRef[] => {
+      const callerContents = await this.objectContents(caller, ctx.hostMemo, "visible_contents").catch((err): ObjRef[] => {
         if (isReadAvailabilityError(err)) return [];
         throw err;
       });
@@ -10304,7 +10334,8 @@ export class WooWorld {
     });
   }
 
-  private async objectContents(objRef: ObjRef, memo?: HostOperationMemo): Promise<ObjRef[]> {
+  private async objectContents(objRef: ObjRef, memo?: HostOperationMemo, surface: "contents" | "match" | "visible_contents" = "contents"): Promise<ObjRef[]> {
+    this.assertResolutionContentsOwnerAuthority(objRef, surface);
     if (await this.remoteHostForObject(objRef, memo)) {
       if (!this.executorContext) throw wooError("E_INTERNAL", "remote host bridge unavailable");
       const effect = remoteBridgeUntrackedEffect("contents", { object: objRef });
@@ -10312,6 +10343,10 @@ export class WooWorld {
       return await this.executorContext.contents(objRef, memo);
     }
     return this.contentsOf(objRef);
+  }
+
+  async contentsForExecution(ctx: CallContext, objRef: ObjRef): Promise<ObjRef[]> {
+    return await this.objectContents(objRef, ctx.hostMemo);
   }
 
   private async propOrNullForActorAsync(actor: ObjRef, objRef: ObjRef, name: string, memo?: HostOperationMemo): Promise<WooValue> {
@@ -10410,7 +10445,7 @@ export class WooWorld {
   }
 
   async visibleContentsForActor(ctx: CallContext, objRef: ObjRef): Promise<ObjRef[]> {
-    const items = await this.objectContents(objRef, ctx.hostMemo);
+    const items = await this.objectContents(objRef, ctx.hostMemo, "visible_contents");
     const out: ObjRef[] = [];
     for (const item of items) {
       if (await this.remoteHostForObject(item, ctx.hostMemo)) {
@@ -11165,11 +11200,12 @@ export class WooWorld {
     add(actor, false);
     if (location) {
       add(location, false);
-      for (const id of await this.objectContents(location, ctx.hostMemo)) add(id, false);
+      for (const id of await this.objectContents(location, ctx.hostMemo, "match")) add(id, false);
     }
     try {
-      for (const id of await this.objectContents(actor, ctx.hostMemo)) add(id, true);
-    } catch {
+      for (const id of await this.objectContents(actor, ctx.hostMemo, "match")) add(id, true);
+    } catch (err) {
+      if (!isReadAvailabilityError(err)) throw err;
       // Actor inventory is part of local matching, but a missing/stale actor stub
       // should not make room command parsing fail.
     }
