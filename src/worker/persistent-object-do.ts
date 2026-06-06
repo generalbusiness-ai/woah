@@ -1415,6 +1415,37 @@ export class PersistentObjectDO {
         return jsonResponse({ ok: results.every((r) => r.ok !== false), results });
       }
 
+      if (worldGatewayHost && request.method === "POST" && pathname === "/api/admin/repair-derived-contents") {
+        // Bounded repair for historical host-local contents drift. The caller
+        // must name hosts explicitly; this route intentionally avoids global
+        // enumeration because contents repair is an operator recovery action,
+        // not a background crawl.
+        const session = this.requireRestSession(world, request);
+        if (!world.object(session.actor).flags.wizard) throw wooError("E_PERM", "wizard authority required");
+        const body = await readJsonBody(request);
+        const targets = Array.isArray(body.hosts) ? body.hosts.filter((item): item is string => typeof item === "string") : [];
+        if (targets.length === 0) throw wooError("E_INVARG", "repair-derived-contents requires hosts: string[]");
+        const results: Array<Record<string, unknown>> = [];
+        for (const target of targets) {
+          try {
+            if (target === WORLD_HOST) {
+              results.push({ ok: true, host: target, ...world.repairDerivedContentsIndex() });
+            } else {
+              const result = await this.forwardInternalChecked<Record<string, unknown>>(
+                target,
+                "/__internal/repair-derived-contents",
+                {},
+                { timeoutMs: 30_000 }
+              );
+              results.push(result);
+            }
+          } catch (err) {
+            results.push({ host: target, ok: false, error: normalizeError(err) });
+          }
+        }
+        return jsonResponse({ ok: results.every((r) => r.ok !== false), results });
+      }
+
       if (worldGatewayHost && request.method === "POST" && pathname === "/api/admin/purge-inactive-guests") {
         const session = this.requireRestSession(world, request);
         if (!world.object(session.actor).flags.wizard) throw wooError("E_PERM", "wizard authority required");
@@ -2265,6 +2296,10 @@ export class PersistentObjectDO {
     // means a deploy that changes verb shape produces a new digest
     // and a new key, so old bytes are unreachable through the
     // pointer.
+    const contentsRepair = world.repairDerivedContentsIndex({ persist: !seedMergeChanged });
+    if (contentsRepair.repaired_containers.length > 0) {
+      console.warn("woo.derived_contents_repaired", { host: hostKey, ...contentsRepair });
+    }
     if (seedMergeChanged) world.persistFullSnapshot();
     if (freshSeedDigest && freshSeed) {
       this.repo.saveMeta(HOST_SEED_DIGEST_META_KEY, freshSeedDigest);
@@ -3564,6 +3599,10 @@ export class PersistentObjectDO {
         this.mcpGateway = null;
         this.mcpPresenceIngressTouchedAt.clear();
         return jsonResponse({ ok: true, host: hostKey, ms: Date.now() - wipeStart });
+      }
+
+      if (request.method === "POST" && pathname === "/__internal/repair-derived-contents") {
+        return jsonResponse({ ok: true, host: hostKey, ...world.repairDerivedContentsIndex() });
       }
 
       if (request.method === "POST" && pathname === "/__internal/end-session") {

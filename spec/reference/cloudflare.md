@@ -512,6 +512,16 @@ cold-load responsibility. When a wizard supplies an explicit `hosts` list, names
 that do not match any routed object host are reported as skipped with
 `reason = "unmatched_host"`.
 
+Host cold-load also repairs the host-local `contents` index from object
+`location` rows before serving requests ([objects.md §4.3](../semantics/objects.md#43-containment-and-cross-host-invariants)).
+This is an incremental repair of derived container rows, not a host-seed
+refresh and not a global sweep. A wizard may run the same repair on already-live
+hosts with `POST /api/admin/repair-derived-contents` and an explicit
+`hosts: string[]` body; the gateway forwards only to the named hosts (or repairs
+`world` locally when named). Operators use this after discovering historical
+contents drift, for example a room whose object rows show items located there
+while its cached `contents` row omits them or still names departed actors.
+
 ### R9.2 Boot identity
 
 Boot runs as `$wiz` (the seed wizard). All `:add_feature`, `:setProp`, etc. invoked during boot satisfy the wizard-bypass rules (per features.md §FT5, identity.md §I7).

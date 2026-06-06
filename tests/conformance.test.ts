@@ -1077,6 +1077,43 @@ describe.each(backends)("world conformance: $name", ({ make }) => {
     }
   });
 
+  it("repairs full host-local derived contents from object locations and persists the repair", () => {
+    const harness = make({ catalogs: false });
+    try {
+      const world = harness.world;
+      world.createObject({ id: "conf_repair_room", name: "Repair Room", parent: "$space", owner: "$wiz" });
+      world.createObject({ id: "conf_repair_mug", name: "Repair Mug", parent: "$thing", owner: "$wiz", location: "conf_repair_room" });
+      world.createObject({ id: "conf_repair_departed", name: "Departed Guest", parent: "$guest", owner: "$wiz", location: "$nowhere" });
+
+      // Reproduce the prod failure shape: the member's authoritative location
+      // points at the room, but the room's derived contents row is missing it
+      // and still names objects that are absent or no longer in the room.
+      const room = world.object("conf_repair_room");
+      room.contents.clear();
+      room.contents.add("conf_repair_missing_guest");
+      room.contents.add("conf_repair_departed");
+      world.object("$nowhere").contents.add("conf_repair_departed");
+      world.markObjectChanged("conf_repair_room");
+      world.markObjectChanged("$nowhere");
+
+      const repaired = world.repairDerivedContentsIndex();
+      expect(repaired).toMatchObject({
+        repaired_containers: ["$nowhere", "conf_repair_room"],
+        members_added: 1,
+        missing_members_removed: 1
+      });
+      expect(repaired.members_removed).toBeGreaterThanOrEqual(3);
+      expect(world.contentsOf("conf_repair_room")).toEqual(["conf_repair_mug"]);
+      expect(world.contentsOf("$nowhere")).toEqual([]);
+
+      const restarted = harness.restart();
+      expect(restarted.contentsOf("conf_repair_room")).toEqual(["conf_repair_mug"]);
+      expect(restarted.contentsOf("$nowhere")).toEqual([]);
+    } finally {
+      harness.cleanup();
+    }
+  });
+
   it("operator purge can reap stale guest sessions before guest TTL", async () => {
     const harness = make();
     try {

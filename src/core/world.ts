@@ -97,6 +97,14 @@ type ProjectionApplyOptions = {
   gatewayHost?: boolean;
 };
 
+export type DerivedContentsRepairResult = {
+  inspected_containers: number;
+  repaired_containers: ObjRef[];
+  members_added: number;
+  members_removed: number;
+  missing_members_removed: number;
+};
+
 export type ShadowHostApplyResult = {
   ok: true;
   host: string;
@@ -5902,6 +5910,79 @@ export class WooWorld {
       value
     });
     return value;
+  }
+
+  repairDerivedContentsIndex(options: { persist?: boolean } = {}): DerivedContentsRepairResult {
+    // `location` is the authoritative movement cell. `contents` is a derived
+    // compatibility index used by catalogs and cached gateway views, so a full
+    // host-local world may safely rebuild it from local object rows. This is
+    // intentionally stricter than the sparse SerializedAuthoritySlice repair:
+    // sparse slices preserve unknown members because absence can mean "not in
+    // the slice"; a loaded host snapshot has no such excuse for a local
+    // container row.
+    const persist = options.persist !== false;
+    const desiredByContainer = new Map<ObjRef, Set<ObjRef>>();
+    for (const obj of this.objects.values()) {
+      if (!obj.location || obj.location === "$nowhere" || !this.objects.has(obj.location)) continue;
+      let members = desiredByContainer.get(obj.location);
+      if (!members) {
+        members = new Set();
+        desiredByContainer.set(obj.location, members);
+      }
+      members.add(obj.id);
+    }
+
+    const repairedContainers: ObjRef[] = [];
+    let inspectedContainers = 0;
+    let membersAdded = 0;
+    let membersRemoved = 0;
+    let missingMembersRemoved = 0;
+
+    for (const container of Array.from(this.objects.values()).sort((a, b) => a.id.localeCompare(b.id))) {
+      const before = Array.from(container.contents).sort();
+      if (before.length === 0 && !desiredByContainer.has(container.id)) continue;
+      inspectedContainers += 1;
+      const next = new Set<ObjRef>();
+      for (const member of before) {
+        const memberRow = this.objects.get(member);
+        if (!memberRow) {
+          membersRemoved += 1;
+          missingMembersRemoved += 1;
+          continue;
+        }
+        if (memberRow.location !== container.id) {
+          membersRemoved += 1;
+          continue;
+        }
+        // $nowhere is a sink, not a maintained container (§B2.15). Clear stale
+        // back-references there rather than reconstructing them.
+        if (container.id === "$nowhere") {
+          membersRemoved += 1;
+          continue;
+        }
+        next.add(member);
+      }
+      if (container.id !== "$nowhere") {
+        for (const member of desiredByContainer.get(container.id) ?? []) {
+          if (!next.has(member)) membersAdded += 1;
+          next.add(member);
+        }
+      }
+      const after = Array.from(next).sort();
+      if (before.length === after.length && before.every((member, index) => member === after[index])) continue;
+      container.contents = new Set(after);
+      container.modified = Date.now();
+      repairedContainers.push(container.id);
+      if (persist) this.persistObject(container.id);
+    }
+    if (persist && repairedContainers.length > 0) this.persist();
+    return {
+      inspected_containers: inspectedContainers,
+      repaired_containers: repairedContainers,
+      members_added: membersAdded,
+      members_removed: membersRemoved,
+      missing_members_removed: missingMembersRemoved
+    };
   }
 
   /**
