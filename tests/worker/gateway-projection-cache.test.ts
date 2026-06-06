@@ -98,6 +98,76 @@ describe("gateway projection cache", () => {
     }
   });
 
+  it("requires an explicit host list for admin derived-contents repair and forwards only those hosts", async () => {
+    const state = new FakeDurableObjectState("world");
+    const forwarded: Record<string, unknown> = {};
+    let testEnv: Env;
+    testEnv = env({
+      WOO: new FakeDurableObjectNamespace((name) => ({
+        fetch: async (request: Request) => {
+          const body = await request.json() as Record<string, unknown>;
+          forwarded.host = name;
+          forwarded.path = new URL(request.url).pathname;
+          forwarded.body = body;
+          forwarded.hostHeader = request.headers.get("x-woo-host-key");
+          return new Response(JSON.stringify({
+            ok: true,
+            host: name,
+            inspected_containers: 2,
+            repaired_containers: ["the_chatroom"],
+            members_added: 1,
+            members_removed: 50,
+            missing_members_removed: 49
+          }), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
+        }
+      })) as unknown as DurableObjectNamespace
+    });
+    try {
+      const po = new PersistentObjectDO(state as unknown as DurableObjectState, testEnv);
+      const adminHeaders = {
+        "content-type": "application/json; charset=utf-8",
+        "x-woo-internal-session": "admin-repair",
+        "x-woo-internal-actor": "$wiz",
+        "x-woo-internal-expires-at": String(Date.now() + 60_000),
+        "x-woo-internal-token-class": "apikey",
+        "x-woo-internal-started": String(Date.now())
+      };
+      const rejected = await po.fetch(new Request("https://woah.example/api/admin/repair-derived-contents", {
+        method: "POST",
+        headers: adminHeaders,
+        body: JSON.stringify({ hosts: [] })
+      }));
+      expect(rejected.status).toBe(400);
+      expect(await rejected.json()).toMatchObject({ error: { code: "E_INVARG" } });
+      expect(forwarded).toEqual({});
+
+      const request = new Request("https://woah.example/api/admin/repair-derived-contents", {
+        method: "POST",
+        headers: adminHeaders,
+        body: JSON.stringify({ hosts: ["the_chatroom"] })
+      });
+      const response = await po.fetch(request);
+      expect(response.status).toBe(200);
+      const payload = await response.json() as { ok?: boolean; results?: Array<Record<string, unknown>> };
+      expect(payload.ok).toBe(true);
+      expect(payload.results).toEqual([
+        expect.objectContaining({
+          ok: true,
+          host: "the_chatroom",
+          repaired_containers: ["the_chatroom"]
+        })
+      ]);
+      expect(forwarded).toMatchObject({
+        host: "the_chatroom",
+        path: "/__internal/repair-derived-contents",
+        body: {},
+        hostHeader: "the_chatroom"
+      });
+    } finally {
+      state.close();
+    }
+  });
+
   it("persists accepted object projection rows and evicts them on delete", () => {
     const state = new FakeDurableObjectState("mcp-gateway-0");
     const objectRow = createWorld().exportObjects(["the_chatroom"])[0]!;
