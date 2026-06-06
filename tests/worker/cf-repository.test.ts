@@ -4039,6 +4039,19 @@ describe("CFObjectRepository production-shape coverage", () => {
 
       const gatewayWorld = await (wooObjects.get("world") as any).getWorld("world") as WooWorld;
       const deckWorld = await (wooObjects.get("the_deck") as any).getWorld("the_deck") as WooWorld;
+      deckWorld.createObject({ id: "cf_resident_contents_item", name: "Resident contents item", parent: "$thing", owner: "$wiz", location: "the_deck", anchor: "the_deck" });
+      deckWorld.object("the_deck").contents.delete("cf_resident_contents_item");
+      deckWorld.object("the_deck").contents.add("cf_resident_missing_guest");
+      deckWorld.markObjectChanged("the_deck");
+      const liveDeckState = wooStates.get("the_deck");
+      expect(liveDeckState).toBeDefined();
+      liveDeckState!.storage.sql.exec("DELETE FROM world_meta WHERE key = ?", "local_catalog_bundle_fingerprint");
+      await (env.WOO as unknown as FakeDurableObjectNamespace).get({ name: "the_deck" }).fetch(await signInternalRequest(env, new Request("https://woo.internal/healthz", {
+        headers: { "x-woo-host-key": "the_deck" }
+      })));
+      expect(deckWorld.contentsOf("the_deck")).toContain("cf_resident_contents_item");
+      expect(deckWorld.contentsOf("the_deck")).not.toContain("cf_resident_missing_guest");
+
       expect(deckWorld.objects.has("$note")).toBe(true);
       expect(installVerb(deckWorld, "$note", "title", `verb :title() rxd {
   return this.name;

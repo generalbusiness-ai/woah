@@ -864,6 +864,16 @@ fan-in. After an accepted MCP or REST commit, the gateway installs any
 as `source:"cache"` so the following turn can plan from the accepted state
 without pre-plan owner fan-in.
 
+Room membership used for MCP command resolution and visibility is also a
+repair-gated read. A sparse MCP shard may hold gateway projection rows for an
+active room, but those rows are stamped projection/cache, not owner authority.
+When `$match`, `visible_contents`, or `contents()` touches such a room in the
+planning VM, the VM raises repairable `E_NEED_STATE` for the room contents cell;
+the gateway fetches the room owner's authority and retries. This is the bounded
+read-boundary repair that prevents stale shard contents from deciding
+`take mug`/tool reachability while preserving warm-cache planning for already
+owner-authoritative cells.
+
 `CommitScopeDO` is the durable authority for v2 scope heads. On first open for
 a scope it materializes the gateway-supplied authority seed into row-shaped DO
 SQLite state: one row per materialized object, one row per session, one row per
