@@ -962,9 +962,12 @@ Runtimes without a background-lifetime primitive may fall back to synchronous
 delivery, but they must not weaken the durable object-host write-through rule
 above. Failed remote MCP fanout is logged and retried by later replay/open
 paths; it does not roll back the accepted commit.
-Remote shards consume `commit.projection_writes` into their gateway projection cache
-when present and expand `commit.projection_delta.tool_surface_sources` against
-their local tool-surface reverse index to evict stale descriptor cache rows.
+Remote shards consume `commit.projection_writes` plus the accepted transcript
+into their gateway projection cache when present, repairing cached container
+`contents` from moves/creates when the full container row is absent. They expand
+`commit.projection_delta.tool_surface_sources` against their local tool-surface
+reverse index to evict stale descriptor cache rows, and any transcript-derived
+cached contents repair also invalidates descriptor rows for that container.
 They must also apply those row-body-complete projection writes to their
 in-memory routing cache without persistence before queue fanout, because MCP
 delivery predicates read session active scopes, subscriber rows, and local
