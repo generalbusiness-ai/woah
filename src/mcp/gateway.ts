@@ -111,13 +111,14 @@ export type McpV2ClientHooks = {
     }
   ) => Promise<ReturnType<typeof executorAuthorityPayload>>;
   executionCapsuleOpen?: boolean;
-  // When set, envelopes are sent WITHOUT the ~3MB top-level authority slice (and
-  // session_objects). The CommitScopeDO is the authority for its own scope and
-  // rehydrates from its durable snapshot, so a warm/snapshotted scope never needs
-  // the slice; a truly-cold scope replies E_SNAPSHOT_REQUIRED and submitEnvelope
-  // retries with the full body (same path the capsule cold-miss already uses).
-  // Stale foreign cells converge through the existing read-version-mismatch →
-  // cell-page repair loop, not silent trust.
+  // When set, ordinary same-scope envelopes are sent WITHOUT the ~3MB top-level
+  // authority slice (and session_objects). The CommitScopeDO is the authority for
+  // its own scope and rehydrates from its durable snapshot, so a warm/snapshotted
+  // scope never needs the slice; a truly-cold scope replies E_SNAPSHOT_REQUIRED
+  // and submitEnvelope retries with the full body (same path the capsule
+  // cold-miss already uses). Cross-scope planned-transcript commits are the
+  // exception: their selected commit scope validates a transcript planned
+  // elsewhere, so the narrow transcript authority remains load-bearing.
   slimWarmEnvelope?: boolean;
   // Cloudflare sparse MCP shards enable this. Local/dev MCP gateways usually plan
   // from an authoritative in-process world whose cells do not carry owner
@@ -125,10 +126,14 @@ export type McpV2ClientHooks = {
   enforceResolutionOwnerRepair?: boolean;
 };
 
-// Strip the ~3MB authority slice (and legacy session_objects) from an envelope
-// body for the slim warm path. Keeps scope/session identity, the tiny session
-// rows, the (authority-free) execution capsule, and the envelope itself.
+// Strip the ~3MB authority slice (and legacy session_objects) from ordinary
+// same-scope envelope bodies for the slim warm path. A planned-transcript
+// commit deliberately executes against a different commit scope than the one
+// that planned the turn; its top-level authority is the validation seed for
+// actor/session/read cells missing from that scope's durable snapshot, so it is
+// not safe to slim.
 function slimMcpEnvelopeBody(body: McpV2EnvelopeBody): McpV2EnvelopeBody {
+  if (body.planned_transcript_commit === true) return body;
   const { authority, session_objects, ...rest } = body;
   void authority;
   void session_objects;
@@ -818,14 +823,15 @@ export class McpGateway {
           target,
           verb
         ));
-        // Slim every envelope: the gateway always opens (and the open seeds a
-        // durable snapshot on) a scope before enveloping it, so the CommitScopeDO
-        // rehydrates from its own snapshot and never needs the ~3MB slice — probe
-        // 360150d8 measured the relay as warm-or-snapshot on 100% of envelopes,
-        // never cold-seeded. The rare genuine miss (no in-memory relay AND no
-        // durable snapshot, e.g. a DO that lost storage) replies E_SNAPSHOT_REQUIRED
-        // and is resolved by the reseed + full-body retry below. The full body
-        // (envelopeBody) is retained for that retry.
+        // Slim ordinary warm envelopes: the gateway opens (and the open seeds a
+        // durable snapshot on) a scope before enveloping it, so a same-scope
+        // CommitScopeDO rehydrates from its own snapshot and never needs the
+        // ~3MB slice. Planned-transcript commits are excluded by
+        // slimMcpEnvelopeBody because their commit scope validates a transcript
+        // planned elsewhere. The rare genuine miss (no in-memory relay AND no
+        // durable snapshot, e.g. a DO that lost storage) replies
+        // E_SNAPSHOT_REQUIRED and is resolved by the reseed + full-body retry
+        // below. The full body (envelopeBody) is retained for that retry.
         const slim = hooks.slimWarmEnvelope === true;
         const firstBody = slim ? slimMcpEnvelopeBody(envelopeBody) : envelopeBody;
         // A cold scope cannot seed from a slimmed body (no authority) nor from a

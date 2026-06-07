@@ -205,6 +205,91 @@ describe("v2 MCP e2e", () => {
     }
   });
 
+  it("slimWarmEnvelope keeps planned-transcript authority when the commit scope has a stale snapshot", async () => {
+    const world = createWorld();
+    const env = { WOO_INTERNAL_SECRET: "v2-mcp-secret" };
+    const scopeStates = new Map<ObjRef, FakeDurableObjectState>();
+    const scopes = new Map<ObjRef, CommitScopeDO>();
+    const commitPosts: Array<{ scope: ObjRef; path: "/v2/open" | "/v2/envelope"; body: Record<string, unknown> }> = [];
+    const stateFor = (commitScope: ObjRef): FakeDurableObjectState => {
+      let state = scopeStates.get(commitScope);
+      if (!state) {
+        state = new FakeDurableObjectState(commitScope);
+        scopeStates.set(commitScope, state);
+      }
+      return state;
+    };
+    const scopeFor = (commitScope: ObjRef): CommitScopeDO => {
+      let scope = scopes.get(commitScope);
+      if (!scope) {
+        scope = new CommitScopeDO(stateFor(commitScope) as unknown as ConstructorParameters<typeof CommitScopeDO>[0], env);
+        scopes.set(commitScope, scope);
+      }
+      return scope;
+    };
+
+    try {
+      // Seed the mug's commit scope before Alice exists. This models a prod
+      // CommitScopeDO that is warm/snapshotted but lacks the current actor row;
+      // a slim planned-transcript submit must carry the narrow validation
+      // authority, not rely on the old snapshot alone.
+      const stale = world.auth("guest:v2-mcp-slim-stale-snapshot");
+      const staleAuthority = executorAuthorityPayload(world, ["the_mug"]);
+      await postCommitScope(scopeFor("the_mug"), env, "the_mug", "/v2/open", {
+        ...staleAuthority,
+        scope: "the_mug",
+        node: "mcp:stale-mug-snapshot",
+        token: `mcp-v2:${stale.id}:${stale.actor}`,
+        session: stale.id,
+        actor: stale.actor,
+        serialized: serializedWorldFromAuthoritySlice(staleAuthority.authority)
+      });
+
+      const gateway = new McpGateway(world, {
+        v2: {
+          slimWarmEnvelope: true,
+          authorityPayload: async (extraObjectIds) => {
+            const payload = executorAuthorityPayload(world, extraObjectIds);
+            return { ...payload, sessions: [], authority: { ...payload.authority, sessions: [] } };
+          },
+          open: async (commitScope, body) => {
+            commitPosts.push({ scope: commitScope, path: "/v2/open", body: body as unknown as Record<string, unknown> });
+            return await postCommitScope(scopeFor(commitScope), env, commitScope, "/v2/open", body);
+          },
+          envelope: async (commitScope, body) => {
+            commitPosts.push({ scope: commitScope, path: "/v2/envelope", body: body as unknown as Record<string, unknown> });
+            return await postCommitScope<McpV2EnvelopeResult>(scopeFor(commitScope), env, commitScope, "/v2/envelope", body);
+          }
+        }
+      });
+
+      const alice = await initializeMcp(gateway, "guest:v2-mcp-slim-planned-take", 1);
+      const aliceActor = world.sessions.get(alice)?.actor;
+      expect(aliceActor).toBeTruthy();
+      const take = await mcp(gateway, alice, 2, "tools/call", {
+        name: "woo_call",
+        arguments: { object: "the_chatroom", verb: "take", args: ["the_mug"] }
+      });
+      expect(take.result.isError, JSON.stringify(take.result.structuredContent)).not.toBe(true);
+      expect(world.object("the_mug").location).toBe(aliceActor);
+
+      const mugEnvelope = commitPosts.find((post) =>
+        post.scope === "the_mug" &&
+        post.path === "/v2/envelope" &&
+        post.body.planned_transcript_commit === true
+      );
+      expect(mugEnvelope).toBeTruthy();
+      expect(mugEnvelope!.body).toHaveProperty("authority");
+      expect(Array.from(authoritySliceObjectIds(mugEnvelope!.body.authority as Parameters<typeof authoritySliceObjectIds>[0]))).toEqual(expect.arrayContaining([
+        "the_mug",
+        "the_chatroom",
+        aliceActor!
+      ]));
+    } finally {
+      for (const state of scopeStates.values()) state.close();
+    }
+  });
+
   it("opens cross-scope planned-transcript commit scopes before building the envelope when capsule open is enabled", async () => {
     const metrics: MetricEvent[] = [];
     const world = createWorld({ metricsHook: (event) => metrics.push(event) });

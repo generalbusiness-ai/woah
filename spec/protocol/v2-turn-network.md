@@ -1323,6 +1323,11 @@ durable snapshot, it MUST reject the tiny head/session open with
 snapshot or authority slice. The open and envelope still obey the session-row
 rule above; a capsule-disabled planned-transcript commit is not allowed to rely
 on gateway-local session state that the selected CommitScopeDO has never seen.
+The planned-transcript envelope MUST NOT use a slim/warm omission of the
+authority slice: the selected commit scope may have a durable snapshot that
+predates the current actor or other transcript validation rows, and the planned
+transcript is not re-executed there. The envelope authority is therefore the
+bounded validation seed for the actor, session, and transcript-touched cells.
 
 Executable cell-page transfers served for browser execution use the same
 `woo.state.transfer.v1` `cell_pages` transfer, with recipient-bound capsule

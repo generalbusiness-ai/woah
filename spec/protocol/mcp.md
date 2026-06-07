@@ -230,6 +230,10 @@ seed snapshot. The following envelope MUST carry the gateway-authenticated MCP
 session row in both the request `sessions` list and the authority slice's
 `sessions` list, even when sparse authority reconstruction omitted the session
 row, so the CommitScopeDO can derive and validate the browser-session token.
+That planned-transcript envelope is not eligible for slim warm-envelope
+authority omission: the selected CommitScopeDO may already have a durable
+snapshot while still missing the caller's actor row or other cells the gateway
+read while planning.
 
 ### M3.1 Working set: `$actor:focus`
 

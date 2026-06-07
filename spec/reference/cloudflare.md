@@ -1067,7 +1067,11 @@ only session rows and never build executable seed transfers; cold scopes may
 retry the same protocol with a seed snapshot. The envelope payload must include
 the bound MCP session row in the request `sessions` field and in
 `authority.sessions`; otherwise the selected CommitScopeDO cannot derive
-the browser-session auth claim for a session that only the gateway shard has seen.
+the browser-session auth claim for a session that only the gateway shard has
+seen. The planned-transcript envelope must also retain its authority slice even
+when `WOO_V2_SLIM_WARM_ENVELOPE` is enabled: a warm selected CommitScopeDO
+snapshot can be older than the current actor/session and cannot validate a
+caller-planned transcript from session rows alone.
 
 Live no-commit v2 transcripts follow the same MCP shard discovery and are sent
 through signed `POST /__internal/mcp-live-fanout` with `{scope,
