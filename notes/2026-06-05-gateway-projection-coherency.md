@@ -94,3 +94,29 @@ THE FIX IS AUTHORITATIVE RESOLUTION, not more cache coherency:
 Status: lineage and contents-durability fixes are merged; contents-durability
 deployed as 97a6d83. This note records the next gateway coherency layer:
 authoritative, owner-repaired resolution for sparse MCP planning.
+
+## Follow-up after deploying authoritative resolution (97a8860)
+Deploy smoke proved the read-boundary repair: `take mug` no longer failed at
+the seed-fixture lookup, and the transcript contained the authoritative
+`the_mug` row. Two remaining gaps explained the residual failures:
+
+- Exact `woo_call(the_chatroom, southeast)` can fail before VM planning if the
+  sparse shard's cached `gateway_tool_surface` row covers `the_chatroom` but was
+  built before the movement verb was visible. A cached object row that lacks the
+  requested verb is not a negative-authority answer; exact `woo_call` must force
+  a bounded owner refresh before returning `E_VERBNF`.
+- Resident owner contents repair was accidentally tied to
+  `local_catalog_bundle_fingerprint`. Because the deploy did not change the
+  catalog fingerprint, already-current hosts never ran the derived-contents
+  repair and authoritative room contents still included historical departed
+  actors. The repair needs its own epoch so a code-only repair deploy can run it
+  once per resident host without rerunning the catalog-seed repair.
+- Local full-suite validation exposed a separate reused-relay auth edge: a REST
+  v2 relay can carry session claims from its initial serialized seed even after
+  the gateway has a current session record. Reused relays now refresh relay-local
+  claims from the current gateway session before open/planning, preserving strict
+  token expiry without rebuilding the relay.
+
+Wrangler tail metrics were unavailable in this run because the active Cloudflare
+token could deploy but could not open `/tails`. The actionable signal came from
+the deploy postflight smoke log rather than tail-backed timing analysis.

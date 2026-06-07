@@ -4045,7 +4045,7 @@ describe("CFObjectRepository production-shape coverage", () => {
       deckWorld.markObjectChanged("the_deck");
       const liveDeckState = wooStates.get("the_deck");
       expect(liveDeckState).toBeDefined();
-      liveDeckState!.storage.sql.exec("DELETE FROM world_meta WHERE key = ?", "local_catalog_bundle_fingerprint");
+      liveDeckState!.storage.sql.exec("DELETE FROM world_meta WHERE key = ?", "resident_derived_contents_repair_epoch");
       await (env.WOO as unknown as FakeDurableObjectNamespace).get({ name: "the_deck" }).fetch(await signInternalRequest(env, new Request("https://woo.internal/healthz", {
         headers: { "x-woo-host-key": "the_deck" }
       })));

@@ -59,6 +59,7 @@ import type { ShadowCapabilityAd } from "../core/capability-ad";
 import {
   createShadowBrowserRelayShim,
   publishShadowBrowserAcceptedFrame,
+  refreshShadowBrowserRelaySessionAuth,
   shadowLiveEventsForTranscriptRelay,
   shadowBrowserSessionBearer,
   shadowBrowserSessionClaimsValue,
@@ -465,6 +466,8 @@ const HOST_STATE_TEARING_DOWN = "tearing_down";
 const HOST_SEED_DIGEST_META_KEY = "host_seed_digest";
 const LOCAL_CATALOG_BUNDLE_FINGERPRINT_META_KEY = "local_catalog_bundle_fingerprint";
 export const LOCAL_CATALOG_BUNDLE_REPAIR_EPOCH = "resident-catalog-repair-v3";
+const RESIDENT_DERIVED_CONTENTS_REPAIR_META_KEY = "resident_derived_contents_repair_epoch";
+const RESIDENT_DERIVED_CONTENTS_REPAIR_EPOCH = "2026-06-06-owner-contents-repair";
 // SHA-256 of the (id|host|anchor) triples this DO last successfully
 // published to the Directory, sorted by id. On gateway cold-restart we
 // recompute the digest from the current route set and skip the
@@ -1046,6 +1049,7 @@ export class PersistentObjectDO {
   // empty-but-cached scope also reads as uncovered (it leaves no row) and so
   // re-verifies with the owner rather than being mistaken for "fully cached".
   private gatewayToolSurfaceRequestCovered(request: RemoteToolRequest): boolean {
+    if (request.forceRefresh === true) return false;
     if (this.gatewayToolSurfaceScopeSaturated(request.id)) return false;
     const row = request.expandContents
       ? firstSqlRow<{ present: number }>(this.state.storage.sql.exec(
@@ -1871,11 +1875,11 @@ export class PersistentObjectDO {
 
   private async ensureLoadedWorldCatalogBundle(world: WooWorld, hostKey: string): Promise<void> {
     const fingerprint = this.currentLocalCatalogBundleFingerprint();
-    if (this.repo.loadMeta(LOCAL_CATALOG_BUNDLE_FINGERPRINT_META_KEY) === fingerprint) return;
+    const catalogBundleCurrent = this.repo.loadMeta(LOCAL_CATALOG_BUNDLE_FINGERPRINT_META_KEY) === fingerprint;
     let persistFullSnapshotAfterRepair = false;
-    if (hostKey === WORLD_HOST) {
+    if (!catalogBundleCurrent && hostKey === WORLD_HOST) {
       installLocalCatalogs(world, parseAutoInstallCatalogs(this.env.WOO_AUTO_INSTALL_CATALOGS));
-    } else if (!isMcpGatewayShardHost(hostKey)) {
+    } else if (!catalogBundleCurrent && !isMcpGatewayShardHost(hostKey)) {
       // Hot DO instances can retain an already-loaded host slice across a
       // Worker deploy. Pull the gateway seed once per catalog bundle so
       // foreign-hosted support rows keep gateway-authoritative repairs while
@@ -1911,13 +1915,17 @@ export class PersistentObjectDO {
       }
     }
     if (!isMcpGatewayShardHost(hostKey)) {
-      const contentsRepair = world.repairDerivedContentsIndex({ persist: !persistFullSnapshotAfterRepair });
-      if (contentsRepair.repaired_containers.length > 0) {
-        console.warn("woo.derived_contents_repaired", { host: hostKey, resident: true, ...contentsRepair });
+      const repairDue = this.repo.loadMeta(RESIDENT_DERIVED_CONTENTS_REPAIR_META_KEY) !== RESIDENT_DERIVED_CONTENTS_REPAIR_EPOCH;
+      if (repairDue) {
+        const contentsRepair = world.repairDerivedContentsIndex({ persist: !persistFullSnapshotAfterRepair });
+        if (contentsRepair.repaired_containers.length > 0) {
+          console.warn("woo.derived_contents_repaired", { host: hostKey, resident: true, ...contentsRepair });
+        }
+        this.repo.saveMeta(RESIDENT_DERIVED_CONTENTS_REPAIR_META_KEY, RESIDENT_DERIVED_CONTENTS_REPAIR_EPOCH);
       }
       if (persistFullSnapshotAfterRepair) world.persistFullSnapshot();
     }
-    this.repo.saveMeta(LOCAL_CATALOG_BUNDLE_FINGERPRINT_META_KEY, fingerprint);
+    if (!catalogBundleCurrent) this.repo.saveMeta(LOCAL_CATALOG_BUNDLE_FINGERPRINT_META_KEY, fingerprint);
   }
 
   private async getWorld(hostKey = this.durableHostKey()): Promise<WooWorld> {
@@ -4861,6 +4869,7 @@ export class PersistentObjectDO {
         openedAt: Date.now(),
         nextTurn: 0
       };
+      refreshShadowBrowserRelaySessionAuth(client.relay, input.session, scope, token);
       if (this.restExecutionCapsuleEnabled() && !forceReopen) {
         this.rememberRestV2Relay(scope, client);
         return client;
@@ -4877,6 +4886,7 @@ export class PersistentObjectDO {
       this.rememberRestV2Relay(scope, client);
       return client;
     }
+    refreshShadowBrowserRelaySessionAuth(client.relay, input.session, scope, token);
     this.rememberRestV2Relay(scope, client);
     this.mergeRestPlanningAuthority(world, client, seeded.authority.authority);
     return client;

@@ -876,9 +876,17 @@ export class McpHost {
         descriptors = await this.sessionManifestDescriptors(sessionId, remoteFailed ? "owner_timeout" : "cache_miss");
       }
       let descriptor = descriptors.find((candidate) => candidate.object === object && candidate.verb === verbName);
+      if (!descriptor) {
+        try {
+          const fresh = await bridge.enumerateRemoteTools(actor, [{ id: object, projection, forceRefresh: true }]);
+          descriptor = fresh.find((candidate) => candidate.object === object && candidate.verb === verbName);
+        } catch {
+          // Preserve the normal miss path if a forced exact refresh is unavailable.
+        }
+      }
       if (!descriptor && projection === "tools" && object === this.world.activeScopeForSession(sessionId)) {
         try {
-          const obvious = await bridge.enumerateRemoteTools(actor, [{ id: object, projection: "obvious" }]);
+          const obvious = await bridge.enumerateRemoteTools(actor, [{ id: object, projection: "obvious", forceRefresh: true }]);
           descriptor = obvious.find((candidate) => candidate.object === object && candidate.verb === verbName);
         } catch {
           // The tools projection already failed to resolve this verb. Preserve
@@ -941,7 +949,7 @@ export class McpHost {
         // misses, ask the owner for the exact requested object and still let
         // remote actorCanSee/verb permission checks decide whether it is
         // callable.
-        const exact = await bridge.enumerateRemoteTools(actor, [{ id: object, projection: "tools" as const }]);
+        const exact = await bridge.enumerateRemoteTools(actor, [{ id: object, projection: "tools" as const, forceRefresh: true }]);
         descriptor = exact.find((candidate) => candidate.object === object && candidate.verb === verbName);
       } catch {
         // Fall through to the session manifest fallback below.

@@ -59,6 +59,7 @@ export type RemoteToolRequest = {
   projection?: RemoteToolProjection;
   expandContents?: boolean;
   contentsProjection?: RemoteToolProjection;
+  forceRefresh?: boolean;
 };
 
 export type PresenceProjectionDef =

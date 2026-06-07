@@ -464,6 +464,7 @@ describe("gateway projection cache", () => {
     // Coverage is request-level: room_a is covered, room_b is not, so the batch
     // is NOT fully covered and enumerateRemoteTools must refresh from the owner.
     expect(po.gatewayToolSurfaceRequestCovered(requestA)).toBe(true);
+    expect(po.gatewayToolSurfaceRequestCovered({ ...requestA, forceRefresh: true })).toBe(false);
     expect(po.gatewayToolSurfaceRequestCovered(requestB)).toBe(false);
     expect([requestA, requestB].every((request) => po.gatewayToolSurfaceRequestCovered(request))).toBe(false);
   });

@@ -662,6 +662,26 @@ export function setShadowBrowserSessionToken(browser: ShadowBrowserNode, token: 
   browser.session_token = token;
 }
 
+export function refreshShadowBrowserRelaySessionAuth(
+  relay: ShadowRelayCache,
+  session: Pick<SerializedSession, "id" | "actor" | "started" | "expiresAt">,
+  scope: ObjRef,
+  token = shadowBrowserSessionBearer(session)
+): ShadowBrowserSessionClaims {
+  // Reused REST/transport relays are intentionally long-lived, while auth
+  // validity belongs to the gateway's current session record. Refresh just the
+  // relay-local claims so transport validation remains strict without forcing a
+  // full relay rebuild or a fresh serialized-world seed on every turn.
+  const existing = relay.session_auth.get(token);
+  const rev = relay.session_revs.get(session.id) ?? existing?.rev ?? 1;
+  const scopes = new Set<ObjRef>(existing?.session === session.id ? existing.scopes : []);
+  scopes.add(scope);
+  relay.session_revs.set(session.id, rev);
+  const claims = shadowBrowserSessionClaimsValue(session, relay.deployment, [...scopes], rev);
+  relay.session_auth.set(token, claims);
+  return claims;
+}
+
 export function createShadowBrowserNodeCache(): ShadowBrowserNodeCache {
   return {
     kind: "woo.browser_cache.shadow.v1",

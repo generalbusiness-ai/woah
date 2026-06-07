@@ -2773,6 +2773,53 @@ describe("McpGateway", () => {
     expect(focusedBody.result.structuredContent?.result).toContain("remote_widget");
   });
 
+  it("forces an owner refresh when an exact remote woo_call misses a cached descriptor", async () => {
+    const home = bootstrapWorld();
+    const remote = bootstrapWorld();
+    const routes = new Map<ObjRef, string>([["remote_room", "remote"]]);
+    const requests: RemoteToolRequest[] = [];
+    const staleDescriptor: RemoteToolDescriptor = {
+      object: "remote_room",
+      verb: "look",
+      aliases: [],
+      arg_spec: { args: [] },
+      direct: true,
+      source: "/* stale cache */",
+      enclosingSpace: "remote_room"
+    };
+    const freshDescriptor: RemoteToolDescriptor = {
+      object: "remote_room",
+      verb: "southeast",
+      aliases: [],
+      arg_spec: { args: [] },
+      direct: true,
+      source: "/* owner */",
+      enclosingSpace: "remote_room"
+    };
+    class ExactRefreshBridge extends RemoteToolBridge {
+      override async enumerateRemoteTools(_actor: ObjRef, batch: RemoteToolRequest[]): Promise<RemoteToolDescriptor[]> {
+        requests.push(...batch);
+        return batch.some((request) => request.forceRefresh === true) ? [freshDescriptor] : [staleDescriptor];
+      }
+    }
+    home.setExecutorContext(new ExactRefreshBridge("home", new Map([["home", home], ["remote", remote]]), routes, new Map()));
+
+    home.createObject({ id: "remote_room", name: "Remote Room", parent: "$space", owner: "$wiz" });
+    const session = home.auth("guest:mcp-exact-force-refresh");
+    home.object(session.actor).location = "remote_room";
+    home.object("remote_room").contents.add(session.actor);
+    session.activeScope = "remote_room";
+
+    const host = new McpHost(home);
+    const resolved = await host.resolveReachableTool(session.actor, "remote_room", "southeast", session.id);
+
+    expect(resolved).toMatchObject({ object: "remote_room", verb: "southeast" });
+    expect(requests).toEqual([
+      expect.objectContaining({ id: "remote_room", projection: "tools" }),
+      expect.objectContaining({ id: "remote_room", projection: "tools", forceRefresh: true })
+    ]);
+  });
+
   it("treats a remote current location as reachable even without a local stub", async () => {
     const home = bootstrapWorld();
     const remote = bootstrapWorld();

@@ -26,6 +26,7 @@ import {
   purgeShadowBrowserRelayHistory,
   receiveShadowBrowserEnvelope,
   receiveShadowBrowserEnvelopeReceipt,
+  refreshShadowBrowserRelaySessionAuth,
   setShadowBrowserSessionToken,
   SHADOW_SCOPE_PROJECTION_PATCH_FIELDS,
   shadowLiveEventsForTranscript,
@@ -963,6 +964,44 @@ describe("shadow browser node shim", () => {
     claims.deployment = browser.relay.deployment;
     browser.relay.session_revs.set(browser.session, claims.rev + 1);
     expect(() => shadowBrowserTransportHello(browser)).toThrow(/rev mismatch/);
+  });
+
+  it("refreshes reused relay session auth from the current gateway session", () => {
+    const anchor = createWorld();
+    const session = anchor.auth("guest:browser-auth-refresh");
+    const serialized = anchor.exportWorld();
+    const serializedSession = serialized.sessions.find((item) => item.id === session.id);
+    if (!serializedSession) throw new Error("expected serialized test session");
+    serializedSession.started = Date.now() - 120_000;
+    serializedSession.expiresAt = Date.now() - 60_000;
+    const relay = createShadowBrowserRelayShim({
+      node: "browser-relay-auth-refresh",
+      scope: "the_dubspace",
+      serialized
+    });
+    const browser = createShadowBrowserNode({
+      node: "browser-auth-refresh",
+      scope: "the_dubspace",
+      actor: session.actor,
+      session: session.id,
+      relay
+    });
+    const rev = relay.session_revs.get(session.id);
+
+    expect(() => shadowBrowserTransportHello(browser)).toThrow(/token is expired/);
+
+    const refreshed = refreshShadowBrowserRelaySessionAuth(relay, {
+      id: session.id,
+      actor: session.actor,
+      started: session.started,
+      expiresAt: Date.now() + 60_000
+    }, "the_dubspace");
+
+    expect(refreshed.rev).toBe(rev);
+    expect(shadowBrowserTransportHello(browser)).toMatchObject({
+      session: session.id,
+      actor: session.actor
+    });
   });
 
   it("advertises the M4 idempotency window through transport hello", async () => {
