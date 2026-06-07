@@ -458,9 +458,10 @@ export function buildShadowCellPageTransfer(input: {
     // was absent from the pre-turn anchor.
     return !lifecycle || !item.preimage.startsWith("read:") || serializedObjectIds.has(lifecycle);
   });
-  const requiredPages = pageClosureForPreimages(input.serialized, selected.map((item) => item.preimage), {
+  let requiredPages = pageClosureForPreimages(input.serialized, selected.map((item) => item.preimage), {
     fullLifecycleObjects: lifecycleObjects
   });
+  requiredPages = ensureCellPageTransferLineageClosure(input.serialized, requiredPages);
   const closureAtomPreimages = fullObjectClosureAtomPreimages(input.serialized, lifecycleObjects);
   const lookupAtomPreimages = lookupClosureAtomPreimages(input.serialized, selected.map((item) => item.preimage));
   const granted = transferAtomsForPages(selected, requiredPages, [...closureAtomPreimages, ...lookupAtomPreimages]);
@@ -1880,6 +1881,31 @@ function pageClosureForPreimages(
   }
 
   return Array.from(pages.values()).sort(compareStatePages);
+}
+
+function ensureCellPageTransferLineageClosure(
+  serialized: SerializedWorld,
+  pages: readonly ShadowStatePage[]
+): ShadowStatePage[] {
+  if (pages.length === 0) return [];
+  const byId = new Map(serialized.objects.map((obj) => [obj.id, obj] as const));
+  const out = new Map(pages.map((page) => [shadowStatePageHash(page), page] as const));
+  const objectsWithLineage = new Set(pages
+    .filter((page) => page.page === "object_lineage")
+    .map((page) => page.object));
+  for (const page of pages) {
+    if (objectsWithLineage.has(page.object)) continue;
+    const obj = byId.get(page.object);
+    if (!obj) continue;
+    // Cell-page transfers are materialization units as well as authority/cache
+    // units. Any transferred cell for an object absent from the receiver needs
+    // the lineage page so mergeShadowStatePagesIntoSerialized can construct the
+    // row before applying live/property/verb pages.
+    const lineage = shadowObjectLineagePage(obj);
+    out.set(shadowStatePageHash(lineage), lineage);
+    objectsWithLineage.add(page.object);
+  }
+  return Array.from(out.values()).sort(compareStatePages);
 }
 
 function objectHasPropertyCell(obj: SerializedObject, name: string): boolean {

@@ -506,6 +506,10 @@ function mergeAuthorityCellPages(
 
   const cellProvenance = options.cellProvenance;
   const changedPages: ShadowStatePage[] = [];
+  const inlineLineageByObject = new Map<ObjRef, ShadowStatePage>();
+  for (const page of authority.inline_pages) {
+    if (page.page === "object_lineage") inlineLineageByObject.set(page.object, page);
+  }
   for (const ref of authority.page_refs) {
     const key = authorityPageRefKey(ref);
     const current = currentPages.get(key);
@@ -578,6 +582,27 @@ function mergeAuthorityCellPages(
     if (tracked) cellProvenance!.set(key, ref.source_host !== undefined ? { source: ref.source, source_host: ref.source_host } : { source: ref.source });
   }
   if (changedPages.length === 0) return false;
+  // Reconstruction support invariant: a page-filtered slice can be semantically
+  // valid for authority while still being incomplete as a materialization unit.
+  // If another incoming page creates a new object and the slice still carries
+  // that object's inline lineage page, add it as fill-only scaffolding so
+  // mergeShadowStatePagesIntoSerialized can build the row. This does not create
+  // authority for the lineage cell; missing official provenance remains fallback
+  // and later owner-authoritative pages can still displace it.
+  const changedObjectsWithLineage = new Set(changedPages
+    .filter((page) => page.page === "object_lineage")
+    .map((page) => page.object));
+  for (const page of [...changedPages]) {
+    if (objectsById.has(page.object) || changedObjectsWithLineage.has(page.object)) continue;
+    const lineage = inlineLineageByObject.get(page.object);
+    if (!lineage) continue;
+    changedPages.push(options.clone ? structuredClone(lineage) as ShadowStatePage : lineage);
+    changedObjectsWithLineage.add(page.object);
+    if (cellProvenance) {
+      const key = authorityPageKey(lineage);
+      if (!cellProvenance.has(key)) cellProvenance.set(key, { source: "fallback" });
+    }
+  }
 
   const base: SerializedWorld = {
     version: 1,

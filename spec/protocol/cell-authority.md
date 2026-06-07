@@ -689,6 +689,11 @@ pages, in-memory indexed state, transcript reads/writes, and diagnostics.
 - A cell-page transfer MUST be installable into durable storage without first
   constructing a full `SerializedWorld`. `SerializedWorld` is a
   compatibility/export view at protocol edges, not the hot-path assembly format.
+- Any cell-page transfer or filtered authority slice that carries a page for an
+  object MUST also carry that object's `object_lineage` page as reconstruction
+  support, unless the receiver already holds the object. A lineage page included
+  only for reconstruction does not by itself grant write authority; provenance
+  and commit validation still determine the authority of each cell.
 
 ### CA12.1 Page coverage
 

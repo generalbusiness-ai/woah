@@ -237,6 +237,45 @@ describe("WooWorld.exportAuthoritySlice content contract", () => {
     expect(serialized.objects.find((obj) => obj.id === "the_deck")?.name).toBe("The Deck");
   });
 
+  it("mergeSerializedAuthoritySlice uses inline lineage as reconstruction support when a final ref set dropped it", () => {
+    // Final authority slices are assembled from several filtered sources. A
+    // malformed page-ref set can keep a new object's live/cell page while losing
+    // the lineage ref, even though the inline lineage page is still present in
+    // the bundle. The merge boundary must use that inline lineage as fill-only
+    // scaffolding instead of throwing "state page set missing lineage page".
+    const room: SerializedObject = { ...objectRecord("lineage_gap_room", ["lineage_gap_item"]), name: "Lineage Gap Room" };
+    const full = buildSerializedAuthorityCellSlice({
+      sessions: [],
+      objects: [room],
+      counters: { objectCounter: 1, parkedTaskCounter: 1, sessionCounter: 1 },
+      pageProvenance: () => ({ source: "projection" as const, source_host: "mcp-gateway-2" })
+    });
+    const missingLineageRef = {
+      ...full,
+      page_refs: full.page_refs.filter((ref) => ref.object !== "lineage_gap_room" || ref.page !== "object_lineage")
+    };
+    const serialized = {
+      version: 1 as const,
+      objectCounter: 1,
+      parkedTaskCounter: 1,
+      sessionCounter: 1,
+      objects: [] as SerializedObject[],
+      sessions: [],
+      logs: [],
+      snapshots: [],
+      parkedTasks: [],
+      tombstones: []
+    };
+    const provenance = new Map();
+    expect(() => mergeSerializedAuthoritySlice(serialized, missingLineageRef, { clone: true, cellProvenance: provenance })).not.toThrow();
+    expect(serialized.objects.find((obj) => obj.id === "lineage_gap_room")).toMatchObject({
+      id: "lineage_gap_room",
+      name: "Lineage Gap Room",
+      contents: ["lineage_gap_item"]
+    });
+    expect(provenance.get("lineage_gap_room:object_lineage:")).toEqual({ source: "fallback" });
+  });
+
   it("refuses a non-authoritative projection stub from overwriting a named lineage (CA11 symmetric stub guard)", () => {
     // Reverse of stub-repair: when the planning world already holds the resolved
     // identity ("Guest 1", projection) and an equal-rank projection page arrives
