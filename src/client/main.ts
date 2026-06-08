@@ -733,7 +733,22 @@ function receiveOptimisticResultFrame(frame: any) {
     receiveLiveEvent(observation, { provisionalTurnId });
   }
   applyScopedMoveResult(frame.result);
+  resolveOptimisticCommandPlan(frame);
   render();
+}
+
+function resolveOptimisticCommandPlan(frame: any) {
+  const id = typeof frame.id === "string" ? frame.id : "";
+  const command = frame.command;
+  if (!id || !command || command.verb !== "command_plan") return;
+  const handler = pendingDirect.get(id);
+  if (!handler) return;
+  // Planning is read-only. Use the browser-local planner result to launch the
+  // selected verb immediately; the server's later live-plan echo still clears
+  // the provisional planner UI, but must not execute the command a second time.
+  pendingDirect.delete(id);
+  pendingFrameErrors.delete(id);
+  handler(frame.result);
 }
 
 function receiveOptimisticErrorFrame(frame: any) {

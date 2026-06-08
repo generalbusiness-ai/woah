@@ -220,7 +220,8 @@ test("dubspace sends committed controls through the v2 intent path", async ({ pa
   await expect.poll(() => appliedVerb, { timeout: 5_000 }).toBe("set_control");
 });
 
-test("chat boot uses /api/me and moves without /api/state", async ({ page }) => {
+test("chat boot uses /api/me and moves without /api/state", async ({ page, request }) => {
+  const diagnostics = await installV2Diagnostics(page, "chat_boot_local_command_plan");
   const stateCalls: string[] = [];
   const v2AppliedVerbs: string[] = [];
   const v2TurnResultVerbs: string[] = [];
@@ -249,8 +250,13 @@ test("chat boot uses /api/me and moves without /api/state", async ({ page }) => 
     });
   });
 
+  const auth = await request.post("/api/auth", { data: { token: `guest:e2e-v2-chat-${crypto.randomUUID()}` } });
+  const session = String((await auth.json())?.session ?? "");
   await page.goto("/");
-  await continueAsGuestIfPrompted(page);
+  await page.evaluate((sessionId) => {
+    localStorage.setItem("woo.session", sessionId);
+  }, session);
+  await page.goto("/objects/the_chatroom");
   await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
   await expect(page.getByText("No chat UI is registered for this room.")).toHaveCount(0);
   await expect(page.locator("woo-chat-space[data-chat-space-host]")).toBeAttached();
@@ -279,6 +285,10 @@ test("chat boot uses /api/me and moves without /api/state", async ({ page }) => 
   await expect(page.locator("[data-chat-input]")).toBeFocused();
   expect(v2AppliedVerbs).not.toContain("say");
   expect(stateCalls).toEqual([]);
+  expectNoV2Failures(diagnostics);
+  expect(diagnostics.localFallbacks, `local fallbacks: ${diagnostics.localFallbacks.join("\n")}`).toEqual([]);
+  const localPlanVerbs = diagnostics.localPlans.map((line) => JSON.parse(line).verb);
+  expect(localPlanVerbs).toEqual(expect.arrayContaining(["command_plan", "say", "southeast", "west"]));
 });
 
 test("switches between tabs", async ({ page }) => {

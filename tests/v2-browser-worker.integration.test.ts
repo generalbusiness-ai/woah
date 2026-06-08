@@ -175,6 +175,114 @@ describe("v2 browser worker integration", () => {
     await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "warm-dubspace-control"));
   });
 
+  it("plans typed commands locally through the space command_plan verb", async () => {
+    const posted: unknown[] = [];
+    const scope = new FakeWorkerScope();
+    vi.stubGlobal("self", scope);
+    vi.stubGlobal("postMessage", (message: unknown) => posted.push(message));
+    vi.stubGlobal("indexedDB", new FakeIndexedDBFactory());
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+
+    await import("../src/client/v2-browser-worker");
+
+    const world = createWorld();
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-command-plan");
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-command-plan",
+      scope: "the_chatroom",
+      serialized: world.exportWorld()
+    });
+    const browser = createShadowBrowserClient({
+      node: "browser:v2-worker-command-plan",
+      scope: "the_chatroom",
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: "token:v2-worker-command-plan"
+    });
+    const opened = await openShadowBrowserScope(browser, { preseed_catalog_pages: true });
+
+    scope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-command-plan",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    const socket = await waitForSocket();
+    socket.open();
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "hello-command-plan", "woo.transport.hello.v1", shadowBrowserTransportHello(browser))));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "transfer-command-plan", opened.transfer.kind, opened.transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "exec-command-plan", opened.executable_transfer.kind, opened.executable_transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "ad-command-plan", "woo.exec_capability_ad.shadow.v1", opened.ads[0])));
+    await waitForMessage(posted, isReadyStatus);
+
+    const cursor = posted.length;
+    scope.dispatch({
+      kind: "call",
+      id: "local-command-plan",
+      route: "direct",
+      scope: "the_chatroom",
+      target: "the_chatroom",
+      verb: "command_plan",
+      args: ["take mug"],
+      persistence: "live"
+    });
+
+    const request = await waitForBrowserBuiltExecRequest(browser, socket, "command_plan");
+    expect(request).toMatchObject({
+      type: "woo.turn.exec.request.shadow.v1",
+      body: {
+        call: {
+          scope: "the_chatroom",
+          target: "the_chatroom",
+          verb: "command_plan",
+          args: ["take mug"]
+        }
+      }
+    });
+    expect(posted.slice(cursor).find((message) => isLocalTurnFallback(message, "local-command-plan"))).toBeUndefined();
+    expect(await waitForMessageFrom(posted, cursor, (message) => isLocalTurnPlanned(message, "local-command-plan"))).toMatchObject({
+      kind: "local_turn_planned",
+      id: "local-command-plan",
+      target: "the_chatroom",
+      verb: "command_plan"
+    });
+
+    const sayCursor = posted.length;
+    scope.dispatch({
+      kind: "call",
+      id: "local-command-say",
+      route: "direct",
+      scope: "the_chatroom",
+      target: "the_chatroom",
+      verb: "say",
+      args: ["hello from local command plan"],
+      persistence: "live"
+    });
+    const sayRequest = await waitForBrowserBuiltExecRequest(browser, socket, "say");
+    expect(sayRequest).toMatchObject({
+      type: "woo.turn.exec.request.shadow.v1",
+      body: {
+        call: {
+          scope: "the_chatroom",
+          target: "the_chatroom",
+          verb: "say",
+          args: ["hello from local command plan"]
+        }
+      }
+    });
+    expect(posted.slice(sayCursor).find((message) => isLocalTurnFallback(message, "local-command-say"))).toBeUndefined();
+    expect(await waitForMessageFrom(posted, sayCursor, (message) => isLocalTurnPlanned(message, "local-command-say"))).toMatchObject({
+      kind: "local_turn_planned",
+      id: "local-command-say",
+      target: "the_chatroom",
+      verb: "say"
+    });
+  });
+
   it("persists a queued durable proposal before enqueueing when the socket is not open", async () => {
     const posted: unknown[] = [];
     const scope = new FakeWorkerScope();
