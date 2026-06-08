@@ -5134,13 +5134,15 @@ function enterPinboard() {
 
 function leavePinboard(done?: () => void) {
   const board = pinboardSpace();
+  // Release tab navigation immediately like the other room tools. A stalled
+  // sequenced leave reply must not trap the user on the Pinboard tab; board
+  // presence and viewport cleanup still apply when the result eventually lands.
   leaveRoomToolSpace({
     tab: "pinboard",
     space: board,
     canSend: canSendPinboardV2,
     route: "sequenced",
     isPresent: pinboardActorPresent,
-    waitForLeaveResult: true,
     onResult: (result) => {
       setPinboardPresent(result);
       clearPinboardViewports();
