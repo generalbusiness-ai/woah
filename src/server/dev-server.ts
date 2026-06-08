@@ -329,7 +329,6 @@ v2wss.on("connection", (ws, req) => {
   // Match the Worker binding: the first frame is TransportHello, followed by a
   // verified state-plane projection or catch-up delta for the requested scope.
   void openShadowBrowserScope(browser, {
-    preseed_catalog_pages: true,
     ...(lastKnownHead ? { last_known_head: lastKnownHead } : {}),
     ...(executableSeedDigest ? { executable_seed_digest: executableSeedDigest } : {}),
     metric: emitDevMetric

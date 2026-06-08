@@ -424,6 +424,7 @@ export function buildShadowCellPageTransfer(input: {
   atom_hashes?: string[];
   missing_atoms?: ShadowMissingAtom[];
   known_page_hashes?: Iterable<string>;
+  catalogVerbLookup?: "all" | "bounded";
   session?: string | null;
   purpose?: ShadowCellPageTransferPurpose;
   capsule?: {
@@ -459,7 +460,9 @@ export function buildShadowCellPageTransfer(input: {
     return !lifecycle || !item.preimage.startsWith("read:") || serializedObjectIds.has(lifecycle);
   });
   let requiredPages = pageClosureForPreimages(input.serialized, selected.map((item) => item.preimage), {
-    fullLifecycleObjects: lifecycleObjects
+    fullLifecycleObjects: lifecycleObjects,
+    catalogVerbLookup: input.catalogVerbLookup,
+    callReceiverHint: input.key.target
   });
   requiredPages = ensureCellPageTransferLineageClosure(input.serialized, requiredPages);
   const closureAtomPreimages = fullObjectClosureAtomPreimages(input.serialized, lifecycleObjects);
@@ -1746,7 +1749,11 @@ function objectClosureForPreimages(serialized: SerializedWorld, preimages: strin
 function pageClosureForPreimages(
   serialized: SerializedWorld,
   preimages: string[],
-  options: { fullLifecycleObjects?: ReadonlySet<ObjRef> } = {}
+  options: {
+    fullLifecycleObjects?: ReadonlySet<ObjRef>;
+    catalogVerbLookup?: "all" | "bounded";
+    callReceiverHint?: ObjRef;
+  } = {}
 ): ShadowStatePage[] {
   if (preimages.length === 0) return [];
   const byId = new Map(serialized.objects.map((obj) => [obj.id, obj] as const));
@@ -1840,6 +1847,19 @@ function pageClosureForPreimages(
     }
   };
   const addCatalogVerbLookups = (name: string): void => {
+    if (options.catalogVerbLookup === "bounded") {
+      // Browser open seeds only need enough helper bytecode to get the first
+      // selectable turn moving. Dynamic calls through runtime objects otherwise
+      // explode into every catalog implementation with that name. Prefer the
+      // current receiver's dispatch chain, then only a globally unique catalog
+      // helper.
+      if (options.callReceiverHint) addVerbLookupClosure(options.callReceiverHint, name);
+      const matches = catalogObjects.filter((obj) =>
+        obj.verbs.some((verb) => verb.name === name || verb.aliases.includes(name))
+      );
+      if (matches.length === 1) addVerbLookupClosure(matches[0]!.id, name);
+      return;
+    }
     for (const obj of catalogObjects) {
       if (obj.verbs.some((verb) => verb.name === name || verb.aliases.includes(name))) {
         addVerbLookupClosure(obj.id, name);
