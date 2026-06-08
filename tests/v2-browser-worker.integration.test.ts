@@ -137,7 +137,6 @@ describe("v2 browser worker integration", () => {
     expect(afterReplyStatus).toMatchObject({
       status: {
         transcript_tail: 0,
-        execution_checkpoints: 0,
         local_execution_ready: true
       }
     });
