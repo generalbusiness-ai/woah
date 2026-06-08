@@ -41,6 +41,8 @@ export function sessionActiveScopeFromRecord(record: Record<string, unknown> | n
 export type RemoteToolDescriptor = {
   object: ObjRef;
   verb: string;
+  /** Object that defines the verb. Sparse gateways use it as a support root for inherited tool calls. */
+  definer?: ObjRef;
   aliases: string[];
   arg_spec: Record<string, WooValue>;
   direct: boolean;

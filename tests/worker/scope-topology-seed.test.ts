@@ -388,6 +388,13 @@ describe("CA11.2 quasi-static topology pre-seeding", () => {
       const readPartitioned = partitionedRemoteIds(metrics, (reason) => reason !== "missing_state_repair");
       const readPartitionedIds = new Set<string>();
       for (const set of readPartitioned.values()) for (const id of set) readPartitionedIds.add(id);
+      // `southeast` is inherited from $room. A sparse MCP relay must fetch that
+      // definer from its real owner, not rely on a possibly stale/bytecode-free
+      // support row cached on the gateway or carried as non-owner room support.
+      const roomDefinerCalls = callsRequesting(harness.authoritySliceCalls(), "$room" as ObjRef);
+      expect(roomDefinerCalls.some((call) => call.host === "world"), `inherited room command must owner-prefetch $room. Calls: ${
+        JSON.stringify(roomDefinerCalls)
+      }`).toBe(true);
       if (readPartitionedIds.has("the_deck")) {
         expect(ownerPrefetchMs, `the_deck was fetched before commit, so the turn must record bounded deterministic owner prefetch. ` +
           `Read-path partitioned ids: ${JSON.stringify(Array.from(readPartitioned, ([h, s]) => [h, Array.from(s)]))}`).not.toBeNull();

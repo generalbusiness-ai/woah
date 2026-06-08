@@ -703,7 +703,11 @@ export class McpGateway {
     const scope = explicitScope ?? this.scopeForV2Call(actor, target);
     const id = `mcp-v2:${sessionId}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
     this.prewarmLikelyRelocationCommitScope(entry, actor, scope, target, verb, route, persistence);
-    const ownerAuthorityObjectIds = this.likelyMovementOwnerAuthorityObjectIds(entry, scope, target, verb, options.toolArgSpec);
+    const ownerAuthorityObjectIds = mergeObjRefs(
+      this.likelyMovementOwnerAuthorityObjectIds(entry, scope, target, verb, options.toolArgSpec),
+      options.toolDefiner ? [options.toolDefiner] : [],
+      options.toolSupportObjectIds ?? []
+    );
     let authorityRefreshAttempts = 0;
     const submitted = await submitTurnIntent<V2ScopeClient, McpV2EnvelopeResult>({
       input: {

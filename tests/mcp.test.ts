@@ -302,6 +302,37 @@ describe("McpHost", () => {
     expect(Object.keys(teachProperties)).toEqual(["phrase"]);
   });
 
+  it("threads inherited tool definers into dispatch options", async () => {
+    const world = bootstrapWorld();
+    const session = world.auth("guest:mcp-definer-prefetch");
+    let capturedOptions: { toolDefiner?: ObjRef; toolSupportObjectIds?: ObjRef[] } | undefined;
+    const host = new McpHost(world, {
+      direct: async (_sessionId, actor, target, verb, args, scope, _persistence, options) => {
+        capturedOptions = options;
+        return attachTranscriptForTest({
+          op: "result",
+          id: "mcp-definer-prefetch",
+          result: true,
+          observations: [],
+          audience: null
+        }, mcpTestTranscript({
+          route: "direct",
+          scope: scope ?? "#-1",
+          call: { actor, target, verb, args }
+        }));
+      }
+    });
+    host.bindSession(session.id, session.actor);
+
+    await world.directCall(undefined, session.actor, "the_chatroom", "enter", [], { sessionId: session.id });
+    const tool = await host.resolveReachableTool(session.actor, "the_chatroom", "southeast", session.id);
+
+    expect(tool?.descriptor).toMatchObject({ object: "the_chatroom", verb: "southeast", definer: "$room" });
+    await host.invokeTool(session.actor, session.id, tool!, []);
+    expect(capturedOptions?.toolDefiner).toBe("$room");
+    expect(capturedOptions?.toolSupportObjectIds).toEqual(expect.arrayContaining(["the_chatroom", "$chatroom", "$room"]));
+  });
+
   // Regression for the tool-surface verb cache (notes/2026-05-28-...): a $space
   // full of same-class items (an outline whose nodes live in its contents) must
   // not recompute the verb surface once per item. Before the cache,

@@ -95,6 +95,8 @@ export type McpInvocationResult = {
 export type McpDispatchOptions = {
   directorySessionScopes?: ObjRef[];
   toolArgSpec?: Record<string, WooValue>;
+  toolDefiner?: ObjRef;
+  toolSupportObjectIds?: ObjRef[];
 };
 
 export type McpDispatchHooks = {
@@ -118,6 +120,7 @@ type McpVerbInfo = {
   name: string;
   aliases: string[];
   arg_spec: Record<string, WooValue>;
+  definer?: ObjRef;
   direct_callable?: boolean;
   perms: string;
   tool_exposed?: boolean;
@@ -537,10 +540,12 @@ export class McpHost {
           verb: verb.name,
           aliases: verb.aliases,
           arg_spec: verb.arg_spec,
+          ...(verb.definer ? { definer: verb.definer } : {}),
           direct: verb.direct_callable === true,
           ...(verb.reads_room_presence === true ? { reads_room_presence: true } : {}),
           source: verb.source ?? "",
-          enclosingSpace: this.enclosingSpaceFor(id)
+          enclosingSpace: this.enclosingSpaceFor(id),
+          source_rows: this.toolSurfaceSourceRows(id, verb.definer)
         }, usedNames);
         tools.push(tool);
         seenObjectVerb.add(`${id}${OBJECT_VERB_SEP}${verb.name}`);
@@ -691,13 +696,14 @@ export class McpHost {
         out.push({
           object: id,
           verb: verb.name,
+          ...(verb.definer ? { definer: verb.definer } : {}),
           aliases: verb.aliases,
           arg_spec: verb.arg_spec,
           direct: verb.direct_callable === true,
           ...(verb.reads_room_presence === true ? { reads_room_presence: true } : {}),
           source: verb.source ?? "",
           enclosingSpace: this.enclosingSpaceFor(id),
-          source_rows: this.toolSurfaceSourceRows(id, verb.owner)
+          source_rows: this.toolSurfaceSourceRows(id, verb.definer)
         });
       }
     };
@@ -718,6 +724,7 @@ export class McpHost {
       verb: string;
       aliases: string[];
       arg_spec: Record<string, WooValue>;
+      definer?: ObjRef;
       direct: boolean;
       reads_room_presence?: boolean;
       source: string;
@@ -749,6 +756,7 @@ export class McpHost {
       descriptor: {
         object,
         verb: spec.verb,
+        ...(spec.definer ? { definer: spec.definer } : {}),
         aliases: spec.aliases,
         arg_spec: spec.arg_spec,
         direct: spec.direct,
@@ -918,10 +926,12 @@ export class McpHost {
         verb: verb.name,
         aliases: verb.aliases,
         arg_spec: verb.arg_spec,
+        ...(verb.definer ? { definer: verb.definer } : {}),
         direct: verb.direct_callable === true,
         ...(verb.reads_room_presence === true ? { reads_room_presence: true } : {}),
         source: verb.source ?? "",
-        enclosingSpace: this.enclosingSpaceFor(object)
+        enclosingSpace: this.enclosingSpaceFor(object),
+        source_rows: this.toolSurfaceSourceRows(object, verb.definer)
       }, new Set());
     }
     if (!bridge?.enumerateRemoteTools) return null;
@@ -1047,7 +1057,7 @@ export class McpHost {
     // verb). It is stable for the cache key — own-verb objects key uniquely on
     // their id — so the cached entries are reused verbatim; the spread produces
     // a fresh object per call.
-    return cached.tooled.map((entry) => ({ ...entry.verb, owner: entry.owner }));
+    return cached.tooled.map((entry) => ({ ...entry.verb, owner: entry.owner, definer: entry.owner }));
   }
 
   // The uncached ancestry + feature walk behind tooledVerbsFor. Returns
@@ -1082,10 +1092,10 @@ export class McpHost {
   private obviousVerbsFor(actor: ObjRef, id: ObjRef): McpVerbInfo[] {
     const cached = this.cachedVerbSurface(actor, id, "obvious");
     if (!cached.obvious) cached.obvious = this.world.obviousCommandVerbs(id, { actor, executableOnly: true }) as unknown as McpVerbInfo[];
-    // The obvious projection leaves `owner` unset on class verbs; default it to
-    // the object itself per call (drives toolSurfaceSourceRows). This default is
-    // per-object, so it is applied here and never written into the cached array.
-    return cached.obvious.map((verb) => ({ ...verb, owner: verb.owner ?? id }));
+    return cached.obvious.map((verb) => {
+      const definer = verb.definer ?? this.localVerbDefiner(id, verb);
+      return { ...verb, ...(definer ? { definer } : {}) };
+    });
   }
 
   // Returns the cache entry for this (actor, object, projection) verb surface,
@@ -1156,6 +1166,14 @@ export class McpHost {
       if (owner && !foundFeatureOwner) keys.add(owner);
     }
     return Array.from(keys).map((key) => ({ table: "objects" as const, authority_scope: object, key }));
+  }
+
+  private localVerbDefiner(object: ObjRef, verb: McpVerbInfo): ObjRef | undefined {
+    for (const definer of this.objectLineage(object)) {
+      const found = this.world.object(definer).verbs.find((candidate) => candidate === verb || candidate.name === verb.name);
+      if (found) return definer;
+    }
+    return undefined;
   }
 
   private objectLineage(start: ObjRef): ObjRef[] {
@@ -1257,6 +1275,14 @@ export class McpHost {
   // ----- tool invocation -----
 
   async invokeTool(actor: ObjRef, sessionId: string, tool: McpTool, args: WooValue[]): Promise<McpInvocationResult> {
+    const sourceRows = tool.descriptor?.source_rows ?? [];
+    const toolSupportObjectIds = sourceRows.length > 0 ? sourceRows.map((row) => row.key) : undefined;
+    const addToolDispatchMetadata = (options: McpDispatchOptions): McpDispatchOptions => {
+      if (tool.descriptor?.arg_spec !== undefined) options.toolArgSpec = tool.descriptor.arg_spec;
+      if (tool.descriptor?.definer) options.toolDefiner = tool.descriptor.definer;
+      if (toolSupportObjectIds) options.toolSupportObjectIds = toolSupportObjectIds;
+      return options;
+    };
     const refreshBaseline = await this.toolRefreshBaseline(actor);
     if (tool.direct) {
       // For wait we need session-scoped queue access. Thread the sessionId
@@ -1275,12 +1301,11 @@ export class McpHost {
           return { result: await this.drainWait(sessionId, args), observations: [] };
         }
         const result = this.dispatchHooks.direct
-          ? await this.dispatchHooks.direct(sessionId, actor, tool.object, tool.verb, args, liveEnclosing, tool.persistence, {
+          ? await this.dispatchHooks.direct(sessionId, actor, tool.object, tool.verb, args, liveEnclosing, tool.persistence, addToolDispatchMetadata({
               directorySessionScopes: tool.readsRoomPresence === true
                 ? roomPresenceCandidateScopes(tool.object, args, liveEnclosing)
-                : [],
-              toolArgSpec: tool.descriptor?.arg_spec
-            })
+                : []
+            }))
           : await this.world.directCall(undefined, actor, tool.object, tool.verb, args, { sessionId });
         if (result.op === "error") throw fromError(result.error);
         // Self observations are returned in the call result; do NOT route them
@@ -1308,7 +1333,7 @@ export class McpHost {
     if (!space) throw wooError("E_INVARG", `verb ${tool.object}:${tool.verb} has no enclosing space for sequenced dispatch`);
     const message = { actor, target: tool.object, verb: tool.verb, args };
     const frame = this.dispatchHooks.call
-      ? await this.dispatchHooks.call(sessionId, actor, space, message, { toolArgSpec: tool.descriptor?.arg_spec })
+      ? await this.dispatchHooks.call(sessionId, actor, space, message, addToolDispatchMetadata({}))
       : await this.world.call(undefined, sessionId, space, message);
     if (frame.op === "error") throw fromError(frame.error);
     if (this.broadcasts.broadcastApplied) {
@@ -1585,6 +1610,7 @@ function descriptorFromTool(tool: McpTool): RemoteToolDescriptor {
   return {
     object: tool.object,
     verb: tool.verb,
+    ...(tool.descriptor?.definer ? { definer: tool.descriptor.definer } : {}),
     aliases: tool.aliases,
     arg_spec: {},
     direct: tool.direct,

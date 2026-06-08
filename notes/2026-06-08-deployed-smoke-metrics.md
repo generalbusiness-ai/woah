@@ -82,6 +82,23 @@ Ignored raw artifacts for the `eec932ee` deployed run:
 - `.woo/smoke-measurements/deploy-eec932ee-ddaa183-20260608T2102Z/analyze-smoke-tail.txt`
 - `.woo/smoke-measurements/deploy-eec932ee-ddaa183-20260608T2102Z/analyze-data-path-costs.txt`
 
+Commit `121cd46` deployed to Cloudflare version
+`d8e30ba2-7141-498c-b570-932f9eb25637` after converting pre-recording sparse
+verb/object misses into missing-state repair. The deploy preflight, tests,
+build, and postflight checks passed. The deploy script's built-in smoke failed
+8/10: pinboard reported `E_OBJNF object not found: the_pinboard`, and tasks
+reported `E_VERBNF verb not found: the_chatroom:southeast`. A tail-captured
+follow-up improved to 9/10: pinboard and outliner passed, while tasks still
+failed on `the_chatroom:southeast`.
+
+Ignored raw artifacts for the `d8e30ba2` deployed run:
+
+- `.woo/smoke-measurements/deploy-d8e30ba2-121cd46-20260608T2129Z/tail.log`
+- `.woo/smoke-measurements/deploy-d8e30ba2-121cd46-20260608T2129Z/smoke.log`
+- `.woo/smoke-measurements/deploy-d8e30ba2-121cd46-20260608T2129Z/smoke-run-1.log`
+- `.woo/smoke-measurements/deploy-d8e30ba2-121cd46-20260608T2129Z/analyze-smoke-tail.txt`
+- `.woo/smoke-measurements/deploy-d8e30ba2-121cd46-20260608T2129Z/analyze-data-path-costs.txt`
+
 ## Correctness Finding
 
 The pinboard blocker happened before VM execution during scope/session
@@ -141,6 +158,19 @@ verb into a `read:cell:verb:<target>:<verb>` missing atom, and converts a thrown
 `E_OBJNF` into a lifecycle missing atom, so cell-page repair hydrates the
 dispatch closure before retrying.
 
+Seventh root cause: the missing-atom repair could fetch the target instance
+and actor, but an inherited tool call also needs the object that defines the
+verb and the class rows that connect the target to that definition. In the
+`d8e30ba2` tail, `mcp_tool_resolve` hit `the_chatroom:southeast`; the first
+direct call failed with `E_VERBNF`, relocation prewarm succeeded, missing-state
+repair fetched `the_chatroom` and `guest_1`, and the retry still failed with
+`E_VERBNF`. Locally, `southeast` resolves on `$room`, not `the_chatroom`.
+Remote tool descriptors now carry the defining object and source support rows,
+and MCP dispatch threads those through the gateway so sparse relays owner-fetch
+support such as `$room` from `world` before executing inherited tools.
+The same definer lookup is applied to obvious-projection tools so support rows
+follow class lineage rather than the verb's code owner.
+
 Fix validation after patching authority-slice materialization:
 
 - `npm run test:files -- tests/authority-slice-shape.test.ts tests/worker/cf-local-structural.test.ts`
@@ -188,6 +218,20 @@ missing-state repair:
 - `npm run smoke:cf-local` passed, 1 file, 4 tests, Vitest duration 40.98s.
 - `npm test` passed, 29 files and 377 tests.
 - `npm run typecheck` passed both TypeScript configs.
+
+Validation after threading inherited tool definers/support rows through MCP
+dispatch:
+
+- `npm run test:files -- tests/mcp.test.ts tests/worker/scope-topology-seed.test.ts`
+  passed, 70 tests. The topology regression asserts that an inherited
+  `the_chatroom:southeast` call owner-prefetches `$room` from `world`.
+- `npm run smoke:cf-local` passed, 1 file, 4 tests, Vitest duration 33.87s.
+- `npm run test:files -- tests/v2-browser-worker.integration.test.ts -t "keeps an accepted reply when its bundled executable transfer fails capsule validation"`
+  passed after the full gate first exposed a one-off timeout in that unrelated
+  browser-worker case.
+- `npm test` passed, 29 files and 377 tests.
+- `npm run typecheck` passed both TypeScript configs.
+- `npm run test:worker` passed, 16 files and 236 tests, 5 skipped.
 
 ## Performance Summary
 
@@ -350,6 +394,42 @@ Data-path costs:
 - Remote owner refresh count: 28.
 - Tool-surface reverse-index source rows requested: 214; cap-hit events: 0.
 
+The tail-captured deployed run after missing-state repair found 817 Cloudflare
+tail events and 3,177 `woo.metric` rows.
+
+Cloudflare invocation timing:
+
+- Worker `POST /mcp`: 71 requests, p95 13,100 ms, max 18,874 ms.
+- PersistentObjectDO `POST /mcp`: 69 requests, p95 13,148 ms, max 18,850 ms,
+  CPU p95 8,628 ms.
+- CommitScopeDO `POST /v2/envelope`: 28 requests, p95 2,118 ms, max 2,636 ms.
+- PersistentObjectDO `POST /__internal/authority-slice`: 71 requests, p95
+  2,042 ms, max 2,538 ms.
+- PersistentObjectDO `POST /__internal/mcp-commit-fanout`: one timeout.
+
+Turn phase attribution across reported turns:
+
+- Submit: 113,172 ms, 51% of summed turn wall time.
+- Authority planning: 68,169 ms, 31%.
+- Ensure-client: 39,850 ms, 18%.
+
+Largest deployed costs:
+
+- `/__internal/authority-slice -> world`: 30 calls, max 833 ms.
+- `/__internal/authority-slice -> the_deck`: 15 calls, max 1,816 ms.
+- `/__internal/authority-slice -> the_chatroom`: 15 calls, max 1,598 ms.
+- `/__internal/authority-slice -> the_outline`: 5 calls, max 1,935 ms.
+- `/__internal/mcp-commit-fanout`: one timeout.
+
+Correctness detail from the final tasks failure:
+
+- `mcp_tool_resolve` hit `the_chatroom:southeast`.
+- First `direct_call` failed with `E_VERBNF`.
+- `mcp_relocation_prewarm` succeeded in 4,703 ms.
+- Missing-state repair fetched `the_chatroom` and `guest_1`.
+- Retry still failed with `E_VERBNF`, confirming inherited definer/support
+  hydration was the remaining gap.
+
 ## Interpretation
 
 The deployed failure was a correctness blocker in sparse authority-slice
@@ -362,4 +442,6 @@ was too close to the deployed end-to-end latency envelope for steps that
 intentionally serialize several cross-shard operations. The `eec932ee` run
 narrowed the remaining tasks failure to executable sparse-state repair:
 resolution and tool-surface reachability were correct, but the target verb cell
-was not hydrated before dispatch retry.
+was not hydrated before dispatch retry. The `d8e30ba2` run narrowed that again:
+the target and actor were repairable, but inherited verb support did not travel
+as an owner-prefetch root.
