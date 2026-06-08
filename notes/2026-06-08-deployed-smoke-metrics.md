@@ -65,6 +65,23 @@ Ignored raw artifacts for the `30b552e8` deployed run:
 - `.woo/smoke-measurements/deploy-30b552e8-9d84257-20260608T2040Z/analyze-smoke-tail.txt`
 - `.woo/smoke-measurements/deploy-30b552e8-9d84257-20260608T2040Z/analyze-data-path-costs.txt`
 
+Commit `ddaa183` deployed to Cloudflare version
+`eec932ee-fd88-441e-8087-506d77a8642b` after preserving pre-recording repair
+errors and raising the smoke step watchdog. The deploy preflight, tests, build,
+and postflight checks passed. The deploy script's built-in smoke failed 7/10
+with two 20s `/mcp` timeouts and one outliner `E_PERM` after reset. A
+tail-captured follow-up improved to 9/10: all chat, movement, mug, pinboard,
+and outliner steps passed, while tasks failed with `E_VERBNF verb not found:
+the_chatroom:southeast`.
+
+Ignored raw artifacts for the `eec932ee` deployed run:
+
+- `.woo/smoke-measurements/deploy-eec932ee-ddaa183-20260608T2102Z/tail.log`
+- `.woo/smoke-measurements/deploy-eec932ee-ddaa183-20260608T2102Z/smoke.log`
+- `.woo/smoke-measurements/deploy-eec932ee-ddaa183-20260608T2102Z/smoke-run-1.log`
+- `.woo/smoke-measurements/deploy-eec932ee-ddaa183-20260608T2102Z/analyze-smoke-tail.txt`
+- `.woo/smoke-measurements/deploy-eec932ee-ddaa183-20260608T2102Z/analyze-data-path-costs.txt`
+
 ## Correctness Finding
 
 The pinboard blocker happened before VM execution during scope/session
@@ -114,6 +131,16 @@ assertion: `alice.leave pinboard` about 14.7s, `bob.leave pinboard` about 8.1s,
 10s. The walkthrough now keeps the 20s per-RPC stuck-request guard but raises
 the step envelope to an env-configurable 120s default.
 
+Sixth root cause: preserving pre-recording `E_VERBNF` made the error visible to
+the caller, but `executeShadowTurnCallOrNeedState` still classified only thrown
+`E_NEED_STATE` as repairable. The `eec932ee` tail showed
+`mcp_tool_resolve` correctly hitting `the_chatroom:southeast`, followed by two
+pre-recorder direct-call `E_VERBNF` failures in the executable sparse world.
+The executor now converts a thrown `E_VERBNF` that matches the requested target
+verb into a `read:cell:verb:<target>:<verb>` missing atom, and converts a thrown
+`E_OBJNF` into a lifecycle missing atom, so cell-page repair hydrates the
+dispatch closure before retrying.
+
 Fix validation after patching authority-slice materialization:
 
 - `npm run test:files -- tests/authority-slice-shape.test.ts tests/worker/cf-local-structural.test.ts`
@@ -149,6 +176,17 @@ smoke step envelope:
   passed, 75 tests.
 - `npm run smoke:cf-local` passed, 1 file, 4 tests, Vitest duration 33.85s.
 - `npm test` passed, 29 files and 376 tests.
+- `npm run typecheck` passed both TypeScript configs.
+
+Validation after converting pre-recording sparse verb/object misses into
+missing-state repair:
+
+- `npm run test:files -- tests/shadow-turn-exec.test.ts -t "pre-recording sparse verb miss"`
+  passed, 1 test.
+- `npm run test:files -- tests/shadow-turn-exec.test.ts tests/mcp.test.ts tests/scope-executor-garden-probe.test.ts tests/smoke-walkthrough-harness.test.ts tests/worker/cf-local-structural.test.ts`
+  passed, 105 tests.
+- `npm run smoke:cf-local` passed, 1 file, 4 tests, Vitest duration 40.98s.
+- `npm test` passed, 29 files and 377 tests.
 - `npm run typecheck` passed both TypeScript configs.
 
 ## Performance Summary
@@ -272,6 +310,46 @@ Data-path costs:
 - Remote owner refresh count: 24.
 - Tool-surface reverse-index source rows requested: 398; cap-hit events: 0.
 
+The tail-captured deployed run after preserving pre-recording repair errors
+found 802 Cloudflare tail events and 3,146 `woo.metric` rows.
+
+Cloudflare invocation timing:
+
+- Worker `POST /mcp`: 71 requests, 0 errors, p95 12,711 ms, max 15,307 ms.
+- PersistentObjectDO `POST /mcp`: 69 requests, 0 errors, p95 13,554 ms, max
+  15,765 ms, CPU p95 7,627 ms.
+- CommitScopeDO `POST /v2/envelope`: 25 requests, p95 2,094 ms, max 2,542 ms.
+- PersistentObjectDO `POST /__internal/authority-slice`: 65 requests, p95
+  1,009 ms, max 2,364 ms.
+- PersistentObjectDO `POST /__internal/mcp-commit-fanout`: 31 requests, p95
+  304 ms, max 4,830 ms.
+
+Turn phase attribution across reported turns:
+
+- Submit: 108,530 ms, 51% of summed turn wall time.
+- Authority planning: 69,455 ms, 32%.
+- Ensure-client: 35,854 ms, 17%.
+
+Largest deployed costs:
+
+- `worker.commit_scope_envelope_rpc`: 99,427 ms, p95 5,526 ms.
+- `worker.post_accept_delivery`: 9,103 ms, p95 698 ms.
+- `/__internal/authority-slice -> world`: 28 calls, 20,350 ms summed.
+- `/__internal/authority-slice -> the_chatroom`: 14 calls, 12,941 ms summed.
+- `/__internal/authority-slice -> the_deck`: 12 calls, 7,988 ms summed.
+- `/__internal/mcp-commit-fanout -> mcp-gateway-25`: 8 calls, 1 timeout,
+  6,112 ms summed, max 5,000 ms.
+
+Data-path costs:
+
+- `storage_full_save`: 1 event, 4,877 rows.
+- `storage_direct_write`: 127 metric rows, 986 data rows.
+- Observed projection bytes: 1.93 MiB.
+- Cross-host round trips: 183.
+- Same-host fallback count: 37.
+- Remote owner refresh count: 28.
+- Tool-surface reverse-index source rows requested: 214; cap-hit events: 0.
+
 ## Interpretation
 
 The deployed failure was a correctness blocker in sparse authority-slice
@@ -281,4 +359,7 @@ authority-slice reconstruction and commit-scope envelope RPC dominate warm turn
 latency, with deployed wall time roughly an order of magnitude higher than
 local CF shape. The `30b552e8` run also showed that the 60s smoke step watchdog
 was too close to the deployed end-to-end latency envelope for steps that
-intentionally serialize several cross-shard operations.
+intentionally serialize several cross-shard operations. The `eec932ee` run
+narrowed the remaining tasks failure to executable sparse-state repair:
+resolution and tool-surface reachability were correct, but the target verb cell
+was not hydrated before dispatch retry.

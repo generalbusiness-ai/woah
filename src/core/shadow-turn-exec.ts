@@ -872,20 +872,20 @@ export async function executeShadowTurnCallOrNeedState(
     // If VM execution throws outside the normal ErrorFrame path, discard the
     // mutable cache and rebuild from node.serialized on the next attempt.
     node.world = undefined;
-    // VTN10.1: a guarded sequenced-call PREAMBLE materialization
-    // miss surfaces as a thrown E_NEED_STATE (no transcript was recorded — the
-    // miss happened before the recorder opened). Convert it to the same clean
-    // `missing_state` the in-run probe path produces, so the repair loop pages
-    // the absent object in and retries instead of propagating an uncaught
-    // throw. Any non-E_NEED_STATE throw is a real fault and re-propagates.
-    const needState = missingAtomsFromThrownNeedState(err);
-    if (needState) {
+    // VTN10.1: guarded pre-recorder materialization/dispatch misses have no
+    // transcript because the recorder has not opened yet. Convert narrowly
+    // repairable thrown errors into the same clean `missing_state` the in-run
+    // probe path produces, so the repair loop pages the absent object/verb in
+    // and retries instead of propagating an uncaught sparse-state fault. Other
+    // throws are real faults and re-propagate.
+    const repairState = missingAtomsFromThrownRepairableState(err, request);
+    if (repairState) {
       return {
         ok: false,
         reason: "missing_state",
         attempted: false,
-        missing_atoms: needState,
-        reply: missingStateReply(request, needState)
+        missing_atoms: repairState,
+        reply: missingStateReply(request, repairState)
       };
     }
     throw err;
@@ -1472,6 +1472,30 @@ function missingAtomsFromThrownNeedState(err: unknown): ShadowMissingAtom[] | nu
   if (!error || error.code !== "E_NEED_STATE") return null;
   const atoms = missingAtomsFromNeedStateValue(error.value);
   return atoms.length > 0 ? atoms : null;
+}
+
+function missingAtomsFromThrownRepairableState(
+  err: unknown,
+  request: ShadowTurnExecRequest
+): ShadowMissingAtom[] | null {
+  const needState = missingAtomsFromThrownNeedState(err);
+  if (needState) return needState;
+
+  const error = err as { code?: string; value?: WooValue } | null;
+  if (!error) return null;
+  if (error.code === "E_OBJNF" && typeof error.value === "string") {
+    return [missingAtomForPreimage(`read:cell:lifecycle:${error.value}`)];
+  }
+  if (error.code !== "E_VERBNF") return null;
+  const value = error.value;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const map = value as Record<string, WooValue>;
+  if (map.obj !== request.call.target || map.name !== request.call.verb) return null;
+  return [missingAtomForPreimage(`read:cell:verb:${request.call.target}:${request.call.verb}`)];
+}
+
+function missingAtomForPreimage(preimage: string): ShadowMissingAtom {
+  return { hash: shadowAtomHash(preimage), preimage };
 }
 
 function missingAtomsFromNeedStateValue(raw: WooValue | undefined): ShadowMissingAtom[] {
