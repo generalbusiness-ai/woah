@@ -134,6 +134,35 @@ const EXECUTION_AD_STORE = "execution_ads";
 // name is TurnProposal; do not rename this string without an explicit migration.
 const PROPOSAL_STORE = "tentative_turns";
 
+// The execution cache (executionCacheForScope) is a pure function of three IDB
+// stores — execution transfers, state pages, and the committed transcript tail —
+// plus the current holder authority. `executionInputEpoch` is bumped by every leaf
+// writer to those stores so a (scope, epoch, authority) memo can short-circuit a
+// full IDB re-read + rebuild. cache_status polling rebuilt the whole cache (twice,
+// via canReconstructExecutionNode) on every poll; with the memo, polls between
+// state changes are O(1). Over-invalidation is always safe (it forces a correct
+// rebuild); under-invalidation would serve stale executable state to the local VM,
+// so the bump lives in the leaf writers, not at scattered call sites.
+const EXECUTION_CACHE_INPUT_STORES = new Set([TRANSCRIPT_STORE, STATE_PAGE_STORE, EXECUTION_TRANSFER_STORE]);
+let executionInputEpoch = 0;
+function bumpExecutionInputEpoch(): void {
+  executionInputEpoch++;
+}
+
+type ExecutionCacheResult = {
+  records: V2ExecutableTransferRecord[];
+  cached_objects: SerializedObject[];
+  cached_pages: ShadowStatePage[];
+  committed_transcript_rows: TranscriptTailRow[];
+};
+const executionCacheMemo = new Map<string, { epoch: number; authority: string; value: ExecutionCacheResult }>();
+
+// The authority filter (executionTransferMatchesCurrentAuthority) reads node/actor/
+// session off `current`, so a memo entry is only valid while those are unchanged.
+function currentExecutionAuthorityKey(): string {
+  return `${current?.node ?? ""}|${current?.actor ?? ""}|${current?.session ?? ""}`;
+}
+
 let dbPromise: Promise<IDBDatabase> | null = null;
 let socket: WebSocket | null = null;
 let current: { token: string; node: string; scope: string; actor?: string; session?: string } | null = null;
@@ -2002,6 +2031,7 @@ async function putTranscript(transcript: EffectTranscript, acceptedSeq?: number)
     received_at: existing?.received_at ?? Date.now()
   };
   await tx(TRANSCRIPT_STORE, "readwrite", (store) => store.put(row));
+  bumpExecutionInputEpoch();
 }
 
 async function putObjectPage(hash: string, object: unknown): Promise<void> {
@@ -2010,6 +2040,7 @@ async function putObjectPage(hash: string, object: unknown): Promise<void> {
 
 async function putStatePage(hash: string, ref: string, page: unknown): Promise<void> {
   await tx(STATE_PAGE_STORE, "readwrite", (store) => store.put({ hash, ref, page, received_at: Date.now() }));
+  bumpExecutionInputEpoch();
 }
 
 async function putStatePages(pages: readonly { hash: string; ref: string; page: unknown }[]): Promise<void> {
@@ -2020,10 +2051,12 @@ async function putStatePages(pages: readonly { hash: string; ref: string; page: 
     for (const { hash, ref, page } of pages) request = store.put({ hash, ref, page, received_at: receivedAt });
     return request!;
   }, { count: pages.length });
+  bumpExecutionInputEpoch();
 }
 
 async function putExecutionTransfer(record: V2ExecutableTransferRecord): Promise<void> {
   await tx(EXECUTION_TRANSFER_STORE, "readwrite", (store) => store.put(record));
+  bumpExecutionInputEpoch();
 }
 
 async function putExecutionAd(record: V2ExecutionAdRecord): Promise<void> {
@@ -2168,15 +2201,29 @@ async function allTurnProposals(): Promise<V2BrowserTurnProposalRecord[]> {
 async function executionCacheForScope(
   scope: string,
   records?: readonly V2ExecutableTransferRecord[]
-): Promise<{
-  records: V2ExecutableTransferRecord[];
-  cached_objects: SerializedObject[];
-  cached_pages: ShadowStatePage[];
-  committed_transcript_rows: TranscriptTailRow[];
-}> {
+): Promise<ExecutionCacheResult> {
   const startedAt = metricNow();
   let scopedRecordCount = 0;
   let pageHashCount = 0;
+  // The `records` argument is always the full execution-transfer set (callers pass
+  // allExecutionTransfers()), so the result is fully determined by the input epoch
+  // and current authority. Serve a memo hit without touching IDB; this collapses the
+  // repeated rebuilds driven by cache_status polling between state changes.
+  const authority = currentExecutionAuthorityKey();
+  const epochAtStart = executionInputEpoch;
+  const memo = executionCacheMemo.get(scope);
+  if (memo && memo.epoch === epochAtStart && memo.authority === authority) {
+    postBrowserActivity({
+      phase: "execution_cache_build",
+      path: "memo",
+      scope,
+      ms: metricElapsed(startedAt),
+      status: "ok",
+      records: memo.value.records.length,
+      count: memo.value.cached_objects.length + memo.value.cached_pages.length
+    });
+    return memo.value;
+  }
   try {
     const sourceRecords = records ?? await allExecutionTransfers();
     // The browser execution-checkpoint store was retired in 0e3b1c5: there is no
@@ -2205,12 +2252,17 @@ async function executionCacheForScope(
       records: scopedRecords.length,
       count: cached_objects.length + cached_pages.length
     });
-    return {
+    const value: ExecutionCacheResult = {
       records: scopedRecords,
       cached_objects,
       cached_pages,
       committed_transcript_rows
     };
+    // Memoize against the epoch sampled BEFORE the reads. If a write landed while we
+    // were reading IDB, executionInputEpoch has already advanced past epochAtStart, so
+    // the entry is born stale and the next call rebuilds — never serving a torn read.
+    executionCacheMemo.set(scope, { epoch: epochAtStart, authority, value });
+    return value;
   } catch (err) {
     postBrowserActivity({
       phase: "execution_cache_build",
@@ -2433,6 +2485,7 @@ async function deleteStoreKeys(storeName: string, keys: readonly IDBValidKey[]):
     for (const key of keys) request = store.delete(key);
     return request ?? store.delete(keys[0]!);
   }, { count: keys.length });
+  if (EXECUTION_CACHE_INPUT_STORES.has(storeName)) bumpExecutionInputEpoch();
 }
 
 function postStatus(): void {

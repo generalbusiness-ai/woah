@@ -1972,20 +1972,27 @@ describe("v2 browser worker integration", () => {
     socket.receive(encodeEnvelope(relayEnvelope(browser, "ad-state-page-read", "woo.exec_capability_ad.shadow.v1", opened.ads[0])));
     await waitForMessage(posted, (message) => isReadyStatus(message));
 
-    posted.length = 0;
-    scope.dispatch({ kind: "cache_status" });
-    await waitForMessage(posted, (message) => isReadyStatus(message));
-
-    const statePageReads = posted
+    const bulkStatePageReadsSince = (from: number) => posted
+      .slice(from)
       .map(browserMetric)
       .filter((metric): metric is Record<string, unknown> =>
-        metric?.phase === "idb_tx" && metric.what === "state_pages" && metric.method === "readonly"
+        metric?.phase === "idb_tx" && metric.what === "state_pages" && metric.method === "readonly" &&
+        Number(metric.count) > 1
       );
-    const cacheReads = statePageReads.filter((metric) => Number(metric.count) > 1);
-    expect(cacheReads).toHaveLength(1);
-    expect(Number(cacheReads[0]!.count)).toBeGreaterThan(1);
-    // One bulk getAll for cached pages plus one count() for the status payload.
-    expect(statePageReads).toHaveLength(2);
+
+    // Batching invariant: the cold build during warmup read cached pages in ONE bulk
+    // getAll (count > 1), never one transaction per page.
+    const warmupBulkReads = bulkStatePageReadsSince(0);
+    expect(warmupBulkReads.length).toBeGreaterThanOrEqual(1);
+    for (const read of warmupBulkReads) expect(Number(read.count)).toBeGreaterThan(1);
+
+    // Memo invariant: the execution cache is memoized by input epoch, so a redundant
+    // cache_status with no intervening state change is served from the memo and does
+    // NOT re-read state pages from IndexedDB.
+    const mark = posted.length;
+    scope.dispatch({ kind: "cache_status" });
+    await waitForMessage(posted, (message) => isReadyStatus(message));
+    expect(bulkStatePageReadsSince(mark)).toHaveLength(0);
   });
 
   it("plans a same-actor durable chain from the tentative journal without waiting for authority", async () => {

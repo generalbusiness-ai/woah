@@ -49,3 +49,50 @@ the per-run counts (idb_tx, state_transfer_request, execution_cache_build) so a
 regression toward the storm/overlap fails the gate. (Browser-side metrics need the
 real e2e; the in-process tests/browser-localdev-perf.test.ts confirms the CORE path
 materializes 0 — useful as the "core is lean" guard.)
+
+## Resolution (worktree browser-localdev-perf)
+
+### Issue #1 — idb_tx storm: ADDRESSED (two changes)
+1. **meta write-through cache** (v2-browser-worker.ts). putMeta is the sole writer of
+   the small `meta` store and keys are scope/session-specific, so an in-memory
+   write-through cache stays authoritative for this dedicated worker. Measured: meta
+   idb_tx 182/run (165 readonly) -> ~37 (~11 readonly), **-82%**.
+2. **Retire the dead execution_checkpoints store.** Its WRITE path was removed in
+   0e3b1c5 but the READ path survived, so getExecutionCheckpoint was called ~130x/run
+   and ALWAYS returned undefined (nothing wrote the store). Removed the store, accessors,
+   the always-false transcriptCoveredByCheckpoint guard, the inert skip_checkpoint_build
+   option, and all the dead checkpoint plumbing (type, params, compose stat, status
+   field). Measured: execution_checkpoints idb_tx 122-132/run -> **0** (store gone).
+   Behavior unchanged (checkpoint was provably always undefined at runtime).
+
+### Issue #3 — execution_cache_build churn: ADDRESSED
+**Epoch-keyed memo for executionCacheForScope.** The cache is a pure function of three
+IDB stores (execution transfers, state pages, committed transcript tail) plus the holder
+authority. A module-level `executionInputEpoch` is bumped by every leaf writer to those
+stores; the cache is memoized by (scope, epoch, authority). The dominant redundant caller
+was cache_status polling, which rebuilt the whole cache (twice — also via
+canReconstructExecutionNode) on every poll. Measured in the turn-saturated e2e: **27 of
+~80 builds (~34%) served from the memo** with zero IDB reads; the hit rate is higher under
+idle status-polling, which this turn-heavy test minimizes. The epoch is sampled BEFORE the
+reads so a write landing mid-read makes the entry born-stale (rebuilt next call) — never a
+torn read served to the local VM.
+
+### Issue #2 — state_transfer overlap: INVESTIGATED, largely already mitigated
+The page-CONTENT overlap is already eliminated server-side: requestStateTransfer sends
+`known_page_hashes`, and the responder (shadow-turn-exec.ts ~471) marks already-held pages
+`inline:false` and omits them from `inline_pages`. The residual cost is (a) per-round
+re-send of atom preimages + page_refs metadata for the full granted closure, and (b) the
+multi-round repair loop itself (13 repairs / ~10 turns, ~3.5s). Both live on the shared
+AUTHORITATIVE transfer path (byte-identical with Cloudflare) and the cold-cache repair
+storm is a known, deep area (see b7_state_transfer_warmfill, divergent_session_state_race).
+A safe, targeted browser-side fix is not available without a larger authoritative-path
+change, so it is deliberately left for dedicated work rather than forced here.
+
+### Tests
+- tests/v2-browser-worker.integration.test.ts: the state-page-read test now asserts BOTH
+  the batching invariant (cold build = one bulk getAll) AND the memo invariant (a redundant
+  cache_status does not re-read state pages).
+- e2e/smoke.spec.ts ("two browser agents execute locally"): structural perf-regression
+  guards — execution_checkpoints reads == 0 (dead store stays dead), meta readonly < 40
+  (cache holds, no storm), and >= 1 execution_cache_build memo hit (memo active).
+- Gates: typecheck clean; 67 browser-suite tests; npm test (375); npm test post-memo (375).
