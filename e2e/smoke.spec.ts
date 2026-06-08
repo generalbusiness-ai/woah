@@ -1,4 +1,21 @@
-import { test, expect, type Locator, type Page } from "@playwright/test";
+import { test, expect, type APIRequestContext, type Locator, type Page } from "@playwright/test";
+
+type BrowserMetricRecord = Record<string, unknown> & {
+  kind?: string;
+  phase?: string;
+  path?: string;
+  reason?: string;
+  ms?: number;
+};
+
+type V2TimelineEvent = {
+  kind: string;
+  id: string;
+  verb: string;
+  t: number;
+  optimistic?: boolean;
+  reason?: string;
+};
 
 type V2Diagnostics = {
   appliedVerbs: string[];
@@ -7,6 +24,8 @@ type V2Diagnostics = {
   localPlans: string[];
   terminalErrors: string[];
   transportErrors: string[];
+  timeline: V2TimelineEvent[];
+  browserMetrics: BrowserMetricRecord[];
 };
 
 async function installV2Diagnostics(page: Page, label: string): Promise<V2Diagnostics> {
@@ -16,7 +35,9 @@ async function installV2Diagnostics(page: Page, label: string): Promise<V2Diagno
     localDelegations: [],
     localPlans: [],
     terminalErrors: [],
-    transportErrors: []
+    transportErrors: [],
+    timeline: [],
+    browserMetrics: []
   };
   const suffix = `${label}${Math.random().toString(36).slice(2)}`.replace(/[^a-zA-Z0-9_]/g, "");
   const recordApplied = `recordV2Applied${suffix}`;
@@ -25,6 +46,21 @@ async function installV2Diagnostics(page: Page, label: string): Promise<V2Diagno
   const recordLocalPlan = `recordV2LocalPlan${suffix}`;
   const recordTerminalError = `recordV2TerminalError${suffix}`;
   const recordTransportError = `recordV2TransportError${suffix}`;
+  const recordTimeline = `recordV2Timeline${suffix}`;
+  await page.route("**/api/browser-metrics", async (route) => {
+    try {
+      const body = route.request().postData();
+      const parsed = body ? JSON.parse(body) as { metrics?: unknown[] } : {};
+      for (const metric of Array.isArray(parsed.metrics) ? parsed.metrics : []) {
+        if (metric && typeof metric === "object" && !Array.isArray(metric)) {
+          diagnostics.browserMetrics.push(metric as BrowserMetricRecord);
+        }
+      }
+    } catch (err) {
+      diagnostics.transportErrors.push(`browser metric parse failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    await route.continue();
+  });
   await page.exposeFunction(recordApplied, (verb: string) => {
     diagnostics.appliedVerbs.push(verb);
   });
@@ -43,25 +79,46 @@ async function installV2Diagnostics(page: Page, label: string): Promise<V2Diagno
   await page.exposeFunction(recordTransportError, (detail: unknown) => {
     diagnostics.transportErrors.push(JSON.stringify(detail));
   });
+  await page.exposeFunction(recordTimeline, (detail: V2TimelineEvent) => {
+    diagnostics.timeline.push(detail);
+  });
   page.on("console", (msg) => {
     const text = msg.text();
     if (text.includes("woo.v2.transport.error") || text.includes("E_V2_LOCAL_EXECUTION_UNAVAILABLE")) {
       diagnostics.transportErrors.push(text);
     }
   });
-  await page.addInitScript(({ recordApplied, recordLocalFallback, recordLocalDelegation, recordLocalPlan, recordTerminalError, recordTransportError }) => {
+  await page.addInitScript(({ recordApplied, recordLocalFallback, recordLocalDelegation, recordLocalPlan, recordTerminalError, recordTransportError, recordTimeline }) => {
+    const recordEvent = (event: { kind: string; id?: unknown; verb?: unknown; optimistic?: unknown; reason?: unknown }) => {
+      void (window as unknown as Record<string, (value: unknown) => Promise<void>>)[recordTimeline]({
+        kind: event.kind,
+        id: typeof event.id === "string" ? event.id : "",
+        verb: typeof event.verb === "string" ? event.verb : "",
+        t: performance.now(),
+        ...(typeof event.optimistic === "boolean" ? { optimistic: event.optimistic } : {}),
+        ...(typeof event.reason === "string" ? { reason: event.reason } : {})
+      });
+    };
     window.addEventListener("woo.v2.applied_frame", (event) => {
-      const verb = String((event as CustomEvent<any>).detail?.applied?.message?.verb ?? "");
+      const detail = (event as CustomEvent<any>).detail;
+      const verb = String(detail?.applied?.message?.verb ?? "");
       void (window as unknown as Record<string, (value: unknown) => Promise<void>>)[recordApplied](verb);
+      recordEvent({ kind: "applied_frame", id: detail?.applied?.id, verb });
     });
     window.addEventListener("woo.v2.local_turn_fallback", (event) => {
-      void (window as unknown as Record<string, (value: unknown) => Promise<void>>)[recordLocalFallback]((event as CustomEvent<any>).detail);
+      const detail = (event as CustomEvent<any>).detail;
+      void (window as unknown as Record<string, (value: unknown) => Promise<void>>)[recordLocalFallback](detail);
+      recordEvent({ kind: "local_turn_fallback", id: detail?.id, verb: detail?.verb, reason: detail?.reason });
     });
     window.addEventListener("woo.v2.local_turn_delegated", (event) => {
-      void (window as unknown as Record<string, (value: unknown) => Promise<void>>)[recordLocalDelegation]((event as CustomEvent<any>).detail);
+      const detail = (event as CustomEvent<any>).detail;
+      void (window as unknown as Record<string, (value: unknown) => Promise<void>>)[recordLocalDelegation](detail);
+      recordEvent({ kind: "local_turn_delegated", id: detail?.id, verb: detail?.verb, reason: detail?.reason });
     });
     window.addEventListener("woo.v2.local_turn_planned", (event) => {
-      void (window as unknown as Record<string, (value: unknown) => Promise<void>>)[recordLocalPlan]((event as CustomEvent<any>).detail);
+      const detail = (event as CustomEvent<any>).detail;
+      void (window as unknown as Record<string, (value: unknown) => Promise<void>>)[recordLocalPlan](detail);
+      recordEvent({ kind: "local_turn_planned", id: detail?.id, verb: detail?.verb });
     });
     window.addEventListener("woo.v2.frame", (event) => {
       const envelope = (event as CustomEvent<any>).detail;
@@ -70,12 +127,19 @@ async function installV2Diagnostics(page: Page, label: string): Promise<V2Diagno
       }
     });
     window.addEventListener("woo.v2.turn_result", (event) => {
-      const error = (event as CustomEvent<any>).detail?.frame?.error;
+      const detail = (event as CustomEvent<any>).detail;
+      const error = detail?.frame?.error;
+      recordEvent({
+        kind: "turn_result",
+        id: detail?.frame?.id,
+        verb: detail?.frame?.command?.verb,
+        optimistic: detail?.optimistic === true
+      });
       if (error?.code === "E_V2_LOCAL_EXECUTION_UNAVAILABLE") {
         void (window as unknown as Record<string, (value: unknown) => Promise<void>>)[recordTerminalError](error);
       }
     });
-  }, { recordApplied, recordLocalFallback, recordLocalDelegation, recordLocalPlan, recordTerminalError, recordTransportError });
+  }, { recordApplied, recordLocalFallback, recordLocalDelegation, recordLocalPlan, recordTerminalError, recordTransportError, recordTimeline });
   return diagnostics;
 }
 
@@ -91,6 +155,84 @@ async function boxKey(locator: Locator): Promise<string> {
 
 async function continueAsGuestIfPrompted(page: { getByRole: (role: "button", options: { name: string }) => Locator }): Promise<void> {
   await page.getByRole("button", { name: "Continue as guest" }).click({ timeout: 1_000 }).catch(() => undefined);
+}
+
+async function authenticateFreshGuest(request: APIRequestContext, token: string): Promise<string> {
+  const auth = await request.post("/api/auth", { data: { token } });
+  return String((await auth.json())?.session ?? "");
+}
+
+async function openFreshGuestChat(page: Page, request: APIRequestContext, token: string): Promise<void> {
+  const session = await authenticateFreshGuest(request, token);
+  await page.goto("/");
+  await page.evaluate((sessionId) => {
+    localStorage.setItem("woo.session", sessionId);
+  }, session);
+  await page.goto("/objects/the_chatroom?v2TestHooks");
+  await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
+  await expect(page.locator("[data-chat-input]")).toBeFocused({ timeout: 5_000 });
+}
+
+function expectNoBrowserExecutionFallback(diagnostics: V2Diagnostics): void {
+  expect(diagnostics.localFallbacks, `local fallbacks: ${diagnostics.localFallbacks.join("\n")}`).toEqual([]);
+  expect(diagnostics.localDelegations, `local delegations: ${diagnostics.localDelegations.join("\n")}`).toEqual([]);
+}
+
+function timelineAfter(diagnostics: V2Diagnostics, cursor: number): V2TimelineEvent[] {
+  return diagnostics.timeline.slice(cursor);
+}
+
+async function sendChatAndExpectSequenced(
+  page: Page,
+  diagnostics: V2Diagnostics,
+  text: string,
+  selectedVerb: string,
+  confirmation: "applied_frame" | "turn_result",
+  options: { timeoutMs?: number } = {}
+): Promise<{ local_ms: number; server_ms: number }> {
+  const timeoutMs = options.timeoutMs ?? 6_000;
+  const cursor = diagnostics.timeline.length;
+  const start = await page.evaluate(() => performance.now());
+  await page.locator("[data-chat-input]").fill(text);
+  await page.locator("[data-chat-input]").press("Enter");
+
+  await expect.poll(() =>
+    timelineAfter(diagnostics, cursor).some((event) => event.kind === "local_turn_planned" && event.verb === "command_plan"),
+  { timeout: timeoutMs, message: `${text}: browser did not locally plan command_plan` }).toBe(true);
+  await expect.poll(() =>
+    timelineAfter(diagnostics, cursor).some((event) => event.kind === "local_turn_planned" && event.verb === selectedVerb),
+  { timeout: timeoutMs, message: `${text}: browser did not locally plan ${selectedVerb}` }).toBe(true);
+
+  await expect.poll(() =>
+    timelineAfter(diagnostics, cursor).some((event) =>
+      confirmation === "applied_frame"
+        ? event.kind === "applied_frame" && event.verb === selectedVerb
+        : event.kind === "turn_result" && event.verb === selectedVerb && event.optimistic !== true
+    ),
+  { timeout: timeoutMs, message: `${text}: server did not confirm ${selectedVerb}` }).toBe(true);
+
+  const local = timelineAfter(diagnostics, cursor).find((event) => event.kind === "local_turn_planned" && event.verb === selectedVerb);
+  const server = timelineAfter(diagnostics, cursor).find((event) =>
+    confirmation === "applied_frame"
+      ? event.kind === "applied_frame" && event.verb === selectedVerb
+      : event.kind === "turn_result" && event.verb === selectedVerb && event.optimistic !== true
+  );
+  if (!local || !server) throw new Error(`${text}: missing local/server timeline event`);
+  expect(local.t, `${text}: local plan must precede server confirmation`).toBeLessThanOrEqual(server.t);
+  const localMs = Math.max(0, local.t - start);
+  const serverMs = Math.max(0, server.t - start);
+  expect(localMs, `${text}: browser local planning should stay responsive`).toBeLessThan(4_000);
+  expect(serverMs, `${text}: devserver confirmation should not dominate interaction`).toBeLessThan(timeoutMs);
+  return { local_ms: localMs, server_ms: serverMs };
+}
+
+function localExecTurnIntentMetrics(diagnostics: V2Diagnostics, verb?: string): BrowserMetricRecord[] {
+  return diagnostics.browserMetrics.filter((metric) =>
+    metric.kind === "browser_activity"
+    && metric.phase === "turn_intent"
+    && (verb === undefined || metric.path === verb)
+    && metric.reason === "local_exec"
+  );
 }
 
 test("loads shell and renders nav", async ({ page }) => {
@@ -933,6 +1075,83 @@ test("chat room transitions update the traveler and source room departure", asyn
     await second.locator("[data-chat-input]").fill("west");
     await second.locator("[data-chat-input]").press("Enter");
     await expect(second.locator(".toolbar h1")).toHaveText("Living Room", { timeout: 5_000 });
+  } finally {
+    await firstContext.close();
+    await secondContext.close();
+  }
+});
+
+test("two browser agents execute locally and are sequenced by the devserver", async ({ browser, request }) => {
+  const firstContext = await browser.newContext();
+  const secondContext = await browser.newContext();
+  try {
+    const first = await firstContext.newPage();
+    const second = await secondContext.newPage();
+    const firstV2 = await installV2Diagnostics(first, "architectureFirst");
+    const secondV2 = await installV2Diagnostics(second, "architectureSecond");
+
+    await Promise.all([
+      openFreshGuestChat(first, request, `guest:e2e-architecture-first-${crypto.randomUUID()}`),
+      openFreshGuestChat(second, request, `guest:e2e-architecture-second-${crypto.randomUUID()}`)
+    ]);
+    const firstActor = (await first.locator(".actor").textContent())?.trim() ?? "";
+    const secondActor = (await second.locator(".actor").textContent())?.trim() ?? "";
+    expect(firstActor).not.toBe("");
+    expect(secondActor).not.toBe("");
+    expect(firstActor).not.toBe(secondActor);
+
+    const firstLine = `first local/server architecture ${crypto.randomUUID()}`;
+    const secondLine = `second local/server architecture ${crypto.randomUUID()}`;
+    const timings: Record<string, { local_ms: number; server_ms: number }> = {};
+
+    timings.firstSay = await sendChatAndExpectSequenced(first, firstV2, `say ${firstLine}`, "say", "turn_result");
+    await expect(second.locator(".chat-feed")).toContainText(firstLine, { timeout: 5_000 });
+
+    timings.firstTake = await sendChatAndExpectSequenced(first, firstV2, "take mug", "take", "applied_frame");
+    await expect(first.locator(".chat-feed")).toContainText("You take Mug.", { timeout: 5_000 });
+
+    timings.firstMoveOut = await sendChatAndExpectSequenced(first, firstV2, "se", "southeast", "applied_frame");
+    await expect(first.locator(".toolbar h1")).toHaveText("Deck", { timeout: 5_000 });
+    await expect(second.locator(".chat-feed")).toContainText("steps out onto the deck", { timeout: 5_000 });
+
+    timings.firstDrop = await sendChatAndExpectSequenced(first, firstV2, "drop mug", "drop", "applied_frame");
+    await expect(first.locator(".chat-feed")).toContainText("You drop Mug.", { timeout: 5_000 });
+
+    timings.secondSay = await sendChatAndExpectSequenced(second, secondV2, `say ${secondLine}`, "say", "turn_result");
+    await expect(second.locator(".chat-feed")).toContainText(secondLine, { timeout: 5_000 });
+
+    timings.secondMoveOut = await sendChatAndExpectSequenced(second, secondV2, "se", "southeast", "applied_frame");
+    await expect(second.locator(".toolbar h1")).toHaveText("Deck", { timeout: 5_000 });
+    await expect(first.locator(".chat-feed")).toContainText("steps out through the sliding glass door", { timeout: 5_000 });
+
+    timings.secondTake = await sendChatAndExpectSequenced(second, secondV2, "take mug", "take", "applied_frame");
+    await expect(second.locator(".chat-feed")).toContainText("You take Mug.", { timeout: 5_000 });
+
+    timings.secondDrop = await sendChatAndExpectSequenced(second, secondV2, "drop mug", "drop", "applied_frame");
+    await expect(second.locator(".chat-feed")).toContainText("You drop Mug.", { timeout: 5_000 });
+
+    await first.waitForTimeout(1_200);
+    await second.waitForTimeout(1_200);
+    await expect.poll(() => localExecTurnIntentMetrics(firstV2).length + localExecTurnIntentMetrics(secondV2).length, {
+      timeout: 4_000,
+      message: "missing browser turn_intent local_exec metrics"
+    }).toBeGreaterThanOrEqual(4);
+    const turnIntentMetrics = [...localExecTurnIntentMetrics(firstV2), ...localExecTurnIntentMetrics(secondV2)];
+    expect(new Set(turnIntentMetrics.map((metric) => metric.path)).size, "local_exec metrics should cover multiple verbs").toBeGreaterThanOrEqual(2);
+    for (const metric of turnIntentMetrics) {
+      if (typeof metric.ms === "number") expect(metric.ms, `local_exec metric for ${String(metric.path)}`).toBeLessThan(4_000);
+    }
+
+    expectNoV2Failures(firstV2);
+    expectNoV2Failures(secondV2);
+    expectNoBrowserExecutionFallback(firstV2);
+    expectNoBrowserExecutionFallback(secondV2);
+    for (const [name, timing] of Object.entries(timings)) {
+      expect(timing.local_ms, `${name} local planning latency`).toBeLessThan(4_000);
+      expect(timing.server_ms, `${name} server confirmation latency`).toBeLessThan(6_000);
+    }
+    await expect(first.locator(".chat-feed")).not.toContainText("tentative v2 turn invalidated");
+    await expect(second.locator(".chat-feed")).not.toContainText("tentative v2 turn invalidated");
   } finally {
     await firstContext.close();
     await secondContext.close();
