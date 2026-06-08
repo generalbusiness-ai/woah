@@ -5,6 +5,8 @@ type BrowserMetricRecord = Record<string, unknown> & {
   phase?: string;
   path?: string;
   reason?: string;
+  what?: string;
+  method?: string;
   ms?: number;
 };
 
@@ -232,6 +234,27 @@ function localExecTurnIntentMetrics(diagnostics: V2Diagnostics, verb?: string): 
     && metric.phase === "turn_intent"
     && (verb === undefined || metric.path === verb)
     && metric.reason === "local_exec"
+  );
+}
+
+// Count browser IndexedDB transactions against one store, optionally by access mode.
+// Used by the perf-regression guards below to keep the browser holder's IDB activity
+// from regressing toward the historical read storm (see
+// notes/2026-06-08-browser-localdev-perf.md).
+function idbTxCount(diagnostics: V2Diagnostics, store: string, method?: "readonly" | "readwrite"): number {
+  return diagnostics.browserMetrics.filter((metric) =>
+    metric.kind === "browser_activity"
+    && metric.phase === "idb_tx"
+    && metric.what === store
+    && (method === undefined || metric.method === method)
+  ).length;
+}
+
+function execCacheBuildMetrics(diagnostics: V2Diagnostics, path?: "build" | "memo"): BrowserMetricRecord[] {
+  return diagnostics.browserMetrics.filter((metric) =>
+    metric.kind === "browser_activity"
+    && metric.phase === "execution_cache_build"
+    && (path === undefined || metric.path === path)
   );
 }
 
@@ -1140,6 +1163,24 @@ test("two browser agents execute locally and are sequenced by the devserver", as
     expect(new Set(turnIntentMetrics.map((metric) => metric.path)).size, "local_exec metrics should cover multiple verbs").toBeGreaterThanOrEqual(2);
     for (const metric of turnIntentMetrics) {
       if (typeof metric.ms === "number") expect(metric.ms, `local_exec metric for ${String(metric.path)}`).toBeLessThan(4_000);
+    }
+
+    // Perf-regression guards for the browser holder's IndexedDB activity. These are
+    // structural (not wall-clock) so they are stable across machines while still
+    // catching a regression toward the historical read storm. See
+    // notes/2026-06-08-browser-localdev-perf.md for the measured baselines.
+    for (const [label, diag] of [["first", firstV2], ["second", secondV2]] as const) {
+      // The execution-checkpoint store was retired (its write path was removed in
+      // 0e3b1c5); nothing may read it again. A non-zero count means the dead read
+      // path was reintroduced.
+      expect(idbTxCount(diag, "execution_checkpoints"), `${label}: retired execution_checkpoints store must never be read`).toBe(0);
+      // The meta write-through cache turns ~165 redundant readonly reads/run into one
+      // read per distinct key. Keep it well under the storm; a handful of distinct
+      // keys (head:<scope> per room, connected, hello, ...) is expected.
+      expect(idbTxCount(diag, "meta", "readonly"), `${label}: meta readonly reads should stay cached, not storm`).toBeLessThan(40);
+      // The execution cache is memoized by input epoch; repeated cache_status polling
+      // between state changes must hit the memo rather than rebuilding every time.
+      expect(execCacheBuildMetrics(diag, "memo").length, `${label}: execution cache memo should serve redundant builds`).toBeGreaterThanOrEqual(1);
     }
 
     expectNoV2Failures(firstV2);

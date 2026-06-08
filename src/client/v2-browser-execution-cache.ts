@@ -8,7 +8,7 @@ import {
   type ShadowExecutionNode
 } from "../core/shadow-turn-exec";
 import { stableShadowJson } from "../core/shadow-cell-version";
-import type { SerializedObject, SerializedWorld } from "../core/repository";
+import type { SerializedObject } from "../core/repository";
 import type { ShadowStatePage, ShadowStatePageRef } from "../core/shadow-state-pages";
 import { hashSource } from "../core/source-hash";
 import { shadowAtomHash, shadowReadCellPreimage, shadowTurnKeyFromTranscript, type ShadowTurnKey } from "../core/turn-key";
@@ -25,22 +25,12 @@ export type V2ExecutableTransferRecord = {
   received_at: number;
 };
 
-export type V2BrowserExecutionCheckpoint = {
-  scope: ObjRef;
-  through_seq: number;
-  transfer_high_watermark: number;
-  serialized: SerializedWorld;
-  atom_hashes: string[];
-  updated_at: number;
-};
-
 export type V2BrowserExecutionComposeStats = {
   scope: ObjRef;
   ms: number;
   transfer_count: number;
   installed_transfer_count: number;
   tentative_transcript_count: number;
-  checkpoint_seq?: number;
   object_count: number;
 };
 
@@ -76,22 +66,21 @@ export function createV2BrowserExecutionNodeFromTransfers(input: {
   records: readonly V2ExecutableTransferRecord[];
   cached_objects?: readonly SerializedObject[];
   cached_pages?: readonly ShadowStatePage[];
-  checkpoint?: V2BrowserExecutionCheckpoint | null;
   tentative_transcripts?: readonly EffectTranscript[];
   onCompose?: (stats: V2BrowserExecutionComposeStats) => void;
 }): ShadowExecutionNode {
+  // The browser execution-checkpoint store was retired in 0e3b1c5, so the node is
+  // always composed from the full set of scoped transfers — there is no persisted
+  // seed/high-watermark to start from or to skip already-installed transfers.
   const startedAt = Date.now();
   const executionNode = createShadowExecutionNode({
     node: input.node,
     scope: input.scope,
-    atom_hashes: input.checkpoint?.atom_hashes,
-    serialized: input.checkpoint?.serialized,
     cached_objects: [...(input.cached_objects ?? [])],
     cached_pages: [...(input.cached_pages ?? [])]
   });
   const records = input.records
     .filter((record) => record.scope === input.scope)
-    .filter((record) => !input.checkpoint || record.received_at > input.checkpoint.transfer_high_watermark)
     .slice()
     .sort((a, b) => a.received_at - b.received_at || a.id.localeCompare(b.id));
   for (const record of records) installShadowStateTransfer(executionNode, record.transfer);
@@ -103,7 +92,6 @@ export function createV2BrowserExecutionNodeFromTransfers(input: {
     transfer_count: input.records.filter((record) => record.scope === input.scope).length,
     installed_transfer_count: records.length,
     tentative_transcript_count: tentative.length,
-    ...(input.checkpoint ? { checkpoint_seq: input.checkpoint.through_seq } : {}),
     object_count: materialized.serialized?.objects.length ?? 0
   });
   return materialized;
@@ -115,7 +103,6 @@ export function createV2BrowserAcceptedWriteCellTransfer(input: {
   records: readonly V2ExecutableTransferRecord[];
   cached_objects?: readonly SerializedObject[];
   cached_pages?: readonly ShadowStatePage[];
-  checkpoint?: V2BrowserExecutionCheckpoint | null;
   transcripts: readonly EffectTranscript[];
   received_at?: number;
   accepted_head: ShadowScopeHead;
@@ -128,8 +115,7 @@ export function createV2BrowserAcceptedWriteCellTransfer(input: {
     scope: input.scope,
     records: input.records,
     cached_objects: input.cached_objects,
-    cached_pages: input.cached_pages,
-    checkpoint: input.checkpoint
+    cached_pages: input.cached_pages
   });
   const materialized = materializeTranscriptOverlays(base, scoped);
   if (!materialized.serialized) return null;
