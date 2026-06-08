@@ -10,7 +10,6 @@ import type { ShadowStatePage } from "../core/shadow-state-pages";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, ObjRef, WooValue } from "../core/types";
 import {
   createV2BrowserExecutionNodeFromTransfers,
-  type V2BrowserExecutionCheckpoint,
   type V2BrowserExecutionComposeStats,
   type V2ExecutableTransferRecord
 } from "./v2-browser-execution-cache";
@@ -31,7 +30,6 @@ export type V2BrowserLocalTurnInput = {
   transfers: readonly V2ExecutableTransferRecord[];
   cached_objects?: readonly SerializedObject[];
   cached_pages?: readonly ShadowStatePage[];
-  execution_checkpoint?: V2BrowserExecutionCheckpoint | null;
   tentative_transcripts?: readonly EffectTranscript[];
   onCompose?: (stats: V2BrowserExecutionComposeStats) => void;
 };
@@ -61,7 +59,6 @@ export async function planV2BrowserLocalTurn(input: V2BrowserLocalTurnInput): Pr
     records: input.transfers,
     cached_objects: input.cached_objects,
     cached_pages: input.cached_pages,
-    checkpoint: input.execution_checkpoint,
     tentative_transcripts: input.tentative_transcripts,
     onCompose: input.onCompose
   });
