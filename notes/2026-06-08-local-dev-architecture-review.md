@@ -81,9 +81,13 @@ as bounded transitional debt, not as a pattern to extend.
   confirmations; no local fallback/delegation is allowed; per-action local and
   server budgets are enforced.
 
-- [ ] Validate unconstrained multi-agent local interaction. At minimum, two
+- [x] Validate unconstrained multi-agent local interaction. At minimum, two
   agents should move, carry, drop, observe peer actions, and continue after
   cross-scope movement without stale-cache or serialization failures.
+  The same two-browser Playwright gate covers this minimum: both agents speak,
+  one actor takes and drops the mug after moving to the deck, the peer observes
+  cross-room movement, and the second actor then takes and drops the mug in the
+  new room without v2 errors or browser-local fallback.
 
 ## Validation on 2026-06-08
 
