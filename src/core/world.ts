@@ -415,6 +415,16 @@ export type DirectCallOptions = {
   onSessionsEnded?: (sessions: Session[]) => void | Promise<void>;
 };
 
+type DirectDispatchFrameOptions = {
+  startedAt: number;
+  sessionId: string | null;
+  audience: ObjRef | null;
+  hostMemo: HostOperationMemo;
+  initialObservations?: Observation[];
+  deferHostEffect?: (effect: DeferredHostEffect) => void;
+  onSessionsEnded?: (sessions: Session[]) => void | Promise<void>;
+};
+
 type WooRepository = WorldRepository & Partial<ObjectRepository>;
 
 type BehaviorSavepoint = {
@@ -3662,43 +3672,13 @@ export class WooWorld {
       throw wooError("E_DIRECT_DENIED", `direct call denied for ${space}:command_plan`, { target: space, verb: "command_plan" });
     }
     if (resolved.skip_presence_check !== true) this.authorizePresence(actor, space, sessionId);
-    const observations: Observation[] = [];
     const args: WooValue[] = [text];
-    const message: Message = { actor, target: space, verb: "command_plan", args };
-    const dispatchCtx: CallContext = {
-      world: this,
-      space,
-      seq: -1,
-      session: sessionId,
-      actor,
-      player: actor,
-      caller: "#-1",
-      callerPerms: actor,
-      progr: actor,
-      thisObj: space,
-      verbName: "command_plan",
-      definer: space,
-      message,
-      observations,
-      hostMemo,
-      observe: (event) => {
-        const observation = { ...event, source: event.source ?? space };
-        this.recordTurnEvent({ kind: "observe", observation });
-        observations.push(observation);
-      }
-    };
-    let result: WooValue = null;
-    await this.withTurnRecording(
-      { id: frameId, route: "direct", scope: space, seq: -1, session: sessionId, actor, target: space, verb: "command_plan", args },
-      async (activeRecorder) => {
-        hostMemo.turnRecorder = activeRecorder;
-        result = await this.dispatch(dispatchCtx, space, "command_plan", args);
-        return result;
-      }
-    );
-    const liveAudiences = await this.directLiveAudiences(space, observations);
-    this.recordMetric({ kind: "direct_call", target: space, verb: "command_plan", audience: space, observations: observations.length, ms: Date.now() - startedAt, status: "ok" });
-    return { op: "result", id: frameId, result, observations, audience: space, ...liveAudiences };
+    return await this.dispatchDirectCallFrame(frameId, actor, space, "command_plan", args, {
+      startedAt,
+      sessionId,
+      audience: space,
+      hostMemo
+    });
   }
 
   private sessionActor(sessionId: string): ObjRef {
@@ -3727,92 +3707,110 @@ export class WooWorld {
       const sessionId = options.sessionId === undefined ? this.primarySessionForActor(actor)?.id ?? null : options.sessionId;
       if (audience) await this.chatPresentAsync(audience, actor);
       if (audience && verb.skip_presence_check !== true && !forceDirect) this.authorizePresence(actor, audience, sessionId);
-      const observations: Observation[] = [];
-      if (forceDirect) observations.push({ type: "wizard_action", action: "force_direct", actor, target, verb: verbName, source: target });
-      const message: Message = { actor, target, verb: verbName, args };
-      const deferredHostEffects: DeferredHostEffect[] = [];
-      let result: WooValue = null;
-      let mutated = false;
-      const dispatchCtx: CallContext = {
-        world: this,
-        space: audience ?? "#-1",
-        seq: -1,
-        session: sessionId,
-        actor,
-        player: actor,
-        caller: "#-1",
-        callerPerms: actor,
-        progr: actor,
-        thisObj: target,
-        verbName,
-        definer: target,
-        message,
-        observations,
+      return await this.dispatchDirectCallFrame(frameId, actor, target, verbName, args, {
+        startedAt,
+        sessionId,
+        audience,
         hostMemo,
-        onSessionsEnded: options.onSessionsEnded,
-        observe: (event) => {
-          const observation = { ...event, source: event.source ?? target };
-          this.recordTurnEvent({ kind: "observe", observation });
-          observations.push(observation);
-        },
-        deferHostEffect: options.deferHostEffect ? (effect) => deferredHostEffects.push(effect) : undefined
-      };
-      await this.withTurnRecording(
-        { id: frameId, route: "direct", scope: audience ?? "#-1", seq: -1, session: sessionId, actor, target, verb: verbName, args },
-        async (activeRecorder) => {
-          hostMemo.turnRecorder = activeRecorder;
-          await this.withPersistencePaused(async () => {
-            const before = this.snapshotProps();
-            const beforePlacement = this.snapshotPlacement();
-            const beforeParkedTasks = new Map(this.parkedTasks);
-            const beforeParkedTaskCounter = this.parkedTaskCounter;
-            const beforeObjectCount = this.objects.size;
-            try {
-              result = await this.dispatch(dispatchCtx, target, verbName, args);
-              mutated =
-                beforeObjectCount !== this.objects.size ||
-                this.propsChanged(before) ||
-                this.placementChanged(beforePlacement) ||
-                beforeParkedTasks.size !== this.parkedTasks.size ||
-                beforeParkedTaskCounter !== this.parkedTaskCounter;
-            } catch (err) {
-              this.restoreProps(before);
-              this.restorePlacement(beforePlacement);
-              this.parkedTasks = new Map(beforeParkedTasks);
-              this.parkedTaskCounter = beforeParkedTaskCounter;
-              throw err;
-            }
-          });
-          return result;
-        }
-      );
-      if (mutated || this.persistenceDirty) this.persist(true);
-      if (options.deferHostEffect) {
-        for (const effect of deferredHostEffects) options.deferHostEffect(effect);
-      }
-      result = await this.enrichScopedMoveResult(dispatchCtx, result);
-      // Cross-host bridge stashes authoritative audience info on ctx; prefer
-      // it over recomputing locally where the local subscriber/presence view
-      // for self-hosted spaces is stale.
-        const crossHostAudience = (dispatchCtx as { crossHostAudience?: { audienceActors?: ObjRef[]; observationAudiences?: ObjRef[][]; audienceSessions?: string[]; observationSessionAudiences?: string[][] } }).crossHostAudience;
-      const liveAudiences = crossHostAudience ?? await this.directLiveAudiences(audience, observations);
-      this.recordMetric({ kind: "direct_call", target, verb: verbName, audience, observations: observations.length, ms: Date.now() - startedAt, status: "ok" });
-      return {
-        op: "result",
-        id: frameId,
-        result,
-        observations,
-          audience,
-          audienceActors: liveAudiences.audienceActors,
-          observationAudiences: liveAudiences.observationAudiences,
-          audienceSessions: liveAudiences.audienceSessions,
-          observationSessionAudiences: liveAudiences.observationSessionAudiences
-        };
+        initialObservations: forceDirect ? [{ type: "wizard_action", action: "force_direct", actor, target, verb: verbName, source: target }] : undefined,
+        deferHostEffect: options.deferHostEffect,
+        onSessionsEnded: options.onSessionsEnded
+      });
     } catch (err) {
       const error = normalizeError(err);
       this.recordMetric({ kind: "direct_call", target, verb: verbName, audience: null, observations: 0, ms: Date.now() - startedAt, status: "error", error: error.code });
       return { op: "error", id: frameId, error };
     }
+  }
+
+  private async dispatchDirectCallFrame(
+    frameId: string | undefined,
+    actor: ObjRef,
+    target: ObjRef,
+    verbName: string,
+    args: WooValue[],
+    options: DirectDispatchFrameOptions
+  ): Promise<DirectResultFrame> {
+    const observations: Observation[] = [...(options.initialObservations ?? [])];
+    const message: Message = { actor, target, verb: verbName, args };
+    const deferredHostEffects: DeferredHostEffect[] = [];
+    let result: WooValue = null;
+    let mutated = false;
+    const dispatchCtx: CallContext = {
+      world: this,
+      space: options.audience ?? "#-1",
+      seq: -1,
+      session: options.sessionId,
+      actor,
+      player: actor,
+      caller: "#-1",
+      callerPerms: actor,
+      progr: actor,
+      thisObj: target,
+      verbName,
+      definer: target,
+      message,
+      observations,
+      hostMemo: options.hostMemo,
+      onSessionsEnded: options.onSessionsEnded,
+      observe: (event) => {
+        const observation = { ...event, source: event.source ?? target };
+        this.recordTurnEvent({ kind: "observe", observation });
+        observations.push(observation);
+      },
+      deferHostEffect: options.deferHostEffect ? (effect) => deferredHostEffects.push(effect) : undefined
+    };
+    await this.withTurnRecording(
+      { id: frameId, route: "direct", scope: options.audience ?? "#-1", seq: -1, session: options.sessionId, actor, target, verb: verbName, args },
+      async (activeRecorder) => {
+        options.hostMemo.turnRecorder = activeRecorder;
+        await this.withPersistencePaused(async () => {
+          const before = this.snapshotProps();
+          const beforePlacement = this.snapshotPlacement();
+          const beforeParkedTasks = new Map(this.parkedTasks);
+          const beforeParkedTaskCounter = this.parkedTaskCounter;
+          const beforeObjectCount = this.objects.size;
+          try {
+            result = await this.dispatch(dispatchCtx, target, verbName, args);
+            mutated =
+              beforeObjectCount !== this.objects.size ||
+              this.propsChanged(before) ||
+              this.placementChanged(beforePlacement) ||
+              beforeParkedTasks.size !== this.parkedTasks.size ||
+              beforeParkedTaskCounter !== this.parkedTaskCounter;
+          } catch (err) {
+            this.restoreProps(before);
+            this.restorePlacement(beforePlacement);
+            this.parkedTasks = new Map(beforeParkedTasks);
+            this.parkedTaskCounter = beforeParkedTaskCounter;
+            throw err;
+          }
+        });
+        return result;
+      }
+    );
+    if (mutated || this.persistenceDirty) this.persist(true);
+    if (options.deferHostEffect) {
+      for (const effect of deferredHostEffects) options.deferHostEffect(effect);
+    }
+    result = await this.enrichScopedMoveResult(dispatchCtx, result);
+    // Cross-host bridge stashes authoritative audience info on ctx; prefer it
+    // over recomputing locally where the local subscriber/presence view for
+    // self-hosted spaces is stale.
+    const crossHostAudience = (dispatchCtx as { crossHostAudience?: { audienceActors?: ObjRef[]; observationAudiences?: ObjRef[][]; audienceSessions?: string[]; observationSessionAudiences?: string[][] } }).crossHostAudience;
+    const liveAudiences = crossHostAudience ?? await this.directLiveAudiences(options.audience, observations);
+    this.recordMetric({ kind: "direct_call", target, verb: verbName, audience: options.audience, observations: observations.length, ms: Date.now() - options.startedAt, status: "ok" });
+    return {
+      op: "result",
+      id: frameId,
+      result,
+      observations,
+      audience: options.audience,
+      audienceActors: liveAudiences.audienceActors,
+      observationAudiences: liveAudiences.observationAudiences,
+      audienceSessions: liveAudiences.audienceSessions,
+      observationSessionAudiences: liveAudiences.observationSessionAudiences
+    };
   }
 
   private async enrichScopedMoveResult(ctx: CallContext, result: WooValue): Promise<WooValue> {
