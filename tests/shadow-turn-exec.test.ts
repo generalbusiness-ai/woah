@@ -1432,6 +1432,73 @@ describe("shadow turn execution", () => {
     expect(createWorldFromSerialized(routed.result.serializedAfter, { persist: false }).getProp("delay_1", "wet")).toBe(0.67);
   });
 
+  it("transfers and retries after a pre-recording sparse verb miss", async () => {
+    const anchor = createWorld();
+    const session = anchor.auth("guest:shadow-verb-miss-retry");
+    const actor = session.actor;
+    anchor.createObject({ id: "verb_retry_box", name: "Verb Retry Box", parent: "$thing", owner: actor });
+    const installed = installVerb(
+      anchor,
+      "verb_retry_box",
+      "bump",
+      `verb :bump() rxd {
+        return "bumped";
+      }`,
+      null
+    );
+    expect(installed.ok).toBe(true);
+
+    const serializedBefore = anchor.exportWorld();
+    const sparseSerialized = structuredClone(serializedBefore);
+    const sparseBox = sparseSerialized.objects.find((object) => object.id === "verb_retry_box");
+    if (!sparseBox) throw new Error("missing verb_retry_box");
+    sparseBox.verbs = sparseBox.verbs.filter((verb) => verb.name !== "bump");
+    const call: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "shadow-verb-miss-retry-bump",
+      route: "direct",
+      scope: "#-1",
+      session: session.id,
+      actor,
+      target: "verb_retry_box",
+      verb: "bump",
+      args: []
+    };
+    const key = shadowTurnKeyFromCall({
+      scope: call.scope,
+      actor: call.actor,
+      target: call.target,
+      verb: call.verb
+    });
+    const request = { kind: "woo.turn.exec.request.shadow.v1" as const, call, key };
+    const node = createShadowExecutionNode({
+      node: "actor-node",
+      scope: key.scope,
+      atom_hashes: key.atom_hashes,
+      serialized: sparseSerialized
+    });
+
+    const first = await executeShadowTurnCallOrNeedState(node, request);
+    expect(first).toMatchObject({ ok: false, reason: "missing_state", attempted: false });
+    if (first.ok || first.reason !== "missing_state") throw new Error("expected pre-recording verb miss");
+    expect(first.missing_atoms).toEqual([
+      expect.objectContaining({ preimage: "read:cell:verb:verb_retry_box:bump" })
+    ]);
+
+    const transfer = buildShadowCellPageTransfer({
+      serialized: serializedBefore,
+      key,
+      missing_atoms: first.missing_atoms
+    });
+    expect(transfer.preimages).toEqual(expect.arrayContaining(["read:cell:verb:verb_retry_box:bump"]));
+    installShadowStateTransfer(node, transfer);
+
+    const retry = await executeShadowTurnCallOrNeedState(node, request);
+    if (!retry.ok) throw new Error(`verb-miss retry failed: ${JSON.stringify(retry, null, 2)}`);
+    expect(retry).toMatchObject({ ok: true, attempted: true });
+    expect(retry.frame).toMatchObject({ op: "result", result: "bumped" });
+  });
+
   it("grants negative verb lookup atoms for the inherited lookup path in one cell-page repair", () => {
     const anchor = createWorld();
     const key = shadowTurnKeyFromCall({

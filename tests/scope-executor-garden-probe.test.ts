@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { createWorld, createWorldFromSerialized } from "../src/core/bootstrap";
 import { createShadowCommitScope } from "../src/core/shadow-commit-scope";
 import { createShadowExecutionNode } from "../src/core/shadow-turn-exec";
-import { runShadowTurnCall, type ShadowTurnCall } from "../src/core/shadow-turn-call";
+import { runShadowTurnCall, runShadowTurnCallOnWorldTranscript, type ShadowTurnCall } from "../src/core/shadow-turn-call";
 import {
   buildShadowTurnExecAd,
   executeShadowTurnCallAcrossInProcessNetwork
@@ -99,6 +99,30 @@ function shadowTurnKeyWithoutPreimages(
 }
 
 describe("scope-executor garden probe", () => {
+  it("preserves pre-recording E_OBJNF as a structured repair signal", async () => {
+    const anchor = createWorld();
+    const session = anchor.auth("guest:sparse-pre-recording-objnf");
+    const serialized = anchor.exportWorld();
+    const sparseSerialized: SerializedWorld = {
+      ...serialized,
+      objects: serialized.objects.filter((object) => object.id !== "the_chatroom")
+    };
+    const call: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "sparse-pre-recording-enter",
+      route: "direct",
+      scope: "the_chatroom",
+      session: session.id,
+      actor: session.actor,
+      target: "the_chatroom",
+      verb: "enter",
+      args: []
+    };
+
+    await expect(runShadowTurnCallOnWorldTranscript(createWorldFromSerialized(sparseSerialized), call))
+      .rejects.toMatchObject({ code: "E_OBJNF", value: "the_chatroom" });
+  });
+
   it("CASE A: full-state single turn does the deck->garden move (records its scope + writes)", async () => {
     const { fullSerialized, actor, sessionId } = await setupOnDeck();
 

@@ -2820,6 +2820,46 @@ describe("McpGateway", () => {
     ]);
   });
 
+  it("forces an owner refresh when an active-scope local projection lacks the requested verb", async () => {
+    const home = bootstrapWorld();
+    const requests: RemoteToolRequest[] = [];
+    const freshDescriptor: RemoteToolDescriptor = {
+      object: "remote_room",
+      verb: "southeast",
+      aliases: [],
+      arg_spec: { args: [] },
+      direct: true,
+      source: "/* owner */",
+      enclosingSpace: "remote_room"
+    };
+    class ActiveScopeRefreshBridge extends RemoteToolBridge {
+      override async enumerateRemoteTools(_actor: ObjRef, batch: RemoteToolRequest[]): Promise<RemoteToolDescriptor[]> {
+        requests.push(...batch);
+        return batch.some((request) => request.id === "remote_room" && request.forceRefresh === true)
+          ? [freshDescriptor]
+          : [];
+      }
+    }
+    const routes = new Map<ObjRef, string>([["remote_room", "home"]]);
+    home.setExecutorContext(new ActiveScopeRefreshBridge("home", new Map([["home", home]]), routes, new Map()));
+
+    // This row is a sparse active-scope projection: it is reachable locally, but
+    // it has no owner tool surface, so local verb lookup misses.
+    home.createObject({ id: "remote_room", name: "Remote Room", parent: "$space", owner: "$wiz" });
+    const session = home.auth("guest:mcp-active-scope-local-stub");
+    home.object(session.actor).location = "remote_room";
+    home.object("remote_room").contents.add(session.actor);
+    session.activeScope = "remote_room";
+
+    const host = new McpHost(home);
+    const resolved = await host.resolveReachableTool(session.actor, "remote_room", "southeast", session.id);
+
+    expect(resolved).toMatchObject({ object: "remote_room", verb: "southeast" });
+    expect(requests).toEqual([
+      expect.objectContaining({ id: "remote_room", projection: "tools", forceRefresh: true })
+    ]);
+  });
+
   it("treats a remote current location as reachable even without a local stub", async () => {
     const home = bootstrapWorld();
     const remote = bootstrapWorld();
