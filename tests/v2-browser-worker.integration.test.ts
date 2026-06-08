@@ -1026,7 +1026,7 @@ describe("v2 browser worker integration", () => {
       }
     });
     expect(posted.filter((message) => isLocalTurnCommitted(message, "bad-bundled-capsule-turn"))).toHaveLength(1);
-  });
+  }, 60_000);
 
   it("validates reply-bundled executable transfers against the accepted transcript key", async () => {
     const posted: unknown[] = [];
@@ -3158,9 +3158,11 @@ async function waitForMessageIndex(messages: unknown[], predicate: (message: unk
   });
 }
 
-// The full guarded suite runs several CPU-heavy worker tests in parallel; keep
-// this poll tolerant of scheduler delay while still bounded.
-async function waitFor<T>(read: () => T | undefined, timeoutMs = 10000): Promise<T> {
+// The full guarded suite runs several CPU-heavy worker tests in parallel, and
+// deploy preflight captures output under Bash. Both can delay the fake worker's
+// timer turns enough that a correct ready/status message arrives after 10s, so
+// keep this poll tolerant of scheduler delay while still bounded.
+async function waitFor<T>(read: () => T | undefined, timeoutMs = 30000): Promise<T> {
   const start = Date.now();
   for (;;) {
     const value = read();
