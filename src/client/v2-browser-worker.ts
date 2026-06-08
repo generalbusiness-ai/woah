@@ -112,6 +112,46 @@ type BrowserActivityMetric = {
   pending?: number;
   bytes?: number;
   records?: number;
+  request_bytes?: number;
+  request_body_bytes?: number;
+  request_known_pages?: number;
+  request_known_page_hash_bytes?: number;
+  request_atom_hashes?: number;
+  request_missing_atoms?: number;
+  request_missing_atom_preimages?: number;
+  request_missing_atom_bytes?: number;
+  request_missing_read_verbs?: number;
+  request_missing_read_props?: number;
+  request_missing_read_contents?: number;
+  request_missing_lifecycle?: number;
+  request_missing_writes?: number;
+  request_missing_other?: number;
+  request_key_atoms?: number;
+  request_key_preimages?: number;
+  request_key_read_verbs?: number;
+  request_key_read_props?: number;
+  request_key_read_contents?: number;
+  request_key_lifecycle?: number;
+  request_key_writes?: number;
+  request_key_other?: number;
+  reply_bytes?: number;
+  reply_metadata_bytes?: number;
+  reply_page_ref_bytes?: number;
+  reply_inline_bytes?: number;
+  reply_preimage_bytes?: number;
+  reply_atom_hash_bytes?: number;
+  reply_page_refs?: number;
+  reply_inline_pages?: number;
+  reply_omitted_pages?: number;
+  reply_preimages?: number;
+  reply_atom_hashes?: number;
+  reply_sessions?: number;
+  reply_logs?: number;
+  reply_snapshots?: number;
+  reply_parked_tasks?: number;
+  reply_tombstones?: number;
+  reply_source_pages?: number;
+  reply_source_objects?: number;
   transfer_mode?: string;
   executable_transfer_cache?: "hit" | "miss";
   error?: string;
@@ -180,13 +220,58 @@ const pendingStateTransfers = new Map<string, {
   node: string;
   actor?: ObjRef;
   session?: string | null;
-  resolve: () => void;
+  resolve: (stats: StateTransferReplyStats) => void;
   reject: (err: Error) => void;
   timer: number;
 }>();
 const pendingTurnExecRequests = new Map<string, ShadowTurnExecRequest>();
 const postedAppliedFrameKeys = new Set<string>();
 const promotedAcceptedTranscriptHashes = new Set<string>();
+
+type StateTransferRequestStats = {
+  request_body_bytes: number;
+  request_known_pages: number;
+  request_known_page_hash_bytes: number;
+  request_atom_hashes: number;
+  request_missing_atoms: number;
+  request_missing_atom_preimages: number;
+  request_missing_atom_bytes: number;
+  request_missing_read_verbs: number;
+  request_missing_read_props: number;
+  request_missing_read_contents: number;
+  request_missing_lifecycle: number;
+  request_missing_writes: number;
+  request_missing_other: number;
+  request_key_atoms: number;
+  request_key_preimages: number;
+  request_key_read_verbs: number;
+  request_key_read_props: number;
+  request_key_read_contents: number;
+  request_key_lifecycle: number;
+  request_key_writes: number;
+  request_key_other: number;
+};
+
+type StateTransferReplyStats = {
+  reply_bytes: number;
+  reply_metadata_bytes: number;
+  reply_page_ref_bytes: number;
+  reply_inline_bytes: number;
+  reply_preimage_bytes: number;
+  reply_atom_hash_bytes: number;
+  reply_page_refs: number;
+  reply_inline_pages: number;
+  reply_omitted_pages: number;
+  reply_preimages: number;
+  reply_atom_hashes: number;
+  reply_sessions: number;
+  reply_logs: number;
+  reply_snapshots: number;
+  reply_parked_tasks: number;
+  reply_tombstones: number;
+  reply_source_pages: number;
+  reply_source_objects: number;
+};
 
 type V2WorkerScope = {
   addEventListener(type: "message", listener: (event: MessageEvent<V2WorkerCommand>) => void): void;
@@ -226,6 +311,104 @@ function jsonBytes(value: unknown): number {
   } catch {
     return 0;
   }
+}
+
+function atomCategoryCounts(preimages: string[]): {
+  read_verbs: number;
+  read_props: number;
+  read_contents: number;
+  lifecycle: number;
+  writes: number;
+  other: number;
+} {
+  const counts = { read_verbs: 0, read_props: 0, read_contents: 0, lifecycle: 0, writes: 0, other: 0 };
+  for (const preimage of preimages) {
+    if (preimage.startsWith("read:cell:verb:")) counts.read_verbs++;
+    else if (preimage.startsWith("read:cell:prop:")) counts.read_props++;
+    else if (preimage.startsWith("read:cell:contents:")) counts.read_contents++;
+    else if (preimage.includes(":cell:lifecycle:")) counts.lifecycle++;
+    else if (preimage.startsWith("write:")) counts.writes++;
+    else counts.other++;
+  }
+  return counts;
+}
+
+function stateTransferRequestStats(request: ShadowExecutableStateTransferRequest): StateTransferRequestStats {
+  const missingAtoms = request.missing_atoms ?? [];
+  const missingCategories = atomCategoryCounts(missingAtoms.flatMap((atom) => typeof atom.preimage === "string" ? [atom.preimage] : []));
+  const keyCategories = atomCategoryCounts(request.key.preimages);
+  return {
+    request_body_bytes: jsonBytes(request),
+    request_known_pages: request.known_page_hashes?.length ?? 0,
+    request_known_page_hash_bytes: jsonBytes(request.known_page_hashes ?? []),
+    request_atom_hashes: request.atom_hashes?.length ?? 0,
+    request_missing_atoms: missingAtoms.length,
+    request_missing_atom_preimages: missingAtoms.filter((atom) => typeof atom.preimage === "string").length,
+    request_missing_atom_bytes: jsonBytes(missingAtoms),
+    request_missing_read_verbs: missingCategories.read_verbs,
+    request_missing_read_props: missingCategories.read_props,
+    request_missing_read_contents: missingCategories.read_contents,
+    request_missing_lifecycle: missingCategories.lifecycle,
+    request_missing_writes: missingCategories.writes,
+    request_missing_other: missingCategories.other,
+    request_key_atoms: request.key.atom_hashes.length,
+    request_key_preimages: request.key.preimages.length,
+    request_key_read_verbs: keyCategories.read_verbs,
+    request_key_read_props: keyCategories.read_props,
+    request_key_read_contents: keyCategories.read_contents,
+    request_key_lifecycle: keyCategories.lifecycle,
+    request_key_writes: keyCategories.writes,
+    request_key_other: keyCategories.other
+  };
+}
+
+function stateTransferReplyStats(transfer: ShadowStateTransfer): StateTransferReplyStats {
+  if (transfer.mode !== "cell_pages") {
+    return {
+      reply_bytes: jsonBytes(transfer),
+      reply_metadata_bytes: jsonBytes(transfer),
+      reply_page_ref_bytes: 0,
+      reply_inline_bytes: 0,
+      reply_preimage_bytes: jsonBytes("preimages" in transfer ? transfer.preimages ?? [] : []),
+      reply_atom_hash_bytes: jsonBytes(transfer.atom_hashes),
+      reply_page_refs: 0,
+      reply_inline_pages: 0,
+      reply_omitted_pages: 0,
+      reply_preimages: "preimages" in transfer ? transfer.preimages?.length ?? 0 : 0,
+      reply_atom_hashes: transfer.atom_hashes.length,
+      reply_sessions: transfer.sessions.length,
+      reply_logs: transfer.logs.length,
+      reply_snapshots: transfer.snapshots.length,
+      reply_parked_tasks: transfer.parkedTasks.length,
+      reply_tombstones: transfer.tombstones.length,
+      reply_source_pages: 0,
+      reply_source_objects: transfer.source_object_count
+    };
+  }
+  const metadata = {
+    ...transfer,
+    inline_pages: []
+  };
+  return {
+    reply_bytes: jsonBytes(transfer),
+    reply_metadata_bytes: jsonBytes(metadata),
+    reply_page_ref_bytes: jsonBytes(transfer.page_refs),
+    reply_inline_bytes: jsonBytes(transfer.inline_pages),
+    reply_preimage_bytes: jsonBytes(transfer.preimages ?? []),
+    reply_atom_hash_bytes: jsonBytes(transfer.atom_hashes),
+    reply_page_refs: transfer.page_refs.length,
+    reply_inline_pages: transfer.inline_pages.length,
+    reply_omitted_pages: transfer.page_refs.filter((ref) => ref.inline === false).length,
+    reply_preimages: transfer.preimages?.length ?? 0,
+    reply_atom_hashes: transfer.atom_hashes.length,
+    reply_sessions: transfer.sessions.length,
+    reply_logs: transfer.logs.length,
+    reply_snapshots: transfer.snapshots.length,
+    reply_parked_tasks: transfer.parkedTasks.length,
+    reply_tombstones: transfer.tombstones.length,
+    reply_source_pages: transfer.source_page_count,
+    reply_source_objects: transfer.source_object_count
+  };
 }
 
 workerScope.addEventListener("message", (event: MessageEvent<V2WorkerCommand>) => {
@@ -610,7 +793,7 @@ async function receiveFrame(encoded: string): Promise<void> {
       postMessage({ kind: "live_event", event: envelope.body as ShadowLiveEvent });
     }
     if (envelope.type === "woo.state.transfer.shadow.v1" && envelope.reply_to) {
-      resolvePendingStateTransfer(envelope.reply_to);
+      resolvePendingStateTransfer(envelope.reply_to, envelope.body as ShadowStateTransfer);
     }
     if (installedExecutableState || receivedStateTransfer || receivedCompleteCheckpointTail) await replayPending();
     markConnectReady(
@@ -1122,7 +1305,7 @@ async function repairLocalExecutableState(
     missing_atoms: missingAtoms.map((atom) => atom.hash)
   });
   try {
-    await requestStateTransfer(envelope);
+    await requestStateTransfer(envelope, { path: command.verb, route: command.route });
     postBrowserActivity({
       phase: "local_turn_repair",
       path: command.verb,
@@ -1150,11 +1333,15 @@ async function repairLocalExecutableState(
   }
 }
 
-async function requestStateTransfer(envelope: ShadowEnvelope<ShadowExecutableStateTransferRequest>): Promise<void> {
+async function requestStateTransfer(
+  envelope: ShadowEnvelope<ShadowExecutableStateTransferRequest>,
+  context: { path?: string; route?: string } = {}
+): Promise<void> {
   const startedAt = metricNow();
   const encoded = encodeEnvelope(envelope);
   const id = envelope.id;
-  const pending = new Promise<void>((resolve, reject) => {
+  const requestStats = stateTransferRequestStats(envelope.body);
+  const pending = new Promise<StateTransferReplyStats>((resolve, reject) => {
     const timer = workerScope.setTimeout(() => {
       pendingStateTransfers.delete(id);
       reject(new Error("state transfer request timed out"));
@@ -1171,24 +1358,33 @@ async function requestStateTransfer(envelope: ShadowEnvelope<ShadowExecutableSta
   });
   sendEncoded(encoded);
   try {
-    await pending;
+    const replyStats = await pending;
     postBrowserActivity({
       phase: "state_transfer_request",
-      path: envelope.body.mode,
+      path: context.path ?? envelope.body.mode,
+      route: context.route,
+      what: envelope.body.mode,
       scope: envelope.body.scope,
       ms: metricElapsed(startedAt),
       status: "ok",
       bytes: jsonBytes(encoded),
-      count: envelope.body.atom_hashes?.length ?? envelope.body.missing_atoms?.length ?? 0
+      count: envelope.body.atom_hashes?.length ?? envelope.body.missing_atoms?.length ?? 0,
+      request_bytes: jsonBytes(encoded),
+      ...requestStats,
+      ...replyStats
     });
   } catch (err) {
     postBrowserActivity({
       phase: "state_transfer_request",
-      path: envelope.body.mode,
+      path: context.path ?? envelope.body.mode,
+      route: context.route,
+      what: envelope.body.mode,
       scope: envelope.body.scope,
       ms: metricElapsed(startedAt),
       status: "error",
       bytes: jsonBytes(encoded),
+      request_bytes: jsonBytes(encoded),
+      ...requestStats,
       error: "E_BROWSER_STATE_TRANSFER",
       error_detail: errorMessage(err)
     });
@@ -1334,12 +1530,12 @@ async function pendingTurnExecRequest(id: string): Promise<ShadowTurnExecRequest
   }
 }
 
-function resolvePendingStateTransfer(id: string): void {
+function resolvePendingStateTransfer(id: string, transfer: ShadowStateTransfer): void {
   const pending = pendingStateTransfers.get(id);
   if (!pending) return;
   pendingStateTransfers.delete(id);
   workerScope.clearTimeout(pending.timer);
-  pending.resolve();
+  pending.resolve(stateTransferReplyStats(transfer));
 }
 
 async function reconcileTentativeTurnReply(reply: ShadowTurnExecReply, replyTo?: string): Promise<void> {

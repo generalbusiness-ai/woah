@@ -28,6 +28,7 @@
 //   private repos and content-hash caching are deferred.
 
 import { createWorld, createWorldFromSerialized, mergeHostScopedSeedWithStatus, nonEmptyHostScopedWorld } from "../core/bootstrap";
+import { BROWSER_ACTIVITY_NUMERIC_DETAIL_FIELDS } from "../core/browser-activity-metric-fields";
 import {
   authoritySlicePageCount,
   authoritySliceObjectIds,
@@ -6556,7 +6557,7 @@ function browserActivityMetricFromPayload(raw: unknown, session: Session): Metri
   const source = input.source === "main" ? "main" : "v2_browser_worker";
   const status = input.status === "error" ? "error" : "ok";
   const ms = nonNegativeNumber(input.ms) ?? 0;
-  return {
+  const metric: MetricEvent = {
     kind: "browser_activity",
     source,
     phase,
@@ -6578,6 +6579,11 @@ function browserActivityMetricFromPayload(raw: unknown, session: Session): Metri
     ...(boundedString(input.error) ? { error: boundedString(input.error)! } : {}),
     ...(boundedString(input.error_detail) ? { error_detail: boundedString(input.error_detail)! } : {})
   };
+  for (const field of BROWSER_ACTIVITY_NUMERIC_DETAIL_FIELDS) {
+    const value = nonNegativeNumber(input[field]);
+    if (value !== undefined) (metric as Record<string, unknown>)[field] = value;
+  }
+  return metric;
 }
 
 function boundedString(value: unknown): string | undefined {

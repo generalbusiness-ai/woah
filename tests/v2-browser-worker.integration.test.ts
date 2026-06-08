@@ -2070,6 +2070,21 @@ describe("v2 browser worker integration", () => {
     const addRepairs = { stateTransferRequests: 0 };
     const addRequest = await waitForBrowserBuiltExecRequest(browser, socket, "add_note", addRepairs);
     expect(addRepairs.stateTransferRequests).toBeLessThanOrEqual(1);
+    if (addRepairs.stateTransferRequests > 0) {
+      const transferMetrics = posted
+        .map(browserMetric)
+        .filter((metric): metric is Record<string, unknown> => metric?.phase === "state_transfer_request");
+      expect(transferMetrics.length).toBeGreaterThanOrEqual(addRepairs.stateTransferRequests);
+      expect(transferMetrics.at(-1)).toMatchObject({
+        phase: "state_transfer_request",
+        status: "ok",
+        request_known_pages: expect.any(Number),
+        request_body_bytes: expect.any(Number),
+        reply_page_refs: expect.any(Number),
+        reply_inline_pages: expect.any(Number),
+        reply_metadata_bytes: expect.any(Number)
+      });
+    }
     expect(addRequest).toMatchObject({
       type: "woo.turn.exec.request.shadow.v1",
       body: { call: { verb: "add_note" } }
