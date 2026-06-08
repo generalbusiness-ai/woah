@@ -34,6 +34,16 @@ function testWooContext(names: Record<string, string> = {}): WooContext {
   };
 }
 
+function appendAmbientCompanionPanel(root: ParentNode, space: string): HTMLElement {
+  const slot = root.querySelector<HTMLElement>("[data-ambient-companion]");
+  expect(slot, "ambient companion slot").not.toBeNull();
+  const panel = document.createElement("aside");
+  panel.dataset.spaceChatPanel = "";
+  panel.dataset.spaceChatSpace = space;
+  slot!.append(panel);
+  return panel;
+}
+
 describe("bundled catalog UI components", () => {
   it("renders and preserves the shared ambient companion shell", () => {
     const host = document.createElement("section");
@@ -1465,7 +1475,7 @@ describe("bundled catalog UI components", () => {
   it("renders the tasks kanban with state columns, cursor badges, and actions", async () => {
     const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
     defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
-    const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; data?: any };
+    const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; data?: any; showCompanion?: boolean };
     element.woo = testWooContext({ guest_1: "Guest 1", guest_2: "Guest 2" });
     document.body.appendChild(element);
 
@@ -1564,6 +1574,8 @@ describe("bundled catalog UI components", () => {
     };
 
     expect(element.querySelector("h1")?.textContent).toBe("Taskboard");
+    expect(element.querySelector('[data-ambient-companion-shell="the_taskboard"]')).toBeNull();
+    element.showCompanion = true;
     expect(element.querySelector('[data-ambient-companion-shell="the_taskboard"]')).not.toBeNull();
     expect(element.querySelector("[data-ambient-companion]")).not.toBeNull();
     // The status-filter lozenges live in the kanban-scoped filter bar, not
@@ -1705,8 +1717,9 @@ describe("bundled catalog UI components", () => {
     if (!customElements.get("woo-space-chat-panel")) {
       customElements.define("woo-space-chat-panel", class extends HTMLElement {});
     }
-    const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; data?: any };
+    const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; data?: any; showCompanion?: boolean };
     document.body.appendChild(element);
+    element.showCompanion = true;
 
     element.data = {
       registryId: "the_taskboard",
@@ -1837,7 +1850,7 @@ describe("bundled catalog UI components", () => {
     element.woo = testWooContext({ guest_1: "Guest 1" });
     document.body.appendChild(element);
 
-    element.data = {
+    const data = {
       boardId: "the_pinboard",
       boardName: "Pinboard",
       boardOwner: "guest_1",
@@ -1853,12 +1866,18 @@ describe("bundled catalog UI components", () => {
       newColor: "pink",
       viewports: {}
     };
+    element.data = data;
 
     expect(element.querySelector<HTMLTextAreaElement>("[data-pin-note-text]")?.value).toBe("hello");
     let detail: any;
     element.addEventListener("woo-pinboard-create", (event: Event) => { detail = (event as CustomEvent).detail; });
     element.querySelector<HTMLFormElement>("[data-pinboard-create]")?.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
     expect(detail).toMatchObject({ text: "draft", color: "pink" });
+
+    const panel = appendAmbientCompanionPanel(element, "the_pinboard");
+    element.data = { ...data, newText: "next draft" };
+    expect(element.querySelector("[data-space-chat-panel]")).toBe(panel);
+    expect(element.querySelector("[data-ambient-companion]")?.firstElementChild).toBe(panel);
   });
 
   it("renders dubspace controls and emits control commits", async () => {
@@ -1868,7 +1887,7 @@ describe("bundled catalog UI components", () => {
     element.woo = testWooContext({ guest_1: "Guest 1" });
     document.body.appendChild(element);
 
-    element.data = {
+    const data = {
       spaceId: "the_dubspace",
       spaceName: "Dubspace",
       spaceDescription: "",
@@ -1889,6 +1908,7 @@ describe("bundled catalog UI components", () => {
       cueSlots: {},
       cuePlaying: {}
     };
+    element.data = data;
 
     let detail: any;
     element.addEventListener("woo-dubspace-control-commit", (event: Event) => { detail = (event as CustomEvent).detail; });
@@ -1896,6 +1916,11 @@ describe("bundled catalog UI components", () => {
     cutoff.value = "750";
     cutoff.dispatchEvent(new window.Event("change", { bubbles: true }));
     expect(detail).toMatchObject({ target: "filter_1", name: "cutoff", value: 750 });
+
+    const panel = appendAmbientCompanionPanel(element, "the_dubspace");
+    element.data = { ...data, audioOn: true };
+    expect(element.querySelector("[data-space-chat-panel]")).toBe(panel);
+    expect(element.querySelector("[data-ambient-companion]")?.firstElementChild).toBe(panel);
   });
 
 });

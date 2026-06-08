@@ -3,6 +3,7 @@ export type V2LocalTurnInvalidatedMessage = {
   id?: string;
   reason?: string;
   invalidated_ids?: unknown;
+  errors?: unknown;
 };
 
 type V2OptimisticLifecycleHooks = {

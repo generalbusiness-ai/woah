@@ -1,6 +1,8 @@
 import {
   escapeHtml,
+  preserveAmbientCompanionPanel,
   renderToolFrame,
+  restoreAmbientCompanionPanel,
   type ChatFormatterRegistry,
   type ObservationRegistry,
   type WooComponentRegistry,
@@ -132,6 +134,7 @@ export class WooPinboardBoardElement extends HTMLElement {
         <div data-pinboard-map-shell>${this.renderMap(width, height)}</div>
       </aside>
     `;
+    const preservedPanel = preserveAmbientCompanionPanel(this, boardId);
     this.innerHTML = renderToolFrame({
       subject: boardId,
       toolbar,
@@ -139,6 +142,7 @@ export class WooPinboardBoardElement extends HTMLElement {
       layoutBody,
       showChat: this.model.inBoard
     });
+    restoreAmbientCompanionPanel(this, preservedPanel);
     this.bind();
   }
 

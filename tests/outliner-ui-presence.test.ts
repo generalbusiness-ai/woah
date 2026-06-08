@@ -26,6 +26,10 @@ function ctx(names: Record<string, string> = {}, options: { refs?: string[]; pro
   };
 }
 
+async function flushPromises(turns = 4): Promise<void> {
+  for (let i = 0; i < turns; i++) await Promise.resolve();
+}
+
 describe("outliner-tree presence aside", () => {
   beforeAll(() => {
     if (!customElements.get("woo-outliner-tree")) {
@@ -142,7 +146,7 @@ describe("outliner-tree presence aside", () => {
     expect(shell?.contains(toolbar), "toolbar must NOT be a descendant of the shell — keep it as a sibling so the shell's calc(100dvh - 5.25rem) lines up").toBe(false);
   });
 
-  it("hydrates from projection refs without list_items or room_roster calls", async () => {
+  it("hydrates from projection refs without list_items or room_roster calls when text is present", async () => {
     const directCall = vi.fn(async () => []);
     const element = document.createElement("woo-outliner-tree") as WooOutlinerTreeElement & { hydrate: () => Promise<void>; subject: string };
     element.subject = "the_outline";
@@ -171,6 +175,138 @@ describe("outliner-tree presence aside", () => {
     expect(directCall).not.toHaveBeenCalled();
     expect(element.querySelector("[data-outliner-row]")?.textContent).toContain("projection row");
     expect(element.querySelector(".presence-list")?.textContent).toContain("Guest One");
+  });
+
+  it("hydrates item text from list_items when projection refs carry default-empty note text", async () => {
+    const directCall = vi.fn(async (subject: string, verb: string) => {
+      expect(subject).toBe("the_outline");
+      expect(verb).toBe("list_items");
+      return [
+        {
+          id: "item_1",
+          name: "item_1",
+          text: "server joined text",
+          parent_id: null,
+          index: 0,
+          hidden: false,
+          owner: "guest_1",
+          writers: [],
+          has_children: false
+        }
+      ];
+    });
+    const element = document.createElement("woo-outliner-tree") as WooOutlinerTreeElement & { hydrate: () => Promise<void>; subject: string };
+    document.body.append(element);
+    element.subject = "the_outline";
+    element.woo = ctx({}, {
+      refs: ["the_outline", "item_1"],
+      directCall,
+      projections: {
+        the_outline: { id: "the_outline", name: "Outline", props: {}, catalogState: {} },
+        item_1: {
+          id: "item_1",
+          name: "item_1",
+          parent: "$outline_item",
+          ancestors: ["$note", "$outline_item"],
+          owner: "guest_1",
+          location: "the_outline",
+          props: { text: "", parent: null, position: 1, hidden: false },
+          catalogState: {}
+        }
+      }
+    });
+
+    await element.hydrate();
+    await flushPromises();
+
+    expect(directCall).toHaveBeenCalledTimes(1);
+    expect(element.querySelector("[data-outliner-row]")?.textContent).toContain("server joined text");
+    expect(element.querySelector("[data-outliner-row]")?.textContent).not.toContain("(empty)");
+  });
+
+  it("does not replace observation-sourced item text with a projection row that omits text", () => {
+    const directCall = vi.fn(async () => []);
+    const element = document.createElement("woo-outliner-tree") as WooOutlinerTreeElement & { data: OutlinerData; syncFromProjection: () => void; subject: string };
+    document.body.append(element);
+    element.subject = "the_outline";
+    element.woo = ctx({}, {
+      refs: ["the_outline", "item_1"],
+      directCall,
+      projections: {
+        the_outline: { id: "the_outline", name: "Outline", props: {}, catalogState: {} },
+        item_1: {
+          id: "item_1",
+          name: "item_1",
+          parent: "$outline_item",
+          ancestors: ["$note", "$outline_item"],
+          owner: "guest_1",
+          location: "the_outline",
+          props: { parent: null, position: 1, hidden: false },
+          catalogState: {}
+        }
+      }
+    });
+    element.data = {
+      outlinerId: "the_outline",
+      outlinerName: "Outline",
+      items: [
+        { id: "item_1", name: "item_1", text: "observation text", parent_id: null, index: 0, hidden: false, owner: "guest_1", writers: [], has_children: false }
+      ],
+      focus: null,
+      actor: "guest_1",
+      roster: []
+    };
+
+    element.syncFromProjection();
+
+    expect(directCall).not.toHaveBeenCalled();
+    expect(element.querySelector("[data-outliner-row]")?.textContent).toContain("observation text");
+    expect(element.querySelector("[data-outliner-row]")?.textContent).not.toContain("(empty)");
+  });
+
+  it("hydrates blank item text when projection rows arrive after the initial empty hydrate", async () => {
+    const refs = ["the_outline"];
+    const projections: Record<string, any> = {
+      the_outline: { id: "the_outline", name: "Outline", props: {}, catalogState: {} }
+    };
+    const directCall = vi.fn(async () => [
+      {
+        id: "item_1",
+        name: "item_1",
+        text: "late projection text",
+        parent_id: null,
+        index: 0,
+        hidden: false,
+        owner: "guest_1",
+        writers: [],
+        has_children: false
+      }
+    ]);
+    const element = document.createElement("woo-outliner-tree") as WooOutlinerTreeElement & { hydrate: () => Promise<void>; syncFromProjection: () => void; subject: string };
+    document.body.append(element);
+    element.subject = "the_outline";
+    element.woo = ctx({}, { refs, projections, directCall });
+
+    await element.hydrate();
+    expect(directCall).not.toHaveBeenCalled();
+
+    refs.push("item_1");
+    projections.item_1 = {
+      id: "item_1",
+      name: "item_1",
+      parent: "$outline_item",
+      ancestors: ["$note", "$outline_item"],
+      owner: "guest_1",
+      location: "the_outline",
+      props: { text: "", parent: null, position: 1, hidden: false },
+      catalogState: {}
+    };
+    element.syncFromProjection();
+    await flushPromises();
+
+    expect(directCall).toHaveBeenCalledTimes(1);
+    expect(element.querySelector("[data-outliner-row]")?.textContent).toContain("late projection text");
+    expect(element.querySelector("[data-outliner-row]")?.textContent).not.toContain("(empty)");
   });
 
   it("does not classify unrelated projected objects as outline rows by props alone", async () => {
@@ -212,6 +348,86 @@ describe("outliner-tree presence aside", () => {
 
     expect(directCall).not.toHaveBeenCalled();
     expect(element.querySelector("[data-outliner-row]")?.textContent).toContain("applied row");
+  });
+
+  it("hydrates readable item text from list_items when generic projection omits it", async () => {
+    const directCall = vi.fn(async () => [
+      {
+        id: "item_1",
+        name: "item_1",
+        text: "authoritative row",
+        parent_id: null,
+        index: 0,
+        hidden: false,
+        owner: "guest_1",
+        writers: [],
+        has_children: false
+      }
+    ]);
+    const element = document.createElement("woo-outliner-tree") as WooOutlinerTreeElement & { hydrate: () => Promise<void>; subject: string };
+    element.subject = "the_outline";
+    element.woo = ctx({}, {
+      refs: ["item_1"],
+      directCall,
+      projections: {
+        the_outline: { id: "the_outline", name: "Outline", props: {}, catalogState: {} },
+        item_1: {
+          id: "item_1",
+          name: "item_1",
+          parent: "$outline_item",
+          ancestors: ["$note", "$outline_item"],
+          owner: "guest_1",
+          location: "the_outline",
+          props: { parent: null, position: 0, hidden: false },
+          catalogState: {}
+        }
+      }
+    });
+    document.body.append(element);
+
+    await element.hydrate();
+    await flushPromises();
+
+    expect(directCall).toHaveBeenCalledTimes(1);
+    expect(directCall).toHaveBeenCalledWith("the_outline", "list_items", []);
+    const text = element.querySelector(".outliner-rows")?.textContent ?? "";
+    expect(text).toContain("authoritative row");
+    expect(text).not.toContain("(empty)");
+  });
+
+  it("preserves observation text when a later generic projection lacks text", () => {
+    const directCall = vi.fn(async () => []);
+    const element = document.createElement("woo-outliner-tree") as WooOutlinerTreeElement & {
+      applyObservation: (observation: Record<string, unknown>) => void;
+      subject: string;
+      syncFromProjection: () => void;
+    };
+    element.subject = "the_outline";
+    element.woo = ctx({}, {
+      refs: ["item_1"],
+      directCall,
+      projections: {
+        the_outline: { id: "the_outline", name: "Outline", props: {}, catalogState: {} },
+        item_1: {
+          id: "item_1",
+          name: "item_1",
+          parent: "$outline_item",
+          ancestors: ["$note", "$outline_item"],
+          owner: "guest_1",
+          location: "the_outline",
+          props: { parent: null, position: 0, hidden: false },
+          catalogState: {}
+        }
+      }
+    });
+
+    element.applyObservation({ type: "outline_item_added", outliner: "the_outline", item: "item_1", parent_id: null, index: 0, text: "observed row", actor: "guest_1" });
+    element.syncFromProjection();
+
+    expect(directCall).not.toHaveBeenCalled();
+    const text = element.querySelector(".outliner-rows")?.textContent ?? "";
+    expect(text).toContain("observed row");
+    expect(text).not.toContain("(empty)");
   });
 
   it("shows the root add form only after outliner presence is ready", () => {

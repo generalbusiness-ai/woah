@@ -1022,6 +1022,58 @@ export class ProjectionFieldFiller {
   }
 }
 
+export type CoalescedViewHydratorOptions<T> = {
+  read: (subject: string, signature: string) => Promise<T>;
+  apply: (value: T, subject: string, signature: string) => void;
+  onError?: (error: unknown, subject: string, signature: string) => void;
+  completeOnError?: boolean;
+};
+
+// Catalog UI views often render immediately from cheap structural projection,
+// then need one catalog verb read to fill semantic display fields that generic
+// projection cannot safely express (for example readable note text). This helper
+// owns only the coalescing/memoization; each catalog still owns its view shape.
+export class CoalescedViewHydrator<T = unknown> {
+  private inFlight = new Set<string>();
+  private completed = new Set<string>();
+  private generation = 0;
+
+  constructor(private options: CoalescedViewHydratorOptions<T>) {}
+
+  ensure(subject: string, signature: string): void {
+    if (!subject || !signature) return;
+    const key = viewHydrationKey(subject, signature);
+    if (this.completed.has(key) || this.inFlight.has(key)) return;
+    this.inFlight.add(key);
+    const generation = this.generation;
+    void this.options.read(subject, signature)
+      .then((value) => {
+        if (generation !== this.generation) return;
+        this.completed.add(key);
+        this.options.apply(value, subject, signature);
+      })
+      .catch((error) => {
+        if (generation !== this.generation) return;
+        if (this.options.completeOnError === true) this.completed.add(key);
+        this.options.onError?.(error, subject, signature);
+      })
+      .finally(() => {
+        if (generation !== this.generation) return;
+        this.inFlight.delete(key);
+      });
+  }
+
+  reset(): void {
+    this.generation += 1;
+    this.inFlight.clear();
+    this.completed.clear();
+  }
+}
+
+function viewHydrationKey(subject: string, signature: string): string {
+  return `${subject}\u0000${signature}`;
+}
+
 export function registerCoreObservationHandlers(registry: ObservationRegistry) {
   registry.observation({
     types: ["taken", "dropped"],
