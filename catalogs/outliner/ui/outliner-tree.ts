@@ -58,6 +58,10 @@ export type OutlinerItem = {
   has_children: boolean;
 };
 
+type ProjectedOutlinerItem = OutlinerItem & {
+  textKnown: boolean;
+};
+
 // One row delivered by $outliner:room_roster — the same shape chat/dubspace
 // use. `presence` ("online" / "idle" / "offline") drives the dot class.
 export type OutlinerRosterRow = {
@@ -106,6 +110,11 @@ export class WooOutlinerTreeElement extends HTMLElement {
   private addingChild = false;
   private dragSourceId: string | null = null;
   private hydrateAttempted = false;
+  private hydrateSequence = 0;
+  private projectionMissingItemText = false;
+  private projectionMissingItemTextSignature = "";
+  private itemTextHydratePendingSignature: string | null = null;
+  private itemTextHydratedSignature: string | null = null;
   private bound = false;
 
   set data(value: OutlinerData) {
@@ -162,6 +171,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
       roster: this.rosterFromProjection()
     };
     this.render();
+    if (this.projectionMissingItemText) this.requestItemsFromList();
   }
 
   applyObservation(observation: Record<string, unknown>): void {
@@ -224,36 +234,106 @@ export class WooOutlinerTreeElement extends HTMLElement {
     if (!this.woo || !this.subject) return this.model.items;
     const rows = this.woo.neighborhood.refs
       .map((ref) => this.outlinerItemFromProjection(ref))
-      .filter((item): item is OutlinerItem => item !== null);
-    if (rows.length === 0 && this.model.items.length > 0) return this.model.items;
-    if (this.model.items.length === 0) return orderedOutlinerItems(rows);
+      .filter((item): item is ProjectedOutlinerItem => item !== null);
+    const items = rows.map(({ textKnown: _textKnown, ...row }) => row);
+    if (items.length === 0 && this.model.items.length > 0) {
+      this.updateProjectionMissingItemText([]);
+      return this.model.items;
+    }
+    if (this.model.items.length === 0) {
+      const ordered = orderedOutlinerItems(items);
+      this.updateProjectionMissingItemText(ordered.filter((item) => item.text === "").map((item) => item.id));
+      return ordered;
+    }
     // Projection sync can run before the newly applied item projection is
     // present in the neighborhood. Preserve rows learned from sequenced
-    // observations so a stale projection snapshot cannot hide a committed
-    // add while the projection catches up.
+    // observations so a stale projection snapshot cannot hide a committed add
+    // or replace catalog-readable note text with the generic projection's
+    // "not present" view.
     const byId = new Map(this.model.items.map((item) => [item.id, { ...item }]));
-    for (const row of rows) byId.set(row.id, { ...(byId.get(row.id) ?? {}), ...row });
+    const missingTextIds: string[] = [];
+    for (const projected of rows) {
+      const { textKnown, ...row } = projected;
+      const previous = byId.get(row.id);
+      const projectionCarriesDisplayText = textKnown && row.text !== "";
+      const text = projectionCarriesDisplayText ? row.text : previous?.text ?? row.text;
+      if (text === "") missingTextIds.push(row.id);
+      byId.set(row.id, {
+        ...(previous ?? {}),
+        ...row,
+        text
+      });
+    }
+    this.updateProjectionMissingItemText(missingTextIds);
     return orderedOutlinerItems([...byId.values()]);
   }
 
-  private outlinerItemFromProjection(ref: string): OutlinerItem | null {
+  private updateProjectionMissingItemText(ids: string[]): void {
+    const signature = [...new Set(ids)].sort().join("|");
+    this.projectionMissingItemTextSignature = signature;
+    this.projectionMissingItemText = signature !== "";
+  }
+
+  private outlinerItemFromProjection(ref: string): ProjectedOutlinerItem | null {
     const projected = this.woo?.observe(ref);
     if (!projected || projected.location !== this.subject) return null;
     const props = projected.props ?? {};
     const ancestors = Array.isArray(projected.ancestors) ? projected.ancestors.map(String) : [];
     const looksLikeOutlineItem = projected.parent === "$outline_item" || ancestors.includes("$outline_item");
     if (!looksLikeOutlineItem) return null;
+    const textKnown = typeof props.text === "string";
     return {
       id: projected.id,
       name: typeof projected.name === "string" ? projected.name : projected.id,
-      text: typeof props.text === "string" ? props.text : "",
+      text: textKnown ? props.text as string : "",
       parent_id: outlinerParent(props.parent),
       index: outlinerIndex(props.position, 0),
       hidden: props.hidden === true,
       owner: typeof projected.owner === "string" ? projected.owner : "",
       writers: Array.isArray(props.writers) ? props.writers.filter((item): item is string => typeof item === "string") : [],
-      has_children: false
+      has_children: false,
+      textKnown
     };
+  }
+
+  private requestItemsFromList(): void {
+    if (!this.woo || !this.subject || !this.projectionMissingItemTextSignature) return;
+    const signature = this.projectionMissingItemTextSignature;
+    if (this.itemTextHydratePendingSignature === signature || this.itemTextHydratedSignature === signature) return;
+    const sequence = ++this.hydrateSequence;
+    const subject = this.subject;
+    this.itemTextHydratePendingSignature = signature;
+    void this.refreshItemsFromList(sequence, subject, signature);
+  }
+
+  private async refreshItemsFromList(sequence: number, subject: string, signature: string): Promise<void> {
+    if (!this.woo || this.subject !== subject) return;
+    try {
+      const result = await this.woo.directCall(subject, "list_items", []);
+      if (this.subject !== subject || this.hydrateSequence !== sequence) return;
+      const items = normalizeOutlinerItems(result);
+      if (!items) return;
+      this.model = {
+        ...this.model,
+        items
+      };
+      if (this.selectedId && !items.some((item) => item.id === this.selectedId)) {
+        this.selectedId = null;
+        this.addingChild = false;
+      }
+      this.projectionMissingItemText = false;
+      this.projectionMissingItemTextSignature = "";
+      this.itemTextHydratedSignature = signature;
+      this.render();
+    } catch {
+      // The projection still gives the tree shape. A failed authoritative
+      // display read should not break local editing or leave a rejected
+      // promise in the console; the next mount or accepted observation can
+      // retry.
+      if (this.itemTextHydratedSignature === signature) this.itemTextHydratedSignature = null;
+    } finally {
+      if (this.itemTextHydratePendingSignature === signature) this.itemTextHydratePendingSignature = null;
+    }
   }
 
   private rosterFromProjection(): OutlinerRosterRow[] {
@@ -902,6 +982,29 @@ function outlinerParent(value: unknown): string | null {
 function outlinerIndex(value: unknown, fallback: number): number {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? Math.max(0, Math.floor(numeric)) : fallback;
+}
+
+function normalizeOutlinerItems(value: unknown): OutlinerItem[] | null {
+  if (!Array.isArray(value)) return null;
+  const items: OutlinerItem[] = [];
+  value.forEach((entry, fallbackIndex) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return;
+    const row = entry as Record<string, unknown>;
+    const id = typeof row.id === "string" && row.id ? row.id : "";
+    if (!id) return;
+    items.push({
+      id,
+      name: typeof row.name === "string" ? row.name : id,
+      text: typeof row.text === "string" ? row.text : "",
+      parent_id: outlinerParent(row.parent_id),
+      index: outlinerIndex(row.index, fallbackIndex),
+      hidden: row.hidden === true,
+      owner: typeof row.owner === "string" ? row.owner : "",
+      writers: Array.isArray(row.writers) ? row.writers.filter((item): item is string => typeof item === "string") : [],
+      has_children: row.has_children === true
+    });
+  });
+  return orderedOutlinerItems(items);
 }
 
 function orderedOutlinerItems(items: OutlinerItem[]): OutlinerItem[] {

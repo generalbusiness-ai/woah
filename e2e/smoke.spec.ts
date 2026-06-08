@@ -173,6 +173,10 @@ async function openFreshGuestChat(page: Page, request: APIRequestContext, token:
   await expect(page.locator("[data-chat-input]")).toBeFocused({ timeout: 5_000 });
 }
 
+function cssAttrValue(value: string): string {
+  return value.replace(/["\\]/g, "\\$&");
+}
+
 function expectNoBrowserExecutionFallback(diagnostics: V2Diagnostics): void {
   expect(diagnostics.localFallbacks, `local fallbacks: ${diagnostics.localFallbacks.join("\n")}`).toEqual([]);
   expect(diagnostics.localDelegations, `local delegations: ${diagnostics.localDelegations.join("\n")}`).toEqual([]);
@@ -552,25 +556,24 @@ test("generic tool view mounts a catalog space-workspace frame", async ({ page }
 });
 
 test("outliner displays items added via the UI", async ({ page }) => {
-  // Regression: outliner-tree hydrate must use `woo.directCall` (returns the
-  // verb's result) — not `woo.call` (fire-and-forget, returns the request
-  // id). If list_items resolves to a UUID string, `Array.isArray(items)` is
-  // false and the tree renders with zero rows. Clicking a twisty then makes
-  // the (already-empty) tree look like it "disappeared." Also asserts the
-  // observation reducer's hydrate isn't dropped while the initial hydrate is
-  // still in flight, and that direct reads see post-commit state — the
-  // dev relay's live_session_serialized snapshot must rebase on accepted
-  // sequenced commits, otherwise the new item appears written but is
-  // invisible to the next list_items.
+  // Regression: item text can be absent from generic projection even when the
+  // row structure is present, because $note readability is catalog-defined.
+  // The tree must preserve observation-sourced text across projection refreshes
+  // and use list_items on reload to recover readable joined rows; otherwise
+  // every item briefly appears correct and then refreshes to "(empty)".
   const tag = `e2e${Math.random().toString(36).slice(2, 8)}`;
   const parentText = `parent-${tag}`;
   const childText = `child-${tag}`;
-  await page.goto("/objects/the_outline?view=tool");
+  await page.goto("/");
   await continueAsGuestIfPrompted(page);
   await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
-  const tree = page.locator("woo-outliner-tree[data-generic-tool-workspace]");
+  await page.getByRole("button", { name: "Outliner" }).click();
+  await expect(page.getByRole("button", { name: "Outliner" })).toHaveClass(/active/);
+  const tree = page.locator("woo-outliner-tree[data-outliner-tree]");
   await expect(tree).toBeVisible();
-  await tree.getByRole("button", { name: "Enter" }).click();
+  // The named Outliner tab auto-enters through the shared tool lifecycle when
+  // selected. Wait for that same path rather than racing it with a second
+  // manual Enter click.
   await expect(tree.getByRole("button", { name: "Leave" })).toBeVisible({ timeout: 5_000 });
 
   // Add a root-level item via the form. Use keyboard Enter — Playwright
@@ -581,13 +584,54 @@ test("outliner displays items added via the UI", async ({ page }) => {
   await addInput.press("Enter");
   const parentRow = tree.locator(".outliner-row").filter({ hasText: parentText });
   await expect(parentRow).toHaveCount(1, { timeout: 5_000 });
+  const parentId = await parentRow.first().getAttribute("data-id");
+  expect(parentId, "new parent row id").toBeTruthy();
+
+  // Add a child as well. The regression this covers appears only after the
+  // accepted add observation is followed by a projection refresh: the item is
+  // initially visible with text, then the refresh used to replace every row's
+  // missing text field with "(empty)".
+  await parentRow.first().click();
+  await parentRow.first().getByRole("button", { name: "add child" }).click();
+  const childInput = tree.locator("[data-outliner-add-child] input[name=text]");
+  await childInput.fill(childText);
+  await childInput.press("Enter");
+  const childRow = tree.locator(".outliner-row").filter({ hasText: childText });
+  await expect(childRow).toHaveCount(1, { timeout: 5_000 });
+  const childId = await childRow.first().getAttribute("data-id");
+  expect(childId, "new child row id").toBeTruthy();
 
   // Add a second item to confirm the observation reducer's coalesced
   // hydrate picks up the new row even while a prior hydrate is in flight.
+  await tree.getByRole("button", { name: "clear selection" }).click();
+  await expect(addInput).toBeVisible({ timeout: 5_000 });
   await addInput.fill(`${parentText}-b`);
   await addInput.press("Enter");
-  await expect(tree.locator(".outliner-row").filter({ hasText: `${parentText}-b` })).toHaveCount(1, { timeout: 5_000 });
-  void childText;
+  const secondRow = tree.locator(".outliner-row").filter({ hasText: `${parentText}-b` });
+  await expect(secondRow).toHaveCount(1, { timeout: 5_000 });
+  const secondId = await secondRow.first().getAttribute("data-id");
+  expect(secondId, "second root row id").toBeTruthy();
+
+  for (const [id, text] of [[parentId, parentText], [childId, childText], [secondId, `${parentText}-b`]] as const) {
+    await expect.poll(async () => {
+      const row = tree.locator(`[data-outliner-row][data-id="${cssAttrValue(String(id))}"] .outliner-text`);
+      return await row.textContent();
+    }, { timeout: 5_000 }).toBe(text);
+  }
+  await expect(tree.locator(".outliner-row").filter({ hasText: "(empty)" })).toHaveCount(0);
+
+  await page.reload();
+  await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
+  await expect(page.getByRole("button", { name: "Outliner" })).toHaveClass(/active/);
+  const reloadedTree = page.locator("woo-outliner-tree[data-outliner-tree]");
+  await expect(reloadedTree).toBeVisible({ timeout: 5_000 });
+  for (const [id, text] of [[parentId, parentText], [childId, childText], [secondId, `${parentText}-b`]] as const) {
+    await expect.poll(async () => {
+      const row = reloadedTree.locator(`[data-outliner-row][data-id="${cssAttrValue(String(id))}"] .outliner-text`);
+      return await row.textContent();
+    }, { timeout: 10_000 }).toBe(text);
+  }
+  await expect(reloadedTree.locator(".outliner-row").filter({ hasText: "(empty)" })).toHaveCount(0);
 });
 
 test("space chat panel bottoms are visually aligned", async ({ page, request }) => {
@@ -730,9 +774,13 @@ test("narrow layout keeps nav tabs on one row", async ({ page }) => {
 
 test("pinboard supports shared text notes", async ({ page }) => {
   const appliedVerbs: string[] = [];
+  const invalidations: string[] = [];
   const v2TransportErrors: string[] = [];
   const expectNoV2TransportErrors = () => {
     expect(v2TransportErrors, v2TransportErrors.join("\n")).toEqual([]);
+  };
+  const expectNoV2Invalidations = () => {
+    expect(invalidations, invalidations.join("\n")).toEqual([]);
   };
   page.on("console", (msg) => {
     const text = msg.text();
@@ -746,10 +794,17 @@ test("pinboard supports shared text notes", async ({ page }) => {
   await page.exposeFunction("recordPinboardAppliedFrame", (verb: string) => {
     appliedVerbs.push(verb);
   });
+  await page.exposeFunction("recordPinboardInvalidation", (detail: unknown) => {
+    invalidations.push(JSON.stringify(detail));
+  });
   await page.addInitScript(() => {
     window.addEventListener("woo.v2.applied_frame", (event) => {
       const verb = String((event as CustomEvent<any>).detail?.applied?.message?.verb ?? "");
       void (window as unknown as { recordPinboardAppliedFrame: (verb: string) => Promise<void> }).recordPinboardAppliedFrame(verb);
+    });
+    window.addEventListener("woo.v2.local_turn_invalidated", (event) => {
+      void (window as unknown as { recordPinboardInvalidation: (detail: unknown) => Promise<void> })
+        .recordPinboardInvalidation((event as CustomEvent<unknown>).detail);
     });
   });
 
@@ -760,10 +815,14 @@ test("pinboard supports shared text notes", async ({ page }) => {
   await page.getByRole("button", { name: "Pinboard" }).click();
   await expect(page.getByRole("button", { name: "Pinboard" })).toHaveClass(/active/);
   await expect(page.locator(".pinboard-stage")).toBeVisible();
-  await expect.poll(() => appliedVerbs, { timeout: 5_000 }).toContain("enter");
-  expectNoV2TransportErrors();
   await expect(page.locator("[data-pinboard-map]")).toBeVisible();
+  await expect.poll(async () => {
+    if (invalidations.length > 0) return invalidations.join("\n");
+    return await page.getByRole("button", { name: "Leave" }).count() > 0 ? "ready" : "pending";
+  }, { timeout: 5_000 }).toBe("ready");
+  expectNoV2Invalidations();
   await expect(page.getByRole("button", { name: "Leave" })).toBeVisible();
+  expectNoV2TransportErrors();
   const stagePanel = page.locator(".pinboard-stage-panel");
   await expect.poll(async () => stagePanel.evaluate((panel) => panel.getBoundingClientRect().height)).toBeGreaterThan(300);
   const firstPaintStageHeights: number[] = [];
@@ -791,29 +850,41 @@ test("pinboard supports shared text notes", async ({ page }) => {
   await miniChatInput.fill("look");
   await miniChatInput.press("Enter");
   await expect(page.locator("woo-space-chat-panel .chat-line.input")).toContainText("look");
-  await expect(page.locator("woo-space-chat-panel")).toContainText("Pinboard has 0 notes on it.");
+  await expect(page.locator("woo-space-chat-panel")).toContainText(/Pinboard has \d+ notes? on it\./);
 
-  await page.locator("[data-pinboard-new-text]").fill("Bring the towel to the hot tub");
+  const initialPinCount = await page.locator(".pin-note").count();
+  const towelText = `Bring the towel to the hot tub ${crypto.randomUUID()}`;
+  const mugText = `Bring the mug too ${crypto.randomUUID()}`;
+  await page.locator("[data-pinboard-new-text]").fill(towelText);
   await page.locator("[data-pinboard-new-color]").selectOption("blue");
   await page.locator("[data-pinboard-create]").getByRole("button", { name: "Add Note" }).click();
   await expect.poll(() => appliedVerbs, { timeout: 5_000 }).toContain("add_note");
   expectNoV2TransportErrors();
-  await expect(page.locator(".pin-note")).toHaveCount(1);
-  await expect(page.locator(".pinboard-stage")).toContainText("Bring the towel to the hot tub");
+  await expect(page.locator(".pin-note")).toHaveCount(initialPinCount + 1);
+  await expect(page.locator(".pinboard-stage")).toContainText(towelText);
 
-  await page.locator("[data-pinboard-new-text]").fill("Bring the mug too");
+  await page.locator("[data-pinboard-new-text]").fill(mugText);
   await page.locator("[data-pinboard-new-color]").selectOption("yellow");
   await page.locator("[data-pinboard-create]").getByRole("button", { name: "Add Note" }).click();
-  await expect(page.locator(".pin-note")).toHaveCount(2);
-  await expect(page.locator(".pinboard-stage")).toContainText("Bring the towel to the hot tub");
-  await expect(page.locator(".pinboard-stage")).toContainText("Bring the mug too");
+  await expect(page.locator(".pin-note")).toHaveCount(initialPinCount + 2);
+  await expect(page.locator(".pinboard-stage")).toContainText(towelText);
+  await expect(page.locator(".pinboard-stage")).toContainText(mugText);
 
-  await page.locator("[data-pin-note-text]").first().fill("Towel is ready");
-  await page.locator("[data-pin-note-text]").first().blur();
+  const towelNoteId = await page.locator("[data-pin-note]").evaluateAll((notes, text) => {
+    for (const note of notes) {
+      const input = note.querySelector<HTMLTextAreaElement>("[data-pin-note-text]");
+      if (input?.value === text) return note.getAttribute("data-pin-note");
+    }
+    return null;
+  }, towelText);
+  expect(towelNoteId, `could not find created Pinboard note with text: ${towelText}`).not.toBeNull();
+  const towelNoteText = page.locator(`[data-pin-note-text="${cssAttrValue(String(towelNoteId))}"]`);
+  await towelNoteText.fill("Towel is ready");
+  await towelNoteText.blur();
   await expect.poll(() => appliedVerbs, { timeout: 5_000 }).toContain("set_text");
   expectNoV2TransportErrors();
   await expect(page.locator(".pinboard-stage")).toContainText("Towel is ready");
-  await expect(page.locator(".pinboard-stage")).toContainText("Bring the mug too");
+  await expect(page.locator(".pinboard-stage")).toContainText(mugText);
   await page.getByRole("button", { name: "Leave" }).click();
   await expect(page.getByRole("button", { name: "Enter" })).toBeVisible();
   expectNoV2TransportErrors();

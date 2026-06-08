@@ -631,6 +631,7 @@ export class WooTasksKanbanElement extends HTMLElement {
   // refresh path the polling timer used to drive every 3s.
   private _woo?: WooContext;
   private _subject?: string;
+  private companionVisible = false;
   get woo(): WooContext | undefined { return this._woo; }
   set woo(value: WooContext | undefined) {
     this._woo = value;
@@ -640,6 +641,13 @@ export class WooTasksKanbanElement extends HTMLElement {
   set subject(value: string | undefined) {
     this._subject = value;
     if (this.isConnected && this._woo && value) this.scheduleRefresh();
+  }
+  get showCompanion(): boolean { return this.companionVisible; }
+  set showCompanion(value: boolean) {
+    const next = value === true;
+    if (this.companionVisible === next) return;
+    this.companionVisible = next;
+    if (this.isConnected) this.render();
   }
   private model: KanbanData = emptyKanbanData();
   private boundClick = false;
@@ -1681,7 +1689,7 @@ export class WooTasksKanbanElement extends HTMLElement {
       toolbar: this.renderHeader(registryName || "Tasks"),
       layoutClass: "woo-tasks-layout",
       layoutBody,
-      showChat: true
+      showChat: this.companionVisible
     });
     restoreAmbientCompanionPanel(this, preservedPanel);
     this.dispatchEvent(new CustomEvent("woo-tasks-rendered", { bubbles: true }));

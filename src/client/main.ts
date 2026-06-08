@@ -267,7 +267,9 @@ const TOOL_TAB_DEFINITIONS: ToolTabDefinition[] = [
     emptyMessage: "No tasks UI is registered for this registry.",
     elementSelector: "[data-tasks-board]",
     elementTagAttrs: (subject) => `data-tasks-board data-tasks-registry="${escapeHtml(subject)}"`,
-    mount: () => bindTasks()
+    mount: () => bindTasks(),
+    enter: () => enterTasks(),
+    leave: (done) => leaveTasks(done)
   },
   {
     tab: "outliner",
@@ -282,7 +284,8 @@ const TOOL_TAB_DEFINITIONS: ToolTabDefinition[] = [
     elementSelector: "[data-outliner-tree]",
     elementTagAttrs: (subject) => `data-outliner-tree data-outliner-subject="${escapeHtml(subject)}"`,
     mount: () => bindOutliner(),
-    enter: () => enterOutliner()
+    enter: () => enterOutliner(),
+    leave: (done) => leaveOutliner(done)
   }
 ];
 const TOOL_TABS = TOOL_TAB_DEFINITIONS.map((definition) => definition.tab);
@@ -516,7 +519,7 @@ function beginPendingToolEnter(space: string) {
   // change. Bound the gate so tool mutation controls cannot stay disabled.
   pendingToolEnterTimers.set(space, window.setTimeout(() => {
     clearPendingToolEnter(space);
-    if (state.tab === "pinboard" || state.tab === "outliner") render();
+    if (isToolTab(state.tab)) render();
   }, TOOL_ENTER_PENDING_TIMEOUT_MS));
 }
 
@@ -2250,9 +2253,10 @@ function actorPresenceList(actor: string): string[] {
   return [];
 }
 
-function actorPresentInSpace(space: string) {
+function actorPresentInSpace(space: string, catalogPresent: readonly string[] = []) {
   const actor = state.actor;
-  if (!actor) return false;
+  if (!actor || !space) return false;
+  if (catalogPresent.includes(actor)) return true;
   if (sessionActiveScope(state.scopedProjection?.session) === space) return true;
   if (state.scopedProjection?.here?.id === space && state.chatPresent.includes(actor)) return true;
   return actorPresenceList(actor).includes(space);
@@ -2794,9 +2798,7 @@ function bindCommon() {
     button.addEventListener("click", async () => {
       const next = button.dataset.tab as AppTab;
       if (next !== "ide") void ensureScopedProjectionReady();
-      const wasDifferent = state.tab !== next;
       setTab(next, { mode: "push" }, () => {
-        if (!wasDifferent) return;
         toolDefinition(next)?.enter?.();
       });
     });
@@ -2889,6 +2891,7 @@ function mountDubspaceComponent() {
   const spaceId = typeof meta.space === "string" ? meta.space : "";
   const space = spaceId ? projectedObjectView(spaceId) ?? dub[spaceId] : null;
   const operators = dubspaceOperators();
+  const inSpace = actorPresentInSpace(spaceId, operators);
   const lines = chatLinesForSpace(spaceId);
   element.subject = spaceId;
   element.woo = createChatWooContext(spaceId, [...chatLineActorRefs(lines), ...operators]);
@@ -2903,13 +2906,13 @@ function mountDubspaceComponent() {
     drum: meta.drum ?? "",
     operators,
     actor: state.actor ?? null,
-    inSpace: Boolean(state.actor && operators.includes(state.actor)),
+    inSpace,
     canSend: canSendDubspaceV2(),
     audioOn: state.audioOn,
     cueSlots: state.cueSlots,
     cuePlaying: state.cuePlaying
   }, () => {
-    if (spaceId && operators.includes(state.actor ?? "")) mountAmbientCompanion(element, spaceId);
+    if (spaceId && inSpace) mountAmbientCompanion(element, spaceId);
   });
   bindDubspaceComponentEvents(element);
 }
@@ -3022,59 +3025,40 @@ function bindDubspace() {
 
 function enterDubspace() {
   const space = dubspaceSpace();
-  if (!space || !canSendDubspaceV2()) return;
-  v2Turn({
-    scope: space,
-    route: "direct",
-    target: space,
-    verb: "enter",
-    args: [],
-    persistence: "durable",
+  enterRoomToolSpace({
+    tab: "dubspace",
+    space,
+    canSend: canSendDubspaceV2,
+    isPresent: () => actorPresentInSpace(space, dubspaceOperators()),
+    onAlreadyPresent: () => {
+      void ensureScopedOverlayForTab("dubspace").then(() => {
+        if (state.tab === "dubspace") render();
+      });
+    },
     onResult: (result) => {
       setDubspaceOperators(result);
       void ensureScopedOverlayForTab("dubspace").then(() => {
         if (state.tab === "dubspace") render();
       });
-      requestSpaceChatFocus(space);
     },
     onError: () => {
       removeDubspaceOperator(state.actor);
-      if (state.tab === "dubspace") render();
     }
   });
 }
 
 function leaveDubspace(done?: () => void) {
   const space = dubspaceSpace();
-  if (!space || !canSendDubspaceV2()) {
-    done?.();
-    return;
-  }
-  if (!dubspaceOperators().includes(state.actor ?? "")) {
-    done?.();
-    return;
-  }
-  // Release the tab switch immediately; the world-side `leave` is best-effort
-  // and proceeds asynchronously. Previously `done?.()` only fired from the
-  // turn's onResult callback, so an errored or stalled leave turn permanently
-  // trapped state.tab at "dubspace" and every subsequent nav click was a no-op.
-  done?.();
-  v2Turn({
-    scope: space,
-    route: "direct",
-    target: space,
-    verb: "leave",
-    args: [],
-    persistence: "durable",
+  leaveRoomToolSpace({
+    tab: "dubspace",
+    space,
+    canSend: canSendDubspaceV2,
+    isPresent: () => actorPresentInSpace(space, dubspaceOperators()),
     onResult: (result) => {
       setDubspaceOperators(result);
       void ensureScopedOverlayForTab("dubspace");
-      if (state.tab === "dubspace") render();
-    },
-    onError: () => {
-      if (state.tab === "dubspace") render();
     }
-  });
+  }, done);
 }
 
 function setDubspaceOperators(result: any) {
@@ -4292,6 +4276,7 @@ function mountPinboardComponent() {
   const board = pinboard?.board;
   const boardId = board?.id ? String(board.id) : pinboardSpace();
   const present = Array.isArray(pinboard?.present) ? pinboard.present.map(String) : [];
+  const inBoard = actorPresentInSpace(boardId, present);
   const notes = Array.isArray(pinboard?.notes) ? pinboard.notes : [];
   const actorRefs = new Set<string>([...present]);
   for (const note of notes) {
@@ -4309,13 +4294,13 @@ function mountPinboardComponent() {
     viewport: pinboard?.viewport ?? { w: 960, h: 560 },
     view: normalizedPinboardView(),
     actor: state.actor ?? null,
-    inBoard: pinboardActorPresent(),
+    inBoard,
     canSend: canSendPinboardV2(),
     newText: state.pinboardNewText,
     newColor: state.pinboardNewColor,
     viewports: state.pinboardViewports
   }, () => {
-    if (boardId && pinboardActorPresent()) mountAmbientCompanion(element, boardId);
+    if (boardId && inBoard) mountAmbientCompanion(element, boardId);
   });
   bindPinboardComponentEvents(element);
 }
@@ -4420,10 +4405,10 @@ function mountOutlinerComponent() {
   element.entering = pendingToolEnters.has(id);
   element.showCompanion = actorPresentInSpace(id);
   element.syncFromProjection?.();
-  // The outliner renders from the v2 projection and applied-frame
-  // observations. Keep the one-time hydrate hook for standalone component
-  // compatibility, but do not let SPA renders create list_items/room_roster
-  // turns.
+  // The outliner renders cheap structural state from projection on every SPA
+  // render. Its one-time hydrate hook may issue list_items when generic note
+  // text is read-gated out of the projection; keep that outside the render
+  // loop so refreshes do not create repeated read turns.
   if (subjectChanged || element.dataset.outlinerHydrated !== "true") {
     element.dataset.outlinerHydrated = "true";
     void element.hydrate?.();
@@ -4432,20 +4417,22 @@ function mountOutlinerComponent() {
 }
 
 function mountTasksKanbanComponent() {
-  const element = document.querySelector<WooElement & { subject?: string }>("[data-tasks-board]");
+  const element = document.querySelector<WooElement & { subject?: string; showCompanion?: boolean }>("[data-tasks-board]");
   if (!element) return;
   const boardId = tasksSpace();
   if (!boardId) return;
+  const inSpace = actorPresentInSpace(boardId);
   element.subject = boardId;
   element.woo = createChatWooContext(boardId);
+  if ("showCompanion" in element) element.showCompanion = inSpace;
   if (element.dataset.tasksEventsBound !== "true") {
     element.dataset.tasksEventsBound = "true";
     element.addEventListener("woo-tasks-rendered", () => {
       const nextBoardId = tasksSpace();
-      if (nextBoardId) mountAmbientCompanion(element, nextBoardId);
+      if (nextBoardId && actorPresentInSpace(nextBoardId)) mountAmbientCompanion(element, nextBoardId);
     });
   }
-  mountAmbientCompanion(element, boardId);
+  if (inSpace) mountAmbientCompanion(element, boardId);
   requestTasksChatFocusIfPending();
 }
 
@@ -4845,8 +4832,12 @@ function pinboardViewportChanged(next: PinNoteBox & { scale: number }, prev: (Pi
 
 function pinboardActorPresent() {
   const board = pinboardSpace();
-  const activeScope = sessionActiveScope(state.scopedProjection?.session);
-  return Boolean(state.actor && board && activeScope === board);
+  if (!board) return false;
+  const projected = ui.observe(board);
+  const props = projected?.props && typeof projected.props === "object" && !Array.isArray(projected.props)
+    ? projected.props
+    : {};
+  return actorPresentInSpace(board, scopedPinboardPresentActors(board, props));
 }
 
 function panPinboardBy(dx: number, dy: number) {
@@ -4989,104 +4980,153 @@ function bindPinNoteResize(handle: HTMLButtonElement) {
   });
 }
 
-function enterOutliner() {
-  // Outliner mutating verbs (add, hide, move_item, set_item_text, undo, ...)
-  // pass the substrate's presence gate on $space, so the SPA must move the
-  // actor into the_outline before they press Add. Skip when already present
-  // so repeat tab clicks don't trigger redundant enter intents.
-  const space = outlinerSpace();
-  if (!space || !canSendV2Browser()) return;
-  if (actorPresentInSpace(space) || pendingToolEnters.has(space)) {
+type RoomToolLifecycleOptions = {
+  tab: ToolTab;
+  space: string;
+  canSend: () => boolean;
+  route?: "direct" | "sequenced";
+  isPresent?: () => boolean;
+  waitForLeaveResult?: boolean;
+  onAlreadyPresent?: () => void;
+  onResult?: (result: any) => void;
+  onError?: (error: any) => void;
+};
+
+function enterRoomToolSpace(options: RoomToolLifecycleOptions) {
+  const { tab, space, canSend, route = "direct" } = options;
+  // Room-like tool mutating verbs pass the substrate's presence gate on
+  // $space, so the SPA must move the actor into the tool room before it exposes
+  // the companion chat and mutation controls. Keep this shared so new tools do
+  // not drift into bespoke chat/presence semantics.
+  if (!space || !canSend()) return;
+  if ((options.isPresent ?? (() => actorPresentInSpace(space)))() || pendingToolEnters.has(space)) {
+    options.onAlreadyPresent?.();
     requestSpaceChatFocus(space);
     return;
   }
   beginPendingToolEnter(space);
-  if (state.tab === "outliner") render();
-  v2Turn({
+  if (state.tab === tab) render();
+  const turnId = v2Turn({
     scope: space,
-    route: "direct",
+    route,
     target: space,
     verb: "enter",
     args: [],
     persistence: "durable",
-    onResult: () => {
+    onResult: (result) => {
       clearPendingToolEnter(space);
+      applyScopedMoveResult(result);
+      options.onResult?.(result);
+      if (state.tab === tab) render();
       requestSpaceChatFocus(space);
     },
-    onError: () => {
+    onError: (error) => {
       clearPendingToolEnter(space);
-      if (state.tab === "outliner") render();
+      options.onError?.(error);
+      if (state.tab === tab) render();
     }
   });
+  if (!turnId) {
+    const error = new Error(`failed to send ${tab} enter`);
+    clearPendingToolEnter(space);
+    options.onError?.(error);
+    if (state.tab === tab) render();
+  }
+}
+
+function leaveRoomToolSpace(options: RoomToolLifecycleOptions, done?: () => void) {
+  const { tab, space, canSend, route = "direct" } = options;
+  if (!space || !canSend()) {
+    done?.();
+    return;
+  }
+  if (!(options.isPresent ?? (() => actorPresentInSpace(space)))()) {
+    done?.();
+    return;
+  }
+  const waitForLeaveResult = options.waitForLeaveResult === true;
+  if (!waitForLeaveResult) done?.();
+  const turnId = v2Turn({
+    scope: space,
+    route,
+    target: space,
+    verb: "leave",
+    args: [],
+    persistence: "durable",
+    onResult: (result) => {
+      applyScopedMoveResult(result);
+      options.onResult?.(result);
+      if (waitForLeaveResult) done?.();
+      if (state.tab === tab) render();
+    },
+    onError: (error) => {
+      options.onError?.(error);
+      if (waitForLeaveResult) done?.();
+      if (state.tab === tab) render();
+    }
+  });
+  if (!turnId) {
+    const error = new Error(`failed to send ${tab} leave`);
+    options.onError?.(error);
+    if (waitForLeaveResult) done?.();
+    if (state.tab === tab) render();
+  }
+}
+
+function enterTasks() {
+  enterRoomToolSpace({ tab: "tasks", space: tasksSpace(), canSend: canSendV2Browser });
+}
+
+function leaveTasks(done?: () => void) {
+  leaveRoomToolSpace({ tab: "tasks", space: tasksSpace(), canSend: canSendV2Browser }, done);
+}
+
+function enterOutliner() {
+  enterRoomToolSpace({ tab: "outliner", space: outlinerSpace(), canSend: canSendV2Browser });
+}
+
+function leaveOutliner(done?: () => void) {
+  leaveRoomToolSpace({ tab: "outliner", space: outlinerSpace(), canSend: canSendV2Browser }, done);
 }
 
 function enterPinboard() {
   const board = pinboardSpace();
-  if (!board || !canSendPinboardV2()) return;
-  if (pinboardActorPresent() || pendingToolEnters.has(board)) {
-    void ensureScopedOverlayForTab("pinboard").then(() => {
-      if (state.tab === "pinboard") render();
-    });
-    requestSpaceChatFocus(board);
-    return;
-  }
-  beginPendingToolEnter(board);
-  if (state.tab === "pinboard") render();
-  v2Turn({
-    scope: board,
+  enterRoomToolSpace({
+    tab: "pinboard",
+    space: board,
+    canSend: canSendPinboardV2,
     route: "sequenced",
-    target: board,
-    verb: "enter",
-    args: [],
-    persistence: "durable",
+    isPresent: pinboardActorPresent,
+    onAlreadyPresent: () => {
+      void ensureScopedOverlayForTab("pinboard").then(() => {
+        if (state.tab === "pinboard") render();
+      });
+    },
     onResult: (result) => {
-      clearPendingToolEnter(board);
-      applyScopedMoveResult(result);
       setPinboardPresent(result);
       // The committed frame updates the projection; forcing list_notes here
       // puts the next user turn behind a redundant read storm.
-      if (state.tab === "pinboard") render();
-      requestSpaceChatFocus(board);
-    },
-    onError: () => {
-      clearPendingToolEnter(board);
-      if (state.tab === "pinboard") render();
     }
   });
 }
 
 function leavePinboard(done?: () => void) {
   const board = pinboardSpace();
-  if (!board || !canSendPinboardV2()) {
-    done?.();
-    return;
-  }
-  if (!pinboardActorPresent()) {
-    done?.();
-    return;
-  }
-  v2Turn({
-    scope: board,
+  leaveRoomToolSpace({
+    tab: "pinboard",
+    space: board,
+    canSend: canSendPinboardV2,
     route: "sequenced",
-    target: board,
-    verb: "leave",
-    args: [],
-    persistence: "durable",
+    isPresent: pinboardActorPresent,
+    waitForLeaveResult: true,
     onResult: (result) => {
-      applyScopedMoveResult(result);
       setPinboardPresent(result);
       clearPinboardViewports();
-      done?.();
       // Leaving removes this session from the board viewport snapshot; force the
       // overlay refresh so stale self-presence does not linger on the map.
       void ensureScopedOverlayForTab("pinboard", { force: true });
-      if (state.tab === "pinboard") render();
-    },
-    onError: () => {
-      done?.();
-      if (state.tab === "pinboard") render();
     }
-  });
+  }, done);
 }
 
 function setPinboardPresent(result: any) {

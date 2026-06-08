@@ -1,6 +1,8 @@
 import {
   escapeHtml,
+  preserveAmbientCompanionPanel,
   renderToolFrame,
+  restoreAmbientCompanionPanel,
   type ChatFormatterRegistry,
   type ObservationRegistry,
   type WooComponentRegistry,
@@ -143,6 +145,7 @@ export class WooDubspaceWorkspaceElement extends HTMLElement {
       </div>
       ${this.renderPresence()}
     `;
+    const preservedPanel = preserveAmbientCompanionPanel(this, spaceId);
     this.innerHTML = renderToolFrame({
       subject: spaceId,
       toolbar,
@@ -150,6 +153,7 @@ export class WooDubspaceWorkspaceElement extends HTMLElement {
       layoutBody,
       showChat: true
     });
+    restoreAmbientCompanionPanel(this, preservedPanel);
     this.bind();
   }
 

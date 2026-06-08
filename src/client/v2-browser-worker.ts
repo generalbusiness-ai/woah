@@ -1328,7 +1328,13 @@ async function reconcileTentativeTurnReply(reply: ShadowTurnExecReply, replyTo?:
     const reason = reply.commit?.reason ?? "commit_rejected";
     if (reason === "stale_head" && await replanNeedsReplanTurns(ids, reason)) return;
     if (!shouldInvalidateTentativeTurnForCommitReason(reason)) return;
-    await invalidateTentativeTurn(ids[0], reason, ids, reply.transcript?.hash);
+    await invalidateTentativeTurn(
+      ids[0],
+      reason,
+      ids,
+      reply.transcript?.hash,
+      reply.commit?.errors ?? reply.commit?.receipt?.errors
+    );
   }
 }
 
@@ -1558,7 +1564,13 @@ async function deleteMatchingTentativeTurns(ids: readonly string[], transcriptHa
   return matched;
 }
 
-async function invalidateTentativeTurn(id: string, reason: string, ids: readonly string[] = [id], transcriptHash?: string): Promise<void> {
+async function invalidateTentativeTurn(
+  id: string,
+  reason: string,
+  ids: readonly string[] = [id],
+  transcriptHash?: string,
+  errors?: readonly string[]
+): Promise<void> {
   const records = await allTurnProposals();
   const anchor = v2TurnProposalForInvalidation(records, ids, transcriptHash);
   if (!anchor) return;
@@ -1567,7 +1579,8 @@ async function invalidateTentativeTurn(id: string, reason: string, ids: readonly
     kind: "local_turn_invalidated",
     id,
     reason,
-    invalidated_ids: [anchor.id]
+    invalidated_ids: [anchor.id],
+    ...(errors && errors.length > 0 ? { errors: Array.from(errors) } : {})
   });
 }
 

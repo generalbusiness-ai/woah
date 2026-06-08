@@ -550,15 +550,18 @@ a dedicated **Outliner** tab (between Tasks and Inspector). Routing:
   the observation handlers + chat formatters register.
 - `renderOutliner()` emits the `<woo-outliner-tree data-outliner-tree>`
   tag, resolved via `toolFrameComponentTag(outlinerSpace(), …)`.
-- `mountOutlinerComponent()` sets `subject` and `woo` on the element
-  and triggers `element.hydrate()` to fetch `list_items` and render
-  the tree.
+- `mountOutlinerComponent()` sets `subject` and `woo` on the element,
+  syncs cheap structural state from projection, and triggers a one-time
+  `element.hydrate()` outside the render loop.
 
-The component self-hydrates via `woo.call(subject, "list_items")` and
-re-fetches on every structural observation it subscribes to. Tab
-state, presence, and route URLs follow the same shape as Pinboard /
-Tasks (`outliner` view hint, `routedSubjects.outliner`,
-`scopedToolSubject("outliner")`).
+The component self-hydrates from projection when item text is present.
+When generic projection omits `$note.text` because text is governed by
+the catalog readability verb, it uses `woo.directCall(subject,
+"list_items")` once to fill the joined display rows. Structural
+observations patch the local model directly so normal add/edit/move
+turns stay responsive. Tab state, presence, and route URLs follow the
+same shape as Pinboard / Tasks (`outliner` view hint,
+`routedSubjects.outliner`, `scopedToolSubject("outliner")`).
 
 The full `ui` block:
 
