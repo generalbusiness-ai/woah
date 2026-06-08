@@ -151,6 +151,7 @@ type CommandVerbSummary = {
   name: string;
   definer?: ObjRef | null;
   direct_callable: boolean;
+  skip_presence_check?: boolean;
   arg_spec?: Record<string, WooValue>;
 };
 
@@ -3636,6 +3637,10 @@ export class WooWorld {
       assertObj(space);
       assertString(text);
       const actor = this.sessionActor(sessionId);
+      const hostMemo = createHostOperationMemo();
+      if (await this.remoteHostForObject(space, hostMemo)) {
+        return await this.planRemoteCommandNow(frameId, actor, sessionId, space, text, hostMemo);
+      }
       // Text-command planning is ordinary catalog behavior. Keep this server
       // convenience wrapper on the exact same verb-dispatch path as browser,
       // REST, MCP, and in-world `:command` callers so space overrides, feature
@@ -3646,6 +3651,54 @@ export class WooWorld {
       const error = normalizeError(err);
       return { op: "error", id: frameId, error };
     }
+  }
+
+  private async planRemoteCommandNow(frameId: string | undefined, actor: ObjRef, sessionId: string, space: ObjRef, text: string, hostMemo: HostOperationMemo): Promise<DirectResultFrame> {
+    const startedAt = Date.now();
+    if (!this.executorContext?.resolveVerb) throw wooError("E_INTERNAL", "remote host bridge verb resolution unavailable");
+    const resolved = await this.executorContext.resolveVerb(space, "command_plan", hostMemo);
+    if (!resolved) throw wooError("E_VERBNF", `verb not found: ${space}:command_plan`, { obj: space, name: "command_plan" });
+    if (resolved.direct_callable !== true) {
+      throw wooError("E_DIRECT_DENIED", `direct call denied for ${space}:command_plan`, { target: space, verb: "command_plan" });
+    }
+    if (resolved.skip_presence_check !== true) this.authorizePresence(actor, space, sessionId);
+    const observations: Observation[] = [];
+    const args: WooValue[] = [text];
+    const message: Message = { actor, target: space, verb: "command_plan", args };
+    const dispatchCtx: CallContext = {
+      world: this,
+      space,
+      seq: -1,
+      session: sessionId,
+      actor,
+      player: actor,
+      caller: "#-1",
+      callerPerms: actor,
+      progr: actor,
+      thisObj: space,
+      verbName: "command_plan",
+      definer: space,
+      message,
+      observations,
+      hostMemo,
+      observe: (event) => {
+        const observation = { ...event, source: event.source ?? space };
+        this.recordTurnEvent({ kind: "observe", observation });
+        observations.push(observation);
+      }
+    };
+    let result: WooValue = null;
+    await this.withTurnRecording(
+      { id: frameId, route: "direct", scope: space, seq: -1, session: sessionId, actor, target: space, verb: "command_plan", args },
+      async (activeRecorder) => {
+        hostMemo.turnRecorder = activeRecorder;
+        result = await this.dispatch(dispatchCtx, space, "command_plan", args);
+        return result;
+      }
+    );
+    const liveAudiences = await this.directLiveAudiences(space, observations);
+    this.recordMetric({ kind: "direct_call", target: space, verb: "command_plan", audience: space, observations: observations.length, ms: Date.now() - startedAt, status: "ok" });
+    return { op: "result", id: frameId, result, observations, audience: space, ...liveAudiences };
   }
 
   private sessionActor(sessionId: string): ObjRef {
@@ -10087,10 +10140,22 @@ export class WooWorld {
       try {
         if (await this.remoteHostForObject(target, ctx.hostMemo)) {
           const resolved = await this.tryResolveVerbForCommand(ctx, target, name);
-          return resolved ? { name: resolved.name, definer: null, direct_callable: resolved.direct_callable, arg_spec: resolved.arg_spec ?? {} } : (this.objects.has("$failed_match") ? "$failed_match" : null);
+          return resolved ? {
+            name: resolved.name,
+            definer: null,
+            direct_callable: resolved.direct_callable,
+            skip_presence_check: resolved.skip_presence_check === true,
+            arg_spec: resolved.arg_spec ?? {}
+          } : (this.objects.has("$failed_match") ? "$failed_match" : null);
         }
         const { definer, verb } = this.resolveVerb(target, name);
-        return { name: verb.name, definer, direct_callable: verb.direct_callable === true, arg_spec: verb.arg_spec ?? {} };
+        return {
+          name: verb.name,
+          definer,
+          direct_callable: verb.direct_callable === true,
+          skip_presence_check: verb.skip_presence_check === true,
+          arg_spec: verb.arg_spec ?? {}
+        };
       } catch (err) {
         const error = normalizeError(err);
         if (error.code !== "E_VERBNF" && !isReadAvailabilityError(error)) throw err;
@@ -10788,7 +10853,13 @@ export class WooWorld {
       }
     }
     const resolved = this.tryResolveVerb(target, verb);
-    return resolved ? { name: resolved.verb.name, definer: resolved.definer, direct_callable: resolved.verb.direct_callable === true, arg_spec: resolved.verb.arg_spec ?? {} } : null;
+    return resolved ? {
+      name: resolved.verb.name,
+      definer: resolved.definer,
+      direct_callable: resolved.verb.direct_callable === true,
+      skip_presence_check: resolved.verb.skip_presence_check === true,
+      arg_spec: resolved.verb.arg_spec ?? {}
+    } : null;
   }
 
   private async planCommandForSpace(ctx: CallContext, input: string, space: ObjRef, options: PublicCommandLocationOptions = {}): Promise<WooValue> {
@@ -10974,7 +11045,13 @@ export class WooWorld {
           const key = `${current}:${verb.slot ?? verb.name}`;
           if (seen.has(key)) continue;
           seen.add(key);
-          out.push({ name: verb.name, definer: current, direct_callable: verb.direct_callable === true, arg_spec: verb.arg_spec ?? {} });
+          out.push({
+            name: verb.name,
+            definer: current,
+            direct_callable: verb.direct_callable === true,
+            skip_presence_check: verb.skip_presence_check === true,
+            arg_spec: verb.arg_spec ?? {}
+          });
         }
         current = obj.parent;
       }

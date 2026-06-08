@@ -1305,11 +1305,11 @@ class FakeExecutorContext implements ExecutorContext {
     };
   }
 
-  async resolveVerb(target: ObjRef, verbName: string): Promise<{ name: string; direct_callable: boolean; arg_spec: Record<string, WooValue> } | null> {
+  async resolveVerb(target: ObjRef, verbName: string): Promise<{ name: string; direct_callable: boolean; skip_presence_check?: boolean; arg_spec: Record<string, WooValue> } | null> {
     const world = this.worldFor(target);
     try {
       const { verb } = world.resolveVerb(target, verbName);
-      return { name: verb.name, direct_callable: verb.direct_callable === true, arg_spec: verb.arg_spec ?? {} };
+      return { name: verb.name, direct_callable: verb.direct_callable === true, skip_presence_check: verb.skip_presence_check === true, arg_spec: verb.arg_spec ?? {} };
     } catch {
       return null;
     }
@@ -2550,7 +2550,7 @@ describe("CFObjectRepository production-shape coverage", () => {
       if (plan.op === "result") expect(plan.result).toMatchObject({ ok: true, route: "direct", target: "cf_home_widget", verb: "ping", args: [] });
 
       const remoteRoomLook = await home.planCommand("cf-plan-remote-room-look-widget", session.id, "cf_remote_room", "look widget");
-      expect(remoteRoomLook.op).toBe("result");
+      expect(remoteRoomLook.op, remoteRoomLook.op === "error" ? JSON.stringify(remoteRoomLook.error) : "").toBe("result");
       if (remoteRoomLook.op === "result") {
         expect(remoteRoomLook.result).toMatchObject({ ok: true, route: "direct", target: "cf_remote_room", verb: "look_at", args: ["cf_home_widget"] });
       }

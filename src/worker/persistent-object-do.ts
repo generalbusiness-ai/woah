@@ -2992,9 +2992,14 @@ export class PersistentObjectDO {
           const host = await hostForObject(target, memo);
           if (!host || host === localHost) {
             const { verb } = world.resolveVerb(target, verbName);
-            return { name: verb.name, direct_callable: verb.direct_callable === true, arg_spec: verb.arg_spec ?? {} };
+            return {
+              name: verb.name,
+              direct_callable: verb.direct_callable === true,
+              skip_presence_check: verb.skip_presence_check === true,
+              arg_spec: verb.arg_spec ?? {}
+            };
           }
-          return await this.forwardInternalReadChecked<{ name: string; direct_callable: boolean; arg_spec?: Record<string, WooValue> }>(
+          return await this.forwardInternalReadChecked<{ name: string; direct_callable: boolean; skip_presence_check?: boolean; arg_spec?: Record<string, WooValue> }>(
             host,
             "/__internal/remote-resolve-verb",
             { target, verb: verbName }
@@ -3007,7 +3012,7 @@ export class PersistentObjectDO {
         const read = async () => {
           const host = await hostForObject(target, memo);
           if (!host || host === localHost) return world.commandVerbCandidateSummaries(target, verbName);
-          const response = await this.forwardInternalReadChecked<{ candidates?: Array<{ name: string; direct_callable: boolean; arg_spec?: Record<string, WooValue> }> }>(
+          const response = await this.forwardInternalReadChecked<{ candidates?: Array<{ name: string; direct_callable: boolean; skip_presence_check?: boolean; arg_spec?: Record<string, WooValue> }> }>(
             host,
             "/__internal/remote-command-verb-candidates",
             { target, verb: verbName }
@@ -3808,7 +3813,12 @@ export class PersistentObjectDO {
         const target = String(body.target ?? "") as ObjRef;
         const verbName = String(body.verb ?? "");
         const { verb } = world.resolveVerb(target, verbName);
-        return jsonResponse({ name: verb.name, direct_callable: verb.direct_callable === true, arg_spec: verb.arg_spec ?? {} });
+        return jsonResponse({
+          name: verb.name,
+          direct_callable: verb.direct_callable === true,
+          skip_presence_check: verb.skip_presence_check === true,
+          arg_spec: verb.arg_spec ?? {}
+        });
       }
 
       if (request.method === "POST" && pathname === "/__internal/remote-command-verb-candidates") {
