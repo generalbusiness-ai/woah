@@ -898,7 +898,17 @@ export class McpHost {
     }
     if (locallyReachable) {
       const verb = (this.usesObviousProjection(actor, object) ? this.obviousVerbsFor(actor, object) : this.tooledVerbsFor(actor, object)).find((candidate) => candidate.name === verbName);
-      if (!verb) return null;
+      if (!verb) {
+        // Sparse gateway shards can carry an active-scope projection row whose
+        // local lineage/tool surface is incomplete. The active scope is still
+        // reachable from the session, so a local verb miss gets one bounded owner
+        // refresh before we report the tool gone.
+        if (bridge?.enumerateRemoteTools && sessionId && object === this.world.activeScopeForSession(sessionId)) {
+          const remote = await this.resolveForcedRemoteTool(actor, object, verbName, bridge.enumerateRemoteTools);
+          if (remote) return remote;
+        }
+        return null;
+      }
       return this.assembleTool(object, {
         verb: verb.name,
         aliases: verb.aliases,
@@ -960,6 +970,24 @@ export class McpHost {
         .find((candidate) => candidate.object === object && candidate.verb === verbName);
     }
     return descriptor ? this.assembleTool(descriptor.object, descriptor, new Set()) : null;
+  }
+
+  private async resolveForcedRemoteTool(
+    actor: ObjRef,
+    object: ObjRef,
+    verbName: string,
+    enumerateRemoteTools: NonNullable<NonNullable<ReturnType<WooWorld["getExecutorContext"]>>["enumerateRemoteTools"]>
+  ): Promise<McpTool | null> {
+    for (const projection of ["tools", "obvious"] as const) {
+      try {
+        const descriptors = await enumerateRemoteTools(actor, [{ id: object, projection, forceRefresh: true }]);
+        const descriptor = descriptors.find((candidate) => candidate.object === object && candidate.verb === verbName);
+        if (descriptor) return this.assembleTool(descriptor.object, descriptor, new Set());
+      } catch {
+        // Preserve the normal miss path if the owner refresh is unavailable.
+      }
+    }
+    return null;
   }
 
   private async sessionManifestDescriptors(sessionId: string, staleReason?: ProjectionFreshness["stale_reason"]): Promise<RemoteToolDescriptor[]> {
