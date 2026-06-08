@@ -638,6 +638,15 @@ governed by the CA11 provenance rules with no exception:
   force-owner repair (the gateway) enables it; holder paths that plan
   optimistically against derived rows and reconcile by their own protocol (the
   browser, REST relay) attach provenance but do not enforce it.
+- **Deterministic movement-destination prefetch.** Some movement destinations are
+  not actually dynamic: a room direction verb can be read from the room's
+  declarative `exits[verb].dest`, and mounted tool `leave`/`out` verbs often name
+  the mount room or actor home before the VM runs. A gateway MAY owner-prefetch
+  those specific source/destination rows before planning so the movement-
+  destination guard passes on attempt 1. This is only a latency optimization: if
+  the destination cannot be proven from local declarative data, or if catalog code
+  chooses a different destination dynamically, the VM guard and
+  `missing_state_repair` path above remain the correctness mechanism.
 - **Catalog classes are seeded FULL; only instances are lineage-only.** The
   destination *rooms* in the closure are seeded lineage-only (dynamic instances,
   repaired to owner on the occupancy transition above). But the shared
@@ -673,11 +682,11 @@ read against the owner.
    (then a correct re-planned move), never a silently-applied wrong move.
 5. The bounded read-staleness window of behavior 4 is the only observable effect
    of a stale pre-seeded page on a pure read; it is repaired by the next move.
-6. A move INTO a pre-seeded neighbor (the occupancy transition) DOES repair that
-   destination to owner authority before commit — a `missing_state_repair`
-   owner-required refresh — so the move uses the owner's real `exits`/hooks. The
-   optimization is for cold topology reads; the moment of occupancy correctly
-   pays one owner fetch.
+6. A move INTO a pre-seeded neighbor (the occupancy transition) DOES use owner
+   authority before commit — either via deterministic owner prefetch before
+   planning, or via a `missing_state_repair` owner-required refresh after the VM
+   proves the destination. The optimization is for cold topology reads; the
+   moment of occupancy correctly pays one owner fetch.
 
 ## CA12. Representation alignment
 

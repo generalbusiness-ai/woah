@@ -1785,7 +1785,8 @@ export class PersistentObjectDO {
               directorySessionScopes: authorityOptions?.directorySessionScopes,
               scopeContentExpansionRoots: authorityOptions?.scopeContentExpansionRoots,
               reconstructionReason: authorityOptions?.reconstructionReason,
-              reconstructionScope: authorityOptions?.reconstructionScope
+              reconstructionScope: authorityOptions?.reconstructionScope,
+              forceOwnerObjectIds: authorityOptions?.forceOwnerObjectIds
             }),
           executionCapsuleOpen: envFlag(this.env.WOO_V2_EXECUTION_CAPSULE),
           slimWarmEnvelope: envFlag(this.env.WOO_V2_SLIM_WARM_ENVELOPE),
@@ -5050,6 +5051,7 @@ export class PersistentObjectDO {
       scopeContentExpansionRoots?: readonly ObjRef[];
       reconstructionReason?: AuthorityReconstructionReason;
       reconstructionScope?: ObjRef;
+      forceOwnerObjectIds?: readonly ObjRef[];
     } = {}
   ): Promise<ReturnType<typeof executorAuthorityPayload>> {
     // `tolerateRemoteFailures: true` allows the per-envelope refresh path to
@@ -5068,6 +5070,7 @@ export class PersistentObjectDO {
     // must revert to owner authority — excluded from the local seed export and
     // not refresh-suppressed — so the owner's exits-bearing row displaces the seed.
     const forceOwnerRefresh = reconstructionReason === "missing_state_repair";
+    const forceOwnerObjectIds = new Set<ObjRef>(options.forceOwnerObjectIds ?? []);
     const reconstructionScope = options.reconstructionScope ?? ids[0] ?? "$nowhere";
     const localHost = this.durableHostKey();
     const mcpGatewayShard = isMcpGatewayShardHost(localHost);
@@ -5113,7 +5116,7 @@ export class PersistentObjectDO {
     if (mcpGatewayShard) this.ensureMcpScopeTopologySeed(world, requestedIds, servedScopeIds);
     const localActorAuthorityRoots = localActorAuthorityRootIds(world, requestedIds, { sessionActorsOnly: mcpGatewayShard });
     const local = mcpGatewayShard
-      ? mcpGatewayLocalAuthorityPayload(world, requestedIds, localActorAuthorityRoots, localHost, this.mcpScopeTopologySeed, servedScopeIds, forceOwnerRefresh)
+      ? mcpGatewayLocalAuthorityPayload(world, requestedIds, localActorAuthorityRoots, localHost, this.mcpScopeTopologySeed, servedScopeIds, forceOwnerRefresh ? true : forceOwnerObjectIds)
       : executorAuthorityPayload(world, requestedIds);
     const localObjectIds = authoritySliceObjectIds(local.authority);
     const preservedObjectIds = new Set<ObjRef>(localObjectIds);
@@ -5179,7 +5182,7 @@ export class PersistentObjectDO {
       // fetched and displaces the seeded lineage-only page by CA11 precedence. A
       // missing_state_repair pass force-fetches every requested id (the
       // movement-destination occupancy transition), so suppression is disabled.
-      if (!forceOwnerRefresh && seededTopologyIds?.has(id) && world.objects.has(id) && !servedScopeIds.has(id)) return [id, localHost] as const;
+      if (!forceOwnerRefresh && !forceOwnerObjectIds.has(id) && seededTopologyIds?.has(id) && world.objects.has(id) && !servedScopeIds.has(id)) return [id, localHost] as const;
       // CA11.2 occupancy transition: on a missing_state_repair pass, a seeded id
       // must be force-fetched from its REAL owner so the authoritative row
       // displaces the local seed. The seed recorded that owner at build time;
@@ -5189,7 +5192,7 @@ export class PersistentObjectDO {
       // of the remote-fetch set — leaving the stale seed in place and looping the
       // movement-boundary guard. The recorded owner is authoritative provenance
       // metadata, so it is the correct host to fetch from.
-      if (forceOwnerRefresh && seededTopologyIds?.has(id)) {
+      if ((forceOwnerRefresh || forceOwnerObjectIds.has(id)) && seededTopologyIds?.has(id)) {
         const seededOwner = seededOwnerById?.get(id);
         if (seededOwner && seededOwner !== localHost) return [id, seededOwner] as const;
       }
@@ -7099,9 +7102,11 @@ function mcpGatewayLocalAuthorityPayload(
   // requested seeded id is force-reverted to owner authority, so exclude it from
   // the local export exactly as a served scope is. The owner row (force-fetched,
   // not refresh-suppressed) is then the only copy in the slice and carries `exits`.
-  forceOwnerSeededIds = false
+  forceOwnerSeededIds: boolean | ReadonlySet<ObjRef> = false
 ): ExecutorAuthorityPayload {
   const localIds = new Set<ObjRef>();
+  const forceAllSeededIds = forceOwnerSeededIds === true;
+  const forceSeededIdSet = forceOwnerSeededIds !== false && forceOwnerSeededIds !== true ? forceOwnerSeededIds : null;
   for (const id of explicitIds) {
     // Session actor stubs on sparse MCP shards are not owner authority for
     // identity/name/property cells. They are patched below as live/projection
@@ -7114,7 +7119,7 @@ function mcpGatewayLocalAuthorityPayload(
     // break a move OUT of that scope. Skipping it from localIds (paired with the
     // byHost force-fetch of served scopes) ensures the owner's authoritative,
     // exits-bearing row is the only copy of this scope in the slice.
-    if (topologySeed?.seededIds.has(id) && (servedScopeIds.has(id) || forceOwnerSeededIds)) continue;
+    if (topologySeed?.seededIds.has(id) && (servedScopeIds.has(id) || forceAllSeededIds || forceSeededIdSet?.has(id))) continue;
     // Bootstrap actor/thing support rows are deliberately resident on every
     // MCP shard. Scope/room rows are not: their catalog lineage belongs to the
     // owner slice, and exporting a stale local stub before owner repair is the

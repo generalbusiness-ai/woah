@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { writeFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import worker from "../../src/worker/index";
 import { CommitScopeDO } from "../../src/worker/commit-scope-do";
@@ -194,11 +195,21 @@ describe("CF-local smoke walkthrough", () => {
         .filter((c) => c[0] === "woo.metric" && typeof c[1] === "string")
         .map((c) => { try { return JSON.parse(c[1] as string) as Record<string, unknown>; } catch { return null; } })
         .filter((m): m is Record<string, unknown> => m !== null);
+      if (process.env.WOO_CF_LOCAL_METRICS_OUT) {
+        writeFileSync(process.env.WOO_CF_LOCAL_METRICS_OUT, `${JSON.stringify(parsedMetrics, null, 2)}\n`);
+      }
 
       // turn_phase_timing — emitted by submitTurnIntent for every POST turn.
       const phaseTimings = parsedMetrics.filter((m) => m.kind === "turn_phase_timing");
       expect(phaseTimings.length, "submitTurnIntent must emit turn_phase_timing on the DO turn path").toBeGreaterThan(0);
       expect(phaseTimings.some((m) => m.outcome === "submitted"), "at least one turn should commit").toBe(true);
+      const repairAttempts = parsedMetrics
+        .filter((m) => m.kind === "turn_repair_attempt")
+        .map((m) => `${String(m.target)}:${String(m.verb)} source=${String(m.source)} reason=${String(m.reason)} objects=${JSON.stringify(m.objects ?? [])} atoms=${JSON.stringify(m.atoms ?? [])}`);
+      expect(
+        repairAttempts,
+        "prod-shaped local smoke should not need sparse-planning repair for deterministic movement/tool-leave turns; prefetch declarative destinations instead"
+      ).toEqual([]);
       const initialChatroomEnters = phaseTimings
         .filter((m) => m.target === "the_chatroom" && m.verb === "enter" && m.route === "direct")
         .slice(0, 2);

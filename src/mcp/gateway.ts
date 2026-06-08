@@ -94,6 +94,7 @@ type V2ScopeEnsureOptions = {
   forceLegacyOpen?: boolean;
   timing?: SubmitTurnPhaseTimer;
   timingLabelPrefix?: string;
+  ownerAuthorityObjectIds?: ObjRef[];
 };
 
 export type McpV2ClientHooks = {
@@ -108,6 +109,7 @@ export type McpV2ClientHooks = {
       scopeContentExpansionRoots?: ObjRef[];
       reconstructionReason?: "warm_turn_refresh" | "cold_open" | "missing_state_repair";
       reconstructionScope?: ObjRef;
+      forceOwnerObjectIds?: ObjRef[];
     }
   ) => Promise<ReturnType<typeof executorAuthorityPayload>>;
   executionCapsuleOpen?: boolean;
@@ -191,6 +193,7 @@ type V2ScopeClient = {
   commitScopeOpenedSessions: Set<string>;
   openedSessions: Set<string>;
   openingSessions: Map<string, Promise<void>>;
+  ownerPrefetchedIds: Set<ObjRef>;
 };
 
 type RemoteAcceptedCommit = {
@@ -225,6 +228,12 @@ function mcpDirectorySessionScopesForAuthority(entry: SessionEntry, ...scopes: A
   add(entry.woo.activeScope ?? null);
   for (const scope of scopes) add(scope);
   return Array.from(out).sort();
+}
+
+function mergeObjRefs(...lists: readonly ObjRef[][]): ObjRef[] {
+  const ids = new Set<ObjRef>();
+  for (const list of lists) for (const id of list) ids.add(id);
+  return Array.from(ids).sort();
 }
 
 function ensureSerializedSession(sessions: readonly SerializedSession[], session: SerializedSession): SerializedSession[] {
@@ -693,6 +702,7 @@ export class McpGateway {
     const scope = explicitScope ?? this.scopeForV2Call(actor, target);
     const id = `mcp-v2:${sessionId}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
     this.prewarmLikelyRelocationCommitScope(entry, actor, scope, target, verb, route, persistence);
+    const ownerAuthorityObjectIds = this.likelyMovementOwnerAuthorityObjectIds(entry, scope, target, verb);
     let authorityRefreshAttempts = 0;
     const submitted = await submitTurnIntent<V2ScopeClient, McpV2EnvelopeResult>({
       input: {
@@ -713,7 +723,8 @@ export class McpGateway {
       ensureClient: async (submitScope, _attempt, context) => await this.ensureV2ScopeClient(entry, submitScope, {
         requireCommitScopeOpen: context.phase === "commit" && context.plannedTranscriptCommit,
         timing: context.timing,
-        timingLabelPrefix: context.phase
+        timingLabelPrefix: context.phase,
+        ownerAuthorityObjectIds: context.phase === "planning" ? ownerAuthorityObjectIds : []
       }),
       clientNode: () => this.v2NodeFor(entry),
       clientHead: (client) => client.relay.commit_scope.head,
@@ -784,7 +795,8 @@ export class McpGateway {
           ),
           ...(contentExpansionRoots.length > 0 ? { scopeContentExpansionRoots: contentExpansionRoots } : {}),
           reconstructionReason: isRepair ? "missing_state_repair" : "warm_turn_refresh",
-          reconstructionScope: submitScope
+          reconstructionScope: submitScope,
+          forceOwnerObjectIds: isRepair ? extraObjectIds : []
         });
         const fallbackClient = this.v2Scopes.get(scope) ?? this.v2Scopes.get(submitScope);
         const authorityPayload = fallbackClient && (payload.staleFallbackCount ?? 0) > 0
@@ -950,6 +962,7 @@ export class McpGateway {
       client = await this.initializeV2ScopeClient(entry, scope, hooks, options);
     }
     await this.ensureV2ScopeSessionOpen(entry, client, hooks, undefined, options);
+    await this.ensureV2OwnerAuthorityPrefetch(entry, client, options);
     return client;
   }
 
@@ -971,13 +984,19 @@ export class McpGateway {
     // materialized /v2/open retry. Coalesce it per scope so parallel sessions
     // do not each build and post the same seed.
     const initializer = (async () => {
+      const ownerAuthorityObjectIds = options.ownerAuthorityObjectIds ?? [];
+      const seedObjectIds = mergeObjRefs([scope, entry.woo.actor], ownerAuthorityObjectIds);
       const seeded = await (options.timing
-        ? options.timing.time("ensure_client", `${timingPrefix}.seed_authority`, () => this.v2SerializedWorld([scope, entry.woo.actor], {
-          directorySessionScopes: mcpDirectorySessionScopesForAuthority(entry, scope)
+        ? options.timing.time("ensure_client", `${timingPrefix}.seed_authority`, () => this.v2SerializedWorld(seedObjectIds, {
+          directorySessionScopes: mcpDirectorySessionScopesForAuthority(entry, scope),
+          forceOwnerObjectIds: ownerAuthorityObjectIds,
+          reconstructionScope: scope
         }))
-        : this.v2SerializedWorld([scope, entry.woo.actor], {
-        directorySessionScopes: mcpDirectorySessionScopesForAuthority(entry, scope)
-      }));
+        : this.v2SerializedWorld(seedObjectIds, {
+          directorySessionScopes: mcpDirectorySessionScopesForAuthority(entry, scope),
+          forceOwnerObjectIds: ownerAuthorityObjectIds,
+          reconstructionScope: scope
+        }));
       const client: V2ScopeClient = {
         scope,
         relay: createShadowBrowserRelayShim({
@@ -990,8 +1009,10 @@ export class McpGateway {
         }),
         commitScopeOpenedSessions: new Set(),
         openedSessions: new Set(),
-        openingSessions: new Map()
+        openingSessions: new Map(),
+        ownerPrefetchedIds: new Set()
       };
+      for (const id of ownerAuthorityObjectIds) client.ownerPrefetchedIds.add(id);
       await this.ensureV2ScopeSessionOpen(entry, client, hooks, seeded, {
         ...options,
         timingLabelPrefix: `${timingPrefix}.initial`
@@ -1005,6 +1026,35 @@ export class McpGateway {
     } finally {
       if (this.v2ScopeInitializers.get(scope) === initializer) this.v2ScopeInitializers.delete(scope);
     }
+  }
+
+  private async ensureV2OwnerAuthorityPrefetch(
+    entry: SessionEntry,
+    client: V2ScopeClient,
+    options: V2ScopeEnsureOptions = {}
+  ): Promise<void> {
+    const ids = Array.from(new Set((options.ownerAuthorityObjectIds ?? [])
+      .filter((id): id is ObjRef => typeof id === "string" && id.length > 0 && !client.ownerPrefetchedIds.has(id))));
+    if (ids.length === 0) return;
+    const timingPrefix = options.timingLabelPrefix ?? "ensure";
+    const authority = this.withMcpSessionAuthority(
+      entry,
+      await (options.timing
+        ? options.timing.time("ensure_client", `${timingPrefix}.owner_prefetch_authority`, () => this.v2AuthorityPayload(ids, {
+          directorySessionScopes: mcpDirectorySessionScopesForAuthority(entry, client.scope),
+          reconstructionReason: "warm_turn_refresh",
+          reconstructionScope: client.scope,
+          forceOwnerObjectIds: ids
+        }))
+        : this.v2AuthorityPayload(ids, {
+          directorySessionScopes: mcpDirectorySessionScopesForAuthority(entry, client.scope),
+          reconstructionReason: "warm_turn_refresh",
+          reconstructionScope: client.scope,
+          forceOwnerObjectIds: ids
+        }))
+    );
+    this.mergeV2AuthorityIntoScopeClient(client, authority.authority);
+    for (const id of ids) client.ownerPrefetchedIds.add(id);
   }
 
   private async ensureV2ScopeSessionOpen(
@@ -1137,6 +1187,7 @@ export class McpGateway {
       scopeContentExpansionRoots?: ObjRef[];
       reconstructionReason?: "warm_turn_refresh" | "cold_open" | "missing_state_repair";
       reconstructionScope?: ObjRef;
+      forceOwnerObjectIds?: ObjRef[];
     } = {}
   ): Promise<ReturnType<typeof executorAuthorityPayload>> {
     return await (
@@ -1147,7 +1198,7 @@ export class McpGateway {
 
   private async v2SerializedWorld(
     extraObjectIds: ObjRef[],
-    options: { directorySessionScopes?: ObjRef[] } = {}
+    options: { directorySessionScopes?: ObjRef[]; forceOwnerObjectIds?: ObjRef[]; reconstructionScope?: ObjRef } = {}
   ): Promise<{ serialized: ReturnType<WooWorld["exportWorld"]>; authority: ReturnType<typeof executorAuthorityPayload> }> {
     const authority = await this.v2AuthorityPayload(extraObjectIds, options);
     const serialized = serializedWorldFromAuthoritySlice(authority.authority);
@@ -1284,6 +1335,50 @@ export class McpGateway {
     if (enclosing) return enclosing;
     const session = this.sessionsByActor(actor);
     return (session ? this.world.activeScopeForSession(session.woo.id) : null) ?? actor;
+  }
+
+  private likelyMovementOwnerAuthorityObjectIds(entry: SessionEntry, scope: ObjRef, target: ObjRef, verb: string): ObjRef[] {
+    const ids = new Set<ObjRef>();
+    const add = (id: ObjRef | null | undefined): void => {
+      if (!id || id === "$nowhere") return;
+      ids.add(id);
+    };
+    const exitDest = this.localExitDestination(target, verb);
+    if (exitDest) {
+      // A direction verb's destination is declarative topology. Fetching the
+      // source + destination owner rows before planning lets the occupancy guard
+      // pass on attempt 1; dynamic moves still fall through to E_NEED_STATE repair.
+      add(scope);
+      add(target);
+      add(exitDest);
+      return Array.from(ids);
+    }
+    if (verb === "leave" || verb === "out") {
+      add(scope);
+      add(target);
+      const mountRoom = this.localObjectProp(target, "mount_room");
+      if (typeof mountRoom === "string") add(mountRoom as ObjRef);
+      else {
+        const home = this.localObjectProp(entry.woo.actor, "home");
+        if (typeof home === "string") add(home as ObjRef);
+      }
+    }
+    return Array.from(ids);
+  }
+
+  private localExitDestination(target: ObjRef, verb: string): ObjRef | null {
+    const exits = this.localObjectProp(target, "exits");
+    if (!exits || typeof exits !== "object" || Array.isArray(exits)) return null;
+    const exitRef = (exits as Record<string, WooValue>)[verb];
+    if (typeof exitRef !== "string") return null;
+    const dest = this.localObjectProp(exitRef as ObjRef, "dest");
+    return typeof dest === "string" ? dest as ObjRef : null;
+  }
+
+  private localObjectProp(id: ObjRef, name: string): WooValue | undefined {
+    const row = this.world.exportObjects([id])[0];
+    if (!row) return undefined;
+    return new Map(row.properties).get(name);
   }
 
   private sessionsByActor(actor: ObjRef): SessionEntry | null {

@@ -343,20 +343,17 @@ describe("CA11.2 quasi-static topology pre-seeding", () => {
   // STEP 0 + conformance #1 (read path) + the occupancy transition.
   //
   // A move across an exit has TWO phases for the destination the_deck:
-  //   (a) the cold neighbor READ — the first planning attempt traces the exit's
-  //       `dest` and reads the_deck's lineage to run `dest:acceptable`. This must
-  //       resolve LOCALLY from the pre-seeded topology closure: NO cross-host
-  //       authority fetch on the read path (`warm_turn_refresh`/`cold_open`).
-  //   (b) the OCCUPANCY transition — because this move ENTERS the_deck, the
-  //       movement-boundary guard (CA11.2) repairs the_deck to owner authority
-  //       before commit, so the_deck IS partitioned with reason
-  //       `missing_state_repair`. The zero-fetch optimization holds for cold
-  //       READS, NOT for the moment of occupancy (the entered scope's dynamic
-  //       authority — exits/next_seq — must come from its owner for the commit).
+  //   (a) deterministic prefetch — the gateway can read the source room's
+  //       declarative `exits[verb].dest` before the VM runs and fetch that
+  //       destination from its owner as part of planning authority.
+  //   (b) repair fallback — if a destination cannot be proven before the VM
+  //       resolves it, the movement-boundary guard (CA11.2) raises
+  //       E_NEED_STATE and the retry repairs the destination to owner authority.
   //
-  // So: no read-path partition of the_deck, but an occupancy repair-fetch of
-  // the_deck is expected, and the move succeeds.
-  it("cold move across the_chatroom's exit reads the neighbor locally; the occupancy transition repairs to owner", async () => {
+  // So: the move succeeds against owner authority for the entered scope. On MCP's
+  // optimized path this should be a bounded owner-prefetch, not a sparse-planning
+  // missing_state repair round.
+  it("cold move across the_chatroom's exit prefetches deterministic destination owner authority", async () => {
     const harness = createHarness();
     let logSpy: ReturnType<typeof vi.spyOn> | null = null;
     let alice: McpSession | null = null;
@@ -375,27 +372,35 @@ describe("CA11.2 quasi-static topology pre-seeding", () => {
       // The move must actually enter the_deck.
       expect(alice.currentRoom, "southeast from the_chatroom should arrive in the_deck").toBe("the_deck");
 
-      // (a) Read path: a cold READ refresh (warm_turn_refresh/cold_open) must NOT
-      // partition the_deck — its lineage is resolved from the pre-seeded closure.
+      const phaseTiming = metrics.find((m) =>
+        m.kind === "turn_phase_timing" &&
+        m.target === "the_chatroom" &&
+        m.verb === "southeast"
+      );
+      const ownerPrefetchMs = typeof (phaseTiming?.ensure_detail_ms as Record<string, unknown> | undefined)?.["planning.owner_prefetch_authority"] === "number"
+        ? (phaseTiming!.ensure_detail_ms as Record<string, number>)["planning.owner_prefetch_authority"]
+        : null;
+      const repairAttempts = metrics.filter((m) => m.kind === "turn_repair_attempt");
+
+      // A generic cold READ refresh should not be the mechanism. If the_deck is
+      // partitioned before commit, it must be the explicit deterministic
+      // owner-prefetch path, and the turn must still converge in one attempt.
       const readPartitioned = partitionedRemoteIds(metrics, (reason) => reason !== "missing_state_repair");
       const readPartitionedIds = new Set<string>();
       for (const set of readPartitioned.values()) for (const id of set) readPartitionedIds.add(id);
-      expect(
-        readPartitionedIds.has("the_deck"),
-        `CA11.2 conformance #1 (read path): the cold neighbor READ of the_deck must resolve locally from the ` +
-        `pre-seeded topology closure and must NOT partition the_deck on a warm_turn_refresh/cold_open fetch. ` +
-        `Read-path partitioned ids: ` +
-        JSON.stringify(Array.from(readPartitioned, ([h, s]) => [h, Array.from(s)]))
-      ).toBe(false);
-
-      // (b) Occupancy transition: entering the_deck repairs it to owner authority.
-      // The repair fetch is the expected `missing_state_repair` partition of the_deck.
+      if (readPartitionedIds.has("the_deck")) {
+        expect(ownerPrefetchMs, `the_deck was fetched before commit, so the turn must record bounded deterministic owner prefetch. ` +
+          `Read-path partitioned ids: ${JSON.stringify(Array.from(readPartitioned, ([h, s]) => [h, Array.from(s)]))}`).not.toBeNull();
+      }
+      expect(phaseTiming, "the southeast move must emit turn_phase_timing").toMatchObject({
+        attempts: 1,
+        outcome: "submitted"
+      });
+      expect(repairAttempts, "deterministic southeast movement should not need sparse-planning repair").toEqual([]);
       expect(
         partitionedWithReason(metrics, "the_deck", "missing_state_repair"),
-        "CA11.2 occupancy transition: a move INTO the_deck must repair the_deck to owner authority before " +
-        "commit (a missing_state_repair partition of the_deck), so the occupant commits against the owner's " +
-        "exits-bearing row, not the lineage-only neighbor seed"
-      ).toBe(true);
+        "deterministic owner prefetch should make the old occupancy repair unnecessary"
+      ).toBe(false);
     } finally {
       logSpy?.mockRestore();
       await alice?.close();

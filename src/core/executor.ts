@@ -345,10 +345,35 @@ function executorObjectIdsFromNeedStateError(err: unknown): ObjRef[] {
     : [];
 }
 
+function executorAtomPreimagesFromNeedStateError(err: unknown): string[] {
+  const error = err as { code?: string; value?: WooValue } | null;
+  return error?.code === "E_NEED_STATE"
+    ? executorNeedStateAtomPreimages(error.value)
+    : [];
+}
+
 function executorObjectIdsFromNeedStateFrame(frame: ErrorFrame): ObjRef[] {
   return frame.error.code === "E_NEED_STATE"
     ? executorObjectIdsFromNeedStateValue(frame.error.value)
     : [];
+}
+
+function executorAtomPreimagesFromNeedStateFrame(frame: ErrorFrame): string[] {
+  return frame.error.code === "E_NEED_STATE"
+    ? executorNeedStateAtomPreimages(frame.error.value)
+    : [];
+}
+
+function executorAtomPreimagesFromMissingState(reply: ShadowTurnExecReply): string[] {
+  if (reply.ok || reply.reason !== "missing_state") return [];
+  const preimages: string[] = [];
+  const seen = new Set<string>();
+  for (const atom of reply.missing_atoms ?? []) {
+    if (typeof atom.preimage !== "string" || seen.has(atom.preimage)) continue;
+    seen.add(atom.preimage);
+    preimages.push(atom.preimage);
+  }
+  return preimages;
 }
 
 function executorObjectIdsFromObjectNotFoundError(err: unknown): ObjRef[] {
@@ -378,6 +403,16 @@ function executorObjectIdsFromLocalPlanningFrame(frame: ErrorFrame): ObjRef[] {
   );
 }
 
+type ExecutorRepairMetricInput = {
+  source: Extract<MetricEvent, { kind: "turn_repair_attempt" }>["source"];
+  reason: Extract<MetricEvent, { kind: "turn_repair_attempt" }>["reason"];
+  attempt: number;
+  commitScope?: ObjRef | null;
+  objects: ObjRef[];
+  atoms?: string[];
+  commitReason?: string;
+};
+
 function isRepairableLocalPlanningLookupError(err: unknown): boolean {
   const coded = err as { code?: unknown; message?: unknown } | null;
   if (coded?.code === "E_VERBNF") return true;
@@ -395,31 +430,39 @@ function isRepairableLocalPlanningLookupFrame(frame: ErrorFrame): boolean {
 }
 
 function executorObjectIdsFromNeedStateValue(raw: WooValue | undefined): ObjRef[] {
+  return mergeExecutorObjectIds(
+    ...executorNeedStateAtomPreimages(raw).map((preimage) => {
+      const id = executorObjectIdFromAtomPreimage(preimage);
+      return id ? [id] : [];
+    })
+  );
+}
+
+function executorNeedStateAtomPreimages(raw: WooValue | undefined): string[] {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
   const missing = (raw as Record<string, WooValue>).missing_atoms;
   if (!Array.isArray(missing)) return [];
-  const ids: ObjRef[] = [];
-  const seen = new Set<ObjRef>();
-  const push = (id: ObjRef | null): void => {
-    if (!id || seen.has(id)) return;
-    seen.add(id);
-    ids.push(id);
-  };
+  const atoms: string[] = [];
+  const seen = new Set<string>();
   for (const item of missing) {
     if (!item || typeof item !== "object" || Array.isArray(item)) continue;
     const map = item as Record<string, WooValue>;
-    if (typeof map.hash !== "string") continue;
-    push(executorObjectIdFromMissingAtom({
-      hash: map.hash,
-      ...(typeof map.preimage === "string" ? { preimage: map.preimage } : {})
-    }));
+    if (typeof map.hash !== "string" || typeof map.preimage !== "string") continue;
+    if (seen.has(map.preimage)) continue;
+    seen.add(map.preimage);
+    atoms.push(map.preimage);
   }
-  return ids;
+  return atoms;
 }
 
 function executorObjectIdFromMissingAtom(atom: ShadowMissingAtom): ObjRef | null {
-  const preimage = atom.preimage;
-  if (typeof preimage !== "string" || preimage.length === 0) return null;
+  return typeof atom.preimage === "string"
+    ? executorObjectIdFromAtomPreimage(atom.preimage)
+    : null;
+}
+
+function executorObjectIdFromAtomPreimage(preimage: string): ObjRef | null {
+  if (preimage.length === 0) return null;
   if (preimage.startsWith("actor:")) return preimage.slice("actor:".length) as ObjRef;
   if (preimage.startsWith("target:")) return preimage.slice("target:".length) as ObjRef;
   if (preimage.startsWith("scope:")) return preimage.slice("scope:".length) as ObjRef;
@@ -638,6 +681,23 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       addDetailMs(retryDetailMs, label, ms);
     }
   };
+  const emitRepairAttempt = (input: ExecutorRepairMetricInput): void => {
+    const objects = mergeExecutorObjectIds(input.objects).slice(0, 64);
+    options.onMetric?.({
+      kind: "turn_repair_attempt",
+      scope: options.input.scope,
+      commit_scope: input.commitScope ?? phaseCommitScope,
+      target: options.input.target,
+      verb: options.input.verb,
+      route: options.input.route,
+      attempt: input.attempt,
+      source: input.source,
+      reason: input.reason,
+      objects,
+      ...(input.atoms && input.atoms.length > 0 ? { atoms: input.atoms.slice(0, 64) } : {}),
+      ...(input.commitReason ? { commit_reason: input.commitReason } : {})
+    });
+  };
   const basePlanningAuthorityObjectIds = (planningScope: ObjRef): ObjRef[] =>
     options.authorityObjectIds?.(options.input, planningScope)
       ?? executorAuthorityObjectIds(options.input, planningScope);
@@ -696,6 +756,9 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       const missingObjectIds = repairPlanningAuthority
         ? executorObjectIdsFromLocalPlanningError(err)
         : [];
+      const missingAtoms = repairPlanningAuthority
+        ? executorAtomPreimagesFromNeedStateError(err)
+        : [];
       const repairIds = missingObjectIds.length > 0
         ? missingObjectIds
         : repairPlanningAuthority && isRepairableLocalPlanningLookupError(err)
@@ -703,6 +766,14 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
         : [];
       const nextRepairObjectIds = mergeExecutorObjectIds(repairObjectIds, repairIds);
       if (attempt + 1 < maxAttempts && nextRepairObjectIds.length > repairObjectIds.length) {
+        emitRepairAttempt({
+          source: "planning_throw",
+          reason: missingObjectIds.length > 0 ? "missing_state" : "lookup_error",
+          attempt: attempt + 1,
+          commitScope: null,
+          objects: repairIds,
+          atoms: missingAtoms
+        });
         repairObjectIds = nextRepairObjectIds;
         if (!options.prePlanAuthority) await refreshPlanningAuthority(planningScope, planningClient, true);
         continue;
@@ -715,6 +786,9 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       const missingObjectIds = repairPlanningAuthority
         ? executorObjectIdsFromLocalPlanningFrame(planned.frame)
         : [];
+      const missingAtoms = repairPlanningAuthority
+        ? executorAtomPreimagesFromNeedStateFrame(planned.frame)
+        : [];
       const repairIds = missingObjectIds.length > 0
         ? missingObjectIds
         : repairPlanningAuthority && isRepairableLocalPlanningLookupFrame(planned.frame)
@@ -722,6 +796,14 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
         : [];
       const nextRepairObjectIds = mergeExecutorObjectIds(repairObjectIds, repairIds);
       if (attempt + 1 < maxAttempts && nextRepairObjectIds.length > repairObjectIds.length) {
+        emitRepairAttempt({
+          source: "planning_frame",
+          reason: missingObjectIds.length > 0 ? "missing_state" : "lookup_error",
+          attempt: attempt + 1,
+          commitScope: null,
+          objects: repairIds,
+          atoms: missingAtoms
+        });
         repairObjectIds = nextRepairObjectIds;
         if (!options.prePlanAuthority) await refreshPlanningAuthority(planningScope, planningClient, true);
         continue;
@@ -827,11 +909,26 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
         timeRetry("commit.apply_state_transfer", () => options.applyStateTransfer?.(commitClient, transfer));
         if (commitClient !== planningClient) timeRetry("planning.apply_state_transfer", () => options.applyStateTransfer?.(planningClient, transfer));
       }
+      const replyMissingObjectIds = executorObjectIdsFromMissingState(body);
+      const transcriptObjectIds = executorTranscriptObjectIds(planned.transcript);
+      const retryObjectIds = mergeExecutorObjectIds(
+        replyMissingObjectIds,
+        transcriptObjectIds
+      );
+      emitRepairAttempt({
+        source: "commit_reply",
+        reason: body.ok === false && body.reason === "missing_state" ? "missing_state" : "commit_rejected",
+        attempt: attempt + 1,
+        commitScope,
+        objects: retryObjectIds,
+        atoms: executorAtomPreimagesFromMissingState(body),
+        commitReason: body.ok === false && body.reason === "commit_rejected" ? body.commit?.reason : undefined
+      });
       repairObjectIds = timeRetry("collect_repair_objects", () =>
         mergeExecutorObjectIds(
           repairObjectIds,
-          executorObjectIdsFromMissingState(body),
-          executorTranscriptObjectIds(planned.transcript)
+          replyMissingObjectIds,
+          transcriptObjectIds
         )
       );
       continue;

@@ -19,7 +19,7 @@ import {
   executorReplyNeedsRepair,
   type ExecutorEnvelopeBody
 } from "../src/core/executor";
-import type { ObjRef } from "../src/core/types";
+import type { MetricEvent, ObjRef } from "../src/core/types";
 
 describe("v2 turn gateway", () => {
   it("refreshes room contents and support classes in authority slices for stale direct-look scopes", async () => {
@@ -301,6 +301,7 @@ describe("v2 turn gateway", () => {
     };
     const authorityCalls: Array<{ ids: ObjRef[]; phase?: string; repair?: boolean }> = [];
     const submissions: ShadowTurnExecRequest[] = [];
+    const events: MetricEvent[] = [];
 
     const result = await submitTurnIntent({
       input: {
@@ -324,6 +325,7 @@ describe("v2 turn gateway", () => {
       clientPlanningProvenance: () => client.cellProvenance,
       enforceMissingProvenance: true,
       enforceResolutionOwnerRepair: true,
+      onMetric: (event) => { events.push(event); },
       nextTurnId: () => { throw new Error("test uses explicit id"); },
       authorityPayload: (_scope, extraObjectIds, context) => {
         authorityCalls.push({ ids: [...extraObjectIds], phase: context?.phase, repair: context?.repair });
@@ -354,6 +356,18 @@ describe("v2 turn gateway", () => {
       op: "result",
       result: expect.objectContaining({ item: "the_mug" })
     });
+    expect(events).toContainEqual(expect.objectContaining({
+      kind: "turn_repair_attempt",
+      scope: "the_chatroom",
+      target: "the_chatroom",
+      verb: "take",
+      route: "direct",
+      attempt: 1,
+      source: "planning_throw",
+      reason: "missing_state",
+      objects: ["the_chatroom"],
+      atoms: ["read:cell:contents:the_chatroom"]
+    }));
   });
 
   it("emits a turn_phase_timing metric attributing the turn's phases (Slice 1)", async () => {

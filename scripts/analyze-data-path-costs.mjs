@@ -23,6 +23,11 @@ const CLASSIFICATION = {
     signal: "attempts, authority_calls, and per-phase ms (ensure/authority/serialize/plan_build/vm/submit)",
     endState: "Phase attribution for a turn; steady state is attempts=1 with authority+submit bounded by the turn's write set, local compute (serialize/plan_build/vm) negligible."
   },
+  turn_repair_attempt: {
+    bucket: "request_wall_time",
+    signal: "attempt, source, reason, objects, atom preimages, commit_reason",
+    endState: "Names the exact missing-state or conflict trigger before a retry; steady state is no repairs on warm movement/tool turns."
+  },
   mcp_dispatch_timing: {
     bucket: "request_wall_time",
     signal: "method, cold_world, and per-step ms (get_world/forward/handle/register)",
