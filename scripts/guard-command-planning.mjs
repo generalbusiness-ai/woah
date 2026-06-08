@@ -90,6 +90,44 @@ if (!planCommandNow?.body) {
   }
 }
 
+const planRemoteCommandNow = methodNamed(worldAst, "planRemoteCommandNow");
+if (!planRemoteCommandNow?.body) {
+  failures.push(`${worldPath}: could not locate planRemoteCommandNow for command-planning guard`);
+} else {
+  const literals = stringLiterals(worldAst, planRemoteCommandNow.body).map((entry) => entry.text);
+  if (literals.includes("$match") || literals.includes("plan_command")) {
+    failures.push(`${worldPath}: planRemoteCommandNow must not target $match:plan_command directly`);
+  }
+  if (!literals.includes("command_plan")) {
+    failures.push(`${worldPath}: planRemoteCommandNow must resolve the active space :command_plan wrapper`);
+  }
+  let directDispatches = 0;
+  let sharedFrameCalls = 0;
+  let directHelperCalls = 0;
+  let parserCalls = 0;
+  let remoteMetadataLookups = 0;
+  visit(planRemoteCommandNow.body, (node) => {
+    const called = calledFunctionName(node);
+    if (called === "dispatch") directDispatches += 1;
+    if (called === "dispatchDirectCallFrame") sharedFrameCalls += 1;
+    if (called === "planCommandForSpace") directHelperCalls += 1;
+    if (called === "parseCommandMap") parserCalls += 1;
+    if (called === "resolveVerb") remoteMetadataLookups += 1;
+  });
+  if (directDispatches > 0) {
+    failures.push(`${worldPath}: planRemoteCommandNow must use dispatchDirectCallFrame instead of constructing its own dispatch frame`);
+  }
+  if (sharedFrameCalls !== 1) {
+    failures.push(`${worldPath}: planRemoteCommandNow must delegate exactly once to dispatchDirectCallFrame, saw ${sharedFrameCalls}`);
+  }
+  if (directHelperCalls > 0 || parserCalls > 0) {
+    failures.push(`${worldPath}: planRemoteCommandNow must stay metadata-driven and must not call parser helpers directly`);
+  }
+  if (remoteMetadataLookups < 1) {
+    failures.push(`${worldPath}: planRemoteCommandNow must resolve remote command_plan metadata before dispatch`);
+  }
+}
+
 const helperCalls = [];
 visit(worldAst, (node) => {
   if (calledFunctionName(node) === "planCommandForSpace") helperCalls.push(node);
