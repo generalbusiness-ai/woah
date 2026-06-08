@@ -19,7 +19,7 @@ import { normalizeError, type WooWorld } from "../core/world";
 import type { SerializedAuthoritySlice, SerializedSession } from "../core/repository";
 import { projectionDeltaMissingWrites, type ProjectionWrite } from "../core/projection-delta";
 import { createMcpServer } from "./server";
-import { McpHost, type McpAcceptedFrameAudience, type McpBroadcastHooks, type McpDispatchHooks, type McpToolManifestHooks } from "./host";
+import { McpHost, type McpAcceptedFrameAudience, type McpBroadcastHooks, type McpDispatchHooks, type McpDispatchOptions, type McpToolManifestHooks } from "./host";
 import { createShadowBrowserRelayShim } from "../core/shadow-browser-node";
 import {
   applyAcceptedFrameToDerivedRelayCache,
@@ -285,10 +285,10 @@ export class McpGateway {
 
   constructor(private world: WooWorld, private options: McpGatewayOptions = {}) {
     const dispatch = options.v2 ? {
-      direct: async (sessionId: string, actor: ObjRef, target: ObjRef, verb: string, args: WooValue[], scope?: ObjRef | null, persistence?: "durable" | "live", options?: { directorySessionScopes?: ObjRef[] }) =>
+      direct: async (sessionId: string, actor: ObjRef, target: ObjRef, verb: string, args: WooValue[], scope?: ObjRef | null, persistence?: "durable" | "live", options?: McpDispatchOptions) =>
         await this.invokeV2Direct(sessionId, actor, target, verb, args, scope, persistence, options),
-      call: async (sessionId: string, actor: ObjRef, space: ObjRef, message: Message) =>
-        await this.invokeV2Call(sessionId, actor, space, message)
+      call: async (sessionId: string, actor: ObjRef, space: ObjRef, message: Message, options?: McpDispatchOptions) =>
+        await this.invokeV2Call(sessionId, actor, space, message, options)
     } satisfies McpDispatchHooks : options.dispatch;
     this.host = new McpHost(world, dispatch, options.toolManifests);
     if (options.broadcasts) this.host.setBroadcastHooks(options.broadcasts);
@@ -663,7 +663,7 @@ export class McpGateway {
     args: WooValue[],
     scope?: ObjRef | null,
     persistence: "durable" | "live" = "durable",
-    options: { directorySessionScopes?: ObjRef[] } = {}
+    options: McpDispatchOptions = {}
   ): Promise<DirectResultFrame | ErrorFrame> {
     // Direct calls record under their live audience when there is one, and
     // under the shadow direct-call scope (`#-1`) otherwise. McpHost passes the
@@ -677,9 +677,10 @@ export class McpGateway {
     sessionId: string,
     actor: ObjRef,
     space: ObjRef,
-    message: Message
+    message: Message,
+    options: McpDispatchOptions = {}
   ): Promise<AppliedFrame | ErrorFrame> {
-    const frame = await this.invokeV2(sessionId, actor, "sequenced", message.target, message.verb, message.args, space);
+    const frame = await this.invokeV2(sessionId, actor, "sequenced", message.target, message.verb, message.args, space, "durable", options);
     if (frame.op === "result") throw new Error(`v2 sequenced call returned direct result: ${message.target}:${message.verb}`);
     return frame;
   }
@@ -693,7 +694,7 @@ export class McpGateway {
     args: WooValue[],
     explicitScope?: ObjRef | null,
     persistence: "durable" | "live" = "durable",
-    options: { directorySessionScopes?: ObjRef[] } = {}
+    options: McpDispatchOptions = {}
   ): Promise<AppliedFrame | DirectResultFrame | ErrorFrame> {
     const hooks = this.options.v2;
     if (!hooks) throw new Error("MCP v2 client hooks are not configured");
@@ -702,7 +703,7 @@ export class McpGateway {
     const scope = explicitScope ?? this.scopeForV2Call(actor, target);
     const id = `mcp-v2:${sessionId}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
     this.prewarmLikelyRelocationCommitScope(entry, actor, scope, target, verb, route, persistence);
-    const ownerAuthorityObjectIds = this.likelyMovementOwnerAuthorityObjectIds(entry, scope, target, verb);
+    const ownerAuthorityObjectIds = this.likelyMovementOwnerAuthorityObjectIds(entry, scope, target, verb, options.toolArgSpec);
     let authorityRefreshAttempts = 0;
     const submitted = await submitTurnIntent<V2ScopeClient, McpV2EnvelopeResult>({
       input: {
@@ -1337,48 +1338,85 @@ export class McpGateway {
     return (session ? this.world.activeScopeForSession(session.woo.id) : null) ?? actor;
   }
 
-  private likelyMovementOwnerAuthorityObjectIds(entry: SessionEntry, scope: ObjRef, target: ObjRef, verb: string): ObjRef[] {
+  // Catalogs may declare deterministic owner-prefetch paths in verb metadata.
+  // The gateway interprets only generic roots/path/fallback forms; command words
+  // and catalog property names must stay in the manifest declarations.
+  private likelyMovementOwnerAuthorityObjectIds(entry: SessionEntry, scope: ObjRef, target: ObjRef, verbName: string, argSpec?: Record<string, WooValue>): ObjRef[] {
+    const prefetch = this.authorityPrefetchEntries(argSpec);
+    if (prefetch.length === 0) return [];
     const ids = new Set<ObjRef>();
     const add = (id: ObjRef | null | undefined): void => {
       if (!id || id === "$nowhere") return;
       ids.add(id);
     };
-    const exitDest = this.localExitDestination(target, verb);
-    if (exitDest) {
-      // A direction verb's destination is declarative topology. Fetching the
-      // source + destination owner rows before planning lets the occupancy guard
-      // pass on attempt 1; dynamic moves still fall through to E_NEED_STATE repair.
-      add(scope);
-      add(target);
-      add(exitDest);
-      return Array.from(ids);
+    for (const item of prefetch) {
+      for (const id of this.resolveAuthorityPrefetchValue(item, { entry, scope, target, verb: verbName })) add(id);
     }
-    if (verb === "leave" || verb === "out") {
-      add(scope);
-      add(target);
-      const mountRoom = this.localObjectProp(target, "mount_room");
-      if (typeof mountRoom === "string") add(mountRoom as ObjRef);
-      else {
-        const home = this.localObjectProp(entry.woo.actor, "home");
-        if (typeof home === "string") add(home as ObjRef);
-      }
-    }
-    return Array.from(ids);
+    return Array.from(ids).sort();
   }
 
-  private localExitDestination(target: ObjRef, verb: string): ObjRef | null {
-    const exits = this.localObjectProp(target, "exits");
-    if (!exits || typeof exits !== "object" || Array.isArray(exits)) return null;
-    const exitRef = (exits as Record<string, WooValue>)[verb];
-    if (typeof exitRef !== "string") return null;
-    const dest = this.localObjectProp(exitRef as ObjRef, "dest");
-    return typeof dest === "string" ? dest as ObjRef : null;
+  private authorityPrefetchEntries(argSpec?: Record<string, WooValue>): WooValue[] {
+    if (!argSpec) return [];
+    const authority = argSpec.authority;
+    if (!authority || typeof authority !== "object" || Array.isArray(authority)) return [];
+    const prefetch = (authority as Record<string, WooValue>).prefetch;
+    return Array.isArray(prefetch) ? prefetch : [];
+  }
+
+  private resolveAuthorityPrefetchValue(
+    value: WooValue,
+    context: { entry: SessionEntry; scope: ObjRef; target: ObjRef; verb: string }
+  ): ObjRef[] {
+    if (typeof value === "string") {
+      const id = this.authorityPrefetchRoot(value, context);
+      return id ? [id] : [];
+    }
+    if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+    const map = value as Record<string, WooValue>;
+    if (Array.isArray(map.first)) {
+      for (const item of map.first) {
+        const ids = this.resolveAuthorityPrefetchValue(item, context);
+        if (ids.length > 0) return ids;
+      }
+      return [];
+    }
+    if (Array.isArray(map.path)) {
+      const id = this.resolveAuthorityPrefetchPath(map.path, context);
+      return id ? [id] : [];
+    }
+    return [];
+  }
+
+  private resolveAuthorityPrefetchPath(
+    path: WooValue[],
+    context: { entry: SessionEntry; scope: ObjRef; target: ObjRef; verb: string }
+  ): ObjRef | null {
+    if (path.length === 0 || typeof path[0] !== "string") return null;
+    let cursor: WooValue | undefined = this.authorityPrefetchRoot(path[0], context) ?? undefined;
+    for (const rawPart of path.slice(1)) {
+      if (typeof rawPart !== "string") return null;
+      const part = rawPart === "$verb" ? context.verb : rawPart;
+      if (typeof cursor === "string") cursor = this.localObjectProp(cursor as ObjRef, part);
+      else if (cursor && typeof cursor === "object" && !Array.isArray(cursor)) cursor = (cursor as Record<string, WooValue>)[part];
+      else return null;
+    }
+    return typeof cursor === "string" ? cursor as ObjRef : null;
+  }
+
+  private authorityPrefetchRoot(
+    root: string,
+    context: { entry: SessionEntry; scope: ObjRef; target: ObjRef }
+  ): ObjRef | null {
+    if (root === "scope") return context.scope;
+    if (root === "target") return context.target;
+    if (root === "actor") return context.entry.woo.actor;
+    return null;
   }
 
   private localObjectProp(id: ObjRef, name: string): WooValue | undefined {
     const row = this.world.exportObjects([id])[0];
     if (!row) return undefined;
-    return new Map(row.properties).get(name);
+    return row.properties.find(([prop]) => prop === name)?.[1];
   }
 
   private sessionsByActor(actor: ObjRef): SessionEntry | null {

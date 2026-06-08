@@ -92,9 +92,14 @@ export type McpInvocationResult = {
   applied?: { space: ObjRef; seq: number; ts: number };
 };
 
+export type McpDispatchOptions = {
+  directorySessionScopes?: ObjRef[];
+  toolArgSpec?: Record<string, WooValue>;
+};
+
 export type McpDispatchHooks = {
-  direct?: (sessionId: string, actor: ObjRef, target: ObjRef, verb: string, args: WooValue[], scope?: ObjRef | null, persistence?: "durable" | "live", options?: { directorySessionScopes?: ObjRef[] }) => McpDirectDispatchFrame | ErrorFrame | Promise<McpDirectDispatchFrame | ErrorFrame>;
-  call?: (sessionId: string, actor: ObjRef, space: ObjRef, message: Message) => McpAppliedDispatchFrame | ErrorFrame | Promise<McpAppliedDispatchFrame | ErrorFrame>;
+  direct?: (sessionId: string, actor: ObjRef, target: ObjRef, verb: string, args: WooValue[], scope?: ObjRef | null, persistence?: "durable" | "live", options?: McpDispatchOptions) => McpDirectDispatchFrame | ErrorFrame | Promise<McpDirectDispatchFrame | ErrorFrame>;
+  call?: (sessionId: string, actor: ObjRef, space: ObjRef, message: Message, options?: McpDispatchOptions) => McpAppliedDispatchFrame | ErrorFrame | Promise<McpAppliedDispatchFrame | ErrorFrame>;
 };
 
 export type McpToolManifestHooks = {
@@ -1245,7 +1250,8 @@ export class McpHost {
           ? await this.dispatchHooks.direct(sessionId, actor, tool.object, tool.verb, args, liveEnclosing, tool.persistence, {
               directorySessionScopes: tool.readsRoomPresence === true
                 ? roomPresenceCandidateScopes(tool.object, args, liveEnclosing)
-                : []
+                : [],
+              toolArgSpec: tool.descriptor?.arg_spec
             })
           : await this.world.directCall(undefined, actor, tool.object, tool.verb, args, { sessionId });
         if (result.op === "error") throw fromError(result.error);
@@ -1274,7 +1280,7 @@ export class McpHost {
     if (!space) throw wooError("E_INVARG", `verb ${tool.object}:${tool.verb} has no enclosing space for sequenced dispatch`);
     const message = { actor, target: tool.object, verb: tool.verb, args };
     const frame = this.dispatchHooks.call
-      ? await this.dispatchHooks.call(sessionId, actor, space, message)
+      ? await this.dispatchHooks.call(sessionId, actor, space, message, { toolArgSpec: tool.descriptor?.arg_spec })
       : await this.world.call(undefined, sessionId, space, message);
     if (frame.op === "error") throw fromError(frame.error);
     if (this.broadcasts.broadcastApplied) {

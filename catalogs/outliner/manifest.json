@@ -179,7 +179,10 @@
           "perms": "rxd",
           "direct_callable": true,
           "tool_exposed": true,
-          "arg_spec": { "args": [] },
+          "arg_spec": {
+            "args": [],
+            "authority": { "prefetch": ["scope", "target", { "first": [{ "path": ["target", "mount_room"] }, { "path": ["actor", "home"] }] }] }
+          },
           "source": "verb :leave() rxd {\n  let dest = actor.home;\n  if (this.mount_room != null) { dest = this.mount_room; }\n  if (dest == null) { dest = $nowhere; }\n  moveto(actor, dest);\n  let key = to_string(actor);\n  let umap = this.last_undo;\n  // Drop this actor's slot AND prune entries for actors no longer present.\n  let present_keys = {};\n  for a in present_actors(this) { present_keys[to_string(a)] = true; }\n  let next_u = {};\n  for k in keys(umap) { if (k != key && has(present_keys, k)) { next_u[k] = umap[k]; } }\n  this.last_undo = next_u;\n  let fmap = this.focus_by_actor;\n  let next_f = {};\n  for k in keys(fmap) { if (k != key && has(present_keys, k)) { next_f[k] = fmap[k]; } }\n  this.focus_by_actor = next_f;\n  let text = actor.name + \" closes \" + this.name + \".\";\n  observe({ type: \"outliner_left\", source: this, actor: actor, outliner: this, destination: dest, text: text, ts: now() });\n  if (this.mount_room != null) {\n    observe_to_space(this.mount_room, { type: \"outliner_activity\", source: this.mount_room, outliner: this, actor: actor, text: text, ts: now() });\n  }\n  return { room: dest, roster: this:room_roster() };\n}"
         },
         {
@@ -188,7 +191,10 @@
           "perms": "rxd",
           "direct_callable": true,
           "tool_exposed": true,
-          "arg_spec": { "args": [] },
+          "arg_spec": {
+            "args": [],
+            "authority": { "prefetch": ["scope", "target", { "first": [{ "path": ["target", "mount_room"] }, { "path": ["actor", "home"] }] }] }
+          },
           "source": "verb :out() rxd { return this:leave(); }"
         },
         {

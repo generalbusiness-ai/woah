@@ -7,7 +7,7 @@ const skippedDirs = new Set(["node_modules", "dist", ".git", "src/generated"]);
 
 // These substrate identifiers are architectural roots or compiler/runtime
 // placeholders, not catalog-level object names.
-const allowedRefs = new Set(["$wiz", "$system", "$nowhere", "$catalog_registry", "$catalog", "$error", "$me"]);
+const allowedRefs = new Set(["$wiz", "$system", "$nowhere", "$catalog_registry", "$catalog", "$error", "$me", "$verb"]);
 
 // Existing files still carry catalog-object knowledge that predates this guard.
 // Keep the exemptions narrow so new v2 code cannot add fresh object-name
@@ -28,6 +28,14 @@ const legacyDebtFiles = new Set([
 
 const objectRefPattern = /\$[A-Za-z_][A-Za-z0-9_]*/g;
 const hits = [];
+
+const forbiddenTransportCatalogCouplings = [
+  { file: "src/mcp/gateway.ts", snippet: 'verb === "leave"', reason: "MCP transport must read deterministic movement rules from verb metadata, not command words" },
+  { file: "src/mcp/gateway.ts", snippet: 'verb === "out"', reason: "MCP transport must read deterministic movement rules from verb metadata, not command words" },
+  { file: "src/mcp/gateway.ts", snippet: '"mount_room"', reason: "MCP transport must not know mounted-tool catalog properties" },
+  { file: "src/mcp/gateway.ts", snippet: '"exits"', reason: "MCP transport must not know room-topology catalog properties" },
+  { file: "src/mcp/gateway.ts", snippet: '"dest"', reason: "MCP transport must not know room-topology catalog properties" }
+];
 
 function normalize(path) {
   return relative(root, path).split(sep).join("/");
@@ -57,8 +65,16 @@ function walk(path) {
 
 for (const dir of checkedRoots) walk(join(root, dir));
 
+for (const { file, snippet, reason } of forbiddenTransportCatalogCouplings) {
+  const text = readFileSync(join(root, file), "utf8");
+  const index = text.indexOf(snippet);
+  if (index === -1) continue;
+  const line = text.slice(0, index).split(/\r?\n/).length;
+  hits.push(`${file}:${line}: ${snippet}: ${reason}`);
+}
+
 if (hits.length > 0) {
-  console.error("Catalog object literals must not leak into new core/MCP implementation files:");
+  console.error("Catalog object literals and catalog-specific transport couplings must not leak into new core/MCP implementation files:");
   for (const hit of hits) console.error(`  ${hit}`);
   console.error("");
   console.error(`Allowed substrate refs: ${Array.from(allowedRefs).sort().join(", ")}`);

@@ -292,7 +292,8 @@
           "tool_exposed": true,
           "arg_spec": {
             "args": [],
-            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" }
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" },
+            "authority": { "prefetch": ["scope", "target", { "path": ["target", "exits", "$verb", "dest"] }] }
           },
           "source": "verb :north() rxd { set_task_perms(caller_perms()); return this:go(\"north\"); }"
         },
@@ -306,7 +307,8 @@
           "tool_exposed": true,
           "arg_spec": {
             "args": [],
-            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" }
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" },
+            "authority": { "prefetch": ["scope", "target", { "path": ["target", "exits", "$verb", "dest"] }] }
           },
           "source": "verb :northeast() rxd { set_task_perms(caller_perms()); return this:go(\"northeast\"); }"
         },
@@ -320,7 +322,8 @@
           "tool_exposed": true,
           "arg_spec": {
             "args": [],
-            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" }
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" },
+            "authority": { "prefetch": ["scope", "target", { "path": ["target", "exits", "$verb", "dest"] }] }
           },
           "source": "verb :east() rxd { set_task_perms(caller_perms()); return this:go(\"east\"); }"
         },
@@ -334,7 +337,8 @@
           "tool_exposed": true,
           "arg_spec": {
             "args": [],
-            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" }
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" },
+            "authority": { "prefetch": ["scope", "target", { "path": ["target", "exits", "$verb", "dest"] }] }
           },
           "source": "verb :southeast() rxd { set_task_perms(caller_perms()); return this:go(\"southeast\"); }"
         },
@@ -348,7 +352,8 @@
           "tool_exposed": true,
           "arg_spec": {
             "args": [],
-            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" }
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" },
+            "authority": { "prefetch": ["scope", "target", { "path": ["target", "exits", "$verb", "dest"] }] }
           },
           "source": "verb :south() rxd { set_task_perms(caller_perms()); return this:go(\"south\"); }"
         },
@@ -362,7 +367,8 @@
           "tool_exposed": true,
           "arg_spec": {
             "args": [],
-            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" }
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" },
+            "authority": { "prefetch": ["scope", "target", { "path": ["target", "exits", "$verb", "dest"] }] }
           },
           "source": "verb :southwest() rxd { set_task_perms(caller_perms()); return this:go(\"southwest\"); }"
         },
@@ -376,7 +382,8 @@
           "tool_exposed": true,
           "arg_spec": {
             "args": [],
-            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" }
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" },
+            "authority": { "prefetch": ["scope", "target", { "path": ["target", "exits", "$verb", "dest"] }] }
           },
           "source": "verb :west() rxd { set_task_perms(caller_perms()); return this:go(\"west\"); }"
         },
@@ -390,7 +397,8 @@
           "tool_exposed": true,
           "arg_spec": {
             "args": [],
-            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" }
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" },
+            "authority": { "prefetch": ["scope", "target", { "path": ["target", "exits", "$verb", "dest"] }] }
           },
           "source": "verb :northwest() rxd { set_task_perms(caller_perms()); return this:go(\"northwest\"); }"
         },
@@ -404,7 +412,8 @@
           "tool_exposed": true,
           "arg_spec": {
             "args": [],
-            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" }
+            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" },
+            "authority": { "prefetch": ["scope", "target", { "path": ["target", "exits", "$verb", "dest"] }] }
           },
           "source": "verb :out() rxd { set_task_perms(caller_perms()); return this:go(\"out\"); }"
         },
@@ -837,7 +846,8 @@
           "arg_spec": {
             "args": [
               "actor?"
-            ]
+            ],
+            "authority": { "prefetch": ["scope", "target", { "path": ["actor", "home"] }] }
           },
           "source": "verb :leave(who) rxd { let dest = actor.home; if (dest == null) { dest = $nowhere; } moveto(actor, dest); observe_to_space(this, { type: \"left\", actor: actor, room: this, text: actor.name + \" left.\", ts: now() }); return { room: dest, roster: this:room_roster(), here_request: true, look_deferred: true }; }"
         },
