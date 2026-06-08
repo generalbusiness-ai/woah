@@ -425,6 +425,13 @@ describe("v2 CommitScopeDO cost budget", () => {
       expect(digest).toBeTruthy();
       expect(first.executable_transfer).toMatchObject({ mode: "cell_pages", purpose: "open_executable_seed" });
       expect(first.executable_transfer.inline_pages.length).toBeGreaterThan(0);
+      expect(firstOpenMetric).toMatchObject({
+        kind: "v2_open",
+        status: "ok",
+        executable_transfer_cache: "miss",
+        preseeded_objects: 0
+      });
+      expect(metrics.some((metric) => metric.kind === "v2_open_step" && metric.phase === "preseed_catalog_install")).toBe(false);
 
       const metricStart = metrics.length;
       resetStateCostLog(scopeState);

@@ -363,7 +363,6 @@ export class CommitScopeDO {
           this.emitV2OpenStep("browser_for", phaseStartedAt, { scope, node });
           phaseStartedAt = metricNow();
           const opened = await openShadowBrowserScope(browser, {
-            preseed_catalog_pages: true,
             last_known_head: input.last_known_head,
             executable_seed_digest: input.executable_seed_digest,
             metric: (event) => this.emitMetric(event)

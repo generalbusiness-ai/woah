@@ -7,6 +7,7 @@ import {
   applyAcceptedFrameToDerivedRelayCache,
   applyShadowBrowserTransfer,
   buildShadowBrowserSessionAuth,
+  buildShadowBrowserOpenExecutableSeedTransfer,
   buildShadowBrowserProjectionTransfer,
   createShadowBrowserNode,
   createShadowBrowserRelayShim,
@@ -48,7 +49,7 @@ import { runShadowTurnCall, runShadowTurnCallTranscript, type ShadowTurnCall } f
 import { shadowTurnKeyFromTranscript } from "../src/core/turn-key";
 import type { EffectTranscript } from "../src/core/effect-transcript";
 import { serializedFor, submitShadowCommit, type ShadowCommitAccepted, type ShadowScopeHead } from "../src/core/shadow-commit-scope";
-import { createShadowExecutionNode } from "../src/core/shadow-turn-exec";
+import { createShadowExecutionNode, type ShadowCellPageTransfer } from "../src/core/shadow-turn-exec";
 import { mergeAuthorityIntoRelayCache } from "../src/core/shadow-relay-cache";
 
 describe("shadow browser node shim", () => {
@@ -114,6 +115,34 @@ describe("shadow browser node shim", () => {
       args: ["delay_1", "wet", 0.54]
     });
     expect(turn.result).toMatchObject({ ok: true });
+  });
+
+  it("keeps browser open executable seeds focused on first-turn execution cells", async () => {
+    const anchor = createWorld();
+    const session = anchor.auth("guest:browser-open-seed-budget");
+    await anchor.directCall("browser-open-seed-budget-enter", session.actor, "the_chatroom", "enter", [], { sessionId: session.id });
+    const relay = createShadowBrowserRelayShim({
+      node: "browser-relay-open-seed-budget",
+      scope: "the_chatroom",
+      serialized: anchor.exportWorld()
+    });
+    const transfer = buildShadowBrowserOpenExecutableSeedTransfer(
+      relay,
+      "the_chatroom",
+      "browser-open-seed-budget",
+      session.actor,
+      session.id
+    );
+
+    expect(stateTransferJsonBytes(transfer)).toBeLessThan(450_000);
+    expect(pageBytesByKind(transfer).property_cell).toBeLessThan(80_000);
+    expect(pageBytesByKind(transfer).verb_bytecode).toBeLessThan(190_000);
+    expect(hasTransferPage(transfer, "$system", "property_cell", "catalog_migration_records")).toBe(false);
+    expect(hasTransferPage(transfer, "$catalog_registry", "property_cell", "installed_catalogs")).toBe(false);
+    expect(hasTransferPage(transfer, "$system", "verb_bytecode", "list_api_keys_for_owner")).toBe(false);
+    expect(hasTransferPage(transfer, "$pinboard", "verb_bytecode", "exitfunc")).toBe(false);
+    expect(hasTransferPage(transfer, "$match", "verb_bytecode", "plan_command")).toBe(true);
+    expect(hasTransferPage(transfer, "$room", "verb_bytecode", "take")).toBe(true);
   });
 
   it("bounds the relay executable seed digest cache by least-recent use", async () => {
@@ -2160,6 +2189,31 @@ async function browserForScope<T = undefined>(
 
 function worldFor(browser: ShadowBrowserNode): ReturnType<typeof createWorldFromSerialized> {
   return createWorldFromSerialized(serializedFor(browser.relay.commit_scope), { persist: false });
+}
+
+function stateTransferJsonBytes(transfer: ShadowCellPageTransfer): number {
+  return new TextEncoder().encode(JSON.stringify(transfer)).length;
+}
+
+function pageBytesByKind(transfer: ShadowCellPageTransfer): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const page of transfer.inline_pages) {
+    out[page.page] = (out[page.page] ?? 0) + new TextEncoder().encode(JSON.stringify(page)).length;
+  }
+  return out;
+}
+
+function hasTransferPage(
+  transfer: ShadowCellPageTransfer,
+  object: string,
+  page: string,
+  name?: string
+): boolean {
+  return transfer.inline_pages.some((item) =>
+    item.object === object &&
+    item.page === page &&
+    (name === undefined || ("name" in item && item.name === name))
+  );
 }
 
 async function submitIntentForTest(

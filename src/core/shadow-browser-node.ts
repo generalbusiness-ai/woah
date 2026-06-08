@@ -938,6 +938,7 @@ export function buildShadowBrowserOpenExecutableSeedTransfer(
     key,
     purpose: "open_executable_seed",
     recipient,
+    catalogVerbLookup: "bounded",
     capsule: {
       head: relay.commit_scope.head,
       actor: actor ?? "",
@@ -1032,6 +1033,10 @@ function shadowBrowserOpenExecutableSeedPreimages(serialized: SerializedWorld, s
   // Seed the feature-aware lookup for that wrapper so the browser VM follows
   // the same catalog path as the server convenience APIs on the first command.
   addOpenSeedVerbLookupCells(serialized, scope, ["command_plan"], add);
+  // The generic movement chain probes target hooks outside the caller's direct
+  // bytecode call graph, so a cold tool/room enter needs these bounded lookups
+  // on the target scope to stay local without dragging every catalog hook.
+  addOpenSeedVerbLookupCells(serialized, scope, ["acceptable", "enterfunc"], add);
 
   // Catalog lineage and property cells are executable metadata: they let a
   // partial browser shard interpret objects that arrive later from accepted
@@ -1070,6 +1075,11 @@ function addOpenSeedDispatchVerbCells(
       const obj = byId.get(current);
       if (!obj) break;
       for (const verb of obj.verbs) {
+        // The open executable seed is a cold-start surface, not a complete
+        // inherited method table. Seed verbs that a browser can actually select
+        // from a command/tool surface plus the planner wrapper needed to choose
+        // them; turn-specific repairs can fetch non-surface helpers on demand.
+        if (!openSeedDispatchVerbSelected(verb)) continue;
         add(`read:cell:verb:${obj.id}:${verb.name}`);
         add(`call:${receiver}:${verb.name}`);
       }
@@ -1080,6 +1090,10 @@ function addOpenSeedDispatchVerbCells(
   addChain(receiver);
 }
 
+function openSeedDispatchVerbSelected(verb: SerializedObject["verbs"][number]): boolean {
+  return verb.tool_exposed === true || verb.name === "command_plan";
+}
+
 function addOpenSeedVerbLookupCells(
   serialized: SerializedWorld,
   receiver: ObjRef,
@@ -1088,22 +1102,22 @@ function addOpenSeedVerbLookupCells(
 ): void {
   const byId = new Map(serialized.objects.map((obj) => [obj.id, obj] as const));
   const wanted = new Set(names);
-  let current: ObjRef | null | undefined = receiver;
-  const seen = new Set<ObjRef>();
-  while (current && !seen.has(current)) {
-    seen.add(current);
-    const obj = byId.get(current);
-    if (!obj) return;
-    for (const name of wanted) add(`read:cell:verb:${obj.id}:${name}`);
-    current = obj.parent;
-  }
-  // Verb lookup can also pass through catalog feature/mixin classes that are
-  // not on the single parent chain. The open seed already ships catalog
-  // objects; for a tiny fixed hook set, include their lookup cells too so a
-  // missing inherited no-op hook never stalls the first local movement turn.
-  for (const obj of shadowBrowserCatalogObjects(serialized)) {
-    for (const name of wanted) add(`read:cell:verb:${obj.id}:${name}`);
-  }
+  const visitedStarts = new Set<ObjRef>();
+  const addChain = (start: ObjRef | null | undefined): void => {
+    if (!start || visitedStarts.has(start)) return;
+    visitedStarts.add(start);
+    let current: ObjRef | null | undefined = start;
+    const seen = new Set<ObjRef>();
+    while (current && !seen.has(current)) {
+      seen.add(current);
+      const obj = byId.get(current);
+      if (!obj) return;
+      for (const name of wanted) add(`read:cell:verb:${obj.id}:${name}`);
+      for (const feature of serializedFeatureRefs(obj)) addChain(feature);
+      current = obj.parent;
+    }
+  };
+  addChain(receiver);
 }
 
 function addOpenSeedCatalogExecutableCells(
@@ -1112,7 +1126,7 @@ function addOpenSeedCatalogExecutableCells(
 ): void {
   for (const obj of shadowBrowserCatalogObjects(serialized)) {
     add(`read:cell:lifecycle:${obj.id}`);
-    addOpenSeedObjectCells(obj, add);
+    addOpenSeedCatalogObjectCells(obj, add);
   }
 }
 
@@ -1133,6 +1147,29 @@ function addOpenSeedObjectCells(
     add(`read:cell:contents:${obj.id}`);
     add(`write:cell:contents:${obj.id}`);
   }
+}
+
+function addOpenSeedCatalogObjectCells(
+  obj: SerializedObject,
+  add: (preimage: string) => void
+): void {
+  // Catalog rows contain large operational values such as migration ledgers and
+  // installed-catalog records. They are not executable metadata for a browser
+  // first turn. Keep structural values plus declared property definitions so
+  // inherited default reads still work without shipping catalog data payloads.
+  for (const name of openSeedCatalogPropertyNames(obj)) {
+    add(`read:cell:prop:${obj.id}.${name}`);
+  }
+}
+
+function openSeedCatalogPropertyNames(obj: SerializedObject): string[] {
+  const names = new Set<string>([
+    "features",
+    "features_version",
+    "host_placement"
+  ]);
+  for (const def of obj.propertyDefs) names.add(def.name);
+  return Array.from(names).sort();
 }
 
 function openSeedPropertyNames(obj: SerializedObject): string[] {
