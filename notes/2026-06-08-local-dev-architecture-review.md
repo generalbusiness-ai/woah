@@ -65,10 +65,12 @@ as bounded transitional debt, not as a pattern to extend.
   `turn_phase_timing.retry_ms` and `retry_detail_ms` should be inspected first;
   if they do not explain the gap, add instrumentation at the missing boundary.
 
-- [ ] Restore a trustworthy local worker lane. Isolated tests pass, but broad
+- [x] Restore a trustworthy local worker lane. Isolated tests pass, but broad
   worker runs have shown order/parallel harness instability. The goal is a
   cheap local signal that catches deployed-shape failures without becoming a
   slow prod-smoke substitute.
+  `npm run test:worker` now passes on this branch: 16 files passed, 1 skipped,
+  236 tests passed, 5 skipped, in 65s.
 
 - [x] Validate browser-local execution evidence end to end. The browser must
   show local VM planning/execution first, then server sequencing/confirmation,
@@ -91,6 +93,8 @@ as bounded transitional debt, not as a pattern to extend.
   passed in 24s.
 - `npm run task:time -- test --task "architecture review and local dev stabilization" -- npm run smoke:cf-local`
   passed 4/4 in 33s.
+- `npm run task:time -- test --task "worker lane stability audit" -- npm run test:worker`
+  passed in 1m 07s.
 - No major serialization-weight regression was visible in these runs. Browser
   cold open executable seeds were about 410 KB / 434 pages per browser in the
   sampled e2e output, and local turn cache work stayed under the existing
