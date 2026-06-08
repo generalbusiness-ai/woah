@@ -72,7 +72,17 @@ describe("browser-localdev per-turn cost", () => {
     // eslint-disable-next-line no-console
     console.log(`[browser-localdev perf] steady-state avg objects re-serialized/turn = ${avgReserialized.toFixed(0)} (world=${totalObjects})`);
 
-    // Baseline assertion (loose, documents current behavior — tighten after fix).
     expect(perTurn.length).toBe(4);
+    // Real guard: the core localdev turn primitive must NOT re-serialize the whole
+    // world on a steady-state turn. Each materialization is an O(world) sort + array
+    // rebuild; a regression that makes serializedFor re-materialize per turn would
+    // push these above zero. This is the "core is lean" backstop for the browser/
+    // localdev perf work (notes/2026-06-08-browser-localdev-perf.md): the measured
+    // browser-side costs are addressed in v2-browser-worker.ts, and this asserts the
+    // substrate underneath them stays free of full-world serialization churn.
+    for (const turn of steady) {
+      expect(turn.materializations, `turn ${turn.label} forced ${turn.materializations} full-world (re)serialization(s)`).toBe(0);
+      expect(turn.objectsReserialized, `turn ${turn.label} re-serialized ${turn.objectsReserialized} objects`).toBe(0);
+    }
   });
 });

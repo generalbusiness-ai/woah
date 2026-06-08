@@ -1735,8 +1735,13 @@ async function db(): Promise<IDBDatabase> {
 const metaCache = new Map<string, unknown>();
 
 async function putMeta(key: string, value: unknown): Promise<void> {
-  metaCache.set(key, value);
+  // Populate the cache only AFTER the write commits. If the transaction throws, the
+  // cache stays consistent with IndexedDB (neither holds the value) rather than
+  // serving a head/catchup/hello value that was never persisted. A getMeta that
+  // races an in-flight putMeta reads IndexedDB and observes the pre-write value,
+  // which is the correct (not-yet-committed) state.
   await tx(META_STORE, "readwrite", (store) => store.put(value, key));
+  metaCache.set(key, value);
 }
 
 async function getMeta<T>(key: string): Promise<T | undefined> {

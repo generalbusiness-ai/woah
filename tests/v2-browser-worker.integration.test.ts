@@ -1988,10 +1988,13 @@ describe("v2 browser worker integration", () => {
 
     // Memo invariant: the execution cache is memoized by input epoch, so a redundant
     // cache_status with no intervening state change is served from the memo and does
-    // NOT re-read state pages from IndexedDB.
+    // NOT re-read state pages from IndexedDB. Wait for the status produced by THIS
+    // dispatch (after `mark`) — matching an older ready status would let the assertion
+    // run before the new async status finishes, and the still-in-flight status() would
+    // then reject once afterEach unstubs postMessage.
     const mark = posted.length;
     scope.dispatch({ kind: "cache_status" });
-    await waitForMessage(posted, (message) => isReadyStatus(message));
+    await waitForMessageFrom(posted, mark, (message) => isReadyStatus(message));
     expect(bulkStatePageReadsSince(mark)).toHaveLength(0);
   });
 
