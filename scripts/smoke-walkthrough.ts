@@ -410,9 +410,10 @@ async function resetSessionPair(pair: SessionPair, failedStep: string): Promise<
 }
 
 // Step-level watchdog. Even if every per-RPC fetch has a deadline, a step
-// that loops over many short calls could still drift long. The watchdog is
-// the hard upper bound and aborts the body if the step itself is stuck.
-const STEP_TIMEOUT_MS = 60_000;
+// that loops over many short calls could still drift long. Deployed smoke
+// setup steps intentionally bundle several cross-shard movement/entry calls,
+// so the step envelope is larger than the 20s per-RPC stuck-request guard.
+const STEP_TIMEOUT_MS = positiveIntEnv("WOO_SMOKE_STEP_TIMEOUT_MS", 120_000);
 async function step(name: string, body: (ctx: StepContext) => Promise<void>): Promise<boolean> {
   const startedAt = Date.now();
   try {
@@ -703,6 +704,13 @@ function mergeSignals(a: AbortSignal | undefined, b: AbortSignal): AbortSignal {
   if (b.aborted) merged.abort();
   else b.addEventListener("abort", relay, { once: true });
   return merged.signal;
+}
+
+function positiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {

@@ -46,6 +46,25 @@ Ignored raw artifacts for the 9/10 deployed run:
 - `.woo/smoke-measurements/deploy-0499b8ce-2bcf337-20260608T2020Z/analyze-smoke-tail.txt`
 - `.woo/smoke-measurements/deploy-0499b8ce-2bcf337-20260608T2020Z/analyze-data-path-costs.txt`
 
+Commit `9d84257` deployed to Cloudflare version
+`30b552e8-4730-4f64-a195-394fa991caf0` after active-scope MCP owner-refresh
+repair. The deploy preflight, tests, build, and postflight checks passed, but
+the built-in deployed smoke failed 8/10: pinboard timed out at the step
+watchdog, and tasks reported `E_INTERNAL fresh turn produced no recording:
+the_chatroom:southeast: E_VERBNF verb not found`. A tail-captured follow-up
+failed 7/10, with `pinboard:add_note reaches peer` passing at 59,478 ms,
+`outliner:enter result includes a roster row for alice` timing out at the
+60,006 ms step watchdog, `outliner:add_item reaches peer` losing the MCP
+session after reset, and tasks finding the recovery actor outside `the_deck`.
+
+Ignored raw artifacts for the `30b552e8` deployed run:
+
+- `.woo/smoke-measurements/deploy-30b552e8-9d84257-20260608T2040Z/tail.log`
+- `.woo/smoke-measurements/deploy-30b552e8-9d84257-20260608T2040Z/smoke.log`
+- `.woo/smoke-measurements/deploy-30b552e8-9d84257-20260608T2040Z/smoke-run-1.log`
+- `.woo/smoke-measurements/deploy-30b552e8-9d84257-20260608T2040Z/analyze-smoke-tail.txt`
+- `.woo/smoke-measurements/deploy-30b552e8-9d84257-20260608T2040Z/analyze-data-path-costs.txt`
+
 ## Correctness Finding
 
 The pinboard blocker happened before VM execution during scope/session
@@ -78,6 +97,23 @@ for `the_chatroom`; because that row did not look remote, the local
 a fresh tool surface. The MCP host now gives active-scope local verb misses one
 bounded owner refresh before reporting the tool gone.
 
+Fourth root cause: the deployed reset path can open a fresh sparse gateway
+state where `the_chatroom` is absent locally. `runShadowTurnCallOnWorldTranscript`
+previously preserved only pre-recording `E_NEED_STATE`, wrapping
+pre-recording `E_OBJNF` and `E_VERBNF` in an opaque
+`fresh turn produced no recording` error. That stripped the code/value pair the
+scope executor needs to refresh authority and retry. Shadow turn calls now
+preserve `E_NEED_STATE`, `E_OBJNF`, and `E_VERBNF` when they are raised before
+the recorder opens.
+
+Fifth finding: the pinboard and outliner step watchdog trips were not single
+stuck verb calls. The `outliner:enter` turn itself completed in 9,959 ms, but
+the smoke step bundled several serial deployed movements and drains before the
+assertion: `alice.leave pinboard` about 14.7s, `bob.leave pinboard` about 8.1s,
+`alice west` about 9.1s, `bob west` about 12.7s, and `the_outline:enter` about
+10s. The walkthrough now keeps the 20s per-RPC stuck-request guard but raises
+the step envelope to an env-configurable 120s default.
+
 Fix validation after patching authority-slice materialization:
 
 - `npm run test:files -- tests/authority-slice-shape.test.ts tests/worker/cf-local-structural.test.ts`
@@ -102,6 +138,17 @@ Additional validation after active-scope MCP owner refresh:
   passed, 108 tests.
 - `npm run smoke:cf-local` passed, 1 file, 4 tests, Vitest duration 34.63s.
 - `npm test` passed, 29 files and 375 tests.
+- `npm run typecheck` passed both TypeScript configs.
+
+Validation after preserving pre-recording sparse repair errors and widening the
+smoke step envelope:
+
+- `npm run test:files -- tests/scope-executor-garden-probe.test.ts tests/smoke-walkthrough-harness.test.ts`
+  passed, 8 tests.
+- `npm run test:files -- tests/mcp.test.ts tests/scope-executor-garden-probe.test.ts tests/smoke-walkthrough-harness.test.ts tests/worker/cf-local-structural.test.ts`
+  passed, 75 tests.
+- `npm run smoke:cf-local` passed, 1 file, 4 tests, Vitest duration 33.85s.
+- `npm test` passed, 29 files and 376 tests.
 - `npm run typecheck` passed both TypeScript configs.
 
 ## Performance Summary
@@ -188,10 +235,50 @@ Data-path costs:
 - Remote owner refresh count: 35.
 - Tool-surface reverse-index source rows requested: 470; cap-hit events: 0.
 
+The tail-captured deployed run after active-scope MCP owner refresh found 700
+Cloudflare tail events and 2,679 `woo.metric` rows.
+
+Cloudflare invocation timing:
+
+- Worker `POST /mcp`: 70 requests, 3 errors, p95 13,695 ms, max 15,309 ms.
+- PersistentObjectDO `POST /mcp`: 69 requests, 1 error, p95 13,675 ms, max
+  15,256 ms, CPU p95 8,257 ms.
+- CommitScopeDO `POST /v2/envelope`: 21 requests, p95 1,990 ms, max 2,027 ms.
+- PersistentObjectDO `POST /__internal/authority-slice`: 55 requests, p95
+  860 ms, max 1,120 ms.
+- Worker/PersistentObjectDO `DELETE /mcp`: p95 3,761 ms, max 7,248 ms.
+
+Turn phase attribution across reported turns:
+
+- Submit: 92,119 ms, 56% of summed turn wall time.
+- Authority planning: 40,785 ms, 25%.
+- Ensure-client: 32,927 ms, 20%.
+
+Largest deployed costs:
+
+- `worker.commit_scope_envelope_rpc`: 87,425 ms, p95 7,255 ms.
+- `/__internal/authority-slice -> world`: 25 calls, 18,786 ms summed.
+- `/__internal/authority-slice -> the_deck`: 12 calls, 8,354 ms summed.
+- `/__internal/authority-slice -> the_chatroom`: 9 calls, 6,223 ms summed.
+- `/__internal/mcp-commit-fanout -> mcp-gateway-6`: one 5,000 ms timeout.
+
+Data-path costs:
+
+- `storage_full_save`: 1 event, 4,872 rows.
+- `storage_direct_write`: 132 metric rows, 1,372 data rows.
+- Observed projection bytes: 1.20 MiB.
+- Cross-host round trips: 148.
+- Same-host fallback count: 30.
+- Remote owner refresh count: 24.
+- Tool-surface reverse-index source rows requested: 398; cap-hit events: 0.
+
 ## Interpretation
 
 The deployed failure was a correctness blocker in sparse authority-slice
-materialization, not a timeout. The performance profile still points to the
-same scaling center as CF-local smoke: authority-slice reconstruction and
-commit-scope envelope RPC dominate warm turn latency, with deployed wall time
-roughly an order of magnitude higher than local CF shape.
+materialization first, then sparse MCP repair propagation. The performance
+profile still points to the same scaling center as CF-local smoke:
+authority-slice reconstruction and commit-scope envelope RPC dominate warm turn
+latency, with deployed wall time roughly an order of magnitude higher than
+local CF shape. The `30b552e8` run also showed that the 60s smoke step watchdog
+was too close to the deployed end-to-end latency envelope for steps that
+intentionally serialize several cross-shard operations.

@@ -171,13 +171,13 @@ export async function runShadowTurnCallOnWorldTranscript(
 
   const recorded = recorder.turns[0];
   if (!recorded) {
-    // A repair guard can raise E_NEED_STATE before the turn recorder opens: the
-    // VTN10.1 guarded preamble does this for missing materialization, and the MCP
-    // resolution-owner guard does it for stale projection contents during command
-    // parsing. Preserve that repair signal so the executor can refresh authority
-    // and retry, instead of burying it under an opaque "no recording" error. Any
-    // other no-recording error is still a genuine bug and propagates as before.
-    if (frame.op === "error" && frame.error.code === "E_NEED_STATE") {
+    // A repair guard can raise before the turn recorder opens: the VTN10.1
+    // guarded preamble does this for missing materialization, and sparse MCP
+    // planning can hit E_OBJNF/E_VERBNF before dispatch opens a recorder.
+    // Preserve those structured repair signals so the executor can refresh
+    // authority and retry, instead of burying them under an opaque
+    // "no recording" error. Other no-recording errors still propagate as bugs.
+    if (frame.op === "error" && preRecordingErrorIsRepairable(frame.error.code)) {
       throw frame.error;
     }
     const suffix = frame.op === "error" ? `: ${frame.error.code} ${frame.error.message}` : "";
@@ -189,6 +189,10 @@ export async function runShadowTurnCallOnWorldTranscript(
     recorded,
     transcript
   };
+}
+
+function preRecordingErrorIsRepairable(code: string): boolean {
+  return code === "E_NEED_STATE" || code === "E_OBJNF" || code === "E_VERBNF";
 }
 
 class ShadowStateGuardTurnRecorder implements TurnRecorder {
