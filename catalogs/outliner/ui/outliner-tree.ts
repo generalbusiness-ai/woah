@@ -110,6 +110,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
   private dragSourceId: string | null = null;
   private hydrateAttempted = false;
   private bound = false;
+  private itemHydrationSubject = "";
   private projectionMissingItemTextSignature = "";
   private readonly itemTextHydrator = new CoalescedViewHydrator<OutlinerItem[]>({
     read: async (subject) => {
@@ -131,6 +132,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
   });
 
   set data(value: OutlinerData) {
+    this.resetItemHydrationIfSubjectChanged(value.outlinerId || this.subject || "");
     this.model = value;
     this.projectionMissingItemTextSignature = "";
     this.render();
@@ -171,6 +173,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
 
   syncFromProjection(): void {
     if (!this.woo || !this.subject) return;
+    this.resetItemHydrationIfSubjectChanged(this.subject);
     const projection = this.woo.observe(this.subject);
     const focusMap = (projection?.props?.focus_by_actor ?? {}) as Record<string, string | null>;
     const actor = this.woo.actor;
@@ -280,6 +283,13 @@ export class WooOutlinerTreeElement extends HTMLElement {
 
   private updateProjectionMissingItemText(ids: string[]): void {
     this.projectionMissingItemTextSignature = [...new Set(ids)].sort().join("|");
+  }
+
+  private resetItemHydrationIfSubjectChanged(subject: string): void {
+    if (!subject || this.itemHydrationSubject === subject) return;
+    this.itemHydrationSubject = subject;
+    this.projectionMissingItemTextSignature = "";
+    this.itemTextHydrator.reset();
   }
 
   private requestItemsFromList(): void {

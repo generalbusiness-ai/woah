@@ -544,6 +544,7 @@ function connect() {
     }
     state.session = session;
     projectionFiller.reset();
+    resetPinboardNotesHydration();
     render();
     try {
       await refresh();
@@ -1570,6 +1571,7 @@ const pinboardNotesHydrator = new CoalescedViewHydrator<any[]>({
     if (state.tab === "pinboard") render();
   }
 });
+let pinboardNotesHydrationBoard = "";
 
 // Initial connect must run AFTER the projection/view hydrators are declared
 // above:
@@ -2030,11 +2032,25 @@ function hydratePinboardNotesTextIfNeeded(pinboard: any) {
   const board = pinboard?.board;
   const boardId = typeof board?.id === "string" ? board.id : "";
   const notes = Array.isArray(pinboard?.notes) ? pinboard.notes : [];
+  if (!boardId) {
+    resetPinboardNotesHydration();
+    return;
+  }
+  if (pinboardNotesHydrationBoard !== boardId) {
+    // Hydration memoization is per visible board; board/session changes should
+    // drop old missing-text signatures instead of accumulating forever.
+    pinboardNotesHydrationBoard = boardId;
+    pinboardNotesHydrator.reset();
+  }
   if (!canSendPinboardV2()) return;
   if (!pinboardActorPresent()) return;
   if (!pinboardNotesHaveMissingText(notes)) return;
-  if (!boardId) return;
   pinboardNotesHydrator.ensure(boardId, pinboardMissingTextSignature(notes));
+}
+
+function resetPinboardNotesHydration(): void {
+  pinboardNotesHydrationBoard = "";
+  pinboardNotesHydrator.reset();
 }
 
 function normalizePinboardNotes(notes: any[], previousNotes: any[] = []) {
