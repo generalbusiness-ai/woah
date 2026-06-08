@@ -249,10 +249,15 @@ Two distinct accepted-transcript effects drive distinct projections. A physical
 `object_move` (the actor's `live:location` write) drives **containment**
 projections (`object.contents`). A first-class **session active-scope
 transition** drives **presence** projections (the session/actor subscriber lists)
-and session-row materialization. Presence is keyed by *session placement*, not
-physical containment, so the transition is recorded whenever a session's active
-scope changes — **including a no-op physical enter** (the actor was already in the
-room) — and its reliable `from`/`to` replace a possibly-sparse move's `from`:
+and session-row materialization. For actors, materializers also use the
+transition as a CA4 membership-mirror repair edge: if a sparse physical move says
+`$nowhere -> new_room` while the session transition says `old_room -> new_room`,
+the actor is removed from `old_room.contents` and added to `new_room.contents`.
+This repairs derived contents, not `live:location` authority. Presence is keyed
+by *session placement*, not physical containment, so the transition is recorded
+whenever a session's active scope changes — **including a no-op physical enter**
+(the actor was already in the room) — and its reliable `from`/`to` replace a
+possibly-sparse move's `from`:
 
 ```ts
 type SessionScopeTransition = {

@@ -2105,6 +2105,32 @@ describe("local catalogs", () => {
     if (wizTitle.op === "result") expect(wizTitle.result).toBe(world.object("$wiz").name);
   });
 
+  it("server text-command planning dispatches the room command_plan verb", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:server-command-plan-dispatch");
+    await world.directCall("enter-server-command-plan-dispatch", session.actor, "the_chatroom", "enter", []);
+    expect(installVerb(world, "the_chatroom", "command_plan", `verb :command_plan(text) rxd {
+      observe({ type: "planner_override", source: this, actor: actor, text: text });
+      return { ok: false, marker: "room_command_plan_override", text: text };
+    }`, null).ok).toBe(true);
+
+    const direct = await world.directCall("direct-command-plan-dispatch", session.actor, "the_chatroom", "command_plan", ["probe"]);
+    const server = await world.planCommand("server-command-plan-dispatch", session.id, "the_chatroom", "probe");
+
+    expect(direct.op).toBe("result");
+    expect(server.op).toBe("result");
+    if (direct.op === "result" && server.op === "result") {
+      expect(server.result).toEqual(direct.result);
+      expect(server.result).toMatchObject({ marker: "room_command_plan_override", text: "probe" });
+      expect(server.observations).toContainEqual(expect.objectContaining({
+        type: "planner_override",
+        source: "the_chatroom",
+        actor: session.actor,
+        text: "probe"
+      }));
+    }
+  });
+
   it("plans chat speech and object commands through the room parser", async () => {
     const world = createWorld();
     const first = world.auth("guest:chat-command-first");
@@ -2129,6 +2155,12 @@ describe("local catalogs", () => {
     expect(dubspaceFilterPlanBeforeEnter.op).toBe("result");
     if (dubspaceFilterPlanBeforeEnter.op === "result") {
       expect(dubspaceFilterPlanBeforeEnter.result).toMatchObject({ ok: true, route: "direct", target: "the_dubspace", verb: "say_to", args: ["filter_1", "500"] });
+    }
+
+    const serverDubspacePlanBeforeEnter = await world.planCommand("server-plan-dubspace-filter-before-enter", first.id, "the_dubspace", "`filter 501");
+    expect(serverDubspacePlanBeforeEnter.op).toBe("result");
+    if (serverDubspacePlanBeforeEnter.op === "result") {
+      expect(serverDubspacePlanBeforeEnter.result).toMatchObject({ ok: true, route: "direct", target: "the_dubspace", verb: "say_to", args: ["filter_1", "501"] });
     }
 
     const rawDubspacePlanBeforeEnter = await world.directCall("raw-plan-dubspace-before-enter", first.actor, "$match", "plan_command", ["`filter 500", "the_dubspace"]);

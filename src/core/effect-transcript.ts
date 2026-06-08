@@ -49,8 +49,10 @@ export type TranscriptMove = {
 // `TranscriptMove`: it is recorded whenever a session's active scope changes —
 // including a no-op physical enter (actor already in the room) — and it is the
 // authoritative input for live presence projections (session_subscribers /
-// subscribers) and session-row materialization. Routing/presence state, not
-// room-membership authority, so it does not count as a CA3 authoritative write.
+// subscribers), session-row materialization, and actor membership mirror repair
+// when a sparse physical move lacks the real source room. Routing/presence state,
+// not room-membership authority, so it does not count as a CA3 authoritative
+// write.
 export type TranscriptSessionScopeTransition = {
   session: string;
   actor: ObjRef;
@@ -863,4 +865,3 @@ function transcriptReadValuesMatch(cell: TranscriptCell, actual: WooValue, recor
 function canonicalContentsValue(value: WooValue): WooValue {
   return Array.isArray(value) ? [...value].sort() : value;
 }
-

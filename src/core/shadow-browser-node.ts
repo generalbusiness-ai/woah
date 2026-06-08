@@ -1028,32 +1028,56 @@ function shadowBrowserOpenExecutableSeedPreimages(serialized: SerializedWorld, s
     // a repair round.
     addOpenSeedVerbLookupCells(serialized, actorLocationObj.id, ["exitfunc"], add);
   }
+  // Text command planning is a real direct verb call to `scope:command_plan`.
+  // Seed the feature-aware lookup for that wrapper so the browser VM follows
+  // the same catalog path as the server convenience APIs on the first command.
+  addOpenSeedVerbLookupCells(serialized, scope, ["command_plan"], add);
 
   // Catalog lineage and property cells are executable metadata: they let a
   // partial browser shard interpret objects that arrive later from accepted
   // transcripts. Without these pages, `isa()` and inherited property walks can
-  // degrade to false/not-found inside a syntactically valid local world. Verb
-  // bytecode remains exact-repair driven because all bundled catalog bytecode is
-  // too large for the open envelope.
+  // degrade to false/not-found inside a syntactically valid local world. Broad
+  // catalog bytecode remains exact-repair driven; the scope's own dispatch
+  // parent/feature closure is seeded below for first-turn local execution.
   addOpenSeedCatalogExecutableCells(serialized, add);
 
   // The browser cannot derive a first-turn key without the selected verb's
-  // bytecode. Scope-lineage verb pages cover normal tool controls while keeping
-  // large content-object catalogs out of the open envelope; content-specific
-  // verbs still arrive through exact missing-state repair after the key exists.
-  let current: ObjRef | null | undefined = scope;
-  while (current) {
-    const obj = byId.get(current);
-    if (!obj) break;
-    for (const verb of obj.verbs) {
-      add(`read:cell:verb:${obj.id}:${verb.name}`);
-      add(`call:${scope}:${verb.name}`);
-    }
-    current = obj.parent;
-  }
+  // bytecode. Scope parent-chain AND feature-chain verb pages cover normal
+  // chat/tool commands (`command_plan`, `say`, `take`, `drop`, movement, ...)
+  // while keeping unrelated content-object catalogs out of the open envelope;
+  // content-specific verbs still arrive through exact missing-state repair
+  // after the key exists.
+  addOpenSeedDispatchVerbCells(serialized, scope, add);
   return [
     ...preimages
   ].sort();
+}
+
+function addOpenSeedDispatchVerbCells(
+  serialized: SerializedWorld,
+  receiver: ObjRef,
+  add: (preimage: string) => void
+): void {
+  const byId = new Map(serialized.objects.map((obj) => [obj.id, obj] as const));
+  const visitedStarts = new Set<ObjRef>();
+  const addChain = (start: ObjRef | null | undefined): void => {
+    if (!start || visitedStarts.has(start)) return;
+    visitedStarts.add(start);
+    let current: ObjRef | null | undefined = start;
+    const visitedChain = new Set<ObjRef>();
+    while (current && !visitedChain.has(current)) {
+      visitedChain.add(current);
+      const obj = byId.get(current);
+      if (!obj) break;
+      for (const verb of obj.verbs) {
+        add(`read:cell:verb:${obj.id}:${verb.name}`);
+        add(`call:${receiver}:${verb.name}`);
+      }
+      for (const feature of serializedFeatureRefs(obj)) addChain(feature);
+      current = obj.parent;
+    }
+  };
+  addChain(receiver);
 }
 
 function addOpenSeedVerbLookupCells(

@@ -3632,55 +3632,18 @@ export class WooWorld {
   }
 
   private async planCommandNow(frameId: string | undefined, sessionId: string, space: ObjRef, text: string): Promise<DirectResultFrame | ErrorFrame> {
-    const startedAt = Date.now();
     try {
       assertObj(space);
       assertString(text);
       const actor = this.sessionActor(sessionId);
-      const hostMemo = createHostOperationMemo();
-      if (!await this.isDescendantOfChecked(space, "$space", hostMemo)) throw wooError("E_TYPE", `${space} is not a space`, space);
-      await this.chatPresentAsync(space, actor);
-      this.authorizePresence(actor, space, sessionId);
-      const observations: Observation[] = [];
-      const ctx: CallContext = {
-        world: this,
-        space,
-        seq: -1,
-        session: sessionId,
-        actor,
-        player: actor,
-        caller: "#-1",
-        callerPerms: actor,
-        progr: actor,
-        thisObj: space,
-        verbName: "command",
-        definer: space,
-        message: { actor, target: space, verb: "command", args: [text] },
-        observations,
-        hostMemo,
-        observe: (event) => {
-          const observation = { ...event, source: event.source ?? space };
-          this.recordTurnEvent({ kind: "observe", observation });
-          observations.push(observation);
-        }
-      };
-      const result = await this.planCommandForSpace(ctx, text, space) as WooValue;
-      const liveAudiences = await this.directLiveAudiences(space, observations);
-      this.recordMetric({ kind: "direct_call", target: space, verb: "command", audience: space, observations: observations.length, ms: Date.now() - startedAt, status: "ok" });
-      return {
-        op: "result",
-        id: frameId,
-        result,
-        observations,
-        audience: space,
-        audienceActors: liveAudiences.audienceActors,
-        observationAudiences: liveAudiences.observationAudiences,
-        audienceSessions: liveAudiences.audienceSessions,
-        observationSessionAudiences: liveAudiences.observationSessionAudiences
-      };
+      // Text-command planning is ordinary catalog behavior. Keep this server
+      // convenience wrapper on the exact same verb-dispatch path as browser,
+      // REST, MCP, and in-world `:command` callers so space overrides, feature
+      // wrappers, skip-presence metadata, observations, and recorder reads are
+      // identical on every transport.
+      return await this.directCallNow(frameId, actor, space, "command_plan", [text], { sessionId });
     } catch (err) {
       const error = normalizeError(err);
-      this.recordMetric({ kind: "direct_call", target: space, verb: "command", audience: space, observations: 0, ms: Date.now() - startedAt, status: "error" });
       return { op: "error", id: frameId, error };
     }
   }
@@ -7316,6 +7279,49 @@ export class WooWorld {
       }
     }
 
+    // Movement writes make `location(object)` authoritative, but inventory and
+    // room matching read the derived `contents(container)` mirror. Host-sliced
+    // localdev/Worker write-through must therefore repair any source/dest
+    // container this host owns; otherwise a user can successfully take an item
+    // and immediately fail `drop` because contents(actor) stayed stale.
+    for (const move of transcript.moves) {
+      if (move.from && move.from !== move.to && belongsHere(move.from)) {
+        const from = this.objects.get(move.from);
+        if (from) {
+          from.contents.delete(move.object);
+          markObject(move.from);
+        }
+      }
+      if (belongsHere(move.to)) {
+        const to = this.objects.get(move.to);
+        if (to) {
+          addSortedSetValue(to.contents, move.object);
+          markObject(move.to);
+        }
+      }
+    }
+    const sessionTransition = transcript.sessionScopeTransition;
+    if (sessionTransition?.to) {
+      // Actor movement can record a physical move from a stale cached row
+      // (for example `$nowhere -> deck`) while the session transition carries
+      // the real room placement (`chatroom -> deck`). Use that CA8 placement to
+      // keep room contents mirrors coherent for matching and roster reads.
+      if (sessionTransition.from && sessionTransition.from !== sessionTransition.to && belongsHere(sessionTransition.from)) {
+        const from = this.objects.get(sessionTransition.from);
+        if (from) {
+          from.contents.delete(sessionTransition.actor);
+          markObject(sessionTransition.from);
+        }
+      }
+      if (belongsHere(sessionTransition.to)) {
+        const to = this.objects.get(sessionTransition.to);
+        if (to) {
+          addSortedSetValue(to.contents, sessionTransition.actor);
+          markObject(sessionTransition.to);
+        }
+      }
+    }
+
     // CA4/CA8 presence projection (per-host slice): an accepted session
     // active-scope transition repairs the source/destination rooms'
     // metadata-declared presence cells on whichever host owns each room, so this
@@ -7467,6 +7473,21 @@ export class WooWorld {
       if (!skippedHostPredicates?.belongsHere(move.to)) {
         this.objects.get(move.to)?.contents.add(move.object);
         touchedObjects.add(move.to);
+      }
+    }
+    const sessionTransition = transcript.sessionScopeTransition;
+    if (sessionTransition?.to) {
+      // Full/gateway materialization has the same stale-physical-source risk as
+      // host-sliced write-through. The session transition is the authoritative
+      // placement edge for actors, so use it to remove the actor from the old
+      // room even when the physical move effect could only say `$nowhere`.
+      if (sessionTransition.from && sessionTransition.from !== sessionTransition.to && !skippedHostPredicates?.belongsHere(sessionTransition.from)) {
+        this.objects.get(sessionTransition.from)?.contents.delete(sessionTransition.actor);
+        touchedObjects.add(sessionTransition.from);
+      }
+      if (!skippedHostPredicates?.belongsHere(sessionTransition.to)) {
+        this.objects.get(sessionTransition.to)?.contents.add(sessionTransition.actor);
+        touchedObjects.add(sessionTransition.to);
       }
     }
     // CA4/CA8 presence projection: a session active-scope transition also

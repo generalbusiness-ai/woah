@@ -7,7 +7,8 @@ import { buildShadowBrowserCatchupTransferForBrowser, buildShadowTurnIntentEnvel
 import { encodeEnvelope } from "../src/core/shadow-envelope";
 import { serializedFor } from "../src/core/shadow-commit-scope";
 import { runShadowTurnCall, type ShadowTurnCall } from "../src/core/shadow-turn-call";
-import { encodeExecutorIntentEnvelope } from "../src/core/executor";
+import { encodeExecutorIntentEnvelope, executorAuthorityPayload } from "../src/core/executor";
+import { markShadowBrowserRelaySerializedChanged, mergeAuthorityIntoRelayCache } from "../src/core/shadow-relay-cache";
 import { decodeTurnIntentCall, devV2BrowserProfileTurnReply, executeDevV2DurableTurnFrame, executeDevV2DurableTurnWsReply, executeDevV2StateTransferWsReply, executeInProcessV2DurableTurn } from "../src/server/dev-v2-helpers";
 import { shadowTurnKeyFromTranscript } from "../src/core/turn-key";
 import { hydrateShadowRelayTail, serializeShadowRelayTail, type SerializedShadowRelayTail } from "../src/core/shadow-relay-tail";
@@ -282,6 +283,71 @@ describe("dev v2 durable turn — CF contract parity", () => {
     expect(planningCommit?.commit_scope.head.seq ?? 0).toBe(0);
     const committed = createWorldFromSerialized(serializedFor(actorCommit!.commit_scope), { persist: false });
     expect(committed.allLocationsForActor(session.actor)).toEqual(["reloc_dest"]);
+  });
+
+  it("materializes contents mirrors for carried objects so REST-shaped drop can match inventory", async () => {
+    // This is the local dev-server user path, not just the lower-level browser
+    // shim: REST durable turns plan on sparse gateway relays, commit on per-scope
+    // relays, then write through the accepted transcript to the local SQLite
+    // world. `drop` resolves inventory with contents(actor), so write-through
+    // must repair container mirrors as well as the moved object's location.
+    const world = createWorld();
+    const session = world.auth("guest:dev-rest-carry-drop");
+    const token = shadowBrowserSessionBearer({ id: session.id, actor: session.actor });
+    const resolvers = makeDevResolvers(world, "carry-drop");
+    const refreshGatewayLikeDevServer = (relay: ShadowRelayCache, extraObjectIds: ObjRef[]): ShadowRelayCache => {
+      const { authority } = executorAuthorityPayload(world, extraObjectIds);
+      mergeAuthorityIntoRelayCache(relay, authority, { preserveSessionActorLive: true, clone: true, reason: "test_dev_authority_merge" });
+      // dev-server.ts also refreshes the serialized session actor after the
+      // authority merge; that replacement is what exposes the local world's
+      // current inventory mirror to the destination-scope planner.
+      const [actorRecord] = world.exportObjects([session.actor]);
+      if (actorRecord) {
+        const snapshot = serializedFor(relay.commit_scope, { reason: "test_dev_session_actor_merge" });
+        const index = snapshot.objects.findIndex((object) => object.id === actorRecord.id);
+        if (index < 0) snapshot.objects.push(actorRecord);
+        else snapshot.objects[index] = actorRecord;
+        markShadowBrowserRelaySerializedChanged(relay);
+      }
+      return relay;
+    };
+    const run = async (id: string, scope: ObjRef, verb: string, args: WooValue[]) => {
+      return await executeDevV2DurableTurnFrame({
+        world,
+        gatewayRelayForScope: (s) => refreshGatewayLikeDevServer(resolvers.gatewayRelayForScope(s), [scope, scope, session.actor]),
+        commitRelayForScope: resolvers.commitRelayForScope,
+        node: `dev:rest-${id}`,
+        call: {
+          id,
+          route: "direct",
+          scope,
+          session: session.id,
+          actor: session.actor,
+          target: scope,
+          verb,
+          args,
+          persistence: "durable",
+          token
+        }
+      });
+    };
+
+    await run("carry-enter", "the_chatroom", "enter", []);
+    await run("carry-take", "the_chatroom", "take", ["mug"]);
+    expect(world.object("the_mug").location).toBe(session.actor);
+    expect(world.contentsOf(session.actor)).toContain("the_mug");
+    expect(world.contentsOf("the_chatroom")).not.toContain("the_mug");
+
+    await run("carry-move", "the_chatroom", "southeast", []);
+    expect(world.object(session.actor).location).toBe("the_deck");
+    expect(world.contentsOf("the_chatroom")).not.toContain(session.actor);
+    expect(world.contentsOf("the_deck")).toContain(session.actor);
+
+    const dropped = await run("carry-drop", "the_deck", "drop", ["mug"]);
+    expect(dropped.frame.op).toBe("applied");
+    expect(world.object("the_mug").location).toBe("the_deck");
+    expect(world.contentsOf(session.actor)).not.toContain("the_mug");
+    expect(world.contentsOf("the_deck")).toContain("the_mug");
   });
 
   // WS drain contract: the socket reply MUST be addressed to the WS client and
