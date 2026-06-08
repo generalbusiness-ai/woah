@@ -33,30 +33,51 @@ as bounded transitional debt, not as a pattern to extend.
   `:command_plan` wrapper is used, and allows `planCommandForSpace` only under
   `nativeHandlers.set("plan_command", ...)`.
 
-- [ ] Make browser open executable seed metadata-driven. The open seed in
+- [x] Make browser open executable seed metadata-driven. The open seed in
   `src/core/shadow-browser-node.ts` currently names `command_plan`,
   `acceptable`, `enterfunc`, `exitfunc`, and several catalog/user-facing
   properties. The direction should be declared executable dependencies from
   bytecode, native primitive contracts, verb metadata, or catalog metadata,
   with the current hand list only as a temporary compatibility surface.
+  `src/core/native-primitive-contract.ts` now declares the command-planning
+  and movement open-seed dependencies, and
+  `src/core/browser-open-seed-contract.ts` centralizes the remaining
+  substrate/browser-holder property dependencies. The browser seed builder
+  consumes those declarations instead of carrying its own command/movement
+  lists. `tests/shadow-browser-node.test.ts` asserts the declaration and the
+  resulting transfer shape.
 
-- [ ] Keep command grammar conventions out of ordinary runtime paths.
+- [x] Keep command grammar conventions out of ordinary runtime paths.
   `planCommandForSpace` is a transitional native-backed parser helper. Its
   command syntax knowledge is acceptable only while invoked through
   `$conversational:command_plan` or another catalog wrapper. Do not add new
   server/client direct callers or new catalog-specific branches here.
+  The helper is documented as the native `plan_command` implementation only,
+  and `scripts/guard-command-planning.mjs` structurally enforces that ordinary
+  server/client conveniences dispatch the catalog wrapper and that the helper
+  has no non-native call sites.
 
-- [ ] Generalize core comments and type descriptions that name bundled verbs or
+- [x] Generalize core comments and type descriptions that name bundled verbs or
   objects where the behavior is actually substrate-level. Specific examples in
   `src/core/types.ts` and related comments should describe movement,
   possession, or directed observation semantics rather than particular demo
   objects or command words unless the comment is documenting a compatibility
   exception.
+  Runtime comments in `src/core/types.ts`, `src/core/world.ts`, and
+  `src/core/shadow-browser-node.ts` now describe directed observations,
+  movement/containment mirrors, helper-bytecode slicing, and browser first-turn
+  command surfaces without demo object examples. Remaining catalog-specific
+  comments are confined to bootstrap/local-catalog lifecycle code or explicit
+  compatibility exceptions.
 
-- [ ] Verify bundled catalog install/migration helpers remain outside normal
+- [x] Verify bundled catalog install/migration helpers remain outside normal
   runtime semantics. `src/core/local-catalogs.ts` can know bundled catalog
   object ids for installation repair, but generic runtime code must not branch
   on those ids.
+  Added `scripts/guard-local-catalog-runtime-boundary.mjs` and wired it into
+  `test:guards`/`pretypecheck`. It audits all `src/**` imports of
+  `local-catalogs.ts` and allows only bootstrap, protocol catalog status,
+  dev/MCP startup parsing, and worker lifecycle repair surfaces.
 
 ## Functional stability tasks
 
@@ -107,6 +128,20 @@ as bounded transitional debt, not as a pattern to extend.
   passed.
 - `npm run task:time -- test --task "command planning guard hardening" -- npm run test:files -- tests/catalogs.test.ts -t "server text-command planning dispatches the room command_plan verb"`
   passed.
+- `npm run task:time -- test --task "architecture drift closure" -- npm run guard:catalog-runtime-boundary`
+  passed.
+- `npm run task:time -- test --task "architecture drift closure" -- npm run guard:command-planning`
+  passed.
+- `npm run task:time -- test --task "architecture drift closure" -- npm run test:files -- tests/shadow-browser-node.test.ts -t "keeps browser open executable seeds focused"`
+  passed.
+- `npm run task:time -- test --task "architecture drift closure" -- npm run test:files -- tests/shadow-browser-node.test.ts tests/turn-recorder.test.ts`
+  passed: 81 tests.
+- `npm run task:time -- test --task "architecture drift closure" -- npm run typecheck`
+  passed.
+- `npm run task:time -- test --task "architecture drift closure" -- npm test`
+  passed: 29 files, 375 tests.
+- `npm run task:time -- test --task "architecture drift closure" -- npm run test:worker`
+  passed: 16 files passed, 1 skipped; 236 tests passed, 5 skipped.
 - No major serialization-weight regression was visible in these runs. Browser
   cold open executable seeds were about 410 KB / 434 pages per browser in the
   sampled e2e output, and local turn cache work stayed under the existing
