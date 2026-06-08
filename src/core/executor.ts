@@ -561,8 +561,10 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
   let planBuildMs = 0;
   let vmMs = 0;
   let submitMs = 0;
+  let retryMs = 0;
   const ensureDetailMs = new Map<string, number>();
   const submitDetailMs = new Map<string, number>();
+  const retryDetailMs = new Map<string, number>();
   let phaseOutcome: "submitted" | "local_frame" | "error" = "error";
   let phaseCommitScope: ObjRef | null = null;
   const addDetailMs = (map: Map<string, number>, label: string, ms: number): void => {
@@ -590,6 +592,7 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
   const emitPhaseTiming = (): void => {
     const ensureDetail = detailRecord(ensureDetailMs);
     const submitDetail = detailRecord(submitDetailMs);
+    const retryDetail = detailRecord(retryDetailMs);
     options.onMetric?.({
       kind: "turn_phase_timing",
       scope: options.input.scope,
@@ -607,8 +610,10 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       plan_build_ms: planBuildMs,
       vm_ms: vmMs,
       submit_ms: submitMs,
+      retry_ms: retryMs,
       ...(ensureDetail ? { ensure_detail_ms: ensureDetail } : {}),
-      ...(submitDetail ? { submit_detail_ms: submitDetail } : {})
+      ...(submitDetail ? { submit_detail_ms: submitDetail } : {}),
+      ...(retryDetail ? { retry_detail_ms: retryDetail } : {})
     });
   };
   // Time a phase and charge its elapsed wall time even when it THROWS — a
@@ -621,6 +626,16 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       return await body();
     } finally {
       add(Date.now() - startedAt);
+    }
+  };
+  const timeRetry = <T>(label: string, body: () => T): T => {
+    const startedAt = Date.now();
+    try {
+      return body();
+    } finally {
+      const ms = Date.now() - startedAt;
+      retryMs += ms;
+      addDetailMs(retryDetailMs, label, ms);
     }
   };
   const basePlanningAuthorityObjectIds = (planningScope: ObjRef): ObjRef[] =>
@@ -795,8 +810,9 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       // the whole retry budget. Without this, a first-turn-on-scope commit whose
       // relay head is still @0 grinds all maxAttempts and returns an error.
       if (body.ok === false && body.commit?.current) {
-        options.applyHead?.(commitClient, body.commit.current);
-        if (commitClient !== planningClient) options.applyHead?.(planningClient, body.commit.current);
+        const current = body.commit.current;
+        timeRetry("commit.apply_head", () => options.applyHead?.(commitClient, current));
+        if (commitClient !== planningClient) timeRetry("planning.apply_head", () => options.applyHead?.(planningClient, current));
       }
       // DESIGN A layer-2: a read-version-mismatch conflict carries a cell-page
       // transfer of the mismatched cells at the committing scope's CURRENT
@@ -807,13 +823,16 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       // commit client and, when distinct, the planning client (the planner is
       // what re-runs the verb next round).
       if (body.ok === false && body.state_transfer) {
-        options.applyStateTransfer?.(commitClient, body.state_transfer);
-        if (commitClient !== planningClient) options.applyStateTransfer?.(planningClient, body.state_transfer);
+        const transfer = body.state_transfer;
+        timeRetry("commit.apply_state_transfer", () => options.applyStateTransfer?.(commitClient, transfer));
+        if (commitClient !== planningClient) timeRetry("planning.apply_state_transfer", () => options.applyStateTransfer?.(planningClient, transfer));
       }
-      repairObjectIds = mergeExecutorObjectIds(
-        repairObjectIds,
-        executorObjectIdsFromMissingState(body),
-        executorTranscriptObjectIds(planned.transcript)
+      repairObjectIds = timeRetry("collect_repair_objects", () =>
+        mergeExecutorObjectIds(
+          repairObjectIds,
+          executorObjectIdsFromMissingState(body),
+          executorTranscriptObjectIds(planned.transcript)
+        )
       );
       continue;
     }
