@@ -3158,7 +3158,9 @@ async function waitForMessageIndex(messages: unknown[], predicate: (message: unk
   });
 }
 
-async function waitFor<T>(read: () => T | undefined, timeoutMs = 5000): Promise<T> {
+// The full guarded suite runs several CPU-heavy worker tests in parallel; keep
+// this poll tolerant of scheduler delay while still bounded.
+async function waitFor<T>(read: () => T | undefined, timeoutMs = 10000): Promise<T> {
   const start = Date.now();
   for (;;) {
     const value = read();

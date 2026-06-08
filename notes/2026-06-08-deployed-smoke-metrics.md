@@ -25,6 +25,13 @@ Ignored raw artifacts:
 - `.woo/smoke-measurements/deploy-280ae9e3-c98f947-20260608T1950Z/analyze-smoke-tail.txt`
 - `.woo/smoke-measurements/deploy-280ae9e3-c98f947-20260608T1950Z/analyze-data-path-costs.txt`
 
+Commit `a978cfe` deployed to Cloudflare version
+`ec5e3cf0-d3ec-4466-9e6a-8b1176adec68` after adding inline-lineage
+materialization support. The deploy preflight, tests, build, and postflight
+checks passed, but the deployed smoke failed with the same 8/10 summary. That
+proved the production payload was not merely dropping a lineage ref while
+retaining the inline lineage page.
+
 ## Correctness Finding
 
 The pinboard blocker happened before VM execution during scope/session
@@ -39,11 +46,28 @@ to hashes present in the final `page_refs`. That can discard an inline
 pages, causing `mergeShadowStatePagesIntoSerialized` to reject the sparse page
 set.
 
+Second root cause: combined authority payloads could also include projection
+support cells, especially Directory/session `object_live` scope contents, for an
+object whose `object_lineage` never survived into any slice. Such a payload
+cannot be materialized as a standalone seed at all. `combineSerializedAuthoritySlices`
+now lineage-closes the final cell slice by dropping non-lineage cells for
+objects that lack any lineage ref, preserving actor/scope support only when an
+identity page also co-travels.
+
 Fix validation after patching authority-slice materialization:
 
 - `npm run test:files -- tests/authority-slice-shape.test.ts tests/worker/cf-local-structural.test.ts`
   passed, 16 tests.
 - `npm run smoke:cf-local` passed, 1 file, 4 tests, Vitest duration 33.10s.
+
+Additional validation after lineage-closing combined authority slices:
+
+- `npm run test:files -- tests/authority-slice-shape.test.ts` passed, 15 tests.
+- `npm run test:files -- tests/worker/cf-local-structural.test.ts tests/worker/gateway-projection-cache.test.ts`
+  passed, 28 tests.
+- `npm run smoke:cf-local` passed, 1 file, 4 tests, Vitest duration 35.14s.
+- `npm test` passed after stabilizing the browser-worker integration helper
+  timeout, 29 files and 375 tests.
 
 ## Performance Summary
 

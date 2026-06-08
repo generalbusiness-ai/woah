@@ -22,6 +22,7 @@ import {
   buildSerializedAuthorityCellSlice,
   cellProvenanceFromAuthoritySlice,
   combineSerializedAuthoritySlices,
+  isAuthorityCellSlice,
   filterSerializedAuthoritySlicePages,
   mergeSerializedAuthoritySlice,
   serializedWorldFromAuthoritySlice,
@@ -29,7 +30,8 @@ import {
 } from "../src/core/authority-slice";
 import { createWorld } from "../src/core/bootstrap";
 import { executorAuthorityPayload } from "../src/core/executor";
-import type { SerializedObject } from "../src/core/repository";
+import type { SerializedAuthorityCellSlice, SerializedObject } from "../src/core/repository";
+import { shadowObjectLivePage, stampAuthorityPageRef } from "../src/core/shadow-state-pages";
 
 describe("WooWorld.exportAuthoritySlice content contract", () => {
   it("includes the explicit root plus its parent class chain", () => {
@@ -281,6 +283,39 @@ describe("WooWorld.exportAuthoritySlice content contract", () => {
       name: "Lineage Gap Room",
       contents: ["lineage_gap_item"]
     });
+  });
+
+  it("combineSerializedAuthoritySlices drops projection cells whose object lineage is absent", () => {
+    // Directory/session projection can know that an actor appears in a scope
+    // before the shard has fetched that scope's owner lineage. A live-only scope
+    // cell is useful as support material only when another slice also carries the
+    // scope identity; it must not create an unmaterializable standalone seed.
+    const deck = { ...objectRecord("the_deck", ["guest_1"]), name: "the_deck", parent: "$space", owner: "$wiz" };
+    const livePage = shadowObjectLivePage(deck);
+    const liveOnly: SerializedAuthorityCellSlice = {
+      kind: "woo.authority_slice.cells.shadow.v1",
+      sessions: [],
+      page_refs: [stampAuthorityPageRef(livePage, true, { source: "projection", source_host: "mcp-gateway-1" })],
+      inline_pages: [livePage],
+      counters: { objectCounter: 1, parkedTaskCounter: 1, sessionCounter: 1 },
+      tombstones: [],
+      source_object_count: 1
+    };
+    const actor = buildSerializedAuthorityCellSlice({
+      sessions: [],
+      objects: [{ ...objectRecord("guest_1", []), name: "Guest 1", parent: "$player", owner: "guest_1" }],
+      counters: { objectCounter: 1, parkedTaskCounter: 1, sessionCounter: 1 },
+      pageProvenance: () => ({ source: "projection" as const, source_host: "mcp-gateway-1" })
+    });
+
+    const combined = combineSerializedAuthoritySlices([], [liveOnly, actor]);
+    expect(isAuthorityCellSlice(combined)).toBe(true);
+    if (isAuthorityCellSlice(combined)) {
+      expect(combined.page_refs.some((ref) => ref.object === "the_deck")).toBe(false);
+      expect(combined.inline_pages.some((page) => page.object === "the_deck")).toBe(false);
+    }
+    expect(() => serializedWorldFromAuthoritySlice(combined)).not.toThrow();
+    expect(serializedWorldFromAuthoritySlice(combined).objects.map((obj) => obj.id)).toEqual(["guest_1"]);
   });
 
   it("refuses a non-authoritative projection stub from overwriting a named lineage (CA11 symmetric stub guard)", () => {

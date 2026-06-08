@@ -281,7 +281,6 @@ export function combineSerializedAuthoritySlices(
     sessionCounter: inferSessionCounter(sessions)
   };
   const tombstones = new Set<ObjRef>();
-  let sourceObjectCount = 0;
 
   // Choose the winning page_ref per cell key by provenance, not raw slice order.
   // An authoritative page is never displaced by a derived one; among equal-rank
@@ -308,7 +307,6 @@ export function combineSerializedAuthoritySlices(
         sessionCounter: Math.max(counters.sessionCounter, slice.counters.sessionCounter)
       };
       for (const id of slice.tombstones) tombstones.add(id);
-      sourceObjectCount += slice.source_object_count;
       // Inline pages must be present before ref precedence runs: the stub tiebreak
       // resolves a ref to its inline page by hash to read the lineage name.
       for (const page of slice.inline_pages) inlineByHash.set(shadowStatePageHash(page), structuredClone(page) as ShadowStatePage);
@@ -325,7 +323,6 @@ export function combineSerializedAuthoritySlices(
       // for the same key wins regardless of slice order.
       for (const obj of slice.objects) {
         const pages = shadowStatePagesForObject(obj);
-        sourceObjectCount += 1;
         for (const page of pages) {
           const ref = stampAuthorityPageRef(page, true, LEGACY_OBJECT_SLICE_PROVENANCE);
           inlineByHash.set(ref.hash, structuredClone(page) as ShadowStatePage);
@@ -345,14 +342,26 @@ export function combineSerializedAuthoritySlices(
     };
   }
 
+  const pageRefs = Array.from(lastPageByKey.values()).sort(compareAuthorityPageRefs);
+  const lineageObjects = new Set(pageRefs
+    .filter((ref) => ref.page === "object_lineage")
+    .map((ref) => ref.object));
+  // A combined authority slice is commonly used as a standalone seed. Projection
+  // helpers can contribute support cells such as object_live without identity;
+  // keep those cells only when some slice also supplied lineage for the object.
+  const lineageClosedPageRefs = pageRefs.filter((ref) => ref.page === "object_lineage" || lineageObjects.has(ref.object));
+  const keptHashes = new Set(lineageClosedPageRefs.map((ref) => ref.hash));
+
   return {
     kind: "woo.authority_slice.cells.shadow.v1",
     sessions: sessions.map((session) => structuredClone(session) as SerializedSession),
-    page_refs: Array.from(lastPageByKey.values()).sort(compareAuthorityPageRefs),
-    inline_pages: Array.from(inlineByHash.values()).sort(compareAuthorityPages),
+    page_refs: lineageClosedPageRefs,
+    inline_pages: Array.from(inlineByHash.values())
+      .filter((page) => keptHashes.has(shadowStatePageHash(page)))
+      .sort(compareAuthorityPages),
     counters,
     tombstones: Array.from(tombstones).sort(),
-    source_object_count: sourceObjectCount
+    source_object_count: new Set(lineageClosedPageRefs.map((ref) => ref.object)).size
   };
 }
 
