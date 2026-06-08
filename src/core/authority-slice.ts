@@ -189,7 +189,7 @@ export function withAuthorityPageProvenance(
 export function serializedWorldFromAuthoritySlice(authority: MergeSerializedAuthorityInput): SerializedWorld {
   if (isAuthorityCellSlice(authority)) {
     const referenced = new Set(authority.page_refs.map((ref) => ref.hash));
-    const pages = authority.inline_pages.filter((page) => referenced.has(shadowStatePageHash(page)));
+    const pages = referencedInlinePagesWithLineage(authority, referenced);
     const serialized = mergeShadowStatePagesIntoSerialized(emptySerializedWorldFromAuthority(authority), pages, () => emptySerializedWorldFromAuthority(authority));
     repairDerivedContentsProjection(serialized);
     pruneSerializedSessionsWithoutActorRows(serialized);
@@ -210,6 +210,33 @@ export function serializedWorldFromAuthoritySlice(authority: MergeSerializedAuth
   repairDerivedContentsProjection(serialized);
   pruneSerializedSessionsWithoutActorRows(serialized);
   return serialized;
+}
+
+function referencedInlinePagesWithLineage(
+  authority: SerializedAuthorityCellSlice,
+  referenced: ReadonlySet<string>
+): ShadowStatePage[] {
+  const pages = authority.inline_pages.filter((page) => referenced.has(shadowStatePageHash(page)));
+  const objectsWithPages = new Set(pages.map((page) => page.object));
+  const objectsWithLineage = new Set(pages
+    .filter((page) => page.page === "object_lineage")
+    .map((page) => page.object));
+  if (objectsWithPages.size === objectsWithLineage.size) return pages;
+
+  // Final page refs may drop fill-only lineage scaffolding while still carrying
+  // changed non-lineage pages inline; merging those pages requires lineage too.
+  const inlineLineageByObject = new Map<ObjRef, ShadowStatePage>();
+  for (const page of authority.inline_pages) {
+    if (page.page === "object_lineage") inlineLineageByObject.set(page.object, page);
+  }
+  for (const object of objectsWithPages) {
+    if (objectsWithLineage.has(object)) continue;
+    const lineage = inlineLineageByObject.get(object);
+    if (!lineage) continue;
+    pages.push(structuredClone(lineage) as ShadowStatePage);
+    objectsWithLineage.add(object);
+  }
+  return pages;
 }
 
 export function mergeSerializedAuthoritySlice(

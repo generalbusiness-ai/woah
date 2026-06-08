@@ -274,6 +274,13 @@ describe("WooWorld.exportAuthoritySlice content contract", () => {
       contents: ["lineage_gap_item"]
     });
     expect(provenance.get("lineage_gap_room:object_lineage:")).toEqual({ source: "fallback" });
+
+    const materialized = serializedWorldFromAuthoritySlice(missingLineageRef);
+    expect(materialized.objects.find((obj) => obj.id === "lineage_gap_room")).toMatchObject({
+      id: "lineage_gap_room",
+      name: "Lineage Gap Room",
+      contents: ["lineage_gap_item"]
+    });
   });
 
   it("refuses a non-authoritative projection stub from overwriting a named lineage (CA11 symmetric stub guard)", () => {
