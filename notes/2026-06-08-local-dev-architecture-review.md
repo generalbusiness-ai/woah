@@ -23,11 +23,15 @@ as bounded transitional debt, not as a pattern to extend.
   `WooWorld.planCommandNow` calls `space:command_plan` instead of directly
   invoking `planCommandForSpace`, and a guard prevents the old bypass.
 
-- [ ] Replace regex-only command-planning guard with a stronger structural
+- [x] Replace regex-only command-planning guard with a stronger structural
   assertion. `scripts/guard-command-planning.mjs` catches the specific bypass
   that was fixed, but it is string-shaped. Add a unit or AST-level guard that
   proves server/client convenience APIs dispatch the catalog wrapper, and that
   only the native primitive implementation calls the parser helper.
+  The guard now parses `world.ts` and `main.ts` with the TypeScript AST. It
+  locates `planCommandNow` independent of formatting, verifies the active-space
+  `:command_plan` wrapper is used, and allows `planCommandForSpace` only under
+  `nativeHandlers.set("plan_command", ...)`.
 
 - [ ] Make browser open executable seed metadata-driven. The open seed in
   `src/core/shadow-browser-node.ts` currently names `command_plan`,
@@ -99,6 +103,10 @@ as bounded transitional debt, not as a pattern to extend.
   passed 4/4 in 33s.
 - `npm run task:time -- test --task "worker lane stability audit" -- npm run test:worker`
   passed in 1m 07s.
+- `npm run task:time -- test --task "command planning guard hardening" -- npm run guard:command-planning`
+  passed.
+- `npm run task:time -- test --task "command planning guard hardening" -- npm run test:files -- tests/catalogs.test.ts -t "server text-command planning dispatches the room command_plan verb"`
+  passed.
 - No major serialization-weight regression was visible in these runs. Browser
   cold open executable seeds were about 410 KB / 434 pages per browser in the
   sampled e2e output, and local turn cache work stayed under the existing
