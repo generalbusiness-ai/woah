@@ -1,4 +1,5 @@
 import {
+  CoalescedViewHydrator,
   escapeHtml,
   preserveAmbientCompanionPanel,
   renderToolFrame,
@@ -58,9 +59,7 @@ export type OutlinerItem = {
   has_children: boolean;
 };
 
-type ProjectedOutlinerItem = OutlinerItem & {
-  textKnown: boolean;
-};
+type ProjectedOutlinerItem = OutlinerItem & { textKnown: boolean };
 
 // One row delivered by $outliner:room_roster — the same shape chat/dubspace
 // use. `presence` ("online" / "idle" / "offline") drives the dot class.
@@ -110,15 +109,32 @@ export class WooOutlinerTreeElement extends HTMLElement {
   private addingChild = false;
   private dragSourceId: string | null = null;
   private hydrateAttempted = false;
-  private hydrateSequence = 0;
-  private projectionMissingItemText = false;
-  private projectionMissingItemTextSignature = "";
-  private itemTextHydratePendingSignature: string | null = null;
-  private itemTextHydratedSignature: string | null = null;
   private bound = false;
+  private itemHydrationSubject = "";
+  private projectionMissingItemTextSignature = "";
+  private readonly itemTextHydrator = new CoalescedViewHydrator<OutlinerItem[]>({
+    read: async (subject) => {
+      if (!this.woo) return [];
+      const items = normalizeOutlinerItems(await this.woo.directCall(subject, "list_items", []));
+      if (!items) throw new Error("list_items did not return outline rows");
+      return items;
+    },
+    apply: (items, subject, signature) => {
+      if (this.subject !== subject || this.projectionMissingItemTextSignature !== signature) return;
+      this.model = { ...this.model, items };
+      if (this.selectedId && !items.some((item) => item.id === this.selectedId)) {
+        this.selectedId = null;
+        this.addingChild = false;
+      }
+      this.projectionMissingItemTextSignature = "";
+      this.render();
+    }
+  });
 
   set data(value: OutlinerData) {
+    this.resetItemHydrationIfSubjectChanged(value.outlinerId || this.subject || "");
     this.model = value;
+    this.projectionMissingItemTextSignature = "";
     this.render();
   }
 
@@ -157,6 +173,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
 
   syncFromProjection(): void {
     if (!this.woo || !this.subject) return;
+    this.resetItemHydrationIfSubjectChanged(this.subject);
     const projection = this.woo.observe(this.subject);
     const focusMap = (projection?.props?.focus_by_actor ?? {}) as Record<string, string | null>;
     const actor = this.woo.actor;
@@ -171,7 +188,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
       roster: this.rosterFromProjection()
     };
     this.render();
-    if (this.projectionMissingItemText) this.requestItemsFromList();
+    this.requestItemsFromList();
   }
 
   applyObservation(observation: Record<string, unknown>): void {
@@ -235,20 +252,20 @@ export class WooOutlinerTreeElement extends HTMLElement {
     const rows = this.woo.neighborhood.refs
       .map((ref) => this.outlinerItemFromProjection(ref))
       .filter((item): item is ProjectedOutlinerItem => item !== null);
-    const items = rows.map(({ textKnown: _textKnown, ...row }) => row);
-    if (items.length === 0 && this.model.items.length > 0) {
+    const projectedItems = rows.map(({ textKnown: _textKnown, ...item }) => item);
+    if (rows.length === 0 && this.model.items.length > 0) {
       this.updateProjectionMissingItemText([]);
       return this.model.items;
     }
     if (this.model.items.length === 0) {
-      const ordered = orderedOutlinerItems(items);
+      const ordered = orderedOutlinerItems(projectedItems);
       this.updateProjectionMissingItemText(ordered.filter((item) => item.text === "").map((item) => item.id));
       return ordered;
     }
     // Projection sync can run before the newly applied item projection is
     // present in the neighborhood. Preserve rows learned from sequenced
-    // observations so a stale projection snapshot cannot hide a committed add
-    // or replace catalog-readable note text with the generic projection's
+    // observations so a stale projection snapshot cannot hide a committed
+    // add or replace catalog-readable note text with the generic projection's
     // "not present" view.
     const byId = new Map(this.model.items.map((item) => [item.id, { ...item }]));
     const missingTextIds: string[] = [];
@@ -258,20 +275,26 @@ export class WooOutlinerTreeElement extends HTMLElement {
       const projectionCarriesDisplayText = textKnown && row.text !== "";
       const text = projectionCarriesDisplayText ? row.text : previous?.text ?? row.text;
       if (text === "") missingTextIds.push(row.id);
-      byId.set(row.id, {
-        ...(previous ?? {}),
-        ...row,
-        text
-      });
+      byId.set(row.id, { ...(previous ?? {}), ...row, text });
     }
     this.updateProjectionMissingItemText(missingTextIds);
     return orderedOutlinerItems([...byId.values()]);
   }
 
   private updateProjectionMissingItemText(ids: string[]): void {
-    const signature = [...new Set(ids)].sort().join("|");
-    this.projectionMissingItemTextSignature = signature;
-    this.projectionMissingItemText = signature !== "";
+    this.projectionMissingItemTextSignature = [...new Set(ids)].sort().join("|");
+  }
+
+  private resetItemHydrationIfSubjectChanged(subject: string): void {
+    if (!subject || this.itemHydrationSubject === subject) return;
+    this.itemHydrationSubject = subject;
+    this.projectionMissingItemTextSignature = "";
+    this.itemTextHydrator.reset();
+  }
+
+  private requestItemsFromList(): void {
+    if (!this.woo || !this.subject || !this.projectionMissingItemTextSignature) return;
+    this.itemTextHydrator.ensure(this.subject, this.projectionMissingItemTextSignature);
   }
 
   private outlinerItemFromProjection(ref: string): ProjectedOutlinerItem | null {
@@ -294,46 +317,6 @@ export class WooOutlinerTreeElement extends HTMLElement {
       has_children: false,
       textKnown
     };
-  }
-
-  private requestItemsFromList(): void {
-    if (!this.woo || !this.subject || !this.projectionMissingItemTextSignature) return;
-    const signature = this.projectionMissingItemTextSignature;
-    if (this.itemTextHydratePendingSignature === signature || this.itemTextHydratedSignature === signature) return;
-    const sequence = ++this.hydrateSequence;
-    const subject = this.subject;
-    this.itemTextHydratePendingSignature = signature;
-    void this.refreshItemsFromList(sequence, subject, signature);
-  }
-
-  private async refreshItemsFromList(sequence: number, subject: string, signature: string): Promise<void> {
-    if (!this.woo || this.subject !== subject) return;
-    try {
-      const result = await this.woo.directCall(subject, "list_items", []);
-      if (this.subject !== subject || this.hydrateSequence !== sequence) return;
-      const items = normalizeOutlinerItems(result);
-      if (!items) return;
-      this.model = {
-        ...this.model,
-        items
-      };
-      if (this.selectedId && !items.some((item) => item.id === this.selectedId)) {
-        this.selectedId = null;
-        this.addingChild = false;
-      }
-      this.projectionMissingItemText = false;
-      this.projectionMissingItemTextSignature = "";
-      this.itemTextHydratedSignature = signature;
-      this.render();
-    } catch {
-      // The projection still gives the tree shape. A failed authoritative
-      // display read should not break local editing or leave a rejected
-      // promise in the console; the next mount or accepted observation can
-      // retry.
-      if (this.itemTextHydratedSignature === signature) this.itemTextHydratedSignature = null;
-    } finally {
-      if (this.itemTextHydratePendingSignature === signature) this.itemTextHydratePendingSignature = null;
-    }
   }
 
   private rosterFromProjection(): OutlinerRosterRow[] {

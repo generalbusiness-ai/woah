@@ -19,7 +19,7 @@ import * as tasksUiModule from "../../catalogs/tasks/ui/kanban-board";
 import * as weatherUiModule from "../../catalogs/weather/ui/weather-badge";
 import { appliedFrameErrorObservations, chatErrorText } from "./chat-errors";
 import { chatObservationSpace, updateEnteredLeftChatPresence } from "./chat-state";
-import { createWooClientFramework, escapeHtml, liveProjectionKey, ProjectionFieldFiller, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
+import { CoalescedViewHydrator, createWooClientFramework, escapeHtml, liveProjectionKey, ProjectionFieldFiller, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
 import { isPinboardObservation } from "./pinboard-observation";
 import { clearProvisionalChatLines, provisionalChatErrorLine, upsertProvisionalChatLine } from "./provisional-chat";
 import { advanceProjectionCursor, idsFromRefsOrSummaries, presentActorsFromObservation, scopedHerePresentActors, scopedModelWithMoveResult, type ScopedProjectionStateModel } from "./scoped-projection";
@@ -328,7 +328,6 @@ const pendingCommands = new Map<string, { space: string; text: string; action?: 
 const pendingNetworkTurns = new Set<string>();
 const pendingToolEnters = new Set<string>();
 const pendingToolEnterTimers = new Map<string, number>();
-let pinboardNotesRefreshPending = false;
 const pendingOverlaySnapshots = new Map<string, Promise<void>>();
 let scopedProjectionLocalRevision = 0;
 let connectInFlight: Promise<void> | null = null;
@@ -371,9 +370,6 @@ let lastPinboardViewportSent: PinNoteBox & { scale: number } | undefined;
 const pinNoteClientZ = new Map<string, number>();
 const PINBOARD_OPTIMISTIC_TTL_MS = 5_000;
 const TOOL_ENTER_PENDING_TIMEOUT_MS = 8_000;
-let pinboardTextHydrationRequestedBoard = "";
-let pinboardTextHydrationRequestedSignature = "";
-let pinboardTextHydrationRequested = false;
 let focusTasksChatOnEntry = false;
 let catalogUiEtag = "";
 let catalogUiCache: any;
@@ -551,6 +547,7 @@ function connect() {
     }
     state.session = session;
     projectionFiller.reset();
+    resetPinboardNotesHydration();
     render();
     try {
       await refresh();
@@ -1569,10 +1566,21 @@ const projectionFiller = new ProjectionFieldFiller(
   }
 );
 
-// Initial connect must run AFTER `projectionFiller` is declared above:
+const pinboardNotesHydrator = new CoalescedViewHydrator<any[]>({
+  read: readPinboardNotesView,
+  apply: (result, board) => {
+    if (!Array.isArray(result)) return;
+    applyPinboardNotesCanonical(board, result);
+    if (state.tab === "pinboard") render();
+  }
+});
+let pinboardNotesHydrationBoard = "";
+
+// Initial connect must run AFTER the projection/view hydrators are declared
+// above:
 // `connect()` → `refreshScopedProjection` → `applyScopedProjectionSnapshot`
-// reaches the filler, and `const` initialization is in temporal dead zone
-// until this point. Moving this block earlier reintroduces a hard-to-spot
+// can reach them, and `const` initialization is in temporal dead zone until
+// this point. Moving this block earlier reintroduces a hard-to-spot
 // ReferenceError under specific stored-session shapes.
 state.authStatus = readStorage(sessionKey) ? "authenticated" : "anonymous";
 if (state.authStatus === "authenticated") connect();
@@ -2014,28 +2022,38 @@ function pinboardNotesHaveMissingText(notes: any[]) {
   });
 }
 
-function pinboardNotesSignature(notes: any[]) {
-  return (Array.isArray(notes) ? notes : []).map((note) => String(note?.id ?? "")).filter(Boolean).sort().join("|");
+function pinboardMissingTextSignature(notes: any[]) {
+  return (Array.isArray(notes) ? notes : [])
+    .filter((note) => note?.text === undefined || note?.text === null)
+    .map((note) => String(note?.id ?? ""))
+    .filter(Boolean)
+    .sort()
+    .join("|");
 }
 
 function hydratePinboardNotesTextIfNeeded(pinboard: any) {
   const board = pinboard?.board;
   const boardId = typeof board?.id === "string" ? board.id : "";
   const notes = Array.isArray(pinboard?.notes) ? pinboard.notes : [];
+  if (!boardId) {
+    resetPinboardNotesHydration();
+    return;
+  }
+  if (pinboardNotesHydrationBoard !== boardId) {
+    // Hydration memoization is per visible board; board/session changes should
+    // drop old missing-text signatures instead of accumulating forever.
+    pinboardNotesHydrationBoard = boardId;
+    pinboardNotesHydrator.reset();
+  }
   if (!canSendPinboardV2()) return;
   if (!pinboardActorPresent()) return;
   if (!pinboardNotesHaveMissingText(notes)) return;
-  if (!boardId) return;
-  const signature = pinboardNotesSignature(notes);
-  const boardChanged = pinboardTextHydrationRequestedBoard !== boardId || pinboardTextHydrationRequestedSignature !== signature;
-  if (boardChanged) {
-    pinboardTextHydrationRequested = false;
-    pinboardTextHydrationRequestedBoard = boardId;
-    pinboardTextHydrationRequestedSignature = signature;
-  }
-  if (pinboardNotesRefreshPending || pinboardTextHydrationRequested) return;
-  pinboardTextHydrationRequested = true;
-  refreshPinboardNotes();
+  pinboardNotesHydrator.ensure(boardId, pinboardMissingTextSignature(notes));
+}
+
+function resetPinboardNotesHydration(): void {
+  pinboardNotesHydrationBoard = "";
+  pinboardNotesHydrator.reset();
 }
 
 function normalizePinboardNotes(notes: any[], previousNotes: any[] = []) {
@@ -4832,7 +4850,11 @@ function pinboardViewportChanged(next: PinNoteBox & { scale: number }, prev: (Pi
 
 function pinboardActorPresent() {
   const board = pinboardSpace();
-  if (!board) return false;
+  if (!state.actor || !board) return false;
+  // Pinboard is a nested space; direct view fills and commit projections can
+  // briefly leave session.activeScope stale while the board presence overlay is
+  // already current. Use the same presence model the board renders, including
+  // explicit `pinboard_left` false tombstones from the catalog reducer.
   const projected = ui.observe(board);
   const props = projected?.props && typeof projected.props === "object" && !Array.isArray(projected.props)
     ? projected.props
@@ -5161,35 +5183,23 @@ function pinboardTargetCall(target: string, verb: string, args: any[] = [], opti
   if (board && target) v2Turn({ scope: board, route: "sequenced", target, verb, args, options });
 }
 
-function refreshPinboardNotes(options: { force?: boolean } = {}) {
-  const board = pinboardSpace();
-  if (!board || !canSendPinboardV2()) return;
-  // Only the missing-text compatibility path should call this now. Mutating
-  // pinboard turns render from projection/applied observations instead.
-  if (pinboardNotesRefreshPending && options.force !== true) return;
-  pinboardNotesRefreshPending = true;
-  window.setTimeout(() => {
-    pinboardNotesRefreshPending = false;
-  }, 2500);
-  v2Turn({
-    scope: board,
-    route: "direct",
-    target: board,
-    verb: "list_notes",
-    args: [],
-    persistence: "live",
-    onResult: (result) => {
-      pinboardNotesRefreshPending = false;
-      if (!Array.isArray(result)) return;
-      applyPinboardNotesCanonical(board, result);
-      if (state.tab === "pinboard") render();
-    },
-    onError: () => {
-      pinboardNotesRefreshPending = false;
-      // Allow the next projection arrival to retry hydration if a transient
-      // failure (cold remote DO, network blip) ate this list_notes call.
-      pinboardTextHydrationRequested = false;
-    }
+function readPinboardNotesView(board: string): Promise<any[]> {
+  if (!board || !canSendPinboardV2()) {
+    return Promise.reject(new Error("pinboard list_notes is unavailable"));
+  }
+  return new Promise((resolve, reject) => {
+    v2Turn({
+      scope: board,
+      route: "direct",
+      target: board,
+      verb: "list_notes",
+      args: [],
+      persistence: "live",
+      onResult: (result) => {
+        resolve(Array.isArray(result) ? result : []);
+      },
+      onError: reject
+    });
   });
 }
 
