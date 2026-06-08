@@ -34,13 +34,13 @@ function seedDerivedUniversalLineage(): Set<ObjRef> {
   return ids;
 }
 
-vi.setConfig({ testTimeout: 180_000 });
+vi.setConfig({ testTimeout: 60_000 });
 
 const SHARDS = 4;
-const RPC_TIMEOUT_MS = 20_000;
-const STEP_TIMEOUT_MS = 60_000;
-const DRAIN_TOTAL_BUDGET_MS = 3000;
-const DRAIN_POLL_MS = 500;
+const RPC_TIMEOUT_MS = 8_000;
+const STEP_TIMEOUT_MS = 15_000;
+const DRAIN_TOTAL_BUDGET_MS = 1500;
+const DRAIN_POLL_MS = 250;
 const DIRECTORY_PRESENCE_WINDOW_MS = 5 * 60_000;
 
 class FakeKVNamespace {
@@ -837,10 +837,11 @@ async function mcpFetch(
     headers.set("content-type", "application/json");
     body = JSON.stringify(input.body);
   }
-  return await raceWithTimeout(
-    harness.request("/mcp", { method: input.method, headers, body }),
-    input.timeoutMs ?? RPC_TIMEOUT_MS,
-    `MCP ${input.method} /mcp timed out after ${input.timeoutMs ?? RPC_TIMEOUT_MS}ms`
+  const timeoutMs = input.timeoutMs ?? RPC_TIMEOUT_MS;
+  return await raceWithAbort(
+    (signal) => harness.request("/mcp", { method: input.method, headers, body, signal }),
+    timeoutMs,
+    `MCP ${input.method} /mcp timed out after ${timeoutMs}ms`
   );
 }
 
@@ -850,6 +851,21 @@ function raceWithTimeout<T>(work: Promise<T>, ms: number, message: string): Prom
     handle = setTimeout(() => reject(new Error(message)), ms);
   });
   return Promise.race([work, timeout]).finally(() => {
+    if (handle) clearTimeout(handle);
+  });
+}
+
+function raceWithAbort<T>(work: (signal: AbortSignal) => Promise<T>, ms: number, message: string): Promise<T> {
+  const controller = new AbortController();
+  let handle: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    handle = setTimeout(() => {
+      const error = new Error(message);
+      controller.abort(error);
+      reject(error);
+    }, ms);
+  });
+  return Promise.race([work(controller.signal), timeout]).finally(() => {
     if (handle) clearTimeout(handle);
   });
 }

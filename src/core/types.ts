@@ -482,7 +482,7 @@ export type MetricEvent =
   // attempts; `authority_calls` counts authorityPayload invocations (each a
   // potential cross-host authority-slice round trip). `outcome` distinguishes a
   // committed turn from a local error frame that never reached submitEnvelope.
-  | { kind: "turn_phase_timing"; scope: ObjRef; commit_scope: ObjRef | null; target: ObjRef; verb: string; route: string; attempts: number; outcome: "submitted" | "local_frame" | "error"; total_ms: number; ensure_client_ms: number; authority_ms: number; authority_calls: number; serialize_ms: number; plan_build_ms: number; vm_ms: number; submit_ms: number; ensure_detail_ms?: Record<string, number>; submit_detail_ms?: Record<string, number> }
+  | { kind: "turn_phase_timing"; scope: ObjRef; commit_scope: ObjRef | null; target: ObjRef; verb: string; route: string; attempts: number; outcome: "submitted" | "local_frame" | "error"; total_ms: number; ensure_client_ms: number; authority_ms: number; authority_calls: number; serialize_ms: number; plan_build_ms: number; vm_ms: number; submit_ms: number; retry_ms?: number; ensure_detail_ms?: Record<string, number>; submit_detail_ms?: Record<string, number>; retry_detail_ms?: Record<string, number> }
   // MCP-only relocation prewarm timing. A gateway may start the likely actor
   // commit-scope head/session open before local planning proves a B6 relocation;
   // this metric confirms the overlap happened and whether it failed harmlessly.
