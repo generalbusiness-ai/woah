@@ -10,6 +10,7 @@ import { registerWooObservationHandlers as registerOutlinerObservationHandlers }
 import { registerWooObservationHandlers as registerPinboardObservationHandlers } from "../catalogs/pinboard/ui/pinboard-board";
 import {
   CatalogUiRegistry,
+  CoalescedViewHydrator,
   createWooClientFramework as createBareWooClientFramework,
   ProjectionFieldFiller
 } from "../src/client/framework";
@@ -611,6 +612,98 @@ describe("client UI framework projection", () => {
 
     filler.ensure("the_weather", ["current"]);
     expect(fetchCalls).toBe(1);
+  });
+
+  it("CoalescedViewHydrator coalesces matching subject/signature reads and memoizes success", async () => {
+    let reads = 0;
+    const applied: string[] = [];
+    let pending: ((value: string) => void) | null = null;
+    const hydrator = new CoalescedViewHydrator<string>({
+      read: (subject, signature) => {
+        reads += 1;
+        return new Promise((resolve) => {
+          pending = () => resolve(`${subject}:${signature}`);
+        });
+      },
+      apply: (value) => {
+        applied.push(value);
+      }
+    });
+
+    hydrator.ensure("the_outline", "item_1");
+    hydrator.ensure("the_outline", "item_1");
+    expect(reads).toBe(1);
+    pending!("view");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(applied).toEqual(["the_outline:item_1"]);
+
+    hydrator.ensure("the_outline", "item_1");
+    expect(reads).toBe(1);
+    hydrator.ensure("the_outline", "item_1|item_2");
+    expect(reads).toBe(2);
+  });
+
+  it("CoalescedViewHydrator reset drops stale in-flight view results", async () => {
+    let reads = 0;
+    const applied: string[] = [];
+    const pendings: Array<(value: string) => void> = [];
+    const hydrator = new CoalescedViewHydrator<string>({
+      read: (subject, signature) => {
+        reads += 1;
+        return new Promise((resolve) => {
+          pendings.push(() => resolve(`${subject}:${signature}`));
+        });
+      },
+      apply: (value) => {
+        applied.push(value);
+      }
+    });
+
+    hydrator.ensure("the_outline", "item_1");
+    hydrator.reset();
+    pendings[0]!("stale");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(applied).toEqual([]);
+
+    hydrator.ensure("the_outline", "item_1");
+    expect(reads).toBe(2);
+    pendings[1]!("fresh");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(applied).toEqual(["the_outline:item_1"]);
+  });
+
+  it("CoalescedViewHydrator retries failed view reads by default", async () => {
+    let reads = 0;
+    const errors: string[] = [];
+    const applied: string[] = [];
+    const hydrator = new CoalescedViewHydrator<string>({
+      read: async (subject, signature) => {
+        reads += 1;
+        if (reads === 1) throw new Error("temporary view read failure");
+        return `${subject}:${signature}`;
+      },
+      apply: (value) => {
+        applied.push(value);
+      },
+      onError: (error) => {
+        errors.push(error instanceof Error ? error.message : String(error));
+      }
+    });
+
+    hydrator.ensure("the_outline", "item_1");
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    hydrator.ensure("the_outline", "item_1");
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(reads).toBe(2);
+    expect(errors).toEqual(["temporary view read failure"]);
+    expect(applied).toEqual(["the_outline:item_1"]);
   });
 
   it("fills missing component-required props when a per-subject summary lands after a thin room snapshot", () => {

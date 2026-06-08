@@ -48,6 +48,15 @@ on the commit plane. The embedded mini-chat also uses the catalog command
 planner over v2 so command aliases remain catalog-owned instead of being parsed
 in client code.
 
+The browser renders immediately from structural projection: board layout,
+projected pin ids, note placement, color, and presence overlays. If that
+projection identifies a note but does not carry readable note text, the SPA uses
+the shared coalesced view hydrator to call `list_notes` once for the current
+missing-text signature and writes the result into `pinboard_note` catalogState.
+That catalog view state outranks later weaker generic projection, so a stale or
+partial projection snapshot cannot blank note text that was already learned from
+observations or `list_notes`.
+
 Pinboard `enter`/`leave` return only the board room and subscriber lists. They
 intentionally do not request a full `here` payload: v2 commit validation treats
 post-commit projection reads as ordinary transcript reads, and a board-mounted
