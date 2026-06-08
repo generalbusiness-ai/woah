@@ -51,6 +51,12 @@ import type { EffectTranscript } from "../src/core/effect-transcript";
 import { serializedFor, submitShadowCommit, type ShadowCommitAccepted, type ShadowScopeHead } from "../src/core/shadow-commit-scope";
 import { createShadowExecutionNode, type ShadowCellPageTransfer } from "../src/core/shadow-turn-exec";
 import { mergeAuthorityIntoRelayCache } from "../src/core/shadow-relay-cache";
+import {
+  browserOpenSeedCatalogPropertyNames,
+  browserOpenSeedDispatchVerbNames,
+  browserOpenSeedObjectPropertyNames,
+  browserOpenSeedVerbLookups
+} from "../src/core/browser-open-seed-contract";
 
 describe("shadow browser node shim", () => {
   it("opens a browser-style dubspace node and commits a real control action", async () => {
@@ -143,6 +149,15 @@ describe("shadow browser node shim", () => {
     expect(hasTransferPage(transfer, "$pinboard", "verb_bytecode", "exitfunc")).toBe(false);
     expect(hasTransferPage(transfer, "$match", "verb_bytecode", "plan_command")).toBe(true);
     expect(hasTransferPage(transfer, "$room", "verb_bytecode", "take")).toBe(true);
+    expect(browserOpenSeedDispatchVerbNames()).toContain("command_plan");
+    expect(browserOpenSeedVerbLookups()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ receiver: "scope", names: expect.arrayContaining(["command_plan"]) }),
+      expect.objectContaining({ receiver: "scope", names: expect.arrayContaining(["acceptable", "enterfunc"]) }),
+      expect.objectContaining({ receiver: "actor_location", names: expect.arrayContaining(["exitfunc"]) })
+    ]));
+    expect(browserOpenSeedObjectPropertyNames()).toEqual(expect.arrayContaining(["name", "description", "aliases", "session_subscribers"]));
+    expect(browserOpenSeedCatalogPropertyNames()).toEqual(expect.arrayContaining(["features", "features_version", "host_placement"]));
+    expect(hasTransferPage(transfer, "the_chatroom", "property_cell", "session_subscribers")).toBe(true);
   });
 
   it("bounds the relay executable seed digest cache by least-recent use", async () => {

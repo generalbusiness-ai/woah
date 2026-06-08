@@ -9,7 +9,21 @@ export type NativePrimitiveContract = {
   reads: string[];
   writes: string[];
   emits: string[];
+  open_seed?: NativePrimitiveOpenSeedContract;
   note: string;
+};
+
+export type NativePrimitiveOpenSeedVerbLookup = {
+  receiver: "scope" | "actor_location";
+  names: string[];
+  reason: string;
+};
+
+export type NativePrimitiveOpenSeedContract = {
+  verb_lookups?: NativePrimitiveOpenSeedVerbLookup[];
+  object_property_names?: string[];
+  catalog_property_names?: string[];
+  dispatch_verb_names?: string[];
 };
 
 const CONTRACTS: Record<string, NativePrimitiveContract> = {
@@ -33,6 +47,20 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
       "object_move",
       "cell_write"
     ],
+    open_seed: {
+      verb_lookups: [
+        {
+          receiver: "actor_location",
+          names: ["exitfunc"],
+          reason: "The movement chain probes the old container hook before moving an actor out."
+        },
+        {
+          receiver: "scope",
+          names: ["acceptable", "enterfunc"],
+          reason: "A first local enter needs target admission and post-entry hooks without a repair round."
+        }
+      ]
+    },
     note: "Movement is transcript-safe only through movetoChecked/moveObjectChecked instrumentation."
   },
   match_object: {
@@ -83,6 +111,17 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     reads: ["space presence", "visible objects", "command parser metadata"],
     writes: [],
     emits: [],
+    open_seed: {
+      verb_lookups: [
+        {
+          receiver: "scope",
+          names: ["command_plan"],
+          reason: "Text command planning must enter through the catalog wrapper on a cold browser scope."
+        }
+      ],
+      object_property_names: ["name", "description", "aliases"],
+      dispatch_verb_names: ["command_plan"]
+    },
     note: "Planner output is a read-only logical result; subsequent execution records the actual verb dispatch."
   },
   parse_command: {
@@ -275,4 +314,30 @@ export function nativePrimitiveIsTranscriptTracked(handler: string | undefined):
 export function nativePrimitiveContractValue(handler: string | undefined): WooValue {
   const contract = nativePrimitiveContract(handler);
   return contract ? structuredClone(contract) as unknown as WooValue : null;
+}
+
+export function nativePrimitiveOpenSeedVerbLookups(): NativePrimitiveOpenSeedVerbLookup[] {
+  return Object.values(CONTRACTS).flatMap((contract) =>
+    (contract.open_seed?.verb_lookups ?? []).map((lookup) => ({
+      receiver: lookup.receiver,
+      names: uniqueSorted(lookup.names),
+      reason: `${contract.handler}: ${lookup.reason}`
+    }))
+  );
+}
+
+export function nativePrimitiveOpenSeedObjectPropertyNames(): string[] {
+  return uniqueSorted(Object.values(CONTRACTS).flatMap((contract) => contract.open_seed?.object_property_names ?? []));
+}
+
+export function nativePrimitiveOpenSeedCatalogPropertyNames(): string[] {
+  return uniqueSorted(Object.values(CONTRACTS).flatMap((contract) => contract.open_seed?.catalog_property_names ?? []));
+}
+
+export function nativePrimitiveOpenSeedDispatchVerbNames(): string[] {
+  return uniqueSorted(Object.values(CONTRACTS).flatMap((contract) => contract.open_seed?.dispatch_verb_names ?? []));
+}
+
+function uniqueSorted(values: Iterable<string>): string[] {
+  return Array.from(new Set(values)).sort();
 }

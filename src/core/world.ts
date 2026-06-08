@@ -6724,12 +6724,12 @@ export class WooWorld {
         }
         for (const verb of obj.verbs) {
           push(verb.owner);
-          // Verb bodies dispatch on shared helper classes ($match, $utils,
-          // $string_utils, …) named by literal in the bytecode. We surface
+          // Verb bodies dispatch on shared helper classes named by literal
+          // in the bytecode. We surface
           // those refs precisely instead of falling back to a catalog-wide
-          // $-prefix sweep: a turn whose verbs call `take` pulls in `$match`
-          // and friends; a turn that does not, does not. Native verbs have
-          // no bytecode body to scan, so we just take the owner.
+          // $-prefix sweep: a turn whose bytecode names a helper pulls in
+          // that helper; a turn that does not, does not. Native verbs have no
+          // bytecode body to scan, so we just take the owner.
           if (verb.kind !== "native") {
             for (const literal of verb.bytecode?.literals ?? []) {
               if (typeof literal === "string" && literal.startsWith("$")) push(literal as ObjRef);
@@ -7332,11 +7332,11 @@ export class WooWorld {
       }
     }
 
-    // Movement writes make `location(object)` authoritative, but inventory and
-    // room matching read the derived `contents(container)` mirror. Host-sliced
-    // localdev/Worker write-through must therefore repair any source/dest
-    // container this host owns; otherwise a user can successfully take an item
-    // and immediately fail `drop` because contents(actor) stayed stale.
+    // Movement writes make `location(object)` authoritative, but visibility
+    // and containment checks read the derived `contents(container)` mirror.
+    // Host-sliced localdev/Worker write-through must therefore repair any
+    // source/dest container this host owns; otherwise a successful move can be
+    // followed by stale container membership on the next turn.
     for (const move of transcript.moves) {
       if (move.from && move.from !== move.to && belongsHere(move.from)) {
         const from = this.objects.get(move.from);
@@ -10172,10 +10172,10 @@ export class WooWorld {
     this.nativeHandlers.set("plan_command", async (ctx, args) => {
       const space = assertObj(args[1] ?? ctx.caller);
       return await this.planCommandForSpace(ctx, assertString(args[0] ?? ""), space, {
-        // Catalog wrappers such as `$conversational:command_plan` are
-        // read-only planners. When the wrapper explicitly opts out of presence
-        // checks, let it plan against the supplied command space without
-        // teaching the browser about catalog command aliases.
+        // Catalog command-plan wrappers are read-only planners. When the
+        // wrapper explicitly opts out of presence checks, let it plan against
+        // the supplied command space without teaching the browser about catalog
+        // command aliases.
         skipPresenceCheck: this.currentVerbSkipsPresenceCheck(ctx)
       }) as unknown as WooValue;
     });
@@ -10862,6 +10862,12 @@ export class WooWorld {
     } : null;
   }
 
+  /**
+   * Transitional implementation of the native plan_command primitive.
+   * Command grammar belongs to catalog wrappers; scripts/guard-command-planning
+   * enforces that ordinary server/client conveniences dispatch those wrappers
+   * and that this helper is called only from nativeHandlers.set("plan_command").
+   */
   private async planCommandForSpace(ctx: CallContext, input: string, space: ObjRef, options: PublicCommandLocationOptions = {}): Promise<WooValue> {
     const text = input.trim();
     if (!text) return await this.commandHuhPlan(ctx, space, input, "empty command");

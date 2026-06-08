@@ -80,10 +80,9 @@ export type PresenceProjectionDef =
 // in sync. `told` carries `to`/`from`; `text` (the substrate `tell()`
 // primitive's emission) carries `target` — both are routed straight to the
 // recipient's sockets regardless of whether the calling verb has a space
-// audience. Without `text` here, a verb like `$portable:give` running off
-// any $space (the_mug isn't a space, neither is its carrier) emits tell()
-// observations that vanish into the audience-broadcast path because
-// directAudience(...) returns null.
+// audience. Without `text` here, an item or actor verb running outside a
+// space audience can emit tell() observations that vanish into the
+// audience-broadcast path because directAudience(...) returns null.
 export const DIRECTED_OBSERVATION_TYPES: ReadonlySet<string> = new Set(["told", "text"]);
 
 export type DirectedRecipients = { to: ObjRef | null; from: ObjRef | null };
@@ -94,8 +93,7 @@ export function directedRecipients(observation: Observation): DirectedRecipients
     // `text` is the substrate `tell(actor, …)` primitive's emission. It
     // routes ONLY to the explicit recipient — `actor` is the sender and
     // does not get an echo. Verbs that want the sender to also see the
-    // line emit a separate tell(actor, …) themselves (the
-    // `:give` / `:take` / `:drop` etc. pattern).
+    // line emit a separate tell(actor, …) themselves.
     return {
       to: typeof observation.target === "string" ? observation.target : null,
       from: null

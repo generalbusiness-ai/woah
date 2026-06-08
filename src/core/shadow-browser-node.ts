@@ -59,6 +59,12 @@ import { stableShadowJson } from "./shadow-cell-version";
 import { decodeEnvelope, type ShadowEnvelope, type ShadowEnvelopeAuth } from "./shadow-envelope";
 import { constantTimeEqual, hashSource } from "./source-hash";
 import { redactSensitiveSerializedPropertyValues } from "./sensitive-serialization";
+import {
+  browserOpenSeedCatalogPropertyNames,
+  browserOpenSeedDispatchVerbNames,
+  browserOpenSeedObjectPropertyNames,
+  browserOpenSeedVerbLookups
+} from "./browser-open-seed-contract";
 import type { MetricEvent, ObjRef, Observation, PropertyDef, WooValue } from "./types";
 import { cloneValue, directedRecipients } from "./types";
 import type { ScopedObjectSummary } from "./world";
@@ -80,6 +86,7 @@ const MAX_SHADOW_LIVE_EVENTS = 500;
 const MAX_SHADOW_BROWSER_TRANSFERS = 200;
 const MAX_SHADOW_BROWSER_CACHE_TAIL = 1_000;
 const MAX_SHADOW_BROWSER_CONFLICTS = 200;
+const OPEN_SEED_DISPATCH_VERB_NAMES = new Set(browserOpenSeedDispatchVerbNames());
 // The envelope codec rejects frames at 1 MiB. Keep browser state-transfer
 // bodies comfortably below that so the surrounding envelope metadata and
 // session token cannot push a retained-tail catch-up over the wire limit.
@@ -1022,21 +1029,11 @@ function shadowBrowserOpenExecutableSeedPreimages(serialized: SerializedWorld, s
   if (actorObj) addOpenSeedObjectCells(actorObj, add, { writeLocation: true });
   if (actorLocationObj) {
     addOpenSeedObjectCells(actorLocationObj, add, { writeContents: true });
-    // A first local `enter` moves the actor out of their current room before
-    // entering the tool scope. The generic movement chain probes
-    // oldLocation:exitfunc even when no concrete hook exists, so seed that
-    // inherited verb lookup at open instead of forcing the first click through
-    // a repair round.
-    addOpenSeedVerbLookupCells(serialized, actorLocationObj.id, ["exitfunc"], add);
   }
-  // Text command planning is a real direct verb call to `scope:command_plan`.
-  // Seed the feature-aware lookup for that wrapper so the browser VM follows
-  // the same catalog path as the server convenience APIs on the first command.
-  addOpenSeedVerbLookupCells(serialized, scope, ["command_plan"], add);
-  // The generic movement chain probes target hooks outside the caller's direct
-  // bytecode call graph, so a cold tool/room enter needs these bounded lookups
-  // on the target scope to stay local without dragging every catalog hook.
-  addOpenSeedVerbLookupCells(serialized, scope, ["acceptable", "enterfunc"], add);
+  for (const lookup of browserOpenSeedVerbLookups()) {
+    const receiver = lookup.receiver === "actor_location" ? actorLocationObj?.id : scope;
+    if (receiver) addOpenSeedVerbLookupCells(serialized, receiver, lookup.names, add);
+  }
 
   // Catalog lineage and property cells are executable metadata: they let a
   // partial browser shard interpret objects that arrive later from accepted
@@ -1047,11 +1044,10 @@ function shadowBrowserOpenExecutableSeedPreimages(serialized: SerializedWorld, s
   addOpenSeedCatalogExecutableCells(serialized, add);
 
   // The browser cannot derive a first-turn key without the selected verb's
-  // bytecode. Scope parent-chain AND feature-chain verb pages cover normal
-  // chat/tool commands (`command_plan`, `say`, `take`, `drop`, movement, ...)
-  // while keeping unrelated content-object catalogs out of the open envelope;
-  // content-specific verbs still arrive through exact missing-state repair
-  // after the key exists.
+  // bytecode. Scope parent-chain AND feature-chain verb pages cover exposed
+  // command/tool surfaces while keeping unrelated content-object catalogs out
+  // of the open envelope; content-specific verbs still arrive through exact
+  // missing-state repair after the key exists.
   addOpenSeedDispatchVerbCells(serialized, scope, add);
   return [
     ...preimages
@@ -1091,7 +1087,7 @@ function addOpenSeedDispatchVerbCells(
 }
 
 function openSeedDispatchVerbSelected(verb: SerializedObject["verbs"][number]): boolean {
-  return verb.tool_exposed === true || verb.name === "command_plan";
+  return verb.tool_exposed === true || OPEN_SEED_DISPATCH_VERB_NAMES.has(verb.name);
 }
 
 function addOpenSeedVerbLookupCells(
@@ -1163,26 +1159,13 @@ function addOpenSeedCatalogObjectCells(
 }
 
 function openSeedCatalogPropertyNames(obj: SerializedObject): string[] {
-  const names = new Set<string>([
-    "features",
-    "features_version",
-    "host_placement"
-  ]);
+  const names = new Set<string>(browserOpenSeedCatalogPropertyNames());
   for (const def of obj.propertyDefs) names.add(def.name);
   return Array.from(names).sort();
 }
 
 function openSeedPropertyNames(obj: SerializedObject): string[] {
-  const names = new Set<string>([
-    "name",
-    "description",
-    "aliases",
-    "mount_room",
-    "subscribers",
-    "session_subscribers",
-    "focus_by_actor",
-    "last_undo"
-  ]);
+  const names = new Set<string>(browserOpenSeedObjectPropertyNames());
   for (const [name] of obj.properties) names.add(name);
   for (const def of obj.propertyDefs) names.add(def.name);
   return Array.from(names).sort();
