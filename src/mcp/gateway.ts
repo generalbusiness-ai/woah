@@ -1259,7 +1259,10 @@ export class McpGateway {
     // fan-in slice. Pages keep recorded provenance when present and otherwise
     // fall back to cache, so this payload can fill local gaps without claiming
     // owner authority.
-    const serialized = serializedFor(client.relay.commit_scope);
+    const serialized = serializedFor(client.relay.commit_scope, {
+      reason: "mcp_cached_warm_authority",
+      metric: (event) => this.world.recordMetric(event)
+    });
     const ids = new Set<ObjRef>(objectIds);
     ids.add(entry.woo.actor);
     const authority = buildSerializedAuthorityCellSlice({
@@ -1287,7 +1290,11 @@ export class McpGateway {
     // per-cell provenance (so the admission gate / merge precedence apply uniformly),
     // preserves the session actors' live cells across the refresh, and bumps the
     // relay-cache generation when the snapshot changed.
-    mergeAuthorityIntoRelayCache(client.relay, authority, { preserveSessionActorLive: true, reason: "mcp_authority_merge" });
+    mergeAuthorityIntoRelayCache(client.relay, authority, {
+      preserveSessionActorLive: true,
+      reason: "mcp_authority_merge",
+      metric: (event) => this.world.recordMetric(event)
+    });
   }
 
   private withRelaySnapshotAuthorityFallback(
@@ -1299,7 +1306,10 @@ export class McpGateway {
     // paths with staleFallbackCount. Only then do we pay to include this MCP
     // shard's last successfully seeded view for the scope; fresh owner rows
     // still override stale values because the payload is combined last.
-    const serialized = serializedFor(client.relay.commit_scope, { reason: "mcp_authority_stale_fallback" });
+    const serialized = serializedFor(client.relay.commit_scope, {
+      reason: "mcp_authority_stale_fallback",
+      metric: (event) => this.world.recordMetric(event)
+    });
     if (serialized.objects.length === 0) return payload;
     const relayAuthority = buildSerializedAuthorityCellSlice({
       sessions: [],
