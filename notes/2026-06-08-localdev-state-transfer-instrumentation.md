@@ -182,3 +182,37 @@ repair reduction, known-page hashes were 140KB of 192KB request bytes in the
 accepted run. The cache-identity/digest protocol remains the clean next byte
 win, while direct `take`/`drop` repair preimages are the next semantic closure
 to inspect.
+
+## 2026-06-09 compact known-page echo
+
+Implemented a relay-issued `woo.known_page_hash_set.v1` identity for the
+browser's held executable state-page set. Each state transfer response registers
+the post-install held set, and later repair requests send the compact identity
+instead of echoing every page hash. When the worker has no confirmed identity it
+now omits the known-page hint entirely rather than sending the full
+`known_page_hashes` list; local measurements showed the repair closures are
+small enough that inlining them is cheaper than echoing hundreds of cached
+hashes. The relay still accepts explicit `known_page_hashes` for non-browser
+senders and regression tests, but the browser worker no longer emits that field
+on repair requests. A relay miss also falls back to treating all pages as
+unknown, producing a larger but correct transfer.
+
+Final localdev two-agent e2e measurement:
+
+| metric | command-seed baseline | compact echo |
+| --- | ---: | ---: |
+| state-transfer repairs | 5 | 8 |
+| request bytes | 191,752 | 94,223 |
+| known-page hash bytes | 140,437 | 16 |
+| compact-token requests | 0 | 5 |
+| reply bytes | 35,896 | 90,447 |
+| total transfer bytes | 227,648 | 184,670 |
+
+The byte win is on the intended axis: explicit known-page hash echo is removed
+from the browser repair hot path, request bytes fall by about 51%, and total
+state-transfer bytes still fall by about 19% despite more inline reply pages in
+this sample. A scope-preserving token variant was tried and rejected: it reduced
+request bytes further in some runs, but new scope relays missed the token and
+inlined enough pages to make total transfer bytes worse. The worker therefore
+clears the compact identity on scope/socket authority changes and registers a
+fresh token on the next repair.

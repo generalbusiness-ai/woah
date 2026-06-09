@@ -6,6 +6,9 @@ export const BROWSER_ACTIVITY_NUMERIC_DETAIL_FIELDS = [
   "request_body_bytes",
   "request_known_pages",
   "request_known_page_hash_bytes",
+  "request_known_page_cache",
+  "request_known_page_cache_count",
+  "request_known_page_cache_bytes",
   "request_atom_hashes",
   "request_missing_atoms",
   "request_missing_atom_preimages",
@@ -41,6 +44,8 @@ export const BROWSER_ACTIVITY_NUMERIC_DETAIL_FIELDS = [
   "reply_parked_tasks",
   "reply_tombstones",
   "reply_source_pages",
-  "reply_source_objects"
+  "reply_source_objects",
+  "reply_known_page_cache",
+  "reply_known_page_cache_count",
+  "reply_known_page_cache_bytes"
 ] as const;
-

@@ -1936,6 +1936,66 @@ describe("shadow browser node shim", () => {
     expect(browser.relay.commit_scope.head.seq).toBe(0);
   });
 
+  it("compacts repeated executable state transfer known-page echoes behind a browser-held set token", async () => {
+    const { browser, actor } = await browserForScope("the_dubspace", "guest:browser-known-pages", async (world, session) => {
+      world.setProp("the_dubspace", "operators", [session.actor]);
+    });
+    const call: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "browser-known-pages-wet",
+      route: "sequenced",
+      scope: "the_dubspace",
+      session: browser.session,
+      actor,
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.52]
+    };
+    const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(authoritativePlanningWorld(serializedFor(browser.relay.commit_scope)), call)).transcript);
+    const first = handleShadowBrowserStateTransferEnvelope(browser, receiveShadowBrowserEnvelopeReceipt(browser, encodeEnvelope(shadowBrowserEnvelope(browser, "woo.state.transfer.request.shadow.v1", {
+      kind: "woo.state.transfer.request.shadow.v1" as const,
+      id: "browser-known-pages-first",
+      scope: "the_dubspace",
+      key,
+      atom_hashes: [key.atom_hashes[0]],
+      mode: "cell_pages" as const
+    }, "browser-known-pages-first-env"))));
+    if (!first || first.body.mode !== "cell_pages" || !first.body.known_page_cache) throw new Error("expected first cell-page transfer with known-page cache token");
+    expect(first.body.inline_pages.length).toBeGreaterThan(0);
+    expect(first.body.known_page_cache.count).toBe(first.body.page_refs.length);
+    expect(browser.cache.known_page_sets.get(first.body.known_page_cache.token)).toHaveLength(first.body.page_refs.length);
+
+    const compact = handleShadowBrowserStateTransferEnvelope(browser, receiveShadowBrowserEnvelopeReceipt(browser, encodeEnvelope(shadowBrowserEnvelope(browser, "woo.state.transfer.request.shadow.v1", {
+      kind: "woo.state.transfer.request.shadow.v1" as const,
+      id: "browser-known-pages-compact",
+      scope: "the_dubspace",
+      key,
+      atom_hashes: [key.atom_hashes[0]],
+      known_page_cache: first.body.known_page_cache,
+      mode: "cell_pages" as const
+    }, "browser-known-pages-compact-env"))));
+    if (!compact || compact.body.mode !== "cell_pages") throw new Error("expected compact cell-page transfer");
+    expect(compact.body.known_page_cache_status).toBe("hit");
+    expect(compact.body.page_refs.length).toBe(first.body.page_refs.length);
+    expect(compact.body.inline_pages).toHaveLength(0);
+    expect(compact.body.page_refs.every((ref) => ref.inline === false)).toBe(true);
+    expect(Array.from(browser.cache.known_page_sets.keys()).at(-1)).toBe(first.body.known_page_cache.token);
+
+    const missIdentity = { ...first.body.known_page_cache, token: `${first.body.known_page_cache.token}:missing`, digest: `${first.body.known_page_cache.digest}:missing` };
+    const fallback = handleShadowBrowserStateTransferEnvelope(browser, receiveShadowBrowserEnvelopeReceipt(browser, encodeEnvelope(shadowBrowserEnvelope(browser, "woo.state.transfer.request.shadow.v1", {
+      kind: "woo.state.transfer.request.shadow.v1" as const,
+      id: "browser-known-pages-miss",
+      scope: "the_dubspace",
+      key,
+      atom_hashes: [key.atom_hashes[0]],
+      known_page_cache: missIdentity,
+      mode: "cell_pages" as const
+    }, "browser-known-pages-miss-env"))));
+    if (!fallback || fallback.body.mode !== "cell_pages") throw new Error("expected fallback cell-page transfer");
+    expect(fallback.body.known_page_cache_status).toBe("miss");
+    expect(fallback.body.inline_pages.length).toBeGreaterThan(0);
+  });
+
   it("does not let a stale browser close remove replacement node auth", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:browser-reload-auth");

@@ -2079,9 +2079,13 @@ describe("v2 browser worker integration", () => {
         phase: "state_transfer_request",
         status: "ok",
         request_known_pages: expect.any(Number),
+        request_known_page_cache: expect.any(Number),
+        request_known_page_cache_count: expect.any(Number),
         request_body_bytes: expect.any(Number),
         reply_page_refs: expect.any(Number),
         reply_inline_pages: expect.any(Number),
+        reply_known_page_cache: expect.any(Number),
+        reply_known_page_cache_count: expect.any(Number),
         reply_metadata_bytes: expect.any(Number)
       });
     }

@@ -1537,10 +1537,16 @@ from missing `TurnKey` atom preimages:
 
 The transfer also carries the session/log/counter envelope data needed to
 execute the turn in a small shard. Page refs can be advertised from cache; only
-unknown pages are inlined. Install verifies inline pages against their
-advertised page hashes and verifies a state-transfer proof scoped to an anchor
-authority and recipient node. State transfer is driven by exact post-selection
-inventory gaps instead of copying the whole world or whole object records.
+unknown pages are inlined. A browser MAY replace repeated full known-page hash
+echoes with a relay-issued `woo.known_page_hash_set.v1` identity for the
+same held-page set. That identity is only an omission hint: if the relay does
+not recognize it, it must serve a correct larger transfer by treating all pages
+as unknown. A request that carries neither explicit known-page hashes nor a
+recognized identity is likewise a request for the relay to inline the selected
+closure. Install verifies inline pages against their advertised page hashes and
+verifies a state-transfer proof scoped to an anchor authority and recipient node.
+State transfer is driven by exact post-selection inventory gaps instead of
+copying the whole world or whole object records.
 
 ### VTN12.1 Commit-reply warm cache-fill (B7)
 
