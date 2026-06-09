@@ -5,6 +5,7 @@ import { createServer as createViteServer } from "vite";
 import { WebSocket, WebSocketServer } from "ws";
 import { compileVerb, definePropertyVersionedAs, installVerbAs, setPropertyValueVersionedAs } from "../core/authoring";
 import { createWorld } from "../core/bootstrap";
+import { BROWSER_ACTIVITY_NUMERIC_DETAIL_FIELDS } from "../core/browser-activity-metric-fields";
 import { parseAutoInstallCatalogs } from "../core/local-catalogs";
 import { handleRestProtocolRequest, restFrameFromTurnReply, type RestProtocolHost, type RestProtocolRequest } from "../core/protocol";
 import { normalizeError, type ParkedTaskRun } from "../core/world";
@@ -1110,7 +1111,7 @@ function browserActivityMetricFromPayload(raw: unknown, session: Session): Metri
   if (!phase) return null;
   const source = input.source === "main" ? "main" : "v2_browser_worker";
   const status = input.status === "error" ? "error" : "ok";
-  return {
+  const metric: MetricEvent = {
     kind: "browser_activity",
     source,
     phase,
@@ -1132,6 +1133,11 @@ function browserActivityMetricFromPayload(raw: unknown, session: Session): Metri
     ...(boundedBrowserMetricString(input.error) ? { error: boundedBrowserMetricString(input.error)! } : {}),
     ...(boundedBrowserMetricString(input.error_detail) ? { error_detail: boundedBrowserMetricString(input.error_detail)! } : {})
   };
+  for (const field of BROWSER_ACTIVITY_NUMERIC_DETAIL_FIELDS) {
+    const value = nonNegativeMetricNumber(input[field]);
+    if (value !== undefined) (metric as Record<string, unknown>)[field] = value;
+  }
+  return metric;
 }
 
 function boundedBrowserMetricString(value: unknown): string | undefined {

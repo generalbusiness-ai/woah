@@ -1,5 +1,6 @@
 import type { EffectTranscript } from "../core/effect-transcript";
 import type { ShadowBrowserStateTransfer, ShadowScopeProjectionPatch } from "../core/shadow-browser-node";
+import type { ShadowKnownPageHashSetIdentity } from "../core/shadow-known-page-cache";
 import type { ShadowCapabilityAd } from "../core/capability-ad";
 import type { ShadowCommitAccepted, ShadowScopeHead } from "../core/shadow-commit-scope";
 import type { ShadowEnvelope } from "../core/shadow-envelope";
@@ -26,6 +27,7 @@ export type V2BrowserCacheMutation =
   | { kind: "object_page"; hash: string; object: SerializedObject }
   | { kind: "state_page"; hash: string; ref: string; page: ShadowStatePage }
   | { kind: "state_pages"; scope: string; pages: Array<{ hash: string; ref: string; page: ShadowStatePage }> }
+  | { kind: "known_page_cache"; identity: ShadowKnownPageHashSetIdentity }
   | { kind: "checkpoint_tail"; transfer: CheckpointTailOpenTransfer<BrowserProfile> }
   | { kind: "execution_ad"; record: V2ExecutionAdRecord }
   | { kind: "execution_transfer"; record: V2ExecutableTransferRecord };
@@ -97,7 +99,8 @@ function stateTransferMutations(transfer: ShadowBrowserStateTransfer): V2Browser
       .filter((item): item is { hash: string; ref: string; page: ShadowStatePage } => item !== null);
     return [
       { kind: "execution_transfer" as const, record: v2ExecutableTransferRecord(transfer) },
-      ...(pages.length > 0 ? [{ kind: "state_pages" as const, scope: transfer.scope, pages }] : [])
+      ...(pages.length > 0 ? [{ kind: "state_pages" as const, scope: transfer.scope, pages }] : []),
+      ...(transfer.known_page_cache ? [{ kind: "known_page_cache" as const, identity: transfer.known_page_cache }] : [])
     ];
   }
   // Browser executable cache is store-2 cell pages only. The worker rejects

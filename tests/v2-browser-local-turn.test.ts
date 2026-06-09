@@ -211,6 +211,51 @@ describe("v2 browser local turn planning", () => {
     });
   });
 
+  it("plans cold command text from the open executable seed without parser repair", async () => {
+    const anchor = createWorld();
+    const session = anchor.auth("guest:v2-browser-command-plan-seed");
+    await anchor.directCall("setup-command-plan-seed-enter", session.actor, "the_chatroom", "enter", [], { sessionId: session.id });
+    const serialized = anchor.exportWorld();
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:command-plan-seed",
+      scope: "the_chatroom",
+      serialized
+    });
+    const openTransfer = buildShadowBrowserOpenExecutableSeedTransfer(
+      relay,
+      "the_chatroom",
+      "browser:command-plan-seed",
+      session.actor
+    );
+    const local = await planV2BrowserLocalTurn({
+      node: "browser:command-plan-seed",
+      actor: session.actor,
+      session: session.id,
+      head: { kind: "woo.scope_head.shadow.v1", scope: "the_chatroom", epoch: 1, seq: 0, hash: "root" },
+      id: "command-plan-seed-take",
+      route: "direct",
+      scope: "the_chatroom",
+      target: "the_chatroom",
+      verb: "command_plan",
+      args: ["take mug"],
+      persistence: "live",
+      transfers: [v2ExecutableTransferRecord(openTransfer, 1)]
+    });
+    expect(local).toMatchObject({
+      ok: true,
+      optimistic_frame: {
+        op: "result",
+        result: {
+          ok: true,
+          route: "direct",
+          target: "the_chatroom",
+          verb: "take",
+          args: ["mug"]
+        }
+      }
+    });
+  });
+
   it("open executable seed carries anchored exits and repairs cold room movement to a real move", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:v2-browser-exit-seed");
