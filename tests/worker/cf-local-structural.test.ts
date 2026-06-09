@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { writeFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import worker from "../../src/worker/index";
 import { CommitScopeDO } from "../../src/worker/commit-scope-do";
@@ -15,6 +16,14 @@ vi.setConfig({ testTimeout: 45_000 });
 const PROD_CATALOGS = "chat,demoworld,dubspace,help,note,pinboard,prog,tasks,blocks-demo";
 const PROD_SHARDS = 32;
 const DIRECTORY_PRESENCE_WINDOW_MS = 5 * 60_000;
+const WARM_TURN_FORBIDDEN_AUTHORITY_RECONSTRUCTION_REASONS = new Set(["warm_turn_refresh", "missing_state_repair"]);
+
+type WarmTurnExpectation = {
+  target: string;
+  verb: string;
+  expectedCount?: number;
+  maxAuthorityCalls?: number;
+};
 
 describe("CF-local prod-shape structural probes", () => {
   it("rejects partial state-page materialization before it becomes a deployed-only lineage failure", () => {
@@ -100,6 +109,108 @@ describe("CF-local prod-shape structural probes", () => {
       harness.close();
     }
   });
+
+  it("gates measured warm deterministic movement and mounted-tool turns", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const harness = createStructuralHarness();
+    const runId = `cf-local-warm-turn-${Date.now()}-${randomUUID().slice(0, 8)}`;
+    let sessionId: string | null = null;
+    try {
+      sessionId = await openMcpSession(harness, `guest:cf-local-warm-turn-${runId}`, runId);
+
+      await callTool(harness, sessionId, 3, "woo_call", { object: "the_chatroom", verb: "enter", args: [] });
+      const setupMetrics = metricsFromLogSpy(logSpy);
+      logSpy.mockClear();
+
+      // Deliberate warm-up: exercise the same deterministic routes once before
+      // measuring so cold opens, catalog install, and first seed fills remain
+      // outside the zero-repair warm-turn gate.
+      await callTool(harness, sessionId, 4, "woo_call", { object: "the_chatroom", verb: "southeast", args: [] });
+      await callTool(harness, sessionId, 5, "woo_call", { object: "the_pinboard", verb: "enter", args: [] });
+      await callTool(harness, sessionId, 6, "woo_call", { object: "the_pinboard", verb: "leave", args: [] });
+      await callTool(harness, sessionId, 7, "woo_call", { object: "the_deck", verb: "west", args: [] });
+      const warmupMetrics = metricsFromLogSpy(logSpy);
+      logSpy.mockClear();
+
+      await callTool(harness, sessionId, 8, "woo_call", { object: "the_chatroom", verb: "southeast", args: [] });
+      await callTool(harness, sessionId, 9, "woo_call", { object: "the_pinboard", verb: "enter", args: [] });
+      await callTool(harness, sessionId, 10, "woo_call", { object: "the_pinboard", verb: "leave", args: [] });
+      await callTool(harness, sessionId, 11, "woo_call", { object: "the_deck", verb: "west", args: [] });
+      const measuredMetrics = metricsFromLogSpy(logSpy);
+
+      writeLabeledMetricsIfRequested(runId, {
+        setup: setupMetrics,
+        warmup: warmupMetrics,
+        measured_warm: measuredMetrics
+      });
+      assertWarmTurnStructuralGate(measuredMetrics, [
+        { target: "the_chatroom", verb: "southeast" },
+        { target: "the_pinboard", verb: "enter" },
+        { target: "the_pinboard", verb: "leave" },
+        { target: "the_deck", verb: "west" }
+      ]);
+    } finally {
+      if (sessionId) await mcpFetch(harness, { method: "DELETE", headers: { "mcp-session-id": sessionId } }).catch(() => undefined);
+      logSpy.mockRestore();
+      harness.close();
+    }
+  });
+
+  it("reports warm-turn structural gate violations with actionable metric context", () => {
+    const violations = warmTurnStructuralViolations([
+      {
+        kind: "turn_phase_timing",
+        target: "the_chatroom",
+        verb: "southeast",
+        route: "direct",
+        attempts: 2,
+        authority_calls: 2,
+        outcome: "submitted",
+        submit_detail_ms: {}
+      },
+      {
+        kind: "turn_repair_attempt",
+        target: "the_chatroom",
+        verb: "southeast",
+        source: "planning_throw",
+        reason: "missing_state",
+        attempt: 1,
+        objects: ["the_deck"],
+        atoms: ["read:cell:contents:the_deck"]
+      },
+      {
+        kind: "authority_slice_reconstructed",
+        reason: "warm_turn_refresh",
+        scope: "the_chatroom",
+        object_count: 12,
+        page_count: 34,
+        source_host: "the_deck"
+      },
+      {
+        kind: "shadow_commit_rejected",
+        scope: "the_chatroom",
+        reason: "read_version_mismatch"
+      },
+      {
+        kind: "v2_envelope",
+        status: "ok",
+        scope: "the_chatroom"
+      },
+      {
+        kind: "v2_envelope",
+        status: "ok",
+        scope: "the_chatroom"
+      }
+    ], [{ target: "the_chatroom", verb: "southeast" }]);
+
+    expect(violations).toEqual(expect.arrayContaining([
+      expect.stringContaining("turn_phase_timing the_chatroom:southeast attempts=2 authority_calls=2"),
+      expect.stringContaining("turn_repair_attempt the_chatroom:southeast source=planning_throw reason=missing_state attempt=1"),
+      expect.stringContaining("authority_slice_reconstructed scope=the_chatroom reason=warm_turn_refresh"),
+      expect.stringContaining("shadow_commit_rejected scope=the_chatroom reason=read_version_mismatch"),
+      expect.stringContaining("v2_envelope accepted_count=2 expected_turns=1")
+    ]));
+  });
 });
 
 type StructuralHarness = {
@@ -157,6 +268,7 @@ function createStructuralHarness(): StructuralHarness {
     WOO_INTERNAL_SECRET: "cf-local-structural-secret",
     WOO_AUTO_INSTALL_CATALOGS: PROD_CATALOGS,
     WOO_MCP_GATEWAY_SHARDS: String(PROD_SHARDS),
+    WOO_V2_SLIM_WARM_ENVELOPE: "1",
     DIRECTORY: new FakeDurableObjectNamespace((name) => {
       if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
       return directory;
@@ -295,6 +407,109 @@ function metricsFromLogSpy(logSpy: ReturnType<typeof vi.spyOn>): Record<string, 
 
 function maxMetric(metrics: Record<string, unknown>[], kind: string, field: string): number {
   return Math.max(0, ...metrics.filter((m) => m.kind === kind).map((m) => Number(m[field]) || 0));
+}
+
+function assertWarmTurnStructuralGate(metrics: Record<string, unknown>[], expectedTurns: WarmTurnExpectation[]): void {
+  const violations = warmTurnStructuralViolations(metrics, expectedTurns);
+  expect(
+    violations,
+    `measured warm deterministic turns violated structural invariants:\n${violations.join("\n")}`
+  ).toEqual([]);
+}
+
+function warmTurnStructuralViolations(metrics: Record<string, unknown>[], expectedTurns: WarmTurnExpectation[]): string[] {
+  const violations: string[] = [];
+  const expected = new Map(expectedTurns.map((turn) => [turnKey(turn), turn]));
+  const phaseTimings = metrics.filter((m) => m.kind === "turn_phase_timing" && expected.has(metricTurnKey(m)));
+  const phaseTimingsByTurn = groupByTurn(phaseTimings);
+  for (const turn of expectedTurns) {
+    const key = turnKey(turn);
+    const timings = phaseTimingsByTurn.get(key) ?? [];
+    const expectedCount = turn.expectedCount ?? 1;
+    if (timings.length !== expectedCount) {
+      violations.push(`turn_phase_timing ${key} count=${timings.length} expected=${expectedCount}`);
+      continue;
+    }
+    for (const timing of timings) {
+      const attempts = Number(timing.attempts);
+      const authorityCalls = Number(timing.authority_calls);
+      const maxAuthorityCalls = turn.maxAuthorityCalls ?? 1;
+      if (attempts !== 1 || authorityCalls > maxAuthorityCalls) {
+        violations.push(`turn_phase_timing ${key} attempts=${String(timing.attempts)} authority_calls=${String(timing.authority_calls)} max_authority_calls=${maxAuthorityCalls}`);
+      }
+      if (timing.outcome !== "submitted") {
+        violations.push(`turn_phase_timing ${key} outcome=${String(timing.outcome)}`);
+      }
+      if (!hasSubmitDetail(timing, "worker.commit_scope_envelope_rpc")) {
+        violations.push(`turn_phase_timing ${key} missing_submit_detail=worker.commit_scope_envelope_rpc`);
+      }
+    }
+  }
+
+  for (const metric of metrics) {
+    const key = metricTurnKey(metric);
+    if (metric.kind === "turn_repair_attempt" && expected.has(key)) {
+      violations.push(
+        `turn_repair_attempt ${key} source=${String(metric.source)} reason=${String(metric.reason)} attempt=${String(metric.attempt)} objects=${JSON.stringify(metric.objects ?? [])} atoms=${JSON.stringify(metric.atoms ?? [])}`
+      );
+    }
+    if (metric.kind === "direct_call" && expected.has(key) && metric.status === "error") {
+      violations.push(`direct_call ${key} status=error error=${String(metric.error ?? "")}`);
+    }
+  }
+
+  for (const metric of metrics) {
+    if (
+      metric.kind === "authority_slice_reconstructed" &&
+      WARM_TURN_FORBIDDEN_AUTHORITY_RECONSTRUCTION_REASONS.has(String(metric.reason))
+    ) {
+      violations.push(`authority_slice_reconstructed scope=${String(metric.scope)} reason=${String(metric.reason)} objects=${String(metric.object_count)} pages=${String(metric.page_count)} source_host=${String(metric.source_host ?? "")}`);
+    }
+    if (metric.kind === "shadow_commit_rejected") {
+      violations.push(`shadow_commit_rejected scope=${String(metric.scope)} reason=${String(metric.reason)}`);
+    }
+  }
+
+  const acceptedEnvelopes = metrics.filter((m) => m.kind === "v2_envelope" && m.status === "ok");
+  if (acceptedEnvelopes.length !== phaseTimings.length) {
+    violations.push(`v2_envelope accepted_count=${acceptedEnvelopes.length} expected_turns=${phaseTimings.length}`);
+  }
+  return violations;
+}
+
+function groupByTurn(metrics: Record<string, unknown>[]): Map<string, Record<string, unknown>[]> {
+  const out = new Map<string, Record<string, unknown>[]>();
+  for (const metric of metrics) {
+    const key = metricTurnKey(metric);
+    const bucket = out.get(key) ?? [];
+    bucket.push(metric);
+    out.set(key, bucket);
+  }
+  return out;
+}
+
+function turnKey(turn: Pick<WarmTurnExpectation, "target" | "verb">): string {
+  return `${turn.target}:${turn.verb}`;
+}
+
+function metricTurnKey(metric: Record<string, unknown>): string {
+  return `${String(metric.target ?? "")}:${String(metric.verb ?? "")}`;
+}
+
+function hasSubmitDetail(metric: Record<string, unknown>, label: string): boolean {
+  const detail = metric.submit_detail_ms;
+  return typeof detail === "object" && detail !== null && label in detail;
+}
+
+function writeLabeledMetricsIfRequested(
+  runId: string,
+  phases: Record<string, Record<string, unknown>[]>
+): void {
+  if (!process.env.WOO_CF_LOCAL_METRICS_OUT) return;
+  const labeled = Object.entries(phases).flatMap(([phase, metrics]) =>
+    metrics.map((metric) => ({ ...metric, cf_local_run: runId, cf_local_phase: phase }))
+  );
+  writeFileSync(process.env.WOO_CF_LOCAL_METRICS_OUT, `${JSON.stringify(labeled, null, 2)}\n`);
 }
 
 function rpc(id: number, method: string, params?: unknown): Record<string, unknown> {

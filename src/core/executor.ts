@@ -189,7 +189,7 @@ export type SubmitTurnIntentOptions<Client, Result extends ExecutorEnvelopeResul
     // missing_state_repair authority refresh that force-fetches owner authority
     // for the named ids (CA11.2 occupancy transition), displacing any local
     // topology pre-seed. Absent / false on the first pre-plan and commit phases.
-    context?: { phase: "intent" | "pre_plan" | "commit"; repair?: boolean }
+    context?: { phase: "intent" | "pre_plan" | "commit"; repair?: boolean; plannedTranscriptCommit?: boolean }
   ): ExecutorAuthorityPayload | Promise<ExecutorAuthorityPayload>;
   // `planned-exec` normally plans from the caller's cached relay view, then
   // refreshes authority for commit. Sparse gateway shards need the reverse for
@@ -841,7 +841,7 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       executorTranscriptObjectIds(planned.transcript)
     );
     authorityCalls += 1;
-    const authority = await timePhase((ms) => { authorityMs += ms; }, () => options.authorityPayload(commitScope, authorityObjectIds, { phase: "commit" }));
+    const authority = await timePhase((ms) => { authorityMs += ms; }, () => options.authorityPayload(commitScope, authorityObjectIds, { phase: "commit", plannedTranscriptCommit }));
     options.applyAuthority?.(commitClient, authority.authority);
     if (commitClient !== planningClient) options.applyAuthority?.(planningClient, authority.authority);
     const head = options.clientHead?.(commitClient);

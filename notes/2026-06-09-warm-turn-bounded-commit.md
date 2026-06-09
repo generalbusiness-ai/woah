@@ -250,6 +250,30 @@ oracle.
   threshold that is not flaky.
 - Which dynamic movement cases must remain outside the zero-repair invariant?
 
+## Progress
+
+2026-06-09:
+
+- Added a CF-local structural probe with explicit setup, warm-up, and measured
+  warm phases. The measured phase gates deterministic movement/tool turns on
+  one attempt, no repair attempts, no shadow commit rejection, no
+  `warm_turn_refresh` or `missing_state_repair` authority-slice reconstruction,
+  and exactly one accepted `/v2/envelope` per measured turn.
+- Added a synthetic violation fixture so the gate reports the offending metric
+  kind, target verb, attempt count, repair reason, reconstruction reason, and
+  envelope count.
+- Enabled `WOO_V2_SLIM_WARM_ENVELOPE` in the CF-local structural and smoke
+  harnesses so local validation matches the deployed slim warm-envelope shape.
+- Avoided measured warm `warm_turn_refresh` reconstruction on slim MCP commit
+  submits by reusing already-admitted relay rows for local executor commit
+  authority payloads. Planned-transcript commits use the planning relay rows
+  after the selected commit scope session is open, which preserves the read
+  support used by planning without rebuilding owner authority.
+
+Remaining plan items still need separate work: the explicit warm state contract,
+removal of planning-time `SerializedWorld` materialization, tighter bounded
+commit budgets, and bounded receiver fanout/apply.
+
 ## First Milestone
 
 Create the CF-local structural gate before changing the runtime. A good first
