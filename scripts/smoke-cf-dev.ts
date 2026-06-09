@@ -20,7 +20,10 @@
 // (e.g. workerd never became ready).
 
 import { spawn, type ChildProcess } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { httpTransport, SmokeSession } from "./smoke/session";
@@ -44,8 +47,14 @@ async function main(): Promise<void> {
   const runId = args.runId;
   const results: StepResult[] = [];
 
-  console.log(`smoke-cf-dev booting wrangler dev on ${baseUrl} (run=${runId})`);
-  const server = await startWorkerd(port);
+  // Per-run, isolated persistence. `wrangler dev` otherwise reuses its default
+  // .wrangler/state, so the gate could pass against a world bootstrapped by an
+  // earlier run and SKIP the cold first-light path (catalog auto-install, KV
+  // host-seed, DO migrations) — exactly the regressions this lane exists to
+  // catch. A fresh temp dir per run forces a true cold boot every time.
+  const persistDir = mkdtempSync(join(tmpdir(), "woo-smoke-cf-dev-"));
+  console.log(`smoke-cf-dev booting wrangler dev on ${baseUrl} (run=${runId}, persist=${persistDir})`);
+  const server = await startWorkerd(port, persistDir);
   let crashed: unknown = null;
   try {
     await waitForHealthz(baseUrl);
@@ -71,8 +80,14 @@ async function main(): Promise<void> {
   } catch (err) {
     crashed = err;
   } finally {
-    if (!args.keep) await stopWorkerd(server);
-    else console.log(`  --keep set; leaving wrangler dev running on ${baseUrl} (pid ${server.pid})`);
+    if (!args.keep) {
+      await stopWorkerd(server);
+      // Remove the cold-boot state only after workerd has exited and released
+      // its file handles, so the next run starts cold again.
+      try { rmSync(persistDir, { recursive: true, force: true }); } catch { /* best effort */ }
+    } else {
+      console.log(`  --keep set; leaving wrangler dev running on ${baseUrl} (pid ${server.pid}, persist=${persistDir})`);
+    }
   }
 
   const passed = results.filter((r) => r.ok).length;
@@ -134,10 +149,17 @@ async function openSessionPair(transport: ReturnType<typeof httpTransport>, runI
 // Spawn `wrangler dev` in its own process group so teardown can kill the whole
 // tree (wrangler spawns a workerd child that a plain SIGTERM to wrangler does
 // not always reap — observed during the lane's bring-up).
-async function startWorkerd(port: number): Promise<ChildProcess> {
+async function startWorkerd(port: number, persistDir: string): Promise<ChildProcess> {
   const child = spawn(
     "npx",
-    ["--no-install", "wrangler", "dev", "-c", "wrangler.smoke.toml", "--port", String(port), "--ip", "127.0.0.1"],
+    [
+      "--no-install", "wrangler", "dev",
+      "-c", "wrangler.smoke.toml",
+      "--port", String(port),
+      "--ip", "127.0.0.1",
+      // Isolate (and reset, via the temp dir) all local DO/KV/cache state.
+      "--persist-to", persistDir
+    ],
     { stdio: ["ignore", "inherit", "inherit"], detached: true }
   );
   child.on("error", (err) => {

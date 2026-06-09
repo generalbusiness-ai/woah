@@ -60,6 +60,19 @@ vitest project and reuses the exact HTTP transport the deployed lane uses.
 Wired into `scripts/deploy.sh` preflight (after `npm test`, before build),
 gated by `WOO_DEPLOY_CF_DEV` (default on) and skipped under `--skip-tests`.
 
+Two hardening fixes after first review:
+- **Isolated cold boot.** `wrangler dev` defaults to a persistent `.wrangler/state`,
+  so the gate could pass against a world bootstrapped by an earlier run and skip
+  cold first-light / catalog install / KV seed / migrations. The lane now creates
+  a per-run temp dir and passes `--persist-to <dir>`, removing it on teardown
+  (kept under `--keep`). Verified: every host logs `cf_repository_load
+  stored:false objects:0` — a true cold boot each run.
+- **No DO drift.** `wrangler.smoke.toml` duplicates the production DO bindings +
+  migrations, but `cf:migrations:check` only inspects `wrangler.toml`. New guard
+  `scripts/guard-smoke-wrangler.mjs` (in `test:guards` + `pretypecheck`) fails if
+  the smoke config's DO binding set or migration sequence drifts from production,
+  and re-checks the smoke config's own migration consistency.
+
 ## Honest fidelity caveat (important)
 
 The workerd lane currently **passes all 11 steps**, including the four that fail
