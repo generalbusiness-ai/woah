@@ -131,6 +131,32 @@ Raw artifacts for the `dd88a37d` deployed runs:
 - `.woo/smoke-measurements/deploy-dd88a37d-c25f372-20260608T223100Z/analyze-smoke-tail.txt`
 - `.woo/smoke-measurements/deploy-dd88a37d-c25f372-20260608T223100Z/analyze-data-path-costs.txt`
 
+Commit `7b478c6` deployed to Cloudflare version
+`1a002d9c-2e04-4eb9-bd60-4a1758dfd85a` after preferring locally proven
+self-host routes over stale Directory `world` routes during sparse repair. The
+deploy preflight, tests, build, upload, postflight health/auth/state checks,
+WebSocket check, wizard claim check, and MCP routing check passed. The deploy
+script's built-in smoke failed 8/10: the inherited movement checks, mug,
+pinboard, and outliner checks passed, while `enter:chatroom (bob)` timed out at
+20s and `tasks: cross-room entered reaches peer` failed with `E_OBJNF object
+not hosted here: the_deck`.
+
+A corrected tail-captured follow-up against the same deployed version failed
+7/10: both chatroom enters, chat, movement, mug, and pinboard passed; outliner
+enter timed out after a 59.4s step; outliner add then failed with `E_PERM
+cannot set item position` after the harness reset sessions and Alice was no
+longer confirmed present in `the_outline`; tasks timed out at the 20s MCP
+request guard. Tail capture found 957 Cloudflare events and 3,841 `woo.metric`
+rows.
+
+Raw artifacts for the `1a002d9c` deployed runs:
+
+- `/tmp/woo-deploy-smoke.log`
+- `.woo/smoke-measurements/deploy-1a002d9c-7b478c6-20260609T005257Z/tail.log`
+- `.woo/smoke-measurements/deploy-1a002d9c-7b478c6-20260609T005257Z/smoke.log`
+- `.woo/smoke-measurements/deploy-1a002d9c-7b478c6-20260609T005257Z/analyze-smoke-tail.txt`
+- `.woo/smoke-measurements/deploy-1a002d9c-7b478c6-20260609T005257Z/analyze-data-path-costs.txt`
+
 ## Correctness Finding
 
 The pinboard blocker happened before VM execution during scope/session
@@ -214,6 +240,17 @@ now prefers a locally-proven self-hosted route when Directory claims `world` for
 a non-bootstrap object during owner repair, so `the_chatroom` repairs fetch from
 the room DO while ordinary actors/default-hosted objects can still resolve to
 `world`.
+
+Ninth finding: after the stale-route fix deployed, production moved past the
+specific `the_chatroom -> world` loop. Tail rows for `the_chatroom:southeast`
+now partition missing `the_deck` state to host `the_deck`, and `the_deck:west`
+repairs missing `the_chatroom` state from host `the_chatroom`. The remaining
+deployed failures are dominated by timeout saturation and commit retries rather
+than that prior owner-route misclassification. The outliner `E_PERM` in the
+tail-captured run is secondary fallout from the harness continuing after
+`outliner:enter` timed out and reset sessions; `add_item` then tried to
+renumber an existing row while the acting user was no longer known-present in
+the outliner.
 
 Fix validation after patching authority-slice materialization:
 
@@ -529,6 +566,50 @@ Data-path costs:
 - Remote owner refresh count: 8.
 - Tool-surface reverse-index source rows requested: 120; cap-hit events: 0.
 
+The tail-captured deployed run after sparse self-host route preference found
+957 Cloudflare tail events and 3,841 `woo.metric` rows.
+
+Cloudflare invocation timing:
+
+- Worker `POST /mcp`: 87 requests, 3 errors, p95 17,834 ms, max 20,002 ms.
+- PersistentObjectDO `POST /mcp`: 86 requests, 1 error, p95 18,044 ms, max
+  20,389 ms, CPU p95 10,710 ms.
+- PersistentObjectDO `POST /__internal/authority-slice`: 95 requests, p95
+  2,389 ms, max 3,278 ms.
+- CommitScopeDO `POST /v2/envelope`: 31 requests, p95 2,509 ms, max 2,596 ms.
+- CommitScopeDO `POST /v2/open`: 20 requests, p95 946 ms, max 965 ms.
+- PersistentObjectDO `POST /__internal/enumerate-tools`: 32 requests, 1 error,
+  p95 473 ms, max 5,345 ms.
+
+Turn phase attribution across reported turns:
+
+- Submit: 136,653 ms, 46% of summed turn wall time.
+- Ensure-client: 93,030 ms, 31%.
+- Authority planning: 67,376 ms, 23%.
+
+Largest deployed costs:
+
+- `worker.commit_scope_envelope_rpc`: 127,984 ms, p95 7,459 ms.
+- `commit.initializer_wait`: 47,565 ms, p95 5,624 ms.
+- `planning.seed_authority`: 40,823 ms, p95 2,942 ms.
+- `/__internal/authority-slice -> world`: 52 calls, 70,149 ms summed, max
+  4,694 ms.
+- `/__internal/authority-slice -> the_chatroom`: 22 calls, 15,187 ms summed,
+  max 1,953 ms.
+- `/__internal/authority-slice -> the_deck`: 15 calls, 10,669 ms summed, max
+  3,384 ms.
+
+Data-path costs:
+
+- `storage_full_save`: 2 events, 6,190 rows.
+- `storage_direct_write`: 153 metric rows, 1,398 data rows.
+- Observed projection bytes: 1.67 MiB.
+- Cross-host round trips: 222.
+- Same-host fallback count: 37.
+- Remote owner refresh count: 32.
+- Tool-surface reverse-index source rows requested: 271; cap-hit events: 0.
+- Tail rows written: 100; max retained tail bytes: 6.90 MiB.
+
 ## Interpretation
 
 The deployed failure was a correctness blocker in sparse authority-slice
@@ -545,4 +626,10 @@ was not hydrated before dispatch retry. The `d8e30ba2` run narrowed that again:
 the target and actor were repairable, but inherited verb support did not travel
 as an owner-prefetch root. The `dd88a37d` run closed inherited verb support in
 production and exposed stale Directory object routing as the next blocker: repair
-was now correctly requested, but the owner host was wrong.
+was now correctly requested, but the owner host was wrong. The `1a002d9c` run
+closed that route-specific blocker in production, but the deployed smoke is
+still not healthy: warm movement/tool turns are paying repeated authority-slice
+fetches, commit-scope envelope waits, and repair/retry costs that put MCP p95
+near the 20s request guard. The next performance target is reducing warm-turn
+authority reconstruction and commit-envelope round trips, not another
+single-object sparse repair classification.
