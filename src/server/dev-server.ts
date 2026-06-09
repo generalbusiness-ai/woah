@@ -854,7 +854,9 @@ async function handleV2ShadowFrame(
       }
       : null;
     if (reply?.body.ok === true && reply.body.commit && reply.body.transcript) {
-      await materializeDevV2CommitLocally(world, reply.body.commit.position.scope, reply.body.transcript);
+      await materializeDevV2CommitLocally(world, reply.body.commit.position.scope, reply.body.transcript, {
+        commit: reply.body.commit
+      });
       persistDevV2RelayTail(reply.body.commit.position.scope);
     }
     if (receiverReply) {

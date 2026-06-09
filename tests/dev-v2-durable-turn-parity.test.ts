@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { authoritativePlanningWorld } from "../src/core/planning-world";
 import { installVerb } from "../src/core/authoring";
@@ -149,6 +149,8 @@ describe("dev v2 durable turn — CF contract parity", () => {
     const sparseSeed = createWorld({ catalogs: false }).exportWorld();
     const gatewayRelay = createShadowBrowserRelayShim({ node: "dev:gw-frame", scope: "the_dubspace", serialized: sparseSeed, deployment: "local-dev" });
     const commitRelay = createShadowBrowserRelayShim({ node: "dev:commit-frame", scope: "the_dubspace", serialized: world.exportWorld(), deployment: "local-dev" });
+    const transcriptApply = vi.spyOn(world, "applyCommittedShadowTranscriptToHost");
+    const projectionApply = vi.spyOn(world, "applyProjectionWrites");
 
     const { frame } = await executeDevV2DurableTurnFrame({
       world,
@@ -160,7 +162,10 @@ describe("dev v2 durable turn — CF contract parity", () => {
     expect(frame.op).toBe("applied");
     if (frame.op !== "applied") throw new Error("expected applied frame");
     expect(frame.space).toBe("the_dubspace");
-    // Write-through: the accepted transcript was materialized into the dev world.
+    // Write-through: REST localdev now follows the CF projection-mode path when
+    // accepted commits carry projection_delta/projection_writes.
+    expect(projectionApply).toHaveBeenCalled();
+    expect(transcriptApply).not.toHaveBeenCalled();
     expect(world.getProp("delay_1", "wet")).toBe(0.37);
   });
 

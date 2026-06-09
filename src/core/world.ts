@@ -7073,7 +7073,16 @@ export class WooWorld {
             this.sessions.delete(write.key);
             if (persist) this.deletePersistedSession(write.key);
           } else {
+            const existing = this.sessions.get(write.key);
             const session = this.hydrateSession(write.row, Date.now());
+            // Projection/persistence rows carry durable session fields only.
+            // Socket attachments are process-local liveness; replacing a live
+            // session wholesale would drop the WebSocket and freeze the client.
+            if (existing && existing.attachedSockets.size > 0) {
+              session.attachedSockets = new Set(existing.attachedSockets);
+              session.lastDetachAt = existing.lastDetachAt;
+              session.lastInputAt = existing.lastInputAt;
+            }
             this.sessions.set(write.key, session);
             if (persist) this.persistSession(session);
           }

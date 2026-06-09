@@ -2206,6 +2206,11 @@ the pending turn without an accepted frame for that turn id, the worker treats
 the pending turn as unresolved and resubmits or fails it through the idempotent
 turn path; it does not assume success from display projection.
 
+The browser MUST bound the lifetime of pending turn envelopes that have been
+queued or sent but receive no reply. When the bound expires, it reports a final
+turn error to the UI, drops the pending envelope and matching tentative proposal,
+and leaves any later accepted frame to arrive through normal catch-up/fanout.
+
 ### VTN14.7 Completion test gates
 
 An implementation does not claim browser-edge v2 completion until tests cover:
@@ -2222,6 +2227,8 @@ An implementation does not claim browser-edge v2 completion until tests cover:
   outliner contents through a gateway/cache-only projection;
 - reconnect from a stale head falls back to projection without confirming or
   deleting unresolved optimistic turns;
+- stalled pending turn envelopes time out into a final UI-visible error and
+  clear matching pending/tentative browser state;
 - durable `woo.turn.intent.request.v1` usage is disabled for normal browser
   surfaces; remaining server-assisted intents are limited to live turns and
   explicit compatibility-mode selected cold delegation.
