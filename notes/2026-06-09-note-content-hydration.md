@@ -97,8 +97,53 @@ structure is to serve it from a cache too.
 - Outliner unit: 65 (incl. new cache-fill test). Worker integration + planner: 44.
 - e2e: outliner perf, pinboard perf, existing outliner display + pinboard tests — pass.
 
+## Review fixes (round 2)
+Three findings from review, all fixed:
+
+- **P1 — read-gated text cached without principal isolation.** The cache is now
+  keyed by the viewing actor: `displayTextCacheKey(ns, actor, subject)` →
+  `woo.<ns>.text.<actor>.<subject>`, and refuses to produce a key without an
+  actor (cache disabled for an unknown principal). `pruneDisplayTextCaches(actor)`
+  runs in `refresh()` once the principal is known, dropping every OTHER principal's
+  cache (isolation + disk hygiene) while keeping the current actor's (which must
+  survive the reload). Explicit logout already wipes all `woo.*` via
+  `clearAccountScopedStorage`. NOTE: do NOT purge in `clearSession()` — it fires on
+  transient `E_NOSESSION` blips during a normal guest reload, followed by a
+  same-guest re-login, so purging there would defeat the cache (this was a real bug
+  caught while fixing P1). Tested in `tests/client-framework.test.ts`.
+- **P2 — pinboard cache resurrected cleared text.** `writePinboardTextCache` now
+  records genuinely-empty text (`""`) instead of dropping it, so a cleared note
+  overwrites its old cached text; the fill skips falsy values so an empty cached
+  string paints nothing. It still never writes until at least one note's text is
+  known, so a pre-hydration render can't clobber a good cache. The outliner got the
+  same treatment plus an **empty-model guard** — its first sync after a reload runs
+  before the projection loads any rows, and writing an empty map there was deleting
+  the actor's own cache (empty map == clear). That self-wipe was the bug that made
+  the outliner reload measure ~2.9s in review. Regression test added.
+- **P3 — perf e2e unstable as a gate.** The instability was a downstream symptom of
+  the P2 self-wipe (outliner reload fell back to the ~3s hydration path, tripping
+  timeouts and cascading ERR_CONNECTION). With that fixed the spec is stable (3/3
+  clean full runs); additionally marked `test.describe.configure({ mode: "serial" })`
+  so these timing-sensitive probes don't contend for the single dev server.
+
+## Result (measured, e2e/note-hydration-perf.spec.ts)
+- Baseline: **~4918ms** structure→text (outliner, 10 items).
+- After fixes: **outliner ~24ms**, **pinboard ~24ms** structure→text; stable across
+  3 consecutive full runs. Genuine cold first-visit (caches wiped): ~25–385ms.
+- **~99% reduction** (target was 80%). Regression gates assert < 1000ms.
+
+## Validation
+- typecheck clean (both tsconfigs); no byte/control-char corruption.
+- npm test gate: 384. Worker integration: 28. Outliner unit: 17 (incl. cache-fill,
+  principal-isolation, no-wipe regression tests). Framework: principal-isolation +
+  prune tests. Full vitest earlier: 1543 / 0 failed.
+- e2e: outliner/pinboard/cold-visit perf + existing outliner display + pinboard
+  tests — all pass.
+
 ## Status
 - [x] serverRead routing + socket-open + tool-scope-direct connect
 - [x] localStorage display cache (outliner + pinboard) via shared framework helpers
-- [x] re-measured: outliner 25ms / pinboard 17ms (~99% reduction)
+- [x] P1 principal-namespaced keys + prune-on-establish; P2 cleared-text + empty-model
+      guards; P3 stable + serial
+- [x] re-measured: outliner 24ms / pinboard 24ms (~99% reduction)
 - [x] tests + regression gates added

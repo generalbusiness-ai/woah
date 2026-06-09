@@ -229,9 +229,11 @@ describe("outliner-tree presence aside", () => {
   });
 
   it("paints cached item text immediately on a cold load while the list_items read is still in flight", async () => {
-    // Simulate a prior session having stashed the readable text.
+    // Simulate a prior session (same actor guest_1) having stashed the readable
+    // text. The cache key is namespaced by the viewing actor — a different
+    // principal must not read it.
     globalThis.localStorage.setItem(
-      "woo.outliner.text.the_outline",
+      "woo.outliner.text.guest_1.the_outline",
       JSON.stringify({ item_1: "cached readable text" })
     );
     // Hold the hydration read open so we observe the pre-hydration paint.
@@ -276,6 +278,29 @@ describe("outliner-tree presence aside", () => {
     releaseRead();
     await flushPromises();
     expect(element.querySelector("[data-outliner-row]")?.textContent).toContain("authoritative text");
+  });
+
+  it("does not delete the display cache when a sync runs before the projection has loaded any items", async () => {
+    // Regression: on a cold reload the first sync runs before the item projection
+    // arrives, so the model is momentarily empty. Writing an empty map then would
+    // delete this actor's cache (empty map == clear), wiping the text we want to
+    // paint. The empty-model guard must leave the cache intact.
+    const key = "woo.outliner.text.guest_1.the_outline";
+    globalThis.localStorage.setItem(key, JSON.stringify({ item_1: "cached readable text" }));
+    const element = document.createElement("woo-outliner-tree") as WooOutlinerTreeElement & { hydrate: () => Promise<void>; subject: string };
+    document.body.append(element);
+    element.subject = "the_outline";
+    // No item refs in the neighborhood yet — the model stays empty this sync.
+    element.woo = ctx({}, {
+      refs: ["the_outline"],
+      directCall: vi.fn(async () => []),
+      projections: { the_outline: { id: "the_outline", name: "Outline", props: {}, catalogState: {} } }
+    });
+    await element.hydrate();
+    await flushPromises();
+    const stored = globalThis.localStorage.getItem(key);
+    expect(stored).not.toBeNull();
+    expect(JSON.parse(stored ?? "{}")).toEqual({ item_1: "cached readable text" });
   });
 
   it("does not replace observation-sourced item text with a projection row that omits text", () => {

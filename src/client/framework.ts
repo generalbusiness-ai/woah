@@ -56,10 +56,47 @@ export type ProjectionSubscriber = (value: ObjectProjection | undefined, ref: st
 // pinboard notes) read text fields that the generic projection deliberately omits
 // because they are catalog-defined and read-gated; that text arrives via a verb
 // hydration whose latency is bounded by the relay scope-open handshake on a cold
-// reload. Stashing the last-seen text per subject lets a reload paint text with
-// the structure; the authoritative hydration read still runs and overwrites it.
-// `key` is a fully-qualified storage key (e.g. `woo.outliner.text.<subject>`).
-// See notes/2026-06-09-note-content-hydration.md.
+// reload. Stashing the last-seen text lets a reload paint text with the structure;
+// the authoritative hydration read still runs and overwrites it.
+//
+// SECURITY: this is read-gated content, so the cache key MUST be namespaced by the
+// viewing principal — callers build keys via `displayTextCacheKey(namespace, actor,
+// subject)`, which refuses to produce a key without an actor. That isolates one
+// principal's cache from another on a shared device and across a guest re-login.
+// `pruneDisplayTextCaches(currentActor)` additionally drops other principals' caches
+// when a principal is established. See notes/2026-06-09-note-content-hydration.md.
+
+// `woo.<namespace>.text.<actor>.<subject>`. Returns "" (cache disabled) when the
+// actor or subject is missing, so an unauthenticated/unknown principal neither
+// reads nor writes the cache.
+export function displayTextCacheKey(namespace: string, actor: string | null | undefined, subject: string): string {
+  if (!namespace || !actor || !subject) return "";
+  return `woo.${namespace}.text.${actor}.${subject}`;
+}
+
+export function clearDisplayTextCaches(): void {
+  pruneDisplayTextCaches(null);
+}
+
+// Remove every display-text cache that does NOT belong to `keepActor`. Called when
+// a principal is established so a different principal's read-gated text is dropped
+// from the device (isolation + disk hygiene), while the CURRENT principal's cache
+// survives — which it must, so a reload still paints text with the structure.
+// `keepActor` null/empty drops all (explicit logout). The actor segment is the 4th
+// dotted field of `woo.<ns>.text.<actor>.<subject>` (refs contain no dots).
+export function pruneDisplayTextCaches(keepActor: string | null | undefined): void {
+  try {
+    const store = globalThis.localStorage;
+    if (!store) return;
+    for (const key of Object.keys(store)) {
+      const match = key.match(/^woo\.[a-z0-9_]+\.text\.([^.]+)\./);
+      if (match && match[1] !== keepActor) store.removeItem(key);
+    }
+  } catch {
+    // localStorage may be unavailable; nothing to purge.
+  }
+}
+
 export function readDisplayTextCache(key: string): Record<string, string> {
   if (!key) return {};
   try {

@@ -19,7 +19,7 @@ import * as tasksUiModule from "../../catalogs/tasks/ui/kanban-board";
 import * as weatherUiModule from "../../catalogs/weather/ui/weather-badge";
 import { appliedFrameErrorObservations, chatErrorText } from "./chat-errors";
 import { chatObservationSpace, updateEnteredLeftChatPresence } from "./chat-state";
-import { CoalescedViewHydrator, createWooClientFramework, escapeHtml, liveProjectionKey, ProjectionFieldFiller, readDisplayTextCache, writeDisplayTextCache, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
+import { CoalescedViewHydrator, createWooClientFramework, displayTextCacheKey, escapeHtml, liveProjectionKey, ProjectionFieldFiller, pruneDisplayTextCaches, readDisplayTextCache, writeDisplayTextCache, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
 import { isPinboardObservation } from "./pinboard-observation";
 import { clearProvisionalChatLines, provisionalChatErrorLine, upsertProvisionalChatLine } from "./provisional-chat";
 import { advanceProjectionCursor, idsFromRefsOrSummaries, presentActorsFromObservation, scopedHerePresentActors, scopedModelWithMoveResult, type ScopedProjectionStateModel } from "./scoped-projection";
@@ -893,6 +893,12 @@ function storeSession(session: string | undefined) {
 
 function clearSession() {
   clearPendingToolEnters();
+  // NOTE: do NOT purge the display-text caches here. clearSession() also fires on
+  // transient blips (E_NOSESSION during a reconnect, a missing-session boot race)
+  // that are immediately followed by a silent re-login as the SAME guest — wiping
+  // the cache there defeats the cold-reload paint. Principal isolation is handled
+  // by actor-namespaced keys plus pruneDisplayTextCaches(actor) once the principal
+  // is (re)established. See notes/2026-06-09-note-content-hydration.md.
   try {
     sessionStorage.removeItem(sessionKey);
     localStorage.removeItem(sessionKey);
@@ -1471,6 +1477,9 @@ async function applyScopedProjectionSnapshot(me: any, catalogs: any) {
   const overlays = me?.overlays && typeof me.overlays === "object" && !Array.isArray(me.overlays) ? me.overlays : {};
   const overlaySnapshots = state.scopedProjection?.overlaySnapshots ?? {};
   state.actor = typeof me?.session?.actor === "string" ? me.session.actor : state.actor;
+  // The principal for this device is now known; drop any other principal's
+  // read-gated display caches (keeps THIS actor's, which must survive the reload).
+  pruneDisplayTextCaches(state.actor);
   state.scopedProjection = {
     me,
     catalogs,
@@ -1895,22 +1904,24 @@ function pinboardModel(): PinboardRenderModel | undefined {
   };
 }
 
-const PINBOARD_TEXT_CACHE_PREFIX = "woo.pinboard.text.";
-
 // Attach last-seen text from the localStorage display cache to notes whose `text`
 // is not yet hydrated, as a separate `cachedText` field. We deliberately do NOT
 // touch `text` itself: the hydration trigger keys on `text === undefined` to fire
 // the authoritative list_notes read, and the component falls back to `cachedText`
 // only while `text` is undefined. So a cold reload paints text with the structure
-// while the authoritative read still runs and overwrites it.
+// while the authoritative read still runs and overwrites it. The cache is keyed by
+// the viewing actor because note text is read-gated (see displayTextCacheKey).
 // See notes/2026-06-09-note-content-hydration.md.
 function fillPinboardNotesFromTextCache(boardId: string, notes: any[]): any[] {
-  if (!boardId || !Array.isArray(notes) || notes.length === 0) return notes;
-  const cache = readDisplayTextCache(PINBOARD_TEXT_CACHE_PREFIX + boardId);
+  const key = displayTextCacheKey("pinboard", state.actor, boardId);
+  if (!key || !Array.isArray(notes) || notes.length === 0) return notes;
+  const cache = readDisplayTextCache(key);
   if (Object.keys(cache).length === 0) return notes;
   return notes.map((note) => {
     const id = String(note?.id ?? "");
     const needsText = note?.text === undefined || note?.text === null;
+    // An empty cached string means the note was last seen cleared; `cache[id]`
+    // is then falsy and we render nothing rather than resurrecting old text.
     return needsText && id && cache[id] ? { ...note, cachedText: cache[id] } : note;
   });
 }
@@ -1919,21 +1930,28 @@ const pinboardTextCacheSignatures = new Map<string, string>();
 
 // Persist whatever note text is currently known (from a list_notes hydration or
 // from in-session note_added/note_edited observations) so a later cold reload can
-// paint it immediately. Deduplicated by content per board. We never write an
-// empty map: pre-hydration renders have no text yet, and clearing the cache then
-// would defeat the purpose; stale ids simply never match on reload.
+// paint it immediately. Deduplicated by content per board. Notes whose text is
+// genuinely empty ("") ARE recorded so a cleared note overwrites its old cached
+// text instead of resurrecting it; only notes whose text is not yet known
+// (undefined) are skipped, and we never write at all until at least one note's
+// text is known (so a pre-hydration render can't clobber a good cache).
 function writePinboardTextCache(boardId: string, notes: any[]): void {
-  if (!boardId) return;
+  const key = displayTextCacheKey("pinboard", state.actor, boardId);
+  if (!key) return;
   const map: Record<string, string> = {};
+  let anyKnown = false;
   for (const note of Array.isArray(notes) ? notes : []) {
     const id = String(note?.id ?? "");
-    if (id && typeof note?.text === "string" && note.text !== "") map[id] = note.text;
+    if (id && typeof note?.text === "string") {
+      map[id] = note.text;
+      anyKnown = true;
+    }
   }
-  if (Object.keys(map).length === 0) return;
+  if (!anyKnown) return;
   const signature = JSON.stringify(map);
   if (pinboardTextCacheSignatures.get(boardId) === signature) return;
   pinboardTextCacheSignatures.set(boardId, signature);
-  writeDisplayTextCache(PINBOARD_TEXT_CACHE_PREFIX + boardId, map);
+  writeDisplayTextCache(key, map);
 }
 
 function scopedPinboardPresentActors(boardId: string, props: Record<string, unknown>): string[] {

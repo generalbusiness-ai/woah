@@ -5,8 +5,14 @@ import { test, expect, type Locator, type Page } from "@playwright/test";
 // visible quickly but each item's readable text lags by many seconds while
 // the catalog view hydrator fetches it via a list_items/list_notes verb read.
 //
-// This spec quantifies that gap so we can prove an 80% improvement. It is a
-// measurement harness, not a behavioral gate; it prints the timings.
+// This spec quantifies that gap so we can prove an 80% improvement. It prints the
+// timings and asserts a loose regression bound on the cached path.
+//
+// Run serially: these are timing-sensitive measurements that all drive the same
+// singleton the_outline/the_pinboard through one dev server. Running them
+// concurrently makes them contend for the server and each other's shared objects,
+// which skews the timings and, under load, can exhaust the single dev server.
+test.describe.configure({ mode: "serial" });
 
 async function continueAsGuestIfPrompted(page: Page): Promise<void> {
   await page.getByRole("button", { name: "Continue as guest" }).click({ timeout: 1_000 }).catch(() => undefined);
