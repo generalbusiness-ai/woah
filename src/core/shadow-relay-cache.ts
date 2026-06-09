@@ -117,17 +117,26 @@ export function shadowSerializedIndex(serialized: SerializedWorld): ShadowSerial
   return index;
 }
 
-// Mutating the relay's serialized snapshot invalidates anything keyed off the
-// pre-mutation state: the commit-scope serialized export, the browser-facing
-// generation (open-time executable seed digests must not validate against
-// pre-commit pages), and the read-index cache for the snapshot object.
+// Relay-cache invalidation shared by both serialized-row mutation and indexed
+// state apply paths. This only invalidates consumers of the serialized snapshot;
+// callers that mutate `commit_scope.serialized` in place must use
+// markShadowBrowserRelaySerializedChanged so the commit-scope index is rebuilt.
+export function invalidateShadowBrowserRelaySerializedCaches(relay: ShadowRelayCache): void {
+  relay.serialized_generation++;
+  relay.open_executable_seed_cache.clear();
+  SHADOW_SERIALIZED_INDEX_CACHE.delete(shadowCommitScopeSerializedRef(relay.commit_scope));
+}
+
+// Mutating the relay's serialized snapshot in place invalidates anything keyed
+// off the pre-mutation state and also rebuilds the commit-scope indexed state.
+// Accepted-frame apply paths already update the indexed state first and should
+// call invalidateShadowBrowserRelaySerializedCaches instead to avoid an O(world)
+// index rebuild on every accepted frame.
 export function markShadowBrowserRelaySerializedChanged(relay: ShadowRelayCache): void {
   if (!isShadowCommitScopeSerializedDirty(relay.commit_scope)) {
     markShadowCommitScopeSerializedChanged(relay.commit_scope);
   }
-  relay.serialized_generation++;
-  relay.open_executable_seed_cache.clear();
-  SHADOW_SERIALIZED_INDEX_CACHE.delete(shadowCommitScopeSerializedRef(relay.commit_scope));
+  invalidateShadowBrowserRelaySerializedCaches(relay);
 }
 
 // THE accepted-frame-into-relay-cache helper across every transport. `advanceHead:true`
@@ -148,7 +157,7 @@ export function applyAcceptedFrameToRelayCache(
     applyShadowTranscriptToCommitScopeCache(relay.commit_scope, transcript);
   }
   recordAcceptedCommitScopeCellProvenance(relay.commit_scope, transcript, accepted, "cache");
-  markShadowBrowserRelaySerializedChanged(relay);
+  invalidateShadowBrowserRelaySerializedCaches(relay);
 }
 
 // Derived/cross-scope convenience (advanceHead: false) — the common case for a relay

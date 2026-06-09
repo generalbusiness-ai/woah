@@ -451,6 +451,7 @@ function createCfSmokeHarness(options: CfSmokeHarnessOptions = {}): CfSmokeHarne
     WOO_INTERNAL_SECRET: "cf-local-smoke-secret",
     WOO_AUTO_INSTALL_CATALOGS: "chat,demoworld,note,blocks-demo",
     WOO_MCP_GATEWAY_SHARDS: String(shards),
+    WOO_V2_SLIM_WARM_ENVELOPE: "1",
     ...(options.hostReadTimeoutMs !== undefined ? { WOO_HOST_READ_TIMEOUT_MS: String(options.hostReadTimeoutMs) } : {}),
     DIRECTORY: new FakeDurableObjectNamespace((name) => {
       if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);

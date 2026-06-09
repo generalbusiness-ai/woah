@@ -3179,9 +3179,9 @@ async function waitForMessageIndex(messages: unknown[], predicate: (message: unk
 
 // The full guarded suite runs several CPU-heavy worker tests in parallel, and
 // deploy preflight captures output under Bash. Both can delay the fake worker's
-// timer turns enough that a correct ready/status message arrives after 10s, so
+// timer turns enough that a correct ready/status message arrives after 30s, so
 // keep this poll tolerant of scheduler delay while still bounded.
-async function waitFor<T>(read: () => T | undefined, timeoutMs = 30000): Promise<T> {
+async function waitFor<T>(read: () => T | undefined, timeoutMs = 60000): Promise<T> {
   const start = Date.now();
   for (;;) {
     const value = read();

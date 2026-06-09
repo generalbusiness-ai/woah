@@ -252,6 +252,11 @@ function ensureSerializedSession(sessions: readonly SerializedSession[], session
   return out.sort((a, b) => a.id.localeCompare(b.id));
 }
 
+function cachedAuthorityPageKey(page: { object: ObjRef; page: string; name?: string }): string {
+  const name = page.page === "property_cell" || page.page === "verb_bytecode" ? page.name ?? "" : "";
+  return `${page.object}:${page.page}:${name}`;
+}
+
 export type McpGatewayOptions = {
   serverName?: string;
   serverVersion?: string;
@@ -781,6 +786,19 @@ export class McpGateway {
         // seeded-id local-export exclusion for those ids, so the owner's
         // exits-bearing row is fetched and displaces the seed by CA11 precedence.
         const isRepair = isPrePlan && context?.repair === true;
+        if (
+          !isPrePlan &&
+          hooks.slimWarmEnvelope === true
+        ) {
+          const submitClient = this.v2Scopes.get(submitScope);
+          const authorityClient = context?.plannedTranscriptCommit === true
+            ? this.v2Scopes.get(scope) ?? submitClient
+            : submitClient;
+          const sessionOpen = context?.plannedTranscriptCommit === true
+            ? submitClient?.commitScopeOpenedSessions.has(entry.woo.id) === true
+            : submitClient?.openedSessions.has(entry.woo.id) === true || submitClient?.commitScopeOpenedSessions.has(entry.woo.id) === true;
+          if (authorityClient && sessionOpen) return this.cachedWarmCommitAuthority(entry, authorityClient, extraObjectIds);
+        }
         const useCommitScopeSnapshotForRemoteAuthority = !isPrePlan && authorityRefreshAttempts === 0;
         if (!isPrePlan) authorityRefreshAttempts += 1;
         // Directory/session scopes still include submit+target so routes and
@@ -1228,13 +1246,55 @@ export class McpGateway {
     };
   }
 
+  private cachedWarmCommitAuthority(
+    entry: SessionEntry,
+    client: V2ScopeClient,
+    objectIds: readonly ObjRef[]
+  ): ExecutorAuthorityPayload {
+    // Slim warm envelope commits do not send authority to CommitScopeDO; the
+    // selected scope rehydrates from its durable snapshot. The executor still
+    // asks for a commit authority payload so it can merge rows locally. Use the
+    // already-admitted relay rows, from either the submit scope or the planning
+    // scope for planned-transcript commits, instead of reconstructing an owner
+    // fan-in slice. Pages keep recorded provenance when present and otherwise
+    // fall back to cache, so this payload can fill local gaps without claiming
+    // owner authority.
+    const serialized = serializedFor(client.relay.commit_scope, {
+      reason: "mcp_cached_warm_authority",
+      metric: (event) => this.world.recordMetric(event)
+    });
+    const ids = new Set<ObjRef>(objectIds);
+    ids.add(entry.woo.actor);
+    const authority = buildSerializedAuthorityCellSlice({
+      sessions: serialized.sessions.filter((session) => session.id === entry.woo.id || ids.has(session.actor)),
+      objects: serialized.objects,
+      counters: {
+        objectCounter: serialized.objectCounter,
+        parkedTaskCounter: serialized.parkedTaskCounter,
+        sessionCounter: serialized.sessionCounter
+      },
+      tombstones: serialized.tombstones,
+      pageProvenance: (page) =>
+        client.relay.commit_scope.cellProvenance?.get(cachedAuthorityPageKey(page)) ?? { source: "cache" }
+    });
+    return this.withMcpSessionAuthority(entry, {
+      sessions: authority.sessions,
+      session_objects: [],
+      authority
+    });
+  }
+
   private mergeV2AuthorityIntoScopeClient(client: V2ScopeClient, authority: SerializedAuthoritySlice): void {
     // The gateway keeps one relay per scope and mutates its serialized snapshot with
     // fresh session/actor authority. The shared relay-cache merge carries the relay's
     // per-cell provenance (so the admission gate / merge precedence apply uniformly),
     // preserves the session actors' live cells across the refresh, and bumps the
     // relay-cache generation when the snapshot changed.
-    mergeAuthorityIntoRelayCache(client.relay, authority, { preserveSessionActorLive: true, reason: "mcp_authority_merge" });
+    mergeAuthorityIntoRelayCache(client.relay, authority, {
+      preserveSessionActorLive: true,
+      reason: "mcp_authority_merge",
+      metric: (event) => this.world.recordMetric(event)
+    });
   }
 
   private withRelaySnapshotAuthorityFallback(
@@ -1246,7 +1306,10 @@ export class McpGateway {
     // paths with staleFallbackCount. Only then do we pay to include this MCP
     // shard's last successfully seeded view for the scope; fresh owner rows
     // still override stale values because the payload is combined last.
-    const serialized = serializedFor(client.relay.commit_scope, { reason: "mcp_authority_stale_fallback" });
+    const serialized = serializedFor(client.relay.commit_scope, {
+      reason: "mcp_authority_stale_fallback",
+      metric: (event) => this.world.recordMetric(event)
+    });
     if (serialized.objects.length === 0) return payload;
     const relayAuthority = buildSerializedAuthorityCellSlice({
       sessions: [],

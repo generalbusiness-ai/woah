@@ -135,9 +135,14 @@ describe("actor-anchored movement projection", () => {
     const roomProjection = createShadowCommitScope({ node: "room-projection", scope: "mv_dest", serialized: before });
     applyAcceptedShadowFrame(roomProjection, acceptedA, plannedA.transcript);
     applyAcceptedShadowFrame(roomProjection, acceptedB, plannedB.transcript);
-    const after = createWorldFromSerialized(serializedFor(roomProjection), { persist: false });
+    const materializationMetrics: unknown[] = [];
+    const after = createWorldFromSerialized(serializedFor(roomProjection, {
+      reason: "movement_projection_test",
+      metric: (event) => materializationMetrics.push(event)
+    }), { persist: false });
     expect(after.contentsOf("mv_dest").sort()).toEqual(expect.arrayContaining([alice.actor, bob.actor]));
     expect(after.contentsOf("mv_src_a")).not.toContain(alice.actor);
     expect(after.contentsOf("mv_src_b")).not.toContain(bob.actor);
+    expect(materializationMetrics).toEqual([]);
   });
 });
