@@ -733,6 +733,29 @@ describe("client UI framework projection", () => {
     expect(runs).toEqual(["run-1", "run-2"]);
   });
 
+  it("CoalescedRefreshController recovers when run() throws synchronously", async () => {
+    let runs = 0;
+    let nextThrows = true;
+    const controller = new CoalescedRefreshController({
+      run: () => {
+        runs += 1;
+        if (nextThrows) { nextThrows = false; throw new Error("sync boom"); }
+      }
+    });
+
+    // A synchronous throw must not escape request() nor wedge running=true.
+    expect(() => controller.request()).not.toThrow();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(runs).toBe(1);
+
+    // Controller is still usable for the next request.
+    controller.request();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(runs).toBe(2);
+  });
+
   it("CoalescedRefreshController gates lifecycle refreshes by key", async () => {
     let runs = 0;
     let runnable = true;

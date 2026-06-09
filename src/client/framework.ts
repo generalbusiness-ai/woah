@@ -1055,15 +1055,28 @@ export class CoalescedRefreshController {
       return;
     }
     this.running = true;
-    void Promise.resolve(this.options.run()).finally(() => {
-      this.running = false;
-      if (this.queued && this.canRun()) {
-        this.queued = false;
-        this.request();
-      } else {
-        this.queued = false;
-      }
-    });
+    // Start run() synchronously (a refresh should kick off this tick), but
+    // guard both failure modes so they can never leave running=true stuck
+    // forever: a synchronous throw is contained here, and an async rejection
+    // is swallowed by .catch. A refresh failure is the consumer's concern,
+    // not the scheduler's, so finally always drains the queue.
+    let started: Promise<void> | void;
+    try {
+      started = this.options.run();
+    } catch {
+      started = undefined;
+    }
+    void Promise.resolve(started)
+      .catch(() => undefined)
+      .finally(() => {
+        this.running = false;
+        if (this.queued && this.canRun()) {
+          this.queued = false;
+          this.request();
+        } else {
+          this.queued = false;
+        }
+      });
   }
 
   requestOnce(key: string): void {
