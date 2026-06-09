@@ -15,6 +15,16 @@
 //
 // Usage:
 //   npm run smoke:cf-dev -- [--port=<n>] [--run-id=<id>] [--verbose] [--keep]
+//                          [--measure] [--passes=<n>]
+//
+// Default mode is the pass/fail deploy gate (one cold pass, 11 steps).
+//
+// `--measure` turns it into a perf bench: it runs the scenario N passes
+// (default 2) against ONE persisted world — pass 1 cold-boots, pass 2+ hit a
+// warm world / warm DOs / warm caches — captures the worker's turn_phase_timing
+// and v2_envelope metrics off the wrangler stdout, buckets them per pass by
+// time window, and prints a cold-vs-warm phase/bytes table. This is the
+// before/after instrument for turn-path perf work (notes/2026-06-09-*).
 //
 // Exit status: 0 if every step passes, 1 if any step fails, 2 on harness crash
 // (e.g. workerd never became ready).
@@ -22,6 +32,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
+import { createInterface } from "node:readline";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -30,6 +41,8 @@ import { httpTransport, SmokeSession } from "./smoke/session";
 import { runSmokeWalkthrough, type SmokeSessionPair, type StepContext } from "./smoke/scenario";
 
 type StepResult = { name: string; ok: boolean; ms: number; detail?: string };
+type Metric = Record<string, unknown> & { kind?: string; ts?: number };
+type PassWindow = { label: string; start: number; end: number; passed: number; total: number };
 
 const args = parseArgs(process.argv.slice(2));
 
@@ -45,37 +58,57 @@ async function main(): Promise<void> {
   const port = args.port ?? (await findFreePort());
   const baseUrl = `http://127.0.0.1:${port}`;
   const runId = args.runId;
-  const results: StepResult[] = [];
+  const passCount = args.passes;
+  // Worker metrics captured off wrangler stdout, used by --measure to attribute
+  // per-pass turn cost. Collected even in gate mode (cheap); only printed when
+  // measuring.
+  const metrics: Metric[] = [];
 
   // Per-run, isolated persistence. `wrangler dev` otherwise reuses its default
   // .wrangler/state, so the gate could pass against a world bootstrapped by an
   // earlier run and SKIP the cold first-light path (catalog auto-install, KV
   // host-seed, DO migrations) — exactly the regressions this lane exists to
-  // catch. A fresh temp dir per run forces a true cold boot every time.
+  // catch. A fresh temp dir per run forces a true cold boot every time. In
+  // --measure mode the dir is NOT wiped between passes, so pass 2+ run warm.
   const persistDir = mkdtempSync(join(tmpdir(), "woo-smoke-cf-dev-"));
-  console.log(`smoke-cf-dev booting wrangler dev on ${baseUrl} (run=${runId}, persist=${persistDir})`);
-  const server = await startWorkerd(port, persistDir);
+  console.log(`smoke-cf-dev booting wrangler dev on ${baseUrl} (run=${runId}, persist=${persistDir}${args.measure ? `, measure passes=${passCount}` : ""})`);
+  const server = await startWorkerd(port, persistDir, (m) => metrics.push(m));
+  const passWindows: PassWindow[] = [];
   let crashed: unknown = null;
   try {
     await waitForHealthz(baseUrl);
     console.log(`  ok    workerd ready (${baseUrl}/healthz)`);
 
     const transport = httpTransport(baseUrl);
-    const pair = await openSessionPair(transport, runId);
-    try {
-      await runSmokeWalkthrough(pair, makeStepRunner(results), {
-        runId,
-        // The workerd lane is a faithful local CF, so it runs the FULL coverage:
-        // take/drop fanout AND the concurrent-through-shared-destination step.
-        // (Unlike the fake lane, it has no dangling_parent_ref==0 ratchet, so
-        // take/drop on a $portable object is fine here.)
-        includeTakeDrop: true,
-        includeConcurrentMove: true,
-        waitTimeoutMs: 10_000,
-        log: args.verbose ? (msg) => console.log(msg) : undefined
+    for (let pass = 1; pass <= passCount; pass += 1) {
+      const passLabel = passCount > 1 ? (pass === 1 ? "cold" : `warm${pass > 2 ? pass - 1 : ""}`) : "run";
+      const passRunId = passCount > 1 ? `${runId}-p${pass}` : runId;
+      if (passCount > 1) console.log(`\n--- pass ${pass}/${passCount} (${passLabel}) ---`);
+      const results: StepResult[] = [];
+      const start = Date.now();
+      const pair = await openSessionPair(transport, passRunId);
+      try {
+        await runSmokeWalkthrough(pair, makeStepRunner(results), {
+          runId: passRunId,
+          // The workerd lane is a faithful local CF, so it runs the FULL coverage:
+          // take/drop fanout AND the concurrent-through-shared-destination step.
+          // (Unlike the fake lane, it has no dangling_parent_ref==0 ratchet, so
+          // take/drop on a $portable object is fine here.)
+          includeTakeDrop: true,
+          includeConcurrentMove: true,
+          waitTimeoutMs: 10_000,
+          log: args.verbose ? (msg) => console.log(msg) : undefined
+        });
+      } finally {
+        await Promise.allSettled([pair.alice.close(), pair.bob.close()]);
+      }
+      passWindows.push({
+        label: passLabel,
+        start,
+        end: Date.now(),
+        passed: results.filter((r) => r.ok).length,
+        total: results.length
       });
-    } finally {
-      await Promise.allSettled([pair.alice.close(), pair.bob.close()]);
     }
   } catch (err) {
     crashed = err;
@@ -90,16 +123,66 @@ async function main(): Promise<void> {
     }
   }
 
-  const passed = results.filter((r) => r.ok).length;
-  const failed = results.length - passed;
   console.log();
-  console.log(`summary: ${passed}/${results.length} steps passed${failed ? `, ${failed} failed` : ""}`);
-  for (const r of results.filter((r) => !r.ok)) console.error(`  FAIL ${r.name}: ${r.detail ?? "(no detail)"}`);
+  let anyFailed = false;
+  for (const w of passWindows) {
+    const failed = w.total - w.passed;
+    if (failed > 0) anyFailed = true;
+    console.log(`summary[${w.label}]: ${w.passed}/${w.total} steps passed${failed ? `, ${failed} failed` : ""}`);
+  }
+  if (args.measure) printMeasurement(metrics, passWindows);
   if (crashed) {
     console.error("smoke-cf-dev harness error:", crashed instanceof Error ? crashed.stack ?? crashed.message : crashed);
     process.exit(2);
   }
-  process.exit(failed > 0 ? 1 : 0);
+  process.exit(anyFailed ? 1 : 0);
+}
+
+// Aggregate turn_phase_timing + v2_envelope metrics into per-pass buckets (by
+// time window) and print a cold-vs-warm table. This is the directional perf
+// instrument: phase ms are real workerd CPU/RPC time, and request_bytes /
+// authority_calls are transport-independent structural costs that map directly
+// to prod latency (count/bytes x cross-colo RTT).
+function printMeasurement(metrics: Metric[], windows: PassWindow[]): void {
+  const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+  const inWindow = (ts: unknown, w: PassWindow) => typeof ts === "number" && ts >= w.start && ts <= w.end;
+
+  const PHASES = ["total_ms", "ensure_client_ms", "authority_ms", "submit_ms", "vm_ms", "serialize_ms", "plan_build_ms"] as const;
+  // ensure_detail / submit_detail subkeys worth surfacing (the authority-assembly
+  // hot spots this perf work targets).
+  const DETAIL = [
+    "planning.seed_authority",
+    "planning.initial.open_rpc",
+    "planning.owner_prefetch_authority",
+    "commit.seed_authority"
+  ];
+
+  console.log("\n=== perf measurement (per pass) ===");
+  const cols = windows.map((w) => w.label.padStart(10));
+  console.log(`  ${"metric".padEnd(34)}${cols.join("")}`);
+  const row = (label: string, values: number[], fmt = (n: number) => String(Math.round(n))) =>
+    console.log(`  ${label.padEnd(34)}${values.map((v) => fmt(v).padStart(10)).join("")}`);
+
+  const perPassTurns = windows.map((w) => metrics.filter((m) => m.kind === "turn_phase_timing" && inWindow(m.ts, w)));
+  row("turns", perPassTurns.map((t) => t.length));
+  for (const p of PHASES) row(p, perPassTurns.map((turns) => turns.reduce((a, t) => a + num((t as any)[p]), 0)));
+  for (const key of DETAIL) {
+    row(`  ${key}`, perPassTurns.map((turns) => turns.reduce((a, t) => a + num((t.ensure_detail_ms as any)?.[key] ?? (t.submit_detail_ms as any)?.[key]), 0)));
+  }
+  row("authority_calls", perPassTurns.map((turns) => turns.reduce((a, t) => a + num(t.authority_calls), 0)));
+  row("repair turns (attempts!=1)", perPassTurns.map((turns) => turns.filter((t) => num(t.attempts) !== 1).length));
+
+  const perPassEnv = windows.map((w) => metrics.filter((m) => m.kind === "v2_envelope" && inWindow(m.ts, w)));
+  row("envelope request_bytes (sum)", perPassEnv.map((env) => env.reduce((a, e) => a + num(e.request_bytes), 0)));
+  row("envelope request_bytes (max)", perPassEnv.map((env) => env.reduce((a, e) => Math.max(a, num(e.request_bytes)), 0)));
+
+  if (windows.length >= 2) {
+    const cold = perPassTurns[0].reduce((a, t) => a + num(t.total_ms), 0);
+    const warm = perPassTurns[windows.length - 1].reduce((a, t) => a + num(t.total_ms), 0);
+    if (cold > 0) console.log(`\n  warm/cold total_ms ratio: ${(warm / cold).toFixed(2)} (cold=${Math.round(cold)}ms warm=${Math.round(warm)}ms)`);
+  }
+  console.log("\n  note: workerd-local is single-process — phase ms is a relative/floor signal, not a");
+  console.log("        prod number; request_bytes & authority_calls are the transport-independent levers.");
 }
 
 // Continue-on-failure step runner: record every step, never reset sessions
@@ -149,7 +232,7 @@ async function openSessionPair(transport: ReturnType<typeof httpTransport>, runI
 // Spawn `wrangler dev` in its own process group so teardown can kill the whole
 // tree (wrangler spawns a workerd child that a plain SIGTERM to wrangler does
 // not always reap — observed during the lane's bring-up).
-async function startWorkerd(port: number, persistDir: string): Promise<ChildProcess> {
+async function startWorkerd(port: number, persistDir: string, onMetric: (m: Metric) => void): Promise<ChildProcess> {
   const child = spawn(
     "npx",
     [
@@ -160,11 +243,26 @@ async function startWorkerd(port: number, persistDir: string): Promise<ChildProc
       // Isolate (and reset, via the temp dir) all local DO/KV/cache state.
       "--persist-to", persistDir
     ],
-    { stdio: ["ignore", "inherit", "inherit"], detached: true }
+    // stdout is piped so we can parse `woo.metric {json}` lines (then re-emit
+    // them so the operator's view is unchanged); stderr stays inherited so the
+    // wrangler banner / [wrangler:info] / worker warnings flow through normally.
+    { stdio: ["ignore", "pipe", "inherit"], detached: true }
   );
   child.on("error", (err) => {
     console.error("failed to spawn wrangler dev:", err);
   });
+  if (child.stdout) {
+    const rl = createInterface({ input: child.stdout });
+    rl.on("line", (line) => {
+      process.stdout.write(`${line}\n`);
+      const marker = "woo.metric ";
+      const at = line.indexOf(marker);
+      if (at < 0) return;
+      const brace = line.indexOf("{", at);
+      if (brace < 0) return;
+      try { onMetric(JSON.parse(line.slice(brace)) as Metric); } catch { /* not a metric line */ }
+    });
+  }
   return child;
 }
 
@@ -245,24 +343,31 @@ function findFreePort(): Promise<number> {
   });
 }
 
-function parseArgs(argv: string[]): { port?: number; runId: string; verbose: boolean; keep: boolean } {
+function parseArgs(argv: string[]): { port?: number; runId: string; verbose: boolean; keep: boolean; measure: boolean; passes: number } {
   let port: number | undefined;
   const envPort = process.env.WOO_SMOKE_CF_DEV_PORT;
   if (envPort && Number.isFinite(Number(envPort))) port = Number(envPort);
   let runId = `${Date.now()}-${randomUUID().slice(0, 8)}`;
   let verbose = false;
   let keep = false;
+  let measure = false;
+  let passes: number | undefined;
   for (const arg of argv) {
     if (arg === "--verbose" || arg === "-v") verbose = true;
     else if (arg === "--keep") keep = true;
+    else if (arg === "--measure") measure = true;
+    else if (arg.startsWith("--passes=")) passes = Number(arg.slice("--passes=".length));
     else if (arg.startsWith("--port=")) port = Number(arg.slice("--port=".length));
     else if (arg.startsWith("--run-id=")) runId = arg.slice("--run-id=".length);
     else if (arg === "--help" || arg === "-h") {
-      console.log("usage: tsx scripts/smoke-cf-dev.ts [--port=<n>] [--run-id=<id>] [--verbose] [--keep]");
+      console.log("usage: tsx scripts/smoke-cf-dev.ts [--port=<n>] [--run-id=<id>] [--verbose] [--keep] [--measure] [--passes=<n>]");
       process.exit(0);
     }
   }
-  return { port, runId, verbose, keep };
+  // --measure defaults to 2 passes (cold then warm); an explicit --passes wins.
+  // Without --measure it is always a single gate pass.
+  const resolvedPasses = measure ? (passes && passes > 0 ? Math.floor(passes) : 2) : 1;
+  return { port, runId, verbose, keep, measure, passes: resolvedPasses };
 }
 
 if (isMainModule()) {

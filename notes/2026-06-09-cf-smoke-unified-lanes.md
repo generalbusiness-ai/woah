@@ -92,6 +92,36 @@ has the delay plumbing (`directorySessionsForScopesDelayMs`,
 `mcpCommitFanoutDelayMs`, `hostReadTimeoutMs`); item 3 extends it to the
 authority-slice path and asserts the prod error codes are never produced.
 
+## Warm-pass perf instrument (`smoke:cf-dev --measure`)
+
+`--measure` runs the scenario N passes (default 2) against ONE persisted world —
+pass 1 cold-boots, pass 2+ run warm — captures the worker's `turn_phase_timing`
+and `v2_envelope` metrics off wrangler stdout, buckets them per pass by time
+window, and prints a cold-vs-warm phase/bytes table. This is the before/after
+instrument for turn-path perf work. Default gate mode is unchanged (one pass).
+
+First baseline (34 turns/pass, workerd-local single-process):
+
+| metric | cold | warm |
+|---|---|---|
+| total_ms | 21135 | 20441 |
+| ensure_client_ms | 10770 | 10216 |
+| planning.seed_authority | 4220 | 4185 |
+| planning.initial.open_rpc | 2703 | 2494 |
+| planning.owner_prefetch_authority | 1469 | 1345 |
+| submit_ms | 3818 | 3747 |
+| envelope request_bytes (max) | 1,940,260 | 1,942,635 |
+| repair turns (attempts!=1) | 0 | 0 |
+
+**Headline: warm/cold total_ms ratio = 0.97.** Warm pays ~full cold cost. The
+dominant `ensure_client` authority assembly (`seed_authority` + `open_rpc` +
+`owner_prefetch`) and the ~2 MB envelope slice are paid **per turn**, not
+amortized — the warm cheap-path effectively doesn't exist, and
+`WOO_V2_SLIM_WARM_ENVELOPE=1` produces no warm byte reduction here. That is the
+target for the authority-assembly perf work. (Phase ms is a relative/floor
+signal on single-process workerd; `request_bytes`/`authority_calls` are the
+transport-independent levers that map to prod latency.)
+
 ## Verification
 
 - `npm run typecheck` clean (both tsconfigs).

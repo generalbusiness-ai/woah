@@ -231,8 +231,8 @@ if [[ "${WOO_DEPLOY_CF_DEV:-1}" == "0" || $SKIP_TESTS -eq 1 ]]; then
   warn "skipping local workerd smoke (smoke:cf-dev)"
 else
   cf_dev_out=$(npm run smoke:cf-dev 2>&1) \
-    || { echo "$cf_dev_out" | grep -aE '^(  ok|  FAIL|summary:|smoke-cf-dev)' | tail -20; fail "local workerd smoke failed — run: npm run smoke:cf-dev"; }
-  ok "workerd smoke: $(echo "$cf_dev_out" | grep -oE 'summary: [0-9]+/[0-9]+ steps passed' | head -1)"
+    || { echo "$cf_dev_out" | grep -aE '^(  ok|  FAIL|summary\[|smoke-cf-dev)' | tail -20; fail "local workerd smoke failed — run: npm run smoke:cf-dev"; }
+  ok "workerd smoke: $(echo "$cf_dev_out" | grep -oE 'summary\[[a-z0-9]+\]: [0-9]+/[0-9]+ steps passed' | head -1)"
 fi
 
 # ===========================================================================
