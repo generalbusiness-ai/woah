@@ -198,6 +198,17 @@ function pageHashPreimage(page: ShadowStatePage): string {
   return stableShadowJson(page as unknown as WooValue);
 }
 
+// Drop `line_map` from a verb_bytecode page for delivery (CA12.2). Because page
+// identity is line_map-blind (pageHashPreimage), this does NOT change the page
+// hash or ref hash — it only removes the dominant byte contributor from the wire
+// and from the ref `bytes` size. Other page kinds pass through unchanged. The
+// receiver dispatches on `bytecode`; it degrades to position-less stack frames
+// and can recompile line_map from `source` on demand.
+export function stripVerbBytecodePageLineMap(page: ShadowStatePage): ShadowStatePage {
+  if (page.page !== "verb_bytecode" || Object.keys(page.verb.line_map ?? {}).length === 0) return page;
+  return { ...page, verb: { ...page.verb, line_map: {} } };
+}
+
 export function shadowStatePageHash(page: ShadowStatePage): string {
   return hashSource(pageHashPreimage(page));
 }

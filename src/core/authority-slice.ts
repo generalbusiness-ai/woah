@@ -14,6 +14,7 @@ import {
   shadowStatePageRef,
   shadowStatePagesForObject,
   stampAuthorityPageRef,
+  stripVerbBytecodePageLineMap,
   type AuthorityPageProvenance,
   type AuthorityPageRef,
   type AuthorityPageSource,
@@ -146,7 +147,15 @@ export function buildSerializedAuthorityCellSlice(input: {
   tombstones?: readonly ObjRef[];
   pageProvenance: (page: ShadowStatePage) => AuthorityPageProvenance;
 }): SerializedAuthorityCellSlice {
-  const pages = input.objects.flatMap((obj) => shadowStatePagesForObject(obj));
+  // CA12.2: strip verb `line_map` from delivered verb_bytecode pages. Page
+  // identity is line_map-blind, so refs and inline pages still pair by hash; this
+  // only removes the dominant byte contributor (~59% of slice bytes on the demo
+  // world) from both the inline payload and the ref `bytes`. Done here (not at the
+  // delivery edge) so refs and inline are built from the same stripped page and
+  // their sizes agree.
+  const pages = input.objects
+    .flatMap((obj) => shadowStatePagesForObject(obj))
+    .map(stripVerbBytecodePageLineMap);
   return {
     kind: "woo.authority_slice.cells.shadow.v1",
     sessions: structuredClone(input.sessions) as SerializedSession[],

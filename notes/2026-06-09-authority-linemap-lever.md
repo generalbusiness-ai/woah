@@ -74,3 +74,28 @@ as the final gate; do not rush it onto the end of unrelated work.
 
 Expected payoff if landed: ~50–59% reduction in per-turn authority-slice bytes,
 which maps to prod latency as bytes × cross-colo RTT on every cross-scope turn.
+
+## Resolution (landed as a two-commit protocol pass)
+
+Done exactly as the plan above prescribes (spec → tests → canonical helper →
+strip), on worktree `authority-warm-assembly`:
+
+- **Commit A** (`2747c48`): spec CA12.2 makes the verb_bytecode page hash
+  line_map-blind (normative); `pageHashPreimage()` in `shadow-state-pages.ts` is
+  the single canonical preimage routed through both `shadowStatePageHash` and
+  `shadowStatePageRef.hash`; 4 CA12.2 tests (all failed before, pass after).
+  `ref.bytes` still reports actual page size. No byte savings yet.
+- **Commit B**: `stripVerbBytecodePageLineMap` applied in
+  `buildSerializedAuthorityCellSlice` (authority-slice.ts) — refs + inline built
+  from the same stripped page, so hashes still pair and sizes agree.
+
+Measured (`smoke:cf-dev --measure`, 34 turns/pass):
+- envelope `request_bytes` sum **44.2 MB → 26.2 MB (−41%)**, max 1.94 MB → 1.24 MB.
+- per-turn total_ms 20.9 s → 13.3 s; `seed_authority` 4227 → 2883 ms;
+  `initial.open_rpc` 2675 → 1497 ms (less serialize/clone/JSON locally; on prod
+  the byte drop additionally cuts bytes × RTT on every cross-scope turn).
+
+Gates green: typecheck; CA12.2 4/4; shadow/authority suites 83; npm test 384;
+test:worker 239; smoke:cf-local 4/4 (the lane that caught the delivery-edge
+regression); smoke:cf-dev 11/11. Deploy smoke pending explicit authorization.
+Did NOT strip source/bytecode; did NOT retry delivery-edge-only stripping.
