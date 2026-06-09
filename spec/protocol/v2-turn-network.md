@@ -1269,10 +1269,16 @@ stale presence. `session_objects` is a compatibility request field for older
 callers that do not send `authority`; authority-bearing requests MUST leave it
 empty, including when the authority itself is a legacy object-row slice.
 An internal open/envelope MUST carry the request's already-authenticated session
-row in both the request `sessions` list and the authority slice's `sessions`
-list. Sparse gateway authority reconstruction MAY omit unrelated sessions, but
-it MUST NOT omit the bound caller session; the CommitScopeDO derives
-browser-session claims from that row before validating the request token.
+row exactly once. On an authority-bearing request it rides in the authority
+slice's `sessions` list, and the top-level request `sessions` list is left empty
+— the same legacy-empty contract as `session_objects`. The CommitScopeDO reads
+`authority.sessions` and only falls back to the top-level `sessions` list when no
+authority slice is present (a no-authority caller, or the warm slim path that
+strips the slice — see below), so duplicating the row at the top level is dead
+wire weight. Sparse gateway authority reconstruction MAY omit unrelated
+sessions, but it MUST NOT omit the bound caller session; the CommitScopeDO
+derives browser-session claims from that row before validating the request
+token.
 After a client has opened a scope and the CommitScopeDO has a durable planning
 snapshot, an MCP per-envelope refresh MAY omit remote object-owner rows and
 fall back to that snapshot for execution state. The request MUST still carry
