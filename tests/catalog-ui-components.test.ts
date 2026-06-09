@@ -109,6 +109,79 @@ describe("bundled catalog UI components", () => {
     }
   });
 
+  it("does not run direct-call refreshes from dubspace or pinboard host rebinding", async () => {
+    const { WooDubspaceWorkspaceElement } = await import("../catalogs/dubspace/ui/dubspace-workspace");
+    const { WooPinboardBoardElement } = await import("../catalogs/pinboard/ui/pinboard-board");
+    defineOnce("woo-dubspace-workspace", WooDubspaceWorkspaceElement);
+    defineOnce("woo-pinboard-board", WooPinboardBoardElement);
+    let directCalls = 0;
+    const makeWoo = (subject: string): WooContext => ({
+      actor: "guest_1",
+      frame: { id: "test", subject, get: () => undefined, set: () => true },
+      neighborhood: { subject, refs: [], related: {}, has: () => true },
+      observe: (ref) => ({ id: ref, name: ref, props: {}, catalogState: {} }),
+      directCall: async () => {
+        directCalls += 1;
+        return [];
+      },
+      send: async () => undefined,
+      call: async () => undefined,
+      emit: () => true
+    });
+
+    const dubspace = document.createElement("woo-dubspace-workspace") as HTMLElement & { woo?: WooContext; subject?: string; data?: any };
+    dubspace.subject = "the_dubspace";
+    dubspace.woo = makeWoo("the_dubspace");
+    document.body.appendChild(dubspace);
+    dubspace.data = {
+      spaceId: "the_dubspace",
+      spaceName: "Dubspace",
+      spaceDescription: "",
+      controls: {},
+      slots: [],
+      filter: "",
+      delay: "",
+      drum: "",
+      operators: [],
+      actor: "guest_1",
+      inSpace: false,
+      canSend: true,
+      audioOn: false,
+      cueSlots: {},
+      cuePlaying: {}
+    };
+    dubspace.subject = "the_dubspace";
+    dubspace.woo = makeWoo("the_dubspace");
+    dubspace.remove();
+    document.body.appendChild(dubspace);
+
+    const pinboard = document.createElement("woo-pinboard-board") as HTMLElement & { woo?: WooContext; subject?: string; data?: any };
+    pinboard.subject = "the_pinboard";
+    pinboard.woo = makeWoo("the_pinboard");
+    document.body.appendChild(pinboard);
+    pinboard.data = {
+      boardId: "the_pinboard",
+      boardName: "Pinboard",
+      notes: [],
+      present: [],
+      palette: ["yellow", "blue", "green", "pink", "white"],
+      viewport: { w: 960, h: 560 },
+      view: { x: 0, y: 0, scale: 1 },
+      actor: "guest_1",
+      inBoard: false,
+      canSend: true,
+      newText: "",
+      newColor: "yellow",
+      viewports: {}
+    };
+    pinboard.subject = "the_pinboard";
+    pinboard.woo = makeWoo("the_pinboard");
+    pinboard.remove();
+    document.body.appendChild(pinboard);
+
+    expect(directCalls).toBe(0);
+  });
+
   it("declares and resolves first-party tool frames", () => {
     const registry = new CatalogUiRegistry();
     expect(registry.installCatalogUi({ alias: "chat", catalog: "chat", objects: { "$space": "$space", "$chatroom": "$chatroom" }, ui: (chatManifest as any).ui })).toEqual([]);

@@ -395,6 +395,83 @@ describe("outliner-tree presence aside", () => {
     expect(text).not.toContain("(empty)");
   });
 
+  it("coalesces list_items while the host rebinds and reconnects the same outliner", async () => {
+    let releaseListItems!: () => void;
+    const listItems = new Promise<void>((resolve) => { releaseListItems = resolve; });
+    let calls = 0;
+    const refs = ["item_1"];
+    const projections = {
+      the_outline: { id: "the_outline", name: "Outline", props: {}, catalogState: {} },
+      item_1: {
+        id: "item_1",
+        name: "item_1",
+        parent: "$outline_item",
+        ancestors: ["$note", "$outline_item"],
+        owner: "guest_1",
+        location: "the_outline",
+        props: { parent: null, position: 0, hidden: false },
+        catalogState: {}
+      }
+    };
+    const makeWoo = (): WooContext => ctx({}, {
+      refs,
+      projections,
+      directCall: async (_subject, verb) => {
+        if (verb === "list_items") {
+          calls += 1;
+          if (calls === 1) await listItems;
+        }
+        return [
+          {
+            id: "item_1",
+            name: "item_1",
+            text: "joined row",
+            parent_id: null,
+            index: 0,
+            hidden: false,
+            owner: "guest_1",
+            writers: [],
+            has_children: false
+          }
+        ];
+      }
+    });
+    const element = document.createElement("woo-outliner-tree") as WooOutlinerTreeElement & {
+      subject: string;
+      syncFromProjection: () => void;
+    };
+    element.subject = "the_outline";
+    element.woo = makeWoo();
+    document.body.append(element);
+    await flushPromises();
+    expect(calls).toBe(1);
+
+    // main.ts reassigns a fresh WooContext and calls syncFromProjection on each
+    // render. The outliner should keep the same in-flight list_items fill.
+    element.woo = makeWoo();
+    element.syncFromProjection();
+    await flushPromises();
+    expect(calls).toBe(1);
+
+    // The app shell also removes and reattaches the preserved tool element.
+    // Reconnect must not schedule a duplicate list_items fill for the same
+    // subject/signature while the first read is still in flight.
+    element.remove();
+    document.body.append(element);
+    element.syncFromProjection();
+    await flushPromises();
+    expect(calls).toBe(1);
+
+    releaseListItems();
+    await flushPromises();
+    expect(calls).toBe(1);
+    expect(element.querySelector("[data-outliner-row]")?.textContent).toContain("joined row");
+
+    element.syncFromProjection();
+    await flushPromises();
+    expect(calls).toBe(1);
+  });
+
   it("preserves observation text when a later generic projection lacks text", () => {
     const directCall = vi.fn(async () => []);
     const element = document.createElement("woo-outliner-tree") as WooOutlinerTreeElement & {
