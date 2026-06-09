@@ -1029,6 +1029,59 @@ export type CoalescedViewHydratorOptions<T> = {
   completeOnError?: boolean;
 };
 
+export type CoalescedRefreshControllerOptions = {
+  run: () => Promise<void> | void;
+  canRun?: () => boolean;
+};
+
+// Catalog views have two repeatable refresh shapes:
+// - full view refreshes, where every invalidation should eventually run but
+//   bursts collapse to one in-flight read plus one queued follow-up; and
+// - semantic field fills, handled by CoalescedViewHydrator below, where a
+//   subject/signature success is memoized.
+// This controller owns the first shape so components do not each reinvent
+// lifecycle-key and in-flight queue state.
+export class CoalescedRefreshController {
+  private running = false;
+  private queued = false;
+  private lastOnceKey = "";
+
+  constructor(private options: CoalescedRefreshControllerOptions) {}
+
+  request(): void {
+    if (!this.canRun()) return;
+    if (this.running) {
+      this.queued = true;
+      return;
+    }
+    this.running = true;
+    void Promise.resolve(this.options.run()).finally(() => {
+      this.running = false;
+      if (this.queued && this.canRun()) {
+        this.queued = false;
+        this.request();
+      } else {
+        this.queued = false;
+      }
+    });
+  }
+
+  requestOnce(key: string): void {
+    if (!key || key === this.lastOnceKey) return;
+    if (!this.canRun()) return;
+    this.lastOnceKey = key;
+    this.request();
+  }
+
+  resetOnceKey(): void {
+    this.lastOnceKey = "";
+  }
+
+  private canRun(): boolean {
+    return this.options.canRun?.() ?? true;
+  }
+}
+
 // Catalog UI views often render immediately from cheap structural projection,
 // then need one catalog verb read to fill semantic display fields that generic
 // projection cannot safely express (for example readable note text). This helper
