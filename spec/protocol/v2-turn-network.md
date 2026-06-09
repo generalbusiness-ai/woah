@@ -1287,6 +1287,40 @@ is a request root; newly minted session actors may not exist in the durable
 scope snapshot yet. First-open bootstrap and serialized seed construction MUST
 NOT use this omission rule.
 
+Warm deterministic MCP movement/tool planning is conforming only when the
+gateway can prove the following catalog-neutral local state contract before it
+runs the VM:
+
+- the authenticated session row, session actor row, actor location, and active
+  scope are present at versions at least as new as the gateway's current head for
+  the planning scope;
+- the planning scope, target scope, and any deterministic destination scope have
+  lineage/live cells with recorded provenance, plus the contents or projection
+  rows needed for command resolution, `visible_contents`, movement source/dest
+  membership, and session presence;
+- the selected verb's definer row, bytecode, inherited lineage, and class-chain
+  rows are present with provenance, and any catalog-declared
+  `arg_spec.authority.prefetch` roots have been resolved through generic
+  roots/path/fallback metadata rather than hardcoded object names;
+- the transcript validation read set implied by the warm planning pass is backed
+  by local cell versions that will be submitted to the selected commit scope, and
+  planned-transcript commits carry the bounded actor/session/transcript authority
+  rows required by that selected scope;
+- fanout routing inputs are present as bounded session/projection rows: live
+  local session, affected scopes from the transcript shape, and Directory-derived
+  shard/session rows inside the presence window. Stale or unrelated Directory
+  rows MUST NOT expand the warm turn's fanout set.
+
+If any row in that contract is missing or has inadmissible provenance, the
+gateway MUST emit a precise repair/missing-state metric naming the failed
+object/cell and run the bounded cold/repair path outside the measured warm
+contract. A normal measured warm turn MUST NOT rebuild a compatibility
+`SerializedWorld` for `mcp_turn_plan`, MUST NOT reconstruct an owner fan-in
+authority slice, and MUST submit exactly one bounded `/v2/envelope` attempt. A
+receiver of accepted fanout MUST consume the accepted frame, projection delta,
+and row-body-complete projection writes; it MUST NOT run a gateway whole-world
+compatibility apply for normal accepted fanout.
+
 MCP and REST gateways may avoid a normal executable `/v2/open` when they
 already hold a local execution view for the commit scope by attaching a
 one-turn execution capsule to `/v2/envelope`:

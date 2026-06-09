@@ -143,6 +143,16 @@ type ShadowCommitScopeSerializedRefs = {
   tombstones?: ObjRef[];
 };
 
+type ShadowSerializedSync = {
+  objects?: Iterable<ObjRef>;
+  sessions?: Iterable<string>;
+  logs?: Iterable<ObjRef>;
+  snapshots?: Iterable<string>;
+  parkedTasks?: Iterable<string>;
+  counters?: boolean;
+  tombstones?: boolean;
+};
+
 export type ShadowIndexedApplyResult = {
   state: ShadowCommitScopeState;
   projection_delta: ProjectionDeltaSummary;
@@ -1097,7 +1107,7 @@ export function applyAcceptedProjectionToCommitScopeCache(
 function applyProjectionWritesToCommitScopeCache(scope: ShadowCommitScope, writes: ProjectionWrite[]): void {
   const next = cloneShadowCommitScopeState(ensureShadowCommitScopeState(scope));
   applyProjectionWritesToCommitScopeState(next, writes);
-  commitShadowCommitScopeState(scope, next);
+  commitShadowCommitScopeState(scope, next, projectionWriteSerializedSync(writes));
 }
 
 function applyMovementProjectionToCommitScopeCache(scope: ShadowCommitScope, transcript: EffectTranscript): void {
@@ -1119,7 +1129,7 @@ function applyMovementProjectionToCommitScopeCache(scope: ShadowCommitScope, tra
   };
   applyMovementProjectionToIndexedState(transcript, mutableObject, undefined);
   applyMovementPresenceProjectionToIndexedState(next, transcript, mutableObject, undefined);
-  commitShadowCommitScopeState(scope, next);
+  commitShadowCommitScopeState(scope, next, { objects: transcriptTouchedObjectIds(transcript) });
 }
 
 // Copy the named properties (and their versions) from `existing` onto `row`,
@@ -1265,9 +1275,164 @@ function sequencerReadVersion(transcript: EffectTranscript): string | undefined 
   )?.version;
 }
 
-function commitShadowCommitScopeState(scope: ShadowCommitScope, state: ShadowCommitScopeState): void {
+function commitShadowCommitScopeState(scope: ShadowCommitScope, state: ShadowCommitScopeState, sync?: ShadowSerializedSync): void {
   scope.state = state;
+  if (sync) {
+    syncSerializedFromState(scope, state, sync);
+    scope.serializedDirty = false;
+    scope.state.serializedRefs = serializedRefs(scope.serialized);
+    return;
+  }
   scope.serializedDirty = true;
+}
+
+function projectionWriteSerializedSync(writes: readonly ProjectionWrite[]): ShadowSerializedSync {
+  const sync: {
+    objects: Set<ObjRef>;
+    sessions: Set<string>;
+    logs: Set<ObjRef>;
+    snapshots: Set<string>;
+    parkedTasks: Set<string>;
+    counters: boolean;
+    tombstones: boolean;
+  } = {
+    objects: new Set(),
+    sessions: new Set(),
+    logs: new Set(),
+    snapshots: new Set(),
+    parkedTasks: new Set(),
+    counters: false,
+    tombstones: false
+  };
+  for (const write of coalesceProjectionWrites(writes)) {
+    switch (write.table) {
+      case "objects":
+        sync.objects.add(write.key);
+        break;
+      case "sessions":
+        sync.sessions.add(write.key);
+        break;
+      case "logs":
+        sync.logs.add(write.key.space);
+        break;
+      case "snapshots":
+        sync.snapshots.add(snapshotSyncKey(write.key.space, write.key.seq));
+        break;
+      case "parked_tasks":
+        sync.parkedTasks.add(write.key);
+        break;
+      case "counters":
+        sync.counters = true;
+        break;
+      case "tombstones":
+        sync.tombstones = true;
+        break;
+      case "tool_surfaces":
+        break;
+    }
+  }
+  return sync;
+}
+
+function syncSerializedFromState(
+  scope: ShadowCommitScope,
+  state: ShadowCommitScopeState,
+  sync: ShadowSerializedSync
+): void {
+  const previous = scope.serialized;
+  const objects = syncMapRows(
+    previous.objects,
+    sync.objects,
+    state.objectsById,
+    (row) => row.id,
+    (a, b) => a.id.localeCompare(b.id)
+  );
+  const sessions = syncMapRows(
+    previous.sessions,
+    sync.sessions,
+    state.sessionsById,
+    (row) => row.id,
+    (a, b) => a.id.localeCompare(b.id)
+  );
+  const logs = syncLogRows(previous.logs, sync.logs, state.logsByScope);
+  const snapshots = syncArrayRows(
+    previous.snapshots,
+    sync.snapshots,
+    state.snapshots,
+    (row) => snapshotSyncKey(row.space_id, row.seq),
+    (a, b) => a.space_id.localeCompare(b.space_id) || a.seq - b.seq
+  );
+  const parkedTasks = syncArrayRows(
+    previous.parkedTasks,
+    sync.parkedTasks,
+    state.parkedTasks,
+    (row) => row.id,
+    (a, b) => a.id.localeCompare(b.id)
+  );
+  scope.serialized = {
+    ...previous,
+    objectCounter: state.objectCounter,
+    parkedTaskCounter: state.parkedTaskCounter,
+    sessionCounter: state.sessionCounter,
+    objects,
+    sessions,
+    logs,
+    snapshots,
+    parkedTasks,
+    tombstones: sync.tombstones ? state.tombstones : previous.tombstones
+  };
+}
+
+function syncMapRows<T, K>(
+  rows: readonly T[],
+  changed: Iterable<K> | undefined,
+  stateRows: ReadonlyMap<K, T>,
+  keyOf: (row: T) => K,
+  compare: (a: T, b: T) => number
+): T[] {
+  const keys = new Set(changed ?? []);
+  if (keys.size === 0) return rows as T[];
+  const next = rows.filter((row) => !keys.has(keyOf(row)));
+  for (const key of keys) {
+    const row = stateRows.get(key);
+    if (row) next.push(row);
+  }
+  return next.sort(compare);
+}
+
+function syncArrayRows<T>(
+  rows: readonly T[],
+  changed: Iterable<string> | undefined,
+  stateRows: readonly T[],
+  keyOf: (row: T) => string,
+  compare: (a: T, b: T) => number
+): T[] {
+  const keys = new Set(changed ?? []);
+  if (keys.size === 0) return rows as T[];
+  const next = rows.filter((row) => !keys.has(keyOf(row)));
+  for (const row of stateRows) {
+    if (keys.has(keyOf(row))) next.push(row);
+  }
+  return next.sort(compare);
+}
+
+function syncLogRows(
+  rows: SerializedWorld["logs"],
+  changed: Iterable<ObjRef> | undefined,
+  stateRows: ReadonlyMap<ObjRef, SerializedWorld["logs"][number][1]>
+): SerializedWorld["logs"] {
+  const keys = new Set(changed ?? []);
+  if (keys.size === 0) return rows;
+  const next = rows.filter(([space]) => !keys.has(space));
+  for (const key of keys) {
+    const entries = stateRows.get(key);
+    if (entries) next.push([key, entries]);
+  }
+  return next.sort(([a], [b]) => a.localeCompare(b));
+}
+
+function snapshotSyncKey(space: ObjRef, seq: number): string {
+  return `${space}\u0000${seq}`;
 }
 
 function serializedWorldFromCommitScopeState(state: ShadowCommitScopeState): SerializedWorld {

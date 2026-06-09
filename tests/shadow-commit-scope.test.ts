@@ -301,9 +301,11 @@ describe("shadow commit scope", () => {
 
     // The MCP/REST projection apply materializes the authority row.
     const projScope = createShadowCommitScope({ node: "scope:test", scope: "room", serialized: serializedWorld() });
+    const metrics: MetricEvent[] = [];
     expect(applyAcceptedProjectionToCommitScopeCache(projScope, accepted, emptyTranscript)).toBe(true);
-    const widget = serializedFor(projScope).objects.find((o) => o.id === "remote_widget");
+    const widget = serializedFor(projScope, { reason: "accepted_projection_test", metric: (event) => metrics.push(event) }).objects.find((o) => o.id === "remote_widget");
     expect(widget?.name).toBe("Remote Widget");
+    expect(metrics).toEqual([]);
   });
 
   // record-if-stronger (review): a derived `cache` stamp never downgrades a stronger

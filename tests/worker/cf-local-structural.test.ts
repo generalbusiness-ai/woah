@@ -17,12 +17,17 @@ const PROD_CATALOGS = "chat,demoworld,dubspace,help,note,pinboard,prog,tasks,blo
 const PROD_SHARDS = 32;
 const DIRECTORY_PRESENCE_WINDOW_MS = 5 * 60_000;
 const WARM_TURN_FORBIDDEN_AUTHORITY_RECONSTRUCTION_REASONS = new Set(["warm_turn_refresh", "missing_state_repair"]);
+const WARM_TURN_MAX_COMMIT_SCOPE_ENVELOPE_RPC_MS = 300;
+const WARM_TURN_MAX_MCP_FANOUT_SHARDS = 1;
+const WARM_TURN_MAX_MCP_SCOPED_SHARDS = 1;
+const WARM_TURN_MAX_MCP_AFFECTED_SCOPES = 3;
 
 type WarmTurnExpectation = {
   target: string;
   verb: string;
   expectedCount?: number;
   maxAuthorityCalls?: number;
+  maxCommitScopeEnvelopeRpcMs?: number;
 };
 
 describe("CF-local prod-shape structural probes", () => {
@@ -82,6 +87,9 @@ describe("CF-local prod-shape structural probes", () => {
         .length;
       const enterTurns = metrics
         .filter((m) => m.kind === "turn_phase_timing" && m.target === "the_chatroom" && m.verb === "enter");
+      writeLabeledMetricsIfRequested(runId, {
+        one_turn_enter: metrics
+      });
 
       expect(enterTurns.length, "the structural probe must exercise the real MCP turn path").toBeGreaterThan(0);
       expect(
@@ -102,7 +110,7 @@ describe("CF-local prod-shape structural probes", () => {
       expect(mcpGatewayConstructors, "one live actor plus stale rows must not cold-start prod-scale gateway shards").toBeLessThanOrEqual(3);
       expect(commitFanoutGatewayTargets, "one enter must not fan out to many stale MCP gateway shards").toBeLessThanOrEqual(2);
       expect(hostSeedDoFetches, "one enter should not scatter host-seed cold loads").toBeLessThanOrEqual(3);
-      expect(authorityReconstructions, "B7 warm-fill regressions show up as authority reconstruction fan-in").toBeLessThanOrEqual(8);
+      expect(authorityReconstructions, "B7 warm-fill regressions show up as authority reconstruction fan-in").toBeLessThanOrEqual(5);
     } finally {
       if (sessionId) await mcpFetch(harness, { method: "DELETE", headers: { "mcp-session-id": sessionId } }).catch(() => undefined);
       logSpy.mockRestore();
@@ -166,7 +174,19 @@ describe("CF-local prod-shape structural probes", () => {
         attempts: 2,
         authority_calls: 2,
         outcome: "submitted",
-        submit_detail_ms: {}
+        submit_detail_ms: {
+          "worker.commit_scope_envelope_rpc": 999
+        }
+      },
+      {
+        kind: "serialized_world_materialized",
+        scope: "the_chatroom",
+        seq: 3,
+        reason: "mcp_turn_plan",
+        ms: 1,
+        objects: 99,
+        sessions: 1,
+        logs: 0
       },
       {
         kind: "turn_repair_attempt",
@@ -192,6 +212,25 @@ describe("CF-local prod-shape structural probes", () => {
         reason: "read_version_mismatch"
       },
       {
+        kind: "mcp_fanout",
+        scope: "the_chatroom",
+        shards: 4,
+        observations: 1,
+        affected_scopes: 8,
+        scoped_shards: 5,
+        audience_session_shards: 4
+      },
+      {
+        kind: "shadow_gateway_apply_step",
+        scope: "the_chatroom",
+        phase: "total",
+        route: "fanout",
+        ms: 2,
+        objects: 80,
+        creates: 0,
+        writes: 2
+      },
+      {
         kind: "v2_envelope",
         status: "ok",
         scope: "the_chatroom"
@@ -205,9 +244,13 @@ describe("CF-local prod-shape structural probes", () => {
 
     expect(violations).toEqual(expect.arrayContaining([
       expect.stringContaining("turn_phase_timing the_chatroom:southeast attempts=2 authority_calls=2"),
+      expect.stringContaining("commit_scope_envelope_rpc the_chatroom:southeast ms=999 max=300"),
+      expect.stringContaining("serialized_world_materialized scope=the_chatroom reason=mcp_turn_plan"),
       expect.stringContaining("turn_repair_attempt the_chatroom:southeast source=planning_throw reason=missing_state attempt=1"),
       expect.stringContaining("authority_slice_reconstructed scope=the_chatroom reason=warm_turn_refresh"),
       expect.stringContaining("shadow_commit_rejected scope=the_chatroom reason=read_version_mismatch"),
+      expect.stringContaining("mcp_fanout scope=the_chatroom shards=4 max_shards=1"),
+      expect.stringContaining("shadow_gateway_apply_step scope=the_chatroom phase=total"),
       expect.stringContaining("v2_envelope accepted_count=2 expected_turns=1")
     ]));
   });
@@ -442,6 +485,12 @@ function warmTurnStructuralViolations(metrics: Record<string, unknown>[], expect
       }
       if (!hasSubmitDetail(timing, "worker.commit_scope_envelope_rpc")) {
         violations.push(`turn_phase_timing ${key} missing_submit_detail=worker.commit_scope_envelope_rpc`);
+      } else {
+        const commitScopeEnvelopeRpcMs = submitDetailNumber(timing, "worker.commit_scope_envelope_rpc");
+        const maxCommitScopeEnvelopeRpcMs = turn.maxCommitScopeEnvelopeRpcMs ?? WARM_TURN_MAX_COMMIT_SCOPE_ENVELOPE_RPC_MS;
+        if (commitScopeEnvelopeRpcMs > maxCommitScopeEnvelopeRpcMs) {
+          violations.push(`commit_scope_envelope_rpc ${key} ms=${commitScopeEnvelopeRpcMs} max=${maxCommitScopeEnvelopeRpcMs}`);
+        }
       }
     }
   }
@@ -468,11 +517,35 @@ function warmTurnStructuralViolations(metrics: Record<string, unknown>[], expect
     if (metric.kind === "shadow_commit_rejected") {
       violations.push(`shadow_commit_rejected scope=${String(metric.scope)} reason=${String(metric.reason)}`);
     }
+    if (metric.kind === "serialized_world_materialized") {
+      violations.push(`serialized_world_materialized scope=${String(metric.scope)} reason=${String(metric.reason)} objects=${String(metric.objects)} sessions=${String(metric.sessions)}`);
+    }
+    if (metric.kind === "shadow_gateway_apply_step") {
+      violations.push(`shadow_gateway_apply_step scope=${String(metric.scope)} phase=${String(metric.phase)} objects=${String(metric.objects)} writes=${String(metric.writes)}`);
+    }
+    if (metric.kind === "mcp_fanout") {
+      const shards = Number(metric.shards) || 0;
+      const scopedShards = Number(metric.scoped_shards) || 0;
+      const affectedScopes = Number(metric.affected_scopes) || 0;
+      const audienceSessionShards = Number(metric.audience_session_shards) || 0;
+      if (
+        shards > WARM_TURN_MAX_MCP_FANOUT_SHARDS ||
+        scopedShards > WARM_TURN_MAX_MCP_SCOPED_SHARDS ||
+        affectedScopes > WARM_TURN_MAX_MCP_AFFECTED_SCOPES ||
+        audienceSessionShards > WARM_TURN_MAX_MCP_FANOUT_SHARDS
+      ) {
+        violations.push(`mcp_fanout scope=${String(metric.scope)} shards=${shards} max_shards=${WARM_TURN_MAX_MCP_FANOUT_SHARDS} scoped_shards=${scopedShards} max_scoped_shards=${WARM_TURN_MAX_MCP_SCOPED_SHARDS} affected_scopes=${affectedScopes} max_affected_scopes=${WARM_TURN_MAX_MCP_AFFECTED_SCOPES} audience_session_shards=${audienceSessionShards}`);
+      }
+    }
   }
 
   const acceptedEnvelopes = metrics.filter((m) => m.kind === "v2_envelope" && m.status === "ok");
   if (acceptedEnvelopes.length !== phaseTimings.length) {
     violations.push(`v2_envelope accepted_count=${acceptedEnvelopes.length} expected_turns=${phaseTimings.length}`);
+  }
+  const mcpFanouts = metrics.filter((m) => m.kind === "mcp_fanout");
+  if (mcpFanouts.length !== phaseTimings.length) {
+    violations.push(`mcp_fanout count=${mcpFanouts.length} expected_turns=${phaseTimings.length}`);
   }
   return violations;
 }
@@ -499,6 +572,12 @@ function metricTurnKey(metric: Record<string, unknown>): string {
 function hasSubmitDetail(metric: Record<string, unknown>, label: string): boolean {
   const detail = metric.submit_detail_ms;
   return typeof detail === "object" && detail !== null && label in detail;
+}
+
+function submitDetailNumber(metric: Record<string, unknown>, label: string): number {
+  const detail = metric.submit_detail_ms;
+  if (typeof detail !== "object" || detail === null) return 0;
+  return Number((detail as Record<string, unknown>)[label]) || 0;
 }
 
 function writeLabeledMetricsIfRequested(

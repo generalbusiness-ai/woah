@@ -269,10 +269,24 @@ oracle.
   authority payloads. Planned-transcript commits use the planning relay rows
   after the selected commit scope session is open, which preserves the read
   support used by planning without rebuilding owner authority.
+- Defined the explicit catalog-neutral warm-state contract in
+  `spec/protocol/v2-turn-network.md`: session/actor/scope rows, destination
+  membership/projection rows, inherited verb/class rows, prefetch metadata,
+  validation read versions, and bounded fanout routing rows. The contract names
+  the cold/repair escape hatch for missing or inadmissible rows.
+- Removed measured warm `mcp_turn_plan` `SerializedWorld` materialization by
+  keeping accepted-frame projection and movement rows synchronized into relay
+  serialized refs incrementally after accepted commits. The measured warm gate
+  now fails on any `serialized_world_materialized` row.
+- Tightened measured warm structural checks to include a bounded local
+  `worker.commit_scope_envelope_rpc` budget, bounded MCP fanout shard/scope
+  counts, and absence of legacy `shadow_gateway_apply_step` receiver apply.
 
-Remaining plan items still need separate work: the explicit warm state contract,
-removal of planning-time `SerializedWorld` materialization, tighter bounded
-commit budgets, and bounded receiver fanout/apply.
+Remaining plan items still need deeper work: complete item 3 by replacing all
+remaining non-warm authority reconstruction with explicit warm-contract missing
+row metrics, sharpen item 5's budget from a local structural ceiling into a
+documented production budget, and complete item 6 for multi-recipient fanout
+under real cross-shard audiences.
 
 ## First Milestone
 
