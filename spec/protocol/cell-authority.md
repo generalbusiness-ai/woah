@@ -454,6 +454,27 @@ materialization of the durable gateway projection cache, which remains the
 cross-turn read model. The rules below still bind any implementation that keeps
 such a checkpoint.)*
 
+*(Implementation status, B7 gateway install: the MCP gateway's per-scope relay
+commit-scope cache now plays the warm-planning-cache role under these rules.
+A warm turn's first-attempt commit authority is served from the relay
+(`cachedWarmCommitAuthority` — recorded per-cell provenance preserved, `cache`
+where unrecorded) whenever the session is open on the scope client OR the
+relay's commit-scope head has advanced past `@0`; a repair attempt
+(attempt > 0) is NEVER served from the warm cache and reconstructs instead.
+The movement owner-prefetch applies the "repair only the missing cell/object
+ids" rule: an id whose tracked `object_lineage`/`object_live` cells are already
+owner-authoritative in the requesting relay is satisfied as-is; an id held
+owner-authoritatively by another warm scope client on the same gateway is
+copied between relay caches process-locally with its recorded provenance — a
+faithful copy of pages the owner served, not fabricated authority, with
+commit-time cell-version validation as the usual staleness arbiter; only the
+residue is reconstructed, and that residue fetch is a first fetch reported as
+`cold_open`, satisfying the health-metric requirement that a sticky seed be
+distinguishable from repeated `warm_turn_refresh` reconstruction. The
+`authority_slice_reconstructed` metric carries a `trigger` field attributing
+each reconstruction to its requesting call path, and `mcp_owner_prefetch`
+reports the warm/residue split per prefetch pass.)*
+
 - The checkpoint MUST carry `source: "cache"` provenance and a non-null owner
   head sequence for the scope it represents.
 - The checkpoint MUST NOT be stored or refreshed from a degraded slice that used

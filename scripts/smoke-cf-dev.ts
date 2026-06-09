@@ -191,6 +191,13 @@ function printMeasurement(metrics: Metric[], windows: PassWindow[]): void {
   const perPassRecon = windows.map((w) => metrics.filter((m) => m.kind === "authority_slice_reconstructed" && inWindow(m.ts, w)));
   row("slice reconstructions (total)", perPassRecon.map((r) => r.length));
   row("  reason=warm_turn_refresh", perPassRecon.map((r) => r.filter((m) => m.reason === "warm_turn_refresh").length));
+  // B7 attribution: split reconstructions by the requesting call path (the
+  // `trigger` field). The union of triggers seen across all passes keeps the
+  // table stable as triggers come and go between runs.
+  const triggers = Array.from(new Set(perPassRecon.flat().map((m) => String(m.trigger ?? m.reason ?? "untagged")))).sort();
+  for (const trigger of triggers) {
+    row(`  trigger=${trigger}`, perPassRecon.map((r) => r.filter((m) => String(m.trigger ?? m.reason ?? "untagged") === trigger).length));
+  }
 
   const perPassEnv = windows.map((w) => metrics.filter((m) => m.kind === "v2_envelope" && inWindow(m.ts, w)));
   row("envelope request_bytes (sum)", perPassEnv.map((env) => env.reduce((a, e) => a + num(e.request_bytes), 0)));

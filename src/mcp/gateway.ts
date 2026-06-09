@@ -14,7 +14,7 @@ import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import type { EffectTranscript } from "../core/effect-transcript";
 import { buildSerializedAuthorityCellSlice, cellProvenanceFromAuthoritySlice, combineSerializedAuthoritySlices, serializedWorldFromAuthoritySlice } from "../core/authority-slice";
-import { wooError, type AppliedFrame, type DirectResultFrame, type ErrorFrame, type ErrorValue, type Message, type ObjRef, type Session, type WooValue } from "../core/types";
+import { wooError, type AppliedFrame, type AuthorityReconstructionTrigger, type DirectResultFrame, type ErrorFrame, type ErrorValue, type Message, type MetricEvent, type ObjRef, type Session, type WooValue } from "../core/types";
 import { normalizeError, type WooWorld } from "../core/world";
 import type { SerializedAuthoritySlice, SerializedSession } from "../core/repository";
 import { projectionDeltaMissingWrites, type ProjectionWrite } from "../core/projection-delta";
@@ -32,9 +32,11 @@ import {
 import type { ShadowTurnCall } from "../core/shadow-turn-call";
 import {
   serializedFor,
+  shadowCommitScopeObject,
   type ShadowCommitAccepted,
   type ShadowScopeHead
 } from "../core/shadow-commit-scope";
+import { planningCellKey } from "../core/planning-world";
 import { affectedTranscriptScopes } from "../core/v2-fanout-projection";
 import type { ShadowTurnExecReply } from "../core/shadow-turn-exec";
 import {
@@ -108,6 +110,7 @@ export type McpV2ClientHooks = {
       directorySessionScopes?: ObjRef[];
       scopeContentExpansionRoots?: ObjRef[];
       reconstructionReason?: "warm_turn_refresh" | "cold_open" | "missing_state_repair";
+      reconstructionTrigger?: AuthorityReconstructionTrigger;
       reconstructionScope?: ObjRef;
       forceOwnerObjectIds?: ObjRef[];
     }
@@ -255,6 +258,57 @@ function ensureSerializedSession(sessions: readonly SerializedSession[], session
 function cachedAuthorityPageKey(page: { object: ObjRef; page: string; name?: string }): string {
   const name = page.page === "property_cell" || page.page === "verb_bytecode" ? page.name ?? "" : "";
   return `${page.object}:${page.page}:${name}`;
+}
+
+// B7: does this relay's planning cache hold the OWNER's authoritative row for
+// `id`? True only when the object row is resident AND both tracked cells
+// (object_lineage + object_live — exactly the cells the CA11.2 movement-
+// destination guard checks) carry recorded `authoritative` provenance. A
+// topology pre-seed (projection) or accepted-write warm fill (cache) does NOT
+// qualify — the owner-prefetch exists to upgrade those, so they stay residue.
+function relayHoldsOwnerAuthority(relay: ShadowRelayCache, id: ObjRef): boolean {
+  const provenance = relay.commit_scope.cellProvenance;
+  if (!provenance) return false;
+  if (!shadowCommitScopeObject(relay.commit_scope, id)) return false;
+  return provenance.get(planningCellKey(id, "object_lineage"))?.source === "authoritative" &&
+    provenance.get(planningCellKey(id, "object_live"))?.source === "authoritative";
+}
+
+// B7: lift one object's cell pages out of a donor scope client's relay into an
+// authority slice the requesting client can merge. The donor holds the owner's
+// rows for `id` (relayHoldsOwnerAuthority gates the call), so each page is
+// re-served with the donor's RECORDED provenance — the tracked identity/live
+// cells keep their original `authoritative` stamp (with the original owner
+// `source_host`): this is a faithful process-local copy of pages the owner
+// served, content-addressed and re-hashed by the same line_map-blind preimage
+// owners use (CA12.2), not fabricated authority for derived data. Its staleness
+// window is the same one the donor relay itself accepts (CA6), and commit-time
+// cell-version validation remains the arbiter. Untracked pages (props/verbs)
+// have no recorded provenance and default to `cache`. The slice carries the
+// REQUESTING relay's sessions/counters/tombstones unchanged because the
+// authority merge REPLACES the session list — the donor must not contribute
+// its own session view.
+function warmRelayAuthoritySliceForObject(
+  requester: ShadowRelayCache,
+  donor: ShadowRelayCache,
+  id: ObjRef,
+  metric: (event: MetricEvent) => void
+): SerializedAuthoritySlice {
+  const row = shadowCommitScopeObject(donor.commit_scope, id);
+  if (!row) throw new Error(`warm owner-prefetch donor has no row for ${id}`);
+  const requesterSerialized = serializedFor(requester.commit_scope, { reason: "mcp_owner_prefetch_warm", metric });
+  const provenance = donor.commit_scope.cellProvenance;
+  return buildSerializedAuthorityCellSlice({
+    sessions: requesterSerialized.sessions,
+    objects: [row],
+    counters: {
+      objectCounter: requesterSerialized.objectCounter,
+      parkedTaskCounter: requesterSerialized.parkedTaskCounter,
+      sessionCounter: requesterSerialized.sessionCounter
+    },
+    tombstones: requesterSerialized.tombstones,
+    pageProvenance: (page) => provenance?.get(cachedAuthorityPageKey(page)) ?? { source: "cache" }
+  });
 }
 
 export type McpGatewayOptions = {
@@ -786,8 +840,17 @@ export class McpGateway {
         // seeded-id local-export exclusion for those ids, so the owner's
         // exits-bearing row is fetched and displaces the seed by CA11 precedence.
         const isRepair = isPrePlan && context?.repair === true;
+        // B7: never serve warm/cached authority on a repair-loop retry. A
+        // conflict (stale_head / read_version_mismatch / missing_state) on
+        // attempt N means the state the cache served just failed validation;
+        // attempt N+1 must reconstruct fresh owner state or a stale cell can
+        // loop cache → mismatch → cache until the retry budget is exhausted.
+        // (The conflict reply's applyHead/applyStateTransfer installs already
+        // refresh the relay, but only for the cells the reply happened to name.)
+        const isRepairAttempt = (context?.attempt ?? 0) > 0;
         if (
           !isPrePlan &&
+          !isRepairAttempt &&
           hooks.slimWarmEnvelope === true
         ) {
           const submitClient = this.v2Scopes.get(submitScope);
@@ -797,8 +860,25 @@ export class McpGateway {
           const sessionOpen = context?.plannedTranscriptCommit === true
             ? submitClient?.commitScopeOpenedSessions.has(entry.woo.id) === true
             : submitClient?.openedSessions.has(entry.woo.id) === true || submitClient?.commitScopeOpenedSessions.has(entry.woo.id) === true;
-          if (authorityClient && sessionOpen) return this.cachedWarmCommitAuthority(entry, authorityClient, extraObjectIds);
+          // B7 widening: a relay whose commit-scope head has advanced past @0 is
+          // tracking the CommitScopeDO's accepted sequence (the open adopted the
+          // durable head and accepted frames advance it), so its admitted rows
+          // ARE the head state the envelope will validate against — serve them
+          // even when this particular session's open marker is not yet recorded
+          // (e.g. another session on this shard opened the scope client).
+          const headKnown = (authorityClient?.relay.commit_scope.head.seq ?? 0) > 0;
+          if (authorityClient && (sessionOpen || headKnown)) return this.cachedWarmCommitAuthority(entry, authorityClient, extraObjectIds);
         }
+        // The CommitScopeDO snapshot fallback (no remote fetch; rely on the
+        // scope's durable snapshot + commit validation) applies to the FIRST
+        // fallthrough commit refresh — including the one a repair attempt pays
+        // after the cached path above refused it. Forcing real remote owner
+        // fetches on repair attempts here was tried and REGRESSED the
+        // production-shape movement path: the refetched slices, merged back
+        // into the relay, displaced fresher repair-installed rows. Repair
+        // freshness comes from the pre-plan missing_state_repair force-owner
+        // refresh and the conflict reply's applyHead/applyStateTransfer
+        // installs, not from this payload.
         const useCommitScopeSnapshotForRemoteAuthority = !isPrePlan && authorityRefreshAttempts === 0;
         if (!isPrePlan) authorityRefreshAttempts += 1;
         // Directory/session scopes still include submit+target so routes and
@@ -822,6 +902,7 @@ export class McpGateway {
           ),
           ...(contentExpansionRoots.length > 0 ? { scopeContentExpansionRoots: contentExpansionRoots } : {}),
           reconstructionReason: isRepair ? "missing_state_repair" : "warm_turn_refresh",
+          reconstructionTrigger: isPrePlan ? "pre_plan_repair" : "turn_commit",
           reconstructionScope: submitScope,
           forceOwnerObjectIds: isRepair ? extraObjectIds : []
         });
@@ -885,7 +966,7 @@ export class McpGateway {
           if (!client) throw err;
           client.openedSessions.delete(entry.woo.id);
           client.commitScopeOpenedSessions.delete(entry.woo.id);
-          const seeded = await context.timing.time("submit", "mcp.snapshot_retry_seed", () => this.v2SerializedWorld([submitScope, entry.woo.actor]));
+          const seeded = await context.timing.time("submit", "mcp.snapshot_retry_seed", () => this.v2SerializedWorld([submitScope, entry.woo.actor], { reconstructionReason: "cold_open", reconstructionTrigger: "snapshot_retry" }));
           await this.ensureV2ScopeSessionOpen(entry, client, hooks, seeded, {
             forceLegacyOpen: true,
             timing: context.timing,
@@ -1013,16 +1094,24 @@ export class McpGateway {
     const initializer = (async () => {
       const ownerAuthorityObjectIds = options.ownerAuthorityObjectIds ?? [];
       const seedObjectIds = mergeObjRefs([scope, entry.woo.actor], ownerAuthorityObjectIds);
+      // First-open seeding is a cold-open cost by the metric taxonomy (the
+      // reason previously defaulted to warm_turn_refresh because the worker
+      // hook always tolerates remote failures; B7 attribution showed these
+      // seeds were the bulk of the mislabeled "warm" reconstructions).
       const seeded = await (options.timing
         ? options.timing.time("ensure_client", `${timingPrefix}.seed_authority`, () => this.v2SerializedWorld(seedObjectIds, {
           directorySessionScopes: mcpDirectorySessionScopesForAuthority(entry, scope),
           forceOwnerObjectIds: ownerAuthorityObjectIds,
-          reconstructionScope: scope
+          reconstructionScope: scope,
+          reconstructionReason: "cold_open",
+          reconstructionTrigger: "scope_seed"
         }))
         : this.v2SerializedWorld(seedObjectIds, {
           directorySessionScopes: mcpDirectorySessionScopesForAuthority(entry, scope),
           forceOwnerObjectIds: ownerAuthorityObjectIds,
-          reconstructionScope: scope
+          reconstructionScope: scope,
+          reconstructionReason: "cold_open",
+          reconstructionTrigger: "scope_seed"
         }));
       const client: V2ScopeClient = {
         scope,
@@ -1063,25 +1152,76 @@ export class McpGateway {
     const ids = Array.from(new Set((options.ownerAuthorityObjectIds ?? [])
       .filter((id): id is ObjRef => typeof id === "string" && id.length > 0 && !client.ownerPrefetchedIds.has(id))));
     if (ids.length === 0) return;
+    // B7 gateway install. The prefetch exists to give local planning OWNER-
+    // authoritative identity/live rows for the ids a movement-class verb will
+    // touch (the CA11.2 movement-destination guard rejects a non-authoritative
+    // destination row). It used to reconstruct a full owner fan-in slice on
+    // every first sighting of an id per scope client — the per-movement
+    // `owner_prefetch` reconstructions the baseline measured. CA11.1's residue
+    // rule applies instead:
+    //   1. an id whose tracked cells are already owner-authoritative in THIS
+    //      client's relay needs nothing;
+    //   2. an id that ANOTHER warm scope client on this gateway holds
+    //      owner-authoritatively (the gateway already paid that owner fetch
+    //      when it seeded/refreshed that scope) is served by copying that
+    //      relay's cell pages — process-local, no reconstruction, no RPC;
+    //   3. only the residue pays a (residue-only, first-fetch) reconstruction.
+    // A warm-served row may lag the owner; commit-time cell-version validation
+    // arbitrates, and the repair attempt always reconstructs fresh (the
+    // executor refuses warm authority when attempt > 0) — the same safety
+    // property every B7 cache read relies on.
+    const metric = (event: MetricEvent): void => this.world.recordMetric(event);
+    let warmLocal = 0;
+    let warmDonor = 0;
+    const residue: ObjRef[] = [];
+    for (const id of ids) {
+      if (relayHoldsOwnerAuthority(client.relay, id)) {
+        client.ownerPrefetchedIds.add(id);
+        warmLocal += 1;
+        continue;
+      }
+      const donor = id === client.scope ? undefined : this.v2Scopes.get(id);
+      if (donor && donor !== client && relayHoldsOwnerAuthority(donor.relay, id)) {
+        this.mergeV2AuthorityIntoScopeClient(client, warmRelayAuthoritySliceForObject(client.relay, donor.relay, id, metric));
+        client.ownerPrefetchedIds.add(id);
+        warmDonor += 1;
+        continue;
+      }
+      residue.push(id);
+    }
+    this.world.recordMetric({
+      kind: "mcp_owner_prefetch",
+      scope: client.scope,
+      requested: ids.length,
+      warm_local: warmLocal,
+      warm_donor: warmDonor,
+      residue: residue.length
+    });
+    if (residue.length === 0) return;
     const timingPrefix = options.timingLabelPrefix ?? "ensure";
+    // The residue is a first fetch of ids this shard has never held with owner
+    // authority — a bounded cold cost by the metric taxonomy, not a per-turn
+    // refresh of already-open state (which the warm paths above now absorb).
     const authority = this.withMcpSessionAuthority(
       entry,
       await (options.timing
-        ? options.timing.time("ensure_client", `${timingPrefix}.owner_prefetch_authority`, () => this.v2AuthorityPayload(ids, {
+        ? options.timing.time("ensure_client", `${timingPrefix}.owner_prefetch_authority`, () => this.v2AuthorityPayload(residue, {
           directorySessionScopes: mcpDirectorySessionScopesForAuthority(entry, client.scope),
-          reconstructionReason: "warm_turn_refresh",
+          reconstructionReason: "cold_open",
+          reconstructionTrigger: "owner_prefetch",
           reconstructionScope: client.scope,
-          forceOwnerObjectIds: ids
+          forceOwnerObjectIds: residue
         }))
-        : this.v2AuthorityPayload(ids, {
+        : this.v2AuthorityPayload(residue, {
           directorySessionScopes: mcpDirectorySessionScopesForAuthority(entry, client.scope),
-          reconstructionReason: "warm_turn_refresh",
+          reconstructionReason: "cold_open",
+          reconstructionTrigger: "owner_prefetch",
           reconstructionScope: client.scope,
-          forceOwnerObjectIds: ids
+          forceOwnerObjectIds: residue
         }))
     );
     this.mergeV2AuthorityIntoScopeClient(client, authority.authority);
-    for (const id of ids) client.ownerPrefetchedIds.add(id);
+    for (const id of residue) client.ownerPrefetchedIds.add(id);
   }
 
   private async ensureV2ScopeSessionOpen(
@@ -1114,10 +1254,12 @@ export class McpGateway {
         entry,
         seeded?.authority ?? await (options.timing
           ? options.timing.time("ensure_client", `${timingPrefix}.session_authority_payload`, () => this.v2AuthorityPayload([client.scope, entry.woo.actor], {
-            directorySessionScopes: mcpDirectorySessionScopesForAuthority(entry, client.scope)
+            directorySessionScopes: mcpDirectorySessionScopesForAuthority(entry, client.scope),
+            reconstructionTrigger: "session_open"
           }))
           : this.v2AuthorityPayload([client.scope, entry.woo.actor], {
-            directorySessionScopes: mcpDirectorySessionScopesForAuthority(entry, client.scope)
+            directorySessionScopes: mcpDirectorySessionScopesForAuthority(entry, client.scope),
+            reconstructionTrigger: "session_open"
           }))
       );
       this.mergeV2AuthorityIntoScopeClient(client, authority.authority);
@@ -1152,10 +1294,14 @@ export class McpGateway {
         if (!isV2CommitScopeSnapshotRequiredError(err)) throw err;
         const retrySeed = seeded ?? await (options.timing
           ? options.timing.time("ensure_client", `${timingPrefix}.snapshot_retry_seed`, () => this.v2SerializedWorld([client.scope, entry.woo.actor], {
-            directorySessionScopes: mcpDirectorySessionScopesForAuthority(entry, client.scope)
+            directorySessionScopes: mcpDirectorySessionScopesForAuthority(entry, client.scope),
+            reconstructionReason: "cold_open",
+            reconstructionTrigger: "snapshot_retry"
           }))
           : this.v2SerializedWorld([client.scope, entry.woo.actor], {
-            directorySessionScopes: mcpDirectorySessionScopesForAuthority(entry, client.scope)
+            directorySessionScopes: mcpDirectorySessionScopesForAuthority(entry, client.scope),
+            reconstructionReason: "cold_open",
+            reconstructionTrigger: "snapshot_retry"
           }));
         opened = await (options.timing
           ? options.timing.time("ensure_client", `${timingPrefix}.snapshot_retry_open_rpc`, () => hooks.open(client.scope, {
@@ -1213,6 +1359,7 @@ export class McpGateway {
       directorySessionScopes?: ObjRef[];
       scopeContentExpansionRoots?: ObjRef[];
       reconstructionReason?: "warm_turn_refresh" | "cold_open" | "missing_state_repair";
+      reconstructionTrigger?: AuthorityReconstructionTrigger;
       reconstructionScope?: ObjRef;
       forceOwnerObjectIds?: ObjRef[];
     } = {}
@@ -1225,7 +1372,7 @@ export class McpGateway {
 
   private async v2SerializedWorld(
     extraObjectIds: ObjRef[],
-    options: { directorySessionScopes?: ObjRef[]; forceOwnerObjectIds?: ObjRef[]; reconstructionScope?: ObjRef } = {}
+    options: { directorySessionScopes?: ObjRef[]; forceOwnerObjectIds?: ObjRef[]; reconstructionScope?: ObjRef; reconstructionReason?: "warm_turn_refresh" | "cold_open" | "missing_state_repair"; reconstructionTrigger?: AuthorityReconstructionTrigger } = {}
   ): Promise<{ serialized: ReturnType<WooWorld["exportWorld"]>; authority: ReturnType<typeof executorAuthorityPayload> }> {
     const authority = await this.v2AuthorityPayload(extraObjectIds, options);
     const serialized = serializedWorldFromAuthoritySlice(authority.authority);
