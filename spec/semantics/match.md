@@ -213,6 +213,15 @@ syntax. The stored verb definition is still the source of truth after install.
 
 `$match:plan_command(text, space)` uses this normative target order: direct object, indirect object, command space, actor. Within each target it uses the existing runtime verb lookup rule, including parent chains and features.
 
+For object phrases inside command planning, the parser uses the bounded command
+surface: ids, `name`, `aliases`, and local `:match_names()` contributions. It
+does not dispatch presentation verbs such as `:title()` while deciding what the
+command means. Generic `$match:match_object` keeps its richer historical
+matching behavior, but a browser-open command seed must be able to warm the
+planner's deterministic read closure without importing arbitrary look/display
+state from every visible object. Catalogs that want a title word to be command
+syntax must expose it as an alias or through `:match_names()`.
+
 When no command-pattern verb matches a slash-prefixed command, the planner
 consults optional huh hooks in this order: `actor:my_huh(cmd)`,
 `space:here_huh(cmd)`, then `actor:last_huh(cmd)`. A missing hook is ignored. A

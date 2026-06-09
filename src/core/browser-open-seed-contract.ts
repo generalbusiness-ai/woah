@@ -1,4 +1,5 @@
 import {
+  nativePrimitiveContract,
   nativePrimitiveOpenSeedCatalogPropertyNames,
   nativePrimitiveOpenSeedDispatchVerbNames,
   nativePrimitiveOpenSeedObjectPropertyNames,
@@ -44,6 +45,14 @@ export function browserOpenSeedObjectPropertyNames(): string[] {
     ...SUBSTRATE_OBJECT_PROPERTIES.map((entry) => entry.name),
     ...nativePrimitiveOpenSeedObjectPropertyNames()
   ]);
+}
+
+export function browserOpenSeedCommandSurfacePropertyNames(): string[] {
+  return uniqueSorted(nativePrimitiveContract("plan_command")?.open_seed?.object_property_names ?? []);
+}
+
+export function browserOpenSeedCommandSurfaceVerbLookupNames(): string[] {
+  return uniqueSorted(nativePrimitiveContract("plan_command")?.open_seed?.object_verb_lookup_names ?? []);
 }
 
 export function browserOpenSeedCatalogPropertyNames(): string[] {

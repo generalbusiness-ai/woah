@@ -262,6 +262,22 @@ function execCacheBuildMetrics(diagnostics: V2Diagnostics, path?: "build" | "mem
   );
 }
 
+function stateTransferRequestMetrics(diagnostics: V2Diagnostics): BrowserMetricRecord[] {
+  return diagnostics.browserMetrics.filter((metric) =>
+    metric.kind === "browser_activity"
+    && metric.phase === "state_transfer_request"
+  );
+}
+
+function numericMetric(metric: BrowserMetricRecord, field: string): number {
+  const value = metric[field];
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function sumMetric(metrics: BrowserMetricRecord[], field: string): number {
+  return metrics.reduce((sum, metric) => sum + numericMetric(metric, field), 0);
+}
+
 test("loads shell and renders nav", async ({ page }) => {
   const consoleErrors: string[] = [];
   page.on("pageerror", (err) => consoleErrors.push(err.message));
@@ -1252,6 +1268,19 @@ test("two browser agents execute locally and are sequenced by the devserver", as
       // The execution cache is memoized by input epoch; repeated cache_status polling
       // between state changes must hit the memo rather than rebuilding every time.
       expect(execCacheBuildMetrics(diag, "memo").length, `${label}: execution cache memo should serve redundant builds`).toBeGreaterThanOrEqual(1);
+      const transferMetrics = stateTransferRequestMetrics(diag);
+      // State-transfer repair is allowed to shrink to zero as coverage improves. If
+      // it fires, it must carry enough request/reply shape to attribute whether the
+      // cost is known-page hash echo, metadata/preimages, or inline page payloads.
+      for (const metric of transferMetrics) {
+        expect(typeof metric.request_known_pages, `${label}: state-transfer metric must include request known-page count`).toBe("number");
+        expect(typeof metric.request_body_bytes, `${label}: state-transfer metric must include request body bytes`).toBe("number");
+        expect(typeof metric.reply_page_refs, `${label}: state-transfer metric must include reply page-ref count`).toBe("number");
+        expect(typeof metric.reply_inline_pages, `${label}: state-transfer metric must include reply inline-page count`).toBe("number");
+        expect(typeof metric.reply_metadata_bytes, `${label}: state-transfer metric must include reply metadata bytes`).toBe("number");
+      }
+      expect(transferMetrics.length, `${label}: state-transfer repair count should stay bounded`).toBeLessThan(30);
+      expect(sumMetric(transferMetrics, "request_bytes"), `${label}: state-transfer request bytes should stay bounded`).toBeLessThan(1_000_000);
     }
 
     expectNoV2Failures(firstV2);
