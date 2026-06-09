@@ -2433,6 +2433,39 @@ describe("local catalogs", () => {
     expect(world.getProp(first.actor, "huh_order")).toEqual(["my_huh", "here_huh", "last_huh"]);
   });
 
+  it("keeps command planning on the command surface rather than presentation titles", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:command-surface-title");
+    await world.directCall("enter-command-surface-title", session.actor, "the_chatroom", "enter", []);
+    world.createObject({
+      id: "obj_title_only_stone",
+      name: "plain stone",
+      parent: "$thing",
+      owner: "$wiz",
+      location: "the_chatroom"
+    });
+    expect(installVerb(world, "obj_title_only_stone", "title", `verb :title() rxd {
+      return "glimmering comet";
+    }`, null).ok).toBe(true);
+
+    const richMatch = await world.directCall("match-presentation-title", session.actor, "$match", "match_object", ["comet", "the_chatroom"]);
+    expect(richMatch.op).toBe("result");
+    if (richMatch.op === "result") expect(richMatch.result).toBe("obj_title_only_stone");
+
+    const titleOnlyPlan = await world.directCall("plan-presentation-title", session.actor, "the_chatroom", "command_plan", ["look comet"]);
+    expect(titleOnlyPlan.op).toBe("result");
+    if (titleOnlyPlan.op === "result") {
+      expect(titleOnlyPlan.result).toMatchObject({ ok: false, route: "huh", text: "look comet" });
+    }
+
+    world.setProp("obj_title_only_stone", "aliases", ["comet"]);
+    const surfacedPlan = await world.directCall("plan-command-surface-alias", session.actor, "the_chatroom", "command_plan", ["look comet"]);
+    expect(surfacedPlan.op).toBe("result");
+    if (surfacedPlan.op === "result") {
+      expect(surfacedPlan.result).toMatchObject({ ok: true, target: "the_chatroom", verb: "look_at", args: ["obj_title_only_stone"] });
+    }
+  });
+
   it("supports a small multi-room chat world with stable carryable placement", async () => {
     const world = createWorld();
     // The "outsider" branch below tests $match permission gating for an actor

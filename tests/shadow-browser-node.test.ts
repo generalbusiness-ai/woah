@@ -52,6 +52,8 @@ import { serializedFor, submitShadowCommit, type ShadowCommitAccepted, type Shad
 import { createShadowExecutionNode, type ShadowCellPageTransfer } from "../src/core/shadow-turn-exec";
 import { mergeAuthorityIntoRelayCache } from "../src/core/shadow-relay-cache";
 import {
+  browserOpenSeedCommandSurfacePropertyNames,
+  browserOpenSeedCommandSurfaceVerbLookupNames,
   browserOpenSeedCatalogPropertyNames,
   browserOpenSeedDispatchVerbNames,
   browserOpenSeedObjectPropertyNames,
@@ -149,7 +151,14 @@ describe("shadow browser node shim", () => {
     expect(hasTransferPage(transfer, "$pinboard", "verb_bytecode", "exitfunc")).toBe(false);
     expect(hasTransferPage(transfer, "$match", "verb_bytecode", "plan_command")).toBe(true);
     expect(hasTransferPage(transfer, "$room", "verb_bytecode", "take")).toBe(true);
+    expect(transfer.preimages).toContain("read:cell:prop:the_mug.name");
+    expect(hasTransferPage(transfer, "the_mug", "property_cell", "aliases")).toBe(true);
+    expect(transfer.preimages).toContain(`read:cell:contents:${session.actor}`);
+    expect(transfer.preimages).toContain("read:cell:verb:the_chatroom:take");
+    expect(transfer.preimages).not.toContain("read:cell:verb:$actor:title");
     expect(browserOpenSeedDispatchVerbNames()).toContain("command_plan");
+    expect(browserOpenSeedCommandSurfacePropertyNames()).toEqual(["aliases", "description", "name"]);
+    expect(browserOpenSeedCommandSurfaceVerbLookupNames()).toEqual(["match_names"]);
     expect(browserOpenSeedVerbLookups()).toEqual(expect.arrayContaining([
       expect.objectContaining({ receiver: "scope", names: expect.arrayContaining(["command_plan"]) }),
       expect.objectContaining({ receiver: "scope", names: expect.arrayContaining(["acceptable", "enterfunc"]) }),

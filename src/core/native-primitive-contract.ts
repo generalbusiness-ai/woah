@@ -22,6 +22,7 @@ export type NativePrimitiveOpenSeedVerbLookup = {
 export type NativePrimitiveOpenSeedContract = {
   verb_lookups?: NativePrimitiveOpenSeedVerbLookup[];
   object_property_names?: string[];
+  object_verb_lookup_names?: string[];
   catalog_property_names?: string[];
   dispatch_verb_names?: string[];
 };
@@ -120,6 +121,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
         }
       ],
       object_property_names: ["name", "description", "aliases"],
+      object_verb_lookup_names: ["match_names"],
       dispatch_verb_names: ["command_plan"]
     },
     note: "Planner output is a read-only logical result; subsequent execution records the actual verb dispatch."

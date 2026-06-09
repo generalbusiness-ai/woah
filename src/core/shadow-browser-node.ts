@@ -61,6 +61,8 @@ import { constantTimeEqual, hashSource } from "./source-hash";
 import { redactSensitiveSerializedPropertyValues } from "./sensitive-serialization";
 import {
   browserOpenSeedCatalogPropertyNames,
+  browserOpenSeedCommandSurfacePropertyNames,
+  browserOpenSeedCommandSurfaceVerbLookupNames,
   browserOpenSeedDispatchVerbNames,
   browserOpenSeedObjectPropertyNames,
   browserOpenSeedVerbLookups
@@ -1049,9 +1051,41 @@ function shadowBrowserOpenExecutableSeedPreimages(serialized: SerializedWorld, s
   // of the open envelope; content-specific verbs still arrive through exact
   // missing-state repair after the key exists.
   addOpenSeedDispatchVerbCells(serialized, scope, add);
+  // `command_plan` is itself dispatched on the scope, but the parser reads the
+  // visible command surface (candidate names/aliases plus command-shaped verbs)
+  // across actors, room contents, inventory, and linked tool rooms. Seed only
+  // that declared command metadata so first free-form commands do not repair the
+  // same deterministic parser closure, without shipping complete method tables.
+  addOpenSeedCommandSurfaceCells(serialized, scope, actor, add);
   return [
     ...preimages
   ].sort();
+}
+
+function addOpenSeedCommandSurfaceCells(
+  serialized: SerializedWorld,
+  scope: ObjRef,
+  actor: ObjRef | undefined,
+  add: (preimage: string) => void
+): void {
+  const byId = new Map(serialized.objects.map((obj) => [obj.id, obj] as const));
+  const candidates = new Set<ObjRef>();
+  const addCandidate = (id: ObjRef | null | undefined): void => {
+    if (id && byId.has(id)) candidates.add(id);
+  };
+  addCandidate(scope);
+  addCandidate(actor);
+  for (const id of byId.get(scope)?.contents ?? []) addCandidate(id);
+  if (actor) {
+    add(`read:cell:contents:${actor}`);
+    for (const id of byId.get(actor)?.contents ?? []) addCandidate(id);
+  }
+  for (const linked of openSeedLinkedObjectRefs(serialized, scope, actor)) addCandidate(linked);
+  const propertyNames = browserOpenSeedCommandSurfacePropertyNames();
+  for (const id of Array.from(candidates).sort()) {
+    for (const name of propertyNames) add(`read:cell:prop:${id}.${name}`);
+    addOpenSeedVerbLookupCells(serialized, id, browserOpenSeedCommandSurfaceVerbLookupNames(), add);
+  }
 }
 
 function addOpenSeedDispatchVerbCells(
@@ -1076,6 +1110,7 @@ function addOpenSeedDispatchVerbCells(
         // from a command/tool surface plus the planner wrapper needed to choose
         // them; turn-specific repairs can fetch non-surface helpers on demand.
         if (!openSeedDispatchVerbSelected(verb)) continue;
+        for (const lookupObject of visitedChain) add(`read:cell:verb:${lookupObject}:${verb.name}`);
         add(`read:cell:verb:${obj.id}:${verb.name}`);
         add(`call:${receiver}:${verb.name}`);
       }

@@ -125,3 +125,60 @@ The first `command_plan` repair for each actor is the biggest fixed pattern:
    state-transfer/repair loop still drives repeated cache rebuilds and reads.
    Optimizing IDB before reducing the repair count risks shaving symptoms.
 
+## Follow-up: command-plan open-seed closure
+
+Implemented the first recommendation on this branch.
+
+What changed:
+
+- `plan_command` now parses object phrases against the bounded command surface:
+  ids, `name`, `aliases`, and local `:match_names()` contributions. It no
+  longer dispatches presentation `:title()` while deciding command syntax.
+  Generic `$match:match_object` keeps the richer title-aware behavior for
+  compatibility.
+- The browser open executable seed now includes the declared command-surface
+  cells for the visible object set: scope, actor, scope contents, actor
+  inventory, and linked tool-room refs.
+- `plan_command.open_seed` records the object property and verb-lookup contract
+  (`name`/`description`/`aliases`, plus `match_names`) so this stays metadata
+  driven rather than catalog-word driven.
+- The spec now states the command-planner boundary explicitly.
+
+Measurement:
+
+```bash
+PORT=5278 VITE_HMR_PORT=15278 WOO_DB=.woo/e2e-command-plan-open-seed.sqlite WOO_METRICS=on npm run dev
+WOO_E2E_BASE_URL=http://localhost:5278 npx playwright test e2e/smoke.spec.ts -g "two browser agents execute locally"
+```
+
+Result: 1/1 passed, Playwright duration 18.4s.
+
+Before vs after:
+
+| metric | baseline | command-surface seed |
+|---|---:|---:|
+| state-transfer repairs | 10 | 5 |
+| `command_plan` repairs | 8 | 1 |
+| state-transfer request bytes | 396,967 | 191,752 |
+| known-page hash bytes | 270,020 | 140,437 |
+| reply bytes | 192,071 | 35,896 |
+| first chatroom open seed bytes | 411,511 | 420,658 |
+
+The main 51-atom `command_plan` repair is gone for cold command text. The
+remaining repairs are now mostly direct `take`/`drop` execution and one smaller
+six-verb `command_plan` repair after a scope/state transition.
+
+Rejected experiment:
+
+- Seeding finite alias lookup atoms for selected dispatch verbs was tried and
+  measured separately in `.woo/e2e-command-plan-alias-seed.log`.
+- It increased first chatroom open seed bytes to 440,250 and repair count to 8,
+  so it was not kept.
+
+Next actionable hotspot:
+
+The protocol still sends a full known-page hash echo on every repair. Even after
+repair reduction, known-page hashes were 140KB of 192KB request bytes in the
+accepted run. The cache-identity/digest protocol remains the clean next byte
+win, while direct `take`/`drop` repair preimages are the next semantic closure
+to inspect.
