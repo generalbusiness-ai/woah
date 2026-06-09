@@ -19,6 +19,7 @@ import {
   type ShadowTurnCallTranscriptRun
 } from "./shadow-turn-call";
 import type { ShadowCapabilityAd } from "./capability-ad";
+import type { ShadowKnownPageHashSetIdentity } from "./shadow-known-page-cache";
 import {
   selectCommitScopeForTranscript,
   serializedFor,
@@ -107,6 +108,8 @@ export type ShadowCellPageTransfer = {
   source_object_count: number;
   source_page_count: number;
   capsule?: ShadowExecutionCapsuleMetadata;
+  known_page_cache?: ShadowKnownPageHashSetIdentity;
+  known_page_cache_status?: "hit" | "miss" | "registered";
   proof: ShadowStateProof;
 };
 

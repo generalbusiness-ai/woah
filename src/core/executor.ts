@@ -570,7 +570,15 @@ export function executorEnvelopeBody(input: {
     token: input.turn.token,
     session: input.turn.session,
     actor: input.turn.actor,
-    sessions: input.authority.sessions,
+    // Authority-bearing envelopes already carry the session rows once, inside
+    // the authority slice. The CommitScopeDO turn path reads `authority.sessions`
+    // and only falls back to this top-level field when no slice is present
+    // (commit-scope-do.ts: `authority?.sessions ?? input.sessions`), so
+    // duplicating the full session list here is dead wire weight. Leave it empty
+    // — the same legacy-empty contract as `session_objects`. The warm slim path,
+    // which strips `authority`, repopulates this field from `authority.sessions`
+    // (see slimMcpEnvelopeBody) so the receiver still has the rows.
+    sessions: [],
     session_objects: input.authority.session_objects,
     authority: input.authority.authority,
     envelope: input.envelope,

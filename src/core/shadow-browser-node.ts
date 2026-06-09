@@ -58,9 +58,12 @@ import type { ShadowCapabilityAd } from "./capability-ad";
 import { stableShadowJson } from "./shadow-cell-version";
 import { decodeEnvelope, type ShadowEnvelope, type ShadowEnvelopeAuth } from "./shadow-envelope";
 import { constantTimeEqual, hashSource } from "./source-hash";
+import { shadowKnownPageHashSet, type ShadowKnownPageHashSetIdentity } from "./shadow-known-page-cache";
 import { redactSensitiveSerializedPropertyValues } from "./sensitive-serialization";
 import {
   browserOpenSeedCatalogPropertyNames,
+  browserOpenSeedCommandSurfacePropertyNames,
+  browserOpenSeedCommandSurfaceVerbLookupNames,
   browserOpenSeedDispatchVerbNames,
   browserOpenSeedObjectPropertyNames,
   browserOpenSeedVerbLookups
@@ -86,6 +89,7 @@ const MAX_SHADOW_LIVE_EVENTS = 500;
 const MAX_SHADOW_BROWSER_TRANSFERS = 200;
 const MAX_SHADOW_BROWSER_CACHE_TAIL = 1_000;
 const MAX_SHADOW_BROWSER_CONFLICTS = 200;
+const MAX_SHADOW_BROWSER_KNOWN_PAGE_SETS = 64;
 const OPEN_SEED_DISPATCH_VERB_NAMES = new Set(browserOpenSeedDispatchVerbNames());
 // The envelope codec rejects frames at 1 MiB. Keep browser state-transfer
 // bodies comfortably below that so the surrounding envelope metadata and
@@ -238,6 +242,7 @@ export type ShadowBrowserNodeCache = {
   conflicts: ShadowCommitConflict[];
   transfers: ShadowBrowserStateTransfer[];
   live_events: ShadowLiveEvent[];
+  known_page_sets: Map<string, string[]>;
 };
 
 export type ShadowBrowserPendingTurn = {
@@ -384,6 +389,7 @@ export type ShadowExecutableStateTransferRequest = {
   // the cell-page closure without inventing it from the partial key.
   atom_hashes?: string[];
   missing_atoms?: ShadowMissingAtom[];
+  known_page_cache?: ShadowKnownPageHashSetIdentity;
   known_page_hashes?: string[];
   mode?: "cell_pages";
 };
@@ -702,7 +708,8 @@ export function createShadowBrowserNodeCache(): ShadowBrowserNodeCache {
     applied_frames: [],
     conflicts: [],
     transfers: [],
-    live_events: []
+    live_events: [],
+    known_page_sets: new Map()
   };
 }
 
@@ -1049,9 +1056,41 @@ function shadowBrowserOpenExecutableSeedPreimages(serialized: SerializedWorld, s
   // of the open envelope; content-specific verbs still arrive through exact
   // missing-state repair after the key exists.
   addOpenSeedDispatchVerbCells(serialized, scope, add);
+  // `command_plan` is itself dispatched on the scope, but the parser reads the
+  // visible command surface (candidate names/aliases plus command-shaped verbs)
+  // across actors, room contents, inventory, and linked tool rooms. Seed only
+  // that declared command metadata so first free-form commands do not repair the
+  // same deterministic parser closure, without shipping complete method tables.
+  addOpenSeedCommandSurfaceCells(serialized, scope, actor, add);
   return [
     ...preimages
   ].sort();
+}
+
+function addOpenSeedCommandSurfaceCells(
+  serialized: SerializedWorld,
+  scope: ObjRef,
+  actor: ObjRef | undefined,
+  add: (preimage: string) => void
+): void {
+  const byId = new Map(serialized.objects.map((obj) => [obj.id, obj] as const));
+  const candidates = new Set<ObjRef>();
+  const addCandidate = (id: ObjRef | null | undefined): void => {
+    if (id && byId.has(id)) candidates.add(id);
+  };
+  addCandidate(scope);
+  addCandidate(actor);
+  for (const id of byId.get(scope)?.contents ?? []) addCandidate(id);
+  if (actor) {
+    add(`read:cell:contents:${actor}`);
+    for (const id of byId.get(actor)?.contents ?? []) addCandidate(id);
+  }
+  for (const linked of openSeedLinkedObjectRefs(serialized, scope, actor)) addCandidate(linked);
+  const propertyNames = browserOpenSeedCommandSurfacePropertyNames();
+  for (const id of Array.from(candidates).sort()) {
+    for (const name of propertyNames) add(`read:cell:prop:${id}.${name}`);
+    addOpenSeedVerbLookupCells(serialized, id, browserOpenSeedCommandSurfaceVerbLookupNames(), add);
+  }
 }
 
 function addOpenSeedDispatchVerbCells(
@@ -1076,6 +1115,7 @@ function addOpenSeedDispatchVerbCells(
         // from a command/tool surface plus the planner wrapper needed to choose
         // them; turn-specific repairs can fetch non-surface helpers on demand.
         if (!openSeedDispatchVerbSelected(verb)) continue;
+        for (const lookupObject of visitedChain) add(`read:cell:verb:${lookupObject}:${verb.name}`);
         add(`read:cell:verb:${obj.id}:${verb.name}`);
         add(`call:${receiver}:${verb.name}`);
       }
@@ -1944,6 +1984,7 @@ export function handleShadowBrowserStateTransferEnvelope(
   // bailed before recording the access. `atom_hashes` still selects atoms from
   // the planned key; when both are present the transfer builder serves the
   // union.
+  const knownPageSet = resolveShadowBrowserKnownPageHashSet(browser, request);
   const transfer = buildShadowCellPageTransfer({
     serialized: serializedFor(browser.relay.commit_scope, { reason: "state_transfer" }),
     key: request.key,
@@ -1953,7 +1994,7 @@ export function handleShadowBrowserStateTransferEnvelope(
     // The relay's in-process execution node may have the same pages from open
     // seeding, but treating that server-local cache as client possession makes
     // cold repair replies reference pages the browser never stored.
-    known_page_hashes: request.known_page_hashes ?? [],
+    known_page_hashes: knownPageSet.hashes,
     session: browser.session,
     recipient: browser.node,
     capsule: {
@@ -1965,6 +2006,12 @@ export function handleShadowBrowserStateTransferEnvelope(
       recipient: browser.node
     }
   });
+  const nextKnownPageSet = rememberShadowBrowserKnownPageHashSet(
+    browser,
+    [...knownPageSet.hashes, ...transfer.page_refs.map((ref) => ref.hash)]
+  );
+  transfer.known_page_cache = nextKnownPageSet.identity;
+  transfer.known_page_cache_status = knownPageSet.status;
   const response: ShadowEnvelope<ShadowStateTransfer> = {
     v: 2,
     type: transfer.kind,
@@ -1980,6 +2027,43 @@ export function handleShadowBrowserStateTransferEnvelope(
   browser.relay.recent_replies.set(receipt.idempotency_key, structuredClone(response));
   trimShadowBrowserIdempotency(browser.relay);
   return response;
+}
+
+function resolveShadowBrowserKnownPageHashSet(
+  browser: ShadowBrowserNode,
+  request: ShadowExecutableStateTransferRequest
+): { hashes: string[]; status: "hit" | "miss" | "registered" } {
+  if (request.known_page_hashes) {
+    const registered = rememberShadowBrowserKnownPageHashSet(browser, request.known_page_hashes);
+    return { hashes: registered.hashes, status: "registered" };
+  }
+  const identity = request.known_page_cache;
+  if (!identity || identity.kind !== "woo.known_page_hash_set.v1") return { hashes: [], status: "miss" };
+  const hashes = browser.cache.known_page_sets.get(identity.token);
+  if (!hashes) return { hashes: [], status: "miss" };
+  const actual = shadowKnownPageHashSet(hashes).identity;
+  if (actual.token !== identity.token || actual.digest !== identity.digest || actual.count !== identity.count) {
+    browser.cache.known_page_sets.delete(identity.token);
+    return { hashes: [], status: "miss" };
+  }
+  browser.cache.known_page_sets.delete(identity.token);
+  browser.cache.known_page_sets.set(identity.token, hashes);
+  return { hashes: [...hashes], status: "hit" };
+}
+
+function rememberShadowBrowserKnownPageHashSet(
+  browser: ShadowBrowserNode,
+  hashes: Iterable<string>
+): { identity: ShadowKnownPageHashSetIdentity; hashes: string[] } {
+  const registered = shadowKnownPageHashSet(hashes);
+  browser.cache.known_page_sets.delete(registered.identity.token);
+  browser.cache.known_page_sets.set(registered.identity.token, registered.hashes);
+  while (browser.cache.known_page_sets.size > MAX_SHADOW_BROWSER_KNOWN_PAGE_SETS) {
+    const oldest = browser.cache.known_page_sets.keys().next().value;
+    if (typeof oldest !== "string") break;
+    browser.cache.known_page_sets.delete(oldest);
+  }
+  return registered;
 }
 
 function shadowBrowserTurnExecReplyEnvelope(

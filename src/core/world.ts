@@ -213,6 +213,10 @@ type CommandOptions = {
   deferHostEffect?: (effect: DeferredHostEffect) => void;
 };
 
+type ObjectMatchOptions = {
+  commandSurfaceOnly?: boolean;
+};
+
 type PublicCommandLocationOptions = {
   skipPresenceCheck?: boolean;
 };
@@ -10871,11 +10875,12 @@ export class WooWorld {
     if (!text) return await this.commandHuhPlan(ctx, space, input, "empty command");
     const actor = await this.publicCommandActor(ctx, undefined);
     const location = await this.publicCommandLocation(ctx, actor, space, options);
+    const matchOptions: ObjectMatchOptions = { commandSurfaceOnly: true };
 
-    const lowered = await this.lowerSpeechPrefixPlan(ctx, text, space, actor, location);
+    const lowered = await this.lowerSpeechPrefixPlan(ctx, text, space, actor, location, matchOptions);
     if (lowered) return lowered as unknown as WooValue;
 
-    const cmd = await this.parseCommandMap(text, ctx, location, actor);
+    const cmd = await this.parseCommandMap(text, ctx, location, actor, matchOptions);
     if (cmd.verb === "drop" && !cmd.argstr) return await this.commandHuhPlan(ctx, space, text, "Drop what?");
     const metadataPlan = await this.resolveCommandPlan(ctx, cmd, space, actor);
     if (metadataPlan) return metadataPlan as unknown as WooValue;
@@ -10885,13 +10890,13 @@ export class WooWorld {
     return await this.commandHuhPlan(ctx, space, text, "I don't understand that.");
   }
 
-  private async lowerSpeechPrefixPlan(ctx: CallContext, text: string, space: ObjRef, actor: ObjRef, location: ObjRef | null): Promise<CommandPlan | WooValue | null> {
+  private async lowerSpeechPrefixPlan(ctx: CallContext, text: string, space: ObjRef, actor: ObjRef, location: ObjRef | null, matchOptions: ObjectMatchOptions = {}): Promise<CommandPlan | WooValue | null> {
     const lower = text.toLowerCase();
     const parsed = new Map<string, Promise<CommandMap>>();
     const parse = async (normalized: string) => {
       const existing = parsed.get(normalized);
       if (existing) return await existing;
-      const next = this.parseCommandMap(normalized, ctx, location, actor);
+      const next = this.parseCommandMap(normalized, ctx, location, actor, matchOptions);
       parsed.set(normalized, next);
       return await next;
     };
@@ -10932,10 +10937,10 @@ export class WooWorld {
       return await this.commandPlanForResolved(ctx, space, actor, "eval", [body], cmd);
     }
     if (text.startsWith("`") && text.length > 1) {
-      return await this.directedSpeechPlan(ctx, space, "say_to", text.slice(1), text, actor, location);
+      return await this.directedSpeechPlan(ctx, space, "say_to", text.slice(1), text, actor, location, matchOptions);
     }
     if (lower.startsWith("/tell ")) {
-      return await this.directedSpeechPlan(ctx, space, "tell", text.slice(6), text, actor, location);
+      return await this.directedSpeechPlan(ctx, space, "tell", text.slice(6), text, actor, location, matchOptions);
     }
     if (text.startsWith("[")) {
       const close = text.indexOf("]");
@@ -10950,9 +10955,9 @@ export class WooWorld {
     return null;
   }
 
-  private async directedSpeechPlan(ctx: CallContext, space: ObjRef, verbName: string, rest: string, original: string, actor: ObjRef, location: ObjRef | null): Promise<CommandPlan | WooValue> {
+  private async directedSpeechPlan(ctx: CallContext, space: ObjRef, verbName: string, rest: string, original: string, actor: ObjRef, location: ObjRef | null, matchOptions: ObjectMatchOptions = {}): Promise<CommandPlan | WooValue> {
     const normalized = `${verbName} ${rest.trim()}`;
-    const cmd = await this.parseCommandMap(normalized, ctx, location, actor);
+    const cmd = await this.parseCommandMap(normalized, ctx, location, actor, matchOptions);
     const target = cmd.dobj_prefix;
     const body = cmd.dobj_prefix_rest.trim();
     if (!target || !body) return await this.commandHuhPlan(ctx, space, original, "Directed speech needs a recipient and text.");
@@ -11199,7 +11204,7 @@ export class WooWorld {
     return null;
   }
 
-  private async parseCommandMap(text: string, ctx: CallContext, location: ObjRef | null, actor: ObjRef = ctx.actor): Promise<CommandMap> {
+  private async parseCommandMap(text: string, ctx: CallContext, location: ObjRef | null, actor: ObjRef = ctx.actor, matchOptions: ObjectMatchOptions = {}): Promise<CommandMap> {
     const trimmed = text.trim();
     if (!trimmed) throw wooError("E_INVARG", "empty command");
     const tokens = tokenizeCommand(trimmed);
@@ -11212,9 +11217,9 @@ export class WooWorld {
     const iobjTokens = prepMatch ? restTokens.slice(prepMatch.index + prepMatch.length) : [];
     const dobjstr = tokenPhrase(dobjTokens);
     const iobjstr = tokenPhrase(iobjTokens);
-    const dobjMatch = dobjstr ? await this.matchObjectForActorAsync(dobjstr, ctx, location, actor) : null;
-    const iobjMatch = iobjstr ? await this.matchObjectForActorAsync(iobjstr, ctx, location, actor) : null;
-    const prefix = await this.longestObjectPrefix(restTokens, ctx, location, actor);
+    const dobjMatch = dobjstr ? await this.matchObjectForActorAsync(dobjstr, ctx, location, actor, matchOptions) : null;
+    const iobjMatch = iobjstr ? await this.matchObjectForActorAsync(iobjstr, ctx, location, actor, matchOptions) : null;
+    const prefix = await this.longestObjectPrefix(restTokens, ctx, location, actor, matchOptions);
     const prefixTokens = prefix ? restTokens.slice(0, prefix.length) : [];
     const prefixRestTokens = prefix ? restTokens.slice(prefix.length) : [];
     const verb = verbToken.value.toLowerCase();
@@ -11250,16 +11255,16 @@ export class WooWorld {
     };
   }
 
-  private async longestObjectPrefix(tokens: ParsedToken[], ctx: CallContext, location: ObjRef | null, actor: ObjRef = ctx.actor): Promise<{ object: ObjRef; end: number; length: number } | null> {
+  private async longestObjectPrefix(tokens: ParsedToken[], ctx: CallContext, location: ObjRef | null, actor: ObjRef = ctx.actor, matchOptions: ObjectMatchOptions = {}): Promise<{ object: ObjRef; end: number; length: number } | null> {
     for (let length = tokens.length; length >= 1; length--) {
       const phrase = tokenPhrase(tokens.slice(0, length));
-      const match = await this.matchObjectForActorAsync(phrase, ctx, location, actor);
+      const match = await this.matchObjectForActorAsync(phrase, ctx, location, actor, matchOptions);
       if (match.status === "ok") return { object: match.value, end: tokens[length - 1].end, length };
     }
     return null;
   }
 
-  private async matchObjectForActorAsync(name: string, ctx: CallContext, location: ObjRef | null, actor: ObjRef = ctx.actor): Promise<ObjectMatch> {
+  private async matchObjectForActorAsync(name: string, ctx: CallContext, location: ObjRef | null, actor: ObjRef = ctx.actor, matchOptions: ObjectMatchOptions = {}): Promise<ObjectMatch> {
     const wanted = name.trim();
     if (!wanted) return this.matchSentinel("failed");
     const lower = wanted.toLowerCase();
@@ -11311,13 +11316,14 @@ export class WooWorld {
       // Actor inventory is part of local matching, but a missing/stale actor stub
       // should not make room command parsing fail.
     }
-    return await this.matchObjectInCandidatesAsync(ctx, wanted, candidates);
+    return await this.matchObjectInCandidatesAsync(ctx, wanted, candidates, matchOptions);
   }
 
   private async matchObjectInCandidatesAsync(
     ctx: CallContext,
     name: string,
-    candidates: Array<{ id: ObjRef; carrying: boolean }> | ObjRef[]
+    candidates: Array<{ id: ObjRef; carrying: boolean }> | ObjRef[],
+    matchOptions: ObjectMatchOptions = {}
   ): Promise<ObjectMatch> {
     const wanted = name.trim();
     if (!wanted) return this.matchSentinel("failed");
@@ -11349,7 +11355,7 @@ export class WooWorld {
     // parallel. With ~10 candidates and per-candidate verb dispatches
     // (titleForLook, $note text), the serial form was the dominant cost of
     // an unhandled chat utterance like "well this is fun".
-    const enriched = await Promise.all(ids.map((id) => this.enrichMatchCandidate(ctx, id, remoteSummaries.summaries.get(id) ?? null)));
+    const enriched = await Promise.all(ids.map((id) => this.enrichMatchCandidate(ctx, id, remoteSummaries.summaries.get(id) ?? null, matchOptions)));
     for (const { id, names, aliases } of enriched) {
       const carrying = tierOf.get(id) === true;
       const nameValues = names.filter(Boolean).map((item) => String(item).toLowerCase());
@@ -11371,7 +11377,7 @@ export class WooWorld {
     return this.resolveObjectMatch(locationBody);
   }
 
-  private async enrichMatchCandidate(ctx: CallContext, id: ObjRef, summary: HostObjectSummary | null): Promise<{ id: ObjRef; names: string[]; aliases: string[] }> {
+  private async enrichMatchCandidate(ctx: CallContext, id: ObjRef, summary: HostObjectSummary | null, matchOptions: ObjectMatchOptions = {}): Promise<{ id: ObjRef; names: string[]; aliases: string[] }> {
     const names: string[] = [id];
     const aliases: string[] = [];
     if (await this.remoteHostForObject(id, ctx.hostMemo)) {
@@ -11400,11 +11406,19 @@ export class WooWorld {
     if (!this.objects.has(id)) return { id, names, aliases };
     const name = this.getProp(id, "name");
     if (typeof name === "string") names.push(name);
-    const [title] = await Promise.all([
-      this.titleForLook(ctx, ctx.thisObj, id).catch(() => null),
-      this.addCatalogMatchNames(ctx, id, names)
-    ]);
-    if (typeof title === "string") names.push(title);
+    // Command planning has a bounded syntax surface: ids, names, aliases, and
+    // catalog-declared :match_names(). Generic $match:match_object retains the
+    // richer presentation-title fallback for compatibility, but browser
+    // command seeds must not pull arbitrary title/read state into the hot path.
+    if (matchOptions.commandSurfaceOnly === true) {
+      await this.addCatalogMatchNames(ctx, id, names);
+    } else {
+      const [title] = await Promise.all([
+        this.titleForLook(ctx, ctx.thisObj, id).catch(() => null),
+        this.addCatalogMatchNames(ctx, id, names)
+      ]);
+      if (typeof title === "string") names.push(title);
+    }
     const localAliases = this.propOrNull(id, "aliases");
     if (Array.isArray(localAliases)) aliases.push(...localAliases.map((item) => String(item)));
     return { id, names, aliases };

@@ -1269,10 +1269,16 @@ stale presence. `session_objects` is a compatibility request field for older
 callers that do not send `authority`; authority-bearing requests MUST leave it
 empty, including when the authority itself is a legacy object-row slice.
 An internal open/envelope MUST carry the request's already-authenticated session
-row in both the request `sessions` list and the authority slice's `sessions`
-list. Sparse gateway authority reconstruction MAY omit unrelated sessions, but
-it MUST NOT omit the bound caller session; the CommitScopeDO derives
-browser-session claims from that row before validating the request token.
+row exactly once. On an authority-bearing request it rides in the authority
+slice's `sessions` list, and the top-level request `sessions` list is left empty
+— the same legacy-empty contract as `session_objects`. The CommitScopeDO reads
+`authority.sessions` and only falls back to the top-level `sessions` list when no
+authority slice is present (a no-authority caller, or the warm slim path that
+strips the slice — see below), so duplicating the row at the top level is dead
+wire weight. Sparse gateway authority reconstruction MAY omit unrelated
+sessions, but it MUST NOT omit the bound caller session; the CommitScopeDO
+derives browser-session claims from that row before validating the request
+token.
 After a client has opened a scope and the CommitScopeDO has a durable planning
 snapshot, an MCP per-envelope refresh MAY omit remote object-owner rows and
 fall back to that snapshot for execution state. The request MUST still carry
@@ -1537,10 +1543,16 @@ from missing `TurnKey` atom preimages:
 
 The transfer also carries the session/log/counter envelope data needed to
 execute the turn in a small shard. Page refs can be advertised from cache; only
-unknown pages are inlined. Install verifies inline pages against their
-advertised page hashes and verifies a state-transfer proof scoped to an anchor
-authority and recipient node. State transfer is driven by exact post-selection
-inventory gaps instead of copying the whole world or whole object records.
+unknown pages are inlined. A browser MAY replace repeated full known-page hash
+echoes with a relay-issued `woo.known_page_hash_set.v1` identity for the
+same held-page set. That identity is only an omission hint: if the relay does
+not recognize it, it must serve a correct larger transfer by treating all pages
+as unknown. A request that carries neither explicit known-page hashes nor a
+recognized identity is likewise a request for the relay to inline the selected
+closure. Install verifies inline pages against their advertised page hashes and
+verifies a state-transfer proof scoped to an anchor authority and recipient node.
+State transfer is driven by exact post-selection inventory gaps instead of
+copying the whole world or whole object records.
 
 ### VTN12.1 Commit-reply warm cache-fill (B7)
 
