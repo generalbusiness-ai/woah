@@ -134,12 +134,16 @@ export type McpV2ClientHooks = {
 // that planned the turn; its top-level authority is the validation seed for
 // actor/session/read cells missing from that scope's durable snapshot, so it is
 // not safe to slim.
-function slimMcpEnvelopeBody(body: McpV2EnvelopeBody): McpV2EnvelopeBody {
+export function slimMcpEnvelopeBody(body: McpV2EnvelopeBody): McpV2EnvelopeBody {
   if (body.planned_transcript_commit === true) return body;
   const { authority, session_objects, ...rest } = body;
-  void authority;
   void session_objects;
-  return { ...rest, session_objects: [] };
+  // Authority-bearing bodies leave the top-level `sessions` empty because the
+  // receiver reads `authority.sessions` (see executorEnvelopeBody). Slimming
+  // removes the authority slice, so carry its session rows forward as the
+  // top-level fallback the CommitScopeDO turn path reads once `authority` is
+  // gone. Without this the slimmed body would arrive with neither copy.
+  return { ...rest, sessions: authority?.sessions ?? rest.sessions ?? [], session_objects: [] };
 }
 
 export type McpV2OpenBody = {

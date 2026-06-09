@@ -390,7 +390,13 @@ describe("v2 MCP e2e", () => {
       const envelopeBody = actorPosts[actorEnvelopeIndex].body;
       const envelopeSessions = envelopeBody.sessions as Array<{ id?: string; actor?: string }>;
       const authoritySessions = (envelopeBody.authority as { sessions?: Array<{ id?: string; actor?: string }> }).sessions ?? [];
-      expect(envelopeSessions).toEqual(expect.arrayContaining([expect.objectContaining({ id: secondSession, actor: secondActor })]));
+      // Dedup contract: an authority-bearing envelope carries the session rows
+      // exactly once, inside the authority slice. The top-level `sessions` field
+      // is left empty (the CommitScopeDO turn path reads `authority.sessions`),
+      // so the session list is not double-serialized on the wire. A
+      // planned-transcript commit is never slimmed, so its authority slice — and
+      // hence the bound session — is still present here.
+      expect(envelopeSessions).toEqual([]);
       expect(authoritySessions).toEqual(expect.arrayContaining([expect.objectContaining({ id: secondSession, actor: secondActor })]));
       const envelope = decodeEnvelope(String(actorPosts[actorEnvelopeIndex].body.envelope));
       const expected = (envelope.body as { expected?: { seq?: unknown } }).expected;

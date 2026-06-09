@@ -1788,6 +1788,11 @@ export class CommitScopeDO {
       // thin-warm-envelope verification.
       capsule_authority_bytes: 0,
       capsule_present: Boolean(input.execution_capsule),
+      // Authority-bearing envelopes carry the session rows once inside the
+      // authority slice (counted in authority_bytes) and leave this top-level
+      // field empty, so this reads ~0 on full-authority turns by design. It is
+      // only non-zero on the warm slim path, where the slice is stripped and the
+      // rows are carried here instead (see slimMcpEnvelopeBody).
       sessions_bytes: input.sessions ? jsonByteLength(input.sessions) : 0,
       session_objects_bytes: input.session_objects ? jsonByteLength(input.session_objects) : 0,
       envelope_bytes: input.envelope ? input.envelope.length : 0

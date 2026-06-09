@@ -13,12 +13,14 @@ import {
   mergeExecutorAuthority,
   submitTurnIntent,
   executorAuthorityPayload,
+  executorEnvelopeBody,
   executorEnvelopeId,
   executorAuthorityObjectIds,
   executorObjectIdsFromMissingState,
   executorReplyNeedsRepair,
   type ExecutorEnvelopeBody
 } from "../src/core/executor";
+import { slimMcpEnvelopeBody, type McpV2EnvelopeBody } from "../src/mcp/gateway";
 import type { MetricEvent, ObjRef } from "../src/core/types";
 
 describe("v2 turn gateway", () => {
@@ -706,6 +708,110 @@ describe("v2 turn gateway", () => {
       session.actor
     ]));
     expect(result.reply?.ok).toBe(true);
+  });
+});
+
+describe("envelope session dedup", () => {
+  // The session rows used to be serialized twice on every authority-bearing
+  // envelope: once at the top level and again inside the authority slice
+  // (executorAuthorityPayload set `sessions: authority.sessions`). The receiver
+  // reads `authority.sessions` and only falls back to the top-level field, so the
+  // top-level copy was dead wire weight. These tests lock down the dedup: the
+  // wire body carries the rows exactly once (in the slice), and the warm slim
+  // path — which strips the slice — carries them forward as the fallback.
+  it("leaves the top-level sessions empty while the authority slice keeps the rows", () => {
+    const world = createWorld();
+    const session = world.auth("guest:v2-session-dedup");
+
+    const payload = executorAuthorityPayload(world, [session.actor]);
+    // The in-process payload still exposes sessions for callers that read it
+    // before serialization (gateway session splice, dev/REST merges).
+    expect(payload.sessions.map((s) => s.id)).toContain(session.id);
+    expect(payload.authority.sessions.map((s) => s.id)).toContain(session.id);
+
+    const body = executorEnvelopeBody({
+      scope: "the_chatroom" as ObjRef,
+      node: "mcp:dedup",
+      turn: {
+        route: "sequenced",
+        scope: "the_chatroom" as ObjRef,
+        session: session.id,
+        actor: session.actor,
+        target: "the_chatroom" as ObjRef,
+        verb: "say",
+        args: [],
+        persistence: "durable",
+        token: "dedup-token"
+      },
+      authority: payload,
+      envelope: "ENVELOPE"
+    });
+
+    // The wire body carries the rows exactly once — in the authority slice.
+    expect(body.sessions).toEqual([]);
+    expect(body.session_objects).toEqual([]);
+    expect(body.authority.sessions.map((s) => s.id)).toContain(session.id);
+  });
+
+  it("slim warm path strips the authority slice but carries its sessions forward", () => {
+    const world = createWorld();
+    const session = world.auth("guest:v2-session-dedup-slim");
+
+    const payload = executorAuthorityPayload(world, [session.actor]);
+    const body = executorEnvelopeBody({
+      scope: "the_chatroom" as ObjRef,
+      node: "mcp:dedup-slim",
+      turn: {
+        route: "sequenced",
+        scope: "the_chatroom" as ObjRef,
+        session: session.id,
+        actor: session.actor,
+        target: "the_chatroom" as ObjRef,
+        verb: "say",
+        args: [],
+        persistence: "durable",
+        token: "dedup-slim-token"
+      },
+      authority: payload,
+      envelope: "ENVELOPE"
+    });
+
+    const slim = slimMcpEnvelopeBody(body as unknown as McpV2EnvelopeBody);
+    // Authority slice removed (the scope rehydrates from its durable snapshot)...
+    expect(slim.authority).toBeUndefined();
+    // ...but the bound session rows are preserved at the top level so the
+    // receiver's `authority?.sessions ?? input.sessions` fallback still resolves.
+    expect(slim.sessions.map((s) => s.id)).toContain(session.id);
+  });
+
+  it("never slims a planned-transcript commit (its authority is the validation seed)", () => {
+    const world = createWorld();
+    const session = world.auth("guest:v2-session-dedup-planned");
+    const payload = executorAuthorityPayload(world, [session.actor]);
+    const body = executorEnvelopeBody({
+      scope: "the_chatroom" as ObjRef,
+      node: "mcp:dedup-planned",
+      turn: {
+        route: "sequenced",
+        scope: "the_chatroom" as ObjRef,
+        session: session.id,
+        actor: session.actor,
+        target: "the_chatroom" as ObjRef,
+        verb: "enter",
+        args: [],
+        persistence: "durable",
+        token: "dedup-planned-token"
+      },
+      authority: payload,
+      envelope: "ENVELOPE",
+      plannedTranscriptCommit: true
+    });
+
+    const slim = slimMcpEnvelopeBody(body as unknown as McpV2EnvelopeBody);
+    // Returned unchanged: authority retained, top-level sessions still empty.
+    expect(slim.authority).toBeDefined();
+    expect(slim.sessions).toEqual([]);
+    expect(slim.authority?.sessions.map((s) => s.id)).toContain(session.id);
   });
 });
 
