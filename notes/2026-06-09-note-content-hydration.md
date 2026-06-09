@@ -126,6 +126,25 @@ Three findings from review, all fixed:
   clean full runs); additionally marked `test.describe.configure({ mode: "serial" })`
   so these timing-sensitive probes don't contend for the single dev server.
 
+## Tab-navigation finding (round 3) — pre-existing, fixed
+User report: navigating tool→tool within one live session (no reload), the SECOND
+tool shows structure but no readable text (and pinboard "chat never shows").
+
+Investigated in-browser, two contexts (a fresh actor B reads content actor A made):
+- **The chat-panel report was a test-selector false alarm** — the companion mounts
+  and is visible on the live transition (verified `ambient-companion-shell` parent).
+- **Pinboard-second no-text is a real PRE-EXISTING bug** (reproduced on `main`,
+  commit 8c6f667). The pinboard note-text hydration is gated on actor presence, and
+  the one-shot trigger in `refreshScopedProjection` runs BEFORE the live-transition
+  `enter` establishes presence, then never retries → the second tool's existing
+  notes render with empty text. Fix: also call the (idempotent, deduped)
+  `hydratePinboardNotesTextIfNeeded` from `mountPinboardComponent`, so it retries on
+  the render that follows presence landing. Verified: a fresh actor now sees the
+  existing note text on the second tool. Regression: `e2e/tool-nav-hydration.spec.ts`.
+- **Outliner-second** is NOT presence-gated; for a fresh actor its text loads via the
+  normal hydration (slower, scope-open-bound) and for a returning actor the display
+  cache paints it instantly — no hard failure, just first-visit latency.
+
 ## Result (measured, e2e/note-hydration-perf.spec.ts)
 - Baseline: **~4918ms** structure→text (outliner, 10 items).
 - After fixes: **outliner ~24ms**, **pinboard ~24ms** structure→text; stable across

@@ -4375,6 +4375,13 @@ function mountPinboardComponent() {
   // Persist whatever text this render knows so a later cold reload paints it with
   // the structure (the authoritative list_notes hydration still runs).
   writePinboardTextCache(boardId, notes);
+  // Retry the note-text hydration on every pinboard render. It is gated on actor
+  // presence (a board read needs the actor in the room) and deduplicated by the
+  // hydrator, so this is cheap and idempotent — but it is essential when arriving
+  // via a live tool-to-tool tab switch: the one-shot trigger in refreshScopedProjection
+  // runs before the `enter` establishes presence, so without this retry the second
+  // tool's existing notes render with empty text until the next full refresh.
+  hydratePinboardNotesTextIfNeeded(pinboard);
   const actorRefs = new Set<string>([...present]);
   for (const note of notes) {
     for (const ref of [note?.author, note?.owner, note?.updated_by]) if (typeof ref === "string") actorRefs.add(ref);
