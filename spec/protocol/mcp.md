@@ -227,13 +227,16 @@ view. The preferred open is `open_protocol: "head_session.v1"` so warm
 CommitScopeDOs return only the current head and never build an executable seed.
 If the selected scope is cold, the gateway may retry the same protocol with a
 seed snapshot. The following envelope MUST carry the gateway-authenticated MCP
-session row in both the request `sessions` list and the authority slice's
-`sessions` list, even when sparse authority reconstruction omitted the session
-row, so the CommitScopeDO can derive and validate the browser-session token.
-That planned-transcript envelope is not eligible for slim warm-envelope
-authority omission: the selected CommitScopeDO may already have a durable
-snapshot while still missing the caller's actor row or other cells the gateway
-read while planning.
+session row in the authority slice's `sessions` list, even when sparse authority
+reconstruction omitted the session row, so the CommitScopeDO can derive and
+validate the browser-session token. The top-level request `sessions` list is
+left empty on this authority-bearing envelope; the CommitScopeDO reads
+`authority.sessions` and the top-level field is only the no-authority/slim-path
+fallback (§v2-turn-network "internal open/envelope"). The planned-transcript
+envelope is not eligible for slim warm-envelope authority omission — the
+selected CommitScopeDO may already have a durable snapshot while still missing
+the caller's actor row or other cells the gateway read while planning — so its
+authority slice (and hence the bound session row) is always present on the wire.
 
 ### M3.1 Working set: `$actor:focus`
 
