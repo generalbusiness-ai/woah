@@ -7,6 +7,8 @@ coverage/
 .dev.vars
 .mcp.json
 .woo/
+# Local workerd state created by `wrangler dev` (smoke:cf-dev lane).
+.wrangler/
 .claude/
 .clawpatch/
 test-results/

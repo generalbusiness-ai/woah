@@ -219,6 +219,22 @@ else
   ok "tests pass ($(echo "$test_out" | grep -oE 'Tests +[0-9]+ passed' | head -1))"
 fi
 
+# Local workerd smoke (item 1). Runs the SAME cross-actor scenario as the
+# deployed smoke below, but against `wrangler dev` (real workerd, real per-DO
+# storage, real cross-DO RPC and host-seed merge) — a far higher-fidelity
+# pre-deploy gate than the in-process fake (`smoke:cf-local`, run by `npm test`
+# above). It is NOT a full prod replica: workerd-local runs every DO in one
+# process with fast reliable RPC, so cross-colo-latency / cold-owner-timeout
+# authority gaps remain a deploy-only signal. Gate it independently so a flaky
+# local workerd never blocks an emergency redeploy.
+if [[ "${WOO_DEPLOY_CF_DEV:-1}" == "0" || $SKIP_TESTS -eq 1 ]]; then
+  warn "skipping local workerd smoke (smoke:cf-dev)"
+else
+  cf_dev_out=$(npm run smoke:cf-dev 2>&1) \
+    || { echo "$cf_dev_out" | grep -aE '^(  ok|  FAIL|summary\[|smoke-cf-dev)' | tail -20; fail "local workerd smoke failed — run: npm run smoke:cf-dev"; }
+  ok "workerd smoke: $(echo "$cf_dev_out" | grep -oE 'summary\[[a-z0-9]+\]: [0-9]+/[0-9]+ steps passed' | head -1)"
+fi
+
 # ===========================================================================
 banner "Build"
 # ===========================================================================

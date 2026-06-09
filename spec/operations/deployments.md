@@ -31,11 +31,26 @@ This section does **not** apply to in-memory or local SQLite modes. Those runtim
 
 - **In-memory mode** (tests). Run with `LocalSQLiteRepository(":memory:")` from [`src/server/sqlite-repository.ts`](../../src/server/sqlite-repository.ts); no disk persistence and reset on process exit.
 - **Local SQLite mode** (single-node local system). Use `npm run dev` (default `WOO_DB=.woo/dev.sqlite`) or set `WOO_DB` for custom path/in-memory behavior.
-- **Local Cloudflare-shape smoke**. Run `npm run smoke:cf-local` before a real
-  Cloudflare smoke/deploy when validating cross-actor behavior. It drives the
-  Worker entrypoint through fake Durable Object namespaces, MCP gateway shards,
-  CommitScopeDOs, host seeds, and HOST_SEED_KV, so it covers distributed runtime
-  boundaries that `npm run dev` cannot exercise.
+- **Cloudflare-shape smoke (three-lane ladder)**. One cross-actor scenario
+  ([`scripts/smoke/scenario.ts`](../../scripts/smoke/scenario.ts)) runs on three
+  lanes of increasing fidelity before a real deploy:
+  1. `npm run smoke:cf-local` — the in-process fake Durable Object namespaces
+     ([`tests/worker/fake-do.ts`](../../tests/worker/fake-do.ts)). Drives the
+     Worker entrypoint through MCP gateway shards, CommitScopeDOs, host seeds, and
+     HOST_SEED_KV. Fast, but every DO is one synchronous in-process object sharing
+     one imported world: it does **not** model cold start, RPC timeouts, per-DO
+     storage isolation, or serialization boundaries.
+  2. `npm run smoke:cf-dev` — **real workerd** via `wrangler dev`
+     ([`wrangler.smoke.toml`](../../wrangler.smoke.toml)): real per-DO storage,
+     cross-DO RPC, and host-seed merge. Catches storage/RPC/merge regressions the
+     fake cannot. Run before a real Cloudflare deploy.
+  3. The deployed walkthrough ([`scripts/smoke-walkthrough.ts`](../../scripts/smoke-walkthrough.ts))
+     over MCP HTTP — the most expensive lane.
+
+  Fidelity is a ladder, not a guarantee: workerd-local still runs every DO in one
+  process with fast reliable RPC, so cross-colo-latency / cold-owner-timeout
+  authority gaps remain a deploy-only signal until fault injection lands
+  (`notes/2026-06-09-cf-smoke-unified-lanes.md`).
 
 ---
 
