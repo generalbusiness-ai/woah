@@ -1,10 +1,27 @@
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { startLocalMcpSmokeServer, type LocalMcpSmokeServer } from "./local-mcp-harness";
 
-const baseUrl = process.env.WOO_MCP_SMOKE_BASE_URL?.replace(/\/+$/, "");
-const describeRemote = baseUrl ? describe : describe.skip;
+// With WOO_MCP_SMOKE_BASE_URL set this smoke runs against a deployed worker.
+// Without it, it boots a local in-process MCP server (see local-mcp-harness.ts)
+// so the streamable-HTTP MCP surface always has a local gate instead of
+// silently skipping the whole suite.
+const remoteBaseUrl = process.env.WOO_MCP_SMOKE_BASE_URL?.replace(/\/+$/, "");
+let baseUrl = remoteBaseUrl;
+let localServer: LocalMcpSmokeServer | undefined;
 const runId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
-describeRemote("deployed v2 MCP smoke", () => {
+beforeAll(async () => {
+  if (!baseUrl) {
+    localServer = await startLocalMcpSmokeServer();
+    baseUrl = localServer.baseUrl;
+  }
+});
+
+afterAll(async () => {
+  await localServer?.close();
+});
+
+describe("v2 MCP smoke (deployed worker or local in-process server)", () => {
   it("initializes, lists tools, commits a catalog call, and delivers the observation to another session", async () => {
     const alice = await RemoteMcpSession.open(`guest:mcp-smoke-alice-${runId}`);
     const bob = await RemoteMcpSession.open(`guest:mcp-smoke-bob-${runId}`);
@@ -54,15 +71,22 @@ describeRemote("deployed v2 MCP smoke", () => {
     const session = await RemoteMcpSession.open(`guest:mcp-smoke-sse-${runId}`);
     const events = session.openEvents();
     try {
+      await session.enterChatroom();
       await session.call("tools/list");
-      const focused = await session.call("tools/call", {
-        name: "woo_focus",
-        // `woo_focus` is a reachability promotion, not a global lookup. Use the
-        // active room so this smoke tests list_changed without depending on a
-        // retired or catalog-specific singleton such as the old taskspace.
-        arguments: { target: "the_chatroom" }
+      // list_changed fires only on a real reachability-digest change. Focusing
+      // the active room can NEVER fire it: `McpHost.reachable()` dedups by
+      // object id and the room is already present with origin "location", so
+      // the digest is identical before and after (this is why the previous
+      // `woo_focus the_chatroom` trigger silently produced no notification).
+      // A cross-room move is the canonical tool-surface change: the actor's
+      // location — and the new room's verb set — replace the old one. The
+      // chatroom's `southeast` exit (living room → deck) ships in the bundled
+      // demoworld catalog on every lane this smoke runs against.
+      const moved = await session.call("tools/call", {
+        name: "woo_call",
+        arguments: { object: "the_chatroom", verb: "southeast", args: [] }
       });
-      expect(focused.result?.isError).not.toBe(true);
+      expect(moved.result?.isError).not.toBe(true);
 
       const notification = await events.nextJson((value) => value?.method === "notifications/tools/list_changed", 5000);
       expect(notification).toMatchObject({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });
@@ -255,7 +279,7 @@ async function mcpFetch(input: {
   body?: unknown;
   signal?: AbortSignal;
 }): Promise<Response> {
-  if (!baseUrl) throw new Error("WOO_MCP_SMOKE_BASE_URL is required");
+  if (!baseUrl) throw new Error("MCP smoke base URL not resolved (beforeAll did not run?)");
   const headers = new Headers({
     accept: "application/json, text/event-stream",
     ...input.headers
