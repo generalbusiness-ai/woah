@@ -99,3 +99,30 @@ Gates green: typecheck; CA12.2 4/4; shadow/authority suites 83; npm test 384;
 test:worker 239; smoke:cf-local 4/4 (the lane that caught the delivery-edge
 regression); smoke:cf-dev 11/11. Deploy smoke pending explicit authorization.
 Did NOT strip source/bytecode; did NOT retry delivery-edge-only stripping.
+
+### Review follow-up (P2/P3) + rebase
+
+- P2 (correctness): `pageHashPreimage` now normalizes `line_map` to `{}`
+  UNCONDITIONALLY for verb_bytecode (covers populated, empty, AND absent). The
+  prior conditional left an absent property hashing differently from `{}`, which
+  would break mixed-version pairing during the rollout reseed convergence. Spec
+  CA12.2 wording tightened; added populated/empty/absent hash-equality test and a
+  hand-built MIXED-version materialization fixture (full-line_map refs + stripped
+  inline pages). CA12.2 now 6/6.
+- P3: the materialize test's "refs minted from full pages" story was stale after
+  Commit B (exportAuthoritySlice now strips on its own); split into an honest
+  end-state guard + the mixed-version fixture above.
+- Rebased clean onto main `10f6505` (note-content-hydration; client-only, no
+  server-file overlap). Re-ran post-rebase: authority slice 21/21, npm test 384,
+  test:worker 239, smoke:cf-dev --measure 11/11 with request_bytes still 26.2 MB.
+
+### Known orthogonal flake (NOT this change)
+
+`smoke:cf-local` step `move:southeast emits 'left' to bob` is intermittently
+flaky: the SAME commit `97a45ae` passed 4/4 then failed 2/2 later, HEAD failed
+then passed 4/4, and plain main also passes — failures cluster right after heavy
+back-to-back suites (load on the 10s in-process waitFor). No commit-rejection or
+hash-mismatch signal accompanies it. It is a pre-existing harness timing/shard
+nondeterminism on the cross-shard fanout step, present on main too, and is
+orthogonal to the line_map work. Worth a separate fix (deterministic wait or
+wider/again-polled timeout on that step).
