@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import { createWorld, createWorldFromSerialized, scopeSerializedWorldToHost } from "../src/core/bootstrap";
 import { installCatalogManifest, updateCatalogManifest, type CatalogManifest } from "../src/core/catalog-installer";
+import type { ProjectionWrite } from "../src/core/projection-delta";
 import type { SerializedWorld } from "../src/core/repository";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, Message, TinyBytecode, VerbDef } from "../src/core/types";
 import { dumpSerializedObjectsToJsonFolder, JsonFolderWorldRepository } from "../src/server/json-folder-repository";
@@ -413,6 +414,38 @@ describe("sqlite persistence", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("preserves live socket attachments across session projection upserts", () => {
+    const world = createWorld();
+    const session = world.auth("guest:projection-socket");
+    world.attachSocket(session.id, "ws-live");
+    const before = world.sessions.get(session.id);
+    expect(before?.attachedSockets.has("ws-live")).toBe(true);
+    expect(before?.lastDetachAt).toBeNull();
+
+    const write: ProjectionWrite = {
+      table: "sessions",
+      key: session.id,
+      op: "upsert",
+      row: {
+        id: session.id,
+        actor: session.actor,
+        started: session.started,
+        expiresAt: session.expiresAt + 60_000,
+        lastDetachAt: Date.now(),
+        tokenClass: session.tokenClass,
+        activeScope: "the_dubspace"
+      },
+      bytes: 1
+    };
+    world.applyProjectionWrites([write]);
+
+    const after = world.sessions.get(session.id);
+    expect(after?.attachedSockets.has("ws-live")).toBe(true);
+    expect(after?.attachedSockets.size).toBe(1);
+    expect(after?.lastDetachAt).toBeNull();
+    expect(after?.activeScope).toBe("the_dubspace");
   });
 
   it("recreates unversioned legacy SQLite databases", () => {

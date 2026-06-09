@@ -252,6 +252,10 @@ async function ensureSocketOpen(): Promise<void> {
 }
 let reconnectDelayMs = 500;
 const maxReconnectDelayMs = 10_000;
+const pendingTurnReplyTimeoutMs = (() => {
+  const configured = (globalThis as { __wooV2PendingTurnReplyTimeoutMs?: unknown }).__wooV2PendingTurnReplyTimeoutMs;
+  return typeof configured === "number" && Number.isFinite(configured) && configured > 0 ? configured : 15_000;
+})();
 let commandQueue: Promise<void> = Promise.resolve();
 let inboundFrameQueue: Promise<void> = Promise.resolve();
 const pendingStateTransfers = new Map<string, {
@@ -264,6 +268,7 @@ const pendingStateTransfers = new Map<string, {
   timer: number;
 }>();
 const pendingTurnExecRequests = new Map<string, ShadowTurnExecRequest>();
+const pendingTurnReplyTimers = new Map<string, number>();
 const postedAppliedFrameKeys = new Set<string>();
 const promotedAcceptedTranscriptHashes = new Set<string>();
 
@@ -1870,13 +1875,16 @@ async function invalidateTentativeTurn(
 ): Promise<void> {
   const records = await allTurnProposals();
   const anchor = v2TurnProposalForInvalidation(records, ids, transcriptHash);
-  if (!anchor) return;
-  await deleteTurnProposal(anchor.id);
+  if (anchor) await deleteTurnProposal(anchor.id);
+  const invalidatedIds = anchor
+    ? [anchor.id]
+    : Array.from(new Set(ids.filter((candidate) => typeof candidate === "string" && candidate.length > 0)));
+  if (invalidatedIds.length === 0) return;
   postMessage({
     kind: "local_turn_invalidated",
     id,
     reason,
-    invalidated_ids: [anchor.id],
+    invalidated_ids: invalidatedIds,
     ...(errors && errors.length > 0 ? { errors: Array.from(errors) } : {})
   });
 }
@@ -2044,11 +2052,119 @@ async function getMeta<T>(key: string): Promise<T | undefined> {
 
 async function putPending(value: PendingEnvelope): Promise<void> {
   await tx(PENDING_STORE, "readwrite", (store) => store.put(value));
+  schedulePendingTurnReplyTimeout(value);
 }
 
 async function deletePending(id: string): Promise<void> {
+  clearPendingTurnReplyTimeout(id);
   pendingTurnExecRequests.delete(id);
   await tx(PENDING_STORE, "readwrite", (store) => store.delete(id));
+}
+
+type PendingTurnInfo = {
+  id: string;
+  scope: string;
+  target: string;
+  verb: string;
+  route: "direct" | "sequenced";
+  persistence: "durable" | "live";
+};
+
+function pendingTurnInfoFromEnvelope(envelope: ShadowEnvelope): PendingTurnInfo | null {
+  if (envelope.type === "woo.turn.exec.request.shadow.v1") {
+    const request = envelope.body as ShadowTurnExecRequest;
+    return {
+      id: request.call.id ?? envelope.id,
+      scope: request.call.scope,
+      target: request.call.target,
+      verb: request.call.verb,
+      route: request.call.route,
+      persistence: request.call.route === "direct" ? "live" : "durable"
+    };
+  }
+  if (envelope.type === "woo.turn.intent.request.shadow.v1") {
+    const request = envelope.body as ShadowTurnIntentRequest;
+    return {
+      id: request.id ?? envelope.id,
+      scope: request.scope,
+      target: request.target,
+      verb: request.verb,
+      route: request.route,
+      persistence: request.persistence ?? (request.route === "direct" ? "live" : "durable")
+    };
+  }
+  return null;
+}
+
+function schedulePendingTurnReplyTimeout(pending: PendingEnvelope): void {
+  if (pendingTurnReplyTimers.has(pending.id)) return;
+  let info: PendingTurnInfo | null = null;
+  try {
+    info = pendingTurnInfoFromEnvelope(decodeEnvelope(pending.encoded));
+  } catch {
+    return;
+  }
+  if (!info) return;
+  const timer = workerScope.setTimeout(() => {
+    void expirePendingTurnReply(pending.id);
+  }, pendingTurnReplyTimeoutMs);
+  pendingTurnReplyTimers.set(pending.id, timer);
+}
+
+function clearPendingTurnReplyTimeout(id: string): void {
+  const timer = pendingTurnReplyTimers.get(id);
+  if (timer === undefined) return;
+  pendingTurnReplyTimers.delete(id);
+  workerScope.clearTimeout(timer);
+}
+
+async function expirePendingTurnReply(id: string): Promise<void> {
+  if (typeof postMessage !== "function") return;
+  pendingTurnReplyTimers.delete(id);
+  const startedAt = metricNow();
+  const pending = await getPending(id);
+  if (!pending || !pendingMatchesCurrentSession(pending)) return;
+  let info: PendingTurnInfo | null = null;
+  try {
+    info = pendingTurnInfoFromEnvelope(decodeEnvelope(pending.encoded));
+  } catch (err) {
+    postBrowserActivity({
+      phase: "turn_reply_timeout",
+      path: "decode_pending",
+      ms: metricElapsed(startedAt),
+      status: "error",
+      error: "E_BROWSER_PENDING_DECODE",
+      error_detail: errorMessage(err)
+    });
+    return;
+  }
+  if (!info) return;
+  await deletePending(id);
+  await deleteMatchingTentativeTurns([id, info.id]);
+  postMessage({
+    kind: "turn_result",
+    frame: {
+      op: "error",
+      id: info.id || id,
+      error: {
+        code: "E_V2_TURN_TIMEOUT",
+        message: "v2 browser worker timed out waiting for turn reply",
+        reason: "turn_timeout"
+      }
+    }
+  });
+  postBrowserActivity({
+    phase: "turn_reply_timeout",
+    path: info.verb,
+    route: info.route,
+    scope: info.scope,
+    ms: metricElapsed(startedAt),
+    status: "error",
+    reason: "turn_timeout",
+    error: "E_V2_TURN_TIMEOUT",
+    pending: (await allPending()).length
+  });
+  postStatus();
 }
 
 async function allPending(): Promise<PendingEnvelope[]> {
@@ -2447,7 +2563,10 @@ async function purgeStalePendingTurnExecRequestsForCurrentAuthority(): Promise<n
     const matches = pendingTurnExecMatchesCurrentSession(pending);
     if (matches === false) staleIds.add(pending.id);
   }
-  for (const id of staleIds) pendingTurnExecRequests.delete(id);
+  for (const id of staleIds) {
+    clearPendingTurnReplyTimeout(id);
+    pendingTurnExecRequests.delete(id);
+  }
   await deleteStoreKeys(PENDING_STORE, Array.from(staleIds));
   return staleIds.size;
 }

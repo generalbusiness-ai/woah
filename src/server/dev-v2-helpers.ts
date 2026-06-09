@@ -24,10 +24,11 @@
 
 import type { EffectTranscript } from "../core/effect-transcript";
 import { serializedFor, transcriptSessionActiveScope, transcriptTouchedObjectIds, type ShadowCommitAccepted } from "../core/shadow-commit-scope";
-import { fanOutHostWrites } from "../core/object-host-write-through";
+import { fanOutHostWrites, partitionProjectionWritesByHost } from "../core/object-host-write-through";
 import {
   browserProfileProjectionContext,
   browserProfileProjectionWriteFromAuthority,
+  projectionDeltaMissingWrites,
   summarizeProjectionWrites,
   type BrowserProfile,
   type ProjectionDeltaSummary,
@@ -82,6 +83,10 @@ export type DevHostWriteThroughOptions = {
   // object-host RPC failure (timeout/rejection) so tests can drive the
   // partial-fanout / E_RETRY contract without Cloudflare.
   onRemoteForward?: (hostKey: string) => void | Promise<void>;
+  // Accepted commit metadata lets localdev exercise the same projection-write
+  // materialization path CF uses once projection_delta is present. Omitted only
+  // by older transcript-mode tests.
+  commit?: ShadowCommitAccepted;
 };
 
 export async function materializeDevV2CommitLocally(
@@ -91,17 +96,59 @@ export async function materializeDevV2CommitLocally(
   options: DevHostWriteThroughOptions = {}
 ): Promise<void> {
   const routeHost = new Map(world.objectRoutes().map((route) => [route.id, route.host] as const));
-  const resolveHost = (id: ObjRef): string => routeHost.get(id) ?? DEV_WORLD_HOST;
+  const resolveHost = (id: ObjRef, fallbackHost = DEV_WORLD_HOST): string => routeHost.get(id) ?? fallbackHost;
   const localHostKey = resolveHost(scope);
   const forwardHook = async (host: string): Promise<void> => {
     if (options.onRemoteForward) await options.onRemoteForward(host);
   };
 
+  if (options.commit?.projection_delta) {
+    const projectionWrites = options.commit.projection_writes ?? [];
+    const missing = projectionDeltaMissingWrites(options.commit.projection_delta, projectionWrites);
+    if (missing.length > 0) {
+      throw wooError("E_PROJECTION_INCOMPLETE", "projection_delta upserts/deletes are missing row-body-complete projection_writes", {
+        scope,
+        missing
+      });
+    }
+    const slicesByHost = await partitionProjectionWritesByHost(
+      projectionWrites,
+      scope,
+      localHostKey,
+      (id) => resolveHost(id, localHostKey)
+    );
+    // Match CF projection-mode write-through: containers whose contents are
+    // derived from an authoritative cross-host move may receive an empty slice
+    // so applyProjectionWrites can rebuild their projection from the transcript.
+    for (const move of transcript.moves) {
+      for (const container of move.from && move.from !== move.to ? [move.to, move.from] : [move.to]) {
+        const host = resolveHost(container, localHostKey);
+        if (host && !slicesByHost.has(host)) slicesByHost.set(host, []);
+      }
+    }
+    await fanOutHostWrites<ProjectionWrite[]>({
+      localHostKey,
+      isGatewayHost: (host) => host === DEV_WORLD_HOST,
+      slicesByHost,
+      scope,
+      touched: projectionWrites.length,
+      retryMessage: "v2 commit accepted but localdev object-host projection write-through failed",
+      onMetric: (event) => world.recordMetric(event),
+      applyLocal: (writes) => {
+        world.applyProjectionWrites(writes, { transcript, hostKey: localHostKey, gatewayHost: localHostKey === DEV_WORLD_HOST });
+      },
+      forwardRemote: async (host, writes) => {
+        await forwardHook(host);
+        world.applyProjectionWrites(writes, { transcript, hostKey: host, gatewayHost: host === DEV_WORLD_HOST });
+      }
+    });
+    return;
+  }
+
   // localdev materializes in transcript mode: apply the accepted transcript per
   // touched host through the shared fan-out (local apply + in-process forward +
-  // E_RETRY). Projection-mode parity (branching on commit.projection_delta like
-  // CF's writeThroughProjectionWritesToObjectHosts) is deferred — see
-  // notes/2026-06-03-object-host-write-through-seam.md.
+  // E_RETRY). Older tests and commits without projection_delta still use this
+  // compatibility path; current durable commits use projection writes above.
   const createdIds = new Set(transcript.creates.map((create) => create.object));
   const hosts = new Set<string>();
   const addHostFor = (id: ObjRef | null | undefined): void => {
@@ -356,7 +403,9 @@ export async function executeDevV2DurableTurnFrame(input: {
   }
   if (!submitted.reply) throw wooError("E_INTERNAL", "dev v2 durable turn produced no reply");
   if (submitted.reply.ok && submitted.reply.commit && submitted.reply.transcript) {
-    await materializeDevV2CommitLocally(input.world, submitted.reply.commit.position.scope, submitted.reply.transcript);
+    await materializeDevV2CommitLocally(input.world, submitted.reply.commit.position.scope, submitted.reply.transcript, {
+      commit: submitted.reply.commit
+    });
   }
   // restFrameFromTurnReply throws turnReplyError on a rejected commit / !ok,
   // matching the legacy dev REST path.
@@ -540,7 +589,9 @@ async function computeDevV2DurableTurnWsReply(input: DevV2DurableWsReplyInput): 
     return { reply: shadowBrowserReplyEnvelopeForReceipt(input.browser, input.receipt, body), submitted };
   }
   if (submitted.reply.ok && submitted.reply.commit && submitted.reply.transcript) {
-    await materializeDevV2CommitLocally(input.world, submitted.reply.commit.position.scope, submitted.reply.transcript);
+    await materializeDevV2CommitLocally(input.world, submitted.reply.commit.position.scope, submitted.reply.transcript, {
+      commit: submitted.reply.commit
+    });
   }
   const receiverReply = devV2BrowserProfileTurnReply({
     reply: submitted.reply,

@@ -28,6 +28,7 @@ import { shadowTurnKeyFromCall, shadowTurnKeyFromTranscript } from "../src/core/
 
 describe("v2 browser worker integration", () => {
   afterEach(() => {
+    FakeWorkerScope.clearAllTimers();
     vi.unstubAllGlobals();
     vi.resetModules();
     FakeWebSocket.instances.length = 0;
@@ -384,6 +385,140 @@ describe("v2 browser worker integration", () => {
       browserMetric(message)?.path === "disconnect"
     );
     await sleep(20);
+  });
+
+  it("surfaces tentative invalidation even when the proposal row is missing", async () => {
+    const posted: unknown[] = [];
+    const scope = new FakeWorkerScope();
+    vi.stubGlobal("self", scope);
+    vi.stubGlobal("postMessage", (message: unknown) => posted.push(message));
+    vi.stubGlobal("indexedDB", new FakeIndexedDBFactory());
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+
+    await import("../src/client/v2-browser-worker");
+
+    const world = createWorld();
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-invalidate-missing");
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-invalidate-missing",
+      scope: "the_dubspace",
+      serialized: world.exportWorld()
+    });
+    const browser = createShadowBrowserClient({
+      node: "browser:v2-worker-invalidate-missing",
+      scope: "the_dubspace",
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: "token:v2-worker-invalidate-missing"
+    });
+
+    scope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-invalidate-missing",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    const socket = await waitForSocket();
+    socket.open();
+    socket.receive(encodeEnvelope({
+      ...relayEnvelope(browser, "transport-error-missing-proposal", "woo.transport.error.v1", {
+        kind: "woo.transport.error.v1",
+        code: "E_TEST",
+        message: "simulated transport rejection"
+      }),
+      reply_to: "missing-proposal-turn"
+    }));
+
+    expect(await waitForMessage(posted, (message) => isLocalTurnInvalidated(message, "missing-proposal-turn"))).toMatchObject({
+      kind: "local_turn_invalidated",
+      id: "missing-proposal-turn",
+      reason: "transport_error",
+      invalidated_ids: ["missing-proposal-turn"]
+    });
+  });
+
+  it("times out pending browser-built turns so the UI receives a final error", async () => {
+    const posted: unknown[] = [];
+    const scope = new FakeWorkerScope();
+    vi.stubGlobal("__wooV2PendingTurnReplyTimeoutMs", 20);
+    vi.stubGlobal("self", scope);
+    vi.stubGlobal("postMessage", (message: unknown) => posted.push(message));
+    vi.stubGlobal("indexedDB", new FakeIndexedDBFactory());
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+
+    await import("../src/client/v2-browser-worker");
+
+    const world = createWorld();
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-timeout");
+    world.setProp("the_dubspace", "operators", [session.actor]);
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-timeout",
+      scope: "the_dubspace",
+      serialized: world.exportWorld()
+    });
+    const browser = createShadowBrowserClient({
+      node: "browser:v2-worker-timeout",
+      scope: "the_dubspace",
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: "token:v2-worker-timeout"
+    });
+    const opened = await openShadowBrowserScope(browser);
+
+    scope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-timeout",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    const socket = await waitForSocket();
+    socket.open();
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "hello-timeout", "woo.transport.hello.v1", shadowBrowserTransportHello(browser))));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "transfer-timeout", opened.transfer.kind, opened.transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "exec-timeout", opened.executable_transfer.kind, opened.executable_transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "ad-timeout", "woo.exec_capability_ad.shadow.v1", opened.ads[0])));
+    await waitForMessage(posted, (message) => isReadyStatus(message));
+
+    scope.dispatch({
+      kind: "call",
+      id: "timed-out-turn",
+      route: "sequenced",
+      scope: "the_dubspace",
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.73],
+      persistence: "durable"
+    });
+    await waitForBrowserBuiltExecRequest(browser, socket, "set_control");
+    await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "timed-out-turn"));
+
+    expect(await waitForMessage(posted, (message) => isFinalTurnError(message, "timed-out-turn", "E_V2_TURN_TIMEOUT"))).toMatchObject({
+      kind: "turn_result",
+      frame: {
+        op: "error",
+        id: "timed-out-turn",
+        error: {
+          code: "E_V2_TURN_TIMEOUT",
+          reason: "turn_timeout"
+        }
+      }
+    });
+    const statusCursor = posted.filter((message) => isKind(message, "status")).length;
+    scope.dispatch({ kind: "cache_status" });
+    expect(await waitFor(() => posted.filter((message) => isKind(message, "status")).slice(statusCursor)[0])).toMatchObject({
+      status: {
+        pending: 0,
+        proposals: 0
+      }
+    });
   });
 
   it("does not render or replay a projection overlay for a cross-scope durable enter", async () => {
@@ -2814,6 +2949,7 @@ function browserWorkerSession(world: ReturnType<typeof createWorld>, token: stri
 }
 
 class FakeWorkerScope {
+  private static readonly timers = new Set<ReturnType<typeof setTimeout>>();
   private readonly listeners: Array<(event: MessageEvent) => void> = [];
 
   addEventListener(type: "message", listener: (event: MessageEvent) => void): void {
@@ -2821,11 +2957,22 @@ class FakeWorkerScope {
   }
 
   setTimeout(handler: () => void, timeout?: number): ReturnType<typeof setTimeout> {
-    return setTimeout(handler, timeout);
+    const timer = setTimeout(() => {
+      FakeWorkerScope.timers.delete(timer);
+      handler();
+    }, timeout);
+    FakeWorkerScope.timers.add(timer);
+    return timer;
   }
 
   clearTimeout(id: ReturnType<typeof setTimeout>): void {
+    FakeWorkerScope.timers.delete(id);
     clearTimeout(id);
+  }
+
+  static clearAllTimers(): void {
+    for (const timer of FakeWorkerScope.timers) clearTimeout(timer);
+    FakeWorkerScope.timers.clear();
   }
 
   dispatch(data: unknown): void {
@@ -3116,10 +3263,26 @@ function isLocalTurnNeedsReplan(message: unknown, id: string): boolean {
     ((message as { ids: unknown[] }).ids).includes(id);
 }
 
+function isLocalTurnInvalidated(message: unknown, id: string): boolean {
+  return isKind(message, "local_turn_invalidated") &&
+    (message as { id?: unknown }).id === id &&
+    Array.isArray((message as { invalidated_ids?: unknown }).invalidated_ids) &&
+    ((message as { invalidated_ids: unknown[] }).invalidated_ids).includes(id);
+}
+
 function isOptimisticTurnResult(message: unknown, id: string): boolean {
   return isKind(message, "turn_result") &&
     (message as { optimistic?: unknown }).optimistic === true &&
     (message as { frame?: { id?: unknown } }).frame?.id === id;
+}
+
+function isFinalTurnError(message: unknown, id: string, code?: string): boolean {
+  if (!isKind(message, "turn_result")) return false;
+  const candidate = message as { optimistic?: unknown; frame?: { op?: unknown; id?: unknown; error?: { code?: unknown } } };
+  return candidate.optimistic !== true &&
+    candidate.frame?.op === "error" &&
+    candidate.frame.id === id &&
+    (code === undefined || candidate.frame.error?.code === code);
 }
 
 function isComposeViewFor(message: unknown, id: string): boolean {
