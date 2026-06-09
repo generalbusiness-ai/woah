@@ -137,3 +137,69 @@ test("MEASURE: pinboard reload structure-to-text delay", async ({ page }) => {
   console.log(`NOTE_HYDRATION_DELAY pinboard items=${NOTE_COUNT} structure_to_text_ms=${delayMs} reload_to_structure_ms=${Math.round(tStructure - tReload)} reload_to_text_ms=${Math.round(tText - tReload)} wall_reload_epoch=${await page.evaluate(() => Date.now())}`);
   expect(delayMs, "pinboard reload structure->text delay regressed").toBeLessThan(1000);
 });
+
+// Genuine first-ever visit: the data exists on the server but THIS browser has
+// never cached it (empty localStorage — incognito / first load / different
+// device). The display cache cannot help here; this measures the routing-fix
+// path (serverRead + socket-open + tool-scope-direct connect) alone, so we know
+// honestly what a true first-time visitor sees. No tight gate — this is a probe.
+test("MEASURE: outliner cold load with EMPTY cache (true first visit)", async ({ page }) => {
+  test.setTimeout(120_000);
+  const tag = `nocache${Math.random().toString(36).slice(2, 7)}`;
+  await page.goto("/");
+  await continueAsGuestIfPrompted(page);
+  await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 10_000 });
+  await page.getByRole("button", { name: "Outliner" }).click();
+  await expect(page.getByRole("button", { name: "Outliner" })).toHaveClass(/active/);
+  const tree = page.locator("woo-outliner-tree[data-outliner-tree]");
+  await expect(tree).toBeVisible();
+  await expect(tree.getByRole("button", { name: "Leave" })).toBeVisible({ timeout: 10_000 });
+
+  const addInput = tree.locator("[data-outliner-add] input[name=text]");
+  const texts: string[] = [];
+  const ids: string[] = [];
+  for (let i = 0; i < ITEM_COUNT; i++) {
+    const itemText = `${tag}-item-${i}-readable`;
+    texts.push(itemText);
+    await addInput.fill(itemText);
+    await addInput.press("Enter");
+    const row = tree.locator(".outliner-row").filter({ hasText: itemText });
+    await expect(row).toHaveCount(1, { timeout: 10_000 });
+    ids.push(String(await row.first().getAttribute("data-id")));
+  }
+
+  // Wipe browser-side caches so the reload is a genuine cold first visit: the
+  // display-text cache (localStorage `woo.*.text.*`) AND IndexedDB (worker
+  // projection/exec caches that paint the structure). Preserve the session token
+  // (woo.session) — a real first-time visitor is still logged in; only their
+  // caches are empty. Forces structure AND text to come from a fresh open.
+  await page.evaluate(async () => {
+    for (const key of Object.keys(localStorage)) {
+      if (key.startsWith("woo.outliner.text.") || key.startsWith("woo.pinboard.text.")) localStorage.removeItem(key);
+    }
+    for (const db of (await indexedDB.databases?.()) ?? []) {
+      if (db.name) indexedDB.deleteDatabase(db.name);
+    }
+  });
+
+  await page.reload();
+  const tReload = await page.evaluate(() => performance.now());
+  await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 10_000 });
+  await expect(page.getByRole("button", { name: "Outliner" })).toHaveClass(/active/);
+  const reloaded = page.locator("woo-outliner-tree[data-outliner-tree]");
+  await expect(reloaded).toBeVisible({ timeout: 10_000 });
+
+  for (const id of ids) {
+    await expect(reloaded.locator(`[data-outliner-row][data-id="${cssAttrValue(id)}"]`)).toHaveCount(1, { timeout: 20_000 });
+  }
+  const tStructure = await page.evaluate(() => performance.now());
+  for (let i = 0; i < ids.length; i++) {
+    await expect.poll(async () =>
+      await reloaded.locator(`[data-outliner-row][data-id="${cssAttrValue(ids[i])}"] .outliner-text`).textContent(),
+    { timeout: 30_000 }).toBe(texts[i]);
+  }
+  const tText = await page.evaluate(() => performance.now());
+  // eslint-disable-next-line no-console
+  console.log(`NOTE_HYDRATION_DELAY outliner-NOCACHE items=${ITEM_COUNT} structure_to_text_ms=${Math.round(tText - tStructure)} reload_to_structure_ms=${Math.round(tStructure - tReload)} reload_to_text_ms=${Math.round(tText - tReload)}`);
+  expect(tText).toBeGreaterThanOrEqual(tStructure);
+});
