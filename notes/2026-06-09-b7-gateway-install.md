@@ -4,7 +4,10 @@ Origin: 2026-06-09. Phase 1.2 of
 [2026-06-09-stable-baseline-plan.md](2026-06-09-stable-baseline-plan.md);
 baseline + success metrics in
 [2026-06-09-baseline-metrics-post-linemap.md](2026-06-09-baseline-metrics-post-linemap.md).
-Branch `b7-gateway-install` off main `8525092`.
+Initial work began after the post-line_map main `8525092` baseline. The deploy
+candidate branch `b7-gateway-install` was rebased onto main `45244cb` before
+merge review; the implementation commits before this note cleanup were
+`6f1e4fa` and `501d9b1`.
 
 ## Instrument first: where the 58/21 actually came from
 
