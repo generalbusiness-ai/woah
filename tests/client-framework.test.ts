@@ -10,10 +10,14 @@ import { registerWooObservationHandlers as registerOutlinerObservationHandlers }
 import { registerWooObservationHandlers as registerPinboardObservationHandlers } from "../catalogs/pinboard/ui/pinboard-board";
 import {
   CatalogUiRegistry,
+  clearDisplayTextCaches,
   CoalescedRefreshController,
   CoalescedViewHydrator,
   createWooClientFramework as createBareWooClientFramework,
-  ProjectionFieldFiller
+  displayTextCacheKey,
+  ProjectionFieldFiller,
+  readDisplayTextCache,
+  writeDisplayTextCache
 } from "../src/client/framework";
 
 // The framework constructor registers only catalog-agnostic observation
@@ -1196,5 +1200,35 @@ describe("catalog UI registry", () => {
       subject: "$space"
     });
     expect(registry.resolveFrame("$chatroom", undefined, () => false)?.frame.id).toBe("chat.room");
+  });
+});
+
+describe("display-text cache (read-gated, principal-namespaced)", () => {
+  it("refuses to produce a key without an actor (cache disabled)", () => {
+    expect(displayTextCacheKey("outliner", null, "the_outline")).toBe("");
+    expect(displayTextCacheKey("outliner", undefined, "the_outline")).toBe("");
+    expect(displayTextCacheKey("outliner", "guest_1", "")).toBe("");
+    expect(displayTextCacheKey("outliner", "guest_1", "the_outline")).toBe("woo.outliner.text.guest_1.the_outline");
+  });
+
+  it("isolates one principal's cached text from another", () => {
+    localStorage.clear();
+    const a = displayTextCacheKey("outliner", "guest_1", "the_outline");
+    const b = displayTextCacheKey("outliner", "guest_2", "the_outline");
+    writeDisplayTextCache(a, { item_1: "secret for guest_1" });
+    // A different principal reading the same subject sees nothing.
+    expect(readDisplayTextCache(b)).toEqual({});
+    expect(readDisplayTextCache(a)).toEqual({ item_1: "secret for guest_1" });
+  });
+
+  it("purges every display-text cache on session teardown but leaves other keys", () => {
+    localStorage.clear();
+    writeDisplayTextCache(displayTextCacheKey("outliner", "guest_1", "the_outline"), { i: "x" });
+    writeDisplayTextCache(displayTextCacheKey("pinboard", "guest_1", "the_pinboard"), { n: "y" });
+    localStorage.setItem("woo.session", "keep-me");
+    clearDisplayTextCaches();
+    expect(readDisplayTextCache(displayTextCacheKey("outliner", "guest_1", "the_outline"))).toEqual({});
+    expect(readDisplayTextCache(displayTextCacheKey("pinboard", "guest_1", "the_pinboard"))).toEqual({});
+    expect(localStorage.getItem("woo.session")).toBe("keep-me");
   });
 });

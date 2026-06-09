@@ -1,14 +1,32 @@
 import {
   CoalescedViewHydrator,
+  displayTextCacheKey,
   escapeHtml,
   preserveAmbientCompanionPanel,
+  readDisplayTextCache,
   renderToolFrame,
   restoreAmbientCompanionPanel,
+  writeDisplayTextCache,
   type ChatFormatterRegistry,
   type ObservationRegistry,
   type WooComponentRegistry,
   type WooContext
 } from "../../../src/client/framework";
+
+// Per-(actor, outliner) localStorage display cache (see readDisplayTextCache):
+// paints last-seen item text alongside the structure on a cold reload while the
+// authoritative list_items hydration is still gated by the relay scope-open
+// handshake. Keyed by the viewing actor because the text is read-gated — a
+// different principal must never read this principal's cached text. See
+// notes/2026-06-09-note-content-hydration.md.
+function readOutlinerTextCache(actor: string | null | undefined, subject: string): Record<string, string> {
+  return readDisplayTextCache(displayTextCacheKey("outliner", actor, subject));
+}
+
+function writeOutlinerTextCache(actor: string | null | undefined, subject: string, map: Record<string, string>): void {
+  const key = displayTextCacheKey("outliner", actor, subject);
+  if (key) writeDisplayTextCache(key, map);
+}
 
 // Inline SVG icons for the row controls. Kept here (rather than as
 // classes referencing background-image rules in styles.css) so they
@@ -112,10 +130,17 @@ export class WooOutlinerTreeElement extends HTMLElement {
   private bound = false;
   private itemHydrationSubject = "";
   private projectionMissingItemTextSignature = "";
+  // Content signature of the item text last written to the localStorage display
+  // cache; guards against rewriting unchanged text on every SPA render.
+  private lastCachedTextSignature = "";
   private readonly itemTextHydrator = new CoalescedViewHydrator<OutlinerItem[]>({
     read: async (subject) => {
       if (!this.woo) return [];
-      const items = normalizeOutlinerItems(await this.woo.directCall(subject, "list_items", []));
+      // Read-only text hydration: route to the authoritative server read instead
+      // of the browser local-execution path, which otherwise pays an
+      // execution-cache rebuild + state-transfer repair storm to fill per-item
+      // text. See notes/2026-06-09-note-content-hydration.md.
+      const items = normalizeOutlinerItems(await this.woo.directCall(subject, "list_items", [], { serverRead: true }));
       if (!items) throw new Error("list_items did not return outline rows");
       return items;
     },
@@ -127,6 +152,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
         this.addingChild = false;
       }
       this.projectionMissingItemTextSignature = "";
+      this.cacheKnownItemText();
       this.render();
     }
   });
@@ -187,8 +213,31 @@ export class WooOutlinerTreeElement extends HTMLElement {
       actor,
       roster: this.rosterFromProjection()
     };
+    this.cacheKnownItemText();
     this.render();
     this.requestItemsFromList();
+  }
+
+  // Persist whatever item text the component currently knows (observations,
+  // projection, or a list_items hydration) to the localStorage display cache so a
+  // cold reload can paint it with the structure. Deduplicated by content.
+  //
+  // Two guards matter: (1) skip entirely when the model has no items — the first
+  // sync after a reload runs before the projection loads the rows, and writing an
+  // empty map there would DELETE this actor's cache (writeDisplayTextCache treats
+  // an empty map as "clear"), wiping the very text we want to paint. (2) record
+  // empty strings too, so a note edited to "" overwrites its old cached text
+  // instead of resurrecting it on the next reload (the fill skips falsy values).
+  private cacheKnownItemText(): void {
+    if (!this.subject || this.model.items.length === 0) return;
+    const map: Record<string, string> = {};
+    for (const item of this.model.items) {
+      if (typeof item.text === "string") map[item.id] = item.text;
+    }
+    const signature = JSON.stringify(map);
+    if (signature === this.lastCachedTextSignature) return;
+    this.lastCachedTextSignature = signature;
+    writeOutlinerTextCache(this.woo?.actor, this.subject, map);
   }
 
   applyObservation(observation: Record<string, unknown>): void {
@@ -257,28 +306,40 @@ export class WooOutlinerTreeElement extends HTMLElement {
       this.updateProjectionMissingItemText([]);
       return this.model.items;
     }
-    if (this.model.items.length === 0) {
-      const ordered = orderedOutlinerItems(projectedItems);
-      this.updateProjectionMissingItemText(ordered.filter((item) => item.text === "").map((item) => item.id));
-      return ordered;
-    }
-    // Projection sync can run before the newly applied item projection is
-    // present in the neighborhood. Preserve rows learned from sequenced
-    // observations so a stale projection snapshot cannot hide a committed
-    // add or replace catalog-readable note text with the generic projection's
-    // "not present" view.
-    const byId = new Map(this.model.items.map((item) => [item.id, { ...item }]));
+    let result: OutlinerItem[];
     const missingTextIds: string[] = [];
-    for (const projected of rows) {
-      const { textKnown, ...row } = projected;
-      const previous = byId.get(row.id);
-      const projectionCarriesDisplayText = textKnown && row.text !== "";
-      const text = projectionCarriesDisplayText ? row.text : previous?.text ?? row.text;
-      if (text === "") missingTextIds.push(row.id);
-      byId.set(row.id, { ...(previous ?? {}), ...row, text });
+    if (this.model.items.length === 0) {
+      result = orderedOutlinerItems(projectedItems);
+      for (const item of result) if (item.text === "") missingTextIds.push(item.id);
+    } else {
+      // Projection sync can run before the newly applied item projection is
+      // present in the neighborhood. Preserve rows learned from sequenced
+      // observations so a stale projection snapshot cannot hide a committed
+      // add or replace catalog-readable note text with the generic projection's
+      // "not present" view.
+      const byId = new Map(this.model.items.map((item) => [item.id, { ...item }]));
+      for (const projected of rows) {
+        const { textKnown, ...row } = projected;
+        const previous = byId.get(row.id);
+        const projectionCarriesDisplayText = textKnown && row.text !== "";
+        const text = projectionCarriesDisplayText ? row.text : previous?.text ?? row.text;
+        if (text === "") missingTextIds.push(row.id);
+        byId.set(row.id, { ...(previous ?? {}), ...row, text });
+      }
+      result = orderedOutlinerItems([...byId.values()]);
     }
     this.updateProjectionMissingItemText(missingTextIds);
-    return orderedOutlinerItems([...byId.values()]);
+    // Paint last-seen text from the localStorage cache for any item whose text
+    // isn't in the projection yet, so a cold reload isn't blank for the seconds
+    // the hydration read (already queued via the missing signature) takes. Run on
+    // EVERY sync with missing text, not just the first: the cache is keyed by the
+    // viewing actor, which can be unset on the first reload sync and become known
+    // a render later — re-reading here recovers that case. The authoritative read
+    // still overwrites this on arrival.
+    if (missingTextIds.length === 0) return result;
+    const cache = readOutlinerTextCache(this.woo.actor, this.subject);
+    if (Object.keys(cache).length === 0) return result;
+    return result.map((item) => (item.text === "" && cache[item.id]) ? { ...item, text: cache[item.id] } : item);
   }
 
   private updateProjectionMissingItemText(ids: string[]): void {

@@ -19,7 +19,7 @@ import * as tasksUiModule from "../../catalogs/tasks/ui/kanban-board";
 import * as weatherUiModule from "../../catalogs/weather/ui/weather-badge";
 import { appliedFrameErrorObservations, chatErrorText } from "./chat-errors";
 import { chatObservationSpace, updateEnteredLeftChatPresence } from "./chat-state";
-import { CoalescedViewHydrator, createWooClientFramework, escapeHtml, liveProjectionKey, ProjectionFieldFiller, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
+import { CoalescedViewHydrator, createWooClientFramework, displayTextCacheKey, escapeHtml, liveProjectionKey, ProjectionFieldFiller, pruneDisplayTextCaches, readDisplayTextCache, writeDisplayTextCache, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
 import { isPinboardObservation } from "./pinboard-observation";
 import { clearProvisionalChatLines, provisionalChatErrorLine, upsertProvisionalChatLine } from "./provisional-chat";
 import { advanceProjectionCursor, idsFromRefsOrSummaries, presentActorsFromObservation, scopedHerePresentActors, scopedModelWithMoveResult, type ScopedProjectionStateModel } from "./scoped-projection";
@@ -858,6 +858,17 @@ function desiredV2BrowserScope(): string {
   // scope is only a bootstrap fallback before any object route is known.
   const route = startupRoute ?? parseLocationRoute(location.pathname, location.search);
   if (route?.objectId) return route.objectId;
+  // On a tool tab the visible scope is the tool's space, not the chat room. A
+  // tool *view* route (e.g. /outliner) carries no objectId, so without this the
+  // worker first connects to the chat room and then reconnects to the tool space
+  // once the tab mounts. That reconnect closes the socket and drops the in-flight
+  // note-text hydration reply, delaying readable content by seconds on a cold
+  // load. Resolving the tool scope here makes the first connect land directly on
+  // the tool space. See notes/2026-06-09-note-content-hydration.md.
+  if (isToolTab(state.tab)) {
+    const toolScope = toolSpace(state.tab);
+    if (toolScope) return toolScope;
+  }
   return activeChatRoom() || state.actor || "";
 }
 
@@ -882,6 +893,12 @@ function storeSession(session: string | undefined) {
 
 function clearSession() {
   clearPendingToolEnters();
+  // NOTE: do NOT purge the display-text caches here. clearSession() also fires on
+  // transient blips (E_NOSESSION during a reconnect, a missing-session boot race)
+  // that are immediately followed by a silent re-login as the SAME guest — wiping
+  // the cache there defeats the cold-reload paint. Principal isolation is handled
+  // by actor-namespaced keys plus pruneDisplayTextCaches(actor) once the principal
+  // is (re)established. See notes/2026-06-09-note-content-hydration.md.
   try {
     sessionStorage.removeItem(sessionKey);
     localStorage.removeItem(sessionKey);
@@ -1460,6 +1477,9 @@ async function applyScopedProjectionSnapshot(me: any, catalogs: any) {
   const overlays = me?.overlays && typeof me.overlays === "object" && !Array.isArray(me.overlays) ? me.overlays : {};
   const overlaySnapshots = state.scopedProjection?.overlaySnapshots ?? {};
   state.actor = typeof me?.session?.actor === "string" ? me.session.actor : state.actor;
+  // The principal for this device is now known; drop any other principal's
+  // read-gated display caches (keeps THIS actor's, which must survive the reload).
+  pruneDisplayTextCaches(state.actor);
   state.scopedProjection = {
     me,
     catalogs,
@@ -1874,13 +1894,64 @@ function pinboardModel(): PinboardRenderModel | undefined {
   const layout = pinboardLayoutFromBoard(board);
   const removed = pinboardLayoutTombstones(board);
   const noteIds = pinboardProjectedNoteIds(boardId, layout, [], removed);
+  const notes = normalizePinboardNotes(noteIds.map((id) => pinboardProjectedNote(id, layout[id])).filter(Boolean));
   return {
     board,
-    notes: normalizePinboardNotes(noteIds.map((id) => pinboardProjectedNote(id, layout[id])).filter(Boolean)),
+    notes: fillPinboardNotesFromTextCache(boardId, notes),
     present: scopedPinboardPresentActors(boardId, props),
     palette,
     viewport: props.viewport && typeof props.viewport === "object" && !Array.isArray(props.viewport) ? props.viewport : { w: 960, h: 560 }
   };
+}
+
+// Attach last-seen text from the localStorage display cache to notes whose `text`
+// is not yet hydrated, as a separate `cachedText` field. We deliberately do NOT
+// touch `text` itself: the hydration trigger keys on `text === undefined` to fire
+// the authoritative list_notes read, and the component falls back to `cachedText`
+// only while `text` is undefined. So a cold reload paints text with the structure
+// while the authoritative read still runs and overwrites it. The cache is keyed by
+// the viewing actor because note text is read-gated (see displayTextCacheKey).
+// See notes/2026-06-09-note-content-hydration.md.
+function fillPinboardNotesFromTextCache(boardId: string, notes: any[]): any[] {
+  const key = displayTextCacheKey("pinboard", state.actor, boardId);
+  if (!key || !Array.isArray(notes) || notes.length === 0) return notes;
+  const cache = readDisplayTextCache(key);
+  if (Object.keys(cache).length === 0) return notes;
+  return notes.map((note) => {
+    const id = String(note?.id ?? "");
+    const needsText = note?.text === undefined || note?.text === null;
+    // An empty cached string means the note was last seen cleared; `cache[id]`
+    // is then falsy and we render nothing rather than resurrecting old text.
+    return needsText && id && cache[id] ? { ...note, cachedText: cache[id] } : note;
+  });
+}
+
+const pinboardTextCacheSignatures = new Map<string, string>();
+
+// Persist whatever note text is currently known (from a list_notes hydration or
+// from in-session note_added/note_edited observations) so a later cold reload can
+// paint it immediately. Deduplicated by content per board. Notes whose text is
+// genuinely empty ("") ARE recorded so a cleared note overwrites its old cached
+// text instead of resurrecting it; only notes whose text is not yet known
+// (undefined) are skipped, and we never write at all until at least one note's
+// text is known (so a pre-hydration render can't clobber a good cache).
+function writePinboardTextCache(boardId: string, notes: any[]): void {
+  const key = displayTextCacheKey("pinboard", state.actor, boardId);
+  if (!key) return;
+  const map: Record<string, string> = {};
+  let anyKnown = false;
+  for (const note of Array.isArray(notes) ? notes : []) {
+    const id = String(note?.id ?? "");
+    if (id && typeof note?.text === "string") {
+      map[id] = note.text;
+      anyKnown = true;
+    }
+  }
+  if (!anyKnown) return;
+  const signature = JSON.stringify(map);
+  if (pinboardTextCacheSignatures.get(boardId) === signature) return;
+  pinboardTextCacheSignatures.set(boardId, signature);
+  writeDisplayTextCache(key, map);
 }
 
 function scopedPinboardPresentActors(boardId: string, props: Record<string, unknown>): string[] {
@@ -2131,12 +2202,13 @@ type V2TurnInput = {
   verb: string;
   args?: unknown[];
   persistence?: "durable" | "live";
+  readOnly?: boolean;
   options?: ProjectionCallOptions;
   onResult?: (result: any) => void;
   onError?: (error: any) => void;
 };
 
-function sendV2TurnIntent(input: Required<Pick<V2TurnInput, "id" | "route" | "scope" | "target" | "verb">> & Pick<V2TurnInput, "args" | "persistence">): boolean {
+function sendV2TurnIntent(input: Required<Pick<V2TurnInput, "id" | "route" | "scope" | "target" | "verb">> & Pick<V2TurnInput, "args" | "persistence" | "readOnly">): boolean {
   ensureV2BrowserWorker();
   syncV2BrowserWorkerScope(input.scope);
   if (!v2BrowserWorker || !state.actor || !state.session) return false;
@@ -2148,7 +2220,10 @@ function sendV2TurnIntent(input: Required<Pick<V2TurnInput, "id" | "route" | "sc
     target: input.target,
     verb: input.verb,
     args: input.args ?? [],
-    ...(input.persistence ? { persistence: input.persistence } : {})
+    ...(input.persistence ? { persistence: input.persistence } : {}),
+    // A read-only display hydration skips the local-execution attempt in the
+    // worker and goes straight to the authoritative server-intent path.
+    ...(input.readOnly ? { read_only: true } : {})
   });
   trackV2TurnNetworkWait(input.id);
   return true;
@@ -2167,7 +2242,8 @@ function v2Turn(input: V2TurnInput): string {
     target: input.target,
     verb: input.verb,
     args: input.args ?? [],
-    persistence: input.persistence
+    persistence: input.persistence,
+    readOnly: input.readOnly ?? input.options?.serverRead === true
   })) {
     ui.failOptimisticCall(id);
     pendingDirect.delete(id);
@@ -4296,6 +4372,16 @@ function mountPinboardComponent() {
   const present = Array.isArray(pinboard?.present) ? pinboard.present.map(String) : [];
   const inBoard = actorPresentInSpace(boardId, present);
   const notes = Array.isArray(pinboard?.notes) ? pinboard.notes : [];
+  // Persist whatever text this render knows so a later cold reload paints it with
+  // the structure (the authoritative list_notes hydration still runs).
+  writePinboardTextCache(boardId, notes);
+  // Retry the note-text hydration on every pinboard render. It is gated on actor
+  // presence (a board read needs the actor in the room) and deduplicated by the
+  // hydrator, so this is cheap and idempotent — but it is essential when arriving
+  // via a live tool-to-tool tab switch: the one-shot trigger in refreshScopedProjection
+  // runs before the `enter` establishes presence, so without this retry the second
+  // tool's existing notes render with empty text until the next full refresh.
+  hydratePinboardNotesTextIfNeeded(pinboard);
   const actorRefs = new Set<string>([...present]);
   for (const note of notes) {
     for (const ref of [note?.author, note?.owner, note?.updated_by]) if (typeof ref === "string") actorRefs.add(ref);
@@ -5197,6 +5283,8 @@ function readPinboardNotesView(board: string): Promise<any[]> {
       verb: "list_notes",
       args: [],
       persistence: "live",
+      // Read-only text hydration: authoritative server read, no local-exec storm.
+      readOnly: true,
       onResult: (result) => {
         resolve(Array.isArray(result) ? result : []);
       },
@@ -5237,6 +5325,9 @@ function applyPinboardNotesCanonical(board: string, result: any[]) {
   }
   ui.applyCanonical([{ subject: board, props: { layout } }]);
   ui.applyCanonical(notePatches, { mode: "replace" });
+  // Stash the authoritative note text so a later cold reload paints it with the
+  // structure instead of waiting for this list_notes read again.
+  writePinboardTextCache(board, notes);
 }
 
 function pinboardNoteState(note: any): Record<string, unknown> {
