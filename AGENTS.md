@@ -173,13 +173,32 @@ and a body that describes the motivation and any key implementaion details.
 
 **Smoke-test discipline**
 
-Cloudflare full smoke-test is *the most expensive* validation step.
-Maintain local dirty-state regression tests and run `npm run smoke:cf-local`
-before CF.  If a smoke-test fails: stop, inspect tail/metrics, and only
-re-run when strong new signals will be available.
+Cloudflare full smoke-test is *the most expensive* validation step. One
+cross-actor scenario (`scripts/smoke/scenario.ts`) runs on three lanes of
+increasing fidelity, all before a paid deploy:
 
-If the cf-local smoke test succeeds but the full deployed smoke-test fails,
-identify root causes and prioritize their mitigation over patching activity.
+1. `npm run smoke:cf-local` — the in-process fake DO (`tests/worker/fake-do.ts`).
+   Fast, but collapses every Durable Object into one synchronous in-process
+   object sharing one world image: no cold start, RPC timeout, per-DO storage
+   isolation, or serialization boundary. Run by `npm test`.
+2. `npm run smoke:cf-dev` — **real workerd** via `wrangler dev`
+   (`wrangler.smoke.toml`): real per-DO storage, cross-DO RPC, and host-seed
+   merge. Far higher fidelity; catches storage/RPC/merge regressions the fake
+   cannot. Run it before CF.
+3. `scripts/smoke-walkthrough.ts` — the deployed worker over MCP HTTP. The most
+   expensive lane.
+
+Fidelity is a ladder, not a guarantee: workerd-local still runs every DO in one
+process with fast reliable RPC, so cross-colo-latency / cold-owner-timeout
+authority gaps remain a **deploy-only** signal until fault injection lands (see
+`notes/2026-06-09-cf-smoke-unified-lanes.md`). Do not claim a lane catches a
+failure it demonstrably passes.
+
+When changing the walkthrough, edit the shared scenario — never reintroduce a
+per-lane copy. If a smoke-test fails: stop, inspect tail/metrics, and only re-run
+when strong new signals will be available. If an earlier lane succeeds but a
+later one fails, identify root causes and prioritize their mitigation over
+patching activity.
 
 **Test selection discipline**
 

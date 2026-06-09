@@ -9,6 +9,8 @@ import { createWorld } from "../../src/core/bootstrap";
 import type { ObjRef } from "../../src/core/types";
 import { FakeDurableObjectNamespace, FakeDurableObjectState } from "./fake-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
+import { isRecord, type McpTransport, rpc, SmokeSession } from "../../scripts/smoke/session";
+import { runSmokeWalkthrough, type StepRunner } from "../../scripts/smoke/scenario";
 
 // Derive the universal actor/thing lineage the gateway-shard support set MUST
 // carry, the same way production does: the parent-closure of
@@ -102,15 +104,34 @@ describe("CF-local smoke walkthrough", () => {
     const runId = `cf-local-${Date.now()}-${randomUUID().slice(0, 8)}`;
     let logSpy: ReturnType<typeof vi.spyOn> | null = null;
     let warnSpy: ReturnType<typeof vi.spyOn> | null = null;
-    let alice: LocalMcpSession | null = null;
-    let bob: LocalMcpSession | null = null;
+    let alice: SmokeSession | null = null;
+    let bob: SmokeSession | null = null;
     try {
       await seedClosedChatroomOccupant(harness, runId);
       logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
       warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-      alice = await LocalMcpSession.open(harness, `guest:cf-local-alice-${runId}`, "alice", runId);
+      alice = await openLocalSession(harness, `guest:cf-local-alice-${runId}`, "alice", runId);
       bob = await openOnDifferentShard(harness, alice, runId);
-      await runWalkthrough(alice, bob);
+      // The ordered steps + cross-actor assertions live in the shared scenario
+      // (scripts/smoke/scenario.ts), run here against the in-process fake DO.
+      // includeConcurrentMove pairs with this file's coherence-invariant ratchet
+      // (B6 / CA14.3: concurrent move through a shared destination keeps both
+      // memberships). includeTakeDrop is held OFF here, by design: this gate also
+      // asserts `dangling_parent_ref == 0`, and a take on a $portable object emits
+      // dangling_parent_ref because the gateway-shard authority slice ships
+      // actor/thing support lineage but NOT the $portable catalog-class lineage of
+      // the acted-on item (the turn still completes via authority repair and the
+      // fanout is correct — only the zero-dangling guard fires). Flip it ON once
+      // $portable and the other contents-object classes reach the gateway slice.
+      // The deployed and workerd lanes already run take/drop.
+      await runSmokeWalkthrough({ alice, bob }, localStep, {
+        runId,
+        includeConcurrentMove: true,
+        includeTakeDrop: false,
+        waitTimeoutMs: 10_000,
+        drainBudgetMs: DRAIN_TOTAL_BUDGET_MS,
+        drainPollMs: DRAIN_POLL_MS
+      });
       // Regression guard for the gateway-shard lineage gap (perf-plan steps
       // 1-2): MCP planning must never run against a sparse relay snapshot that
       // dangles either universal actor support ($system/$guest/...) or
@@ -314,7 +335,7 @@ describe("CF-local smoke walkthrough", () => {
     const harness = createCfSmokeHarness({ shards: 32 });
     const runId = `cf-local-prod-shape-${Date.now()}-${randomUUID().slice(0, 8)}`;
     let logSpy: ReturnType<typeof vi.spyOn> | null = null;
-    let alice: LocalMcpSession | null = null;
+    let alice: SmokeSession | null = null;
     try {
       const staleSessionIds = await seedDirectoryMcpAudience(harness, runId, {
         scope: "the_chatroom",
@@ -328,7 +349,7 @@ describe("CF-local smoke walkthrough", () => {
       // live in prod, then no client ingress for > W".
       harness.setDirectoryLastSeenAt(staleSessionIds, Date.now() - DIRECTORY_PRESENCE_WINDOW_MS - 60_000);
       logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-      alice = await LocalMcpSession.open(harness, `guest:cf-local-prod-shape-alice-${runId}`, "alice", runId);
+      alice = await openLocalSession(harness, `guest:cf-local-prod-shape-alice-${runId}`, "alice", runId);
 
       await alice.call("the_chatroom", "enter", []);
       await harness.drainWaitUntil();
@@ -372,9 +393,9 @@ describe("CF-local smoke walkthrough", () => {
   it("throttles established MCP ingress presence touches before dispatch", async () => {
     const harness = createCfSmokeHarness();
     const runId = `cf-local-ingress-throttle-${Date.now()}-${randomUUID().slice(0, 8)}`;
-    let session: LocalMcpSession | null = null;
+    let session: SmokeSession | null = null;
     try {
-      session = await LocalMcpSession.open(harness, `guest:cf-local-ingress-throttle-${runId}`, "alice", runId);
+      session = await openLocalSession(harness, `guest:cf-local-ingress-throttle-${runId}`, "alice", runId);
 
       harness.clearDirectoryRequests();
       await session.callTool("woo_wait", { timeout_ms: 1, limit: 1 });
@@ -503,7 +524,7 @@ function createCfSmokeHarness(options: CfSmokeHarnessOptions = {}): CfSmokeHarne
 }
 
 async function seedClosedChatroomOccupant(harness: CfSmokeHarness, runId: string): Promise<void> {
-  const session = await LocalMcpSession.open(harness, `guest:cf-local-stale-${runId}`, "stale", runId);
+  const session = await openLocalSession(harness, `guest:cf-local-stale-${runId}`, "stale", runId);
   try {
     await session.call("the_chatroom", "enter", []);
   } finally {
@@ -551,305 +572,50 @@ async function registerDirectorySession(harness: CfSmokeHarness, payload: Record
   expect(response.ok, await response.clone().text()).toBe(true);
 }
 
-async function openOnDifferentShard(harness: CfSmokeHarness, alice: LocalMcpSession, runId: string): Promise<LocalMcpSession> {
+async function openOnDifferentShard(harness: CfSmokeHarness, alice: SmokeSession, runId: string): Promise<SmokeSession> {
   const aliceShard = mcpShardHost(alice.sessionId, harness.shards);
   for (let i = 0; i < 16; i += 1) {
-    const candidate = await LocalMcpSession.open(harness, `guest:cf-local-bob-${runId}-${i}`, "bob", runId);
+    const candidate = await openLocalSession(harness, `guest:cf-local-bob-${runId}-${i}`, "bob", runId);
     if (mcpShardHost(candidate.sessionId, harness.shards) !== aliceShard) return candidate;
     await candidate.close();
   }
   throw new Error(`could not find bob session on a different MCP shard than ${aliceShard}`);
 }
 
-async function runWalkthrough(alice: LocalMcpSession, bob: LocalMcpSession): Promise<void> {
-  await step("enter:chatroom (alice)", async () => {
-    await alice.call("the_chatroom", "enter", []);
-  });
-  await step("enter:chatroom (bob)", async () => {
-    await bob.call("the_chatroom", "enter", []);
-  });
-  await drain(alice);
-  await drain(bob);
-
-  await step("chat:say reaches peer", async () => {
-    const text = `walkthrough-say-${alice.runId}`;
-    await alice.call("the_chatroom", "say", [text]);
-    await waitFor(bob, (obs) => obs.type === "said" && typeof obs.text === "string" && obs.text.includes(text));
-  });
-
-  // B6 / CA14.3: two actors moving through the same destination concurrently
-  // must both commit independently (each at its own actor-location authority,
-  // off the room sequencer) and both retain membership — no lost destination
-  // membership, no read_version_mismatch. The CI ratchet in this file already
-  // fails on any read_version_mismatch; this step additionally proves both
-  // memberships survive a concurrent enter by requiring bidirectional delivery.
-  await step("B6: concurrent move through shared destination keeps both memberships", async () => {
-    // Both start co-located in the_chatroom (prior steps). Move both out to the
-    // shared the_deck concurrently, then back into the_chatroom concurrently.
-    await Promise.all([
-      alice.call("the_chatroom", "southeast", []),
-      bob.call("the_chatroom", "southeast", [])
-    ]);
-    await drain(alice);
-    await drain(bob);
-    // Read into fresh locals so each assertion sees the full room-name union
-    // (the getter would otherwise stay flow-narrowed across the awaits below).
-    const aliceAfterOut: string | null = alice.currentRoom;
-    const bobAfterOut: string | null = bob.currentRoom;
-    if (aliceAfterOut !== "the_deck" || bobAfterOut !== "the_deck") {
-      throw new Error(`expected both on the_deck after concurrent move; alice=${aliceAfterOut} bob=${bobAfterOut}`);
-    }
-    await Promise.all([
-      alice.call("the_deck", "west", []),
-      bob.call("the_deck", "west", [])
-    ]);
-    await drain(alice);
-    await drain(bob);
-    const aliceBack: string | null = alice.currentRoom;
-    const bobBack: string | null = bob.currentRoom;
-    if (aliceBack !== "the_chatroom" || bobBack !== "the_chatroom") {
-      throw new Error(`expected both back in the_chatroom; alice=${aliceBack} bob=${bobBack}`);
-    }
-    // Membership is intact iff each actor's utterance reaches the other.
-    const aliceText = `b6-concurrent-alice-${alice.runId}`;
-    await alice.call("the_chatroom", "say", [aliceText]);
-    await waitFor(bob, (obs) => obs.type === "said" && typeof obs.text === "string" && obs.text.includes(aliceText), 10_000);
-    const bobText = `b6-concurrent-bob-${bob.runId}`;
-    await bob.call("the_chatroom", "say", [bobText]);
-    await waitFor(alice, (obs) => obs.type === "said" && typeof obs.text === "string" && obs.text.includes(bobText), 10_000);
-  });
-
-  await step("move:southeast emits `left` to bob (origin room)", async () => {
-    await alice.call("the_chatroom", "southeast", []);
-    await waitFor(bob, (obs) =>
-      obs.type === "left" &&
-      obs.actor === alice.actor &&
-      obs.source === "the_chatroom" &&
-      obs.destination === "the_deck" &&
-      obs.exit === "southeast",
-    10_000);
-  });
-
-  await step("move:west emits `entered` to bob (destination room)", async () => {
-    await alice.call("the_deck", "west", []);
-    await waitFor(bob, (obs) =>
-      obs.type === "entered" &&
-      obs.actor === alice.actor &&
-      obs.source === "the_chatroom" &&
-      obs.origin === "the_deck" &&
-      obs.exit === "west",
-    10_000);
-  });
-
-  // NOTE — take/drop is NOT yet exercised in this gated walkthrough, by design.
-  // The prod MCP smoke (scripts/smoke-walkthrough.ts) carries a same-room take/drop
-  // step (alice takes then drops the mug; bob sees `taken`/`dropped`). It is held
-  // out HERE because this gate also asserts `dangling_parent_ref == 0`, and a
-  // take/drop turn exposes a real gap in that family: the gateway-shard authority
-  // slice ships actor/thing support lineage but NOT the `$portable` catalog-class
-  // lineage of the item being acted on, so planning a `take` on a $portable object
-  // emits dangling_parent_ref (the turn still completes via authority repair and the
-  // cross-actor fanout is correct — only the zero-dangling guard fires). Add the
-  // step here once $portable (and the other contents-object catalog classes) reach
-  // the gateway-shard slice. Carrying an item ACROSS a room boundary is a further
-  // step still: the carried object's cell authority is not migrated with the actor,
-  // so the destination shard reports "not carrying" — the mobile-object-heap /
-  // cross-scope contents-migration target.
-
-  await step("pinboard:add_note reaches peer", async () => {
-    await alice.call("the_chatroom", "southeast", []);
-    await bob.call("the_chatroom", "southeast", []);
-    await drain(alice);
-    await drain(bob);
-    try {
-      await alice.call("the_deck", "enter", ["the_pinboard"]);
-    } catch {
-      // The canonical entry below is the real assertion; the deck command is
-      // retained as an opportunistic route/manifest warm-up because prod smoke
-      // has failed here when the deck scope held stale executable state.
-    }
-    await alice.call("the_pinboard", "enter", []);
-    await bob.call("the_pinboard", "enter", []);
-    await drain(alice);
-    await drain(bob);
-    const text = `pinboard-${alice.runId}`;
-    await alice.call("the_pinboard", "add_note", [text, "yellow", 32, 32, 200, 120]);
-    await waitFor(bob, (obs) =>
-      obs.type === "note_added" &&
-      isRecord(obs.note) &&
-      typeof obs.note.text === "string" &&
-      obs.note.text.includes(text),
-    10_000);
-  });
-
-  await step("outliner:enter result includes a roster row for alice", async () => {
-    await alice.leaveIfIn("the_pinboard");
-    await bob.leaveIfIn("the_pinboard");
-    if (alice.currentRoom === "the_deck") await alice.call("the_deck", "west", []);
-    if (bob.currentRoom === "the_deck") await bob.call("the_deck", "west", []);
-    await drain(alice);
-    await drain(bob);
-    const aliceEnter = await alice.call("the_outline", "enter", []);
-    if (!isRecord(aliceEnter) || !Array.isArray(aliceEnter.roster)) {
-      throw new Error(`expected roster array on the_outline:enter result; got ${JSON.stringify(aliceEnter).slice(0, 200)}`);
-    }
-    const ids = new Set(aliceEnter.roster.filter(isRecord).map((row) => String(row.id ?? "")));
-    if (!ids.has(alice.actor)) {
-      throw new Error(`alice not in her own enter roster; ids=${[...ids].join(",")} expected alice=${alice.actor}`);
-    }
-  });
-
-  await step("outliner:add_item reaches peer", async () => {
-    await bob.call("the_outline", "enter", []);
-    await drain(alice);
-    await drain(bob);
-    const text = `outline-${alice.runId}`;
-    await alice.call("the_outline", "add_item", [text]);
-    await waitFor(bob, (obs) => obs.type === "outline_item_added" && obs.text === text, 10_000);
-  });
-
-  await step("tasks: cross-room `entered` reaches peer", async () => {
-    await alice.leaveIfIn("the_outline");
-    await bob.leaveIfIn("the_outline");
-    if (alice.currentRoom === "the_chatroom") await alice.call("the_chatroom", "southeast", []);
-    if (bob.currentRoom === "the_chatroom") await bob.call("the_chatroom", "southeast", []);
-    await walkSouthToTaskboard(alice);
-    await drain(alice);
-    await drain(bob);
-    await walkSouthToTaskboard(bob);
-    await waitFor(alice, (obs) =>
-      obs.type === "entered" &&
-      obs.actor === bob.actor &&
-      obs.source === "the_taskboard",
-    10_000);
+// Transport for the fake-DO lane: every /mcp request is dispatched in-process
+// through the worker entry (harness.request -> worker.fetch), with no network,
+// cold start, or RPC boundary. That absence is exactly what this lane trades
+// away versus the workerd and deployed lanes — and why a failure that needs a
+// real cross-DO boundary (missing cell/lineage on a shard) will not reproduce
+// here. See notes/2026-06-09-cf-smoke-unified-lanes.md.
+function harnessMcpTransport(harness: CfSmokeHarness): McpTransport {
+  return (init) => harness.request("/mcp", {
+    method: init.method,
+    headers: init.headers,
+    body: init.body,
+    signal: init.signal
   });
 }
 
-async function walkSouthToTaskboard(session: LocalMcpSession): Promise<void> {
-  if (session.currentRoom !== "the_deck") {
-    throw new Error(`${session.label} expected on the_deck before south; at=${session.currentRoom}`);
-  }
-  await session.call("the_deck", "south", []);
-  const afterFirstMove = session.currentRoom as string | null;
-  if (afterFirstMove === "the_garden") await session.call("the_garden", "south", []);
-  const afterSouthPath = session.currentRoom as string | null;
-  if (afterSouthPath !== "the_taskboard") {
-    throw new Error(`${session.label} expected on the_taskboard after south path; at=${session.currentRoom}`);
-  }
+function openLocalSession(harness: CfSmokeHarness, token: string, label: string, runId: string): Promise<SmokeSession> {
+  return SmokeSession.open(harnessMcpTransport(harness), {
+    token,
+    label,
+    clientName: `cf-local-smoke/${runId}/${label}`,
+    rpcTimeoutMs: RPC_TIMEOUT_MS
+  });
 }
 
-async function step(name: string, body: () => Promise<void>): Promise<void> {
+// Fake-DO lane step runner: bound each step by a watchdog and fail the vitest
+// case on any error. No session reset / cascade halt — that recovery policy
+// belongs to the deployed lane. Prefix the step name for readable output.
+const localStep: StepRunner = async (name, body) => {
   try {
-    await raceWithTimeout(body(), STEP_TIMEOUT_MS, `step "${name}" exceeded ${STEP_TIMEOUT_MS}ms watchdog`);
+    await raceWithTimeout(body({}), STEP_TIMEOUT_MS, `step "${name}" exceeded ${STEP_TIMEOUT_MS}ms watchdog`);
   } catch (err) {
     throw new Error(`${name}: ${err instanceof Error ? err.message : String(err)}`);
   }
-}
-
-async function drain(session: LocalMcpSession): Promise<void> {
-  const started = Date.now();
-  while (Date.now() - started < DRAIN_TOTAL_BUDGET_MS) {
-    try {
-      const result = await session.callTool("woo_wait", { timeout_ms: DRAIN_POLL_MS, limit: 100 });
-      if (waitObservationsOf(result).length === 0) return;
-    } catch {
-      return;
-    }
-  }
-}
-
-async function waitFor(
-  session: LocalMcpSession,
-  match: (obs: Record<string, any>) => boolean,
-  totalTimeoutMs = 5000
-): Promise<Record<string, any>> {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < totalTimeoutMs) {
-    const remaining = totalTimeoutMs - (Date.now() - startedAt);
-    const result = await session.callTool("woo_wait", { timeout_ms: Math.min(remaining, 1000), limit: 100 });
-    for (const obs of waitObservationsOf(result)) {
-      if (isRecord(obs) && match(obs)) return obs;
-    }
-  }
-  throw new Error(`timeout after ${totalTimeoutMs}ms waiting for matching observation`);
-}
-
-class LocalMcpSession {
-  private nextId = 2;
-  currentRoom: string | null = null;
-
-  private constructor(
-    private readonly harness: CfSmokeHarness,
-    readonly sessionId: string,
-    readonly actor: string,
-    readonly label: string,
-    readonly runId: string
-  ) {}
-
-  static async open(harness: CfSmokeHarness, token: string, label: string, runId: string): Promise<LocalMcpSession> {
-    const response = await mcpFetch(harness, {
-      method: "POST",
-      headers: { "mcp-token": token },
-      body: rpc(1, "initialize", initializeParams(`cf-local-smoke/${runId}/${label}`))
-    });
-    expect(response.ok, await response.clone().text()).toBe(true);
-    const sessionId = response.headers.get("mcp-session-id");
-    expect(sessionId).toBeTruthy();
-    await parseMcpResponse(response);
-
-    const probing = new LocalMcpSession(harness, sessionId!, "", label, runId);
-    const notified = await mcpFetch(harness, {
-      method: "POST",
-      headers: { "mcp-session-id": sessionId! },
-      body: notification("notifications/initialized")
-    });
-    expect(notified.status).toBe(202);
-    const tools = await probing.callTool("woo_list_reachable_tools", { scope: "all", limit: 200 });
-    const list = tools?.result?.structuredContent?.result?.tools ?? [];
-    const selfTool = list.find((tool: any) =>
-      typeof tool?.object === "string" &&
-      /^guest_/.test(tool.object) &&
-      (tool.verb === "focus_list" || tool.verb === "focus" || tool.verb === "wait")
-    );
-    if (!selfTool || typeof selfTool.object !== "string") {
-      throw new Error(`could not resolve actor for ${label} from tool list (saw ${list.length} tools)`);
-    }
-    return new LocalMcpSession(harness, sessionId!, selfTool.object, label, runId);
-  }
-
-  async call(object: string, verb: string, args: unknown[]): Promise<unknown> {
-    const result = unwrap(await this.callTool("woo_call", { object, verb, args }));
-    if (isRecord(result) && typeof result.room === "string") this.currentRoom = result.room;
-    return result;
-  }
-
-  async leaveIfIn(space: string): Promise<boolean> {
-    if (this.currentRoom !== space) return false;
-    await this.call(space, "leave", []);
-    return true;
-  }
-
-  async callTool(name: string, params: Record<string, unknown>): Promise<any> {
-    const response = await mcpFetch(this.harness, {
-      method: "POST",
-      headers: { "mcp-session-id": this.sessionId },
-      body: rpc(this.nextId++, "tools/call", { name, arguments: params })
-    });
-    expect(response.ok, await response.clone().text()).toBe(true);
-    const body = await parseMcpResponse(response);
-    if (body && typeof body === "object" && "error" in body && body.error) {
-      throw new Error(`tools/call ${name} JSON-RPC error: ${JSON.stringify(body.error)}`);
-    }
-    return body;
-  }
-
-  async close(): Promise<void> {
-    await mcpFetch(this.harness, {
-      method: "DELETE",
-      headers: { "mcp-session-id": this.sessionId }
-    }).catch(() => undefined);
-  }
-}
+};
 
 async function mcpFetch(
   harness: CfSmokeHarness,
@@ -892,49 +658,6 @@ function raceWithAbort<T>(work: (signal: AbortSignal) => Promise<T>, ms: number,
   return Promise.race([work(controller.signal), timeout]).finally(() => {
     if (handle) clearTimeout(handle);
   });
-}
-
-async function parseMcpResponse(response: Response): Promise<any> {
-  if (response.status === 202 || response.status === 204) return null;
-  const text = await response.text();
-  if (!text) return null;
-  const contentType = response.headers.get("content-type") ?? "";
-  if (contentType.includes("text/event-stream")) {
-    const data = text.split(/\r?\n/).find((line) => line.startsWith("data:"))?.slice("data:".length).trim();
-    return data ? JSON.parse(data) : null;
-  }
-  return JSON.parse(text);
-}
-
-function unwrap(body: any): unknown {
-  if (body?.result?.isError) {
-    throw new Error(`MCP tool error: ${JSON.stringify(body.result.structuredContent ?? body.result, null, 2)}`);
-  }
-  return body?.result?.structuredContent?.result;
-}
-
-function waitObservationsOf(body: any): unknown[] {
-  return body?.result?.structuredContent?.result?.observations ?? [];
-}
-
-function initializeParams(name: string): Record<string, unknown> {
-  return {
-    protocolVersion: "2025-06-18",
-    capabilities: {},
-    clientInfo: { name, version: "0.0.0" }
-  };
-}
-
-function rpc(id: number, method: string, params?: unknown): Record<string, unknown> {
-  return { jsonrpc: "2.0", id, method, ...(params === undefined ? {} : { params }) };
-}
-
-function notification(method: string, params?: unknown): Record<string, unknown> {
-  return { jsonrpc: "2.0", method, ...(params === undefined ? {} : { params }) };
-}
-
-function isRecord(value: unknown): value is Record<string, any> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function metricsFromLogSpy(logSpy: ReturnType<typeof vi.spyOn>): Record<string, unknown>[] {

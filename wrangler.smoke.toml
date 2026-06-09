@@ -1,0 +1,73 @@
+# Smoke-only Wrangler config for the local workerd smoke lane
+# (scripts/smoke-cf-dev.ts, `npm run smoke:cf-dev`).
+#
+# This boots the REAL worker entry in REAL workerd via `wrangler dev --local`,
+# with REAL per-Durable-Object storage and REAL cross-DO RPC — the distributed
+# substrate surface the in-process fake (tests/worker/fake-do.ts) cannot model.
+# It is the lane between the fast in-process fake (`smoke:cf-local`) and the
+# paid Cloudflare deploy smoke (`scripts/smoke-walkthrough.ts`).
+#
+# Differences from the production wrangler.toml, all deliberate:
+#   - distinct `name` ("woah-smoke") so local DO storage never collides with a
+#     real deploy's namespaces;
+#   - no `routes` / no custom domains (local only);
+#   - no `[assets]` block — the smoke only hits /healthz and /mcp, never static
+#     assets, so we skip the `dist/` build entirely (the fake Env proves the
+#     worker boots without ASSETS/METRICS bindings);
+#   - no Analytics Engine binding — AE writes are deploy-only telemetry;
+#   - secrets are inlined as local-only `[vars]` (safe non-secret dev values),
+#     so the lane needs no `.dev.vars` file.
+#
+# Everything that matters for the walkthrough — the three Durable Object
+# classes, their sqlite migrations, the KV host-seed binding, and the
+# auto-installed demo world — matches production.
+name = "woah-smoke"
+main = "src/worker/index.ts"
+compatibility_date = "2026-04-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = false
+
+[observability]
+enabled = false
+
+[vars]
+# Same demo bundle as production so the local world matches woah1: the
+# walkthrough needs the_chatroom (chat), the_deck/the_garden (demoworld),
+# the_pinboard (pinboard), the_outline (outliner via dubspace), the_taskboard
+# (tasks), the_mug (demoworld), and note support.
+WOO_AUTO_INSTALL_CATALOGS = "chat,demoworld,dubspace,help,note,pinboard,prog,tasks,blocks-demo"
+WOO_V2_SLIM_WARM_ENVELOPE = "1"
+# Local-only, non-secret defaults (mirror .dev.vars.example). Production sets
+# these via `wrangler secret put`; locally they are just config.
+WOO_INITIAL_WIZARD_TOKEN = "local-smoke-wizard-token"
+WOO_INTERNAL_SECRET = "local-smoke-internal-secret"
+
+[[durable_objects.bindings]]
+name = "WOO"
+class_name = "PersistentObjectDO"
+
+[[durable_objects.bindings]]
+name = "DIRECTORY"
+class_name = "DirectoryDO"
+
+[[durable_objects.bindings]]
+name = "COMMIT_SCOPE"
+class_name = "CommitScopeDO"
+
+[[kv_namespaces]]
+binding = "HOST_SEED_KV"
+# id is ignored in local mode (wrangler dev --local uses a local KV store);
+# kept non-empty so wrangler accepts the binding.
+id = "local_smoke_host_seed_kv"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["PersistentObjectDO"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["DirectoryDO"]
+
+[[migrations]]
+tag = "cf-do-0006"
+new_sqlite_classes = ["CommitScopeDO"]
