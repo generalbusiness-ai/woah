@@ -34,6 +34,7 @@
     "smoke:onboarding": "tsx scripts/smoke-onboarding.ts",
     "smoke:walkthrough": "tsx scripts/smoke-walkthrough.ts",
     "smoke:walkthrough:tail": "scripts/smoke-with-tail.sh",
+    "smoke:metrics-history": "node scripts/smoke-metrics-history.mjs",
     "smoke:cf-local": "vitest run --reporter=dot tests/worker/cf-local-walkthrough.test.ts",
     "smoke:cf-dev": "tsx scripts/smoke-cf-dev.ts",
     "smoke:cf-local:structural": "vitest run --reporter=dot tests/worker/cf-local-structural.test.ts",
