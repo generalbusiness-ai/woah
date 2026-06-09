@@ -10,6 +10,7 @@ import { registerWooObservationHandlers as registerOutlinerObservationHandlers }
 import { registerWooObservationHandlers as registerPinboardObservationHandlers } from "../catalogs/pinboard/ui/pinboard-board";
 import {
   CatalogUiRegistry,
+  CoalescedRefreshController,
   CoalescedViewHydrator,
   createWooClientFramework as createBareWooClientFramework,
   ProjectionFieldFiller
@@ -704,6 +705,92 @@ describe("client UI framework projection", () => {
     expect(reads).toBe(2);
     expect(errors).toEqual(["temporary view read failure"]);
     expect(applied).toEqual(["the_outline:item_1"]);
+  });
+
+  it("CoalescedRefreshController collapses bursts to one queued follow-up", async () => {
+    const runs: string[] = [];
+    const releases: Array<() => void> = [];
+    const controller = new CoalescedRefreshController({
+      run: () => new Promise<void>((resolve) => {
+        runs.push(`run-${runs.length + 1}`);
+        releases.push(resolve);
+      })
+    });
+
+    controller.request();
+    controller.request();
+    controller.request();
+    expect(runs).toEqual(["run-1"]);
+
+    releases.shift()?.();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(runs).toEqual(["run-1", "run-2"]);
+
+    releases.shift()?.();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(runs).toEqual(["run-1", "run-2"]);
+  });
+
+  it("CoalescedRefreshController recovers when run() throws synchronously", async () => {
+    let runs = 0;
+    let nextThrows = true;
+    const controller = new CoalescedRefreshController({
+      run: () => {
+        runs += 1;
+        if (nextThrows) { nextThrows = false; throw new Error("sync boom"); }
+      }
+    });
+
+    // A synchronous throw must not escape request() nor wedge running=true.
+    expect(() => controller.request()).not.toThrow();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(runs).toBe(1);
+
+    // Controller is still usable for the next request.
+    controller.request();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(runs).toBe(2);
+  });
+
+  it("CoalescedRefreshController gates lifecycle refreshes by key", async () => {
+    let runs = 0;
+    let runnable = true;
+    const controller = new CoalescedRefreshController({
+      canRun: () => runnable,
+      run: async () => { runs += 1; }
+    });
+
+    controller.requestOnce("the_taskboard\0guest_1\0the_taskboard");
+    await Promise.resolve();
+    controller.requestOnce("the_taskboard\0guest_1\0the_taskboard");
+    await Promise.resolve();
+    expect(runs).toBe(1);
+
+    controller.requestOnce("the_taskboard\0guest_2\0the_taskboard");
+    await Promise.resolve();
+    expect(runs).toBe(2);
+
+    controller.resetOnceKey();
+    controller.requestOnce("the_taskboard\0guest_2\0the_taskboard");
+    await Promise.resolve();
+    expect(runs).toBe(3);
+
+    runnable = false;
+    controller.request();
+    await Promise.resolve();
+    expect(runs).toBe(3);
+
+    controller.requestOnce("the_taskboard\0guest_3\0the_taskboard");
+    await Promise.resolve();
+    expect(runs).toBe(3);
+    runnable = true;
+    controller.requestOnce("the_taskboard\0guest_3\0the_taskboard");
+    await Promise.resolve();
+    expect(runs).toBe(4);
   });
 
   it("fills missing component-required props when a per-subject summary lands after a thin room snapshot", () => {

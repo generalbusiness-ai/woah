@@ -1,4 +1,5 @@
 import {
+  CoalescedRefreshController,
   escapeHtml,
   preserveAmbientCompanionPanel,
   renderToolFrame,
@@ -640,7 +641,7 @@ export class WooTasksKanbanElement extends HTMLElement {
     // WooContext each time. Treat actor/frame changes as meaningful, but avoid
     // turning same-subject context identity churn into another directCall sweep.
     if (!value) {
-      this.lastLifecycleRefreshKey = "";
+      this.refreshController.resetOnceKey();
       return;
     }
     if (!this.isConnected) return;
@@ -652,7 +653,7 @@ export class WooTasksKanbanElement extends HTMLElement {
     this._subject = value;
     if (previous === value) return;
     if (!value) {
-      this.lastLifecycleRefreshKey = "";
+      this.refreshController.resetOnceKey();
       return;
     }
     if (this.isConnected && this._woo && value) this.scheduleLifecycleRefresh();
@@ -667,8 +668,10 @@ export class WooTasksKanbanElement extends HTMLElement {
   private model: KanbanData = emptyKanbanData();
   private boundClick = false;
   private boundSubmit = false;
-  private refreshing = false;
-  private refreshQueued = false;
+  private readonly refreshController = new CoalescedRefreshController({
+    run: () => this.refresh(),
+    canRun: () => this.isConnected && !!this.woo
+  });
   private openPrompt: { taskId: string; verb: string } | null = null;
   private adminOpen = false;
   private adminSection: AdminSection = "role";
@@ -692,7 +695,6 @@ export class WooTasksKanbanElement extends HTMLElement {
   private boundFocus = false;
   private renderDeferredForFocus = false;
   private refreshRetryTimer: number | null = null;
-  private lastLifecycleRefreshKey = "";
   private filterText = "";
   private filterLabels = new Set<string>();
   private visibleStateColumns = new Set<StateColumnId>(DEFAULT_VISIBLE_STATE_COLUMNS);
@@ -831,27 +833,11 @@ export class WooTasksKanbanElement extends HTMLElement {
   // settles. A burst of N task_passed/task_claimed observations from a single
   // applied frame produces 2 directCall sweeps total, not N.
   private scheduleRefresh(): void {
-    if (this.refreshing) {
-      this.refreshQueued = true;
-      return;
-    }
-    this.refreshing = true;
-    void this.refresh().finally(() => {
-      this.refreshing = false;
-      if (this.refreshQueued && this.isConnected && this.woo) {
-        this.refreshQueued = false;
-        this.scheduleRefresh();
-      } else {
-        this.refreshQueued = false;
-      }
-    });
+    this.refreshController.request();
   }
 
   private scheduleLifecycleRefresh(): void {
-    const key = this.lifecycleRefreshKey();
-    if (!key || key === this.lastLifecycleRefreshKey) return;
-    this.lastLifecycleRefreshKey = key;
-    this.scheduleRefresh();
+    this.refreshController.requestOnce(this.lifecycleRefreshKey());
   }
 
   async refresh(): Promise<void> {
@@ -1405,7 +1391,7 @@ export class WooTasksKanbanElement extends HTMLElement {
     } catch {
       // Errors land as observations; refresh will repaint either way.
     }
-    void this.refresh();
+    this.scheduleRefresh();
   }
 
   private async submitAdminForm(form: HTMLFormElement): Promise<void> {
@@ -1431,7 +1417,7 @@ export class WooTasksKanbanElement extends HTMLElement {
       } catch (err) {
         this.setAdminStatus("role", "error", `Could not ${action} role "${name}": ${errorMessage(err)}`);
       }
-      void this.refresh();
+      this.scheduleRefresh();
       return;
     }
     if (kind === "obligation") {
@@ -1453,7 +1439,7 @@ export class WooTasksKanbanElement extends HTMLElement {
       } catch (err) {
         this.setAdminStatus("obligation", "error", `Could not ${action} step "${key}": ${errorMessage(err)}`);
       }
-      void this.refresh();
+      this.scheduleRefresh();
       return;
     }
     if (kind === "policy") {
@@ -1473,7 +1459,7 @@ export class WooTasksKanbanElement extends HTMLElement {
       } catch (err) {
         this.setAdminStatus("policy", "error", `Could not save policy "${policyKind}": ${errorMessage(err)}`);
       }
-      void this.refresh();
+      this.scheduleRefresh();
       return;
     }
   }
@@ -1546,7 +1532,7 @@ export class WooTasksKanbanElement extends HTMLElement {
     } catch (err) {
       this.setAdminStatus(section, "error", `Could not remove ${kind} "${key}": ${errorMessage(err)}`);
     }
-    void this.refresh();
+    this.scheduleRefresh();
   }
 
   private async submitDetailForm(form: HTMLFormElement): Promise<void> {
@@ -1588,7 +1574,7 @@ export class WooTasksKanbanElement extends HTMLElement {
     this.detailDraft = null;
     this.render();
     await Promise.all(calls);
-    void this.refresh();
+    this.scheduleRefresh();
   }
 
   private async openTaskDetail(taskId: string): Promise<void> {
@@ -1643,7 +1629,7 @@ export class WooTasksKanbanElement extends HTMLElement {
     } catch {
       // Errors surface as observations; live reconciliation tightens this later.
     }
-    void this.refresh();
+    this.scheduleRefresh();
   }
 
   private filteredTasks(): KanbanTask[] {
