@@ -634,13 +634,28 @@ export class WooTasksKanbanElement extends HTMLElement {
   private companionVisible = false;
   get woo(): WooContext | undefined { return this._woo; }
   set woo(value: WooContext | undefined) {
+    const previous = this._woo;
     this._woo = value;
-    if (this.isConnected && value) this.scheduleRefresh();
+    // main.ts preserves this element across app renders and reassigns a fresh
+    // WooContext each time. Treat actor/frame changes as meaningful, but avoid
+    // turning same-subject context identity churn into another directCall sweep.
+    if (!value) {
+      this.lastLifecycleRefreshKey = "";
+      return;
+    }
+    if (!this.isConnected) return;
+    if (!previous || this.contextRefreshKey(previous) !== this.contextRefreshKey(value)) this.scheduleLifecycleRefresh();
   }
   get subject(): string | undefined { return this._subject; }
   set subject(value: string | undefined) {
+    const previous = this._subject;
     this._subject = value;
-    if (this.isConnected && this._woo && value) this.scheduleRefresh();
+    if (previous === value) return;
+    if (!value) {
+      this.lastLifecycleRefreshKey = "";
+      return;
+    }
+    if (this.isConnected && this._woo && value) this.scheduleLifecycleRefresh();
   }
   get showCompanion(): boolean { return this.companionVisible; }
   set showCompanion(value: boolean) {
@@ -677,9 +692,23 @@ export class WooTasksKanbanElement extends HTMLElement {
   private boundFocus = false;
   private renderDeferredForFocus = false;
   private refreshRetryTimer: number | null = null;
+  private lastLifecycleRefreshKey = "";
   private filterText = "";
   private filterLabels = new Set<string>();
   private visibleStateColumns = new Set<StateColumnId>(DEFAULT_VISIBLE_STATE_COLUMNS);
+
+  private currentSubject(): string {
+    return this.subject ?? this.model.registryId;
+  }
+
+  private contextRefreshKey(woo: WooContext): string {
+    return `${woo.actor ?? ""}\u0000${woo.frame.subject}`;
+  }
+
+  private lifecycleRefreshKey(): string {
+    const subject = this.currentSubject();
+    return this.woo && subject ? `${subject}\u0000${this.contextRefreshKey(this.woo)}` : "";
+  }
 
   set data(value: Partial<KanbanData> & Pick<KanbanData, "registryId" | "registryName" | "actor" | "actorNames" | "tasks">) {
     this.model = normalizeKanbanData(this.model, value);
@@ -715,7 +744,7 @@ export class WooTasksKanbanElement extends HTMLElement {
     this.addEventListener("dragstart", this.handleDragStart);
     this.addEventListener("dragover", this.handleDragOver);
     this.addEventListener("drop", this.handleDrop);
-    if (this.woo) this.scheduleRefresh();
+    this.scheduleLifecycleRefresh();
     if (typeof window !== "undefined") {
       window.addEventListener(TASKS_REFRESH_EVENT, this.handleTasksRefresh);
     }
@@ -816,6 +845,13 @@ export class WooTasksKanbanElement extends HTMLElement {
         this.refreshQueued = false;
       }
     });
+  }
+
+  private scheduleLifecycleRefresh(): void {
+    const key = this.lifecycleRefreshKey();
+    if (!key || key === this.lastLifecycleRefreshKey) return;
+    this.lastLifecycleRefreshKey = key;
+    this.scheduleRefresh();
   }
 
   async refresh(): Promise<void> {

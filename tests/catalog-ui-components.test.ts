@@ -109,6 +109,79 @@ describe("bundled catalog UI components", () => {
     }
   });
 
+  it("does not run direct-call refreshes from dubspace or pinboard host rebinding", async () => {
+    const { WooDubspaceWorkspaceElement } = await import("../catalogs/dubspace/ui/dubspace-workspace");
+    const { WooPinboardBoardElement } = await import("../catalogs/pinboard/ui/pinboard-board");
+    defineOnce("woo-dubspace-workspace", WooDubspaceWorkspaceElement);
+    defineOnce("woo-pinboard-board", WooPinboardBoardElement);
+    let directCalls = 0;
+    const makeWoo = (subject: string): WooContext => ({
+      actor: "guest_1",
+      frame: { id: "test", subject, get: () => undefined, set: () => true },
+      neighborhood: { subject, refs: [], related: {}, has: () => true },
+      observe: (ref) => ({ id: ref, name: ref, props: {}, catalogState: {} }),
+      directCall: async () => {
+        directCalls += 1;
+        return [];
+      },
+      send: async () => undefined,
+      call: async () => undefined,
+      emit: () => true
+    });
+
+    const dubspace = document.createElement("woo-dubspace-workspace") as HTMLElement & { woo?: WooContext; subject?: string; data?: any };
+    dubspace.subject = "the_dubspace";
+    dubspace.woo = makeWoo("the_dubspace");
+    document.body.appendChild(dubspace);
+    dubspace.data = {
+      spaceId: "the_dubspace",
+      spaceName: "Dubspace",
+      spaceDescription: "",
+      controls: {},
+      slots: [],
+      filter: "",
+      delay: "",
+      drum: "",
+      operators: [],
+      actor: "guest_1",
+      inSpace: false,
+      canSend: true,
+      audioOn: false,
+      cueSlots: {},
+      cuePlaying: {}
+    };
+    dubspace.subject = "the_dubspace";
+    dubspace.woo = makeWoo("the_dubspace");
+    dubspace.remove();
+    document.body.appendChild(dubspace);
+
+    const pinboard = document.createElement("woo-pinboard-board") as HTMLElement & { woo?: WooContext; subject?: string; data?: any };
+    pinboard.subject = "the_pinboard";
+    pinboard.woo = makeWoo("the_pinboard");
+    document.body.appendChild(pinboard);
+    pinboard.data = {
+      boardId: "the_pinboard",
+      boardName: "Pinboard",
+      notes: [],
+      present: [],
+      palette: ["yellow", "blue", "green", "pink", "white"],
+      viewport: { w: 960, h: 560 },
+      view: { x: 0, y: 0, scale: 1 },
+      actor: "guest_1",
+      inBoard: false,
+      canSend: true,
+      newText: "",
+      newColor: "yellow",
+      viewports: {}
+    };
+    pinboard.subject = "the_pinboard";
+    pinboard.woo = makeWoo("the_pinboard");
+    pinboard.remove();
+    document.body.appendChild(pinboard);
+
+    expect(directCalls).toBe(0);
+  });
+
   it("declares and resolves first-party tool frames", () => {
     const registry = new CatalogUiRegistry();
     expect(registry.installCatalogUi({ alias: "chat", catalog: "chat", objects: { "$space": "$space", "$chatroom": "$chatroom" }, ui: (chatManifest as any).ui })).toEqual([]);
@@ -1382,6 +1455,58 @@ describe("bundled catalog UI components", () => {
     window.dispatchEvent(new CustomEvent("woo-tasks-refresh"));
     await flush();
     expect(listingCalls).toBe(beforeDisconnect);
+  });
+
+  it("does not refresh-loop when the host rebinds the same tasks subject", async () => {
+    const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
+    defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
+    const flush = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
+    let listingCalls = 0;
+    let releaseInitialListing!: () => void;
+    const initialListing = new Promise<void>((resolve) => { releaseInitialListing = resolve; });
+    const makeWoo = (): WooContext => ({
+      actor: "guest_1",
+      frame: { id: "test", subject: "the_taskboard", get: () => undefined, set: () => true },
+      neighborhood: { subject: "the_taskboard", refs: [], related: {}, has: () => true },
+      observe: (ref) => ({ id: ref, name: ref === "the_taskboard" ? "Taskboard" : ref, props: {}, catalogState: {} }),
+      directCall: async (_target, verb) => {
+        if (verb === "listing") {
+          listingCalls += 1;
+          if (listingCalls === 1) await initialListing;
+        }
+        return [];
+      },
+      send: async () => undefined,
+      call: async () => undefined,
+      emit: () => true
+    });
+    const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; subject?: string };
+    element.woo = makeWoo();
+    element.subject = "the_taskboard";
+    document.body.appendChild(element);
+    await flush();
+    expect(listingCalls).toBe(1);
+
+    // main.ts preserves the custom element across app renders but reassigns the
+    // same subject and a fresh WooContext. That must update the component's
+    // context without scheduling another directCall refresh.
+    element.subject = "the_taskboard";
+    element.woo = makeWoo();
+    await flush();
+    expect(listingCalls).toBe(1);
+
+    // The app shell preserves active tool elements by removing and reattaching
+    // them during render. Reconnect must not behave like a fresh taskboard entry.
+    element.remove();
+    document.body.appendChild(element);
+    await flush();
+    expect(listingCalls).toBe(1);
+
+    releaseInitialListing();
+    await flush();
+    expect(listingCalls).toBe(1);
+
+    element.remove();
   });
 
   it("kicks an initial refresh when woo is wired up after the element connects", async () => {
