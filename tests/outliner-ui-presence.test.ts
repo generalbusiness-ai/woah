@@ -39,6 +39,10 @@ describe("outliner-tree presence aside", () => {
 
   beforeEach(() => {
     document.body.innerHTML = "";
+    // The outliner persists known item text to localStorage (display accelerator
+    // for cold reloads); clear it so cached text from one case can't leak into
+    // another's projection-fill.
+    globalThis.localStorage?.clear();
   });
 
   // Two-actor roster — names come from the row, not the projection, so the
@@ -224,6 +228,56 @@ describe("outliner-tree presence aside", () => {
     expect(element.querySelector("[data-outliner-row]")?.textContent).not.toContain("(empty)");
   });
 
+  it("paints cached item text immediately on a cold load while the list_items read is still in flight", async () => {
+    // Simulate a prior session having stashed the readable text.
+    globalThis.localStorage.setItem(
+      "woo.outliner.text.the_outline",
+      JSON.stringify({ item_1: "cached readable text" })
+    );
+    // Hold the hydration read open so we observe the pre-hydration paint.
+    let releaseRead!: () => void;
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+    const directCall = vi.fn(async (_subject: string, verb: string) => {
+      if (verb === "list_items") await readGate;
+      return [
+        { id: "item_1", name: "item_1", text: "authoritative text", parent_id: null, index: 0, hidden: false, owner: "guest_1", writers: [], has_children: false }
+      ];
+    });
+    const element = document.createElement("woo-outliner-tree") as WooOutlinerTreeElement & { hydrate: () => Promise<void>; subject: string };
+    document.body.append(element);
+    element.subject = "the_outline";
+    element.woo = ctx({}, {
+      refs: ["the_outline", "item_1"],
+      directCall,
+      projections: {
+        the_outline: { id: "the_outline", name: "Outline", props: {}, catalogState: {} },
+        item_1: {
+          id: "item_1",
+          name: "item_1",
+          parent: "$outline_item",
+          ancestors: ["$note", "$outline_item"],
+          owner: "guest_1",
+          location: "the_outline",
+          props: { text: "", parent: null, position: 1, hidden: false },
+          catalogState: {}
+        }
+      }
+    });
+
+    await element.hydrate();
+    await flushPromises();
+
+    // Before the read resolves, the row already shows the cached text, not "(empty)".
+    expect(directCall).toHaveBeenCalledTimes(1);
+    expect(element.querySelector("[data-outliner-row]")?.textContent).toContain("cached readable text");
+    expect(element.querySelector("[data-outliner-row]")?.textContent).not.toContain("(empty)");
+
+    // The authoritative read still runs and overwrites the cached value.
+    releaseRead();
+    await flushPromises();
+    expect(element.querySelector("[data-outliner-row]")?.textContent).toContain("authoritative text");
+  });
+
   it("does not replace observation-sourced item text with a projection row that omits text", () => {
     const directCall = vi.fn(async () => []);
     const element = document.createElement("woo-outliner-tree") as WooOutlinerTreeElement & { data: OutlinerData; syncFromProjection: () => void; subject: string };
@@ -389,7 +443,8 @@ describe("outliner-tree presence aside", () => {
     await flushPromises();
 
     expect(directCall).toHaveBeenCalledTimes(1);
-    expect(directCall).toHaveBeenCalledWith("the_outline", "list_items", []);
+    // Read-only display hydration: routed as an authoritative server read.
+    expect(directCall).toHaveBeenCalledWith("the_outline", "list_items", [], { serverRead: true });
     const text = element.querySelector(".outliner-rows")?.textContent ?? "";
     expect(text).toContain("authoritative row");
     expect(text).not.toContain("(empty)");

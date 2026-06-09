@@ -55,7 +55,7 @@ type V2WorkerCommand =
   | { kind: "connect"; token: string; node?: string; scope?: string; actor?: string; session?: string }
   | { kind: "disconnect" }
   | { kind: "send"; envelope: ShadowEnvelope }
-  | { kind: "call"; id: string; route: "direct" | "sequenced"; scope: string; target: string; verb: string; args?: unknown[]; body?: Record<string, WooValue>; persistence?: "durable" | "live" }
+  | { kind: "call"; id: string; route: "direct" | "sequenced"; scope: string; target: string; verb: string; args?: unknown[]; body?: Record<string, WooValue>; persistence?: "durable" | "live"; read_only?: boolean }
   | { kind: "get_projection"; scope?: string }
   | { kind: "cache_status" };
 
@@ -219,6 +219,37 @@ let connecting = false;
 let connectPromise: Promise<void> | null = null;
 let connectReady: { sawDisplayState: boolean; sawExecutableState: boolean; sawAd: boolean; settle: (reason?: string) => void; timer: number } | null = null;
 let connectGeneration = 0;
+// Waiters that only need the WebSocket to reach OPEN, not the full
+// display+executable+ad readiness that connect() resolves on. A read-only
+// server intent (read_only) is sent to the authoritative relay directly, so it
+// can fire as soon as the socket can carry it — typically ~950ms before full
+// connect readiness on a cold reload. See ensureSocketOpen().
+let socketOpenWaiters: Array<{ resolve: () => void; reject: (err: unknown) => void }> = [];
+
+function flushSocketOpenWaiters(err?: unknown): void {
+  if (socketOpenWaiters.length === 0) return;
+  const waiters = socketOpenWaiters;
+  socketOpenWaiters = [];
+  for (const waiter of waiters) {
+    if (err) waiter.reject(err);
+    else waiter.resolve();
+  }
+}
+
+// Resolve once the socket is OPEN (or join an in-flight connect and resolve on
+// its 'open'). Unlike connect(), this does NOT wait for the executable seed and
+// scope ad — those only matter for local turn planning, which read_only calls
+// skip. Races the full connect() promise as a fallback so a socket that settles
+// via close/error/timeout before 'open' never hangs the caller.
+async function ensureSocketOpen(): Promise<void> {
+  if (socket?.readyState === WebSocket.OPEN) return;
+  const opened = new Promise<void>((resolve, reject) => {
+    socketOpenWaiters.push({ resolve, reject });
+  });
+  const connected = connect();
+  if (socket?.readyState === WebSocket.OPEN) return;
+  await Promise.race([opened, connected]);
+}
 let reconnectDelayMs = 500;
 const maxReconnectDelayMs = 10_000;
 let commandQueue: Promise<void> = Promise.resolve();
@@ -696,6 +727,9 @@ async function connect(): Promise<void> {
       connecting = false;
       reconnectDelayMs = 500;
       void putMeta("connected", true);
+      // Release read_only callers waiting only for a usable socket, ahead of the
+      // full display+executable+ad readiness barrier below.
+      flushSocketOpenWaiters();
       postBrowserActivity({
         phase: "websocket_open",
         path: "connect",
@@ -723,6 +757,7 @@ async function connect(): Promise<void> {
     ws.addEventListener("close", () => {
       if (socket !== ws) return;
       connecting = false;
+      flushSocketOpenWaiters(new Error("v2 browser socket closed"));
       rejectPendingStateTransfers(new Error("v2 browser socket closed"));
       void putMeta("connected", false);
       postStatus();
@@ -742,6 +777,7 @@ async function connect(): Promise<void> {
     ws.addEventListener("error", () => {
       if (socket !== ws) return;
       connecting = false;
+      flushSocketOpenWaiters(new Error("v2 browser socket error"));
       rejectPendingStateTransfers(new Error("v2 browser socket error"));
       void putMeta("connected", false);
       postStatus();
@@ -964,20 +1000,34 @@ async function sendTurnIntent(command: Extract<V2WorkerCommand, { kind: "call" }
       await connectTo({ ...current, scope: commandScope });
     }
     const connectWaitStartedAt = metricNow();
-    await connect();
+    // A read_only server intent needs only a usable socket, not the full
+    // executable-seed/ad readiness that connect() awaits. Waiting on socket-open
+    // alone cuts ~950ms off a cold-reload hydration. Non-read calls still await
+    // full readiness so their local planning has the executable seed.
+    if (command.read_only) await ensureSocketOpen();
+    else await connect();
     postBrowserActivity({
       phase: "turn_connect_wait",
       path: command.verb,
       route: command.route,
       scope: command.scope || current?.scope,
       ms: metricElapsed(connectWaitStartedAt),
-      status: "ok"
+      status: "ok",
+      ...(command.read_only ? { reason: "socket_open" } : {})
     });
     if (!current || !current.actor) {
       postMessage({ kind: "error", error: "v2 browser call lost authenticated actor while connecting" });
       return;
     }
-    if (await sendLocalTurnExec(command)) {
+    // Read-only display hydrations (read_only) skip the local-execution attempt.
+    // Local exec is for optimistic writes; for a pure read it cannot beat the
+    // authoritative server (which answers in milliseconds) and instead pays an
+    // execution-cache rebuild + state-transfer repair storm when the open seed
+    // does not cover the per-item read atoms. Route straight to server intent.
+    // `persistence` is "live" for these, so v2ServerAssistedIntentPolicy admits
+    // the server intent without a scope ad. See
+    // notes/2026-06-09-note-content-hydration.md.
+    if (!command.read_only && await sendLocalTurnExec(command)) {
       plannedLocally = true;
       postStatus();
       return;

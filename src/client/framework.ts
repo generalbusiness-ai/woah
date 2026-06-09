@@ -40,9 +40,54 @@ export type ProjectionCallOptions = {
     ttlMs?: number;
     reconcile?: ProjectionOptimisticReconcile;
   };
+  // Read-only view hydrations (e.g. list_items/list_notes filling note text)
+  // gain nothing from optimistic local execution — the result must arrive before
+  // render regardless — but pay the full local-exec cost (execution-cache rebuild
+  // + state-transfer repair) when the open seed does not cover the per-item text
+  // atoms. Setting `serverRead` routes the call straight to the authoritative
+  // server-intent path, which answers the read in milliseconds. See
+  // notes/2026-06-09-note-content-hydration.md.
+  serverRead?: boolean;
 };
 
 export type ProjectionSubscriber = (value: ObjectProjection | undefined, ref: string) => void;
+
+// Display-text accelerator cache (localStorage). Catalog views (outliner items,
+// pinboard notes) read text fields that the generic projection deliberately omits
+// because they are catalog-defined and read-gated; that text arrives via a verb
+// hydration whose latency is bounded by the relay scope-open handshake on a cold
+// reload. Stashing the last-seen text per subject lets a reload paint text with
+// the structure; the authoritative hydration read still runs and overwrites it.
+// `key` is a fully-qualified storage key (e.g. `woo.outliner.text.<subject>`).
+// See notes/2026-06-09-note-content-hydration.md.
+export function readDisplayTextCache(key: string): Record<string, string> {
+  if (!key) return {};
+  try {
+    const raw = globalThis.localStorage?.getItem(key);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const out: Record<string, string> = {};
+    for (const [id, text] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof id === "string" && typeof text === "string") out[id] = text;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+export function writeDisplayTextCache(key: string, map: Record<string, string>): void {
+  if (!key) return;
+  try {
+    const store = globalThis.localStorage;
+    if (!store) return;
+    if (Object.keys(map).length === 0) store.removeItem(key);
+    else store.setItem(key, JSON.stringify(map));
+  } catch {
+    // localStorage may be unavailable (private mode / quota); the cache is optional.
+  }
+}
 
 export function liveProjectionKey(type: string, subject: string, discriminator?: string): string {
   return ["live", type, subject, discriminator].filter((part) => part !== undefined && part !== "").map(String).join(":");

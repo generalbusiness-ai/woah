@@ -12,6 +12,9 @@ import {
 export type PinboardNote = Record<string, unknown> & {
   id?: string;
   text?: unknown;
+  // Display-only fallback text from the localStorage cache, shown while `text`
+  // is undefined on a cold reload (see main.ts pinboardModel / the display cache).
+  cachedText?: unknown;
   x?: unknown;
   y?: unknown;
   w?: unknown;
@@ -162,7 +165,10 @@ export class WooPinboardBoardElement extends HTMLElement {
     const box = pinNoteRecordBox(note);
     const z = pinNumber(note?.z, 1);
     const color = pinNoteColor(note, this.model.palette);
-    const text = pinNoteText(note?.text);
+    // `cachedText` is the last-seen text from a prior session's localStorage cache,
+    // used only while `text` is still undefined on a cold reload (before the
+    // list_notes hydration returns authoritative text). See main.ts pinboardModel.
+    const text = pinNoteText(note?.text ?? note?.cachedText);
     const meta = this.pinNoteMeta(note);
     const aria = [text || "Pinboard note", meta.replace(/\n/g, "; ")].filter(Boolean).join("; ");
     const action = this.pinNoteAction(note);

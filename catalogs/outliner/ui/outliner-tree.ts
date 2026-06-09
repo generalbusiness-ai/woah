@@ -2,13 +2,29 @@ import {
   CoalescedViewHydrator,
   escapeHtml,
   preserveAmbientCompanionPanel,
+  readDisplayTextCache,
   renderToolFrame,
   restoreAmbientCompanionPanel,
+  writeDisplayTextCache,
   type ChatFormatterRegistry,
   type ObservationRegistry,
   type WooComponentRegistry,
   type WooContext
 } from "../../../src/client/framework";
+
+// Per-outliner localStorage display cache (see readDisplayTextCache): paints
+// last-seen item text alongside the structure on a cold reload while the
+// authoritative list_items hydration is still gated by the relay scope-open
+// handshake. See notes/2026-06-09-note-content-hydration.md.
+const OUTLINER_TEXT_CACHE_PREFIX = "woo.outliner.text.";
+
+function readOutlinerTextCache(subject: string): Record<string, string> {
+  return subject ? readDisplayTextCache(OUTLINER_TEXT_CACHE_PREFIX + subject) : {};
+}
+
+function writeOutlinerTextCache(subject: string, map: Record<string, string>): void {
+  if (subject) writeDisplayTextCache(OUTLINER_TEXT_CACHE_PREFIX + subject, map);
+}
 
 // Inline SVG icons for the row controls. Kept here (rather than as
 // classes referencing background-image rules in styles.css) so they
@@ -112,10 +128,17 @@ export class WooOutlinerTreeElement extends HTMLElement {
   private bound = false;
   private itemHydrationSubject = "";
   private projectionMissingItemTextSignature = "";
+  // Content signature of the item text last written to the localStorage display
+  // cache; guards against rewriting unchanged text on every SPA render.
+  private lastCachedTextSignature = "";
   private readonly itemTextHydrator = new CoalescedViewHydrator<OutlinerItem[]>({
     read: async (subject) => {
       if (!this.woo) return [];
-      const items = normalizeOutlinerItems(await this.woo.directCall(subject, "list_items", []));
+      // Read-only text hydration: route to the authoritative server read instead
+      // of the browser local-execution path, which otherwise pays an
+      // execution-cache rebuild + state-transfer repair storm to fill per-item
+      // text. See notes/2026-06-09-note-content-hydration.md.
+      const items = normalizeOutlinerItems(await this.woo.directCall(subject, "list_items", [], { serverRead: true }));
       if (!items) throw new Error("list_items did not return outline rows");
       return items;
     },
@@ -127,6 +150,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
         this.addingChild = false;
       }
       this.projectionMissingItemTextSignature = "";
+      this.cacheKnownItemText();
       this.render();
     }
   });
@@ -187,8 +211,24 @@ export class WooOutlinerTreeElement extends HTMLElement {
       actor,
       roster: this.rosterFromProjection()
     };
+    this.cacheKnownItemText();
     this.render();
     this.requestItemsFromList();
+  }
+
+  // Persist whatever item text the component currently knows (observations,
+  // projection, or a list_items hydration) to the localStorage display cache so a
+  // cold reload can paint it with the structure. Deduplicated by content.
+  private cacheKnownItemText(): void {
+    if (!this.subject) return;
+    const map: Record<string, string> = {};
+    for (const item of this.model.items) {
+      if (typeof item.text === "string" && item.text !== "") map[item.id] = item.text;
+    }
+    const signature = Object.keys(map).sort().map((id) => id + "" + map[id]).join("");
+    if (signature === this.lastCachedTextSignature) return;
+    this.lastCachedTextSignature = signature;
+    writeOutlinerTextCache(this.subject, map);
   }
 
   applyObservation(observation: Record<string, unknown>): void {
@@ -259,8 +299,15 @@ export class WooOutlinerTreeElement extends HTMLElement {
     }
     if (this.model.items.length === 0) {
       const ordered = orderedOutlinerItems(projectedItems);
-      this.updateProjectionMissingItemText(ordered.filter((item) => item.text === "").map((item) => item.id));
-      return ordered;
+      const missing = ordered.filter((item) => item.text === "").map((item) => item.id);
+      this.updateProjectionMissingItemText(missing);
+      if (missing.length === 0) return ordered;
+      // Cold reload: structure is present but per-item text isn't in the
+      // projection yet. Paint last-seen text from the localStorage cache so the
+      // view isn't blank for the seconds it takes the hydration read (already
+      // queued via the missing signature) to return authoritative text.
+      const cache = readOutlinerTextCache(this.subject);
+      return ordered.map((item) => (item.text === "" && cache[item.id]) ? { ...item, text: cache[item.id] } : item);
     }
     // Projection sync can run before the newly applied item projection is
     // present in the neighborhood. Preserve rows learned from sequenced
