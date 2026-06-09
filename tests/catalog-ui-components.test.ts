@@ -1384,6 +1384,58 @@ describe("bundled catalog UI components", () => {
     expect(listingCalls).toBe(beforeDisconnect);
   });
 
+  it("does not refresh-loop when the host rebinds the same tasks subject", async () => {
+    const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
+    defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
+    const flush = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
+    let listingCalls = 0;
+    let releaseInitialListing!: () => void;
+    const initialListing = new Promise<void>((resolve) => { releaseInitialListing = resolve; });
+    const makeWoo = (): WooContext => ({
+      actor: "guest_1",
+      frame: { id: "test", subject: "the_taskboard", get: () => undefined, set: () => true },
+      neighborhood: { subject: "the_taskboard", refs: [], related: {}, has: () => true },
+      observe: (ref) => ({ id: ref, name: ref === "the_taskboard" ? "Taskboard" : ref, props: {}, catalogState: {} }),
+      directCall: async (_target, verb) => {
+        if (verb === "listing") {
+          listingCalls += 1;
+          if (listingCalls === 1) await initialListing;
+        }
+        return [];
+      },
+      send: async () => undefined,
+      call: async () => undefined,
+      emit: () => true
+    });
+    const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; subject?: string };
+    element.woo = makeWoo();
+    element.subject = "the_taskboard";
+    document.body.appendChild(element);
+    await flush();
+    expect(listingCalls).toBe(1);
+
+    // main.ts preserves the custom element across app renders but reassigns the
+    // same subject and a fresh WooContext. That must update the component's
+    // context without scheduling another directCall refresh.
+    element.subject = "the_taskboard";
+    element.woo = makeWoo();
+    await flush();
+    expect(listingCalls).toBe(1);
+
+    // The app shell preserves active tool elements by removing and reattaching
+    // them during render. Reconnect must not behave like a fresh taskboard entry.
+    element.remove();
+    document.body.appendChild(element);
+    await flush();
+    expect(listingCalls).toBe(1);
+
+    releaseInitialListing();
+    await flush();
+    expect(listingCalls).toBe(1);
+
+    element.remove();
+  });
+
   it("kicks an initial refresh when woo is wired up after the element connects", async () => {
     const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
     defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
