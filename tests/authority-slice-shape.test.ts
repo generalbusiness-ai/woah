@@ -34,6 +34,7 @@ import type { SerializedAuthorityCellSlice, SerializedObject } from "../src/core
 import {
   shadowObjectLivePage,
   shadowStatePageHash,
+  shadowStatePagesForObject,
   shadowStatePageRef,
   shadowVerbBytecodePages,
   stampAuthorityPageRef
@@ -455,6 +456,28 @@ describe("CA12.2 verb_bytecode page-hash is line_map-blind", () => {
     expect(shadowStatePageHash(strip(page))).toBe(shadowStatePageRef(page, true).hash);
   });
 
+  it("hashes populated, empty, and absent line_map identically", () => {
+    // The canonical preimage MUST collapse all three wire shapes (CA12.2). The
+    // "absent" case matters: a delivered page that omitted the property entirely
+    // must not hash differently from `line_map: {}`, or a mixed-version fleet
+    // (old full-line_map refs vs new stripped/omitted inline pages) fails to
+    // pair during the rollout reseed convergence.
+    const { page } = verbPageWithLineMap();
+    const populated = page;
+    const empty: ShadowVerbBytecodePage = { ...page, verb: { ...page.verb, line_map: {} } };
+    // Reproduce a wire page whose verb has NO line_map property at all.
+    const absentVerb = { ...page.verb } as Record<string, unknown>;
+    delete absentVerb.line_map;
+    const absent = { ...page, verb: absentVerb } as unknown as ShadowVerbBytecodePage;
+    expect(Object.prototype.hasOwnProperty.call(absent.verb, "line_map")).toBe(false);
+
+    const h = shadowStatePageHash(populated);
+    expect(shadowStatePageHash(empty)).toBe(h);
+    expect(shadowStatePageHash(absent)).toBe(h);
+    expect(shadowStatePageRef(empty, true).hash).toBe(shadowStatePageRef(populated, true).hash);
+    expect(shadowStatePageRef(absent, true).hash).toBe(shadowStatePageRef(populated, true).hash);
+  });
+
   it("keeps line_map out of identity but reflects actual size in ref.bytes", () => {
     const { page } = verbPageWithLineMap();
     // Identity is line_map-blind; `bytes` is a size hint, not identity, so a
@@ -464,25 +487,59 @@ describe("CA12.2 verb_bytecode page-hash is line_map-blind", () => {
     expect(shadowStatePageRef(strip(page), true).bytes).toBeLessThan(shadowStatePageRef(page, true).bytes);
   });
 
-  it("materializes a slice whose inline verb pages were line_map-stripped (bytecode survives)", () => {
+  it("delivers stripped inline verb pages that still materialize with bytecode (end state)", () => {
+    // End-state guard after Commit B: exportAuthoritySlice ALREADY strips line_map
+    // from delivered verb pages (buildSerializedAuthorityCellSlice). Assert the
+    // delivered inline pages are stripped, and that they still materialize with
+    // execution-essential bytecode intact and an empty line_map.
     const world = createWorld({ catalogs: ["chat", "demoworld", "note", "pinboard", "tasks"] });
     const slice = world.exportAuthoritySlice([], ["$pinboard"]);
     expect(isAuthorityCellSlice(slice)).toBe(true);
     if (!isAuthorityCellSlice(slice)) throw new Error("expected a cell slice");
-    // Refs were minted from full pages; strip line_map from the delivered inline
-    // pages. serializedWorldFromAuthoritySlice pairs refs to inline pages by
-    // shadowStatePageHash, so this only materializes if the hash is line_map-blind.
-    const strippedSlice: SerializedAuthorityCellSlice = {
-      ...slice,
-      inline_pages: slice.inline_pages.map((p) =>
-        p.page === "verb_bytecode" ? { ...p, verb: { ...p.verb, line_map: {} } } : p
-      )
-    };
-    const materialized = serializedWorldFromAuthoritySlice(strippedSlice);
+    const deliveredVerbPages = slice.inline_pages.filter((p) => p.page === "verb_bytecode");
+    expect(deliveredVerbPages.length).toBeGreaterThan(0);
+    for (const p of deliveredVerbPages) {
+      expect(
+        Object.keys((p as ShadowVerbBytecodePage).verb.line_map ?? {}).length,
+        `delivered ${p.page} ${(p as ShadowVerbBytecodePage).name} must ship without line_map`
+      ).toBe(0);
+    }
+    const materialized = serializedWorldFromAuthoritySlice(slice);
     const pinboard = materialized.objects.find((o) => o.id === "$pinboard");
     const bytecodeVerb = pinboard?.verbs.find((v) => v.kind === "bytecode");
     expect(bytecodeVerb, "$pinboard bytecode verb must survive materialization").toBeTruthy();
     expect((bytecodeVerb as { bytecode?: unknown }).bytecode, "execution-essential bytecode preserved").toBeTruthy();
     expect(Object.keys((bytecodeVerb as { line_map: Record<string, unknown> }).line_map).length).toBe(0);
+  });
+
+  it("materializes a MIXED-version slice: full-line_map refs paired with stripped inline pages", () => {
+    // Rollout convergence: an old node mints refs from full (line_map-bearing)
+    // pages while a new node delivers the same pages line_map-stripped inline.
+    // serializedWorldFromAuthoritySlice pairs refs to inline by shadowStatePageHash,
+    // so this materializes ONLY because the hash is line_map-blind. Build the
+    // fixture by hand (buildSerializedAuthorityCellSlice now strips on its own).
+    const { world, page } = verbPageWithLineMap();
+    const obj = page.object;
+    const fullPages = shadowStatePagesForObject(world.exportObjects([obj])[0]);
+    expect(fullPages.some((p) => p.page === "verb_bytecode"
+      && Object.keys((p as ShadowVerbBytecodePage).verb.line_map ?? {}).length > 0)).toBe(true);
+    const slice: SerializedAuthorityCellSlice = {
+      kind: "woo.authority_slice.cells.shadow.v1",
+      sessions: [],
+      // refs minted from FULL pages (old node)
+      page_refs: fullPages.map((p) => stampAuthorityPageRef(p, true, { source: "authoritative" })),
+      // inline pages with verb line_map STRIPPED (new node)
+      inline_pages: fullPages.map((p) =>
+        p.page === "verb_bytecode" ? { ...p, verb: { ...p.verb, line_map: {} } } : p
+      ),
+      counters: { objectCounter: 0, parkedTaskCounter: 0, sessionCounter: 0 },
+      tombstones: [],
+      source_object_count: 1
+    };
+    const materialized = serializedWorldFromAuthoritySlice(slice);
+    const o = materialized.objects.find((x) => x.id === obj);
+    const bytecodeVerb = o?.verbs.find((v) => v.kind === "bytecode");
+    expect(bytecodeVerb, `${obj} bytecode verb must survive mixed-version materialization`).toBeTruthy();
+    expect((bytecodeVerb as { bytecode?: unknown }).bytecode).toBeTruthy();
   });
 });

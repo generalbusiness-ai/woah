@@ -191,7 +191,13 @@ export function shadowVerbBytecodePages(obj: SerializedObject): ShadowVerbByteco
 // `bytes` is computed separately from the actual page (below), so it still
 // reflects real wire size whether or not line_map is present.
 function pageHashPreimage(page: ShadowStatePage): string {
-  if (page.page === "verb_bytecode" && Object.keys(page.verb.line_map ?? {}).length > 0) {
+  if (page.page === "verb_bytecode") {
+    // Normalize line_map to {} UNCONDITIONALLY for the identity preimage. This
+    // must collapse all three wire shapes to the same hash: a populated
+    // line_map, an explicit empty `line_map: {}`, and the property absent
+    // entirely (a delivered page that omitted it). A conditional strip would
+    // leave "absent" hashing differently from "{}". Spreading `line_map: {}`
+    // after the verb spread sets the key whether or not it was present.
     const blind: ShadowVerbBytecodePage = { ...page, verb: { ...page.verb, line_map: {} } };
     return stableShadowJson(blind as unknown as WooValue);
   }

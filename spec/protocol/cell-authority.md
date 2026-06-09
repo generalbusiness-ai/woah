@@ -733,8 +733,11 @@ For a `verb_bytecode` page the canonical preimage MUST exclude the verb
 metadata, consumed only by stack-trace formatting, and its presence MUST NOT
 change a page's identity. Concretely:
 
-- The same verb page with a populated `line_map` and with an empty `line_map`
-  MUST produce the same page hash and the same page-ref `hash`.
+- The same verb page MUST produce the same page hash and page-ref `hash`
+  whether its `line_map` is populated, an explicit empty `{}`, or the property is
+  absent entirely. The canonical preimage normalizes all three to the same shape;
+  a conditional strip that left "absent" hashing differently from `{}` is a
+  conformance bug.
 - All page hashing, page-ref construction, and transfer verification MUST route
   through this one canonical preimage. A node MUST NOT recompute a page hash by
   any path that includes `line_map`, and verification MUST compare pages by this
