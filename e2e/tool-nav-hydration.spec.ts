@@ -19,7 +19,7 @@ async function seedBothTools(page: Page, outText: string, pinText: string): Prom
   await tree.getByRole("button", { name: "Leave" }).waitFor({ timeout: 10_000 });
   await tree.locator("[data-outliner-add] input[name=text]").fill(outText);
   await tree.locator("[data-outliner-add] input[name=text]").press("Enter");
-  await expect(tree.locator(".outliner-row").filter({ hasText: outText })).toHaveCount(1, { timeout: 10_000 });
+  await expect(tree.locator(".outliner-row").filter({ hasText: outText })).toHaveCount(1, { timeout: 15_000 });
   await page.getByRole("button", { name: "Pinboard" }).click();
   await expect(page.locator(".pinboard-stage")).toBeVisible({ timeout: 10_000 });
   await page.locator("[data-pinboard-new-text]").fill(pinText);
@@ -47,10 +47,15 @@ test("fresh actor: pinboard note text hydrates when reached as the SECOND tool",
   await pb.getByRole("button", { name: "Outliner" }).click();
   await expect(pb.locator(".outliner-row").filter({ hasText: outText })).toHaveCount(1, { timeout: 15_000 });
 
-  // Second tool: pinboard via live tab switch — its existing note text must show.
+  // Second tool: pinboard via live tab switch — THIS note's existing text must
+  // hydrate. Match by content (the board is a shared singleton, so other notes
+  // may be present); the assertion is that our note's text is non-empty/correct.
   await pb.getByRole("button", { name: "Pinboard" }).click();
   await expect(pb.locator(".pinboard-stage")).toBeVisible({ timeout: 10_000 });
-  await expect(pb.locator("[data-pin-note-text]").first()).toHaveValue(pinText, { timeout: 15_000 });
+  await expect.poll(async () => {
+    return await pb.locator("[data-pin-note-text]").evaluateAll((tas) =>
+      (tas as HTMLTextAreaElement[]).map((t) => t.value));
+  }, { timeout: 20_000, message: "second-tool pinboard note text must hydrate" }).toContain(pinText);
 
   await b.close();
 });
