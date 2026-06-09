@@ -555,6 +555,9 @@ async function connectTo(next: { token: string; node: string; scope: string; act
   // repair starts with an honest no-hint transfer and registers a fresh token.
   if (changed || executionAuthorityChanged) knownPageCacheIdentity = null;
   if (executionAuthorityChanged) await purgeStaleExecutableStateForCurrentAuthority("connect_authority_changed");
+  // IndexedDB pending envelopes survive worker restarts; arm their original
+  // deadlines before socket readiness so a cold-open stall is still bounded.
+  await armPendingTurnReplyTimeoutsForCurrentSession();
   await postCachedProjection(current.scope);
   await replayOptimisticProposalOverlays(current.scope);
   if (changed) {
@@ -957,6 +960,7 @@ async function replayPending(): Promise<void> {
   // sent with the new bearer token's socket.
   for (const pending of await allPending()) {
     if (!current || !pendingMatchesCurrentSession(pending)) continue;
+    schedulePendingTurnReplyTimeout(pending);
     sendEncoded(pending.encoded);
   }
 }
@@ -2106,9 +2110,23 @@ function schedulePendingTurnReplyTimeout(pending: PendingEnvelope): void {
   }
   if (!info) return;
   const timer = workerScope.setTimeout(() => {
-    void expirePendingTurnReply(pending.id);
-  }, pendingTurnReplyTimeoutMs);
+    enqueuePendingTurnReplyExpiry(pending.id);
+  }, pendingTurnReplyDelayMs(pending));
   pendingTurnReplyTimers.set(pending.id, timer);
+}
+
+function pendingTurnReplyDelayMs(pending: PendingEnvelope): number {
+  // A restarted worker must keep the envelope's original deadline rather than
+  // granting a fresh full timeout from the reload time.
+  const createdAt = Number.isFinite(pending.created_at) ? pending.created_at : Date.now();
+  return Math.max(0, createdAt + pendingTurnReplyTimeoutMs - Date.now());
+}
+
+async function armPendingTurnReplyTimeoutsForCurrentSession(): Promise<void> {
+  for (const pending of await allPending()) {
+    if (!pendingMatchesCurrentSession(pending)) continue;
+    schedulePendingTurnReplyTimeout(pending);
+  }
 }
 
 function clearPendingTurnReplyTimeout(id: string): void {
@@ -2116,6 +2134,16 @@ function clearPendingTurnReplyTimeout(id: string): void {
   if (timer === undefined) return;
   pendingTurnReplyTimers.delete(id);
   workerScope.clearTimeout(timer);
+}
+
+function enqueuePendingTurnReplyExpiry(id: string): void {
+  // Timeout expiry races the same pending/proposal stores as real replies, so
+  // serialize it with inbound frames and let expirePendingTurnReply re-check.
+  inboundFrameQueue = inboundFrameQueue
+    .then(() => expirePendingTurnReply(id))
+    .catch((err: unknown) => {
+      if (typeof postMessage === "function") postMessage({ kind: "error", error: errorMessage(err) });
+    });
 }
 
 async function expirePendingTurnReply(id: string): Promise<void> {

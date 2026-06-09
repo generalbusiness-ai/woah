@@ -521,6 +521,167 @@ describe("v2 browser worker integration", () => {
     });
   });
 
+  it("arms timeouts for pending turns restored after a worker restart", async () => {
+    const indexedDB = new FakeIndexedDBFactory();
+    const world = createWorld();
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-timeout-restart");
+    world.setProp("the_dubspace", "operators", [session.actor]);
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-timeout-restart",
+      scope: "the_dubspace",
+      serialized: world.exportWorld()
+    });
+    const browser = createShadowBrowserClient({
+      node: "browser:v2-worker-timeout-restart",
+      scope: "the_dubspace",
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: "token:v2-worker-timeout-restart"
+    });
+    const opened = await openShadowBrowserScope(browser);
+
+    const firstPosted: unknown[] = [];
+    const firstScope = new FakeWorkerScope();
+    vi.stubGlobal("__wooV2PendingTurnReplyTimeoutMs", 1000);
+    vi.stubGlobal("self", firstScope);
+    vi.stubGlobal("postMessage", (message: unknown) => firstPosted.push(message));
+    vi.stubGlobal("indexedDB", indexedDB);
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+    await import("../src/client/v2-browser-worker");
+
+    firstScope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-timeout-restart",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    const firstSocket = await waitForSocket();
+    firstSocket.open();
+    firstSocket.receive(encodeEnvelope(relayEnvelope(browser, "hello-timeout-restart-a", "woo.transport.hello.v1", shadowBrowserTransportHello(browser))));
+    firstSocket.receive(encodeEnvelope(relayEnvelope(browser, "transfer-timeout-restart-a", opened.transfer.kind, opened.transfer)));
+    firstSocket.receive(encodeEnvelope(relayEnvelope(browser, "exec-timeout-restart-a", opened.executable_transfer.kind, opened.executable_transfer)));
+    firstSocket.receive(encodeEnvelope(relayEnvelope(browser, "ad-timeout-restart-a", "woo.exec_capability_ad.shadow.v1", opened.ads[0])));
+    await waitForMessage(firstPosted, (message) => isReadyStatus(message));
+
+    firstScope.dispatch({
+      kind: "call",
+      id: "restart-timed-out-turn",
+      route: "sequenced",
+      scope: "the_dubspace",
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.74],
+      persistence: "durable"
+    });
+    await waitForBrowserBuiltExecRequest(browser, firstSocket, "set_control");
+    await waitForMessage(firstPosted, (message) => isLocalTurnPlanned(message, "restart-timed-out-turn"));
+    const firstStatusCursor = firstPosted.filter((message) => isKind(message, "status")).length;
+    firstScope.dispatch({ kind: "cache_status" });
+    await waitFor(() => (firstPosted.filter((message) => isKind(message, "status")).slice(firstStatusCursor)[0] as { status?: { pending?: unknown } } | undefined)?.status?.pending === 1 ? true : undefined);
+
+    vi.resetModules();
+    FakeWorkerScope.clearAllTimers();
+    FakeWebSocket.instances.length = 0;
+    const reloadedPosted: unknown[] = [];
+    const reloadedScope = new FakeWorkerScope();
+    vi.stubGlobal("__wooV2PendingTurnReplyTimeoutMs", 20);
+    vi.stubGlobal("self", reloadedScope);
+    vi.stubGlobal("postMessage", (message: unknown) => reloadedPosted.push(message));
+    vi.stubGlobal("indexedDB", indexedDB);
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+    await import("../src/client/v2-browser-worker");
+
+    reloadedScope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-timeout-restart",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+
+    expect(await waitForMessage(reloadedPosted, (message) => isFinalTurnError(message, "restart-timed-out-turn", "E_V2_TURN_TIMEOUT"))).toMatchObject({
+      kind: "turn_result",
+      frame: {
+        op: "error",
+        id: "restart-timed-out-turn",
+        error: {
+          code: "E_V2_TURN_TIMEOUT",
+          reason: "turn_timeout"
+        }
+      }
+    });
+  });
+
+  it("does not post a timeout error after the matching final reply arrives", async () => {
+    const posted: unknown[] = [];
+    const scope = new FakeWorkerScope();
+    vi.stubGlobal("__wooV2PendingTurnReplyTimeoutMs", 40);
+    vi.stubGlobal("self", scope);
+    vi.stubGlobal("postMessage", (message: unknown) => posted.push(message));
+    vi.stubGlobal("indexedDB", new FakeIndexedDBFactory());
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+
+    await import("../src/client/v2-browser-worker");
+
+    const world = createWorld();
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-timeout-reply");
+    world.setProp("the_dubspace", "operators", [session.actor]);
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-timeout-reply",
+      scope: "the_dubspace",
+      serialized: world.exportWorld()
+    });
+    const browser = createShadowBrowserClient({
+      node: "browser:v2-worker-timeout-reply",
+      scope: "the_dubspace",
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: "token:v2-worker-timeout-reply"
+    });
+    const opened = await openShadowBrowserScope(browser);
+
+    scope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-timeout-reply",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    const socket = await waitForSocket();
+    socket.open();
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "hello-timeout-reply", "woo.transport.hello.v1", shadowBrowserTransportHello(browser))));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "transfer-timeout-reply", opened.transfer.kind, opened.transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "exec-timeout-reply", opened.executable_transfer.kind, opened.executable_transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "ad-timeout-reply", "woo.exec_capability_ad.shadow.v1", opened.ads[0])));
+    await waitForMessage(posted, (message) => isReadyStatus(message));
+
+    scope.dispatch({
+      kind: "call",
+      id: "reply-before-timeout-turn",
+      route: "sequenced",
+      scope: "the_dubspace",
+      target: "the_dubspace",
+      verb: "set_control",
+      args: ["delay_1", "wet", 0.75],
+      persistence: "durable"
+    });
+    const request = await waitForBrowserBuiltExecRequest(browser, socket, "set_control");
+    socket.receive(encodeEnvelope(await relayReply(browser, encodeEnvelope(request))));
+    await waitForMessage(posted, (message) => isLocalTurnCommitted(message, "reply-before-timeout-turn"));
+    await sleep(80);
+
+    expect(posted.some((message) => isFinalTurnError(message, "reply-before-timeout-turn", "E_V2_TURN_TIMEOUT"))).toBe(false);
+  });
+
   it("does not render or replay a projection overlay for a cross-scope durable enter", async () => {
     const posted: unknown[] = [];
     const indexedDB = new FakeIndexedDBFactory();
