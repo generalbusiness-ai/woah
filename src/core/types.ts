@@ -260,6 +260,21 @@ export type WooObject = {
   eventSchemas: Map<string, Record<string, WooValue>>;
 };
 
+// B7 gateway install: which call path requested an authority-slice
+// reconstruction. Threaded from the gateway call sites through the worker's
+// v2GatewayAuthorityPayload to the `authority_slice_reconstructed` metric so
+// the warm_turn_refresh bucket is attributable (see the metric's doc below).
+export type AuthorityReconstructionTrigger =
+  | "turn_commit"
+  | "pre_plan_repair"
+  | "owner_prefetch"
+  | "scope_seed"
+  | "session_open"
+  | "snapshot_retry"
+  | "open_seed"
+  | "gateway_state"
+  | "rest_turn";
+
 // Engine-level instrumentation. Hosts install a hook (`WooWorld.setMetricsHook`)
 // that drains these and emits structured logs (`woo.metric ...`) so tail-based
 // debugging can reason about audience size, cross-host RPC cost, and
@@ -402,7 +417,15 @@ export type MetricEvent =
   // `page_count` size the slice — page_count counts cell pages for the new
   // cell-slice representation (CA12), or object rows for the legacy slice.
   // `source_host` is the host that did the reconstruction.
-  | { kind: "authority_slice_reconstructed"; reason: "warm_turn_refresh" | "cold_open" | "missing_state_repair" | "slice_served"; scope: ObjRef; object_count: number; page_count: number; source_host: string }
+  // `trigger` (B7 gateway install) attributes the reconstruction to the call
+  // path that requested it, so the warm_turn_refresh bucket can be split into
+  // its real sources: per-turn commit authority ("turn_commit"), repair-driven
+  // pre-plan refresh ("pre_plan_repair"), movement-destination owner prefetch
+  // ("owner_prefetch"), first-open relay seeding ("scope_seed"), session-open
+  // authority ("session_open"), the E_SNAPSHOT_REQUIRED reseed ("snapshot_retry"),
+  // the /v2/open cold seed ("open_seed"), gateway state export ("gateway_state"),
+  // and the REST per-turn refresh ("rest_turn"). Absent on legacy emitters.
+  | { kind: "authority_slice_reconstructed"; reason: "warm_turn_refresh" | "cold_open" | "missing_state_repair" | "slice_served"; trigger?: AuthorityReconstructionTrigger; scope: ObjRef; object_count: number; page_count: number; source_host: string }
   // CA11.2 instrumentation: the set of object ids a gateway turn could NOT
   // resolve locally and partitioned to a remote owner host. Fires for every
   // remote host the planning/commit authority refresh touches, whether the
@@ -492,6 +515,13 @@ export type MetricEvent =
   // commit-scope head/session open before local planning proves a B6 relocation;
   // this metric confirms the overlap happened and whether it failed harmlessly.
   | { kind: "mcp_relocation_prewarm"; scope: ObjRef; commit_scope: ObjRef; target: ObjRef; verb: string; ms: number; status: "ok" | "error"; error?: string; error_detail?: string }
+  // B7 gateway install: outcome of one MCP owner-authority prefetch pass.
+  // `requested` ids were newly named by a verb's authority.prefetch metadata;
+  // `warm_local` were already owner-authoritative in the planning relay,
+  // `warm_donor` were copied process-locally from another warm scope client's
+  // relay, and only `residue` paid an authority reconstruction (a first fetch).
+  // Healthy steady state: residue == 0 for revisited destinations.
+  | { kind: "mcp_owner_prefetch"; scope: ObjRef; requested: number; warm_local: number; warm_donor: number; residue: number }
   // Phase attribution for the PersistentObjectDO `/mcp` dispatch wrapper (Slice
   // 1). Covers the steps OUTSIDE submitTurnIntent — session forwarding, the SDK
   // transport handle (which for POST contains the turn, for DELETE is just

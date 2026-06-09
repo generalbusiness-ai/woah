@@ -189,7 +189,13 @@ export type SubmitTurnIntentOptions<Client, Result extends ExecutorEnvelopeResul
     // missing_state_repair authority refresh that force-fetches owner authority
     // for the named ids (CA11.2 occupancy transition), displacing any local
     // topology pre-seed. Absent / false on the first pre-plan and commit phases.
-    context?: { phase: "intent" | "pre_plan" | "commit"; repair?: boolean; plannedTranscriptCommit?: boolean }
+    //
+    // `attempt` is the zero-based repair-loop attempt the request belongs to.
+    // B7 warm-authority callers use it to refuse cached/warm authority on a
+    // repair attempt (attempt > 0): a retry after a conflict/miss must
+    // reconstruct fresh state rather than re-serve the same cache that just
+    // failed validation, or a stale cell loops cache → mismatch → cache.
+    context?: { phase: "intent" | "pre_plan" | "commit"; repair?: boolean; plannedTranscriptCommit?: boolean; attempt?: number }
   ): ExecutorAuthorityPayload | Promise<ExecutorAuthorityPayload>;
   // `planned-exec` normally plans from the caller's cached relay view, then
   // refreshes authority for commit. Sparse gateway shards need the reverse for
@@ -713,9 +719,9 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     basePlanningAuthorityObjectIds(planningScope),
     repairObjectIds
   );
-  const refreshPlanningAuthority = async (planningScope: ObjRef, planningClient: Client, repair = false): Promise<void> => {
+  const refreshPlanningAuthority = async (planningScope: ObjRef, planningClient: Client, repair: boolean, attempt: number): Promise<void> => {
     authorityCalls += 1;
-    const authority = await timePhase((ms) => { authorityMs += ms; }, () => options.authorityPayload(planningScope, planningAuthorityObjectIds(planningScope), { phase: "pre_plan", repair }));
+    const authority = await timePhase((ms) => { authorityMs += ms; }, () => options.authorityPayload(planningScope, planningAuthorityObjectIds(planningScope), { phase: "pre_plan", repair, attempt }));
     options.applyAuthority?.(planningClient, authority.authority);
   };
   try {
@@ -731,7 +737,7 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     const turnId = options.input.id ?? options.nextTurnId(planningClient, attempt);
     const call = buildExecutorCall(options.input, turnId);
     if (options.prePlanAuthority) {
-      await refreshPlanningAuthority(planningScope, planningClient);
+      await refreshPlanningAuthority(planningScope, planningClient, false, attempt);
     }
     const serialized = await timePhase((ms) => { serializeMs += ms; }, () => options.clientSerialized?.(planningClient));
     if (!serialized) throw new Error("planned v2 turn gateway submission requires clientSerialized");
@@ -783,7 +789,7 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
           atoms: missingAtoms
         });
         repairObjectIds = nextRepairObjectIds;
-        if (!options.prePlanAuthority) await refreshPlanningAuthority(planningScope, planningClient, true);
+        if (!options.prePlanAuthority) await refreshPlanningAuthority(planningScope, planningClient, true, attempt + 1);
         continue;
       }
       throw err;
@@ -813,7 +819,7 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
           atoms: missingAtoms
         });
         repairObjectIds = nextRepairObjectIds;
-        if (!options.prePlanAuthority) await refreshPlanningAuthority(planningScope, planningClient, true);
+        if (!options.prePlanAuthority) await refreshPlanningAuthority(planningScope, planningClient, true, attempt + 1);
         continue;
       }
       phaseOutcome = "local_frame";
@@ -849,7 +855,7 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       executorTranscriptObjectIds(planned.transcript)
     );
     authorityCalls += 1;
-    const authority = await timePhase((ms) => { authorityMs += ms; }, () => options.authorityPayload(commitScope, authorityObjectIds, { phase: "commit", plannedTranscriptCommit }));
+    const authority = await timePhase((ms) => { authorityMs += ms; }, () => options.authorityPayload(commitScope, authorityObjectIds, { phase: "commit", plannedTranscriptCommit, attempt }));
     options.applyAuthority?.(commitClient, authority.authority);
     if (commitClient !== planningClient) options.applyAuthority?.(planningClient, authority.authority);
     const head = options.clientHead?.(commitClient);

@@ -50,7 +50,7 @@ import {
   type RestProtocolHost,
   type RestProtocolRequest
 } from "../core/protocol";
-import type { ErrorValue, MetricEvent, ObjRef, Observation, RemoteToolDescriptor, RemoteToolRequest, Session, TinyBytecode, VerbDef, WooValue } from "../core/types";
+import type { AuthorityReconstructionTrigger, ErrorValue, MetricEvent, ObjRef, Observation, RemoteToolDescriptor, RemoteToolRequest, Session, TinyBytecode, VerbDef, WooValue } from "../core/types";
 import { directedRecipients, freezeTinyBytecode, publicAppliedFrame, sessionActiveScopeFromRecord, wooError } from "../core/types";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, LiveEventFrame, Message } from "../core/types";
 import type { SeedWorld, SerializedAuthorityCellSlice, SerializedAuthoritySlice, SerializedObject, SerializedSession, SerializedWorld, TombstoneRecord } from "../core/repository";
@@ -1786,6 +1786,7 @@ export class PersistentObjectDO {
               directorySessionScopes: authorityOptions?.directorySessionScopes,
               scopeContentExpansionRoots: authorityOptions?.scopeContentExpansionRoots,
               reconstructionReason: authorityOptions?.reconstructionReason,
+              reconstructionTrigger: authorityOptions?.reconstructionTrigger,
               reconstructionScope: authorityOptions?.reconstructionScope,
               forceOwnerObjectIds: authorityOptions?.forceOwnerObjectIds
             }),
@@ -4575,7 +4576,7 @@ export class PersistentObjectDO {
     try {
       const seedObjectIds = [commitScope, session.actor];
       let phaseStartedAt = metricNow();
-      const authority = await this.v2GatewayAuthorityPayload(world, seedObjectIds, { reconstructionReason: "cold_open", reconstructionScope: commitScope });
+      const authority = await this.v2GatewayAuthorityPayload(world, seedObjectIds, { reconstructionReason: "cold_open", reconstructionTrigger: "open_seed", reconstructionScope: commitScope });
       this.emitV2OpenStep("gateway_authority", phaseStartedAt, { scope: commitScope, node, actor: session.actor, count: seedObjectIds.length });
       phaseStartedAt = metricNow();
       const openBody = {
@@ -4949,7 +4950,7 @@ export class PersistentObjectDO {
 
   private async v2GatewayState(world: WooWorld, extraObjectIds: Iterable<ObjRef>): Promise<{ serialized: SerializedWorld; authority: ReturnType<typeof executorAuthorityPayload> }> {
     const ids = Array.from(extraObjectIds);
-    const authority = await this.v2GatewayAuthorityPayload(world, ids, { reconstructionReason: "cold_open", reconstructionScope: ids[0] ?? "$nowhere" });
+    const authority = await this.v2GatewayAuthorityPayload(world, ids, { reconstructionReason: "cold_open", reconstructionTrigger: "gateway_state", reconstructionScope: ids[0] ?? "$nowhere" });
     const serialized = serializedWorldFromAuthoritySlice(authority.authority);
     return { serialized, authority };
   }
@@ -4959,7 +4960,8 @@ export class PersistentObjectDO {
     reconstructionScope: ObjRef,
     authority: SerializedAuthoritySlice,
     directoryScopeSessions: readonly DirectorySerializedSession[],
-    reason: AuthorityReconstructionReason
+    reason: AuthorityReconstructionReason,
+    trigger?: AuthorityReconstructionTrigger
   ): ExecutorAuthorityPayload {
     const sessionActors = new Set<ObjRef>(
       authority.sessions
@@ -4990,6 +4992,7 @@ export class PersistentObjectDO {
     world.recordMetric({
       kind: "authority_slice_reconstructed",
       reason,
+      ...(trigger ? { trigger } : {}),
       scope: reconstructionScope,
       object_count: authoritySliceObjectIds(filteredAuthority).size,
       page_count: authoritySlicePageCount(filteredAuthority),
@@ -5051,6 +5054,7 @@ export class PersistentObjectDO {
       directorySessionScopes?: readonly ObjRef[];
       scopeContentExpansionRoots?: readonly ObjRef[];
       reconstructionReason?: AuthorityReconstructionReason;
+      reconstructionTrigger?: AuthorityReconstructionTrigger;
       reconstructionScope?: ObjRef;
       forceOwnerObjectIds?: readonly ObjRef[];
     } = {}
@@ -5389,7 +5393,7 @@ export class PersistentObjectDO {
       ? authority
       : { ...authority, sessions: authoritySessions };
     return {
-      ...this.authorityPayloadFromCachedAuthority(world, reconstructionScope, filteredAuthority, directoryScopeSessions, reconstructionReason),
+      ...this.authorityPayloadFromCachedAuthority(world, reconstructionScope, filteredAuthority, directoryScopeSessions, reconstructionReason, options.reconstructionTrigger),
       staleFallbackCount
     };
   }
@@ -5467,6 +5471,7 @@ export class PersistentObjectDO {
           tolerateRemoteFailures: true,
           directorySessionScopes: extraObjectIds,
           reconstructionReason: "warm_turn_refresh",
+          reconstructionTrigger: "rest_turn",
           reconstructionScope: _scope
         }),
       applyAuthority: (client, authority) => {
