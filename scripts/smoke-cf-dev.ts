@@ -53,6 +53,8 @@ const READY_POLL_MS = 500;
 // Generous step watchdog: cold workerd DO instantiation on first touch is real
 // here (unlike the fake), so individual steps can run several seconds.
 const STEP_TIMEOUT_MS = 60_000;
+// Settle window for piped worker metrics to drain before teardown in --measure.
+const METRIC_FLUSH_MS = 2000;
 
 async function main(): Promise<void> {
   const port = args.port ?? (await findFreePort());
@@ -110,6 +112,11 @@ async function main(): Promise<void> {
         total: results.length
       });
     }
+    // Metrics arrive asynchronously via the piped wrangler stdout; the last
+    // pass's lines can still be in the pipe when its window closes. Let them
+    // drain before teardown SIGTERMs wrangler (which would drop buffered output),
+    // so the final pass is not under-counted in the measurement table.
+    if (args.measure) await sleep(METRIC_FLUSH_MS);
   } catch (err) {
     crashed = err;
   } finally {
@@ -172,17 +179,27 @@ function printMeasurement(metrics: Metric[], windows: PassWindow[]): void {
   row("authority_calls", perPassTurns.map((turns) => turns.reduce((a, t) => a + num(t.authority_calls), 0)));
   row("repair turns (attempts!=1)", perPassTurns.map((turns) => turns.filter((t) => num(t.attempts) !== 1).length));
 
+  // The actual perf levers (per-turn detail shows repeat turns on a warm scope
+  // are already ~free; cost concentrates here):
+  //  - first-touch turns: a scope seeded for the first time on this session
+  //    (ensure_client > 0) — pays a full authority-slice reconstruction;
+  //  - warm_turn_refresh reconstructions: owner_prefetch on movement verbs
+  //    rebuilds a full slice just to prefetch the destination. Target = 0
+  //    (notes/2026-06-09-warm-turn-bounded-commit.md).
+  row("first-touch turns (ensure>0)", perPassTurns.map((turns) => turns.filter((t) => num(t.ensure_client_ms) > 0).length));
+  row("warm-repeat turns (ensure==0)", perPassTurns.map((turns) => turns.filter((t) => num(t.ensure_client_ms) === 0).length));
+  const perPassRecon = windows.map((w) => metrics.filter((m) => m.kind === "authority_slice_reconstructed" && inWindow(m.ts, w)));
+  row("slice reconstructions (total)", perPassRecon.map((r) => r.length));
+  row("  reason=warm_turn_refresh", perPassRecon.map((r) => r.filter((m) => m.reason === "warm_turn_refresh").length));
+
   const perPassEnv = windows.map((w) => metrics.filter((m) => m.kind === "v2_envelope" && inWindow(m.ts, w)));
   row("envelope request_bytes (sum)", perPassEnv.map((env) => env.reduce((a, e) => a + num(e.request_bytes), 0)));
   row("envelope request_bytes (max)", perPassEnv.map((env) => env.reduce((a, e) => Math.max(a, num(e.request_bytes)), 0)));
 
-  if (windows.length >= 2) {
-    const cold = perPassTurns[0].reduce((a, t) => a + num(t.total_ms), 0);
-    const warm = perPassTurns[windows.length - 1].reduce((a, t) => a + num(t.total_ms), 0);
-    if (cold > 0) console.log(`\n  warm/cold total_ms ratio: ${(warm / cold).toFixed(2)} (cold=${Math.round(cold)}ms warm=${Math.round(warm)}ms)`);
-  }
-  console.log("\n  note: workerd-local is single-process — phase ms is a relative/floor signal, not a");
-  console.log("        prod number; request_bytes & authority_calls are the transport-independent levers.");
+  console.log("\n  levers: shrink first-touch seed_authority (full slice per scope/session) and drive");
+  console.log("          warm_turn_refresh reconstructions toward 0. Repeat turns on a warm scope are");
+  console.log("          already ~free (ensure==0). Phase ms is a single-process floor, not a prod number;");
+  console.log("          request_bytes & reconstruction counts are the transport-independent levers.");
 }
 
 // Continue-on-failure step runner: record every step, never reset sessions
