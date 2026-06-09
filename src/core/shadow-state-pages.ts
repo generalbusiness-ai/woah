@@ -182,18 +182,34 @@ export function shadowVerbBytecodePages(obj: SerializedObject): ShadowVerbByteco
     .sort((a, b) => (a.verb.slot ?? 0) - (b.verb.slot ?? 0) || a.name.localeCompare(b.name));
 }
 
+// Canonical preimage for a state page's IDENTITY hash (CA12.2). For a
+// `verb_bytecode` page this is line_map-blind: `line_map` (pc -> source position)
+// is authoring/diagnostic metadata, consumed only by stack-trace formatting, and
+// MUST NOT change a page's identity. Both shadowStatePageHash and the ref `hash`
+// route through this ONE function, so the two can never diverge and a delivered
+// page MAY omit `line_map` without desynchronising ref/verification. The page
+// `bytes` is computed separately from the actual page (below), so it still
+// reflects real wire size whether or not line_map is present.
+function pageHashPreimage(page: ShadowStatePage): string {
+  if (page.page === "verb_bytecode" && Object.keys(page.verb.line_map ?? {}).length > 0) {
+    const blind: ShadowVerbBytecodePage = { ...page, verb: { ...page.verb, line_map: {} } };
+    return stableShadowJson(blind as unknown as WooValue);
+  }
+  return stableShadowJson(page as unknown as WooValue);
+}
+
 export function shadowStatePageHash(page: ShadowStatePage): string {
-  return hashSource(stableShadowJson(page as unknown as WooValue));
+  return hashSource(pageHashPreimage(page));
 }
 
 export function shadowStatePageRef(page: ShadowStatePage, inline: boolean): ShadowStatePageRef {
-  const json = stableShadowJson(page as unknown as WooValue);
   return {
     object: page.object,
     page: page.page,
     ...(page.page === "property_cell" || page.page === "verb_bytecode" ? { name: page.name } : {}),
-    hash: hashSource(json),
-    bytes: utf8ByteLength(json),
+    // Identity hash is line_map-blind; `bytes` reports the actual page size.
+    hash: hashSource(pageHashPreimage(page)),
+    bytes: utf8ByteLength(stableShadowJson(page as unknown as WooValue)),
     inline
   };
 }

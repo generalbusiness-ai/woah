@@ -31,7 +31,14 @@ import {
 import { createWorld } from "../src/core/bootstrap";
 import { executorAuthorityPayload } from "../src/core/executor";
 import type { SerializedAuthorityCellSlice, SerializedObject } from "../src/core/repository";
-import { shadowObjectLivePage, stampAuthorityPageRef } from "../src/core/shadow-state-pages";
+import {
+  shadowObjectLivePage,
+  shadowStatePageHash,
+  shadowStatePageRef,
+  shadowVerbBytecodePages,
+  stampAuthorityPageRef
+} from "../src/core/shadow-state-pages";
+import type { ShadowVerbBytecodePage } from "../src/core/shadow-state-pages";
 
 describe("WooWorld.exportAuthoritySlice content contract", () => {
   it("includes the explicit root plus its parent class chain", () => {
@@ -408,3 +415,74 @@ function compareAuthorityRefsForTest(
 ): number {
   return a.object.localeCompare(b.object) || a.page.localeCompare(b.page) || (a.name ?? "").localeCompare(b.name ?? "");
 }
+
+// CA12.2: a verb_bytecode page's identity hash is line_map-blind. line_map is
+// authoring/diagnostic metadata (pc -> source position), so the same verb with
+// or without it MUST hash identically — that is what makes it safe to omit
+// line_map from a delivered authority page (the dominant slice-byte contributor)
+// without desynchronising page-ref/verification. These tests fail before the
+// canonical-preimage change and pass after it.
+describe("CA12.2 verb_bytecode page-hash is line_map-blind", () => {
+  // A serialized verb_bytecode page that actually carries a populated line_map.
+  function verbPageWithLineMap(): { world: ReturnType<typeof createWorld>; page: ShadowVerbBytecodePage } {
+    const world = createWorld({ catalogs: ["chat", "demoworld", "note", "pinboard", "tasks"] });
+    for (const id of ["$pinboard", "$task_registry", "$note", "$exit", "$room"]) {
+      const objs = world.exportObjects([id]);
+      if (objs.length === 0) continue;
+      const page = shadowVerbBytecodePages(objs[0]).find(
+        (p) => Object.keys((p.verb as { line_map?: Record<string, unknown> }).line_map ?? {}).length > 0
+      );
+      if (page) return { world, page };
+    }
+    throw new Error("no verb_bytecode page with a populated line_map found in the demo world");
+  }
+
+  function strip(page: ShadowVerbBytecodePage): ShadowVerbBytecodePage {
+    return { ...page, verb: { ...page.verb, line_map: {} } };
+  }
+
+  it("hashes identical verb pages the same whether or not line_map is present", () => {
+    const { page } = verbPageWithLineMap();
+    expect(Object.keys((page.verb as { line_map: Record<string, unknown> }).line_map).length).toBeGreaterThan(0);
+    expect(shadowStatePageHash(strip(page))).toBe(shadowStatePageHash(page));
+    expect(shadowStatePageRef(strip(page), true).hash).toBe(shadowStatePageRef(page, true).hash);
+  });
+
+  it("lets a ref minted from the full page identify a line_map-stripped inline page", () => {
+    const { page } = verbPageWithLineMap();
+    // The ref a sender mints from the full page must still identify the page
+    // after delivery strips line_map — otherwise verification cannot pair them.
+    expect(shadowStatePageHash(strip(page))).toBe(shadowStatePageRef(page, true).hash);
+  });
+
+  it("keeps line_map out of identity but reflects actual size in ref.bytes", () => {
+    const { page } = verbPageWithLineMap();
+    // Identity is line_map-blind; `bytes` is a size hint, not identity, so a
+    // stripped page is smaller. This guards against re-folding line_map back
+    // into the page hash (which would reintroduce the delivery-edge desync bug).
+    expect(shadowStatePageHash(strip(page))).toBe(shadowStatePageHash(page));
+    expect(shadowStatePageRef(strip(page), true).bytes).toBeLessThan(shadowStatePageRef(page, true).bytes);
+  });
+
+  it("materializes a slice whose inline verb pages were line_map-stripped (bytecode survives)", () => {
+    const world = createWorld({ catalogs: ["chat", "demoworld", "note", "pinboard", "tasks"] });
+    const slice = world.exportAuthoritySlice([], ["$pinboard"]);
+    expect(isAuthorityCellSlice(slice)).toBe(true);
+    if (!isAuthorityCellSlice(slice)) throw new Error("expected a cell slice");
+    // Refs were minted from full pages; strip line_map from the delivered inline
+    // pages. serializedWorldFromAuthoritySlice pairs refs to inline pages by
+    // shadowStatePageHash, so this only materializes if the hash is line_map-blind.
+    const strippedSlice: SerializedAuthorityCellSlice = {
+      ...slice,
+      inline_pages: slice.inline_pages.map((p) =>
+        p.page === "verb_bytecode" ? { ...p, verb: { ...p.verb, line_map: {} } } : p
+      )
+    };
+    const materialized = serializedWorldFromAuthoritySlice(strippedSlice);
+    const pinboard = materialized.objects.find((o) => o.id === "$pinboard");
+    const bytecodeVerb = pinboard?.verbs.find((v) => v.kind === "bytecode");
+    expect(bytecodeVerb, "$pinboard bytecode verb must survive materialization").toBeTruthy();
+    expect((bytecodeVerb as { bytecode?: unknown }).bytecode, "execution-essential bytecode preserved").toBeTruthy();
+    expect(Object.keys((bytecodeVerb as { line_map: Record<string, unknown> }).line_map).length).toBe(0);
+  });
+});

@@ -722,6 +722,42 @@ Implementations MUST either split live state into exact cell/projection coverage
 (`live:location:<obj>`, per-member `projection:contents:<room>/<member>`) or
 forbid sparse use of object-level live pages until the split exists.
 
+### CA12.2 Page-hash canonicalization (verb_bytecode is line_map-blind)
+
+A state page's identity hash and its page reference hash MUST be computed from a
+single canonical preimage, so that two pages that are equivalent for execution
+and validation hash identically regardless of representation-only differences.
+
+For a `verb_bytecode` page the canonical preimage MUST exclude the verb
+`line_map` (the pc→source-position map). `line_map` is authoring/diagnostic
+metadata, consumed only by stack-trace formatting, and its presence MUST NOT
+change a page's identity. Concretely:
+
+- The same verb page with a populated `line_map` and with an empty `line_map`
+  MUST produce the same page hash and the same page-ref `hash`.
+- All page hashing, page-ref construction, and transfer verification MUST route
+  through this one canonical preimage. A node MUST NOT recompute a page hash by
+  any path that includes `line_map`, and verification MUST compare pages by this
+  canonical hash, never by deep content equality that would observe `line_map`.
+- Because the hash is line_map-blind, a sender MAY omit `line_map` from a
+  delivered `verb_bytecode` page (inline or referenced) and the receiver's
+  ref/hash verification still accepts it. Execution uses `bytecode`; a receiver
+  that lacks `line_map` degrades gracefully to position-less stack frames and
+  MAY recompile `line_map` from `source` on demand (see the host-seed delivery
+  contract, which already strips `line_map`). `source`/`bytecode`/`source_hash`
+  MUST be preserved.
+- The page-ref `bytes` field reports the actual delivered page size and so MAY
+  differ between a line_map-bearing and a line_map-stripped copy of the same
+  page; it is a size hint, not part of page identity, and is never used to
+  reject a page.
+
+Changing this canonicalization changes every `verb_bytecode` page hash, so the
+first deployment that adopts it triggers a one-time reseed convergence (cold
+satellites re-fetch pages under the new hashes via the existing
+`E_SNAPSHOT_REQUIRED`/missing-page repair path). This is self-healing and
+requires no migration, but it is a fleet-wide convergence cost that MUST be
+expected on rollout.
+
 ## CA13. Performance and hot-spot scalability
 
 Two scaling axes are both first-class, not one primary and one edge case:
