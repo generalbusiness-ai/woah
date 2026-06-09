@@ -99,6 +99,38 @@ Ignored raw artifacts for the `d8e30ba2` deployed run:
 - `.woo/smoke-measurements/deploy-d8e30ba2-121cd46-20260608T2129Z/analyze-smoke-tail.txt`
 - `.woo/smoke-measurements/deploy-d8e30ba2-121cd46-20260608T2129Z/analyze-data-path-costs.txt`
 
+Commit `c25f372` deployed to Cloudflare version
+`dd88a37d-0825-409d-8e5d-3b17c945afed` after threading inherited tool
+definers/support rows through MCP dispatch. The deploy preflight, tests, build,
+and postflight checks passed. The deploy script's built-in smoke failed/halted:
+5/8 attempted steps passed, with three 20s MCP timeout-class failures. The
+important correctness signal was that both `move:southeast emits left to bob`
+and `move:west emits entered to bob` passed in production, closing the
+inherited `$room:southeast` blocker.
+
+A follow-up smoke without usable tail auth passed 7/10: chat, movement, mug,
+and pinboard passed, while outliner failed with `E_VERBNF reachable MCP tool
+not found: the_outline:enter`, reset hit `E_NEED_STATE` for
+`read:cell:contents:the_chatroom`, and tasks found the recovery actor at
+`null`.
+
+A corrected tail-captured follow-up against the same deployed version failed
+0/10 after the first step hit `E_NEED_STATE`: `contents needs
+owner-authoritative contents for the_chatroom`. Every subsequent reset retried
+against the same missing authoritative `object_live` cell, causing `E_NOSESSION`
+fallout, and the final tasks step timed out.
+
+Raw artifacts for the `dd88a37d` deployed runs:
+
+- `/tmp/woo-deploy-smoke.log`
+- `.woo/smoke-measurements/deploy-dd88a37d-c25f372-20260608T222217Z/smoke.log`
+- `.woo/smoke-measurements/deploy-dd88a37d-c25f372-20260608T222217Z/smoke-run-1.log`
+- `.woo/smoke-measurements/deploy-dd88a37d-c25f372-20260608T223100Z/tail.log`
+- `.woo/smoke-measurements/deploy-dd88a37d-c25f372-20260608T223100Z/smoke.log`
+- `.woo/smoke-measurements/deploy-dd88a37d-c25f372-20260608T223100Z/smoke-run-1.log`
+- `.woo/smoke-measurements/deploy-dd88a37d-c25f372-20260608T223100Z/analyze-smoke-tail.txt`
+- `.woo/smoke-measurements/deploy-dd88a37d-c25f372-20260608T223100Z/analyze-data-path-costs.txt`
+
 ## Correctness Finding
 
 The pinboard blocker happened before VM execution during scope/session
@@ -171,6 +203,18 @@ support such as `$room` from `world` before executing inherited tools.
 The same definer lookup is applied to obvious-projection tools so support rows
 follow class lineage rather than the verb's code owner.
 
+Eighth root cause: once inherited tool support reached production, sparse
+gateway repair exposed a stale Directory route. The `dd88a37d` tail showed
+`turn_repair_attempt` for `read:cell:contents:the_chatroom`, but the
+corresponding `authority_slice_partition` sent `the_chatroom` to host `world`
+instead of host `the_chatroom`. `world` can only provide projection/cache
+support for that room, so the retry still lacked an owner-authoritative
+`object_live` page and looped on `E_NEED_STATE`. Sparse MCP authority routing
+now prefers a locally-proven self-hosted route when Directory claims `world` for
+a non-bootstrap object during owner repair, so `the_chatroom` repairs fetch from
+the room DO while ordinary actors/default-hosted objects can still resolve to
+`world`.
+
 Fix validation after patching authority-slice materialization:
 
 - `npm run test:files -- tests/authority-slice-shape.test.ts tests/worker/cf-local-structural.test.ts`
@@ -232,6 +276,21 @@ dispatch:
 - `npm test` passed, 29 files and 377 tests.
 - `npm run typecheck` passed both TypeScript configs.
 - `npm run test:worker` passed, 16 files and 236 tests, 5 skipped.
+
+Validation after preferring sparse self-host routes over stale Directory world
+routes:
+
+- `npm run test:files -- tests/worker/gateway-projection-cache.test.ts` passed,
+  27 tests. The new regression forces Directory to answer
+  `the_chatroom -> world` and verifies missing-state repair fetches
+  `the_chatroom` from host `the_chatroom` with authoritative `object_live`
+  provenance.
+- `npm run test:files -- tests/mcp.test.ts tests/worker/scope-topology-seed.test.ts tests/worker/gateway-projection-cache.test.ts`
+  passed, 97 tests.
+- `npm run smoke:cf-local` passed, 1 file, 4 tests, Vitest duration 33.21s.
+- `npm run typecheck` passed both TypeScript configs.
+- `npm test` passed, 29 files and 377 tests.
+- `npm run test:worker` passed, 16 files and 237 tests, 5 skipped.
 
 ## Performance Summary
 
@@ -430,6 +489,46 @@ Correctness detail from the final tasks failure:
 - Retry still failed with `E_VERBNF`, confirming inherited definer/support
   hydration was the remaining gap.
 
+The tail-captured deployed run after inherited tool support found 782
+Cloudflare tail events and 2,170 `woo.metric` rows.
+
+Cloudflare invocation timing:
+
+- Worker `POST /mcp`: 87 requests, p95 8,569 ms, max 10,961 ms.
+- PersistentObjectDO `POST /mcp`: 86 requests, p95 8,446 ms, max 10,946 ms,
+  CPU p95 5,502 ms.
+- PersistentObjectDO `POST /__internal/authority-slice`: 38 requests, p95
+  2,482 ms, max 2,877 ms.
+- CommitScopeDO `POST /v2/envelope`: 4 requests, p95 2,628 ms, max 2,673 ms.
+- PersistentObjectDO `DELETE /mcp`: 34 requests, 1 error, p95 428 ms, max
+  8,044 ms.
+
+Turn phase attribution across reported turns:
+
+- Authority planning: 40,120 ms, 46% of summed turn wall time.
+- Ensure-client: 30,612 ms, 35%.
+- Submit: 15,990 ms, 18%.
+
+Correctness detail from the `E_NEED_STATE` failure:
+
+- `mcp_tool_resolve` hit `the_chatroom:enter`.
+- The first direct call failed with `E_NEED_STATE` for
+  `read:cell:contents:the_chatroom`.
+- The repair attempt named object `the_chatroom`, but authority partition sent
+  it to host `world`.
+- The retry failed with the same `E_NEED_STATE`, confirming route misclassification
+  rather than missing repair classification.
+
+Data-path costs:
+
+- `storage_full_save`: 3 events, 8,958 rows.
+- `storage_direct_write`: 172 metric rows, 1,997 data rows.
+- Observed projection bytes: 93.7 KiB.
+- Cross-host round trips: 85.
+- Same-host fallback count: 25.
+- Remote owner refresh count: 8.
+- Tool-surface reverse-index source rows requested: 120; cap-hit events: 0.
+
 ## Interpretation
 
 The deployed failure was a correctness blocker in sparse authority-slice
@@ -444,4 +543,6 @@ narrowed the remaining tasks failure to executable sparse-state repair:
 resolution and tool-surface reachability were correct, but the target verb cell
 was not hydrated before dispatch retry. The `d8e30ba2` run narrowed that again:
 the target and actor were repairable, but inherited verb support did not travel
-as an owner-prefetch root.
+as an owner-prefetch root. The `dd88a37d` run closed inherited verb support in
+production and exposed stale Directory object routing as the next blocker: repair
+was now correctly requested, but the owner host was wrong.

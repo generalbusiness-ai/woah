@@ -5123,6 +5123,15 @@ export class PersistentObjectDO {
     const routesById = isMcpGatewayShardHost(localHost)
       ? new Map<ObjRef, { id: ObjRef; host: string; anchor: ObjRef | null }>()
       : new Map(world.objectRoutes().map((route) => [route.id, route] as const));
+    const localSelfHostedRoute = (id: ObjRef): string => {
+      if (!mcpGatewayShard || id.startsWith("$") || !world.objects.has(id)) return "";
+      try {
+        const host = world.objectHostKey(id);
+        return host === id ? host : "";
+      } catch {
+        return "";
+      }
+    };
     const resolveHost = async (id: ObjRef, fallbackHost: string): Promise<string> => {
       const localRoute = routesById.get(id) ?? null;
       if (localRoute) {
@@ -5154,8 +5163,17 @@ export class PersistentObjectDO {
         // Sparse MCP shards can carry a stale `id -> world` cache entry from an
         // earlier fallback route. For authority refresh, Directory is the
         // routing authority: an unresolved non-$ id should use the local
-        // last-known row, not wake the world singleton as a guessed owner.
-        const directoryHost = await this.fetchDirectoryObjectHost(id, "");
+        // last-known row, not wake the world singleton as a guessed owner. A
+        // deployed Directory can also hold an older `id -> world` row for a
+        // self-hosted room; when the sparse local row proves self-placement,
+        // prefer that owner route so a force-owner repair fetches authoritative
+        // live cells from the room DO instead of looping on world's projection.
+        const localSelfHost = localSelfHostedRoute(id);
+        const directoryHost = await this.fetchDirectoryObjectHost(id, localSelfHost);
+        if (directoryHost === WORLD_HOST && localSelfHost) {
+          this.routeCache.set(id, localSelfHost);
+          return localSelfHost;
+        }
         if (directoryHost) {
           this.routeCache.set(id, directoryHost);
           return directoryHost;

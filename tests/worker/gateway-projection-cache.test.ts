@@ -1143,6 +1143,61 @@ describe("gateway projection cache", () => {
     expect(reads).toEqual(["the_chatroom", "world"]);
   });
 
+  it("does not let a stale Directory world route override sparse self-host repair", async () => {
+    const state = new FakeDurableObjectState("mcp-gateway-0");
+    const world = createWorld();
+    const session = world.auth("guest:authority-stale-directory-world");
+    const reads: Array<{ host: string; objects: ObjRef[] }> = [];
+    const po = new PersistentObjectDO(state as unknown as DurableObjectState, env({
+      DIRECTORY: new FakeDurableObjectNamespace(() => ({
+        fetch: async (request: Request) => {
+          const body = await request.json() as { id?: string };
+          return new Response(JSON.stringify({ id: body.id, host: "world", anchor: null }), {
+            headers: { "content-type": "application/json" }
+          });
+        }
+      })) as unknown as DurableObjectNamespace
+    })) as unknown as {
+      v2GatewayAuthorityPayload: (
+        world: ReturnType<typeof createWorld>,
+        extraObjectIds: ObjRef[],
+        options: {
+          tolerateRemoteFailures?: boolean;
+          reconstructionReason?: "warm_turn_refresh" | "cold_open" | "missing_state_repair" | "slice_served";
+          reconstructionScope?: ObjRef;
+          forceOwnerObjectIds?: readonly ObjRef[];
+        }
+      ) => Promise<{ authority: SerializedAuthoritySlice }>;
+      forwardInternalReadChecked: (host: string, path: string, body: { objects?: ObjRef[] }) => Promise<{ authority: SerializedAuthoritySlice }>;
+      routeCache: Map<ObjRef, string>;
+    };
+    po.forwardInternalReadChecked = async (host, _path, body) => {
+      reads.push({ host, objects: [...(body.objects ?? [])] });
+      return { authority: authorityFromHost(world, host, body.objects ?? []) };
+    };
+
+    const payload = await po.v2GatewayAuthorityPayload(world, ["the_chatroom", session.actor], {
+      tolerateRemoteFailures: true,
+      reconstructionReason: "missing_state_repair",
+      reconstructionScope: "the_chatroom",
+      forceOwnerObjectIds: ["the_chatroom"]
+    });
+
+    expect(reads).toEqual(expect.arrayContaining([
+      expect.objectContaining({ host: "the_chatroom", objects: expect.arrayContaining(["the_chatroom"]) })
+    ]));
+    expect(reads.some((read) => read.host === "world" && read.objects.includes("the_chatroom"))).toBe(false);
+    expect(po.routeCache.get("the_chatroom")).toBe("the_chatroom");
+    if (payload.authority.kind === "woo.authority_slice.cells.shadow.v1") {
+      expect(payload.authority.page_refs).toContainEqual(expect.objectContaining({
+        object: "the_chatroom",
+        page: "object_live",
+        source: "authoritative",
+        source_host: "the_chatroom"
+      }));
+    }
+  });
+
   it("omits session rows whose actor row is absent from the authority slice", async () => {
     const state = new FakeDurableObjectState("mcp-gateway-0");
     const world = createWorld();
