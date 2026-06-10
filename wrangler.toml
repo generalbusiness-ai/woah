@@ -57,6 +57,16 @@ WOO_V2_SLIM_WARM_ENVELOPE = "1"
 # start penalty. Disabled in the fake-DO test lane (WOO_V2_KV_SEED_AUTHORITY must
 # NOT be set there) because the lane is microtask-ordering-sensitive.
 WOO_V2_KV_SEED_AUTHORITY = "1"
+# B-i: planned-transcript (cross-scope) envelopes carry only the turn's read
+# closure instead of the scope-wide authority slice (VTN8.3). Validated by the
+# corpus/lane parity gates and the <256KB enforced byte ceiling; verdict
+# equivalence is proven, not assumed. Flag-off restores full slices instantly.
+WOO_V2_READ_CLOSURE_ENVELOPE = "1"
+# D1: peer fanout moves off the caller's commit-reply path into the durable
+# v2_fanout_pending outbox (VTN9.1): reply after durable save, drain after
+# reply, drain-on-reactivation covers the crash window, bounded backoff with
+# fanout_redelivery metrics. Flag-off restores synchronous post-accept delivery.
+WOO_V2_TAIL_DELIVERY = "1"
 
 # Static assets: the bundled SPA is built to dist/ via `npm run build`.
 # The Worker entry routes global API/WS traffic to the gateway DO and object

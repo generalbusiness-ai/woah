@@ -34,6 +34,12 @@ enabled = false
 # Same demo bundle as wrangler.smoke.toml so the world matches.
 WOO_AUTO_INSTALL_CATALOGS = "chat,demoworld,dubspace,help,note,pinboard,prog,tasks,blocks-demo"
 WOO_V2_SLIM_WARM_ENVELOPE = "1"
+# Behavior flags mirror production wrangler.toml (enforced by
+# guard:smoke-wrangler WOO_* parity): the browser e2e lane must exercise the
+# same envelope/fanout/cold-read paths the deployed worker runs.
+WOO_V2_KV_SEED_AUTHORITY = "1"
+WOO_V2_READ_CLOSURE_ENVELOPE = "1"
+WOO_V2_TAIL_DELIVERY = "1"
 # Local-only, non-secret defaults.
 WOO_INITIAL_WIZARD_TOKEN = "local-cf-e2e-wizard-token"
 WOO_INTERNAL_SECRET = "local-cf-e2e-internal-secret"
