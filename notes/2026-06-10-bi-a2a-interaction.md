@@ -165,6 +165,18 @@ granularity, not a stable regression.
 - Both invariants hold simultaneously
 - npm test: 561/561, ~39s wall
 
+## Validation
+
+All acceptance criteria verified on `bi-a2a-interaction` at HEAD:
+
+| Check | Result |
+|-------|--------|
+| `npm run typecheck` | clean (both tsconfigs) |
+| `npm test` | 561/561 green, 39s wall |
+| `npm run test:worker` | 276/276 green, 51s wall |
+| `npm run smoke:cf-dev` (run 1) | 13/13 steps passed |
+| `npm run smoke:cf-dev` (run 2) | 13/13 steps passed |
+
 ## Profiling artefacts
 
 Temporary profiling code (debug counters + `tests/bi-a2a-profiling.test.ts`) was
