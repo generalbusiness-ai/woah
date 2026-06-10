@@ -954,6 +954,51 @@ transfer. A reconnecting browser therefore follows this order:
 5. discard optimistic browser-local state that cannot be reconciled to the new
    head.
 
+### VTN9.1 Tail-driven post-reply delivery
+
+> **Status: specified, not implemented** (plan item D1,
+> `notes/2026-06-09-cf-cross-scope-architecture-plan.md`; implementation
+> brief `notes/2026-06-09-d1-tail-delivery-design.md`). Flag:
+> `WOO_V2_TAIL_DELIVERY`. Measured motivation: peer fanout is awaited on the
+> caller's reply path today (mean 533 ms, p95 2.3 s of every deployed turn).
+
+The committing scope's reply to the submitting caller MUST NOT wait on peer
+delivery. The contract:
+
+1. **Durability before reply.** The accepted frame is persisted to the
+   scope's durable relay tail before the commit reply is sent (the existing
+   persist-before-ack rule, unchanged).
+2. **Reply before fanout.** The commit reply — and with it the caller's own
+   applied frame — is sent as soon as the frame is durable. Peer fanout
+   (derived relay caches, projection owners, session shards) runs after,
+   off the caller's critical path.
+3. **The durable tail is the outbox.** Delivery to each destination is a
+   drain of the durable tail in sequence order, tracked by a durable
+   per-destination cursor. Delivery is at-least-once; receivers are already
+   idempotent and sequence-gated (`durableProjectionHeadSeq` fallback,
+   per-(member, source-version) projection application), so redelivery
+   converges.
+4. **Crash recovery.** A scope host evicted or killed after the reply but
+   before the drain completes MUST resume the drain from the durable
+   cursors on its next activation. An implementation MAY use a post-reply
+   continuation (`waitUntil`) for the common case, but correctness MUST
+   come from cursor + drain-on-reactivation, never from the continuation
+   having run.
+5. **Ordering scope.** Per-destination delivery preserves commit order;
+   no cross-destination ordering is guaranteed (unchanged from today).
+6. **Failure visibility.** A destination that repeatedly rejects or times
+   out is retried with bounded backoff and surfaced as a metric
+   (`fanout_redelivery`: destination, attempt count, age). A destination
+   that falls more than a bounded distance behind the head is repaired via
+   the existing catch-up/state-transfer machinery instead of frame-by-frame
+   replay — never silently dropped.
+
+Conformance: a kill injected between durable save and fanout
+(`kill_after_commit`, the C1a fault seam) MUST yield a world where the
+caller saw success and every affected peer converges after the scope's next
+activation. Actor reply time and peer-visible latency MUST be independent
+of audience size up to the fanout shard bound (CA13.1).
+
 ## VTN10. Execution plane
 
 Execution RPC asks another node to execute a whole turn. The request target is a
