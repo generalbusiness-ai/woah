@@ -12,7 +12,7 @@
 // scenario reads `pair.alice`/`pair.bob` fresh inside each step so a session
 // reset between steps is transparent here.
 //
-// Two flags select the small differences between lanes:
+// Four flags select the small differences between lanes:
 //   - includeTakeDrop: the same-room mug take/drop step. ON for the deployed
 //     and workerd lanes; OFF for the dangling-ref-gated fake lane (a take on a
 //     $portable object emits dangling_parent_ref until $portable lineage reaches
@@ -20,6 +20,15 @@
 //   - includeConcurrentMove: the B6 concurrent-through-shared-destination step.
 //     ON for the fake lane (it pairs with that lane's coherence-invariant
 //     ratchet); optional elsewhere.
+//   - includeCarryAcrossRooms: C3 gate — take a $portable in room A, move to
+//     room B, invoke a verb on it (testing the object's class lineage resolves
+//     in the new scope), peer in room B sees the dropped item. This step passes
+//     in the fake lane (single world image) but FAILS in cf-dev and deployed
+//     until A2 (lineage-closed row installation) lands. TRACKED → A2.
+//   - includeToolSurfaceAfterMove: C3 gate — after moving from chatroom to
+//     the_deck and entering the_pinboard, assert add_note is reachable from the
+//     new scope. The verb-on-carried-object test covers the lineage side; this
+//     one covers the tool-surface enumeration side. TRACKED → A2.
 
 import { isRecord, SmokeSession, waitObservationsOf } from "./session";
 
@@ -36,6 +45,16 @@ export type SmokeScenarioOptions = {
   runId: string;
   includeTakeDrop?: boolean;
   includeConcurrentMove?: boolean;
+  // C3 gates — carry an object across a room boundary and verify the object's
+  // class lineage is usable in the new scope. PASS in fake lane (shared world
+  // image), FAIL in cf-dev/deployed until A2 (lineage-closed row installation).
+  // See notes/2026-06-09-c2c3-gates-scenario.md for the per-lane status.
+  includeCarryAcrossRooms?: boolean;
+  // C3 gate — assert that the pinboard's add_note tool is reachable after
+  // moving to the_deck from the_chatroom. Exercises the tool-surface
+  // enumeration path that cross-scope lineage gaps break in cf-dev/deployed.
+  // PASS in fake lane; FAIL in cf-dev/deployed until A2 lands. TRACKED → A2.
+  includeToolSurfaceAfterMove?: boolean;
   // Per-assertion wait budget (the cross-actor fanout settle window).
   waitTimeoutMs?: number;
   drainBudgetMs?: number;
@@ -175,6 +194,168 @@ export async function runSmokeWalkthrough(
       waitMs, ctx.signal, cfg);
       await drain(alice, cfg, ctx.signal);
       await drain(bob, cfg, ctx.signal);
+    });
+  }
+
+  // C3 gate: carry-across-rooms. Alice takes the mug from the_chatroom,
+  // moves southeast to the_deck (carrying it), and invokes `read` on it.
+  // `read` is defined on $portable and inherited by the mug — its execution
+  // requires the class lineage ($portable → $thing → $root) to be present in
+  // the gateway shard's authority for the_deck. Bob, who moves to the_deck
+  // before Alice drops the mug, observes the `dropped` fanout.
+  //
+  // In the fake lane (shared in-process world): passes, because the full world
+  // image is always available and lineage is never absent.
+  // In cf-dev and deployed: FAILS until A2 (propagateTranscriptToOtherScopes
+  // delivering lineage-closed rows) lands. TRACKED → A2.
+  //
+  // This step intentionally replaces the deliberate omission at scenario.ts
+  // line ~160 ("Deliberately SAME-ROOM — carrying an item across a boundary
+  // is not yet on the distributed path") that was hiding face #2 from every
+  // pre-deploy lane. See notes/2026-06-09-cf-cross-scope-architecture-plan.md §A2.
+  if (options.includeCarryAcrossRooms) {
+    await step("carry-across-rooms: alice takes mug, moves to deck, reads it, drops it; bob sees `dropped`", async (ctx) => {
+      const { alice, bob } = pair;
+      // Precondition: both actors in the_chatroom. Guard against prior steps
+      // leaving them elsewhere — leaveIfIn + westward walk cover the common
+      // tail states (pinboard/outline are off the deck path).
+      await alice.leaveIfIn("the_pinboard", ctx.signal);
+      await alice.leaveIfIn("the_outline", ctx.signal);
+      await bob.leaveIfIn("the_pinboard", ctx.signal);
+      await bob.leaveIfIn("the_outline", ctx.signal);
+      if (alice.currentRoom === "the_deck") await alice.call("the_deck", "west", [], ctx.signal);
+      if (bob.currentRoom === "the_deck") await bob.call("the_deck", "west", [], ctx.signal);
+      await drain(alice, cfg, ctx.signal);
+      await drain(bob, cfg, ctx.signal);
+      if (alice.currentRoom !== "the_chatroom") {
+        throw new Error(`carry-across-rooms: alice expected in the_chatroom; at=${alice.currentRoom}`);
+      }
+      // Step 1: alice takes the mug. The mug is a $portable located in the_chatroom.
+      await alice.call("the_chatroom", "take", ["mug"], ctx.signal);
+      await drain(alice, cfg, ctx.signal);
+      await drain(bob, cfg, ctx.signal);
+      // Step 2: alice moves to the_deck while holding the mug. The mug's location
+      // follows the actor, crossing the room authority boundary. Widen the
+      // currentRoom type before checking: TS flow-narrows it to "the_chatroom"
+      // from the guard above but call() mutates it asynchronously.
+      await alice.call("the_chatroom", "southeast", [], ctx.signal);
+      const aliceRoomAfterMove: string | null = alice.currentRoom;
+      if (aliceRoomAfterMove !== "the_deck") {
+        throw new Error(`carry-across-rooms: alice expected on the_deck after southeast; at=${aliceRoomAfterMove}`);
+      }
+      // Step 3: bob moves to the_deck so he can observe the drop.
+      await bob.call("the_chatroom", "southeast", [], ctx.signal);
+      await drain(alice, cfg, ctx.signal);
+      await drain(bob, cfg, ctx.signal);
+      // Steps 4-5 run inside try/finally: this step is EXPECTED to fail on
+      // lanes where A2 has not landed (tracked-fail), and a step that throws
+      // mid-sequence must still restore the invariants downstream steps assume
+      // (both actors back in the_chatroom, mug not carried). Without this the
+      // tracked-fail strands alice on the_deck holding the mug, and the next
+      // step's `the_chatroom:southeast` setup fails E_PERM — observed
+      // deterministically once A1's strict session presence landed.
+      try {
+        // Step 4: alice invokes `read` on the mug. `read` is defined on $portable
+        // (note catalog) and inherited by the mug. The verb must be reachable from
+        // the_deck scope — this is the cross-scope lineage test. A lineage gap here
+        // produces E_VERBNF (the gateway shard cannot find the $portable:read verb
+        // descriptor because it was never delivered to this shard's relay cache).
+        await alice.call("the_deck", "read", ["mug"], ctx.signal);
+        // Step 5: alice drops the mug in the_deck. Bob, now in the_deck, must
+        // receive the `dropped` observation as cross-scope fanout confirmation.
+        await alice.call("the_deck", "drop", ["mug"], ctx.signal);
+        await waitFor(bob, (obs) =>
+          obs.type === "dropped" &&
+          obs.actor === alice.actor &&
+          obs.item === "the_mug" &&
+          obs.room === "the_deck",
+        waitMs, ctx.signal, cfg);
+        await drain(alice, cfg, ctx.signal);
+        await drain(bob, cfg, ctx.signal);
+        // Restore: move the mug back to its home room (the_chatroom) so the
+        // take/drop and carry steps are independently idempotent across reruns.
+        // The mug is now in the_deck; walk bob back to grab it.
+        await bob.call("the_deck", "take", ["mug"], ctx.signal);
+        await bob.call("the_deck", "west", [], ctx.signal);
+        await bob.call("the_chatroom", "drop", ["mug"], ctx.signal);
+      } finally {
+        // Best-effort restoration; each call is swallowed individually so a
+        // cleanup failure can never mask the step's real (tracked) error.
+        // Alice drops wherever she stands (duplicate drop after the success
+        // path is a harmless rejected turn), then both actors walk west.
+        const tryCall = async (who: typeof alice, scope: string, verb: string, args: string[]) => {
+          try { await who.call(scope, verb, args, ctx.signal); } catch { /* best-effort cleanup */ }
+        };
+        const aliceRoomCleanup: string | null = alice.currentRoom;
+        if (aliceRoomCleanup === "the_deck") {
+          await tryCall(alice, "the_deck", "drop", ["mug"]);
+          await tryCall(alice, "the_deck", "west", []);
+        }
+        const bobRoomCleanup: string | null = bob.currentRoom;
+        if (bobRoomCleanup === "the_deck") await tryCall(bob, "the_deck", "west", []);
+        try { await drain(alice, cfg, ctx.signal); } catch { /* best-effort */ }
+        try { await drain(bob, cfg, ctx.signal); } catch { /* best-effort */ }
+      }
+    });
+  }
+
+  // C3 gate: tool-surface-after-move. After alice moves from the_chatroom to
+  // the_deck and enters the_pinboard from the new scope, assert that the
+  // pinboard's add_note tool is reachable. This exercises the tool-surface
+  // enumeration path separately from the verb-on-carried-object test above.
+  //
+  // Smoke failure #1 in the b7-tail run ("the_pinboard:add_note not reachable")
+  // is exactly this gap: the tool surface showed only 7 rows on the gateway
+  // shard because $portable (and catalog class ancestors) lineage never reached
+  // the destination shard's relay cache.
+  //
+  // In the fake lane: passes (shared world image, full lineage always present).
+  // In cf-dev/deployed: FAILS until A2 lands. TRACKED → A2.
+  if (options.includeToolSurfaceAfterMove) {
+    await step("tool-surface-after-move: add_note reachable after entering pinboard from new scope", async (ctx) => {
+      const { alice } = pair;
+      // Precondition: alice must be in the_deck to enter the_pinboard.
+      await alice.leaveIfIn("the_pinboard", ctx.signal);
+      await alice.leaveIfIn("the_outline", ctx.signal);
+      if (alice.currentRoom === "the_chatroom") await alice.call("the_chatroom", "southeast", [], ctx.signal);
+      if (alice.currentRoom !== "the_deck") {
+        throw new Error(`tool-surface-after-move: alice expected on the_deck; at=${alice.currentRoom}`);
+      }
+      // Assertion runs inside try/finally: whether it passes or (tracked-)fails,
+      // alice must end back in the_chatroom — downstream steps (pinboard:add_note
+      // reaches peer) set up with `the_chatroom:southeast` and fail E_PERM if a
+      // gated step strands her on the_deck. State-neutrality is a requirement
+      // for every optional scenario step.
+      try {
+        await alice.call("the_pinboard", "enter", [], ctx.signal);
+        await drain(alice, cfg, ctx.signal);
+        // Assert add_note is reachable via the tool list. We use woo_list_reachable_tools
+        // rather than calling the verb so that a missing tool-surface entry is
+        // distinguishable from an argument/auth error. The minimum acceptance bar
+        // is that add_note appears in the reachable-tools list at all — the existing
+        // pinboard:add_note step (always run, not gated) covers functional correctness.
+        const toolsResult = await alice.callTool("woo_list_reachable_tools", { scope: "all", limit: 200 }, { signal: ctx.signal });
+        const toolsList: unknown[] = (toolsResult as any)?.result?.structuredContent?.result?.tools ?? [];
+        const addNoteTool = toolsList.find((t: any) => isRecord(t) && t.object === "the_pinboard" && t.verb === "add_note");
+        if (!addNoteTool) {
+          const pinboardTools = toolsList
+            .filter((t: any) => isRecord(t) && String(t.object ?? "").includes("pinboard"))
+            .map((t: any) => String((t as any).verb ?? "?"));
+          throw new Error(
+            `tool-surface-after-move: the_pinboard:add_note not in reachable tools after scope-crossing enter; ` +
+            `pinboard tools visible: [${pinboardTools.join(", ")}] (total reachable: ${toolsList.length})`
+          );
+        }
+      } finally {
+        // Best-effort restoration to the_chatroom; swallowed individually so a
+        // cleanup failure never masks the assertion's real error.
+        try { await alice.leaveIfIn("the_pinboard", ctx.signal); } catch { /* best-effort */ }
+        const aliceRoomCleanup: string | null = alice.currentRoom;
+        if (aliceRoomCleanup === "the_deck") {
+          try { await alice.call("the_deck", "west", [], ctx.signal); } catch { /* best-effort */ }
+        }
+        try { await drain(alice, cfg, ctx.signal); } catch { /* best-effort */ }
+      }
     });
   }
 
