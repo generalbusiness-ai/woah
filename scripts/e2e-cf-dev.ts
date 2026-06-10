@@ -30,7 +30,7 @@
 // Exit status: 0 all specs pass, 1 specs fail, 2 harness crash.
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, createWriteStream } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve, dirname } from "node:path";
@@ -45,7 +45,25 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const READY_TIMEOUT_MS = 180_000;
 const READY_POLL_MS = 500;
 
+// After /healthz returns OK, wrangler may still be finishing its initial
+// TypeScript compilation in the background. When that finishes, wrangler
+// reloads ("Reloading local server…") and sends new state transfers to any
+// active WS clients, dropping their connections mid-flight. Waiting for
+// STABLE_WINDOW_MS of quiet (no reload activity) before running Playwright
+// ensures the reload happens before any browser connects, eliminating the
+// send-before-stable race that caused flaky spec 1 failures.
+const STABLE_WINDOW_MS = 3_000;
+const STABLE_TIMEOUT_MS = 60_000;
+
 const args = parseArgs(process.argv.slice(2));
+
+// Wrangler log file for post-mortem analysis on failure.
+type WorkerdHandle = {
+  process: ChildProcess;
+  // Resolves with true if a reload is in progress and completes within
+  // STABLE_TIMEOUT_MS; resolves with false if already stable.
+  waitForStable: () => Promise<boolean>;
+};
 
 async function main(): Promise<void> {
   const port = args.port ?? (await findFreePort());
@@ -61,9 +79,10 @@ async function main(): Promise<void> {
   // boot every run, so the lane never passes against a world bootstrapped by a
   // prior run. This mirrors the hermeticity guarantee in smoke:cf-dev.
   const persistDir = mkdtempSync(join(tmpdir(), "woo-e2e-cf-dev-"));
+  const logPath = join(persistDir, "wrangler.log");
   console.log(`e2e:cf booting wrangler dev on ${baseUrl} (persist=${persistDir})`);
 
-  const server = await startWorkerd(port, persistDir);
+  const handle = await startWorkerd(port, persistDir, logPath);
   let playwrightExitCode = 1;
   let crashed: unknown = null;
 
@@ -71,18 +90,32 @@ async function main(): Promise<void> {
     await waitForHealthz(baseUrl);
     console.log(`  ok    workerd ready (${baseUrl}/healthz)`);
 
-    // Step 3: run Playwright against the live workerd. Pass the worker's base
+    // Step 3: wait for wrangler to stabilize. Wrangler dev finishes its initial
+    // TypeScript compilation AFTER reporting "Ready", and the resulting reload
+    // drops any active WS connections. Waiting here ensures the reload happens
+    // before Playwright connects a browser, so the specs never see mid-test
+    // disconnections from a startup reload.
+    const reloaded = await handle.waitForStable();
+    if (reloaded) {
+      console.log("  ok    wrangler reloaded and stabilized (initial compilation done)");
+    } else {
+      console.log("  ok    wrangler stable (no reload needed)");
+    }
+
+    // Step 4: run Playwright against the stable workerd. Pass the worker's base
     // URL as WOO_CF_E2E_BASE_URL so the Playwright config can forward it to the
     // browser.
     playwrightExitCode = await runPlaywright(baseUrl, args.verbose);
   } catch (err) {
     crashed = err;
+    console.error(`e2e:cf wrangler log at ${logPath}`);
   } finally {
     if (!args.keep) {
-      await stopWorkerd(server);
+      await stopWorkerd(handle.process);
       try { rmSync(persistDir, { recursive: true, force: true }); } catch { /* best effort */ }
     } else {
-      console.log(`  --keep set; leaving wrangler dev running on ${baseUrl} (pid ${server.pid}, persist=${persistDir})`);
+      console.log(`  --keep set; leaving wrangler dev running on ${baseUrl} (pid ${handle.process.pid}, persist=${persistDir})`);
+      console.log(`  wrangler log: ${logPath}`);
     }
   }
 
@@ -96,7 +129,19 @@ async function main(): Promise<void> {
 // Spawn `wrangler dev` using wrangler.cf-e2e.toml which adds the [assets] block.
 // Same detached-process-group pattern as smoke-cf-dev.ts so teardown can kill
 // the full tree (wrangler spawns a workerd child).
-async function startWorkerd(port: number, persistDir: string): Promise<ChildProcess> {
+//
+// Returns a WorkerdHandle with a waitForStable() function that waits until
+// wrangler has not emitted a reload/recompile signal for STABLE_WINDOW_MS.
+// This is critical: wrangler finishes its initial TypeScript compilation AFTER
+// reporting "Ready on http://...", and the resulting reload drops all active
+// WebSocket connections. By waiting for stability before Playwright connects,
+// we ensure browsers never experience a mid-test wrangler reload.
+//
+// The wrangler stdout+stderr is teed to logPath for post-mortem analysis.
+async function startWorkerd(port: number, persistDir: string, logPath: string): Promise<WorkerdHandle> {
+  const logStream = createWriteStream(logPath, { flags: "a" });
+
+  // stderr: both pipe (for readline) and inherit via tee
   const child = spawn(
     "npx",
     [
@@ -107,7 +152,9 @@ async function startWorkerd(port: number, persistDir: string): Promise<ChildProc
       "--persist-to", persistDir
     ],
     {
-      stdio: ["ignore", "pipe", "inherit"],
+      // pipe both stdout and stderr so we can monitor reload signals.
+      // We re-emit them to the terminal manually below.
+      stdio: ["ignore", "pipe", "pipe"],
       detached: true,
       cwd: ROOT
     }
@@ -115,13 +162,60 @@ async function startWorkerd(port: number, persistDir: string): Promise<ChildProc
   child.on("error", (err) => {
     console.error("failed to spawn wrangler dev:", err);
   });
-  // Re-emit stdout so the operator can see wrangler build/boot messages.
-  if (child.stdout) {
-    const { createInterface } = await import("node:readline");
-    const rl = createInterface({ input: child.stdout });
-    rl.on("line", (line) => process.stdout.write(`${line}\n`));
+
+  // Track the last time a "reload" log line was seen. wrangler emits
+  // "Reloading local server…" when compilation finishes and triggers a
+  // hot reload. We watch for this to implement waitForStable().
+  let lastReloadAt = 0;
+  let sawReload = false;
+
+  const { createInterface } = await import("node:readline");
+
+  function setupStreamRelay(stream: NodeJS.ReadableStream, label: string): void {
+    const rl = createInterface({ input: stream });
+    rl.on("line", (line: string) => {
+      // Tee to console and log file.
+      process.stdout.write(`${line}\n`);
+      logStream.write(`[${label}] ${line}\n`);
+      // Detect wrangler reload signals.
+      if (/Reloading local server|Restarting local server|Detected new incoming request/i.test(line)) {
+        lastReloadAt = Date.now();
+        sawReload = true;
+      }
+    });
   }
-  return child;
+
+  if (child.stdout) setupStreamRelay(child.stdout, "wrangler");
+  if (child.stderr) setupStreamRelay(child.stderr, "wrangler");
+
+  // waitForStable: wait until STABLE_WINDOW_MS has elapsed without a reload,
+  // or until STABLE_TIMEOUT_MS total. Returns true if we saw at least one
+  // reload (i.e., the initial compilation-complete reload was absorbed),
+  // false if wrangler was already stable when we started waiting.
+  function waitForStable(): Promise<boolean> {
+    return new Promise<boolean>((resolve, reject) => {
+      const startedAt = Date.now();
+      function check(): void {
+        const elapsed = Date.now() - startedAt;
+        if (elapsed > STABLE_TIMEOUT_MS) {
+          reject(new Error(`wrangler did not stabilize within ${STABLE_TIMEOUT_MS}ms`));
+          return;
+        }
+        const msSinceReload = lastReloadAt > 0 ? Date.now() - lastReloadAt : STABLE_WINDOW_MS + 1;
+        if (msSinceReload > STABLE_WINDOW_MS) {
+          // Either we never saw a reload (stable from the start) or we've been
+          // quiet for STABLE_WINDOW_MS after the last reload.
+          resolve(sawReload);
+          return;
+        }
+        setTimeout(check, 200);
+      }
+      // Start checking immediately; don't block on the initial reload.
+      setTimeout(check, 200);
+    });
+  }
+
+  return { process: child, waitForStable };
 }
 
 async function stopWorkerd(child: ChildProcess): Promise<void> {

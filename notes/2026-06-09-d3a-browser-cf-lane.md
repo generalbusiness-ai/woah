@@ -126,6 +126,130 @@ To run it: uncomment `WOO_BROWSER_PROJECTION_HOLDER = "1"` in
 same-scope verbs; the spec 4 optimistic-before-committed assertion may pass or
 may hit the A2 lineage gap for cross-scope state. Record findings here.
 
+## Flake root cause and fix (2026-06-09)
+
+The lane had a ~33–50% failure rate on spec 1 ("guest connects and say line
+appears in chat"). The failure shape was: `expect.poll(getSayVerbs)` timed out
+after 30 s with an EMPTY array — no `woo.v2.turn_result` event with verb=say
+ever fired. The Playwright page snapshot showed the sidebar rendered (actor name,
+tab buttons) but the chat feed empty.
+
+### Root cause 1: readiness race (`waitForConnected` fires before WS scope open)
+
+`waitForConnected(page)` checks for the `.actor` DOM element to stop showing
+"connecting...". This element is set by `connect()` in `src/client/main.ts`
+(around line 537), which calls `refresh()` (REST `/api/me`) and then
+asynchronously (NOT awaited) calls `syncV2BrowserWorkerScope()` to start the WS
+scope connection. The `.actor` element is set from the REST response — the WS
+scope handshake happens afterward.
+
+The `say` command submitted right after `waitForConnected()` lands in
+`sendV2TurnIntent()` in `src/client/v2-browser-worker.ts`. That function calls
+`await connect()`, which resolves when the WS socket is OPEN. However, if the
+socket was not yet OPEN when `sendChatInput()` checked, the call was dropped
+before even reaching `sendV2TurnIntent()` (the `!space → return` guard at around
+line 4039 of `main.ts`).
+
+Even when the call does reach `sendV2TurnIntent()`, `putPending()` saves it to
+IndexedDB and then `sendEncoded()` is called. The `sendEncoded()` function
+(`src/client/v2-browser-worker.ts`, around line 1945) is a **silent NO-OP**
+when `socket?.readyState !== WebSocket.OPEN`:
+
+```typescript
+// sendEncoded — silent drop if socket not OPEN (no error, no retry, no log)
+if (socket?.readyState === WebSocket.OPEN) {
+  socket.send(encoded);
+}
+// else: message is silently discarded; only replayPending() can recover it
+```
+
+When the turn is silently dropped this way, it is saved in IDB and can only be
+recovered by `replayPending()`, which is called after the next state transfer
+arrives (i.e., after the WS reconnects and the relay sends a new state
+transfer). On a cold world, the scope DO initialization takes 15–30 s, so
+the replay may not complete before the 30 s test poll timeout.
+
+### Root cause 2: wrangler dev auto-reload on startup
+
+wrangler dev reports "Ready on http://127.0.0.1:PORT" before it finishes its
+initial TypeScript compilation. When compilation finishes (~1–2 s after "Ready"),
+wrangler emits "Reloading local server…" and drops all active WebSocket
+connections. A browser that connected during this window (which the test did,
+right after `/healthz` returned OK) would have its WS dropped mid-test.
+
+The browser worker reconnects and eventually `replayPending()` fires, but the
+round-trip delay (reconnect + scope DO cold start + state transfer + replay)
+pushed the say turn past the 30 s Playwright poll timeout in failing runs.
+
+### Fix: `waitForScopeReady` and wrangler stability gate
+
+Two changes were made:
+
+**1. `e2e/cf-smoke.spec.ts`: `waitForScopeReady(getProjections, scope)`**
+
+A new `installProjectionListener()` helper installs an `addInitScript` listener
+for `woo.v2.projection` CustomEvents. A new `waitForScopeReady()` function polls
+until at least one live (non-cached) projection event arrives for the target scope:
+
+```typescript
+await expect
+  .poll(() => getProjections().some((e) => e.scope === scope && e.cached !== true), {
+    timeout,
+    message: `expected a live woo.v2.projection for scope ${scope}`
+  })
+  .toBe(true);
+```
+
+The `woo.v2.projection` event is dispatched in `src/client/main.ts` (around
+line 590) when the browser worker sends a `{kind: "projection"}` message. The
+`cached` field is true when the projection came from IndexedDB before the WS
+opened; false/absent when it came from a live WS state transfer. A live
+projection proves: (1) the WS socket IS open, (2) the relay delivered a state
+transfer, (3) if a wrangler reload happened, the reconnect and re-open
+completed. Applied to all 4 specs (including spec 4 fixme).
+
+**2. `scripts/e2e-cf-dev.ts`: wrangler stability gate and log tee**
+
+After `/healthz` returns OK, the harness now calls `handle.waitForStable()`
+before starting Playwright. `waitForStable()` watches for "Reloading local
+server" lines in wrangler stdout/stderr and only resolves when
+`STABLE_WINDOW_MS` (3 s) have elapsed without a reload signal (or
+`STABLE_TIMEOUT_MS` = 60 s timeout). This ensures the initial compilation
+reload happens before any browser connects.
+
+Additionally, all wrangler stdout and stderr is now teed to `wrangler.log` in
+the persist dir for post-mortem analysis on failure.
+
+### Silent-drop product defect (confirmed, not fixed by this PR)
+
+The silent-drop mechanism is a real product defect in `src/client/v2-browser-worker.ts`.
+When the WS socket is not OPEN at the moment `sendEncoded()` is called, the turn
+is discarded without any user-visible error, log line, or retry timer. The turn
+is saved in IDB via `putPending()`, but the pending-turn timeout timer is not
+started for turns silently dropped this way (the timer is armed by
+`armPendingTurnReplyTimeoutsForCurrentSession()` which ran before the new turn
+was added). The user sees: the chat input cleared (filled + Enter accepted), no
+response, no error — a completely silent failure.
+
+Recovery path: `replayPending()` is called when the WS reconnects and the next
+state transfer arrives. On a warm world this is ~400 ms; on a cold world it can
+take 15–120 s.
+
+Fix direction (not implemented here): `sendEncoded()` should either (a) return a
+boolean that causes `sendTurnIntent()` to start a recovery timer immediately, or
+(b) `sendTurnIntent()` should check socket readiness before calling `putPending()`
+and either queue the intent for when the socket opens or emit an error. The lane
+fix (waitForScopeReady) avoids the race in test code, but does not fix the
+product-level silent drop for real users who submit a turn during the brief
+window between REST session open and WS scope ready.
+
+### Validation results
+
+After both fixes:
+- `npm run typecheck`: clean (both tsconfigs)
+- `npm test`: 510 tests, all passed (37 files)
+- `npm run e2e:cf` × 5 consecutive: 3 passed / 1 skipped (spec 4 fixme) every run
+
 ## Known limitations
 
 1. The lane boots a fresh world on every run. Spec 1 and 2 use unique run-id

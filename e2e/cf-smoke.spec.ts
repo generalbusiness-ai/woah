@@ -34,6 +34,11 @@ import { test, expect, type Page } from "@playwright/test";
 // (committed=false) and receiveAppliedFrame (committed=true).
 type RenderFrameEvent = { id: string; verb: string; committed: boolean; t: number };
 
+// v2 scope projection event shape (detail of the woo.v2.projection CustomEvent).
+// The `cached` field is true when the projection came from IndexedDB before the
+// WS relay connected; false/absent when it came from a live state transfer.
+type ProjectionEvent = { kind?: string; scope?: string; cached?: boolean };
+
 // Install the render_frame listener. Must be called before any navigation
 // (before openGuestPage) so addInitScript fires before the app's JS runs.
 // Returns a function to collect received events from the test process.
@@ -71,6 +76,27 @@ async function installTurnResultListener(page: Page): Promise<() => string[]> {
   return () => verbs;
 }
 
+// Install a scope-projection listener. Must be called before any navigation.
+// Collects woo.v2.projection events from the browser worker — these fire when
+// the WS relay delivers a live state transfer (cached=false/absent) or when a
+// cached IndexedDB projection is replayed (cached=true). Only live projections
+// signal that the WS scope is fully open and the first turn can be sent and
+// received promptly. Returns a function to retrieve all received events.
+async function installProjectionListener(page: Page): Promise<() => ProjectionEvent[]> {
+  const events: ProjectionEvent[] = [];
+  const fnName = `_wooProjection${Math.random().toString(36).slice(2)}`;
+  await page.exposeFunction(fnName, (event: ProjectionEvent) => {
+    events.push(event);
+  });
+  await page.addInitScript((fn: string) => {
+    window.addEventListener("woo.v2.projection", (e) => {
+      const detail = (e as CustomEvent<ProjectionEvent>).detail;
+      void (window as unknown as Record<string, (v: unknown) => Promise<void>>)[fn](detail);
+    });
+  }, fnName);
+  return () => events;
+}
+
 // Auth a fresh guest via POST /api/auth and store the session id in localStorage
 // before navigating, so the page loads already authenticated.
 async function openGuestPage(page: Page, token: string, path = "/"): Promise<void> {
@@ -95,9 +121,41 @@ async function openGuestPage(page: Page, token: string, path = "/"): Promise<voi
 }
 
 // Wait for the actor indicator to stop showing "connecting..." (the WS is
-// open and the projection has arrived).
+// open and the projection has arrived at the REST level).
+//
+// NOTE: this gate fires as soon as state.actor is set (from the /api/me REST
+// response), BEFORE the v2 browser worker's WebSocket scope is open. Callers
+// that will issue turns immediately after should also call waitForScopeReady
+// to ensure the WS relay has delivered at least one live projection for the
+// target scope — otherwise the turn is saved to IndexedDB and replayed on the
+// next WS reconnect, which can take tens of seconds on a cold world.
 async function waitForConnected(page: Page, timeout = 30_000): Promise<void> {
   await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout });
+}
+
+// Wait for the v2 browser worker to deliver at least one LIVE projection for
+// the given scope. A live projection (cached !== true) means the WS relay has
+// opened, the scope's state transfer was received, and the first turn can be
+// sent over the socket and get a timely response.
+//
+// Root-cause context (flake, 2026-06-09): waitForConnected fires when the REST
+// /api/me response returns (state.actor set), but the browser worker's WS
+// connection to the relay may still be in progress. On a cold world the scope
+// DO can take 15–30 s to initialize, which means the first turn submitted right
+// after waitForConnected lands in IDB without a live socket and is only replayed
+// on the next reconnect. By waiting for a live projection we prove the WS scope
+// is ready and eliminate the send-before-socket race.
+async function waitForScopeReady(
+  getProjections: () => ProjectionEvent[],
+  scope: string,
+  timeout = 60_000
+): Promise<void> {
+  await expect
+    .poll(() => getProjections().some((e) => e.scope === scope && e.cached !== true), {
+      timeout,
+      message: `expected a live woo.v2.projection for scope ${scope}`
+    })
+    .toBe(true);
 }
 
 // ── spec 1: guest connects, room renders, say appears ──────────────────────
@@ -110,13 +168,20 @@ test.describe("CF browser: single-user say", () => {
     const token = `guest:${runId}-alice`;
     const speech = `hello from workerd ${runId}`;
 
-    // Install the turn_result listener BEFORE navigation so addInitScript fires.
+    // Install ALL listeners BEFORE navigation so addInitScript fires before the
+    // app's first event. The projection listener is required for waitForScopeReady.
     const getSayVerbs = await installTurnResultListener(page);
+    const getProjections = await installProjectionListener(page);
 
     await openGuestPage(page, token, "/objects/the_chatroom");
     await waitForConnected(page);
 
-    // The chat input must be present (matches dev-server smoke.spec.ts pattern).
+    // Wait for the v2 browser worker to deliver a LIVE projection for this
+    // scope. This proves the WS relay is open and the first turn will receive a
+    // timely response rather than sitting in IDB waiting for a reconnect.
+    await waitForScopeReady(getProjections, "the_chatroom");
+
+    // The chat input must be present and visible once the scope is ready.
     await expect(page.locator("[data-chat-input]")).toBeVisible({ timeout: 10_000 });
 
     // Issue the say command.
@@ -154,12 +219,21 @@ test.describe("CF browser: cross-client say delivery", () => {
     try {
       // Install listeners before navigation so they fire from addInitScript.
       const getAliceSayVerbs = await installTurnResultListener(alicePage);
+      const getAliceProjections = await installProjectionListener(alicePage);
+      // Bob only needs the projection listener; we do not check his turn_result.
+      const getBobProjections = await installProjectionListener(bobPage);
 
       // Connect both guests to the_chatroom.
       await openGuestPage(alicePage, aliceToken, "/objects/the_chatroom");
       await openGuestPage(bobPage, bobToken, "/objects/the_chatroom");
       await waitForConnected(alicePage);
       await waitForConnected(bobPage);
+
+      // Wait for live projections on both sides before Alice sends. This ensures
+      // both WS relay connections are open, so Alice's say reaches the server and
+      // the server's fanout reaches Bob promptly.
+      await waitForScopeReady(getAliceProjections, "the_chatroom");
+      await waitForScopeReady(getBobProjections, "the_chatroom");
 
       // Alice sends a say command.
       await alicePage.locator("[data-chat-input]").fill(`say ${speech}`);
@@ -197,9 +271,12 @@ test.describe("CF browser: render_frame observability", () => {
     // Install listeners before navigation so addInitScript registers them.
     const getFrames = await installRenderFrameListener(page);
     const getSayVerbs = await installTurnResultListener(page);
+    const getProjections = await installProjectionListener(page);
 
     await openGuestPage(page, token, "/objects/the_chatroom");
     await waitForConnected(page);
+    // Wait for live WS projection before submitting (same race fix as specs 1+2).
+    await waitForScopeReady(getProjections, "the_chatroom");
     await expect(page.locator("[data-chat-input]")).toBeVisible({ timeout: 10_000 });
 
     await page.locator("[data-chat-input]").fill(`say ${speech}`);
@@ -259,9 +336,12 @@ test.fixme("optimistic render_frame precedes committed render_frame for same-sco
 
   const getFrames = await installRenderFrameListener(page);
   const getSayVerbs = await installTurnResultListener(page);
+  const getProjections = await installProjectionListener(page);
 
   await openGuestPage(page, token, "/objects/the_chatroom");
   await waitForConnected(page);
+  // Wait for live WS projection before submitting (same race fix as specs 1-3).
+  await waitForScopeReady(getProjections, "the_chatroom");
   await expect(page.locator("[data-chat-input]")).toBeVisible({ timeout: 10_000 });
 
   await page.locator("[data-chat-input]").fill(`say ${speech}`);
