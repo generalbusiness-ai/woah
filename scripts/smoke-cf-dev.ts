@@ -40,9 +40,29 @@ import { pathToFileURL } from "node:url";
 import { httpTransport, SmokeSession } from "./smoke/session";
 import { runSmokeWalkthrough, type SmokeSessionPair, type StepContext } from "./smoke/scenario";
 
-type StepResult = { name: string; ok: boolean; ms: number; detail?: string };
+// `tracked` names the plan item (e.g. "→ A2") when a failure is expected on
+// this lane until that item lands. Tracked failures are printed as TRACKED-FAIL
+// (not FAIL) and are not counted toward `anyFailed`, so the gate stays green
+// while the tracked item is outstanding. When a tracked step starts PASSING the
+// gate loudly reports that it should be promoted to ENFORCED.
+type StepResult = { name: string; ok: boolean; ms: number; detail?: string; tracked?: string };
 type Metric = Record<string, unknown> & { kind?: string; ts?: number };
-type PassWindow = { label: string; start: number; end: number; passed: number; total: number };
+type PassWindow = { label: string; start: number; end: number; passed: number; total: number; trackedFailed: number };
+
+// Steps whose failures are tracked (expected on this lane, not build-failing).
+// Each entry: step name substring → plan item tag. Keep entries sorted.
+// Remove an entry only when the plan item has landed and the step reliably passes.
+const CF_DEV_TRACKED_FAIL_STEPS: ReadonlyMap<string, string> = new Map([
+  // C3: carry-across-rooms fails in cf-dev because $portable lineage is not
+  // delivered to the destination shard's relay cache by
+  // propagateTranscriptToOtherScopes. Fixed by A2 (lineage-closed row
+  // installation). See notes/2026-06-09-cf-cross-scope-architecture-plan.md §A2.
+  ["carry-across-rooms", "→ A2"],
+  // C3: tool-surface-after-move fails for the same reason — the gateway-shard
+  // authority slice for a scope entered cross-room lacks the catalog class
+  // lineage needed to enumerate the pinboard's verbs. Fixed by A2. TRACKED → A2.
+  ["tool-surface-after-move", "→ A2"]
+]);
 
 const args = parseArgs(process.argv.slice(2));
 
@@ -98,6 +118,10 @@ async function main(): Promise<void> {
           // take/drop on a $portable object is fine here.)
           includeTakeDrop: true,
           includeConcurrentMove: true,
+          // C3 gates: run both new cross-scope steps. They are expected to fail on
+          // this lane until A2 lands — see CF_DEV_TRACKED_FAIL_STEPS above.
+          includeCarryAcrossRooms: true,
+          includeToolSurfaceAfterMove: true,
           waitTimeoutMs: 10_000,
           log: args.verbose ? (msg) => console.log(msg) : undefined
         });
@@ -109,7 +133,8 @@ async function main(): Promise<void> {
         start,
         end: Date.now(),
         passed: results.filter((r) => r.ok).length,
-        total: results.length
+        total: results.length,
+        trackedFailed: results.filter((r) => !r.ok && r.tracked !== undefined).length
       });
     }
     // Metrics arrive asynchronously via the piped wrangler stdout; the last
@@ -131,11 +156,18 @@ async function main(): Promise<void> {
   }
 
   console.log();
+  // Unexpected failures: real bugs; tracked failures: expected until the named
+  // plan item lands. When a tracked step starts passing, the gate should be
+  // promoted to ENFORCED — that transition is reported loudly here.
   let anyFailed = false;
   for (const w of passWindows) {
     const failed = w.total - w.passed;
-    if (failed > 0) anyFailed = true;
-    console.log(`summary[${w.label}]: ${w.passed}/${w.total} steps passed${failed ? `, ${failed} failed` : ""}`);
+    const unexpected = failed - (w.trackedFailed ?? 0);
+    if (unexpected > 0) anyFailed = true;
+    const summary = `${w.passed}/${w.total} steps passed` +
+      (unexpected > 0 ? `, ${unexpected} unexpected failures` : "") +
+      (w.trackedFailed ? `, ${w.trackedFailed} tracked-fail (expected; see CF_DEV_TRACKED_FAIL_STEPS)` : "");
+    console.log(`summary[${w.label}]: ${summary}`);
   }
   if (args.measure) printMeasurement(metrics, passWindows);
   if (crashed) {
@@ -212,19 +244,40 @@ function printMeasurement(metrics: Metric[], windows: PassWindow[]): void {
 // Continue-on-failure step runner: record every step, never reset sessions
 // (local workerd is deterministic — a failure is a real bug to surface, not a
 // flake to recover from), and watchdog-bound each step.
+//
+// Steps whose names match a key substring in CF_DEV_TRACKED_FAIL_STEPS are
+// allowed to fail without affecting the exit code; they are logged as TRACKED-FAIL
+// and counted separately. When a tracked step passes, it is logged as
+// TRACKED-OK: promote the step from tracked to enforced when that happens.
 function makeStepRunner(results: StepResult[]) {
   return async (name: string, body: (ctx: StepContext) => Promise<void>): Promise<void> => {
     const startedAt = Date.now();
+    // Look up the tracked tag before executing so we can print it clearly
+    // whether the step passes or fails.
+    let trackedTag: string | undefined;
+    for (const [key, tag] of CF_DEV_TRACKED_FAIL_STEPS) {
+      if (name.includes(key)) { trackedTag = tag; break; }
+    }
     try {
       await raceWithAbort((signal) => body({ signal }), STEP_TIMEOUT_MS, `step "${name}" exceeded ${STEP_TIMEOUT_MS}ms watchdog`);
       const ms = Date.now() - startedAt;
-      results.push({ name, ok: true, ms });
-      console.log(`  ok    ${name} (${ms}ms)`);
+      results.push({ name, ok: true, ms, tracked: trackedTag });
+      if (trackedTag) {
+        // A previously-tracked step now passes: promote it to ENFORCED.
+        console.log(`  TRACKED-OK (promote to ENFORCED) ${name} (${ms}ms) [${trackedTag}]`);
+      } else {
+        console.log(`  ok    ${name} (${ms}ms)`);
+      }
     } catch (err) {
       const ms = Date.now() - startedAt;
       const detail = err instanceof Error ? err.message : String(err);
-      results.push({ name, ok: false, ms, detail });
-      console.error(`  FAIL  ${name} (${ms}ms): ${detail}`);
+      results.push({ name, ok: false, ms, detail, tracked: trackedTag });
+      if (trackedTag) {
+        // Expected failure on this lane: log with TRACKED-FAIL, not FAIL.
+        console.error(`  TRACKED-FAIL [${trackedTag}] ${name} (${ms}ms): ${detail}`);
+      } else {
+        console.error(`  FAIL  ${name} (${ms}ms): ${detail}`);
+      }
       // Swallow: the scenario is sequential and later steps assume room state
       // from earlier ones, but we still attempt them so the operator sees the
       // full failure surface. Without rethrowing, runSmokeWalkthrough proceeds.

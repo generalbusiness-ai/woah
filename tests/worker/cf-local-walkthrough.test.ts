@@ -124,10 +124,21 @@ describe("CF-local smoke walkthrough", () => {
       // fanout is correct — only the zero-dangling guard fires). Flip it ON once
       // $portable and the other contents-object classes reach the gateway slice.
       // The deployed and workerd lanes already run take/drop.
+      //
+      // C3 gates: includeCarryAcrossRooms and includeToolSurfaceAfterMove are also
+      // held OFF here for the same reason as includeTakeDrop: the carry step calls
+      // `take` on a $portable object, which emits dangling_parent_ref because the
+      // gateway-shard relay lacks $portable class lineage (same root cause as face
+      // #2, notes/2026-06-09-cf-cross-scope-architecture-plan.md). Both steps are
+      // TRACKED in cf-dev via CF_DEV_TRACKED_FAIL_STEPS (→ A2) and will be flipped
+      // ON in both lanes once A2 (lineage-closed row installation) lands.
+      // See notes/2026-06-09-c2c3-gates-scenario.md for the per-lane status.
       await runSmokeWalkthrough({ alice, bob }, localStep, {
         runId,
         includeConcurrentMove: true,
         includeTakeDrop: false,
+        includeCarryAcrossRooms: false,
+        includeToolSurfaceAfterMove: false,
         waitTimeoutMs: 10_000,
         drainBudgetMs: DRAIN_TOTAL_BUDGET_MS,
         drainPollMs: DRAIN_POLL_MS
