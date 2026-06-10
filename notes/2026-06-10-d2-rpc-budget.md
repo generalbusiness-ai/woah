@@ -269,16 +269,67 @@ After D2:
 - enumerate-tools: 0 on warm turns (fanout-delivered tool surfaces serve)
 - apply-v2-commit: 1/turn (slim warm envelope already reduces this to 1 for same-scope)
 
+## Implementation status (commit 25d3987)
+
+### D2a: done
+
+Serve `directory_sessions_for_scopes` from the local SQL projection cache
+on gateway shards, eliminating Directory RPCs on warm turns (fanout-audience
+path only). Flag: `WOO_V2_D2_SESSION_FROM_PROJECTION=1`.
+
+Path differentiation: `loadDirectorySessionsForScopes` now accepts an optional
+`path` label (`"mcp_fanout_audience"` or `"authority_reconstruction"`) recorded
+in the metric. The D2 gate can distinguish fanout-audience Directory RPCs (D2a
+eliminates these) from authority-reconstruction Directory RPCs (always use
+Directory, intentional).
+
+Note: authority reconstruction also calls `loadDirectorySessionsForScopes` (line
+~5372) and this ALWAYS goes to Directory. D2a does NOT eliminate these. They
+are tagged `path=authority_reconstruction` in the metric.
+
+### D2b: NOT IMPLEMENTED (architectural blocker)
+
+`deliverMcpCommitFanout` runs on the GATEWAY SHARD (called from the gateway's
+`getMcpGateway(world).v2.envelope` callback). The gateway shard's world is SPARSE
+— it has no verb bytecode from catalog installation. `computeD2ToolSurfaceWrites`
+is a no-op on gateway shards because `enumerateLocalToolDescriptors` returns
+empty. The CommitScopeDO (world host) has verb bytecode but no McpHost.
+
+D2b requires extending `CommitScopeEnvelopeResponse` to include tool_surface_writes
+computed on the CommitScopeDO side and returned to the gateway shard. Deferred.
+
+### Before/after RPC count (fake lane)
+
+Before D2a: 2.5 cross_host_rpc/turn + 0.5 directory_sessions_for_scopes/turn
+After D2a:  2.5 cross_host_rpc/turn + 0 directory_sessions_for_scopes (projection_cache)
+
+Note: `directory_sessions_for_scopes` RPCs (via `env.DIRECTORY.get().fetch()`) are
+NOT counted as `cross_host_rpc` (which only counts `forwardInternal()` calls). So
+D2a doesn't change the fake-lane `cross_host_rpc` count — it eliminates the
+Directory fetch overhead on warm turns.
+
 ## Test gates
 
-1. Structural fake-lane gate: warm same-scope and warm cross-scope turns ≤ 3
-   cross_host_rpc per turn. directory_sessions_for_scopes == 0 after projection
-   is seeded; enumerate-tools == 0 on warm turns with unchanged tool surface.
+1. D2 Gate 1: tests/worker/d2-rpc-budget.test.ts
+   - Verifies fanout-audience directory_sessions_for_scopes: 0 status=ok on warm turns
+   - Verifies at least one status=projection_cache on warm turns  
+   - Verifies session count from projection cache ≤ live actors + 1
+   - Verifies turn-path cross_host_rpc (apply-v2-commit + enumerate-tools +
+     mcp-commit-fanout) ≤ 3/turn on fully warm turns
+   Status: PASSED
 
-2. C2 structural test: flip from TRACKED to ENFORCED (≤ 3 warm RPCs/turn
-   in the fake lane — currently logged only with a gross 2× ceiling).
+2. C2 structural test: C2_TRACKED_WARM_TURN_MAX_CROSS_HOST_RPCS flipped from
+   TRACKED to ENFORCED (≤ 3/turn, was logged with 2× ceiling). WOO_V2_D2_SESSION_FROM_PROJECTION=1
+   added to createStructuralHarness.
+   Status: PASSED (2.5/turn, well under 3)
 
-3. Tool-surface freshness regression: after a verb/catalog change OR room
-   membership change, the tool surface must refresh (invalidation must still work).
+3. Tool-surface freshness regression: not tested yet. enumerate-tools cache
+   invalidation is unchanged from before D2 (D2b not implemented). Deferred.
 
-4. Full validation: typecheck + targeted test:files + npm test + test:worker.
+4. Validation results:
+   - typecheck: clean
+   - tests/worker/d2-rpc-budget.test.ts: 1/1 passed
+   - tests/worker/cf-local-structural.test.ts: 6/6 passed
+   - npm test: 582/582 passed
+   - npm run test:worker: 288/288 passed
+   - npm run smoke:cf-dev: 13/13 × 2 runs
