@@ -339,6 +339,16 @@ describe("B-i read-closure parity", () => {
       // The verdict kind must match (both accept or both reject).
       expect(resultFull.kind, `full vs closure kind mismatch at scope=${scope}: full=${resultSummary(resultFull)} closure=${resultSummary(resultClosure)}`).toEqual(resultClosure.kind);
 
+      // Accepted post_state_hash is computed over TOUCHED cells only
+      // (transcriptTouchedStateHashWithReader), and the closure carries every
+      // touched cell at identical values — so it MUST be byte-identical across
+      // the two seeds. Only the chained scope-HEAD hashes (epoch root over the
+      // whole seeded world) legitimately differ between full and closure
+      // harness seeds. A mismatch here means the closure missed a cell.
+      if (resultFull.kind === "woo.commit.accepted.shadow.v1" && resultClosure.kind === "woo.commit.accepted.shadow.v1") {
+        expect((resultFull as any).post_state_hash, `accepted post_state_hash mismatch at scope=${scope}`).toEqual((resultClosure as any).post_state_hash);
+      }
+
       if (resultFull.kind === "woo.commit.conflict.shadow.v1" && resultClosure.kind === "woo.commit.conflict.shadow.v1") {
         // For conflicts, the rejection reason must also match.  post_state_hash
         // is not compared because the pre-state differs (full has more objects).

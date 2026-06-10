@@ -858,13 +858,15 @@ pass.
 lane, an implementation MUST demonstrate verdict equivalence empirically, not
 only by the argument above: (1) corpus parity — for a recorded corpus of
 (pre-state, planned transcript) pairs from the shared smoke scenario, validate
-each pair against both envelope shapes and assert identical verdicts and
-mismatched-cell sets (note: `post_state_hash` differs between full and closure
-scopes because they start from different world sizes — this is expected and
-does not affect the live commit path, where the CommitScopeDO only applies the
-transcript to the rows it holds, not the full gateway world); (2) lane parity
-— the full scenario run with the flag off and on yields identical per-turn
-verdict streams and final state. The cross-scope envelope byte ceiling (< 256 KB)
+each pair against both envelope shapes and assert identical verdicts,
+mismatched-cell sets, and — for accepted commits — identical
+`post_state_hash` (it is computed over touched cells only, which the closure
+carries in full; a mismatch means the closure missed a cell). Chained
+scope-HEAD hashes are exempt from comparison in a two-seed harness: the
+epoch root hashes the whole seeded world, which legitimately differs
+between a full-slice seed and a closure seed. (2) lane parity — the full
+scenario run with the flag off and on yields identical per-turn verdict
+streams and final state. The cross-scope envelope byte ceiling (< 256 KB)
 becomes an enforced structural gate when the flag is enabled.
 
 The rationale that motivated the old full-slice rule — "the selected commit
