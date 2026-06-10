@@ -562,6 +562,11 @@ export class WooWorld {
   private sessionSubscribersIndex = new Map<ObjRef, Map<string, ObjRef>>();
   private sessionSpacesIndex = new Map<string, Set<ObjRef>>();
   private presenceIndexBuilt = false;
+  // Placement index for the authoritative session table. Liveness is still
+  // checked at read time; the index only avoids scanning every host session for
+  // each room roster.
+  private sessionActiveScopeIndex = new Map<ObjRef, Set<string>>();
+  private sessionActiveScopeIndexBuilt = false;
   private lastSubscriberScrubAt = new Map<ObjRef, number>();
 
   private turnRecorder: TurnRecorder | null;
@@ -1453,6 +1458,55 @@ export class WooWorld {
     let actorSpaces = this.actorPresenceIndex.get(actor);
     if (!actorSpaces) { actorSpaces = new Set(); this.actorPresenceIndex.set(actor, actorSpaces); }
     actorSpaces.add(space);
+  }
+
+  private invalidateSessionActiveScopeIndex(): void {
+    this.sessionActiveScopeIndexBuilt = false;
+    this.sessionActiveScopeIndex.clear();
+  }
+
+  private ensureSessionActiveScopeIndex(): void {
+    if (this.sessionActiveScopeIndexBuilt) return;
+    this.sessionActiveScopeIndex.clear();
+    for (const session of this.sessions.values()) this.indexSessionActiveScope(session);
+    this.sessionActiveScopeIndexBuilt = true;
+  }
+
+  private indexSessionActiveScope(session: Session): void {
+    let sessions = this.sessionActiveScopeIndex.get(session.activeScope);
+    if (!sessions) {
+      sessions = new Set();
+      this.sessionActiveScopeIndex.set(session.activeScope, sessions);
+    }
+    sessions.add(session.id);
+  }
+
+  private unindexSessionActiveScope(session: Session): void {
+    const sessions = this.sessionActiveScopeIndex.get(session.activeScope);
+    if (!sessions) return;
+    sessions.delete(session.id);
+    if (sessions.size === 0) this.sessionActiveScopeIndex.delete(session.activeScope);
+  }
+
+  private noteSessionInserted(session: Session): void {
+    if (this.sessionActiveScopeIndexBuilt) this.indexSessionActiveScope(session);
+  }
+
+  private noteSessionDeleted(session: Session | undefined): void {
+    if (session && this.sessionActiveScopeIndexBuilt) this.unindexSessionActiveScope(session);
+  }
+
+  private setSessionActiveScope(session: Session, activeScope: ObjRef): boolean {
+    if (session.activeScope === activeScope) return false;
+    if (this.sessionActiveScopeIndexBuilt) this.unindexSessionActiveScope(session);
+    session.activeScope = activeScope;
+    if (this.sessionActiveScopeIndexBuilt) this.indexSessionActiveScope(session);
+    return true;
+  }
+
+  private sessionIdsInActiveScope(space: ObjRef): string[] {
+    this.ensureSessionActiveScopeIndex();
+    return Array.from(this.sessionActiveScopeIndex.get(space) ?? []);
   }
 
   deleteProp(objRef: ObjRef, name: string): boolean {
@@ -3095,6 +3149,7 @@ export class WooWorld {
     };
     this.withPersistenceDeferred(() => {
       this.sessions.set(id, session);
+      this.noteSessionInserted(session);
       this.persistSession(session);
       // No reader (substrate or catalog) consults `actor.session_id` —
       // `world.sessions` is the source of truth for session lifecycle. The
@@ -3132,10 +3187,7 @@ export class WooWorld {
         existing.expiresAt = expiresAt;
         changed = true;
       }
-      if (activeScope && existing.activeScope !== activeScope) {
-        existing.activeScope = activeScope;
-        changed = true;
-      }
+      if (activeScope && this.setSessionActiveScope(existing, activeScope)) changed = true;
       // If the originating host knows the apikey id but the routed copy
       // doesn't yet, learn it so future revokes can tear the session down
       // here too.
@@ -3163,6 +3215,7 @@ export class WooWorld {
     };
     this.withPersistenceDeferred(() => {
       this.sessions.set(id, session);
+      this.noteSessionInserted(session);
       this.persistSession(session);
       // No reader (substrate or catalog) consults `actor.session_id` —
       // `world.sessions` is the source of truth for session lifecycle. The
@@ -5424,7 +5477,7 @@ export class WooWorld {
         if (session.activeScope !== destination) {
           this.recordTurnEvent({ kind: "session_scope", session: session.id, actor, from: session.activeScope ?? null, to: destination });
         }
-        session.activeScope = destination;
+        this.setSessionActiveScope(session, destination);
         this.persistSession(session);
       }
     }
@@ -5840,7 +5893,7 @@ export class WooWorld {
       if (oldLocation !== targetRef) {
         this.recordTurnEvent({ kind: "session_scope", session: session.id, actor, from: oldLocation ?? null, to: targetRef });
       }
-      session.activeScope = targetRef;
+      this.setSessionActiveScope(session, targetRef);
       this.persistSession(session);
       const primary = this.primarySessionForActor(actor);
       const isPrimary = primary?.id === session.id;
@@ -6090,7 +6143,7 @@ export class WooWorld {
       if (present) {
         const session = this.sessions.get(sessionId);
         if (session && session.actor === actor) {
-          session.activeScope = space;
+          this.setSessionActiveScope(session, space);
           this.persistSession(session);
         }
       }
@@ -6968,6 +7021,7 @@ export class WooWorld {
       this.presenceIndexBuilt = false;
       this.subscribersIndex.clear();
       this.actorPresenceIndex.clear();
+      this.invalidateSessionActiveScopeIndex();
       for (const item of serialized.objects) {
         this.objects.set(item.id, {
           id: item.id,
@@ -7084,10 +7138,13 @@ export class WooWorld {
           break;
         case "sessions":
           if (write.op === "delete") {
+            const existing = this.sessions.get(write.key);
+            this.noteSessionDeleted(existing);
             this.sessions.delete(write.key);
             if (persist) this.deletePersistedSession(write.key);
           } else {
             const existing = this.sessions.get(write.key);
+            this.noteSessionDeleted(existing);
             const session = this.hydrateSession(write.row, Date.now());
             // Projection/persistence rows carry durable session fields only.
             // Socket attachments are process-local liveness; replacing a live
@@ -7098,6 +7155,7 @@ export class WooWorld {
               session.lastInputAt = existing.lastInputAt;
             }
             this.sessions.set(write.key, session);
+            this.noteSessionInserted(session);
             if (persist) this.persistSession(session);
           }
           result.sessions += 1;
@@ -7423,7 +7481,7 @@ export class WooWorld {
     if (gatewayHost && sessionUpdate) {
       const session = this.sessions.get(sessionUpdate.session);
       if (session?.actor === sessionUpdate.actor) {
-        session.activeScope = sessionUpdate.activeScope;
+        this.setSessionActiveScope(session, sessionUpdate.activeScope);
         this.persistSession(session);
         sessions += 1;
       }
@@ -7599,7 +7657,7 @@ export class WooWorld {
     if (sessionUpdate) {
       const session = this.sessions.get(sessionUpdate.session);
       if (session?.actor === sessionUpdate.actor) {
-        session.activeScope = sessionUpdate.activeScope;
+        this.setSessionActiveScope(session, sessionUpdate.activeScope);
         touchedSession = session;
       }
     }
@@ -8583,6 +8641,7 @@ export class WooWorld {
     // session_id mirror is no longer written (see createSessionForActor /
     // ensureSessionForActor); the matching reset on reap would just rewrite
     // the inherited default.
+    this.noteSessionDeleted(session);
     this.sessions.delete(sessionId);
     this.deletePersistedSession(sessionId);
     if (wasPrimary && !isGuest) this.promoteActorPrimaryLocation(session.actor);
@@ -8599,6 +8658,7 @@ export class WooWorld {
     this.removeSessionPresence(sessionId, session.actor);
     session.closedAt = Date.now();
     session.attachedSockets.clear();
+    this.noteSessionDeleted(session);
     this.sessions.delete(sessionId);
   }
 
@@ -8968,8 +9028,9 @@ export class WooWorld {
     const now = Date.now();
     const sessions: string[] = [];
     const actors = new Set<ObjRef>();
-    for (const session of this.sessions.values()) {
-      if (session.activeScope !== space) continue;
+    for (const sessionId of this.sessionIdsInActiveScope(space)) {
+      const session = this.sessions.get(sessionId);
+      if (!session) continue;
       if (!this.sessionIsLive(session, now)) continue;
       sessions.push(session.id);
       actors.add(session.actor);
@@ -9199,7 +9260,7 @@ export class WooWorld {
       if (present) {
         const session = this.sessions.get(sessionId);
         if (session && session.actor === actor) {
-          session.activeScope = space;
+          this.setSessionActiveScope(session, space);
           this.persistSession(session);
         }
       }
@@ -9222,7 +9283,7 @@ export class WooWorld {
     if (present) {
       const session = this.sessions.get(sessionId);
       if (session && session.actor === actor) {
-        session.activeScope = space;
+        this.setSessionActiveScope(session, space);
         this.persistSession(session);
       }
     }
@@ -9734,6 +9795,7 @@ export class WooWorld {
     // properties on objects we just rolled back. Drop it so the next read
     // rebuilds from the restored property values.
     this.invalidatePresenceIndex();
+    this.invalidateSessionActiveScopeIndex();
   }
 
   private cloneObject(obj: WooObject): WooObject {
@@ -10560,7 +10622,7 @@ export class WooWorld {
     return { summaries, remoteCount: remoteIds.length, batchCount: remoteIds.length };
   }
 
-  async presentActorsIn(_ctx: CallContext, space: ObjRef): Promise<ObjRef[]> {
+  async presentActorsIn(ctx: CallContext, space: ObjRef): Promise<ObjRef[]> {
     const actors = new Set<ObjRef>();
     const now = Date.now();
     // CA8: the session table is the authoritative live placement source. The
@@ -10568,8 +10630,9 @@ export class WooWorld {
     // cross-host materialization and back-compat, so catalog roster reads must not
     // disappear when a sparse planning snapshot has the session row but not yet
     // the derived presence cell.
-    for (const session of this.sessions.values()) {
-      if (session.activeScope !== space) continue;
+    for (const sessionId of this.sessionIdsInActiveScope(space)) {
+      const session = this.sessions.get(sessionId);
+      if (!session) continue;
       if (!this.sessionIsLive(session, now)) continue;
       if (!this.objects.has(session.actor)) continue;
       actors.add(session.actor);
@@ -10578,7 +10641,20 @@ export class WooWorld {
     if (sessions) {
       for (const [sessionId, actor] of sessions) {
         const session = this.sessions.get(sessionId);
-        if (session && (session.actor !== actor || this.sessionExpired(session, now))) continue;
+        if (session) {
+          if (session.actor !== actor || !this.sessionIsLive(session, now)) continue;
+        } else if (!sessionId.startsWith("legacy:")) {
+          // Missing local session rows are stale for local actors and must not
+          // surface a non-live, non-dereferenceable roster entry. A missing row
+          // for a remote actor can be legitimate because this room host may only
+          // hold the projected presence cell; keep trusting that projection when
+          // the actor object is materialized locally as a remote/cache row.
+          const actorRemote = await this.remoteHostForObject(actor, ctx.hostMemo).catch((err) => {
+            if (!isReadAvailabilityError(err)) throw err;
+            return null;
+          });
+          if (!actorRemote) continue;
+        }
         // Remote session rows are intentionally projected into the space owner so
         // catalog code can model presence from the room itself. If this host does
         // not own the session row, trust the projection; stale remote rows are

@@ -12,7 +12,6 @@ const catalogsRoot = join(root, "catalogs");
 const mainTsPath = join(root, "src/client/main.ts");
 const errors = [];
 let auditedFrames = 0;
-const movementManagedSubjects = new Set(["$pinboard", "$outliner", "$dubspace"]);
 const movementForbiddenVerbs = new Set(["enter", "leave", "out"]);
 const suppressedInheritedLifecycleTools = ["enter", "leave"];
 
@@ -48,8 +47,8 @@ function hasMainRegion(frame) {
   return Array.isArray(frame?.regions?.main) && frame.regions.main.length > 0;
 }
 
-function classByLocalName(manifest, localName) {
-  return (manifest.classes ?? []).find((cls) => cls?.local_name === localName);
+function classHasMountRoom(cls) {
+  return (cls.properties ?? []).some((prop) => prop?.name === "mount_room");
 }
 
 for (const dir of dirs) {
@@ -77,9 +76,9 @@ for (const dir of dirs) {
     }
   }
 
-  for (const subject of movementManagedSubjects) {
-    const cls = classByLocalName(manifest, subject);
-    if (!cls) continue;
+  for (const cls of manifest.classes ?? []) {
+    if (!classHasMountRoom(cls)) continue;
+    const subject = cls.local_name ?? "<unnamed>";
     const where = `${rel(manifestPath)} class ${subject}`;
     if (cls.parent !== "$room" && cls.parent !== "chat:$room") {
       errors.push(`${where}: movement-managed tool spaces must inherit $room for the exit graph`);
@@ -92,8 +91,8 @@ for (const dir of dirs) {
     let suppressedInheritedTools = null;
     for (const prop of cls.properties ?? []) {
       if (prop?.name === "suppressed_inherited_tools") suppressedInheritedTools = prop;
-      if (subject === "$dubspace" && prop?.name === "operators") {
-        errors.push(`${where}: dubspace authority must derive from presence, not an operators property`);
+      if (prop?.name === "operators") {
+        errors.push(`${where}: mounted tool-space authority must derive from presence, not an operators property`);
       }
     }
     const suppressedDefaults = Array.isArray(suppressedInheritedTools?.default) ? suppressedInheritedTools.default : [];

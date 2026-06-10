@@ -1140,8 +1140,10 @@ export class McpHost {
     // `self:<id>` makes objects with their own verbs unique; `shared` lets
     // own-verb-free siblings reuse one entry keyed on the parent.
     const ownIdentity = obj.verbs.length > 0 ? `self:${id}` : "shared";
-    const ownFeatures = JSON.stringify(this.world.propOrNull(id, "features") ?? null);
-    const suppressedTools = projection === "tools" ? JSON.stringify(this.world.propOrNull(id, "suppressed_inherited_tools") ?? null) : "";
+    const features = this.world.propOrNull(id, "features");
+    const ownFeatures = Array.isArray(features) && features.length > 0 ? JSON.stringify(features) : "";
+    const suppressed = projection === "tools" ? this.world.propOrNull(id, "suppressed_inherited_tools") : null;
+    const suppressedTools = Array.isArray(suppressed) && suppressed.length > 0 ? JSON.stringify(suppressed) : "";
     const tooledDiscriminator = projection === "tools" ? `${id === actor}:${this.isBlockObject(id)}:${suppressedTools}` : "";
     return `${projection}|${actor}|p:${obj.parent ?? ""}|own:${ownIdentity}|f:${ownFeatures}|t:${tooledDiscriminator}`;
   }

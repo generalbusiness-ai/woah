@@ -93,4 +93,16 @@ describe("session-scope presence (CA8)", () => {
 
     await expect(world.presentActorsIn({} as any, "the_chatroom")).resolves.toContain(watcher.actor);
   });
+
+  it("present_actors excludes local projection rows whose live session row is missing", async () => {
+    const world = createWorld();
+    const stale = world.auth("guest:ssp-stale-projection");
+    world.setProp("the_chatroom", "session_subscribers", [
+      { session: stale.id, actor: stale.actor }
+    ] as unknown as WooValue);
+    world.setProp("the_chatroom", "subscribers", [stale.actor] as unknown as WooValue);
+    world.sessions.delete(stale.id);
+
+    await expect(world.presentActorsIn({} as any, "the_chatroom")).resolves.not.toContain(stale.actor);
+  });
 });
