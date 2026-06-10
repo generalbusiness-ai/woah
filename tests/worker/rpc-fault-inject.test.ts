@@ -765,6 +765,9 @@ type D1Harness = FaultHarness & {
   discardWaitUntil(): void;
   undrainedRowCount(shardName: string): number;
   allShardNames(): string[];
+  // Raw SQL access for white-box row manipulation (backoff regression gate).
+  sqlExec(shardName: string, sql: string, ...params: unknown[]): void;
+  sqlCount(shardName: string, sql: string, ...params: unknown[]): number;
 };
 
 function createD1Harness(): D1Harness {
@@ -846,6 +849,17 @@ function createD1Harness(): D1Harness {
       const rows = state.storage.sql.exec(
         "SELECT COUNT(*) AS n FROM v2_fanout_pending WHERE delivered = 0"
       ).toArray();
+      return Number((rows[0] as Record<string, unknown> | undefined)?.["n"] ?? 0);
+    },
+    sqlExec: (shardName: string, sql: string, ...params: unknown[]): void => {
+      const state = wooStates.get(shardName);
+      if (!state) throw new Error(`no shard state: ${shardName}`);
+      state.storage.sql.exec(sql, ...(params as never[]));
+    },
+    sqlCount: (shardName: string, sql: string, ...params: unknown[]): number => {
+      const state = wooStates.get(shardName);
+      if (!state) throw new Error(`no shard state: ${shardName}`);
+      const rows = state.storage.sql.exec(sql, ...(params as never[])).toArray();
       return Number((rows[0] as Record<string, unknown> | undefined)?.["n"] ?? 0);
     },
     allShardNames: (): string[] => Array.from(wooStates.keys())
@@ -1194,6 +1208,70 @@ describe("mcp-commit-fanout error mode", () => {
     } finally {
       warnSpy?.mockRestore();
       await session?.close();
+      harness.close();
+    }
+  });
+});
+
+// ─── D1 backoff regression: retry window anchored at the last attempt ────────
+//
+// Review finding (2026-06-10): the drain computed `Date.now() - backoff` and
+// compared it to `Date.now()`, which is never in the future — so failed rows
+// retried immediately on every drain and could burn through MAX_DRAIN_ATTEMPTS
+// in a single pass. The fix anchors the window at last_attempt_at_ms. This
+// gate proves the window is respected: a row whose last attempt was "just now"
+// must be SKIPPED by the drain (the skip happens before payload parsing, so a
+// garbage payload makes reaching-the-parse-step observable: parsed-garbage is
+// marked delivered, a skipped row stays undelivered).
+
+describe("D1 backoff: failed rows wait out their retry window", () => {
+  it("skips rows until last_attempt_at_ms + backoff elapses, then processes them", async () => {
+    const runId = `d1-backoff-${Date.now()}`;
+    const harness = createD1Harness();
+    let alice: SmokeSession | null = null;
+    try {
+      alice = await openD1Session(harness, `${runId}-a`, "alice");
+      await alice.call("the_chatroom", "enter", []);
+      // Settle setup drains so the injected row below is the only pending one.
+      await harness.drainWaitUntil();
+      // Inject the row directly (white-box): a single-session run may produce
+      // no real fanout targets, so a say-minted row is not guaranteed. The row
+      // poses as a recently-FAILED attempt with a garbage payload. Within the
+      // retry window the drain must SKIP it without parsing (a parsed garbage
+      // row would be marked delivered by the malformed-row path).
+      // Target the MCP gateway shard: drain-on-reactivation fires on the DO
+      // that alice's requests reach, and the outbox/drain live on the gateway.
+      const shard = harness.allShardNames().find((n) => n.startsWith("mcp-gateway"));
+      expect(shard, "an mcp gateway shard must exist after setup").toBeTruthy();
+      harness.sqlExec(
+        shard!,
+        "INSERT INTO v2_fanout_pending (id, destination, scope, seq, payload, queued_at_ms, delivered, attempts, last_attempt_at_ms) VALUES (?, ?, ?, ?, 'garbage', ?, 0, 1, ?)",
+        `d1-backoff-row-${runId}`, "mcp-gateway-99", "the_chatroom", 1, Date.now(), Date.now()
+      );
+      harness.simulateGatewayEviction(shard!);
+      await alice.call("the_chatroom", "say", [`poke1-${runId}`]);
+      await harness.drainWaitUntil();
+      expect(
+        harness.sqlCount(shard!, "SELECT COUNT(*) AS n FROM v2_fanout_pending WHERE delivered = 0 AND payload = 'garbage'"),
+        "row inside its retry window must be skipped, not parsed"
+      ).toBe(1);
+      // Age the row past its window (backoff for attempts=1 is 1s) and drain
+      // again: now the drain reaches the parse step and the garbage row is
+      // marked delivered (the malformed-row path), proving it was processed.
+      harness.sqlExec(
+        shard!,
+        "UPDATE v2_fanout_pending SET last_attempt_at_ms = ? WHERE payload = 'garbage'",
+        Date.now() - 60_000
+      );
+      harness.simulateGatewayEviction(shard!);
+      await alice.call("the_chatroom", "say", [`poke2-${runId}`]);
+      await harness.drainWaitUntil();
+      expect(
+        harness.sqlCount(shard!, "SELECT COUNT(*) AS n FROM v2_fanout_pending WHERE delivered = 0 AND payload = 'garbage'"),
+        "row past its retry window must be processed"
+      ).toBe(0);
+    } finally {
+      await alice?.close();
       harness.close();
     }
   });

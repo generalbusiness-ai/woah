@@ -914,7 +914,7 @@ describe("local catalogs", () => {
     if (entered.op === "result") {
       expect(entered.result).toMatchObject({ room: "the_dubspace", look_deferred: true });
       expect(entered.observations.map((obs) => obs.type)).toEqual(["dubspace_entered", "dubspace_activity"]);
-      expect(entered.observations[0]).toMatchObject({ text: `${actorName} steps up to Dubspace.` });
+      expect(entered.observations[0]).toMatchObject({ source: "the_dubspace", text: `${actorName} steps up to Dubspace.` });
       expect(entered.observations[1]).toMatchObject({ source: "the_chatroom", space: "the_dubspace", actor });
     }
     expect(world.object(actor).location).toBe("the_dubspace");
@@ -1181,6 +1181,9 @@ describe("local catalogs", () => {
     const other = world.auth("guest:catalog-pinboard-other");
     const entered = await moveActorTo(world, session.actor, "the_pinboard", { requestId: "pinboard-moveto", sessionId: session.id });
     expect(entered.op).toBe("result");
+    if (entered.op === "result") {
+      expect(entered.observations[0]).toMatchObject({ type: "pinboard_entered", source: "the_pinboard", board: "the_pinboard", actor: session.actor });
+    }
     expect(world.object(session.actor).location).toBe("the_pinboard");
     expect(world.hasPresence(session.actor, "the_pinboard")).toBe(true);
     await moveActorTo(world, other.actor, "the_pinboard", { requestId: "pinboard-moveto-other", sessionId: other.id });
@@ -1194,6 +1197,7 @@ describe("local catalogs", () => {
     expect(added.op).toBe("applied");
     if (added.op !== "applied") return;
     expect(added.observations.map((obs) => obs.type)).toEqual(["pin_added", "pinboard_activity", "note_edited", "pin_recolored", "note_added"]);
+    expect(added.observations[0]).toMatchObject({ type: "pin_added", source: "the_pinboard", board: "the_pinboard", actor: session.actor });
     const note = added.observations.find((obs) => obs.type === "note_added")?.note as Record<string, unknown>;
     expect(note).toMatchObject({ text: "Bring the towel to the hot tub", color: "blue", x: 12, y: 24, w: 160, h: 88 });
     const pin = String(note.id);

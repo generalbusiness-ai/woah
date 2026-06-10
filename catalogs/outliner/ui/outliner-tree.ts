@@ -158,8 +158,13 @@ export class WooOutlinerTreeElement extends HTMLElement {
   });
 
   set data(value: OutlinerData) {
-    this.resetItemHydrationIfSubjectChanged(value.outlinerId || this.subject || "");
-    this.model = value;
+    // Host data assignment is an optional integration path, not the source of
+    // truth for this component. Reject unrelated payloads here so another tool's
+    // data shape cannot replace the outliner model and crash render().
+    const next = normalizeOutlinerData(value, this.model, this.subject);
+    if (!next) return;
+    this.resetItemHydrationIfSubjectChanged(next.outlinerId || this.subject || "");
+    this.model = next;
     this.projectionMissingItemTextSignature = "";
     this.render();
   }
@@ -494,7 +499,6 @@ export class WooOutlinerTreeElement extends HTMLElement {
     const toolbar = `
       <section class="toolbar outliner-toolbar">
         <h1>${escapeHtml(data.outlinerName)}</h1>
-        <button type="button" data-outliner-presence="${this.enterPending ? "pending" : this.companionVisible ? "leave" : "enter"}" ${this.enterPending ? "disabled" : ""}>${this.enterPending ? "Entering..." : this.companionVisible ? "Leave" : "Enter"}</button>
         <label class="outliner-toggle">
           <input type="checkbox" data-outliner-show-hidden ${this.showHidden ? "checked" : ""}>
           show hidden
@@ -507,6 +511,8 @@ export class WooOutlinerTreeElement extends HTMLElement {
     // user creates children "in place" via the + button on the selected
     // row, so hiding the top form removes ambiguity about which parent a
     // new item would land under.
+    // Movement is driven by the selected browser tab; this form becomes
+    // writable only after the shared tool movement path opens the companion.
     const canMutate = this.companionVisible && !this.enterPending;
     const topAdd = canMutate && this.selectedId == null
       ? `<form class="outliner-add" data-outliner-add>
@@ -694,13 +700,6 @@ export class WooOutlinerTreeElement extends HTMLElement {
 
   private onClick = async (event: Event): Promise<void> => {
     const target = event.target as HTMLElement;
-    const presence = target.closest<HTMLElement>("[data-outliner-presence]");
-    if (presence) {
-      event.preventDefault();
-      const action = presence.dataset.outlinerPresence === "leave" ? "leave" : "enter";
-      await this.callVerb(action, []);
-      return;
-    }
     const btn = target.closest<HTMLElement>("[data-outliner-action]");
     if (btn) {
       event.preventDefault();
@@ -1049,6 +1048,38 @@ function normalizeOutlinerItems(value: unknown): OutlinerItem[] | null {
     });
   });
   return orderedOutlinerItems(items);
+}
+
+function normalizeOutlinerData(value: unknown, fallback: OutlinerData, subject?: string): OutlinerData | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  const items = normalizeOutlinerItems(row.items);
+  if (!items) return null;
+  return {
+    outlinerId: typeof row.outlinerId === "string" && row.outlinerId ? row.outlinerId : subject || fallback.outlinerId,
+    outlinerName: typeof row.outlinerName === "string" && row.outlinerName ? row.outlinerName : fallback.outlinerName || "Outline",
+    items,
+    focus: typeof row.focus === "string" ? row.focus : null,
+    actor: typeof row.actor === "string" ? row.actor : null,
+    roster: normalizeOutlinerRoster(row.roster)
+  };
+}
+
+function normalizeOutlinerRoster(value: unknown): OutlinerRosterRow[] {
+  if (!Array.isArray(value)) return [];
+  const rows: OutlinerRosterRow[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const row = entry as Record<string, unknown>;
+    const id = typeof row.id === "string" && row.id ? row.id : "";
+    if (!id) continue;
+    const rosterRow: OutlinerRosterRow = { id };
+    if (typeof row.name === "string") rosterRow.name = row.name;
+    if (typeof row.presence === "string") rosterRow.presence = row.presence;
+    if (typeof row.idle_seconds === "number" && Number.isFinite(row.idle_seconds)) rosterRow.idle_seconds = row.idle_seconds;
+    rows.push(rosterRow);
+  }
+  return rows;
 }
 
 function orderedOutlinerItems(items: OutlinerItem[]): OutlinerItem[] {

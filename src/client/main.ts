@@ -325,6 +325,7 @@ const pendingCommands = new Map<string, { space: string; text: string; action?: 
 const pendingNetworkTurns = new Set<string>();
 const pendingToolEnters = new Set<string>();
 const pendingToolEnterTimers = new Map<string, number>();
+const pendingToolMoveRetryTimers = new Map<string, number>();
 const pendingOverlaySnapshots = new Map<string, Promise<void>>();
 let scopedProjectionLocalRevision = 0;
 let connectInFlight: Promise<void> | null = null;
@@ -358,15 +359,21 @@ function toolDefinition(tab: AppTab): ToolTabDefinition | undefined {
 function isToolTab(tab: AppTab): tab is ToolTab {
   return (TOOL_TABS as AppTab[]).includes(tab);
 }
+
+function isToolSurfaceTab(tab: AppTab): boolean {
+  return isToolTab(tab) || tab === "tool";
+}
 let reconnectDelayMs = reconnectBaseDelayMs;
 let reconnectTimer: number | undefined;
 let pinboardViewportTimer: number | undefined;
 let pinboardViewAnimationTimer: number | undefined;
 let lastPinboardViewportPublishAt = 0;
 let lastPinboardViewportSent: PinNoteBox & { scale: number } | undefined;
+let pendingChatDestinationRoom = "";
 const pinNoteClientZ = new Map<string, number>();
 const PINBOARD_OPTIMISTIC_TTL_MS = 5_000;
 const TOOL_ENTER_PENDING_TIMEOUT_MS = 8_000;
+const TOOL_ENTER_RETRY_DELAY_MS = 150;
 let focusTasksChatOnEntry = false;
 let catalogUiEtag = "";
 let catalogUiCache: any;
@@ -512,7 +519,7 @@ function beginPendingToolEnter(space: string) {
   // change. Bound the gate so tool mutation controls cannot stay disabled.
   pendingToolEnterTimers.set(space, window.setTimeout(() => {
     clearPendingToolEnter(space);
-    if (isToolTab(state.tab)) render();
+    if (isToolSurfaceTab(state.tab)) render();
   }, TOOL_ENTER_PENDING_TIMEOUT_MS));
 }
 
@@ -521,13 +528,18 @@ function clearPendingToolEnter(space: string) {
   const timer = pendingToolEnterTimers.get(space);
   if (timer !== undefined) window.clearTimeout(timer);
   pendingToolEnterTimers.delete(space);
+  const retryTimer = pendingToolMoveRetryTimers.get(space);
+  if (retryTimer !== undefined) window.clearTimeout(retryTimer);
+  pendingToolMoveRetryTimers.delete(space);
 }
 
 function clearPendingToolEnters(options: { render?: boolean } = {}) {
-  if (pendingToolEnters.size === 0 && pendingToolEnterTimers.size === 0) return;
+  if (pendingToolEnters.size === 0 && pendingToolEnterTimers.size === 0 && pendingToolMoveRetryTimers.size === 0) return;
   for (const timer of pendingToolEnterTimers.values()) window.clearTimeout(timer);
+  for (const timer of pendingToolMoveRetryTimers.values()) window.clearTimeout(timer);
   pendingToolEnters.clear();
   pendingToolEnterTimers.clear();
+  pendingToolMoveRetryTimers.clear();
   if (options.render) render();
 }
 
@@ -576,7 +588,7 @@ function ensureV2BrowserWorker() {
     if (event.data?.kind === "browser_metric") queueBrowserMetric(event.data.metric);
     if (event.data?.kind === "status") {
       console.debug("woo.v2", event.data.status);
-      if (event.data.status?.connected === false) clearPendingToolEnters({ render: state.tab === "pinboard" || state.tab === "outliner" });
+      if (event.data.status?.connected === false) clearPendingToolEnters({ render: isToolSurfaceTab(state.tab) });
     }
     if (event.data?.kind === "projection") {
       const startedAt = performance.now();
@@ -1268,6 +1280,10 @@ function enterTabDestination(tab: AppTab) {
     enterChat();
     return;
   }
+  if (tab === "tool") {
+    enterGenericTool();
+    return;
+  }
   toolDefinition(tab)?.enter?.();
 }
 
@@ -1275,6 +1291,7 @@ function setTab(tab: AppTab, options: { mode?: "replace" | "push"; leaveCurrent?
   const mode = options.mode ?? "push";
   const leaveCurrent = options.leaveCurrent ?? true;
   const current = state.tab;
+  if (tab === "chat") pendingChatDestinationRoom = chatDestinationRoomForPreviousTab(current);
   if (current === "tasks" && tab !== "tasks") {
     focusTasksChatOnEntry = false;
   } else if (current !== "tasks" && tab === "tasks") {
@@ -2225,6 +2242,24 @@ function activeChatRoom() {
   return state.tab === "chat" ? defaultChatRoom() : "";
 }
 
+function chatDestinationRoomForPreviousTab(previousTab: AppTab): string {
+  const previousSubject = previousTab === "tool"
+    ? state.genericToolSubject
+    : isToolTab(previousTab)
+      ? toolSpace(previousTab)
+      : "";
+  const mountRoom = toolMountRoom(previousSubject);
+  if (mountRoom) return mountRoom;
+  if (chatRoomPin?.room) return chatRoomPin.room;
+  return activeChatRoom();
+}
+
+function toolMountRoom(subject: string): string {
+  if (!subject) return "";
+  const value = projectedObjectView(subject)?.props?.mount_room;
+  return typeof value === "string" && value ? value : "";
+}
+
 type V2TurnInput = {
   id?: string;
   route: "direct" | "sequenced";
@@ -2234,12 +2269,14 @@ type V2TurnInput = {
   args?: unknown[];
   persistence?: "durable" | "live";
   readOnly?: boolean;
+  skipLocalExecution?: boolean;
+  serverAuthoritative?: boolean;
   options?: ProjectionCallOptions;
   onResult?: (result: any) => void;
   onError?: (error: any) => void;
 };
 
-function sendV2TurnIntent(input: Required<Pick<V2TurnInput, "id" | "route" | "scope" | "target" | "verb">> & Pick<V2TurnInput, "args" | "persistence" | "readOnly">): boolean {
+function sendV2TurnIntent(input: Required<Pick<V2TurnInput, "id" | "route" | "scope" | "target" | "verb">> & Pick<V2TurnInput, "args" | "persistence" | "readOnly" | "skipLocalExecution" | "serverAuthoritative">): boolean {
   ensureV2BrowserWorker();
   syncV2BrowserWorkerScope(input.scope);
   if (!v2BrowserWorker || !state.actor || !state.session) return false;
@@ -2254,7 +2291,15 @@ function sendV2TurnIntent(input: Required<Pick<V2TurnInput, "id" | "route" | "sc
     ...(input.persistence ? { persistence: input.persistence } : {}),
     // A read-only display hydration skips the local-execution attempt in the
     // worker and goes straight to the authoritative server-intent path.
-    ...(input.readOnly ? { read_only: true } : {})
+    ...(input.readOnly ? { read_only: true } : {}),
+    // Movement lifecycle hooks can write presence/session-owned cells that the
+    // browser-local commit verifier cannot always authorize from sparse state.
+    // Keep the durable turn, but skip browser-local planning.
+    ...(input.skipLocalExecution ? { skip_local_execution: true } : {}),
+    // Some lifecycle moves are owned by session/presence state, not by the
+    // tool's browser-executable control surface. Send those as plain durable
+    // intents to the authoritative scope executor instead of a browser ad.
+    ...(input.serverAuthoritative ? { server_authoritative: true } : {})
   });
   trackV2TurnNetworkWait(input.id);
   return true;
@@ -2274,7 +2319,9 @@ function v2Turn(input: V2TurnInput): string {
     verb: input.verb,
     args: input.args ?? [],
     persistence: input.persistence,
-    readOnly: input.readOnly ?? input.options?.serverRead === true
+    readOnly: input.readOnly ?? input.options?.serverRead === true,
+    skipLocalExecution: input.skipLocalExecution,
+    serverAuthoritative: input.serverAuthoritative
   })) {
     ui.failOptimisticCall(id);
     pendingDirect.delete(id);
@@ -3215,8 +3262,10 @@ function normalizePattern(raw: any): Record<string, boolean[]> {
 }
 
 function enterChat() {
-  const room = activeChatRoom();
-  if (!room || !canSendChat()) return;
+  const room = pendingChatDestinationRoom || activeChatRoom();
+  pendingChatDestinationRoom = "";
+  if (!room || !canSendChat() || !state.actor) return;
+  setCurrentChatRoom(room);
   const onError = chatErrorHandler(room);
   const onResult = (result: any) => {
     applyScopedMoveResult(result);
@@ -3225,7 +3274,18 @@ function enterChat() {
     if (state.tab === "chat") render();
   };
   if (canSendChatV2()) {
-    v2Turn({ scope: room, route: "direct", target: room, verb: "enter", args: [], persistence: "durable", onResult, onError });
+    v2Turn({
+      scope: room,
+      route: "direct",
+      target: state.actor,
+      verb: "moveto",
+      args: [room],
+      persistence: "durable",
+      skipLocalExecution: true,
+      serverAuthoritative: true,
+      onResult,
+      onError
+    });
     return;
   }
   direct(room, "enter", [], onResult, onError);
@@ -4098,9 +4158,16 @@ function renderChatCommandResult(action: ChatCommandUiAction, result: any, origi
 function applyLookResult(result: any) {
   const present = idsFromRefsOrSummaries(Array.isArray(result?.roster) ? result.roster : Array.isArray(result?.present_actors) ? result.present_actors : []);
   if (present.length === 0) return;
+  const lookedId = typeof result?.id === "string" ? result.id : "";
+  // Tool-space `look` results describe that nested space's roster. Feed those
+  // rosters back into the tool projection instead of overwriting chat presence.
+  if (lookedId && lookedId === pinboardSpace()) {
+    setPinboardPresent(result);
+    if (state.tab === "pinboard") render();
+    return;
+  }
   // `look pinboard` returns the board's own roster; clobbering chatPresent
   // with it hides the chat UI for anyone not also inside the board.
-  const lookedId = typeof result?.id === "string" ? result.id : "";
   if (lookedId && lookedId !== activeChatRoom()) return;
   state.chatPresent = present;
 }
@@ -4818,7 +4885,12 @@ function blurActivePinNoteText(): boolean {
 }
 
 function normalizedPinboardView(): PinboardView {
-  const current = state.pinboardView;
+  // The viewport is client-local UI state, not durable world state. During
+  // reload/projection interleavings older pages can briefly lack it; normalize
+  // that the same way we normalize corrupt numeric values.
+  const current = state.pinboardView && typeof state.pinboardView === "object"
+    ? state.pinboardView
+    : { x: 0, y: 0, scale: 1 };
   const scale = clamp(Number(current.scale), PINBOARD_MIN_ZOOM, PINBOARD_MAX_ZOOM);
   const x = Number.isFinite(Number(current.x)) ? Number(current.x) : 0;
   const y = Number.isFinite(Number(current.y)) ? Number(current.y) : 0;
@@ -5067,7 +5139,7 @@ function bindPinNoteResize(handle: HTMLButtonElement) {
 }
 
 type RoomToolLifecycleOptions = {
-  tab: ToolTab;
+  tab: AppTab;
   space: string;
   canSend: () => boolean;
   route?: "direct" | "sequenced";
@@ -5080,11 +5152,55 @@ type RoomToolLifecycleOptions = {
 
 type ToolMoveOptions = Omit<RoomToolLifecycleOptions, "route" | "waitForLeaveResult">;
 
-function moveActorToToolSpace(options: ToolMoveOptions) {
+function scheduleToolMoveRetry(options: ToolMoveOptions) {
+  const { tab, space } = options;
+  if (!space || !state.actor) return;
+  if (pendingToolMoveRetryTimers.has(space)) return;
+  beginPendingToolEnter(space);
+  if (state.tab === tab) render();
+  const startedAt = performance.now();
+  const retry = () => {
+    pendingToolMoveRetryTimers.delete(space);
+    const isPresent = options.isPresent ?? (() => actorPresentInSpace(space));
+    if (state.tab !== tab) {
+      clearPendingToolEnter(space);
+      return;
+    }
+    if (isPresent()) {
+      clearPendingToolEnter(space);
+      options.onAlreadyPresent?.();
+      requestSpaceChatFocus(space);
+      if (state.tab === tab) render();
+      return;
+    }
+    if (performance.now() - startedAt >= TOOL_ENTER_PENDING_TIMEOUT_MS) {
+      clearPendingToolEnter(space);
+      if (state.tab === tab) render();
+      return;
+    }
+    if (state.actor && options.canSend()) {
+      moveActorToToolSpace(options, { retrying: true });
+      return;
+    }
+    pendingToolMoveRetryTimers.set(space, window.setTimeout(retry, TOOL_ENTER_RETRY_DELAY_MS));
+  };
+  pendingToolMoveRetryTimers.set(space, window.setTimeout(retry, TOOL_ENTER_RETRY_DELAY_MS));
+}
+
+function moveActorToToolSpace(options: ToolMoveOptions, retryOptions: { retrying?: boolean } = {}) {
   const { tab, space, canSend } = options;
-  if (!space || !state.actor || !canSend()) return;
-  if ((options.isPresent ?? (() => actorPresentInSpace(space)))() || pendingToolEnters.has(space)) {
+  if (!space || !state.actor) return;
+  if ((options.isPresent ?? (() => actorPresentInSpace(space)))()) {
+    clearPendingToolEnter(space);
     options.onAlreadyPresent?.();
+    requestSpaceChatFocus(space);
+    return;
+  }
+  if (!canSend()) {
+    scheduleToolMoveRetry(options);
+    return;
+  }
+  if (!retryOptions.retrying && pendingToolEnters.has(space)) {
     requestSpaceChatFocus(space);
     return;
   }
@@ -5097,6 +5213,8 @@ function moveActorToToolSpace(options: ToolMoveOptions) {
     verb: "moveto",
     args: [space],
     persistence: "durable",
+    skipLocalExecution: true,
+    serverAuthoritative: true,
     onResult: (result) => {
       clearPendingToolEnter(space);
       applyScopedMoveResult(result);
@@ -5209,6 +5327,12 @@ function leaveTasks(done?: () => void) {
 
 function enterOutliner() {
   moveActorToToolSpace({ tab: "outliner", space: outlinerSpace(), canSend: canSendV2Browser });
+}
+
+function enterGenericTool() {
+  const space = state.genericToolSubject;
+  if (!space) return;
+  moveActorToToolSpace({ tab: "tool", space, canSend: canSendV2Browser });
 }
 
 function enterPinboard() {

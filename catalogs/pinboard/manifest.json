@@ -262,7 +262,7 @@
               "object"
             ]
           },
-          "source": "verb :enterfunc(object) rx { if (isa(object, $actor)) { let text = object.name + \" starts working at \" + this.name + \".\"; observe({ type: \"pinboard_entered\", actor: object, board: this, origin: this.mount_room, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: object, text: text, ts: now() }); } return true; } if (!isa(object, $note)) { return true; } let key = to_string(object); let layout = this.layout; if (!has(layout, key)) { let z = this.next_z; this.next_z = z + 1; let count = length(layout) + 1; layout[key] = { x: 48 + ((count - 1) * 32), y: 48 + ((count - 1) * 26), w: 180, h: 110, z: z }; this.layout = layout; } observe({ type: \"pin_added\", actor: actor, board: this, pin: object, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: actor, pin: object, text: actor.name + \" pinned a note to \" + this.name + \".\", ts: now() }); } return true; }"
+          "source": "verb :enterfunc(object) rx { if (isa(object, $actor)) { let text = object.name + \" starts working at \" + this.name + \".\"; observe({ type: \"pinboard_entered\", source: this, actor: object, board: this, origin: this.mount_room, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: object, text: text, ts: now() }); } return true; } if (!isa(object, $note)) { return true; } let key = to_string(object); let layout = this.layout; if (!has(layout, key)) { let z = this.next_z; this.next_z = z + 1; let count = length(layout) + 1; layout[key] = { x: 48 + ((count - 1) * 32), y: 48 + ((count - 1) * 26), w: 180, h: 110, z: z }; this.layout = layout; } observe({ type: \"pin_added\", source: this, actor: actor, board: this, pin: object, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: actor, pin: object, text: actor.name + \" pinned a note to \" + this.name + \".\", ts: now() }); } return true; }"
         },
         {
           "name": "exitfunc",
@@ -272,7 +272,7 @@
               "object"
             ]
           },
-          "source": "verb :exitfunc(object) rx { if (isa(object, $actor)) { let text = object.name + \" steps back from \" + this.name + \".\"; observe({ type: \"pinboard_left\", actor: object, board: this, destination: this.mount_room, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: object, text: text, ts: now() }); } return true; } if (!isa(object, $note)) { return true; } let key = to_string(object); let layout = this.layout; if (has(layout, key)) { let next = {}; for k in keys(layout) { if (k != key) { next[k] = layout[k]; } } this.layout = next; } observe({ type: \"pin_removed\", actor: actor, board: this, pin: object, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: actor, pin: object, text: actor.name + \" took a note from \" + this.name + \".\", ts: now() }); } return true; }"
+          "source": "verb :exitfunc(object) rx { if (isa(object, $actor)) { let text = object.name + \" steps back from \" + this.name + \".\"; observe({ type: \"pinboard_left\", source: this, actor: object, board: this, destination: this.mount_room, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: object, text: text, ts: now() }); } return true; } if (!isa(object, $note)) { return true; } let key = to_string(object); let layout = this.layout; if (has(layout, key)) { let next = {}; for k in keys(layout) { if (k != key) { next[k] = layout[k]; } } this.layout = next; } observe({ type: \"pin_removed\", source: this, actor: actor, board: this, pin: object, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: actor, pin: object, text: actor.name + \" took a note from \" + this.name + \".\", ts: now() }); } return true; }"
         },
         {
           "name": "post",
@@ -384,6 +384,7 @@
       "on": "$pinboard",
       "type": "pinboard_entered",
       "shape": {
+        "source": "obj",
         "actor": "obj",
         "board": "obj",
         "text": "str"
@@ -393,6 +394,7 @@
       "on": "$pinboard",
       "type": "pinboard_left",
       "shape": {
+        "source": "obj",
         "actor": "obj",
         "board": "obj",
         "text": "str"
@@ -428,6 +430,7 @@
       "on": "$pinboard",
       "type": "pin_added",
       "shape": {
+        "source": "obj",
         "actor": "obj",
         "board": "obj",
         "pin": "obj"
@@ -437,6 +440,7 @@
       "on": "$pinboard",
       "type": "pin_removed",
       "shape": {
+        "source": "obj",
         "actor": "obj",
         "board": "obj",
         "pin": "obj"

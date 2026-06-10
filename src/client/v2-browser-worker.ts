@@ -55,7 +55,7 @@ type V2WorkerCommand =
   | { kind: "connect"; token: string; node?: string; scope?: string; actor?: string; session?: string }
   | { kind: "disconnect" }
   | { kind: "send"; envelope: ShadowEnvelope }
-  | { kind: "call"; id: string; route: "direct" | "sequenced"; scope: string; target: string; verb: string; args?: unknown[]; body?: Record<string, WooValue>; persistence?: "durable" | "live"; read_only?: boolean }
+  | { kind: "call"; id: string; route: "direct" | "sequenced"; scope: string; target: string; verb: string; args?: unknown[]; body?: Record<string, WooValue>; persistence?: "durable" | "live"; read_only?: boolean; skip_local_execution?: boolean; server_authoritative?: boolean }
   | { kind: "get_projection"; scope?: string }
   | { kind: "cache_status" };
 
@@ -1012,7 +1012,8 @@ async function sendTurnIntent(command: Extract<V2WorkerCommand, { kind: "call" }
     // A read_only server intent needs only a usable socket, not the full
     // executable-seed/ad readiness that connect() awaits. Waiting on socket-open
     // alone cuts ~950ms off a cold-reload hydration. Non-read calls still await
-    // full readiness so their local planning has the executable seed.
+    // full readiness so local planning or delegated scope execution has the
+    // executable seed/ad needed by the durable intent path.
     if (command.read_only) await ensureSocketOpen();
     else await connect();
     postBrowserActivity({
@@ -1036,7 +1037,7 @@ async function sendTurnIntent(command: Extract<V2WorkerCommand, { kind: "call" }
     // `persistence` is "live" for these, so v2ServerAssistedIntentPolicy admits
     // the server intent without a scope ad. See
     // notes/2026-06-09-note-content-hydration.md.
-    if (!command.read_only && await sendLocalTurnExec(command)) {
+    if (!command.read_only && !command.skip_local_execution && !command.server_authoritative && await sendLocalTurnExec(command)) {
       plannedLocally = true;
       postStatus();
       return;
@@ -1053,10 +1054,12 @@ async function sendTurnIntent(command: Extract<V2WorkerCommand, { kind: "call" }
       persistence: command.persistence ?? (command.route === "direct" ? "live" : "durable")
     };
     const delegationStartedAt = metricNow();
-    const scopeDelegation = selectV2DelegatedScopeExecutor({
-      records: await allExecutionAds(),
-      scope: body.scope
-    });
+    const scopeDelegation = command.server_authoritative
+      ? { ok: false as const }
+      : selectV2DelegatedScopeExecutor({
+          records: await allExecutionAds(),
+          scope: body.scope
+        });
     postBrowserActivity({
       phase: "scope_delegation_select",
       path: command.verb,
@@ -1073,7 +1076,8 @@ async function sendTurnIntent(command: Extract<V2WorkerCommand, { kind: "call" }
     const fallbackPolicy = v2ServerAssistedIntentPolicy({
       route: command.route,
       persistence: body.persistence,
-      selectedScopeAd: scopeDelegation.ok ? scopeDelegation.ad.node : null
+      selectedScopeAd: scopeDelegation.ok ? scopeDelegation.ad.node : null,
+      serverAuthoritative: command.server_authoritative === true
     });
     if (!fallbackPolicy.ok) {
       postTurnUnavailable(command, fallbackPolicy.reason);
