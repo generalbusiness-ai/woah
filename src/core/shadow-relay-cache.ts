@@ -25,6 +25,7 @@ import type { AuthorityPageRef } from "./shadow-state-pages";
 import {
   applyAcceptedProjectionToCommitScopeCache,
   applyAcceptedShadowFrame,
+  applyAuthorityMergeToCommitScopeState,
   applyShadowTranscriptToCommitScopeCache,
   isShadowCommitScopeSerializedDirty,
   markShadowCommitScopeSerializedChanged,
@@ -213,6 +214,13 @@ function restoreRelayActorLiveCells(
 // uniformly), optionally preserving the session actors' live cells across the merge,
 // and bumps the relay-cache generation when the snapshot actually changed. Returns
 // whether the merge changed durable state.
+//
+// B-iii incremental merge: when the merge installs NOTHING (the common warm case),
+// the dirty-mark and index rebuild are skipped entirely. When the merge DOES change
+// rows, the indexed state (objectsById / sessionsById Maps) is updated in place for
+// only the changed rows instead of rebuilding the full O(n) index — unless the scope
+// is already dirty (a pending full rebuild), in which case we fall through to the
+// existing markShadowBrowserRelaySerializedChanged path to avoid double-work.
 export function mergeAuthorityIntoRelayCache(
   relay: ShadowRelayCache,
   authority: SerializedAuthoritySlice,
@@ -226,11 +234,63 @@ export function mergeAuthorityIntoRelayCache(
     ? preserveRelayActorLiveCells(serialized, authority.sessions)
     : null;
   const cellProvenance = (relay.commit_scope.cellProvenance ??= new Map());
-  let changed = mergeSerializedAuthoritySlice(serialized, authority, { clone: options.clone === true, cellProvenance });
+
+  // Snapshot the array references before the merge so we can detect reference
+  // replacements even when the JSON content is unchanged (the fingerprint-based
+  // no-op check can return false while mergeAuthorityCellPages already swapped
+  // serialized.objects for a new array with identical content). Any such ref
+  // change must update state.serializedRefs or the next serializedFor call will
+  // see a mismatch and trigger an unnecessary O(n) materialization.
+  const preObjects = serialized.objects;
+  const preSessions = serialized.sessions;
+
+  // Collect changed IDs for incremental state update (B-iii). The sets are
+  // only provided when the scope is NOT already dirty — if dirty, a full
+  // rebuild is already pending and incremental patching would be redundant.
+  const alreadyDirty = isShadowCommitScopeSerializedDirty(relay.commit_scope);
+  const changedObjectIds = alreadyDirty ? undefined : new Set<string>();
+  const changedSessionIds = alreadyDirty ? undefined : new Set<string>();
+
+  let changed = mergeSerializedAuthoritySlice(serialized, authority, {
+    clone: options.clone === true,
+    cellProvenance,
+    changedObjectIds,
+    changedSessionIds
+  });
   if (preserved) restoreRelayActorLiveCells(serialized, preserved);
   if (pruneRelayPresentationStubs(serialized, cellProvenance)) changed = true;
-  if (changed) markShadowBrowserRelaySerializedChanged(relay);
-  return changed;
+
+  // Even when changed===false (fingerprint-identical merge), mergeAuthorityCellPages
+  // or pruneRelayPresentationStubs may have replaced the array references with new
+  // arrays carrying the same content. If so, the commit-scope state's serializedRefs
+  // now point to the stale pre-merge arrays and must be refreshed, or the next
+  // serializedFor call will see a reference mismatch and trigger an unnecessary
+  // O(n) materialization.
+  const refsReplaced = !alreadyDirty && (serialized.objects !== preObjects || serialized.sessions !== preSessions);
+
+  if (!changed) {
+    if (refsReplaced) {
+      // Content-identical but array-reference-changed. Patch only the refs — no
+      // Map updates needed since no rows actually changed.
+      applyAuthorityMergeToCommitScopeState(relay.commit_scope, new Set(), new Set());
+    }
+    // No-op merge: nothing semantically changed. Skip dirty-marking and generation bump.
+    return false;
+  }
+
+  if (!alreadyDirty && changedObjectIds !== undefined && changedSessionIds !== undefined) {
+    // Incremental update: only patch the rows that actually changed in the
+    // indexed Maps, then refresh the serializedRefs. Avoids the O(n) full
+    // rebuild from createShadowCommitScopeState — the indexed Maps stay live.
+    applyAuthorityMergeToCommitScopeState(relay.commit_scope, changedObjectIds, changedSessionIds);
+    // Generation bump so planning-world and seed caches see the new content.
+    invalidateShadowBrowserRelaySerializedCaches(relay);
+  } else {
+    // The scope was already dirty (a pending full rebuild), or the scope state
+    // needs a full refresh for another reason. Fall through to the existing path.
+    markShadowBrowserRelaySerializedChanged(relay);
+  }
+  return true;
 }
 
 function pruneRelayPresentationStubs(

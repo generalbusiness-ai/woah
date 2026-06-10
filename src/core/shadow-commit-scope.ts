@@ -439,6 +439,82 @@ export function markShadowCommitScopeSerializedChanged(scope: ShadowCommitScope)
   scope.serializedDirty = false;
 }
 
+// B-iii incremental merge: apply the results of a mergeSerializedAuthoritySlice
+// call to the commit-scope's indexed state WITHOUT a full O(n) rebuild. The
+// caller must have already merged into scope.serialized (the merge mutates it
+// in place). This function patches only the changed rows in the Maps and updates
+// the serializedRefs so ensureShadowCommitScopeState does not fall back to a
+// full rebuild on next access.
+//
+// When to use vs markShadowCommitScopeSerializedChanged:
+//   - Use this when you know which rows changed (authority merge path).
+//   - Use markShadowCommitScopeSerializedChanged for in-place array edits that
+//     don't track the precise changed set (ensureSerializedSession, etc.).
+//
+// Safety invariant: every changed object/session ID in the sets must already
+// have its new value in scope.serialized.objects / scope.serialized.sessions
+// before this is called. The function reads the new values from scope.serialized
+// and writes them into the indexed Maps, so partial/stale content in those
+// arrays would corrupt the index. The caller (mergeAuthorityIntoRelayCache) owns
+// the sequencing and holds this invariant.
+export function applyAuthorityMergeToCommitScopeState(
+  scope: ShadowCommitScope,
+  changedObjectIds: ReadonlySet<ObjRef>,
+  changedSessionIds: ReadonlySet<string>
+): void {
+  const serialized = scope.serialized;
+  const state = scope.state;
+
+  // Update the counter fields in case mergeAuthorityMetadata bumped them.
+  // These are cheap scalar assignments — always safe to sync.
+  state.objectCounter = serialized.objectCounter;
+  state.parkedTaskCounter = serialized.parkedTaskCounter;
+  state.sessionCounter = serialized.sessionCounter;
+
+  // Patch the objectsById map: update/add changed objects, remove tombstoned ones.
+  if (changedObjectIds.size > 0) {
+    // Build a lookup from the NEW serialized.objects array for the changed IDs.
+    // The merge already populated the correct values there.
+    const newByKey = new Map<ObjRef, SerializedObject>();
+    for (const obj of serialized.objects) {
+      if (changedObjectIds.has(obj.id)) newByKey.set(obj.id, obj);
+    }
+    for (const id of changedObjectIds) {
+      const obj = newByKey.get(id);
+      if (obj) {
+        state.objectsById.set(id, obj);
+      } else {
+        // Object was removed from the serialized world by pruneSerializedSessionsWithoutActorRows
+        // or a similar cleanup. Remove it from the index.
+        state.objectsById.delete(id);
+      }
+    }
+  }
+
+  // Patch the sessionsById map: update/add changed sessions, remove deleted ones.
+  if (changedSessionIds.size > 0) {
+    const newSessionMap = new Map<string, SerializedWorld["sessions"][number]>();
+    for (const session of serialized.sessions) {
+      if (changedSessionIds.has(session.id)) newSessionMap.set(session.id, session);
+    }
+    for (const id of changedSessionIds) {
+      const session = newSessionMap.get(id);
+      if (session) {
+        state.sessionsById.set(id, session);
+      } else {
+        state.sessionsById.delete(id);
+      }
+    }
+  }
+
+  // Update the serializedRefs so stateMatchesSerializedRefs returns true for
+  // the new arrays. The objects/sessions arrays were replaced by the merge; all
+  // other arrays (logs, snapshots, parkedTasks, tombstones) are NOT mutated by
+  // an authority merge, so their refs remain valid.
+  state.serializedRefs = serializedRefs(serialized);
+  scope.serializedDirty = false;
+}
+
 export function isShadowCommitScopeSerializedDirty(scope: ShadowCommitScope): boolean {
   return scope.serializedDirty;
 }

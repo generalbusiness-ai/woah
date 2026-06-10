@@ -39,6 +39,12 @@ export type MergeSerializedAuthorityOptions = {
   // (an existing cell is protected from any non-authoritative page), so no
   // behavior changes for legacy/one-shot merges.
   cellProvenance?: Map<string, AuthorityPageProvenance>;
+  // B-iii incremental merge: when present, the merge populates these output sets
+  // with the exact IDs that actually changed, so callers can update only the
+  // changed rows in their indexed state instead of rebuilding the whole index.
+  // An absent set means the caller does not need the incremental detail.
+  changedObjectIds?: Set<ObjRef>;
+  changedSessionIds?: Set<string>;
 };
 
 // Precedence among authority page sources. Higher wins. `authoritative` is the
@@ -588,6 +594,22 @@ function mergeAuthoritySessions(
     ? structuredClone(sessions) as SerializedSession[]
     : sessions.map((session) => session as SerializedSession);
   if (stableShadowJson(next as unknown as WooValue) === stableShadowJson(serialized.sessions as unknown as WooValue)) return false;
+  // B-iii: record which session rows actually changed so callers can update
+  // only those entries in their indexed state.
+  if (options.changedSessionIds) {
+    const before = new Map(serialized.sessions.map((s) => [s.id, stableShadowJson(s as unknown as WooValue)]));
+    for (const session of next) {
+      const prev = before.get(session.id);
+      if (prev === undefined || prev !== stableShadowJson(session as unknown as WooValue)) {
+        options.changedSessionIds.add(session.id);
+      }
+    }
+    // Also record sessions removed from `next` (deleted sessions).
+    const nextIds = new Set(next.map((s) => s.id));
+    for (const prev of serialized.sessions) {
+      if (!nextIds.has(prev.id)) options.changedSessionIds.add(prev.id);
+    }
+  }
   serialized.sessions = next;
   return true;
 }
@@ -619,11 +641,15 @@ function mergeAuthorityObjectRows(
     if (index === undefined) {
       byId.set(next.id, serialized.objects.length);
       serialized.objects.push(next);
+      // B-iii: record the new object as changed.
+      options.changedObjectIds?.add(next.id);
       changed = true;
       continue;
     }
     if (stableShadowJson(serialized.objects[index] as unknown as WooValue) === stableShadowJson(next as unknown as WooValue)) continue;
     serialized.objects[index] = next;
+    // B-iii: record the updated object as changed.
+    options.changedObjectIds?.add(next.id);
     changed = true;
   }
   return changed;
@@ -741,6 +767,15 @@ function mergeAuthorityCellPages(
       const key = authorityPageKey(lineage);
       if (!cellProvenance.has(key)) cellProvenance.set(key, { source: "fallback" });
     }
+  }
+
+  // B-iii: the changed object IDs are exactly the set of objects in changedPages
+  // (including scaffolding lineage objects added above). Record them before the
+  // merge so the caller can do an incremental state update instead of a full O(n)
+  // rebuild. The set may include NEW objects (not yet in objectsById) that the
+  // merge introduces — those also need to be added to the indexed state.
+  if (options.changedObjectIds) {
+    for (const page of changedPages) options.changedObjectIds.add(page.object);
   }
 
   const base: SerializedWorld = {
