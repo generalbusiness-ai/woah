@@ -42,10 +42,10 @@ const C2_ENFORCED_WARM_SAME_SCOPE_ENVELOPE_BYTES = 64 * 1024; // 64 KB — autho
 // tracked item lands and the invariant holds, replace the TRACKED check with
 // an ENFORCED one and remove the tag.
 
-// Cross-scope envelope bytes should be < 256 KB once B-i (read-closure
-// envelopes for planned-transcript commits) ships. Today cross-scope moves
-// carry the full ~1.7 MB authority slice. TRACKED → B-i.
-const C2_TRACKED_CROSS_SCOPE_ENVELOPE_BYTES = 256 * 1024; // 256 KB — TRACKED → B-i
+// Cross-scope envelope bytes must be < 256 KB now that B-i (read-closure
+// envelopes for planned-transcript commits) is implemented and gated by
+// WOO_V2_READ_CLOSURE_ENVELOPE=1. ENFORCED (was TRACKED → B-i).
+const C2_TRACKED_CROSS_SCOPE_ENVELOPE_BYTES = 256 * 1024; // 256 KB — ENFORCED (B-i landed)
 
 // dangling_parent_ref must be 0 in movement-only turns (ENFORCED). Movement
 // turns (enter/leave/traverse) never involve $portable objects, so any dangling
@@ -404,9 +404,11 @@ describe("CF-local prod-shape structural probes", () => {
       // baseline. When a tracked gate starts passing, it should be promoted to
       // ENFORCED: remove its TRACKED tag and add a hard assertion.
 
-      // Cross-scope envelope bytes: planned-transcript commits (movement turns)
-      // still carry the full ~1.7 MB authority slice because slimMcpEnvelopeBody
-      // excludes planned-transcript commits. This will change when B-i lands.
+      // Cross-scope envelope bytes: B-i (read-closure envelopes) is now active
+      // (WOO_V2_READ_CLOSURE_ENVELOPE=1 in createStructuralHarness). Planned-transcript
+      // (movement) commits carry only the read closure: actor + session + transcript-
+      // touched cells + lineage ancestors (without verb_bytecode for lineage-only objects).
+      // This reduces the cross-scope authority from ~1.7 MB to < 256 KB.
       //
       // We use v2_envelope_bytes.authority_bytes (WOO_V2_ENVELOPE_BYTE_BREAKDOWN=1)
       // rather than v2_envelope.request_bytes, because request_bytes is derived from
@@ -417,16 +419,14 @@ describe("CF-local prod-shape structural probes", () => {
         .filter((m) => m.kind === "v2_envelope_bytes")
         .filter((m) => m.scope !== "the_chatroom");
       const maxCrossScopeBytes = Math.max(0, ...crossScopeEnvelopeBreakdowns.map((m) => Number(m.authority_bytes) || 0));
-      const crossScopeExceedsTarget = maxCrossScopeBytes > C2_TRACKED_CROSS_SCOPE_ENVELOPE_BYTES;
-      console.log(`c2.cross_scope_envelope_bytes max=${maxCrossScopeBytes} target=${C2_TRACKED_CROSS_SCOPE_ENVELOPE_BYTES} status=${crossScopeExceedsTarget ? "TRACKED" : "PROMOTE"} plan=B-i`);
-      if (!crossScopeExceedsTarget) {
-        // Tracked invariant now passes — fail loudly to force promotion to ENFORCED.
-        throw new Error(
-          `C2 TRACKED (→ B-i): cross-scope envelope authority_bytes max=${maxCrossScopeBytes} is now BELOW target=${C2_TRACKED_CROSS_SCOPE_ENVELOPE_BYTES}. ` +
-          `PROMOTE to ENFORCED: add a hard byte ceiling assertion and remove this TRACKED entry. ` +
-          `This gate is intentionally failing because a tracked expected-failure is now passing.`
-        );
-      }
+      console.log(`c2.cross_scope_envelope_bytes max=${maxCrossScopeBytes} target=${C2_TRACKED_CROSS_SCOPE_ENVELOPE_BYTES} status=ENFORCED plan=B-i`);
+      expect(
+        maxCrossScopeBytes,
+        `C2 ENFORCED (B-i): cross-scope (planned-transcript) envelope authority bytes must be < ${C2_TRACKED_CROSS_SCOPE_ENVELOPE_BYTES} (256 KB). ` +
+        `Got max=${maxCrossScopeBytes}. WOO_V2_READ_CLOSURE_ENVELOPE=1 is set in createStructuralHarness. ` +
+        `If this fails: the read-closure filter (filterAuthorityToReadClosure in authority-slice.ts) has regressed. ` +
+        `Ref PLAN: §C2 / §B-i.`
+      ).toBeLessThan(C2_TRACKED_CROSS_SCOPE_ENVELOPE_BYTES);
 
       // dangling_parent_ref count: ENFORCED to be 0 for movement-only turns.
       // Movement turns (enter/leave/southeast/west) do not involve $portable
@@ -567,6 +567,10 @@ function createStructuralHarness(): StructuralHarness {
     WOO_AUTO_INSTALL_CATALOGS: PROD_CATALOGS,
     WOO_MCP_GATEWAY_SHARDS: String(PROD_SHARDS),
     WOO_V2_SLIM_WARM_ENVELOPE: "1",
+    // B-i: enable read-closure envelopes for planned-transcript (cross-scope)
+    // commits. This flag changes the C2 cross-scope envelope bytes gate from
+    // TRACKED to ENFORCED (< 256 KB ceiling now holds).
+    WOO_V2_READ_CLOSURE_ENVELOPE: "1",
     // Enable per-envelope byte breakdown in the gateway env as well.  The flag
     // is read by CommitScopeDO (whose env is set separately above), but we also
     // set it here for consistency and to allow gateway-side code to key on it.

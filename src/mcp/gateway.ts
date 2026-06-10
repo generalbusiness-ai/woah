@@ -13,7 +13,7 @@
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import type { EffectTranscript } from "../core/effect-transcript";
-import { buildSerializedAuthorityCellSlice, cellProvenanceFromAuthoritySlice, combineSerializedAuthoritySlices, serializedWorldFromAuthoritySlice } from "../core/authority-slice";
+import { buildSerializedAuthorityCellSlice, cellProvenanceFromAuthoritySlice, combineSerializedAuthoritySlices, filterAuthorityToReadClosure, serializedWorldFromAuthoritySlice } from "../core/authority-slice";
 import { wooError, type AppliedFrame, type AuthorityReconstructionTrigger, type DirectResultFrame, type ErrorFrame, type ErrorValue, type Message, type MetricEvent, type ObjRef, type Session, type WooValue } from "../core/types";
 import { normalizeError, type WooWorld } from "../core/world";
 import type { SerializedAuthoritySlice, SerializedSession } from "../core/repository";
@@ -129,6 +129,12 @@ export type McpV2ClientHooks = {
   // from an authoritative in-process world whose cells do not carry owner
   // source_host stamps, so the resolution-owner guard stays off by default.
   enforceResolutionOwnerRepair?: boolean;
+  // B-i: when set, planned-transcript (cross-scope) envelopes carry only the
+  // turn's read closure (actor + session + transcript-touched cells + lineage)
+  // instead of the full scope-wide authority slice. The validation contract and
+  // E_SNAPSHOT_REQUIRED cold-scope escape are unchanged; only the unread bulk
+  // of the slice is withheld. Flag: WOO_V2_READ_CLOSURE_ENVELOPE.
+  readClosureEnvelope?: boolean;
 };
 
 // Strip the ~3MB authority slice (and legacy session_objects) from ordinary
@@ -147,6 +153,37 @@ export function slimMcpEnvelopeBody(body: McpV2EnvelopeBody): McpV2EnvelopeBody 
   // top-level fallback the CommitScopeDO turn path reads once `authority` is
   // gone. Without this the slimmed body would arrive with neither copy.
   return { ...rest, sessions: authority?.sessions ?? rest.sessions ?? [], session_objects: [] };
+}
+
+// B-i: filter a planned-transcript envelope body's authority to the turn's
+// read closure (VTN8.3). The closure = pages for (actor ∪ session ∪
+// transcript-touched cells ∪ their write pre-images) ∪ lineage_closure of
+// those objects. `closureObjectIds` is the set computed by the executor
+// (executorAuthorityObjectIds + transcript ids + repairObjectIds); the session
+// filter covers only the submitting session and session actors in the closure.
+//
+// The `planned_transcript_commit: true` flag is preserved so the CommitScopeDO
+// still processes this as a planned-transcript commit. The E_SNAPSHOT_REQUIRED
+// cold-scope escape in submitEnvelope retries with the FULL body and is
+// unchanged (the `envelopeBody` variable retains the unfiltered authority for
+// that path).
+//
+// Only applies to cell-slice authority (the deployed format). Legacy
+// object-slice authority falls through unchanged so the function is safe to
+// call unconditionally.
+export function closureMcpEnvelopeBody(
+  body: McpV2EnvelopeBody,
+  closureObjectIds: ReadonlySet<ObjRef>,
+  sessionIds: readonly string[]
+): McpV2EnvelopeBody {
+  if (!body.authority || body.planned_transcript_commit !== true) return body;
+  const closureAuthority = filterAuthorityToReadClosure(body.authority, closureObjectIds, sessionIds);
+  return {
+    ...body,
+    authority: closureAuthority,
+    // session_objects is legacy-empty on authority-bearing bodies (see executorEnvelopeBody).
+    session_objects: []
+  };
 }
 
 export type McpV2OpenBody = {
@@ -953,11 +990,39 @@ export class McpGateway {
         // E_SNAPSHOT_REQUIRED and is resolved by the reseed + full-body retry
         // below. The full body (envelopeBody) is retained for that retry.
         const slim = hooks.slimWarmEnvelope === true;
-        const firstBody = slim ? slimMcpEnvelopeBody(envelopeBody) : envelopeBody;
+        // B-i: when readClosureEnvelope is on, filter a planned-transcript
+        // commit's authority to the turn's read closure (VTN8.3). This replaces
+        // the full scope-wide slice (~1.7 MB) with only the cells the validator
+        // actually reads (actor, session, transcript-touched + lineage). The
+        // full body (envelopeBody) is retained for the E_SNAPSHOT_REQUIRED
+        // cold-scope retry — see the catch block below.
+        const closureEnabled = hooks.readClosureEnvelope === true;
+        let firstBody: McpV2EnvelopeBody;
+        if (slim) {
+          firstBody = slimMcpEnvelopeBody(envelopeBody);
+          // slimMcpEnvelopeBody returns the planned-transcript body unchanged;
+          // if closure is also enabled, apply the closure filter on top.
+          if (closureEnabled && firstBody.planned_transcript_commit === true && context.closureObjectIds) {
+            firstBody = closureMcpEnvelopeBody(
+              firstBody,
+              new Set(context.closureObjectIds),
+              context.closureSessionIds ?? []
+            );
+          }
+        } else if (closureEnabled && envelopeBody.planned_transcript_commit === true && context.closureObjectIds) {
+          // slim is off but closure is on: filter the planned-transcript body.
+          firstBody = closureMcpEnvelopeBody(
+            envelopeBody,
+            new Set(context.closureObjectIds),
+            context.closureSessionIds ?? []
+          );
+        } else {
+          firstBody = envelopeBody;
+        }
         // A cold scope cannot seed from a slimmed body (no authority) nor from a
         // capsule body (capsule carries no slice), so both modes must be able to
         // re-seed and retry with the full body on E_SNAPSHOT_REQUIRED.
-        const reseedEligible = slim || hooks.executionCapsuleOpen === true;
+        const reseedEligible = slim || closureEnabled || hooks.executionCapsuleOpen === true;
         try {
           return await hooks.envelope(submitScope, firstBody, { timing: context.timing });
         } catch (err) {
@@ -979,7 +1044,7 @@ export class McpGateway {
           this.world.recordMetric({
             kind: "mcp_envelope_slim_reseed",
             scope: submitScope,
-            mode: slim ? "slim" : "capsule"
+            mode: slim ? "slim" : (closureEnabled ? "closure" : "capsule")
           });
           return await context.timing.time("submit", "mcp.snapshot_retry_envelope_rpc", () => hooks.envelope(submitScope, legacyBody, { timing: context.timing }));
         }

@@ -208,7 +208,13 @@ export type SubmitTurnIntentOptions<Client, Result extends ExecutorEnvelopeResul
   // or sparse class/verb lineage (`E_VERBNF`).
   // This keeps warm turns local while preserving bounded cold-miss repair.
   repairPlanningAuthority?: boolean;
-  submitEnvelope(scope: ObjRef, body: ExecutorEnvelopeBody, context: { timing: SubmitTurnPhaseTimer }): Promise<Result>;
+  // B-i: when the caller implements read-closure envelopes (VTN8.3), the
+  // executor passes the transcript's closure object IDs in context so the
+  // submitEnvelope implementation can filter the authority payload to only
+  // those objects before sending to the CommitScopeDO. The IDs include
+  // actor + scope + transcript-touched objects + any repair object IDs.
+  // Same-scope (non-planned-transcript) commits do not set this field.
+  submitEnvelope(scope: ObjRef, body: ExecutorEnvelopeBody, context: { timing: SubmitTurnPhaseTimer; closureObjectIds?: readonly ObjRef[]; closureSessionIds?: readonly string[] }): Promise<Result>;
   applyAuthority?(client: Client, authority: SerializedAuthoritySlice): void;
   // Adopt the authority's reported current head after a stale-head/version
   // conflict, so the next attempt plans + submits against the right head instead
@@ -320,6 +326,49 @@ export function executorAuthorityObjectIds(
 
 function executorTranscriptObjectIds(transcript: ShadowTurnCallTranscriptRun["transcript"]): ObjRef[] {
   return Array.from(transcriptTouchedObjectIds(transcript)).sort();
+}
+
+// B-i read-closure: the full object set the validator reads = write-touched
+// objects (from transcriptTouchedObjectIds) PLUS:
+//   - read-touched objects (transcript.reads[*].cell.object) — compared by
+//     validateTranscriptWithCellReader for version consistency;
+//   - writer.progr objects for writes/creates/moves — checked by
+//     validateShadowWriteAuthorityIndex (serializedObject(index, writer.progr));
+//   - writer.definer objects — checked by recordedWriterIsValid;
+//   - state probes — materialization dependencies (negative-lookup edges).
+// Called exclusively for closure authority building; does not expand the full
+// authority payload for non-closure paths.
+export function executorTranscriptReadClosureObjectIds(transcript: ShadowTurnCallTranscriptRun["transcript"]): ObjRef[] {
+  const ids = transcriptTouchedObjectIds(transcript);
+  // All read cells — RecordedCell always has an `object` field.
+  for (const read of transcript.reads) {
+    ids.add(read.cell.object);
+  }
+  // State probes — RecordedCell always has `object`.
+  for (const probe of transcript.stateProbes ?? []) {
+    ids.add(probe.object);
+  }
+  // Writer progr + definer objects for permission validation.
+  // validateShadowWriteAuthorityIndex checks serializedObject(index, write.writer.progr)
+  // and recordedWriterIsValid checks read.cell.object === writer.definer — both
+  // must be present in the closure authority.
+  for (const write of transcript.writes) {
+    if (write.writer) {
+      ids.add(write.writer.progr);
+      ids.add(write.writer.definer);
+      ids.add(write.writer.thisObj);
+      ids.add(write.writer.caller);
+    }
+  }
+  for (const create of transcript.creates) {
+    if (create.writer) {
+      ids.add(create.writer.progr);
+      ids.add(create.writer.definer);
+      ids.add(create.writer.thisObj);
+      ids.add(create.writer.caller);
+    }
+  }
+  return Array.from(ids).sort();
 }
 
 export function executorReplyNeedsRepair(reply: ShadowTurnExecReply): boolean {
@@ -887,6 +936,17 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       envelopeId: options.envelopeId?.(turnId, attempt),
       request
     });
+    // B-i: for planned-transcript commits, pass the closure object IDs and
+    // session IDs in the submitEnvelope context so the caller (MCP gateway)
+    // can filter the authority to the read closure (VTN8.3). Same-scope
+    // commits do not set these fields. The closure IDs include BOTH write-touched
+    // objects (from authorityObjectIds) AND read-touched objects from the
+    // transcript (transcript.reads[*].cell.object), because validateTranscriptWithCellReader
+    // checks version consistency for all reads — those objects must be present in the
+    // authority even if they were only READ (not written) by the turn.
+    const closureContext: { timing: SubmitTurnPhaseTimer; closureObjectIds?: readonly ObjRef[]; closureSessionIds?: readonly string[] } = plannedTranscriptCommit
+      ? { timing, closureObjectIds: executorTranscriptReadClosureObjectIds(planned.transcript), closureSessionIds: [options.input.session] }
+      : { timing };
     const result = await timePhase((ms) => { submitMs += ms; }, () => options.submitEnvelope(commitScope, executorEnvelopeBody({
       scope: commitScope,
       node: options.clientNode(commitClient),
@@ -894,7 +954,7 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       authority,
       envelope,
       plannedTranscriptCommit
-    }), { timing }));
+    }), closureContext));
     const replyEnvelope = decodeExecutorReply(result.reply);
     if (replyEnvelope?.body && attempt + 1 < maxAttempts && shouldRetry(replyEnvelope.body)) {
       const body = replyEnvelope.body;
