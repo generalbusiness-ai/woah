@@ -159,6 +159,25 @@ async function continueAsGuestIfPrompted(page: { getByRole: (role: "button", opt
   await page.getByRole("button", { name: "Continue as guest" }).click({ timeout: 1_000 }).catch(() => undefined);
 }
 
+async function waitForOutlinerWritable(tree: Locator): Promise<void> {
+  await expect(tree.locator("[data-outliner-add] input[name=text]")).toBeVisible({ timeout: 15_000 });
+}
+
+async function waitForPinboardWritable(page: Page): Promise<void> {
+  await expect(page.locator("[data-pinboard-new-text]")).toBeVisible({ timeout: 15_000 });
+  await expect(page.locator("woo-space-chat-panel[data-space-chat-panel]")).toBeVisible({ timeout: 15_000 });
+  await expect(page.locator("woo-space-chat-panel .space-chat-head span")).toHaveText("Pinboard", { timeout: 15_000 });
+}
+
+async function settlePinboardPresence(page: Page): Promise<void> {
+  await waitForPinboardWritable(page);
+  const miniChatInput = page.locator("[data-space-chat-input]");
+  await expect(miniChatInput).toBeVisible({ timeout: 15_000 });
+  await miniChatInput.fill("look");
+  await miniChatInput.press("Enter");
+  await expect(page.locator("woo-space-chat-panel")).toContainText(/Pinboard has \d+ notes? on it\./, { timeout: 15_000 });
+}
+
 async function authenticateFreshGuest(request: APIRequestContext, token: string): Promise<string> {
   const auth = await request.post("/api/auth", { data: { token } });
   return String((await auth.json())?.session ?? "");
@@ -578,12 +597,7 @@ test("page header h1 aligns across tools", async ({ page, request }) => {
   expect(sizes.size, `h1 font-size mismatch: ${JSON.stringify(headers)}`).toBe(1);
 });
 
-// Known-red on main under the hermetic e2e config (fails identically against
-// a fresh dev server + fresh database, so it is a real product bug, not test
-// drift or stale-server residue). Quarantined so a NEW failure in this suite
-// is distinguishable from this old one; un-fixme when the generic tool-view
-// mount is fixed.
-test.fixme("generic tool view mounts a catalog space-workspace frame", async ({ page }) => {
+test("generic tool view mounts a catalog space-workspace frame", async ({ page }) => {
   await page.goto("/objects/the_outline?view=tool");
   await continueAsGuestIfPrompted(page);
   await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
@@ -594,11 +608,10 @@ test.fixme("generic tool view mounts a catalog space-workspace frame", async ({ 
   // The tool title lives in the shared `.toolbar` h1 (unified in 98dda36);
   // the only h2 inside the tree is the Presence aside.
   await expect(tree.locator(".toolbar h1")).toHaveText("Outline");
-  await tree.getByRole("button", { name: "Enter" }).click();
-  await expect(tree.getByRole("button", { name: "Leave" })).toBeVisible({ timeout: 5_000 });
+  await waitForOutlinerWritable(tree);
   await expect(tree.locator("woo-space-chat-panel[data-space-chat-panel]")).toBeVisible();
-  await tree.getByRole("button", { name: "Leave" }).click();
-  await expect(tree.getByRole("button", { name: "Enter" })).toBeVisible({ timeout: 5_000 });
+  await expect(tree.getByRole("button", { name: "Enter" })).toHaveCount(0);
+  await expect(tree.getByRole("button", { name: "Leave" })).toHaveCount(0);
 });
 
 test("outliner displays items added via the UI", async ({ page }) => {
@@ -618,9 +631,9 @@ test("outliner displays items added via the UI", async ({ page }) => {
   const tree = page.locator("woo-outliner-tree[data-outliner-tree]");
   await expect(tree).toBeVisible();
   // The named Outliner tab auto-enters through the shared tool lifecycle when
-  // selected. Wait for that same path rather than racing it with a second
-  // manual Enter click.
-  await expect(tree.getByRole("button", { name: "Leave" })).toBeVisible({ timeout: 5_000 });
+  // selected. Wait for the writable root form rather than racing it with a
+  // manual lifecycle control.
+  await waitForOutlinerWritable(tree);
 
   // Add a root-level item via the form. Use keyboard Enter — Playwright
   // "fill" then click on the submit button has occasional races where the
@@ -668,9 +681,11 @@ test("outliner displays items added via the UI", async ({ page }) => {
 
   await page.reload();
   await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
+  await page.getByRole("button", { name: "Outliner" }).click();
   await expect(page.getByRole("button", { name: "Outliner" })).toHaveClass(/active/);
   const reloadedTree = page.locator("woo-outliner-tree[data-outliner-tree]");
   await expect(reloadedTree).toBeVisible({ timeout: 5_000 });
+  await waitForOutlinerWritable(reloadedTree);
   for (const [id, text] of [[parentId, parentText], [childId, childText], [secondId, `${parentText}-b`]] as const) {
     await expect.poll(async () => {
       const row = reloadedTree.locator(`[data-outliner-row][data-id="${cssAttrValue(String(id))}"] .outliner-text`);
@@ -904,12 +919,9 @@ test("pinboard supports shared text notes", async ({ page }) => {
   await expect(page.getByRole("button", { name: "Pinboard" })).toHaveClass(/active/);
   await expect(page.locator(".pinboard-stage")).toBeVisible();
   await expect(page.locator("[data-pinboard-map]")).toBeVisible();
-  await expect.poll(async () => {
-    if (invalidations.length > 0) return invalidations.join("\n");
-    return await page.getByRole("button", { name: "Leave" }).count() > 0 ? "ready" : "pending";
-  }, { timeout: 5_000 }).toBe("ready");
+  await waitForPinboardWritable(page);
+  expect(invalidations).toEqual([]);
   expectNoV2Invalidations();
-  await expect(page.getByRole("button", { name: "Leave" })).toBeVisible();
   expectNoV2TransportErrors();
   const stagePanel = page.locator(".pinboard-stage-panel");
   await expect.poll(async () => stagePanel.evaluate((panel) => panel.getBoundingClientRect().height)).toBeGreaterThan(300);
@@ -973,8 +985,7 @@ test("pinboard supports shared text notes", async ({ page }) => {
   expectNoV2TransportErrors();
   await expect(page.locator(".pinboard-stage")).toContainText("Towel is ready");
   await expect(page.locator(".pinboard-stage")).toContainText(mugText);
-  await page.getByRole("button", { name: "Leave" }).click();
-  await expect(page.getByRole("button", { name: "Enter" })).toBeVisible();
+  await expect(page.locator("woo-space-chat-panel[data-space-chat-panel]")).toBeVisible();
   expectNoV2TransportErrors();
 });
 
@@ -988,7 +999,7 @@ test("pinboard supports local zoom and pan without resetting on updates", async 
 
   await page.getByRole("button", { name: "Pinboard" }).click();
   await expect(page.getByRole("button", { name: "Pinboard" })).toHaveClass(/active/);
-  await expect(page.getByRole("button", { name: "Leave" })).toBeVisible();
+  await settlePinboardPresence(page);
   await expect(page.locator("[data-pinboard-zoom-label]")).toHaveText("100%");
   const stagePanelGap = await page.locator(".pinboard-stage-panel").evaluate((panel) => {
     const stage = panel.querySelector(".pinboard-stage");
@@ -1035,7 +1046,7 @@ test("pinboard supports local zoom and pan without resetting on updates", async 
   await expect(page.locator("[data-pinboard-zoom-label]")).toHaveText("120%");
   await expect.poll(async () => page.locator("[data-pinboard-canvas]").evaluate((element) => getComputedStyle(element).transform)).toBe(mapCenteredTransform);
   const centeredNote = page.locator(".pin-note").filter({ hasText: centeredText }).first();
-  await expect(centeredNote).toBeVisible();
+  await expect(centeredNote).toBeVisible({ timeout: 10_000 });
   const centeredDelta = await centeredNote.evaluate((note) => {
     const stage = note.closest(".pinboard-stage");
     if (!stage) return Number.POSITIVE_INFINITY;
@@ -1079,17 +1090,12 @@ async function openSharedPinboardNote(browser: Browser): Promise<SharedPinboardS
 
     await first.getByRole("button", { name: "Pinboard" }).click();
     await second.getByRole("button", { name: "Pinboard" }).click();
-    await first.getByRole("button", { name: "Enter" }).click();
-    await second.getByRole("button", { name: "Enter" }).click();
-    await expect(first.getByRole("button", { name: "Leave" })).toBeVisible();
-    await expect(second.getByRole("button", { name: "Leave" })).toBeVisible();
-    await expect.poll(() => firstV2.appliedVerbs, { timeout: 5_000 }).toContain("enter");
-    await expect.poll(() => secondV2.appliedVerbs, { timeout: 5_000 }).toContain("enter");
+    await Promise.all([settlePinboardPresence(first), settlePinboardPresence(second)]);
 
     const text = `Slide this note ${Date.now()}`;
     await first.locator("[data-pinboard-new-text]").fill(text);
     await first.locator("[data-pinboard-create]").getByRole("button", { name: "Add Note" }).click();
-    await expect.poll(() => firstV2.appliedVerbs, { timeout: 5_000 }).toContain("add_note");
+    await expect.poll(() => firstV2.appliedVerbs, { timeout: 10_000 }).toContain("add_note");
     const firstNote = first.locator(".pin-note").filter({ hasText: text }).first();
     const secondNote = second.locator(".pin-note").filter({ hasText: text }).first();
     await expect(firstNote).toBeVisible();
@@ -1122,7 +1128,8 @@ test("pinboard shared notes survive a peer reload", async ({ browser }) => {
     const { second, secondV2, text } = scenario;
     await second.reload();
     await expect(second.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
-    await expect(second.getByRole("button", { name: "Pinboard" })).toHaveClass(/active/);
+    await second.getByRole("button", { name: "Pinboard" }).click();
+    await waitForPinboardWritable(second);
     await expect(second.locator(".pin-note").filter({ hasText: text })).toBeVisible({ timeout: 10_000 });
     expectNoV2Failures(secondV2);
   } finally {
@@ -1151,12 +1158,10 @@ test("outliner shares committed items with another user and survives reload", as
     await expect(firstTree).toBeVisible({ timeout: 5_000 });
     await expect(secondTree).toBeVisible({ timeout: 5_000 });
 
-    await firstTree.getByRole("button", { name: "Enter" }).click();
-    await secondTree.getByRole("button", { name: "Enter" }).click();
-    await expect(firstTree.getByRole("button", { name: "Leave" })).toBeVisible({ timeout: 5_000 });
-    await expect(secondTree.getByRole("button", { name: "Leave" })).toBeVisible({ timeout: 5_000 });
-    await expect.poll(() => firstV2.appliedVerbs, { timeout: 5_000 }).toContain("enter");
-    await expect.poll(() => secondV2.appliedVerbs, { timeout: 5_000 }).toContain("enter");
+    await waitForOutlinerWritable(firstTree);
+    await waitForOutlinerWritable(secondTree);
+    await expect.poll(() => firstV2.appliedVerbs, { timeout: 5_000 }).toContain("moveto");
+    await expect.poll(() => secondV2.appliedVerbs, { timeout: 5_000 }).toContain("moveto");
 
     const text = `shared-outline-${Date.now()}`;
     await first.waitForTimeout(250);
@@ -1170,8 +1175,10 @@ test("outliner shares committed items with another user and survives reload", as
 
     await second.reload();
     await expect(second.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
+    await second.getByRole("button", { name: "Outliner" }).click();
     const reloadedSecondTree = second.locator("woo-outliner-tree");
     await expect(reloadedSecondTree).toBeVisible({ timeout: 5_000 });
+    await waitForOutlinerWritable(reloadedSecondTree);
     await expect(reloadedSecondTree.locator(".outliner-row").filter({ hasText: text })).toHaveCount(1, { timeout: 10_000 });
     expectNoV2Failures(secondV2);
   } finally {
@@ -1194,8 +1201,7 @@ test("pinboard shares viewport presence overlays", async ({ browser }) => {
 
     await first.getByRole("button", { name: "Pinboard" }).click();
     await second.getByRole("button", { name: "Pinboard" }).click();
-    await expect(first.getByRole("button", { name: "Leave" })).toBeVisible();
-    await expect(second.getByRole("button", { name: "Leave" })).toBeVisible();
+    await Promise.all([settlePinboardPresence(first), settlePinboardPresence(second)]);
 
     await first.getByRole("button", { name: "Zoom in" }).click();
     const overlay = second.locator(`[data-pinboard-viewport="${firstActor}"]`);
@@ -1209,7 +1215,7 @@ test("pinboard shares viewport presence overlays", async ({ browser }) => {
     await expect.poll(async () => boxKey(overlay)).not.toBe(before);
     await expect.poll(async () => overlay.evaluate((element) => (element as HTMLElement).dataset.stableMarker ?? "")).toBe("kept");
 
-    await first.getByRole("button", { name: "Leave" }).click();
+    await first.getByRole("button", { name: "Chat", exact: true }).click();
     await expect(overlay).toHaveCount(0);
   } finally {
     await firstContext.close();

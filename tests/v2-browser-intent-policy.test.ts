@@ -22,6 +22,17 @@ describe("v2 browser intent fallback policy", () => {
     });
   });
 
+  it("allows explicitly server-authoritative durable lifecycle turns", () => {
+    expect(v2ServerAssistedIntentPolicy({
+      route: "direct",
+      persistence: "durable",
+      serverAuthoritative: true
+    })).toEqual({
+      ok: true,
+      reason: "server_authoritative"
+    });
+  });
+
   it("blocks bare durable server-assisted planning", () => {
     expect(v2ServerAssistedIntentPolicy({ route: "sequenced", persistence: "durable" })).toEqual({
       ok: false,

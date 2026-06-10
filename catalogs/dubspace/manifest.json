@@ -341,7 +341,7 @@
               "object"
             ]
           },
-          "source": "verb :enterfunc(object) rx { if (!isa(object, $actor)) { return true; } let text = object.name + \" steps up to \" + this.name + \".\"; observe({ type: \"dubspace_entered\", actor: object, space: this, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"dubspace_activity\", source: this.mount_room, actor: object, space: this, text: text, ts: now() }); } return true; }"
+          "source": "verb :enterfunc(object) rx { if (!isa(object, $actor)) { return true; } let text = object.name + \" steps up to \" + this.name + \".\"; observe({ type: \"dubspace_entered\", source: this, actor: object, space: this, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"dubspace_activity\", source: this.mount_room, actor: object, space: this, text: text, ts: now() }); } return true; }"
         },
         {
           "name": "exitfunc",
@@ -351,7 +351,7 @@
               "object"
             ]
           },
-          "source": "verb :exitfunc(object) rx { if (!isa(object, $actor)) { return true; } let text = object.name + \" steps away from \" + this.name + \".\"; observe({ type: \"dubspace_left\", actor: object, space: this, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"dubspace_activity\", source: this.mount_room, actor: object, space: this, text: text, ts: now() }); } return true; }"
+          "source": "verb :exitfunc(object) rx { if (!isa(object, $actor)) { return true; } let text = object.name + \" steps away from \" + this.name + \".\"; observe({ type: \"dubspace_left\", source: this, actor: object, space: this, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"dubspace_activity\", source: this.mount_room, actor: object, space: this, text: text, ts: now() }); } return true; }"
         },
         {
           "name": "_require_present",

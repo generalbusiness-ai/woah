@@ -1,6 +1,8 @@
 // Tool workspace UI guard: keep first-party `$space` tools on the shared
 // workspace/minichat path. A `space-workspace` frame whose subject is not the
 // chatroom itself must declare a main region and the shared mini-chat region.
+// Tool tabs are destination moves; non-chat catalog components must not
+// reintroduce explicit Enter/Leave controls or lifecycle custom events.
 //
 // Run via `npm run guard:tool-workspace-ui` or as part of `npm test`.
 
@@ -12,8 +14,13 @@ const catalogsRoot = join(root, "catalogs");
 const mainTsPath = join(root, "src/client/main.ts");
 const errors = [];
 let auditedFrames = 0;
+let auditedUiFiles = 0;
 const movementForbiddenVerbs = new Set(["enter", "leave", "out"]);
 const suppressedInheritedLifecycleTools = ["enter", "leave"];
+const forbiddenUiLifecyclePatterns = [
+  { label: "manual Enter/Leave data attribute", pattern: /data-[a-z0-9-]+-(?:enter|leave)\b/g },
+  { label: "manual Enter/Leave custom event", pattern: /woo-[a-z0-9-]+-(?:enter|leave)\b/g }
+];
 
 const dirs = readdirSync(catalogsRoot)
   .map((name) => join(catalogsRoot, name))
@@ -49,6 +56,24 @@ function hasMainRegion(frame) {
 
 function classHasMountRoom(cls) {
   return (cls.properties ?? []).some((prop) => prop?.name === "mount_room");
+}
+
+function walkFiles(dir, out = []) {
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const entry of entries) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      walkFiles(path, out);
+    } else if (entry.isFile() && /\.(?:mjs|js|ts|tsx)$/.test(entry.name)) {
+      out.push(path);
+    }
+  }
+  return out;
 }
 
 for (const dir of dirs) {
@@ -99,6 +124,20 @@ for (const dir of dirs) {
     for (const verb of suppressedInheritedLifecycleTools) {
       if (!suppressedDefaults.includes(verb)) {
         errors.push(`${where}: must suppress inherited ${JSON.stringify(verb)} from the MCP tool surface`);
+      }
+    }
+  }
+
+  const catalogName = typeof manifest.name === "string" ? manifest.name : rel(dir).split("/").pop();
+  if (catalogName !== "chat") {
+    for (const uiPath of walkFiles(join(dir, "ui"))) {
+      auditedUiFiles += 1;
+      const source = readFileSync(uiPath, "utf8");
+      for (const { label, pattern } of forbiddenUiLifecyclePatterns) {
+        pattern.lastIndex = 0;
+        for (const match of source.matchAll(pattern)) {
+          errors.push(`${rel(uiPath)}: ${label} ${JSON.stringify(match[0])} bypasses tab-driven movement`);
+        }
       }
     }
   }
@@ -153,4 +192,4 @@ if (errors.length > 0) {
   process.exit(1);
 }
 
-console.log(`tool workspace UI: ok (${auditedFrames} space-workspace tool frames audited)`);
+console.log(`tool workspace UI: ok (${auditedFrames} space-workspace tool frames, ${auditedUiFiles} non-chat UI files audited)`);

@@ -36,7 +36,7 @@ test("MEASURE: outliner reload structure-to-text delay", async ({ page }) => {
   await expect(page.getByRole("button", { name: "Outliner" })).toHaveClass(/active/);
   const tree = page.locator("woo-outliner-tree[data-outliner-tree]");
   await expect(tree).toBeVisible();
-  await expect(tree.getByRole("button", { name: "Leave" })).toBeVisible({ timeout: 10_000 });
+  await expect(tree.locator("[data-outliner-add] input[name=text]")).toBeVisible({ timeout: 10_000 });
 
   const addInput = tree.locator("[data-outliner-add] input[name=text]");
   // Track only the rows THIS run creates (by data-id) so the measurement is
@@ -159,7 +159,7 @@ test("MEASURE: outliner cold load with EMPTY cache (true first visit)", async ({
   await expect(page.getByRole("button", { name: "Outliner" })).toHaveClass(/active/);
   const tree = page.locator("woo-outliner-tree[data-outliner-tree]");
   await expect(tree).toBeVisible();
-  await expect(tree.getByRole("button", { name: "Leave" })).toBeVisible({ timeout: 10_000 });
+  await expect(tree.locator("[data-outliner-add] input[name=text]")).toBeVisible({ timeout: 10_000 });
 
   const addInput = tree.locator("[data-outliner-add] input[name=text]");
   const texts: string[] = [];

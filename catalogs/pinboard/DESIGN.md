@@ -475,6 +475,10 @@ client projection rather than through a full-world snapshot model.
   `pin_resized`, and `note_added`. The umbrella `pinboard_activity` is still
   emitted for room-level summaries. Pin color/text changes arrive through
   `pin_recolored` and the note catalog's `note_edited`.
+- Movement-hook board observations (`pinboard_entered`, `pinboard_left`,
+  `pin_added`, `pin_removed`) carry `source: board` so clients subscribed to the
+  board receive entry, exit, pin-add, and pin-removal events even when the actor
+  or note is moving to a different destination room.
 - Kanban frontend should not consume `layout`. It consumes `list_columns`
   and renders columns in array order and cards in `cards` order.
 - Kanban observations: `kanban_column_added`, `kanban_column_renamed`,

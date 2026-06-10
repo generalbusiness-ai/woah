@@ -597,11 +597,33 @@ describe("outliner-tree presence aside", () => {
 
     element.entering = true;
     expect(element.querySelector("[data-outliner-add]"), "not present while enter is pending").toBeNull();
-    expect(element.querySelector("[data-outliner-presence='pending']")).not.toBeNull();
+    expect(element.querySelector("[data-outliner-presence]"), "no manual presence control").toBeNull();
 
     element.entering = false;
     element.showCompanion = true;
     expect(element.querySelector("[data-outliner-add]"), "present after enter completes").not.toBeNull();
+  });
+
+  it("ignores unrelated host data assignments without replacing the outliner model", () => {
+    const element = document.createElement("woo-outliner-tree") as WooOutlinerTreeElement & { data: OutlinerData };
+    element.woo = ctx();
+    document.body.append(element);
+    element.data = {
+      outlinerId: "the_outline",
+      outlinerName: "Outline",
+      items: [
+        { id: "item_1", name: "item_1", text: "kept row", parent_id: null, index: 0, hidden: false, owner: "guest_1", writers: [], has_children: false }
+      ],
+      focus: null,
+      actor: "guest_1",
+      roster: []
+    };
+
+    expect(() => {
+      (element as unknown as { data: unknown }).data = { space: "the_chatroom", lines: [], present: [] };
+    }).not.toThrow();
+
+    expect(element.querySelector(".outliner-text")?.textContent).toBe("kept row");
   });
 
   it("keeps an applied row visible when the next projection snapshot is stale", () => {

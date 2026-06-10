@@ -16,7 +16,7 @@ async function guest(page: Page): Promise<void> {
 async function seedBothTools(page: Page, outText: string, pinText: string): Promise<void> {
   await page.getByRole("button", { name: "Outliner" }).click();
   const tree = page.locator("woo-outliner-tree[data-outliner-tree]");
-  await tree.getByRole("button", { name: "Leave" }).waitFor({ timeout: 10_000 });
+  await expect(tree.locator("[data-outliner-add] input[name=text]")).toBeVisible({ timeout: 10_000 });
   await tree.locator("[data-outliner-add] input[name=text]").fill(outText);
   await tree.locator("[data-outliner-add] input[name=text]").press("Enter");
   await expect(tree.locator(".outliner-row").filter({ hasText: outText })).toHaveCount(1, { timeout: 15_000 });

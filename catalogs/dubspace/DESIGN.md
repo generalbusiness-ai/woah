@@ -132,8 +132,8 @@ Each observation the dubspace emits has a defined payload shape. UI and agents c
 
 | Observation | Payload | When emitted |
 |---|---|---|
-| `dubspace_entered` | `{actor: obj, space: obj, text: str}` | Actor moves into the dubspace and is present at the controls. |
-| `dubspace_left` | `{actor: obj, space: obj, text: str}` | Actor moves out of the dubspace and is no longer present at the controls. |
+| `dubspace_entered` | `{source: obj, actor: obj, space: obj, text: str}` | Actor moves into the dubspace and is present at the controls. |
+| `dubspace_left` | `{source: obj, actor: obj, space: obj, text: str}` | Actor moves out of the dubspace and is no longer present at the controls. |
 | `dubspace_activity` | `{actor: obj, space: obj, text: str}` | Room-visible mounted-object activity, sourced from the containing room. |
 | `loop_started` | `{slot: obj, loop_id: str}` | `:start_loop` applied. |
 | `loop_stopped` | `{slot: obj}` | `:stop_loop` applied. |

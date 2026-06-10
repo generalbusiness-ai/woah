@@ -191,6 +191,80 @@ describe("v2 browser worker integration", () => {
     await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "warm-dubspace-control"));
   });
 
+  it("sends server-authoritative movement as a plain durable intent without scope-ad delegation", async () => {
+    const posted: unknown[] = [];
+    const scope = new FakeWorkerScope();
+    vi.stubGlobal("self", scope);
+    vi.stubGlobal("postMessage", (message: unknown) => posted.push(message));
+    vi.stubGlobal("indexedDB", new FakeIndexedDBFactory());
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+
+    await import("../src/client/v2-browser-worker");
+
+    const world = createWorld();
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-server-authoritative-move");
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-server-authoritative-move",
+      scope: "the_dubspace",
+      serialized: world.exportWorld()
+    });
+    const browser = createShadowBrowserClient({
+      node: "browser:v2-worker-server-authoritative-move",
+      scope: "the_dubspace",
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: "token:v2-worker-server-authoritative-move"
+    });
+    const opened = await openShadowBrowserScope(browser);
+
+    scope.dispatch({
+      kind: "connect",
+      token: "token:v2-worker-server-authoritative-move",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    const socket = await waitForSocket();
+    socket.open();
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "hello-server-authoritative-move", "woo.transport.hello.v1", shadowBrowserTransportHello(browser))));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "transfer-server-authoritative-move", opened.transfer.kind, opened.transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "exec-state-server-authoritative-move", opened.executable_transfer.kind, opened.executable_transfer)));
+    socket.receive(encodeEnvelope(relayEnvelope(browser, "ad-server-authoritative-move", "woo.exec_capability_ad.shadow.v1", opened.ads[0])));
+    await waitForMessage(posted, isReadyStatus);
+
+    const sentCursor = socket.sent.length;
+    scope.dispatch({
+      kind: "call",
+      id: "server-authoritative-moveto",
+      route: "direct",
+      scope: "the_dubspace",
+      target: session.actor,
+      verb: "moveto",
+      args: ["the_dubspace"],
+      persistence: "durable",
+      skip_local_execution: true,
+      server_authoritative: true
+    });
+
+    const intent = await waitForTurnIntentRequest(socket, "moveto", sentCursor);
+    expect(intent).toMatchObject({
+      type: "woo.turn.intent.request.shadow.v1",
+      body: {
+        id: "server-authoritative-moveto",
+        route: "direct",
+        scope: "the_dubspace",
+        target: session.actor,
+        verb: "moveto",
+        persistence: "durable"
+      }
+    });
+    expect((intent.body as { selected_ad?: unknown }).selected_ad).toBeUndefined();
+    expect(posted.some((message) => isLocalTurnDelegated(message, "server-authoritative-moveto"))).toBe(false);
+  });
+
   it("plans typed commands locally through the space command_plan verb", async () => {
     const posted: unknown[] = [];
     const scope = new FakeWorkerScope();
@@ -3191,6 +3265,21 @@ async function waitForBrowserBuiltExecRequest(
       continue;
     }
     if (verb && (envelope.body as { call?: { verb?: unknown } }).call?.verb !== verb) continue;
+    return envelope;
+  }
+}
+
+async function waitForTurnIntentRequest(
+  socket: FakeWebSocket,
+  verb?: string,
+  startCursor = socket.sent.length
+): Promise<ShadowEnvelope> {
+  let cursor = startCursor;
+  for (;;) {
+    await waitFor(() => socket.sent[cursor] ? true : undefined);
+    const envelope = decodeEnvelope(socket.sent[cursor++]);
+    if (envelope.type !== "woo.turn.intent.request.shadow.v1") continue;
+    if (verb && (envelope.body as { verb?: unknown }).verb !== verb) continue;
     return envelope;
   }
 }
