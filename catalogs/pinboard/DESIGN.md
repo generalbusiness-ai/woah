@@ -40,9 +40,9 @@ SPA host supplies scoped projection data, verb-call services, and the current
 pinboard view; drag/resize gesture plumbing remains host-owned until the frame
 action model carries those gestures directly.
 
-Browser clients route Pinboard through v2. Enter/leave commit because durable
-board presence is the authorization precondition for sequenced note/layout
-edits. Viewport telemetry and read-only note hydration execute on the v2 direct
+Browser clients route Pinboard through v2. Enter and `out` commit because
+durable board presence is the authorization precondition for sequenced
+note/layout edits. Viewport telemetry and read-only note hydration execute on the v2 direct
 plane with `live`; create, edit, recolor, layout, take, and drop execute
 on the commit plane. The embedded mini-chat also uses the catalog command
 planner over v2 so command aliases remain catalog-owned instead of being parsed
@@ -57,7 +57,7 @@ That catalog view state outranks later weaker generic projection, so a stale or
 partial projection snapshot cannot blank note text that was already learned from
 observations or `list_notes`.
 
-Pinboard `enter`/`leave` return only the board room and subscriber lists. They
+Pinboard `enter`/`out` return only the board room and subscriber lists. They
 intentionally do not request a full `here` payload: v2 commit validation treats
 post-commit projection reads as ordinary transcript reads, and a board-mounted
 parent-room snapshot can otherwise read the board's post-increment `next_seq`
@@ -87,7 +87,7 @@ $thing
 ```
 
 `$pinboard` is not a subclass of any "physical board" abstraction — it
-behaves like one because the chat surface (look/enter/leave/say/page)
+behaves like one because the chat surface (look/enter/out/say/page)
 applies wherever `$space` descendants live. The board reads as physical
 because it shares those verbs, not because of cross-tree inheritance.
 
@@ -168,7 +168,7 @@ Adds:
 | Verb | Purpose |
 | --- | --- |
 | `look` / `look_self` | Standard space look surface; returns the joined view (pins + layout + presence). |
-| `enter` / `leave` / `out` | Move the actor into/out of the board and subscribe/unsubscribe from incremental observations. `leave` and `out` return to `mount_room` when set, otherwise actor home. Enter/leave physically move actors and can cross hosts because bundled `the_pinboard` has `host_placement: "self"`. |
+| `enter` / `out` | Move the actor into/out of the board and subscribe/unsubscribe from incremental observations. `out` returns to `mount_room` when set, otherwise actor home. Enter/out physically move actors and can cross hosts because bundled `the_pinboard` has `host_placement: "self"`. |
 | `viewport(x, y, w, h, scale)` | Frontend telemetry for client-side panning/zoom. |
 | `list_notes` | Returns `[{ id, name, text, color, owner, writers, x, y, w, h, z }]` joining contents + layout. |
 | `acceptable(object)` | Returns `isa(object, $note) || isa(object, $actor)`. Notes and actors can enter; layout verbs ignore actors. |
@@ -194,7 +194,7 @@ ordered column layout.
 | Verb | Perms | Purpose |
 | --- | --- | --- |
 | `look` / `look_self` | anyone | Standard space look surface; returns board title, columns (joined card view), and presence. See *Return shapes* below. |
-| `enter` / `leave` | anyone | Subscribe/unsubscribe from incremental observations. |
+| `enter` / `out` | anyone | Subscribe/unsubscribe from incremental observations. |
 | `list_columns` | anyone | Returns the columns + joined card view. See *Return shapes*. |
 | `add_column(title, index?)` | board owner / wizard | Insert a new empty column. Generates a stable id from `next_column_id`. Emits `kanban_column_added`. |
 | `rename_column(column_id, title)` | board owner / wizard | Change display title only. Emits `kanban_column_renamed`. |

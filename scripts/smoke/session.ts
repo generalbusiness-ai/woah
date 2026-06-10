@@ -39,8 +39,8 @@ const DEFAULT_RPC_TIMEOUT_MS = 20_000;
 export class SmokeSession {
   private nextId = 2;
   // Tracked from every move-style response that carries a `room` field in its
-  // structuredContent.result. Guarded helpers (leaveIfIn, directional walks)
-  // gate on this so a leave/direction verb is never issued from the wrong
+  // structuredContent.result. Guarded helpers (exitIfIn, directional walks)
+  // gate on this so an exit/direction verb is never issued from the wrong
   // assumed room — which would surface as a confusing E_VERBNF that masks the
   // real upstream failure.
   currentRoom: string | null = null;
@@ -97,20 +97,20 @@ export class SmokeSession {
 
   async call(object: string, verb: string, verbArgs: unknown[], signal?: AbortSignal): Promise<unknown> {
     const result = unwrap(await this.callRaw(object, verb, verbArgs, signal));
-    // Move/enter/leave responses carry `room` in structuredContent.result;
+    // Move/enter/out responses carry `room` in structuredContent.result;
     // update tracked room from every successful call.
     if (isRecord(result) && typeof result.room === "string") this.currentRoom = result.room;
     return result;
   }
 
-  // Call `verb` on `space` only if our tracked location matches `space`. Used to
-  // close out a tool space (`pinboard:leave`, `outline:leave`) where an earlier
-  // `enter` may have failed; calling leave from a room we never reached emits a
+  // Call `out` on `space` only if our tracked location matches `space`. Used to
+  // close out a tool space (`pinboard:out`, `outline:out`) where an earlier
+  // `enter` may have failed; calling out from a room we never reached emits a
   // confusing E_VERBNF that masks the real upstream failure. Returns true iff
-  // the leave actually fired.
-  async leaveIfIn(space: string, signal?: AbortSignal): Promise<boolean> {
+  // the exit actually fired.
+  async exitIfIn(space: string, signal?: AbortSignal): Promise<boolean> {
     if (this.currentRoom !== space) return false;
-    await this.call(space, "leave", [], signal);
+    await this.call(space, "out", [], signal);
     return true;
   }
 

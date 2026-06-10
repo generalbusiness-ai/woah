@@ -217,11 +217,11 @@ export async function runSmokeWalkthrough(
   // tool_exposed).
   await step("outliner:enter result includes a roster row for alice", async (ctx) => {
     const { alice, bob } = pair;
-    // Only leave if actually in the pinboard; only walk west if actually on the
+    // Only exit if actually in the pinboard; only walk west if actually on the
     // deck — guards keep a prior-step failure from cascading into a stale
     // E_VERBNF on a wrong-room verb that masks the real cause.
-    await alice.leaveIfIn("the_pinboard", ctx.signal);
-    await bob.leaveIfIn("the_pinboard", ctx.signal);
+    await alice.exitIfIn("the_pinboard", ctx.signal);
+    await bob.exitIfIn("the_pinboard", ctx.signal);
     if (alice.currentRoom === "the_deck") await alice.call("the_deck", "west", [], ctx.signal);
     if (bob.currentRoom === "the_deck") await bob.call("the_deck", "west", [], ctx.signal);
     await drain(alice, cfg, ctx.signal);
@@ -257,8 +257,8 @@ export async function runSmokeWalkthrough(
   // lands there (demoworld routes deck-south through the_garden).
   await step("tasks: cross-room `entered` reaches peer", async (ctx) => {
     const { alice, bob } = pair;
-    await alice.leaveIfIn("the_outline", ctx.signal);
-    await bob.leaveIfIn("the_outline", ctx.signal);
+    await alice.exitIfIn("the_outline", ctx.signal);
+    await bob.exitIfIn("the_outline", ctx.signal);
     if (alice.currentRoom === "the_chatroom") await alice.call("the_chatroom", "southeast", [], ctx.signal);
     if (bob.currentRoom === "the_chatroom") await bob.call("the_chatroom", "southeast", [], ctx.signal);
     await walkSouthToTaskboard(alice, ctx.signal);

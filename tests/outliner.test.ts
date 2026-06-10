@@ -382,8 +382,8 @@ describe("outliner catalog: single-level undo", () => {
     await expectResult(call(world, session.actor, "the_outline", "enter", []));
     const a = await addItem(world, session.actor, "doomed");
     expect(world.objects.has(a)).toBe(true);
-    // Leave without undoing — slot is cleared on leave.
-    await expectResult(call(world, session.actor, "the_outline", "leave", []));
+    // Exit without undoing; the exit hook clears the slot.
+    await expectResult(call(world, session.actor, "the_outline", "out", []));
     // Re-enter — slot wiped on enter too.
     await expectResult(call(world, session.actor, "the_outline", "enter", []));
     const r = await expectResult(call(world, session.actor, "the_outline", "undo", []));
@@ -401,7 +401,7 @@ describe("outliner catalog: focus", () => {
     await expectResult(call(world, session.actor, "the_outline", "focus_on", [a]));
     let fmap = world.propOrNull("the_outline", "focus_by_actor") as Record<string, string | null>;
     expect(fmap[session.actor]).toBe(a);
-    await expectResult(call(world, session.actor, "the_outline", "leave", []));
+    await expectResult(call(world, session.actor, "the_outline", "out", []));
     await expectResult(call(world, session.actor, "the_outline", "enter", []));
     fmap = world.propOrNull("the_outline", "focus_by_actor") as Record<string, string | null>;
     expect(fmap[session.actor] ?? null).toBe(null);
@@ -599,7 +599,7 @@ describe("outliner catalog: room_roster (presence aside)", () => {
     const a = world.auth("guest:roster-enter");
     const entered = await expectResult(call(world, a.actor, "the_outline", "enter", []));
     expect(entered.observations.map((o) => o.type)).toContain("outliner_entered");
-    const left = await expectResult(call(world, a.actor, "the_outline", "leave", []));
+    const left = await expectResult(call(world, a.actor, "the_outline", "out", []));
     expect(left.observations.map((o) => o.type)).toContain("outliner_left");
   });
 });

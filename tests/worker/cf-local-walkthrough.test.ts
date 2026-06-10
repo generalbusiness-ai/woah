@@ -50,8 +50,8 @@ const DETERMINISTIC_PREFETCH_TURNS = new Set([
   "the_deck:south",
   "the_deck:west",
   "the_garden:south",
-  "the_outline:leave",
-  "the_pinboard:leave"
+  "the_outline:out",
+  "the_pinboard:out"
 ]);
 
 class FakeKVNamespace {
@@ -164,7 +164,7 @@ describe("CF-local smoke walkthrough", () => {
       // ZERO-TOLERANCE as of A4. The presence/containment PROJECTION cells
       // (`subscribers`, `session_subscribers`, `contents`) used to sit on the
       // commit-validation path, so a cross-room turn could plan them stale and get
-      // rejected (e.g. `the_outline:leave` rejecting on `the_chatroom.subscribers`).
+      // rejected (e.g. `the_outline:out` rejecting on `the_chatroom.subscribers`).
       // A4 (cell-authority CA2/CA4) took them OFF the validation path: a read of a
       // projection cell is no longer a consistency dependency, because its truth is
       // each member's own `live:location` authoritative cell. The allow-list is now
@@ -234,14 +234,14 @@ describe("CF-local smoke walkthrough", () => {
       expect(phaseTimings.some((m) => m.outcome === "submitted"), "at least one turn should commit").toBe(true);
       const deterministicRepairAttempts = parsedMetrics
         .filter((m) => m.kind === "turn_repair_attempt")
-        // This gate covers the deterministic movement/tool-leave turns in this
+        // This gate covers the deterministic movement/tool-exit turns in this
         // walkthrough. Other verbs, such as cold take/drop, may still repair
         // correctly until their authority closures are made sparse-plan complete.
         .filter((m) => DETERMINISTIC_PREFETCH_TURNS.has(`${String(m.target)}:${String(m.verb)}`))
         .map((m) => `${String(m.target)}:${String(m.verb)} source=${String(m.source)} reason=${String(m.reason)} objects=${JSON.stringify(m.objects ?? [])} atoms=${JSON.stringify(m.atoms ?? [])}`);
       expect(
         deterministicRepairAttempts,
-        "prod-shaped local smoke should not need sparse-planning repair for deterministic movement/tool-leave turns; prefetch declarative destinations instead"
+        "prod-shaped local smoke should not need sparse-planning repair for deterministic movement/tool-exit turns; prefetch declarative destinations instead"
       ).toEqual([]);
       const initialChatroomEnters = phaseTimings
         .filter((m) => m.target === "the_chatroom" && m.verb === "enter" && m.route === "direct")

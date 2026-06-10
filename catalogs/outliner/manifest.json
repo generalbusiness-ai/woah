@@ -1,8 +1,8 @@
 {
   "name": "outliner",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "spec_version": "v1",
-  "description": "Shared hierarchical text outliner. Each item is an $outline_item < $note tree node with .parent / .position / .hidden; the outliner is an $outliner < $space that scopes items and tracks per-actor focus + single-level undo. UI is minimal: enter/leave, collapse/expand, drag-reorder, drag-drop reparent, hidden checkbox, undo button, and embedded minichat. Chat carries 'add' / 'hide <item>' / 'focus [<item>]' commands. Items are not portable: they cannot be carried; removal recycles, with children re-attached to the removed item's former parent.",
+  "description": "Shared hierarchical text outliner. Each item is an $outline_item < $note tree node with .parent / .position / .hidden; the outliner is an $outliner < $space that scopes items and tracks per-actor focus + single-level undo. UI is minimal: enter/out, collapse/expand, drag-reorder, drag-drop reparent, hidden checkbox, undo button, and embedded minichat. Chat carries 'add' / 'hide <item>' / 'focus [<item>]' commands. Items are not portable: they cannot be carried; removal recycles, with children re-attached to the removed item's former parent.",
   "license": "MIT",
   "depends": [
     "@local:chat",
@@ -172,18 +172,7 @@
             "args": [],
             "command": { "dobj": ["none", "this"], "prep": "none", "iobj": "none", "args_from": [], "route": "sequenced" }
           },
-          "source": "verb :enter() rxd {\n  let old = location(actor);\n  moveto(actor, this);\n  // Reset per-actor state: clear undo slot and reset focus to root.\n  let key = to_string(actor);\n  let fmap = this.focus_by_actor;\n  fmap[key] = null;\n  this.focus_by_actor = fmap;\n  let umap = this.last_undo;\n  if (has(umap, key)) {\n    let next = {};\n    for k in keys(umap) { if (k != key) { next[k] = umap[k]; } }\n    this.last_undo = next;\n  }\n  let text = actor.name + \" opens \" + this.name + \".\";\n  observe({ type: \"outliner_entered\", source: this, actor: actor, outliner: this, origin: old, text: text, ts: now() });\n  if (this.mount_room != null) {\n    observe_to_space(this.mount_room, { type: \"outliner_activity\", source: this.mount_room, outliner: this, actor: actor, text: text, ts: now() });\n  }\n  return { room: this, roster: this:room_roster() };\n}"
-        },
-        {
-          "name": "leave",
-          "perms": "rxd",
-          "direct_callable": true,
-          "tool_exposed": true,
-          "arg_spec": {
-            "args": [],
-            "authority": { "prefetch": ["scope", "target", { "first": [{ "path": ["target", "mount_room"] }, { "path": ["actor", "home"] }] }] }
-          },
-          "source": "verb :leave() rxd {\n  let dest = actor.home;\n  if (this.mount_room != null) { dest = this.mount_room; }\n  if (dest == null) { dest = $nowhere; }\n  moveto(actor, dest);\n  let key = to_string(actor);\n  let umap = this.last_undo;\n  // Drop this actor's slot AND prune entries for actors no longer present.\n  let present_keys = {};\n  for a in present_actors(this) { present_keys[to_string(a)] = true; }\n  let next_u = {};\n  for k in keys(umap) { if (k != key && has(present_keys, k)) { next_u[k] = umap[k]; } }\n  this.last_undo = next_u;\n  let fmap = this.focus_by_actor;\n  let next_f = {};\n  for k in keys(fmap) { if (k != key && has(present_keys, k)) { next_f[k] = fmap[k]; } }\n  this.focus_by_actor = next_f;\n  let text = actor.name + \" closes \" + this.name + \".\";\n  observe({ type: \"outliner_left\", source: this, actor: actor, outliner: this, destination: dest, text: text, ts: now() });\n  if (this.mount_room != null) {\n    observe_to_space(this.mount_room, { type: \"outliner_activity\", source: this.mount_room, outliner: this, actor: actor, text: text, ts: now() });\n  }\n  return { room: dest, roster: this:room_roster() };\n}"
+          "source": "verb :enter() rxd {\n  let old = location(actor);\n  moveto(actor, this);\n  let text = actor.name + \" opens \" + this.name + \".\";\n  observe({ type: \"outliner_entered\", source: this, actor: actor, outliner: this, origin: old, text: text, ts: now() });\n  if (this.mount_room != null) {\n    observe_to_space(this.mount_room, { type: \"outliner_activity\", source: this.mount_room, outliner: this, actor: actor, text: text, ts: now() });\n  }\n  return { room: this, roster: this:room_roster() };\n}"
         },
         {
           "name": "out",
@@ -195,7 +184,7 @@
             "args": [],
             "authority": { "prefetch": ["scope", "target", { "first": [{ "path": ["target", "mount_room"] }, { "path": ["actor", "home"] }] }] }
           },
-          "source": "verb :out() rxd { return this:leave(); }"
+          "source": "verb :out() rxd {\n  let dest = actor.home;\n  if (this.mount_room != null) { dest = this.mount_room; }\n  if (dest == null) { dest = $nowhere; }\n  moveto(actor, dest);\n  let text = actor.name + \" closes \" + this.name + \".\";\n  observe({ type: \"outliner_left\", source: this, actor: actor, outliner: this, destination: dest, text: text, ts: now() });\n  if (this.mount_room != null) {\n    observe_to_space(this.mount_room, { type: \"outliner_activity\", source: this.mount_room, outliner: this, actor: actor, text: text, ts: now() });\n  }\n  return { room: dest, roster: this:room_roster() };\n}"
         },
         {
           "name": "acceptable",
@@ -207,13 +196,13 @@
           "name": "enterfunc",
           "perms": "rx",
           "arg_spec": { "args": ["object"] },
-          "source": "verb :enterfunc(object) rx {\n  if (isa(object, $outline_item)) {\n    // Validate parent: if set, must point at a same-outliner item.\n    let p = null;\n    try { p = object.parent; } except err { p = null; }\n    if (p != null) {\n      if (!isa(p, $outline_item) || location(p) != this) {\n        // Inconsistent — clear to root rather than leaving a dangling parent.\n        object:set_parent(null);\n        p = null;\n      }\n    }\n    // If position isn't set or is 0, allocate at end of the sibling list.\n    let pos = 0;\n    try { pos = object.position; } except err { pos = 0; }\n    if (typeof(pos) != \"number\" || pos < 1) {\n      let siblings = this:_siblings_ordered(p);\n      // Replace any existing entry for this item to avoid double-add on re-enter.\n      let cleaned = [];\n      for s in siblings { if (s != object) { cleaned = cleaned + [s]; } }\n      cleaned = cleaned + [object];\n      this:_renumber_siblings(p, cleaned);\n    } else {\n      // Position present; trust it. (Renumber is the caller's job for moves.)\n    }\n    let siblings_after = this:_siblings_ordered(p);\n    let idx = 0; let i = 1;\n    for s in siblings_after { if (s == object) { idx = i - 1; } i = i + 1; }\n    let body = \"\";\n    try { body = object:text(); } except err { body = \"\"; }\n    observe({ type: \"outline_item_added\", source: this, actor: actor, outliner: this, item: object, parent_id: p, index: idx, text: body, ts: now() });\n  }\n  return true;\n}"
+          "source": "verb :enterfunc(object) rx {\n  if (isa(object, $actor)) {\n    // A fresh visit starts at root and cannot reuse stale undo from an older visit.\n    let key = to_string(object);\n    let fmap = this.focus_by_actor;\n    fmap[key] = null;\n    this.focus_by_actor = fmap;\n    let umap = this.last_undo;\n    if (has(umap, key)) {\n      let next = {};\n      for k in keys(umap) { if (k != key) { next[k] = umap[k]; } }\n      this.last_undo = next;\n    }\n    return true;\n  }\n  if (isa(object, $outline_item)) {\n    // Validate parent: if set, must point at a same-outliner item.\n    let p = null;\n    try { p = object.parent; } except err { p = null; }\n    if (p != null) {\n      if (!isa(p, $outline_item) || location(p) != this) {\n        // Inconsistent — clear to root rather than leaving a dangling parent.\n        object:set_parent(null);\n        p = null;\n      }\n    }\n    // If position isn't set or is 0, allocate at end of the sibling list.\n    let pos = 0;\n    try { pos = object.position; } except err { pos = 0; }\n    if (typeof(pos) != \"number\" || pos < 1) {\n      let siblings = this:_siblings_ordered(p);\n      // Replace any existing entry for this item to avoid double-add on re-enter.\n      let cleaned = [];\n      for s in siblings { if (s != object) { cleaned = cleaned + [s]; } }\n      cleaned = cleaned + [object];\n      this:_renumber_siblings(p, cleaned);\n    } else {\n      // Position present; trust it. (Renumber is the caller's job for moves.)\n    }\n    let siblings_after = this:_siblings_ordered(p);\n    let idx = 0; let i = 1;\n    for s in siblings_after { if (s == object) { idx = i - 1; } i = i + 1; }\n    let body = \"\";\n    try { body = object:text(); } except err { body = \"\"; }\n    observe({ type: \"outline_item_added\", source: this, actor: actor, outliner: this, item: object, parent_id: p, index: idx, text: body, ts: now() });\n  }\n  return true;\n}"
         },
         {
           "name": "exitfunc",
           "perms": "rx",
           "arg_spec": { "args": ["object"] },
-          "source": "verb :exitfunc(object) rx {\n  if (isa(object, $outline_item)) {\n    this:_detach_item(object, { emit: true, clear_item: true });\n  }\n  return true;\n}"
+          "source": "verb :exitfunc(object) rx {\n  if (isa(object, $actor)) {\n    let key = to_string(object);\n    let umap = this.last_undo;\n    // Drop this actor's slot AND prune entries for actors no longer present.\n    let present_keys = {};\n    for a in present_actors(this) { present_keys[to_string(a)] = true; }\n    let next_u = {};\n    for k in keys(umap) { if (k != key && has(present_keys, k)) { next_u[k] = umap[k]; } }\n    this.last_undo = next_u;\n    let fmap = this.focus_by_actor;\n    let next_f = {};\n    for k in keys(fmap) { if (k != key && has(present_keys, k)) { next_f[k] = fmap[k]; } }\n    this.focus_by_actor = next_f;\n    return true;\n  }\n  if (isa(object, $outline_item)) {\n    this:_detach_item(object, { emit: true, clear_item: true });\n  }\n  return true;\n}"
         },
         {
           "name": "list_items",

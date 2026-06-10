@@ -1,6 +1,6 @@
 ---
 name: outliner
-version: 0.1.0
+version: 1.0.0
 spec_version: v1
 license: MIT
 description: Shared hierarchical text outliner. Items are first-class $outline_item < $note objects with parent / position / hidden; the outliner is an $outliner < $space that scopes the tree and carries per-actor focus and single-level undo. Chat commands are 'add', 'hide <item>', 'focus [<item>]'.
@@ -37,7 +37,7 @@ In an outliner, chat input understands three commands:
   bare `focus` resets to the root, so subsequent `add` commands create
   top-level items.
 
-Everything else (enter/leave, collapse/expand, drag-reorder, drag-drop
+Everything else (enter/out, collapse/expand, drag-reorder, drag-drop
 reparent, inline text editing, the hidden checkbox, the show-hidden
 toggle, the undo button, and the embedded minichat) is in the UI
 overlay.
@@ -55,7 +55,7 @@ an item directly, so children never end up pointing at a tombstone.
 ## Undo
 
 Single-level: every mutation overwrites the actor's `last_undo` slot;
-`undo()` consumes it. Slot is cleared on `:enter` and `:leave`, so a
+`undo()` consumes it. Slot is cleared on actor entry and exit, so a
 fresh session always starts empty regardless of how the prior session
 ended.
 

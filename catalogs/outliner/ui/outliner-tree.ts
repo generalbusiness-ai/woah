@@ -494,7 +494,6 @@ export class WooOutlinerTreeElement extends HTMLElement {
     const toolbar = `
       <section class="toolbar outliner-toolbar">
         <h1>${escapeHtml(data.outlinerName)}</h1>
-        <button type="button" data-outliner-presence="${this.enterPending ? "pending" : this.companionVisible ? "leave" : "enter"}" ${this.enterPending ? "disabled" : ""}>${this.enterPending ? "Entering..." : this.companionVisible ? "Leave" : "Enter"}</button>
         <label class="outliner-toggle">
           <input type="checkbox" data-outliner-show-hidden ${this.showHidden ? "checked" : ""}>
           show hidden
@@ -694,13 +693,6 @@ export class WooOutlinerTreeElement extends HTMLElement {
 
   private onClick = async (event: Event): Promise<void> => {
     const target = event.target as HTMLElement;
-    const presence = target.closest<HTMLElement>("[data-outliner-presence]");
-    if (presence) {
-      event.preventDefault();
-      const action = presence.dataset.outlinerPresence === "leave" ? "leave" : "enter";
-      await this.callVerb(action, []);
-      return;
-    }
     const btn = target.closest<HTMLElement>("[data-outliner-action]");
     if (btn) {
       event.preventDefault();

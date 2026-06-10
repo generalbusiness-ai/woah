@@ -174,14 +174,61 @@ describe("local catalogs", () => {
     expect(tasks.seed_hooks).toContainEqual({ kind: "attach_feature", consumer: "the_taskboard", feature: "chat:$transparent" });
   });
 
-  it("keeps mounted demo-space enter and leave verbs portable", async () => {
+  it("keeps mounted demo-space enter and out verbs portable without leave aliases", async () => {
     const world = createWorld({ catalogs: false });
     installLocalCatalogs(world, ["chat", "demoworld", "dubspace", "pinboard"]);
 
     expect(world.ownVerb("$dubspace", "enter")?.kind).toBe("bytecode");
-    expect(world.ownVerb("$dubspace", "leave")?.kind).toBe("bytecode");
+    expect(world.ownVerb("$dubspace", "out")?.kind).toBe("bytecode");
+    expect(world.ownVerb("$dubspace", "leave")).toBeNull();
     expect(world.ownVerb("$pinboard", "enter")?.kind).toBe("bytecode");
-    expect(world.ownVerb("$pinboard", "leave")?.kind).toBe("bytecode");
+    expect(world.ownVerb("$pinboard", "out")?.kind).toBe("bytecode");
+    expect(world.ownVerb("$pinboard", "leave")).toBeNull();
+    expect(world.ownVerb("$outliner", "enter")?.kind).toBe("bytecode");
+    expect(world.ownVerb("$outliner", "out")?.kind).toBe("bytecode");
+    expect(world.ownVerb("$outliner", "leave")).toBeNull();
+  });
+
+  it("local-catalog boot drops retired tool leave verbs during v0 to v1 upgrades", () => {
+    const cases = [
+      { alias: "dubspace", classRef: "$dubspace" },
+      { alias: "outliner", classRef: "$outliner" },
+      { alias: "pinboard", classRef: "$pinboard" }
+    ] as const;
+
+    for (const item of cases) {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["chat", "note"]);
+      const v0: RuntimeCatalogManifest = {
+        name: item.alias,
+        version: "0.9.0",
+        spec_version: "v1",
+        depends: ["@local:chat"],
+        classes: [
+          {
+            local_name: item.classRef,
+            parent: "$space",
+            verbs: [
+              { name: "enter", perms: "rx", arg_spec: { args: [] }, source: "verb :enter() rx { return true; }" },
+              { name: "leave", perms: "rx", arg_spec: { args: [] }, source: "verb :leave() rx { return false; }" },
+              { name: "out", perms: "rx", arg_spec: { args: [] }, source: "verb :out() rx { return this:leave(); }" }
+            ]
+          }
+        ]
+      };
+      installCatalogManifest(world, v0, { tap: "@local", alias: item.alias });
+      expect(world.ownVerbExact(item.classRef, "leave"), `${item.alias} v0 leave setup`).toBeDefined();
+
+      installLocalCatalogs(world, [item.alias]);
+
+      expect(world.ownVerbExact(item.classRef, "leave"), `${item.alias} leave dropped`).toBeNull();
+      expect(world.ownVerbExact(item.classRef, "out"), `${item.alias} out retained`).toBeDefined();
+      const installed = world.propOrNull("$catalog_registry", "installed_catalogs") as Array<Record<string, WooValue>>;
+      expect(String(installed.find((record) => record.alias === item.alias)?.version), `${item.alias} version`).toMatch(/^1\.\d+\.\d+$/);
+
+      installLocalCatalogs(world, [item.alias]);
+      expect(world.ownVerbExact(item.classRef, "leave"), `${item.alias} idempotent leave drop`).toBeNull();
+    }
   });
 
   it("seeds a south exit from the_deck into the_garden, then south again to the_taskboard", async () => {
@@ -1366,8 +1413,8 @@ describe("local catalogs", () => {
     await world.directCall("pinboard-enter-stranded", stranded.actor, "the_pinboard", "enter", []);
     world.setProp(stranded.actor, "home", null);
     world.setProp("the_pinboard", "mount_room", null);
-    const fallbackLeave = await world.directCall("pinboard-leave-stranded", stranded.actor, "the_pinboard", "leave", []);
-    expect(fallbackLeave.op).toBe("result");
+    const fallbackOut = await world.directCall("pinboard-out-stranded", stranded.actor, "the_pinboard", "out", []);
+    expect(fallbackOut.op).toBe("result");
     expect(world.object(stranded.actor).location).toBe("$nowhere");
     expect(world.hasPresence(stranded.actor, "the_pinboard")).toBe(false);
   });

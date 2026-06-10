@@ -597,7 +597,7 @@ describe("outliner-tree presence aside", () => {
 
     element.entering = true;
     expect(element.querySelector("[data-outliner-add]"), "not present while enter is pending").toBeNull();
-    expect(element.querySelector("[data-outliner-presence='pending']")).not.toBeNull();
+    expect(element.querySelector("[data-outliner-presence]"), "no manual presence control").toBeNull();
 
     element.entering = false;
     element.showCompanion = true;

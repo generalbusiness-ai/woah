@@ -1,4 +1,4 @@
-import { test, expect, type Page } from "@playwright/test";
+import { test, expect, type APIRequestContext, type Page } from "@playwright/test";
 
 // Regression for SPA tool-to-tool navigation within one live session. When a
 // fresh actor (empty display cache) navigates to a tool as the SECOND tool, its
@@ -13,29 +13,53 @@ async function guest(page: Page): Promise<void> {
   await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 10_000 });
 }
 
-async function seedBothTools(page: Page, outText: string, pinText: string): Promise<void> {
-  await page.getByRole("button", { name: "Outliner" }).click();
-  const tree = page.locator("woo-outliner-tree[data-outliner-tree]");
-  await tree.getByRole("button", { name: "Leave" }).waitFor({ timeout: 10_000 });
-  await tree.locator("[data-outliner-add] input[name=text]").fill(outText);
-  await tree.locator("[data-outliner-add] input[name=text]").press("Enter");
-  await expect(tree.locator(".outliner-row").filter({ hasText: outText })).toHaveCount(1, { timeout: 15_000 });
-  await page.getByRole("button", { name: "Pinboard" }).click();
-  await expect(page.locator(".pinboard-stage")).toBeVisible({ timeout: 10_000 });
-  await page.locator("[data-pinboard-new-text]").fill(pinText);
-  await page.locator("[data-pinboard-create]").getByRole("button", { name: "Add Note" }).click();
-  await expect(page.locator(".pinboard-stage")).toContainText(pinText, { timeout: 10_000 });
+async function expectJson(response: Awaited<ReturnType<APIRequestContext["post"]>>, context: string): Promise<any> {
+  const body = await response.json();
+  expect(response.ok(), `${context}: ${JSON.stringify(body)}`).toBe(true);
+  return body;
 }
 
-test("fresh actor: pinboard note text hydrates when reached as the SECOND tool", async ({ browser }) => {
+async function seedBothTools(request: APIRequestContext, outText: string, pinText: string): Promise<void> {
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const auth = await expectJson(await request.post("/api/auth", { data: { token: `guest:tool-nav-seed-${suffix}` } }), "seed auth");
+  const headers = { Authorization: `Session ${auth.session}` };
+
+  await expectJson(await request.post("/api/objects/the_outline/calls/enter", {
+    headers,
+    data: { id: `seed-outline-enter-${suffix}`, space: "the_outline", args: [] }
+  }), "seed outline enter");
+  await expectJson(await request.post("/api/objects/the_outline/calls/add", {
+    headers,
+    data: { id: `seed-outline-add-${suffix}`, space: "the_outline", args: [outText] }
+  }), "seed outline add");
+  const listedOutline = await expectJson(await request.post("/api/objects/the_outline/calls/list_items", {
+    headers,
+    data: { args: [] }
+  }), "seed outline list");
+  expect(listedOutline.result.some((row: { text?: string }) => row.text === outText), "seeded outline item text").toBe(true);
+
+  await expectJson(await request.post("/api/objects/the_pinboard/calls/enter", {
+    headers,
+    data: { id: `seed-pinboard-enter-${suffix}`, space: "the_pinboard", args: [] }
+  }), "seed pinboard enter");
+  await expectJson(await request.post("/api/objects/the_pinboard/calls/add_note", {
+    headers,
+    data: { id: `seed-pinboard-add-${suffix}`, space: "the_pinboard", args: [pinText, "yellow"] }
+  }), "seed pinboard add");
+  const listedPins = await expectJson(await request.post("/api/objects/the_pinboard/calls/list_notes", {
+    headers,
+    data: { args: [] }
+  }), "seed pinboard list");
+  expect(listedPins.result.some((note: { text?: string }) => note.text === pinText), "seeded pinboard note text").toBe(true);
+}
+
+test("fresh actor: pinboard note text hydrates when reached as the SECOND tool", async ({ browser, request }) => {
   test.setTimeout(120_000);
   const outText = "exist-out-" + Math.random().toString(36).slice(2, 7);
   const pinText = "exist-pin-" + Math.random().toString(36).slice(2, 7);
 
-  // Context A seeds server-side content in both tools.
-  const a = await browser.newContext();
-  await seedBothTools(await a.newPage().then(async (p) => { await p.goto("/"); await guest(p); return p; }), outText, pinText);
-  await a.close();
+  // Seed server-side content in both tools before opening the fresh browser.
+  await seedBothTools(request, outText, pinText);
 
   // Context B is a different fresh guest (empty cache) — it must hydrate from server.
   const b = await browser.newContext();

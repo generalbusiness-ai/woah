@@ -56,9 +56,6 @@ this.innerHTML = renderToolFrame({
   toolbar: `
     <section class="toolbar example-toolbar">
       <h1>${escapeHtml(toolName)}</h1>
-      ${actorIsPresent
-        ? `<button data-example-leave>Leave</button>`
-        : `<button data-example-enter>Enter</button>`}
     </section>
   `,
   layoutClass: "example-layout",
@@ -66,7 +63,7 @@ this.innerHTML = renderToolFrame({
     <div class="example-work">${workspaceHtml}</div>
     ${this.renderPresence()}
   `,
-  showChat: actorIsPresent
+  showChat: true
 });
 restoreAmbientCompanionPanel(this, preservedPanel);
 ```
@@ -91,10 +88,10 @@ Contract:
   `display: inline-flex; white-space: nowrap` so they can't wrap and
   blow the 2.125rem envelope.
 
-Enter/Leave controls call the tool space's normal `enter` and `leave`
-verbs through `this.woo.call(this.subject, "enter", [])` or
-`this.woo.call(this.subject, "leave", [])`; they do not invent a parallel
-presence model.
+The host enters the destination tool space when the browser switches to a tool
+tab. Tool components do not render Enter/Leave controls and must not model tab
+navigation as a synthetic exit. Explicit user exit from a tool space is the
+catalog's normal `out` verb.
 
 ## Do Not
 
@@ -113,6 +110,8 @@ presence model.
   shared host path cannot express the tool.
 - Do not add a new `main.ts` render/bind branch for a tool whose main
   component can hydrate from `WooContext`.
+- Do not render Enter/Leave controls for browser tool tabs. Tab switching moves
+  the actor to the destination; explicit tool-space exit is `out`.
 - Do not store presence only in client-local state.
 - Do not copy a tool's domain UI as the pattern. Copy the frame shape and
   workspace shell contract; the domain UI should remain catalog-specific.

@@ -147,7 +147,7 @@ Each observation the dubspace emits has a defined payload shape. UI and agents c
 | `gesture_progress` | `{actor: obj, target: obj, name: str, value: any}` | Direct call: in-flight slider drag preview. Live-only. |
 | `cursor` | `{actor: obj, x: float, y: float}` | Direct call: pointer position. Live-only. |
 
-All observations include `type` (the table key) and `source` (the dubspace itself, unless noted otherwise). `dubspace_activity` is sourced from the mounted room so actors present in the room see the operator step up/away messages. Observations from sequenced v2 intents (`:set_control`, `:start_loop`, etc.) become part of the resulting applied frame and are replayable. Observations from direct v2 intents (`:enter`, `:leave`, `:preview_control`, `:cursor`) are live-only — see [events.md §12.6](../../spec/semantics/events.md#126-observation-durability-follows-invocation-route).
+All observations include `type` (the table key) and `source` (the dubspace itself, unless noted otherwise). `dubspace_activity` is sourced from the mounted room so actors present in the room see the operator step up/away messages. Observations from sequenced v2 intents (`:set_control`, `:start_loop`, etc.) become part of the resulting applied frame and are replayable. Observations from direct v2 intents (`:enter`, `:out`, `:preview_control`, `:cursor`) are live-only — see [events.md §12.6](../../spec/semantics/events.md#126-observation-durability-follows-invocation-route).
 
 ## Live Events
 
@@ -158,7 +158,7 @@ All observations include `type` (the table key) and `source` (the dubspace itsel
 - Gesture began, moved, ended.
 - Scene saved or recalled.
 
-Gesture previews and operator enter/leave hints go through v2 direct intents (live-only); gesture commits that affect the shared mix go through v2 sequenced intents. The latest committed control values are persistent materialized state.
+Gesture previews and operator enter/out hints go through v2 direct intents (live-only); gesture commits that affect the shared mix go through v2 sequenced intents. The latest committed control values are persistent materialized state.
 
 ## Minimal Interactions
 

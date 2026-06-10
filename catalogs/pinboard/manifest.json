@@ -1,6 +1,6 @@
 {
   "name": "pinboard",
-  "version": "0.4.1",
+  "version": "1.0.0",
   "spec_version": "v1",
   "description": "Spatial bulletin board: a $space-shaped wall that holds movable $note objects. Pins are $pin < $note instances with an optional color; the board owns layout (x/y/w/h/z per pin) and presence. Pins inherit the v0.2 $note shape (name + description + text, where text is a single markdown string); board-level layout is independent of note content. Pins can be taken off the board, dropped in rooms, picked up, and posted onto another board, all using ordinary $portable take/drop infrastructure. Subclass $pin for richer per-note behavior (voting, ephemeral, timestamped) without changing the board.",
   "license": "MIT",
@@ -223,17 +223,6 @@
           "source": "verb :enter() rxd { let old = location(actor); moveto(actor, this); let text = actor.name + \" starts working at \" + this.name + \".\"; observe({ type: \"pinboard_entered\", actor: actor, board: this, origin: old, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: actor, text: text, ts: now() }); } return { room: this, roster: this:room_roster() }; }"
         },
         {
-          "name": "leave",
-          "perms": "rxd",
-          "direct_callable": true,
-          "tool_exposed": true,
-          "arg_spec": {
-            "args": [],
-            "authority": { "prefetch": ["scope", "target", { "first": [{ "path": ["target", "mount_room"] }, { "path": ["actor", "home"] }] }] }
-          },
-          "source": "verb :leave() rxd { let dest = actor.home; if (this.mount_room != null) { dest = this.mount_room; } if (dest == null) { dest = $nowhere; } moveto(actor, dest); let text = actor.name + \" steps back from \" + this.name + \".\"; observe({ type: \"pinboard_left\", actor: actor, board: this, destination: dest, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: actor, text: text, ts: now() }); } return { room: dest, roster: this:room_roster() }; }"
-        },
-        {
           "name": "out",
           "aliases": [
             "o@ut"
@@ -246,7 +235,7 @@
             "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "route": "sequenced" },
             "authority": { "prefetch": ["scope", "target", { "first": [{ "path": ["target", "mount_room"] }, { "path": ["actor", "home"] }] }] }
           },
-          "source": "verb :out() rxd { return this:leave(); }"
+          "source": "verb :out() rxd { let dest = actor.home; if (this.mount_room != null) { dest = this.mount_room; } if (dest == null) { dest = $nowhere; } moveto(actor, dest); let text = actor.name + \" steps back from \" + this.name + \".\"; observe({ type: \"pinboard_left\", actor: actor, board: this, destination: dest, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"pinboard_activity\", source: this.mount_room, board: this, actor: actor, text: text, ts: now() }); } return { room: dest, roster: this:room_roster() }; }"
         },
         {
           "name": "viewport",

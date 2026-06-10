@@ -1,6 +1,8 @@
 // Tool workspace UI guard: keep first-party `$space` tools on the shared
 // workspace/minichat path. A `space-workspace` frame whose subject is not the
 // chatroom itself must declare a main region and the shared mini-chat region.
+// Browser tool tabs are destination moves, so non-chat tool components must not
+// reintroduce explicit Enter/Leave controls or matching custom events.
 //
 // Run via `npm run guard:tool-workspace-ui` or as part of `npm test`.
 
@@ -12,6 +14,7 @@ const catalogsRoot = join(root, "catalogs");
 const mainTsPath = join(root, "src/client/main.ts");
 const errors = [];
 let auditedFrames = 0;
+let auditedUiFiles = 0;
 
 const dirs = readdirSync(catalogsRoot)
   .map((name) => join(catalogsRoot, name))
@@ -45,6 +48,25 @@ function hasMainRegion(frame) {
   return Array.isArray(frame?.regions?.main) && frame.regions.main.length > 0;
 }
 
+function walkFiles(dir, out = []) {
+  let entries;
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return out;
+  }
+  for (const entry of entries) {
+    const path = join(dir, entry);
+    const stat = statSync(path);
+    if (stat.isDirectory()) {
+      walkFiles(path, out);
+    } else if (/\.(?:mjs|js|ts|tsx)$/.test(entry)) {
+      out.push(path);
+    }
+  }
+  return out;
+}
+
 for (const dir of dirs) {
   const manifestPath = join(dir, "manifest.json");
   let manifest;
@@ -67,6 +89,23 @@ for (const dir of dirs) {
     }
     if (!hasSharedMiniChat(frame)) {
       errors.push(`${where}: space-workspace tool frames must declare regions.chat with chat:chat.space-mini`);
+    }
+  }
+
+  if (manifest.name !== "chat") {
+    for (const uiPath of walkFiles(join(dir, "ui"))) {
+      auditedUiFiles += 1;
+      const source = readFileSync(uiPath, "utf8");
+      const banned = [
+        /data-[a-z0-9-]+-(?:enter|leave)\b/,
+        /woo-[a-z0-9-]+-(?:enter|leave)\b/
+      ];
+      for (const pattern of banned) {
+        const match = source.match(pattern);
+        if (match) {
+          errors.push(`${rel(uiPath)}: tool components must not render or dispatch explicit Enter/Leave controls (${JSON.stringify(match[0])})`);
+        }
+      }
     }
   }
 }
@@ -108,4 +147,4 @@ if (errors.length > 0) {
   process.exit(1);
 }
 
-console.log(`tool workspace UI: ok (${auditedFrames} space-workspace tool frames audited)`);
+console.log(`tool workspace UI: ok (${auditedFrames} space-workspace tool frames, ${auditedUiFiles} non-chat UI files audited)`);

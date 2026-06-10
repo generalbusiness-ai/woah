@@ -1,6 +1,6 @@
 {
   "name": "dubspace",
-  "version": "0.2.11",
+  "version": "1.0.0",
   "spec_version": "v1",
   "description": "Shared dub-mix sound space demo objects.",
   "license": "MIT",
@@ -342,19 +342,7 @@
             "args": [],
             "command": { "dobj": ["none", "this"], "prep": "none", "iobj": "none", "args_from": [], "route": "sequenced", "persistence": "durable" }
           },
-          "source": "verb :enter() rxd { moveto(actor, this); if (!(actor in this.operators)) { this.operators = this.operators + [actor]; } let text = actor.name + \" steps up to \" + this.name + \".\"; observe({ type: \"dubspace_entered\", actor: actor, space: this, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"dubspace_activity\", source: this.mount_room, actor: actor, space: this, text: text, ts: now() }); } return { room: this, operators: this.operators, roster: this:room_roster(), here_request: true, look_deferred: true }; }"
-        },
-        {
-          "name": "leave",
-          "perms": "rxd",
-          "direct_callable": true,
-          "skip_presence_check": true,
-          "tool_exposed": true,
-          "arg_spec": {
-            "args": [],
-            "authority": { "prefetch": ["scope", "target", { "first": [{ "path": ["target", "mount_room"] }, { "path": ["actor", "home"] }] }] }
-          },
-          "source": "verb :leave() rxd { let dest = actor.home; if (this.mount_room != null) { dest = this.mount_room; } if (dest == null) { dest = $nowhere; } moveto(actor, dest); let next = []; for item in this.operators { if (item != actor) { next = next + [item]; } } this.operators = next; let text = actor.name + \" steps away from \" + this.name + \".\"; observe({ type: \"dubspace_left\", actor: actor, space: this, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"dubspace_activity\", source: this.mount_room, actor: actor, space: this, text: text, ts: now() }); } return { room: dest, operators: this.operators, here_request: true, look_deferred: true }; }"
+          "source": "verb :enter() rxd { moveto(actor, this); let text = actor.name + \" steps up to \" + this.name + \".\"; observe({ type: \"dubspace_entered\", actor: actor, space: this, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"dubspace_activity\", source: this.mount_room, actor: actor, space: this, text: text, ts: now() }); } return { room: this, operators: this.operators, roster: this:room_roster(), here_request: true, look_deferred: true }; }"
         },
         {
           "name": "out",
@@ -370,7 +358,27 @@
             "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [] },
             "authority": { "prefetch": ["scope", "target", { "first": [{ "path": ["target", "mount_room"] }, { "path": ["actor", "home"] }] }] }
           },
-          "source": "verb :out() rxd { return this:leave(); }"
+          "source": "verb :out() rxd { let dest = actor.home; if (this.mount_room != null) { dest = this.mount_room; } if (dest == null) { dest = $nowhere; } moveto(actor, dest); let text = actor.name + \" steps away from \" + this.name + \".\"; observe({ type: \"dubspace_left\", actor: actor, space: this, text: text, ts: now() }); if (this.mount_room != null) { observe_to_space(this.mount_room, { type: \"dubspace_activity\", source: this.mount_room, actor: actor, space: this, text: text, ts: now() }); } return { room: dest, operators: this.operators, here_request: true, look_deferred: true }; }"
+        },
+        {
+          "name": "enterfunc",
+          "perms": "rx",
+          "arg_spec": {
+            "args": [
+              "object"
+            ]
+          },
+          "source": "verb :enterfunc(object) rx { if (isa(object, $actor) && !(object in this.operators)) { this.operators = this.operators + [object]; } return true; }"
+        },
+        {
+          "name": "exitfunc",
+          "perms": "rx",
+          "arg_spec": {
+            "args": [
+              "object"
+            ]
+          },
+          "source": "verb :exitfunc(object) rx { if (isa(object, $actor)) { let next = []; for item in this.operators { if (item != object) { next = next + [item]; } } this.operators = next; } return true; }"
         },
         {
           "name": "set_control",

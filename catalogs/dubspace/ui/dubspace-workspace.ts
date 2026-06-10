@@ -85,27 +85,6 @@ export class WooDubspaceWorkspaceElement extends HTMLElement {
       `;
       return;
     }
-    if (!data.inSpace) {
-      this.innerHTML = renderToolFrame({
-        subject: spaceId,
-        toolbar: `
-          <section class="toolbar dubspace-toolbar">
-            <h1>${escapeHtml(data.spaceName || "Dubspace")}</h1>
-            <button data-dubspace-enter ${data.canSend ? "" : "disabled"}>Enter</button>
-          </section>
-        `,
-        layoutClass: "dubspace-layout",
-        layoutBody: `
-          <div class="card">
-            <p>${escapeHtml(data.spaceDescription || "Enter the dubspace to work at the controls.")}</p>
-          </div>
-          ${this.renderPresence()}
-        `,
-        showChat: false
-      });
-      this.bind();
-      return;
-    }
     const delay = props(data.controls[data.delay]);
     const drum = props(data.controls[data.drum]);
     const pattern = normalizePattern(drum.pattern);
@@ -209,7 +188,6 @@ export class WooDubspaceWorkspaceElement extends HTMLElement {
   }
 
   private bind(): void {
-    this.querySelector<HTMLButtonElement>("[data-dubspace-enter]")?.addEventListener("click", () => this.dispatch("enter"));
     this.querySelector<HTMLButtonElement>("[data-audio]")?.addEventListener("click", () => this.dispatch("audio"));
     this.querySelectorAll<HTMLButtonElement>("[data-loop]").forEach((button) => {
       button.addEventListener("click", () => this.dispatch("loop", { slot: button.dataset.loop ?? "", playing: button.dataset.playing === "true" }));
