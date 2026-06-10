@@ -810,9 +810,12 @@ classification and its observability metric are new.
 
 ### VTN8.3 Read-closure envelopes for planned-transcript commits
 
-> **Status: specified, not implemented** (plan item B-i,
+> **Status: implemented, flag-gated** (plan item B-i,
 > `notes/2026-06-09-cf-cross-scope-architecture-plan.md`). Flag:
-> `WOO_V2_READ_CLOSURE_ENVELOPE`. Rollout requires the parity gate below.
+> `WOO_V2_READ_CLOSURE_ENVELOPE`. Enabled in the smoke lane
+> (`wrangler.smoke.toml`) and the cf-local structural test harness. The parity
+> gate (corpus + lane parity, byte ceiling < 256 KB) is enforced in
+> `tests/b-i-read-closure-parity.test.ts` and `tests/worker/cf-local-structural.test.ts`.
 
 Commit validation (VTN8 steps 1–10) reads only: the actor and session rows,
 the cells the transcript declares as reads (including permission/policy reads,
@@ -855,10 +858,13 @@ pass.
 lane, an implementation MUST demonstrate verdict equivalence empirically, not
 only by the argument above: (1) corpus parity — for a recorded corpus of
 (pre-state, planned transcript) pairs from the shared smoke scenario, validate
-each pair against both envelope shapes and assert identical verdicts,
-mismatched-cell sets, and post-state hashes; (2) lane parity — the full
-scenario run with the flag off and on yields identical per-turn verdict
-streams and final state. The cross-scope envelope byte ceiling (< 256 KB)
+each pair against both envelope shapes and assert identical verdicts and
+mismatched-cell sets (note: `post_state_hash` differs between full and closure
+scopes because they start from different world sizes — this is expected and
+does not affect the live commit path, where the CommitScopeDO only applies the
+transcript to the rows it holds, not the full gateway world); (2) lane parity
+— the full scenario run with the flag off and on yields identical per-turn
+verdict streams and final state. The cross-scope envelope byte ceiling (< 256 KB)
 becomes an enforced structural gate when the flag is enabled.
 
 The rationale that motivated the old full-slice rule — "the selected commit

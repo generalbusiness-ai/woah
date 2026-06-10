@@ -37,6 +37,9 @@ enabled = false
 # (tasks), the_mug (demoworld), and note support.
 WOO_AUTO_INSTALL_CATALOGS = "chat,demoworld,dubspace,help,note,pinboard,prog,tasks,blocks-demo"
 WOO_V2_SLIM_WARM_ENVELOPE = "1"
+# B-i: enable read-closure envelopes for planned-transcript (cross-scope) commits.
+# Test lane only — not set in production wrangler.toml.
+WOO_V2_READ_CLOSURE_ENVELOPE = "1"
 # Local-only, non-secret defaults (mirror .dev.vars.example). Production sets
 # these via `wrangler secret put`; locally they are just config.
 WOO_INITIAL_WIZARD_TOKEN = "local-smoke-wizard-token"

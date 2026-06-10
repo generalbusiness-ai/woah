@@ -14,3 +14,4 @@ coverage/
 test-results/
 playwright-report/
 playwright/.cache/
+node_modules

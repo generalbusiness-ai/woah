@@ -156,6 +156,12 @@ export interface Env {
   // top-level authority slice; the CommitScopeDO rehydrates from its own durable
   // snapshot and a truly-cold scope falls back via E_SNAPSHOT_REQUIRED.
   WOO_V2_SLIM_WARM_ENVELOPE?: string;
+  // B-i: when set, planned-transcript (cross-scope) commit envelopes carry
+  // only the turn's read closure (VTN8.3) instead of the full scope-wide
+  // authority slice (~1.7 MB). The validation contract is unchanged; only the
+  // unread bulk of the slice is withheld. E_SNAPSHOT_REQUIRED cold-scope
+  // escape is preserved.
+  WOO_V2_READ_CLOSURE_ENVELOPE?: string;
   // Fault injection configuration for RPC seam testing (worker/test layer only).
   // JSON array of FaultSpec objects; see src/worker/rpc-fault-inject.ts.
   // Never set in production. Opt-in per test run.
@@ -1810,6 +1816,9 @@ export class PersistentObjectDO {
             }),
           executionCapsuleOpen: envFlag(this.env.WOO_V2_EXECUTION_CAPSULE),
           slimWarmEnvelope: envFlag(this.env.WOO_V2_SLIM_WARM_ENVELOPE),
+          // B-i read-closure envelopes: filter planned-transcript commit authority
+          // to the turn's read closure (VTN8.3). Flag: WOO_V2_READ_CLOSURE_ENVELOPE.
+          readClosureEnvelope: envFlag(this.env.WOO_V2_READ_CLOSURE_ENVELOPE),
           enforceResolutionOwnerRepair: true
         },
         toolManifests: {

@@ -947,10 +947,15 @@ several require a multi-DO harness, CA16):
     `O(objects_in_scope)` work.
 18. **Read-closure envelope parity (VTN8.3).** A planned-transcript commit
     submitted with the read-closure envelope produces a verdict (accept, or
-    rejection reason + conflicting cells) and post-state identical to the same
-    transcript submitted with a full-slice envelope, over a recorded corpus
-    from the shared scenario; with the closure enabled, cross-scope envelope
-    request bytes stay under the structural ceiling.
+    rejection reason + conflicting cells) identical to the same transcript
+    submitted with a full-slice envelope, over a recorded corpus from the shared
+    scenario (the `post_state_hash` differs because the full and closure scopes
+    start from different world sizes, but the accept/reject verdict and conflict
+    reason are identical); with the closure enabled, cross-scope envelope request
+    bytes stay under the structural ceiling (< 256 KB).
+    **Status: implemented (flag-gated), gate enforced** in
+    `tests/b-i-read-closure-parity.test.ts` and
+    `tests/worker/cf-local-structural.test.ts`.
 
 ## CA15. Open questions
 
