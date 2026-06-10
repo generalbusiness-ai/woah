@@ -892,12 +892,26 @@ projection; CA8 fanout). Neither reintroduces a placement-style shared owner.
 - **Cold-owner authority (B-ii).** When `WOO_V2_KV_SEED_AUTHORITY` is set, the
   MCP gateway serves cold-owner authority from a pre-built `HOST_SEED_KV`
   checkpoint (latency ~10–50ms) instead of a live `/__internal/authority-slice`
-  RPC (cold-start penalty ~5s). The KV slice carries `source:"cache"` provenance;
-  commit validation may reject stale cell versions, which retries the turn against
-  a now-warm owner. The owner DO is woken asynchronously (after reply) so
-  subsequent turns pay zero cold-start cost. The turn repair loop in
-  `submitTurnIntent` is bounded by `repairBudgetMs` (MCP gateway: 12 000ms) to
-  prevent indefinite retries when every attempt is under repair.
+  RPC (cold-start penalty ~5s) — but only for reads where `source:"cache"`
+  provenance is acceptable under CA11 precedence. Reads that REQUIRE
+  owner-authoritative data — specifically a `missing_state_repair` authority
+  pass (`forceOwnerRefresh`, triggered by the CA11.2 movement-destination guard
+  or the `enforceResolutionOwnerRepair` contents guard) and any individually
+  owner-required ids (`forceOwnerObjectIds`) — MUST use the live RPC. Serving
+  KV cache for owner-required reads would loop: the guard raises `E_NEED_STATE`,
+  the repair retry fetches KV again, the guard fires again, and the repair
+  exhausts `maxAttempts`. The KV path MUST check `forceOwnerRefresh` and
+  `forceOwnerObjectIds` before deciding to serve cache. For owner-required live
+  RPCs that time out (cold owner), the timeout MUST NOT be silently swallowed:
+  the gateway fires an async DO wake (`state.waitUntil`) and propagates the
+  error so the `repairBudgetMs` check surfaces a clean retryable error, letting
+  the owner warm for the next client retry. For non-owner-required reads, the KV
+  slice carries `source:"cache"` provenance; commit validation may reject stale
+  cell versions, which retries the turn against a now-warm owner. The owner DO is
+  woken asynchronously (after reply) so subsequent turns pay zero cold-start cost.
+  The turn repair loop in `submitTurnIntent` is bounded by `repairBudgetMs`
+  (MCP gateway: 12 000ms) to prevent indefinite retries when every attempt is
+  under repair.
 
 ### CA13.5 Forbidden degradation modes
 
@@ -975,14 +989,20 @@ several require a multi-DO harness, CA16):
     `tests/worker/cf-local-structural.test.ts`.
 19. **Bounded cold-owner authority and repair budget (B-ii).** When the
     `WOO_V2_KV_SEED_AUTHORITY` flag is set, a cold-owner authority-slice RPC is
-    replaced by a KV checkpoint read (~10–50ms) with `source:"cache"` provenance;
-    the owner DO is woken asynchronously (not in-turn). Without a KV checkpoint the
-    live RPC runs as before. The turn repair loop in `submitTurnIntent` respects a
-    `repairBudgetMs` deadline: once `Date.now() - turnStartedAt >= repairBudgetMs`
-    the loop stops and surfaces the last retryable error (MCP gateway sets 12 000ms
-    budget). **Status: implemented (flag-gated), gates enforced** in
+    replaced by a KV checkpoint read (~10–50ms) with `source:"cache"` provenance
+    for reads where cache is acceptable (non-owner-required passes); for
+    owner-required reads (CA11.2 `missing_state_repair` pass and
+    `forceOwnerObjectIds`) the live RPC is used and a cold-owner timeout is
+    propagated (not swallowed) after firing an async DO wake. Without a KV
+    checkpoint the live RPC runs as before. The turn repair loop in
+    `submitTurnIntent` respects a `repairBudgetMs` deadline: once
+    `Date.now() - turnStartedAt >= repairBudgetMs` the loop stops and surfaces
+    the last retryable error (MCP gateway sets 12 000ms budget).
+    **Status: implemented (flag-gated), gates enforced** in
     `tests/worker/rpc-fault-inject.test.ts` (B-ii Gate 1: error fails fast;
-    Gate 2: latency does not affect warm path; Gate 3: budget stops exhausted loop).
+    Gate 2: latency does not affect warm path; Gate 3: budget stops exhausted
+    loop; Gate 4: `WOO_V2_KV_SEED_AUTHORITY` flag is safe in all lanes —
+    `enter` succeeds with flag on, no CA11 provenance loop).
 
 ## CA15. Open questions
 
