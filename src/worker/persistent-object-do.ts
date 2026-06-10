@@ -127,6 +127,7 @@ import {
 } from "../core/projection-delta";
 import { metricErrorFields } from "./metric-errors";
 import { writeMetricToAnalytics, writeConstructorMetricToAnalytics } from "./metrics-sink";
+import { FaultInjector } from "./rpc-fault-inject";
 
 // Re-import WooWorld type. Note `import type` must reach the world module
 // without dragging Node-only deps into the Worker bundle.
@@ -155,6 +156,10 @@ export interface Env {
   // top-level authority slice; the CommitScopeDO rehydrates from its own durable
   // snapshot and a truly-cold scope falls back via E_SNAPSHOT_REQUIRED.
   WOO_V2_SLIM_WARM_ENVELOPE?: string;
+  // Fault injection configuration for RPC seam testing (worker/test layer only).
+  // JSON array of FaultSpec objects; see src/worker/rpc-fault-inject.ts.
+  // Never set in production. Opt-in per test run.
+  WOO_FAULT_INJECT?: string;
   // Workers Analytics Engine binding. The metrics-sink module writes every
   // `MetricEvent` here (modulo sampling) so /admin/stats can query historical
   // counts and latencies without depending on tail-time consumption.
@@ -546,6 +551,10 @@ export class PersistentObjectDO {
   // Set true once a teardown sequence has been scheduled in this DO
   // lifetime so we don't double-fire it from concurrent fetch handlers.
   private teardownScheduled = false;
+  // Lazily-parsed fault injector. Null when WOO_FAULT_INJECT is unset (the
+  // production and default-test case). Only consumed by the three RPC seams
+  // that track-C fault injection targets. See src/worker/rpc-fault-inject.ts.
+  private _faultInjector: FaultInjector | undefined = undefined;
 
   constructor(state: DurableObjectState, env: Env) {
     const constructorStartedAt = Date.now();
@@ -556,6 +565,15 @@ export class PersistentObjectDO {
     const constructorMs = Date.now() - constructorStartedAt;
     console.log("woo.metric", JSON.stringify({ kind: "do_constructor", class: "PersistentObjectDO", ms: constructorMs, ts: Date.now(), host_key: this.durableHostKey() }));
     writeConstructorMetricToAnalytics("PersistentObjectDO", constructorMs, this.durableHostKey(), this.env.METRICS);
+  }
+
+  // Return the lazily-initialised fault injector for this DO instance.
+  // Fast-path: returns a pre-checked no-op immediately when WOO_FAULT_INJECT
+  // is unset (the production case). Parsed once per DO lifetime, not per call.
+  private faultInjector(): FaultInjector {
+    if (this._faultInjector !== undefined) return this._faultInjector;
+    this._faultInjector = FaultInjector.fromEnv(this.env.WOO_FAULT_INJECT);
+    return this._faultInjector;
   }
 
   private migrateGatewayProjectionCache(): void {
@@ -4766,6 +4784,13 @@ export class PersistentObjectDO {
 
   private async v2CommitScopePost<T>(scope: ObjRef, path: "/v2/open" | "/v2/envelope" | "/v2/state-transfer", body: Record<string, unknown>): Promise<T> {
     if (!this.env.COMMIT_SCOPE) throw wooError("E_NOT_IMPLEMENTED", "COMMIT_SCOPE binding is required for v2 turn network");
+    // C1a fault injection: envelope seam (latency / timeout / error pre-call modes).
+    // kill_after_commit is implemented in CommitScopeDO itself (post-durable-save,
+    // pre-response). No-op when WOO_FAULT_INJECT is unset.
+    if (path === "/v2/envelope") {
+      const fi = this.faultInjector();
+      if (!fi.isEmpty()) await fi.applyPreCall("envelope");
+    }
     const id = this.env.COMMIT_SCOPE.idFromName(String(scope));
     const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}${path}`, {
       method: "POST",
@@ -6438,6 +6463,34 @@ export class PersistentObjectDO {
     const timeoutMs = options.timeoutMs ?? this.hostWriteRpcTimeoutMs();
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(wooError("E_TIMEOUT", `cross-host RPC timed out: ${host}${path}`, { host, path, timeout_ms: timeoutMs })), timeoutMs);
+    // C1a fault injection: authority-slice and mcp-commit-fanout seams.
+    // Placed after the AbortController is created so the timeout signal aborts
+    // the mode=timeout fault (which hangs until the signal fires).
+    // No-op when WOO_FAULT_INJECT is unset (production).
+    // kill_after_commit is not applicable to these two seams.
+    const fi = this.faultInjector();
+    if (!fi.isEmpty()) {
+      const faultRoute = path === "/__internal/authority-slice" ? "authority-slice" as const
+        : path === "/__internal/mcp-commit-fanout" ? "mcp-commit-fanout" as const
+        : null;
+      if (faultRoute !== null) {
+        try {
+          await fi.applyPreCall(faultRoute, controller.signal);
+        } catch (faultErr) {
+          clearTimeout(timeout);
+          // latency: resolved (no error); timeout/error: rethrow after metrics.
+          const isAbortTimeout = controller.signal.aborted && (controller.signal.reason as { code?: string } | undefined)?.code === "E_TIMEOUT";
+          this.world?.recordMetric({
+            kind: "cross_host_rpc", route: path, host,
+            ms: Date.now() - startedAt,
+            status: isAbortTimeout ? "timeout" : "error",
+            rpc_id: rpcId,
+            error: "fault_injected"
+          });
+          throw isAbortTimeout ? controller.signal.reason : faultErr;
+        }
+      }
+    }
     let observedQueueMs = 0;
     try {
       const { response, queueMs } = await this.outboundFetch(id, request, controller.signal);
