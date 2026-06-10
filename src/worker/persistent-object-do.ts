@@ -4200,7 +4200,11 @@ export class PersistentObjectDO {
       // MCP shard worlds are sparse transport projections. They can drop the
       // local session row, but WORLD owns the guest object and must run the
       // authoritative guest reset that moves the actor back to $nowhere.
-      world.sessions.delete(sessionId);
+      // Use markSessionClosed (A1) instead of direct sessions.delete so that
+      // the shard's in-memory presence index (sessionSubscribersIndex) is also
+      // cleaned up. Without this, a closed session would linger in the shard's
+      // audience index until the next reap cycle, bloating fanout audience counts.
+      world.markSessionClosed(sessionId);
       await this.forwardInternalChecked<{ ok: true; ended: boolean }>(
         WORLD_HOST,
         "/__internal/end-session",

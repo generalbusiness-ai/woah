@@ -3247,6 +3247,7 @@ export class WooWorld {
   }
 
   private sessionIsLive(session: Session, now = Date.now()): boolean {
+    if (session.closedAt !== undefined) return false;
     if (this.sessionExpired(session, now)) return false;
     if (session.attachedSockets.size > 0) return true;
     return session.lastInputAt >= now - IDLE_PRESENCE_LIVE_WINDOW_MS;
@@ -3375,7 +3376,9 @@ export class WooWorld {
   hasLiveSessions(actor: ObjRef): boolean {
     const now = Date.now();
     for (const session of this.sessions.values()) {
-      if (session.actor === actor && !this.sessionExpired(session, now)) return true;
+      if (session.actor !== actor) continue;
+      if (session.closedAt !== undefined) continue;
+      if (!this.sessionExpired(session, now)) return true;
     }
     return false;
   }
@@ -3385,17 +3388,26 @@ export class WooWorld {
     const now = Date.now();
     const out: Session[] = [];
     for (const session of this.sessions.values()) {
-      if (session.actor === actor && !this.sessionExpired(session, now)) out.push(session);
+      if (session.actor !== actor) continue;
+      if (session.closedAt !== undefined) continue;
+      if (!this.sessionExpired(session, now)) out.push(session);
     }
     out.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
     return out;
   }
 
   primarySessionForActor(actor: ObjRef): Session | null {
+    const now = Date.now();
     let best: Session | null = null;
     for (const session of this.sessions.values()) {
       if (session.actor !== actor) continue;
-      if (this.sessionExpired(session, Date.now())) continue;
+      // Closed sessions (marked by reapSession / markSessionClosed) must never
+      // win the primary election. A closed session object may still be referenced
+      // transiently by async code between the time reapSession marks it and the
+      // time the caller receives the next task tick; filtering here prevents such
+      // a stale reference from becoming primary and causing a physical-move skip.
+      if (session.closedAt !== undefined) continue;
+      if (this.sessionExpired(session, now)) continue;
       if (best === null || session.started < best.started || (session.started === best.started && session.id < best.id)) {
         best = session;
       }
@@ -3407,6 +3419,10 @@ export class WooWorld {
     let best: Session | null = null;
     for (const session of this.sessions.values()) {
       if (session.actor !== actor) continue;
+      // Closed sessions are excluded even from the "including expired" variant
+      // used by the reap-time wasPrimary check, because a just-reaped session
+      // should not be considered primary when deciding whether to promote.
+      if (session.closedAt !== undefined) continue;
       if (best === null || session.started < best.started || (session.started === best.started && session.id < best.id)) {
         best = session;
       }
@@ -3430,6 +3446,9 @@ export class WooWorld {
     const out: ObjRef[] = [];
     for (const session of this.sessions.values()) {
       if (session.actor !== actor) continue;
+      // Skip closed sessions: a session marked closedAt has already had its
+      // presence cleaned up and must not contribute to the location set.
+      if (session.closedAt !== undefined) continue;
       if (!out.includes(session.activeScope)) out.push(session.activeScope);
     }
     if (out.length === 0) {
@@ -3450,6 +3469,7 @@ export class WooWorld {
     const out: ObjRef[] = [];
     for (const session of this.sessions.values()) {
       if (session.actor !== actor) continue;
+      if (session.closedAt !== undefined) continue;
       if (this.sessionExpired(session, now)) continue;
       if (!out.includes(session.activeScope)) out.push(session.activeScope);
     }
@@ -5828,31 +5848,37 @@ export class WooWorld {
       }
       session.activeScope = targetRef;
       this.persistSession(session);
-      const primary = this.primarySessionForActor(actor);
-      const isPrimary = primary?.id === session.id;
       const remoteActorHost = await this.remoteHostForObject(actor, ctx.hostMemo);
-      // Diagnostic: capture whether the primary-session guard fires the
-      // physical-move branch. Bug B (outline:leave server vs client
-      // divergence) shows session.activeScope updating but actor.location
-      // staying at the_outline — that would happen if isPrimary=false here.
+      // A1: every live session that commits a move for its actor executes the
+      // physical move (actor.location write). The pre-CA8 "is_primary" gate was
+      // introduced to prevent secondary sessions from racing to update
+      // actor.location — but CA8 made the session active-scope transition a
+      // first-class transcript effect, decoupling presence (session-keyed) from
+      // containment (actor.location). Concurrent moves from two sessions of the
+      // same actor are serialized by the commit sequencer (actor's location cell
+      // is the commit scope); the second commit will conflict and re-plan at most
+      // once. Removing the gate eliminates the flake where a stale older session
+      // (e.g. loaded from the Directory on a gateway shard) wins the primary
+      // election and causes the current session's move to skip actor.location —
+      // leaving session.activeScope and actor.location diverged, which breaks
+      // the next verb's E_PERM presence check.
       this.recordMetric({
         kind: "moveto_actor",
         actor,
         session_id: session.id,
         from: oldLocation ?? null,
         to: targetRef,
-        is_primary: isPrimary,
-        primary_session_id: primary?.id ?? null,
+        // is_primary is now always true: every session executes its own move.
+        is_primary: true,
+        primary_session_id: this.primarySessionForActor(actor)?.id ?? null,
         remote_actor_host: Boolean(remoteActorHost),
         defer_host_effect: Boolean(ctx.deferHostEffect)
       });
-      if (isPrimary) {
-        if (ctx.deferHostEffect && remoteActorHost) {
-          this.mirrorRemoteMoveLocally(actor, targetRef);
-          ctx.deferHostEffect({ kind: "move_object", obj: actor, target: targetRef, suppress_mirror_host: this.executorContext?.localHost ?? null });
-        } else {
-          await this.moveObjectChecked(actor, targetRef);
-        }
+      if (ctx.deferHostEffect && remoteActorHost) {
+        this.mirrorRemoteMoveLocally(actor, targetRef);
+        ctx.deferHostEffect({ kind: "move_object", obj: actor, target: targetRef, suppress_mirror_host: this.executorContext?.localHost ?? null });
+      } else {
+        await this.moveObjectChecked(actor, targetRef);
       }
       if (await this.spaceLikeOrRemote(targetRef, ctx.hostMemo)) {
         await this.updatePresenceChecked(actor, targetRef, true, ctx);
@@ -8559,6 +8585,12 @@ export class WooWorld {
     if (!session) return;
     const isGuest = this.inheritsFrom(session.actor, "$guest");
     const wasPrimary = this.primarySessionForActorIncludingExpired(session.actor)?.id === sessionId;
+    // Mark the session as closed BEFORE any async-visible side effects. Any
+    // code that holds a reference to this session object (e.g. an async iterator
+    // that was mid-flight when reap fired) will see closedAt set and treat the
+    // session as non-primary, preventing a stale reference from winning a
+    // primarySessionForActor election or driving a physical move.
+    session.closedAt = Date.now();
     session.attachedSockets.clear();
     this.killReadTasksFor(session.actor);
     this.removeSessionPresence(sessionId, session.actor);
@@ -8569,6 +8601,25 @@ export class WooWorld {
     this.deletePersistedSession(sessionId);
     if (wasPrimary && !isGuest) this.promoteActorPrimaryLocation(session.actor);
     if (isGuest) this.resetGuestOnDisconnect(session.actor);
+  }
+
+  /** Mark a session as closed in-memory without triggering the full reap chain.
+   * Used by sparse shard worlds (MCP gateway shards) that need to invalidate a
+   * session from their local world.sessions map without running the world-host
+   * reap logic (guest reset, primary promotion). The full reap is forwarded to
+   * the world host; this call just makes the local session invisible to
+   * primarySessionForActor and other liveness queries immediately, and also
+   * cleans up any presence rows the shard may have indexed. */
+  markSessionClosed(sessionId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    // Clean up presence index so the shard's audience queries don't include
+    // this session after close. On the world host, reapSession handles this;
+    // on sparse shards, this is the only cleanup that runs locally.
+    this.removeSessionPresence(sessionId, session.actor);
+    session.closedAt = Date.now();
+    session.attachedSockets.clear();
+    this.sessions.delete(sessionId);
   }
 
   private promoteActorPrimaryLocation(actor: ObjRef): void {

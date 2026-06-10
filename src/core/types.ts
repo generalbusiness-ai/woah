@@ -573,6 +573,13 @@ export type Session = {
    * "apikey". Lets revokeApiKey close live sessions whose credential was
    * just revoked, instead of leaving them usable until expiry. */
   apikeyId?: string;
+  /** Wall-clock ms when this session was explicitly closed by reapSession.
+   * In-memory only — not persisted, because a closed session is deleted from
+   * storage immediately. Set before the session is removed from world.sessions
+   * so that any async code holding a reference to the session object can detect
+   * closure and skip it. A session with this field set must NEVER win a
+   * primarySessionForActor election or execute a physical move. */
+  closedAt?: number;
 };
 
 export type CompileDiagnostic = {

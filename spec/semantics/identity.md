@@ -131,10 +131,24 @@ Operators may override per world via `$server_options.session_*`.
 
 While at least one live connection is attached, the session is not reaped for ordinary timeout. When no live connections are attached and either `session.last_detach_at + grace < now` or `now > session.expires_at`, the runtime reaps:
 
-1. Kill any `READ` tasks for this actor (`E_INTRPT`).
-2. Remove this session from every space's `session_subscribers` list. The runtime derives the `space.subscribers` actor set from remaining live session entries. In hosted deployments, the actor and space can live on different hosts; if a remote subscriber cleanup fails, later authoritative reads of the space audience may confirm stale entries and lazily remove them.
-3. Call `actor:on_disfunc()` if defined. This is where guest reset happens (§I6.4). Errors are caught and logged; reap continues.
-4. Delete the session record.
+1. Mark the session as **closed** (`session.closedAt = now`) before any other side
+   effects. This in-memory marker prevents any code that holds a reference to the
+   session object from treating it as primary or executing a physical move on its
+   behalf after reap begins. The marker is never persisted (the session is deleted
+   from storage in step 4), but it guards against the window between the start of
+   reap and the in-memory deletion.
+2. Kill any `READ` tasks for this actor (`E_INTRPT`).
+3. Remove this session from every space's `session_subscribers` list. The runtime derives the `space.subscribers` actor set from remaining live session entries. In hosted deployments, the actor and space can live on different hosts; if a remote subscriber cleanup fails, later authoritative reads of the space audience may confirm stale entries and lazily remove them.
+4. Call `actor:on_disfunc()` if defined. This is where guest reset happens (§I6.4). Errors are caught and logged; reap continues.
+5. Delete the session record.
+
+**Sparse-shard close path.** MCP gateway shards hold sparse transport-projection
+worlds. When a session closes on a shard that is not the world host, the shard
+calls `markSessionClosed` (which performs steps 1 and 3 above and removes the
+session from the shard's in-memory map) and then forwards the close to the world
+host. The world host runs the full reap chain (steps 1–5 above). The Directory
+receives an `unregister-session` call from whichever host processes the close;
+if the call fails, the Directory row expires on its normal TTL.
 
 After reap, the *actor* may persist or not depending on its class:
 
@@ -165,6 +179,39 @@ verb $guest:on_disfunc() {
 This is the LambdaCore `@disfunc` pattern under a clearer name. Guest inventory is ejected before the guest is moved home: an item with its own valid `home` returns there, otherwise it falls back to the disconnect room, then the guest's home. The guest `home` property is conventionally `$nowhere` (a seeded `$thing`; see [bootstrap.md §B6](bootstrap.md#b6-demo-instances)); operators may override per-guest if they want named lounges.
 
 The disfunc runs with `progr = this.owner` (typically `$wiz`), so it has authority to reset state regardless of what permission flips occurred during the session.
+
+---
+
+## I6.5 Primary session and actor.location (multi-session actors)
+
+An actor may have more than one live session simultaneously (e.g. two browser
+tabs using distinct `session:` tokens). Each session maintains its own
+`active_scope` field (the session's command focus / presence location). The
+actor's **physical location** (`actor.location` in the object model) is the
+containment truth for things like `look` and inventory; it is distinct from
+any session's `active_scope`.
+
+**Move semantics (A1, CA8).** When a session's actor performs a `moveto`,
+the executing session drives *both* the physical location write and the
+session active-scope transition. The active-scope transition is recorded as
+a first-class transcript effect (`TranscriptSessionScopeTransition`, CA8),
+which every materializer uses to repair presence projections and session rows.
+The physical location write (`actor.location`) is committed via the actor's
+own location cell scope.
+
+Prior to CA8, only the "primary" session (oldest non-expired) drove the
+physical location write; secondary sessions updated `active_scope` only. This
+distinction is no longer needed: CA8 decouples presence (session-keyed) from
+containment (actor.location), and concurrent moves from two sessions of the
+same actor are serialized by the commit sequencer. The "is_primary" gate on
+the physical move is removed.
+
+**`primary_session(actor)` builtin.** Returns the oldest non-expired,
+non-closed live session for the actor, or `null`. Used by catalog code that
+needs to resolve the actor's "canonical" presence location when no session
+context is available. A closed session (one whose `closedAt` is set) is
+excluded from the election. This builtin is for catalog convenience; it is
+not a correctness gate for moves.
 
 ---
 
