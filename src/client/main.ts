@@ -698,7 +698,16 @@ function receiveDirectResultFrame(frame: any) {
     receiveLiveEvent(observation);
   }
   applyScopedMoveResult(frame.result);
-  if (typeof frame.id === "string") ui.completeOptimisticCall(frame.id);
+  if (typeof frame.id === "string") {
+    ui.completeOptimisticCall(frame.id);
+    // Test-observable marker (D3a): direct results (live verbs, or CF fallback
+    // paths that skip optimistic execution) are committed renders — fire
+    // woo.v2.render_frame(committed=true) so the ordering spec can observe them
+    // alongside the applied_frame path. This covers the CF-without-holder case.
+    window.dispatchEvent(new CustomEvent("woo.v2.render_frame", {
+      detail: { id: frame.id, verb: frame.command?.verb ?? "", committed: true, t: performance.now() }
+    }));
+  }
   if (handler) {
     pendingDirect.delete(frame.id);
     if (typeof frame.id === "string") pendingCommands.delete(frame.id);
@@ -720,8 +729,20 @@ function receiveOptimisticResultFrame(frame: any) {
   // results so controls can advance against the local tentative journal, but
   // they MUST NOT fire the pendingDirect/onResult handler: those callbacks gate
   // committed side effects such as refreshes and external hydration.
+  //
+  // Test-observable marker (D3a): fire "woo.v2.render_frame" with committed=false
+  // so Playwright assertions can detect optimistic-before-committed ordering
+  // without instrumenting browser-worker internals. Production-safe: zero behavior
+  // change, one lightweight CustomEvent per optimistic frame. Emitted here (at the
+  // ui.applyOptimisticFrame call site) so the timing is tight to the actual UI
+  // update, not the message receipt.
   const observations = frame.observations ?? [];
-  if (typeof frame.id === "string") ui.applyOptimisticFrame(frame.id, frame);
+  if (typeof frame.id === "string") {
+    ui.applyOptimisticFrame(frame.id, frame);
+    window.dispatchEvent(new CustomEvent("woo.v2.render_frame", {
+      detail: { id: frame.id, verb: frame.command?.verb ?? "", committed: false, t: performance.now() }
+    }));
+  }
   // Tag chat lines pushed from optimistic observations with the turn id so
   // the authoritative reply (receiveAppliedFrame for durable verbs,
   // receiveDirectResultFrame for live verbs) can clear them before pushing
@@ -801,6 +822,16 @@ function receiveAppliedFrame(frame: any) {
   completeV2TurnNetworkWait(frame.id);
   if (typeof frame.id === "string") clearProvisionalChatForTurn(frame.id, false);
   ui.ingestAppliedFrame(frame);
+  // Test-observable marker (D3a): fire "woo.v2.render_frame" with committed=true
+  // to complement the optimistic marker in receiveOptimisticResultFrame. Together
+  // they let e2e assertions verify the ordering invariant: optimistic render
+  // (committed=false) must precede the applied-frame render (committed=true) for
+  // the same turn id when browser-projection-holder is enabled.
+  if (typeof frame.id === "string") {
+    window.dispatchEvent(new CustomEvent("woo.v2.render_frame", {
+      detail: { id: frame.id, verb: frame.message?.verb ?? "", committed: true, t: performance.now() }
+    }));
+  }
   applyScopedMoveResult(frame.result);
   const needsScopedDeferredLook = frame.result
     && typeof frame.result === "object"
