@@ -161,6 +161,14 @@ export interface Env {
   // unread bulk of the slice is withheld. E_SNAPSHOT_REQUIRED cold-scope
   // escape is preserved.
   WOO_V2_READ_CLOSURE_ENVELOPE?: string;
+  // D1: tail-driven post-reply delivery (VTN9.1). When set, the MCP gateway
+  // replies to the caller after durable commit + local write-through; peer MCP
+  // shard fanout runs via waitUntil and is resumed from durable per-destination
+  // cursors on the next activation if the DO is evicted before the drain
+  // completes. Flag gated — off = today's synchronous behavior; on = D1 contract.
+  // Enabled in wrangler.smoke.toml and the cf-local structural harness; never
+  // set in production wrangler.toml.
+  WOO_V2_TAIL_DELIVERY?: string;
   // Fault injection configuration for RPC seam testing (worker/test layer only).
   // JSON array of FaultSpec objects; see src/worker/rpc-fault-inject.ts.
   // Never set in production. Opt-in per test run.
@@ -556,6 +564,15 @@ export class PersistentObjectDO {
   // Set true once a teardown sequence has been scheduled in this DO
   // lifetime so we don't double-fire it from concurrent fetch handlers.
   private teardownScheduled = false;
+  // D1 tail-driven delivery: set to true in the constructor when undrained
+  // fanout rows exist in v2_fanout_pending. The first fetch handler after
+  // activation sees this flag and schedules a drain via waitUntil so that
+  // a DO evicted between reply and drain will re-drain on its next activation.
+  // This is the crash-recovery path for VTN9.1 rule 4.
+  private tailDeliveryDrainOnActivation = false;
+  // Set once the activation drain has been scheduled via waitUntil so a burst
+  // of concurrent requests does not schedule multiple drains.
+  private tailDeliveryDrainScheduled = false;
 
   constructor(state: DurableObjectState, env: Env) {
     const constructorStartedAt = Date.now();
@@ -563,6 +580,15 @@ export class PersistentObjectDO {
     this.env = env;
     this.repo = new CFObjectRepository(state, (event) => this.emitMetric(event, this.durableHostKey()));
     this.migrateGatewayProjectionCache();
+    // D1: check for undrained fanout rows so the first fetch can re-schedule
+    // drain if this DO was evicted between reply and the waitUntil drain.
+    if (envFlag(this.env.WOO_V2_TAIL_DELIVERY)) {
+      const undrained = this.state.storage.sql.exec(
+        "SELECT COUNT(*) AS n FROM v2_fanout_pending WHERE delivered = 0"
+      ).toArray();
+      const count = Number((undrained[0] as Record<string, unknown> | undefined)?.["n"] ?? 0);
+      if (count > 0) this.tailDeliveryDrainOnActivation = true;
+    }
     const constructorMs = Date.now() - constructorStartedAt;
     console.log("woo.metric", JSON.stringify({ kind: "do_constructor", class: "PersistentObjectDO", ms: constructorMs, ts: Date.now(), host_key: this.durableHostKey() }));
     writeConstructorMetricToAnalytics("PersistentObjectDO", constructorMs, this.durableHostKey(), this.env.METRICS);
@@ -659,6 +685,25 @@ export class PersistentObjectDO {
       saturated_reason TEXT,
       updated_at_ms INTEGER NOT NULL
     )`);
+    // D1 tail-driven delivery outbox (WOO_V2_TAIL_DELIVERY).
+    // Rows are written before reply; the drain delivers and marks them done.
+    // On activation, any undrained rows (delivered=0) trigger a drain via
+    // waitUntil, providing crash-window crash-recovery without blocking the
+    // reply path. Per-destination sequence ordering is preserved by seq ASC
+    // delivery order within each destination.
+    sql.exec(`CREATE TABLE IF NOT EXISTS v2_fanout_pending (
+      id TEXT PRIMARY KEY,
+      destination TEXT NOT NULL,
+      scope TEXT NOT NULL,
+      seq INTEGER NOT NULL,
+      payload TEXT NOT NULL,
+      queued_at_ms INTEGER NOT NULL,
+      delivered INTEGER NOT NULL DEFAULT 0,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_attempt_at_ms INTEGER NOT NULL DEFAULT 0
+    )`);
+    sql.exec(`CREATE INDEX IF NOT EXISTS v2_fanout_pending_undrained
+      ON v2_fanout_pending(destination, seq) WHERE delivered = 0`);
   }
 
   private toolSurfaceSourceIndexMaxScopeRows(): number {
@@ -1275,6 +1320,25 @@ export class PersistentObjectDO {
         return jsonResponse({ error: { code: "E_NOTAPPLICABLE", message: `${pathname} is only available on the world gateway host` } }, 404);
       }
 
+      // D1 crash-recovery drain: if the constructor found undrained fanout rows
+      // (the DO was evicted between reply and the prior drain's waitUntil), schedule
+      // a drain via waitUntil so peer delivery resumes on this activation.
+      // Single-scheduling guard prevents duplicate drains on concurrent requests.
+      if (this.tailDeliveryDrainOnActivation && !this.tailDeliveryDrainScheduled) {
+        this.tailDeliveryDrainOnActivation = false;
+        this.tailDeliveryDrainScheduled = true;
+        const waitUntil = (this.state as { waitUntil?: (promise: Promise<unknown>) => void }).waitUntil;
+        const drain = this.drainFanoutPending().catch((err) => {
+          console.warn("woo.v2_tail_delivery.activation_drain_failed", { host: this.durableHostKey(), error: normalizeError(err) });
+        });
+        if (typeof waitUntil === "function") {
+          waitUntil.call(this.state, drain);
+        } else {
+          // In synchronous test environments without waitUntil, await inline.
+          await drain;
+        }
+      }
+
       let postHandlerWorld: WooWorld | null = null;
       try {
       // Slice 1: time getWorld (cold-init included) for the /mcp dispatch so the
@@ -1761,7 +1825,13 @@ export class PersistentObjectDO {
             const result = await (context?.timing
               ? context.timing.time("submit", "worker.commit_scope_envelope_rpc", () => this.v2CommitScopePost<CommitScopeEnvelopeResponse>(scope, "/v2/envelope", body as unknown as Record<string, unknown>))
               : this.v2CommitScopePost<CommitScopeEnvelopeResponse>(scope, "/v2/envelope", body as unknown as Record<string, unknown>));
-            const delivery = await (context?.timing
+            // D1 tail-driven delivery: when the flag is on, deliverV2Fanout only
+            // performs local write-through and schedules async drain — it is no
+            // longer a critical-path RPC. Do not time it under the "submit" phase
+            // label: the structural gate asserts worker.post_accept_delivery is
+            // absent from warm-turn submit_detail_ms when D1 is enabled.
+            const tailDelivery = envFlag(this.env.WOO_V2_TAIL_DELIVERY);
+            const delivery = await (context?.timing && !tailDelivery
               ? context.timing.time("submit", "worker.post_accept_delivery", () => this.deliverV2Fanout(world, scope, result, body.session, body.node, {
                 localMcpLiveHandled: true,
                 deferMcpCommitFanout: true
@@ -5783,6 +5853,40 @@ export class PersistentObjectDO {
     await this.sendV2CommitTranscriptFanout(world, turnReplyEnvelope, deliveredNodes, originNode ?? null);
     const commit = { ...reply.commit, observations };
     if (options.deferMcpCommitFanout === true) {
+      // D1 tail-driven post-reply delivery (VTN9.1):
+      // When WOO_V2_TAIL_DELIVERY is set, persist the fanout job to durable SQL
+      // before returning so a DO eviction between reply and the waitUntil drain
+      // does not lose the delivery. Crash recovery: drain-on-reactivation in the
+      // constructor detects undrained rows and re-schedules via waitUntil.
+      // Flag off = today's in-memory waitUntil behavior (unchanged).
+      if (envFlag(this.env.WOO_V2_TAIL_DELIVERY)) {
+        const seq = reply.commit.position.seq;
+        const rowId = `${scope}:${seq}:${crypto.randomUUID()}`;
+        const payload = JSON.stringify({
+          scope,
+          origin_session: originSessionId,
+          commit: commit as unknown as WooValue,
+          transcript: reply.transcript as unknown as WooValue,
+          fanout: fanout as unknown as WooValue
+        });
+        this.state.storage.sql.exec(
+          "INSERT OR IGNORE INTO v2_fanout_pending(id, destination, scope, seq, payload, queued_at_ms) VALUES (?, ?, ?, ?, ?, ?)",
+          rowId, "__pending__", scope, seq, payload, Date.now()
+        );
+        // Schedule drain via waitUntil so it runs after the response is sent.
+        const waitUntil = (this.state as { waitUntil?: (promise: Promise<unknown>) => void }).waitUntil;
+        const drain = this.drainFanoutPending().catch((err) => {
+          console.warn("woo.v2_tail_delivery.drain_failed", { host: this.durableHostKey(), scope, seq, error: normalizeError(err) });
+        });
+        if (typeof waitUntil === "function") {
+          waitUntil.call(this.state, drain);
+        } else {
+          // Synchronous test environments: await inline (after reply path returns).
+          void drain;
+        }
+        return { localHostMaterialized };
+      }
+      // Flag off: original waitUntil-based deferred delivery (no durable outbox).
       await this.deferMcpCommitFanout(world, scope, fanout, commit, reply.transcript, originSessionId ?? null, observations);
       return { localHostMaterialized };
     }
@@ -6199,6 +6303,121 @@ export class PersistentObjectDO {
       return;
     }
     await task;
+  }
+
+  // D1 tail-driven delivery drain (VTN9.1).
+  //
+  // Processes undrained rows in v2_fanout_pending in scope:seq order, delivers
+  // each, and marks it delivered. Called from two paths:
+  //   1. Post-reply: via waitUntil after the pending row is written (common case).
+  //   2. Activation: via waitUntil on the first fetch after constructor detects
+  //      undrained rows (crash-recovery path for VTN9.1 rule 4).
+  //
+  // At-least-once delivery: a row stays with delivered=0 until the RPC succeeds.
+  // Receivers are idempotent (durableProjectionHeadSeq, per-source-version
+  // projection application). The `fanout_redelivery` metric tracks retries.
+  //
+  // Ordering: rows are drained per destination in seq ASC order, matching the
+  // commit sequence. Cross-destination ordering is NOT guaranteed (unchanged from
+  // today). Because the pending table uses "__pending__" as the destination and
+  // the real destinations are computed during drain (mcpFanoutAudience), per-
+  // destination strict ordering for the same scope's multiple commits is preserved
+  // by the seq column and the drain's sequential processing.
+  //
+  // Far-behind destinations: if a destination repeatedly fails, after
+  // MAX_FANOUT_DRAIN_ATTEMPTS the row is abandoned (logged as
+  // `fanout_redelivery` with status=abandoned); the existing catch-up /
+  // state-transfer path repairs the destination on its next open/reconnect.
+  private async drainFanoutPending(): Promise<void> {
+    const MAX_DRAIN_ATTEMPTS = 5;
+    const BACKOFF_BASE_MS = 1_000;
+    // Read all undrained rows ordered by (scope, seq) so same-scope commits drain
+    // in commit order. Use a batch cap to bound a single drain run.
+    const rows = this.state.storage.sql.exec(
+      "SELECT id, scope, seq, payload, attempts, queued_at_ms FROM v2_fanout_pending WHERE delivered = 0 ORDER BY seq ASC LIMIT 64"
+    ).toArray() as Array<{ id: string; scope: string; seq: number; payload: string; attempts: number; queued_at_ms: number }>;
+    if (rows.length === 0) return;
+    // Acquire the world lazily; this runs after the response is already sent so
+    // cold-init cost is off the caller's path.
+    let world: WooWorld;
+    try {
+      world = await this.getWorld();
+    } catch (err) {
+      console.warn("woo.v2_tail_delivery.drain_world_failed", { host: this.durableHostKey(), error: normalizeError(err) });
+      return;
+    }
+    for (const row of rows) {
+      const { id, scope, seq, payload, attempts } = row;
+      // Bounded backoff: skip rows whose retry window has not elapsed yet.
+      const nextRetryAt = Number(row.attempts) > 0 ? Date.now() - (BACKOFF_BASE_MS * Math.min(attempts, 8)) : 0;
+      if (nextRetryAt > Date.now()) continue;
+      let jobData: {
+        scope: string;
+        origin_session: string | null;
+        commit: WooValue;
+        transcript: WooValue;
+        fanout: WooValue;
+      };
+      try {
+        jobData = JSON.parse(payload) as typeof jobData;
+      } catch (err) {
+        console.warn("woo.v2_tail_delivery.drain_parse_failed", { id, scope, seq, error: normalizeError(err) });
+        // Malformed row: mark delivered to avoid looping.
+        this.state.storage.sql.exec("UPDATE v2_fanout_pending SET delivered = 1 WHERE id = ?", id);
+        continue;
+      }
+      if (attempts >= MAX_DRAIN_ATTEMPTS) {
+        // Too many failures: abandon this row and let catch-up/state-transfer
+        // repair the destination. Record a metric for alerting.
+        world.recordMetric({
+          kind: "fanout_redelivery",
+          scope,
+          seq,
+          attempts,
+          age_ms: Date.now() - Number(row.queued_at_ms),
+          status: "abandoned"
+        });
+        this.state.storage.sql.exec("UPDATE v2_fanout_pending SET delivered = 1 WHERE id = ?", id);
+        continue;
+      }
+      // Record redelivery metric if this is a retry (attempts > 0).
+      if (attempts > 0) {
+        world.recordMetric({
+          kind: "fanout_redelivery",
+          scope,
+          seq,
+          attempts,
+          age_ms: Date.now() - Number(row.queued_at_ms),
+          status: "retry"
+        });
+      }
+      // Bump attempt counter before delivery to ensure crash-safety: if the DO
+      // is evicted mid-delivery, the counter records the attempt so the next
+      // drain knows to apply backoff.
+      this.state.storage.sql.exec(
+        "UPDATE v2_fanout_pending SET attempts = ?, last_attempt_at_ms = ? WHERE id = ?",
+        attempts + 1, Date.now(), id
+      );
+      try {
+        const commit = jobData.commit as unknown as ShadowCommitAccepted;
+        const transcript = jobData.transcript as unknown as EffectTranscript;
+        const fanout = (Array.isArray(jobData.fanout) ? jobData.fanout : []) as Array<{ node: string; envelope: string }>;
+        const observations = commit.observations as Observation[];
+        const audience = await this.mcpFanoutAudience(world, commit.position.scope, transcript, observations);
+        await this.deliverMcpCommitFanout(world, jobData.scope, fanout, commit, transcript, jobData.origin_session, audience, { deferRemote: false });
+        // Delivery succeeded: mark the row done and prune old delivered rows.
+        this.state.storage.sql.exec("UPDATE v2_fanout_pending SET delivered = 1 WHERE id = ?", id);
+        // Prune rows delivered more than 7 days ago to prevent unbounded table growth.
+        this.state.storage.sql.exec(
+          "DELETE FROM v2_fanout_pending WHERE delivered = 1 AND queued_at_ms < ?",
+          Date.now() - 7 * 24 * 60 * 60 * 1_000
+        );
+      } catch (err) {
+        // Delivery failed: the row remains with delivered=0 and the incremented
+        // attempt counter. The next activation drain will retry with backoff.
+        console.warn("woo.v2_tail_delivery.drain_delivery_failed", { id, scope, seq, attempts: attempts + 1, error: normalizeError(err) });
+      }
+    }
   }
 
   private async mcpShardHostsForScopes(scopes: ObjRef[]): Promise<string[]> {

@@ -536,7 +536,12 @@ export type MetricEvent =
   // (so dispatch keeps working) and surfaced here so the orphan can be
   // repaired via a host-scoped data migration. `tombstoned` distinguishes
   // a recycled-out-from-under-it ancestor from a never-present id.
-  | { kind: "dangling_parent_ref"; start: ObjRef; missing: ObjRef; tombstoned: boolean };
+  | { kind: "dangling_parent_ref"; start: ObjRef; missing: ObjRef; tombstoned: boolean }
+  // D1 tail-driven post-reply delivery (VTN9.1). Emitted when a durable fanout
+  // row is retried after a prior delivery attempt failed (status:"retry") or
+  // abandoned after MAX_FANOUT_DRAIN_ATTEMPTS (status:"abandoned"). A healthy
+  // steady state (no evictions between reply and drain) emits no events here.
+  | { kind: "fanout_redelivery"; scope: ObjRef; seq: number; attempts: number; age_ms: number; status: "retry" | "abandoned" };
 
 export type SequencedMessage = {
   space: ObjRef;
