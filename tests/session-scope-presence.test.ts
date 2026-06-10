@@ -105,4 +105,22 @@ describe("session-scope presence (CA8)", () => {
 
     await expect(world.presentActorsIn({} as any, "the_chatroom")).resolves.not.toContain(stale.actor);
   });
+
+  it("delivery audiences ignore stale local projection rows after a session moves away", async () => {
+    const world = createWorld();
+    const watcher = world.auth("guest:ssp-stale-delivery");
+    const session = world.sessions.get(watcher.id)!;
+    session.activeScope = "the_chatroom";
+    world.setProp("the_deck", "session_subscribers", [
+      { session: watcher.id, actor: watcher.actor }
+    ] as unknown as WooValue);
+    world.setProp("the_deck", "subscribers", [watcher.actor] as unknown as WooValue);
+
+    const audiences = await world.computeDirectLiveAudiences("the_deck", [
+      { type: "entered", source: "the_deck", actor: "guest_other", room: "the_deck" } as any
+    ]);
+
+    expect(audiences.observationAudiences?.[0]).not.toContain(watcher.actor);
+    expect(audiences.observationSessionAudiences?.[0]).not.toContain(watcher.id);
+  });
 });

@@ -162,7 +162,9 @@ describe("shadow browser node shim", () => {
     expect(transfer.preimages).toContain("read:cell:verb:the_chatroom:take");
     expect(transfer.preimages).not.toContain("read:cell:verb:$actor:title");
     expect(browserOpenSeedDispatchVerbNames()).toContain("command_plan");
-    expect(browserOpenSeedCommandSurfacePropertyNames()).toEqual(["aliases", "description", "name"]);
+    // "text" is included because catalog classes with match_names may read this.text
+    // (see native-primitive-contract.ts plan_command.open_seed.object_property_names).
+    expect(browserOpenSeedCommandSurfacePropertyNames()).toEqual(["aliases", "description", "name", "text"]);
     expect(browserOpenSeedCommandSurfaceVerbLookupNames()).toEqual(["match_names"]);
     expect(browserOpenSeedVerbLookups()).toEqual(expect.arrayContaining([
       expect.objectContaining({ receiver: "scope", names: expect.arrayContaining(["command_plan"]) }),

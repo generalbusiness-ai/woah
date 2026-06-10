@@ -9038,16 +9038,48 @@ export class WooWorld {
     return { sessions, actors: Array.from(actors) };
   }
 
+  private objectIsLocallyOwned(objRef: ObjRef): boolean {
+    const local = this.executorContext?.localHost;
+    if (!local) return true;
+    return this.hostKeyForObject(objRef) === local;
+  }
+
+  private projectedDeliveryAudienceIn(space: ObjRef): { sessions: string[]; actors: ObjRef[] } {
+    const sessionMap = this.presenceSessionsIn(space);
+    if (!sessionMap) return { sessions: [], actors: [] };
+    const now = Date.now();
+    const sessions: string[] = [];
+    const actors = new Set<ObjRef>();
+    for (const [sessionId, actor] of sessionMap) {
+      if (sessionId.startsWith("legacy:")) continue;
+      const session = this.sessions.get(sessionId);
+      if (session) {
+        if (session.actor !== actor || session.activeScope !== space || !this.sessionIsLive(session, now)) continue;
+        sessions.push(sessionId);
+        actors.add(actor);
+        continue;
+      }
+      // A missing row for a locally owned actor is stale. A missing row for a
+      // remote actor is still useful on a room/tool host that only materialized
+      // the projected presence cell; the owning actor/session host remains the
+      // source of truth for delivery.
+      if (this.objectIsLocallyOwned(actor)) continue;
+      sessions.push(sessionId);
+      actors.add(actor);
+    }
+    return { sessions, actors: Array.from(actors) };
+  }
+
   private liveAudienceActors(space: ObjRef): ObjRef[] | undefined {
     // CA8: prefer the session/audience table (activeScope), unioned with the
-    // durable presence projection for back-compat. The projection alone misses
-    // a session that was born in this room without ever running an enter turn.
+    // durable presence projection for remote sessions. Local projection rows are
+    // only delivery-eligible when their live session is still active here; stale
+    // rows must not route destination-room observations to actors who have
+    // already moved back out.
     const tableActors = this.sessionTableAudienceIn(space).actors;
     const rawSessionSubscribers = this.propOrNull(space, "session_subscribers");
     if (Array.isArray(rawSessionSubscribers)) {
-      const sessions = this.presenceSessionsIn(space);
-      const projected = sessions ? Array.from(sessions.values()) : [];
-      return Array.from(new Set([...tableActors, ...projected]));
+      return Array.from(new Set([...tableActors, ...this.projectedDeliveryAudienceIn(space).actors]));
     }
     const rawLegacySubscribers = this.propOrNull(space, "subscribers");
     if (!Array.isArray(rawLegacySubscribers)) return tableActors.length > 0 ? tableActors : undefined;
@@ -9086,13 +9118,12 @@ export class WooWorld {
   }
 
   private appliedFrameAudience(space: ObjRef, observations: Observation[]): { audienceSessions?: string[]; observationSessionAudiences?: string[][] } {
-    // CA8: union the session/audience table (activeScope) with the durable
-    // presence projection, matching the direct-observation path. A session born
-    // in this room with no enter turn is only in the session table, so a
-    // projection-only audience would silently drop it from sequenced frames.
+    // CA8: union the session/audience table (activeScope) with live remote
+    // delivery projections, matching the direct-observation path. Local stale
+    // projection rows are excluded so accepted-frame fanout cannot deliver a
+    // destination-room event to a session that already moved away.
     const sessionSet = new Set<string>(this.sessionTableAudienceIn(space).sessions);
-    const sessionMap = this.presenceSessionsIn(space);
-    if (sessionMap) for (const sessionId of sessionMap.keys()) sessionSet.add(sessionId);
+    for (const sessionId of this.projectedDeliveryAudienceIn(space).sessions) sessionSet.add(sessionId);
     const sessions = Array.from(sessionSet);
     return {
       audienceSessions: sessions.length > 0 ? sessions : undefined,
@@ -9146,20 +9177,19 @@ export class WooWorld {
     const sessionMap = audience ? this.presenceSessionsIn(audience) : null;
     if (sessionMap || (audience && this.objects.has(audience) && this.isSpaceLike(audience))) {
       const sessions = new Set<string>();
-      const now = Date.now();
       // CA8: the session/audience table (activeScope) is the authoritative live
       // routing source — it includes a session born in this room with no enter
-      // turn. Union with the durable presence projection for back-compat.
+      // turn. Union with delivery-eligible remote projections, but never with
+      // stale local projection rows whose session already moved elsewhere.
       if (audience) {
         for (const sessionId of this.sessionTableAudienceIn(audience).sessions) {
           const session = this.sessions.get(sessionId);
           if (session && actorSet.has(session.actor)) sessions.add(sessionId);
         }
       }
-      for (const [sessionId, actor] of sessionMap ?? []) {
-        const session = this.sessions.get(sessionId);
-        if (!session || session.actor !== actor || !this.sessionIsLive(session, now)) continue;
-        if (actorSet.has(actor)) sessions.add(sessionId);
+      if (audience) for (const sessionId of this.projectedDeliveryAudienceIn(audience).sessions) {
+        const actor = sessionMap?.get(sessionId);
+        if (actor && actorSet.has(actor)) sessions.add(sessionId);
       }
       return Array.from(sessions);
     }

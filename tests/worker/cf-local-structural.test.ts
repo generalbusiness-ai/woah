@@ -316,6 +316,12 @@ describe("CF-local prod-shape structural probes", () => {
   // (one shard per live session) which is CORRECT — so the two-actor scenario must
   // use a relaxed maxScoped budget for say turns. We separate the enforced gate on
   // movement turns (single-session fanout) from the same-scope say turn.
+  //
+  // A2 gate (carry path): After A2 (mergeIncomingObjectLineageClosure), a
+  // $note/$portable object carried across a scope boundary MUST NOT emit
+  // dangling_parent_ref. We add a take → cross-scope move → drop sequence so this
+  // test exercises the carry path and the dangling gate covers it. The dangling
+  // assertion below counts ALL metric events (setup + movement + carry + say).
   it("C2: measures cross-scope envelope bytes, dangling refs, RPC counts, and sessions (enforced + tracked gates)", async () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const harness = createStructuralHarness();
@@ -352,13 +358,52 @@ describe("CF-local prod-shape structural probes", () => {
       const measuredMovementMetrics = metricsFromLogSpy(logSpy);
       logSpy.mockClear();
 
+      // A2 carry phase: take the mug ($note/$portable) from the_chatroom, carry it
+      // across the southeast boundary to the_deck, invoke `read` on the mug (a
+      // direct_callable verb on $note — this is the A2 gate: the deck relay must
+      // have the mug's class lineage to resolve the verb), then drop it and walk
+      // back to restore state.
+      //
+      // Why direct_callable `read` rather than `drop`:
+      // The `drop` verb is on $room, not the mug; it searches alice's inventory via
+      // `match_object("mug", actor)`. In the fake lane the deck relay's planning
+      // snapshot does not include the mug's live state (location = alice) because the
+      // take committed at the chatroom scope and was never propagated as a live-state
+      // update to the deck relay — only the A2 lineage pages are propagated by
+      // mergeIncomingObjectLineageClosure. The deck relay therefore sees alice's
+      // contents as empty, causing `match_object` to return $failed_match.
+      // `the_mug:read []` is `direct_callable` so the gateway routes it to the mug's
+      // object directly without room-scope inventory resolution; the verb dispatch
+      // walks $note → $portable → $thing → $root, which is exactly the chain that
+      // dangling_parent_ref would have blocked before A2.
+      //
+      // In the fake lane (single shared world image) the relay gap that causes
+      // dangling_parent_ref in cf-dev is collapsed. The fake gate confirms:
+      // (1) the A2 code path (mergeIncomingObjectLineageClosure) executes without
+      //     introducing repair loops, rejections, or dangling refs, and
+      // (2) the mug remains verb-dispatchable from the deck after a carry+read.
+      // The cf-dev gate (carry-across-rooms, formerly TRACKED → A2, now removed from
+      // CF_DEV_TRACKED_FAIL_STEPS) confirms the distributed behavior.
+      await callTool(harness, sessionA, 13, "woo_call", { object: "the_chatroom", verb: "take", args: ["mug"] });
+      await callTool(harness, sessionA, 14, "woo_call", { object: "the_chatroom", verb: "southeast", args: [] });
+      // Direct read on the carried mug — the A2 gate verb (direct_callable on $note).
+      await callTool(harness, sessionA, 15, "woo_call", { object: "the_mug",      verb: "read",      args: [] });
+      // Walk back and restore: drop the mug in the deck (direct call so no inventory
+      // lookup), then pick it up again and drop in chatroom so the next run starts clean.
+      // Use the direct drop path: move west with the mug, then drop in chatroom.
+      await callTool(harness, sessionA, 16, "woo_call", { object: "the_deck",     verb: "west",      args: [] });
+      await callTool(harness, sessionA, 17, "woo_call", { object: "the_chatroom", verb: "drop",      args: ["mug"] });
+      const measuredCarryMetrics = metricsFromLogSpy(logSpy);
+      logSpy.mockClear();
+
       // Measure the same-scope say turn separately.
-      await callTool(harness, sessionA, 13, "woo_call", { object: "the_chatroom", verb: "say", args: [`measured-say-${runId}`] });
+      await callTool(harness, sessionA, 19, "woo_call", { object: "the_chatroom", verb: "say", args: [`measured-say-${runId}`] });
       const measuredSayMetrics = metricsFromLogSpy(logSpy);
 
       writeLabeledMetricsIfRequested(runId, {
         setup: setupMetrics,
         measured_movement: measuredMovementMetrics,
+        measured_carry: measuredCarryMetrics,
         measured_say: measuredSayMetrics
       });
 
@@ -428,22 +473,25 @@ describe("CF-local prod-shape structural probes", () => {
         `Ref PLAN: §C2 / §B-i.`
       ).toBeLessThan(C2_TRACKED_CROSS_SCOPE_ENVELOPE_BYTES);
 
-      // dangling_parent_ref count: ENFORCED to be 0 for movement-only turns.
-      // Movement turns (enter/leave/southeast/west) do not involve $portable
-      // objects and must never emit dangling_parent_ref. The A2 debt (lineage-
-      // closed row installation for $portable objects) manifests only when a
-      // `take` or `drop` is performed on a $portable; that is tracked via the
-      // carry-across-rooms scenario in scripts/smoke/scenario.ts (C3, TRACKED A2).
-      // Count over the full run (setup + measured).
-      const allMetrics = [...setupMetrics, ...measuredMovementMetrics, ...measuredSayMetrics];
+      // dangling_parent_ref count: ENFORCED to be 0 across all turns including carry.
+      // A2 (mergeIncomingObjectLineageClosure) ships the transitive parent chain of
+      // every incoming object into the destination relay before the delta frame, so
+      // a carried $note/$portable object crossing a scope boundary MUST NOT produce
+      // dangling_parent_ref. The carry phase above (take + cross-scope move + drop)
+      // exercises this path. In the fake-lane (single shared world image) the real
+      // multi-shard gap is collapsed, but the gate still confirms A2 does NOT add
+      // new repair loops or dangling refs. The higher-fidelity cf-dev gate (carry-
+      // across-rooms, formerly TRACKED → A2, now ENFORCED — see CF_DEV_TRACKED_FAIL_STEPS
+      // comment in scripts/smoke-cf-dev.ts) confirms the real distributed behavior.
+      // Count over the full run (setup + movement + carry + say).
+      const allMetrics = [...setupMetrics, ...measuredMovementMetrics, ...measuredCarryMetrics, ...measuredSayMetrics];
       const danglingRefs = allMetrics.filter((m) => m.kind === "dangling_parent_ref");
-      console.log(`c2.dangling_parent_ref count=${danglingRefs.length} target=${C2_TRACKED_DANGLING_PARENT_REF_TARGET} status=ENFORCED plan=A2-movement-only`);
+      console.log(`c2.dangling_parent_ref count=${danglingRefs.length} target=${C2_TRACKED_DANGLING_PARENT_REF_TARGET} status=ENFORCED plan=A2`);
       expect(
         danglingRefs.length,
-        `C2 ENFORCED: movement-only turns must not emit dangling_parent_ref. Got ${danglingRefs.length}. ` +
-        `Dangling refs in movement turns indicate a regression in the class-lineage relay cache. ` +
-        `Note: dangling_parent_ref for $portable objects (take/drop) is separately tracked in ` +
-        `carry-across-rooms scenario. Ref PLAN: §C2 / §A2.`
+        `C2 ENFORCED: all turns (movement + carry + say) must not emit dangling_parent_ref. Got ${danglingRefs.length}. ` +
+        `Dangling refs in carry turns indicate a regression in the A2 lineage closure fix ` +
+        `(mergeIncomingObjectLineageClosure in gateway.ts). Ref PLAN: §C2 / §A2.`
       ).toBe(0);
 
       // Per-turn cross-host RPC count on warm turns. In the fake lane all DOs are

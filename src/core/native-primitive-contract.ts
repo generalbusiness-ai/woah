@@ -161,7 +161,14 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
           reason: "Text command planning must enter through the catalog wrapper on a cold browser scope."
         }
       ],
-      object_property_names: ["name", "description", "aliases"],
+      // "text" is included because catalog classes that define a match_names verb
+      // may read this.text to extract line-based match names from their body. The
+      // match_names verb bytecode is seeded via object_verb_lookup_names; its data
+      // dependency (text) must be in the atom-guard set or planning returns
+      // missing_state for any room that contains such an object. Cell pages for
+      // text are already included for objects that carry the property; this entry
+      // ensures the preimage is registered so missingAtomsForShadowTurn accepts it.
+      object_property_names: ["aliases", "description", "name", "text"],
       object_verb_lookup_names: ["match_names"],
       dispatch_verb_names: ["command_plan"]
     },
