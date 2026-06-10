@@ -50,7 +50,7 @@ describe("smoke walkthrough harness", () => {
     // must not be misread as a saturation timeout.
     expect(isTimeoutDetail("timeout after 5000ms waiting for matching observation")).toBe(false);
     expect(isTimeoutDetail('I don\'t see "mug" here.')).toBe(false);
-    expect(isTimeoutDetail("reachable MCP tool not found: the_outline:enter")).toBe(false);
+    expect(isTimeoutDetail("reachable MCP tool not found: the_outline:add_item")).toBe(false);
     expect(isTimeoutDetail("MCP session not found; reinitialize")).toBe(false);
     expect(isTimeoutDetail(undefined)).toBe(false);
   });

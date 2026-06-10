@@ -48,7 +48,8 @@ describe("v2 browser executable cache", () => {
   it("rebuilds executable state from compact transfer refs plus cached pages", async () => {
     const world = createWorld();
     const session = world.auth("guest:v2-browser-execution-cache");
-    world.setProp("the_dubspace", "operators", [session.actor]);
+    const moved = await world.directCall("v2-browser-cache-dubspace-moveto", session.actor, session.actor, "moveto", ["the_dubspace"], { sessionId: session.id });
+    expect(moved.op).toBe("result");
     const serialized = world.exportWorld();
     const call: ShadowTurnCall = {
       kind: "woo.turn_call.shadow.v1",

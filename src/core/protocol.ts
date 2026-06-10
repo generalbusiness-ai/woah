@@ -457,6 +457,7 @@ export function statusForError(error: ErrorValue): number {
 
 export function restFrameFromTurnReply(scope: ObjRef, reply: ShadowTurnExecReply): AppliedFrame | DirectResultFrame {
   if (reply.ok !== true) throw turnReplyError(reply);
+  if (reply.outcome.error !== undefined) throw normalizeError(reply.outcome.error);
   if (reply.commit) {
     return {
       op: "applied",

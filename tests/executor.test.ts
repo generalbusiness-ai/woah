@@ -23,6 +23,11 @@ import {
 import { slimMcpEnvelopeBody, type McpV2EnvelopeBody } from "../src/mcp/gateway";
 import type { MetricEvent, ObjRef } from "../src/core/types";
 
+async function moveActorToDubspace(world: ReturnType<typeof createWorld>, session: { id: string; actor: string }, requestId: string): Promise<void> {
+  const moved = await world.directCall(requestId, session.actor, session.actor, "moveto", ["the_dubspace"], { sessionId: session.id });
+  expect(moved.op).toBe("result");
+}
+
 describe("v2 turn gateway", () => {
   it("refreshes room contents and support classes in authority slices for stale direct-look scopes", async () => {
     const world = createWorld();
@@ -222,7 +227,7 @@ describe("v2 turn gateway", () => {
   it("plans and submits a durable exec request through the planned-exec strategy", async () => {
     const world = createWorld();
     const session = world.auth("guest:v2-gateway-planned");
-    world.setProp("the_dubspace", "operators", [session.actor]);
+    await moveActorToDubspace(world, session, "planned-dubspace-moveto");
     const harness = makePlannedExecHarness(world.exportWorld());
 
     const result = await submitTurnIntent({
@@ -375,7 +380,7 @@ describe("v2 turn gateway", () => {
   it("emits a turn_phase_timing metric attributing the turn's phases (Slice 1)", async () => {
     const world = createWorld();
     const session = world.auth("guest:v2-gateway-phase-timing");
-    world.setProp("the_dubspace", "operators", [session.actor]);
+    await moveActorToDubspace(world, session, "phase-timing-dubspace-moveto");
     const harness = makePlannedExecHarness(world.exportWorld());
 
     const events: Array<Record<string, unknown>> = [];
@@ -430,7 +435,7 @@ describe("v2 turn gateway", () => {
     // of burning the whole retry budget.
     const world = createWorld();
     const session = world.auth("guest:v2-gateway-stale-head");
-    world.setProp("the_dubspace", "operators", [session.actor]);
+    await moveActorToDubspace(world, session, "stale-head-dubspace-moveto");
     const harness = makePlannedExecHarness(world.exportWorld());
 
     const authorityCurrentHead = scopeHead("the_dubspace", 5); // authority is at seq 5; relay starts at @0
@@ -496,7 +501,7 @@ describe("v2 turn gateway", () => {
     // of re-submitting the same stale rows and grinding the retry budget.
     const world = createWorld();
     const session = world.auth("guest:v2-gateway-version-mismatch");
-    world.setProp("the_dubspace", "operators", [session.actor]);
+    await moveActorToDubspace(world, session, "version-mismatch-dubspace-moveto");
     const harness = makePlannedExecHarness(world.exportWorld());
 
     // Minimal transfer; the executor only checks presence and forwards it to
@@ -568,7 +573,7 @@ describe("v2 turn gateway", () => {
     // outcome "error".
     const world = createWorld();
     const session = world.auth("guest:v2-gateway-throwing-phase");
-    world.setProp("the_dubspace", "operators", [session.actor]);
+    await moveActorToDubspace(world, session, "throwing-phase-dubspace-moveto");
     const harness = makePlannedExecHarness(world.exportWorld());
 
     const events: Array<Record<string, unknown>> = [];
@@ -601,7 +606,7 @@ describe("v2 turn gateway", () => {
     expect(timing[0]!.submit_ms as number).toBeGreaterThan(0);
   });
 
-  it("routes planned-exec submission to the transcript commit scope, not the caller scope", async () => {
+  it("routes planned actor movement to the actor commit scope, not the UI scope", async () => {
     const world = createWorld();
     const session = world.auth("guest:v2-gateway-cross-scope");
     await world.directCall("setup:enter-chatroom", session.actor, "the_chatroom", "enter", [], { sessionId: session.id });
@@ -609,14 +614,14 @@ describe("v2 turn gateway", () => {
 
     const result = await submitTurnIntent({
       input: {
-        id: "planned-enter-dubspace",
+        id: "planned-moveto-dubspace",
         route: "direct",
-        scope: "the_chatroom",
+        scope: "the_dubspace",
         session: session.id,
         actor: session.actor,
-        target: "the_dubspace",
-        verb: "enter",
-        args: [],
+        target: session.actor,
+        verb: "moveto",
+        args: ["the_dubspace"],
         persistence: "durable",
         token: "token"
       },
@@ -626,32 +631,34 @@ describe("v2 turn gateway", () => {
 
     expect(result.kind).toBe("submitted");
     if (result.kind !== "submitted") throw new Error("expected planned submission");
-    expect(result.scope).toBe("the_chatroom");
-    expect(result.commitScope).toBe("the_dubspace");
+    expect(result.scope).toBe("the_dubspace");
+    expect(result.commitScope).toBe(session.actor);
     expect(result.planned?.transcript.scope).toBe("the_dubspace");
-    expect(harness.ensureScopes).toEqual(["the_chatroom", "the_dubspace"]);
+    expect(harness.ensureScopes).toEqual(["the_dubspace", session.actor]);
     expect(harness.submissions).toHaveLength(1);
     const submitted = harness.submissions[0];
-    expect(submitted.scope).toBe("the_dubspace");
-    expect(submitted.body.scope).toBe("the_dubspace");
-    expect(submitted.body.node).toBe("node:the_dubspace");
+    expect(submitted.scope).toBe(session.actor);
+    expect(submitted.body.scope).toBe(session.actor);
+    expect(submitted.body.node).toBe(`node:${session.actor}`);
     expect(submitted.request).toMatchObject({
       kind: "woo.turn.exec.request.shadow.v1",
-      id: "planned-enter-dubspace",
+      id: "planned-moveto-dubspace",
       call: {
         route: "direct",
-        scope: "the_chatroom",
-        target: "the_dubspace",
-        verb: "enter"
+        scope: "the_dubspace",
+        target: session.actor,
+        verb: "moveto",
+        args: ["the_dubspace"]
       },
       key: { scope: "the_dubspace" },
-      expected: scopeHead("the_dubspace"),
+      expected: scopeHead(session.actor),
+      planned_transcript: expect.objectContaining({ scope: "the_dubspace" }),
       auth: { mode: "shadow_local", actor: session.actor, session: session.id }
     });
     expect(authorityObjectIds(submitted.body.authority)).toEqual([
+      session.actor,
       "the_dubspace",
-      "the_chatroom",
-      session.actor
+      "the_chatroom"
     ]);
     expect(result.reply?.ok).toBe(true);
   });

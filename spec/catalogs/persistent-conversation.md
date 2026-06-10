@@ -113,8 +113,8 @@ the consumer's parent chain, so a conversational feature fills in
 missing verbs but does not override the space's native behavior.
 
 That precedence is intentional. On a pinboard, `:post`, `:take`,
-`:drop`, `:enter`, `:leave`, and `:enterfunc` remain pinboard
-behavior. The chat UI sends commands to the current space; the
+`:drop`, `:enterfunc`, `:exitfunc`, and room movement behavior remain
+pinboard behavior. The chat UI sends commands to the current space; the
 space decides whether a note is acceptable and where it lands.
 
 **Shared affordance.** Both features provide the same public chat
@@ -359,14 +359,14 @@ utterance and there is no benefit to logging "$X looked at history."
 A frequent UX want: when a user enters a persistent conversational
 space, immediately show them the last N utterances.
 
-For v1, clients that want post-enter backlog **call `:history()`
-after `:enter` returns**. This is the right contract for feature
-composition because features do not override parent-chain verbs. If
-the consumer space already defines `:enter`, as pinboard does, that
-space keeps ownership of its entry behavior.
+For v1, clients that want post-entry backlog **call `:history()` after
+the actor movement completes**. This is the right contract for feature
+composition because features do not override parent-chain movement
+hooks. If the consumer space defines `:enterfunc`, as pinboard does,
+that space keeps ownership of its entry behavior.
 
 A future space may explicitly call a feature hook from its own
-`:enter`, or the DSL may grow a stable super-call/hook pattern. That
+`:enterfunc`, or the DSL may grow a stable super-call/hook pattern. That
 would be an ergonomic improvement, not a change to the persistence
 model.
 
@@ -555,8 +555,8 @@ part of the demo's durable state.
 
 ## PC15. What's not in v1
 
-- **Auto-replay-on-enter** (PC8). Clients call `:history()` after
-  `:enter` for now.
+- **Auto-replay-on-entry** (PC8). Clients call `:history()` after actor
+  movement for now.
 - **Audience-scoped history** (PC6). Tells/say_to remain direct in
   v1 to keep history public-only. Per-caller filtered replay is a
   follow-up.

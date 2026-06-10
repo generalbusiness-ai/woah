@@ -31,7 +31,7 @@ async function callInDubspace(
     return world.call(requestId, sessionId, "the_dubspace", request);
   }
   if (!world.hasPresence(sessionActor, "the_dubspace")) {
-    const entered = await world.directCall(`enter-${requestId}`, sessionActor, "the_dubspace", "enter", []);
+    const entered = await world.directCall(`move-${requestId}`, sessionActor, sessionActor, "moveto", ["the_dubspace"], { sessionId });
     if (entered.op === "error") return entered;
   }
 
@@ -42,7 +42,7 @@ async function callInDubspace(
     return world.call(requestId, sessionId, "the_dubspace", request);
   }
   if (request.target === "the_dubspace" && verb.direct_callable === true && typeof verb.perms === "string" && verb.perms.includes("x")) {
-    const direct = await world.directCall(requestId, request.actor, request.target, request.verb, request.args);
+    const direct = await world.directCall(requestId, request.actor, request.target, request.verb, request.args, { sessionId });
     return direct;
   }
 
@@ -60,7 +60,7 @@ async function callInPinboard(
     return world.call(requestId, sessionId, "the_pinboard", request);
   }
   if (!world.hasPresence(sessionActor, "the_pinboard")) {
-    const entered = await world.directCall(`enter-${requestId}`, sessionActor, "the_pinboard", "enter", []);
+    const entered = await world.directCall(`move-${requestId}`, sessionActor, sessionActor, "moveto", ["the_pinboard"], { sessionId });
     if (entered.op === "error") return entered;
   }
 
@@ -71,7 +71,7 @@ async function callInPinboard(
     return world.call(requestId, sessionId, "the_pinboard", request);
   }
   if (verb.direct_callable === true && typeof verb.perms === "string" && verb.perms.includes("x")) {
-    const direct = await world.directCall(requestId, request.actor, request.target, request.verb, request.args);
+    const direct = await world.directCall(requestId, request.actor, request.target, request.verb, request.args, { sessionId });
     return direct;
   }
 

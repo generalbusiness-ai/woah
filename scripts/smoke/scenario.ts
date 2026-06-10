@@ -300,7 +300,7 @@ export async function runSmokeWalkthrough(
   }
 
   // C3 gate: tool-surface-after-move. After alice moves from the_chatroom to
-  // the_deck and enters the_pinboard from the new scope, assert that the
+  // the_deck and then moves into the_pinboard from the new scope, assert that the
   // pinboard's add_note tool is reachable. This exercises the tool-surface
   // enumeration path separately from the verb-on-carried-object test above.
   //
@@ -312,9 +312,9 @@ export async function runSmokeWalkthrough(
   // In the fake lane: passes (shared world image, full lineage always present).
   // In cf-dev/deployed: FAILS until A2 lands. TRACKED → A2.
   if (options.includeToolSurfaceAfterMove) {
-    await step("tool-surface-after-move: add_note reachable after entering pinboard from new scope", async (ctx) => {
+    await step("tool-surface-after-move: add_note reachable after moving into pinboard from new scope", async (ctx) => {
       const { alice } = pair;
-      // Precondition: alice must be in the_deck to enter the_pinboard.
+      // Precondition: alice must be in the_deck before moving to the_pinboard.
       await alice.leaveIfIn("the_pinboard", ctx.signal);
       await alice.leaveIfIn("the_outline", ctx.signal);
       if (alice.currentRoom === "the_chatroom") await alice.call("the_chatroom", "southeast", [], ctx.signal);
@@ -327,7 +327,7 @@ export async function runSmokeWalkthrough(
       // gated step strands her on the_deck. State-neutrality is a requirement
       // for every optional scenario step.
       try {
-        await alice.call("the_pinboard", "enter", [], ctx.signal);
+        await alice.moveTo("the_pinboard", ctx.signal);
         await drain(alice, cfg, ctx.signal);
         // Assert add_note is reachable via the tool list. We use woo_list_reachable_tools
         // rather than calling the verb so that a missing tool-surface entry is
@@ -342,7 +342,7 @@ export async function runSmokeWalkthrough(
             .filter((t: any) => isRecord(t) && String(t.object ?? "").includes("pinboard"))
             .map((t: any) => String((t as any).verb ?? "?"));
           throw new Error(
-            `tool-surface-after-move: the_pinboard:add_note not in reachable tools after scope-crossing enter; ` +
+            `tool-surface-after-move: the_pinboard:add_note not in reachable tools after scope-crossing movement; ` +
             `pinboard tools visible: [${pinboardTools.join(", ")}] (total reachable: ${toolsList.length})`
           );
         }
@@ -359,27 +359,18 @@ export async function runSmokeWalkthrough(
     });
   }
 
-  // Tool spaces: each is mounted in a specific room and the MCP reachability
-  // gate hides its `enter` verb until the actor is physically in that room, so
-  // we move both actors there before the assertion. Pinboard is mounted in
-  // the_deck.
+  // Tool spaces: each is mounted in a specific room. Browser tab switching now
+  // moves the actor directly to the tool space; the smoke path mirrors that
+  // movement instead of calling a tool-space `enter` verb. Pinboard is mounted
+  // in the_deck.
   await step("pinboard:add_note reaches peer", async (ctx) => {
     const { alice, bob } = pair;
     await alice.call("the_chatroom", "southeast", [], ctx.signal);
     await bob.call("the_chatroom", "southeast", [], ctx.signal);
     await drain(alice, cfg, ctx.signal);
     await drain(bob, cfg, ctx.signal);
-    // `the_deck:enter the_pinboard` is the cross-room-enter form; tolerate it
-    // failing (scope_mismatch on an unrouted session) as an opportunistic
-    // route/manifest warm-up — the canonical `the_pinboard:enter` below is the
-    // real assertion.
-    try {
-      await alice.call("the_deck", "enter", ["the_pinboard"], ctx.signal);
-    } catch (err) {
-      cfg.log?.(`alice deck:enter the_pinboard warm-up failed: ${(err as Error).message}`);
-    }
-    await alice.call("the_pinboard", "enter", [], ctx.signal);
-    await bob.call("the_pinboard", "enter", [], ctx.signal);
+    await alice.moveTo("the_pinboard", ctx.signal);
+    await bob.moveTo("the_pinboard", ctx.signal);
     await drain(alice, cfg, ctx.signal);
     await drain(bob, cfg, ctx.signal);
     const text = `pinboard-${runId}`;
@@ -392,11 +383,10 @@ export async function runSmokeWalkthrough(
     waitMs, ctx.signal, cfg);
   });
 
-  // Outliner is mounted in the_chatroom, so both actors come back west. The
-  // `:enter` reply returns the roster directly, so we assert the row shape on
-  // its result rather than calling :room_roster (direct_callable but not
-  // tool_exposed).
-  await step("outliner:enter result includes a roster row for alice", async (ctx) => {
+  // Outliner is mounted in the_chatroom, so both actors come back west. Movement
+  // into the outliner updates presence; assert the joined public `look` view
+  // carries the roster shape assembled by the internal `look_self` helper.
+  await step("outliner roster includes a row for alice after movement", async (ctx) => {
     const { alice, bob } = pair;
     // Only leave if actually in the pinboard; only walk west if actually on the
     // deck — guards keep a prior-step failure from cascading into a stale
@@ -407,14 +397,18 @@ export async function runSmokeWalkthrough(
     if (bob.currentRoom === "the_deck") await bob.call("the_deck", "west", [], ctx.signal);
     await drain(alice, cfg, ctx.signal);
     await drain(bob, cfg, ctx.signal);
-    const aliceEnter = await alice.call("the_outline", "enter", [], ctx.signal);
-    if (!isRecord(aliceEnter) || !Array.isArray(aliceEnter.roster)) {
-      throw new Error(`expected roster array on the_outline:enter result; got ${JSON.stringify(aliceEnter).slice(0, 200)}`);
+    await alice.moveTo("the_outline", ctx.signal);
+    const aliceView = await alice.call("the_outline", "look", [], ctx.signal);
+    if (!isRecord(aliceView) || !Array.isArray(aliceView.roster)) {
+      throw new Error(`expected roster array on the_outline:look result; got ${JSON.stringify(aliceView).slice(0, 200)}`);
     }
-    const rows = aliceEnter.roster.filter(isRecord);
+    const rows = aliceView.roster.filter(isRecord);
     const ids = new Set(rows.map((row) => String(row.id ?? "")));
     if (!ids.has(alice.actor)) {
-      throw new Error(`alice not in her own enter roster; ids=${[...ids].join(",")} expected alice=${alice.actor}`);
+      throw new Error(
+        `alice not in her own outliner roster; ids=${[...ids].join(",")} expected alice=${alice.actor}; ` +
+        `currentRoom=${alice.currentRoom}; view=${JSON.stringify(aliceView).slice(0, 600)}`
+      );
     }
     for (const row of rows) {
       if (typeof row.id !== "string" || typeof row.name !== "string") {
@@ -425,7 +419,7 @@ export async function runSmokeWalkthrough(
 
   await step("outliner:add_item reaches peer", async (ctx) => {
     const { alice, bob } = pair;
-    await bob.call("the_outline", "enter", [], ctx.signal);
+    await bob.moveTo("the_outline", ctx.signal);
     await drain(alice, cfg, ctx.signal);
     await drain(bob, cfg, ctx.signal);
     const text = `outline-${runId}`;
@@ -505,6 +499,7 @@ async function waitFor(
   cfg: DrainConfig
 ): Promise<Record<string, any>> {
   const startedAt = Date.now();
+  const seen: string[] = [];
   while (Date.now() - startedAt < totalTimeoutMs) {
     throwIfAborted(signal);
     const remaining = totalTimeoutMs - (Date.now() - startedAt);
@@ -514,14 +509,23 @@ async function waitFor(
       cfg.log?.(`    [${session.label}] received ${observations.length} obs: ${observations.map((o: any) => o.type).join(",")}`);
     }
     for (const obs of observations) {
+      if (isRecord(obs)) seen.push(observationSummary(obs));
       if (isRecord(obs) && match(obs)) return obs;
     }
   }
-  throw new Error(`timeout after ${totalTimeoutMs}ms waiting for matching observation`);
+  const suffix = seen.length ? `; saw ${seen.slice(-12).join("; ")}` : "; saw no observations";
+  throw new Error(`timeout after ${totalTimeoutMs}ms waiting for matching observation${suffix}`);
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
   if (!signal?.aborted) return;
   const reason = signal.reason;
   throw reason instanceof Error ? reason : new Error("operation aborted");
+}
+
+function observationSummary(obs: Record<string, any>): string {
+  const fields = ["type", "actor", "source", "room", "origin", "destination", "exit", "target"]
+    .map((key) => obs[key] === undefined ? null : `${key}=${String(obs[key])}`)
+    .filter((item): item is string => item !== null);
+  return `{${fields.join(",")}}`;
 }

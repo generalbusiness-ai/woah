@@ -50,8 +50,8 @@ const DETERMINISTIC_PREFETCH_TURNS = new Set([
   "the_deck:south",
   "the_deck:west",
   "the_garden:south",
-  "the_outline:leave",
-  "the_pinboard:leave"
+  "the_outline:out",
+  "the_pinboard:out"
 ]);
 
 class FakeKVNamespace {
@@ -124,21 +124,10 @@ describe("CF-local smoke walkthrough", () => {
       // fanout is correct — only the zero-dangling guard fires). Flip it ON once
       // $portable and the other contents-object classes reach the gateway slice.
       // The deployed and workerd lanes already run take/drop.
-      //
-      // C3 gates: includeCarryAcrossRooms and includeToolSurfaceAfterMove are also
-      // held OFF here for the same reason as includeTakeDrop: the carry step calls
-      // `take` on a $portable object, which emits dangling_parent_ref because the
-      // gateway-shard relay lacks $portable class lineage (same root cause as face
-      // #2, notes/2026-06-09-cf-cross-scope-architecture-plan.md). Both steps are
-      // TRACKED in cf-dev via CF_DEV_TRACKED_FAIL_STEPS (→ A2) and will be flipped
-      // ON in both lanes once A2 (lineage-closed row installation) lands.
-      // See notes/2026-06-09-c2c3-gates-scenario.md for the per-lane status.
       await runSmokeWalkthrough({ alice, bob }, localStep, {
         runId,
         includeConcurrentMove: true,
         includeTakeDrop: false,
-        includeCarryAcrossRooms: false,
-        includeToolSurfaceAfterMove: false,
         waitTimeoutMs: 10_000,
         drainBudgetMs: DRAIN_TOTAL_BUDGET_MS,
         drainPollMs: DRAIN_POLL_MS
@@ -175,7 +164,7 @@ describe("CF-local smoke walkthrough", () => {
       // ZERO-TOLERANCE as of A4. The presence/containment PROJECTION cells
       // (`subscribers`, `session_subscribers`, `contents`) used to sit on the
       // commit-validation path, so a cross-room turn could plan them stale and get
-      // rejected (e.g. `the_outline:leave` rejecting on `the_chatroom.subscribers`).
+      // rejected (e.g. `the_outline:out` rejecting on `the_chatroom.subscribers`).
       // A4 (cell-authority CA2/CA4) took them OFF the validation path: a read of a
       // projection cell is no longer a consistency dependency, because its truth is
       // each member's own `live:location` authoritative cell. The allow-list is now

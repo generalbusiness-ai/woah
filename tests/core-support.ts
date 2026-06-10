@@ -12,6 +12,15 @@ export function authedWorld() {
   return { world, session, actor: session.actor };
 }
 
+export async function moveActorTo(
+  world: ReturnType<typeof createWorld>,
+  actor: string,
+  target: string,
+  options: { requestId?: string; sessionId?: string } = {}
+): Promise<DirectResultFrame | ErrorFrame> {
+  return world.directCall(options.requestId ?? `move-${actor}-${target}`, actor, actor, "moveto", [target], { sessionId: options.sessionId });
+}
+
 export async function callInDubspace(
   world: ReturnType<typeof createWorld>,
   sessionId: string,
@@ -23,7 +32,7 @@ export async function callInDubspace(
     return world.call(requestId, sessionId, "the_dubspace", request);
   }
   if (!world.hasPresence(sessionActor, "the_dubspace")) {
-    const entered = await world.directCall(`enter-${requestId}`, sessionActor, "the_dubspace", "enter", []);
+    const entered = await moveActorTo(world, sessionActor, "the_dubspace", { requestId: `move-${requestId}`, sessionId });
     if (entered.op === "error") return entered;
   }
 
@@ -34,7 +43,7 @@ export async function callInDubspace(
     return world.call(requestId, sessionId, "the_dubspace", request);
   }
   if (request.target === "the_dubspace" && verb.direct_callable === true && typeof verb.perms === "string" && verb.perms.includes("x")) {
-    return world.directCall(requestId, request.actor, request.target, request.verb, request.args);
+    return world.directCall(requestId, request.actor, request.target, request.verb, request.args, { sessionId });
   }
 
   return world.call(requestId, sessionId, "the_dubspace", request);

@@ -1,6 +1,6 @@
 ---
 name: dubspace
-version: 0.2.11
+version: 1.0.0
 spec_version: v1
 license: MIT
 description: Shared dub-mix sound space demo objects.

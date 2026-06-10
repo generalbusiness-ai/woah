@@ -26,6 +26,11 @@ import { createShadowCommitScope, serializedFor, type ShadowCommitAccepted } fro
 import { buildShadowCellPageTransfer, type ShadowTurnExecReply, type ShadowTurnExecRequest } from "../src/core/shadow-turn-exec";
 import { shadowTurnKeyFromCall, shadowTurnKeyFromTranscript } from "../src/core/turn-key";
 
+async function moveBrowserSessionToDubspace(world: ReturnType<typeof createWorld>, session: { id: string; actor: string }, requestId = "browser-worker-dubspace-moveto"): Promise<void> {
+  const moved = await world.directCall(requestId, session.actor, session.actor, "moveto", ["the_dubspace"], { sessionId: session.id });
+  expect(moved.op).toBe("result");
+}
+
 describe("v2 browser worker integration", () => {
   afterEach(() => {
     FakeWorkerScope.clearAllTimers();
@@ -47,7 +52,7 @@ describe("v2 browser worker integration", () => {
 
     const world = createWorld();
     const session = browserWorkerSession(world, "guest:v2-browser-worker");
-    world.setProp("the_dubspace", "operators", [session.actor]);
+    await moveBrowserSessionToDubspace(world, session);
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker",
       scope: "the_dubspace",
@@ -296,7 +301,7 @@ describe("v2 browser worker integration", () => {
 
     const world = createWorld();
     const session = browserWorkerSession(world, "guest:v2-browser-worker-queued-journal");
-    world.setProp("the_dubspace", "operators", [session.actor]);
+    await moveBrowserSessionToDubspace(world, session);
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-queued-journal",
       scope: "the_dubspace",
@@ -455,7 +460,7 @@ describe("v2 browser worker integration", () => {
 
     const world = createWorld();
     const session = browserWorkerSession(world, "guest:v2-browser-worker-timeout");
-    world.setProp("the_dubspace", "operators", [session.actor]);
+    await moveBrowserSessionToDubspace(world, session);
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-timeout",
       scope: "the_dubspace",
@@ -525,7 +530,7 @@ describe("v2 browser worker integration", () => {
     const indexedDB = new FakeIndexedDBFactory();
     const world = createWorld();
     const session = browserWorkerSession(world, "guest:v2-browser-worker-timeout-restart");
-    world.setProp("the_dubspace", "operators", [session.actor]);
+    await moveBrowserSessionToDubspace(world, session);
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-timeout-restart",
       scope: "the_dubspace",
@@ -632,7 +637,7 @@ describe("v2 browser worker integration", () => {
 
     const world = createWorld();
     const session = browserWorkerSession(world, "guest:v2-browser-worker-timeout-reply");
-    world.setProp("the_dubspace", "operators", [session.actor]);
+    await moveBrowserSessionToDubspace(world, session);
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-timeout-reply",
       scope: "the_dubspace",
@@ -696,7 +701,7 @@ describe("v2 browser worker integration", () => {
 
     const world = createWorld();
     const session = browserWorkerSession(world, "guest:v2-browser-worker-cross-scope-overlay");
-    world.setProp("the_dubspace", "operators", [session.actor]);
+    await moveBrowserSessionToDubspace(world, session);
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-cross-scope-overlay",
       scope: "the_dubspace",
@@ -787,7 +792,7 @@ describe("v2 browser worker integration", () => {
 
     const world = createWorld();
     const session = browserWorkerSession(world, "guest:v2-browser-worker-reload-overlay");
-    world.setProp("the_dubspace", "operators", [session.actor]);
+    await moveBrowserSessionToDubspace(world, session);
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-reload-overlay",
       scope: "the_dubspace",
@@ -1236,7 +1241,7 @@ describe("v2 browser worker integration", () => {
 
     const world = createWorld();
     const session = browserWorkerSession(world, "guest:v2-browser-worker-bad-bundled-capsule");
-    world.setProp("the_dubspace", "operators", [session.actor]);
+    await moveBrowserSessionToDubspace(world, session);
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-bad-bundled-capsule",
       scope: "the_dubspace",
@@ -1471,7 +1476,7 @@ describe("v2 browser worker integration", () => {
 
     const world = createWorld();
     const session = browserWorkerSession(world, "guest:v2-browser-worker-replan");
-    world.setProp("the_dubspace", "operators", [session.actor]);
+    await moveBrowserSessionToDubspace(world, session);
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-replan",
       scope: "the_dubspace",
@@ -1607,7 +1612,7 @@ describe("v2 browser worker integration", () => {
 
     const world = createWorld();
     const session = browserWorkerSession(world, "guest:v2-browser-worker-id-only-accept");
-    world.setProp("the_dubspace", "operators", [session.actor]);
+    await moveBrowserSessionToDubspace(world, session);
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-id-only-accept",
       scope: "the_dubspace",
@@ -1844,7 +1849,7 @@ describe("v2 browser worker integration", () => {
 
     const world = createWorld();
     const session = browserWorkerSession(world, "guest:v2-browser-worker-projection-boundary");
-    world.setProp("the_dubspace", "operators", [session.actor]);
+    await moveBrowserSessionToDubspace(world, session);
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-projection-boundary",
       scope: "the_dubspace",
@@ -2686,7 +2691,8 @@ describe("v2 browser worker integration", () => {
     const world = createWorld();
     const firstSession = browserWorkerSession(world, "guest:v2-browser-worker-auth-cache-a");
     const secondSession = browserWorkerSession(world, "guest:v2-browser-worker-auth-cache-b");
-    world.setProp("the_dubspace", "operators", [firstSession.actor, secondSession.actor]);
+    await moveBrowserSessionToDubspace(world, firstSession, "browser-worker-first-dubspace-moveto");
+    await moveBrowserSessionToDubspace(world, secondSession, "browser-worker-second-dubspace-moveto");
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-auth-cache",
       scope: "the_dubspace",
@@ -2785,7 +2791,8 @@ describe("v2 browser worker integration", () => {
     const world = createWorld();
     const firstSession = browserWorkerSession(world, "guest:v2-browser-worker-stale-reply-a");
     const secondSession = browserWorkerSession(world, "guest:v2-browser-worker-stale-reply-b");
-    world.setProp("the_dubspace", "operators", [firstSession.actor, secondSession.actor]);
+    await moveBrowserSessionToDubspace(world, firstSession, "browser-worker-first-dubspace-moveto");
+    await moveBrowserSessionToDubspace(world, secondSession, "browser-worker-second-dubspace-moveto");
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-stale-reply",
       scope: "the_dubspace",
@@ -2884,7 +2891,8 @@ describe("v2 browser worker integration", () => {
     const world = createWorld();
     const session = browserWorkerSession(world, "guest:v2-browser-worker-pending-replay-a");
     const otherSession = browserWorkerSession(world, "guest:v2-browser-worker-pending-replay-b");
-    world.setProp("the_dubspace", "operators", [session.actor, otherSession.actor]);
+    await moveBrowserSessionToDubspace(world, session, "browser-worker-primary-dubspace-moveto");
+    await moveBrowserSessionToDubspace(world, otherSession, "browser-worker-other-dubspace-moveto");
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-pending-replay",
       scope: "the_dubspace",
@@ -2981,7 +2989,8 @@ describe("v2 browser worker integration", () => {
     const world = createWorld();
     const session = browserWorkerSession(world, "guest:v2-browser-worker-checkpoint");
     const remoteSession = browserWorkerSession(world, "guest:v2-browser-worker-checkpoint-remote");
-    world.setProp("the_dubspace", "operators", [session.actor, remoteSession.actor]);
+    await moveBrowserSessionToDubspace(world, session, "browser-worker-primary-dubspace-moveto");
+    await moveBrowserSessionToDubspace(world, remoteSession, "browser-worker-remote-dubspace-moveto");
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-checkpoint",
       scope: "the_dubspace",

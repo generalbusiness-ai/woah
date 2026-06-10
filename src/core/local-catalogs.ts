@@ -1246,8 +1246,8 @@ function runDubspaceV2ControlPresenceMigration(world: WooWorld, names: readonly 
   if (!names.includes("dubspace")) return;
   if (!localCatalogInstalled(world, "dubspace")) return;
   if (migrationApplied(world, LOCAL_CATALOG_DUBSPACE_V2_CONTROL_PRESENCE_MIGRATION)) return;
-  // Browser v2 treats Dubspace enter/leave as direct live presence, while
-  // committed control writes go through the Dubspace commit scope. Existing
+  // Browser v2 moves actors into/out of Dubspace through the normal movement
+  // path, while committed control writes go through the Dubspace commit scope. Existing
   // worlds therefore need these durable control verbs repaired so the old
   // room-presence gate does not reject commit-scope turns before recording.
   const controls = [

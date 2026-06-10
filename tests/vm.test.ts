@@ -21,7 +21,7 @@ async function callInDubspace(
 ): Promise<ReturnType<typeof world.call>> {
   const sessionActor = world.sessions.get(sessionId)?.actor;
   if (sessionActor === request.actor && !world.hasPresence(sessionActor, "the_dubspace")) {
-    const entered = await world.directCall(`enter-${requestId}`, sessionActor, "the_dubspace", "enter", []);
+    const entered = await world.directCall(`move-${requestId}`, sessionActor, sessionActor, "moveto", ["the_dubspace"], { sessionId });
     if (entered.op === "error") return entered;
   }
   return world.call(requestId, sessionId, "the_dubspace", request);

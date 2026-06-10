@@ -234,7 +234,7 @@ Three observed shapes from the bundled catalogs:
 |---|---|
 | `the_chatroom:southeast → the_deck` | `left`, `entered` (chat catalog's room/exit baseline). |
 | `the_deck:east → the_hot_tub` | `text`, `left`, `entered` — exits may add flavor text via an extra `text` observation alongside the standard pair. |
-| `the_dubspace:enter` | `dubspace_entered`, `dubspace_activity` — catalog-specific types because dubspace entry has its own semantics (operator roster, mount-room announcement). |
+| actor `moveto(the_dubspace)` | `dubspace_entered`, `dubspace_activity` — catalog-specific types because dubspace entry has its own semantics (presence-derived control authority, mount-room announcement). |
 
 Clients MUST treat the movement observation surface as open: catalogs
 can introduce new types and extra observations, and the same logical

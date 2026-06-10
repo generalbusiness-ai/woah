@@ -1068,6 +1068,7 @@ export class McpHost {
   private computeTooledVerbs(actor: ObjRef, id: ObjRef): TooledVerbEntry[] {
     const seen = new Set<string>();
     const out: TooledVerbEntry[] = [];
+    const suppressedInherited = this.suppressedInheritedToolVerbs(id);
     const collect = (start: ObjRef): void => {
       let cursor: ObjRef | null = start;
       while (cursor && this.world.objects.has(cursor)) {
@@ -1076,6 +1077,7 @@ export class McpHost {
           if (seen.has(verb.name)) continue;
           seen.add(verb.name);
           if (this.isSuppressedInheritedActorTool(actor, id, cursor)) continue;
+          if (cursor !== id && suppressedInherited.has(verb.name)) continue;
           if (verb.tool_exposed !== true) continue;
           if (!this.world.canExecuteVerb(actor, verb)) continue;
           out.push({ verb: verb as unknown as McpVerbInfo, owner: cursor });
@@ -1139,7 +1141,8 @@ export class McpHost {
     // own-verb-free siblings reuse one entry keyed on the parent.
     const ownIdentity = obj.verbs.length > 0 ? `self:${id}` : "shared";
     const ownFeatures = JSON.stringify(this.world.propOrNull(id, "features") ?? null);
-    const tooledDiscriminator = projection === "tools" ? `${id === actor}:${this.isBlockObject(id)}` : "";
+    const suppressedTools = projection === "tools" ? JSON.stringify(this.world.propOrNull(id, "suppressed_inherited_tools") ?? null) : "";
+    const tooledDiscriminator = projection === "tools" ? `${id === actor}:${this.isBlockObject(id)}:${suppressedTools}` : "";
     return `${projection}|${actor}|p:${obj.parent ?? ""}|own:${ownIdentity}|f:${ownFeatures}|t:${tooledDiscriminator}`;
   }
 
@@ -1196,6 +1199,12 @@ export class McpHost {
 
   private isSuppressedInheritedActorTool(actor: ObjRef, target: ObjRef, definingObject: ObjRef): boolean {
     return target !== actor && this.isBlockObject(target) && definingObject === "$actor";
+  }
+
+  private suppressedInheritedToolVerbs(target: ObjRef): Set<string> {
+    const raw = this.world.propOrNull(target, "suppressed_inherited_tools");
+    if (!Array.isArray(raw)) return new Set();
+    return new Set(raw.filter((item): item is string => typeof item === "string"));
   }
 
   private featureListOf(id: ObjRef): ObjRef[] {

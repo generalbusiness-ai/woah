@@ -111,9 +111,6 @@ export class WooPinboardBoardElement extends HTMLElement {
     const toolbar = `
       <section class="toolbar pinboard-toolbar">
         <h1>${escapeHtml(this.model.boardName || "Pinboard")}</h1>
-        ${this.model.inBoard
-          ? `<button data-pinboard-leave ${this.model.canSend ? "" : "disabled"}>Leave</button>`
-          : `<button data-pinboard-enter ${this.model.canSend ? "" : "disabled"}>Enter</button>`}
       </section>
     `;
     const layoutBody = `
@@ -127,7 +124,7 @@ export class WooPinboardBoardElement extends HTMLElement {
               <button data-pinboard-zoom="in" aria-label="Zoom in">+</button>
             </div>
             <div class="pinboard-canvas" data-pinboard-canvas style="${pinboardViewStyle(this.model.view)}">
-              ${this.model.notes.map((note) => this.renderNote(note)).join("") || `<div class="pinboard-empty">${escapeHtml(this.model.inBoard ? "Add a note to start." : "Enter the pinboard to add or move notes.")}</div>`}
+              ${this.model.notes.map((note) => this.renderNote(note)).join("") || `<div class="pinboard-empty">${escapeHtml(this.model.inBoard ? "Add a note to start." : "No notes yet.")}</div>`}
             </div>
           </div>
         </div>
@@ -235,8 +232,6 @@ export class WooPinboardBoardElement extends HTMLElement {
   }
 
   private bind(): void {
-    this.querySelector<HTMLButtonElement>("[data-pinboard-enter]")?.addEventListener("click", () => this.dispatch("enter"));
-    this.querySelector<HTMLButtonElement>("[data-pinboard-leave]")?.addEventListener("click", () => this.dispatch("leave"));
     this.querySelector<HTMLFormElement>("[data-pinboard-create]")?.addEventListener("submit", (event) => {
       event.preventDefault();
       const text = this.querySelector<HTMLTextAreaElement>("[data-pinboard-new-text]")?.value ?? "";

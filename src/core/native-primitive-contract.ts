@@ -28,6 +28,46 @@ export type NativePrimitiveOpenSeedContract = {
 };
 
 const CONTRACTS: Record<string, NativePrimitiveContract> = {
+  player_moveto: {
+    kind: "woo.native_primitive_contract.shadow.v1",
+    handler: "player_moveto",
+    version: 1,
+    transcript: "tracked",
+    deterministic: true,
+    reads: [
+      "actor session",
+      "actor.location",
+      "target.acceptable dispatch",
+      "old-location.exitfunc dispatch",
+      "target.enterfunc dispatch"
+    ],
+    writes: [
+      "actor.location",
+      "session.activeScope",
+      "container.contents"
+    ],
+    emits: [
+      "object_move",
+      "session_scope",
+      "cell_write"
+    ],
+    open_seed: {
+      dispatch_verb_names: ["moveto"],
+      verb_lookups: [
+        {
+          receiver: "actor_location",
+          names: ["exitfunc"],
+          reason: "The movement chain probes the old container hook before moving an actor out."
+        },
+        {
+          receiver: "scope",
+          names: ["acceptable", "enterfunc"],
+          reason: "A first local actor movement needs target admission and post-entry hooks without a repair round."
+        }
+      ]
+    },
+    note: "Player movement is transcript-safe through movetoActorChecked, which records physical location and session-scope presence transitions."
+  },
   thing_moveto: {
     kind: "woo.native_primitive_contract.shadow.v1",
     handler: "thing_moveto",
@@ -49,6 +89,7 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
       "cell_write"
     ],
     open_seed: {
+      dispatch_verb_names: ["moveto"],
       verb_lookups: [
         {
           receiver: "actor_location",

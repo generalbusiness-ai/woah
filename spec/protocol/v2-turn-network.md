@@ -2387,7 +2387,7 @@ browser UI/audio engines apply the committed frame
 Browser-node pinboard flow:
 
 ```text
-UI -> worker: TurnIntent(route=sequenced, enter())
+UI -> worker: TurnIntent(route=direct, actor.moveto(the_pinboard), persistence=durable)
 commit scope -> browser: AppliedFrame(pinboard_entered)
 UI -> worker: TurnIntent(route=sequenced, add_note/move_pin/resize_pin/set_text/...)
 commit scope -> browser: AppliedFrame(note_added/pin_moved/pin_resized/note_edited/...)
@@ -2395,16 +2395,17 @@ UI -> worker: TurnIntent(route=direct, persistence=live, viewport/list_notes)
 relay -> browser: direct result envelope or live pinboard_viewport observation
 ```
 
-Pinboard enter/leave are committed turns because the board's durable presence
-is the authorization precondition for layout and note edits. Viewport telemetry
-and projection hydration are direct live-persistence calls; they MUST NOT carry
-durable writes. Pinboard embedded chat uses the catalog `command_plan` verb over
-v2 so aliases and object matching remain catalog-owned.
+Pinboard tab activation moves the actor through `$player:moveto` with durable
+persistence because board presence is the authorization precondition for layout
+and note edits. Returning to the mounted room uses the room/exit `out` path.
+Viewport telemetry and projection hydration are direct live-persistence calls;
+they MUST NOT carry durable writes. Pinboard embedded chat uses the catalog
+`command_plan` verb over v2 so aliases and object matching remain catalog-owned.
 
 Browser-node outliner flow:
 
 ```text
-UI -> worker: TurnIntent(route=sequenced, enter())
+UI -> worker: TurnIntent(route=direct, actor.moveto(the_outline), persistence=durable)
 commit scope -> browser: AppliedFrame(outliner_entered)
 UI -> worker: TurnIntent(route=sequenced, add/add_item/hide/move_item/...)
 commit scope -> browser: AppliedFrame(outline_item_added/outline_item_hidden/...)
@@ -2416,7 +2417,7 @@ Server-side focus remains a catalog feature for chat and agent workflows, but
 the browser UI's selected row is local-only: clicking a row selects it without a
 network call, and create-in-place passes the selected parent id explicitly to
 `add_item`. The browser worker must therefore support the same same-actor
-dependency chain as pinboard: `enter` can be tentative while `add` or
+dependency chain as pinboard: actor movement can be tentative while `add` or
 `add_item` plans against the local journal, then both turns reconcile against
 authoritative accepted frames.
 

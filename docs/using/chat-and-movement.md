@@ -136,14 +136,17 @@ Both walk you through the named exit. Eight compass directions
 enter <place>
 ```
 
-Calls `<place>:enter()`. Use this for entering objects-as-spaces (a
-hot tub, a vehicle, another room with no compass exit).
+Calls the destination's room-entry command. Use this for entering
+room-like objects that deliberately support text entry. Browser tool
+tabs do not use an Enter control; switching to a tool tab moves you to
+that tool space through the normal actor movement path.
 
 ```
-leave
+out
 ```
 
-Calls `<here>:leave()`. The inverse of `enter`.
+Calls `<here>:go("out")`. Mounted space-type entities should provide an
+`out` exit whose destination is the room they are mounted in.
 
 When you arrive somewhere new, you'll typically see:
 - An `entered` observation broadcast to the destination room.

@@ -60,6 +60,11 @@ import {
   browserOpenSeedVerbLookups
 } from "../src/core/browser-open-seed-contract";
 
+async function moveActorToScope(world: ReturnType<typeof createWorld>, session: { id: string; actor: string }, scope: ObjRef, requestId: string): Promise<void> {
+  const moved = await world.directCall(requestId, session.actor, session.actor, "moveto", [scope], { sessionId: session.id });
+  expect(moved.op).toBe("result");
+}
+
 describe("shadow browser node shim", () => {
   it("opens a browser-style dubspace node and commits a real control action", async () => {
     const { browser } = await browserForScope("the_dubspace", "guest:browser-dubspace");
@@ -252,7 +257,6 @@ describe("shadow browser node shim", () => {
   it("does not let live-persistence turns dirty the next durable dubspace turn", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:browser-dubspace-live-before-commit");
-    anchor.setProp("the_dubspace", "operators", [session.actor]);
     const relay = createShadowBrowserRelayShim({
       node: "browser-relay",
       scope: "the_dubspace",
@@ -652,8 +656,8 @@ describe("shadow browser node shim", () => {
     const anchor = createWorld();
     const firstSession = anchor.auth("guest:browser-live-a");
     const secondSession = anchor.auth("guest:browser-live-b");
-    await anchor.directCall("browser-live-a-enter", firstSession.actor, "the_dubspace", "enter", [], { sessionId: firstSession.id });
-    await anchor.directCall("browser-live-b-enter", secondSession.actor, "the_dubspace", "enter", [], { sessionId: secondSession.id });
+    await moveActorToScope(anchor, firstSession, "the_dubspace", "browser-live-a-move");
+    await moveActorToScope(anchor, secondSession, "the_dubspace", "browser-live-b-move");
     const relay = createShadowBrowserRelayShim({
       node: "browser-live-relay",
       scope: "the_dubspace",
@@ -803,8 +807,8 @@ describe("shadow browser node shim", () => {
     const anchor = createWorld();
     const firstSession = anchor.auth("guest:browser-state-a");
     const secondSession = anchor.auth("guest:browser-state-b");
-    await anchor.directCall("browser-state-a-enter", firstSession.actor, "the_dubspace", "enter", [], { sessionId: firstSession.id });
-    await anchor.directCall("browser-state-b-enter", secondSession.actor, "the_dubspace", "enter", [], { sessionId: secondSession.id });
+    await moveActorToScope(anchor, firstSession, "the_dubspace", "browser-state-a-move");
+    await moveActorToScope(anchor, secondSession, "the_dubspace", "browser-state-b-move");
     const relay = createShadowBrowserRelayShim({
       node: "browser-state-relay",
       scope: "the_dubspace",
@@ -876,7 +880,7 @@ describe("shadow browser node shim", () => {
     }
     const sessions = await Promise.all(Array.from({ length: 4 }, async (_item, index) => {
       const session = anchor.auth(`guest:browser-projection-fanout-${index}`);
-      await anchor.directCall(`browser-projection-fanout-enter-${index}`, session.actor, "the_dubspace", "enter", [], { sessionId: session.id });
+      await moveActorToScope(anchor, session, "the_dubspace", `browser-projection-fanout-move-${index}`);
       return session;
     }));
     const relay = createShadowBrowserRelayShim({
@@ -1563,8 +1567,8 @@ describe("shadow browser node shim", () => {
     const anchor = createWorld();
     const firstSession = anchor.auth("guest:browser-catchup-stale-a");
     const secondSession = anchor.auth("guest:browser-catchup-stale-b");
-    await anchor.directCall("browser-catchup-stale-a-enter", firstSession.actor, "the_dubspace", "enter", [], { sessionId: firstSession.id });
-    await anchor.directCall("browser-catchup-stale-b-enter", secondSession.actor, "the_dubspace", "enter", [], { sessionId: secondSession.id });
+    await moveActorToScope(anchor, firstSession, "the_dubspace", "browser-catchup-stale-a-move");
+    await moveActorToScope(anchor, secondSession, "the_dubspace", "browser-catchup-stale-b-move");
     const relay = createShadowBrowserRelayShim({
       node: "browser-catchup-stale-relay",
       scope: "the_dubspace",
@@ -1619,8 +1623,8 @@ describe("shadow browser node shim", () => {
     const anchor = createWorld();
     const firstSession = anchor.auth("guest:browser-mux-a");
     const secondSession = anchor.auth("guest:browser-mux-b");
-    await anchor.directCall("browser-mux-a-enter", firstSession.actor, "the_dubspace", "enter", [], { sessionId: firstSession.id });
-    await anchor.directCall("browser-mux-b-enter", secondSession.actor, "the_dubspace", "enter", [], { sessionId: secondSession.id });
+    await moveActorToScope(anchor, firstSession, "the_dubspace", "browser-mux-a-move");
+    await moveActorToScope(anchor, secondSession, "the_dubspace", "browser-mux-b-move");
     const relay = createShadowBrowserRelayShim({
       node: "browser-mux-relay",
       scope: "the_dubspace",
@@ -1733,7 +1737,6 @@ describe("shadow browser node shim", () => {
 
   it("honors a selected delegated executor and replies with executable cache material", async () => {
     const { browser, actor } = await browserForScope("the_dubspace", "guest:browser-selected-executor", async (world, session) => {
-      world.setProp("the_dubspace", "operators", [session.actor]);
     });
     const call: ShadowTurnCall = {
       kind: "woo.turn_call.shadow.v1",
@@ -1787,7 +1790,6 @@ describe("shadow browser node shim", () => {
 
   it("executes default server-assisted intents through the guarded relay executor", async () => {
     const { browser } = await browserForScope("the_dubspace", "guest:browser-authoritative-intent", async (world, session) => {
-      world.setProp("the_dubspace", "operators", [session.actor]);
     });
     const metrics: MetricEvent[] = [];
     const envelope = shadowBrowserEnvelope(browser, "woo.turn.intent.request.shadow.v1", {
@@ -1854,7 +1856,6 @@ describe("shadow browser node shim", () => {
 
   it("carries selected delegated executors through server-assisted intent planning", async () => {
     const { browser, actor } = await browserForScope("the_dubspace", "guest:browser-selected-intent-executor", async (world, session) => {
-      world.setProp("the_dubspace", "operators", [session.actor]);
     });
     const planningCall: ShadowTurnCall = {
       kind: "woo.turn_call.shadow.v1",
@@ -1898,7 +1899,6 @@ describe("shadow browser node shim", () => {
 
   it("serves executable state transfer requests without committing the turn", async () => {
     const { browser, actor } = await browserForScope("the_dubspace", "guest:browser-state-repair", async (world, session) => {
-      world.setProp("the_dubspace", "operators", [session.actor]);
     });
     const call: ShadowTurnCall = {
       kind: "woo.turn_call.shadow.v1",
@@ -1938,7 +1938,6 @@ describe("shadow browser node shim", () => {
 
   it("compacts repeated executable state transfer known-page echoes behind a browser-held set token", async () => {
     const { browser, actor } = await browserForScope("the_dubspace", "guest:browser-known-pages", async (world, session) => {
-      world.setProp("the_dubspace", "operators", [session.actor]);
     });
     const call: ShadowTurnCall = {
       kind: "woo.turn_call.shadow.v1",
@@ -1999,7 +1998,7 @@ describe("shadow browser node shim", () => {
   it("does not let a stale browser close remove replacement node auth", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:browser-reload-auth");
-    await anchor.directCall("browser-reload-auth-enter", session.actor, "the_dubspace", "enter", [], { sessionId: session.id });
+    await moveActorToScope(anchor, session, "the_dubspace", "browser-reload-auth-move");
     const relay = createShadowBrowserRelayShim({
       node: "browser-relay",
       scope: "the_dubspace",
@@ -2050,8 +2049,8 @@ describe("shadow browser node shim", () => {
     const anchor = createWorld();
     const sessionA = anchor.auth("guest:b9-a");
     const sessionB = anchor.auth("guest:b9-b");
-    await anchor.directCall("b9-a-enter", sessionA.actor, "the_dubspace", "enter", [], { sessionId: sessionA.id });
-    await anchor.directCall("b9-b-enter", sessionB.actor, "the_dubspace", "enter", [], { sessionId: sessionB.id });
+    await moveActorToScope(anchor, sessionA, "the_dubspace", "b9-a-move");
+    await moveActorToScope(anchor, sessionB, "the_dubspace", "b9-b-move");
     const relay = createShadowBrowserRelayShim({ node: "b9-relay", scope: "the_dubspace", serialized: anchor.exportWorld() });
     const a = createShadowBrowserNode({ node: "b9-a", scope: "the_dubspace", actor: sessionA.actor, session: sessionA.id, relay });
     const b = createShadowBrowserNode({ node: "b9-b", scope: "the_dubspace", actor: sessionB.actor, session: sessionB.id, relay });
@@ -2254,7 +2253,7 @@ async function browserForScope<T = undefined>(
 ): Promise<{ browser: ShadowBrowserNode; actor: ObjRef; seed: T }> {
   const anchor = createWorld();
   const session = anchor.auth(token);
-  await anchor.directCall(`${token}:enter:${scope}`, session.actor, scope, "enter", [], { sessionId: session.id });
+  await moveActorToScope(anchor, session, scope, `${token}:move:${scope}`);
   const seed = await setup?.(anchor, session) as T;
   const relay = createShadowBrowserRelayShim({
     node: "browser-relay",

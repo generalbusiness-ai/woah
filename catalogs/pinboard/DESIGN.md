@@ -18,7 +18,7 @@ But now the design is more extensible and MOO-like:
 | Class | Parent | Description |
 |---|---|---|
 | `$pin` | `$note` | Pinboard note. `$note` subclass with an optional `.color`; remembers its color across moves. |
-| `$pinboard` | `$space` | Spatial bulletin board. Holds `$note` descendants in `.contents` and tracks per-pin layout (x/y/w/h/z) keyed by pin object id. |
+| `$pinboard` | `$room` | Spatial bulletin board. Holds `$note` descendants in `.contents` and tracks per-pin layout (x/y/w/h/z) keyed by pin object id. |
 | `$kanban_board` | `$space` | Ordered-column board. Holds `$note` descendants as cards, including `$pin`, but tracks them in ordered lists within columns instead of freeform x/y layout. |
 
 ## Why redesign
@@ -40,13 +40,14 @@ SPA host supplies scoped projection data, verb-call services, and the current
 pinboard view; drag/resize gesture plumbing remains host-owned until the frame
 action model carries those gestures directly.
 
-Browser clients route Pinboard through v2. Enter/leave commit because durable
-board presence is the authorization precondition for sequenced note/layout
-edits. Viewport telemetry and read-only note hydration execute on the v2 direct
-plane with `live`; create, edit, recolor, layout, take, and drop execute
-on the commit plane. The embedded mini-chat also uses the catalog command
-planner over v2 so command aliases remain catalog-owned instead of being parsed
-in client code.
+Browser clients route Pinboard through v2. Activating the Pinboard tab moves the
+actor to the board with the normal actor `moveto` path, so durable board
+presence remains the authorization precondition for sequenced note/layout edits
+without a component-level Enter/Leave control. Viewport telemetry and read-only
+note hydration execute on the v2 direct plane with `live`; create, edit,
+recolor, layout, take, and drop execute on the commit plane. The embedded
+mini-chat also uses the catalog command planner over v2 so command aliases
+remain catalog-owned instead of being parsed in client code.
 
 The browser renders immediately from structural projection: board layout,
 projected pin ids, note placement, color, and presence overlays. If that
@@ -57,9 +58,9 @@ That catalog view state outranks later weaker generic projection, so a stale or
 partial projection snapshot cannot blank note text that was already learned from
 observations or `list_notes`.
 
-Pinboard `enter`/`leave` return only the board room and subscriber lists. They
-intentionally do not request a full `here` payload: v2 commit validation treats
-post-commit projection reads as ordinary transcript reads, and a board-mounted
+Pinboard actor movement intentionally requests only the deferred room refresh
+needed by the browser. It does not require a full nested board payload:
+post-commit projection reads are ordinary transcript reads, and a board-mounted
 parent-room snapshot can otherwise read the board's post-increment `next_seq`
 while validating against the pre-commit head. The browser already refreshes the
 board overlay through the v2 state plane.
@@ -74,22 +75,23 @@ $thing
   │     └── $note             (catalogs/note)
   │           └── $pin        (catalogs/pinboard, adds .color)
   └── $space                  (core)
-        ├── $pinboard         (catalogs/pinboard)
-        │      .contents holds $note descendants and actors currently inside
-        │      .layout map keyed by pin obj id → {x,y,w,h,z}
-        │      .next_z, .palette, .viewport, .mount_room
-        │      presence semantics from $space
-        └── $kanban_board     (catalogs/pinboard)
+        └── $room             (catalogs/chat)
+          ├── $pinboard       (catalogs/pinboard)
+          │    .contents holds $note descendants and actors currently inside
+          │    .layout map keyed by pin obj id → {x,y,w,h,z}
+          │    .next_z, .palette, .viewport, .mount_room
+          │    presence semantics from $room
+          └── $kanban_board   (catalogs/pinboard)
                .contents holds $note descendants
                .columns list of {id, title, cards[]} (ordered)
                .next_column_id, .mount_room
-               presence semantics from $space
+               presence semantics from $room
 ```
 
 `$pinboard` is not a subclass of any "physical board" abstraction — it
-behaves like one because the chat surface (look/enter/leave/say/page)
-applies wherever `$space` descendants live. The board reads as physical
-because it shares those verbs, not because of cross-tree inheritance.
+behaves like one because room look, exits, movement hooks, say, and page
+apply wherever `$room` descendants live. The board reads as physical
+because it shares those behaviors, not because of cross-tree inheritance.
 
 ## Data shapes
 
@@ -168,12 +170,12 @@ Adds:
 | Verb | Purpose |
 | --- | --- |
 | `look` / `look_self` | Standard space look surface; returns the joined view (pins + layout + presence). |
-| `enter` / `leave` / `out` | Move the actor into/out of the board and subscribe/unsubscribe from incremental observations. `leave` and `out` return to `mount_room` when set, otherwise actor home. Enter/leave physically move actors and can cross hosts because bundled `the_pinboard` has `host_placement: "self"`. |
+| room movement / `out` | Actors arrive through the substrate `moveto` chain, normally from browser tab activation or an exit. `out` is the inherited room command resolved through an exit whose destination is seeded by the world catalog. `$pinboard` defines no public lifecycle verbs of its own. |
 | `viewport(x, y, w, h, scale)` | Frontend telemetry for client-side panning/zoom. |
 | `list_notes` | Returns `[{ id, name, text, color, owner, writers, x, y, w, h, z }]` joining contents + layout. |
 | `acceptable(object)` | Returns `isa(object, $note) || isa(object, $actor)`. Notes and actors can enter; layout verbs ignore actors. |
-| `enterfunc(object)` | Called by core when an object arrives. For notes, allocates default layout if missing and fires `pin_added`; actors are accepted without layout. |
-| `exitfunc(object)` | Called when an object leaves. For notes, removes its layout entry and fires `pin_removed`; actors are ignored. |
+| `enterfunc(object)` | Called by core when an object arrives. For actors, emits `pinboard_entered` plus mounted-room activity. For notes, allocates default layout if missing and fires `pin_added`. |
+| `exitfunc(object)` | Called when an object leaves. For actors, emits `pinboard_left` plus mounted-room activity. For notes, removes its layout entry and fires `pin_removed`. |
 | `post(pin)` | Convenience: `moveto(pin, this)` after the type check. Same effect as `pin:moveto(this)`. |
 | `drop(object)` | Sequenced room-style convenience for a carried note. Resolves the carried object, requires `location(pin) == actor`, and calls `moveto(pin, this)`, so `enterfunc` owns placement. |
 | `take(pin)` | Move pin to the actor's inventory. **Note-controller-only**: pin author or wizard. Board owners use `:eject` for curation; this verb does not grant board-owner authority. |
@@ -496,7 +498,7 @@ client projection rather than through a full-world snapshot model.
 
 - Multi-line pin text. v0.1's single-line model becomes a list-of-strings
   via `$note.text`. Frontend needs to render multi-line.
-- Should `move_pin` and `resize_pin` require board-presence (`enter`)?
+- Should `move_pin` and `resize_pin` require board-presence (actor location in the board)?
   v0.1 didn't. Probably fine.
 - Auto-recycle on `:eject` instead of moving to actor inventory? The
   ejecting actor may not want a stranger's pin in their inventory.

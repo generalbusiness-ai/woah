@@ -191,7 +191,7 @@ without subsequent merges stomping receiver-side ledger writes.
 
 | Name | Carrier | Pattern |
 |---|---|---|
-| `next_seq`, `subscribers`, `operators`, `focus_list`, `last_snapshot_seq` | `$space` instances / actors | per-host live state |
+| `next_seq`, `subscribers`, `focus_list`, `last_snapshot_seq` | `$space` instances / actors | per-host live state |
 | `bootstrap_token_used`, `wizard_actions`, `applied_migrations`, `catalog_migration_records`, `installed_catalogs` | `$system` | per-host ledger |
 | `_subscribers_scrubbed_v1` | `$space` descendants the receiver hosts a local copy of | per-host one-shot scrub marker (host-side scrub of stale subscribers, gated to fire once per object) |
 

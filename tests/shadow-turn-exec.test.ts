@@ -23,6 +23,11 @@ import { InMemoryTurnRecorder } from "../src/core/turn-recorder";
 import { shadowAtomHash, shadowTurnKeyFromCall, shadowTurnKeyFromTranscript, type ShadowTurnKey } from "../src/core/turn-key";
 import type { MetricEvent } from "../src/core/types";
 
+async function moveActorToDubspace(world: ReturnType<typeof createWorld>, actor: string, sessionId: string, requestId: string): Promise<void> {
+  const moved = await world.directCall(requestId, actor, actor, "moveto", ["the_dubspace"], { sessionId });
+  expect(moved.op).toBe("result");
+}
+
 describe("shadow turn execution", () => {
   it("refuses missing state, installs a cell-page transfer, and retries the whole turn", async () => {
     const anchor = createWorld();
@@ -84,7 +89,7 @@ describe("shadow turn execution", () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:shadow-catalog-turn");
     const actor = session.actor;
-    anchor.setProp("the_dubspace", "operators", [actor]);
+    await moveActorToDubspace(anchor, actor, session.id, "shadow-catalog-turn-move");
 
     const serializedBefore = anchor.exportWorld();
     const call: ShadowTurnCall = {
@@ -221,7 +226,7 @@ describe("shadow turn execution", () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:shadow-granular-turn");
     const actor = session.actor;
-    await anchor.directCall("shadow-granular-enter", actor, "the_dubspace", "enter", [], { sessionId: session.id });
+    await moveActorToDubspace(anchor, actor, session.id, "shadow-granular-move");
 
     const serializedBefore = anchor.exportWorld();
     const call: ShadowTurnCall = {
@@ -299,7 +304,7 @@ describe("shadow turn execution", () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:shadow-commit-scope");
     const actor = session.actor;
-    await anchor.directCall("shadow-commit-scope-enter", actor, "the_dubspace", "enter", [], { sessionId: session.id });
+    await moveActorToDubspace(anchor, actor, session.id, "shadow-commit-scope-move");
 
     const serializedBefore = anchor.exportWorld();
     const commitScope = createShadowCommitScope({ node: "stable-anchor", scope: "the_dubspace", serialized: serializedBefore });
@@ -373,7 +378,7 @@ describe("shadow turn execution", () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:shadow-transcript-only-exec");
     const actor = session.actor;
-    await anchor.directCall("shadow-transcript-only-enter", actor, "the_dubspace", "enter", [], { sessionId: session.id });
+    await moveActorToDubspace(anchor, actor, session.id, "shadow-transcript-only-move");
 
     const serializedBefore = anchor.exportWorld();
     const commitScope = createShadowCommitScope({ node: "stable-anchor", scope: "the_dubspace", serialized: serializedBefore });
@@ -425,7 +430,7 @@ describe("shadow turn execution", () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:shadow-transcript-only-rejected");
     const actor = session.actor;
-    await anchor.directCall("shadow-transcript-only-rejected-enter", actor, "the_dubspace", "enter", [], { sessionId: session.id });
+    await moveActorToDubspace(anchor, actor, session.id, "shadow-transcript-only-rejected-move");
 
     const serializedBefore = anchor.exportWorld();
     const commitScope = createShadowCommitScope({ node: "stable-anchor", scope: "the_dubspace", serialized: serializedBefore });
@@ -511,8 +516,7 @@ describe("shadow turn execution", () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:shadow-authoritative-stale");
     const actor = session.actor;
-    await anchor.directCall("shadow-authoritative-stale-enter", actor, "the_dubspace", "enter", [], { sessionId: session.id });
-    anchor.setProp("the_dubspace", "operators", [actor]);
+    await moveActorToDubspace(anchor, actor, session.id, "shadow-authoritative-stale-move");
 
     const serializedBefore = anchor.exportWorld();
     const commitScope = createShadowCommitScope({ node: "stable-anchor", scope: "the_dubspace", serialized: serializedBefore });
@@ -932,7 +936,7 @@ describe("shadow turn execution", () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:shadow-page-cache");
     const actor = session.actor;
-    await anchor.directCall("shadow-page-cache-enter", actor, "the_dubspace", "enter", [], { sessionId: session.id });
+    await moveActorToDubspace(anchor, actor, session.id, "shadow-page-cache-move");
 
     const firstSerializedBefore = anchor.exportWorld();
     const firstCall: ShadowTurnCall = {
@@ -1010,7 +1014,7 @@ describe("shadow turn execution", () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:shadow-catalog-cache");
     const actor = session.actor;
-    await anchor.directCall("shadow-catalog-cache-enter", actor, "the_dubspace", "enter", [], { sessionId: session.id });
+    await moveActorToDubspace(anchor, actor, session.id, "shadow-catalog-cache-move");
 
     const serializedBefore = anchor.exportWorld();
     const call: ShadowTurnCall = {
@@ -1095,7 +1099,7 @@ describe("shadow turn execution", () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:shadow-page-integrity");
     const actor = session.actor;
-    await anchor.directCall("shadow-page-integrity-enter", actor, "the_dubspace", "enter", [], { sessionId: session.id });
+    await moveActorToDubspace(anchor, actor, session.id, "shadow-page-integrity-move");
 
     const serializedBefore = anchor.exportWorld();
     const call: ShadowTurnCall = {
@@ -1129,7 +1133,7 @@ describe("shadow turn execution", () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:shadow-cell-page-integrity");
     const actor = session.actor;
-    await anchor.directCall("shadow-cell-page-integrity-enter", actor, "the_dubspace", "enter", [], { sessionId: session.id });
+    await moveActorToDubspace(anchor, actor, session.id, "shadow-cell-page-integrity-move");
 
     const serializedBefore = anchor.exportWorld();
     const call: ShadowTurnCall = {
@@ -1166,7 +1170,7 @@ describe("shadow turn execution", () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:shadow-proof");
     const actor = session.actor;
-    await anchor.directCall("shadow-proof-enter", actor, "the_dubspace", "enter", [], { sessionId: session.id });
+    await moveActorToDubspace(anchor, actor, session.id, "shadow-proof-move");
 
     const serializedBefore = anchor.exportWorld();
     const call: ShadowTurnCall = {
@@ -1207,7 +1211,7 @@ describe("shadow turn execution", () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:shadow-capsule-proof");
     const actor = session.actor;
-    await anchor.directCall("shadow-capsule-enter", actor, "the_dubspace", "enter", [], { sessionId: session.id });
+    await moveActorToDubspace(anchor, actor, session.id, "shadow-capsule-move");
 
     const serializedBefore = anchor.exportWorld();
     const commitScope = createShadowCommitScope({ node: "anchor", scope: "the_dubspace", serialized: serializedBefore });
@@ -1289,7 +1293,7 @@ describe("shadow turn execution", () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:shadow-capsule-binding");
     const actor = session.actor;
-    await anchor.directCall("shadow-capsule-binding-enter", actor, "the_dubspace", "enter", [], { sessionId: session.id });
+    await moveActorToDubspace(anchor, actor, session.id, "shadow-capsule-binding-move");
 
     const serializedBefore = anchor.exportWorld();
     const commitScope = createShadowCommitScope({ node: "anchor", scope: "the_dubspace", serialized: serializedBefore });
@@ -1343,7 +1347,7 @@ describe("shadow turn execution", () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:shadow-need-state");
     const actor = session.actor;
-    await anchor.directCall("shadow-need-state-enter", actor, "the_dubspace", "enter", [], { sessionId: session.id });
+    await moveActorToDubspace(anchor, actor, session.id, "shadow-need-state-move");
 
     const serializedBefore = anchor.exportWorld();
     const beforeWet = anchor.getProp("delay_1", "wet");
@@ -1387,7 +1391,7 @@ describe("shadow turn execution", () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:shadow-need-state-retry");
     const actor = session.actor;
-    await anchor.directCall("shadow-need-state-retry-enter", actor, "the_dubspace", "enter", [], { sessionId: session.id });
+    await moveActorToDubspace(anchor, actor, session.id, "shadow-need-state-retry-move");
 
     const serializedBefore = anchor.exportWorld();
     const call: ShadowTurnCall = {
@@ -1600,7 +1604,7 @@ describe("submitShadowCommit pre-apply rejection (P1.1)", () => {
     const anchor = createWorld();
     const session = anchor.auth(`guest:preapply-${id}`);
     const actor = session.actor;
-    anchor.setProp("the_dubspace", "operators", [actor]);
+    await moveActorToDubspace(anchor, actor, session.id, `preapply-${id}-move`);
     const serializedBefore = anchor.exportWorld();
     const planned = await runShadowTurnCall(authoritativePlanningWorld(serializedBefore), {
       kind: "woo.turn_call.shadow.v1",

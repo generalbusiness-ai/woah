@@ -1,6 +1,6 @@
 {
   "name": "demoworld",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "spec_version": "v1",
   "license": "MIT",
   "description": "First-light demo world. Seeds the Living Room / Deck / Hot Tub setting with portable props, a sulphur-crested cockatoo, and the bundled demo instances of every demo-capable catalog (dubspace, pinboard, outliner, weather, horoscope). Other catalogs define classes/verbs but never depend on demoworld; demoworld owns every demo placement so the layering stays one-way.",
@@ -290,7 +290,21 @@
         ],
         "exits": {
           "southeast": "exit_living_room_southeast",
-          "south": "exit_living_room_south"
+          "se": "exit_living_room_southeast",
+          "sliding door": "exit_living_room_southeast",
+          "door": "exit_living_room_southeast",
+          "deck": "exit_living_room_southeast",
+          "outside": "exit_living_room_southeast",
+          "out": "exit_living_room_southeast",
+          "south": "exit_living_room_south",
+          "s": "exit_living_room_south",
+          "outline": "exit_living_room_outline",
+          "outliner": "exit_living_room_outline",
+          "tree": "exit_living_room_outline",
+          "dubspace": "exit_living_room_dubspace",
+          "dub": "exit_living_room_dubspace",
+          "mix": "exit_living_room_dubspace",
+          "controls": "exit_living_room_dubspace"
         }
       }
     },
@@ -323,8 +337,24 @@
         ],
         "exits": {
           "west": "exit_deck_west",
+          "w": "exit_deck_west",
+          "living room": "exit_deck_west",
+          "lr": "exit_deck_west",
+          "inside": "exit_deck_west",
+          "in": "exit_deck_west",
           "east": "exit_deck_east",
-          "south": "exit_deck_south"
+          "e": "exit_deck_east",
+          "hot tub": "exit_deck_east",
+          "tub": "exit_deck_east",
+          "south": "exit_deck_south",
+          "s": "exit_deck_south",
+          "steps": "exit_deck_south",
+          "down": "exit_deck_south",
+          "garden": "exit_deck_south",
+          "pinboard": "exit_deck_pinboard",
+          "board": "exit_deck_pinboard",
+          "note board": "exit_deck_pinboard",
+          "corkboard": "exit_deck_pinboard"
         }
       }
     },
@@ -689,7 +719,13 @@
         "aliases": ["outline", "outliner", "tree"],
         "focus_by_actor": {},
         "last_undo": {},
-        "mount_room": "the_chatroom"
+        "mount_room": "the_chatroom",
+        "exits": {
+          "out": "exit_outline_out",
+          "back": "exit_outline_out",
+          "living room": "exit_outline_out",
+          "room": "exit_outline_out"
+        }
       }
     },
     {
@@ -729,7 +765,13 @@
           "w": 960,
           "h": 560
         },
-        "mount_room": "the_deck"
+        "mount_room": "the_deck",
+        "exits": {
+          "out": "exit_pinboard_out",
+          "back": "exit_pinboard_out",
+          "deck": "exit_pinboard_out",
+          "room": "exit_pinboard_out"
+        }
       }
     },
     {
@@ -756,14 +798,231 @@
           "mix",
           "controls"
         ],
-        "operators": [],
-        "mount_room": "the_chatroom"
+        "mount_room": "the_chatroom",
+        "exits": {
+          "out": "exit_dubspace_out",
+          "back": "exit_dubspace_out",
+          "living room": "exit_dubspace_out",
+          "room": "exit_dubspace_out"
+        }
       }
     },
     {
       "kind": "attach_feature",
       "consumer": "the_dubspace",
       "feature": "chat:$transparent"
+    },
+    {
+      "kind": "create_instance",
+      "class": "$exit",
+      "as": "exit_living_room_outline",
+      "name": "outline",
+      "description": "A shared outline mounted on the living room wall.",
+      "anchor": "the_chatroom",
+      "properties": {
+        "aliases": [
+          "outline",
+          "outliner",
+          "tree"
+        ],
+        "source": "the_chatroom",
+        "dest": "the_outline",
+        "leave_msg": "You step over to the shared outline.",
+        "oleave_msg": "steps over to the shared outline.",
+        "oarrive_msg": "opens the shared outline."
+      }
+    },
+    {
+      "kind": "create_instance",
+      "class": "$exit",
+      "as": "exit_outline_out",
+      "name": "out",
+      "description": "The way back to the living room.",
+      "anchor": "the_outline",
+      "properties": {
+        "aliases": [
+          "out",
+          "back",
+          "living room",
+          "room"
+        ],
+        "source": "the_outline",
+        "dest": "the_chatroom",
+        "leave_msg": "You step back from the outline.",
+        "oleave_msg": "steps back from the outline.",
+        "oarrive_msg": "returns from the outline."
+      }
+    },
+    {
+      "kind": "create_instance",
+      "class": "$exit",
+      "as": "exit_living_room_dubspace",
+      "name": "dubspace",
+      "description": "The dubspace control surface by the living room speakers.",
+      "anchor": "the_chatroom",
+      "properties": {
+        "aliases": [
+          "dubspace",
+          "dub",
+          "mix",
+          "controls"
+        ],
+        "source": "the_chatroom",
+        "dest": "the_dubspace",
+        "leave_msg": "You step up to the dubspace controls.",
+        "oleave_msg": "steps up to the dubspace controls.",
+        "oarrive_msg": "steps up to the dubspace controls."
+      }
+    },
+    {
+      "kind": "create_instance",
+      "class": "$exit",
+      "as": "exit_dubspace_out",
+      "name": "out",
+      "description": "The way back to the living room.",
+      "anchor": "the_dubspace",
+      "properties": {
+        "aliases": [
+          "out",
+          "back",
+          "living room",
+          "room"
+        ],
+        "source": "the_dubspace",
+        "dest": "the_chatroom",
+        "leave_msg": "You step away from the dubspace controls.",
+        "oleave_msg": "steps away from the dubspace controls.",
+        "oarrive_msg": "steps away from the dubspace controls."
+      }
+    },
+    {
+      "kind": "create_instance",
+      "class": "$exit",
+      "as": "exit_deck_pinboard",
+      "name": "pinboard",
+      "description": "The shared pinboard mounted on the deck wall.",
+      "anchor": "the_deck",
+      "properties": {
+        "aliases": [
+          "pinboard",
+          "board",
+          "note board",
+          "corkboard"
+        ],
+        "source": "the_deck",
+        "dest": "the_pinboard",
+        "leave_msg": "You step over to the pinboard.",
+        "oleave_msg": "steps over to the pinboard.",
+        "oarrive_msg": "starts working at the pinboard."
+      }
+    },
+    {
+      "kind": "create_instance",
+      "class": "$exit",
+      "as": "exit_pinboard_out",
+      "name": "out",
+      "description": "The way back to the deck.",
+      "anchor": "the_pinboard",
+      "properties": {
+        "aliases": [
+          "out",
+          "back",
+          "deck",
+          "room"
+        ],
+        "source": "the_pinboard",
+        "dest": "the_deck",
+        "leave_msg": "You step back from the pinboard.",
+        "oleave_msg": "steps back from the pinboard.",
+        "oarrive_msg": "returns from the pinboard."
+      }
+    },
+    {
+      "kind": "set_property",
+      "object": "the_chatroom",
+      "property": "exits",
+      "value": {
+        "southeast": "exit_living_room_southeast",
+        "se": "exit_living_room_southeast",
+        "sliding door": "exit_living_room_southeast",
+        "door": "exit_living_room_southeast",
+        "deck": "exit_living_room_southeast",
+        "outside": "exit_living_room_southeast",
+        "out": "exit_living_room_southeast",
+        "south": "exit_living_room_south",
+        "s": "exit_living_room_south",
+        "outline": "exit_living_room_outline",
+        "outliner": "exit_living_room_outline",
+        "tree": "exit_living_room_outline",
+        "dubspace": "exit_living_room_dubspace",
+        "dub": "exit_living_room_dubspace",
+        "mix": "exit_living_room_dubspace",
+        "controls": "exit_living_room_dubspace"
+      },
+      "mode": "set"
+    },
+    {
+      "kind": "set_property",
+      "object": "the_deck",
+      "property": "exits",
+      "value": {
+        "west": "exit_deck_west",
+        "w": "exit_deck_west",
+        "living room": "exit_deck_west",
+        "lr": "exit_deck_west",
+        "inside": "exit_deck_west",
+        "in": "exit_deck_west",
+        "east": "exit_deck_east",
+        "e": "exit_deck_east",
+        "hot tub": "exit_deck_east",
+        "tub": "exit_deck_east",
+        "south": "exit_deck_south",
+        "s": "exit_deck_south",
+        "steps": "exit_deck_south",
+        "down": "exit_deck_south",
+        "garden": "exit_deck_south",
+        "pinboard": "exit_deck_pinboard",
+        "board": "exit_deck_pinboard",
+        "note board": "exit_deck_pinboard",
+        "corkboard": "exit_deck_pinboard"
+      },
+      "mode": "set"
+    },
+    {
+      "kind": "set_property",
+      "object": "the_outline",
+      "property": "exits",
+      "value": {
+        "out": "exit_outline_out",
+        "back": "exit_outline_out",
+        "living room": "exit_outline_out",
+        "room": "exit_outline_out"
+      },
+      "mode": "set"
+    },
+    {
+      "kind": "set_property",
+      "object": "the_dubspace",
+      "property": "exits",
+      "value": {
+        "out": "exit_dubspace_out",
+        "back": "exit_dubspace_out",
+        "living room": "exit_dubspace_out",
+        "room": "exit_dubspace_out"
+      },
+      "mode": "set"
+    },
+    {
+      "kind": "set_property",
+      "object": "the_pinboard",
+      "property": "exits",
+      "value": {
+        "out": "exit_pinboard_out",
+        "back": "exit_pinboard_out",
+        "deck": "exit_pinboard_out",
+        "room": "exit_pinboard_out"
+      },
+      "mode": "set"
     },
     {
       "kind": "create_instance",

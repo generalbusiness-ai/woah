@@ -574,7 +574,7 @@ describe("McpHost", () => {
     // listeners), but the MCP layer trims to the caller's session
     // audience so the dubspace tab matches the chatroom tab in
     // single-utterance count.
-    await world.directCall(undefined, session.actor, "the_dubspace", "enter", [], { sessionId: session.id });
+    await world.directCall(undefined, session.actor, session.actor, "moveto", ["the_dubspace"], { sessionId: session.id });
     const dubspaceSayTool = (await host.enumerateTools(session.actor)).find((t) => t.object === "the_dubspace" && t.verb === "say")!;
     expect(dubspaceSayTool).toBeDefined();
     const dubspaceSay = await host.invokeTool(session.actor, session.id, dubspaceSayTool, ["beat"]);
@@ -651,7 +651,7 @@ describe("McpHost", () => {
     const session = world.auth("guest:mcp-seq");
     const host = new McpHost(world);
     host.bindSession(session.id, session.actor);
-    const enteredPinboard = await world.directCall(undefined, session.actor, "the_pinboard", "enter", []);
+    const enteredPinboard = await world.directCall(undefined, session.actor, session.actor, "moveto", ["the_pinboard"], { sessionId: session.id });
     expect(enteredPinboard.op).toBe("result");
 
     const addNote = (await host.enumerateTools(session.actor)).find((t) => t.object === "the_pinboard" && t.verb === "add_note")!;
@@ -3020,22 +3020,22 @@ describe("McpGateway", () => {
       method: "tools/list"
     }, { "mcp-session-id": sessionId! }));
     const initialBody = (await initial.json()) as { result: { tools: Array<{ name: string }> } };
-    expect(initialBody.result.tools.some((t) => t.name === "the_pinboard__enter")).toBe(false);
+    expect(initialBody.result.tools.some((t) => t.name === "the_pinboard__list_notes")).toBe(false);
 
     const actor = Array.from(world.sessions.values())[0]?.actor;
     expect(actor).toBeTruthy();
-    world.setProp(actor!, "focus_list", ["the_pinboard"]);
+    await world.directCall("mcp-refresh-move-pinboard", actor!, actor!, "moveto", ["the_pinboard"], { sessionId: sessionId! });
 
     const staleCall = await gateway.handle(jsonRpcRequest("http://t/mcp", {
       jsonrpc: "2.0",
       id: 3,
       method: "tools/call",
-      params: { name: "the_pinboard__enter", arguments: {} }
+      params: { name: "the_pinboard__list_notes", arguments: {} }
     }, { "mcp-session-id": sessionId! }));
     expect(staleCall.ok).toBe(true);
-    const staleCallBody = (await staleCall.json()) as { result: { isError?: boolean; structuredContent?: { observations?: Array<{ type?: string }> } } };
+    const staleCallBody = (await staleCall.json()) as { result: { isError?: boolean; structuredContent?: { result?: unknown } } };
     expect(staleCallBody.result.isError).not.toBe(true);
-    expect(staleCallBody.result.structuredContent?.observations?.some((o) => o.type === "pinboard_entered")).toBe(true);
+    expect(Array.isArray(staleCallBody.result.structuredContent?.result)).toBe(true);
   });
 
   it("keeps stable actor-control tools available when dynamic actor tools are hidden", async () => {

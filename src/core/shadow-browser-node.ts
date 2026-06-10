@@ -1015,7 +1015,10 @@ function shadowBrowserOpenExecutableSeedPreimages(serialized: SerializedWorld, s
   };
   add(`scope:${scope}`);
   add(`target:${scope}`);
-  if (actor) add(`actor:${actor}`);
+  if (actor) {
+    add(`actor:${actor}`);
+    add(`target:${actor}`);
+  }
   for (const id of byId.get(scope)?.contents ?? []) add(`target:${id}`);
   // A scope's exits and other anchor-cluster objects are not in `contents`
   // (anchor=scope, location=null), but parser verbs can resolve refs to them
@@ -1056,6 +1059,7 @@ function shadowBrowserOpenExecutableSeedPreimages(serialized: SerializedWorld, s
   // of the open envelope; content-specific verbs still arrive through exact
   // missing-state repair after the key exists.
   addOpenSeedDispatchVerbCells(serialized, scope, add);
+  if (actor) addOpenSeedDispatchVerbCells(serialized, actor, add);
   // `command_plan` is itself dispatched on the scope, but the parser reads the
   // visible command surface (candidate names/aliases plus command-shaped verbs)
   // across actors, room contents, inventory, and linked tool rooms. Seed only

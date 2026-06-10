@@ -657,7 +657,6 @@ export function bootstrap(world: WooWorld, options: BootstrapOptions = {}): WooW
 const DYNAMIC_HOST_SEED_PROPERTIES = new Set([
   "next_seq",
   "subscribers",
-  "operators",
   "last_snapshot_seq",
   "focus_list",
   "bootstrap_token_used",
@@ -1164,7 +1163,12 @@ function seedUniversal(world: WooWorld): void {
     argSpec: { args: ["name"], command: { dobj: "any", prep: "any", iobj: "any", args_from: ["argstr"] } }
   });
   native(world, "$player", "on_disfunc", "player_on_disfunc", "verb :on_disfunc() r { ... }", { perms: "r" });
-  native(world, "$player", "moveto", "player_moveto", "verb :moveto(target) r { ... }", { perms: "r" });
+  native(world, "$player", "moveto", "player_moveto", "verb :moveto(target) rxd { ... }", {
+    directCallable: true,
+    perms: "rxd",
+    skipPresenceCheck: true,
+    argSpec: { args: ["target"] }
+  });
   sourceVerb(world, "$player", "tell", PLAYER_TELL_SOURCE, { directCallable: true });
   sourceVerb(world, "$player", "tell_lines", PLAYER_TELL_LINES_SOURCE, { directCallable: true });
   sourceVerb(world, "$player", "help", PLAYER_HELP_SOURCE, {

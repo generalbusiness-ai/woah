@@ -17,6 +17,11 @@ import type { ExecutorCallInput } from "../src/core/executor";
 import type { ShadowRelayCache } from "../src/core/shadow-relay-cache";
 import type { ObjRef, WooValue } from "../src/core/types";
 
+async function moveActorToDubspace(world: ReturnType<typeof createWorld>, session: { id: string; actor: string }, requestId = "dev-v2-dubspace-moveto"): Promise<void> {
+  const moved = await world.directCall(requestId, session.actor, session.actor, "moveto", ["the_dubspace"], { sessionId: session.id });
+  expect(moved.op).toBe("result");
+}
+
 // The dev primitive is scope-aware (matching CF's per-scope ensureRestV2Relay /
 // v2CommitScopePost): it resolves the gateway/commit relay for whatever scope
 // submitTurnIntent asks for. For a same-scope turn the resolvers return the one
@@ -97,7 +102,7 @@ describe("dev v2 durable turn — CF contract parity", () => {
   it("plans on a sparse gateway (repair loop fires) and commits via the authoritative relay", async () => {
     const world = createWorld();
     const session = world.auth("guest:dev-parity");
-    world.setProp("the_dubspace", "operators", [session.actor]);
+    await moveActorToDubspace(world, session);
 
     // Sparse gateway: bootstrap-only seed (NO the_dubspace / delay_1). The
     // authoritative commit relay holds the full world.
@@ -145,7 +150,7 @@ describe("dev v2 durable turn — CF contract parity", () => {
   it("executeDevV2DurableTurnFrame applies the commit to the dev world and returns an applied frame", async () => {
     const world = createWorld();
     const session = world.auth("guest:dev-frame");
-    world.setProp("the_dubspace", "operators", [session.actor]);
+    await moveActorToDubspace(world, session);
     const sparseSeed = createWorld({ catalogs: false }).exportWorld();
     const gatewayRelay = createShadowBrowserRelayShim({ node: "dev:gw-frame", scope: "the_dubspace", serialized: sparseSeed, deployment: "local-dev" });
     const commitRelay = createShadowBrowserRelayShim({ node: "dev:commit-frame", scope: "the_dubspace", serialized: world.exportWorld(), deployment: "local-dev" });
@@ -172,7 +177,7 @@ describe("dev v2 durable turn — CF contract parity", () => {
   it("executeDevV2DurableTurnFrame throws a turn error when the verb raises (parity with the legacy REST contract)", async () => {
     const world = createWorld();
     const session = world.auth("guest:dev-frame-err");
-    world.setProp("the_dubspace", "operators", [session.actor]);
+    await moveActorToDubspace(world, session);
     const sparseSeed = createWorld({ catalogs: false }).exportWorld();
     const gatewayRelay = createShadowBrowserRelayShim({ node: "dev:gw-err", scope: "the_dubspace", serialized: sparseSeed, deployment: "local-dev" });
     const commitRelay = createShadowBrowserRelayShim({ node: "dev:commit-err", scope: "the_dubspace", serialized: world.exportWorld(), deployment: "local-dev" });
@@ -206,7 +211,7 @@ describe("dev v2 durable turn — CF contract parity", () => {
     // gateway, turn 2 is warm (no new repair) and commits at the advanced head.
     const world = createWorld();
     const session = world.auth("guest:dev-warm");
-    world.setProp("the_dubspace", "operators", [session.actor]);
+    await moveActorToDubspace(world, session);
     const gatewayRelay = createShadowBrowserRelayShim({ node: "dev:gw-warm", scope: "the_dubspace", serialized: createWorld({ catalogs: false }).exportWorld(), deployment: "local-dev" });
     const commitRelay = createShadowBrowserRelayShim({ node: "dev:commit-warm", scope: "the_dubspace", serialized: world.exportWorld(), deployment: "local-dev" });
 
@@ -359,10 +364,10 @@ describe("dev v2 durable turn — CF contract parity", () => {
   // carry reply_to = the original intent envelope id, or the SPA's pending-turn
   // set never drains (the wait cursor spins forever). True for BOTH a committed
   // turn and a verb that raised.
-  function wsReplyHarness(actorAllowed: boolean, verb: string, id: string) {
+  async function wsReplyHarness(actorAllowed: boolean, verb: string, id: string) {
     const world = createWorld();
     const session = world.auth(`guest:dev-ws-${id}`);
-    if (actorAllowed) world.setProp("the_dubspace", "operators", [session.actor]);
+    if (actorAllowed) await moveActorToDubspace(world, session);
     const gatewayRelay = createShadowBrowserRelayShim({ node: `dev:gw-ws-${id}`, scope: "the_dubspace", serialized: createWorld({ catalogs: false }).exportWorld(), deployment: "local-dev" });
     const commitRelay = createShadowBrowserRelayShim({ node: `dev:commit-ws-${id}`, scope: "the_dubspace", serialized: world.exportWorld(), deployment: "local-dev" });
     const token = shadowBrowserSessionBearer({ id: session.id, actor: session.actor });
@@ -377,7 +382,7 @@ describe("dev v2 durable turn — CF contract parity", () => {
   }
 
   it("WS durable success reply is socket-addressed and drains (reply_to = intent id, ok)", async () => {
-    const h = wsReplyHarness(true, "set_control", "dev-ws-ok");
+    const h = await wsReplyHarness(true, "set_control", "dev-ws-ok");
     const { reply } = await executeDevV2DurableTurnWsReply({
       world: h.world, ...fixedResolvers("the_dubspace", h.gatewayRelay, h.commitRelay),
       browser: h.wsBrowser, receipt: h.receipt, call: h.call, node: `dev:exec-${h.call.id}`
@@ -394,7 +399,7 @@ describe("dev v2 durable turn — CF contract parity", () => {
   });
 
   it("dev browser-profile conversion also covers legacy WS exec replies", async () => {
-    const h = wsReplyHarness(true, "set_control", "dev-ws-legacy-profile");
+    const h = await wsReplyHarness(true, "set_control", "dev-ws-legacy-profile");
     const call: ShadowTurnCall = {
       kind: "woo.turn_call.shadow.v1",
       id: h.call.id,
@@ -440,7 +445,7 @@ describe("dev v2 durable turn — CF contract parity", () => {
   });
 
   it("WS durable verb-error reply STILL drains (reply_to = intent id, ok:false) instead of throwing", async () => {
-    const h = wsReplyHarness(true, "__parity_no_such_verb__", "dev-ws-err");
+    const h = await wsReplyHarness(true, "__parity_no_such_verb__", "dev-ws-err");
     const { reply } = await executeDevV2DurableTurnWsReply({
       world: h.world, ...fixedResolvers("the_dubspace", h.gatewayRelay, h.commitRelay),
       browser: h.wsBrowser, receipt: h.receipt, call: h.call, node: `dev:exec-${h.call.id}`
@@ -453,7 +458,7 @@ describe("dev v2 durable turn — CF contract parity", () => {
   });
 
   it("WS durable reply is idempotent: a replayed intent does NOT re-execute (no double commit)", async () => {
-    const h = wsReplyHarness(true, "set_control", "dev-ws-idem");
+    const h = await wsReplyHarness(true, "set_control", "dev-ws-idem");
     const args = {
       world: h.world, ...fixedResolvers("the_dubspace", h.gatewayRelay, h.commitRelay),
       browser: h.wsBrowser, call: h.call, node: "dev:exec-idem"
@@ -480,7 +485,7 @@ describe("dev v2 durable turn — CF contract parity", () => {
     // tail (the CF checkpoint-tail frame-transfer path), not re-send a full
     // projection. localdev shares buildShadowBrowserCatchupTransfer with CF, so
     // this exercises the same catch-up decision in-process.
-    const h = wsReplyHarness(true, "set_control", "dev-ws-recon");
+    const h = await wsReplyHarness(true, "set_control", "dev-ws-recon");
     const resolvers = fixedResolvers("the_dubspace", h.gatewayRelay, h.commitRelay);
     const token = shadowBrowserSessionBearer({ id: h.wsBrowser.session as string, actor: h.wsBrowser.actor });
     const commit = async (id: string, wet: number) => {
@@ -530,7 +535,7 @@ describe("dev v2 durable turn — CF contract parity", () => {
     const repo = new LocalSQLiteRepository(":memory:");
     const world = createWorld({ repository: repo });
     const session = world.auth("guest:dev-tail");
-    world.setProp("the_dubspace", "operators", [session.actor]);
+    await moveActorToDubspace(world, session);
     const token = shadowBrowserSessionBearer({ id: session.id, actor: session.actor });
 
     const makeRelays = () => ({
@@ -611,7 +616,7 @@ describe("dev v2 durable turn — CF contract parity", () => {
     const repo = new LocalSQLiteRepository(":memory:");
     const world = createWorld({ repository: repo });
     const session = world.auth("guest:dev-state-tail");
-    world.setProp("the_dubspace", "operators", [session.actor]);
+    await moveActorToDubspace(world, session);
     const token = shadowBrowserSessionBearer({ id: session.id, actor: session.actor });
 
     // The relay is seeded full-world so the cell-page transfer builder finds the

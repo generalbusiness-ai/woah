@@ -20,7 +20,7 @@ export type DubspaceData = {
   filter: string;
   delay: string;
   drum: string;
-  operators: string[];
+  present: string[];
   actor: string | null;
   inSpace: boolean;
   canSend: boolean;
@@ -57,7 +57,7 @@ export class WooDubspaceWorkspaceElement extends HTMLElement {
     filter: "",
     delay: "",
     drum: "",
-    operators: [],
+    present: [],
     actor: null,
     inSpace: false,
     canSend: false,
@@ -91,13 +91,12 @@ export class WooDubspaceWorkspaceElement extends HTMLElement {
         toolbar: `
           <section class="toolbar dubspace-toolbar">
             <h1>${escapeHtml(data.spaceName || "Dubspace")}</h1>
-            <button data-dubspace-enter ${data.canSend ? "" : "disabled"}>Enter</button>
           </section>
         `,
         layoutClass: "dubspace-layout",
         layoutBody: `
           <div class="card">
-            <p>${escapeHtml(data.spaceDescription || "Enter the dubspace to work at the controls.")}</p>
+            <p>${escapeHtml(data.spaceDescription || "Dubspace controls are unavailable.")}</p>
           </div>
           ${this.renderPresence()}
         `,
@@ -158,12 +157,12 @@ export class WooDubspaceWorkspaceElement extends HTMLElement {
   }
 
   private renderPresence(): string {
-    const operators = this.model.operators;
+    const present = this.model.present;
     return `
       <aside class="card dubspace-presence">
         <h2>At the controls</h2>
         <div class="presence-list">
-          ${operators.map((id) => `<button disabled>${escapeHtml(this.actorLabel(id))}<span>${escapeHtml(id)}</span></button>`).join("") || "<p>No one is at the controls.</p>"}
+          ${present.map((id) => `<button disabled>${escapeHtml(this.actorLabel(id))}<span>${escapeHtml(id)}</span></button>`).join("") || "<p>No one is at the controls.</p>"}
         </div>
       </aside>
     `;
@@ -209,7 +208,6 @@ export class WooDubspaceWorkspaceElement extends HTMLElement {
   }
 
   private bind(): void {
-    this.querySelector<HTMLButtonElement>("[data-dubspace-enter]")?.addEventListener("click", () => this.dispatch("enter"));
     this.querySelector<HTMLButtonElement>("[data-audio]")?.addEventListener("click", () => this.dispatch("audio"));
     this.querySelectorAll<HTMLButtonElement>("[data-loop]").forEach((button) => {
       button.addEventListener("click", () => this.dispatch("loop", { slot: button.dataset.loop ?? "", playing: button.dataset.playing === "true" }));

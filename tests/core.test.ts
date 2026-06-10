@@ -11,6 +11,7 @@ import {
   callInDubspace,
   LocalExecutorContext,
   message,
+  moveActorTo,
   nativeVerb
 } from "./core-support";
 
@@ -54,7 +55,7 @@ describe("woo core", () => {
     expect((world.state(actor).objects.the_dubspace as Record<string, unknown>).description).toBeNull();
     expect((world.state("$wiz").objects.the_dubspace as Record<string, unknown>).description).toBe("private dubspace");
 
-    await callInDubspace(world, session.id, "enter-describe", message(actor, "the_dubspace", "enter", []));
+    await moveActorTo(world, actor, "the_dubspace", { requestId: "move-describe", sessionId: session.id });
     const described = await callInDubspace(world, session.id, "describe-private", message(actor, "the_dubspace", "describe", []));
     expect(described.op).toBe("result");
     if (described.op === "result") expect((described.result as Record<string, unknown>).description).toBeNull();
@@ -677,13 +678,13 @@ describe("woo core", () => {
     chat.setActorPresence(watcher.actor, "the_deck", true);
     chat.setSpaceSubscriber("the_deck", watcher.actor, true);
 
-    const entered = await pinboard.directCall("remote-mounted-pinboard-enter", actor.actor, "the_pinboard", "enter", []);
+    const entered = await chat.directCall("remote-mounted-pinboard-enter", actor.actor, actor.actor, "moveto", ["the_pinboard"], { sessionId: actor.id });
 
     expect(entered.op).toBe("result");
     if (entered.op !== "result") return;
     expect(entered.observations.map((obs) => obs.type)).toEqual(["pinboard_entered", "pinboard_activity"]);
     expect(entered.observations[1]).toMatchObject({ source: "the_deck", board: "the_pinboard", actor: actor.actor });
-    expect(entered.observationAudiences?.[0]).toEqual([]);
+    expect(entered.observationAudiences?.[0]).toEqual([actor.actor]);
     expect(entered.observationAudiences?.[1]).toEqual([watcher.actor]);
   });
 
@@ -905,8 +906,8 @@ describe("woo core", () => {
     expect(world.replay("$catalog_registry", 1, 10).map((entry) => entry.message.verb)).toEqual([]);
     expect(world.object("catalog_dubspace").parent).toBe("$catalog");
     expect(world.object("$space").parent).toBe("$sequenced_log");
-    expect(world.object("$dubspace").parent).toBe("$space");
-    expect(world.object("$pinboard").parent).toBe("$space");
+    expect(world.object("$dubspace").parent).toBe("$room");
+    expect(world.object("$pinboard").parent).toBe("$room");
     expect(world.object("$conversational").parent).toBe("$thing");
     expect(world.object("$dubspace").eventSchemas.has("control_changed")).toBe(true);
     expect(world.verbInfo("the_dubspace", "set_control").source).toContain("target.(name)");
@@ -950,14 +951,14 @@ describe("woo core", () => {
     expect(ids).toContain("$pinboard");
     expect(ids).toContain("$pin");
     expect(ids).toContain("$conversational");
-    expect(ids).not.toContain("the_dubspace");
+    expect(ids).toContain("the_dubspace");
     expect(scoped.sessions).toEqual([]);
     expect(scoped.logs.every(([space]) => space === "the_pinboard")).toBe(true);
     expect(scoped.parkedTaskCounter).toBe(13);
 
     const cluster = createWorldFromSerialized(scoped, { persist: false });
     const clusterSession = cluster.auth("guest:host-scope");
-    const entered = await cluster.directCall("host-scope-enter", clusterSession.actor, "the_pinboard", "enter", []);
+    const entered = await cluster.directCall("host-scope-moveto", clusterSession.actor, clusterSession.actor, "moveto", ["the_pinboard"], { sessionId: clusterSession.id });
     expect(entered.op).toBe("result");
     const created = await cluster.call("host-scope-create", clusterSession.id, "the_pinboard", message(clusterSession.actor, "the_pinboard", "add_note", ["Scoped"]));
     expect(created.op).toBe("applied");
@@ -1006,7 +1007,7 @@ describe("woo core", () => {
     expect(ids).toContain("$dubspace");
     expect(ids).toContain("$loop_slot");
     expect(ids).toContain("slot_1");
-    expect(ids).not.toContain("the_pinboard");
+    expect(ids).toContain("the_pinboard");
     expect(ids).toContain("the_chatroom");
 
     const chatScoped = scopeSerializedWorldToHost(full, "the_chatroom");
@@ -1014,7 +1015,17 @@ describe("woo core", () => {
     const room = chatScoped.objects.find((obj) => obj.id === "the_chatroom");
     const mountedDubspace = chatScoped.objects.find((obj) => obj.id === "the_dubspace");
     expect(chatIds).toContain("the_dubspace");
-    expect(mountedDubspace?.contents).toEqual([]);
+    expect(mountedDubspace?.contents).toEqual([
+      "slot_1",
+      "slot_2",
+      "slot_3",
+      "slot_4",
+      "channel_1",
+      "filter_1",
+      "delay_1",
+      "drum_1",
+      "default_scene"
+    ]);
     expect(room?.contents).toContain("the_dubspace");
   });
 
@@ -1962,7 +1973,7 @@ describe("woo core", () => {
     const secondary = world.ensureSessionForActor("zz-secondary-location-session", actor, "guest");
 
     expect((await world.directCall("primary-enter-chat", actor, "the_chatroom", "enter", [], { sessionId: primary.id })).op).toBe("result");
-    expect((await world.directCall("secondary-enter-dubspace", actor, "the_dubspace", "enter", [], { sessionId: secondary.id })).op).toBe("result");
+    expect((await moveActorTo(world, actor, "the_dubspace", { requestId: "secondary-move-dubspace", sessionId: secondary.id })).op).toBe("result");
 
     expect(world.activeScopeForSession(primary.id)).toBe("the_chatroom");
     expect(world.activeScopeForSession(secondary.id)).toBe("the_dubspace");
@@ -1996,7 +2007,7 @@ describe("woo core", () => {
     const secondary = world.ensureSessionForActor("secondary-audience-session", actor, "guest");
 
     await world.directCall("audience-primary-chat", actor, "the_chatroom", "enter", [], { sessionId: primary.id });
-    await world.directCall("audience-secondary-dubspace", actor, "the_dubspace", "enter", [], { sessionId: secondary.id });
+    await moveActorTo(world, actor, "the_dubspace", { requestId: "audience-secondary-dubspace", sessionId: secondary.id });
     const said = await world.directCall("audience-say", actor, "the_chatroom", "say", ["hello"], { sessionId: primary.id });
 
     expect(said.op).toBe("result");
@@ -2012,7 +2023,7 @@ describe("woo core", () => {
     const inside = world.auth("guest:transparent-inside");
 
     await world.directCall("transparent-outside-enter", outside.actor, "the_chatroom", "enter", [], { sessionId: outside.id });
-    await world.directCall("transparent-inside-enter", inside.actor, "the_dubspace", "enter", [], { sessionId: inside.id });
+    await moveActorTo(world, inside.actor, "the_dubspace", { requestId: "transparent-inside-move", sessionId: inside.id });
     const said = await world.directCall("transparent-say", inside.actor, "the_dubspace", "say", ["beat"], { sessionId: inside.id });
 
     expect(said.op).toBe("result");
@@ -2022,32 +2033,32 @@ describe("woo core", () => {
     }
   });
 
-  it("routes transparent announcements once to child and parent room sessions", async () => {
+  it("routes tool-room announcements once to actors in that room", async () => {
     const world = createWorld();
     const speaker = world.auth("guest:transparent-announcer");
     const inside = world.auth("guest:transparent-announcement-inside");
     const outside = world.auth("guest:transparent-announcement-outside");
 
     await world.directCall("transparent-ann-outside-enter", outside.actor, "the_chatroom", "enter", [], { sessionId: outside.id });
-    await world.directCall("transparent-ann-speaker-enter", speaker.actor, "the_dubspace", "enter", [], { sessionId: speaker.id });
-    await world.directCall("transparent-ann-inside-enter", inside.actor, "the_dubspace", "enter", [], { sessionId: inside.id });
+    await moveActorTo(world, speaker.actor, "the_dubspace", { requestId: "transparent-ann-speaker-move", sessionId: speaker.id });
+    await moveActorTo(world, inside.actor, "the_dubspace", { requestId: "transparent-ann-inside-move", sessionId: inside.id });
 
     const announced = await world.directCall("transparent-announcement", speaker.actor, "the_dubspace", "announce_all", ["pulse"], { sessionId: speaker.id });
 
     expect(announced.op).toBe("result");
     if (announced.op === "result") {
       const textObservations = announced.observations.filter((observation) => observation.type === "text");
-      expect(textObservations.map((observation) => observation.target).sort()).toEqual([speaker.actor, inside.actor, outside.actor].sort());
+      expect(textObservations.map((observation) => observation.target).sort()).toEqual([speaker.actor, inside.actor].sort());
       expect(textObservations.filter((observation) => observation.target === speaker.actor)).toHaveLength(1);
       expect(textObservations.filter((observation) => observation.target === inside.actor)).toHaveLength(1);
-      expect(textObservations.filter((observation) => observation.target === outside.actor)).toHaveLength(1);
+      expect(textObservations.filter((observation) => observation.target === outside.actor)).toHaveLength(0);
       const sessionsByTarget = Object.fromEntries(textObservations.map((observation, index) => [
         String(observation.target),
         announced.observationSessionAudiences?.[index] ?? []
       ]));
       expect(sessionsByTarget[speaker.actor]).toEqual([speaker.id]);
       expect(sessionsByTarget[inside.actor]).toEqual([inside.id]);
-      expect(sessionsByTarget[outside.actor]).toEqual([outside.id]);
+      expect(sessionsByTarget[outside.actor]).toBeUndefined();
     }
   });
 
@@ -2172,8 +2183,8 @@ describe("woo core", () => {
     newest.started = 300;
 
     expect((await world.directCall("primary-promotion-oldest-enter", actor, "the_chatroom", "enter", [], { sessionId: oldest.id })).op).toBe("result");
-    expect((await world.directCall("primary-promotion-middle-enter", actor, "the_dubspace", "enter", [], { sessionId: middle.id })).op).toBe("result");
-    expect((await world.directCall("primary-promotion-newest-enter", actor, "the_dubspace", "enter", [], { sessionId: newest.id })).op).toBe("result");
+    expect((await moveActorTo(world, actor, "the_dubspace", { requestId: "primary-promotion-middle-move", sessionId: middle.id })).op).toBe("result");
+    expect((await moveActorTo(world, actor, "the_dubspace", { requestId: "primary-promotion-newest-move", sessionId: newest.id })).op).toBe("result");
     expect(world.primarySessionForActor(actor)?.id).toBe(oldest.id);
     expect(world.object(actor).location).toBe("the_chatroom");
 
@@ -2237,11 +2248,11 @@ describe("woo core", () => {
     const world = createWorld();
     const session = world.auth("guest:reap");
     const actor = session.actor;
-    await world.directCall("enter-chat-before-reap", actor, "the_chatroom", "enter", []);
-    const enterDubspace = await world.directCall("enter-dubspace-before-reap", actor, "the_dubspace", "enter", []);
+    await world.directCall("enter-chat-before-reap", actor, "the_chatroom", "enter", [], { sessionId: session.id });
+    const enterDubspace = await moveActorTo(world, actor, "the_dubspace", { requestId: "move-dubspace-before-reap", sessionId: session.id });
     expect(enterDubspace.op).toBe("result");
-    expect(world.getProp("the_dubspace", "operators")).toEqual([actor]);
-    await world.directCall("return-chat-before-reap", actor, "the_chatroom", "enter", []);
+    expect(world.propOrNull("the_dubspace", "operators")).toBeNull();
+    await world.directCall("return-chat-before-reap", actor, "the_chatroom", "enter", [], { sessionId: session.id });
     const takeLamp = await world.directCall("take-lamp-before-reap", actor, "the_chatroom", "take", ["lamp"]);
     expect(takeLamp.op).toBe("result");
     expect(world.object("the_lamp").location).toBe(actor);
@@ -2258,7 +2269,7 @@ describe("woo core", () => {
     expect(world.hasPresence(actor, "the_dubspace")).toBe(false);
     expect(world.hasPresence(actor, "the_dubspace")).toBe(false);
     expect(world.hasPresence(actor, "the_chatroom")).toBe(false);
-    expect(world.getProp("the_dubspace", "operators")).toEqual([]);
+    expect(world.propOrNull("the_dubspace", "operators")).toBeNull();
     expect(world.getProp(actor, "description")).toBe("");
     expect(world.getProp(actor, "aliases")).toEqual([]);
     expect(world.getProp(actor, "focus_list")).toEqual([]);
@@ -2269,7 +2280,7 @@ describe("woo core", () => {
 
     const next = world.auth("guest:after-reap");
     expect(next.actor).toBe(actor);
-    expect(world.getProp("the_dubspace", "operators")).toEqual([]);
+    expect(world.propOrNull("the_dubspace", "operators")).toBeNull();
   });
 
   it("rejects calls from expired sessions", async () => {
@@ -2333,7 +2344,7 @@ describe("woo core", () => {
 
   it("runs direct dubspace previews as live-only observations", async () => {
     const { world, actor } = authedWorld();
-    const entered = await world.directCall("enter-dubspace-preview", actor, "the_dubspace", "enter", []);
+    const entered = await moveActorTo(world, actor, "the_dubspace", { requestId: "move-dubspace-preview" });
     expect(entered.op).toBe("result");
     const result = entered.op === "result"
       ? await world.directCall("preview-1", actor, "the_dubspace", "preview_control", ["delay_1", "feedback", 0.42])
@@ -2395,7 +2406,7 @@ describe("woo core", () => {
     // the_dubspace mounts in the_chatroom with the chat:$transparent feature,
     // so a `say` here also propagates to the parent chatroom — say emits two
     // `said` observations, one per audience.
-    const dubspaceEnter = await world.directCall("dubspace-enter", first.actor, "the_dubspace", "enter", []);
+    const dubspaceEnter = await moveActorTo(world, first.actor, "the_dubspace", { requestId: "dubspace-move", sessionId: first.id });
     expect(dubspaceEnter.op).toBe("result");
     const dubspaceSay = dubspaceEnter.op === "result"
       ? await world.directCall("dubspace-say", first.actor, "the_dubspace", "say", ["same feature"])

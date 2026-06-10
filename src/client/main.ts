@@ -236,8 +236,7 @@ const TOOL_TAB_DEFINITIONS: ToolTabDefinition[] = [
     elementSelector: "[data-dubspace-workspace]",
     elementTagAttrs: (subject) => `data-dubspace-workspace data-dubspace-space="${escapeHtml(subject)}"`,
     mount: () => bindDubspace(),
-    enter: () => enterDubspace(),
-    leave: (done) => leaveDubspace(done)
+    enter: () => enterDubspace()
   },
   {
     tab: "pinboard",
@@ -252,8 +251,7 @@ const TOOL_TAB_DEFINITIONS: ToolTabDefinition[] = [
     elementSelector: "[data-pinboard-board]",
     elementTagAttrs: (subject) => `data-pinboard-board data-pinboard-space="${escapeHtml(subject)}"`,
     mount: () => bindPinboard(),
-    enter: () => enterPinboard(),
-    leave: (done) => leavePinboard(done)
+    enter: () => enterPinboard()
   },
   {
     tab: "tasks",
@@ -284,8 +282,7 @@ const TOOL_TAB_DEFINITIONS: ToolTabDefinition[] = [
     elementSelector: "[data-outliner-tree]",
     elementTagAttrs: (subject) => `data-outliner-tree data-outliner-subject="${escapeHtml(subject)}"`,
     mount: () => bindOutliner(),
-    enter: () => enterOutliner(),
-    leave: (done) => leaveOutliner(done)
+    enter: () => enterOutliner()
   }
 ];
 const TOOL_TABS = TOOL_TAB_DEFINITIONS.map((definition) => definition.tab);
@@ -873,12 +870,10 @@ function applyDubspaceObservationSideEffects(observation: any) {
   if (!isDubspaceObservation(observation)) return;
   if (String(observation?.actor ?? "") !== state.actor) return;
   if (observation?.type === "dubspace_entered") {
-    addDubspaceOperator(state.actor);
     markNestedSpaceDeparture(dubspaceSpace());
     if (state.tab !== "dubspace") setTab("dubspace", { mode: "push", leaveCurrent: false });
     requestSpaceChatFocus(dubspaceSpace());
   } else if (observation?.type === "dubspace_left") {
-    removeDubspaceOperator(state.actor);
     if (state.tab === "dubspace") setTab("chat", { mode: "push", leaveCurrent: false });
   }
 }
@@ -1242,33 +1237,38 @@ async function applyLocationRoute(mode: "replace" | "push", route: RouteLocation
     syncUrlFromCurrentState(mode);
     return;
   }
-  const ensureTabPresence = (tab: AppTab) => {
-    toolDefinition(tab)?.enter?.();
-  };
   const viewTab = tabFromViewHint(route.view);
   if (viewTab) {
     const summary = await fetchScopedObjectSummary(route.objectId).catch(() => undefined);
     if (viewTab === "ide") setSelectedObject(route.objectId, { apply: false });
     pinRoutedSubject(viewTab, routeSubjectForTab(viewTab, route.objectId, summary));
     setTab(viewTab, { mode, leaveCurrent: true }, () => {
-      ensureTabPresence(viewTab);
+      enterTabDestination(viewTab);
     });
     return;
   }
 
   const summary = await fetchScopedObjectSummary(route.objectId).catch(() => undefined);
   const inferredTab = routeForObjectId(route.objectId, summary);
-  if (inferredTab === "ide") {
+    if (inferredTab === "ide") {
     setSelectedObject(route.objectId, { apply: false });
     setTab(inferredTab, { mode, leaveCurrent: true }, () => {
-      ensureTabPresence(inferredTab);
+      enterTabDestination(inferredTab);
     });
     return;
   }
   pinRoutedSubject(inferredTab, routeSubjectForTab(inferredTab, route.objectId, summary));
   setTab(inferredTab, { mode, leaveCurrent: true }, () => {
-    ensureTabPresence(inferredTab);
+    enterTabDestination(inferredTab);
   });
+}
+
+function enterTabDestination(tab: AppTab) {
+  if (tab === "chat") {
+    enterChat();
+    return;
+  }
+  toolDefinition(tab)?.enter?.();
 }
 
 function setTab(tab: AppTab, options: { mode?: "replace" | "push"; leaveCurrent?: boolean } = {}, done?: () => void) {
@@ -2305,7 +2305,7 @@ function v2PlanAndExecuteCommand(space: string, text: string, onError?: (error: 
     const persistence = plan.persistence === "durable" || plan.persistence === "live"
       ? plan.persistence
       : route === "direct" ? "live" : "durable";
-    // Sequenced commands on $space-typed targets (e.g. pinboard:enter when its
+    // Sequenced commands on $space-typed targets (e.g. room-like enter commands when their
     // arg_spec.command.route is "sequenced") plan with `space: target`. Honor
     // the substrate's plan.space; otherwise the executed turn's scope is the
     // caller's chat room, the transcript is recorded there, and the dev WS
@@ -2542,10 +2542,7 @@ function receiveLiveEvent(observation: any, options: { provisionalTurnId?: strin
   }
   // Pinboard side effects (window auto-open and viewport cleanup) must fire
   // before the chat-observation branch, because pinboard_* types appear in
-  // both observation lists and the chat branch returns early. The board is a
-  // focus surface, not a place you travel to (catalogs/pinboard/DESIGN.md);
-  // text-command exits switch back to chat through command side effects, while
-  // toolbar Leave stays on the board and exposes the Enter control.
+  // both observation lists and the chat branch returns early.
   if (isPinboardObservation(observation)) {
     const pinboardAnimations = capturePinboardAnimations([observation]);
     if (observation?.type === "pinboard_left") removePinboardViewport(String(observation?.actor ?? ""));
@@ -2555,8 +2552,6 @@ function receiveLiveEvent(observation: any, options: { provisionalTurnId?: strin
         if (state.tab !== "pinboard") setTab("pinboard", { mode: "push", leaveCurrent: false });
         requestSpaceChatFocus(pinboardSpace());
       } else if (observation?.type === "pinboard_left" && state.tab === "pinboard") {
-        // Toolbar Leave means "leave this board presence", not "navigate away";
-        // keep the pinboard mounted so the user sees the Enter control.
         clearPinboardViewports();
       }
     }
@@ -2565,12 +2560,10 @@ function receiveLiveEvent(observation: any, options: { provisionalTurnId?: strin
   if (isDubspaceObservation(observation)) {
     if (String(observation?.actor ?? "") === state.actor) {
       if (observation?.type === "dubspace_entered") {
-        addDubspaceOperator(state.actor);
         markNestedSpaceDeparture(dubspaceSpace());
         if (state.tab !== "dubspace") setTab("dubspace", { mode: "push", leaveCurrent: false });
         requestSpaceChatFocus(dubspaceSpace());
       } else if (observation?.type === "dubspace_left") {
-        removeDubspaceOperator(state.actor);
         if (state.tab === "dubspace") {
           setTab("chat", { mode: "push", leaveCurrent: false });
         }
@@ -2924,7 +2917,7 @@ function bindCommon() {
       const next = button.dataset.tab as AppTab;
       if (next !== "ide") void ensureScopedProjectionReady();
       setTab(next, { mode: "push" }, () => {
-        toolDefinition(next)?.enter?.();
+        enterTabDestination(next);
       });
     });
   });
@@ -2974,10 +2967,12 @@ function installBundledCatalogUi() {
   }
 }
 
-function dubspaceOperators(): string[] {
+function dubspacePresentActors(): string[] {
   const space = dubspaceSpace();
-  const raw = space ? projectedObjectView(space)?.props?.operators : [];
-  return Array.isArray(raw) ? raw.map(String) : [];
+  if (!space) return [];
+  if (String(state.scopedProjection?.here?.id ?? "") === space) return scopedHerePresentActors(state.scopedProjection?.here);
+  if (state.actor && actorPresentInSpace(space)) return [state.actor];
+  return [];
 }
 
 function mountAmbientCompanion(element: HTMLElement, space: string) {
@@ -3015,11 +3010,11 @@ function mountDubspaceComponent() {
   const meta = dubspaceMeta();
   const spaceId = typeof meta.space === "string" ? meta.space : "";
   const space = spaceId ? projectedObjectView(spaceId) ?? dub[spaceId] : null;
-  const operators = dubspaceOperators();
-  const inSpace = actorPresentInSpace(spaceId, operators);
+  const present = dubspacePresentActors();
+  const inSpace = actorPresentInSpace(spaceId, present);
   const lines = chatLinesForSpace(spaceId);
   element.subject = spaceId;
-  element.woo = createChatWooContext(spaceId, [...chatLineActorRefs(lines), ...operators]);
+  element.woo = createChatWooContext(spaceId, [...chatLineActorRefs(lines), ...present]);
   setCustomElementData(element, {
     spaceId,
     spaceName: String(space?.name ?? "Dubspace"),
@@ -3029,7 +3024,7 @@ function mountDubspaceComponent() {
     filter: meta.filter ?? "",
     delay: meta.delay ?? "",
     drum: meta.drum ?? "",
-    operators,
+    present,
     actor: state.actor ?? null,
     inSpace,
     canSend: canSendDubspaceV2(),
@@ -3045,7 +3040,6 @@ function mountDubspaceComponent() {
 function bindDubspaceComponentEvents(element: WooElement) {
   if (element.dataset.dubspaceEventsBound === "true") return;
   element.dataset.dubspaceEventsBound = "true";
-  element.addEventListener("woo-dubspace-enter", enterDubspace);
   element.addEventListener("woo-dubspace-audio", async () => {
     audio ??= new DubAudio();
     if (state.audioOn) {
@@ -3150,65 +3144,22 @@ function bindDubspace() {
 
 function enterDubspace() {
   const space = dubspaceSpace();
-  enterRoomToolSpace({
+  moveActorToToolSpace({
     tab: "dubspace",
     space,
     canSend: canSendDubspaceV2,
-    isPresent: () => actorPresentInSpace(space, dubspaceOperators()),
+    isPresent: () => actorPresentInSpace(space, dubspacePresentActors()),
     onAlreadyPresent: () => {
       void ensureScopedOverlayForTab("dubspace").then(() => {
         if (state.tab === "dubspace") render();
       });
     },
-    onResult: (result) => {
-      setDubspaceOperators(result);
+    onResult: () => {
       void ensureScopedOverlayForTab("dubspace").then(() => {
         if (state.tab === "dubspace") render();
       });
-    },
-    onError: () => {
-      removeDubspaceOperator(state.actor);
     }
   });
-}
-
-function leaveDubspace(done?: () => void) {
-  const space = dubspaceSpace();
-  leaveRoomToolSpace({
-    tab: "dubspace",
-    space,
-    canSend: canSendDubspaceV2,
-    isPresent: () => actorPresentInSpace(space, dubspaceOperators()),
-    onResult: (result) => {
-      setDubspaceOperators(result);
-      void ensureScopedOverlayForTab("dubspace");
-    }
-  }, done);
-}
-
-function setDubspaceOperators(result: any) {
-  const space = dubspaceSpace();
-  const operators = Array.isArray(result)
-    ? result
-    : Array.isArray(result?.operators)
-      ? result.operators
-      : [];
-  if (!space) return;
-  patchDubspaceProjectionProps(space, { operators: operators.map(String) });
-}
-
-function addDubspaceOperator(actor: string | undefined) {
-  const space = dubspaceSpace();
-  if (!actor || !space) return;
-  const operators = dubspaceOperators();
-  if (operators.includes(actor)) return;
-  patchDubspaceProjectionProps(space, { operators: [...operators, actor] });
-}
-
-function removeDubspaceOperator(actor: string | undefined) {
-  const space = dubspaceSpace();
-  if (!actor || !space) return;
-  patchDubspaceProjectionProps(space, { operators: dubspaceOperators().filter((item) => item !== actor) });
 }
 
 function bindPitchDial(dial: HTMLElement) {
@@ -4070,14 +4021,12 @@ function renderChatCommandResult(action: ChatCommandUiAction, result: any, origi
   applyScopedMoveResult(result);
   const { verb, target } = action;
   if (verb === "enter" && target === dubspaceSpace()) {
-    setDubspaceOperators(result);
     setTab("dubspace", { mode: "push", leaveCurrent: false });
     void ensureScopedOverlayForTab("dubspace");
     requestSpaceChatFocus(target);
     return;
   }
   if ((verb === "leave" || verb === "out") && target === dubspaceSpace()) {
-    setDubspaceOperators(result);
     setTab("chat", { mode: "push", leaveCurrent: false });
     focusChatInput();
     return;
@@ -4443,8 +4392,6 @@ function mountPinboardComponent() {
 function bindPinboardComponentEvents(element: WooElement) {
   if (element.dataset.pinboardEventsBound === "true") return;
   element.dataset.pinboardEventsBound = "true";
-  element.addEventListener("woo-pinboard-enter", enterPinboard);
-  element.addEventListener("woo-pinboard-leave", () => leavePinboard());
   element.addEventListener("woo-pinboard-create", (event) => {
     const detail = (event as CustomEvent<{ text?: unknown; color?: unknown }>).detail ?? {};
     const text = String(detail.text ?? state.pinboardNewText).trim();
@@ -5131,6 +5078,46 @@ type RoomToolLifecycleOptions = {
   onError?: (error: any) => void;
 };
 
+type ToolMoveOptions = Omit<RoomToolLifecycleOptions, "route" | "waitForLeaveResult">;
+
+function moveActorToToolSpace(options: ToolMoveOptions) {
+  const { tab, space, canSend } = options;
+  if (!space || !state.actor || !canSend()) return;
+  if ((options.isPresent ?? (() => actorPresentInSpace(space)))() || pendingToolEnters.has(space)) {
+    options.onAlreadyPresent?.();
+    requestSpaceChatFocus(space);
+    return;
+  }
+  beginPendingToolEnter(space);
+  if (state.tab === tab) render();
+  const turnId = v2Turn({
+    scope: space,
+    route: "direct",
+    target: state.actor,
+    verb: "moveto",
+    args: [space],
+    persistence: "durable",
+    onResult: (result) => {
+      clearPendingToolEnter(space);
+      applyScopedMoveResult(result);
+      options.onResult?.(result);
+      if (state.tab === tab) render();
+      requestSpaceChatFocus(space);
+    },
+    onError: (error) => {
+      clearPendingToolEnter(space);
+      options.onError?.(error);
+      if (state.tab === tab) render();
+    }
+  });
+  if (!turnId) {
+    const error = new Error(`failed to move actor into ${tab}`);
+    clearPendingToolEnter(space);
+    options.onError?.(error);
+    if (state.tab === tab) render();
+  }
+}
+
 function enterRoomToolSpace(options: RoomToolLifecycleOptions) {
   const { tab, space, canSend, route = "direct" } = options;
   // Room-like tool mutating verbs pass the substrate's presence gate on
@@ -5221,53 +5208,26 @@ function leaveTasks(done?: () => void) {
 }
 
 function enterOutliner() {
-  enterRoomToolSpace({ tab: "outliner", space: outlinerSpace(), canSend: canSendV2Browser });
-}
-
-function leaveOutliner(done?: () => void) {
-  leaveRoomToolSpace({ tab: "outliner", space: outlinerSpace(), canSend: canSendV2Browser }, done);
+  moveActorToToolSpace({ tab: "outliner", space: outlinerSpace(), canSend: canSendV2Browser });
 }
 
 function enterPinboard() {
   const board = pinboardSpace();
-  enterRoomToolSpace({
+  moveActorToToolSpace({
     tab: "pinboard",
     space: board,
     canSend: canSendPinboardV2,
-    route: "sequenced",
     isPresent: pinboardActorPresent,
     onAlreadyPresent: () => {
       void ensureScopedOverlayForTab("pinboard").then(() => {
         if (state.tab === "pinboard") render();
       });
     },
-    onResult: (result) => {
-      setPinboardPresent(result);
+    onResult: () => {
       // The committed frame updates the projection; forcing list_notes here
       // puts the next user turn behind a redundant read storm.
     }
   });
-}
-
-function leavePinboard(done?: () => void) {
-  const board = pinboardSpace();
-  // Release tab navigation immediately like the other room tools. A stalled
-  // sequenced leave reply must not trap the user on the Pinboard tab; board
-  // presence and viewport cleanup still apply when the result eventually lands.
-  leaveRoomToolSpace({
-    tab: "pinboard",
-    space: board,
-    canSend: canSendPinboardV2,
-    route: "sequenced",
-    isPresent: pinboardActorPresent,
-    onResult: (result) => {
-      setPinboardPresent(result);
-      clearPinboardViewports();
-      // Leaving removes this session from the board viewport snapshot; force the
-      // overlay refresh so stale self-presence does not linger on the map.
-      void ensureScopedOverlayForTab("pinboard", { force: true });
-    }
-  }, done);
 }
 
 function setPinboardPresent(result: any) {

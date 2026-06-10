@@ -1,7 +1,7 @@
 # Outliner — design
 
 A persisted shared hierarchy of short text items, with extremely minimal
-UI: enter/leave, collapse/expand, drag-reorder within siblings,
+UI: tab movement, collapse/expand, drag-reorder within siblings,
 drag-drop across the tree, an undo button, and a per-item hidden
 checkbox (with a client-side toggle to show hidden alongside visible).
 Like other `$space` surfaces, it carries an embedded chat panel.
@@ -11,7 +11,7 @@ Like other `$space` surfaces, it carries an embedded chat panel.
 | Class | Parent | Description |
 |---|---|---|
 | `$outline_item` | `$note` | One tree node. Text lives in the inherited `.text` slot; `.parent` points at another item in the same outliner (or `null` for top-level); `.position` is a 1-indexed sibling rank (siblings carry contiguous `1..N`); `.hidden` is a per-item flag. Optional `.name` distinguishes nodes for `$match`. **Not portable**: overrides inherited `.portable` to `false` for room `take` UX, and also overrides `:moveto` so direct movement cannot put it anywhere except an `$outliner` or `$nowhere`. Removal recycles. |
-| `$outliner` | `$space` | Holds items in `.contents`; tracks per-actor focus and per-actor single-level undo in side maps. Tree shape and item state live on the items themselves. |
+| `$outliner` | `$room` | Holds items in `.contents`; tracks per-actor focus and per-actor single-level undo in side maps. Tree shape and item state live on the items themselves. |
 
 Items are first-class objects (objref-addressable), matching the
 `$pin < $note` / kanban-card pattern. This keeps content/permissions
@@ -43,16 +43,17 @@ $thing
   │                 :moveto override   rejects targets that aren't $outliner (or recycling)
   │                 :recycle handler   defensive tree cleanup for direct recycle(item)
   └── $space
-        └── $outliner                  (catalogs/outliner)
-              .contents holds $outline_item descendants and present actors
-              .focus_by_actor          per-actor focus into the tree
-              .last_undo               per-actor single inverse-op slot
-              .mount_room              standard space mount pattern
+        └── $room                     (catalogs/chat)
+              └── $outliner            (catalogs/outliner)
+                    .contents holds $outline_item descendants and present actors
+                    .focus_by_actor     per-actor focus into the tree
+                    .last_undo          per-actor single inverse-op slot
+                    .mount_room         standard space mount pattern
 ```
 
 Like `$pinboard`/`$kanban_board`, `$outliner` is not a subclass of any
-"document" abstraction — it reads as one because every `$space` carries
-the chat surface (look/enter/leave/say/page).
+"document" abstraction — it reads as one because it is a room-shaped
+space with look, exit, speech, and movement-hook behavior.
 
 ## Data shapes
 
@@ -65,9 +66,9 @@ the chat surface (look/enter/leave/say/page).
 | `position` | `$outline_item` | `int`. Sibling rank under `.parent`; siblings of the same parent carry a contiguous dense `1..N` numbering after any mutation. Default `0` (re-stamped on enterfunc). `perms: "r"`. |
 | `hidden` | `$outline_item` | `bool`. Default `false`. Flag is set only on items the user explicitly hid — descendant visual hiding is computed client-side. `perms: "r"`. |
 | `contents` | `$outliner` (built-in) | Items currently in the tree, plus present actors. |
-| `focus_by_actor` | `$outliner` | `map<str, objref \| null>`. Per-actor focus. `null` = root. Reset to `null` on `:enter` and `:leave`. Survives in the map across disconnect/crash but is overwritten on the next `:enter`, so durability is harmless. `perms: "r"`. |
-| `last_undo` | `$outliner` | `map<str, map \| null>`. **Single-level undo**: one slot per actor holding the inverse of their most recent mutation, or `null`/missing if there's nothing to undo. Each new mutation overwrites the slot. `:undo` applies the slot and clears it. **Wiped on `:enter` and on `:leave`**, and any write also prunes entries for actors not currently in `contents(this)`. `perms: "r"`. |
-| `mount_room` | `$outliner` | Optional room hosting the outliner for room-level activity events. Same shape as `$pinboard.mount_room`. `perms: "r"`. |
+| `focus_by_actor` | `$outliner` | `map<str, objref \| null>`. Per-actor focus. `null` = root. Reset to `null` by actor `enterfunc` and pruned by actor `exitfunc`. Survives in the map across disconnect/crash but is overwritten on the next movement into the outliner, so durability is harmless. `perms: "r"`. |
+| `last_undo` | `$outliner` | `map<str, map \| null>`. **Single-level undo**: one slot per actor holding the inverse of their most recent mutation, or `null`/missing if there's nothing to undo. Each new mutation overwrites the slot. `:undo` applies the slot and clears it. **Wiped by actor `enterfunc` and actor `exitfunc`**, and any write also prunes entries for actors not currently in `contents(this)`. `perms: "r"`. |
+| `mount_room` | `$outliner` | Optional room hosting the outliner for room-level activity events and for seeding the demo instance's return exit. Same shape as `$pinboard.mount_room`. `perms: "r"`. |
 
 All item-state properties and outliner-side maps are `perms: "r"` (public
 read, owner+wizard direct-write). Mutations route through verbs.
@@ -91,7 +92,7 @@ only visit-scoped side maps (`focus_by_actor`, `last_undo`) plus its normal
   user-visible need.
 - **Single-level undo is a real simplification.** `last_undo` replaces a
   stack, which avoids pruning large per-actor arrays and makes reconnect
-  behavior easy: clear the one slot on `:enter` and `:leave`.
+  behavior easy: clear the one slot from movement hooks.
 - **Focus remains server-side.** It is not just UI chrome: chat `add` uses
   the actor's focus as the default parent. Keeping it on the outliner gives
   all clients and command paths the same current focus.
@@ -205,11 +206,11 @@ surface.
 | Verb | Perms | Purpose |
 |---|---|---|
 | `look` / `look_self` | anyone | Standard space look surface; returns title, full joined tree, presence. |
-| `enter` / `leave` / `out` | anyone | Move actor in/out and subscribe/unsubscribe. `:enter` clears the actor's `last_undo` slot and resets `focus_by_actor[actor] = null` (so a fresh visit always starts clean, regardless of how the prior session ended). `:leave` clears both again and prunes any other map entries for actors not currently in `contents`. Returns to `mount_room` if set, else `actor.home`. |
+| room movement / `out` | inherited | Actors arrive through the substrate `moveto` chain, normally from browser tab activation or an exit. `out` is the inherited room command resolved through an exit whose destination is seeded by the world catalog. `$outliner` defines no public lifecycle verbs of its own. |
 | `list_items()` | anyone | Joined depth-first view: `[{id, name, text, parent_id, index, hidden, owner, writers, has_children}, …]`. Built by scanning `contents(this)`, grouping items by `.parent`, sorting each group by `.position`, and walking depth-first. `index` is the derived sibling index. Items the actor cannot read return `text: ""`. |
 | `acceptable(object)` | anyone | `isa(object, $outline_item) \|\| isa(object, $actor)`. |
-| `enterfunc(object)` | core | For items: if `item.parent` is unset (fresh item from `create` or a cross-outliner move), leave it at `null` (top-level). If set, validate it points to another item in this outliner — raise `E_INVARG` otherwise. If `item.position` is unset or empty, allocate a position past the last sibling. Emit `outline_item_added`. Actors accepted without tree placement. |
-| `exitfunc(object)` | core | For items leaving this outliner by `moveto`, calls `_detach_item(object, {emit: true, clear_item: true})`. This reparents direct children to the item's former parent, clears the moving item's `.parent` and `.position` so a destination outliner can place it as top-level, and emits `outline_item_removed`. Recycle does not call `exitfunc`; the item-level `:recycle` handler calls the same helper. |
+| `enterfunc(object)` | core | For actors: reset `focus_by_actor[actor]` to `null`, clear that actor's undo slot, and emit `outliner_entered` plus mounted-room activity. For items: if `item.parent` is unset (fresh item from `create` or a cross-outliner move), leave it at `null` (top-level). If set, validate it points to another item in this outliner — raise `E_INVARG` otherwise. If `item.position` is unset or empty, allocate a position past the last sibling. Emit `outline_item_added`. |
+| `exitfunc(object)` | core | For actors: clear that actor's focus/undo entries, prune stale entries for actors no longer present, and emit `outliner_left` plus mounted-room activity. For items leaving this outliner by `moveto`, calls `_detach_item(object, {emit: true, clear_item: true})`. This reparents direct children to the item's former parent, clears the moving item's `.parent` and `.position` so a destination outliner can place it as top-level, and emits `outline_item_removed`. Recycle does not call `exitfunc`; the item-level `:recycle` handler calls the same helper. |
 | `add_item(text, parent_id?, index?)` | anyone present | Composite: `create($outline_item, {owner: actor, parent: parent_id, position: <computed>}) + set_text + moveto(item, this)`. `parent_id` defaults to caller's focus (or `null` if focus is root). `index` chooses where among siblings; default is end. Emits `outline_item_added`. Sets caller's `last_undo` slot to `{verb: "remove_item", args: [new_item]}`. |
 | `set_item_text(item, text)` | item author / writers / wizard | Composite: capture old text for undo, call `item:set_text(text)`, and let inherited `$note:set_text` emit `note_edited`. The outliner does not re-emit text changes. Sets caller's `last_undo` slot to `{verb: "set_item_text", args: [item, old_text]}`. |
 | `move_item(item, new_parent_id, index?)` | anyone present | Re-parent and/or reorder. `new_parent_id == null` means root. Validates same-outliner and no-cycle (raises `E_CYCLE` if `new_parent_id` is `item` or a descendant). Computes a new `.position` from target siblings around `index`, then calls `item:set_parent(new_parent_id) + item:set_position(new_pos)`. Idempotent at current `(parent, index)`: no-op. Emits **exactly one** `outline_item_moved`. Sets caller's `last_undo` slot to `{verb: "move_item", args: [item, old_parent, old_index]}`. |
@@ -240,10 +241,10 @@ per-actor state stored on the outliner (`focus`):
 | `focus <item>` | `:focus_command(item)` | `dobj: "object", prep: "any", iobj: "any", args_from: ["dobj_prefix"], persistence: "durable"` | Calls `focus_on(item)`. |
 | `focus` | `:focus_root_command()` | `dobj: "none", prep: "none", iobj: "none", args_from: [], persistence: "durable"` | Calls `focus_on(null)`. |
 
-These are the only outliner-specific chat verbs; everything else (space
-enter/leave, drag, collapse, undo button, the show-hidden toggle,
-single-item hide via checkbox) is UI-driven against the normal `$space`
-and structural verb surface.
+These are the only outliner-specific chat verbs; everything else (room
+movement, drag, collapse, undo button, the show-hidden toggle,
+single-item hide via checkbox) is UI-driven against the normal room and
+structural verb surface.
 
 ## Focus
 
@@ -251,9 +252,10 @@ Per-(actor, outliner) state. Stored on the outliner rather than the
 actor because:
 - it's scoped to this space (an actor can be present in multiple
   outliners; each has its own focus);
-- it resets on `:enter`, so it doesn't need to outlive the visit;
-- the outliner already holds per-actor undo state, so the lifecycle
-  matches.
+- it resets when the actor moves into the outliner, so it doesn't need
+  to outlive the visit;
+- the outliner already holds per-actor undo state, so the movement-hook
+  lifecycle matches.
 
 `outline_focus_changed` is **directed to the focusing actor only**
 (observation envelope sets `to: actor`). Other clients don't need to
@@ -269,10 +271,10 @@ with the recorded args. There is no stack — every new mutation
 overwrites the slot, so an actor can only undo their most recent
 operation.
 
-- Slot is cleared on both `:enter` and `:leave`, and any write prunes
+- Slot is cleared on actor `enterfunc` and actor `exitfunc`, and any write prunes
   entries for actors not currently in `contents(this)`. A crashed
   session leaves at most one stale record, which is discarded on the
-  actor's next `:enter`.
+  actor's next movement into the outliner.
 - Undo dispatch does **not** write a new inverse — undo is one-way.
   (After an undo, the slot is empty; you can't redo.) Convention:
   every composer verb takes an optional final boolean argument
@@ -647,9 +649,10 @@ The component owns:
   client-local** (per-tab); not part of the server-side hierarchy. The
   user expects different collapse states in different tabs/sessions
   and doesn't want their open-folder choices broadcast.
-- Enter/Leave controls. These call the outliner's normal `$space`
-  `enter`/`leave` verbs; when present, the host mounts the shared
-  minichat into the component's ambient companion slot.
+- No Enter/Leave controls. The host moves the actor into the outliner
+  when the Outliner tab becomes active; the component only renders the
+  workspace and its tool controls. When present, the host mounts the
+  shared minichat into the component's ambient companion slot.
 - **Click-row-to-select, click-again-to-edit.** Selection in the
   browser UI is **client-local** — a per-tab affordance for "the row I'm
   pointing at right now," not round-tripped through the server. A single
@@ -739,13 +742,16 @@ Primitives used here are already in v0:
   performs catalog cleanup before substrate tombstoning.
 
 No new core surface required. No new DO bindings (uses existing
-`$space` infrastructure). No bootstrap changes.
+`$space` infrastructure). Demoworld seeds the sample outliner's in/out
+exits; custom worlds that mount an outliner should do the same.
 
 ## Migrations
 
-First-version catalog (`v0.1.0`): no `migration-v*.json` file; no
-local-boot migration; no DO migration; no spec-version bump. Future
-breaking changes follow `spec/discovery/catalogs.md §CT14`.
+`v1.0.0` promotes `$outliner` from `$space` to `$room`, removes the
+class-owned public `enter`/`leave`/`out` lifecycle verbs, and uses
+movement hooks plus room exits instead. The catalog ships
+`migration-v0-to-v1.json`; no local-boot migration, DO migration, or
+spec-version bump is required.
 
 ## Tests
 
@@ -796,8 +802,8 @@ breaking changes follow `spec/discovery/catalogs.md §CT14`.
 - after `:undo` clears the slot, a follow-up `:undo` is a no-op and
   does not emit `outline_undone`.
 - `eject_item` does not touch the curator's `last_undo` slot.
-- `last_undo` cleared on both `:enter` and `:leave` (re-enter starts
-  fresh even after a crash that skipped `:leave`)
+- `last_undo` cleared by actor movement into and out of the outliner
+  (re-entry starts fresh even after a crash that skipped the exit hook)
 - pruning: writing the slot drops entries belonging to actors not
   currently in `contents(this)`
 - `hidden` flag is only set on the explicitly-flagged item
@@ -815,7 +821,7 @@ listings, text-omitted skeletons with on-demand text fetch).
 - **Redo**. Not requested; can come later. The undo records carry
   enough information to support redo if needed (`{verb, args}` is
   itself the forward op once you've undone it).
-- **Cross-session undo persistence**. Slot is cleared on `:enter` and `:leave`.
+- **Cross-session undo persistence**. Slot is cleared on actor entry and exit hooks.
 - **Server-side collapse state**. Client-local only.
 - **Server-side show-hidden state**. Client-local only.
 - **Multi-select / bulk move**. v0 moves one item at a time.

@@ -18,6 +18,11 @@ import {
 } from "../src/core/shadow-turn-network";
 import { shadowTurnKeyFromTranscript } from "../src/core/turn-key";
 
+async function moveActorToDubspace(world: ReturnType<typeof createWorld>, session: { id: string; actor: string }, requestId: string): Promise<void> {
+  const moved = await world.directCall(requestId, session.actor, session.actor, "moveto", ["the_dubspace"], { sessionId: session.id });
+  expect(moved.op).toBe("result");
+}
+
 // B7 (VTN0 claim 5 / VTN12): state transfer as first-class verifiable cache-fill.
 // The two-node gate the B7 spec note requires: an actor executes a turn on a
 // REMOTE authoritative owner, the reply carries a verifiable state transfer, the
@@ -43,7 +48,7 @@ describe("B7 state-transfer warm cache-fill", () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:b7-warm");
     const actor = session.actor;
-    anchor.setProp("the_dubspace", "operators", [actor]);
+    await moveActorToDubspace(anchor, session, "b7-warm-moveto");
     const serialized = anchor.exportWorld();
 
     // Owner B holds authoritative scope state and is the only node that can
@@ -122,7 +127,7 @@ describe("B7 state-transfer warm cache-fill", () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:b7-relay-cache");
     const actor = session.actor;
-    anchor.setProp("the_dubspace", "operators", [actor]);
+    await moveActorToDubspace(anchor, session, "b7-relay-cache-moveto");
     const serialized = anchor.exportWorld();
     const owner = createShadowExecutionNode({
       node: "owner-B",
@@ -178,7 +183,7 @@ describe("B7 state-transfer warm cache-fill", () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:b7-cold");
     const actor = session.actor;
-    anchor.setProp("the_dubspace", "operators", [actor]);
+    await moveActorToDubspace(anchor, session, "b7-cold-moveto");
     const serialized = anchor.exportWorld();
     const commitScope = createShadowCommitScope({ node: "owner-B", scope: "the_dubspace", serialized });
 

@@ -14,7 +14,7 @@ live sound gestures.
 | `$delay` | `$control` | Control for delay-effect state (send, time, feedback, wet). |
 | `$drum_loop` | `$control` | Control for an eight-step percussion loop (transport, tempo, pattern). |
 | `$scene` | `$root` | Saved control snapshot for scene recall. |
-| `$dubspace` | `$space` | Shared dub-mix space. Composes `$space` sequencing with sound-control verbs. |
+| `$dubspace` | `$room` | Shared dub-mix space. Composes room sequencing/presence with sound-control verbs. |
 
 ## Goal
 
@@ -23,8 +23,9 @@ UI and sound, not chat.
 
 Dubspace is also a mounted thing in the chat world. In the demo seed it lives
 in the Living Room, can be matched by aliases like "dubspace" and "controls",
-and has its own focused UI. Entering that UI means the actor is at the
-controls; the mounted room observes the enter/exit activity.
+and has its own focused UI. Activating that UI moves the actor to the
+controls through the normal movement path; the mounted room observes the
+entry/exit activity from `enterfunc` / `exitfunc`.
 
 The seeded `the_dubspace` instance also attaches ephemeral
 `chat:$transparent`, so the focused Dubspace UI can include the same compact
@@ -46,7 +47,7 @@ for fast reload. No world-level clock is required for ordering.
 
 The catalog declares `dubspace.workspace` as `<woo-dubspace-workspace>` in
 `ui/dubspace-workspace.ts`. The component owns the workstation markup for loop
-slots, filter, delay, percussion, operator presence, and the embedded mini-chat
+slots, filter, delay, percussion, room presence, and the embedded mini-chat
 mount point. The SPA host supplies scoped projection data, audio services, and
 transport callbacks; the component communicates back through `woo-dubspace-*`
 custom events rather than private host DOM bindings.
@@ -61,14 +62,14 @@ custom events rather than private host DOM bindings.
 - One eight-step percussion loop.
 - One saved scene.
 - A mounted-room relationship to the Living Room.
-- An operator list for actors currently at the controls.
+- Presence-derived control authority for actors currently at the controls.
 
 Dubspace follows the workspace roster model. `room_roster()` returns distinct
-actors from `session_subscribers`, enriched as `{id, name, presence,
-idle_seconds?}`; `live_audience(observation?)` is the separate delivery
-contract and delegates to the substrate observation routing rules. The operator
-list remains catalog authority state for control writes, not the presentation
-roster and not the live-delivery index.
+actors from runtime presence, enriched as `{id, name, presence, idle_seconds?}`;
+`live_audience(observation?)` is the separate delivery contract and delegates
+to the substrate observation routing rules. Control authority is not stored in
+a catalog-maintained operator list; verbs call `_require_present()`, which
+authorizes actors whose current location is the dubspace, plus wizards.
 
 ## Persistent State
 
@@ -79,7 +80,6 @@ roster and not the live-delivery index.
 - Delay send, time, feedback, and wet level.
 - Percussion transport (`playing`, `started_at`), tempo, and eight-step pattern.
 - Scene name and saved control values.
-- Operators currently at the controls.
 
 ## Live Slider Previews
 
@@ -92,17 +92,17 @@ The preview layer exists so continuous gestures feel live without filling the `$
 
 Every tab observing the dubspace applies these projected control changes to its
 local audio engine. That is intentional shared-mix behavior: a non-originating
-operator hears loop, transport, scene, and control changes when the room state
+present actor hears loop, transport, scene, and control changes when the room state
 changes.
 
 All Dubspace verbs are catalog-authored Woo source. `:set_control` uses dynamic
 property access (`target.(name) = value`); scenes snapshot the demo's seeded
 controls explicitly from the catalog rather than through core-native handlers.
-Committed control verbs set `skip_presence_check` so control commits are
-authorized by the Dubspace-owned contents/allow-list rather than by room UI
-presence. The verb bodies still authorize writes by
-checking that the target control is contained by the dubspace and that the
-property name is in the catalog's explicit allow-list.
+Committed control verbs set `skip_presence_check` because they run on the
+dubspace object rather than on a carried object. Their bodies explicitly
+authorize by `_require_present()`, then check that the target control is
+contained by the dubspace and that the property name is in the catalog's
+explicit allow-list.
 Any Dubspace verb with `skip_presence_check: true` MUST gate every write in
 the verb body. For dynamic control writes that means `target in contents(this)`
 and `name in allowed`; adding a new control property requires updating that
@@ -132,8 +132,8 @@ Each observation the dubspace emits has a defined payload shape. UI and agents c
 
 | Observation | Payload | When emitted |
 |---|---|---|
-| `dubspace_entered` | `{actor: obj, space: obj, text: str}` | Actor enters the dubspace UI and becomes an operator. |
-| `dubspace_left` | `{actor: obj, space: obj, text: str}` | Actor leaves the dubspace UI and stops being an operator. |
+| `dubspace_entered` | `{actor: obj, space: obj, text: str}` | Actor moves into the dubspace and is present at the controls. |
+| `dubspace_left` | `{actor: obj, space: obj, text: str}` | Actor moves out of the dubspace and is no longer present at the controls. |
 | `dubspace_activity` | `{actor: obj, space: obj, text: str}` | Room-visible mounted-object activity, sourced from the containing room. |
 | `loop_started` | `{slot: obj, loop_id: str}` | `:start_loop` applied. |
 | `loop_stopped` | `{slot: obj}` | `:stop_loop` applied. |
@@ -147,18 +147,18 @@ Each observation the dubspace emits has a defined payload shape. UI and agents c
 | `gesture_progress` | `{actor: obj, target: obj, name: str, value: any}` | Direct call: in-flight slider drag preview. Live-only. |
 | `cursor` | `{actor: obj, x: float, y: float}` | Direct call: pointer position. Live-only. |
 
-All observations include `type` (the table key) and `source` (the dubspace itself, unless noted otherwise). `dubspace_activity` is sourced from the mounted room so actors present in the room see the operator step up/away messages. Observations from sequenced v2 intents (`:set_control`, `:start_loop`, etc.) become part of the resulting applied frame and are replayable. Observations from direct v2 intents (`:enter`, `:leave`, `:preview_control`, `:cursor`) are live-only — see [events.md §12.6](../../spec/semantics/events.md#126-observation-durability-follows-invocation-route).
+All observations include `type` (the table key) and `source` (the dubspace itself, unless noted otherwise). `dubspace_activity` is sourced from the mounted room so actors present in the room see the step up/away messages. Observations from sequenced v2 intents (`:set_control`, `:start_loop`, etc.) become part of the resulting applied frame and are replayable. Observations from direct v2 intents (`:preview_control`, `:cursor`) are live-only — see [events.md §12.6](../../spec/semantics/events.md#126-observation-durability-follows-invocation-route). Movement observations are produced by the substrate move chain through `enterfunc` / `exitfunc`.
 
 ## Live Events
 
-- Operator entered or left the controls.
+- Actor entered or left the controls.
 - Loop started or stopped.
 - Control changed.
 - Percussion step, tempo, and transport changed.
 - Gesture began, moved, ended.
 - Scene saved or recalled.
 
-Gesture previews and operator enter/leave hints go through v2 direct intents (live-only); gesture commits that affect the shared mix go through v2 sequenced intents. The latest committed control values are persistent materialized state.
+Gesture previews go through v2 direct intents (live-only); actor entry/exit hints come from the movement hooks; gesture commits that affect the shared mix go through v2 sequenced intents. The latest committed control values are persistent materialized state.
 
 ## Minimal Interactions
 

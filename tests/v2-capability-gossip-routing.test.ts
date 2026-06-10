@@ -123,7 +123,8 @@ describe("B8 capability gossip routing", () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:b8-migrate");
     const actor = session.actor;
-    anchor.setProp("the_dubspace", "operators", [actor]);
+    const moved = await anchor.directCall("b8-migrate-dubspace-moveto", actor, actor, "moveto", ["the_dubspace"], { sessionId: session.id });
+    expect(moved.op).toBe("result");
     const serialized = anchor.exportWorld();
 
     const ownerB = createShadowExecutionNode({ node: "owner-B", scope: "the_dubspace", serialized, authoritative_state: true });

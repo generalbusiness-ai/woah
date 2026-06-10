@@ -99,7 +99,8 @@ describe("v2 browser delegation", () => {
 async function plannedDubspaceKey() {
   const world = createWorld();
   const session = world.auth("guest:v2-browser-delegation");
-  world.setProp("the_dubspace", "operators", [session.actor]);
+  const moved = await world.directCall("delegation-dubspace-moveto", session.actor, session.actor, "moveto", ["the_dubspace"], { sessionId: session.id });
+  expect(moved.op).toBe("result");
   const call: ShadowTurnCall = {
     kind: "woo.turn_call.shadow.v1",
     id: "delegated-dubspace-turn",

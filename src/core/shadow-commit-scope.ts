@@ -1129,7 +1129,14 @@ function applyMovementProjectionToCommitScopeCache(scope: ShadowCommitScope, tra
   };
   applyMovementProjectionToIndexedState(transcript, mutableObject, undefined);
   applyMovementPresenceProjectionToIndexedState(next, transcript, mutableObject, undefined);
-  commitShadowCommitScopeState(scope, next, { objects: transcriptTouchedObjectIds(transcript) });
+  applyTranscriptSessionLocationToState(next, transcript);
+  const sessionSync = transcript.sessionScopeTransition?.session
+    ? new Set([transcript.sessionScopeTransition.session])
+    : undefined;
+  commitShadowCommitScopeState(scope, next, {
+    objects: transcriptTouchedObjectIds(transcript),
+    ...(sessionSync ? { sessions: sessionSync } : {})
+  });
 }
 
 // Copy the named properties (and their versions) from `existing` onto `row`,

@@ -1,0 +1,11 @@
+{
+  "from_version": "0.x.x",
+  "to_version": "1.0.0",
+  "spec_version": "v1",
+  "steps": [
+    { "kind": "change_parent", "class": "$outliner", "parent": "chat:$room" },
+    { "kind": "drop_verb", "class": "$outliner", "verb": "enter" },
+    { "kind": "drop_verb", "class": "$outliner", "verb": "leave" },
+    { "kind": "drop_verb", "class": "$outliner", "verb": "out" }
+  ]
+}

@@ -97,21 +97,28 @@ export class SmokeSession {
 
   async call(object: string, verb: string, verbArgs: unknown[], signal?: AbortSignal): Promise<unknown> {
     const result = unwrap(await this.callRaw(object, verb, verbArgs, signal));
-    // Move/enter/leave responses carry `room` in structuredContent.result;
+  // Move/enter/out responses carry `room` in structuredContent.result;
     // update tracked room from every successful call.
     if (isRecord(result) && typeof result.room === "string") this.currentRoom = result.room;
     return result;
   }
 
-  // Call `verb` on `space` only if our tracked location matches `space`. Used to
-  // close out a tool space (`pinboard:leave`, `outline:leave`) where an earlier
-  // `enter` may have failed; calling leave from a room we never reached emits a
+  // Call `out` on `space` only if our tracked location matches `space`. Used to
+  // close out a tool space where an earlier movement may have failed; calling
+  // out from a room we never reached emits a
   // confusing E_VERBNF that masks the real upstream failure. Returns true iff
-  // the leave actually fired.
+  // the out actually fired.
   async leaveIfIn(space: string, signal?: AbortSignal): Promise<boolean> {
     if (this.currentRoom !== space) return false;
-    await this.call(space, "leave", [], signal);
+    await this.call(space, "out", [], signal);
     return true;
+  }
+
+  async moveTo(space: string, signal?: AbortSignal): Promise<unknown> {
+    const exit = TOOL_SPACE_EXIT_ALIASES[space];
+    if (!exit) throw new Error(`no smoke movement route for ${space}`);
+    if (!this.currentRoom) throw new Error(`cannot move to ${space}: current room is unknown`);
+    return await this.call(this.currentRoom, "go", [exit], signal);
   }
 
   async callRaw(object: string, verb: string, verbArgs: unknown[], signal?: AbortSignal): Promise<any> {
@@ -150,6 +157,12 @@ export class SmokeSession {
     }).catch(() => undefined);
   }
 }
+
+const TOOL_SPACE_EXIT_ALIASES: Record<string, string> = {
+  the_dubspace: "dubspace",
+  the_outline: "outline",
+  the_pinboard: "pinboard"
+};
 
 // HTTP transport for the deployed and local-workerd lanes: a raw fetch to
 // <baseUrl>/mcp. The per-RPC deadline lives in the session (fetchMcp), so the

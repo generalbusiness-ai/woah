@@ -75,7 +75,7 @@ async function callInDubspace(
     return world.call(requestId, sessionId, "the_dubspace", request);
   }
   if (!world.hasPresence(sessionActor, "the_dubspace")) {
-    const entered = await world.directCall(`enter-${requestId}`, sessionActor, "the_dubspace", "enter", []);
+    const entered = await world.directCall(`move-${requestId}`, sessionActor, sessionActor, "moveto", ["the_dubspace"], { sessionId });
     if (entered.op === "error") return entered;
   }
 
@@ -86,7 +86,7 @@ async function callInDubspace(
     return world.call(requestId, sessionId, "the_dubspace", request);
   }
   if (request.target === "the_dubspace" && verb.direct_callable === true && typeof verb.perms === "string" && verb.perms.includes("x")) {
-    return world.directCall(requestId, request.actor, request.target, request.verb, request.args);
+    return world.directCall(requestId, request.actor, request.target, request.verb, request.args, { sessionId });
   }
   return world.call(requestId, sessionId, "the_dubspace", request);
 }

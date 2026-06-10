@@ -68,7 +68,7 @@ import {
 import type { PlanningAdmissibilityViolation } from "../core/planning-world";
 import { restFrameFromTurnReply } from "../core/protocol";
 import { wooError, type AppliedFrame, type DirectResultFrame, type MetricEvent, type ObjRef, type WooValue } from "../core/types";
-import type { WooWorld } from "../core/world";
+import { normalizeError, type WooWorld } from "../core/world";
 
 const DEV_WORLD_HOST = "world";
 
@@ -592,6 +592,11 @@ async function computeDevV2DurableTurnWsReply(input: DevV2DurableWsReplyInput): 
     await materializeDevV2CommitLocally(input.world, submitted.reply.commit.position.scope, submitted.reply.transcript, {
       commit: submitted.reply.commit
     });
+  }
+  if (submitted.reply.ok && submitted.reply.outcome.error !== undefined) {
+    const error = normalizeError(submitted.reply.outcome.error);
+    const body = verbThrewReplyBody({ id: turnId, scope: input.call.scope, route: input.call.route, error });
+    return { reply: shadowBrowserReplyEnvelopeForReceipt(input.browser, input.receipt, body), submitted };
   }
   const receiverReply = devV2BrowserProfileTurnReply({
     reply: submitted.reply,

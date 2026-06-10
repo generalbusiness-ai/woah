@@ -141,7 +141,7 @@ describe("turn recorder", () => {
     const recorder = new InMemoryTurnRecorder();
     world.setTurnRecorder(recorder);
 
-    const entered = await world.directCall("seq-enter", actor, "the_dubspace", "enter", [], { sessionId: session.id });
+    const entered = await world.directCall("seq-moveto", actor, actor, "moveto", ["the_dubspace"], { sessionId: session.id });
     expect(entered.op).toBe("result");
     recorder.turns.length = 0;
 

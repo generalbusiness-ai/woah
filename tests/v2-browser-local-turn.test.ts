@@ -14,6 +14,36 @@ import { hashSource } from "../src/core/source-hash";
 import type { EffectTranscript } from "../src/core/effect-transcript";
 import type { WooValue } from "../src/core/types";
 
+async function moveActorTo(world: ReturnType<typeof createWorld>, session: { id: string; actor: string }, target: string, requestId: string): Promise<void> {
+  const moved = await world.directCall(requestId, session.actor, session.actor, "moveto", [target], { sessionId: session.id });
+  expect(moved.op).toBe("result");
+}
+
+function toolSpaceMovetoCall(session: { id: string; actor: string }, space: string, id: string): ShadowTurnCall {
+  return {
+    kind: "woo.turn_call.shadow.v1",
+    id,
+    route: "direct",
+    scope: space,
+    session: session.id,
+    actor: session.actor,
+    target: session.actor,
+    verb: "moveto",
+    args: [space]
+  };
+}
+
+function toolSpaceMovetoInput(session: { actor: string }, space: string) {
+  return {
+    route: "direct" as const,
+    scope: space,
+    target: session.actor,
+    verb: "moveto",
+    args: [space],
+    persistence: "durable" as const
+  };
+}
+
 describe("v2 browser local turn planning", () => {
   it("matches server transcripts for representative committed browser surfaces", async () => {
     await expectLocalTranscriptToMatchServer({
@@ -33,7 +63,7 @@ describe("v2 browser local turn planning", () => {
       verb: "add_note",
       args: ["parity pin", "yellow", 48, 48, 180, 110],
       setup: async (world, session) => {
-        await world.directCall("setup-pinboard-parity-enter", session.actor, "the_pinboard", "enter", [], { sessionId: session.id });
+        await moveActorTo(world, session, "the_pinboard", "setup-pinboard-parity-moveto");
       }
     });
     await expectLocalTranscriptToMatchServer({
@@ -55,7 +85,7 @@ describe("v2 browser local turn planning", () => {
       verb: "set_control",
       args: ["delay_1", "wet", 0.42],
       setup: async (world, session) => {
-        world.setProp("the_dubspace", "operators", [session.actor]);
+        await moveActorTo(world, session, "the_dubspace", "setup-dubspace-parity-moveto");
       }
     });
   });
@@ -63,7 +93,7 @@ describe("v2 browser local turn planning", () => {
   it("builds a TurnExecRequest from a warmed browser execution cache", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:v2-browser-local-turn");
-    anchor.setProp("the_dubspace", "operators", [session.actor]);
+    await moveActorTo(anchor, session, "the_dubspace", "browser-local-turn-moveto");
     const serialized = anchor.exportWorld();
     const call = dubspaceCall(session.id, session.actor, 0.42);
     const planned = await runShadowTurnCall(authoritativePlanningWorld(serialized), call);
@@ -139,15 +169,7 @@ describe("v2 browser local turn planning", () => {
       const transfer = buildShadowBrowserOpenExecutableSeedTransfer(relay, scope, `browser:${scope}`, session.actor);
       const tentative_transcripts = tentative
         ? [(await runShadowTurnCall(authoritativePlanningWorld(serialized), {
-          kind: "woo.turn_call.shadow.v1",
-          id: `${scope}:enter`,
-          route: "sequenced",
-          scope,
-          session: session.id,
-          actor: session.actor,
-          target: scope,
-          verb: "enter",
-          args: []
+          ...toolSpaceMovetoCall(session, scope, `${scope}:moveto`)
         })).transcript]
         : [];
       const local = await planV2BrowserLocalTurn({
@@ -172,7 +194,7 @@ describe("v2 browser local turn planning", () => {
     }
   });
 
-  it("plans a cold tool enter from the open executable seed", async () => {
+  it("plans a cold tool movement from the open executable seed", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:v2-browser-local-enter-seed");
     const serialized = anchor.exportWorld();
@@ -192,18 +214,13 @@ describe("v2 browser local turn planning", () => {
       actor: session.actor,
       session: session.id,
       head: { kind: "woo.scope_head.shadow.v1", scope: "the_pinboard", epoch: 1, seq: 0, hash: "root" },
-      id: "pinboard-enter-seed",
-      route: "sequenced",
-      scope: "the_pinboard",
-      target: "the_pinboard",
-      verb: "enter",
-      args: [],
-      persistence: "durable",
+      id: "pinboard-moveto-seed",
+      ...toolSpaceMovetoInput(session, "the_pinboard"),
       transfers: [v2ExecutableTransferRecord(openTransfer, 1)]
     });
     expect(local).toMatchObject({
       ok: true,
-      request: { call: { target: "the_pinboard", verb: "enter" } },
+      request: { call: { target: session.actor, verb: "moveto", args: ["the_pinboard"] } },
       optimistic_frame: {
         op: "result",
         result: { room: "the_pinboard" }
@@ -385,7 +402,7 @@ describe("v2 browser local turn planning", () => {
     }));
   });
 
-  it("preserves stale subscriber rows without authoring derived enter presence writes", async () => {
+  it("records session-scope movement over stale subscriber projection rows", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:v2-browser-local-outliner-scrub");
     anchor.setProp("the_outline", "session_subscribers", [{ session: "expired:test", actor: "stale_actor" }]);
@@ -408,25 +425,26 @@ describe("v2 browser local turn planning", () => {
       actor: session.actor,
       session: session.id,
       head: { kind: "woo.scope_head.shadow.v1", scope: "the_outline", epoch: 1, seq: 0, hash: "root" },
-      id: "outline-enter-scrub",
-      route: "sequenced",
-      scope: "the_outline",
-      target: "the_outline",
-      verb: "enter",
-      args: [],
-      persistence: "durable",
+      id: "outline-moveto-scrub",
+      ...toolSpaceMovetoInput(session, "the_outline"),
       transfers: [v2ExecutableTransferRecord(openTransfer, 1)]
     });
 
     expect(local).toMatchObject({
       ok: true,
-      request: { call: { target: "the_outline", verb: "enter" } },
+      request: { call: { target: session.actor, verb: "moveto", args: ["the_outline"] } },
       optimistic_frame: {
         op: "result",
         result: { room: "the_outline" }
       }
     });
-    if (!local.ok) throw new Error("expected local outliner enter plan");
+    if (!local.ok) throw new Error("expected local outliner moveto plan");
+    expect(local.transcript.sessionScopeTransition).toEqual({
+      session: session.id,
+      actor: session.actor,
+      from: "the_chatroom",
+      to: "the_outline"
+    });
     expect(local.transcript.reads).toEqual(expect.arrayContaining([
       expect.objectContaining({
         cell: { kind: "prop", object: "the_outline", name: "session_subscribers" },
@@ -443,24 +461,26 @@ describe("v2 browser local turn planning", () => {
       expect.objectContaining({ cell: { kind: "prop", object: "the_outline", name: "session_subscribers" } }),
       expect.objectContaining({ cell: { kind: "prop", object: "the_outline", name: "subscribers" } })
     ]));
+    const frameResult = local.optimistic_frame.op === "result" && local.optimistic_frame.result && typeof local.optimistic_frame.result === "object" && !Array.isArray(local.optimistic_frame.result)
+      ? local.optimistic_frame.result as Record<string, WooValue>
+      : {};
+    const here = frameResult.here && typeof frameResult.here === "object" && !Array.isArray(frameResult.here)
+      ? frameResult.here as Record<string, WooValue>
+      : {};
+    expect(here.roster).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: session.actor })
+    ]));
+    expect(here.roster).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "stale_actor" })
+    ]));
   });
 
-  it("plans a local enter over an accepted peer enter transcript", async () => {
+  it("plans a local movement over an accepted peer movement transcript", async () => {
     const anchor = createWorld();
     const first = anchor.auth("guest:v2-browser-local-peer-enter-a");
     const second = anchor.auth("guest:v2-browser-local-peer-enter-b");
     const serialized = anchor.exportWorld();
-    const firstEntered = await runShadowTurnCall(authoritativePlanningWorld(serialized), {
-      kind: "woo.turn_call.shadow.v1",
-      id: "pinboard-peer-enter-a",
-      route: "sequenced",
-      scope: "the_pinboard",
-      session: first.id,
-      actor: first.actor,
-      target: "the_pinboard",
-      verb: "enter",
-      args: []
-    });
+    const firstEntered = await runShadowTurnCall(authoritativePlanningWorld(serialized), toolSpaceMovetoCall(first, "the_pinboard", "pinboard-peer-moveto-a"));
     const relay = createShadowBrowserRelayShim({
       node: "relay:pinboard-peer-enter",
       scope: "the_pinboard",
@@ -485,19 +505,14 @@ describe("v2 browser local turn planning", () => {
       actor: second.actor,
       session: second.id,
       head: { kind: "woo.scope_head.shadow.v1", scope: "the_pinboard", epoch: 1, seq: 1, hash: "peer" },
-      id: "pinboard-peer-enter-b",
-      route: "sequenced",
-      scope: "the_pinboard",
-      target: "the_pinboard",
-      verb: "enter",
-      args: [],
-      persistence: "durable",
+      id: "pinboard-peer-moveto-b",
+      ...toolSpaceMovetoInput(second, "the_pinboard"),
       transfers: [v2ExecutableTransferRecord(openTransfer, 1), promoted.record]
     });
 
     expect(planned).toMatchObject({
       ok: true,
-      request: { call: { target: "the_pinboard", verb: "enter" } },
+      request: { call: { target: second.actor, verb: "moveto", args: ["the_pinboard"] } },
       optimistic_frame: {
         op: "result",
         result: { room: "the_pinboard" }
@@ -515,17 +530,7 @@ describe("v2 browser local turn planning", () => {
       serialized
     });
     const transfer = buildShadowBrowserOpenExecutableSeedTransfer(relay, "the_pinboard", "browser:pinboard-tail", session.actor);
-    const entered = await runShadowTurnCall(authoritativePlanningWorld(serialized), {
-      kind: "woo.turn_call.shadow.v1",
-      id: "pinboard-tail-enter",
-      route: "sequenced",
-      scope: "the_pinboard",
-      session: session.id,
-      actor: session.actor,
-      target: "the_pinboard",
-      verb: "enter",
-      args: []
-    });
+    const entered = await runShadowTurnCall(authoritativePlanningWorld(serialized), toolSpaceMovetoCall(session, "the_pinboard", "pinboard-tail-moveto"));
     const added = await runShadowTurnCall(authoritativePlanningWorld(entered.serializedAfter), {
       kind: "woo.turn_call.shadow.v1",
       id: "pinboard-tail-add",
@@ -606,17 +611,7 @@ describe("v2 browser local turn planning", () => {
       serialized
     });
     const transfer = buildShadowBrowserOpenExecutableSeedTransfer(relay, "the_outline", "browser:outline-tail", session.actor);
-    const entered = await runShadowTurnCall(authoritativePlanningWorld(serialized), {
-      kind: "woo.turn_call.shadow.v1",
-      id: "outline-tail-enter",
-      route: "sequenced",
-      scope: "the_outline",
-      session: session.id,
-      actor: session.actor,
-      target: "the_outline",
-      verb: "enter",
-      args: []
-    });
+    const entered = await runShadowTurnCall(authoritativePlanningWorld(serialized), toolSpaceMovetoCall(session, "the_outline", "outline-tail-moveto"));
     const added = await runShadowTurnCall(authoritativePlanningWorld(entered.serializedAfter), {
       kind: "woo.turn_call.shadow.v1",
       id: "outline-tail-add",
@@ -700,17 +695,7 @@ describe("v2 browser local turn planning", () => {
       serialized
     });
     const seed = buildShadowBrowserOpenExecutableSeedTransfer(relay, "the_outline", "browser:outline-tentative-text", session.actor);
-    const entered = await runShadowTurnCall(authoritativePlanningWorld(serialized), {
-      kind: "woo.turn_call.shadow.v1",
-      id: "outline-tentative-enter-reference",
-      route: "sequenced",
-      scope: "the_outline",
-      session: session.id,
-      actor: session.actor,
-      target: "the_outline",
-      verb: "enter",
-      args: []
-    });
+    const entered = await runShadowTurnCall(authoritativePlanningWorld(serialized), toolSpaceMovetoCall(session, "the_outline", "outline-tentative-moveto-reference"));
     const added = await runShadowTurnCall(authoritativePlanningWorld(entered.serializedAfter), {
       kind: "woo.turn_call.shadow.v1",
       id: "outline-tentative-add-reference",
@@ -736,17 +721,12 @@ describe("v2 browser local turn planning", () => {
       actor: session.actor,
       session: session.id,
       head,
-      id: "outline-tentative-enter",
-      route: "sequenced",
-      scope: "the_outline",
-      target: "the_outline",
-      verb: "enter",
-      args: [],
-      persistence: "durable",
+      id: "outline-tentative-moveto",
+      ...toolSpaceMovetoInput(session, "the_outline"),
       transfers
     });
-    expect(localEnter).toMatchObject({ ok: true, request: { call: { verb: "enter" } } });
-    if (!localEnter.ok) throw new Error("expected local outliner enter");
+    expect(localEnter).toMatchObject({ ok: true, request: { call: { target: session.actor, verb: "moveto", args: ["the_outline"] } } });
+    if (!localEnter.ok) throw new Error("expected local outliner moveto");
 
     const localAdd = await planV2BrowserLocalTurn({
       node: "browser:outline-tentative-text",
@@ -822,17 +802,7 @@ describe("v2 browser local turn planning", () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:v2-browser-local-turn-journal");
     const serialized = anchor.exportWorld();
-    const enterCall: ShadowTurnCall = {
-      kind: "woo.turn_call.shadow.v1",
-      id: "pinboard-enter",
-      route: "sequenced",
-      scope: "the_pinboard",
-      session: session.id,
-      actor: session.actor,
-      target: "the_pinboard",
-      verb: "enter",
-      args: []
-    };
+    const enterCall: ShadowTurnCall = toolSpaceMovetoCall(session, "the_pinboard", "pinboard-moveto");
     const entered = await runShadowTurnCall(authoritativePlanningWorld(serialized), enterCall);
     const addCall: ShadowTurnCall = {
       kind: "woo.turn_call.shadow.v1",
@@ -875,17 +845,12 @@ describe("v2 browser local turn planning", () => {
       actor: session.actor,
       session: session.id,
       head: { kind: "woo.scope_head.shadow.v1", scope: "the_pinboard", epoch: 1, seq: 0, hash: "root" },
-      id: "pinboard-enter",
-      route: "sequenced",
-      scope: "the_pinboard",
-      target: "the_pinboard",
-      verb: "enter",
-      args: [],
-      persistence: "durable",
+      id: "pinboard-moveto",
+      ...toolSpaceMovetoInput(session, "the_pinboard"),
       transfers
     });
-    expect(localEnter).toMatchObject({ ok: true, request: { call: { verb: "enter" } } });
-    if (!localEnter.ok) throw new Error("expected local enter plan");
+    expect(localEnter).toMatchObject({ ok: true, request: { call: { target: session.actor, verb: "moveto", args: ["the_pinboard"] } } });
+    if (!localEnter.ok) throw new Error("expected local moveto plan");
 
     const localAdd = await planV2BrowserLocalTurn({
       node: "browser:test",
@@ -939,17 +904,7 @@ describe("v2 browser local turn planning", () => {
         `browser:${scenario.scope}:one-repair`,
         session.actor
       );
-      const entered = await runShadowTurnCall(authoritativePlanningWorld(serialized), {
-        kind: "woo.turn_call.shadow.v1",
-        id: `${scenario.scope}:one-repair-enter`,
-        route: "sequenced",
-        scope: scenario.scope,
-        session: session.id,
-        actor: session.actor,
-        target: scenario.scope,
-        verb: "enter",
-        args: []
-      });
+      const entered = await runShadowTurnCall(authoritativePlanningWorld(serialized), toolSpaceMovetoCall(session, scenario.scope, `${scenario.scope}:one-repair-moveto`));
 
       const first = await planV2BrowserLocalTurn({
         node: `browser:${scenario.scope}:one-repair`,
@@ -1006,7 +961,7 @@ describe("v2 browser local turn planning", () => {
   it("keeps a turn exec request available when local planning needs delegated state", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:v2-browser-local-turn-missing-state");
-    anchor.setProp("the_dubspace", "operators", [session.actor]);
+    await moveActorTo(anchor, session, "the_dubspace", "browser-local-turn-missing-state-moveto");
     const serialized = anchor.exportWorld();
     const call = dubspaceCall(session.id, session.actor, 0.57);
     const key = shadowTurnKeyFromTranscript((await runShadowTurnCall(authoritativePlanningWorld(serialized), call)).transcript);

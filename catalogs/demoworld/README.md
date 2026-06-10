@@ -1,6 +1,6 @@
 ---
 name: demoworld
-version: 0.1.0
+version: 0.2.0
 spec_version: v1
 license: MIT
 description: First-light demo world. Seeds the Living Room / Deck / Hot Tub setting with portable props, a sulphur-crested cockatoo, and every bundled demo instance (the_dubspace and its controls, the_pinboard, the_outline, the_weather, the_horoscope). Sinks the demo-instance dependency graph — nothing depends on demoworld.
