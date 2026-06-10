@@ -204,3 +204,38 @@ count ≤ actors + 1) exercises both.
   `sessionSubscribersIndex` is consulted when building the fanout audience
   on that shard. A session that was never presence-removed would keep showing
   up in the audience until the next reap cycle.
+
+## Post-mortem: DELETE-resume regression (fixed)
+
+The original A1 change made `closeMcpWooSession` call `markSessionClosed`,
+which runs `removeSessionPresence` + `removeActorActiveLists` on the gateway
+shard world. Those walkers mutate every cached object carrying a
+`session_subscribers`/`operators` row — including tool-space rows the shard
+merely caches (e.g. `the_pinboard` after a tool-scope connect). On a DO
+world, `setProp`/`updateSpaceSubscriberLocal` write through to the durable
+repository, which rejects non-hosted objects with
+`E_OBJNF "object not hosted here: the_pinboard"` (cf-repository.ts ~714).
+The exception aborted `closeMcpWooSession` BEFORE the `/__internal/end-session`
+forward and `unregisterSessionRoute`, so the Directory kept the registration
+and a request with the closed MCP session id resumed successfully
+(tests/worker/cf-local-walkthrough.test.ts:310).
+
+Fix: `sessionCleanupOwned(id)` — close-path cleanup only durably mutates
+objects whose durable home (`hostKeyForObject`) is this world's
+`executorContext.localHost`; single-host worlds own everything. This mirrors
+the projection-apply `hostKey` guard. Skipping cached copies is correct:
+the owning host runs the same cleanup in its own reap, dead sessions are
+excluded from audiences by liveness regardless of stale cached subscriber
+rows, and cached rows converge on the owner's next fanout update.
+
+Race-cluster connection (the nondeterministic cf-dev 7/13 collapse with
+E_PERM/E_NOSESSION on peer steps): the same throw fires on ANY shard close
+after a session touched a tool space — the C3 tool-surface step plants
+exactly such rows — leaving sessions half-closed (gateway map entry removed,
+world/Directory state inconsistent). With the throw gone, the close path
+always completes; the cluster should disappear from cf-dev. If any residual
+flake remains it needs fresh evidence, not this mechanism.
+
+Process note: this regression escaped because the original validation skipped
+`npm run test:worker`. Worker-lane tests are mandatory for any change
+touching `src/worker/` or session lifecycle.
