@@ -41,6 +41,20 @@ WOO_V2_SLIM_WARM_ENVELOPE = "1"
 # these via `wrangler secret put`; locally they are just config.
 WOO_INITIAL_WIZARD_TOKEN = "local-smoke-wizard-token"
 WOO_INTERNAL_SECRET = "local-smoke-internal-secret"
+# C1a fault injection — NEVER set in production. Opt-in per test run by
+# un-commenting and editing the value. See src/worker/rpc-fault-inject.ts
+# for the FaultSpec format. Examples:
+#
+#   authority-slice timeout (B-ii gate: cold-owner degradation must be bounded):
+#     WOO_FAULT_INJECT = '[{"route":"authority-slice","mode":"timeout"}]'
+#
+#   envelope latency (measure warm-turn cost floor without commit speed):
+#     WOO_FAULT_INJECT = '[{"route":"envelope","mode":"latency","ms":200}]'
+#
+#   kill_after_commit nth=1 (D1 gate: peer convergence after crash-window):
+#     WOO_FAULT_INJECT = '[{"route":"envelope","mode":"kill_after_commit","nth":1}]'
+#
+# WOO_FAULT_INJECT = ""
 
 [[durable_objects.bindings]]
 name = "WOO"

@@ -83,6 +83,7 @@ import {
 import { verifyInternalRequest, type InternalAuthEnv } from "./internal-auth";
 import { metricErrorFields } from "./metric-errors";
 import { writeMetricToAnalytics, writeConstructorMetricToAnalytics } from "./metrics-sink";
+import { FaultInjector, KillAfterCommitError } from "./rpc-fault-inject";
 
 const SHADOW_OPEN_EXECUTABLE_SEED_WARN_BYTES = 1_000_000;
 const SHADOW_TAIL_RETENTION_BYTES = 16 * 1024 * 1024;
@@ -112,6 +113,11 @@ type CommitScopeEnv = InternalAuthEnv & {
   // breaking the request into authority / capsule-authority / sessions / envelope
   // bytes plus relay warmth. Off by default — it re-stringifies the large slice.
   WOO_V2_ENVELOPE_BYTE_BREAKDOWN?: string;
+  // Fault injection configuration for RPC seam testing (worker/test layer only).
+  // JSON array of FaultSpec objects; see src/worker/rpc-fault-inject.ts.
+  // Never set in production. kill_after_commit fires here, post-durable-save,
+  // before the /v2/envelope response is sent back to the gateway.
+  WOO_FAULT_INJECT?: string;
 };
 
 type PersistedCheckpointPageRef = {
@@ -170,6 +176,9 @@ export class CommitScopeDO {
   // as warm / snapshot-rehydrated / cold-seeded, the axis that decides whether the
   // ~3MB top-level authority in the request was actually needed.
   private lastRelayInitSource: "snapshot" | "cold_seed" | null = null;
+  // Lazily-parsed fault injector for C1a kill_after_commit. Null until first
+  // access; no-op when WOO_FAULT_INJECT is unset (production and default tests).
+  private _faultInjector: FaultInjector | undefined = undefined;
 
   constructor(
     private readonly state: CommitScopeDurableState,
@@ -224,6 +233,14 @@ export class CommitScopeDO {
     const constructorMs = Date.now() - constructorStartedAt;
     console.log("woo.metric", JSON.stringify({ kind: "do_constructor", class: "CommitScopeDO", ms: constructorMs, ts: Date.now(), host_key: this.durableScopeKey() }));
     writeConstructorMetricToAnalytics("CommitScopeDO", constructorMs, this.durableScopeKey(), this.env.METRICS);
+  }
+
+  // Lazily-initialised fault injector. Fast-path: returns no-op immediately when
+  // WOO_FAULT_INJECT is unset. Parsed once per DO lifetime, not per request.
+  private faultInjector(): FaultInjector {
+    if (this._faultInjector !== undefined) return this._faultInjector;
+    this._faultInjector = FaultInjector.fromEnv(this.env.WOO_FAULT_INJECT);
+    return this._faultInjector;
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -479,6 +496,15 @@ export class CommitScopeDO {
           if (!fullSave) {
             tailStats = await this.saveEnvelopeDelta(relay, receipt, reply);
           }
+          // C1a kill_after_commit: simulate a DO crash AFTER the commit is
+          // durably persisted but BEFORE fanout/reply delivery. The commit
+          // state is on-disk; only the response delivery path is suppressed.
+          // This is the hook point for plan item D1 (tail-driven peer delivery):
+          // a rehydrating DO must be able to detect and re-deliver from the relay
+          // tail without the gateway ever having seen the reply.
+          // The fault fires ONLY for accepted (fresh) commits — a replayed
+          // idempotency response is already-delivered, not a new commit.
+          if (receipt.fresh) this.faultInjector().applyKillAfterCommit();
           this.emitCommitReplyReplayMetric({
             scope,
             node,
@@ -528,6 +554,13 @@ export class CommitScopeDO {
             fanout
           } satisfies CommitScopeEnvelopeResponse);
         } catch (err) {
+          // kill_after_commit: commit IS durable; surface a distinct error code
+          // so the gateway can record the crash-window event and the test can
+          // assert that the commit applied while delivery was suppressed.
+          if (err instanceof KillAfterCommitError) {
+            this.emitMetric({ kind: "v2_envelope", scope, node, ms: Date.now() - startedAt, status: "error", full_save: fullSave, error: "E_KILL_AFTER_COMMIT" });
+            return jsonResponse({ error: { code: "E_KILL_AFTER_COMMIT", message: err.message } }, 500);
+          }
           this.emitMetric({ kind: "v2_envelope", scope, node, ms: Date.now() - startedAt, status: "error", full_save: fullSave, ...metricErrorFields(err) });
           throw err;
         }
