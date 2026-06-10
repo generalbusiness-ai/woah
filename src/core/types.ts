@@ -312,7 +312,7 @@ export type MetricEvent =
   | { kind: "mcp_request"; method: string; tool?: string; ms: number; status: "ok" | "error" }
   | { kind: "mcp_tool_refresh_taken"; actor: ObjRef; source: "invoke" | "accepted_frame"; reason: string; transcript: boolean; session_id?: string; active_scope?: ObjRef | null }
   | { kind: "mcp_tool_refresh_skipped"; actor: ObjRef; source: "invoke" | "accepted_frame"; reason: string; transcript: boolean; session_id?: string; active_scope?: ObjRef | null }
-  | { kind: "directory_sessions_for_scopes"; scopes: number; sessions: number; ms: number; status: "ok" | "error" | "timeout"; error?: string }
+  | { kind: "directory_sessions_for_scopes"; scopes: number; sessions: number; ms: number; status: "ok" | "error" | "timeout" | "projection_cache"; error?: string; path?: "mcp_fanout_audience" | "authority_reconstruction" }
   // Tool-resolution diagnostic: emitted by createMcpServer's findReachableTool
   // whenever a tools/call requests a specific (object, verb). Captures the
   // gateway's view of the actor's session at decision time so a miss can be

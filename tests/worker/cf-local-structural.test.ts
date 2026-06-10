@@ -55,11 +55,10 @@ const C2_TRACKED_CROSS_SCOPE_ENVELOPE_BYTES = 256 * 1024; // 256 KB — ENFORCED
 // movement-only ENFORCED check.
 const C2_TRACKED_DANGLING_PARENT_REF_TARGET = 0; // ENFORCED zero for movement-only turns
 
-// Per-turn cross-host RPC count should be ≤ 3 on warm turns once D2
-// (directory/tool-surface consolidation) ships. Today the b7-tail run shows
-// ~8 RPCs per turn (directory lookups + enumerate-tools + envelope + fanout).
-// TRACKED → D2.
-const C2_TRACKED_WARM_TURN_MAX_CROSS_HOST_RPCS = 3; // TRACKED → D2
+// Per-turn cross-host RPC count must be ≤ 3 on warm turns. D2a
+// (directory session from projection cache) landed, eliminating directory
+// RPCs on warm turns. Fake-lane baseline is ~2.5/turn. ENFORCED (D2a).
+const C2_TRACKED_WARM_TURN_MAX_CROSS_HOST_RPCS = 3; // ENFORCED (D2a)
 
 // Sessions-for-scopes result should be ≤ live actors + 1 once A1 (session
 // lifecycle as first-class state) ships. Today closed pooled-guest sessions
@@ -496,42 +495,48 @@ describe("CF-local prod-shape structural probes", () => {
 
       // Per-turn cross-host RPC count on warm turns. In the fake lane all DOs are
       // in-process, so cross_host_rpc is emitted but represents local function calls
-      // rather than real cross-colo network RPCs. The fake lane reading (~2-3/turn)
-      // does NOT reflect production load (~8+/turn in deployed smoke before D2).
-      // This gate is purely structural: it gives a count baseline and detects
-      // regressions that ADD new RPCs (the count going UP is bad; going down is fine).
-      // The D2 bound of ≤ 3 RPCs/turn is a deploy-lane target; here we record the
-      // current value and log it for baseline tracking. See smoke-cf-dev.ts for the
-      // corresponding TRACKED gate in the higher-fidelity workerd lane.
+      // rather than real cross-colo network RPCs.
+      //
+      // ENFORCED (D2 landed): directory_sessions_for_scopes RPCs are now served from
+      // the SQL projection cache (status=projection_cache) so they no longer fire
+      // cross_host_rpc metrics. The fake-lane budget is ≤ 3/turn which holds at
+      // ~2.5/turn (apply-v2-commit 1.75 + enumerate-tools 0.5 + mcp-fanout 0.25).
+      // This gate prevents regressions that add new forwardInternal() call paths
+      // on the hot turn path. Going down is always fine; going above 3 is a signal
+      // to investigate before deploying.
       const phaseTimings = measuredMovementMetrics.filter((m) => m.kind === "turn_phase_timing");
       const crossHostRpcs = measuredMovementMetrics.filter((m) => m.kind === "cross_host_rpc");
       const rpcsPerTurn = phaseTimings.length > 0 ? crossHostRpcs.length / phaseTimings.length : 0;
-      console.log(`c2.cross_host_rpc_per_turn avg=${rpcsPerTurn.toFixed(1)} target_note=D2_deploy_lane plan=D2`);
-      // No TRACKED/PROMOTE check here: the fake-lane RPC count is not comparable
-      // to the production RPC count D2 tracks. Track this in cf-dev instead.
+      console.log(`c2.cross_host_rpc_per_turn avg=${rpcsPerTurn.toFixed(1)} budget=${C2_TRACKED_WARM_TURN_MAX_CROSS_HOST_RPCS} status=ENFORCED plan=D2`);
       expect(
         rpcsPerTurn,
-        `C2 baseline: warm movement turns emitted more cross_host_rpc than expected in fake lane. ` +
-        `avg=${rpcsPerTurn.toFixed(1)} ceiling=${C2_TRACKED_WARM_TURN_MAX_CROSS_HOST_RPCS * 2} ` +
-        `(fake-lane budget = 2× the D2 deploy target, only catches gross regressions). ` +
-        `Real D2 tracking is in smoke-cf-dev.ts.`
-      ).toBeLessThan(C2_TRACKED_WARM_TURN_MAX_CROSS_HOST_RPCS * 2);
+        `C2 ENFORCED (D2): warm movement turns must emit ≤ ${C2_TRACKED_WARM_TURN_MAX_CROSS_HOST_RPCS} cross_host_rpc per turn. ` +
+        `Got avg=${rpcsPerTurn.toFixed(1)}. Note: directory_sessions_for_scopes is now served from ` +
+        `the SQL projection cache (D2a) and does not count as a cross_host_rpc. ` +
+        `If this fails: a new forwardInternal() call was added to the turn hot path. ` +
+        `Ref PLAN: §D2.`
+      ).toBeLessThanOrEqual(C2_TRACKED_WARM_TURN_MAX_CROSS_HOST_RPCS);
 
       // Sessions-for-scopes: ENFORCED ≤ actors + margin in the fake lane.
       // The fake Directory is clean — sessions that are opened are tracked accurately
       // and there is no stale-session accumulation (the A1 production problem). So
       // the fake lane should always show ≤ actors + 1 rows. If this fails, a
-      // new code path is creating extra Directory sessions for the same scope.
+      // new code path is creating extra sessions for the same scope.
+      //
+      // With D2a enabled, sessions are served from the SQL projection cache
+      // (status=projection_cache). Include both status=ok (Directory RPC) and
+      // status=projection_cache (local SQL read) in the max-sessions check so
+      // the gate still detects inflation regardless of which path served the data.
       //
       // The A1 production problem (stale sessions from closed pooled-guest clients
       // lingering in Directory) is NOT visible in the fake lane. It is tracked in
       // smoke-cf-dev.ts at a higher fidelity lane. This gate only catches regressions
       // that add sessions beyond the live actor count.
       const ACTOR_COUNT = 2;
-      const sessionsForScopes = allMetrics.filter((m) => m.kind === "directory_sessions_for_scopes" && m.status === "ok");
+      const sessionsForScopes = allMetrics.filter((m) => m.kind === "directory_sessions_for_scopes" && (m.status === "ok" || m.status === "projection_cache"));
       const maxSessionsFound = Math.max(0, ...sessionsForScopes.map((m) => Number(m.sessions) || 0));
       const sessionsBudget = ACTOR_COUNT + C2_TRACKED_MAX_SESSIONS_FOR_SCOPES_MARGIN;
-      console.log(`c2.sessions_for_scopes max=${maxSessionsFound} budget=${sessionsBudget} actors=${ACTOR_COUNT} margin=${C2_TRACKED_MAX_SESSIONS_FOR_SCOPES_MARGIN} status=ENFORCED plan=A1-fake-lane`);
+      console.log(`c2.sessions_for_scopes max=${maxSessionsFound} budget=${sessionsBudget} actors=${ACTOR_COUNT} margin=${C2_TRACKED_MAX_SESSIONS_FOR_SCOPES_MARGIN} status=ENFORCED plan=A1-D2a-fake-lane`);
       expect(
         maxSessionsFound,
         `C2 ENFORCED: sessions_for_scopes must be ≤ actors + margin in fake lane. ` +
@@ -683,6 +688,10 @@ function createStructuralHarness(): StructuralHarness {
     // is read by CommitScopeDO (whose env is set separately above), but we also
     // set it here for consistency and to allow gateway-side code to key on it.
     WOO_V2_ENVELOPE_BYTE_BREAKDOWN: "1",
+    // D2a: serve session/audience data for MCP fanout from the local SQL
+    // projection cache on gateway shards, eliminating Directory RPCs on warm
+    // turns after the first fanout (which seeds the projection table).
+    WOO_V2_D2_SESSION_FROM_PROJECTION: "1",
     DIRECTORY: new FakeDurableObjectNamespace((name) => {
       if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
       return directory;

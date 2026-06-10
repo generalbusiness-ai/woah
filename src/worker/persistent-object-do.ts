@@ -184,6 +184,25 @@ export interface Env {
   // Enabled in wrangler.smoke.toml and the cf-local structural harness; never
   // set in production wrangler.toml.
   WOO_V2_TAIL_DELIVERY?: string;
+  // D2a: serve session/audience data for MCP fanout from the local
+  // gateway_projection_session SQL table instead of an RPC to Directory.
+  // Safe by CA11 (projection provenance: fanout routing, not authority proof).
+  // When the scope has a projection head (we have received at least one fanout
+  // for this scope), serve sessions from the projection cache; fall back to
+  // Directory only on cold/first-touch (no projection head for any affected scope).
+  // Merges local in-memory sessions from this.world with the SQL projection rows
+  // so shards that own the session also see it (no double-lookup).
+  WOO_V2_D2_SESSION_FROM_PROJECTION?: string;
+  // D2b: include tool_surface projection writes in the commit fanout body so
+  // receiving gateway shards apply invalidated→fresh tool descriptor rows in one
+  // SQL transaction, eliminating the subsequent enumerate-tools RPC on warm turns.
+  // The CommitScopeDO (which has a full WooWorld with verb definitions) enumerates
+  // tool descriptors for objects whose rows appear in the commit's projection_writes,
+  // converts them to ToolSurfaceProjectionRow format, and attaches them as
+  // d2_tool_surface_writes in the fanout body. The receiver applies them after
+  // applyRemoteAccepted (same-process, single-threaded, no window between invalidate
+  // and re-insert from the caller's perspective).
+  WOO_V2_D2_TOOL_SURFACE_IN_FANOUT?: string;
   // Fault injection configuration for RPC seam testing (worker/test layer only).
   // JSON array of FaultSpec objects; see src/worker/rpc-fault-inject.ts.
   // Never set in production. Opt-in per test run.
@@ -2222,7 +2241,13 @@ export class PersistentObjectDO {
     throw wooError("E_STORAGE", `too many MCP gateway shard session pages for ${hostKey}`, hostKey);
   }
 
-  private async loadDirectorySessionsForScopes(scopes: readonly ObjRef[]): Promise<DirectorySerializedSession[]> {
+  private async loadDirectorySessionsForScopes(
+    scopes: readonly ObjRef[],
+    // Optional path label recorded in the directory_sessions_for_scopes metric so
+    // callers can distinguish fanout-audience lookups (D2a hot path) from authority-
+    // reconstruction lookups (always Directory). Undefined = legacy call site.
+    path?: "mcp_fanout_audience" | "authority_reconstruction"
+  ): Promise<DirectorySerializedSession[]> {
     const requested = Array.from(new Set(scopes.filter((scope) => typeof scope === "string" && scope.length > 0))).sort();
     if (requested.length === 0) return [];
     const cacheKey = requested.join("\n");
@@ -2242,7 +2267,8 @@ export class PersistentObjectDO {
         sessions: 0,
         ms: Date.now() - startedAt,
         status: error.code === "E_TIMEOUT" ? "timeout" : "error",
-        error: error.code
+        error: error.code,
+        ...(path !== undefined ? { path } : {})
       });
       return [];
     });
@@ -2260,7 +2286,8 @@ export class PersistentObjectDO {
         scopes: requested.length,
         sessions: sessions.length,
         ms: Date.now() - startedAt,
-        status: "ok"
+        status: "ok",
+        ...(path !== undefined ? { path } : {})
       });
     }
     return cloneDirectorySerializedSessions(sessions);
@@ -2309,6 +2336,127 @@ export class PersistentObjectDO {
       if (!oldest) break;
       this.directoryScopeSessionsCache.delete(oldest);
     }
+  }
+
+  // D2a: serve session/audience data from the local SQL projection cache.
+  //
+  // Returns sessions only when the gateway has received at least one projection
+  // fanout for any of the requested scopes (gateway_projection_scope row exists
+  // and is not stale). If no projection head is present for any scope, returns
+  // { hasProjection: false } so the caller falls back to Directory.
+  //
+  // CA11 provenance rule: this data is safe for audience/routing decisions
+  // (which shards receive the fanout) but MUST NOT be used for authority proofs.
+  // The session's activeScope field is the critical routing hint; expiresAt is
+  // used only to avoid routing to expired sessions.
+  private loadProjectionSessionsForScopes(scopes: readonly ObjRef[]): {
+    sessions: DirectorySerializedSession[];
+    hasProjection: boolean;
+  } {
+    if (scopes.length === 0) return { sessions: [], hasProjection: false };
+    const sql = this.state.storage.sql;
+    const placeholders = scopes.map(() => "?").join(", ");
+    // Check that at least one scope has a non-stale projection head.
+    const headRow = firstSqlRow<{ found: number }>(sql.exec(
+      `SELECT 1 AS found FROM gateway_projection_scope WHERE scope IN (${placeholders}) AND stale = 0 LIMIT 1`,
+      ...scopes
+    ));
+    if (!headRow) return { sessions: [], hasProjection: false };
+    // Load session rows for all requested scopes from the SQL projection cache.
+    // The `body` column is a JSON-serialized SerializedSession with activeScope.
+    const rows = sqlRows<{ body: string }>(sql.exec(
+      `SELECT body FROM gateway_projection_session WHERE scope IN (${placeholders}) AND stale = 0`,
+      ...scopes
+    ));
+    const sessions: DirectorySerializedSession[] = [];
+    for (const row of rows) {
+      try {
+        const parsed = JSON.parse(row.body) as unknown;
+        const session = serializedSessionFromDirectoryRoute(parsed);
+        if (session) sessions.push(session);
+      } catch { /* skip malformed rows */ }
+    }
+    return { sessions, hasProjection: true };
+  }
+
+  // D2b: enumerate tool surface rows for objects in the projection_writes so the
+  // receiving gateway shard can apply them inline (invalidate + re-insert in one
+  // fanout), eliminating the subsequent enumerate-tools RPC on warm turns.
+  //
+  // Only called on the CommitScopeDO (world host), which has the full WooWorld
+  // including verb bytecode. Gateway shards are sparse and cannot compute this.
+  //
+  // For each object write in `projectionWrites`, calls enumerateLocalToolDescriptors
+  // for the authority scope and converts the results to ToolSurfaceProjectionRow
+  // format. Uses the turn actor for actorCanSee filtering — in practice rooms are
+  // visible to all actors and the cached tool surface is not actor-specific.
+  private computeD2ToolSurfaceWrites(
+    world: WooWorld,
+    scope: ObjRef,
+    projectionWrites: readonly ProjectionWrite[],
+    actor: ObjRef
+  ): ToolSurfaceProjectionRow[] {
+    const host = this.getMcpGateway(world).host;
+    // Find distinct objects that received an upsert write in this commit.
+    // Only upserts can change the object's verb surface; deletes remove it.
+    const upsertedObjects = new Set<ObjRef>();
+    for (const write of projectionWrites) {
+      if (write.table === "objects" && write.op !== "delete") upsertedObjects.add(write.key);
+    }
+    if (upsertedObjects.size === 0) return [];
+    // Build tool surface rows for each (scope, object) pair.
+    // Use expandContents=false (single-object request) to enumerate verbs owned
+    // by each individual object. The scope request covers the full scope's
+    // objects (actor sees the room), which is what the gateway caches.
+    // Emit tool_surfaces writes for scope-level requests: the receiving shard
+    // uses (scope, object) keys, so we enumerate the scope's tool surface and
+    // filter to the upserted objects.
+    const requests = [{ id: scope, projection: "tools" as const, expandContents: true, contentsProjection: "obvious" as const }];
+    const descriptors = host.enumerateLocalToolDescriptors(actor, requests);
+    // Group descriptors by object, keeping only those for upserted objects.
+    const byObject = new Map<ObjRef, typeof descriptors>();
+    for (const descriptor of descriptors) {
+      if (!upsertedObjects.has(descriptor.object)) continue;
+      const list = byObject.get(descriptor.object) ?? [];
+      list.push(descriptor);
+      byObject.set(descriptor.object, list);
+    }
+    const head: ShadowScopeHead = {
+      kind: "woo.scope_head.shadow.v1",
+      scope,
+      epoch: 1,
+      seq: 0,
+      hash: ""
+    };
+    const result: ToolSurfaceProjectionRow[] = [];
+    for (const [object, objectDescriptors] of byObject) {
+      const sourceRows = coalesceToolSurfaceSourceRows(
+        objectDescriptors.flatMap((descriptor) =>
+          descriptor.source_rows && descriptor.source_rows.length > 0
+            ? descriptor.source_rows.map((row) => ({ ...row, authority_scope: scope }))
+            : [{ table: "objects" as const, authority_scope: scope, key: object }]
+        )
+      );
+      result.push({
+        kind: "woo.tool_surface_projection.v1",
+        scope,
+        object,
+        head,
+        verbs: objectDescriptors.map((descriptor) => ({
+          name: descriptor.verb,
+          owner: object,
+          perms: "x",
+          aliases: descriptor.aliases,
+          arg_spec: descriptor.arg_spec,
+          direct: descriptor.direct,
+          ...(descriptor.reads_room_presence === true ? { reads_room_presence: true } : {}),
+          source: descriptor.source,
+          enclosingSpace: descriptor.enclosingSpace
+        })),
+        source_rows: sourceRows
+      });
+    }
+    return result;
   }
 
   private async createHostScopedWorld(hostKey: ObjRef, metricsHook: (event: MetricEvent) => void): Promise<WooWorld> {
@@ -3581,6 +3729,30 @@ export class PersistentObjectDO {
         // applies the SQL write via the persistAcceptedProjection hook, in
         // contiguous order, as it accepts/drains each frame.
         this.getMcpGateway(world).acceptRemoteV2Commit(scope, body.commit, body.transcript as EffectTranscript, originSession, audience);
+        // D2b: apply tool_surface rows included in the fanout body by the
+        // CommitScopeDO. These rows refill the cache immediately after the
+        // invalidation done by applyGatewayProjectionWrites (objects write at
+        // ~line 858), so the next enumerateRemoteTools call finds a cache hit
+        // instead of issuing an enumerate-tools RPC.
+        //
+        // Single-threaded DO execution: acceptRemoteV2Commit finished its SQL
+        // writes (via persistAcceptedProjection) before we reach this point, so
+        // there is no window where the cache is invalidated but not yet refilled.
+        //
+        // Only applies these writes when the fanout body contains them (sender
+        // had WOO_V2_D2_TOOL_SURFACE_IN_FANOUT set and could enumerate verbs).
+        if (Array.isArray(body.d2_tool_surface_writes)) {
+          const commit = body.commit as ShadowCommitAccepted;
+          const position = commit.position;
+          const now = Date.now();
+          this.state.storage.transactionSync(() => {
+            for (const row of body.d2_tool_surface_writes as unknown[]) {
+              if (isToolSurfaceProjectionRow(row)) {
+                this.upsertGatewayToolSurface(row, scope, position, now);
+              }
+            }
+          });
+        }
         return jsonResponse({ ok: true });
       }
 
@@ -5193,8 +5365,11 @@ export class PersistentObjectDO {
     const reconstructionScope = options.reconstructionScope ?? ids[0] ?? "$nowhere";
     const localHost = this.durableHostKey();
     const mcpGatewayShard = isMcpGatewayShardHost(localHost);
+    // Authority reconstruction always uses the live Directory (not the D2a projection
+    // cache) because it is fetching authoritative session state for world assembly, not
+    // fanout routing. The path label distinguishes this from the fanout-audience path.
     const directoryScopeSessions = mcpGatewayShard && directorySessionScopes.length > 0
-      ? await this.loadDirectorySessionsForScopes(directorySessionScopes)
+      ? await this.loadDirectorySessionsForScopes(directorySessionScopes, "authority_reconstruction")
       : [];
     // A5: the in-memory per-scope authority checkpoint is removed. A warm turn
     // reconstructs from local rows + owner slices (the authoritative path); the
@@ -6206,7 +6381,58 @@ export class PersistentObjectDO {
     transcript: EffectTranscript,
     observations: readonly Observation[]
   ): Promise<McpFanoutAudience> {
-    const directorySessions = await this.loadDirectorySessionsForScopes(affectedMcpFanoutScopes(scope, transcript, (object, property) => world.isPresenceProjectionProperty(object, property)));
+    const affectedScopes = affectedMcpFanoutScopes(scope, transcript, (object, property) => world.isPresenceProjectionProperty(object, property));
+    // D2a: serve session/audience data from the local projection cache when the
+    // flag is set and this is a gateway shard (sparse MCP node) that has received
+    // at least one fanout for the affected scope(s).
+    //
+    // CA11 provenance rule: projection-derived session data is fine for
+    // audience/routing (fanout destination decisions) but must NOT be used for
+    // authority proofs. This path only determines which shards get the fanout.
+    let directorySessions: DirectorySerializedSession[];
+    if (envFlag(this.env.WOO_V2_D2_SESSION_FROM_PROJECTION) && isMcpGatewayShardHost(this.durableHostKey())) {
+      const { sessions: projectionSessions, hasProjection } = this.loadProjectionSessionsForScopes(affectedScopes);
+      if (hasProjection) {
+        // Merge projection-cache sessions with any live in-memory sessions on
+        // this shard. Live sessions are authoritative; projection rows fill in
+        // for other shards' sessions that this shard knows about via fanout.
+        const localSessions: DirectorySerializedSession[] = this.world
+          ? Array.from(this.world.sessions.values())
+              .filter((s) => affectedScopes.includes(s.activeScope as ObjRef))
+              .map((s) => ({
+                id: s.id,
+                actor: s.actor,
+                started: s.started ?? Date.now(),
+                expiresAt: s.expiresAt ?? 0,
+                lastDetachAt: null,
+                tokenClass: (s.tokenClass === "guest" || s.tokenClass === "apikey") ? s.tokenClass : "bearer",
+                activeScope: s.activeScope,
+                currentLocation: s.activeScope
+              } as DirectorySerializedSession))
+          : [];
+        // Live sessions win over projection rows (same-id overwrite).
+        const byId = new Map<string, DirectorySerializedSession>();
+        for (const s of projectionSessions) byId.set(s.id, s);
+        for (const s of localSessions) byId.set(s.id, s);
+        directorySessions = Array.from(byId.values());
+        world.recordMetric({
+          kind: "directory_sessions_for_scopes",
+          scopes: affectedScopes.length,
+          sessions: directorySessions.length,
+          ms: 0,
+          status: "projection_cache",
+          // path label: distinguishes fanout-audience (D2a cache path) from
+          // authority-reconstruction (direct Directory fetch at ~line 5361).
+          path: "mcp_fanout_audience"
+        });
+      } else {
+        // No projection head for any affected scope (first touch or stale):
+        // fall back to Directory to get authoritative session data.
+        directorySessions = await this.loadDirectorySessionsForScopes(affectedScopes, "mcp_fanout_audience");
+      }
+    } else {
+      directorySessions = await this.loadDirectorySessionsForScopes(affectedScopes, "mcp_fanout_audience");
+    }
     // MCP gateway shards are intentionally sparse. Directory is the live
     // session table for MCP fanout, so recomputing audiences from local room
     // lineage on those shards both duplicates the route source of truth and
@@ -6407,6 +6633,27 @@ export class PersistentObjectDO {
       subscriberShardSet.add(shard);
     }
     const localSuppressed = hosts.delete(localHost);
+    // D2b: include tool_surface rows in the fanout body so receiving gateway
+    // shards re-fill the tool descriptor cache inline, eliminating the
+    // subsequent enumerate-tools RPC on warm turns after movement.
+    //
+    // Only attempted when the flag is set AND there are remote shards to send
+    // to (avoids the enumeration cost on no-shard or local-only fanouts).
+    // Only the CommitScopeDO (world host, not a gateway shard) has the full
+    // verb registry needed to enumerate tool surfaces.
+    let d2ToolSurfaceWrites: ToolSurfaceProjectionRow[] = [];
+    if (hosts.size > 0 && envFlag(this.env.WOO_V2_D2_TOOL_SURFACE_IN_FANOUT) && !isMcpGatewayShardHost(this.durableHostKey())) {
+      const actor = transcript.call.actor as ObjRef;
+      if (actor && this.world?.objects.has(actor)) {
+        try {
+          d2ToolSurfaceWrites = this.computeD2ToolSurfaceWrites(world, scope, commit.projection_writes ?? [], actor);
+        } catch (err) {
+          // Non-fatal: tool surface enumeration failure means the gateway falls
+          // back to an enumerate-tools RPC on the next turn, no correctness loss.
+          console.warn("woo.d2_tool_surface.enumeration_failed", { scope, error: normalizeError(err) });
+        }
+      }
+    }
     // Metric fires regardless of hosts.size so triage can see that the
     // selector ran with `shards: 0` (peer-not-seeing-observation cases often
     // hinge on this — no remote shards selected and local delivery
@@ -6416,7 +6663,11 @@ export class PersistentObjectDO {
       origin_session: originSessionId,
       commit: commit as unknown as WooValue,
       transcript: transcript as unknown as WooValue,
-      ...mcpFanoutAudienceBody(audience)
+      ...mcpFanoutAudienceBody(audience),
+      // D2b: tool surface rows piggy-backed in the fanout body; empty when not
+      // computed or when the flag is off. The receiver applies these writes after
+      // applyRemoteAccepted so the cache is warmed in the same activation.
+      ...(d2ToolSurfaceWrites.length > 0 ? { d2_tool_surface_writes: d2ToolSurfaceWrites as unknown as WooValue } : {})
     };
     world.recordMetric({
       kind: "mcp_fanout",
