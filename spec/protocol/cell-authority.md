@@ -140,7 +140,15 @@ Projection maintenance rules (all MUST):
   source/destination container owners to the durable fanout and let each owner
   rebuild its own membership row from the accepted move. Non-owner hosts may
   cache such rows, but MUST NOT persist ownership of a container they merely
-  cache.
+  cache. *(Implementation status, A2 lineage-closed fanout: `propagateTranscriptToOtherScopes`
+  (gateway.ts) now delivers the transitive parent chain of every object arriving
+  in a destination scope — `mergeIncomingObjectLineageClosure` — before applying
+  the delta frame. Pages are stamped `cache` provenance so CA11 precedence still
+  applies (an owner-authoritative row displaces the fill). This eliminates the
+  `dangling_parent_ref` error that caused `E_VERBNF`/`E_OBJNF` on the destination
+  shard when a carried `$portable`/`$note` object crossed a scope boundary. Gate:
+  `dangling_parent_ref == 0` ENFORCED in cf-local-structural.test.ts C2 carry
+  phase and in smoke:cf-dev carry-across-rooms step.)*
 - **Idempotent application.** Applying the same accepted movement event twice
   MUST NOT create duplicate membership. Application is keyed by movement event id
   or by the member's `live:location` source version.

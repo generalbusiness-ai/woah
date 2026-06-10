@@ -212,6 +212,14 @@ describe("v2 browser local turn planning", () => {
   });
 
   it("plans cold command text from the open executable seed without parser repair", async () => {
+    // Note: the_lamp ($portable, no match_names) is used here intentionally.
+    // the_mug was changed to $note which defines match_names, and that verb reads
+    // `this.text` during command planning. Since the browser open-seed does NOT
+    // carry the `text` property (see native-primitive-contract.ts — text is
+    // deliberately excluded from browser seeds; see AGENTS.md §note text cold-
+    // reload hydration), planning `take mug` would record a text-cell read
+    // dependency and return ok=false/missing_state. the_lamp ($portable) has no
+    // match_names verb, so it resolves cleanly from name + aliases alone.
     const anchor = createWorld();
     const session = anchor.auth("guest:v2-browser-command-plan-seed");
     await anchor.directCall("setup-command-plan-seed-enter", session.actor, "the_chatroom", "enter", [], { sessionId: session.id });
@@ -237,7 +245,7 @@ describe("v2 browser local turn planning", () => {
       scope: "the_chatroom",
       target: "the_chatroom",
       verb: "command_plan",
-      args: ["take mug"],
+      args: ["take lamp"],
       persistence: "live",
       transfers: [v2ExecutableTransferRecord(openTransfer, 1)]
     });
@@ -250,7 +258,7 @@ describe("v2 browser local turn planning", () => {
           route: "direct",
           target: "the_chatroom",
           verb: "take",
-          args: ["mug"]
+          args: ["lamp"]
         }
       }
     });

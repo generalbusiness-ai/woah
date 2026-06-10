@@ -16,7 +16,7 @@ import type { EffectTranscript } from "../core/effect-transcript";
 import { buildSerializedAuthorityCellSlice, cellProvenanceFromAuthoritySlice, combineSerializedAuthoritySlices, serializedWorldFromAuthoritySlice } from "../core/authority-slice";
 import { wooError, type AppliedFrame, type AuthorityReconstructionTrigger, type DirectResultFrame, type ErrorFrame, type ErrorValue, type Message, type MetricEvent, type ObjRef, type Session, type WooValue } from "../core/types";
 import { normalizeError, type WooWorld } from "../core/world";
-import type { SerializedAuthoritySlice, SerializedSession } from "../core/repository";
+import type { SerializedAuthoritySlice, SerializedObject, SerializedSession } from "../core/repository";
 import { projectionDeltaMissingWrites, type ProjectionWrite } from "../core/projection-delta";
 import { createMcpServer } from "./server";
 import { McpHost, type McpAcceptedFrameAudience, type McpBroadcastHooks, type McpDispatchHooks, type McpDispatchOptions, type McpToolManifestHooks } from "./host";
@@ -308,6 +308,158 @@ function warmRelayAuthoritySliceForObject(
     },
     tombstones: requesterSerialized.tombstones,
     pageProvenance: (page) => provenance?.get(cachedAuthorityPageKey(page)) ?? { source: "cache" }
+  });
+}
+
+// A2 / CA4 durable owner delivery: collect the ObjRef ids of objects that the
+// transcript MOVES INTO `destScope` or CREATES IN `destScope`, PLUS the
+// transitive contents of any actor moving into the scope (their carried inventory).
+//
+// The inventory case is the key one: when an actor carries an object from room A
+// to room B, the transcript records actor:location A→B but the carried item was
+// already moved to the actor in a prior turn. The current transcript does NOT
+// contain a move for the item (its location is the actor, not room B). But room
+// B's relay still needs the item's class lineage to dispatch verbs on it once it
+// arrives. We collect it from the origin relay's actor.contents list.
+//
+// `originLookup` supplies the origin relay's object row by id (needed for the
+// contents walk). Absent if the origin relay is not available.
+function incomingObjectIds(
+  destScope: ObjRef,
+  transcript: EffectTranscript,
+  originLookup?: (id: ObjRef) => { contents: ObjRef[] } | undefined
+): Set<ObjRef> {
+  const ids = new Set<ObjRef>();
+  for (const move of transcript.moves) {
+    if (move.to === destScope) {
+      ids.add(move.object);
+      // If an actor is moving into this scope, also include their carried contents
+      // (inventory). The contents list from the origin relay reflects the state
+      // at move time — anything already in the actor's inventory. One level deep
+      // is sufficient: the carried item's own contents are part of its authority,
+      // not cross-scope to this relay; and carried sub-containers are rare.
+      if (originLookup) {
+        const carried = originLookup(move.object)?.contents ?? [];
+        for (const item of carried) ids.add(item);
+      }
+    }
+  }
+  for (const create of transcript.creates) {
+    if (create.location === destScope) ids.add(create.object);
+  }
+  return ids;
+}
+
+// A2 / CA4: collect the transitive parent chain (lineage closure) of `startId`
+// from `objectsById`. Returns all ancestor ids (not including `startId` itself,
+// which the transcript delta already carries). Stops when a parent is absent —
+// the destination relay will call the fallback repair path for truly missing
+// objects. Bounded by the class chain depth (a few dozen levels at most);
+// cycles are prevented by the `visited` guard.
+function transitiveParentIds(startId: ObjRef, objectsById: (id: ObjRef) => { parent: ObjRef | null } | undefined): ObjRef[] {
+  const parents: ObjRef[] = [];
+  const visited = new Set<ObjRef>();
+  visited.add(startId);
+  let current = objectsById(startId)?.parent ?? null;
+  while (current !== null) {
+    if (visited.has(current)) break; // cycle guard
+    visited.add(current);
+    parents.push(current);
+    current = objectsById(current)?.parent ?? null;
+  }
+  return parents;
+}
+
+// A2 / CA4: merge the lineage closure of objects incoming to `destScope` from
+// the origin relay into the destination relay, using `cache` provenance.
+//
+// Why `cache` provenance: we are copying pages from the origin relay's planning
+// snapshot, which itself holds them as `cache` (warm fill from the accepted
+// write transfer, B7). This is NOT the owner's authoritative row. CA11 precedence
+// ensures a later owner-authoritative page still displaces this fill, so the merge
+// is strictly additive and safe. A relay that already holds the page at equal or
+// higher rank keeps its current value (the already-current hash guard in
+// mergeSerializedAuthoritySlice is a no-op for matching hashes).
+//
+// What we send: the ANCESTOR class-definition rows of each incoming object —
+// the object itself is NOT included (the delta frame handles its live state).
+// Specifically, the transitive parent chain (grandparent, great-grandparent, …)
+// up to the root class is merged. That is sufficient for parentWalkLookup to
+// resolve the full chain and eliminate dangling_parent_ref.
+//
+// Idempotent: merging the same pages twice is a no-op (same hash → skip).
+function mergeIncomingObjectLineageClosure(
+  destScope: ObjRef,
+  transcript: EffectTranscript,
+  originRelay: ShadowRelayCache,
+  destRelay: ShadowRelayCache,
+  metric: (event: MetricEvent) => void
+): void {
+  const lookup = (id: ObjRef) => shadowCommitScopeObject(originRelay.commit_scope, id);
+  const incoming = incomingObjectIds(destScope, transcript, lookup);
+  if (incoming.size === 0) return;
+
+  // Collect only the ANCESTORS (parent chain) of each incoming object — do NOT
+  // include the incoming objects themselves. The delta frame
+  // (applyAcceptedFrameToDerivedRelayCache) already applies the incoming objects'
+  // live state (location/contents/properties). Including them here would merge a
+  // stale `object_live` page from the origin relay into the dest relay, clobbering
+  // the delta frame's correct value (or triggering a spurious serialized_generation
+  // increment when the hashes differ). Only the ancestor class-definition rows are
+  // needed to allow parentWalkLookup to resolve the verb chain.
+  //
+  // Exception: an object CREATED in the dest scope (transcript.creates) was not
+  // in the dest relay at all; it still needs its own lineage page so the relay
+  // can materialize the new row. Those are included via the creates path in
+  // incomingObjectIds, but their parent chain is all we need here — the create
+  // write itself is applied by the delta frame.
+  const lineageIds = new Set<ObjRef>();
+  for (const id of incoming) {
+    for (const parentId of transitiveParentIds(id, lookup)) {
+      lineageIds.add(parentId);
+    }
+  }
+  if (lineageIds.size === 0) return;
+
+  // Build a lineage-only slice for ancestors that are MISSING from the dest relay.
+  // Only merge what is actually absent — if all ancestors are already present
+  // (common in full-world seeds), skip the merge entirely. This prevents a
+  // spurious serialized_generation increment on the dest relay (mergeAuthorityInto-
+  // RelayCache always increments generation when it detects any change, and would
+  // also trigger pruneRelayPresentationStubs on a freshly-seeded relay that has
+  // not yet had its cellProvenance populated). Provenance is `cache` — a derived
+  // copy from the origin relay, not the owner's authoritative row. CA11 precedence
+  // means a later owner-authoritative page still displaces this fill.
+  const objects: SerializedObject[] = [];
+  for (const id of lineageIds) {
+    if (shadowCommitScopeObject(destRelay.commit_scope, id)) continue; // already present
+    const row = shadowCommitScopeObject(originRelay.commit_scope, id);
+    if (row) objects.push(row);
+  }
+  if (objects.length === 0) return;
+
+  const destSerialized = serializedFor(destRelay.commit_scope, {
+    reason: "a2_lineage_closure",
+    metric
+  });
+  const lineageSlice = buildSerializedAuthorityCellSlice({
+    sessions: destSerialized.sessions,
+    objects,
+    counters: {
+      objectCounter: destSerialized.objectCounter,
+      parkedTaskCounter: destSerialized.parkedTaskCounter,
+      sessionCounter: destSerialized.sessionCounter
+    },
+    tombstones: destSerialized.tombstones,
+    // A2: all pages are `cache` — we are copying from the origin relay's view,
+    // not from the object's authoritative owner. CA11 precedence means a later
+    // owner-authoritative row still displaces these fill pages; meanwhile they
+    // ensure parentWalkLookup can resolve the chain and emit zero dangling_parent_ref.
+    pageProvenance: () => ({ source: "cache" })
+  });
+  mergeAuthorityIntoRelayCache(destRelay, lineageSlice, {
+    reason: "a2_lineage_closure",
+    metric
   });
 }
 
@@ -1528,6 +1680,19 @@ export class McpGateway {
   // authority: the target relay's head belongs to its own commit sequence, so we
   // apply projection rows + movement projection WITHOUT touching head.
   //
+  // A2 (CA4 durable owner delivery): the transcript delta alone is not enough for
+  // an object that arrives in a scope for the first time. The receiving relay has
+  // the move effect (location change) but none of the arriving object's class
+  // lineage pages (the moved object's class chain back to the root). Without them,
+  // verb resolution walks parentWalkLookup, hits a null, records dangling_parent_ref,
+  // and throws E_VERBNF/E_OBJNF. Before applying the delta we therefore merge the
+  // LINEAGE CLOSURE of all objects incoming to each affected scope — every
+  // transitive parent in the chain — from the origin relay's planning snapshot.
+  // Provenance is `cache` (a derived copy from the origin relay, not owner
+  // authority), so the merge respects CA11 precedence: a later owner-authoritative
+  // row still displaces it. Idempotent: merging a lineage page that is already
+  // present is a no-op (same hash → already-current guard in mergeSerializedAuthoritySlice).
+  //
   // Bounded to the transcript's affected scopes (move from/to, creates with a
   // location, contents/presence writes); we do not touch every open relay.
   private propagateTranscriptToOtherScopes(
@@ -1540,9 +1705,20 @@ export class McpGateway {
       transcript,
       (object, property) => this.world.isPresenceProjectionProperty(object, property)
     ));
+    // A2: pre-build the lineage closure slice from the origin relay so we can
+    // inject it into every affected destination relay before the delta frame.
+    // We only need to compute this if there are moves/creates that cross scope
+    // boundaries (objects arriving at a different scope than originScope).
+    const originClient = this.v2Scopes.get(originScope);
     for (const [scope, client] of this.v2Scopes) {
       if (scope === originScope) continue;
       if (!affected.has(scope)) continue;
+      // A2: before applying the derived delta, inject the lineage closure of
+      // objects arriving in this scope so the relay can resolve their verb chains.
+      if (originClient) {
+        mergeIncomingObjectLineageClosure(scope, transcript, originClient.relay, client.relay,
+          (event) => this.world.recordMetric(event));
+      }
       // The one shared derived-cache application (authority rows + movement
       // projection + provenance + dirty-mark, no head advance).
       applyAcceptedFrameToDerivedRelayCache(client.relay, accepted, transcript);
