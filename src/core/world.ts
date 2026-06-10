@@ -8676,11 +8676,34 @@ export class WooWorld {
     }
   }
 
+    // Session-close cleanup may only durably mutate objects whose durable
+    // home is THIS host. A multi-host world (CF DO shard, world host) caches
+    // rows it does not own — e.g. an MCP gateway shard holds the_pinboard's
+    // `session_subscribers` after a tool-scope connect — and a setProp there
+    // write-throughs to the repository, which rejects it with E_OBJNF
+    // "object not hosted here". An exception on the close path aborts
+    // closeMcpWooSession BEFORE the end-session forward and the Directory
+    // unregister, which leaves the closed session resumable (the A1
+    // DELETE-resume regression, tests/worker/cf-local-walkthrough.test.ts).
+    // Skipping cached copies is correct, not just safe: the owning host runs
+    // this same cleanup authoritatively in its own reap, dead sessions are
+    // filtered from audiences by session liveness regardless of stale cached
+    // subscriber rows, and the cached row converges on the owner's next
+    // fanout/projection update. Single-host worlds (in-memory, SQLite tests)
+    // have no executorContext and own everything. This mirrors the
+    // projection-apply `hostKey` guard (see ProjectionApplyOptions.hostKey).
+    private sessionCleanupOwned(id: ObjRef): boolean {
+      const local = this.executorContext?.localHost;
+      if (!local) return true;
+      return this.hostKeyForObject(id) === local;
+    }
+
     private removeSessionPresence(sessionId: string, actor: ObjRef): void {
       for (const obj of this.objects.values()) {
         const raw = obj.properties.get("session_subscribers");
         if (!Array.isArray(raw)) continue;
         if (!raw.some((item) => !!item && typeof item === "object" && !Array.isArray(item) && (item as Record<string, WooValue>).session === sessionId)) continue;
+        if (!this.sessionCleanupOwned(obj.id)) continue;
         this.updateSpaceSubscriberLocal(obj.id, actor, false, sessionId);
       }
       this.removeActorActiveLists(actor);
@@ -8690,9 +8713,11 @@ export class WooWorld {
     for (const obj of this.objects.values()) {
       const raw = obj.properties.get("operators");
       if (!Array.isArray(raw) || !raw.includes(actor)) continue;
+      if (!this.sessionCleanupOwned(obj.id)) continue;
       this.setProp(obj.id, "operators", raw.filter((item) => item !== actor) as WooValue[]);
     }
     if (!this.objects.has(actor)) return;
+    if (!this.sessionCleanupOwned(actor)) return;
     const focusList = this.propOrNull(actor, "focus_list");
     if (Array.isArray(focusList) && focusList.length > 0) this.setProp(actor, "focus_list", []);
   }
