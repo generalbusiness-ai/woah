@@ -57,11 +57,13 @@ const CF_DEV_TRACKED_FAIL_STEPS: ReadonlyMap<string, string> = new Map([
   // delivered to the destination shard's relay cache by
   // propagateTranscriptToOtherScopes. Fixed by A2 (lineage-closed row
   // installation). See notes/2026-06-09-cf-cross-scope-architecture-plan.md §A2.
-  ["carry-across-rooms", "→ A2"],
-  // C3: tool-surface-after-move fails for the same reason — the gateway-shard
-  // authority slice for a scope entered cross-room lacks the catalog class
-  // lineage needed to enumerate the pinboard's verbs. Fixed by A2. TRACKED → A2.
-  ["tool-surface-after-move", "→ A2"]
+  ["carry-across-rooms", "→ A2"]
+  // tool-surface-after-move was initially tracked → A2 here, but the observed
+  // cf-dev run PASSES it (TRACKED-OK promotion, 2026-06-09): workerd-local
+  // serves the pinboard tool surface correctly after a cross-room enter. The
+  // add_note E_VERBNF remains a DEPLOY-ONLY failure (lane-fidelity ladder,
+  // AGENTS.md) until A2 lands, so the step is ENFORCED on this lane and the
+  // deployed walkthrough carries the A2 signal.
 ]);
 
 const args = parseArgs(process.argv.slice(2));
