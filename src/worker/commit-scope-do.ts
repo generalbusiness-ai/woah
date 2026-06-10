@@ -86,8 +86,34 @@ import { writeMetricToAnalytics, writeConstructorMetricToAnalytics } from "./met
 import { FaultInjector, KillAfterCommitError } from "./rpc-fault-inject";
 
 const SHADOW_OPEN_EXECUTABLE_SEED_WARN_BYTES = 1_000_000;
-const SHADOW_TAIL_RETENTION_BYTES = 16 * 1024 * 1024;
-const SHADOW_TAIL_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+// Per-table soft budget for the durable relay tail (accepted_frames and
+// transcript_tail measured independently, so the combined ceiling is 2×).
+//
+// Retention policy (B-iv):
+//   - The checkpoint floor is a HARD constraint: rows with seq > lastCheckpointSeq
+//     are NEVER pruned, even when over budget. A rehydrating DO must be able to
+//     replay all frames since the last durable checkpoint.
+//   - Within the budget, the most-recent rows are kept; older rows (seq ≤
+//     lastCheckpointSeq) are pruned when over budget or when too old.
+//   - With WOO_V2_CHECKPOINT_BOUNDED at interval 32, the tail above the checkpoint
+//     floor is bounded to at most 31 frames. Each frame is typically a few KB of
+//     chat/action deltas; 31 × 50 KB ≈ 1.5 MB worst-case for covered frames.
+//   - 4 MB per table (8 MB combined) keeps a generous buffer for bursty rooms
+//     while ensuring covered frames are pruned quickly once a checkpoint fires.
+//     Previously 16 MB; the deployed b7-tail run showed one active scope at
+//     17.6 MB combined because covered frames were never pruned fast enough.
+//
+// Cursor-floor concern (D1 design brief):
+//   v2_fanout_pending rows carry self-contained payloads (commit + transcript +
+//   fanout list); the drain never reads from the CommitScopeDO relay tail. The
+//   cursor-floor rule is therefore MOOT for this table — tail pruning cannot
+//   outrun an in-flight D1 delivery. See notes/2026-06-10-b-iv-checkpoint-tail.md.
+const SHADOW_TAIL_RETENTION_BYTES = 4 * 1024 * 1024;
+// Age-based pruning: rows older than 1 hour can be pruned even if within the byte
+// budget, provided they are below the checkpoint floor (covered by a checkpoint).
+// 7 days was excessively generous; a DO typically rehydrates within seconds, and
+// the checkpoint floor (not the age limit) provides the correctness guarantee.
+const SHADOW_TAIL_RETENTION_MS = 60 * 60 * 1000;
 const CHECKPOINT_TRANSFER_DEFAULT_BYTES = 512 * 1024;
 const CHECKPOINT_TRANSFER_MAX_BYTES = 1024 * 1024;
 const CHECKPOINT_PAGE_TARGET_BYTES = 512 * 1024;

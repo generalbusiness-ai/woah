@@ -51,6 +51,10 @@ WOO_INTERNAL_SECRET = "local-smoke-internal-secret"
 # before reply and drains them after, so crash recovery re-delivers
 # rather than drops. Safe to enable in the smoke lane.
 WOO_V2_TAIL_DELIVERY = "1"
+# B-iv: bounded checkpoints — see wrangler.toml for rationale.
+# Must match production to satisfy guard:smoke-wrangler WOO_* parity.
+WOO_V2_CHECKPOINT_BOUNDED = "1"
+WOO_V2_CHECKPOINT_FRAME_INTERVAL = "32"
 # C1a fault injection — NEVER set in production. Opt-in per test run by
 # un-commenting and editing the value. See src/worker/rpc-fault-inject.ts
 # for the FaultSpec format. Examples:

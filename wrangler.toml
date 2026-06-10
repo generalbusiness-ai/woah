@@ -67,6 +67,23 @@ WOO_V2_READ_CLOSURE_ENVELOPE = "1"
 # reply, drain-on-reactivation covers the crash window, bounded backoff with
 # fanout_redelivery metrics. Flag-off restores synchronous post-accept delivery.
 WOO_V2_TAIL_DELIVERY = "1"
+# B-iv: gate per-commit checkpoint builds on a frame interval rather than
+# running on EVERY accepted commit (B-iv default). Production CommitScopeDOs
+# reconstruct on essentially every turn, so the gate reads the PERSISTED
+# checkpoint seq (not in-memory) to survive reconstruction. Intervening frames
+# are covered by the durable accepted-frame tail. The first commit after a cold
+# activation always checkpoints (seq=unknown), bounding worst-case cold replay
+# to one interval.
+# Interval 32 was chosen because: (a) the default "checkpoint every commit"
+# rebuilt the ~3MB checkpoint on ~every CF turn, accounting for an estimated
+# 10-15% of CommitScopeDO cpuTime; (b) 32 frames bounds worst-case tail-only
+# replay to a small, bounded window; (c) for a normal room at 1 turn/s the
+# checkpoint runs once every ~32 seconds, well within the DO's idle eviction
+# window, so the persisted floor is fresh and cold-replay cost is bounded.
+# Set WOO_V2_CHECKPOINT_FRAME_INTERVAL=1000000 to measure the CPU floor
+# (effectively never checkpoint on commit); the default 32 is the shipped value.
+WOO_V2_CHECKPOINT_BOUNDED = "1"
+WOO_V2_CHECKPOINT_FRAME_INTERVAL = "32"
 
 # Static assets: the bundled SPA is built to dist/ via `npm run build`.
 # The Worker entry routes global API/WS traffic to the gateway DO and object

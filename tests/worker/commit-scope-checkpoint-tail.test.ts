@@ -354,6 +354,77 @@ describe("CommitScopeDO checkpoint/tail open", () => {
     }
   });
 
+  it("P1′ bounded mode: evicted DO rehydrates correctly from checkpoint + tail (frames beyond last checkpoint)", async () => {
+    // Regression guard for the bounded-checkpoint DO eviction path:
+    // when a DO is evicted between checkpoints, the rehydrated instance must
+    // serve the correct HEAD (the most-recent accepted frame, NOT the checkpoint
+    // head) and a checkpoint open must replay tail frames beyond the checkpoint.
+    //
+    // Scenario: interval=3; seq 1 is checkpointed, seqs 2 and 3 are tail-only.
+    // A new DO instance on the same storage (a reconstruction / eviction) must
+    // see head.seq==3 and surface seq 2 + 3 in the frame transfer.
+    const state = new WaitUntilState("scope-a");
+    const objectRow = createWorld().exportObjects(["the_chatroom"])[0]!;
+    const env = { WOO_INTERNAL_SECRET: SECRET, WOO_V2_CHECKPOINT_BOUNDED: "1", WOO_V2_CHECKPOINT_FRAME_INTERVAL: "3" };
+    const write = (seq: number): ProjectionWrite => ({
+      table: "objects",
+      key: "the_chatroom",
+      op: "upsert",
+      row: objectRow,
+      bytes: 100
+    });
+
+    try {
+      // Construct a DO first so the constructor creates the v2_commit_scope_*
+      // tables; then seed rows on the same storage. The DO instance is discarded —
+      // the next instance is the "reconstructed after eviction" one we actually
+      // test. (The FakeDurableObjectState is shared in-process; constructing first
+      // then seeding mirrors what happens in production: tables exist, a DO
+      // constructor runs, then later the state has been written by prior turns.)
+      new CommitScopeDO(state as unknown as DurableObjectState, env);
+
+      // Seed three frames: seq 1 anchors the checkpoint, seqs 2-3 are tail-only.
+      const frame1 = accepted("scope-a", 1, [write(1)]);
+      const frame2 = accepted("scope-a", 2, [write(2)]);
+      const frame3 = accepted("scope-a", 3, [write(3)]);
+      seedScopeRows(state, "scope-a", head("scope-a", 3), {
+        objects: [objectRow],
+        frames: [frame1, frame2, frame3]
+      });
+      // Persist a checkpoint that covers only seq 1 (simulating bounded-mode skip
+      // of seqs 2 and 3). This is what saveEnvelopeDelta + maybeCheckpointOnCommit
+      // would leave on disk with interval=3 after three commits starting from 0.
+      seedCheckpointRow(state, "scope-a", head("scope-a", 1), Date.now());
+
+      // "Evict" the DO: construct a brand-new instance on the same storage.
+      const reconstructed = new CommitScopeDO(state as unknown as DurableObjectState, env);
+
+      // The checkpoint-tail open must see head.seq == 3 (the actual committed head
+      // from the meta row, not the checkpoint head seq 1). The transfer must be
+      // mode=frames carrying both seqs 2 and 3 (the tail beyond the checkpoint).
+      const response = await reconstructed.fetch(await checkpointOpenRequest("scope-a", {
+        known_head: head("scope-a", 1)
+      }));
+      expect(response.ok).toBe(true);
+      const body = await response.json() as Record<string, any>;
+      expect(body).toMatchObject({
+        ok: true,
+        open_protocol: "checkpoint_tail.v1",
+        head: { seq: 3 },
+        transfer: {
+          kind: "frames",
+          from: { seq: 1 },
+          frames: [
+            { frame: { position: { seq: 2 } } },
+            { frame: { position: { seq: 3 } } }
+          ]
+        }
+      });
+    } finally {
+      state.close();
+    }
+  });
+
   it("returns browser-profile checkpoint pages without authority object bodies", async () => {
     const state = new WaitUntilState("scope-a");
     const target = new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: SECRET });

@@ -6509,6 +6509,18 @@ export class PersistentObjectDO {
   private async drainFanoutPending(): Promise<void> {
     const MAX_DRAIN_ATTEMPTS = 5;
     const BACKOFF_BASE_MS = 1_000;
+    // B-iv retention sweep: delete delivered rows older than 24 hours at the
+    // start of every drain pass. The per-success cleanup (7 days) at the bottom
+    // of each successful delivery handles the common case; this sweep ensures
+    // that abandoned rows (marked delivered=1 after MAX_DRAIN_ATTEMPTS) and any
+    // rows that were delivered but whose cleanup never ran (e.g. if the DO was
+    // evicted mid-delivery) are also pruned without waiting for a future success.
+    // 24 hours is generous (DOs typically rehydrate within seconds); it bounds
+    // the table to at most one day of delivered history.
+    this.state.storage.sql.exec(
+      "DELETE FROM v2_fanout_pending WHERE delivered = 1 AND queued_at_ms < ?",
+      Date.now() - 24 * 60 * 60 * 1_000
+    );
     // Read all undrained rows ordered by (scope, seq) so same-scope commits drain
     // in commit order. Use a batch cap to bound a single drain run.
     const rows = this.state.storage.sql.exec(
