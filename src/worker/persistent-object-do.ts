@@ -6334,8 +6334,8 @@ export class PersistentObjectDO {
     // Read all undrained rows ordered by (scope, seq) so same-scope commits drain
     // in commit order. Use a batch cap to bound a single drain run.
     const rows = this.state.storage.sql.exec(
-      "SELECT id, scope, seq, payload, attempts, queued_at_ms FROM v2_fanout_pending WHERE delivered = 0 ORDER BY seq ASC LIMIT 64"
-    ).toArray() as Array<{ id: string; scope: string; seq: number; payload: string; attempts: number; queued_at_ms: number }>;
+      "SELECT id, scope, seq, payload, attempts, queued_at_ms, last_attempt_at_ms FROM v2_fanout_pending WHERE delivered = 0 ORDER BY seq ASC LIMIT 64"
+    ).toArray() as Array<{ id: string; scope: string; seq: number; payload: string; attempts: number; queued_at_ms: number; last_attempt_at_ms: number | null }>;
     if (rows.length === 0) return;
     // Acquire the world lazily; this runs after the response is already sent so
     // cold-init cost is off the caller's path.
@@ -6349,7 +6349,13 @@ export class PersistentObjectDO {
     for (const row of rows) {
       const { id, scope, seq, payload, attempts } = row;
       // Bounded backoff: skip rows whose retry window has not elapsed yet.
-      const nextRetryAt = Number(row.attempts) > 0 ? Date.now() - (BACKOFF_BASE_MS * Math.min(attempts, 8)) : 0;
+      // The window is anchored at the LAST ATTEMPT time, not now — the prior
+      // formula computed Date.now() - backoff and compared it to Date.now(),
+      // which is never in the future, so failed rows retried immediately on
+      // every drain and could burn through MAX_DRAIN_ATTEMPTS in one pass
+      // (review finding, 2026-06-10).
+      const lastAttemptAt = Number(row.last_attempt_at_ms ?? 0);
+      const nextRetryAt = attempts > 0 ? lastAttemptAt + (BACKOFF_BASE_MS * Math.min(attempts, 8)) : 0;
       if (nextRetryAt > Date.now()) continue;
       let jobData: {
         scope: string;
