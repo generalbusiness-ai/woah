@@ -1,4 +1,4 @@
-node_modules/
+node_modules
 dist/
 coverage/
 .DS_Store
@@ -14,3 +14,4 @@ coverage/
 test-results/
 playwright-report/
 playwright/.cache/
+node_modules

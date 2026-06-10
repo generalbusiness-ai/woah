@@ -462,6 +462,100 @@ export function authoritySliceObjectIds(authority: MergeSerializedAuthorityInput
   return new Set(authority.page_refs.map((ref) => ref.object));
 }
 
+// B-i read-closure envelopes (VTN8.3). Filter a cell-slice authority to only
+// carry pages for the turn's read closure:
+//
+//   read_closure(turn) =
+//       pages( actor row
+//            ∪ submitting-session rows
+//            ∪ read_set(transcript)   // incl. permission/policy reads
+//            ∪ write_preimages(transcript) )
+//     ∪ lineage_closure(objects of those pages)
+//
+// The lineage closure is expanded by walking each closure object's parent
+// chain using the lineage pages already present in the full authority slice.
+// The `filterSerializedAuthoritySliceObjects` helper filters page_refs and
+// inline_pages to the expanded set; it also preserves the lineage-page
+// invariant (every kept object has its lineage page).
+//
+// Sessions are filtered to only the submitting session (by id) and any session
+// whose actor is in the closure.  The counters and tombstones are retained
+// unchanged — the CommitScopeDO's version gate compares only per-cell
+// versions, not the counter watermarks, and tombstones are cheap.
+export function filterAuthorityToReadClosure(
+  authority: SerializedAuthoritySlice,
+  closureObjectIds: ReadonlySet<ObjRef>,
+  sessionIds: readonly string[]
+): SerializedAuthoritySlice {
+  if (!isAuthorityCellSlice(authority)) {
+    // Legacy object-slice: filter to closure objects and session actors.
+    const sessionSet = new Set(sessionIds);
+    return {
+      kind: "woo.authority_slice.shadow.v1",
+      sessions: authority.sessions.filter(
+        (s) => sessionSet.has(s.id) || closureObjectIds.has(s.actor)
+      ).map((s) => structuredClone(s) as SerializedSession),
+      objects: authority.objects.filter((o) => closureObjectIds.has(o.id)).map((o) => structuredClone(o) as SerializedObject)
+    };
+  }
+  // Build a parent-lookup map from the lineage pages already in the slice.
+  // We use inline_pages (which always carry lineage pages) rather than
+  // page_refs alone, so the walk is complete even for objects whose owner is
+  // a remote shard we seeded as "fallback" lineage.
+  const parentOf = new Map<ObjRef, ObjRef>();
+  for (const page of authority.inline_pages) {
+    if (page.page === "object_lineage" && page.parent !== null && page.parent !== undefined) {
+      parentOf.set(page.object, page.parent as ObjRef);
+    }
+  }
+  // Expand the closure IDs to include their full lineage (parent chains) so
+  // every object referenced by a kept page also has its lineage present.
+  // Without this expansion a CommitScopeDO merge would fail the
+  // "state page set missing lineage page for X" invariant when a parent object
+  // first arrives via child pages only.
+  // Track which IDs are "lineage-only ancestors" (not directly in the closure)
+  // so we can strip their verb_bytecode pages — the validator only needs those
+  // for objects that appear as verb-read targets in the transcript.
+  const lineageOnlyIds = new Set<ObjRef>();
+  const expandedIds = new Set<ObjRef>(closureObjectIds);
+  for (const id of Array.from(closureObjectIds)) {
+    let current: ObjRef = id;
+    for (let depth = 0; depth < 32; depth++) {
+      const parent = parentOf.get(current);
+      if (!parent) break;
+      if (!expandedIds.has(parent)) {
+        expandedIds.add(parent);
+        lineageOnlyIds.add(parent);
+      }
+      current = parent;
+    }
+  }
+  const sessionSet = new Set(sessionIds);
+  const filteredSessions = authority.sessions.filter(
+    (s) => sessionSet.has(s.id) || expandedIds.has(s.actor)
+  ).map((s) => structuredClone(s) as SerializedSession);
+  // For lineage-only ancestors, strip verb_bytecode pages. The commit validator
+  // only walks lineage for property-def resolution (propertyDefs chain walk) and
+  // permission checks — it does NOT execute verbs on ancestors. Keeping only
+  // object_live, object_lineage, and property_cell pages for these objects is
+  // sufficient for validation and substantially reduces bytes.
+  const filtered = filterSerializedAuthoritySlicePages(
+    { ...authority, sessions: filteredSessions },
+    (ref) => {
+      if (!expandedIds.has(ref.object)) return false;
+      // For lineage-only ancestors, exclude verb_bytecode pages.
+      if (lineageOnlyIds.has(ref.object) && ref.page === "verb_bytecode") return false;
+      return true;
+    }
+  );
+  // Restore sessions (filterSerializedAuthoritySlicePages may not filter them
+  // the same way — replace with our session-filtered list).
+  if (isAuthorityCellSlice(filtered)) {
+    return { ...filtered, sessions: filteredSessions };
+  }
+  return filtered;
+}
+
 // Count the cell pages a slice carries, for instrumentation that sizes a
 // reconstruction (step 2a). For the cell-slice representation (CA12) this is
 // the number of page refs; for the legacy object-row representation there are
