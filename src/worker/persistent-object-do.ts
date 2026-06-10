@@ -5398,9 +5398,28 @@ export class PersistentObjectDO {
       // because the pre-fetch adds an extra await before the live-RPC section.
       // The fake-DO test harness is timing-sensitive and must not see this extra
       // await; the flag is set only in wrangler.smoke.toml and wrangler.toml.
+      //
+      // CA11 provenance rule: KV seed carries source:"cache" and MUST NOT satisfy
+      // owner-required reads. A missing_state_repair pass (forceOwnerRefresh=true)
+      // requires the owner's authoritative row for ALL ids; serving KV cache here
+      // would loop (KV cache provenance → assertResolutionContentsOwnerAuthority
+      // or movement-destination guard raises E_NEED_STATE → repair retry →
+      // KV serves same cache again → same E_NEED_STATE → ...). Individually
+      // owner-required ids (forceOwnerObjectIds) have the same constraint.
+      // Skip KV pre-fetch and KV serve for any host that has owner-required ids;
+      // those hosts must use the live RPC. The live RPC on a cold owner will
+      // time out; for owner-required reads that timeout must propagate (not be
+      // swallowed as a stale fallback) so the repair-budget check surfaces a
+      // clean retryable error and the async wake warms the owner for next turn.
       const kvPointerByHost: Map<string, string> = new Map();
       if (this.env.HOST_SEED_KV && envFlag(this.env.WOO_V2_KV_SEED_AUTHORITY)) {
         await Promise.all(Array.from(byHost.keys(), async (host) => {
+          // Skip KV pre-fetch for any host with owner-required objects.
+          // forceOwnerRefresh means the entire pass is owner-required;
+          // forceOwnerObjectIds means specific ids from this host need live authority.
+          if (forceOwnerRefresh) return;
+          const hostObjects = byHost.get(host);
+          if (hostObjects && Array.from(hostObjects).some((id) => forceOwnerObjectIds.has(id))) return;
           try {
             const pointer = await this.env.HOST_SEED_KV!.get(hostSeedPointerKey(this.env, host as ObjRef), "text");
             if (pointer && pointer.length > 0) kvPointerByHost.set(host, pointer);
@@ -5410,9 +5429,14 @@ export class PersistentObjectDO {
         }));
       }
       remoteSlices.push(...await Promise.all(Array.from(byHost, async ([host, objects]) => {
+        // CA11 provenance rule: skip the KV path entirely for hosts that have
+        // owner-required objects. This check mirrors the pre-fetch guard above:
+        // if any object in this host's set is owner-required, we must not serve
+        // KV cache provenance for it — the live RPC is the only valid source.
+        const hostNeedsOwnerAuthority = forceOwnerRefresh || Array.from(objects).some((id) => forceOwnerObjectIds.has(id));
         // B-ii: on a KV pointer hit (pointer was pre-fetched above), load the
         // seed bytes and build a cache-provenance authority slice without a live RPC.
-        const kvPointer = kvPointerByHost.get(host);
+        const kvPointer = !hostNeedsOwnerAuthority ? kvPointerByHost.get(host) : undefined;
         if (kvPointer) {
           try {
             const raw = await this.env.HOST_SEED_KV!.get(hostSeedBytesKey(this.env, host as ObjRef, kvPointer), "text");
@@ -5478,8 +5502,9 @@ export class PersistentObjectDO {
           }
         }
         // Live authority-slice RPC (original path): no KV pointer hit, owner DO is
-        // already warm, or HOST_SEED_KV is not configured. Swallow timeouts on
-        // refresh paths (tolerateRemoteFailures=true).
+        // already warm, HOST_SEED_KV is not configured, or this host has owner-
+        // required objects (hostNeedsOwnerAuthority). Swallow timeouts on refresh
+        // paths (tolerateRemoteFailures=true) EXCEPT for owner-required reads.
         try {
           const response = await this.forwardInternalReadChecked<{ authority: SerializedAuthoritySlice }>(
             host,
@@ -5489,8 +5514,36 @@ export class PersistentObjectDO {
           return { host, response, error: null as { code: string } | null };
         } catch (err) {
           const error = normalizeError(err);
+          // Owner-required reads (CA11.2 missing_state_repair pass, or
+          // forceOwnerObjectIds): even on a tolerateRemoteFailures path, a
+          // cold-owner timeout MUST NOT be silently dropped as a stale fallback.
+          // Dropping it leaves those objects absent from the slice, which causes
+          // assertResolutionContentsOwnerAuthority / movement-destination guard to
+          // raise the same E_NEED_STATE again — an infinite loop. Instead, fire the
+          // async wake (owner warms for next turn) and propagate so the repair-budget
+          // check in submitTurnIntent surfaces a clean retryable error.
+          if (error.code === "E_TIMEOUT" && options.tolerateRemoteFailures && hostNeedsOwnerAuthority) {
+            // Async wake: warm the owner DO for the next turn's live RPC.
+            if (typeof this.state.waitUntil === "function") {
+              this.state.waitUntil(
+                this.forwardInternalReadChecked<{ authority: SerializedAuthoritySlice }>(
+                  host,
+                  "/__internal/authority-slice",
+                  { objects: Array.from(objects) }
+                ).then(() => {
+                  world.recordMetric({ kind: "authority_slice_async_wake", host, status: "ok" });
+                }).catch((wakeErr) => {
+                  const e = normalizeError(wakeErr);
+                  world.recordMetric({ kind: "authority_slice_async_wake", host, status: "error", error: e.code });
+                })
+              );
+            }
+            // Propagate so the repair budget catches it and surfaces a retryable error.
+            throw err;
+          }
           // Only swallow read-deadline timeouts (E_TIMEOUT) and only when the
-          // caller declared this is a refresh path (durable snapshot exists).
+          // caller declared this is a refresh path (durable snapshot exists) and
+          // the objects are NOT owner-required (guard above handles that case).
           // Other errors (auth, signature, unreachable) always propagate;
           // first-open seeding paths likewise propagate so cold-cold misses
           // fail loudly instead of persisting a partial seed.

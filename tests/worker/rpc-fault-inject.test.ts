@@ -624,6 +624,52 @@ describe("B-ii Gate 3: repair budget stops retrying when exhausted", () => {
   });
 });
 
+// ─── B-ii Gate 4: KV seed flag is safe in all lanes — no provenance loop ─────
+//
+// CA11.2 provenance safety gate: when WOO_V2_KV_SEED_AUTHORITY is enabled,
+// a turn that requires owner-authoritative contents (enter/move, triggering
+// assertResolutionContentsOwnerAuthority) must NOT loop. The pre-fix path
+// served KV cache provenance even on missing_state_repair passes, causing:
+//   KV → source:"cache" → E_NEED_STATE → repair → KV again → same E_NEED_STATE
+// The fix: owner-required reads (missing_state_repair / forceOwnerObjectIds)
+// always use the live RPC, never the KV cache.
+//
+// In the fake-DO lane the live RPC is in-process (no cold-start), so the
+// turn must succeed. The gate is: does `enter` complete without looping?
+// (Before the fix, with the flag on, the fake lane entered a repair loop
+// that exhausted maxAttempts and returned E_NEED_STATE / E_REPAIR_BUDGET.)
+
+describe("B-ii Gate 4: WOO_V2_KV_SEED_AUTHORITY flag is safe — enter succeeds, no CA11 provenance loop", () => {
+  it("enter succeeds with WOO_V2_KV_SEED_AUTHORITY enabled", async () => {
+    const runId = `bii-g4-${Date.now()}`;
+    // Enable the KV seed authority flag. No fault injection — the KV namespace
+    // is empty (FakeKVNamespace starts empty), so the KV path finds no pointer
+    // and falls through to the live RPC. This validates the flag is safe when
+    // the KV seed is absent (the pre-fix extra await broke the fake lane even
+    // with an empty KV).
+    const harness = createFaultHarness();
+    // Patch the env to enable the KV seed flag after harness creation.
+    // The harness env is mutable; we add the flag directly.
+    (harness.env as unknown as Record<string, unknown>).WOO_V2_KV_SEED_AUTHORITY = "1";
+    let session: SmokeSession | null = null;
+    try {
+      session = await openSession(harness, runId, "alice");
+      // `enter` triggers owner-required authority reads (CA11.2). Before the
+      // fix, the KV path (even empty) was consulted on missing_state_repair
+      // passes, causing a loop. With the fix, owner-required reads bypass KV.
+      const result = await session.call("the_chatroom", "enter", []);
+      expect(result, "B-ii Gate 4: enter must succeed with WOO_V2_KV_SEED_AUTHORITY enabled").toBeTruthy();
+      await harness.drainWaitUntil();
+      // Verify a subsequent warm turn also works (no regression on warm path).
+      const sayResult = await session.call("the_chatroom", "say", ["bii-gate4"]);
+      expect(sayResult, "B-ii Gate 4: warm say must succeed after enter").toBeTruthy();
+    } finally {
+      await session?.close();
+      harness.close();
+    }
+  });
+});
+
 // ─── kill_after_commit: D1 gate foundation ────────────────────────────────────
 //
 // The commit is durably applied in CommitScopeDO BEFORE the kill fires.
