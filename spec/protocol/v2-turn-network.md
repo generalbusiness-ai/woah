@@ -808,6 +808,64 @@ by the general selector, so the chosen commit scope is provably identical to the
 pre-B6 binary rule for every `relocation` and `planning` turn; only the `multi`
 classification and its observability metric are new.
 
+### VTN8.3 Read-closure envelopes for planned-transcript commits
+
+> **Status: specified, not implemented** (plan item B-i,
+> `notes/2026-06-09-cf-cross-scope-architecture-plan.md`). Flag:
+> `WOO_V2_READ_CLOSURE_ENVELOPE`. Rollout requires the parity gate below.
+
+Commit validation (VTN8 steps 1–10) reads only: the actor and session rows,
+the cells the transcript declares as reads (including permission/policy reads,
+step 8), the pre-images of cells the transcript writes (step 10 applies the
+writes to produce `post_state_hash`), and the verb/catalog identity material
+(step 5). It never reads untouched scope state. The planned-transcript
+envelope's `authority` field therefore MUST be exactly the **read closure**:
+
+```text
+read_closure(turn) =
+    pages( actor row
+         ∪ submitting-session rows
+         ∪ read_set(transcript)            // incl. permission/policy reads
+         ∪ write_preimages(transcript) )
+  ∪ lineage_closure(objects of those pages)
+```
+
+with each page carried at the version and provenance the planner saw, under
+the standard lineage-completeness transfer invariant (a transfer MUST NOT
+install a row whose parent/definer chain is absent from the merged result).
+The envelope MUST NOT carry untouched scope-wide state: no scope contents
+expansion, no roster, no neighbor topology. Session/audience rows used for
+post-commit delivery are carried in the envelope's `sessions` field as today
+and are unaffected by this rule.
+
+**Verdict equivalence.** This restriction is byte-shrinking, not
+semantics-changing, by the following argument, which an implementation MUST
+preserve: (a) the validator's merge applies envelope pages under authority
+precedence and the per-cell version gate, so a fresher row already held by the
+commit scope is never displaced by an envelope page — the envelope seeds cells
+the scope has not seen, it never overrides what it has; (b) validation reads
+only touched cells, and every touched cell is in the closure; therefore the
+verdict (accept, or rejection reason + `conflicting_cells`) over any pre-state
+is identical with the full slice and with the closure. A touched cell that is
+absent from both the closure and the scope's durable state MUST produce the
+existing `missing_state`-class rejection naming the cells — never a silent
+pass.
+
+**Parity gate (rollout requirement).** Before the flag ships beyond a test
+lane, an implementation MUST demonstrate verdict equivalence empirically, not
+only by the argument above: (1) corpus parity — for a recorded corpus of
+(pre-state, planned transcript) pairs from the shared smoke scenario, validate
+each pair against both envelope shapes and assert identical verdicts,
+mismatched-cell sets, and post-state hashes; (2) lane parity — the full
+scenario run with the flag off and on yields identical per-turn verdict
+streams and final state. The cross-scope envelope byte ceiling (< 256 KB)
+becomes an enforced structural gate when the flag is enabled.
+
+The rationale that motivated the old full-slice rule — "the selected commit
+scope may have a durable snapshot that predates the current actor or other
+transcript validation rows" — is satisfied by the closure itself: the actor,
+session, and every transcript-validation row are exactly what it carries.
+
 ## VTN9. Catch-up and applied frames
 
 Subscribers consume committed state through applied frames.
@@ -1363,11 +1421,14 @@ durable snapshot, it MUST reject the tiny head/session open with
 snapshot or authority slice. The open and envelope still obey the session-row
 rule above; a capsule-disabled planned-transcript commit is not allowed to rely
 on gateway-local session state that the selected CommitScopeDO has never seen.
-The planned-transcript envelope MUST NOT use a slim/warm omission of the
+The planned-transcript envelope MUST NOT use a slim/warm *omission* of the
 authority slice: the selected commit scope may have a durable snapshot that
 predates the current actor or other transcript validation rows, and the planned
-transcript is not re-executed there. The envelope authority is therefore the
-bounded validation seed for the actor, session, and transcript-touched cells.
+transcript is not re-executed there. The envelope authority is the bounded
+validation seed for the actor, session, and transcript-touched cells — and
+VTN8.3 makes that bound normative: the authority is restricted to the turn's
+read closure (actor + session + read set + write pre-images + lineage), never
+the scope-wide slice.
 
 Executable cell-page transfers served for browser execution use the same
 `woo.state.transfer.v1` `cell_pages` transfer, with recipient-bound capsule

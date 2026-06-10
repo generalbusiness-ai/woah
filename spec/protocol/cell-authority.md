@@ -945,6 +945,12 @@ several require a multi-DO harness, CA16):
     with occupant *shard* count, not occupant count; and no movement, projection,
     fanout, or read path performs `O(occupants²)`, `O(world)`, or
     `O(objects_in_scope)` work.
+18. **Read-closure envelope parity (VTN8.3).** A planned-transcript commit
+    submitted with the read-closure envelope produces a verdict (accept, or
+    rejection reason + conflicting cells) and post-state identical to the same
+    transcript submitted with a full-slice envelope, over a recorded corpus
+    from the shared scenario; with the closure enabled, cross-scope envelope
+    request bytes stay under the structural ceiling.
 
 ## CA15. Open questions
 
