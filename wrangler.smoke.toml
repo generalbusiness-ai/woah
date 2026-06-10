@@ -37,6 +37,9 @@ enabled = false
 # (tasks), the_mug (demoworld), and note support.
 WOO_AUTO_INSTALL_CATALOGS = "chat,demoworld,dubspace,help,note,pinboard,prog,tasks,blocks-demo"
 WOO_V2_SLIM_WARM_ENVELOPE = "1"
+# B-ii: serve cold-owner authority from HOST_SEED_KV checkpoint. Enabled in the
+# workerd smoke lane (real DO storage/RPC). NOT in the fake-DO lane (fake-do.ts).
+WOO_V2_KV_SEED_AUTHORITY = "1"
 # B-i: enable read-closure envelopes for planned-transcript (cross-scope) commits.
 # Test lane only — not set in production wrangler.toml.
 WOO_V2_READ_CLOSURE_ENVELOPE = "1"

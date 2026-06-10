@@ -40,6 +40,7 @@ import {
 } from "./shadow-commit-scope";
 import { shadowTurnKeyFromTranscript } from "./turn-key";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, MetricEvent, ObjRef, WooValue } from "./types";
+import { wooError } from "./types";
 import type { WooWorld } from "./world";
 
 export const V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED = "E_SNAPSHOT_REQUIRED";
@@ -133,6 +134,19 @@ export type SubmitTurnPhaseTimer = {
 export type SubmitTurnIntentOptions<Client, Result extends ExecutorEnvelopeResult> = {
   input: ExecutorCallInput;
   maxAttempts?: number;
+  // B-ii: repair deadline budget. When the repair loop has consumed more than
+  // `repairBudgetMs` milliseconds (summed across all attempts), the next retry
+  // is refused even when `maxAttempts` has not been reached. The loop surfaces
+  // the last retryable error (missing_state/commit_rejected) as a clean
+  // woo error instead of cascading into the transport deadline. Default: no
+  // budget (unlimited, the existing behaviour).
+  //
+  // Design rationale: MCP requests have a 20s transport deadline. A 5s cold-owner
+  // authority-slice RPC on each of maxAttempts=8 retries would consume 40s —
+  // double the deadline. The budget lets the caller express the portion of the
+  // transport deadline it is willing to spend on repair, leaving room for a
+  // clean error response before the transport closes the connection.
+  repairBudgetMs?: number;
   ensureClient(
     scope: ObjRef,
     attempt: number,
@@ -773,8 +787,40 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     const authority = await timePhase((ms) => { authorityMs += ms; }, () => options.authorityPayload(planningScope, planningAuthorityObjectIds(planningScope), { phase: "pre_plan", repair, attempt }));
     options.applyAuthority?.(planningClient, authority.authority);
   };
+  // B-ii: repair deadline budget. Budget applies from the start of the first
+  // retry attempt (attempt > 0). `turnStartedAt` is the loop entry wall time,
+  // so `Date.now() - turnStartedAt` is the cumulative elapsed including all
+  // authority fetches. Comparing against `repairBudgetMs` (the portion of the
+  // transport deadline reserved for repair) prevents an unbounded cascade of
+  // 5s authority-slice RPCs consuming the entire MCP request window (20s).
+  //
+  // When the budget check fires, the loop surfaces the last retryable error
+  // (missing_state or commit_rejected) as a woo error with code E_REPAIR_BUDGET
+  // so the caller can surface a clean retryable failure to the transport, rather
+  // than hanging until the transport closes the connection.
+  const repairBudgetMs = options.repairBudgetMs;
+  // The error to surface when the budget is exhausted. Populated on each retry
+  // path so the budget check always has a clean error to throw. Typed as unknown
+  // because `throw` accepts any value — we store an ErrorValue (plain object from
+  // wooError) which the gateway's normalizeError will decode correctly.
+  let lastRetryableError: unknown = null;
+  // Helper: check budget BEFORE starting a new attempt. Must be called whenever
+  // `attempt > 0` (i.e., a repair retry is about to start), so a slow previous
+  // attempt's elapsed time is counted before the next one starts.
+  const budgetExhausted = (attempt: number): boolean => {
+    if (repairBudgetMs === undefined || attempt === 0) return false;
+    return (Date.now() - turnStartedAt) >= repairBudgetMs;
+  };
   try {
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    // B-ii: if a budget is configured and we've spent it, surface the last
+    // retryable error instead of starting another attempt. This prevents a
+    // cascade of cold-owner 5s authority-slice timeouts from consuming the
+    // entire MCP request window (20s deadline).
+    if (budgetExhausted(attempt)) {
+      // eslint-disable-next-line @typescript-eslint/only-throw-error
+      throw lastRetryableError ?? new Error("v2 turn repair budget exhausted");
+    }
     phaseAttempts = attempt + 1;
     const planningScope = options.planningScope?.(options.input) ?? options.input.scope;
     const planningClient = await timePhase((ms) => { ensureClientMs += ms; }, () => options.ensureClient(planningScope, attempt, {
@@ -838,6 +884,9 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
           atoms: missingAtoms
         });
         repairObjectIds = nextRepairObjectIds;
+        // B-ii: record retryable error so the budget check can surface it
+        // instead of the generic "retry loop exhausted" message.
+        lastRetryableError = wooError("E_REPAIR_BUDGET", "turn repair budget exhausted on planning miss", options.input.scope);
         if (!options.prePlanAuthority) await refreshPlanningAuthority(planningScope, planningClient, true, attempt + 1);
         continue;
       }
@@ -868,6 +917,8 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
           atoms: missingAtoms
         });
         repairObjectIds = nextRepairObjectIds;
+        // B-ii: record retryable error so the budget check can surface it.
+        lastRetryableError = wooError("E_REPAIR_BUDGET", "turn repair budget exhausted on planning frame miss", options.input.scope);
         if (!options.prePlanAuthority) await refreshPlanningAuthority(planningScope, planningClient, true, attempt + 1);
         continue;
       }
@@ -1005,6 +1056,13 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
           transcriptObjectIds
         )
       );
+      // B-ii: record retryable error so the budget check can surface it cleanly
+      // instead of the generic "retry loop exhausted" message on budget expiry.
+      lastRetryableError = wooError(
+        "E_REPAIR_BUDGET",
+        "turn repair budget exhausted on commit reply",
+        options.input.scope
+      );
       continue;
     }
     phaseOutcome = "submitted";
@@ -1020,7 +1078,12 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       planned
     };
   }
-  throw new Error("v2 turn gateway retry loop exhausted");
+  // Retry budget exhaustion arrives here via the budgetExhausted check at the
+  // top of the loop or naturally when maxAttempts is reached. Surface the last
+  // retryable error if available (preferred: it names the reason); fall back to
+  // the generic exhausted message so the code path always throws something.
+  // eslint-disable-next-line @typescript-eslint/only-throw-error
+  throw lastRetryableError ?? new Error("v2 turn gateway retry loop exhausted");
   } finally {
     emitPhaseTiming();
   }

@@ -380,7 +380,11 @@ export type MetricEvent =
   // already records a `cross_host_rpc{status:"timeout", rpc_id}` for the
   // underlying RPC; this distinct event captures the higher-level policy
   // decision so cross_host_rpc latency stats stay clean.
-  | { kind: "authority_slice_stale_fallback"; host: string; object_count: number; reason: "timeout" | "snapshot_fallback" | "content_expansion_timeout" }
+  | { kind: "authority_slice_stale_fallback"; host: string; object_count: number; reason: "timeout" | "snapshot_fallback" | "content_expansion_timeout" | "kv_seed" }
+  // B-ii: emitted when the HOST_SEED_KV path warms a cold owner DO asynchronously
+  // after serving a KV-seed authority slice for it. The DO is woken in a background
+  // waitUntil so the next turn finds it warm and the KV fallback is bypassed.
+  | { kind: "authority_slice_async_wake"; host: string; status: "ok" | "error"; error?: string }
   // Sparse MCP gateway pre-plan expansion from a requested scope's direct
   // contents to the contained objects' owner authority. This is bounded identity
   // repair for roster/name reads, not global enumeration.

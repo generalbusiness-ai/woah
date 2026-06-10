@@ -127,6 +127,7 @@ import {
 } from "../core/projection-delta";
 import { metricErrorFields } from "./metric-errors";
 import { writeMetricToAnalytics, writeConstructorMetricToAnalytics } from "./metrics-sink";
+import { FaultInjector } from "./rpc-fault-inject";
 
 // Re-import WooWorld type. Note `import type` must reach the world module
 // without dragging Node-only deps into the Worker bundle.
@@ -161,6 +162,20 @@ export interface Env {
   // unread bulk of the slice is withheld. E_SNAPSHOT_REQUIRED cold-scope
   // escape is preserved.
   WOO_V2_READ_CLOSURE_ENVELOPE?: string;
+  // B-ii: serve cold-owner authority from HOST_SEED_KV (durable checkpoint)
+  // instead of a live cross-DO authority-slice RPC. When set, the MCP gateway
+  // pre-fetches per-host KV seed pointers before the concurrent live-RPC pass;
+  // on a KV hit the authority slice is built from the seed bytes (cache
+  // provenance) and an async DO wake is scheduled so the owner warms for the
+  // next turn; on a KV miss the live RPC runs as before.
+  //
+  // This flag gates the pre-fetch step, which adds an extra await before the
+  // live-RPC concurrent Promise.all. Without the flag, the code path is identical
+  // to the pre-B-ii baseline (no extra awaits). The fake-DO test harness is
+  // sensitive to microtask ordering, so this flag must NOT be set in the fake-DO
+  // test lane. It IS enabled in wrangler.smoke.toml (workerd lane) and in
+  // production via wrangler.toml.
+  WOO_V2_KV_SEED_AUTHORITY?: string;
   // D1: tail-driven post-reply delivery (VTN9.1). When set, the MCP gateway
   // replies to the caller after durable commit + local write-through; peer MCP
   // shard fanout runs via waitUntil and is resumed from durable per-destination
@@ -573,6 +588,10 @@ export class PersistentObjectDO {
   // Set once the activation drain has been scheduled via waitUntil so a burst
   // of concurrent requests does not schedule multiple drains.
   private tailDeliveryDrainScheduled = false;
+  // C1a: lazily-parsed fault injector (parsed once per DO lifetime from
+  // WOO_FAULT_INJECT). Null means "not yet initialised". Use faultInjector()
+  // accessor for access; it is a no-op when WOO_FAULT_INJECT is unset.
+  private _faultInjector: FaultInjector | null = null;
 
   constructor(state: DurableObjectState, env: Env) {
     const constructorStartedAt = Date.now();
@@ -592,6 +611,16 @@ export class PersistentObjectDO {
     const constructorMs = Date.now() - constructorStartedAt;
     console.log("woo.metric", JSON.stringify({ kind: "do_constructor", class: "PersistentObjectDO", ms: constructorMs, ts: Date.now(), host_key: this.durableHostKey() }));
     writeConstructorMetricToAnalytics("PersistentObjectDO", constructorMs, this.durableHostKey(), this.env.METRICS);
+  }
+
+  // C1a: lazily-parsed fault injector. Parsed once per DO lifetime from the
+  // WOO_FAULT_INJECT env var. Returns a no-op injector when the env var is unset
+  // (isEmpty() === true, fast-path for production). Accessing this in a hot path
+  // is cheap after the first parse because isEmpty() short-circuits all hooks.
+  private faultInjector(): FaultInjector {
+    if (this._faultInjector !== null) return this._faultInjector;
+    this._faultInjector = FaultInjector.fromEnv(this.env.WOO_FAULT_INJECT);
+    return this._faultInjector;
   }
 
   private migrateGatewayProjectionCache(): void {
@@ -5357,7 +5386,100 @@ export class PersistentObjectDO {
         remoteSlices.push({ host, response: null, error: null });
       }
     } else {
+      // B-ii: if HOST_SEED_KV is configured AND WOO_V2_KV_SEED_AUTHORITY is set,
+      // pre-fetch all KV seed pointers for the remote hosts BEFORE the concurrent
+      // live-RPC Promise.all. Pre-fetching outside the concurrent loop keeps the
+      // live-RPC Promise.all interleaving identical to the pre-B-ii baseline when
+      // no KV hits exist (null pointer), so the fake-DO test harness ordering is
+      // preserved. On a KV hit, the cached pointer is available synchronously
+      // inside the concurrent lambda — no extra await for missed hosts.
+      //
+      // The WOO_V2_KV_SEED_AUTHORITY flag is required (not just HOST_SEED_KV)
+      // because the pre-fetch adds an extra await before the live-RPC section.
+      // The fake-DO test harness is timing-sensitive and must not see this extra
+      // await; the flag is set only in wrangler.smoke.toml and wrangler.toml.
+      const kvPointerByHost: Map<string, string> = new Map();
+      if (this.env.HOST_SEED_KV && envFlag(this.env.WOO_V2_KV_SEED_AUTHORITY)) {
+        await Promise.all(Array.from(byHost.keys(), async (host) => {
+          try {
+            const pointer = await this.env.HOST_SEED_KV!.get(hostSeedPointerKey(this.env, host as ObjRef), "text");
+            if (pointer && pointer.length > 0) kvPointerByHost.set(host, pointer);
+          } catch {
+            // KV errors fall through to the live RPC path silently.
+          }
+        }));
+      }
       remoteSlices.push(...await Promise.all(Array.from(byHost, async ([host, objects]) => {
+        // B-ii: on a KV pointer hit (pointer was pre-fetched above), load the
+        // seed bytes and build a cache-provenance authority slice without a live RPC.
+        const kvPointer = kvPointerByHost.get(host);
+        if (kvPointer) {
+          try {
+            const raw = await this.env.HOST_SEED_KV!.get(hostSeedBytesKey(this.env, host as ObjRef, kvPointer), "text");
+            if (raw) {
+              let parsed: unknown;
+              try { parsed = JSON.parse(raw); } catch { parsed = null; }
+              if (parsed !== null) {
+                const currentWorld = world.exportWorld();
+                const seedResult = restoreHostSeedKvPayload(parsed, kvPointer, currentWorld, this.env, (event) => world.recordMetric(event));
+                if (seedResult.ok) {
+                  const seed = seedResult.value;
+                  // Filter seed objects to only the requested ids. The seed may
+                  // contain many objects; we only need the subset the turn touched.
+                  const requestedSet = new Set<ObjRef>(Array.from(objects));
+                  const seedObjects = seed.objects.filter((obj) => requestedSet.has(obj.id));
+                  if (seedObjects.length > 0) {
+                    const sliceFromKv = buildSerializedAuthorityCellSlice({
+                      sessions: [],
+                      objects: seedObjects,
+                      counters: {
+                        objectCounter: seed.objectCounter,
+                        parkedTaskCounter: seed.parkedTaskCounter,
+                        sessionCounter: seed.sessionCounter
+                      },
+                      tombstones: seed.tombstones ?? [],
+                      // Cache provenance: the KV seed is a stale snapshot, not a
+                      // live owner read. Commit validation will reject stale cell
+                      // versions, so the turn retries with fresh authority.
+                      pageProvenance: () => ({ source: "cache" })
+                    });
+                    world.recordMetric({
+                      kind: "authority_slice_stale_fallback",
+                      host,
+                      object_count: objects.size,
+                      reason: "kv_seed"
+                    });
+                    // Async DO wake: schedule a background authority-slice fetch to
+                    // warm the owner DO for the next turn. Fire-and-forget — we do
+                    // not wait for it. The owner must be woken eventually; once warm
+                    // the next authority-slice call returns an authoritative row and
+                    // the KV fallback is bypassed.
+                    if (typeof this.state.waitUntil === "function") {
+                      this.state.waitUntil(
+                        this.forwardInternalReadChecked<{ authority: SerializedAuthoritySlice }>(
+                          host,
+                          "/__internal/authority-slice",
+                          { objects: Array.from(objects) }
+                        ).then(() => {
+                          world.recordMetric({ kind: "authority_slice_async_wake", host, status: "ok" });
+                        }).catch((wakeErr) => {
+                          const e = normalizeError(wakeErr);
+                          world.recordMetric({ kind: "authority_slice_async_wake", host, status: "error", error: e.code });
+                        })
+                      );
+                    }
+                    return { host, response: { authority: sliceFromKv }, error: null as { code: string } | null };
+                  }
+                }
+              }
+            }
+          } catch {
+            // KV bytes-load error: fall through to the live RPC path.
+          }
+        }
+        // Live authority-slice RPC (original path): no KV pointer hit, owner DO is
+        // already warm, or HOST_SEED_KV is not configured. Swallow timeouts on
+        // refresh paths (tolerateRemoteFailures=true).
         try {
           const response = await this.forwardInternalReadChecked<{ authority: SerializedAuthoritySlice }>(
             host,
@@ -5382,6 +5504,9 @@ export class PersistentObjectDO {
             staleFallbackCount += 1;
             return { host, response: null, error };
           }
+          // B-ii: if tolerateRemoteFailures is false (first-open seeding path)
+          // and the RPC timed out, this is a hard failure. The budget check in
+          // submitTurnIntent will surface a clean E_REPAIR_BUDGET error.
           throw err;
         }
       })));
@@ -6668,8 +6793,21 @@ export class PersistentObjectDO {
     const timeoutMs = options.timeoutMs ?? this.hostWriteRpcTimeoutMs();
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(wooError("E_TIMEOUT", `cross-host RPC timed out: ${host}${path}`, { host, path, timeout_ms: timeoutMs })), timeoutMs);
+    // C1a: fault injection seam for authority-slice and mcp-commit-fanout routes.
+    // The pre-call hook fires before the real outbound fetch. For mode=timeout the
+    // hook hangs until the AbortController fires (so the RPC deadline governs the
+    // wall time, matching the real-production timeout behaviour). For mode=error
+    // the hook throws immediately (used in the fake-DO lane where real timeouts
+    // are undesirable). mode=latency adds a fixed delay before the real call.
+    // NOTE: the seam is INSIDE the try/catch so that cross_host_rpc error metrics
+    // are recorded even for pre-call faults (Gate 1 verification depends on this).
+    const fi = this.faultInjector();
+    const faultRouteKey = path === "/__internal/authority-slice" ? "authority-slice" as const
+      : path === "/__internal/mcp-commit-fanout" ? "mcp-commit-fanout" as const
+      : null;
     let observedQueueMs = 0;
     try {
+      if (!fi.isEmpty() && faultRouteKey) await fi.applyPreCall(faultRouteKey, controller.signal);
       const { response, queueMs } = await this.outboundFetch(id, request, controller.signal);
       observedQueueMs = queueMs;
       const parsed = await response.json() as T;

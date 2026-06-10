@@ -57,6 +57,25 @@ const REMOTE_ACCEPTED_LRU_LIMIT = 8192;
 const REMOTE_PENDING_LIMIT = 1024;
 const REMOTE_PENDING_MAX_AGE_MS = 60_000;
 
+// B-ii: repair deadline budget for the MCP turn repair loop.
+//
+// MCP requests have a ~20s transport-level deadline. Each repair attempt may
+// call `/__internal/authority-slice` on a cold owner DO (measured: 5s timeout
+// in production). With maxAttempts=8, an unconstrained loop could consume 40s
+// — double the deadline — leaving the transport to close the connection mid-turn
+// with no clean error for the client. The budget reserves 12s for repair
+// (allowing at most 2 full cold-owner timeouts before the loop stops and
+// surfaces a clean E_REPAIR_BUDGET retryable error, which the client can retry
+// immediately). The remaining 8s covers the first-attempt authority assembly,
+// planning, VM execution, and the CommitScopeDO envelope RPC.
+//
+// This is intentionally a conservative budget: authority-slice calls on warm
+// paths resolve in ≤50ms, so 12s only fires when multiple attempts each hit
+// a cold-owner stall. The KV seed read (B-ii fix for cold-owner auth) should
+// reduce cold-owner RPC frequency substantially; the budget is a safety net
+// for whatever cold paths remain.
+const MCP_REPAIR_BUDGET_MS = 12_000;
+
 function isV2CommitScopeSnapshotRequiredError(err: unknown): boolean {
   if (!err || typeof err !== "object" || Array.isArray(err)) return false;
   const code = (err as { code?: unknown }).code;
@@ -977,6 +996,11 @@ export class McpGateway {
       prePlanAuthority: false,
       repairPlanningAuthority: true,
       maxAttempts: 8,
+      // B-ii: cap the repair loop to MCP_REPAIR_BUDGET_MS so a cascade of
+      // cold-owner authority-slice timeouts (5s each) cannot consume the entire
+      // 20s MCP request deadline. The loop stops when the budget is spent and
+      // surfaces a clean E_REPAIR_BUDGET retryable error.
+      repairBudgetMs: MCP_REPAIR_BUDGET_MS,
       ensureClient: async (submitScope, _attempt, context) => await this.ensureV2ScopeClient(entry, submitScope, {
         requireCommitScopeOpen: context.phase === "commit" && context.plannedTranscriptCommit,
         timing: context.timing,

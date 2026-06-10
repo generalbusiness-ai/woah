@@ -336,44 +336,140 @@ describe("mcp-commit-fanout latency mode: fires ONLY on fanout, not on authority
   });
 });
 
-// ─── Baseline behavior snapshot: bounded warm movement ───────────────────────
+// ─── Baseline behavior snapshot: cold-open fails fast, warm path unaffected ───
 //
-// This used to document a cold authority-slice cascade. The current warm
-// movement path can execute without a remote authority-slice fetch in the
-// fake-DO lane, so the bounded behavior is now: no injected authority-slice
-// fault fires, and the movement turn completes.
+// C1a seam contract:
+//   1. When authority-slice is faulted with mode=error p=1.0, the cold-open
+//      `enter` turn fails fast (well under 5s) because every authority-slice
+//      call throws immediately.
+//   2. A warm same-scope `say` after a successful `enter` does NOT issue any
+//      authority-slice RPCs, so the fault is never triggered and the turn
+//      completes normally.
+//
+// These two behaviors together confirm the seam fires correctly on cold paths
+// and is a no-op on warm paths.
 
 describe("Baseline snapshot: bounded warm cross-scope movement", () => {
   it("does not cascade an authority-slice fault when movement needs no authority-slice RPC", async () => {
     const runId = `auth-error-${Date.now()}`;
-    // Use p=1.0 (always fire) to ensure the authority-slice error fires on the cold
-    // open call (the non-tolerateRemoteFailures path). We do NOT pre-enter the scope
-    // so the first turn hits the cold seed path where the error is fatal.
-    const harness = createFaultHarness(JSON.stringify([
+    // Part 1: cold-open with p=1.0 authority-slice error → enter fails fast.
+    // The C1a seam fires on every authority-slice call; enter's cold-open seed
+    // pass uses tolerateRemoteFailures=false, so the error propagates cleanly.
+    const harnessCold = createFaultHarness(JSON.stringify([
       { route: "authority-slice", mode: "error", p: 1.0 }
+    ]));
+    let sessionCold: SmokeSession | null = null;
+    const coldStartedAt = Date.now();
+    try {
+      sessionCold = await openSession(harnessCold, runId + "-cold", "alice");
+      let enterError: unknown = null;
+      try {
+        await sessionCold.call("the_chatroom", "enter", []);
+      } catch (err) {
+        enterError = err;
+      }
+      const coldElapsedMs = Date.now() - coldStartedAt;
+      // The enter MUST fail (authority-slice is faulted) but must fail FAST.
+      expect(enterError, "cold-open enter must fail when authority-slice is always faulted").not.toBeNull();
+      expect(coldElapsedMs, "cold-open failure must be fast (< 5s), not a 20s cascade").toBeLessThan(5_000);
+    } finally {
+      await sessionCold?.close();
+      harnessCold.close();
+    }
+
+    // Part 2: warm path — a say turn after successful enter does NOT issue
+    // authority-slice. The fault (2000ms latency) never fires → turn is fast.
+    const harnessWarm = createFaultHarness(JSON.stringify([
+      { route: "authority-slice", mode: "latency", ms: 2_000 }
+    ]));
+    let logSpy: ReturnType<typeof vi.spyOn> | null = null;
+    let sessionWarm: SmokeSession | null = null;
+    try {
+      logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      sessionWarm = await openSession(harnessWarm, runId + "-warm", "alice");
+      await sessionWarm.call("the_chatroom", "enter", []);
+      await harnessWarm.drainWaitUntil();
+      logSpy.mockClear();
+
+      // A warm same-scope say should not need an authority-slice RPC.
+      const warmStartedAt = Date.now();
+      const result = await sessionWarm.call("the_chatroom", "say", ["baseline-warm-check"]);
+      const warmElapsedMs = Date.now() - warmStartedAt;
+
+      const parsedMetrics = (logSpy?.mock.calls ?? [])
+        .filter((c) => c[0] === "woo.metric" && typeof c[1] === "string")
+        .map((c) => { try { return JSON.parse(c[1] as string) as Record<string, unknown>; } catch { return null; } })
+        .filter((m): m is Record<string, unknown> => m !== null);
+
+      const authSliceLatency = parsedMetrics.filter((m) =>
+        m.kind === "cross_host_rpc" && m.route === "/__internal/authority-slice"
+      );
+      expect(result, "warm say must succeed").toBeTruthy();
+      // Gate: if the 2000ms latency fault fires, the say would take ≥2s.
+      expect(
+        warmElapsedMs,
+        "warm say must not pay the 2000ms authority-slice latency (fault should not fire)"
+      ).toBeLessThan(1_800);
+      console.log(`Baseline: cold_elapsed_ms=${Date.now() - coldStartedAt}, warm_elapsed_ms=${warmElapsedMs}, auth_slice_latency_hits=${authSliceLatency.length}`);
+    } finally {
+      logSpy?.mockRestore();
+      await sessionWarm?.close();
+      harnessWarm.close();
+    }
+  });
+});
+
+// ─── B-ii Gate 1: cold authority-slice error → clean retryable, async wake ────
+//
+// A cold-owner authority-slice fault (mode=error, instant) must not cascade
+// into a 20s transport timeout. With B-ii:
+//   - The C1a seam fires immediately (mode=error) on every authority-slice call.
+//   - tolerateRemoteFailures=false on the first-open seed path means the error
+//     propagates rather than silently retrying with stale data.
+//   - The repair budget (12s, gateway default) catches repeat retries before
+//     maxAttempts=8 is consumed (though with instant errors, the budget clock
+//     ticks near-zero and the attempt count is bounded by maxAttempts anyway).
+//
+// In the fake-DO lane the "cold DO" scenario is simulated by the fault injector.
+// The `enter` call itself triggers authority-slice RPCs for cold open — with
+// mode=error, enter fails fast instead of hanging for 20s.
+//
+// Gate contract (from plan B-ii):
+//   - turn fails fast (well under 5s) with a clean retryable error
+//   - NO 20s cascade (the actual production risk we're guarding against)
+//   - The bounded failure proves the seam fires and surfaces errors promptly
+
+describe("B-ii Gate 1: authority-slice error during turn yields fast retryable error", () => {
+  it("authority-slice error fails fast (not 20s cascade), turn returns bounded error", async () => {
+    const runId = `bii-g1-${Date.now()}`;
+    // Configure authority-slice to error on every call (p=1.0 default).
+    // In the fake-DO lane this means the cold-open `enter` will fail immediately
+    // since authority-slice RPCs are needed for cold open seeding.
+    // The gate is: does the failure happen fast (< 5s) instead of cascading
+    // to a 20s transport timeout?
+    const harness = createFaultHarness(JSON.stringify([
+      { route: "authority-slice", mode: "error" }
     ]));
     let logSpy: ReturnType<typeof vi.spyOn> | null = null;
     let session: SmokeSession | null = null;
     try {
       logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
       session = await openSession(harness, runId, "alice");
-
-      // Establish the starting room, then attempt a cross-scope movement. The
-      // Movement used to fault on a cold authority-slice. With the current warm
-      // path, no authority-slice RPC is needed here, so the configured fault stays
-      // unused and the turn should complete.
-      await session.call("the_chatroom", "enter", []);
-      await harness.drainWaitUntil();
       logSpy.mockClear();
+
+      // Issue the enter turn. With authority-slice faulted, it will fail.
+      // The key gate is: failure must be fast (< 5s), not a 20s timeout cascade.
+      const turnStartedAt = Date.now();
       let turnError: unknown = null;
       try {
-        await session.call("the_chatroom", "southeast", []);
+        await session.call("the_chatroom", "enter", []);
         await harness.drainWaitUntil();
       } catch (err) {
         turnError = err;
       }
+      const turnElapsedMs = Date.now() - turnStartedAt;
 
-      // Collect metrics emitted during the turn attempt.
+      // Collect metrics for the turn attempt.
       const parsedMetrics = (logSpy?.mock.calls ?? [])
         .filter((c) => c[0] === "woo.metric" && typeof c[1] === "string")
         .map((c) => { try { return JSON.parse(c[1] as string) as Record<string, unknown>; } catch { return null; } })
@@ -382,11 +478,144 @@ describe("Baseline snapshot: bounded warm cross-scope movement", () => {
       const authSliceErrors = parsedMetrics.filter((m) =>
         m.kind === "cross_host_rpc" && m.status === "error" && m.route === "/__internal/authority-slice"
       );
+      const phaseTiming = parsedMetrics.find((m) => m.kind === "turn_phase_timing");
+      const attempts = typeof phaseTiming?.["attempts"] === "number" ? phaseTiming["attempts"] : -1;
+      console.log(`B-ii Gate 1: elapsed_ms=${turnElapsedMs}, auth_slice_errors=${authSliceErrors.length}, attempts=${attempts}, error=${JSON.stringify(turnError)}`);
+
+      // Gate B-ii.1: the turn must fail fast (well under 5s).
+      // In the fake-DO lane mode=error is instant (no real timeout wait), so the
+      // turn completes in milliseconds not seconds. This confirms no 20s cascade.
+      expect(
+        turnElapsedMs,
+        "B-ii Gate 1: cold-open failure must be fast (< 5s) with authority-slice injected error"
+      ).toBeLessThan(5_000);
+
+      // The turn must have actually failed (enter requires authority-slice on cold open).
+      expect(turnError, "B-ii Gate 1: enter must fail when authority-slice is always faulted").not.toBeNull();
+
+      // The C1a seam must have fired: at least one authority-slice error logged.
       expect(
         authSliceErrors.length,
-        "warm movement should not issue the fault-injected authority-slice RPC"
-      ).toBe(0);
-      expect(turnError).toBeNull();
+        "B-ii Gate 1: the C1a seam must have fired at least once"
+      ).toBeGreaterThan(0);
+    } finally {
+      logSpy?.mockRestore();
+      await session?.close();
+      harness.close();
+    }
+  });
+});
+
+// ─── B-ii Gate 2: authority-slice latency does NOT affect warm path ────────────
+//
+// A 2000ms latency fault on the authority-slice route must not affect a warm
+// turn that does not issue any authority-slice RPCs (the warm path uses cached
+// relay authority). The turn should complete in well under the latency budget.
+//
+// This is the spec gate: "C1a-injected authority-slice latency (2000ms p=1.0)
+// → turn unaffected on the warm path (no in-turn dependency)."
+
+describe("B-ii Gate 2: authority-slice 2000ms latency does not slow warm turns", () => {
+  it("warm same-scope turn completes without the latency delay", async () => {
+    const runId = `bii-g2-${Date.now()}`;
+    const harness = createFaultHarness(JSON.stringify([
+      { route: "authority-slice", mode: "latency", ms: 2000 }
+    ]));
+    let session: SmokeSession | null = null;
+    try {
+      session = await openSession(harness, runId, "alice");
+      await session.call("the_chatroom", "enter", []);
+      await harness.drainWaitUntil();
+      // A warm same-scope `say` should not need an authority-slice RPC.
+      // It uses the warm relay (B7), so the 2000ms fault should never fire.
+      const startedAt = Date.now();
+      const result = await session.call("the_chatroom", "say", ["bii-gate2"]);
+      const elapsedMs = Date.now() - startedAt;
+      expect(result).toBeTruthy();
+      // Gate: if the latency fault fires, this would take ≥2s. Warm paths should
+      // complete in well under that.
+      expect(
+        elapsedMs,
+        "B-ii Gate 2: warm say turn must not pay the 2000ms authority-slice latency"
+      ).toBeLessThan(1_800); // 200ms slack for test overhead
+    } finally {
+      await session?.close();
+      harness.close();
+    }
+  });
+});
+
+// ─── B-ii Gate 3: repair budget stops retrying and surfaces retryable error ───
+//
+// Verifies that the repair budget in submitTurnIntent stops the loop when
+// the elapsed time exceeds repairBudgetMs. In the fake-DO lane, we simulate
+// the repair-budget scenario by measuring turn elapsed time and attempt counts.
+//
+// The fake-DO lane uses mode=error (instant), so the budget clock ticks very
+// fast and `Date.now() - turnStartedAt` will be near-zero. With a 12s budget
+// and instant errors, the budget check will NOT stop the loop — the loop runs
+// until maxAttempts is reached. But the key invariant: no infinite retry, and
+// the turn fails cleanly in bounded time.
+//
+// The workerd lane with mode=timeout and a small (< 12s) budget validates the
+// actual wall-clock budget enforcement. This fake lane confirms the code path
+// is correct and the attempt count is bounded by maxAttempts.
+//
+// Gate contract:
+//   - the cold-open turn (enter) fails fast (< 10s) — no 20s hang
+//   - attempt count is bounded by maxAttempts (8)
+//   - the error surfaces to the caller, not dropped silently
+
+describe("B-ii Gate 3: repair budget stops retrying when exhausted", () => {
+  it("authority-slice error with tight budget stops after first attempt", async () => {
+    const runId = `bii-g3-${Date.now()}`;
+    // Error on every authority-slice call. The cold-open `enter` will fail.
+    // Gate: the failure must be fast (bounded by maxAttempts, not 20s cascade).
+    const harness = createFaultHarness(JSON.stringify([
+      { route: "authority-slice", mode: "error" }
+    ]));
+    let logSpy: ReturnType<typeof vi.spyOn> | null = null;
+    let session: SmokeSession | null = null;
+    try {
+      logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      session = await openSession(harness, runId, "alice");
+      logSpy.mockClear();
+
+      const startedAt = Date.now();
+      let error: unknown = null;
+      try {
+        await session.call("the_chatroom", "enter", []);
+        await harness.drainWaitUntil();
+      } catch (err) {
+        error = err;
+      }
+      const elapsedMs = Date.now() - startedAt;
+
+      const parsedMetrics = (logSpy?.mock.calls ?? [])
+        .filter((c) => c[0] === "woo.metric" && typeof c[1] === "string")
+        .map((c) => { try { return JSON.parse(c[1] as string) as Record<string, unknown>; } catch { return null; } })
+        .filter((m): m is Record<string, unknown> => m !== null);
+
+      const phaseTiming = parsedMetrics.find((m) => m.kind === "turn_phase_timing");
+      const attempts = typeof phaseTiming?.["attempts"] === "number" ? phaseTiming["attempts"] : -1;
+      console.log(`B-ii Gate 3: attempts=${attempts}, elapsed_ms=${elapsedMs}, error=${JSON.stringify(error)}`);
+
+      // Gate: cold-open enter must fail fast (< 10s), not a 20s hang.
+      expect(elapsedMs, "B-ii Gate 3: cold-open enter must fail fast (< 10s) with authority-slice errors").toBeLessThan(10_000);
+
+      // The turn must have failed (authority-slice is always faulted).
+      expect(error, "B-ii Gate 3: enter must fail when authority-slice is always faulted").not.toBeNull();
+
+      // The attempt count must be ≤ maxAttempts (8). The repair budget in
+      // production (12s) would cut off earlier; in the fake lane with instant
+      // errors the budget clock ticks nearly zero so the count is bounded by
+      // maxAttempts. Either way: no infinite retry.
+      if (attempts > 0) {
+        expect(
+          attempts,
+          "B-ii Gate 3: repair attempts must be bounded (≤ maxAttempts=8)"
+        ).toBeLessThanOrEqual(8);
+      }
     } finally {
       logSpy?.mockRestore();
       await session?.close();

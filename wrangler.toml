@@ -52,6 +52,11 @@ CF_ACCOUNT_ID = "6e953d231f1c9aadffbf59537a82e13a"
 # appears. The v2_envelope.request_bytes size proxy verifies the warm-turn drop
 # from MB-scale to KB-scale.
 WOO_V2_SLIM_WARM_ENVELOPE = "1"
+# B-ii: serve cold-owner authority from HOST_SEED_KV instead of a live cross-DO
+# authority-slice RPC. The KV checkpoint is available in ~10-50ms vs ~5s cold-
+# start penalty. Disabled in the fake-DO test lane (WOO_V2_KV_SEED_AUTHORITY must
+# NOT be set there) because the lane is microtask-ordering-sensitive.
+WOO_V2_KV_SEED_AUTHORITY = "1"
 
 # Static assets: the bundled SPA is built to dist/ via `npm run build`.
 # The Worker entry routes global API/WS traffic to the gateway DO and object

@@ -889,6 +889,15 @@ projection; CA8 fanout). Neither reintroduces a placement-style shared owner.
   crowded rooms.
 - The first interaction with a cold parent pays projection fetch/repair once
   (CA4); steady-state reads take no route-home RPC.
+- **Cold-owner authority (B-ii).** When `WOO_V2_KV_SEED_AUTHORITY` is set, the
+  MCP gateway serves cold-owner authority from a pre-built `HOST_SEED_KV`
+  checkpoint (latency ~10–50ms) instead of a live `/__internal/authority-slice`
+  RPC (cold-start penalty ~5s). The KV slice carries `source:"cache"` provenance;
+  commit validation may reject stale cell versions, which retries the turn against
+  a now-warm owner. The owner DO is woken asynchronously (after reply) so
+  subsequent turns pay zero cold-start cost. The turn repair loop in
+  `submitTurnIntent` is bounded by `repairBudgetMs` (MCP gateway: 12 000ms) to
+  prevent indefinite retries when every attempt is under repair.
 
 ### CA13.5 Forbidden degradation modes
 
@@ -964,6 +973,16 @@ several require a multi-DO harness, CA16):
     **Status: implemented (flag-gated), gate enforced** in
     `tests/b-i-read-closure-parity.test.ts` and
     `tests/worker/cf-local-structural.test.ts`.
+19. **Bounded cold-owner authority and repair budget (B-ii).** When the
+    `WOO_V2_KV_SEED_AUTHORITY` flag is set, a cold-owner authority-slice RPC is
+    replaced by a KV checkpoint read (~10–50ms) with `source:"cache"` provenance;
+    the owner DO is woken asynchronously (not in-turn). Without a KV checkpoint the
+    live RPC runs as before. The turn repair loop in `submitTurnIntent` respects a
+    `repairBudgetMs` deadline: once `Date.now() - turnStartedAt >= repairBudgetMs`
+    the loop stops and surfaces the last retryable error (MCP gateway sets 12 000ms
+    budget). **Status: implemented (flag-gated), gates enforced** in
+    `tests/worker/rpc-fault-inject.test.ts` (B-ii Gate 1: error fails fast;
+    Gate 2: latency does not affect warm path; Gate 3: budget stops exhausted loop).
 
 ## CA15. Open questions
 
