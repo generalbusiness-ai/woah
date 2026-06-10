@@ -640,7 +640,7 @@
     },
     {
       "kind": "create_instance",
-      "class": "$portable",
+      "class": "$note",
       "as": "the_mug",
       "name": "Mug",
       "description": "A heavy ceramic mug with the last smell of coffee in it.",
@@ -651,7 +651,9 @@
           "coffee mug",
           "cup"
         ],
-        "home": "the_chatroom"
+        "home": "the_chatroom",
+        "text": "",
+        "writers": []
       }
     },
     {

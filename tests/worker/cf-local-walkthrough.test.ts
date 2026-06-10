@@ -116,28 +116,23 @@ describe("CF-local smoke walkthrough", () => {
       // (scripts/smoke/scenario.ts), run here against the in-process fake DO.
       // includeConcurrentMove pairs with this file's coherence-invariant ratchet
       // (B6 / CA14.3: concurrent move through a shared destination keeps both
-      // memberships). includeTakeDrop is held OFF here, by design: this gate also
-      // asserts `dangling_parent_ref == 0`, and a take on a $portable object emits
-      // dangling_parent_ref because the gateway-shard authority slice ships
-      // actor/thing support lineage but NOT the $portable catalog-class lineage of
-      // the acted-on item (the turn still completes via authority repair and the
-      // fanout is correct — only the zero-dangling guard fires). Flip it ON once
-      // $portable and the other contents-object classes reach the gateway slice.
-      // The deployed and workerd lanes already run take/drop.
+      // memberships).
       //
-      // C3 gates: includeCarryAcrossRooms and includeToolSurfaceAfterMove are also
-      // held OFF here for the same reason as includeTakeDrop: the carry step calls
-      // `take` on a $portable object, which emits dangling_parent_ref because the
-      // gateway-shard relay lacks $portable class lineage (same root cause as face
-      // #2, notes/2026-06-09-cf-cross-scope-architecture-plan.md). Both steps are
-      // TRACKED in cf-dev via CF_DEV_TRACKED_FAIL_STEPS (→ A2) and will be flipped
-      // ON in both lanes once A2 (lineage-closed row installation) lands.
-      // See notes/2026-06-09-c2c3-gates-scenario.md for the per-lane status.
+      // A2 landed (2026-06-10): includeTakeDrop and includeCarryAcrossRooms are
+      // now ON. Before A2, a `take` on a $portable object emitted dangling_parent_ref
+      // because the gateway-shard relay lacked $portable catalog-class lineage. A2
+      // (mergeIncomingObjectLineageClosure in gateway.ts) pre-delivers the transitive
+      // parent chain of every incoming object to the destination relay, so dangling
+      // refs no longer fire. Both steps are now active in all three smoke lanes.
+      // includeToolSurfaceAfterMove stays OFF in this lane: the mug is now $note, and
+      // the tool-surface-after-move step requires alice to enter the_pinboard, which
+      // the dangling_parent_ref==0 gate already covers via includeCarryAcrossRooms.
+      // The full tool-surface step is enforced in smoke:cf-dev.
       await runSmokeWalkthrough({ alice, bob }, localStep, {
         runId,
         includeConcurrentMove: true,
-        includeTakeDrop: false,
-        includeCarryAcrossRooms: false,
+        includeTakeDrop: true,
+        includeCarryAcrossRooms: true,
         includeToolSurfaceAfterMove: false,
         waitTimeoutMs: 10_000,
         drainBudgetMs: DRAIN_TOTAL_BUDGET_MS,

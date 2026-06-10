@@ -53,11 +53,14 @@ type PassWindow = { label: string; start: number; end: number; passed: number; t
 // Each entry: step name substring → plan item tag. Keep entries sorted.
 // Remove an entry only when the plan item has landed and the step reliably passes.
 const CF_DEV_TRACKED_FAIL_STEPS: ReadonlyMap<string, string> = new Map([
-  // C3: carry-across-rooms fails in cf-dev because $portable lineage is not
-  // delivered to the destination shard's relay cache by
-  // propagateTranscriptToOtherScopes. Fixed by A2 (lineage-closed row
-  // installation). See notes/2026-06-09-cf-cross-scope-architecture-plan.md §A2.
-  ["carry-across-rooms", "→ A2"]
+  // A2 landed (2026-06-10): carry-across-rooms was tracked → A2 because
+  // propagateTranscriptToOtherScopes delivered transcript deltas without the
+  // moved/created objects' class lineage, causing dangling_parent_ref and
+  // E_VERBNF on the destination shard. A2 (mergeIncomingObjectLineageClosure)
+  // fixes this by pre-merging the transitive parent chain of all incoming
+  // objects into the destination relay before the delta frame. The step is now
+  // ENFORCED (removed from this map). If it regresses, the gate exit code flips.
+  //
   // tool-surface-after-move was initially tracked → A2 here, but the observed
   // cf-dev run PASSES it (TRACKED-OK promotion, 2026-06-09): workerd-local
   // serves the pinboard tool surface correctly after a cross-room enter. The

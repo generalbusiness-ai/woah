@@ -212,6 +212,12 @@ describe("v2 browser local turn planning", () => {
   });
 
   it("plans cold command text from the open executable seed without parser repair", async () => {
+    // the_mug is a $note in the chatroom. $note:match_names reads this.text during
+    // command planning for any command that scans room contents. The plan_command
+    // contract must seed "text" as a property name so the atom-guard accepts the
+    // read (native-primitive-contract.ts object_property_names). This test exercises
+    // that contract: if "text" is dropped from the seed contract, it will return
+    // ok=false/missing_state for take mug (or any command matching room contents).
     const anchor = createWorld();
     const session = anchor.auth("guest:v2-browser-command-plan-seed");
     await anchor.directCall("setup-command-plan-seed-enter", session.actor, "the_chatroom", "enter", [], { sessionId: session.id });
