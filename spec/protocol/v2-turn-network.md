@@ -964,11 +964,13 @@ transfer. A reconnecting browser therefore follows this order:
 
 ### VTN9.1 Tail-driven post-reply delivery
 
-> **Status: specified, not implemented** (plan item D1,
+> **Status: implemented (flag-gated)** (plan item D1,
 > `notes/2026-06-09-cf-cross-scope-architecture-plan.md`; implementation
 > brief `notes/2026-06-09-d1-tail-delivery-design.md`). Flag:
 > `WOO_V2_TAIL_DELIVERY`. Measured motivation: peer fanout is awaited on the
 > caller's reply path today (mean 533 ms, p95 2.3 s of every deployed turn).
+> Enabled in the smoke lane (`wrangler.smoke.toml`). Not yet deployed to
+> production.
 
 The committing scope's reply to the submitting caller MUST NOT wait on peer
 delivery. The contract:

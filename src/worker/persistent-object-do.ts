@@ -5859,7 +5859,7 @@ export class PersistentObjectDO {
       // does not lose the delivery. Crash recovery: drain-on-reactivation in the
       // constructor detects undrained rows and re-schedules via waitUntil.
       // Flag off = today's in-memory waitUntil behavior (unchanged).
-      if (envFlag(this.env.WOO_V2_TAIL_DELIVERY)) {
+      if (envFlag(this.env?.WOO_V2_TAIL_DELIVERY)) {
         const seq = reply.commit.position.seq;
         const rowId = `${scope}:${seq}:${crypto.randomUUID()}`;
         const payload = JSON.stringify({

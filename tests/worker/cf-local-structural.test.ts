@@ -552,6 +552,66 @@ describe("CF-local prod-shape structural probes", () => {
   }, 120_000);
 });
 
+// ─── D1 Gate 4: warm turns with WOO_V2_TAIL_DELIVERY=1 must NOT include
+// worker.post_accept_delivery in submit subphases ─────────────────────────────
+//
+// When WOO_V2_TAIL_DELIVERY is enabled, the gateway skips the timing wrapper
+// for `worker.post_accept_delivery` because the delivery is async (off the
+// critical path). A warm turn's `submit_detail_ms` MUST contain
+// `worker.commit_scope_envelope_rpc` (the CommitScopeDO round-trip) but must
+// NOT contain `worker.post_accept_delivery`.
+//
+// This is enforced only when the D1 flag is on; the existing structural tests
+// (WOO_V2_TAIL_DELIVERY absent) continue to pass with or without the label.
+
+describe("D1 Gate 4: warm turn submit subphases with WOO_V2_TAIL_DELIVERY=1", () => {
+  it("warm commit turn has commit_scope_envelope_rpc but NOT post_accept_delivery in submit_detail_ms", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const harness = createD1StructuralHarness();
+    const runId = `d1-gate4-${Date.now()}-${randomUUID().slice(0, 8)}`;
+    let sessionId: string | null = null;
+    try {
+      sessionId = await openMcpSession(harness, `guest:d1-gate4-${runId}`, runId);
+
+      // Cold turn: enter the chatroom. This primes the relay + gateway world.
+      await callTool(harness, sessionId, 3, "woo_call", { object: "the_chatroom", verb: "enter", args: [] });
+      logSpy.mockClear();
+
+      // Warm turn: southeast exits the chatroom. With WOO_V2_SLIM_WARM_ENVELOPE=1,
+      // the warm envelope strips the authority slice. With WOO_V2_TAIL_DELIVERY=1,
+      // post_accept_delivery is not timed (fanout is async). The submit_detail_ms
+      // must have commit_scope_envelope_rpc but NOT post_accept_delivery.
+      await callTool(harness, sessionId, 4, "woo_call", { object: "the_chatroom", verb: "southeast", args: [] });
+      const metrics = metricsFromLogSpy(logSpy);
+
+      const warmTurns = metrics.filter(
+        (m) => m.kind === "turn_phase_timing" && m.target === "the_chatroom" && m.verb === "southeast"
+      );
+      expect(
+        warmTurns.length,
+        "D1 gate 4: at least one warm turn must be recorded"
+      ).toBeGreaterThan(0);
+
+      for (const turn of warmTurns) {
+        // Commit scope RPC must be present (the commit still happens synchronously).
+        expect(
+          hasSubmitDetail(turn, "worker.commit_scope_envelope_rpc"),
+          `D1 gate 4: worker.commit_scope_envelope_rpc must appear in submit_detail_ms with D1 on (turn: ${JSON.stringify(turn.submit_detail_ms)})`
+        ).toBe(true);
+        // Post-accept delivery must be ABSENT with D1 on (it is async, off critical path).
+        expect(
+          hasSubmitDetail(turn, "worker.post_accept_delivery"),
+          `D1 gate 4: worker.post_accept_delivery must NOT appear in submit_detail_ms when WOO_V2_TAIL_DELIVERY=1 (turn: ${JSON.stringify(turn.submit_detail_ms)})`
+        ).toBe(false);
+      }
+    } finally {
+      if (sessionId) await mcpFetch(harness, { method: "DELETE", headers: { "mcp-session-id": sessionId } }).catch(() => undefined);
+      logSpy.mockRestore();
+      harness.close();
+    }
+  }, 120_000);
+});
+
 type StructuralHarness = {
   env: Env;
   request(path: string, init: RequestInit): Promise<Response>;
@@ -623,6 +683,78 @@ function createStructuralHarness(): StructuralHarness {
     // is read by CommitScopeDO (whose env is set separately above), but we also
     // set it here for consistency and to allow gateway-side code to key on it.
     WOO_V2_ENVELOPE_BYTE_BREAKDOWN: "1",
+    DIRECTORY: new FakeDurableObjectNamespace((name) => {
+      if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
+      return directory;
+    }),
+    WOO: wooNamespace,
+    COMMIT_SCOPE: commitNamespace,
+    HOST_SEED_KV: new FakeKVNamespace() as unknown as KVNamespace
+  } as unknown as Env;
+
+  return {
+    env,
+    request: async (path, init) => await worker.fetch(new Request(`https://woo.test${path}`, init), env, {}),
+    setDirectoryLastSeenAt: (sessionIds, lastSeenAt) => {
+      for (const sessionId of sessionIds) {
+        directoryState.storage.sql.exec("UPDATE session_route SET last_seen_at = ? WHERE session_id = ?", lastSeenAt, sessionId);
+      }
+    },
+    close: () => {
+      directoryState.close();
+      for (const state of wooStates.values()) state.close();
+      for (const state of commitStates.values()) state.close();
+    }
+  };
+}
+
+// Creates a structural harness with WOO_V2_TAIL_DELIVERY=1 for Gate 4.
+// Reuses the same structure as createStructuralHarness; only the env differs.
+function createD1StructuralHarness(): StructuralHarness {
+  const directoryState = new FakeDurableObjectState("directory");
+  const directory = new DirectoryDO(directoryState as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: "d1-structural-secret" });
+  const wooStates = new Map<string, FakeDurableObjectState>();
+  const wooObjects = new Map<string, PersistentObjectDO>();
+  const commitStates = new Map<string, FakeDurableObjectState>();
+  const commitObjects = new Map<string, CommitScopeDO>();
+  let env: Env;
+
+  const wooNamespace = new FakeDurableObjectNamespace((name) => {
+    let object = wooObjects.get(name);
+    if (!object) {
+      const state = wooStates.get(name) ?? new FakeDurableObjectState(name);
+      wooStates.set(name, state);
+      object = new PersistentObjectDO(state as unknown as DurableObjectState, env);
+      wooObjects.set(name, object);
+    }
+    return object;
+  });
+
+  const commitNamespace = new FakeDurableObjectNamespace((name) => {
+    let object = commitObjects.get(name);
+    if (!object) {
+      const state = commitStates.get(name) ?? new FakeDurableObjectState(name);
+      commitStates.set(name, state);
+      object = new CommitScopeDO(state as unknown as DurableObjectState, {
+        WOO_INTERNAL_SECRET: "d1-structural-secret",
+        WOO_V2_ENVELOPE_BYTE_BREAKDOWN: "1"
+      });
+      commitObjects.set(name, object);
+    }
+    return object;
+  });
+
+  env = {
+    WOO_INITIAL_WIZARD_TOKEN: "d1-structural-token",
+    WOO_INTERNAL_SECRET: "d1-structural-secret",
+    WOO_AUTO_INSTALL_CATALOGS: PROD_CATALOGS,
+    WOO_MCP_GATEWAY_SHARDS: String(PROD_SHARDS),
+    WOO_V2_SLIM_WARM_ENVELOPE: "1",
+    WOO_V2_READ_CLOSURE_ENVELOPE: "1",
+    WOO_V2_ENVELOPE_BYTE_BREAKDOWN: "1",
+    // D1 flag: when on, warm turn submit_detail_ms must NOT include
+    // worker.post_accept_delivery (fanout is async, off the critical path).
+    WOO_V2_TAIL_DELIVERY: "1",
     DIRECTORY: new FakeDurableObjectNamespace((name) => {
       if (name !== "directory") throw new Error(`unexpected Directory DO ${name}`);
       return directory;

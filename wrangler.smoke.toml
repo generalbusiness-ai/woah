@@ -44,6 +44,10 @@ WOO_V2_READ_CLOSURE_ENVELOPE = "1"
 # these via `wrangler secret put`; locally they are just config.
 WOO_INITIAL_WIZARD_TOKEN = "local-smoke-wizard-token"
 WOO_INTERNAL_SECRET = "local-smoke-internal-secret"
+# D1: tail-driven post-reply delivery. Writes v2_fanout_pending rows
+# before reply and drains them after, so crash recovery re-delivers
+# rather than drops. Safe to enable in the smoke lane.
+WOO_V2_TAIL_DELIVERY = "1"
 # C1a fault injection — NEVER set in production. Opt-in per test run by
 # un-commenting and editing the value. See src/worker/rpc-fault-inject.ts
 # for the FaultSpec format. Examples:
