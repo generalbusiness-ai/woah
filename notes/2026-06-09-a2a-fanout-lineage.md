@@ -109,9 +109,23 @@ reliable gates; the walkthrough's intermittent failure is a known pre-existing i
 - `tests/a2-fanout-lineage-closure.test.ts`: 3 tests (integration + 2 unit)
 - `package.json`: curated test list
 - `catalogs/demoworld/manifest.json`: the_mug $portable→$note + text/writers props
-- `tests/v2-browser-local-turn.test.ts`: take mug→lamp (mug now $note, match_names reads text)
+- `src/core/native-primitive-contract.ts`: add "text" to plan_command.open_seed.object_property_names
+- `tests/v2-browser-local-turn.test.ts`: restored to take mug (fixed seed contract covers text)
+- `tests/shadow-browser-node.test.ts`: updated contract assertion to include "text"
 - `tests/worker/cf-local-structural.test.ts`: carry phase + dangling gate ENFORCED
 - `tests/worker/cf-local-walkthrough.test.ts`: flags ON
 - `scripts/smoke-cf-dev.ts`: carry-across-rooms removed from TRACKED_FAIL_STEPS
 - `scripts/smoke/scenario.ts`: carry step uses read (A2 gate) + restore via chatroom
 - `spec/protocol/cell-authority.md`: CA4 implementation status
+
+## Contract fix: plan_command seed text
+
+After changing the_mug to `$note`, the `$note:match_names` verb reads `this.text` during
+command planning for ANY command that scans room contents. The `plan_command` open-seed
+contract declared `match_names` as a verb-lookup name but omitted `"text"` from
+`object_property_names`. This caused `missingAtomsForShadowTurn` to flag
+`read:cell:prop:the_mug.text` as missing for any room command (including `take lamp`).
+
+The data (text cell page) was already in the seed transfer for objects with the property.
+The fix adds `"text"` to `object_property_names` so the preimage hash is registered in
+`node.atom_hashes`. Harmless for objects without text (preimage registered, never touched).
