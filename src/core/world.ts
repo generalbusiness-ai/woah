@@ -3247,6 +3247,7 @@ export class WooWorld {
   }
 
   private sessionIsLive(session: Session, now = Date.now()): boolean {
+    if (session.closedAt !== undefined) return false;
     if (this.sessionExpired(session, now)) return false;
     if (session.attachedSockets.size > 0) return true;
     return session.lastInputAt >= now - IDLE_PRESENCE_LIVE_WINDOW_MS;
@@ -3326,6 +3327,7 @@ export class WooWorld {
     const liveGuestActors = new Set<ObjRef>();
     for (const session of this.sessions.values()) {
       if (!this.inheritsFrom(session.actor, "$guest")) continue;
+      if (session.closedAt !== undefined) continue;
       if (!this.sessionExpired(session, now)) liveGuestActors.add(session.actor);
     }
 
@@ -3375,7 +3377,9 @@ export class WooWorld {
   hasLiveSessions(actor: ObjRef): boolean {
     const now = Date.now();
     for (const session of this.sessions.values()) {
-      if (session.actor === actor && !this.sessionExpired(session, now)) return true;
+      if (session.actor !== actor) continue;
+      if (session.closedAt !== undefined) continue;
+      if (!this.sessionExpired(session, now)) return true;
     }
     return false;
   }
@@ -3385,7 +3389,9 @@ export class WooWorld {
     const now = Date.now();
     const out: Session[] = [];
     for (const session of this.sessions.values()) {
-      if (session.actor === actor && !this.sessionExpired(session, now)) out.push(session);
+      if (session.actor !== actor) continue;
+      if (session.closedAt !== undefined) continue;
+      if (!this.sessionExpired(session, now)) out.push(session);
     }
     out.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
     return out;
@@ -3393,9 +3399,14 @@ export class WooWorld {
 
   primarySessionForActor(actor: ObjRef): Session | null {
     let best: Session | null = null;
+    const now = Date.now();
     for (const session of this.sessions.values()) {
       if (session.actor !== actor) continue;
-      if (this.sessionExpired(session, Date.now())) continue;
+      // Closed sessions can remain referenced briefly during cleanup. Never let
+      // one win primary election and suppress the physical move for a newer live
+      // session.
+      if (session.closedAt !== undefined) continue;
+      if (this.sessionExpired(session, now)) continue;
       if (best === null || session.started < best.started || (session.started === best.started && session.id < best.id)) {
         best = session;
       }
@@ -3407,6 +3418,7 @@ export class WooWorld {
     let best: Session | null = null;
     for (const session of this.sessions.values()) {
       if (session.actor !== actor) continue;
+      if (session.closedAt !== undefined) continue;
       if (best === null || session.started < best.started || (session.started === best.started && session.id < best.id)) {
         best = session;
       }
@@ -3430,6 +3442,7 @@ export class WooWorld {
     const out: ObjRef[] = [];
     for (const session of this.sessions.values()) {
       if (session.actor !== actor) continue;
+      if (session.closedAt !== undefined) continue;
       if (!out.includes(session.activeScope)) out.push(session.activeScope);
     }
     if (out.length === 0) {
@@ -3450,6 +3463,7 @@ export class WooWorld {
     const out: ObjRef[] = [];
     for (const session of this.sessions.values()) {
       if (session.actor !== actor) continue;
+      if (session.closedAt !== undefined) continue;
       if (this.sessionExpired(session, now)) continue;
       if (!out.includes(session.activeScope)) out.push(session.activeScope);
     }
@@ -8533,6 +8547,7 @@ export class WooWorld {
   }
 
   private sessionExpired(session: Session, now: number): boolean {
+    if (session.closedAt !== undefined) return true;
     if (session.attachedSockets.size > 0) return false;
     if (now >= session.expiresAt) return true;
     if (session.lastDetachAt === null) return false;
@@ -8559,6 +8574,9 @@ export class WooWorld {
     if (!session) return;
     const isGuest = this.inheritsFrom(session.actor, "$guest");
     const wasPrimary = this.primarySessionForActorIncludingExpired(session.actor)?.id === sessionId;
+    // Stamp before cleanup so any caller holding this session object sees it as
+    // non-live even before the map deletion and persistence work complete.
+    session.closedAt = Date.now();
     session.attachedSockets.clear();
     this.killReadTasksFor(session.actor);
     this.removeSessionPresence(sessionId, session.actor);
@@ -8569,6 +8587,19 @@ export class WooWorld {
     this.deletePersistedSession(sessionId);
     if (wasPrimary && !isGuest) this.promoteActorPrimaryLocation(session.actor);
     if (isGuest) this.resetGuestOnDisconnect(session.actor);
+  }
+
+  /** Mark a session closed in-place for sparse shards/gateways that learn about
+   * the close before the owning world host reaps it durably. This is not a
+   * replacement for `endSession`; it makes local liveness and presence queries
+   * stop seeing the session immediately. */
+  markSessionClosed(sessionId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    this.removeSessionPresence(sessionId, session.actor);
+    session.closedAt = Date.now();
+    session.attachedSockets.clear();
+    this.sessions.delete(sessionId);
   }
 
   private promoteActorPrimaryLocation(actor: ObjRef): void {
@@ -10530,23 +10561,35 @@ export class WooWorld {
   }
 
   async presentActorsIn(_ctx: CallContext, space: ObjRef): Promise<ObjRef[]> {
-    const sessions = this.presenceSessionsIn(space);
-    if (!sessions) return [];
     const actors = new Set<ObjRef>();
     const now = Date.now();
-    for (const [sessionId, actor] of sessions) {
-      const session = this.sessions.get(sessionId);
-      if (session && (session.actor !== actor || this.sessionExpired(session, now))) continue;
-      // Remote session rows are intentionally projected into the space owner so
-      // catalog code can model presence from the room itself. If this host does
-      // not own the session row, trust the projection; stale remote rows are
-      // scrubbed by the subscriber scrub paths rather than hidden from every
-      // cross-host room read.
-      // A projected presence row is only useful when the actor object is in
-      // the same planning snapshot. Older CommitScopeDO snapshots can contain
-      // dangling session rows; do not surface those refs to catalog code.
-      if (!this.objects.has(actor)) continue;
-      actors.add(actor);
+    // CA8: the session table is the authoritative live placement source. The
+    // session_subscribers property below is a derived projection used for
+    // cross-host materialization and back-compat, so catalog roster reads must not
+    // disappear when a sparse planning snapshot has the session row but not yet
+    // the derived presence cell.
+    for (const session of this.sessions.values()) {
+      if (session.activeScope !== space) continue;
+      if (!this.sessionIsLive(session, now)) continue;
+      if (!this.objects.has(session.actor)) continue;
+      actors.add(session.actor);
+    }
+    const sessions = this.presenceSessionsIn(space);
+    if (sessions) {
+      for (const [sessionId, actor] of sessions) {
+        const session = this.sessions.get(sessionId);
+        if (session && (session.actor !== actor || this.sessionExpired(session, now))) continue;
+        // Remote session rows are intentionally projected into the space owner so
+        // catalog code can model presence from the room itself. If this host does
+        // not own the session row, trust the projection; stale remote rows are
+        // scrubbed by the subscriber scrub paths rather than hidden from every
+        // cross-host room read.
+        // A projected presence row is only useful when the actor object is in
+        // the same planning snapshot. Older CommitScopeDO snapshots can contain
+        // dangling session rows; do not surface those refs to catalog code.
+        if (!this.objects.has(actor)) continue;
+        actors.add(actor);
+      }
     }
     return Array.from(actors).sort();
   }

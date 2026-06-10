@@ -1059,7 +1059,7 @@ function shadowBrowserOpenExecutableSeedPreimages(serialized: SerializedWorld, s
   // of the open envelope; content-specific verbs still arrive through exact
   // missing-state repair after the key exists.
   addOpenSeedDispatchVerbCells(serialized, scope, add);
-  if (actor) addOpenSeedDispatchVerbCells(serialized, actor, add);
+  if (actor) addOpenSeedActorMovementCells(serialized, actor, add);
   // `command_plan` is itself dispatched on the scope, but the parser reads the
   // visible command surface (candidate names/aliases plus command-shaped verbs)
   // across actors, room contents, inventory, and linked tool rooms. Seed only
@@ -1128,6 +1128,19 @@ function addOpenSeedDispatchVerbCells(
     }
   };
   addChain(receiver);
+}
+
+function addOpenSeedActorMovementCells(
+  serialized: SerializedWorld,
+  actor: ObjRef,
+  add: (preimage: string) => void
+): void {
+  // Browser tab switches call the actor movement primitive directly. Do not
+  // seed the actor's whole public command surface here: player utility verbs are
+  // large and unrelated to first-turn movement, and normal command execution can
+  // still exact-repair those cells after planning.
+  addOpenSeedVerbLookupCells(serialized, actor, ["moveto"], add);
+  add(`call:${actor}:moveto`);
 }
 
 function openSeedDispatchVerbSelected(verb: SerializedObject["verbs"][number]): boolean {

@@ -38,6 +38,11 @@ const CLASSIFICATION = {
     signal: "scope, commit_scope, target, verb, ms, status",
     endState: "Speculative actor commit-scope head/session open for relocation-shaped MCP turns; normal commit validation remains authoritative."
   },
+  mcp_owner_prefetch: {
+    bucket: "seed_cache",
+    signal: "scope, requested, warm_local, warm_donor, residue",
+    endState: "Owner prefetch should warm local/donor rows ahead of a turn; steady-state residue identifies remaining cold owner reads."
+  },
   broadcast: {
     bucket: "fanout",
     signal: "obs_count and audience_size",

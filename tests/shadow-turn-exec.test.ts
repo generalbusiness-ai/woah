@@ -1667,12 +1667,20 @@ describe("submitShadowCommit pre-apply rejection (P1.1)", () => {
 
   it("rejects a read_version_mismatch before commit-apply and still carries the repair cells", async () => {
     const { serializedBefore, transcript } = await planControlTurn("readmismatch", 0.5);
-    // Tamper a recorded prop read's version so it disagrees with the committed
-    // cell. Writes stay untouched (no post_state error to mask the verdict).
+    // Tamper a versioned bytecode read so it disagrees with the committed cell.
+    // Writes stay untouched (no post_state error to mask the verdict). The old
+    // operators-property read disappeared with the movement-model cleanup, so
+    // use the authoritative dispatch cell that every `set_control` turn still
+    // depends on.
     const tampered = structuredClone(transcript);
-    const propRead = tampered.reads.find((read) => read.cell.kind === "prop" && read.version !== undefined);
-    expect(propRead, "set_control transcript should record a versioned prop read").toBeDefined();
-    propRead!.version = String(Number(propRead!.version) + 7);
+    const dispatchRead = tampered.reads.find((read) =>
+      read.cell.kind === "verb" &&
+      read.cell.object === "$dubspace" &&
+      read.cell.name === "set_control" &&
+      read.version !== undefined
+    );
+    expect(dispatchRead, "set_control transcript should record a versioned dispatch read").toBeDefined();
+    dispatchRead!.version = `tampered:${dispatchRead!.version}`;
 
     const commitScope = createShadowCommitScope({ node: "stable-anchor", scope: "the_dubspace", serialized: serializedBefore });
     const probe = collectApplySteps();
@@ -1693,7 +1701,7 @@ describe("submitShadowCommit pre-apply rejection (P1.1)", () => {
     // DESIGN A repair data survives the pre-apply path: the mismatched cell is
     // handed back so the caller can refresh it and converge on the next attempt.
     expect(rejected.mismatched_read_cells?.length).toBeGreaterThan(0);
-    expect(rejected.mismatched_read_cells).toContainEqual(propRead!.cell);
+    expect(rejected.mismatched_read_cells).toContainEqual(dispatchRead!.cell);
     // Nothing applied: the scope head did not advance.
     expect(commitScope.head).toEqual(createShadowCommitScope({ node: "stable-anchor", scope: "the_dubspace", serialized: serializedBefore }).head);
   });

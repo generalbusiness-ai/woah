@@ -103,14 +103,13 @@ export class SmokeSession {
     return result;
   }
 
-  // Call `out` on `space` only if our tracked location matches `space`. Used to
-  // close out a tool space where an earlier movement may have failed; calling
-  // out from a room we never reached emits a
-  // confusing E_VERBNF that masks the real upstream failure. Returns true iff
-  // the out actually fired.
+  // Follow the `out` exit only if our tracked location matches `space`. Tool
+  // spaces model "way back" as a room exit, not as a public lifecycle verb.
+  // Guarding the call keeps cleanup from masking the real upstream failure with a
+  // wrong-room movement error. Returns true iff the exit actually fired.
   async leaveIfIn(space: string, signal?: AbortSignal): Promise<boolean> {
     if (this.currentRoom !== space) return false;
-    await this.call(space, "out", [], signal);
+    await this.call(space, "go", ["out"], signal);
     return true;
   }
 

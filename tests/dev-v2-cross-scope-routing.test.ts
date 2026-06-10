@@ -126,7 +126,7 @@ describe("dev v2 cross-scope WS routing", () => {
     expect(reply.body.transcript?.call).toMatchObject({ target: targetScope, verb: "enter" });
   });
 
-  it("routes a chatroom-relay cross-scope durable move to the transcript authority", async () => {
+  it("routes a chatroom-relay durable tab move to the actor transcript authority", async () => {
     // Pins the lower-level guard beneath the dev WS router: a relay connected
     // to one room may execute a cross-scope turn, but it must submit the
     // accepted transcript to the authority revealed by that transcript rather
@@ -165,9 +165,9 @@ describe("dev v2 cross-scope WS routing", () => {
       id: "intent-cross-scope-regression",
       route: "direct",
       scope: chatroomScope,
-      target: "the_dubspace" as ObjRef,
-      verb: "enter",
-      args: [],
+      target: session.actor,
+      verb: "moveto",
+      args: ["the_dubspace"],
       persistence: "durable"
     });
     const reply = await handleShadowBrowserTurnExecEnvelope(
@@ -176,7 +176,8 @@ describe("dev v2 cross-scope WS routing", () => {
     );
     expect(reply?.body).toMatchObject({ ok: true });
     if (!reply || reply.body.ok !== true) return;
-    expect(reply.body.commit?.position.scope).toBe("the_dubspace");
+    expect(reply.body.transcript?.call).toMatchObject({ target: session.actor, verb: "moveto", args: ["the_dubspace"] });
+    expect(reply.body.commit?.position.scope).toBe(session.actor);
     expect(reply.body.commit).not.toHaveProperty("transaction");
   });
 

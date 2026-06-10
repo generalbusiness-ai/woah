@@ -31,6 +31,17 @@ async function moveBrowserSessionToDubspace(world: ReturnType<typeof createWorld
   expect(moved.op).toBe("result");
 }
 
+function toolSpaceMovetoInput(session: { actor: string }, space: string) {
+  return {
+    route: "sequenced" as const,
+    scope: space,
+    target: session.actor,
+    verb: "moveto",
+    args: [space],
+    persistence: "durable" as const
+  };
+}
+
 describe("v2 browser worker integration", () => {
   afterEach(() => {
     FakeWorkerScope.clearAllTimers();
@@ -335,29 +346,19 @@ describe("v2 browser worker integration", () => {
 
     scope.dispatch({
       kind: "call",
-      id: "queued-warmup-enter",
-      route: "sequenced",
-      scope: "the_dubspace",
-      target: "the_dubspace",
-      verb: "enter",
-      args: [],
-      persistence: "durable"
+      id: "queued-warmup-moveto",
+      ...toolSpaceMovetoInput(session, "the_dubspace")
     });
-    const warmupRequest = await waitForBrowserBuiltExecRequest(browser, socket, "enter");
+    const warmupRequest = await waitForBrowserBuiltExecRequest(browser, socket, "moveto");
     socket.receive(encodeEnvelope(await relayReply(browser, encodeEnvelope(warmupRequest))));
-    await waitForMessage(posted, (message) => isLocalTurnCommitted(message, "queued-warmup-enter"));
+    await waitForMessage(posted, (message) => isLocalTurnCommitted(message, "queued-warmup-moveto"));
 
     socket.close();
     posted.length = 0;
     scope.dispatch({
       kind: "call",
-      id: "queued-dubspace-enter",
-      route: "sequenced",
-      scope: "the_dubspace",
-      target: "the_dubspace",
-      verb: "enter",
-      args: [],
-      persistence: "durable"
+      id: "queued-dubspace-moveto",
+      ...toolSpaceMovetoInput(session, "the_dubspace")
     });
     const reconnectSocket = await waitForSocket(1);
     await sleep(0);
@@ -372,7 +373,7 @@ describe("v2 browser worker integration", () => {
       browserMetric(message)?.reason === "socket_not_open"
     );
     expect(proposalJournalIndex).toBeLessThan(sendIndex);
-    expect(await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "queued-dubspace-enter"))).toMatchObject({
+    expect(await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "queued-dubspace-moveto"))).toMatchObject({
       kind: "local_turn_planned"
     });
     const statusCursor = posted.filter((message) => isKind(message, "status")).length;
@@ -687,7 +688,7 @@ describe("v2 browser worker integration", () => {
     expect(posted.some((message) => isFinalTurnError(message, "reply-before-timeout-turn", "E_V2_TURN_TIMEOUT"))).toBe(false);
   });
 
-  it("does not render or replay a projection overlay for a cross-scope durable enter", async () => {
+  it("replays a durable tab moveto as a normal optimistic result after reload", async () => {
     const posted: unknown[] = [];
     const indexedDB = new FakeIndexedDBFactory();
     const firstScope = new FakeWorkerScope();
@@ -735,16 +736,11 @@ describe("v2 browser worker integration", () => {
 
     firstScope.dispatch({
       kind: "call",
-      id: "cross-scope-enter",
-      route: "sequenced",
-      scope: "the_dubspace",
-      target: "the_dubspace",
-      verb: "enter",
-      args: [],
-      persistence: "durable"
+      id: "cross-scope-moveto",
+      ...toolSpaceMovetoInput(session, "the_dubspace")
     });
-    await waitForBrowserBuiltExecRequest(browser, firstSocket, "enter");
-    expect(await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "cross-scope-enter"))).toMatchObject({
+    await waitForBrowserBuiltExecRequest(browser, firstSocket, "moveto");
+    expect(await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "cross-scope-moveto"))).toMatchObject({
       kind: "local_turn_planned",
       result_known: true
     });
@@ -752,7 +748,11 @@ describe("v2 browser worker integration", () => {
       browserMetric(message)?.phase === "proposal_journal" &&
       browserMetric(message)?.path === "fire_and_forget"
     );
-    expect(posted.some((message) => isOptimisticTurnResult(message, "cross-scope-enter"))).toBe(false);
+    expect(await waitForMessage(posted, (message) => isOptimisticTurnResult(message, "cross-scope-moveto"))).toMatchObject({
+      kind: "turn_result",
+      frame: { op: "result", id: "cross-scope-moveto", result: { room: "the_dubspace" } },
+      optimistic: true
+    });
 
     vi.resetModules();
     FakeWebSocket.instances.length = 0;
@@ -774,8 +774,16 @@ describe("v2 browser worker integration", () => {
       session: session.id
     });
     await sleep(20);
-    expect(reloadedPosted.some((message) => isOptimisticTurnResult(message, "cross-scope-enter"))).toBe(false);
-    expect(reloadedPosted.some((message) => isKind(message, "local_turn_overlay_replayed"))).toBe(false);
+    expect(await waitForMessage(reloadedPosted, (message) => isOptimisticTurnResult(message, "cross-scope-moveto"))).toMatchObject({
+      kind: "turn_result",
+      optimistic: true,
+      replayed: true,
+      frame: { id: "cross-scope-moveto", result: { room: "the_dubspace" } }
+    });
+    expect(await waitForMessage(reloadedPosted, (message) => isKind(message, "local_turn_overlay_replayed"))).toMatchObject({
+      kind: "local_turn_overlay_replayed",
+      id: "cross-scope-moveto"
+    });
   });
 
   it("replays surviving proposal overlays after a worker reload", async () => {
@@ -2344,18 +2352,13 @@ describe("v2 browser worker integration", () => {
 
     scope.dispatch({
       kind: "call",
-      id: "pinboard-enter-journal",
-      route: "sequenced",
-      scope: "the_pinboard",
-      target: "the_pinboard",
-      verb: "enter",
-      args: [],
-      persistence: "durable"
+      id: "pinboard-moveto-journal",
+      ...toolSpaceMovetoInput(session, "the_pinboard")
     });
-    const enterRequest = await waitForBrowserBuiltExecRequest(browser, socket, "enter");
-    expect(enterRequest).toMatchObject({
+    const moveRequest = await waitForBrowserBuiltExecRequest(browser, socket, "moveto");
+    expect(moveRequest).toMatchObject({
       type: "woo.turn.exec.request.shadow.v1",
-      body: { call: { verb: "enter" } }
+      body: { call: { target: session.actor, verb: "moveto", args: ["the_pinboard"] } }
     });
 
     scope.dispatch({
@@ -2396,11 +2399,11 @@ describe("v2 browser worker integration", () => {
     });
     await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "pinboard-add-journal"));
 
-    socket.receive(encodeEnvelope(await relayReply(browser, encodeEnvelope(enterRequest))));
+    socket.receive(encodeEnvelope(await relayReply(browser, encodeEnvelope(moveRequest))));
     await waitForMessage(posted, (message) => isKind(message, "applied_frame"));
-    await waitForMessage(posted, (message) => isLocalTurnCommitted(message, "pinboard-enter-journal"));
+    await waitForMessage(posted, (message) => isLocalTurnCommitted(message, "pinboard-moveto-journal"));
     socket.receive(encodeEnvelope(await relayReply(browser, encodeEnvelope(addRequest))));
-    await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "pinboard-enter-journal"));
+    await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "pinboard-moveto-journal"));
     await waitForMessage(posted, (message) => isLocalTurnCommitted(message, "pinboard-add-journal"));
   });
 
@@ -2449,15 +2452,10 @@ describe("v2 browser worker integration", () => {
 
     scope.dispatch({
       kind: "call",
-      id: "outline-enter-journal",
-      route: "sequenced",
-      scope: "the_outline",
-      target: "the_outline",
-      verb: "enter",
-      args: [],
-      persistence: "durable"
+      id: "outline-moveto-journal",
+      ...toolSpaceMovetoInput(session, "the_outline")
     });
-    await waitForBrowserBuiltExecRequest(browser, socket, "enter");
+    await waitForBrowserBuiltExecRequest(browser, socket, "moveto");
 
     scope.dispatch({
       kind: "call",
@@ -2492,6 +2490,8 @@ describe("v2 browser worker integration", () => {
 
     const world = createWorld();
     const session = browserWorkerSession(world, "guest:v2-browser-worker-live-read");
+    const moved = await world.directCall("seed-live-read-moveto-before-open", session.actor, session.actor, "moveto", ["the_pinboard"], { sessionId: session.id });
+    expect(moved.op).toBe("result");
     const relay = createShadowBrowserRelayShim({
       node: "relay:v2-worker-live-read",
       scope: "the_pinboard",
@@ -2526,13 +2526,6 @@ describe("v2 browser worker integration", () => {
     // Advance authority afterwards so a local-only list would incorrectly
     // finalize as empty, while the relay can return the durable note.
     const authoritativeText = "authority-only pinboard note";
-    const entered = await world.call("seed-live-read-enter", session.id, "the_pinboard", {
-      actor: session.actor,
-      target: "the_pinboard",
-      verb: "enter",
-      args: []
-    });
-    expect(entered.op).toBe("applied");
     const added = await world.call("seed-live-read-note", session.id, "the_pinboard", {
       actor: session.actor,
       target: "the_pinboard",
@@ -2548,19 +2541,7 @@ describe("v2 browser worker integration", () => {
     relay.executors.length = 0;
     relay.live_session_serialized.clear();
     relay.serialized_generation++;
-
-    scope.dispatch({
-      kind: "call",
-      id: "pinboard-enter-before-local-list",
-      route: "sequenced",
-      scope: "the_pinboard",
-      target: "the_pinboard",
-      verb: "enter",
-      args: [],
-      persistence: "durable"
-    });
-    await waitForBrowserBuiltExecRequest(browser, socket, "enter");
-    const sentAfterEnter = socket.sent.length;
+    const sentBeforeList = socket.sent.length;
 
     scope.dispatch({
       kind: "call",
@@ -2574,7 +2555,7 @@ describe("v2 browser worker integration", () => {
     });
 
     const listRequest = await waitForBrowserBuiltExecRequest(browser, socket, "list_notes");
-    expect(socket.sent.length).toBeGreaterThan(sentAfterEnter);
+    expect(socket.sent.length).toBeGreaterThan(sentBeforeList);
     expect(listRequest).toMatchObject({
       type: "woo.turn.exec.request.shadow.v1",
       body: { persistence: "live", call: { verb: "list_notes" } }
@@ -2663,16 +2644,11 @@ describe("v2 browser worker integration", () => {
 
     scope.dispatch({
       kind: "call",
-      id: "overlay-reset-enter",
-      route: "sequenced",
-      scope: "the_pinboard",
-      target: "the_pinboard",
-      verb: "enter",
-      args: [],
-      persistence: "durable"
+      id: "overlay-reset-moveto",
+      ...toolSpaceMovetoInput(session, "the_pinboard")
     });
-    await waitForBrowserBuiltExecRequest(browser, socket, "enter");
-    expect(await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "overlay-reset-enter"))).toMatchObject({
+    await waitForBrowserBuiltExecRequest(browser, socket, "moveto");
+    expect(await waitForMessage(posted, (message) => isLocalTurnPlanned(message, "overlay-reset-moveto"))).toMatchObject({
       kind: "local_turn_planned"
     });
   });

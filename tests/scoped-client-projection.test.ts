@@ -336,21 +336,24 @@ describe("scoped client projection", () => {
     });
   });
 
-  it("keeps feature-space enter results lightweight", async () => {
+  it("returns the tool space as here when moving into it", async () => {
     const world = createWorld();
     const session = world.auth("guest:feature-move-result");
-    const entered = await world.directCall("feature-move-result-enter", session.actor, "the_pinboard", "enter", [], { sessionId: session.id });
+    const entered = await world.directCall("feature-move-result-enter", session.actor, session.actor, "moveto", ["the_pinboard"], { sessionId: session.id });
     expect(entered.op).toBe("result");
     if (entered.op !== "result") return;
     expect(entered.result).toMatchObject({
       room: "the_pinboard",
-      roster: expect.arrayContaining([expect.objectContaining({ id: session.actor })])
+      here_request: true,
+      look_deferred: true,
+      here: {
+        id: "the_pinboard",
+        name: "Pinboard",
+        roster: expect.arrayContaining([expect.objectContaining({ id: session.actor })])
+      }
     });
     expect((entered.result as Record<string, unknown>).present).toBeUndefined();
     expect((entered.result as Record<string, unknown>).present_actors).toBeUndefined();
-    expect((entered.result as Record<string, unknown>).here_request).toBeUndefined();
-    expect((entered.result as Record<string, unknown>).look_deferred).toBeUndefined();
-    expect((entered.result as Record<string, unknown>).here).toBeUndefined();
   });
 
   it("adds here to feature-space leave results", async () => {
@@ -563,17 +566,16 @@ describe("scoped client projection", () => {
     expect(roomBridge.objectSummaryManyCalls).toContainEqual([badge]);
   });
 
-  it("keeps here on the containing room when active_scope is a feature space", async () => {
+  it("keeps here on the active tool space", async () => {
     const world = createWorld();
     const session = world.auth("guest:feature-space-here");
-    const entered = await world.directCall("feature-here-enter", session.actor, "the_pinboard", "enter", [], { sessionId: session.id });
+    const entered = await world.directCall("feature-here-enter", session.actor, session.actor, "moveto", ["the_pinboard"], { sessionId: session.id });
     expect(entered.op).toBe("result");
 
     const body = await apiMe(world, session);
     expect(body.session.active_scope).toBe("the_pinboard");
     expect(body.session.current_location).toBe("the_pinboard");
-    expect(body.here).toMatchObject({ id: "the_deck", name: "Deck" });
-    expect(body.overlays.active_scope).toMatchObject({ subject: "the_pinboard", restore: true });
-    expect(body.overlays.current_location).toBeUndefined();
+    expect(body.here).toMatchObject({ id: "the_pinboard", name: "Pinboard" });
+    expect(body.overlays).toBeUndefined();
   });
 });

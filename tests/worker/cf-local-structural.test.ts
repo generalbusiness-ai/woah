@@ -178,15 +178,15 @@ describe("CF-local prod-shape structural probes", () => {
       // measuring so cold opens, catalog install, and first seed fills remain
       // outside the zero-repair warm-turn gate.
       await callTool(harness, sessionId, 4, "woo_call", { object: "the_chatroom", verb: "southeast", args: [] });
-      await callTool(harness, sessionId, 5, "woo_call", { object: "the_pinboard", verb: "enter", args: [] });
-      await callTool(harness, sessionId, 6, "woo_call", { object: "the_pinboard", verb: "leave", args: [] });
+      await callTool(harness, sessionId, 5, "woo_call", { object: "the_deck", verb: "go", args: ["pinboard"] });
+      await callTool(harness, sessionId, 6, "woo_call", { object: "the_pinboard", verb: "go", args: ["out"] });
       await callTool(harness, sessionId, 7, "woo_call", { object: "the_deck", verb: "west", args: [] });
       const warmupMetrics = metricsFromLogSpy(logSpy);
       logSpy.mockClear();
 
       await callTool(harness, sessionId, 8, "woo_call", { object: "the_chatroom", verb: "southeast", args: [] });
-      await callTool(harness, sessionId, 9, "woo_call", { object: "the_pinboard", verb: "enter", args: [] });
-      await callTool(harness, sessionId, 10, "woo_call", { object: "the_pinboard", verb: "leave", args: [] });
+      await callTool(harness, sessionId, 9, "woo_call", { object: "the_deck", verb: "go", args: ["pinboard"] });
+      await callTool(harness, sessionId, 10, "woo_call", { object: "the_pinboard", verb: "go", args: ["out"] });
       await callTool(harness, sessionId, 11, "woo_call", { object: "the_deck", verb: "west", args: [] });
       const measuredMetrics = metricsFromLogSpy(logSpy);
 
@@ -197,8 +197,8 @@ describe("CF-local prod-shape structural probes", () => {
       });
       assertWarmTurnStructuralGate(measuredMetrics, [
         { target: "the_chatroom", verb: "southeast" },
-        { target: "the_pinboard", verb: "enter" },
-        { target: "the_pinboard", verb: "leave" },
+        { target: "the_deck", verb: "go" },
+        { target: "the_pinboard", verb: "go" },
         { target: "the_deck", verb: "west" }
       ]);
     } finally {
@@ -335,8 +335,8 @@ describe("CF-local prod-shape structural probes", () => {
       // Warm-up: exercise same-scope and cross-scope paths once before the
       // measured phase so cold-opens and catalog install stay outside the gate.
       await callTool(harness, sessionA, 5, "woo_call", { object: "the_chatroom", verb: "southeast", args: [] });
-      await callTool(harness, sessionA, 6, "woo_call", { object: "the_pinboard", verb: "enter", args: [] });
-      await callTool(harness, sessionA, 7, "woo_call", { object: "the_pinboard", verb: "leave", args: [] });
+      await callTool(harness, sessionA, 6, "woo_call", { object: "the_deck", verb: "go", args: ["pinboard"] });
+      await callTool(harness, sessionA, 7, "woo_call", { object: "the_pinboard", verb: "go", args: ["out"] });
       await callTool(harness, sessionA, 8, "woo_call", { object: "the_deck", verb: "west", args: [] });
       logSpy.mockClear();
 
@@ -346,8 +346,8 @@ describe("CF-local prod-shape structural probes", () => {
       // The say turn's envelope bytes are measured separately below without the
       // structural fanout check.
       await callTool(harness, sessionA, 9,  "woo_call", { object: "the_chatroom", verb: "southeast", args: [] });
-      await callTool(harness, sessionA, 10, "woo_call", { object: "the_pinboard", verb: "enter", args: [] });
-      await callTool(harness, sessionA, 11, "woo_call", { object: "the_pinboard", verb: "leave", args: [] });
+      await callTool(harness, sessionA, 10, "woo_call", { object: "the_deck", verb: "go", args: ["pinboard"] });
+      await callTool(harness, sessionA, 11, "woo_call", { object: "the_pinboard", verb: "go", args: ["out"] });
       await callTool(harness, sessionA, 12, "woo_call", { object: "the_deck", verb: "west", args: [] });
       const measuredMovementMetrics = metricsFromLogSpy(logSpy);
       logSpy.mockClear();
@@ -394,8 +394,8 @@ describe("CF-local prod-shape structural probes", () => {
       // envelope per accepted turn, no warm_turn_refresh/missing_state_repair.
       assertWarmTurnStructuralGate(measuredMovementMetrics, [
         { target: "the_chatroom", verb: "southeast" },
-        { target: "the_pinboard", verb: "enter" },
-        { target: "the_pinboard", verb: "leave" },
+        { target: "the_deck", verb: "go" },
+        { target: "the_pinboard", verb: "go" },
         { target: "the_deck", verb: "west" }
       ]);
 

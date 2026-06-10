@@ -49,7 +49,7 @@ import { signInternalRequest } from "../src/worker/internal-auth";
 import { FakeDurableObjectState } from "./worker/fake-do";
 import type { EffectTranscript } from "../src/core/effect-transcript";
 import type { SerializedAuthoritySlice, SerializedWorld } from "../src/core/repository";
-import type { MetricEvent, ObjRef } from "../src/core/types";
+import type { MetricEvent, ObjRef, WooValue } from "../src/core/types";
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -144,8 +144,8 @@ async function initializeMcp(gateway: McpGateway, token: string, id: number): Pr
   return sessionId;
 }
 
-async function mcpOk(gateway: McpGateway, sessionId: string, id: number, object: ObjRef, verb: string): Promise<void> {
-  const result = await mcp(gateway, sessionId, id, "tools/call", { name: "woo_call", arguments: { object, verb, args: [] } });
+async function mcpOk(gateway: McpGateway, sessionId: string, id: number, object: ObjRef, verb: string, args: WooValue[] = []): Promise<void> {
+  const result = await mcp(gateway, sessionId, id, "tools/call", { name: "woo_call", arguments: { object, verb, args } });
   const r = result as { result?: { isError?: boolean; structuredContent?: unknown } };
   expect(r.result?.isError, `${object}:${verb} => ${JSON.stringify(r.result?.structuredContent)}`).not.toBe(true);
 }
@@ -291,8 +291,8 @@ describe("B-i read-closure parity", () => {
       await mcpOk(gateway, session, 2, "the_chatroom", "enter");
       // Warm-up: exercise cross-scope paths.
       await mcpOk(gateway, session, 3, "the_chatroom", "southeast");
-      await mcpOk(gateway, session, 4, "the_pinboard", "enter");
-      await mcpOk(gateway, session, 5, "the_pinboard", "leave");
+      await mcpOk(gateway, session, 4, "the_deck", "go", ["pinboard"]);
+      await mcpOk(gateway, session, 5, "the_pinboard", "go", ["out"]);
       await mcpOk(gateway, session, 6, "the_deck", "west");
     } finally {
       fixture.close();
@@ -526,9 +526,9 @@ describe("B-i read-closure parity", () => {
       // Enter chatroom, then move to the deck (cross-scope: chatroom→deck).
       await mcpOk(gateway, session, 2, "the_chatroom", "enter");
       await mcpOk(gateway, session, 3, "the_chatroom", "southeast");
-      // Enter the pinboard (deck→pinboard, cross-scope), then leave (pinboard→deck, cross-scope).
-      await mcpOk(gateway, session, 4, "the_pinboard", "enter");
-      await mcpOk(gateway, session, 5, "the_pinboard", "leave");
+      // Follow the deck pinboard exit, then the board's out exit back to deck.
+      await mcpOk(gateway, session, 4, "the_deck", "go", ["pinboard"]);
+      await mcpOk(gateway, session, 5, "the_pinboard", "go", ["out"]);
     } finally {
       fixture.close();
     }
@@ -581,13 +581,13 @@ describe("B-i read-closure parity", () => {
         await mcpOk(gateway, session, 2, "the_chatroom", "enter");
         // warm-up
         await mcpOk(gateway, session, 3, "the_chatroom", "southeast");
-        await mcpOk(gateway, session, 4, "the_pinboard", "enter");
-        await mcpOk(gateway, session, 5, "the_pinboard", "leave");
+        await mcpOk(gateway, session, 4, "the_deck", "go", ["pinboard"]);
+        await mcpOk(gateway, session, 5, "the_pinboard", "go", ["out"]);
         await mcpOk(gateway, session, 6, "the_deck", "west");
         // measured
         await mcpOk(gateway, session, 7, "the_chatroom", "southeast");
-        await mcpOk(gateway, session, 8, "the_pinboard", "enter");
-        await mcpOk(gateway, session, 9, "the_pinboard", "leave");
+        await mcpOk(gateway, session, 8, "the_deck", "go", ["pinboard"]);
+        await mcpOk(gateway, session, 9, "the_pinboard", "go", ["out"]);
         await mcpOk(gateway, session, 10, "the_deck", "west");
 
         const sessionObj = world.sessions.get(session);
@@ -637,8 +637,8 @@ describe("B-i read-closure parity", () => {
       const session = await initializeMcp(gateway, "guest:b-i-size-gate", 1);
       await mcpOk(gateway, session, 2, "the_chatroom", "enter");
       await mcpOk(gateway, session, 3, "the_chatroom", "southeast");
-      await mcpOk(gateway, session, 4, "the_pinboard", "enter");
-      await mcpOk(gateway, session, 5, "the_pinboard", "leave");
+      await mcpOk(gateway, session, 4, "the_deck", "go", ["pinboard"]);
+      await mcpOk(gateway, session, 5, "the_pinboard", "go", ["out"]);
       await mcpOk(gateway, session, 6, "the_deck", "west");
     } finally {
       fixture.close();

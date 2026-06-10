@@ -82,4 +82,15 @@ describe("session-scope presence (CA8)", () => {
     expect(audiences.observationAudiences?.[0]).toContain(watcher.actor);
     expect(audiences.audienceSessions).toContain(watcher.id);
   });
+
+  it("present_actors reads the session table when the presence projection is absent", async () => {
+    const world = createWorld();
+    const watcher = world.auth("guest:ssp-roster");
+    const sess = world.sessions.get(watcher.id)!;
+    sess.activeScope = "the_chatroom";
+    world.setProp("the_chatroom", "session_subscribers", []);
+    world.setProp("the_chatroom", "subscribers", []);
+
+    await expect(world.presentActorsIn({} as any, "the_chatroom")).resolves.toContain(watcher.actor);
+  });
 });

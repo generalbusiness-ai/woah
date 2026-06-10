@@ -257,6 +257,7 @@ describe("shadow browser node shim", () => {
   it("does not let live-persistence turns dirty the next durable dubspace turn", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:browser-dubspace-live-before-commit");
+    await moveActorToScope(anchor, session, "the_dubspace", "browser-dubspace-live-before-commit-move");
     const relay = createShadowBrowserRelayShim({
       node: "browser-relay",
       scope: "the_dubspace",
@@ -273,9 +274,9 @@ describe("shadow browser node shim", () => {
     const live = await executeShadowBrowserTurn(browser, {
       id: "browser-dubspace-live-enter",
       route: "sequenced",
-      target: "the_dubspace",
-      verb: "enter",
-      args: [],
+      target: session.actor,
+      verb: "moveto",
+      args: ["the_chatroom"],
       persistence: "live"
     });
     const committed = await executeShadowBrowserTurn(browser, {
