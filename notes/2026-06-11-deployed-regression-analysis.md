@@ -130,3 +130,42 @@ script now self-sources too — commit 0a37712 on main). Tailed run
    paths even outside repair loops.
 3. **Bootstrap migration** for missing seed instances (outliner pair),
    unchanged from the original recommendation.
+
+## UPDATE 2 (post-fix deploy #3): the unified root cause
+
+Deploy #3 shipped the three fixes; walkthrough still 6/10. Live probes
+(wizard MCP + tailed reproduction of a single `look exit_living_room_outline`)
+pin the real mechanism:
+
+- Prod HOST_SEED_KV is EMPTY (0 keys) — the KV-stale-seed theory was wrong;
+  Fix 1's gate is correct but irrelevant to this incident.
+- The migration RAN: the world host now has exit_living_room_outline
+  (planning resolves it). But the look loops `missing_state` on
+  `read:cell:lifecycle:exit_living_room_outline` at commit scope
+  the_chatroom: **the chatroom CommitScopeDO's durable world predates the
+  migration and lacks the instance**; commit validation (correctly, per its
+  own state) rejects every attempt; the conflict reply repairs the PLANNER,
+  never the commit scope's own state → loop → E_REPAIR_BUDGET.
+- The earlier $exit v1/v2 read_version_mismatch loop is the same divergence
+  in the other direction (verb pages).
+
+**Architectural finding: CommitScopeDO-resident scope worlds are a third
+durable copy of the world that catalog repairs and bootstrap migrations
+never update.** World host: repaired. Scope DOs: frozen at their snapshot
+epoch. Fresh-world lanes can never see this (scopes seed from the current
+world at first open) — the stale-world lane recommendation stands, now with
+its precise target.
+
+**The fix (small, uses existing machinery)**: stamp CommitScopeDO durable
+snapshots/checkpoints with the catalog bundle hash (or world catalog
+version); on open/rehydrate, a stamp mismatch with the current bundle is
+treated exactly like E_SNAPSHOT_REQUIRED — discard the stale scope state and
+reseed from the world via the existing reseed + full-body retry flow. This
+heals every diverged scope DO on next touch, now and after any future
+catalog change. (An operational alternative — manually nuking scope DO
+storage — is neither available via API nor principled.)
+
+Status of the three shipped fixes: Fix 1 (KV B7 rule) correct,
+prod-irrelevant here, keep. Fix 2 (seed invalidation on repair) correct for
+its class, keep. Fix 3 (missing-instances migration) WORKED on the world
+host — necessary but not sufficient without the scope-stamp fix.
