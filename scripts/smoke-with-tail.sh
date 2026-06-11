@@ -11,12 +11,25 @@
 #   OUT_DIR=.woo/measurements/manual scripts/smoke-with-tail.sh
 #   TAIL_LOG=/tmp/keep.log scripts/smoke-with-tail.sh  # explicit tail path
 #
-# Requires wrangler in $PATH and CF auth env exported (the same as for
-# `npm run deploy`).
+# Requires wrangler in $PATH. CF auth is self-sourced from the same fallback
+# chain as scripts/deploy.sh, so a bare invocation works in a fresh shell —
+# this script previously required the env pre-exported, and a session that
+# had not sourced it got a misleading wrangler tails auth error (code 10000)
+# while deploys (self-sourcing) kept working (2026-06-11 analysis finding).
 
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+
+if [[ -z "${CLOUDFLARE_API_TOKEN:-}" && -f "$HOME/.config/generalbusiness/cloudflare_woo.env" ]]; then
+  # shellcheck disable=SC1091
+  source "$HOME/.config/generalbusiness/cloudflare_woo.env"
+  export CLOUDFLARE_API_TOKEN
+fi
+if [[ -z "${CLOUDFLARE_API_TOKEN:-}" && -f "$HOME/.config/cloudflare/woo.token" ]]; then
+  CLOUDFLARE_API_TOKEN=$(cat "$HOME/.config/cloudflare/woo.token")
+  export CLOUDFLARE_API_TOKEN
+fi
 
 RUNS="${RUNS:-1}"
 BASE_URL="${WOO_SMOKE_BASE_URL:-https://woah1.generalbusiness.ai}"
