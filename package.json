@@ -43,6 +43,7 @@
     "smoke:mcp": "vitest run tests/smoke/v2-mcp-smoke.test.ts --reporter=dot",
     "smoke:mcp:stdio": "tsx scripts/smoke-mcp-stdio.ts",
     "smoke:browser": "playwright test e2e/smoke.spec.ts -g \"chat boot uses /api/me\"",
+    "load:cf-dev": "tsx scripts/load-cf-dev.ts",
     "test:e2e": "playwright test",
     "test:e2e:share": "playwright test e2e/smoke.spec.ts -g \"pinboard shares created notes with another user|pinboard shared notes survive a peer reload|outliner shares committed items with another user\"",
     "test:e2e:ui": "playwright test --ui",
