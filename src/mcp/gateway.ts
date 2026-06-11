@@ -132,6 +132,10 @@ export type McpV2ClientHooks = {
       reconstructionTrigger?: AuthorityReconstructionTrigger;
       reconstructionScope?: ObjRef;
       forceOwnerObjectIds?: ObjRef[];
+      // B7 repair-attempt rule: true when the executor context's `attempt > 0`.
+      // Propagated from v2AuthorityPayload so implementors can skip stale
+      // cached pages (e.g. KV seed) on repair retries. See 2026-06-11 incident.
+      repairAttempt?: boolean;
     }
   ) => Promise<ReturnType<typeof executorAuthorityPayload>>;
   executionCapsuleOpen?: boolean;
@@ -1117,7 +1121,13 @@ export class McpGateway {
           reconstructionReason: isRepair ? "missing_state_repair" : "warm_turn_refresh",
           reconstructionTrigger: isPrePlan ? "pre_plan_repair" : "turn_commit",
           reconstructionScope: submitScope,
-          forceOwnerObjectIds: isRepair ? extraObjectIds : []
+          forceOwnerObjectIds: isRepair ? extraObjectIds : [],
+          // B7 repair-attempt rule: pass `isRepairAttempt` so the KV seed path
+          // (in v2GatewayAuthorityPayload on the gateway shard) skips stale
+          // cached pages on retries. Without this, a stale KV page that caused
+          // read_version_mismatch on attempt N is re-served on attempt N+1,
+          // looping until E_REPAIR_BUDGET. See: 2026-06-11 incident.
+          repairAttempt: isRepairAttempt
         });
         const fallbackClient = this.v2Scopes.get(scope) ?? this.v2Scopes.get(submitScope);
         const authorityPayload = fallbackClient && (payload.staleFallbackCount ?? 0) > 0
@@ -1603,6 +1613,10 @@ export class McpGateway {
       reconstructionTrigger?: AuthorityReconstructionTrigger;
       reconstructionScope?: ObjRef;
       forceOwnerObjectIds?: ObjRef[];
+      // B7 repair-attempt rule: propagated from the executor context's `attempt`
+      // counter so the KV seed layer (in v2GatewayAuthorityPayload) can skip
+      // stale cached pages on repair retries. See: 2026-06-11 incident.
+      repairAttempt?: boolean;
     } = {}
   ): Promise<ReturnType<typeof executorAuthorityPayload>> {
     return await (

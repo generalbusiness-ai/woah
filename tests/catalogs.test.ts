@@ -311,6 +311,74 @@ describe("local catalogs", () => {
     expect(world.getProp("$system", "applied_migrations")).toContain("2026-05-17-demoworld-garden-conversational-feature");
   });
 
+  // FIX 3: bootstrap local-boot migration for missing seed instances.
+  // Catalog repair updates VERBS but does not create new seed INSTANCES.
+  // Long-lived worlds deployed before a catalog added new create_instance
+  // entries (e.g. exit_living_room_outline, exit_living_room_dubspace, etc.)
+  // are missing those instances. The 2026-06-11-missing-seed-instances
+  // migration audits all installed catalog manifests and creates missing ones.
+  describe("2026-06-11-missing-seed-instances migration", () => {
+    const MIGRATION_ID = "2026-06-11-missing-seed-instances";
+
+    it("fresh world: migration is recorded as applied, no errors", () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["chat", "note", "tasks", "demoworld"]);
+      // On a freshly installed world, all seed instances exist. The migration
+      // is recorded as applied (no-op path via cleanInstalled).
+      expect(world.getProp("$system", "applied_migrations")).toContain(MIGRATION_ID);
+      // Canonical demoworld exits must exist.
+      expect(world.objects.has("exit_living_room_outline")).toBe(true);
+      expect(world.objects.has("exit_living_room_dubspace")).toBe(true);
+      expect(world.objects.has("exit_deck_pinboard")).toBe(true);
+    });
+
+    it("world missing exit instances: migration creates them idempotently", () => {
+      // Simulate an old-world scenario: install demoworld, remove a newly-added
+      // exit instance from the world, then re-run installLocalCatalogs. The
+      // migration must recreate the missing instance.
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["chat", "note", "tasks", "demoworld"]);
+
+      // Remove exit_living_room_outline to simulate a pre-migration world state.
+      // Also remove exit_living_room_dubspace and exit_deck_pinboard to exercise
+      // multi-instance repair in one pass.
+      const toRemove = ["exit_living_room_outline", "exit_living_room_dubspace", "exit_deck_pinboard"];
+      for (const id of toRemove) {
+        expect(world.objects.has(id)).toBe(true); // confirm present before removal
+        world.objects.delete(id);
+        expect(world.objects.has(id)).toBe(false);
+      }
+      // Remove the migration marker so the migration re-runs.
+      const ledger = (world.getProp("$system", "applied_migrations") as string[])
+        .filter((id) => id !== MIGRATION_ID);
+      world.setProp("$system", "applied_migrations", ledger);
+
+      // Re-run catalog install. The migration must create the missing exits.
+      installLocalCatalogs(world, ["chat", "note", "tasks", "demoworld"]);
+
+      for (const id of toRemove) {
+        expect(world.objects.has(id)).toBe(true);
+      }
+      expect(world.getProp("$system", "applied_migrations")).toContain(MIGRATION_ID);
+    });
+
+    it("idempotent: re-running after a full install is a no-op", () => {
+      const world = createWorld({ catalogs: false });
+      installLocalCatalogs(world, ["chat", "note", "tasks", "demoworld"]);
+      // Remove migration marker to force re-run; all instances are present.
+      const ledger = (world.getProp("$system", "applied_migrations") as string[])
+        .filter((id) => id !== MIGRATION_ID);
+      world.setProp("$system", "applied_migrations", ledger);
+      const instancesBefore = Array.from(world.objects.keys()).filter((id) => id.startsWith("exit_")).sort();
+
+      installLocalCatalogs(world, ["chat", "note", "tasks", "demoworld"]);
+
+      const instancesAfter = Array.from(world.objects.keys()).filter((id) => id.startsWith("exit_")).sort();
+      expect(instancesAfter).toEqual(instancesBefore);
+      expect(world.getProp("$system", "applied_migrations")).toContain(MIGRATION_ID);
+    });
+  });
+
   it("wires the_taskboard back to the garden, and the garden back to the deck", async () => {
     const world = createWorld({ catalogs: false });
     installLocalCatalogs(world, ["chat", "note", "tasks", "demoworld"]);

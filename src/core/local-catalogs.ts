@@ -140,6 +140,18 @@ const LOCAL_CATALOG_ROSTER_PRESENTATION_RECONCILE_MIGRATION = "2026-05-15-roster
 // defaults the move to `live`, the commit never fires, and the H1 stays put.
 // A new migration id forces one more reconcile against the current manifest.
 const LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_RECONCILE_MIGRATION = "2026-05-14-chat-v2-command-persistence-reconcile";
+// FIX 3: bootstrap local-boot migration for missing seed instances.
+// Long-lived deployed worlds that were installed before catalog repair created
+// new seed instances (e.g. exit_living_room_outline, added by the tool-space
+// movement model to demoworld) are missing those objects — catalog repair updates
+// VERBS but does not create INSTANCES. This migration audits all installed
+// bundled catalogs' seed_hooks against the live world and creates any missing
+// create_instance entries idempotently. Idempotency is structural: each
+// create_instance hook gates on world.objects.has(hook.as) so reruns skip
+// already-present instances. The migration id is content-independent to make
+// it a one-shot repair; future manifest additions require a new migration id.
+// Deployed fix reference: 2026-06-11 E_OBJNF exit_living_room_outline.
+const LOCAL_CATALOG_MISSING_SEED_INSTANCES_MIGRATION = "2026-06-11-missing-seed-instances";
 const CATALOG_MIGRATION_RECORD_LIMIT = 200;
 
 export const DEFAULT_LOCAL_CATALOGS = bundledCatalogAliases();
@@ -222,7 +234,8 @@ const LOCAL_CATALOG_MIGRATION_INDEX: Array<{ id: string; only?: string }> = [
   { id: LOCAL_CATALOG_REST_LIVE_PERSISTENCE_METADATA_MIGRATION },
   { id: LOCAL_CATALOG_DISPENSER_NEXT_PENDING_LIVE_MIGRATION, only: "dispenser" },
   { id: LOCAL_CATALOG_ROSTER_PRESENTATION_RECONCILE_MIGRATION },
-  { id: LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_RECONCILE_MIGRATION, only: "chat" }
+  { id: LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_RECONCILE_MIGRATION, only: "chat" },
+  { id: LOCAL_CATALOG_MISSING_SEED_INSTANCES_MIGRATION }
 ];
 
 export function bundledCatalogAliases(): string[] {
@@ -474,6 +487,15 @@ function runLocalCatalogMigrations(world: WooWorld, names: readonly string[], cl
   run(LOCAL_CATALOG_DISPENSER_NEXT_PENDING_LIVE_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "dispenser" });
   run(LOCAL_CATALOG_ROSTER_PRESENTATION_RECONCILE_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true });
   run(LOCAL_CATALOG_CHAT_V2_COMMAND_PERSISTENCE_RECONCILE_MIGRATION, { allowImplementationHints: true, reconcileClassVerbs: true, only: "chat" });
+  // FIX 3: create any seed instances declared in installed bundled catalog
+  // manifests that are absent from the live world. Runs over every installed
+  // bundled catalog (no `only:` restriction) so the repair is general: a
+  // catalog repair that adds new seed instances (as happened with
+  // exit_living_room_outline and siblings in the tool-space movement model)
+  // will have those instances present in old worlds after the next cold-init.
+  // The `reconcileSeedHooks: true` path in runLocalCatalogSchemaPlan gates each
+  // create_instance step on world.objects.has(hook.as), so reruns are no-ops.
+  runMissingSeedInstancesMigration(world, names, cleanInstalled);
   return covered;
 }
 
@@ -1689,6 +1711,58 @@ function installedLocalCatalogNames(world: WooWorld): string[] {
     if (typeof item.alias === "string" && LOCAL_CATALOGS.has(item.alias)) names.add(item.alias);
   }
   return Array.from(names);
+}
+
+// FIX 3: audit all installed bundled catalog manifests for missing seed
+// instances and create any that are absent. Catalog repair (installLocalCatalogs)
+// updates VERBS but does not create new seed INSTANCES that the manifest declares
+// — instances are only created on a fresh install of the catalog. Long-lived
+// deployed worlds therefore lack instances added by manifest updates (e.g.
+// exit_living_room_outline and siblings added with the tool-space movement model).
+//
+// This migration passes reconcileSeedHooks: true to runLocalCatalogSchemaPlan for
+// every installed bundled catalog; the plan's create_instance steps gate on
+// world.objects.has(hook.as) so the migration is idempotent. A world where all
+// instances are already present records the migration id and is a no-op on
+// subsequent cold-inits. A fresh install records the migration id immediately
+// (cleanInstalled gate) without running the schema plan for catalogs just
+// freshly installed.
+//
+// The `only:` restriction is intentionally absent — all bundled catalogs with
+// seed instances benefit from this general repair (spec §CT5.4.1: the migration
+// may operate over the discovered bundled catalog manifests as a set).
+function runMissingSeedInstancesMigration(world: WooWorld, names: readonly string[], cleanInstalled: ReadonlySet<string>): void {
+  if (migrationApplied(world, LOCAL_CATALOG_MISSING_SEED_INSTANCES_MIGRATION)) return;
+  let repaired = false;
+  for (const name of names) {
+    if (!localCatalogInstalled(world, name)) continue;
+    if (cleanInstalled.has(name)) {
+      // Freshly installed: instances were just created; no schema plan needed.
+      repaired = true;
+      continue;
+    }
+    const manifest = LOCAL_CATALOGS.get(name);
+    if (!manifest) continue;
+    // Check whether any create_instance seed hook is missing from this world.
+    const hasMissing = (manifest.seed_hooks ?? []).some(
+      (hook) => hook.kind === "create_instance" && typeof hook.as === "string" && !world.objects.has(hook.as)
+    );
+    if (!hasMissing) {
+      // All declared instances are present; no repair needed for this catalog.
+      repaired = true;
+      continue;
+    }
+    // At least one instance is missing: run reconcileSeedHooks to create it.
+    // reconcileSeedHooks gates each create_instance step on world.objects.has
+    // so already-present instances are untouched.
+    const result = runLocalCatalogSchemaPlan(world, name, manifest, "gateway", "world", {
+      allowImplementationHints: true,
+      reconcileSeedHooks: true
+    });
+    if (result.status === "failed") throw new Error(`missing-seed-instances repair failed for catalog ${name}: ${result.plan_id}`);
+    repaired = true;
+  }
+  if (repaired) markMigrationApplied(world, LOCAL_CATALOG_MISSING_SEED_INSTANCES_MIGRATION);
 }
 
 function migrationApplied(world: WooWorld, id: string): boolean {

@@ -1938,7 +1938,12 @@ export class PersistentObjectDO {
               reconstructionReason: authorityOptions?.reconstructionReason,
               reconstructionTrigger: authorityOptions?.reconstructionTrigger,
               reconstructionScope: authorityOptions?.reconstructionScope,
-              forceOwnerObjectIds: authorityOptions?.forceOwnerObjectIds
+              forceOwnerObjectIds: authorityOptions?.forceOwnerObjectIds,
+              // B7 repair-attempt rule: gateway.ts sets repairAttempt in the
+              // v2AuthorityPayload options when the executor context has attempt > 0.
+              // Thread it here so the KV seed path skips stale cached pages on
+              // retries. See: 2026-06-11 incident; gateway.ts ~line 1063.
+              repairAttempt: authorityOptions?.repairAttempt === true
             }),
           executionCapsuleOpen: envFlag(this.env.WOO_V2_EXECUTION_CAPSULE),
           slimWarmEnvelope: envFlag(this.env.WOO_V2_SLIM_WARM_ENVELOPE),
@@ -2035,6 +2040,29 @@ export class PersistentObjectDO {
     let persistFullSnapshotAfterRepair = false;
     if (!catalogBundleCurrent && hostKey === WORLD_HOST) {
       installLocalCatalogs(world, parseAutoInstallCatalogs(this.env.WOO_AUTO_INSTALL_CATALOGS));
+      // FIX 2: catalog bundle repair may have bumped verb bytecode versions on
+      // catalog class/support objects whose rows are owned by WORLD_HOST. Any
+      // KV seed written before this repair carries pre-repair bytecode. The KV
+      // serve path validates payload integrity (hash check) but does not check
+      // staleness against the live world; a seed written under the OLD catalog
+      // fingerprint remains readable and will be served indefinitely on cold
+      // paths until explicitly invalidated. Delete the pointer for WORLD_HOST so
+      // the next KV build picks up the post-repair state. Per-object precision
+      // is not required — invalidating ALL seeds on any catalog change is
+      // acceptable (repair is rare, at most once per deploy). Fire async via
+      // waitUntil so we do not delay the current request.
+      // Note: the pointer key is deterministic (namespace+host); deleting it
+      // forces a fresh KV write on the next /__internal/host-seed request,
+      // which will carry current (post-repair) bytecode.
+      if (this.env.HOST_SEED_KV && typeof this.state.waitUntil === "function") {
+        this.state.waitUntil((async () => {
+          try {
+            await this.env.HOST_SEED_KV!.delete(hostSeedPointerKey(this.env, WORLD_HOST as ObjRef));
+          } catch (err) {
+            console.warn("woo.host_seed_kv_invalidate.failed", { host: WORLD_HOST, error: normalizeError(err) });
+          }
+        })());
+      }
     } else if (!catalogBundleCurrent && !isMcpGatewayShardHost(hostKey)) {
       // Hot DO instances can retain an already-loaded host slice across a
       // Worker deploy. Pull the gateway seed once per catalog bundle so
@@ -2062,6 +2090,20 @@ export class PersistentObjectDO {
           runHostScopedLocalCatalogLifecycle(world, hostKey, { freshSeed: true });
           persistFullSnapshotAfterRepair = changed;
           if (fetched.digest) this.repo.saveMeta(HOST_SEED_DIGEST_META_KEY, fetched.digest);
+          // FIX 2: as above for WORLD_HOST — a changed satellite host seed means
+          // verb versions may have advanced. Invalidate the KV pointer so cold
+          // paths regenerate from current state rather than serving a pre-repair
+          // KV payload. Only needed when the seed actually changed (merged.changed);
+          // a no-change merge leaves the KV seed current.
+          if (changed && this.env.HOST_SEED_KV && typeof this.state.waitUntil === "function") {
+            this.state.waitUntil((async () => {
+              try {
+                await this.env.HOST_SEED_KV!.delete(hostSeedPointerKey(this.env, hostKey as ObjRef));
+              } catch (err) {
+                console.warn("woo.host_seed_kv_invalidate.failed", { host: hostKey, error: normalizeError(err) });
+              }
+            })());
+          }
         } else {
           runHostScopedLocalCatalogLifecycle(world, hostKey);
         }
@@ -5399,6 +5441,16 @@ export class PersistentObjectDO {
       reconstructionTrigger?: AuthorityReconstructionTrigger;
       reconstructionScope?: ObjRef;
       forceOwnerObjectIds?: readonly ObjRef[];
+      // B7 repair-attempt rule: when attempt > 0 (any retry after a commit
+      // conflict or missing-state miss), skip the KV seed and take the live
+      // owner path. Serving a cached KV seed on a repair attempt means a stale
+      // pre-repair page (e.g. verb v1 when v2 was installed by catalog repair)
+      // re-enters planning on every retry, displacing the repair install, until
+      // the budget is exhausted with read_version_mismatch on every attempt.
+      // This mirrors the relay warm-cache rule already enforced in gateway.ts
+      // (`isRepairAttempt = (context?.attempt ?? 0) > 0`). See incident
+      // 2026-06-11: $exit v1 KV pages looped E_REPAIR_BUDGET on 364 attempts.
+      repairAttempt?: boolean;
     } = {}
   ): Promise<ReturnType<typeof executorAuthorityPayload>> {
     // `tolerateRemoteFailures: true` allows the per-envelope refresh path to
@@ -5418,6 +5470,13 @@ export class PersistentObjectDO {
     // not refresh-suppressed — so the owner's exits-bearing row displaces the seed.
     const forceOwnerRefresh = reconstructionReason === "missing_state_repair";
     const forceOwnerObjectIds = new Set<ObjRef>(options.forceOwnerObjectIds ?? []);
+    // B7 repair-attempt rule: skip KV seed on any repair retry (attempt > 0).
+    // A stale KV page that caused a read_version_mismatch on attempt N must not
+    // be re-served on attempt N+1 — the repair loop would loop cache → mismatch
+    // → cache until the budget is exhausted. forceOwnerRefresh and
+    // forceOwnerObjectIds already exclude KV for owner-required passes; this
+    // flag additionally covers commit-phase retries where neither is set.
+    const repairAttempt = options.repairAttempt === true;
     const reconstructionScope = options.reconstructionScope ?? ids[0] ?? "$nowhere";
     const localHost = this.durableHostKey();
     const mcpGatewayShard = isMcpGatewayShardHost(localHost);
@@ -5651,6 +5710,11 @@ export class PersistentObjectDO {
           if (forceOwnerRefresh) return;
           const hostObjects = byHost.get(host);
           if (hostObjects && Array.from(hostObjects).some((id) => forceOwnerObjectIds.has(id))) return;
+          // B7 repair-attempt rule: never serve KV seed on a repair retry.
+          // A stale page that caused mismatch on attempt N must not be re-served
+          // on attempt N+1 or the loop runs until budget exhaustion.
+          // Reference: 2026-06-11 incident ($exit v1 looping 364 times).
+          if (repairAttempt) return;
           try {
             const pointer = await this.env.HOST_SEED_KV!.get(hostSeedPointerKey(this.env, host as ObjRef), "text");
             if (pointer && pointer.length > 0) kvPointerByHost.set(host, pointer);
@@ -5664,7 +5728,9 @@ export class PersistentObjectDO {
         // owner-required objects. This check mirrors the pre-fetch guard above:
         // if any object in this host's set is owner-required, we must not serve
         // KV cache provenance for it — the live RPC is the only valid source.
-        const hostNeedsOwnerAuthority = forceOwnerRefresh || Array.from(objects).some((id) => forceOwnerObjectIds.has(id));
+        // B7 repair-attempt rule: also skip on any retry attempt — the same
+        // stale page that caused mismatch must not be served again.
+        const hostNeedsOwnerAuthority = forceOwnerRefresh || repairAttempt || Array.from(objects).some((id) => forceOwnerObjectIds.has(id));
         // B-ii: on a KV pointer hit (pointer was pre-fetched above), load the
         // seed bytes and build a cache-provenance authority slice without a live RPC.
         const kvPointer = !hostNeedsOwnerAuthority ? kvPointerByHost.get(host) : undefined;
@@ -5960,13 +6026,15 @@ export class PersistentObjectDO {
       // Per-turn authority refresh against an already-opened relay; the
       // CommitScopeDO has a durable snapshot so a cold satellite's slice
       // can be safely omitted. See comment on v2GatewayAuthorityPayload.
-      authorityPayload: async (_scope, extraObjectIds) =>
+      authorityPayload: async (_scope, extraObjectIds, authorityOptions) =>
         await this.v2GatewayAuthorityPayload(world, extraObjectIds, {
           tolerateRemoteFailures: true,
           directorySessionScopes: extraObjectIds,
           reconstructionReason: "warm_turn_refresh",
           reconstructionTrigger: "rest_turn",
-          reconstructionScope: _scope
+          reconstructionScope: _scope,
+          // B7 repair-attempt rule: skip KV seed on repair retries (attempt > 0).
+          repairAttempt: (authorityOptions?.attempt ?? 0) > 0
         }),
       applyAuthority: (client, authority) => {
         this.mergeRestPlanningAuthority(world, client, authority);
@@ -7542,7 +7610,9 @@ function hostSeedKvNamespace(env: Env): string {
   return namespace;
 }
 
-function hostSeedPointerKey(env: Env, host: ObjRef): string {
+// Exported for test use only — allows tests to inject KV entries at the correct
+// key for a given host (B7 repair-attempt gate and FIX 2 KV invalidation tests).
+export function hostSeedPointerKey(env: Env, host: ObjRef): string {
   return `seed-current:${hostSeedKvNamespace(env)}:${host}`;
 }
 
