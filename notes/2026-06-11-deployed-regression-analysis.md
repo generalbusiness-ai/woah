@@ -89,3 +89,44 @@ this deploy cycle.
 4. Characterize the pinboard timeout with the same tail.
 5. Build the stale-world lane (catalogs@N-1 → upgrade → scenario) as a
    pre-deploy gate.
+
+## UPDATE (same day): tailed run pins the remaining mechanisms
+
+Tail auth root-caused (not scope: smoke-with-tail.sh required pre-exported
+CF env while deploy.sh self-sources ~/.config/generalbusiness/cloudflare_woo.env;
+script now self-sources too — commit 0a37712 on main). Tailed run
+.woo/smoke-measurements/20260611T112824Z-7428 (3594 metric events):
+
+- **pinboard:add_note PASSED this run (48s)** — the timeout is marginal
+  cold-latency, not deterministic. Watch, don't chase yet.
+- **outliner pair: deterministic, identical E_OBJNF exit_living_room_outline**
+  — old-world missing seed instance confirmed. Fix unchanged: bootstrap
+  local-boot migration.
+- **tasks cross-room: PINNED.** Client error is now `E_REPAIR_BUDGET` (B-ii's
+  bounded error — the 20s transport cascade is gone, working as designed).
+  The tail shows the non-converging loop precisely (364 guest_111 events):
+  relocation commits at scope=guest_111 rejected `read_version_mismatch` with
+  `$exit:invoke` / `$exit:move` read at version **1** while actual is **2**,
+  on EVERY attempt. The deployed catalog repair bumped $exit verbs to v2; the
+  gateway's planning keeps re-reading v1. Code-level cause: the B-ii KV-seed
+  serve decision (persistent-object-do.ts ~5670) gates only on
+  owner-required — it does NOT honor the B7 rule "never serve cached
+  authority on a repair attempt" (implemented for the relay warm cache in
+  gateway.ts, absent from the new KV path). Stale pre-repair KV seed pages
+  ($exit v1) re-enter planning on each retry, displacing the repair install,
+  until E_REPAIR_BUDGET. A `host_seed_kv_restore_miss reason=hash_mismatch`
+  event (the_horoscope) shows the KV layer validates payload integrity but
+  nothing invalidates seeds that are merely OLD.
+
+### Fix items (precise)
+1. **B-ii follow-up (code defect, small)**: thread the repair-attempt context
+   into the KV-seed serve decision; `attempt > 0` (or missing_state_repair /
+   post-conflict refresh) must skip KV exactly as the warm relay cache does.
+   Test: forced read_version_mismatch with a stale KV seed converges in ≤2
+   attempts instead of exhausting the budget.
+2. **Seed hygiene (old-world)**: invalidate/regenerate host-seed KV when a
+   catalog bundle repair bumps verb versions (invalidateHostSeed exists);
+   otherwise long-lived worlds serve pre-repair pages indefinitely on cold
+   paths even outside repair loops.
+3. **Bootstrap migration** for missing seed instances (outliner pair),
+   unchanged from the original recommendation.
