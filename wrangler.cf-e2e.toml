@@ -40,11 +40,14 @@ WOO_V2_SLIM_WARM_ENVELOPE = "1"
 WOO_V2_KV_SEED_AUTHORITY = "1"
 WOO_V2_READ_CLOSURE_ENVELOPE = "1"
 WOO_V2_TAIL_DELIVERY = "1"
-# D2a: serve MCP fanout-audience session reads from the gateway shard's local
-# projection cache (sequence-current rows maintained by fanout) instead of a
-# per-turn Directory RPC; Directory remains the cold/first-touch fallback and
-# the authority-reconstruction path intentionally still uses it.
-WOO_V2_D2_SESSION_FROM_PROJECTION = "1"
+# D2a (WOO_V2_D2_SESSION_FROM_PROJECTION) is DISABLED pending an audience-
+# completeness invariant: the projection cache can hold a PARTIAL roster for a
+# scope (own session cached, cross-shard peer's row not yet arrived via
+# fanout), and the enrichment fallback only covers zero-session scopes — the
+# pre-deploy gate caught a cross-room `entered` observation silently dropped
+# (timing-dependent). Re-enable only with a provable roster-completeness
+# marker. The code + harness coverage remain; Directory lookups (~2.3/turn)
+# are the accepted cost until then. See notes/2026-06-10-d2-rpc-budget.md.
 # B-iv: bounded checkpoints — see wrangler.toml for rationale.
 # Must match production to satisfy guard:smoke-wrangler WOO_* parity.
 WOO_V2_CHECKPOINT_BOUNDED = "1"
