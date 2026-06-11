@@ -51,6 +51,11 @@ WOO_INTERNAL_SECRET = "local-smoke-internal-secret"
 # before reply and drains them after, so crash recovery re-delivers
 # rather than drops. Safe to enable in the smoke lane.
 WOO_V2_TAIL_DELIVERY = "1"
+# D2a: serve MCP fanout-audience session reads from the gateway shard's local
+# projection cache (sequence-current rows maintained by fanout) instead of a
+# per-turn Directory RPC; Directory remains the cold/first-touch fallback and
+# the authority-reconstruction path intentionally still uses it.
+WOO_V2_D2_SESSION_FROM_PROJECTION = "1"
 # B-iv: bounded checkpoints — see wrangler.toml for rationale.
 # Must match production to satisfy guard:smoke-wrangler WOO_* parity.
 WOO_V2_CHECKPOINT_BOUNDED = "1"

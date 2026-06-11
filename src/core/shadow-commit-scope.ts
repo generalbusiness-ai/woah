@@ -1030,6 +1030,44 @@ function projectionWritesForIndexedApply(
     }
   }
 
+  // D2a completeness: emit all co-present sessions for each affected scope so
+  // gateway shards that receive this fanout gain a COMPLETE roster, not just
+  // the transitioning session. Without this, a shard that holds a
+  // gateway_projection_scope head for a scope (its own prior fanout) but has
+  // never received another actor's session row for that scope will serve a
+  // partial audience, silently omitting the co-present peer from cross-shard
+  // fanout delivery.
+  //
+  // The affected scopes are the commit scope plus any moves/session transition
+  // in the transcript — the same set the fanout audience query covers. For each
+  // session whose activeScope is in that set, emit its row alongside any explicit
+  // session update above. coalesceProjectionWrites() deduplicates if the same
+  // session is written twice.
+  //
+  // Bound: O(sessions per affected scope) extra rows per movement commit, bounded
+  // by the number of concurrently active sessions in a room (typically 2–20),
+  // each ~300–500 bytes. The completeness invariant for D2a requires no extra
+  // schema field.
+  if (sessionUpdate || transcript.moves.length > 0) {
+    const affectedScopes = new Set<ObjRef>([transcript.scope]);
+    for (const move of transcript.moves) {
+      if (move.from) affectedScopes.add(move.from);
+      if (move.to) affectedScopes.add(move.to);
+    }
+    if (transcript.sessionScopeTransition) {
+      if (transcript.sessionScopeTransition.from) affectedScopes.add(transcript.sessionScopeTransition.from);
+      if (transcript.sessionScopeTransition.to) affectedScopes.add(transcript.sessionScopeTransition.to);
+    }
+    const alreadyEmitted = sessionUpdate ? new Set([sessionUpdate.session]) : new Set<string>();
+    for (const session of next.sessionsById.values()) {
+      if (alreadyEmitted.has(session.id)) continue;
+      const scope = session.activeScope ?? session.currentLocation ?? null;
+      if (!scope || !affectedScopes.has(scope)) continue;
+      const clone = structuredClone(session) as SerializedWorld["sessions"][number];
+      writes.push({ table: "sessions", key: clone.id, op: "upsert", row: clone, bytes: projectionRowBytes(clone) });
+    }
+  }
+
   const log = transcriptLogEntry(transcript);
   if (log) {
     const clone = structuredClone(log) as SerializedWorld["logs"][number][1][number];

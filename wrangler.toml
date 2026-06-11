@@ -67,6 +67,11 @@ WOO_V2_READ_CLOSURE_ENVELOPE = "1"
 # reply, drain-on-reactivation covers the crash window, bounded backoff with
 # fanout_redelivery metrics. Flag-off restores synchronous post-accept delivery.
 WOO_V2_TAIL_DELIVERY = "1"
+# D2a: serve MCP fanout-audience session reads from the gateway shard's local
+# projection cache (sequence-current rows maintained by fanout) instead of a
+# per-turn Directory RPC; Directory remains the cold/first-touch fallback and
+# the authority-reconstruction path intentionally still uses it.
+WOO_V2_D2_SESSION_FROM_PROJECTION = "1"
 # B-iv: gate per-commit checkpoint builds on a frame interval rather than
 # running on EVERY accepted commit (B-iv default). Production CommitScopeDOs
 # reconstruct on essentially every turn, so the gate reads the PERSISTED

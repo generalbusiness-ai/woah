@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import type { EffectTranscript } from "../src/core/effect-transcript";
+import type { EffectTranscript, TranscriptSessionScopeTransition } from "../src/core/effect-transcript";
 import type { SerializedObject, SerializedWorld } from "../src/core/repository";
 import {
   acceptedFrameTrackedObjectIds,
@@ -317,6 +317,88 @@ describe("shadow commit scope", () => {
     (scope.cellProvenance ??= new Map()).set(planningCellKey("room", "object_lineage"), { source: "authoritative" });
     recordAcceptedCommitScopeCellProvenance(scope, addChildTranscript(), undefined, "cache");
     expect(scope.cellProvenance?.get(planningCellKey("room", "object_lineage"))).toEqual({ source: "authoritative" });
+  });
+
+  // D2a completeness regression: when actor B moves into scope S where actor A is
+  // already present (activeScope = S), both A's session AND B's session must appear
+  // in the accepted commit's projection_writes. Without this, a gateway shard that
+  // holds a projection head for scope S (from B's commit) but never received A's
+  // session row (A's session was written to A's shard only) would serve a partial
+  // audience, silently omitting A from cross-shard fanout delivery.
+  //
+  // This is the invariant that fixes "tasks: cross-room `entered` reaches peer"
+  // failing in the workerd smoke lane with WOO_V2_D2_SESSION_FROM_PROJECTION=1.
+  it("includes co-present sessions in projection_writes when an actor moves into a scope (D2a completeness)", () => {
+    // alice is already in "dest" (the destination scope).
+    // bob is in "origin" and moves to "dest" in this commit.
+    const before: SerializedWorld = {
+      version: 1,
+      objectCounter: 1,
+      parkedTaskCounter: 1,
+      sessionCounter: 2,
+      objects: [
+        objectRecord("alice", "Alice", "dest", []),
+        objectRecord("bob", "Bob", "origin", []),
+        objectRecord("origin", "Origin", null, ["bob"]),
+        objectRecord("dest", "Dest", null, ["alice"])
+      ],
+      sessions: [
+        { id: "session-alice", actor: "alice", started: 1, activeScope: "dest" },
+        { id: "session-bob",   actor: "bob",   started: 1, activeScope: "origin" }
+      ],
+      logs: [],
+      snapshots: [],
+      parkedTasks: [],
+      tombstones: []
+    };
+    // Bob moves from "origin" to "dest", and his session transitions to "dest".
+    const sessionTransition: TranscriptSessionScopeTransition = {
+      session: "session-bob",
+      actor: "bob",
+      from: "origin",
+      to: "dest"
+    };
+    const transcript: EffectTranscript = {
+      kind: "woo.effect_transcript.shadow.v1",
+      id: "bob-enters-dest",
+      route: "sequenced",
+      scope: "origin",
+      seq: 1,
+      session: "session-bob",
+      call: { actor: "bob", target: "origin", verb: "south", args: [], body: undefined },
+      reads: [],
+      writes: [
+        { cell: { kind: "location", object: "bob" }, value: "dest", op: "move" },
+        { cell: { kind: "contents", object: "dest" }, value: ["alice", "bob"], op: "replace" },
+        { cell: { kind: "contents", object: "origin" }, value: [], op: "replace" }
+      ],
+      creates: [],
+      moves: [{ object: "bob", from: "origin", to: "dest" }],
+      sessionScopeTransition: sessionTransition,
+      observations: [],
+      logicalInputs: [],
+      untrackedEffects: [],
+      complete: true,
+      incompleteReasons: [],
+      hash: "transcript:bob-enters-dest"
+    };
+
+    const scope = createShadowCommitScope({ node: "scope:test", scope: "origin", serialized: before });
+    const applied = applyShadowTranscriptToIndexedState(scope.state, transcript);
+
+    // Both alice and bob must appear in the sessions projection_writes.
+    // Bob's session row is required (his activeScope changed to "dest").
+    // Alice's session row is required for D2a completeness: a gateway shard
+    // receiving this fanout gains alice's presence in "dest" so it can include
+    // her in the fanout audience without a Directory RPC.
+    const sessionWrites = applied.projection_writes.filter((w) => w.table === "sessions" && w.op === "upsert");
+    const sessionIds = sessionWrites.map((w) => w.key as string).sort();
+    expect(
+      sessionIds,
+      "D2a completeness: projection_writes must include both the transitioning session AND co-present sessions. " +
+      "If only session-bob is present, the gateway shard serving this fanout cannot include alice in the audience " +
+      "without a Directory RPC (the bug that caused 'tasks: cross-room entered reaches peer' to fail in workerd)."
+    ).toEqual(["session-alice", "session-bob"]);
   });
 });
 

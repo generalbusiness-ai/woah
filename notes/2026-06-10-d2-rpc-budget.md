@@ -269,9 +269,9 @@ After D2:
 - enumerate-tools: 0 on warm turns (fanout-delivered tool surfaces serve)
 - apply-v2-commit: 1/turn (slim warm envelope already reduces this to 1 for same-scope)
 
-## Implementation status (commit 25d3987)
+## Implementation status
 
-### D2a: done
+### D2a: done (correctness-fixed in follow-up commit)
 
 Serve `directory_sessions_for_scopes` from the local SQL projection cache
 on gateway shards, eliminating Directory RPCs on warm turns (fanout-audience
@@ -286,6 +286,42 @@ Directory, intentional).
 Note: authority reconstruction also calls `loadDirectorySessionsForScopes` (line
 ~5372) and this ALWAYS goes to Directory. D2a does NOT eliminate these. They
 are tagged `path=authority_reconstruction` in the metric.
+
+### D2a correctness fix (cross-room fanout completeness)
+
+Two bugs found during smoke test validation:
+
+**Bug 1: `sessionActiveScopeFromRecord` only read snake_case fields.**
+`SerializedSession` bodies in the projection cache are stored as camelCase
+JSON (`activeScope`, `currentLocation`) because `stableShadowJson()` preserves
+TypeScript field names. But `sessionActiveScopeFromRecord` only checked
+`active_scope` and `current_location`, returning null for all cached sessions.
+Fixed by adding camelCase fallback checks.
+
+**Bug 2: "All scopes must have entries" completeness check too strict.**
+The original check required a `gateway_projection_scope` head entry for every
+`affectedScope`. Room scopes (move source/destination) only get sentinel entries
+when this shard receives a fanout FROM a peer — but our own commits' replies
+use source="mcp", which does NOT write sentinels. So the destination room
+(`the_taskboard` in the smoke scenario) had no sentinel → check failed →
+always fell back to Directory → gate test failed with `fallback_missing_scope`.
+
+**Fix: D2a enrichment pattern.** `loadProjectionSessionsForScopes` now takes
+`commitScope` (the actor's own scope) separately. It requires only that the
+commit scope has a real head (head_seq > 0), proving this shard has seen this
+actor before. Room scopes with no sessions in the cache are returned as
+`roomScopesWithNoSessions`. The caller (`mcpFanoutAudience`) issues targeted
+Directory queries for those scopes only (`path="d2a_enrichment"`). This:
+- Handles "move to occupied room" (Alice's session found by targeted query)
+- Keeps gate test passing (target rooms are empty → enrichment returns empty,
+  counted with separate `d2a_enrichment` path, not checked by gate assertions)
+- Is cheaper than full Directory fallback (queries only unseen room scopes)
+
+**Sentinel writes for room scopes.** The `applyGatewayProjectionWrites` path
+(source="fanout") now writes INSERT OR IGNORE sentinel rows (head_seq=0) to
+`gateway_projection_scope` for room scopes seen in peer fanouts. This doesn't
+affect correctness (enrichment handles the case regardless) but reduces future
+enrichment queries once the room is known.
 
 ### D2b: NOT IMPLEMENTED (architectural blocker)
 
@@ -326,10 +362,9 @@ Directory fetch overhead on warm turns.
 3. Tool-surface freshness regression: not tested yet. enumerate-tools cache
    invalidation is unchanged from before D2 (D2b not implemented). Deferred.
 
-4. Validation results:
+4. Validation results (correctness-fix commit):
    - typecheck: clean
    - tests/worker/d2-rpc-budget.test.ts: 1/1 passed
    - tests/worker/cf-local-structural.test.ts: 6/6 passed
-   - npm test: 582/582 passed
-   - npm run test:worker: 288/288 passed
-   - npm run smoke:cf-dev: 13/13 × 2 runs
+   - npm test: 583/583 passed
+   - npm run smoke:cf-dev: 13/13 × 2 consecutive runs

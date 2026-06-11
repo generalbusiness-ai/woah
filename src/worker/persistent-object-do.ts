@@ -906,18 +906,40 @@ export class PersistentObjectDO {
             if (write.op === "delete") {
               sql.exec("DELETE FROM gateway_projection_session WHERE session_id = ?", write.key);
             } else {
+              const roomScope = write.row.activeScope ?? write.row.currentLocation ?? null;
               sql.exec(
                 `INSERT OR REPLACE INTO gateway_projection_session(
                   session_id, scope, actor, body, last_apply_seq, last_apply_hash, updated_at_ms, stale, stale_reason
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL)`,
                 write.key,
-                write.row.activeScope ?? write.row.currentLocation ?? null,
+                roomScope,
                 write.row.actor,
                 stableShadowJson(write.row as unknown as WooValue),
                 position.seq,
                 position.hash,
                 now
               );
+              // D2a: when receiving a fanout from a peer CommitScopeDO, write a
+              // sentinel entry for the room scope so loadProjectionSessionsForScopes
+              // can later use the local session cache for that room. The sentinel
+              // (head_seq = 0) differs from real commit-scope heads (head_seq > 0).
+              // Without the sentinel, room scopes (which never appear as commit scopes
+              // in actor-scoped routing) would be absent from gateway_projection_scope,
+              // which is fine since D2a enrichment covers the gap for missing scopes.
+              //
+              // Only write from peer fanouts (source="fanout"): our own commit replies
+              // (source="mcp") only carry our actor's data, not co-present sessions.
+              if (source === "fanout" && roomScope && roomScope !== authorityScope) {
+                // INSERT OR IGNORE: only write on first fanout receipt for this scope;
+                // subsequent upserts must not regress a real commit-scope head.
+                sql.exec(
+                  `INSERT OR IGNORE INTO gateway_projection_scope(scope, head_seq, head_hash, updated_at_ms, stale, stale_reason) VALUES (?, ?, ?, ?, 0, NULL)`,
+                  roomScope,
+                  0,
+                  "",
+                  now
+                );
+              }
             }
             rows += 1;
             break;
@@ -2245,8 +2267,10 @@ export class PersistentObjectDO {
     scopes: readonly ObjRef[],
     // Optional path label recorded in the directory_sessions_for_scopes metric so
     // callers can distinguish fanout-audience lookups (D2a hot path) from authority-
-    // reconstruction lookups (always Directory). Undefined = legacy call site.
-    path?: "mcp_fanout_audience" | "authority_reconstruction"
+    // reconstruction lookups (always Directory). "d2a_enrichment" is used for
+    // targeted enrichment queries that supplement D2a cache for room scopes with
+    // no locally-cached sessions. Undefined = legacy call site.
+    path?: "mcp_fanout_audience" | "authority_reconstruction" | "d2a_enrichment"
   ): Promise<DirectorySerializedSession[]> {
     const requested = Array.from(new Set(scopes.filter((scope) => typeof scope === "string" && scope.length > 0))).sort();
     if (requested.length === 0) return [];
@@ -2340,43 +2364,75 @@ export class PersistentObjectDO {
 
   // D2a: serve session/audience data from the local SQL projection cache.
   //
-  // Returns sessions only when the gateway has received at least one projection
-  // fanout for any of the requested scopes (gateway_projection_scope row exists
-  // and is not stale). If no projection head is present for any scope, returns
-  // { hasProjection: false } so the caller falls back to Directory.
+  // `commitScope` is the scope that actually committed (position.scope from the
+  // CommitScopeDO reply). `affectedScopes` includes commitScope plus any move
+  // source/destination rooms and session-scope-transition rooms.
+  //
+  // Serves session rows from `gateway_projection_session` when the commit scope
+  // has a confirmed real head (head_seq > 0), meaning this shard has previously
+  // processed commits from this actor. Returns `hasProjection: false` (fall back
+  // to Directory) when the commit scope is unknown (first commit ever from this
+  // actor on this shard).
+  //
+  // For room scopes in `affectedScopes` where no sessions are found in the cache,
+  // `roomScopesWithNoSessions` is populated. The caller (`mcpFanoutAudience`) uses
+  // this list to do targeted Directory enrichment queries for those specific scopes,
+  // handling the "move to occupied room" case where co-present actors' sessions
+  // were never propagated to this shard (because they committed before this shard
+  // was relevant to their fanout). This is cheaper than a full Directory fallback
+  // and correct: an empty result from the targeted query confirms the room is
+  // actually empty; a non-empty result fills in the missing roster.
+  //
+  // Returns { hasProjection: false } to fall back to full Directory.
   //
   // CA11 provenance rule: this data is safe for audience/routing decisions
   // (which shards receive the fanout) but MUST NOT be used for authority proofs.
   // The session's activeScope field is the critical routing hint; expiresAt is
   // used only to avoid routing to expired sessions.
-  private loadProjectionSessionsForScopes(scopes: readonly ObjRef[]): {
+  private loadProjectionSessionsForScopes(commitScope: ObjRef, scopes: readonly ObjRef[]): {
     sessions: DirectorySerializedSession[];
     hasProjection: boolean;
+    /** Room scopes (non-commit-scope) that had no sessions in the cache.
+     * The caller should do targeted Directory enrichment for these. */
+    roomScopesWithNoSessions: ObjRef[];
   } {
-    if (scopes.length === 0) return { sessions: [], hasProjection: false };
+    const empty = { sessions: [], hasProjection: false, roomScopesWithNoSessions: [] };
+    if (scopes.length === 0) return empty;
     const sql = this.state.storage.sql;
-    const placeholders = scopes.map(() => "?").join(", ");
-    // Check that at least one scope has a non-stale projection head.
-    const headRow = firstSqlRow<{ found: number }>(sql.exec(
-      `SELECT 1 AS found FROM gateway_projection_scope WHERE scope IN (${placeholders}) AND stale = 0 LIMIT 1`,
-      ...scopes
+    // Require that the commit scope has a real head (head_seq > 0). This means
+    // this shard has previously processed commits from this CommitScopeDO. Before
+    // the first commit, head_seq is 0 or absent → fall back to Directory.
+    const commitHeadRow = sqlRows<{ head_seq: number }>(sql.exec(
+      `SELECT head_seq FROM gateway_projection_scope WHERE scope = ? AND stale = 0`,
+      commitScope
     ));
-    if (!headRow) return { sessions: [], hasProjection: false };
+    if (commitHeadRow.length === 0 || (commitHeadRow[0].head_seq ?? 0) === 0) {
+      return empty;
+    }
     // Load session rows for all requested scopes from the SQL projection cache.
     // The `body` column is a JSON-serialized SerializedSession with activeScope.
-    const rows = sqlRows<{ body: string }>(sql.exec(
-      `SELECT body FROM gateway_projection_session WHERE scope IN (${placeholders}) AND stale = 0`,
+    const placeholders = scopes.map(() => "?").join(", ");
+    const rows = sqlRows<{ scope: string; body: string }>(sql.exec(
+      `SELECT scope, body FROM gateway_projection_session WHERE scope IN (${placeholders}) AND stale = 0`,
       ...scopes
     ));
+    // Track which room scopes have sessions so we can identify gaps for enrichment.
+    const roomScopesWithSessions = new Set<string>();
     const sessions: DirectorySerializedSession[] = [];
     for (const row of rows) {
+      roomScopesWithSessions.add(row.scope);
       try {
         const parsed = JSON.parse(row.body) as unknown;
         const session = serializedSessionFromDirectoryRoute(parsed);
         if (session) sessions.push(session);
       } catch { /* skip malformed rows */ }
     }
-    return { sessions, hasProjection: true };
+    // Find room scopes (non-commit-scope) with no sessions in the cache.
+    // These may have co-present sessions on other shards that were never fanned
+    // to this shard (e.g. "Alice in the_taskboard" when Bob is just arriving).
+    // The caller will issue targeted Directory queries for these scopes.
+    const roomScopesWithNoSessions = scopes.filter((s) => s !== commitScope && !roomScopesWithSessions.has(s));
+    return { sessions, hasProjection: true, roomScopesWithNoSessions };
   }
 
   // D2b: enumerate tool surface rows for objects in the projection_writes so the
@@ -6391,8 +6447,21 @@ export class PersistentObjectDO {
     // authority proofs. This path only determines which shards get the fanout.
     let directorySessions: DirectorySerializedSession[];
     if (envFlag(this.env.WOO_V2_D2_SESSION_FROM_PROJECTION) && isMcpGatewayShardHost(this.durableHostKey())) {
-      const { sessions: projectionSessions, hasProjection } = this.loadProjectionSessionsForScopes(affectedScopes);
+      const { sessions: projectionSessions, hasProjection, roomScopesWithNoSessions } = this.loadProjectionSessionsForScopes(scope, affectedScopes);
       if (hasProjection) {
+        // D2a enrichment: for room scopes with no sessions in the projection cache,
+        // do a targeted Directory query. This handles the "move to occupied room"
+        // scenario where co-present actors' sessions were never propagated to this
+        // shard (because they committed before this shard was in their fanout audience).
+        // The targeted query is cheaper than a full Directory fallback and uses a
+        // distinct metric path ("d2a_enrichment") so gate tests on the primary
+        // "mcp_fanout_audience" path are not affected.
+        // A room with no cached sessions might be empty OR occupied by actors whose
+        // session data this shard never received. The targeted query resolves which.
+        let enrichedSessions: DirectorySerializedSession[] = [];
+        if (roomScopesWithNoSessions.length > 0) {
+          enrichedSessions = await this.loadDirectorySessionsForScopes(roomScopesWithNoSessions, "d2a_enrichment");
+        }
         // Merge projection-cache sessions with any live in-memory sessions on
         // this shard. Live sessions are authoritative; projection rows fill in
         // for other shards' sessions that this shard knows about via fanout.
@@ -6410,8 +6479,10 @@ export class PersistentObjectDO {
                 currentLocation: s.activeScope
               } as DirectorySerializedSession))
           : [];
-        // Live sessions win over projection rows (same-id overwrite).
+        // Projection cache rows win over enrichment (cache is more recent);
+        // live in-memory sessions win over both (authoritative for this shard).
         const byId = new Map<string, DirectorySerializedSession>();
+        for (const s of enrichedSessions) byId.set(s.id, s);
         for (const s of projectionSessions) byId.set(s.id, s);
         for (const s of localSessions) byId.set(s.id, s);
         directorySessions = Array.from(byId.values());
@@ -6426,7 +6497,7 @@ export class PersistentObjectDO {
           path: "mcp_fanout_audience"
         });
       } else {
-        // No projection head for any affected scope (first touch or stale):
+        // No real commit-scope head (first touch or shard has never seen this actor):
         // fall back to Directory to get authoritative session data.
         directorySessions = await this.loadDirectorySessionsForScopes(affectedScopes, "mcp_fanout_audience");
       }
