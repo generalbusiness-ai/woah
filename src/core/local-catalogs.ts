@@ -167,6 +167,21 @@ export function localCatalogBundleFingerprint(names: readonly string[] = DEFAULT
   return hashSource(JSON.stringify(material));
 }
 
+// Fingerprint of the local-boot migration INDEX (the ordered id list).
+// Consumers that gate catalog repair on "has anything changed?" must include
+// this alongside localCatalogBundleFingerprint: adding a migration changes NO
+// manifest, so a bundle-only fingerprint says "already repaired" and the new
+// migration silently never runs against fingerprint-gated stores (the
+// CommitScopeDO snapshot repair). Observed 2026-06-11: the
+// missing-seed-instances migration ran on ledger-gated hosts (world) but was
+// skipped by every scope snapshot whose bundle fingerprint predated it —
+// deployed scopes looped E_REPAIR_BUDGET on the instance the world had and
+// they lacked. Deriving the epoch from all inputs (manifests + migration
+// index) removes the manual-bump failure mode.
+export function localCatalogMigrationIndexFingerprint(): string {
+  return hashSource(JSON.stringify(LOCAL_CATALOG_MIGRATION_INDEX.map((entry) => entry.id)));
+}
+
 const LOCAL_CATALOG_MIGRATION_INDEX: Array<{ id: string; only?: string }> = [
   { id: LOCAL_CATALOG_SOURCE_MIGRATION },
   { id: LOCAL_CATALOG_PLACEMENT_MIGRATION },

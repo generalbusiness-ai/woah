@@ -10,7 +10,7 @@ import type { EffectTranscript } from "../core/effect-transcript";
 import type { ShadowCapabilityAd } from "../core/capability-ad";
 import { cellProvenanceFromAuthoritySlice, pruneSerializedSessionsWithoutActorRows, serializedWorldFromAuthoritySlice } from "../core/authority-slice";
 import { createWorldFromSerialized } from "../core/bootstrap";
-import { localCatalogBundleFingerprint, parseAutoInstallCatalogs, runHostScopedLocalCatalogLifecycle } from "../core/local-catalogs";
+import { localCatalogBundleFingerprint, localCatalogMigrationIndexFingerprint, parseAutoInstallCatalogs, runHostScopedLocalCatalogLifecycle } from "../core/local-catalogs";
 import type { SerializedAuthoritySlice, SerializedObject, SerializedSession, SerializedWorld } from "../core/repository";
 import {
   applyShadowBrowserTransfer,
@@ -1740,7 +1740,15 @@ export class CommitScopeDO {
   }
 
   private currentSnapshotRepairFingerprint(): string {
-    return `${localCatalogBundleFingerprint(parseAutoInstallCatalogs(this.env.WOO_AUTO_INSTALL_CATALOGS))}:${COMMIT_SCOPE_SNAPSHOT_REPAIR_EPOCH}`;
+    // The repair epoch is DERIVED from every input that can require a repair:
+    // manifest content (bundle fingerprint) AND the local-boot migration index.
+    // A migration added without any manifest change previously left this
+    // fingerprint unchanged, so fingerprint-gated scope snapshots skipped the
+    // new migration forever while ledger-gated hosts (world) ran it — the
+    // 2026-06-11 deployed E_REPAIR_BUDGET loops (scope lacked
+    // exit_living_room_outline that the world had). The manual epoch const
+    // remains as a last-resort override only.
+    return `${localCatalogBundleFingerprint(parseAutoInstallCatalogs(this.env.WOO_AUTO_INSTALL_CATALOGS))}:${localCatalogMigrationIndexFingerprint()}:${COMMIT_SCOPE_SNAPSHOT_REPAIR_EPOCH}`;
   }
 
   private loadSnapshotRepairFingerprint(): string | null {

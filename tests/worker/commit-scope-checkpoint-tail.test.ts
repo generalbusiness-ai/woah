@@ -9,6 +9,7 @@ import type { ObjRef } from "../../src/core/types";
 import type { ShadowCommitAccepted, ShadowScopeHead } from "../../src/core/shadow-commit-scope";
 import { CommitScopeDO } from "../../src/worker/commit-scope-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
+import { localCatalogBundleFingerprint } from "../../src/core/local-catalogs";
 import { FakeDurableObjectState } from "./fake-do";
 
 const SECRET = "test-secret";
@@ -526,6 +527,84 @@ describe("CommitScopeDO checkpoint/tail open", () => {
       expect(response.ok).toBe(true);
       const repaired = objectRow(state, "$conversational");
       expect(repaired?.verbs.find((verb) => verb.name === "room_roster")?.source).toBe(currentRoster.source);
+    } finally {
+      state.close();
+    }
+  });
+
+  it("re-repairs a snapshot when the migration index grows without manifest changes", async () => {
+    // Regression for the 2026-06-11 deployed E_REPAIR_BUDGET loops: the
+    // snapshot-repair fingerprint previously covered manifest content only, so
+    // adding a local-boot migration (no manifest change) left fingerprint-gated
+    // scope snapshots permanently unrepaired — the world host ran the new
+    // missing-seed-instances migration (ledger-gated per id) while every scope
+    // snapshot skipped it, and commits looped on the instance the world had
+    // and the scope lacked. The fingerprint now folds in the migration index;
+    // a stored OLD-format fingerprint (bundle:epoch) must mismatch and trigger
+    // the repair on load.
+    const state = new WaitUntilState("the_chatroom");
+    const currentWorld = createWorld();
+    const session = currentWorld.auth("guest:commit-scope-epoch-repair");
+    // Simulate an aged scope snapshot: demoworld installed, but the exit
+    // instance absent and the migration id missing from the ledger (the world
+    // predates both).
+    const staleSeed = createWorld().exportHostScopedWorld("the_chatroom");
+    const staleObjects = staleSeed.objects
+      .filter((object) => object.id !== "exit_living_room_outline")
+      .map((object) => {
+        if (object.id !== "$system") return object;
+        // SerializedObject.properties is an entry list ([name, value][]).
+        const properties = (object.properties ?? []).map(([name, value]) =>
+          name === "applied_migrations" && Array.isArray(value)
+            ? [name, value.filter((id) => id !== "2026-06-11-missing-seed-instances")] as [string, unknown]
+            : [name, value] as [string, unknown]
+        );
+        return { ...object, properties };
+      });
+    expect(staleObjects.some((object) => object.id === "exit_living_room_outline")).toBe(false);
+    const target = new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: SECRET });
+    const authority = executorAuthorityPayload(currentWorld, ["the_chatroom", session.actor]);
+    seedScopeRows(state, "the_chatroom", head("the_chatroom", 0), {
+      objects: staleObjects,
+      sessions: authority.sessions
+    });
+    // Store the OLD-format fingerprint exactly as a pre-fix deploy left it:
+    // bundle hash + manual epoch const, NO migration-index segment. With the
+    // bundle unchanged, the old gating would treat this snapshot as already
+    // repaired and never run the new migration.
+    state.storage.sql.exec(
+      "INSERT OR REPLACE INTO v2_commit_scope_snapshot_repair(id, fingerprint, updated_at) VALUES ('current', ?, ?)",
+      `${localCatalogBundleFingerprint()}:commit-scope-catalog-repair-v1`,
+      Date.now()
+    );
+
+    try {
+      const request = await signInternalRequest({ WOO_INTERNAL_SECRET: SECRET }, new Request("https://woo.internal/v2/open", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          scope: "the_chatroom",
+          node: "browser:commit-scope-epoch-repair",
+          token: "guest:commit-scope-epoch-repair",
+          session: session.id,
+          actor: session.actor,
+          ...authority
+        })
+      }));
+      const response = await target.fetch(request);
+      await state.drainWaitUntil();
+
+      expect(response.ok).toBe(true);
+      // The repair ran the missing-seed-instances migration against the scope
+      // snapshot: the exit instance now exists in the persisted scope world.
+      const repairedExit = objectRow(state, "exit_living_room_outline");
+      expect(repairedExit, "repair must create the missing seed instance in the scope snapshot").toBeTruthy();
+      // And the stored fingerprint is the new derived format (three segments),
+      // so the repair does not re-run on every load.
+      const storedFingerprint = (state.storage.sql.exec(
+        "SELECT fingerprint FROM v2_commit_scope_snapshot_repair WHERE id = 'current' LIMIT 1"
+      ).toArray()[0] as { fingerprint?: string } | undefined)?.fingerprint ?? "";
+      expect(storedFingerprint.split(":").length).toBe(3);
     } finally {
       state.close();
     }
