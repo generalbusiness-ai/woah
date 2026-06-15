@@ -1447,20 +1447,35 @@ type ExecutionCapsule = {
   session: string;
   target: ObjRef;
   verb: string;
-  authority: AuthorityCellSlice;
   expires_at_ms: number;
 };
 ```
 
 The capsule is execution sufficiency only. It is not a projection checkpoint,
 not a descriptor cache, and not a durable replacement for the scope's accepted
-frame log. A CommitScopeDO that already has a durable snapshot validates the
-capsule scope, actor/session binding, epoch, and expiry before merging the
-request's authority slice and executing the envelope. A CommitScopeDO with no
-durable snapshot MUST reject capsule-only execution with `E_SNAPSHOT_REQUIRED`;
-rollout callers may then perform the legacy seed bootstrap and retry the
-envelope without the capsule. If the capsule's head is behind the scope head,
-the ordinary stale-head repair path applies.
+frame log. It deliberately carries NO authority slice: the CommitScopeDO
+validates a capsule by head/scope/actor/session metadata only and never reads an
+embedded slice, so the request's top-level authority (when present) is the sole
+slice source. A CommitScopeDO that already has a durable snapshot validates the
+capsule kind, scope, and actor/session binding before merging the request's
+authority slice and executing the envelope. These three are integrity checks: a
+mismatch is a genuine wiring fault and MUST reject with `E_PROTOCOL`.
+
+The capsule's **head** (its `head.scope` and `head.epoch`) is NOT an integrity
+check — it is a freshness assertion that can go stale between capsule-open and
+commit validation, because the authoritative scope state may move underneath an
+in-flight turn (a snapshot repair rebuilds the scope under a new epoch; a gateway
+client may carry a head from a stale cross-scope view across a relocation
+rebind). A capsule whose head no longer matches the current scope head therefore
+follows the SAME recovery as a cold capsule, NOT a terminal rejection: the
+CommitScopeDO replies `E_SNAPSHOT_REQUIRED`, and the gateway re-seeds the scope,
+re-opens the session against the current head, and retries the envelope with the
+capsule stripped. A CommitScopeDO with no durable snapshot likewise MUST reject
+capsule-only execution with `E_SNAPSHOT_REQUIRED`; rollout callers then perform
+the legacy seed bootstrap and retry the envelope without the capsule. The
+capsule-stripped retry skips head validation entirely, so recovery converges in
+one reseed and cannot loop. Finally, an expired capsule (past `expires_at_ms`)
+rejects with `E_STALE`.
 
 The capsule shortcut applies only when the commit scope will execute the turn
 from the caller's local execution view. If the executor has already planned a
