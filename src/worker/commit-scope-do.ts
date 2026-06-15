@@ -727,8 +727,35 @@ export class CommitScopeDO {
     if (capsule.kind !== "woo.execution_capsule.v1") throw wooError("E_PROTOCOL", "invalid execution capsule kind");
     if (capsule.scope !== input.scope) throw wooError("E_PROTOCOL", "execution capsule scope mismatch");
     if (capsule.actor !== input.actor || capsule.session !== input.session) throw wooError("E_PROTOCOL", "execution capsule session mismatch");
-    if (capsule.head.scope !== input.scope) throw wooError("E_PROTOCOL", "execution capsule head scope mismatch");
-    if (capsule.head.epoch !== currentHead.epoch) throw wooError("E_PROTOCOL", "execution capsule epoch mismatch");
+    // The head a capsule carries is captured at the gateway when the turn is
+    // planned; by the time it reaches commit validation the authoritative scope
+    // state may have MOVED underneath it. Two ways this happens, both transient
+    // and self-healing, NEITHER a protocol violation:
+    //   * head.scope != input.scope (the capsule's own scope already matched at
+    //     line above, so its HEAD belongs to a different scope view): the gateway
+    //     client carried a head from a stale/cross-scope relay across a
+    //     relocation rebind (the divergent-session-state race).
+    //   * head.epoch != currentHead.epoch: the scope DO rebuilt its serialized
+    //     state under a new epoch — E1.1 snapshot repair self-heals an aged scope
+    //     on cold load, advancing ScopeHead.epoch — so an in-flight capsule
+    //     built against the pre-repair head is now behind.
+    // The capsule was well-formed when built; only the head went stale. Recover
+    // via the SAME path the executor contract prescribes for a cold-scope capsule
+    // (executor.ts: "a cold scope with a capsule throws E_SNAPSHOT_REQUIRED and
+    // is re-seeded ... via the gateway retry"): reply E_SNAPSHOT_REQUIRED so the
+    // gateway re-seeds the scope, re-opens the session against the CURRENT head,
+    // and retries with the capsule STRIPPED (gateway.ts submitEnvelope catch).
+    // The stripped retry skips this check (no capsule), so recovery converges in
+    // one reseed and cannot loop. Terminal E_PROTOCOL here instead ABORTED the
+    // turn — the 2026-06-12 deployed outliner/tasks "execution capsule head scope
+    // mismatch" failures, where every aged scope that self-healed via E1.1 then
+    // rejected the in-flight capsule built against its old head.
+    if (capsule.head.scope !== input.scope) {
+      throw wooError(V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED, "execution capsule head scope predates rebuilt commit scope; reseed required");
+    }
+    if (capsule.head.epoch !== currentHead.epoch) {
+      throw wooError(V2_COMMIT_SCOPE_SNAPSHOT_REQUIRED, "execution capsule head epoch predates rebuilt commit scope; reseed required");
+    }
     if (capsule.expires_at_ms <= Date.now()) throw wooError("E_STALE", "execution capsule expired");
   }
 

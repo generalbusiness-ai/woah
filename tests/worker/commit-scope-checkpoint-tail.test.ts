@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { createWorld } from "../../src/core/bootstrap";
 import { installVerb } from "../../src/core/authoring";
 import type { EffectTranscript } from "../../src/core/effect-transcript";
-import { executorAuthorityPayload } from "../../src/core/executor";
+import { buildExecutionCapsule, executorAuthorityPayload } from "../../src/core/executor";
 import type { ProjectionWrite } from "../../src/core/projection-delta";
 import type { SerializedObject, SerializedSession, SerializedWorld } from "../../src/core/repository";
 import type { ObjRef } from "../../src/core/types";
@@ -608,6 +608,135 @@ describe("CommitScopeDO checkpoint/tail open", () => {
     } finally {
       state.close();
     }
+  });
+
+  // Regression for the 2026-06-12 deployed outliner/tasks failures: after E1.1
+  // made aged scope snapshots self-heal on cold load (advancing ScopeHead.epoch),
+  // an in-flight execution capsule built against the PRE-repair head reached the
+  // rebuilt scope and was rejected with terminal E_PROTOCOL "execution capsule
+  // head scope mismatch" — aborting the turn instead of healing. A stale capsule
+  // head is not a protocol violation; it must map to the retryable
+  // E_SNAPSHOT_REQUIRED class so the gateway re-seeds, re-opens against the
+  // current head, and retries with the capsule stripped (executor.ts contract).
+  describe("stale execution capsule head → retryable reseed, not terminal protocol", () => {
+    // Build a loadable scope snapshot and POST a /v2/envelope carrying a capsule
+    // whose head has been mutated to look stale; the request throws inside
+    // validateExecutionCapsule before the envelope body is ever decoded, so the
+    // envelope string is a placeholder.
+    async function postEnvelopeWithCapsule(
+      state: WaitUntilState,
+      target: CommitScopeDO,
+      scope: ObjRef,
+      mutateHead: (head: ShadowScopeHead) => ShadowScopeHead
+    ): Promise<{ status: number; code?: string; message?: string }> {
+      const world = createWorld();
+      const session = world.auth("guest:commit-scope-capsule-head");
+      const seed = world.exportHostScopedWorld(scope);
+      const authority = executorAuthorityPayload(world, [scope, session.actor]);
+      // Snapshot at epoch 1 (the head() helper's epoch); the loaded relay head is
+      // the authority for the capsule check.
+      seedScopeRows(state, scope, head(scope, 0), { objects: seed.objects, sessions: authority.sessions });
+      const capsule = buildExecutionCapsule({
+        scope,
+        head: mutateHead(head(scope, 0)),
+        actor: session.actor,
+        session: session.id,
+        target: scope,
+        verb: "noop"
+      });
+      const request = await signInternalRequest({ WOO_INTERNAL_SECRET: SECRET }, new Request("https://woo.internal/v2/envelope", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          scope,
+          node: "node:commit-scope-capsule-head",
+          token: "guest:commit-scope-capsule-head",
+          session: session.id,
+          actor: session.actor,
+          sessions: authority.sessions,
+          authority,
+          execution_capsule: capsule,
+          envelope: "" // never decoded; the capsule check throws first
+        })
+      }));
+      const response = await target.fetch(request);
+      await state.drainWaitUntil();
+      const payload = (await response.json()) as { error?: { code?: string; message?: string } };
+      return { status: response.status, code: payload.error?.code, message: payload.error?.message };
+    }
+
+    it("epoch behind the rebuilt head replies E_SNAPSHOT_REQUIRED (not E_PROTOCOL)", async () => {
+      const state = new WaitUntilState("the_chatroom");
+      const target = new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: SECRET });
+      try {
+        // epoch 0 < the loaded snapshot's epoch (1): the canonical "scope was
+        // rebuilt under a new epoch, capsule is from before" case.
+        const result = await postEnvelopeWithCapsule(state, target, "the_chatroom", (h) => ({ ...h, epoch: 0 }));
+        expect(result.code).toBe("E_SNAPSHOT_REQUIRED");
+        expect(result.message).toMatch(/reseed required/);
+      } finally {
+        state.close();
+      }
+    });
+
+    it("head.scope belonging to a stale cross-scope view replies E_SNAPSHOT_REQUIRED (not E_PROTOCOL)", async () => {
+      const state = new WaitUntilState("the_chatroom");
+      const target = new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: SECRET });
+      try {
+        // capsule.scope still matches input.scope (passes the scope check), but
+        // its HEAD belongs to a different scope — the divergent-session-state
+        // race where the gateway client carried a stale relay head.
+        const result = await postEnvelopeWithCapsule(state, target, "the_chatroom", (h) => ({ ...h, scope: "the_deck" as ObjRef }));
+        expect(result.code).toBe("E_SNAPSHOT_REQUIRED");
+        expect(result.message).toMatch(/reseed required/);
+      } finally {
+        state.close();
+      }
+    });
+
+    it("a genuinely mis-routed capsule (capsule.scope != request scope) stays terminal E_PROTOCOL", async () => {
+      // Guard against over-broadening: a capsule whose OWN scope does not match
+      // the request is a real wiring bug, not staleness — it must not be retried.
+      const state = new WaitUntilState("the_chatroom");
+      const target = new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: SECRET });
+      try {
+        const world = createWorld();
+        const session = world.auth("guest:commit-scope-capsule-misroute");
+        const seed = world.exportHostScopedWorld("the_chatroom");
+        const authority = executorAuthorityPayload(world, ["the_chatroom", session.actor]);
+        seedScopeRows(state, "the_chatroom", head("the_chatroom", 0), { objects: seed.objects, sessions: authority.sessions });
+        const capsule = buildExecutionCapsule({
+          scope: "the_deck" as ObjRef, // capsule built for a different scope entirely
+          head: head("the_deck", 0),
+          actor: session.actor,
+          session: session.id,
+          target: "the_deck" as ObjRef,
+          verb: "noop"
+        });
+        const request = await signInternalRequest({ WOO_INTERNAL_SECRET: SECRET }, new Request("https://woo.internal/v2/envelope", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            scope: "the_chatroom",
+            node: "node:commit-scope-capsule-misroute",
+            token: "guest:commit-scope-capsule-misroute",
+            session: session.id,
+            actor: session.actor,
+            sessions: authority.sessions,
+            authority,
+            execution_capsule: capsule,
+            envelope: ""
+          })
+        }));
+        const response = await target.fetch(request);
+        await state.drainWaitUntil();
+        const payload = (await response.json()) as { error?: { code?: string; message?: string } };
+        expect(payload.error?.code).toBe("E_PROTOCOL");
+        expect(payload.error?.message).toMatch(/scope mismatch/);
+      } finally {
+        state.close();
+      }
+    });
   });
 
   it("pages checkpoints by byte budget and resumes the pinned export with a continuation", async () => {
