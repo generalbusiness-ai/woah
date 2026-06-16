@@ -1414,7 +1414,8 @@ runs the VM:
 - the selected verb's definer row, bytecode, inherited lineage, and class-chain
   rows are present with provenance, and any catalog-declared
   `arg_spec.authority.prefetch` roots have been resolved through generic
-  roots/path/fallback metadata rather than hardcoded object names;
+  roots/path/fallback metadata, including argument-derived path segments such as
+  `{ "arg": 0 }`, rather than hardcoded object names;
 - the transcript validation read set implied by the warm planning pass is backed
   by local cell versions that will be submitted to the selected commit scope, and
   planned-transcript commits carry the bounded actor/session/transcript authority

@@ -342,6 +342,7 @@ export type MetricEvent =
   | { kind: "authority_tail"; scope: ObjRef; ms: number; tail_rows_written: number; tail_rows_pruned: number; tail_bytes_retained: number; accepted_frames_retained: number; transcript_tail_retained: number }
   | { kind: "gateway_projection_apply"; scope: ObjRef; rows: number; projection_bytes: number; source: "rest" | "mcp" | "fanout" }
   | { kind: "gateway_projection_cache_write"; scope: ObjRef; rows: number; bytes: number; projection_bytes: number; gateway_projection_rows_written: number; gateway_projection_bytes: number; source: "rest" | "mcp" | "fanout" }
+  | { kind: "gateway_projection_cache_epoch"; status: "initialized" | "current" | "reset"; epoch: string; old_epoch?: string; rows_deleted?: number }
   | { kind: "gateway_tool_surface_source_rows"; scope: ObjRef; object: ObjRef; rows: number; scope_rows: number; shard_rows: number; cap: number; shard_cap: number; saturated: boolean; saturation_reason?: "scope" | "shard" | "scope_and_shard" }
   | { kind: "same_host_fallback"; route: "/__internal/enumerate-tools"; host: string; rows: number; reason: "owner_timeout" | "cache_hit" }
   | { kind: "v2_ws_reject"; scope?: ObjRef; node?: string; ms: number; status: "error"; error: string; error_detail?: string }
@@ -521,6 +522,13 @@ export type MetricEvent =
   // so sparse-planning retries can be reduced without guessing from aggregate
   // `E_NEED_STATE` counts.
   | { kind: "turn_repair_attempt"; scope: ObjRef; commit_scope: ObjRef | null; target: ObjRef; verb: string; route: string; attempt: number; source: "planning_throw" | "planning_frame" | "commit_reply"; reason: "missing_state" | "lookup_error" | "commit_rejected"; objects: ObjRef[]; atoms?: string[]; commit_reason?: string }
+  // Terminal sparse-planning / commit-retry failure. `turn_repair_attempt`
+  // records every retry that widened authority; this summary fires once when
+  // the retry/budget loop gives up so deployed tails can classify the stale
+  // materialization that kept returning. The thrown ErrorValue carries the
+  // same sanitized fields, so MCP/browser callers see an actionable retryable
+  // state-path failure instead of only `E_REPAIR_BUDGET <scope>`.
+  | { kind: "state_path_divergence"; code: "E_REPAIR_BUDGET"; cause: "missing_live_session" | "missing_owner_state" | "missing_lineage_or_instance" | "stale_commit_state" | "lookup_missing_object" | "unknown"; scope: ObjRef; commit_scope: ObjRef | null; target: ObjRef; verb: string; route: string; attempts: number; elapsed_ms: number; repair_source?: "planning_throw" | "planning_frame" | "commit_reply"; repair_reason?: "missing_state" | "lookup_error" | "commit_rejected"; missing_objects: ObjRef[]; missing_object_count: number; missing_atoms?: string[]; missing_atom_count?: number; commit_reason?: string }
   // MCP-only relocation prewarm timing. A gateway may start the likely actor
   // commit-scope head/session open before local planning proves a B6 relocation;
   // this metric confirms the overlap happened and whether it failed harmlessly.

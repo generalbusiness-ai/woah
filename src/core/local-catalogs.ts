@@ -182,6 +182,10 @@ export function localCatalogMigrationIndexFingerprint(): string {
   return hashSource(JSON.stringify(LOCAL_CATALOG_MIGRATION_INDEX.map((entry) => entry.id)));
 }
 
+export function localCatalogRepairFingerprint(repairEpoch: string, names: readonly string[] = DEFAULT_LOCAL_CATALOGS): string {
+  return `${localCatalogBundleFingerprint(names)}:${localCatalogMigrationIndexFingerprint()}:${repairEpoch}`;
+}
+
 const LOCAL_CATALOG_MIGRATION_INDEX: Array<{ id: string; only?: string }> = [
   { id: LOCAL_CATALOG_SOURCE_MIGRATION },
   { id: LOCAL_CATALOG_PLACEMENT_MIGRATION },

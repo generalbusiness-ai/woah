@@ -98,6 +98,11 @@ class FakeIDBObjectStore {
     return successfulRequest(undefined);
   }
 
+  clear(): FakeRequest<undefined> {
+    this.store.rows.clear();
+    return successfulRequest(undefined);
+  }
+
   count(): FakeRequest<number> {
     return successfulRequest(this.store.rows.size);
   }

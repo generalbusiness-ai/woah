@@ -429,7 +429,8 @@
             "args": [
               "exit"
             ],
-            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["argstr"], "persistence": "durable" }
+            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["argstr"], "persistence": "durable" },
+            "authority": { "prefetch": ["scope", "target", { "path": ["target", "exits", { "arg": 0 }, "dest"] }] }
           },
           "source": "verb :go(exit) rxd { set_task_perms(caller_perms()); let exit_obj = this:match_exit(exit); if (exit_obj == $failed_match) { let msg = \"You can't go that way (\" + exit + \").\"; tell(actor, msg); return msg; } return exit_obj:invoke(); }"
         },

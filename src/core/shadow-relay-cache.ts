@@ -56,6 +56,7 @@ export type ShadowRelayCache = {
   kind: "woo.browser_relay.shadow.v1";
   node: string;
   deployment: string;
+  cache_epoch?: string;
   commit_scope: ShadowCommitScope;
   commit_scopes: Map<ObjRef, ShadowCommitScope>;
   executors: ShadowExecutionNode[];

@@ -42,7 +42,7 @@ import {
 } from "../core/authority-slice";
 import { shadowObjectLineagePage, shadowObjectLivePage, shadowPropertyCellPages, stampAuthorityPageRef, type AuthorityPageProvenance, type ShadowStatePage } from "../core/shadow-state-pages";
 import type { EffectTranscript } from "../core/effect-transcript";
-import { installLocalCatalogs, localCatalogBundleFingerprint, parseAutoInstallCatalogs, runHostScopedLocalCatalogLifecycle } from "../core/local-catalogs";
+import { installLocalCatalogs, localCatalogBundleFingerprint, localCatalogRepairFingerprint, parseAutoInstallCatalogs, runHostScopedLocalCatalogLifecycle } from "../core/local-catalogs";
 import {
   handleRestProtocolRequest,
   restFrameFromTurnReply,
@@ -521,6 +521,17 @@ const LOCAL_CATALOG_BUNDLE_FINGERPRINT_META_KEY = "local_catalog_bundle_fingerpr
 export const LOCAL_CATALOG_BUNDLE_REPAIR_EPOCH = "resident-catalog-repair-v3";
 const RESIDENT_DERIVED_CONTENTS_REPAIR_META_KEY = "resident_derived_contents_repair_epoch";
 const RESIDENT_DERIVED_CONTENTS_REPAIR_EPOCH = "2026-06-06-owner-contents-repair";
+const GATEWAY_PROJECTION_CACHE_EPOCH_META_ID = "current";
+const GATEWAY_PROJECTION_CACHE_TABLES = [
+  "gateway_projection_scope",
+  "gateway_projection_object",
+  "gateway_scope_member",
+  "gateway_projection_session",
+  "gateway_tool_surface",
+  "gateway_session_tool_manifest",
+  "gateway_tool_surface_source",
+  "gateway_tool_surface_scope"
+] as const;
 // SHA-256 of the (id|host|anchor) triples this DO last successfully
 // published to the Directory, sorted by id. On gateway cold-restart we
 // recompute the digest from the current route set and skip the
@@ -587,6 +598,7 @@ export class PersistentObjectDO {
   // back-to-back roster verbs can add synchronous singleton pressure during
   // the post-deploy cold-load window.
   private directoryScopeSessionsCache = new Map<string, DirectoryScopeSessionsCacheEntry>();
+  private directoryScopeSessionsCacheGeneration = 0;
   // Established MCP ingress must refresh stale presence before a long-polling
   // handler waits, but not on every turn. This records successful recent local
   // touches for this hot DO lifetime; Directory remains the durable authority.
@@ -733,6 +745,12 @@ export class PersistentObjectDO {
       saturated_reason TEXT,
       updated_at_ms INTEGER NOT NULL
     )`);
+    sql.exec(`CREATE TABLE IF NOT EXISTS gateway_projection_cache_meta (
+      id TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at_ms INTEGER NOT NULL
+    )`);
+    this.ensureGatewayProjectionCacheEpoch(sql);
     // D1 tail-driven delivery outbox (WOO_V2_TAIL_DELIVERY).
     // Rows are written before reply; the drain delivers and marks them done.
     // On activation, any undrained rows (delivered=0) trigger a drain via
@@ -752,6 +770,53 @@ export class PersistentObjectDO {
     )`);
     sql.exec(`CREATE INDEX IF NOT EXISTS v2_fanout_pending_undrained
       ON v2_fanout_pending(destination, seq) WHERE delivered = 0`);
+  }
+
+  private currentGatewayProjectionCacheEpoch(): string {
+    return this.currentLocalCatalogBundleFingerprint();
+  }
+
+  private ensureGatewayProjectionCacheEpoch(sql: DurableObjectStorage["sql"]): void {
+    const epoch = this.currentGatewayProjectionCacheEpoch();
+    const row = firstSqlRow<{ value: string }>(sql.exec(
+      "SELECT value FROM gateway_projection_cache_meta WHERE id = ? LIMIT 1",
+      GATEWAY_PROJECTION_CACHE_EPOCH_META_ID
+    ));
+    if (!row) {
+      sql.exec(
+        "INSERT INTO gateway_projection_cache_meta(id, value, updated_at_ms) VALUES (?, ?, ?)",
+        GATEWAY_PROJECTION_CACHE_EPOCH_META_ID,
+        epoch,
+        Date.now()
+      );
+      this.emitMetric({ kind: "gateway_projection_cache_epoch", status: "initialized", epoch }, this.durableHostKey());
+      return;
+    }
+    if (row.value === epoch) {
+      this.emitMetric({ kind: "gateway_projection_cache_epoch", status: "current", epoch }, this.durableHostKey());
+      return;
+    }
+    let rowsDeleted = 0;
+    this.state.storage.transactionSync(() => {
+      for (const table of GATEWAY_PROJECTION_CACHE_TABLES) {
+        const before = firstSqlRow<{ n: number }>(sql.exec(`SELECT COUNT(*) AS n FROM ${table}`));
+        rowsDeleted += Number(before?.n ?? 0);
+        sql.exec(`DELETE FROM ${table}`);
+      }
+      sql.exec(
+        "INSERT OR REPLACE INTO gateway_projection_cache_meta(id, value, updated_at_ms) VALUES (?, ?, ?)",
+        GATEWAY_PROJECTION_CACHE_EPOCH_META_ID,
+        epoch,
+        Date.now()
+      );
+    });
+    this.emitMetric({
+      kind: "gateway_projection_cache_epoch",
+      status: "reset",
+      old_epoch: row.value,
+      epoch,
+      rows_deleted: rowsDeleted
+    }, this.durableHostKey());
   }
 
   private toolSurfaceSourceIndexMaxScopeRows(): number {
@@ -846,6 +911,7 @@ export class PersistentObjectDO {
     let bytes = 0;
     const authorityScope = position.scope;
     const fullObjectWrites = new Set<ObjRef>();
+    let sessionProjectionTouched = false;
     // Accepted-fanout application is idempotent by scope head. A duplicate
     // envelope replay or a redelivered fanout frame carries a position already
     // reflected in the cache; re-applying it would burn durable writes for no
@@ -903,6 +969,7 @@ export class PersistentObjectDO {
             rows += 1;
             break;
           case "sessions":
+            sessionProjectionTouched = true;
             if (write.op === "delete") {
               sql.exec("DELETE FROM gateway_projection_session WHERE session_id = ?", write.key);
             } else {
@@ -959,6 +1026,7 @@ export class PersistentObjectDO {
         rows += this.applyGatewayProjectionTranscriptDerivedRows(transcript, fullObjectWrites, position, now);
       }
     });
+    if (sessionProjectionTouched) this.invalidateDirectoryScopeSessionsCache();
     this.emitMetric({
       kind: "gateway_projection_cache_write",
       scope: authorityScope,
@@ -2031,7 +2099,7 @@ export class PersistentObjectDO {
   }
 
   private currentLocalCatalogBundleFingerprint(): string {
-    return `${localCatalogBundleFingerprint(parseAutoInstallCatalogs(this.env.WOO_AUTO_INSTALL_CATALOGS))}:${LOCAL_CATALOG_BUNDLE_REPAIR_EPOCH}`;
+    return localCatalogRepairFingerprint(LOCAL_CATALOG_BUNDLE_REPAIR_EPOCH, parseAutoInstallCatalogs(this.env.WOO_AUTO_INSTALL_CATALOGS));
   }
 
   private async ensureLoadedWorldCatalogBundle(world: WooWorld, hostKey: string): Promise<void> {
@@ -2323,6 +2391,7 @@ export class PersistentObjectDO {
     if (cached?.value && cached.expiresAt > now) return cloneDirectorySerializedSessions(cached.value);
 
     const startedAt = Date.now();
+    const cacheGeneration = this.directoryScopeSessionsCacheGeneration;
     let failed = false;
     const promise = this.fetchDirectorySessionsForScopes(requested).catch((err) => {
       failed = true;
@@ -2341,10 +2410,12 @@ export class PersistentObjectDO {
     this.directoryScopeSessionsCache.set(cacheKey, { expiresAt: now + DIRECTORY_SCOPE_SESSIONS_TTL_MS, promise });
     this.trimDirectoryScopeSessionsCache();
     const sessions = await promise;
-    this.directoryScopeSessionsCache.set(cacheKey, {
-      expiresAt: Date.now() + DIRECTORY_SCOPE_SESSIONS_TTL_MS,
-      value: cloneDirectorySerializedSessions(sessions)
-    });
+    if (this.directoryScopeSessionsCacheGeneration === cacheGeneration) {
+      this.directoryScopeSessionsCache.set(cacheKey, {
+        expiresAt: Date.now() + DIRECTORY_SCOPE_SESSIONS_TTL_MS,
+        value: cloneDirectorySerializedSessions(sessions)
+      });
+    }
     this.trimDirectoryScopeSessionsCache();
     if (!failed) {
       this.world?.recordMetric({
@@ -2357,6 +2428,11 @@ export class PersistentObjectDO {
       });
     }
     return cloneDirectorySerializedSessions(sessions);
+  }
+
+  private invalidateDirectoryScopeSessionsCache(): void {
+    if (this.directoryScopeSessionsCache.size > 0) this.directoryScopeSessionsCache.clear();
+    this.directoryScopeSessionsCacheGeneration += 1;
   }
 
   private async fetchDirectorySessionsForScopes(requested: readonly ObjRef[]): Promise<DirectorySerializedSession[]> {
@@ -4500,6 +4576,7 @@ export class PersistentObjectDO {
       }));
       const response = await this.env.DIRECTORY.get(id).fetch(request);
       const sessionRegistered = response.ok;
+      if (sessionRegistered) this.invalidateDirectoryScopeSessionsCache();
       if (sessionRegistered && options.touchPresence !== false && options.rememberMcpPresenceTouch === true) {
         this.rememberMcpPresenceIngressTouch(session.id, Date.now());
       }
@@ -4671,6 +4748,7 @@ export class PersistentObjectDO {
 
   private async unregisterSessionRoute(sessionId: string): Promise<void> {
     this.mcpPresenceIngressTouchedAt.delete(sessionId);
+    this.invalidateDirectoryScopeSessionsCache();
     try {
       const id = this.env.DIRECTORY.idFromName(DIRECTORY_HOST);
       const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/unregister-session`, {
@@ -5258,6 +5336,7 @@ export class PersistentObjectDO {
           node: `${this.durableHostKey()}:rest-relay:${scope}`,
           scope,
           serialized: seeded.serialized,
+          cache_epoch: this.currentLocalCatalogBundleFingerprint(),
           // Authority-derived seed: carry the slice's real per-cell provenance so a
           // first-open turn that plans before mergeRestPlanningAuthority still sees
           // tagged cells (not flattened to cache).
@@ -7605,7 +7684,7 @@ function hostSeedKvNamespace(env: Env): string {
   const key = `${env.WOO_AUTO_INSTALL_CATALOGS ?? "<default>"}:${LOCAL_CATALOG_BUNDLE_REPAIR_EPOCH}`;
   const cached = hostSeedKvNamespaces.get(key);
   if (cached) return cached;
-  const namespace = `${localCatalogBundleFingerprint(parseAutoInstallCatalogs(env.WOO_AUTO_INSTALL_CATALOGS))}:${LOCAL_CATALOG_BUNDLE_REPAIR_EPOCH}`;
+  const namespace = localCatalogRepairFingerprint(LOCAL_CATALOG_BUNDLE_REPAIR_EPOCH, parseAutoInstallCatalogs(env.WOO_AUTO_INSTALL_CATALOGS));
   hostSeedKvNamespaces.set(key, namespace);
   return namespace;
 }

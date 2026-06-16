@@ -482,6 +482,12 @@ type ExecutorRepairMetricInput = {
   commitReason?: string;
 };
 
+type StatePathDivergenceCause = Extract<MetricEvent, { kind: "state_path_divergence" }>["cause"];
+
+type ExecutorDivergenceDetail = ExecutorRepairMetricInput & {
+  cause: StatePathDivergenceCause;
+};
+
 function isRepairableLocalPlanningLookupError(err: unknown): boolean {
   const coded = err as { code?: unknown; message?: unknown } | null;
   if (coded?.code === "E_VERBNF") return true;
@@ -775,6 +781,68 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       ...(input.commitReason ? { commit_reason: input.commitReason } : {})
     });
   };
+  const sanitizedRepairObjectIds = (objects: readonly ObjRef[]): ObjRef[] =>
+    mergeExecutorObjectIds(Array.from(objects))
+      .filter((id) => !id.startsWith("session-") && !id.startsWith("mcp:session") && !id.includes(":session-"))
+      .slice(0, 64);
+  const classifyDivergenceCause = (input: ExecutorRepairMetricInput): StatePathDivergenceCause => {
+    const atoms = input.atoms ?? [];
+    if (input.reason === "commit_rejected") return "stale_commit_state";
+    if (atoms.some((atom) => atom.includes("session"))) return "missing_live_session";
+    if (input.reason === "lookup_error") return "lookup_missing_object";
+    if (atoms.some((atom) => atom.includes(":parent") || atom.includes(":verb:"))) return "missing_lineage_or_instance";
+    if (input.reason === "missing_state") return "missing_owner_state";
+    return "unknown";
+  };
+  const repairBudgetErrorValue = (message: string, detail: ExecutorDivergenceDetail): WooValue => {
+    const objects = sanitizedRepairObjectIds(detail.objects);
+    const objectCount = mergeExecutorObjectIds(detail.objects).length;
+    const atoms = (detail.atoms ?? []).slice(0, 64);
+    return {
+      scope: options.input.scope,
+      commit_scope: detail.commitScope ?? phaseCommitScope,
+      target: options.input.target,
+      verb: options.input.verb,
+      route: options.input.route,
+      cause: detail.cause,
+      repair_source: detail.source,
+      repair_reason: detail.reason,
+      attempts: detail.attempt,
+      missing_objects: objects,
+      missing_object_count: objectCount,
+      ...(atoms.length > 0 ? { missing_atoms: atoms, missing_atom_count: detail.atoms?.length ?? atoms.length } : {}),
+      ...(detail.commitReason ? { commit_reason: detail.commitReason } : {}),
+      message
+    };
+  };
+  const emitTerminalDivergence = (detail: ExecutorDivergenceDetail): void => {
+    const objects = sanitizedRepairObjectIds(detail.objects);
+    const objectCount = mergeExecutorObjectIds(detail.objects).length;
+    const atoms = (detail.atoms ?? []).slice(0, 64);
+    options.onMetric?.({
+      kind: "state_path_divergence",
+      code: "E_REPAIR_BUDGET",
+      cause: detail.cause,
+      scope: options.input.scope,
+      commit_scope: detail.commitScope ?? phaseCommitScope,
+      target: options.input.target,
+      verb: options.input.verb,
+      route: options.input.route,
+      attempts: phaseAttempts,
+      elapsed_ms: Date.now() - turnStartedAt,
+      repair_source: detail.source,
+      repair_reason: detail.reason,
+      missing_objects: objects,
+      missing_object_count: objectCount,
+      ...(atoms.length > 0 ? { missing_atoms: atoms, missing_atom_count: detail.atoms?.length ?? atoms.length } : {}),
+      ...(detail.commitReason ? { commit_reason: detail.commitReason } : {})
+    });
+  };
+  const rememberRetryableDivergence = (message: string, input: ExecutorRepairMetricInput): void => {
+    const detail: ExecutorDivergenceDetail = { ...input, cause: classifyDivergenceCause(input) };
+    lastRetryableDivergence = detail;
+    lastRetryableError = wooError("E_REPAIR_BUDGET", message, repairBudgetErrorValue(message, detail));
+  };
   const basePlanningAuthorityObjectIds = (planningScope: ObjRef): ObjRef[] =>
     options.authorityObjectIds?.(options.input, planningScope)
       ?? executorAuthorityObjectIds(options.input, planningScope);
@@ -804,6 +872,7 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
   // because `throw` accepts any value — we store an ErrorValue (plain object from
   // wooError) which the gateway's normalizeError will decode correctly.
   let lastRetryableError: unknown = null;
+  let lastRetryableDivergence: ExecutorDivergenceDetail | null = null;
   // Helper: check budget BEFORE starting a new attempt. Must be called whenever
   // `attempt > 0` (i.e., a repair retry is about to start), so a slow previous
   // attempt's elapsed time is counted before the next one starts.
@@ -818,6 +887,7 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     // cascade of cold-owner 5s authority-slice timeouts from consuming the
     // entire MCP request window (20s deadline).
     if (budgetExhausted(attempt)) {
+      if (lastRetryableDivergence) emitTerminalDivergence(lastRetryableDivergence);
       // eslint-disable-next-line @typescript-eslint/only-throw-error
       throw lastRetryableError ?? new Error("v2 turn repair budget exhausted");
     }
@@ -886,7 +956,14 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
         repairObjectIds = nextRepairObjectIds;
         // B-ii: record retryable error so the budget check can surface it
         // instead of the generic "retry loop exhausted" message.
-        lastRetryableError = wooError("E_REPAIR_BUDGET", "turn repair budget exhausted on planning miss", options.input.scope);
+        rememberRetryableDivergence("turn repair budget exhausted on planning miss", {
+          source: "planning_throw",
+          reason: missingObjectIds.length > 0 ? "missing_state" : "lookup_error",
+          attempt: attempt + 1,
+          commitScope: null,
+          objects: repairIds,
+          atoms: missingAtoms
+        });
         if (!options.prePlanAuthority) await refreshPlanningAuthority(planningScope, planningClient, true, attempt + 1);
         continue;
       }
@@ -918,7 +995,14 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
         });
         repairObjectIds = nextRepairObjectIds;
         // B-ii: record retryable error so the budget check can surface it.
-        lastRetryableError = wooError("E_REPAIR_BUDGET", "turn repair budget exhausted on planning frame miss", options.input.scope);
+        rememberRetryableDivergence("turn repair budget exhausted on planning frame miss", {
+          source: "planning_frame",
+          reason: missingObjectIds.length > 0 ? "missing_state" : "lookup_error",
+          attempt: attempt + 1,
+          commitScope: null,
+          objects: repairIds,
+          atoms: missingAtoms
+        });
         if (!options.prePlanAuthority) await refreshPlanningAuthority(planningScope, planningClient, true, attempt + 1);
         continue;
       }
@@ -1058,11 +1142,15 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       );
       // B-ii: record retryable error so the budget check can surface it cleanly
       // instead of the generic "retry loop exhausted" message on budget expiry.
-      lastRetryableError = wooError(
-        "E_REPAIR_BUDGET",
-        "turn repair budget exhausted on commit reply",
-        options.input.scope
-      );
+      rememberRetryableDivergence("turn repair budget exhausted on commit reply", {
+        source: "commit_reply",
+        reason: body.ok === false && body.reason === "missing_state" ? "missing_state" : "commit_rejected",
+        attempt: attempt + 1,
+        commitScope,
+        objects: retryObjectIds,
+        atoms: executorAtomPreimagesFromMissingState(body),
+        commitReason: body.ok === false && body.reason === "commit_rejected" ? body.commit?.reason : undefined
+      });
       continue;
     }
     phaseOutcome = "submitted";
@@ -1082,6 +1170,7 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
   // top of the loop or naturally when maxAttempts is reached. Surface the last
   // retryable error if available (preferred: it names the reason); fall back to
   // the generic exhausted message so the code path always throws something.
+  if (lastRetryableDivergence) emitTerminalDivergence(lastRetryableDivergence);
   // eslint-disable-next-line @typescript-eslint/only-throw-error
   throw lastRetryableError ?? new Error("v2 turn gateway retry loop exhausted");
   } finally {

@@ -98,6 +98,105 @@ describe("gateway projection cache", () => {
     }
   });
 
+  it("clears derived gateway projection rows when the cache epoch changes", () => {
+    const state = new FakeDurableObjectState("mcp-gateway-0");
+    try {
+      const first = new PersistentObjectDO(state as unknown as DurableObjectState, env()) as unknown as {
+        applyGatewayProjectionWrites: (head: ShadowScopeHead, writes: ProjectionWrite[], source: "fanout", delta?: ProjectionDeltaSummary) => { rows: number; bytes: number };
+      };
+      first.applyGatewayProjectionWrites({
+        kind: "woo.scope_head.shadow.v1",
+        scope: "the_chatroom",
+        epoch: 1,
+        seq: 1,
+        hash: "h1"
+      }, [{
+        table: "objects",
+        key: "the_chatroom",
+        op: "upsert",
+        row: createWorld().exportObjects(["the_chatroom"])[0]!,
+        bytes: 123
+      }], "fanout");
+      expect(rows(state, "SELECT id FROM gateway_projection_object")).toHaveLength(1);
+
+      state.storage.sql.exec(
+        "UPDATE gateway_projection_cache_meta SET value = ? WHERE id = ?",
+        "old-cache-epoch",
+        "current"
+      );
+      new PersistentObjectDO(state as unknown as DurableObjectState, env());
+
+      expect(rows(state, "SELECT id FROM gateway_projection_object")).toEqual([]);
+      expect(rows(state, "SELECT scope FROM gateway_projection_scope")).toEqual([]);
+      const meta = rows<{ value: string }>(state, "SELECT value FROM gateway_projection_cache_meta WHERE id = ?", "current")[0];
+      expect(meta?.value).toBeTruthy();
+      expect(meta?.value).not.toBe("old-cache-epoch");
+    } finally {
+      state.close();
+    }
+  });
+
+  it("invalidates cached Directory session lookups when projected session rows move", async () => {
+    const state = new FakeDurableObjectState("mcp-gateway-0");
+    const deckSession: SerializedSession = {
+      id: "bob-session",
+      actor: "guest_bob",
+      started: 1,
+      expiresAt: Date.now() + 60_000,
+      tokenClass: "guest",
+      activeScope: "the_deck",
+      currentLocation: "the_deck"
+    };
+    let directorySessions: SerializedSession[] = [deckSession];
+    const po = new PersistentObjectDO(state as unknown as DurableObjectState, env({
+      DIRECTORY: new FakeDurableObjectNamespace(() => ({
+        fetch: async (request: Request): Promise<Response> => {
+          if (new URL(request.url).pathname !== "/sessions-for-scopes") {
+            return Response.json({ error: { code: "E_OBJNF" } }, { status: 404 });
+          }
+          return Response.json({ sessions: directorySessions, next_after_session_id: null });
+        }
+      })) as unknown as DurableObjectNamespace
+    })) as unknown as {
+      loadDirectorySessionsForScopes: (scopes: ObjRef[], path: "mcp_fanout_audience") => Promise<SerializedSession[]>;
+      applyGatewayProjectionWrites: (
+        head: ShadowScopeHead,
+        writes: ProjectionWrite[],
+        source: "fanout",
+        delta?: ProjectionDeltaSummary
+      ) => { rows: number; bytes: number };
+    };
+    try {
+      const first = await po.loadDirectorySessionsForScopes(["the_chatroom", "the_deck"], "mcp_fanout_audience");
+      expect(first.map((session) => session.activeScope)).toEqual(["the_deck"]);
+
+      const chatSession: SerializedSession = {
+        ...deckSession,
+        activeScope: "the_chatroom",
+        currentLocation: "the_chatroom"
+      };
+      directorySessions = [chatSession];
+      po.applyGatewayProjectionWrites({
+        kind: "woo.scope_head.shadow.v1",
+        scope: "guest_bob",
+        epoch: 1,
+        seq: 2,
+        hash: "h2"
+      }, [{
+        table: "sessions",
+        key: "bob-session",
+        op: "upsert",
+        row: chatSession,
+        bytes: 128
+      }], "fanout", { projection_bytes: 128 });
+
+      const second = await po.loadDirectorySessionsForScopes(["the_chatroom", "the_deck"], "mcp_fanout_audience");
+      expect(second.map((session) => session.activeScope)).toEqual(["the_chatroom"]);
+    } finally {
+      state.close();
+    }
+  });
+
   it("requires an explicit host list for admin derived-contents repair and forwards only those hosts", async () => {
     const state = new FakeDurableObjectState("world");
     const forwarded: Record<string, unknown> = {};

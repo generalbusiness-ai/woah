@@ -2,7 +2,7 @@ import { authoritativePlanningWorld } from "../../src/core/planning-world";
 import { describe, expect, it, vi } from "vitest";
 import { installVerb } from "../../src/core/authoring";
 import { createWorld } from "../../src/core/bootstrap";
-import { localCatalogBundleFingerprint, parseAutoInstallCatalogs } from "../../src/core/local-catalogs";
+import { localCatalogBundleFingerprint, localCatalogRepairFingerprint, parseAutoInstallCatalogs } from "../../src/core/local-catalogs";
 import { decodeEnvelope, encodeEnvelope } from "../../src/core/shadow-envelope";
 import {
   createShadowBrowserNode,
@@ -171,7 +171,7 @@ function createHostSeedKvHarness() {
     HOST_SEED_KV: kv as unknown as KVNamespace
   } as unknown as Env;
 
-  const kvNamespace = (): string => `${localCatalogBundleFingerprint(parseAutoInstallCatalogs(env.WOO_AUTO_INSTALL_CATALOGS))}:${LOCAL_CATALOG_BUNDLE_REPAIR_EPOCH}`;
+  const kvNamespace = (): string => localCatalogRepairFingerprint(LOCAL_CATALOG_BUNDLE_REPAIR_EPOCH, parseAutoInstallCatalogs(env.WOO_AUTO_INSTALL_CATALOGS));
   const hostSeedPointerKey = (host: string): string => `seed-current:${kvNamespace()}:${host}`;
   const hostSeedBytesKey = (host: string, digest: string): string => `seed:${kvNamespace()}:${host}:${digest}`;
 

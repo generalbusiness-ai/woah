@@ -717,10 +717,11 @@ read against the owner.
    proves the destination. Deterministic prefetch is declared by catalog verb
    metadata, not by transport-layer knowledge of command words or catalog
    property conventions: the runtime may interpret generic `authority.prefetch`
-   references such as the current scope, target, actor, property paths, and
-   fallback lists, but the property names and destination rules come from the
-   verb declaration. The optimization is for cold topology reads; the moment of
-   occupancy correctly pays one owner fetch.
+   references such as the current scope, target, actor, property paths,
+   argument-derived path segments such as `{ "arg": 0 }`, and fallback lists,
+   but the property names and destination rules come from the verb declaration.
+   The optimization is for cold topology reads; the moment of occupancy
+   correctly pays one owner fetch.
 
 ## CA12. Representation alignment
 

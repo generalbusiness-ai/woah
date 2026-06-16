@@ -10,7 +10,7 @@ import type { EffectTranscript } from "../core/effect-transcript";
 import type { ShadowCapabilityAd } from "../core/capability-ad";
 import { cellProvenanceFromAuthoritySlice, pruneSerializedSessionsWithoutActorRows, serializedWorldFromAuthoritySlice } from "../core/authority-slice";
 import { createWorldFromSerialized } from "../core/bootstrap";
-import { localCatalogBundleFingerprint, localCatalogMigrationIndexFingerprint, parseAutoInstallCatalogs, runHostScopedLocalCatalogLifecycle } from "../core/local-catalogs";
+import { localCatalogRepairFingerprint, parseAutoInstallCatalogs, runHostScopedLocalCatalogLifecycle } from "../core/local-catalogs";
 import type { SerializedAuthoritySlice, SerializedObject, SerializedSession, SerializedWorld } from "../core/repository";
 import {
   applyShadowBrowserTransfer,
@@ -702,7 +702,8 @@ export class CommitScopeDO {
     const relay = createShadowBrowserRelayShim({
       node: `node:commit-scope:${input.scope}`,
       scope: input.scope,
-      serialized
+      serialized,
+      cache_epoch: this.currentSnapshotRepairFingerprint()
     });
     // A3.2 provenance retrofit: the relay is seeded directly from the serialized
     // world (bypassing the provenance-recording merge), so capture per-cell
@@ -1611,6 +1612,7 @@ export class CommitScopeDO {
       node: meta.relay_node,
       scope: meta.scope as ObjRef,
       serialized,
+      cache_epoch: this.currentSnapshotRepairFingerprint(),
       idempotency_window_ms: Number(meta.idempotency_window_ms)
     });
     relay.commit_scope.head = JSON.parse(meta.head) as ShadowScopeHead;
@@ -1775,7 +1777,7 @@ export class CommitScopeDO {
     // 2026-06-11 deployed E_REPAIR_BUDGET loops (scope lacked
     // exit_living_room_outline that the world had). The manual epoch const
     // remains as a last-resort override only.
-    return `${localCatalogBundleFingerprint(parseAutoInstallCatalogs(this.env.WOO_AUTO_INSTALL_CATALOGS))}:${localCatalogMigrationIndexFingerprint()}:${COMMIT_SCOPE_SNAPSHOT_REPAIR_EPOCH}`;
+    return localCatalogRepairFingerprint(COMMIT_SCOPE_SNAPSHOT_REPAIR_EPOCH, parseAutoInstallCatalogs(this.env.WOO_AUTO_INSTALL_CATALOGS));
   }
 
   private loadSnapshotRepairFingerprint(): string | null {

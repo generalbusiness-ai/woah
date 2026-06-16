@@ -233,13 +233,8 @@ describe("CF-local smoke walkthrough", () => {
       // Slice 1 instrumentation guard: the phase-attribution metrics must
       // actually fire on the real worker DO /mcp path, or a deploy ships blind
       // instruments. Parse the structured woo.metric log lines the DO emits.
-      const parsedMetrics = consoleSpyCalls(logSpy)
-        .filter((c) => c[0] === "woo.metric" && typeof c[1] === "string")
-        .map((c) => { try { return JSON.parse(c[1] as string) as Metric; } catch { return null; } })
-        .filter((m): m is Metric => m !== null);
-      if (process.env.WOO_CF_LOCAL_METRICS_OUT) {
-        writeFileSync(process.env.WOO_CF_LOCAL_METRICS_OUT, `${JSON.stringify(parsedMetrics, null, 2)}\n`);
-      }
+      const parsedMetrics = metricsFromLogSpy(logSpy);
+      writeMetricsIfRequested(parsedMetrics);
 
       // turn_phase_timing — emitted by submitTurnIntent for every POST turn.
       const phaseTimings = parsedMetrics.filter((m) => m.kind === "turn_phase_timing");
@@ -317,6 +312,9 @@ describe("CF-local smoke walkthrough", () => {
         .filter((m): m is Metric => m !== null)
         .filter((m) => m.kind === "mcp_dispatch_timing" && m.method === "DELETE");
       expect(deleteDispatch.length, "the /mcp dispatch wrapper must emit mcp_dispatch_timing for DELETE teardown").toBeGreaterThan(0);
+    } catch (err) {
+      if (logSpy) writeMetricsIfRequested(metricsFromLogSpy(logSpy));
+      throw err;
     } finally {
       await Promise.allSettled([alice?.close(), bob?.close()]);
       warnSpy?.mockRestore();
@@ -678,6 +676,11 @@ function metricsFromLogSpy(logSpy: ReturnType<typeof vi.spyOn>): Metric[] {
     .filter((c) => c[0] === "woo.metric" && typeof c[1] === "string")
     .map((c) => { try { return JSON.parse(c[1] as string) as Metric; } catch { return null; } })
     .filter((m): m is Metric => m !== null);
+}
+
+function writeMetricsIfRequested(metrics: readonly Metric[]): void {
+  if (!process.env.WOO_CF_LOCAL_METRICS_OUT) return;
+  writeFileSync(process.env.WOO_CF_LOCAL_METRICS_OUT, `${JSON.stringify(metrics, null, 2)}\n`);
 }
 
 async function delayFor(ms: number | undefined, signal?: AbortSignal): Promise<void> {

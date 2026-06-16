@@ -2727,6 +2727,116 @@ describe("v2 browser worker integration", () => {
     });
   });
 
+  it("clears derived browser cache rows when the transport cache epoch changes", async () => {
+    const indexedDB = new FakeIndexedDBFactory();
+    const world = createWorld();
+    const session = browserWorkerSession(world, "guest:v2-browser-worker-cache-epoch");
+    const relay = createShadowBrowserRelayShim({
+      node: "relay:v2-worker-cache-epoch",
+      scope: "the_pinboard",
+      serialized: world.exportWorld(),
+      cache_epoch: "browser-cache-epoch-a"
+    });
+    const browser = createShadowBrowserClient({
+      node: "browser:v2-worker-cache-epoch",
+      scope: "the_pinboard",
+      actor: session.actor,
+      session: session.id,
+      relay,
+      token: "token:v2-worker-cache-epoch"
+    });
+    const opened = await openShadowBrowserScope(browser);
+
+    const firstPosted: unknown[] = [];
+    const firstScope = new FakeWorkerScope();
+    vi.stubGlobal("self", firstScope);
+    vi.stubGlobal("postMessage", (message: unknown) => firstPosted.push(message));
+    vi.stubGlobal("indexedDB", indexedDB);
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+    await import("../src/client/v2-browser-worker");
+
+    firstScope.dispatch({
+      kind: "connect",
+      token: browser.session_token ?? "",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    const firstSocket = await waitForSocket();
+    firstSocket.open();
+    firstSocket.receive(encodeEnvelope(relayEnvelope(browser, "hello-cache-epoch-a", "woo.transport.hello.v1", shadowBrowserTransportHello(browser))));
+    firstSocket.receive(encodeEnvelope(relayEnvelope(browser, "transfer-cache-epoch-a", opened.transfer.kind, opened.transfer)));
+    firstSocket.receive(encodeEnvelope(relayEnvelope(browser, "exec-cache-epoch-a", opened.executable_transfer.kind, opened.executable_transfer)));
+    firstSocket.receive(encodeEnvelope(relayEnvelope(browser, "ad-cache-epoch-a", "woo.exec_capability_ad.shadow.v1", opened.ads[0])));
+    await waitForMessage(firstPosted, isReadyStatus);
+
+    firstScope.dispatch({ kind: "send", envelope: pendingReplayEnvelope(browser, { id: "pending-cache-epoch" }) });
+    await waitForMessage(firstPosted, (message) =>
+      browserMetric(message)?.phase === "command" &&
+      browserMetric(message)?.path === "send"
+    );
+    const beforeStatusCursor = firstPosted.filter((message) => isKind(message, "status")).length;
+    firstScope.dispatch({ kind: "cache_status" });
+    const beforeStatusMessage = await waitFor(() => firstPosted.filter((message) => isKind(message, "status")).slice(beforeStatusCursor)[0]);
+    const beforeStatus = (beforeStatusMessage as { status?: Record<string, unknown> }).status ?? {};
+    expect(beforeStatus).toMatchObject({
+      pending: 1,
+      projections: 1,
+      execution_transfers: 1,
+      execution_ads: 1,
+      cache_epoch: "browser-cache-epoch-a"
+    });
+    expect(Number(beforeStatus.state_pages)).toBeGreaterThan(0);
+
+    vi.resetModules();
+    FakeWebSocket.instances.length = 0;
+    relay.cache_epoch = "browser-cache-epoch-b";
+    const secondPosted: unknown[] = [];
+    const secondScope = new FakeWorkerScope();
+    vi.stubGlobal("self", secondScope);
+    vi.stubGlobal("postMessage", (message: unknown) => secondPosted.push(message));
+    vi.stubGlobal("indexedDB", indexedDB);
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "woo.test" });
+    await import("../src/client/v2-browser-worker");
+
+    secondScope.dispatch({
+      kind: "connect",
+      token: browser.session_token ?? "",
+      node: browser.node,
+      scope: browser.scope,
+      actor: browser.actor,
+      session: session.id
+    });
+    const secondSocket = await waitForSocket();
+    secondSocket.open();
+    secondSocket.receive(encodeEnvelope(relayEnvelope(browser, "hello-cache-epoch-b", "woo.transport.hello.v1", shadowBrowserTransportHello(browser))));
+    await waitForMessage(secondPosted, (message) =>
+      browserMetric(message)?.phase === "cache_epoch" &&
+      browserMetric(message)?.reason === "reset"
+    );
+    const afterStatusCursor = secondPosted.filter((message) => isKind(message, "status")).length;
+    secondScope.dispatch({ kind: "cache_status" });
+    const afterStatusMessage = await waitFor(() => secondPosted.filter((message) => isKind(message, "status")).slice(afterStatusCursor)[0]);
+    expect(afterStatusMessage).toMatchObject({
+      status: {
+        pending: 1,
+        projections: 0,
+        projection_rows: 0,
+        applied_frames: 0,
+        transcript_tail: 0,
+        object_pages: 0,
+        state_pages: 0,
+        execution_transfers: 0,
+        execution_ads: 0,
+        proposals: 0,
+        cache_epoch: "browser-cache-epoch-b"
+      }
+    });
+  });
+
   it("purges auth-bound executable state when the browser actor/session changes", async () => {
     const posted: unknown[] = [];
     const scope = new FakeWorkerScope();

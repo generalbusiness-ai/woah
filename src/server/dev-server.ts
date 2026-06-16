@@ -6,7 +6,7 @@ import { WebSocket, WebSocketServer } from "ws";
 import { compileVerb, definePropertyVersionedAs, installVerbAs, setPropertyValueVersionedAs } from "../core/authoring";
 import { createWorld } from "../core/bootstrap";
 import { BROWSER_ACTIVITY_NUMERIC_DETAIL_FIELDS } from "../core/browser-activity-metric-fields";
-import { parseAutoInstallCatalogs } from "../core/local-catalogs";
+import { localCatalogRepairFingerprint, parseAutoInstallCatalogs } from "../core/local-catalogs";
 import { handleRestProtocolRequest, restFrameFromTurnReply, type RestProtocolHost, type RestProtocolRequest } from "../core/protocol";
 import { normalizeError, type ParkedTaskRun } from "../core/world";
 import {
@@ -74,6 +74,7 @@ const SHADOW_OPEN_EXECUTABLE_SEED_WARN_BYTES = 1_000_000;
 // defer to the world's object-authoring permission checks.
 const repository = new LocalSQLiteRepository(process.env.WOO_DB ?? ".woo/dev.sqlite");
 const world = createWorld({ repository, catalogs: parseAutoInstallCatalogs(process.env.WOO_AUTO_INSTALL_CATALOGS) });
+const DEV_BROWSER_CACHE_EPOCH = localCatalogRepairFingerprint("local-dev-browser-cache-v1", parseAutoInstallCatalogs(process.env.WOO_AUTO_INSTALL_CATALOGS));
 ensureLocaldevWizardApiKey();
 if (process.env.WOO_METRICS !== "off") {
   world.setMetricsHook(emitDevMetric);
@@ -471,7 +472,8 @@ function v2RelayForScope(scope: ObjRef): ShadowRelayCache {
       node: "node:dev:relay",
       scope,
       serialized: world.exportWorld(),
-      deployment: "local-dev"
+      deployment: "local-dev",
+      cache_epoch: DEV_BROWSER_CACHE_EPOCH
     });
     // Rehydrate the relay's durable tail (idempotency seen/reply window + the
     // accepted-frame/transcript reconnect tail) from the localdev store, the
@@ -605,7 +607,8 @@ function v2GatewayRelayForScope(scope: ObjRef): ShadowRelayCache {
       node: "node:dev:gateway",
       scope,
       serialized: devGatewaySparseSeed,
-      deployment: "local-dev"
+      deployment: "local-dev",
+      cache_epoch: DEV_BROWSER_CACHE_EPOCH
     });
     v2GatewayRelaysByScope.set(scope, relay);
   }

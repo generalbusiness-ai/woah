@@ -979,7 +979,7 @@ export class McpGateway {
     const id = `mcp-v2:${sessionId}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
     this.prewarmLikelyRelocationCommitScope(entry, actor, scope, target, verb, route, persistence);
     const ownerAuthorityObjectIds = mergeObjRefs(
-      this.likelyMovementOwnerAuthorityObjectIds(entry, scope, target, verb, options.toolArgSpec),
+      this.likelyMovementOwnerAuthorityObjectIds(entry, scope, target, verb, args, options.toolArgSpec),
       options.toolDefiner ? [options.toolDefiner] : [],
       options.toolSupportObjectIds ?? []
     );
@@ -1838,16 +1838,22 @@ export class McpGateway {
   // Catalogs may declare deterministic owner-prefetch paths in verb metadata.
   // The gateway interprets only generic roots/path/fallback forms; command words
   // and catalog property names must stay in the manifest declarations.
-  private likelyMovementOwnerAuthorityObjectIds(entry: SessionEntry, scope: ObjRef, target: ObjRef, verbName: string, argSpec?: Record<string, WooValue>): ObjRef[] {
+  private likelyMovementOwnerAuthorityObjectIds(
+    entry: SessionEntry,
+    scope: ObjRef,
+    target: ObjRef,
+    verbName: string,
+    args: readonly WooValue[],
+    argSpec?: Record<string, WooValue>
+  ): ObjRef[] {
     const prefetch = this.authorityPrefetchEntries(argSpec);
-    if (prefetch.length === 0) return [];
     const ids = new Set<ObjRef>();
     const add = (id: ObjRef | null | undefined): void => {
       if (!id || id === "$nowhere") return;
       ids.add(id);
     };
     for (const item of prefetch) {
-      for (const id of this.resolveAuthorityPrefetchValue(item, { entry, scope, target, verb: verbName })) add(id);
+      for (const id of this.resolveAuthorityPrefetchValue(item, { entry, scope, target, verb: verbName, args })) add(id);
     }
     return Array.from(ids).sort();
   }
@@ -1862,7 +1868,7 @@ export class McpGateway {
 
   private resolveAuthorityPrefetchValue(
     value: WooValue,
-    context: { entry: SessionEntry; scope: ObjRef; target: ObjRef; verb: string }
+    context: { entry: SessionEntry; scope: ObjRef; target: ObjRef; verb: string; args: readonly WooValue[] }
   ): ObjRef[] {
     if (typeof value === "string") {
       const id = this.authorityPrefetchRoot(value, context);
@@ -1886,18 +1892,30 @@ export class McpGateway {
 
   private resolveAuthorityPrefetchPath(
     path: WooValue[],
-    context: { entry: SessionEntry; scope: ObjRef; target: ObjRef; verb: string }
+    context: { entry: SessionEntry; scope: ObjRef; target: ObjRef; verb: string; args: readonly WooValue[] }
   ): ObjRef | null {
     if (path.length === 0 || typeof path[0] !== "string") return null;
     let cursor: WooValue | undefined = this.authorityPrefetchRoot(path[0], context) ?? undefined;
     for (const rawPart of path.slice(1)) {
-      if (typeof rawPart !== "string") return null;
-      const part = rawPart === "$verb" ? context.verb : rawPart;
+      const part = this.authorityPrefetchPathPart(rawPart, context);
+      if (part === null) return null;
       if (typeof cursor === "string") cursor = this.localObjectProp(cursor as ObjRef, part);
       else if (cursor && typeof cursor === "object" && !Array.isArray(cursor)) cursor = (cursor as Record<string, WooValue>)[part];
       else return null;
     }
     return typeof cursor === "string" ? cursor as ObjRef : null;
+  }
+
+  private authorityPrefetchPathPart(
+    rawPart: WooValue,
+    context: { verb: string; args: readonly WooValue[] }
+  ): string | null {
+    if (typeof rawPart === "string") return rawPart === "$verb" ? context.verb : rawPart;
+    if (!rawPart || typeof rawPart !== "object" || Array.isArray(rawPart)) return null;
+    const arg = (rawPart as Record<string, WooValue>).arg;
+    if (typeof arg !== "number" || !Number.isInteger(arg) || arg < 0) return null;
+    const value = context.args[arg];
+    return typeof value === "string" ? value.trim() : null;
   }
 
   private authorityPrefetchRoot(

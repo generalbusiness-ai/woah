@@ -92,6 +92,7 @@ type V2CacheStatus = {
   local_execution_ready?: boolean;
   local_execution_coverage_seq?: number;
   last_hello?: unknown;
+  cache_epoch?: string;
   catchup_required?: boolean;
 };
 
@@ -180,6 +181,18 @@ const EXECUTION_AD_STORE = "execution_ads";
 // Physical store name is fixed for IndexedDB compatibility. The logical record
 // name is TurnProposal; do not rename this string without an explicit migration.
 const PROPOSAL_STORE = "tentative_turns";
+const CACHE_EPOCH_META_KEY = "cache_epoch";
+const DERIVED_CACHE_STORES = [
+  PROJECTION_STORE,
+  PROJECTION_ROW_STORE,
+  APPLIED_STORE,
+  TRANSCRIPT_STORE,
+  OBJECT_PAGE_STORE,
+  STATE_PAGE_STORE,
+  EXECUTION_TRANSFER_STORE,
+  EXECUTION_AD_STORE,
+  PROPOSAL_STORE
+] as const;
 
 // The execution cache (executionCacheForScope) is a pure function of three IDB
 // stores — execution transfers, state pages, and the committed transcript tail —
@@ -941,6 +954,7 @@ async function reconcileTransportHello(body: unknown): Promise<void> {
   if (typeof hello.actor !== "string" || typeof hello.session !== "string") {
     throw new Error("TransportHello missing actor/session");
   }
+  await reconcileBrowserCacheEpoch(hello);
   const helloSession = hello.session || null;
   const changed = current.actor !== hello.actor || (current.session ?? null) !== helloSession;
   if (changed) {
@@ -951,6 +965,33 @@ async function reconcileTransportHello(body: unknown): Promise<void> {
     };
   }
   await purgeStaleExecutableStateForCurrentAuthority(changed ? "transport_hello_authority_changed" : "transport_hello");
+}
+
+async function reconcileBrowserCacheEpoch(hello: ShadowTransportHello): Promise<void> {
+  const epoch = typeof hello.cache_epoch === "string" && hello.cache_epoch.length > 0 ? hello.cache_epoch : null;
+  if (!epoch) return;
+  const startedAt = metricNow();
+  const previous = await getMeta<string>(CACHE_EPOCH_META_KEY);
+  if (previous === epoch) {
+    postBrowserActivity({
+      phase: "cache_epoch",
+      path: "transport_hello",
+      ms: metricElapsed(startedAt),
+      status: "ok",
+      reason: "current"
+    });
+    return;
+  }
+  const rowsDeleted = previous ? await clearDerivedBrowserCache() : 0;
+  await putMeta(CACHE_EPOCH_META_KEY, epoch);
+  postBrowserActivity({
+    phase: "cache_epoch",
+    path: "transport_hello",
+    ms: metricElapsed(startedAt),
+    status: "ok",
+    reason: previous ? "reset" : "initialized",
+    count: rowsDeleted
+  });
 }
 
 async function replayPending(): Promise<void> {
@@ -2058,6 +2099,32 @@ async function getMeta<T>(key: string): Promise<T | undefined> {
   return value;
 }
 
+async function clearDerivedBrowserCache(): Promise<number> {
+  let rowsDeleted = 0;
+  const headKeys = (await tx<IDBValidKey[]>(META_STORE, "readonly", (store) => store.getAllKeys()))
+    .filter((key) => typeof key === "string" && key.startsWith("head:"));
+  if (headKeys.length > 0) {
+    await deleteStoreKeys(META_STORE, headKeys);
+    for (const key of headKeys) metaCache.delete(String(key));
+    rowsDeleted += headKeys.length;
+  }
+  for (const storeName of DERIVED_CACHE_STORES) {
+    rowsDeleted += await clearStore(storeName);
+  }
+  resetDerivedBrowserCacheMemory();
+  return rowsDeleted;
+}
+
+function resetDerivedBrowserCacheMemory(): void {
+  knownPageCacheIdentity = null;
+  executionCacheMemo.clear();
+  pendingTurnExecRequests.clear();
+  postedAppliedFrameKeys.clear();
+  promotedAcceptedTranscriptHashes.clear();
+  bumpExecutionInputEpoch();
+  rejectPendingStateTransfers(new Error("v2 browser cache epoch changed"));
+}
+
 async function putPending(value: PendingEnvelope): Promise<void> {
   await tx(PENDING_STORE, "readwrite", (store) => store.put(value));
   schedulePendingTurnReplyTimeout(value);
@@ -2861,6 +2928,7 @@ async function status(): Promise<V2CacheStatus> {
     ...(localExecutionReady !== undefined ? { local_execution_ready: localExecutionReady } : {}),
     ...(coverageSeq !== undefined ? { local_execution_coverage_seq: coverageSeq } : {}),
     last_hello: await getMeta("hello"),
+    cache_epoch: await getMeta<string>(CACHE_EPOCH_META_KEY),
     catchup_required: await getMeta("catchup_required")
   };
 }
@@ -2934,6 +3002,14 @@ function isShadowStatePage(value: unknown): value is ShadowStatePage {
 
 async function countStore(storeName: string): Promise<number> {
   return await tx<number>(storeName, "readonly", (store) => store.count());
+}
+
+async function clearStore(storeName: string): Promise<number> {
+  const count = await countStore(storeName);
+  if (count === 0) return 0;
+  await tx<undefined>(storeName, "readwrite", (store) => store.clear(), { count });
+  if (EXECUTION_CACHE_INPUT_STORES.has(storeName)) bumpExecutionInputEpoch();
+  return count;
 }
 
 async function deleteStoreKeys(storeName: string, keys: readonly IDBValidKey[]): Promise<void> {

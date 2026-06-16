@@ -189,6 +189,12 @@ describe("CF-local prod-shape structural probes", () => {
       await callTool(harness, sessionId, 7, "woo_call", { object: "the_deck", verb: "west", args: [] });
       const warmupMetrics = metricsFromLogSpy(logSpy);
       logSpy.mockClear();
+      assertWarmTurnStructuralGate(warmupMetrics, [
+        { target: "the_chatroom", verb: "southeast" },
+        { target: "the_deck", verb: "go" },
+        { target: "the_pinboard", verb: "go" },
+        { target: "the_deck", verb: "west" }
+      ]);
 
       await callTool(harness, sessionId, 8, "woo_call", { object: "the_chatroom", verb: "southeast", args: [] });
       await callTool(harness, sessionId, 9, "woo_call", { object: "the_deck", verb: "go", args: ["pinboard"] });
@@ -249,6 +255,18 @@ describe("CF-local prod-shape structural probes", () => {
         atoms: ["read:cell:contents:the_deck"]
       },
       {
+        kind: "state_path_divergence",
+        target: "the_chatroom",
+        verb: "southeast",
+        code: "E_REPAIR_BUDGET",
+        cause: "missing_owner_state",
+        scope: "the_chatroom",
+        commit_scope: "guest_1",
+        attempts: 2,
+        missing_objects: ["the_deck"],
+        missing_atoms: ["read:cell:lifecycle:the_deck"]
+      },
+      {
         kind: "authority_slice_reconstructed",
         reason: "warm_turn_refresh",
         scope: "the_chatroom",
@@ -297,6 +315,7 @@ describe("CF-local prod-shape structural probes", () => {
       expect.stringContaining("commit_scope_envelope_rpc the_chatroom:southeast ms=999 max=300"),
       expect.stringContaining("serialized_world_materialized scope=the_chatroom reason=mcp_turn_plan"),
       expect.stringContaining("turn_repair_attempt the_chatroom:southeast source=planning_throw reason=missing_state attempt=1"),
+      expect.stringContaining("state_path_divergence the_chatroom:southeast code=E_REPAIR_BUDGET cause=missing_owner_state"),
       expect.stringContaining("authority_slice_reconstructed scope=the_chatroom reason=warm_turn_refresh"),
       expect.stringContaining("shadow_commit_rejected scope=the_chatroom reason=read_version_mismatch"),
       expect.stringContaining("mcp_fanout scope=the_chatroom shards=4 max_shards=1"),
@@ -334,6 +353,7 @@ describe("CF-local prod-shape structural probes", () => {
     const runId = `cf-local-c2-${Date.now()}-${randomUUID().slice(0, 8)}`;
     let sessionA: string | null = null;
     let sessionB: string | null = null;
+    const c2MetricPhases: Record<string, Record<string, unknown>[]> = {};
     try {
       // Open two sessions: alice is active, bob is idle in the same chatroom so
       // sessions-for-scopes reflects a realistic 2-actor scenario.
@@ -342,6 +362,7 @@ describe("CF-local prod-shape structural probes", () => {
       await callTool(harness, sessionA, 3, "woo_call", { object: "the_chatroom", verb: "enter", args: [] });
       await callTool(harness, sessionB, 4, "woo_call", { object: "the_chatroom", verb: "enter", args: [] });
       const setupMetrics = metricsFromLogSpy(logSpy);
+      c2MetricPhases.setup = setupMetrics;
       logSpy.mockClear();
 
       // Warm-up: exercise same-scope and cross-scope paths once before the
@@ -350,7 +371,16 @@ describe("CF-local prod-shape structural probes", () => {
       await callTool(harness, sessionA, 6, "woo_call", { object: "the_deck", verb: "go", args: ["pinboard"] });
       await callTool(harness, sessionA, 7, "woo_call", { object: "the_pinboard", verb: "go", args: ["out"] });
       await callTool(harness, sessionA, 8, "woo_call", { object: "the_deck", verb: "west", args: [] });
+      c2MetricPhases.warmup = metricsFromLogSpy(logSpy);
       logSpy.mockClear();
+      // Cold opens are allowed here, but first traversal must not repair: this
+      // is the deployed state-path divergence that previously inflated latency.
+      assertWarmTurnStructuralGate(c2MetricPhases.warmup, [
+        { target: "the_chatroom", verb: "southeast" },
+        { target: "the_deck", verb: "go" },
+        { target: "the_pinboard", verb: "go" },
+        { target: "the_deck", verb: "west" }
+      ]);
 
       // Measured phase: cross-scope movement turns only. The same-scope say turn
       // is intentionally excluded here because with two sessions it produces
@@ -362,6 +392,7 @@ describe("CF-local prod-shape structural probes", () => {
       await callTool(harness, sessionA, 11, "woo_call", { object: "the_pinboard", verb: "go", args: ["out"] });
       await callTool(harness, sessionA, 12, "woo_call", { object: "the_deck", verb: "west", args: [] });
       const measuredMovementMetrics = metricsFromLogSpy(logSpy);
+      c2MetricPhases.measured_movement = measuredMovementMetrics;
       logSpy.mockClear();
 
       // A2 carry phase: take the mug ($note/$portable) from the_chatroom, carry it
@@ -400,18 +431,15 @@ describe("CF-local prod-shape structural probes", () => {
       await callTool(harness, sessionA, 16, "woo_call", { object: "the_deck",     verb: "west",      args: [] });
       await callTool(harness, sessionA, 17, "woo_call", { object: "the_chatroom", verb: "drop",      args: ["mug"] });
       const measuredCarryMetrics = metricsFromLogSpy(logSpy);
+      c2MetricPhases.measured_carry = measuredCarryMetrics;
       logSpy.mockClear();
 
       // Measure the same-scope say turn separately.
       await callTool(harness, sessionA, 19, "woo_call", { object: "the_chatroom", verb: "say", args: [`measured-say-${runId}`] });
       const measuredSayMetrics = metricsFromLogSpy(logSpy);
+      c2MetricPhases.measured_say = measuredSayMetrics;
 
-      writeLabeledMetricsIfRequested(runId, {
-        setup: setupMetrics,
-        measured_movement: measuredMovementMetrics,
-        measured_carry: measuredCarryMetrics,
-        measured_say: measuredSayMetrics
-      });
+      writeLabeledMetricsIfRequested(runId, c2MetricPhases);
 
       // ── ENFORCED gates (must pass on current main with slim warm envelope) ──
 
@@ -526,7 +554,8 @@ describe("CF-local prod-shape structural probes", () => {
       expect(
         rpcsPerTurn,
         `C2 ENFORCED (D2): warm movement turns must emit ≤ ${C2_TRACKED_WARM_TURN_MAX_CROSS_HOST_RPCS} cross_host_rpc per turn. ` +
-        `Got avg=${rpcsPerTurn.toFixed(1)}. Note: directory_sessions_for_scopes is now served from ` +
+        `Got avg=${rpcsPerTurn.toFixed(1)}. route_breakdown=${metricBreakdown(crossHostRpcs, "route")}. ` +
+        `host_breakdown=${metricBreakdown(crossHostRpcs, "host")}. Note: directory_sessions_for_scopes is now served from ` +
         `the SQL projection cache (D2a) and does not count as a cross_host_rpc. ` +
         `If this fails: a new forwardInternal() call was added to the turn hot path. ` +
         `Ref PLAN: §D2.`
@@ -560,6 +589,10 @@ describe("CF-local prod-shape structural probes", () => {
         `A1 production stale-session accumulation is tracked in smoke-cf-dev.ts. ` +
         `Ref PLAN: §C2 / §A1.`
       ).toBeLessThanOrEqual(sessionsBudget);
+    } catch (err) {
+      c2MetricPhases.failure = metricsFromLogSpy(logSpy);
+      writeLabeledMetricsIfRequested(runId, c2MetricPhases);
+      throw err;
     } finally {
       if (sessionA) await mcpFetch(harness, { method: "DELETE", headers: { "mcp-session-id": sessionA } }).catch(() => undefined);
       if (sessionB) await mcpFetch(harness, { method: "DELETE", headers: { "mcp-session-id": sessionB } }).catch(() => undefined);
@@ -919,6 +952,18 @@ function maxMetric(metrics: Record<string, unknown>[], kind: string, field: stri
   return Math.max(0, ...metrics.filter((m) => m.kind === kind).map((m) => Number(m[field]) || 0));
 }
 
+function metricBreakdown(metrics: Record<string, unknown>[], field: string): string {
+  const counts = new Map<string, number>();
+  for (const metric of metrics) {
+    const key = String(metric[field] ?? "<missing>");
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([key, count]) => `${key}:${count}`)
+    .join(",");
+}
+
 function assertWarmTurnStructuralGate(metrics: Record<string, unknown>[], expectedTurns: WarmTurnExpectation[]): void {
   const violations = warmTurnStructuralViolations(metrics, expectedTurns);
   expect(
@@ -967,6 +1012,11 @@ function warmTurnStructuralViolations(metrics: Record<string, unknown>[], expect
     if (metric.kind === "turn_repair_attempt" && expected.has(key)) {
       violations.push(
         `turn_repair_attempt ${key} source=${String(metric.source)} reason=${String(metric.reason)} attempt=${String(metric.attempt)} objects=${JSON.stringify(metric.objects ?? [])} atoms=${JSON.stringify(metric.atoms ?? [])}`
+      );
+    }
+    if (metric.kind === "state_path_divergence" && expected.has(key)) {
+      violations.push(
+        `state_path_divergence ${key} code=${String(metric.code)} cause=${String(metric.cause)} attempts=${String(metric.attempts)} objects=${JSON.stringify(metric.missing_objects ?? [])} atoms=${JSON.stringify(metric.missing_atoms ?? [])}`
       );
     }
     if (metric.kind === "direct_call" && expected.has(key) && metric.status === "error") {

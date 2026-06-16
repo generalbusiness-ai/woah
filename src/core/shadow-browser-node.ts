@@ -304,6 +304,7 @@ export type ShadowBrowserSessionAuth = {
 export type ShadowTransportHello = {
   kind: "woo.transport.hello.v1";
   relay: string;
+  cache_epoch?: string;
   session: string;
   actor: ObjRef;
   server_time: number;
@@ -471,6 +472,7 @@ export function createShadowBrowserRelayShim(input: {
   executors?: ShadowExecutionNode[];
   state_signing?: Partial<ShadowBrowserStateSigning>;
   deployment?: string;
+  cache_epoch?: string;
   session_revs?: Record<string, number>;
   idempotency_window_ms?: number;
   // Per-cell provenance for the seed (A3.2). The constructor is generic across
@@ -499,6 +501,7 @@ export function createShadowBrowserRelayShim(input: {
     kind: "woo.browser_relay.shadow.v1",
     node: input.node,
     deployment,
+    ...(input.cache_epoch ? { cache_epoch: input.cache_epoch } : {}),
     commit_scope: commitScope,
     commit_scopes: new Map([[input.scope, commitScope]]),
     executors: input.executors ?? [],
@@ -1876,6 +1879,7 @@ export function shadowBrowserTransportHello(browser: ShadowBrowserNode, now = Da
   return {
     kind: "woo.transport.hello.v1",
     relay: browser.relay.node,
+    ...(browser.relay.cache_epoch ? { cache_epoch: browser.relay.cache_epoch } : {}),
     session: claims.session,
     actor: claims.actor,
     server_time: now,
