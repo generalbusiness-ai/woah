@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { startLocalMcpSmokeServer, type LocalMcpSmokeServer } from "./local-mcp-harness";
 
 // With WOO_MCP_SMOKE_BASE_URL set this smoke runs against a deployed worker.
@@ -9,6 +9,15 @@ const remoteBaseUrl = process.env.WOO_MCP_SMOKE_BASE_URL?.replace(/\/+$/, "");
 let baseUrl = remoteBaseUrl;
 let localServer: LocalMcpSmokeServer | undefined;
 const runId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+const DEPLOYED_TEST_TIMEOUT_MS = 75_000;
+const LOCAL_TEST_TIMEOUT_MS = 30_000;
+const MCP_FETCH_TIMEOUT_MS = remoteBaseUrl ? 45_000 : 15_000;
+
+// The deployed lane regularly runs close to Vitest's 30s default per-test
+// timeout (2026-06-16 measured first test at 27.8s). Keep the test meaningful
+// by giving the remote service a realistic budget, while per-request fetch
+// timeouts below still distinguish a stuck /mcp exchange from slow success.
+vi.setConfig({ testTimeout: remoteBaseUrl ? DEPLOYED_TEST_TIMEOUT_MS : LOCAL_TEST_TIMEOUT_MS });
 
 beforeAll(async () => {
   if (!baseUrl) {
@@ -280,6 +289,12 @@ async function mcpFetch(input: {
   signal?: AbortSignal;
 }): Promise<Response> {
   if (!baseUrl) throw new Error("MCP smoke base URL not resolved (beforeAll did not run?)");
+  const timeoutController = new AbortController();
+  const timeoutError = new Error(`MCP ${input.method} /mcp timed out after ${MCP_FETCH_TIMEOUT_MS}ms`);
+  const signal = input.signal
+    ? AbortSignal.any([input.signal, timeoutController.signal])
+    : timeoutController.signal;
+  const timeout = setTimeout(() => timeoutController.abort(timeoutError), MCP_FETCH_TIMEOUT_MS);
   const headers = new Headers({
     accept: "application/json, text/event-stream",
     ...input.headers
@@ -289,12 +304,14 @@ async function mcpFetch(input: {
     headers.set("content-type", "application/json");
     body = JSON.stringify(input.body);
   }
-  return await fetch(`${baseUrl}/mcp`, {
-    method: input.method,
-    headers,
-    body,
-    signal: input.signal
-  });
+  try {
+    return await fetch(`${baseUrl}/mcp`, { method: input.method, headers, body, signal });
+  } catch (err) {
+    if (timeoutController.signal.aborted) throw timeoutError;
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function parseMcpResponse(response: Response): Promise<any> {

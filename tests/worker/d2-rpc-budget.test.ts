@@ -34,6 +34,13 @@ const PROD_SHARDS = 32;
 // enumerate-tools ~0.5 + mcp-fanout ~0.25 = ~2.5/turn, well under 3.
 const D2_MAX_CROSS_HOST_RPCS_PER_TURN = 3;
 
+type ConsoleCall = unknown[];
+type Metric = Record<string, unknown>;
+
+function consoleSpyCalls(spy: ReturnType<typeof vi.spyOn>): ConsoleCall[] {
+  return spy.mock.calls as ConsoleCall[];
+}
+
 // ─── Harness ────────────────────────────────────────────────────────────────
 
 type D2Harness = {
@@ -197,11 +204,11 @@ async function callTool(
   }
 }
 
-function metricsFromLogSpy(logSpy: ReturnType<typeof vi.spyOn>): Record<string, unknown>[] {
-  return logSpy.mock.calls
+function metricsFromLogSpy(logSpy: ReturnType<typeof vi.spyOn>): Metric[] {
+  return consoleSpyCalls(logSpy)
     .filter((c) => c[0] === "woo.metric" && typeof c[1] === "string")
-    .map((c) => { try { return JSON.parse(c[1] as string) as Record<string, unknown>; } catch { return null; } })
-    .filter((m): m is Record<string, unknown> => m !== null);
+    .map((c) => { try { return JSON.parse(c[1] as string) as Metric; } catch { return null; } })
+    .filter((m): m is Metric => m !== null);
 }
 
 // ─── D2 Gate 1: warm turns with WOO_V2_D2_SESSION_FROM_PROJECTION=1 must not

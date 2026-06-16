@@ -295,9 +295,14 @@ function callsRequesting(calls: AuthoritySliceCall[], id: ObjRef): AuthoritySlic
 }
 
 type Metric = Record<string, unknown>;
+type ConsoleCall = unknown[];
+
+function consoleSpyCalls(spy: ReturnType<typeof vi.spyOn>): ConsoleCall[] {
+  return spy.mock.calls as ConsoleCall[];
+}
 
 function metricsFromLogSpy(logSpy: ReturnType<typeof vi.spyOn>): Metric[] {
-  return logSpy.mock.calls
+  return consoleSpyCalls(logSpy)
     .filter((c) => c[0] === "woo.metric" && typeof c[1] === "string")
     .map((c) => { try { return JSON.parse(c[1] as string) as Metric; } catch { return null; } })
     .filter((m): m is Metric => m !== null);

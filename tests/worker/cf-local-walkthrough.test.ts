@@ -98,6 +98,13 @@ type CfSmokeHarnessOptions = {
   hostReadTimeoutMs?: number;
 };
 
+type ConsoleCall = unknown[];
+type Metric = Record<string, unknown>;
+
+function consoleSpyCalls(spy: ReturnType<typeof vi.spyOn>): ConsoleCall[] {
+  return spy.mock.calls as ConsoleCall[];
+}
+
 describe("CF-local smoke walkthrough", () => {
   it("covers cross-shard MCP movement and tool-space fanout through Worker Durable Object shape", async () => {
     const harness = createCfSmokeHarness();
@@ -144,7 +151,7 @@ describe("CF-local smoke walkthrough", () => {
       // scope/catalog classes ($chatroom/$note/...). Those rows must be present
       // before local VM planning, or the turn fails locally before authority
       // repair can act.
-      const danglingParentRefs = logSpy.mock.calls
+      const danglingParentRefs = consoleSpyCalls(logSpy)
         .map((args) => args.map((arg) => (typeof arg === "string" ? arg : JSON.stringify(arg))).join(" "))
         .filter((line) => line.includes("dangling_parent_ref"))
         .map((line) => ({
@@ -198,7 +205,7 @@ describe("CF-local smoke walkthrough", () => {
         return m !== null && KNOWN_CI_DEBT_CELLS.has(m[1]);
       };
       const ciOffenders: string[] = [];
-      for (const call of logSpy.mock.calls) {
+      for (const call of consoleSpyCalls(logSpy)) {
         if (call[0] !== "woo.commit_rejected.errors" || typeof call[1] !== "string") continue;
         let parsed: { errors?: unknown; scope?: unknown; verb?: unknown; target?: unknown; actor?: unknown };
         try {
@@ -226,10 +233,10 @@ describe("CF-local smoke walkthrough", () => {
       // Slice 1 instrumentation guard: the phase-attribution metrics must
       // actually fire on the real worker DO /mcp path, or a deploy ships blind
       // instruments. Parse the structured woo.metric log lines the DO emits.
-      const parsedMetrics = logSpy.mock.calls
+      const parsedMetrics = consoleSpyCalls(logSpy)
         .filter((c) => c[0] === "woo.metric" && typeof c[1] === "string")
-        .map((c) => { try { return JSON.parse(c[1] as string) as Record<string, unknown>; } catch { return null; } })
-        .filter((m): m is Record<string, unknown> => m !== null);
+        .map((c) => { try { return JSON.parse(c[1] as string) as Metric; } catch { return null; } })
+        .filter((m): m is Metric => m !== null);
       if (process.env.WOO_CF_LOCAL_METRICS_OUT) {
         writeFileSync(process.env.WOO_CF_LOCAL_METRICS_OUT, `${JSON.stringify(parsedMetrics, null, 2)}\n`);
       }
@@ -260,7 +267,7 @@ describe("CF-local smoke walkthrough", () => {
         contentExpansions,
         "stale guest room contents must not trigger pre-plan contents authority expansion; active guests arrive through Directory/session projection"
       ).toEqual([]);
-      const admissionViolations = warnSpy.mock.calls
+      const admissionViolations = consoleSpyCalls(warnSpy)
         .filter((call) => call[0] === "woo.planning_world_inadmissible")
         .map((call) => JSON.stringify(call[1] ?? {}));
       expect(
@@ -304,10 +311,10 @@ describe("CF-local smoke walkthrough", () => {
         "DELETE /mcp must end the Woo session and unregister Directory so a stale MCP session id cannot be resumed"
       ).toBe(false);
       alice = null;
-      const deleteDispatch = logSpy.mock.calls
+      const deleteDispatch = consoleSpyCalls(logSpy)
         .filter((c) => c[0] === "woo.metric" && typeof c[1] === "string")
-        .map((c) => { try { return JSON.parse(c[1] as string) as Record<string, unknown>; } catch { return null; } })
-        .filter((m): m is Record<string, unknown> => m !== null)
+        .map((c) => { try { return JSON.parse(c[1] as string) as Metric; } catch { return null; } })
+        .filter((m): m is Metric => m !== null)
         .filter((m) => m.kind === "mcp_dispatch_timing" && m.method === "DELETE");
       expect(deleteDispatch.length, "the /mcp dispatch wrapper must emit mcp_dispatch_timing for DELETE teardown").toBeGreaterThan(0);
     } finally {
@@ -666,11 +673,11 @@ function raceWithAbort<T>(work: (signal: AbortSignal) => Promise<T>, ms: number,
   });
 }
 
-function metricsFromLogSpy(logSpy: ReturnType<typeof vi.spyOn>): Record<string, unknown>[] {
-  return logSpy.mock.calls
+function metricsFromLogSpy(logSpy: ReturnType<typeof vi.spyOn>): Metric[] {
+  return consoleSpyCalls(logSpy)
     .filter((c) => c[0] === "woo.metric" && typeof c[1] === "string")
-    .map((c) => { try { return JSON.parse(c[1] as string) as Record<string, unknown>; } catch { return null; } })
-    .filter((m): m is Record<string, unknown> => m !== null);
+    .map((c) => { try { return JSON.parse(c[1] as string) as Metric; } catch { return null; } })
+    .filter((m): m is Metric => m !== null);
 }
 
 async function delayFor(ms: number | undefined, signal?: AbortSignal): Promise<void> {

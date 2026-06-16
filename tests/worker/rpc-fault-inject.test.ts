@@ -26,6 +26,20 @@ import worker from "../../src/worker/index";
 
 vi.setConfig({ testTimeout: 30_000 });
 
+type ConsoleCall = unknown[];
+type Metric = Record<string, unknown>;
+
+function consoleSpyCalls(spy: ReturnType<typeof vi.spyOn> | null | undefined): ConsoleCall[] {
+  return spy ? spy.mock.calls as ConsoleCall[] : [];
+}
+
+function metricsFromLogSpy(logSpy: ReturnType<typeof vi.spyOn> | null | undefined): Metric[] {
+  return consoleSpyCalls(logSpy)
+    .filter((c) => c[0] === "woo.metric" && typeof c[1] === "string")
+    .map((c) => { try { return JSON.parse(c[1] as string) as Metric; } catch { return null; } })
+    .filter((m): m is Metric => m !== null);
+}
+
 // ─── Unit tests: FaultInjector ───────────────────────────────────────────────
 
 describe("FaultInjector.fromEnv", () => {
@@ -397,10 +411,7 @@ describe("Baseline snapshot: bounded warm cross-scope movement", () => {
       const result = await sessionWarm.call("the_chatroom", "say", ["baseline-warm-check"]);
       const warmElapsedMs = Date.now() - warmStartedAt;
 
-      const parsedMetrics = (logSpy?.mock.calls ?? [])
-        .filter((c) => c[0] === "woo.metric" && typeof c[1] === "string")
-        .map((c) => { try { return JSON.parse(c[1] as string) as Record<string, unknown>; } catch { return null; } })
-        .filter((m): m is Record<string, unknown> => m !== null);
+      const parsedMetrics = metricsFromLogSpy(logSpy);
 
       const authSliceLatency = parsedMetrics.filter((m) =>
         m.kind === "cross_host_rpc" && m.route === "/__internal/authority-slice"
@@ -471,10 +482,7 @@ describe("B-ii Gate 1: authority-slice error during turn yields fast retryable e
       const turnElapsedMs = Date.now() - turnStartedAt;
 
       // Collect metrics for the turn attempt.
-      const parsedMetrics = (logSpy?.mock.calls ?? [])
-        .filter((c) => c[0] === "woo.metric" && typeof c[1] === "string")
-        .map((c) => { try { return JSON.parse(c[1] as string) as Record<string, unknown>; } catch { return null; } })
-        .filter((m): m is Record<string, unknown> => m !== null);
+      const parsedMetrics = metricsFromLogSpy(logSpy);
 
       const authSliceErrors = parsedMetrics.filter((m) =>
         m.kind === "cross_host_rpc" && m.status === "error" && m.route === "/__internal/authority-slice"
@@ -592,10 +600,7 @@ describe("B-ii Gate 3: repair budget stops retrying when exhausted", () => {
       }
       const elapsedMs = Date.now() - startedAt;
 
-      const parsedMetrics = (logSpy?.mock.calls ?? [])
-        .filter((c) => c[0] === "woo.metric" && typeof c[1] === "string")
-        .map((c) => { try { return JSON.parse(c[1] as string) as Record<string, unknown>; } catch { return null; } })
-        .filter((m): m is Record<string, unknown> => m !== null);
+      const parsedMetrics = metricsFromLogSpy(logSpy);
 
       const phaseTiming = parsedMetrics.find((m) => m.kind === "turn_phase_timing");
       const attempts = typeof phaseTiming?.["attempts"] === "number" ? phaseTiming["attempts"] : -1;
@@ -729,10 +734,7 @@ describe("FIX 1 (B7 KV repair-attempt rule): KV seed skipped on repair attempts,
       // The turn must be fast (no stale-KV loop).
       expect(elapsedMs, "FIX 1: enter must not loop (< 8s)").toBeLessThan(8_000);
 
-      const parsedMetrics = (logSpy?.mock.calls ?? [])
-        .filter((c) => c[0] === "woo.metric" && typeof c[1] === "string")
-        .map((c) => { try { return JSON.parse(c[1] as string) as Record<string, unknown>; } catch { return null; } })
-        .filter((m): m is Record<string, unknown> => m !== null);
+      const parsedMetrics = metricsFromLogSpy(logSpy);
 
       // Gate: the phase timing must show ≤ 2 attempts. The stale KV path should
       // not cause indefinite looping (which would exhaust maxAttempts=8).
@@ -871,10 +873,7 @@ describe("kill_after_commit: commit is durable, fanout suppressed", () => {
       // error=E_KILL_AFTER_COMMIT. This proves the commit WAS processed and
       // persisted before the kill fired (the metric is only emitted on the
       // kill path, which runs after saveFullIfNeeded/saveEnvelopeDelta).
-      const parsedMetrics = (logSpy?.mock.calls ?? [])
-        .filter((c) => c[0] === "woo.metric" && typeof c[1] === "string")
-        .map((c) => { try { return JSON.parse(c[1] as string) as Record<string, unknown>; } catch { return null; } })
-        .filter((m): m is Record<string, unknown> => m !== null);
+      const parsedMetrics = metricsFromLogSpy(logSpy);
       const killMetrics = parsedMetrics.filter((m) =>
         m.kind === "v2_envelope" && m.error === "E_KILL_AFTER_COMMIT"
       );

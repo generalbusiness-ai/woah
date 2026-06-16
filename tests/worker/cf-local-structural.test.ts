@@ -22,6 +22,13 @@ const WARM_TURN_MAX_MCP_FANOUT_SHARDS = 1;
 const WARM_TURN_MAX_MCP_SCOPED_SHARDS = 1;
 const WARM_TURN_MAX_MCP_AFFECTED_SCOPES = 3;
 
+type ConsoleCall = unknown[];
+type Metric = Record<string, unknown>;
+
+function consoleSpyCalls(spy: ReturnType<typeof vi.spyOn>): ConsoleCall[] {
+  return spy.mock.calls as ConsoleCall[];
+}
+
 // ── C2 gate budgets ────────────────────────────────────────────────────────
 // ENFORCED (fails the build if violated on current main with the slim warm
 // envelope flag that is already deployed):
@@ -901,11 +908,11 @@ async function parseMcpResponse(response: Response): Promise<any> {
   return JSON.parse(text);
 }
 
-function metricsFromLogSpy(logSpy: ReturnType<typeof vi.spyOn>): Record<string, unknown>[] {
-  return logSpy.mock.calls
+function metricsFromLogSpy(logSpy: ReturnType<typeof vi.spyOn>): Metric[] {
+  return consoleSpyCalls(logSpy)
     .filter((c) => c[0] === "woo.metric" && typeof c[1] === "string")
-    .map((c) => { try { return JSON.parse(c[1] as string) as Record<string, unknown>; } catch { return null; } })
-    .filter((m): m is Record<string, unknown> => m !== null);
+    .map((c) => { try { return JSON.parse(c[1] as string) as Metric; } catch { return null; } })
+    .filter((m): m is Metric => m !== null);
 }
 
 function maxMetric(metrics: Record<string, unknown>[], kind: string, field: string): number {
