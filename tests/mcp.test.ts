@@ -997,6 +997,58 @@ describe("McpHost", () => {
     ]));
   });
 
+  it("does not await post-call tool manifest refresh when background mode is enabled", async () => {
+    const world = bootstrapWorld();
+    const session = world.auth("guest:mcp-background-refresh");
+    world.object(session.actor).location = "the_chatroom";
+    const transcript = mcpTestTranscript({
+      id: "mcp-background-refresh",
+      session: session.id,
+      call: { actor: session.actor, target: session.actor, verb: "probe", args: [] },
+      moves: [{ object: session.actor, from: "the_chatroom", to: "the_deck" }],
+      writes: [{ cell: { kind: "location", object: session.actor }, value: "the_deck", op: "move" }],
+      hash: "mcp-background-refresh"
+    });
+    const host = new McpHost(world, {
+      direct: async () => attachTranscriptForTest(
+        { op: "result" as const, result: true, observations: [], audience: null },
+        transcript
+      )
+    }, {}, { postInvokeManifestRefresh: "background" });
+    host.bindSession(session.id, session.actor);
+    let releaseRefresh!: () => void;
+    let refreshStarted!: () => void;
+    const refreshStartedPromise = new Promise<void>((resolve) => { refreshStarted = resolve; });
+    const refreshDonePromise = new Promise<boolean>((resolve) => {
+      releaseRefresh = () => resolve(true);
+    });
+    const refreshSpy = vi.spyOn(host, "refreshSessionToolManifest").mockImplementation(async () => {
+      refreshStarted();
+      return await refreshDonePromise;
+    });
+    const tool: McpTool = {
+      name: `${session.actor}__probe`,
+      object: session.actor,
+      verb: "probe",
+      aliases: [],
+      description: "",
+      inputSchema: {},
+      direct: true,
+      persistence: "durable",
+      enclosingSpace: "the_chatroom"
+    };
+
+    const invocation = host.invokeTool(session.actor, session.id, tool, []);
+    await refreshStartedPromise;
+    await expect(Promise.race([
+      invocation.then(() => "invoked"),
+      new Promise((resolve) => setTimeout(() => resolve("blocked"), 25))
+    ])).resolves.toBe("invoked");
+    expect(refreshSpy).toHaveBeenCalledTimes(1);
+    releaseRefresh();
+    await refreshDonePromise;
+  });
+
   it("saves an active remote manifest after a move when the gateway actor row is stale", async () => {
     const home = bootstrapWorld();
     const remote = bootstrapWorld();

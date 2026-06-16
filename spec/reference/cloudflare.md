@@ -1050,6 +1050,12 @@ adding source-index entries, so descriptor reads fall back to the session
 manifest or an owner refresh instead of relying on an unbounded invalidation
 index.
 
+Worker MCP gateways do not await post-invoke session-manifest refresh before
+returning a committed tool result. Once the turn has committed, refreshing the
+session's descriptor manifest is background cache maintenance; explicit
+`tools/list` and `woo_list_reachable_tools` requests still await their descriptor
+read because their result is the descriptor payload itself.
+
 `WOO_V2_EXECUTION_CAPSULE` controls a separate MCP/REST execution-open
 optimization. When enabled, a gateway that already has a local execution view
 for a durable scope may submit the next `/v2/envelope` with

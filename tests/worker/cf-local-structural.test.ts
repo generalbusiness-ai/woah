@@ -528,19 +528,28 @@ describe("CF-local prod-shape structural probes", () => {
         `(mergeIncomingObjectLineageClosure in gateway.ts). Ref PLAN: §C2 / §A2.`
       ).toBe(0);
 
-      // Per-turn cross-host RPC count on warm turns. In the fake lane all DOs are
-      // in-process, so cross_host_rpc is emitted but represents local function calls
-      // rather than real cross-colo network RPCs.
+      // Per-turn state write-through RPC count on warm movement turns. In the
+      // fake lane all DOs are in-process, so cross_host_rpc is emitted but
+      // represents local function calls rather than real cross-colo network RPCs.
       //
-      // ENFORCED (D2 landed): directory_sessions_for_scopes RPCs are now served from
-      // the SQL projection cache (status=projection_cache) so they no longer fire
-      // cross_host_rpc metrics. The fake-lane budget is ≤ 3/turn which holds at
-      // ~2.5/turn (apply-v2-commit 1.75 + enumerate-tools 0.5 + mcp-fanout 0.25).
-      // This gate prevents regressions that add new forwardInternal() call paths
-      // on the hot turn path. Going down is always fine; going above 3 is a signal
-      // to investigate before deploying.
+      // ENFORCED (D2a/state-path): directory_sessions_for_scopes RPCs are now
+      // served from the SQL projection cache (status=projection_cache), and warm
+      // turns must not repair or fetch authority slices. The remaining
+      // correctness-critical cross-host writes are apply-v2-commit calls to the
+      // changed object/container owners. The fake-lane budget is ≤ 3/turn after
+      // one first-touch allowance, matching the maximum source/destination/actor
+      // owner write-through fanout for cross-scope movement.
+      //
+      // Descriptor refresh (`/__internal/enumerate-tools`) is tracked separately
+      // below because D2b is explicitly deferred; it is latency work, but it is
+      // not state-path divergence. MCP commit fanout is D1 background/tail
+      // delivery and likewise should not be folded into this state-write gate.
       const phaseTimings = measuredMovementMetrics.filter((m) => m.kind === "turn_phase_timing");
       const crossHostRpcs = measuredMovementMetrics.filter((m) => m.kind === "cross_host_rpc");
+      const authoritySliceRpcs = crossHostRpcs.filter((m) => m.route === "/__internal/authority-slice");
+      const stateWriteRpcs = crossHostRpcs.filter((m) => m.route === "/__internal/apply-v2-commit");
+      const descriptorRpcs = crossHostRpcs.filter((m) => m.route === "/__internal/enumerate-tools");
+      const fanoutRpcs = crossHostRpcs.filter((m) => m.route === "/__internal/mcp-commit-fanout" || m.route === "/__internal/mcp-live-fanout");
       // First-touch allowance, mirroring tests/worker/d2-rpc-budget.test.ts:
       // under the full worker suite (isolate:false, shared module caches) the
       // first measured turn can pay one turn's worth of first-touch chatter
@@ -548,17 +557,26 @@ describe("CF-local prod-shape structural probes", () => {
       // The budget is a WARM-turn budget; exclude one turn's allowance — a
       // regression adding +1 RPC/turn still fails.
       const rpcsPerTurn = phaseTimings.length > 0
-        ? Math.max(0, crossHostRpcs.length - C2_TRACKED_WARM_TURN_MAX_CROSS_HOST_RPCS) / phaseTimings.length
+        ? Math.max(0, stateWriteRpcs.length - C2_TRACKED_WARM_TURN_MAX_CROSS_HOST_RPCS) / phaseTimings.length
         : 0;
-      console.log(`c2.cross_host_rpc_per_turn avg=${rpcsPerTurn.toFixed(1)} raw_total=${crossHostRpcs.length} turns=${phaseTimings.length} budget=${C2_TRACKED_WARM_TURN_MAX_CROSS_HOST_RPCS} status=ENFORCED plan=D2 (first-touch-adjusted)`);
+      const descriptorRpcsPerTurn = phaseTimings.length > 0 ? descriptorRpcs.length / phaseTimings.length : 0;
+      const fanoutRpcsPerTurn = phaseTimings.length > 0 ? fanoutRpcs.length / phaseTimings.length : 0;
+      console.log(`c2.state_write_rpc_per_turn avg=${rpcsPerTurn.toFixed(1)} raw_total=${stateWriteRpcs.length} turns=${phaseTimings.length} budget=${C2_TRACKED_WARM_TURN_MAX_CROSS_HOST_RPCS} status=ENFORCED plan=D2a (first-touch-adjusted)`);
+      console.log(`c2.descriptor_refresh_rpc_per_turn avg=${descriptorRpcsPerTurn.toFixed(1)} raw_total=${descriptorRpcs.length} turns=${phaseTimings.length} status=TRACKED plan=D2b`);
+      console.log(`c2.background_fanout_rpc_per_turn avg=${fanoutRpcsPerTurn.toFixed(1)} raw_total=${fanoutRpcs.length} turns=${phaseTimings.length} status=TRACKED plan=D1`);
+      expect(
+        authoritySliceRpcs.length,
+        `C2 ENFORCED: warm movement turns must not fetch authority slices. ` +
+        `Got ${authoritySliceRpcs.length}. route_breakdown=${metricBreakdown(crossHostRpcs, "route")}. ` +
+        `Authority-slice RPCs here mean the warm state path lost owner/session material and can re-enter repair latency.`
+      ).toBe(0);
       expect(
         rpcsPerTurn,
-        `C2 ENFORCED (D2): warm movement turns must emit ≤ ${C2_TRACKED_WARM_TURN_MAX_CROSS_HOST_RPCS} cross_host_rpc per turn. ` +
-        `Got avg=${rpcsPerTurn.toFixed(1)}. route_breakdown=${metricBreakdown(crossHostRpcs, "route")}. ` +
+        `C2 ENFORCED (D2a): warm movement turns must emit ≤ ${C2_TRACKED_WARM_TURN_MAX_CROSS_HOST_RPCS} state write-through RPCs per turn. ` +
+        `Got avg=${rpcsPerTurn.toFixed(1)}. state_route_breakdown=${metricBreakdown(stateWriteRpcs, "route")}. all_route_breakdown=${metricBreakdown(crossHostRpcs, "route")}. ` +
         `host_breakdown=${metricBreakdown(crossHostRpcs, "host")}. Note: directory_sessions_for_scopes is now served from ` +
-        `the SQL projection cache (D2a) and does not count as a cross_host_rpc. ` +
-        `If this fails: a new forwardInternal() call was added to the turn hot path. ` +
-        `Ref PLAN: §D2.`
+        `the SQL projection cache (D2a) and does not count as a cross_host_rpc; descriptor refresh is tracked as D2b latency work. ` +
+        `If this fails: movement is writing through to more object/container owners than the bounded state path allows. Ref PLAN: §D2.`
       ).toBeLessThanOrEqual(C2_TRACKED_WARM_TURN_MAX_CROSS_HOST_RPCS);
 
       // Sessions-for-scopes: ENFORCED ≤ actors + margin in the fake lane.

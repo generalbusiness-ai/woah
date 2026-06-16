@@ -110,6 +110,10 @@ export type McpToolManifestHooks = {
   saveSessionManifest?: (manifest: SessionToolManifest) => Promise<void> | void;
 };
 
+export type McpHostOptions = {
+  postInvokeManifestRefresh?: "inline" | "background";
+};
+
 type McpTranscriptBearing = { transcript?: EffectTranscript };
 type McpDirectDispatchFrame = DirectResultFrame & McpTranscriptBearing;
 type McpAppliedDispatchFrame = AppliedFrame & McpTranscriptBearing;
@@ -176,7 +180,12 @@ export class McpHost {
 
   private broadcasts: McpBroadcastHooks = {};
 
-  constructor(private world: WooWorld, private dispatchHooks: McpDispatchHooks = {}, private manifestHooks: McpToolManifestHooks = {}) {
+  constructor(
+    private world: WooWorld,
+    private dispatchHooks: McpDispatchHooks = {},
+    private manifestHooks: McpToolManifestHooks = {},
+    private options: McpHostOptions = {}
+  ) {
     // The actor_focus/unfocus/focus_list/wait native handlers are registered
     // by WooWorld's constructor (see registerNativeHandlers in world.ts) so
     // they remain installed when the actor's home DO wakes from hibernation
@@ -828,6 +837,22 @@ export class McpHost {
     return changed;
   }
 
+  private async refreshSessionToolManifestAfterInvoke(sessionId: string, actor: ObjRef): Promise<void> {
+    if (this.options.postInvokeManifestRefresh === "background") {
+      // The turn has already committed; manifest refresh only maintains
+      // descriptor caches and must not hold the caller's reply path in workers.
+      void this.refreshSessionToolManifest(sessionId, actor).catch((err) => {
+        console.warn("woo.mcp_tool_manifest_refresh.failed", {
+          session_id: sessionId,
+          actor,
+          error: err instanceof Error ? err.message : String(err)
+        });
+      });
+      return;
+    }
+    await this.refreshSessionToolManifest(sessionId, actor);
+  }
+
   /** Number of sessions currently bound to this MCP host (have an entry in
    * `this.queues`). Used by acceptRemote* diagnostic metrics to distinguish
    * "fanout reached a shard that hosts no MCP sessions" from "fanout reached
@@ -1329,7 +1354,7 @@ export class McpHost {
         const decision = await this.toolRefreshDecisionAfterInvoke(actor, tool, (result as McpTranscriptBearing).transcript, refreshBaseline);
         this.recordToolRefreshDecision(actor, "invoke", decision, sessionId);
         if (decision.refresh) {
-          await this.refreshSessionToolManifest(sessionId, actor);
+          await this.refreshSessionToolManifestAfterInvoke(sessionId, actor);
         }
         return { result: result.result, observations: this.filterCallerObservations(sessionId, result.observations, result.observationSessionAudiences) };
       } finally {
@@ -1353,7 +1378,7 @@ export class McpHost {
     const decision = await this.toolRefreshDecisionAfterInvoke(actor, tool, (frame as McpTranscriptBearing).transcript, refreshBaseline);
     this.recordToolRefreshDecision(actor, "invoke", decision, sessionId);
     if (decision.refresh) {
-      await this.refreshSessionToolManifest(sessionId, actor);
+      await this.refreshSessionToolManifestAfterInvoke(sessionId, actor);
     }
     const errObs = frame.observations.find((o) => o.type === "$error");
     return {

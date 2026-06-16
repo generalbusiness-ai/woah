@@ -529,6 +529,7 @@ export type McpGatewayOptions = {
   broadcasts?: McpBroadcastHooks;
   dispatch?: McpDispatchHooks;
   toolManifests?: McpToolManifestHooks;
+  postInvokeToolManifestRefresh?: "inline" | "background";
   // Persist an accepted fanout commit into a durable projection cache (the
   // worker gateway's SQL rows). Invoked from applyRemoteAccepted, i.e. in
   // contiguous scope-sequence order including drained out-of-order frames, so
@@ -565,7 +566,9 @@ export class McpGateway {
       call: async (sessionId: string, actor: ObjRef, space: ObjRef, message: Message, options?: McpDispatchOptions) =>
         await this.invokeV2Call(sessionId, actor, space, message, options)
     } satisfies McpDispatchHooks : options.dispatch;
-    this.host = new McpHost(world, dispatch, options.toolManifests);
+    this.host = new McpHost(world, dispatch, options.toolManifests, {
+      postInvokeManifestRefresh: options.postInvokeToolManifestRefresh ?? "inline"
+    });
     if (options.broadcasts) this.host.setBroadcastHooks(options.broadcasts);
   }
 

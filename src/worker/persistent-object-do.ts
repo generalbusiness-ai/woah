@@ -2025,6 +2025,7 @@ export class PersistentObjectDO {
           loadSessionManifest: (sessionId) => this.loadGatewaySessionToolManifest(sessionId),
           saveSessionManifest: (manifest) => this.saveGatewaySessionToolManifest(manifest)
         },
+        postInvokeToolManifestRefresh: "background",
         // Persist accepted fanout into the durable SQL projection cache in
         // contiguous sequence order, as the gateway accepts/drains each frame.
         persistAcceptedProjection: (commit, transcript) =>
