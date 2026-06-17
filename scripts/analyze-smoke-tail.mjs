@@ -167,6 +167,7 @@ function report(metrics, events) {
   reportCrossHostRpc(metrics);
   reportVerbDispatch(metrics);
   reportTurnPhaseTiming(metrics);
+  reportStatePathDivergence(metrics);
   reportMcpDispatchTiming(metrics);
   reportObservationRouting(metrics);
   reportSlowHandlers(metrics);
@@ -459,6 +460,56 @@ function reportMcpDispatchTiming(metrics) {
     const b = row.b;
     const p95 = (arr) => summarize(arr).p95;
     console.log(`  ${pad(row.key, 16)} ${num(row.tot.count, 4)} ${num(row.tot.p95, 7)} ${num(row.tot.max, 7)} ${num(p95(b.getWorld), 8)} ${num(p95(b.forward), 7)} ${num(p95(b.handle), 7)} ${num(p95(b.register), 8)}`);
+  }
+}
+
+function reportStatePathDivergence(metrics) {
+  section("State-path divergence");
+  const byFailure = new Map();
+  for (const m of metrics) {
+    if (m.kind !== "state_path_divergence") continue;
+    const targetVerb = `${m.target || "?"}:${m.verb || "?"}`;
+    const key = `${targetVerb} ${m.code || "?"}/${m.cause || "unknown"}`;
+    const bucket = byFailure.get(key) || {
+      elapsed: [],
+      attempts: [],
+      count: 0,
+      reasons: new Map(),
+      commitReasons: new Map(),
+      objects: new Map(),
+      atoms: new Map()
+    };
+    bucket.count += 1;
+    bucket.elapsed.push(m.elapsed_ms || 0);
+    bucket.attempts.push(m.attempts || 0);
+    if (m.repair_reason) bucket.reasons.set(m.repair_reason, (bucket.reasons.get(m.repair_reason) || 0) + 1);
+    if (m.commit_reason) bucket.commitReasons.set(m.commit_reason, (bucket.commitReasons.get(m.commit_reason) || 0) + 1);
+    for (const id of m.missing_objects || []) bucket.objects.set(id, (bucket.objects.get(id) || 0) + 1);
+    for (const atom of m.missing_atoms || []) bucket.atoms.set(atom, (bucket.atoms.get(atom) || 0) + 1);
+    byFailure.set(key, bucket);
+  }
+  if (byFailure.size === 0) {
+    console.log("  (no state_path_divergence metrics)");
+    return;
+  }
+  console.log(`  ${pad("target:verb code/cause", 48)} ${pad("n", 4)} ${pad("att.max", 7)} ${pad("p95", 6)} ${pad("max", 6)} reason  samples`);
+  const rows = Array.from(byFailure.entries())
+    .map(([key, bucket]) => ({ key, bucket, stats: summarize(bucket.elapsed) }))
+    .sort((a, b) => b.stats.sum - a.stats.sum);
+  for (const row of rows.slice(0, 30)) {
+    const b = row.bucket;
+    const top = (map, limit = 3) => Array.from(map.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, limit)
+      .map(([value, count]) => `${value}(${count})`)
+      .join(" ");
+    const reasons = top(b.reasons) || "-";
+    const samples = [
+      top(b.commitReasons),
+      top(b.objects),
+      top(b.atoms, 2)
+    ].filter(Boolean).join(" | ");
+    console.log(`  ${pad(row.key, 48)} ${num(b.count, 4)} ${num(Math.max(...b.attempts), 7)} ${num(row.stats.p95, 6)} ${num(row.stats.max, 6)} ${pad(reasons, 7)} ${samples || "-"}`);
   }
 }
 

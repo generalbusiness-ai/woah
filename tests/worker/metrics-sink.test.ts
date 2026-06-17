@@ -205,6 +205,35 @@ describe("metrics-sink", () => {
       expect(calls[0]!.doubles?.[DBL_COUNT]).toBe(1);
     });
 
+    it("stores state-path code, cause, and missing-object count", () => {
+      const { binding, calls } = fakeAnalytics();
+      const event: MetricEvent = {
+        kind: "state_path_divergence",
+        code: "E_OBJNF",
+        cause: "lookup_missing_object",
+        scope: "the_outliner",
+        commit_scope: null,
+        target: "exit_living_room_outline",
+        verb: "add_item",
+        route: "sequenced",
+        attempts: 1,
+        elapsed_ms: 812,
+        repair_source: "planning_throw",
+        repair_reason: "missing_state",
+        missing_objects: ["exit_living_room_outline"],
+        missing_object_count: 1
+      };
+      writeMetricToAnalytics(event, "mcp-gateway-0", binding);
+      expect(calls[0]!.blobs?.[SLOT_KIND]).toBe("state_path_divergence");
+      expect(calls[0]!.blobs?.[SLOT_SCOPE]).toBe("the_outliner");
+      expect(calls[0]!.blobs?.[SLOT_ERROR]).toBe("E_OBJNF");
+      expect(calls[0]!.blobs?.[SLOT_TARGET]).toBe("exit_living_room_outline");
+      expect(calls[0]!.blobs?.[SLOT_VERB]).toBe("add_item");
+      expect(calls[0]!.blobs?.[SLOT_REASON]).toBe("lookup_missing_object");
+      expect(calls[0]!.doubles?.[DBL_MS]).toBe(812);
+      expect(calls[0]!.doubles?.[DBL_COUNT]).toBe(1);
+    });
+
     it("populates space+verb for applied so per-space verb activity is queryable", () => {
       const { binding, calls } = fakeAnalytics();
       const event: MetricEvent = { kind: "applied", space: "the_chatroom", seq: 695, verb: "southeast", ms: 7 };

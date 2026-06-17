@@ -127,6 +127,7 @@ function summarizeRun(dir) {
   const turns = summarizeTurns(metrics);
   const recon = summarizeReconstructions(metrics);
   const repairs = summarizeRepairs(metrics, turns);
+  const divergence = summarizeStatePathDivergence(metrics);
   const ownerPrefetch = summarizeOwnerPrefetch(metrics);
   const data = summarizeDataPath(metrics);
   const rpc = summarizeRpc(metrics);
@@ -175,6 +176,15 @@ function summarizeRun(dir) {
     repair_commit_rejected: repairs.byReason.commit_rejected || 0,
     repair_missing_state: repairs.byReason.missing_state || 0,
     shadow_commit_rejected: repairs.shadowCommitRejected,
+    state_path_divergence: divergence.count,
+    state_path_e_repair_budget: divergence.byCode.E_REPAIR_BUDGET || 0,
+    state_path_e_need_state: divergence.byCode.E_NEED_STATE || 0,
+    state_path_e_objnf: divergence.byCode.E_OBJNF || 0,
+    state_path_e_verbnf: divergence.byCode.E_VERBNF || 0,
+    state_path_e_nosession: divergence.byCode.E_NOSESSION || 0,
+    state_path_missing_live_session: divergence.byCause.missing_live_session || 0,
+    state_path_lookup_missing_object: divergence.byCause.lookup_missing_object || 0,
+    state_path_stale_commit_state: divergence.byCause.stale_commit_state || 0,
     recon_total: recon.total,
     recon_pages_total: recon.pagesTotal,
     recon_cold_open: recon.byReason.cold_open || 0,
@@ -417,6 +427,15 @@ function summarizeRepairs(metrics, turns) {
   };
 }
 
+function summarizeStatePathDivergence(metrics) {
+  const rows = metrics.filter((m) => m.kind === "state_path_divergence");
+  return {
+    count: rows.length,
+    byCode: countBy(rows, (m) => m.code || "unknown"),
+    byCause: countBy(rows, (m) => m.cause || "unknown")
+  };
+}
+
 function summarizeOwnerPrefetch(metrics) {
   const rows = metrics.filter((m) => m.kind === "mcp_owner_prefetch");
   return {
@@ -542,6 +561,9 @@ function toCsv(rows) {
     "phase_ensure_share_pct", "phase_authority_share_pct", "phase_submit_share_pct", "phase_local_share_pct",
     "turn_attempts_avg", "turn_attempts_max", "turns_attempts_gt1",
     "repair_attempts", "repair_commit_rejected", "repair_missing_state", "shadow_commit_rejected",
+    "state_path_divergence", "state_path_e_repair_budget", "state_path_e_need_state", "state_path_e_objnf",
+    "state_path_e_verbnf", "state_path_e_nosession", "state_path_missing_live_session",
+    "state_path_lookup_missing_object", "state_path_stale_commit_state",
     "recon_total", "recon_cold_open", "recon_warm_turn_refresh", "recon_missing_state_repair", "recon_slice_served",
     "recon_trigger_scope_seed", "recon_trigger_owner_prefetch", "recon_trigger_pre_plan_repair", "recon_trigger_turn_commit",
     "owner_prefetch_requested", "owner_prefetch_warm_local", "owner_prefetch_warm_donor", "owner_prefetch_residue",

@@ -192,7 +192,7 @@ export async function runShadowTurnCallOnWorldTranscript(
 }
 
 function preRecordingErrorIsRepairable(code: string): boolean {
-  return code === "E_NEED_STATE" || code === "E_OBJNF" || code === "E_VERBNF";
+  return code === "E_NEED_STATE" || code === "E_OBJNF" || code === "E_VERBNF" || code === "E_NOSESSION";
 }
 
 class ShadowStateGuardTurnRecorder implements TurnRecorder {

@@ -580,17 +580,17 @@ or repurposed.
 | `blobs[5]`  | `phase`     | `shadow_*_step.phase`, `startup_storage.phase`, `init.phase`, `v2_open_step.phase`, `browser_activity.phase` |
 | `blobs[6]`  | `what`      | `storage_direct_write.what`, browser cache/IndexedDB store |
 | `blobs[7]`  | `status`    | `"ok" \| "error" \| "timeout"` |
-| `blobs[8]`  | `error`     | error code (`E_*`) |
+| `blobs[8]`  | `error`     | error code (`E_*`) or diagnostic event code |
 | `blobs[9]`  | `target`    | `direct_call.target`, `dispatch_resolved.target`, falls back to `dangling_parent_ref.start` |
 | `blobs[10]` | `verb`      | `applied.verb`, `direct_call.verb`, `dispatch_resolved.verb` |
 | `blobs[11]` | `tool`      | `mcp_request.tool` |
 | `blobs[12]` | `host`      | `cross_host_rpc.host`, `dispatch_resolved.host`, `host_schema_sync.host` |
 | `blobs[13]` | `actor`     | `mcp_tool_refresh_*.actor`, `dispatch_resolved.actor` |
 | `blobs[14]` | `path`      | `dispatch_resolved.path`: `local \| read \| mutating`; browser frame/activity path |
-| `blobs[15]` | `reason` / `mode` | `mcp_tool_refresh_*.reason`, `shadow_commit_rejected.reason`, `rest_v2_in_process_fallback.reason`, `commit_reply_replay.mode`, `shadow_transcript_anomaly.reason`, browser fallback/cache reason |
+| `blobs[15]` | `reason` / `mode` / `cause` | `mcp_tool_refresh_*.reason`, `shadow_commit_rejected.reason`, `rest_v2_in_process_fallback.reason`, `commit_reply_replay.mode`, `shadow_transcript_anomaly.reason`, `state_path_divergence.cause`, browser fallback/cache reason |
 | `blobs[16]` | `error_detail` | bounded diagnostic detail for uncoded internal errors |
 | `blobs[17]` | `source`    | `browser_activity.source` (`main` or `v2_browser_worker`) |
-| `doubles[0]` | `ms`         | latency, when present |
+| `doubles[0]` | `ms`         | latency (`ms`, `elapsed_ms`, or `total_ms`), when present |
 | `doubles[1]` | `sample_rate`| 1 by default, or the 1-in-N multiplier (see "Sampling" below) |
 | `doubles[2]` | `count`      | primary kind-specific count: `rows`, `audience_size`, `observations`, `fanout`, `hosts`, `objects`, `bytes`, or anomaly event count |
 

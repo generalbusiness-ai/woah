@@ -107,6 +107,8 @@ function primaryCount(event: MetricEvent): number {
             : 0;
     case "shadow_transcript_anomaly":
       return 1;
+    case "state_path_divergence":
+      return typeof e.missing_object_count === "number" && e.missing_object_count > 0 ? e.missing_object_count : 1;
     case "startup_storage":
       return typeof e.objects === "number" ? e.objects : (typeof e.routes === "number" ? e.routes : 0);
     case "kv_catalog_reservoir_build":
@@ -137,7 +139,8 @@ function primaryCount(event: MetricEvent): number {
 //                                v2_open_step.phase, browser_activity.phase
 //   blobs[6]    = what           storage_direct_write.what, browser cache/IDB store
 //   blobs[7]    = status         "ok" | "error" | "timeout"
-//   blobs[8]    = error          error code (E_*, or wooError().code)
+//   blobs[8]    = error          error code (E_*, wooError().code, or diagnostic
+//                                event code)
 //   blobs[9]    = target         direct_call.target, dispatch_resolved.target,
 //                                dangling_parent_ref.start (in-world object)
 //   blobs[10]   = verb           applied.verb, direct_call.verb,
@@ -152,10 +155,11 @@ function primaryCount(event: MetricEvent): number {
 //                                rest_v2_in_process_fallback.reason,
 //                                commit_reply_replay.mode,
 //                                shadow_transcript_anomaly.reason,
+//                                state_path_divergence.cause,
 //                                browser fallback/cache reason
 //   blobs[16]   = error_detail   bounded diagnostic detail for uncoded errors
 //   blobs[17]   = source         browser_activity.source ("main"|"v2_browser_worker")
-//   doubles[0]  = ms             latency (when present)
+//   doubles[0]  = ms             latency (ms, elapsed_ms, or total_ms when present)
 //   doubles[1]  = sample_rate    1 (default) or the 1-in-N multiplier
 //   doubles[2]  = count          primary kind-specific count: rows |
 //                                audience_size | observations | fanout |
@@ -173,7 +177,10 @@ export function writeMetricToAnalytics(
   if (rate > 1 && Math.random() * rate >= 1) return;
 
   const e = event as Record<string, unknown>;
-  const ms = typeof e.ms === "number" ? e.ms : 0;
+  const ms = typeof e.ms === "number" ? e.ms
+    : typeof e.elapsed_ms === "number" ? e.elapsed_ms
+      : typeof e.total_ms === "number" ? e.total_ms
+        : 0;
 
   // Fixed-length arrays so AE columns stay aligned even when an event
   // doesn't carry a given axis. Empty strings are how AE expresses "n/a"
@@ -189,7 +196,7 @@ export function writeMetricToAnalytics(
   blobs[5] = stringOrEmpty(e.phase);
   blobs[6] = stringOrEmpty(e.what);
   blobs[7] = stringOrEmpty(e.status);
-  blobs[8] = stringOrEmpty(e.error);
+  blobs[8] = stringOrEmpty(e.error ?? e.code);
   // `dangling_parent_ref` reports the orphan's anchor as `start`, not
   // `target`; surface it on the same axis so the dashboard can group
   // "objects touched / missing" without a special-case query.
@@ -199,7 +206,7 @@ export function writeMetricToAnalytics(
   blobs[12] = stringOrEmpty(e.host);
   blobs[13] = stringOrEmpty(e.actor);
   blobs[14] = stringOrEmpty(e.path);
-  blobs[15] = stringOrEmpty(e.reason ?? e.mode);
+  blobs[15] = stringOrEmpty(e.reason ?? e.mode ?? e.cause ?? e.repair_reason);
   blobs[16] = stringOrEmpty(e.error_detail);
   blobs[17] = stringOrEmpty(e.source);
 

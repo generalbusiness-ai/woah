@@ -33,6 +33,15 @@ describe("smoke-metrics-history", () => {
               },
               { kind: "turn_repair_attempt", reason: "missing_state" },
               { kind: "shadow_commit_rejected", reason: "read_version_mismatch" },
+              {
+                kind: "state_path_divergence",
+                code: "E_OBJNF",
+                cause: "lookup_missing_object",
+                missing_objects: ["exit_living_room_outline"],
+                missing_object_count: 1,
+                elapsed_ms: 100,
+                attempts: 1
+              },
               { kind: "authority_slice_reconstructed", reason: "warm_turn_refresh", trigger: "turn_commit", page_count: 7 },
               { kind: "authority_slice_reconstructed", reason: "cold_open", trigger: "owner_prefetch", page_count: 5 },
               { kind: "mcp_owner_prefetch", requested: 3, warm_local: 1, warm_donor: 1, residue: 1 },
@@ -65,6 +74,9 @@ describe("smoke-metrics-history", () => {
       expect(row.turn_total_p95_ms).toBe(1000);
       expect(row.turns_attempts_gt1).toBe(1);
       expect(row.repair_attempts).toBe(1);
+      expect(row.state_path_divergence).toBe(1);
+      expect(row.state_path_e_objnf).toBe(1);
+      expect(row.state_path_lookup_missing_object).toBe(1);
       expect(row.recon_total).toBe(2);
       expect(row.recon_warm_turn_refresh).toBe(1);
       expect(row.recon_trigger_owner_prefetch).toBe(1);
@@ -77,6 +89,7 @@ describe("smoke-metrics-history", () => {
 
       const csv = readFileSync(join(out, "summary.csv"), "utf8");
       expect(csv).toContain("recon_warm_turn_refresh");
+      expect(csv).toContain("state_path_e_objnf");
       expect(csv).toContain("deploy-abc1234-deadbee-b7-tail-20260609T205833Z");
       expect(readFileSync(join(out, "chart.svg"), "utf8")).toContain("Cloudflare Smoke Metrics History");
     } finally {

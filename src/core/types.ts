@@ -524,11 +524,11 @@ export type MetricEvent =
   | { kind: "turn_repair_attempt"; scope: ObjRef; commit_scope: ObjRef | null; target: ObjRef; verb: string; route: string; attempt: number; source: "planning_throw" | "planning_frame" | "commit_reply"; reason: "missing_state" | "lookup_error" | "commit_rejected"; objects: ObjRef[]; atoms?: string[]; commit_reason?: string }
   // Terminal sparse-planning / commit-retry failure. `turn_repair_attempt`
   // records every retry that widened authority; this summary fires once when
-  // the retry/budget loop gives up so deployed tails can classify the stale
-  // materialization that kept returning. The thrown ErrorValue carries the
-  // same sanitized fields, so MCP/browser callers see an actionable retryable
-  // state-path failure instead of only `E_REPAIR_BUDGET <scope>`.
-  | { kind: "state_path_divergence"; code: "E_REPAIR_BUDGET"; cause: "missing_live_session" | "missing_owner_state" | "missing_lineage_or_instance" | "stale_commit_state" | "lookup_missing_object" | "unknown"; scope: ObjRef; commit_scope: ObjRef | null; target: ObjRef; verb: string; route: string; attempts: number; elapsed_ms: number; repair_source?: "planning_throw" | "planning_frame" | "commit_reply"; repair_reason?: "missing_state" | "lookup_error" | "commit_rejected"; missing_objects: ObjRef[]; missing_object_count: number; missing_atoms?: string[]; missing_atom_count?: number; commit_reason?: string }
+  // the retry/budget loop gives up, or when a local state-path failure cannot
+  // be repaired before returning/throwing. Deployed tails can then classify
+  // stale materialization, missing live session, and lookup divergence without
+  // relying on transport-level timeout/error rows alone.
+  | { kind: "state_path_divergence"; code: "E_REPAIR_BUDGET" | "E_NEED_STATE" | "E_OBJNF" | "E_VERBNF" | "E_NOSESSION"; cause: "missing_live_session" | "missing_owner_state" | "missing_lineage_or_instance" | "stale_commit_state" | "lookup_missing_object" | "unknown"; scope: ObjRef; commit_scope: ObjRef | null; target: ObjRef; verb: string; route: string; attempts: number; elapsed_ms: number; repair_source?: "planning_throw" | "planning_frame" | "commit_reply"; repair_reason?: "missing_state" | "lookup_error" | "commit_rejected"; missing_objects: ObjRef[]; missing_object_count: number; missing_atoms?: string[]; missing_atom_count?: number; commit_reason?: string }
   // MCP-only relocation prewarm timing. A gateway may start the likely actor
   // commit-scope head/session open before local planning proves a B6 relocation;
   // this metric confirms the overlap happened and whether it failed harmlessly.

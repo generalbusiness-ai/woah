@@ -483,9 +483,11 @@ type ExecutorRepairMetricInput = {
 };
 
 type StatePathDivergenceCause = Extract<MetricEvent, { kind: "state_path_divergence" }>["cause"];
+type StatePathDivergenceCode = Extract<MetricEvent, { kind: "state_path_divergence" }>["code"];
 
 type ExecutorDivergenceDetail = ExecutorRepairMetricInput & {
   cause: StatePathDivergenceCause;
+  code?: StatePathDivergenceCode;
 };
 
 function isRepairableLocalPlanningLookupError(err: unknown): boolean {
@@ -502,6 +504,45 @@ function isRepairableLocalPlanningLookupError(err: unknown): boolean {
 function isRepairableLocalPlanningLookupFrame(frame: ErrorFrame): boolean {
   return frame.error.code === "E_VERBNF" ||
     (frame.error.code === "E_INTERNAL" && (frame.error.message ?? "").includes("E_VERBNF"));
+}
+
+const STATE_PATH_CODES: readonly StatePathDivergenceCode[] = [
+  "E_REPAIR_BUDGET",
+  "E_NEED_STATE",
+  "E_OBJNF",
+  "E_VERBNF",
+  "E_NOSESSION"
+];
+
+function normalizeStatePathCode(code: unknown): StatePathDivergenceCode | null {
+  return typeof code === "string" && STATE_PATH_CODES.includes(code as StatePathDivergenceCode)
+    ? code as StatePathDivergenceCode
+    : null;
+}
+
+function executorStatePathCodeFromError(err: unknown): StatePathDivergenceCode | null {
+  const coded = err as { code?: unknown; message?: unknown } | null;
+  const direct = normalizeStatePathCode(coded?.code);
+  if (direct) return direct;
+  const message = err instanceof Error
+    ? err.message
+    : typeof coded?.message === "string"
+    ? coded.message
+    : "";
+  for (const code of STATE_PATH_CODES) {
+    if (message.includes(code)) return code;
+  }
+  return null;
+}
+
+function executorStatePathCodeFromFrame(frame: ErrorFrame): StatePathDivergenceCode | null {
+  const direct = normalizeStatePathCode(frame.error.code);
+  if (direct) return direct;
+  const message = frame.error.message ?? "";
+  for (const code of STATE_PATH_CODES) {
+    if (message.includes(code)) return code;
+  }
+  return null;
 }
 
 function executorObjectIdsFromNeedStateValue(raw: WooValue | undefined): ObjRef[] {
@@ -785,10 +826,13 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     mergeExecutorObjectIds(Array.from(objects))
       .filter((id) => !id.startsWith("session-") && !id.startsWith("mcp:session") && !id.includes(":session-"))
       .slice(0, 64);
-  const classifyDivergenceCause = (input: ExecutorRepairMetricInput): StatePathDivergenceCause => {
+  const classifyDivergenceCause = (input: ExecutorRepairMetricInput, code?: StatePathDivergenceCode | null): StatePathDivergenceCause => {
     const atoms = input.atoms ?? [];
     if (input.reason === "commit_rejected") return "stale_commit_state";
+    if (code === "E_NOSESSION") return "missing_live_session";
     if (atoms.some((atom) => atom.includes("session"))) return "missing_live_session";
+    if (code === "E_OBJNF") return "lookup_missing_object";
+    if (code === "E_VERBNF") return "missing_lineage_or_instance";
     if (input.reason === "lookup_error") return "lookup_missing_object";
     if (atoms.some((atom) => atom.includes(":parent") || atom.includes(":verb:"))) return "missing_lineage_or_instance";
     if (input.reason === "missing_state") return "missing_owner_state";
@@ -821,7 +865,7 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     const atoms = (detail.atoms ?? []).slice(0, 64);
     options.onMetric?.({
       kind: "state_path_divergence",
-      code: "E_REPAIR_BUDGET",
+      code: detail.code ?? "E_REPAIR_BUDGET",
       cause: detail.cause,
       scope: options.input.scope,
       commit_scope: detail.commitScope ?? phaseCommitScope,
@@ -837,6 +881,26 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
       ...(atoms.length > 0 ? { missing_atoms: atoms, missing_atom_count: detail.atoms?.length ?? atoms.length } : {}),
       ...(detail.commitReason ? { commit_reason: detail.commitReason } : {})
     });
+  };
+  const terminalPlanningDivergence = (
+    source: "planning_throw" | "planning_frame",
+    code: StatePathDivergenceCode | null,
+    attempt: number,
+    repairIds: ObjRef[],
+    missingObjectIds: ObjRef[],
+    missingAtoms: string[]
+  ): ExecutorDivergenceDetail | null => {
+    if (!code) return null;
+    const objects = repairIds.length > 0 ? repairIds : missingObjectIds;
+    const input: ExecutorRepairMetricInput = {
+      source,
+      reason: missingObjectIds.length > 0 || missingAtoms.length > 0 ? "missing_state" : "lookup_error",
+      attempt,
+      commitScope: null,
+      objects,
+      atoms: missingAtoms
+    };
+    return { ...input, code, cause: classifyDivergenceCause(input, code) };
   };
   const rememberRetryableDivergence = (message: string, input: ExecutorRepairMetricInput): void => {
     const detail: ExecutorDivergenceDetail = { ...input, cause: classifyDivergenceCause(input) };
@@ -967,6 +1031,17 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
         if (!options.prePlanAuthority) await refreshPlanningAuthority(planningScope, planningClient, true, attempt + 1);
         continue;
       }
+      if (repairPlanningAuthority) {
+        const terminal = terminalPlanningDivergence(
+          "planning_throw",
+          executorStatePathCodeFromError(err),
+          attempt + 1,
+          repairIds,
+          missingObjectIds,
+          missingAtoms
+        );
+        if (terminal) emitTerminalDivergence(terminal);
+      }
       throw err;
     }
     if (planned.frame.op === "error") {
@@ -1005,6 +1080,17 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
         });
         if (!options.prePlanAuthority) await refreshPlanningAuthority(planningScope, planningClient, true, attempt + 1);
         continue;
+      }
+      if (repairPlanningAuthority) {
+        const terminal = terminalPlanningDivergence(
+          "planning_frame",
+          executorStatePathCodeFromFrame(planned.frame),
+          attempt + 1,
+          repairIds,
+          missingObjectIds,
+          missingAtoms
+        );
+        if (terminal) emitTerminalDivergence(terminal);
       }
       phaseOutcome = "local_frame";
       return { kind: "local_frame", frame: planned.frame, call, planned };

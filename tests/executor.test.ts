@@ -606,6 +606,99 @@ describe("v2 turn gateway", () => {
     expect(timing[0]!.submit_ms as number).toBeGreaterThan(0);
   });
 
+  it("emits state_path_divergence when local planning cannot materialize an object", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:v2-gateway-terminal-objnf");
+    await moveActorToDubspace(world, session, "terminal-objnf-dubspace-moveto");
+    const harness = makePlannedExecHarness(world.exportWorld());
+
+    const events: MetricEvent[] = [];
+    await expect(submitTurnIntent({
+      input: {
+        id: "terminal-objnf-turn",
+        route: "direct",
+        scope: "the_dubspace",
+        session: session.id,
+        actor: session.actor,
+        target: "missing_tool_instance",
+        verb: "look",
+        args: [],
+        persistence: "durable",
+        token: "token"
+      },
+      maxAttempts: 1,
+      repairPlanningAuthority: true,
+      ...harness.options,
+      onMetric: (event) => { events.push(event); }
+    })).rejects.toMatchObject({ code: "E_OBJNF", value: "missing_tool_instance" });
+
+    expect(events).toContainEqual(expect.objectContaining({
+      kind: "state_path_divergence",
+      code: "E_OBJNF",
+      cause: "lookup_missing_object",
+      scope: "the_dubspace",
+      commit_scope: null,
+      target: "missing_tool_instance",
+      verb: "look",
+      route: "direct",
+      attempts: 1,
+      repair_source: "planning_throw",
+      repair_reason: "missing_state",
+      missing_objects: ["missing_tool_instance"],
+      missing_object_count: 1
+    }));
+    expect(events).toContainEqual(expect.objectContaining({
+      kind: "turn_phase_timing",
+      scope: "the_dubspace",
+      target: "missing_tool_instance",
+      verb: "look",
+      outcome: "error"
+    }));
+  });
+
+  it("emits state_path_divergence when local planning has no live session", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:v2-gateway-terminal-nosession");
+    await moveActorToDubspace(world, session, "terminal-nosession-dubspace-moveto");
+    const harness = makePlannedExecHarness(world.exportWorld());
+
+    const events: MetricEvent[] = [];
+    await expect(submitTurnIntent({
+      input: {
+        id: "terminal-nosession-turn",
+        route: "sequenced",
+        scope: "the_dubspace",
+        session: "missing-session",
+        actor: session.actor,
+        target: "the_dubspace",
+        verb: "set_control",
+        args: ["delay_1", "wet", 0.2],
+        persistence: "durable",
+        token: "token"
+      },
+      maxAttempts: 1,
+      repairPlanningAuthority: true,
+      ...harness.options,
+      onMetric: (event) => { events.push(event); }
+    })).rejects.toMatchObject({ code: "E_NOSESSION" });
+
+    expect(events).toContainEqual(expect.objectContaining({
+      kind: "state_path_divergence",
+      code: "E_NOSESSION",
+      cause: "missing_live_session",
+      scope: "the_dubspace",
+      commit_scope: null,
+      target: "the_dubspace",
+      verb: "set_control",
+      route: "sequenced",
+      attempts: 1,
+      repair_source: "planning_throw",
+      repair_reason: "lookup_error",
+      missing_objects: [],
+      missing_object_count: 0
+    }));
+  });
+
   it("routes planned actor movement to the actor commit scope, not the UI scope", async () => {
     const world = createWorld();
     const session = world.auth("guest:v2-gateway-cross-scope");
