@@ -2008,6 +2008,31 @@ describe("local catalogs", () => {
     }
   });
 
+  it("repairs missing seed objects anchored in the current host slice", { timeout: 30000 }, () => {
+    const gateway = createWorld();
+    const scoped = nonEmptyHostScopedWorld(gateway.exportWorld(), "the_chatroom");
+    expect(scoped).not.toBeNull();
+    expect(scoped!.objects.some((object) => object.id === "exit_living_room_outline")).toBe(true);
+
+    const staleScoped = {
+      ...scoped!,
+      objects: scoped!.objects.filter((object) => object.id !== "exit_living_room_outline")
+    };
+    const host = createWorldFromSerialized(staleScoped, { persist: false });
+    expect(host.objects.has("exit_living_room_outline")).toBe(false);
+
+    runHostScopedLocalCatalogLifecycle(host, "the_chatroom");
+
+    expect(host.objects.has("exit_living_room_outline")).toBe(true);
+    expect(host.object("exit_living_room_outline")).toMatchObject({
+      parent: "$exit",
+      anchor: "the_chatroom",
+      name: "outline"
+    });
+    expect(host.getProp("exit_living_room_outline", "source")).toBe("the_chatroom");
+    expect(host.getProp("exit_living_room_outline", "dest")).toBe("the_outline");
+  });
+
   it("records clean host schema plans without applying seed repairs", { timeout: 30000 }, () => {
     const gateway = createWorld();
     const scoped = nonEmptyHostScopedWorld(gateway.exportWorld(), "the_hot_tub");

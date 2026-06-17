@@ -599,7 +599,10 @@ function runHostScopedSchemaPlans(world: WooWorld, host: string, freshSeed: bool
       allowImplementationHints: true,
       reconcileSeedHooks: true,
       reconcileClassVerbs: true,
-      skipMissingSeedHooks: true
+      // Host repair may create only seed instances anchored in this host; the
+      // planner still skips unrelated missing seed hooks so satellites do not
+      // mint the whole demo world.
+      skipMissingSeedHooks: false
     });
     if (result.status === "failed") {
       console.warn("woo.local_catalog_host_schema_plan_failed", { catalog: name, host, plan_id: result.plan_id, error: result.error ?? null, issues: result.issues });

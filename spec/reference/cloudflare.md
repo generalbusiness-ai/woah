@@ -473,7 +473,9 @@ mutations are preserved (host-seeds.md §HS5). Host-local data migrations
 use the same record path and run against state the host actually owns;
 the gateway's `$system.applied_migrations` ledger may be copied into a
 host seed, but it does not prove the host's local instance data was
-converted.
+converted. Host-scoped schema repair may create missing seed instances only
+for seed hooks anchored in that host; for example, a room host may repair its
+own anchored exit rows without creating unrelated demo instances.
 
 When `HOST_SEED_KV` is configured, the Worker writes content-addressed
 cache entries for host seeds. The KV bytes omit `verb.bytecode` and
@@ -901,7 +903,9 @@ rows, versioned cells for session actors, the sessions' active rooms, explicit
 turn scope/target rows, and their required owner/class/feature/catalog support
 cells. The DO refreshes those cells before planning or serving recipient-bound
 transfer state so cross-scope movement accepted by one CommitScopeDO is visible
-to the next scope without a full-world transfer.
+to the next scope without a full-world transfer. Persisted CommitScopeDO
+snapshots also run the host-scoped local catalog lifecycle when their repair
+fingerprint changes, including anchored seed-instance repair for the scope host.
 Session rows are valid authority only with their actor object row present in the
 same merged planning snapshot. Gateways and CommitScopeDOs MUST omit or prune
 dangling session rows before exposing presence to catalog code; projected

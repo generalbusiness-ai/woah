@@ -119,7 +119,7 @@ const CHECKPOINT_TRANSFER_MAX_BYTES = 1024 * 1024;
 const CHECKPOINT_PAGE_TARGET_BYTES = 512 * 1024;
 const CHECKPOINT_CONTINUATION_TTL_MS = 5 * 60 * 1000;
 const JSON_BYTES = new TextEncoder();
-const COMMIT_SCOPE_SNAPSHOT_REPAIR_EPOCH = "commit-scope-catalog-repair-v1";
+const COMMIT_SCOPE_SNAPSHOT_REPAIR_EPOCH = "commit-scope-catalog-repair-v2";
 
 type CommitScopeEnv = InternalAuthEnv & {
   WOO_AUTO_INSTALL_CATALOGS?: string;

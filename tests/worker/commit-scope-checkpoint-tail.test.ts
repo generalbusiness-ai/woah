@@ -9,7 +9,7 @@ import type { ObjRef } from "../../src/core/types";
 import type { ShadowCommitAccepted, ShadowScopeHead } from "../../src/core/shadow-commit-scope";
 import { CommitScopeDO } from "../../src/worker/commit-scope-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
-import { localCatalogBundleFingerprint } from "../../src/core/local-catalogs";
+import { localCatalogBundleFingerprint, localCatalogRepairFingerprint } from "../../src/core/local-catalogs";
 import { FakeDurableObjectState } from "./fake-do";
 
 const SECRET = "test-secret";
@@ -605,6 +605,56 @@ describe("CommitScopeDO checkpoint/tail open", () => {
         "SELECT fingerprint FROM v2_commit_scope_snapshot_repair WHERE id = 'current' LIMIT 1"
       ).toArray()[0] as { fingerprint?: string } | undefined)?.fingerprint ?? "";
       expect(storedFingerprint.split(":").length).toBe(3);
+    } finally {
+      state.close();
+    }
+  });
+
+  it("re-runs snapshot repair when the repair epoch changes with no manifest change", async () => {
+    // Regression for the 2026-06-17 deployed outliner failure: snapshots could
+    // already carry the three-part v1 repair fingerprint while still missing a
+    // host-anchored seed object. The host repair logic changed, so the repair
+    // epoch must force those snapshots back through repair on the next load.
+    const state = new WaitUntilState("the_chatroom");
+    const currentWorld = createWorld();
+    const session = currentWorld.auth("guest:commit-scope-epoch-bump");
+    const staleSeed = createWorld().exportHostScopedWorld("the_chatroom");
+    const staleObjects = staleSeed.objects.filter((object) => object.id !== "exit_living_room_outline");
+    expect(staleObjects.some((object) => object.id === "exit_living_room_outline")).toBe(false);
+    const target = new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: SECRET });
+    const authority = executorAuthorityPayload(currentWorld, ["the_chatroom", session.actor]);
+    seedScopeRows(state, "the_chatroom", head("the_chatroom", 0), {
+      objects: staleObjects,
+      sessions: authority.sessions
+    });
+    state.storage.sql.exec(
+      "INSERT OR REPLACE INTO v2_commit_scope_snapshot_repair(id, fingerprint, updated_at) VALUES ('current', ?, ?)",
+      localCatalogRepairFingerprint("commit-scope-catalog-repair-v1"),
+      Date.now()
+    );
+
+    try {
+      const request = await signInternalRequest({ WOO_INTERNAL_SECRET: SECRET }, new Request("https://woo.internal/v2/open", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          scope: "the_chatroom",
+          node: "browser:commit-scope-epoch-bump",
+          token: "guest:commit-scope-epoch-bump",
+          session: session.id,
+          actor: session.actor,
+          ...authority
+        })
+      }));
+      const response = await target.fetch(request);
+      await state.drainWaitUntil();
+
+      expect(response.ok).toBe(true);
+      expect(objectRow(state, "exit_living_room_outline")).toBeTruthy();
+      const storedFingerprint = (state.storage.sql.exec(
+        "SELECT fingerprint FROM v2_commit_scope_snapshot_repair WHERE id = 'current' LIMIT 1"
+      ).toArray()[0] as { fingerprint?: string } | undefined)?.fingerprint ?? "";
+      expect(storedFingerprint).toContain("commit-scope-catalog-repair-v2");
     } finally {
       state.close();
     }

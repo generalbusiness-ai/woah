@@ -275,10 +275,13 @@ a fresh gateway host seed. A brand-new host DO records the host-scoped
 content-addressed schema plan as covered by that seed; a host with stored state
 executes scoped plan steps, verifies postconditions, and appends a host-specific
 record to `$system.catalog_migration_records`. They do not run opaque manifest
-repair over partial slices. Host-local data migrations use the same ledger and
-run against state the host actually owns. If a fresh gateway host seed was
-available, the host re-applies it after the host-scoped lifecycle so copied
-support classes and verbs converge to the gateway's repaired definitions.
+repair over partial slices. A host-scoped schema plan may create a missing seed
+instance only when that seed hook resolves to an anchor whose route host is the
+current host; unrelated missing seed hooks remain skipped so a satellite host
+does not mint the whole bundled world. Host-local data migrations use the same
+ledger and run against state the host actually owns. If a fresh gateway host
+seed was available, the host re-applies it after the host-scoped lifecycle so
+copied support classes and verbs converge to the gateway's repaired definitions.
 
 Live object hosts can also be refreshed from the gateway's current host seed by
 a wizard operation. That path copies gateway support objects into the running

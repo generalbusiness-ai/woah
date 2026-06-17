@@ -663,7 +663,7 @@ export function planCatalogSchemaMigration(world: WooWorld, manifest: CatalogMan
         if (reconcileSeedHooks) steps.push({ id: `${steps.length + 1}:reconcile_seed_object:${id}`, kind: "reconcile_seed_object", object: id, hook });
         steps.push({ id: `${steps.length + 1}:seed_property_defaults:${id}`, kind: "seed_property_defaults", object: id, hook });
         steps.push({ id: `${steps.length + 1}:sync_exit_aliases:${id}`, kind: "sync_exit_aliases", object: id });
-      } else if (!skipMissingSeedHooks && scope === "gateway") {
+      } else if (!skipMissingSeedHooks && (scope === "gateway" || missingSeedHookBelongsToHost(world, hook, localObjects, localSeeds, existing, host))) {
         steps.push({ id: `${steps.length + 1}:ensure_seed_object:${id}`, kind: "ensure_seed_object", object: id, hook });
         steps.push({ id: `${steps.length + 1}:seed_property_defaults:${id}`, kind: "seed_property_defaults", object: id, hook });
         steps.push({ id: `${steps.length + 1}:sync_exit_aliases:${id}`, kind: "sync_exit_aliases", object: id });
@@ -702,6 +702,20 @@ export function planCatalogSchemaMigration(world: WooWorld, manifest: CatalogMan
     },
     steps
   };
+}
+
+function missingSeedHookBelongsToHost(
+  world: WooWorld,
+  hook: Extract<CatalogSeedHook, { kind: "create_instance" }>,
+  localObjects: Map<string, ObjRef>,
+  localSeeds: Map<string, ObjRef>,
+  existing: InstalledCatalogRecord[],
+  host: string
+): boolean {
+  if (!hook.anchor) return false;
+  const anchor = resolveMaybeObjectRef(world, hook.anchor, localObjects, localSeeds, existing);
+  if (!anchor) return false;
+  return world.objectRoutes().some((route) => route.id === anchor && route.host === host);
 }
 
 export function applyCatalogSchemaPlan(world: WooWorld, manifest: CatalogManifest, plan: CatalogSchemaPlan, options: CatalogSchemaPlanOptions = {}): CatalogSchemaPlanApplyResult {
