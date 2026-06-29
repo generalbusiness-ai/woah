@@ -35,8 +35,11 @@ convert values explicitly before joining.
 
 ### 19.3 List / map
 
-`listappend`, `listinsert`, `listdelete`, `setadd`, `setremove`,  
+`listappend`, `listinsert(list, index, value)`, `listdelete`, `setadd`, `setremove`,
 `mapkeys`, `mapvalues`, `mapdelete`, `mapmerge`.
+
+`listinsert` uses the language's 1-based list indexing. It returns a new list
+with `value` inserted before `index`; `index == length(list) + 1` appends.
 
 ### 19.4 Object
 
@@ -116,6 +119,21 @@ cannot mutate state, dispatch arbitrary verbs, or emit observations. Inside a
 sequenced VM frame, implementations must avoid parallel cross-host fanout
 because the sequencer already holds a queue slot; the reference implementation
 falls back to serial reads. If any read fails, the builtin raises that error.
+
+`object_siblings_ordered(container, item_class, parent_prop, position_prop,
+parent_id)` scans `contents(container)`, keeps descendants of `item_class`,
+skips stale refs that cannot be resolved, and returns the object refs whose
+`parent_prop` equals `parent_id`, ordered by positive numeric `position_prop`
+with object id as a stable tie-breaker. Unranked items sort after ranked
+items in contents order.
+
+`object_tree_rows(container, item_class, parent_prop, position_prop, text_verb,
+hidden_prop?)` performs the same scan and sibling ordering, then returns a
+depth-first joined tree view with rows shaped as `{id, name, text, parent_id,
+index, hidden, owner, writers, has_children}`. `text` is read by dispatching
+`text_verb` on each row object; failures produce `text: ""`, matching catalog
+read-gate projections. The helper is for catalog display projections that
+would otherwise allocate quadratic intermediate lists in woocode.
 
 The authoring-facing contract for compile/install, expected-version conflicts,
 and diagnostics is in [../authoring/minimal-ide.md](../authoring/minimal-ide.md).

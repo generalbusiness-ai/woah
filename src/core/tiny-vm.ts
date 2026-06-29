@@ -176,7 +176,10 @@ export const BUILTIN_NAMES = [
   "_dead_room_look_projection", "_dead_room_who_projection",
   "_dead_player_listing_projection", "_dead_object_examine_projection", "_dead_help_topic_projection",
   "present_actors", "connected_players", "session_metadata", "visible_contents", "obvious_verbs", "remote_describe",
-  "active_actors"
+  "active_actors",
+  // Generic projection helpers for catalog code that must build large lists
+  // without exercising woocode's functional-list allocation path.
+  "listinsert", "object_tree_rows", "object_siblings_ordered"
 ];
 
 export async function runTinyVm(ctx: CallContext, bytecode: TinyBytecode, args: WooValue[]): Promise<WooValue> {
@@ -1144,6 +1147,42 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         const prop = assertString(builtinArgs[1]);
         return await frame.ctx.world.collectPropChecked(frame.ctx.progr, refs, prop, frame.ctx.hostMemo, { parallel: frame.ctx.seq < 0 });
       }
+      case "listinsert": {
+        if (builtinArgs.length !== 3) throw wooError("E_INVARG", "listinsert expects list, one-based index, and value");
+        const list = assertList(builtinArgs[0]);
+        const raw = numeric(builtinArgs[1], "listinsert index");
+        if (!Number.isFinite(raw)) throw wooError("E_INVARG", "listinsert index must be finite", builtinArgs[1]);
+        const index = Math.floor(raw);
+        if (index < 1 || index > list.length + 1) throw wooError("E_RANGE", "listinsert index out of range", index);
+        return [...list.slice(0, index - 1), builtinArgs[2] ?? null, ...list.slice(index - 1)];
+      }
+      case "object_siblings_ordered": {
+        if (builtinArgs.length !== 5) throw wooError("E_INVARG", "object_siblings_ordered expects container, item_class, parent_prop, position_prop, and parent_id");
+        const parent = builtinArgs[4] === null ? null : assertObj(builtinArgs[4]);
+        const records = await collectObjectTreeRecords(
+          frame,
+          assertObj(builtinArgs[0]),
+          assertObj(builtinArgs[1]),
+          assertString(builtinArgs[2]),
+          assertString(builtinArgs[3])
+        );
+        return orderedSiblings(records, parent).map((record) => record.id);
+      }
+      case "object_tree_rows": {
+        if (builtinArgs.length < 5 || builtinArgs.length > 6) {
+          throw wooError("E_INVARG", "object_tree_rows expects container, item_class, parent_prop, position_prop, text_verb, and optional hidden_prop");
+        }
+        const textVerb = assertString(builtinArgs[4]);
+        const hiddenProp = builtinArgs.length >= 6 && builtinArgs[5] !== null ? assertString(builtinArgs[5]) : "hidden";
+        const records = await collectObjectTreeRecords(
+          frame,
+          assertObj(builtinArgs[0]),
+          assertObj(builtinArgs[1]),
+          assertString(builtinArgs[2]),
+          assertString(builtinArgs[3])
+        );
+        return await buildObjectTreeRows(frame, records, textVerb, hiddenProp);
+      }
       case "builder_create_object":
         if (builtinArgs.length < 1 || builtinArgs.length > 2) throw wooError("E_INVARG", "builder_create_object expects parent and optional opts");
         return await frame.ctx.world.builderCreateObject(frame.ctx.actor, assertObj(builtinArgs[0]), builtinArgs[1] ?? null, frame.ctx.definer);
@@ -1410,6 +1449,122 @@ function tickWeight(op: string): number {
 function chargeTicks(frame: VmFrame, ticks: number): void {
   frame.ticksRemaining -= ticks;
   if (frame.ticksRemaining < 0) throw wooError("E_TICKS", "task exceeded tick budget");
+}
+
+type TreeRecord = {
+  id: ObjRef;
+  parent: ObjRef | null;
+  position: number;
+  order: number;
+};
+
+async function collectObjectTreeRecords(frame: VmFrame, container: ObjRef, itemClass: ObjRef, parentProp: string, positionProp: string): Promise<TreeRecord[]> {
+  const contents = await frame.ctx.world.contentsForExecution(frame.ctx, container);
+  chargeTicks(frame, contents.length);
+  const records: TreeRecord[] = [];
+  for (const value of contents) {
+    let id: ObjRef;
+    try {
+      id = assertObj(value);
+    } catch {
+      continue;
+    }
+    let isItem = false;
+    try {
+      isItem = await frame.ctx.world.isDescendantOfChecked(id, itemClass, frame.ctx.hostMemo);
+    } catch {
+      isItem = false;
+    }
+    if (!isItem) continue;
+    let parent: ObjRef | null = null;
+    try {
+      const rawParent = await frame.ctx.world.getPropChecked(frame.ctx.progr, id, parentProp, frame.ctx.hostMemo);
+      parent = rawParent === null ? null : assertObj(rawParent);
+    } catch {
+      parent = null;
+    }
+    let position = 0;
+    try {
+      const rawPosition = await frame.ctx.world.getPropChecked(frame.ctx.progr, id, positionProp, frame.ctx.hostMemo);
+      if (typeof rawPosition === "number" && Number.isFinite(rawPosition)) position = Math.floor(rawPosition);
+    } catch {
+      position = 0;
+    }
+    records.push({ id, parent, position, order: records.length });
+  }
+  return records;
+}
+
+function treeParentKey(parent: ObjRef | null): string {
+  return parent === null ? "\0root" : `\0obj:${parent}`;
+}
+
+function compareTreeRecords(a: TreeRecord, b: TreeRecord): number {
+  const ar = a.position >= 1 ? a.position : Number.POSITIVE_INFINITY;
+  const br = b.position >= 1 ? b.position : Number.POSITIVE_INFINITY;
+  if (ar !== br) return ar - br;
+  if (a.position >= 1 && b.position >= 1 && a.id !== b.id) return a.id < b.id ? -1 : 1;
+  return a.order - b.order;
+}
+
+function orderedSiblings(records: TreeRecord[], parent: ObjRef | null): TreeRecord[] {
+  return records
+    .filter((record) => record.parent === parent)
+    .sort(compareTreeRecords);
+}
+
+async function buildObjectTreeRows(frame: VmFrame, records: TreeRecord[], textVerb: string, hiddenProp: string): Promise<WooValue[]> {
+  chargeTicks(frame, records.length);
+  const groups = new Map<string, TreeRecord[]>();
+  for (const record of records) {
+    const key = treeParentKey(record.parent);
+    const group = groups.get(key);
+    if (group) group.push(record);
+    else groups.set(key, [record]);
+  }
+  for (const group of groups.values()) group.sort(compareTreeRecords);
+
+  const out: WooValue[] = [];
+  const roots = groups.get(treeParentKey(null)) ?? [];
+  const stack: Array<{ record: TreeRecord; parent: ObjRef | null; index: number }> = [];
+  for (let i = roots.length - 1; i >= 0; i--) stack.push({ record: roots[i]!, parent: null, index: i });
+
+  while (stack.length > 0) {
+    const entry = stack.pop()!;
+    const cur = entry.record.id;
+    const children = groups.get(treeParentKey(cur)) ?? [];
+    let text = "";
+    try {
+      const value = await frame.ctx.world.dispatch(
+        { ...frame.ctx, caller: frame.ctx.thisObj, callerPerms: frame.ctx.progr },
+        cur,
+        textVerb,
+        []
+      );
+      if (typeof value === "string") text = value;
+    } catch {
+      text = "";
+    }
+    let hidden = false;
+    try {
+      hidden = (await frame.ctx.world.getPropChecked(frame.ctx.progr, cur, hiddenProp, frame.ctx.hostMemo)) === true;
+    } catch {
+      hidden = false;
+    }
+    out.push({
+      id: cur,
+      name: await frame.ctx.world.getPropChecked(frame.ctx.progr, cur, "name", frame.ctx.hostMemo),
+      text,
+      parent_id: entry.parent,
+      index: entry.index,
+      hidden,
+      owner: await frame.ctx.world.getPropChecked(frame.ctx.progr, cur, "owner", frame.ctx.hostMemo),
+      writers: await frame.ctx.world.getPropChecked(frame.ctx.progr, cur, "writers", frame.ctx.hostMemo),
+      has_children: children.length > 0
+    });
+    for (let i = children.length - 1; i >= 0; i--) stack.push({ record: children[i]!, parent: cur, index: i });
+  }
+  return out;
 }
 
 function literal(bytecode: TinyBytecode, operand: WooValue | undefined): WooValue {

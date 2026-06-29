@@ -137,15 +137,13 @@ thousands). Cost of a move/insert/reorder is O(N_siblings) writes
 under the affected parent — bounded by the user's working set, not by
 the whole outliner.
 
-**The re-stamp helper.** `$outliner:_renumber_siblings(parent_id)` is
-the only verb that writes `item.position`. It:
-1. Collects the siblings of `parent_id` (`null` means top-level) by
-   scanning `contents(this)`.
-2. Sorts them by current `(position, objref)` — `objref` as the
-   stable tie-breaker — and emits items at their requested positions
-   if the caller passed an `inserted_at` override.
-3. Assigns each sibling a fresh `1..N` position via
-   `item:set_position(i)`.
+**The re-stamp helper.** `$outliner:_renumber_siblings(parent_id, ordered)`
+is the internal path that writes `item.position`. Callers pass the desired
+sibling order; the helper assigns each item a fresh `1..N` position directly
+with catalog-owner authority. It deliberately does not call the public
+`item:set_position` presence gate, because composers can run during repair,
+replay, or session-scope churn where the actor's physical presence row is not
+the authority being exercised.
 
 Composers (`add_item`, `move_item`, `reorder_item`, `_restore_item`)
 prepare the desired sibling order and then call `:_renumber_siblings`
@@ -187,19 +185,19 @@ Adds these item-local verbs:
 | `set_parent(new_parent)` | actor present in this item's outliner | Pure property write. Validates same-outliner and no-cycle. No observation, no undo. |
 
 **Observation and undo discipline.** The outliner-specific item write
-verbs (`set_hidden`, `set_position`, `set_parent`) are the only place
-those placement/visibility fields change, but they do not emit
-observations and do not write the actor's `last_undo` slot — they don't
-know which composer call they were part of, and emitting from here would
-either double-fire (when called from a composer that also emits) or fire
-single property-write events that lose composer-level intent (e.g. an
-`outline_item_moved` collapsed into separate parent and position writes).
-Composers on the outliner emit exactly one structural observation per
-user-facing operation and write the slot exactly once. Text is the
-exception: inherited `$note:set_text` remains the single source of the
-`note_edited` observation. The UI and chat never call outliner-specific
-item write verbs directly; everything routes through the outliner
-surface.
+verbs (`set_hidden`, `set_position`, `set_parent`) are public/controller-safe
+property writers. They do not emit observations and do not write the actor's
+`last_undo` slot — they don't know which composer call they were part of, and
+emitting from here would either double-fire (when called from a composer that
+also emits) or fire single property-write events that lose composer-level
+intent (e.g. an `outline_item_moved` collapsed into separate parent and
+position writes). The internal `_renumber_siblings` helper is the exception:
+it writes `.position` directly after a composer has built a validated sibling
+order. Composers on the outliner emit exactly one structural observation per
+user-facing operation and write the slot exactly once. Text is the exception:
+inherited `$note:set_text` remains the single source of the `note_edited`
+observation. The UI and chat never call outliner-specific item write verbs
+directly; everything routes through the outliner surface.
 
 ### Outliner (`$outliner`)
 
@@ -207,13 +205,13 @@ surface.
 |---|---|---|
 | `look` / `look_self` | anyone | Standard space look surface; returns title, full joined tree, presence. |
 | room movement / `out` | inherited | Actors arrive through the substrate `moveto` chain, normally from browser tab activation or an exit. `out` is the inherited room command resolved through an exit whose destination is seeded by the world catalog. `$outliner` defines no public lifecycle verbs of its own. |
-| `list_items()` | anyone | Joined depth-first view: `[{id, name, text, parent_id, index, hidden, owner, writers, has_children}, …]`. Built by scanning `contents(this)`, grouping items by `.parent`, sorting each group by `.position`, and walking depth-first. `index` is the derived sibling index. Items the actor cannot read return `text: ""`. |
+| `list_items()` | anyone | Joined depth-first view: `[{id, name, text, parent_id, index, hidden, owner, writers, has_children}, …]`. Built by the generic `object_tree_rows` substrate helper from the catalog-owned shape: scan `contents(this)`, keep `$outline_item` descendants, group by `.parent`, sort each group by `.position`, and walk depth-first. `index` is the derived sibling index. Items the actor cannot read return `text: ""`. The helper exists because building this large joined view with repeated woocode list concatenation exceeds the VM memory model on thousand-item outlines. |
 | `acceptable(object)` | anyone | `isa(object, $outline_item) \|\| isa(object, $actor)`. |
 | `enterfunc(object)` | core | For actors: reset `focus_by_actor[actor]` to `null`, clear that actor's undo slot, and emit `outliner_entered` plus mounted-room activity. For items: if `item.parent` is unset (fresh item from `create` or a cross-outliner move), leave it at `null` (top-level). If set, validate it points to another item in this outliner — raise `E_INVARG` otherwise. If `item.position` is unset or empty, allocate a position past the last sibling. Emit `outline_item_added`. |
 | `exitfunc(object)` | core | For actors: clear that actor's focus/undo entries, prune stale entries for actors no longer present, and emit `outliner_left` plus mounted-room activity. For items leaving this outliner by `moveto`, calls `_detach_item(object, {emit: true, clear_item: true})`. This reparents direct children to the item's former parent, clears the moving item's `.parent` and `.position` so a destination outliner can place it as top-level, and emits `outline_item_removed`. Recycle does not call `exitfunc`; the item-level `:recycle` handler calls the same helper. |
 | `add_item(text, parent_id?, index?)` | anyone present | Composite: `create($outline_item, {owner: actor, parent: parent_id, position: <computed>}) + set_text + moveto(item, this)`. `parent_id` defaults to caller's focus (or `null` if focus is root). `index` chooses where among siblings; default is end. Emits `outline_item_added`. Sets caller's `last_undo` slot to `{verb: "remove_item", args: [new_item]}`. |
 | `set_item_text(item, text)` | item author / writers / wizard | Composite: capture old text for undo, call `item:set_text(text)`, and let inherited `$note:set_text` emit `note_edited`. The outliner does not re-emit text changes. Sets caller's `last_undo` slot to `{verb: "set_item_text", args: [item, old_text]}`. |
-| `move_item(item, new_parent_id, index?)` | anyone present | Re-parent and/or reorder. `new_parent_id == null` means root. Validates same-outliner and no-cycle (raises `E_CYCLE` if `new_parent_id` is `item` or a descendant). Computes a new `.position` from target siblings around `index`, then calls `item:set_parent(new_parent_id) + item:set_position(new_pos)`. Idempotent at current `(parent, index)`: no-op. Emits **exactly one** `outline_item_moved`. Sets caller's `last_undo` slot to `{verb: "move_item", args: [item, old_parent, old_index]}`. |
+| `move_item(item, new_parent_id, index?)` | anyone present | Re-parent and/or reorder. `new_parent_id == null` means root. Validates same-outliner and no-cycle (raises `E_CYCLE` if `new_parent_id` is `item` or a descendant). Builds the target sibling order around `index`, calls `item:set_parent(new_parent_id)`, then uses `_renumber_siblings` to assign positions. Idempotent at current `(parent, index)`: no-op. Emits **exactly one** `outline_item_moved`. Sets caller's `last_undo` slot to `{verb: "move_item", args: [item, old_parent, old_index]}`. |
 | `reorder_item(item, index)` | anyone present | Intra-sibling reorder. Same as `move_item` with the current parent, but emits the distinct `outline_item_reordered` so UIs can animate intra-sibling motion separately. Idempotent. Sets caller's `last_undo` slot to `{verb: "reorder_item", args: [item, old_index]}`. |
 | `hide(item, hidden)` | anyone present | Sole user-facing surface for hidden-toggling. Calls `item:set_hidden(hidden)`, emits `outline_item_hidden`, and sets caller's `last_undo` slot to `{verb: "hide", args: [item, !hidden]}`. Idempotent. The UI checkbox and chat `hide` both route here, never to `item:set_hidden` directly. |
 | `_detach_item(item, opts?)` | internal | Shared cleanup helper. Validates `location(item) == this`, snapshots direct children, reparents them to `item.parent` with fresh adjacent positions, optionally clears `item.parent = null` and `item.position = ""`, and optionally emits one `outline_item_removed`. Idempotent enough for recycle paths: if there are no direct children left, it only performs the remaining clear/emit work requested by `opts`. |
@@ -408,8 +406,10 @@ Properties:
 - `$outline_item.text` — inherited `perms: ""`. Public API is `:text()` /
   `:set_text(text)`; gated by `:is_readable_by(actor)` /
   `:is_writable_by(actor)`. Standard `$note` convention.
-- `$outline_item.parent` / `.position` / `.hidden` — `perms: "r"`. Verbs
-  are the only mutators (`set_parent`, `set_position`, `set_hidden`).
+- `$outline_item.parent` / `.position` / `.hidden` — `perms: "r"`. Public
+  mutations route through `set_parent`, `set_position`, and `set_hidden`;
+  internal composer renumbering writes `.position` directly with catalog
+  owner authority after validating the desired sibling order.
 - `$outliner.focus_by_actor` / `.last_undo` / `.mount_room` —
   `perms: "r"`. Verbs are the only mutators.
 
@@ -811,10 +811,11 @@ spec-version bump is required.
 - `list_items` shape (joined view) and depth-first order
 - text read-gate hides text but not the row
 
-Performance test: build a 2000-item outliner, measure `list_items` and
-serial `add_item` cost. If `list_items` becomes the hot path on large
-outliners, revisit the joined-view shape (incremental snapshots, paged
-listings, text-omitted skeletons with on-demand text fetch).
+Performance test: build a 2000-item outliner, assert `list_items` and
+tail `add_item` complete without exhausting VM memory. If latency becomes
+the hot path on large outliners, revisit the joined-view shape
+(incremental snapshots, paged listings, text-omitted skeletons with
+on-demand text fetch).
 
 ## What's not in
 

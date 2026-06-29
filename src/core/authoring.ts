@@ -24,7 +24,7 @@ const IMPURE_BUILTIN_NAMES: ReadonlySet<string> = new Set([
   "add_property", "delete_property", "set_property_info", "clear_property",
   // dispatch/execute_command_plan call into other verbs whose purity we
   // can't classify from this verb's bytecode alone — conservatively impure.
-  "dispatch", "execute_command_plan"
+  "dispatch", "execute_command_plan", "object_tree_rows"
 ]);
 
 const IMPURE_OPCODES: ReadonlySet<string> = new Set([
@@ -973,6 +973,9 @@ const VALID_BUILTINS = new Set([
   "authoring_inspect",
   "authoring_search",
   "set_object_name",
+  "listinsert",
+  "object_tree_rows",
+  "object_siblings_ordered",
   "is_remote_object",
   "presence_status"
 ]);

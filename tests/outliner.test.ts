@@ -50,6 +50,18 @@ function parentOf(world: ReturnType<typeof createWorld>, item: string): string |
   return world.propOrNull(item, "parent") as string | null;
 }
 
+function seedOutlineItem(world: ReturnType<typeof createWorld>, text: string, position: number, parent: string | null = null): string {
+  const item = world.createRuntimeObject("$outline_item", "$wiz", "the_outline", {
+    progr: "$wiz",
+    location: "the_outline",
+    name: ""
+  });
+  world.setProp(item, "parent", parent);
+  world.setProp(item, "position", position);
+  world.setProp(item, "text", text);
+  return item;
+}
+
 describe("outliner catalog: seed + basic shape", () => {
   it("seeds the_outline as an $outliner instance in the Living Room", () => {
     const world = setupWorld();
@@ -107,6 +119,34 @@ describe("outliner catalog: add / list / focus", () => {
     ]);
     expect(items[0].has_children).toBe(true);
     expect(items[3].has_children).toBe(false);
+  });
+
+  it("list_items handles the documented 2000-item baseline without exhausting VM memory", async () => {
+    const world = setupWorld();
+    const session = world.auth("guest:large-reader");
+    await expectResult(call(world, session.actor, "the_outline", "enter", []));
+    const first = seedOutlineItem(world, "root 1", 1);
+    for (let i = 2; i <= 2000; i++) seedOutlineItem(world, `root ${i}`, i);
+
+    const r = await expectResult(call(world, session.actor, "the_outline", "list_items", []));
+    const items = r.result as Array<{ id: string; parent_id: string | null; index: number; text: string; has_children: boolean }>;
+    expect(items).toHaveLength(2000);
+    expect(items[0]).toMatchObject({ id: first, parent_id: null, index: 0, text: "root 1", has_children: false });
+    expect(items[1999]).toMatchObject({ parent_id: null, index: 1999, text: "root 2000" });
+  });
+
+  it("add_item appends after a large existing root sibling set", async () => {
+    const world = setupWorld();
+    const session = world.auth("guest:large-adder");
+    await expectResult(call(world, session.actor, "the_outline", "enter", []));
+    for (let i = 1; i <= 2000; i++) seedOutlineItem(world, `old ${i}`, i);
+
+    const added = await addItem(world, session.actor, "new tail");
+    expect(position(world, added)).toBe(2001);
+    const r = await expectResult(call(world, session.actor, "the_outline", "list_items", []));
+    const items = r.result as Array<{ id: string; index: number; text: string }>;
+    expect(items).toHaveLength(2001);
+    expect(items[2000]).toMatchObject({ id: added, index: 2000, text: "new tail" });
   });
 
   it("chat add command creates an item under the actor's current focus", async () => {
