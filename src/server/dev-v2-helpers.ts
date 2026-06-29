@@ -59,6 +59,7 @@ import {
   handleShadowBrowserStateTransferEnvelope,
   handleShadowBrowserTurnExecEnvelope,
   receiveShadowBrowserEnvelopeReceipt,
+  refreshShadowBrowserRelaySessionAuth,
   shadowBrowserReplyEnvelopeForReceipt,
   shadowLiveEventsForTranscriptRelay,
   type ShadowBrowserEnvelopeReceipt,
@@ -292,6 +293,17 @@ export async function executeInProcessV2DurableTurn(input: {
   onMetric?: (event: MetricEvent) => void;
   onAdmissionViolation?: (violations: PlanningAdmissibilityViolation[]) => void;
 }): Promise<SubmitTurnIntentResult<DevV2GatewayClient, ExecutorEnvelopeResult>> {
+  input.world.touchSessionInput(input.call.session);
+  const refreshRelaySessionAuth = (scope: ObjRef, relay: ShadowRelayCache): void => {
+    const session = input.world.sessions.get(input.call.session);
+    if (!session) return;
+    refreshShadowBrowserRelaySessionAuth(relay, {
+      id: session.id,
+      actor: session.actor,
+      started: session.started,
+      expiresAt: session.expiresAt
+    }, scope, input.call.token);
+  };
   // One gateway client per scope. submitTurnIntent calls ensureClient for the
   // planning scope and again for the (possibly different) commit scope; each
   // needs its own sparse gateway relay + turn counter.
@@ -305,6 +317,7 @@ export async function executeInProcessV2DurableTurn(input: {
     prePlanAuthority: true,
     ensureClient: async (scope) => {
       const gatewayRelay = input.gatewayRelayForScope(scope);
+      refreshRelaySessionAuth(scope, gatewayRelay);
       let client = clients.get(scope);
       if (!client) {
         client = { node: input.node, relay: gatewayRelay, nextTurn: 0 };
@@ -357,6 +370,7 @@ export async function executeInProcessV2DurableTurn(input: {
       if (commitRelay.commit_scope.scope !== scope) {
         throw wooError("E_INTERNAL", `dev commit relay scope mismatch: relay=${commitRelay.commit_scope.scope} envelope=${scope}`);
       }
+      refreshRelaySessionAuth(scope, commitRelay);
       mergeAuthorityIntoRelayCache(commitRelay, body.authority, { preserveSessionActorLive: true, clone: true, reason: "dev_commit_authority" });
       const commitBrowser = createShadowBrowserClient({
         node: input.node,

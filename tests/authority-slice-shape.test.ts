@@ -30,7 +30,7 @@ import {
 } from "../src/core/authority-slice";
 import { createWorld } from "../src/core/bootstrap";
 import { executorAuthorityPayload } from "../src/core/executor";
-import type { SerializedAuthorityCellSlice, SerializedObject } from "../src/core/repository";
+import type { SerializedAuthorityCellSlice, SerializedObject, SerializedSession } from "../src/core/repository";
 import {
   shadowObjectLivePage,
   shadowStatePageHash,
@@ -386,6 +386,39 @@ describe("WooWorld.exportAuthoritySlice content contract", () => {
     const authority = executorAuthorityPayload(world, ["the_dubspace", session.actor]).authority;
     const serialized = serializedWorldFromAuthoritySlice(authority);
     expect(mergeSerializedAuthoritySlice(serialized, authority, { clone: true })).toBe(false);
+  });
+
+  it("keeps active session expiry monotonic when merging stale authority rows", () => {
+    const actor = objectRecord("guest_1", []);
+    const currentSession: SerializedSession = {
+      id: "session-active",
+      actor: actor.id,
+      started: 1_000,
+      expiresAt: 60_000,
+      lastDetachAt: null,
+      tokenClass: "guest",
+      activeScope: "the_chatroom"
+    };
+    const staleAuthoritySession: SerializedSession = {
+      ...currentSession,
+      expiresAt: 20_000,
+      activeScope: "the_deck"
+    };
+    const serialized = {
+      sessions: [currentSession],
+      objects: [actor]
+    };
+
+    mergeSerializedAuthoritySlice(serialized, {
+      kind: "woo.authority_slice.shadow.v1",
+      sessions: [staleAuthoritySession],
+      objects: [actor]
+    }, { clone: true });
+
+    expect(serialized.sessions).toEqual([{
+      ...staleAuthoritySession,
+      expiresAt: currentSession.expiresAt
+    }]);
   });
 });
 

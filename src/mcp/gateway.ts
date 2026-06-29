@@ -20,7 +20,7 @@ import type { SerializedAuthoritySlice, SerializedObject, SerializedSession } fr
 import { projectionDeltaMissingWrites, type ProjectionWrite } from "../core/projection-delta";
 import { createMcpServer } from "./server";
 import { McpHost, type McpAcceptedFrameAudience, type McpBroadcastHooks, type McpDispatchHooks, type McpDispatchOptions, type McpToolManifestHooks } from "./host";
-import { createShadowBrowserRelayShim } from "../core/shadow-browser-node";
+import { createShadowBrowserRelayShim, refreshShadowBrowserRelaySessionAuth } from "../core/shadow-browser-node";
 import {
   applyAcceptedFrameToDerivedRelayCache,
   applyAcceptedFrameToRelayCache,
@@ -160,22 +160,24 @@ export type McpV2ClientHooks = {
   readClosureEnvelope?: boolean;
 };
 
-// Strip the ~3MB authority slice (and legacy session_objects) from ordinary
-// same-scope envelope bodies for the slim warm path. A planned-transcript
+// Strip the ~3MB authority slice from ordinary same-scope envelope bodies for
+// the slim warm path. Keep the bounded session_objects actor rows: warm
+// CommitScopeDO snapshots can outlive newly allocated guest actors or their
+// latest location, and those rows are the cheap bridge that keeps slim replay
+// aligned with the gateway's planning view. A planned-transcript
 // commit deliberately executes against a different commit scope than the one
 // that planned the turn; its top-level authority is the validation seed for
 // actor/session/read cells missing from that scope's durable snapshot, so it is
 // not safe to slim.
 export function slimMcpEnvelopeBody(body: McpV2EnvelopeBody): McpV2EnvelopeBody {
   if (body.planned_transcript_commit === true) return body;
-  const { authority, session_objects, ...rest } = body;
-  void session_objects;
+  const { authority, ...rest } = body;
   // Authority-bearing bodies leave the top-level `sessions` empty because the
   // receiver reads `authority.sessions` (see executorEnvelopeBody). Slimming
   // removes the authority slice, so carry its session rows forward as the
   // top-level fallback the CommitScopeDO turn path reads once `authority` is
   // gone. Without this the slimmed body would arrive with neither copy.
-  return { ...rest, sessions: authority?.sessions ?? rest.sessions ?? [], session_objects: [] };
+  return { ...rest, sessions: authority?.sessions ?? rest.sessions ?? [], session_objects: rest.session_objects ?? [] };
 }
 
 // B-i: filter a planned-transcript envelope body's authority to the turn's
@@ -272,8 +274,7 @@ type RemoteAcceptedCommit = {
   routed?: boolean;
 };
 
-function serializedSessionForMcpEntry(entry: SessionEntry): SerializedSession {
-  const session = entry.woo;
+function serializedMcpSession(session: Session): SerializedSession {
   return {
     id: session.id,
     actor: session.actor,
@@ -313,6 +314,13 @@ function ensureSerializedSession(sessions: readonly SerializedSession[], session
     out[index] = structuredClone(session) as SerializedSession;
   }
   return out.sort((a, b) => a.id.localeCompare(b.id));
+}
+
+function ensureSerializedObjects(objects: readonly SerializedObject[], fresh: readonly SerializedObject[]): SerializedObject[] {
+  const byId = new Map<ObjRef, SerializedObject>();
+  for (const obj of objects) byId.set(obj.id, structuredClone(obj) as SerializedObject);
+  for (const obj of fresh) byId.set(obj.id, structuredClone(obj) as SerializedObject);
+  return Array.from(byId.values()).sort((a, b) => a.id.localeCompare(b.id));
 }
 
 function cachedAuthorityPageKey(page: { object: ObjRef; page: string; name?: string }): string {
@@ -1162,9 +1170,11 @@ export class McpGateway {
         installShadowCellPageTransferAsAuthority(client.relay, transfer, { reason: "mcp_version_mismatch_repair" });
       },
       submitEnvelope: async (submitScope, body, context) => {
+        const submitClient = this.v2Scopes.get(submitScope);
+        if (submitClient) this.refreshV2ScopeSessionAuth(entry, submitClient);
         const envelopeBody = await context.timing.time("submit", "mcp.execution_capsule", () => this.withExecutionCapsule(
           hooks,
-          this.v2Scopes.get(submitScope)?.relay.commit_scope.head ?? null,
+          submitClient?.relay.commit_scope.head ?? null,
           body as McpV2EnvelopeBody,
           target,
           verb
@@ -1487,6 +1497,7 @@ export class McpGateway {
   ): Promise<void> {
     const requireCommitScopeOpen = options.forceLegacyOpen === true || options.requireCommitScopeOpen === true;
     const timingPrefix = options.timingLabelPrefix ?? "ensure";
+    this.refreshV2ScopeSessionAuth(entry, client);
     if (requireCommitScopeOpen && client.commitScopeOpenedSessions.has(entry.woo.id)) {
       options.timing?.add("ensure_client", `${timingPrefix}.session_open_cached`, 0);
       return;
@@ -1583,6 +1594,49 @@ export class McpGateway {
     }
   }
 
+  private refreshV2ScopeSessionAuth(entry: SessionEntry, client: V2ScopeClient): void {
+    // Scope clients and their relay caches are intentionally long-lived. Refresh
+    // relay-local auth from the live MCP session before a cached-open shortcut so
+    // active stateless transports do not keep using an expired shadow claim.
+    const session = this.serializedSessionForEntry(entry);
+    refreshShadowBrowserRelaySessionAuth(
+      client.relay,
+      session,
+      client.scope,
+      entry.v2Token
+    );
+    this.refreshV2ScopeSessionRow(client, session);
+  }
+
+  private refreshV2ScopeSessionRow(client: V2ScopeClient, session: SerializedSession): void {
+    // The first planning pass for a warm scope reads the relay snapshot before
+    // commit-time authority is fetched. Keep the live MCP session row in that
+    // snapshot current, otherwise a move that just returned {room} can plan the
+    // next movement from the previous activeScope.
+    const current = serializedFor(client.relay.commit_scope, {
+      reason: "mcp_session_row_refresh",
+      metric: (event) => this.world.recordMetric(event)
+    });
+    const sessions = current.sessions
+      .filter((row) => row.id !== session.id)
+      .concat([structuredClone(session) as SerializedSession])
+      .sort((a, b) => a.id.localeCompare(b.id));
+    mergeAuthorityIntoRelayCache(client.relay, buildSerializedAuthorityCellSlice({
+      sessions,
+      objects: [],
+      counters: {
+        objectCounter: current.objectCounter,
+        parkedTaskCounter: current.parkedTaskCounter,
+        sessionCounter: current.sessionCounter
+      },
+      tombstones: current.tombstones ?? [],
+      pageProvenance: () => ({ source: "authoritative" })
+    }), {
+      reason: "mcp_session_row_refresh",
+      metric: (event) => this.world.recordMetric(event)
+    });
+  }
+
   private withExecutionCapsule(
     hooks: McpV2ClientHooks,
     head: ShadowScopeHead | null,
@@ -1638,17 +1692,25 @@ export class McpGateway {
   }
 
   private withMcpSessionAuthority(entry: SessionEntry, payload: ExecutorAuthorityPayload): ExecutorAuthorityPayload {
-    const session = serializedSessionForMcpEntry(entry);
+    const session = this.serializedSessionForEntry(entry);
     const sessions = ensureSerializedSession(payload.sessions, session);
     const authoritySessions = ensureSerializedSession(payload.authority.sessions, session);
+    const sessionObjects = ensureSerializedObjects(payload.session_objects, this.world.exportObjects([session.actor]));
     return {
       ...payload,
       sessions,
+      session_objects: sessionObjects,
       authority: {
         ...payload.authority,
         sessions: authoritySessions
       }
     };
+  }
+
+  private serializedSessionForEntry(entry: SessionEntry): SerializedSession {
+    const live = this.world.sessions.get(entry.woo.id);
+    if (live) entry.woo = live;
+    return serializedMcpSession(live ?? entry.woo);
   }
 
   private cachedWarmCommitAuthority(

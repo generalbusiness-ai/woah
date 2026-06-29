@@ -790,6 +790,16 @@ those sparse rows except for exact ids whose owner was resolved through
 Directory. Actual durable turn execution still
 commits through `CommitScopeDO`.
 
+Warm MCP durable turns may use a slim CommitScopeDO envelope that omits the
+full authority slice. That slim path must still carry the caller's current
+session row plus the bounded session-actor object row. CommitScopeDO treats that
+pair as fresh gateway authority for the caller: it can replace a stale
+per-scope `activeScope`, persist the actor row at `head_session.v1` open
+boundaries, and validate replay against the caller's live session placement
+even when the scope snapshot predates the latest guest allocation or movement.
+Legacy no-authority refreshes that do not carry a session actor row keep the
+older "preserve scope-known activeScope" merge behavior.
+
 Directory presence is leased separately from auth validity. Each
 `session_route` carries a `last_seen_at` timestamp distinct from `expires_at`:
 `expires_at` is the auth-validity gate (24h for apikey/bearer, the guest TTL for

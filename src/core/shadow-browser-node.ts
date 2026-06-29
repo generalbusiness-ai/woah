@@ -691,10 +691,16 @@ export function refreshShadowBrowserRelaySessionAuth(
   const existing = relay.session_auth.get(token);
   const rev = relay.session_revs.get(session.id) ?? existing?.rev ?? 1;
   const scopes = new Set<ObjRef>(existing?.session === session.id ? existing.scopes : []);
+  const tokens = new Set<string>([token]);
+  for (const [existingToken, existingClaims] of relay.session_auth) {
+    if (existingClaims.session !== session.id) continue;
+    tokens.add(existingToken);
+    for (const existingScope of existingClaims.scopes) scopes.add(existingScope);
+  }
   scopes.add(scope);
   relay.session_revs.set(session.id, rev);
   const claims = shadowBrowserSessionClaimsValue(session, relay.deployment, [...scopes], rev);
-  relay.session_auth.set(token, claims);
+  for (const refreshedToken of tokens) relay.session_auth.set(refreshedToken, claims);
   return claims;
 }
 

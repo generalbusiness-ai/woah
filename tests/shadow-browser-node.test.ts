@@ -1323,6 +1323,10 @@ describe("shadow browser node shim", () => {
     const anchor = createWorld();
     const firstSession = anchor.auth("guest:browser-huh-a");
     const secondSession = anchor.auth("guest:browser-huh-b");
+    // This test can run late in the full parallel deploy gate; keep its
+    // synthetic transport sessions alive so expiry does not mask fan-out scope.
+    firstSession.expiresAt = Date.now() + 60 * 60_000;
+    secondSession.expiresAt = firstSession.expiresAt;
     await anchor.directCall("browser-huh-a-enter", firstSession.actor, "the_chatroom", "enter", [], { sessionId: firstSession.id });
     await anchor.directCall("browser-huh-b-enter", secondSession.actor, "the_chatroom", "enter", [], { sessionId: secondSession.id });
     const relay = createShadowBrowserRelayShim({

@@ -22,6 +22,7 @@ import { createWorld } from "../src/core/bootstrap";
 import { executorAuthorityPayload } from "../src/core/executor";
 import { planningCellKey } from "../src/core/planning-world";
 import { encodeEnvelope, type ShadowEnvelope } from "../src/core/shadow-envelope";
+import { serializedFor } from "../src/core/shadow-commit-scope";
 import type { ShadowTurnExecReply } from "../src/core/shadow-turn-exec";
 import type { AuthorityPageProvenance } from "../src/core/shadow-state-pages";
 import type { MetricEvent, ObjRef } from "../src/core/types";
@@ -170,6 +171,72 @@ describe("B7 MCP warm authority", () => {
         warm_donor: 1,
         residue: 0
       });
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("refreshes cached relay auth for active MCP sessions before warm turns", async () => {
+    const world = createWorld({ catalogs: ["chat", "demoworld", "tasks", "blocks-demo"] });
+    const env = { WOO_INTERNAL_SECRET: "v2-warm-secret" };
+    const fixture = commitScopeFixture(env);
+    const gateway = warmGateway(world, env, fixture.scopeFor, []);
+    try {
+      const session = await initializeMcp(gateway, "guest:b7-auth-refresh", 1);
+      await mcpOk(gateway, session, 2, "the_chatroom", "enter");
+      const record = world.sessions.get(session);
+      if (!record) throw new Error("expected live MCP session");
+      record.expiresAt = Date.now() + 10_000;
+      const staleExpiry = record.expiresAt;
+
+      const scopes = (gateway as unknown as {
+        v2Scopes: Map<ObjRef, { relay: { session_auth: Map<string, { session: string; expires_at: number }> } }>;
+      }).v2Scopes;
+      const client = scopes.get("the_chatroom");
+      expect(client, "expected warm chatroom scope client").toBeDefined();
+      for (const claims of client!.relay.session_auth.values()) {
+        if (claims.session === session) claims.expires_at = Date.now() - 1;
+      }
+
+      await mcpOk(gateway, session, 3, "the_chatroom", "look");
+
+      const refreshedClient = scopes.get("the_chatroom");
+      expect(refreshedClient, "expected warm chatroom scope client after refresh").toBeDefined();
+      const refreshed = Array.from(refreshedClient!.relay.session_auth.values())
+        .filter((claims) => claims.session === session)
+        .map((claims) => claims.expires_at);
+      const renewed = world.sessions.get(session)?.expiresAt;
+      expect(renewed).toBeGreaterThan(staleExpiry);
+      expect(Math.max(...refreshed)).toBe(renewed);
+    } finally {
+      fixture.close();
+    }
+  });
+
+  it("refreshes the warm relay session row before planning movement", async () => {
+    const world = createWorld({ catalogs: ["chat", "demoworld", "tasks", "blocks-demo"] });
+    const env = { WOO_INTERNAL_SECRET: "v2-warm-secret" };
+    const fixture = commitScopeFixture(env);
+    const gateway = warmGateway(world, env, fixture.scopeFor, []);
+    try {
+      const session = await initializeMcp(gateway, "guest:b7-session-row-refresh", 1);
+      await mcpOk(gateway, session, 2, "the_chatroom", "enter");
+      await mcpCall(gateway, session, 3, "the_chatroom", "go", ["outline"]);
+      await mcpCall(gateway, session, 4, "the_outline", "go", ["out"]);
+      expect(world.activeScopeForSession(session)).toBe("the_chatroom");
+
+      const scopes = (gateway as unknown as {
+        v2Scopes: Map<ObjRef, { relay: { commit_scope: Parameters<typeof serializedFor>[0] } }>;
+      }).v2Scopes;
+      const chatroomClient = scopes.get("the_chatroom");
+      expect(chatroomClient, "expected warm chatroom scope client").toBeDefined();
+      const serialized = serializedFor(chatroomClient!.relay.commit_scope, { reason: "test_stale_session_row" });
+      const cachedSession = serialized.sessions.find((row) => row.id === session);
+      expect(cachedSession, "expected cached session row in chatroom relay").toBeDefined();
+      cachedSession!.activeScope = "the_outline";
+
+      await mcpCall(gateway, session, 5, "the_chatroom", "southeast", []);
+      expect(world.activeScopeForSession(session)).toBe("the_deck");
     } finally {
       fixture.close();
     }
@@ -349,9 +416,13 @@ function lastOwnerPrefetch(metrics: MetricEvent[]): Extract<MetricEvent, { kind:
 }
 
 async function mcpOk(gateway: McpGateway, sessionId: string, id: number, object: ObjRef, verb: string): Promise<void> {
+  await mcpCall(gateway, sessionId, id, object, verb, []);
+}
+
+async function mcpCall(gateway: McpGateway, sessionId: string, id: number, object: ObjRef, verb: string, args: unknown[]): Promise<void> {
   const result = await mcp(gateway, sessionId, id, "tools/call", {
     name: "woo_call",
-    arguments: { object, verb, args: [] }
+    arguments: { object, verb, args }
   });
   expect(result.result.isError, `${object}:${verb} failed: ${JSON.stringify(result.result.structuredContent)}`).not.toBe(true);
 }

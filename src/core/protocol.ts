@@ -298,7 +298,7 @@ export async function handleRestProtocolRequest(request: RestProtocolRequest, ho
 
     if (request.method === "GET" && route.rest.length === 1 && route.rest[0] === "log") {
       if (!isSpaceLike(world, target)) throw wooError("E_NOTAPPLICABLE", `${target} does not have a sequenced log`, target);
-      if (!world.hasPresence(session.actor, target)) throw wooError("E_PERM", `${session.actor} is not present in ${target}`);
+      if (!world.sessionCanAccessSpace(session.actor, target, session.id)) throw wooError("E_PERM", `${session.actor} is not present in ${target}`);
       const from = Math.max(1, Number(request.query("from") ?? 1));
       const limit = Math.min(Math.max(1, Number(request.query("limit") ?? 100)), 1000);
       const entries = world.replay(target, from, limit + 1);

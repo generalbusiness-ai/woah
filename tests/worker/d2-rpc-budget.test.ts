@@ -59,6 +59,10 @@ class FakeKVNamespace {
   async put(key: string, value: string): Promise<void> {
     this.values.set(key, value);
   }
+
+  async delete(key: string): Promise<void> {
+    this.values.delete(key);
+  }
 }
 
 function createD2Harness(): D2Harness {

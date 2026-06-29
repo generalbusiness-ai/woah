@@ -64,6 +64,10 @@ class FakeKVNamespace {
   async put(key: string, value: string): Promise<void> {
     this.values.set(key, value);
   }
+
+  async delete(key: string): Promise<void> {
+    this.values.delete(key);
+  }
 }
 
 class WaitUntilDurableObjectState extends FakeDurableObjectState {
@@ -135,16 +139,34 @@ describe("CF-local smoke walkthrough", () => {
       // the tool-surface-after-move step requires alice to enter the_pinboard, which
       // the dangling_parent_ref==0 gate already covers via includeCarryAcrossRooms.
       // The full tool-surface step is enforced in smoke:cf-dev.
-      await runSmokeWalkthrough({ alice, bob }, localStep, {
-        runId,
-        includeConcurrentMove: true,
-        includeTakeDrop: true,
-        includeCarryAcrossRooms: true,
-        includeToolSurfaceAfterMove: false,
-        waitTimeoutMs: 10_000,
-        drainBudgetMs: DRAIN_TOTAL_BUDGET_MS,
-        drainPollMs: DRAIN_POLL_MS
-      });
+      try {
+        await runSmokeWalkthrough({ alice, bob }, localStep, {
+          runId,
+          includeConcurrentMove: true,
+          includeTakeDrop: true,
+          includeCarryAcrossRooms: true,
+          includeToolSurfaceAfterMove: false,
+          waitTimeoutMs: 10_000,
+          drainBudgetMs: DRAIN_TOTAL_BUDGET_MS,
+          drainPollMs: DRAIN_POLL_MS
+        });
+      } catch (err) {
+        const relevantMetrics = logSpy
+          ? consoleSpyCalls(logSpy)
+            .map((args) => args.map((arg) => (typeof arg === "string" ? arg : JSON.stringify(arg))).join(" "))
+            .filter((line) =>
+              line.includes('"kind":"mcp_tool_resolve"') ||
+              line.includes('"kind":"moveto_actor"') ||
+              line.includes('"kind":"gateway_projection_apply"') ||
+              line.includes('"kind":"gateway_projection_cache_write"') ||
+              line.includes('"kind":"turn_phase_timing"')
+            )
+            .slice(-40)
+          : [];
+        throw new Error(
+          `${err instanceof Error ? err.message : String(err)}\nRelevant captured metrics:\n${relevantMetrics.join("\n")}`
+        );
+      }
       // Regression guard for the gateway-shard lineage gap (perf-plan steps
       // 1-2): MCP planning must never run against a sparse relay snapshot that
       // dangles either universal actor support ($system/$guest/...) or

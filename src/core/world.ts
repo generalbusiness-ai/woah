@@ -3258,16 +3258,23 @@ export class WooWorld {
     });
   }
 
-  /** Mark a session as having received meaningful user input. Updates the
-   * in-memory `lastInputAt` only — does not persist. Called from authenticated
-   * WS / REST ingress for `op: call | direct | input` (and on socket attach,
-   * inline above). NOT called from `world.directCall` or `world.call`,
-   * because many of those callers are internal/test/system paths without a
-   * real user behind them; the gating happens at the protocol edge instead. */
+  /** Mark a session as having received meaningful user input. Called from
+   * authenticated WS / REST / MCP ingress for `op: call | direct | input` (and
+   * on socket attach, inline above). NOT called from `world.directCall` or
+   * `world.call`, because many of those callers are internal/test/system paths
+   * without a real user behind them; the gating happens at the protocol edge
+   * instead. */
   touchSessionInput(sessionId: string, now: number = Date.now()): void {
     const session = this.sessions.get(sessionId);
     if (!session) return;
     session.lastInputAt = now;
+    if (session.closedAt !== undefined || now >= session.expiresAt) return;
+    const ttl = this.sessionTtl(session.tokenClass);
+    if (session.expiresAt - now > ttl / 2) return;
+    // Sliding renewal keeps active stateless transports authenticated without a
+    // session-row write on every request. Persist only near the half-life.
+    session.expiresAt = now + ttl;
+    this.persistSession(session);
   }
 
   /** Most recent input timestamp across any of `actor`'s sessions, regardless
@@ -3559,6 +3566,16 @@ export class WooWorld {
   hasSessionPresence(sessionId: string, space: ObjRef): boolean {
     this.ensurePresenceIndex();
     return this.sessionSpacesIndex.get(sessionId)?.has(space) === true;
+  }
+
+  sessionCanAccessSpace(actor: ObjRef, space: ObjRef, sessionId: string | null = null): boolean {
+    if (this.isWizard(actor)) return true;
+    // Durable/log replay can race projection materialization on sparse MCP
+    // shards. The session row is the authoritative occupancy hint for the
+    // caller, so mirror authorizePresence instead of requiring the room's
+    // subscriber projection to have arrived first.
+    if (sessionId && (this.hasSessionPresence(sessionId, space) || this.activeScopeForSession(sessionId) === space)) return true;
+    return this.hasPresence(actor, space);
   }
 
   async call(frameId: string | undefined, sessionId: string, space: ObjRef, message: Message): Promise<AppliedFrame | ErrorFrame> {
@@ -8851,9 +8868,7 @@ export class WooWorld {
   }
 
   private authorizePresence(actor: ObjRef, space: ObjRef, sessionId: string | null = null): void {
-    if (this.isWizard(actor)) return;
-    if (sessionId && (this.hasSessionPresence(sessionId, space) || this.activeScopeForSession(sessionId) === space)) return;
-    if (!this.hasPresence(actor, space)) {
+    if (!this.sessionCanAccessSpace(actor, space, sessionId)) {
       throw wooError("E_PERM", `${actor} is not present in ${space}`);
     }
   }

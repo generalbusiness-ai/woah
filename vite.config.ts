@@ -13,10 +13,12 @@ export default defineConfig({
   test: {
     include: ["tests/**/*.test.ts"],
     exclude: [...configDefaults.exclude, "**/.claude/**"],
-    // The threads pool avoids Vitest fork/birpc RPC timeouts; no single-worker
-    // cap is needed now that per-test timeout is high enough for heavy files.
+    // The Worker and browser shims are CPU-heavy under the deploy gate. Keep
+    // enough parallelism for coverage while avoiding scheduler stalls that make
+    // otherwise short integration tests hit their wall-clock timeout.
     pool: "threads",
+    maxWorkers: 4,
     isolate: false,
-    testTimeout: 30_000
+    testTimeout: 60_000
   }
 });

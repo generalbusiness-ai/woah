@@ -24,6 +24,7 @@ import {
   MAX_SHADOW_IDEMPOTENCY_ENTRIES,
   MAX_SHADOW_RECENT_REPLIES_ENTRIES,
   MAX_SHADOW_TRANSCRIPT_TAIL,
+  mergeShadowBrowserAuthoritySessionState,
   mergeShadowBrowserSessionState,
   openShadowBrowserScope,
   receiveShadowBrowserEnvelopeReceipt,
@@ -793,7 +794,14 @@ export class CommitScopeDO {
       return;
     }
     const serialized = serializedFor(relay.commit_scope, { reason: "commit_scope_session_merge", metric: (event) => this.emitMetric(event) });
-    const mergedSessions = mergeShadowBrowserSessionState(serialized.sessions, sessionRows);
+    // Legacy no-authority refreshes may be stale gateway snapshots, so they
+    // preserve an already scope-owned activeScope. Slim MCP requests are
+    // different: they carry the caller's current actor row in session_objects,
+    // making the accompanying session row fresh gateway authority for this
+    // caller. Let it replace stale per-scope activeScope rows.
+    const mergedSessions = (input.session_objects?.length ?? 0) > 0
+      ? mergeShadowBrowserAuthoritySessionState(serialized.sessions, sessionRows)
+      : mergeShadowBrowserSessionState(serialized.sessions, sessionRows);
     if (stableShadowJson(mergedSessions as unknown as WooValue) !== stableShadowJson(serialized.sessions as unknown as WooValue)) {
       serialized.sessions = mergedSessions;
       markShadowBrowserRelaySerializedChanged(relay);
@@ -1669,26 +1677,32 @@ export class CommitScopeDO {
   }
 
   private saveHeadSessionOpenBoundary(relay: ShadowRelayCache, input: CommitScopeBaseRequest): boolean {
-    // A warm head/session open should persist at most the caller's session row.
-    // Cold relays are handled by saveFullIfNeeded above.
+    // A warm head/session open persists only the caller's session row and actor
+    // row. The actor row is load-bearing for dynamic guests and for sessions
+    // that moved since this scope's last full snapshot; without it a later slim
+    // envelope can rehydrate a session that points at an actor the snapshot
+    // cannot dereference, or at a stale actor location.
     const session = shadowCommitScopeSession(relay.commit_scope, input.session, input.actor);
     const actor = shadowCommitScopeObject(relay.commit_scope, input.actor);
     if (!session || !actor) return false;
-    const body = JSON.stringify(session);
-    const existing = sqlRows<{ body: string }>(this.state.storage.sql.exec(
+    const sessionBody = JSON.stringify(session);
+    const actorBody = JSON.stringify(actor);
+    const existingSession = sqlRows<{ body: string }>(this.state.storage.sql.exec(
       "SELECT body FROM v2_commit_scope_session WHERE id = ? LIMIT 1",
       session.id
     ))[0] ?? null;
-    if (existing?.body === body) return false;
+    const existingActor = sqlRows<{ body: string }>(this.state.storage.sql.exec(
+      "SELECT body FROM v2_commit_scope_object WHERE id = ? LIMIT 1",
+      actor.id
+    ))[0] ?? null;
+    const sessionChanged = existingSession?.body !== sessionBody;
+    const actorChanged = existingActor?.body !== actorBody;
+    if (!sessionChanged && !actorChanged) return false;
     const now = Date.now();
     this.state.storage.transactionSync(() => {
       this.saveMeta(relay, now);
-      this.state.storage.sql.exec(
-        "INSERT OR REPLACE INTO v2_commit_scope_session(id, body, updated_at) VALUES (?, ?, ?)",
-        session.id,
-        body,
-        now
-      );
+      if (actorChanged) this.saveObjectRow(actor, now);
+      if (sessionChanged) this.saveSessionRow(session, now);
     });
     return true;
   }

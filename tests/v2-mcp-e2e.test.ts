@@ -183,8 +183,9 @@ describe("v2 MCP e2e", () => {
       expect(JSON.stringify(waited.result.structuredContent)).toContain("slim two");
 
       // With slimWarmEnvelope enabled, every first-attempt envelope omits the
-      // authority slice and legacy session_objects while retaining the tiny
-      // session rows. True cold misses are covered by the companion reseed test.
+      // authority slice while retaining the tiny session rows and the current
+      // session actor support row. True cold misses are covered by the companion
+      // reseed test.
       const envelopes = commitPosts.filter((post) => post.path === "/v2/envelope");
       expect(envelopes.length).toBeGreaterThanOrEqual(2);
       expect(
@@ -192,7 +193,10 @@ describe("v2 MCP e2e", () => {
         JSON.stringify(envelopes.map((post) => ({ scope: post.scope, hasAuthority: Object.prototype.hasOwnProperty.call(post.body, "authority") })))
       ).toBe(true);
       for (const post of envelopes) {
-        expect(post.body.session_objects ?? []).toEqual([]);
+        const actor = post.body.actor;
+        expect(post.body.session_objects ?? []).toEqual(expect.arrayContaining([
+          expect.objectContaining({ id: actor })
+        ]));
         expect(post.body).toHaveProperty("sessions");
       }
       // Convergence on the slim path is proven above: the second turn's
@@ -202,6 +206,141 @@ describe("v2 MCP e2e", () => {
       // companion cold-reseed test below exercises the durable commit retry.)
     } finally {
       for (const state of scopeStates.values()) state.close();
+    }
+  });
+
+  it("slimWarmEnvelope sends the session actor row for a new guest on an already-warm scope", async () => {
+    const world = createWorld();
+    const env = { WOO_INTERNAL_SECRET: "v2-mcp-secret" };
+    const scopeStates = new Map<ObjRef, FakeDurableObjectState>();
+    const scopes = new Map<ObjRef, CommitScopeDO>();
+    const commitPosts: Array<{ scope: ObjRef; path: "/v2/open" | "/v2/envelope"; body: Record<string, unknown> }> = [];
+    const stateFor = (commitScope: ObjRef): FakeDurableObjectState => {
+      let state = scopeStates.get(commitScope);
+      if (!state) {
+        state = new FakeDurableObjectState(commitScope);
+        scopeStates.set(commitScope, state);
+      }
+      return state;
+    };
+    const scopeFor = (commitScope: ObjRef): CommitScopeDO => {
+      let scope = scopes.get(commitScope);
+      if (!scope) {
+        scope = new CommitScopeDO(stateFor(commitScope) as unknown as ConstructorParameters<typeof CommitScopeDO>[0], env);
+        scopes.set(commitScope, scope);
+      }
+      return scope;
+    };
+    const gateway = new McpGateway(world, {
+      v2: {
+        slimWarmEnvelope: true,
+        open: async (commitScope, body) => {
+          commitPosts.push({ scope: commitScope, path: "/v2/open", body: body as unknown as Record<string, unknown> });
+          return await postCommitScope(scopeFor(commitScope), env, commitScope, "/v2/open", body);
+        },
+        envelope: async (commitScope, body) => {
+          commitPosts.push({ scope: commitScope, path: "/v2/envelope", body: body as unknown as Record<string, unknown> });
+          return await postCommitScope<McpV2EnvelopeResult>(scopeFor(commitScope), env, commitScope, "/v2/envelope", body);
+        }
+      }
+    });
+
+    try {
+      const alice = await initializeMcp(gateway, "guest:v2-mcp-warm-scope-alice", 1);
+      const aliceActor = world.sessions.get(alice)?.actor;
+      expect(aliceActor).toBeTruthy();
+      const warm = await mcp(gateway, alice, 2, "tools/call", {
+        name: "woo_call",
+        arguments: { object: "the_chatroom", verb: "say", args: ["warm chatroom before later guest"] }
+      });
+      expect(warm.result.isError, JSON.stringify(warm.result.structuredContent)).not.toBe(true);
+
+      const later = await initializeMcp(gateway, "guest:v2-mcp-warm-scope-later", 20);
+      const laterActor = world.sessions.get(later)?.actor;
+      expect(laterActor).toBeTruthy();
+      expect(laterActor).not.toBe(aliceActor);
+      const moved = await mcp(gateway, later, 21, "tools/call", {
+        name: "woo_call",
+        arguments: { object: "the_chatroom", verb: "go", args: ["outline"] }
+      });
+      expect(moved.result.isError, JSON.stringify(moved.result.structuredContent)).not.toBe(true);
+      expect(moved.result.structuredContent.result).toEqual(expect.objectContaining({ room: "the_outline" }));
+
+      const laterChatroomOpens = commitPosts.filter((post) =>
+        post.scope === "the_chatroom" &&
+        post.path === "/v2/open" &&
+        post.body.actor === laterActor
+      );
+      expect(laterChatroomOpens.length).toBeGreaterThanOrEqual(1);
+      expect(laterChatroomOpens.some((post) =>
+        Array.isArray(post.body.session_objects) &&
+        post.body.session_objects.some((obj: any) => obj?.id === laterActor)
+      )).toBe(true);
+      const laterChatroomEnvelope = commitPosts.find((post) =>
+        post.scope === "the_chatroom" &&
+        post.path === "/v2/envelope" &&
+        post.body.actor === laterActor
+      );
+      expect(laterChatroomEnvelope?.body).not.toHaveProperty("authority");
+      expect(laterChatroomEnvelope?.body.session_objects).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: laterActor, location: "the_chatroom" })
+      ]));
+    } finally {
+      for (const state of scopeStates.values()) state.close();
+    }
+  });
+
+  it("slim head-session open replaces a stale activeScope when carrying the actor row", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:v2-mcp-head-session-active-scope");
+    expect(world.activeScopeForSession(session.id)).toBe("the_chatroom");
+
+    const env = { WOO_INTERNAL_SECRET: "v2-mcp-secret" };
+    const state = new FakeDurableObjectState("the_chatroom");
+    const scope = new CommitScopeDO(state as unknown as ConstructorParameters<typeof CommitScopeDO>[0], env);
+    try {
+      const staleSeed = world.exportWorld();
+      const staleSession = staleSeed.sessions.find((row) => row.id === session.id);
+      expect(staleSession).toBeTruthy();
+      staleSession!.activeScope = "the_deck";
+
+      await postCommitScope(scope, env, "the_chatroom", "/v2/open", {
+        scope: "the_chatroom",
+        node: "mcp:stale-head-session-seed",
+        token: `mcp-v2:${session.id}:${session.actor}`,
+        session: session.id,
+        actor: session.actor,
+        serialized: staleSeed,
+        sessions: staleSeed.sessions,
+        session_objects: []
+      });
+
+      const currentSession = world.exportSessions().find((row) => row.id === session.id);
+      expect(currentSession?.activeScope).toBe("the_chatroom");
+      await postCommitScope(scope, env, "the_chatroom", "/v2/open", {
+        scope: "the_chatroom",
+        node: "mcp:fresh-head-session-open",
+        token: `mcp-v2:${session.id}:${session.actor}`,
+        session: session.id,
+        actor: session.actor,
+        open_protocol: "head_session.v1",
+        known_head: null,
+        sessions: [currentSession!],
+        session_objects: world.exportObjects([session.actor])
+      });
+
+      const rows = sqlRows<{ body: string }>(state.storage.sql.exec(
+        "SELECT body FROM v2_commit_scope_session WHERE id = ? LIMIT 1",
+        session.id
+      ));
+      expect(rows).toHaveLength(1);
+      expect(JSON.parse(rows[0].body)).toMatchObject({
+        id: session.id,
+        actor: session.actor,
+        activeScope: "the_chatroom"
+      });
+    } finally {
+      state.close();
     }
   });
 
@@ -937,7 +1076,10 @@ describe("v2 MCP e2e", () => {
       expect(seededOpens).toHaveLength(concurrentCalls);
       expect(tinyOpens.every((body) => body.open_protocol === "head_session.v1")).toBe(true);
       expect(tinyOpens.every((body) => !Object.prototype.hasOwnProperty.call(body, "serialized"))).toBe(true);
-      expect(tinyOpens.every((body) => Array.isArray(body.session_objects) && body.session_objects.length === 0)).toBe(true);
+      expect(tinyOpens.every((body) =>
+        Array.isArray(body.session_objects) &&
+        body.session_objects.some((obj: any) => obj?.id === body.actor)
+      )).toBe(true);
       expect(seededOpens.every((body) => body.open_protocol === "head_session.v1")).toBe(true);
       expect(seededOpens.every((body) => Object.prototype.hasOwnProperty.call(body, "serialized"))).toBe(true);
       expect(seededOpens.every((body) => body.authority?.kind === "woo.authority_slice.cells.shadow.v1")).toBe(true);

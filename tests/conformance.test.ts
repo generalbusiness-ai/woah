@@ -320,6 +320,26 @@ function installFailureFixture(world: WooWorld): void {
 }
 
 describe.each(backends)("world conformance: $name", ({ make }) => {
+  it("renews active stateless session auth expiry on input", () => {
+    const harness = make({ catalogs: false });
+    try {
+      const world = harness.world;
+      const session = world.auth("guest:conf-touch-renew");
+      const now = Date.now();
+      session.expiresAt = now + 10_000;
+
+      world.touchSessionInput(session.id, now);
+
+      expect(session.lastInputAt).toBe(now);
+      expect(session.expiresAt).toBeGreaterThan(now + 4 * 60_000);
+      const renewed = session.expiresAt;
+      const restarted = harness.restart();
+      expect(restarted.sessions.get(session.id)?.expiresAt).toBe(renewed);
+    } finally {
+      harness.cleanup();
+    }
+  });
+
   it("sequences calls, supports idempotent retry, replay paging, and behavior rollback", async () => {
     const harness = make();
     try {

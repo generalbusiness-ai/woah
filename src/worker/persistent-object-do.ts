@@ -4153,7 +4153,7 @@ export class PersistentObjectDO {
           Number(body.started ?? 0)
         );
         const space = String(body.space ?? "") as ObjRef;
-        if (!world.hasPresence(session.actor, space)) throw wooError("E_PERM", `${session.actor} is not present in ${space}`);
+        if (!world.sessionCanAccessSpace(session.actor, space, session.id)) throw wooError("E_PERM", `${session.actor} is not present in ${space}`);
         const from = Math.max(1, Number(body.from ?? 1));
         const limit = Math.min(Math.max(1, Number(body.limit ?? 100)), 500);
         return jsonResponse({ op: "replay", id: body.frame_id, space, from, entries: world.replay(space, from, limit) });

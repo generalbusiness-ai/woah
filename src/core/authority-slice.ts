@@ -590,9 +590,21 @@ function mergeAuthoritySessions(
   sessions: readonly SerializedSession[],
   options: MergeSerializedAuthorityOptions
 ): boolean {
+  const existingById = new Map(serialized.sessions.map((session) => [session.id, session]));
   const next = options.clone
     ? structuredClone(sessions) as SerializedSession[]
     : sessions.map((session) => session as SerializedSession);
+  for (const session of next) {
+    const existing = existingById.get(session.id);
+    if (!existing || existing.actor !== session.actor) continue;
+    // Authority slices can be assembled from relay snapshots older than the
+    // gateway's live session row. Expiry is a liveness lease, so keep it
+    // monotonic for the same session while still allowing omission to delete a
+    // closed/reaped session and allowing activeScope to come from authority.
+    const existingExpiresAt = existing.expiresAt ?? 0;
+    const sessionExpiresAt = session.expiresAt ?? 0;
+    if (existingExpiresAt > sessionExpiresAt) session.expiresAt = existingExpiresAt;
+  }
   if (stableShadowJson(next as unknown as WooValue) === stableShadowJson(serialized.sessions as unknown as WooValue)) return false;
   // B-iii: record which session rows actually changed so callers can update
   // only those entries in their indexed state.
