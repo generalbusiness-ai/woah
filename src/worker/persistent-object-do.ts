@@ -203,6 +203,10 @@ export interface Env {
   // applyRemoteAccepted (same-process, single-threaded, no window between invalidate
   // and re-insert from the caller's perspective).
   WOO_V2_D2_TOOL_SURFACE_IN_FANOUT?: string;
+  // Best-effort MCP commit fanout timeout. This must stay much shorter than the
+  // generic read timeout: remote MCP delivery is replay-repairable, while stale
+  // gateway shards can otherwise spend seconds per recipient after every commit.
+  WOO_MCP_COMMIT_FANOUT_TIMEOUT_MS?: string;
   // Fault injection configuration for RPC seam testing (worker/test layer only).
   // JSON array of FaultSpec objects; see src/worker/rpc-fault-inject.ts.
   // Never set in production. Opt-in per test run.
@@ -395,6 +399,12 @@ const METRIC_SAMPLE_WINDOW_MS = 1000;
 // run bootstrap, and serve the snapshot, which can spike to 3-4s on first
 // touch. Override per deployment via WOO_HOST_READ_TIMEOUT_MS.
 const HOST_READ_RPC_TIMEOUT_MS = 5000;
+// Remote MCP commit fanout is best-effort delivery to peer wait queues. A warm
+// legitimate peer shard normally answers in tens of milliseconds, while a stale
+// cold shard can sit on the generic 5s read deadline and saturate the gateway
+// fleet. Keep this budget short and rely on replay/catch-up for missed stale
+// recipients.
+const MCP_COMMIT_FANOUT_RPC_TIMEOUT_MS = 1000;
 // Mutating cross-host RPCs do not have an inherent deadline (a write that
 // takes 30s may still be making progress), but a wedged DO can park a slot
 // forever and the local task chain along with it. The watchdog is a
@@ -6917,7 +6927,7 @@ export class PersistentObjectDO {
     if (hosts.size > 0) {
       const task = Promise.all(Array.from(hosts, async (host) => {
         try {
-          await this.forwardInternalChecked<{ ok: true }>(host, "/__internal/mcp-commit-fanout", body, { timeoutMs: this.hostReadRpcTimeoutMs() });
+          await this.forwardInternalChecked<{ ok: true }>(host, "/__internal/mcp-commit-fanout", body, { timeoutMs: this.mcpCommitFanoutRpcTimeoutMs() });
         } catch (err) {
           console.warn("woo.mcp_fanout.failed", { host, scope, error: normalizeError(err) });
         }
@@ -7203,6 +7213,11 @@ export class PersistentObjectDO {
   private hostReadRpcTimeoutMs(): number {
     const configured = Number(this.env.WOO_HOST_READ_TIMEOUT_MS);
     return Number.isFinite(configured) && configured > 0 ? configured : HOST_READ_RPC_TIMEOUT_MS;
+  }
+
+  private mcpCommitFanoutRpcTimeoutMs(): number {
+    const configured = Number(this.env.WOO_MCP_COMMIT_FANOUT_TIMEOUT_MS);
+    return Number.isFinite(configured) && configured > 0 ? configured : MCP_COMMIT_FANOUT_RPC_TIMEOUT_MS;
   }
 
   private hostWriteRpcTimeoutMs(): number {

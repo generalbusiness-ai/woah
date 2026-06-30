@@ -545,6 +545,49 @@ describe("v2 Worker fan-out helpers", () => {
     );
   });
 
+  it("uses the dedicated short timeout for remote MCP commit fanout", async () => {
+    const gateway = Object.create(PersistentObjectDO.prototype) as Record<string, any>;
+    gateway.state = new FakeDurableObjectState("the_weather") as unknown as DurableObjectState;
+    gateway.env = {
+      WOO_MCP_GATEWAY_SHARDS: "32",
+      WOO_HOST_READ_TIMEOUT_MS: "5000",
+      WOO_MCP_COMMIT_FANOUT_TIMEOUT_MS: "777"
+    } as Env;
+    const calls: Array<{ host: string; path: string; options: { timeoutMs?: number } }> = [];
+    gateway.forwardInternalChecked = vi.fn(async (host: string, path: string, _body: Record<string, unknown>, options: { timeoutMs?: number }) => {
+      calls.push({ host, path, options });
+      return { ok: true };
+    });
+
+    const world = createWorld();
+    const alice = world.auth("guest:mcp-fanout-timeout-alice");
+    const bob = world.auth("guest:mcp-fanout-timeout-bob");
+    const transcript = durableTranscript("mcp-fanout-timeout", "the_weather", alice.id, alice.actor, [
+      { type: "text", source: "the_weather", text: "weather update" }
+    ]);
+    const commit = durableReplyEnvelope("mcp-fanout-timeout", "the_weather", "mcp:alice", alice.id, alice.actor, transcript).body.commit!;
+
+    await (gateway as unknown as {
+      deliverMcpCommitFanout(
+        world: WooWorld,
+        scope: ObjRef,
+        fanout: Array<{ node: string; envelope: string }>,
+        commit: unknown,
+        transcript: unknown,
+        originSessionId: string | null,
+        audience: { audienceSessions?: string[] },
+        options?: { deferRemote?: boolean }
+      ): Promise<void>;
+    }).deliverMcpCommitFanout(world, "the_weather", [], commit, transcript, alice.id, { audienceSessions: [bob.id] }, { deferRemote: false });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      path: "/__internal/mcp-commit-fanout",
+      options: { timeoutMs: 777 }
+    });
+    expect(calls[0]!.host).toMatch(/^mcp-gateway-\d+$/);
+  });
+
   it("supplements durable same-scope browser fan-out from gateway sockets when commit-scope memory lacks peer nodes", async () => {
     class SocketState extends FakeDurableObjectState {
       override getWebSockets(): WebSocket[] {

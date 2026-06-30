@@ -1008,6 +1008,11 @@ Runtimes without a background-lifetime primitive may fall back to synchronous
 delivery, but they must not weaken the durable object-host write-through rule
 above. Failed remote MCP fanout is logged and retried by later replay/open
 paths; it does not roll back the accepted commit.
+Because remote MCP fanout is best-effort and replay-repairable, it must use a
+shorter RPC deadline than generic cold read RPCs. A stale or cold gateway shard
+must not spend the full host-read timeout after every unrelated commit; the
+production default is 1000ms and may be overridden with
+`WOO_MCP_COMMIT_FANOUT_TIMEOUT_MS`.
 Remote shards consume `commit.projection_writes` plus the accepted transcript
 into their gateway projection cache when present, repairing cached container
 `contents` from moves/creates when the full container row is absent. They expand
