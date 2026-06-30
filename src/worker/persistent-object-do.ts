@@ -4051,7 +4051,7 @@ export class PersistentObjectDO {
         const authority = withAuthorityPageProvenance(
           world.exportAuthoritySlice([], objects),
           (ref) => ({
-            source: world.objectHostKey(ref.object) === hostKey ? "authoritative" : "cache",
+            source: (ref.object === hostKey || world.objectHostKey(ref.object) === hostKey) ? "authoritative" : "cache",
             source_host: hostKey
           })
         );
@@ -5641,6 +5641,11 @@ export class PersistentObjectDO {
         return "";
       }
     };
+    const bundledTopologyOwnerHost = (id: ObjRef): string => {
+      if (!mcpGatewayShard || id.startsWith("$")) return "";
+      const host = mcpGatewayBundledScopeTopologyObjects().ownerHostById.get(id) ?? "";
+      return host && host !== WORLD_HOST ? host : "";
+    };
     const resolveHost = async (id: ObjRef, fallbackHost: string): Promise<string> => {
       const localRoute = routesById.get(id) ?? null;
       if (localRoute) {
@@ -5677,11 +5682,21 @@ export class PersistentObjectDO {
         // self-hosted room; when the sparse local row proves self-placement,
         // prefer that owner route so a force-owner repair fetches authoritative
         // live cells from the room DO instead of looping on world's projection.
+        // Some sparse shards hold only a lineage-only topology row for the
+        // served scope, so local `host_placement` cannot prove self-ownership.
+        // For bundled topology ids, the precomputed owner map is the bounded
+        // fallback that keeps stale Directory `world` rows from misrouting a
+        // required owner refresh.
         const localSelfHost = localSelfHostedRoute(id);
-        const directoryHost = await this.fetchDirectoryObjectHost(id, localSelfHost);
+        const topologyOwnerHost = bundledTopologyOwnerHost(id);
+        const directoryHost = await this.fetchDirectoryObjectHost(id, localSelfHost || topologyOwnerHost);
         if (directoryHost === WORLD_HOST && localSelfHost) {
           this.routeCache.set(id, localSelfHost);
           return localSelfHost;
+        }
+        if ((directoryHost === WORLD_HOST || !directoryHost) && topologyOwnerHost) {
+          this.routeCache.set(id, topologyOwnerHost);
+          return topologyOwnerHost;
         }
         if (directoryHost) {
           this.routeCache.set(id, directoryHost);
