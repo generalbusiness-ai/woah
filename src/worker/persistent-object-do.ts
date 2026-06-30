@@ -5550,12 +5550,13 @@ export class PersistentObjectDO {
     // not refresh-suppressed — so the owner's exits-bearing row displaces the seed.
     const forceOwnerRefresh = reconstructionReason === "missing_state_repair";
     const forceOwnerObjectIds = new Set<ObjRef>(options.forceOwnerObjectIds ?? []);
-    // B7 repair-attempt rule: skip KV seed on any repair retry (attempt > 0).
-    // A stale KV page that caused a read_version_mismatch on attempt N must not
-    // be re-served on attempt N+1 — the repair loop would loop cache → mismatch
-    // → cache until the budget is exhausted. forceOwnerRefresh and
-    // forceOwnerObjectIds already exclude KV for owner-required passes; this
-    // flag additionally covers commit-phase retries where neither is set.
+    // B7 repair-attempt rule: skip cached/seeded stale authority on any repair
+    // retry (attempt > 0). A stale page that caused a read_version_mismatch on
+    // attempt N must not be re-served on attempt N+1 -- the repair loop would
+    // loop cache/seed -> mismatch -> cache/seed until the budget is exhausted.
+    // forceOwnerRefresh and forceOwnerObjectIds already exclude cached authority
+    // for owner-required passes; this flag additionally covers commit-phase
+    // retries where neither is set.
     const repairAttempt = options.repairAttempt === true;
     const reconstructionScope = options.reconstructionScope ?? ids[0] ?? "$nowhere";
     const localHost = this.durableHostKey();
@@ -5673,13 +5674,14 @@ export class PersistentObjectDO {
     };
 
     // CA11.2: a pre-seeded topology id is owner-deferring quasi-static lineage
-    // that we DELIBERATELY do not refresh per turn — that synchronous cross-host
-    // authority-slice is exactly the cost the pre-seed removes. It is repaired on
-    // the next move's commit-time read-dependency validation at the owner (which
-    // returns E_STALE_AUTHORITY / read-version on a topology edit), and an
-    // owner-authoritative row, when it arrives by any path, displaces the seeded
-    // page by CA11 precedence. So exclude seeded ids from the remote partition;
-    // the accepted CA6 read-staleness window is the only observable effect.
+    // that we DELIBERATELY do not refresh on an ordinary turn -- that synchronous
+    // cross-host authority-slice is exactly the cost the pre-seed removes. It is
+    // repaired on the next move's commit-time read-dependency validation at the
+    // owner (which returns E_STALE_AUTHORITY / read-version on a topology edit),
+    // and an owner-authoritative row, when it arrives by any path, displaces the
+    // seeded page by CA11 precedence. So exclude seeded ids from the remote
+    // partition only while the turn is not already repairing; a repair attempt
+    // must not re-serve the same stale seed that just failed validation.
     const seededTopologyIds = mcpGatewayShard && this.mcpScopeTopologySeed ? this.mcpScopeTopologySeed.seededIds : null;
     const seededOwnerById = mcpGatewayShard && this.mcpScopeTopologySeed ? this.mcpScopeTopologySeed.ownerHostById : null;
     const resolvedIds = await Promise.all(requestedIds.map(async (id) => {
@@ -5687,19 +5689,21 @@ export class PersistentObjectDO {
       // scope (an actor's active scope / the commit scope) is excluded from
       // suppression so its owner-authoritative row (with live exits/next_seq) is
       // fetched and displaces the seeded lineage-only page by CA11 precedence. A
-      // missing_state_repair pass force-fetches every requested id (the
-      // movement-destination occupancy transition), so suppression is disabled.
-      if (!forceOwnerRefresh && !forceOwnerObjectIds.has(id) && seededTopologyIds?.has(id) && world.objects.has(id) && !servedScopeIds.has(id)) return [id, localHost] as const;
-      // CA11.2 occupancy transition: on a missing_state_repair pass, a seeded id
-      // must be force-fetched from its REAL owner so the authoritative row
-      // displaces the local seed. The seed recorded that owner at build time;
-      // use it directly. A gateway shard does NOT publish its seeded rows to
-      // Directory, so the generic resolveHost would return "" for a seeded id
-      // (no Directory route, no local route) and the id would silently drop out
-      // of the remote-fetch set — leaving the stale seed in place and looping the
-      // movement-boundary guard. The recorded owner is authoritative provenance
-      // metadata, so it is the correct host to fetch from.
-      if ((forceOwnerRefresh || forceOwnerObjectIds.has(id)) && seededTopologyIds?.has(id)) {
+      // missing_state_repair pass force-fetches every requested id (the movement-
+      // destination occupancy transition), and a commit-phase repair attempt has
+      // already proven the seed stale via read_version_mismatch; in both cases
+      // suppression is disabled.
+      if (!repairAttempt && !forceOwnerRefresh && !forceOwnerObjectIds.has(id) && seededTopologyIds?.has(id) && world.objects.has(id) && !servedScopeIds.has(id)) return [id, localHost] as const;
+      // CA11.2 occupancy/repair transition: on a missing_state_repair pass, or on
+      // any retry after read_version_mismatch, a seeded id must be fetched from
+      // its REAL owner so the authoritative row displaces the local seed. The
+      // seed recorded that owner at build time; use it directly. A gateway shard
+      // does NOT publish its seeded rows to Directory, so the generic resolveHost
+      // would return "" for a seeded id (no Directory route, no local route) and
+      // the id would silently drop out of the remote-fetch set -- leaving the
+      // stale seed in place and looping repair. The recorded owner is
+      // authoritative provenance metadata, so it is the correct host to fetch.
+      if ((repairAttempt || forceOwnerRefresh || forceOwnerObjectIds.has(id)) && seededTopologyIds?.has(id)) {
         const seededOwner = seededOwnerById?.get(id);
         if (seededOwner && seededOwner !== localHost) return [id, seededOwner] as const;
       }

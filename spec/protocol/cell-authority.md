@@ -667,6 +667,15 @@ governed by the CA11 provenance rules with no exception:
   force-owner repair (the gateway) enables it; holder paths that plan
   optimistically against derived rows and reconcile by their own protocol (the
   browser, REST relay) attach provenance but do not enforce it.
+- **Commit repair after stale topology validation.** A commit-time
+  `read_version_mismatch` against a pre-seeded topology page is the owner proving
+  that the local seed is stale. The next repair attempt MUST NOT apply the normal
+  topology refresh-suppression rule for that seeded id. It MUST route the id to
+  the real owner recorded in the seed provenance (`source_host`) so the owner's
+  authoritative row can displace the seed before the repaired transcript is
+  submitted. Re-serving the same topology seed on the retry is forbidden because
+  it can oscillate between local seed state and owner state until the repair
+  budget is exhausted.
 - **Deterministic movement-destination prefetch.** Some movement destinations are
   not actually dynamic: a room direction verb can be read from the room's
   declarative `exits[verb].dest`, and mounted tool `leave`/`out` verbs often name
@@ -914,6 +923,12 @@ projection; CA8 fanout). Neither reintroduces a placement-style shared owner.
   (MCP gateway: 12 000ms) from the first observed repairable miss/conflict, to
   prevent indefinite retries when every repair attempt is under repair without
   denying the first useful retry after a slow cold first attempt.
+- **Topology pre-seed suppression is also disabled on repair attempts.** The
+  ordinary cold-start optimization may classify a one-hop topology seed as
+  locally sufficient, but once a retry is running after `read_version_mismatch`
+  that same seed is evidence, not authority. The repair attempt MUST resolve the
+  seeded id through its recorded owner provenance instead of suppressing the
+  remote owner partition.
 
 ### CA13.5 Forbidden degradation modes
 

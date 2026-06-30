@@ -220,6 +220,58 @@ describe("CF-local prod-shape structural probes", () => {
     }
   });
 
+  it("routes topology-preseeded ids to their seeded owner during repair attempts", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const harness = createStructuralHarness();
+    const runId = `cf-local-topology-repair-${Date.now()}-${randomUUID().slice(0, 8)}`;
+    let sessionId: string | null = null;
+    try {
+      sessionId = await openMcpSession(harness, `guest:topology-repair-${runId}`, runId);
+      await callTool(harness, sessionId, 3, "woo_call", { object: "the_chatroom", verb: "enter", args: [] });
+      await callTool(harness, sessionId, 4, "woo_call", { object: "the_chatroom", verb: "southeast", args: [] });
+
+      const gatewayHost = mcpShardHost(sessionId);
+      const gateway = harness.wooObject(gatewayHost) as unknown as {
+        getWorld(): Promise<unknown>;
+        v2GatewayAuthorityPayload(world: unknown, ids: Iterable<ObjRef>, options: Record<string, unknown>): Promise<unknown>;
+      } | undefined;
+      expect(gateway, `expected gateway DO ${gatewayHost} to exist`).toBeTruthy();
+      const world = await gateway!.getWorld();
+
+      // Prime the deck's topology closure in the gateway world, then ask for a
+      // repair-attempt authority payload. Snapshot fallback avoids a real remote
+      // fetch; the partition metric is enough to prove seeded ids route to owner
+      // instead of being classified as satisfied by the local pre-seed.
+      logSpy.mockClear();
+      await gateway!.v2GatewayAuthorityPayload(world, ["the_deck", "exit_deck_south", "the_garden"], {
+        tolerateRemoteFailures: true,
+        useCommitScopeSnapshotForRemoteAuthority: true,
+        reconstructionReason: "warm_turn_refresh",
+        reconstructionTrigger: "turn_commit",
+        reconstructionScope: "guest_1",
+        repairAttempt: true
+      });
+
+      const repairPartitions = metricsFromLogSpy(logSpy)
+        .filter((m) => m.kind === "authority_slice_partition" && m.reason === "warm_turn_refresh");
+      const partitionedObjects = new Set(
+        repairPartitions.flatMap((m) => Array.isArray(m.objects) ? m.objects.map(String) : [])
+      );
+      expect(
+        partitionedObjects.has("exit_deck_south"),
+        "repair attempts must route seeded exit cells to their recorded owner"
+      ).toBe(true);
+      expect(
+        partitionedObjects.has("the_garden"),
+        "repair attempts must route seeded destination cells to their recorded owner"
+      ).toBe(true);
+    } finally {
+      if (sessionId) await mcpFetch(harness, { method: "DELETE", headers: { "mcp-session-id": sessionId } }).catch(() => undefined);
+      logSpy.mockRestore();
+      harness.close();
+    }
+  }, 120_000);
+
   it("reports warm-turn structural gate violations with actionable metric context", () => {
     const violations = warmTurnStructuralViolations([
       {
@@ -687,6 +739,7 @@ type StructuralHarness = {
   env: Env;
   request(path: string, init: RequestInit): Promise<Response>;
   setDirectoryLastSeenAt(sessionIds: readonly string[], lastSeenAt: number): void;
+  wooObject(name: string): PersistentObjectDO | undefined;
   close(): void;
 };
 
@@ -779,6 +832,7 @@ function createStructuralHarness(): StructuralHarness {
         directoryState.storage.sql.exec("UPDATE session_route SET last_seen_at = ? WHERE session_id = ?", lastSeenAt, sessionId);
       }
     },
+    wooObject: (name) => wooObjects.get(name),
     close: () => {
       directoryState.close();
       for (const state of wooStates.values()) state.close();
@@ -851,6 +905,7 @@ function createD1StructuralHarness(): StructuralHarness {
         directoryState.storage.sql.exec("UPDATE session_route SET last_seen_at = ? WHERE session_id = ?", lastSeenAt, sessionId);
       }
     },
+    wooObject: (name) => wooObjects.get(name),
     close: () => {
       directoryState.close();
       for (const state of wooStates.values()) state.close();
