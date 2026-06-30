@@ -28,6 +28,8 @@ export type SerializedSession = {
   lastDetachAt?: number | null;
   tokenClass?: "guest" | "bearer" | "apikey";
   activeScope?: ObjRef | null;
+  /** Recent client-ingress presence timestamp. This is a delivery hint, not an auth proof. */
+  lastSeenAt?: number;
   /** Legacy serialized field accepted while older snapshots exist. */
   currentLocation?: ObjRef | null;
   /** The apikey record id this session was minted from, when tokenClass is

@@ -447,6 +447,85 @@ describe("gateway projection cache", () => {
     expect(po.readGatewayToolSurfaceDescriptors([{ id: "remote_room", projection: "tools", expandContents: true }])).toEqual([]);
   });
 
+  it("does not use stale projection session rows as MCP fanout audience", () => {
+    const state = new FakeDurableObjectState("mcp-gateway-0");
+    const po = new PersistentObjectDO(state as unknown as DurableObjectState, env()) as unknown as {
+      applyGatewayProjectionWrites: (
+        head: ShadowScopeHead,
+        writes: ProjectionWrite[],
+        source: "fanout",
+        delta?: ProjectionDeltaSummary
+      ) => { rows: number; bytes: number };
+      loadProjectionSessionsForScopes: (
+        commitScope: ObjRef,
+        scopes: readonly ObjRef[]
+      ) => { sessions: SerializedSession[]; hasProjection: boolean; roomScopesWithNoSessions: ObjRef[] };
+    };
+    const now = Date.now();
+    const commitScope = "guest_probe" as ObjRef;
+    const room = "the_chatroom" as ObjRef;
+    const staleNoPresence: SerializedSession = {
+      id: "session-stale-no-presence",
+      actor: "guest_stale_no_presence" as ObjRef,
+      started: now - 60_000,
+      expiresAt: now + 60_000,
+      tokenClass: "guest",
+      activeScope: room
+    };
+    const staleOldPresence: SerializedSession = {
+      id: "session-stale-old-presence",
+      actor: "guest_stale_old_presence" as ObjRef,
+      started: now - 60_000,
+      expiresAt: now + 60_000,
+      tokenClass: "guest",
+      activeScope: room,
+      lastSeenAt: now - 10 * 60_000
+    };
+
+    try {
+      po.applyGatewayProjectionWrites({
+        kind: "woo.scope_head.shadow.v1",
+        scope: commitScope,
+        epoch: 1,
+        seq: 1,
+        hash: "h1"
+      }, [
+        { table: "sessions", key: staleNoPresence.id, op: "upsert", row: staleNoPresence, bytes: 100 },
+        { table: "sessions", key: staleOldPresence.id, op: "upsert", row: staleOldPresence, bytes: 100 }
+      ], "fanout");
+
+      const staleResult = po.loadProjectionSessionsForScopes(commitScope, [room]);
+      expect(staleResult.hasProjection).toBe(true);
+      expect(staleResult.sessions).toEqual([]);
+      expect(staleResult.roomScopesWithNoSessions).toEqual([room]);
+
+      const livePresence: SerializedSession = {
+        id: "session-live-presence",
+        actor: "guest_live_presence" as ObjRef,
+        started: now,
+        expiresAt: now + 60_000,
+        tokenClass: "guest",
+        activeScope: room,
+        lastSeenAt: now
+      };
+      po.applyGatewayProjectionWrites({
+        kind: "woo.scope_head.shadow.v1",
+        scope: commitScope,
+        epoch: 1,
+        seq: 2,
+        hash: "h2"
+      }, [
+        { table: "sessions", key: livePresence.id, op: "upsert", row: livePresence, bytes: 100 }
+      ], "fanout");
+
+      const liveResult = po.loadProjectionSessionsForScopes(commitScope, [room]);
+      expect(liveResult.sessions.map((session) => session.id)).toEqual([livePresence.id]);
+      expect(liveResult.roomScopesWithNoSessions).toEqual([]);
+    } finally {
+      state.close();
+    }
+  });
+
   it("does not replay host transcripts for empty projection deltas", async () => {
     const state = new FakeDurableObjectState("world");
     const world = createWorld();

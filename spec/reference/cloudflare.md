@@ -834,6 +834,15 @@ subscribers ride the commit-scope subscriber/fanout path and catch up by replay,
 so an idle-but-live session that has fallen out of the presence window is not
 kept room-present for its whole auth lease.
 
+Gateway projection-session caches follow the same presence contract. A projected
+`sessions` row may remain useful for auth-shaped state until `expires_at`, but it
+is eligible for MCP fanout audience only when it carries a recent client-ingress
+`lastSeenAt`/`last_seen_at` timestamp within `PRESENCE_LIVE_WINDOW_MS`. Legacy
+projection rows without that timestamp, or rows whose timestamp has aged out,
+are treated as cache-incomplete for audience routing and fall back to the
+targeted Directory enrichment path instead of selecting one gateway shard per
+stale session.
+
 `DELETE /mcp` is a session end, not a heartbeat. When an established MCP session
 is routed to a shard, the shard closes the local transport queue, drops local
 session/tool cache rows, forwards a signed internal end-session request to

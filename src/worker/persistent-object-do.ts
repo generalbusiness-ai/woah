@@ -411,6 +411,11 @@ const HOST_WRITE_RPC_TIMEOUT_MS = 30_000;
 // a moved/disconnected actor linger in user-visible room text.
 const DIRECTORY_SCOPE_SESSIONS_TTL_MS = 1_000;
 const DIRECTORY_SCOPE_SESSIONS_CACHE_MAX = 128;
+// Projection-cache session rows must obey the same live-presence window as
+// Directory. The row may remain auth-valid until expiresAt, but fanout delivery
+// is a recent-ingress concern; otherwise stale relay/session rows can fan out to
+// many cold gateway shards after the client is gone.
+const PROJECTED_SESSION_PRESENCE_LIVE_WINDOW_MS = 5 * 60_000;
 // Mirrors Directory's W/2 presence-write throttle. This one lives on the
 // gateway so an established MCP request does not pay a synchronous Directory
 // ingress-touch RPC when the local DO already refreshed this session recently.
@@ -2535,15 +2540,19 @@ export class PersistentObjectDO {
       `SELECT scope, body FROM gateway_projection_session WHERE scope IN (${placeholders}) AND stale = 0`,
       ...scopes
     ));
-    // Track which room scopes have sessions so we can identify gaps for enrichment.
+    const now = Date.now();
+    // Track which room scopes have live sessions so we can identify gaps for
+    // enrichment. Stale or legacy rows without a presence timestamp do not count:
+    // they are cache-incomplete and the caller must ask Directory for that room.
     const roomScopesWithSessions = new Set<string>();
     const sessions: DirectorySerializedSession[] = [];
     for (const row of rows) {
-      roomScopesWithSessions.add(row.scope);
       try {
         const parsed = JSON.parse(row.body) as unknown;
         const session = serializedSessionFromDirectoryRoute(parsed);
-        if (session) sessions.push(session);
+        if (!session || !projectionSessionRecentlyLive(session, now)) continue;
+        roomScopesWithSessions.add(row.scope);
+        sessions.push(session);
       } catch { /* skip malformed rows */ }
     }
     // Find room scopes (non-commit-scope) with no sessions in the cache.
@@ -6628,7 +6637,8 @@ export class PersistentObjectDO {
                 lastDetachAt: null,
                 tokenClass: (s.tokenClass === "guest" || s.tokenClass === "apikey") ? s.tokenClass : "bearer",
                 activeScope: s.activeScope,
-                currentLocation: s.activeScope
+                currentLocation: s.activeScope,
+                lastSeenAt: s.lastInputAt
               } as DirectorySerializedSession))
           : [];
         // Projection cache rows win over enrichment (cache is more recent);
@@ -8711,6 +8721,7 @@ function serializedSessionFromDirectoryRoute(value: unknown): DirectorySerialize
       : "";
   const actor = typeof record.actor === "string" ? record.actor as ObjRef : null;
   const expiresAt = Number(record.expires_at ?? record.expiresAt ?? 0);
+  const lastSeenAt = finitePositiveNumber(record.last_seen_at ?? record.lastSeenAt);
   if (!id || !actor || !Number.isFinite(expiresAt) || expiresAt <= 0) return null;
   const activeScope = sessionActiveScopeFromRecord({
     active_scope: record.active_scope,
@@ -8727,6 +8738,7 @@ function serializedSessionFromDirectoryRoute(value: unknown): DirectorySerialize
     tokenClass: record.token_class === "guest" || record.token_class === "apikey" ? record.token_class : "bearer",
     activeScope,
     currentLocation: activeScope,
+    ...(lastSeenAt !== null ? { lastSeenAt } : {}),
     ...(typeof record.apikey_id === "string" && record.apikey_id.length > 0 ? { apikeyId: record.apikey_id } : {}),
     displayName: typeof record.display_name === "string" && record.display_name.length > 0 ? record.display_name : null,
     focusList: focusListFromUnknown(record.focus_list),
@@ -8997,6 +9009,13 @@ function mcpFanoutAudienceFromDirectorySessions(
     audienceSessions: allSessions.size > 0 ? Array.from(allSessions).sort() : undefined,
     observationSessionAudiences: observations.length > 0 ? observationSessionAudiences : undefined
   };
+}
+
+function projectionSessionRecentlyLive(session: DirectorySerializedSession, now = Date.now()): boolean {
+  const expiresAt = typeof session.expiresAt === "number" ? session.expiresAt : Number.POSITIVE_INFINITY;
+  if (expiresAt <= now) return false;
+  const lastSeenAt = finitePositiveNumber(session.lastSeenAt);
+  return lastSeenAt !== null && lastSeenAt > now - PROJECTED_SESSION_PRESENCE_LIVE_WINDOW_MS;
 }
 
 function mcpObservationActorTargets(observation: Observation): Set<ObjRef> {
