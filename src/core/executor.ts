@@ -134,18 +134,21 @@ export type SubmitTurnPhaseTimer = {
 export type SubmitTurnIntentOptions<Client, Result extends ExecutorEnvelopeResult> = {
   input: ExecutorCallInput;
   maxAttempts?: number;
-  // B-ii: repair deadline budget. When the repair loop has consumed more than
-  // `repairBudgetMs` milliseconds (summed across all attempts), the next retry
-  // is refused even when `maxAttempts` has not been reached. The loop surfaces
-  // the last retryable error (missing_state/commit_rejected) as a clean
-  // woo error instead of cascading into the transport deadline. Default: no
-  // budget (unlimited, the existing behaviour).
+  // B-ii: repair deadline budget. Once a repairable miss/conflict has been
+  // observed, the repair loop may consume at most `repairBudgetMs`
+  // milliseconds before the next retry is refused, even when `maxAttempts` has
+  // not been reached. The loop surfaces the last retryable error
+  // (missing_state/commit_rejected) as a clean woo error instead of cascading
+  // into the transport deadline. Default: no budget (unlimited, the existing
+  // behaviour).
   //
-  // Design rationale: MCP requests have a 20s transport deadline. A 5s cold-owner
-  // authority-slice RPC on each of maxAttempts=8 retries would consume 40s —
-  // double the deadline. The budget lets the caller express the portion of the
-  // transport deadline it is willing to spend on repair, leaving room for a
-  // clean error response before the transport closes the connection.
+  // Design rationale: MCP requests have a 20s transport deadline. A 5s
+  // cold-owner authority-slice RPC on each of maxAttempts=8 repairs would
+  // consume 40s — double the deadline. The budget lets the caller express the
+  // portion of the transport deadline it is willing to spend on actual repair,
+  // leaving room for a clean error response before the transport closes the
+  // connection while still allowing the first useful retry after a slow cold
+  // first attempt.
   repairBudgetMs?: number;
   ensureClient(
     scope: ObjRef,
@@ -902,8 +905,22 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     };
     return { ...input, code, cause: classifyDivergenceCause(input, code) };
   };
+  const repairBudgetMs = options.repairBudgetMs;
+  // The error to surface when the budget is exhausted. Populated on each retry
+  // path so the budget check always has a clean error to throw. Typed as unknown
+  // because `throw` accepts any value — we store an ErrorValue (plain object from
+  // wooError) which the gateway's normalizeError will decode correctly.
+  let lastRetryableError: unknown = null;
+  let lastRetryableDivergence: ExecutorDivergenceDetail | null = null;
+  // Start the deadline only after the first repairable miss/conflict is known.
+  // A cold first attempt can legitimately consume most of the MCP request window;
+  // denying the first retry would strand the fresh authority data carried by the
+  // conflict reply and turn a repairable read-version mismatch into a terminal
+  // user-visible error.
+  let repairBudgetStartedAt: number | null = null;
   const rememberRetryableDivergence = (message: string, input: ExecutorRepairMetricInput): void => {
     const detail: ExecutorDivergenceDetail = { ...input, cause: classifyDivergenceCause(input) };
+    repairBudgetStartedAt ??= Date.now();
     lastRetryableDivergence = detail;
     lastRetryableError = wooError("E_REPAIR_BUDGET", message, repairBudgetErrorValue(message, detail));
   };
@@ -919,30 +936,23 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     const authority = await timePhase((ms) => { authorityMs += ms; }, () => options.authorityPayload(planningScope, planningAuthorityObjectIds(planningScope), { phase: "pre_plan", repair, attempt }));
     options.applyAuthority?.(planningClient, authority.authority);
   };
-  // B-ii: repair deadline budget. Budget applies from the start of the first
-  // retry attempt (attempt > 0). `turnStartedAt` is the loop entry wall time,
-  // so `Date.now() - turnStartedAt` is the cumulative elapsed including all
-  // authority fetches. Comparing against `repairBudgetMs` (the portion of the
-  // transport deadline reserved for repair) prevents an unbounded cascade of
-  // 5s authority-slice RPCs consuming the entire MCP request window (20s).
+  // B-ii: repair deadline budget. Budget applies from the first repairable
+  // miss/conflict, not from the start of the original turn. This prevents an
+  // unbounded cascade of 5s authority-slice RPCs from consuming the entire MCP
+  // request window (20s), while still allowing the first repair retry after a
+  // slow cold attempt finally returns a useful conflict reply.
   //
   // When the budget check fires, the loop surfaces the last retryable error
   // (missing_state or commit_rejected) as a woo error with code E_REPAIR_BUDGET
   // so the caller can surface a clean retryable failure to the transport, rather
   // than hanging until the transport closes the connection.
-  const repairBudgetMs = options.repairBudgetMs;
-  // The error to surface when the budget is exhausted. Populated on each retry
-  // path so the budget check always has a clean error to throw. Typed as unknown
-  // because `throw` accepts any value — we store an ErrorValue (plain object from
-  // wooError) which the gateway's normalizeError will decode correctly.
-  let lastRetryableError: unknown = null;
-  let lastRetryableDivergence: ExecutorDivergenceDetail | null = null;
   // Helper: check budget BEFORE starting a new attempt. Must be called whenever
   // `attempt > 0` (i.e., a repair retry is about to start), so a slow previous
   // attempt's elapsed time is counted before the next one starts.
   const budgetExhausted = (attempt: number): boolean => {
     if (repairBudgetMs === undefined || attempt === 0) return false;
-    return (Date.now() - turnStartedAt) >= repairBudgetMs;
+    if (repairBudgetStartedAt === null) return false;
+    return (Date.now() - repairBudgetStartedAt) >= repairBudgetMs;
   };
   try {
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {

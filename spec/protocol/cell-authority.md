@@ -911,8 +911,9 @@ projection; CA8 fanout). Neither reintroduces a placement-style shared owner.
   cell versions, which retries the turn against a now-warm owner. The owner DO is
   woken asynchronously (after reply) so subsequent turns pay zero cold-start cost.
   The turn repair loop in `submitTurnIntent` is bounded by `repairBudgetMs`
-  (MCP gateway: 12 000ms) to prevent indefinite retries when every attempt is
-  under repair.
+  (MCP gateway: 12 000ms) from the first observed repairable miss/conflict, to
+  prevent indefinite retries when every repair attempt is under repair without
+  denying the first useful retry after a slow cold first attempt.
 
 ### CA13.5 Forbidden degradation modes
 
@@ -996,9 +997,12 @@ several require a multi-DO harness, CA16):
     `forceOwnerObjectIds`) the live RPC is used and a cold-owner timeout is
     propagated (not swallowed) after firing an async DO wake. Without a KV
     checkpoint the live RPC runs as before. The turn repair loop in
-    `submitTurnIntent` respects a `repairBudgetMs` deadline: once
-    `Date.now() - turnStartedAt >= repairBudgetMs` the loop stops and surfaces
-    the last retryable error (MCP gateway sets 12 000ms budget).
+    `submitTurnIntent` respects a `repairBudgetMs` deadline from the first
+    observed repairable miss/conflict: once
+    `Date.now() - repairBudgetStartedAt >= repairBudgetMs`, the next repair
+    attempt stops and surfaces the last retryable error (MCP gateway sets
+    12 000ms budget). A slow initial attempt that returns a retryable conflict
+    MUST still get its first repair retry.
     **Status: implemented (flag-gated), gates enforced** in
     `tests/worker/rpc-fault-inject.test.ts` (B-ii Gate 1: error fails fast;
     Gate 2: latency does not affect warm path; Gate 3: budget stops exhausted

@@ -1,5 +1,5 @@
 import { authoritativePlanningWorld } from "../src/core/planning-world";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { authoritySliceObjectIds, buildSerializedAuthorityCellSlice, cellProvenanceFromAuthoritySlice, serializedWorldFromAuthoritySlice, withAuthorityPageProvenance } from "../src/core/authority-slice";
 import { createWorld } from "../src/core/bootstrap";
 import type { EffectTranscript } from "../src/core/effect-transcript";
@@ -563,6 +563,73 @@ describe("v2 turn gateway", () => {
     expect(installed).toHaveLength(1);
     // The transfer round-trips through the reply envelope, so compare by value.
     expect(installed[0]).toEqual(repairTransfer);
+  });
+
+  it("allows the first repair retry after a slow initial commit conflict", async () => {
+    // Production smoke hit this path when a cold first attempt spent more than
+    // MCP_REPAIR_BUDGET_MS before returning a read_version_mismatch. The budget
+    // must bound repair work, not refuse the first retry that can consume the
+    // fresh conflict reply.
+    const world = createWorld();
+    const session = world.auth("guest:v2-gateway-slow-first-conflict");
+    await moveActorToDubspace(world, session, "slow-first-conflict-dubspace-moveto");
+    const harness = makePlannedExecHarness(world.exportWorld());
+
+    let now = 1_000_000;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    let submitCount = 0;
+
+    try {
+      const result = await submitTurnIntent({
+        input: {
+          id: "slow-first-conflict-turn",
+          route: "sequenced",
+          scope: "the_dubspace",
+          session: session.id,
+          actor: session.actor,
+          target: "the_dubspace",
+          verb: "set_control",
+          args: ["delay_1", "wet", 0.7],
+          persistence: "durable",
+          token: "token"
+        },
+        maxAttempts: 8,
+        repairBudgetMs: 12_000,
+        ...harness.options,
+        applyHead: (client: PlannedGatewayClient, head: ShadowScopeHead) => { client.head = head; },
+        submitEnvelope: async (scope: ObjRef, body: ExecutorEnvelopeBody) => {
+          const envelope = decodeEnvelope<ShadowTurnExecRequest>(body.envelope);
+          harness.submissions.push({ scope, body, envelope, request: envelope.body });
+          submitCount += 1;
+          if (submitCount === 1) {
+            now += 13_500;
+            return { reply: encodeEnvelope(replyEnvelope({
+              kind: "woo.turn.exec.reply.shadow.v1",
+              ok: false,
+              id: envelope.body.id,
+              reason: "commit_rejected",
+              commit: {
+                kind: "woo.commit.conflict.shadow.v1",
+                id: envelope.body.id ?? "turn",
+                scope: "the_dubspace",
+                current: scopeHead("the_dubspace", 4),
+                reason: "read_version_mismatch",
+                errors: ["read version mismatch $exit:invoke transcript=1 actual=2"],
+                receipt: receipt(false)
+              }
+            })) };
+          }
+          now += 1;
+          return { reply: encodeEnvelope(replyEnvelope(okReplyForExecRequest(envelope.body))) };
+        }
+      });
+
+      expect(result.kind).toBe("submitted");
+      expect(submitCount).toBe(2);
+      expect(harness.submissions[1]!.request.expected?.seq).toBe(4);
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 
   it("charges a throwing phase and still emits turn_phase_timing with error outcome", async () => {
