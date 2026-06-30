@@ -277,16 +277,25 @@ function rejectShadowCommit(
       ? { mismatched_read_cells: validation.mismatchedReadCells }
       : {})
   };
-  // `stale_head` is a transient conflict: the same submission id can succeed
-  // on a later retry once the caller resubmits against the new head (or the
-  // relay's `executeShadowTurnCallAcrossInProcessNetwork` re-runs the verb
+  // `stale_head` is a transient head conflict: the same submission id can
+  // succeed on a later retry once the caller resubmits against the new head (or
+  // the relay's `executeShadowTurnCallAcrossInProcessNetwork` re-runs the verb
   // and updates `expected` automatically). Caching the rejection by id would
-  // serve the stale conflict to every retry, which makes the convergence
-  // loop fail even though the underlying transcript would commit. Permanent
-  // rejections (post-state mismatch, permission, invariant) stay cached so
-  // re-submissions don't retry doomed work.
+  // serve the stale conflict to every retry. `read_version_mismatch` conflicts
+  // are cached for duplicate replay, but any commit-scope state refresh clears
+  // them because the repair path deliberately changes the pre-state they were
+  // computed against. Permanent rejections (post-state mismatch, permission,
+  // invariant) stay cached so re-submissions do not retry doomed work.
   if (submissionCacheKey && conflict.reason !== "stale_head") scope.submissions.set(submissionCacheKey, conflict);
   return conflict;
+}
+
+function clearCachedReadVersionConflicts(scope: ShadowCommitScope): void {
+  for (const [key, result] of scope.submissions) {
+    if (result.kind === "woo.commit.conflict.shadow.v1" && result.reason === "read_version_mismatch") {
+      scope.submissions.delete(key);
+    }
+  }
 }
 
 export function submitShadowCommit(scope: ShadowCommitScope, submit: ShadowCommitSubmit): ShadowCommitResult {
@@ -437,6 +446,7 @@ export function applyShadowTranscriptToCommitScopeCache(
 export function markShadowCommitScopeSerializedChanged(scope: ShadowCommitScope): void {
   scope.state = createShadowCommitScopeState(scope.serialized);
   scope.serializedDirty = false;
+  clearCachedReadVersionConflicts(scope);
 }
 
 // B-iii incremental merge: apply the results of a mergeSerializedAuthoritySlice
@@ -513,6 +523,9 @@ export function applyAuthorityMergeToCommitScopeState(
   // an authority merge, so their refs remain valid.
   state.serializedRefs = serializedRefs(serialized);
   scope.serializedDirty = false;
+  if (changedObjectIds.size > 0 || changedSessionIds.size > 0) {
+    clearCachedReadVersionConflicts(scope);
+  }
 }
 
 export function isShadowCommitScopeSerializedDirty(scope: ShadowCommitScope): boolean {
@@ -1398,6 +1411,7 @@ function sequencerReadVersion(transcript: EffectTranscript): string | undefined 
 
 function commitShadowCommitScopeState(scope: ShadowCommitScope, state: ShadowCommitScopeState, sync?: ShadowSerializedSync): void {
   scope.state = state;
+  clearCachedReadVersionConflicts(scope);
   if (sync) {
     syncSerializedFromState(scope, state, sync);
     scope.serializedDirty = false;

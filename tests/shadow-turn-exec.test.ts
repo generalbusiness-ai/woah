@@ -4,7 +4,7 @@ import { installVerb } from "../src/core/authoring";
 import { createWorld, createWorldFromSerialized } from "../src/core/bootstrap";
 import { capabilityAdProbablyCoversTurn } from "../src/core/capability-ad";
 import { effectTranscriptFromRecordedTurn } from "../src/core/effect-transcript";
-import { createShadowCommitScope, serializedFor, submitShadowCommit } from "../src/core/shadow-commit-scope";
+import { createShadowCommitScope, markShadowCommitScopeSerializedChanged, serializedFor, submitShadowCommit } from "../src/core/shadow-commit-scope";
 import {
   buildShadowCellPageTransfer,
   buildShadowObjectRecordTransfer,
@@ -1704,6 +1704,61 @@ describe("submitShadowCommit pre-apply rejection (P1.1)", () => {
     expect(rejected.mismatched_read_cells).toContainEqual(dispatchRead!.cell);
     // Nothing applied: the scope head did not advance.
     expect(commitScope.head).toEqual(createShadowCommitScope({ node: "stable-anchor", scope: "the_dubspace", serialized: serializedBefore }).head);
+  });
+
+  it("revalidates read_version_mismatch submissions after repair state changes", async () => {
+    const { serializedBefore, transcript } = await planControlTurn("readmismatch-cache", 0.5);
+    const dispatchRead = transcript.reads.find((read) =>
+      read.cell.kind === "verb" &&
+      read.cell.object === "$dubspace" &&
+      read.cell.name === "set_control" &&
+      read.version !== undefined
+    );
+    expect(dispatchRead, "set_control transcript should record a versioned dispatch read").toBeDefined();
+    if (!dispatchRead || dispatchRead.cell.kind !== "verb") throw new Error("expected versioned verb dispatch read");
+    const dispatchCell = dispatchRead.cell;
+
+    const staleSerialized = structuredClone(serializedBefore);
+    const staleObject = staleSerialized.objects.find((obj) => obj.id === dispatchCell.object);
+    expect(staleObject, "stale scope should contain the dispatch definer").toBeDefined();
+    const staleVerb = staleObject!.verbs.find((verb) => verb.name === dispatchCell.name || verb.aliases.includes(dispatchCell.name));
+    expect(staleVerb, "stale scope should contain the dispatch verb").toBeDefined();
+    const currentVersion = Number(dispatchRead.version);
+    expect(currentVersion, "dispatch read version should be numeric").toBeGreaterThan(0);
+    staleVerb!.version = currentVersion - 1;
+    if (staleVerb!.kind === "bytecode") staleVerb!.bytecode = { ...staleVerb!.bytecode, version: currentVersion - 1 };
+
+    const commitScope = createShadowCommitScope({ node: "stable-anchor", scope: "the_dubspace", serialized: staleSerialized });
+    const rejected = submitShadowCommit(commitScope, {
+      kind: "woo.commit.submit.shadow.v1",
+      id: "transient-readmismatch",
+      scope: "the_dubspace",
+      expected: structuredClone(commitScope.head),
+      transcript
+    });
+    expect(rejected.kind).toBe("woo.commit.conflict.shadow.v1");
+    if (rejected.kind !== "woo.commit.conflict.shadow.v1") throw new Error("expected read_version_mismatch conflict");
+    expect(rejected.reason).toBe("read_version_mismatch");
+    expect(Array.from(commitScope.submissions.values())).toContainEqual(
+      expect.objectContaining({ kind: "woo.commit.conflict.shadow.v1", reason: "read_version_mismatch" })
+    );
+
+    // Simulate a retry after authority repair refreshed the commit scope to the
+    // planner's read versions. The same id+transcript hash must be revalidated;
+    // replaying the prior conflict would trap the repair loop at E_REPAIR_BUDGET.
+    commitScope.serialized = structuredClone(serializedBefore);
+    markShadowCommitScopeSerializedChanged(commitScope);
+    expect(Array.from(commitScope.submissions.values()).some((item) =>
+      item.kind === "woo.commit.conflict.shadow.v1" && item.reason === "read_version_mismatch"
+    )).toBe(false);
+    const accepted = submitShadowCommit(commitScope, {
+      kind: "woo.commit.submit.shadow.v1",
+      id: "transient-readmismatch",
+      scope: "the_dubspace",
+      expected: structuredClone(commitScope.head),
+      transcript
+    });
+    expect(accepted.kind).toBe("woo.commit.accepted.shadow.v1");
   });
 });
 
