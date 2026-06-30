@@ -1050,6 +1050,12 @@ are pinned to the retained export id/head/hash; a stale continuation returns
 `E_CHECKPOINT_CONTINUATION_STALE`. Legacy `/v2/open` responses remain the
 default while checkpoint/tail negotiation is off. `WOO_V2_CHECKPOINT_TAIL_OPEN`
 enables the CommitScopeDO body-field protocol for trusted callers.
+`WOO_V2_CHECKPOINT_BOUNDED` and `WOO_V2_CHECKPOINT_FRAME_INTERVAL` control how
+often accepted commits schedule asynchronous checkpoint refreshes. The retained
+accepted-frame and transcript-tail SQL tables remain protected by the complete
+checkpoint floor, but rows below that floor are pruned by count, age, and the
+per-table `WOO_V2_TAIL_RETENTION_BYTES` budget so hot CommitScopeDO envelopes
+do not grow with aged replay history.
 `WOO_BROWSER_PROJECTION_HOLDER` is the independent browser-holder rollback gate:
 when it is off, browser WebSocket open/envelope requests do not ask CommitScopeDO
 for browser-profile rows. Browser checkpoint/tail opens are narrower again:

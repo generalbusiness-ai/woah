@@ -478,7 +478,13 @@ Accepted-frame and transcript tails are append/prune surfaces. `saveFull` or
 checkpoint construction MUST NOT rewrite retained tail rows. A new accepted
 frame is inserted by `(scope, seq)` and a transcript-tail row is inserted by
 transcript hash; pruning deletes only rows outside the configured retention
-horizon after a complete checkpoint covers the prefix being pruned.
+horizon after a complete checkpoint covers the prefix being pruned. The complete
+checkpoint head is the hard correctness floor: rows newer than that head MUST
+remain even when row-count, byte, or age budgets are exceeded. Rows at or below
+that floor MAY be pruned by deployment-specific row-count, byte, and age
+budgets. The Cloudflare reference exposes the per-table byte budget as
+`WOO_V2_TAIL_RETENTION_BYTES`; this bounds replay history carried in hot
+CommitScopeDO envelopes without changing commit validation.
 
 Checkpoint rows are maintained outside `/v2/open` packaging. If no complete
 manifest for the current head exists, checkpoint/tail open schedules

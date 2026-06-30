@@ -51,7 +51,8 @@ WOO_V2_TAIL_DELIVERY = "1"
 # B-iv: bounded checkpoints — see wrangler.toml for rationale.
 # Must match production to satisfy guard:smoke-wrangler WOO_* parity.
 WOO_V2_CHECKPOINT_BOUNDED = "1"
-WOO_V2_CHECKPOINT_FRAME_INTERVAL = "32"
+WOO_V2_CHECKPOINT_FRAME_INTERVAL = "8"
+WOO_V2_TAIL_RETENTION_BYTES = "524288"
 # Local-only, non-secret defaults.
 WOO_INITIAL_WIZARD_TOKEN = "local-cf-e2e-wizard-token"
 WOO_INTERNAL_SECRET = "local-cf-e2e-internal-secret"

@@ -117,6 +117,40 @@ describe("CommitScopeDO checkpoint/tail open", () => {
     }
   });
 
+  it("uses the configured byte budget for checkpoint-covered tail rows", () => {
+    const state = new FakeDurableObjectState("scope-a");
+    const scope = "scope-a";
+    const now = Date.now();
+    // Construct once to create the SQL tables before seeding rows directly, then
+    // construct the measured instance with the production-style byte override.
+    new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: SECRET });
+    seedTailRows(state, scope, 12, now);
+    seedCheckpointRow(state, scope, head(scope, 12), now);
+    const newestAcceptedBytes = tailBodyBytes(state, "v2_commit_scope_accepted_frame", 12);
+    const newestTranscriptBytes = tailBodyBytes(state, "v2_commit_scope_transcript_tail", 12);
+    const target = new CommitScopeDO(state as unknown as DurableObjectState, {
+      WOO_INTERNAL_SECRET: SECRET,
+      WOO_V2_TAIL_RETENTION_BYTES: String(Math.max(newestAcceptedBytes, newestTranscriptBytes))
+    }) as unknown as {
+      pruneAcceptedFramesByHorizon: (relay: { commit_scope: { scope: ObjRef } }, now: number) => number;
+      pruneTranscriptTailByHorizon: (relay: { commit_scope: { scope: ObjRef } }, now: number) => number;
+    };
+    const relay = { commit_scope: { scope } };
+
+    try {
+      expect(target.pruneAcceptedFramesByHorizon(relay, now)).toBeGreaterThan(0);
+      expect(target.pruneTranscriptTailByHorizon(relay, now)).toBeGreaterThan(0);
+      expect(tailSeqs(state, "v2_commit_scope_accepted_frame")).toContain(12);
+      expect(tailSeqs(state, "v2_commit_scope_transcript_tail")).toContain(12);
+      expect(tailSeqs(state, "v2_commit_scope_accepted_frame")).not.toContain(1);
+      expect(tailSeqs(state, "v2_commit_scope_transcript_tail")).not.toContain(1);
+      expect(tailRowCount(state, "v2_commit_scope_accepted_frame")).toBeLessThan(12);
+      expect(tailRowCount(state, "v2_commit_scope_transcript_tail")).toBeLessThan(12);
+    } finally {
+      state.close();
+    }
+  });
+
   it("returns row-body-complete frame transfers when known_head is retained", async () => {
     const state = new FakeDurableObjectState("scope-a");
     const target = new CommitScopeDO(state as unknown as DurableObjectState, { WOO_INTERNAL_SECRET: SECRET });
@@ -1024,6 +1058,16 @@ function tailSeqs(
   table: "v2_commit_scope_accepted_frame" | "v2_commit_scope_transcript_tail"
 ): number[] {
   return state.storage.sql.exec(`SELECT seq FROM ${table} ORDER BY seq`).toArray().map((row) => Number((row as { seq: number }).seq));
+}
+
+function tailBodyBytes(
+  state: FakeDurableObjectState,
+  table: "v2_commit_scope_accepted_frame" | "v2_commit_scope_transcript_tail",
+  seq: number
+): number {
+  const row = state.storage.sql.exec(`SELECT body FROM ${table} WHERE seq = ? LIMIT 1`, seq).toArray()[0] as { body?: string } | undefined;
+  if (!row?.body) throw new Error(`missing ${table} row ${seq}`);
+  return new TextEncoder().encode(row.body).byteLength;
 }
 
 function objectRow(state: FakeDurableObjectState, id: ObjRef): SerializedObject | null {

@@ -109,7 +109,7 @@ const SHADOW_OPEN_EXECUTABLE_SEED_WARN_BYTES = 1_000_000;
 //   fanout list); the drain never reads from the CommitScopeDO relay tail. The
 //   cursor-floor rule is therefore MOOT for this table — tail pruning cannot
 //   outrun an in-flight D1 delivery. See notes/2026-06-10-b-iv-checkpoint-tail.md.
-const SHADOW_TAIL_RETENTION_BYTES = 4 * 1024 * 1024;
+const SHADOW_TAIL_RETENTION_BYTES_DEFAULT = 4 * 1024 * 1024;
 // Age-based pruning: rows older than 1 hour can be pruned even if within the byte
 // budget, provided they are below the checkpoint floor (covered by a checkpoint).
 // 7 days was excessively generous; a DO typically rehydrates within seconds, and
@@ -136,6 +136,10 @@ type CommitScopeEnv = InternalAuthEnv & {
   // Set very high (e.g. 1000000) to measure the floor (effectively never
   // checkpoint on commit); set to a sane value (e.g. 32) as the actual fix.
   WOO_V2_CHECKPOINT_FRAME_INTERVAL?: string;
+  // Per-table byte budget for accepted-frame and transcript-tail rows below the
+  // checkpoint floor. The checkpoint floor remains the correctness boundary;
+  // this only bounds replay history that is already covered by a checkpoint.
+  WOO_V2_TAIL_RETENTION_BYTES?: string;
   // Authority-slimming probe (step 1): when on, emit a v2_envelope_bytes metric
   // breaking the request into authority / capsule-authority / sessions / envelope
   // bytes plus relay warmth. Off by default — it re-stringifies the large slice.
@@ -2147,7 +2151,7 @@ export class CommitScopeDO {
       table: "v2_commit_scope_accepted_frame",
       scope: relay.commit_scope.scope,
       maxRows: MAX_SHADOW_ACCEPTED_TAIL,
-      maxBytes: SHADOW_TAIL_RETENTION_BYTES,
+      maxBytes: shadowTailRetentionBytes(this.env.WOO_V2_TAIL_RETENTION_BYTES),
       minUpdatedAt: now - SHADOW_TAIL_RETENTION_MS
     });
   }
@@ -2178,7 +2182,7 @@ export class CommitScopeDO {
       table: "v2_commit_scope_transcript_tail",
       scope: relay.commit_scope.scope,
       maxRows: MAX_SHADOW_TRANSCRIPT_TAIL,
-      maxBytes: SHADOW_TAIL_RETENTION_BYTES,
+      maxBytes: shadowTailRetentionBytes(this.env.WOO_V2_TAIL_RETENTION_BYTES),
       minUpdatedAt: now - SHADOW_TAIL_RETENTION_MS
     });
   }
@@ -2519,6 +2523,11 @@ const CHECKPOINT_FRAME_INTERVAL_DEFAULT = 32;
 function checkpointFrameInterval(value: string | undefined): number {
   const raw = Number((value ?? "").trim());
   return Number.isInteger(raw) && raw > 0 ? raw : CHECKPOINT_FRAME_INTERVAL_DEFAULT;
+}
+
+function shadowTailRetentionBytes(value: string | undefined): number {
+  const raw = Number((value ?? "").trim());
+  return Number.isInteger(raw) && raw > 0 ? raw : SHADOW_TAIL_RETENTION_BYTES_DEFAULT;
 }
 
 function jsonByteLength(value: unknown): number {
