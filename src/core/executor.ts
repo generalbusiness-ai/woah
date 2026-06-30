@@ -29,6 +29,7 @@ import {
   buildShadowTurnExecEnvelope,
   buildShadowTurnIntentEnvelope
 } from "./shadow-browser-node";
+import type { TranscriptCell } from "./effect-transcript";
 import { decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "./shadow-envelope";
 import { runShadowTurnCallTranscript, type ShadowTurnCall, type ShadowTurnCallTranscriptRun } from "./shadow-turn-call";
 import { buildPlanningWorld, type PlanningAdmissibilityViolation, type PlanningWorldProvenance } from "./planning-world";
@@ -231,7 +232,7 @@ export type SubmitTurnIntentOptions<Client, Result extends ExecutorEnvelopeResul
   // those objects before sending to the CommitScopeDO. The IDs include
   // actor + scope + transcript-touched objects + any repair object IDs.
   // Same-scope (non-planned-transcript) commits do not set this field.
-  submitEnvelope(scope: ObjRef, body: ExecutorEnvelopeBody, context: { timing: SubmitTurnPhaseTimer; closureObjectIds?: readonly ObjRef[]; closureSessionIds?: readonly string[] }): Promise<Result>;
+  submitEnvelope(scope: ObjRef, body: ExecutorEnvelopeBody, context: { timing: SubmitTurnPhaseTimer; closureObjectIds?: readonly ObjRef[]; closureSessionIds?: readonly string[]; closureReadCells?: readonly TranscriptCell[] }): Promise<Result>;
   applyAuthority?(client: Client, authority: SerializedAuthoritySlice): void;
   // Adopt the authority's reported current head after a stale-head/version
   // conflict, so the next attempt plans + submits against the right head instead
@@ -1175,8 +1176,13 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     // transcript (transcript.reads[*].cell.object), because validateTranscriptWithCellReader
     // checks version consistency for all reads — those objects must be present in the
     // authority even if they were only READ (not written) by the turn.
-    const closureContext: { timing: SubmitTurnPhaseTimer; closureObjectIds?: readonly ObjRef[]; closureSessionIds?: readonly string[] } = plannedTranscriptCommit
-      ? { timing, closureObjectIds: executorTranscriptReadClosureObjectIds(planned.transcript), closureSessionIds: [options.input.session] }
+    const closureContext: { timing: SubmitTurnPhaseTimer; closureObjectIds?: readonly ObjRef[]; closureSessionIds?: readonly string[]; closureReadCells?: readonly TranscriptCell[] } = plannedTranscriptCommit
+      ? {
+          timing,
+          closureObjectIds: executorTranscriptReadClosureObjectIds(planned.transcript),
+          closureSessionIds: [options.input.session],
+          closureReadCells: planned.transcript.reads.map((read) => read.cell)
+        }
       : { timing };
     const result = await timePhase((ms) => { submitMs += ms; }, () => options.submitEnvelope(commitScope, executorEnvelopeBody({
       scope: commitScope,

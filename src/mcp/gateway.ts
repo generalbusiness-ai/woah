@@ -12,7 +12,7 @@
 
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
-import type { EffectTranscript } from "../core/effect-transcript";
+import type { EffectTranscript, TranscriptCell } from "../core/effect-transcript";
 import { buildSerializedAuthorityCellSlice, cellProvenanceFromAuthoritySlice, combineSerializedAuthoritySlices, filterAuthorityToReadClosure, serializedWorldFromAuthoritySlice } from "../core/authority-slice";
 import { wooError, type AppliedFrame, type AuthorityReconstructionTrigger, type DirectResultFrame, type ErrorFrame, type ErrorValue, type Message, type MetricEvent, type ObjRef, type Session, type WooValue } from "../core/types";
 import { normalizeError, type WooWorld } from "../core/world";
@@ -199,10 +199,11 @@ export function slimMcpEnvelopeBody(body: McpV2EnvelopeBody): McpV2EnvelopeBody 
 export function closureMcpEnvelopeBody(
   body: McpV2EnvelopeBody,
   closureObjectIds: ReadonlySet<ObjRef>,
-  sessionIds: readonly string[]
+  sessionIds: readonly string[],
+  readCells?: readonly TranscriptCell[]
 ): McpV2EnvelopeBody {
   if (!body.authority || body.planned_transcript_commit !== true) return body;
-  const closureAuthority = filterAuthorityToReadClosure(body.authority, closureObjectIds, sessionIds);
+  const closureAuthority = filterAuthorityToReadClosure(body.authority, closureObjectIds, sessionIds, { readCells });
   return {
     ...body,
     authority: closureAuthority,
@@ -1202,7 +1203,8 @@ export class McpGateway {
             firstBody = closureMcpEnvelopeBody(
               firstBody,
               new Set(context.closureObjectIds),
-              context.closureSessionIds ?? []
+              context.closureSessionIds ?? [],
+              context.closureReadCells
             );
           }
         } else if (closureEnabled && envelopeBody.planned_transcript_commit === true && context.closureObjectIds) {
@@ -1210,7 +1212,8 @@ export class McpGateway {
           firstBody = closureMcpEnvelopeBody(
             envelopeBody,
             new Set(context.closureObjectIds),
-            context.closureSessionIds ?? []
+            context.closureSessionIds ?? [],
+            context.closureReadCells
           );
         } else {
           firstBody = envelopeBody;

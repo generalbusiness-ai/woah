@@ -251,6 +251,33 @@ function resultSummary(r: ShadowCommitResult): string {
 // ── 1. Corpus parity ──────────────────────────────────────────────────────────
 
 describe("B-i read-closure parity", () => {
+  it("strips unread verb bytecode pages when transcript read cells are available", () => {
+    const world = createWorld({ catalogs: TEST_CATALOGS });
+    const fullAuthority = executorAuthorityPayload(world, ["$room"]).authority;
+    expect(isAuthorityCellSlice(fullAuthority)).toBe(true);
+    if (!isAuthorityCellSlice(fullAuthority)) return;
+    const roomVerbRefs = fullAuthority.page_refs
+      .filter((ref) => ref.object === "$room" && ref.page === "verb_bytecode")
+      .sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    expect(roomVerbRefs.length, "fixture should expose multiple $room verb pages").toBeGreaterThan(1);
+    const keptVerb = String(roomVerbRefs[0].name);
+
+    const closureAuthority = filterAuthorityToReadClosure(
+      fullAuthority,
+      new Set<ObjRef>(["$room"]),
+      [],
+      { readCells: [{ kind: "verb", object: "$room", name: keptVerb }] }
+    );
+    expect(isAuthorityCellSlice(closureAuthority)).toBe(true);
+    if (!isAuthorityCellSlice(closureAuthority)) return;
+    const keptRoomVerbs = closureAuthority.page_refs
+      .filter((ref) => ref.object === "$room" && ref.page === "verb_bytecode")
+      .map((ref) => String(ref.name))
+      .sort();
+
+    expect(keptRoomVerbs).toEqual([keptVerb]);
+  });
+
   it("corpus parity: full-slice and closure authority produce identical verdicts for planned-transcript commits", async () => {
     // Use a world with the full demo catalog so the scenario exercises real
     // movement verbs that plan in one scope and commit in another.

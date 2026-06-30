@@ -21,6 +21,7 @@ import {
   type ShadowStatePage,
   type ShadowStatePageRef
 } from "./shadow-state-pages";
+import type { TranscriptCell } from "./effect-transcript";
 import type { ObjRef, WooValue } from "./types";
 
 export type MergeSerializedAuthorityInput =
@@ -491,7 +492,8 @@ export function authoritySliceObjectIds(authority: MergeSerializedAuthorityInput
 export function filterAuthorityToReadClosure(
   authority: SerializedAuthoritySlice,
   closureObjectIds: ReadonlySet<ObjRef>,
-  sessionIds: readonly string[]
+  sessionIds: readonly string[],
+  options: { readCells?: readonly TranscriptCell[] } = {}
 ): SerializedAuthoritySlice {
   if (!isAuthorityCellSlice(authority)) {
     // Legacy object-slice: filter to closure objects and session actors.
@@ -540,17 +542,27 @@ export function filterAuthorityToReadClosure(
   const filteredSessions = authority.sessions.filter(
     (s) => sessionSet.has(s.id) || expandedIds.has(s.actor)
   ).map((s) => structuredClone(s) as SerializedSession);
+  const readVerbPages = options.readCells
+    ? new Set(options.readCells
+      .filter((cell) => cell.kind === "verb")
+      .map((cell) => `${cell.object}\u0000${cell.name}`))
+    : null;
   // For lineage-only ancestors, strip verb_bytecode pages. The commit validator
   // only walks lineage for property-def resolution (propertyDefs chain walk) and
   // permission checks — it does NOT execute verbs on ancestors. Keeping only
   // object_live, object_lineage, and property_cell pages for these objects is
-  // sufficient for validation and substantially reduces bytes.
+  // sufficient for validation and substantially reduces bytes. When the caller
+  // provides transcript read cells, apply the same rule to direct closure objects:
+  // commit validation replays no bytecode and only needs verb pages whose values
+  // were explicitly recorded as reads for writer-frame validation.
   const filtered = filterSerializedAuthoritySlicePages(
     { ...authority, sessions: filteredSessions },
     (ref) => {
       if (!expandedIds.has(ref.object)) return false;
-      // For lineage-only ancestors, exclude verb_bytecode pages.
-      if (lineageOnlyIds.has(ref.object) && ref.page === "verb_bytecode") return false;
+      if (ref.page === "verb_bytecode") {
+        if (lineageOnlyIds.has(ref.object)) return false;
+        if (readVerbPages) return readVerbPages.has(`${ref.object}\u0000${ref.name ?? ""}`);
+      }
       return true;
     }
   );
