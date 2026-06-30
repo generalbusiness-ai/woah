@@ -742,6 +742,60 @@ describe("v2 MCP e2e", () => {
     }
   });
 
+  it("does not spend snapshot authority on a slim warm repair attempt", async () => {
+    const world = createWorld();
+    const env = { WOO_INTERNAL_SECRET: "v2-mcp-secret" };
+    const scopeStates = new Map<ObjRef, FakeDurableObjectState>();
+    const scopes = new Map<ObjRef, CommitScopeDO>();
+    const scopeFor = (commitScope: ObjRef): CommitScopeDO => {
+      let scope = scopes.get(commitScope);
+      if (!scope) {
+        const state = new FakeDurableObjectState(commitScope);
+        scopeStates.set(commitScope, state);
+        scope = new CommitScopeDO(state as unknown as ConstructorParameters<typeof CommitScopeDO>[0], env);
+        scopes.set(commitScope, scope);
+      }
+      return scope;
+    };
+    const authorityCalls: Array<{ repair: boolean; snapshot: boolean }> = [];
+    let envelopeCalls = 0;
+    const gateway = new McpGateway(world, {
+      v2: {
+        slimWarmEnvelope: true,
+        open: async (commitScope, body) => await postCommitScope(scopeFor(commitScope), env, commitScope, "/v2/open", body),
+        authorityPayload: async (extraObjectIds, options) => {
+          authorityCalls.push({
+            repair: options?.repairAttempt === true,
+            snapshot: options?.useCommitScopeSnapshotForRemoteAuthority === true
+          });
+          return executorAuthorityPayload(world, extraObjectIds);
+        },
+        envelope: async (commitScope, body) => {
+          envelopeCalls += 1;
+          if (envelopeCalls === 1) {
+            return { ok: true, reply: encodeEnvelope(replyEnvelope(missingStateReply("mcp-slim-snapshot-repair"))) };
+          }
+          return await postCommitScope(scopeFor(commitScope), env, commitScope, "/v2/envelope", body);
+        }
+      }
+    });
+
+    try {
+      const session = await initializeMcp(gateway, "guest:v2-mcp-slim-snapshot-repair", 1);
+      const result = await mcp(gateway, session, 4, "tools/call", {
+        name: "woo_call",
+        arguments: { object: "the_chatroom", verb: "enter", args: [] }
+      });
+
+      expect(result.result.isError, JSON.stringify(result.result.structuredContent)).not.toBe(true);
+      expect(envelopeCalls).toBe(2);
+      expect(authorityCalls.some((call) => call.repair)).toBe(true);
+      expect(authorityCalls.filter((call) => call.repair).map((call) => call.snapshot)).toEqual([false]);
+    } finally {
+      for (const state of scopeStates.values()) state.close();
+    }
+  });
+
   it("carries relay snapshot rows when snapshot-fallback authority is sparse", async () => {
     const world = createWorld({ catalogs: ["chat", "demoworld", "tasks", "blocks-demo"] });
     const scopeStates = new Map<string, FakeDurableObjectState>();

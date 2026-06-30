@@ -1098,16 +1098,13 @@ export class McpGateway {
           if (authorityClient && (sessionOpen || headKnown)) return this.cachedWarmCommitAuthority(entry, authorityClient, extraObjectIds);
         }
         // The CommitScopeDO snapshot fallback (no remote fetch; rely on the
-        // scope's durable snapshot + commit validation) applies to the FIRST
-        // fallthrough commit refresh — including the one a repair attempt pays
-        // after the cached path above refused it. Forcing real remote owner
-        // fetches on repair attempts here was tried and REGRESSED the
-        // production-shape movement path: the refetched slices, merged back
-        // into the relay, displaced fresher repair-installed rows. Repair
-        // freshness comes from the pre-plan missing_state_repair force-owner
-        // refresh and the conflict reply's applyHead/applyStateTransfer
-        // installs, not from this payload.
-        const useCommitScopeSnapshotForRemoteAuthority = !isPrePlan && authorityRefreshAttempts === 0;
+        // scope's durable snapshot + commit validation) applies only to the
+        // first ORDINARY fallthrough commit refresh. A cached warm attempt can
+        // fail before this counter advances; the following repair attempt must
+        // not spend the unused snapshot slot, because it has already proved the
+        // current cached/snapshot view stale and may have just installed live
+        // owner rows through missing_state_repair or state_transfer.
+        const useCommitScopeSnapshotForRemoteAuthority = !isPrePlan && !isRepairAttempt && authorityRefreshAttempts === 0;
         if (!isPrePlan) authorityRefreshAttempts += 1;
         // Directory/session scopes still include submit+target so routes and
         // sessions resolve for the destination. But a repair-driven pre-plan

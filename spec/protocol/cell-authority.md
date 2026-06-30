@@ -929,6 +929,14 @@ projection; CA8 fanout). Neither reintroduces a placement-style shared owner.
   that same seed is evidence, not authority. The repair attempt MUST resolve the
   seeded id through its recorded owner provenance instead of suppressing the
   remote owner partition.
+- **Commit snapshot fallback is also disabled on repair attempts.** A warm MCP
+  turn MAY use the CommitScopeDO's durable snapshot instead of waking every
+  remote owner for the first ordinary commit refresh. Once the executor is on a
+  repair attempt, that shortcut is no longer ordinary: the previous cached or
+  snapshot view has failed validation, and the retry may have just installed live
+  owner cells through `missing_state_repair` or `read_version_mismatch`
+  `state_transfer`. The repair attempt MUST build commit authority from the live
+  owner path for its touched ids, not from the unused snapshot-fallback slot.
 
 ### CA13.5 Forbidden degradation modes
 
