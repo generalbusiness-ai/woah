@@ -105,8 +105,11 @@ describe("A1 session lifecycle", () => {
     const actor = staleSession.actor;
 
     // Second session — newer (higher `started`, but world.auth creates one at a time).
+    // This case exercises stale-session movement, not guest expiry. Use the
+    // credential-class TTL so slow full-suite deploy gates cannot expire the
+    // shadow transport token before the durable turn reaches commit.
     // Give them distinct started times so the ordering is deterministic.
-    const freshSession = world.createSessionForActor(actor, "guest");
+    const freshSession = world.createSessionForActor(actor, "bearer");
     // Ensure the stale session sorts older: make its started a tick earlier.
     const staleRow = world.sessions.get(staleSession.id)!;
     const freshRow = world.sessions.get(freshSession.id)!;
