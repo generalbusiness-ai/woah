@@ -1100,7 +1100,8 @@ legacy seed bootstrap and retry without the capsule. This flag does not change
 checkpoint/tail projection catch-up and does not add a Cloudflare Durable Object
 class migration. Planned-transcript commits are not eligible for this shortcut:
 when the chosen commit scope differs from the planned transcript's turn-key
-scope, the gateway must first open the chosen scope with
+scope, or when the transcript carries a session active-scope transition, the
+gateway must first open the chosen scope with
 `open_protocol: "head_session.v1"`, adopt its current head, and submit the
 transcript envelope without `execution_capsule`. Warm head/session opens carry
 only session rows and never build executable seed transfers; cold scopes may

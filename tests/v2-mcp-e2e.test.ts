@@ -281,7 +281,12 @@ describe("v2 MCP e2e", () => {
         post.path === "/v2/envelope" &&
         post.body.actor === laterActor
       );
-      expect(laterChatroomEnvelope?.body).not.toHaveProperty("authority");
+      // Placement-changing turns commit the gateway-planned transcript even when
+      // the selected commit scope is the planning room. Re-running `go outline`
+      // in a cold/stale room snapshot can accept "can't go that way" and lose the
+      // session-scope transition; planned validation preserves the actual move.
+      expect(laterChatroomEnvelope?.body).toHaveProperty("planned_transcript_commit", true);
+      expect(laterChatroomEnvelope?.body).toHaveProperty("authority");
       expect(laterChatroomEnvelope?.body.session_objects).toEqual(expect.arrayContaining([
         expect.objectContaining({ id: laterActor, location: "the_chatroom" })
       ]));

@@ -808,6 +808,15 @@ by the general selector, so the chosen commit scope is provably identical to the
 pre-B6 binary rule for every `relocation` and `planning` turn; only the `multi`
 classification and its observability metric are new.
 
+Commit-scope selection is separate from the envelope execution strategy. A
+transcript that carries a session active-scope transition (`sessionScopeTransition`,
+CA8) MUST be submitted as a planned-transcript commit even when the selected
+commit scope equals the transcript's turn-key scope. The commit scope still
+validates the transcript against its current head and read closure, but it MUST
+NOT re-run the room verb from a possibly stale/cold room snapshot, because doing
+so can accept a non-movement result while dropping the already-planned placement
+transition.
+
 ### VTN8.3 Read-closure envelopes for planned-transcript commits
 
 > **Status: implemented, flag-gated** (plan item B-i,

@@ -1113,14 +1113,19 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
     // authority (CA3, off the room sequencer); everything else commits at the
     // planning/turn-key scope, which already serializes the shared cells the
     // turn touches. A "multi" turn (>=2 distinct non-planning owners) keeps the
-    // planning-scope commit for now and is flagged for observability. A
-    // differing commitScope drives the planned-transcript commit path below so
+    // planning-scope commit for now and is flagged for observability. A differing
+    // commitScope drives the planned-transcript commit path below so
     // the authority replays the planned transcript rather than re-running the
-    // verb in a foreign scope.
+    // verb in a foreign scope. Session active-scope transitions use the same
+    // path even when the selected commit scope is the planning scope: placement
+    // is CA8 routing state, and re-running a room verb against a stale/cold room
+    // snapshot can collapse a planned move into a no-op while still accepting the
+    // turn. The planned transcript remains validated by the commit scope, but the
+    // effect stream is the one the gateway actually planned.
     const commitSelection = selectCommitScopeForTranscript(planned.transcript, key.scope, options.onMetric);
     const commitScope = commitSelection.scope;
     phaseCommitScope = commitScope;
-    const plannedTranscriptCommit = commitScope !== key.scope;
+    const plannedTranscriptCommit = commitScope !== key.scope || planned.transcript.sessionScopeTransition !== undefined;
     const commitClient = commitScope === planningScope && !plannedTranscriptCommit
       ? planningClient
       : await timePhase((ms) => { ensureClientMs += ms; }, () => options.ensureClient(commitScope, attempt, {
