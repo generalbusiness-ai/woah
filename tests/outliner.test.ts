@@ -422,9 +422,9 @@ describe("outliner catalog: single-level undo", () => {
     await expectResult(call(world, session.actor, "the_outline", "enter", []));
     const a = await addItem(world, session.actor, "doomed");
     expect(world.objects.has(a)).toBe(true);
-    // Leave without undoing — slot is cleared on leave.
+    // Leave without undoing; entry cleanup, not exit, defines fresh-visit state.
     await expectResult(call(world, session.actor, "the_outline", "leave", []));
-    // Re-enter — slot wiped on enter too.
+    // Re-enter — slot wiped on enter.
     await expectResult(call(world, session.actor, "the_outline", "enter", []));
     const r = await expectResult(call(world, session.actor, "the_outline", "undo", []));
     expect(r.result).toBe(false);
@@ -433,6 +433,14 @@ describe("outliner catalog: single-level undo", () => {
 });
 
 describe("outliner catalog: focus", () => {
+  it("initial enter leaves root focus implicit", async () => {
+    const world = setupWorld();
+    const session = world.auth("guest:implicit-root-focus");
+    await expectResult(call(world, session.actor, "the_outline", "enter", []));
+    const fmap = world.propOrNull("the_outline", "focus_by_actor") as Record<string, string | null>;
+    expect(Object.prototype.hasOwnProperty.call(fmap, session.actor)).toBe(false);
+  });
+
   it("focus resets to null on enter", async () => {
     const world = setupWorld();
     const session = world.auth("guest:reset");

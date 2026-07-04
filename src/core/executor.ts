@@ -1258,6 +1258,13 @@ export async function submitTurnIntent<Client, Result extends ExecutorEnvelopeRe
         atoms: executorAtomPreimagesFromMissingState(body),
         commitReason: body.ok === false && body.reason === "commit_rejected" ? body.commit?.reason : undefined
       });
+      if (!options.prePlanAuthority) {
+        // The commit scope just proved this attempt planned against stale or
+        // incomplete state. Apply the repair to the planning relay before the next
+        // VM pass; otherwise the retry re-plans against the same stale projection
+        // and can turn a repairable commit miss into a terminal local error frame.
+        await refreshPlanningAuthority(planningScope, planningClient, true, attempt + 1);
+      }
       continue;
     }
     phaseOutcome = "submitted";

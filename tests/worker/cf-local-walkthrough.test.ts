@@ -157,6 +157,12 @@ describe("CF-local smoke walkthrough", () => {
             .filter((line) =>
               line.includes('"kind":"mcp_tool_resolve"') ||
               line.includes('"kind":"moveto_actor"') ||
+              line.includes('"kind":"mcp_owner_prefetch"') ||
+              line.includes('"kind":"turn_repair_attempt"') ||
+              line.includes('"kind":"authority_slice_partition"') ||
+              line.includes('"kind":"authority_slice_reconstructed"') ||
+              line.includes('"kind":"cross_host_rpc"') ||
+              line.includes('"kind":"state_path_divergence"') ||
               line.includes('"kind":"gateway_projection_apply"') ||
               line.includes('"kind":"gateway_projection_cache_write"') ||
               line.includes('"kind":"turn_phase_timing"')

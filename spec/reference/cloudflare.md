@@ -829,7 +829,11 @@ registration. Touches are throttled at both layers: a gateway-local in-memory
 W/2 cache prevents an established session from paying a pre-dispatch Directory
 RPC on every turn, and Directory's durable W/2 throttle preserves the
 `register-session` dedupe's write-storm protection across DO lifetimes and
-shards. Presence for delivery and presence for display stay separate: durable
+shards. A cold MCP gateway shard that rebuilds from Directory live-session rows
+initializes that gateway-local cache from each row's `last_seen_at`, so the first
+post-load notification or tool probe does not immediately re-touch Directory when
+the lease is already fresh; rows older than W/2 still refresh on the next ingress.
+Presence for delivery and presence for display stay separate: durable
 subscribers ride the commit-scope subscriber/fanout path and catch up by replay,
 so an idle-but-live session that has fallen out of the presence window is not
 kept room-present for its whole auth lease.

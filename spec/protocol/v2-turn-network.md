@@ -1761,6 +1761,16 @@ and retries; commit submission still carries a bounded authority payload for
 validation, usually sourced from the opened CommitScopeDO snapshot on the first
 envelope attempt.
 
+When a commit-scope reply rejects an envelope with a retryable result
+(`missing_state`, or `commit_rejected` with `stale_head`,
+`read_version_mismatch`, or `nondeterministic`), the gateway MUST treat the reply
+as a planning-cache repair signal before re-running the VM: install any attached
+state transfer, add the reply's missing objects and the transcript read closure
+to the repair authority request, refresh the planning relay from owner/anchor
+authority, and only then retry the turn. Re-submitting or re-planning against the
+same stale relay projection violates bounded repair because a repairable commit
+miss can degrade into a terminal local `E_NEED_STATE` frame.
+
 Browser relays also implement `mode: "projection"` and `mode: "delta"` for
 display/cache catch-up. Opening a scope installs a projection transfer instead
 of directly mutating the browser projection cache. After an accepted commit,

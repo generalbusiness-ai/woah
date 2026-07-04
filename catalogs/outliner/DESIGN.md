@@ -66,8 +66,8 @@ space with look, exit, speech, and movement-hook behavior.
 | `position` | `$outline_item` | `int`. Sibling rank under `.parent`; siblings of the same parent carry a contiguous dense `1..N` numbering after any mutation. Default `0` (re-stamped on enterfunc). `perms: "r"`. |
 | `hidden` | `$outline_item` | `bool`. Default `false`. Flag is set only on items the user explicitly hid — descendant visual hiding is computed client-side. `perms: "r"`. |
 | `contents` | `$outliner` (built-in) | Items currently in the tree, plus present actors. |
-| `focus_by_actor` | `$outliner` | `map<str, objref \| null>`. Per-actor focus. `null` = root. Reset to `null` by actor `enterfunc` and pruned by actor `exitfunc`. Survives in the map across disconnect/crash but is overwritten on the next movement into the outliner, so durability is harmless. `perms: "r"`. |
-| `last_undo` | `$outliner` | `map<str, map \| null>`. **Single-level undo**: one slot per actor holding the inverse of their most recent mutation, or `null`/missing if there's nothing to undo. Each new mutation overwrites the slot. `:undo` applies the slot and clears it. **Wiped by actor `enterfunc` and actor `exitfunc`**, and any write also prunes entries for actors not currently in `contents(this)`. `perms: "r"`. |
+| `focus_by_actor` | `$outliner` | `map<str, objref \| null>`. Per-actor focus. Missing or `null` = root. Actor `enterfunc` clears a non-root stored focus, but it does not write an already-root/no-entry slot. Exit is observation-only for this map; stale entries are reset on the actor's next movement into the outliner or pruned by a later focus write, so durability is harmless. `perms: "r"`. |
+| `last_undo` | `$outliner` | `map<str, map \| null>`. **Single-level undo**: one slot per actor holding the inverse of their most recent mutation, or `null`/missing if there's nothing to undo. Each new mutation overwrites the slot. `:undo` applies the slot and clears it. Actor `enterfunc` wipes an existing slot so every fresh visit starts empty; exit is observation-only for this map, and later undo writes prune entries for actors not currently in `contents(this)`. `perms: "r"`. |
 | `mount_room` | `$outliner` | Optional room hosting the outliner for room-level activity events and for seeding the demo instance's return exit. Same shape as `$pinboard.mount_room`. `perms: "r"`. |
 
 All item-state properties and outliner-side maps are `perms: "r"` (public
@@ -207,8 +207,8 @@ directly; everything routes through the outliner surface.
 | room movement / `out` | inherited | Actors arrive through the substrate `moveto` chain, normally from browser tab activation or an exit. `out` is the inherited room command resolved through an exit whose destination is seeded by the world catalog. `$outliner` defines no public lifecycle verbs of its own. |
 | `list_items()` | anyone | Joined depth-first view: `[{id, name, text, parent_id, index, hidden, owner, writers, has_children}, …]`. Built by the generic `object_tree_rows` substrate helper from the catalog-owned shape: scan `contents(this)`, keep `$outline_item` descendants, group by `.parent`, sort each group by `.position`, and walk depth-first. `index` is the derived sibling index. Items the actor cannot read return `text: ""`. The helper exists because building this large joined view with repeated woocode list concatenation exceeds the VM memory model on thousand-item outlines. |
 | `acceptable(object)` | anyone | `isa(object, $outline_item) \|\| isa(object, $actor)`. |
-| `enterfunc(object)` | core | For actors: reset `focus_by_actor[actor]` to `null`, clear that actor's undo slot, and emit `outliner_entered` plus mounted-room activity. For items: if `item.parent` is unset (fresh item from `create` or a cross-outliner move), leave it at `null` (top-level). If set, validate it points to another item in this outliner — raise `E_INVARG` otherwise. If `item.position` is unset or empty, allocate a position past the last sibling. Emit `outline_item_added`. |
-| `exitfunc(object)` | core | For actors: clear that actor's focus/undo entries, prune stale entries for actors no longer present, and emit `outliner_left` plus mounted-room activity. For items leaving this outliner by `moveto`, calls `_detach_item(object, {emit: true, clear_item: true})`. This reparents direct children to the item's former parent, clears the moving item's `.parent` and `.position` so a destination outliner can place it as top-level, and emits `outline_item_removed`. Recycle does not call `exitfunc`; the item-level `:recycle` handler calls the same helper. |
+| `enterfunc(object)` | core | For actors: reset a non-root `focus_by_actor[actor]` to root, clear that actor's undo slot if present, and emit `outliner_entered` plus mounted-room activity. A first entry at implicit root does not materialize a `focus_by_actor` row, avoiding no-op shared-map conflicts between independent actors. For items: if `item.parent` is unset (fresh item from `create` or a cross-outliner move), leave it at `null` (top-level). If set, validate it points to another item in this outliner — raise `E_INVARG` otherwise. If `item.position` is unset or empty, allocate a position past the last sibling. Emit `outline_item_added`. |
+| `exitfunc(object)` | core | For actors: emit `outliner_left` plus mounted-room activity without mutating `focus_by_actor` or `last_undo`. Fresh-visit cleanup happens on the next `enterfunc`; keeping exit observation-only avoids shared-map conflicts on cross-scope movement commits. For items leaving this outliner by `moveto`, calls `_detach_item(object, {emit: true, clear_item: true})`. This reparents direct children to the item's former parent, clears the moving item's `.parent` and `.position` so a destination outliner can place it as top-level, and emits `outline_item_removed`. Recycle does not call `exitfunc`; the item-level `:recycle` handler calls the same helper. |
 | `add_item(text, parent_id?, index?)` | anyone present | Composite: `create($outline_item, {owner: actor, parent: parent_id, position: <computed>}) + set_text + moveto(item, this)`. `parent_id` defaults to caller's focus (or `null` if focus is root). `index` chooses where among siblings; default is end. Emits `outline_item_added`. Sets caller's `last_undo` slot to `{verb: "remove_item", args: [new_item]}`. |
 | `set_item_text(item, text)` | item author / writers / wizard | Composite: capture old text for undo, call `item:set_text(text)`, and let inherited `$note:set_text` emit `note_edited`. The outliner does not re-emit text changes. Sets caller's `last_undo` slot to `{verb: "set_item_text", args: [item, old_text]}`. |
 | `move_item(item, new_parent_id, index?)` | anyone present | Re-parent and/or reorder. `new_parent_id == null` means root. Validates same-outliner and no-cycle (raises `E_CYCLE` if `new_parent_id` is `item` or a descendant). Builds the target sibling order around `index`, calls `item:set_parent(new_parent_id)`, then uses `_renumber_siblings` to assign positions. Idempotent at current `(parent, index)`: no-op. Emits **exactly one** `outline_item_moved`. Sets caller's `last_undo` slot to `{verb: "move_item", args: [item, old_parent, old_index]}`. |
@@ -269,9 +269,10 @@ with the recorded args. There is no stack — every new mutation
 overwrites the slot, so an actor can only undo their most recent
 operation.
 
-- Slot is cleared on actor `enterfunc` and actor `exitfunc`, and any write prunes
-  entries for actors not currently in `contents(this)`. A crashed
-  session leaves at most one stale record, which is discarded on the
+- Slot is cleared on actor `enterfunc`; actor `exitfunc` is observation-only so
+  cross-scope movement does not contend on the shared undo map. Any undo write
+  prunes entries for actors not currently in `contents(this)`. A crashed or
+  exited session leaves at most one stale record, which is discarded on the
   actor's next movement into the outliner.
 - Undo dispatch does **not** write a new inverse — undo is one-way.
   (After an undo, the slot is empty; you can't redo.) Convention:
@@ -802,8 +803,9 @@ spec-version bump is required.
 - after `:undo` clears the slot, a follow-up `:undo` is a no-op and
   does not emit `outline_undone`.
 - `eject_item` does not touch the curator's `last_undo` slot.
-- `last_undo` cleared by actor movement into and out of the outliner
-  (re-entry starts fresh even after a crash that skipped the exit hook)
+- `last_undo` cleared by actor movement into the outliner; actor exit leaves
+  stale slots for the next entry/write cleanup rather than contending on the
+  shared map during cross-scope moves.
 - pruning: writing the slot drops entries belonging to actors not
   currently in `contents(this)`
 - `hidden` flag is only set on the explicitly-flagged item

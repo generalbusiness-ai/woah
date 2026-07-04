@@ -276,18 +276,27 @@ describe("v2 MCP e2e", () => {
         Array.isArray(post.body.session_objects) &&
         post.body.session_objects.some((obj: any) => obj?.id === laterActor)
       )).toBe(true);
-      const laterChatroomEnvelope = commitPosts.find((post) =>
-        post.scope === "the_chatroom" &&
+      const laterPlannedEnvelope = commitPosts.find((post) =>
         post.path === "/v2/envelope" &&
-        post.body.actor === laterActor
+        post.body.actor === laterActor &&
+        post.body.planned_transcript_commit === true
       );
       // Placement-changing turns commit the gateway-planned transcript even when
-      // the selected commit scope is the planning room. Re-running `go outline`
-      // in a cold/stale room snapshot can accept "can't go that way" and lose the
-      // session-scope transition; planned validation preserves the actual move.
-      expect(laterChatroomEnvelope?.body).toHaveProperty("planned_transcript_commit", true);
-      expect(laterChatroomEnvelope?.body).toHaveProperty("authority");
-      expect(laterChatroomEnvelope?.body.session_objects).toEqual(expect.arrayContaining([
+      // the selected commit scope is not the planning room. Re-running `go
+      // outline` in a cold/stale room snapshot can accept "can't go that way"
+      // and lose the session-scope transition; planned validation preserves the
+      // actual move.
+      if (!laterPlannedEnvelope) {
+        throw new Error(`expected planned envelope for ${laterActor}; posts=${JSON.stringify(commitPosts.map((post) => ({
+          scope: post.scope,
+          path: post.path,
+          actor: post.body.actor,
+          planned: post.body.planned_transcript_commit
+        })))}`);
+      }
+      expect(laterPlannedEnvelope.scope).toBe(laterActor);
+      expect(laterPlannedEnvelope.body).toHaveProperty("authority");
+      expect(laterPlannedEnvelope.body.session_objects).toEqual(expect.arrayContaining([
         expect.objectContaining({ id: laterActor, location: "the_chatroom" })
       ]));
     } finally {
@@ -740,8 +749,9 @@ describe("v2 MCP e2e", () => {
       expect(envelopeCalls).toBe(2);
       // B7 warm-cache-first MCP planning no longer pays the two unconditional
       // pre-plan authority refreshes. The first commit refresh may use the
-      // CommitScopeDO snapshot fallback; the repair attempt must not reuse it.
-      expect(authoritySnapshotFlags).toEqual([false, false, true, false]);
+      // CommitScopeDO snapshot fallback; both the repair planning refresh and
+      // the repair commit refresh must not reuse it.
+      expect(authoritySnapshotFlags).toEqual([false, false, true, false, false]);
     } finally {
       for (const state of scopeStates.values()) state.close();
     }
@@ -794,8 +804,9 @@ describe("v2 MCP e2e", () => {
 
       expect(result.result.isError, JSON.stringify(result.result.structuredContent)).not.toBe(true);
       expect(envelopeCalls).toBe(2);
-      expect(authorityCalls.some((call) => call.repair)).toBe(true);
-      expect(authorityCalls.filter((call) => call.repair).map((call) => call.snapshot)).toEqual([false]);
+      const repairCalls = authorityCalls.filter((call) => call.repair);
+      expect(repairCalls.length).toBeGreaterThan(0);
+      expect(repairCalls.every((call) => call.snapshot === false)).toBe(true);
     } finally {
       for (const state of scopeStates.values()) state.close();
     }

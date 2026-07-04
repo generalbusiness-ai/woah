@@ -4433,6 +4433,14 @@ describe("CFObjectRepository production-shape coverage", () => {
       }));
       const registeredNewer = await harness.env.DIRECTORY.get(harness.env.DIRECTORY.idFromName("directory")).fetch(registerNewer);
       expect(registeredNewer.ok, await registeredNewer.clone().text()).toBe(true);
+      const directoryLastSeenAt = Date.now() - 1_000;
+      for (const sessionId of [oldSessionId, newSessionId]) {
+        harness.directoryState.storage.sql.exec(
+          "UPDATE session_route SET last_seen_at = ? WHERE session_id = ?",
+          directoryLastSeenAt,
+          sessionId
+        );
+      }
       const fillerActor = "cf_mcp_directory_filler" as ObjRef;
       for (let i = 0; i < 2050; i += 1) {
         harness.directoryState.storage.sql.exec(
@@ -4485,6 +4493,11 @@ describe("CFObjectRepository production-shape coverage", () => {
       expect(shardWorld.sessions.get(oldSessionId)).toMatchObject({ actor, started: 1_000, activeScope: "the_deck" });
       expect(shardWorld.sessions.get(newSessionId)).toMatchObject({ actor, started: 2_000, activeScope: "the_deck" });
       expect(shardWorld.primarySessionForActor(actor)?.id).toBe(oldSessionId);
+      const ingressTouches = (shardObject as any).mcpPresenceIngressTouchedAt as Map<string, number>;
+      // Cold shard load inherits Directory's fresh lease, so the first
+      // notification/tool probe can skip the pre-dispatch Directory touch.
+      expect(ingressTouches.get(oldSessionId)).toBe(directoryLastSeenAt);
+      expect(ingressTouches.get(newSessionId)).toBe(directoryLastSeenAt);
       expect(shardWorld.object(actor).name).toBe("Directory Actor");
       expect(shardWorld.propOrNull(actor, "focus_list")).toEqual(["the_pinboard"]);
       expect(shardWorld.propOrNull(actor, "home")).toBe("the_deck");

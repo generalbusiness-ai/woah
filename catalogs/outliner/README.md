@@ -55,9 +55,9 @@ an item directly, so children never end up pointing at a tombstone.
 ## Undo
 
 Single-level: every mutation overwrites the actor's `last_undo` slot;
-`undo()` consumes it. Slot is cleared by actor movement into and out of
-the outliner, so a fresh visit always starts empty regardless of how the
-prior session ended.
+`undo()` consumes it. Slot is cleared by actor movement into the outliner,
+so a fresh visit always starts empty regardless of how the prior session
+ended.
 
 See [DESIGN.md](DESIGN.md) for the full behavior contract — class
 shapes, verb signatures, observation envelopes, undo capture, the

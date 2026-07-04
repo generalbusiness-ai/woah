@@ -2289,6 +2289,13 @@ export class PersistentObjectDO {
     // just to rebind queues.
     const startedAt = Date.now();
     const sessions = await this.loadMcpGatewayShardSessions(hostKey);
+    // These rows already passed Directory's live-presence filter. Seed the local
+    // W/2 ingress throttle from their durable lease so the first notification or
+    // tool probe after cold-load does not synchronously touch Directory again.
+    for (const session of sessions) {
+      const lastSeenAt = finitePositiveNumber(session.lastSeenAt);
+      if (lastSeenAt !== null) this.rememberMcpPresenceIngressTouch(session.id, lastSeenAt);
+    }
     const { world: snapshot, topologySeed } = mcpGatewayShardSerializedWorld(sessions);
     // Record the CA11.2 seeded-topology ids for the export path's owner-deferring
     // provenance stamp. Held on the DO instance because the export runs here and
