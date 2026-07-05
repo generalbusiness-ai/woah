@@ -65,7 +65,7 @@ The spec is split into layers. Implementation references in semantics and protoc
 Language and runtime foundations: object/verb/value semantics and execution behavior independent of host implementation.
 
 - [core.md](spec/semantics/core.md) — woah core: objects, messages, spaces, actors, observations
-- [distribution.md](spec/semantics/distribution.md) — Execute/Sequence/Hold roles; turn scope vs object host; sequencer keyed by scope ObjRef; cell version is freshness; no node owns objects (DT1–DT8, **draft**)
+- [distribution.md](spec/semantics/distribution.md) — Execute/Sequence/Hold roles; turn scope vs object host; sequencer keyed by scope ObjRef; cell version is freshness; no node owns objects (DT1–DT8, **implemented core**; DT3 partial)
 - [projection-cache.md](spec/semantics/projection-cache.md) — accepted-frame projection rows, row-body-complete fanout, tool-surface rows, and session tool manifests (PC1–PC4, **draft**)
 - [values.md](spec/semantics/values.md) — value contract, equality, canonical serialization (V1–V11)
 - [objects.md](spec/semantics/objects.md) — object model, identity, verb dispatch, properties (§4, §5, §9, §10)
@@ -82,7 +82,7 @@ Language and runtime foundations: object/verb/value semantics and execution beha
 - [tasks.md](spec/semantics/tasks.md) — lifecycle, suspend, fork, read (§16)
 - [builtins.md](spec/semantics/builtins.md) — builtins, errors (§19, §20)
 - [recycle.md](spec/semantics/recycle.md) — `recycle()` semantics: cleanup, handlers, dangling refs (RC1–RC9)
-- [moveto.md](spec/semantics/moveto.md) — receiver-driven container moves with acceptable/enter/exit hooks (M1–M10)
+- [moveto.md](spec/semantics/moveto.md) — receiver-driven container moves with acceptable/enter/exit hooks (M1–M10, **implemented core**)
 - [match.md](spec/semantics/match.md) — `$match` scaffolding for chat-shaped text → object/verb resolution (MA1–MA7)
 - [features.md](spec/semantics/features.md) — feature objects: composition without multiple inheritance (FT1–FT10)
 - [text-format.md](spec/semantics/text-format.md) — `.format` property convention for markdown / plain text content (TF1–TF10)
@@ -92,6 +92,7 @@ Language and runtime foundations: object/verb/value semantics and execution beha
 
 Host-facing interfaces for runtime execution, transport, and client bootstrap across local and edge hosts.
 
+- [coherence.md](spec/protocol/coherence.md) — **the coherence layer**: normative contract for the `src/net/` distribution layer (Plan 002) — invariants, effect transcript, validation order, named-copy registry, divergence taxonomy, SLOs, conformance gates (CO1–CO12, **adopted**; governs where it overlaps v2-turn-network.md / cell-authority.md)
 - [hosts.md](spec/protocol/hosts.md) — three host classes, task migration, trust boundaries (§3)
 - [host-seeds.md](spec/protocol/host-seeds.md) — host-seed contents and the per-subject merge rule for cross-host reconciliation (HS1–HS5, **draft**)
 - [wire.md](spec/protocol/wire.md) — JSON WebSocket message format (§17)
@@ -100,8 +101,8 @@ Host-facing interfaces for runtime execution, transport, and client bootstrap ac
 - [browser-host.md](spec/protocol/browser-host.md) — transient host bootstrap (§18)
 - [routing.md](spec/protocol/routing.md) — `/objects/<id>` URL form, class-driven renderer dispatch, browser navigation vs MCP focus, `:locate()` / `:open_in_<view>()` verb conventions (AR1–AR13)
 - [ui-component-model.md](spec/protocol/ui-component-model.md) — client UI framework: catalog-owned browser modules, Web Component ABI, declarative frames, scoped neighborhoods, frame composition, consistent client projection, and observation normalization (UCM1–UCM30, **draft**)
-- [v2-turn-network.md](spec/protocol/v2-turn-network.md) — draft v2 node-network protocol: deterministic VM turns, commit scopes, execution capability gossip, state transfer, live events, in-browser nodes, and scope-local scheduled turns (VTN1-VTN18, **draft**)
-- [cell-authority.md](spec/protocol/cell-authority.md) — first-class cell authority, movement as `live:location` truth with per-member contents projection, hot-room scalability, and authority migration toward activity; supersedes VTN8.1 MV-A (CA1-CA16, **draft**)
+- [v2-turn-network.md](spec/protocol/v2-turn-network.md) — draft v2 node-network protocol: deterministic VM turns, commit scopes, execution capability gossip, state transfer, live events, in-browser nodes, and scope-local scheduled turns (VTN1-VTN18, **draft**; carried parts superseded by coherence.md)
+- [cell-authority.md](spec/protocol/cell-authority.md) — first-class cell authority, movement as `live:location` truth with per-member contents projection, hot-room scalability, and authority migration toward activity; supersedes VTN8.1 MV-A (CA1-CA16, **draft**; carried parts superseded by coherence.md)
 
 ### Reference (Cloudflare)
 

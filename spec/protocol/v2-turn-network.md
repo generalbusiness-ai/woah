@@ -6,6 +6,14 @@ status: draft
 # V2 turn network protocol
 
 > Part of the [woo specification](../../SPEC.md). Layer: **protocol**.
+>
+> **Superseded-by note (2026-07-05, Plan 002):** the ratified semantics of
+> this draft — VTN0 (coherence invariant and target claims), VTN7 (effect
+> transcript), VTN8 (validation order, write-set scope selection), VTN10.1
+> (materialization miss), VTN18.2 (scheduled turns) — are carried forward
+> verbatim by [coherence.md](coherence.md), which **governs** where the two
+> overlap. The rest of this document describes the v2 mechanism scheduled
+> for deletion at Plan 002 Phase 5 and remains as design history.
 
 This document specifies the first buildable protocol draft for the v2 node
 network sketched in [notes/2026-05-12-woo-v2-actor-local-vm-turns.md](../../notes/2026-05-12-woo-v2-actor-local-vm-turns.md).
