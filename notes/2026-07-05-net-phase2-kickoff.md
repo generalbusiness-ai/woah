@@ -44,9 +44,55 @@ smoke:cf-dev 13/13).
    rule and `E_SCOPE_SPLIT` for two-shared-scope write sets (CO2.3).
 7. **`outbox.ts`** — durable fanout rows, at-least-once, per-scope order,
    receiver no-op by head (CO2.7).
-8. **`plan.ts`** — gateway planner: runs the world engine (via the Phase-1
-   `TurnEffects`/`TurnEngine` seam) against a CellStore view, emits the
-   transcript + read-closure envelope (CO7, byte ceilings enforced here).
+8. **`plan.ts` + `bridge.ts`** — gateway planner. DESIGN (fixed 2026-07-05
+   after the seam study; entry points `src/core/shadow-turn-call.ts:92-192`,
+   admission gate `planning-world.ts:220-257`):
+   - **`bridge.ts`** is the second (and last) engine-boundary file
+     (amending the single-bridge rule: bridges = `transcript.ts` schema +
+     `bridge.ts` engine views). Both directions, with **net cell payload
+     shapes** (no shadow-state-pages dependency):
+     `cellsFromSerialized(world)` — per object: `object_lineage` value
+     `{parent, owner, name, anchor, flags, eventSchemas?}`; `object_live`
+     value `{location}`; `property_cell` value `{value, def?}` (def
+     carried when the object defines it); `verb_bytecode` value = the
+     serialized verb **minus line_map** (CO7); `session` cells from
+     `SerializedSession` rows. `serializedFromCells(cells)` — the
+     inverse; `contents` computed from live cells at assembly (CA4
+     projection); `propertyVersions` left at defaults (see version
+     rule); result routed through `authoritativePlanningWorld` /
+     `buildPlanningWorld`.
+   - **Version rule (resolves seam-report 6.1):** the ephemeral planning
+     world's engine-recorded read versions (prop/verb counters,
+     shadow_cell_version.v1 structural hashes) are meaningless to net.
+     `plan.ts` REWRITES every `reads[].version` through the **planning
+     view's** net cells (`netCellKeyFor(read.cell)` -> `view.get(key)
+     ?.version ?? "absent"`). View-based rewrite preserves staleness
+     detection; engine counters never leak into net.
+   - **`transcript.ts` apply amendment:** property writes produce
+     `{value, def?}` payloads (merge def from the prior cell) so
+     apply-produced and bridge-seeded state are version-identical;
+     otherwise post-state parity breaks on the first write to a seeded
+     cell.
+   - **`planTurn(input)`**: assemble a sparse planning world from the
+     view; `runShadowTurnCallTranscript`; rewrite read versions; select
+     scope via `route.ts`; compute `post_state_version` with the shared
+     `applyTranscript` against an **authority-role scratch copy of the
+     view** (new `CellStore.scratchAuthorityFrom(view)` — planner parity
+     only); build the read-closure envelope with `serializeTransfer` +
+     byte accounting (warm < 64 KB, cross-scope < 256 KB; breach = plain
+     Error — misplan bug, not divergence); return
+     `{ submit, selection, envelopeBytes }`.
+   - **Test harness** (`tests/net/plan.test.ts`): copy
+     `tests/shadow-turn-exec.test.ts:88-108` — `createWorld()` bootstrap,
+     authoring installVerb, `exportWorld()` -> `cellsFromSerialized`
+     seeds a ScopeSequencer; derived view installed from authority;
+     planTurn a scripted verb; submit -> accepted; then stale-view turn
+     -> read_version_mismatch -> refresh view from mismatched_reads ->
+     re-plan -> accepted (the mini repair loop; foundation of the
+     differential gate).
+   - Session-scope turns (seam 6.3): session cells project into
+     `SerializedWorld.sessions`; the accepted `sessionScopeTransition`
+     folds back into the session cell.
 9. **Differential gate** — `scripts/smoke/scenario.ts` through v2
    (fake lane) and `src/net/` (InProcessHost); compare committed state +
    observation streams turn-by-turn (CO12.4).
