@@ -28,34 +28,29 @@ import {
   wooError
 } from "./types";
 import type { ObjectRepository, ParkedTaskRecord, SeedWorld, SerializedAuthoritySlice, SerializedObject, SerializedProperty, SerializedSession, SerializedWorld, SpaceSnapshotRecord, WorldRepository } from "./repository";
-import { buildSerializedAuthorityCellSlice } from "./authority-slice";
 import { isVmReadSignal, isVmSuspendSignal, runSerializedTinyVmTask, runSerializedTinyVmTaskWithInput, runTinyVm, type SerializedVmTask } from "./tiny-vm";
 import { installCatalogManifest, updateCatalogManifest, type CatalogManifest, type CatalogMigrationManifest } from "./catalog-installer";
 import { normalizeVerbPerms } from "./verb-perms";
 import { analyzeBytecodePurity, combineVerbPurity, compileVerb, propagateVerbPurity } from "./authoring";
 import { hashSource, randomHex, constantTimeEqual } from "./source-hash";
-import { shadowOwnerCellVersion, shadowStructuralCellVersion, type ShadowStructuralCellKind } from "./shadow-cell-version";
-import { shadowAtomHash } from "./turn-key";
-import type { PlanningWorldProvenance } from "./planning-world";
-import { planningCellKey } from "./planning-world";
-import { objectCreateEvent, type ActiveTurnRecorder, type RecordedCell, type RecordedWriteAuthority, type TurnRecorder, type TurnRecorderEvent, type TurnStart } from "./turn-recorder";
-import { remoteBridgeUntrackedEffect } from "./remote-bridge-transcript-policy";
+import {
+  createV2TurnEffects,
+  type TurnEffects,
+  type ShadowStructuralCellKind,
+  type PlanningWorldProvenance,
+  type ActiveTurnRecorder,
+  type RecordedCell,
+  type RecordedWriteAuthority,
+  type TurnRecorder,
+  type TurnRecorderEvent,
+  type TurnStart,
+  type EffectTranscript,
+  type TranscriptWrite,
+  type TranscriptPropTarget,
+  type ProjectionWrite
+} from "./turn-effects";
 import { readObjectPropertyValue } from "./property-read";
 import { redactSensitiveSerializedPropertyValues } from "./sensitive-serialization";
-import { applyPresenceProjectionRowDelta, sessionScopePresenceDeltas } from "./effect-transcript";
-import type { EffectTranscript, TranscriptWrite } from "./effect-transcript";
-import {
-  applyTranscriptContentsWriteRefs,
-  applyTranscriptPropWrite,
-  finalWritesByCell,
-  mergeTranscriptLogEntry,
-  nextObjectCounterForCreates,
-  serializedObjectForTranscriptCreate,
-  transcriptLogEntry,
-  transcriptSessionActiveScope,
-  type TranscriptPropTarget
-} from "./shadow-commit-scope";
-import { projectionRowBytes, type ProjectionWrite } from "./projection-delta";
 
 export type NativeHandler = (ctx: CallContext, args: WooValue[]) => WooValue | Promise<WooValue>;
 const GUEST_SESSION_GRACE_MS = 60_000;
@@ -494,6 +489,10 @@ function isObjectRepository(repository: WooRepository | undefined): repository i
 }
 
 export class WooWorld {
+  // The distribution-layer seam (Plan 002 Phase 1; spec/protocol/coherence.md).
+  // All effect recording/versioning/apply operations go through this
+  // interface; src/net/ supplies an alternative implementation later.
+  private readonly effects: TurnEffects = createV2TurnEffects();
   objects = new Map<ObjRef, WooObject>();
   sessions = new Map<string, Session>();
   logs = new Map<ObjRef, SpaceLogEntry[]>();
@@ -646,7 +645,7 @@ export class WooWorld {
     if (!this.enforceResolutionOwnerRepair) return;
     const provenance = this.planningCellProvenance;
     if (!provenance || !this.objects.has(container)) return;
-    const liveProv = provenance.get(planningCellKey(container, "object_live"));
+    const liveProv = provenance.get(this.effects.planningCellKey(container, "object_live"));
     // Owner slices served over /__internal/authority-slice stamp both
     // source:"authoritative" and source_host. A missing source_host on a sparse
     // MCP planning cell is legacy/local provenance and must not be trusted for
@@ -654,7 +653,7 @@ export class WooWorld {
     if (liveProv?.source === "authoritative" && typeof liveProv.source_host === "string" && liveProv.source_host.length > 0) return;
     const preimage = `read:cell:contents:${container}`;
     throw wooError("E_NEED_STATE", `${surface} needs owner-authoritative contents for ${container}`, {
-      missing_atoms: [{ hash: shadowAtomHash(preimage), preimage }]
+      missing_atoms: [{ hash: this.effects.shadowAtomHash(preimage), preimage }]
     });
   }
 
@@ -697,7 +696,7 @@ export class WooWorld {
         const id = error.value;
         const preimage = `read:cell:lifecycle:${id}`;
         throw wooError("E_NEED_STATE", "shadow turn preamble touched unmaterialized object", {
-          missing_atoms: [{ hash: shadowAtomHash(preimage), preimage }]
+          missing_atoms: [{ hash: this.effects.shadowAtomHash(preimage), preimage }]
         });
       }
       throw err;
@@ -797,13 +796,13 @@ export class WooWorld {
   private propertyVersionForRecording(objRef: ObjRef, name: string): number | string | undefined {
     const obj = this.objects.get(objRef);
     if (!obj) return undefined;
-    if (name === "owner") return shadowOwnerCellVersion(objRef, obj.owner);
+    if (name === "owner") return this.effects.shadowOwnerCellVersion(objRef, obj.owner);
     return obj.propertyVersions.get(name) ?? 0;
   }
 
   private structuralVersionForRecording(kind: ShadowStructuralCellKind, objRef: ObjRef): string | undefined {
     const obj = this.objects.get(objRef);
-    return obj ? shadowStructuralCellVersion(kind, obj) : undefined;
+    return obj ? this.effects.shadowStructuralCellVersion(kind, obj) : undefined;
   }
 
   private recordUntrackedEffect(name: string, detail?: Record<string, WooValue>): void {
@@ -824,7 +823,7 @@ export class WooWorld {
       key: { space: snapshot.space_id, seq: snapshot.seq },
       op: "upsert",
       row: snapshot,
-      bytes: projectionRowBytes(snapshot)
+      bytes: this.effects.projectionRowBytes(snapshot)
     });
   }
 
@@ -834,7 +833,7 @@ export class WooWorld {
       key: task.id,
       op: "upsert",
       row: task,
-      bytes: projectionRowBytes(task)
+      bytes: this.effects.projectionRowBytes(task)
     });
   }
 
@@ -844,7 +843,7 @@ export class WooWorld {
       key: "parkedTaskCounter",
       op: "upsert",
       value: this.parkedTaskCounter,
-      bytes: projectionRowBytes({ key: "parkedTaskCounter", value: this.parkedTaskCounter })
+      bytes: this.effects.projectionRowBytes({ key: "parkedTaskCounter", value: this.parkedTaskCounter })
     });
   }
 
@@ -853,7 +852,7 @@ export class WooWorld {
   }
 
   private recordTombstoneProjectionUpsert(id: ObjRef): void {
-    this.recordProjectionWrite({ table: "tombstones", key: id, op: "upsert", row: { id }, bytes: projectionRowBytes({ id }) });
+    this.recordProjectionWrite({ table: "tombstones", key: id, op: "upsert", row: { id }, bytes: this.effects.projectionRowBytes({ id }) });
   }
 
   setLogicalInputsForReplay(inputs: Array<{ name: string; value: WooValue }>): void {
@@ -1108,7 +1107,7 @@ export class WooWorld {
     if (obj.parent) this.persistObject(obj.parent);
     if (obj.location) this.persistObject(obj.location);
     this.persist();
-    this.recordTurnEvent(objectCreateEvent(obj));
+    this.recordTurnEvent(this.effects.objectCreateEvent(obj));
     return obj;
   }
 
@@ -1810,7 +1809,7 @@ export class WooWorld {
   async getPropChecked(progr: ObjRef, objRef: ObjRef, name: string, memo?: HostOperationMemo): Promise<WooValue> {
     if (await this.remoteHostForObject(objRef, memo)) {
       if (!this.executorContext) throw wooError("E_INTERNAL", "remote host bridge unavailable");
-      const effect = remoteBridgeUntrackedEffect("get_prop", { progr, object: objRef, property: name });
+      const effect = this.effects.remoteBridgeUntrackedEffect("get_prop", { progr, object: objRef, property: name });
       this.recordUntrackedEffect(effect.name, effect.detail);
       return await this.executorContext.getPropChecked(progr, objRef, name, memo);
     }
@@ -1832,7 +1831,7 @@ export class WooWorld {
   async setPropChecked(progr: ObjRef, objRef: ObjRef, name: string, value: WooValue, memo?: HostOperationMemo): Promise<void> {
     if (await this.remoteHostForObject(objRef, memo)) {
       if (!this.executorContext) throw wooError("E_INTERNAL", "remote host bridge unavailable");
-      const effect = remoteBridgeUntrackedEffect("set_prop", { progr, object: objRef, property: name });
+      const effect = this.effects.remoteBridgeUntrackedEffect("set_prop", { progr, object: objRef, property: name });
       this.recordUntrackedEffect(effect.name, effect.detail);
       await this.executorContext.setPropChecked(progr, objRef, name, value, memo);
       return;
@@ -4200,7 +4199,7 @@ export class WooWorld {
     let result: WooValue;
     if (await this.remoteHostForObject(target, ctx.hostMemo) || (startAt ? await this.remoteHostForObject(startAt, ctx.hostMemo) : false)) {
       if (!this.executorContext) throw wooError("E_INTERNAL", "remote host bridge unavailable");
-      const effect = remoteBridgeUntrackedEffect("dispatch", { target, verb: verbName, start_at: startAt ?? null });
+      const effect = this.effects.remoteBridgeUntrackedEffect("dispatch", { target, verb: verbName, start_at: startAt ?? null });
       this.recordUntrackedEffect(effect.name, effect.detail);
       result = await this.executorContext.dispatch(ctx, target, verbName, args, startAt);
     } else {
@@ -5961,8 +5960,8 @@ export class WooWorld {
       const provenance = this.planningCellProvenance;
       if (!provenance) return;
       if (!this.objects.has(targetRef)) return;
-      const lineageProv = provenance.get(planningCellKey(targetRef, "object_lineage"));
-      const liveProv = provenance.get(planningCellKey(targetRef, "object_live"));
+      const lineageProv = provenance.get(this.effects.planningCellKey(targetRef, "object_lineage"));
+      const liveProv = provenance.get(this.effects.planningCellKey(targetRef, "object_live"));
       // A recorded non-authoritative provenance on EITHER tracked cell means the
       // destination row standing locally is a derived copy (projection/cache/
       // fallback/gossip), not the owner's authority — it lacks the dynamic
@@ -5972,7 +5971,7 @@ export class WooWorld {
       if (!isNonAuthoritative(lineageProv) && !isNonAuthoritative(liveProv)) return;
       const preimage = `read:cell:lifecycle:${targetRef}`;
       throw wooError("E_NEED_STATE", "movement destination served from non-authoritative topology pre-seed; repair to owner authority before commit", {
-        missing_atoms: [{ hash: shadowAtomHash(preimage), preimage }]
+        missing_atoms: [{ hash: this.effects.shadowAtomHash(preimage), preimage }]
       });
     }
 
@@ -6024,7 +6023,7 @@ export class WooWorld {
   async moveObjectChecked(objRef: ObjRef, targetRef: ObjRef, options: { suppressMirrorHost?: string | null } = {}): Promise<MoveObjectResult> {
     if (await this.remoteHostForObject(objRef)) {
       if (!this.executorContext) throw wooError("E_INTERNAL", "remote host bridge unavailable");
-      const effect = remoteBridgeUntrackedEffect("move", { object: objRef, target: targetRef });
+      const effect = this.effects.remoteBridgeUntrackedEffect("move", { object: objRef, target: targetRef });
       this.recordUntrackedEffect(effect.name, effect.detail);
       return await this.executorContext.moveObject(objRef, targetRef, options);
     }
@@ -6200,7 +6199,7 @@ export class WooWorld {
       return obj.location;
     }
     if (!this.executorContext) throw wooError("E_INTERNAL", "remote host bridge unavailable");
-    const effect = remoteBridgeUntrackedEffect("location", { object: objRef });
+    const effect = this.effects.remoteBridgeUntrackedEffect("location", { object: objRef });
     this.recordUntrackedEffect(effect.name, effect.detail);
     return await this.executorContext.location(objRef, memo);
   }
@@ -6867,7 +6866,7 @@ export class WooWorld {
     // if (startsWith("$")) push(id)` sweep was removed (2026-05-20): on
     // production it inflated the slice to ~3 MB / 1000 page-refs and pushed
     // cold-open round-trips past the 5s HOST_READ_RPC_TIMEOUT ceiling.
-    return buildSerializedAuthorityCellSlice({
+    return this.effects.buildSerializedAuthorityCellSlice({
       sessions,
       objects: this.exportObjects(ids),
       counters: {
@@ -7184,7 +7183,7 @@ export class WooWorld {
           } else {
             const entries = this.logs.get(write.key.space) ?? [];
             const row = cloneValue(write.row as unknown as WooValue) as unknown as SpaceLogEntry;
-            mergeTranscriptLogEntry(entries, row);
+            this.effects.mergeTranscriptLogEntry(entries, row);
             this.logs.set(write.key.space, entries);
             if (persist) this.activeObjectRepository()?.saveCommittedLogEntry(write.key.space, row);
           }
@@ -7281,10 +7280,10 @@ export class WooWorld {
     // containment deltas onto the local full row.
     let contents = Array.from(existing.contents);
     let sawContentsWrite = false;
-    for (const write of finalWritesByCell(transcript)) {
+    for (const write of this.effects.finalWritesByCell(transcript)) {
       if (write.cell.kind !== "contents" || write.cell.object !== id) continue;
       sawContentsWrite = true;
-      contents = applyTranscriptContentsWriteRefs(contents, write, transcript, (event) => this.recordMetric(event));
+      contents = this.effects.applyTranscriptContentsWriteRefs(contents, write, transcript, (event) => this.recordMetric(event));
     }
     if (!sawContentsWrite) {
       for (const move of transcript.moves) {
@@ -7321,7 +7320,7 @@ export class WooWorld {
     for (const create of transcript.creates) {
       if (create.object === id || create.parent === id || create.location === id) wholeObjectDirty = true;
     }
-    for (const write of finalWritesByCell(transcript)) {
+    for (const write of this.effects.finalWritesByCell(transcript)) {
       if (write.cell.object !== id) continue;
       if (write.cell.kind === "prop") {
         if (write.op === "remove") wholeObjectDirty = true;
@@ -7407,7 +7406,7 @@ export class WooWorld {
     for (const create of transcript.creates) {
       if (!createBelongsHere(create)) continue;
       if (!this.objects.has(create.object)) {
-        const serialized = serializedObjectForTranscriptCreate(create, objectTimestamp);
+        const serialized = this.effects.serializedObjectForTranscriptCreate(create, objectTimestamp);
         this.objects.set(create.object, this.objectFromSerializedCreate(serialized));
         if (serialized.parent) addSortedSetValue(this.objects.get(serialized.parent)?.children, serialized.id);
         if (serialized.location) addSortedSetValue(this.objects.get(serialized.location)?.contents, serialized.id);
@@ -7418,7 +7417,7 @@ export class WooWorld {
       creates += 1;
     }
 
-    for (const write of finalWritesByCell(transcript)) {
+    for (const write of this.effects.finalWritesByCell(transcript)) {
       if (!belongsHere(write.cell.object)) continue;
       const target = this.objects.get(write.cell.object);
       if (!target) continue;
@@ -7482,7 +7481,7 @@ export class WooWorld {
     // Location stays the only authoritative write (CA3); these rows are
     // recomputed projections, written via setPropLocal (no turn record;
     // invalidates the presence index).
-    const presenceDeltas = sessionScopePresenceDeltas(
+    const presenceDeltas = this.effects.sessionScopePresenceDeltas(
       (room) => this.presenceProjectionPropsForObject(room),
       transcript
     );
@@ -7490,11 +7489,11 @@ export class WooWorld {
       if (!belongsHere(delta.room)) continue;
       if (!this.objects.has(delta.room)) continue;
       const before = this.propOrNull(delta.room, delta.property);
-      const after = applyPresenceProjectionRowDelta(before, delta);
+      const after = this.effects.applyPresenceProjectionRowDelta(before, delta);
       if (this.setPropLocal(delta.room, delta.property, after)) markObject(delta.room);
     }
 
-    const sessionUpdate = transcriptSessionActiveScope(transcript);
+    const sessionUpdate = this.effects.transcriptSessionActiveScope(transcript);
     if (gatewayHost && sessionUpdate) {
       const session = this.sessions.get(sessionUpdate.session);
       if (session?.actor === sessionUpdate.actor) {
@@ -7504,16 +7503,16 @@ export class WooWorld {
       }
     }
 
-    const logEntry = transcriptLogEntry(transcript);
+    const logEntry = this.effects.transcriptLogEntry(transcript);
     if (logEntry && belongsHere(transcript.scope)) {
       const entries = this.logs.get(transcript.scope) ?? [];
-      mergeTranscriptLogEntry(entries, logEntry);
+      this.effects.mergeTranscriptLogEntry(entries, logEntry);
       this.logs.set(transcript.scope, entries);
       this.activeObjectRepository()?.saveCommittedLogEntry(transcript.scope, logEntry);
       logs += 1;
     }
 
-    this.objectCounter = nextObjectCounterForCreates(this.objectCounter, transcript.creates);
+    this.objectCounter = this.effects.nextObjectCounterForCreates(this.objectCounter, transcript.creates);
     if (gatewayHost && transcript.creates.length > 0) this.persistCounters();
     for (const id of dirtyObjects) {
       this.persistObject(id);
@@ -7598,7 +7597,7 @@ export class WooWorld {
     let stepStartedAt = Date.now();
     for (const create of transcript.creates) {
       if (skippedHostPredicates?.createBelongsHere(create)) continue;
-      const serialized = serializedObjectForTranscriptCreate(create, objectTimestamp);
+      const serialized = this.effects.serializedObjectForTranscriptCreate(create, objectTimestamp);
       this.objects.set(create.object, this.objectFromSerializedCreate(serialized));
       if (serialized.parent) addSortedSetValue(this.objects.get(serialized.parent)?.children, serialized.id);
       if (serialized.location) addSortedSetValue(this.objects.get(serialized.location)?.contents, serialized.id);
@@ -7609,7 +7608,7 @@ export class WooWorld {
     profile?.("apply_creates", stepStartedAt);
 
     stepStartedAt = Date.now();
-    const writes = finalWritesByCell(transcript);
+    const writes = this.effects.finalWritesByCell(transcript);
     profile?.("collect_writes", stepStartedAt);
 
     stepStartedAt = Date.now();
@@ -7650,7 +7649,7 @@ export class WooWorld {
     // authoritative write (CA3); these rows are local projections recomputed
     // from the accepted transcript, written via setPropLocal (which skips turn
     // recording and invalidates the presence index for presence cells).
-    const presenceDeltas = sessionScopePresenceDeltas(
+    const presenceDeltas = this.effects.sessionScopePresenceDeltas(
       (room) => this.presenceProjectionPropsForObject(room),
       transcript
     );
@@ -7658,7 +7657,7 @@ export class WooWorld {
       if (skippedHostPredicates?.belongsHere(delta.room)) continue;
       if (!this.objects.has(delta.room)) continue;
       const before = this.propOrNull(delta.room, delta.property);
-      const after = applyPresenceProjectionRowDelta(before, delta);
+      const after = this.effects.applyPresenceProjectionRowDelta(before, delta);
       if (this.setPropLocal(delta.room, delta.property, after)) touchedObjects.add(delta.room);
     }
     profile?.("apply_writes", stepStartedAt);
@@ -7669,7 +7668,7 @@ export class WooWorld {
     profile?.("sort_objects", stepStartedAt);
 
     stepStartedAt = Date.now();
-    const sessionUpdate = transcriptSessionActiveScope(transcript);
+    const sessionUpdate = this.effects.transcriptSessionActiveScope(transcript);
     let touchedSession: Session | null = null;
     if (sessionUpdate) {
       const session = this.sessions.get(sessionUpdate.session);
@@ -7691,16 +7690,16 @@ export class WooWorld {
     if (touchedSession) this.persistSession(touchedSession);
 
     stepStartedAt = Date.now();
-    const logEntry = transcriptLogEntry(transcript);
+    const logEntry = this.effects.transcriptLogEntry(transcript);
     if (logEntry) {
       const entries = this.logs.get(transcript.scope) ?? [];
-      mergeTranscriptLogEntry(entries, logEntry);
+      this.effects.mergeTranscriptLogEntry(entries, logEntry);
       this.logs.set(transcript.scope, entries);
     }
     profile?.("apply_log", stepStartedAt);
 
     stepStartedAt = Date.now();
-    this.objectCounter = nextObjectCounterForCreates(this.objectCounter, transcript.creates);
+    this.objectCounter = this.effects.nextObjectCounterForCreates(this.objectCounter, transcript.creates);
     profile?.("counters", stepStartedAt);
   }
 
@@ -7767,7 +7766,7 @@ export class WooWorld {
         return;
       case "contents":
         if (Array.isArray(write.value)) {
-          target.contents = new Set(applyTranscriptContentsWriteRefs(
+          target.contents = new Set(this.effects.applyTranscriptContentsWriteRefs(
             Array.from(target.contents),
             write,
             transcript,
@@ -7791,7 +7790,7 @@ export class WooWorld {
     if (write.cell.kind !== "prop") return;
     const propName = write.cell.name;
     const presenceProjection = this.presenceProjectionForObjectRecord(target, propName);
-    applyTranscriptPropWrite(this.wooObjectPropTarget(target), write);
+    this.effects.applyTranscriptPropWrite(this.wooObjectPropTarget(target), write);
     target.modified = objectTimestamp;
     if (presenceProjection) this.invalidatePresenceIndex();
   }
@@ -8833,7 +8832,7 @@ export class WooWorld {
     if (remote) {
       if (options.suppressMirrorHost && remote === options.suppressMirrorHost) return;
       if (!this.executorContext) throw wooError("E_INTERNAL", "remote host bridge unavailable");
-      const effect = remoteBridgeUntrackedEffect("mirror_contents", { container: containerRef, object: objRef, present });
+      const effect = this.effects.remoteBridgeUntrackedEffect("mirror_contents", { container: containerRef, object: objRef, present });
       this.recordUntrackedEffect(effect.name, effect.detail);
       await this.executorContext.mirrorContents(containerRef, objRef, present);
       return;
@@ -10600,7 +10599,7 @@ export class WooWorld {
     this.assertResolutionContentsOwnerAuthority(objRef, surface);
     if (await this.remoteHostForObject(objRef, memo)) {
       if (!this.executorContext) throw wooError("E_INTERNAL", "remote host bridge unavailable");
-      const effect = remoteBridgeUntrackedEffect("contents", { object: objRef });
+      const effect = this.effects.remoteBridgeUntrackedEffect("contents", { object: objRef });
       this.recordUntrackedEffect(effect.name, effect.detail);
       return await this.executorContext.contents(objRef, memo);
     }
