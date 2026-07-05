@@ -96,7 +96,11 @@ smoke:cf-dev 13/13).
       RecordedCell→net-cell translation table, clone-apply with v2
       finalWritesByCell parity, contents→projection routing, deterministic
       post-state version; CO3 bridge note added to coherence.md
-- [ ] 4. scope.ts + validation-order tests (ported corpus)
+- [x] 4. scope.ts + tests — ScopeSequencer: CO4 order (verdict-reasons
+      reply model, terminal-vs-retryable split, incomplete never
+      relabelled), idempotent replies, rolling head digest, bounded
+      recovery tail, CO2.8 scheduled queue with nextAlarmAt/dueTurns;
+      planner-parity post_state_version comparison
 - [ ] 5. host.ts (InProcessHost)
 - [ ] 6. route.ts + ride-along tests
 - [ ] 7. outbox.ts + D1-ported gates
