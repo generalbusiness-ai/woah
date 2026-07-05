@@ -17,11 +17,23 @@ smoke:cf-dev 13/13).
    `(scope_head, catalog_epoch)` (CO8). Lineage-closure enforced at the
    serialization boundary (CO7: a transfer that doesn't close over
    `object_lineage` does not serialize — `E_LINEAGE` is an assert).
-3. **`transcript.ts`** — the EffectTranscript schema (CO3). **Type
-   imports from `src/core/effect-transcript.ts` where identical** — the
-   wire kind `woo.effect_transcript.v1` is shared with v2 on purpose
-   (differential gate compares transcripts across layers). Apply =
+3. **`transcript.ts`** — the EffectTranscript schema (CO3). Apply =
    deterministic re-application of recorded writes to a cell-store clone.
+   **Discovery (2026-07-05): the implemented v2 transcript kind is
+   `woo.effect_transcript.shadow.v1`** (`src/core/effect-transcript.ts:68`),
+   not VTN7's `woo.effect_transcript.v1`, and its field shape differs from
+   the spec draft (`route`, `seq`, `call` pick, `stateProbes`,
+   `sessionScopeTransition`, `projectionWrites`; `TranscriptCell =
+   RecordedCell` from turn-recorder). Consequences:
+   - `transcript.ts` consumes the **implemented** shape (type-imported —
+     this is the single allowed v2 bridge file) so the differential gate
+     compares like with like;
+   - coherence.md CO3 needs a one-line correction when transcript.ts
+     lands: the CO3 schema is the *target* shape; the bridge consumes
+     shadow.v1 until Phase-5 deletion, at which point the kind string
+     graduates to `woo.effect_transcript.v1`;
+   - the apply mapping is TranscriptCell(RecordedCell) → net cellKey —
+     write the translation table in transcript.ts next to the code.
 4. **`scope.ts`** — the sequencer: head, epoch, CO4 validation order
    (steps 1–11 with the doomed-round short-circuit bounds), reply/seen
    idempotency, bounded recovery tail, scheduled-turn queue + parked-task
