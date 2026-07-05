@@ -197,6 +197,22 @@ export class CellStore {
     return dropped;
   }
 
+  /**
+   * Planner-parity scratch ONLY (CO4 step 10, gateway side): an
+   * authority-role copy of a derived view's cells — values and versions
+   * preserved, provenance re-stamped `authoritative` — so the planner can
+   * run the SAME `applyTranscript` the committing scope runs (it refuses
+   * derived stores) and predict `post_state_version` from its view's
+   * pre-state. The result is a post-state computation scratch and MUST be
+   * discarded after the digest is read: holding it as state would mint a
+   * second write path for the view's cells (CO2.1).
+   */
+  static scratchAuthorityFrom(view: CellStore): CellStore {
+    const scratch = new CellStore("authority");
+    for (const [key, cell] of view.cells) scratch.cells.set(key, { ...cell, provenance: "authoritative" });
+    return scratch;
+  }
+
   /** Snapshot for post-state re-derivation (CO4 step 10): apply recorded
    * writes to a clone, never to live state. */
   clone(): CellStore {

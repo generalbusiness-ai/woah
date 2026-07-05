@@ -35,6 +35,41 @@ import { netError } from "./errors";
 
 export type { EffectTranscript, TranscriptCell, TranscriptWrite };
 
+/**
+ * The canonical `property_cell` payload: `{value?, def?}`.
+ *
+ * `def` is present when the object locally *defines* the property (the
+ * PropertyDef row); `value` when the object locally *values* it. A
+ * def-only payload (inherited default, never locally set) omits `value`;
+ * a value-only payload (set on an object that inherits its def) omits
+ * `def`. The bridge (bridge.ts) seeds this shape and applyTranscript
+ * produces it, so an apply-produced cell is version-identical to a
+ * bridge-seeded cell for the same logical state — without this,
+ * post-state parity breaks on the first write to a seeded property
+ * (kickoff design, step 8).
+ */
+export type PropertyCellPayload = { value?: unknown; def?: unknown };
+
+/** Build a `{value?, def?}` payload, omitting absent slots entirely so the
+ * canonical-JSON content address is stable across producers. `hasValue`
+ * is explicit because `undefined` is not a representable Woo value but
+ * "no local value" must be distinguishable from "locally null". */
+export function propertyCellPayload(input: { hasValue: boolean; value?: unknown; def?: unknown }): PropertyCellPayload {
+  return {
+    ...(input.hasValue ? { value: input.value } : {}),
+    ...(input.def !== undefined ? { def: input.def } : {})
+  };
+}
+
+/** The `def` slot of a `{value?, def?}` payload; undefined when the payload
+ * carries no local definition (or is not a property payload at all). */
+export function propertyCellDef(payload: unknown): unknown {
+  if (payload && typeof payload === "object" && !Array.isArray(payload) && "def" in payload) {
+    return (payload as PropertyCellPayload).def;
+  }
+  return undefined;
+}
+
 /** Canonical string identity for a recorded cell (dedup/lookup key). */
 export function transcriptCellId(cell: TranscriptCell): string {
   switch (cell.kind) {
@@ -126,7 +161,18 @@ export function applyTranscript(pre: CellStore, transcript: EffectTranscript, st
         break;
       }
       case "prop": {
-        post.commit({ kind: "property_cell", object: write.cell.object, name: write.cell.name, value: write.value, stamp });
+        // `{value, def?}` payload, merging `def` from the prior cell: the
+        // write updates the value slot only; a local definition survives so
+        // the applied cell stays version-identical to what the bridge would
+        // seed for the same post-state (see PropertyCellPayload).
+        const def = propertyCellDef(post.get(key)?.value);
+        post.commit({
+          kind: "property_cell",
+          object: write.cell.object,
+          name: write.cell.name,
+          value: propertyCellPayload({ hasValue: true, value: write.value, def }),
+          stamp
+        });
         break;
       }
       case "verb": {

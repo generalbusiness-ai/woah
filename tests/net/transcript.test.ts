@@ -42,12 +42,12 @@ describe("recorded-cell translation (CO3 table)", () => {
 describe("applyTranscript (CO4 step 10)", () => {
   it("applies prop writes to a clone, never the live pre-state", () => {
     const pre = new CellStore("authority");
-    pre.commit({ kind: "property_cell", object: "#1", name: "n", value: "old", stamp: STAMP });
+    pre.commit({ kind: "property_cell", object: "#1", name: "n", value: { value: "old" }, stamp: STAMP });
     const result = applyTranscript(pre, baseTranscript({
       writes: [{ cell: { kind: "prop", object: "#1", name: "n" }, value: "new", op: "set" }]
     }), STAMP);
-    expect(pre.get("property_cell:#1:n")?.value).toBe("old");
-    expect(result.post.get("property_cell:#1:n")?.value).toBe("new");
+    expect(pre.get("property_cell:#1:n")?.value).toEqual({ value: "old" });
+    expect(result.post.get("property_cell:#1:n")?.value).toEqual({ value: "new" });
     expect(result.touched).toEqual(["property_cell:#1:n"]);
   });
 
@@ -59,7 +59,27 @@ describe("applyTranscript (CO4 step 10)", () => {
         { cell: { kind: "prop", object: "#1", name: "n" }, value: "second", op: "set" }
       ]
     }), STAMP);
-    expect(result.post.get("property_cell:#1:n")?.value).toBe("second");
+    expect(result.post.get("property_cell:#1:n")?.value).toEqual({ value: "second" });
+  });
+
+  it("prop writes merge def from the prior cell ({value, def?} payload)", () => {
+    // A seeded def-only cell (inherited default, never locally valued):
+    // the first write must produce {value, def} — the same payload the
+    // bridge would seed for that post-state — or the planner's predicted
+    // post_state_version and the scope's derived one diverge on the very
+    // first write to a seeded property (kickoff step-8 amendment).
+    const def = { name: "n", defaultValue: 0, owner: "#actor", perms: "rw", version: 1 };
+    const pre = new CellStore("authority");
+    pre.commit({ kind: "property_cell", object: "#1", name: "n", value: { def }, stamp: STAMP });
+    const result = applyTranscript(pre, baseTranscript({
+      writes: [{ cell: { kind: "prop", object: "#1", name: "n" }, value: 7, op: "set" }]
+    }), STAMP);
+    expect(result.post.get("property_cell:#1:n")?.value).toEqual({ value: 7, def });
+    // A def-less prior (or no prior at all) stays value-only.
+    const bare = applyTranscript(new CellStore("authority"), baseTranscript({
+      writes: [{ cell: { kind: "prop", object: "#1", name: "n" }, value: 7, op: "set" }]
+    }), STAMP);
+    expect(bare.post.get("property_cell:#1:n")?.value).toEqual({ value: 7 });
   });
 
   it("creates materialize lineage identity + live cells", () => {

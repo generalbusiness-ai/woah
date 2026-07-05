@@ -66,6 +66,25 @@ describe("store roles enforce the coherence invariant (CO2.1)", () => {
     expect(store.get("property_cell:#1:n")?.value).toBe(1);
     expect(snap.get("property_cell:#1:n")?.value).toBe(2);
   });
+
+  it("scratchAuthorityFrom gives a planner-parity apply target from a derived view", () => {
+    const authority = new CellStore("authority");
+    const committed = authority.commit({ kind: "property_cell", object: "#1", name: "n", value: { value: 1 }, stamp: STAMP });
+    const view = new CellStore("derived");
+    view.install(committed);
+    const scratch = CellStore.scratchAuthorityFrom(view);
+    // Authority role (so applyTranscript accepts it), values/versions
+    // preserved, provenance re-stamped for the apply only.
+    expect(scratch.role).toBe("authority");
+    expect(scratch.get("property_cell:#1:n")?.version).toBe(committed.version);
+    expect(scratch.get("property_cell:#1:n")?.value).toEqual({ value: 1 });
+    expect(scratch.get("property_cell:#1:n")?.provenance).toBe("authoritative");
+    // Scratch mutations never reach the view — it is a discardable
+    // post-state computation, not a second write path (CO2.1).
+    scratch.commit({ kind: "property_cell", object: "#1", name: "n", value: { value: 2 }, stamp: STAMP });
+    expect(view.get("property_cell:#1:n")?.value).toEqual({ value: 1 });
+    expect(view.get("property_cell:#1:n")?.provenance).toBe("derived");
+  });
 });
 
 describe("epoch discipline (CO8)", () => {

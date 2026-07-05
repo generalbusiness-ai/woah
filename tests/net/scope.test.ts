@@ -61,7 +61,7 @@ describe("commit acceptance (CO4)", () => {
       expect(reply.head.seq).toBe(1);
       expect(reply.touched).toEqual(["property_cell:#thing:n"]);
     }
-    expect(seq.store.get("property_cell:#thing:n")?.value).toBe("v1");
+    expect(seq.store.get("property_cell:#thing:n")?.value).toEqual({ value: "v1" });
     expect(seq.store.get("property_cell:#thing:n")?.provenance).toBe("authoritative");
   });
 
@@ -112,7 +112,9 @@ describe("commit acceptance (CO4)", () => {
 
   it("read-version mismatch rejects retryable with the mismatched cells (repair input)", () => {
     const seq = new ScopeSequencer(SCOPE, EPOCH);
-    seq.seed([{ kind: "property_cell", object: "#thing", name: "n", value: "current" }]);
+    // Seed with the canonical `{value}` property payload (transcript.ts
+    // PropertyCellPayload) so seeded and apply-produced cells share versions.
+    seq.seed([{ kind: "property_cell", object: "#thing", name: "n", value: { value: "current" } }]);
     const t = transcript({ reads: [{ cell: { kind: "prop", object: "#thing", name: "n" }, version: "stale-version", value: "old" as never }] });
     const reply = seq.submit(submitFor(seq, t, "k1"));
     expect(reply.status).toBe("rejected");
@@ -125,7 +127,9 @@ describe("commit acceptance (CO4)", () => {
 
   it("reads at the current authority version validate", () => {
     const seq = new ScopeSequencer(SCOPE, EPOCH);
-    seq.seed([{ kind: "property_cell", object: "#thing", name: "n", value: "current" }]);
+    // Seed with the canonical `{value}` property payload (transcript.ts
+    // PropertyCellPayload) so seeded and apply-produced cells share versions.
+    seq.seed([{ kind: "property_cell", object: "#thing", name: "n", value: { value: "current" } }]);
     const version = seq.store.get("property_cell:#thing:n")?.version as string;
     const t = transcript({
       reads: [{ cell: { kind: "prop", object: "#thing", name: "n" }, version, value: "current" as never }],

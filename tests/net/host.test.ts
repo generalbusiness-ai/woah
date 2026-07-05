@@ -90,7 +90,7 @@ describe("commit → fanout → receiver, off the reply path (CO2.7)", () => {
 
     expect(receiver.size).toBe(0); // reply returned; nothing delivered yet
     await host.flush();
-    expect(receiver.get("property_cell:#t:n")?.value).toBe("hello");
+    expect(receiver.get("property_cell:#t:n")?.value).toEqual({ value: "hello" });
     expect(receiver.get("property_cell:#t:n")?.provenance).toBe("derived");
   });
 });
