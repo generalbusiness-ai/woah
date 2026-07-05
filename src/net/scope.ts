@@ -178,17 +178,19 @@ export class ScopeSequencer {
       return this.reject(submit, "stale_head", { base: submit.base, head: this.headState });
     }
 
-    // Step 7: read versions against current authority cells.
-    const mismatched: TranscriptCell[] = [];
+    // Step 7: read versions against current authority cells. A cell read
+    // more than once in the turn is named ONCE in the repair input — the
+    // gateway refreshes cells, not read events.
+    const mismatched = new Map<string, TranscriptCell>();
     for (const read of submit.transcript.reads) {
       if (read.version === undefined) continue; // negative/probe read
       const key = netCellKeyFor(read.cell);
       if (key === null) continue; // contents reads are projection reads (CA4)
       const current = this.store.get(key)?.version ?? "absent";
-      if (current !== String(read.version)) mismatched.push(read.cell);
+      if (current !== String(read.version)) mismatched.set(key, read.cell);
     }
-    if (mismatched.length > 0) {
-      return this.reject(submit, "read_version_mismatch", {}, mismatched);
+    if (mismatched.size > 0) {
+      return this.reject(submit, "read_version_mismatch", {}, [...mismatched.values()]);
     }
 
     // Step 9: per-write authority (recorded VM frame, never owner union).

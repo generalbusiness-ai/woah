@@ -130,6 +130,16 @@ describe("lineage-closed transfers (CO7): dangling refs are unrepresentable", ()
     }
   });
 
+  it("session cells ride in transfers without an object closure (CO7 session rows)", () => {
+    // Lineage closure is an object-page property; a session cell keys on
+    // its session id, which has no lineage row by definition.
+    const cells = [
+      makeCell({ kind: "session", object: "session:abc", value: { id: "session:abc", actor: "#a" }, provenance: "authoritative", stamp: STAMP })
+    ];
+    expect(serializeTransfer(cells).cells).toHaveLength(1);
+    expect(lineageClosureKeys(cells).size).toBe(0);
+  });
+
   it("receiver-known lineage keeps closures under the byte ceiling without reshipping", () => {
     const known = new Set([cellKey("object_lineage", "#root"), cellKey("object_lineage", "#thing")]);
     const cells = [makeCell({ kind: "object_live", object: "#thing", value: {}, provenance: "authoritative", stamp: STAMP })];

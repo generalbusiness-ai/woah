@@ -245,12 +245,20 @@ export type CellTransfer = {
   assumes_known: string[];
 };
 
+/** Lineage closure is an *object*-page property (CO7). Session and log
+ * cells key on session ids / log streams — subjects with no lineage row —
+ * so they ride in transfers (CO7 names session rows as envelope content)
+ * without triggering the object closure walk. */
+function cellRequiresLineageClosure(kind: CellKind): boolean {
+  return kind !== "session" && kind !== "log";
+}
+
 export function serializeTransfer(cells: Cell[], receiverKnown: ReadonlySet<string> = new Set()): CellTransfer {
   const present = new Set(cells.map((c) => c.key));
   const lineageByObject = new Map<string, Cell>();
   for (const cell of cells) if (cell.kind === "object_lineage") lineageByObject.set(cell.object, cell);
 
-  const objects = new Set(cells.map((c) => c.object));
+  const objects = new Set(cells.filter((c) => cellRequiresLineageClosure(c.kind)).map((c) => c.object));
   for (const object of objects) {
     const key = cellKey("object_lineage", object);
     if (!present.has(key) && !receiverKnown.has(key)) {
@@ -273,6 +281,7 @@ export function serializeTransfer(cells: Cell[], receiverKnown: ReadonlySet<stri
 export function lineageClosureKeys(cells: Cell[]): Set<string> {
   const keys = new Set<string>();
   for (const cell of cells) {
+    if (!cellRequiresLineageClosure(cell.kind)) continue;
     keys.add(cellKey("object_lineage", cell.object));
     if (cell.kind === "object_lineage") {
       const parent = parentOfLineage(cell);
