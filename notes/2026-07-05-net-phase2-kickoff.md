@@ -76,8 +76,10 @@ smoke:cf-dev 13/13).
 
 ## Progress log (update as steps land)
 
-- [ ] 1. errors.ts + tests
-- [ ] 2. cells.ts + tests
+- [x] 1. errors.ts + tests (`70e0838`)
+- [x] 2. cells.ts + tests — CellStore with role-enforced CI, canonical
+      content addressing, epoch reseed, lineage-closed transfers with
+      receiver-known closure
 - [ ] 3. transcript.ts + tests
 - [ ] 4. scope.ts + validation-order tests (ported corpus)
 - [ ] 5. host.ts (InProcessHost)
