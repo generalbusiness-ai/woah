@@ -144,9 +144,14 @@ implemented it, so this layer carries the obligation explicitly.
 ## CO3. The effect transcript
 
 The canonical record submitted for commit validation, carried unchanged
-from VTN7 (`woo.effect_transcript.v1`). The wire kind string is preserved
-so transcripts are comparable across the old and new layers during the
-Plan-002 differential gate.
+from VTN7 (`woo.effect_transcript.v1`). **Bridge note (implementation):**
+the v2 layer's *implemented* transcript kind is
+`woo.effect_transcript.shadow.v1` with additional fields
+(`route`/`seq`/`stateProbes`/`sessionScopeTransition`/`projectionWrites`);
+during the Plan-002 differential-gate era, `src/net/transcript.ts` consumes
+that implemented shape through its single bridge import so the two layers
+compare like with like. The schema below is the *target* shape; the kind
+string graduates to `woo.effect_transcript.v1` at Phase-5 deletion.
 
 ```ts
 type EffectTranscript = {

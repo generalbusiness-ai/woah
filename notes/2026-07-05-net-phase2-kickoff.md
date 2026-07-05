@@ -92,7 +92,10 @@ smoke:cf-dev 13/13).
 - [x] 2. cells.ts + tests — CellStore with role-enforced CI, canonical
       content addressing, epoch reseed, lineage-closed transfers with
       receiver-known closure
-- [ ] 3. transcript.ts + tests
+- [x] 3. transcript.ts + tests — bridge of implemented shadow.v1 shape,
+      RecordedCell→net-cell translation table, clone-apply with v2
+      finalWritesByCell parity, contents→projection routing, deterministic
+      post-state version; CO3 bridge note added to coherence.md
 - [ ] 4. scope.ts + validation-order tests (ported corpus)
 - [ ] 5. host.ts (InProcessHost)
 - [ ] 6. route.ts + ride-along tests
