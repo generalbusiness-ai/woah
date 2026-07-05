@@ -161,5 +161,15 @@ smoke:cf-dev 13/13).
       on failure (no skip-ahead), backoff windows, attempt-budget →
       abandoned (named divergence), crash-recovery re-enqueue keeps row
       state, receiver no-op by per-scope seq high-water
-- [ ] 8. plan.ts + envelope byte gates
+- [x] 8. plan.ts + bridge.ts + envelope byte gates — `{value, def?}`
+      property payloads with prior-cell def merge for apply/bridge
+      version parity (`27a10fa`); bridge.ts engine views
+      (SerializedWorld ↔ net cells, contents/children recomputed CA4,
+      verb pages minus line_map, VM round-trip proven) (`abd3b09`);
+      planTurn: view-based read-version rewrite, route.ts scope
+      selection + commit-scope retarget, scratch-authority
+      post_state_version, CO7 envelope byte gates (warm 64 KB /
+      cross-scope 256 KB, breach = plain misplan Error), and the mini
+      repair loop (stale view → mismatched_reads → targeted refresh →
+      converge) as the acceptance bar (`2523fe4`)
 - [ ] 9. differential gate
