@@ -293,6 +293,26 @@ const CLASSIFICATION = {
     signal: "reason, scope, object_count, page_count, source_host",
     endState: "Per-turn authority-slice reconstruction (warm_turn_refresh) is replaced by content-addressed read-through warm cache-fill (B7) plus checkpoint/tail catch-up; steady-state warm turns reconstruct nothing."
   },
+  authority_slice_async_wake: {
+    bucket: "cross_host",
+    signal: "host, status, error",
+    endState: "Cold-owner authority wake runs off the reply path (B-ii); steady-state warm turns wake nothing, and failures surface as bounded retryable errors."
+  },
+  fanout_redelivery: {
+    bucket: "fanout_apply",
+    signal: "scope, seq, attempts, age_ms, status",
+    endState: "Durable-outbox rows redeliver at-least-once with bounded backoff (D1); abandoned rows are named divergence events, never silent loss."
+  },
+  gateway_projection_cache_epoch: {
+    bucket: "seed_cache",
+    signal: "status, epoch, old_epoch, rows_deleted",
+    endState: "Epoch-stamped projection cache (E1.2): a mismatch resets rows as a named self-healing reseed; steady state reports current with zero deletions."
+  },
+  state_path_divergence: {
+    bucket: "data_integrity",
+    signal: "code, cause, scope, target, verb, attempts, missing_object_count",
+    endState: "Terminal state-path failures carry a named divergence code and cause (E2); the taxonomy replaces loop-exhaustion diagnosis and each code has a defined reseed/repair path."
+  },
   authority_slice_partition: {
     bucket: "cross_host",
     signal: "host, reason, object_count, objects",
