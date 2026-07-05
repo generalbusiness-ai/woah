@@ -172,4 +172,27 @@ smoke:cf-dev 13/13).
       cross-scope 256 KB, breach = plain misplan Error), and the mini
       repair loop (stale view → mismatched_reads → targeted refresh →
       converge) as the acceptance bar (`2523fe4`)
-- [ ] 9. differential gate
+- [x] 9. differential gate — **commit-layer scope for Phase 2**
+      (`tests/net/differential.test.ts`): the same scripted turn sequence
+      (prop write + observe, create, move) runs v2-native
+      (createWorldFromSerialized + directCall + recorder) and through the
+      net pipeline (planTurn → ScopeSequencer → warm view refresh from
+      reply.touched); observation streams compare deep-equal turn-by-turn
+      and final authority state compares cell-by-cell by content address
+      (CO12.1-flavored). The FULL differential — scripts/smoke/scenario.ts
+      through the v2 fake lane vs src/net on InProcessHost — needs the
+      Phase-4 transports (session open, command routing, fanout delivery)
+      and lands with them. Step-9 findings, both fixed in `src/net/`:
+      (a) applyTranscript re-merged a create's lifecycle write echo into
+      the lineage payload, forking its content address from the
+      bridge-seeded shape on every created object — the create record is
+      now the sole authority for created lineage; (b) creates need the
+      owning scope's objectCounter at plan time (ids are
+      `obj_<scope>_<counter>`), so PlanTurnInput gained `counters`
+      threaded into the ephemeral planning world. Both divergences were
+      demonstrated by the gate before fixing (lineage version diff /
+      minted-id observation diff), so the gate provably has teeth.
+
+Phase 2 build steps (1–9) are complete. Scenario-level v2 ↔ net parity
+remains pending the Phase-3 hosts and Phase-4 transports; the commit
+layer holds the differential line until then.

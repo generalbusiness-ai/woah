@@ -25,7 +25,13 @@
  * to refresh before re-planning (the repair loop the CO12.4 differential
  * gate builds on).
  */
-import { planningWorldFromCells, runShadowTurnCallTranscript, storeCells, type ShadowTurnCall } from "./bridge";
+import {
+  planningWorldFromCells,
+  runShadowTurnCallTranscript,
+  storeCells,
+  type SerializedFromCellsOptions,
+  type ShadowTurnCall
+} from "./bridge";
 import { CellStore, cellKey, cellVersion, serializeTransfer, type Cell, type EpochStamp } from "./cells";
 import { selectCommitScope, type ScopeClassifier, type ScopeSelection } from "./route";
 import type { CommitSubmit, ScopeHead } from "./scope";
@@ -49,6 +55,13 @@ export type PlanTurnInput = {
    * reply (CO2.5). */
   idempotencyKey: string;
   stamp: EpochStamp;
+  /** World counters for the ephemeral planning world. Counters are host
+   * state, not cells: a turn that CREATES must plan with the owning
+   * scope's current objectCounter, or the planned id diverges from the
+   * id the authority would allocate (ids are `obj_<scope>_<counter>` —
+   * deterministic given the counter). Turns that do not create run fine
+   * at the bridge defaults. */
+  counters?: SerializedFromCellsOptions;
 };
 
 export type PlanTurnResult = {
@@ -63,10 +76,9 @@ export type PlanTurnResult = {
 export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
   const { call, view, planningScope, classifier, base, idempotencyKey, stamp } = input;
 
-  // Sparse execution against the view's cells only. World counters stay
-  // at bridge defaults: a turn that CREATES needs the owning host's
-  // counters threaded here (Phase-3 wiring; see SerializedFromCellsOptions).
-  const world = planningWorldFromCells(storeCells(view));
+  // Sparse execution against the view's cells only (plus the caller's
+  // counters for creates — see PlanTurnInput.counters).
+  const world = planningWorldFromCells(storeCells(view), input.counters);
   const run = await runShadowTurnCallTranscript(world, call);
 
   const selection = selectCommitScope(run.transcript, planningScope, classifier);

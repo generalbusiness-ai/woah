@@ -92,6 +92,21 @@ describe("applyTranscript (CO4 step 10)", () => {
     expect(result.touched).toContain("object_live:#new");
   });
 
+  it("a create's lifecycle write echo does not fork the lineage payload", () => {
+    // The recorder emits BOTH a create record and a lifecycle write for
+    // one object_create; the create is the authority. Re-merging the echo
+    // would graft `lifecycle: "create"` onto the payload and diverge its
+    // content address from the bridge-seeded lineage shape (caught by the
+    // step-9 differential gate).
+    const result = applyTranscript(new CellStore("authority"), baseTranscript({
+      creates: [{ object: "#new", name: "widget", parent: "$thing", owner: "#actor", anchor: null, location: null, flags: {} }],
+      writes: [{ cell: { kind: "lifecycle", object: "#new" }, value: "created", op: "create" }]
+    }), STAMP);
+    expect(result.post.get(cellKey("object_lineage", "#new"))?.value).toEqual({
+      parent: "$thing", owner: "#actor", name: "widget", anchor: null, flags: {}
+    });
+  });
+
   it("moves rewrite only the moved object's live cell (CA3: O(1) container move)", () => {
     const pre = new CellStore("authority");
     pre.commit({ kind: "object_live", object: "#bag", value: { location: "#room" }, stamp: STAMP });

@@ -155,6 +155,15 @@ export function applyTranscript(pre: CellStore, transcript: EffectTranscript, st
         break;
       }
       case "lifecycle": {
+        // A create's lifecycle write is the ECHO of the create record the
+        // loop above already applied (the recorder emits both for one
+        // object_create). Re-merging it would graft a `lifecycle` key onto
+        // the lineage payload and fork its content address from the
+        // bridge-seeded shape — the step-9 differential gate catches this
+        // as a lineage version divergence on every created object.
+        if (write.op === "create" && (transcript.creates ?? []).some((create) => create.object === write.cell.object)) {
+          break;
+        }
         const existing = post.get(key);
         const prior = (existing?.value ?? {}) as Record<string, unknown>;
         post.commit({ kind: "object_lineage", object: write.cell.object, value: { ...prior, lifecycle: write.op }, stamp });
