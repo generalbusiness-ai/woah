@@ -101,7 +101,12 @@ smoke:cf-dev 13/13).
       relabelled), idempotent replies, rolling head digest, bounded
       recovery tail, CO2.8 scheduled queue with nextAlarmAt/dueTurns;
       planner-parity post_state_version comparison
-- [ ] 5. host.ts (InProcessHost)
+- [x] 5. host.ts + tests — Host interface (now/defer/setAlarm) +
+      deterministic InProcessHost (manual clock, ordered alarms with
+      re-arm, nested-defer flush); first scope+outbox integration test
+      (commit → durable enqueue → deferred drain → derived install) and
+      the CO2.8 eviction-survival pattern (alarms rebuilt from scope
+      state alone)
 - [x] 6. route.ts + tests — pure write-set → scope selection: planning
       for read-only, single-scope direct, one-shared-anchor ride-along
       (CA3), riders-only → planning (B6), two shared scopes →
