@@ -106,6 +106,9 @@ smoke:cf-dev 13/13).
       for read-only, single-scope direct, one-shared-anchor ride-along
       (CA3), riders-only → planning (B6), two shared scopes →
       E_SCOPE_SPLIT; contents excluded (CA4); creates land at anchor
-- [ ] 7. outbox.ts + D1-ported gates
+- [x] 7. outbox.ts + tests — per-destination seq-ordered lanes that halt
+      on failure (no skip-ahead), backoff windows, attempt-budget →
+      abandoned (named divergence), crash-recovery re-enqueue keeps row
+      state, receiver no-op by per-scope seq high-water
 - [ ] 8. plan.ts + envelope byte gates
 - [ ] 9. differential gate
