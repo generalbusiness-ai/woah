@@ -102,7 +102,10 @@ smoke:cf-dev 13/13).
       recovery tail, CO2.8 scheduled queue with nextAlarmAt/dueTurns;
       planner-parity post_state_version comparison
 - [ ] 5. host.ts (InProcessHost)
-- [ ] 6. route.ts + ride-along tests
+- [x] 6. route.ts + tests — pure write-set → scope selection: planning
+      for read-only, single-scope direct, one-shared-anchor ride-along
+      (CA3), riders-only → planning (B6), two shared scopes →
+      E_SCOPE_SPLIT; contents excluded (CA4); creates land at anchor
 - [ ] 7. outbox.ts + D1-ported gates
 - [ ] 8. plan.ts + envelope byte gates
 - [ ] 9. differential gate
