@@ -35,6 +35,10 @@ export type NetFaultSpec = {
   latency_ms?: number;
   error?: string | boolean;
   kill_after_commit?: boolean;
+  /** Let the first N matching calls through unfaulted — how a lane arms a
+   * fault for the repair path while sparing setup calls on the same route
+   * (e.g. one clean /closure pull, then every refresh faults). */
+  skip_first?: number;
 };
 
 export type NetFaults = Record<string, NetFaultSpec>;
@@ -127,6 +131,10 @@ export function parseNetFaults(env: WorkerdHostEnv): NetFaults | null {
 export class WorkerdHost implements Host {
   private readonly options: WorkerdHostOptions;
   private readonly faults: NetFaults | null;
+  /** Matching-call counts per fault suffix, for skip_first. Per-host
+   * (per DO lifetime) — a lane that needs cross-eviction counting should
+   * use distinct routes instead. */
+  private readonly faultMatches = new Map<string, number>();
   /** Armed wake-ups by key. The DO alarm API is a single alarm per DO,
    * so the key exists for documentation/bookkeeping: the storage alarm
    * is always armed to the EARLIEST pending `at` across keys. */
@@ -224,7 +232,12 @@ export class WorkerdHost implements Host {
   private faultFor(route: string): NetFaultSpec | null {
     if (!this.faults) return null;
     for (const [suffix, spec] of Object.entries(this.faults)) {
-      if (route === suffix || route.endsWith(suffix)) return spec;
+      if (route === suffix || route.endsWith(suffix)) {
+        const seen = (this.faultMatches.get(suffix) ?? 0) + 1;
+        this.faultMatches.set(suffix, seen);
+        if (spec.skip_first !== undefined && seen <= spec.skip_first) return null;
+        return spec;
+      }
     }
     return null;
   }

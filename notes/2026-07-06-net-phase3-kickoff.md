@@ -141,6 +141,15 @@ driving the new path.
       OVERWRITES the seed; live pulls write the seed back deferred
       (best-effort, full pulls only — a `known`-relieved pull would
       snapshot a partial closure).
-- [ ] 4a. fake-DO fast lane for the new classes
-- [ ] 4b. workerd lane + fault injection + parked-task eviction gate
+- [x] 4a. covered by the step-2/3 fake-DO lane tests (net-do, net-gateway-repair, net-scope-fanout, net-kv-seed) — real per-instance storage isolation
+- [x] 4b. scripts/net-smoke-workerd.ts (`npm run smoke:net-dev`): 8/8 in
+      real workerd — warm structure gates (attempt 1, 6.8KB envelope),
+      subscriber fanout + rider adoption over real cross-DO RPC, real
+      alarm firing, 100ms submit latency ≠ divergence, faulted closure →
+      E_BUDGET with six-round E_READ_VERSION trace (skip_first fault
+      field spares setup calls). Eviction-survival stays gated by the
+      fake lane (workerd-local cannot force eviction — stated in the
+      script header). Lane debugging surfaced a permanent observability
+      fix: per-attempt net_scope_outbox_delivery_failed metric (failed
+      rows were silent until abandonment)
 - [ ] 5. aged-world lane

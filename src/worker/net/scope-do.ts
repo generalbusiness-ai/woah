@@ -595,17 +595,40 @@ export class NetScopeDO {
           row.last_attempt_at_ms = p.last_attempt_at_ms === null ? null : Number(p.last_attempt_at_ms);
           rows.push(row);
         }
-        await outbox.drain(this.host.now(), async (row) => {
-          if (route === "/adopt") {
-            await this.host.rpc(row.destination, "/adopt", {
-              from_scope: row.body.scope,
-              seq: row.body.seq,
-              cells: row.body.cells
-            });
-          } else {
-            await this.host.rpc(row.destination, "/fanout", row.body);
+        // Capture per-row delivery errors: Outbox.drain records failure by
+        // status alone, so without this a row retries silently for the
+        // whole attempt budget — an unobservable failure window ("no
+        // silent caps"). The error surfaces on the failed row's metric
+        // below on EVERY failed attempt, not only at abandonment.
+        const deliveryErrors = new Map<string, string>();
+        const drained = await outbox.drain(this.host.now(), async (row) => {
+          try {
+            if (route === "/adopt") {
+              await this.host.rpc(row.destination, "/adopt", {
+                from_scope: row.body.scope,
+                seq: row.body.seq,
+                cells: row.body.cells
+              });
+            } else {
+              await this.host.rpc(row.destination, "/fanout", row.body);
+            }
+          } catch (err) {
+            deliveryErrors.set(row.id, String(err));
+            throw err;
           }
         });
+        for (const failedId of drained.failed) {
+          console.log(
+            "woo.metric",
+            JSON.stringify({
+              kind: "net_scope_outbox_delivery_failed",
+              route,
+              id: failedId,
+              error: deliveryErrors.get(failedId) ?? "unknown",
+              ts: Date.now()
+            })
+          );
+        }
         this.state.storage.transactionSync(() => {
           for (const row of rows) {
             if (row.status === "delivered") {
