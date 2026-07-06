@@ -1,11 +1,25 @@
 ---
 date: 2026-05-20
-status: draft
+status: implemented (core role model DT1–DT2, DT4–DT8; DT3 partial — see status table)
 ---
 
 # Distribution: Execute, Sequence, Hold
 
 > Part of the [woo specification](../../SPEC.md). Layer: **semantics**.
+>
+> **Status (audited 2026-07-05):** the three-role model is the implemented
+> semantics and its vocabulary is a CI gate; it is normative, not draft.
+>
+> | Section | Verdict | Evidence |
+> |---|---|---|
+> | DT1 (three roles) | implemented | executor `src/core/executor.ts`; sequencer `src/worker/commit-scope-do.ts`; holders per DT8. The `ExecutionCapsule` mention is v2 mechanism — superseded by [coherence.md CO7](../protocol/coherence.md) at Plan 002 cutover |
+> | DT2 (turn scope / object host / sequencer identity) | implemented | wire-level `scope` field; `idFromName(String(scope))` derivation (cloudflare.md R8); anchor placement (objects.md §4.2). Atomic cross-scope sub-transcripts remain **deferred** as stated |
+> | DT3 (commit lifecycle) | **partial** | head-match + validate + accept/reject implemented; the per-proposal *signature / registered-signer* model is realized today as transport-level internal auth (`verifyInternalRequest`, `commit-scope-do.ts:304`) plus actor/session authority — executor-anonymous signatures are not built |
+> | DT4 (cell versions are freshness) | implemented | read-version validation (coherence.md CO2.4 / VTN8 step 7) |
+> | DT5 (big-world consequences) | implemented as protocol; world.ts-internal enumeration debt tracked separately | see LATER.md (edge/reverse-index) |
+> | DT6 (anti-pattern vocabulary) | implemented — enforced CI gate | `guard:vocabulary` in `test:guards` and `pretypecheck` (`package.json:29,51`) |
+> | DT7 | explicit non-goals | — |
+> | DT8 (implementation mapping) | implemented | renames landed: `ExecutorContext` (`world.ts:260`), `executor.ts` |
 
 woah is a distributed system. Many nodes participate in the same world. This section defines *which* nodes are allowed to do *what*, and what counts as the authoritative answer when nodes disagree.
 

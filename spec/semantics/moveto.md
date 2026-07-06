@@ -1,11 +1,23 @@
 ---
 date: 2026-05-02
-status: draft
+status: implemented (core M1–M5, M7; see status table)
 ---
 
 # Moveto pipeline
 
-> Working draft.
+> **Status (audited 2026-07-05):** the receiver-driven move chain is
+> implemented and is a documented hot path; this spec is its reference.
+>
+> | Section | Verdict | Evidence |
+> |---|---|---|
+> | M1–M3 (two primitives, hook chain, authority) | implemented | `movetoChecked` `src/core/world.ts:5816`, `assertCanMoveto` `:5817`, re-entry marker `movetoStack` `:5840` |
+> | M4 (cross-host moves) | implemented | deferred owner write via `ctx.deferHostEffect` in `movetoChecked` |
+> | M5 (builtin surface) | implemented | `"moveto"` in `tiny-vm.ts:112` (op `:964`), `dsl-compiler.ts:139`, `authoring.ts:14,906` |
+> | M6 (diagnostic `moveto_failed` schema) | not implemented — optional by its own text ("Skip if it adds noise") | no emitter in `world.ts` |
+> | M7 (caller migration) | implemented | `moveto(` in `catalogs/chat/manifest.json`, `catalogs/pinboard/manifest.json` |
+> | M8 (tests) | covered | moveto chain + cross-host cases in `tests/core.test.ts` (e.g. `:681,:837,:961`) |
+> | M9 | descriptive (enabled outcomes) | — |
+> | M10 | open questions — still open, non-normative | — |
 
 The LambdaMOO container model — `note:moveto(board)` triggers
 `board:acceptable(note)`, then `current.location:exitfunc(note)`, then

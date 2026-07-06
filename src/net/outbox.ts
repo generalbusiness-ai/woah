@@ -1,0 +1,142 @@
+/**
+ * Durable fanout outbox — coherence.md CO2.7.
+ *
+ * Committed effects reach every derived copy at-least-once, ordered per
+ * scope, crash-safe. The contract (ported from the v2 D1 gates):
+ *
+ * - rows are enqueued durably BEFORE the commit reply returns (the caller
+ *   sequences that; the outbox never loses an enqueued row);
+ * - drain delivers per-destination in seq order and stops that
+ *   destination's lane on the first failure (order is per-scope FIFO,
+ *   never skip-ahead);
+ * - failed rows wait out a backoff window keyed on their attempt count;
+ * - rows exceeding the attempt budget are marked `abandoned` — a named,
+ *   observable divergence event (the receiver reseeds via epoch check),
+ *   never silent loss;
+ * - redelivery is harmless: receivers no-op by scope seq (CO2.5), tested
+ *   here via applyFanout.
+ *
+ * No wall-clock reads inside the module — `now` is always a parameter
+ * (Host supplies it), which keeps drains deterministic in tests and
+ * replayable in workflows.
+ */
+import { CellStore, type Cell } from "./cells";
+
+export type FanoutBody = {
+  scope: string;
+  seq: number;
+  /** Authority cells for the receiver to install as derived copies —
+   * already lineage-closed by serializeTransfer (CO7). */
+  cells: Cell[];
+  /** Observations for live delivery at the destination. */
+  observations: unknown[];
+};
+
+export type FanoutRow = {
+  id: string;
+  destination: string;
+  body: FanoutBody;
+  status: "pending" | "delivered" | "abandoned";
+  attempts: number;
+  last_attempt_at_ms: number | null;
+};
+
+export type OutboxOptions = {
+  /** Backoff before retrying a failed row, by attempt count (1-based). */
+  backoffMs?: (attempt: number) => number;
+  /** Attempts before a row is abandoned (named divergence, not loss). */
+  maxAttempts?: number;
+};
+
+export type DrainResult = {
+  delivered: string[];
+  failed: string[];
+  abandoned: string[];
+  skipped_backoff: string[];
+};
+
+export class Outbox {
+  private readonly rows = new Map<string, FanoutRow>();
+  private readonly backoffMs: (attempt: number) => number;
+  private readonly maxAttempts: number;
+
+  constructor(options: OutboxOptions = {}) {
+    this.backoffMs = options.backoffMs ?? ((attempt) => Math.min(30_000, 250 * 2 ** (attempt - 1)));
+    this.maxAttempts = options.maxAttempts ?? 8;
+  }
+
+  /** Durable enqueue — call BEFORE returning the commit reply (CO2.7). */
+  enqueue(destination: string, body: FanoutBody): FanoutRow {
+    const row: FanoutRow = {
+      id: `${destination}/${body.scope}/${body.seq}`,
+      destination,
+      body,
+      status: "pending",
+      attempts: 0,
+      last_attempt_at_ms: null
+    };
+    // Same (destination, scope, seq) re-enqueued is the same fact; keep
+    // the earlier row (attempts/backoff state included).
+    if (!this.rows.has(row.id)) this.rows.set(row.id, row);
+    return this.rows.get(row.id) as FanoutRow;
+  }
+
+  pending(): FanoutRow[] {
+    return [...this.rows.values()].filter((row) => row.status === "pending");
+  }
+
+  /**
+   * Deliver pending rows: per destination, in (scope, seq) order, halting
+   * that destination's lane on the first failure so order is preserved.
+   * Rows inside their backoff window are skipped (and halt their lane —
+   * delivering seq+1 before seq would break per-scope order).
+   */
+  async drain(now: number, deliver: (row: FanoutRow) => Promise<void>): Promise<DrainResult> {
+    const result: DrainResult = { delivered: [], failed: [], abandoned: [], skipped_backoff: [] };
+    const lanes = new Map<string, FanoutRow[]>();
+    for (const row of this.pending()) {
+      const lane = lanes.get(row.destination) ?? [];
+      lane.push(row);
+      lanes.set(row.destination, lane);
+    }
+    for (const lane of lanes.values()) {
+      lane.sort((a, b) => a.body.scope.localeCompare(b.body.scope) || a.body.seq - b.body.seq);
+      for (const row of lane) {
+        if (row.last_attempt_at_ms !== null && now < row.last_attempt_at_ms + this.backoffMs(row.attempts)) {
+          result.skipped_backoff.push(row.id);
+          break; // preserve order: nothing later in this lane may jump the queue
+        }
+        row.attempts += 1;
+        row.last_attempt_at_ms = now;
+        try {
+          await deliver(row);
+          row.status = "delivered";
+          result.delivered.push(row.id);
+        } catch {
+          if (row.attempts >= this.maxAttempts) {
+            row.status = "abandoned";
+            result.abandoned.push(row.id);
+          } else {
+            result.failed.push(row.id);
+          }
+          break; // halt the lane; retry after backoff
+        }
+      }
+    }
+    return result;
+  }
+}
+
+/**
+ * Receiver application: install the body's cells into a derived store,
+ * no-op'ing redeliveries by scope seq (CO2.5). Returns whether the body
+ * advanced the receiver. `seen` is the receiver's durable per-scope
+ * high-water map.
+ */
+export function applyFanout(store: CellStore, seen: Map<string, number>, body: FanoutBody): boolean {
+  const last = seen.get(body.scope) ?? 0;
+  if (body.seq <= last) return false; // redelivery — harmless no-op
+  for (const cell of body.cells) store.install(cell);
+  seen.set(body.scope, body.seq);
+  return true;
+}

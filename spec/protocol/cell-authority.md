@@ -4,6 +4,14 @@ status: draft
 
 # Cell authority, movement projection, and authority migration
 
+> **Superseded-by note (2026-07-05, Plan 002):** the ratified movement model
+> — CA3 (location-as-truth, ride-along), CA4 (contents as projection), CA6
+> (actor-anchored default) — and the CA10/CA13 growth path are carried
+> forward by [coherence.md](coherence.md), which **governs** where the two
+> overlap. The v2-specific mechanism sections (authority slices, CA11 stub
+> refusal, CA12 representation bridging) describe the layer scheduled for
+> deletion at Plan 002 Phase 5 and remain as design history.
+
 This document specifies how durable state authority is located in the v2 node
 network: which node may accept a write to a given cell, how movement is
 represented so that hundreds of independent actors can move against overlapping
