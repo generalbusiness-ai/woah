@@ -46,7 +46,7 @@
  * here until Phase 5.
  */
 import type { Cell } from "../../net/cells";
-import { lineageClosureKeys, serializeTransfer, type CellTransfer } from "../../net/cells";
+import { cellKey, lineageClosureKeys, serializeTransfer, type CellTransfer } from "../../net/cells";
 import { isNetError, netError } from "../../net/errors";
 import { Outbox, type FanoutBody, type FanoutRow } from "../../net/outbox";
 import { ScopeSequencer, type CommitSubmit, type ScheduledTurn, type ScopeHead } from "../../net/scope";
@@ -393,7 +393,21 @@ export class NetScopeDO {
     if (meta !== null && scope !== undefined && scope !== meta.scope) {
       throw new Error(`NetScopeDO storage is ${meta.scope}; request names ${scope}`);
     }
-    this.seq = new ScopeSequencer(resolvedScope, resolvedEpoch, { durable: this.store });
+    const seq: ScopeSequencer = new ScopeSequencer(resolvedScope, resolvedEpoch, {
+      durable: this.store,
+      // Ownership wiring (Phase-3 hardening fix 2). Fixed-assignment rule,
+      // in force until the Phase-3.5 topology section lands anchor-map-
+      // driven ownership: a scope owns an object iff its store holds
+      // object_lineage:<object> — i.e. the object was part of this scope's
+      // own seeded/committed population. Rider adoption and the rider
+      // residue cache only ever carry touched VALUE cells (never lineage),
+      // so a ride-along cannot spuriously grant ownership here. Reads of
+      // non-owned cells are skipped at CO4 step 7 by the sequencer: their
+      // freshness is the owning scope's + the adopt-time prior-version
+      // CAS's job (CO2.4; notes/2026-07-06-rider-read-integrity.md).
+      owns: (object) => seq.store.has(cellKey("object_lineage", object))
+    });
+    this.seq = seq;
     return this.seq;
   }
 

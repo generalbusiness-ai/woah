@@ -166,6 +166,79 @@ describe("NetScopeDO over fake-DO storage", () => {
     first.close();
   });
 
+  it("skips read validation for foreign-anchored cells but still validates owned reads (fix 2: owns wiring)", async () => {
+    const scope = makeScope("room-a", env);
+    await call(scope.instance, env, "/seed", { scope: "room-a", catalog_epoch: EPOCH, cells: seedCells() });
+    const head0 = (await call<{ head: ScopeHead }>(scope.instance, env, "/head")).head;
+
+    const { applyTranscript } = await import("../../src/net/transcript");
+    const { ScopeSequencer } = await import("../../src/net/scope");
+
+    const transcriptWith = (reads: unknown[], hash: string) => ({
+      kind: "woo.effect_transcript.shadow.v1",
+      route: "sequenced",
+      scope: "room-a",
+      seq: 1,
+      call: { actor: "#actor", target: "#thing", verb: "set_label", args: [], body: undefined },
+      reads,
+      writes: [{ cell: { kind: "prop", object: "#thing", name: "label" }, value: "owned-check", op: "set", writer: WRITER }],
+      creates: [],
+      moves: [],
+      observations: [],
+      logicalInputs: [],
+      untrackedEffects: [],
+      complete: true,
+      incompleteReasons: [],
+      hash
+    });
+
+    const postStateFor = (transcript: unknown) => {
+      const twin = new ScopeSequencer("room-a", EPOCH);
+      twin.seed(seedCells());
+      return applyTranscript(twin.store, transcript as never, { scope_head: "x", catalog_epoch: EPOCH }).postStateVersion;
+    };
+
+    // A read of a foreign-anchored cell (#elsewhere has no object_lineage
+    // in this scope's store) carries a version this scope cannot attest.
+    // With `owns` wired, step 7 skips it — validation is the owning
+    // scope's + the adoption CAS's job (CO2.4) — so the submit accepts.
+    const foreignRead = transcriptWith(
+      [{ cell: { kind: "prop", object: "#elsewhere", name: "x" }, version: "some-foreign-version", value: 0 }],
+      "net-do-owns-1"
+    );
+    const accepted = await call<CommitReply>(scope.instance, env, "/submit", {
+      kind: "woo.net.commit_submit.v1",
+      scope: "room-a",
+      base: head0,
+      idempotency_key: "owns-t1",
+      transcript: foreignRead,
+      post_state_version: postStateFor(foreignRead),
+      stamp: { scope_head: "x", catalog_epoch: EPOCH }
+    });
+    expect(accepted.status).toBe("accepted");
+
+    // A stale read of an OWNED cell (#thing's lineage IS in the store)
+    // still rejects read_version_mismatch — owns must not blind the scope
+    // to its own cells.
+    const head1 = (await call<{ head: ScopeHead }>(scope.instance, env, "/head")).head;
+    const ownedStaleRead = transcriptWith(
+      [{ cell: { kind: "prop", object: "#thing", name: "label" }, version: "stale-owned-version", value: "old" }],
+      "net-do-owns-2"
+    );
+    const rejected = await call<CommitReply>(scope.instance, env, "/submit", {
+      kind: "woo.net.commit_submit.v1",
+      scope: "room-a",
+      base: head1,
+      idempotency_key: "owns-t2",
+      transcript: ownedStaleRead,
+      post_state_version: "irrelevant-never-reached",
+      stamp: { scope_head: "x", catalog_epoch: EPOCH }
+    });
+    expect(rejected.status).toBe("rejected");
+    expect(rejected.status === "rejected" && rejected.reason).toBe("read_version_mismatch");
+    scope.close();
+  });
+
   it("scheduled turns arm the alarm durably and re-arm after restart (CO2.8)", async () => {
     const first = makeScope("room-a", env);
     await call(first.instance, env, "/schedule", {
