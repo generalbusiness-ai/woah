@@ -36,7 +36,7 @@ import type { CommitReply, CommitSubmit, RejectReason, ScopeHead } from "../../n
 import { netCellKeyFor } from "../../net/transcript";
 import type { CellTransfer } from "../../net/cells";
 import { verifyInternalRequest } from "../internal-auth";
-import { WorkerdHost, type WorkerdHostEnv, type NetStub } from "./workerd-host";
+import { resolveNetDestination, WorkerdHost, type NetBindingsEnv } from "./workerd-host";
 
 export type NetGatewayDurableState = {
   id: unknown;
@@ -49,35 +49,7 @@ export type NetGatewayDurableState = {
   };
 };
 
-/** Structural slice of a DurableObjectNamespace — enough to resolve a
- * name to a stub; satisfied by real bindings and the fake namespace. */
-export type NetNamespace = {
-  idFromName(name: string): unknown;
-  get(id: unknown): NetStub;
-};
-
-export type NetGatewayEnv = WorkerdHostEnv & {
-  /** Test override: resolve rpc destinations to stubs directly (the fake
-   * harness wires this). When absent, destinations resolve through the
-   * real bindings below: `scope:<name>` → SCOPE_NET, `gateway:<name>` →
-   * GATEWAY_NET. */
-  NET_RESOLVE?: (destination: string) => NetStub;
-  SCOPE_NET?: NetNamespace;
-  GATEWAY_NET?: NetNamespace;
-};
-
-/** destination = "<kind>:<name>" (kickoff RPC surface). */
-function resolveFromBindings(env: NetGatewayEnv, destination: string): NetStub {
-  if (env.NET_RESOLVE) return env.NET_RESOLVE(destination);
-  const split = destination.indexOf(":");
-  const kind = split === -1 ? destination : destination.slice(0, split);
-  const name = split === -1 ? "" : destination.slice(split + 1);
-  const namespace = kind === "scope" ? env.SCOPE_NET : kind === "gateway" ? env.GATEWAY_NET : undefined;
-  if (!namespace || !name) {
-    throw new Error(`NetGatewayDO: cannot resolve rpc destination ${destination}`);
-  }
-  return namespace.get(namespace.idFromName(name));
-}
+export type NetGatewayEnv = NetBindingsEnv;
 
 function sqlRows<T>(cursor: unknown): T[] {
   return (cursor as { toArray(): T[] }).toArray();
@@ -148,7 +120,7 @@ export class NetGatewayDO {
     state.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_gateway_cell (key TEXT PRIMARY KEY, body TEXT NOT NULL)");
     state.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_gateway_scope (scope TEXT PRIMARY KEY, seen_seq INTEGER NOT NULL)");
     this.host = new WorkerdHost({
-      resolve: (destination) => resolveFromBindings(this.env, destination),
+      resolve: (destination) => resolveNetDestination(this.env, destination),
       env,
       waitUntil: state.waitUntil?.bind(state),
       alarmStorage: state.storage
@@ -278,7 +250,14 @@ export class NetGatewayDO {
       }
       const submit: CommitSubmit = { ...planned.submit, base };
 
-      const reply = (await this.host.rpc(destination, "/submit", submit)) as CommitReply;
+      // The submit rides with its rider directions (CA3 forward): the
+      // scope shell enqueues /net/adopt rows for the accepted rider
+      // cells after commit. CommitSubmit itself is unchanged — riders
+      // are an HTTP-body sibling, not sequencer input.
+      const reply = (await this.host.rpc(destination, "/submit", {
+        submit,
+        rider_destinations: this.riderDestinationsFor(request, planned.selection.riders)
+      })) as CommitReply;
       if (reply.status === "accepted") {
         if (reply.touched.length > 0) await this.installTouched(view, destination, reply.touched);
         return { reply, selection: planned.selection, envelopeBytes: planned.envelopeBytes, attempt, trace };
@@ -357,6 +336,28 @@ export class NetGatewayDO {
       max_attempts: MAX_TURN_ATTEMPTS,
       elapsed_ms: this.host.now() - startedAt
     });
+  }
+
+  /** Rider forwarding directions for the committing scope (CA3): for
+   * each rider scope in the selection, its rpc destination plus the
+   * objects the request anchors to it. The object list rides too because
+   * only the gateway holds the anchor map — the scope shell must know
+   * WHICH accepted cells are the rider's, and the sequencer itself never
+   * learns rider topology (src/net/scope.ts types stay unchanged). */
+  private riderDestinationsFor(
+    request: TurnRequest,
+    riders: string[]
+  ): Record<string, { destination: string; objects: string[] }> {
+    const out: Record<string, { destination: string; objects: string[] }> = {};
+    for (const rider of riders) {
+      const destination = request.scopes[rider];
+      if (!destination) throw new Error(`no rpc destination for rider scope ${rider}`);
+      const objects = Object.entries(request.anchors ?? {})
+        .filter(([, scope]) => scope === rider)
+        .map(([object]) => object);
+      out[rider] = { destination, objects };
+    }
+    return out;
   }
 
   /** One planning pass against the current view. The provisional base is

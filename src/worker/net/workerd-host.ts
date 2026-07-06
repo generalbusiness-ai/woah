@@ -54,6 +54,38 @@ export type WorkerdHostEnv = InternalAuthEnv & {
  * DurableObjectStub and by the fake namespace's stubs alike. */
 export type NetStub = { fetch(request: Request): Promise<Response> | Response };
 
+/** Structural slice of a DurableObjectNamespace — enough to resolve a
+ * name to a stub; satisfied by real bindings and the fake namespace. */
+export type NetNamespace = {
+  idFromName(name: string): unknown;
+  get(id: unknown): NetStub;
+};
+
+/** The env bindings both net DO classes resolve rpc destinations from.
+ * NET_RESOLVE is the test override (the fake harness wires stubs
+ * directly); without it, `scope:<name>` → SCOPE_NET and
+ * `gateway:<name>` → GATEWAY_NET (the kickoff RPC surface). */
+export type NetBindingsEnv = WorkerdHostEnv & {
+  NET_RESOLVE?: (destination: string) => NetStub;
+  SCOPE_NET?: NetNamespace;
+  GATEWAY_NET?: NetNamespace;
+};
+
+/** destination = "<kind>:<name>". Shared by NetGatewayDO and NetScopeDO
+ * (the scope needs it for outbox fanout/adoption drains) so the two
+ * shells cannot drift on how a destination name resolves. */
+export function resolveNetDestination(env: NetBindingsEnv, destination: string): NetStub {
+  if (env.NET_RESOLVE) return env.NET_RESOLVE(destination);
+  const split = destination.indexOf(":");
+  const kind = split === -1 ? destination : destination.slice(0, split);
+  const name = split === -1 ? "" : destination.slice(split + 1);
+  const namespace = kind === "scope" ? env.SCOPE_NET : kind === "gateway" ? env.GATEWAY_NET : undefined;
+  if (!namespace || !name) {
+    throw new Error(`cannot resolve rpc destination ${destination}`);
+  }
+  return namespace.get(namespace.idFromName(name));
+}
+
 /** The alarm slice of DO storage. Real `ctx.storage` satisfies this;
  * the fake-DO test harness supplies a recording equivalent. */
 export type AlarmStorage = {
