@@ -24,7 +24,8 @@ import { cellsFromSerialized, storeCells, type ShadowTurnCall } from "../../src/
 import { CellStore, cellKey, cellVersion } from "../../src/net/cells";
 import { planTurn } from "../../src/net/plan";
 import type { ScopeClassifier } from "../../src/net/route";
-import { ScopeSequencer } from "../../src/net/scope";
+import { ScopeSequencer, type CommitSubmit } from "../../src/net/scope";
+import { netCellKeyFor } from "../../src/net/transcript";
 
 const SCOPE = "home";
 const EPOCH = "cat1";
@@ -331,6 +332,37 @@ describe("differential gate: v2-native vs net commit layer (CO12.4)", () => {
     const view = new CellStore("derived");
     for (const seq of sequencers.values()) for (const cell of storeCells(seq.store)) view.install(cell);
 
+    // CO2.3 rider integrity (rule 1): the committing scope validates
+    // FOREIGN reads against owner attestations instead of skipping them,
+    // so the harness plays the gateway's part — partition the planned
+    // transcript's foreign reads by owner and attest each key at the
+    // owner's current store version (the /net/attest shape). A submit
+    // with an uncovered foreign read rejects terminal rider_unattested.
+    const attestForeignReads = (
+      transcript: { reads: Array<{ cell: { kind: string; object: string; name?: string } }> },
+      committingScope: string
+    ): NonNullable<CommitSubmit["attestations"]> => {
+      const byOwner = new Map<string, Set<string>>();
+      for (const read of transcript.reads) {
+        const key = netCellKeyFor(read.cell as never);
+        if (key === null) continue; // contents reads are projection reads (CA4)
+        const owner = classifier2.scopeOf(read.cell.object);
+        if (owner === committingScope) continue;
+        const keys = byOwner.get(owner) ?? new Set<string>();
+        keys.add(key);
+        byOwner.set(owner, keys);
+      }
+      const out: NonNullable<CommitSubmit["attestations"]> = {};
+      for (const [owner, keys] of byOwner) {
+        const seq = sequencers.get(owner) as ScopeSequencer;
+        out[owner] = {
+          owner_head: seq.head(),
+          cells: [...keys].sort().map((key) => ({ key, version: seq.store.get(key)?.version ?? "absent" }))
+        };
+      }
+      return out;
+    };
+
     const observationsB: Observation[][] = [];
     for (const turn of script) {
       const target = sequencers.get(turn.scope) as ScopeSequencer;
@@ -356,7 +388,8 @@ describe("differential gate: v2-native vs net commit layer (CO12.4)", () => {
       // The routing under test: retarget (pure move → cluster) and CA3
       // ride-along (room write + actor rider → world, riders named).
       expect(plan.selection, `${turn.id} routing`).toEqual({ scope: turn.scope, riders: turn.riders });
-      const reply = target.submit(plan.submit);
+      const attestations = attestForeignReads(plan.transcript, turn.scope);
+      const reply = target.submit({ ...plan.submit, attestations });
       expect(reply.status, `side B ${turn.id} (${turn.verb}): ${JSON.stringify(reply)}`).toBe("accepted");
       if (reply.status !== "accepted") return;
       observationsB.push(plan.transcript.observations);

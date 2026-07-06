@@ -84,21 +84,28 @@ describe("commit acceptance (CO4)", () => {
     }
   });
 
-  it("owns predicate skips foreign-anchored reads; without it every read validates (CO2.4)", () => {
+  it("owns predicate routes foreign reads to attestation; without it every read validates locally (CO2.4/CO2.3)", () => {
     // Multi-scope topology: this sequencer owns #thing but not #elsewhere.
     // A transcript read of #elsewhere carries the planning view's version;
-    // a scope that cannot attest the cell must not reject on it — its
-    // freshness is the gateway's cross-scope repair concern at the owning
-    // scope. Without `owns` (single-scope deployment) the same submit
-    // rejects, which is the surfaced Phase-2 gap the option closes.
+    // a scope that cannot attest the cell from its own store validates it
+    // against the submit's owner attestation instead (CO2.3 rider
+    // integrity — see the dedicated describe below). Without `owns`
+    // (single-scope deployment) the same submit validates every read
+    // against the local store, attestations ignored.
     const foreignRead = {
       reads: [{ cell: { kind: "prop" as const, object: "#elsewhere", name: "x" }, version: "view-version", value: null as never }],
       writes: [propWrite("v1")]
     };
     const owning = new ScopeSequencer(SCOPE, EPOCH, { owns: (object) => object === "#thing" });
-    expect(owning.submit(submitFor(owning, transcript(foreignRead), "k1")).status).toBe("accepted");
+    const attested = {
+      ...submitFor(owning, transcript(foreignRead), "k1"),
+      attestations: { the_cluster: { owner_head: { seq: 3, hash: "h3" }, cells: [{ key: "property_cell:#elsewhere:x", version: "view-version" }] } }
+    };
+    expect(owning.submit(attested).status).toBe("accepted");
     const single = new ScopeSequencer(SCOPE, EPOCH);
-    const reply = single.submit(submitFor(single, transcript(foreignRead), "k1"));
+    // The single-scope sequencer ignores the attestation: #elsewhere is
+    // absent from its store, so the "view-version" read mismatches.
+    const reply = single.submit({ ...submitFor(single, transcript(foreignRead), "k1"), attestations: attested.attestations });
     expect(reply.status === "rejected" && reply.reason === "read_version_mismatch").toBe(true);
   });
 
@@ -197,6 +204,86 @@ describe("commit acceptance (CO4)", () => {
     }
     expect(seq.head().seq).toBe(4);
     expect(seq.recoveryTail().map((e) => e.seq)).toEqual([3, 4]);
+  });
+});
+
+// CO2.3 rider integrity, rule 1 (spec/protocol/coherence.md amendment
+// 2026-07-06): a committing scope validates FOREIGN-anchored reads against
+// the owner attestation the submit carries — matching versions accept,
+// differing versions repair as read_version_mismatch (the gateway
+// re-attests + re-plans), and a rider read with no covering attestation
+// rejects terminal rider_unattested (never silently skipped).
+describe("rider read attestation (CO2.3)", () => {
+  const RIDER_KEY = "property_cell:#elsewhere:x";
+
+  /** Ride-along shape: one owned write plus a read of a cell anchored at
+   * another scope, planned at `readVersion` through the gateway view. */
+  function riderReadTranscript(readVersion: string) {
+    return transcript({
+      reads: [{ cell: { kind: "prop" as const, object: "#elsewhere", name: "x" }, version: readVersion, value: null as never }],
+      writes: [propWrite("v1")]
+    });
+  }
+
+  function owningSequencer(): ScopeSequencer {
+    return new ScopeSequencer(SCOPE, EPOCH, { owns: (object) => object === "#thing" });
+  }
+
+  function attestationAt(version: string): CommitSubmit["attestations"] {
+    return { the_cluster: { owner_head: { seq: 7, hash: "owner-h7" }, cells: [{ key: RIDER_KEY, version }] } };
+  }
+
+  it("a rider read matching its owner attestation accepts", () => {
+    const seq = owningSequencer();
+    const submit = { ...submitFor(seq, riderReadTranscript("owner-v1"), "k1"), attestations: attestationAt("owner-v1") };
+    expect(seq.submit(submit).status).toBe("accepted");
+  });
+
+  it("a stale attestation rejects retryable read_version_mismatch naming the rider cell", () => {
+    // The owner moved between the view's install and the attest fetch:
+    // the plan read owner-v1, the owner attests owner-v2. Retryable — the
+    // gateway refreshes the cell from its owner, re-attests, re-plans.
+    const seq = owningSequencer();
+    const submit = { ...submitFor(seq, riderReadTranscript("owner-v1"), "k1"), attestations: attestationAt("owner-v2") };
+    const reply = seq.submit(submit);
+    expect(reply.status).toBe("rejected");
+    if (reply.status === "rejected") {
+      expect(reply.reason).toBe("read_version_mismatch");
+      expect(reply.retryable).toBe(true);
+      expect(reply.mismatched_reads).toEqual([{ kind: "prop", object: "#elsewhere", name: "x" }]);
+    }
+    expect(seq.head().seq).toBe(0); // nothing committed
+  });
+
+  it("a rider read with no covering attestation rejects terminal rider_unattested", () => {
+    const seq = owningSequencer();
+    // No attestations at all…
+    const bare = seq.submit(submitFor(seq, riderReadTranscript("owner-v1"), "k1"));
+    expect(bare.status).toBe("rejected");
+    if (bare.status === "rejected") {
+      expect(bare.reason).toBe("rider_unattested");
+      expect(bare.retryable).toBe(false);
+      expect(bare.detail).toEqual({ key: RIDER_KEY });
+    }
+    // …and an attestation that covers a DIFFERENT cell is equally not
+    // proof for this one.
+    const wrongCell = {
+      ...submitFor(seq, riderReadTranscript("owner-v1"), "k2"),
+      attestations: { the_cluster: { owner_head: { seq: 7, hash: "owner-h7" }, cells: [{ key: "property_cell:#elsewhere:other", version: "v" }] } }
+    };
+    const reply = seq.submit(wrongCell);
+    expect(reply.status === "rejected" && reply.reason === "rider_unattested" && !reply.retryable).toBe(true);
+  });
+
+  it("owns absent (single-scope): every read validates locally, attestations ignored", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seq.seed([{ kind: "property_cell", object: "#elsewhere", name: "x", value: { value: "here" } }]);
+    const version = seq.store.get(RIDER_KEY)?.version as string;
+    // Local validation passes on the store's version even though the
+    // attached attestation names a different one — the field is only
+    // consulted when `owns` is wired.
+    const submit = { ...submitFor(seq, riderReadTranscript(version), "k1"), attestations: attestationAt("some-other-version") };
+    expect(seq.submit(submit).status).toBe("accepted");
   });
 });
 

@@ -398,7 +398,12 @@ describe("rider adoption prior-version CAS (fix 1)", () => {
 
   /** Ride-along transcript builder: read greeted at `readVersion` (the
    * version the plan observed through the gateway view), write visits +
-   * greeted. Planner-parity post-state from a twin seeded like the room. */
+   * greeted. Planner-parity post-state from a twin seeded like the room.
+   * The submit carries the CO2.3 owner attestation at the same version —
+   * the gateway attests at plan time, so plan-observed and attested
+   * versions agree unless the owner moved BETWEEN view install and
+   * attest (the read_version_mismatch repair case, covered in
+   * tests/net/scope.test.ts). */
   function rideAlongReading(base: ScopeHead, key: string, hash: string, readVersion: string, visits: number, greeted: number): CommitSubmit {
     const transcript = {
       kind: "woo.effect_transcript.shadow.v1",
@@ -430,7 +435,15 @@ describe("rider adoption prior-version CAS (fix 1)", () => {
       idempotency_key: key,
       transcript: transcript as never,
       post_state_version: derived.postStateVersion,
-      stamp: { scope_head: "x", catalog_epoch: EPOCH }
+      stamp: { scope_head: "x", catalog_epoch: EPOCH },
+      attestations: {
+        [CLUSTER_SCOPE]: {
+          // Fixture head: validation compares attested cell versions,
+          // not the owner head (provenance/diagnostics only).
+          owner_head: { seq: 0, hash: "fixture-owner-head" },
+          cells: [{ key: "property_cell:#actor:greeted", version: readVersion }]
+        }
+      }
     };
   }
 

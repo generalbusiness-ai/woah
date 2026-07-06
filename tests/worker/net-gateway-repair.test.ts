@@ -8,7 +8,7 @@
 // rounds); a recovery whose closure fetch keeps failing (WOO_NET_FAULTS)
 // exhausts the attempt ceiling and surfaces E_BUDGET with the full
 // attempt trace in the /net/turn error reply.
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { FakeDurableObjectState } from "./fake-do";
 import {
   MAX_TURN_ATTEMPTS,
@@ -22,17 +22,28 @@ import { installVerb } from "../../src/core/authoring";
 import { createWorld } from "../../src/core/bootstrap";
 import { cellsFromSerialized, type ShadowTurnCall } from "../../src/net/bridge";
 import type { AttemptTraceEntry } from "../../src/net/errors";
-import type { CommitReply } from "../../src/net/scope";
+import { applyTranscript } from "../../src/net/transcript";
+import { ScopeSequencer, type CommitReply, type CommitSubmit, type ScopeHead } from "../../src/net/scope";
 
 const SECRET = "net-repair-test-secret";
 const EPOCH = "cat-net-repair-1";
 const SCOPE = "repair_room";
 
-/** Fake DO state + the alarm slice the net DOs need. */
-function netState(name: string): { state: NetScopeDurableState & NetGatewayDurableState; close: () => void } {
+/** Fake DO state + the alarm slice the net DOs need. `settle` awaits the
+ * deferred tasks WorkerdHost hands to waitUntil (outbox drains — the
+ * rider-adoption tests need adoption to have landed before asserting). */
+function netState(name: string): {
+  state: NetScopeDurableState & NetGatewayDurableState;
+  settle: () => Promise<void>;
+  close: () => void;
+} {
   const fake = new FakeDurableObjectState(name);
+  const deferred: Array<Promise<unknown>> = [];
   const state = {
     id: fake.id,
+    waitUntil: (promise: Promise<unknown>) => {
+      deferred.push(promise);
+    },
     storage: {
       sql: fake.storage.sql,
       transactionSync: fake.storage.transactionSync,
@@ -40,7 +51,13 @@ function netState(name: string): { state: NetScopeDurableState & NetGatewayDurab
       deleteAlarm: () => {}
     }
   };
-  return { state, close: () => fake.close() };
+  return {
+    state,
+    settle: async () => {
+      while (deferred.length > 0) await deferred.shift();
+    },
+    close: () => fake.close()
+  };
 }
 
 type Fetchable = { fetch(request: Request): Promise<Response> | Response };

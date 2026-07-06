@@ -17,6 +17,12 @@
  *                           field is the gateway's CA3 rider directions
  *                           (src/net/scope.ts types stay unchanged; the
  *                           sequencer never learns rider topology)
+ *       POST /net/attest    {keys} → {scope, owner_head, cells:
+ *                           [{key, version}]} — the CO2.3 rider-read
+ *                           attestation surface: the gateway fetches
+ *                           this from each owner scope at plan time so
+ *                           the committing scope can validate foreign
+ *                           reads (absent cells attest "absent")
  *       POST /net/closure   {keys, known?} → lineage-closed CellTransfer
  *       GET  /net/head      {scope, catalog_epoch, head}
  *       POST /net/seed      bootstrap/install path (also how tests build
@@ -335,6 +341,21 @@ export class NetScopeDO {
         };
         return json(this.adopt(body));
       }
+      if (request.method === "POST" && url.pathname === "/net/attest") {
+        // CO2.3 rider-read attestation: report this authority's current
+        // version for each requested cell key, plus the head the report
+        // was taken at. Absent cells attest "absent" — the same token
+        // read-version validation uses, so an attested absence compares
+        // directly against a planned "absent" read. Read-only: no state
+        // changes, no head movement.
+        const body = (await request.json()) as { keys: string[] };
+        const seq = this.ensureSequencer();
+        return json({
+          scope: seq.scope,
+          owner_head: seq.head(),
+          cells: body.keys.map((key) => ({ key, version: seq.store.get(key)?.version ?? "absent" }))
+        });
+      }
       if (request.method === "POST" && url.pathname === "/net/closure") {
         const body = (await request.json()) as { keys: string[]; known?: string[] };
         return json(this.closure(body.keys, body.known ?? []));
@@ -538,20 +559,27 @@ export class NetScopeDO {
   // ---- Fanout + rider adoption (CO2.7, CA3) ---------------------------
 
   /**
-   * Prior observations for the adopt-time CAS (rider-read integrity fix
-   * 1, interim guard). For every cell of a rider-anchored object, record
-   * the version the committing turn OBSERVED before writing. Two honest
-   * sources, in preference order:
+   * Prior observations for the adopt-time CAS (CO2.3 rider integrity).
+   * For every cell of a rider-anchored object, record the version the
+   * committing turn OBSERVED before writing. Three honest sources, in
+   * preference order:
    *
+   * (0) the submit's owner attestation covering the cell — the spec's
+   *     "the version the committing turn observed" is by definition the
+   *     ATTESTED version once CO2.3 rule 1 validates rider reads against
+   *     it (on an accepted submit it equals the transcript's rewritten
+   *     read version, so this is a provenance clarification for read
+   *     cells and the primary source going forward);
    * (a) the transcript's read version for that cell — plan.ts rewrote it
-   *     through the gateway view (a derived copy of the OWNER's fact), so
-   *     it is exactly the rider read nobody validated (the CO2.4 gap this
-   *     guard closes);
+   *     through the gateway view (a derived copy of the OWNER's fact);
+   *     the fallback for submits without attestations (direct submits,
+   *     single-owner tests);
    * (b) this scope's own pre-commit copy — the residue cache of an
-   *     earlier accepted ride-along. Versions are content addresses of
-   *     values (cells.ts cellVersion), so a cached copy of the owner's
-   *     value carries the SAME version string the owner holds, making it
-   *     directly comparable at the owner.
+   *     earlier accepted ride-along; the fallback for writes-only riders
+   *     that never read the cell this turn. Versions are content
+   *     addresses of values (cells.ts cellVersion), so a cached copy of
+   *     the owner's value carries the SAME version string the owner
+   *     holds, making it directly comparable at the owner.
    *
    * The committing scope's transcript-write `prior` field is NOT usable:
    * it carries engine-recorded versions (plan.ts rewrites reads only),
@@ -573,6 +601,18 @@ export class NetScopeDO {
       for (const object of rider.objects) riderObjects.add(object);
     }
     if (riderObjects.size === 0) return priors;
+    // Source (0): the owner attestations the turn was validated against.
+    // Attestation cell keys are `<kind>:<object>[:<name>]` (object ids
+    // never contain ':'); only rider-object cells become priors —
+    // attestations may also cover foreign reads of NON-rider objects
+    // (read-only foreign state), which adoption never touches.
+    for (const entry of Object.values(submit.attestations ?? {})) {
+      for (const cell of entry.cells) {
+        if (priors.has(cell.key)) continue;
+        const object = cell.key.split(":")[1] ?? "";
+        if (riderObjects.has(object)) priors.set(cell.key, cell.version);
+      }
+    }
     for (const read of submit.transcript.reads) {
       if (read.version === undefined) continue; // negative/probe read
       if (!riderObjects.has(read.cell.object)) continue;

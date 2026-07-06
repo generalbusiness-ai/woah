@@ -413,7 +413,19 @@ export class NetGatewayDO {
       if (base === null) {
         base = ((await this.host.rpc(destination, "/head")) as { head: ScopeHead }).head;
       }
-      const submit: CommitSubmit = { ...planned.submit, base };
+      // CO2.3 rider integrity (rule 1): attest every FOREIGN read — a
+      // read whose object anchors to a scope other than the committing
+      // one — from its owner before submitting. Fetched fresh on EVERY
+      // round (including stale_head resubmits), so a read_version_
+      // mismatch repair — which refreshes the mismatched cells from
+      // their owners (refreshCells routes by `anchors`) and re-plans —
+      // automatically re-attests the affected owners too.
+      const attestations = await this.attestForeignReads(request, planned, targetScope);
+      const submit: CommitSubmit = {
+        ...planned.submit,
+        base,
+        ...(attestations !== undefined ? { attestations } : {})
+      };
 
       // The submit rides with its rider directions (CA3 forward): the
       // scope shell enqueues /net/adopt rows for the accepted rider
@@ -563,6 +575,46 @@ export class NetGatewayDO {
       idempotencyKey,
       scope
     );
+  }
+
+  /**
+   * Owner attestations for the planned transcript's foreign reads
+   * (CO2.3 rider integrity, rule 1). Partition the reads by owning scope
+   * — the same `anchors` routing refreshCells uses; objects absent from
+   * the map anchor to the planning scope — and fetch `POST /net/attest`
+   * from each owner whose scope is NOT the committing one. The committing
+   * scope validates rider reads against these instead of skipping them;
+   * a foreign read submitted without its attestation rejects terminal
+   * `rider_unattested`. Returns undefined when every read is local to
+   * the committing scope (the warm single-scope case adds no RPC).
+   */
+  private async attestForeignReads(
+    request: TurnRequest,
+    planned: PlanTurnResult,
+    targetScope: string
+  ): Promise<CommitSubmit["attestations"]> {
+    const byOwner = new Map<string, Set<string>>();
+    for (const read of planned.transcript.reads) {
+      const key = netCellKeyFor(read.cell);
+      if (key === null) continue; // contents reads are projection reads (CA4)
+      const owner = request.anchors?.[read.cell.object] ?? request.planningScope;
+      if (owner === targetScope) continue; // validated locally at the committing scope
+      const keys = byOwner.get(owner) ?? new Set<string>();
+      keys.add(key);
+      byOwner.set(owner, keys);
+    }
+    if (byOwner.size === 0) return undefined;
+    const attestations: NonNullable<CommitSubmit["attestations"]> = {};
+    for (const [owner, keys] of byOwner) {
+      const destination = request.scopes[owner];
+      if (!destination) throw new Error(`no rpc destination to attest reads owned by ${owner}`);
+      const reply = (await this.host.rpc(destination, "/attest", { keys: [...keys].sort() })) as {
+        owner_head: ScopeHead;
+        cells: Array<{ key: string; version: string }>;
+      };
+      attestations[owner] = { owner_head: reply.owner_head, cells: reply.cells };
+    }
+    return attestations;
   }
 
   /** Rider forwarding directions for the committing scope (CA3): for

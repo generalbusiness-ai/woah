@@ -47,6 +47,15 @@ export type CommitSubmit = {
    * the scope re-derives and compares (CO4 step 10). */
   post_state_version: string;
   stamp: EpochStamp;
+  /** CO2.3 rider integrity (rule 1): owner attestations for the
+   * transcript's FOREIGN-anchored reads, keyed by owning scope. The
+   * gateway fetches these at plan time (`POST /net/attest` — one async
+   * RPC per owner, off the validation path); the committing scope
+   * validates each rider read against the attested version instead of
+   * skipping it. Only consulted when `owns` is wired (multi-scope
+   * topologies); single-scope sequencers validate every read locally
+   * and ignore this field. */
+  attestations?: Record<string, { owner_head: ScopeHead; cells: Array<{ key: string; version: string }> }>;
 };
 
 export type RejectReason =
@@ -56,6 +65,7 @@ export type RejectReason =
   | "stale_head"          // base behind current head
   | "incomplete_transcript" // step 4 — never short-circuited
   | "read_version_mismatch" // step 7
+  | "rider_unattested"    // step 7 — foreign read with no owner attestation (CO2.3); terminal
   | "write_unauthorized"  // step 9
   | "post_state_mismatch"; // step 10
 
@@ -105,11 +115,14 @@ export type ScopeSequencerOptions = {
   writeAuthorized?: (submit: CommitSubmit) => boolean;
   /** Cell ownership for multi-scope topologies. A scope can only attest
    * (CO2.4) the cells it is the authority for; when provided, step 7
-   * skips reads of foreign-anchored cells — their freshness is the
-   * gateway's cross-scope repair concern at the owning scope (Phase 3).
-   * WRITES are never filtered: a CA3 rider write to a foreign-anchored
-   * cell rides along atomically at this scope by design. Single-scope
-   * deployments omit this and validate every read. */
+   * validates reads of foreign-anchored cells against the submit's
+   * owner `attestations` (CO2.3 rider integrity) — matching versions
+   * pass, differing versions reject `read_version_mismatch`, and a
+   * foreign read with no covering attestation rejects terminal
+   * `rider_unattested`. WRITES are never filtered: a CA3 rider write to
+   * a foreign-anchored cell rides along atomically at this scope by
+   * design. Single-scope deployments omit this and validate every read
+   * locally (attestations are ignored). */
   owns?: (object: string) => boolean;
   /** Bounded recovery tail length (the scope's own log — CO5 note). */
   tailLimit?: number;
@@ -233,13 +246,40 @@ export class ScopeSequencer {
     // Step 7: read versions against current authority cells. A cell read
     // more than once in the turn is named ONCE in the repair input — the
     // gateway refreshes cells, not read events.
+    //
+    // CO2.3 rider integrity (rule 1): when `owns` is wired (multi-scope),
+    // a FOREIGN-anchored read is validated against the owner attestation
+    // the submit carries — never skipped, never checked against this
+    // scope's own store (which cannot attest cells it does not hold).
+    // Attested versions are flattened across owner entries: a cell's key
+    // is globally unique, so which owner attested it is provenance detail
+    // the validation itself does not need.
+    const attested = new Map<string, string>();
+    for (const entry of Object.values(submit.attestations ?? {})) {
+      for (const cell of entry.cells) attested.set(cell.key, cell.version);
+    }
     const mismatched = new Map<string, TranscriptCell>();
     for (const read of submit.transcript.reads) {
       if (read.version === undefined) continue; // negative/probe read
       const key = netCellKeyFor(read.cell);
       if (key === null) continue; // contents reads are projection reads (CA4)
-      // Foreign-anchored reads are not attestable here (see options.owns).
-      if (this.options.owns && !this.options.owns(read.cell.object)) continue;
+      if (this.options.owns && !this.options.owns(read.cell.object)) {
+        const attestedVersion = attested.get(key);
+        if (attestedVersion === undefined) {
+          // A rider read nobody attested is a protocol violation by the
+          // submitter (the gateway attests every foreign read at plan
+          // time), not a stale-view condition — terminal, named (the
+          // pre-amendment behavior silently skipped these reads, which
+          // is the CO2.4 gap this closes; notes/2026-07-06-rider-read-
+          // integrity.md).
+          return this.reject(submit, "rider_unattested", { key });
+        }
+        // Attested-vs-planned mismatch repairs exactly like an owned
+        // stale read: the gateway refreshes the cell (from its owner,
+        // via the anchors routing), re-attests, and re-plans.
+        if (attestedVersion !== String(read.version)) mismatched.set(key, read.cell);
+        continue;
+      }
       const current = this.store.get(key)?.version ?? "absent";
       if (current !== String(read.version)) mismatched.set(key, read.cell);
     }
