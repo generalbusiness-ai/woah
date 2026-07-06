@@ -10,8 +10,9 @@
 // by seq); a /net/fanout delivery fault (WOO_NET_FAULTS) leaves a
 // pending row that a later drain — kicked by the next request on a
 // fresh DO over the same storage — delivers.
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { FakeDurableObjectState } from "./fake-do";
+import { cellVersion } from "../../src/net/cells";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
@@ -288,5 +289,219 @@ describe("NetScopeDO fanout + rider adoption over fake-DO", () => {
 
     room.close();
     gatewayState.close();
+  });
+});
+
+// ---- Rider-read integrity interim guard (Phase-3 hardening fix 1) --------
+// notes/2026-07-06-rider-read-integrity.md: adoption CASes each cell
+// against the prior version the committing turn observed; a mismatch is
+// owner-wins + net_adopt_conflict (named divergence), never a silent
+// lost update. The committing scope's residue copies re-stamp derived.
+describe("rider adoption prior-version CAS (fix 1)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** Ride-along transcript builder: read greeted at `readVersion` (the
+   * version the plan observed through the gateway view), write visits +
+   * greeted. Planner-parity post-state from a twin seeded like the room. */
+  function rideAlongReading(base: ScopeHead, key: string, hash: string, readVersion: string, visits: number, greeted: number): CommitSubmit {
+    const transcript = {
+      kind: "woo.effect_transcript.shadow.v1",
+      route: "sequenced",
+      scope: ROOM_SCOPE,
+      seq: base.seq + 1,
+      call: { actor: "#actor", target: "#room", verb: "greet", args: [], body: undefined },
+      reads: [{ cell: { kind: "prop", object: "#actor", name: "greeted" }, version: readVersion, value: greeted - 1 }],
+      writes: [
+        { cell: { kind: "prop", object: "#room", name: "visits" }, value: visits, op: "set", writer: WRITER },
+        { cell: { kind: "prop", object: "#actor", name: "greeted" }, value: greeted, op: "set", writer: WRITER }
+      ],
+      creates: [],
+      moves: [],
+      observations: [],
+      logicalInputs: [],
+      untrackedEffects: [],
+      complete: true,
+      incompleteReasons: [],
+      hash
+    };
+    const twin = new ScopeSequencer(ROOM_SCOPE, EPOCH);
+    twin.seed(roomCells());
+    const derived = applyTranscript(twin.store, transcript as never, { scope_head: "x", catalog_epoch: EPOCH });
+    return {
+      kind: "woo.net.commit_submit.v1",
+      scope: ROOM_SCOPE,
+      base,
+      idempotency_key: key,
+      transcript: transcript as never,
+      post_state_version: derived.postStateVersion,
+      stamp: { scope_head: "x", catalog_epoch: EPOCH }
+    };
+  }
+
+  /** Direct owner-ordered write at the cluster (the owner "advancing"
+   * between the shared scope's plan and its adopt delivery). */
+  function clusterAdvanceSubmit(base: ScopeHead, greeted: number): CommitSubmit {
+    const transcript = {
+      kind: "woo.effect_transcript.shadow.v1",
+      route: "sequenced",
+      scope: CLUSTER_SCOPE,
+      seq: base.seq + 1,
+      call: { actor: "#actor", target: "#actor", verb: "stamp", args: [], body: undefined },
+      reads: [],
+      writes: [{ cell: { kind: "prop", object: "#actor", name: "greeted" }, value: greeted, op: "set", writer: WRITER }],
+      creates: [],
+      moves: [],
+      observations: [],
+      logicalInputs: [],
+      untrackedEffects: [],
+      complete: true,
+      incompleteReasons: [],
+      hash: `cluster-advance-${greeted}`
+    };
+    const twin = new ScopeSequencer(CLUSTER_SCOPE, EPOCH);
+    twin.seed(clusterCells());
+    const derived = applyTranscript(twin.store, transcript as never, { scope_head: "x", catalog_epoch: EPOCH });
+    return {
+      kind: "woo.net.commit_submit.v1",
+      scope: CLUSTER_SCOPE,
+      base,
+      idempotency_key: `cluster-advance-${greeted}`,
+      transcript: transcript as never,
+      post_state_version: derived.postStateVersion,
+      stamp: { scope_head: "x", catalog_epoch: EPOCH }
+    };
+  }
+
+  it("owner-unmoved adopts cleanly; an owner advance between plan and adopt survives with one net_adopt_conflict", async () => {
+    const metricLines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+      metricLines.push(args.map(String).join(" "));
+    });
+    const conflicts = () => metricLines.filter((line) => line.includes("net_adopt_conflict")).length;
+
+    const scopeEnvBase = { WOO_INTERNAL_SECRET: SECRET };
+    const cluster = netState(`scope-${CLUSTER_SCOPE}-cas`);
+    const clusterDO = new NetScopeDO(cluster.state, scopeEnvBase);
+    await call(clusterDO, scopeEnvBase, "/seed", { scope: CLUSTER_SCOPE, catalog_epoch: EPOCH, cells: clusterCells() });
+
+    const room = netState(`scope-${ROOM_SCOPE}-cas`);
+    const roomEnv: NetScopeEnv = {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_RESOLVE: (destination) => {
+        if (destination === `scope:${CLUSTER_SCOPE}`) return clusterDO;
+        throw new Error(`unexpected destination ${destination}`);
+      }
+    };
+    const roomDO = new NetScopeDO(room.state, roomEnv);
+    await call(roomDO, roomEnv, "/seed", { scope: ROOM_SCOPE, catalog_epoch: EPOCH, cells: roomCells() });
+    const riders = { [CLUSTER_SCOPE]: { destination: `scope:${CLUSTER_SCOPE}`, objects: ["#actor"] } };
+
+    const greetedAt = async (): Promise<{ value: unknown; version: string }> => {
+      const closure = await call<{ cells: Array<{ value: unknown; version: string }> }>(clusterDO, scopeEnvBase, "/closure", {
+        keys: ["property_cell:#actor:greeted"],
+        known: ["object_lineage:#actor"]
+      });
+      return closure.cells[0];
+    };
+
+    // ---- Happy path: the plan reads greeted at the owner's live version
+    // (versions are value content addresses; the seeded value is {value:0}).
+    const head0 = (await call<{ head: ScopeHead }>(roomDO, roomEnv, "/head")).head;
+    const happy = rideAlongReading(head0, "cas-happy", "cas-t1", cellVersion({ value: 0 }), 1, 1);
+    expect((await call<CommitReply>(roomDO, roomEnv, "/submit", { submit: happy, rider_destinations: riders })).status).toBe("accepted");
+    await room.settle();
+    expect((await greetedAt()).value).toEqual({ value: 1 }); // adopted cleanly
+    expect(conflicts()).toBe(0);
+
+    // ---- Negative path (the external reviewer's scenario): the plan reads
+    // greeted at {value:1}; the OWNER then advances the cell directly
+    // (owner-ordered write → {value:42}) before the shared scope's commit
+    // is adopted. The owner's newer value must SURVIVE, with exactly one
+    // named net_adopt_conflict — never a silent clobber.
+    const stale = rideAlongReading(
+      (await call<{ head: ScopeHead }>(roomDO, roomEnv, "/head")).head,
+      "cas-stale",
+      "cas-t2",
+      cellVersion({ value: 1 }), // what the plan observed
+      2,
+      2
+    );
+    const clusterHead = (await call<{ head: ScopeHead }>(clusterDO, scopeEnvBase, "/head")).head;
+    expect((await call<CommitReply>(clusterDO, scopeEnvBase, "/submit", clusterAdvanceSubmit(clusterHead, 42))).status).toBe("accepted");
+
+    expect((await call<CommitReply>(roomDO, roomEnv, "/submit", { submit: stale, rider_destinations: riders })).status).toBe("accepted");
+    await room.settle();
+
+    const after = await greetedAt();
+    expect(after.value).toEqual({ value: 42 }); // owner-wins: newer value survived
+    expect(conflicts()).toBe(1); // exactly one named divergence
+
+    // Redelivery of the processed adoption no-ops (high-water advanced
+    // even though the cell conflicted) — the verdict cannot flap.
+    const replay = await call<{ applied: boolean }>(clusterDO, scopeEnvBase, "/adopt", {
+      from_scope: ROOM_SCOPE,
+      seq: 2,
+      cells: [],
+      prior_versions: {}
+    });
+    expect(replay.applied).toBe(false);
+    expect(conflicts()).toBe(1);
+
+    room.close();
+    cluster.close();
+  });
+
+  it("re-stamps the committing scope's rider residue derived in closures (no dual authority)", async () => {
+    const scopeEnvBase = { WOO_INTERNAL_SECRET: SECRET };
+    const cluster = netState(`scope-${CLUSTER_SCOPE}-residue`);
+    const clusterDO = new NetScopeDO(cluster.state, scopeEnvBase);
+    await call(clusterDO, scopeEnvBase, "/seed", { scope: CLUSTER_SCOPE, catalog_epoch: EPOCH, cells: clusterCells() });
+
+    const room = netState(`scope-${ROOM_SCOPE}-residue`);
+    const roomEnv: NetScopeEnv = {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_RESOLVE: () => clusterDO
+    };
+    const roomDO = new NetScopeDO(room.state, roomEnv);
+    await call(roomDO, roomEnv, "/seed", { scope: ROOM_SCOPE, catalog_epoch: EPOCH, cells: roomCells() });
+
+    const head0 = (await call<{ head: ScopeHead }>(roomDO, roomEnv, "/head")).head;
+    const submit = rideAlongReading(head0, "residue-1", "residue-t1", cellVersion({ value: 0 }), 1, 1);
+    expect(
+      (
+        await call<CommitReply>(roomDO, roomEnv, "/submit", {
+          submit,
+          rider_destinations: { [CLUSTER_SCOPE]: { destination: `scope:${CLUSTER_SCOPE}`, objects: ["#actor"] } }
+        })
+      ).status
+    ).toBe("accepted");
+    await room.settle();
+
+    // A full "*" closure from the committing scope must not crash on the
+    // rider cell's missing lineage (declared receiver-known), and must
+    // ship the rider residue DERIVED while the scope's own cells stay
+    // authoritative — the owner is the only authoritative copy now.
+    const full = await call<{ cells: Array<{ key: string; provenance: string }>; assumes_known: string[] }>(
+      roomDO,
+      roomEnv,
+      "/closure",
+      { keys: ["*"], known: [] }
+    );
+    const byKey = new Map(full.cells.map((cell) => [cell.key, cell.provenance]));
+    expect(byKey.get("property_cell:#actor:greeted")).toBe("derived");
+    expect(byKey.get("property_cell:#room:visits")).toBe("authoritative");
+    expect(full.assumes_known).toContain("object_lineage:#actor");
+
+    // The owner's own copy stays authoritative in ITS closures.
+    const owned = await call<{ cells: Array<{ key: string; provenance: string }> }>(clusterDO, scopeEnvBase, "/closure", {
+      keys: ["property_cell:#actor:greeted"],
+      known: ["object_lineage:#actor"]
+    });
+    expect(owned.cells[0]?.provenance).toBe("authoritative");
+
+    room.close();
+    cluster.close();
   });
 });

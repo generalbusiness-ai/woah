@@ -1,7 +1,15 @@
 # Rider-read integrity: the ride-along gap (Phase-3 review finding)
 
-Date: 2026-07-06. Status: CONFIRMED High (external review), fix required
-before Phase-4 builds on the ride-along path.
+Date: 2026-07-06. Status: interim guard LANDED (Phase-3 hardening pass,
+branch net-phase3): /net/adopt now CASes each cell against the prior
+version the committing turn observed (transcript read version, falling
+back to the committing scope's pre-commit residue copy), owner-wins on
+mismatch with a `net_adopt_conflict` metric, and the committing scope's
+rider residue re-stamps `derived` at every closure exit. `owns` is wired
+in the shell (lineage-in-store fixed-assignment rule). The full design
+(A: owner attestation at plan time + B: owner-sequenced adoption policy)
+remains open for Phase-3.5 — the residual tear (the room transcript's
+embedded stale rider value) is still an accepted, NAMED inconsistency.
 
 ## The defect
 

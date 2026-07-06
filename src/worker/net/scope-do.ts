@@ -52,6 +52,7 @@ import { Outbox, type FanoutBody, type FanoutRow } from "../../net/outbox";
 import { ScopeSequencer, type CommitSubmit, type ScheduledTurn, type ScopeHead } from "../../net/scope";
 import type { ScopeMeta, ScopeStore, TailEntry } from "../../net/scope-store";
 import type { CommitReply } from "../../net/scope";
+import { netCellKeyFor } from "../../net/transcript";
 import { verifyInternalRequest } from "../internal-auth";
 import { resolveNetDestination, WorkerdHost, type NetBindingsEnv } from "./workerd-host";
 
@@ -79,6 +80,14 @@ type RiderDestinations = Record<string, { destination: string; objects: string[]
  * destination carrying both cannot collide row ids, and adoption cannot
  * be held behind a slow subscriber (or vice versa). */
 type OutboxRoute = "/fanout" | "/adopt";
+
+/** The /adopt outbox body: FanoutBody plus the per-cell prior versions
+ * the committing turn observed (the rider-read integrity interim guard —
+ * notes/2026-07-06-rider-read-integrity.md). Extra field only; the
+ * src/net/outbox.ts FanoutBody type stays unchanged (Outbox carries the
+ * body opaquely and the JSON round-trip through net_scope_outbox keeps
+ * the field). */
+type AdoptOutboxBody = FanoutBody & { prior_versions?: Record<string, string> };
 
 /** Rows out of a storage.sql cursor (both the real SqlStorageCursor and
  * the fake expose toArray()). */
@@ -234,6 +243,17 @@ export class NetScopeDO {
     state.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS net_scope_adopted (from_scope TEXT PRIMARY KEY, seq INTEGER NOT NULL)"
     );
+    // Rider residue ledger (rider-read integrity, fix 1): keys of cells
+    // this scope committed via CA3 ride-along but does NOT anchor. After
+    // the owner adopts them they are a CACHE of the owner's fact, so any
+    // later transfer out of this scope must ship them derived, never
+    // authoritative-provenance (a second authoritative copy is exactly the
+    // CO2.1 dual-authority violation). The re-stamp happens at the
+    // serialization exit (closure()) because CellStore's authority role
+    // deliberately refuses to HOLD derived cells — the sequencer's store
+    // and its durable mirror keep the authoritative stamp so hydration
+    // and post-state derivation stay byte-identical.
+    state.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_scope_rider_cache (key TEXT PRIMARY KEY)");
     this.host = new WorkerdHost({
       resolve: (destination) => resolveNetDestination(this.env, destination),
       env,
@@ -264,6 +284,11 @@ export class NetScopeDO {
         const riderDestinations = "submit" in raw ? (raw.rider_destinations ?? {}) : {};
         const seq = this.ensureSequencer(submit.scope, submit.stamp.catalog_epoch);
         const headBefore = seq.head().seq;
+        // Rider-read integrity (fix 1): capture, BEFORE the commit applies,
+        // the prior version this turn observed for each rider-anchored
+        // cell — the adopt-time CAS input. Must run pre-submit because the
+        // accept path replaces the cells in place.
+        const riderPriors = this.captureRiderPriors(seq, submit, riderDestinations);
         let reply!: CommitReply;
         // The commit write-through and the outbox enqueue share ONE
         // transaction (CO2.7: rows are durable before the reply returns;
@@ -274,7 +299,7 @@ export class NetScopeDO {
           // Idempotent replays (head did not advance) enqueue nothing:
           // their rows were enqueued when the turn first committed.
           if (reply.status === "accepted" && reply.head.seq === headBefore + 1) {
-            this.enqueueDeliveries(seq, reply, submit, riderDestinations);
+            this.enqueueDeliveries(seq, reply, submit, riderDestinations, riderPriors);
           }
         });
         this.host.defer(() => this.drainOutbox());
@@ -290,7 +315,12 @@ export class NetScopeDO {
         return json({ ok: true });
       }
       if (request.method === "POST" && url.pathname === "/net/adopt") {
-        const body = (await request.json()) as { from_scope: string; seq: number; cells: Cell[] };
+        const body = (await request.json()) as {
+          from_scope: string;
+          seq: number;
+          cells: Cell[];
+          prior_versions?: Record<string, string>;
+        };
         return json(this.adopt(body));
       }
       if (request.method === "POST" && url.pathname === "/net/closure") {
@@ -434,6 +464,11 @@ export class NetScopeDO {
     const knownSet = new Set(known);
     // Close over lineage to a fixed point: adding a lineage cell can name
     // a parent whose lineage cell must ride too (unless receiver-known).
+    // Lineage this store does not hold (foreign rider objects — a rider
+    // cache cell's lineage lives at its OWNING scope, never here) is
+    // declared receiver-known instead of crashing the transfer — the same
+    // rule fanoutCells applies; without it any closure touching a rider
+    // residue cell threw E_LINEAGE.
     for (;;) {
       let added = false;
       for (const need of lineageClosureKeys([...cells.values()])) {
@@ -442,15 +477,89 @@ export class NetScopeDO {
         if (cell) {
           cells.set(need, cell);
           added = true;
+        } else {
+          knownSet.add(need);
         }
       }
       if (!added) break;
     }
-    const transfer = serializeTransfer([...cells.values()].sort((a, b) => a.key.localeCompare(b.key)), knownSet);
+    // Rider residue re-stamp (fix 1): cells this scope committed via
+    // ride-along but does not anchor ship as DERIVED — they are a cache
+    // of the owner's fact now, and a transfer stamping them authoritative
+    // would mint a second authority for the owner's cells (CO2.1).
+    // Derived cells are legal transfer content: serializeTransfer checks
+    // lineage closure only, and receivers install into derived views
+    // (authority stores never install from closures — only /net/adopt and
+    // /net/seed feed an authority store).
+    const riderCache = this.riderCacheKeys();
+    const outCells = [...cells.values()]
+      .map((cell) => (riderCache.has(cell.key) ? { ...cell, provenance: "derived" as const } : cell))
+      .sort((a, b) => a.key.localeCompare(b.key));
+    const transfer = serializeTransfer(outCells, knownSet);
     return { ...transfer, scope: seq.scope, head: seq.head(), catalog_epoch: seq.catalogEpoch };
   }
 
+  /** Keys in the rider residue ledger (see the constructor comment). */
+  private riderCacheKeys(): Set<string> {
+    return new Set(
+      sqlRows<{ key: string }>(this.state.storage.sql.exec("SELECT key FROM net_scope_rider_cache")).map(
+        (row) => row.key
+      )
+    );
+  }
+
   // ---- Fanout + rider adoption (CO2.7, CA3) ---------------------------
+
+  /**
+   * Prior observations for the adopt-time CAS (rider-read integrity fix
+   * 1, interim guard). For every cell of a rider-anchored object, record
+   * the version the committing turn OBSERVED before writing. Two honest
+   * sources, in preference order:
+   *
+   * (a) the transcript's read version for that cell — plan.ts rewrote it
+   *     through the gateway view (a derived copy of the OWNER's fact), so
+   *     it is exactly the rider read nobody validated (the CO2.4 gap this
+   *     guard closes);
+   * (b) this scope's own pre-commit copy — the residue cache of an
+   *     earlier accepted ride-along. Versions are content addresses of
+   *     values (cells.ts cellVersion), so a cached copy of the owner's
+   *     value carries the SAME version string the owner holds, making it
+   *     directly comparable at the owner.
+   *
+   * The committing scope's transcript-write `prior` field is NOT usable:
+   * it carries engine-recorded versions (plan.ts rewrites reads only),
+   * which never compare equal to net content addresses.
+   *
+   * A cell observed by neither source (a blind "stamp the actor" write,
+   * first ride-along) ships no prior: the owner applies it as an
+   * owner-ordered blind write — the rider-read-integrity note's design-C
+   * allowance, because with no read there is no stale read to launder.
+   */
+  private captureRiderPriors(
+    seq: ScopeSequencer,
+    submit: CommitSubmit,
+    riderDestinations: RiderDestinations
+  ): Map<string, string> {
+    const priors = new Map<string, string>();
+    const riderObjects = new Set<string>();
+    for (const rider of Object.values(riderDestinations)) {
+      for (const object of rider.objects) riderObjects.add(object);
+    }
+    if (riderObjects.size === 0) return priors;
+    for (const read of submit.transcript.reads) {
+      if (read.version === undefined) continue; // negative/probe read
+      if (!riderObjects.has(read.cell.object)) continue;
+      const key = netCellKeyFor(read.cell);
+      if (key === null || priors.has(key)) continue;
+      priors.set(key, String(read.version));
+    }
+    for (const key of seq.store.keys()) {
+      const cell = seq.store.get(key);
+      if (!cell || !riderObjects.has(cell.object) || priors.has(key)) continue;
+      priors.set(key, cell.version);
+    }
+    return priors;
+  }
 
   /**
    * Enqueue the accepted commit's deliveries durably (called inside the
@@ -459,12 +568,16 @@ export class NetScopeDO {
    * a /net/adopt row per rider scope carrying only the cells anchored to
    * it — the gateway's rider_destinations names those objects, because
    * anchor topology is gateway knowledge the sequencer never learns.
+   * Adopt rows also carry the per-cell prior versions captured pre-commit
+   * (captureRiderPriors) for the owner's CAS, and the shipped rider keys
+   * are recorded in the residue ledger (see the constructor comment).
    */
   private enqueueDeliveries(
     seq: ScopeSequencer,
     reply: Extract<CommitReply, { status: "accepted" }>,
     submit: CommitSubmit,
-    riderDestinations: RiderDestinations
+    riderDestinations: RiderDestinations,
+    riderPriors: Map<string, string>
   ): void {
     const observations = (submit.transcript.observations ?? []) as unknown[];
     const subscribers = sqlRows<{ destination: string }>(
@@ -496,13 +609,30 @@ export class NetScopeDO {
         [...cells].sort((a, b) => a.key.localeCompare(b.key)),
         known
       );
-      this.persistOutboxRow("/adopt", rider.destination, {
+      // Per-cell prior versions for the owner's CAS: only cells with an
+      // actual observation carry one (blind writes apply owner-ordered).
+      const priorVersions: Record<string, string> = {};
+      for (const cell of transfer.cells) {
+        const prior = riderPriors.get(cell.key);
+        if (prior !== undefined) priorVersions[cell.key] = prior;
+      }
+      const adoptBody: AdoptOutboxBody = {
         scope: seq.scope,
         seq: reply.head.seq,
         cells: transfer.cells,
         // Observations fan out to subscribers; adoption is cell-only.
-        observations: []
-      });
+        observations: [],
+        prior_versions: priorVersions
+      };
+      this.persistOutboxRow("/adopt", rider.destination, adoptBody);
+      // Residue ledger: from now on these keys are a cache of the owner's
+      // fact — a later transfer out of this scope ships them derived.
+      for (const cell of cells) {
+        this.state.storage.sql.exec(
+          "INSERT INTO net_scope_rider_cache (key) VALUES (?) ON CONFLICT(key) DO NOTHING",
+          cell.key
+        );
+      }
     }
   }
 
@@ -618,10 +748,13 @@ export class NetScopeDO {
         const drained = await outbox.drain(this.host.now(), async (row) => {
           try {
             if (route === "/adopt") {
+              const adoptBody = row.body as AdoptOutboxBody;
               await this.host.rpc(row.destination, "/adopt", {
-                from_scope: row.body.scope,
-                seq: row.body.seq,
-                cells: row.body.cells
+                from_scope: adoptBody.scope,
+                seq: adoptBody.seq,
+                cells: adoptBody.cells,
+                // The pre-commit observations for the owner's CAS (fix 1).
+                ...(adoptBody.prior_versions !== undefined ? { prior_versions: adoptBody.prior_versions } : {})
               });
             } else {
               await this.host.rpc(row.destination, "/fanout", row.body);
@@ -681,30 +814,74 @@ export class NetScopeDO {
   /**
    * CA3 rider adoption: install cells this scope anchors that were
    * committed atomically at another scope — the owner adopting the
-   * ride-along write as its authority copy (authoritative-into-authority
-   * install; the cells keep the committing scope's stamp per CO8). This
-   * scope's own head does NOT advance: adoption is not a commit here.
-   * Idempotent by (from_scope, seq) high-water, so the at-least-once
-   * outbox may redeliver freely.
+   * ride-along write as its OWN ordered write (authoritative-into-
+   * authority install; the cells keep the committing scope's stamp per
+   * CO8). This scope's own head does NOT advance: adoption is not a
+   * commit here. Idempotent by (from_scope, seq) high-water, so the
+   * at-least-once outbox may redeliver freely.
+   *
+   * Rider-read integrity interim guard (fix 1; notes/2026-07-06-rider-
+   * read-integrity.md "Interim guard"): adoption is no longer a raw
+   * install. Each cell CASes against the prior version the committing
+   * turn observed (captureRiderPriors at the sender):
+   * - owner's current version === prior → the owner did not move inside
+   *   the plan→adopt window; apply as an owner-ordered write.
+   * - mismatch → the owner advanced (or the committing view was stale);
+   *   OWNER WINS — the cell is NOT overwritten, and the divergence is
+   *   named + counted (net_adopt_conflict), never silent (CO6). The
+   *   committing scope's transcript already embedded the stale value in
+   *   its post-state; that residual tear is the accepted, named
+   *   inconsistency until design A+B (owner attestation) lands.
+   * - no prior claimed (blind "stamp the actor" write) → apply; with no
+   *   read there is no stale read to launder (design-C allowance).
+   * The (from_scope, seq) high-water advances either way: the adoption
+   * WAS processed; redelivery must not flap the verdict.
    */
-  private adopt(body: { from_scope: string; seq: number; cells: Cell[] }): { applied: boolean; installed: number } {
+  private adopt(body: {
+    from_scope: string;
+    seq: number;
+    cells: Cell[];
+    prior_versions?: Record<string, string>;
+  }): { applied: boolean; installed: number; conflicts: number } {
     const seq = this.ensureSequencer();
     return this.store.transaction(() => {
       const rows = sqlRows<{ seq: number }>(
         this.state.storage.sql.exec("SELECT seq FROM net_scope_adopted WHERE from_scope = ?", body.from_scope)
       );
       const last = rows.length > 0 ? Number(rows[0].seq) : 0;
-      if (body.seq <= last) return { applied: false, installed: 0 };
+      if (body.seq <= last) return { applied: false, installed: 0, conflicts: 0 };
+      let installed = 0;
+      let conflicts = 0;
       for (const cell of body.cells) {
+        const prior = body.prior_versions?.[cell.key];
+        const ours = seq.store.get(cell.key)?.version ?? "absent";
+        if (prior !== undefined && prior !== ours) {
+          conflicts += 1;
+          console.log(
+            "woo.metric",
+            JSON.stringify({
+              kind: "net_adopt_conflict",
+              scope: seq.scope,
+              from_scope: body.from_scope,
+              seq: body.seq,
+              key: cell.key,
+              ours,
+              theirs: cell.version,
+              ts: Date.now()
+            })
+          );
+          continue;
+        }
         seq.store.install(cell);
         this.store.writeCell(cell);
+        installed += 1;
       }
       this.state.storage.sql.exec(
         "INSERT INTO net_scope_adopted (from_scope, seq) VALUES (?, ?) ON CONFLICT(from_scope) DO UPDATE SET seq = excluded.seq",
         body.from_scope,
         body.seq
       );
-      return { applied: true, installed: body.cells.length };
+      return { applied: true, installed, conflicts };
     });
   }
 
