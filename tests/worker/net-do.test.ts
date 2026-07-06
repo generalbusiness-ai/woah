@@ -249,7 +249,7 @@ describe("NetScopeDO over fake-DO storage", () => {
     scope.close();
   });
 
-  it("skips read validation for foreign-anchored cells but still validates owned reads (fix 2: owns wiring)", async () => {
+  it("routes foreign-anchored reads to attestation but still validates owned reads locally (owns wiring + CO2.3)", async () => {
     const scope = makeScope("room-a", env);
     await call(scope.instance, env, "/seed", { scope: "room-a", catalog_epoch: EPOCH, cells: seedCells() });
     const head0 = (await call<{ head: ScopeHead }>(scope.instance, env, "/head")).head;
@@ -282,13 +282,28 @@ describe("NetScopeDO over fake-DO storage", () => {
     };
 
     // A read of a foreign-anchored cell (#elsewhere has no object_lineage
-    // in this scope's store) carries a version this scope cannot attest.
-    // With `owns` wired, step 7 skips it — validation is the owning
-    // scope's + the adoption CAS's job (CO2.4) — so the submit accepts.
+    // in this scope's store) carries a version this scope cannot attest
+    // from its own store. With `owns` wired, step 7 validates it against
+    // the submit's owner attestation (CO2.3 rider integrity): with no
+    // covering attestation the submit rejects terminal rider_unattested…
     const foreignRead = transcriptWith(
       [{ cell: { kind: "prop", object: "#elsewhere", name: "x" }, version: "some-foreign-version", value: 0 }],
       "net-do-owns-1"
     );
+    const unattested = await call<CommitReply>(scope.instance, env, "/submit", {
+      kind: "woo.net.commit_submit.v1",
+      scope: "room-a",
+      base: head0,
+      idempotency_key: "owns-t0",
+      transcript: foreignRead,
+      post_state_version: postStateFor(foreignRead),
+      stamp: { scope_head: "x", catalog_epoch: EPOCH }
+    });
+    expect(unattested.status).toBe("rejected");
+    expect(unattested.status === "rejected" && unattested.reason).toBe("rider_unattested");
+    expect(unattested.status === "rejected" && unattested.retryable).toBe(false);
+
+    // …and with the owner's attestation at the planned version it accepts.
     const accepted = await call<CommitReply>(scope.instance, env, "/submit", {
       kind: "woo.net.commit_submit.v1",
       scope: "room-a",
@@ -296,7 +311,13 @@ describe("NetScopeDO over fake-DO storage", () => {
       idempotency_key: "owns-t1",
       transcript: foreignRead,
       post_state_version: postStateFor(foreignRead),
-      stamp: { scope_head: "x", catalog_epoch: EPOCH }
+      stamp: { scope_head: "x", catalog_epoch: EPOCH },
+      attestations: {
+        "cluster-elsewhere": {
+          owner_head: { seq: 4, hash: "owner-h4" },
+          cells: [{ key: "property_cell:#elsewhere:x", version: "some-foreign-version" }]
+        }
+      }
     });
     expect(accepted.status).toBe("accepted");
 
