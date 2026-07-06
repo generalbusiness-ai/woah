@@ -230,15 +230,17 @@ export class NetGatewayDO {
         const seed = JSON.parse(raw) as SeedRecord;
         const live = (await this.host.rpc(body.destination, "/head")) as { head: ScopeHead };
         if (live.head.seq === seed.head.seq && live.head.hash === seed.head.hash) {
-          this.state.storage.transactionSync(() => {
-            for (const cell of seed.cells) {
-              // Copy #3 provenance: these cells came through KV, not the
-              // authority — mark them honestly (planning treats derived
-              // and seed copies identically; the stamp is provenance).
-              view.install({ ...cell, provenance: "seed" });
-              this.persistCell(view, cell.key);
-            }
-          });
+          this.discardViewOnThrow(() =>
+            this.state.storage.transactionSync(() => {
+              for (const cell of seed.cells) {
+                // Copy #3 provenance: these cells came through KV, not the
+                // authority — mark them honestly (planning treats derived
+                // and seed copies identically; the stamp is provenance).
+                view.install({ ...cell, provenance: "seed" });
+                this.persistCell(view, cell.key);
+              }
+            })
+          );
           return { ok: true, installed: seed.cells.length, head: seed.head, source: "kv" };
         }
         // Seed lags the live head: named, informational (CO6 E_SEED_LAG),
@@ -295,7 +297,6 @@ export class NetGatewayDO {
    * hash or the post-state digest, so patching it in is sound.
    */
   private async turn(request: TurnRequest): Promise<TurnResult> {
-    const view = this.ensureView();
     const classifier: ScopeClassifier = {
       scopeOf: (object) => request.anchors?.[object] ?? request.planningScope,
       isShared: (scope) => (request.shared ?? [request.planningScope]).includes(scope)
@@ -313,6 +314,10 @@ export class NetGatewayDO {
       // runs (a zero-attempt turn could never converge or explain itself).
       if (attempt > 1 && this.host.now() >= deadline) break;
       const elapsed = () => this.host.now() - startedAt;
+      // Re-acquire the view per attempt (fix 3): a failed durable write in
+      // a prior round discarded this.view; the loop must plan against the
+      // rehydrated store, never a detached one.
+      const view = this.ensureView();
 
       // ---- Plan (or adopt the stale_head resubmit).
       let planned: PlanTurnResult;
@@ -408,15 +413,20 @@ export class NetGatewayDO {
           await this.tryRecovery(trace, async () => {
             // CO8 named reseed: drop every cell stamped with another
             // epoch (mirrored into SQLite), pull the scope's full
-            // closure back, re-plan.
-            const stale = [...view.keys()].filter(
-              (key) => view.get(key)?.stamp.catalog_epoch !== request.catalog_epoch
-            );
-            view.dropStaleEpoch({ catalog_epoch: request.catalog_epoch });
-            this.state.storage.transactionSync(() => {
-              for (const key of stale) this.persistCell(view, key);
+            // closure back, re-plan. The drop mutates memory BEFORE the
+            // persist transaction, so the whole block is discard-on-throw
+            // (fix 3): a failed persist rehydrates instead of leaving the
+            // view missing cells SQLite still holds.
+            await this.discardViewOnThrow(async () => {
+              const stale = [...view.keys()].filter(
+                (key) => view.get(key)?.stamp.catalog_epoch !== request.catalog_epoch
+              );
+              view.dropStaleEpoch({ catalog_epoch: request.catalog_epoch });
+              this.state.storage.transactionSync(() => {
+                for (const key of stale) this.persistCell(view, key);
+              });
+              await this.reseedFromScope(view, destination);
             });
-            await this.reseedFromScope(view, destination);
           });
           break;
         }
@@ -495,17 +505,19 @@ export class NetGatewayDO {
   private async installTouched(view: CellStore, destination: string, touched: string[]): Promise<void> {
     const transfer = (await this.host.rpc(destination, "/closure", { keys: touched, known: [] })) as CellTransfer;
     const wanted = new Set(touched);
-    this.state.storage.transactionSync(() => {
-      for (const cell of transfer.cells) {
-        view.install(cell);
-        this.persistCell(view, cell.key);
-        wanted.delete(cell.key);
-      }
-      for (const key of wanted) {
-        view.delete(key);
-        this.persistCell(view, key);
-      }
-    });
+    this.discardViewOnThrow(() =>
+      this.state.storage.transactionSync(() => {
+        for (const cell of transfer.cells) {
+          view.install(cell);
+          this.persistCell(view, cell.key);
+          wanted.delete(cell.key);
+        }
+        for (const key of wanted) {
+          view.delete(key);
+          this.persistCell(view, key);
+        }
+      })
+    );
   }
 
   /** Targeted view refresh (the E_READ_VERSION / E_MISSING_STATE
@@ -533,17 +545,19 @@ export class NetGatewayDO {
     for (const [destination, want] of byDestination) {
       const transfer = (await this.host.rpc(destination, "/closure", { keys: want, known })) as CellTransfer;
       const wanted = new Set(want);
-      this.state.storage.transactionSync(() => {
-        for (const cell of transfer.cells) {
-          view.install(cell);
-          this.persistCell(view, cell.key);
-          wanted.delete(cell.key);
-        }
-        for (const key of wanted) {
-          view.delete(key);
-          this.persistCell(view, key);
-        }
-      });
+      this.discardViewOnThrow(() =>
+        this.state.storage.transactionSync(() => {
+          for (const cell of transfer.cells) {
+            view.install(cell);
+            this.persistCell(view, cell.key);
+            wanted.delete(cell.key);
+          }
+          for (const key of wanted) {
+            view.delete(key);
+            this.persistCell(view, key);
+          }
+        })
+      );
     }
   }
 
@@ -558,30 +572,64 @@ export class NetGatewayDO {
       head: ScopeHead;
       catalog_epoch: string;
     };
-    this.state.storage.transactionSync(() => {
-      for (const cell of transfer.cells) {
-        view.install(cell);
-        this.persistCell(view, cell.key);
-      }
-    });
+    this.discardViewOnThrow(() =>
+      this.state.storage.transactionSync(() => {
+        for (const cell of transfer.cells) {
+          view.install(cell);
+          this.persistCell(view, cell.key);
+        }
+      })
+    );
     return transfer;
   }
 
   /** CO2.5 receiver idempotency + copy-#2 persistence, one transaction. */
   private receiveFanout(body: FanoutBody): boolean {
     const view = this.ensureView();
-    return this.state.storage.transactionSync(() => {
-      const applied = applyFanout(view, this.seen, body);
-      if (applied) {
-        for (const cell of body.cells) this.persistCell(view, cell.key);
-        this.state.storage.sql.exec(
-          "INSERT INTO net_gateway_scope (scope, seen_seq) VALUES (?, ?) ON CONFLICT(scope) DO UPDATE SET seen_seq = excluded.seen_seq",
-          body.scope,
-          body.seq
-        );
+    return this.discardViewOnThrow(() =>
+      this.state.storage.transactionSync(() => {
+        const applied = applyFanout(view, this.seen, body);
+        if (applied) {
+          for (const cell of body.cells) this.persistCell(view, cell.key);
+          this.state.storage.sql.exec(
+            "INSERT INTO net_gateway_scope (scope, seen_seq) VALUES (?, ?) ON CONFLICT(scope) DO UPDATE SET seen_seq = excluded.seen_seq",
+            body.scope,
+            body.seq
+          );
+        }
+        return applied;
+      })
+    );
+  }
+
+  /**
+   * Memory-follows-durable (fix 3): applyFanout / view installs mutate
+   * the in-memory view (and the `seen` high-water) inside the callback;
+   * if the durable transaction then aborts, memory is ahead of SQLite —
+   * a replayed delivery would no-op against a phantom high-water and the
+   * write would be lost. On ANY throw, discard the view AND the seen map
+   * (they hydrate together in ensureView) so the next request rehydrates
+   * both from the rolled-back durable state, then rethrow. Handles sync
+   * and async callbacks (the stale_epoch recovery block awaits inside).
+   */
+  private discardViewOnThrow<T>(fn: () => T): T {
+    const discard = (): void => {
+      this.view = null;
+      this.seen.clear();
+    };
+    try {
+      const result = fn();
+      if (result instanceof Promise) {
+        return result.catch((err: unknown) => {
+          discard();
+          throw err;
+        }) as unknown as T;
       }
-      return applied;
-    });
+      return result;
+    } catch (err) {
+      discard();
+      throw err;
+    }
   }
 
   /** Lazy hydration of the derived view + per-scope high-water. */

@@ -166,6 +166,89 @@ describe("NetScopeDO over fake-DO storage", () => {
     first.close();
   });
 
+  it("discards the in-memory sequencer when the durable transaction aborts (fix 3: memory follows durable)", async () => {
+    const scope = makeScope("room-a", env);
+    // One-shot fault: the reply write-through (one of the LAST rows of
+    // the accept transaction, after cells+meta already ran) throws once.
+    // The fake DO's transactionSync rolls the whole transaction back —
+    // the same contract as real DO SQLite — leaving durable state at
+    // head 0 while seq.submit already advanced the in-memory sequencer.
+    const realExec = scope.state.storage.sql.exec.bind(scope.state.storage.sql);
+    let armed = true;
+    scope.state.storage.sql = {
+      exec: (query: string, ...params: unknown[]) => {
+        if (armed && query.startsWith("INSERT INTO net_scope_reply")) {
+          armed = false;
+          throw new Error("injected writeReply failure");
+        }
+        return realExec(query, ...params);
+      }
+    };
+    await call(scope.instance, env, "/seed", { scope: "room-a", catalog_epoch: EPOCH, cells: seedCells() });
+    const head0 = (await call<{ head: ScopeHead }>(scope.instance, env, "/head")).head;
+
+    const transcript = {
+      kind: "woo.effect_transcript.shadow.v1",
+      route: "sequenced",
+      scope: "room-a",
+      seq: 1,
+      call: { actor: "#actor", target: "#thing", verb: "set_label", args: [], body: undefined },
+      reads: [],
+      writes: [{ cell: { kind: "prop", object: "#thing", name: "label" }, value: "durable-once", op: "set", writer: WRITER }],
+      creates: [],
+      moves: [],
+      observations: [],
+      logicalInputs: [],
+      untrackedEffects: [],
+      complete: true,
+      incompleteReasons: [],
+      hash: "net-do-abort-1"
+    };
+    const { applyTranscript } = await import("../../src/net/transcript");
+    const { ScopeSequencer } = await import("../../src/net/scope");
+    const twin = new ScopeSequencer("room-a", EPOCH);
+    twin.seed(seedCells());
+    const derived = applyTranscript(twin.store, transcript as never, { scope_head: "x", catalog_epoch: EPOCH });
+    const submit = {
+      kind: "woo.net.commit_submit.v1",
+      scope: "room-a",
+      base: head0,
+      idempotency_key: "abort-t1",
+      transcript,
+      post_state_version: derived.postStateVersion,
+      stamp: { scope_head: "x", catalog_epoch: EPOCH }
+    };
+
+    // First submit: the durable transaction aborts → 500 to the caller.
+    const request = new Request("https://do/net/submit", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(submit)
+    });
+    const failed = await scope.instance.fetch(await signInternalRequest(env, request));
+    expect(failed.status).toBe(500);
+    expect(JSON.stringify(await failed.json())).toContain("injected writeReply failure");
+
+    // Durable state never advanced — the head is still 0 (memory would
+    // have said 1; the discarded sequencer rehydrated from SQLite).
+    const headAfterAbort = (await call<{ head: ScopeHead }>(scope.instance, env, "/head")).head;
+    expect(headAfterAbort).toEqual(head0);
+
+    // The REPLAYED submit re-validates fresh (no phantom recorded reply
+    // from the aborted attempt) and commits durably exactly once.
+    const replay = await call<CommitReply>(scope.instance, env, "/submit", submit);
+    expect(replay.status).toBe("accepted");
+    expect(replay.status === "accepted" && replay.head.seq).toBe(1);
+
+    // Idempotency after the successful commit still holds: same key →
+    // the recorded reply, head does not advance again.
+    const replayAgain = await call<CommitReply>(scope.instance, env, "/submit", submit);
+    expect(replayAgain).toEqual(replay);
+    const finalHead = (await call<{ head: ScopeHead }>(scope.instance, env, "/head")).head;
+    expect(finalHead.seq).toBe(1);
+    scope.close();
+  });
+
   it("skips read validation for foreign-anchored cells but still validates owned reads (fix 2: owns wiring)", async () => {
     const scope = makeScope("room-a", env);
     await call(scope.instance, env, "/seed", { scope: "room-a", catalog_epoch: EPOCH, cells: seedCells() });

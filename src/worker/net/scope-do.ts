@@ -294,14 +294,16 @@ export class NetScopeDO {
         // transaction (CO2.7: rows are durable before the reply returns;
         // a crash can never separate a commit from its fanout). The
         // sequencer's internal transaction joins this outer one.
-        this.store.transaction(() => {
-          reply = seq.submit(submit);
-          // Idempotent replays (head did not advance) enqueue nothing:
-          // their rows were enqueued when the turn first committed.
-          if (reply.status === "accepted" && reply.head.seq === headBefore + 1) {
-            this.enqueueDeliveries(seq, reply, submit, riderDestinations, riderPriors);
-          }
-        });
+        this.discardSeqOnThrow(() =>
+          this.store.transaction(() => {
+            reply = seq.submit(submit);
+            // Idempotent replays (head did not advance) enqueue nothing:
+            // their rows were enqueued when the turn first committed.
+            if (reply.status === "accepted" && reply.head.seq === headBefore + 1) {
+              this.enqueueDeliveries(seq, reply, submit, riderDestinations, riderPriors);
+            }
+          })
+        );
         this.host.defer(() => this.drainOutbox());
         return json(reply);
       }
@@ -338,7 +340,7 @@ export class NetScopeDO {
           cells: Array<Pick<Cell, "kind" | "object" | "name" | "value">>;
         };
         const seq = this.ensureSequencer(body.scope, body.catalog_epoch);
-        seq.seed(body.cells);
+        this.discardSeqOnThrow(() => seq.seed(body.cells));
         return json({ ok: true, scope: seq.scope, head: seq.head() });
       }
       if (request.method === "POST" && url.pathname === "/net/schedule") {
@@ -350,7 +352,7 @@ export class NetScopeDO {
         if (this.store.readMeta() === null) {
           this.store.writeMeta({ scope: seq.scope, catalog_epoch: seq.catalogEpoch, head: seq.head() });
         }
-        seq.schedule(body.turn, this.host.now());
+        this.discardSeqOnThrow(() => seq.schedule(body.turn, this.host.now()));
         this.rearmAlarm(seq);
         return json({ ok: true, next_alarm_at: seq.nextAlarmAt() });
       }
@@ -380,7 +382,7 @@ export class NetScopeDO {
     }
     const seq = this.ensureSequencer(meta.scope, meta.catalog_epoch);
     const now = this.host.now();
-    for (const turn of seq.dueTurns(now)) {
+    for (const turn of this.discardSeqOnThrow(() => seq.dueTurns(now))) {
       console.log(
         "woo.metric",
         JSON.stringify({
@@ -844,7 +846,7 @@ export class NetScopeDO {
     prior_versions?: Record<string, string>;
   }): { applied: boolean; installed: number; conflicts: number } {
     const seq = this.ensureSequencer();
-    return this.store.transaction(() => {
+    return this.discardSeqOnThrow(() => this.store.transaction(() => {
       const rows = sqlRows<{ seq: number }>(
         this.state.storage.sql.exec("SELECT seq FROM net_scope_adopted WHERE from_scope = ?", body.from_scope)
       );
@@ -882,7 +884,24 @@ export class NetScopeDO {
         body.seq
       );
       return { applied: true, installed, conflicts };
-    });
+    }));
+  }
+
+  /**
+   * Memory-follows-durable (fix 3): the in-memory sequencer mutates
+   * inside the callback (submit/seed/schedule/adopt), so if the durable
+   * transaction then aborts, memory is AHEAD of SQLite — an idempotent
+   * replay would find a phantom recorded reply and never re-commit. On
+   * ANY throw, discard the sequencer; the next request rehydrates it
+   * from the (rolled-back) durable store and re-validates fresh.
+   */
+  private discardSeqOnThrow<T>(fn: () => T): T {
+    try {
+      return fn();
+    } catch (err) {
+      this.seq = null;
+      throw err;
+    }
   }
 
   /** Always re-derive the wake-up from scope state (never from memory). */
