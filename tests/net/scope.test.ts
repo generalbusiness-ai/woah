@@ -65,6 +65,43 @@ describe("commit acceptance (CO4)", () => {
     expect(seq.store.get("property_cell:#thing:n")?.provenance).toBe("authoritative");
   });
 
+  it("accepted cells stamp the actual head — `seq:hash` — per CO8", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    for (let i = 0; i < 2; i += 1) {
+      const reply = seq.submit(submitFor(seq, transcript({ writes: [propWrite(`v${i}`)], hash: `t${i}` }), `k${i}`));
+      expect(reply.status).toBe("accepted");
+      if (reply.status !== "accepted") return;
+      // Post-accept invariant: every touched cell's stamp names the head
+      // the commit produced (the full seq:hash form stamp() uses, never a
+      // bare counter), so epoch checks (CO8) compare real heads.
+      const head = seq.head();
+      expect(reply.head).toEqual(head);
+      for (const key of reply.touched) {
+        const cell = seq.store.get(key);
+        expect(cell?.stamp.scope_head).toBe(`${head.seq}:${head.hash}`);
+        expect(cell?.stamp.catalog_epoch).toBe(EPOCH);
+      }
+    }
+  });
+
+  it("owns predicate skips foreign-anchored reads; without it every read validates (CO2.4)", () => {
+    // Multi-scope topology: this sequencer owns #thing but not #elsewhere.
+    // A transcript read of #elsewhere carries the planning view's version;
+    // a scope that cannot attest the cell must not reject on it — its
+    // freshness is the gateway's cross-scope repair concern at the owning
+    // scope. Without `owns` (single-scope deployment) the same submit
+    // rejects, which is the surfaced Phase-2 gap the option closes.
+    const foreignRead = {
+      reads: [{ cell: { kind: "prop" as const, object: "#elsewhere", name: "x" }, version: "view-version", value: null as never }],
+      writes: [propWrite("v1")]
+    };
+    const owning = new ScopeSequencer(SCOPE, EPOCH, { owns: (object) => object === "#thing" });
+    expect(owning.submit(submitFor(owning, transcript(foreignRead), "k1")).status).toBe("accepted");
+    const single = new ScopeSequencer(SCOPE, EPOCH);
+    const reply = single.submit(submitFor(single, transcript(foreignRead), "k1"));
+    expect(reply.status === "rejected" && reply.reason === "read_version_mismatch").toBe(true);
+  });
+
   it("replayed idempotency key returns the recorded reply (CO2.5)", () => {
     const seq = new ScopeSequencer(SCOPE, EPOCH);
     const submit = submitFor(seq, transcript({ writes: [propWrite("v1")] }), "k1");

@@ -92,6 +92,50 @@ describe("applyTranscript (CO4 step 10)", () => {
     expect(result.touched).toContain("object_live:#new");
   });
 
+  it("op remove with a local def reverts the cell to def-only ({def})", () => {
+    // LambdaMOO clear_property: the local override goes away, the
+    // property reads the inherited default again. The def survives so
+    // the cell matches what the bridge seeds for a defined-but-unvalued
+    // property (bridge.ts reconstructs no-local-value from the missing
+    // `value` slot).
+    const def = { name: "n", defaultValue: 0, owner: "#actor", perms: "rw", version: 1 };
+    const pre = new CellStore("authority");
+    pre.commit({ kind: "property_cell", object: "#1", name: "n", value: { value: 9, def }, stamp: STAMP });
+    const result = applyTranscript(pre, baseTranscript({
+      writes: [{ cell: { kind: "prop", object: "#1", name: "n" }, value: 0, op: "remove" }]
+    }), STAMP);
+    expect(result.post.get("property_cell:#1:n")?.value).toEqual({ def });
+    expect(result.touched).toEqual(["property_cell:#1:n"]);
+  });
+
+  it("op remove without a def deletes the cell (absent post-state)", () => {
+    // A value written over an inherited def and then cleared leaves the
+    // object with neither value nor def: no cell at all. The clone's
+    // delete flows through scope.submit's absent-from-post adoption.
+    const pre = new CellStore("authority");
+    pre.commit({ kind: "property_cell", object: "#1", name: "n", value: { value: 9 }, stamp: STAMP });
+    const result = applyTranscript(pre, baseTranscript({
+      writes: [{ cell: { kind: "prop", object: "#1", name: "n" }, value: 0, op: "remove" }]
+    }), STAMP);
+    expect(result.post.has("property_cell:#1:n")).toBe(false);
+    expect(pre.get("property_cell:#1:n")?.value).toEqual({ value: 9 }); // pre-state untouched
+    expect(result.touched).toEqual(["property_cell:#1:n"]);
+  });
+
+  it("postStateVersion distinguishes remove-with-def, remove-without-def, and a value write", () => {
+    const def = { name: "n", defaultValue: 0, owner: "#actor", perms: "rw", version: 1 };
+    const withDef = new CellStore("authority");
+    withDef.commit({ kind: "property_cell", object: "#1", name: "n", value: { value: 9, def }, stamp: STAMP });
+    const withoutDef = new CellStore("authority");
+    withoutDef.commit({ kind: "property_cell", object: "#1", name: "n", value: { value: 9 }, stamp: STAMP });
+    const remove = baseTranscript({ writes: [{ cell: { kind: "prop", object: "#1", name: "n" }, value: 0, op: "remove" }] });
+    const set = baseTranscript({ writes: [{ cell: { kind: "prop", object: "#1", name: "n" }, value: 0, op: "set" }] });
+    const removedWithDef = applyTranscript(withDef, remove, STAMP).postStateVersion; // {def}
+    const removedWithoutDef = applyTranscript(withoutDef, remove, STAMP).postStateVersion; // absent
+    const written = applyTranscript(withDef, set, STAMP).postStateVersion; // {value: 0, def}
+    expect(new Set([removedWithDef, removedWithoutDef, written]).size).toBe(3);
+  });
+
   it("a create's lifecycle write echo does not fork the lineage payload", () => {
     // The recorder emits BOTH a create record and a lifecycle write for
     // one object_create; the create is the authority. Re-merging the echo

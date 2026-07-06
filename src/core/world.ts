@@ -2272,9 +2272,49 @@ export class WooWorld {
     }
     const obj = this.object(objRef);
     if (!obj.properties.has(name)) return;
+    const beforeVersion = this.propertyVersionForRecording(objRef, name);
+    const presenceProjection = this.presenceProjectionForProperty(objRef, name);
     obj.properties.delete(name);
     obj.propertyVersions.set(name, (obj.propertyVersions.get(name) ?? 0) + 1);
     obj.modified = Date.now();
+    if (presenceProjection) {
+      this.invalidatePresenceIndex();
+    } else {
+      // Record the local-override removal as a `prop` cell_write with
+      // op "remove". This was the missing emitter half of the remove op:
+      // the appliers (applyTranscriptPropWrite, the net coherence layer)
+      // have always handled op "remove", but no turn path recorded one,
+      // so a verb calling clear_property mutated state invisibly to the
+      // transcript — an unnamed divergence for every commit/replay
+      // consumer. `value` carries the post-remove effective value (the
+      // now-inherited default), which is what post-state validation
+      // (writeValueMatchesPostState) reads back from the applied world.
+      // Clearing a property whose def lives on this object itself leaves
+      // no readable value anywhere on the chain (getProp raises E_PROPNF
+      // the same way — clear_property is meant for inherited defs, per
+      // LambdaMOO); record null for that edge rather than failing the
+      // clear. The recorder pipeline attaches the VM frame's write
+      // authority (recordedEventWithWriter), same as every cell_write.
+      let effective: WooValue = null;
+      try {
+        effective = readObjectPropertyValue({
+          object: obj,
+          name,
+          lookupParent: (parent, start) => this.parentWalkLookup(start, parent),
+          propertyNotFound: () => wooError("E_PROPNF", `property not found: ${name}`, name)
+        });
+      } catch {
+        effective = null;
+      }
+      this.recordTurnEvent({
+        kind: "cell_write",
+        cell: { kind: "prop", object: objRef, name },
+        value: cloneValue(effective),
+        op: "remove",
+        prior: beforeVersion === undefined ? undefined : String(beforeVersion),
+        next: String(this.propertyVersionForRecording(objRef, name))
+      });
+    }
     this.persistObject(objRef);
     this.persist();
   }

@@ -170,11 +170,33 @@ export function applyTranscript(pre: CellStore, transcript: EffectTranscript, st
         break;
       }
       case "prop": {
+        const def = propertyCellDef(post.get(key)?.value);
+        // op "remove" is LambdaMOO clear_property: drop the LOCAL value so
+        // the property reverts to the inherited default (v2 parity:
+        // applyTranscriptPropWrite → removeProperty). With a local def the
+        // cell becomes def-only `{def}` (the bridge reconstructs
+        // no-local-value from the missing `value` slot); with no def the
+        // cell disappears — post.delete on the clone, hashed "absent" by
+        // postStateVersion, adopted as a delete by scope.submit's
+        // absent-from-post handling.
+        if (write.op === "remove") {
+          if (def !== undefined) {
+            post.commit({
+              kind: "property_cell",
+              object: write.cell.object,
+              name: write.cell.name,
+              value: propertyCellPayload({ hasValue: false, def }),
+              stamp
+            });
+          } else {
+            post.delete(key);
+          }
+          break;
+        }
         // `{value, def?}` payload, merging `def` from the prior cell: the
         // write updates the value slot only; a local definition survives so
         // the applied cell stays version-identical to what the bridge would
         // seed for the same post-state (see PropertyCellPayload).
-        const def = propertyCellDef(post.get(key)?.value);
         post.commit({
           kind: "property_cell",
           object: write.cell.object,

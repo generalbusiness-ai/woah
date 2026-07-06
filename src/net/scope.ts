@@ -102,6 +102,14 @@ export type ScopeSequencerOptions = {
    * write to name its recording VM frame (`writer`), per CO3: never the
    * union of verb owners. */
   writeAuthorized?: (submit: CommitSubmit) => boolean;
+  /** Cell ownership for multi-scope topologies. A scope can only attest
+   * (CO2.4) the cells it is the authority for; when provided, step 7
+   * skips reads of foreign-anchored cells — their freshness is the
+   * gateway's cross-scope repair concern at the owning scope (Phase 3).
+   * WRITES are never filtered: a CA3 rider write to a foreign-anchored
+   * cell rides along atomically at this scope by design. Single-scope
+   * deployments omit this and validate every read. */
+  owns?: (object: string) => boolean;
   /** Bounded recovery tail length (the scope's own log — CO5 note). */
   tailLimit?: number;
 };
@@ -186,6 +194,8 @@ export class ScopeSequencer {
       if (read.version === undefined) continue; // negative/probe read
       const key = netCellKeyFor(read.cell);
       if (key === null) continue; // contents reads are projection reads (CA4)
+      // Foreign-anchored reads are not attestable here (see options.owns).
+      if (this.options.owns && !this.options.owns(read.cell.object)) continue;
       const current = this.store.get(key)?.version ?? "absent";
       if (current !== String(read.version)) mismatched.set(key, read.cell);
     }
@@ -201,8 +211,21 @@ export class ScopeSequencer {
       return this.reject(submit, "write_unauthorized", {});
     }
 
+    // The head this acceptance WILL have is computable before the apply
+    // (rolling digest over prior hash + next seq + transcript hash), so
+    // applied cells are stamped with the actual `(scope_head,
+    // catalog_epoch)` per CO8 — one computation, adopted below on accept.
+    // The stamp never affects step-10 parity: postStateVersion digests
+    // cell VALUES only, so the planner (stamping with its own view's
+    // epoch) derives the same digest.
+    const nextHead: ScopeHead = {
+      seq: this.headState.seq + 1,
+      hash: cellVersion([this.headState.hash, this.headState.seq + 1, submit.transcript.hash])
+    };
+    const nextStamp: EpochStamp = { scope_head: `${nextHead.seq}:${nextHead.hash}`, catalog_epoch: this.catalogEpoch };
+
     // Step 10: re-derive post-state on a clone and compare digests.
-    const applied = applyTranscript(this.store, submit.transcript, this.nextStamp());
+    const applied = applyTranscript(this.store, submit.transcript, nextStamp);
     if (applied.postStateVersion !== submit.post_state_version) {
       return this.reject(submit, "post_state_mismatch", {
         derived: applied.postStateVersion,
@@ -217,9 +240,8 @@ export class ScopeSequencer {
       if (cell) this.store.install(cell);
       else this.store.delete(key);
     }
-    const seq = this.headState.seq + 1;
-    this.headState = { seq, hash: cellVersion([this.headState.hash, seq, submit.transcript.hash]) };
-    this.tail.push({ seq, transcript_hash: submit.transcript.hash, touched: applied.touched });
+    this.headState = nextHead;
+    this.tail.push({ seq: nextHead.seq, transcript_hash: submit.transcript.hash, touched: applied.touched });
     if (this.tail.length > this.options.tailLimit) this.tail.splice(0, this.tail.length - this.options.tailLimit);
 
     const reply: CommitReply = {
@@ -272,10 +294,6 @@ export class ScopeSequencer {
       .sort((a, b) => a.at_logical_time - b.at_logical_time || a.id.localeCompare(b.id));
     for (const turn of due) this.scheduled.delete(turn.id);
     return due;
-  }
-
-  private nextStamp(): EpochStamp {
-    return { scope_head: `${this.headState.seq + 1}`, catalog_epoch: this.catalogEpoch };
   }
 
   private reject(submit: CommitSubmit, reason: RejectReason, detail: Record<string, unknown>, mismatched?: TranscriptCell[]): CommitReply {

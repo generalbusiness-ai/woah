@@ -196,3 +196,50 @@ smoke:cf-dev 13/13).
 Phase 2 build steps (1–9) are complete. Scenario-level v2 ↔ net parity
 remains pending the Phase-3 hosts and Phase-4 transports; the commit
 layer holds the differential line until then.
+
+## Owner-review fixes (2026-07-05, post step 9)
+
+Three review findings addressed before merge:
+
+1. **Property removals (High).** `applyTranscript` treated every prop
+   write as a value write, losing op-"remove" (clear_property). It now
+   mirrors v2's `applyTranscriptPropWrite`: the local override goes
+   away — with a local def the cell becomes def-only `{def}` (reverts
+   to the inherited default); with no def the cell is deleted (absent
+   post-state, adopted as a delete by scope.submit). **Sub-finding:**
+   no engine path ever *recorded* a prop remove — `clear_property`
+   (`world.clearPropertyForActor`) mutated state invisibly to the
+   transcript while every applier already handled op "remove". The
+   missing emitter now records a `prop` cell_write (op "remove",
+   post-remove effective value, frame write authority via
+   recordedEventWithWriter). The differential exercises the path
+   end-to-end (scenario-1 `reset` turn: cleared override cell deleted,
+   class def cell intact on both sides). Edge documented in code:
+   clearing a SELF-defined property leaves nothing readable on the
+   chain (getProp raises E_PROPNF the same way — clear_property is for
+   inherited defs, per LambdaMOO), so the recorded value is null there.
+2. **CO8 stamps (Medium).** Accepted cells were stamped with a bare
+   `${seq+1}` counter instead of the `seq:hash` head form. `submit()`
+   now computes the next head before the apply (it only needs the prior
+   head + transcript hash), stamps applied cells
+   `${nextHead.seq}:${nextHead.hash}`, and adopts that same head on
+   accept — one computation. Post-accept invariant test added (every
+   touched cell's stamp names the reply head). postStateVersion parity
+   is unaffected: it digests cell values only.
+3. **Two-scope differential (Medium).** Second differential scenario:
+   an actor anchor cluster + a shared world scope, two ScopeSequencers,
+   one gateway view spanning both. Exercises (a) a pure actor move
+   retargeted by route.ts and committed at the cluster sequencer; (b)
+   CA3 ride-along at the shared scope with the accepted rider cells
+   forwarded to and adopted by the owning sequencer — **this
+   rider-adoption forward is the Phase-3 GatewayDO's job via the
+   durable outbox (CO2.7); the harness performs it inline**; (c) every
+   turn planned against the two-scope read closure. Surfaced
+   divergence, demonstrated before fixing: a scope validated reads it
+   does not own — the cluster rejected `read_version_mismatch` on the
+   foreign `$player:moveto` verb read. `ScopeSequencer` now takes an
+   `owns` predicate and skips foreign-anchored reads (CO2.4 is a
+   per-authority attestation; foreign-read freshness is the gateway's
+   cross-scope repair concern at the owning scope — Phase 3). Writes
+   are never filtered: CA3 riders apply at the committing scope by
+   design.
