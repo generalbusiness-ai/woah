@@ -86,7 +86,12 @@ driving the new path.
 
 ## Progress log (update as steps land)
 
-- [ ] 1. ScopeStore persistence + hydrate/write-through/crash tests
+- [x] 1. ScopeStore persistence — sync five-row-family interface +
+      InMemoryScopeStore; sequencer hydrates unconditionally (meta
+      validated when present — a scheduled-only scope has no meta yet),
+      writes through on accept (one transaction: cells+meta+reply+tail),
+      seed, terminal-rejection replies, schedule/cancel/dueTurns;
+      no-store behavior byte-identical
 - [ ] 2. WorkerdHost + ScopeDO/GatewayDO shells + wrangler/migrations
 - [ ] 3. Gateway repair loop + rider adoption + cache + KV seeds
 - [ ] 4a. fake-DO fast lane for the new classes

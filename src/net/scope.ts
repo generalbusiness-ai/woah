@@ -25,6 +25,7 @@
  */
 import { CellStore, type Cell, type EpochStamp } from "./cells";
 import { netError } from "./errors";
+import type { ScopeStore } from "./scope-store";
 import { applyTranscript, netCellKeyFor, type EffectTranscript, type TranscriptCell } from "./transcript";
 import { cellVersion } from "./cells";
 
@@ -112,6 +113,11 @@ export type ScopeSequencerOptions = {
   owns?: (object: string) => boolean;
   /** Bounded recovery tail length (the scope's own log — CO5 note). */
   tailLimit?: number;
+  /** Durability (Phase 3): when provided, the sequencer hydrates from the
+   * store at construction and writes through on every state change (CO5
+   * copy #1). Without it, behavior is identical to the in-memory Phase-2
+   * sequencer. Type-only import: no runtime cycle with scope-store. */
+  durable?: ScopeStore;
 };
 
 export class ScopeSequencer {
@@ -130,6 +136,34 @@ export class ScopeSequencer {
     this.store = new CellStore("authority");
     this.headState = { seq: 0, hash: cellVersion(["genesis", scope]) };
     this.options = { tailLimit: options.tailLimit ?? 256, ...options };
+
+    // Hydrate from the durable store (cold start / post-eviction). The
+    // store is the truth for everything the sequencer holds in memory.
+    // Meta may legitimately be absent (a scope that has only scheduled
+    // turns, never a seed or commit) — validate it when present, but load
+    // every row family unconditionally.
+    const durable = this.options.durable;
+    if (durable) {
+      const meta = durable.readMeta();
+      if (meta) {
+        if (meta.scope !== scope) {
+          // Wrong storage wired to this sequencer — deployment bug, not
+          // divergence; refuse loudly rather than adopt foreign state.
+          throw new Error(`scope-store hydration mismatch: store is for ${meta.scope}, sequencer is ${scope}`);
+        }
+        if (meta.catalog_epoch !== catalogEpoch) {
+          // A catalog upgrade over durable scope state is an explicit
+          // migration concern (aged-world lane, Phase 3 step 5) — not a
+          // silent adoption. Refuse until that path exists.
+          throw new Error(`scope-store epoch mismatch: store ${meta.catalog_epoch}, runtime ${catalogEpoch}`);
+        }
+        this.headState = meta.head;
+      }
+      for (const cell of durable.readCells()) this.store.install(cell);
+      for (const { key, reply } of durable.readReplies()) this.replies.set(key, reply);
+      for (const entry of durable.readTail()) this.tail.push(entry);
+      for (const turn of durable.readScheduled()) this.scheduled.set(turn.id, turn);
+    }
   }
 
   head(): ScopeHead {
@@ -142,8 +176,18 @@ export class ScopeSequencer {
 
   /** Seed authoritative cells outside a turn (bootstrap/install path). */
   seed(cells: Array<Pick<Cell, "kind" | "object" | "name" | "value">>): void {
+    const seeded: Cell[] = [];
     for (const cell of cells) {
-      this.store.commit({ kind: cell.kind, object: cell.object, ...(cell.name !== undefined ? { name: cell.name } : {}), value: cell.value, stamp: this.stamp() });
+      seeded.push(this.store.commit({ kind: cell.kind, object: cell.object, ...(cell.name !== undefined ? { name: cell.name } : {}), value: cell.value, stamp: this.stamp() }));
+    }
+    const durable = this.options.durable;
+    if (durable) {
+      durable.transaction(() => {
+        for (const cell of seeded) durable.writeCell(cell);
+        // Meta is written on seed too, so a seeded-but-never-committed
+        // scope still hydrates with its head and epoch.
+        durable.writeMeta({ scope: this.scope, catalog_epoch: this.catalogEpoch, head: this.headState });
+      });
     }
   }
 
@@ -241,7 +285,8 @@ export class ScopeSequencer {
       else this.store.delete(key);
     }
     this.headState = nextHead;
-    this.tail.push({ seq: nextHead.seq, transcript_hash: submit.transcript.hash, touched: applied.touched });
+    const tailEntry = { seq: nextHead.seq, transcript_hash: submit.transcript.hash, touched: applied.touched };
+    this.tail.push(tailEntry);
     if (this.tail.length > this.options.tailLimit) this.tail.splice(0, this.tail.length - this.options.tailLimit);
 
     const reply: CommitReply = {
@@ -253,6 +298,25 @@ export class ScopeSequencer {
       post_state_version: applied.postStateVersion
     };
     this.replies.set(submit.idempotency_key, reply);
+
+    // Write-through (CO5 copy #1): one atomic transaction covering cells,
+    // head, reply, and tail — a crash between the reply and the fanout
+    // drain can never leave them disagreeing, which is what makes
+    // idempotent replay after rehydration sound (CO2.5).
+    const durable = this.options.durable;
+    if (durable) {
+      durable.transaction(() => {
+        for (const key of applied.touched) {
+          const cell = this.store.get(key);
+          if (cell) durable.writeCell(cell);
+          else durable.deleteCell(key);
+        }
+        durable.writeMeta({ scope: this.scope, catalog_epoch: this.catalogEpoch, head: this.headState });
+        durable.writeReply(submit.idempotency_key, reply);
+        durable.appendTail(tailEntry);
+        durable.trimTail(this.options.tailLimit);
+      });
+    }
     return reply;
   }
 
@@ -270,10 +334,13 @@ export class ScopeSequencer {
       throw netError("E_MISSING_STATE", "scheduled turn must target a future logical time", { id: turn.id, at: turn.at_logical_time, now: nowLogical });
     }
     this.scheduled.set(turn.id, turn);
+    this.options.durable?.writeScheduled(turn);
   }
 
   cancel(scheduleId: string): boolean {
-    return this.scheduled.delete(scheduleId);
+    const removed = this.scheduled.delete(scheduleId);
+    if (removed) this.options.durable?.deleteScheduled(scheduleId);
+    return removed;
   }
 
   /** Earliest pending logical time, or null — the Host sets its alarm to
@@ -292,7 +359,15 @@ export class ScopeSequencer {
     const due = [...this.scheduled.values()]
       .filter((turn) => turn.at_logical_time <= nowLogical)
       .sort((a, b) => a.at_logical_time - b.at_logical_time || a.id.localeCompare(b.id));
-    for (const turn of due) this.scheduled.delete(turn.id);
+    const durable = this.options.durable;
+    const pop = () => {
+      for (const turn of due) {
+        this.scheduled.delete(turn.id);
+        durable?.deleteScheduled(turn.id);
+      }
+    };
+    if (durable) durable.transaction(pop);
+    else pop();
     return due;
   }
 
@@ -309,8 +384,12 @@ export class ScopeSequencer {
     };
     // Terminal rejections are idempotency-recorded so replays cannot flap
     // between verdicts; retryable ones are not, because the entire point
-    // of a retry is a fresh validation against repaired state.
-    if (!RETRYABLE_VERDICTS.has(reason)) this.replies.set(submit.idempotency_key, reply);
+    // of a retry is a fresh validation against repaired state. The same
+    // rule holds durably: only recorded replies are persisted.
+    if (!RETRYABLE_VERDICTS.has(reason)) {
+      this.replies.set(submit.idempotency_key, reply);
+      this.options.durable?.writeReply(submit.idempotency_key, reply);
+    }
     return reply;
   }
 }
