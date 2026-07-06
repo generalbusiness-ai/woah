@@ -11,6 +11,7 @@ import type { Env } from "./persistent-object-do";
 import { signInternalRequest } from "./internal-auth";
 import { sessionActiveScopeFromRecord, wooError } from "../core/types";
 import { handleAdmin } from "./admin";
+import { resolveNetDestination, type NetBindingsEnv } from "./net/workerd-host";
 
 export { PersistentObjectDO } from "./persistent-object-do";
 export { DirectoryDO } from "./directory-do";
@@ -56,6 +57,19 @@ export default {
 
     if (url.pathname.startsWith("/__internal/")) {
       return jsonResponse({ error: wooError("E_NOSESSION", "internal routes require a signed internal request") }, 401);
+    }
+
+    // Plan 002 Phase 3 lane surface (step 4b): the workerd smoke lane
+    // (scripts/net-smoke-workerd.ts, `npm run smoke:net-dev`) drives the
+    // net DOs over plain HTTP through this block. It exists ONLY for the
+    // local proving lanes — the Phase-4 transports (session open, command
+    // routing, fanout delivery) replace it, at which point this block is
+    // deleted. Hard-refused in deployed environments: WOO_AE_DATASET is
+    // set only by the deploy configs (the same runtime posture as
+    // parseNetFaults), so on a deploy the surface 404s indistinguishably
+    // from any other unknown route.
+    if (url.pathname.startsWith("/net-smoke/")) {
+      return handleNetSmoke(request, env, url);
     }
 
     if (request.method === "POST" && url.pathname === "/api/auth") {
@@ -471,6 +485,52 @@ export function cleanInternalHeaders(input: Headers): Headers {
 function sanitizePublicHeaders(request: Request): Request {
   const headers = cleanInternalHeaders(request.headers);
   return new Request(request, { headers });
+}
+
+/**
+ * Phase-3 lane surface (see the /net-smoke/ block in fetch above):
+ *   {any method} /net-smoke/{scope|gateway}/<name>/<route...>
+ *     → env.SCOPE_NET / env.GATEWAY_NET stub for <name>,
+ *       signInternalRequest, forward as /net/<route...>, return the reply.
+ * Query strings pass through (GET /net/cell?key=...). The internal-auth
+ * signature is minted HERE — a caller cannot supply one — so the net DOs'
+ * verifyInternalRequest posture is unchanged: this block is just a local
+ * test doorway in front of the same signed surface the DOs already expose.
+ */
+async function handleNetSmoke(request: Request, env: Env, url: URL): Promise<Response> {
+  if (env.WOO_AE_DATASET !== undefined) {
+    // Deployed environment: refuse with a plain 404 (no hint the route exists).
+    return jsonResponse({ error: { code: "E_OBJNF", message: `no such route: ${url.pathname}` } }, 404);
+  }
+  const parts = url.pathname.split("/").filter(Boolean); // ["net-smoke", kind, name, ...route]
+  const kind = parts[1];
+  const name = parts[2];
+  const route = parts.slice(3).map((part) => decodeURIComponent(part)).join("/");
+  if ((kind !== "scope" && kind !== "gateway") || !name || !route) {
+    return jsonResponse({ error: { code: "E_INVARG", message: "expected /net-smoke/{scope|gateway}/<name>/<route...>" } }, 404);
+  }
+  // SCOPE_NET/GATEWAY_NET are bound in every wrangler config but the v2 Env
+  // type does not declare them (the v2 freeze); the structural
+  // NetBindingsEnv slice is the honest view of what this block needs.
+  const netEnv = env as unknown as NetBindingsEnv;
+  let stub;
+  try {
+    stub = resolveNetDestination(netEnv, `${kind}:${name}`);
+  } catch (err) {
+    return jsonResponse({ error: { code: "E_INTERNAL", message: errorMessage(err) } }, 500);
+  }
+  const target = new URL(`https://do/net/${route}`);
+  target.search = url.search;
+  const forward =
+    request.method === "GET"
+      ? new Request(target)
+      : new Request(target, {
+          method: request.method,
+          headers: { "content-type": "application/json" },
+          body: await request.arrayBuffer()
+        });
+  const signed = await signInternalRequest(netEnv, forward);
+  return stub.fetch(signed);
 }
 
 function parseObjectRoute(pathname: string): { id: string; rest: string[] } | null {

@@ -171,6 +171,15 @@ export class NetGatewayDO {
       if (request.method === "POST" && url.pathname === "/net/turn") {
         return json(await this.turn((await request.json()) as TurnRequest));
       }
+      if (request.method === "GET" && url.pathname === "/net/cell") {
+        // Lane read surface (Phase-3 step 4b): expose one view cell so the
+        // workerd smoke can assert fanout landed. Phase-4 transports carry
+        // real client reads; until then this is also a useful operator
+        // probe (a derived copy with provenance + stamp visible).
+        const key = url.searchParams.get("key") ?? "";
+        const cell = this.ensureView().get(key) ?? null;
+        return json({ key, cell });
+      }
       return json({ error: `no such route: ${request.method} ${url.pathname}` }, 404);
     } catch (err) {
       if (isNetError(err)) {
