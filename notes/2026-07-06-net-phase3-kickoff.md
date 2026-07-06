@@ -219,3 +219,22 @@ driving the new path.
 - Aged-world lane: upgrade convergence via named CO8 reseeds only.
 - All suites: tests/net 84, npm test green, test:worker green, guards,
   typecheck both tsconfigs.
+
+## Post-review hardening + Phase 3.5 design (2026-07-06)
+
+Three-review pass (owner + two agents) found 8 defects; ALL FIXED
+(c96e571..5dc9795): adoption prior-version CAS + owner-wins conflicts +
+rider-residue derived re-stamp; shell `owns` wiring (lineage-in-store
+rule); memory-follows-durable on transaction abort; outbox alarm-driven
+retry + post-drain recheck + fanout gap metric; gateway degraded-install
+/ submit-death recovery / selection pinning / trace on plain errors;
+planTurn view snapshot (version-laundering closed); pull advances the
+fanout high-water; parked-turn peek + alarm-arm capture + smoke body
+cap. Lane re-verified 8/8 on the hardened tree.
+
+Phase 3.5 design: coherence.md gains the CO2.3 rider-integrity
+amendment (attestation + owner-sequenced adoption + named bounded tear)
+and CO13 relations / CO14 sessions / CO15 topology+install / CO16
+scheduled execution. Rationale + sequencing in
+notes/2026-07-06-phase35-design.md. Implementation of CO13-CO16 and the
+/net/attest path is the Phase-3.5 build, gating Phase 4.
