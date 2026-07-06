@@ -92,7 +92,17 @@ driving the new path.
       writes through on accept (one transaction: cells+meta+reply+tail),
       seed, terminal-rejection replies, schedule/cancel/dueTurns;
       no-store behavior byte-identical
-- [ ] 2. WorkerdHost + ScopeDO/GatewayDO shells + wrangler/migrations
+- [x] 2. Host.rpc (single fault seam) + WorkerdHost (Date.now/waitUntil/
+      single-DO-alarm mapping, WOO_NET_FAULTS parsed once + refused in
+      deployed envs) + NetScopeDO (SqliteScopeStore, lazy hydration,
+      /net/{submit,closure,head,seed,schedule}, alarm() re-derives from
+      durable state) + NetGatewayDO (SQLite derived view + seen
+      high-water, /net/{fanout,pull,turn}, env-binding destination
+      resolution w/ test override) + wrangler three-config parity +
+      cf-do-0004 tag (cf-do-migrations.test.ts expectations updated —
+      the pinned class list is that migration kind's own gate) + fake-DO
+      lane test (per-instance isolation is REAL for the new classes:
+      each FakeDurableObjectState owns its own SQLite)
 - [ ] 3. Gateway repair loop + rider adoption + cache + KV seeds
 - [ ] 4a. fake-DO fast lane for the new classes
 - [ ] 4b. workerd lane + fault injection + parked-task eviction gate

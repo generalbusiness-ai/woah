@@ -15,6 +15,10 @@ import { handleAdmin } from "./admin";
 export { PersistentObjectDO } from "./persistent-object-do";
 export { DirectoryDO } from "./directory-do";
 export { CommitScopeDO } from "./commit-scope-do";
+// Plan 002 coherence layer (spec/protocol/coherence.md): new classes
+// beside the v2 ones; no production route reaches them until Phase 5.
+export { NetScopeDO } from "./net/scope-do";
+export { NetGatewayDO } from "./net/gateway-do";
 
 const WORLD_HOST = "world";
 const DIRECTORY_HOST = "directory";

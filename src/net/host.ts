@@ -28,6 +28,22 @@ export interface Host {
    * `at: null` clears the alarm. The Host guarantees `fire` runs once
    * per arming when now() reaches `at`. */
   setAlarm(key: string, at: number | null, fire: () => Promise<void>): void;
+  /**
+   * EVERY cross-node call in the coherence layer goes through this one
+   * method — gateway→scope submit/closure/head, scope→gateway fanout,
+   * scope→scope rider adoption. That single choke point is what makes
+   * fault injection a one-place seam (Phase-3 kickoff: latency, error,
+   * kill-after-commit are applied inside `rpc`, never scattered across
+   * call sites the way v2's patch points were).
+   *
+   * `destination` names the remote node (e.g. `scope:the_room`,
+   * `gateway:shard-3`); `route` is the path suffix under the node's
+   * `/net` surface (e.g. `/submit`); `body` is the JSON payload —
+   * `undefined` means a body-less GET. The result is the decoded JSON
+   * reply. Failures are plain Errors (transport) or NetError (taxonomy)
+   * — never a third shape.
+   */
+  rpc(destination: string, route: string, body?: unknown): Promise<unknown>;
 }
 
 /** Deterministic in-process binding. Nothing runs until the test drives
@@ -36,6 +52,7 @@ export class InProcessHost implements Host {
   private time: number;
   private readonly deferred: Array<() => Promise<void>> = [];
   private readonly alarms = new Map<string, { at: number; fire: () => Promise<void> }>();
+  private readonly rpcHandlers = new Map<string, (route: string, body: unknown) => Promise<unknown>>();
 
   constructor(start = 0) {
     this.time = start;
@@ -43,6 +60,23 @@ export class InProcessHost implements Host {
 
   now(): number {
     return this.time;
+  }
+
+  /** Register the in-process stand-in for a remote node. Tests wire the
+   * destination directly to the receiving module (no transport), so the
+   * same pipeline code runs under both hosts. */
+  registerRpc(destination: string, handler: (route: string, body: unknown) => Promise<unknown>): void {
+    this.rpcHandlers.set(destination, handler);
+  }
+
+  async rpc(destination: string, route: string, body?: unknown): Promise<unknown> {
+    const handler = this.rpcHandlers.get(destination);
+    if (!handler) {
+      // Unknown destination is a wiring bug in the test/dev composition,
+      // not a taxonomy divergence — plain Error by contract.
+      throw new Error(`InProcessHost.rpc: no handler registered for destination ${destination}`);
+    }
+    return handler(route, body);
   }
 
   defer(task: () => Promise<void>): void {

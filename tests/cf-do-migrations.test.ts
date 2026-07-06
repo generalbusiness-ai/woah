@@ -10,8 +10,10 @@ describe("Cloudflare Durable Object migration management", () => {
     const analysis = analyzeDoMigrations(currentWrangler);
 
     expect(analysis.ok).toBe(true);
-    expect(analysis.boundClasses).toEqual(["CommitScopeDO", "DirectoryDO", "PersistentObjectDO"]);
-    expect(analysis.activeClasses).toEqual(["CommitScopeDO", "DirectoryDO", "PersistentObjectDO"]);
+    // NetGatewayDO/NetScopeDO joined in Plan 002 Phase 3 (cf-do-0004);
+    // they sit beside the v2 classes until the Phase-5 cutover.
+    expect(analysis.boundClasses).toEqual(["CommitScopeDO", "DirectoryDO", "NetGatewayDO", "NetScopeDO", "PersistentObjectDO"]);
+    expect(analysis.activeClasses).toEqual(["CommitScopeDO", "DirectoryDO", "NetGatewayDO", "NetScopeDO", "PersistentObjectDO"]);
     expect(analysis.duplicateTags).toEqual([]);
   });
 
@@ -27,7 +29,8 @@ class_name = "AuditDO"
 
     expect(result.changed).toBe(true);
     expect(result.errors).toEqual([]);
-    expect(result.text).toContain('tag = "cf-do-0004"');
+    // cf-do-0004 was taken by the net classes; the next append is 0005.
+    expect(result.text).toContain('tag = "cf-do-0005"');
     expect(result.text).toContain('new_sqlite_classes = [ "AuditDO" ]');
     expect(analyzeDoMigrations(result.text).ok).toBe(true);
   });
