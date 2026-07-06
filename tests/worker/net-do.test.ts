@@ -414,4 +414,95 @@ describe("NetGatewayDO end-to-end over fake-DO", () => {
     expect((await call<{ applied: boolean }>(gateway2, gatewayEnv, "/fanout", body)).applied).toBe(false);
     scope.close();
   });
+
+  it("a pull advances the fanout high-water to the closure head, so stale pre-pull fanout rows no-op (fix 7)", async () => {
+    const scopeEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET };
+    const scope = makeScope("room-a", scopeEnv);
+    await call(scope.instance, scopeEnv, "/seed", { scope: "room-a", catalog_epoch: EPOCH, cells: seedCells() });
+
+    // Advance the scope to head 1 with a direct commit, BEFORE any
+    // gateway pulls — the pull must then arrive already-at-head-1.
+    const head0 = (await call<{ head: ScopeHead }>(scope.instance, scopeEnv, "/head")).head;
+    const transcript = {
+      kind: "woo.effect_transcript.shadow.v1",
+      route: "sequenced",
+      scope: "room-a",
+      seq: 1,
+      call: { actor: "#actor", target: "#thing", verb: "set_label", args: [], body: undefined },
+      reads: [],
+      writes: [{ cell: { kind: "prop", object: "#thing", name: "label" }, value: "pre-pull", op: "set", writer: WRITER }],
+      creates: [],
+      moves: [],
+      observations: [],
+      logicalInputs: [],
+      untrackedEffects: [],
+      complete: true,
+      incompleteReasons: [],
+      hash: "net-do-fix7-1"
+    };
+    const { applyTranscript } = await import("../../src/net/transcript");
+    const { ScopeSequencer } = await import("../../src/net/scope");
+    const twin = new ScopeSequencer("room-a", EPOCH);
+    twin.seed(seedCells());
+    const derived = applyTranscript(twin.store, transcript as never, { scope_head: "x", catalog_epoch: EPOCH });
+    const reply = await call<CommitReply>(scope.instance, scopeEnv, "/submit", {
+      kind: "woo.net.commit_submit.v1",
+      scope: "room-a",
+      base: head0,
+      idempotency_key: "fix7-t1",
+      transcript,
+      post_state_version: derived.postStateVersion,
+      stamp: { scope_head: "x", catalog_epoch: EPOCH }
+    });
+    expect(reply.status).toBe("accepted");
+
+    const gatewayState = netState("gateway-fix7");
+    const gatewayEnv: NetGatewayEnv = {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_RESOLVE: (destination) => {
+        if (destination === "scope:room-a") return scope.instance;
+        throw new Error(`unexpected destination ${destination}`);
+      }
+    };
+    const gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
+    const pulled = await call<{ head: ScopeHead }>(gateway, gatewayEnv, "/pull", {
+      scope: "room-a",
+      destination: "scope:room-a"
+    });
+    expect(pulled.head.seq).toBe(1);
+
+    // A stale pre-pull fanout row (seq <= the pulled head) must no-op —
+    // applying it would regress the freshly pulled view.
+    const staleFanout = {
+      scope: "room-a",
+      seq: 1,
+      cells: [
+        {
+          key: "property_cell:#thing:label",
+          kind: "property_cell",
+          object: "#thing",
+          name: "label",
+          value: { value: "old-regression" },
+          version: "v-stale",
+          provenance: "authoritative",
+          stamp: { scope_head: "1:x", catalog_epoch: EPOCH }
+        }
+      ],
+      observations: []
+    };
+    expect((await call<{ applied: boolean }>(gateway, gatewayEnv, "/fanout", staleFanout)).applied).toBe(false);
+    // The pulled state survived (no regression to the stale value).
+    const probe = await call<{ cell: { value: unknown } | null }>(
+      gateway,
+      gatewayEnv,
+      "/cell?key=property_cell:%23thing:label"
+    );
+    expect(probe.cell?.value).toEqual({ value: "pre-pull" });
+
+    // A genuinely newer fanout (seq 2) still applies.
+    expect(
+      (await call<{ applied: boolean }>(gateway, gatewayEnv, "/fanout", { ...staleFanout, seq: 2 })).applied
+    ).toBe(true);
+    scope.close();
+  });
 });

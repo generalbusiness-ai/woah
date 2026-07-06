@@ -259,6 +259,9 @@ export class NetGatewayDO {
               }
             })
           );
+          // Fix 7: the seed IS the state at its head — stale pre-pull
+          // fanout rows must no-op instead of regressing the view.
+          this.advanceSeen(body.scope, seed.head.seq);
           return { ok: true, installed: seed.cells.length, head: seed.head, source: "kv" };
         }
         // Seed lags the live head: named, informational (CO6 E_SEED_LAG),
@@ -683,8 +686,9 @@ export class NetGatewayDO {
     view: CellStore,
     destination: string,
     known: string[] = []
-  ): Promise<CellTransfer & { head: ScopeHead; catalog_epoch: string }> {
+  ): Promise<CellTransfer & { scope: string; head: ScopeHead; catalog_epoch: string }> {
     const transfer = (await this.host.rpc(destination, "/closure", { keys: ["*"], known })) as CellTransfer & {
+      scope: string;
       head: ScopeHead;
       catalog_epoch: string;
     };
@@ -694,9 +698,29 @@ export class NetGatewayDO {
           view.install(cell);
           this.persistCell(view, cell.key);
         }
+        // Fix 7: the closure carries the scope's head — the view now IS
+        // the state at that head, so the fanout high-water advances with
+        // it (same transaction as the install). A stale pre-pull fanout
+        // row then no-ops by seq instead of regressing the fresh view.
+        this.advanceSeen(transfer.scope, transfer.head.seq);
       })
     );
     return transfer;
+  }
+
+  /** Raise a scope's fanout high-water to `seq` (never lowers) — memory
+   * and SQLite together, matching how ensureView hydrates them (fix 7). */
+  private advanceSeen(scope: string, seq: number): void {
+    const last = this.seen.get(scope) ?? 0;
+    if (seq <= last) return;
+    // SQL first, memory second: if the durable write throws, memory has
+    // not moved (memory-follows-durable, fix 3 discipline).
+    this.state.storage.sql.exec(
+      "INSERT INTO net_gateway_scope (scope, seen_seq) VALUES (?, ?) ON CONFLICT(scope) DO UPDATE SET seen_seq = excluded.seen_seq",
+      scope,
+      seq
+    );
+    this.seen.set(scope, seq);
   }
 
   /** CO2.5 receiver idempotency + copy-#2 persistence, one transaction. */
