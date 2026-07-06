@@ -114,6 +114,11 @@ type TurnResult = {
   envelopeBytes: number;
   attempt: number;
   trace: AttemptTraceEntry[];
+  /** Present (true) when the commit was ACCEPTED but the post-accept
+   * warm cache-fill (installTouched) failed (fix 5a): the commit is
+   * durable at the scope; the view repairs itself on the next turn via
+   * read_version_mismatch → targeted refresh. Never a 500. */
+  install_degraded?: boolean;
 };
 
 /** Retryable verdict → the CO6 taxonomy code its round is recorded as.
@@ -144,6 +149,15 @@ export class NetGatewayDO {
     // SqliteScopeStore: cheap, idempotent, no separate first-boot path.
     state.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_gateway_cell (key TEXT PRIMARY KEY, body TEXT NOT NULL)");
     state.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_gateway_scope (scope TEXT PRIMARY KEY, seen_seq INTEGER NOT NULL)");
+    // Selection pinning (fix 5c): idempotency_key → the scope the FIRST
+    // submit for that key targeted. A re-plan (same key, refreshed view)
+    // must never migrate the commit to a different scope — the pinned
+    // scope may already hold the recorded reply, and a second scope would
+    // double-commit the turn. Rows are as durable and as unbounded as the
+    // scopes' own reply cache (the same idempotency posture).
+    state.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS net_gateway_pin (idempotency_key TEXT PRIMARY KEY, scope TEXT NOT NULL)"
+    );
     this.host = new WorkerdHost({
       resolve: (destination) => resolveNetDestination(this.env, destination),
       env,
@@ -197,7 +211,11 @@ export class NetGatewayDO {
           400
         );
       }
-      return json({ error: String(err) }, 500);
+      // Plain-Error escapes after failed repair rounds carry the trace
+      // as a structured field (fix 5d) — surface it so the 500 explains
+      // its convergence shape too.
+      const attempts = err instanceof Error ? (err as Error & { attempts?: AttemptTraceEntry[] }).attempts : undefined;
+      return json({ error: String(err), ...(attempts !== undefined ? { attempts } : {}) }, 500);
     }
   }
 
@@ -297,13 +315,30 @@ export class NetGatewayDO {
    * hash or the post-state digest, so patching it in is sound.
    */
   private async turn(request: TurnRequest): Promise<TurnResult> {
+    const trace: AttemptTraceEntry[] = [];
+    try {
+      return await this.turnAttempts(request, trace);
+    } catch (err) {
+      // Fix 5d: a plain-Error escape (misplan bug, double transport
+      // failure) after failed rounds must still explain the convergence
+      // shape. NetErrors carry their own trace (E_BUDGET) or are
+      // terminal-by-taxonomy; for plain Errors, attach the accumulated
+      // trace as a structured field — the fetch handler surfaces it
+      // beside the error string in the 500 reply.
+      if (!isNetError(err) && err instanceof Error && trace.length > 0) {
+        (err as Error & { attempts?: AttemptTraceEntry[] }).attempts = trace;
+      }
+      throw err;
+    }
+  }
+
+  private async turnAttempts(request: TurnRequest, trace: AttemptTraceEntry[]): Promise<TurnResult> {
     const classifier: ScopeClassifier = {
       scopeOf: (object) => request.anchors?.[object] ?? request.planningScope,
       isShared: (scope) => (request.shared ?? [request.planningScope]).includes(scope)
     };
     const startedAt = this.host.now();
     const deadline = startedAt + REPAIR_BUDGET_MS;
-    const trace: AttemptTraceEntry[] = [];
     // stale_head resubmit carry-over: when only the base was stale the
     // planned transcript is still valid — the next round submits it
     // against the fresh head instead of paying a re-plan.
@@ -344,9 +379,33 @@ export class NetGatewayDO {
         }
       }
 
-      const destination = request.scopes[planned.selection.scope];
+      // Selection pinning (fix 5c): the FIRST submit for this key pins
+      // its scope durably BEFORE the rpc leaves. Any later round (or a
+      // replayed request) whose re-plan selects a DIFFERENT scope is
+      // overridden to the pinned one — the pinned scope may hold the
+      // recorded reply; committing elsewhere would double-commit. The
+      // overridden submit still carries its planned transcript scope, so
+      // a genuinely migrated selection rejects terminal scope_mismatch
+      // at the pinned scope and SURFACES (never commits elsewhere).
+      const pinned = this.pinnedScope(request.idempotency_key);
+      const targetScope = pinned ?? planned.selection.scope;
+      if (pinned === null) {
+        this.pinScope(request.idempotency_key, planned.selection.scope);
+      } else if (pinned !== planned.selection.scope) {
+        console.log(
+          "woo.metric",
+          JSON.stringify({
+            kind: "net_turn_selection_pin_override",
+            idempotency_key: request.idempotency_key,
+            planned: planned.selection.scope,
+            pinned,
+            ts: Date.now()
+          })
+        );
+      }
+      const destination = request.scopes[targetScope];
       if (!destination) {
-        throw new Error(`no rpc destination for selected scope ${planned.selection.scope}`);
+        throw new Error(`no rpc destination for selected scope ${targetScope}`);
       }
       if (base === null) {
         base = ((await this.host.rpc(destination, "/head")) as { head: ScopeHead }).head;
@@ -357,13 +416,53 @@ export class NetGatewayDO {
       // scope shell enqueues /net/adopt rows for the accepted rider
       // cells after commit. CommitSubmit itself is unchanged — riders
       // are an HTTP-body sibling, not sequencer input.
-      const reply = (await this.host.rpc(destination, "/submit", {
+      const submitBody = {
         submit,
         rider_destinations: this.riderDestinationsFor(request, planned.selection.riders)
-      })) as CommitReply;
+      };
+      let reply: CommitReply;
+      try {
+        reply = (await this.host.rpc(destination, "/submit", submitBody)) as CommitReply;
+      } catch (err) {
+        // CO2.5 recovery (fix 5b): the transport died in the reply
+        // window (kill_after_commit shape) — the scope may or may not
+        // have durably committed. ONE resubmit with the SAME idempotency
+        // key disambiguates: a committed turn returns its recorded
+        // reply; an uncommitted one validates fresh. Only a second
+        // transport failure surfaces (with the trace via fix 5d).
+        reply = (await this.host.rpc(destination, "/submit", submitBody)) as CommitReply;
+      }
       if (reply.status === "accepted") {
-        if (reply.touched.length > 0) await this.installTouched(view, destination, reply.touched);
-        return { reply, selection: planned.selection, envelopeBytes: planned.envelopeBytes, attempt, trace };
+        let installDegraded = false;
+        if (reply.touched.length > 0) {
+          try {
+            await this.installTouched(view, destination, reply.touched);
+          } catch (err) {
+            // Fix 5a: the COMMIT is durable at the scope; a failed warm
+            // cache-fill must never turn an accepted turn into a 500.
+            // The stale view self-repairs next turn (read_version_
+            // mismatch → targeted refresh). Named + counted.
+            installDegraded = true;
+            console.log(
+              "woo.metric",
+              JSON.stringify({
+                kind: "net_turn_install_degraded",
+                scope: reply.scope,
+                touched: reply.touched.length,
+                error: String(err),
+                ts: Date.now()
+              })
+            );
+          }
+        }
+        return {
+          reply,
+          selection: planned.selection,
+          envelopeBytes: planned.envelopeBytes,
+          attempt,
+          trace,
+          ...(installDegraded ? { install_degraded: true } : {})
+        };
       }
       if (!reply.retryable) {
         // Terminal verdict: surface the scope's reply immediately (CO6).
@@ -444,6 +543,23 @@ export class NetGatewayDO {
       max_attempts: MAX_TURN_ATTEMPTS,
       elapsed_ms: this.host.now() - startedAt
     });
+  }
+
+  /** The scope pinned to an idempotency key, or null (fix 5c). */
+  private pinnedScope(idempotencyKey: string): string | null {
+    const rows = sqlRows<{ scope: string }>(
+      this.state.storage.sql.exec("SELECT scope FROM net_gateway_pin WHERE idempotency_key = ?", idempotencyKey)
+    );
+    return rows.length > 0 ? rows[0].scope : null;
+  }
+
+  /** Persist the key → scope pin; first writer wins (fix 5c). */
+  private pinScope(idempotencyKey: string, scope: string): void {
+    this.state.storage.sql.exec(
+      "INSERT INTO net_gateway_pin (idempotency_key, scope) VALUES (?, ?) ON CONFLICT(idempotency_key) DO NOTHING",
+      idempotencyKey,
+      scope
+    );
   }
 
   /** Rider forwarding directions for the committing scope (CA3): for

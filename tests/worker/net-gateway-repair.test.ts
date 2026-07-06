@@ -139,6 +139,7 @@ type TurnBody = {
   reply: CommitReply;
   attempt: number;
   trace: AttemptTraceEntry[];
+  install_degraded?: boolean;
 };
 
 describe("NetGatewayDO repair loop (CO6/CO10)", () => {
@@ -222,5 +223,134 @@ describe("NetGatewayDO repair loop (CO6/CO10)", () => {
     close();
     gState.close();
     g2State.close();
+  });
+});
+
+// ---- Gateway turn edges (Phase-3 hardening fix 5) --------------------------
+describe("gateway turn edges (fix 5)", () => {
+  it("an accepted commit whose warm cache-fill fails returns 200 with install_degraded, never a 500 (fix 5a)", async () => {
+    const { scopeDO, bumpCall, close } = await seededScope();
+
+    // Warm the view on clean env (a fault would break the pull)...
+    const gState = netState("gateway-fix5a");
+    const cleanEnv = gatewayEnvFor(scopeDO);
+    const warm = new NetGatewayDO(gState.state, cleanEnv);
+    await call(warm, cleanEnv, "/pull", { scope: SCOPE, destination: `scope:${SCOPE}` });
+
+    // ...then reopen the SAME storage with /closure faulted: the turn
+    // plans on the fresh view and commits on attempt 1, but the
+    // post-accept installTouched dies. The commit is durable at the
+    // scope — the reply must be the ACCEPTED TurnResult, degraded.
+    const faultEnv = gatewayEnvFor(scopeDO, { "/closure": { error: "closure lane down" } });
+    const faulted = new NetGatewayDO(gState.state, faultEnv);
+    const result = await call<TurnBody>(faulted, faultEnv, "/turn", turnRequest(bumpCall("turn-5a-1"), "fix5a-t1"));
+    expect(result.reply.status).toBe("accepted");
+    expect(result.attempt).toBe(1);
+    expect(result.install_degraded).toBe(true);
+
+    close();
+    gState.close();
+  });
+
+  it("a transport death in the submit reply window recovers via ONE same-key resubmit (fix 5b, CO2.5)", async () => {
+    const { scopeDO, scopeEnv, bumpCall, close } = await seededScope();
+
+    // Kill-after-commit at the stub seam: the FIRST /net/submit forwards
+    // to the scope (which commits durably) and then throws before the
+    // reply reaches the gateway. Later calls pass through.
+    let killArmed = true;
+    const killingStub = {
+      fetch: async (request: Request) => {
+        const response = await scopeDO.fetch(request);
+        if (killArmed && new URL(request.url).pathname === "/net/submit") {
+          killArmed = false;
+          throw new Error("transport died after commit");
+        }
+        return response;
+      }
+    };
+    const gState = netState("gateway-fix5b");
+    const gEnv: NetGatewayEnv = {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_RESOLVE: (destination) => {
+        if (destination === `scope:${SCOPE}`) return killingStub;
+        throw new Error(`unexpected destination ${destination}`);
+      }
+    };
+    const gateway = new NetGatewayDO(gState.state, gEnv);
+    await call(gateway, gEnv, "/pull", { scope: SCOPE, destination: `scope:${SCOPE}` });
+
+    // The turn survives: the resubmit returns the RECORDED reply.
+    const result = await call<TurnBody>(gateway, gEnv, "/turn", turnRequest(bumpCall("turn-5b-1"), "fix5b-t1"));
+    expect(result.reply.status).toBe("accepted");
+    expect(result.attempt).toBe(1);
+
+    // Exactly one commit at the scope (the resubmit replayed, it did not
+    // double-commit): head advanced once.
+    const head = await call<{ head: { seq: number } }>(scopeDO, scopeEnv, "/head");
+    expect(head.head.seq).toBe(1);
+
+    close();
+    gState.close();
+  });
+
+  it("pins the first submit's scope per idempotency key; a changed re-plan selection is overridden and surfaced, never committed elsewhere (fix 5c)", async () => {
+    const { scopeDO, scopeEnv, bumpCall, close } = await seededScope();
+
+    // A second, unrelated scope DO — the stale pin target.
+    const otherState = netState("scope-pin-other");
+    const otherEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET };
+    const otherDO = new NetScopeDO(otherState.state, otherEnv);
+    await call(otherDO, otherEnv, "/seed", { scope: "pin_other", catalog_epoch: EPOCH, cells: [] });
+
+    const gState = netState("gateway-fix5c");
+    const gEnv: NetGatewayEnv = {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_RESOLVE: (destination) => {
+        if (destination === `scope:${SCOPE}`) return scopeDO;
+        if (destination === "scope:pin_other") return otherDO;
+        throw new Error(`unexpected destination ${destination}`);
+      }
+    };
+    const gateway = new NetGatewayDO(gState.state, gEnv);
+    await call(gateway, gEnv, "/pull", { scope: SCOPE, destination: `scope:${SCOPE}` });
+
+    // Happy path: a normal turn persists its (key → scope) pin.
+    const first = await call<TurnBody>(gateway, gEnv, "/turn", {
+      ...turnRequest(bumpCall("turn-5c-1"), "fix5c-t1"),
+      scopes: { [SCOPE]: `scope:${SCOPE}`, pin_other: "scope:pin_other" }
+    });
+    expect(first.reply.status).toBe("accepted");
+    const pinned = (
+      gState.state.storage.sql.exec("SELECT scope FROM net_gateway_pin WHERE idempotency_key = 'fix5c-t1'") as {
+        toArray(): Array<{ scope: string }>;
+      }
+    ).toArray();
+    expect(pinned).toEqual([{ scope: SCOPE }]);
+
+    // Divergent re-plan: simulate a key whose FIRST submit targeted
+    // pin_other (pre-persisted pin) while the current plan selects
+    // repair_room. The override routes to the pinned scope, whose shell
+    // refuses the wrong-scope submit (one DO = one scope — upstream of
+    // the sequencer's scope_mismatch verdict, same terminal CO6
+    // posture): the failure SURFACES and repair_room must not commit.
+    gState.state.storage.sql.exec(
+      "INSERT INTO net_gateway_pin (idempotency_key, scope) VALUES ('fix5c-t2', 'pin_other')"
+    );
+    const headBefore = (await call<{ head: { seq: number } }>(scopeDO, scopeEnv, "/head")).head.seq;
+    const { status, body } = await callRaw<{ error: unknown }>(gateway, gEnv, "/turn", {
+      ...turnRequest(bumpCall("turn-5c-2"), "fix5c-t2"),
+      scopes: { [SCOPE]: `scope:${SCOPE}`, pin_other: "scope:pin_other" }
+    });
+    expect(status).toBe(500);
+    expect(JSON.stringify(body)).toContain("pin_other");
+    // Never double-commit elsewhere: the freshly-selected scope did NOT
+    // receive the turn.
+    const headAfter = (await call<{ head: { seq: number } }>(scopeDO, scopeEnv, "/head")).head.seq;
+    expect(headAfter).toBe(headBefore);
+
+    close();
+    otherState.close();
+    gState.close();
   });
 });
