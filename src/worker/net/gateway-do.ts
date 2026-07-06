@@ -10,8 +10,10 @@
  *   - the internal-auth'd /net surface:
  *       POST /net/fanout  FanoutBody → install cells, advance seen seq
  *       POST /net/pull    {scope, destination} → CO7 state-transfer
- *                         cache-fill: fetch the scope's lineage-closed
- *                         closure and install it as derived
+ *                         cache-fill: KV seed first when HOST_SEED_KV is
+ *                         bound (head-checked against the live scope;
+ *                         CO5 copy #3), else the scope's lineage-closed
+ *                         live closure — which then rewrites the seed
  *       POST /net/turn    the CO6-taxonomy repair loop: plan → submit,
  *                         with each retryable verdict mapped to its
  *                         defined recovery (refetch head / targeted
@@ -49,7 +51,30 @@ export type NetGatewayDurableState = {
   };
 };
 
-export type NetGatewayEnv = NetBindingsEnv;
+/** Structural KV slice (CO5 copy #3) — satisfied by a real KVNamespace
+ * binding and by a Map-backed test fake alike. */
+export type NetSeedKV = {
+  get(key: string): Promise<string | null>;
+  put(key: string, value: string): Promise<void>;
+};
+
+/** The KV value at `net:seed:<scope>`: a full-closure snapshot of the
+ * scope's cells at a stated head. Consumers head-check before trusting
+ * (CO7: the cold path is the normal path — a lagging seed falls back to
+ * the live closure, which then overwrites the seed). */
+type SeedRecord = {
+  cells: Cell[];
+  head: ScopeHead;
+  catalog_epoch: string;
+};
+
+const seedKey = (scope: string): string => `net:seed:${scope}`;
+
+export type NetGatewayEnv = NetBindingsEnv & {
+  /** KV seeds (CO5 copy #3). Optional: without the binding, /net/pull is
+   * always the live-closure path. */
+  HOST_SEED_KV?: NetSeedKV;
+};
 
 function sqlRows<T>(cursor: unknown): T[] {
   return (cursor as { toArray(): T[] }).toArray();
@@ -141,9 +166,7 @@ export class NetGatewayDO {
       }
       if (request.method === "POST" && url.pathname === "/net/pull") {
         const body = (await request.json()) as { scope: string; destination: string; known?: string[] };
-        const view = this.ensureView();
-        const transfer = await this.reseedFromScope(view, body.destination, body.known ?? []);
-        return json({ ok: true, installed: transfer.cells.length, head: transfer.head });
+        return json(await this.pull(body));
       }
       if (request.method === "POST" && url.pathname === "/net/turn") {
         return json(await this.turn((await request.json()) as TurnRequest));
@@ -167,6 +190,72 @@ export class NetGatewayDO {
       }
       return json({ error: String(err) }, 500);
     }
+  }
+
+  /**
+   * /net/pull — cold cache-fill with KV seeds (CO5 copy #3, CO7).
+   *
+   * KV first when the binding exists: read `net:seed:<scope>`, then
+   * HEAD-CHECK it against the live scope before trusting (the cold path
+   * is the normal path run at higher latency, never a trust-me shortcut).
+   * A seed at the live head installs with `seed` provenance — the honest
+   * copy-#3 marking. A lagging seed (E_SEED_LAG — informational, the
+   * consumer proceeds via the head check) falls back to the live closure,
+   * which then OVERWRITES the seed. On any live pull the seed is written
+   * back best-effort via defer — never on the reply path, and only for
+   * full pulls (`known` non-empty would snapshot a partial closure).
+   */
+  private async pull(body: { scope: string; destination: string; known?: string[] }): Promise<{
+    ok: true;
+    installed: number;
+    head: ScopeHead;
+    source: "kv" | "live";
+  }> {
+    const view = this.ensureView();
+    const known = body.known ?? [];
+    const kv = this.env.HOST_SEED_KV;
+
+    if (kv && known.length === 0) {
+      const raw = await kv.get(seedKey(body.scope));
+      if (raw !== null) {
+        const seed = JSON.parse(raw) as SeedRecord;
+        const live = (await this.host.rpc(body.destination, "/head")) as { head: ScopeHead };
+        if (live.head.seq === seed.head.seq && live.head.hash === seed.head.hash) {
+          this.state.storage.transactionSync(() => {
+            for (const cell of seed.cells) {
+              // Copy #3 provenance: these cells came through KV, not the
+              // authority — mark them honestly (planning treats derived
+              // and seed copies identically; the stamp is provenance).
+              view.install({ ...cell, provenance: "seed" });
+              this.persistCell(view, cell.key);
+            }
+          });
+          return { ok: true, installed: seed.cells.length, head: seed.head, source: "kv" };
+        }
+        // Seed lags the live head: named, informational (CO6 E_SEED_LAG),
+        // and self-healing — the live path below rewrites the seed.
+        console.log(
+          "woo.metric",
+          JSON.stringify({
+            kind: "net_seed_lag",
+            code: "E_SEED_LAG",
+            scope: body.scope,
+            seed_head: seed.head,
+            live_head: live.head,
+            ts: Date.now()
+          })
+        );
+      }
+    }
+
+    const transfer = await this.reseedFromScope(view, body.destination, known);
+    if (kv && known.length === 0) {
+      // Best-effort seed write-back (deferred — a KV outage must never
+      // fail or slow the pull; the next pull just goes live again).
+      const record: SeedRecord = { cells: transfer.cells, head: transfer.head, catalog_epoch: transfer.catalog_epoch };
+      this.host.defer(() => kv.put(seedKey(body.scope), JSON.stringify(record)));
+    }
+    return { ok: true, installed: transfer.cells.length, head: transfer.head, source: "live" };
   }
 
   /**

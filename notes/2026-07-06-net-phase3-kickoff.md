@@ -103,7 +103,44 @@ driving the new path.
       the pinned class list is that migration kind's own gate) + fake-DO
       lane test (per-instance isolation is REAL for the new classes:
       each FakeDurableObjectState owns its own SQLite)
-- [ ] 3. Gateway repair loop + rider adoption + cache + KV seeds
+- [x] 3. Gateway machinery, in three commits:
+      **(a)** the CO6-taxonomy repair loop replaces NetGatewayDO.turn's
+      single attempt — per-verdict recoveries (E_MISSING_STATE →
+      targeted closure fetch of exactly the missing keys; stale_head →
+      head refetch + same-transcript resubmit only when the base was the
+      whole story; read_version_mismatch/post_state_mismatch → refresh
+      exactly the mismatched cells then RE-PLAN; stale_epoch →
+      dropStaleEpoch + full reseed, the CO8 path), bounded by
+      repair_budget_ms=12 000 (CO10) + a 6-attempt ceiling; E_BUDGET
+      carries the AttemptTraceEntry trail into the /net/turn error
+      reply; recovery failures annotate their round (recovery_error).
+      **(b)** scope-side fanout + CA3 rider adoption — net_scope_
+      subscribers + /net/subscribe; durable net_scope_outbox (FanoutRow
+      mirror + a route column) enqueued in the SAME transaction as the
+      commit write-through; drain shape (the documented choice):
+      rehydrate pending SQLite rows into a fresh src/net Outbox per
+      drain, restoring persisted attempt/backoff state onto the minted
+      rows, so lane/backoff/abandon semantics are identical to
+      src/net/outbox.ts; delivered rows deleted (receivers are
+      seq-idempotent, CO2.5), abandoned rows kept + woo.metric; drains
+      via host.defer + drain-on-reactivation (any request re-kicks
+      pending rows); /net/adopt installs authoritative rider cells,
+      idempotent by (from_scope, seq) high-water, the adopting head does
+      NOT advance. One deliberate shape choice: the submit sibling field
+      is `rider_destinations: {scope: {destination, objects}}` — the
+      object list rides because only the gateway holds the anchor map
+      (a bare `{scope: destination}` cannot say WHICH accepted cells are
+      the rider's, and shipping the full closure would mint a second
+      authority for room facts); src/net types unchanged.
+      resolveNetDestination moved to workerd-host.ts, shared by both
+      shells.
+      **(c)** KV seeds (CO5 copy #3) — /net/pull tries HOST_SEED_KV
+      (`net:seed:<scope>`, structural {get,put} slice) first and
+      HEAD-CHECKS against the live scope before trusting; a lagging seed
+      logs E_SEED_LAG (informational) and falls back live, which
+      OVERWRITES the seed; live pulls write the seed back deferred
+      (best-effort, full pulls only — a `known`-relieved pull would
+      snapshot a partial closure).
 - [ ] 4a. fake-DO fast lane for the new classes
 - [ ] 4b. workerd lane + fault injection + parked-task eviction gate
 - [ ] 5. aged-world lane
