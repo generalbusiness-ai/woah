@@ -211,3 +211,46 @@ describe("envelope byte gates (CO7/CO10)", () => {
     })).rejects.toThrow(/oversized warm envelope/);
   });
 });
+
+describe("plan-time snapshot (fix 6: the version-laundering window)", () => {
+  it("reads carry the versions the execution saw, not versions installed into the view mid-plan", async () => {
+    const { seq, call } = harness("snapshot");
+    const view = derivedViewOf(seq.store);
+    const key = "property_cell:plan_box:counter";
+    const snapshotVersion = view.get(key)?.version;
+    expect(snapshotVersion).toBeDefined();
+
+    // Start the plan. planTurn snapshots the view SYNCHRONOUSLY before
+    // its first await, so a mutation right after the call lands inside
+    // the await window — exactly where a concurrent fanout/refresh would
+    // interleave on a real gateway.
+    const pending = planTurn({
+      call: call("plan-snap-1"),
+      view,
+      planningScope: SCOPE,
+      classifier,
+      base: seq.head(),
+      idempotencyKey: "ksnap",
+      stamp: seq.stamp()
+    });
+    const midPlan = view.get(key) as NonNullable<ReturnType<typeof view.get>>;
+    view.install({ ...midPlan, value: { value: 999 }, version: "laundered-version" });
+
+    const plan = await pending;
+    const counterReads = plan.transcript.reads.filter(
+      (read) => read.cell.kind === "prop" && read.cell.object === "plan_box" && read.cell.name === "counter"
+    );
+    expect(counterReads.length).toBeGreaterThanOrEqual(1);
+    for (const read of counterReads) {
+      // The snapshot version — NOT the mid-plan install. Were the live
+      // view consulted here, a stale plan would sail past the scope's
+      // read-version check wearing versions its execution never saw.
+      expect(read.version).toBe(snapshotVersion);
+      expect(read.version).not.toBe("laundered-version");
+    }
+
+    // The plan itself is still honest end-to-end: the authority (which
+    // did NOT move) accepts it.
+    expect(seq.submit(plan.submit).status).toBe("accepted");
+  });
+});

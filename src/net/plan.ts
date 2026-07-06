@@ -76,21 +76,31 @@ export type PlanTurnResult = {
 export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
   const { call, view, planningScope, classifier, base, idempotencyKey, stamp } = input;
 
-  // Sparse execution against the view's cells only (plus the caller's
+  // ONE consistent snapshot, taken synchronously BEFORE the first await
+  // (fix 6: the version-laundering window). The cells the ephemeral world
+  // executes against, the versions the recorded reads are rewritten with,
+  // the post-state pre-image, and the read-closure bytes must all come
+  // from the same instant: the VM run below yields the event loop, and a
+  // concurrent fanout/refresh mutating the live view mid-plan would
+  // otherwise stamp the reads with versions the execution never saw —
+  // laundering a stale plan past the scope's read-version check.
+  const snapshot = view.clone();
+
+  // Sparse execution against the snapshot's cells only (plus the caller's
   // counters for creates — see PlanTurnInput.counters).
-  const world = planningWorldFromCells(storeCells(view), input.counters);
+  const world = planningWorldFromCells(storeCells(snapshot), input.counters);
   const run = await runShadowTurnCallTranscript(world, call);
 
   const selection = selectCommitScope(run.transcript, planningScope, classifier);
-  const transcript = submitTranscript(run.transcript, view, selection.scope);
+  const transcript = submitTranscript(run.transcript, snapshot, selection.scope);
 
-  // Planner-parity post-state: same apply, same prior cells (the view is
-  // a read-through of authority), so an honest plan predicts the digest
-  // the scope derives at CO4 step 10 — and a stale view is caught by the
-  // read-version check before post-state ever disagrees.
-  const applied = applyTranscript(CellStore.scratchAuthorityFrom(view), transcript, stamp);
+  // Planner-parity post-state: same apply, same prior cells (the snapshot
+  // is a read-through of authority), so an honest plan predicts the
+  // digest the scope derives at CO4 step 10 — and a stale view is caught
+  // by the read-version check before post-state ever disagrees.
+  const applied = applyTranscript(CellStore.scratchAuthorityFrom(snapshot), transcript, stamp);
 
-  const closure = serializeTransfer(readClosureCells(view, transcript, call));
+  const closure = serializeTransfer(readClosureCells(snapshot, transcript, call));
   // The CO7 envelope is the transcript plus its read-closure; measure the
   // whole shape that would go on the wire.
   const envelopeBytes = new TextEncoder().encode(JSON.stringify({ transcript, closure })).byteLength;
@@ -121,7 +131,9 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
 /**
  * The transcript the gateway submits: recorded reads re-versioned through
  * the view (the version rule), retargeted at the selected commit scope,
- * and re-content-addressed.
+ * and re-content-addressed. `view` is the plan-time SNAPSHOT (fix 6),
+ * never the live store — the rewrite must carry the versions the
+ * execution actually saw.
  *
  * - Scope: the executor records the transport's audience placeholder for
  *   direct routes; CO2.3 makes the write set the scope authority
