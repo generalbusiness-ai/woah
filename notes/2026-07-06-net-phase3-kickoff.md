@@ -152,4 +152,25 @@ driving the new path.
       script header). Lane debugging surfaced a permanent observability
       fix: per-attempt net_scope_outbox_delivery_failed metric (failed
       rows were silent until abandonment)
-- [ ] 5. aged-world lane
+- [x] 5. tests/net/aged-world.test.ts — age at cat-v1 through real
+      planned turns (durable store), upgrade: old store REFUSES hydration
+      at cat-v2 (the step-1 refusal is the migration boundary = the
+      Phase-5 reinstall model), fresh cat-v2 authority reseeded from aged
+      cells, replay through the stale cat-v1 view → exactly one named
+      stale_epoch verdict + one dropStaleEpoch reseed → converged; final
+      state matches a never-aged cat-v2 control (values AND versions);
+      zero unnamed divergence anywhere in the scenario
+
+## Phase 3 complete — exit-gate evidence
+
+- Fake-DO lane (real per-instance isolation): net-do, net-gateway-repair,
+  net-scope-fanout, net-kv-seed — cold-restart idempotent replay, head
+  continuity, eviction-survival of parked turns, repair convergence,
+  E_BUDGET traces, rider adoption, drain-on-reactivation, KV staleness.
+- Workerd lane (`npm run smoke:net-dev`) 8/8: CO10 warm structure
+  (attempt 1, 6.8KB envelope), fanout + rider adoption over real
+  cross-DO RPC, real alarm firing, 100ms latency ≠ divergence, faulted
+  closure → E_BUDGET with six-round taxonomy trace.
+- Aged-world lane: upgrade convergence via named CO8 reseeds only.
+- All suites: tests/net 84, npm test green, test:worker green, guards,
+  typecheck both tsconfigs.
