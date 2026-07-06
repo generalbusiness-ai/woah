@@ -137,7 +137,18 @@ export class WorkerdHost implements Host {
   private readonly faultMatches = new Map<string, number>();
   /** Armed wake-ups by key. The DO alarm API is a single alarm per DO,
    * so the key exists for documentation/bookkeeping: the storage alarm
-   * is always armed to the EARLIEST pending `at` across keys. */
+   * is always armed to the EARLIEST pending `at` across keys.
+   *
+   * Post-eviction caveat (fix 8d): this map is per-DO-lifetime memory —
+   * after an eviction it starts EMPTY, so the earliest-of-keys
+   * computation only spans keys re-registered in the new lifetime. A
+   * fresh lifetime's first setAlarm can therefore re-arm the durable
+   * storage alarm LATER than a wake an earlier lifetime had armed for
+   * another key (delay, never loss: the DO's alarm() handler re-derives
+   * every wake source — scheduled rows, outbox retries — from durable
+   * state and re-arms all keys). Correctness never depends on this map;
+   * it only prevents a later-key arm from clobbering an earlier one
+   * within a single lifetime. */
   private readonly alarms = new Map<string, number>();
 
   constructor(options: WorkerdHostOptions) {
@@ -168,8 +179,8 @@ export class WorkerdHost implements Host {
    * The `fire` callback is deliberately NOT retained: in-memory
    * callbacks cannot survive eviction, so the durable wake path is the
    * DO class's own `alarm()` handler, which re-derives due work from
-   * hydrated scope state and re-arms from `nextAlarmAt()` (CO2.8 —
-   * exactly why a parked task survives eviction).
+   * durable scope state (scheduled rows, outbox retries) and re-arms
+   * every key (CO2.8 — exactly why a parked task survives eviction).
    */
   setAlarm(key: string, at: number | null, _fire: () => Promise<void>): void {
     const storage = this.options.alarmStorage;
@@ -181,8 +192,21 @@ export class WorkerdHost implements Host {
       if (earliest === null || pending < earliest) earliest = pending;
     }
     // Fire-and-forget: the storage alarm API is async but arming has no
-    // caller-visible result; a failed arm surfaces on the next request.
-    void (earliest === null ? storage.deleteAlarm() : storage.setAlarm(earliest));
+    // caller-visible result. A failed arm is a LIVENESS hazard (a quiet
+    // scope's retry/wake never fires), so capture both sync throws and
+    // async rejections as a named metric (fix 8b) — the next request's
+    // drain-on-reactivation / re-arm is the recovery.
+    const logArmFailure = (err: unknown): void => {
+      console.log(
+        "woo.metric",
+        JSON.stringify({ kind: "net_alarm_arm_failed", key, at: earliest, error: String(err), ts: Date.now() })
+      );
+    };
+    try {
+      void Promise.resolve(earliest === null ? storage.deleteAlarm() : storage.setAlarm(earliest)).catch(logArmFailure);
+    } catch (err) {
+      logArmFailure(err);
+    }
   }
 
   /**

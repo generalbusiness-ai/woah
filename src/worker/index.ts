@@ -25,6 +25,9 @@ const WORLD_HOST = "world";
 const DIRECTORY_HOST = "directory";
 const INTERNAL_ORIGIN = "https://woo.internal";
 const MAX_JSON_BODY_BYTES = 1 * 1024 * 1024;
+/** Body cap for the /net-smoke lane doorway (fix 8c): bounded, but wide
+ * enough for /net/seed's full-world cell closure (see handleNetSmoke). */
+const NET_SMOKE_MAX_BODY_BYTES = 8 * 1024 * 1024;
 const MCP_SESSION_HEADER = "mcp-session-id";
 const MCP_GATEWAY_SHARD_PREFIX = "mcp-gateway-";
 const DEFAULT_MCP_GATEWAY_SHARDS = 32;
@@ -521,14 +524,28 @@ async function handleNetSmoke(request: Request, env: Env, url: URL): Promise<Res
   }
   const target = new URL(`https://do/net/${route}`);
   target.search = url.search;
-  const forward =
-    request.method === "GET"
-      ? new Request(target)
-      : new Request(target, {
-          method: request.method,
-          headers: { "content-type": "application/json" },
-          body: await request.arrayBuffer()
-        });
+  let forward: Request;
+  if (request.method === "GET") {
+    forward = new Request(target);
+  } else {
+    // Cap the body read (fix 8c): an unbounded arrayBuffer() on a
+    // local-lane doorway is still an unbounded buffer. The bound is
+    // larger than the public JSON cap because /net/seed legitimately
+    // carries a full bootstrap-world cell closure (~1.1 MiB today) — a
+    // state transfer, not a turn envelope. readLimitedBody throws
+    // E_RATE past the cap (→ 429 via errorResponseFor).
+    let body: ArrayBuffer;
+    try {
+      body = await readLimitedBody(request, NET_SMOKE_MAX_BODY_BYTES);
+    } catch (err) {
+      return errorResponseFor(err);
+    }
+    forward = new Request(target, {
+      method: request.method,
+      headers: { "content-type": "application/json" },
+      body
+    });
+  }
   const signed = await signInternalRequest(netEnv, forward);
   return stub.fetch(signed);
 }
@@ -552,11 +569,11 @@ async function readJson(request: Request): Promise<Record<string, unknown>> {
   }
 }
 
-async function readLimitedBody(request: Request): Promise<ArrayBuffer> {
+async function readLimitedBody(request: Request, maxBytes = MAX_JSON_BODY_BYTES): Promise<ArrayBuffer> {
   const declared = Number(request.headers.get("content-length") ?? 0);
-  if (Number.isFinite(declared) && declared > MAX_JSON_BODY_BYTES) throw wooError("E_RATE", `request body exceeds ${MAX_JSON_BODY_BYTES} bytes`);
+  if (Number.isFinite(declared) && declared > maxBytes) throw wooError("E_RATE", `request body exceeds ${maxBytes} bytes`);
   const body = await request.arrayBuffer();
-  if (body.byteLength > MAX_JSON_BODY_BYTES) throw wooError("E_RATE", `request body exceeds ${MAX_JSON_BODY_BYTES} bytes`);
+  if (body.byteLength > maxBytes) throw wooError("E_RATE", `request body exceeds ${maxBytes} bytes`);
   return body;
 }
 

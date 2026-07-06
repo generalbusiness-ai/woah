@@ -354,11 +354,21 @@ export class ScopeSequencer {
     return min;
   }
 
-  /** Pop every turn due at or before `nowLogical`, in time order. */
-  dueTurns(nowLogical: number): ScheduledTurn[] {
-    const due = [...this.scheduled.values()]
+  /** Non-consuming view of the turns due at or before `nowLogical`, in
+   * firing order (fix 8a). The Phase-3 shell OBSERVES due turns at alarm
+   * time but cannot yet execute them (the turn executor arrives with
+   * Phase 3.5); peeking leaves the rows parked instead of destructively
+   * popping work that would then be lost (CO2.8). `dueTurns` remains the
+   * consuming form for the executor that actually runs the turns. */
+  peekDue(nowLogical: number): ScheduledTurn[] {
+    return [...this.scheduled.values()]
       .filter((turn) => turn.at_logical_time <= nowLogical)
       .sort((a, b) => a.at_logical_time - b.at_logical_time || a.id.localeCompare(b.id));
+  }
+
+  /** Pop every turn due at or before `nowLogical`, in time order. */
+  dueTurns(nowLogical: number): ScheduledTurn[] {
+    const due = this.peekDue(nowLogical);
     const durable = this.options.durable;
     const pop = () => {
       for (const turn of due) {

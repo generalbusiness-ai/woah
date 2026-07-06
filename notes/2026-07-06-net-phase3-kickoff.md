@@ -161,6 +161,51 @@ driving the new path.
       state matches a never-aged cat-v2 control (values AND versions);
       zero unnamed divergence anywhere in the scenario
 
+- [x] Hardening pass (review-confirmed defects, owner-approved fixes;
+      one commit each on `net-phase3`):
+      1. **Adoption integrity interim guard** — /net/adopt CASes each
+         cell against the prior version the committing turn observed
+         (transcript read version, else the pre-commit residue copy);
+         mismatch = owner-wins + `net_adopt_conflict` metric, never a
+         silent clobber; high-water advances either way. Rider residue
+         at the committing scope re-stamps `derived` at the closure()
+         exit (durable `net_scope_rider_cache` ledger) so no second
+         authoritative copy ever ships; closure() also stopped throwing
+         E_LINEAGE on rider cells' foreign lineage (receiver-known, the
+         fanoutCells rule). Full A+B design remains Phase-3.5
+         (notes/2026-07-06-rider-read-integrity.md).
+      2. **owns wiring** — the shell's sequencer gets the fixed-
+         assignment ownership rule (store holds object_lineage:<object>)
+         until Phase-3.5 anchor-map topology; foreign-anchored reads are
+         the owner's + the adopt CAS's job.
+      3. **Memory follows durable** — any throw out of a transaction
+         that already mutated the in-memory sequencer/view discards the
+         memory (rehydrate on next request); no phantom replies, no
+         lost redeliveries.
+      4. **Outbox liveness** — post-drain retry alarm (quiet scopes
+         deliver), alarm() kicks the drain, post-drain recheck loop for
+         mid-drain enqueues, `net_fanout_gap` metric on skipped seqs.
+      5. **Gateway turn edges** — accepted-commit install failures
+         return `install_degraded` (never 500), submit transport death
+         recovers via one same-key resubmit (CO2.5), selection pinned
+         per idempotency key (override + surface, never double-commit),
+         plain-Error escapes carry the attempt trace.
+      6. **planTurn snapshot** — one view.clone() before the first
+         await; reads/post-state/closure all from the same instant
+         (closes the version-laundering window; src/net change approved).
+      7. **Pull advances the fanout high-water** — seen[scope] =
+         max(seen, closure head) on /net/pull and every reseed; stale
+         pre-pull fanout rows no-op instead of regressing the view.
+      8. **Small hard edges** — alarm() PEEKS due turns (non-consuming
+         `peekDue`, approved src/net change): rows the shell cannot
+         execute stay PARKED, logged once per alarm-firing with a
+         "parked" note, and re-arm considers only FUTURE turns (no
+         tight loop); the parked rows drain when the Phase-3.5 executor
+         wires alarm-fired turns through submit(). WorkerdHost.setAlarm
+         captures arm failures (`net_alarm_arm_failed`); handleNetSmoke
+         caps its body read (readLimitedBody); WorkerdHost.alarms map
+         carries the post-eviction caveat comment.
+
 ## Phase 3 complete — exit-gate evidence
 
 - Fake-DO lane (real per-instance isolation): net-do, net-gateway-repair,

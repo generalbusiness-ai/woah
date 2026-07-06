@@ -363,7 +363,7 @@ export class NetScopeDO {
           this.store.writeMeta({ scope: seq.scope, catalog_epoch: seq.catalogEpoch, head: seq.head() });
         }
         this.discardSeqOnThrow(() => seq.schedule(body.turn, this.host.now()));
-        this.rearmAlarm(seq);
+        this.rearmAlarm(this.host.now());
         return json({ ok: true, next_alarm_at: seq.nextAlarmAt() });
       }
       return json({ error: `no such route: ${request.method} ${url.pathname}` }, 404);
@@ -378,10 +378,10 @@ export class NetScopeDO {
   /**
    * DO alarm wake (CO2.8). The sequencer rehydrates from durable state —
    * in-memory callbacks never survive eviction, which is exactly why the
-   * durable path re-derives everything here. Step 2 only OBSERVES fired
-   * turns (a woo.metric line each); planning/submitting the scheduled
-   * turn arrives with step-3 gateway machinery. Re-arming from
-   * nextAlarmAt() is unconditional: remaining parked turns must wake.
+   * durable path re-derives everything here. Phase 3 only OBSERVES fired
+   * turns (a woo.metric line each, rows left parked — fix 8a);
+   * planning/submitting the scheduled turn arrives with the Phase-3.5
+   * executor. Re-arming considers future turns and outbox retries.
    */
   async alarm(): Promise<void> {
     // Outbox liveness (fix 4a): a QUIET scope must still retry failed
@@ -400,7 +400,13 @@ export class NetScopeDO {
     }
     const seq = this.ensureSequencer(meta.scope, meta.catalog_epoch);
     const now = this.host.now();
-    for (const turn of this.discardSeqOnThrow(() => seq.dueTurns(now))) {
+    // Fix 8a: PEEK, never pop. The executor that could actually run
+    // these turns lands in Phase 3.5; destructively popping them here
+    // would delete parked work the wake-up cannot execute (CO2.8 broken
+    // silently). Each due turn logs once per alarm-firing with a note;
+    // the rows stay parked, and the re-arm below considers only FUTURE
+    // turns so overdue rows cannot spin the alarm in a tight loop.
+    for (const turn of seq.peekDue(now)) {
       console.log(
         "woo.metric",
         JSON.stringify({
@@ -409,11 +415,12 @@ export class NetScopeDO {
           id: turn.id,
           at_logical_time: turn.at_logical_time,
           fired_at: now,
+          note: "parked: turn executor lands in Phase 3.5; row retained",
           ts: Date.now()
         })
       );
     }
-    this.rearmAlarm(seq);
+    this.rearmAlarm(now);
   }
 
   /**
@@ -996,11 +1003,21 @@ export class NetScopeDO {
     }
   }
 
-  /** Always re-derive the wake-up from scope state (never from memory).
-   * Two keys feed the single storage alarm (WorkerdHost keeps the
-   * earliest): the scheduled-turn wake and the outbox retry (fix 4a). */
-  private rearmAlarm(seq: ScopeSequencer): void {
-    this.host.setAlarm(SCOPE_ALARM_KEY, seq.nextAlarmAt(), async () => {
+  /** Always re-derive the wake-up from DURABLE scope state (never from
+   * memory). Two keys feed the single storage alarm (WorkerdHost keeps
+   * the earliest): the scheduled-turn wake and the outbox retry (fix
+   * 4a). Only FUTURE turns arm the clock (fix 8a): overdue rows are
+   * parked observations until the Phase-3.5 executor drains them —
+   * arming for them would fire the alarm in a tight loop that can do
+   * no useful work. */
+  private rearmAlarm(now: number): void {
+    let nextFuture: number | null = null;
+    for (const turn of this.store.readScheduled()) {
+      if (turn.at_logical_time > now && (nextFuture === null || turn.at_logical_time < nextFuture)) {
+        nextFuture = turn.at_logical_time;
+      }
+    }
+    this.host.setAlarm(SCOPE_ALARM_KEY, nextFuture, async () => {
       // The durable wake path is alarm() above; this callback exists to
       // satisfy the Host contract and is not retained by WorkerdHost.
     });
