@@ -215,6 +215,12 @@ export class SqliteScopeStore implements ScopeStore {
 }
 
 const SCOPE_ALARM_KEY = "scope";
+const OUTBOX_ALARM_KEY = "outbox";
+
+/** Mirror of src/net/outbox.ts's default backoff, passed INTO the Outbox
+ * at drain time so the drain's skip-window and the alarm's retry-time
+ * computation (outboxNextRetryAt) can never drift apart. */
+const OUTBOX_BACKOFF_MS = (attempt: number): number => Math.min(30_000, 250 * 2 ** (attempt - 1));
 
 export class NetScopeDO {
   private readonly store: SqliteScopeStore;
@@ -223,6 +229,10 @@ export class NetScopeDO {
   /** One drain at a time; a re-kick while draining is dropped (the next
    * request or defer re-kicks — rows are durable, nothing is lost). */
   private draining = false;
+  /** Whether THIS lifetime armed the outbox retry alarm key (fix 4a);
+   * gates the clear so scopes with no outbox history never touch the
+   * storage alarm. Lost on eviction by design — see armOutboxRetryAlarm. */
+  private outboxAlarmArmed = false;
 
   constructor(
     private readonly state: NetScopeDurableState,
@@ -374,9 +384,17 @@ export class NetScopeDO {
    * nextAlarmAt() is unconditional: remaining parked turns must wake.
    */
   async alarm(): Promise<void> {
+    // Outbox liveness (fix 4a): a QUIET scope must still retry failed
+    // deliveries — this alarm is the retry engine when no request ever
+    // arrives to trigger drain-on-reactivation. The drain's own finally
+    // re-arms for the next backoff window if rows remain.
+    this.deferPendingDrain();
     const meta = this.store.readMeta();
     if (meta === null) {
       // Nothing durable names this scope — a spurious wake. Clear.
+      // (Outbox rows imply meta: they only exist after an accepted
+      // commit, whose write-through persists meta in the same
+      // transaction — so this clear cannot strand a retry.)
       await this.state.storage.deleteAlarm();
       return;
     }
@@ -716,7 +734,37 @@ export class NetScopeDO {
     if (this.draining) return;
     this.draining = true;
     try {
-      for (const route of ["/fanout", "/adopt"] as const) {
+      // Post-drain recheck (fix 4b): rows enqueued while a pass was in
+      // flight are invisible to that pass AND their enqueue-time defer
+      // no-ops on this.draining — without the recheck they would strand
+      // until the next request. Loop while a pass delivered something or
+      // fresh (never-attempted) pending rows appeared; a fresh row is
+      // attempted by the very next pass (its attempts becomes >= 1), so
+      // the loop is bounded even when every delivery fails.
+      for (;;) {
+        const delivered = await this.drainOutboxPass();
+        if (delivered > 0) continue;
+        const fresh = sqlRows<{ n: number }>(
+          this.state.storage.sql.exec(
+            "SELECT COUNT(*) AS n FROM net_scope_outbox WHERE status = 'pending' AND attempts = 0"
+          )
+        )[0];
+        if (!fresh || Number(fresh.n) === 0) break;
+      }
+    } finally {
+      this.draining = false;
+      // Outbox liveness (fix 4a): rows still pending after the drain
+      // (failed, waiting out backoff) arm the DO alarm for their
+      // earliest retry time, so a quiet scope with no further requests
+      // still delivers when the alarm fires.
+      this.armOutboxRetryAlarm();
+    }
+  }
+
+  /** One drain pass over both route lanes; returns delivered-row count. */
+  private async drainOutboxPass(): Promise<number> {
+    let deliveredCount = 0;
+    for (const route of ["/fanout", "/adopt"] as const) {
         const persisted = sqlRows<{
           id: string;
           destination: string;
@@ -730,7 +778,9 @@ export class NetScopeDO {
           )
         );
         if (persisted.length === 0) continue;
-        const outbox = new Outbox();
+        // Backoff injected explicitly so it stays in lockstep with the
+        // alarm's retry-time computation (see OUTBOX_BACKOFF_MS).
+        const outbox = new Outbox({ backoffMs: OUTBOX_BACKOFF_MS });
         const rows: FanoutRow[] = [];
         for (const p of persisted) {
           const row = outbox.enqueue(p.destination, JSON.parse(p.body) as FanoutBody);
@@ -766,6 +816,7 @@ export class NetScopeDO {
             throw err;
           }
         });
+        deliveredCount += drained.delivered.length;
         for (const failedId of drained.failed) {
           console.log(
             "woo.metric",
@@ -807,9 +858,50 @@ export class NetScopeDO {
             }
           }
         });
-      }
-    } finally {
-      this.draining = false;
+    }
+    return deliveredCount;
+  }
+
+  /**
+   * Earliest wall-clock time a pending outbox row becomes retryable
+   * (last_attempt_at_ms + backoff(attempts); a never-attempted row is
+   * due immediately). Null when nothing is pending.
+   */
+  private outboxNextRetryAt(): number | null {
+    const rows = sqlRows<{ attempts: number; last_attempt_at_ms: number | null }>(
+      this.state.storage.sql.exec(
+        "SELECT attempts, last_attempt_at_ms FROM net_scope_outbox WHERE status = 'pending'"
+      )
+    );
+    let earliest: number | null = null;
+    for (const row of rows) {
+      const at =
+        row.last_attempt_at_ms === null
+          ? this.host.now()
+          : Number(row.last_attempt_at_ms) + OUTBOX_BACKOFF_MS(Number(row.attempts));
+      if (earliest === null || at < earliest) earliest = at;
+    }
+    return earliest;
+  }
+
+  /**
+   * Arm (or clear) the outbox retry wake-up (fix 4a). Uses its own
+   * WorkerdHost alarm key so the storage alarm lands on the earlier of
+   * the scheduled-turn wake and the outbox retry. The clear only runs
+   * when THIS lifetime armed the key: after eviction the flag resets,
+   * and a stale storage alarm simply fires alarm(), which re-derives
+   * everything from durable state and no-ops harmlessly.
+   */
+  private armOutboxRetryAlarm(): void {
+    const at = this.outboxNextRetryAt();
+    if (at !== null) {
+      this.outboxAlarmArmed = true;
+      this.host.setAlarm(OUTBOX_ALARM_KEY, at, async () => {
+        // Durable wake path is the DO's alarm() handler (see rearmAlarm).
+      });
+    } else if (this.outboxAlarmArmed) {
+      this.outboxAlarmArmed = false;
+      this.host.setAlarm(OUTBOX_ALARM_KEY, null, async () => {});
     }
   }
 
@@ -904,12 +996,15 @@ export class NetScopeDO {
     }
   }
 
-  /** Always re-derive the wake-up from scope state (never from memory). */
+  /** Always re-derive the wake-up from scope state (never from memory).
+   * Two keys feed the single storage alarm (WorkerdHost keeps the
+   * earliest): the scheduled-turn wake and the outbox retry (fix 4a). */
   private rearmAlarm(seq: ScopeSequencer): void {
     this.host.setAlarm(SCOPE_ALARM_KEY, seq.nextAlarmAt(), async () => {
       // The durable wake path is alarm() above; this callback exists to
       // satisfy the Host contract and is not retained by WorkerdHost.
     });
+    this.armOutboxRetryAlarm();
   }
 }
 

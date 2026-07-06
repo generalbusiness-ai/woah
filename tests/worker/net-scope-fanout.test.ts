@@ -26,10 +26,12 @@ const ROOM_SCOPE = "room_w";
 const CLUSTER_SCOPE = "cluster_c";
 
 /** Fake DO state + alarm slice + waitUntil capture, so tests can await
- * the deferred outbox drains WorkerdHost hands to waitUntil. */
+ * the deferred outbox drains WorkerdHost hands to waitUntil. Armings
+ * are recorded (null = deleteAlarm) so tests can assert retry wake-ups. */
 function netState(name: string) {
   const fake = new FakeDurableObjectState(name);
   const deferred: Array<Promise<unknown>> = [];
+  const alarms: Array<number | null> = [];
   const state: NetScopeDurableState & NetGatewayDurableState = {
     id: fake.id,
     waitUntil: (promise: Promise<unknown>) => {
@@ -38,12 +40,17 @@ function netState(name: string) {
     storage: {
       sql: fake.storage.sql,
       transactionSync: fake.storage.transactionSync,
-      setAlarm: (_at: number) => {},
-      deleteAlarm: () => {}
+      setAlarm: (at: number) => {
+        alarms.push(at);
+      },
+      deleteAlarm: () => {
+        alarms.push(null);
+      }
     }
   };
   return {
     state,
+    alarms,
     /** Await every captured deferred task (including ones queued while
      * settling — a drain may be re-kicked). */
     settle: async () => {
@@ -288,6 +295,93 @@ describe("NetScopeDO fanout + rider adoption over fake-DO", () => {
     expect(outboxRows(room.state)).toEqual([]);
 
     room.close();
+    gatewayState.close();
+  });
+});
+
+// ---- Outbox liveness (Phase-3 hardening fix 4) ----------------------------
+describe("outbox liveness (fix 4)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("a quiet scope retries a failed delivery via the alarm (fix 4a): no further requests needed", async () => {
+    const gatewayState = netState("gateway-quiet-1");
+    const gatewayEnv: NetGatewayEnv = { WOO_INTERNAL_SECRET: SECRET };
+    const gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
+    const recorder = recordingStub(gateway);
+    const resolve = (destination: string) => {
+      if (destination === "gateway:g1") return recorder.stub;
+      throw new Error(`unexpected destination ${destination}`);
+    };
+
+    // Faulted fanout lane: the delivery fails, the row stays pending.
+    const room = netState(`scope-${ROOM_SCOPE}-quiet`);
+    const faultedEnv: NetScopeEnv = {
+      WOO_INTERNAL_SECRET: SECRET,
+      WOO_NET_FAULTS: JSON.stringify({ "/fanout": { error: "fanout lane down" } }),
+      NET_RESOLVE: resolve
+    };
+    const faultedDO = new NetScopeDO(room.state, faultedEnv);
+    await call(faultedDO, faultedEnv, "/seed", { scope: ROOM_SCOPE, catalog_epoch: EPOCH, cells: roomCells() });
+    await call(faultedDO, faultedEnv, "/subscribe", { destination: "gateway:g1" });
+    const head0 = (await call<{ head: ScopeHead }>(faultedDO, faultedEnv, "/head")).head;
+    expect((await call<CommitReply>(faultedDO, faultedEnv, "/submit", rideAlongSubmit(head0))).status).toBe("accepted");
+    await room.settle();
+
+    // The failed drain armed the DO alarm for the retry window — the
+    // quiet-scope liveness guarantee (no request will ever re-kick it).
+    expect(outboxRows(room.state)).toEqual([{ route: "/fanout", status: "pending", attempts: 1 }]);
+    const armed = room.alarms.filter((at): at is number => at !== null);
+    expect(armed.length).toBeGreaterThanOrEqual(1);
+    expect(armed[armed.length - 1]).toBeGreaterThan(0);
+
+    // "Eviction + alarm fire": a fresh DO over the same storage, fault
+    // gone, and ONLY the alarm handler runs — no fetch traffic at all.
+    await new Promise((resolveSleep) => setTimeout(resolveSleep, 300));
+    const healthyEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve };
+    const healthyDO = new NetScopeDO(room.state, healthyEnv);
+    await healthyDO.alarm();
+    await room.settle();
+
+    const delivered = recorder.calls.filter((c) => c.path === "/net/fanout");
+    expect(delivered).toHaveLength(1);
+    expect(outboxRows(room.state)).toEqual([]);
+
+    room.close();
+    gatewayState.close();
+  });
+
+  it("emits net_fanout_gap when a delivery skips a seq (fix 4c) and still applies it", async () => {
+    const metricLines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+      metricLines.push(args.map(String).join(" "));
+    });
+    const gaps = () => metricLines.filter((line) => line.includes("net_fanout_gap"));
+
+    const gatewayState = netState("gateway-gap-1");
+    const gatewayEnv: NetGatewayEnv = { WOO_INTERNAL_SECRET: SECRET };
+    const gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
+
+    const bodyAt = (seq: number) => ({
+      scope: ROOM_SCOPE,
+      seq,
+      cells: [],
+      observations: []
+    });
+    // seq 1 from a fresh receiver: contiguous (expected 1), no gap.
+    expect((await call<{ applied: boolean }>(gateway, gatewayEnv, "/fanout", bodyAt(1))).applied).toBe(true);
+    expect(gaps()).toHaveLength(0);
+    // seq 3 skips 2: named divergence, applied anyway (idempotent-by-seq
+    // receivers deliberately apply ahead of a hole).
+    expect((await call<{ applied: boolean }>(gateway, gatewayEnv, "/fanout", bodyAt(3))).applied).toBe(true);
+    expect(gaps()).toHaveLength(1);
+    expect(gaps()[0]).toContain('"expected":2');
+    expect(gaps()[0]).toContain('"got":3');
+    // The late seq 2 no-ops below the high-water — and is NOT a gap.
+    expect((await call<{ applied: boolean }>(gateway, gatewayEnv, "/fanout", bodyAt(2))).applied).toBe(false);
+    expect(gaps()).toHaveLength(1);
+
     gatewayState.close();
   });
 });

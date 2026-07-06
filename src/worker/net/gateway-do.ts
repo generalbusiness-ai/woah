@@ -586,6 +586,18 @@ export class NetGatewayDO {
   /** CO2.5 receiver idempotency + copy-#2 persistence, one transaction. */
   private receiveFanout(body: FanoutBody): boolean {
     const view = this.ensureView();
+    // Receiver contiguity (fix 4c): applyFanout is idempotent by seq but
+    // deliberately applies AHEAD of a hole (a sender's earlier row may
+    // have abandoned). A skipped seq is a named divergence (CO6) — count
+    // it before applying. Whether to reseed on a gap is Phase-3.5
+    // policy; the metric is the discipline now.
+    const last = this.seen.get(body.scope) ?? 0;
+    if (body.seq > last + 1) {
+      console.log(
+        "woo.metric",
+        JSON.stringify({ kind: "net_fanout_gap", scope: body.scope, expected: last + 1, got: body.seq, ts: Date.now() })
+      );
+    }
     return this.discardViewOnThrow(() =>
       this.state.storage.transactionSync(() => {
         const applied = applyFanout(view, this.seen, body);
