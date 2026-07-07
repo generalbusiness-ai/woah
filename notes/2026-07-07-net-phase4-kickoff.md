@@ -74,7 +74,22 @@ localdev/browser parity lanes.
       mismatch (a fresh accept always digest-matches its own plan)
       omits them and marks `replayed: true` instead of presenting the
       re-planned execution as the committed one.
-- [ ] 2. /net-api REST surface + client auth + session requirement
+- [x] 2. /net-api REST surface + client auth + session requirement —
+      worker entry routes `/net-api/*` to ONE stable GATEWAY_NET shard
+      (`net-api`; mint and turn must share a view — hash-sharding by
+      session id waits on a session→cluster pull-on-miss story), public
+      body cap, no internal signing. The gateway authenticates
+      `apikey:<id>:<secret>` against `property_cell:$system:api_keys`
+      (pull-on-miss; core's scheme mirrored in
+      src/worker/net/client-auth.ts), 401 E_NOSESSION refusals name
+      their verdicts. `/net-api/turn` requires + validates the session
+      cell (actor bound to the authenticated key) and runs
+      route:sequenced; planningScope = scopeOf(session.activeScope ∥
+      actor live location ∥ actor), convention pulls `cluster:<actor>` /
+      `room:<anchor>` on miss. Spec: CO14 `/net-api` bullet. Lane: the
+      workerd smoke now drives the client surface through the worker
+      entry (auth refusal, mint, sessioned turn with
+      result/observations, roster read from the subscribed mirror).
 - [ ] 3. WS + observation push via session_presence
 - [ ] 4. client feed + echo overlay + framework adapter
 - [ ] 5. e2e + cross-user fix + lane extension

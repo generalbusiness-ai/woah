@@ -437,10 +437,18 @@ One write path per fact (CO9), concretized:
   repair path, bounded by scope size — CO11.1). A multi-scope rebuild
   drops candidates whose owner is anchored elsewhere: those rows belong
   at the owning scope, and a local copy would be the CO9 dual write.
-- **The gateway mirror** is fed only by `FanoutBody.relations` (a
-  commit's local deltas, or a `/net/relate` refan) under the same
-  per-scope seq high-water that gates cells; `GET /net/relation
-  ?relation=&owner=` is the client-read primitive for who/contents.
+- **The gateway mirror** is fed by `FanoutBody.relations` (a commit's
+  local deltas, or a `/net/relate` refan) under the same per-scope seq
+  high-water that gates cells, plus one coherence companion: a FULL
+  closure (`keys: ["*"]` — the pull/reseed path) carries the scope's
+  relation rows, upserted in the same transaction that advances the
+  high-water. Required because a pull supersedes earlier fanout rows by
+  seq — without the rows riding the closure, a pull would silently
+  starve the mirror of everything those deliveries carried. Upsert-only:
+  a row deleted at the authority while the gateway was unsubscribed
+  lingers until a later remove delta heals it; a fresh shard's mirror is
+  exact. `GET /net/relation?relation=&owner=` is the client-read
+  primitive for who/contents.
 - **Fanout audiences** are computed from the `session_presence` relation
   (owner = the space, members = live sessions) — CO2.7's
   "O(distinct occupant shards)" gets its production definition here.
@@ -479,10 +487,47 @@ One write path per fact (CO9), concretized:
   terminal-failing. Ownership witness: the scope holds the cell AND it
   is not CA3 rider residue. Sessions absent entirely → allowed only for
   direct-route turns (lane/tooling submits); a sequenced turn must name
-  a session, and Phase-4 transports will require sessions on all
-  client-originated turns. Credential authentication against identity
-  cells in the catalog scope closure (CO15) is the Phase-4 transport
-  story in front of `/net/session-open`.
+  a session, and the Phase-4 client surface requires sessions on all
+  client-originated turns (next bullet). Credential authentication
+  against identity cells in the catalog scope closure (CO15) is the
+  Phase-4 transport in front of `/net/session-open` — implemented as
+  `/net-api` (below).
+- **The `/net-api` client surface (implemented — Phase 4 item 2).** The
+  worker entry routes `/net-api/*` to ONE stable GATEWAY_NET shard
+  (`net-api`): a session cell installs into the MINTING gateway's
+  derived view and `/net-api/turn` validates the session from that same
+  view, so mint and turn must land on the same DO; hash-sharding by
+  session id waits on a session→cluster pull-on-miss story (session ids
+  carry no lineage). No internal signing rides this path — the gateway
+  authenticates the client credential itself: `authorization: Bearer
+  apikey:<id>:<secret>` (or `x-woo-api-key`) verified against the
+  catalog identity cell `property_cell:$system:api_keys` (pull-on-miss
+  from the catalog scope), with core's exact salt/hash scheme
+  reimplemented in `src/worker/net/client-auth.ts` (never an engine
+  import); refusals are named 401 `E_NOSESSION` verdicts.
+  - `POST /net-api/session {ttl_ms?}` derives the actor's cluster from
+    view lineage (CO15; convention pull `cluster:<actor>` on miss) and
+    mints through `/net/session-open`'s machinery.
+  - `POST /net-api/turn {target, verb, args?, session, idempotency_key?}`
+    REQUIRES a session (`session_required` without one) and validates
+    the named session cell — presence, expiry, and actor binding to the
+    AUTHENTICATED apikey actor — before planning; the turn then runs
+    route:`sequenced` so the committing scope's authorize revalidates
+    end-to-end (the gateway authenticates; scopes authorize).
+  - **planningScope from the session cell:** the anchor object is the
+    session's `activeScope` when set, else the actor's live location
+    from the view, else the actor itself; the anchor classifies through
+    view lineage (CO15 walk; convention pull `room:<anchor>` on miss),
+    falling back to the actor's cluster when it cannot classify.
+  - Accepted turn replies carry the planned transcript's `result`,
+    `error`, and `observations` (the gateway holds the planned
+    transcript; `error` matters because an errored verb still commits
+    its complete transcript — without the field an accepted no-op is
+    indistinguishable from success). A replay detected by post-state
+    digest mismatch omits them and marks `replayed: true` (a fresh
+    accept always digest-matches its plan).
+  - `GET /net-api/relation` / `GET /net-api/cell` are the authenticated
+    client reads over the CO13 roster mirror and the view cell probe.
 - **Every planned submit carries its session read** (folded in by
   `plan.ts` when the engine transcript lacks it — the engine cannot
   record session-kind cells), versioned through the plan snapshot, so

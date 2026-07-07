@@ -107,6 +107,11 @@ async function main(): Promise<number> {
     // The annex refans the CO14 presence delta (delivered via /net/relate)
     // to ITS subscribers — the gateway must subscribe there too.
     await post(base, "scope", ANNEX, "subscribe", { destination: `gateway:${GATEWAY}` });
+    // Phase-4 client surface: the worker entry routes /net-api/* to the
+    // stable `net-api` gateway shard; subscribing that shard to the ROOM
+    // feeds its relation mirror (the client roster read below) with the
+    // cross-scope move's contents refan.
+    await post(base, "scope", ROOM, "subscribe", { destination: "gateway:net-api" });
     step("seed 4 partitions + subscribe room/annex + pull 4", true);
 
     // Warm derived-topology turns: the CO10 structure gate at lane
@@ -231,6 +236,69 @@ async function main(): Promise<number> {
     });
     step("session cell committed at its cluster authority with the transitioned scope", transitionedSession !== null);
 
+    // ---- Phase-4 client surface: /net-api over the WORKER ENTRY (not
+    // the /net-smoke doorway — no internal signing anywhere on this
+    // path). Apikey auth against the catalog identity cell (pulled on
+    // miss by the fresh `net-api` shard), session mint, a sessioned turn
+    // returning the item-1 result/observations, and the authenticated
+    // roster read served from the shard's fanout-fed mirror.
+    const clientHeaders = { "content-type": "application/json", authorization: "Bearer apikey:lane-key:lane-secret" };
+    const authFail = await fetch(`${base}/net-api/session`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer apikey:lane-key:wrong" },
+      body: "{}"
+    });
+    step("client surface refuses a bad apikey secret (401 E_NOSESSION)", authFail.status === 401, `status=${authFail.status}`);
+    const mintRes = await fetch(`${base}/net-api/session`, {
+      method: "POST",
+      headers: clientHeaders,
+      body: JSON.stringify({ ttl_ms: 600_000 })
+    });
+    const mintBody = (await mintRes.json()) as { session?: string; actor?: string };
+    step(
+      "client session minted over /net-api",
+      mintRes.status === 200 && typeof mintBody.session === "string" && mintBody.actor === fixture.actor,
+      `status=${mintRes.status}`
+    );
+    const noSession = await fetch(`${base}/net-api/turn`, {
+      method: "POST",
+      headers: clientHeaders,
+      body: JSON.stringify({ target: "lane_client_box", verb: "click" })
+    });
+    step("session-less client turn refused (CO14 session_required)", noSession.status === 401, `status=${noSession.status}`);
+    const clickRes = await fetch(`${base}/net-api/turn`, {
+      method: "POST",
+      headers: clientHeaders,
+      body: JSON.stringify({ target: "lane_client_box", verb: "click", session: mintBody.session })
+    });
+    const clickBody = (await clickRes.json()) as {
+      reply?: { status?: string };
+      result?: unknown;
+      observations?: Array<{ type?: string }>;
+    };
+    step(
+      "sessioned client turn commits with result + observations on the reply",
+      clickRes.status === 200 &&
+        clickBody.reply?.status === "accepted" &&
+        clickBody.result === 1 &&
+        (clickBody.observations ?? []).some((o) => o.type === "clicked"),
+      `status=${clickRes.status} body=${JSON.stringify({ reply: clickBody.reply?.status, result: clickBody.result, error: (clickBody as { error?: unknown }).error })}`
+    );
+    // The cross-scope move step related the actor into the room's
+    // contents; that row reaches the `net-api` shard either by refan
+    // (subscribed above) or riding the client turn's warm pull (full
+    // closures carry relation rows — the CO13 pull coherence rule), so
+    // the authenticated roster read shows it.
+    const clientRoster = await poll(async () => {
+      const res = await fetch(`${base}/net-api/relation?relation=contents&owner=${encodeURIComponent("net_lane_room")}`, {
+        headers: { authorization: "Bearer apikey:lane-key:lane-secret" }
+      });
+      if (res.status !== 200) return null;
+      const body = (await res.json()) as { members?: Array<{ member: string }> };
+      return body.members?.some((m) => m.member === fixture.actor) ? body : null;
+    });
+    step("authenticated roster read over /net-api shows the room contents", clientRoster !== null);
+
     // CO16 scheduled-turn execution end-to-end via a REAL workerd alarm:
     // the gateway registers as PLANNER on the room; the alarm moves the
     // due bump turn through the durable outbox to /net/plan-scheduled;
@@ -340,6 +408,37 @@ async function buildFixture() {
   const welcomeVerb = world.object("net_lane_annex").verbs.find((verb) => verb.name === "welcome");
   if (!welcomeVerb) throw new Error("fixture welcome verb missing after install");
   welcomeVerb.skip_presence_check = true;
+  // Phase-4 client surface (/net-api): an apikey minted into
+  // $system.api_keys via the same wizard path localdev bootstrap uses;
+  // partitionCells carries the identity cell to the CATALOG partition
+  // naturally ($-prefix rule), where the client gateway pulls it on miss.
+  world.ensureApiKey("$wiz", actor, "lane-key", "lane-secret", "net-lane-client");
+  // A dedicated ROOM-anchored target for the client turn. Engine
+  // semantics (the CO14 hydration caveat): a sequenced move is a SESSION
+  // transition, never an object_live write — so even after the lane's
+  // session turn "enters" the annex on session lane-s2, the actor's
+  // object_live location stays the genesis room, and the client's FRESH
+  // session hydrates there. The client turn therefore targets a box in
+  // the room, where its session actually is.
+  world.createObject({ id: "lane_client_box", name: "Lane Client Box", parent: "$thing", owner: actor, anchor: "net_lane_room", location: "net_lane_room" });
+  // The client actor STANDS in the room (realistic client scenario: you
+  // click things where you are). Located-elsewhere targeting is a
+  // Phase-4 non-goal; the recovery loop only probes scopes derivable
+  // from the actor/session/conventions (Big-World: no scope scans).
+  await world.moveObject(actor, "net_lane_room");
+  world.defineProperty("lane_client_box", { name: "clicks", defaultValue: 0, owner: actor, perms: "rw", typeHint: "int" });
+  const clickInstalled = installVerb(
+    world,
+    "lane_client_box",
+    "click",
+    `verb :click() rxd {
+      this.clicks = this.clicks + 1;
+      observe({ type: "clicked", clicks: this.clicks });
+      return this.clicks;
+    }`,
+    null
+  );
+  if (!clickInstalled.ok) throw new Error(`fixture click install failed: ${JSON.stringify(clickInstalled)}`);
   // Genesis placement: the actor occupies the lane room, so its presence
   // rows land in the room partition (genesis state, not under test).
   const placed = await world.directCall("lane-genesis-place", actor, actor, "moveto", ["net_lane_room"], { sessionId: session.id });

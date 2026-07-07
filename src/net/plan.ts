@@ -33,6 +33,7 @@ import {
   type ShadowTurnCall
 } from "./bridge";
 import { CellStore, cellKey, cellVersion, serializeTransfer, type Cell, type EpochStamp } from "./cells";
+import { isNetError, netError } from "./errors";
 import { selectCommitScope, type ScopeClassifier, type ScopeSelection } from "./route";
 import type { CommitSubmit, ScopeHead } from "./scope";
 import { sessionWriter } from "./sessions";
@@ -95,7 +96,28 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
   // Sparse execution against the snapshot's cells only (plus the caller's
   // counters for creates — see PlanTurnInput.counters).
   const world = planningWorldFromCells(storeCells(snapshot), input.counters);
-  const run = await runShadowTurnCallTranscript(world, call);
+  let run;
+  try {
+    run = await runShadowTurnCallTranscript(world, call);
+  } catch (err) {
+    // CO2.6/VTN10.1 at the planner boundary: under SPARSE execution a
+    // lookup miss for an object the view simply does not hold must
+    // surface as repairable E_MISSING_STATE, never as the engine's
+    // semantic E_OBJNF/E_VERBNF (plain thrown objects that no repair
+    // loop can act on). Only a view that HOLDS the object's lineage may
+    // report semantic absence — then the engine's verdict stands.
+    throw translateSparsePlanningThrow(err, snapshot, call);
+  }
+
+  // CO2.6 second half: the engine RECORDS dispatch failures in the
+  // transcript (error field) rather than throwing — a recorded
+  // E_OBJNF/E_VERBNF whose subject cells are absent from the view is the
+  // same sparse miss as a thrown one, and submitting it would durably
+  // commit a failed turn the repair loop could have converged. Only when
+  // the view HOLDS the named page is the failure semantic (a real
+  // verb-not-found is a legitimate committed outcome).
+  const recordedMiss = sparseMissFromRecordedError(run.transcript, snapshot);
+  if (recordedMiss) throw recordedMiss;
 
   // CO14: every planned submit carries its session read (and a
   // transition-carrying turn folds the session-cell write) BEFORE scope
@@ -274,4 +296,93 @@ function readClosureCells(
   }
 
   return [...keys].sort().map((key) => view.get(key) as Cell);
+}
+
+/**
+ * CO2.6/VTN10.1 translation for sparse planning (see the call site): an
+ * engine throw whose subject object is simply not materialized in the
+ * planning view becomes repairable E_MISSING_STATE naming the missing
+ * lineage/live keys, so the gateway repair loop fetches the closure and
+ * re-plans. A view that HOLDS the subject's lineage lets the engine
+ * verdict stand (semantic absence), rethrown as a legible Error carrying
+ * the engine code — never as an opaque [object Object].
+ */
+function translateSparsePlanningThrow(err: unknown, view: CellStore, call: ShadowTurnCall): unknown {
+  if (isNetError(err)) return err;
+  const woo = err as { code?: unknown; message?: unknown; value?: unknown } | null;
+  const code = typeof woo?.code === "string" ? woo.code : null;
+  if (code === "E_OBJNF" || code === "E_VERBNF" || code === "E_NEED_STATE") {
+    const missing = sparseMissingKeys(code, woo?.value, view, call);
+    if (missing.length > 0) {
+      return netError("E_MISSING_STATE", `sparse planning miss (${code}) — view lacks the subject's cells`, {
+        engine_code: code,
+        missing
+      });
+    }
+  }
+  if (code) {
+    // Semantic absence (or an engine failure) with the subject present:
+    // terminal, but legible — the engine code and message survive.
+    return new Error(`planning failed: ${code}${typeof woo?.message === "string" ? ` ${woo.message}` : ""}`);
+  }
+  return err instanceof Error ? err : new Error(`planning failed: ${JSON.stringify(err)}`);
+}
+
+/** The recorded-error twin of translateSparsePlanningThrow (see the call
+ * site): a completed transcript whose error names cells the view lacks. */
+function sparseMissFromRecordedError(transcript: EffectTranscript, view: CellStore): unknown | null {
+  const error = transcript.error as { code?: unknown; value?: unknown; trace?: Array<{ obj?: unknown }> } | undefined;
+  const code = typeof error?.code === "string" ? error.code : null;
+  if (code !== "E_OBJNF" && code !== "E_VERBNF" && code !== "E_PROPNF") return null;
+  // E_PROPNF's value is the property NAME; the failing frame's `obj`
+  // rides in the trace — reshape into the {obj, name} form the shared
+  // derivation understands.
+  const value =
+    code === "E_PROPNF" && typeof error?.value === "string" && typeof error?.trace?.[0]?.obj === "string"
+      ? { obj: error.trace[0].obj, name: error.value }
+      : error?.value;
+  const missing = sparseMissingKeys(code, value, view, transcript.call as { target?: string; actor?: string });
+  if (missing.length === 0) return null;
+  return netError("E_MISSING_STATE", `sparse planning miss (recorded ${code}) — view lacks the subject's cells`, {
+    engine_code: code,
+    missing
+  });
+}
+
+/** Missing-cell derivation shared by the thrown and recorded paths:
+ * lineage+live for unmaterialized subjects; the specific verb page for a
+ * verb miss whose object IS materialized (dispatch found the object but
+ * not the page — inherited verbs resolve through the class chain, which
+ * is receiver-known catalog closure and already in view). */
+function sparseMissingKeys(
+  code: string,
+  value: unknown,
+  view: CellStore,
+  call: { target?: string; actor?: string }
+): string[] {
+  const missing = new Set<string>();
+  const verbMiss = value as { obj?: unknown; name?: unknown } | null;
+  if (code === "E_VERBNF" && typeof verbMiss?.obj === "string" && typeof verbMiss?.name === "string") {
+    if (!view.has(cellKey("verb_bytecode", verbMiss.obj, verbMiss.name))) {
+      missing.add(cellKey("verb_bytecode", verbMiss.obj, verbMiss.name));
+    }
+  }
+  if (code === "E_PROPNF" && typeof verbMiss?.obj === "string" && typeof verbMiss?.name === "string") {
+    if (!view.has(cellKey("property_cell", verbMiss.obj, verbMiss.name))) {
+      missing.add(cellKey("property_cell", verbMiss.obj, verbMiss.name));
+    }
+  }
+  const refs = [
+    typeof value === "string" ? value : null,
+    typeof verbMiss?.obj === "string" ? verbMiss.obj : null,
+    call.target ?? null,
+    call.actor ?? null
+  ].filter((ref): ref is string => typeof ref === "string" && ref.length > 0);
+  for (const ref of refs) {
+    if (!view.has(cellKey("object_lineage", ref))) {
+      missing.add(cellKey("object_lineage", ref));
+      missing.add(cellKey("object_live", ref));
+    }
+  }
+  return [...missing];
 }

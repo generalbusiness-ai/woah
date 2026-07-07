@@ -776,7 +776,10 @@ export class NetScopeDO {
    * ships nothing: at the receiver, absence after an accepted commit
    * means the cell was deleted.
    */
-  private closure(keys: string[], known: string[]): CellTransfer & { scope: string; head: ScopeHead; catalog_epoch: string } {
+  private closure(
+    keys: string[],
+    known: string[]
+  ): CellTransfer & { scope: string; head: ScopeHead; catalog_epoch: string; relations?: RelationRow[] } {
     const seq = this.ensureSequencer();
     const store = seq.store;
     const wantAll = keys.length === 1 && keys[0] === "*";
@@ -821,7 +824,25 @@ export class NetScopeDO {
       .map((cell) => (riderCache.has(cell.key) ? { ...cell, provenance: "derived" as const } : cell))
       .sort((a, b) => a.key.localeCompare(b.key));
     const transfer = serializeTransfer(outCells, knownSet);
-    return { ...transfer, scope: seq.scope, head: seq.head(), catalog_epoch: seq.catalogEpoch };
+    // CO13: a FULL closure carries the scope's relation rows too. A
+    // gateway pull advances its fanout high-water to this head (fix 7),
+    // which makes any earlier relation fanout/refan no-op at the
+    // receiver — without the rows riding here, a pull would silently
+    // starve the mirror of every roster row the superseded fanout
+    // carried. Targeted closures skip them: they never advance the
+    // high-water. Sorted for a deterministic transfer.
+    const relations = wantAll
+      ? [...seq.relations().values()].sort((a, b) =>
+          relationKey(a.relation, a.owner, a.member).localeCompare(relationKey(b.relation, b.owner, b.member))
+        )
+      : undefined;
+    return {
+      ...transfer,
+      scope: seq.scope,
+      head: seq.head(),
+      catalog_epoch: seq.catalogEpoch,
+      ...(relations !== undefined ? { relations } : {})
+    };
   }
 
   /** Keys in the rider residue ledger (see the constructor comment),

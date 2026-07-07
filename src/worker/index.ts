@@ -1,6 +1,9 @@
 // Worker entry — splits routing between Durable Objects and Workers Assets.
 //
 // Global API, /healthz, /v2/turn-network/ws      → world/gateway DO.
+// /net-api/*  (Phase-4 client surface)           → GATEWAY_NET stable shard
+//                                                  (client-credentialed; see
+//                                                  handleNetApi).
 // Object REST calls and reads                    → Directory-resolved host DO
 //                                                  (calls/Y formerly forced
 //                                                  to world; see /api/objects
@@ -73,6 +76,17 @@ export default {
     // from any other unknown route.
     if (url.pathname.startsWith("/net-smoke/")) {
       return handleNetSmoke(request, env, url);
+    }
+
+    // Plan 002 Phase 4 item 2: the coherence layer's PRODUCTION client
+    // surface. UNLIKE /net-smoke this is NOT gated on WOO_AE_DATASET —
+    // it carries client credentials (apikey verified by the gateway DO
+    // against the catalog identity cell), and no internal signature is
+    // minted here, so the DO's /net-api handler trusts nothing about
+    // this hop (sanitizePublicHeaders already stripped any injected
+    // internal headers above).
+    if (url.pathname.startsWith("/net-api/")) {
+      return handleNetApi(request, env, url);
     }
 
     if (request.method === "POST" && url.pathname === "/api/auth") {
@@ -488,6 +502,48 @@ export function cleanInternalHeaders(input: Headers): Headers {
 function sanitizePublicHeaders(request: Request): Request {
   const headers = cleanInternalHeaders(request.headers);
   return new Request(request, { headers });
+}
+
+/** The one GATEWAY_NET shard serving the whole /net-api client surface.
+ *
+ * Sharding decision (Phase 4 item 2, documented): ONE stable shard for
+ * now. A session cell installs into the MINTING gateway's derived view,
+ * and /net-api/turn validates the session from that same view — so mint
+ * and turn must land on the same DO. Hash-sharding by session id (the v2
+ * MCP idiom, forwardToMcpGateway above) needs a session→cluster
+ * resolution story first (session ids carry no lineage, CO14), so a
+ * non-minting shard could pull the cell on miss; that lands with the
+ * Phase-4/5 scale work, not here. */
+const NET_API_GATEWAY_SHARD = "net-api";
+
+/**
+ * Phase-4 client surface: forward /net-api/* to the stable GATEWAY_NET
+ * shard. The gateway DO authenticates the client credential itself; this
+ * hop only enforces the public JSON body cap (the same idiom as every
+ * public route) and never signs the request.
+ */
+async function handleNetApi(request: Request, env: Env, url: URL): Promise<Response> {
+  const netEnv = env as unknown as NetBindingsEnv;
+  let stub;
+  try {
+    stub = resolveNetDestination(netEnv, `gateway:${NET_API_GATEWAY_SHARD}`);
+  } catch (err) {
+    return jsonResponse({ error: { code: "E_INTERNAL", message: errorMessage(err) } }, 500);
+  }
+  const target = new URL(`https://do${url.pathname}`);
+  target.search = url.search;
+  // An exception escaping the DO's fetch propagates as a THROW from
+  // stub.fetch here (workerd semantics) — without this guard the client
+  // sees an opaque runtime 500 with a non-JSON body. Normalize it.
+  try {
+    if (request.method === "GET") {
+      return await stub.fetch(new Request(target, { headers: request.headers }));
+    }
+    const body = await readLimitedBody(request);
+    return await stub.fetch(new Request(target, { method: request.method, headers: request.headers, body }));
+  } catch (err) {
+    return errorResponseFor(err);
+  }
 }
 
 /**
