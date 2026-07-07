@@ -402,7 +402,12 @@ describe("NetGatewayDO end-to-end over fake-DO", () => {
       planningScope: "room-a",
       catalog_epoch: EPOCH,
       idempotency_key: "gw-turn-1",
-      scopes: { "room-a": "scope:room-a" }
+      scopes: { "room-a": "scope:room-a" },
+      // Lane override (deprecated for production — CO15): the hand-built
+      // seedCells fixture is not a derivable topology; keep the legacy
+      // classifier. Derived-topology turns are covered by
+      // tests/worker/net-topology-turn.test.ts.
+      shared: ["room-a"]
     }).catch((err) => ({ reply: { status: "rejected" } as CommitReply, selection: { scope: "err" }, err: String(err) }));
     // A verb miss in a sparse view surfaces as a taxonomy/E_VERBNF-shaped
     // error, not a crash — either way the plumbing responded coherently.

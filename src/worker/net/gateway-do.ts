@@ -22,18 +22,21 @@
  *                         ceiling; terminal verdicts and budget
  *                         exhaustion surface with the attempt trace
  *
- * The /net/turn classifier inputs (`anchors`, `shared`) ride on the
- * request in step 2 because the gateway does not yet derive anchoring
- * from lineage cells — that arrives with the step-3 gateway machinery.
+ * Topology (Plan 002 Phase 3.5 item 2, CO15): the gateway derives its
+ * classifier from the VIEW's lineage cells (topology.ts anchor walk) and
+ * maps scope names to rpc destinations by convention (`scope:<name>` —
+ * the DO namespace key IS the scope name). Request-supplied `anchors`/
+ * `shared`/`scopes` remain as lane/test overrides only.
  *
  * This class sits beside the v2 DO classes and shares nothing with them;
  * nothing routes production traffic here until Phase 5.
  */
-import { CellStore, type Cell } from "../../net/cells";
+import { CellStore, cellKey, type Cell } from "../../net/cells";
 import { budgetExhausted, isNetError, type AttemptTraceEntry, type NetErrorCode } from "../../net/errors";
 import { applyFanout, type FanoutBody } from "../../net/outbox";
 import { planTurn, type PlanTurnInput, type PlanTurnResult } from "../../net/plan";
 import type { ScopeClassifier } from "../../net/route";
+import { CATALOG_SCOPE, classifierFromLineage, type AnchorLineage } from "../../net/topology";
 import type { CommitReply, CommitSubmit, RejectReason, ScopeHead } from "../../net/scope";
 import { netCellKeyFor } from "../../net/transcript";
 import type { CellTransfer } from "../../net/cells";
@@ -96,8 +99,19 @@ type TurnRequest = {
   planningScope: string;
   catalog_epoch: string;
   idempotency_key: string;
-  /** scope → rpc destination (e.g. "scope:the_room"). */
-  scopes: Record<string, string>;
+  /** DEPRECATED-FOR-PRODUCTION topology overrides (lane/test fixtures
+   * only — CO15 forbids request-supplied topology on the production
+   * path). When ALL THREE are absent the gateway derives everything:
+   * the classifier from the view's lineage cells (topology.ts anchor
+   * walk) and each scope's rpc destination by the `scope:<scopeName>`
+   * convention — the DO namespace key IS the scope name
+   * (resolveNetDestination is unchanged; it splits on the first ':').
+   * Presence of `anchors` or `shared` switches the whole classifier to
+   * the legacy request-supplied one — the two sources are never mixed,
+   * so a fixture cannot half-override the derivation. */
+  /** scope → rpc destination override (e.g. "scope:the_room"). Absent
+   * entries fall back to the `scope:<scopeName>` convention. */
+  scopes?: Record<string, string>;
   /** object → owning scope; objects absent here anchor to planningScope. */
   anchors?: Record<string, string>;
   /** which scopes are shared sequencers (rooms); others are clusters. */
@@ -335,11 +349,61 @@ export class NetGatewayDO {
     }
   }
 
+  /**
+   * The turn's ScopeClassifier (CO15). Production path: derived from the
+   * VIEW's lineage cells via the topology.ts anchor walk — never from
+   * request-supplied topology. The lookup reads the live view store, so
+   * a classifier built after a refresh sees the refreshed lineage; the
+   * fallback covers objects with no lineage cell yet (same-turn creates),
+   * mirroring the legacy `?? planningScope` rule.
+   *
+   * Lane/test override: presence of `anchors` OR `shared` selects the
+   * legacy request-supplied classifier wholesale (never mixed with the
+   * derivation — a fixture cannot half-override CO15).
+   */
+  private classifierFor(request: TurnRequest, view: CellStore): ScopeClassifier {
+    if (request.anchors !== undefined || request.shared !== undefined) {
+      return {
+        scopeOf: (object) => request.anchors?.[object] ?? request.planningScope,
+        isShared: (scope) => (request.shared ?? [request.planningScope]).includes(scope)
+      };
+    }
+    return classifierFromLineage(
+      (object) => (view.get(cellKey("object_lineage", object))?.value as AnchorLineage | undefined) ?? null,
+      { fallback: request.planningScope }
+    );
+  }
+
+  /** Scope name → rpc destination. Convention: `scope:<scopeName>` (the
+   * DO namespace key IS the scope name — CO15); a request `scopes` entry
+   * overrides it (lane fixtures wiring fake stubs). */
+  private destinationFor(request: TurnRequest, scope: string): string {
+    return request.scopes?.[scope] ?? `scope:${scope}`;
+  }
+
+  /**
+   * The catalog scope's lineage keys held by this view (CO15): the
+   * shared substrate is universally receiver-known in transfers, so the
+   * planner's read closure never reships class chains. An unclassifiable
+   * lineage cell (mid-walk gap during a partial refresh) simply ships —
+   * the known-set is an envelope optimization and must never fail a plan.
+   * Under the legacy override classifier no scope is ever "catalog", so
+   * the set is empty and legacy envelopes are unchanged.
+   */
+  private catalogKnownKeys(view: CellStore, classifier: ScopeClassifier): Set<string> {
+    const known = new Set<string>();
+    for (const key of view.keys()) {
+      if (!key.startsWith("object_lineage:")) continue;
+      try {
+        if (classifier.scopeOf(objectOfCellKey(key)) === CATALOG_SCOPE) known.add(key);
+      } catch {
+        // Unclosed walk: leave the key out; the cell ships normally.
+      }
+    }
+    return known;
+  }
+
   private async turnAttempts(request: TurnRequest, trace: AttemptTraceEntry[]): Promise<TurnResult> {
-    const classifier: ScopeClassifier = {
-      scopeOf: (object) => request.anchors?.[object] ?? request.planningScope,
-      isShared: (scope) => (request.shared ?? [request.planningScope]).includes(scope)
-    };
     const startedAt = this.host.now();
     const deadline = startedAt + REPAIR_BUDGET_MS;
     // stale_head resubmit carry-over: when only the base was stale the
@@ -354,8 +418,11 @@ export class NetGatewayDO {
       const elapsed = () => this.host.now() - startedAt;
       // Re-acquire the view per attempt (fix 3): a failed durable write in
       // a prior round discarded this.view; the loop must plan against the
-      // rehydrated store, never a detached one.
+      // rehydrated store, never a detached one. The classifier rebuilds
+      // with it (CO15: it is a function of the view's lineage cells, and
+      // a recovery may have refreshed them).
       const view = this.ensureView();
+      const classifier = this.classifierFor(request, view);
 
       // ---- Plan (or adopt the stale_head resubmit).
       let planned: PlanTurnResult;
@@ -371,9 +438,7 @@ export class NetGatewayDO {
           if (isNetError(err) && err.code === "E_MISSING_STATE") {
             const missing = Array.isArray(err.detail.missing) ? (err.detail.missing as string[]) : [];
             trace.push({ attempt, code: "E_MISSING_STATE", missing, elapsed_ms: elapsed() });
-            await this.tryRecovery(trace, () =>
-              this.refreshCells(request, view, missing, request.scopes[request.planningScope])
-            );
+            await this.tryRecovery(trace, () => this.refreshCells(request, classifier, view, missing));
             continue;
           }
           // Terminal NetError codes and plain Errors (misplan bugs,
@@ -406,10 +471,7 @@ export class NetGatewayDO {
           })
         );
       }
-      const destination = request.scopes[targetScope];
-      if (!destination) {
-        throw new Error(`no rpc destination for selected scope ${targetScope}`);
-      }
+      const destination = this.destinationFor(request, targetScope);
       if (base === null) {
         base = ((await this.host.rpc(destination, "/head")) as { head: ScopeHead }).head;
       }
@@ -418,9 +480,9 @@ export class NetGatewayDO {
       // one — from its owner before submitting. Fetched fresh on EVERY
       // round (including stale_head resubmits), so a read_version_
       // mismatch repair — which refreshes the mismatched cells from
-      // their owners (refreshCells routes by `anchors`) and re-plans —
-      // automatically re-attests the affected owners too.
-      const attestations = await this.attestForeignReads(request, planned, targetScope);
+      // their owners (refreshCells routes by the classifier) and
+      // re-plans — automatically re-attests the affected owners too.
+      const attestations = await this.attestForeignReads(request, classifier, planned, targetScope);
       const submit: CommitSubmit = {
         ...planned.submit,
         base,
@@ -433,7 +495,7 @@ export class NetGatewayDO {
       // are an HTTP-body sibling, not sequencer input.
       const submitBody = {
         submit,
-        rider_destinations: this.riderDestinationsFor(request, planned.selection.riders)
+        rider_destinations: this.riderDestinationsFor(request, classifier, planned)
       };
       let reply: CommitReply;
       try {
@@ -518,7 +580,7 @@ export class NetGatewayDO {
           // disagreement naming nothing, reseed the scope's closure)
           // and re-plan.
           await this.tryRecovery(trace, async () => {
-            if (mismatchKeys.length > 0) await this.refreshCells(request, view, mismatchKeys, destination);
+            if (mismatchKeys.length > 0) await this.refreshCells(request, classifier, view, mismatchKeys);
             else await this.reseedFromScope(view, destination);
           });
           break;
@@ -580,16 +642,19 @@ export class NetGatewayDO {
   /**
    * Owner attestations for the planned transcript's foreign reads
    * (CO2.3 rider integrity, rule 1). Partition the reads by owning scope
-   * — the same `anchors` routing refreshCells uses; objects absent from
-   * the map anchor to the planning scope — and fetch `POST /net/attest`
-   * from each owner whose scope is NOT the committing one. The committing
-   * scope validates rider reads against these instead of skipping them;
-   * a foreign read submitted without its attestation rejects terminal
-   * `rider_unattested`. Returns undefined when every read is local to
-   * the committing scope (the warm single-scope case adds no RPC).
+   * — the classifier is the same routing refreshCells uses — and fetch
+   * `POST /net/attest` from each owner whose scope is NOT the committing
+   * one. The committing scope validates rider reads against these instead
+   * of skipping them; a foreign read submitted without its attestation
+   * rejects terminal `rider_unattested`. Returns undefined when every
+   * read is local to the committing scope (the warm single-scope case
+   * adds no RPC). Under the derived classifier, class-chain reads anchor
+   * to the catalog scope, so a cross-class turn attests against the
+   * catalog sequencer like any other owner (CO15).
    */
   private async attestForeignReads(
     request: TurnRequest,
+    classifier: ScopeClassifier,
     planned: PlanTurnResult,
     targetScope: string
   ): Promise<CommitSubmit["attestations"]> {
@@ -597,7 +662,7 @@ export class NetGatewayDO {
     for (const read of planned.transcript.reads) {
       const key = netCellKeyFor(read.cell);
       if (key === null) continue; // contents reads are projection reads (CA4)
-      const owner = request.anchors?.[read.cell.object] ?? request.planningScope;
+      const owner = classifier.scopeOf(read.cell.object);
       if (owner === targetScope) continue; // validated locally at the committing scope
       const keys = byOwner.get(owner) ?? new Set<string>();
       keys.add(key);
@@ -606,8 +671,7 @@ export class NetGatewayDO {
     if (byOwner.size === 0) return undefined;
     const attestations: NonNullable<CommitSubmit["attestations"]> = {};
     for (const [owner, keys] of byOwner) {
-      const destination = request.scopes[owner];
-      if (!destination) throw new Error(`no rpc destination to attest reads owned by ${owner}`);
+      const destination = this.destinationFor(request, owner);
       const reply = (await this.host.rpc(destination, "/attest", { keys: [...keys].sort() })) as {
         owner_head: ScopeHead;
         cells: Array<{ key: string; version: string }>;
@@ -619,29 +683,51 @@ export class NetGatewayDO {
 
   /** Rider forwarding directions for the committing scope (CA3): for
    * each rider scope in the selection, its rpc destination plus the
-   * objects the request anchors to it. The object list rides too because
-   * only the gateway holds the anchor map — the scope shell must know
-   * WHICH accepted cells are the rider's, and the sequencer itself never
-   * learns rider topology (src/net/scope.ts types stay unchanged). */
+   * objects the TRANSCRIPT writes there — writes/moves/creates
+   * classified by the same walk route.ts selected the scope with. The
+   * object list rides because the scope shell must know WHICH accepted
+   * cells are the rider's, and the sequencer itself never learns rider
+   * topology (src/net/scope.ts types stay unchanged). */
   private riderDestinationsFor(
     request: TurnRequest,
-    riders: string[]
+    classifier: ScopeClassifier,
+    planned: PlanTurnResult
   ): Record<string, { destination: string; objects: string[] }> {
+    const riders = new Set(planned.selection.riders);
+    if (riders.size === 0) return {};
+    const objectsByScope = new Map<string, Set<string>>();
+    const put = (scope: string, object: string): void => {
+      if (!riders.has(scope)) return;
+      const set = objectsByScope.get(scope) ?? new Set<string>();
+      set.add(object);
+      objectsByScope.set(scope, set);
+    };
+    for (const write of planned.transcript.writes) {
+      if (netCellKeyFor(write.cell) === null) continue; // contents → projection (CA4)
+      put(classifier.scopeOf(write.cell.object), write.cell.object);
+    }
+    for (const move of planned.transcript.moves ?? []) {
+      put(classifier.scopeOf(move.object), move.object);
+    }
+    for (const create of planned.transcript.creates ?? []) {
+      // route.ts rule: a create's cells land at its anchor's scope when
+      // declared, else with the planning scope.
+      put(create.anchor ? classifier.scopeOf(create.anchor) : request.planningScope, create.object);
+    }
     const out: Record<string, { destination: string; objects: string[] }> = {};
-    for (const rider of riders) {
-      const destination = request.scopes[rider];
-      if (!destination) throw new Error(`no rpc destination for rider scope ${rider}`);
-      const objects = Object.entries(request.anchors ?? {})
-        .filter(([, scope]) => scope === rider)
-        .map(([object]) => object);
-      out[rider] = { destination, objects };
+    for (const rider of planned.selection.riders) {
+      out[rider] = {
+        destination: this.destinationFor(request, rider),
+        objects: [...(objectsByScope.get(rider) ?? new Set<string>())].sort()
+      };
     }
     return out;
   }
 
   /** One planning pass against the current view. The provisional base is
    * patched after the head fetch — `base` is an envelope field, not part
-   * of the transcript hash. */
+   * of the transcript hash. Catalog-scope lineage keys ride as the
+   * receiver-known set (CO15: class chains never reship). */
   private async planOnce(request: TurnRequest, view: CellStore, classifier: ScopeClassifier): Promise<PlanTurnResult> {
     return planTurn({
       call: request.call,
@@ -651,6 +737,7 @@ export class NetGatewayDO {
       base: { seq: 0, hash: "provisional" },
       idempotencyKey: request.idempotency_key,
       stamp: { scope_head: "gateway", catalog_epoch: request.catalog_epoch },
+      receiverKnown: this.catalogKnownKeys(view, classifier),
       ...(request.counters !== undefined ? { counters: request.counters } : {})
     });
   }
@@ -693,23 +780,22 @@ export class NetGatewayDO {
 
   /** Targeted view refresh (the E_READ_VERSION / E_MISSING_STATE
    * recovery): fetch exactly `keys`, lineage-closed, from each key's
-   * owning scope — `anchors` maps objects to scopes; unanchored objects
-   * belong to the scope the turn was talking to (`fallback`). `known` is
-   * the view's lineage keys, so the transfer never reships the class
-   * chain (CO7). A requested key that comes back absent was deleted at
-   * the authority. */
+   * owning scope — the classifier routes each object (its fallback
+   * already covers objects the view cannot classify: they refresh from
+   * the planning scope, the legacy behavior). `known` is the view's
+   * lineage keys, so the transfer never reships the class chain (CO7).
+   * A requested key that comes back absent was deleted at the
+   * authority. */
   private async refreshCells(
     request: TurnRequest,
+    classifier: ScopeClassifier,
     view: CellStore,
-    keys: string[],
-    fallback: string | undefined
+    keys: string[]
   ): Promise<void> {
     if (keys.length === 0) return;
     const byDestination = new Map<string, string[]>();
     for (const key of keys) {
-      const scope = request.anchors?.[objectOfCellKey(key)];
-      const destination = (scope !== undefined ? request.scopes[scope] : undefined) ?? fallback;
-      if (!destination) throw new Error(`no rpc destination to refresh ${key}`);
+      const destination = this.destinationFor(request, classifier.scopeOf(objectOfCellKey(key)));
       byDestination.set(destination, [...(byDestination.get(destination) ?? []), key]);
     }
     const known = [...view.keys()].filter((key) => key.startsWith("object_lineage:"));

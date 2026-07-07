@@ -62,6 +62,11 @@ export type PlanTurnInput = {
    * deterministic given the counter). Turns that do not create run fine
    * at the bridge defaults. */
   counters?: SerializedFromCellsOptions;
+  /** Lineage keys the receiver universally holds (CO15: the catalog
+   * scope's closure is receiver-known in every transfer — class chains
+   * never reship). The read closure omits these cells and declares them
+   * `assumes_known` instead; only `object_lineage:*` keys belong here. */
+  receiverKnown?: ReadonlySet<string>;
 };
 
 export type PlanTurnResult = {
@@ -100,7 +105,8 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
   // by the read-version check before post-state ever disagrees.
   const applied = applyTranscript(CellStore.scratchAuthorityFrom(snapshot), transcript, stamp);
 
-  const closure = serializeTransfer(readClosureCells(snapshot, transcript, call));
+  const receiverKnown = input.receiverKnown ?? new Set<string>();
+  const closure = serializeTransfer(readClosureCells(snapshot, transcript, call, receiverKnown), receiverKnown);
   // The CO7 envelope is the transcript plus its read-closure; measure the
   // whole shape that would go on the wire.
   const envelopeBytes = new TextEncoder().encode(JSON.stringify({ transcript, closure })).byteLength;
@@ -161,9 +167,17 @@ function submitTranscript(recorded: EffectTranscript, view: CellStore, scope: st
  * lineage (each referenced object's `object_lineage` plus its transitive
  * parent chain). Cells absent from the view ship nothing — their
  * absence is already encoded in the transcript's "absent" read versions.
- * `serializeTransfer` then asserts the closure (E_LINEAGE = planner bug).
+ * Receiver-known lineage keys (CO15: the catalog closure) are walked for
+ * their parents but never shipped — that is how class chains stay off
+ * the wire. `serializeTransfer` then asserts the closure (E_LINEAGE =
+ * planner bug).
  */
-function readClosureCells(view: CellStore, transcript: EffectTranscript, call: ShadowTurnCall): Cell[] {
+function readClosureCells(
+  view: CellStore,
+  transcript: EffectTranscript,
+  call: ShadowTurnCall,
+  receiverKnown: ReadonlySet<string>
+): Cell[] {
   const keys = new Set<string>();
   const objects = new Set<string>();
   const add = (key: string | null, object?: string): void => {
@@ -195,7 +209,10 @@ function readClosureCells(view: CellStore, transcript: EffectTranscript, call: S
     walked.add(object);
     const lineage = view.get(cellKey("object_lineage", object));
     if (!lineage) continue;
-    keys.add(lineage.key);
+    // Receiver-known lineage never ships (CO15) but its parent chain is
+    // still walked: a shipped child may hang below a known ancestor whose
+    // OWN parent is not known and must therefore ride.
+    if (!receiverKnown.has(lineage.key)) keys.add(lineage.key);
     const parent = (lineage.value as { parent?: unknown }).parent;
     if (typeof parent === "string") pending.push(parent);
   }
