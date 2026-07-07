@@ -25,6 +25,7 @@
  */
 import { CellStore, type Cell, type EpochStamp } from "./cells";
 import { netError } from "./errors";
+import { applyRelationDeltas, deriveRelationDeltas, rebuildContentsRelation, relationKey, type RelationDelta, type RelationRow } from "./relations";
 import type { ScopeStore } from "./scope-store";
 import { applyTranscript, netCellKeyFor, type EffectTranscript, type TranscriptCell } from "./transcript";
 import { cellVersion } from "./cells";
@@ -85,6 +86,10 @@ export type CommitReply =
       /** Authority cells touched, for warm cache-fill (CO7 state transfer). */
       touched: string[];
       post_state_version: string;
+      /** CO13: relation deltas whose owner is anchored to ANOTHER scope —
+       * the shell delivers them to the owning scope via the durable
+       * outbox (/net/relate). Local deltas were already applied here. */
+      relations_foreign?: Array<{ scope: string; deltas: RelationDelta[] }>;
     }
   | {
       kind: "woo.net.commit_reply.v1";
@@ -124,6 +129,10 @@ export type ScopeSequencerOptions = {
    * design. Single-scope deployments omit this and validate every read
    * locally (attestations are ignored). */
   owns?: (object: string) => boolean;
+  /** CO13: the anchor-derived scope of an object (topology.ts). Used to
+   * partition derived relation deltas into local rows vs rows owned by
+   * another scope. Absent → every delta is local (single-scope). */
+  scopeOf?: (object: string) => string;
   /** Bounded recovery tail length (the scope's own log — CO5 note). */
   tailLimit?: number;
   /** Durability (Phase 3): when provided, the sequencer hydrates from the
@@ -141,6 +150,7 @@ export class ScopeSequencer {
   private readonly replies = new Map<string, CommitReply>();
   private readonly tail: Array<{ seq: number; transcript_hash: string; touched: string[] }> = [];
   private readonly scheduled = new Map<string, ScheduledTurn>();
+  private readonly relationRows = new Map<string, RelationRow>();
   private readonly options: Required<Pick<ScopeSequencerOptions, "tailLimit">> & ScopeSequencerOptions;
 
   constructor(scope: string, catalogEpoch: string, options: ScopeSequencerOptions = {}) {
@@ -176,6 +186,7 @@ export class ScopeSequencer {
       for (const { key, reply } of durable.readReplies()) this.replies.set(key, reply);
       for (const entry of durable.readTail()) this.tail.push(entry);
       for (const turn of durable.readScheduled()) this.scheduled.set(turn.id, turn);
+      for (const row of durable.readRelations()) this.relationRows.set(relationKey(row.relation, row.owner, row.member), row);
     }
   }
 
@@ -329,13 +340,22 @@ export class ScopeSequencer {
     this.tail.push(tailEntry);
     if (this.tail.length > this.options.tailLimit) this.tail.splice(0, this.tail.length - this.options.tailLimit);
 
+    // CO13: derive relation deltas from the accepted transcript — the
+    // single write path for contents/presence rows. Local rows apply here
+    // (durably, in the same transaction below); foreign rows ride the
+    // reply for the shell's /net/relate delivery.
+    const derived = deriveRelationDeltas(submit.transcript, applied, this.scope, this.options.scopeOf);
+    const changedRelationKeys = applyRelationDeltas(this.relationRows, derived.local);
+    const relationsForeign = [...derived.foreign.entries()].map(([scope, deltas]) => ({ scope, deltas }));
+
     const reply: CommitReply = {
       kind: "woo.net.commit_reply.v1",
       status: "accepted",
       scope: this.scope,
       head: this.headState,
       touched: applied.touched,
-      post_state_version: applied.postStateVersion
+      post_state_version: applied.postStateVersion,
+      ...(relationsForeign.length > 0 ? { relations_foreign: relationsForeign } : {})
     };
     this.replies.set(submit.idempotency_key, reply);
 
@@ -355,6 +375,11 @@ export class ScopeSequencer {
         durable.writeReply(submit.idempotency_key, reply);
         durable.appendTail(tailEntry);
         durable.trimTail(this.options.tailLimit);
+        for (const key of changedRelationKeys) {
+          const row = this.relationRows.get(key);
+          if (row) durable.writeRelation(key, row);
+          else durable.deleteRelation(key);
+        }
       });
     }
     return reply;
@@ -464,6 +489,50 @@ export class ScopeSequencer {
       });
     }
     return { status: "applied", head: this.headState, applied: appliedKeys, conflicts };
+  }
+
+  /** Derived relation rows this scope owns (CO13). Read surface for the
+   * shell's /net/relate application and for roster queries. */
+  relations(): ReadonlyMap<string, RelationRow> {
+    return this.relationRows;
+  }
+
+  /** Apply externally delivered relation deltas (the /net/relate path —
+   * rows derived at ANOTHER scope whose owner objects anchor here).
+   * Durable write-through; returns the changed keys for refanning. */
+  applyForeignRelationDeltas(deltas: RelationDelta[]): string[] {
+    const changed = applyRelationDeltas(this.relationRows, deltas);
+    const durable = this.options.durable;
+    if (durable && changed.length > 0) {
+      durable.transaction(() => {
+        for (const key of changed) {
+          const row = this.relationRows.get(key);
+          if (row) durable.writeRelation(key, row);
+          else durable.deleteRelation(key);
+        }
+      });
+    }
+    return changed;
+  }
+
+  /** CO13 bounded repair: recompute the contents relation from authority
+   * live cells (presence rows are preserved — they rebuild from session
+   * cells once CO14 lands). Replaces rows in memory and durably. */
+  rebuildRelations(): void {
+    const rebuilt = rebuildContentsRelation([...this.store.keys()].map((key) => this.store.get(key)).filter((c): c is Cell => Boolean(c)));
+    for (const [key, row] of [...this.relationRows]) {
+      if (row.relation === "contents" && !rebuilt.has(key)) this.relationRows.delete(key);
+    }
+    for (const [key, row] of rebuilt) this.relationRows.set(key, row);
+    const durable = this.options.durable;
+    if (durable) {
+      durable.transaction(() => {
+        for (const row of durable.readRelations()) {
+          if (row.relation === "contents") durable.deleteRelation(relationKey(row.relation, row.owner, row.member));
+        }
+        for (const [key, row] of rebuilt) durable.writeRelation(key, row);
+      });
+    }
   }
 
   /** The scope's bounded recovery log (CO5: read by the scope alone). */

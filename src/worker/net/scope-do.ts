@@ -59,6 +59,7 @@ import { cellKey, lineageClosureKeys, serializeTransfer, type CellTransfer } fro
 import { isNetError, netError } from "../../net/errors";
 import { Outbox, type FanoutBody, type FanoutRow } from "../../net/outbox";
 import { ScopeSequencer, type CommitSubmit, type ScheduledTurn, type ScopeHead } from "../../net/scope";
+import type { RelationRow } from "../../net/relations";
 import type { ScopeMeta, ScopeStore, TailEntry } from "../../net/scope-store";
 import type { CommitReply } from "../../net/scope";
 import { netCellKeyFor } from "../../net/transcript";
@@ -124,6 +125,8 @@ export class SqliteScopeStore implements ScopeStore {
     );
     this.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_scope_tail (seq INTEGER PRIMARY KEY, body TEXT NOT NULL)");
     this.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_scope_scheduled (id TEXT PRIMARY KEY, body TEXT NOT NULL)");
+    // Sixth row family (CO13): derived relation rows this scope owns.
+    this.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_scope_relation (key TEXT PRIMARY KEY, body TEXT NOT NULL)");
   }
 
   transaction<T>(fn: () => T): T {
@@ -220,6 +223,24 @@ export class SqliteScopeStore implements ScopeStore {
 
   deleteScheduled(id: string): void {
     this.storage.sql.exec("DELETE FROM net_scope_scheduled WHERE id = ?", id);
+  }
+
+  readRelations(): RelationRow[] {
+    return sqlRows<{ body: string }>(this.storage.sql.exec("SELECT body FROM net_scope_relation")).map(
+      (row) => JSON.parse(row.body) as RelationRow
+    );
+  }
+
+  writeRelation(key: string, row: RelationRow): void {
+    this.storage.sql.exec(
+      "INSERT INTO net_scope_relation (key, body) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET body = excluded.body",
+      key,
+      JSON.stringify(row)
+    );
+  }
+
+  deleteRelation(key: string): void {
+    this.storage.sql.exec("DELETE FROM net_scope_relation WHERE key = ?", key);
   }
 }
 
