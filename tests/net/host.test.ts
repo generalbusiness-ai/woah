@@ -132,3 +132,32 @@ describe("scheduled turns wake via the scope alarm and survive eviction (CO2.8)"
     expect(scope.nextAlarmAt()).toBeNull();
   });
 });
+
+describe("rpc registry — the single cross-node seam (Phase-3 Host.rpc)", () => {
+  it("dispatches to the registered destination handler with route and body", async () => {
+    const host = new InProcessHost();
+    const calls: Array<{ route: string; body: unknown }> = [];
+    host.registerRpc("scope:the_room", async (route, body) => {
+      calls.push({ route, body });
+      return { ok: true, route };
+    });
+
+    const reply = await host.rpc("scope:the_room", "/submit", { seq: 1 });
+    expect(reply).toEqual({ ok: true, route: "/submit" });
+    // Body-less form (the GET-shaped /head fetch) passes undefined through.
+    await host.rpc("scope:the_room", "/head");
+    expect(calls).toEqual([
+      { route: "/submit", body: { seq: 1 } },
+      { route: "/head", body: undefined }
+    ]);
+  });
+
+  it("throws a plain Error (never a NetError) for an unregistered destination", async () => {
+    const host = new InProcessHost();
+    await expect(host.rpc("scope:nowhere", "/head")).rejects.toThrow(
+      /no handler registered for destination scope:nowhere/
+    );
+    // Wiring bugs are not taxonomy divergence: the error is a plain Error.
+    await expect(host.rpc("scope:nowhere", "/head")).rejects.not.toHaveProperty("code");
+  });
+});

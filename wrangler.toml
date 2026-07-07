@@ -128,6 +128,18 @@ class_name = "DirectoryDO"
 name = "COMMIT_SCOPE"
 class_name = "CommitScopeDO"
 
+# Plan 002 coherence layer (spec/protocol/coherence.md). New classes sit
+# beside the v2 ones; nothing routes production traffic here until the
+# Phase-5 cutover. SCOPE_NET is the scope authority (CO5 copy #1);
+# GATEWAY_NET is the session-edge derived cache (copy #2).
+[[durable_objects.bindings]]
+name = "SCOPE_NET"
+class_name = "NetScopeDO"
+
+[[durable_objects.bindings]]
+name = "GATEWAY_NET"
+class_name = "NetGatewayDO"
+
 # KV-fronted host-seed cache. WORLD writes (host, digest, seed_bytes)
 # tuples on every host-seed build; cold satellites read from KV via a
 # Worker route before falling back to WORLD's DO. Per-region cached at
@@ -197,3 +209,7 @@ dataset = "woo_v1_prod"
 # [[env.staging.analytics_engine_datasets]]
 # binding = "METRICS"
 # dataset = "woo_v1_staging"
+
+[[migrations]]
+tag = "cf-do-0004"
+new_sqlite_classes = [ "NetGatewayDO", "NetScopeDO" ]

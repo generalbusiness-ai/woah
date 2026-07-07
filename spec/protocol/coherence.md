@@ -97,6 +97,34 @@ authority that makes this turn's writes atomic:
   `E_SCOPE_SPLIT` (CO6) — a named limitation, not a silent commit to the
   planning scope. Lifting it is the CA10 growth path (CO11).
 
+**Rider integrity (amendment, 2026-07-06).** Ride-along writes touch cells
+whose authority is another scope; three rules keep CO2.4 intact across
+that seam:
+
+1. **Attested rider reads.** A transcript that READS a rider cell must
+   carry an owner attestation `{cells: [{key, version}], owner_head}`
+   fetched from the owning scope at plan time (`POST /net/attest` — one
+   async RPC off the validation path). The committing scope validates
+   rider reads against the attestation; a rider read with no attestation
+   rejects `rider_unattested` (terminal, named). The committing scope's
+   `owns` predicate scopes what it validates against its own store.
+2. **Owner-sequenced adoption.** Rider writes reach their owner via
+   `/net/adopt` and are applied as owner-ordered events with a per-cell
+   prior-version CAS (the attested version the committing turn
+   observed). **Adoption is an owner-sequenced commit: the owner's head
+   advances and adopted cells stamp the new head**, so owner observers
+   and catch-up see it like any commit. CAS match → clean apply.
+   Mismatch → **owner wins**, and the conflict is a named, counted event
+   (`net_adopt_conflict`) — never a silent overwrite.
+3. **The residual tear is named and bounded.** On a conflict, the
+   committing scope's transcript already embedded the stale rider value
+   in its post-state; that inconsistency is bounded by the attestation
+   window, observable via the conflict count, healed by the next
+   read-version repair on the cell, and eliminated structurally by CA10
+   route migration (CO11). The committing scope's residual copies of
+   rider cells are **derived**, never authoritative, at every transfer
+   exit.
+
 ### CO2.4 Read-version validation
 
 A committed turn's reads must match current authority state at validation
@@ -370,3 +398,80 @@ that only runs under `test:full` does not hold the line):
    named CO6/CO8 events, never as failures.
 7. **Taxonomy gate**: grep/type-level check that no error surface in
    `src/net/` emits outside the CO6 enum.
+
+## CO13. Relations and the projection applier
+
+One write path per fact (CO9), concretized:
+
+- A **relation row** is `relation:<name>:<owner>:<member>` with a small
+  JSON body, stored at the scope that owns the relation's OWNER object
+  (a sixth scope row family), mirrored into gateway views for reads, and
+  fanned to subscribers alongside cells (`FanoutBody.relations`).
+- **The applier runs at the committing scope.** On accept, the scope
+  derives relation deltas from the transcript: `projectionWrites`
+  (contents add/remove), moves (contents of the source and destination
+  parents), and session-scope transitions (presence). Deltas whose owner
+  object is anchored elsewhere are delivered to the owning scope via the
+  durable outbox (`POST /net/relate`, idempotent by `(from_scope, seq)`);
+  the owner applies them and refans to its own subscribers.
+- `contents(parent) = { object | live:location:<object> == parent }`
+  (CA4) remains the definitional truth; relation rows are its
+  materialization, rebuildable by scanning live cells at the owner (the
+  repair path, bounded by scope size — CO11.1).
+- **Fanout audiences** are computed from the `session_presence` relation
+  (owner = the space, members = live sessions) — CO2.7's
+  "O(distinct occupant shards)" gets its production definition here.
+
+## CO14. Session authority and authentication
+
+- **A session is a cell** (`session:<id>`), authoritative at the ACTOR's
+  cluster scope. Minting/refresh/expiry are ordinary commits there — one
+  write path.
+- **The gateway authenticates; scopes authorize.** The gateway validates
+  client credentials against identity cells in the catalog scope closure
+  (CO15) and mints the session via a turn. Every submit carries the
+  session read in its read closure; CO4 step 1 (`authorize`) checks the
+  session cell (presence, expiry, actor binding) like any other read —
+  attested via CO2.3 rider rules when the commit scope is not the
+  session's owner.
+- **Session-scope transitions are session-cell writes**, folded in at
+  plan time from the engine's recorded transition; presence (CO13)
+  derives from the committed cell. There is no separate presence write
+  path.
+
+## CO15. Topology, partitioning, and catalog install
+
+- **Anchor derivation is a pure function of lineage cells.**
+  `scopeOf(object)` walks `lineage.anchor` to its root: actor root →
+  `cluster:<actor>`; space root → `room:<space>`; anchorless → the
+  catalog scope. Gateways build their classifier from view lineage —
+  never from request-supplied topology (lane fixtures excepted).
+- **The catalog scope** owns the shared substrate: `$system`, `$root`,
+  class lineage, verb bytecode, identity maps. Its closure is
+  read-mostly, KV-seeded to every gateway at install, and universally
+  receiver-known in transfers (class chains never reship — the CO7
+  `assumes_known` mechanism's production population). Catalog cells
+  change only through the install pipeline: a sequenced commit at the
+  catalog scope plus a `catalog_epoch` bump, which every consumer heals
+  from via `E_STALE_EPOCH` reseed (the aged-world lane, CO12.6, is the
+  proof).
+- **The install pipeline** partitions a bootstrap/exported world by the
+  anchor walk (`partitionCells`): catalog cells → catalog scope; rooms +
+  room-anchored → room scopes; actors + carried → cluster scopes.
+  Deployment = per-partition seed + KV seed writes. The Phase-5
+  fresh-install path (identity import included) is this same pipeline.
+
+## CO16. Scheduled-turn execution
+
+- The scope remains the durable home and the waker (CO2.8); **a
+  registered planner gateway executes**. Subscription carries a role
+  (`fanout` | `planner`); at alarm time the scope delivers each due turn
+  to a planner via the durable outbox
+  (`POST /net/plan-scheduled`), and the planner runs the normal turn
+  machinery with idempotency key `sched:<id>:<at_logical_time>` —
+  at-least-once delivery + the scope's reply cache = fired exactly once.
+- With no registered planner, due turns stay parked with a named metric
+  (the non-destructive peek is the specified no-planner state).
+- Engine-side `schedules`/`cancellations` transcript fields (VTN18.2)
+  remain deferred until the DSL exposes scheduling; `/net/schedule` is
+  the substrate surface until then.

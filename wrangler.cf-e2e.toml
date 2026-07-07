@@ -83,6 +83,18 @@ class_name = "DirectoryDO"
 name = "COMMIT_SCOPE"
 class_name = "CommitScopeDO"
 
+# Plan 002 coherence layer (spec/protocol/coherence.md). New classes sit
+# beside the v2 ones; nothing routes production traffic here until the
+# Phase-5 cutover. SCOPE_NET is the scope authority (CO5 copy #1);
+# GATEWAY_NET is the session-edge derived cache (copy #2).
+[[durable_objects.bindings]]
+name = "SCOPE_NET"
+class_name = "NetScopeDO"
+
+[[durable_objects.bindings]]
+name = "GATEWAY_NET"
+class_name = "NetGatewayDO"
+
 [[kv_namespaces]]
 binding = "HOST_SEED_KV"
 id = "local_cf_e2e_host_seed_kv"
@@ -98,3 +110,7 @@ new_sqlite_classes = ["DirectoryDO"]
 [[migrations]]
 tag = "cf-do-0006"
 new_sqlite_classes = ["CommitScopeDO"]
+
+[[migrations]]
+tag = "cf-do-0004"
+new_sqlite_classes = [ "NetGatewayDO", "NetScopeDO" ]
