@@ -8,12 +8,31 @@
  *     cells) and the per-scope fanout high-water (CO2.5 receiver
  *     idempotency), hydrated lazily;
  *   - the internal-auth'd /net surface:
- *       POST /net/fanout  FanoutBody → install cells, advance seen seq
+ *       POST /net/fanout  FanoutBody → install cells, advance seen seq,
+ *                         mirror relation deltas (CO13) under the same
+ *                         high-water
+ *       GET  /net/relation ?relation=&owner= → the member rows of one
+ *                         relation at one owner (the CO13 client-read
+ *                         primitive for who/contents)
  *       POST /net/pull    {scope, destination} → CO7 state-transfer
  *                         cache-fill: KV seed first when HOST_SEED_KV is
  *                         bound (head-checked against the live scope;
  *                         CO5 copy #3), else the scope's lineage-closed
  *                         live closure — which then rewrites the seed
+ *       POST /net/session-open  CO14 mint: build a session-cell commit via
+ *                         mintSessionSubmit, submit it to the actor's
+ *                         cluster scope (stale_head-only retry), install
+ *                         the accepted cell in the view (test/lane-facing
+ *                         until Phase-4 transports authenticate in front)
+ *       POST /net/plan-scheduled  CO16 planner execution: a scope's due
+ *                         scheduled turn, delivered via its durable
+ *                         outbox to this gateway (subscribed with role
+ *                         "planner"), runs the NORMAL /net/turn
+ *                         machinery under the stable idempotency key
+ *                         `sched:<id>:<at_logical_time>` — at-least-once
+ *                         delivery + the committing scope's reply cache
+ *                         = fired exactly once. Cold views pull-on-miss
+ *                         before planning (see planScheduled)
  *       POST /net/turn    the CO6-taxonomy repair loop: plan → submit,
  *                         with each retryable verdict mapped to its
  *                         defined recovery (refetch head / targeted
@@ -22,19 +41,24 @@
  *                         ceiling; terminal verdicts and budget
  *                         exhaustion surface with the attempt trace
  *
- * The /net/turn classifier inputs (`anchors`, `shared`) ride on the
- * request in step 2 because the gateway does not yet derive anchoring
- * from lineage cells — that arrives with the step-3 gateway machinery.
+ * Topology (Plan 002 Phase 3.5 item 2, CO15): the gateway derives its
+ * classifier from the VIEW's lineage cells (topology.ts anchor walk) and
+ * maps scope names to rpc destinations by convention (`scope:<name>` —
+ * the DO namespace key IS the scope name). Request-supplied `anchors`/
+ * `shared`/`scopes` remain as lane/test overrides only.
  *
  * This class sits beside the v2 DO classes and shares nothing with them;
  * nothing routes production traffic here until Phase 5.
  */
-import { CellStore, type Cell } from "../../net/cells";
-import { budgetExhausted, isNetError, type AttemptTraceEntry, type NetErrorCode } from "../../net/errors";
+import { CellStore, cellKey, type Cell } from "../../net/cells";
+import { budgetExhausted, isNetError, netError, type AttemptTraceEntry, type NetErrorCode } from "../../net/errors";
 import { applyFanout, type FanoutBody } from "../../net/outbox";
+import { relationKey, type RelationDelta } from "../../net/relations";
+import { mintSessionSubmit } from "../../net/sessions";
 import { planTurn, type PlanTurnInput, type PlanTurnResult } from "../../net/plan";
 import type { ScopeClassifier } from "../../net/route";
-import type { CommitReply, CommitSubmit, RejectReason, ScopeHead } from "../../net/scope";
+import { CATALOG_SCOPE, classifierFromLineage, type AnchorLineage } from "../../net/topology";
+import type { CommitReply, CommitSubmit, RejectReason, ScheduledTurn, ScopeHead } from "../../net/scope";
 import { netCellKeyFor } from "../../net/transcript";
 import type { CellTransfer } from "../../net/cells";
 import { verifyInternalRequest } from "../internal-auth";
@@ -96,13 +120,43 @@ type TurnRequest = {
   planningScope: string;
   catalog_epoch: string;
   idempotency_key: string;
-  /** scope → rpc destination (e.g. "scope:the_room"). */
-  scopes: Record<string, string>;
+  /** DEPRECATED-FOR-PRODUCTION topology overrides (lane/test fixtures
+   * only — CO15 forbids request-supplied topology on the production
+   * path). When ALL THREE are absent the gateway derives everything:
+   * the classifier from the view's lineage cells (topology.ts anchor
+   * walk) and each scope's rpc destination by the `scope:<scopeName>`
+   * convention — the DO namespace key IS the scope name
+   * (resolveNetDestination is unchanged; it splits on the first ':').
+   * Presence of `anchors` or `shared` switches the whole classifier to
+   * the legacy request-supplied one — the two sources are never mixed,
+   * so a fixture cannot half-override the derivation. */
+  /** scope → rpc destination override (e.g. "scope:the_room"). Absent
+   * entries fall back to the `scope:<scopeName>` convention. */
+  scopes?: Record<string, string>;
   /** object → owning scope; objects absent here anchor to planningScope. */
   anchors?: Record<string, string>;
   /** which scopes are shared sequencers (rooms); others are clusters. */
   shared?: string[];
   counters?: PlanTurnInput["counters"];
+};
+
+/** /net/plan-scheduled body (CO16; see planScheduled): the wire shape
+ * the scope's outbox drain delivers. */
+type PlanScheduledRequest = {
+  scheduled_turn: ScheduledTurn;
+  scope: string;
+  catalog_epoch: string;
+};
+
+/** /net/session-open body (CO14 mint; see sessionOpen). */
+type SessionOpenRequest = {
+  session: string;
+  actor: string;
+  ttl_ms: number;
+  catalog_epoch: string;
+  /** Optional rpc-destination override (lane fixtures); the scope name is
+   * recovered from the `scope:<scopeName>` convention when it applies. */
+  cluster_destination?: string;
 };
 
 /** /net/turn reply body. `trace` lists the failed rounds that preceded
@@ -149,6 +203,16 @@ export class NetGatewayDO {
     // SqliteScopeStore: cheap, idempotent, no separate first-boot path.
     state.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_gateway_cell (key TEXT PRIMARY KEY, body TEXT NOT NULL)");
     state.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_gateway_scope (scope TEXT PRIMARY KEY, seen_seq INTEGER NOT NULL)");
+    // CO13 relation mirror: roster rows (contents, session_presence)
+    // received via FanoutBody.relations — the client-read primitive for
+    // who/contents (GET /net/relation). SQLite-only (no memory cache):
+    // reads are per-request queries and writes are gated by the same
+    // per-scope seen high-water as cells, so there is no hydrated state
+    // to keep coherent. Columns denormalize the row for the
+    // (relation, owner) query; `body` is the row's JSON body or NULL.
+    state.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS net_gateway_relation (key TEXT PRIMARY KEY, relation TEXT NOT NULL, owner TEXT NOT NULL, member TEXT NOT NULL, body TEXT)"
+    );
     // Selection pinning (fix 5c): idempotency_key → the scope the FIRST
     // submit for that key targeted. A re-plan (same key, refreshed view)
     // must never migrate the commit to a different scope — the pinned
@@ -185,6 +249,12 @@ export class NetGatewayDO {
       if (request.method === "POST" && url.pathname === "/net/turn") {
         return json(await this.turn((await request.json()) as TurnRequest));
       }
+      if (request.method === "POST" && url.pathname === "/net/plan-scheduled") {
+        return json(await this.planScheduled((await request.json()) as PlanScheduledRequest));
+      }
+      if (request.method === "POST" && url.pathname === "/net/session-open") {
+        return json(await this.sessionOpen((await request.json()) as SessionOpenRequest));
+      }
       if (request.method === "GET" && url.pathname === "/net/cell") {
         // Lane read surface (Phase-3 step 4b): expose one view cell so the
         // workerd smoke can assert fanout landed. Phase-4 transports carry
@@ -193,6 +263,26 @@ export class NetGatewayDO {
         const key = url.searchParams.get("key") ?? "";
         const cell = this.ensureView().get(key) ?? null;
         return json({ key, cell });
+      }
+      if (request.method === "GET" && url.pathname === "/net/relation") {
+        // CO13 client-read primitive: the members of one relation at one
+        // owner (who is in the room / what a container holds), served
+        // from the fanout-fed mirror. Phase-4 transports wrap this for
+        // real clients; until then it is the lane's roster probe.
+        const relation = url.searchParams.get("relation") ?? "";
+        const owner = url.searchParams.get("owner") ?? "";
+        if (!relation || !owner) throw new Error("relation and owner query params are required");
+        const members = sqlRows<{ member: string; body: string | null }>(
+          this.state.storage.sql.exec(
+            "SELECT member, body FROM net_gateway_relation WHERE relation = ? AND owner = ? ORDER BY member ASC",
+            relation,
+            owner
+          )
+        ).map((row) => ({
+          member: row.member,
+          ...(row.body !== null ? { body: JSON.parse(row.body) as unknown } : {})
+        }));
+        return json({ relation, owner, members });
       }
       return json({ error: `no such route: ${request.method} ${url.pathname}` }, 404);
     } catch (err) {
@@ -335,11 +425,61 @@ export class NetGatewayDO {
     }
   }
 
+  /**
+   * The turn's ScopeClassifier (CO15). Production path: derived from the
+   * VIEW's lineage cells via the topology.ts anchor walk — never from
+   * request-supplied topology. The lookup reads the live view store, so
+   * a classifier built after a refresh sees the refreshed lineage; the
+   * fallback covers objects with no lineage cell yet (same-turn creates),
+   * mirroring the legacy `?? planningScope` rule.
+   *
+   * Lane/test override: presence of `anchors` OR `shared` selects the
+   * legacy request-supplied classifier wholesale (never mixed with the
+   * derivation — a fixture cannot half-override CO15).
+   */
+  private classifierFor(request: TurnRequest, view: CellStore): ScopeClassifier {
+    if (request.anchors !== undefined || request.shared !== undefined) {
+      return {
+        scopeOf: (object) => request.anchors?.[object] ?? request.planningScope,
+        isShared: (scope) => (request.shared ?? [request.planningScope]).includes(scope)
+      };
+    }
+    return classifierFromLineage(
+      (object) => (view.get(cellKey("object_lineage", object))?.value as AnchorLineage | undefined) ?? null,
+      { fallback: request.planningScope }
+    );
+  }
+
+  /** Scope name → rpc destination. Convention: `scope:<scopeName>` (the
+   * DO namespace key IS the scope name — CO15); a request `scopes` entry
+   * overrides it (lane fixtures wiring fake stubs). */
+  private destinationFor(request: TurnRequest, scope: string): string {
+    return request.scopes?.[scope] ?? `scope:${scope}`;
+  }
+
+  /**
+   * The catalog scope's lineage keys held by this view (CO15): the
+   * shared substrate is universally receiver-known in transfers, so the
+   * planner's read closure never reships class chains. An unclassifiable
+   * lineage cell (mid-walk gap during a partial refresh) simply ships —
+   * the known-set is an envelope optimization and must never fail a plan.
+   * Under the legacy override classifier no scope is ever "catalog", so
+   * the set is empty and legacy envelopes are unchanged.
+   */
+  private catalogKnownKeys(view: CellStore, classifier: ScopeClassifier): Set<string> {
+    const known = new Set<string>();
+    for (const key of view.keys()) {
+      if (!key.startsWith("object_lineage:")) continue;
+      try {
+        if (classifier.scopeOf(objectOfCellKey(key)) === CATALOG_SCOPE) known.add(key);
+      } catch {
+        // Unclosed walk: leave the key out; the cell ships normally.
+      }
+    }
+    return known;
+  }
+
   private async turnAttempts(request: TurnRequest, trace: AttemptTraceEntry[]): Promise<TurnResult> {
-    const classifier: ScopeClassifier = {
-      scopeOf: (object) => request.anchors?.[object] ?? request.planningScope,
-      isShared: (scope) => (request.shared ?? [request.planningScope]).includes(scope)
-    };
     const startedAt = this.host.now();
     const deadline = startedAt + REPAIR_BUDGET_MS;
     // stale_head resubmit carry-over: when only the base was stale the
@@ -354,8 +494,11 @@ export class NetGatewayDO {
       const elapsed = () => this.host.now() - startedAt;
       // Re-acquire the view per attempt (fix 3): a failed durable write in
       // a prior round discarded this.view; the loop must plan against the
-      // rehydrated store, never a detached one.
+      // rehydrated store, never a detached one. The classifier rebuilds
+      // with it (CO15: it is a function of the view's lineage cells, and
+      // a recovery may have refreshed them).
       const view = this.ensureView();
+      const classifier = this.classifierFor(request, view);
 
       // ---- Plan (or adopt the stale_head resubmit).
       let planned: PlanTurnResult;
@@ -371,9 +514,7 @@ export class NetGatewayDO {
           if (isNetError(err) && err.code === "E_MISSING_STATE") {
             const missing = Array.isArray(err.detail.missing) ? (err.detail.missing as string[]) : [];
             trace.push({ attempt, code: "E_MISSING_STATE", missing, elapsed_ms: elapsed() });
-            await this.tryRecovery(trace, () =>
-              this.refreshCells(request, view, missing, request.scopes[request.planningScope])
-            );
+            await this.tryRecovery(trace, () => this.refreshCells(request, classifier, view, missing));
             continue;
           }
           // Terminal NetError codes and plain Errors (misplan bugs,
@@ -406,10 +547,7 @@ export class NetGatewayDO {
           })
         );
       }
-      const destination = request.scopes[targetScope];
-      if (!destination) {
-        throw new Error(`no rpc destination for selected scope ${targetScope}`);
-      }
+      const destination = this.destinationFor(request, targetScope);
       if (base === null) {
         base = ((await this.host.rpc(destination, "/head")) as { head: ScopeHead }).head;
       }
@@ -418,22 +556,25 @@ export class NetGatewayDO {
       // one — from its owner before submitting. Fetched fresh on EVERY
       // round (including stale_head resubmits), so a read_version_
       // mismatch repair — which refreshes the mismatched cells from
-      // their owners (refreshCells routes by `anchors`) and re-plans —
-      // automatically re-attests the affected owners too.
-      const attestations = await this.attestForeignReads(request, planned, targetScope);
+      // their owners (refreshCells routes by the classifier) and
+      // re-plans — automatically re-attests the affected owners too.
+      const attestations = await this.attestForeignReads(request, classifier, planned, targetScope);
       const submit: CommitSubmit = {
         ...planned.submit,
         base,
         ...(attestations !== undefined ? { attestations } : {})
       };
 
-      // The submit rides with its rider directions (CA3 forward): the
-      // scope shell enqueues /net/adopt rows for the accepted rider
-      // cells after commit. CommitSubmit itself is unchanged — riders
-      // are an HTTP-body sibling, not sequencer input.
+      // The submit rides with its rider directions (CA3 forward) and its
+      // relation-owner directions (CO13): the scope shell enqueues
+      // /net/adopt rows for the accepted rider cells and /net/relate
+      // rows for foreign relation deltas after commit. CommitSubmit
+      // itself is unchanged — both are HTTP-body siblings, not sequencer
+      // input.
       const submitBody = {
         submit,
-        rider_destinations: this.riderDestinationsFor(request, planned.selection.riders)
+        rider_destinations: this.riderDestinationsFor(request, classifier, planned),
+        relate_destinations: this.relateDestinationsFor(request, classifier, planned, targetScope)
       };
       let reply: CommitReply;
       try {
@@ -518,7 +659,7 @@ export class NetGatewayDO {
           // disagreement naming nothing, reseed the scope's closure)
           // and re-plan.
           await this.tryRecovery(trace, async () => {
-            if (mismatchKeys.length > 0) await this.refreshCells(request, view, mismatchKeys, destination);
+            if (mismatchKeys.length > 0) await this.refreshCells(request, classifier, view, mismatchKeys);
             else await this.reseedFromScope(view, destination);
           });
           break;
@@ -560,6 +701,149 @@ export class NetGatewayDO {
     });
   }
 
+  /**
+   * /net/plan-scheduled — CO16 planner execution: run a scope's due
+   * scheduled turn through the NORMAL turn machinery (the same repair
+   * loop, pinning, attestation, and install-on-accept as /net/turn).
+   *
+   * - **Exactly once.** The idempotency key is the stable
+   *   `sched:<id>:<at_logical_time>`: the scope's outbox delivers
+   *   at-least-once, and every redelivery replans under the SAME key, so
+   *   the committing scope's reply cache (CO2.5, checked before any
+   *   validation) returns the recorded reply instead of re-committing.
+   *   The 200 reply — accepted OR terminal-rejected TurnResult — is what
+   *   deletes the sender's outbox row.
+   * - **Sessions-absent rule (CO14).** ScheduledTurn.call carries
+   *   actor/target/verb/args and no session, so scheduled turns run as
+   *   actor-authority DIRECT-route turns (the lane/tooling allowance) —
+   *   until VTN18.2's engine-side scheduling lands an authority field,
+   *   this is the documented CO16 posture.
+   * - **Pull-on-miss.** A planner may be woken with a COLD view (first
+   *   dispatch after deployment/eviction). Scopes this gateway has never
+   *   seen (no fanout/pull high-water) are pulled before planning: the
+   *   SENDING scope, the catalog scope (class chains + verb bytecode —
+   *   normally KV-seeded at install, CO15), and the call actor's cluster
+   *   by the CO15 `cluster:<actor>` convention (best-effort: a
+   *   non-cluster-rooted actor's pull fails as a named metric and the
+   *   turn falls back to the standard E_MISSING_STATE recovery).
+   *   Head-0 caveat: a scope whose head has never advanced records no
+   *   high-water, so seed-only scopes re-pull per dispatch — redundant
+   *   but harmless, and scheduled turns are rare by design.
+   */
+  private async planScheduled(body: PlanScheduledRequest): Promise<TurnResult> {
+    this.ensureView(); // hydrates the `seen` high-water map alongside the view
+    const turn = body.scheduled_turn;
+    for (const scope of new Set([body.scope, CATALOG_SCOPE, `cluster:${turn.call.actor}`])) {
+      if (this.seen.has(scope)) continue;
+      try {
+        await this.pull({ scope, destination: `scope:${scope}` });
+      } catch (err) {
+        // Named, never silent: the standard planning recovery is the
+        // fallback when a warm-up pull cannot land.
+        console.log(
+          "woo.metric",
+          JSON.stringify({ kind: "net_plan_scheduled_pull_miss_failed", scope, error: String(err), ts: Date.now() })
+        );
+      }
+    }
+    const key = `sched:${turn.id}:${turn.at_logical_time}`;
+    return this.turn({
+      call: {
+        kind: "woo.turn_call.shadow.v1",
+        id: key,
+        route: "direct",
+        scope: body.scope,
+        actor: turn.call.actor,
+        target: turn.call.target,
+        verb: turn.call.verb,
+        args: turn.call.args as PlanTurnInput["call"]["args"]
+      },
+      planningScope: body.scope,
+      catalog_epoch: body.catalog_epoch,
+      idempotency_key: key
+    });
+  }
+
+  /**
+   * /net/session-open — CO14 minting (test/lane-facing until the Phase-4
+   * transports put credential authentication in front of it; CO14: the
+   * gateway authenticates, scopes authorize).
+   *
+   * Honest-path decision, documented: the mint is a DIRECT submit built by
+   * mintSessionSubmit, not a /net/turn — a session mint is a substrate
+   * commit with no verb to execute, so driving the planner would require
+   * a phantom `session_mint` verb in every world. The repair loop is
+   * correspondingly minimal: only `stale_head` can race a mint (the
+   * transcript reads nothing), so refetch the head and resubmit the SAME
+   * transcript — expiry is stamped once, before the loop, keeping the
+   * idempotency key stable across attempts (CO2.5).
+   *
+   * The cluster scope is derived from the view's lineage (CO15 anchor
+   * walk on the actor) when possible; `cluster_destination` overrides the
+   * rpc destination (lane fixtures wiring fake stubs), with the scope
+   * name recovered from the `scope:<scopeName>` convention.
+   */
+  private async sessionOpen(request: SessionOpenRequest): Promise<{
+    reply: CommitReply;
+    scope: string;
+    value: unknown;
+    install_degraded?: boolean;
+  }> {
+    const view = this.ensureView();
+    let clusterScope: string;
+    if (request.cluster_destination?.startsWith("scope:")) {
+      clusterScope = request.cluster_destination.slice("scope:".length);
+    } else {
+      // CO15: derive from view lineage. An actor the view has never
+      // pulled is a materialization miss (CO2.6) — the caller's recovery
+      // is /net/pull then retry — not the assert-class E_LINEAGE the raw
+      // walk throws for unclosed sets.
+      if (!view.has(cellKey("object_lineage", request.actor))) {
+        throw netError("E_MISSING_STATE", "session-open actor is not in the gateway view", {
+          missing: [cellKey("object_lineage", request.actor)]
+        });
+      }
+      const classifier = classifierFromLineage(
+        (object) => (view.get(cellKey("object_lineage", object))?.value as AnchorLineage | undefined) ?? null
+      );
+      clusterScope = classifier.scopeOf(request.actor);
+    }
+    const destination = request.cluster_destination ?? `scope:${clusterScope}`;
+
+    const now = this.host.now();
+    let base = ((await this.host.rpc(destination, "/head")) as { head: ScopeHead }).head;
+    const { submit, value } = mintSessionSubmit({
+      session: request.session,
+      actor: request.actor,
+      ttl_ms: request.ttl_ms,
+      now,
+      base,
+      epoch: request.catalog_epoch,
+      clusterScope
+    });
+    let reply: CommitReply;
+    for (let attempt = 1; ; attempt += 1) {
+      reply = (await this.host.rpc(destination, "/submit", { ...submit, base })) as CommitReply;
+      if (reply.status === "accepted" || !reply.retryable || reply.reason !== "stale_head" || attempt >= 3) break;
+      base = ((await this.host.rpc(destination, "/head")) as { head: ScopeHead }).head;
+    }
+    if (reply.status !== "accepted") return { reply, scope: clusterScope, value };
+    // Install the accepted session cell into the view (warm cache-fill,
+    // CO7) — the same degrade rule as /net/turn (fix 5a): the commit is
+    // durable; a failed fill self-repairs on the next turn's read check.
+    let installDegraded = false;
+    try {
+      await this.installTouched(view, destination, reply.touched);
+    } catch (err) {
+      installDegraded = true;
+      console.log(
+        "woo.metric",
+        JSON.stringify({ kind: "net_session_open_install_degraded", scope: clusterScope, error: String(err), ts: Date.now() })
+      );
+    }
+    return { reply, scope: clusterScope, value, ...(installDegraded ? { install_degraded: true } : {}) };
+  }
+
   /** The scope pinned to an idempotency key, or null (fix 5c). */
   private pinnedScope(idempotencyKey: string): string | null {
     const rows = sqlRows<{ scope: string }>(
@@ -580,16 +864,19 @@ export class NetGatewayDO {
   /**
    * Owner attestations for the planned transcript's foreign reads
    * (CO2.3 rider integrity, rule 1). Partition the reads by owning scope
-   * — the same `anchors` routing refreshCells uses; objects absent from
-   * the map anchor to the planning scope — and fetch `POST /net/attest`
-   * from each owner whose scope is NOT the committing one. The committing
-   * scope validates rider reads against these instead of skipping them;
-   * a foreign read submitted without its attestation rejects terminal
-   * `rider_unattested`. Returns undefined when every read is local to
-   * the committing scope (the warm single-scope case adds no RPC).
+   * — the classifier is the same routing refreshCells uses — and fetch
+   * `POST /net/attest` from each owner whose scope is NOT the committing
+   * one. The committing scope validates rider reads against these instead
+   * of skipping them; a foreign read submitted without its attestation
+   * rejects terminal `rider_unattested`. Returns undefined when every
+   * read is local to the committing scope (the warm single-scope case
+   * adds no RPC). Under the derived classifier, class-chain reads anchor
+   * to the catalog scope, so a cross-class turn attests against the
+   * catalog sequencer like any other owner (CO15).
    */
   private async attestForeignReads(
     request: TurnRequest,
+    classifier: ScopeClassifier,
     planned: PlanTurnResult,
     targetScope: string
   ): Promise<CommitSubmit["attestations"]> {
@@ -597,7 +884,14 @@ export class NetGatewayDO {
     for (const read of planned.transcript.reads) {
       const key = netCellKeyFor(read.cell);
       if (key === null) continue; // contents reads are projection reads (CA4)
-      const owner = request.anchors?.[read.cell.object] ?? request.planningScope;
+      // CO14: session cells classify by the calling actor (sessions.ts
+      // classification rule — session ids carry no lineage; their
+      // authority is the actor's cluster). The folded session read of a
+      // room-committed turn attests at the cluster like any rider read.
+      const owner =
+        read.cell.kind === "session"
+          ? classifier.scopeOf(planned.transcript.call.actor)
+          : classifier.scopeOf(read.cell.object);
       if (owner === targetScope) continue; // validated locally at the committing scope
       const keys = byOwner.get(owner) ?? new Set<string>();
       keys.add(key);
@@ -606,8 +900,7 @@ export class NetGatewayDO {
     if (byOwner.size === 0) return undefined;
     const attestations: NonNullable<CommitSubmit["attestations"]> = {};
     for (const [owner, keys] of byOwner) {
-      const destination = request.scopes[owner];
-      if (!destination) throw new Error(`no rpc destination to attest reads owned by ${owner}`);
+      const destination = this.destinationFor(request, owner);
       const reply = (await this.host.rpc(destination, "/attest", { keys: [...keys].sort() })) as {
         owner_head: ScopeHead;
         cells: Array<{ key: string; version: string }>;
@@ -619,29 +912,107 @@ export class NetGatewayDO {
 
   /** Rider forwarding directions for the committing scope (CA3): for
    * each rider scope in the selection, its rpc destination plus the
-   * objects the request anchors to it. The object list rides too because
-   * only the gateway holds the anchor map — the scope shell must know
-   * WHICH accepted cells are the rider's, and the sequencer itself never
-   * learns rider topology (src/net/scope.ts types stay unchanged). */
+   * objects the TRANSCRIPT writes there — writes/moves/creates
+   * classified by the same walk route.ts selected the scope with. The
+   * object list rides because the scope shell must know WHICH accepted
+   * cells are the rider's, and the sequencer itself never learns rider
+   * topology (src/net/scope.ts types stay unchanged). */
   private riderDestinationsFor(
     request: TurnRequest,
-    riders: string[]
+    classifier: ScopeClassifier,
+    planned: PlanTurnResult
   ): Record<string, { destination: string; objects: string[] }> {
+    const riders = new Set(planned.selection.riders);
+    if (riders.size === 0) return {};
+    const objectsByScope = new Map<string, Set<string>>();
+    const put = (scope: string, object: string): void => {
+      if (!riders.has(scope)) return;
+      const set = objectsByScope.get(scope) ?? new Set<string>();
+      set.add(object);
+      objectsByScope.set(scope, set);
+    };
+    for (const write of planned.transcript.writes) {
+      if (netCellKeyFor(write.cell) === null) continue; // contents → projection (CA4)
+      // CO14: a folded session-cell write rides to the ACTOR's cluster
+      // (the same classification route.ts selected the rider scope with);
+      // the listed object is the session id, so the scope shell picks the
+      // accepted session cell for the /adopt row.
+      const owningScope =
+        write.cell.kind === "session"
+          ? classifier.scopeOf(planned.transcript.call.actor)
+          : classifier.scopeOf(write.cell.object);
+      put(owningScope, write.cell.object);
+    }
+    for (const move of planned.transcript.moves ?? []) {
+      put(classifier.scopeOf(move.object), move.object);
+    }
+    for (const create of planned.transcript.creates ?? []) {
+      // route.ts rule: a create's cells land at its anchor's scope when
+      // declared, else with the planning scope.
+      put(create.anchor ? classifier.scopeOf(create.anchor) : request.planningScope, create.object);
+    }
     const out: Record<string, { destination: string; objects: string[] }> = {};
-    for (const rider of riders) {
-      const destination = request.scopes[rider];
-      if (!destination) throw new Error(`no rpc destination for rider scope ${rider}`);
-      const objects = Object.entries(request.anchors ?? {})
-        .filter(([, scope]) => scope === rider)
-        .map(([object]) => object);
-      out[rider] = { destination, objects };
+    for (const rider of planned.selection.riders) {
+      out[rider] = {
+        destination: this.destinationFor(request, rider),
+        objects: [...(objectsByScope.get(rider) ?? new Set<string>())].sort()
+      };
+    }
+    return out;
+  }
+
+  /** CO13 relation-owner directions for the committing scope: the
+   * transcript's relation OWNER objects — move sources/destinations,
+   * create locations, contents-write containers, session-transition
+   * rooms — classified by the same walk route.ts selects scopes with,
+   * keeping only owners anchored to a scope OTHER than the committing
+   * one. The scope shell feeds these to the sequencer's delta partition
+   * (`scopeOf`) and addresses the /net/relate outbox rows from them —
+   * anchor topology stays gateway knowledge (the rider_destinations
+   * rule). An owner the classifier cannot place falls back to the
+   * planning scope inside `classifierFor`, so a same-turn-created
+   * container classifies with the turn, never as a spurious foreign
+   * owner. */
+  private relateDestinationsFor(
+    request: TurnRequest,
+    classifier: ScopeClassifier,
+    planned: PlanTurnResult,
+    targetScope: string
+  ): Record<string, { destination: string; objects: string[] }> {
+    const owners = new Set<string>();
+    for (const move of planned.transcript.moves ?? []) {
+      if (move.from) owners.add(move.from);
+      owners.add(move.to);
+    }
+    for (const create of planned.transcript.creates ?? []) {
+      if (create.location) owners.add(create.location);
+    }
+    for (const write of planned.transcript.writes) {
+      if (write.cell.kind === "contents") owners.add(write.cell.object);
+    }
+    const transition = planned.transcript.sessionScopeTransition;
+    if (transition?.from) owners.add(transition.from);
+    if (transition?.to) owners.add(transition.to);
+
+    const objectsByScope = new Map<string, Set<string>>();
+    for (const owner of owners) {
+      const scope = classifier.scopeOf(owner);
+      if (scope === targetScope) continue; // local owner: the commit applies its rows itself
+      const set = objectsByScope.get(scope) ?? new Set<string>();
+      set.add(owner);
+      objectsByScope.set(scope, set);
+    }
+    const out: Record<string, { destination: string; objects: string[] }> = {};
+    for (const [scope, objects] of objectsByScope) {
+      out[scope] = { destination: this.destinationFor(request, scope), objects: [...objects].sort() };
     }
     return out;
   }
 
   /** One planning pass against the current view. The provisional base is
    * patched after the head fetch — `base` is an envelope field, not part
-   * of the transcript hash. */
+   * of the transcript hash. Catalog-scope lineage keys ride as the
+   * receiver-known set (CO15: class chains never reship). */
   private async planOnce(request: TurnRequest, view: CellStore, classifier: ScopeClassifier): Promise<PlanTurnResult> {
     return planTurn({
       call: request.call,
@@ -651,6 +1022,7 @@ export class NetGatewayDO {
       base: { seq: 0, hash: "provisional" },
       idempotencyKey: request.idempotency_key,
       stamp: { scope_head: "gateway", catalog_epoch: request.catalog_epoch },
+      receiverKnown: this.catalogKnownKeys(view, classifier),
       ...(request.counters !== undefined ? { counters: request.counters } : {})
     });
   }
@@ -693,23 +1065,28 @@ export class NetGatewayDO {
 
   /** Targeted view refresh (the E_READ_VERSION / E_MISSING_STATE
    * recovery): fetch exactly `keys`, lineage-closed, from each key's
-   * owning scope — `anchors` maps objects to scopes; unanchored objects
-   * belong to the scope the turn was talking to (`fallback`). `known` is
-   * the view's lineage keys, so the transfer never reships the class
-   * chain (CO7). A requested key that comes back absent was deleted at
-   * the authority. */
+   * owning scope — the classifier routes each object (its fallback
+   * already covers objects the view cannot classify: they refresh from
+   * the planning scope, the legacy behavior). `known` is the view's
+   * lineage keys, so the transfer never reships the class chain (CO7).
+   * A requested key that comes back absent was deleted at the
+   * authority. */
   private async refreshCells(
     request: TurnRequest,
+    classifier: ScopeClassifier,
     view: CellStore,
-    keys: string[],
-    fallback: string | undefined
+    keys: string[]
   ): Promise<void> {
     if (keys.length === 0) return;
     const byDestination = new Map<string, string[]>();
     for (const key of keys) {
-      const scope = request.anchors?.[objectOfCellKey(key)];
-      const destination = (scope !== undefined ? request.scopes[scope] : undefined) ?? fallback;
-      if (!destination) throw new Error(`no rpc destination to refresh ${key}`);
+      // CO14: session cell keys name session ids (no lineage); the only
+      // session cell a turn's reads can name is the CALL's session, whose
+      // authority is the calling actor's cluster (sessions.ts rule).
+      const owner = key.startsWith("session:")
+        ? classifier.scopeOf(request.call.actor)
+        : classifier.scopeOf(objectOfCellKey(key));
+      const destination = this.destinationFor(request, owner);
       byDestination.set(destination, [...(byDestination.get(destination) ?? []), key]);
     }
     const known = [...view.keys()].filter((key) => key.startsWith("object_lineage:"));
@@ -795,6 +1172,12 @@ export class NetGatewayDO {
         const applied = applyFanout(view, this.seen, body);
         if (applied) {
           for (const cell of body.cells) this.persistCell(view, cell.key);
+          // CO13: relation deltas ride the same body and the same seq
+          // gate — a redelivered body no-ops above (applyFanout), so the
+          // mirror never double-applies. applyFanout itself stays
+          // cell-only (relation rows are not cells); the shell owns the
+          // mirror table.
+          for (const delta of body.relations ?? []) this.applyRelationDelta(delta);
           this.state.storage.sql.exec(
             "INSERT INTO net_gateway_scope (scope, seen_seq) VALUES (?, ?) ON CONFLICT(scope) DO UPDATE SET seen_seq = excluded.seen_seq",
             body.scope,
@@ -804,6 +1187,25 @@ export class NetGatewayDO {
         return applied;
       })
     );
+  }
+
+  /** One relation delta into the mirror table (add = upsert, remove =
+   * delete; both idempotent, matching applyRelationDeltas' semantics at
+   * the owning scope). */
+  private applyRelationDelta(delta: RelationDelta): void {
+    const key = relationKey(delta.row.relation, delta.row.owner, delta.row.member);
+    if (delta.op === "add") {
+      this.state.storage.sql.exec(
+        "INSERT INTO net_gateway_relation (key, relation, owner, member, body) VALUES (?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET body = excluded.body",
+        key,
+        delta.row.relation,
+        delta.row.owner,
+        delta.row.member,
+        delta.row.body !== undefined ? JSON.stringify(delta.row.body) : null
+      );
+    } else {
+      this.state.storage.sql.exec("DELETE FROM net_gateway_relation WHERE key = ?", key);
+    }
   }
 
   /**

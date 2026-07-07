@@ -94,7 +94,7 @@ async function advanceScope(scopeDO: Fetchable, env: NetScopeEnv): Promise<void>
   const head = (await call<{ head: ScopeHead }>(scopeDO, env, "/head")).head;
   const transcript = {
     kind: "woo.effect_transcript.shadow.v1",
-    route: "sequenced",
+    route: "direct",
     scope: SCOPE,
     seq: head.seq + 1,
     call: { actor: "#actor", target: "#thing", verb: "set_label", args: [], body: undefined },

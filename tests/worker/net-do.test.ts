@@ -114,7 +114,7 @@ describe("NetScopeDO over fake-DO storage", () => {
 
     const transcript = {
       kind: "woo.effect_transcript.shadow.v1",
-      route: "sequenced",
+      route: "direct",
       scope: "room-a",
       seq: 1,
       call: { actor: "#actor", target: "#thing", verb: "set_label", args: [], body: undefined },
@@ -189,7 +189,7 @@ describe("NetScopeDO over fake-DO storage", () => {
 
     const transcript = {
       kind: "woo.effect_transcript.shadow.v1",
-      route: "sequenced",
+      route: "direct",
       scope: "room-a",
       seq: 1,
       call: { actor: "#actor", target: "#thing", verb: "set_label", args: [], body: undefined },
@@ -259,7 +259,7 @@ describe("NetScopeDO over fake-DO storage", () => {
 
     const transcriptWith = (reads: unknown[], hash: string) => ({
       kind: "woo.effect_transcript.shadow.v1",
-      route: "sequenced",
+      route: "direct",
       scope: "room-a",
       seq: 1,
       call: { actor: "#actor", target: "#thing", verb: "set_label", args: [], body: undefined },
@@ -402,7 +402,12 @@ describe("NetGatewayDO end-to-end over fake-DO", () => {
       planningScope: "room-a",
       catalog_epoch: EPOCH,
       idempotency_key: "gw-turn-1",
-      scopes: { "room-a": "scope:room-a" }
+      scopes: { "room-a": "scope:room-a" },
+      // Lane override (deprecated for production — CO15): the hand-built
+      // seedCells fixture is not a derivable topology; keep the legacy
+      // classifier. Derived-topology turns are covered by
+      // tests/worker/net-topology-turn.test.ts.
+      shared: ["room-a"]
     }).catch((err) => ({ reply: { status: "rejected" } as CommitReply, selection: { scope: "err" }, err: String(err) }));
     // A verb miss in a sparse view surfaces as a taxonomy/E_VERBNF-shaped
     // error, not a crash — either way the plumbing responded coherently.
@@ -436,6 +441,104 @@ describe("NetGatewayDO end-to-end over fake-DO", () => {
     scope.close();
   });
 
+  it("session-open mints at the cluster scope and installs the cell in the view (CO14)", async () => {
+    const scopeEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET };
+    const cluster = makeScope("cluster-actor", scopeEnv);
+    await call(cluster.instance, scopeEnv, "/seed", { scope: "cluster:#actor", catalog_epoch: EPOCH, cells: seedCells() });
+
+    const gatewayState = netState("gateway-sessions");
+    const gatewayEnv: NetGatewayEnv = {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_RESOLVE: (destination) => {
+        if (destination === "scope:cluster:#actor") return cluster.instance;
+        throw new Error(`unexpected destination ${destination}`);
+      }
+    };
+    const gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
+
+    const opened = await call<{ reply: CommitReply; scope: string; value: { id: string; actor: string; expiresAt: number } }>(
+      gateway,
+      gatewayEnv,
+      "/session-open",
+      { session: "s-open-1", actor: "#actor", ttl_ms: 60_000, catalog_epoch: EPOCH, cluster_destination: "scope:cluster:#actor" }
+    );
+    expect(opened.reply.status, JSON.stringify(opened.reply)).toBe("accepted");
+    expect(opened.scope).toBe("cluster:#actor");
+    expect(opened.value).toMatchObject({ id: "s-open-1", actor: "#actor" });
+
+    // The accepted cell is authoritative at the cluster…
+    const closure = await call<{ cells: Array<{ key: string; value: unknown }> }>(
+      cluster.instance,
+      scopeEnv,
+      "/closure",
+      { keys: ["session:s-open-1"], known: [] }
+    );
+    expect(closure.cells).toHaveLength(1);
+    expect(closure.cells[0].value).toMatchObject({ id: "s-open-1", actor: "#actor" });
+
+    // …and installed into the gateway view as a derived copy (CO7 fill).
+    const probe = await call<{ cell: { value: unknown; provenance: string } | null }>(
+      gateway,
+      gatewayEnv,
+      "/cell?key=session:s-open-1"
+    );
+    expect(probe.cell?.provenance).toBe("derived");
+    expect(probe.cell?.value).toMatchObject({ id: "s-open-1", actor: "#actor" });
+
+    // A sequenced submit at the cluster can now name the session: the
+    // shell's authorize validates it from the OWNED cell (CO4 step 1).
+    const head = (await call<{ head: ScopeHead }>(cluster.instance, scopeEnv, "/head")).head;
+    const transcript = {
+      kind: "woo.effect_transcript.shadow.v1",
+      route: "sequenced",
+      scope: "cluster:#actor",
+      seq: 1,
+      session: "s-open-1",
+      call: { actor: "#actor", target: "#thing", verb: "set_label", args: [], body: undefined },
+      reads: [],
+      writes: [{ cell: { kind: "prop", object: "#thing", name: "label" }, value: "sessioned", op: "set", writer: WRITER }],
+      creates: [],
+      moves: [],
+      observations: [],
+      logicalInputs: [],
+      untrackedEffects: [],
+      complete: true,
+      incompleteReasons: [],
+      hash: "net-do-session-1"
+    };
+    const { applyTranscript } = await import("../../src/net/transcript");
+    const { ScopeSequencer } = await import("../../src/net/scope");
+    const twin = new ScopeSequencer("cluster:#actor", EPOCH);
+    twin.seed(seedCells());
+    const derived = applyTranscript(twin.store, transcript as never, { scope_head: "x", catalog_epoch: EPOCH });
+    const sequencedReply = await call<CommitReply>(cluster.instance, scopeEnv, "/submit", {
+      kind: "woo.net.commit_submit.v1",
+      scope: "cluster:#actor",
+      base: head,
+      idempotency_key: "session-turn-1",
+      transcript,
+      post_state_version: derived.postStateVersion,
+      stamp: { scope_head: "x", catalog_epoch: EPOCH }
+    });
+    expect(sequencedReply.status, JSON.stringify(sequencedReply)).toBe("accepted");
+
+    // Minting an already-EXPIRED session is refused with the named
+    // verdict — through the real shell wiring, not just the library.
+    const expiredOpen = await call<{ reply: CommitReply }>(gateway, gatewayEnv, "/session-open", {
+      session: "s-open-dead",
+      actor: "#actor",
+      ttl_ms: -1,
+      catalog_epoch: EPOCH,
+      cluster_destination: "scope:cluster:#actor"
+    });
+    expect(expiredOpen.reply.status).toBe("rejected");
+    if (expiredOpen.reply.status === "rejected") {
+      expect(expiredOpen.reply.reason).toBe("unauthorized");
+      expect(expiredOpen.reply.detail).toMatchObject({ session: "s-open-dead", session_verdict: "expired" });
+    }
+    cluster.close();
+  });
+
   it("a pull advances the fanout high-water to the closure head, so stale pre-pull fanout rows no-op (fix 7)", async () => {
     const scopeEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET };
     const scope = makeScope("room-a", scopeEnv);
@@ -446,7 +549,7 @@ describe("NetGatewayDO end-to-end over fake-DO", () => {
     const head0 = (await call<{ head: ScopeHead }>(scope.instance, scopeEnv, "/head")).head;
     const transcript = {
       kind: "woo.effect_transcript.shadow.v1",
-      route: "sequenced",
+      route: "direct",
       scope: "room-a",
       seq: 1,
       call: { actor: "#actor", target: "#thing", verb: "set_label", args: [], body: undefined },

@@ -25,6 +25,7 @@ import { CellStore, cellKey, cellVersion } from "../../src/net/cells";
 import { planTurn } from "../../src/net/plan";
 import type { ScopeClassifier } from "../../src/net/route";
 import { ScopeSequencer, type CommitSubmit } from "../../src/net/scope";
+import { classifierFromCells, partitionCells } from "../../src/net/topology";
 import { netCellKeyFor } from "../../src/net/transcript";
 
 const SCOPE = "home";
@@ -230,28 +231,34 @@ describe("differential gate: v2-native vs net commit layer (CO12.4)", () => {
     expect((minted[0].value as { name: string }).name).toBe("minted widget");
   });
 
-  it("two scopes: retargeted actor move, CA3 rider adoption, cross-scope read closure", async () => {
+  it("three scopes via partitionCells: retargeted carried-item move, CA3 rider adoption, catalog attestation", async () => {
     // The multi-scope commit paths the single-scope scenario cannot reach:
     // route.ts retargeting to a non-planning scope, ride-along writes
     // committed at the shared scope and adopted by the owner, and reads
     // validated only by the scope that owns them (scope.owns — CO2.4 is a
-    // per-authority attestation; without `owns` the move turn below
-    // rejects read_version_mismatch on the foreign $player:moveto verb
-    // read, which is how this gap was demonstrated before fixing).
+    // per-authority attestation).
     //
-    // Topology: the actor is its own anchor cluster ("cluster"); every
-    // other object — rooms, classes — anchors to the one shared scope
-    // ("world"). Rooms are $thing containers so the move chain runs
-    // without $space presence/session machinery (presence rows are CO9
-    // projections with no net applier until Phase 3, and $space
-    // enter/exit hooks emit wall-clock `ts` observations that can never
-    // compare deep-equal across two separately-timed executions).
+    // Topology is DERIVED, not hand-mapped (CO15, Phase 3.5 item 2): the
+    // classifier comes from topology.ts over the genesis cells, and the
+    // sequencers are seeded from partitionCells — one authority per
+    // partition of one bootstrap world. Rooms are real $space children
+    // (bootstrap $space defines no acceptable/enterfunc/exitfunc hooks,
+    // so the move chain stays deterministic); the moved object is a
+    // CARRIED item (actor-anchored → the actor's cluster scope) rather
+    // than the actor itself, because an actor moveto runs the $space
+    // presence/session machinery whose net applier is CO13/CO14 work
+    // (items 3-4), not this item. Class-chain reads ($thing:moveto,
+    // $space lineage) anchor to the CATALOG scope, so every cross-scope
+    // turn here also exercises catalog attestation.
     const world = createWorld();
     const session = world.auth("guest:differential-2");
     const actor = session.actor;
     world.object(actor).flags.programmer = true;
-    world.createObject({ id: "diff2_room", name: "North Room", parent: "$thing", owner: actor });
-    world.createObject({ id: "diff2_annex", name: "South Annex", parent: "$thing", owner: actor });
+    world.createObject({ id: "diff2_room", name: "North Room", parent: "$space", owner: actor });
+    world.createObject({ id: "diff2_annex", name: "South Annex", parent: "$space", owner: actor });
+    // The carried item: anchored to the actor, so its authority cells
+    // live at the actor's cluster (CO15 "actors + carried").
+    world.createObject({ id: "diff2_satchel", name: "Satchel", parent: "$thing", owner: actor, anchor: actor, location: actor });
     world.defineProperty("diff2_room", { name: "visits", defaultValue: 0, owner: actor, perms: "rw", typeHint: "int" });
     // The rider property's def lives on the actor's CLASS: the actor's own
     // cell is value-only, so the shared scope's rider apply (which has no
@@ -276,25 +283,49 @@ describe("differential gate: v2-native vs net commit layer (CO12.4)", () => {
       null
     );
     expect(installed.ok).toBe(true);
+    // Satchel verb: the pure-movement turn. $thing's native :moveto is
+    // not direct_callable, so the scripted move goes through an authored
+    // delegating verb (the scenario-1 `stash` idiom); the movetoChecked
+    // chain underneath is identical.
+    const stowInstalled = installVerb(
+      world,
+      "diff2_satchel",
+      "stow",
+      `verb :stow(target) rxd {
+        moveto(this, target);
+        return location(this);
+      }`,
+      null
+    );
+    expect(stowInstalled.ok).toBe(true);
     // Start the actor in the north room (genesis state, shared by both
-    // sides), so the scripted move is room → annex with no catalog-lobby
-    // exit hooks in the compared turns.
+    // sides), so the scripted turns run with the room occupied. The
+    // genesis placement is the one actor-moveto here — its presence
+    // writes land in the exported genesis, never in a compared turn.
     const placed = await world.directCall("diff2-genesis-place", actor, actor, "moveto", ["diff2_room"], { sessionId: session.id });
     expect(placed.op).toBe("result");
     const genesis2 = world.exportWorld();
+    const genesisCells = cellsFromSerialized(genesis2);
 
-    const CLUSTER_SCOPE = "cluster";
-    const WORLD_SCOPE = "world";
-    const classifier2: ScopeClassifier = {
-      scopeOf: (object) => (object === actor ? CLUSTER_SCOPE : WORLD_SCOPE),
-      isShared: (scope) => scope === WORLD_SCOPE
-    };
+    // CO15: classifier and partition both DERIVED from the genesis cells.
+    const classifier2: ScopeClassifier = classifierFromCells(genesisCells as never);
+    const ROOM_SCOPE = "room:diff2_room";
+    const CLUSTER_SCOPE = `cluster:${actor}`;
+    // CO14: session ids carry no lineage — a session's scope is its
+    // ACTOR's cluster (partitionCells' rule). The harness owns/attest
+    // lookups route session ids through this map.
+    const sessionActorById = new Map(genesis2.sessions.map((row) => [row.id, row.actor] as const));
+    const scopeOfObjectOrSession = (object: string): string =>
+      classifier2.scopeOf(sessionActorById.get(object) ?? object);
 
-    // The scripted turns with their expected commit routing.
+    // The scripted turns with their expected commit routing: the greet is
+    // the CA3 ride-along (room write + actor rider); the satchel move is
+    // the pure-movement retarget — the moved object's home is the actor's
+    // cluster, so the commit leaves the planning (room) scope entirely.
     const script: Array<{ id: string; target: string; verb: string; args: unknown[]; scope: string; riders: string[] }> = [
-      { id: "diff2-turn-1", target: "diff2_room", verb: "greet", args: [], scope: WORLD_SCOPE, riders: [CLUSTER_SCOPE] },
-      { id: "diff2-turn-2", target: actor, verb: "moveto", args: ["diff2_annex"], scope: CLUSTER_SCOPE, riders: [] },
-      { id: "diff2-turn-3", target: "diff2_room", verb: "greet", args: [], scope: WORLD_SCOPE, riders: [CLUSTER_SCOPE] }
+      { id: "diff2-turn-1", target: "diff2_room", verb: "greet", args: [], scope: ROOM_SCOPE, riders: [CLUSTER_SCOPE] },
+      { id: "diff2-turn-2", target: "diff2_satchel", verb: "stow", args: ["diff2_annex"], scope: CLUSTER_SCOPE, riders: [] },
+      { id: "diff2-turn-3", target: "diff2_room", verb: "greet", args: [], scope: ROOM_SCOPE, riders: [CLUSTER_SCOPE] }
     ];
 
     // ---- Side A: v2-native, same recorder capture as scenario 1.
@@ -314,20 +345,23 @@ describe("differential gate: v2-native vs net commit layer (CO12.4)", () => {
         .map((cell) => [cellKey(cell.kind, cell.object, cell.name), cellVersion(cell.value)] as const)
     );
 
-    // ---- Side B: TWO sequencers, one per scope, each the single
-    // authority for its partition of the genesis cells and validating
-    // only the reads it owns (foreign reads are the other scope's
-    // attestation — scope.owns).
-    const sequencers = new Map<string, ScopeSequencer>([
-      [WORLD_SCOPE, new ScopeSequencer(WORLD_SCOPE, EPOCH, { owns: (object) => classifier2.scopeOf(object) === WORLD_SCOPE })],
-      [CLUSTER_SCOPE, new ScopeSequencer(CLUSTER_SCOPE, EPOCH, { owns: (object) => classifier2.scopeOf(object) === CLUSTER_SCOPE })]
-    ]);
-    for (const cell of cellsFromSerialized(genesis2)) {
-      // Session cells key on session ids (no anchor); they ride with the
-      // shared scope, and are excluded from comparison anyway.
-      (sequencers.get(classifier2.scopeOf(cell.object)) as ScopeSequencer).seed([cell]);
+    // ---- Side B: ONE sequencer per partitionCells partition — the room,
+    // the actor's cluster, the catalog scope (class lineage + verb
+    // bytecode + the seed substrate), plus every other partition the
+    // bundled world carries (other rooms, other guests' clusters). Each
+    // is the single authority for its partition and validates only the
+    // reads it owns (foreign reads are the owners' attestations —
+    // scope.owns). Session cells partition with their actor's cluster
+    // (CO14) and are excluded from comparison anyway.
+    const partitions = partitionCells(genesisCells);
+    expect([...partitions.keys()]).toEqual(expect.arrayContaining([ROOM_SCOPE, CLUSTER_SCOPE, "catalog", "room:diff2_annex"]));
+    const sequencers = new Map<string, ScopeSequencer>();
+    for (const [scope, cells] of partitions) {
+      const seq = new ScopeSequencer(scope, EPOCH, { owns: (object) => scopeOfObjectOrSession(object) === scope });
+      seq.seed(cells);
+      sequencers.set(scope, seq);
     }
-    // One gateway view spanning BOTH scopes (the cross-scope read closure
+    // One gateway view spanning EVERY scope (the cross-scope read closure
     // every turn plans against).
     const view = new CellStore("derived");
     for (const seq of sequencers.values()) for (const cell of storeCells(seq.store)) view.install(cell);
@@ -346,7 +380,7 @@ describe("differential gate: v2-native vs net commit layer (CO12.4)", () => {
       for (const read of transcript.reads) {
         const key = netCellKeyFor(read.cell as never);
         if (key === null) continue; // contents reads are projection reads (CA4)
-        const owner = classifier2.scopeOf(read.cell.object);
+        const owner = scopeOfObjectOrSession(read.cell.object);
         if (owner === committingScope) continue;
         const keys = byOwner.get(owner) ?? new Set<string>();
         keys.add(key);
@@ -371,7 +405,7 @@ describe("differential gate: v2-native vs net commit layer (CO12.4)", () => {
           kind: "woo.turn_call.shadow.v1",
           id: `${turn.id}-b`,
           route: "direct",
-          scope: WORLD_SCOPE, // the session's planning scope; route.ts picks the commit scope
+          scope: ROOM_SCOPE, // the session's planning scope; route.ts picks the commit scope
           session: session.id,
           actor,
           target: turn.target,
@@ -379,7 +413,7 @@ describe("differential gate: v2-native vs net commit layer (CO12.4)", () => {
           args: turn.args as never[]
         },
         view,
-        planningScope: WORLD_SCOPE,
+        planningScope: ROOM_SCOPE,
         classifier: classifier2,
         base: target.head(),
         idempotencyKey: turn.id,
@@ -445,6 +479,9 @@ describe("differential gate: v2-native vs net commit layer (CO12.4)", () => {
     const merged = new Map<string, ReturnType<CellStore["get"]>>();
     for (const seq of sequencers.values()) {
       for (const cell of storeCells(seq.store)) {
+        // Session cells key on session ids (no lineage to classify) and
+        // are excluded from the comparison below — skip them here.
+        if (cell.kind === "session") continue;
         if (classifier2.scopeOf(cell.object) === seq.scope || !merged.has(cell.key)) merged.set(cell.key, cell);
       }
     }
@@ -457,13 +494,13 @@ describe("differential gate: v2-native vs net commit layer (CO12.4)", () => {
     }
     expect(diffs, `two-scope differential divergence (net authority vs v2 reference):\n${diffs.join("\n")}`).toEqual([]);
 
-    // The cross-scope facts landed where they belong: the actor moved at
-    // its own sequencer (annex), the rider greeted count lives at the
-    // cluster authority (adopted from the world commits: 1 then 1+2=3),
-    // the room's visits at the world authority.
+    // The cross-scope facts landed where they belong: the carried satchel
+    // moved at the actor's OWN cluster sequencer (annex), the rider
+    // greeted count lives at the cluster authority (adopted from the room
+    // commits: 1 then 1+2=3), the room's visits at the room authority.
     const cluster = sequencers.get(CLUSTER_SCOPE) as ScopeSequencer;
-    const shared = sequencers.get(WORLD_SCOPE) as ScopeSequencer;
-    expect((cluster.store.get(`object_live:${actor}`)?.value as { location: string }).location).toBe("diff2_annex");
+    const shared = sequencers.get(ROOM_SCOPE) as ScopeSequencer;
+    expect((cluster.store.get("object_live:diff2_satchel")?.value as { location: string }).location).toBe("diff2_annex");
     expect(cluster.store.get(`property_cell:${actor}:greeted`)?.value).toMatchObject({ value: 3 });
     expect(cluster.store.get(`property_cell:${actor}:greeted`)?.provenance).toBe("authoritative");
     expect(shared.store.get("property_cell:diff2_room:visits")?.value).toMatchObject({ value: 2 });

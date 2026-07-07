@@ -49,6 +49,15 @@ export function selectCommitScope(
   const written = new Set<string>();
   for (const write of transcript.writes) {
     if (netCellKeyFor(write.cell) === null) continue; // contents → projection, not authority (CA4)
+    if (write.cell.kind === "session") {
+      // CO14: a transcript's session cells are the CALLING session's (the
+      // mint and the plan-time fold are the only producers — sessions.ts
+      // classification rule), and a session's authority is its actor's
+      // cluster scope. Session ids have no lineage, so the classifier
+      // routes through the actor — mirroring partitionCells.
+      written.add(classifier.scopeOf(transcript.call.actor));
+      continue;
+    }
     written.add(classifier.scopeOf(write.cell.object));
   }
   for (const create of transcript.creates ?? []) {

@@ -17,6 +17,7 @@
  * room-sized; CA12.1 cell-keyed splitting is the deferred scale lever).
  */
 import type { Cell } from "./cells";
+import type { RelationRow } from "./relations";
 import type { CommitReply, ScheduledTurn, ScopeHead } from "./scope";
 
 export type ScopeMeta = {
@@ -60,6 +61,14 @@ export interface ScopeStore {
   readScheduled(): ScheduledTurn[];
   writeScheduled(turn: ScheduledTurn): void;
   deleteScheduled(id: string): void;
+
+  /** Sixth row family (CO13): derived relation rows owned by this scope,
+   * keyed by relationKey(relation, owner, member). Derived — always
+   * rebuildable from authority cells — but persisted so hydration does
+   * not pay a rebuild on every cold start. */
+  readRelations(): RelationRow[];
+  writeRelation(key: string, row: RelationRow): void;
+  deleteRelation(key: string): void;
 }
 
 /** Reference implementation for tests and the in-process host. The
@@ -72,6 +81,7 @@ export class InMemoryScopeStore implements ScopeStore {
   private readonly replies = new Map<string, CommitReply>();
   private tail: TailEntry[] = [];
   private readonly scheduled = new Map<string, ScheduledTurn>();
+  private readonly relations = new Map<string, RelationRow>();
 
   transaction<T>(fn: () => T): T {
     return fn();
@@ -127,5 +137,17 @@ export class InMemoryScopeStore implements ScopeStore {
 
   deleteScheduled(id: string): void {
     this.scheduled.delete(id);
+  }
+
+  readRelations(): RelationRow[] {
+    return [...this.relations.values()].map((row) => structuredClone(row));
+  }
+
+  writeRelation(key: string, row: RelationRow): void {
+    this.relations.set(key, structuredClone(row));
+  }
+
+  deleteRelation(key: string): void {
+    this.relations.delete(key);
   }
 }

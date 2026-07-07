@@ -410,34 +410,101 @@ One write path per fact (CO9), concretized:
 - **The applier runs at the committing scope.** On accept, the scope
   derives relation deltas from the transcript: `projectionWrites`
   (contents add/remove), moves (contents of the source and destination
-  parents), and session-scope transitions (presence). Deltas whose owner
-  object is anchored elsewhere are delivered to the owning scope via the
-  durable outbox (`POST /net/relate`, idempotent by `(from_scope, seq)`);
-  the owner applies them and refans to its own subscribers.
+  parents), and session-scope transitions (presence). Local deltas apply
+  in the SAME transaction as the commit; deltas whose owner object is
+  anchored elsewhere are delivered to the owning scope via the durable
+  outbox (`POST /net/relate`, idempotent by `(from_scope, seq)` — a
+  high-water separate from `/net/adopt`'s, because one turn can produce
+  both facts at the same `(from_scope, seq)`).
+- **Relation delivery applies owner-sequenced.** The owner applies a
+  delivered batch as one owner event — its head advances once, with a
+  `relate:<from_scope>:<seq>` recovery-tail entry (the adoption
+  discipline, CO2.3 rule 2) — and refans the applied deltas to its own
+  subscribers at the advanced seq. The advance is load-bearing:
+  subscriber gateways gate every `FanoutBody` by per-scope seq (CO2.5),
+  so a refan at an unadvanced head would silently no-op. An all-no-op
+  batch (idempotent re-adds, removes of absent rows) advances nothing
+  and refans nothing; the sender high-water still moves.
+- **Relation-owner topology is gateway knowledge** (the
+  `rider_destinations` rule): the gateway classifies the transcript's
+  relation-owner objects (move endpoints, create locations, contents
+  containers, transition rooms) and ships a `relate_destinations` submit
+  sibling; the sequencer partitions deltas through it and never learns
+  anchor topology itself.
 - `contents(parent) = { object | live:location:<object> == parent }`
   (CA4) remains the definitional truth; relation rows are its
   materialization, rebuildable by scanning live cells at the owner (the
-  repair path, bounded by scope size — CO11.1).
+  repair path, bounded by scope size — CO11.1). A multi-scope rebuild
+  drops candidates whose owner is anchored elsewhere: those rows belong
+  at the owning scope, and a local copy would be the CO9 dual write.
+- **The gateway mirror** is fed only by `FanoutBody.relations` (a
+  commit's local deltas, or a `/net/relate` refan) under the same
+  per-scope seq high-water that gates cells; `GET /net/relation
+  ?relation=&owner=` is the client-read primitive for who/contents.
 - **Fanout audiences** are computed from the `session_presence` relation
   (owner = the space, members = live sessions) — CO2.7's
   "O(distinct occupant shards)" gets its production definition here.
+  (CO14's session cells and the presence rows they drive are landed;
+  wiring fanout AUDIENCE selection to the relation arrives with the
+  Phase-4 transports — until then fanout remains per-subscriber.)
 
 ## CO14. Session authority and authentication
 
-- **A session is a cell** (`session:<id>`), authoritative at the ACTOR's
-  cluster scope. Minting/refresh/expiry are ordinary commits there — one
-  write path.
-- **The gateway authenticates; scopes authorize.** The gateway validates
-  client credentials against identity cells in the catalog scope closure
-  (CO15) and mints the session via a turn. Every submit carries the
-  session read in its read closure; CO4 step 1 (`authorize`) checks the
-  session cell (presence, expiry, actor binding) like any other read —
-  attested via CO2.3 rider rules when the commit scope is not the
-  session's owner.
+- **A session is a cell** (`session:<id>`, value = the bridge's
+  `SerializedSession` row — one shape from seed to mint to fold),
+  authoritative at the ACTOR's cluster scope. Minting/refresh/expiry are
+  ordinary commits there — one write path (`mintSessionSubmit` builds
+  the commit; the gateway's `/net/session-open` submits it directly —
+  a mint is a substrate commit with no verb to execute — and installs
+  the accepted cell in its view). Session cells are a **net-only
+  transcript-cell kind**: the v2 recorder never emits them; the bridge
+  (`src/net/transcript.ts`) widens the vocabulary, and only the mint and
+  the plan-time fold produce them.
+- **The gateway authenticates; scopes authorize.** CO4 step 1
+  (`authorize`, `authorizeSessionSubmit`) validates every session the
+  submit answers for — each session-kind read plus the transcript's
+  `session` field — with the named verdicts `expired` / `missing` /
+  `actor_mismatch` / `session_unattested` / `session_required` carried
+  in the `unauthorized` reject detail. Three validation sources, in
+  order: a transcript that WRITES the session cell (mint/refresh/
+  transition) validates the **written value** (demanding pre-existence
+  would forbid minting); an **owned** session validates from the scope's
+  own authoritative cell; a **foreign** session composes the CO2.3
+  machinery — session cells are just cells: the submit must carry the
+  session read plus an owner attestation, and an attested version equal
+  to the read's version proves the read VALUE by content address, which
+  authorize then validates semantically. An attested-but-different
+  version is NOT an auth verdict: step 7 rejects it retryably
+  (`read_version_mismatch`) so a stale view repairs instead of
+  terminal-failing. Ownership witness: the scope holds the cell AND it
+  is not CA3 rider residue. Sessions absent entirely → allowed only for
+  direct-route turns (lane/tooling submits); a sequenced turn must name
+  a session, and Phase-4 transports will require sessions on all
+  client-originated turns. Credential authentication against identity
+  cells in the catalog scope closure (CO15) is the Phase-4 transport
+  story in front of `/net/session-open`.
+- **Every planned submit carries its session read** (folded in by
+  `plan.ts` when the engine transcript lacks it — the engine cannot
+  record session-kind cells), versioned through the plan snapshot, so
+  freshness is pinned by CO4 step 7 like any read.
 - **Session-scope transitions are session-cell writes**, folded in at
-  plan time from the engine's recorded transition; presence (CO13)
-  derives from the committed cell. There is no separate presence write
-  path.
+  plan time from the engine's recorded transition (value = the prior
+  row merged with `activeScope = transition.to`, written by the actor's
+  own frame, BEFORE scope selection so the write participates in
+  write-set routing); presence (CO13) derives from the committed cell's
+  turn. There is no separate presence write path.
+- **Session cells classify by the transcript's calling actor** (route
+  selection, rider directions, attestation, targeted refresh): session
+  ids carry no lineage, the only session cells a transcript carries are
+  the calling session's, and a session's authority is its actor's
+  cluster — the same rule `partitionCells` applies to seed rows.
+- **Engine hydration caveat (stated):** the engine hydrates a session
+  row whose `activeScope` is null (or names an unknown object) to the
+  actor's current location (`hydrateSession`), so a freshly minted
+  session "occupies" wherever its actor stands, and a transition is only
+  recorded when the turn moves the session to a DIFFERENT scope. Net
+  inherits this through the bridge; the lane's session turn therefore
+  enters a room the actor does not already occupy.
 
 ## CO15. Topology, partitioning, and catalog install
 
@@ -464,14 +531,41 @@ One write path per fact (CO9), concretized:
 ## CO16. Scheduled-turn execution
 
 - The scope remains the durable home and the waker (CO2.8); **a
-  registered planner gateway executes**. Subscription carries a role
-  (`fanout` | `planner`); at alarm time the scope delivers each due turn
-  to a planner via the durable outbox
-  (`POST /net/plan-scheduled`), and the planner runs the normal turn
-  machinery with idempotency key `sched:<id>:<at_logical_time>` —
-  at-least-once delivery + the scope's reply cache = fired exactly once.
+  registered planner gateway executes**. `/net/subscribe` carries a
+  role (`fanout` | `planner`; fanout is the default, and fanout/refan
+  delivery targets fanout-role subscribers only — one destination may
+  hold both roles). At alarm time the scope moves each due turn
+  **atomically** from the scheduled row family to a durable outbox row
+  (`POST /net/plan-scheduled {scheduled_turn, scope, catalog_epoch}`)
+  in one transaction: the turn exists in exactly one family at any
+  instant — never lost, never duplicated. Rows address ONE planner,
+  chosen deterministically (the lexicographically first planner-role
+  subscriber, so re-fires address the same reply cache); failover is
+  the outbox lane's ordinary retry/backoff/abandon policy (abandonment
+  is the named divergence) — multi-planner election is deliberately out
+  of scope.
+- **The planner runs the normal turn machinery** (the `/net/turn`
+  repair loop, selection pinning, attestation, install-on-accept) with
+  idempotency key `sched:<id>:<at_logical_time>` — at-least-once
+  delivery + the committing scope's reply cache = fired exactly once. A
+  200 reply (an accepted OR terminal-rejected TurnResult) deletes the
+  sender's outbox row: a terminal verdict will not change on
+  redelivery. A cold planner view **pulls on miss** before planning —
+  the sending scope, the catalog closure, and the call actor's cluster
+  (the CO15 conventions), each only when the gateway holds no
+  high-water for it; anything further rides the standard
+  E_MISSING_STATE recovery.
+- **Scheduled turns are session-less**: `ScheduledTurn.call` carries
+  actor/target/verb/args and no session, so per CO14's sessions-absent
+  rule they run as actor-authority DIRECT-route turns. This is the
+  documented posture until VTN18.2's engine-side scheduling lands an
+  authority field.
 - With no registered planner, due turns stay parked with a named metric
-  (the non-destructive peek is the specified no-planner state).
+  (`net_scope_scheduled_turn_fired`; the non-destructive peek is the
+  specified no-planner state). A later planner subscription arms an
+  immediate wake, so parked overdue turns dispatch without waiting for
+  an unrelated alarm. Dispatches emit
+  `net_scope_scheduled_turn_dispatched`.
 - Engine-side `schedules`/`cancellations` transcript fields (VTN18.2)
   remain deferred until the DSL exposes scheduling; `/net/schedule` is
   the substrate surface until then.

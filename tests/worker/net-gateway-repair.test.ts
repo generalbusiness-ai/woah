@@ -148,7 +148,13 @@ function turnRequest(bump: ShadowTurnCall, idempotencyKey: string) {
     planningScope: SCOPE,
     catalog_epoch: EPOCH,
     idempotency_key: idempotencyKey,
-    scopes: { [SCOPE]: `scope:${SCOPE}` }
+    scopes: { [SCOPE]: `scope:${SCOPE}` },
+    // Lane override (deprecated for production — CO15): this fixture
+    // seeds an ENTIRE bootstrap world into one scope, which is not a
+    // derivable topology; `shared` selects the legacy request-supplied
+    // classifier (everything anchors to planningScope). The derived
+    // path is covered by tests/worker/net-topology-turn.test.ts.
+    shared: [SCOPE]
   };
 }
 

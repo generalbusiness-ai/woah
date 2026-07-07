@@ -28,8 +28,13 @@
  *       POST /net/seed      bootstrap/install path (also how tests build
  *                           a scope; the catalog install pipeline adopts
  *                           it in a later step)
- *       POST /net/subscribe {destination} → register a fanout receiver
- *                           (a gateway shard; maintained on session open)
+ *       POST /net/subscribe {destination, role?} → register a receiver.
+ *                           role "fanout" (default) receives /net/fanout
+ *                           deliveries (a gateway shard; maintained on
+ *                           session open); role "planner" registers a
+ *                           planner gateway for scheduled-turn execution
+ *                           (CO16) — it receives /net/plan-scheduled,
+ *                           never fanout
  *       POST /net/adopt     {from_scope, seq, cells, prior_versions?} →
  *                           CA3 rider adoption as an OWNER-SEQUENCED
  *                           commit (CO2.3): per-cell prior-version CAS,
@@ -37,18 +42,31 @@
  *                           the adopted cells fan out to this scope's
  *                           own subscribers; idempotent by (from_scope,
  *                           seq)
+ *       POST /net/relate    {from_scope, seq, deltas} → CO13 relation
+ *                           delivery: deltas derived at another scope
+ *                           whose owner objects anchor here apply to
+ *                           this scope's relation family (owner-
+ *                           sequenced — the head advances once per
+ *                           applied batch) and refan to this scope's
+ *                           own subscribers; idempotent by (from_scope,
+ *                           seq) — a separate high-water from /adopt
  *       POST /net/schedule  park a scheduled turn + arm the alarm
  *                           (test-facing until the gateway machinery
  *                           schedules from transcripts)
  *   - the durable fanout outbox (CO2.7): accepted commits enqueue
- *     /net/fanout rows (every subscriber) and /net/adopt rows (every
- *     rider scope) in the SAME transaction as the commit write-through,
+ *     /net/fanout rows (every subscriber), /net/adopt rows (every
+ *     rider scope), and /net/relate rows (every foreign relation-owner
+ *     scope) in the SAME transaction as the commit write-through,
  *     then drain via host.defer — never on the reply path; leftover rows
  *     drain on the next request (drain-on-reactivation);
- *   - the alarm() wake path: pop due turns, emit a woo.metric line per
- *     fired turn (planning a scheduled turn arrives with the gateway
- *     machinery), and ALWAYS re-arm from nextAlarmAt() — the queue is
- *     scope state, so a parked task survives eviction (CO2.8).
+ *   - the alarm() wake path (CO16): when a planner-role subscriber is
+ *     registered, each due scheduled turn moves ATOMICALLY from the
+ *     scheduled row family to a durable /plan-scheduled outbox row (one
+ *     transaction — never lost, never duplicated) addressed to ONE
+ *     planner, then drains like any outbox lane; with no planner the due
+ *     turns stay parked with a named metric (the specified no-planner
+ *     state). ALWAYS re-arm from durable state — the queue is scope
+ *     state, so a parked task survives eviction (CO2.8).
  *
  * This class sits beside the v2 DO classes and shares nothing with them:
  * the standing v2 freeze continues, nothing routes production traffic
@@ -59,6 +77,8 @@ import { cellKey, lineageClosureKeys, serializeTransfer, type CellTransfer } fro
 import { isNetError, netError } from "../../net/errors";
 import { Outbox, type FanoutBody, type FanoutRow } from "../../net/outbox";
 import { ScopeSequencer, type CommitSubmit, type ScheduledTurn, type ScopeHead } from "../../net/scope";
+import { authorizeSessionSubmit } from "../../net/sessions";
+import { relationKey, type RelationDelta, type RelationRow } from "../../net/relations";
 import type { ScopeMeta, ScopeStore, TailEntry } from "../../net/scope-store";
 import type { CommitReply } from "../../net/scope";
 import { netCellKeyFor } from "../../net/transcript";
@@ -85,10 +105,26 @@ export type NetScopeEnv = NetBindingsEnv;
  * rider scope, its rpc destination and the objects anchored to it. */
 type RiderDestinations = Record<string, { destination: string; objects: string[] }>;
 
-/** The two outbox delivery surfaces. They drain as separate lanes so a
- * destination carrying both cannot collide row ids, and adoption cannot
- * be held behind a slow subscriber (or vice versa). */
-type OutboxRoute = "/fanout" | "/adopt";
+/** The gateway's CO13 relation-owner directions (submit HTTP-body
+ * sibling, same principle as RiderDestinations: anchor topology is
+ * gateway knowledge the sequencer never learns). Per FOREIGN owner
+ * scope, its rpc destination and the relation-owner OBJECTS (move
+ * sources/destinations, create locations, transition rooms) anchored to
+ * it. The shell turns this into the sequencer's `scopeOf` hints, so the
+ * accept-path delta partition and the /relate row destinations agree by
+ * construction. Absent (direct submits, tests) → every delta is local. */
+type RelateDestinations = Record<string, { destination: string; objects: string[] }>;
+
+/** The four outbox delivery surfaces. They drain as separate lanes so a
+ * destination carrying several cannot collide row ids, and adoption/
+ * relation/planner delivery cannot be held behind a slow subscriber (or
+ * vice versa). */
+type OutboxRoute = "/fanout" | "/adopt" | "/relate" | "/plan-scheduled";
+
+/** Subscriber roles (CO16): `fanout` receives /net/fanout deliveries;
+ * `planner` registers a planner gateway that executes scheduled turns
+ * via /net/plan-scheduled. One destination may hold both roles. */
+type SubscriberRole = "fanout" | "planner";
 
 /** The /adopt outbox body: FanoutBody plus the per-cell prior versions
  * the committing turn observed (the rider-read integrity interim guard —
@@ -97,6 +133,15 @@ type OutboxRoute = "/fanout" | "/adopt";
  * body opaquely and the JSON round-trip through net_scope_outbox keeps
  * the field). */
 type AdoptOutboxBody = FanoutBody & { prior_versions?: Record<string, string> };
+
+/** The /plan-scheduled outbox body (CO16): FanoutBody plus the scheduled
+ * turn and the epoch the planner must plan under. `seq` is NOT a scope
+ * head seq — scheduled dispatch does not advance the head — but the
+ * durable dispatch counter (net_scope_sched_dispatch), which keeps the
+ * outbox row id unique per turn and the planner lane's drain order equal
+ * to dispatch order. Same extra-field-only principle as AdoptOutboxBody:
+ * the src/net/outbox.ts FanoutBody type stays unchanged. */
+type PlanScheduledOutboxBody = FanoutBody & { scheduled_turn: ScheduledTurn; catalog_epoch: string };
 
 /** Rows out of a storage.sql cursor (both the real SqlStorageCursor and
  * the fake expose toArray()). */
@@ -124,6 +169,8 @@ export class SqliteScopeStore implements ScopeStore {
     );
     this.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_scope_tail (seq INTEGER PRIMARY KEY, body TEXT NOT NULL)");
     this.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_scope_scheduled (id TEXT PRIMARY KEY, body TEXT NOT NULL)");
+    // Sixth row family (CO13): derived relation rows this scope owns.
+    this.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_scope_relation (key TEXT PRIMARY KEY, body TEXT NOT NULL)");
   }
 
   transaction<T>(fn: () => T): T {
@@ -221,6 +268,24 @@ export class SqliteScopeStore implements ScopeStore {
   deleteScheduled(id: string): void {
     this.storage.sql.exec("DELETE FROM net_scope_scheduled WHERE id = ?", id);
   }
+
+  readRelations(): RelationRow[] {
+    return sqlRows<{ body: string }>(this.storage.sql.exec("SELECT body FROM net_scope_relation")).map(
+      (row) => JSON.parse(row.body) as RelationRow
+    );
+  }
+
+  writeRelation(key: string, row: RelationRow): void {
+    this.storage.sql.exec(
+      "INSERT INTO net_scope_relation (key, body) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET body = excluded.body",
+      key,
+      JSON.stringify(row)
+    );
+  }
+
+  deleteRelation(key: string): void {
+    this.storage.sql.exec("DELETE FROM net_scope_relation WHERE key = ?", key);
+  }
 }
 
 const SCOPE_ALARM_KEY = "scope";
@@ -242,6 +307,21 @@ export class NetScopeDO {
    * gates the clear so scopes with no outbox history never touch the
    * storage alarm. Lost on eviction by design — see armOutboxRetryAlarm. */
   private outboxAlarmArmed = false;
+  /** In-memory mirror of the rider residue ledger (net_scope_rider_cache),
+   * hydrated lazily and appended on insert — `owns` consults it per read
+   * (CO14 session witness), so a per-call SQL scan would be a hot-path
+   * regression. Discarded with the sequencer on any transaction abort
+   * (memory-follows-durable, fix 3). */
+  private riderCacheMemo: Set<string> | null = null;
+  /** Per-submit relation-owner scope hints (object → owning scope name),
+   * loaded from the gateway's relate_destinations sibling for the
+   * duration of one /net/submit and cleared after. The sequencer's
+   * `scopeOf` option reads this map through a closure: DO requests run
+   * one at a time and the sequencer's submit is synchronous inside the
+   * transaction, so the per-request lifetime is race-free. Outside a
+   * submit the map is empty → every delta classifies local (the
+   * documented no-hints behavior). */
+  private readonly relateScopeHints = new Map<string, string>();
 
   constructor(
     private readonly state: NetScopeDurableState,
@@ -253,14 +333,46 @@ export class NetScopeDO {
     // durable outbox (mirrors src/net/outbox.ts FanoutRow + a route
     // column), and the per-sender adoption high-water (CO2.5 receiver
     // idempotency for /net/adopt).
+    // Subscribers carry a role (CO16): fanout receivers vs the planner
+    // registry. PK is (destination, role) — one gateway commonly holds
+    // BOTH roles (it mirrors fanout AND executes scheduled turns). The
+    // pre-CO16 table was destination-only; migrate by the recreate idiom
+    // (SQLite cannot ALTER a primary key): probe for the role column and,
+    // when absent, rebuild the table in one transaction with existing
+    // rows carrying role='fanout' — they were fanout receivers by
+    // definition. Idempotent: a migrated (or fresh) table has the column
+    // and the probe passes.
     state.storage.sql.exec(
-      "CREATE TABLE IF NOT EXISTS net_scope_subscribers (destination TEXT PRIMARY KEY)"
+      "CREATE TABLE IF NOT EXISTS net_scope_subscribers (destination TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'fanout', PRIMARY KEY (destination, role))"
     );
+    const subscriberColumns = sqlRows<{ name: string }>(state.storage.sql.exec("PRAGMA table_info(net_scope_subscribers)"));
+    if (!subscriberColumns.some((column) => column.name === "role")) {
+      state.storage.transactionSync(() => {
+        state.storage.sql.exec("ALTER TABLE net_scope_subscribers RENAME TO net_scope_subscribers_legacy");
+        state.storage.sql.exec(
+          "CREATE TABLE net_scope_subscribers (destination TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'fanout', PRIMARY KEY (destination, role))"
+        );
+        state.storage.sql.exec(
+          "INSERT INTO net_scope_subscribers (destination, role) SELECT destination, 'fanout' FROM net_scope_subscribers_legacy"
+        );
+        state.storage.sql.exec("DROP TABLE net_scope_subscribers_legacy");
+      });
+    }
     state.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS net_scope_outbox (route TEXT NOT NULL, id TEXT NOT NULL, destination TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL, last_attempt_at_ms INTEGER, PRIMARY KEY (route, id))"
     );
     state.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS net_scope_adopted (from_scope TEXT PRIMARY KEY, seq INTEGER NOT NULL)"
+    );
+    // Relation-delivery high-water (CO13): (from_scope, seq) receiver
+    // idempotency for /net/relate — the same discipline as
+    // net_scope_adopted, in a SEPARATE table because one committing turn
+    // can legitimately produce BOTH an /adopt row and a /relate row to
+    // the same owner at the same (from_scope, seq) (a ride-along write
+    // plus a move whose destination anchors here); a shared counter
+    // would let whichever arrived first swallow the other.
+    state.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS net_scope_related (from_scope TEXT PRIMARY KEY, seq INTEGER NOT NULL)"
     );
     // Rider residue ledger (rider-read integrity, fix 1): keys of cells
     // this scope committed via CA3 ride-along but does NOT anchor. After
@@ -273,6 +385,12 @@ export class NetScopeDO {
     // and its durable mirror keep the authoritative stamp so hydration
     // and post-state derivation stay byte-identical.
     state.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_scope_rider_cache (key TEXT PRIMARY KEY)");
+    // Scheduled-dispatch counter (CO16): a durable monotonic sequence for
+    // /plan-scheduled outbox rows. It must be durable — outbox row ids
+    // embed it (`<destination>/<scope>/<n>`), and a counter reset across
+    // eviction could re-mint the id of a still-pending row, whose
+    // ON CONFLICT DO NOTHING enqueue would silently swallow the new turn.
+    state.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_scope_sched_dispatch (id TEXT PRIMARY KEY, n INTEGER NOT NULL)");
     this.host = new WorkerdHost({
       resolve: (destination) => resolveNetDestination(this.env, destination),
       env,
@@ -295,12 +413,13 @@ export class NetScopeDO {
     try {
       if (request.method === "POST" && url.pathname === "/net/submit") {
         // Bare CommitSubmit (direct submits, tests) or the gateway's
-        // {submit, rider_destinations} sibling shape.
+        // {submit, rider_destinations, relate_destinations} sibling shape.
         const raw = (await request.json()) as
           | CommitSubmit
-          | { submit: CommitSubmit; rider_destinations?: RiderDestinations };
+          | { submit: CommitSubmit; rider_destinations?: RiderDestinations; relate_destinations?: RelateDestinations };
         const submit = "submit" in raw ? raw.submit : raw;
         const riderDestinations = "submit" in raw ? (raw.rider_destinations ?? {}) : {};
+        const relateDestinations = "submit" in raw ? (raw.relate_destinations ?? {}) : {};
         const seq = this.ensureSequencer(submit.scope, submit.stamp.catalog_epoch);
         const headBefore = seq.head().seq;
         // Rider-read integrity (fix 1): capture, BEFORE the commit applies,
@@ -309,30 +428,60 @@ export class NetScopeDO {
         // accept path replaces the cells in place.
         const riderPriors = this.captureRiderPriors(seq, submit, riderDestinations);
         let reply!: CommitReply;
-        // The commit write-through and the outbox enqueue share ONE
-        // transaction (CO2.7: rows are durable before the reply returns;
-        // a crash can never separate a commit from its fanout). The
-        // sequencer's internal transaction joins this outer one.
-        this.discardSeqOnThrow(() =>
-          this.store.transaction(() => {
-            reply = seq.submit(submit);
-            // Idempotent replays (head did not advance) enqueue nothing:
-            // their rows were enqueued when the turn first committed.
-            if (reply.status === "accepted" && reply.head.seq === headBefore + 1) {
-              this.enqueueDeliveries(seq, reply, submit, riderDestinations, riderPriors);
-            }
-          })
-        );
+        // CO13: load the gateway's relation-owner hints for THIS submit —
+        // the sequencer's `scopeOf` reads them to partition derived
+        // relation deltas (see relateScopeHints). Cleared in finally so a
+        // reject/throw can never leak hints into the next request.
+        this.relateScopeHints.clear();
+        for (const [scope, entry] of Object.entries(relateDestinations)) {
+          for (const object of entry.objects) this.relateScopeHints.set(object, scope);
+        }
+        try {
+          // The commit write-through and the outbox enqueue share ONE
+          // transaction (CO2.7: rows are durable before the reply returns;
+          // a crash can never separate a commit from its fanout). The
+          // sequencer's internal transaction joins this outer one.
+          this.discardSeqOnThrow(() =>
+            this.store.transaction(() => {
+              reply = seq.submit(submit);
+              // Idempotent replays (head did not advance) enqueue nothing:
+              // their rows were enqueued when the turn first committed.
+              if (reply.status === "accepted" && reply.head.seq === headBefore + 1) {
+                this.enqueueDeliveries(seq, reply, submit, riderDestinations, riderPriors, relateDestinations);
+              }
+            })
+          );
+        } finally {
+          this.relateScopeHints.clear();
+        }
         this.host.defer(() => this.drainOutbox());
         return json(reply);
       }
       if (request.method === "POST" && url.pathname === "/net/subscribe") {
-        const body = (await request.json()) as { destination?: string };
+        const body = (await request.json()) as { destination?: string; role?: string };
         if (!body.destination) throw new Error("subscribe requires a destination");
+        // CO16 subscriber roles: default stays fanout (every pre-role
+        // caller keeps its behavior); an unknown role is a caller bug —
+        // refuse loudly rather than park it under a role nothing drains.
+        const role: SubscriberRole = (body.role ?? "fanout") as SubscriberRole;
+        if (role !== "fanout" && role !== "planner") {
+          throw new Error(`subscribe role must be "fanout" or "planner", got ${JSON.stringify(body.role)}`);
+        }
         this.state.storage.sql.exec(
-          "INSERT INTO net_scope_subscribers (destination) VALUES (?) ON CONFLICT(destination) DO NOTHING",
-          body.destination
+          "INSERT INTO net_scope_subscribers (destination, role) VALUES (?, ?) ON CONFLICT(destination, role) DO NOTHING",
+          body.destination,
+          role
         );
+        // A newly registered planner must pick up rows parked while no
+        // planner existed (rearmAlarm deliberately never arms for
+        // overdue rows): arm an immediate wake so the durable alarm()
+        // path — the single dispatch point — moves them to the outbox.
+        if (role === "planner") {
+          const now = this.host.now();
+          if (this.store.readScheduled().some((turn) => turn.at_logical_time <= now)) {
+            this.host.setAlarm(SCOPE_ALARM_KEY, now, async () => {});
+          }
+        }
         return json({ ok: true });
       }
       if (request.method === "POST" && url.pathname === "/net/adopt") {
@@ -348,6 +497,18 @@ export class NetScopeDO {
         // off the reply path, same as /net/submit.
         this.host.defer(() => this.drainOutbox());
         return json(adopted);
+      }
+      if (request.method === "POST" && url.pathname === "/net/relate") {
+        const body = (await request.json()) as {
+          from_scope: string;
+          seq: number;
+          deltas: RelationDelta[];
+        };
+        const related = this.relate(body);
+        // A non-empty application enqueued refan rows to this scope's own
+        // subscribers (see relate()); drain them off the reply path.
+        this.host.defer(() => this.drainOutbox());
+        return json(related);
       }
       if (request.method === "POST" && url.pathname === "/net/attest") {
         // CO2.3 rider-read attestation: report this authority's current
@@ -405,12 +566,24 @@ export class NetScopeDO {
   }
 
   /**
-   * DO alarm wake (CO2.8). The sequencer rehydrates from durable state —
-   * in-memory callbacks never survive eviction, which is exactly why the
-   * durable path re-derives everything here. Phase 3 only OBSERVES fired
-   * turns (a woo.metric line each, rows left parked — fix 8a);
-   * planning/submitting the scheduled turn arrives with the Phase-3.5
-   * executor. Re-arming considers future turns and outbox retries.
+   * DO alarm wake (CO2.8, CO16). The sequencer rehydrates from durable
+   * state — in-memory callbacks never survive eviction, which is exactly
+   * why the durable path re-derives everything here.
+   *
+   * Scheduled-turn execution (CO16): PEEK first, then — only when a
+   * planner-role subscriber is registered — move each due turn from the
+   * scheduled row family to a durable /plan-scheduled outbox row in ONE
+   * transaction (the dueTurns pop joins it), so the turn changes family
+   * atomically: never lost (a crash before the transaction leaves it
+   * parked; after it, the outbox's at-least-once drain owns it) and
+   * never duplicated (it exists in exactly one family at any instant,
+   * and the planner's `sched:<id>:<at_logical_time>` idempotency key
+   * de-dupes redeliveries — CO2.5). With NO planner registered the due
+   * turns stay parked with the named metric — the specified no-planner
+   * state (fix 8a's non-destructive peek): destructively popping work
+   * nothing can execute would break CO2.8 silently. Re-arming considers
+   * only FUTURE turns (parked overdue rows cannot spin the alarm) and
+   * outbox retries.
    */
   async alarm(): Promise<void> {
     // Outbox liveness (fix 4a): a QUIET scope must still retry failed
@@ -429,27 +602,97 @@ export class NetScopeDO {
     }
     const seq = this.ensureSequencer(meta.scope, meta.catalog_epoch);
     const now = this.host.now();
-    // Fix 8a: PEEK, never pop. The executor that could actually run
-    // these turns lands in Phase 3.5; destructively popping them here
-    // would delete parked work the wake-up cannot execute (CO2.8 broken
-    // silently). Each due turn logs once per alarm-firing with a note;
-    // the rows stay parked, and the re-arm below considers only FUTURE
-    // turns so overdue rows cannot spin the alarm in a tight loop.
-    for (const turn of seq.peekDue(now)) {
-      console.log(
-        "woo.metric",
-        JSON.stringify({
-          kind: "net_scope_scheduled_turn_fired",
-          scope: seq.scope,
-          id: turn.id,
-          at_logical_time: turn.at_logical_time,
-          fired_at: now,
-          note: "parked: turn executor lands in Phase 3.5; row retained",
-          ts: Date.now()
-        })
-      );
+    const due = seq.peekDue(now);
+    if (due.length > 0) {
+      const planner = this.plannerDestination();
+      if (planner === null) {
+        // The specified no-planner state (CO16): rows stay parked, one
+        // named metric per due turn per alarm firing.
+        for (const turn of due) {
+          console.log(
+            "woo.metric",
+            JSON.stringify({
+              kind: "net_scope_scheduled_turn_fired",
+              scope: seq.scope,
+              id: turn.id,
+              at_logical_time: turn.at_logical_time,
+              fired_at: now,
+              note: "parked: no planner-role subscriber registered (CO16); row retained",
+              ts: Date.now()
+            })
+          );
+        }
+      } else {
+        // Atomic family move: outbox enqueue + scheduled-row pop share
+        // ONE transaction (dueTurns' internal transaction joins). The
+        // dueTurns pop mutates sequencer memory, so the whole block is
+        // discard-on-throw (fix 3): an aborted transaction rehydrates
+        // the queue from the rolled-back store instead of leaving
+        // memory ahead of SQLite.
+        this.discardSeqOnThrow(() =>
+          this.store.transaction(() => {
+            for (const turn of seq.dueTurns(now)) {
+              const dispatchBody: PlanScheduledOutboxBody = {
+                scope: seq.scope,
+                seq: this.nextScheduledDispatch(),
+                cells: [],
+                observations: [],
+                scheduled_turn: turn,
+                catalog_epoch: seq.catalogEpoch
+              };
+              this.persistOutboxRow("/plan-scheduled", planner, dispatchBody);
+            }
+          })
+        );
+        for (const turn of due) {
+          console.log(
+            "woo.metric",
+            JSON.stringify({
+              kind: "net_scope_scheduled_turn_dispatched",
+              scope: seq.scope,
+              id: turn.id,
+              at_logical_time: turn.at_logical_time,
+              fired_at: now,
+              planner,
+              ts: Date.now()
+            })
+          );
+        }
+        this.host.defer(() => this.drainOutbox());
+      }
     }
     this.rearmAlarm(now);
+  }
+
+  /**
+   * The planner destination for scheduled-turn dispatch (CO16): the
+   * lexicographically FIRST planner-role subscriber — deterministic, so
+   * repeated alarms (and re-fires after a crash) address the same
+   * planner and its reply cache. Each outbox row targets this SINGLE
+   * destination; failover to other planners is retry policy (the
+   * planner lane halts/backs off/abandons like any outbox lane —
+   * abandonment is the named net_scope_outbox_abandoned divergence, and
+   * multi-planner election is deliberately out of scope). Null when no
+   * planner is registered — the specified parked state.
+   */
+  private plannerDestination(): string | null {
+    const rows = sqlRows<{ destination: string }>(
+      this.state.storage.sql.exec(
+        "SELECT destination FROM net_scope_subscribers WHERE role = 'planner' ORDER BY destination ASC LIMIT 1"
+      )
+    );
+    return rows.length > 0 ? rows[0].destination : null;
+  }
+
+  /** Next durable scheduled-dispatch sequence number (see the
+   * net_scope_sched_dispatch comment in the constructor). Called only
+   * inside the alarm's move transaction. */
+  private nextScheduledDispatch(): number {
+    this.state.storage.sql.exec(
+      "INSERT INTO net_scope_sched_dispatch (id, n) VALUES ('dispatch', 1) ON CONFLICT(id) DO UPDATE SET n = n + 1"
+    );
+    const rows = sqlRows<{ n: number }>(this.state.storage.sql.exec("SELECT n FROM net_scope_sched_dispatch WHERE id = 'dispatch'"));
+    return Number(rows[0]?.n ?? 1);
   }
 
   /**
@@ -481,6 +724,18 @@ export class NetScopeDO {
     }
     const seq: ScopeSequencer = new ScopeSequencer(resolvedScope, resolvedEpoch, {
       durable: this.store,
+      // CO4 step 1 (CO14): validate the submit's session story — every
+      // session read plus the transcript's session field — from this
+      // authority's own cells when owned, else via the CO2.3 attestation
+      // the submit carries; mint writes validate their written value.
+      // Semantics live in src/net/sessions.ts; the shell only supplies
+      // the ownership witness, the store read, and the clock.
+      authorize: (submit) =>
+        authorizeSessionSubmit(submit, {
+          ownsSession: (id) => this.ownsSessionCell(seq, id),
+          readSession: (id) => seq.store.get(cellKey("session", id)),
+          now: () => this.host.now()
+        }),
       // Ownership wiring (Phase-3 hardening fix 2). Fixed-assignment rule,
       // in force until the Phase-3.5 topology section lands anchor-map-
       // driven ownership: a scope owns an object iff its store holds
@@ -491,7 +746,21 @@ export class NetScopeDO {
       // non-owned cells are skipped at CO4 step 7 by the sequencer: their
       // freshness is the owning scope's + the adopt-time prior-version
       // CAS's job (CO2.4; notes/2026-07-06-rider-read-integrity.md).
-      owns: (object) => seq.store.has(cellKey("object_lineage", object))
+      //
+      // CO14 addendum: session cells key on session ids, which never have
+      // lineage — a scope owns a session iff it HOLDS the cell (the mint
+      // committed here, or the seed partitioned it here with its actor)
+      // AND the cell is not rider residue (a session cell that rode along
+      // in a CA3 commit is a cache of the owner's fact; claiming
+      // ownership of it would let this scope validate reads against a
+      // stale copy — the ownsSessionCell helper excludes the ledger).
+      owns: (object) => seq.store.has(cellKey("object_lineage", object)) || this.ownsSessionCell(seq, object),
+      // CO13 relation-owner classification: the gateway's per-submit
+      // relate_destinations hints (anchor topology is gateway knowledge —
+      // the same rule as rider_destinations); an unhinted owner is local.
+      // The closure reads the mutable hint map so one sequencer instance
+      // serves every submit (hints are loaded/cleared per request).
+      scopeOf: (object) => this.relateScopeHints.get(object) ?? seq.scope
     });
     this.seq = seq;
     return this.seq;
@@ -555,13 +824,25 @@ export class NetScopeDO {
     return { ...transfer, scope: seq.scope, head: seq.head(), catalog_epoch: seq.catalogEpoch };
   }
 
-  /** Keys in the rider residue ledger (see the constructor comment). */
+  /** Keys in the rider residue ledger (see the constructor comment),
+   * memoized in memory (the memo is appended by enqueueDeliveries inside
+   * the commit transaction and discarded on abort — fix 3). */
   private riderCacheKeys(): Set<string> {
-    return new Set(
-      sqlRows<{ key: string }>(this.state.storage.sql.exec("SELECT key FROM net_scope_rider_cache")).map(
-        (row) => row.key
-      )
-    );
+    if (this.riderCacheMemo === null) {
+      this.riderCacheMemo = new Set(
+        sqlRows<{ key: string }>(this.state.storage.sql.exec("SELECT key FROM net_scope_rider_cache")).map(
+          (row) => row.key
+        )
+      );
+    }
+    return this.riderCacheMemo;
+  }
+
+  /** CO14 session-ownership witness (see the `owns` wiring comment): the
+   * scope holds the session cell AND it is not rider residue. */
+  private ownsSessionCell(seq: ScopeSequencer, session: string): boolean {
+    const key = cellKey("session", session);
+    return seq.store.has(key) && !this.riderCacheKeys().has(key);
   }
 
   // ---- Fanout + rider adoption (CO2.7, CA3) ---------------------------
@@ -639,24 +920,29 @@ export class NetScopeDO {
   /**
    * Enqueue the accepted commit's deliveries durably (called inside the
    * submit transaction): a /net/fanout row per registered subscriber
-   * (lineage-closed touched closure + the transcript's observations) and
-   * a /net/adopt row per rider scope carrying only the cells anchored to
-   * it — the gateway's rider_destinations names those objects, because
-   * anchor topology is gateway knowledge the sequencer never learns.
-   * Adopt rows also carry the per-cell prior versions captured pre-commit
-   * (captureRiderPriors) for the owner's CAS, and the shipped rider keys
-   * are recorded in the residue ledger (see the constructor comment).
+   * (lineage-closed touched closure + the transcript's observations +
+   * the commit's LOCAL relation deltas, so subscriber gateways learn
+   * rosters push-fashion — CO13), a /net/adopt row per rider scope
+   * carrying only the cells anchored to it, and a /net/relate row per
+   * foreign relation-owner scope carrying its deltas — the gateway's
+   * rider_destinations/relate_destinations name those objects/scopes,
+   * because anchor topology is gateway knowledge the sequencer never
+   * learns. Adopt rows also carry the per-cell prior versions captured
+   * pre-commit (captureRiderPriors) for the owner's CAS, and the shipped
+   * rider keys are recorded in the residue ledger (see the constructor
+   * comment).
    */
   private enqueueDeliveries(
     seq: ScopeSequencer,
     reply: Extract<CommitReply, { status: "accepted" }>,
     submit: CommitSubmit,
     riderDestinations: RiderDestinations,
-    riderPriors: Map<string, string>
+    riderPriors: Map<string, string>,
+    relateDestinations: RelateDestinations
   ): void {
     const observations = (submit.transcript.observations ?? []) as unknown[];
     const subscribers = sqlRows<{ destination: string }>(
-      this.state.storage.sql.exec("SELECT destination FROM net_scope_subscribers")
+      this.state.storage.sql.exec("SELECT destination FROM net_scope_subscribers WHERE role = 'fanout'")
     );
     if (subscribers.length > 0) {
       const cells = this.fanoutCells(seq, reply.touched);
@@ -665,9 +951,25 @@ export class NetScopeDO {
           scope: seq.scope,
           seq: reply.head.seq,
           cells,
-          observations
+          observations,
+          ...(reply.relations && reply.relations.length > 0 ? { relations: reply.relations } : {})
         });
       }
+    }
+    // CO13: foreign relation deltas go to their owner scopes as durable
+    // /relate rows (same transaction as the commit, same at-least-once
+    // drain, (from_scope, seq) idempotency at the receiver — the /adopt
+    // idioms exactly). The destination comes from the gateway's
+    // relate_destinations when named, else the CO15 `scope:<scopeName>`
+    // convention (the DO namespace key IS the scope name).
+    for (const entry of reply.relations_foreign ?? []) {
+      this.persistOutboxRow("/relate", relateDestinations[entry.scope]?.destination ?? `scope:${entry.scope}`, {
+        scope: seq.scope,
+        seq: reply.head.seq,
+        cells: [],
+        observations: [],
+        relations: entry.deltas
+      });
     }
     for (const rider of Object.values(riderDestinations)) {
       const objects = new Set(rider.objects);
@@ -701,12 +1003,15 @@ export class NetScopeDO {
       };
       this.persistOutboxRow("/adopt", rider.destination, adoptBody);
       // Residue ledger: from now on these keys are a cache of the owner's
-      // fact — a later transfer out of this scope ships them derived.
+      // fact — a later transfer out of this scope ships them derived, and
+      // `owns` never claims them (CO14 session witness). The memo append
+      // rides the same transaction; discardSeqOnThrow drops it on abort.
       for (const cell of cells) {
         this.state.storage.sql.exec(
           "INSERT INTO net_scope_rider_cache (key) VALUES (?) ON CONFLICT(key) DO NOTHING",
           cell.key
         );
+        this.riderCacheMemo?.add(cell.key);
       }
     }
   }
@@ -816,10 +1121,10 @@ export class NetScopeDO {
     }
   }
 
-  /** One drain pass over both route lanes; returns delivered-row count. */
+  /** One drain pass over the route lanes; returns delivered-row count. */
   private async drainOutboxPass(): Promise<number> {
     let deliveredCount = 0;
-    for (const route of ["/fanout", "/adopt"] as const) {
+    for (const route of ["/fanout", "/adopt", "/relate", "/plan-scheduled"] as const) {
         const persisted = sqlRows<{
           id: string;
           destination: string;
@@ -862,6 +1167,31 @@ export class NetScopeDO {
                 cells: adoptBody.cells,
                 // The pre-commit observations for the owner's CAS (fix 1).
                 ...(adoptBody.prior_versions !== undefined ? { prior_versions: adoptBody.prior_versions } : {})
+              });
+            } else if (route === "/relate") {
+              // CO13: the row's FanoutBody carries the deltas; the wire
+              // shape is (from_scope, seq, deltas) — the receiver's
+              // idempotency key plus its application input.
+              await this.host.rpc(row.destination, "/relate", {
+                from_scope: row.body.scope,
+                seq: row.body.seq,
+                deltas: row.body.relations ?? []
+              });
+            } else if (route === "/plan-scheduled") {
+              // CO16: deliver the scheduled turn to the planner gateway,
+              // which runs the normal turn machinery under the stable
+              // `sched:<id>:<at_logical_time>` idempotency key. A 200
+              // (any TurnResult, accepted or terminal-rejected) deletes
+              // the row below: at-least-once delivery + the committing
+              // scope's reply cache = fired exactly once, and a terminal
+              // verdict will not change on redelivery. A thrown rpc
+              // (planner down, E_BUDGET 400) retries on the lane's
+              // backoff and abandons as the named divergence.
+              const schedBody = row.body as PlanScheduledOutboxBody;
+              await this.host.rpc(row.destination, "/plan-scheduled", {
+                scheduled_turn: schedBody.scheduled_turn,
+                scope: schedBody.scope,
+                catalog_epoch: schedBody.catalog_epoch
               });
             } else {
               await this.host.rpc(row.destination, "/fanout", row.body);
@@ -1030,7 +1360,7 @@ export class NetScopeDO {
         // observations to ITS subscribers; this delivers the owner's
         // authoritative cell state.
         const subscribers = sqlRows<{ destination: string }>(
-          this.state.storage.sql.exec("SELECT destination FROM net_scope_subscribers")
+          this.state.storage.sql.exec("SELECT destination FROM net_scope_subscribers WHERE role = 'fanout'")
         );
         if (subscribers.length > 0) {
           const cells = this.fanoutCells(seq, result.applied);
@@ -1054,6 +1384,64 @@ export class NetScopeDO {
   }
 
   /**
+   * CO13 relation delivery: deltas derived at ANOTHER scope whose owner
+   * objects anchor here, applied to this scope's relation family as an
+   * owner-sequenced event (ScopeSequencer.applyForeignRelationDeltas
+   * advances the head once per non-empty batch — see its doc for why the
+   * refan needs a real seq), then REFANNED to this scope's own fanout
+   * subscribers so their gateways learn the roster change push-fashion.
+   *
+   * Mirrors adopt() exactly: the application, the refan enqueue, and the
+   * (from_scope, seq) high-water advance share ONE transaction, so a
+   * crash cannot separate the applied rows from their fanout (CO2.7) and
+   * redelivery no-ops (CO2.5). The high-water advances even when every
+   * delta was a no-op (`empty`): the fact WAS processed; redelivery must
+   * not flap the verdict.
+   */
+  private relate(body: {
+    from_scope: string;
+    seq: number;
+    deltas: RelationDelta[];
+  }): { applied: boolean; changed: number; head: ScopeHead } {
+    const seq = this.ensureSequencer();
+    return this.discardSeqOnThrow(() => this.store.transaction(() => {
+      const rows = sqlRows<{ seq: number }>(
+        this.state.storage.sql.exec("SELECT seq FROM net_scope_related WHERE from_scope = ?", body.from_scope)
+      );
+      const last = rows.length > 0 ? Number(rows[0].seq) : 0;
+      if (body.seq <= last) return { applied: false, changed: 0, head: seq.head() };
+      const result = seq.applyForeignRelationDeltas(body.deltas, { from_scope: body.from_scope, seq: body.seq });
+      if (result.status === "applied") {
+        // Refan exactly the deltas that changed this family (an add of an
+        // identical row / remove of an absent row carries no news) at the
+        // ADVANCED head — subscriber gateways gate by per-scope seq.
+        const changed = new Set(result.changed);
+        const applied = body.deltas.filter((delta) =>
+          changed.has(relationKey(delta.row.relation, delta.row.owner, delta.row.member))
+        );
+        const subscribers = sqlRows<{ destination: string }>(
+          this.state.storage.sql.exec("SELECT destination FROM net_scope_subscribers WHERE role = 'fanout'")
+        );
+        for (const { destination } of subscribers) {
+          this.persistOutboxRow("/fanout", destination, {
+            scope: seq.scope,
+            seq: result.head.seq,
+            cells: [],
+            observations: [],
+            relations: applied
+          });
+        }
+      }
+      this.state.storage.sql.exec(
+        "INSERT INTO net_scope_related (from_scope, seq) VALUES (?, ?) ON CONFLICT(from_scope) DO UPDATE SET seq = excluded.seq",
+        body.from_scope,
+        body.seq
+      );
+      return { applied: result.status === "applied", changed: result.changed.length, head: result.head };
+    }));
+  }
+
+  /**
    * Memory-follows-durable (fix 3): the in-memory sequencer mutates
    * inside the callback (submit/seed/schedule/adopt), so if the durable
    * transaction then aborts, memory is AHEAD of SQLite — an idempotent
@@ -1066,6 +1454,10 @@ export class NetScopeDO {
       return fn();
     } catch (err) {
       this.seq = null;
+      // The rider-residue memo may have been appended inside the aborted
+      // transaction (enqueueDeliveries) — rehydrate it from the rolled-
+      // back ledger alongside the sequencer.
+      this.riderCacheMemo = null;
       throw err;
     }
   }
@@ -1073,10 +1465,13 @@ export class NetScopeDO {
   /** Always re-derive the wake-up from DURABLE scope state (never from
    * memory). Two keys feed the single storage alarm (WorkerdHost keeps
    * the earliest): the scheduled-turn wake and the outbox retry (fix
-   * 4a). Only FUTURE turns arm the clock (fix 8a): overdue rows are
-   * parked observations until the Phase-3.5 executor drains them —
-   * arming for them would fire the alarm in a tight loop that can do
-   * no useful work. */
+   * 4a). Only FUTURE turns arm the clock (fix 8a): an overdue row still
+   * in the scheduled family means no planner was registered when it
+   * fired (CO16's parked state — it dispatches on the first alarm after
+   * a planner subscribes, or on the next future turn's wake); arming for
+   * it would fire the alarm in a tight loop that can do no useful work.
+   * Dispatched rows live in the outbox family, whose retry alarm covers
+   * them. */
   private rearmAlarm(now: number): void {
     let nextFuture: number | null = null;
     for (const turn of this.store.readScheduled()) {

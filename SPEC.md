@@ -92,7 +92,7 @@ Language and runtime foundations: object/verb/value semantics and execution beha
 
 Host-facing interfaces for runtime execution, transport, and client bootstrap across local and edge hosts.
 
-- [coherence.md](spec/protocol/coherence.md) — **the coherence layer**: normative contract for the `src/net/` distribution layer (Plan 002) — invariants, effect transcript, validation order, named-copy registry, divergence taxonomy, SLOs, conformance gates (CO1–CO12, **adopted**; governs where it overlaps v2-turn-network.md / cell-authority.md)
+- [coherence.md](spec/protocol/coherence.md) — **the coherence layer**: normative contract for the `src/net/` distribution layer (Plan 002) — invariants, effect transcript, validation order, named-copy registry, divergence taxonomy, SLOs, conformance gates, relations, sessions, topology, scheduled-turn execution (CO1–CO16, **adopted**; governs where it overlaps v2-turn-network.md / cell-authority.md)
 - [hosts.md](spec/protocol/hosts.md) — three host classes, task migration, trust boundaries (§3)
 - [host-seeds.md](spec/protocol/host-seeds.md) — host-seed contents and the per-subject merge rule for cross-host reconciliation (HS1–HS5, **draft**)
 - [wire.md](spec/protocol/wire.md) — JSON WebSocket message format (§17)
