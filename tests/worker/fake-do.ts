@@ -35,9 +35,50 @@ export class FakeSqlStorage {
   }
 }
 
+/**
+ * Minimal server-side WebSocket fake for the DO hibernation API surface
+ * (state.acceptWebSocket + tags, serializeAttachment). `sent` records
+ * every frame for assertions; `close()` moves readyState to CLOSED so
+ * tag lookups drop the socket like workerd does after a close.
+ */
+export class FakeWebSocket {
+  /** 1 = OPEN, 3 = CLOSED — the two states the fake distinguishes. */
+  readyState = 1;
+  readonly sent: string[] = [];
+  private attachment: unknown = null;
+
+  send(data: string | ArrayBuffer): void {
+    if (this.readyState !== 1) throw new Error("fake websocket is not open");
+    this.sent.push(typeof data === "string" ? data : new TextDecoder().decode(data));
+  }
+
+  close(_code?: number, _reason?: string): void {
+    this.readyState = 3;
+  }
+
+  serializeAttachment(value: unknown): void {
+    // JSON round-trip mirrors workerd's structured-clone persistence:
+    // attaching something non-serializable should fail in tests too.
+    this.attachment = JSON.parse(JSON.stringify(value));
+  }
+
+  deserializeAttachment(): unknown {
+    return this.attachment;
+  }
+}
+
+/** The `new WebSocketPair()` global shape (workerd): index 0 is the
+ * client end, index 1 the server end. Tests stub this onto globalThis
+ * (the established cf-repository.test.ts idiom). */
+export class FakeWebSocketPair {
+  readonly 0 = new FakeWebSocket() as unknown as WebSocket;
+  readonly 1 = new FakeWebSocket() as unknown as WebSocket;
+}
+
 export class FakeDurableObjectState {
   readonly id: { name: string };
   readonly acceptedWebSockets: WebSocket[] = [];
+  private readonly webSocketTags = new Map<WebSocket, string[]>();
   private readonly db = new DatabaseSync(":memory:");
   private transactionDepth = 0;
   private savepointCounter = 0;
@@ -55,12 +96,21 @@ export class FakeDurableObjectState {
     return await fn();
   }
 
-  acceptWebSocket(ws: WebSocket): void {
+  acceptWebSocket(ws: WebSocket, tags?: string[]): void {
     this.acceptedWebSockets.push(ws);
+    this.webSocketTags.set(ws, tags ?? []);
   }
 
-  getWebSockets(): WebSocket[] {
-    return [];
+  /** Accepted sockets, optionally filtered by tag; CLOSED sockets are
+   * dropped, matching workerd's post-close behavior. (Some test files
+   * subclass and override this with their own registry — the base now
+   * honestly reflects acceptWebSocket instead of returning [].) */
+  getWebSockets(tag?: string): WebSocket[] {
+    return this.acceptedWebSockets.filter((ws) => {
+      const state = (ws as unknown as { readyState?: number }).readyState;
+      if (state !== undefined && state !== 1) return false;
+      return tag === undefined || (this.webSocketTags.get(ws) ?? []).includes(tag);
+    });
   }
 
   close(): void {

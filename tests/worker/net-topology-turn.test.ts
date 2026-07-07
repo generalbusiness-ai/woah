@@ -79,6 +79,11 @@ type TurnBody = {
   attempt: number;
   trace: AttemptTraceEntry[];
   envelopeBytes: number;
+  // Phase-4 item 1: the planned transcript's result/observations on an
+  // accepted reply; `replayed` on a detected idempotent replay.
+  result?: unknown;
+  observations?: Array<Record<string, unknown>>;
+  replayed?: boolean;
 };
 
 describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
@@ -115,6 +120,7 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
         let src = this.bonus_source;
         this.counter = this.counter + src.bonus;
         actor.greeted = actor.greeted + 1;
+        observe({ type: "bumped", counter: this.counter });
         return this.counter;
       }`,
       null
@@ -207,6 +213,12 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
     // route.ts on the DERIVED classifier: the box write is the room's,
     // the actor write rides along (CA3) — commit at the room, one rider.
     expect(turn1.selection).toEqual({ scope: roomScope, riders: [clusterScope] });
+    // Phase-4 item 1: the accepted reply carries the planned transcript's
+    // result (the verb's return value) and observations (the observe()
+    // event), and is not marked as a replay.
+    expect(turn1.result).toBe(1);
+    expect(turn1.observations?.map((o) => o.type)).toContain("bumped");
+    expect(turn1.replayed).toBeUndefined();
     // Foreign reads attested at their derived owners over real RPC: the
     // class chain at the catalog scope, the actor's cells at the cluster.
     expect(rpcLog).toContain(`scope:${CATALOG_SCOPE}/net/attest`);
@@ -236,6 +248,22 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
     expect(turn2.reply.status, JSON.stringify(turn2.reply)).toBe("accepted");
     expect(turn2.attempt).toBe(1);
     expect(turn2.selection).toEqual({ scope: roomScope, riders: [clusterScope] });
+    expect(turn2.result).toBe(2);
+
+    // Phase-4 item 1, idempotent replay: resubmitting turn 1's key returns
+    // the scope's RECORDED reply (CO2.5). The world moved on (counter is
+    // now 2), so this round's re-plan predicts a different post-state than
+    // the recorded accept — the gateway detects that digest mismatch,
+    // marks the reply replayed, and omits result/observations rather than
+    // presenting the re-planned execution as the committed one.
+    const replay = await call<TurnBody>(gateway, gatewayEnv, "/turn", turnRequest("topo-t1"));
+    expect(replay.reply.status).toBe("accepted");
+    if (replay.reply.status === "accepted" && turn1.reply.status === "accepted") {
+      expect(replay.reply.post_state_version).toBe(turn1.reply.post_state_version);
+    }
+    expect(replay.replayed).toBe(true);
+    expect(replay.result).toBeUndefined();
+    expect(replay.observations).toBeUndefined();
 
     // Authority landed where the topology says it lives: counter at the
     // room, greeted at the cluster (after the second adoption settles).

@@ -1,0 +1,282 @@
+// Phase-4 item 2: the /net-api client surface over fake-DO
+// (coherence.md CO14 "credential authentication against identity cells
+// in the catalog scope closure" + the Phase-4 sessions-required rule).
+//
+// The client gateway shard starts with an EMPTY view, so this exercises
+// the pull-on-miss paths for real: the catalog identity cell
+// (property_cell:$system:api_keys) pulls from the catalog scope on the
+// first authenticated request, the actor's cluster pulls by the CO15
+// `cluster:<actor>` convention before the mint, and the planning scope
+// pulls by the `room:<space>` convention before the sessioned turn.
+//
+// Proves:
+//   - named 401 refusals (missing/malformed/wrong credentials; the CO14
+//     session_required rule; missing/actor-mismatched sessions);
+//   - POST /net-api/session authenticates, derives the actor's cluster
+//     from view lineage, mints via the existing machinery, and returns
+//     {session, actor, expires_at};
+//   - POST /net-api/turn validates the session cell, plans at the
+//     location-derived scope, commits route:"sequenced" through the
+//     normal /net/turn machinery, and returns the item-1
+//     result/observations;
+//   - client idempotency keys replay per the item-1 contract;
+//   - the authenticated GET reads (cell probe, relation roster) serve.
+import { describe, expect, it } from "vitest";
+import { FakeDurableObjectState } from "./fake-do";
+import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
+import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
+import { installVerb } from "../../src/core/authoring";
+import { createWorld } from "../../src/core/bootstrap";
+import { cellsFromSerialized } from "../../src/net/bridge";
+import { CATALOG_SCOPE, partitionCells } from "../../src/net/topology";
+import type { CommitReply } from "../../src/net/scope";
+
+const SECRET = "net-client-api-test-secret";
+const EPOCH = "cat-net-capi-1";
+const KEY_ID = "capi-key";
+const KEY_SECRET = "capi-secret";
+
+function netState(name: string): {
+  state: NetScopeDurableState & NetGatewayDurableState;
+  settle: () => Promise<void>;
+  close: () => void;
+} {
+  const fake = new FakeDurableObjectState(name);
+  const deferred: Array<Promise<unknown>> = [];
+  const state = {
+    id: fake.id,
+    waitUntil: (promise: Promise<unknown>) => {
+      deferred.push(promise);
+    },
+    storage: {
+      sql: fake.storage.sql,
+      transactionSync: fake.storage.transactionSync,
+      setAlarm: (_at: number) => {},
+      deleteAlarm: () => {}
+    }
+  };
+  return {
+    state,
+    settle: async () => {
+      while (deferred.length > 0) await deferred.shift();
+    },
+    close: () => fake.close()
+  };
+}
+
+/** Unsigned client request straight at the gateway DO — the /net-api
+ * surface must never require internal signing. */
+async function clientFetch(
+  gateway: NetGatewayDO,
+  method: string,
+  path: string,
+  opts: { token?: string; headers?: Record<string, string>; body?: unknown } = {}
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const headers = new Headers(opts.headers ?? {});
+  if (opts.token) headers.set("authorization", `Bearer ${opts.token}`);
+  const request =
+    method === "GET"
+      ? new Request(`https://do${path}`, { headers })
+      : new Request(`https://do${path}`, {
+          method,
+          headers: (headers.set("content-type", "application/json"), headers),
+          body: JSON.stringify(opts.body ?? {})
+        });
+  const response = await gateway.fetch(request);
+  return { status: response.status, body: (await response.json()) as Record<string, unknown> };
+}
+
+type TurnBody = {
+  reply: CommitReply;
+  attempt: number;
+  result?: unknown;
+  observations?: Array<Record<string, unknown>>;
+  replayed?: boolean;
+};
+
+async function buildHarness() {
+  // ---- Engine-real fixture: a room, a room-anchored box with a bump
+  // verb (returns + observes), the actor placed in the room, and an
+  // apikey minted into $system.api_keys via the same wizard path
+  // localdev bootstrap uses — partitionCells then carries the identity
+  // cell to the catalog scope naturally ($-prefix rule, CO15).
+  const world = createWorld();
+  const session = world.auth("guest:net-client-api");
+  const actor = session.actor;
+  world.createObject({ id: "capi_room", name: "Client Room", parent: "$space", owner: actor });
+  world.createObject({ id: "capi_box", name: "Client Box", parent: "$thing", owner: actor, anchor: "capi_room", location: "capi_room" });
+  world.defineProperty("capi_box", { name: "counter", defaultValue: 0, owner: actor, perms: "rw", typeHint: "int" });
+  const installed = installVerb(
+    world,
+    "capi_box",
+    "bump",
+    `verb :bump() rxd {
+      this.counter = this.counter + 1;
+      observe({ type: "bumped", counter: this.counter });
+      return this.counter;
+    }`,
+    null
+  );
+  expect(installed.ok).toBe(true);
+  const placed = await world.directCall("capi-genesis-place", actor, actor, "moveto", ["capi_room"], { sessionId: session.id });
+  expect(placed.op).toBe("result");
+  world.ensureApiKey("$wiz", actor, KEY_ID, KEY_SECRET, "net-client-api-test");
+  // A second authenticated identity for the actor_mismatch case.
+  const other = world.auth("guest:net-client-api-2").actor;
+  world.ensureApiKey("$wiz", other, "capi-key-2", "capi-secret-2", "net-client-api-test-2");
+
+  const partitions = partitionCells(cellsFromSerialized(world.exportWorld()));
+  const roomScope = "room:capi_room";
+  const clusterScope = `cluster:${actor}`;
+  expect([...partitions.keys()]).toEqual(expect.arrayContaining([roomScope, clusterScope, CATALOG_SCOPE]));
+
+  const states: Array<ReturnType<typeof netState>> = [];
+  const scopeDOs = new Map<string, NetScopeDO>();
+  const resolve = (destination: string) => {
+    const scope = destination.startsWith("scope:") ? destination.slice("scope:".length) : null;
+    const instance = scope !== null ? scopeDOs.get(scope) : undefined;
+    if (!instance) throw new Error(`unresolvable destination ${destination}`);
+    return instance;
+  };
+  const scopeEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve };
+  for (const scope of [roomScope, clusterScope, CATALOG_SCOPE, `cluster:${other}`]) {
+    const st = netState(`scope-${scope}`);
+    const instance = new NetScopeDO(st.state, scopeEnv);
+    const seedRequest = new Request("https://do/net/seed", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ scope, catalog_epoch: EPOCH, cells: partitions.get(scope) ?? [] })
+    });
+    const { signInternalRequest } = await import("../../src/worker/internal-auth");
+    const seeded = await instance.fetch(await signInternalRequest(scopeEnv, seedRequest));
+    expect(seeded.ok).toBe(true);
+    states.push(st);
+    scopeDOs.set(scope, instance);
+  }
+
+  // The client gateway shard: EMPTY view — every warm-up is pull-on-miss.
+  const gatewayState = netState("gateway-net-api");
+  const gatewayEnv: NetGatewayEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve };
+  const gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
+  states.push(gatewayState);
+
+  return { gateway, actor, other, roomScope, close: () => states.forEach((st) => st.close()) };
+}
+
+describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
+  it("authenticates apikeys against the catalog identity cell and refuses namedly", async () => {
+    const h = await buildHarness();
+
+    // Missing credential entirely.
+    const missing = await clientFetch(h.gateway, "GET", "/net-api/cell?key=object_live:capi_box");
+    expect(missing.status).toBe(401);
+    expect(missing.body.error).toMatchObject({ code: "E_NOSESSION", detail: { reason: "missing_credential" } });
+
+    // A bearer token of another class is refused, not misparsed.
+    const wrongClass = await clientFetch(h.gateway, "GET", "/net-api/cell?key=x", { token: "sess-123" });
+    expect(wrongClass.status).toBe(401);
+    expect(wrongClass.body.error).toMatchObject({ code: "E_NOSESSION", detail: { reason: "unsupported_token_class" } });
+
+    // Wrong secret (constant-time compare path).
+    const badSecret = await clientFetch(h.gateway, "GET", "/net-api/cell?key=x", { token: `apikey:${KEY_ID}:nope` });
+    expect(badSecret.status).toBe(401);
+    expect(badSecret.body.error).toMatchObject({ code: "E_NOSESSION", detail: { reason: "secret_rejected" } });
+
+    // Unknown key id.
+    const unknown = await clientFetch(h.gateway, "GET", "/net-api/cell?key=x", { token: "apikey:who:ever" });
+    expect(unknown.status).toBe(401);
+    expect(unknown.body.error).toMatchObject({ code: "E_NOSESSION", detail: { reason: "unknown_or_revoked" } });
+
+    // The x-woo-api-key carrier works (prefix optional).
+    const viaHeader = await clientFetch(h.gateway, "GET", "/net-api/cell?key=object_live:capi_box", {
+      headers: { "x-woo-api-key": `${KEY_ID}:${KEY_SECRET}` }
+    });
+    expect(viaHeader.status).toBe(200);
+
+    h.close();
+  });
+
+  it("mints a session, requires sessions on turns (CO14), and returns result/observations on the sessioned turn", async () => {
+    const h = await buildHarness();
+    const token = `apikey:${KEY_ID}:${KEY_SECRET}`;
+
+    // The CO14 Phase-4 rule: a client turn with no session is refused
+    // with the named verdict BEFORE any planning happens.
+    const sessionless = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+      token,
+      body: { target: "capi_box", verb: "bump" }
+    });
+    expect(sessionless.status).toBe(401);
+    expect(sessionless.body.error).toMatchObject({
+      code: "E_NOSESSION",
+      detail: { session_verdict: "session_required" }
+    });
+
+    // A session id the cluster never minted: verdict "missing".
+    const bogus = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+      token,
+      body: { target: "capi_box", verb: "bump", session: "s_forged" }
+    });
+    expect(bogus.status).toBe(401);
+    expect(bogus.body.error).toMatchObject({ code: "E_NOSESSION", detail: { session_verdict: "missing" } });
+
+    // Mint: authenticates, pulls the cluster by convention, derives the
+    // cluster scope from view lineage, session-opens.
+    const before = Date.now();
+    const minted = await clientFetch(h.gateway, "POST", "/net-api/session", { token, body: { ttl_ms: 600_000 } });
+    expect(minted.status, JSON.stringify(minted.body)).toBe(200);
+    expect(minted.body.actor).toBe(h.actor);
+    const sid = minted.body.session as string;
+    expect(sid).toMatch(/^s_/);
+    expect(minted.body.expires_at as number).toBeGreaterThanOrEqual(before + 600_000);
+
+    // Another authenticated identity presenting THIS actor's session:
+    // the actor binding refuses it (actor_mismatch).
+    const stolen = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+      token: "apikey:capi-key-2:capi-secret-2",
+      body: { target: "capi_box", verb: "bump", session: sid }
+    });
+    expect(stolen.status).toBe(401);
+    expect(stolen.body.error).toMatchObject({ code: "E_NOSESSION", detail: { session_verdict: "actor_mismatch" } });
+
+    // The sessioned turn: planning scope derives from the session cell
+    // (activeScope null after mint → the actor's live location → the
+    // room), commits sequenced through the normal machinery, and the
+    // reply carries the item-1 result/observations.
+    const turn = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+      token,
+      body: { target: "capi_box", verb: "bump", session: sid, idempotency_key: "capi-t1" }
+    });
+    expect(turn.status, JSON.stringify(turn.body)).toBe(200);
+    const turnBody = turn.body as unknown as TurnBody;
+    expect(turnBody.reply.status, JSON.stringify(turnBody.reply)).toBe("accepted");
+    expect(turnBody.result).toBe(1);
+    expect(turnBody.observations?.map((o) => o.type)).toContain("bumped");
+
+    // Client-supplied idempotency key replays per the item-1 contract:
+    // the recorded reply comes back marked, without an invented result.
+    const replay = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+      token,
+      body: { target: "capi_box", verb: "bump", session: sid, idempotency_key: "capi-t1" }
+    });
+    expect(replay.status).toBe(200);
+    const replayBody = replay.body as unknown as TurnBody;
+    expect(replayBody.reply.status).toBe("accepted");
+    expect(replayBody.replayed).toBe(true);
+    expect(replayBody.result).toBeUndefined();
+
+    // Authenticated reads: the committed counter is in the view
+    // (install-on-accept), and the relation roster read serves from the
+    // mirror (content is proven in the workerd lane, where fanout
+    // subscription feeds it; here the mirror is empty but the surface
+    // answers).
+    const probe = await clientFetch(h.gateway, "GET", "/net-api/cell?key=property_cell:capi_box:counter", { token });
+    expect(probe.status).toBe(200);
+    expect((probe.body.cell as { value?: { value?: number } })?.value?.value).toBe(1);
+    const roster = await clientFetch(h.gateway, "GET", `/net-api/relation?relation=contents&owner=capi_room`, { token });
+    expect(roster.status).toBe(200);
+    expect(Array.isArray(roster.body.members)).toBe(true);
+
+    h.close();
+  });
+});

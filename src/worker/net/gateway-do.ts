@@ -22,8 +22,9 @@
  *       POST /net/session-open  CO14 mint: build a session-cell commit via
  *                         mintSessionSubmit, submit it to the actor's
  *                         cluster scope (stale_head-only retry), install
- *                         the accepted cell in the view (test/lane-facing
- *                         until Phase-4 transports authenticate in front)
+ *                         the accepted cell in the view. POST
+ *                         /net-api/session is the credentialed client
+ *                         front; the internal route stays for lane/tests
  *       POST /net/plan-scheduled  CO16 planner execution: a scope's due
  *                         scheduled turn, delivered via its durable
  *                         outbox to this gateway (subscribed with role
@@ -41,6 +42,11 @@
  *                         ceiling; terminal verdicts and budget
  *                         exhaustion surface with the attempt trace
  *
+ * plus the CLIENT-facing /net-api surface (Phase 4 item 2 — apikey
+ * credentials instead of internal signing; see the clientApi block):
+ *       POST /net-api/session, POST /net-api/turn,
+ *       GET /net-api/relation, GET /net-api/cell
+ *
  * Topology (Plan 002 Phase 3.5 item 2, CO15): the gateway derives its
  * classifier from the VIEW's lineage cells (topology.ts anchor walk) and
  * maps scope names to rpc destinations by convention (`scope:<name>` —
@@ -53,20 +59,30 @@
 import { CellStore, cellKey, type Cell } from "../../net/cells";
 import { budgetExhausted, isNetError, netError, type AttemptTraceEntry, type NetErrorCode } from "../../net/errors";
 import { applyFanout, type FanoutBody } from "../../net/outbox";
-import { relationKey, type RelationDelta } from "../../net/relations";
-import { mintSessionSubmit } from "../../net/sessions";
+import { relationKey, type RelationDelta, type RelationRow } from "../../net/relations";
+import { mintSessionSubmit, sessionCellKey, validateSessionCell } from "../../net/sessions";
 import { planTurn, type PlanTurnInput, type PlanTurnResult } from "../../net/plan";
 import type { ScopeClassifier } from "../../net/route";
 import { CATALOG_SCOPE, classifierFromLineage, type AnchorLineage } from "../../net/topology";
 import type { CommitReply, CommitSubmit, RejectReason, ScheduledTurn, ScopeHead } from "../../net/scope";
-import { netCellKeyFor } from "../../net/transcript";
+import { netCellKeyFor, type EffectTranscript } from "../../net/transcript";
 import type { CellTransfer } from "../../net/cells";
+import { randomHex } from "../../core/source-hash";
 import { verifyInternalRequest } from "../internal-auth";
+import { ClientAuthError, parseClientCredential, verifyApiKeyCredential } from "./client-auth";
 import { resolveNetDestination, WorkerdHost, type NetBindingsEnv } from "./workerd-host";
 
 export type NetGatewayDurableState = {
   id: unknown;
   waitUntil?: (promise: Promise<unknown>) => void;
+  /** DO hibernation-friendly WebSocket surface (Phase 4 item 3): sockets
+   * are accepted with their SESSION ID as the tag, so delivery is
+   * `getWebSockets(session)` — the runtime IS the registry (in-memory /
+   * hibernation only; no new durable copy, CO5 stays at five). Optional
+   * because the structural fake-DO harness predates it: routes that need
+   * it refuse namedly when the runtime lacks the surface. */
+  acceptWebSocket?(ws: WebSocket, tags?: string[]): void;
+  getWebSockets?(tag?: string): WebSocket[];
   storage: {
     sql: { exec(query: string, ...params: unknown[]): unknown };
     transactionSync<T>(callback: () => T): T;
@@ -83,13 +99,16 @@ export type NetSeedKV = {
 };
 
 /** The KV value at `net:seed:<scope>`: a full-closure snapshot of the
- * scope's cells at a stated head. Consumers head-check before trusting
- * (CO7: the cold path is the normal path — a lagging seed falls back to
- * the live closure, which then overwrites the seed). */
+ * scope's cells (and relation rows — CO13: a pull advances the fanout
+ * high-water, so the rows must ride the snapshot or the mirror starves;
+ * see reseedFromScope) at a stated head. Consumers head-check before
+ * trusting (CO7: the cold path is the normal path — a lagging seed falls
+ * back to the live closure, which then overwrites the seed). */
 type SeedRecord = {
   cells: Cell[];
   head: ScopeHead;
   catalog_epoch: string;
+  relations?: RelationRow[];
 };
 
 const seedKey = (scope: string): string => `net:seed:${scope}`;
@@ -168,6 +187,29 @@ type TurnResult = {
   envelopeBytes: number;
   attempt: number;
   trace: AttemptTraceEntry[];
+  /** Phase-4 item 1: the planned transcript's verb return value,
+   * error, and observations, carried on an ACCEPTED reply (the gateway
+   * holds the planned transcript — every transport needs the caller to
+   * see what its turn did). Omitted on rejected replies (nothing
+   * committed) and on detected idempotent replays (see `replayed`);
+   * `result`/`error` are also omitted when the transcript lacks them.
+   * `error` matters: a verb that THREW still commits its (complete,
+   * effect-less or partial) transcript, so an accepted reply without
+   * the error field would be indistinguishable from success. */
+  result?: EffectTranscript["result"];
+  error?: EffectTranscript["error"];
+  observations?: EffectTranscript["observations"];
+  /** Present (true) when the accepted reply is detectably the scope's
+   * RECORDED reply for an earlier submit of the same idempotency key
+   * (CO2.5): a fresh accept's post_state_version always equals this
+   * round's plan (CO4 step 10 rejects otherwise), so a differing digest
+   * proves the commit happened on a prior request. The re-planned
+   * transcript then describes a DIFFERENT execution than the one that
+   * committed, so result/observations are omitted rather than invented.
+   * A replay whose re-plan converged on the identical post-state is
+   * indistinguishable from (and equivalent to) a fresh accept, and
+   * carries the re-planned result/observations without this flag. */
+  replayed?: boolean;
   /** Present (true) when the commit was ACCEPTED but the post-accept
    * warm cache-fill (installTouched) failed (fix 5a): the commit is
    * durable at the scope; the view repairs itself on the next turn via
@@ -190,10 +232,45 @@ function objectOfCellKey(key: string): string {
   return key.split(":")[1] ?? "";
 }
 
+/** Session TTL bounds for the /net-api client surface: default 30 min,
+ * clamped to [1 min, 24 h] — a client cannot mint an immortal session. */
+const CLIENT_SESSION_TTL_DEFAULT_MS = 30 * 60_000;
+const CLIENT_SESSION_TTL_MIN_MS = 60_000;
+const CLIENT_SESSION_TTL_MAX_MS = 24 * 60 * 60_000;
+
+function clampClientTtl(raw: unknown): number {
+  const ttl = typeof raw === "number" && Number.isFinite(raw) ? raw : CLIENT_SESSION_TTL_DEFAULT_MS;
+  return Math.min(CLIENT_SESSION_TTL_MAX_MS, Math.max(CLIENT_SESSION_TTL_MIN_MS, ttl));
+}
+
+/** What a gateway WebSocket carries across hibernation (Phase 4 item 3):
+ * the validated session id (also the socket's tag) and the apikey-
+ * authenticated actor the session is bound to. */
+type GatewaySocketAttachment = { session: string; actor: string; opened_at: number };
+
+/** Echo-dedupe LRU bound (see recentClientTurns). */
+const RECENT_CLIENT_TURN_CAP = 512;
+
 export class NetGatewayDO {
   private readonly host: WorkerdHost;
   private view: CellStore | null = null;
   private readonly seen = new Map<string, number>();
+  /**
+   * Echo dedupe (Phase 4 item 3 chunk 2): turn id → the session that
+   * submitted it through THIS shard's client surface. The submitting
+   * session receives its turn's observations on the turn reply (item 1),
+   * so pushObservations skips its sockets when the fanout announcing the
+   * same turn arrives.
+   *
+   * Boundedness, documented: an insertion-ordered Map capped at
+   * RECENT_CLIENT_TURN_CAP — plenty for the window between a submit and
+   * its own fanout (same-scope, one commit). In-memory only, ON PURPOSE:
+   * losing an entry (hibernation, cap overflow) degrades to ONE
+   * duplicate frame for the submitter — never a missed frame for anyone
+   * else — which matches the layer's at-most-once, no-durability
+   * observation posture (kickoff rule).
+   */
+  private readonly recentClientTurns = new Map<string, string>();
 
   constructor(
     private readonly state: NetGatewayDurableState,
@@ -231,12 +308,20 @@ export class NetGatewayDO {
   }
 
   async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    // Phase-4 item 2: the /net-api client surface carries CLIENT
+    // credentials (apikey verified against the catalog identity cell),
+    // never internal signing — the worker entry forwards these requests
+    // unsigned and this handler trusts nothing about the hop. Everything
+    // else on this DO stays behind verifyInternalRequest.
+    if (url.pathname.startsWith("/net-api/")) {
+      return this.clientApi(request, url);
+    }
     try {
       await verifyInternalRequest(this.env, request);
     } catch (err) {
       return json({ error: String(err) }, 401);
     }
-    const url = new URL(request.url);
     try {
       if (request.method === "POST" && url.pathname === "/net/fanout") {
         const body = (await request.json()) as FanoutBody;
@@ -272,17 +357,7 @@ export class NetGatewayDO {
         const relation = url.searchParams.get("relation") ?? "";
         const owner = url.searchParams.get("owner") ?? "";
         if (!relation || !owner) throw new Error("relation and owner query params are required");
-        const members = sqlRows<{ member: string; body: string | null }>(
-          this.state.storage.sql.exec(
-            "SELECT member, body FROM net_gateway_relation WHERE relation = ? AND owner = ? ORDER BY member ASC",
-            relation,
-            owner
-          )
-        ).map((row) => ({
-          member: row.member,
-          ...(row.body !== null ? { body: JSON.parse(row.body) as unknown } : {})
-        }));
-        return json({ relation, owner, members });
+        return json({ relation, owner, members: this.relationMembers(relation, owner) });
       }
       return json({ error: `no such route: ${request.method} ${url.pathname}` }, 404);
     } catch (err) {
@@ -347,6 +422,11 @@ export class NetGatewayDO {
                 view.install({ ...cell, provenance: "seed" });
                 this.persistCell(view, cell.key);
               }
+              // CO13: relation rows ride the seed for the same reason they
+              // ride the live closure (see reseedFromScope's upsert note).
+              for (const row of seed.relations ?? []) {
+                this.applyRelationDelta({ op: "add", row });
+              }
             })
           );
           // Fix 7: the seed IS the state at its head — stale pre-pull
@@ -374,7 +454,12 @@ export class NetGatewayDO {
     if (kv && known.length === 0) {
       // Best-effort seed write-back (deferred — a KV outage must never
       // fail or slow the pull; the next pull just goes live again).
-      const record: SeedRecord = { cells: transfer.cells, head: transfer.head, catalog_epoch: transfer.catalog_epoch };
+      const record: SeedRecord = {
+        cells: transfer.cells,
+        head: transfer.head,
+        catalog_epoch: transfer.catalog_epoch,
+        ...(transfer.relations !== undefined ? { relations: transfer.relations } : {})
+      };
       this.host.defer(() => kv.put(seedKey(body.scope), JSON.stringify(record)));
     }
     return { ok: true, installed: transfer.cells.length, head: transfer.head, source: "live" };
@@ -611,12 +696,24 @@ export class NetGatewayDO {
             );
           }
         }
+        // Phase-4 item 1: replay detection by post-state digest — see the
+        // TurnResult.replayed doc. A recorded reply (CO2.5) commits
+        // nothing this round, so this round's re-planned result would
+        // describe an execution that never happened; omit it honestly.
+        const replayed = reply.post_state_version !== submit.post_state_version;
         return {
           reply,
           selection: planned.selection,
           envelopeBytes: planned.envelopeBytes,
           attempt,
           trace,
+          ...(replayed
+            ? { replayed: true }
+            : {
+                ...(planned.transcript.result !== undefined ? { result: planned.transcript.result } : {}),
+                ...(planned.transcript.error !== undefined ? { error: planned.transcript.error } : {}),
+                observations: planned.transcript.observations
+              }),
           ...(installDegraded ? { install_degraded: true } : {})
         };
       }
@@ -731,21 +828,8 @@ export class NetGatewayDO {
    *   but harmless, and scheduled turns are rare by design.
    */
   private async planScheduled(body: PlanScheduledRequest): Promise<TurnResult> {
-    this.ensureView(); // hydrates the `seen` high-water map alongside the view
     const turn = body.scheduled_turn;
-    for (const scope of new Set([body.scope, CATALOG_SCOPE, `cluster:${turn.call.actor}`])) {
-      if (this.seen.has(scope)) continue;
-      try {
-        await this.pull({ scope, destination: `scope:${scope}` });
-      } catch (err) {
-        // Named, never silent: the standard planning recovery is the
-        // fallback when a warm-up pull cannot land.
-        console.log(
-          "woo.metric",
-          JSON.stringify({ kind: "net_plan_scheduled_pull_miss_failed", scope, error: String(err), ts: Date.now() })
-        );
-      }
-    }
+    await this.warmScopes([body.scope, CATALOG_SCOPE, `cluster:${turn.call.actor}`], "net_plan_scheduled_pull_miss_failed");
     const key = `sched:${turn.id}:${turn.at_logical_time}`;
     return this.turn({
       call: {
@@ -765,9 +849,10 @@ export class NetGatewayDO {
   }
 
   /**
-   * /net/session-open — CO14 minting (test/lane-facing until the Phase-4
-   * transports put credential authentication in front of it; CO14: the
-   * gateway authenticates, scopes authorize).
+   * /net/session-open — CO14 minting. The credentialed client front is
+   * POST /net-api/session (clientSession below); this internal route
+   * remains for lanes/tests and trusted tooling (CO14: the gateway
+   * authenticates, scopes authorize).
    *
    * Honest-path decision, documented: the mint is a DIRECT submit built by
    * mintSessionSubmit, not a /net/turn — a session mint is a substrate
@@ -842,6 +927,519 @@ export class NetGatewayDO {
       );
     }
     return { reply, scope: clusterScope, value, ...(installDegraded ? { install_degraded: true } : {}) };
+  }
+
+  // ---- /net-api: the Phase-4 client surface (kickoff item 2) -------------
+  //
+  // Client-facing, NO internal auth: every route authenticates the woo
+  // apikey credential against the catalog identity cell
+  // (property_cell:$system:api_keys — CO14/CO15), pull-on-miss from the
+  // catalog scope. Named failures are 401 {error:{code:"E_NOSESSION"}}.
+  //
+  //   POST /net-api/session {ttl_ms?}
+  //     → authenticate, derive the actor's cluster scope (CO15 topology),
+  //       session-open through the existing mint machinery, reply
+  //       {session, actor, expires_at, scope}.
+  //   POST /net-api/turn {target, verb, args?, session, idempotency_key?}
+  //     → REQUIRES a valid session (the CO14 Phase-4 rule: client-
+  //       originated turns need sessions), validated from the session
+  //       cell in the gateway view; builds a route:"sequenced"
+  //       TurnRequest (the committing scope's authorize revalidates the
+  //       session — the gateway authenticates, scopes authorize) and runs
+  //       the normal /net/turn machinery; the reply is the TurnResult
+  //       including item-1 result/observations.
+  //   GET /net-api/relation?relation=&owner=   authenticated roster read
+  //   GET /net-api/cell?key=                   authenticated cell probe
+  //   GET /net-api/ws?session=                  WebSocket upgrade (Phase 4
+  //     item 3): same apikey authentication, session REQUIRED and
+  //     validated like /net-api/turn, then the socket is accepted with
+  //     the session id as its hibernation tag. Frames (JSON, `id`
+  //     echoed):
+  //       {type:"turn", id?, target, verb, args?, idempotency_key?}
+  //         → the clientTurn path on the SOCKET's session (a frame
+  //           cannot speak for another session) →
+  //           {type:"turn_result", id, status, ...TurnResult-or-error}
+  //       {type:"ping", id?} → {type:"pong", id}
+  //       anything else → {type:"error", id?, error:{code, message}}
+  //     Observation push (item 3 chunk 2) delivers
+  //     {type:"observations", scope, seq, observations} frames to
+  //     sockets whose session is present (CO13 session_presence) in a
+  //     fanout's scope — see pushObservations.
+
+  private async clientApi(request: Request, url: URL): Promise<Response> {
+    try {
+      // The WS upgrade may carry its credential as `?token=` — the ONLY
+      // route with the query carrier, because the WebSocket API (browser
+      // and Node-native alike) cannot set request headers; see
+      // parseClientCredential's queryToken note. Headers still win.
+      const wsUpgrade = request.method === "GET" && url.pathname === "/net-api/ws";
+      const credential = parseClientCredential(request.headers, wsUpgrade ? url.searchParams.get("token") : null);
+      const identity = await this.catalogIdentity();
+      const { actor } = verifyApiKeyCredential(identity.map, credential);
+
+      if (request.method === "GET" && url.pathname === "/net-api/ws") {
+        return await this.clientWebSocket(request, url, actor);
+      }
+      if (request.method === "POST" && url.pathname === "/net-api/session") {
+        const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+        return await this.clientSession(actor, body, identity.epoch);
+      }
+      if (request.method === "POST" && url.pathname === "/net-api/turn") {
+        const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+        return await this.clientTurn(actor, body, identity.epoch);
+      }
+      if (request.method === "GET" && url.pathname === "/net-api/relation") {
+        const relation = url.searchParams.get("relation") ?? "";
+        const owner = url.searchParams.get("owner") ?? "";
+        if (!relation || !owner) {
+          return json({ error: { code: "E_INVARG", message: "relation and owner query params are required" } }, 400);
+        }
+        return json({ relation, owner, members: this.relationMembers(relation, owner) });
+      }
+      if (request.method === "GET" && url.pathname === "/net-api/cell") {
+        const key = url.searchParams.get("key") ?? "";
+        if (!key) return json({ error: { code: "E_INVARG", message: "key query param is required" } }, 400);
+        return json({ key, cell: this.ensureView().get(key) ?? null });
+      }
+      return json({ error: { code: "E_OBJNF", message: `no such route: ${request.method} ${url.pathname}` } }, 404);
+    } catch (err) {
+      if (err instanceof ClientAuthError) {
+        return json({ error: { code: err.code, message: err.message, detail: err.detail } }, 401);
+      }
+      if (isNetError(err)) {
+        // Same taxonomy surfacing as the internal /net/turn handler
+        // (E_BUDGET carries its attempt trace so the failure explains
+        // itself — CO6), on the client status vocabulary.
+        return json(
+          {
+            error: {
+              code: err.code,
+              message: err.message,
+              detail: err.detail,
+              ...(err.attempts ? { attempts: err.attempts } : {})
+            }
+          },
+          400
+        );
+      }
+      return json({ error: { code: "E_INTERNAL", message: String(err) } }, 500);
+    }
+  }
+
+  /**
+   * The catalog identity cell (`property_cell:$system:api_keys`),
+   * pull-on-miss from the catalog scope destination (CO15 convention).
+   * Returns the api_keys map (the property payload's VALUE slot) and the
+   * cell's catalog_epoch stamp — the honest epoch for everything this
+   * client request plans against (clients never supply epochs).
+   */
+  private async catalogIdentity(): Promise<{ map: unknown; epoch: string }> {
+    const key = cellKey("property_cell", "$system", "api_keys");
+    let cell = this.ensureView().get(key);
+    if (!cell) {
+      // Unlike warmScopes this pull is a HARD requirement: without the
+      // identity cell no client request can authenticate, so a failed
+      // pull surfaces (500) rather than degrading to a misleading 401.
+      await this.pull({ scope: CATALOG_SCOPE, destination: `scope:${CATALOG_SCOPE}` });
+      cell = this.ensureView().get(key);
+    }
+    if (!cell) {
+      throw new ClientAuthError("no apikey registry in the catalog scope", { reason: "no_registry" });
+    }
+    const payload = cell.value as { value?: unknown } | null | undefined;
+    const map = payload && typeof payload === "object" ? payload.value : undefined;
+    return { map, epoch: cell.stamp.catalog_epoch };
+  }
+
+  /** POST /net-api/session — see the clientApi header. */
+  private async clientSession(actor: string, body: Record<string, unknown>, epoch: string): Promise<Response> {
+    // The mint needs the actor's lineage (cluster-scope derivation) in
+    // view; the CO15 `cluster:<actor>` convention names the pull
+    // destination without needing lineage first (the planScheduled
+    // idiom). Best-effort: sessionOpen's own E_MISSING_STATE names the
+    // failure when the pull could not land.
+    await this.warmScopes([CATALOG_SCOPE, `cluster:${actor}`], "net_client_pull_miss_failed");
+    const session = `s_${randomHex(16)}`;
+    const opened = await this.sessionOpen({
+      session,
+      actor,
+      ttl_ms: clampClientTtl(body.ttl_ms),
+      catalog_epoch: epoch
+    });
+    if (opened.reply.status !== "accepted") {
+      // A mint only rejects retryably (stale_head races, already retried
+      // inside sessionOpen) or on epoch drift; either way the client's
+      // recovery is simply to retry.
+      return json({ error: { code: "E_RETRY", message: "session mint did not commit; retry", detail: opened.reply } }, 503);
+    }
+    const value = opened.value as { expiresAt?: number } | null;
+    return json({
+      session,
+      actor,
+      expires_at: typeof value?.expiresAt === "number" ? value.expiresAt : null,
+      scope: opened.scope
+    });
+  }
+
+  /** POST /net-api/turn — see the clientApi header. */
+  private async clientTurn(actor: string, body: Record<string, unknown>, epoch: string): Promise<Response> {
+    // CO14 Phase-4 rule: client-originated turns REQUIRE a session. The
+    // gateway refuses session-less turns up front (named), and the turn
+    // still runs route:"sequenced" so the committing scope's authorize
+    // revalidates the session end-to-end.
+    const session = typeof body.session === "string" && body.session.length > 0 ? body.session : null;
+    if (!session) {
+      return json(
+        {
+          error: {
+            code: "E_NOSESSION",
+            message: "client-originated turns require a session (CO14): POST /net-api/session first",
+            detail: { session_verdict: "session_required" }
+          }
+        },
+        401
+      );
+    }
+    await this.warmScopes([CATALOG_SCOPE, `cluster:${actor}`], "net_client_pull_miss_failed");
+    const cell = this.ensureView().get(sessionCellKey(session));
+    // The actor binding pins the session to the AUTHENTICATED apikey
+    // actor: presenting another actor's session id is actor_mismatch.
+    const verdict = validateSessionCell(cell, this.host.now(), actor);
+    if (verdict !== "ok") {
+      return json(
+        { error: { code: "E_NOSESSION", message: `session ${verdict}`, detail: { session_verdict: verdict } } },
+        401
+      );
+    }
+    const target = typeof body.target === "string" ? body.target : "";
+    const verb = typeof body.verb === "string" ? body.verb : "";
+    if (!target || !verb) {
+      return json({ error: { code: "E_INVARG", message: "turn body requires target and verb" } }, 400);
+    }
+    const args = (Array.isArray(body.args) ? body.args : []) as PlanTurnInput["call"]["args"];
+
+    // planningScope from the session cell (the CO14 Phase-4 refinement):
+    // the anchor object is the session's activeScope when set (the CO13
+    // presence scope), else the actor's live location from the view, else
+    // the actor itself (a located-nowhere actor plans at its own cluster).
+    const row = cell?.value as { activeScope?: string | null } | undefined;
+    const anchorObject = this.clientAnchorObject(actor, row?.activeScope ?? null);
+    const planningScope = await this.clientPlanningScope(anchorObject, actor);
+    // Client retries reuse their supplied idempotency key (CO2.5); an
+    // unkeyed request gets a fresh turn identity.
+    const key =
+      typeof body.idempotency_key === "string" && body.idempotency_key.length > 0
+        ? body.idempotency_key
+        : `napi:${randomHex(12)}`;
+    // Echo dedupe (item 3 chunk 2): recorded BEFORE the submit leaves —
+    // the committing scope's outbox drain races the turn reply, so a
+    // post-reply registration could let the fanout push arrive first and
+    // duplicate the reply's observations at the submitter.
+    this.noteClientTurn(key, session);
+    const result = await this.turn({
+      call: {
+        kind: "woo.turn_call.shadow.v1",
+        id: key,
+        route: "sequenced",
+        scope: anchorObject,
+        session,
+        actor,
+        target,
+        verb,
+        args
+      },
+      planningScope,
+      catalog_epoch: epoch,
+      idempotency_key: key
+    });
+    // Terminal rejections return as 200 TurnResults (same as /net/turn):
+    // the reply names its verdict; thrown taxonomy errors (E_BUDGET etc.)
+    // surface through the clientApi catch instead.
+    return json(result);
+  }
+
+  /** The space object a client turn anchors to — see clientTurn. */
+  private clientAnchorObject(actor: string, activeScope: string | null): string {
+    if (activeScope) return activeScope;
+    const live = this.ensureView().get(cellKey("object_live", actor))?.value as
+      | { location?: string | null }
+      | undefined;
+    return typeof live?.location === "string" && live.location.length > 0 ? live.location : actor;
+  }
+
+  /**
+   * Classify the client turn's anchor object to its planning scope (CO15
+   * anchor walk over view lineage). The anchor's lineage may live at a
+   * scope this view has never pulled; the `room:<space>` naming
+   * convention (CO15) lets the gateway attempt a best-effort convention
+   * pull first — the same posture planScheduled takes with
+   * `cluster:<actor>`. If the object still cannot classify, the actor's
+   * cluster is the honest fallback: the session plans at its own
+   * authority and the repair loop's E_MISSING_STATE recovery covers any
+   * reads the plan then needs.
+   */
+  private async clientPlanningScope(anchorObject: string, actor: string): Promise<string> {
+    if (!this.ensureView().has(cellKey("object_lineage", anchorObject))) {
+      await this.warmScopes([`room:${anchorObject}`], "net_client_pull_miss_failed");
+    }
+    try {
+      const view = this.ensureView();
+      const classifier = classifierFromLineage(
+        (object) => (view.get(cellKey("object_lineage", object))?.value as AnchorLineage | undefined) ?? null
+      );
+      return classifier.scopeOf(anchorObject);
+    } catch {
+      return `cluster:${actor}`;
+    }
+  }
+
+  /**
+   * GET /net-api/ws — the WebSocket upgrade (Phase 4 item 3; kickoff
+   * "WS transport + observation push"). Credential authentication already
+   * happened in clientApi (the same apikey path as every /net-api route);
+   * this handler additionally REQUIRES a `?session=` bound to the
+   * authenticated actor — validated exactly like /net-api/turn — because
+   * the socket's tag IS its delivery address: an unvalidated session tag
+   * would let one client subscribe to another session's observations.
+   *
+   * Registry decision (kickoff, documented): the runtime's hibernation
+   * socket set is the WHOLE registry — `acceptWebSocket(ws, [session])`
+   * tags the socket, `getWebSockets(session)` finds it, and the
+   * attachment carries {session, actor} across hibernation. No durable
+   * copy anywhere (CO5 stays at five): a dropped socket loses only
+   * liveness; the session cell persists and a reconnect re-tags.
+   */
+  private async clientWebSocket(request: Request, url: URL, actor: string): Promise<Response> {
+    if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+      return json({ error: { code: "E_INVARG", message: "expected Upgrade: websocket" } }, 400);
+    }
+    // The hibernation surface and the WebSocketPair global are workerd
+    // runtime features; a structural harness without them gets a named
+    // refusal instead of an opaque TypeError.
+    const accept = this.state.acceptWebSocket?.bind(this.state);
+    const PairCtor = (globalThis as { WebSocketPair?: new () => { 0: WebSocket; 1: WebSocket } }).WebSocketPair;
+    if (!accept || !PairCtor) {
+      return json({ error: { code: "E_INTERNAL", message: "runtime does not support WebSocket upgrades" } }, 500);
+    }
+    const session = url.searchParams.get("session") ?? "";
+    if (!session) {
+      return json(
+        {
+          error: {
+            code: "E_NOSESSION",
+            message: "WebSocket upgrade requires a session query param (CO14): POST /net-api/session first",
+            detail: { session_verdict: "session_required" }
+          }
+        },
+        401
+      );
+    }
+    await this.warmScopes([CATALOG_SCOPE, `cluster:${actor}`], "net_client_pull_miss_failed");
+    const verdict = validateSessionCell(this.ensureView().get(sessionCellKey(session)), this.host.now(), actor);
+    if (verdict !== "ok") {
+      return json(
+        { error: { code: "E_NOSESSION", message: `session ${verdict}`, detail: { session_verdict: verdict } } },
+        401
+      );
+    }
+    const pair = new PairCtor();
+    const server = pair[1] as WebSocket & { serializeAttachment?(value: unknown): void };
+    // The attachment survives hibernation; webSocketMessage reads it back
+    // instead of re-authenticating per frame (the session cell is still
+    // revalidated per turn inside clientTurn — expiry keeps its bite).
+    server.serializeAttachment?.({ session, actor, opened_at: this.host.now() } satisfies GatewaySocketAttachment);
+    accept(server, [session]);
+    return new Response(null, { status: 101, webSocket: pair[0] });
+  }
+
+  /** The socket's hibernation attachment, or null for a socket this DO
+   * never attached (defensive: workerd only routes accepted sockets). */
+  private socketAttachment(ws: WebSocket): GatewaySocketAttachment | null {
+    const readable = ws as WebSocket & { deserializeAttachment?(): unknown };
+    if (typeof readable.deserializeAttachment !== "function") return null;
+    const raw = readable.deserializeAttachment() as Partial<GatewaySocketAttachment> | null | undefined;
+    return raw && typeof raw.session === "string" && typeof raw.actor === "string"
+      ? (raw as GatewaySocketAttachment)
+      : null;
+  }
+
+  /**
+   * Inbound WS frames (the DO hibernation callback). Every reply is a
+   * frame on the same socket — a transport error must never kill the
+   * connection when it can be named instead. `id` (when the frame
+   * carries one) is echoed for client correlation.
+   */
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    const send = (frame: Record<string, unknown>): void => {
+      try {
+        ws.send(JSON.stringify(frame));
+      } catch {
+        // Socket died mid-reply; webSocketClose owns the cleanup.
+      }
+    };
+    if (typeof message !== "string") {
+      send({ type: "error", error: { code: "E_INVARG", message: "frames must be JSON text" } });
+      return;
+    }
+    let frame: Record<string, unknown>;
+    try {
+      frame = JSON.parse(message) as Record<string, unknown>;
+    } catch {
+      send({ type: "error", error: { code: "E_INVARG", message: "frames must be JSON text" } });
+      return;
+    }
+    const id = frame.id;
+    const att = this.socketAttachment(ws);
+    if (!att) {
+      send({ type: "error", ...(id !== undefined ? { id } : {}), error: { code: "E_NOSESSION", message: "socket has no session attachment" } });
+      return;
+    }
+    if (frame.type === "ping") {
+      send({ type: "pong", ...(id !== undefined ? { id } : {}) });
+      return;
+    }
+    if (frame.type === "turn") {
+      try {
+        // The epoch is re-read per frame (pull-on-miss — the identity
+        // cell's stamp, same honest source clientApi uses); the frame's
+        // session is ALWAYS the socket's own (attachment), so one
+        // authenticated socket cannot submit on another session.
+        const identity = await this.catalogIdentity();
+        const response = await this.clientTurn(att.actor, { ...frame, session: att.session }, identity.epoch);
+        const payload = (await response.json()) as Record<string, unknown>;
+        send({ type: "turn_result", ...(id !== undefined ? { id } : {}), status: response.status, ...payload });
+      } catch (err) {
+        send({
+          type: "turn_result",
+          ...(id !== undefined ? { id } : {}),
+          status: 500,
+          error: { code: isNetError(err) ? err.code : "E_INTERNAL", message: String(err) }
+        });
+      }
+      return;
+    }
+    send({
+      type: "error",
+      ...(id !== undefined ? { id } : {}),
+      error: { code: "E_INVARG", message: `unknown frame type ${JSON.stringify(frame.type)}` }
+    });
+  }
+
+  /** Socket teardown is intentionally a no-op beyond the runtime's own
+   * bookkeeping: the registry IS the hibernation socket set (a closed
+   * socket leaves getWebSockets automatically) and the session CELL is
+   * durable state that outlives any socket (kickoff rule). */
+  async webSocketClose(_ws: WebSocket, _code: number, _reason: string, _wasClean: boolean): Promise<void> {}
+
+  async webSocketError(_ws: WebSocket, _err: unknown): Promise<void> {}
+
+  /** Record which session submitted a turn id (see recentClientTurns). */
+  private noteClientTurn(turnId: string, session: string): void {
+    this.recentClientTurns.delete(turnId); // refresh insertion order
+    this.recentClientTurns.set(turnId, session);
+    while (this.recentClientTurns.size > RECENT_CLIENT_TURN_CAP) {
+      const oldest = this.recentClientTurns.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.recentClientTurns.delete(oldest);
+    }
+  }
+
+  /**
+   * Observation push (Phase 4 item 3 chunk 2): route an applied fanout's
+   * observations to the sockets of sessions PRESENT in the fanout's
+   * scope — CO13's session_presence relation gets its first consumer.
+   *
+   * - The audience is read from THIS shard's mirror
+   *   (net_gateway_relation): a presence row whose owner space anchors
+   *   to the fanout's scope names a member session; that session's
+   *   tagged sockets (getWebSockets(session)) receive one
+   *   {type:"observations", scope, seq, observations} frame. Sessions on
+   *   other gateway shards are those shards' concern — they subscribe to
+   *   the same scope and run this same routine.
+   * - Owner→scope goes through the view-lineage classifier (CO15 walk),
+   *   with the `room:<owner>` naming convention as the fallback for an
+   *   owner whose lineage this view has not pulled.
+   * - The SUBMITTING session is skipped via the turn-id echo dedupe
+   *   (recentClientTurns): its observations arrived on the turn reply.
+   * - Delivery is AT-MOST-ONCE and never durable (kickoff rule): the
+   *   per-scope seq gate in receiveFanout drops redeliveries before this
+   *   runs, a dead socket's send failure is swallowed (close cleanup is
+   *   the runtime's), and a session with no socket is skipped silently.
+   *   Missed-observation catch-up is deliberately NOT promised in
+   *   Phase 4.
+   */
+  private pushObservations(body: FanoutBody): void {
+    const getSockets = this.state.getWebSockets?.bind(this.state);
+    if (!getSockets) return; // runtime without a WS surface (structural fakes)
+    if (!Array.isArray(body.observations) || body.observations.length === 0) return;
+    const rows = sqlRows<{ member: string; owner: string }>(
+      this.state.storage.sql.exec("SELECT member, owner FROM net_gateway_relation WHERE relation = 'session_presence'")
+    );
+    if (rows.length === 0) return;
+    const view = this.ensureView();
+    const classifier = classifierFromLineage(
+      (object) => (view.get(cellKey("object_lineage", object))?.value as AnchorLineage | undefined) ?? null
+    );
+    const frame = JSON.stringify({
+      type: "observations",
+      scope: body.scope,
+      seq: body.seq,
+      observations: body.observations
+    });
+    for (const row of rows) {
+      let ownerScope: string | null;
+      try {
+        ownerScope = classifier.scopeOf(row.owner);
+      } catch {
+        ownerScope = null; // lineage not in view — the convention check decides
+      }
+      if (ownerScope !== body.scope && `room:${row.owner}` !== body.scope) continue;
+      if (body.turn_id !== undefined && this.recentClientTurns.get(body.turn_id) === row.member) continue;
+      for (const ws of getSockets(row.member)) {
+        try {
+          ws.send(frame);
+        } catch {
+          // Dead socket: the runtime's close/error callback owns cleanup.
+        }
+      }
+    }
+  }
+
+  /**
+   * Best-effort pulls for scopes this gateway holds no high-water for —
+   * the cold-view warm-up shared by /net/plan-scheduled and the /net-api
+   * surface. Failures are named metrics, never throws: the caller's
+   * normal machinery (E_MISSING_STATE recovery, view/session checks) is
+   * the fallback. Head-0 caveat (documented at planScheduled): a scope
+   * whose head never advanced records no high-water and re-pulls per
+   * request — redundant but harmless.
+   */
+  private async warmScopes(scopes: Iterable<string>, metricKind: string): Promise<void> {
+    this.ensureView(); // hydrates the `seen` high-water map alongside the view
+    for (const scope of new Set(scopes)) {
+      if (this.seen.has(scope)) continue;
+      try {
+        await this.pull({ scope, destination: `scope:${scope}` });
+      } catch (err) {
+        console.log("woo.metric", JSON.stringify({ kind: metricKind, scope, error: String(err), ts: Date.now() }));
+      }
+    }
+  }
+
+  /** The (relation, owner) member rows from the fanout-fed mirror — the
+   * CO13 client-read primitive, shared by /net/relation (internal) and
+   * /net-api/relation (client). */
+  private relationMembers(relation: string, owner: string): Array<{ member: string; body?: unknown }> {
+    return sqlRows<{ member: string; body: string | null }>(
+      this.state.storage.sql.exec(
+        "SELECT member, body FROM net_gateway_relation WHERE relation = ? AND owner = ? ORDER BY member ASC",
+        relation,
+        owner
+      )
+    ).map((row) => ({
+      member: row.member,
+      ...(row.body !== null ? { body: JSON.parse(row.body) as unknown } : {})
+    }));
   }
 
   /** The scope pinned to an idempotency key, or null (fix 5c). */
@@ -1078,16 +1676,30 @@ export class NetGatewayDO {
     keys: string[]
   ): Promise<void> {
     if (keys.length === 0) return;
+    // Owner-KNOWN keys (the view holds the object's lineage, or the key
+    // names the call's session — sessions.ts rule) route to their owner
+    // and use authoritative-absence semantics: a key the owner does not
+    // return was deleted there, so it deletes here. Owner-UNKNOWN keys
+    // (no lineage in view — the classifier's scopeOf answer is only its
+    // fallback) get pull-on-miss semantics instead: try the fallback,
+    // then the CO15 naming-convention candidates (`room:<object>`,
+    // `cluster:<object>` — the same convention the CO16 planner uses),
+    // and NEVER delete on a miss — a misrouted fetch proves nothing
+    // about the cell's existence. Still-missing keys stay missing; the
+    // next repair round's trace names them (bounded by the budget).
     const byDestination = new Map<string, string[]>();
+    const unknownOwner: string[] = [];
     for (const key of keys) {
-      // CO14: session cell keys name session ids (no lineage); the only
-      // session cell a turn's reads can name is the CALL's session, whose
-      // authority is the calling actor's cluster (sessions.ts rule).
-      const owner = key.startsWith("session:")
-        ? classifier.scopeOf(request.call.actor)
-        : classifier.scopeOf(objectOfCellKey(key));
-      const destination = this.destinationFor(request, owner);
-      byDestination.set(destination, [...(byDestination.get(destination) ?? []), key]);
+      const object = objectOfCellKey(key);
+      if (key.startsWith("session:")) {
+        const destination = this.destinationFor(request, classifier.scopeOf(request.call.actor));
+        byDestination.set(destination, [...(byDestination.get(destination) ?? []), key]);
+      } else if (view.has(cellKey("object_lineage", object))) {
+        const destination = this.destinationFor(request, classifier.scopeOf(object));
+        byDestination.set(destination, [...(byDestination.get(destination) ?? []), key]);
+      } else {
+        unknownOwner.push(key);
+      }
     }
     const known = [...view.keys()].filter((key) => key.startsWith("object_lineage:"));
     for (const [destination, want] of byDestination) {
@@ -1107,6 +1719,44 @@ export class NetGatewayDO {
         })
       );
     }
+    if (unknownOwner.length === 0) return;
+    const byObject = new Map<string, string[]>();
+    for (const key of unknownOwner) {
+      const object = objectOfCellKey(key);
+      byObject.set(object, [...(byObject.get(object) ?? []), key]);
+    }
+    // The actor's live location names the room the turn is happening in
+    // — the strongest candidate for cells of objects addressed there.
+    const actorLive = view.get(cellKey("object_live", request.call.actor))?.value as { location?: string | null } | undefined;
+    const actorRoom = typeof actorLive?.location === "string" && actorLive.location ? `room:${actorLive.location}` : null;
+    for (const [object, want] of byObject) {
+      const candidates = [
+        ...(actorRoom ? [this.destinationFor(request, actorRoom)] : []),
+        this.destinationFor(request, classifier.scopeOf(object)),
+        this.destinationFor(request, `room:${object}`),
+        this.destinationFor(request, `cluster:${object}`)
+      ];
+      let satisfied = false;
+      for (const destination of [...new Set(candidates)]) {
+        if (satisfied) break;
+        try {
+          const transfer = (await this.host.rpc(destination, "/closure", { keys: want, known })) as CellTransfer;
+          if (transfer.cells.length === 0) continue;
+          this.discardViewOnThrow(() =>
+            this.state.storage.transactionSync(() => {
+              for (const cell of transfer.cells) {
+                view.install(cell);
+                this.persistCell(view, cell.key);
+              }
+            })
+          );
+          satisfied = true;
+        } catch {
+          // A candidate that is not a real scope (no durable state)
+          // refuses — expected for convention probes; try the next.
+        }
+      }
+    }
   }
 
   /** Full-closure install from the scope — the CO8 named reseed and the
@@ -1115,17 +1765,31 @@ export class NetGatewayDO {
     view: CellStore,
     destination: string,
     known: string[] = []
-  ): Promise<CellTransfer & { scope: string; head: ScopeHead; catalog_epoch: string }> {
+  ): Promise<CellTransfer & { scope: string; head: ScopeHead; catalog_epoch: string; relations?: RelationRow[] }> {
     const transfer = (await this.host.rpc(destination, "/closure", { keys: ["*"], known })) as CellTransfer & {
       scope: string;
       head: ScopeHead;
       catalog_epoch: string;
+      relations?: RelationRow[];
     };
     this.discardViewOnThrow(() =>
       this.state.storage.transactionSync(() => {
         for (const cell of transfer.cells) {
           view.install(cell);
           this.persistCell(view, cell.key);
+        }
+        // CO13: the full closure carries the scope's relation rows —
+        // upsert them into the mirror in the same transaction. Required
+        // for coherence with fix 7 below: advancing the high-water
+        // no-ops every earlier relation fanout/refan, so without this
+        // the mirror would silently lose the rows those deliveries
+        // carried. Upsert-only: a mirror row deleted at the authority
+        // while this gateway was unsubscribed lingers until a later
+        // remove delta (seq above the new high-water) heals it — a
+        // fresh shard's mirror is exact, which is the pull-on-miss case
+        // this exists for.
+        for (const row of transfer.relations ?? []) {
+          this.applyRelationDelta({ op: "add", row });
         }
         // Fix 7: the closure carries the scope's head — the view now IS
         // the state at that head, so the fanout high-water advances with
@@ -1167,10 +1831,10 @@ export class NetGatewayDO {
         JSON.stringify({ kind: "net_fanout_gap", scope: body.scope, expected: last + 1, got: body.seq, ts: Date.now() })
       );
     }
-    return this.discardViewOnThrow(() =>
+    const applied = this.discardViewOnThrow(() =>
       this.state.storage.transactionSync(() => {
-        const applied = applyFanout(view, this.seen, body);
-        if (applied) {
+        const advanced = applyFanout(view, this.seen, body);
+        if (advanced) {
           for (const cell of body.cells) this.persistCell(view, cell.key);
           // CO13: relation deltas ride the same body and the same seq
           // gate — a redelivered body no-ops above (applyFanout), so the
@@ -1184,9 +1848,16 @@ export class NetGatewayDO {
             body.seq
           );
         }
-        return applied;
+        return advanced;
       })
     );
+    // Observation push (item 3 chunk 2) AFTER the mirror application, so
+    // a presence transition riding this very body shapes its own
+    // audience (an enter's add is visible; a leave's remove already
+    // excludes the leaver). The seq gate above makes the push
+    // at-most-once per socket per turn: redeliveries never reach here.
+    if (applied) this.pushObservations(body);
+    return applied;
   }
 
   /** One relation delta into the mirror table (add = upsert, remove =

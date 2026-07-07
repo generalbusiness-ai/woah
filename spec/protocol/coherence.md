@@ -437,16 +437,31 @@ One write path per fact (CO9), concretized:
   repair path, bounded by scope size — CO11.1). A multi-scope rebuild
   drops candidates whose owner is anchored elsewhere: those rows belong
   at the owning scope, and a local copy would be the CO9 dual write.
-- **The gateway mirror** is fed only by `FanoutBody.relations` (a
-  commit's local deltas, or a `/net/relate` refan) under the same
-  per-scope seq high-water that gates cells; `GET /net/relation
-  ?relation=&owner=` is the client-read primitive for who/contents.
+- **The gateway mirror** is fed by `FanoutBody.relations` (a commit's
+  local deltas, or a `/net/relate` refan) under the same per-scope seq
+  high-water that gates cells, plus one coherence companion: a FULL
+  closure (`keys: ["*"]` — the pull/reseed path) carries the scope's
+  relation rows, upserted in the same transaction that advances the
+  high-water. Required because a pull supersedes earlier fanout rows by
+  seq — without the rows riding the closure, a pull would silently
+  starve the mirror of everything those deliveries carried. Upsert-only:
+  a row deleted at the authority while the gateway was unsubscribed
+  lingers until a later remove delta heals it; a fresh shard's mirror is
+  exact. `GET /net/relation?relation=&owner=` is the client-read
+  primitive for who/contents.
 - **Fanout audiences** are computed from the `session_presence` relation
   (owner = the space, members = live sessions) — CO2.7's
   "O(distinct occupant shards)" gets its production definition here.
-  (CO14's session cells and the presence rows they drive are landed;
-  wiring fanout AUDIENCE selection to the relation arrives with the
-  Phase-4 transports — until then fanout remains per-subscriber.)
+  Implemented (Phase 4 item 3) at the RECEIVING gateway: scope-level
+  fanout stays per-subscriber (rows go to subscribed shards), and each
+  shard narrows the audience itself — an applied `FanoutBody`'s
+  `observations` are pushed to the WebSocket(s) of every session whose
+  presence row's owner anchors to the fanout's scope, read from that
+  shard's own mirror (sessions on other shards are those shards'
+  concern). `FanoutBody.turn_id` (the committed turn's idempotency key)
+  rides commit-announcing fanout so the shard that submitted the turn
+  skips the SUBMITTING session's sockets — that session already received
+  the observations on its turn reply (CO14 `/net-api` bullet below).
 
 ## CO14. Session authority and authentication
 
@@ -479,10 +494,75 @@ One write path per fact (CO9), concretized:
   terminal-failing. Ownership witness: the scope holds the cell AND it
   is not CA3 rider residue. Sessions absent entirely → allowed only for
   direct-route turns (lane/tooling submits); a sequenced turn must name
-  a session, and Phase-4 transports will require sessions on all
-  client-originated turns. Credential authentication against identity
-  cells in the catalog scope closure (CO15) is the Phase-4 transport
-  story in front of `/net/session-open`.
+  a session, and the Phase-4 client surface requires sessions on all
+  client-originated turns (next bullet). Credential authentication
+  against identity cells in the catalog scope closure (CO15) is the
+  Phase-4 transport in front of `/net/session-open` — implemented as
+  `/net-api` (below).
+- **The `/net-api` client surface (implemented — Phase 4 item 2).** The
+  worker entry routes `/net-api/*` to ONE stable GATEWAY_NET shard
+  (`net-api`): a session cell installs into the MINTING gateway's
+  derived view and `/net-api/turn` validates the session from that same
+  view, so mint and turn must land on the same DO; hash-sharding by
+  session id waits on a session→cluster pull-on-miss story (session ids
+  carry no lineage). No internal signing rides this path — the gateway
+  authenticates the client credential itself: `authorization: Bearer
+  apikey:<id>:<secret>` (or `x-woo-api-key`) verified against the
+  catalog identity cell `property_cell:$system:api_keys` (pull-on-miss
+  from the catalog scope), with core's exact salt/hash scheme
+  reimplemented in `src/worker/net/client-auth.ts` (never an engine
+  import); refusals are named 401 `E_NOSESSION` verdicts.
+  - `POST /net-api/session {ttl_ms?}` derives the actor's cluster from
+    view lineage (CO15; convention pull `cluster:<actor>` on miss) and
+    mints through `/net/session-open`'s machinery.
+  - `POST /net-api/turn {target, verb, args?, session, idempotency_key?}`
+    REQUIRES a session (`session_required` without one) and validates
+    the named session cell — presence, expiry, and actor binding to the
+    AUTHENTICATED apikey actor — before planning; the turn then runs
+    route:`sequenced` so the committing scope's authorize revalidates
+    end-to-end (the gateway authenticates; scopes authorize).
+  - **planningScope from the session cell:** the anchor object is the
+    session's `activeScope` when set, else the actor's live location
+    from the view, else the actor itself; the anchor classifies through
+    view lineage (CO15 walk; convention pull `room:<anchor>` on miss),
+    falling back to the actor's cluster when it cannot classify.
+  - Accepted turn replies carry the planned transcript's `result`,
+    `error`, and `observations` (the gateway holds the planned
+    transcript; `error` matters because an errored verb still commits
+    its complete transcript — without the field an accepted no-op is
+    indistinguishable from success). A replay detected by post-state
+    digest mismatch omits them and marks `replayed: true` (a fresh
+    accept always digest-matches its plan).
+  - `GET /net-api/relation` / `GET /net-api/cell` are the authenticated
+    client reads over the CO13 roster mirror and the view cell probe.
+  - **`GET /net-api/ws` (implemented — Phase 4 item 3)** upgrades to a
+    WebSocket: the same apikey authentication (additionally accepted as
+    `?token=apikey:<id>:<secret>` on THIS route only — the WebSocket API
+    cannot set request headers; headers win when present) plus a
+    REQUIRED `?session=` validated exactly like `/net-api/turn`. The
+    accepted socket is tagged with the session id via the DO hibernation
+    API — the runtime socket set IS the registry (per-shard, in-memory/
+    hibernation only; no new durable copy — CO5 stands at five; a
+    dropped socket loses liveness only, the session cell persists and a
+    reconnect re-tags). Frames (JSON; `id` echoed): `{type:"turn",
+    target, verb, args?, idempotency_key?}` runs the `/net-api/turn`
+    path on the SOCKET's own session and replies `{type:"turn_result",
+    id, status, ...}`; `{type:"ping"}` → `{type:"pong"}`; anything else
+    → a named `{type:"error"}` frame, never a close.
+  - **Observation delivery (Phase 4 item 3):** the submitting session
+    receives its turn's observations ON THE TURN REPLY only (previous
+    bullet; the WS `turn_result` frame carries them). Peers receive them
+    via fanout: the gateway routes an applied fanout's observations to
+    the sockets of sessions PRESENT in the fanout's scope per its CO13
+    mirror, as `{type:"observations", scope, seq, observations}` frames.
+    Echo dedupe is `FanoutBody.turn_id` matched against a bounded
+    in-memory LRU of recently client-submitted turn ids (recorded before
+    the submit leaves, so the fanout can never race past it); losing an
+    entry (hibernation, cap) degrades to one duplicate frame for the
+    submitter, never a missed frame for a peer. Delivery is
+    AT-MOST-ONCE and never durable: the per-scope seq gate drops
+    redeliveries, dead sockets are skipped, and missed-observation
+    catch-up is deliberately NOT promised in Phase 4.
 - **Every planned submit carries its session read** (folded in by
   `plan.ts` when the engine transcript lacks it — the engine cannot
   record session-kind cells), versioned through the plan snapshot, so

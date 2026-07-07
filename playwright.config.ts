@@ -14,6 +14,11 @@ const useExternalBaseUrl = Boolean(process.env.WOO_E2E_BASE_URL);
 
 export default defineConfig({
   testDir: "./e2e",
+  // net-feed.spec.ts manages its own wrangler-dev backend (npm run e2e:net,
+  // playwright.net-e2e.config.ts) — running it here would spawn a second
+  // workerd under the dev-server webServer for nothing. Browser-spawning
+  // lanes are explicit, like e2e:cf.
+  testIgnore: "**/net-feed.spec.ts",
   timeout: 30_000,
   fullyParallel: false,
   workers: 1,
