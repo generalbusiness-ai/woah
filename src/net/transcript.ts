@@ -23,17 +23,43 @@
  * |                         |   projection (CA4/CO9), never an|
  * |                         |   authority cell; those writes  |
  * |                         |   route to the projection applier|
+ * | session {object=sid}    | session:<sid> — net-only kind   |
+ * |                         |   (CO14; see SessionTranscriptCell|
+ * |                         |   below): the v2 recorder never |
+ * |                         |   emits it                      |
  */
 import type {
-  EffectTranscript,
-  TranscriptCell,
-  TranscriptWrite
+  EffectTranscript as EngineEffectTranscript,
+  TranscriptCell as EngineTranscriptCell,
+  TranscriptRead as EngineTranscriptRead,
+  TranscriptWrite as EngineTranscriptWrite
 } from "../core/effect-transcript";
 import { finalWritesByCell } from "../core/shadow-commit-scope";
 import { CellStore, cellKey, cellVersion, type EpochStamp } from "./cells";
 import { netError } from "./errors";
 
-export type { EffectTranscript, TranscriptCell, TranscriptWrite };
+/**
+ * CO14: the net layer's session-cell vocabulary, widened AT THE BRIDGE.
+ *
+ * The v2 recorder never emits a session-kind RecordedCell (v2 persists
+ * session rows out-of-band via persistSession), so the engine's
+ * `RecordedCell` union — and every exhaustive switch on it in the frozen
+ * v2 layer — stays untouched. Session cells enter transcripts only
+ * through the net layer's own producers: `mintSessionSubmit`
+ * (sessions.ts) and the plan-time transition fold (plan.ts). Everything
+ * downstream of the bridge (scope validation, apply, routing) consumes
+ * the widened types re-exported here, so an engine transcript remains
+ * directly assignable (the union only widens).
+ */
+export type SessionTranscriptCell = { kind: "session"; object: string };
+export type TranscriptCell = EngineTranscriptCell | SessionTranscriptCell;
+export type TranscriptRead = Omit<EngineTranscriptRead, "cell"> & { cell: TranscriptCell };
+export type TranscriptWrite = Omit<EngineTranscriptWrite, "cell"> & { cell: TranscriptCell };
+export type EffectTranscript = Omit<EngineEffectTranscript, "reads" | "writes" | "stateProbes"> & {
+  reads: TranscriptRead[];
+  writes: TranscriptWrite[];
+  stateProbes?: TranscriptCell[];
+};
 
 /**
  * The canonical `property_cell` payload: `{value?, def?}`.
@@ -78,6 +104,7 @@ export function transcriptCellId(cell: TranscriptCell): string {
     case "location": return `location:${cell.object}`;
     case "contents": return `contents:${cell.object}`;
     case "lifecycle": return `lifecycle:${cell.object}`;
+    case "session": return `session:${cell.object}`;
   }
 }
 
@@ -90,6 +117,7 @@ export function netCellKeyFor(cell: TranscriptCell): string | null {
     case "location": return cellKey("object_live", cell.object);
     case "lifecycle": return cellKey("object_lineage", cell.object);
     case "contents": return null;
+    case "session": return cellKey("session", cell.object);
   }
 }
 
@@ -107,10 +135,33 @@ export type ApplyResult = {
 };
 
 /**
+ * Last-write-wins collapse over the widened write set. Engine-kind cells
+ * collapse through the v2 `finalWritesByCell` UNCHANGED (byte-identical
+ * across the two layers for the differential gate); session-kind cells —
+ * which v2's cell-key switch has never seen — collapse by the same rule
+ * locally. The two id spaces cannot collide (session ids vs object ids),
+ * so splitting preserves the collapse exactly.
+ */
+function finalNetWritesByCell(transcript: EffectTranscript): TranscriptWrite[] {
+  const engineWrites: EngineTranscriptWrite[] = [];
+  const sessionWrites = new Map<string, TranscriptWrite>();
+  for (const write of transcript.writes) {
+    if (write.cell.kind === "session") sessionWrites.set(transcriptCellId(write.cell), write);
+    else engineWrites.push(write as EngineTranscriptWrite);
+  }
+  const collapsedEngine =
+    sessionWrites.size === 0
+      ? finalWritesByCell(transcript as unknown as EngineEffectTranscript)
+      : finalWritesByCell({ ...transcript, writes: engineWrites } as unknown as EngineEffectTranscript);
+  return [...(collapsedEngine as TranscriptWrite[]), ...sessionWrites.values()];
+}
+
+/**
  * Apply a transcript's final writes to a clone of `pre` (CO4 step 10:
  * applying can only add a post-state mismatch; it never runs bytecode).
- * `finalWritesByCell` is imported from v2 so last-write-wins collapsing
- * is byte-identical across the two layers for the differential gate.
+ * Engine-kind collapsing is delegated to v2's `finalWritesByCell` so
+ * last-write-wins stays byte-identical across the two layers for the
+ * differential gate (see finalNetWritesByCell).
  */
 export function applyTranscript(pre: CellStore, transcript: EffectTranscript, stamp: EpochStamp): ApplyResult {
   if (pre.role !== "authority") {
@@ -143,13 +194,23 @@ export function applyTranscript(pre: CellStore, transcript: EffectTranscript, st
     touched.add(liveKey);
   }
 
-  for (const write of finalWritesByCell(transcript)) {
+  for (const write of finalNetWritesByCell(transcript)) {
     const key = netCellKeyFor(write.cell);
     if (key === null) {
       projectionWrites.push(write);
       continue;
     }
     switch (write.cell.kind) {
+      case "session": {
+        // CO14: a session is a cell. `set` writes commit the full row
+        // (mint/refresh/transition-fold — the value is the whole
+        // SerializedSession-shaped payload, so post-state parity holds
+        // from the write value alone, without prior-state merging);
+        // `remove` is expiry/logout.
+        if (write.op === "remove") post.delete(key);
+        else post.commit({ kind: "session", object: write.cell.object, value: write.value, stamp });
+        break;
+      }
       case "location": {
         post.commit({ kind: "object_live", object: write.cell.object, value: { location: write.value ?? null }, stamp });
         break;

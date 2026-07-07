@@ -68,6 +68,7 @@ import { cellKey, lineageClosureKeys, serializeTransfer, type CellTransfer } fro
 import { isNetError, netError } from "../../net/errors";
 import { Outbox, type FanoutBody, type FanoutRow } from "../../net/outbox";
 import { ScopeSequencer, type CommitSubmit, type ScheduledTurn, type ScopeHead } from "../../net/scope";
+import { authorizeSessionSubmit } from "../../net/sessions";
 import { relationKey, type RelationDelta, type RelationRow } from "../../net/relations";
 import type { ScopeMeta, ScopeStore, TailEntry } from "../../net/scope-store";
 import type { CommitReply } from "../../net/scope";
@@ -283,6 +284,12 @@ export class NetScopeDO {
    * gates the clear so scopes with no outbox history never touch the
    * storage alarm. Lost on eviction by design — see armOutboxRetryAlarm. */
   private outboxAlarmArmed = false;
+  /** In-memory mirror of the rider residue ledger (net_scope_rider_cache),
+   * hydrated lazily and appended on insert — `owns` consults it per read
+   * (CO14 session witness), so a per-call SQL scan would be a hot-path
+   * regression. Discarded with the sequencer on any transaction abort
+   * (memory-follows-durable, fix 3). */
+  private riderCacheMemo: Set<string> | null = null;
   /** Per-submit relation-owner scope hints (object → owning scope name),
    * loaded from the gateway's relate_destinations sibling for the
    * duration of one /net/submit and cleared after. The sequencer's
@@ -566,6 +573,18 @@ export class NetScopeDO {
     }
     const seq: ScopeSequencer = new ScopeSequencer(resolvedScope, resolvedEpoch, {
       durable: this.store,
+      // CO4 step 1 (CO14): validate the submit's session story — every
+      // session read plus the transcript's session field — from this
+      // authority's own cells when owned, else via the CO2.3 attestation
+      // the submit carries; mint writes validate their written value.
+      // Semantics live in src/net/sessions.ts; the shell only supplies
+      // the ownership witness, the store read, and the clock.
+      authorize: (submit) =>
+        authorizeSessionSubmit(submit, {
+          ownsSession: (id) => this.ownsSessionCell(seq, id),
+          readSession: (id) => seq.store.get(cellKey("session", id)),
+          now: () => this.host.now()
+        }),
       // Ownership wiring (Phase-3 hardening fix 2). Fixed-assignment rule,
       // in force until the Phase-3.5 topology section lands anchor-map-
       // driven ownership: a scope owns an object iff its store holds
@@ -576,7 +595,15 @@ export class NetScopeDO {
       // non-owned cells are skipped at CO4 step 7 by the sequencer: their
       // freshness is the owning scope's + the adopt-time prior-version
       // CAS's job (CO2.4; notes/2026-07-06-rider-read-integrity.md).
-      owns: (object) => seq.store.has(cellKey("object_lineage", object)),
+      //
+      // CO14 addendum: session cells key on session ids, which never have
+      // lineage — a scope owns a session iff it HOLDS the cell (the mint
+      // committed here, or the seed partitioned it here with its actor)
+      // AND the cell is not rider residue (a session cell that rode along
+      // in a CA3 commit is a cache of the owner's fact; claiming
+      // ownership of it would let this scope validate reads against a
+      // stale copy — the ownsSessionCell helper excludes the ledger).
+      owns: (object) => seq.store.has(cellKey("object_lineage", object)) || this.ownsSessionCell(seq, object),
       // CO13 relation-owner classification: the gateway's per-submit
       // relate_destinations hints (anchor topology is gateway knowledge —
       // the same rule as rider_destinations); an unhinted owner is local.
@@ -646,13 +673,25 @@ export class NetScopeDO {
     return { ...transfer, scope: seq.scope, head: seq.head(), catalog_epoch: seq.catalogEpoch };
   }
 
-  /** Keys in the rider residue ledger (see the constructor comment). */
+  /** Keys in the rider residue ledger (see the constructor comment),
+   * memoized in memory (the memo is appended by enqueueDeliveries inside
+   * the commit transaction and discarded on abort — fix 3). */
   private riderCacheKeys(): Set<string> {
-    return new Set(
-      sqlRows<{ key: string }>(this.state.storage.sql.exec("SELECT key FROM net_scope_rider_cache")).map(
-        (row) => row.key
-      )
-    );
+    if (this.riderCacheMemo === null) {
+      this.riderCacheMemo = new Set(
+        sqlRows<{ key: string }>(this.state.storage.sql.exec("SELECT key FROM net_scope_rider_cache")).map(
+          (row) => row.key
+        )
+      );
+    }
+    return this.riderCacheMemo;
+  }
+
+  /** CO14 session-ownership witness (see the `owns` wiring comment): the
+   * scope holds the session cell AND it is not rider residue. */
+  private ownsSessionCell(seq: ScopeSequencer, session: string): boolean {
+    const key = cellKey("session", session);
+    return seq.store.has(key) && !this.riderCacheKeys().has(key);
   }
 
   // ---- Fanout + rider adoption (CO2.7, CA3) ---------------------------
@@ -813,12 +852,15 @@ export class NetScopeDO {
       };
       this.persistOutboxRow("/adopt", rider.destination, adoptBody);
       // Residue ledger: from now on these keys are a cache of the owner's
-      // fact — a later transfer out of this scope ships them derived.
+      // fact — a later transfer out of this scope ships them derived, and
+      // `owns` never claims them (CO14 session witness). The memo append
+      // rides the same transaction; discardSeqOnThrow drops it on abort.
       for (const cell of cells) {
         this.state.storage.sql.exec(
           "INSERT INTO net_scope_rider_cache (key) VALUES (?) ON CONFLICT(key) DO NOTHING",
           cell.key
         );
+        this.riderCacheMemo?.add(cell.key);
       }
     }
   }
@@ -1245,6 +1287,10 @@ export class NetScopeDO {
       return fn();
     } catch (err) {
       this.seq = null;
+      // The rider-residue memo may have been appended inside the aborted
+      // transaction (enqueueDeliveries) — rehydrate it from the rolled-
+      // back ledger alongside the sequencer.
+      this.riderCacheMemo = null;
       throw err;
     }
   }

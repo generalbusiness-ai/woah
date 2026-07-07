@@ -19,6 +19,11 @@
  *                         bound (head-checked against the live scope;
  *                         CO5 copy #3), else the scope's lineage-closed
  *                         live closure — which then rewrites the seed
+ *       POST /net/session-open  CO14 mint: build a session-cell commit via
+ *                         mintSessionSubmit, submit it to the actor's
+ *                         cluster scope (stale_head-only retry), install
+ *                         the accepted cell in the view (test/lane-facing
+ *                         until Phase-4 transports authenticate in front)
  *       POST /net/turn    the CO6-taxonomy repair loop: plan → submit,
  *                         with each retryable verdict mapped to its
  *                         defined recovery (refetch head / targeted
@@ -40,6 +45,7 @@ import { CellStore, cellKey, type Cell } from "../../net/cells";
 import { budgetExhausted, isNetError, type AttemptTraceEntry, type NetErrorCode } from "../../net/errors";
 import { applyFanout, type FanoutBody } from "../../net/outbox";
 import { relationKey, type RelationDelta } from "../../net/relations";
+import { mintSessionSubmit } from "../../net/sessions";
 import { planTurn, type PlanTurnInput, type PlanTurnResult } from "../../net/plan";
 import type { ScopeClassifier } from "../../net/route";
 import { CATALOG_SCOPE, classifierFromLineage, type AnchorLineage } from "../../net/topology";
@@ -123,6 +129,17 @@ type TurnRequest = {
   /** which scopes are shared sequencers (rooms); others are clusters. */
   shared?: string[];
   counters?: PlanTurnInput["counters"];
+};
+
+/** /net/session-open body (CO14 mint; see sessionOpen). */
+type SessionOpenRequest = {
+  session: string;
+  actor: string;
+  ttl_ms: number;
+  catalog_epoch: string;
+  /** Optional rpc-destination override (lane fixtures); the scope name is
+   * recovered from the `scope:<scopeName>` convention when it applies. */
+  cluster_destination?: string;
 };
 
 /** /net/turn reply body. `trace` lists the failed rounds that preceded
@@ -214,6 +231,9 @@ export class NetGatewayDO {
       }
       if (request.method === "POST" && url.pathname === "/net/turn") {
         return json(await this.turn((await request.json()) as TurnRequest));
+      }
+      if (request.method === "POST" && url.pathname === "/net/session-open") {
+        return json(await this.sessionOpen((await request.json()) as SessionOpenRequest));
       }
       if (request.method === "GET" && url.pathname === "/net/cell") {
         // Lane read surface (Phase-3 step 4b): expose one view cell so the
@@ -661,6 +681,78 @@ export class NetGatewayDO {
     });
   }
 
+  /**
+   * /net/session-open — CO14 minting (test/lane-facing until the Phase-4
+   * transports put credential authentication in front of it; CO14: the
+   * gateway authenticates, scopes authorize).
+   *
+   * Honest-path decision, documented: the mint is a DIRECT submit built by
+   * mintSessionSubmit, not a /net/turn — a session mint is a substrate
+   * commit with no verb to execute, so driving the planner would require
+   * a phantom `session_mint` verb in every world. The repair loop is
+   * correspondingly minimal: only `stale_head` can race a mint (the
+   * transcript reads nothing), so refetch the head and resubmit the SAME
+   * transcript — expiry is stamped once, before the loop, keeping the
+   * idempotency key stable across attempts (CO2.5).
+   *
+   * The cluster scope is derived from the view's lineage (CO15 anchor
+   * walk on the actor) when possible; `cluster_destination` overrides the
+   * rpc destination (lane fixtures wiring fake stubs), with the scope
+   * name recovered from the `scope:<scopeName>` convention.
+   */
+  private async sessionOpen(request: SessionOpenRequest): Promise<{
+    reply: CommitReply;
+    scope: string;
+    value: unknown;
+    install_degraded?: boolean;
+  }> {
+    const view = this.ensureView();
+    let clusterScope: string;
+    if (request.cluster_destination?.startsWith("scope:")) {
+      clusterScope = request.cluster_destination.slice("scope:".length);
+    } else {
+      // CO15: derive from view lineage — the actor must be pullable state.
+      const classifier = classifierFromLineage(
+        (object) => (view.get(cellKey("object_lineage", object))?.value as AnchorLineage | undefined) ?? null
+      );
+      clusterScope = classifier.scopeOf(request.actor);
+    }
+    const destination = request.cluster_destination ?? `scope:${clusterScope}`;
+
+    const now = this.host.now();
+    let base = ((await this.host.rpc(destination, "/head")) as { head: ScopeHead }).head;
+    const { submit, value } = mintSessionSubmit({
+      session: request.session,
+      actor: request.actor,
+      ttl_ms: request.ttl_ms,
+      now,
+      base,
+      epoch: request.catalog_epoch,
+      clusterScope
+    });
+    let reply: CommitReply;
+    for (let attempt = 1; ; attempt += 1) {
+      reply = (await this.host.rpc(destination, "/submit", { ...submit, base })) as CommitReply;
+      if (reply.status === "accepted" || !reply.retryable || reply.reason !== "stale_head" || attempt >= 3) break;
+      base = ((await this.host.rpc(destination, "/head")) as { head: ScopeHead }).head;
+    }
+    if (reply.status !== "accepted") return { reply, scope: clusterScope, value };
+    // Install the accepted session cell into the view (warm cache-fill,
+    // CO7) — the same degrade rule as /net/turn (fix 5a): the commit is
+    // durable; a failed fill self-repairs on the next turn's read check.
+    let installDegraded = false;
+    try {
+      await this.installTouched(view, destination, reply.touched);
+    } catch (err) {
+      installDegraded = true;
+      console.log(
+        "woo.metric",
+        JSON.stringify({ kind: "net_session_open_install_degraded", scope: clusterScope, error: String(err), ts: Date.now() })
+      );
+    }
+    return { reply, scope: clusterScope, value, ...(installDegraded ? { install_degraded: true } : {}) };
+  }
+
   /** The scope pinned to an idempotency key, or null (fix 5c). */
   private pinnedScope(idempotencyKey: string): string | null {
     const rows = sqlRows<{ scope: string }>(
@@ -701,7 +793,14 @@ export class NetGatewayDO {
     for (const read of planned.transcript.reads) {
       const key = netCellKeyFor(read.cell);
       if (key === null) continue; // contents reads are projection reads (CA4)
-      const owner = classifier.scopeOf(read.cell.object);
+      // CO14: session cells classify by the calling actor (sessions.ts
+      // classification rule — session ids carry no lineage; their
+      // authority is the actor's cluster). The folded session read of a
+      // room-committed turn attests at the cluster like any rider read.
+      const owner =
+        read.cell.kind === "session"
+          ? classifier.scopeOf(planned.transcript.call.actor)
+          : classifier.scopeOf(read.cell.object);
       if (owner === targetScope) continue; // validated locally at the committing scope
       const keys = byOwner.get(owner) ?? new Set<string>();
       keys.add(key);
@@ -743,7 +842,15 @@ export class NetGatewayDO {
     };
     for (const write of planned.transcript.writes) {
       if (netCellKeyFor(write.cell) === null) continue; // contents → projection (CA4)
-      put(classifier.scopeOf(write.cell.object), write.cell.object);
+      // CO14: a folded session-cell write rides to the ACTOR's cluster
+      // (the same classification route.ts selected the rider scope with);
+      // the listed object is the session id, so the scope shell picks the
+      // accepted session cell for the /adopt row.
+      const owningScope =
+        write.cell.kind === "session"
+          ? classifier.scopeOf(planned.transcript.call.actor)
+          : classifier.scopeOf(write.cell.object);
+      put(owningScope, write.cell.object);
     }
     for (const move of planned.transcript.moves ?? []) {
       put(classifier.scopeOf(move.object), move.object);
@@ -882,7 +989,13 @@ export class NetGatewayDO {
     if (keys.length === 0) return;
     const byDestination = new Map<string, string[]>();
     for (const key of keys) {
-      const destination = this.destinationFor(request, classifier.scopeOf(objectOfCellKey(key)));
+      // CO14: session cell keys name session ids (no lineage); the only
+      // session cell a turn's reads can name is the CALL's session, whose
+      // authority is the calling actor's cluster (sessions.ts rule).
+      const owner = key.startsWith("session:")
+        ? classifier.scopeOf(request.call.actor)
+        : classifier.scopeOf(objectOfCellKey(key));
+      const destination = this.destinationFor(request, owner);
       byDestination.set(destination, [...(byDestination.get(destination) ?? []), key]);
     }
     const known = [...view.keys()].filter((key) => key.startsWith("object_lineage:"));

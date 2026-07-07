@@ -117,7 +117,7 @@ function clusterCells() {
 function rideAlongSubmit(base: ScopeHead): CommitSubmit {
   const transcript = {
     kind: "woo.effect_transcript.shadow.v1",
-    route: "sequenced",
+    route: "direct",
     scope: ROOM_SCOPE,
     seq: 1,
     call: { actor: "#actor", target: "#room", verb: "greet", args: [], body: undefined },
@@ -407,7 +407,7 @@ describe("rider adoption prior-version CAS (fix 1)", () => {
   function rideAlongReading(base: ScopeHead, key: string, hash: string, readVersion: string, visits: number, greeted: number): CommitSubmit {
     const transcript = {
       kind: "woo.effect_transcript.shadow.v1",
-      route: "sequenced",
+      route: "direct",
       scope: ROOM_SCOPE,
       seq: base.seq + 1,
       call: { actor: "#actor", target: "#room", verb: "greet", args: [], body: undefined },
@@ -452,7 +452,7 @@ describe("rider adoption prior-version CAS (fix 1)", () => {
   function clusterAdvanceSubmit(base: ScopeHead, greeted: number): CommitSubmit {
     const transcript = {
       kind: "woo.effect_transcript.shadow.v1",
-      route: "sequenced",
+      route: "direct",
       scope: CLUSTER_SCOPE,
       seq: base.seq + 1,
       call: { actor: "#actor", target: "#actor", verb: "stamp", args: [], body: undefined },

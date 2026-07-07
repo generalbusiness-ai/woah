@@ -311,6 +311,12 @@ describe("differential gate: v2-native vs net commit layer (CO12.4)", () => {
     const classifier2: ScopeClassifier = classifierFromCells(genesisCells as never);
     const ROOM_SCOPE = "room:diff2_room";
     const CLUSTER_SCOPE = `cluster:${actor}`;
+    // CO14: session ids carry no lineage — a session's scope is its
+    // ACTOR's cluster (partitionCells' rule). The harness owns/attest
+    // lookups route session ids through this map.
+    const sessionActorById = new Map(genesis2.sessions.map((row) => [row.id, row.actor] as const));
+    const scopeOfObjectOrSession = (object: string): string =>
+      classifier2.scopeOf(sessionActorById.get(object) ?? object);
 
     // The scripted turns with their expected commit routing: the greet is
     // the CA3 ride-along (room write + actor rider); the satchel move is
@@ -351,7 +357,7 @@ describe("differential gate: v2-native vs net commit layer (CO12.4)", () => {
     expect([...partitions.keys()]).toEqual(expect.arrayContaining([ROOM_SCOPE, CLUSTER_SCOPE, "catalog", "room:diff2_annex"]));
     const sequencers = new Map<string, ScopeSequencer>();
     for (const [scope, cells] of partitions) {
-      const seq = new ScopeSequencer(scope, EPOCH, { owns: (object) => classifier2.scopeOf(object) === scope });
+      const seq = new ScopeSequencer(scope, EPOCH, { owns: (object) => scopeOfObjectOrSession(object) === scope });
       seq.seed(cells);
       sequencers.set(scope, seq);
     }
@@ -374,7 +380,7 @@ describe("differential gate: v2-native vs net commit layer (CO12.4)", () => {
       for (const read of transcript.reads) {
         const key = netCellKeyFor(read.cell as never);
         if (key === null) continue; // contents reads are projection reads (CA4)
-        const owner = classifier2.scopeOf(read.cell.object);
+        const owner = scopeOfObjectOrSession(read.cell.object);
         if (owner === committingScope) continue;
         const keys = byOwner.get(owner) ?? new Set<string>();
         keys.add(key);

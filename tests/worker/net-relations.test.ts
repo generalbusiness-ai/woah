@@ -85,7 +85,10 @@ function roomCells() {
 function clusterCells() {
   return [
     { kind: "object_lineage" as const, object: "#actor", value: { parent: null, owner: "#actor", name: "actor", anchor: null, flags: {} } },
-    { kind: "object_live" as const, object: "#actor", value: { location: null } }
+    { kind: "object_live" as const, object: "#actor", value: { location: null } },
+    // CO14: the cluster is the session's authority — the sequenced move
+    // below names s1, and authorize validates it from this owned cell.
+    { kind: "session" as const, object: "s1", value: { id: "s1", actor: "#actor", started: 0 } }
   ];
 }
 
@@ -132,7 +135,9 @@ function crossScopeMoveSubmit(base: ScopeHead): CommitSubmit {
 function localMoveSubmit(base: ScopeHead): CommitSubmit {
   const transcript = {
     kind: "woo.effect_transcript.shadow.v1",
-    route: "sequenced",
+    // Tooling submit without a session: direct route (CO14 — a sequenced
+    // turn must name a session).
+    route: "direct",
     scope: ROOM_SCOPE,
     seq: 1,
     call: { actor: "#actor", target: "#box", verb: "moveto", args: ["#room"], body: undefined },

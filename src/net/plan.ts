@@ -35,7 +35,8 @@ import {
 import { CellStore, cellKey, cellVersion, serializeTransfer, type Cell, type EpochStamp } from "./cells";
 import { selectCommitScope, type ScopeClassifier, type ScopeSelection } from "./route";
 import type { CommitSubmit, ScopeHead } from "./scope";
-import { applyTranscript, netCellKeyFor, type EffectTranscript } from "./transcript";
+import { sessionWriter } from "./sessions";
+import { applyTranscript, netCellKeyFor, type EffectTranscript, type TranscriptRead, type TranscriptWrite } from "./transcript";
 
 /** CO7/CO10 envelope byte ceilings, enforced at plan time. */
 export const WARM_ENVELOPE_BYTE_LIMIT = 64 * 1024;
@@ -96,8 +97,12 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
   const world = planningWorldFromCells(storeCells(snapshot), input.counters);
   const run = await runShadowTurnCallTranscript(world, call);
 
-  const selection = selectCommitScope(run.transcript, planningScope, classifier);
-  const transcript = submitTranscript(run.transcript, snapshot, selection.scope);
+  // CO14: every planned submit carries its session read (and a
+  // transition-carrying turn folds the session-cell write) BEFORE scope
+  // selection, so the folded write participates in the write-set routing.
+  const withSession = foldSessionEffects(run.transcript, snapshot, call);
+  const selection = selectCommitScope(withSession, planningScope, classifier);
+  const transcript = submitTranscript(withSession, snapshot, selection.scope);
 
   // Planner-parity post-state: same apply, same prior cells (the snapshot
   // is a read-through of authority), so an honest plan predicts the
@@ -132,6 +137,57 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
     envelopeBytes,
     transcript
   };
+}
+
+/**
+ * CO14 session effects, folded in at plan time (before scope selection —
+ * a folded write participates in write-set routing):
+ *
+ * 1. **Every planned submit carries its session read.** The engine
+ *    recorder cannot emit session-kind cells (the vocabulary is net-only
+ *    — transcript.ts), so when the call names a session and the recorded
+ *    transcript lacks its read, append one versioned/valued from the plan
+ *    snapshot. The scope's authorize step (CO4 step 1) validates it —
+ *    owned or CO2.3-attested — and step 7 pins its freshness like any
+ *    other read.
+ * 2. **A session-scope transition folds into a session-cell write** (the
+ *    CA8 lesson carried into net; CO14 "no separate presence write
+ *    path"): value = the snapshot's prior session row merged with
+ *    `activeScope: transition.to`, written by the actor's own frame. The
+ *    committed cell is then the single source presence (CO13) derives
+ *    from, in the SAME turn. Prior-row freshness is pinned by the folded
+ *    read (rule 1 — a transition turn always names its session).
+ */
+function foldSessionEffects(recorded: EffectTranscript, snapshot: CellStore, call: ShadowTurnCall): EffectTranscript {
+  const session = call.session ?? (typeof recorded.session === "string" ? recorded.session : null);
+  if (!session) return recorded;
+  const key = cellKey("session", session);
+  const prior = snapshot.get(key);
+
+  const reads = [...recorded.reads];
+  if (!reads.some((read) => read.cell.kind === "session" && read.cell.object === session)) {
+    reads.push({
+      cell: { kind: "session", object: session },
+      // submitTranscript rewrites this through the same snapshot; recorded
+      // here too so the transcript is honest even before the rewrite.
+      version: prior?.version ?? "absent",
+      value: (prior?.value ?? null) as TranscriptRead["value"]
+    });
+  }
+
+  const writes = [...recorded.writes];
+  const transition = recorded.sessionScopeTransition;
+  if (transition && transition.session === session) {
+    const priorRow = (prior?.value ?? {}) as Record<string, unknown>;
+    const value = { ...priorRow, id: session, actor: transition.actor, activeScope: transition.to };
+    writes.push({
+      cell: { kind: "session", object: session },
+      value: value as TranscriptWrite["value"],
+      op: "set",
+      writer: sessionWriter(transition.actor, "session_transition")
+    });
+  }
+  return { ...recorded, reads, writes };
 }
 
 /**

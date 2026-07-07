@@ -233,11 +233,20 @@ export class ScopeSequencer {
     const recorded = this.replies.get(submit.idempotency_key);
     if (recorded) return recorded;
 
-    // Step 1: envelope/actor/session authority.
+    // Step 1: envelope/actor/session authority (CO14: the shell wires
+    // authorizeSessionSubmit here). A thrown error carrying a structured
+    // `detail` object (SessionAuthError) folds it into the reject reply,
+    // so an unauthorized refusal names its verdict (expired / missing /
+    // actor_mismatch / session_unattested / session_required) instead of
+    // burying it in prose.
     try {
       this.options.authorize?.(submit);
     } catch (err) {
-      return this.reject(submit, "unauthorized", { error: String(err) });
+      const structured =
+        err && typeof err === "object" && "detail" in err && err.detail && typeof err.detail === "object"
+          ? (err.detail as Record<string, unknown>)
+          : {};
+      return this.reject(submit, "unauthorized", { error: String(err), ...structured });
     }
 
     // Step 2: scope and epoch.
