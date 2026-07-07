@@ -248,10 +248,29 @@ function clampClientTtl(raw: unknown): number {
  * authenticated actor the session is bound to. */
 type GatewaySocketAttachment = { session: string; actor: string; opened_at: number };
 
+/** Echo-dedupe LRU bound (see recentClientTurns). */
+const RECENT_CLIENT_TURN_CAP = 512;
+
 export class NetGatewayDO {
   private readonly host: WorkerdHost;
   private view: CellStore | null = null;
   private readonly seen = new Map<string, number>();
+  /**
+   * Echo dedupe (Phase 4 item 3 chunk 2): turn id → the session that
+   * submitted it through THIS shard's client surface. The submitting
+   * session receives its turn's observations on the turn reply (item 1),
+   * so pushObservations skips its sockets when the fanout announcing the
+   * same turn arrives.
+   *
+   * Boundedness, documented: an insertion-ordered Map capped at
+   * RECENT_CLIENT_TURN_CAP — plenty for the window between a submit and
+   * its own fanout (same-scope, one commit). In-memory only, ON PURPOSE:
+   * losing an entry (hibernation, cap overflow) degrades to ONE
+   * duplicate frame for the submitter — never a missed frame for anyone
+   * else — which matches the layer's at-most-once, no-durability
+   * observation posture (kickoff rule).
+   */
+  private readonly recentClientTurns = new Map<string, string>();
 
   constructor(
     private readonly state: NetGatewayDurableState,
@@ -1107,6 +1126,11 @@ export class NetGatewayDO {
       typeof body.idempotency_key === "string" && body.idempotency_key.length > 0
         ? body.idempotency_key
         : `napi:${randomHex(12)}`;
+    // Echo dedupe (item 3 chunk 2): recorded BEFORE the submit leaves —
+    // the committing scope's outbox drain races the turn reply, so a
+    // post-reply registration could let the fanout push arrive first and
+    // duplicate the reply's observations at the submitter.
+    this.noteClientTurn(key, session);
     const result = await this.turn({
       call: {
         kind: "woo.turn_call.shadow.v1",
@@ -1303,6 +1327,78 @@ export class NetGatewayDO {
   async webSocketClose(_ws: WebSocket, _code: number, _reason: string, _wasClean: boolean): Promise<void> {}
 
   async webSocketError(_ws: WebSocket, _err: unknown): Promise<void> {}
+
+  /** Record which session submitted a turn id (see recentClientTurns). */
+  private noteClientTurn(turnId: string, session: string): void {
+    this.recentClientTurns.delete(turnId); // refresh insertion order
+    this.recentClientTurns.set(turnId, session);
+    while (this.recentClientTurns.size > RECENT_CLIENT_TURN_CAP) {
+      const oldest = this.recentClientTurns.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.recentClientTurns.delete(oldest);
+    }
+  }
+
+  /**
+   * Observation push (Phase 4 item 3 chunk 2): route an applied fanout's
+   * observations to the sockets of sessions PRESENT in the fanout's
+   * scope — CO13's session_presence relation gets its first consumer.
+   *
+   * - The audience is read from THIS shard's mirror
+   *   (net_gateway_relation): a presence row whose owner space anchors
+   *   to the fanout's scope names a member session; that session's
+   *   tagged sockets (getWebSockets(session)) receive one
+   *   {type:"observations", scope, seq, observations} frame. Sessions on
+   *   other gateway shards are those shards' concern — they subscribe to
+   *   the same scope and run this same routine.
+   * - Owner→scope goes through the view-lineage classifier (CO15 walk),
+   *   with the `room:<owner>` naming convention as the fallback for an
+   *   owner whose lineage this view has not pulled.
+   * - The SUBMITTING session is skipped via the turn-id echo dedupe
+   *   (recentClientTurns): its observations arrived on the turn reply.
+   * - Delivery is AT-MOST-ONCE and never durable (kickoff rule): the
+   *   per-scope seq gate in receiveFanout drops redeliveries before this
+   *   runs, a dead socket's send failure is swallowed (close cleanup is
+   *   the runtime's), and a session with no socket is skipped silently.
+   *   Missed-observation catch-up is deliberately NOT promised in
+   *   Phase 4.
+   */
+  private pushObservations(body: FanoutBody): void {
+    const getSockets = this.state.getWebSockets?.bind(this.state);
+    if (!getSockets) return; // runtime without a WS surface (structural fakes)
+    if (!Array.isArray(body.observations) || body.observations.length === 0) return;
+    const rows = sqlRows<{ member: string; owner: string }>(
+      this.state.storage.sql.exec("SELECT member, owner FROM net_gateway_relation WHERE relation = 'session_presence'")
+    );
+    if (rows.length === 0) return;
+    const view = this.ensureView();
+    const classifier = classifierFromLineage(
+      (object) => (view.get(cellKey("object_lineage", object))?.value as AnchorLineage | undefined) ?? null
+    );
+    const frame = JSON.stringify({
+      type: "observations",
+      scope: body.scope,
+      seq: body.seq,
+      observations: body.observations
+    });
+    for (const row of rows) {
+      let ownerScope: string | null;
+      try {
+        ownerScope = classifier.scopeOf(row.owner);
+      } catch {
+        ownerScope = null; // lineage not in view — the convention check decides
+      }
+      if (ownerScope !== body.scope && `room:${row.owner}` !== body.scope) continue;
+      if (body.turn_id !== undefined && this.recentClientTurns.get(body.turn_id) === row.member) continue;
+      for (const ws of getSockets(row.member)) {
+        try {
+          ws.send(frame);
+        } catch {
+          // Dead socket: the runtime's close/error callback owns cleanup.
+        }
+      }
+    }
+  }
 
   /**
    * Best-effort pulls for scopes this gateway holds no high-water for —
@@ -1730,10 +1826,10 @@ export class NetGatewayDO {
         JSON.stringify({ kind: "net_fanout_gap", scope: body.scope, expected: last + 1, got: body.seq, ts: Date.now() })
       );
     }
-    return this.discardViewOnThrow(() =>
+    const applied = this.discardViewOnThrow(() =>
       this.state.storage.transactionSync(() => {
-        const applied = applyFanout(view, this.seen, body);
-        if (applied) {
+        const advanced = applyFanout(view, this.seen, body);
+        if (advanced) {
           for (const cell of body.cells) this.persistCell(view, cell.key);
           // CO13: relation deltas ride the same body and the same seq
           // gate — a redelivered body no-ops above (applyFanout), so the
@@ -1747,9 +1843,16 @@ export class NetGatewayDO {
             body.seq
           );
         }
-        return applied;
+        return advanced;
       })
     );
+    // Observation push (item 3 chunk 2) AFTER the mirror application, so
+    // a presence transition riding this very body shapes its own
+    // audience (an enter's add is visible; a leave's remove already
+    // excludes the leaver). The seq gate above makes the push
+    // at-most-once per socket per turn: redeliveries never reach here.
+    if (applied) this.pushObservations(body);
+    return applied;
   }
 
   /** One relation delta into the mirror table (add = upsert, remove =

@@ -197,6 +197,23 @@ async function buildHarness() {
     null
   );
   expect(wave.ok).toBe(true);
+  // A third room for the "present elsewhere" push case: a session that
+  // transitioned HERE must receive nothing from an annex-scope fanout.
+  world.createObject({ id: "ws_side", name: "WS Side Room", parent: "$space", owner: actor });
+  const sideWelcome = installVerb(
+    world,
+    "ws_side",
+    "welcome",
+    `verb :welcome() rxd {
+      moveto(actor, this);
+      return 1;
+    }`,
+    null
+  );
+  expect(sideWelcome.ok).toBe(true);
+  const sideWelcomeVerb = world.object("ws_side").verbs.find((verb) => verb.name === "welcome");
+  if (!sideWelcomeVerb) throw new Error("side welcome verb missing after install");
+  sideWelcomeVerb.skip_presence_check = true;
   const placed = await world.directCall("ws-genesis-place", actor, actor, "moveto", ["ws_room"], { sessionId: session.id });
   expect(placed.op).toBe("result");
   world.ensureApiKey("$wiz", actor, KEY_ID, KEY_SECRET, "net-ws-test");
@@ -206,6 +223,7 @@ async function buildHarness() {
   const partitions = partitionCells(cellsFromSerialized(world.exportWorld()));
   const roomScope = "room:ws_room";
   const annexScope = "room:ws_annex";
+  const sideScope = "room:ws_side";
   const clusterScope = `cluster:${actor}`;
 
   const deferred: Array<Promise<unknown>> = [];
@@ -220,7 +238,7 @@ async function buildHarness() {
     return instance;
   };
   const scopeEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve };
-  for (const scope of [roomScope, annexScope, clusterScope, CATALOG_SCOPE, `cluster:${other}`]) {
+  for (const scope of [roomScope, annexScope, sideScope, clusterScope, CATALOG_SCOPE, `cluster:${other}`]) {
     const st = netState(`scope-${scope}`, deferred);
     const instance = new NetScopeDO(st.state, scopeEnv);
     const seedRequest = new Request("https://do/net/seed", {
@@ -274,6 +292,7 @@ async function buildHarness() {
     other,
     roomScope,
     annexScope,
+    sideScope,
     subscribe,
     settle,
     mint,
@@ -375,6 +394,97 @@ describe("/net-api/ws socket surface (Phase 4 item 3 chunk 1)", () => {
     await h.gateway.webSocketMessage(server as unknown as WebSocket, "not json");
     expect(frames(server).at(-1)).toMatchObject({ type: "error", error: { code: "E_INVARG" } });
     expect(server.readyState).toBe(1);
+
+    h.close();
+  });
+});
+
+describe("observation push via session_presence (Phase 4 item 3 chunk 2)", () => {
+  it("pushes a turn's observations to present peers, skipping the submitter and absent sessions", async () => {
+    const h = await buildHarness();
+    const token = `apikey:${KEY_ID}:${KEY_SECRET}`;
+    // The gateway shard subscribes to the rooms whose fanout it should
+    // mirror (the lane registration): the annex carries the presence
+    // refans AND the wave commit; the side room carries s3's presence.
+    await h.subscribe(h.annexScope);
+    await h.subscribe(h.sideScope);
+
+    // Four sessions of the authenticated actor, entering rooms through
+    // the engine-real transition path (:welcome folds the session-cell
+    // write; the presence deltas reach the room scope via /net/relate
+    // and refan to the subscribed mirror — the CO13 single write path).
+    const s1 = await h.mint(); // submitter: annex + socket
+    const s2 = await h.mint(); // peer: annex + socket → MUST receive
+    const s3 = await h.mint(); // elsewhere: side room + socket → nothing
+    const s4 = await h.mint(); // annex, NO socket → skipped silently
+    const enter = async (sid: string, room: string, key: string): Promise<void> => {
+      const entered = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+        token,
+        body: { target: room, verb: "welcome", session: sid, idempotency_key: key }
+      });
+      expect(entered.status, JSON.stringify(entered.body)).toBe(200);
+      expect((entered.body.reply as { status?: string })?.status).toBe("accepted");
+    };
+    await enter(s1, "ws_annex", "ws-enter-1");
+    await enter(s2, "ws_annex", "ws-enter-2");
+    await enter(s3, "ws_side", "ws-enter-3");
+    await enter(s4, "ws_annex", "ws-enter-4");
+    await h.settle();
+
+    // The mirror now names the annex audience (sanity for the fixture:
+    // without these rows the push assertions below would be vacuous).
+    const roster = await clientFetch(h.gateway, "GET", "/net-api/relation?relation=session_presence&owner=ws_annex", {
+      token
+    });
+    const members = (roster.body.members as Array<{ member: string }>).map((row) => row.member);
+    expect(members).toEqual(expect.arrayContaining([s1, s2, s4]));
+    expect(members).not.toContain(s3);
+
+    const a = await upgrade(h, s1);
+    const b = await upgrade(h, s2);
+    const c = await upgrade(h, s3);
+    expect(a.status).toBe(101);
+    expect(b.status).toBe(101);
+    expect(c.status).toBe(101);
+    const socketA = a.server as FakeWebSocket;
+    const socketB = b.server as FakeWebSocket;
+    const socketC = c.server as FakeWebSocket;
+
+    // s1 waves over ITS socket; the commit's fanout (annex scope, with
+    // the turn id riding — src/net/outbox.ts FanoutBody.turn_id) then
+    // fans to the subscribed mirror.
+    await h.gateway.webSocketMessage(
+      socketA as unknown as WebSocket,
+      JSON.stringify({ type: "turn", id: "w1", target: "ws_wave_box", verb: "wave", idempotency_key: "ws-wave-1" })
+    );
+    const waveResult = frames(socketA).at(-1) as {
+      type: string;
+      status: number;
+      reply?: { status?: string };
+      observations?: Array<{ type?: string }>;
+    };
+    expect(waveResult.type).toBe("turn_result");
+    expect(waveResult.status, JSON.stringify(waveResult)).toBe(200);
+    expect(waveResult.reply?.status).toBe("accepted");
+    // Item-1 contract: the submitter's observations arrive ON THE REPLY.
+    expect(waveResult.observations?.map((o) => o.type)).toContain("waved");
+    await h.settle();
+
+    // The present PEER receives the observations frame from the fanout.
+    const peerObservations = frames(socketB).filter((frame) => frame.type === "observations");
+    expect(peerObservations).toHaveLength(1);
+    expect(peerObservations[0]).toMatchObject({ scope: h.annexScope });
+    expect((peerObservations[0].observations as Array<{ type?: string }>).map((o) => o.type)).toContain("waved");
+
+    // The SUBMITTER's socket gets nothing via fanout (turn-id dedupe:
+    // the reply above already carried the observations — pushing again
+    // would duplicate them).
+    expect(frames(socketA).filter((frame) => frame.type === "observations")).toHaveLength(0);
+
+    // A session present in ANOTHER room receives nothing; the socket-less
+    // annex session (s4) was skipped silently — the push neither threw
+    // nor blocked the peer delivery, which the s2 assertion above proves.
+    expect(frames(socketC).filter((frame) => frame.type === "observations")).toHaveLength(0);
 
     h.close();
   });

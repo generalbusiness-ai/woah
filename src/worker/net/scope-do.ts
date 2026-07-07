@@ -973,6 +973,10 @@ export class NetScopeDO {
           seq: reply.head.seq,
           cells,
           observations,
+          // Phase 4 item 3: the turn id rides the fanout so receiving
+          // gateways can echo-dedupe the SUBMITTING session's push (it
+          // already got these observations on the turn reply).
+          turn_id: submit.idempotency_key,
           ...(reply.relations && reply.relations.length > 0 ? { relations: reply.relations } : {})
         });
       }

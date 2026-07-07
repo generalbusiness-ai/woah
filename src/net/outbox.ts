@@ -31,6 +31,14 @@ export type FanoutBody = {
   cells: Cell[];
   /** Observations for live delivery at the destination. */
   observations: unknown[];
+  /** The committed turn's idempotency key (Phase 4 item 3): lets a
+   * receiving gateway skip pushing `observations` to the SUBMITTING
+   * session's sockets — that session already received them on its turn
+   * reply (item 1), so a fanout push would be a duplicate. Present only
+   * on commit-announcing fanout (the committing scope knows the key);
+   * relation refans and adoption rows carry no observations, so they
+   * never need it. */
+  turn_id?: string;
   /** CO13: relation deltas riding alongside cells — the LOCAL deltas of
    * the commit this body announces, or the applied deltas of a
    * /net/relate refan. `applyFanout` stays cell-only by design (relation
