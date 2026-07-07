@@ -537,7 +537,12 @@ async function handleNetApi(request: Request, env: Env, url: URL): Promise<Respo
   // sees an opaque runtime 500 with a non-JSON body. Normalize it.
   try {
     if (request.method === "GET") {
-      return await stub.fetch(new Request(target, { headers: request.headers }));
+      // `new Request(target, request)` re-targets the URL while copying
+      // method/headers from the inbound request — including the Upgrade
+      // header, so GET /net-api/ws forwards as a real WebSocket upgrade
+      // (the same posture as forwardToHost's v2 WS forwarding) and the
+      // DO's 101 + webSocket response returns to the client unwrapped.
+      return await stub.fetch(new Request(target, request));
     }
     const body = await readLimitedBody(request);
     return await stub.fetch(new Request(target, { method: request.method, headers: request.headers, body }));

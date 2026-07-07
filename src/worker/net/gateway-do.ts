@@ -75,6 +75,14 @@ import { resolveNetDestination, WorkerdHost, type NetBindingsEnv } from "./worke
 export type NetGatewayDurableState = {
   id: unknown;
   waitUntil?: (promise: Promise<unknown>) => void;
+  /** DO hibernation-friendly WebSocket surface (Phase 4 item 3): sockets
+   * are accepted with their SESSION ID as the tag, so delivery is
+   * `getWebSockets(session)` — the runtime IS the registry (in-memory /
+   * hibernation only; no new durable copy, CO5 stays at five). Optional
+   * because the structural fake-DO harness predates it: routes that need
+   * it refuse namedly when the runtime lacks the surface. */
+  acceptWebSocket?(ws: WebSocket, tags?: string[]): void;
+  getWebSockets?(tag?: string): WebSocket[];
   storage: {
     sql: { exec(query: string, ...params: unknown[]): unknown };
     transactionSync<T>(callback: () => T): T;
@@ -234,6 +242,11 @@ function clampClientTtl(raw: unknown): number {
   const ttl = typeof raw === "number" && Number.isFinite(raw) ? raw : CLIENT_SESSION_TTL_DEFAULT_MS;
   return Math.min(CLIENT_SESSION_TTL_MAX_MS, Math.max(CLIENT_SESSION_TTL_MIN_MS, ttl));
 }
+
+/** What a gateway WebSocket carries across hibernation (Phase 4 item 3):
+ * the validated session id (also the socket's tag) and the apikey-
+ * authenticated actor the session is bound to. */
+type GatewaySocketAttachment = { session: string; actor: string; opened_at: number };
 
 export class NetGatewayDO {
   private readonly host: WorkerdHost;
@@ -918,6 +931,21 @@ export class NetGatewayDO {
   //       including item-1 result/observations.
   //   GET /net-api/relation?relation=&owner=   authenticated roster read
   //   GET /net-api/cell?key=                   authenticated cell probe
+  //   GET /net-api/ws?session=                  WebSocket upgrade (Phase 4
+  //     item 3): same apikey authentication, session REQUIRED and
+  //     validated like /net-api/turn, then the socket is accepted with
+  //     the session id as its hibernation tag. Frames (JSON, `id`
+  //     echoed):
+  //       {type:"turn", id?, target, verb, args?, idempotency_key?}
+  //         → the clientTurn path on the SOCKET's session (a frame
+  //           cannot speak for another session) →
+  //           {type:"turn_result", id, status, ...TurnResult-or-error}
+  //       {type:"ping", id?} → {type:"pong", id}
+  //       anything else → {type:"error", id?, error:{code, message}}
+  //     Observation push (item 3 chunk 2) delivers
+  //     {type:"observations", scope, seq, observations} frames to
+  //     sockets whose session is present (CO13 session_presence) in a
+  //     fanout's scope — see pushObservations.
 
   private async clientApi(request: Request, url: URL): Promise<Response> {
     try {
@@ -925,6 +953,9 @@ export class NetGatewayDO {
       const identity = await this.catalogIdentity();
       const { actor } = verifyApiKeyCredential(identity.map, credential);
 
+      if (request.method === "GET" && url.pathname === "/net-api/ws") {
+        return await this.clientWebSocket(request, url, actor);
+      }
       if (request.method === "POST" && url.pathname === "/net-api/session") {
         const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
         return await this.clientSession(actor, body, identity.epoch);
@@ -1132,6 +1163,146 @@ export class NetGatewayDO {
       return `cluster:${actor}`;
     }
   }
+
+  /**
+   * GET /net-api/ws — the WebSocket upgrade (Phase 4 item 3; kickoff
+   * "WS transport + observation push"). Credential authentication already
+   * happened in clientApi (the same apikey path as every /net-api route);
+   * this handler additionally REQUIRES a `?session=` bound to the
+   * authenticated actor — validated exactly like /net-api/turn — because
+   * the socket's tag IS its delivery address: an unvalidated session tag
+   * would let one client subscribe to another session's observations.
+   *
+   * Registry decision (kickoff, documented): the runtime's hibernation
+   * socket set is the WHOLE registry — `acceptWebSocket(ws, [session])`
+   * tags the socket, `getWebSockets(session)` finds it, and the
+   * attachment carries {session, actor} across hibernation. No durable
+   * copy anywhere (CO5 stays at five): a dropped socket loses only
+   * liveness; the session cell persists and a reconnect re-tags.
+   */
+  private async clientWebSocket(request: Request, url: URL, actor: string): Promise<Response> {
+    if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+      return json({ error: { code: "E_INVARG", message: "expected Upgrade: websocket" } }, 400);
+    }
+    // The hibernation surface and the WebSocketPair global are workerd
+    // runtime features; a structural harness without them gets a named
+    // refusal instead of an opaque TypeError.
+    const accept = this.state.acceptWebSocket?.bind(this.state);
+    const PairCtor = (globalThis as { WebSocketPair?: new () => { 0: WebSocket; 1: WebSocket } }).WebSocketPair;
+    if (!accept || !PairCtor) {
+      return json({ error: { code: "E_INTERNAL", message: "runtime does not support WebSocket upgrades" } }, 500);
+    }
+    const session = url.searchParams.get("session") ?? "";
+    if (!session) {
+      return json(
+        {
+          error: {
+            code: "E_NOSESSION",
+            message: "WebSocket upgrade requires a session query param (CO14): POST /net-api/session first",
+            detail: { session_verdict: "session_required" }
+          }
+        },
+        401
+      );
+    }
+    await this.warmScopes([CATALOG_SCOPE, `cluster:${actor}`], "net_client_pull_miss_failed");
+    const verdict = validateSessionCell(this.ensureView().get(sessionCellKey(session)), this.host.now(), actor);
+    if (verdict !== "ok") {
+      return json(
+        { error: { code: "E_NOSESSION", message: `session ${verdict}`, detail: { session_verdict: verdict } } },
+        401
+      );
+    }
+    const pair = new PairCtor();
+    const server = pair[1] as WebSocket & { serializeAttachment?(value: unknown): void };
+    // The attachment survives hibernation; webSocketMessage reads it back
+    // instead of re-authenticating per frame (the session cell is still
+    // revalidated per turn inside clientTurn — expiry keeps its bite).
+    server.serializeAttachment?.({ session, actor, opened_at: this.host.now() } satisfies GatewaySocketAttachment);
+    accept(server, [session]);
+    return new Response(null, { status: 101, webSocket: pair[0] });
+  }
+
+  /** The socket's hibernation attachment, or null for a socket this DO
+   * never attached (defensive: workerd only routes accepted sockets). */
+  private socketAttachment(ws: WebSocket): GatewaySocketAttachment | null {
+    const readable = ws as WebSocket & { deserializeAttachment?(): unknown };
+    if (typeof readable.deserializeAttachment !== "function") return null;
+    const raw = readable.deserializeAttachment() as Partial<GatewaySocketAttachment> | null | undefined;
+    return raw && typeof raw.session === "string" && typeof raw.actor === "string"
+      ? (raw as GatewaySocketAttachment)
+      : null;
+  }
+
+  /**
+   * Inbound WS frames (the DO hibernation callback). Every reply is a
+   * frame on the same socket — a transport error must never kill the
+   * connection when it can be named instead. `id` (when the frame
+   * carries one) is echoed for client correlation.
+   */
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    const send = (frame: Record<string, unknown>): void => {
+      try {
+        ws.send(JSON.stringify(frame));
+      } catch {
+        // Socket died mid-reply; webSocketClose owns the cleanup.
+      }
+    };
+    if (typeof message !== "string") {
+      send({ type: "error", error: { code: "E_INVARG", message: "frames must be JSON text" } });
+      return;
+    }
+    let frame: Record<string, unknown>;
+    try {
+      frame = JSON.parse(message) as Record<string, unknown>;
+    } catch {
+      send({ type: "error", error: { code: "E_INVARG", message: "frames must be JSON text" } });
+      return;
+    }
+    const id = frame.id;
+    const att = this.socketAttachment(ws);
+    if (!att) {
+      send({ type: "error", ...(id !== undefined ? { id } : {}), error: { code: "E_NOSESSION", message: "socket has no session attachment" } });
+      return;
+    }
+    if (frame.type === "ping") {
+      send({ type: "pong", ...(id !== undefined ? { id } : {}) });
+      return;
+    }
+    if (frame.type === "turn") {
+      try {
+        // The epoch is re-read per frame (pull-on-miss — the identity
+        // cell's stamp, same honest source clientApi uses); the frame's
+        // session is ALWAYS the socket's own (attachment), so one
+        // authenticated socket cannot submit on another session.
+        const identity = await this.catalogIdentity();
+        const response = await this.clientTurn(att.actor, { ...frame, session: att.session }, identity.epoch);
+        const payload = (await response.json()) as Record<string, unknown>;
+        send({ type: "turn_result", ...(id !== undefined ? { id } : {}), status: response.status, ...payload });
+      } catch (err) {
+        send({
+          type: "turn_result",
+          ...(id !== undefined ? { id } : {}),
+          status: 500,
+          error: { code: isNetError(err) ? err.code : "E_INTERNAL", message: String(err) }
+        });
+      }
+      return;
+    }
+    send({
+      type: "error",
+      ...(id !== undefined ? { id } : {}),
+      error: { code: "E_INVARG", message: `unknown frame type ${JSON.stringify(frame.type)}` }
+    });
+  }
+
+  /** Socket teardown is intentionally a no-op beyond the runtime's own
+   * bookkeeping: the registry IS the hibernation socket set (a closed
+   * socket leaves getWebSockets automatically) and the session CELL is
+   * durable state that outlives any socket (kickoff rule). */
+  async webSocketClose(_ws: WebSocket, _code: number, _reason: string, _wasClean: boolean): Promise<void> {}
+
+  async webSocketError(_ws: WebSocket, _err: unknown): Promise<void> {}
 
   /**
    * Best-effort pulls for scopes this gateway holds no high-water for —
