@@ -77,7 +77,7 @@ import { cellKey, lineageClosureKeys, serializeTransfer, type CellTransfer } fro
 import { isNetError, netError } from "../../net/errors";
 import { Outbox, type FanoutBody, type FanoutRow } from "../../net/outbox";
 import { ScopeSequencer, type CommitSubmit, type ScheduledTurn, type ScopeHead } from "../../net/scope";
-import { authorizeSessionSubmit } from "../../net/sessions";
+import { authorizeSessionSubmit, validateSessionCell } from "../../net/sessions";
 import { relationKey, type RelationDelta, type RelationRow } from "../../net/relations";
 import type { ScopeMeta, ScopeStore, TailEntry } from "../../net/scope-store";
 import type { CommitReply } from "../../net/scope";
@@ -229,6 +229,10 @@ export class SqliteScopeStore implements ScopeStore {
     );
   }
 
+  deleteReply(key: string): void {
+    this.storage.sql.exec("DELETE FROM net_scope_reply WHERE idempotency_key = ?", key);
+  }
+
   readTail(): TailEntry[] {
     return sqlRows<{ body: string }>(this.storage.sql.exec("SELECT body FROM net_scope_tail ORDER BY seq ASC")).map(
       (row) => JSON.parse(row.body) as TailEntry
@@ -290,6 +294,9 @@ export class SqliteScopeStore implements ScopeStore {
 
 const SCOPE_ALARM_KEY = "scope";
 const OUTBOX_ALARM_KEY = "outbox";
+/** H2b: the session-reaper wake (a third key into the single storage
+ * alarm — WorkerdHost keeps the earliest across keys). */
+const SESSION_ALARM_KEY = "session-reap";
 
 /** Mirror of src/net/outbox.ts's default backoff, passed INTO the Outbox
  * at drain time so the drain's skip-window and the alarm's retry-time
@@ -455,6 +462,12 @@ export class NetScopeDO {
           this.relateScopeHints.clear();
         }
         this.host.defer(() => this.drainOutbox());
+        // H2b: a commit touching a session cell minted or refreshed an
+        // expiry — re-derive the reap wake (gated on the touched keys so
+        // the hot non-session path never pays the scan).
+        if (reply.status === "accepted" && reply.touched.some((key) => key.startsWith("session:"))) {
+          this.armSessionReapAlarm(seq);
+        }
         return json(reply);
       }
       if (request.method === "POST" && url.pathname === "/net/subscribe") {
@@ -496,6 +509,11 @@ export class NetScopeDO {
         // subscribers (owner-sequenced commit — see adopt()); drain them
         // off the reply path, same as /net/submit.
         this.host.defer(() => this.drainOutbox());
+        // H2b: the folded session mint reaches its cluster authority via
+        // adoption — a session cell in the batch (re)arms the reap wake.
+        if (adopted.applied && body.cells.some((cell) => cell.kind === "session")) {
+          this.armSessionReapAlarm(this.ensureSequencer());
+        }
         return json(adopted);
       }
       if (request.method === "POST" && url.pathname === "/net/relate") {
@@ -557,6 +575,8 @@ export class NetScopeDO {
         }
         const seq = this.ensureSequencer(body.scope, body.catalog_epoch);
         this.discardSeqOnThrow(() => seq.seed(body.cells));
+        // H2b: seeded session cells arm the reap wake too.
+        if (body.cells.some((cell) => cell.kind === "session")) this.armSessionReapAlarm(seq);
         return json({ ok: true, scope: seq.scope, head: seq.head() });
       }
       if (request.method === "POST" && url.pathname === "/net/schedule") {
@@ -618,6 +638,9 @@ export class NetScopeDO {
     }
     const seq = this.ensureSequencer(meta.scope, meta.catalog_epoch);
     const now = this.host.now();
+    // H2b: reap expired session cells (and their presence rows) before
+    // the scheduled-turn machinery — an owner-sequenced cleanup event.
+    this.reapSessionsAtAlarm(seq, now);
     const due = seq.peekDue(now);
     if (due.length > 0) {
       const planner = this.plannerDestination();
@@ -678,6 +701,116 @@ export class NetScopeDO {
       }
     }
     this.rearmAlarm(now);
+    // H2b: re-derive the next session-expiry wake from durable state
+    // (the reap above removed everything currently expired, so only
+    // future "ok" expiries arm — never a busy loop).
+    this.armSessionReapAlarm(seq);
+  }
+
+  /**
+   * H2b: the session reaper (alarm-driven). Delegates the semantics to
+   * ScopeSequencer.reapExpiredSessions (one owner-sequenced batch — see
+   * its doc for why that path was chosen over a synthetic turn) and owns
+   * the DELIVERY half here, in the SAME transaction as the reap (CO2.7:
+   * a crash can never separate the cleanup from its propagation):
+   *
+   * - local presence removals refan to this scope's fanout subscribers
+   *   at the reap's advanced head seq (mirrors drop the rows);
+   * - a reaped session whose last presence room anchors at ANOTHER scope
+   *   gets a /net/relate remove delta addressed by the CO15
+   *   `room:<owner>` naming convention (the shell's only topology
+   *   knowledge; a misaddressed row abandons as the named
+   *   net_scope_outbox_abandoned divergence, and the stale presence row
+   *   at the owner is display-only residue — audiences filter through
+   *   live sessions, so it can never resurrect delivery).
+   *
+   * Session-cell deletions do NOT fan out (documented on the sequencer
+   * method: derived copies self-expire by value).
+   */
+  private reapSessionsAtAlarm(seq: ScopeSequencer, now: number): void {
+    const result = this.discardSeqOnThrow(() =>
+      this.store.transaction(() => {
+        const reap = seq.reapExpiredSessions(now, (id) => this.ownsSessionCell(seq, id));
+        if (reap.status !== "applied") return reap;
+        if (reap.localRemovals.length > 0) {
+          const subscribers = sqlRows<{ destination: string }>(
+            this.state.storage.sql.exec("SELECT destination FROM net_scope_subscribers WHERE role = 'fanout'")
+          );
+          for (const { destination } of subscribers) {
+            this.persistOutboxRow("/fanout", destination, {
+              scope: seq.scope,
+              seq: reap.head.seq,
+              cells: [],
+              observations: [],
+              relations: reap.localRemovals
+            });
+          }
+        }
+        // Foreign presence rows: group remove deltas per owning scope.
+        const locallyRemoved = new Set(
+          reap.localRemovals.map((delta) => relationKey(delta.row.relation, delta.row.owner, delta.row.member))
+        );
+        const byScope = new Map<string, RelationDelta[]>();
+        for (const entry of reap.reaped) {
+          if (entry.activeScope === null) continue;
+          // A room whose lineage this scope holds is a LOCAL owner — its
+          // row (if any) was removed in the batch above.
+          if (seq.store.has(cellKey("object_lineage", entry.activeScope))) continue;
+          const row = { relation: "session_presence", owner: entry.activeScope, member: entry.session };
+          if (locallyRemoved.has(relationKey(row.relation, row.owner, row.member))) continue;
+          const owningScope = `room:${entry.activeScope}`;
+          byScope.set(owningScope, [...(byScope.get(owningScope) ?? []), { op: "remove", row }]);
+        }
+        for (const [owningScope, deltas] of byScope) {
+          this.persistOutboxRow("/relate", `scope:${owningScope}`, {
+            scope: seq.scope,
+            seq: reap.head.seq,
+            cells: [],
+            observations: [],
+            relations: deltas
+          });
+        }
+        return reap;
+      })
+    );
+    if (result.status === "applied") {
+      console.log(
+        "woo.metric",
+        JSON.stringify({
+          kind: "net_session_reaped",
+          scope: seq.scope,
+          sessions: result.reaped.map((entry) => entry.session),
+          ts: Date.now()
+        })
+      );
+      this.host.defer(() => this.drainOutbox());
+    }
+  }
+
+  /**
+   * H2b: arm the session-reaper wake to the EARLIEST future expiry among
+   * owned session cells. Only cells validating "ok" arm: an expired cell
+   * is reaped by the very pass that calls this, and a malformed cell
+   * (which can never reap) must not spin the alarm. Called wherever
+   * session cells can appear or change: submit-accept touching a session
+   * key, seed carrying session cells, adopt delivering the folded mint,
+   * and the end of every alarm pass.
+   */
+  private armSessionReapAlarm(seq: ScopeSequencer): void {
+    const now = this.host.now();
+    let next: number | null = null;
+    for (const key of seq.store.keys()) {
+      if (!key.startsWith("session:")) continue;
+      const cell = seq.store.get(key);
+      if (!cell || !this.ownsSessionCell(seq, cell.object)) continue;
+      if (validateSessionCell(cell, now) !== "ok") continue;
+      const expiresAt = (cell.value as { expiresAt?: unknown } | null)?.expiresAt;
+      if (typeof expiresAt !== "number") continue; // no expiry: nothing to reap
+      if (next === null || expiresAt < next) next = expiresAt;
+    }
+    this.host.setAlarm(SESSION_ALARM_KEY, next, async () => {
+      // Durable wake path is alarm() (the WorkerdHost contract).
+    });
   }
 
   /**

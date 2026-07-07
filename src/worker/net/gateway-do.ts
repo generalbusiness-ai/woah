@@ -252,6 +252,11 @@ type GatewaySocketAttachment = { session: string; actor: string; opened_at: numb
 /** Echo-dedupe LRU bound (see recentClientTurns). */
 const RECENT_CLIENT_TURN_CAP = 512;
 
+/** H2c: selection-pin retention (see pinScope) — matches the scopes'
+ * reply-cache bound (scope.ts REPLY_KEEP_RECENT) so the pin never
+ * outlives the reply it protects by more than the window. */
+const GATEWAY_PIN_LIMIT = 1024;
+
 /** H4 rate limits (wire.md inbound rule): the standard per-actor budget
  * for every /net-api operation — REST requests and WS turn frames share
  * ONE bucket per authenticated actor, so a client cannot double its
@@ -319,8 +324,10 @@ export class NetGatewayDO {
     // submit for that key targeted. A re-plan (same key, refreshed view)
     // must never migrate the commit to a different scope — the pinned
     // scope may already hold the recorded reply, and a second scope would
-    // double-commit the turn. Rows are as durable and as unbounded as the
-    // scopes' own reply cache (the same idempotency posture).
+    // double-commit the turn. Bounded (H2c): pinScope prunes to the most
+    // recent GATEWAY_PIN_LIMIT rows — the same retention posture as the
+    // scopes' reply cache, and the same documented consequence (see
+    // pinScope).
     state.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS net_gateway_pin (idempotency_key TEXT PRIMARY KEY, scope TEXT NOT NULL)"
     );
@@ -1719,13 +1726,30 @@ export class NetGatewayDO {
     return rows.length > 0 ? rows[0].scope : null;
   }
 
-  /** Persist the key → scope pin; first writer wins (fix 5c). */
+  /** Persist the key → scope pin; first writer wins (fix 5c).
+   *
+   * H2c boundedness: the table keeps only the most recent
+   * GATEWAY_PIN_LIMIT rows (rowid order — SQLite's insertion order),
+   * pruned on insert. Consequence, documented (the reply-cache posture,
+   * scope.ts pruneReplies): a replay arriving after its pin pruned may
+   * re-plan to a different scope — but by the same retention window its
+   * recorded reply at the original scope has pruned too, so the request
+   * is a NEW turn by every observable measure: it validates fresh
+   * against the current head and read versions. Idempotency is a
+   * bounded-window guarantee, not an eternal one. */
   private pinScope(idempotencyKey: string, scope: string): void {
     this.state.storage.sql.exec(
       "INSERT INTO net_gateway_pin (idempotency_key, scope) VALUES (?, ?) ON CONFLICT(idempotency_key) DO NOTHING",
       idempotencyKey,
       scope
     );
+    const count = sqlRows<{ n: number }>(this.state.storage.sql.exec("SELECT COUNT(*) AS n FROM net_gateway_pin"))[0];
+    if (count && Number(count.n) > GATEWAY_PIN_LIMIT) {
+      this.state.storage.sql.exec(
+        "DELETE FROM net_gateway_pin WHERE rowid NOT IN (SELECT rowid FROM net_gateway_pin ORDER BY rowid DESC LIMIT ?)",
+        GATEWAY_PIN_LIMIT
+      );
+    }
   }
 
   /**

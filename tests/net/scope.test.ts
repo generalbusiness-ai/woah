@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import { CellStore, cellVersion } from "../../src/net/cells";
 import { applyTranscript, type EffectTranscript } from "../../src/net/transcript";
 import { ScopeSequencer, type CommitSubmit } from "../../src/net/scope";
+import { InMemoryScopeStore } from "../../src/net/scope-store";
 
 const SCOPE = "the_room";
 const EPOCH = "cat1";
@@ -424,5 +425,57 @@ describe("durable continuations (CO2.8)", () => {
     seq.schedule({ id: "y", at_logical_time: 30, call: { actor: "#a", target: "#t", verb: "tick", args: [] } }, 0);
     expect(seq.cancel("y")).toBe(true);
     expect(seq.nextAlarmAt()).toBeNull();
+  });
+});
+
+describe("reply-cache boundedness (H2a)", () => {
+  it("prunes old replies past the tail window + recent set, memory and durable rows in lockstep", () => {
+    const store = new InMemoryScopeStore();
+    const seq = new ScopeSequencer(SCOPE, EPOCH, { durable: store, tailLimit: 4, replyLimit: 8 });
+    // Keep the FIRST submit verbatim: replaying it after its reply prunes
+    // must re-validate (and safely reject stale_head), never re-commit.
+    let firstSubmit: CommitSubmit | null = null;
+    for (let i = 0; i < 40; i += 1) {
+      const submit = submitFor(seq, transcript({ writes: [propWrite(`v${i}`)], hash: `h2a-${i}` }), `h2a-key-${i}`);
+      if (i === 0) firstSubmit = submit;
+      const reply = seq.submit(submit);
+      expect(reply.status, `commit ${i}`).toBe("accepted");
+    }
+    // Bounded: 40 commits, at most replyLimit retained — durably too.
+    expect(store.readReplies().length).toBeLessThanOrEqual(8);
+    const keys = store.readReplies().map((row) => row.key);
+    expect(keys).toContain("h2a-key-39");
+    expect(keys).not.toContain("h2a-key-0");
+
+    // A RECENT key still replays (recorded reply, marked).
+    const replay = seq.submit(submitFor(seq, transcript({ writes: [propWrite("again")], hash: "h2a-replay" }), "h2a-key-39"));
+    expect(replay.status).toBe("accepted");
+    expect(replay.status === "accepted" && replay.replayed).toBe(true);
+
+    // A PRUNED key's late replay re-validates instead of replaying — and
+    // its ancient base rejects stale_head. Safe: it can never silently
+    // re-commit (committing needs the current head + fresh reads).
+    const headBefore = seq.head().seq;
+    const late = seq.submit(firstSubmit as CommitSubmit);
+    expect(late.status).toBe("rejected");
+    expect(late.status === "rejected" && late.reason).toBe("stale_head");
+    expect(seq.head().seq).toBe(headBefore);
+
+    // Rehydration sees the bounded set, not a resurrected unbounded one.
+    const rehydrated = new ScopeSequencer(SCOPE, EPOCH, { durable: store, tailLimit: 4, replyLimit: 8 });
+    const rereplay = rehydrated.submit(submitFor(rehydrated, transcript({ writes: [propWrite("again2")], hash: "h2a-re" }), "h2a-key-39"));
+    expect(rereplay.status === "accepted" && rereplay.replayed).toBe(true);
+  });
+
+  it("never prunes a reply whose turn is still within the recovery-tail window", () => {
+    // tailLimit LARGER than the commit count: every reply stays within
+    // the window, so even a tiny replyLimit must not prune any of them.
+    const store = new InMemoryScopeStore();
+    const seq = new ScopeSequencer(SCOPE, EPOCH, { durable: store, tailLimit: 64, replyLimit: 2 });
+    for (let i = 0; i < 10; i += 1) {
+      const reply = seq.submit(submitFor(seq, transcript({ writes: [propWrite(`w${i}`)], hash: `h2aw-${i}` }), `h2aw-key-${i}`));
+      expect(reply.status).toBe("accepted");
+    }
+    expect(store.readReplies().length).toBe(10);
   });
 });

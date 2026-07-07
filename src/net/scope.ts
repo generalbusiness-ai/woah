@@ -25,6 +25,7 @@
  */
 import { CellStore, type Cell, type EpochStamp } from "./cells";
 import { netError } from "./errors";
+import { validateSessionCell } from "./sessions";
 import { applyRelationDeltas, deriveRelationDeltas, rebuildContentsRelation, relationKey, type RelationDelta, type RelationRow } from "./relations";
 import type { ScopeStore } from "./scope-store";
 import { applyTranscript, netCellKeyFor, type EffectTranscript, type TranscriptCell } from "./transcript";
@@ -148,12 +149,20 @@ export type ScopeSequencerOptions = {
   scopeOf?: (object: string) => string;
   /** Bounded recovery tail length (the scope's own log — CO5 note). */
   tailLimit?: number;
+  /** H2a: reply-cache bound — the most-recent set kept BEYOND the
+   * retained tail window (default REPLY_KEEP_RECENT). See pruneReplies. */
+  replyLimit?: number;
   /** Durability (Phase 3): when provided, the sequencer hydrates from the
    * store at construction and writes through on every state change (CO5
    * copy #1). Without it, behavior is identical to the in-memory Phase-2
    * sequencer. Type-only import: no runtime cycle with scope-store. */
   durable?: ScopeStore;
 };
+
+/** H2a default: recorded replies kept beyond the tail window. Sized so a
+ * busy scope's recent idempotent retries always replay, while the table
+ * stops growing one row per turn forever. */
+export const REPLY_KEEP_RECENT = 1024;
 
 export class ScopeSequencer {
   readonly scope: string;
@@ -385,6 +394,9 @@ export class ScopeSequencer {
       ...(relationsForeign.length > 0 ? { relations_foreign: relationsForeign } : {})
     };
     this.replies.set(submit.idempotency_key, reply);
+    // H2a: bound the reply cache on each accepted commit (memory and the
+    // durable rows prune in lockstep inside the transaction below).
+    const prunedReplies = this.pruneReplies();
 
     // Write-through (CO5 copy #1): one atomic transaction covering cells,
     // head, reply, and tail — a crash between the reply and the fanout
@@ -402,6 +414,7 @@ export class ScopeSequencer {
         durable.writeReply(submit.idempotency_key, reply);
         durable.appendTail(tailEntry);
         durable.trimTail(this.options.tailLimit);
+        for (const key of prunedReplies) durable.deleteReply(key);
         for (const key of changedRelationKeys) {
           const row = this.relationRows.get(key);
           if (row) durable.writeRelation(key, row);
@@ -522,6 +535,103 @@ export class ScopeSequencer {
    * shell's /net/relate application and for roster queries. */
   relations(): ReadonlyMap<string, RelationRow> {
     return this.relationRows;
+  }
+
+  /**
+   * H2b: reap EXPIRED session cells this scope owns, as ONE
+   * owner-sequenced cleanup event (the coherent path, chosen over a
+   * synthetic cleanup *turn*: a reap is a substrate fact with no verb to
+   * execute, exactly the session-mint precedent — driving the planner
+   * would need a phantom verb in every world, and the owner-sequenced
+   * batch already gives observers a real head advance with CO8-correct
+   * ordering, the adopt()/relate() discipline).
+   *
+   * - Only OWNED cells reap (`ownsSession` — the shell's witness, which
+   *   excludes rider residue: a cached copy of another scope's session
+   *   is that owner's to reap; ours self-expires by VALUE on every
+   *   validate, so keeping it costs nothing but bytes until the next
+   *   transfer refresh).
+   * - The batch advances the head ONCE with a deterministic marker, the
+   *   deleted keys land in the tail entry, and the durable write-through
+   *   covers cells + meta + tail + relation rows in one transaction —
+   *   submit/adopt's exact crash discipline.
+   * - LOCAL session_presence rows naming a reaped session are removed
+   *   here (returned as `localRemovals` so the shell refans them);
+   *   rows owned by OTHER scopes are the shell's delivery concern (it
+   *   knows the CO15 naming convention; the sequencer never learns
+   *   topology) — `reaped[].activeScope` names each session's last
+   *   presence room for that.
+   * - Cell DELETIONS deliberately do not fan out: FanoutBody carries
+   *   installs only (applyFanout semantics), and a derived copy of an
+   *   expired session cell already validates "expired" by VALUE at
+   *   every consumer, so the stale copy is inert until a transfer
+   *   refresh drops it.
+   */
+  reapExpiredSessions(
+    now: number,
+    ownsSession: (id: string) => boolean
+  ): {
+    status: "applied" | "empty";
+    head: ScopeHead;
+    reaped: Array<{ session: string; activeScope: string | null }>;
+    localRemovals: RelationDelta[];
+  } {
+    const reaped: Array<{ session: string; activeScope: string | null }> = [];
+    const deletedKeys: string[] = [];
+    for (const key of [...this.store.keys()].sort()) {
+      if (!key.startsWith("session:")) continue;
+      const cell = this.store.get(key);
+      if (!cell || !ownsSession(cell.object)) continue;
+      if (validateSessionCell(cell, now) !== "expired") continue;
+      const value = cell.value as { activeScope?: unknown } | null;
+      reaped.push({
+        session: cell.object,
+        activeScope: typeof value?.activeScope === "string" && value.activeScope ? value.activeScope : null
+      });
+      deletedKeys.push(key);
+    }
+    if (reaped.length === 0) {
+      return { status: "empty", head: this.headState, reaped: [], localRemovals: [] };
+    }
+
+    // One head advance for the batch; the marker digests the reaped ids
+    // so the rolling hash is deterministic and the tail stays legible.
+    const marker = `session_reap:${cellVersion(reaped.map((entry) => entry.session))}`;
+    const nextHead: ScopeHead = {
+      seq: this.headState.seq + 1,
+      hash: cellVersion([this.headState.hash, this.headState.seq + 1, marker])
+    };
+    for (const key of deletedKeys) this.store.delete(key);
+    this.headState = nextHead;
+    const tailEntry = { seq: nextHead.seq, transcript_hash: marker, touched: deletedKeys };
+    this.tail.push(tailEntry);
+    if (this.tail.length > this.options.tailLimit) this.tail.splice(0, this.tail.length - this.options.tailLimit);
+
+    // Local presence rows naming a reaped session: remove and report.
+    const reapedIds = new Set(reaped.map((entry) => entry.session));
+    const localRemovals: RelationDelta[] = [];
+    for (const row of this.relationRows.values()) {
+      if (row.relation === "session_presence" && reapedIds.has(row.member)) {
+        localRemovals.push({ op: "remove", row });
+      }
+    }
+    const changedRelationKeys = applyRelationDeltas(this.relationRows, localRemovals);
+
+    const durable = this.options.durable;
+    if (durable) {
+      durable.transaction(() => {
+        for (const key of deletedKeys) durable.deleteCell(key);
+        durable.writeMeta({ scope: this.scope, catalog_epoch: this.catalogEpoch, head: this.headState });
+        durable.appendTail(tailEntry);
+        durable.trimTail(this.options.tailLimit);
+        for (const key of changedRelationKeys) {
+          const row = this.relationRows.get(key);
+          if (row) durable.writeRelation(key, row);
+          else durable.deleteRelation(key);
+        }
+      });
+    }
+    return { status: "applied", head: this.headState, reaped, localRemovals };
   }
 
   /**
@@ -675,6 +785,50 @@ export class ScopeSequencer {
     if (durable) durable.transaction(pop);
     else pop();
     return due;
+  }
+
+  /**
+   * H2a: bound the reply cache. Every recorded reply carries the head it
+   * was recorded AT (`reply.head.seq` — accepted replies advance to it,
+   * terminal rejections record the head they rejected against), so age
+   * is derivable from content with no schema change. Two retention
+   * guarantees, both honored:
+   *
+   * - **never prune within the tail window** — a reply whose seq is
+   *   still covered by the retained recovery tail (seq > head - tail
+   *   limit) is never a candidate, so recovery-tail replay always finds
+   *   its replies;
+   * - **a bounded most-recent set beyond the window** — outside the
+   *   window, only the OLDEST replies prune, and only down to
+   *   `replyLimit` (default REPLY_KEEP_RECENT).
+   *
+   * Consequence, documented: a replay arriving AFTER its reply pruned
+   * (a client retrying a turn from thousands of commits ago) re-enters
+   * validation instead of replaying — which is SAFE: its base is
+   * ancient, so stale_head (or read_version_mismatch after a repair
+   * re-plan) rejects it; the one thing it can never do is silently
+   * re-commit, because committing requires the current head and fresh
+   * read versions, at which point it IS a new turn by any observable
+   * measure.
+   *
+   * Returns the pruned keys so the caller deletes the durable rows in
+   * the same transaction (memory-follows-durable in lockstep).
+   */
+  private pruneReplies(): string[] {
+    const limit = this.options.replyLimit ?? REPLY_KEEP_RECENT;
+    if (this.replies.size <= limit) return [];
+    const cutoff = this.headState.seq - this.options.tailLimit;
+    const candidates = [...this.replies.entries()]
+      .map(([key, reply]) => ({ key, seq: reply.head.seq }))
+      .filter((entry) => entry.seq <= cutoff)
+      .sort((a, b) => a.seq - b.seq);
+    const pruned: string[] = [];
+    for (const entry of candidates) {
+      if (this.replies.size <= limit) break;
+      this.replies.delete(entry.key);
+      pruned.push(entry.key);
+    }
+    return pruned;
   }
 
   private reject(submit: CommitSubmit, reason: RejectReason, detail: Record<string, unknown>, mismatched?: TranscriptCell[]): CommitReply {

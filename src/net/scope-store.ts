@@ -52,6 +52,10 @@ export interface ScopeStore {
 
   readReplies(): Array<{ key: string; reply: CommitReply }>;
   writeReply(key: string, reply: CommitReply): void;
+  /** H2a: the reply cache is BOUNDED (see ScopeSequencer's prune rule);
+   * pruned keys are deleted here in the same transaction as the commit
+   * that pruned them, keeping memory and durable rows in lockstep. */
+  deleteReply(key: string): void;
 
   readTail(): TailEntry[];
   appendTail(entry: TailEntry): void;
@@ -113,6 +117,10 @@ export class InMemoryScopeStore implements ScopeStore {
 
   writeReply(key: string, reply: CommitReply): void {
     this.replies.set(key, structuredClone(reply));
+  }
+
+  deleteReply(key: string): void {
+    this.replies.delete(key);
   }
 
   readTail(): TailEntry[] {
