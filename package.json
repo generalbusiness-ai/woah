@@ -50,6 +50,7 @@
     "test:e2e:share": "playwright test e2e/smoke.spec.ts -g \"pinboard shares created notes with another user|pinboard shared notes survive a peer reload|outliner shares committed items with another user\"",
     "test:e2e:ui": "playwright test --ui",
     "e2e:cf": "tsx scripts/e2e-cf-dev.ts",
+    "e2e:net": "playwright test --config playwright.net-e2e.config.ts",
     "pretypecheck": "npm run catalog:index && npm run catalog:check && npm run guard:object-names && npm run guard:layering && npm run guard:catalog-layering && npm run guard:catalog-runtime-boundary && npm run guard:tool-workspace-ui && npm run guard:catalog-migrations && npm run guard:client-imports && npm run guard:command-planning && npm run guard:vocabulary && npm run guard:turn-effects && npm run guard:serialized-access && npm run guard:smoke-wrangler",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.worker.json",
     "prebuild": "npm run catalog:index",

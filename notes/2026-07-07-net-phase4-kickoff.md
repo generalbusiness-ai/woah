@@ -127,4 +127,50 @@ localdev/browser parity lanes.
       WooClientFramework satisfies the target structurally, nothing in
       production imports it until Phase 5. Tests: tests/client/ (22)
       joined the curated npm-test gate.
-- [ ] 5. e2e + cross-user fix + lane extension
+- [x] 5. e2e + cross-user fix + lane extension — `npm run e2e:net`
+      (e2e/net-feed.spec.ts + playwright.net-e2e.config.ts): NetFeed in
+      REAL browsers (Playwright Chromium) against REAL workerd. The spec
+      owns its wrangler-dev lifecycle and shares ONE fixture with the
+      smoke:net-dev lane (scripts/net-smoke-fixture.ts, world half, run
+      under tsx — in-process for the lane, `--dump` subprocess for the
+      e2e since Playwright's Node loader refuses the engine's JSON
+      manifest imports; scripts/net-smoke-harness.ts, engine-free
+      lifecycle/doorway half, imported by the spec). The page under test
+      is a MINIMAL e2e-only static page (e2e/net-feed-page/: entry.ts
+      imports the real NetFeed; esbuild-bundled in beforeAll; served
+      same-origin via `wrangler dev --assets`, so no CORS/proxy and no
+      new wrangler config). **The cross-user CLASS is the gate**: two
+      browser contexts with distinct apikeys/actors (the fixture's
+      second identity CLIENT_KEY_B) enter the shared annex; A's wave
+      arrives at B as a PEER observation frame AND B's cell re-read
+      shows the committed waves value (the mirror path), while A sees
+      its own result exactly once — then the reverse direction. This is
+      the v2 cross-user pinboard/outliner sharing bug class (peer change
+      never rendered in the other browser), fixed by construction in the
+      new feed and now pinned by e2e. HONEST SCOPE: the lane proves the
+      NetFeed surface end-to-end in real browsers; the SPA does not use
+      NetFeed until the Phase-5 cutover, so the pinboard/outliner UIs
+      themselves are re-proven then, on this same lane.
+
+## PHASE 4 COMPLETE
+
+All five items landed on branch `net-phase4`, each with its lane
+evidence:
+
+1. **Turn results on the reply** — TurnResult carries the planned
+   transcript's result/observations; replay honesty via post-state
+   digest (`replayed: true`). Evidence: tests/net, smoke:net-dev
+   result/observation steps.
+2. **/net-api REST surface + client auth** — apikey→identity-cell auth,
+   session requirement (CO14), stable `net-api` shard. Evidence:
+   smoke:net-dev client-surface steps (refusal, mint, sessioned turn,
+   roster read).
+3. **WS transport + observation push** — session-tagged sockets,
+   session_presence-routed push, turn-id echo dedupe. Evidence:
+   smoke:net-dev WS steps (24/24 with the push/dedupe assertions).
+4. **NetFeed + adapter** — intent-pending echo overlay, self/peer
+   observation posture, WS-with-REST-fallback turns, framework adapter
+   parity. Evidence: tests/client (22) in the npm-test gate.
+5. **e2e cross-user gate** — this item; `npm run e2e:net` 2/2 green
+   (single-context commit + cross-user both directions), smoke:net-dev
+   24/24 on the shared fixture.
