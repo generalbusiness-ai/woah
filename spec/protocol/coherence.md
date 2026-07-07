@@ -512,6 +512,16 @@ One write path per fact (CO9), concretized:
   from the catalog scope), with core's exact salt/hash scheme
   reimplemented in `src/worker/net/client-auth.ts` (never an engine
   import); refusals are named 401 `E_NOSESSION` verdicts.
+  **Rate limits (wire.md's inbound rule, applied per authenticated
+  actor):** every `/net-api` operation — REST request or WS turn frame —
+  draws from one token bucket of 50 ops/s sustained, burst 100; the
+  amplifier routes (`POST /net-api/session`, `POST /net-api/ws-ticket` —
+  durable-commit and ticket minters) draw from a tighter 5/s bucket.
+  Excess refuses with the named `E_RATE` (HTTP 429; on a WS turn frame,
+  a `turn_result` with status 429 so the client's in-flight turn settles
+  instead of stranding). Buckets are per-gateway-isolate memory
+  (bounded, idle-evicted); eviction degrades to permitting one fresh
+  burst, never to blocking a legitimate client.
   - `POST /net-api/session {ttl_ms?}` derives the actor's cluster from
     view lineage (CO15; convention pull `cluster:<actor>` on miss) and
     mints through `/net/session-open`'s machinery.
@@ -535,11 +545,16 @@ One write path per fact (CO9), concretized:
     accept always digest-matches its plan).
   - `GET /net-api/relation` / `GET /net-api/cell` are the authenticated
     client reads over the CO13 roster mirror and the view cell probe.
-  - **`GET /net-api/ws` (implemented — Phase 4 item 3)** upgrades to a
-    WebSocket: the same apikey authentication (additionally accepted as
-    `?token=apikey:<id>:<secret>` on THIS route only — the WebSocket API
-    cannot set request headers; headers win when present) plus a
-    REQUIRED `?session=` validated exactly like `/net-api/turn`. The
+  - **`GET /net-api/ws` (implemented — Phase 4 item 3; ticket auth per
+    pre-deploy fix B3)** upgrades to a WebSocket. The upgrade
+    authenticates by a SHORT-LIVED SINGLE-USE TICKET, never the apikey:
+    `POST /net-api/ws-ticket {session}` (authenticated over HTTP like
+    every other route) mints an opaque ~60s ticket bound to
+    (session, actor), and `GET /net-api/ws?ticket=` consumes it
+    (read-then-delete; a reused or expired ticket refuses 401) then
+    validates the bound session exactly like `/net-api/turn` — the
+    WebSocket API cannot set request headers, and the permanent
+    credential must never ride a URL (history/logs/traces). The
     accepted socket is tagged with the session id via the DO hibernation
     API — the runtime socket set IS the registry (per-shard, in-memory/
     hibernation only; no new durable copy — CO5 stands at five; a

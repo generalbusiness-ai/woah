@@ -70,6 +70,7 @@ import type { CellTransfer } from "../../net/cells";
 import { randomHex } from "../../core/source-hash";
 import { verifyInternalRequest } from "../internal-auth";
 import { ClientAuthError, parseClientCredential, verifyApiKeyCredential } from "./client-auth";
+import { TokenBucketLimiter } from "./rate-limit";
 import { resolveNetDestination, WorkerdHost, type NetBindingsEnv } from "./workerd-host";
 
 export type NetGatewayDurableState = {
@@ -251,6 +252,20 @@ type GatewaySocketAttachment = { session: string; actor: string; opened_at: numb
 /** Echo-dedupe LRU bound (see recentClientTurns). */
 const RECENT_CLIENT_TURN_CAP = 512;
 
+/** H4 rate limits (wire.md inbound rule): the standard per-actor budget
+ * for every /net-api operation — REST requests and WS turn frames share
+ * ONE bucket per authenticated actor, so a client cannot double its
+ * budget by splitting traffic across transports. */
+const CLIENT_RATE_PER_SEC = 50;
+const CLIENT_RATE_BURST = 100;
+/** Tighter budget for the durable-commit / ticket AMPLIFIERS: a session
+ * mint is a sequenced commit at the actor's cluster and a ws-ticket is a
+ * durable row + a later upgrade — both cost far more than a read, so
+ * they get their own small bucket (burst covers a client opening a few
+ * tabs at once; sustained abuse throttles to 5/s). */
+const CLIENT_MINT_RATE_PER_SEC = 5;
+const CLIENT_MINT_RATE_BURST = 20;
+
 export class NetGatewayDO {
   private readonly host: WorkerdHost;
   private view: CellStore | null = null;
@@ -271,6 +286,16 @@ export class NetGatewayDO {
    * observation posture (kickoff rule).
    */
   private readonly recentClientTurns = new Map<string, string>();
+
+  /** H4 token buckets, PER-ISOLATE by design (see rate-limit.ts header):
+   * `clientRate` covers every authenticated /net-api operation (REST +
+   * WS turn frames, one bucket per actor); `mintRate` is the tighter
+   * bucket for the amplifier routes (session mint, ws-ticket). */
+  private readonly clientRate = new TokenBucketLimiter({ ratePerSec: CLIENT_RATE_PER_SEC, burst: CLIENT_RATE_BURST });
+  private readonly mintRate = new TokenBucketLimiter({
+    ratePerSec: CLIENT_MINT_RATE_PER_SEC,
+    burst: CLIENT_MINT_RATE_BURST
+  });
 
   constructor(
     private readonly state: NetGatewayDurableState,
@@ -995,6 +1020,11 @@ export class NetGatewayDO {
       const identity = await this.catalogIdentity();
       const { actor } = verifyApiKeyCredential(identity.map, credential);
 
+      // H4: rate limiting runs AFTER authentication resolves the actor
+      // (so buckets key on identity, never on spoofable request bytes)
+      // and BEFORE any dispatch — a throttled client costs one map lookup.
+      this.enforceClientRate(actor, url.pathname);
+
       if (request.method === "POST" && url.pathname === "/net-api/ws-ticket") {
         const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
         return await this.mintWsTicket(actor, body);
@@ -1048,6 +1078,34 @@ export class NetGatewayDO {
         );
       }
       return json({ error: { code: "E_INTERNAL", message: String(err) } }, 500);
+    }
+  }
+
+  /**
+   * H4: one token per authenticated /net-api operation. The amplifier
+   * routes (session mint, ws-ticket) consume from the tighter mint
+   * bucket; everything else from the standard 50/s-burst-100 bucket
+   * (wire.md). A refused take throws the named E_RATE as a
+   * ClientAuthError so the clientApi catch maps it to 429 — recovery is
+   * simply waiting for the refill (documented in the error detail).
+   */
+  private enforceClientRate(actor: string, pathname: string): void {
+    const isAmplifier = pathname === "/net-api/session" || pathname === "/net-api/ws-ticket";
+    const allowed = isAmplifier
+      ? this.mintRate.take(actor, this.host.now())
+      : this.clientRate.take(actor, this.host.now());
+    if (!allowed) {
+      throw new ClientAuthError(
+        "rate limit exceeded; retry after backoff",
+        {
+          reason: "rate_limited",
+          limit: isAmplifier
+            ? { rate_per_sec: CLIENT_MINT_RATE_PER_SEC, burst: CLIENT_MINT_RATE_BURST }
+            : { rate_per_sec: CLIENT_RATE_PER_SEC, burst: CLIENT_RATE_BURST }
+        },
+        "E_RATE",
+        429
+      );
     }
   }
 
@@ -1353,6 +1411,22 @@ export class NetGatewayDO {
       return;
     }
     if (frame.type === "turn") {
+      // H4: inbound WS turn frames draw from the SAME per-actor bucket as
+      // the REST surface (a socket is just another transport for the same
+      // identity). Divergence from wire.md's "error frame with no id"
+      // noted deliberately: this frame vocabulary correlates every reply
+      // by id, and an uncorrelated drop would strand the client's
+      // in-flight turn — so the refusal is a turn_result with status 429
+      // and the named E_RATE, which settles the waiter.
+      if (!this.clientRate.take(att.actor, this.host.now())) {
+        send({
+          type: "turn_result",
+          ...(id !== undefined ? { id } : {}),
+          status: 429,
+          error: { code: "E_RATE", message: "rate limit exceeded; retry after backoff" }
+        });
+        return;
+      }
       try {
         // The epoch is re-read per frame (pull-on-miss — the identity
         // cell's stamp, same honest source clientApi uses); the frame's

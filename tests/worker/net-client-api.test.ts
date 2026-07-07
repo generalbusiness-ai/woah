@@ -343,4 +343,60 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
 
     h.close();
   });
+
+  it("rate-limits /net-api per authenticated actor: burst 100, named 429 E_RATE, refills (H4)", async () => {
+    const h = await buildHarness();
+    const token = `apikey:${KEY_ID}:${KEY_SECRET}`;
+
+    // Exhaust the standard bucket with cheap reads (each consumes ONE
+    // token after auth; the 401 session_required they return is
+    // irrelevant to the budget — rate limiting runs before dispatch).
+    for (let i = 0; i < 100; i += 1) {
+      const res = await clientFetch(h.gateway, "GET", "/net-api/cell?key=object_live:capi_box", { token });
+      expect(res.status, `op ${i}`).toBe(401); // session_required, NOT rate limited
+    }
+    const throttled = await clientFetch(h.gateway, "GET", "/net-api/cell?key=object_live:capi_box", { token });
+    expect(throttled.status).toBe(429);
+    expect(throttled.body.error).toMatchObject({ code: "E_RATE", detail: { reason: "rate_limited" } });
+
+    // The bucket refills on the clock (50/s): after ~150ms at least a few
+    // tokens are back and the same request passes rate limiting again.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const recovered = await clientFetch(h.gateway, "GET", "/net-api/cell?key=object_live:capi_box", { token });
+    expect(recovered.status).toBe(401); // back to session_required — not 429
+
+    h.close();
+  });
+
+  it("gives session mint + ws-ticket a tighter shared bucket (H4 amplifier rule)", async () => {
+    const h = await buildHarness();
+    const token = `apikey:${KEY_ID}:${KEY_SECRET}`;
+
+    // One real mint (amplifier token 1) provides the session the ticket
+    // mints below need.
+    const minted = await clientFetch(h.gateway, "POST", "/net-api/session", { token, body: { ttl_ms: 600_000 } });
+    expect(minted.status, JSON.stringify(minted.body)).toBe(200);
+    const sid = minted.body.session as string;
+
+    // ws-ticket mints share the amplifier bucket (burst 20, refill 5/s).
+    // Fire rapid ticket mints until the bucket refuses: the loop issues
+    // far faster than the refill rate, so within 40 attempts a named
+    // 429 E_RATE MUST occur (refill can stretch the burst by at most a
+    // couple of tokens over the loop's wall time — timing-robust).
+    let throttled: { status: number; body: Record<string, unknown> } | null = null;
+    for (let i = 0; i < 40 && throttled === null; i += 1) {
+      const res = await clientFetch(h.gateway, "POST", "/net-api/ws-ticket", { token, body: { session: sid } });
+      if (res.status === 429) throttled = res;
+      else expect(res.status, `ticket ${i}: ${JSON.stringify(res.body)}`).toBe(200);
+    }
+    expect(throttled, "amplifier bucket never throttled in 40 rapid mints").not.toBeNull();
+    expect(throttled?.body.error).toMatchObject({ code: "E_RATE" });
+
+    // The STANDARD bucket is untouched by amplifier exhaustion: a plain
+    // read still authenticates and dispatches (401 session_required).
+    const read = await clientFetch(h.gateway, "GET", "/net-api/cell?key=object_live:capi_box", { token });
+    expect(read.status).toBe(401);
+
+    h.close();
+  });
 });

@@ -426,6 +426,32 @@ describe("/net-api/ws socket surface (Phase 4 item 3 chunk 1)", () => {
 
     h.close();
   });
+
+  it("rate-limits inbound turn frames on the socket's actor bucket (H4)", async () => {
+    const h = await buildHarness();
+    const token = `apikey:${KEY_ID}:${KEY_SECRET}`;
+    const sid = await h.mint();
+    const opened = await upgrade(h, sid);
+    expect(opened.status).toBe(101);
+    const server = opened.server as FakeWebSocket;
+
+    // REST and WS frames share ONE per-actor bucket: exhaust it with
+    // cheap REST reads (each consumes a token after auth) so the frame
+    // path's refusal is provable without 100 full commits.
+    for (let i = 0; i < 100; i += 1) {
+      await clientFetch(h.gateway, "GET", "/net-api/cell?key=object_live:ws_box", { token });
+    }
+    await h.gateway.webSocketMessage(
+      server as unknown as WebSocket,
+      JSON.stringify({ type: "turn", id: "rate1", target: "ws_box", verb: "bump", idempotency_key: "ws-rate-1" })
+    );
+    const refused = frames(server).at(-1);
+    expect(refused).toMatchObject({ type: "turn_result", id: "rate1", status: 429, error: { code: "E_RATE" } });
+    // The socket survives the refusal (a throttle is not a protocol error).
+    expect(server.readyState).toBe(1);
+
+    h.close();
+  });
 });
 
 describe("observation push via session_presence (Phase 4 item 3 chunk 2)", () => {
