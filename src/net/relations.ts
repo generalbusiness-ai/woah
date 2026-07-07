@@ -131,8 +131,13 @@ export function applyRelationDeltas(rows: Map<string, RelationRow>, deltas: Rela
 /**
  * Rebuild the `contents` relation from authority cells (CO13's bounded
  * repair: scan the scope's live cells — O(scope size), the same bound as
- * hydration). Presence rows rebuild from session cells once CO14 lands;
- * until then a rebuild preserves existing presence rows untouched.
+ * hydration). Presence rows are preserved untouched, deliberately: a
+ * presence row lives at the ROOM's scope while its defining session cell
+ * lives at the actor's CLUSTER (CO14), so a local scan cannot see the
+ * defining fact — a cross-scope presence rebuild would be the CO9 dual
+ * write. Presence re-derives through its one write path (transition
+ * commits + /net/relate delivery); single-scope worlds rebuild both from
+ * the same store because everything anchors together there.
  */
 export function rebuildContentsRelation(cells: Iterable<Cell>): Map<string, RelationRow> {
   const rows = new Map<string, RelationRow>();

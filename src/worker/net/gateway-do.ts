@@ -42,7 +42,7 @@
  * nothing routes production traffic here until Phase 5.
  */
 import { CellStore, cellKey, type Cell } from "../../net/cells";
-import { budgetExhausted, isNetError, type AttemptTraceEntry, type NetErrorCode } from "../../net/errors";
+import { budgetExhausted, isNetError, netError, type AttemptTraceEntry, type NetErrorCode } from "../../net/errors";
 import { applyFanout, type FanoutBody } from "../../net/outbox";
 import { relationKey, type RelationDelta } from "../../net/relations";
 import { mintSessionSubmit } from "../../net/sessions";
@@ -711,7 +711,15 @@ export class NetGatewayDO {
     if (request.cluster_destination?.startsWith("scope:")) {
       clusterScope = request.cluster_destination.slice("scope:".length);
     } else {
-      // CO15: derive from view lineage — the actor must be pullable state.
+      // CO15: derive from view lineage. An actor the view has never
+      // pulled is a materialization miss (CO2.6) — the caller's recovery
+      // is /net/pull then retry — not the assert-class E_LINEAGE the raw
+      // walk throws for unclosed sets.
+      if (!view.has(cellKey("object_lineage", request.actor))) {
+        throw netError("E_MISSING_STATE", "session-open actor is not in the gateway view", {
+          missing: [cellKey("object_lineage", request.actor)]
+        });
+      }
       const classifier = classifierFromLineage(
         (object) => (view.get(cellKey("object_lineage", object))?.value as AnchorLineage | undefined) ?? null
       );

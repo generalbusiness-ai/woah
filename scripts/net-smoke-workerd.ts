@@ -13,13 +13,17 @@
 // its view's lineage cells and routes by the `scope:<scopeName>`
 // convention, in real workerd. Three runs:
 //
-//   run 1 (clean):   seed 3 partitions → subscribe → pull 3 → warm
+//   run 1 (clean):   seed 4 partitions → subscribe → pull 4 → warm
 //                    derived-topology turns (CO10 structure: attempt
 //                    === 1, empty trace, envelope < 64 KB) → subscriber
 //                    fanout lands over real cross-DO RPC → ride-along
 //                    rider adoption at the actor's CLUSTER scope
-//                    (/net/adopt) over real RPC → scheduled turn fires
-//                    via a REAL workerd alarm.
+//                    (/net/adopt) over real RPC → CO14 sessions:
+//                    /net/session-open mints at the cluster, an
+//                    engine-planned SEQUENCED turn folds the session
+//                    transition, and the presence roster reads back via
+//                    GET /net/relation → scheduled turn fires via a REAL
+//                    workerd alarm.
 //   run 2 (latency): WOO_NET_FAULTS latency 100 ms on /submit — the warm
 //                    turn still converges with attempt === 1 (latency is
 //                    not divergence; the CO12.5 gate the v2 era lacked).
@@ -53,6 +57,11 @@ import type { AttemptTraceEntry } from "../src/net/errors";
 const EPOCH = "cat-net-lane-1";
 // CO15 derived scope names: the DO namespace key IS the scope name.
 const ROOM = "room:net_lane_room";
+// The CO14 session turn transitions INTO this second room: a freshly
+// minted session hydrates with activeScope = the actor's current location
+// (world.ts hydrateSession), so entering the room the actor already
+// occupies records no transition — the fold needs a real scope change.
+const ANNEX = "room:net_lane_annex";
 const GATEWAY = "lane-gw";
 
 type StepResult = { name: string; ok: boolean; detail?: string };
@@ -68,10 +77,10 @@ async function main(): Promise<number> {
   const fixture = await buildFixture();
   const CLUSTER = fixture.cluster;
 
-  /** Seed the three derived partitions (CO15 partitionCells) and pull
-   * each into the gateway's view: planning needs the room cells, the
-   * actor's cluster (actor + session rows), and the catalog class chain.
-   * THREE /closure pulls — run 3's skip_first counts them. */
+  /** Seed the four derived partitions (CO15 partitionCells) and pull
+   * each into the gateway's view: planning needs the room + annex cells,
+   * the actor's cluster (actor + session rows), and the catalog class
+   * chain. FOUR /closure pulls — run 3's skip_first counts them. */
   const seedAndPull = async (base: string): Promise<void> => {
     for (const [scope, cells] of fixture.partitions) {
       await post(base, "scope", scope, "seed", { scope, catalog_epoch: EPOCH, cells });
@@ -86,7 +95,10 @@ async function main(): Promise<number> {
   await withWorkerd({}, async (base) => {
     await seedAndPull(base);
     await post(base, "scope", ROOM, "subscribe", { destination: `gateway:${GATEWAY}` });
-    step("seed 3 partitions + subscribe + pull 3", true);
+    // The annex refans the CO14 presence delta (delivered via /net/relate)
+    // to ITS subscribers — the gateway must subscribe there too.
+    await post(base, "scope", ANNEX, "subscribe", { destination: `gateway:${GATEWAY}` });
+    step("seed 4 partitions + subscribe room/annex + pull 4", true);
 
     // Warm derived-topology turns: the CO10 structure gate at lane
     // level. The request carries NO anchors/shared/scopes — the
@@ -162,6 +174,54 @@ async function main(): Promise<number> {
     step("cross-scope move relates to the room and the gateway roster shows it (GET /net/relation)", roster !== null,
       moveReply.status !== "accepted" ? `submit ${JSON.stringify(moveReply)}` : undefined);
 
+    // CO14 sessions end-to-end over real cross-DO RPC: the gateway mints
+    // a session cell at the actor's CLUSTER (/net/session-open), then an
+    // ENGINE-PLANNED sequenced turn carrying that session enters the
+    // ANNEX — the plan-time fold turns the recorded sessionScopeTransition
+    // into the session-cell write (committed at the cluster, the turn's
+    // only authority write), the presence deltas reach the annex via
+    // /net/relate, and the subscriber gateway's roster read shows them.
+    const opened = await post<{ reply: CommitReply; scope: string }>(base, "gateway", GATEWAY, "session-open", {
+      session: "lane-s2",
+      actor: fixture.actor,
+      ttl_ms: 600_000,
+      catalog_epoch: EPOCH,
+      cluster_destination: `scope:${CLUSTER}`
+    });
+    step(
+      "session-open minted the session cell at the cluster scope (CO14)",
+      opened.reply.status === "accepted" && opened.scope === CLUSTER,
+      opened.reply.status !== "accepted" ? JSON.stringify(opened.reply) : undefined
+    );
+    const sessionTurn = await post<TurnBody>(base, "gateway", GATEWAY, "turn", fixture.sessionTurnRequest("lane-sess-1", "lane-s2"));
+    const presenceRoster = sessionTurn.reply.status === "accepted"
+      ? await poll(async () => {
+          const read = await get<{ members: Array<{ member: string; body?: { actor?: string } }> }>(
+            base, "gateway", GATEWAY, `relation?relation=session_presence&owner=${encodeURIComponent("net_lane_annex")}`
+          );
+          const row = read.members.find((m) => m.member === "lane-s2");
+          return row && row.body?.actor === fixture.actor ? read : null;
+        })
+      : null;
+    step(
+      "sequenced session turn folds the transition; presence roster shows the session (GET /net/relation)",
+      presenceRoster !== null,
+      sessionTurn.reply.status !== "accepted"
+        ? `turn ${JSON.stringify(sessionTurn.reply)}`
+        : presenceRoster !== null
+          ? "annex session_presence has lane-s2"
+          : "roster poll timed out"
+    );
+    // The folded session-cell write committed at the session's cluster
+    // authority: its copy now carries activeScope = the annex.
+    const transitionedSession = await poll(async () => {
+      const closure = await post<{ cells: Array<{ key: string; value: { activeScope?: string } }> }>(
+        base, "scope", CLUSTER, "closure", { keys: ["session:lane-s2"], known: [] }
+      );
+      return closure.cells.length === 1 && closure.cells[0].value.activeScope === "net_lane_annex" ? closure : null;
+    });
+    step("session cell committed at its cluster authority with the transitioned scope", transitionedSession !== null);
+
     // Scheduled turn fires via a REAL workerd alarm (CO2.8 at lane level).
     metrics = [];
     await post(base, "scope", ROOM, "schedule", {
@@ -190,10 +250,10 @@ async function main(): Promise<number> {
 
   // ---- run 3: /closure error → E_BUDGET with taxonomy trace ---------------
   console.log("run 3: /closure fault → E_BUDGET with attempt trace");
-  // skip_first spares the THREE clean partition pulls (each pull rides
+  // skip_first spares the FOUR clean partition pulls (each pull rides
   // /closure); every later closure call — the repair loop's refreshes —
   // faults.
-  await withWorkerd({ WOO_NET_FAULTS: JSON.stringify({ "/closure": { error: "lane closure fault", skip_first: 3 } }) }, async (base) => {
+  await withWorkerd({ WOO_NET_FAULTS: JSON.stringify({ "/closure": { error: "lane closure fault", skip_first: 4 } }) }, async (base) => {
     await seedAndPull(base);
     // Stale the view: mutate the scope directly, bypassing the gateway.
     const head = (await get<{ head: ScopeHead }>(base, "scope", ROOM, "head")).head;
@@ -242,6 +302,26 @@ async function buildFixture() {
     null
   );
   if (!installed.ok) throw new Error(`fixture verb install failed: ${JSON.stringify(installed)}`);
+  // CO14 lane room + verb: the session turn transitions into the ANNEX (a
+  // second room — see the ANNEX const note: entering the genesis room
+  // would record no transition). Entry verbs skip the presence gate (the
+  // catalog `enter` idiom) — a sequenced call into a room the session has
+  // not entered yet IS the entering.
+  world.createObject({ id: "net_lane_annex", name: "Lane Annex", parent: "$space", owner: actor });
+  const welcomeInstalled = installVerb(
+    world,
+    "net_lane_annex",
+    "welcome",
+    `verb :welcome() rxd {
+      moveto(actor, this);
+      return 1;
+    }`,
+    null
+  );
+  if (!welcomeInstalled.ok) throw new Error(`fixture welcome install failed: ${JSON.stringify(welcomeInstalled)}`);
+  const welcomeVerb = world.object("net_lane_annex").verbs.find((verb) => verb.name === "welcome");
+  if (!welcomeVerb) throw new Error("fixture welcome verb missing after install");
+  welcomeVerb.skip_presence_check = true;
   // Genesis placement: the actor occupies the lane room, so its presence
   // rows land in the room partition (genesis state, not under test).
   const placed = await world.directCall("lane-genesis-place", actor, actor, "moveto", ["net_lane_room"], { sessionId: session.id });
@@ -251,7 +331,7 @@ async function buildFixture() {
   const allPartitions = partitionCells(cellsFromSerialized(world.exportWorld()));
   // The lane drives exactly these three partitions; the bundled world's
   // other partitions (other rooms/guests) are not part of the scenario.
-  const partitions: Array<[string, NetCellInput[]]> = [ROOM, cluster, CATALOG_SCOPE].map((scope) => {
+  const partitions: Array<[string, NetCellInput[]]> = [ROOM, ANNEX, cluster, CATALOG_SCOPE].map((scope) => {
     const cells = allPartitions.get(scope);
     if (!cells || cells.length === 0) throw new Error(`fixture partition ${scope} is empty`);
     return [scope, cells];
@@ -280,6 +360,31 @@ async function buildFixture() {
     idempotency_key: key
   });
 
+  /** CO14 lane turn: an engine-planned SEQUENCED call carrying `sid` into
+   * the ANNEX's :welcome (moveto(actor, this)). The minted session
+   * hydrates at the actor's genesis room, so moving to the annex records
+   * a sessionScopeTransition → the plan-time fold emits the session-cell
+   * write. The turn's only authority write IS that session cell, so
+   * route.ts retargets the commit to the actor's CLUSTER (CA3 pure
+   * session movement); the presence deltas are the two rooms' rows,
+   * delivered to them via /net/relate (CO13). */
+  const sessionTurnRequest = (key: string, sid: string) => ({
+    call: {
+      kind: "woo.turn_call.shadow.v1",
+      id: key,
+      route: "sequenced",
+      scope: "net_lane_annex",
+      session: sid,
+      actor,
+      target: "net_lane_annex",
+      verb: "welcome",
+      args: []
+    } satisfies ShadowTurnCall,
+    planningScope: ROOM,
+    catalog_epoch: EPOCH,
+    idempotency_key: key
+  });
+
   /** Hand-built ride-along (room write + REAL-actor rider write), with
    * the planner-parity post-state computed the same way the tests do.
    * The rider write is blind (no read, no attestation), so adoption at
@@ -288,7 +393,7 @@ async function buildFixture() {
     const writer = { progr: actor, thisObj: actor, verb: "greet", definer: "$thing", caller: actor, callerPerms: actor };
     const transcript = {
       kind: "woo.effect_transcript.shadow.v1",
-      route: "sequenced",
+      route: "direct",
       scope: ROOM,
       seq: 1,
       call: { actor, target: ROOM, verb: "greet", args: [], body: undefined },
@@ -328,7 +433,7 @@ async function buildFixture() {
     const writer = { progr: actor, thisObj: "lane_box", verb: "bump", definer: "lane_box", caller: actor, callerPerms: actor };
     const transcript = {
       kind: "woo.effect_transcript.shadow.v1",
-      route: "sequenced",
+      route: "direct",
       scope: ROOM,
       seq: 1,
       call: { actor, target: "lane_box", verb: "bump", args: [], body: undefined },
@@ -398,7 +503,7 @@ async function buildFixture() {
     };
   };
 
-  return { partitions, cluster, actor, turnRequest, rideAlongSubmit, directBumpSubmit, crossScopeMoveSubmit };
+  return { partitions, cluster, actor, turnRequest, sessionTurnRequest, rideAlongSubmit, directBumpSubmit, crossScopeMoveSubmit };
 }
 
 // ---- lane plumbing ---------------------------------------------------------

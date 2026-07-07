@@ -444,25 +444,67 @@ One write path per fact (CO9), concretized:
 - **Fanout audiences** are computed from the `session_presence` relation
   (owner = the space, members = live sessions) — CO2.7's
   "O(distinct occupant shards)" gets its production definition here.
-  (Lands with CO14's session cells; until then fanout remains
-  per-subscriber.)
+  (CO14's session cells and the presence rows they drive are landed;
+  wiring fanout AUDIENCE selection to the relation arrives with the
+  Phase-4 transports — until then fanout remains per-subscriber.)
 
 ## CO14. Session authority and authentication
 
-- **A session is a cell** (`session:<id>`), authoritative at the ACTOR's
-  cluster scope. Minting/refresh/expiry are ordinary commits there — one
-  write path.
-- **The gateway authenticates; scopes authorize.** The gateway validates
-  client credentials against identity cells in the catalog scope closure
-  (CO15) and mints the session via a turn. Every submit carries the
-  session read in its read closure; CO4 step 1 (`authorize`) checks the
-  session cell (presence, expiry, actor binding) like any other read —
-  attested via CO2.3 rider rules when the commit scope is not the
-  session's owner.
+- **A session is a cell** (`session:<id>`, value = the bridge's
+  `SerializedSession` row — one shape from seed to mint to fold),
+  authoritative at the ACTOR's cluster scope. Minting/refresh/expiry are
+  ordinary commits there — one write path (`mintSessionSubmit` builds
+  the commit; the gateway's `/net/session-open` submits it directly —
+  a mint is a substrate commit with no verb to execute — and installs
+  the accepted cell in its view). Session cells are a **net-only
+  transcript-cell kind**: the v2 recorder never emits them; the bridge
+  (`src/net/transcript.ts`) widens the vocabulary, and only the mint and
+  the plan-time fold produce them.
+- **The gateway authenticates; scopes authorize.** CO4 step 1
+  (`authorize`, `authorizeSessionSubmit`) validates every session the
+  submit answers for — each session-kind read plus the transcript's
+  `session` field — with the named verdicts `expired` / `missing` /
+  `actor_mismatch` / `session_unattested` / `session_required` carried
+  in the `unauthorized` reject detail. Three validation sources, in
+  order: a transcript that WRITES the session cell (mint/refresh/
+  transition) validates the **written value** (demanding pre-existence
+  would forbid minting); an **owned** session validates from the scope's
+  own authoritative cell; a **foreign** session composes the CO2.3
+  machinery — session cells are just cells: the submit must carry the
+  session read plus an owner attestation, and an attested version equal
+  to the read's version proves the read VALUE by content address, which
+  authorize then validates semantically. An attested-but-different
+  version is NOT an auth verdict: step 7 rejects it retryably
+  (`read_version_mismatch`) so a stale view repairs instead of
+  terminal-failing. Ownership witness: the scope holds the cell AND it
+  is not CA3 rider residue. Sessions absent entirely → allowed only for
+  direct-route turns (lane/tooling submits); a sequenced turn must name
+  a session, and Phase-4 transports will require sessions on all
+  client-originated turns. Credential authentication against identity
+  cells in the catalog scope closure (CO15) is the Phase-4 transport
+  story in front of `/net/session-open`.
+- **Every planned submit carries its session read** (folded in by
+  `plan.ts` when the engine transcript lacks it — the engine cannot
+  record session-kind cells), versioned through the plan snapshot, so
+  freshness is pinned by CO4 step 7 like any read.
 - **Session-scope transitions are session-cell writes**, folded in at
-  plan time from the engine's recorded transition; presence (CO13)
-  derives from the committed cell. There is no separate presence write
-  path.
+  plan time from the engine's recorded transition (value = the prior
+  row merged with `activeScope = transition.to`, written by the actor's
+  own frame, BEFORE scope selection so the write participates in
+  write-set routing); presence (CO13) derives from the committed cell's
+  turn. There is no separate presence write path.
+- **Session cells classify by the transcript's calling actor** (route
+  selection, rider directions, attestation, targeted refresh): session
+  ids carry no lineage, the only session cells a transcript carries are
+  the calling session's, and a session's authority is its actor's
+  cluster — the same rule `partitionCells` applies to seed rows.
+- **Engine hydration caveat (stated):** the engine hydrates a session
+  row whose `activeScope` is null (or names an unknown object) to the
+  actor's current location (`hydrateSession`), so a freshly minted
+  session "occupies" wherever its actor stands, and a transition is only
+  recorded when the turn moves the session to a DIFFERENT scope. Net
+  inherits this through the bridge; the lane's session turn therefore
+  enters a room the actor does not already occupy.
 
 ## CO15. Topology, partitioning, and catalog install
 

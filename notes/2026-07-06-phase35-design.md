@@ -157,8 +157,39 @@ owners.**
    CO14 (sessions are not cells yet). Lane: the workerd smoke commits a
    cross-scope move at the real actor's cluster and reads the room
    roster off the gateway — 9/9. Unblocks look/who and audience.
-4. CO14 sessions (mint + authorize + transition folding) — unblocks
-   Phase-4 transports.
+4. CO14 sessions (mint + authorize + transition folding) — DONE
+   (branch net-phase35). A session is a cell whose value is the bridge's
+   SerializedSession row (ONE shape; task vocabulary expires_at/
+   created_at/scope = expiresAt/started/activeScope). Session cells are
+   a net-only transcript-cell kind widened at the bridge
+   (src/net/transcript.ts) — v2's RecordedCell and its exhaustive
+   switches stay frozen; only mintSessionSubmit and the plan.ts fold
+   produce them, and engine-kind write collapsing still delegates to
+   v2's finalWritesByCell byte-identically. src/net/sessions.ts carries
+   the library (mint / validate / authorizeSessionSubmit); NetScopeDO
+   wires authorize with ownership = holds-the-cell minus rider residue.
+   plan.ts folds BOTH the session read (every submit that names a
+   session carries a validatable read — CO14's read-closure rule made
+   real) and the transition write (prior row + activeScope, before
+   scope selection so routing sees it); session cells classify by the
+   calling actor everywhere (route/attest/riders/refresh — the
+   partitionCells rule). Gateway /net/session-open mints via a DIRECT
+   submit (no phantom verb) with a stale_head-only retry and installs
+   the cell. Sequenced turns must name a session; direct-route
+   tooling turns stay session-less until Phase-4 transports.
+   Two engine seams found and documented (spec CO14 caveat):
+   (a) hydrateSession coerces a null/unknown activeScope to the actor's
+   current location, so transitions only record when the turn moves the
+   session to a DIFFERENT scope — the lane's session turn enters a
+   second room (annex) for exactly this reason; (b) presence prop
+   writes (subscribers/session_subscribers) ride the transcript as
+   projection writes, so a pure session-entry turn's only AUTHORITY
+   write is the folded session cell and route.ts retargets it to the
+   actor's cluster (CA3 pure session movement) with the presence deltas
+   delivered to the rooms via /net/relate. Lane: session-open →
+   sequenced fold turn → GET /net/relation session_presence roster at
+   the annex — 12/12. Fanout-audience-from-presence wiring stays with
+   Phase 4 (spec CO13 note updated).
 5. CO16 scheduled execution — closes CO2.8.
 Each lands spec-first, then code, with lane coverage extended to a
 three-scope topology (room, cluster, catalog) as the new default fixture.
@@ -175,3 +206,16 @@ the 2026-06-16 canary-timeout triage (budget vs latency, not a wedged
 path). If this keeps biting local gates, the proportionate fix is a
 dedicated budget bump for the fake-lane walkthrough in its own commit —
 not silently, and not mixed into feature work.
+
+Additional evidence recorded during CO14 (2026-07-07): four full-suite
+runs (npm test x3, test:worker x1) each failed 3-5 heavy v2 files with a
+DISJOINT set every run (scope-executor-garden-probe, object-host-write-
+through, b-i-read-closure-parity, dev-v2-durable-turn-parity, mcp-warm-
+authority, shadow-browser-node, cf-local-structural, cf-repository,
+rpc-fault-inject, v2-browser-worker.integration across the four runs);
+every failure is timeout-shaped (60s test timeouts, internal 5s RPC
+timeouts, one assertion that is a timeout-message artifact), every file
+passes in isolation, and one test:worker run on a quiet machine passed
+all 26 files/330 tests. Zero imports from src/net in any failing file
+(verified by grep). The proportionate-budget-bump recommendation above
+stands and is now overdue — still its own commit, not this one.
