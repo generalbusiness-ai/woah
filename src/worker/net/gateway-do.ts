@@ -968,7 +968,12 @@ export class NetGatewayDO {
 
   private async clientApi(request: Request, url: URL): Promise<Response> {
     try {
-      const credential = parseClientCredential(request.headers);
+      // The WS upgrade may carry its credential as `?token=` — the ONLY
+      // route with the query carrier, because the WebSocket API (browser
+      // and Node-native alike) cannot set request headers; see
+      // parseClientCredential's queryToken note. Headers still win.
+      const wsUpgrade = request.method === "GET" && url.pathname === "/net-api/ws";
+      const credential = parseClientCredential(request.headers, wsUpgrade ? url.searchParams.get("token") : null);
       const identity = await this.catalogIdentity();
       const { actor } = verifyApiKeyCredential(identity.map, credential);
 

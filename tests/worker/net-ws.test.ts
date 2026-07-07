@@ -351,6 +351,21 @@ describe("/net-api/ws socket surface (Phase 4 item 3 chunk 1)", () => {
     // The attachment carries the validated identity across hibernation.
     expect(server.deserializeAttachment()).toMatchObject({ session: sid, actor: h.actor });
 
+    // The query-token carrier: the WebSocket API (browser and
+    // Node-native) cannot set headers, so the upgrade — and ONLY the
+    // upgrade — accepts ?token=apikey:...; every other route ignores
+    // the query param (headers stay the only credential carrier there).
+    const viaQuery = await clientFetch(
+      h.gateway,
+      "GET",
+      `/net-api/ws?session=${sid}&token=apikey:${KEY_ID}:${KEY_SECRET}`,
+      { headers: { upgrade: "websocket" } }
+    );
+    expect(viaQuery.status).toBe(101);
+    const ignoredQuery = await clientFetch(h.gateway, "GET", `/net-api/cell?key=x&token=apikey:${KEY_ID}:${KEY_SECRET}`);
+    expect(ignoredQuery.status).toBe(401);
+    expect(ignoredQuery.body.error).toMatchObject({ code: "E_NOSESSION", detail: { reason: "missing_credential" } });
+
     // Ping → pong with the id echoed.
     await h.gateway.webSocketMessage(server as unknown as WebSocket, JSON.stringify({ type: "ping", id: "p1" }));
     expect(frames(server).at(-1)).toEqual({ type: "pong", id: "p1" });

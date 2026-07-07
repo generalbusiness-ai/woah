@@ -90,6 +90,16 @@ localdev/browser parity lanes.
       workerd smoke now drives the client surface through the worker
       entry (auth refusal, mint, sessioned turn with
       result/observations, roster read from the subscribed mirror).
-- [ ] 3. WS + observation push via session_presence
+- [x] 3. WS + observation push — GET /net-api/ws (apikey + session
+      validated at upgrade; hibernation-tagged sockets by session id;
+      {type:"turn"} frames run the clientTurn path and reply
+      turn_result); receiveFanout pushes {type:"observations"} to
+      sockets whose sessions appear in the fanout scope's
+      session_presence mirror rows, at-most-once, with turn_id dedupe
+      so the submitter (who got them on the reply) is never
+      double-delivered (FanoutBody carries the originating turn_id).
+      Lane: two live sessions over real workerd — wave from socket A →
+      turn_result with the observation at A, observations push at B,
+      no duplicate at A (24/24).
 - [ ] 4. client feed + echo overlay + framework adapter
 - [ ] 5. e2e + cross-user fix + lane extension

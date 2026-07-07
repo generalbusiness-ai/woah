@@ -112,6 +112,10 @@ async function main(): Promise<number> {
     // feeds its relation mirror (the client roster read below) with the
     // cross-scope move's contents refan.
     await post(base, "scope", ROOM, "subscribe", { destination: "gateway:net-api" });
+    // Item 3: the annex feeds the client shard too — its refans carry the
+    // client sessions' presence rows (the WS push audience) and its
+    // commit fanout carries the wave observations the push delivers.
+    await post(base, "scope", ANNEX, "subscribe", { destination: "gateway:net-api" });
     step("seed 4 partitions + subscribe room/annex + pull 4", true);
 
     // Warm derived-topology turns: the CO10 structure gate at lane
@@ -299,6 +303,124 @@ async function main(): Promise<number> {
     });
     step("authenticated roster read over /net-api shows the room contents", clientRoster !== null);
 
+    // ---- Phase-4 item 3: WS transport + observation push over REAL
+    // workerd, driven with Node's NATIVE WebSocket client (the browser
+    // API shape — it cannot set request headers, which is exactly why
+    // the upgrade accepts ?token=; every other route stays header-only).
+    // Two fresh client sessions transition into the ANNEX via sequenced
+    // :welcome turns (a mint records no presence — entering IS the
+    // transition), then A waves over its socket: the observation arrives
+    // on A's turn_result frame ONLY (turn-id echo dedupe), while B's
+    // socket receives the {type:"observations"} push from the annex
+    // fanout routed through the CO13 session_presence mirror.
+    const wsBase = base.replace(/^http/, "ws");
+    const wsToken = "apikey:lane-key:lane-secret";
+    const refused = await new Promise<boolean>((resolve) => {
+      const ws = new WebSocket(`${wsBase}/net-api/ws?session=s_nope`); // no credential
+      ws.addEventListener("open", () => {
+        ws.close();
+        resolve(false);
+      });
+      ws.addEventListener("error", () => resolve(true));
+    });
+    step("WS upgrade without a credential is refused", refused);
+
+    const mintClient = async (): Promise<string> => {
+      const res = await fetch(`${base}/net-api/session`, {
+        method: "POST",
+        headers: clientHeaders,
+        body: JSON.stringify({ ttl_ms: 600_000 })
+      });
+      const body = (await res.json()) as { session?: string };
+      if (res.status !== 200 || typeof body.session !== "string") {
+        throw new Error(`ws-pass session mint failed: ${res.status} ${JSON.stringify(body)}`);
+      }
+      return body.session;
+    };
+    const enterAnnex = async (sid: string, key: string): Promise<boolean> => {
+      const res = await fetch(`${base}/net-api/turn`, {
+        method: "POST",
+        headers: clientHeaders,
+        body: JSON.stringify({ target: "net_lane_annex", verb: "welcome", session: sid, idempotency_key: key })
+      });
+      const body = (await res.json()) as { reply?: { status?: string } };
+      return res.status === 200 && body.reply?.status === "accepted";
+    };
+    const sA = await mintClient();
+    const sB = await mintClient();
+    const enteredA = await enterAnnex(sA, "lane-ws-enter-a");
+    const enteredB = await enterAnnex(sB, "lane-ws-enter-b");
+    step("two client sessions enter the annex (sequenced transitions)", enteredA && enteredB);
+    // The presence rows are the push audience — they must reach the
+    // client shard's mirror (via the annex refan) before the wave.
+    const wsPresence = await poll(async () => {
+      const res = await fetch(
+        `${base}/net-api/relation?relation=session_presence&owner=${encodeURIComponent("net_lane_annex")}`,
+        { headers: { authorization: `Bearer ${wsToken}` } }
+      );
+      if (res.status !== 200) return null;
+      const body = (await res.json()) as { members?: Array<{ member: string }> };
+      const members = (body.members ?? []).map((m) => m.member);
+      return members.includes(sA) && members.includes(sB) ? body : null;
+    });
+    step("client sessions' presence rows reach the net-api mirror", wsPresence !== null);
+
+    const openSocket = (sid: string): Promise<{ ws: WebSocket; frames: Array<Record<string, unknown>> }> =>
+      new Promise((resolve, reject) => {
+        const collected: Array<Record<string, unknown>> = [];
+        const ws = new WebSocket(`${wsBase}/net-api/ws?session=${sid}&token=${encodeURIComponent(wsToken)}`);
+        ws.addEventListener("message", (event) => {
+          try {
+            collected.push(JSON.parse(String((event as MessageEvent).data)) as Record<string, unknown>);
+          } catch {
+            /* non-JSON frame: not expected; leave it out of the tally */
+          }
+        });
+        ws.addEventListener("open", () => resolve({ ws, frames: collected }));
+        ws.addEventListener("error", () => reject(new Error(`ws open failed for ${sid}`)));
+      });
+    const socketA = await openSocket(sA);
+    const socketB = await openSocket(sB);
+    try {
+      socketA.ws.send(JSON.stringify({ type: "ping", id: "lp1" }));
+      const pong = await poll(async () => socketA.frames.find((f) => f.type === "pong" && f.id === "lp1") ?? null, 5000);
+      step("WS ping/pong over real workerd", pong !== null);
+
+      socketA.ws.send(
+        JSON.stringify({ type: "turn", id: "lw1", target: "net_lane_annex", verb: "wave", idempotency_key: "lane-ws-wave-1" })
+      );
+      const waveResult = (await poll(
+        async () => socketA.frames.find((f) => f.type === "turn_result" && f.id === "lw1") ?? null
+      )) as { status?: number; reply?: { status?: string }; observations?: Array<{ type?: string }> } | null;
+      step(
+        "turn over WS commits with result + observations on the turn_result frame",
+        waveResult?.status === 200 &&
+          waveResult.reply?.status === "accepted" &&
+          (waveResult.observations ?? []).some((o) => o.type === "waved"),
+        waveResult ? `status=${waveResult.status} reply=${waveResult.reply?.status}` : "timed out"
+      );
+      const pushed = (await poll(async () => socketB.frames.find((f) => f.type === "observations") ?? null)) as {
+        scope?: string;
+        observations?: Array<{ type?: string }>;
+      } | null;
+      step(
+        "peer socket receives the observations push from the annex fanout",
+        pushed !== null && pushed.scope === ANNEX && (pushed.observations ?? []).some((o) => o.type === "waved"),
+        pushed ? `scope=${pushed.scope}` : "timed out"
+      );
+      // Echo dedupe: the peer's push above proves the fanout landed;
+      // give any stray duplicate a beat, then assert the submitter saw
+      // the observation ONLY on its turn_result frame.
+      await sleep(500);
+      step(
+        "submitter socket receives no duplicate observations push (turn-id dedupe)",
+        !socketA.frames.some((f) => f.type === "observations")
+      );
+    } finally {
+      socketA.ws.close();
+      socketB.ws.close();
+    }
+
     // CO16 scheduled-turn execution end-to-end via a REAL workerd alarm:
     // the gateway registers as PLANNER on the room; the alarm moves the
     // due bump turn through the durable outbox to /net/plan-scheduled;
@@ -408,6 +530,23 @@ async function buildFixture() {
   const welcomeVerb = world.object("net_lane_annex").verbs.find((verb) => verb.name === "welcome");
   if (!welcomeVerb) throw new Error("fixture welcome verb missing after install");
   welcomeVerb.skip_presence_check = true;
+  // Phase-4 item 3 (WS observation push): an observing verb ON the annex
+  // for sessions that have transitioned in — the wave's fanout carries
+  // the observation the peer socket must receive. No presence skip: by
+  // wave time the session HAS entered (that ordering is the point).
+  world.defineProperty("net_lane_annex", { name: "waves", defaultValue: 0, owner: actor, perms: "rw", typeHint: "int" });
+  const waveInstalled = installVerb(
+    world,
+    "net_lane_annex",
+    "wave",
+    `verb :wave() rxd {
+      this.waves = this.waves + 1;
+      observe({ type: "waved", waves: this.waves });
+      return this.waves;
+    }`,
+    null
+  );
+  if (!waveInstalled.ok) throw new Error(`fixture wave install failed: ${JSON.stringify(waveInstalled)}`);
   // Phase-4 client surface (/net-api): an apikey minted into
   // $system.api_keys via the same wizard path localdev bootstrap uses;
   // partitionCells carries the identity cell to the CATALOG partition

@@ -49,8 +49,17 @@ export type ClientCredential = { id: string; secret: string };
  * A bearer token WITHOUT the `apikey:` prefix is refused namedly: other
  * token classes (bearer session import) are the Phase-5 identity story,
  * and silently treating one as an apikey would mask the misconfiguration.
+ *
+ * `queryToken` (Phase 4 item 3) is a LAST-resort carrier the caller opts
+ * into for the ONE route that needs it: WebSocket upgrades, where the
+ * browser (and Node-native) WebSocket API cannot set request headers —
+ * the same reason the v2 WS route carries `?token=`. It must be the FULL
+ * `apikey:<id>:<secret>` form (the prefix names the token class, exactly
+ * the bearer rule) and rides TLS like everything else; headers always
+ * win when present, so no HTTP client is ever pushed toward the URL
+ * carrier.
  */
-export function parseClientCredential(headers: Headers): ClientCredential {
+export function parseClientCredential(headers: Headers, queryToken?: string | null): ClientCredential {
   const auth = headers.get("authorization")?.trim() ?? "";
   const bearerMatch = /^Bearer\s+(.+)$/i.exec(auth);
   let token: string | null = null;
@@ -65,6 +74,15 @@ export function parseClientCredential(headers: Headers): ClientCredential {
   } else {
     const headerKey = headers.get("x-woo-api-key")?.trim();
     if (headerKey) token = headerKey.startsWith("apikey:") ? headerKey.slice("apikey:".length) : headerKey;
+  }
+  if (!token && queryToken) {
+    const raw = queryToken.trim();
+    if (!raw.startsWith("apikey:")) {
+      throw new ClientAuthError("query token must be apikey:<id>:<secret> (other token classes are Phase-5)", {
+        reason: "unsupported_token_class"
+      });
+    }
+    token = raw.slice("apikey:".length);
   }
   if (!token) {
     throw new ClientAuthError(
