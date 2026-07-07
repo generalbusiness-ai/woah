@@ -145,3 +145,16 @@ owners.**
 5. CO16 scheduled execution — closes CO2.8.
 Each lands spec-first, then code, with lane coverage extended to a
 three-scope topology (room, cluster, catalog) as the new default fixture.
+
+## Gate-flake evidence (2026-07-07, recorded during CO15)
+
+The heavy v2 fake-DO tests (cf-local-walkthrough cross-shard movement,
+structural/budget probes) are timing-marginal under sustained machine
+load: repeated A/B runs show nondeterministic 30/60s timeouts on BOTH
+net-phase35 HEAD (2 fails / 5 runs of cf-local-walkthrough) AND base
+f5e6acb (1 fail / 3 runs), with the failing set varying run to run and
+no import path from the CO15 diff into any failing file. Same class as
+the 2026-06-16 canary-timeout triage (budget vs latency, not a wedged
+path). If this keeps biting local gates, the proportionate fix is a
+dedicated budget bump for the fake-lane walkthrough in its own commit —
+not silently, and not mixed into feature work.
