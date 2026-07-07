@@ -30,10 +30,13 @@
  *                           it in a later step)
  *       POST /net/subscribe {destination} → register a fanout receiver
  *                           (a gateway shard; maintained on session open)
- *       POST /net/adopt     {from_scope, seq, cells} → CA3 rider
- *                           adoption: install authoritative cells this
- *                           scope anchors that were committed at another
- *                           scope; idempotent by (from_scope, seq)
+ *       POST /net/adopt     {from_scope, seq, cells, prior_versions?} →
+ *                           CA3 rider adoption as an OWNER-SEQUENCED
+ *                           commit (CO2.3): per-cell prior-version CAS,
+ *                           head advances once per applied batch, and
+ *                           the adopted cells fan out to this scope's
+ *                           own subscribers; idempotent by (from_scope,
+ *                           seq)
  *       POST /net/schedule  park a scheduled turn + arm the alarm
  *                           (test-facing until the gateway machinery
  *                           schedules from transcripts)
@@ -339,7 +342,12 @@ export class NetScopeDO {
           cells: Cell[];
           prior_versions?: Record<string, string>;
         };
-        return json(this.adopt(body));
+        const adopted = this.adopt(body);
+        // A non-empty adoption enqueued fanout rows to this scope's own
+        // subscribers (owner-sequenced commit — see adopt()); drain them
+        // off the reply path, same as /net/submit.
+        this.host.defer(() => this.drainOutbox());
+        return json(adopted);
       }
       if (request.method === "POST" && url.pathname === "/net/attest") {
         // CO2.3 rider-read attestation: report this authority's current
@@ -953,76 +961,95 @@ export class NetScopeDO {
   }
 
   /**
-   * CA3 rider adoption: install cells this scope anchors that were
-   * committed atomically at another scope — the owner adopting the
-   * ride-along write as its OWN ordered write (authoritative-into-
-   * authority install; the cells keep the committing scope's stamp per
-   * CO8). This scope's own head does NOT advance: adoption is not a
-   * commit here. Idempotent by (from_scope, seq) high-water, so the
-   * at-least-once outbox may redeliver freely.
+   * CA3 rider adoption (CO2.3 rider integrity, rule 2): cells this scope
+   * anchors that were committed via ride-along at another scope are
+   * applied as an OWNER-SEQUENCED commit — ScopeSequencer.adopt CASes
+   * each cell against the prior version the committing turn observed
+   * (the attested version for attested cells; captureRiderPriors at the
+   * sender), advances this scope's head ONCE for the applied batch, and
+   * stamps the adopted cells with the new head (CO8-correct stamps —
+   * observers and catch-up see a real owner-head advance).
    *
-   * Rider-read integrity interim guard (fix 1; notes/2026-07-06-rider-
-   * read-integrity.md "Interim guard"): adoption is no longer a raw
-   * install. Each cell CASes against the prior version the committing
-   * turn observed (captureRiderPriors at the sender):
-   * - owner's current version === prior → the owner did not move inside
-   *   the plan→adopt window; apply as an owner-ordered write.
-   * - mismatch → the owner advanced (or the committing view was stale);
-   *   OWNER WINS — the cell is NOT overwritten, and the divergence is
-   *   named + counted (net_adopt_conflict), never silent (CO6). The
-   *   committing scope's transcript already embedded the stale value in
-   *   its post-state; that residual tear is the accepted, named
-   *   inconsistency until design A+B (owner attestation) lands.
-   * - no prior claimed (blind "stamp the actor" write) → apply; with no
-   *   read there is no stale read to launder (design-C allowance).
-   * The (from_scope, seq) high-water advances either way: the adoption
-   * WAS processed; redelivery must not flap the verdict.
+   * Conflicts are owner-wins and surface as net_adopt_conflict metrics
+   * (named, counted — never a silent lost update, CO6). The committing
+   * scope's transcript already embedded the stale value in its
+   * post-state; that residual tear is the spec's named, bounded
+   * inconsistency — healed by the next read-version repair on the cell,
+   * eliminated structurally by CA10 route migration.
+   *
+   * After a non-empty apply, the adopted cells fan out to THIS scope's
+   * own subscribers through the durable outbox — the owner's observers
+   * learn of adopted changes exactly like any owner commit (the catch-up
+   * gap the 2026-07-06 review named). The enqueue shares the adoption's
+   * transaction, so a crash cannot separate the owner commit from its
+   * fanout rows (CO2.7).
+   *
+   * Idempotent by the (from_scope, seq) high-water, which advances even
+   * on an all-conflict adoption: the fact WAS processed; redelivery must
+   * not flap the verdict.
    */
   private adopt(body: {
     from_scope: string;
     seq: number;
     cells: Cell[];
     prior_versions?: Record<string, string>;
-  }): { applied: boolean; installed: number; conflicts: number } {
+  }): { applied: boolean; installed: number; conflicts: number; head: ScopeHead } {
     const seq = this.ensureSequencer();
     return this.discardSeqOnThrow(() => this.store.transaction(() => {
       const rows = sqlRows<{ seq: number }>(
         this.state.storage.sql.exec("SELECT seq FROM net_scope_adopted WHERE from_scope = ?", body.from_scope)
       );
       const last = rows.length > 0 ? Number(rows[0].seq) : 0;
-      if (body.seq <= last) return { applied: false, installed: 0, conflicts: 0 };
-      let installed = 0;
-      let conflicts = 0;
-      for (const cell of body.cells) {
-        const prior = body.prior_versions?.[cell.key];
-        const ours = seq.store.get(cell.key)?.version ?? "absent";
-        if (prior !== undefined && prior !== ours) {
-          conflicts += 1;
-          console.log(
-            "woo.metric",
-            JSON.stringify({
-              kind: "net_adopt_conflict",
+      if (body.seq <= last) return { applied: false, installed: 0, conflicts: 0, head: seq.head() };
+      const result = seq.adopt({
+        from_scope: body.from_scope,
+        seq: body.seq,
+        cells: body.cells,
+        priors: body.prior_versions ?? {}
+      });
+      for (const conflict of result.conflicts) {
+        console.log(
+          "woo.metric",
+          JSON.stringify({
+            kind: "net_adopt_conflict",
+            scope: seq.scope,
+            from_scope: body.from_scope,
+            seq: body.seq,
+            key: conflict.key,
+            ours: conflict.ours,
+            theirs: conflict.theirs,
+            ts: Date.now()
+          })
+        );
+      }
+      if (result.status === "applied") {
+        // Owner-observer fanout: subscribers receive the adopted cells at
+        // the advanced head exactly like a submit's fanout (lineage-
+        // closed). Adoption carries no observations of its own — the
+        // committing scope's fanout already delivered the turn's
+        // observations to ITS subscribers; this delivers the owner's
+        // authoritative cell state.
+        const subscribers = sqlRows<{ destination: string }>(
+          this.state.storage.sql.exec("SELECT destination FROM net_scope_subscribers")
+        );
+        if (subscribers.length > 0) {
+          const cells = this.fanoutCells(seq, result.applied);
+          for (const { destination } of subscribers) {
+            this.persistOutboxRow("/fanout", destination, {
               scope: seq.scope,
-              from_scope: body.from_scope,
-              seq: body.seq,
-              key: cell.key,
-              ours,
-              theirs: cell.version,
-              ts: Date.now()
-            })
-          );
-          continue;
+              seq: result.head.seq,
+              cells,
+              observations: []
+            });
+          }
         }
-        seq.store.install(cell);
-        this.store.writeCell(cell);
-        installed += 1;
       }
       this.state.storage.sql.exec(
         "INSERT INTO net_scope_adopted (from_scope, seq) VALUES (?, ?) ON CONFLICT(from_scope) DO UPDATE SET seq = excluded.seq",
         body.from_scope,
         body.seq
       );
-      return { applied: true, installed, conflicts };
+      return { applied: true, installed: result.applied.length, conflicts: result.conflicts.length, head: result.head };
     }));
   }
 

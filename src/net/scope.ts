@@ -360,6 +360,112 @@ export class ScopeSequencer {
     return reply;
   }
 
+  /**
+   * CA3 rider adoption as an OWNER-SEQUENCED commit (CO2.3 rider
+   * integrity, rule 2). Cells committed via ride-along at another scope
+   * arrive here to be applied as owner-ordered events:
+   *
+   * - Per cell, CAS this authority's current version (absent hashes as
+   *   "absent") against `priors[key]` — the version the committing turn
+   *   observed (the attested version for attested cells). Match →
+   *   applied. Mismatch → the owner moved inside the attestation window:
+   *   OWNER WINS, the cell is not applied, and the conflict is returned
+   *   for the caller to name and count (`net_adopt_conflict`) — never a
+   *   silent overwrite. A cell with NO prior claimed (a blind "stamp the
+   *   actor" write that read nothing) applies owner-ordered: with no
+   *   read there is no stale read to launder (the design-C allowance).
+   *   Conflicts never block the applied cells.
+   * - A non-empty applied set is ONE owner commit: the head advances
+   *   once for the batch, the applied cells commit through the store
+   *   with the NEW head stamp (authoritative provenance — this IS an
+   *   owner-ordered event, so observers and catch-up see a real
+   *   owner-head advance with CO8-correct stamps), a tail entry is
+   *   appended, and the durable write-through covers cells + meta + tail
+   *   in one transaction exactly like submit's accept path.
+   * - Adoption does NOT run CO4 validation: the writes were already
+   *   validated at the committing scope against this owner's plan-time
+   *   attestations (CO2.3 rule 1); re-validating here would make two
+   *   validation authorities disagree about one turn. Sender idempotency
+   *   — the (from_scope, seq) high-water — is the SHELL's job
+   *   (NetScopeDO), which is why this method must be called exactly once
+   *   per adoption fact.
+   */
+  adopt(input: { from_scope: string; seq: number; cells: Cell[]; priors: Record<string, string> }): {
+    status: "applied" | "empty";
+    head: ScopeHead;
+    applied: string[];
+    conflicts: Array<{ key: string; ours: string; theirs: string }>;
+  } {
+    const accepted: Cell[] = [];
+    const conflicts: Array<{ key: string; ours: string; theirs: string }> = [];
+    for (const cell of input.cells) {
+      const ours = this.store.get(cell.key)?.version ?? "absent";
+      const prior = input.priors[cell.key];
+      if (prior !== undefined && prior !== ours) {
+        conflicts.push({ key: cell.key, ours, theirs: cell.version });
+        continue;
+      }
+      accepted.push(cell);
+    }
+    if (accepted.length === 0) {
+      // Nothing applied: the head does not advance (an all-conflict
+      // adoption changes no owner state, so minting an owner event for
+      // it would fan out a no-op), but the conflicts still surface for
+      // the caller to count.
+      return { status: "empty", head: this.headState, applied: [], conflicts };
+    }
+
+    // One head advance for the batch. The digest marker names the
+    // adoption fact — the committing scope and ITS seq — so the rolling
+    // hash is deterministic and the tail entry stays legible in the
+    // recovery log (`adopt:<from_scope>:<from_seq>` in place of a
+    // transcript hash: adoptions have no transcript of their own).
+    const marker = `adopt:${input.from_scope}:${input.seq}`;
+    const nextHead: ScopeHead = {
+      seq: this.headState.seq + 1,
+      hash: cellVersion([this.headState.hash, this.headState.seq + 1, marker])
+    };
+    const nextStamp: EpochStamp = { scope_head: `${nextHead.seq}:${nextHead.hash}`, catalog_epoch: this.catalogEpoch };
+    const appliedKeys: string[] = [];
+    for (const cell of accepted) {
+      // Re-commit through the store (never a raw install): the value is
+      // the committing scope's, but the authority stamp — provenance +
+      // the NEW owner head — is minted here, because from this moment
+      // the owner is the cell's one authority (CO2.1).
+      const committed = this.store.commit({
+        kind: cell.kind,
+        object: cell.object,
+        ...(cell.name !== undefined ? { name: cell.name } : {}),
+        value: cell.value,
+        stamp: nextStamp
+      });
+      appliedKeys.push(committed.key);
+    }
+    appliedKeys.sort();
+    this.headState = nextHead;
+    const tailEntry = { seq: nextHead.seq, transcript_hash: marker, touched: appliedKeys };
+    this.tail.push(tailEntry);
+    if (this.tail.length > this.options.tailLimit) this.tail.splice(0, this.tail.length - this.options.tailLimit);
+
+    // Write-through (CO5 copy #1): identical discipline to submit's
+    // accept path — cells, head, and tail in ONE transaction, so a crash
+    // between the adopt reply and the owner's own fanout drain can never
+    // leave them disagreeing.
+    const durable = this.options.durable;
+    if (durable) {
+      durable.transaction(() => {
+        for (const key of appliedKeys) {
+          const cell = this.store.get(key);
+          if (cell) durable.writeCell(cell);
+        }
+        durable.writeMeta({ scope: this.scope, catalog_epoch: this.catalogEpoch, head: this.headState });
+        durable.appendTail(tailEntry);
+        durable.trimTail(this.options.tailLimit);
+      });
+    }
+    return { status: "applied", head: this.headState, applied: appliedKeys, conflicts };
+  }
+
   /** The scope's bounded recovery log (CO5: read by the scope alone). */
   recoveryTail(): ReadonlyArray<{ seq: number; transcript_hash: string; touched: string[] }> {
     return this.tail;

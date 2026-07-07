@@ -393,17 +393,43 @@ describe("differential gate: v2-native vs net commit layer (CO12.4)", () => {
       expect(reply.status, `side B ${turn.id} (${turn.verb}): ${JSON.stringify(reply)}`).toBe("accepted");
       if (reply.status !== "accepted") return;
       observationsB.push(plan.transcript.observations);
+      const riderCellsByOwner = new Map<string, Array<NonNullable<ReturnType<CellStore["get"]>>>>();
       for (const key of reply.touched) {
         const cell = target.store.get(key);
         if (cell) view.install(cell);
         else view.delete(key);
-        // Rider adoption: accepted rider cells committed at the shared
-        // scope flow to their owning scope, which installs them as
-        // authoritative (authoritative-into-authority install). In the
-        // real system this forward is the Phase-3 GatewayDO's job via the
-        // durable outbox (CO2.7); the harness performs it inline.
-        const owner = cell ? sequencers.get(classifier2.scopeOf(cell.object)) : undefined;
-        if (cell && owner && owner !== target) owner.store.install(cell);
+        // Collect accepted rider cells for their owners (below).
+        const ownerScope = cell ? classifier2.scopeOf(cell.object) : undefined;
+        if (cell && ownerScope !== undefined && ownerScope !== turn.scope) {
+          riderCellsByOwner.set(ownerScope, [...(riderCellsByOwner.get(ownerScope) ?? []), cell]);
+        }
+      }
+      // Rider adoption: accepted rider cells committed at the shared
+      // scope flow to their owning scope as an OWNER-SEQUENCED commit
+      // (CO2.3 rule 2, seq.adopt) — per-cell prior CAS against the
+      // version this turn observed (the attested version), ONE owner
+      // head advance per batch, adopted cells stamped with the NEW owner
+      // head. In the real system this forward is the scope DO's durable
+      // outbox (CO2.7); the harness performs it inline.
+      for (const [ownerScope, cells] of riderCellsByOwner) {
+        const owner = sequencers.get(ownerScope) as ScopeSequencer;
+        const priors: Record<string, string> = {};
+        for (const cell of cells) {
+          const attested = attestations[ownerScope]?.cells.find((entry) => entry.key === cell.key);
+          if (attested) priors[cell.key] = attested.version;
+        }
+        const headBefore = owner.head().seq;
+        const adopted = owner.adopt({ from_scope: turn.scope, seq: reply.head.seq, cells, priors });
+        expect(adopted.status, `${turn.id} adoption at ${ownerScope}`).toBe("applied");
+        expect(adopted.conflicts, `${turn.id} adoption conflicts at ${ownerScope}`).toEqual([]);
+        // The owner's head ADVANCED on adoption, and the adopted cells
+        // stamp the new head (an owner-ordered event, CO8).
+        expect(owner.head().seq, `${turn.id} owner head advance`).toBe(headBefore + 1);
+        for (const key of adopted.applied) {
+          expect(owner.store.get(key)?.stamp.scope_head, `${turn.id} adopted stamp ${key}`).toBe(
+            `${owner.head().seq}:${owner.head().hash}`
+          );
+        }
       }
     }
 
@@ -442,6 +468,13 @@ describe("differential gate: v2-native vs net commit layer (CO12.4)", () => {
     expect(cluster.store.get(`property_cell:${actor}:greeted`)?.provenance).toBe("authoritative");
     expect(shared.store.get("property_cell:diff2_room:visits")?.value).toMatchObject({ value: 2 });
     expect(shared.head().seq).toBe(2);
-    expect(cluster.head().seq).toBe(1);
+    // The cluster's head counts its OWN commits and the adoptions it
+    // sequenced: adopt(greet 1) + moveto + adopt(greet 2) = 3 (CO2.3
+    // rule 2 — adoption is an owner-sequenced commit).
+    expect(cluster.head().seq).toBe(3);
+    // The last adoption's cells carry the cluster's current head stamp.
+    expect(cluster.store.get(`property_cell:${actor}:greeted`)?.stamp.scope_head).toBe(
+      `${cluster.head().seq}:${cluster.head().hash}`
+    );
   });
 });

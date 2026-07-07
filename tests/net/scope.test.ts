@@ -3,7 +3,7 @@
 // semantics (stale-head, read-version, post-state, replay) against the
 // net sequencer.
 import { describe, expect, it } from "vitest";
-import { CellStore } from "../../src/net/cells";
+import { CellStore, cellVersion } from "../../src/net/cells";
 import { applyTranscript, type EffectTranscript } from "../../src/net/transcript";
 import { ScopeSequencer, type CommitSubmit } from "../../src/net/scope";
 
@@ -284,6 +284,113 @@ describe("rider read attestation (CO2.3)", () => {
     // consulted when `owns` is wired.
     const submit = { ...submitFor(seq, riderReadTranscript(version), "k1"), attestations: attestationAt("some-other-version") };
     expect(seq.submit(submit).status).toBe("accepted");
+  });
+});
+
+// CO2.3 rider integrity, rule 2: adoption is an owner-sequenced commit —
+// per-cell prior-version CAS (owner-wins on mismatch, named conflicts),
+// ONE head advance per applied batch, adopted cells stamped with the new
+// head, and a tail entry naming the adoption fact.
+describe("owner-sequenced adoption (CO2.3)", () => {
+  const GREETED = "property_cell:#actor:greeted";
+  const LIVE = "object_live:#actor";
+
+  function ownerWith(greeted: unknown): ScopeSequencer {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seq.seed([{ kind: "property_cell", object: "#actor", name: "greeted", value: greeted }]);
+    return seq;
+  }
+
+  /** An incoming adopted cell as the committing scope ships it (its own
+   * stamp; the version is the value's content address either way). */
+  function incoming(key: string, kind: "property_cell" | "object_live", name: string | undefined, value: unknown) {
+    return {
+      key,
+      kind,
+      object: "#actor",
+      ...(name !== undefined ? { name } : {}),
+      value,
+      version: cellVersion(value),
+      provenance: "authoritative" as const,
+      stamp: { scope_head: "9:committing-scope-head", catalog_epoch: EPOCH }
+    };
+  }
+
+  it("applies a matching batch as ONE owner commit: head advances once, cells stamp the new head, tail names the adoption", () => {
+    const seq = ownerWith({ value: 0 });
+    const prior = seq.store.get(GREETED)?.version as string;
+    const result = seq.adopt({
+      from_scope: "room_w",
+      seq: 5,
+      cells: [
+        incoming(GREETED, "property_cell", "greeted", { value: 1 }),
+        incoming(LIVE, "object_live", undefined, { location: "room_w" })
+      ],
+      priors: { [GREETED]: prior } // LIVE ships no prior: a blind write, applied owner-ordered
+    });
+    expect(result.status).toBe("applied");
+    expect(result.applied).toEqual([LIVE, GREETED].sort());
+    expect(result.conflicts).toEqual([]);
+    // One head advance for the two-cell batch.
+    expect(seq.head().seq).toBe(1);
+    expect(result.head).toEqual(seq.head());
+    // Adopted cells are authoritative AT THE NEW HEAD (CO8): the owner
+    // minted the stamp; the committing scope's stamp does not survive.
+    for (const key of result.applied) {
+      const cell = seq.store.get(key);
+      expect(cell?.provenance).toBe("authoritative");
+      expect(cell?.stamp.scope_head).toBe(`${seq.head().seq}:${seq.head().hash}`);
+    }
+    expect(seq.store.get(GREETED)?.value).toEqual({ value: 1 });
+    // The recovery tail names the adoption fact in transcript_hash form.
+    expect(seq.recoveryTail()).toEqual([{ seq: 1, transcript_hash: "adopt:room_w:5", touched: result.applied }]);
+  });
+
+  it("owner-wins on a prior mismatch: the conflict is named, applied cells still land, the head still advances", () => {
+    const seq = ownerWith({ value: 42 }); // the owner moved inside the window
+    const result = seq.adopt({
+      from_scope: "room_w",
+      seq: 6,
+      cells: [
+        incoming(GREETED, "property_cell", "greeted", { value: 1 }),
+        incoming(LIVE, "object_live", undefined, { location: "room_w" })
+      ],
+      priors: { [GREETED]: cellVersion({ value: 0 }) } // the committing turn observed the OLD value
+    });
+    expect(result.status).toBe("applied"); // the blind LIVE cell applied
+    expect(result.applied).toEqual([LIVE]);
+    expect(result.conflicts).toEqual([{ key: GREETED, ours: cellVersion({ value: 42 }), theirs: cellVersion({ value: 1 }) }]);
+    expect(seq.store.get(GREETED)?.value).toEqual({ value: 42 }); // owner survived
+    expect(seq.head().seq).toBe(1); // the applied cell is an owner event
+  });
+
+  it("an all-conflict adoption is empty: no head advance, no tail entry, conflicts surfaced", () => {
+    const seq = ownerWith({ value: 42 });
+    const result = seq.adopt({
+      from_scope: "room_w",
+      seq: 7,
+      cells: [incoming(GREETED, "property_cell", "greeted", { value: 1 })],
+      priors: { [GREETED]: cellVersion({ value: 0 }) }
+    });
+    expect(result.status).toBe("empty");
+    expect(result.applied).toEqual([]);
+    expect(result.conflicts).toHaveLength(1);
+    expect(seq.head().seq).toBe(0);
+    expect(seq.recoveryTail()).toEqual([]);
+    expect(seq.store.get(GREETED)?.value).toEqual({ value: 42 });
+  });
+
+  it('a prior of "absent" CASes against a missing cell (first ride-along write)', () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH); // no greeted cell at all
+    const result = seq.adopt({
+      from_scope: "room_w",
+      seq: 1,
+      cells: [incoming(GREETED, "property_cell", "greeted", { value: 1 })],
+      priors: { [GREETED]: "absent" }
+    });
+    expect(result.status).toBe("applied");
+    expect(seq.store.get(GREETED)?.value).toEqual({ value: 1 });
+    expect(seq.head().seq).toBe(1);
   });
 });
 
