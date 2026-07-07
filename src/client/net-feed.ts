@@ -483,6 +483,20 @@ export class NetFeed {
       if (!this.webSocketImpl) this.setConnection("idle");
       return;
     }
+    // A superseded socket (re-open() with a fresh session) is closed,
+    // not leaked; its handlers no-op via the `this.socket !== socket`
+    // identity guards below, so its in-flight turns are flushed HERE
+    // (they fall back to REST with their same idempotency keys).
+    if (this.socket) {
+      const previous = this.socket;
+      this.socket = null;
+      this.failInFlightTurns();
+      try {
+        previous.close();
+      } catch {
+        // A never-opened socket may throw on close.
+      }
+    }
     this.setConnection(this.reconnectAttempt > 0 ? "reconnecting" : "opening");
     const wsBase = this.baseUrl.replace(/^http/, "ws");
     const url = `${wsBase}/net-api/ws?session=${encodeURIComponent(this.session)}&token=${encodeURIComponent(this.apiKey)}`;
@@ -510,12 +524,18 @@ export class NetFeed {
       if (this.socket !== socket) return;
       this.socket = null;
       // In-flight WS turns fall back to REST with their same keys.
-      for (const [id, waiter] of [...this.wsInFlight]) {
-        this.wsInFlight.delete(id);
-        waiter.reject(new NetFeedError("E_RETRY", "socket closed before turn_result", 0));
-      }
+      this.failInFlightTurns();
       if (!this.closedByUser) this.scheduleReconnect();
     };
+  }
+
+  /** Flush every awaited WS turn_result: each waiter's reject resolves
+   * its turn to the REST-fallback path (see turnOverSocket). */
+  private failInFlightTurns(): void {
+    for (const [id, waiter] of [...this.wsInFlight]) {
+      this.wsInFlight.delete(id);
+      waiter.reject(new NetFeedError("E_RETRY", "socket closed before turn_result", 0));
+    }
   }
 
   private scheduleReconnect(): void {

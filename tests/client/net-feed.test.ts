@@ -362,6 +362,30 @@ describe("NetFeed reconnect", () => {
     expect(feed.state().connection).toBe("open");
   });
 
+  it("re-open() supersedes the old socket: closed (not leaked) and its in-flight turn falls back to REST with the same key", async () => {
+    const { feed, calls } = feedWith({
+      ...SESSION_ROUTE,
+      "POST /net-api/turn": () => ({ body: acceptedTurnResult() })
+    });
+    await feed.open();
+    const first = FakeSocket.instances[0];
+    first.open();
+    const turn = feed.turn({ target: "#bob", verb: "wave" });
+    await tick();
+    const wsKey = first.sent[0].idempotency_key;
+
+    await feed.open(); // fresh mint + fresh socket
+    expect(first.closed).toBe(true);
+    expect(FakeSocket.instances).toHaveLength(2);
+    const outcome = await turn;
+    expect(outcome.status).toBe("accepted");
+    const turnCall = calls.find((call) => call.path === "/net-api/turn");
+    expect((turnCall?.body as Record<string, unknown>).idempotency_key).toBe(wsKey);
+    // The dead socket's own close event must not clobber the new one.
+    first.drop();
+    expect(FakeSocket.instances).toHaveLength(2);
+  });
+
   it("close() stops reconnecting", async () => {
     const { feed } = feedWith(SESSION_ROUTE);
     await feed.open();
