@@ -57,7 +57,7 @@
  * nothing routes production traffic here until Phase 5.
  */
 import { CellStore, cellKey, type Cell } from "../../net/cells";
-import { budgetExhausted, isNetError, netError, type AttemptTraceEntry, type NetErrorCode } from "../../net/errors";
+import { budgetExhausted, isNetError, netError, NetError, type AttemptTraceEntry, type NetErrorCode } from "../../net/errors";
 import { applyFanout, type FanoutBody } from "../../net/outbox";
 import { relationKey, type RelationDelta, type RelationRow } from "../../net/relations";
 import { mintSessionSubmit, sessionCellKey, validateSessionCell } from "../../net/sessions";
@@ -799,14 +799,14 @@ export class NetGatewayDO {
           break;
         }
         case "stale_epoch": {
-          await this.tryRecovery(trace, async () => {
+          const reseeded = await this.tryRecovery(trace, async () => {
             // CO8 named reseed: drop every cell stamped with another
             // epoch (mirrored into SQLite), pull the scope's full
             // closure back, re-plan. The drop mutates memory BEFORE the
             // persist transaction, so the whole block is discard-on-throw
             // (fix 3): a failed persist rehydrates instead of leaving the
             // view missing cells SQLite still holds.
-            await this.discardViewOnThrow(async () => {
+            return await this.discardViewOnThrow(async () => {
               const stale = [...view.keys()].filter(
                 (key) => view.get(key)?.stamp.catalog_epoch !== request.catalog_epoch
               );
@@ -814,9 +814,28 @@ export class NetGatewayDO {
               this.state.storage.transactionSync(() => {
                 for (const key of stale) this.persistCell(view, key);
               });
-              await this.reseedFromScope(view, destination);
+              return await this.reseedFromScope(view, destination);
             });
           });
+          // M9: the reseed is only a recovery when the STALENESS was the
+          // view's. When the scope's DURABLE epoch still disagrees with
+          // the turn's stamp after a successful reseed, no amount of
+          // re-planning converges (the re-plan re-stamps the same epoch)
+          // — the pre-M9 behavior ground the whole repair budget to
+          // E_BUDGET. Surface the disagreement terminally instead: it is
+          // a catalog-install state, not turn mechanics. (A FAILED reseed
+          // stays on the budget path — the trace's recovery_error names
+          // it and a later round may still converge.)
+          if (reseeded !== undefined && reseeded.catalog_epoch !== request.catalog_epoch) {
+            // Carries the attempt trace like E_BUDGET does, so the
+            // terminal reply still explains its convergence shape (CO6).
+            throw new NetError(
+              "E_EPOCH_MISMATCH",
+              "turn epoch disagrees with the scope's durable epoch after reseed",
+              { scope: targetScope, turn_epoch: request.catalog_epoch, scope_epoch: reseeded.catalog_epoch },
+              trace
+            );
+          }
           break;
         }
         default:

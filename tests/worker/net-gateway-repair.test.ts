@@ -296,6 +296,63 @@ describe("NetGatewayDO repair loop (CO6/CO10)", () => {
   });
 });
 
+// ---- Epoch guard (pre-deploy fix M9) ---------------------------------------
+describe("epoch guard (M9)", () => {
+  it("refuses a seed whose epoch disagrees with the scope's durable epoch; same-epoch re-seed stays idempotent", async () => {
+    const { scopeDO, scopeEnv, close } = await seededScope();
+
+    // Idempotent re-seed at the SAME epoch: fine (the install pipeline's
+    // retry posture).
+    const again = await callRaw<{ ok?: boolean }>(scopeDO, scopeEnv, "/seed", {
+      scope: SCOPE,
+      catalog_epoch: EPOCH,
+      cells: []
+    });
+    expect(again.status).toBe(200);
+
+    // A DIFFERENT epoch refuses with the named terminal code — the
+    // pre-M9 behavior let ensureSequencer resolve the epoch from meta
+    // (meta wins) and silently stamped the new cells with the OLD epoch.
+    const mismatch = await callRaw<{ error: { code: string; detail?: Record<string, unknown> } }>(
+      scopeDO,
+      scopeEnv,
+      "/seed",
+      { scope: SCOPE, catalog_epoch: "cat-net-repair-2", cells: [] }
+    );
+    expect(mismatch.status).toBe(400);
+    expect(mismatch.body.error.code).toBe("E_EPOCH_MISMATCH");
+    expect(mismatch.body.error.detail).toMatchObject({ seed_epoch: "cat-net-repair-2", scope_epoch: EPOCH });
+
+    close();
+  });
+
+  it("a turn stamped with a different epoch than the scope's durable meta surfaces E_EPOCH_MISMATCH terminally, not E_BUDGET", async () => {
+    const { scopeDO, bumpCall, close } = await seededScope();
+    const gState = netState("gateway-m9");
+    const gEnv = gatewayEnvFor(scopeDO);
+    const gateway = new NetGatewayDO(gState.state, gEnv);
+    await call(gateway, gEnv, "/pull", { scope: SCOPE, destination: `scope:${SCOPE}` });
+
+    // The turn stamps an epoch the scope was never seeded at. The first
+    // round rejects stale_epoch (retryable); the CO8 reseed runs and
+    // SUCCEEDS — but the scope's durable epoch still differs, so no
+    // re-plan can converge. Pre-M9 this ground the whole budget to
+    // E_BUDGET; now the disagreement surfaces terminally with its trace.
+    const { status, body } = await callRaw<{
+      error: { code: string; detail?: Record<string, unknown>; attempts?: AttemptTraceEntry[] };
+    }>(gateway, gEnv, "/turn", { ...turnRequest(bumpCall("turn-m9-1"), "m9-t1"), catalog_epoch: "cat-net-repair-9" });
+    expect(status).toBe(400);
+    expect(body.error.code).toBe("E_EPOCH_MISMATCH");
+    expect(body.error.detail).toMatchObject({ turn_epoch: "cat-net-repair-9", scope_epoch: EPOCH });
+    // ONE stale_epoch round, then terminal — never the attempt ceiling.
+    expect(body.error.attempts).toHaveLength(1);
+    expect(body.error.attempts?.[0].code).toBe("E_STALE_EPOCH");
+
+    close();
+    gState.close();
+  });
+});
+
 // ---- Gateway turn edges (Phase-3 hardening fix 5) --------------------------
 describe("gateway turn edges (fix 5)", () => {
   it("an accepted commit whose warm cache-fill fails returns 200 with install_degraded, never a 500 (fix 5a)", async () => {

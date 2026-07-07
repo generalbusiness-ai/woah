@@ -539,6 +539,22 @@ export class NetScopeDO {
           catalog_epoch: string;
           cells: Array<Pick<Cell, "kind" | "object" | "name" | "value">>;
         };
+        // M9 seed-time epoch guard: a scope seeded at epoch A must refuse
+        // a seed stamped with epoch B — without this, ensureSequencer
+        // resolves the epoch from durable meta (meta wins) and the new
+        // cells would be SILENTLY stamped with the old epoch, hiding a
+        // catalog-install disagreement. Idempotent re-seed at the SAME
+        // epoch stays a no-op-shaped success (the install pipeline's
+        // retry posture). Epoch RECONCILIATION is the catalog migration
+        // path's job (aged-world lane), never a silent adoption here.
+        const durableEpoch = this.seq?.catalogEpoch ?? this.store.readMeta()?.catalog_epoch;
+        if (durableEpoch !== undefined && durableEpoch !== body.catalog_epoch) {
+          throw netError("E_EPOCH_MISMATCH", "seed epoch disagrees with the scope's durable epoch", {
+            scope: body.scope,
+            seed_epoch: body.catalog_epoch,
+            scope_epoch: durableEpoch
+          });
+        }
         const seq = this.ensureSequencer(body.scope, body.catalog_epoch);
         this.discardSeqOnThrow(() => seq.seed(body.cells));
         return json({ ok: true, scope: seq.scope, head: seq.head() });

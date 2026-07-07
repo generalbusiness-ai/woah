@@ -288,6 +288,7 @@ divergence. Tail metrics count by code.
 | `E_LINEAGE` | transfer lacking lineage closure | cannot occur by construction (CO7); assert/alarm |
 | `E_BUDGET` | repair budget exhausted | terminal; reply carries the attempt trace (each attempt's taxonomy code) |
 | `E_SEED_LAG` | KV seed behind scope head | informational; consumer proceeds via head-check |
+| `E_EPOCH_MISMATCH` | durable catalog epochs genuinely disagree: a seed against a scope seeded at another epoch, or a turn whose stamp still differs from the scope's durable epoch AFTER the CO8 reseed | terminal; catalog install/migration reconciles (operator concern), never a retry treadmill |
 
 Retryable codes are turn mechanics and never user-visible as failures;
 terminal codes surface to the caller with their trace.
@@ -321,7 +322,14 @@ Every durable artifact in copies #2–#5 stamps the epoch of its inputs:
 `(scope_head, catalog_epoch)`. Every consumer checks the stamp before use;
 a mismatch is a named self-healing reseed (`E_STALE_EPOCH`), never silent
 reuse. `catalog_epoch` advances on catalog install/upgrade; `scope_head`
-advances per commit. This generalizes the E1 discipline that landed for v2
+advances per commit. The reseed heals STALE COPIES only: when the durable
+epochs themselves disagree — a seed stamped with a different epoch than an
+already-seeded scope's meta, or a turn whose stamp still differs from the
+scope's durable epoch after a successful reseed — the condition is the
+terminal `E_EPOCH_MISMATCH` (CO6), surfaced with its attempt trace instead
+of grinding the repair budget; reconciliation is the catalog
+install/migration path's job. Idempotent re-seed at the SAME epoch remains
+a success. This generalizes the E1 discipline that landed for v2
 scope repair, and makes the aged-world lane (CO12) meaningful: an upgraded
 world converges by reseeding stamped copies, with the reseeds visible in
 tail metrics by code.

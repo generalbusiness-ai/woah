@@ -20,7 +20,11 @@ export type NetErrorCode =
   | "E_SCOPE_SPLIT"    // write set spans two distinct shared scopes (CO2.3)
   | "E_LINEAGE"        // transfer lacking lineage closure — cannot occur by construction; assert
   | "E_BUDGET"         // repair budget exhausted; carries the attempt trace
-  | "E_SEED_LAG";      // KV seed behind scope head; informational
+  | "E_SEED_LAG"       // KV seed behind scope head; informational
+  | "E_EPOCH_MISMATCH"; // durable catalog epochs genuinely disagree (M9): a seed
+                        // against a scope seeded at another epoch, or a turn whose
+                        // stamp still differs from the scope's durable epoch AFTER
+                        // the CO8 reseed — terminal, never a retry treadmill
 
 /** Recovery action per code (CO6 table). Kept as data so tail metrics and
  * operator tooling can render the defined recovery without a lookup table
@@ -33,7 +37,8 @@ export const NET_ERROR_RECOVERY: Record<NetErrorCode, string> = {
   E_SCOPE_SPLIT: "terminal; named limitation until CA10",
   E_LINEAGE: "cannot occur by construction (CO7); assert/alarm",
   E_BUDGET: "terminal; reply carries the attempt trace",
-  E_SEED_LAG: "informational; consumer proceeds via head-check"
+  E_SEED_LAG: "informational; consumer proceeds via head-check",
+  E_EPOCH_MISMATCH: "terminal; catalog install/migration must reconcile the epochs (operator concern)"
 };
 
 const RETRYABLE: ReadonlySet<NetErrorCode> = new Set([

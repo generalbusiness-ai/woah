@@ -18,7 +18,8 @@ const ALL_CODES: NetErrorCode[] = [
   "E_SCOPE_SPLIT",
   "E_LINEAGE",
   "E_BUDGET",
-  "E_SEED_LAG"
+  "E_SEED_LAG",
+  "E_EPOCH_MISMATCH"
 ];
 
 describe("net divergence taxonomy (CO6)", () => {
@@ -38,6 +39,9 @@ describe("net divergence taxonomy (CO6)", () => {
     expect(isRetryable(netError("E_BUDGET", "x"))).toBe(false);
     expect(isRetryable(netError("E_LINEAGE", "x"))).toBe(false);
     expect(isRetryable(netError("E_SEED_LAG", "x"))).toBe(false);
+    // M9: a genuine durable-epoch disagreement is terminal — retrying it
+    // is exactly the E_BUDGET treadmill the code exists to prevent.
+    expect(isRetryable(netError("E_EPOCH_MISMATCH", "x"))).toBe(false);
   });
 
   it("carries structured detail and identifies via isNetError", () => {
