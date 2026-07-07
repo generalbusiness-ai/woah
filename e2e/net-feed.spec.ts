@@ -149,8 +149,10 @@ async function waitForAnnexPresence(sessions: string[]): Promise<void> {
   await expect
     .poll(
       async () => {
+        // B1: the roster read carries a session present in the annex —
+        // sessions[0] is user A's, which entered the annex above.
         const res = await fetch(
-          `${base}/net-api/relation?relation=session_presence&owner=${encodeURIComponent("net_lane_annex")}`,
+          `${base}/net-api/relation?session=${encodeURIComponent(sessions[0])}&relation=session_presence&owner=${encodeURIComponent("net_lane_annex")}`,
           { headers: { authorization: `Bearer ${CLIENT_KEY_A}` } }
         );
         if (res.status !== 200) return false;
