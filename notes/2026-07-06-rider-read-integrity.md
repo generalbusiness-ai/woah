@@ -1,6 +1,9 @@
 # Rider-read integrity: the ride-along gap (Phase-3 review finding)
 
-Date: 2026-07-06. Status: interim guard LANDED (Phase-3 hardening pass,
+Date: 2026-07-06. Status: FULL DESIGN A+B IMPLEMENTED (a2655d1 +
+8ba00ff): plan-time /net/attest attestations validated at the committing
+scope (rider_unattested terminal), owner-sequenced adoption with head
+advance + owner-subscriber fanout. Earlier interim-guard status: LANDED (Phase-3 hardening pass,
 branch net-phase3): /net/adopt now CASes each cell against the prior
 version the committing turn observed (transcript read version, falling
 back to the committing scope's pre-commit residue copy), owner-wins on

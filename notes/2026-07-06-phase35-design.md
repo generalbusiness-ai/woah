@@ -121,8 +121,8 @@ owners.**
 
 ## Sequencing (Phase 3.5)
 
-1. CO2.3 amendment + /net/attest + owner-sequenced adopt (builds on the
-   interim guard).
+1. CO2.3 amendment + /net/attest + owner-sequenced adopt — DONE
+   (a2655d1, 8ba00ff).
 2. CO15 topology (anchor derivation + catalog scope + partitionCells) —
    unblocks removing request-supplied topology and enables real
    multi-scope lanes.

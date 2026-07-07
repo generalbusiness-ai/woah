@@ -110,10 +110,12 @@ that seam:
    `owns` predicate scopes what it validates against its own store.
 2. **Owner-sequenced adoption.** Rider writes reach their owner via
    `/net/adopt` and are applied as owner-ordered events with a per-cell
-   prior-version CAS (the version the committing turn observed). CAS
-   match → clean apply. Mismatch → **owner wins**, and the conflict is a
-   named, counted event (`net_adopt_conflict`) — never a silent
-   overwrite.
+   prior-version CAS (the attested version the committing turn
+   observed). **Adoption is an owner-sequenced commit: the owner's head
+   advances and adopted cells stamp the new head**, so owner observers
+   and catch-up see it like any commit. CAS match → clean apply.
+   Mismatch → **owner wins**, and the conflict is a named, counted event
+   (`net_adopt_conflict`) — never a silent overwrite.
 3. **The residual tear is named and bounded.** On a conflict, the
    committing scope's transcript already embedded the stale rider value
    in its post-state; that inconsistency is bounded by the attestation
@@ -473,4 +475,3 @@ One write path per fact (CO9), concretized:
 - Engine-side `schedules`/`cancellations` transcript fields (VTN18.2)
   remain deferred until the DSL exposes scheduling; `/net/schedule` is
   the substrate surface until then.
-
