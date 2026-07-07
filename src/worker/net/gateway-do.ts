@@ -59,7 +59,7 @@ import { planTurn, type PlanTurnInput, type PlanTurnResult } from "../../net/pla
 import type { ScopeClassifier } from "../../net/route";
 import { CATALOG_SCOPE, classifierFromLineage, type AnchorLineage } from "../../net/topology";
 import type { CommitReply, CommitSubmit, RejectReason, ScheduledTurn, ScopeHead } from "../../net/scope";
-import { netCellKeyFor } from "../../net/transcript";
+import { netCellKeyFor, type EffectTranscript } from "../../net/transcript";
 import type { CellTransfer } from "../../net/cells";
 import { verifyInternalRequest } from "../internal-auth";
 import { resolveNetDestination, WorkerdHost, type NetBindingsEnv } from "./workerd-host";
@@ -168,6 +168,25 @@ type TurnResult = {
   envelopeBytes: number;
   attempt: number;
   trace: AttemptTraceEntry[];
+  /** Phase-4 item 1: the planned transcript's verb return value and
+   * observations, carried on an ACCEPTED reply (the gateway holds the
+   * planned transcript — every transport needs the caller to see what
+   * its turn did). Omitted on rejected replies (nothing committed) and
+   * on detected idempotent replays (see `replayed`); `result` is also
+   * omitted when the verb returned nothing. */
+  result?: EffectTranscript["result"];
+  observations?: EffectTranscript["observations"];
+  /** Present (true) when the accepted reply is detectably the scope's
+   * RECORDED reply for an earlier submit of the same idempotency key
+   * (CO2.5): a fresh accept's post_state_version always equals this
+   * round's plan (CO4 step 10 rejects otherwise), so a differing digest
+   * proves the commit happened on a prior request. The re-planned
+   * transcript then describes a DIFFERENT execution than the one that
+   * committed, so result/observations are omitted rather than invented.
+   * A replay whose re-plan converged on the identical post-state is
+   * indistinguishable from (and equivalent to) a fresh accept, and
+   * carries the re-planned result/observations without this flag. */
+  replayed?: boolean;
   /** Present (true) when the commit was ACCEPTED but the post-accept
    * warm cache-fill (installTouched) failed (fix 5a): the commit is
    * durable at the scope; the view repairs itself on the next turn via
@@ -611,12 +630,23 @@ export class NetGatewayDO {
             );
           }
         }
+        // Phase-4 item 1: replay detection by post-state digest — see the
+        // TurnResult.replayed doc. A recorded reply (CO2.5) commits
+        // nothing this round, so this round's re-planned result would
+        // describe an execution that never happened; omit it honestly.
+        const replayed = reply.post_state_version !== submit.post_state_version;
         return {
           reply,
           selection: planned.selection,
           envelopeBytes: planned.envelopeBytes,
           attempt,
           trace,
+          ...(replayed
+            ? { replayed: true }
+            : {
+                ...(planned.transcript.result !== undefined ? { result: planned.transcript.result } : {}),
+                observations: planned.transcript.observations
+              }),
           ...(installDegraded ? { install_degraded: true } : {})
         };
       }

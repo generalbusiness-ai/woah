@@ -68,7 +68,12 @@ localdev/browser parity lanes.
 
 ## Progress log
 
-- [ ] 1. turn results + observations on the reply
+- [x] 1. turn results + observations on the reply — TurnResult carries
+      the planned transcript's `result`/`observations` on accepted
+      replies; an idempotent replay detected by post-state digest
+      mismatch (a fresh accept always digest-matches its own plan)
+      omits them and marks `replayed: true` instead of presenting the
+      re-planned execution as the committed one.
 - [ ] 2. /net-api REST surface + client auth + session requirement
 - [ ] 3. WS + observation push via session_presence
 - [ ] 4. client feed + echo overlay + framework adapter
