@@ -321,8 +321,9 @@ async function main(): Promise<number> {
 
     // ---- Phase-4 item 3: WS transport + observation push over REAL
     // workerd, driven with Node's NATIVE WebSocket client (the browser
-    // API shape — it cannot set request headers, which is exactly why
-    // the upgrade accepts ?token=; every other route stays header-only).
+    // API shape — it cannot set request headers, which is exactly why the
+    // upgrade authenticates by a single-use TICKET (B3), minted over HTTP;
+    // the apikey never rides the URL.
     // Two fresh client sessions transition into the ANNEX via sequenced
     // :welcome turns (a mint records no presence — entering IS the
     // transition), then A waves over its socket: the observation arrives
@@ -332,7 +333,7 @@ async function main(): Promise<number> {
     const wsBase = base.replace(/^http/, "ws");
     const wsToken = "apikey:lane-key:lane-secret";
     const refused = await new Promise<boolean>((resolve) => {
-      const ws = new WebSocket(`${wsBase}/net-api/ws?session=s_nope`); // no credential
+      const ws = new WebSocket(`${wsBase}/net-api/ws?ticket=wst_nope`); // invalid ticket
       ws.addEventListener("open", () => {
         ws.close();
         resolve(false);
@@ -381,10 +382,18 @@ async function main(): Promise<number> {
     });
     step("client sessions' presence rows reach the net-api mirror", wsPresence !== null);
 
-    const openSocket = (sid: string): Promise<{ ws: WebSocket; frames: Array<Record<string, unknown>> }> =>
-      new Promise((resolve, reject) => {
+    const openSocket = async (sid: string): Promise<{ ws: WebSocket; frames: Array<Record<string, unknown>> }> => {
+      // B3: mint a single-use ticket over authenticated HTTP, then connect
+      // with ?ticket= — the apikey never rides the WS URL.
+      const ticketRes = await fetch(`${base}/net-api/ws-ticket`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${wsToken}`, "content-type": "application/json" },
+        body: JSON.stringify({ session: sid })
+      });
+      const ticket = ((await ticketRes.json()) as { ticket?: string }).ticket ?? "";
+      return new Promise((resolve, reject) => {
         const collected: Array<Record<string, unknown>> = [];
-        const ws = new WebSocket(`${wsBase}/net-api/ws?session=${sid}&token=${encodeURIComponent(wsToken)}`);
+        const ws = new WebSocket(`${wsBase}/net-api/ws?ticket=${encodeURIComponent(ticket)}`);
         ws.addEventListener("message", (event) => {
           try {
             collected.push(JSON.parse(String((event as MessageEvent).data)) as Record<string, unknown>);
@@ -395,6 +404,7 @@ async function main(): Promise<number> {
         ws.addEventListener("open", () => resolve({ ws, frames: collected }));
         ws.addEventListener("error", () => reject(new Error(`ws open failed for ${sid}`)));
       });
+    };
     const socketA = await openSocket(sA);
     const socketB = await openSocket(sB);
     try {

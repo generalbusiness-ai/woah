@@ -29,7 +29,8 @@
  *   POST /net-api/turn {target,verb,args,session,idempotency_key} → TurnResult
  *   GET  /net-api/cell?key=                    → {key, cell}
  *   GET  /net-api/relation?relation=&owner=    → {relation, owner, members}
- *   GET  /net-api/ws?session=&token=           → WebSocket upgrade
+ *   POST /net-api/ws-ticket {session}          → {ticket, expires_at}  (B3)
+ *   GET  /net-api/ws?ticket=                   → WebSocket upgrade
  *     client→server frames: {type:"turn", id, target, verb, args, idempotency_key}
  *                           {type:"ping", id?}
  *     server→client frames: {type:"turn_result", id, status, ...TurnResult|{error}}
@@ -96,8 +97,8 @@ export type NetFeedOptions = {
   baseUrl: string;
   /** The full woo client credential: `apikey:<id>:<secret>` (the form
    * client-auth.ts parses). Sent as `authorization: Bearer <apiKey>` on
-   * HTTP and as `?token=` on the WS upgrade (the one carrier a browser
-   * WebSocket allows). */
+   * HTTP; the WS upgrade uses a short-lived single-use TICKET minted over
+   * HTTP (B3) so this permanent secret never rides the WS URL. */
   apiKey: string;
   fetchImpl?: NetFetchLike;
   webSocketImpl?: NetWebSocketCtor;
@@ -284,7 +285,10 @@ export class NetFeed {
     const reply = (await this.fetchJson("POST", "/net-api/session", body)) as SessionReply;
     this.session = reply.session;
     this.actor = reply.actor;
-    this.connectSocket();
+    // Await the initial socket CONSTRUCTION (B3 ticket mint + connect) so
+    // a caller that open()s then acts has a live socket; failures fall to
+    // the background reconnect loop. Reconnects (below) stay fire-and-forget.
+    await this.connectSocket();
     this.notifyState();
     return { session: reply.session, actor: reply.actor };
   }
@@ -484,7 +488,7 @@ export class NetFeed {
 
   // ---- Socket plumbing -----------------------------------------------------
 
-  private connectSocket(): void {
+  private async connectSocket(): Promise<void> {
     if (!this.webSocketImpl || !this.session || this.closedByUser) {
       // No WS runtime (or closed): REST-only operation, honestly stated.
       if (!this.webSocketImpl) this.setConnection("idle");
@@ -505,13 +509,42 @@ export class NetFeed {
       }
     }
     this.setConnection(this.reconnectAttempt > 0 ? "reconnecting" : "opening");
+    // B3: mint a short-lived single-use ticket over authenticated HTTP,
+    // then connect with `?ticket=` — the permanent apikey never rides the
+    // WS URL (it would leak through history/logs/traces). A mint failure
+    // (e.g. session expired) schedules a reconnect like any connect error.
+    const session = this.session;
+    let ticket: string;
+    try {
+      const reply = (await this.fetchJson("POST", "/net-api/ws-ticket", { session })) as { ticket: string };
+      ticket = reply.ticket;
+    } catch {
+      if (this.session === session && !this.closedByUser) this.scheduleReconnect();
+      return;
+    }
+    // A re-open()/close between mint and connect supersedes this attempt.
+    if (this.session !== session || this.closedByUser || !this.webSocketImpl) return;
     const wsBase = this.baseUrl.replace(/^http/, "ws");
-    const url = `${wsBase}/net-api/ws?session=${encodeURIComponent(this.session)}&token=${encodeURIComponent(this.apiKey)}`;
+    const url = `${wsBase}/net-api/ws?ticket=${encodeURIComponent(ticket)}`;
     let socket: NetSocketLike;
     try {
       socket = new this.webSocketImpl(url);
     } catch {
       this.scheduleReconnect();
+      return;
+    }
+    this.attachSocket(socket, session);
+  }
+
+  /** Wire a freshly-constructed socket's handlers (extracted from
+   * connectSocket for the async B3 ticket flow). */
+  private attachSocket(socket: NetSocketLike, session: string): void {
+    if (this.session !== session) {
+      try {
+        socket.close();
+      } catch {
+        /* never-opened */
+      }
       return;
     }
     this.socket = socket;
@@ -551,7 +584,7 @@ export class NetFeed {
     this.setConnection("reconnecting");
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
-      this.connectSocket();
+      void this.connectSocket();
     }, this.backoffMs(this.reconnectAttempt));
   }
 

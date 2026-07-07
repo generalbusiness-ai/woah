@@ -43,7 +43,7 @@ is correct and small. Document the tradeoff.)
 Tests: two identical submits under one key — second returns
 `replayed:true` with NO fabricated result/observations; head unchanged.
 
-### B3 — Long-lived apikey secret in the WS URL [SECURITY]
+### B3 — Long-lived apikey secret in the WS URL [SECURITY] — DONE
 `?token=apikey:<id>:<secret>` (client-auth.ts:53; net-feed.ts:501)
 leaks the PERMANENT credential via history/logs/traces.
 Fix: a short-lived WS ticket. `POST /net-api/ws-ticket` (authenticated

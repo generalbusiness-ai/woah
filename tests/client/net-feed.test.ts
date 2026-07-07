@@ -82,7 +82,9 @@ class FakeSocket implements NetSocketLike {
 const SESSION_ROUTE = {
   "POST /net-api/session": () => ({
     body: { session: "s_1", actor: "#alice", expires_at: 999, scope: "cluster:#alice" }
-  })
+  }),
+  // B3: NetFeed mints a single-use WS ticket over HTTP before connecting.
+  "POST /net-api/ws-ticket": () => ({ body: { ticket: "wst_test", expires_at: 999 } })
 };
 
 /** An accepted gateway TurnResult body (the /net-api/turn reply shape). */
@@ -134,7 +136,8 @@ describe("NetFeed open()", () => {
     // browser WebSocket allows) and opens asynchronously.
     expect(FakeSocket.instances).toHaveLength(1);
     const socket = FakeSocket.instances[0];
-    expect(socket.url).toBe(`wss://woo.test/net-api/ws?session=s_1&token=${encodeURIComponent(API_KEY)}`);
+    // B3: the socket connects with a single-use ticket, never the apikey.
+    expect(socket.url).toBe("wss://woo.test/net-api/ws?ticket=wst_test");
     expect(feed.state().connection).toBe("opening");
     socket.open();
     expect(feed.state().connection).toBe("open");
@@ -352,12 +355,14 @@ describe("NetFeed reconnect", () => {
 
     first.drop();
     expect(feed.state().connection).toBe("reconnecting");
-    await tick(); // backoffMs: () => 0
+    await tick(); // backoff timer (backoffMs: () => 0)
+    await tick(); // B3: the reconnect mints a WS ticket (async) before connecting
     expect(FakeSocket.instances).toHaveLength(2);
     const second = FakeSocket.instances[1];
-    // The session cell persists; re-register is just a new upgrade with
-    // the SAME session id (kickoff rule).
-    expect(second.url).toContain("session=s_1");
+    // The session cell persists; re-register is a fresh single-use ticket
+    // (minted for the SAME session id — kickoff rule; B3: no apikey in URL).
+    expect(second.url).toContain("ticket=");
+    expect(second.url).not.toContain("apikey");
     second.open();
     expect(feed.state().connection).toBe("open");
   });

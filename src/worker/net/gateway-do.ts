@@ -299,6 +299,13 @@ export class NetGatewayDO {
     state.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS net_gateway_pin (idempotency_key TEXT PRIMARY KEY, scope TEXT NOT NULL)"
     );
+    // B3: short-lived single-use WebSocket tickets. A ticket authenticates
+    // one upgrade so the permanent apikey never rides the WS URL. Durable
+    // (survives hibernation between mint and connect) but self-limiting:
+    // TTL-reaped on every mint, and each ticket is deleted on use.
+    state.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS net_gateway_ws_ticket (ticket TEXT PRIMARY KEY, session TEXT NOT NULL, actor TEXT NOT NULL, expires_at INTEGER NOT NULL)"
+    );
     this.host = new WorkerdHost({
       resolve: (destination) => resolveNetDestination(this.env, destination),
       env,
@@ -973,17 +980,24 @@ export class NetGatewayDO {
 
   private async clientApi(request: Request, url: URL): Promise<Response> {
     try {
-      // The WS upgrade may carry its credential as `?token=` — the ONLY
-      // route with the query carrier, because the WebSocket API (browser
-      // and Node-native alike) cannot set request headers; see
-      // parseClientCredential's queryToken note. Headers still win.
-      const wsUpgrade = request.method === "GET" && url.pathname === "/net-api/ws";
-      const credential = parseClientCredential(request.headers, wsUpgrade ? url.searchParams.get("token") : null);
+      // B3: the WS upgrade authenticates by a short-lived single-use
+      // TICKET (?ticket=), NOT the apikey. The WebSocket API cannot set
+      // request headers, so the only alternative — the permanent apikey
+      // in the URL — would leak through history/logs/traces. The ticket
+      // is minted over authenticated HTTP (POST /net-api/ws-ticket) and
+      // carries no long-lived secret. It is verified here, before the
+      // apikey path, so an upgrade never needs a credential in its URL.
+      if (request.method === "GET" && url.pathname === "/net-api/ws") {
+        return await this.clientWebSocketByTicket(request, url);
+      }
+
+      const credential = parseClientCredential(request.headers, null);
       const identity = await this.catalogIdentity();
       const { actor } = verifyApiKeyCredential(identity.map, credential);
 
-      if (request.method === "GET" && url.pathname === "/net-api/ws") {
-        return await this.clientWebSocket(request, url, actor);
+      if (request.method === "POST" && url.pathname === "/net-api/ws-ticket") {
+        const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+        return await this.mintWsTicket(actor, body);
       }
       if (request.method === "POST" && url.pathname === "/net-api/session") {
         const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
@@ -1220,38 +1234,67 @@ export class NetGatewayDO {
    * copy anywhere (CO5 stays at five): a dropped socket loses only
    * liveness; the session cell persists and a reconnect re-tags.
    */
-  private async clientWebSocket(request: Request, url: URL, actor: string): Promise<Response> {
+  /** POST /net-api/ws-ticket {session} — mint a single-use ~60s ticket
+   * bound to (session, actor) for a subsequent WS upgrade (B3). The
+   * session must be the caller's own live session. */
+  private async mintWsTicket(actor: string, body: Record<string, unknown>): Promise<Response> {
+    const session = typeof body.session === "string" ? body.session : "";
+    if (!session) {
+      return json({ error: { code: "E_INVARG", message: "ws-ticket requires a session" } }, 400);
+    }
+    await this.warmScopes([CATALOG_SCOPE, `cluster:${actor}`], "net_client_pull_miss_failed");
+    const verdict = validateSessionCell(this.ensureView().get(sessionCellKey(session)), this.host.now(), actor);
+    if (verdict !== "ok") {
+      return json({ error: { code: "E_NOSESSION", message: `session ${verdict}`, detail: { session_verdict: verdict } } }, 401);
+    }
+    const now = this.host.now();
+    // Reap expired tickets on mint — bounded cleanup, no separate reaper.
+    this.state.storage.sql.exec("DELETE FROM net_gateway_ws_ticket WHERE expires_at <= ?", now);
+    const ticket = `wst_${randomHex(24)}`;
+    const expiresAt = now + 60_000;
+    this.state.storage.sql.exec(
+      "INSERT INTO net_gateway_ws_ticket (ticket, session, actor, expires_at) VALUES (?, ?, ?, ?)",
+      ticket,
+      session,
+      actor,
+      expiresAt
+    );
+    return json({ ticket, expires_at: expiresAt });
+  }
+
+  /** GET /net-api/ws?ticket= — the WS upgrade, authenticated by a
+   * single-use ticket (B3): consume it, validate the bound session, and
+   * accept the socket. No apikey in the URL. */
+  private async clientWebSocketByTicket(request: Request, url: URL): Promise<Response> {
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
       return json({ error: { code: "E_INVARG", message: "expected Upgrade: websocket" } }, 400);
     }
-    // The hibernation surface and the WebSocketPair global are workerd
-    // runtime features; a structural harness without them gets a named
-    // refusal instead of an opaque TypeError.
     const accept = this.state.acceptWebSocket?.bind(this.state);
     const PairCtor = (globalThis as { WebSocketPair?: new () => { 0: WebSocket; 1: WebSocket } }).WebSocketPair;
     if (!accept || !PairCtor) {
       return json({ error: { code: "E_INTERNAL", message: "runtime does not support WebSocket upgrades" } }, 500);
     }
-    const session = url.searchParams.get("session") ?? "";
-    if (!session) {
-      return json(
-        {
-          error: {
-            code: "E_NOSESSION",
-            message: "WebSocket upgrade requires a session query param (CO14): POST /net-api/session first",
-            detail: { session_verdict: "session_required" }
-          }
-        },
-        401
-      );
+    const ticket = url.searchParams.get("ticket") ?? "";
+    if (!ticket) {
+      return json({ error: { code: "E_NOSESSION", message: "WS upgrade requires a ticket (POST /net-api/ws-ticket)", detail: { reason: "ticket_required" } } }, 401);
     }
+    // Consume the ticket single-use: read-then-delete in one transaction,
+    // so a replayed ticket URL cannot open a second socket.
+    const row = this.state.storage.transactionSync(() => {
+      const found = sqlRows<{ session: string; actor: string; expires_at: number }>(
+        this.state.storage.sql.exec("SELECT session, actor, expires_at FROM net_gateway_ws_ticket WHERE ticket = ?", ticket)
+      )[0];
+      if (found) this.state.storage.sql.exec("DELETE FROM net_gateway_ws_ticket WHERE ticket = ?", ticket);
+      return found;
+    });
+    if (!row || row.expires_at <= this.host.now()) {
+      return json({ error: { code: "E_NOSESSION", message: "ticket invalid or expired", detail: { reason: "ticket_invalid" } } }, 401);
+    }
+    const { session, actor } = row;
     await this.warmScopes([CATALOG_SCOPE, `cluster:${actor}`], "net_client_pull_miss_failed");
     const verdict = validateSessionCell(this.ensureView().get(sessionCellKey(session)), this.host.now(), actor);
     if (verdict !== "ok") {
-      return json(
-        { error: { code: "E_NOSESSION", message: `session ${verdict}`, detail: { session_verdict: verdict } } },
-        401
-      );
+      return json({ error: { code: "E_NOSESSION", message: `session ${verdict}`, detail: { session_verdict: verdict } } }, 401);
     }
     const pair = new PairCtor();
     const server = pair[1] as WebSocket & { serializeAttachment?(value: unknown): void };

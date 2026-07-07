@@ -122,16 +122,25 @@ async function clientFetch(
   return { status: response.status, body, ...(response.webSocket ? { webSocket: response.webSocket } : {}) };
 }
 
-/** WS upgrade against the gateway DO; returns the 101 (or refusal) plus
- * the fake SERVER socket the DO accepted (for frame assertions). */
+/** Mint a B3 WS ticket for a session over authenticated HTTP. */
+async function mintTicket(h: Harness, session: string, token = `apikey:${KEY_ID}:${KEY_SECRET}`): Promise<string> {
+  const res = await clientFetch(h.gateway, "POST", "/net-api/ws-ticket", { token, body: { session } });
+  if (res.status !== 200) throw new Error(`ws-ticket mint failed: ${res.status} ${JSON.stringify(res.body)}`);
+  return res.body.ticket as string;
+}
+
+/** WS upgrade against the gateway DO (B3: authenticated by a ticket, not
+ * the apikey). Returns the 101 (or refusal) plus the fake SERVER socket
+ * the DO accepted. `ticket` overrides the minted one (for invalid-ticket
+ * cases); pass null session to skip minting entirely. */
 async function upgrade(
   h: Harness,
   session: string | null,
-  opts: { token?: string; noUpgradeHeader?: boolean } = {}
+  opts: { ticket?: string; noUpgradeHeader?: boolean } = {}
 ): Promise<{ status: number; body: Record<string, unknown>; server: FakeWebSocket | null }> {
   const before = new Set(h.gatewayFake.getWebSockets());
-  const result = await clientFetch(h.gateway, "GET", `/net-api/ws${session !== null ? `?session=${session}` : ""}`, {
-    token: opts.token ?? `apikey:${KEY_ID}:${KEY_SECRET}`,
+  const ticket = opts.ticket ?? (session !== null ? await mintTicket(h, session) : null);
+  const result = await clientFetch(h.gateway, "GET", `/net-api/ws${ticket !== null ? `?ticket=${ticket}` : ""}`, {
     headers: opts.noUpgradeHeader ? {} : { upgrade: "websocket" }
   });
   const server = h.gatewayFake.getWebSockets().find((ws) => !before.has(ws)) ?? null;
@@ -301,43 +310,57 @@ async function buildHarness() {
 }
 
 describe("/net-api/ws socket surface (Phase 4 item 3 chunk 1)", () => {
-  it("refuses upgrades namedly: header, credential, session", async () => {
+  it("refuses upgrades namedly: header, ticket, and refuses ticket mint for bad key/foreign session (B3)", async () => {
     const h = await buildHarness();
+    const sid = await h.mint();
 
     // No Upgrade header: a plain GET is not a WebSocket.
-    const plain = await upgrade(h, "s_whatever", { noUpgradeHeader: true });
+    const plain = await upgrade(h, sid, { noUpgradeHeader: true });
     expect(plain.status).toBe(400);
     expect(plain.body.error).toMatchObject({ code: "E_INVARG" });
     expect(plain.server).toBeNull();
 
-    // Bad credential: the same 401 the REST surface gives.
-    const badKey = await upgrade(h, "s_whatever", { token: `apikey:${KEY_ID}:wrong` });
-    expect(badKey.status).toBe(401);
-    expect(badKey.body.error).toMatchObject({ code: "E_NOSESSION", detail: { reason: "secret_rejected" } });
-    expect(badKey.server).toBeNull();
+    // No ticket: the upgrade carries no apikey (B3), so a ticket is
+    // REQUIRED — the permanent credential never rides the URL.
+    const noTicket = await upgrade(h, null);
+    expect(noTicket.status).toBe(401);
+    expect(noTicket.body.error).toMatchObject({ code: "E_NOSESSION", detail: { reason: "ticket_required" } });
+    expect(noTicket.server).toBeNull();
 
-    // No session query param: sockets are session-addressed, so a
-    // session is REQUIRED (the CO14 client rule).
-    const noSession = await upgrade(h, null);
-    expect(noSession.status).toBe(401);
-    expect(noSession.body.error).toMatchObject({ code: "E_NOSESSION", detail: { session_verdict: "session_required" } });
-    expect(noSession.server).toBeNull();
+    // An unknown/forged ticket.
+    const badTicket = await upgrade(h, null, { ticket: "wst_forged" });
+    expect(badTicket.status).toBe(401);
+    expect(badTicket.body.error).toMatchObject({ code: "E_NOSESSION", detail: { reason: "ticket_invalid" } });
 
-    // A session the cluster never minted.
-    const bogus = await upgrade(h, "s_forged");
-    expect(bogus.status).toBe(401);
-    expect(bogus.body.error).toMatchObject({ code: "E_NOSESSION", detail: { session_verdict: "missing" } });
+    // A ticket is single-use: reusing one refuses the second upgrade.
+    const ticket = await mintTicket(h, sid);
+    const first = await upgrade(h, null, { ticket });
+    expect(first.status).toBe(101);
+    const reuse = await upgrade(h, null, { ticket });
+    expect(reuse.status).toBe(401);
+    expect(reuse.body.error).toMatchObject({ code: "E_NOSESSION", detail: { reason: "ticket_invalid" } });
 
-    // Another authenticated identity presenting this actor's session.
-    const sid = await h.mint();
-    const stolen = await upgrade(h, sid, { token: "apikey:ws-key-2:ws-secret-2" });
-    expect(stolen.status).toBe(401);
-    expect(stolen.body.error).toMatchObject({ code: "E_NOSESSION", detail: { session_verdict: "actor_mismatch" } });
+    // The ticket MINT is where apikey auth lives: a bad secret is refused.
+    const badMint = await clientFetch(h.gateway, "POST", "/net-api/ws-ticket", {
+      token: `apikey:${KEY_ID}:wrong`,
+      body: { session: sid }
+    });
+    expect(badMint.status).toBe(401);
+    expect(badMint.body.error).toMatchObject({ code: "E_NOSESSION", detail: { reason: "secret_rejected" } });
+
+    // Another authenticated identity cannot mint a ticket for THIS actor's
+    // session (the session's actor binding refuses it).
+    const stolenMint = await clientFetch(h.gateway, "POST", "/net-api/ws-ticket", {
+      token: "apikey:ws-key-2:ws-secret-2",
+      body: { session: sid }
+    });
+    expect(stolenMint.status).toBe(401);
+    expect(stolenMint.body.error).toMatchObject({ code: "E_NOSESSION", detail: { session_verdict: "actor_mismatch" } });
 
     h.close();
   });
 
-  it("accepts a valid upgrade tagged by session and serves turn/ping frames", async () => {
+  it("accepts a ticket upgrade tagged by session and serves turn/ping frames", async () => {
     const h = await buildHarness();
     const sid = await h.mint();
 
@@ -351,17 +374,8 @@ describe("/net-api/ws socket surface (Phase 4 item 3 chunk 1)", () => {
     // The attachment carries the validated identity across hibernation.
     expect(server.deserializeAttachment()).toMatchObject({ session: sid, actor: h.actor });
 
-    // The query-token carrier: the WebSocket API (browser and
-    // Node-native) cannot set headers, so the upgrade — and ONLY the
-    // upgrade — accepts ?token=apikey:...; every other route ignores
-    // the query param (headers stay the only credential carrier there).
-    const viaQuery = await clientFetch(
-      h.gateway,
-      "GET",
-      `/net-api/ws?session=${sid}&token=apikey:${KEY_ID}:${KEY_SECRET}`,
-      { headers: { upgrade: "websocket" } }
-    );
-    expect(viaQuery.status).toBe(101);
+    // B3: the apikey never rides the URL — the query token path is gone;
+    // every route authenticates by header (or, for the upgrade, ticket).
     const ignoredQuery = await clientFetch(h.gateway, "GET", `/net-api/cell?key=x&token=apikey:${KEY_ID}:${KEY_SECRET}`);
     expect(ignoredQuery.status).toBe(401);
     expect(ignoredQuery.body.error).toMatchObject({ code: "E_NOSESSION", detail: { reason: "missing_credential" } });
