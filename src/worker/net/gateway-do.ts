@@ -999,17 +999,23 @@ export class NetGatewayDO {
         if (!relation || !owner) {
           return json({ error: { code: "E_INVARG", message: "relation and owner query params are required" } }, 400);
         }
+        // B1: reads require the caller's session (the presence anchor) and
+        // are authorized against it — no global reads, no credential cells.
+        const session = this.readSession(url, actor);
+        this.authorizeRelationRead(actor, session, owner);
         return json({ relation, owner, members: this.relationMembers(relation, owner) });
       }
       if (request.method === "GET" && url.pathname === "/net-api/cell") {
         const key = url.searchParams.get("key") ?? "";
         if (!key) return json({ error: { code: "E_INVARG", message: "key query param is required" } }, 400);
+        const session = this.readSession(url, actor);
+        this.authorizeCellRead(actor, session, key);
         return json({ key, cell: this.ensureView().get(key) ?? null });
       }
       return json({ error: { code: "E_OBJNF", message: `no such route: ${request.method} ${url.pathname}` } }, 404);
     } catch (err) {
       if (err instanceof ClientAuthError) {
-        return json({ error: { code: err.code, message: err.message, detail: err.detail } }, 401);
+        return json({ error: { code: err.code, message: err.message, detail: err.detail } }, err.status);
       }
       if (isNetError(err)) {
         // Same taxonomy surfacing as the internal /net/turn handler
@@ -1434,6 +1440,128 @@ export class NetGatewayDO {
   /** The (relation, owner) member rows from the fanout-fed mirror — the
    * CO13 client-read primitive, shared by /net/relation (internal) and
    * /net-api/relation (client). */
+  /**
+   * B1 read authorization (deny-by-default). Authentication proves WHO the
+   * caller is; this proves WHAT they may see. Two hard rules plus a
+   * presence scope:
+   *
+   * 1. **Credential/system/bytecode cells are never readable by clients.**
+   *    The identity map (`property_cell:$system:api_keys`), bearer/pending
+   *    credential props, any `$system` cell, and verb bytecode are denied
+   *    outright — auth pulls the identity map into this very view, so
+   *    without this rule any key could read the salted-hash records.
+   * 2. **A caller sees its own identity + what it is co-present with.** The
+   *    caller's own actor and session cells are always allowed. Otherwise
+   *    a cell is readable only if its object is present in — or is — a
+   *    scope the caller's session occupies (CO13 session_presence /
+   *    contents in the mirror); a relation is readable only if its owner
+   *    is such a scope (or the caller's own actor). No global reads.
+   *
+   * `caller` is the authenticated actor; `session` is the caller's
+   * validated session id (required on reads — the presence anchor).
+   */
+  /** The caller's session from `?session=`, validated as a live cell bound
+   * to the authenticated actor (B1: reads are presence-scoped, so a valid
+   * session is the anchor). Throws ClientAuthError on a missing/invalid/
+   * foreign session. */
+  private readSession(url: URL, actor: string): string {
+    const session = url.searchParams.get("session") ?? "";
+    if (!session) {
+      throw new ClientAuthError("reads require a session query param (B1: presence-scoped)", { reason: "session_required" });
+    }
+    const verdict = validateSessionCell(this.ensureView().get(sessionCellKey(session)), this.host.now(), actor);
+    if (verdict !== "ok") {
+      throw new ClientAuthError(`session ${verdict}`, { session_verdict: verdict });
+    }
+    return session;
+  }
+
+  private callerPresenceScopes(session: string, caller: string): Set<string> {
+    // Where the caller is present. Three signals, all bounded to the
+    // caller's own state (never a global scan):
+    // 1. The caller's ACTOR's live location — you are present where your
+    //    actor stands. This is the primary, always-correct signal (a
+    //    freshly-minted session whose actor already occupies a room has a
+    //    null activeScope but is plainly present there).
+    // 2. The session cell's activeScope (the CO13 presence scope a
+    //    transition set) — a session that moved elsewhere than its actor's
+    //    static location.
+    // 3. session_presence rows for this session.
+    const scopes = new Set<string>();
+    const actorLive = this.ensureView().get(cellKey("object_live", caller));
+    const location = (actorLive?.value as { location?: unknown } | undefined)?.location;
+    if (typeof location === "string" && location) scopes.add(location);
+    const cell = this.ensureView().get(sessionCellKey(session));
+    const active = (cell?.value as { activeScope?: unknown } | undefined)?.activeScope;
+    if (typeof active === "string" && active) scopes.add(active);
+    const rows = sqlRows<{ owner: string }>(
+      this.state.storage.sql.exec(
+        "SELECT owner FROM net_gateway_relation WHERE relation = 'session_presence' AND member = ?",
+        session
+      )
+    );
+    for (const r of rows) scopes.add(r.owner);
+    return scopes;
+  }
+
+  private denyCredentialCell(key: string): boolean {
+    // key = <kind>:<object>[:<name>]
+    const parts = key.split(":");
+    const kind = parts[0];
+    const object = parts[1] ?? "";
+    const name = parts[2] ?? "";
+    if (kind === "verb_bytecode") return true; // clients never read bytecode
+    if (object === "$system") return true; // the whole system object
+    if (kind === "property_cell") {
+      // Credential-shaped property names anywhere, defensively.
+      if (name === "api_keys" || name === "bearer_tokens" || name === "pending_credentials") return true;
+    }
+    return false;
+  }
+
+  /** Authorize a cell read; throws ClientAuthError(403) on denial. */
+  private authorizeCellRead(caller: string, session: string, key: string): void {
+    if (this.denyCredentialCell(key)) {
+      throw new ClientAuthError("cell not readable", { key }, "E_PERM", 403);
+    }
+    const parts = key.split(":");
+    const kind = parts[0];
+    const object = parts[1] ?? "";
+    // Own identity is always readable: the caller's actor cells + its own
+    // session cell.
+    if (object === caller) return;
+    if (kind === "session" && object === session) return;
+    // Co-presence: the object IS one of the caller's rooms, or it LIVES in
+    // one. The object's own live cell location is the authoritative,
+    // lag-free membership signal (the contents relation mirror only
+    // materializes on commit/rebuild; a freshly-pulled object has its live
+    // cell but maybe not yet a roster row). Fall back to the contents
+    // roster for objects whose live cell the view lacks.
+    const scopes = this.callerPresenceScopes(session, caller);
+    if (scopes.has(object)) return;
+    const liveCell = this.ensureView().get(cellKey("object_live", object));
+    const location = (liveCell?.value as { location?: unknown } | undefined)?.location;
+    if (typeof location === "string" && scopes.has(location)) return;
+    for (const scope of scopes) {
+      const present = sqlRows<{ n: number }>(
+        this.state.storage.sql.exec(
+          "SELECT 1 AS n FROM net_gateway_relation WHERE relation = 'contents' AND owner = ? AND member = ? LIMIT 1",
+          scope,
+          object
+        )
+      );
+      if (present.length > 0) return;
+    }
+    throw new ClientAuthError("cell not readable in the caller's presence", { key }, "E_PERM", 403);
+  }
+
+  /** Authorize a relation read; throws ClientAuthError(403) on denial. */
+  private authorizeRelationRead(caller: string, session: string, owner: string): void {
+    if (owner === caller) return; // the caller's own relations
+    if (this.callerPresenceScopes(session, caller).has(owner)) return; // a room the caller is in
+    throw new ClientAuthError("relation not readable in the caller's presence", { owner }, "E_PERM", 403);
+  }
+
   private relationMembers(relation: string, owner: string): Array<{ member: string; body?: unknown }> {
     return sqlRows<{ member: string; body: string | null }>(
       this.state.storage.sql.exec(

@@ -447,12 +447,19 @@ export class NetFeed {
 
   // ---- Reads (cell / relation) -------------------------------------------
 
+  /** The open session, or throw — reads are presence-scoped (B1), so a
+   * read before open() is a client error surfaced named. */
+  private requireSession(): string {
+    if (!this.session) throw new NetFeedError("E_NOSESSION", "reads require an open session — call open() first", 0);
+    return this.session;
+  }
+
   /** GET /net-api/cell?key= — the cell body, or null. Cached (TTL-less;
    * invalidated by change signals — see the read-cache posture). */
   async cell(key: string): Promise<unknown> {
     const cacheKey = `cell ${key}`;
     if (this.readCache.has(cacheKey)) return this.readCache.get(cacheKey);
-    const reply = (await this.fetchJson("GET", `/net-api/cell?key=${encodeURIComponent(key)}`)) as {
+    const reply = (await this.fetchJson("GET", `/net-api/cell?session=${encodeURIComponent(this.requireSession())}&key=${encodeURIComponent(key)}`)) as {
       cell: unknown;
     };
     this.readCache.set(cacheKey, reply.cell ?? null);
@@ -468,7 +475,7 @@ export class NetFeed {
     }
     const reply = (await this.fetchJson(
       "GET",
-      `/net-api/relation?relation=${encodeURIComponent(relation)}&owner=${encodeURIComponent(owner)}`
+      `/net-api/relation?session=${encodeURIComponent(this.requireSession())}&relation=${encodeURIComponent(relation)}&owner=${encodeURIComponent(owner)}`
     )) as { members: Array<{ member: string; body?: unknown }> };
     const members = Array.isArray(reply.members) ? reply.members : [];
     this.readCache.set(cacheKey, members);

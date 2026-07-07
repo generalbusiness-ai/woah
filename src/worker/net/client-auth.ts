@@ -27,13 +27,20 @@ import { constantTimeEqual, hashSource } from "../../core/source-hash";
 
 /** Named client-auth failure; always an HTTP 401 E_NOSESSION upstream. */
 export class ClientAuthError extends Error {
-  readonly code = "E_NOSESSION";
+  readonly code: string;
+  readonly status: number;
   constructor(
     message: string,
-    readonly detail: Record<string, unknown> = {}
+    readonly detail: Record<string, unknown> = {},
+    // Defaults keep every existing throw (authentication failures) at
+    // E_NOSESSION/401; the B1 authorization denials pass E_PERM/403.
+    code = "E_NOSESSION",
+    status = 401
   ) {
     super(message);
     this.name = "ClientAuthError";
+    this.code = code;
+    this.status = status;
   }
 }
 

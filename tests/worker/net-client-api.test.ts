@@ -132,23 +132,30 @@ async function buildHarness() {
 
   const states: Array<ReturnType<typeof netState>> = [];
   const scopeDOs = new Map<string, NetScopeDO>();
+  const gateways = new Map<string, NetGatewayDO>();
   const resolve = (destination: string) => {
-    const scope = destination.startsWith("scope:") ? destination.slice("scope:".length) : null;
-    const instance = scope !== null ? scopeDOs.get(scope) : undefined;
-    if (!instance) throw new Error(`unresolvable destination ${destination}`);
-    return instance;
+    if (destination.startsWith("scope:")) {
+      const instance = scopeDOs.get(destination.slice("scope:".length));
+      if (!instance) throw new Error(`unresolvable destination ${destination}`);
+      return instance;
+    }
+    if (destination.startsWith("gateway:")) {
+      const instance = gateways.get(destination.slice("gateway:".length));
+      if (!instance) throw new Error(`unresolvable destination ${destination}`);
+      return instance;
+    }
+    throw new Error(`unresolvable destination ${destination}`);
   };
   const scopeEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve };
+  const { signInternalRequest } = await import("../../src/worker/internal-auth");
+  const signedTo = async (instance: NetScopeDO | NetGatewayDO, path: string, body: unknown) => {
+    const req = new Request(`https://do${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    return instance.fetch(await signInternalRequest(scopeEnv, req));
+  };
   for (const scope of [roomScope, clusterScope, CATALOG_SCOPE, `cluster:${other}`]) {
     const st = netState(`scope-${scope}`);
     const instance = new NetScopeDO(st.state, scopeEnv);
-    const seedRequest = new Request("https://do/net/seed", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ scope, catalog_epoch: EPOCH, cells: partitions.get(scope) ?? [] })
-    });
-    const { signInternalRequest } = await import("../../src/worker/internal-auth");
-    const seeded = await instance.fetch(await signInternalRequest(scopeEnv, seedRequest));
+    const seeded = await signedTo(instance, "/net/seed", { scope, catalog_epoch: EPOCH, cells: partitions.get(scope) ?? [] });
     expect(seeded.ok).toBe(true);
     states.push(st);
     scopeDOs.set(scope, instance);
@@ -158,6 +165,7 @@ async function buildHarness() {
   const gatewayState = netState("gateway-net-api");
   const gatewayEnv: NetGatewayEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve };
   const gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
+  gateways.set("net-api", gateway);
   states.push(gatewayState);
 
   return { gateway, actor, other, roomScope, close: () => states.forEach((st) => st.close()) };
@@ -187,11 +195,64 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     expect(unknown.status).toBe(401);
     expect(unknown.body.error).toMatchObject({ code: "E_NOSESSION", detail: { reason: "unknown_or_revoked" } });
 
-    // The x-woo-api-key carrier works (prefix optional).
+    // The x-woo-api-key carrier authenticates (prefix optional): the
+    // request gets PAST auth to the B1 session check — proven by the
+    // session_required verdict (not missing_credential), i.e. the
+    // credential was accepted.
     const viaHeader = await clientFetch(h.gateway, "GET", "/net-api/cell?key=object_live:capi_box", {
       headers: { "x-woo-api-key": `${KEY_ID}:${KEY_SECRET}` }
     });
-    expect(viaHeader.status).toBe(200);
+    expect(viaHeader.status).toBe(401);
+    expect(viaHeader.body.error).toMatchObject({ code: "E_NOSESSION", detail: { reason: "session_required" } });
+
+    h.close();
+  });
+
+  it("authorizes reads by presence and denies credential/foreign cells (B1)", async () => {
+    const h = await buildHarness();
+    const token = `apikey:${KEY_ID}:${KEY_SECRET}`;
+    const minted = await clientFetch(h.gateway, "POST", "/net-api/session", { token, body: { ttl_ms: 600_000 } });
+    expect(minted.status, JSON.stringify(minted.body)).toBe(200);
+    const sid = minted.body.session as string;
+    // A bump turn pulls capi_room into the gateway view; the caller is
+    // present where its actor stands (capi_room, from genesis placement),
+    // so its own-room cells/relation are readable with no transition.
+    const bumped = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+      token,
+      body: { target: "capi_box", verb: "bump", session: sid }
+    });
+    expect(bumped.status, JSON.stringify(bumped.body)).toBe(200);
+
+    // DENY: the credential cell — the acute case (auth pulled it into the
+    // view, so without B1 any key could read the salted-hash records).
+    const creds = await clientFetch(h.gateway, "GET", `/net-api/cell?session=${sid}&key=${encodeURIComponent("property_cell:$system:api_keys")}`, { token });
+    expect(creds.status).toBe(403);
+    expect(creds.body.error).toMatchObject({ code: "E_PERM" });
+
+    // DENY: verb bytecode (no client reason to read it).
+    const bytecode = await clientFetch(h.gateway, "GET", `/net-api/cell?session=${sid}&key=${encodeURIComponent("verb_bytecode:capi_box:bump")}`, { token });
+    expect(bytecode.status).toBe(403);
+
+    // ALLOW: the caller's own actor cell.
+    const own = await clientFetch(h.gateway, "GET", `/net-api/cell?session=${sid}&key=${encodeURIComponent("object_live:" + h.actor)}`, { token });
+    expect(own.status, JSON.stringify(own.body)).toBe(200);
+
+    // ALLOW: an object that lives in the caller's room.
+    const boxCell = await clientFetch(h.gateway, "GET", `/net-api/cell?session=${sid}&key=object_live:capi_box`, { token });
+    expect(boxCell.status, JSON.stringify(boxCell.body)).toBe(200);
+
+    // ALLOW: the room's contents relation (a room the caller is in).
+    const roster = await clientFetch(h.gateway, "GET", `/net-api/relation?session=${sid}&relation=contents&owner=capi_room`, { token });
+    expect(roster.status, JSON.stringify(roster.body)).toBe(200);
+
+    // DENY: a relation whose owner is a scope the caller is not present in.
+    const foreign = await clientFetch(h.gateway, "GET", `/net-api/relation?session=${sid}&relation=contents&owner=room:elsewhere`, { token });
+    expect(foreign.status).toBe(403);
+
+    // DENY: reads without a session (the presence anchor).
+    const noSession = await clientFetch(h.gateway, "GET", "/net-api/cell?key=object_live:capi_box", { token });
+    expect(noSession.status).toBe(401);
+    expect(noSession.body.error).toMatchObject({ detail: { reason: "session_required" } });
 
     h.close();
   });
@@ -270,10 +331,13 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     // mirror (content is proven in the workerd lane, where fanout
     // subscription feeds it; here the mirror is empty but the surface
     // answers).
-    const probe = await clientFetch(h.gateway, "GET", "/net-api/cell?key=property_cell:capi_box:counter", { token });
-    expect(probe.status).toBe(200);
+    // B1: reads carry the caller's session; the caller is present where its
+    // actor stands (capi_room), so both its box cell and the room roster
+    // are readable.
+    const probe = await clientFetch(h.gateway, "GET", `/net-api/cell?session=${sid}&key=property_cell:capi_box:counter`, { token });
+    expect(probe.status, JSON.stringify(probe.body)).toBe(200);
     expect((probe.body.cell as { value?: { value?: number } })?.value?.value).toBe(1);
-    const roster = await clientFetch(h.gateway, "GET", `/net-api/relation?relation=contents&owner=capi_room`, { token });
+    const roster = await clientFetch(h.gateway, "GET", `/net-api/relation?session=${sid}&relation=contents&owner=capi_room`, { token });
     expect(roster.status).toBe(200);
     expect(Array.isArray(roster.body.members)).toBe(true);
 

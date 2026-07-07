@@ -310,7 +310,7 @@ async function main(): Promise<number> {
     // closures carry relation rows — the CO13 pull coherence rule), so
     // the authenticated roster read shows it.
     const clientRoster = await poll(async () => {
-      const res = await fetch(`${base}/net-api/relation?relation=contents&owner=${encodeURIComponent("net_lane_room")}`, {
+      const res = await fetch(`${base}/net-api/relation?session=${mintBody.session}&relation=contents&owner=${encodeURIComponent("net_lane_room")}`, {
         headers: { authorization: "Bearer apikey:lane-key:lane-secret" }
       });
       if (res.status !== 200) return null;
@@ -371,7 +371,7 @@ async function main(): Promise<number> {
     // client shard's mirror (via the annex refan) before the wave.
     const wsPresence = await poll(async () => {
       const res = await fetch(
-        `${base}/net-api/relation?relation=session_presence&owner=${encodeURIComponent("net_lane_annex")}`,
+        `${base}/net-api/relation?session=${sA}&relation=session_presence&owner=${encodeURIComponent("net_lane_annex")}`,
         { headers: { authorization: `Bearer ${wsToken}` } }
       );
       if (res.status !== 200) return null;

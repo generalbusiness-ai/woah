@@ -146,8 +146,9 @@ describe("mintSessionSubmit → accepted at the cluster scope (CO14)", () => {
     // The session cell IS the bridge shape: expiry/creation ride the
     // SerializedSession field names.
     expect(value).toMatchObject({ id: "s1", actor: "#actor", started: NOW, expiresAt: NOW + 60_000 });
-    // CO2.5: a replayed open returns the recorded reply, no double commit.
-    expect(seq.submit(submit)).toEqual(reply);
+    // CO2.5: a replayed open returns the recorded reply (marked replayed
+    // per B2), no double commit.
+    expect(seq.submit(submit)).toEqual({ ...reply, replayed: true });
     expect(seq.head().seq).toBe(1);
   });
 

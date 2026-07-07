@@ -154,7 +154,7 @@ describe("NetScopeDO over fake-DO storage", () => {
     // and its SQLite survive; only the in-memory sequencer is lost).
     const second = new NetScopeDO(first.state, env);
     const replay = await call<CommitReply>(second, env, "/submit", submit);
-    expect(replay).toEqual(reply); // recorded reply, no double-commit
+    expect(replay).toEqual({ ...reply, replayed: true }); // recorded reply, marked (B2), no double-commit
     const head1 = (await call<{ head: ScopeHead }>(second, env, "/head")).head;
     expect(head1.seq).toBe(1);
 
@@ -241,9 +241,11 @@ describe("NetScopeDO over fake-DO storage", () => {
     expect(replay.status === "accepted" && replay.head.seq).toBe(1);
 
     // Idempotency after the successful commit still holds: same key →
-    // the recorded reply, head does not advance again.
+    // the recorded reply (marked replayed per B2), head does not advance.
+    // (`replay` above was the first fresh commit after the abort, not a
+    // replay, so it carries no marker.)
     const replayAgain = await call<CommitReply>(scope.instance, env, "/submit", submit);
-    expect(replayAgain).toEqual(replay);
+    expect(replayAgain).toEqual({ ...replay, replayed: true });
     const finalHead = (await call<{ head: ScopeHead }>(scope.instance, env, "/head")).head;
     expect(finalHead.seq).toBe(1);
     scope.close();

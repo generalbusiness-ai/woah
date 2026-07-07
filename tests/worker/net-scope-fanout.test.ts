@@ -238,7 +238,7 @@ describe("NetScopeDO fanout + rider adoption over fake-DO", () => {
       submit,
       rider_destinations: { [CLUSTER_SCOPE]: { destination: `scope:${CLUSTER_SCOPE}`, objects: ["#actor"] } }
     });
-    expect(resubmit).toEqual(reply);
+    expect(resubmit).toEqual({ ...reply, replayed: true });
     await room.settle();
     expect(outboxRows(room.state)).toEqual([]);
     expect(clusterRecorder.calls.filter((c) => c.path === "/net/adopt")).toHaveLength(1);

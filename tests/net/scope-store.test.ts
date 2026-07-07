@@ -62,9 +62,10 @@ describe("hydrate round-trip (CO5 copy #1)", () => {
     expect(b.store.get("object_lineage:#t")?.value).toEqual({ parent: null });
     expect(b.recoveryTail().map((e) => e.seq)).toEqual([1, 2]);
     expect(b.nextAlarmAt()).toBe(99);
-    // Idempotent replay of a pre-eviction key returns the RECORDED reply.
+    // Idempotent replay of a pre-eviction key returns the RECORDED reply
+    // (marked replayed per B2 — same verdict/head/touched otherwise).
     const replay = b.submit(submitFor(b, transcript("t2", "two"), "k2"));
-    expect(replay).toEqual(r2);
+    expect(replay).toEqual({ ...r2, replayed: true });
     expect(b.head().seq).toBe(2); // no double-commit
   });
 

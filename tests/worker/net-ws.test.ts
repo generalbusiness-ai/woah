@@ -448,7 +448,9 @@ describe("observation push via session_presence (Phase 4 item 3 chunk 2)", () =>
 
     // The mirror now names the annex audience (sanity for the fixture:
     // without these rows the push assertions below would be vacuous).
-    const roster = await clientFetch(h.gateway, "GET", "/net-api/relation?relation=session_presence&owner=ws_annex", {
+    // B1: the roster read carries the caller's session; s1 is present in
+    // ws_annex (entered above), so it may read the annex's presence.
+    const roster = await clientFetch(h.gateway, "GET", `/net-api/relation?session=${s1}&relation=session_presence&owner=ws_annex`, {
       token
     });
     const members = (roster.body.members as Array<{ member: string }>).map((row) => row.member);
