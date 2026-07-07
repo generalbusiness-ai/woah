@@ -28,8 +28,13 @@
  *       POST /net/seed      bootstrap/install path (also how tests build
  *                           a scope; the catalog install pipeline adopts
  *                           it in a later step)
- *       POST /net/subscribe {destination} → register a fanout receiver
- *                           (a gateway shard; maintained on session open)
+ *       POST /net/subscribe {destination, role?} → register a receiver.
+ *                           role "fanout" (default) receives /net/fanout
+ *                           deliveries (a gateway shard; maintained on
+ *                           session open); role "planner" registers a
+ *                           planner gateway for scheduled-turn execution
+ *                           (CO16) — it receives /net/plan-scheduled,
+ *                           never fanout
  *       POST /net/adopt     {from_scope, seq, cells, prior_versions?} →
  *                           CA3 rider adoption as an OWNER-SEQUENCED
  *                           commit (CO2.3): per-cell prior-version CAS,
@@ -54,10 +59,14 @@
  *     scope) in the SAME transaction as the commit write-through,
  *     then drain via host.defer — never on the reply path; leftover rows
  *     drain on the next request (drain-on-reactivation);
- *   - the alarm() wake path: pop due turns, emit a woo.metric line per
- *     fired turn (planning a scheduled turn arrives with the gateway
- *     machinery), and ALWAYS re-arm from nextAlarmAt() — the queue is
- *     scope state, so a parked task survives eviction (CO2.8).
+ *   - the alarm() wake path (CO16): when a planner-role subscriber is
+ *     registered, each due scheduled turn moves ATOMICALLY from the
+ *     scheduled row family to a durable /plan-scheduled outbox row (one
+ *     transaction — never lost, never duplicated) addressed to ONE
+ *     planner, then drains like any outbox lane; with no planner the due
+ *     turns stay parked with a named metric (the specified no-planner
+ *     state). ALWAYS re-arm from durable state — the queue is scope
+ *     state, so a parked task survives eviction (CO2.8).
  *
  * This class sits beside the v2 DO classes and shares nothing with them:
  * the standing v2 freeze continues, nothing routes production traffic
@@ -106,11 +115,16 @@ type RiderDestinations = Record<string, { destination: string; objects: string[]
  * construction. Absent (direct submits, tests) → every delta is local. */
 type RelateDestinations = Record<string, { destination: string; objects: string[] }>;
 
-/** The three outbox delivery surfaces. They drain as separate lanes so a
+/** The four outbox delivery surfaces. They drain as separate lanes so a
  * destination carrying several cannot collide row ids, and adoption/
- * relation delivery cannot be held behind a slow subscriber (or vice
- * versa). */
-type OutboxRoute = "/fanout" | "/adopt" | "/relate";
+ * relation/planner delivery cannot be held behind a slow subscriber (or
+ * vice versa). */
+type OutboxRoute = "/fanout" | "/adopt" | "/relate" | "/plan-scheduled";
+
+/** Subscriber roles (CO16): `fanout` receives /net/fanout deliveries;
+ * `planner` registers a planner gateway that executes scheduled turns
+ * via /net/plan-scheduled. One destination may hold both roles. */
+type SubscriberRole = "fanout" | "planner";
 
 /** The /adopt outbox body: FanoutBody plus the per-cell prior versions
  * the committing turn observed (the rider-read integrity interim guard —
@@ -119,6 +133,15 @@ type OutboxRoute = "/fanout" | "/adopt" | "/relate";
  * body opaquely and the JSON round-trip through net_scope_outbox keeps
  * the field). */
 type AdoptOutboxBody = FanoutBody & { prior_versions?: Record<string, string> };
+
+/** The /plan-scheduled outbox body (CO16): FanoutBody plus the scheduled
+ * turn and the epoch the planner must plan under. `seq` is NOT a scope
+ * head seq — scheduled dispatch does not advance the head — but the
+ * durable dispatch counter (net_scope_sched_dispatch), which keeps the
+ * outbox row id unique per turn and the planner lane's drain order equal
+ * to dispatch order. Same extra-field-only principle as AdoptOutboxBody:
+ * the src/net/outbox.ts FanoutBody type stays unchanged. */
+type PlanScheduledOutboxBody = FanoutBody & { scheduled_turn: ScheduledTurn; catalog_epoch: string };
 
 /** Rows out of a storage.sql cursor (both the real SqlStorageCursor and
  * the fake expose toArray()). */
@@ -310,9 +333,31 @@ export class NetScopeDO {
     // durable outbox (mirrors src/net/outbox.ts FanoutRow + a route
     // column), and the per-sender adoption high-water (CO2.5 receiver
     // idempotency for /net/adopt).
+    // Subscribers carry a role (CO16): fanout receivers vs the planner
+    // registry. PK is (destination, role) — one gateway commonly holds
+    // BOTH roles (it mirrors fanout AND executes scheduled turns). The
+    // pre-CO16 table was destination-only; migrate by the recreate idiom
+    // (SQLite cannot ALTER a primary key): probe for the role column and,
+    // when absent, rebuild the table in one transaction with existing
+    // rows carrying role='fanout' — they were fanout receivers by
+    // definition. Idempotent: a migrated (or fresh) table has the column
+    // and the probe passes.
     state.storage.sql.exec(
-      "CREATE TABLE IF NOT EXISTS net_scope_subscribers (destination TEXT PRIMARY KEY)"
+      "CREATE TABLE IF NOT EXISTS net_scope_subscribers (destination TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'fanout', PRIMARY KEY (destination, role))"
     );
+    const subscriberColumns = sqlRows<{ name: string }>(state.storage.sql.exec("PRAGMA table_info(net_scope_subscribers)"));
+    if (!subscriberColumns.some((column) => column.name === "role")) {
+      state.storage.transactionSync(() => {
+        state.storage.sql.exec("ALTER TABLE net_scope_subscribers RENAME TO net_scope_subscribers_legacy");
+        state.storage.sql.exec(
+          "CREATE TABLE net_scope_subscribers (destination TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'fanout', PRIMARY KEY (destination, role))"
+        );
+        state.storage.sql.exec(
+          "INSERT INTO net_scope_subscribers (destination, role) SELECT destination, 'fanout' FROM net_scope_subscribers_legacy"
+        );
+        state.storage.sql.exec("DROP TABLE net_scope_subscribers_legacy");
+      });
+    }
     state.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS net_scope_outbox (route TEXT NOT NULL, id TEXT NOT NULL, destination TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL, last_attempt_at_ms INTEGER, PRIMARY KEY (route, id))"
     );
@@ -340,6 +385,12 @@ export class NetScopeDO {
     // and its durable mirror keep the authoritative stamp so hydration
     // and post-state derivation stay byte-identical.
     state.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_scope_rider_cache (key TEXT PRIMARY KEY)");
+    // Scheduled-dispatch counter (CO16): a durable monotonic sequence for
+    // /plan-scheduled outbox rows. It must be durable — outbox row ids
+    // embed it (`<destination>/<scope>/<n>`), and a counter reset across
+    // eviction could re-mint the id of a still-pending row, whose
+    // ON CONFLICT DO NOTHING enqueue would silently swallow the new turn.
+    state.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_scope_sched_dispatch (id TEXT PRIMARY KEY, n INTEGER NOT NULL)");
     this.host = new WorkerdHost({
       resolve: (destination) => resolveNetDestination(this.env, destination),
       env,
@@ -407,12 +458,30 @@ export class NetScopeDO {
         return json(reply);
       }
       if (request.method === "POST" && url.pathname === "/net/subscribe") {
-        const body = (await request.json()) as { destination?: string };
+        const body = (await request.json()) as { destination?: string; role?: string };
         if (!body.destination) throw new Error("subscribe requires a destination");
+        // CO16 subscriber roles: default stays fanout (every pre-role
+        // caller keeps its behavior); an unknown role is a caller bug —
+        // refuse loudly rather than park it under a role nothing drains.
+        const role: SubscriberRole = (body.role ?? "fanout") as SubscriberRole;
+        if (role !== "fanout" && role !== "planner") {
+          throw new Error(`subscribe role must be "fanout" or "planner", got ${JSON.stringify(body.role)}`);
+        }
         this.state.storage.sql.exec(
-          "INSERT INTO net_scope_subscribers (destination) VALUES (?) ON CONFLICT(destination) DO NOTHING",
-          body.destination
+          "INSERT INTO net_scope_subscribers (destination, role) VALUES (?, ?) ON CONFLICT(destination, role) DO NOTHING",
+          body.destination,
+          role
         );
+        // A newly registered planner must pick up rows parked while no
+        // planner existed (rearmAlarm deliberately never arms for
+        // overdue rows): arm an immediate wake so the durable alarm()
+        // path — the single dispatch point — moves them to the outbox.
+        if (role === "planner") {
+          const now = this.host.now();
+          if (this.store.readScheduled().some((turn) => turn.at_logical_time <= now)) {
+            this.host.setAlarm(SCOPE_ALARM_KEY, now, async () => {});
+          }
+        }
         return json({ ok: true });
       }
       if (request.method === "POST" && url.pathname === "/net/adopt") {
@@ -497,12 +566,24 @@ export class NetScopeDO {
   }
 
   /**
-   * DO alarm wake (CO2.8). The sequencer rehydrates from durable state —
-   * in-memory callbacks never survive eviction, which is exactly why the
-   * durable path re-derives everything here. Phase 3 only OBSERVES fired
-   * turns (a woo.metric line each, rows left parked — fix 8a);
-   * planning/submitting the scheduled turn arrives with the Phase-3.5
-   * executor. Re-arming considers future turns and outbox retries.
+   * DO alarm wake (CO2.8, CO16). The sequencer rehydrates from durable
+   * state — in-memory callbacks never survive eviction, which is exactly
+   * why the durable path re-derives everything here.
+   *
+   * Scheduled-turn execution (CO16): PEEK first, then — only when a
+   * planner-role subscriber is registered — move each due turn from the
+   * scheduled row family to a durable /plan-scheduled outbox row in ONE
+   * transaction (the dueTurns pop joins it), so the turn changes family
+   * atomically: never lost (a crash before the transaction leaves it
+   * parked; after it, the outbox's at-least-once drain owns it) and
+   * never duplicated (it exists in exactly one family at any instant,
+   * and the planner's `sched:<id>:<at_logical_time>` idempotency key
+   * de-dupes redeliveries — CO2.5). With NO planner registered the due
+   * turns stay parked with the named metric — the specified no-planner
+   * state (fix 8a's non-destructive peek): destructively popping work
+   * nothing can execute would break CO2.8 silently. Re-arming considers
+   * only FUTURE turns (parked overdue rows cannot spin the alarm) and
+   * outbox retries.
    */
   async alarm(): Promise<void> {
     // Outbox liveness (fix 4a): a QUIET scope must still retry failed
@@ -521,27 +602,97 @@ export class NetScopeDO {
     }
     const seq = this.ensureSequencer(meta.scope, meta.catalog_epoch);
     const now = this.host.now();
-    // Fix 8a: PEEK, never pop. The executor that could actually run
-    // these turns lands in Phase 3.5; destructively popping them here
-    // would delete parked work the wake-up cannot execute (CO2.8 broken
-    // silently). Each due turn logs once per alarm-firing with a note;
-    // the rows stay parked, and the re-arm below considers only FUTURE
-    // turns so overdue rows cannot spin the alarm in a tight loop.
-    for (const turn of seq.peekDue(now)) {
-      console.log(
-        "woo.metric",
-        JSON.stringify({
-          kind: "net_scope_scheduled_turn_fired",
-          scope: seq.scope,
-          id: turn.id,
-          at_logical_time: turn.at_logical_time,
-          fired_at: now,
-          note: "parked: turn executor lands in Phase 3.5; row retained",
-          ts: Date.now()
-        })
-      );
+    const due = seq.peekDue(now);
+    if (due.length > 0) {
+      const planner = this.plannerDestination();
+      if (planner === null) {
+        // The specified no-planner state (CO16): rows stay parked, one
+        // named metric per due turn per alarm firing.
+        for (const turn of due) {
+          console.log(
+            "woo.metric",
+            JSON.stringify({
+              kind: "net_scope_scheduled_turn_fired",
+              scope: seq.scope,
+              id: turn.id,
+              at_logical_time: turn.at_logical_time,
+              fired_at: now,
+              note: "parked: no planner-role subscriber registered (CO16); row retained",
+              ts: Date.now()
+            })
+          );
+        }
+      } else {
+        // Atomic family move: outbox enqueue + scheduled-row pop share
+        // ONE transaction (dueTurns' internal transaction joins). The
+        // dueTurns pop mutates sequencer memory, so the whole block is
+        // discard-on-throw (fix 3): an aborted transaction rehydrates
+        // the queue from the rolled-back store instead of leaving
+        // memory ahead of SQLite.
+        this.discardSeqOnThrow(() =>
+          this.store.transaction(() => {
+            for (const turn of seq.dueTurns(now)) {
+              const dispatchBody: PlanScheduledOutboxBody = {
+                scope: seq.scope,
+                seq: this.nextScheduledDispatch(),
+                cells: [],
+                observations: [],
+                scheduled_turn: turn,
+                catalog_epoch: seq.catalogEpoch
+              };
+              this.persistOutboxRow("/plan-scheduled", planner, dispatchBody);
+            }
+          })
+        );
+        for (const turn of due) {
+          console.log(
+            "woo.metric",
+            JSON.stringify({
+              kind: "net_scope_scheduled_turn_dispatched",
+              scope: seq.scope,
+              id: turn.id,
+              at_logical_time: turn.at_logical_time,
+              fired_at: now,
+              planner,
+              ts: Date.now()
+            })
+          );
+        }
+        this.host.defer(() => this.drainOutbox());
+      }
     }
     this.rearmAlarm(now);
+  }
+
+  /**
+   * The planner destination for scheduled-turn dispatch (CO16): the
+   * lexicographically FIRST planner-role subscriber — deterministic, so
+   * repeated alarms (and re-fires after a crash) address the same
+   * planner and its reply cache. Each outbox row targets this SINGLE
+   * destination; failover to other planners is retry policy (the
+   * planner lane halts/backs off/abandons like any outbox lane —
+   * abandonment is the named net_scope_outbox_abandoned divergence, and
+   * multi-planner election is deliberately out of scope). Null when no
+   * planner is registered — the specified parked state.
+   */
+  private plannerDestination(): string | null {
+    const rows = sqlRows<{ destination: string }>(
+      this.state.storage.sql.exec(
+        "SELECT destination FROM net_scope_subscribers WHERE role = 'planner' ORDER BY destination ASC LIMIT 1"
+      )
+    );
+    return rows.length > 0 ? rows[0].destination : null;
+  }
+
+  /** Next durable scheduled-dispatch sequence number (see the
+   * net_scope_sched_dispatch comment in the constructor). Called only
+   * inside the alarm's move transaction. */
+  private nextScheduledDispatch(): number {
+    this.state.storage.sql.exec(
+      "INSERT INTO net_scope_sched_dispatch (id, n) VALUES ('dispatch', 1) ON CONFLICT(id) DO UPDATE SET n = n + 1"
+    );
+    const rows = sqlRows<{ n: number }>(this.state.storage.sql.exec("SELECT n FROM net_scope_sched_dispatch WHERE id = 'dispatch'"));
+    return Number(rows[0]?.n ?? 1);
   }
 
   /**
@@ -791,7 +942,7 @@ export class NetScopeDO {
   ): void {
     const observations = (submit.transcript.observations ?? []) as unknown[];
     const subscribers = sqlRows<{ destination: string }>(
-      this.state.storage.sql.exec("SELECT destination FROM net_scope_subscribers")
+      this.state.storage.sql.exec("SELECT destination FROM net_scope_subscribers WHERE role = 'fanout'")
     );
     if (subscribers.length > 0) {
       const cells = this.fanoutCells(seq, reply.touched);
@@ -973,7 +1124,7 @@ export class NetScopeDO {
   /** One drain pass over the route lanes; returns delivered-row count. */
   private async drainOutboxPass(): Promise<number> {
     let deliveredCount = 0;
-    for (const route of ["/fanout", "/adopt", "/relate"] as const) {
+    for (const route of ["/fanout", "/adopt", "/relate", "/plan-scheduled"] as const) {
         const persisted = sqlRows<{
           id: string;
           destination: string;
@@ -1025,6 +1176,22 @@ export class NetScopeDO {
                 from_scope: row.body.scope,
                 seq: row.body.seq,
                 deltas: row.body.relations ?? []
+              });
+            } else if (route === "/plan-scheduled") {
+              // CO16: deliver the scheduled turn to the planner gateway,
+              // which runs the normal turn machinery under the stable
+              // `sched:<id>:<at_logical_time>` idempotency key. A 200
+              // (any TurnResult, accepted or terminal-rejected) deletes
+              // the row below: at-least-once delivery + the committing
+              // scope's reply cache = fired exactly once, and a terminal
+              // verdict will not change on redelivery. A thrown rpc
+              // (planner down, E_BUDGET 400) retries on the lane's
+              // backoff and abandons as the named divergence.
+              const schedBody = row.body as PlanScheduledOutboxBody;
+              await this.host.rpc(row.destination, "/plan-scheduled", {
+                scheduled_turn: schedBody.scheduled_turn,
+                scope: schedBody.scope,
+                catalog_epoch: schedBody.catalog_epoch
               });
             } else {
               await this.host.rpc(row.destination, "/fanout", row.body);
@@ -1193,7 +1360,7 @@ export class NetScopeDO {
         // observations to ITS subscribers; this delivers the owner's
         // authoritative cell state.
         const subscribers = sqlRows<{ destination: string }>(
-          this.state.storage.sql.exec("SELECT destination FROM net_scope_subscribers")
+          this.state.storage.sql.exec("SELECT destination FROM net_scope_subscribers WHERE role = 'fanout'")
         );
         if (subscribers.length > 0) {
           const cells = this.fanoutCells(seq, result.applied);
@@ -1253,7 +1420,7 @@ export class NetScopeDO {
           changed.has(relationKey(delta.row.relation, delta.row.owner, delta.row.member))
         );
         const subscribers = sqlRows<{ destination: string }>(
-          this.state.storage.sql.exec("SELECT destination FROM net_scope_subscribers")
+          this.state.storage.sql.exec("SELECT destination FROM net_scope_subscribers WHERE role = 'fanout'")
         );
         for (const { destination } of subscribers) {
           this.persistOutboxRow("/fanout", destination, {
@@ -1298,10 +1465,13 @@ export class NetScopeDO {
   /** Always re-derive the wake-up from DURABLE scope state (never from
    * memory). Two keys feed the single storage alarm (WorkerdHost keeps
    * the earliest): the scheduled-turn wake and the outbox retry (fix
-   * 4a). Only FUTURE turns arm the clock (fix 8a): overdue rows are
-   * parked observations until the Phase-3.5 executor drains them —
-   * arming for them would fire the alarm in a tight loop that can do
-   * no useful work. */
+   * 4a). Only FUTURE turns arm the clock (fix 8a): an overdue row still
+   * in the scheduled family means no planner was registered when it
+   * fired (CO16's parked state — it dispatches on the first alarm after
+   * a planner subscribes, or on the next future turn's wake); arming for
+   * it would fire the alarm in a tight loop that can do no useful work.
+   * Dispatched rows live in the outbox family, whose retry alarm covers
+   * them. */
   private rearmAlarm(now: number): void {
     let nextFuture: number | null = null;
     for (const turn of this.store.readScheduled()) {
