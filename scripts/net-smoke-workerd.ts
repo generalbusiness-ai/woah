@@ -139,6 +139,29 @@ async function main(): Promise<number> {
     step("ride-along rider adopted at the actor's cluster scope (/net/adopt over real RPC)", adopted !== null,
       rideReply.status !== "accepted" ? `submit ${JSON.stringify(rideReply)}` : undefined);
 
+    // CO13 relations across two real scope DOs: a cross-scope move
+    // commits at the actor's CLUSTER; the ROOM — the foreign owner of
+    // the contents row — receives /net/relate through the durable
+    // outbox, applies it owner-sequenced, and refans it to its
+    // subscriber. The gateway's GET /net/relation (the who/contents
+    // client-read primitive) then serves the roster, proving the whole
+    // relate→apply→refan→mirror chain over real cross-DO RPC.
+    const clusterHead = (await get<{ head: ScopeHead }>(base, "scope", CLUSTER, "head")).head;
+    const moveReply = await post<CommitReply>(base, "scope", CLUSTER, "submit", {
+      submit: fixture.crossScopeMoveSubmit(clusterHead),
+      relate_destinations: { [ROOM]: { destination: `scope:${ROOM}`, objects: ["net_lane_room"] } }
+    });
+    const roster = moveReply.status === "accepted"
+      ? await poll(async () => {
+          const read = await get<{ members: Array<{ member: string }> }>(
+            base, "gateway", GATEWAY, `relation?relation=contents&owner=${encodeURIComponent("net_lane_room")}`
+          );
+          return read.members.some((m) => m.member === fixture.actor) ? read : null;
+        })
+      : null;
+    step("cross-scope move relates to the room and the gateway roster shows it (GET /net/relation)", roster !== null,
+      moveReply.status !== "accepted" ? `submit ${JSON.stringify(moveReply)}` : undefined);
+
     // Scheduled turn fires via a REAL workerd alarm (CO2.8 at lane level).
     metrics = [];
     await post(base, "scope", ROOM, "schedule", {
@@ -234,6 +257,7 @@ async function buildFixture() {
     return [scope, cells];
   });
   const roomCells = allPartitions.get(ROOM) as NetCellInput[];
+  const clusterCells = allPartitions.get(cluster) as NetCellInput[];
 
   const bump = (id: string): ShadowTurnCall => ({
     kind: "woo.turn_call.shadow.v1",
@@ -333,7 +357,48 @@ async function buildFixture() {
     };
   };
 
-  return { partitions, cluster, actor, turnRequest, rideAlongSubmit, directBumpSubmit };
+  /** CO13 cross-scope move: the actor (cluster-anchored, so the single
+   * authoritative movement write commits at ITS cluster — CA3) moves
+   * into the lane room. The contents/presence rows this derives are the
+   * ROOM's rows; the relate_destinations sibling names the room as their
+   * owner, and the room learns of them via /net/relate. `from: null`
+   * matches genesis (the placement already located the actor there), so
+   * the twin post-state is a same-value live-cell write — the step
+   * exercises relation delivery, not movement mechanics. */
+  const crossScopeMoveSubmit = (base: ScopeHead): CommitSubmit => {
+    const transcript = {
+      kind: "woo.effect_transcript.shadow.v1",
+      route: "sequenced",
+      scope: cluster,
+      seq: 1,
+      session: session.id,
+      call: { actor, target: actor, verb: "moveto", args: ["net_lane_room"], body: undefined },
+      reads: [],
+      writes: [],
+      creates: [],
+      moves: [{ object: actor, from: null, to: "net_lane_room" }],
+      observations: [],
+      logicalInputs: [],
+      untrackedEffects: [],
+      complete: true,
+      incompleteReasons: [],
+      hash: "lane-relate-move-1"
+    };
+    const twin = new ScopeSequencer(cluster, EPOCH);
+    twin.seed(clusterCells as never);
+    const derived = applyTranscript(twin.store, transcript as never, { scope_head: "x", catalog_epoch: EPOCH });
+    return {
+      kind: "woo.net.commit_submit.v1",
+      scope: cluster,
+      base,
+      idempotency_key: "lane-relate-move-1",
+      transcript: transcript as never,
+      post_state_version: derived.postStateVersion,
+      stamp: { scope_head: "x", catalog_epoch: EPOCH }
+    };
+  };
+
+  return { partitions, cluster, actor, turnRequest, rideAlongSubmit, directBumpSubmit, crossScopeMoveSubmit };
 }
 
 // ---- lane plumbing ---------------------------------------------------------

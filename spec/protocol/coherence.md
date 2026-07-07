@@ -410,17 +410,42 @@ One write path per fact (CO9), concretized:
 - **The applier runs at the committing scope.** On accept, the scope
   derives relation deltas from the transcript: `projectionWrites`
   (contents add/remove), moves (contents of the source and destination
-  parents), and session-scope transitions (presence). Deltas whose owner
-  object is anchored elsewhere are delivered to the owning scope via the
-  durable outbox (`POST /net/relate`, idempotent by `(from_scope, seq)`);
-  the owner applies them and refans to its own subscribers.
+  parents), and session-scope transitions (presence). Local deltas apply
+  in the SAME transaction as the commit; deltas whose owner object is
+  anchored elsewhere are delivered to the owning scope via the durable
+  outbox (`POST /net/relate`, idempotent by `(from_scope, seq)` — a
+  high-water separate from `/net/adopt`'s, because one turn can produce
+  both facts at the same `(from_scope, seq)`).
+- **Relation delivery applies owner-sequenced.** The owner applies a
+  delivered batch as one owner event — its head advances once, with a
+  `relate:<from_scope>:<seq>` recovery-tail entry (the adoption
+  discipline, CO2.3 rule 2) — and refans the applied deltas to its own
+  subscribers at the advanced seq. The advance is load-bearing:
+  subscriber gateways gate every `FanoutBody` by per-scope seq (CO2.5),
+  so a refan at an unadvanced head would silently no-op. An all-no-op
+  batch (idempotent re-adds, removes of absent rows) advances nothing
+  and refans nothing; the sender high-water still moves.
+- **Relation-owner topology is gateway knowledge** (the
+  `rider_destinations` rule): the gateway classifies the transcript's
+  relation-owner objects (move endpoints, create locations, contents
+  containers, transition rooms) and ships a `relate_destinations` submit
+  sibling; the sequencer partitions deltas through it and never learns
+  anchor topology itself.
 - `contents(parent) = { object | live:location:<object> == parent }`
   (CA4) remains the definitional truth; relation rows are its
   materialization, rebuildable by scanning live cells at the owner (the
-  repair path, bounded by scope size — CO11.1).
+  repair path, bounded by scope size — CO11.1). A multi-scope rebuild
+  drops candidates whose owner is anchored elsewhere: those rows belong
+  at the owning scope, and a local copy would be the CO9 dual write.
+- **The gateway mirror** is fed only by `FanoutBody.relations` (a
+  commit's local deltas, or a `/net/relate` refan) under the same
+  per-scope seq high-water that gates cells; `GET /net/relation
+  ?relation=&owner=` is the client-read primitive for who/contents.
 - **Fanout audiences** are computed from the `session_presence` relation
   (owner = the space, members = live sessions) — CO2.7's
   "O(distinct occupant shards)" gets its production definition here.
+  (Lands with CO14's session cells; until then fanout remains
+  per-subscriber.)
 
 ## CO14. Session authority and authentication
 

@@ -138,8 +138,25 @@ owners.**
    DOs and drives /net/turn with NO request topology — 8/8. The
    install-pipeline KV-seeding of the catalog closure stays with the
    install work item (named TODO in topology.ts).
-3. CO13 relations (applier + /net/relate + contents/presence) — unblocks
-   look/who and audience.
+3. CO13 relations (applier + /net/relate + contents/presence) — DONE
+   (branch net-phase35). src/net/relations.ts derives contents/presence
+   deltas from accepted transcripts (one write path — the committing
+   scope's applier); ScopeStore gained the sixth row family
+   (net_scope_relation); local deltas apply in the accept transaction and
+   ride FanoutBody.relations; foreign deltas ride the reply
+   (relations_foreign) and the shell delivers durable /net/relate rows
+   ((from_scope, seq) idempotent, separate high-water from /adopt). Two
+   decisions the spec text was refined to state: relate application is
+   OWNER-SEQUENCED (head advances once per applied batch so the refan
+   rides a real seq under the subscribers' CO2.5 gate), and
+   relation-owner topology ships as the gateway's relate_destinations
+   submit sibling (the rider_destinations rule — the sequencer never
+   learns anchors). The gateway mirrors rows into net_gateway_relation
+   under the fanout seq high-water; GET /net/relation is the who/
+   contents read primitive. Fanout audiences FROM presence stay with
+   CO14 (sessions are not cells yet). Lane: the workerd smoke commits a
+   cross-scope move at the real actor's cluster and reads the room
+   roster off the gateway — 9/9. Unblocks look/who and audience.
 4. CO14 sessions (mint + authorize + transition folding) — unblocks
    Phase-4 transports.
 5. CO16 scheduled execution — closes CO2.8.
