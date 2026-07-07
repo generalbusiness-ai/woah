@@ -101,5 +101,30 @@ localdev/browser parity lanes.
       Lane: two live sessions over real workerd — wave from socket A →
       turn_result with the observation at A, observations push at B,
       no duplicate at A (24/24).
-- [ ] 4. client feed + echo overlay + framework adapter
+- [x] 4. client feed + echo overlay + framework adapter —
+      `src/client/net-feed.ts` (NetFeed: injectable transports; session
+      mint + WS with reconnect-backoff, the session cell making
+      re-register a plain re-upgrade; turn() over the WS turn frame with
+      REST fallback — mid-turn socket death retries over REST under the
+      SAME idempotency key, CO2.5; TTL-less cell/relation read cache,
+      whole-cache invalidation on change signals — coarse on purpose:
+      the client holds no anchor topology, correctness comes from
+      re-read). **Echo decision:** Phase-4 echo is INTENT-PENDING +
+      reply-settled — the overlay holds the submitted intent keyed by
+      turn id, dropped on settle/reject; plan §3.6's predicted-write
+      overlay (transcript.ts apply in-browser) is deliberately a LATER
+      refinement (it needs the planner's view client-side; intent-pending
+      is the honest Phase-4 contract). Observation posture mirrors the
+      gateway: reply observations = source:"self", frames =
+      source:"peer" behind a per-scope (scope, seq) high-water plus a
+      bounded self-settled guard against a lost gateway echo-dedupe entry
+      (the reply never advances the FRAME high-water — that would drop
+      an in-flight earlier peer frame). `src/client/net-feed-adapter.ts`
+      wireNetFeed delivers feed events as route:"sequenced" with `space`
+      recovered from the CO15 `room:<space>` scope name — byte-equal to
+      the v2 ingestAppliedFrame reducer input, proven by a parity test
+      against the client-framework.test.ts note_edited fixture;
+      WooClientFramework satisfies the target structurally, nothing in
+      production imports it until Phase 5. Tests: tests/client/ (22)
+      joined the curated npm-test gate.
 - [ ] 5. e2e + cross-user fix + lane extension
