@@ -1,0 +1,22 @@
+<!doctype html>
+<!--
+  NetFeed e2e test page (Plan 002 Phase 4 item 5; e2e/net-feed.spec.ts).
+
+  E2E-ONLY: this page is NOT the SPA and is never deployed. The spec's
+  beforeAll bundles e2e/net-feed-page/entry.ts with esbuild into
+  net-feed-page.js beside a copy of this file in a temp directory, then
+  serves both from the SAME origin as the worker via
+  `wrangler dev -c wrangler.smoke.toml --assets <dir>` — so the page's
+  fetch + WebSocket hit /net-api with no CORS or proxy. The full SPA
+  integration is the Phase-5 cutover; this page exists to prove the
+  NetFeed surface in real browsers.
+-->
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>NetFeed e2e</title>
+  </head>
+  <body>
+    <script src="/net-feed-page.js"></script>
+  </body>
+</html>

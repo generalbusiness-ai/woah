@@ -7,13 +7,19 @@
 // ones) and drives NetGatewayDO/NetScopeDO through the /net-smoke doorway:
 // real per-DO SQLite, real cross-DO RPC, real alarms.
 //
+// The fixture and the workerd plumbing are SHARED with the Playwright e2e
+// lane (e2e/net-feed.spec.ts): scripts/net-smoke-fixture.ts holds the
+// engine-real world, scripts/net-smoke-harness.ts the lifecycle/doorway
+// helpers — one scenario, one fixture, per the smoke discipline. This
+// script is the Node HTTP/WS lane over that fixture.
+//
 // Topology is DERIVED (CO15, Phase 3.5 item 2): the world is split by
 // partitionCells into room/cluster/catalog scope DOs, and the /net/turn
 // requests carry NO anchors/shared/scopes — the gateway classifies from
 // its view's lineage cells and routes by the `scope:<scopeName>`
 // convention, in real workerd. Three runs:
 //
-//   run 1 (clean):   seed 4 partitions → subscribe → pull 4 → warm
+//   run 1 (clean):   seed the derived partitions → subscribe → pull → warm
 //                    derived-topology turns (CO10 structure: attempt
 //                    === 1, empty trace, envelope < 64 KB) → subscriber
 //                    fanout lands over real cross-DO RPC → ride-along
@@ -44,28 +50,22 @@
 //
 // Exit: 0 all steps pass, 1 any step fails, 2 harness crash.
 
-import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
-import { createServer } from "node:net";
-import { createInterface } from "node:readline";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { installVerb } from "../src/core/authoring";
-import { createWorld } from "../src/core/bootstrap";
-import { cellsFromSerialized, type NetCellInput, type ShadowTurnCall } from "../src/net/bridge";
-import { CATALOG_SCOPE, partitionCells } from "../src/net/topology";
-import { applyTranscript } from "../src/net/transcript";
-import { ScopeSequencer, type CommitReply, type CommitSubmit, type ScopeHead } from "../src/net/scope";
+import {
+  ANNEX,
+  EPOCH,
+  ROOM,
+  get,
+  poll,
+  post,
+  postRaw,
+  seedPartitions,
+  sleep,
+  withWorkerd
+} from "./net-smoke-harness";
+import { buildLaneFixture } from "./net-smoke-fixture";
+import type { CommitReply, ScopeHead } from "../src/net/scope";
 import type { AttemptTraceEntry } from "../src/net/errors";
 
-const EPOCH = "cat-net-lane-1";
-// CO15 derived scope names: the DO namespace key IS the scope name.
-const ROOM = "room:net_lane_room";
-// The CO14 session turn transitions INTO this second room: a freshly
-// minted session hydrates with activeScope = the actor's current location
-// (world.ts hydrateSession), so entering the room the actor already
-// occupies records no transition — the fold needs a real scope change.
-const ANNEX = "room:net_lane_annex";
 const GATEWAY = "lane-gw";
 
 type StepResult = { name: string; ok: boolean; detail?: string };
@@ -73,9 +73,23 @@ const results: StepResult[] = [];
 /** woo.metric lines parsed off workerd stdout. No step asserts on these
  * since CO16 made scheduled execution observable by its EFFECT (the
  * counter cell) instead of by metric; kept as the lane's diagnostics
- * channel — the readline consumer also keeps the child's stdout pipe
- * drained. */
+ * channel. */
 const metrics: Array<Record<string, unknown>> = [];
+const laneWorkerdOptions = {
+  onLine: (line: string): void => {
+    const at = line.indexOf("woo.metric ");
+    if (at >= 0) {
+      const brace = line.indexOf("{", at);
+      if (brace >= 0) {
+        try {
+          metrics.push(JSON.parse(line.slice(brace)) as Record<string, unknown>);
+        } catch {
+          /* not a metric line */
+        }
+      }
+    }
+  }
+};
 
 function step(name: string, ok: boolean, detail?: string): void {
   results.push({ name, ok, ...(detail ? { detail } : {}) });
@@ -83,17 +97,19 @@ function step(name: string, ok: boolean, detail?: string): void {
 }
 
 async function main(): Promise<number> {
-  const fixture = await buildFixture();
+  const fixture = await buildLaneFixture();
   const CLUSTER = fixture.cluster;
+  // Every partition seed is followed by a gateway pull, and each pull
+  // rides one /closure — run 3's skip_first counts them (dynamic: the
+  // fixture grows partitions, the fault window follows).
+  const pullCount = fixture.partitions.length;
 
-  /** Seed the four derived partitions (CO15 partitionCells) and pull
-   * each into the gateway's view: planning needs the room + annex cells,
-   * the actor's cluster (actor + session rows), and the catalog class
-   * chain. FOUR /closure pulls — run 3's skip_first counts them. */
+  /** Seed the derived partitions (CO15 partitionCells) and pull each
+   * into the gateway's view: planning needs the room + annex cells, the
+   * actors' clusters (actor + session rows), and the catalog class
+   * chain. */
   const seedAndPull = async (base: string): Promise<void> => {
-    for (const [scope, cells] of fixture.partitions) {
-      await post(base, "scope", scope, "seed", { scope, catalog_epoch: EPOCH, cells });
-    }
+    await seedPartitions(base, fixture.partitions);
     for (const [scope] of fixture.partitions) {
       await post(base, "gateway", GATEWAY, "pull", { scope, destination: `scope:${scope}` });
     }
@@ -116,7 +132,7 @@ async function main(): Promise<number> {
     // client sessions' presence rows (the WS push audience) and its
     // commit fanout carries the wave observations the push delivers.
     await post(base, "scope", ANNEX, "subscribe", { destination: "gateway:net-api" });
-    step("seed 4 partitions + subscribe room/annex + pull 4", true);
+    step(`seed ${pullCount} partitions + subscribe room/annex + pull ${pullCount}`, true);
 
     // Warm derived-topology turns: the CO10 structure gate at lane
     // level. The request carries NO anchors/shared/scopes — the
@@ -442,7 +458,7 @@ async function main(): Promise<number> {
       return closure.cells[0]?.value?.value === 3 ? closure : null;
     }, 15_000);
     step("scheduled turn executed by the planner gateway via real workerd alarm (counter 2→3)", bumped !== null);
-  });
+  }, laneWorkerdOptions);
 
   // ---- run 2: injected submit latency ------------------------------------
   console.log("run 2: 100ms /submit latency (latency is not divergence)");
@@ -454,14 +470,14 @@ async function main(): Promise<number> {
       turn.reply.status === "accepted" && turn.attempt === 1,
       `attempt=${turn.attempt}`
     );
-  });
+  }, laneWorkerdOptions);
 
   // ---- run 3: /closure error → E_BUDGET with taxonomy trace ---------------
   console.log("run 3: /closure fault → E_BUDGET with attempt trace");
-  // skip_first spares the FOUR clean partition pulls (each pull rides
-  // /closure); every later closure call — the repair loop's refreshes —
-  // faults.
-  await withWorkerd({ WOO_NET_FAULTS: JSON.stringify({ "/closure": { error: "lane closure fault", skip_first: 4 } }) }, async (base) => {
+  // skip_first spares the clean partition pulls (each pull rides
+  // /closure — pullCount of them); every later closure call — the repair
+  // loop's refreshes — faults.
+  await withWorkerd({ WOO_NET_FAULTS: JSON.stringify({ "/closure": { error: "lane closure fault", skip_first: pullCount } }) }, async (base) => {
     await seedAndPull(base);
     // Stale the view: mutate the scope directly, bypassing the gateway.
     const head = (await get<{ head: ScopeHead }>(base, "scope", ROOM, "head")).head;
@@ -477,420 +493,16 @@ async function main(): Promise<number> {
         trace.every((entry) => typeof entry.code === "string" && entry.code.startsWith("E_")),
       `code=${error?.code} trace=${trace.map((t) => t.code).join(",")}`
     );
-  });
+  }, laneWorkerdOptions);
 
   const failed = results.filter((r) => !r.ok);
   console.log(`\nsummary[net-smoke]: ${results.length - failed.length}/${results.length} steps passed`);
   return failed.length === 0 ? 0 : 1;
 }
 
-// ---- fixture --------------------------------------------------------------
-
-/** Engine-real fixture, SPLIT by partitionCells (CO15): a $space lane
- * room owning its anchored counter box (room partition), the real actor
- * + its session rows (cluster partition), and the class chain / seed
- * substrate (catalog partition). The gateway derives all topology from
- * these — turnRequest deliberately carries none. */
-async function buildFixture() {
-  const world = createWorld();
-  const session = world.auth("guest:net-lane");
-  const actor = session.actor;
-  world.createObject({ id: "net_lane_room", name: "Lane Room", parent: "$space", owner: actor });
-  world.createObject({ id: "lane_box", name: "Lane Box", parent: "$thing", owner: actor, anchor: "net_lane_room", location: "net_lane_room" });
-  world.defineProperty("lane_box", { name: "counter", defaultValue: 0, owner: actor, perms: "rw", typeHint: "int" });
-  const installed = installVerb(
-    world,
-    "lane_box",
-    "bump",
-    `verb :bump() rxd {
-      let before = this.counter;
-      this.counter = before + 1;
-      return this.counter;
-    }`,
-    null
-  );
-  if (!installed.ok) throw new Error(`fixture verb install failed: ${JSON.stringify(installed)}`);
-  // CO14 lane room + verb: the session turn transitions into the ANNEX (a
-  // second room — see the ANNEX const note: entering the genesis room
-  // would record no transition). Entry verbs skip the presence gate (the
-  // catalog `enter` idiom) — a sequenced call into a room the session has
-  // not entered yet IS the entering.
-  world.createObject({ id: "net_lane_annex", name: "Lane Annex", parent: "$space", owner: actor });
-  const welcomeInstalled = installVerb(
-    world,
-    "net_lane_annex",
-    "welcome",
-    `verb :welcome() rxd {
-      moveto(actor, this);
-      return 1;
-    }`,
-    null
-  );
-  if (!welcomeInstalled.ok) throw new Error(`fixture welcome install failed: ${JSON.stringify(welcomeInstalled)}`);
-  const welcomeVerb = world.object("net_lane_annex").verbs.find((verb) => verb.name === "welcome");
-  if (!welcomeVerb) throw new Error("fixture welcome verb missing after install");
-  welcomeVerb.skip_presence_check = true;
-  // Phase-4 item 3 (WS observation push): an observing verb ON the annex
-  // for sessions that have transitioned in — the wave's fanout carries
-  // the observation the peer socket must receive. No presence skip: by
-  // wave time the session HAS entered (that ordering is the point).
-  world.defineProperty("net_lane_annex", { name: "waves", defaultValue: 0, owner: actor, perms: "rw", typeHint: "int" });
-  const waveInstalled = installVerb(
-    world,
-    "net_lane_annex",
-    "wave",
-    `verb :wave() rxd {
-      this.waves = this.waves + 1;
-      observe({ type: "waved", waves: this.waves });
-      return this.waves;
-    }`,
-    null
-  );
-  if (!waveInstalled.ok) throw new Error(`fixture wave install failed: ${JSON.stringify(waveInstalled)}`);
-  // Phase-4 client surface (/net-api): an apikey minted into
-  // $system.api_keys via the same wizard path localdev bootstrap uses;
-  // partitionCells carries the identity cell to the CATALOG partition
-  // naturally ($-prefix rule), where the client gateway pulls it on miss.
-  world.ensureApiKey("$wiz", actor, "lane-key", "lane-secret", "net-lane-client");
-  // A dedicated ROOM-anchored target for the client turn. Engine
-  // semantics (the CO14 hydration caveat): a sequenced move is a SESSION
-  // transition, never an object_live write — so even after the lane's
-  // session turn "enters" the annex on session lane-s2, the actor's
-  // object_live location stays the genesis room, and the client's FRESH
-  // session hydrates there. The client turn therefore targets a box in
-  // the room, where its session actually is.
-  world.createObject({ id: "lane_client_box", name: "Lane Client Box", parent: "$thing", owner: actor, anchor: "net_lane_room", location: "net_lane_room" });
-  // The client actor STANDS in the room (realistic client scenario: you
-  // click things where you are). Located-elsewhere targeting is a
-  // Phase-4 non-goal; the recovery loop only probes scopes derivable
-  // from the actor/session/conventions (Big-World: no scope scans).
-  await world.moveObject(actor, "net_lane_room");
-  world.defineProperty("lane_client_box", { name: "clicks", defaultValue: 0, owner: actor, perms: "rw", typeHint: "int" });
-  const clickInstalled = installVerb(
-    world,
-    "lane_client_box",
-    "click",
-    `verb :click() rxd {
-      this.clicks = this.clicks + 1;
-      observe({ type: "clicked", clicks: this.clicks });
-      return this.clicks;
-    }`,
-    null
-  );
-  if (!clickInstalled.ok) throw new Error(`fixture click install failed: ${JSON.stringify(clickInstalled)}`);
-  // Genesis placement: the actor occupies the lane room, so its presence
-  // rows land in the room partition (genesis state, not under test).
-  const placed = await world.directCall("lane-genesis-place", actor, actor, "moveto", ["net_lane_room"], { sessionId: session.id });
-  if (placed.op !== "result") throw new Error(`fixture placement failed: ${JSON.stringify(placed)}`);
-
-  const cluster = `cluster:${actor}`;
-  const allPartitions = partitionCells(cellsFromSerialized(world.exportWorld()));
-  // The lane drives exactly these three partitions; the bundled world's
-  // other partitions (other rooms/guests) are not part of the scenario.
-  const partitions: Array<[string, NetCellInput[]]> = [ROOM, ANNEX, cluster, CATALOG_SCOPE].map((scope) => {
-    const cells = allPartitions.get(scope);
-    if (!cells || cells.length === 0) throw new Error(`fixture partition ${scope} is empty`);
-    return [scope, cells];
-  });
-  const roomCells = allPartitions.get(ROOM) as NetCellInput[];
-  const clusterCells = allPartitions.get(cluster) as NetCellInput[];
-
-  const bump = (id: string): ShadowTurnCall => ({
-    kind: "woo.turn_call.shadow.v1",
-    id,
-    route: "direct",
-    scope: ROOM,
-    session: session.id,
-    actor,
-    target: "lane_box",
-    verb: "bump",
-    args: []
-  });
-
-  // NO anchors/shared/scopes: the gateway must derive the classifier
-  // from view lineage and the destinations from scope:<scopeName>.
-  const turnRequest = (key: string) => ({
-    call: bump(key),
-    planningScope: ROOM,
-    catalog_epoch: EPOCH,
-    idempotency_key: key
-  });
-
-  /** CO14 lane turn: an engine-planned SEQUENCED call carrying `sid` into
-   * the ANNEX's :welcome (moveto(actor, this)). The minted session
-   * hydrates at the actor's genesis room, so moving to the annex records
-   * a sessionScopeTransition → the plan-time fold emits the session-cell
-   * write. The turn's only authority write IS that session cell, so
-   * route.ts retargets the commit to the actor's CLUSTER (CA3 pure
-   * session movement); the presence deltas are the two rooms' rows,
-   * delivered to them via /net/relate (CO13). */
-  const sessionTurnRequest = (key: string, sid: string) => ({
-    call: {
-      kind: "woo.turn_call.shadow.v1",
-      id: key,
-      route: "sequenced",
-      scope: "net_lane_annex",
-      session: sid,
-      actor,
-      target: "net_lane_annex",
-      verb: "welcome",
-      args: []
-    } satisfies ShadowTurnCall,
-    planningScope: ROOM,
-    catalog_epoch: EPOCH,
-    idempotency_key: key
-  });
-
-  /** Hand-built ride-along (room write + REAL-actor rider write), with
-   * the planner-parity post-state computed the same way the tests do.
-   * The rider write is blind (no read, no attestation), so adoption at
-   * the cluster applies it owner-ordered — the design-C allowance. */
-  const rideAlongSubmit = (base: ScopeHead): CommitSubmit => {
-    const writer = { progr: actor, thisObj: actor, verb: "greet", definer: "$thing", caller: actor, callerPerms: actor };
-    const transcript = {
-      kind: "woo.effect_transcript.shadow.v1",
-      route: "direct",
-      scope: ROOM,
-      seq: 1,
-      call: { actor, target: ROOM, verb: "greet", args: [], body: undefined },
-      reads: [],
-      writes: [
-        { cell: { kind: "prop", object: "lane_box", name: "visits" }, value: 1, op: "set", writer },
-        { cell: { kind: "prop", object: actor, name: "greeted" }, value: true, op: "set", writer }
-      ],
-      creates: [],
-      moves: [],
-      observations: [{ type: "greeted", actor }],
-      logicalInputs: [],
-      untrackedEffects: [],
-      complete: true,
-      incompleteReasons: [],
-      hash: "lane-ride-1"
-    };
-    const twin = new ScopeSequencer(ROOM, EPOCH);
-    twin.seed(roomCells as never);
-    const derived = applyTranscript(twin.store, transcript as never, { scope_head: "x", catalog_epoch: EPOCH });
-    return {
-      kind: "woo.net.commit_submit.v1",
-      scope: ROOM,
-      base,
-      idempotency_key: "lane-ride-1",
-      transcript: transcript as never,
-      post_state_version: derived.postStateVersion,
-      stamp: { scope_head: "x", catalog_epoch: EPOCH }
-    };
-  };
-
-  /** Direct scope mutation for run 3: bump the counter behind the
-   * gateway's back so its pulled view goes stale. Twin-parity digest
-   * over the ROOM PARTITION (the same cells the room DO was seeded
-   * with), same as rideAlongSubmit. */
-  const directBumpSubmit = (base: ScopeHead): CommitSubmit => {
-    const writer = { progr: actor, thisObj: "lane_box", verb: "bump", definer: "lane_box", caller: actor, callerPerms: actor };
-    const transcript = {
-      kind: "woo.effect_transcript.shadow.v1",
-      route: "direct",
-      scope: ROOM,
-      seq: 1,
-      call: { actor, target: "lane_box", verb: "bump", args: [], body: undefined },
-      reads: [],
-      writes: [{ cell: { kind: "prop", object: "lane_box", name: "counter" }, value: 99, op: "set", writer }],
-      creates: [],
-      moves: [],
-      observations: [],
-      logicalInputs: [],
-      untrackedEffects: [],
-      complete: true,
-      incompleteReasons: [],
-      hash: "lane-direct-bump"
-    };
-    const twin = new ScopeSequencer(ROOM, EPOCH);
-    twin.seed(roomCells as never);
-    const derived = applyTranscript(twin.store, transcript as never, { scope_head: "x", catalog_epoch: EPOCH });
-    return {
-      kind: "woo.net.commit_submit.v1",
-      scope: ROOM,
-      base,
-      idempotency_key: "lane-direct-bump",
-      transcript: transcript as never,
-      post_state_version: derived.postStateVersion,
-      stamp: { scope_head: "x", catalog_epoch: EPOCH }
-    };
-  };
-
-  /** CO13 cross-scope move: the actor (cluster-anchored, so the single
-   * authoritative movement write commits at ITS cluster — CA3) moves
-   * into the lane room. The contents/presence rows this derives are the
-   * ROOM's rows; the relate_destinations sibling names the room as their
-   * owner, and the room learns of them via /net/relate. `from: null`
-   * matches genesis (the placement already located the actor there), so
-   * the twin post-state is a same-value live-cell write — the step
-   * exercises relation delivery, not movement mechanics. */
-  const crossScopeMoveSubmit = (base: ScopeHead): CommitSubmit => {
-    const transcript = {
-      kind: "woo.effect_transcript.shadow.v1",
-      route: "sequenced",
-      scope: cluster,
-      seq: 1,
-      session: session.id,
-      call: { actor, target: actor, verb: "moveto", args: ["net_lane_room"], body: undefined },
-      reads: [],
-      writes: [],
-      creates: [],
-      moves: [{ object: actor, from: null, to: "net_lane_room" }],
-      observations: [],
-      logicalInputs: [],
-      untrackedEffects: [],
-      complete: true,
-      incompleteReasons: [],
-      hash: "lane-relate-move-1"
-    };
-    const twin = new ScopeSequencer(cluster, EPOCH);
-    twin.seed(clusterCells as never);
-    const derived = applyTranscript(twin.store, transcript as never, { scope_head: "x", catalog_epoch: EPOCH });
-    return {
-      kind: "woo.net.commit_submit.v1",
-      scope: cluster,
-      base,
-      idempotency_key: "lane-relate-move-1",
-      transcript: transcript as never,
-      post_state_version: derived.postStateVersion,
-      stamp: { scope_head: "x", catalog_epoch: EPOCH }
-    };
-  };
-
-  return { partitions, cluster, actor, turnRequest, sessionTurnRequest, rideAlongSubmit, directBumpSubmit, crossScopeMoveSubmit };
-}
-
-// ---- lane plumbing ---------------------------------------------------------
+// ---- lane types -------------------------------------------------------------
 
 type TurnBody = { reply: CommitReply; attempt: number; trace: AttemptTraceEntry[]; envelopeBytes: number };
-
-async function withWorkerd(vars: Record<string, string>, body: (base: string) => Promise<void>): Promise<void> {
-  const port = await findFreePort();
-  const base = `http://127.0.0.1:${port}`;
-  const persistDir = mkdtempSync(join(tmpdir(), "woo-net-smoke-"));
-  const child = startWorkerd(port, persistDir, vars);
-  try {
-    await waitReady(base);
-    await body(base);
-  } finally {
-    await stopWorkerd(child);
-    rmSync(persistDir, { recursive: true, force: true });
-  }
-}
-
-function startWorkerd(port: number, persistDir: string, vars: Record<string, string>): ChildProcess {
-  const varArgs = Object.entries(vars).flatMap(([key, value]) => ["--var", `${key}:${value}`]);
-  const child = spawn(
-    "npx",
-    ["--no-install", "wrangler", "dev", "-c", "wrangler.smoke.toml", "--port", String(port), "--ip", "127.0.0.1", "--persist-to", persistDir, ...varArgs],
-    { stdio: ["ignore", "pipe", "inherit"], detached: true }
-  );
-  child.on("error", (err) => console.error("failed to spawn wrangler dev:", err));
-  if (child.stdout) {
-    const rl = createInterface({ input: child.stdout });
-    rl.on("line", (line) => {
-      const at = line.indexOf("woo.metric ");
-      if (at >= 0) {
-        const brace = line.indexOf("{", at);
-        if (brace >= 0) {
-          try {
-            metrics.push(JSON.parse(line.slice(brace)) as Record<string, unknown>);
-          } catch {
-            /* not a metric line */
-          }
-        }
-      }
-    });
-  }
-  return child;
-}
-
-async function stopWorkerd(child: ChildProcess): Promise<void> {
-  if (child.pid === undefined) return;
-  const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
-  try {
-    process.kill(-child.pid, "SIGTERM");
-  } catch {
-    try {
-      child.kill("SIGTERM");
-    } catch {
-      /* already gone */
-    }
-  }
-  await Promise.race([exited, sleep(5000)]);
-  try {
-    process.kill(-child.pid, "SIGKILL");
-  } catch {
-    /* already gone */
-  }
-}
-
-async function waitReady(base: string): Promise<void> {
-  const deadline = Date.now() + 60_000;
-  for (;;) {
-    try {
-      const response = await fetch(`${base}/healthz`);
-      if (response.ok) return;
-    } catch {
-      /* not up yet */
-    }
-    if (Date.now() > deadline) throw new Error("workerd never became ready");
-    await sleep(500);
-  }
-}
-
-async function postRaw(base: string, kind: string, name: string, route: string, body: unknown): Promise<{ status: number; body: unknown }> {
-  const response = await fetch(`${base}/net-smoke/${kind}/${name}/${route}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body)
-  });
-  return { status: response.status, body: await response.json() };
-}
-
-async function post<T>(base: string, kind: string, name: string, route: string, body: unknown): Promise<T> {
-  const { status, body: decoded } = await postRaw(base, kind, name, route, body);
-  if (status !== 200) throw new Error(`POST /net-smoke/${kind}/${name}/${route} failed: ${status} ${JSON.stringify(decoded)}`);
-  return decoded as T;
-}
-
-async function get<T>(base: string, kind: string, name: string, route: string): Promise<T> {
-  const response = await fetch(`${base}/net-smoke/${kind}/${name}/${route}`);
-  const decoded = (await response.json()) as T;
-  if (!response.ok) throw new Error(`GET /net-smoke/${kind}/${name}/${route} failed: ${response.status}`);
-  return decoded;
-}
-
-async function poll<T>(probe: () => Promise<T | null>, timeoutMs = 10_000): Promise<T | null> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const value = await probe().catch(() => null);
-    if (value !== null) return value;
-    if (Date.now() > deadline) return null;
-    await sleep(300);
-  }
-}
-
-function findFreePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const server = createServer();
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (address && typeof address === "object") {
-        const port = address.port;
-        server.close(() => resolve(port));
-      } else {
-        server.close(() => reject(new Error("no port")));
-      }
-    });
-  });
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 main()
   .then((code) => process.exit(code))
