@@ -124,8 +124,20 @@ owners.**
 1. CO2.3 amendment + /net/attest + owner-sequenced adopt — DONE
    (a2655d1, 8ba00ff).
 2. CO15 topology (anchor derivation + catalog scope + partitionCells) —
-   unblocks removing request-supplied topology and enables real
-   multi-scope lanes.
+   DONE (branch net-phase35). src/net/topology.ts is the pure anchor
+   walk: root's parent chain reaching $actor → cluster:<root>, reaching
+   $space → room:<root>; $-prefixed roots and anchorless non-actor/
+   non-space roots → catalog. The gateway derives its classifier from
+   VIEW lineage and routes by the `scope:<scopeName>` convention;
+   request anchors/shared/scopes are demoted to lane overrides; catalog
+   lineage rides receiver-known in plan envelopes (class chains never
+   reship). Three scopes (room, cluster, catalog) are now the default
+   proving fixture: the differential's multi-scope scenario seeds its
+   sequencers from partitionCells with a topology.ts classifier, and the
+   workerd lane partitions a bootstrap world into room/cluster/catalog
+   DOs and drives /net/turn with NO request topology — 8/8. The
+   install-pipeline KV-seeding of the catalog closure stays with the
+   install work item (named TODO in topology.ts).
 3. CO13 relations (applier + /net/relate + contents/presence) — unblocks
    look/who and audience.
 4. CO14 sessions (mint + authorize + transition folding) — unblocks
