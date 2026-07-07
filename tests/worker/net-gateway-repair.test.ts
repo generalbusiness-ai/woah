@@ -107,6 +107,21 @@ async function seededScope() {
     null
   );
   expect(installed.ok).toBe(true);
+  // A TOUCHLESS verb (writes no cells) that returns a value and observes:
+  // its replay leaves post-state identical, so the old digest-guess replay
+  // detection false-negatived and would fabricate a fresh result on
+  // resubmit. The B2 fix decides replay at the scope, not by digest.
+  const pinged = installVerb(
+    world,
+    "repair_box",
+    "ping",
+    `verb :ping() rxd {
+      observe({ type: "pinged" });
+      return this.counter;
+    }`,
+    null
+  );
+  expect(pinged.ok).toBe(true);
 
   const scopeEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET };
   const scope = netState(`scope-${SCOPE}`);
@@ -117,7 +132,7 @@ async function seededScope() {
     cells: cellsFromSerialized(world.exportWorld())
   });
 
-  const bumpCall = (id: string): ShadowTurnCall => ({
+  const verbCall = (verb: string) => (id: string): ShadowTurnCall => ({
     kind: "woo.turn_call.shadow.v1",
     id,
     route: "direct",
@@ -125,10 +140,12 @@ async function seededScope() {
     session: session.id,
     actor,
     target: "repair_box",
-    verb: "bump",
+    verb,
     args: []
   });
-  return { scopeDO, scopeEnv, bumpCall, close: scope.close };
+  const bumpCall = verbCall("bump");
+  const pingCall = verbCall("ping");
+  return { scopeDO, scopeEnv, bumpCall, pingCall, close: scope.close };
 }
 
 function gatewayEnvFor(scopeDO: Fetchable, faults?: Record<string, unknown>): NetGatewayEnv {
@@ -163,7 +180,37 @@ type TurnBody = {
   attempt: number;
   trace: AttemptTraceEntry[];
   install_degraded?: boolean;
+  replayed?: boolean;
+  result?: unknown;
+  observations?: Array<{ type?: string }>;
 };
+
+describe("idempotent replay does not fabricate output (B2)", () => {
+  it("a touchless verb's replay returns replayed:true with NO result/observations", async () => {
+    const { scopeDO, pingCall, close } = await seededScope();
+    const gwState = netState("gw-replay");
+    const gwEnv = gatewayEnvFor(scopeDO);
+    const gw = new NetGatewayDO(gwState.state, gwEnv);
+    await call(gw, gwEnv, "/pull", { scope: SCOPE, destination: `scope:${SCOPE}` });
+
+    // First submit: the touchless ping observes and returns the counter.
+    const first = await call<TurnBody>(gw, gwEnv, "/turn", turnRequest(pingCall("ping-1"), "ping-key"));
+    expect(first.reply.status).toBe("accepted");
+    expect(first.replayed).toBeUndefined();
+    expect(first.observations?.some((o) => o.type === "pinged")).toBe(true);
+
+    // Replay under the SAME key: post-state is identical (nothing was
+    // touched), so the old digest guess said "fresh" and re-planned new
+    // output. The fix returns replayed:true and omits result/observations
+    // — the committed turn's real output was the first reply's.
+    const replay = await call<TurnBody>(gw, gwEnv, "/turn", turnRequest(pingCall("ping-1"), "ping-key"));
+    expect(replay.reply.status).toBe("accepted");
+    expect(replay.replayed).toBe(true);
+    expect(replay.result).toBeUndefined();
+    expect(replay.observations ?? []).toEqual([]);
+    close();
+  });
+});
 
 describe("NetGatewayDO repair loop (CO6/CO10)", () => {
   it("converges a stale view via the targeted read_version_mismatch refresh (attempts >= 2)", async () => {

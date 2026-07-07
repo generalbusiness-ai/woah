@@ -696,11 +696,16 @@ export class NetGatewayDO {
             );
           }
         }
-        // Phase-4 item 1: replay detection by post-state digest — see the
-        // TurnResult.replayed doc. A recorded reply (CO2.5) commits
-        // nothing this round, so this round's re-planned result would
-        // describe an execution that never happened; omit it honestly.
-        const replayed = reply.post_state_version !== submit.post_state_version;
+        // Phase-4 item 1 / B2 fix: replay is decided by the SCOPE, which
+        // knows authoritatively (it looked the idempotency key up), not
+        // guessed by digest here — a digest guess false-negatives on a
+        // cell-touchless or same-post-state retry and would then present a
+        // freshly-planned result/observations as the committed turn's
+        // output (acute for now()/random() turns). A recorded reply
+        // (CO2.5) committed nothing this round, so omit its re-planned
+        // output. (`post_state_version` equality is the fallback for a
+        // scope that predates the flag — belt and suspenders.)
+        const replayed = reply.replayed === true || reply.post_state_version !== submit.post_state_version;
         return {
           reply,
           selection: planned.selection,

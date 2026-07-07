@@ -95,6 +95,14 @@ export type CommitReply =
        * the shell delivers them to the owning scope via the durable
        * outbox (/net/relate). Local deltas were already applied here. */
       relations_foreign?: Array<{ scope: string; deltas: RelationDelta[] }>;
+      /** CO2.5: set only when this reply is a RECORDED reply returned to an
+       * idempotent resubmit — this round committed nothing. The gateway
+       * MUST NOT present a freshly-planned result/observations as the
+       * committed output when this is true (they would describe an
+       * execution that never happened — acute for now()/random() turns).
+       * Stamped on a copy at return time; the cached reply never carries
+       * it, so replay-of-a-replay stays stable. */
+      replayed?: boolean;
     }
   | {
       kind: "woo.net.commit_reply.v1";
@@ -229,9 +237,13 @@ export class ScopeSequencer {
    */
   submit(submit: CommitSubmit): CommitReply {
     // Step 3 first for replays: an idempotent resubmit must return the
-    // recorded reply even if the world moved on (CO2.5).
+    // recorded reply even if the world moved on (CO2.5). Return it with
+    // `replayed: true` STAMPED ON A COPY (never mutating the cache) so the
+    // gateway knows authoritatively that this round committed nothing and
+    // must not fabricate output. The stored reply's own `replayed` stays
+    // unset, so replay-of-a-replay remains stable.
     const recorded = this.replies.get(submit.idempotency_key);
-    if (recorded) return recorded;
+    if (recorded) return recorded.status === "accepted" ? { ...recorded, replayed: true } : recorded;
 
     // Step 1: envelope/actor/session authority (CO14: the shell wires
     // authorizeSessionSubmit here). A thrown error carrying a structured

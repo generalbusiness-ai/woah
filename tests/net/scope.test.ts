@@ -109,13 +109,24 @@ describe("commit acceptance (CO4)", () => {
     expect(reply.status === "rejected" && reply.reason === "read_version_mismatch").toBe(true);
   });
 
-  it("replayed idempotency key returns the recorded reply (CO2.5)", () => {
+  it("replayed idempotency key returns the recorded reply marked replayed (CO2.5, B2)", () => {
     const seq = new ScopeSequencer(SCOPE, EPOCH);
     const submit = submitFor(seq, transcript({ writes: [propWrite("v1")] }), "k1");
     const first = seq.submit(submit);
+    expect(first.status === "accepted" && first.replayed).toBeUndefined(); // fresh accept is not a replay
     const replay = seq.submit(submit);
-    expect(replay).toBe(first);
     expect(seq.head().seq).toBe(1); // no double-commit
+    // The replay is a COPY marked replayed — never the cached object (so a
+    // later reader of the cache can't observe the stamp), same verdict/
+    // head otherwise. The B2 signal: the gateway learns "committed
+    // nothing" authoritatively instead of guessing by digest.
+    expect(replay).not.toBe(first);
+    expect(replay.status === "accepted" && replay.replayed).toBe(true);
+    expect(replay.head).toEqual(first.head);
+    // Replay-of-a-replay is still stable (the cache never gained the stamp).
+    const replay2 = seq.submit(submit);
+    expect(replay2.status === "accepted" && replay2.replayed).toBe(true);
+    expect(replay2.head).toEqual(first.head);
   });
 
   it("stale base rejects retryable stale_head", () => {
