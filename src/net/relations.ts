@@ -105,12 +105,20 @@ export function deriveRelationDeltas(
 }
 
 /** Apply deltas to a relation map (the in-memory row family). Returns
- * the keys that changed, for durable write-through. */
+ * the keys that CHANGED, for durable write-through — an add of an
+ * identical row and a remove of an absent row are both no-ops, so a
+ * redelivered batch reports empty and the caller (the owner-sequenced
+ * relate path) neither advances its head nor refans a no-op. */
 export function applyRelationDeltas(rows: Map<string, RelationRow>, deltas: RelationDelta[]): string[] {
   const changed: string[] = [];
   for (const delta of deltas) {
     const key = relationKey(delta.row.relation, delta.row.owner, delta.row.member);
     if (delta.op === "add") {
+      const existing = rows.get(key);
+      // Same key ⇒ relation/owner/member already match; only the body can
+      // differ. Bodies come from the single derivation path, so plain
+      // JSON comparison is stable here.
+      if (existing && JSON.stringify(existing.body) === JSON.stringify(delta.row.body)) continue;
       rows.set(key, delta.row);
     } else {
       if (!rows.delete(key)) continue; // removing an absent row changes nothing

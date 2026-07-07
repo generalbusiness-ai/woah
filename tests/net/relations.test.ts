@@ -115,8 +115,13 @@ describe("sequencer relation application (durable, one transaction)", () => {
     const reply = seq.submit(bumpSubmit(seq, [{ object: "#alice", from: "room:hall", to: "room:den" }], "k1"));
     expect(reply.status).toBe("accepted");
     if (reply.status !== "accepted") return;
-    // Local: the remove at this room. Foreign: the add at room:den.
+    // Local: the remove at this room (carried on the reply for the
+    // shell's fanout even when it changed nothing). Foreign: the add at
+    // room:den.
     expect(seq.relations().size).toBe(0); // remove of an absent row = no row
+    expect(reply.relations).toEqual([
+      { op: "remove", row: { relation: "contents", owner: "room:hall", member: "#alice" } }
+    ]);
     expect(reply.relations_foreign).toEqual([
       { scope: "room:den", deltas: [{ op: "add", row: { relation: "contents", owner: "room:den", member: "#alice" } }] }
     ]);
@@ -128,6 +133,39 @@ describe("sequencer relation application (durable, one transaction)", () => {
     expect(den.relations().get(relationKey("contents", "room:den", "#alice"))).toMatchObject({ member: "#alice" });
     const denRehydrated = new ScopeSequencer("room:den", EPOCH, { durable: denStore });
     expect(denRehydrated.relations().size).toBe(1);
+  });
+
+  it("applyForeignRelationDeltas is owner-sequenced: one head advance per applied batch, tail names the fact, no-ops are empty", () => {
+    const store = new InMemoryScopeStore();
+    const seq = new ScopeSequencer("room:den", EPOCH, { durable: store });
+    const add: Parameters<typeof seq.applyForeignRelationDeltas>[0] = [
+      { op: "add", row: { relation: "contents", owner: "room:den", member: "#alice" } },
+      { op: "add", row: { relation: "session_presence", owner: "room:den", member: "s1", body: { actor: "#alice" } } }
+    ];
+    const applied = seq.applyForeignRelationDeltas(add, { from_scope: "cluster:#alice", seq: 4 });
+    // One head advance for the two-delta batch; the refan rides this seq.
+    expect(applied.status).toBe("applied");
+    expect(applied.head.seq).toBe(1);
+    expect(seq.head()).toEqual(applied.head);
+    expect(applied.changed.sort()).toEqual([
+      relationKey("contents", "room:den", "#alice"),
+      relationKey("session_presence", "room:den", "s1")
+    ]);
+    // The recovery tail names the relate fact (adopt-style legibility).
+    expect(seq.recoveryTail()).toEqual([
+      { seq: 1, transcript_hash: "relate:cluster:#alice:4", touched: applied.changed.sort() }
+    ]);
+    // Re-applying identical adds changes nothing: empty, NO head advance
+    // (an all-no-op relate must not fan a no-op to subscribers).
+    const noop = seq.applyForeignRelationDeltas(add, { from_scope: "cluster:#alice", seq: 5 });
+    expect(noop.status).toBe("empty");
+    expect(noop.changed).toEqual([]);
+    expect(seq.head().seq).toBe(1);
+    // Head + rows survive rehydration together (meta written in the same
+    // transaction as the rows).
+    const rehydrated = new ScopeSequencer("room:den", EPOCH, { durable: store });
+    expect(rehydrated.head().seq).toBe(1);
+    expect(rehydrated.relations().size).toBe(2);
   });
 
   it("rebuildRelations recomputes contents from live cells and preserves presence", () => {
@@ -150,6 +188,24 @@ describe("sequencer relation application (durable, one transaction)", () => {
     ]);
     // Durable state matches the rebuild.
     expect(store.readRelations().length).toBe(3);
+  });
+
+  it("rebuildRelations drops candidates owned by another scope (multi-scope: no second copy of a foreign row family)", () => {
+    // A cluster scope holds the actor's live cell, whose LOCATION is a
+    // foreign room. Its rebuild must not mint the room's contents row —
+    // that row lives at the room (delivered there via /net/relate at
+    // derivation time); a local copy would be the CO9 dual write.
+    const seq = new ScopeSequencer("cluster:#alice", EPOCH, {
+      scopeOf: (owner) => (owner.startsWith("room:") ? owner : "cluster:#alice")
+    });
+    seq.seed([
+      { kind: "object_live", object: "#alice", value: { location: "room:hall" } },
+      { kind: "object_live", object: "#satchel", value: { location: "#alice" } }
+    ]);
+    seq.rebuildRelations();
+    // The carried item's row (owner #alice → this cluster) survives; the
+    // room-owned row does not appear.
+    expect([...seq.relations().keys()]).toEqual([relationKey("contents", "#alice", "#satchel")]);
   });
 });
 

@@ -21,6 +21,7 @@
  * replayable in workflows.
  */
 import { CellStore, type Cell } from "./cells";
+import type { RelationDelta } from "./relations";
 
 export type FanoutBody = {
   scope: string;
@@ -30,6 +31,13 @@ export type FanoutBody = {
   cells: Cell[];
   /** Observations for live delivery at the destination. */
   observations: unknown[];
+  /** CO13: relation deltas riding alongside cells — the LOCAL deltas of
+   * the commit this body announces, or the applied deltas of a
+   * /net/relate refan. `applyFanout` stays cell-only by design (relation
+   * rows are not cells and never install into a CellStore); the gateway
+   * SHELL mirrors these into its relation table under the same per-scope
+   * seq high-water that gates the cells. */
+  relations?: RelationDelta[];
 };
 
 export type FanoutRow = {

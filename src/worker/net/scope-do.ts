@@ -37,12 +37,21 @@
  *                           the adopted cells fan out to this scope's
  *                           own subscribers; idempotent by (from_scope,
  *                           seq)
+ *       POST /net/relate    {from_scope, seq, deltas} → CO13 relation
+ *                           delivery: deltas derived at another scope
+ *                           whose owner objects anchor here apply to
+ *                           this scope's relation family (owner-
+ *                           sequenced — the head advances once per
+ *                           applied batch) and refan to this scope's
+ *                           own subscribers; idempotent by (from_scope,
+ *                           seq) — a separate high-water from /adopt
  *       POST /net/schedule  park a scheduled turn + arm the alarm
  *                           (test-facing until the gateway machinery
  *                           schedules from transcripts)
  *   - the durable fanout outbox (CO2.7): accepted commits enqueue
- *     /net/fanout rows (every subscriber) and /net/adopt rows (every
- *     rider scope) in the SAME transaction as the commit write-through,
+ *     /net/fanout rows (every subscriber), /net/adopt rows (every
+ *     rider scope), and /net/relate rows (every foreign relation-owner
+ *     scope) in the SAME transaction as the commit write-through,
  *     then drain via host.defer — never on the reply path; leftover rows
  *     drain on the next request (drain-on-reactivation);
  *   - the alarm() wake path: pop due turns, emit a woo.metric line per
@@ -59,7 +68,7 @@ import { cellKey, lineageClosureKeys, serializeTransfer, type CellTransfer } fro
 import { isNetError, netError } from "../../net/errors";
 import { Outbox, type FanoutBody, type FanoutRow } from "../../net/outbox";
 import { ScopeSequencer, type CommitSubmit, type ScheduledTurn, type ScopeHead } from "../../net/scope";
-import type { RelationRow } from "../../net/relations";
+import { relationKey, type RelationDelta, type RelationRow } from "../../net/relations";
 import type { ScopeMeta, ScopeStore, TailEntry } from "../../net/scope-store";
 import type { CommitReply } from "../../net/scope";
 import { netCellKeyFor } from "../../net/transcript";
@@ -86,10 +95,21 @@ export type NetScopeEnv = NetBindingsEnv;
  * rider scope, its rpc destination and the objects anchored to it. */
 type RiderDestinations = Record<string, { destination: string; objects: string[] }>;
 
-/** The two outbox delivery surfaces. They drain as separate lanes so a
- * destination carrying both cannot collide row ids, and adoption cannot
- * be held behind a slow subscriber (or vice versa). */
-type OutboxRoute = "/fanout" | "/adopt";
+/** The gateway's CO13 relation-owner directions (submit HTTP-body
+ * sibling, same principle as RiderDestinations: anchor topology is
+ * gateway knowledge the sequencer never learns). Per FOREIGN owner
+ * scope, its rpc destination and the relation-owner OBJECTS (move
+ * sources/destinations, create locations, transition rooms) anchored to
+ * it. The shell turns this into the sequencer's `scopeOf` hints, so the
+ * accept-path delta partition and the /relate row destinations agree by
+ * construction. Absent (direct submits, tests) → every delta is local. */
+type RelateDestinations = Record<string, { destination: string; objects: string[] }>;
+
+/** The three outbox delivery surfaces. They drain as separate lanes so a
+ * destination carrying several cannot collide row ids, and adoption/
+ * relation delivery cannot be held behind a slow subscriber (or vice
+ * versa). */
+type OutboxRoute = "/fanout" | "/adopt" | "/relate";
 
 /** The /adopt outbox body: FanoutBody plus the per-cell prior versions
  * the committing turn observed (the rider-read integrity interim guard —
@@ -263,6 +283,15 @@ export class NetScopeDO {
    * gates the clear so scopes with no outbox history never touch the
    * storage alarm. Lost on eviction by design — see armOutboxRetryAlarm. */
   private outboxAlarmArmed = false;
+  /** Per-submit relation-owner scope hints (object → owning scope name),
+   * loaded from the gateway's relate_destinations sibling for the
+   * duration of one /net/submit and cleared after. The sequencer's
+   * `scopeOf` option reads this map through a closure: DO requests run
+   * one at a time and the sequencer's submit is synchronous inside the
+   * transaction, so the per-request lifetime is race-free. Outside a
+   * submit the map is empty → every delta classifies local (the
+   * documented no-hints behavior). */
+  private readonly relateScopeHints = new Map<string, string>();
 
   constructor(
     private readonly state: NetScopeDurableState,
@@ -282,6 +311,16 @@ export class NetScopeDO {
     );
     state.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS net_scope_adopted (from_scope TEXT PRIMARY KEY, seq INTEGER NOT NULL)"
+    );
+    // Relation-delivery high-water (CO13): (from_scope, seq) receiver
+    // idempotency for /net/relate — the same discipline as
+    // net_scope_adopted, in a SEPARATE table because one committing turn
+    // can legitimately produce BOTH an /adopt row and a /relate row to
+    // the same owner at the same (from_scope, seq) (a ride-along write
+    // plus a move whose destination anchors here); a shared counter
+    // would let whichever arrived first swallow the other.
+    state.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS net_scope_related (from_scope TEXT PRIMARY KEY, seq INTEGER NOT NULL)"
     );
     // Rider residue ledger (rider-read integrity, fix 1): keys of cells
     // this scope committed via CA3 ride-along but does NOT anchor. After
@@ -316,12 +355,13 @@ export class NetScopeDO {
     try {
       if (request.method === "POST" && url.pathname === "/net/submit") {
         // Bare CommitSubmit (direct submits, tests) or the gateway's
-        // {submit, rider_destinations} sibling shape.
+        // {submit, rider_destinations, relate_destinations} sibling shape.
         const raw = (await request.json()) as
           | CommitSubmit
-          | { submit: CommitSubmit; rider_destinations?: RiderDestinations };
+          | { submit: CommitSubmit; rider_destinations?: RiderDestinations; relate_destinations?: RelateDestinations };
         const submit = "submit" in raw ? raw.submit : raw;
         const riderDestinations = "submit" in raw ? (raw.rider_destinations ?? {}) : {};
+        const relateDestinations = "submit" in raw ? (raw.relate_destinations ?? {}) : {};
         const seq = this.ensureSequencer(submit.scope, submit.stamp.catalog_epoch);
         const headBefore = seq.head().seq;
         // Rider-read integrity (fix 1): capture, BEFORE the commit applies,
@@ -330,20 +370,32 @@ export class NetScopeDO {
         // accept path replaces the cells in place.
         const riderPriors = this.captureRiderPriors(seq, submit, riderDestinations);
         let reply!: CommitReply;
-        // The commit write-through and the outbox enqueue share ONE
-        // transaction (CO2.7: rows are durable before the reply returns;
-        // a crash can never separate a commit from its fanout). The
-        // sequencer's internal transaction joins this outer one.
-        this.discardSeqOnThrow(() =>
-          this.store.transaction(() => {
-            reply = seq.submit(submit);
-            // Idempotent replays (head did not advance) enqueue nothing:
-            // their rows were enqueued when the turn first committed.
-            if (reply.status === "accepted" && reply.head.seq === headBefore + 1) {
-              this.enqueueDeliveries(seq, reply, submit, riderDestinations, riderPriors);
-            }
-          })
-        );
+        // CO13: load the gateway's relation-owner hints for THIS submit —
+        // the sequencer's `scopeOf` reads them to partition derived
+        // relation deltas (see relateScopeHints). Cleared in finally so a
+        // reject/throw can never leak hints into the next request.
+        this.relateScopeHints.clear();
+        for (const [scope, entry] of Object.entries(relateDestinations)) {
+          for (const object of entry.objects) this.relateScopeHints.set(object, scope);
+        }
+        try {
+          // The commit write-through and the outbox enqueue share ONE
+          // transaction (CO2.7: rows are durable before the reply returns;
+          // a crash can never separate a commit from its fanout). The
+          // sequencer's internal transaction joins this outer one.
+          this.discardSeqOnThrow(() =>
+            this.store.transaction(() => {
+              reply = seq.submit(submit);
+              // Idempotent replays (head did not advance) enqueue nothing:
+              // their rows were enqueued when the turn first committed.
+              if (reply.status === "accepted" && reply.head.seq === headBefore + 1) {
+                this.enqueueDeliveries(seq, reply, submit, riderDestinations, riderPriors, relateDestinations);
+              }
+            })
+          );
+        } finally {
+          this.relateScopeHints.clear();
+        }
         this.host.defer(() => this.drainOutbox());
         return json(reply);
       }
@@ -369,6 +421,18 @@ export class NetScopeDO {
         // off the reply path, same as /net/submit.
         this.host.defer(() => this.drainOutbox());
         return json(adopted);
+      }
+      if (request.method === "POST" && url.pathname === "/net/relate") {
+        const body = (await request.json()) as {
+          from_scope: string;
+          seq: number;
+          deltas: RelationDelta[];
+        };
+        const related = this.relate(body);
+        // A non-empty application enqueued refan rows to this scope's own
+        // subscribers (see relate()); drain them off the reply path.
+        this.host.defer(() => this.drainOutbox());
+        return json(related);
       }
       if (request.method === "POST" && url.pathname === "/net/attest") {
         // CO2.3 rider-read attestation: report this authority's current
@@ -512,7 +576,13 @@ export class NetScopeDO {
       // non-owned cells are skipped at CO4 step 7 by the sequencer: their
       // freshness is the owning scope's + the adopt-time prior-version
       // CAS's job (CO2.4; notes/2026-07-06-rider-read-integrity.md).
-      owns: (object) => seq.store.has(cellKey("object_lineage", object))
+      owns: (object) => seq.store.has(cellKey("object_lineage", object)),
+      // CO13 relation-owner classification: the gateway's per-submit
+      // relate_destinations hints (anchor topology is gateway knowledge —
+      // the same rule as rider_destinations); an unhinted owner is local.
+      // The closure reads the mutable hint map so one sequencer instance
+      // serves every submit (hints are loaded/cleared per request).
+      scopeOf: (object) => this.relateScopeHints.get(object) ?? seq.scope
     });
     this.seq = seq;
     return this.seq;
@@ -660,20 +730,25 @@ export class NetScopeDO {
   /**
    * Enqueue the accepted commit's deliveries durably (called inside the
    * submit transaction): a /net/fanout row per registered subscriber
-   * (lineage-closed touched closure + the transcript's observations) and
-   * a /net/adopt row per rider scope carrying only the cells anchored to
-   * it — the gateway's rider_destinations names those objects, because
-   * anchor topology is gateway knowledge the sequencer never learns.
-   * Adopt rows also carry the per-cell prior versions captured pre-commit
-   * (captureRiderPriors) for the owner's CAS, and the shipped rider keys
-   * are recorded in the residue ledger (see the constructor comment).
+   * (lineage-closed touched closure + the transcript's observations +
+   * the commit's LOCAL relation deltas, so subscriber gateways learn
+   * rosters push-fashion — CO13), a /net/adopt row per rider scope
+   * carrying only the cells anchored to it, and a /net/relate row per
+   * foreign relation-owner scope carrying its deltas — the gateway's
+   * rider_destinations/relate_destinations name those objects/scopes,
+   * because anchor topology is gateway knowledge the sequencer never
+   * learns. Adopt rows also carry the per-cell prior versions captured
+   * pre-commit (captureRiderPriors) for the owner's CAS, and the shipped
+   * rider keys are recorded in the residue ledger (see the constructor
+   * comment).
    */
   private enqueueDeliveries(
     seq: ScopeSequencer,
     reply: Extract<CommitReply, { status: "accepted" }>,
     submit: CommitSubmit,
     riderDestinations: RiderDestinations,
-    riderPriors: Map<string, string>
+    riderPriors: Map<string, string>,
+    relateDestinations: RelateDestinations
   ): void {
     const observations = (submit.transcript.observations ?? []) as unknown[];
     const subscribers = sqlRows<{ destination: string }>(
@@ -686,9 +761,25 @@ export class NetScopeDO {
           scope: seq.scope,
           seq: reply.head.seq,
           cells,
-          observations
+          observations,
+          ...(reply.relations && reply.relations.length > 0 ? { relations: reply.relations } : {})
         });
       }
+    }
+    // CO13: foreign relation deltas go to their owner scopes as durable
+    // /relate rows (same transaction as the commit, same at-least-once
+    // drain, (from_scope, seq) idempotency at the receiver — the /adopt
+    // idioms exactly). The destination comes from the gateway's
+    // relate_destinations when named, else the CO15 `scope:<scopeName>`
+    // convention (the DO namespace key IS the scope name).
+    for (const entry of reply.relations_foreign ?? []) {
+      this.persistOutboxRow("/relate", relateDestinations[entry.scope]?.destination ?? `scope:${entry.scope}`, {
+        scope: seq.scope,
+        seq: reply.head.seq,
+        cells: [],
+        observations: [],
+        relations: entry.deltas
+      });
     }
     for (const rider of Object.values(riderDestinations)) {
       const objects = new Set(rider.objects);
@@ -837,10 +928,10 @@ export class NetScopeDO {
     }
   }
 
-  /** One drain pass over both route lanes; returns delivered-row count. */
+  /** One drain pass over the route lanes; returns delivered-row count. */
   private async drainOutboxPass(): Promise<number> {
     let deliveredCount = 0;
-    for (const route of ["/fanout", "/adopt"] as const) {
+    for (const route of ["/fanout", "/adopt", "/relate"] as const) {
         const persisted = sqlRows<{
           id: string;
           destination: string;
@@ -883,6 +974,15 @@ export class NetScopeDO {
                 cells: adoptBody.cells,
                 // The pre-commit observations for the owner's CAS (fix 1).
                 ...(adoptBody.prior_versions !== undefined ? { prior_versions: adoptBody.prior_versions } : {})
+              });
+            } else if (route === "/relate") {
+              // CO13: the row's FanoutBody carries the deltas; the wire
+              // shape is (from_scope, seq, deltas) — the receiver's
+              // idempotency key plus its application input.
+              await this.host.rpc(row.destination, "/relate", {
+                from_scope: row.body.scope,
+                seq: row.body.seq,
+                deltas: row.body.relations ?? []
               });
             } else {
               await this.host.rpc(row.destination, "/fanout", row.body);
@@ -1071,6 +1171,64 @@ export class NetScopeDO {
         body.seq
       );
       return { applied: true, installed: result.applied.length, conflicts: result.conflicts.length, head: result.head };
+    }));
+  }
+
+  /**
+   * CO13 relation delivery: deltas derived at ANOTHER scope whose owner
+   * objects anchor here, applied to this scope's relation family as an
+   * owner-sequenced event (ScopeSequencer.applyForeignRelationDeltas
+   * advances the head once per non-empty batch — see its doc for why the
+   * refan needs a real seq), then REFANNED to this scope's own fanout
+   * subscribers so their gateways learn the roster change push-fashion.
+   *
+   * Mirrors adopt() exactly: the application, the refan enqueue, and the
+   * (from_scope, seq) high-water advance share ONE transaction, so a
+   * crash cannot separate the applied rows from their fanout (CO2.7) and
+   * redelivery no-ops (CO2.5). The high-water advances even when every
+   * delta was a no-op (`empty`): the fact WAS processed; redelivery must
+   * not flap the verdict.
+   */
+  private relate(body: {
+    from_scope: string;
+    seq: number;
+    deltas: RelationDelta[];
+  }): { applied: boolean; changed: number; head: ScopeHead } {
+    const seq = this.ensureSequencer();
+    return this.discardSeqOnThrow(() => this.store.transaction(() => {
+      const rows = sqlRows<{ seq: number }>(
+        this.state.storage.sql.exec("SELECT seq FROM net_scope_related WHERE from_scope = ?", body.from_scope)
+      );
+      const last = rows.length > 0 ? Number(rows[0].seq) : 0;
+      if (body.seq <= last) return { applied: false, changed: 0, head: seq.head() };
+      const result = seq.applyForeignRelationDeltas(body.deltas, { from_scope: body.from_scope, seq: body.seq });
+      if (result.status === "applied") {
+        // Refan exactly the deltas that changed this family (an add of an
+        // identical row / remove of an absent row carries no news) at the
+        // ADVANCED head — subscriber gateways gate by per-scope seq.
+        const changed = new Set(result.changed);
+        const applied = body.deltas.filter((delta) =>
+          changed.has(relationKey(delta.row.relation, delta.row.owner, delta.row.member))
+        );
+        const subscribers = sqlRows<{ destination: string }>(
+          this.state.storage.sql.exec("SELECT destination FROM net_scope_subscribers")
+        );
+        for (const { destination } of subscribers) {
+          this.persistOutboxRow("/fanout", destination, {
+            scope: seq.scope,
+            seq: result.head.seq,
+            cells: [],
+            observations: [],
+            relations: applied
+          });
+        }
+      }
+      this.state.storage.sql.exec(
+        "INSERT INTO net_scope_related (from_scope, seq) VALUES (?, ?) ON CONFLICT(from_scope) DO UPDATE SET seq = excluded.seq",
+        body.from_scope,
+        body.seq
+      );
+      return { applied: result.status === "applied", changed: result.changed.length, head: result.head };
     }));
   }
 

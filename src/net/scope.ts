@@ -86,6 +86,11 @@ export type CommitReply =
       /** Authority cells touched, for warm cache-fill (CO7 state transfer). */
       touched: string[];
       post_state_version: string;
+      /** CO13: the LOCAL relation deltas this commit derived and applied
+       * to the scope's own relation family — the shell includes them in
+       * FanoutBody.relations so subscriber gateways mirror rosters
+       * push-fashion (never a second derivation at the receiver). */
+      relations?: RelationDelta[];
       /** CO13: relation deltas whose owner is anchored to ANOTHER scope —
        * the shell delivers them to the owning scope via the durable
        * outbox (/net/relate). Local deltas were already applied here. */
@@ -355,6 +360,7 @@ export class ScopeSequencer {
       head: this.headState,
       touched: applied.touched,
       post_state_version: applied.postStateVersion,
+      ...(derived.local.length > 0 ? { relations: derived.local } : {}),
       ...(relationsForeign.length > 0 ? { relations_foreign: relationsForeign } : {})
     };
     this.replies.set(submit.idempotency_key, reply);
@@ -497,29 +503,83 @@ export class ScopeSequencer {
     return this.relationRows;
   }
 
-  /** Apply externally delivered relation deltas (the /net/relate path —
-   * rows derived at ANOTHER scope whose owner objects anchor here).
-   * Durable write-through; returns the changed keys for refanning. */
-  applyForeignRelationDeltas(deltas: RelationDelta[]): string[] {
+  /**
+   * Apply externally delivered relation deltas (the /net/relate path —
+   * rows derived at ANOTHER scope whose owner objects anchor here) as an
+   * OWNER-SEQUENCED event, mirroring adopt():
+   *
+   * - A non-empty applied batch advances the head ONCE, with a tail
+   *   entry naming the relate fact (`relate:<from_scope>:<from_seq>`).
+   *   The advance is what gives the shell's refan a REAL seq: subscriber
+   *   gateways gate every FanoutBody by per-scope seq (CO2.5), so a
+   *   refan at an unadvanced head would no-op at any subscriber that
+   *   already saw that seq and the roster delta would be silently lost.
+   * - An all-no-op batch (adds of identical rows, removes of absent
+   *   rows) is `empty`: no head advance, nothing to refan — but the
+   *   caller's (from_scope, seq) high-water still advances at the shell,
+   *   exactly like an all-conflict adoption (the fact WAS processed).
+   * - Durable write-through covers rows + meta + tail in one transaction
+   *   (CO5 copy #1 discipline, same as submit/adopt).
+   *
+   * Sender idempotency — the (from_scope, seq) high-water — is the
+   * SHELL's job (NetScopeDO /net/relate), which is why this method must
+   * be called exactly once per relate fact. `from` is optional so tests
+   * and single-process hosts can apply deltas directly (the marker then
+   * names the local scope itself).
+   */
+  applyForeignRelationDeltas(
+    deltas: RelationDelta[],
+    from?: { from_scope: string; seq: number }
+  ): { status: "applied" | "empty"; head: ScopeHead; changed: string[] } {
     const changed = applyRelationDeltas(this.relationRows, deltas);
+    if (changed.length === 0) {
+      return { status: "empty", head: this.headState, changed: [] };
+    }
+    // One head advance for the batch — the same rolling-digest shape as
+    // adopt(), keeping the recovery tail legible (relates have no
+    // transcript of their own).
+    const marker = `relate:${from?.from_scope ?? this.scope}:${from?.seq ?? 0}`;
+    const nextHead: ScopeHead = {
+      seq: this.headState.seq + 1,
+      hash: cellVersion([this.headState.hash, this.headState.seq + 1, marker])
+    };
+    this.headState = nextHead;
+    const tailEntry = { seq: nextHead.seq, transcript_hash: marker, touched: [...changed].sort() };
+    this.tail.push(tailEntry);
+    if (this.tail.length > this.options.tailLimit) this.tail.splice(0, this.tail.length - this.options.tailLimit);
     const durable = this.options.durable;
-    if (durable && changed.length > 0) {
+    if (durable) {
       durable.transaction(() => {
         for (const key of changed) {
           const row = this.relationRows.get(key);
           if (row) durable.writeRelation(key, row);
           else durable.deleteRelation(key);
         }
+        durable.writeMeta({ scope: this.scope, catalog_epoch: this.catalogEpoch, head: this.headState });
+        durable.appendTail(tailEntry);
+        durable.trimTail(this.options.tailLimit);
       });
     }
-    return changed;
+    return { status: "applied", head: this.headState, changed };
   }
 
   /** CO13 bounded repair: recompute the contents relation from authority
    * live cells (presence rows are preserved — they rebuild from session
-   * cells once CO14 lands). Replaces rows in memory and durably. */
+   * cells once CO14 lands). Replaces rows in memory and durably.
+   *
+   * When `scopeOf` is wired (multi-scope), candidates whose OWNER is
+   * anchored elsewhere are dropped: those rows belong at the owning
+   * scope (they were delivered there via /net/relate at derivation
+   * time), and rebuilding them here would mint a second copy of another
+   * scope's row family — the CO9 dual-write this module exists to
+   * prevent. Single-scope rebuilds keep everything. */
   rebuildRelations(): void {
     const rebuilt = rebuildContentsRelation([...this.store.keys()].map((key) => this.store.get(key)).filter((c): c is Cell => Boolean(c)));
+    if (this.options.scopeOf) {
+      for (const [key, row] of [...rebuilt]) {
+        if (this.options.scopeOf(row.owner) !== this.scope) rebuilt.delete(key);
+      }
+    }
     for (const [key, row] of [...this.relationRows]) {
       if (row.relation === "contents" && !rebuilt.has(key)) this.relationRows.delete(key);
     }

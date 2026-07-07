@@ -8,7 +8,12 @@
  *     cells) and the per-scope fanout high-water (CO2.5 receiver
  *     idempotency), hydrated lazily;
  *   - the internal-auth'd /net surface:
- *       POST /net/fanout  FanoutBody → install cells, advance seen seq
+ *       POST /net/fanout  FanoutBody → install cells, advance seen seq,
+ *                         mirror relation deltas (CO13) under the same
+ *                         high-water
+ *       GET  /net/relation ?relation=&owner= → the member rows of one
+ *                         relation at one owner (the CO13 client-read
+ *                         primitive for who/contents)
  *       POST /net/pull    {scope, destination} → CO7 state-transfer
  *                         cache-fill: KV seed first when HOST_SEED_KV is
  *                         bound (head-checked against the live scope;
@@ -34,6 +39,7 @@
 import { CellStore, cellKey, type Cell } from "../../net/cells";
 import { budgetExhausted, isNetError, type AttemptTraceEntry, type NetErrorCode } from "../../net/errors";
 import { applyFanout, type FanoutBody } from "../../net/outbox";
+import { relationKey, type RelationDelta } from "../../net/relations";
 import { planTurn, type PlanTurnInput, type PlanTurnResult } from "../../net/plan";
 import type { ScopeClassifier } from "../../net/route";
 import { CATALOG_SCOPE, classifierFromLineage, type AnchorLineage } from "../../net/topology";
@@ -163,6 +169,16 @@ export class NetGatewayDO {
     // SqliteScopeStore: cheap, idempotent, no separate first-boot path.
     state.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_gateway_cell (key TEXT PRIMARY KEY, body TEXT NOT NULL)");
     state.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_gateway_scope (scope TEXT PRIMARY KEY, seen_seq INTEGER NOT NULL)");
+    // CO13 relation mirror: roster rows (contents, session_presence)
+    // received via FanoutBody.relations — the client-read primitive for
+    // who/contents (GET /net/relation). SQLite-only (no memory cache):
+    // reads are per-request queries and writes are gated by the same
+    // per-scope seen high-water as cells, so there is no hydrated state
+    // to keep coherent. Columns denormalize the row for the
+    // (relation, owner) query; `body` is the row's JSON body or NULL.
+    state.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS net_gateway_relation (key TEXT PRIMARY KEY, relation TEXT NOT NULL, owner TEXT NOT NULL, member TEXT NOT NULL, body TEXT)"
+    );
     // Selection pinning (fix 5c): idempotency_key → the scope the FIRST
     // submit for that key targeted. A re-plan (same key, refreshed view)
     // must never migrate the commit to a different scope — the pinned
@@ -207,6 +223,26 @@ export class NetGatewayDO {
         const key = url.searchParams.get("key") ?? "";
         const cell = this.ensureView().get(key) ?? null;
         return json({ key, cell });
+      }
+      if (request.method === "GET" && url.pathname === "/net/relation") {
+        // CO13 client-read primitive: the members of one relation at one
+        // owner (who is in the room / what a container holds), served
+        // from the fanout-fed mirror. Phase-4 transports wrap this for
+        // real clients; until then it is the lane's roster probe.
+        const relation = url.searchParams.get("relation") ?? "";
+        const owner = url.searchParams.get("owner") ?? "";
+        if (!relation || !owner) throw new Error("relation and owner query params are required");
+        const members = sqlRows<{ member: string; body: string | null }>(
+          this.state.storage.sql.exec(
+            "SELECT member, body FROM net_gateway_relation WHERE relation = ? AND owner = ? ORDER BY member ASC",
+            relation,
+            owner
+          )
+        ).map((row) => ({
+          member: row.member,
+          ...(row.body !== null ? { body: JSON.parse(row.body) as unknown } : {})
+        }));
+        return json({ relation, owner, members });
       }
       return json({ error: `no such route: ${request.method} ${url.pathname}` }, 404);
     } catch (err) {
@@ -489,13 +525,16 @@ export class NetGatewayDO {
         ...(attestations !== undefined ? { attestations } : {})
       };
 
-      // The submit rides with its rider directions (CA3 forward): the
-      // scope shell enqueues /net/adopt rows for the accepted rider
-      // cells after commit. CommitSubmit itself is unchanged — riders
-      // are an HTTP-body sibling, not sequencer input.
+      // The submit rides with its rider directions (CA3 forward) and its
+      // relation-owner directions (CO13): the scope shell enqueues
+      // /net/adopt rows for the accepted rider cells and /net/relate
+      // rows for foreign relation deltas after commit. CommitSubmit
+      // itself is unchanged — both are HTTP-body siblings, not sequencer
+      // input.
       const submitBody = {
         submit,
-        rider_destinations: this.riderDestinationsFor(request, classifier, planned)
+        rider_destinations: this.riderDestinationsFor(request, classifier, planned),
+        relate_destinations: this.relateDestinationsFor(request, classifier, planned, targetScope)
       };
       let reply: CommitReply;
       try {
@@ -724,6 +763,54 @@ export class NetGatewayDO {
     return out;
   }
 
+  /** CO13 relation-owner directions for the committing scope: the
+   * transcript's relation OWNER objects — move sources/destinations,
+   * create locations, contents-write containers, session-transition
+   * rooms — classified by the same walk route.ts selects scopes with,
+   * keeping only owners anchored to a scope OTHER than the committing
+   * one. The scope shell feeds these to the sequencer's delta partition
+   * (`scopeOf`) and addresses the /net/relate outbox rows from them —
+   * anchor topology stays gateway knowledge (the rider_destinations
+   * rule). An owner the classifier cannot place falls back to the
+   * planning scope inside `classifierFor`, so a same-turn-created
+   * container classifies with the turn, never as a spurious foreign
+   * owner. */
+  private relateDestinationsFor(
+    request: TurnRequest,
+    classifier: ScopeClassifier,
+    planned: PlanTurnResult,
+    targetScope: string
+  ): Record<string, { destination: string; objects: string[] }> {
+    const owners = new Set<string>();
+    for (const move of planned.transcript.moves ?? []) {
+      if (move.from) owners.add(move.from);
+      owners.add(move.to);
+    }
+    for (const create of planned.transcript.creates ?? []) {
+      if (create.location) owners.add(create.location);
+    }
+    for (const write of planned.transcript.writes) {
+      if (write.cell.kind === "contents") owners.add(write.cell.object);
+    }
+    const transition = planned.transcript.sessionScopeTransition;
+    if (transition?.from) owners.add(transition.from);
+    if (transition?.to) owners.add(transition.to);
+
+    const objectsByScope = new Map<string, Set<string>>();
+    for (const owner of owners) {
+      const scope = classifier.scopeOf(owner);
+      if (scope === targetScope) continue; // local owner: the commit applies its rows itself
+      const set = objectsByScope.get(scope) ?? new Set<string>();
+      set.add(owner);
+      objectsByScope.set(scope, set);
+    }
+    const out: Record<string, { destination: string; objects: string[] }> = {};
+    for (const [scope, objects] of objectsByScope) {
+      out[scope] = { destination: this.destinationFor(request, scope), objects: [...objects].sort() };
+    }
+    return out;
+  }
+
   /** One planning pass against the current view. The provisional base is
    * patched after the head fetch — `base` is an envelope field, not part
    * of the transcript hash. Catalog-scope lineage keys ride as the
@@ -881,6 +968,12 @@ export class NetGatewayDO {
         const applied = applyFanout(view, this.seen, body);
         if (applied) {
           for (const cell of body.cells) this.persistCell(view, cell.key);
+          // CO13: relation deltas ride the same body and the same seq
+          // gate — a redelivered body no-ops above (applyFanout), so the
+          // mirror never double-applies. applyFanout itself stays
+          // cell-only (relation rows are not cells); the shell owns the
+          // mirror table.
+          for (const delta of body.relations ?? []) this.applyRelationDelta(delta);
           this.state.storage.sql.exec(
             "INSERT INTO net_gateway_scope (scope, seen_seq) VALUES (?, ?) ON CONFLICT(scope) DO UPDATE SET seen_seq = excluded.seen_seq",
             body.scope,
@@ -890,6 +983,25 @@ export class NetGatewayDO {
         return applied;
       })
     );
+  }
+
+  /** One relation delta into the mirror table (add = upsert, remove =
+   * delete; both idempotent, matching applyRelationDeltas' semantics at
+   * the owning scope). */
+  private applyRelationDelta(delta: RelationDelta): void {
+    const key = relationKey(delta.row.relation, delta.row.owner, delta.row.member);
+    if (delta.op === "add") {
+      this.state.storage.sql.exec(
+        "INSERT INTO net_gateway_relation (key, relation, owner, member, body) VALUES (?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET body = excluded.body",
+        key,
+        delta.row.relation,
+        delta.row.owner,
+        delta.row.member,
+        delta.row.body !== undefined ? JSON.stringify(delta.row.body) : null
+      );
+    } else {
+      this.state.storage.sql.exec("DELETE FROM net_gateway_relation WHERE key = ?", key);
+    }
   }
 
   /**
