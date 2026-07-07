@@ -309,3 +309,144 @@ describe("CO16 scheduled-turn dispatch at the scope (chunk 1)", () => {
     expect(plannerB.received).toEqual([]);
   });
 });
+
+// ---- Chunk 2: the planner gateway executes exactly once --------------------
+describe("CO16 planner gateway execution (chunk 2, end-to-end over fake-DO)", () => {
+  it("alarm → planner plans+submits the scheduled verb turn; redelivery cannot double-commit; a cold planner converges via pull-on-miss", async () => {
+    // ---- Engine-real fixture: a room, a room-anchored box with a
+    // counter-only bump verb, and the real actor placed in the room —
+    // partitioned into room/cluster/catalog scope DOs (CO15, the default
+    // proving fixture).
+    const world = createWorld();
+    const session = world.auth("guest:net-sched");
+    const actor = session.actor;
+    world.createObject({ id: "sched_room", name: "Sched Room", parent: "$space", owner: actor });
+    world.createObject({ id: "sched_box", name: "Sched Box", parent: "$thing", owner: actor, anchor: "sched_room", location: "sched_room" });
+    world.defineProperty("sched_box", { name: "counter", defaultValue: 0, owner: actor, perms: "rw", typeHint: "int" });
+    const installed = installVerb(
+      world,
+      "sched_box",
+      "bump",
+      `verb :bump() rxd {
+        this.counter = this.counter + 1;
+        return this.counter;
+      }`,
+      null
+    );
+    expect(installed.ok).toBe(true);
+    const placed = await world.directCall("sched-genesis-place", actor, actor, "moveto", ["sched_room"], { sessionId: session.id });
+    expect(placed.op).toBe("result");
+
+    const partitions = partitionCells(cellsFromSerialized(world.exportWorld()));
+    const roomScope = "room:sched_room";
+    const clusterScope = `cluster:${actor}`;
+    expect([...partitions.keys()]).toEqual(expect.arrayContaining([roomScope, clusterScope, CATALOG_SCOPE]));
+
+    // ---- Scope DOs + the planner gateway, wired by the CO15
+    // `scope:<scopeName>` convention. The room reaches the planner as
+    // `gateway:sched-gw`; RPCs are logged per destination+path so the
+    // test can assert WHERE dispatches and pull-on-miss went.
+    const rpcLog: string[] = [];
+    const scopeDOs = new Map<string, NetScopeDO>();
+    const gateways = new Map<string, NetGatewayDO>();
+    const resolve = (destination: string): NetStub => {
+      const target = destination.startsWith("scope:")
+        ? scopeDOs.get(destination.slice("scope:".length))
+        : destination.startsWith("gateway:")
+          ? gateways.get(destination.slice("gateway:".length))
+          : undefined;
+      if (!target) throw new Error(`unexpected destination ${destination}`);
+      return {
+        fetch: (request: Request) => {
+          rpcLog.push(`${destination}${new URL(request.url).pathname}`);
+          return target.fetch(request);
+        }
+      };
+    };
+    const scopeEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve };
+    const gatewayEnv: NetGatewayEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve };
+    const doStates = new Map<string, ReturnType<typeof netState>>();
+    for (const scope of [roomScope, clusterScope, CATALOG_SCOPE]) {
+      const st = netState(`scope-${scope}`);
+      const instance = new NetScopeDO(st.state, scopeEnv);
+      await call(instance, scopeEnv, "/seed", { scope, catalog_epoch: EPOCH, cells: partitions.get(scope) ?? [] });
+      doStates.set(scope, st);
+      scopeDOs.set(scope, instance);
+    }
+    const gatewayState = netState("gateway-sched");
+    const gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
+    gateways.set("sched-gw", gateway);
+    for (const scope of [roomScope, clusterScope, CATALOG_SCOPE]) {
+      await call(gateway, gatewayEnv, "/pull", { scope, destination: `scope:${scope}` });
+    }
+    const roomDO = scopeDOs.get(roomScope) as NetScopeDO;
+    const roomState = doStates.get(roomScope) as ReturnType<typeof netState>;
+    await call(roomDO, scopeEnv, "/subscribe", { destination: "gateway:sched-gw", role: "planner" });
+
+    const counterAt = async (): Promise<unknown> => {
+      const closure = await call<{ cells: Array<{ value: unknown }> }>(roomDO, scopeEnv, "/closure", {
+        keys: ["property_cell:sched_box:counter"],
+        known: ["object_lineage:sched_box"]
+      });
+      return closure.cells[0]?.value;
+    };
+
+    // ---- The full CO16 path: schedule → alarm → outbox → planner runs
+    // the normal turn machinery → the effect lands in scope authority.
+    const dueAt = Date.now() + 30;
+    const bumpTurn: ScheduledTurn = { id: "sched-e2e", at_logical_time: dueAt, call: { actor, target: "sched_box", verb: "bump", args: [] } };
+    await call(roomDO, scopeEnv, "/schedule", { scope: roomScope, catalog_epoch: EPOCH, turn: bumpTurn });
+    await sleep(60);
+    rpcLog.length = 0;
+    await roomDO.alarm();
+    await roomState.settle();
+    await gatewayState.settle();
+
+    expect(rpcLog).toContain("gateway:sched-gw/net/plan-scheduled");
+    expect(rpcLog).toContain(`scope:${roomScope}/net/submit`);
+    expect(await counterAt()).toMatchObject({ value: 1 });
+    expect(scheduledRows(roomState.state)).toEqual([]);
+    expect(outboxRows(roomState.state)).toEqual([]);
+    const headAfterFirst = (await call<{ head: { seq: number } }>(roomDO, scopeEnv, "/head")).head;
+
+    // ---- Redelivery cannot double-commit: the same dispatch body (the
+    // outbox redelivers it verbatim, so id AND at_logical_time — the
+    // idempotency-key inputs — are identical) replans under the SAME
+    // `sched:<id>:<at>` key, and the committing scope's reply cache
+    // returns the recorded reply. The head does not advance and the
+    // counter does not move.
+    const redelivered = await call<{ reply: CommitReply }>(gateway, gatewayEnv, "/plan-scheduled", {
+      scheduled_turn: bumpTurn,
+      scope: roomScope,
+      catalog_epoch: EPOCH
+    });
+    expect(redelivered.reply.status).toBe("accepted");
+    expect(redelivered.reply.status === "accepted" && redelivered.reply.head.seq).toBe(headAfterFirst.seq);
+    expect(await counterAt()).toMatchObject({ value: 1 });
+
+    // ---- A COLD planner converges via pull-on-miss: a fresh gateway
+    // (nothing pulled, no fanout history) receives a dispatch directly
+    // and must pull the sending scope, the catalog closure, and the call
+    // actor's cluster before planning — then commit normally.
+    const coldState = netState("gateway-sched-cold");
+    const coldGateway = new NetGatewayDO(coldState.state, gatewayEnv);
+    gateways.set("cold-gw", coldGateway);
+    rpcLog.length = 0;
+    const coldTurn: ScheduledTurn = { id: "sched-cold", at_logical_time: dueAt + 1, call: { actor, target: "sched_box", verb: "bump", args: [] } };
+    const cold = await call<{ reply: CommitReply; attempt: number }>(coldGateway, gatewayEnv, "/plan-scheduled", {
+      scheduled_turn: coldTurn,
+      scope: roomScope,
+      catalog_epoch: EPOCH
+    });
+    expect(cold.reply.status, JSON.stringify(cold.reply)).toBe("accepted");
+    expect(await counterAt()).toMatchObject({ value: 2 });
+    // Pull-on-miss went to all three unseen scopes (live closure pulls).
+    for (const scope of [roomScope, CATALOG_SCOPE, clusterScope]) {
+      expect(rpcLog).toContain(`scope:${scope}/net/closure`);
+    }
+
+    for (const st of doStates.values()) st.close();
+    gatewayState.close();
+    coldState.close();
+  });
+});

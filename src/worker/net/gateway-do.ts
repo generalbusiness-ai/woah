@@ -24,6 +24,15 @@
  *                         cluster scope (stale_head-only retry), install
  *                         the accepted cell in the view (test/lane-facing
  *                         until Phase-4 transports authenticate in front)
+ *       POST /net/plan-scheduled  CO16 planner execution: a scope's due
+ *                         scheduled turn, delivered via its durable
+ *                         outbox to this gateway (subscribed with role
+ *                         "planner"), runs the NORMAL /net/turn
+ *                         machinery under the stable idempotency key
+ *                         `sched:<id>:<at_logical_time>` — at-least-once
+ *                         delivery + the committing scope's reply cache
+ *                         = fired exactly once. Cold views pull-on-miss
+ *                         before planning (see planScheduled)
  *       POST /net/turn    the CO6-taxonomy repair loop: plan → submit,
  *                         with each retryable verdict mapped to its
  *                         defined recovery (refetch head / targeted
@@ -49,7 +58,7 @@ import { mintSessionSubmit } from "../../net/sessions";
 import { planTurn, type PlanTurnInput, type PlanTurnResult } from "../../net/plan";
 import type { ScopeClassifier } from "../../net/route";
 import { CATALOG_SCOPE, classifierFromLineage, type AnchorLineage } from "../../net/topology";
-import type { CommitReply, CommitSubmit, RejectReason, ScopeHead } from "../../net/scope";
+import type { CommitReply, CommitSubmit, RejectReason, ScheduledTurn, ScopeHead } from "../../net/scope";
 import { netCellKeyFor } from "../../net/transcript";
 import type { CellTransfer } from "../../net/cells";
 import { verifyInternalRequest } from "../internal-auth";
@@ -129,6 +138,14 @@ type TurnRequest = {
   /** which scopes are shared sequencers (rooms); others are clusters. */
   shared?: string[];
   counters?: PlanTurnInput["counters"];
+};
+
+/** /net/plan-scheduled body (CO16; see planScheduled): the wire shape
+ * the scope's outbox drain delivers. */
+type PlanScheduledRequest = {
+  scheduled_turn: ScheduledTurn;
+  scope: string;
+  catalog_epoch: string;
 };
 
 /** /net/session-open body (CO14 mint; see sessionOpen). */
@@ -231,6 +248,9 @@ export class NetGatewayDO {
       }
       if (request.method === "POST" && url.pathname === "/net/turn") {
         return json(await this.turn((await request.json()) as TurnRequest));
+      }
+      if (request.method === "POST" && url.pathname === "/net/plan-scheduled") {
+        return json(await this.planScheduled((await request.json()) as PlanScheduledRequest));
       }
       if (request.method === "POST" && url.pathname === "/net/session-open") {
         return json(await this.sessionOpen((await request.json()) as SessionOpenRequest));
@@ -678,6 +698,69 @@ export class NetGatewayDO {
       budget_ms: REPAIR_BUDGET_MS,
       max_attempts: MAX_TURN_ATTEMPTS,
       elapsed_ms: this.host.now() - startedAt
+    });
+  }
+
+  /**
+   * /net/plan-scheduled — CO16 planner execution: run a scope's due
+   * scheduled turn through the NORMAL turn machinery (the same repair
+   * loop, pinning, attestation, and install-on-accept as /net/turn).
+   *
+   * - **Exactly once.** The idempotency key is the stable
+   *   `sched:<id>:<at_logical_time>`: the scope's outbox delivers
+   *   at-least-once, and every redelivery replans under the SAME key, so
+   *   the committing scope's reply cache (CO2.5, checked before any
+   *   validation) returns the recorded reply instead of re-committing.
+   *   The 200 reply — accepted OR terminal-rejected TurnResult — is what
+   *   deletes the sender's outbox row.
+   * - **Sessions-absent rule (CO14).** ScheduledTurn.call carries
+   *   actor/target/verb/args and no session, so scheduled turns run as
+   *   actor-authority DIRECT-route turns (the lane/tooling allowance) —
+   *   until VTN18.2's engine-side scheduling lands an authority field,
+   *   this is the documented CO16 posture.
+   * - **Pull-on-miss.** A planner may be woken with a COLD view (first
+   *   dispatch after deployment/eviction). Scopes this gateway has never
+   *   seen (no fanout/pull high-water) are pulled before planning: the
+   *   SENDING scope, the catalog scope (class chains + verb bytecode —
+   *   normally KV-seeded at install, CO15), and the call actor's cluster
+   *   by the CO15 `cluster:<actor>` convention (best-effort: a
+   *   non-cluster-rooted actor's pull fails as a named metric and the
+   *   turn falls back to the standard E_MISSING_STATE recovery).
+   *   Head-0 caveat: a scope whose head has never advanced records no
+   *   high-water, so seed-only scopes re-pull per dispatch — redundant
+   *   but harmless, and scheduled turns are rare by design.
+   */
+  private async planScheduled(body: PlanScheduledRequest): Promise<TurnResult> {
+    this.ensureView(); // hydrates the `seen` high-water map alongside the view
+    const turn = body.scheduled_turn;
+    for (const scope of new Set([body.scope, CATALOG_SCOPE, `cluster:${turn.call.actor}`])) {
+      if (this.seen.has(scope)) continue;
+      try {
+        await this.pull({ scope, destination: `scope:${scope}` });
+      } catch (err) {
+        // Named, never silent: the standard planning recovery is the
+        // fallback when a warm-up pull cannot land.
+        console.log(
+          "woo.metric",
+          JSON.stringify({ kind: "net_plan_scheduled_pull_miss_failed", scope, error: String(err), ts: Date.now() })
+        );
+      }
+    }
+    const key = `sched:${turn.id}:${turn.at_logical_time}`;
+    return this.turn({
+      call: {
+        kind: "woo.turn_call.shadow.v1",
+        id: key,
+        route: "direct",
+        scope: body.scope,
+        actor: turn.call.actor,
+        target: turn.call.target,
+        verb: turn.call.verb,
+        args: turn.call.args as PlanTurnInput["call"]["args"]
+      },
+      planningScope: body.scope,
+      catalog_epoch: body.catalog_epoch,
+      idempotency_key: key
     });
   }
 

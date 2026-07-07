@@ -190,8 +190,41 @@ owners.**
    sequenced fold turn → GET /net/relation session_presence roster at
    the annex — 12/12. Fanout-audience-from-presence wiring stays with
    Phase 4 (spec CO13 note updated).
-5. CO16 scheduled execution — closes CO2.8.
-Each lands spec-first, then code, with lane coverage extended to a
+5. CO16 scheduled execution — DONE (branch net-phase35); closes CO2.8.
+   Subscribers carry a role (fanout | planner; PK (destination, role),
+   legacy destination-only tables recreate-migrated in place with
+   existing rows as fanout). At alarm time the scope moves each due
+   turn ATOMICALLY from the scheduled row family to a durable
+   /plan-scheduled outbox row in one transaction (row ids keyed by a
+   durable dispatch counter — scheduled dispatch never advances the
+   head), addressed to the lexicographically FIRST planner-role
+   subscriber; failover is the outbox lane's retry/backoff/abandon
+   policy, no election. The planner gateway (POST /net/plan-scheduled)
+   runs the NORMAL turn machinery under the stable
+   sched:<id>:<at_logical_time> idempotency key — at-least-once
+   delivery + the committing scope's reply cache = fired exactly once;
+   a 200 (accepted or terminal-rejected) deletes the sender's row. Cold
+   planner views pull-on-miss (sending scope, catalog closure, the call
+   actor's cluster — each only when no high-water exists); scheduled
+   turns run SESSION-LESS as actor-authority direct-route turns per
+   CO14's sessions-absent rule (until VTN18.2's authority field). No
+   planner → parked + the named net_scope_scheduled_turn_fired metric;
+   a late planner subscription arms an immediate wake. Tests:
+   tests/worker/net-scheduled.test.ts (7 — atomic move, parked state,
+   late-planner wake, crash-window survival, legacy-table migration,
+   deterministic pick, and the end-to-end planner suite with redelivery
+   idempotency + cold-view convergence). Lane: the workerd smoke's
+   metric-only scheduled step became the full path — planner subscribe,
+   schedule the bump fixture ~2s out, poll the room's counter cell for
+   the committed effect — 12/12.
+
+**Phase 3.5 COMPLETE.** All five items landed on branch net-phase35:
+(1) CO2.3 rider attestation + owner-sequenced adoption, (2) CO15
+derived topology (partitionCells + catalog scope), (3) CO13 relations +
+/net/relate, (4) CO14 session cells (mint + authorize + transition
+folding), (5) CO16 scheduled-turn execution.
+
+Each landed spec-first, then code, with lane coverage extended to a
 three-scope topology (room, cluster, catalog) as the new default fixture.
 
 ## Gate-flake evidence (2026-07-07, recorded during CO15)

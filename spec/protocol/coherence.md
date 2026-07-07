@@ -531,14 +531,41 @@ One write path per fact (CO9), concretized:
 ## CO16. Scheduled-turn execution
 
 - The scope remains the durable home and the waker (CO2.8); **a
-  registered planner gateway executes**. Subscription carries a role
-  (`fanout` | `planner`); at alarm time the scope delivers each due turn
-  to a planner via the durable outbox
-  (`POST /net/plan-scheduled`), and the planner runs the normal turn
-  machinery with idempotency key `sched:<id>:<at_logical_time>` —
-  at-least-once delivery + the scope's reply cache = fired exactly once.
+  registered planner gateway executes**. `/net/subscribe` carries a
+  role (`fanout` | `planner`; fanout is the default, and fanout/refan
+  delivery targets fanout-role subscribers only — one destination may
+  hold both roles). At alarm time the scope moves each due turn
+  **atomically** from the scheduled row family to a durable outbox row
+  (`POST /net/plan-scheduled {scheduled_turn, scope, catalog_epoch}`)
+  in one transaction: the turn exists in exactly one family at any
+  instant — never lost, never duplicated. Rows address ONE planner,
+  chosen deterministically (the lexicographically first planner-role
+  subscriber, so re-fires address the same reply cache); failover is
+  the outbox lane's ordinary retry/backoff/abandon policy (abandonment
+  is the named divergence) — multi-planner election is deliberately out
+  of scope.
+- **The planner runs the normal turn machinery** (the `/net/turn`
+  repair loop, selection pinning, attestation, install-on-accept) with
+  idempotency key `sched:<id>:<at_logical_time>` — at-least-once
+  delivery + the committing scope's reply cache = fired exactly once. A
+  200 reply (an accepted OR terminal-rejected TurnResult) deletes the
+  sender's outbox row: a terminal verdict will not change on
+  redelivery. A cold planner view **pulls on miss** before planning —
+  the sending scope, the catalog closure, and the call actor's cluster
+  (the CO15 conventions), each only when the gateway holds no
+  high-water for it; anything further rides the standard
+  E_MISSING_STATE recovery.
+- **Scheduled turns are session-less**: `ScheduledTurn.call` carries
+  actor/target/verb/args and no session, so per CO14's sessions-absent
+  rule they run as actor-authority DIRECT-route turns. This is the
+  documented posture until VTN18.2's engine-side scheduling lands an
+  authority field.
 - With no registered planner, due turns stay parked with a named metric
-  (the non-destructive peek is the specified no-planner state).
+  (`net_scope_scheduled_turn_fired`; the non-destructive peek is the
+  specified no-planner state). A later planner subscription arms an
+  immediate wake, so parked overdue turns dispatch without waiting for
+  an unrelated alarm. Dispatches emit
+  `net_scope_scheduled_turn_dispatched`.
 - Engine-side `schedules`/`cancellations` transcript fields (VTN18.2)
   remain deferred until the DSL exposes scheduling; `/net/schedule` is
   the substrate surface until then.

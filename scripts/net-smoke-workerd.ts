@@ -22,8 +22,12 @@
 //                    /net/session-open mints at the cluster, an
 //                    engine-planned SEQUENCED turn folds the session
 //                    transition, and the presence roster reads back via
-//                    GET /net/relation → scheduled turn fires via a REAL
-//                    workerd alarm.
+//                    GET /net/relation → CO16 scheduled execution: the
+//                    gateway subscribes as PLANNER, a REAL workerd alarm
+//                    moves the due bump turn through the durable outbox
+//                    to /net/plan-scheduled, the planner runs the normal
+//                    turn machinery, and the effect lands in the room's
+//                    authority (counter cell polled at the scope).
 //   run 2 (latency): WOO_NET_FAULTS latency 100 ms on /submit — the warm
 //                    turn still converges with attempt === 1 (latency is
 //                    not divergence; the CO12.5 gate the v2 era lacked).
@@ -66,7 +70,12 @@ const GATEWAY = "lane-gw";
 
 type StepResult = { name: string; ok: boolean; detail?: string };
 const results: StepResult[] = [];
-let metrics: Array<Record<string, unknown>> = [];
+/** woo.metric lines parsed off workerd stdout. No step asserts on these
+ * since CO16 made scheduled execution observable by its EFFECT (the
+ * counter cell) instead of by metric; kept as the lane's diagnostics
+ * channel — the readline consumer also keeps the child's stdout pipe
+ * drained. */
+const metrics: Array<Record<string, unknown>> = [];
 
 function step(name: string, ok: boolean, detail?: string): void {
   results.push({ name, ok, ...(detail ? { detail } : {}) });
@@ -222,18 +231,27 @@ async function main(): Promise<number> {
     });
     step("session cell committed at its cluster authority with the transitioned scope", transitionedSession !== null);
 
-    // Scheduled turn fires via a REAL workerd alarm (CO2.8 at lane level).
-    metrics = [];
+    // CO16 scheduled-turn execution end-to-end via a REAL workerd alarm:
+    // the gateway registers as PLANNER on the room; the alarm moves the
+    // due bump turn through the durable outbox to /net/plan-scheduled;
+    // the planner runs the normal turn machinery (idempotency key
+    // sched:<id>:<at_logical_time>); the effect lands in the ROOM's
+    // authority — polled off the scope's counter cell, which turns 1+2
+    // bumped to 2 (the full path, not the Phase-3 metric-only peek).
+    await post(base, "scope", ROOM, "subscribe", { destination: `gateway:${GATEWAY}`, role: "planner" });
     await post(base, "scope", ROOM, "schedule", {
       scope: ROOM,
       catalog_epoch: EPOCH,
-      turn: { id: "lane-tick", at_logical_time: Date.now() + 1500, call: { actor: fixture.actor, target: "lane_box", verb: "tick", args: [] } }
+      turn: { id: "lane-tick", at_logical_time: Date.now() + 2000, call: { actor: fixture.actor, target: "lane_box", verb: "bump", args: [] } }
     });
-    const fired = await poll(
-      async () => metrics.find((m) => m.kind === "net_scope_scheduled_turn_fired" && m.id === "lane-tick") ?? null,
-      15_000
-    );
-    step("scheduled turn fired via real workerd alarm", fired !== null);
+    const bumped = await poll(async () => {
+      const closure = await post<{ cells: Array<{ value?: { value?: number } }> }>(base, "scope", ROOM, "closure", {
+        keys: ["property_cell:lane_box:counter"],
+        known: ["object_lineage:lane_box"]
+      });
+      return closure.cells[0]?.value?.value === 3 ? closure : null;
+    }, 15_000);
+    step("scheduled turn executed by the planner gateway via real workerd alarm (counter 2→3)", bumped !== null);
   });
 
   // ---- run 2: injected submit latency ------------------------------------
