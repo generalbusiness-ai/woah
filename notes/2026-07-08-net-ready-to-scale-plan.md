@@ -27,9 +27,16 @@ invariant green.
   driver parameterized by: rooms `R`, sessions/room `S`, off-room sessions
   `X`, cold-open, outbox backlog `B`, scheduled-due burst `D`.
 - Instrument counters (reuse D2 `net_turn_structure` `sync_rpc`/
-  `reconstructions`; ADD: `plan_cells` = cells fed to the planning world,
-  `presence_scan_rows` per fanout, `closure_bytes`/`closure_pages`,
-  `outbox_drain_rows` per pass).
+  `reconstructions`; ADD: `plan_cells`, `presence_scan_rows` per fanout,
+  `closure_bytes`/`closure_pages`, `outbox_drain_rows` per pass).
+- **`plan_cells` is MANDATORY and sourced from the exact cell array passed
+  to `planningWorldFromCells`** (today `storeCells(snapshot)` — the whole
+  view), NOT inferred from `readClosureCells` after planning (review #5).
+  The existing structure counters (attempt/bytes/sync_rpc/writes/
+  reconstructions, `gateway-do.ts:634`) do not see the resident-view
+  clone/rebuild CPU at all; and counting the post-hoc read closure would
+  already look small today, hiding the very O(view) cost the red baseline
+  must show. Count the planner INPUT, not its output.
 - Assert INVARIANTS (ratios across two world sizes), not absolute times:
   - `plan_cells` and warm `sync_rpc` **flat as view size grows** (Phase 1);
   - `presence_scan_rows` ~ room occupants, **flat as `X` grows** (Phase 2);
@@ -45,11 +52,21 @@ Today `plan.ts:94` `view.clone()` copies ALL cells and `:98`
 `planningWorldFromCells(storeCells(snapshot))` builds the world from ALL of
 them, every turn → O(view). Make it O(read-set):
 
-- Compute the turn's **seed slice**: actor + session + target + their
-  `lineageClosureKeys` (`cells.ts:281`) — the statically-knowable reads.
-- **Slice-clone** for the fix-6 consistent snapshot (clone only seed keys,
-  not the whole store), preserving the version-laundering guarantee for the
-  slice.
+- Compute the turn's **seed slice** with an explicit slice builder — NOT
+  a one-shot `lineageClosureKeys` (review #3: that helper is ONE-HOP,
+  `cells.ts:281`; transitive lineage needs the fixed-point loop
+  `scope-do.ts:949`). The builder must include, so a warm turn dispatches
+  in attempt 1 with zero miss→pull rounds:
+  1. **fixed-point lineage closure** of actor + session + target (loop
+     `lineageClosureKeys` to convergence, per `scope-do.ts:949`);
+  2. the actor/session **live + session cells**;
+  3. the target's **dispatch chain**: `verb_bytecode` pages + property-def
+     cells up the parent/class chain (bytecode is stored as per-object
+     cells, `bridge.ts:107`), so inherited verbs/props resolve locally
+     rather than as a repair round.
+- **Slice-clone** for the fix-6 consistent snapshot (clone only the built
+  slice's keys, not the whole store), preserving the version-laundering
+  guarantee for the slice.
 - Build the planning world from the **slice**, run sparse. A read the verb
   makes outside the seed is already a CO2.6 miss → `E_MISSING_STATE`
   (`translateSparsePlanningThrow`) → the existing repair loop pulls those
@@ -63,23 +80,37 @@ them, every turn → O(view). Make it O(read-set):
   already models the actual read set — reuse its shape for the seed.
 - Invariant (Phase 0): `plan_cells`/warm `sync_rpc` flat as view grows.
 - Tests: extend the D2 `net-turn-structure` gate to assert `plan_cells` ~
-  read-set on a large-view fixture; `load:net-dev` plan invariant green.
-- Risk: cold turns may take extra miss→pull rounds. Mitigate with a
-  complete seed (actor/session/target/lineage covers the common case) and
-  the bounded repair budget; the load gate quantifies cold-round count.
+  read-set on a large-view fixture; and a **large-UNRELATED-view test**
+  (many resident cells the turn never touches) that still commits in
+  **attempt 1 with 0 reconstructions** (review #3) — proving both that warm
+  = O(slice) not O(view) AND that the slice builder is complete enough for
+  dispatch. `load:net-dev` plan invariant green.
+- Risk: an incomplete seed turns a warm turn into extra miss→pull rounds
+  (the attempt-1 test is the guard). The dispatch-chain + fixed-point
+  lineage seed covers the common case; the bounded repair budget covers the
+  tail; the load gate quantifies cold-round count.
 
 ## Phase 2 — presence by-scope (remove O(sessions) fanout scan)
 
 `pushObservations` scans the whole presence table (`gateway-do.ts:1658`,
 no owner predicate) then filters in JS (`:1671`).
 
-- Push the filter into SQL: `WHERE relation='session_presence' AND
-  owner=?`, add index `(relation, owner)` on `net_gateway_relation` (the
-  `owner` column already exists, `:381`).
+- **Do NOT filter on the raw `owner` column** (review #1): a relation row's
+  `owner` is an OBJECT id (`ws_annex`) but the fanout body carries a SCOPE
+  name (`room:ws_annex`); today the scan bridges them via
+  `classifier.scopeOf(row.owner)` + fallback `room:${row.owner}`
+  (`gateway-do.ts:1671`), so `WHERE owner=body.scope` would miss every
+  valid occupant. Instead **materialize `owner_scope` at mirror-write
+  time** and filter `WHERE relation='session_presence' AND owner_scope=?`,
+  index `(relation, owner_scope)`. (`owner_scope` is a new column →
+  schema-before-data, Phase 5 discipline.) Computing it once at write also
+  removes the per-fanout classifier walk.
 - Invariant: `presence_scan_rows` ~ occupants, flat as off-room `X` grows.
-- Simplicity: SQL does the filtering; the JS classifier loop shrinks to the
-  room's own rows. Small, independent, high value.
-- Test: many off-room sessions; assert scan rows bounded.
+- Simplicity: SQL does the filtering against a precomputed scope; the JS
+  classifier loop per fanout goes away entirely.
+- Tests: many off-room sessions, assert scan rows bounded; AND a fanout
+  whose `body.scope` uses the `room:<object>` convention still reaches the
+  room's occupants (guards the owner-id vs scope-name bridge).
 
 ## Phase 3 — bounded outbox + scheduled (remove O(backlog)/burst)
 
@@ -104,12 +135,24 @@ all due rows in one alarm txn (`:632`).
 Cold warming does `keys:["*"]` (`gateway-do.ts:1764`) enumerating all store
 keys + relations (`scope-do.ts:779/834`) synchronously.
 
-- Client-path warming pulls **targeted** keys (leverages Phase 1's seed
-  slice), not `["*"]`. Reserve full closure for repair/maintenance with
-  byte/page budgets + continuations.
+- Client-path warming pulls **targeted** CELL keys (leverages Phase 1's
+  seed slice), not `["*"]`. Reserve full-closure cell copy for
+  repair/maintenance with byte/page budgets + continuations.
+- **Preserve CO13 roster backfill** (review #2): `selfSubscribe` relies on
+  the FULL pull today precisely because full closure carries the scope's
+  standing relation rows — the pull is what back-fills peer presence after
+  subscribe (`gateway-do.ts:1707`), and the scope emits relation rows only
+  on a full closure (`scope-do.ts:976`, `wantAll`). Dropping the `["*"]`
+  pull would silently starve the mirror of the roster. So the targeted
+  warming MUST still backfill relations: add a **relation-only backfill
+  after subscribe** (or a targeted closure mode that carries the scope's
+  relation pages, paged, without copying all cells). Targeting applies to
+  CELLS; the scope's relation rows still backfill on subscribe.
 - Invariant: `closure_bytes`/`closure_pages` bounded on cold open.
 - Simplicity: first-touch cost tracks what the session needs, not scope
   size.
+- Test: a session subscribing AFTER peers are present still sees the roster
+  under targeted (non-`["*"]`) warming.
 
 ## Phase 5 — durable-format & contract stamps (Register B; before-data track)
 
@@ -141,6 +184,14 @@ Cheap, independent, and **must all be in before any namespace holds data**
   last bullet). This must ship in the FIRST deploy so live sessions are
   routable after a future shard — session ids otherwise carry no lineage
   and cannot be re-sharded.
+- **Delimiter-safe encoding** (review #4): session ids are `s_${hex}`
+  (`gateway-do.ts:1279`) and cell keys are colon-delimited with
+  `objectOfCellKey` assuming object ids never contain `:` (`cells.ts:51`,
+  `gateway-do.ts:284`). The hint MUST forbid `:` — e.g.
+  `s_${shard}_${hex}` with `_` separators (or a fixed-width shard prefix)
+  so `sessionCellKey`/`objectOfCellKey` parsing is unaffected. Add tests
+  around `sessionCellKey`, `objectOfCellKey`, WS tickets, and
+  `/net-api/turn` with a hinted session id.
 - Multi-shard `/net-api` routing keyed on the hint — enabled by Phase 1
   (the gateway no longer needs the world resident). May land after the
   first deploy; the hint may not.
@@ -164,6 +215,7 @@ Cheap, independent, and **must all be in before any namespace holds data**
 - **Phase 1** next (the spine; unblocks 4 and 6).
 - **Phases 2, 3, 5** are largely independent and interleave with 1.
 - **Phase 4** after 1. **Phase 6** hint anytime; routing after 1.
-- Schema-adding parts of **3, 5, 6** must precede any live data.
+- Schema-adding parts of **2 (`owner_scope`), 3, 5, 6** must precede any
+  live data (cf-do-0004 freeze).
 
 First-deploy ready-to-scale = Phases 0–5 green + Phase 6 hint stamped.
