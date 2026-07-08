@@ -382,6 +382,13 @@ export class NetGatewayDO {
   ) {
     // CREATE IF NOT EXISTS on every construction — same idiom as
     // SqliteScopeStore: cheap, idempotent, no separate first-boot path.
+    // Phase 5 durable-format stamp (mirrors net_scope_meta's row): the
+    // gateway's one branch point for durable evolution + migration ledger.
+    state.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_gateway_meta (id TEXT PRIMARY KEY, body TEXT NOT NULL)");
+    state.storage.sql.exec(
+      "INSERT OR IGNORE INTO net_gateway_meta (id, body) VALUES ('schema_version', ?)",
+      JSON.stringify({ v: 1 })
+    );
     state.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_gateway_cell (key TEXT PRIMARY KEY, body TEXT NOT NULL)");
     state.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_gateway_scope (scope TEXT PRIMARY KEY, seen_seq INTEGER NOT NULL)");
     // CO13 relation mirror: roster rows (contents, session_presence)
@@ -829,7 +836,13 @@ export class NetGatewayDO {
       const destination = this.destinationFor(request, targetScope);
       if (base === null) {
         structure.countRpc();
-        base = ((await this.host.rpc(destination, "/head")) as { head: ScopeHead }).head;
+        // Phase 5: the head reply names the scope's durable epoch —
+        // consume it. A turn stamped with another epoch can NEVER commit
+        // (re-planning re-stamps the same epoch), so fail fast here
+        // instead of grinding plan → submit → reseed to E_BUDGET.
+        const live = await this.scopeHead(destination);
+        this.assertTurnEpoch(live, request.catalog_epoch, targetScope, trace);
+        base = live.head;
       }
       // CO2.3 rider integrity (rule 1): attest every FOREIGN read — a
       // read whose object anchors to a scope other than the committing
@@ -937,13 +950,19 @@ export class NetGatewayDO {
 
       switch (reply.reason) {
         case "stale_head": {
-          const fresh = await this.tryRecovery(
+          const live = await this.tryRecovery(
             trace,
             async () => {
               structure.countRpc();
-              return ((await this.host.rpc(destination, "/head")) as { head: ScopeHead }).head;
+              return await this.scopeHead(destination);
             }
           );
+          // Phase 5: epoch check OUTSIDE tryRecovery (the M9 pattern) —
+          // a genuine epoch disagreement is terminal and must escape the
+          // retry loop, while a FAILED head fetch stays on the budget
+          // path (recovery_error names it; a later round may converge).
+          if (live !== undefined) this.assertTurnEpoch(live, request.catalog_epoch, targetScope, trace);
+          const fresh = live?.head;
           const headMoved = fresh !== undefined && (fresh.seq !== submit.base.seq || fresh.hash !== submit.base.hash);
           if (fresh !== undefined && headMoved && !reply.mismatched_reads) {
             // The head moved and no reads were reported stale: the
@@ -1120,7 +1139,12 @@ export class NetGatewayDO {
     const destination = request.cluster_destination ?? `scope:${clusterScope}`;
 
     const now = this.host.now();
-    let base = ((await this.host.rpc(destination, "/head")) as { head: ScopeHead }).head;
+    // Phase 5: the session mint stamps request.catalog_epoch; a cluster
+    // scope at another durable epoch would reject every submit, so fail
+    // fast at the head fetch (same rule as the turn path).
+    const liveHead = await this.scopeHead(destination);
+    this.assertTurnEpoch(liveHead, request.catalog_epoch, clusterScope, []);
+    let base = liveHead.head;
     const { submit, value } = mintSessionSubmit({
       session: request.session,
       actor: request.actor,
@@ -1134,7 +1158,7 @@ export class NetGatewayDO {
     for (let attempt = 1; ; attempt += 1) {
       reply = (await this.host.rpc(destination, "/submit", { ...submit, base })) as CommitReply;
       if (reply.status === "accepted" || !reply.retryable || reply.reason !== "stale_head" || attempt >= 3) break;
-      base = ((await this.host.rpc(destination, "/head")) as { head: ScopeHead }).head;
+      base = (await this.scopeHead(destination)).head;
     }
     if (reply.status !== "accepted") return { reply, scope: clusterScope, value };
     // Install the accepted session cell into the view (warm cache-fill,
@@ -2144,6 +2168,35 @@ export class NetGatewayDO {
       slicePlanning: true,
       ...(request.counters !== undefined ? { counters: request.counters } : {})
     });
+  }
+
+  /** The scope's /head reply, epoch included (Phase 5: the epoch was
+   * previously discarded here — the one uniform place every turn path
+   * already touches). */
+  private async scopeHead(destination: string): Promise<{ head: ScopeHead; catalog_epoch?: string }> {
+    return (await this.host.rpc(destination, "/head")) as { head: ScopeHead; catalog_epoch?: string };
+  }
+
+  /** Phase 5 fail-fast: a turn whose stamp disagrees with the scope's
+   * DURABLE epoch can never commit — re-planning re-stamps the same
+   * epoch — so surface the M9 terminal verdict at the head fetch instead
+   * of grinding plan → submit → reseed rounds to E_BUDGET. Tolerates an
+   * absent epoch field (a stubbed fixture head); such a turn still meets
+   * the submit path's stale_epoch verdict and the M9 post-reseed check. */
+  private assertTurnEpoch(
+    live: { catalog_epoch?: string },
+    turnEpoch: string,
+    scope: string,
+    trace: AttemptTraceEntry[]
+  ): void {
+    if (typeof live.catalog_epoch === "string" && live.catalog_epoch !== turnEpoch) {
+      throw new NetError(
+        "E_EPOCH_MISMATCH",
+        "turn epoch disagrees with the scope's durable epoch at head fetch",
+        { scope, turn_epoch: turnEpoch, scope_epoch: live.catalog_epoch },
+        trace
+      );
+    }
   }
 
   /** Run a recovery action; a failure (e.g. the closure fetch itself

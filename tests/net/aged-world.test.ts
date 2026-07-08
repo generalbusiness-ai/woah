@@ -144,7 +144,9 @@ describe("aged-world lane (CO12.6): upgrade converges via named CO8 reseeds only
     // silent adoption of old-epoch rows — so wiring the cat-v1 store to
     // a cat-v2 sequencer must throw, and that throw is a named
     // boundary, not divergence.
-    expect(() => new ScopeSequencer(SCOPE, EPOCH_V2, { durable: agedStore })).toThrow(/epoch mismatch/);
+    // Phase 5 made the refusal a NAMED terminal (E_EPOCH_MISMATCH), so
+    // operators see the CO6 code instead of a bare Error string.
+    expect(() => new ScopeSequencer(SCOPE, EPOCH_V2, { durable: agedStore })).toThrow(/E_EPOCH_MISMATCH/);
 
     // The reinstall: a FRESH sequencer + fresh durable store at cat-v2,
     // seeded from the AGED world's exported cells (iterate the aged

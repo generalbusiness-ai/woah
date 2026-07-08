@@ -333,20 +333,20 @@ describe("epoch guard (M9)", () => {
     const gateway = new NetGatewayDO(gState.state, gEnv);
     await call(gateway, gEnv, "/pull", { scope: SCOPE, destination: `scope:${SCOPE}` });
 
-    // The turn stamps an epoch the scope was never seeded at. The first
-    // round rejects stale_epoch (retryable); the CO8 reseed runs and
-    // SUCCEEDS — but the scope's durable epoch still differs, so no
-    // re-plan can converge. Pre-M9 this ground the whole budget to
-    // E_BUDGET; now the disagreement surfaces terminally with its trace.
+    // The turn stamps an epoch the scope was never seeded at. Phase 5
+    // consumes the epoch the /head reply names, so the disagreement
+    // surfaces terminally at the base fetch — BEFORE any plan → submit →
+    // reseed round burns (pre-M9 this ground the whole budget to
+    // E_BUDGET; M9 cut it to one stale_epoch round; the head-fetch check
+    // cuts it to zero).
     const { status, body } = await callRaw<{
       error: { code: string; detail?: Record<string, unknown>; attempts?: AttemptTraceEntry[] };
     }>(gateway, gEnv, "/turn", { ...turnRequest(bumpCall("turn-m9-1"), "m9-t1"), catalog_epoch: "cat-net-repair-9" });
     expect(status).toBe(400);
     expect(body.error.code).toBe("E_EPOCH_MISMATCH");
     expect(body.error.detail).toMatchObject({ turn_epoch: "cat-net-repair-9", scope_epoch: EPOCH });
-    // ONE stale_epoch round, then terminal — never the attempt ceiling.
-    expect(body.error.attempts).toHaveLength(1);
-    expect(body.error.attempts?.[0].code).toBe("E_STALE_EPOCH");
+    // Zero repair rounds burnt: the fail-fast fired at the head fetch.
+    expect(body.error.attempts ?? []).toHaveLength(0);
 
     close();
     gState.close();

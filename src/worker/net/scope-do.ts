@@ -163,6 +163,15 @@ export class SqliteScopeStore implements ScopeStore {
     // idiom (CommitScopeDO does the same): cheap, idempotent, and no
     // separate "first boot" path to get wrong.
     this.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_scope_meta (id TEXT PRIMARY KEY, body TEXT NOT NULL)");
+    // Phase 5 durable-format stamp: ONE branch point for all future
+    // durable evolution (and the migration ledger's anchor row). Written
+    // at construction — INSERT OR IGNORE, so an existing world keeps the
+    // version it was created at and future readers can branch on it
+    // instead of probing table shapes.
+    this.storage.sql.exec(
+      "INSERT OR IGNORE INTO net_scope_meta (id, body) VALUES ('schema_version', ?)",
+      JSON.stringify({ v: 1 })
+    );
     this.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_scope_cell (key TEXT PRIMARY KEY, body TEXT NOT NULL)");
     this.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS net_scope_reply (idempotency_key TEXT PRIMARY KEY, body TEXT NOT NULL)"

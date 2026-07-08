@@ -344,6 +344,44 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     h.close();
   });
 
+  it("v1 client-surface field names are pinned (Phase 5 contract freeze: add-only, never rename)", async () => {
+    // The .v1 kind tags are decorative — no receiver checks them — so the
+    // ONLY thing protecting deployed clients from a silent break is that
+    // these names keep answering. Subset assertions: adding a field
+    // passes; renaming one fails.
+    const h = await buildHarness();
+    const token = `apikey:${KEY_ID}:${KEY_SECRET}`;
+    const minted = await clientFetch(h.gateway, "POST", "/net-api/session", { token, body: { ttl_ms: 600_000 } });
+    expect(minted.status, JSON.stringify(minted.body)).toBe(200);
+    for (const key of ["session", "actor", "expires_at"]) {
+      expect(Object.keys(minted.body), `session.${key}`).toContain(key);
+    }
+    const sid = minted.body.session as string;
+
+    const turn = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+      token,
+      body: { target: "capi_box", verb: "bump", session: sid, idempotency_key: "capi-pin-1" }
+    });
+    expect(turn.status, JSON.stringify(turn.body)).toBe(200);
+    for (const key of ["reply", "result", "observations"]) {
+      expect(Object.keys(turn.body), `turn.${key}`).toContain(key);
+    }
+    const reply = turn.body.reply as Record<string, unknown>;
+    for (const key of ["status", "scope", "head", "post_state_version"]) {
+      expect(Object.keys(reply), `turn.reply.${key}`).toContain(key);
+    }
+
+    const probe = await clientFetch(h.gateway, "GET", `/net-api/cell?session=${sid}&key=property_cell:capi_box:counter`, { token });
+    expect(probe.status).toBe(200);
+    for (const key of ["key", "cell"]) expect(Object.keys(probe.body), `cell.${key}`).toContain(key);
+
+    const roster = await clientFetch(h.gateway, "GET", `/net-api/relation?session=${sid}&relation=contents&owner=capi_room`, { token });
+    expect(roster.status).toBe(200);
+    for (const key of ["relation", "owner", "members"]) expect(Object.keys(roster.body), `relation.${key}`).toContain(key);
+
+    h.close();
+  });
+
   it("rate-limits /net-api per authenticated actor: burst 100, named 429 E_RATE, refills (H4)", async () => {
     const h = await buildHarness();
     const token = `apikey:${KEY_ID}:${KEY_SECRET}`;

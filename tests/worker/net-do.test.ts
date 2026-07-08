@@ -524,19 +524,65 @@ describe("NetGatewayDO end-to-end over fake-DO", () => {
     });
     expect(sequencedReply.status, JSON.stringify(sequencedReply)).toBe("accepted");
 
-    // Minting an already-EXPIRED session is refused with the named
-    // verdict — through the real shell wiring, not just the library.
-    const expiredOpen = await call<{ reply: CommitReply }>(gateway, gatewayEnv, "/session-open", {
-      session: "s-open-dead",
-      actor: "#actor",
-      ttl_ms: -1,
-      catalog_epoch: EPOCH,
-      cluster_destination: "scope:cluster:#actor"
+    // Phase 5: a zero/negative TTL can no longer even CONSTRUCT a mint —
+    // the no-expiry guard refuses at the library boundary, through the
+    // real shell wiring (caller-bug class, non-2xx with the message).
+    const guardRequest = new Request("https://do/net/session-open", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        session: "s-open-dead",
+        actor: "#actor",
+        ttl_ms: -1,
+        catalog_epoch: EPOCH,
+        cluster_destination: "scope:cluster:#actor"
+      })
     });
-    expect(expiredOpen.reply.status).toBe("rejected");
-    if (expiredOpen.reply.status === "rejected") {
-      expect(expiredOpen.reply.reason).toBe("unauthorized");
-      expect(expiredOpen.reply.detail).toMatchObject({ session: "s-open-dead", session_verdict: "expired" });
+    const guardResponse = await gateway.fetch(await signInternalRequest(gatewayEnv, guardRequest));
+    expect(guardResponse.ok).toBe(false);
+    expect(JSON.stringify(await guardResponse.json())).toContain("no-expiry sessions are forbidden");
+
+    // The scope's authorize still names an already-expired session cell
+    // "expired" (CO4 step 1) — exercised with a hand-built mint whose
+    // written value expired in the past (the shape the guard now forbids
+    // honest producers from constructing).
+    const { cellVersion, CellStore } = await import("../../src/net/cells");
+    const { sessionWriter } = await import("../../src/net/sessions");
+    const deadValue = { id: "s-open-dead", actor: "#actor", started: Date.now() - 10_000, expiresAt: Date.now() - 5_000, activeScope: null };
+    const deadBody = {
+      kind: "woo.effect_transcript.shadow.v1",
+      id: "session-mint:s-open-dead",
+      route: "direct",
+      scope: "cluster:#actor",
+      seq: 0,
+      session: "s-open-dead",
+      call: { actor: "#actor", target: "#actor", verb: "session_mint", args: [], body: undefined },
+      reads: [],
+      writes: [{ cell: { kind: "session", object: "s-open-dead" }, value: deadValue, op: "set", writer: sessionWriter("#actor", "session_mint") }],
+      creates: [],
+      moves: [],
+      observations: [],
+      logicalInputs: [],
+      untrackedEffects: [],
+      complete: true,
+      incompleteReasons: []
+    };
+    const deadTranscript = { ...deadBody, hash: cellVersion(deadBody) };
+    const deadApplied = applyTranscript(new CellStore("authority"), deadTranscript as never, { scope_head: "planner", catalog_epoch: EPOCH });
+    const deadHead = (await call<{ head: ScopeHead }>(cluster.instance, scopeEnv, "/head")).head;
+    const expiredReply = await call<CommitReply>(cluster.instance, scopeEnv, "/submit", {
+      kind: "woo.net.commit_submit.v1",
+      scope: "cluster:#actor",
+      base: deadHead,
+      idempotency_key: "session-mint:s-open-dead:manual",
+      transcript: deadTranscript,
+      post_state_version: deadApplied.postStateVersion,
+      stamp: { scope_head: "planner", catalog_epoch: EPOCH }
+    });
+    expect(expiredReply.status).toBe("rejected");
+    if (expiredReply.status === "rejected") {
+      expect(expiredReply.reason).toBe("unauthorized");
+      expect(expiredReply.detail).toMatchObject({ session: "s-open-dead", session_verdict: "expired" });
     }
     cluster.close();
   });

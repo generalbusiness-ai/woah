@@ -404,6 +404,13 @@ describe("/net-api/ws socket surface (Phase 4 item 3 chunk 1)", () => {
     expect(turnFrame.reply?.status).toBe("accepted");
     expect(turnFrame.result).toBe(1);
     expect(turnFrame.observations?.map((o) => o.type)).toContain("bumped");
+    // Phase 5 v1 contract freeze: the turn_result frame's field names are
+    // pinned (add-only, never rename — a renamed field breaks deployed
+    // clients silently; the .v1 tags are decorative and no receiver
+    // checks them).
+    for (const key of ["type", "id", "status", "reply", "result", "observations"]) {
+      expect(Object.keys(turnFrame as Record<string, unknown>), `turn_result.${key}`).toContain(key);
+    }
 
     // A frame claiming ANOTHER session still runs on the socket's own:
     // the reply is a normal accepted turn, not an actor_mismatch — the
@@ -503,6 +510,11 @@ describe("gateway self-subscribe (H1)", () => {
     const peerObservations = frames(socketB).filter((frame) => frame.type === "observations");
     expect(peerObservations).toHaveLength(1);
     expect((peerObservations[0].observations as Array<{ type?: string }>).map((o) => o.type)).toContain("waved");
+    // Phase 5 v1 contract freeze: the push frame's field names are pinned
+    // (add-only, never rename).
+    for (const key of ["type", "scope", "seq", "observations"]) {
+      expect(Object.keys(peerObservations[0] as Record<string, unknown>), `observations.${key}`).toContain(key);
+    }
 
     h.close();
   });

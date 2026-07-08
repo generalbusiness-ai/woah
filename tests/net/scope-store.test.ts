@@ -116,7 +116,8 @@ describe("crash-sim: the store is the truth (CO2.5)", () => {
     const a = new ScopeSequencer(SCOPE, EPOCH, { durable: store });
     a.submit(submitFor(a, transcript("t1", "v"), "k1"));
     expect(() => new ScopeSequencer("other_room", EPOCH, { durable: store })).toThrow(/hydration mismatch/);
-    expect(() => new ScopeSequencer(SCOPE, "cat2", { durable: store })).toThrow(/epoch mismatch/);
+    // Phase 5: the epoch refusal carries the named terminal code.
+    expect(() => new ScopeSequencer(SCOPE, "cat2", { durable: store })).toThrow(/E_EPOCH_MISMATCH/);
   });
 });
 

@@ -342,6 +342,35 @@ Cheap, independent, and **must all be in before any namespace holds data**
   reaper arms only on expiry (`scope-do.ts:807`) and there is no external
   GC.
 
+STATUS (2026-07-08): **PHASE 5 COMPLETE.** (1) `schema_version` v:1 rows
+stamped at construction: `net_scope_meta` + new `net_gateway_meta`
+(INSERT OR IGNORE — an existing world keeps its created-at version; the
+one branch point + migration-ledger anchor). (2) `/net/head`'s
+`catalog_epoch` is CONSUMED: `scopeHead()` + `assertTurnEpoch()` fail
+the turn/session-open terminally (M9's `E_EPOCH_MISMATCH`, with trace)
+at the head fetch — ZERO repair rounds burnt (was: one stale_epoch
+round post-M9; whole budget pre-M9). The epoch check sits OUTSIDE
+`tryRecovery` (the M9 pattern) so a genuine disagreement escapes the
+retry loop while a failed head fetch stays on the budget path. DECIDED:
+the hydration hard-throw (scope.ts) REFUSES — never reseeds (the
+durable store is the authority; wiping it over a config skew would
+destroy the one authoritative copy) — and now throws the NAMED
+`E_EPOCH_MISMATCH` instead of a bare Error. (3) v1 contract frozen:
+`tests/worker/net-wire-contract.test.ts` pins golden `cellVersion`
+hashes of representative cell values (drift = world-wide read-mismatch
+storm on a rolling deploy; the fix for a red golden is to restore the
+serialization, never to update the constant) plus Cell/CellTransfer/
+CommitSubmit/EffectTranscript field names; `/net-api` reply keys pinned
+in net-client-api.test.ts and WS `turn_result`/`observations` frame
+keys in net-ws.test.ts (subset assertions: add-only passes, rename
+fails). (4) No-expiry sessions forbidden at mint: `mintSessionSubmit`
+refuses non-finite/≤0 `ttl_ms` (plain Error — caller-bug class; the
+CO6 vocabulary stays closed); the net-do expired-session shell test now
+hand-crafts the expired mint (the guard forbids honest construction)
+and still proves the scope's `expired` authorize verdict. Gates:
+typecheck; npm test 754; test:worker 376; smoke:net-dev 24/24; e2e:net
+2/2; load:net-dev 2/2.
+
 ## Phase 6 — shard-enablement (scale = routing change, not migration)
 
 - **Stamp a resolvable shard hint into the session id at mint** (Register A

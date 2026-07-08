@@ -201,10 +201,19 @@ export class ScopeSequencer {
           throw new Error(`scope-store hydration mismatch: store is for ${meta.scope}, sequencer is ${scope}`);
         }
         if (meta.catalog_epoch !== catalogEpoch) {
+          // DECIDED (ready-to-scale Phase 5): REFUSE, never reseed. The
+          // durable store is the authority — silently adopting the
+          // runtime's epoch (or wiping authority state to "reseed" it)
+          // would destroy the one authoritative copy over a config skew.
           // A catalog upgrade over durable scope state is an explicit
-          // migration concern (aged-world lane, Phase 3 step 5) — not a
-          // silent adoption. Refuse until that path exists.
-          throw new Error(`scope-store epoch mismatch: store ${meta.catalog_epoch}, runtime ${catalogEpoch}`);
+          // migration concern (CT14 / spec-version walk); until that path
+          // exists this surfaces as the M9 terminal code so operators see
+          // a named epoch disagreement, not a 500.
+          throw netError("E_EPOCH_MISMATCH", "scope-store epoch disagrees with the runtime's catalog epoch", {
+            scope,
+            store_epoch: meta.catalog_epoch,
+            runtime_epoch: catalogEpoch
+          });
         }
         this.headState = meta.head;
       }

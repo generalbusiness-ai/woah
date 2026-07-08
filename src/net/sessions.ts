@@ -125,6 +125,20 @@ export type MintSessionResult = {
  * the recorded reply while a later REFRESH (new expiry) is a fresh turn.
  */
 export function mintSessionSubmit(input: MintSessionInput): MintSessionResult {
+  // Phase 5 (ready-to-scale): no-expiry session cells are forbidden at
+  // mint. The reaper arms only on a numeric expiry and there is no
+  // external GC, so a session minted with a zero/NaN/negative TTL would
+  // be immortal state (sessionLiveness treats a missing expiresAt as
+  // never-expiring by SerializedSession's optionality).
+  if (!Number.isFinite(input.ttl_ms) || input.ttl_ms <= 0) {
+    // A caller bug (the misplan class — plain Error, never a CO6 code):
+    // every mint site owns its TTL (clampClientTtl on the client route),
+    // so an invalid one reaching here means a broken caller, not a
+    // divergence to repair.
+    throw new Error(
+      `session mint requires a positive finite ttl_ms (no-expiry sessions are forbidden): session=${input.session} ttl_ms=${input.ttl_ms}`
+    );
+  }
   const value: SessionCellValue = {
     id: input.session,
     actor: input.actor,
