@@ -15,6 +15,41 @@ routing may follow). That is the honest ready-to-scale line: no O(world)
 assumption remains, and adding a shard later is a routing change, not a
 data migration.
 
+SECOND REVIEW (2026-07-08, 5 findings) — ALL RESOLVED:
+1. Scheduled execution was still O(parked rows) (hydration read all;
+   peekDue filtered/sorted the whole map; subscribe probed via
+   readScheduled().some). FIXED at the store contract: ScopeStore gains
+   `readScheduledDue(now, limit)` / `nextScheduledAfter` /
+   `hasScheduledDue` / `hasScheduled`, SQLite-implemented off the due_at
+   index; the sequencer NO LONGER HYDRATES the scheduled family (the one
+   row family a scope does not hold resident — a parked queue can
+   outnumber live cells without bound, and every consumer question is a
+   due-time question) and peekDue/dueTurns/nextAlarmAt/cancel delegate;
+   the in-memory map serves only durable-less sequencers.
+2. One drain invocation could still consume O(backlog) CPU (the
+   delivered>0 loop). FIXED: OUTBOX_PASSES_PER_DRAIN=8 budgets an
+   invocation at LANES×ROWS×PASSES rows; leftover DUE work makes
+   outboxNextRetryAt clamp to now, so the finally's retry alarm IS the
+   continuation on a fresh invocation budget (tested: 300-row backlog →
+   exactly 256 delivered on kick 1, alarm at now, kick 2 finishes, order
+   intact).
+3. The lane-directory backfill ran O(backlog) on EVERY construction.
+   FIXED: all three Phase-3 backfills (outbox columns, lane directory,
+   scheduled due_at) are marker-gated one-time migrations
+   (net_scope_meta rows `migrated_outbox_lane_directory` /
+   `migrated_scheduled_due_at`; crash between backfill and marker heals
+   idempotently; markers asserted in the migration test).
+4. Lane ENUMERATION per pass is O(active lanes) — DECIDED as
+   intentional and documented at OUTBOX_LANES_PER_PASS: active lanes are
+   the scope's real fan-out (subscribers + neighbor owners), never
+   backlog depth or world size; a due-ordered lane index maintained on
+   every head change is complexity the fan-out numbers do not justify.
+   LANES_PER_PASS bounds delivery fan-out, not enumeration.
+5. net-outbox-bounded + net-wire-contract now ride the CURATED `npm
+   test` list (the deploy gate runs npm test), not just test:worker.
+Gates after the fixes: typecheck; npm test 775; test:worker 378;
+smoke:net-dev 24/24; e2e:net 2/2; load:net-dev 3/3.
+
 **BAR MET (2026-07-08, branch `net-predeploy` @ `b1cf68c`):** Phases 0–6
 (hint) are ALL COMPLETE — see the per-phase STATUS blocks below. Every
 `load:net-dev` invariant is a green assertion (plan_cells flat,

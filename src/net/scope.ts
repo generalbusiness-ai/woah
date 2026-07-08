@@ -220,7 +220,12 @@ export class ScopeSequencer {
       for (const cell of durable.readCells()) this.store.install(cell);
       for (const { key, reply } of durable.readReplies()) this.replies.set(key, reply);
       for (const entry of durable.readTail()) this.tail.push(entry);
-      for (const turn of durable.readScheduled()) this.scheduled.set(turn.id, turn);
+      // The scheduled family deliberately does NOT hydrate (review #1):
+      // a parked queue can outnumber a scope's live cells without bound,
+      // and every consumer question is a due-time question the store
+      // answers off its due index (peekDue/dueTurns/nextAlarmAt
+      // delegate). The in-memory map serves only durable-less
+      // sequencers.
       for (const row of durable.readRelations()) this.relationRows.set(relationKey(row.relation, row.owner, row.member), row);
     }
   }
@@ -747,25 +752,35 @@ export class ScopeSequencer {
   // ---- Durable continuations (CO2.8) ----------------------------------
 
   /** Enqueue a scheduled turn; validated exactly like a live submission
-   * when it fires (the firing path goes back through submit()). */
+   * when it fires (the firing path goes back through submit()). With a
+   * durable store the queue lives THERE (see peekDue); the in-memory map
+   * serves only the durable-less sequencer. */
   schedule(turn: ScheduledTurn, nowLogical: number): void {
     if (turn.at_logical_time <= nowLogical) {
       throw netError("E_MISSING_STATE", "scheduled turn must target a future logical time", { id: turn.id, at: turn.at_logical_time, now: nowLogical });
     }
-    this.scheduled.set(turn.id, turn);
-    this.options.durable?.writeScheduled(turn);
+    const durable = this.options.durable;
+    if (durable) durable.writeScheduled(turn);
+    else this.scheduled.set(turn.id, turn);
   }
 
   cancel(scheduleId: string): boolean {
-    const removed = this.scheduled.delete(scheduleId);
-    if (removed) this.options.durable?.deleteScheduled(scheduleId);
-    return removed;
+    const durable = this.options.durable;
+    if (durable) {
+      const existed = durable.hasScheduled(scheduleId);
+      if (existed) durable.deleteScheduled(scheduleId);
+      return existed;
+    }
+    return this.scheduled.delete(scheduleId);
   }
 
   /** Earliest pending logical time, or null — the Host sets its alarm to
    * this (CO2.8: the scope wakes itself; a parked task survives eviction
-   * because the queue is scope state). */
+   * because the queue is scope state). One indexed lookup on a durable
+   * store (logical times are wall-clock ms, always > 0). */
   nextAlarmAt(): number | null {
+    const durable = this.options.durable;
+    if (durable) return durable.nextScheduledAfter(0);
     let min: number | null = null;
     for (const turn of this.scheduled.values()) {
       if (min === null || turn.at_logical_time < min) min = turn.at_logical_time;
@@ -781,8 +796,13 @@ export class ScopeSequencer {
    * consuming form for the executor that actually runs the turns.
    * `limit` bounds the batch to the FIRST n due turns in firing order
    * (ready-to-scale Phase 3: an alarm processes a bounded batch and
-   * re-arms, so a due burst can never balloon one alarm transaction). */
+   * re-arms, so a due burst can never balloon one alarm transaction).
+   * On a durable store this is one indexed due query — the scheduled
+   * family is never hydrated or scanned wholesale (review #1: the batch
+   * limit must bound rows SCANNED, not just rows moved). */
   peekDue(nowLogical: number, limit?: number): ScheduledTurn[] {
+    const durable = this.options.durable;
+    if (durable) return durable.readScheduledDue(nowLogical, limit ?? Number.MAX_SAFE_INTEGER);
     const due = [...this.scheduled.values()]
       .filter((turn) => turn.at_logical_time <= nowLogical)
       .sort((a, b) => a.at_logical_time - b.at_logical_time || a.id.localeCompare(b.id));

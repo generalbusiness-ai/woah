@@ -190,6 +190,39 @@ describe("Phase 3 — bounded outbox drain", () => {
     expect(laneRows(scope.state)).toEqual([]);
   });
 
+  it("one drain invocation is budgeted: a catch-up backlog yields to the alarm continuation instead of consuming the invocation (review #2)", async () => {
+    const healthy = okStub();
+    const scope = netState("bounded-budget");
+    const env: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: () => healthy.stub };
+    const scopeDO = new NetScopeDO(scope.state, env);
+    // More than PASSES_PER_DRAIN × ROWS_PER_LANE (8 × 32 = 256) rows in
+    // one lane: the first kick must stop at the budget and arm an
+    // immediate alarm; the alarm's fresh invocation finishes the job.
+    const BACKLOG = 300;
+    for (let seq = 1; seq <= BACKLOG; seq++) insertRow(scope.state, "gateway:mirror", seq);
+
+    const before = Date.now();
+    await kick(scopeDO, env);
+    await scope.settle();
+    expect(healthy.received).toHaveLength(256); // exactly the budget
+    expect(pendingRows(scope.state)).toHaveLength(BACKLOG - 256);
+    // The continuation: the retry alarm armed at ~now (due work remains).
+    const armed = scope.alarms.filter((at): at is number => at !== null);
+    expect(armed.length).toBeGreaterThanOrEqual(1);
+    expect(armed[armed.length - 1]).toBeLessThanOrEqual(Date.now() + 5);
+    expect(armed[armed.length - 1]).toBeGreaterThanOrEqual(before - 5);
+
+    // The next invocation (the fake's alarms never self-fire — kick
+    // stands in for the alarm's deferPendingDrain) finishes the backlog
+    // in order.
+    await kick(scopeDO, env);
+    await scope.settle();
+    expect(pendingRows(scope.state)).toEqual([]);
+    expect((healthy.received as Array<{ seq: number }>).map((b) => b.seq)).toEqual(
+      Array.from({ length: BACKLOG }, (_, i) => i + 1)
+    );
+  });
+
   it("a stuck destination attempts only its lane head, never starves a healthy lane, and arms the alarm at the head's retry — not a spin", async () => {
     const metricLines: string[] = [];
     vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
@@ -266,6 +299,15 @@ describe("Phase 3 — bounded outbox drain", () => {
     ).toArray();
     expect(migrated).toEqual([{ scope: SCOPE, seq: 7, next_attempt_at_ms: 1000 + 500 }]); // last_attempt + backoff(2)
     expect(laneRows(scope.state)).toEqual([{ route: "/fanout", destination: "gateway:legacy" }]);
+    // Review #3: the backfills are marker-gated one-time migrations — a
+    // cold construction over an already-migrated store never re-scans
+    // the backlog. The markers land in net_scope_meta.
+    const markers = (
+      scope.state.storage.sql.exec(
+        "SELECT id FROM net_scope_meta WHERE id IN ('migrated_outbox_lane_directory', 'migrated_scheduled_due_at') ORDER BY id"
+      ) as { toArray(): Array<{ id: string }> }
+    ).toArray();
+    expect(markers.map((row) => row.id)).toEqual(["migrated_outbox_lane_directory", "migrated_scheduled_due_at"]);
     const scheduled = (
       scope.state.storage.sql.exec("SELECT due_at FROM net_scope_scheduled WHERE id = 'sched-legacy'") as {
         toArray(): Array<{ due_at: number }>;

@@ -65,6 +65,17 @@ export interface ScopeStore {
   readScheduled(): ScheduledTurn[];
   writeScheduled(turn: ScheduledTurn): void;
   deleteScheduled(id: string): void;
+  /** Phase 3 (bounded scheduled): the due-time queries the alarm path
+   * runs, answered from the store's due index so alarm work is O(due
+   * batch), never O(parked rows). The scheduled family is the ONE row
+   * family the sequencer does NOT hydrate wholesale — a parked queue can
+   * outnumber a scope's live cells without bound, and every consumer
+   * question is a due-time question. `readScheduled` above remains for
+   * export/inspection only. */
+  readScheduledDue(now: number, limit: number): ScheduledTurn[];
+  nextScheduledAfter(now: number): number | null;
+  hasScheduledDue(now: number): boolean;
+  hasScheduled(id: string): boolean;
 
   /** Sixth row family (CO13): derived relation rows owned by this scope,
    * keyed by relationKey(relation, owner, member). Derived — always
@@ -145,6 +156,33 @@ export class InMemoryScopeStore implements ScopeStore {
 
   deleteScheduled(id: string): void {
     this.scheduled.delete(id);
+  }
+
+  // The reference store answers the due queries by scanning its map —
+  // fine for a test store; the SQLite store answers off the due index.
+  readScheduledDue(now: number, limit: number): ScheduledTurn[] {
+    return [...this.scheduled.values()]
+      .filter((turn) => turn.at_logical_time <= now)
+      .sort((a, b) => a.at_logical_time - b.at_logical_time || a.id.localeCompare(b.id))
+      .slice(0, limit)
+      .map((turn) => structuredClone(turn));
+  }
+
+  nextScheduledAfter(now: number): number | null {
+    let min: number | null = null;
+    for (const turn of this.scheduled.values()) {
+      if (turn.at_logical_time > now && (min === null || turn.at_logical_time < min)) min = turn.at_logical_time;
+    }
+    return min;
+  }
+
+  hasScheduledDue(now: number): boolean {
+    for (const turn of this.scheduled.values()) if (turn.at_logical_time <= now) return true;
+    return false;
+  }
+
+  hasScheduled(id: string): boolean {
+    return this.scheduled.has(id);
   }
 
   readRelations(): RelationRow[] {

@@ -191,11 +191,18 @@ export class SqliteScopeStore implements ScopeStore {
     if (!scheduledColumns.some((column) => column.name === "due_at")) {
       this.storage.sql.exec("ALTER TABLE net_scope_scheduled ADD COLUMN due_at INTEGER");
     }
-    for (const row of sqlRows<{ id: string; body: string }>(
-      this.storage.sql.exec("SELECT id, body FROM net_scope_scheduled WHERE due_at IS NULL")
-    )) {
-      const turn = JSON.parse(row.body) as ScheduledTurn;
-      this.storage.sql.exec("UPDATE net_scope_scheduled SET due_at = ? WHERE id = ?", turn.at_logical_time, row.id);
+    // One-time backfill, gated by a meta marker (review: an unconditional
+    // WHERE-IS-NULL scan is O(parked rows) on EVERY cold construction —
+    // exactly the cold-DO scale class Phase 3 removes). A crash between
+    // backfill and marker heals on the next construction (idempotent).
+    if (!this.metaMarkerPresent("migrated_scheduled_due_at")) {
+      for (const row of sqlRows<{ id: string; body: string }>(
+        this.storage.sql.exec("SELECT id, body FROM net_scope_scheduled WHERE due_at IS NULL")
+      )) {
+        const turn = JSON.parse(row.body) as ScheduledTurn;
+        this.storage.sql.exec("UPDATE net_scope_scheduled SET due_at = ? WHERE id = ?", turn.at_logical_time, row.id);
+      }
+      this.writeMetaMarker("migrated_scheduled_due_at");
     }
     this.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_net_scope_scheduled_due ON net_scope_scheduled (due_at)");
     // Sixth row family (CO13): derived relation rows this scope owns.
@@ -212,6 +219,20 @@ export class SqliteScopeStore implements ScopeStore {
     } finally {
       this.transactionDepth = 0;
     }
+  }
+
+  /** Migration-marker rows in net_scope_meta (Phase 5's schema_version
+   * discipline applied to one-time backfills): a marker present means the
+   * named backfill already ran, so cold constructions never re-scan. */
+  metaMarkerPresent(id: string): boolean {
+    const rows = sqlRows<{ n: number }>(
+      this.storage.sql.exec("SELECT EXISTS(SELECT 1 FROM net_scope_meta WHERE id = ?) AS n", id)
+    );
+    return rows.length > 0 && Number(rows[0].n) > 0;
+  }
+
+  writeMetaMarker(id: string): void {
+    this.storage.sql.exec("INSERT OR IGNORE INTO net_scope_meta (id, body) VALUES (?, ?)", id, JSON.stringify({ v: 1 }));
   }
 
   readMeta(): ScopeMeta | null {
@@ -303,15 +324,41 @@ export class SqliteScopeStore implements ScopeStore {
     this.storage.sql.exec("DELETE FROM net_scope_scheduled WHERE id = ?", id);
   }
 
+  /** Phase 3 bounded due queries — all answered off the due_at index so
+   * the alarm path's work is O(due batch), never O(parked rows). */
+  readScheduledDue(now: number, limit: number): ScheduledTurn[] {
+    return sqlRows<{ body: string }>(
+      this.storage.sql.exec(
+        "SELECT body FROM net_scope_scheduled WHERE due_at <= ? ORDER BY due_at, id LIMIT ?",
+        now,
+        limit
+      )
+    ).map((row) => JSON.parse(row.body) as ScheduledTurn);
+  }
+
   /** Earliest scheduled due-time strictly after `now`, or null — one
-   * indexed MIN lookup (Phase 3: alarm re-arming must not read and parse
-   * every parked row; overdue parked rows are deliberately excluded so
-   * the no-planner state cannot spin the alarm). */
+   * indexed MIN lookup (alarm re-arming must not read and parse every
+   * parked row; overdue parked rows are deliberately excluded so the
+   * no-planner state cannot spin the alarm). */
   nextScheduledAfter(now: number): number | null {
     const rows = sqlRows<{ at: number | null }>(
       this.storage.sql.exec("SELECT MIN(due_at) AS at FROM net_scope_scheduled WHERE due_at > ?", now)
     );
     return rows.length > 0 && rows[0].at !== null ? Number(rows[0].at) : null;
+  }
+
+  hasScheduledDue(now: number): boolean {
+    const rows = sqlRows<{ n: number }>(
+      this.storage.sql.exec("SELECT EXISTS(SELECT 1 FROM net_scope_scheduled WHERE due_at <= ?) AS n", now)
+    );
+    return rows.length > 0 && Number(rows[0].n) > 0;
+  }
+
+  hasScheduled(id: string): boolean {
+    const rows = sqlRows<{ n: number }>(
+      this.storage.sql.exec("SELECT EXISTS(SELECT 1 FROM net_scope_scheduled WHERE id = ?) AS n", id)
+    );
+    return rows.length > 0 && Number(rows[0].n) > 0;
   }
 
   readRelations(): RelationRow[] {
@@ -352,9 +399,25 @@ const OUTBOX_ROUTES = ["/fanout", "/adopt", "/relate", "/plan-scheduled"] as con
  * PREFIX in (scope, seq) order — CO2.7 ordering is untouched). Remaining
  * healthy work re-drains via drainOutbox's delivered>0 loop; failed rows
  * wait for the due-time alarm. Sized generously above any current
- * subscriber fan-in; the point is a bound that exists, not a small one. */
+ * subscriber fan-in; the point is a bound that exists, not a small one.
+ *
+ * DECIDED (review #4): lane ENUMERATION per pass is O(active lanes) —
+ * the directory is read whole and each lane head-probed until enough due
+ * lanes are found. Intentional: active lanes are this scope's real
+ * fan-out (its fanout subscribers plus the neighbor scopes its commits
+ * ride to), a Big-World-safe quantity that never grows with backlog
+ * depth or world size — bounding it further would need a due-ordered
+ * lane index maintained on every head change, complexity the fan-out
+ * numbers do not justify. LANES_PER_PASS bounds the DELIVERY fan-out of
+ * one pass, not the enumeration. */
 const OUTBOX_LANES_PER_PASS = 16;
 const OUTBOX_ROWS_PER_LANE = 32;
+/** Passes one drain INVOCATION may run before yielding to the alarm
+ * continuation (review #2): bounds a single waitUntil task's total CPU
+ * under a catch-up backlog at LANES×ROWS×PASSES rows; the retry alarm —
+ * which clamps to "now" while due work remains — resumes the drain on a
+ * fresh invocation budget. */
+const OUTBOX_PASSES_PER_DRAIN = 8;
 /** Debugging tail of abandoned rows kept after their divergence metric
  * fired; everything older is pruned (a dead subscriber must not grow
  * storage without bound). */
@@ -454,22 +517,29 @@ export class NetScopeDO {
         state.storage.sql.exec(`ALTER TABLE net_scope_outbox ADD COLUMN ${column}`);
       }
     }
-    for (const row of sqlRows<{ route: string; id: string; body: string; attempts: number; last_attempt_at_ms: number | null }>(
-      state.storage.sql.exec(
-        "SELECT route, id, body, attempts, last_attempt_at_ms FROM net_scope_outbox WHERE scope IS NULL OR seq IS NULL OR next_attempt_at_ms IS NULL"
-      )
-    )) {
-      const body = JSON.parse(row.body) as FanoutBody;
-      const nextAttempt =
-        row.last_attempt_at_ms === null ? 0 : Number(row.last_attempt_at_ms) + OUTBOX_BACKOFF_MS(Number(row.attempts));
-      state.storage.sql.exec(
-        "UPDATE net_scope_outbox SET scope = ?, seq = ?, next_attempt_at_ms = ? WHERE route = ? AND id = ?",
-        body.scope,
-        body.seq,
-        nextAttempt,
-        row.route,
-        row.id
-      );
+    // One-time backfills below, gated by meta markers (review: an
+    // unconditional backlog scan on EVERY construction is itself the
+    // cold-DO scale class Phase 3 removes). Crash between backfill and
+    // marker heals next construction — both backfills are idempotent.
+    const outboxMigrated = this.store.metaMarkerPresent("migrated_outbox_lane_directory");
+    if (!outboxMigrated) {
+      for (const row of sqlRows<{ route: string; id: string; body: string; attempts: number; last_attempt_at_ms: number | null }>(
+        state.storage.sql.exec(
+          "SELECT route, id, body, attempts, last_attempt_at_ms FROM net_scope_outbox WHERE scope IS NULL OR seq IS NULL OR next_attempt_at_ms IS NULL"
+        )
+      )) {
+        const body = JSON.parse(row.body) as FanoutBody;
+        const nextAttempt =
+          row.last_attempt_at_ms === null ? 0 : Number(row.last_attempt_at_ms) + OUTBOX_BACKOFF_MS(Number(row.attempts));
+        state.storage.sql.exec(
+          "UPDATE net_scope_outbox SET scope = ?, seq = ?, next_attempt_at_ms = ? WHERE route = ? AND id = ?",
+          body.scope,
+          body.seq,
+          nextAttempt,
+          row.route,
+          row.id
+        );
+      }
     }
     state.storage.sql.exec(
       "CREATE INDEX IF NOT EXISTS idx_net_scope_outbox_due ON net_scope_outbox (status, next_attempt_at_ms)"
@@ -483,15 +553,19 @@ export class NetScopeDO {
     // no SQLite index scan over the backlog gives that (DISTINCT walks
     // every pending entry, so a 10k-row stuck lane would tax every pass).
     // Maintained on enqueue (INSERT OR IGNORE) and pruned when a lane
-    // drains empty; the backfill re-derives it idempotently for
-    // pre-directory dev worlds (and after any missed prune — a stale
-    // lane row costs one O(1) head probe, never a wrong delivery).
+    // drains empty; the one-time backfill (marker-gated with the column
+    // backfill above) derives it for pre-directory dev worlds. A stale
+    // lane row after a missed prune costs one O(1) head probe, never a
+    // wrong delivery.
     state.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS net_scope_outbox_lane (route TEXT NOT NULL, destination TEXT NOT NULL, PRIMARY KEY (route, destination))"
     );
-    state.storage.sql.exec(
-      "INSERT OR IGNORE INTO net_scope_outbox_lane (route, destination) SELECT DISTINCT route, destination FROM net_scope_outbox WHERE status = 'pending'"
-    );
+    if (!outboxMigrated) {
+      state.storage.sql.exec(
+        "INSERT OR IGNORE INTO net_scope_outbox_lane (route, destination) SELECT DISTINCT route, destination FROM net_scope_outbox WHERE status = 'pending'"
+      );
+      this.store.writeMetaMarker("migrated_outbox_lane_directory");
+    }
     state.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS net_scope_adopted (from_scope TEXT PRIMARY KEY, seq INTEGER NOT NULL)"
     );
@@ -615,7 +689,9 @@ export class NetScopeDO {
         // path — the single dispatch point — moves them to the outbox.
         if (role === "planner") {
           const now = this.host.now();
-          if (this.store.readScheduled().some((turn) => turn.at_logical_time <= now)) {
+          // Indexed EXISTS probe (review #1) — never a read-and-parse of
+          // every parked row on the subscribe path.
+          if (this.store.hasScheduledDue(now)) {
             this.host.setAlarm(SCOPE_ALARM_KEY, now, async () => {});
           }
         }
@@ -1500,19 +1576,26 @@ export class NetScopeDO {
       // an enqueue landed mid-drain (the flag is exact: due rows parked
       // behind a mid-backoff lane head are NOT progress and must not
       // spin the loop — their lane's head retry time arms the alarm in
-      // the finally below).
-      for (;;) {
+      // the finally below). The pass budget bounds ONE invocation's
+      // total work (review #2: unbounded passes let a catch-up backlog
+      // consume a whole DO invocation's CPU); leftover DUE work makes
+      // outboxNextRetryAt clamp to "now", so the finally's alarm IS the
+      // continuation — the next alarm invocation resumes with a fresh
+      // budget.
+      for (let pass = 1; ; pass += 1) {
         this.enqueuedWhileDraining = false;
         const delivered = await this.drainOutboxPass();
-        if (delivered > 0 || this.enqueuedWhileDraining) continue;
-        break;
+        if (delivered === 0 && !this.enqueuedWhileDraining) break;
+        if (pass >= OUTBOX_PASSES_PER_DRAIN) break;
       }
     } finally {
       this.draining = false;
       // Outbox liveness (fix 4a): rows still pending after the drain
-      // (failed, waiting out backoff) arm the DO alarm for their
-      // earliest retry time, so a quiet scope with no further requests
-      // still delivers when the alarm fires.
+      // (failed and waiting out backoff, or due work beyond this
+      // invocation's pass budget) arm the DO alarm for their earliest
+      // actionable time — a quiet scope with no further requests still
+      // delivers when the alarm fires, and a budget-exhausted drain
+      // resumes immediately on the alarm's fresh invocation.
       this.armOutboxRetryAlarm();
     }
   }
