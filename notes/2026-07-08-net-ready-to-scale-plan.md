@@ -15,6 +15,18 @@ routing may follow). That is the honest ready-to-scale line: no O(world)
 assumption remains, and adding a shard later is a routing change, not a
 data migration.
 
+**BAR MET (2026-07-08, branch `net-predeploy` @ `b1cf68c`):** Phases 0–6
+(hint) are ALL COMPLETE — see the per-phase STATUS blocks below. Every
+`load:net-dev` invariant is a green assertion (plan_cells flat,
+snapshot_cells flat, cold-open closure flat, outbox/scheduled bounds
+proven in tests/worker/net-outbox-bounded.test.ts), and the correctness
+gates hold: typecheck; npm test 759; test:worker 377; smoke:net-dev
+24/24 (real workerd); e2e:net 2/2 (real browsers); load:net-dev 3/3.
+Multi-shard /net-api routing (Phase 6's second half) is post-first-
+deploy work by design. Remaining pre-deploy steps are the OWNER's:
+merge, and the Phase-5 deploy protocol from plan §8 (fresh namespace,
+identity import, write-freeze cutover).
+
 ---
 
 ## Phase 0 — the measuring stick: `load:net-dev` asymptotic gate
