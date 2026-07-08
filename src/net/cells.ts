@@ -122,9 +122,65 @@ export type StoreRole = "authority" | "derived";
 export class CellStore {
   readonly role: StoreRole;
   private readonly cells = new Map<string, Cell>();
+  /** object id → keys of every cell whose `object` is that id. Kept by
+   * every mutation so `cellsForObject` is O(own cells), not O(store) —
+   * the Phase-1 seed-slice builder calls it per seeded object on every
+   * turn (ready-to-scale blocker #1: a per-turn store scan is O(view)). */
+  private readonly keysByObject = new Map<string, Set<string>>();
+  /** actor id → keys of the actor's session cells. The seed slice must
+   * enumerate the calling actor's sessions (the move chain's primary-
+   * session decision needs them all) without an O(store) key scan. */
+  private readonly sessionKeysByActor = new Map<string, Set<string>>();
 
   constructor(role: StoreRole) {
     this.role = role;
+  }
+
+  /** Single internal write path: every insert/overwrite goes through here
+   * so the object and session indexes can never drift from the map. An
+   * overwrite un-indexes the prior cell first — a session row's `actor`
+   * can change across writes, and the stale index entry must not linger. */
+  private setCell(cell: Cell): void {
+    const prior = this.cells.get(cell.key);
+    if (prior) this.unindexCell(prior);
+    this.cells.set(cell.key, cell);
+    this.indexCell(cell);
+  }
+
+  /** Single internal delete path — see setCell. */
+  private removeCell(key: string): void {
+    const prior = this.cells.get(key);
+    if (!prior) return;
+    this.unindexCell(prior);
+    this.cells.delete(key);
+  }
+
+  private indexCell(cell: Cell): void {
+    let objectKeys = this.keysByObject.get(cell.object);
+    if (!objectKeys) this.keysByObject.set(cell.object, (objectKeys = new Set()));
+    objectKeys.add(cell.key);
+    const actor = sessionActorOf(cell);
+    if (actor !== null) {
+      let sessionKeys = this.sessionKeysByActor.get(actor);
+      if (!sessionKeys) this.sessionKeysByActor.set(actor, (sessionKeys = new Set()));
+      sessionKeys.add(cell.key);
+    }
+  }
+
+  private unindexCell(cell: Cell): void {
+    const objectKeys = this.keysByObject.get(cell.object);
+    if (objectKeys) {
+      objectKeys.delete(cell.key);
+      if (objectKeys.size === 0) this.keysByObject.delete(cell.object);
+    }
+    const actor = sessionActorOf(cell);
+    if (actor !== null) {
+      const sessionKeys = this.sessionKeysByActor.get(actor);
+      if (sessionKeys) {
+        sessionKeys.delete(cell.key);
+        if (sessionKeys.size === 0) this.sessionKeysByActor.delete(actor);
+      }
+    }
   }
 
   get(key: string): Cell | undefined {
@@ -157,7 +213,7 @@ export class CellStore {
       });
     }
     const cell = makeCell({ ...input, provenance: "authoritative" });
-    this.cells.set(cell.key, cell);
+    this.setCell(cell);
     return cell;
   }
 
@@ -173,14 +229,14 @@ export class CellStore {
     if (this.role === "derived" && cell.provenance === "authoritative") {
       // Derived copies re-stamp what they receive: the value is the
       // authority's, the copy is not.
-      this.cells.set(cell.key, { ...cell, provenance: "derived" });
+      this.setCell({ ...cell, provenance: "derived" });
       return;
     }
-    this.cells.set(cell.key, cell);
+    this.setCell(cell);
   }
 
   delete(key: string): void {
-    this.cells.delete(key);
+    this.removeCell(key);
   }
 
   /** CO8: drop every cell whose stamp mismatches the expected epoch —
@@ -190,7 +246,7 @@ export class CellStore {
     let dropped = 0;
     for (const [key, cell] of this.cells) {
       if (cell.stamp.catalog_epoch !== expected.catalog_epoch) {
-        this.cells.delete(key);
+        this.removeCell(key);
         dropped += 1;
       }
     }
@@ -209,7 +265,7 @@ export class CellStore {
    */
   static scratchAuthorityFrom(view: CellStore): CellStore {
     const scratch = new CellStore("authority");
-    for (const [key, cell] of view.cells) scratch.cells.set(key, { ...cell, provenance: "authoritative" });
+    for (const cell of view.cells.values()) scratch.setCell({ ...cell, provenance: "authoritative" });
     return scratch;
   }
 
@@ -217,28 +273,57 @@ export class CellStore {
    * writes to a clone, never to live state. */
   clone(): CellStore {
     const copy = new CellStore(this.role);
-    for (const [key, cell] of this.cells) copy["cells"].set(key, { ...cell });
+    for (const cell of this.cells.values()) copy.setCell({ ...cell });
     return copy;
   }
 
   /** Slice-clone: a copy holding only the given keys that this store has
    * (Phase 1 slice planning — the planner runs against the turn's seed
-   * slice, grown from the full snapshot on a miss). Same role and same
+   * slice, cloned per attempt from the live view). Same role and same
    * detached-copy semantics as `clone`; absent keys are skipped. */
   cloneSlice(keys: Iterable<string>): CellStore {
     const copy = new CellStore(this.role);
     for (const key of keys) {
       const cell = this.cells.get(key);
-      if (cell) copy["cells"].set(key, { ...cell });
+      if (cell) copy.setCell({ ...cell });
     }
     return copy;
   }
 
+  /** Every cell whose subject is `object` — O(the object's own cells) via
+   * the object index (the seed-slice builder's per-object hot call). */
   cellsForObject(object: string): Cell[] {
+    const keys = this.keysByObject.get(object);
+    if (!keys) return [];
     const out: Cell[] = [];
-    for (const cell of this.cells.values()) if (cell.object === object) out.push(cell);
+    for (const key of keys) {
+      const cell = this.cells.get(key);
+      if (cell) out.push(cell);
+    }
     return out;
   }
+
+  /** The actor's session cells — O(the actor's own sessions) via the
+   * session index (the seed-slice builder's per-turn session lookup,
+   * replacing an O(store) key scan). */
+  sessionCellsForActor(actor: string): Cell[] {
+    const keys = this.sessionKeysByActor.get(actor);
+    if (!keys) return [];
+    const out: Cell[] = [];
+    for (const key of keys) {
+      const cell = this.cells.get(key);
+      if (cell) out.push(cell);
+    }
+    return out;
+  }
+}
+
+/** The actor a session cell belongs to, or null for every other cell kind
+ * (the session index's extraction rule — value shape per CO14 rows). */
+function sessionActorOf(cell: Cell): string | null {
+  if (cell.kind !== "session") return null;
+  const actor = (cell.value as { actor?: unknown } | null | undefined)?.actor;
+  return typeof actor === "string" && actor.length > 0 ? actor : null;
 }
 
 /**

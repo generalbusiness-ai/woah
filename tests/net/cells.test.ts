@@ -87,6 +87,74 @@ describe("store roles enforce the coherence invariant (CO2.1)", () => {
   });
 });
 
+describe("object and session indexes (ready-to-scale blocker #1)", () => {
+  const session = (id: string, actor: string) =>
+    makeCell({ kind: "session", object: id, value: { id, actor }, provenance: "derived", stamp: STAMP });
+
+  it("cellsForObject tracks install, overwrite and delete", () => {
+    const view = new CellStore("derived");
+    view.install(makeCell({ kind: "object_lineage", object: "#a", value: { parent: null }, provenance: "derived", stamp: STAMP }));
+    view.install(makeCell({ kind: "property_cell", object: "#a", name: "n", value: 1, provenance: "derived", stamp: STAMP }));
+    view.install(makeCell({ kind: "property_cell", object: "#b", name: "n", value: 2, provenance: "derived", stamp: STAMP }));
+    expect(view.cellsForObject("#a").map((c) => c.key).sort()).toEqual(["object_lineage:#a", "property_cell:#a:n"]);
+    // Overwrite must not duplicate the index entry.
+    view.install(makeCell({ kind: "property_cell", object: "#a", name: "n", value: 9, provenance: "derived", stamp: STAMP }));
+    expect(view.cellsForObject("#a")).toHaveLength(2);
+    expect(view.cellsForObject("#a").find((c) => c.name === "n")?.value).toBe(9);
+    view.delete("property_cell:#a:n");
+    expect(view.cellsForObject("#a").map((c) => c.key)).toEqual(["object_lineage:#a"]);
+    expect(view.cellsForObject("#b")).toHaveLength(1);
+    expect(view.cellsForObject("#nowhere")).toEqual([]);
+  });
+
+  it("sessionCellsForActor tracks the session rows' actor field, including re-pointing on overwrite", () => {
+    const view = new CellStore("derived");
+    view.install(session("s_1", "#alice"));
+    view.install(session("s_2", "#alice"));
+    view.install(session("s_3", "#bob"));
+    expect(view.sessionCellsForActor("#alice").map((c) => c.object).sort()).toEqual(["s_1", "s_2"]);
+    expect(view.sessionCellsForActor("#bob").map((c) => c.object)).toEqual(["s_3"]);
+    // A session row rewritten to a different actor moves index entries.
+    view.install(session("s_2", "#bob"));
+    expect(view.sessionCellsForActor("#alice").map((c) => c.object)).toEqual(["s_1"]);
+    expect(view.sessionCellsForActor("#bob").map((c) => c.object).sort()).toEqual(["s_2", "s_3"]);
+    view.delete("session:s_1");
+    expect(view.sessionCellsForActor("#alice")).toEqual([]);
+  });
+
+  it("clone, cloneSlice and scratchAuthorityFrom carry working indexes", () => {
+    const authority = new CellStore("authority");
+    authority.commit({ kind: "object_lineage", object: "#a", value: { parent: null }, stamp: STAMP });
+    authority.commit({ kind: "property_cell", object: "#a", name: "n", value: 1, stamp: STAMP });
+    authority.commit({ kind: "session", object: "s_1", value: { id: "s_1", actor: "#alice" }, stamp: STAMP });
+
+    const copy = authority.clone();
+    expect(copy.cellsForObject("#a")).toHaveLength(2);
+    expect(copy.sessionCellsForActor("#alice")).toHaveLength(1);
+
+    const slice = authority.cloneSlice(["property_cell:#a:n", "session:s_1", "absent:key"]);
+    expect(slice.cellsForObject("#a").map((c) => c.key)).toEqual(["property_cell:#a:n"]);
+    expect(slice.sessionCellsForActor("#alice")).toHaveLength(1);
+
+    const scratch = CellStore.scratchAuthorityFrom(copy);
+    expect(scratch.cellsForObject("#a")).toHaveLength(2);
+    // Copies are detached: mutating one never leaks into the source index.
+    copy.delete("property_cell:#a:n");
+    expect(authority.cellsForObject("#a")).toHaveLength(2);
+    expect(scratch.cellsForObject("#a")).toHaveLength(2);
+  });
+
+  it("dropStaleEpoch un-indexes what it drops (CO8 reseed keeps indexes honest)", () => {
+    const view = new CellStore("derived");
+    view.install(makeCell({ kind: "property_cell", object: "#a", name: "n", value: 1, provenance: "derived", stamp: { scope_head: "h0", catalog_epoch: "old" } }));
+    view.install(makeCell({ kind: "session", object: "s_1", value: { id: "s_1", actor: "#alice" }, provenance: "derived", stamp: { scope_head: "h0", catalog_epoch: "old" } }));
+    view.install(makeCell({ kind: "property_cell", object: "#a", name: "m", value: 2, provenance: "derived", stamp: STAMP }));
+    expect(view.dropStaleEpoch({ catalog_epoch: "cat1" })).toBe(2);
+    expect(view.cellsForObject("#a").map((c) => c.key)).toEqual(["property_cell:#a:m"]);
+    expect(view.sessionCellsForActor("#alice")).toEqual([]);
+  });
+});
+
 describe("epoch discipline (CO8)", () => {
   it("dropStaleEpoch removes mismatched cells and reports the count", () => {
     const cache = new CellStore("derived");

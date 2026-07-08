@@ -184,6 +184,11 @@ describe("slice-based planning (Phase 1 — the spine)", () => {
     // Flat: the slice of the large world is no bigger than the small
     // world's full plan plus a small constant.
     expect(sliced.planCells).toBeLessThanOrEqual(full.planCells + 16);
+    // Blocker #1: the fix-6 SNAPSHOT is the slice itself — the clone,
+    // scratch, rewrite and closure never touch an O(view) copy. (The
+    // default path keeps the full clone: snapshotCells ~ view.)
+    expect(sliced.snapshotCells).toBe(sliced.planCells);
+    expect(fullViewOfLarge.snapshotCells).toBeGreaterThan(sliced.snapshotCells + 300);
 
     // Correctness: the slice plan commits, and to the same post-state a
     // full-view plan of the same world would (identical execution).
@@ -337,6 +342,41 @@ describe("plan-time snapshot (fix 6: the version-laundering window)", () => {
 
     // The plan itself is still honest end-to-end: the authority (which
     // did NOT move) accepts it.
+    expect(seq.submit(plan.submit).status).toBe("accepted");
+  });
+
+  it("slice planning keeps the fix-6 property: the seed slice is cloned synchronously, so a mid-plan install cannot launder", async () => {
+    // Blocker #1 moved the snapshot from a full view.clone() to a per-
+    // attempt slice-clone; the clone is still synchronous, so a warm turn
+    // (no growth rounds) records exactly the versions its execution saw.
+    const { seq, call } = harness("slice-snapshot");
+    const view = derivedViewOf(seq.store);
+    const key = "property_cell:plan_box:counter";
+    const snapshotVersion = view.get(key)?.version;
+    expect(snapshotVersion).toBeDefined();
+
+    const pending = planTurn({
+      call: call("plan-slice-snap-1"),
+      view,
+      planningScope: SCOPE,
+      classifier,
+      base: seq.head(),
+      idempotencyKey: "kslicesnap",
+      stamp: seq.stamp(),
+      slicePlanning: true
+    });
+    const midPlan = view.get(key) as NonNullable<ReturnType<typeof view.get>>;
+    view.install({ ...midPlan, value: { value: 999 }, version: "laundered-version" });
+
+    const plan = await pending;
+    const counterReads = plan.transcript.reads.filter(
+      (read) => read.cell.kind === "prop" && read.cell.object === "plan_box" && read.cell.name === "counter"
+    );
+    expect(counterReads.length).toBeGreaterThanOrEqual(1);
+    for (const read of counterReads) {
+      expect(read.version).toBe(snapshotVersion);
+      expect(read.version).not.toBe("laundered-version");
+    }
     expect(seq.submit(plan.submit).status).toBe("accepted");
   });
 });

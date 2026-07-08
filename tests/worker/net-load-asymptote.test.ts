@@ -181,24 +181,21 @@ describe("load:net-dev — plan-cost asymptotic invariant", () => {
     ).toBeLessThanOrEqual(FLAT_TOLERANCE);
   });
 
-  // Honesty gate (review blocker #1): plan_cells being flat proves the
-  // planner INPUT is sliced, but the warm turn STILL clones the whole view
-  // (fix-6 snapshot), builds scratch from it, and scans it (catalogKnownKeys,
-  // the seed session-scan) — all O(view). This asserts the snapshot itself
-  // is flat, which is NOT yet true, so it is marked `.fails`: it PASSES only
-  // while the residual O(view) cost remains, and MUST be converted to a
-  // normal assertion (removing `.fails`) once the snapshot becomes a
-  // view-index-backed slice-clone. It documents the known gap in the gate
-  // itself rather than in prose only — a green suite that silently hides a
-  // scale blocker is the false confidence this exists to prevent.
-  it.fails("snapshot_cells is NOT yet flat — the fix-6 clone/scratch/scans are still O(view) (blocker #1)", async () => {
+  // Blocker #1 (closed): plan_cells being flat proves the planner INPUT is
+  // sliced; this asserts the fix-6 SNAPSHOT is flat too — the warm turn's
+  // clone, scratch post-state, version rewrite, read closure and catalog
+  // classification all operate on the seed slice (view-index-backed
+  // slice-clone), so NO per-turn pass over the resident view remains. A
+  // regression that reintroduces an O(view) snapshot (e.g. a full clone
+  // sneaking back into the slice path) turns this red.
+  it("snapshot_cells stays flat as the view grows (the whole warm turn is O(read-set), not just the planner input)", async () => {
     const small = await warmTurnStructure(0);
     const large = await warmTurnStructure(PAD);
     const delta = large.snapshot_cells - small.snapshot_cells;
     expect(
       delta,
       `snapshot_cells grew by ${delta} (small=${small.snapshot_cells}, large=${large.snapshot_cells}); ` +
-        `the warm turn still clones/scans the whole view. Remove \`.fails\` when the snapshot is a slice-clone.`
+        `the warm turn is cloning/scanning the whole view again (blocker #1 regression).`
     ).toBeLessThanOrEqual(FLAT_TOLERANCE);
   });
 });

@@ -67,16 +67,21 @@ export type PlanTurnInput = {
   /** Lineage keys the receiver universally holds (CO15: the catalog
    * scope's closure is receiver-known in every transfer — class chains
    * never reship). The read closure omits these cells and declares them
-   * `assumes_known` instead; only `object_lineage:*` keys belong here. */
-  receiverKnown?: ReadonlySet<string>;
+   * `assumes_known` instead; only `object_lineage:*` keys belong here.
+   * The function form is invoked with the PLANNING STORE (the seed slice
+   * under slicePlanning) once the run settles, so a caller can classify
+   * just the lineage keys the plan can actually reference instead of
+   * scanning its whole view per turn (ready-to-scale blocker #1). */
+  receiverKnown?: ReadonlySet<string> | ((planStore: CellStore) => ReadonlySet<string>);
   /** Phase 1 (slice-based planning): when true, the planner runs the VM
    * against the turn's SEED SLICE (actor/session/target + their class
-   * chain) rather than the whole view, growing the slice from the
-   * (consistent) snapshot on a sparse miss — so a warm turn's plan cost is
-   * O(read-set), not O(view). Genuinely-absent cells still escape as
-   * E_MISSING_STATE to the gateway's pull path. Default (absent/false)
-   * plans against the whole view — byte-identical to the pre-slice path,
-   * so non-turn callers (session mint, tests) are unaffected. */
+   * chain), slice-cloned per attempt from the live view's indexes and
+   * grown on a sparse miss — so the WHOLE warm turn (clone, execution,
+   * rewrite, scratch, closure) costs O(read-set), not O(view) (blocker
+   * #1). Genuinely-absent cells still escape as E_MISSING_STATE to the
+   * gateway's pull path. Default (absent/false) plans against one full
+   * view clone — byte-identical to the pre-slice path, so non-turn
+   * callers (session mint, tests) are unaffected. */
   slicePlanning?: boolean;
 };
 
@@ -94,19 +99,18 @@ export type PlanTurnResult = {
    * exact array so it measures the resident-view clone/rebuild CPU, not
    * the post-hoc read closure. */
   planCells: number;
-  /** Phase 0 (honesty): cells in the fix-6 SNAPSHOT — currently
-   * `view.clone()`, so O(view). plan_cells being flat proves the planner
-   * INPUT is sliced, but NOT that the snapshot clone / scratch / scans are
-   * bounded (review blocker #1). This exposes that residual O(view) cost so
-   * the load gate can measure it; it goes to ~read-set only once the
-   * snapshot is a view-index-backed slice-clone (tracked work). */
+  /** Phase 0 (honesty): cells in the fix-6 SNAPSHOT the settled attempt
+   * planned against. Under slicePlanning this is the seed SLICE (the
+   * clone, scratch, rewrite and closure all operate on it), so it must
+   * stay flat as the view grows — the load gate's blocker-#1 invariant.
+   * On the default path it is the full `view.clone()`, O(view). */
   snapshotCells: number;
 };
 
 export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
   const { call, view, planningScope, classifier, base, idempotencyKey, stamp } = input;
 
-  // ONE consistent snapshot, taken synchronously BEFORE the first await
+  // ONE consistent snapshot per planning attempt, taken synchronously
   // (fix 6: the version-laundering window). The cells the ephemeral world
   // executes against, the versions the recorded reads are rewritten with,
   // the post-state pre-image, and the read-closure bytes must all come
@@ -114,75 +118,108 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
   // concurrent fanout/refresh mutating the live view mid-plan would
   // otherwise stamp the reads with versions the execution never saw —
   // laundering a stale plan past the scope's read-version check.
-  const snapshot = view.clone();
-
-  // Phase 1: the VM runs against the turn's SEED SLICE (slice planning) or
-  // the whole snapshot (default). `seed` grows on a sparse miss by
-  // promoting the missing cell FROM THE SNAPSHOT — an in-memory, fix-6-
-  // consistent read, NOT an RPC — so a warm turn (its reads resident)
-  // converges in this loop with zero repair rounds and plan_cells ~
-  // read-set. Only a cell genuinely absent from the snapshot escapes as
-  // E_MISSING_STATE to the gateway's pull path. Default (no slicePlanning)
-  // seeds every snapshot key, so the loop runs once against the whole view
-  // and behaves byte-identically to the pre-slice path.
-  const seed = input.slicePlanning ? buildSeedSlice(snapshot, call) : new Set<string>(snapshot.keys());
+  //
+  // Default mode takes the snapshot ONCE, before the first await — the
+  // full `view.clone()`, byte-identical to the pre-slice path. Slice mode
+  // (Phase 1 / ready-to-scale blocker #1) instead clones ONLY the seed
+  // slice's keys, re-cloned from the live view at the top of every
+  // attempt: each clone is synchronous, so the fix-6 single-instant
+  // property holds for the attempt that settles (its execution, rewrite,
+  // scratch and closure all read the SAME detached slice), while the copy
+  // cost is O(read-set), never O(view).
+  const sliceMode = input.slicePlanning === true;
+  const snapshot = sliceMode ? null : view.clone();
+  // Phase 1 seed: the actor/session/target dispatch closure, built from
+  // the LIVE view's object/session indexes (O(seed)). A sparse miss grows
+  // it below — in-memory, never an RPC — so a warm turn (its reads
+  // resident) converges here with zero repair rounds and plan_cells ~
+  // read-set. Only a cell genuinely absent from the view escapes as
+  // E_MISSING_STATE to the gateway's pull path.
+  const seed = sliceMode ? buildSeedSlice(view, call) : null;
+  // A mid-attempt view mutation can make an attempt retry without growing
+  // the seed (the re-clone picks up the changed cells). Monotonic seed
+  // growth bounds the growth rounds; this caps the retry-without-growth
+  // tail so a pathological flap cannot spin the loop forever.
+  let retriesWithoutGrowth = 0;
+  const RETRY_WITHOUT_GROWTH_LIMIT = 8;
   let run: Awaited<ReturnType<typeof runShadowTurnCallTranscript>> | undefined;
+  let planStore: CellStore | undefined;
   let planInput: Cell[] = [];
   for (;;) {
-    // Default (non-slice) mode plans against the snapshot directly — no
-    // extra copy, byte-identical to the pre-slice path. Slice mode builds
-    // the seed slice; a miss grows it from the snapshot below.
-    const sliceStore = input.slicePlanning ? snapshot.cloneSlice(seed) : snapshot;
-    planInput = storeCells(sliceStore);
+    // The attempt's fix-6 snapshot: the seed slice (slice mode) or the
+    // one full snapshot (default — no extra copy).
+    const attemptStore = sliceMode && seed ? view.cloneSlice(seed) : (snapshot as CellStore);
+    planInput = storeCells(attemptStore);
     const world = planningWorldFromCells(planInput, input.counters);
     let attemptRun: Awaited<ReturnType<typeof runShadowTurnCallTranscript>>;
     try {
       attemptRun = await runShadowTurnCallTranscript(world, call);
     } catch (err) {
-      // A sparse miss vs the SLICE. Grow from the snapshot and re-run; if
-      // nothing is growable the cell is genuinely absent — surface the
-      // miss against the SNAPSHOT so the gateway pulls exactly those keys
-      // (CO2.6/VTN10.1: repairable E_MISSING_STATE, never a raw engine
-      // E_OBJNF/E_VERBNF the repair loop cannot act on).
-      const missVsSlice = translateSparsePlanningThrow(err, sliceStore, call);
-      if (growSeedFromSnapshot(missVsSlice, snapshot, seed)) {
-        expandObjRefs(seed, snapshot); // a grown cell may carry obj-refs
+      // A sparse miss vs the attempt's slice. Grow from the LIVE view and
+      // re-run; if nothing is growable the cell is genuinely absent —
+      // surface the miss against the VIEW so the gateway pulls exactly
+      // those keys (CO2.6/VTN10.1: repairable E_MISSING_STATE, never a raw
+      // engine E_OBJNF/E_VERBNF the repair loop cannot act on).
+      const missVsAttempt = translateSparsePlanningThrow(err, attemptStore, call);
+      if (!sliceMode || !seed) throw missVsAttempt;
+      if (growSeedFromView(missVsAttempt, view, seed)) {
+        expandObjRefs(seed, view); // a grown cell may carry obj-refs
         continue;
       }
-      throw translateSparsePlanningThrow(err, snapshot, call);
+      // No growth: either the keys are genuinely absent from the live view
+      // (escape to the pull path) or they landed in the view mid-attempt
+      // (already seeded — the next re-clone picks them up; bounded retry).
+      if (missIsResidentNow(missVsAttempt, view) && retriesWithoutGrowth < RETRY_WITHOUT_GROWTH_LIMIT) {
+        retriesWithoutGrowth += 1;
+        continue;
+      }
+      throw translateSparsePlanningThrow(err, view, call);
     }
     // CO2.6 second half: the engine RECORDS a dispatch miss in the
     // transcript rather than throwing. Same grow-or-escape vs the slice.
-    const recordedVsSlice = sparseMissFromRecordedError(attemptRun.transcript, sliceStore);
-    if (recordedVsSlice) {
-      if (growSeedFromSnapshot(recordedVsSlice, snapshot, seed)) {
-        expandObjRefs(seed, snapshot);
+    const recordedVsAttempt = sparseMissFromRecordedError(attemptRun.transcript, attemptStore);
+    if (recordedVsAttempt) {
+      if (!sliceMode || !seed) throw recordedVsAttempt;
+      if (growSeedFromView(recordedVsAttempt, view, seed)) {
+        expandObjRefs(seed, view);
         continue;
       }
-      const recordedVsSnapshot = sparseMissFromRecordedError(attemptRun.transcript, snapshot);
-      if (recordedVsSnapshot) throw recordedVsSnapshot;
+      if (missIsResidentNow(recordedVsAttempt, view) && retriesWithoutGrowth < RETRY_WITHOUT_GROWTH_LIMIT) {
+        retriesWithoutGrowth += 1;
+        continue;
+      }
+      const recordedVsView = sparseMissFromRecordedError(attemptRun.transcript, view);
+      if (recordedVsView) throw recordedVsView;
     }
     run = attemptRun;
+    planStore = attemptStore;
     break;
   }
   // The loop only breaks after a successful, sparse-miss-free run.
-  if (!run) throw new Error("planner loop exited without a run (unreachable)");
+  if (!run || !planStore) throw new Error("planner loop exited without a run (unreachable)");
 
   // CO14: every planned submit carries its session read (and a
   // transition-carrying turn folds the session-cell write) BEFORE scope
   // selection, so the folded write participates in the write-set routing.
-  const withSession = foldSessionEffects(run.transcript, snapshot, call);
+  const withSession = foldSessionEffects(run.transcript, planStore, call);
   const selection = selectCommitScope(withSession, planningScope, classifier);
-  const transcript = submitTranscript(withSession, snapshot, selection.scope);
+  const transcript = submitTranscript(withSession, planStore, selection.scope);
 
-  // Planner-parity post-state: same apply, same prior cells (the snapshot
-  // is a read-through of authority), so an honest plan predicts the
-  // digest the scope derives at CO4 step 10 — and a stale view is caught
-  // by the read-version check before post-state ever disagrees.
-  const applied = applyTranscript(CellStore.scratchAuthorityFrom(snapshot), transcript, stamp);
+  // Planner-parity post-state: same apply, same prior cells (the settled
+  // attempt's store is a read-through of authority, and every write
+  // preimage is slice-resident — a materialized object carries ALL its
+  // view cells), so an honest plan predicts the digest the scope derives
+  // at CO4 step 10 — `postStateVersion` digests TOUCHED cells only, so a
+  // slice-sized scratch predicts the same value the full store would —
+  // and a stale view is caught by the read-version check before
+  // post-state ever disagrees.
+  const applied = applyTranscript(CellStore.scratchAuthorityFrom(planStore), transcript, stamp);
 
-  const receiverKnown = input.receiverKnown ?? new Set<string>();
-  const closure = serializeTransfer(readClosureCells(snapshot, transcript, call, receiverKnown), receiverKnown);
+  // The function form classifies just the settled store's lineage keys
+  // (O(slice)) instead of a per-turn whole-view scan (blocker #1).
+  const receiverKnown =
+    typeof input.receiverKnown === "function" ? input.receiverKnown(planStore) : input.receiverKnown ?? new Set<string>();
+  const closure = serializeTransfer(readClosureCells(planStore, transcript, call, receiverKnown), receiverKnown);
   // The CO7 envelope is the transcript plus its read-closure; measure the
   // whole shape that would go on the wire.
   const envelopeBytes = new TextEncoder().encode(JSON.stringify({ transcript, closure })).byteLength;
@@ -208,7 +245,7 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
     envelopeBytes,
     transcript,
     planCells: planInput.length,
-    snapshotCells: snapshot.size
+    snapshotCells: planStore.size
   };
 }
 
@@ -363,12 +400,14 @@ function readClosureCells(
  * before it reads anything object-specific, so the common case converges
  * with no growth round. Fixed-point over the actor's and target's class
  * chain (`lineageClosureKeys` is one-hop; the parent walk here is
- * transitive), plus every cell the snapshot holds for each object in that
+ * transitive), plus every cell the view holds for each object in that
  * chain (live, lineage, property defs, verb pages — inherited dispatch
- * resolves locally) and the call's session cell. O(chain), never O(view);
- * any read beyond it grows the slice from the snapshot in planTurn's loop.
+ * resolves locally) and the call's session cell. O(chain), never O(view):
+ * the per-object and per-actor lookups ride the CellStore indexes
+ * (blocker #1). Built synchronously from the LIVE view; planTurn's loop
+ * then slice-clones the seed keys per attempt and grows on a miss.
  */
-function buildSeedSlice(snapshot: CellStore, call: ShadowTurnCall): Set<string> {
+function buildSeedSlice(view: CellStore, call: ShadowTurnCall): Set<string> {
   const seed = new Set<string>();
   if (typeof call.session === "string" && call.session) seed.add(cellKey("session", call.session));
   // Seed the actor's OTHER session cells too. The move chain's body-move
@@ -378,13 +417,9 @@ function buildSeedSlice(snapshot: CellStore, call: ShadowTurnCall): Set<string> 
   // the actor's primary and relocate the shared physical body. A sequenced
   // session transition must NOT write object_live (the actor's location is
   // the primary session's; a non-primary session's move is presence-only).
-  // Scan is a cheap key-prefix filter bounded by the actor's own sessions.
+  // The session index makes this O(the actor's own sessions).
   if (typeof call.actor === "string" && call.actor) {
-    for (const key of snapshot.keys()) {
-      if (!key.startsWith("session:")) continue;
-      const value = snapshot.get(key)?.value as { actor?: unknown } | null | undefined;
-      if (value && value.actor === call.actor) seed.add(key);
-    }
+    for (const cell of view.sessionCellsForActor(call.actor)) seed.add(cell.key);
   }
   const chain = new Set<string>();
   for (const ref of [call.actor, call.target]) {
@@ -393,7 +428,7 @@ function buildSeedSlice(snapshot: CellStore, call: ShadowTurnCall): Set<string> 
   for (;;) {
     let added = false;
     for (const object of [...chain]) {
-      const lineage = snapshot.get(cellKey("object_lineage", object));
+      const lineage = view.get(cellKey("object_lineage", object));
       const parent =
         lineage && typeof lineage.value === "object" && lineage.value
           ? (lineage.value as { parent?: unknown }).parent
@@ -406,14 +441,14 @@ function buildSeedSlice(snapshot: CellStore, call: ShadowTurnCall): Set<string> 
     if (!added) break;
   }
   for (const object of chain) {
-    for (const cell of snapshot.cellsForObject(object)) seed.add(cell.key);
+    for (const cell of view.cellsForObject(object)) seed.add(cell.key);
   }
   // Resolve object-valued properties so obj-ref reads land on materialized
   // objects: an unmaterialized ref target makes the engine attribute the
   // downstream property miss to the frame's OWN `this` (not the ref
   // target), which growth cannot then identify. One hop here; deeper refs
   // resolve as growth re-expands (planTurn's loop).
-  expandObjRefs(seed, snapshot);
+  expandObjRefs(seed, view);
   return seed;
 }
 
@@ -439,20 +474,23 @@ function collectStrings(value: unknown, out: Set<string>): void {
  * miss to the executing frame's OWN `this`, so a read of `ref.prop` whose
  * cell is absent mis-reports as `this.prop` and cannot be grown — the only
  * safe cure is to have the ref target's cells present before the VM reads
- * them. Bounded by the turn's reachable object graph (only snapshot-
- * resident objects; unrelated objects are never referenced, so the slice
- * stays independent of view size — the Phase-0 invariant). */
-function expandObjRefs(seed: Set<string>, snapshot: CellStore): void {
+ * them. Bounded by the turn's reachable object graph (only view-resident
+ * objects; unrelated objects are never referenced, so the slice stays
+ * independent of view size — the Phase-0 invariant). A lineage payload's
+ * `parent`/`owner` are strings too, so each seeded object's class chain
+ * closes transitively here — the read-closure walk and serializeTransfer's
+ * dangle assert both depend on that. */
+function expandObjRefs(seed: Set<string>, view: CellStore): void {
   for (;;) {
     const strings = new Set<string>();
     for (const key of seed) {
-      const cell = snapshot.get(key);
+      const cell = view.get(key);
       if (cell) collectStrings(cell.value, strings);
     }
     let added = false;
     for (const ref of strings) {
-      if (!snapshot.has(cellKey("object_lineage", ref))) continue; // not a resident object
-      for (const cell of snapshot.cellsForObject(ref)) {
+      if (!view.has(cellKey("object_lineage", ref))) continue; // not a resident object
+      for (const cell of view.cellsForObject(ref)) {
         if (!seed.has(cell.key)) {
           seed.add(cell.key);
           added = true;
@@ -464,24 +502,34 @@ function expandObjRefs(seed: Set<string>, snapshot: CellStore): void {
 }
 
 /**
- * Phase 1: promote a sparse miss's cells from the snapshot into the seed.
+ * Phase 1: promote a sparse miss's cells from the live view into the seed.
  * Returns true iff the seed grew (at least one missing key was resident in
- * the snapshot and newly added) — the planTurn loop then re-runs against
- * the enlarged slice with no RPC. A miss whose keys are all absent from
- * the snapshot returns false, so the caller escapes to the pull path. The
- * seed is monotonic ⊆ snapshot keys, so growth always terminates.
+ * the view and newly added) — the planTurn loop then re-clones the enlarged
+ * slice with no RPC. A miss whose keys are all absent from the view returns
+ * false, so the caller escapes to the pull path. The seed only ever grows,
+ * so growth rounds are bounded by the turn's reachable key set.
  */
-function growSeedFromSnapshot(miss: unknown, snapshot: CellStore, seed: Set<string>): boolean {
+function growSeedFromView(miss: unknown, view: CellStore, seed: Set<string>): boolean {
   if (!isNetError(miss) || miss.code !== "E_MISSING_STATE") return false;
   const missing = Array.isArray(miss.detail.missing) ? (miss.detail.missing as string[]) : [];
   let grew = false;
   for (const key of missing) {
-    if (snapshot.has(key) && !seed.has(key)) {
+    if (view.has(key) && !seed.has(key)) {
       seed.add(key);
       grew = true;
     }
   }
   return grew;
+}
+
+/** True when every key a sparse miss names is resident in the live view
+ * (planTurn's growthless-retry guard): the cells must have landed AFTER
+ * the attempt's slice-clone (fanout/refresh interleaving with the VM's
+ * awaits), so re-cloning — not pulling — is the correct next step. */
+function missIsResidentNow(miss: unknown, view: CellStore): boolean {
+  if (!isNetError(miss) || miss.code !== "E_MISSING_STATE") return false;
+  const missing = Array.isArray(miss.detail.missing) ? (miss.detail.missing as string[]) : [];
+  return missing.length > 0 && missing.every((key) => view.has(key));
 }
 
 function translateSparsePlanningThrow(err: unknown, view: CellStore, call: ShadowTurnCall): unknown {

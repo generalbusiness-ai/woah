@@ -252,16 +252,16 @@ class TurnStructure {
    * cache-fill) is deliberately NOT counted here — it is not a repair. */
   reconstructions = 0;
   /** Phase 0 / CO10: cells fed to the planner (`PlanTurnResult.planCells`)
-   * on the round that settled — the planner INPUT size. On the current
-   * pre-slice path this is the whole view (O(view)); once planning is
-   * slice-based it must stay ~read-set regardless of view size. The load
-   * gate's plan invariant asserts against this. Set per round so a settled
-   * turn reports its final plan's input. */
+   * on the round that settled — the planner INPUT size. Slice planning
+   * keeps it ~read-set regardless of view size; the load gate's plan
+   * invariant asserts against this. Set per round so a settled turn
+   * reports its final plan's input. */
   plan_cells = 0;
-  /** Phase 0 (honesty): cells in the fix-6 snapshot clone
-   * (`PlanTurnResult.snapshotCells`) — currently O(view). plan_cells being
-   * flat does NOT prove the snapshot clone / scratch / scans are bounded
-   * (review blocker #1); this measures that residual O(view) cost. */
+  /** Phase 0: cells in the settled attempt's fix-6 snapshot
+   * (`PlanTurnResult.snapshotCells`). Under slice planning this is the
+   * seed SLICE the whole turn (clone/scratch/rewrite/closure) operates on,
+   * so it must stay flat as the view grows — the load gate's blocker-#1
+   * invariant asserts it alongside plan_cells. */
   snapshot_cells = 0;
   countRpc(): void {
     this.sync_rpc += 1;
@@ -728,13 +728,18 @@ export class NetGatewayDO {
   }
 
   /**
-   * The catalog scope's lineage keys held by this view (CO15): the
+   * The catalog scope's lineage keys held by the given store (CO15): the
    * shared substrate is universally receiver-known in transfers, so the
    * planner's read closure never reships class chains. An unclassifiable
    * lineage cell (mid-walk gap during a partial refresh) simply ships —
    * the known-set is an envelope optimization and must never fail a plan.
    * Under the legacy override classifier no scope is ever "catalog", so
    * the set is empty and legacy envelopes are unchanged.
+   *
+   * Called by the planner with the settled PLAN SLICE (blocker #1: the
+   * closure can only reference slice lineage keys, so classifying just
+   * those is equivalent to — and O(view) cheaper than — scanning the
+   * whole resident view per turn).
    */
   private catalogKnownKeys(view: CellStore, classifier: ScopeClassifier): Set<string> {
     const known = new Set<string>();
@@ -2125,15 +2130,17 @@ export class NetGatewayDO {
       base: { seq: 0, hash: "provisional" },
       idempotencyKey: request.idempotency_key,
       stamp: { scope_head: "gateway", catalog_epoch: request.catalog_epoch },
-      receiverKnown: this.catalogKnownKeys(view, classifier),
+      // The callback form runs over the settled plan SLICE, not the whole
+      // view — with slicePlanning below this keeps the entire warm turn
+      // (snapshot clone, scratch, closure, catalog classification) at
+      // O(read-set); load:net-dev asserts both plan_cells and
+      // snapshot_cells stay flat as the view grows (blocker #1).
+      receiverKnown: (planStore) => this.catalogKnownKeys(planStore, classifier),
       // Phase 1: the gateway turn path plans against the read-set SLICE
-      // (built from the actor/session/target closure, grown from the view
-      // on a miss), so the planner-world INPUT is O(read-set), not O(view).
-      // NOTE: the surrounding turn machinery still has O(view) passes (the
-      // fix-6 snapshot clone, scratch post-state, catalogKnownKeys scan) —
-      // those are the remaining ready-to-scale work tracked in
-      // notes/2026-07-08-net-ready-to-scale-plan.md, and load:net-dev now
-      // measures them (view_touch_cells) alongside plan_cells.
+      // (built from the actor/session/target closure via the view's
+      // object/session indexes, slice-cloned per attempt, grown on a
+      // miss), so the planner world AND the fix-6 snapshot are
+      // O(read-set), not O(view).
       slicePlanning: true,
       ...(request.counters !== undefined ? { counters: request.counters } : {})
     });

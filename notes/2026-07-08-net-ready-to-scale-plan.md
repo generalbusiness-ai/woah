@@ -90,7 +90,8 @@ them, every turn → O(view). Make it O(read-set):
   lineage seed covers the common case; the bounded repair budget covers the
   tail; the load gate quantifies cold-round count.
 
-REVIEW BLOCKER #1 (2026-07-08, OPEN — the warm turn is still O(view)): slice
+REVIEW BLOCKER #1 (2026-07-08, CLOSED — see the resolution paragraph after
+the original statement): slice
 planning bounds the planner INPUT (plan_cells 997 flat), but the surrounding
 turn machinery still has O(view) passes: the fix-6 `view.clone()` snapshot
 (plan.ts), the scratch post-state clone (scratchAuthorityFrom), the
@@ -107,6 +108,31 @@ indexes touch every consumer) — a focused pass, not a tail-of-session rush.
 Also landed from the same review: relation read indexes (member;
 owner,member), load:net-dev wired into deploy.sh, stale slicePlanning comment
 fixed.
+
+RESOLUTION (2026-07-08): blocker #1 CLOSED — the whole warm turn is now
+O(read-set). CellStore carries an OBJECT index (`keysByObject`, making
+`cellsForObject` O(own cells)) and a SESSION index (`sessionKeysByActor` →
+new `sessionCellsForActor`), maintained by a single internal write/delete
+path (`setCell`/`removeCell`) so commit/install/delete/dropStaleEpoch/
+clone/cloneSlice/scratchAuthorityFrom can never drift them. Slice-mode
+planTurn no longer takes a full `view.clone()`: the seed is built from the
+LIVE view's indexes and the fix-6 snapshot is a PER-ATTEMPT synchronous
+`view.cloneSlice(seed)` (a growth round re-clones the enlarged seed; a
+growthless retry is bounded at 8 for the mid-attempt-install race), and the
+settled attempt's slice is the single instant the session fold, version
+rewrite, scratch post-state, and read closure all operate on — fix-6 holds
+per attempt (a new slice-mode laundering test proves it). `postStateVersion`
+digests TOUCHED cells only, so the slice-sized scratch predicts the same
+digest as the full store (write preimages are slice-resident: a
+materialized object carries ALL its view cells). `catalogKnownKeys` is now
+computed over the settled SLICE via a `receiverKnown` callback (the closure
+can only reference slice lineage keys, so this is equivalent and O(slice)).
+The default (non-slice) path keeps the single full pre-await clone,
+byte-identical. Gate flipped: the load lane's `it.fails` is now a normal
+assertion — snapshot_cells 997 FLAT across view sizes (was 1256→2156),
+equal to plan_cells, attempt 1, 0 reconstructions. Gates green: typecheck;
+npm test 754; test:worker 360; smoke:net-dev 24/24 (real workerd); e2e:net
+2/2 (real browsers); load:net-dev 2/2.
 
 STATUS (2026-07-08, FINAL): **PHASE 1 COMPLETE — slice planning is ON**
 (commit `647853d`). All gates green with slicing enabled: typecheck; npm
