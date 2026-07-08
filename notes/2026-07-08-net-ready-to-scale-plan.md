@@ -139,6 +139,27 @@ stays GATED OFF until that lands. The presence fix + slice machinery + the
 load gate are committed; the flag flips after the pull-on-miss/warming fix.
 The slice MACHINERY itself remains proven correct (tests/net/plan.test.ts).
 
+ROOT CAUSE fully resolved (2026-07-08, empirically): the "NEW blocker" above
+and the earlier net-ws presence failure have ONE root — **`welcome`/enter
+moves the shared actor BODY**, not per-session presence. Every enter/join
+path (`player_moveto`, `movetoChecked`, `player_join`) couples
+`actor.location` + `session.activeScope`; there is NO presence-only
+primitive. Evidence: (1) `click` is presence-gated — anchoring a fresh
+session away from the dragged body yields `E_PERM ... not present` (Model S
+confirmed at the verb layer); (2) a second session of the same actor
+entering the same room is a no-op body-move → no transition → no presence
+(the bug foldSessionEffects synthesis WORKED AROUND); (3) lane-s2's enter
+drags the shared body to the annex → a fresh client session lands there →
+clicking net_lane_room's box is "not present". Per-session presence
+(owner-ratified) is INCOHERENT if entering moves the one body (two sessions
+can't be in two rooms). Required fix = a **presence-join**: entering a SPACE
+sets the SESSION's `activeScope` only; the shared body moves only on a
+physical `go`. Engine + catalog change (presence-set primitive distinct
+from `player_moveto`; `welcome`/enter-a-space use it; `go` keeps moveto).
+Dissolves both bugs at the root and retires the foldSessionEffects
+workaround. Fresh-session-anchor change was reverted (too blunt). Slicing
+stays gated off until the presence-join lands.
+
 Design realized:
 keep the full consistent `view.clone()` (fix-6 intact) but build the
 planning WORLD from the seed slice, growing it FROM the snapshot on a miss
