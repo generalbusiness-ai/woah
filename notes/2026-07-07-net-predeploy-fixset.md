@@ -7,6 +7,44 @@ measuring cold-start/cross-colo behavior. Inputs: two internal reviews
 (`notes/2026-07-07-net-review-alignment-stability.md`) + an external
 security/correctness review (2026-07-07).
 
+## STATUS — all items landed (2026-07-07)
+
+Every item is done, committed on `net-predeploy`, and the full gate chain
+is green. The branch is ready for the owner's merge + staging-deploy call.
+
+| Item | What | Commit |
+|---|---|---|
+| B2 | replay decided by the scope, never fabricates fresh output | `41c4a09` |
+| B1 | authorize /net-api reads — deny credentials, scope by presence | `ab3c0b9` / `7fadb58` |
+| B3 | short-lived single-use WS ticket — apikey never in the URL | `decb3fe` |
+| H4 | per-actor token-bucket rate limits on /net-api | `35e4e16` |
+| M9 | durable epoch disagreement is terminal `E_EPOCH_MISMATCH` | `215b90a` |
+| H2 | reapers: reply-cache bound, pin table, expired sessions | `2b78816` |
+| H1 | gateway self-subscribe + net-smoke doorway signature gate | `e837554` |
+| M10 | NetFeed re-mints an expired session instead of looping | `7bf8152` |
+| D2 | per-turn CO10 structural counters + curated warm gate | `32db7f2` |
+
+Regression tests added, as the gate required: unauthorized cell/relation
+reads (B1, net-client-api.test.ts), same-post-state replay (B2, across
+scope-store/sessions/net-do/net-scope-fanout), single-use WS ticket auth
+(B3, net-ws.test.ts), unsigned net-smoke refusal (H1b,
+net-smoke-doorway.test.ts), session re-mint + terminal give-up (M10,
+net-feed.test.ts), warm-turn structure (D2, net-turn-structure.test.ts).
+
+Final gate chain, all green: typecheck; `npm test` 748; `test:worker` 358;
+`git diff --check` clean; `smoke:net-dev` 24/24 real workerd; `e2e:net`
+2/2 (the cross-user case exercises H1 self-subscribe end-to-end).
+
+Two H1b subtleties worth remembering (workerd-only signals the fake lane
+missed): the public edge's `sanitizePublicHeaders` strips the inbound
+internal signature, so the doorway gets the RAW pre-sanitize request — and
+that raw request must be a `clone()`, since `sanitizePublicHeaders` builds
+`new Request(request, …)` which disturbs the original body stream (real
+workerd surfaces "stream locked to a reader" on a POST doorway call).
+
+NEXT: owner decides merge-to-main + the measurement-only staging deploy.
+Deferred (NOT this set): the CO11/CO12 items in the section below.
+
 ## The blockers (must land before staging)
 
 ### B1 — Unauthorized reads expose arbitrary cells incl. credentials [SECURITY]
