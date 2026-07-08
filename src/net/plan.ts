@@ -94,6 +94,13 @@ export type PlanTurnResult = {
    * exact array so it measures the resident-view clone/rebuild CPU, not
    * the post-hoc read closure. */
   planCells: number;
+  /** Phase 0 (honesty): cells in the fix-6 SNAPSHOT — currently
+   * `view.clone()`, so O(view). plan_cells being flat proves the planner
+   * INPUT is sliced, but NOT that the snapshot clone / scratch / scans are
+   * bounded (review blocker #1). This exposes that residual O(view) cost so
+   * the load gate can measure it; it goes to ~read-set only once the
+   * snapshot is a view-index-backed slice-clone (tracked work). */
+  snapshotCells: number;
 };
 
 export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
@@ -200,7 +207,8 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
     selection,
     envelopeBytes,
     transcript,
-    planCells: planInput.length
+    planCells: planInput.length,
+    snapshotCells: snapshot.size
   };
 }
 

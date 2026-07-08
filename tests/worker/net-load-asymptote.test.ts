@@ -66,6 +66,7 @@ type TurnStructureReport = {
   sync_rpc: number;
   reconstructions: number;
   plan_cells: number;
+  snapshot_cells: number;
 };
 type TurnBody = { reply: CommitReply; structure?: TurnStructureReport };
 
@@ -177,6 +178,27 @@ describe("load:net-dev — plan-cost asymptotic invariant", () => {
       `plan_cells grew by ${delta} when ${PAD} unrelated objects were added ` +
         `(small=${small.plan_cells}, large=${large.plan_cells}); a warm turn must plan ` +
         `against its read-set, not the resident view. RED until Phase 1 slice planning.`
+    ).toBeLessThanOrEqual(FLAT_TOLERANCE);
+  });
+
+  // Honesty gate (review blocker #1): plan_cells being flat proves the
+  // planner INPUT is sliced, but the warm turn STILL clones the whole view
+  // (fix-6 snapshot), builds scratch from it, and scans it (catalogKnownKeys,
+  // the seed session-scan) — all O(view). This asserts the snapshot itself
+  // is flat, which is NOT yet true, so it is marked `.fails`: it PASSES only
+  // while the residual O(view) cost remains, and MUST be converted to a
+  // normal assertion (removing `.fails`) once the snapshot becomes a
+  // view-index-backed slice-clone. It documents the known gap in the gate
+  // itself rather than in prose only — a green suite that silently hides a
+  // scale blocker is the false confidence this exists to prevent.
+  it.fails("snapshot_cells is NOT yet flat — the fix-6 clone/scratch/scans are still O(view) (blocker #1)", async () => {
+    const small = await warmTurnStructure(0);
+    const large = await warmTurnStructure(PAD);
+    const delta = large.snapshot_cells - small.snapshot_cells;
+    expect(
+      delta,
+      `snapshot_cells grew by ${delta} (small=${small.snapshot_cells}, large=${large.snapshot_cells}); ` +
+        `the warm turn still clones/scans the whole view. Remove \`.fails\` when the snapshot is a slice-clone.`
     ).toBeLessThanOrEqual(FLAT_TOLERANCE);
   });
 });

@@ -258,6 +258,11 @@ class TurnStructure {
    * gate's plan invariant asserts against this. Set per round so a settled
    * turn reports its final plan's input. */
   plan_cells = 0;
+  /** Phase 0 (honesty): cells in the fix-6 snapshot clone
+   * (`PlanTurnResult.snapshotCells`) — currently O(view). plan_cells being
+   * flat does NOT prove the snapshot clone / scratch / scans are bounded
+   * (review blocker #1); this measures that residual O(view) cost. */
+  snapshot_cells = 0;
   countRpc(): void {
     this.sync_rpc += 1;
   }
@@ -277,6 +282,7 @@ type TurnStructureReport = {
   scope_row_writes: number;
   reconstructions: number;
   plan_cells: number;
+  snapshot_cells: number;
 };
 
 /** Retryable verdict → the CO6 taxonomy code its round is recorded as.
@@ -648,7 +654,8 @@ export class NetGatewayDO {
         sync_rpc: structure.sync_rpc,
         scope_row_writes: 0,
         reconstructions: structure.reconstructions,
-        plan_cells: structure.plan_cells
+        plan_cells: structure.plan_cells,
+        snapshot_cells: structure.snapshot_cells
       });
       // Fix 5d: a plain-Error escape (misplan bug, double transport
       // failure) after failed rounds must still explain the convergence
@@ -676,7 +683,8 @@ export class NetGatewayDO {
       // nothing (the rejected CommitReply variant has no `touched`).
       scope_row_writes: result.reply.status === "accepted" ? result.reply.touched.length : 0,
       reconstructions: structure.reconstructions,
-      plan_cells: structure.plan_cells
+      plan_cells: structure.plan_cells,
+      snapshot_cells: structure.snapshot_cells
     };
   }
 
@@ -787,6 +795,7 @@ export class NetGatewayDO {
       // Phase 0: record the planner input size of THIS round's plan (the
       // resubmit branch reuses the prior plan's, already the settling one).
       structure.plan_cells = planned.planCells;
+      structure.snapshot_cells = planned.snapshotCells;
 
       // Selection pinning (fix 5c): the FIRST submit for this key pins
       // its scope durably BEFORE the rpc leaves. Any later round (or a
