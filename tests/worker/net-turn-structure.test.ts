@@ -1,0 +1,179 @@
+// D2 / CO10 warm-turn structural budget gate (CO12.3 "budget gates").
+//
+// A genuinely WARM SAME-SCOPE turn: one scope holds the whole fixture and
+// the turn carries a `shared:[scope]` classifier override, so every read
+// and write classifies to that one scope — no foreign attestation, no
+// rider, no cross-scope hop. CO10's warm-turn structure then bounds it:
+//   1 attempt, ≤ 3 cross-host RPCs on the synchronous reply path
+//   (/head + /submit + the post-accept installTouched /closure),
+//   0 authority reconstructions.
+//
+// The gate reads TurnResult.structure (the counters the gateway now emits
+// as the `net_turn_structure` metric) AND cross-checks the sync-RPC count
+// against a per-destination RPC log, so a miscount in either the counter
+// or the plumbing fails the test. This file is in the curated `npm test`
+// list (a CO12 gate that only ran under test:full would not hold the line).
+import { describe, expect, it } from "vitest";
+import { FakeDurableObjectState } from "./fake-do";
+import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
+import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
+import { signInternalRequest } from "../../src/worker/internal-auth";
+import { installVerb } from "../../src/core/authoring";
+import { createWorld } from "../../src/core/bootstrap";
+import { cellsFromSerialized, type ShadowTurnCall } from "../../src/net/bridge";
+import type { AttemptTraceEntry } from "../../src/net/errors";
+import type { CommitReply } from "../../src/net/scope";
+
+const SECRET = "net-turn-structure-secret";
+const EPOCH = "cat-net-structure-1";
+const SCOPE = "flat"; // one scope holds the whole flattened world
+
+function netState(name: string): { state: NetScopeDurableState & NetGatewayDurableState; close: () => void } {
+  const fake = new FakeDurableObjectState(name);
+  const state = {
+    id: fake.id,
+    waitUntil: (_promise: Promise<unknown>) => {},
+    storage: {
+      sql: fake.storage.sql,
+      transactionSync: fake.storage.transactionSync,
+      setAlarm: (_at: number) => {},
+      deleteAlarm: () => {}
+    }
+  };
+  return { state, close: () => fake.close() };
+}
+
+type Fetchable = { fetch(request: Request): Promise<Response> | Response };
+
+async function call<T>(target: Fetchable, env: { WOO_INTERNAL_SECRET?: string }, route: string, body?: unknown): Promise<T> {
+  const url = `https://do/net${route}`;
+  const request =
+    body === undefined
+      ? new Request(url)
+      : new Request(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  const signed = await signInternalRequest(env, request);
+  const response = await target.fetch(signed);
+  const decoded = (await response.json()) as T;
+  if (!response.ok) throw new Error(`call ${route} failed: ${JSON.stringify(decoded)}`);
+  return decoded;
+}
+
+type TurnStructureReport = {
+  scope: string;
+  attempt: number;
+  envelope_bytes: number;
+  sync_rpc: number;
+  scope_row_writes: number;
+  reconstructions: number;
+};
+type TurnBody = {
+  reply: CommitReply;
+  attempt: number;
+  trace: AttemptTraceEntry[];
+  structure?: TurnStructureReport;
+};
+
+describe("D2 / CO10 warm-turn structural budget", () => {
+  it("a warm same-scope accepted turn stays within the CO10 structure (1 attempt, ≤3 sync RPC, 0 reconstructions)", async () => {
+    // ---- Engine-real fixture: a room, a room-anchored box whose bump
+    // verb writes ONLY the box (no actor rider → no cross-scope write),
+    // and the actor placed in the room. The whole world is then flattened
+    // into ONE scope, so the shared-override turn touches a single scope.
+    const world = createWorld();
+    const session = world.auth("guest:net-structure");
+    const actor = session.actor;
+    world.createObject({ id: "strn_room", name: "Structure Room", parent: "$space", owner: actor });
+    world.createObject({ id: "strn_box", name: "Structure Box", parent: "$thing", owner: actor, anchor: "strn_room", location: "strn_room" });
+    world.defineProperty("strn_box", { name: "counter", defaultValue: 0, owner: actor, perms: "rw", typeHint: "int" });
+    const installed = installVerb(
+      world,
+      "strn_box",
+      "bump",
+      `verb :bump() rxd {
+        this.counter = this.counter + 1;
+        observe({ type: "bumped", counter: this.counter });
+        return this.counter;
+      }`,
+      null
+    );
+    expect(installed.ok).toBe(true);
+    const placed = await world.directCall("strn-genesis-place", actor, actor, "moveto", ["strn_room"], { sessionId: session.id });
+    expect(placed.op).toBe("result");
+
+    // ---- Flatten: seed EVERY cell into the single scope DO. The
+    // `shared:[SCOPE]` override on the turn (below) classifies every
+    // object to SCOPE regardless of its natural anchor, so there is no
+    // foreign read to attest — exactly the warm same-scope case CO10
+    // bounds. Real per-instance SQLite (fake-DO), signed /net surface.
+    const cells = cellsFromSerialized(world.exportWorld());
+    const scopeState = netState("scope-flat");
+    const scopeEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET };
+    const scopeDO = new NetScopeDO(scopeState.state, scopeEnv);
+    await call(scopeDO, scopeEnv, "/seed", { scope: SCOPE, catalog_epoch: EPOCH, cells });
+
+    // The gateway records every RPC pathname per destination, so the
+    // sync-RPC counter can be cross-checked against the real plumbing.
+    const rpcLog: string[] = [];
+    const gatewayState = netState("gateway-structure");
+    const gatewayEnv: NetGatewayEnv = {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_RESOLVE: (destination) => {
+        if (destination !== `scope:${SCOPE}`) throw new Error(`unexpected destination ${destination}`);
+        return {
+          fetch: (request: Request) => {
+            rpcLog.push(new URL(request.url).pathname);
+            return scopeDO.fetch(request);
+          }
+        };
+      }
+    };
+    const gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
+    await call(gateway, gatewayEnv, "/pull", { scope: SCOPE, destination: `scope:${SCOPE}` });
+
+    const bump = (id: string): ShadowTurnCall => ({
+      kind: "woo.turn_call.shadow.v1",
+      id,
+      route: "direct",
+      scope: SCOPE,
+      actor,
+      target: "strn_box",
+      verb: "bump",
+      args: []
+    });
+    const turnRequest = (key: string) => ({
+      call: bump(key),
+      planningScope: SCOPE,
+      catalog_epoch: EPOCH,
+      idempotency_key: key,
+      // Single-scope classifier override (lane form): every object → SCOPE.
+      shared: [SCOPE],
+      scopes: { [SCOPE]: `scope:${SCOPE}` }
+    });
+
+    // First turn warms install-on-accept; the second is the gate target.
+    const turn1 = await call<TurnBody>(gateway, gatewayEnv, "/turn", turnRequest("strn-t1"));
+    expect(turn1.reply.status, JSON.stringify(turn1.reply)).toBe("accepted");
+
+    rpcLog.length = 0;
+    const turn2 = await call<TurnBody>(gateway, gatewayEnv, "/turn", turnRequest("strn-t2"));
+    expect(turn2.reply.status, JSON.stringify(turn2.reply)).toBe("accepted");
+
+    // ---- The CO10 warm-turn structural gate.
+    const structure = turn2.structure;
+    expect(structure, "TurnResult must carry the D2 structure report").toBeTruthy();
+    expect(structure?.attempt).toBe(1); // no repair round
+    expect(structure?.reconstructions).toBe(0); // warm view: no refresh/reseed
+    expect(structure?.sync_rpc).toBeLessThanOrEqual(3); // /head + /submit + installTouched
+    expect(structure?.scope_row_writes).toBeGreaterThan(0); // the counter cell moved
+    expect(structure?.scope).toBe(SCOPE);
+
+    // Cross-check the counter against the real plumbing: the only RPCs on
+    // the reply path are the head, the submit, and the warm cache-fill
+    // closure — all to the single scope, none of them a foreign attest.
+    expect(rpcLog).toEqual(["/net/head", "/net/submit", "/net/closure"]);
+    expect(structure?.sync_rpc).toBe(rpcLog.length);
+
+    scopeState.close();
+    gatewayState.close();
+  });
+});

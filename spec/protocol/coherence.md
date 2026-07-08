@@ -394,7 +394,15 @@ that only runs under `test:full` does not hold the line):
    equals committed authority at the same head (multi-node topology).
 2. **Registry gate**: no durable write lands outside the five CO5 stores.
 3. **Budget gates**: envelope bytes, scope-row writes, sync RPC count,
-   reconstruction count — asserted per turn in unit lanes.
+   reconstruction count — counted per turn by the gateway (threaded
+   through the turn's RPC sites, not a shared instance counter, so the
+   count survives await-interleaving), attached to the `TurnResult`, and
+   emitted as the `net_turn_structure` metric so the deployed profile
+   emits the evidence CO10 is measured against. The curated
+   `tests/worker/net-turn-structure.test.ts` asserts the warm same-scope
+   structure (1 attempt, ≤ 3 sync RPCs — `/head` + `/submit` + the
+   post-accept `installTouched` `/closure` — and 0 reconstructions),
+   cross-checked against a per-destination RPC log.
 4. **Differential gate** (build-time, Plan 002 Phase 2): v2 and `src/net/`
    produce equal committed state and observation streams on the shared
    smoke scenario; divergence is a stop.

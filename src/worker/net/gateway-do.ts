@@ -224,6 +224,51 @@ type TurnResult = {
    * durable at the scope; the view repairs itself on the next turn via
    * read_version_mismatch → targeted refresh. Never a 500. */
   install_degraded?: boolean;
+  /** D2 / CO10: the turn's structural budget counts (CO12.3 "budget
+   * gates"). Present on every settled TurnResult (accepted or terminal);
+   * lets a unit lane assert the warm-turn structure directly rather than
+   * scraping the emitted metric. */
+  structure?: TurnStructureReport;
+};
+
+/**
+ * D2 / CO10: per-turn structural budget counters (the CO12.3 "budget
+ * gates": sync RPCs, scope-row writes, reconstructions per turn). Threaded
+ * explicitly through the turn's RPC sites rather than kept on the DO
+ * instance, so the count stays correct even when the runtime interleaves
+ * another turn across an await — a shared instance counter could not tell
+ * two concurrent turns apart. The shared RPC helpers take it as OPTIONAL:
+ * a non-turn caller (/net/pull, session-open cache-fill) passes none and
+ * nothing is counted, leaving their behaviour unchanged.
+ */
+class TurnStructure {
+  /** Cross-host RPCs on the SYNCHRONOUS reply path (CO10 warm budget ≤ 3:
+   * /head + /submit + the post-accept installTouched /closure). Post-reply
+   * outbox fanout is excluded by construction — it is not on this path. */
+  sync_rpc = 0;
+  /** Authority reconstructions: the view rebuilt from a scope closure
+   * (refreshCells targeted refresh / reseedFromScope full reseed). The
+   * warm path never reconstructs. installTouched (the happy-path warm
+   * cache-fill) is deliberately NOT counted here — it is not a repair. */
+  reconstructions = 0;
+  countRpc(): void {
+    this.sync_rpc += 1;
+  }
+  countReconstruction(): void {
+    this.reconstructions += 1;
+  }
+}
+
+/** The per-turn CO10 structure attached to a TurnResult and emitted as the
+ * `net_turn_structure` metric so the deployed profile emits the evidence
+ * CO10 is measured against. */
+type TurnStructureReport = {
+  scope: string;
+  attempt: number;
+  envelope_bytes: number;
+  sync_rpc: number;
+  scope_row_writes: number;
+  reconstructions: number;
 };
 
 /** Retryable verdict → the CO6 taxonomy code its round is recorded as.
@@ -548,9 +593,28 @@ export class NetGatewayDO {
    */
   private async turn(request: TurnRequest): Promise<TurnResult> {
     const trace: AttemptTraceEntry[] = [];
+    const structure = new TurnStructure();
     try {
-      return await this.turnAttempts(request, trace);
+      const result = await this.turnAttempts(request, trace, structure);
+      // D2 / CO10: attach the structural budget to the result (so a unit
+      // lane can assert it) and emit it as a metric (so staging emits the
+      // evidence CO10 is measured against).
+      const report = this.turnStructureReport(result, structure);
+      this.emitTurnStructure(request, report);
+      return { ...result, structure: report };
     } catch (err) {
+      // D2: a failed turn still emits its repair-path structure (no reply,
+      // so scope-row writes are 0 and the scope is the planning scope) —
+      // the sync-RPC and reconstruction counts of the exhausted budget are
+      // exactly the evidence a CO10 investigation wants.
+      this.emitTurnStructure(request, {
+        scope: request.planningScope,
+        attempt: trace.length + 1,
+        envelope_bytes: 0,
+        sync_rpc: structure.sync_rpc,
+        scope_row_writes: 0,
+        reconstructions: structure.reconstructions
+      });
       // Fix 5d: a plain-Error escape (misplan bug, double transport
       // failure) after failed rounds must still explain the convergence
       // shape. NetErrors carry their own trace (E_BUDGET) or are
@@ -562,6 +626,29 @@ export class NetGatewayDO {
       }
       throw err;
     }
+  }
+
+  /** D2: fold the counters + the settled reply into the CO10 report.
+   * scope-row writes are the accepted commit's touched rows (0 on a
+   * terminal reject, which committed nothing). */
+  private turnStructureReport(result: TurnResult, structure: TurnStructure): TurnStructureReport {
+    return {
+      scope: result.reply.scope,
+      attempt: result.attempt,
+      envelope_bytes: result.envelopeBytes,
+      sync_rpc: structure.sync_rpc,
+      // Only an accepted reply wrote rows; a terminal reject committed
+      // nothing (the rejected CommitReply variant has no `touched`).
+      scope_row_writes: result.reply.status === "accepted" ? result.reply.touched.length : 0,
+      reconstructions: structure.reconstructions
+    };
+  }
+
+  private emitTurnStructure(request: TurnRequest, report: TurnStructureReport): void {
+    console.log(
+      "woo.metric",
+      JSON.stringify({ kind: "net_turn_structure", idempotency_key: request.idempotency_key, ...report, ts: Date.now() })
+    );
   }
 
   /**
@@ -618,7 +705,7 @@ export class NetGatewayDO {
     return known;
   }
 
-  private async turnAttempts(request: TurnRequest, trace: AttemptTraceEntry[]): Promise<TurnResult> {
+  private async turnAttempts(request: TurnRequest, trace: AttemptTraceEntry[], structure: TurnStructure): Promise<TurnResult> {
     const startedAt = this.host.now();
     const deadline = startedAt + REPAIR_BUDGET_MS;
     // stale_head resubmit carry-over: when only the base was stale the
@@ -653,7 +740,7 @@ export class NetGatewayDO {
           if (isNetError(err) && err.code === "E_MISSING_STATE") {
             const missing = Array.isArray(err.detail.missing) ? (err.detail.missing as string[]) : [];
             trace.push({ attempt, code: "E_MISSING_STATE", missing, elapsed_ms: elapsed() });
-            await this.tryRecovery(trace, () => this.refreshCells(request, classifier, view, missing));
+            await this.tryRecovery(trace, () => this.refreshCells(request, classifier, view, missing, structure));
             continue;
           }
           // Terminal NetError codes and plain Errors (misplan bugs,
@@ -688,6 +775,7 @@ export class NetGatewayDO {
       }
       const destination = this.destinationFor(request, targetScope);
       if (base === null) {
+        structure.countRpc();
         base = ((await this.host.rpc(destination, "/head")) as { head: ScopeHead }).head;
       }
       // CO2.3 rider integrity (rule 1): attest every FOREIGN read — a
@@ -697,7 +785,7 @@ export class NetGatewayDO {
       // mismatch repair — which refreshes the mismatched cells from
       // their owners (refreshCells routes by the classifier) and
       // re-plans — automatically re-attests the affected owners too.
-      const attestations = await this.attestForeignReads(request, classifier, planned, targetScope);
+      const attestations = await this.attestForeignReads(request, classifier, planned, targetScope, structure);
       const submit: CommitSubmit = {
         ...planned.submit,
         base,
@@ -717,6 +805,7 @@ export class NetGatewayDO {
       };
       let reply: CommitReply;
       try {
+        structure.countRpc();
         reply = (await this.host.rpc(destination, "/submit", submitBody)) as CommitReply;
       } catch (err) {
         // CO2.5 recovery (fix 5b): the transport died in the reply
@@ -725,13 +814,14 @@ export class NetGatewayDO {
         // key disambiguates: a committed turn returns its recorded
         // reply; an uncommitted one validates fresh. Only a second
         // transport failure surfaces (with the trace via fix 5d).
+        structure.countRpc();
         reply = (await this.host.rpc(destination, "/submit", submitBody)) as CommitReply;
       }
       if (reply.status === "accepted") {
         let installDegraded = false;
         if (reply.touched.length > 0) {
           try {
-            await this.installTouched(view, destination, reply.touched);
+            await this.installTouched(view, destination, reply.touched, structure);
           } catch (err) {
             // Fix 5a: the COMMIT is durable at the scope; a failed warm
             // cache-fill must never turn an accepted turn into a 500.
@@ -796,7 +886,10 @@ export class NetGatewayDO {
         case "stale_head": {
           const fresh = await this.tryRecovery(
             trace,
-            async () => ((await this.host.rpc(destination, "/head")) as { head: ScopeHead }).head
+            async () => {
+              structure.countRpc();
+              return ((await this.host.rpc(destination, "/head")) as { head: ScopeHead }).head;
+            }
           );
           const headMoved = fresh !== undefined && (fresh.seq !== submit.base.seq || fresh.hash !== submit.base.hash);
           if (fresh !== undefined && headMoved && !reply.mismatched_reads) {
@@ -815,8 +908,8 @@ export class NetGatewayDO {
           // disagreement naming nothing, reseed the scope's closure)
           // and re-plan.
           await this.tryRecovery(trace, async () => {
-            if (mismatchKeys.length > 0) await this.refreshCells(request, classifier, view, mismatchKeys);
-            else await this.reseedFromScope(view, destination);
+            if (mismatchKeys.length > 0) await this.refreshCells(request, classifier, view, mismatchKeys, structure);
+            else await this.reseedFromScope(view, destination, undefined, structure);
           });
           break;
         }
@@ -836,7 +929,7 @@ export class NetGatewayDO {
               this.state.storage.transactionSync(() => {
                 for (const key of stale) this.persistCell(view, key);
               });
-              return await this.reseedFromScope(view, destination);
+              return await this.reseedFromScope(view, destination, undefined, structure);
             });
           });
           // M9: the reseed is only a recovery when the STALENESS was the
@@ -1837,7 +1930,8 @@ export class NetGatewayDO {
     request: TurnRequest,
     classifier: ScopeClassifier,
     planned: PlanTurnResult,
-    targetScope: string
+    targetScope: string,
+    counters?: TurnStructure
   ): Promise<CommitSubmit["attestations"]> {
     const byOwner = new Map<string, Set<string>>();
     for (const read of planned.transcript.reads) {
@@ -1860,6 +1954,7 @@ export class NetGatewayDO {
     const attestations: NonNullable<CommitSubmit["attestations"]> = {};
     for (const [owner, keys] of byOwner) {
       const destination = this.destinationFor(request, owner);
+      counters?.countRpc();
       const reply = (await this.host.rpc(destination, "/attest", { keys: [...keys].sort() })) as {
         owner_head: ScopeHead;
         cells: Array<{ key: string; version: string }>;
@@ -2004,7 +2099,11 @@ export class NetGatewayDO {
   /** Warm cache-fill (CO7): accepted cells become the view's derived
    * copies, so the next turn plans locally. A touched key with no cell
    * in the transfer was deleted at the authority; mirror the deletion. */
-  private async installTouched(view: CellStore, destination: string, touched: string[]): Promise<void> {
+  private async installTouched(view: CellStore, destination: string, touched: string[], counters?: TurnStructure): Promise<void> {
+    // D2: on the SYNCHRONOUS reply path (post-accept), so it counts toward
+    // the sync-RPC budget — but it is the happy-path warm fill, NOT an
+    // authority reconstruction, so reconstructions stays 0 on a warm turn.
+    counters?.countRpc();
     const transfer = (await this.host.rpc(destination, "/closure", { keys: touched, known: [] })) as CellTransfer;
     const wanted = new Set(touched);
     this.discardViewOnThrow(() =>
@@ -2034,9 +2133,14 @@ export class NetGatewayDO {
     request: TurnRequest,
     classifier: ScopeClassifier,
     view: CellStore,
-    keys: string[]
+    keys: string[],
+    counters?: TurnStructure
   ): Promise<void> {
     if (keys.length === 0) return;
+    // D2: a targeted refresh IS an authority reconstruction (view rebuilt
+    // from owner closures) — one per call, regardless of how many owner
+    // closures it fans to; each of those closures counts as a sync RPC.
+    counters?.countReconstruction();
     // Owner-KNOWN keys (the view holds the object's lineage, or the key
     // names the call's session — sessions.ts rule) route to their owner
     // and use authoritative-absence semantics: a key the owner does not
@@ -2064,6 +2168,7 @@ export class NetGatewayDO {
     }
     const known = [...view.keys()].filter((key) => key.startsWith("object_lineage:"));
     for (const [destination, want] of byDestination) {
+      counters?.countRpc();
       const transfer = (await this.host.rpc(destination, "/closure", { keys: want, known })) as CellTransfer;
       const wanted = new Set(want);
       this.discardViewOnThrow(() =>
@@ -2101,6 +2206,7 @@ export class NetGatewayDO {
       for (const destination of [...new Set(candidates)]) {
         if (satisfied) break;
         try {
+          counters?.countRpc();
           const transfer = (await this.host.rpc(destination, "/closure", { keys: want, known })) as CellTransfer;
           if (transfer.cells.length === 0) continue;
           this.discardViewOnThrow(() =>
@@ -2125,8 +2231,13 @@ export class NetGatewayDO {
   private async reseedFromScope(
     view: CellStore,
     destination: string,
-    known: string[] = []
+    known: string[] = [],
+    counters?: TurnStructure
   ): Promise<CellTransfer & { scope: string; head: ScopeHead; catalog_epoch: string; relations?: RelationRow[] }> {
+    // D2: a full reseed is an authority reconstruction and one sync RPC on
+    // the turn path (the /net/pull live path passes no counter, unchanged).
+    counters?.countReconstruction();
+    counters?.countRpc();
     const transfer = (await this.host.rpc(destination, "/closure", { keys: ["*"], known })) as CellTransfer & {
       scope: string;
       head: ScopeHead;
