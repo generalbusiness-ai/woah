@@ -96,13 +96,39 @@ same-scope / topology / obj-ref turns — `load:net-dev` went green
 `tests/net/plan.test.ts` ("slice-based planning (Phase 1 — the spine)":
 slice excludes 300 unrelated objects and commits to the identical
 post-state). The gateway flag `slicePlanning` is GATED OFF (commented in
-`planOnce`) pending one gap: a cross-scope TRANSITION turn (session moveto
-into another room) takes repair rounds under slicing that perturb the
-presence-mirror high-water and drop a `session_presence` row (net-ws). The
-seed must cover the transition turn's read set — the receiver-driven move
-chain (`obj:moveto`/`target:acceptable`/`exitfunc`/`enterfunc`) plus the
-from/to rooms' occupancy the presence derivation touches — so the turn
-stays attempt-1 warm (no repair) before the flag flips on. Design realized:
+`planOnce`).
+
+ROOT CAUSE of the gate (instrumented 2026-07-08 — the earlier "seed
+completeness / repair high-water" hypothesis was WRONG): slicing is CORRECT
+and exposed a LATENT CO14 presence bug. The net-ws fixture mints TWO
+sessions of the SAME actor (guest_1) and enters both into the annex via
+`welcome` = `moveto(actor, this)`. Per-session presence is derived from the
+ACTOR's physical move (the engine's `sessionScopeTransition`, plan.ts
+`foldSessionEffects`):
+  - Full-view: s2 plans against a STALE view (guest_1 still in ws_room), so
+    the move transitions ws_room→annex and presence(annex,s2) is added —
+    the test passes BY RACE.
+  - Slice: s2 plans against a FRESH view (guest_1 already in the annex from
+    s1's committed enter), so `moveto` is a NO-OP, the engine records
+    `transition: null`, no session write folds, and s2 gets NO presence row.
+So a second session of the same actor entering an already-occupied room
+never gains presence — per-SESSION presence is tied to the ACTOR's move,
+not the session's own activeScope. Slicing removes the stale-view race that
+hid it.
+
+DECISION NEEDED before flipping the flag (CO14 semantics, not mechanical):
+should per-session presence follow the SESSION's activeScope — each session
+present where its actor is, regardless of whether THIS turn physically moved
+the shared actor? If yes, `foldSessionEffects` should synthesize the
+transition from (session.prior.activeScope → actor's resulting location)
+rather than rely on the engine's actor-move transition — but the trigger
+"session.activeScope ≠ actor.location" risks synthesizing spurious
+transitions on ordinary turns, depending on what a freshly-minted session's
+activeScope is relative to the actor's room. Pin the intended model first.
+The slice MACHINERY is proven correct (tests/net/plan.test.ts) and is NOT
+the blocker.
+
+Design realized:
 keep the full consistent `view.clone()` (fix-6 intact) but build the
 planning WORLD from the seed slice, growing it FROM the snapshot on a miss
 (no RPC); a fixed-point obj-ref expansion seeds referenced objects' full
