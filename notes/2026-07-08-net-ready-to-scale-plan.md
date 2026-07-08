@@ -62,6 +62,28 @@ deploy work by design. Remaining pre-deploy steps are the OWNER's:
 merge, and the Phase-5 deploy protocol from plan §8 (fresh namespace,
 identity import, write-freeze cutover).
 
+**MERGED AND DEPLOYED (2026-07-08, owner-approved):** fast-forward merge
+to main @ `23bd7fc` (36 commits), deployed to prod as version
+`1822b220-82d7-41c7-8375-7e11ca14e17f` via scripts/deploy.sh (all gates
+green: cf migrations, typecheck, npm test 775, load:net-dev, workerd
+smoke, postflight). The deployed v2 walkthrough gate failed its FIRST
+run 9/10 on `pinboard:add_note reaches peer` — `E_TIMEOUT
+the_pinboard/__internal/authority-slice 5000ms`, the documented
+deploy-only v2 cold-owner-timeout class (unrelated to this change set,
+which touches only the net path) — and the warm re-run passed **10/10**,
+the best deployed walkthrough on record (prior baseline 8/10). NO
+ROLLBACK. The net path is live as the PARALLEL surface with its fresh,
+empty namespace: prod probes confirm the gateway DO boots and refuses
+namedly (401 E_NOSESSION missing_credential), and the catalog scope DO
+answers the identity pull with the named
+`E_MISSING_STATE has_meta:false` — both new DO classes construct their
+Phase-3/5 schema in production without error. (Rough edge, noted: an
+authenticated request against the unseeded catalog surfaces as a 500
+E_INTERNAL wrapping that named miss; a friendlier "not installed"
+verdict can land with the seeding work.) NEXT (a separate op, plan §8
+Phase 5): world install/seed into the net namespace, identity
+export/import tooling, write-freeze cutover, route switch.
+
 ---
 
 ## Phase 0 — the measuring stick: `load:net-dev` asymptotic gate
