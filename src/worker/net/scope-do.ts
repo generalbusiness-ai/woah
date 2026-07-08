@@ -168,7 +168,27 @@ export class SqliteScopeStore implements ScopeStore {
       "CREATE TABLE IF NOT EXISTS net_scope_reply (idempotency_key TEXT PRIMARY KEY, body TEXT NOT NULL)"
     );
     this.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_scope_tail (seq INTEGER PRIMARY KEY, body TEXT NOT NULL)");
-    this.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_scope_scheduled (id TEXT PRIMARY KEY, body TEXT NOT NULL)");
+    // `due_at` mirrors the body's at_logical_time so due-time questions
+    // (next future wake, due-burst batching) are one indexed lookup, never
+    // a read-and-parse of every parked row (ready-to-scale Phase 3). It
+    // must exist BEFORE any namespace holds data (cf-do-0004 freeze);
+    // the probe+ALTER covers pre-column dev worlds, and the backfill is
+    // idempotent (only NULL rows, so a crash between ALTER and backfill
+    // heals on the next construction).
+    this.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS net_scope_scheduled (id TEXT PRIMARY KEY, body TEXT NOT NULL, due_at INTEGER)"
+    );
+    const scheduledColumns = sqlRows<{ name: string }>(this.storage.sql.exec("PRAGMA table_info(net_scope_scheduled)"));
+    if (!scheduledColumns.some((column) => column.name === "due_at")) {
+      this.storage.sql.exec("ALTER TABLE net_scope_scheduled ADD COLUMN due_at INTEGER");
+    }
+    for (const row of sqlRows<{ id: string; body: string }>(
+      this.storage.sql.exec("SELECT id, body FROM net_scope_scheduled WHERE due_at IS NULL")
+    )) {
+      const turn = JSON.parse(row.body) as ScheduledTurn;
+      this.storage.sql.exec("UPDATE net_scope_scheduled SET due_at = ? WHERE id = ?", turn.at_logical_time, row.id);
+    }
+    this.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_net_scope_scheduled_due ON net_scope_scheduled (due_at)");
     // Sixth row family (CO13): derived relation rows this scope owns.
     this.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_scope_relation (key TEXT PRIMARY KEY, body TEXT NOT NULL)");
   }
@@ -263,14 +283,26 @@ export class SqliteScopeStore implements ScopeStore {
 
   writeScheduled(turn: ScheduledTurn): void {
     this.storage.sql.exec(
-      "INSERT INTO net_scope_scheduled (id, body) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET body = excluded.body",
+      "INSERT INTO net_scope_scheduled (id, body, due_at) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET body = excluded.body, due_at = excluded.due_at",
       turn.id,
-      JSON.stringify(turn)
+      JSON.stringify(turn),
+      turn.at_logical_time
     );
   }
 
   deleteScheduled(id: string): void {
     this.storage.sql.exec("DELETE FROM net_scope_scheduled WHERE id = ?", id);
+  }
+
+  /** Earliest scheduled due-time strictly after `now`, or null — one
+   * indexed MIN lookup (Phase 3: alarm re-arming must not read and parse
+   * every parked row; overdue parked rows are deliberately excluded so
+   * the no-planner state cannot spin the alarm). */
+  nextScheduledAfter(now: number): number | null {
+    const rows = sqlRows<{ at: number | null }>(
+      this.storage.sql.exec("SELECT MIN(due_at) AS at FROM net_scope_scheduled WHERE due_at > ?", now)
+    );
+    return rows.length > 0 && rows[0].at !== null ? Number(rows[0].at) : null;
   }
 
   readRelations(): RelationRow[] {
@@ -303,6 +335,28 @@ const SESSION_ALARM_KEY = "session-reap";
  * computation (outboxNextRetryAt) can never drift apart. */
 const OUTBOX_BACKOFF_MS = (attempt: number): number => Math.min(30_000, 250 * 2 ** (attempt - 1));
 
+/** The outbox's route lanes, in drain order (matches OutboxRoute). */
+const OUTBOX_ROUTES = ["/fanout", "/adopt", "/relate", "/plan-scheduled"] as const;
+
+/** Phase-3 drain bounds: one pass touches at most LANES_PER_PASS due
+ * destinations per route and ROWS_PER_LANE rows per destination (a lane
+ * PREFIX in (scope, seq) order — CO2.7 ordering is untouched). Remaining
+ * healthy work re-drains via drainOutbox's delivered>0 loop; failed rows
+ * wait for the due-time alarm. Sized generously above any current
+ * subscriber fan-in; the point is a bound that exists, not a small one. */
+const OUTBOX_LANES_PER_PASS = 16;
+const OUTBOX_ROWS_PER_LANE = 32;
+/** Debugging tail of abandoned rows kept after their divergence metric
+ * fired; everything older is pruned (a dead subscriber must not grow
+ * storage without bound). */
+const OUTBOX_ABANDONED_KEEP = 256;
+
+/** Phase-3 scheduled-burst bound: one alarm firing moves at most this
+ * many due turns into the /plan-scheduled outbox, then re-arms
+ * immediately when more are due — a burst can never balloon one alarm
+ * transaction. */
+const SCHEDULED_BATCH_PER_ALARM = 32;
+
 export class NetScopeDO {
   private readonly store: SqliteScopeStore;
   private readonly host: WorkerdHost;
@@ -310,6 +364,13 @@ export class NetScopeDO {
   /** One drain at a time; a re-kick while draining is dropped (the next
    * request or defer re-kicks — rows are durable, nothing is lost). */
   private draining = false;
+  /** Set by persistOutboxRow when an enqueue lands mid-drain (fix 4b):
+   * the drain loop re-passes before releasing, so such rows never strand
+   * until the next request. This replaces the old fresh-row COUNT probe,
+   * which under bounded lane batches could not distinguish "new work"
+   * from due rows parked behind a mid-backoff lane head — and would spin
+   * the loop on the latter. */
+  private enqueuedWhileDraining = false;
   /** Whether THIS lifetime armed the outbox retry alarm key (fix 4a);
    * gates the clear so scopes with no outbox history never touch the
    * storage alarm. Lost on eviction by design — see armOutboxRetryAlarm. */
@@ -365,8 +426,62 @@ export class NetScopeDO {
         state.storage.sql.exec("DROP TABLE net_scope_subscribers_legacy");
       });
     }
+    // Outbox columns beyond the FanoutRow mirror (ready-to-scale Phase 3;
+    // must exist BEFORE any namespace holds data — cf-do-0004 freeze):
+    // `scope`/`seq` duplicate the body's ordering key so a drain can read
+    // a bounded LANE PREFIX in (scope, seq) order straight off an index
+    // (never parse-and-sort the whole backlog), and `next_attempt_at_ms`
+    // is the row's retry due-time (enqueue → 0 = due now; failure →
+    // last_attempt + backoff) so dueness checks and the retry alarm are
+    // one indexed lookup. The probe+ALTER covers pre-column dev worlds;
+    // the backfill is idempotent (NULL rows only).
     state.storage.sql.exec(
-      "CREATE TABLE IF NOT EXISTS net_scope_outbox (route TEXT NOT NULL, id TEXT NOT NULL, destination TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL, last_attempt_at_ms INTEGER, PRIMARY KEY (route, id))"
+      "CREATE TABLE IF NOT EXISTS net_scope_outbox (route TEXT NOT NULL, id TEXT NOT NULL, destination TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL, last_attempt_at_ms INTEGER, scope TEXT, seq INTEGER, next_attempt_at_ms INTEGER, PRIMARY KEY (route, id))"
+    );
+    const outboxColumns = sqlRows<{ name: string }>(state.storage.sql.exec("PRAGMA table_info(net_scope_outbox)"));
+    for (const column of ["scope TEXT", "seq INTEGER", "next_attempt_at_ms INTEGER"]) {
+      const name = column.split(" ")[0];
+      if (!outboxColumns.some((existing) => existing.name === name)) {
+        state.storage.sql.exec(`ALTER TABLE net_scope_outbox ADD COLUMN ${column}`);
+      }
+    }
+    for (const row of sqlRows<{ route: string; id: string; body: string; attempts: number; last_attempt_at_ms: number | null }>(
+      state.storage.sql.exec(
+        "SELECT route, id, body, attempts, last_attempt_at_ms FROM net_scope_outbox WHERE scope IS NULL OR seq IS NULL OR next_attempt_at_ms IS NULL"
+      )
+    )) {
+      const body = JSON.parse(row.body) as FanoutBody;
+      const nextAttempt =
+        row.last_attempt_at_ms === null ? 0 : Number(row.last_attempt_at_ms) + OUTBOX_BACKOFF_MS(Number(row.attempts));
+      state.storage.sql.exec(
+        "UPDATE net_scope_outbox SET scope = ?, seq = ?, next_attempt_at_ms = ? WHERE route = ? AND id = ?",
+        body.scope,
+        body.seq,
+        nextAttempt,
+        row.route,
+        row.id
+      );
+    }
+    state.storage.sql.exec(
+      "CREATE INDEX IF NOT EXISTS idx_net_scope_outbox_due ON net_scope_outbox (status, next_attempt_at_ms)"
+    );
+    state.storage.sql.exec(
+      "CREATE INDEX IF NOT EXISTS idx_net_scope_outbox_lane ON net_scope_outbox (route, destination, status, scope, seq)"
+    );
+    // Lane directory (Phase 3): one row per (route, destination) that may
+    // hold pending outbox rows. Lane discovery — which destinations have
+    // work, and each lane's HEAD due-time — must be O(active lanes), and
+    // no SQLite index scan over the backlog gives that (DISTINCT walks
+    // every pending entry, so a 10k-row stuck lane would tax every pass).
+    // Maintained on enqueue (INSERT OR IGNORE) and pruned when a lane
+    // drains empty; the backfill re-derives it idempotently for
+    // pre-directory dev worlds (and after any missed prune — a stale
+    // lane row costs one O(1) head probe, never a wrong delivery).
+    state.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS net_scope_outbox_lane (route TEXT NOT NULL, destination TEXT NOT NULL, PRIMARY KEY (route, destination))"
+    );
+    state.storage.sql.exec(
+      "INSERT OR IGNORE INTO net_scope_outbox_lane (route, destination) SELECT DISTINCT route, destination FROM net_scope_outbox WHERE status = 'pending'"
     );
     state.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS net_scope_adopted (from_scope TEXT PRIMARY KEY, seq INTEGER NOT NULL)"
@@ -641,12 +756,16 @@ export class NetScopeDO {
     // H2b: reap expired session cells (and their presence rows) before
     // the scheduled-turn machinery — an owner-sequenced cleanup event.
     this.reapSessionsAtAlarm(seq, now);
-    const due = seq.peekDue(now);
+    // Phase 3: one firing handles a BOUNDED batch of due turns; leftovers
+    // re-arm immediately below (planner registered) or stay parked
+    // (no-planner — future-only re-arm, so overdue rows cannot spin).
+    const due = seq.peekDue(now, SCHEDULED_BATCH_PER_ALARM);
+    let planner: string | null = null;
     if (due.length > 0) {
-      const planner = this.plannerDestination();
+      planner = this.plannerDestination();
       if (planner === null) {
         // The specified no-planner state (CO16): rows stay parked, one
-        // named metric per due turn per alarm firing.
+        // named metric per due turn (bounded by the batch) per firing.
         for (const turn of due) {
           console.log(
             "woo.metric",
@@ -662,6 +781,9 @@ export class NetScopeDO {
           );
         }
       } else {
+        // Narrowed copy for the closures below (TS loses a `let`'s
+        // narrowing across function boundaries).
+        const plannerDest = planner;
         // Atomic family move: outbox enqueue + scheduled-row pop share
         // ONE transaction (dueTurns' internal transaction joins). The
         // dueTurns pop mutates sequencer memory, so the whole block is
@@ -670,7 +792,7 @@ export class NetScopeDO {
         // memory ahead of SQLite.
         this.discardSeqOnThrow(() =>
           this.store.transaction(() => {
-            for (const turn of seq.dueTurns(now)) {
+            for (const turn of seq.dueTurns(now, SCHEDULED_BATCH_PER_ALARM)) {
               const dispatchBody: PlanScheduledOutboxBody = {
                 scope: seq.scope,
                 seq: this.nextScheduledDispatch(),
@@ -679,7 +801,7 @@ export class NetScopeDO {
                 scheduled_turn: turn,
                 catalog_epoch: seq.catalogEpoch
               };
-              this.persistOutboxRow("/plan-scheduled", planner, dispatchBody);
+              this.persistOutboxRow("/plan-scheduled", plannerDest, dispatchBody);
             }
           })
         );
@@ -700,7 +822,12 @@ export class NetScopeDO {
         this.host.defer(() => this.drainOutbox());
       }
     }
-    this.rearmAlarm(now);
+    // Phase 3 immediate re-arm: a planner-dispatched batch that left due
+    // turns parked wakes again NOW (each firing makes batch-sized
+    // progress); otherwise the wake is the next FUTURE turn. The
+    // no-planner overdue rows deliberately never re-arm (no spin).
+    const moreDueNow = planner !== null && seq.peekDue(now, 1).length > 0;
+    this.rearmAlarm(now, { dueNow: moreDueNow });
     // H2b: re-derive the next session-expiry wake from durable state
     // (the reap above removed everything currently expired, so only
     // future "ok" expiries arm — never a busy loop).
@@ -1226,24 +1353,37 @@ export class NetScopeDO {
   }
 
   /** Durable outbox row (mirrors src/net/outbox.ts FanoutRow, plus the
-   * route column). Same (route, destination, scope, seq) re-enqueued is
-   * the same fact — keep the earlier row and its retry state, exactly
-   * Outbox.enqueue's rule. */
+   * route column and the Phase-3 lane/due columns). Same (route,
+   * destination, scope, seq) re-enqueued is the same fact — keep the
+   * earlier row and its retry state, exactly Outbox.enqueue's rule. */
   private persistOutboxRow(route: OutboxRoute, destination: string, body: FanoutBody): void {
     this.state.storage.sql.exec(
-      "INSERT INTO net_scope_outbox (route, id, destination, body, status, attempts, last_attempt_at_ms) VALUES (?, ?, ?, ?, 'pending', 0, NULL) ON CONFLICT(route, id) DO NOTHING",
+      "INSERT INTO net_scope_outbox (route, id, destination, body, status, attempts, last_attempt_at_ms, scope, seq, next_attempt_at_ms) VALUES (?, ?, ?, ?, 'pending', 0, NULL, ?, ?, 0) ON CONFLICT(route, id) DO NOTHING",
       route,
       `${destination}/${body.scope}/${body.seq}`,
       destination,
-      JSON.stringify(body)
+      JSON.stringify(body),
+      body.scope,
+      body.seq
     );
+    this.state.storage.sql.exec(
+      "INSERT OR IGNORE INTO net_scope_outbox_lane (route, destination) VALUES (?, ?)",
+      route,
+      destination
+    );
+    // Rows enqueued while a drain is in flight are invisible to its
+    // passes; the drain's exit check consumes this flag (fix 4b) so they
+    // are picked up before the drain releases.
+    if (this.draining) this.enqueuedWhileDraining = true;
   }
 
   /** Kick a deferred drain when pending rows exist (reactivation path —
-   * a scope evicted mid-backoff delivers on its next request). */
+   * a scope evicted mid-backoff delivers on its next request). An
+   * indexed existence probe, never a backlog count (Phase 3): the cost
+   * of this per-request check must not grow with the backlog. */
   private deferPendingDrain(): void {
     const pending = sqlRows<{ n: number }>(
-      this.state.storage.sql.exec("SELECT COUNT(*) AS n FROM net_scope_outbox WHERE status = 'pending'")
+      this.state.storage.sql.exec("SELECT EXISTS(SELECT 1 FROM net_scope_outbox WHERE status = 'pending') AS n")
     )[0];
     if (pending && Number(pending.n) > 0) this.host.defer(() => this.drainOutbox());
   }
@@ -1272,18 +1412,15 @@ export class NetScopeDO {
       // flight are invisible to that pass AND their enqueue-time defer
       // no-ops on this.draining — without the recheck they would strand
       // until the next request. Loop while a pass delivered something or
-      // fresh (never-attempted) pending rows appeared; a fresh row is
-      // attempted by the very next pass (its attempts becomes >= 1), so
-      // the loop is bounded even when every delivery fails.
+      // an enqueue landed mid-drain (the flag is exact: due rows parked
+      // behind a mid-backoff lane head are NOT progress and must not
+      // spin the loop — their lane's head retry time arms the alarm in
+      // the finally below).
       for (;;) {
+        this.enqueuedWhileDraining = false;
         const delivered = await this.drainOutboxPass();
-        if (delivered > 0) continue;
-        const fresh = sqlRows<{ n: number }>(
-          this.state.storage.sql.exec(
-            "SELECT COUNT(*) AS n FROM net_scope_outbox WHERE status = 'pending' AND attempts = 0"
-          )
-        )[0];
-        if (!fresh || Number(fresh.n) === 0) break;
+        if (delivered > 0 || this.enqueuedWhileDraining) continue;
+        break;
       }
     } finally {
       this.draining = false;
@@ -1295,22 +1432,70 @@ export class NetScopeDO {
     }
   }
 
-  /** One drain pass over the route lanes; returns delivered-row count. */
+  /** One drain pass over the route lanes; returns delivered-row count.
+   *
+   * Bounded (ready-to-scale Phase 3): a pass reads DUE destinations off
+   * the (status, next_attempt_at_ms) index — a destination whose rows
+   * are all waiting out backoff costs nothing — and per destination a
+   * LANE PREFIX of at most OUTBOX_ROWS_PER_LANE rows in (scope, seq)
+   * order off the lane index. The prefix deliberately includes a
+   * mid-backoff head (Outbox.drain halts the lane on it — CO2.7 order,
+   * never skip-ahead), and only ATTEMPTED rows are written back, so a
+   * stuck destination's backlog can no longer turn every later request
+   * into O(backlog) reads and rewrites — nor starve other destinations,
+   * which drain their own lanes in the same pass. Remaining work is
+   * picked up by drainOutbox's delivered>0 loop (healthy backlog) or the
+   * due-time alarm (failed rows). */
   private async drainOutboxPass(): Promise<number> {
     let deliveredCount = 0;
-    for (const route of ["/fanout", "/adopt", "/relate", "/plan-scheduled"] as const) {
-        const persisted = sqlRows<{
+    const dueAt = this.host.now();
+    for (const route of OUTBOX_ROUTES) {
+        // Actionable lanes: the directory row exists and the lane HEAD
+        // (first pending row in (scope, seq) order — one indexed probe)
+        // is due. A lane whose head is mid-backoff is skipped whole: by
+        // CO2.7 nothing behind the head may deliver anyway, so reading
+        // its rows would be pure waste.
+        const lanes: string[] = [];
+        for (const lane of this.outboxLanes(route)) {
+          if (lanes.length >= OUTBOX_LANES_PER_PASS) break;
+          const head = this.outboxLaneHead(route, lane);
+          if (head === null) {
+            // Emptied (or abandoned-only) lane: prune the directory row.
+            this.state.storage.sql.exec(
+              "DELETE FROM net_scope_outbox_lane WHERE route = ? AND destination = ?",
+              route,
+              lane
+            );
+            continue;
+          }
+          if (head <= dueAt) lanes.push(lane);
+        }
+        if (lanes.length === 0) continue;
+        const persisted: Array<{
           id: string;
           destination: string;
           body: string;
           attempts: number;
           last_attempt_at_ms: number | null;
-        }>(
-          this.state.storage.sql.exec(
-            "SELECT id, destination, body, attempts, last_attempt_at_ms FROM net_scope_outbox WHERE route = ? AND status = 'pending'",
-            route
-          )
-        );
+        }> = [];
+        for (const lane of lanes) {
+          persisted.push(
+            ...sqlRows<{
+              id: string;
+              destination: string;
+              body: string;
+              attempts: number;
+              last_attempt_at_ms: number | null;
+            }>(
+              this.state.storage.sql.exec(
+                "SELECT id, destination, body, attempts, last_attempt_at_ms FROM net_scope_outbox WHERE route = ? AND destination = ? AND status = 'pending' ORDER BY scope, seq LIMIT ?",
+                route,
+                lane,
+                OUTBOX_ROWS_PER_LANE
+              )
+            )
+          );
+        }
         if (persisted.length === 0) continue;
         // Backoff injected explicitly so it stays in lockstep with the
         // alarm's retry-time computation (see OUTBOX_BACKOFF_MS).
@@ -1388,20 +1573,33 @@ export class NetScopeDO {
             })
           );
         }
+        // Write back ONLY the rows this pass attempted (Phase 3): a row
+        // skipped for backoff is byte-identical in storage — rewriting it
+        // would make every pass O(batch) writes regardless of progress.
+        const touched = new Set([...drained.delivered, ...drained.failed, ...drained.abandoned]);
+        let abandonedCount = 0;
         this.state.storage.transactionSync(() => {
           for (const row of rows) {
+            if (!touched.has(row.id)) continue;
             if (row.status === "delivered") {
               this.state.storage.sql.exec("DELETE FROM net_scope_outbox WHERE route = ? AND id = ?", route, row.id);
             } else {
+              // last_attempt_at_ms was just stamped by the attempt, so the
+              // due-time lands exactly where Outbox.drain's skip window and
+              // outboxNextRetryAt expect it (one backoff formula, three
+              // readers).
+              const nextAttemptAt = Number(row.last_attempt_at_ms) + OUTBOX_BACKOFF_MS(row.attempts);
               this.state.storage.sql.exec(
-                "UPDATE net_scope_outbox SET status = ?, attempts = ?, last_attempt_at_ms = ? WHERE route = ? AND id = ?",
+                "UPDATE net_scope_outbox SET status = ?, attempts = ?, last_attempt_at_ms = ?, next_attempt_at_ms = ? WHERE route = ? AND id = ?",
                 row.status,
                 row.attempts,
                 row.last_attempt_at_ms,
+                nextAttemptAt,
                 route,
                 row.id
               );
               if (row.status === "abandoned") {
+                abandonedCount += 1;
                 console.log(
                   "woo.metric",
                   JSON.stringify({
@@ -1416,31 +1614,103 @@ export class NetScopeDO {
               }
             }
           }
+          if (abandonedCount > 0) {
+            // Bounded abandoned retention: each abandonment already emitted
+            // its named divergence metric above; the rows are kept only as
+            // a debugging tail. Unbounded retention would be a storage leak
+            // scaling with a dead subscriber's lifetime (the small-world
+            // assumption Phase 3 removes).
+            this.state.storage.sql.exec(
+              "DELETE FROM net_scope_outbox WHERE status = 'abandoned' AND rowid NOT IN (SELECT rowid FROM net_scope_outbox WHERE status = 'abandoned' ORDER BY rowid DESC LIMIT ?)",
+              OUTBOX_ABANDONED_KEEP
+            );
+          }
+          // Prune emptied lanes from the directory (one EXISTS probe per
+          // lane this pass touched — a lane row must vanish when its last
+          // pending row does, or the directory grows with dead
+          // destinations forever).
+          for (const lane of lanes) {
+            const remains = sqlRows<{ n: number }>(
+              this.state.storage.sql.exec(
+                "SELECT EXISTS(SELECT 1 FROM net_scope_outbox WHERE route = ? AND destination = ? AND status = 'pending') AS n",
+                route,
+                lane
+              )
+            )[0];
+            if (!remains || Number(remains.n) === 0) {
+              this.state.storage.sql.exec(
+                "DELETE FROM net_scope_outbox_lane WHERE route = ? AND destination = ?",
+                route,
+                lane
+              );
+            }
+          }
         });
+        // Phase 0/CO10 observability for the Phase-3 invariant: rows a
+        // pass considered must stay bounded as the backlog grows (the
+        // load gate asserts against this).
+        console.log(
+          "woo.metric",
+          JSON.stringify({
+            kind: "net_scope_outbox_drain_pass",
+            route,
+            considered: persisted.length,
+            delivered: drained.delivered.length,
+            failed: drained.failed.length,
+            abandoned: drained.abandoned.length,
+            skipped_backoff: drained.skipped_backoff.length,
+            ts: Date.now()
+          })
+        );
     }
     return deliveredCount;
   }
 
-  /**
-   * Earliest wall-clock time a pending outbox row becomes retryable
-   * (last_attempt_at_ms + backoff(attempts); a never-attempted row is
-   * due immediately). Null when nothing is pending.
-   */
-  private outboxNextRetryAt(): number | null {
-    const rows = sqlRows<{ attempts: number; last_attempt_at_ms: number | null }>(
+  /** The route's lane directory (Phase 3): every destination that may
+   * hold pending rows — O(active lanes), independent of backlog depth. */
+  private outboxLanes(route: OutboxRoute): string[] {
+    return sqlRows<{ destination: string }>(
       this.state.storage.sql.exec(
-        "SELECT attempts, last_attempt_at_ms FROM net_scope_outbox WHERE status = 'pending'"
+        "SELECT destination FROM net_scope_outbox_lane WHERE route = ? ORDER BY destination",
+        route
+      )
+    ).map((row) => row.destination);
+  }
+
+  /** The lane HEAD's due-time: the first pending row in (scope, seq)
+   * order — one probe off the lane index. Null when the lane holds no
+   * pending rows (directory row is prunable). The head's due-time IS the
+   * lane's actionable time: CO2.7 forbids anything behind it delivering
+   * first, so rows further back are irrelevant to scheduling. */
+  private outboxLaneHead(route: OutboxRoute, destination: string): number | null {
+    const rows = sqlRows<{ at: number | null }>(
+      this.state.storage.sql.exec(
+        "SELECT next_attempt_at_ms AS at FROM net_scope_outbox WHERE route = ? AND destination = ? AND status = 'pending' ORDER BY scope, seq LIMIT 1",
+        route,
+        destination
       )
     );
+    return rows.length > 0 && rows[0].at !== null ? Number(rows[0].at) : null;
+  }
+
+  /**
+   * Earliest wall-clock time a pending outbox row becomes ACTIONABLE:
+   * the minimum over lane heads (Phase 3 — O(active lanes) probes, never
+   * a read of every pending row). Per-lane heads, not a global MIN over
+   * rows: a due row parked behind a mid-backoff head is not actionable,
+   * and counting it would arm an immediate alarm that a bounded pass can
+   * do nothing with — an alarm-driven busy loop. Clamped to now so the
+   * alarm never arms in the past. Null when nothing is pending.
+   */
+  private outboxNextRetryAt(): number | null {
     let earliest: number | null = null;
-    for (const row of rows) {
-      const at =
-        row.last_attempt_at_ms === null
-          ? this.host.now()
-          : Number(row.last_attempt_at_ms) + OUTBOX_BACKOFF_MS(Number(row.attempts));
-      if (earliest === null || at < earliest) earliest = at;
+    for (const route of OUTBOX_ROUTES) {
+      for (const lane of this.outboxLanes(route)) {
+        const head = this.outboxLaneHead(route, lane);
+        if (head !== null && (earliest === null || head < earliest)) earliest = head;
+      }
     }
-    return earliest;
+    return earliest === null ? null : Math.max(earliest, this.host.now());
   }
 
   /**
@@ -1646,13 +1916,12 @@ export class NetScopeDO {
    * it would fire the alarm in a tight loop that can do no useful work.
    * Dispatched rows live in the outbox family, whose retry alarm covers
    * them. */
-  private rearmAlarm(now: number): void {
-    let nextFuture: number | null = null;
-    for (const turn of this.store.readScheduled()) {
-      if (turn.at_logical_time > now && (nextFuture === null || turn.at_logical_time < nextFuture)) {
-        nextFuture = turn.at_logical_time;
-      }
-    }
+  private rearmAlarm(now: number, opts?: { dueNow?: boolean }): void {
+    // One indexed MIN over due_at (Phase 3) — re-arming must not read and
+    // parse every parked row. `dueNow` is the alarm handler's bounded-
+    // batch continuation: more turns are due right now and a planner can
+    // execute them, so wake immediately instead of at the next future one.
+    const nextFuture = opts?.dueNow ? now : this.store.nextScheduledAfter(now);
     this.host.setAlarm(SCOPE_ALARM_KEY, nextFuture, async () => {
       // The durable wake path is alarm() above; this callback exists to
       // satisfy the Host contract and is not retained by WorkerdHost.

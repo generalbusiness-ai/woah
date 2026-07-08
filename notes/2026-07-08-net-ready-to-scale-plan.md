@@ -266,6 +266,34 @@ all due rows in one alarm txn (`:632`).
 - Simplicity: a stuck destination or due-burst can no longer turn every
   later request into O(backlog) work.
 
+STATUS (2026-07-08): **PHASE 3 COMPLETE.** Outbox: `scope`/`seq`/
+`next_attempt_at_ms` columns + due and lane indexes + a **lane directory**
+table (`net_scope_outbox_lane`, one row per (route, destination) with
+pending rows — lane discovery is O(active lanes); a SQLite DISTINCT over
+the backlog index would be O(B) per pass, which is why the directory
+exists). Drain pass = due lanes by HEAD due-time probe, then a bounded
+lane PREFIX in (scope, seq) order per destination (CO2.7 order untouched:
+a mid-backoff head halts its lane); only ATTEMPTED rows write back; the
+retry alarm arms at the earliest lane HEAD (a due row parked behind a
+mid-backoff head is NOT actionable — arming on a global MIN would
+busy-loop the alarm). The fix-4b fresh-row COUNT recheck became an
+`enqueuedWhileDraining` flag: under bounded batches "fresh rows exist"
+no longer implies progress, and the old probe would spin the drain loop
+on blocked lanes (latent even pre-bounding for multi-row faulted lanes).
+Abandoned rows keep a bounded debugging tail (256; each already emits its
+divergence metric). Scheduled: `due_at` column + index (rearm = one
+indexed MIN, not a read-all-parse); one alarm firing moves a bounded
+batch (32) atomically and re-arms IMMEDIATELY while more are due
+(planner registered); no-planner overdue rows still never spin. Per-pass
+`net_scope_outbox_drain_pass` metric (considered/delivered/failed/
+abandoned/skipped) is the Phase-0 observability. Legacy-table probe+ALTER
+backfills are idempotent and vitest-covered
+(tests/worker/net-outbox-bounded.test.ts: bounded passes under B=100,
+stuck-lane no-starvation + head-only attempts + alarm-at-head-retry,
+legacy migration, bounded burst D=80 w/ exactly-once). coherence.md CO16
+updated. Gates: typecheck; npm test 754; test:worker 364; smoke:net-dev
+24/24; e2e:net 2/2; load:net-dev 2/2.
+
 ## Phase 4 — paged/targeted closure (remove unpaged sync copy)
 
 Cold warming does `keys:["*"]` (`gateway-do.ts:1764`) enumerating all store

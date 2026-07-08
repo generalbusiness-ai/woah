@@ -645,11 +645,19 @@ One write path per fact (CO9), concretized:
   registered planner gateway executes**. `/net/subscribe` carries a
   role (`fanout` | `planner`; fanout is the default, and fanout/refan
   delivery targets fanout-role subscribers only — one destination may
-  hold both roles). At alarm time the scope moves each due turn
-  **atomically** from the scheduled row family to a durable outbox row
+  hold both roles). At alarm time the scope moves due turns
+  **atomically** from the scheduled row family to durable outbox rows
   (`POST /net/plan-scheduled {scheduled_turn, scope, catalog_epoch}`)
-  in one transaction: the turn exists in exactly one family at any
-  instant — never lost, never duplicated. Rows address ONE planner,
+  in one transaction: each turn exists in exactly one family at any
+  instant — never lost, never duplicated. One firing moves a **bounded
+  batch** (in firing order) and re-arms immediately while more turns are
+  due, so a due burst can never balloon a single alarm transaction; with
+  no planner registered, due turns stay parked and the alarm re-arms
+  only for future turns (overdue rows cannot spin it). Outbox drains are
+  likewise bounded per pass — per due destination, a lane **prefix** in
+  (scope, seq) order — so a stuck destination's backlog neither taxes
+  later requests O(backlog) nor starves other destinations' lanes; the
+  retry alarm arms at the earliest lane HEAD's due-time. Rows address ONE planner,
   chosen deterministically (the lexicographically first planner-role
   subscriber, so re-fires address the same reply cache); failover is
   the outbox lane's ordinary retry/backoff/abandon policy (abandonment
