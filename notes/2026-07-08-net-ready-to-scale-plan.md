@@ -116,17 +116,28 @@ never gains presence — per-SESSION presence is tied to the ACTOR's move,
 not the session's own activeScope. Slicing removes the stale-view race that
 hid it.
 
-DECISION NEEDED before flipping the flag (CO14 semantics, not mechanical):
-should per-session presence follow the SESSION's activeScope — each session
-present where its actor is, regardless of whether THIS turn physically moved
-the shared actor? If yes, `foldSessionEffects` should synthesize the
-transition from (session.prior.activeScope → actor's resulting location)
-rather than rely on the engine's actor-move transition — but the trigger
-"session.activeScope ≠ actor.location" risks synthesizing spurious
-transitions on ordinary turns, depending on what a freshly-minted session's
-activeScope is relative to the actor's room. Pin the intended model first.
-The slice MACHINERY is proven correct (tests/net/plan.test.ts) and is NOT
-the blocker.
+DECISION (owner, 2026-07-08): per-session presence — each session present
+where its actor is, regardless of whether THIS turn physically moved the
+shared actor. IMPLEMENTED in `foldSessionEffects`: the engine-transition
+path is left byte-identical (real moves unchanged — so the fix is INERT in
+the full-view/default path), and when the engine records NO transition for
+the session, one is SYNTHESIZED from (session.prior.activeScope → actor's
+current location) if they differ. With slicing ON the whole in-process net
+suite is green (171) and `load:net-dev` is green (plan_cells 996 flat).
+
+NEW blocker (real-workerd only, in-process could not surface it — the
+fidelity ladder): with slicing ON, `smoke:net-dev` is 22/24. A client turn
+on an object NOT resident in the net-api shard view (`lane_client_box`)
+loops E_MISSING_STATE → E_BUDGET: the object genuinely is not in the shard
+(full-view had pulled it during warm-up; slicing does not over-pull), and
+pull-on-miss cannot recover it because the object's owner is not
+conventionally derivable (refreshCells convention probes room:<obj>/
+cluster:<obj> miss). So slicing surfaces a pull-on-miss ROUTING gap for
+client-turn targets, and/or the need for the client-warming path to pull the
+target's room contents (Phase 4 targeted-but-complete warming). Slicing
+stays GATED OFF until that lands. The presence fix + slice machinery + the
+load gate are committed; the flag flips after the pull-on-miss/warming fix.
+The slice MACHINERY itself remains proven correct (tests/net/plan.test.ts).
 
 Design realized:
 keep the full consistent `view.clone()` (fix-6 intact) but build the

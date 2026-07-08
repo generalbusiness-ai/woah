@@ -241,9 +241,36 @@ function foldSessionEffects(recorded: EffectTranscript, snapshot: CellStore, cal
   }
 
   const writes = [...recorded.writes];
-  const transition = recorded.sessionScopeTransition;
+  const priorRow = (prior?.value ?? {}) as Record<string, unknown>;
+  const engineTransition =
+    recorded.sessionScopeTransition && recorded.sessionScopeTransition.session === session
+      ? recorded.sessionScopeTransition
+      : null;
+  // The engine records a transition only when the actor PHYSICALLY moves
+  // this turn. But CO14 presence is per-SESSION: a session whose actor is
+  // ALREADY at the destination (e.g. a second session of the same actor
+  // entering a room the actor already occupies — the actor-move is a
+  // no-op, so no engine transition) still ENTERS that scope and must gain
+  // presence there. When the engine recorded no transition for this
+  // session, synthesize one from the session's prior activeScope to the
+  // actor's current location if they differ. The engine-transition path is
+  // left byte-identical (real moves are unchanged); this only ADDS the
+  // no-op-move case that a stale planning view used to mask.
+  let transition = engineTransition;
+  if (!transition) {
+    const actor = call.actor ?? (typeof recorded.session === "string" ? recorded.call?.actor : undefined);
+    const priorActiveScope =
+      typeof priorRow.activeScope === "string" && priorRow.activeScope ? priorRow.activeScope : null;
+    const actorLoc =
+      typeof actor === "string" && actor
+        ? (snapshot.get(cellKey("object_live", actor))?.value as { location?: unknown } | undefined)?.location
+        : undefined;
+    const to = typeof actorLoc === "string" && actorLoc ? actorLoc : null;
+    if (typeof actor === "string" && actor && to && to !== priorActiveScope) {
+      transition = { session, actor, from: priorActiveScope, to };
+    }
+  }
   if (transition && transition.session === session) {
-    const priorRow = (prior?.value ?? {}) as Record<string, unknown>;
     const value = { ...priorRow, id: session, actor: transition.actor, activeScope: transition.to };
     writes.push({
       cell: { kind: "session", object: session },
@@ -251,6 +278,9 @@ function foldSessionEffects(recorded: EffectTranscript, snapshot: CellStore, cal
       op: "set",
       writer: sessionWriter(transition.actor, "session_transition")
     });
+    // Carry the (possibly synthesized) transition so deriveRelationDeltas
+    // adds/removes the session_presence rows for it (CO13).
+    return { ...recorded, reads, writes, sessionScopeTransition: transition };
   }
   return { ...recorded, reads, writes };
 }
