@@ -384,6 +384,12 @@ Named honestly so they are decisions, not surprises:
    against later mobility.
 4. **Scale posture.** "Millions of nodes" remains the design discipline —
    no global enumeration anywhere in this layer — not a numeric SLO.
+5. **The full (`"*"`) closure is unpaged.** It is reserved for
+   repair/maintenance state transfer (the cold-open path pulls targeted —
+   Phase 4) and is bounded by scope size (CO11.1's room-sized scopes),
+   not by a byte/page budget with continuations. A scope large enough to
+   need paged repair transfer is the same scope CA13 decomposition
+   addresses; paging lands with that work.
 
 ## CO12. Conformance gates
 
@@ -455,16 +461,23 @@ One write path per fact (CO9), concretized:
   at the owning scope, and a local copy would be the CO9 dual write.
 - **The gateway mirror** is fed by `FanoutBody.relations` (a commit's
   local deltas, or a `/net/relate` refan) under the same per-scope seq
-  high-water that gates cells, plus one coherence companion: a FULL
-  closure (`keys: ["*"]` — the pull/reseed path) carries the scope's
-  relation rows, upserted in the same transaction that advances the
-  high-water. Required because a pull supersedes earlier fanout rows by
-  seq — without the rows riding the closure, a pull would silently
-  starve the mirror of everything those deliveries carried. Upsert-only:
-  a row deleted at the authority while the gateway was unsubscribed
-  lingers until a later remove delta heals it; a fresh shard's mirror is
-  exact. `GET /net/relation?relation=&owner=` is the client-read
-  primitive for who/contents.
+  high-water that gates cells, plus one coherence companion: a closure
+  that advances the high-water carries the scope's relation rows,
+  upserted in the same transaction. That is the FULL closure
+  (`keys: ["*"]` — the repair/reseed state transfer) and, since the
+  ready-to-scale Phase 4, the TARGETED cold-open closure
+  (`objects: [...], relations: true` — the named objects' class+anchor
+  chains, their actors' session cells, and the roster; the client
+  cold-open's cost tracks the session's need, never the scope's size).
+  Required because a pull supersedes earlier fanout rows by seq —
+  without the rows riding the closure, a pull would silently starve the
+  mirror of everything those deliveries carried; a targeted pull's
+  un-copied cells are ABSENT at the receiver, and absent is never stale
+  (pull-on-miss and read-version checks own them). Upsert-only: a row
+  deleted at the authority while the gateway was unsubscribed lingers
+  until a later remove delta heals it; a fresh shard's mirror is exact.
+  `GET /net/relation?relation=&owner=` is the client-read primitive for
+  who/contents.
 - **Fanout audiences** are computed from the `session_presence` relation
   (owner = the space, members = live sessions) — CO2.7's
   "O(distinct occupant shards)" gets its production definition here.

@@ -1073,7 +1073,17 @@ export class NetGatewayDO {
    */
   private async planScheduled(body: PlanScheduledRequest): Promise<TurnResult> {
     const turn = body.scheduled_turn;
-    await this.warmScopes([body.scope, CATALOG_SCOPE, `cluster:${turn.call.actor}`], "net_plan_scheduled_pull_miss_failed");
+    // Phase 4: the catalog pulls FULL (shared substrate, O(catalog) by
+    // design); the sending scope and the actor's cluster pull TARGETED —
+    // the turn's target and actor chains plus each scope's roster.
+    await this.warmScopes(
+      [
+        { scope: body.scope, objects: [turn.call.target, turn.call.actor] },
+        CATALOG_SCOPE,
+        { scope: `cluster:${turn.call.actor}`, objects: [turn.call.actor] }
+      ],
+      "net_plan_scheduled_pull_miss_failed"
+    );
     const key = `sched:${turn.id}:${turn.at_logical_time}`;
     return this.turn({
       call: {
@@ -1362,7 +1372,10 @@ export class NetGatewayDO {
     // destination without needing lineage first (the planScheduled
     // idiom). Best-effort: sessionOpen's own E_MISSING_STATE names the
     // failure when the pull could not land.
-    await this.warmScopes([CATALOG_SCOPE, `cluster:${actor}`], "net_client_pull_miss_failed");
+    await this.warmScopes(
+      [CATALOG_SCOPE, { scope: `cluster:${actor}`, objects: [actor] }],
+      "net_client_pull_miss_failed"
+    );
     // Phase 6: the id carries THIS shard's name so a future multi-shard
     // /net-api router can resolve a live session to the gateway holding
     // its view — a routing change, never a data migration.
@@ -1412,7 +1425,10 @@ export class NetGatewayDO {
         401
       );
     }
-    await this.warmScopes([CATALOG_SCOPE, `cluster:${actor}`], "net_client_pull_miss_failed");
+    await this.warmScopes(
+      [CATALOG_SCOPE, { scope: `cluster:${actor}`, objects: [actor] }],
+      "net_client_pull_miss_failed"
+    );
     const cell = this.ensureView().get(sessionCellKey(session));
     // The actor binding pins the session to the AUTHENTICATED apikey
     // actor: presenting another actor's session id is actor_mismatch.
@@ -1437,6 +1453,17 @@ export class NetGatewayDO {
     const row = cell?.value as { activeScope?: string | null } | undefined;
     const anchorObject = this.clientAnchorObject(actor, row?.activeScope ?? null);
     const planningScope = await this.clientPlanningScope(anchorObject, actor);
+    // Phase 4: warm the TURN'S TARGET (and its anchor) at the planning
+    // scope. Under targeted cold-open the room's cells no longer arrive
+    // wholesale, and a client-turn target the view never materialized is
+    // exactly the case pull-on-miss cannot route (its owner is not
+    // conventionally derivable from the object id — the Phase-1 smoke
+    // blocker); naming it here pulls its chain from the scope that
+    // anchors it before planning starts.
+    await this.warmScopes(
+      [{ scope: planningScope, objects: [target, anchorObject] }],
+      "net_client_pull_miss_failed"
+    );
     // Client retries reuse their supplied idempotency key (CO2.5); an
     // unkeyed request gets a fresh turn identity.
     const key =
@@ -1507,7 +1534,10 @@ export class NetGatewayDO {
    */
   private async clientPlanningScope(anchorObject: string, actor: string): Promise<string> {
     if (!this.ensureView().has(cellKey("object_lineage", anchorObject))) {
-      await this.warmScopes([`room:${anchorObject}`], "net_client_pull_miss_failed");
+      await this.warmScopes(
+        [{ scope: `room:${anchorObject}`, objects: [anchorObject] }],
+        "net_client_pull_miss_failed"
+      );
     }
     try {
       const view = this.ensureView();
@@ -1544,7 +1574,10 @@ export class NetGatewayDO {
     if (!session) {
       return json({ error: { code: "E_INVARG", message: "ws-ticket requires a session" } }, 400);
     }
-    await this.warmScopes([CATALOG_SCOPE, `cluster:${actor}`], "net_client_pull_miss_failed");
+    await this.warmScopes(
+      [CATALOG_SCOPE, { scope: `cluster:${actor}`, objects: [actor] }],
+      "net_client_pull_miss_failed"
+    );
     const verdict = validateSessionCell(this.ensureView().get(sessionCellKey(session)), this.host.now(), actor);
     if (verdict !== "ok") {
       return json({ error: { code: "E_NOSESSION", message: `session ${verdict}`, detail: { session_verdict: verdict } } }, 401);
@@ -1593,7 +1626,10 @@ export class NetGatewayDO {
       return json({ error: { code: "E_NOSESSION", message: "ticket invalid or expired", detail: { reason: "ticket_invalid" } } }, 401);
     }
     const { session, actor } = row;
-    await this.warmScopes([CATALOG_SCOPE, `cluster:${actor}`], "net_client_pull_miss_failed");
+    await this.warmScopes(
+      [CATALOG_SCOPE, { scope: `cluster:${actor}`, objects: [actor] }],
+      "net_client_pull_miss_failed"
+    );
     const verdict = validateSessionCell(this.ensureView().get(sessionCellKey(session)), this.host.now(), actor);
     if (verdict !== "ok") {
       return json({ error: { code: "E_NOSESSION", message: `session ${verdict}`, detail: { session_verdict: verdict } } }, 401);
@@ -1795,12 +1831,15 @@ export class NetGatewayDO {
    * `ON CONFLICT DO NOTHING`); a no-op when `NET_GATEWAY_SELF` is unset
    * (internal /net/turn lane path and hand-wired unit fixtures).
    *
-   * On the FIRST subscribe to a scope this lifetime a PULL follows: a
-   * full closure carries the scope's current relation rows (CO13), so a
+   * On the FIRST subscribe to a scope this lifetime a RELATION BACKFILL
+   * follows: the scope's current relation rows (CO13) ride a TARGETED
+   * closure (Phase 4 — no longer the full `["*"]` cell copy), so a
    * session subscribing AFTER peers are already present still sees their
    * presence rows in the mirror (a later commit's fanout carries only
-   * ITS own deltas, never the standing roster — the pull is what
-   * back-fills it). Best-effort: a failed subscribe/pull is a named
+   * ITS own deltas, never the standing roster — the backfill is what
+   * carries it). Cells the session's turns need arrive targeted (the
+   * warm paths) or by pull-on-miss; cold-open cost tracks the session,
+   * not the scope. Best-effort: a failed subscribe/backfill is a named
    * metric, never a thrown turn error; the scope is dropped from the
    * memoized set so the next touch retries.
    */
@@ -1810,7 +1849,7 @@ export class NetGatewayDO {
     this.selfSubscribed.add(scope);
     try {
       await this.host.rpc(`scope:${scope}`, "/subscribe", { destination: self });
-      await this.pull({ scope, destination: `scope:${scope}` });
+      await this.pullTargeted(scope, `scope:${scope}`, []);
     } catch (err) {
       this.selfSubscribed.delete(scope);
       console.log(
@@ -1820,12 +1859,39 @@ export class NetGatewayDO {
     }
   }
 
-  private async warmScopes(scopes: Iterable<string>, metricKind: string): Promise<void> {
-    this.ensureView(); // hydrates the `seen` high-water map alongside the view
-    for (const scope of new Set(scopes)) {
-      if (this.seen.has(scope)) continue;
+  /** Warm entries: a bare scope name means a FULL pull (reserved for the
+   * catalog scope — the shared substrate the planner needs resident
+   * wholesale, O(installed catalog) by design, never O(world)); an
+   * `{scope, objects}` entry pulls targeted (Phase 4): the named
+   * objects' chains plus the scope's relation roster, so a client
+   * cold-open copies what the session needs, not the scope. */
+  private async warmScopes(
+    entries: Iterable<string | { scope: string; objects: string[] }>,
+    metricKind: string
+  ): Promise<void> {
+    const view = this.ensureView(); // hydrates the `seen` high-water map alongside the view
+    const visited = new Set<string>();
+    for (const entry of entries) {
+      const scope = typeof entry === "string" ? entry : entry.scope;
+      if (visited.has(scope)) continue;
+      visited.add(scope);
       try {
-        await this.pull({ scope, destination: `scope:${scope}` });
+        if (typeof entry === "string") {
+          // Full pull: once per scope, keyed on the fanout high-water.
+          if (this.seen.has(scope)) continue;
+          await this.pull({ scope, destination: `scope:${scope}` });
+        } else {
+          // Targeted: the guard is per OBJECT, not per scope — a scope
+          // warmed for one object must still pull a LATER object's chain
+          // (the high-water only proves the roster/backfill happened).
+          // An object with lineage in view is materialized; any of its
+          // still-missing cells are the repair loop's job.
+          const missing = entry.objects.filter(
+            (object) => object.length > 0 && !view.has(cellKey("object_lineage", object))
+          );
+          if (this.seen.has(scope) && missing.length === 0) continue;
+          await this.pullTargeted(scope, `scope:${scope}`, missing);
+        }
       } catch (err) {
         console.log("woo.metric", JSON.stringify({ kind: metricKind, scope, error: String(err), ts: Date.now() }));
       }
@@ -2359,6 +2425,41 @@ export class NetGatewayDO {
 
   /** Full-closure install from the scope — the CO8 named reseed and the
    * /net/pull live path share this. */
+  /**
+   * Phase 4 targeted warming: pull ONLY the named objects' cells (each
+   * with its class chain, expanded at the authority) plus the scope's
+   * relation rows, and advance the fanout high-water to the returned
+   * head. Advancing is safe for the same reason the full pull's fix-7
+   * advance is: the relation mirror is coherent at that head (the rows
+   * rode along), and a cell this pull did not carry is ABSENT from the
+   * view — absent is never stale; pull-on-miss and read-version checks
+   * own it. This is the client cold-open path: its cost tracks what the
+   * session needs (objects' chains + roster), never the scope's size —
+   * the Phase-0 `closure` invariant. Empty `objects` = roster-only
+   * backfill (the selfSubscribe case).
+   */
+  private async pullTargeted(scope: string, destination: string, objects: string[]): Promise<void> {
+    const view = this.ensureView();
+    const transfer = (await this.host.rpc(destination, "/closure", {
+      keys: [],
+      known: [],
+      objects,
+      relations: true
+    })) as CellTransfer & { scope: string; head: ScopeHead; relations?: RelationRow[] };
+    this.discardViewOnThrow(() =>
+      this.state.storage.transactionSync(() => {
+        for (const cell of transfer.cells) {
+          view.install(cell);
+          this.persistCell(view, cell.key);
+        }
+        for (const row of transfer.relations ?? []) {
+          this.applyRelationDelta({ op: "add", row });
+        }
+        this.advanceSeen(transfer.scope, transfer.head.seq);
+      })
+    );
+  }
+
   private async reseedFromScope(
     view: CellStore,
     destination: string,

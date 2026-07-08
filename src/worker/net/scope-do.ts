@@ -668,8 +668,13 @@ export class NetScopeDO {
         });
       }
       if (request.method === "POST" && url.pathname === "/net/closure") {
-        const body = (await request.json()) as { keys: string[]; known?: string[] };
-        return json(this.closure(body.keys, body.known ?? []));
+        const body = (await request.json()) as {
+          keys: string[];
+          known?: string[];
+          objects?: string[];
+          relations?: boolean;
+        };
+        return json(this.closure(body.keys, body.known ?? [], body.objects ?? [], body.relations === true));
       }
       if (request.method === "GET" && url.pathname === "/net/head") {
         const seq = this.ensureSequencer();
@@ -1053,23 +1058,75 @@ export class NetScopeDO {
 
   /**
    * Lineage-closed transfer for the requested keys (`keys: ["*"]` = the
-   * full scope cell set — the CO7 cold-open/state-transfer case; scopes
-   * are room-sized by design, which is what keeps "*" bounded).
+   * full scope cell set — the CO7 repair/maintenance state-transfer case;
+   * scopes are room-sized by design, which is what keeps "*" bounded).
    * Requested keys always ship when present; `known` only relieves the
    * lineage-closure requirement (how transfers stay small without
    * reshipping the class chain — CO7). A requested key that is absent
    * ships nothing: at the receiver, absence after an accepted commit
    * means the cell was deleted.
+   *
+   * Phase 4 (targeted warming): `objects` selects EVERY cell of each
+   * named object plus its transitive class chain (the authority-side
+   * twin of the Phase-1 seed slice — the chain walk and per-object cell
+   * reads ride the CellStore indexes), so a cold client path can warm
+   * exactly what its session needs instead of copying the scope.
+   * `withRelations` makes ANY closure carry the scope's current relation
+   * rows (CO13) — the roster backfill a subscriber needs — without also
+   * copying every cell the way `"*"` does.
    */
   private closure(
     keys: string[],
-    known: string[]
+    known: string[],
+    objects: string[] = [],
+    withRelations = false
   ): CellTransfer & { scope: string; head: ScopeHead; catalog_epoch: string; relations?: RelationRow[] } {
     const seq = this.ensureSequencer();
     const store = seq.store;
     const wantAll = keys.length === 1 && keys[0] === "*";
     const cells = new Map<string, Cell>();
-    const requested = wantAll ? [...store.keys()] : keys;
+    const requested = wantAll ? [...store.keys()] : [...keys];
+    // Objects mode: fixed-point over each object's PARENT chain (verb
+    // pages and property defs up the class chain — inherited dispatch
+    // resolves at the receiver without a per-cell miss→pull round each)
+    // AND its ANCHOR chain (the CO15 topology walk classifies an object
+    // by anchors; a receiver holding the object but not its anchor's
+    // lineage cannot even route a turn at it — E_LINEAGE at the
+    // classifier, not a repairable miss). Then every cell of every
+    // chained object, plus every SESSION cell whose actor is a NAMED
+    // object: the move chain's primary-session decision ENUMERATES the
+    // planning world's sessions (the Phase-1 seed-completeness lesson),
+    // so a receiver holding some of an actor's sessions but not all
+    // would mis-designate a non-primary session as primary and
+    // physically move the shared body on a presence-only transition.
+    // All three expansions are short by design (class depth, room-sized
+    // anchoring, one actor's sessions) — O(session need).
+    if (!wantAll && objects.length > 0) {
+      const chain = new Set(objects);
+      for (;;) {
+        let added = false;
+        for (const object of [...chain]) {
+          const lineage = store.get(cellKey("object_lineage", object));
+          const value =
+            lineage && typeof lineage.value === "object" && lineage.value
+              ? (lineage.value as { parent?: unknown; anchor?: unknown })
+              : undefined;
+          for (const next of [value?.parent, value?.anchor]) {
+            if (typeof next === "string" && next && !chain.has(next)) {
+              chain.add(next);
+              added = true;
+            }
+          }
+        }
+        if (!added) break;
+      }
+      for (const object of chain) {
+        for (const cell of store.cellsForObject(object)) requested.push(cell.key);
+      }
+      for (const object of objects) {
+        for (const cell of store.sessionCellsForActor(object)) requested.push(cell.key);
+      }
+    }
     for (const key of requested) {
       const cell = store.get(key);
       if (cell) cells.set(key, cell);
@@ -1114,13 +1171,32 @@ export class NetScopeDO {
     // which makes any earlier relation fanout/refan no-op at the
     // receiver — without the rows riding here, a pull would silently
     // starve the mirror of every roster row the superseded fanout
-    // carried. Targeted closures skip them: they never advance the
-    // high-water. Sorted for a deterministic transfer.
-    const relations = wantAll
-      ? [...seq.relations().values()].sort((a, b) =>
-          relationKey(a.relation, a.owner, a.member).localeCompare(relationKey(b.relation, b.owner, b.member))
-        )
-      : undefined;
+    // carried. Phase 4: `withRelations` extends the same guarantee to a
+    // TARGETED pull (the client cold-open backfill), so advancing the
+    // high-water on it is equally safe — the roster is coherent at the
+    // returned head, and un-pulled cells are absent, not stale. A plain
+    // keyed closure (refreshCells repair) still skips them: it never
+    // advances the high-water. Sorted for a deterministic transfer.
+    const relations =
+      wantAll || withRelations
+        ? [...seq.relations().values()].sort((a, b) =>
+            relationKey(a.relation, a.owner, a.member).localeCompare(relationKey(b.relation, b.owner, b.member))
+          )
+        : undefined;
+    // Phase 0/4 observability: the load gate's cold-open invariant reads
+    // this — a targeted cold-open's cells must track the session's needs,
+    // never the scope's size.
+    console.log(
+      "woo.metric",
+      JSON.stringify({
+        kind: "net_scope_closure_served",
+        scope: seq.scope,
+        mode: wantAll ? "full" : objects.length > 0 ? "objects" : "keys",
+        cells: transfer.cells.length,
+        relations: relations?.length ?? 0,
+        ts: Date.now()
+      })
+    );
     return {
       ...transfer,
       scope: seq.scope,

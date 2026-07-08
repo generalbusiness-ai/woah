@@ -318,6 +318,42 @@ keys + relations (`scope-do.ts:779/834`) synchronously.
 - Test: a session subscribing AFTER peers are present still sees the roster
   under targeted (non-`["*"]`) warming.
 
+STATUS (2026-07-08): **PHASE 4 COMPLETE.** `/net/closure` gains an
+OBJECTS mode (each named object's transitive class chain AND anchor
+chain, every cell of every chained object, plus every SESSION cell whose
+actor is a named object — expanded at the authority over the CellStore
+indexes) and a `relations` flag (any closure can carry the scope's
+current relation rows). The gateway's new `pullTargeted` installs the
+slice, upserts the roster, and ADVANCES the fanout high-water — safe
+because the roster is coherent at the returned head and un-copied cells
+are ABSENT (never stale; pull-on-miss owns them). Client cold-open paths
+all went targeted: selfSubscribe = roster-only backfill; cluster warms
+pull `objects:[actor]`; clientPlanningScope pulls `objects:[anchor]`;
+clientTurn additionally warms `objects:[target, anchor]` at the planning
+scope (the Phase-1 smoke blocker's exact case: a client-turn target
+pull-on-miss cannot route); planScheduled targets `[target, actor]`.
+The CATALOG scope stays a FULL pull BY DECISION (the planner needs the
+shared substrate resident wholesale; O(installed catalog), never
+O(world)). The full `"*"` closure is now repair/maintenance-only and
+remains unpaged — recorded as CO11.5 (a scope needing paged repair
+transfer is the scope CA13 decomposes). TWO REGRESSIONS CAUGHT DURING
+THE PASS, both seed-completeness twins of the Phase-1 lesson: (1) the
+objects expansion must walk ANCHOR chains, not just parents — the CO15
+classifier E_LINEAGEs on an anchor gap; (2) it must carry the named
+actors' SESSION cells — a receiver holding SOME of an actor's sessions
+mis-designates primary and physically moves the shared body on a
+presence-only enter (found via trace: the ws fixture's world-session was
+primary; targeted warming dropped it; s1's enter moved the body; s2's
+enter became a no-op with NO transition → no presence row). Load gate
+gained the Phase-4 invariant (objects-closure flat as the scope grows;
+`"*"` demonstrably scales — why cold-open must not use it). Roster
+backfill after subscribe is proven by the H1 net-ws suites + smoke.
+Gates: typecheck; npm test 759; test:worker 377; smoke:net-dev 24/24;
+e2e:net 2/2; load:net-dev 3/3. coherence.md CO13 mirror + CO11.5
+updated. NOTE: a cold first-touch turn may pay extra repair rounds vs
+the old whole-scope pull (fake-lane h1-enter-1: attempt 3) — the
+designed trade; warm turns unchanged (attempt 1 throughout).
+
 ## Phase 5 — durable-format & contract stamps (Register B; before-data track)
 
 Cheap, independent, and **must all be in before any namespace holds data**

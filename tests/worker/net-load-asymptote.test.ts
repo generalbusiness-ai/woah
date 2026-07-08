@@ -181,6 +181,47 @@ describe("load:net-dev — plan-cost asymptotic invariant", () => {
     ).toBeLessThanOrEqual(FLAT_TOLERANCE);
   });
 
+  // Phase 4 (targeted cold-open): the closure a client cold-open pulls —
+  // objects mode, relations riding — must track the SESSION'S NEED (the
+  // named objects' chains + the roster), never the scope's size. The full
+  // "*" closure remains the repair/maintenance state transfer and DOES
+  // scale with the scope; the invariant is that the cold-open path no
+  // longer uses it.
+  it("objects-mode closure stays flat as the scope grows (cold-open ~ session need; \"*\" reserved for repair)", async () => {
+    const sizes = async (unrelated: number): Promise<{ targeted: number; full: number }> => {
+      const world = createWorld();
+      const session = world.auth(`guest:net-load-closure-${unrelated}`);
+      const actor = session.actor;
+      world.createObject({ id: "load_room", name: "Load Room", parent: "$space", owner: actor });
+      world.createObject({ id: "load_box", name: "Load Box", parent: "$thing", owner: actor, anchor: "load_room", location: "load_room" });
+      for (let i = 0; i < unrelated; i++) {
+        world.createObject({ id: `load_pad_${i}`, name: `Pad ${i}`, parent: "$thing", owner: actor, anchor: "load_room", location: "load_room" });
+        world.defineProperty(`load_pad_${i}`, { name: "n", defaultValue: i, owner: actor, perms: "rw", typeHint: "int" });
+      }
+      const cells = cellsFromSerialized(world.exportWorld());
+      const scopeState = netState(`closure-${unrelated}`);
+      const scopeEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET };
+      const scopeDO = new NetScopeDO(scopeState.state, scopeEnv);
+      await call(scopeDO, scopeEnv, "/seed", { scope: SCOPE, catalog_epoch: EPOCH, cells });
+      const targeted = await call<{ cells: unknown[] }>(scopeDO, scopeEnv, "/closure", {
+        keys: [],
+        known: [],
+        objects: ["load_box", actor],
+        relations: true
+      });
+      const full = await call<{ cells: unknown[] }>(scopeDO, scopeEnv, "/closure", { keys: ["*"], known: [] });
+      scopeState.close();
+      return { targeted: targeted.cells.length, full: full.cells.length };
+    };
+    const small = await sizes(0);
+    const large = await sizes(PAD);
+    // THE INVARIANT: padding never enters the targeted cold-open closure.
+    expect(large.targeted - small.targeted).toBeLessThanOrEqual(FLAT_TOLERANCE);
+    // The full closure DOES scale with the scope — which is exactly why
+    // the cold-open path must not use it.
+    expect(large.full).toBeGreaterThan(large.targeted + PAD);
+  });
+
   // Blocker #1 (closed): plan_cells being flat proves the planner INPUT is
   // sliced; this asserts the fix-6 SNAPSHOT is flat too — the warm turn's
   // clone, scratch post-state, version rewrite, read closure and catalog
