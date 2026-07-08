@@ -78,6 +78,13 @@ export type PlanTurnResult = {
   envelopeBytes: number;
   /** The submitted transcript (rewritten reads, commit-scope target). */
   transcript: EffectTranscript;
+  /** Phase 0 / CO10: the number of cells fed to `planningWorldFromCells`
+   * — the planner's INPUT size, the thing that scales with view size on
+   * the current (pre-slice) path and must stay ~read-set once planning is
+   * slice-based (the `plan_cells` structural counter). Sourced from the
+   * exact array so it measures the resident-view clone/rebuild CPU, not
+   * the post-hoc read closure. */
+  planCells: number;
 };
 
 export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
@@ -94,8 +101,11 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
   const snapshot = view.clone();
 
   // Sparse execution against the snapshot's cells only (plus the caller's
-  // counters for creates — see PlanTurnInput.counters).
-  const world = planningWorldFromCells(storeCells(snapshot), input.counters);
+  // counters for creates — see PlanTurnInput.counters). `planInput` is
+  // captured so `plan_cells` (Phase 0) counts the EXACT planner input —
+  // today the whole view, the O(view) cost the red baseline must show.
+  const planInput = storeCells(snapshot);
+  const world = planningWorldFromCells(planInput, input.counters);
   let run;
   try {
     run = await runShadowTurnCallTranscript(world, call);
@@ -157,7 +167,8 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
     },
     selection,
     envelopeBytes,
-    transcript
+    transcript,
+    planCells: planInput.length
   };
 }
 

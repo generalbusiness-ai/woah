@@ -251,6 +251,13 @@ class TurnStructure {
    * warm path never reconstructs. installTouched (the happy-path warm
    * cache-fill) is deliberately NOT counted here — it is not a repair. */
   reconstructions = 0;
+  /** Phase 0 / CO10: cells fed to the planner (`PlanTurnResult.planCells`)
+   * on the round that settled — the planner INPUT size. On the current
+   * pre-slice path this is the whole view (O(view)); once planning is
+   * slice-based it must stay ~read-set regardless of view size. The load
+   * gate's plan invariant asserts against this. Set per round so a settled
+   * turn reports its final plan's input. */
+  plan_cells = 0;
   countRpc(): void {
     this.sync_rpc += 1;
   }
@@ -269,6 +276,7 @@ type TurnStructureReport = {
   sync_rpc: number;
   scope_row_writes: number;
   reconstructions: number;
+  plan_cells: number;
 };
 
 /** Retryable verdict → the CO6 taxonomy code its round is recorded as.
@@ -613,7 +621,8 @@ export class NetGatewayDO {
         envelope_bytes: 0,
         sync_rpc: structure.sync_rpc,
         scope_row_writes: 0,
-        reconstructions: structure.reconstructions
+        reconstructions: structure.reconstructions,
+        plan_cells: structure.plan_cells
       });
       // Fix 5d: a plain-Error escape (misplan bug, double transport
       // failure) after failed rounds must still explain the convergence
@@ -640,7 +649,8 @@ export class NetGatewayDO {
       // Only an accepted reply wrote rows; a terminal reject committed
       // nothing (the rejected CommitReply variant has no `touched`).
       scope_row_writes: result.reply.status === "accepted" ? result.reply.touched.length : 0,
-      reconstructions: structure.reconstructions
+      reconstructions: structure.reconstructions,
+      plan_cells: structure.plan_cells
     };
   }
 
@@ -748,6 +758,9 @@ export class NetGatewayDO {
           throw err;
         }
       }
+      // Phase 0: record the planner input size of THIS round's plan (the
+      // resubmit branch reuses the prior plan's, already the settling one).
+      structure.plan_cells = planned.planCells;
 
       // Selection pinning (fix 5c): the FIRST submit for this key pins
       // its scope durably BEFORE the rpc leaves. Any later round (or a
