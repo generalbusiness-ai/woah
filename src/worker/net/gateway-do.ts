@@ -404,6 +404,16 @@ export class NetGatewayDO {
     state.storage.sql.exec(
       "CREATE INDEX IF NOT EXISTS net_gateway_relation_scope ON net_gateway_relation (relation, owner_scope)"
     );
+    // The authenticated read/auth query shapes (all O(matching rows), never
+    // a table scan): presence-of-a-member (relation, member); the contents
+    // membership check and the roster read (relation, owner, member — the
+    // second also serves the owner-only ORDER BY member read as a prefix).
+    state.storage.sql.exec(
+      "CREATE INDEX IF NOT EXISTS net_gateway_relation_member ON net_gateway_relation (relation, member)"
+    );
+    state.storage.sql.exec(
+      "CREATE INDEX IF NOT EXISTS net_gateway_relation_owner_member ON net_gateway_relation (relation, owner, member)"
+    );
     // Selection pinning (fix 5c): idempotency_key → the scope the FIRST
     // submit for that key targeted. A re-plan (same key, refreshed view)
     // must never migrate the commit to a different scope — the pinned
@@ -2107,16 +2117,14 @@ export class NetGatewayDO {
       idempotencyKey: request.idempotency_key,
       stamp: { scope_head: "gateway", catalog_epoch: request.catalog_epoch },
       receiverKnown: this.catalogKnownKeys(view, classifier),
-      // Phase 1: the gateway turn path plans against the read-set slice
-      // (grown from the snapshot on a miss), so warm-turn plan cost is
-      // O(read-set), not O(view). GATED OFF for now: same-scope, topology,
-      // and obj-ref turns are proven (load:net-dev green, net-do/topology/
-      // plan green), but a cross-scope TRANSITION turn (session moveto) now
-      // takes repair rounds under slicing that perturb the presence mirror
-      // high-water and drop a session_presence row (net-ws). The seed must
-      // cover the transition turn's read set (the move chain: acceptable/
-      // enterfunc + the from/to rooms' occupancy) so it stays attempt-1
-      // warm before this flips on. See notes/2026-07-08-net-ready-to-scale-plan.md.
+      // Phase 1: the gateway turn path plans against the read-set SLICE
+      // (built from the actor/session/target closure, grown from the view
+      // on a miss), so the planner-world INPUT is O(read-set), not O(view).
+      // NOTE: the surrounding turn machinery still has O(view) passes (the
+      // fix-6 snapshot clone, scratch post-state, catalogKnownKeys scan) —
+      // those are the remaining ready-to-scale work tracked in
+      // notes/2026-07-08-net-ready-to-scale-plan.md, and load:net-dev now
+      // measures them (view_touch_cells) alongside plan_cells.
       slicePlanning: true,
       ...(request.counters !== undefined ? { counters: request.counters } : {})
     });

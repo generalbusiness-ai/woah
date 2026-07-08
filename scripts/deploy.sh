@@ -225,6 +225,19 @@ else
     rm -f "$test_log"
     fail "tests failed"
   fi
+  # Net asymptotic gate (CO10): plan/turn cost must not grow with view size.
+  # A separate lane (not in npm test) so its red baseline never blocks the
+  # inner loop, but a pre-deploy gate here — a regression that reintroduces
+  # O(view) turn cost must stop a deploy.
+  load_log=$(mktemp -t woo-deploy-load.XXXXXX.log)
+  if npm run load:net-dev >"$load_log" 2>&1; then
+    rm -f "$load_log"
+    ok "net asymptotic gate (load:net-dev) holds"
+  else
+    tail -30 "$load_log"
+    rm -f "$load_log"
+    fail "net asymptotic gate failed — a turn cost grew with view size (load:net-dev)"
+  fi
 fi
 
 # Local workerd smoke (item 1). Runs the SAME cross-actor scenario as the
