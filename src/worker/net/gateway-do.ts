@@ -2100,7 +2100,7 @@ export class NetGatewayDO {
       // cover the transition turn's read set (the move chain: acceptable/
       // enterfunc + the from/to rooms' occupancy) so it stays attempt-1
       // warm before this flips on. See notes/2026-07-08-net-ready-to-scale-plan.md.
-      // slicePlanning: true,
+      slicePlanning: true,
       ...(request.counters !== undefined ? { counters: request.counters } : {})
     });
   }

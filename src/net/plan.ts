@@ -241,36 +241,9 @@ function foldSessionEffects(recorded: EffectTranscript, snapshot: CellStore, cal
   }
 
   const writes = [...recorded.writes];
-  const priorRow = (prior?.value ?? {}) as Record<string, unknown>;
-  const engineTransition =
-    recorded.sessionScopeTransition && recorded.sessionScopeTransition.session === session
-      ? recorded.sessionScopeTransition
-      : null;
-  // The engine records a transition only when the actor PHYSICALLY moves
-  // this turn. But CO14 presence is per-SESSION: a session whose actor is
-  // ALREADY at the destination (e.g. a second session of the same actor
-  // entering a room the actor already occupies — the actor-move is a
-  // no-op, so no engine transition) still ENTERS that scope and must gain
-  // presence there. When the engine recorded no transition for this
-  // session, synthesize one from the session's prior activeScope to the
-  // actor's current location if they differ. The engine-transition path is
-  // left byte-identical (real moves are unchanged); this only ADDS the
-  // no-op-move case that a stale planning view used to mask.
-  let transition = engineTransition;
-  if (!transition) {
-    const actor = call.actor ?? (typeof recorded.session === "string" ? recorded.call?.actor : undefined);
-    const priorActiveScope =
-      typeof priorRow.activeScope === "string" && priorRow.activeScope ? priorRow.activeScope : null;
-    const actorLoc =
-      typeof actor === "string" && actor
-        ? (snapshot.get(cellKey("object_live", actor))?.value as { location?: unknown } | undefined)?.location
-        : undefined;
-    const to = typeof actorLoc === "string" && actorLoc ? actorLoc : null;
-    if (typeof actor === "string" && actor && to && to !== priorActiveScope) {
-      transition = { session, actor, from: priorActiveScope, to };
-    }
-  }
+  const transition = recorded.sessionScopeTransition;
   if (transition && transition.session === session) {
+    const priorRow = (prior?.value ?? {}) as Record<string, unknown>;
     const value = { ...priorRow, id: session, actor: transition.actor, activeScope: transition.to };
     writes.push({
       cell: { kind: "session", object: session },
@@ -278,9 +251,6 @@ function foldSessionEffects(recorded: EffectTranscript, snapshot: CellStore, cal
       op: "set",
       writer: sessionWriter(transition.actor, "session_transition")
     });
-    // Carry the (possibly synthesized) transition so deriveRelationDeltas
-    // adds/removes the session_presence rows for it (CO13).
-    return { ...recorded, reads, writes, sessionScopeTransition: transition };
   }
   return { ...recorded, reads, writes };
 }
@@ -393,6 +363,21 @@ function readClosureCells(
 function buildSeedSlice(snapshot: CellStore, call: ShadowTurnCall): Set<string> {
   const seed = new Set<string>();
   if (typeof call.session === "string" && call.session) seed.add(cellKey("session", call.session));
+  // Seed the actor's OTHER session cells too. The move chain's body-move
+  // decision (isPrimary / primarySessionForActor) ENUMERATES the planning
+  // world's sessions — it is not a cell read the growth loop can catch —
+  // so a slice holding only the CALLING session would mis-designate it as
+  // the actor's primary and relocate the shared physical body. A sequenced
+  // session transition must NOT write object_live (the actor's location is
+  // the primary session's; a non-primary session's move is presence-only).
+  // Scan is a cheap key-prefix filter bounded by the actor's own sessions.
+  if (typeof call.actor === "string" && call.actor) {
+    for (const key of snapshot.keys()) {
+      if (!key.startsWith("session:")) continue;
+      const value = snapshot.get(key)?.value as { actor?: unknown } | null | undefined;
+      if (value && value.actor === call.actor) seed.add(key);
+    }
+  }
   const chain = new Set<string>();
   for (const ref of [call.actor, call.target]) {
     if (typeof ref === "string" && ref) chain.add(ref);
