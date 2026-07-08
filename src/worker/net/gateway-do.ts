@@ -61,6 +61,7 @@ import { budgetExhausted, isNetError, netError, NetError, type AttemptTraceEntry
 import { applyFanout, type FanoutBody } from "../../net/outbox";
 import { relationKey, type RelationDelta, type RelationRow } from "../../net/relations";
 import { mintSessionSubmit, sessionCellKey, validateSessionCell } from "../../net/sessions";
+import { sessionIdWithShardHint } from "../../net/session-id";
 import { planTurn, type PlanTurnInput, type PlanTurnResult } from "../../net/plan";
 import type { ScopeClassifier } from "../../net/route";
 import { CATALOG_SCOPE, classifierFromLineage, type AnchorLineage } from "../../net/topology";
@@ -1345,6 +1346,15 @@ export class NetGatewayDO {
     return { map, epoch: cell.stamp.catalog_epoch };
   }
 
+  /** This gateway shard's own name (Phase 6): the DO id's name when the
+   * id came from idFromName (workerd exposes it; the fake harness sets
+   * it), null when the runtime cannot name itself — the mint then falls
+   * back to the hint-less legacy id form. */
+  private shardName(): string | null {
+    const name = (this.state.id as { name?: unknown } | null | undefined)?.name;
+    return typeof name === "string" && name.length > 0 ? name : null;
+  }
+
   /** POST /net-api/session — see the clientApi header. */
   private async clientSession(actor: string, body: Record<string, unknown>, epoch: string): Promise<Response> {
     // The mint needs the actor's lineage (cluster-scope derivation) in
@@ -1353,7 +1363,10 @@ export class NetGatewayDO {
     // idiom). Best-effort: sessionOpen's own E_MISSING_STATE names the
     // failure when the pull could not land.
     await this.warmScopes([CATALOG_SCOPE, `cluster:${actor}`], "net_client_pull_miss_failed");
-    const session = `s_${randomHex(16)}`;
+    // Phase 6: the id carries THIS shard's name so a future multi-shard
+    // /net-api router can resolve a live session to the gateway holding
+    // its view — a routing change, never a data migration.
+    const session = sessionIdWithShardHint(this.shardName(), randomHex(16));
     const opened = await this.sessionOpen({
       session,
       actor,

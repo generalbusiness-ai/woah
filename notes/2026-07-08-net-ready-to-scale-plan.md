@@ -391,6 +391,22 @@ typecheck; npm test 754; test:worker 376; smoke:net-dev 24/24; e2e:net
 - Invariant: adding a shard requires no data migration (hint resolves the
   session's cluster).
 
+STATUS (2026-07-08): **PHASE 6 HINT SHIPPED** (routing itself remains
+post-first-deploy, as planned). `src/net/session-id.ts`:
+`sessionIdWithShardHint(shard, random)` mints `s_<shard>_<random>` with
+the shard token sanitized to `[A-Za-z0-9-]` — `:` can never enter a
+session id (cell-key parse safe) and `_` cannot break the strict
+three-token parse; `sessionShardHint(id)` recovers the shard, null for
+the hint-less legacy `s_<random>` form (routes to the default shard).
+The gateway mints with its own DO name (`state.id.name` — workerd
+exposes it for idFromName ids; fake harness sets it), falling back to
+the legacy form when the runtime cannot name itself. Unit tests cover
+roundtrip, sanitization, legacy/malformed → null, and the
+`session:<id>` cell-key parse; smoke:net-dev 24/24 proves hinted ids
+end-to-end over real workerd (WS tickets, turns, presence). Gates:
+typecheck; npm test 759; test:worker 376; smoke 24/24; e2e:net 2/2;
+load 2/2.
+
 ---
 
 ## Cross-cutting gate (every phase)
