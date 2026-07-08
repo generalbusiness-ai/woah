@@ -220,7 +220,11 @@ export class NetFeed {
   private socket: NetSocketLike | null = null;
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private closedByUser = false;
+  /** Suppresses the reconnect loop. Set by BOTH close() (user intent) and
+   * terminate() (a terminal failure the user never asked for); the two are
+   * told apart by `lastError` (null after close(), set after terminate()).
+   * Do NOT read this to infer user intent — read `lastError` for that. */
+  private reconnectSuppressed = false;
 
   /** M10: the terminal failure that stopped the feed (surfaced on state),
    * or null. Set by terminate(); cleared by a successful (re)mint. */
@@ -230,8 +234,8 @@ export class NetFeed {
    * A re-mint attempted at/past the cap without intervening progress is a
    * dead credential (not an expired session) — it throws terminally rather
    * than spinning the treadmill this whole item exists to kill. */
-  private remintStreak = 0;
-  private static readonly REMINT_STREAK_CAP = 1;
+  private remintsWithoutProgress = 0;
+  private static readonly MAX_REMINTS_WITHOUT_PROGRESS = 1;
   /** M10: coalesce concurrent re-mints (socket path + turn path) onto one
    * POST /net-api/session. */
   private remintInFlight: Promise<string> | null = null;
@@ -301,11 +305,11 @@ export class NetFeed {
    * session id (kickoff rule — no durable socket registry anywhere).
    */
   async open(): Promise<{ session: string; actor: string }> {
-    this.closedByUser = false;
+    this.reconnectSuppressed = false;
     // M10: a fresh open() clears any prior terminal failure and the
     // re-mint bound — this is the consumer's deliberate restart.
     this.lastError = null;
-    this.remintStreak = 0;
+    this.remintsWithoutProgress = 0;
     const body = this.ttlMs !== undefined ? { ttl_ms: this.ttlMs } : {};
     const reply = (await this.fetchJson("POST", "/net-api/session", body)) as SessionReply;
     this.session = reply.session;
@@ -321,7 +325,7 @@ export class NetFeed {
   /** Stop reconnecting and close the socket. The session cell simply
    * expires server-side; there is no unregister call to make. */
   close(): void {
-    this.closedByUser = true;
+    this.reconnectSuppressed = true;
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -348,14 +352,14 @@ export class NetFeed {
    */
   private async remintSession(): Promise<string> {
     if (this.remintInFlight) return this.remintInFlight;
-    if (this.remintStreak >= NetFeed.REMINT_STREAK_CAP) {
+    if (this.remintsWithoutProgress >= NetFeed.MAX_REMINTS_WITHOUT_PROGRESS) {
       throw new NetFeedError(
         "E_NOSESSION",
         "session re-mint made no progress — the credential is likely revoked",
         401
       );
     }
-    this.remintStreak += 1;
+    this.remintsWithoutProgress += 1;
     const attempt = (async (): Promise<string> => {
       const body = this.ttlMs !== undefined ? { ttl_ms: this.ttlMs } : {};
       const reply = (await this.fetchJson("POST", "/net-api/session", body)) as SessionReply;
@@ -381,7 +385,7 @@ export class NetFeed {
    */
   private terminate(error: NetFeedError): void {
     this.lastError = error;
-    this.closedByUser = true; // stop the reconnect loop (state.error tells them apart)
+    this.reconnectSuppressed = true; // stop the reconnect loop; lastError marks this as a failure, not a close()
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -518,7 +522,7 @@ export class NetFeed {
     // M10: a turn that reached the gateway and settled (accepted OR
     // rejected) proves the session is live — real progress, so the
     // re-mint bound resets.
-    this.remintStreak = 0;
+    this.remintsWithoutProgress = 0;
     // A WS turn_result that carried an error object (or a REST error
     // status that somehow reached here) is a thrown failure, not a
     // settled outcome.
@@ -555,7 +559,7 @@ export class NetFeed {
   }
 
   private recordSelfSettled(scope: string, seq: number): void {
-    const key = `${scope} ${seq}`;
+    const key = `${scope}\0${seq}`;
     this.selfSettled.delete(key);
     this.selfSettled.add(key);
     while (this.selfSettled.size > SELF_SETTLED_CAP) {
@@ -577,7 +581,7 @@ export class NetFeed {
   /** GET /net-api/cell?key= — the cell body, or null. Cached (TTL-less;
    * invalidated by change signals — see the read-cache posture). */
   async cell(key: string): Promise<unknown> {
-    const cacheKey = `cell ${key}`;
+    const cacheKey = `cell\0${key}`;
     if (this.readCache.has(cacheKey)) return this.readCache.get(cacheKey);
     const reply = (await this.fetchJson("GET", `/net-api/cell?session=${encodeURIComponent(this.requireSession())}&key=${encodeURIComponent(key)}`)) as {
       cell: unknown;
@@ -589,7 +593,7 @@ export class NetFeed {
   /** GET /net-api/relation — the (relation, owner) member rows. Cached
    * like cell(). */
   async relation(relation: string, owner: string): Promise<Array<{ member: string; body?: unknown }>> {
-    const cacheKey = `relation ${relation} ${owner}`;
+    const cacheKey = `relation\0${relation}\0${owner}`;
     if (this.readCache.has(cacheKey)) {
       return this.readCache.get(cacheKey) as Array<{ member: string; body?: unknown }>;
     }
@@ -605,7 +609,7 @@ export class NetFeed {
   // ---- Socket plumbing -----------------------------------------------------
 
   private async connectSocket(): Promise<void> {
-    if (!this.webSocketImpl || !this.session || this.closedByUser) {
+    if (!this.webSocketImpl || !this.session || this.reconnectSuppressed) {
       // No WS runtime (or closed): REST-only operation, honestly stated.
       if (!this.webSocketImpl) this.setConnection("idle");
       return;
@@ -637,7 +641,7 @@ export class NetFeed {
     } catch (err) {
       // Superseded by a re-open()/close() between the connect start and
       // the mint reply — abandon this attempt silently.
-      if (this.session !== session || this.closedByUser) return;
+      if (this.session !== session || this.reconnectSuppressed) return;
       // M10: a ticket mint that fails because the SESSION is gone
       // (E_NOSESSION) is the treadmill this item kills — re-minting a
       // ticket for a dead session forever. Re-mint the SESSION once, then
@@ -655,7 +659,7 @@ export class NetFeed {
           );
           return;
         }
-        if (!this.closedByUser) void this.connectSocket();
+        if (!this.reconnectSuppressed) void this.connectSocket();
         return;
       }
       // Any other failure (transient network): reconnect with backoff.
@@ -663,7 +667,7 @@ export class NetFeed {
       return;
     }
     // A re-open()/close between mint and connect supersedes this attempt.
-    if (this.session !== session || this.closedByUser || !this.webSocketImpl) return;
+    if (this.session !== session || this.reconnectSuppressed || !this.webSocketImpl) return;
     const wsBase = this.baseUrl.replace(/^http/, "ws");
     const url = `${wsBase}/net-api/ws?ticket=${encodeURIComponent(ticket)}`;
     let socket: NetSocketLike;
@@ -691,7 +695,7 @@ export class NetFeed {
     socket.onopen = () => {
       if (this.socket !== socket) return; // superseded by a newer connect
       this.reconnectAttempt = 0;
-      this.remintStreak = 0; // M10: a live socket is real progress
+      this.remintsWithoutProgress = 0; // M10: a live socket is real progress
       this.setConnection("open");
     };
     socket.onmessage = (event) => {
@@ -706,7 +710,7 @@ export class NetFeed {
       this.socket = null;
       // In-flight WS turns fall back to REST with their same keys.
       this.failInFlightTurns();
-      if (!this.closedByUser) this.scheduleReconnect();
+      if (!this.reconnectSuppressed) this.scheduleReconnect();
     };
   }
 
@@ -720,7 +724,7 @@ export class NetFeed {
   }
 
   private scheduleReconnect(): void {
-    if (this.closedByUser || this.reconnectTimer !== null) return;
+    if (this.reconnectSuppressed || this.reconnectTimer !== null) return;
     this.reconnectAttempt += 1;
     this.setConnection("reconnecting");
     this.reconnectTimer = setTimeout(() => {
@@ -759,7 +763,7 @@ export class NetFeed {
     const seen = this.frameSeen.get(scope) ?? 0;
     if (seq <= seen) return; // redelivery on the ordered lane
     this.frameSeen.set(scope, seq);
-    if (this.selfSettled.has(`${scope} ${seq}`)) {
+    if (this.selfSettled.has(`${scope}\0${seq}`)) {
       // Our own committed turn came back as a frame (gateway echo-dedupe
       // lost its LRU entry): the reply already emitted these as "self".
       return;

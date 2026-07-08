@@ -149,8 +149,11 @@ export type ScopeSequencerOptions = {
   scopeOf?: (object: string) => string;
   /** Bounded recovery tail length (the scope's own log — CO5 note). */
   tailLimit?: number;
-  /** H2a: reply-cache bound — the most-recent set kept BEYOND the
-   * retained tail window (default REPLY_KEEP_RECENT). See pruneReplies. */
+  /** H2a: reply-cache bound — the TOTAL number of recorded replies the
+   * cache holds (default REPLY_CACHE_CAP). Within-window replies (still
+   * covered by the recovery tail) are never pruned but DO count toward
+   * this cap, so the number retained beyond the window is this cap minus
+   * the in-window count, not this cap itself. See pruneReplies. */
   replyLimit?: number;
   /** Durability (Phase 3): when provided, the sequencer hydrates from the
    * store at construction and writes through on every state change (CO5
@@ -159,10 +162,11 @@ export type ScopeSequencerOptions = {
   durable?: ScopeStore;
 };
 
-/** H2a default: recorded replies kept beyond the tail window. Sized so a
- * busy scope's recent idempotent retries always replay, while the table
- * stops growing one row per turn forever. */
-export const REPLY_KEEP_RECENT = 1024;
+/** H2a default: the TOTAL reply-cache cap. Sized so a busy scope's recent
+ * idempotent retries always replay, while the table stops growing one row
+ * per turn forever. The recovery-tail window is never pruned, so the count
+ * retained BEYOND the window is this cap minus the in-window replies. */
+export const REPLY_CACHE_CAP = 1024;
 
 export class ScopeSequencer {
   readonly scope: string;
@@ -798,9 +802,10 @@ export class ScopeSequencer {
    *   still covered by the retained recovery tail (seq > head - tail
    *   limit) is never a candidate, so recovery-tail replay always finds
    *   its replies;
-   * - **a bounded most-recent set beyond the window** — outside the
-   *   window, only the OLDEST replies prune, and only down to
-   *   `replyLimit` (default REPLY_KEEP_RECENT).
+   * - **a bounded TOTAL cache** — outside the window, the OLDEST replies
+   *   prune until the whole cache is back within `replyLimit` (default
+   *   REPLY_CACHE_CAP); in-window replies are never candidates but do
+   *   count toward the cap.
    *
    * Consequence, documented: a replay arriving AFTER its reply pruned
    * (a client retrying a turn from thousands of commits ago) re-enters
@@ -815,7 +820,7 @@ export class ScopeSequencer {
    * the same transaction (memory-follows-durable in lockstep).
    */
   private pruneReplies(): string[] {
-    const limit = this.options.replyLimit ?? REPLY_KEEP_RECENT;
+    const limit = this.options.replyLimit ?? REPLY_CACHE_CAP;
     if (this.replies.size <= limit) return [];
     const cutoff = this.headState.seq - this.options.tailLimit;
     const candidates = [...this.replies.entries()]

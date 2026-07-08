@@ -306,7 +306,7 @@ type GatewaySocketAttachment = { session: string; actor: string; opened_at: numb
 const RECENT_CLIENT_TURN_CAP = 512;
 
 /** H2c: selection-pin retention (see pinScope) — matches the scopes'
- * reply-cache bound (scope.ts REPLY_KEEP_RECENT) so the pin never
+ * reply-cache bound (scope.ts REPLY_CACHE_CAP) so the pin never
  * outlives the reply it protects by more than the window. */
 const GATEWAY_PIN_LIMIT = 1024;
 
@@ -1808,7 +1808,7 @@ export class NetGatewayDO {
     return scopes;
   }
 
-  private denyCredentialCell(key: string): boolean {
+  private denyProtectedCell(key: string): boolean {
     // key = <kind>:<object>[:<name>]
     const parts = key.split(":");
     const kind = parts[0];
@@ -1825,7 +1825,7 @@ export class NetGatewayDO {
 
   /** Authorize a cell read; throws ClientAuthError(403) on denial. */
   private authorizeCellRead(caller: string, session: string, key: string): void {
-    if (this.denyCredentialCell(key)) {
+    if (this.denyProtectedCell(key)) {
       throw new ClientAuthError("cell not readable", { key }, "E_PERM", 403);
     }
     const parts = key.split(":");
@@ -1931,7 +1931,7 @@ export class NetGatewayDO {
     classifier: ScopeClassifier,
     planned: PlanTurnResult,
     targetScope: string,
-    counters?: TurnStructure
+    structure?: TurnStructure
   ): Promise<CommitSubmit["attestations"]> {
     const byOwner = new Map<string, Set<string>>();
     for (const read of planned.transcript.reads) {
@@ -1954,7 +1954,7 @@ export class NetGatewayDO {
     const attestations: NonNullable<CommitSubmit["attestations"]> = {};
     for (const [owner, keys] of byOwner) {
       const destination = this.destinationFor(request, owner);
-      counters?.countRpc();
+      structure?.countRpc();
       const reply = (await this.host.rpc(destination, "/attest", { keys: [...keys].sort() })) as {
         owner_head: ScopeHead;
         cells: Array<{ key: string; version: string }>;
@@ -2099,11 +2099,11 @@ export class NetGatewayDO {
   /** Warm cache-fill (CO7): accepted cells become the view's derived
    * copies, so the next turn plans locally. A touched key with no cell
    * in the transfer was deleted at the authority; mirror the deletion. */
-  private async installTouched(view: CellStore, destination: string, touched: string[], counters?: TurnStructure): Promise<void> {
+  private async installTouched(view: CellStore, destination: string, touched: string[], structure?: TurnStructure): Promise<void> {
     // D2: on the SYNCHRONOUS reply path (post-accept), so it counts toward
     // the sync-RPC budget — but it is the happy-path warm fill, NOT an
     // authority reconstruction, so reconstructions stays 0 on a warm turn.
-    counters?.countRpc();
+    structure?.countRpc();
     const transfer = (await this.host.rpc(destination, "/closure", { keys: touched, known: [] })) as CellTransfer;
     const wanted = new Set(touched);
     this.discardViewOnThrow(() =>
@@ -2134,13 +2134,13 @@ export class NetGatewayDO {
     classifier: ScopeClassifier,
     view: CellStore,
     keys: string[],
-    counters?: TurnStructure
+    structure?: TurnStructure
   ): Promise<void> {
     if (keys.length === 0) return;
     // D2: a targeted refresh IS an authority reconstruction (view rebuilt
     // from owner closures) — one per call, regardless of how many owner
     // closures it fans to; each of those closures counts as a sync RPC.
-    counters?.countReconstruction();
+    structure?.countReconstruction();
     // Owner-KNOWN keys (the view holds the object's lineage, or the key
     // names the call's session — sessions.ts rule) route to their owner
     // and use authoritative-absence semantics: a key the owner does not
@@ -2168,7 +2168,7 @@ export class NetGatewayDO {
     }
     const known = [...view.keys()].filter((key) => key.startsWith("object_lineage:"));
     for (const [destination, want] of byDestination) {
-      counters?.countRpc();
+      structure?.countRpc();
       const transfer = (await this.host.rpc(destination, "/closure", { keys: want, known })) as CellTransfer;
       const wanted = new Set(want);
       this.discardViewOnThrow(() =>
@@ -2206,7 +2206,7 @@ export class NetGatewayDO {
       for (const destination of [...new Set(candidates)]) {
         if (satisfied) break;
         try {
-          counters?.countRpc();
+          structure?.countRpc();
           const transfer = (await this.host.rpc(destination, "/closure", { keys: want, known })) as CellTransfer;
           if (transfer.cells.length === 0) continue;
           this.discardViewOnThrow(() =>
@@ -2232,12 +2232,12 @@ export class NetGatewayDO {
     view: CellStore,
     destination: string,
     known: string[] = [],
-    counters?: TurnStructure
+    structure?: TurnStructure
   ): Promise<CellTransfer & { scope: string; head: ScopeHead; catalog_epoch: string; relations?: RelationRow[] }> {
     // D2: a full reseed is an authority reconstruction and one sync RPC on
-    // the turn path (the /net/pull live path passes no counter, unchanged).
-    counters?.countReconstruction();
-    counters?.countRpc();
+    // the turn path (the /net/pull live path passes no structure, unchanged).
+    structure?.countReconstruction();
+    structure?.countRpc();
     const transfer = (await this.host.rpc(destination, "/closure", { keys: ["*"], known })) as CellTransfer & {
       scope: string;
       head: ScopeHead;
