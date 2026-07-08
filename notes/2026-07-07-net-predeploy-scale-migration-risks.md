@@ -1,181 +1,162 @@
-# Net pre-deploy risk register — scale + migration/supportability
+# Net pre-deploy risk register — ready-to-scale is the deploy bar
 
-Date: 2026-07-07. Branch `net-predeploy`. Inputs: an external scale/
-asymptotic review (6 findings) + three grounded investigations (durable
-schema, wire contracts, topology/cutover). All claims spot-verified
-against code; DDL confirmed.
+Date: 2026-07-07 (reframed 2026-07-08). Branch `net-predeploy`. Inputs: an
+external scale/asymptotic review (6 findings) + three grounded
+investigations (durable schema, wire contracts, topology/cutover). All
+claims spot-verified against code; DDL confirmed.
 
-## The spine: one root, many symptoms
+## Frame: the first new deploy must be architecturally ready-to-scale
 
-Most of the scale findings are **one architectural fact** with several
-faces: **the single `/net-api` gateway shard depends on a monolithic warm
-image, and planning is not slice-based.** Concretely:
+Not "deploy small, measure, scale later." That earlier gate/sequencing
+framing is wrong for two reasons:
+
+1. **The rebuild exists to shed O(world).** Plan 002 is the *simplest-
+   system* rebuild whose whole point was escaping v2's per-turn world-
+   assembly. A first deploy that still clones the entire gateway view per
+   turn and scans every session per fanout re-baptizes the exact debt we
+   are replacing — under a fresh namespace we then cannot cleanly migrate
+   off.
+2. **"Scale later" has no path.** The findings below show topology and
+   schema **freeze the moment the namespace holds state**: DO classes and
+   table shapes lock under `cf-do-0004`; session ids carry no lineage
+   (CO14) so live sessions cannot be re-sharded; there is no cross-DO data
+   migration and no `schema_version` to branch on. Small-world assumptions
+   baked in at deploy are not deferred debt — they are permanent until a
+   from-scratch cutover.
+
+So one discipline, applied aggressively **at every stage**, two moves:
+
+- **(A) Remove small-world assumptions.** Any cost that scales with view
+  size, total session count, outbox backlog, or closure size — rather than
+  with the turn's actual work — is a defect to fix *before* deploy, not a
+  number to measure after.
+- **(B) Orient toward simplicity.** Here the scalable shape is almost
+  always the *simpler* one: a turn that plans against its read-closure is
+  simpler than one that reconstructs the whole world; an indexed by-scope
+  query is simpler than a whole-table scan plus JS filter; a version stamp
+  is simpler than probe-based bespoke migrations and a hard-throw epoch.
+  Scale and simplicity point the same way. Where they seem to diverge,
+  take the simpler design and make it scale.
+
+(A) and (B) are the same direction. This section replaces the earlier
+"three gates / measure-then-scale" sequencing.
+
+## The one assumption to remove: the monolithic warm image
+
+Most findings are one architectural fact with several faces: **the single
+`/net-api` gateway shard depends on a monolithic warm image, and planning
+is not slice-based.**
 
 - `/net-api/*` → one stable DO (`index.ts` `NET_API_GATEWAY_SHARD="net-api"`);
   session mint and turn must land on the same DO (session ids carry no
-  lineage, CO14), so it can't be sharded without a session→cluster story.
+  lineage), so it cannot shard without a session→cluster story.
 - `ensureView()` hydrates every known cell into memory; then EVERY plan
-  does `view.clone()` (`plan.ts:94` — copies all cells) and rebuilds a
-  full serialized planning world from all of them (`plan.ts:98` →
+  does `view.clone()` (`plan.ts:94`, copies all cells) and rebuilds a full
+  serialized planning world from all of them (`plan.ts:98` →
   `bridge.ts:276` `storeCells` iterates all keys). A warm turn is
-  **O(gateway-view), not O(read-set)** — directly contradicting
-  coherence.md:356 (no O(world)).
-- Fanout presence delivery scans the whole mirrored presence table
-  (`gateway-do.ts:1658` `WHERE relation='session_presence'`, no owner
-  predicate) and classifies each row in JS (`:1671`). One room message is
-  **O(all mirrored sessions)**, not O(room occupants) — and on one shard,
-  "all mirrored sessions" = the whole deployment.
+  **O(view), not O(read-set)** — contradicting coherence.md:356.
+- Fanout scans the whole mirrored presence table (`gateway-do.ts:1658`,
+  `WHERE relation='session_presence'`, no owner predicate) and classifies
+  each row in JS (`:1671`): **O(all mirrored sessions)**, not O(room
+  occupants) — and on one shard that is the whole deployment.
 
-Directional fix (the pre-cutover spine): make planning slice-based
-(actor/session/target/lineage/read-closure only), so the gateway stops
-needing the whole world resident; THEN shard `/net-api`. Everything in
-"Gate 2" below is downstream of this.
+Removing it — slice-based planning so the gateway never needs the world
+resident — is simultaneously the scale fix and the simplification, and it
+is the precondition for sharding. Everything in "assumptions to remove"
+below is a face of it.
 
-## Three gates, not one
+## Register (A): small-world assumptions to remove
 
-The staging deploy is **measurement-only, single-shard, fresh namespace,
-small seeded world** (plan §8). That reframes the reviewer's "Blocker":
-the O(world) costs are not blockers for a *small-world measurement*
-deploy — that deploy is the instrument to quantify them. But some risks
-bite regardless of scale, and some schema shapes are far cheaper to lay
-down before any namespace holds live data. Hence three gates.
+Cost that scales with the wrong thing. Each line: the assumption, then the
+simpler ready-to-scale shape.
 
----
+- **O(view) warm planning** — `plan.ts:94`/`:98`, `bridge.ts:276`. Plan
+  against the turn's read-closure (actor/session/target/lineage), not the
+  whole view. Simpler: no full-world reconstruction per turn.
+- **O(sessions) presence scan** — `gateway-do.ts:1658`. Query by scope; the
+  `owner` column already exists on `net_gateway_relation`, so add
+  `AND owner=?` / index `(relation, owner)`. Simpler: SQL does the filter,
+  not a JS classifier loop.
+- **Unpaged synchronous full closure** — `keys:["*"]` reseed enumerates all
+  store keys + relations (`scope-do.ts:779/834`) on cold open/first turn.
+  Targeted + paged client-path warming; reserve full closure for repair
+  with byte/page budgets and continuations.
+- **Outbox drain O(backlog)** — `net_scope_outbox` has `PRIMARY KEY(route,
+  id)` and no due-time/status index and no `next_attempt_at_ms`
+  (`scope-do.ts:369`); drain reads all pending for a route (`:1160`), retry
+  scans all pending (`:1280`). A stuck destination turns every later
+  request/alarm into O(backlog). Add `next_attempt_at_ms`, due-indexed
+  bounded `LIMIT` batches, update only rows attempted.
+- **Scheduled burst** — `net_scope_scheduled(id, body)` with no due index
+  (`scope-do.ts:171`); all due rows move to outbox in one alarm txn
+  (`:632`). Due-indexed bounded batch + immediate re-arm when more remains.
+- **Single monolithic shard** — downstream of slice-based planning: shard
+  `/net-api` once the gateway no longer holds the world. Needs a
+  session→cluster resolution (stamp a resolvable shard hint into the
+  session id at mint).
 
-### GATE 0 — bake in NOW (cheap today, needs a cross-DO data migration later)
+## Register (B): simplicity / honesty debts to remove (no "later")
 
-There is **no `schema_version` column, no version envelope, and no
-`applied_migrations` ledger anywhere in `src/net`/`src/worker/net`** — and
-DO class table shapes freeze under `cf-do-0004` the moment the namespace
-holds state (no cross-DO data-migration tool exists; only per-DO recreate
-idioms like the `net_scope_subscribers` PK rebuild). So every one of these
-is ~minutes now and a per-DO-recreate-under-load (or impossible) later:
+Hidden complexity or claims that break once state is live.
 
-1. **Stamp `schema_version`** in `net_scope_meta` and a new
-   `net_gateway_meta` at construction (`v:1`). One row each. Opens the door
-   for ALL future durable evolution and doubles as the migration ledger.
-   Today an incompatible shape change to `net_scope_*` (authority, not
-   rebuildable) has no branch point and no rebuild.
-2. **Decide the `catalog_epoch` policy** before data exists. Today a store
-   epoch mismatch is a **hard throw** on hydration (`scope.ts:203-207`,
-   "refuse until that path exists") and a live mismatch is terminal
-   `E_EPOCH_MISMATCH` with no walk-forward wired (M6 spec-version migration
-   deferred). First deploy is uniform so it can't bite yet — but decide
-   refuse-vs-reseed now, and adopt the rule: never bump epoch + change cell
-   shapes in one deploy without an ordered scope walk.
-3. **Consume the `catalog_epoch` already returned by `/net/head`**
-   (`gateway-do.ts` discards it at :513/:779/etc.). One-line change: turns a
-   future epoch-skew from a per-turn plan→submit→reseed budget-grind into an
-   immediate fail-fast/reseed signal. Highest-leverage code hedge for the
-   second deploy, free to land now.
-4. **Presence query by scope.** The `owner` column already exists on
-   `net_gateway_relation`; push the room filter into SQL (add
-   `AND owner = ?` / index `(relation, owner)`) so `pushObservations` stops
-   being whole-table. Few lines, removes the fanout cliff without any
-   topology change, and fixes the query shape before data.
-5. **Outbox + scheduled due-time schema.** Add `next_attempt_at_ms` +
-   indexed due queries to `net_scope_outbox` and a due-time index to
-   `net_scope_scheduled` NOW (columns/indexes are frozen by cf-do-0004
-   once live). The bounded-batch *logic* (Gate 1) can follow; the *columns*
-   should exist before data.
-6. **Freeze the v1 wire/field-name contract + golden-hash test.** No
-   receiver checks the `.v1` `kind` tags (they're decorative) — evolution
-   MUST be additive-field, never a version-gate, and coherence correctness
-   is `cellVersion = hash(canonicalJson(value))` equality across two
-   independently-versioned CO5 copies. A serialization change to any cell
-   value silently breaks read-version equality → non-converging
-   `read_version_mismatch` → terminal `E_BUDGET`, world-wide, for the skew
-   window. Cheap hedge: a golden-hash test over `canonicalJson`/
-   `cellVersion` of representative cell values, and pin the `/net-api` + WS
-   field names (add-only, never rename).
-7. **Forbid no-expiry session cells at mint.** The reaper arms only on
-   `expiresAt` (`scope-do.ts:807-808` skips no-expiry); a no-expiry session
-   cell + its presence rows is never reaped and there is no external GC.
-   `/net-api` already clamps TTL, so assert `expiresAt` present on every
-   session cell to close the hole the internal seed path leaves open.
-8. **(Optional) shard hint in the session id** at mint, unused today, so a
-   future re-shard has a lineage to route on instead of a data migration.
+- **No `schema_version` / migration ledger anywhere** in `src/net`/
+  `src/worker/net`; authority tables (`net_scope_*`) are not rebuildable
+  and store bare JSON with no envelope. Stamp `v:1` in `net_scope_meta` +
+  a new `net_gateway_meta` at construction. Simpler and honest: one branch
+  point instead of probe-based bespoke migrations (e.g. the
+  `net_scope_subscribers` PK-rebuild idiom).
+- **`catalog_epoch` hard-throw hydration** (`scope.ts:203`, "refuse until
+  that path exists") + **`/net/head` discards the epoch it already
+  returns** (`gateway-do.ts:513/779`). Consume the epoch from `/net/head`
+  to fail fast / reseed instead of grinding a plan→submit→reseed budget to
+  terminal `E_BUDGET`; decide reseed-vs-refuse before any state exists.
+  Rule: never bump epoch + change cell shapes in one deploy without an
+  ordered scope walk.
+- **Decorative `.v1` kind tags** — no receiver checks them (grep confirms),
+  so evolution MUST be additive-field, never a version-gate. Coherence
+  correctness is `cellVersion = hash(canonicalJson(value))` equality across
+  two independently-versioned CO5 copies; a serialization change to any
+  cell value silently breaks read-version equality → non-converging
+  `read_version_mismatch` → terminal `E_BUDGET` world-wide for the skew
+  window. Add a golden-hash test over `canonicalJson`/`cellVersion` and
+  freeze the `/net-api` + WS field names (add-only, never rename).
+- **No-expiry session cells never reaped** — the reaper arms only on
+  `expiresAt` (`scope-do.ts:807`), and there is no external GC. Forbid
+  no-expiry session cells at mint (assert `expiresAt` present).
 
----
+## Ready-to-scale acceptance bar
 
-### GATE 1 — can bite the MEASUREMENT deploy itself (not scale-gated)
+What proves the small-world assumptions are actually gone: a net load gate
+(`load:net-dev`) asserting **asymptotic invariants** — not production SLOs —
+*before* deploy. There is none today; `load:cf-dev` is v2-oriented.
+Invariants to gate on:
 
-Amplifiers under outage/backlog/burst, and correctness holes — a small
-world can still hit these:
+- plan cost ~ turn read-set, **independent of view size**;
+- fanout scan rows ~ room occupants, **independent of total sessions**;
+- closure bytes/pages **bounded** on cold open;
+- outbox drain rows **bounded** under backlog.
 
-- **Outbox drain O(backlog) under a stuck destination** (scale #3). Drain
-  reads all pending for a route, retry scans all pending
-  (`scope-do.ts:1160/1280`, no index). A blocked planner/gateway turns
-  every later request/alarm into O(backlog) CPU. Needs bounded `LIMIT`
-  batches + due-indexed queries (schema from Gate 0.5) + a kill-switch.
-- **Scheduled burst in one alarm txn** (scale #5). All due rows moved to
-  outbox in one alarm (`scope-do.ts:632`); a due-burst can exceed one DO
-  turn budget. Needs bounded batch + immediate re-arm when more remains.
-- **Reaping holes** (topology #4): no-expiry sessions (Gate 0.7 closes it)
-  and abandoned foreign-presence removes (inert residue, documented).
-- **Cell-value hash drift** (wire R1) only bites on a *rolling* (second)
-  deploy, not the first uniform one — but the golden-hash test (Gate 0.6)
-  is the cheap pre-emptive guard.
+These are the deploy bar. The deploy ships when the invariants hold — not
+when a small seeded world happens to be fast.
 
----
+## Separate axis: cutover mechanics (not small-world assumptions)
 
-### GATE 2 — blocks SCALING TRAFFIC & the production CUTOVER (the measurement deploy exists to quantify these)
+Real pre-deploy items, orthogonal to (A)/(B), kept here so they are not
+lost:
 
-NOT blockers for a small-world measurement deploy; must be instrumented by
-it and resolved before real-size traffic/cutover:
+- **Irreversible cutover** — once the route flips and users write, rollback
+  discards all net-namespace writes (no delta-replay, by design). Keep the
+  write-freeze total and the bake window short.
+- **Frozen DO class identities** under `cf-do-0004` — treat class names and
+  `net_scope_*`/`net_gateway_*` table shapes as final before the namespace
+  holds data (which is *why* the register-(B) schema stamps and register-(A)
+  indexes must land first).
+- **Partial identity import** — well-guarded by abort-on-dangling; add a
+  count reconciliation vs live `$system.api_keys` cardinality so nothing is
+  silently excluded from the reachable-graph walk.
+- **SqliteHost dropped** — `host.ts:13` advertises a durable local-SQLite
+  net mode that has no implementation. Either implement it against the
+  existing seam or strike the claim before it becomes a support commitment.
 
-- **O(view) warm planning** (scale #1) — the headline debt. Real, confirmed
-  (`plan.ts:94/98`), contradicts coherence.md:356. Small on a small world;
-  quantify the view-size→latency slope at staging. Fix = slice-based
-  planning before scaling. This is the O(world) regression the whole
-  rebuild was meant to erase and hasn't yet.
-- **O(sessions) presence scan** (scale #2 / topology #1) — quantify at
-  staging; Gate 0.4 is the cheap partial hedge.
-- **Unpaged synchronous full closure** on cold open/first turn (scale #4):
-  `keys:["*"]` reseed enumerates all store keys + relations. Quantify;
-  page/target the client-warming path later, reserve full closure for
-  repair with byte/page budgets.
-- **Single shard, no online re-shard for LIVE sessions** (topology #1):
-  session ids carry no lineage, so a new shard can't resolve an existing
-  session's cell. Only drain-by-TTL works. Downstream of the spine.
-- **Irreversible cutover** (topology #2): once the route flips and users
-  write, rollback discards all net-namespace writes (no delta-replay, by
-  design). Accepted/documented; keep the write-freeze total and the bake
-  window short.
-- **Frozen DO class identities** (topology #3), **SqliteHost dropped /
-  doc-false** for non-CF self-hosting (topology #5), **partial identity
-  import** (topology #6, well-guarded by abort-on-dangling).
-
----
-
-### GATE 3 — the meta-gap: no net load gate (scale #6)
-
-There is **no net-specific asymptotic/load gate**; `load:cf-dev` is
-v2-oriented. Before the measurement deploy's numbers can be *trusted or
-gated on*, add `load:net-dev`: vary rooms / sessions / off-room presence /
-cold gateway open / outbox backlog / scheduled burst, and assert
-**asymptotic invariants first** (plan cost ~ read-set not view; fanout scan
-rows ~ room occupants not total sessions; closure bytes bounded; outbox
-drain rows bounded) — not production SLOs. This arguably PRECEDES the
-measurement deploy: it gives the deploy invariants to check against, and
-several invariants (presence scan bounded, plan slice bounded) are exactly
-the Gate-2 items the deploy is meant to characterize.
-
-## Recommended sequencing
-
-1. **Gate 0** (bake-in-now, cheap, before any namespace holds data) — do
-   these on `net-predeploy` before the staging deploy.
-2. **Gate 3** `load:net-dev` with asymptotic invariants — before or
-   alongside the measurement deploy, so its numbers mean something.
-3. **Measurement staging deploy** — small world, instrumented; quantify the
-   Gate-2 slopes (view size, presence scan, closure bytes) and confirm Gate
-   1 amplifiers don't wedge.
-4. **Gate 1** bounded batches/kill-switches — before any deploy that could
-   see a stuck destination or a due-burst (arguably before staging).
-5. **Gate 2** slice-based planning → then shard — the pre-cutover project;
-   the measurement deploy sizes it.
-
-Nothing here re-opens the v2 freeze. Gate 0 + Gate 3 are the
-option-preserving, cheap-now work; the reviewer's "Blocker" (#1) is a
-cutover/scale blocker the measurement deploy is designed to measure, not a
-blocker for that deploy — provided it stays small-world and instrumented.
+Nothing here reopens the v2 freeze. This IS the simplest-system direction —
+carried through into the first deploy instead of deferred past it.
