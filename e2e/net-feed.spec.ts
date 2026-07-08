@@ -42,13 +42,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ChildProcess } from "node:child_process";
 import {
-  ANNEX,
   CLIENT_KEY_A,
   CLIENT_KEY_B,
-  ROOM,
   dumpLaneFixture,
   findFreePort,
-  post,
   seedPartitions,
   startWorkerd,
   stopWorkerd,
@@ -95,13 +92,13 @@ test.beforeAll(async () => {
   await waitReady(base);
 
   // 3. Seed the derived partitions through the /net-smoke doorway (the
-  //    shared fixture idiom), then subscribe the client-facing `net-api`
-  //    shard to both rooms: the ROOM feeds contents reads, the ANNEX
-  //    refan carries the sessions' presence rows (the WS push audience)
-  //    and its commit fanout carries the wave observations.
+  //    shared fixture idiom). The client-facing `net-api` shard is NOT
+  //    subscribed here: H1 self-subscribe registers it to the
+  //    room/cluster scopes each client session touches (session-open +
+  //    each turn's anchor — NetGatewayDO.selfSubscribe), so peer
+  //    observation push and the contents/presence roster reads work
+  //    without the manual doorway subscribe this used to need.
   await seedPartitions(base, fixture.partitions);
-  await post(base, "scope", ROOM, "subscribe", { destination: "gateway:net-api" });
-  await post(base, "scope", ANNEX, "subscribe", { destination: "gateway:net-api" });
 });
 
 test.afterAll(async () => {

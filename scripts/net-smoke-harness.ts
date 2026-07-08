@@ -23,8 +23,23 @@ import { createInterface } from "node:readline";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { signInternalRequest } from "../src/worker/internal-auth";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+/** H1(b): the /net-smoke doorway now REQUIRES a signed internal request
+ * (worker index handleNetSmoke), so it can never be an unauthenticated
+ * seeding surface on a reachable deploy. The lane holds the same secret
+ * wrangler.smoke.toml sets and signs every doorway call. Kept in lockstep
+ * with wrangler.smoke.toml's WOO_INTERNAL_SECRET var. */
+const NET_SMOKE_INTERNAL_SECRET = "local-smoke-internal-secret";
+const signEnv = { WOO_INTERNAL_SECRET: NET_SMOKE_INTERNAL_SECRET };
+
+/** Sign a doorway Request with the lane's internal secret and fetch it. */
+async function signedFetch(url: string, init: RequestInit): Promise<Response> {
+  const signed = await signInternalRequest(signEnv, new Request(url, init));
+  return fetch(signed);
+}
 
 export const EPOCH = "cat-net-lane-1";
 // CO15 derived scope names: the DO namespace key IS the scope name.
@@ -199,7 +214,7 @@ export async function postRaw(
   route: string,
   body: unknown
 ): Promise<{ status: number; body: unknown }> {
-  const response = await fetch(`${base}/net-smoke/${kind}/${name}/${route}`, {
+  const response = await signedFetch(`${base}/net-smoke/${kind}/${name}/${route}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body)
@@ -214,7 +229,7 @@ export async function post<T>(base: string, kind: string, name: string, route: s
 }
 
 export async function get<T>(base: string, kind: string, name: string, route: string): Promise<T> {
-  const response = await fetch(`${base}/net-smoke/${kind}/${name}/${route}`);
+  const response = await signedFetch(`${base}/net-smoke/${kind}/${name}/${route}`, { method: "GET" });
   const decoded = (await response.json()) as T;
   if (!response.ok) throw new Error(`GET /net-smoke/${kind}/${name}/${route} failed: ${response.status}`);
   return decoded;

@@ -11,7 +11,7 @@
 // Everything else                                → env.ASSETS.fetch (the bundled SPA from ./dist).
 
 import type { Env } from "./persistent-object-do";
-import { signInternalRequest } from "./internal-auth";
+import { signInternalRequest, verifyInternalRequest } from "./internal-auth";
 import { sessionActiveScopeFromRecord, wooError } from "../core/types";
 import { handleAdmin } from "./admin";
 import { resolveNetDestination, type NetBindingsEnv } from "./net/workerd-host";
@@ -52,6 +52,19 @@ export default {
   async fetch(request: Request, env: Env, _ctx: unknown): Promise<Response> {
     const url = new URL(request.url);
 
+    // Capture the request BEFORE sanitization for the one caller that must
+    // read the inbound internal signature: the /net-smoke doorway (H1b).
+    // sanitizePublicHeaders strips every x-woo-internal-* header, so the
+    // signature cannot survive into handleNetSmoke otherwise. We must
+    // CLONE, not alias: sanitizePublicHeaders builds `new Request(request,
+    // …)`, which disturbs (locks) the original's body stream — a POST
+    // doorway call would then fail its body read with "stream locked to a
+    // reader" on real workerd (the fake lane never surfaced it). The clone
+    // has an independent, unlocked body. Only pay the clone for the
+    // /net-smoke path; every other request aliases as before.
+    const isNetSmoke = url.pathname.startsWith("/net-smoke/");
+    const rawRequest = isNetSmoke ? request.clone() : request;
+
     // Strip any x-woo-internal-* / x-woo-host-key the public client tried to
     // inject; those headers are reserved for trusted gateway → DO forwarding.
     request = sanitizePublicHeaders(request);
@@ -74,8 +87,17 @@ export default {
     // set only by the deploy configs (the same runtime posture as
     // parseNetFaults), so on a deploy the surface 404s indistinguishably
     // from any other unknown route.
-    if (url.pathname.startsWith("/net-smoke/")) {
-      return handleNetSmoke(request, env, url);
+    //
+    // H1b passes the RAW (pre-sanitize) request so the doorway can verify
+    // the inbound internal signature — the sanitized copy has none. This
+    // is safe: (1) the deploy-404 fires first, so a deployed environment
+    // never reaches verification with the raw request; (2) verification
+    // rejects anyone without WOO_INTERNAL_SECRET; (3) handleNetSmoke
+    // rebuilds a FRESH forward request to the DO (it never propagates an
+    // inbound header), so an injected x-woo-host-key etc. is dropped, not
+    // trusted. The proving lanes hold the secret and sign every call.
+    if (isNetSmoke) {
+      return handleNetSmoke(rawRequest, env, url);
     }
 
     // Plan 002 Phase 4 item 2: the coherence layer's PRODUCTION client
@@ -565,6 +587,23 @@ async function handleNetSmoke(request: Request, env: Env, url: URL): Promise<Res
   if (env.WOO_AE_DATASET !== undefined) {
     // Deployed environment: refuse with a plain 404 (no hint the route exists).
     return jsonResponse({ error: { code: "E_OBJNF", message: `no such route: ${url.pathname}` } }, 404);
+  }
+  // H1(b): the doorway must NEVER be an unauthenticated seeding/admin
+  // surface. The WOO_AE_DATASET 404 above hides it on the deploy
+  // profile, but a reachable environment that merely lacked that var
+  // would expose /net/seed and friends to anyone. Require the internal
+  // signature on the INBOUND request too — the local proving lanes hold
+  // WOO_INTERNAL_SECRET and sign (net-smoke-harness.ts); nobody else can.
+  // Defense in depth: both the deploy-404 AND the signature gate. NOTE:
+  // `request` here is the RAW pre-sanitize request (the fetch entry hands
+  // it in specifically for this check); the sanitized copy has no
+  // signature headers. Safe because the fresh forward below never
+  // propagates an inbound header to the DO — see the fetch-entry comment.
+  const netEnvForAuth = env as unknown as NetBindingsEnv;
+  try {
+    await verifyInternalRequest(netEnvForAuth, request);
+  } catch (err) {
+    return jsonResponse({ error: { code: "E_NOSESSION", message: `net-smoke requires a signed internal request: ${errorMessage(err)}` } }, 401);
   }
   const parts = url.pathname.split("/").filter(Boolean); // ["net-smoke", kind, name, ...route]
   const kind = parts[1];

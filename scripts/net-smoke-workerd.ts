@@ -121,17 +121,12 @@ async function main(): Promise<number> {
     await seedAndPull(base);
     await post(base, "scope", ROOM, "subscribe", { destination: `gateway:${GATEWAY}` });
     // The annex refans the CO14 presence delta (delivered via /net/relate)
-    // to ITS subscribers — the gateway must subscribe there too.
+    // to ITS subscribers — the internal lane gateway must subscribe there
+    // too. (The CLIENT-surface `net-api` shard no longer subscribes here:
+    // H1 self-subscribe now registers it to the room/cluster scopes each
+    // client session touches — see NetGatewayDO.selfSubscribe. This lane
+    // is the proof that the manual client-shard subscribe is retired.)
     await post(base, "scope", ANNEX, "subscribe", { destination: `gateway:${GATEWAY}` });
-    // Phase-4 client surface: the worker entry routes /net-api/* to the
-    // stable `net-api` gateway shard; subscribing that shard to the ROOM
-    // feeds its relation mirror (the client roster read below) with the
-    // cross-scope move's contents refan.
-    await post(base, "scope", ROOM, "subscribe", { destination: "gateway:net-api" });
-    // Item 3: the annex feeds the client shard too — its refans carry the
-    // client sessions' presence rows (the WS push audience) and its
-    // commit fanout carries the wave observations the push delivers.
-    await post(base, "scope", ANNEX, "subscribe", { destination: "gateway:net-api" });
     step(`seed ${pullCount} partitions + subscribe room/annex + pull ${pullCount}`, true);
 
     // Warm derived-topology turns: the CO10 structure gate at lane

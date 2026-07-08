@@ -153,7 +153,7 @@ function frames(server: FakeWebSocket): Array<Record<string, unknown>> {
 
 type Harness = Awaited<ReturnType<typeof buildHarness>>;
 
-async function buildHarness() {
+async function buildHarness(gatewayEnvExtra: Partial<NetGatewayEnv> = {}) {
   // Engine-real fixture, mirroring net-client-api.test.ts plus the
   // presence pieces: a home room with an observing box, a second room
   // (the "annex") reachable by a presence-gate-skipping :welcome (the
@@ -262,7 +262,7 @@ async function buildHarness() {
   }
 
   const gatewayState = netState("gateway-net-api", deferred);
-  const gatewayEnv: NetGatewayEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve };
+  const gatewayEnv: NetGatewayEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve, ...gatewayEnvExtra };
   gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
   states.push(gatewayState);
 
@@ -449,6 +449,60 @@ describe("/net-api/ws socket surface (Phase 4 item 3 chunk 1)", () => {
     expect(refused).toMatchObject({ type: "turn_result", id: "rate1", status: 429, error: { code: "E_RATE" } });
     // The socket survives the refusal (a throttle is not a protocol error).
     expect(server.readyState).toBe(1);
+
+    h.close();
+  });
+});
+
+describe("gateway self-subscribe (H1)", () => {
+  it("auto-subscribes the gateway to the scopes a session touches, so peer push works with NO manual subscribe", async () => {
+    // NET_GATEWAY_SELF set, and — crucially — NO h.subscribe() call
+    // anywhere: the gateway must register itself to the annex on its own
+    // (session-open → cluster; each turn's anchor → the active scope),
+    // which is exactly what H1 replaces the lane's manual subscribe with.
+    const h = await buildHarness({ NET_GATEWAY_SELF: "gateway:net-api" });
+    const token = `apikey:${KEY_ID}:${KEY_SECRET}`;
+
+    const s1 = await h.mint(); // submitter
+    const s2 = await h.mint(); // peer present in the annex → MUST receive
+    const enter = async (sid: string, key: string): Promise<void> => {
+      const entered = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+        token,
+        body: { target: "ws_annex", verb: "welcome", session: sid, idempotency_key: key }
+      });
+      expect(entered.status, JSON.stringify(entered.body)).toBe(200);
+      expect((entered.body.reply as { status?: string })?.status).toBe("accepted");
+    };
+    await enter(s1, "h1-enter-1");
+    await enter(s2, "h1-enter-2");
+    await h.settle();
+
+    // The mirror learned the annex audience purely via self-subscribe +
+    // the pull-after-subscribe / live refans (no doorway subscribe).
+    const roster = await clientFetch(h.gateway, "GET", `/net-api/relation?session=${s1}&relation=session_presence&owner=ws_annex`, {
+      token
+    });
+    const members = (roster.body.members as Array<{ member: string }>).map((row) => row.member);
+    expect(members).toEqual(expect.arrayContaining([s1, s2]));
+
+    const a = await upgrade(h, s1);
+    const b = await upgrade(h, s2);
+    expect(a.status).toBe(101);
+    expect(b.status).toBe(101);
+    const socketA = a.server as FakeWebSocket;
+    const socketB = b.server as FakeWebSocket;
+
+    await h.gateway.webSocketMessage(
+      socketA as unknown as WebSocket,
+      JSON.stringify({ type: "turn", id: "h1w1", target: "ws_wave_box", verb: "wave", idempotency_key: "h1-wave-1" })
+    );
+    await h.settle();
+
+    // The peer received the push — proving the self-subscription carried
+    // the annex fanout to this shard.
+    const peerObservations = frames(socketB).filter((frame) => frame.type === "observations");
+    expect(peerObservations).toHaveLength(1);
+    expect((peerObservations[0].observations as Array<{ type?: string }>).map((o) => o.type)).toContain("waved");
 
     h.close();
   });

@@ -118,6 +118,14 @@ export type NetGatewayEnv = NetBindingsEnv & {
   /** KV seeds (CO5 copy #3). Optional: without the binding, /net/pull is
    * always the live-closure path. */
   HOST_SEED_KV?: NetSeedKV;
+  /** H1: THIS gateway's own rpc destination (e.g. `gateway:net-api`) —
+   * the name a scope fans out to. Set on the CLIENT-surface shard so a
+   * client session auto-subscribes this gateway to the scopes it touches
+   * (selfSubscribe); peer observation push then works without any
+   * external /net/subscribe call. Unset on the internal /net/turn lane
+   * path and on unit fixtures that wire subscribers by hand — where
+   * self-subscribe is a no-op (backward compatible). */
+  NET_GATEWAY_SELF?: string;
 };
 
 function sqlRows<T>(cursor: unknown): T[] {
@@ -291,6 +299,13 @@ export class NetGatewayDO {
    * observation posture (kickoff rule).
    */
   private readonly recentClientTurns = new Map<string, string>();
+
+  /** H1: scopes this gateway has self-subscribed this lifetime (avoids a
+   * re-subscribe RPC + re-pull per turn). Per-isolate memory: after
+   * eviction it starts empty and the first touch re-subscribes
+   * (idempotent server-side) — a dropped entry costs one redundant
+   * subscribe/pull, never a lost subscription. */
+  private readonly selfSubscribed = new Set<string>();
 
   /** H4 token buckets, PER-ISOLATE by design (see rate-limit.ts header):
    * `clientRate` covers every authenticated /net-api operation (REST +
@@ -1181,6 +1196,11 @@ export class NetGatewayDO {
       // recovery is simply to retry.
       return json({ error: { code: "E_RETRY", message: "session mint did not commit; retry", detail: opened.reply } }, 503);
     }
+    // H1: subscribe this gateway to the actor's CLUSTER — the session's
+    // authority scope, where its cell and any cluster-committed
+    // observations live. (Room subscriptions follow as the session's
+    // turns anchor there; see clientTurn.)
+    await this.selfSubscribe(opened.scope);
     const value = opened.value as { expiresAt?: number } | null;
     return json({
       session,
@@ -1261,6 +1281,21 @@ export class NetGatewayDO {
       catalog_epoch: epoch,
       idempotency_key: key
     });
+    // H1: keep this gateway subscribed to the scope the session is NOW
+    // present in — its activeScope AFTER any transition this turn folded
+    // (install-on-accept already refreshed the session cell in the view).
+    // A room-entering turn plans at the OLD anchor but lands the session
+    // in the NEW room, so subscribing to the post-turn active scope is
+    // what makes the peer push for that room reach this shard's sockets.
+    // Best-effort (selfSubscribe swallows failures); it must never turn a
+    // committed turn into an error.
+    if (result.reply.status === "accepted") {
+      const settled = this.ensureView().get(sessionCellKey(session))?.value as
+        | { activeScope?: string | null }
+        | undefined;
+      const settledScope = settled?.activeScope ?? null;
+      if (settledScope) await this.selfSubscribe(await this.clientPlanningScope(settledScope, actor));
+    }
     // Terminal rejections return as 200 TurnResults (same as /net/turn):
     // the reply names its verdict; thrown taxonomy errors (E_BUDGET etc.)
     // surface through the clientApi catch instead.
@@ -1568,6 +1603,39 @@ export class NetGatewayDO {
    * whose head never advanced records no high-water and re-pulls per
    * request — redundant but harmless.
    */
+  /**
+   * H1: subscribe THIS gateway to a scope's fanout so peer observation
+   * push reaches its sockets — WITHOUT any external /net/subscribe call
+   * (the lane doorway's manual subscribe, now retired for the client
+   * shard). Idempotent server-side (`net_scope_subscribers` is
+   * `ON CONFLICT DO NOTHING`); a no-op when `NET_GATEWAY_SELF` is unset
+   * (internal /net/turn lane path and hand-wired unit fixtures).
+   *
+   * On the FIRST subscribe to a scope this lifetime a PULL follows: a
+   * full closure carries the scope's current relation rows (CO13), so a
+   * session subscribing AFTER peers are already present still sees their
+   * presence rows in the mirror (a later commit's fanout carries only
+   * ITS own deltas, never the standing roster — the pull is what
+   * back-fills it). Best-effort: a failed subscribe/pull is a named
+   * metric, never a thrown turn error; the scope is dropped from the
+   * memoized set so the next touch retries.
+   */
+  private async selfSubscribe(scope: string): Promise<void> {
+    const self = this.env.NET_GATEWAY_SELF;
+    if (!self || this.selfSubscribed.has(scope)) return;
+    this.selfSubscribed.add(scope);
+    try {
+      await this.host.rpc(`scope:${scope}`, "/subscribe", { destination: self });
+      await this.pull({ scope, destination: `scope:${scope}` });
+    } catch (err) {
+      this.selfSubscribed.delete(scope);
+      console.log(
+        "woo.metric",
+        JSON.stringify({ kind: "net_self_subscribe_failed", scope, error: String(err), ts: Date.now() })
+      );
+    }
+  }
+
   private async warmScopes(scopes: Iterable<string>, metricKind: string): Promise<void> {
     this.ensureView(); // hydrates the `seen` high-water map alongside the view
     for (const scope of new Set(scopes)) {
