@@ -561,6 +561,20 @@ describe("observation push via session_presence (Phase 4 item 3 chunk 2)", () =>
     const socketB = b.server as FakeWebSocket;
     const socketC = c.server as FakeWebSocket;
 
+    // Phase 2 invariant: capture the net_presence_scan metric to prove the
+    // presence fanout scanned only the TARGET scope's occupants (O(occupants)),
+    // never the off-scope s3 or a whole-table sweep.
+    const scanRows: number[] = [];
+    const logSpy = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+      if (args[0] === "woo.metric" && typeof args[1] === "string" && args[1].includes("net_presence_scan")) {
+        try {
+          scanRows.push((JSON.parse(args[1] as string) as { presence_scan_rows: number }).presence_scan_rows);
+        } catch {
+          /* not the metric we want */
+        }
+      }
+    });
+
     // s1 waves over ITS socket; the commit's fanout (annex scope, with
     // the turn id riding — src/net/outbox.ts FanoutBody.turn_id) then
     // fans to the subscribed mirror.
@@ -596,6 +610,14 @@ describe("observation push via session_presence (Phase 4 item 3 chunk 2)", () =>
     // annex session (s4) was skipped silently — the push neither threw
     // nor blocked the peer delivery, which the s2 assertion above proves.
     expect(frames(socketC).filter((frame) => frame.type === "observations")).toHaveLength(0);
+
+    // Phase 2 invariant: the fanout scan touched exactly the ANNEX
+    // occupants (s1, s2, s4 — three rows), NOT the off-scope s3, and never
+    // the whole session_presence table. This is the O(occupants) property
+    // the owner_scope index gives: adding sessions in OTHER scopes cannot
+    // grow this count.
+    logSpy.mockRestore();
+    expect(scanRows).toEqual([3]);
 
     h.close();
   });

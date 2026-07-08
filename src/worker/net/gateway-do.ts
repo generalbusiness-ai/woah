@@ -386,7 +386,23 @@ export class NetGatewayDO {
     // to keep coherent. Columns denormalize the row for the
     // (relation, owner) query; `body` is the row's JSON body or NULL.
     state.storage.sql.exec(
-      "CREATE TABLE IF NOT EXISTS net_gateway_relation (key TEXT PRIMARY KEY, relation TEXT NOT NULL, owner TEXT NOT NULL, member TEXT NOT NULL, body TEXT)"
+      "CREATE TABLE IF NOT EXISTS net_gateway_relation (key TEXT PRIMARY KEY, relation TEXT NOT NULL, owner TEXT NOT NULL, member TEXT NOT NULL, body TEXT, owner_scope TEXT)"
+    );
+    // Phase 2: `owner_scope` is the scope the owner belongs to, MATERIALIZED
+    // at write time — a fanout carries a SCOPE name (`room:ws_annex`) but the
+    // relation owner is an OBJECT id (`ws_annex`), so the presence fanout
+    // filters on `owner_scope` to stay O(occupants), never scanning every
+    // session_presence row and classifying each in JS. Additive-column
+    // migration for a table created before it (before-data everywhere today;
+    // idempotent). A legacy row's NULL owner_scope simply misses the indexed
+    // filter until the next fanout/pull rewrites it — the same self-heal a
+    // stale mirror row already has.
+    const relationColumns = sqlRows<{ name: string }>(state.storage.sql.exec("PRAGMA table_info(net_gateway_relation)"));
+    if (!relationColumns.some((column) => column.name === "owner_scope")) {
+      state.storage.sql.exec("ALTER TABLE net_gateway_relation ADD COLUMN owner_scope TEXT");
+    }
+    state.storage.sql.exec(
+      "CREATE INDEX IF NOT EXISTS net_gateway_relation_scope ON net_gateway_relation (relation, owner_scope)"
     );
     // Selection pinning (fix 5c): idempotency_key → the scope the FIRST
     // submit for that key targeted. A re-plan (same key, refreshed view)
@@ -1667,14 +1683,22 @@ export class NetGatewayDO {
     const getSockets = this.state.getWebSockets?.bind(this.state);
     if (!getSockets) return; // runtime without a WS surface (structural fakes)
     if (!Array.isArray(body.observations) || body.observations.length === 0) return;
-    const rows = sqlRows<{ member: string; owner: string }>(
-      this.state.storage.sql.exec("SELECT member, owner FROM net_gateway_relation WHERE relation = 'session_presence'")
+    // Phase 2: filter by the materialized owner_scope (indexed) so the scan
+    // is O(occupants of body.scope), NOT O(all mirrored sessions). The
+    // owner→scope classification happened once at write time (ownerScopeFor).
+    const rows = sqlRows<{ member: string }>(
+      this.state.storage.sql.exec(
+        "SELECT member FROM net_gateway_relation WHERE relation = 'session_presence' AND owner_scope = ?",
+        body.scope
+      )
+    );
+    // Load-gate evidence (CO10): rows scanned must track occupants, flat as
+    // total off-scope sessions grow.
+    console.log(
+      "woo.metric",
+      JSON.stringify({ kind: "net_presence_scan", scope: body.scope, presence_scan_rows: rows.length, ts: Date.now() })
     );
     if (rows.length === 0) return;
-    const view = this.ensureView();
-    const classifier = classifierFromLineage(
-      (object) => (view.get(cellKey("object_lineage", object))?.value as AnchorLineage | undefined) ?? null
-    );
     const frame = JSON.stringify({
       type: "observations",
       scope: body.scope,
@@ -1682,13 +1706,6 @@ export class NetGatewayDO {
       observations: body.observations
     });
     for (const row of rows) {
-      let ownerScope: string | null;
-      try {
-        ownerScope = classifier.scopeOf(row.owner);
-      } catch {
-        ownerScope = null; // lineage not in view — the convention check decides
-      }
-      if (ownerScope !== body.scope && `room:${row.owner}` !== body.scope) continue;
       if (body.turn_id !== undefined && this.recentClientTurns.get(body.turn_id) === row.member) continue;
       for (const ws of getSockets(row.member)) {
         try {
@@ -2363,15 +2380,36 @@ export class NetGatewayDO {
     const key = relationKey(delta.row.relation, delta.row.owner, delta.row.member);
     if (delta.op === "add") {
       this.state.storage.sql.exec(
-        "INSERT INTO net_gateway_relation (key, relation, owner, member, body) VALUES (?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET body = excluded.body",
+        "INSERT INTO net_gateway_relation (key, relation, owner, member, body, owner_scope) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET body = excluded.body, owner_scope = excluded.owner_scope",
         key,
         delta.row.relation,
         delta.row.owner,
         delta.row.member,
-        delta.row.body !== undefined ? JSON.stringify(delta.row.body) : null
+        delta.row.body !== undefined ? JSON.stringify(delta.row.body) : null,
+        this.ownerScopeFor(delta.row.owner)
       );
     } else {
       this.state.storage.sql.exec("DELETE FROM net_gateway_relation WHERE key = ?", key);
+    }
+  }
+
+  /** Phase 2: the scope a relation owner belongs to, computed ONCE at write
+   * time (the presence fanout then filters on it, O(occupants), instead of
+   * classifying every session_presence row per fanout). The CO15
+   * view-lineage classifier, with the `room:<owner>` naming convention as
+   * the fallback for an owner whose lineage this view has not pulled — the
+   * same owner→scope rule the fanout scan used inline. For a presence
+   * owner (a $space) both coincide, so the stored value is stable across a
+   * later lineage pull. */
+  private ownerScopeFor(owner: string): string {
+    const view = this.ensureView();
+    const classifier = classifierFromLineage(
+      (object) => (view.get(cellKey("object_lineage", object))?.value as AnchorLineage | undefined) ?? null
+    );
+    try {
+      return classifier.scopeOf(owner);
+    } catch {
+      return `room:${owner}`;
     }
   }
 
