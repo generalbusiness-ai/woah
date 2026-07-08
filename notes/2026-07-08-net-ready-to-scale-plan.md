@@ -90,6 +90,24 @@ them, every turn → O(view). Make it O(read-set):
   lineage seed covers the common case; the bounded repair budget covers the
   tail; the load gate quantifies cold-round count.
 
+REVIEW BLOCKER #1 (2026-07-08, OPEN — the warm turn is still O(view)): slice
+planning bounds the planner INPUT (plan_cells 997 flat), but the surrounding
+turn machinery still has O(view) passes: the fix-6 `view.clone()` snapshot
+(plan.ts), the scratch post-state clone (scratchAuthorityFrom), the
+`catalogKnownKeys` view.keys() scan (gateway), and the seed session-scan
+(plan.ts, added in Phase 1). load:net-dev now MEASURES this: snapshot_cells
+1256→2156 (O(view)) alongside plan_cells 997 flat, and carries an
+`it.fails` invariant documenting the gap in the gate. The fix requires the
+CellStore (gateway view) to carry OBJECT and SESSION indexes so a slice can
+be extracted in O(seed) — `cellsForObject` and the session-scan are O(view)
+today. Then: snapshot = view-index-backed slice-clone (grown from the live
+view on a miss, install-copy for fix-6); scratch/catalogKnownKeys operate on
+the slice; remove `it.fails`. This is a core-data-structure change (CellStore
+indexes touch every consumer) — a focused pass, not a tail-of-session rush.
+Also landed from the same review: relation read indexes (member;
+owner,member), load:net-dev wired into deploy.sh, stale slicePlanning comment
+fixed.
+
 STATUS (2026-07-08, FINAL): **PHASE 1 COMPLETE — slice planning is ON**
 (commit `647853d`). All gates green with slicing enabled: typecheck; npm
 test 749; test:worker 359 (load gate rejoined); smoke:net-dev 24/24 (real
