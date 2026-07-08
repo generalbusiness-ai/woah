@@ -404,6 +404,83 @@ describe("NetFeed reconnect", () => {
   });
 });
 
+describe("NetFeed session re-mint (M10)", () => {
+  /** A session route that hands out s_1, s_2, … on each mint, and a
+   * ws-ticket route whose behaviour is caller-controlled per session id. */
+  function expiringSessionRoutes(ticketFor: (session: string) => { status?: number; body: unknown }) {
+    const state = { sessionMints: 0 };
+    return {
+      state,
+      routes: {
+        "POST /net-api/session": () => {
+          state.sessionMints += 1;
+          return { body: { session: `s_${state.sessionMints}`, actor: "#alice", expires_at: 999, scope: "cluster:#alice" } };
+        },
+        "POST /net-api/ws-ticket": (call: FetchCall) => ticketFor(String((call.body as { session?: string }).session))
+      } as Record<string, (call: FetchCall) => { status?: number; body: unknown }>
+    };
+  }
+
+  it("re-mints ONCE when the ws-ticket mint 401s on an expired session, then recovers to open", async () => {
+    // s_1's ticket mint fails as if the session expired; the fresh s_2
+    // mints a ticket fine. The treadmill (re-ticketing a dead session
+    // forever) is replaced by a single re-mint + retry.
+    const { state, routes } = expiringSessionRoutes((session) =>
+      session === "s_1"
+        ? { status: 401, body: { error: { code: "E_NOSESSION", message: "session expired" } } }
+        : { body: { ticket: "wst_ok", expires_at: 999 } }
+    );
+    const { feed } = feedWith(routes);
+    await feed.open();
+    await tick(); // the re-mint's recursive connectSocket mints the s_2 ticket
+    expect(state.sessionMints).toBe(2); // re-minted exactly once
+    expect(feed.state().session).toBe("s_2");
+    expect(FakeSocket.instances).toHaveLength(1); // only the s_2 attempt built a socket
+    FakeSocket.instances[0].open();
+    expect(feed.state().connection).toBe("open");
+    expect(feed.state().error).toBeNull();
+  });
+
+  it("gives up with a surfaced terminal error when the re-mint makes no progress (revoked credential)", async () => {
+    // Every session's ticket mint 401s: s_1 → re-mint s_2 → still 401 →
+    // a second re-mint would spin, so the feed terminates instead. The
+    // credential, not the session, is dead.
+    const { state, routes } = expiringSessionRoutes(() => ({
+      status: 401,
+      body: { error: { code: "E_NOSESSION", message: "session expired" } }
+    }));
+    const { feed } = feedWith(routes);
+    await feed.open();
+    await tick();
+    await tick();
+    expect(state.sessionMints).toBe(2); // one initial + exactly one re-mint, then stop
+    expect(feed.state().connection).toBe("closed");
+    expect(feed.state().error).toBeInstanceOf(NetFeedError);
+    expect(feed.state().error?.code).toBe("E_NOSESSION");
+    expect(FakeSocket.instances).toHaveLength(0); // never got past a ticket mint
+  });
+
+  it("re-mints once and retries a REST turn (same idempotency key) when the session expired mid-turn", async () => {
+    let turnCalls = 0;
+    const { state, routes } = expiringSessionRoutes(() => ({ body: { ticket: "wst", expires_at: 999 } }));
+    routes["POST /net-api/turn"] = () => {
+      turnCalls += 1;
+      return turnCalls === 1
+        ? { status: 401, body: { error: { code: "E_NOSESSION", message: "session expired" } } }
+        : { body: acceptedTurnResult() };
+    };
+    const { feed, calls } = feedWith(routes, { webSocket: false });
+    await feed.open();
+    const outcome = await feed.turn({ target: "#bob", verb: "wave" });
+    expect(outcome.status).toBe("accepted");
+    expect(state.sessionMints).toBe(2); // re-minted once under the in-flight turn
+    expect(feed.state().session).toBe("s_2");
+    const turnKeys = calls.filter((c) => c.path === "/net-api/turn").map((c) => (c.body as Record<string, unknown>).idempotency_key);
+    expect(turnKeys).toHaveLength(2);
+    expect(turnKeys[0]).toBe(turnKeys[1]); // CO2.5: same key across the retry
+  });
+});
+
 describe("NetFeed reads + cache", () => {
   it("caches relation reads and invalidates on an applied observations frame", async () => {
     const members = [{ member: "s_2", body: { actor: "#bob" } }];

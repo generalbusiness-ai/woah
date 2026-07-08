@@ -131,6 +131,12 @@ export type NetFeedState = {
   actor: string | null;
   /** The echo overlay, in submission order. */
   pending: readonly NetPendingTurn[];
+  /** M10: the terminal failure that stopped the feed, or null. Set when a
+   * session re-mint fails (a revoked credential, not a recoverable
+   * session/socket drop); cleared on any successful (re)mint and on
+   * open(). A consumer that sees a non-null error knows the feed will not
+   * reconnect on its own — it must fix the credential and open() again. */
+  error: NetFeedError | null;
 };
 
 /** One observation, as the feed emits it to subscribers.
@@ -216,6 +222,20 @@ export class NetFeed {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private closedByUser = false;
 
+  /** M10: the terminal failure that stopped the feed (surfaced on state),
+   * or null. Set by terminate(); cleared by a successful (re)mint. */
+  private lastError: NetFeedError | null = null;
+  /** M10: re-mints allowed between real progress signals. A live socket
+   * (onopen) or a settled turn resets it to 0; each re-mint increments it.
+   * A re-mint attempted at/past the cap without intervening progress is a
+   * dead credential (not an expired session) — it throws terminally rather
+   * than spinning the treadmill this whole item exists to kill. */
+  private remintStreak = 0;
+  private static readonly REMINT_STREAK_CAP = 1;
+  /** M10: coalesce concurrent re-mints (socket path + turn path) onto one
+   * POST /net-api/session. */
+  private remintInFlight: Promise<string> | null = null;
+
   /** The echo overlay (intent-pending; see the header). */
   private readonly pending = new Map<string, NetPendingTurn>();
   /** In-flight WS turn correlation: frame id → settle callbacks. */
@@ -264,7 +284,8 @@ export class NetFeed {
       connection: this.connection,
       session: this.session,
       actor: this.actor,
-      pending: [...this.pending.values()]
+      pending: [...this.pending.values()],
+      error: this.lastError
     };
   }
 
@@ -281,6 +302,10 @@ export class NetFeed {
    */
   async open(): Promise<{ session: string; actor: string }> {
     this.closedByUser = false;
+    // M10: a fresh open() clears any prior terminal failure and the
+    // re-mint bound — this is the consumer's deliberate restart.
+    this.lastError = null;
+    this.remintStreak = 0;
     const body = this.ttlMs !== undefined ? { ttl_ms: this.ttlMs } : {};
     const reply = (await this.fetchJson("POST", "/net-api/session", body)) as SessionReply;
     this.session = reply.session;
@@ -308,6 +333,69 @@ export class NetFeed {
       socket?.close();
     } catch {
       // A socket that never opened may throw on close; nothing to do.
+    }
+  }
+
+  /**
+   * M10: re-mint the session with the held apikey (a fresh session id),
+   * updating session/actor. Coalesces concurrent callers onto one POST so
+   * the socket path and a REST turn racing the same expiry mint once. The
+   * streak bound is the treadmill guard: a re-mint attempted at/past the
+   * cap with no intervening progress (a live socket or a settled turn)
+   * throws a terminal NetFeedError — that is a revoked credential, not an
+   * expired session, and retrying it forever is the exact loop this item
+   * removes. A successful mint clears any surfaced error.
+   */
+  private async remintSession(): Promise<string> {
+    if (this.remintInFlight) return this.remintInFlight;
+    if (this.remintStreak >= NetFeed.REMINT_STREAK_CAP) {
+      throw new NetFeedError(
+        "E_NOSESSION",
+        "session re-mint made no progress — the credential is likely revoked",
+        401
+      );
+    }
+    this.remintStreak += 1;
+    const attempt = (async (): Promise<string> => {
+      const body = this.ttlMs !== undefined ? { ttl_ms: this.ttlMs } : {};
+      const reply = (await this.fetchJson("POST", "/net-api/session", body)) as SessionReply;
+      this.session = reply.session;
+      this.actor = reply.actor;
+      this.lastError = null;
+      this.notifyState();
+      return reply.session;
+    })();
+    this.remintInFlight = attempt;
+    try {
+      return await attempt;
+    } finally {
+      this.remintInFlight = null;
+    }
+  }
+
+  /**
+   * M10: give up for good. Stop the reconnect loop, surface the error on
+   * state (onState subscribers see a non-null `error`), and mark the
+   * connection closed. Distinct from close() (user intent): the feed
+   * failed and the error says why. A later open() clears it.
+   */
+  private terminate(error: NetFeedError): void {
+    this.lastError = error;
+    this.closedByUser = true; // stop the reconnect loop (state.error tells them apart)
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    const socket = this.socket;
+    this.socket = null;
+    // notifyState even if the connection value is unchanged: the error is
+    // the news here, and setConnection would swallow a no-op transition.
+    this.connection = "closed";
+    this.notifyState();
+    try {
+      socket?.close();
+    } catch {
+      // A never-opened socket may throw on close.
     }
   }
 
@@ -387,6 +475,30 @@ export class NetFeed {
     verb: string,
     args: unknown[]
   ): Promise<Record<string, unknown>> {
+    try {
+      return await this.postTurn(turnId, target, verb, args);
+    } catch (err) {
+      // M10: the session expired under an in-flight REST turn. Re-mint
+      // once and retry with the SAME idempotency key — CO2.5 makes the
+      // retry safe (if the first attempt somehow committed, the gateway
+      // returns its recorded reply rather than re-executing). A re-mint
+      // past the streak cap throws terminally, surfacing to the caller.
+      if (err instanceof NetFeedError && err.code === "E_NOSESSION") {
+        await this.remintSession();
+        return await this.postTurn(turnId, target, verb, args);
+      }
+      throw err;
+    }
+  }
+
+  /** One POST /net-api/turn with the current session (M10 wraps this with
+   * a single re-mint+retry on E_NOSESSION). */
+  private async postTurn(
+    turnId: string,
+    target: string,
+    verb: string,
+    args: unknown[]
+  ): Promise<Record<string, unknown>> {
     return (await this.fetchJson("POST", "/net-api/turn", {
       target,
       verb,
@@ -403,6 +515,10 @@ export class NetFeed {
    * as source:"self".
    */
   private settleTurn(turnId: string, body: Record<string, unknown>): NetTurnOutcome {
+    // M10: a turn that reached the gateway and settled (accepted OR
+    // rejected) proves the session is live — real progress, so the
+    // re-mint bound resets.
+    this.remintStreak = 0;
     // A WS turn_result that carried an error object (or a REST error
     // status that somehow reached here) is a thrown failure, not a
     // settled outcome.
@@ -518,8 +634,32 @@ export class NetFeed {
     try {
       const reply = (await this.fetchJson("POST", "/net-api/ws-ticket", { session })) as { ticket: string };
       ticket = reply.ticket;
-    } catch {
-      if (this.session === session && !this.closedByUser) this.scheduleReconnect();
+    } catch (err) {
+      // Superseded by a re-open()/close() between the connect start and
+      // the mint reply — abandon this attempt silently.
+      if (this.session !== session || this.closedByUser) return;
+      // M10: a ticket mint that fails because the SESSION is gone
+      // (E_NOSESSION) is the treadmill this item kills — re-minting a
+      // ticket for a dead session forever. Re-mint the SESSION once, then
+      // retry the connect with the fresh id. A re-mint that throws (past
+      // the streak cap → a revoked credential) is terminal: stop the loop
+      // and surface it, rather than spin.
+      if (err instanceof NetFeedError && err.code === "E_NOSESSION") {
+        try {
+          await this.remintSession();
+        } catch (remintErr) {
+          this.terminate(
+            remintErr instanceof NetFeedError
+              ? remintErr
+              : new NetFeedError("E_NOSESSION", "session re-mint failed", 401)
+          );
+          return;
+        }
+        if (!this.closedByUser) void this.connectSocket();
+        return;
+      }
+      // Any other failure (transient network): reconnect with backoff.
+      this.scheduleReconnect();
       return;
     }
     // A re-open()/close between mint and connect supersedes this attempt.
@@ -551,6 +691,7 @@ export class NetFeed {
     socket.onopen = () => {
       if (this.socket !== socket) return; // superseded by a newer connect
       this.reconnectAttempt = 0;
+      this.remintStreak = 0; // M10: a live socket is real progress
       this.setConnection("open");
     };
     socket.onmessage = (event) => {
