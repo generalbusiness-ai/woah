@@ -90,6 +90,22 @@ them, every turn → O(view). Make it O(read-set):
   lineage seed covers the common case; the bounded repair budget covers the
   tail; the load gate quantifies cold-round count.
 
+STATUS (2026-07-08, FINAL): **PHASE 1 COMPLETE — slice planning is ON**
+(commit `647853d`). All gates green with slicing enabled: typecheck; npm
+test 749; test:worker 359 (load gate rejoined); smoke:net-dev 24/24 (real
+workerd); e2e:net 2/2 (real browsers, cross-user both directions);
+load:net-dev green (plan_cells flat). Warm-turn plan cost is O(read-set),
+not O(view). The REAL root of the two cross-scope blockers was NOT the
+presence model (the presence-join detour broke cross-user co-location and
+was reverted) but a slice SEED-COMPLETENESS bug: the move chain's body-move
+decision (isPrimary / primarySessionForActor) ENUMERATES the planning
+world's sessions, so a slice holding only the calling session mis-designated
+it as the actor's primary and moved the shared body. Fix = buildSeedSlice
+seeds every session cell for the call's actor (bounded key-prefix scan). The
+earlier foldSessionEffects synthesis workaround was REMOVED — the seed fix
+makes it unnecessary and it was breaking the cross-user peer-observation
+e2e. Below is the prior (mid-flight) status, retained for history.
+
 STATUS (2026-07-08): the slice machinery is LANDED and proven for
 same-scope / topology / obj-ref turns — `load:net-dev` went green
 (plan_cells 1256→flat-across-view-size), and a curated unit proof lives in
