@@ -2090,6 +2090,17 @@ export class NetGatewayDO {
       idempotencyKey: request.idempotency_key,
       stamp: { scope_head: "gateway", catalog_epoch: request.catalog_epoch },
       receiverKnown: this.catalogKnownKeys(view, classifier),
+      // Phase 1: the gateway turn path plans against the read-set slice
+      // (grown from the snapshot on a miss), so warm-turn plan cost is
+      // O(read-set), not O(view). GATED OFF for now: same-scope, topology,
+      // and obj-ref turns are proven (load:net-dev green, net-do/topology/
+      // plan green), but a cross-scope TRANSITION turn (session moveto) now
+      // takes repair rounds under slicing that perturb the presence mirror
+      // high-water and drop a session_presence row (net-ws). The seed must
+      // cover the transition turn's read set (the move chain: acceptable/
+      // enterfunc + the from/to rooms' occupancy) so it stays attempt-1
+      // warm before this flips on. See notes/2026-07-08-net-ready-to-scale-plan.md.
+      // slicePlanning: true,
       ...(request.counters !== undefined ? { counters: request.counters } : {})
     });
   }

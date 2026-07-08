@@ -221,6 +221,19 @@ export class CellStore {
     return copy;
   }
 
+  /** Slice-clone: a copy holding only the given keys that this store has
+   * (Phase 1 slice planning — the planner runs against the turn's seed
+   * slice, grown from the full snapshot on a miss). Same role and same
+   * detached-copy semantics as `clone`; absent keys are skipped. */
+  cloneSlice(keys: Iterable<string>): CellStore {
+    const copy = new CellStore(this.role);
+    for (const key of keys) {
+      const cell = this.cells.get(key);
+      if (cell) copy["cells"].set(key, { ...cell });
+    }
+    return copy;
+  }
+
   cellsForObject(object: string): Cell[] {
     const out: Cell[] = [];
     for (const cell of this.cells.values()) if (cell.object === object) out.push(cell);

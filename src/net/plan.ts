@@ -69,6 +69,15 @@ export type PlanTurnInput = {
    * never reship). The read closure omits these cells and declares them
    * `assumes_known` instead; only `object_lineage:*` keys belong here. */
   receiverKnown?: ReadonlySet<string>;
+  /** Phase 1 (slice-based planning): when true, the planner runs the VM
+   * against the turn's SEED SLICE (actor/session/target + their class
+   * chain) rather than the whole view, growing the slice from the
+   * (consistent) snapshot on a sparse miss — so a warm turn's plan cost is
+   * O(read-set), not O(view). Genuinely-absent cells still escape as
+   * E_MISSING_STATE to the gateway's pull path. Default (absent/false)
+   * plans against the whole view — byte-identical to the pre-slice path,
+   * so non-turn callers (session mint, tests) are unaffected. */
+  slicePlanning?: boolean;
 };
 
 export type PlanTurnResult = {
@@ -100,34 +109,57 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
   // laundering a stale plan past the scope's read-version check.
   const snapshot = view.clone();
 
-  // Sparse execution against the snapshot's cells only (plus the caller's
-  // counters for creates — see PlanTurnInput.counters). `planInput` is
-  // captured so `plan_cells` (Phase 0) counts the EXACT planner input —
-  // today the whole view, the O(view) cost the red baseline must show.
-  const planInput = storeCells(snapshot);
-  const world = planningWorldFromCells(planInput, input.counters);
-  let run;
-  try {
-    run = await runShadowTurnCallTranscript(world, call);
-  } catch (err) {
-    // CO2.6/VTN10.1 at the planner boundary: under SPARSE execution a
-    // lookup miss for an object the view simply does not hold must
-    // surface as repairable E_MISSING_STATE, never as the engine's
-    // semantic E_OBJNF/E_VERBNF (plain thrown objects that no repair
-    // loop can act on). Only a view that HOLDS the object's lineage may
-    // report semantic absence — then the engine's verdict stands.
-    throw translateSparsePlanningThrow(err, snapshot, call);
+  // Phase 1: the VM runs against the turn's SEED SLICE (slice planning) or
+  // the whole snapshot (default). `seed` grows on a sparse miss by
+  // promoting the missing cell FROM THE SNAPSHOT — an in-memory, fix-6-
+  // consistent read, NOT an RPC — so a warm turn (its reads resident)
+  // converges in this loop with zero repair rounds and plan_cells ~
+  // read-set. Only a cell genuinely absent from the snapshot escapes as
+  // E_MISSING_STATE to the gateway's pull path. Default (no slicePlanning)
+  // seeds every snapshot key, so the loop runs once against the whole view
+  // and behaves byte-identically to the pre-slice path.
+  const seed = input.slicePlanning ? buildSeedSlice(snapshot, call) : new Set<string>(snapshot.keys());
+  let run: Awaited<ReturnType<typeof runShadowTurnCallTranscript>> | undefined;
+  let planInput: Cell[] = [];
+  for (;;) {
+    // Default (non-slice) mode plans against the snapshot directly — no
+    // extra copy, byte-identical to the pre-slice path. Slice mode builds
+    // the seed slice; a miss grows it from the snapshot below.
+    const sliceStore = input.slicePlanning ? snapshot.cloneSlice(seed) : snapshot;
+    planInput = storeCells(sliceStore);
+    const world = planningWorldFromCells(planInput, input.counters);
+    let attemptRun: Awaited<ReturnType<typeof runShadowTurnCallTranscript>>;
+    try {
+      attemptRun = await runShadowTurnCallTranscript(world, call);
+    } catch (err) {
+      // A sparse miss vs the SLICE. Grow from the snapshot and re-run; if
+      // nothing is growable the cell is genuinely absent — surface the
+      // miss against the SNAPSHOT so the gateway pulls exactly those keys
+      // (CO2.6/VTN10.1: repairable E_MISSING_STATE, never a raw engine
+      // E_OBJNF/E_VERBNF the repair loop cannot act on).
+      const missVsSlice = translateSparsePlanningThrow(err, sliceStore, call);
+      if (growSeedFromSnapshot(missVsSlice, snapshot, seed)) {
+        expandObjRefs(seed, snapshot); // a grown cell may carry obj-refs
+        continue;
+      }
+      throw translateSparsePlanningThrow(err, snapshot, call);
+    }
+    // CO2.6 second half: the engine RECORDS a dispatch miss in the
+    // transcript rather than throwing. Same grow-or-escape vs the slice.
+    const recordedVsSlice = sparseMissFromRecordedError(attemptRun.transcript, sliceStore);
+    if (recordedVsSlice) {
+      if (growSeedFromSnapshot(recordedVsSlice, snapshot, seed)) {
+        expandObjRefs(seed, snapshot);
+        continue;
+      }
+      const recordedVsSnapshot = sparseMissFromRecordedError(attemptRun.transcript, snapshot);
+      if (recordedVsSnapshot) throw recordedVsSnapshot;
+    }
+    run = attemptRun;
+    break;
   }
-
-  // CO2.6 second half: the engine RECORDS dispatch failures in the
-  // transcript (error field) rather than throwing — a recorded
-  // E_OBJNF/E_VERBNF whose subject cells are absent from the view is the
-  // same sparse miss as a thrown one, and submitting it would durably
-  // commit a failed turn the repair loop could have converged. Only when
-  // the view HOLDS the named page is the failure semantic (a real
-  // verb-not-found is a legitimate committed outcome).
-  const recordedMiss = sparseMissFromRecordedError(run.transcript, snapshot);
-  if (recordedMiss) throw recordedMiss;
+  // The loop only breaks after a successful, sparse-miss-free run.
+  if (!run) throw new Error("planner loop exited without a run (unreachable)");
 
   // CO14: every planned submit carries its session read (and a
   // transition-carrying turn folds the session-cell write) BEFORE scope
@@ -318,6 +350,117 @@ function readClosureCells(
  * verdict stand (semantic absence), rethrown as a legible Error carrying
  * the engine code — never as an opaque [object Object].
  */
+/**
+ * Phase 1: the turn's SEED SLICE — the cells a warm turn's dispatch needs
+ * before it reads anything object-specific, so the common case converges
+ * with no growth round. Fixed-point over the actor's and target's class
+ * chain (`lineageClosureKeys` is one-hop; the parent walk here is
+ * transitive), plus every cell the snapshot holds for each object in that
+ * chain (live, lineage, property defs, verb pages — inherited dispatch
+ * resolves locally) and the call's session cell. O(chain), never O(view);
+ * any read beyond it grows the slice from the snapshot in planTurn's loop.
+ */
+function buildSeedSlice(snapshot: CellStore, call: ShadowTurnCall): Set<string> {
+  const seed = new Set<string>();
+  if (typeof call.session === "string" && call.session) seed.add(cellKey("session", call.session));
+  const chain = new Set<string>();
+  for (const ref of [call.actor, call.target]) {
+    if (typeof ref === "string" && ref) chain.add(ref);
+  }
+  for (;;) {
+    let added = false;
+    for (const object of [...chain]) {
+      const lineage = snapshot.get(cellKey("object_lineage", object));
+      const parent =
+        lineage && typeof lineage.value === "object" && lineage.value
+          ? (lineage.value as { parent?: unknown }).parent
+          : undefined;
+      if (typeof parent === "string" && parent && !chain.has(parent)) {
+        chain.add(parent);
+        added = true;
+      }
+    }
+    if (!added) break;
+  }
+  for (const object of chain) {
+    for (const cell of snapshot.cellsForObject(object)) seed.add(cell.key);
+  }
+  // Resolve object-valued properties so obj-ref reads land on materialized
+  // objects: an unmaterialized ref target makes the engine attribute the
+  // downstream property miss to the frame's OWN `this` (not the ref
+  // target), which growth cannot then identify. One hop here; deeper refs
+  // resolve as growth re-expands (planTurn's loop).
+  expandObjRefs(seed, snapshot);
+  return seed;
+}
+
+/** Collect every string appearing anywhere in a cell value (property refs,
+ * incl. object-valued defaults, live-location ids, etc.). */
+function collectStrings(value: unknown, out: Set<string>): void {
+  if (typeof value === "string") {
+    out.add(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectStrings(item, out);
+    return;
+  }
+  if (value && typeof value === "object") {
+    for (const item of Object.values(value)) collectStrings(item, out);
+  }
+}
+
+/** Seed the FULL cells of every RESIDENT object reachable through an
+ * object-valued property in the seed, to a fixed point. A ref target needs
+ * all its cells (not just lineage+live): the engine attributes a property
+ * miss to the executing frame's OWN `this`, so a read of `ref.prop` whose
+ * cell is absent mis-reports as `this.prop` and cannot be grown — the only
+ * safe cure is to have the ref target's cells present before the VM reads
+ * them. Bounded by the turn's reachable object graph (only snapshot-
+ * resident objects; unrelated objects are never referenced, so the slice
+ * stays independent of view size — the Phase-0 invariant). */
+function expandObjRefs(seed: Set<string>, snapshot: CellStore): void {
+  for (;;) {
+    const strings = new Set<string>();
+    for (const key of seed) {
+      const cell = snapshot.get(key);
+      if (cell) collectStrings(cell.value, strings);
+    }
+    let added = false;
+    for (const ref of strings) {
+      if (!snapshot.has(cellKey("object_lineage", ref))) continue; // not a resident object
+      for (const cell of snapshot.cellsForObject(ref)) {
+        if (!seed.has(cell.key)) {
+          seed.add(cell.key);
+          added = true;
+        }
+      }
+    }
+    if (!added) break;
+  }
+}
+
+/**
+ * Phase 1: promote a sparse miss's cells from the snapshot into the seed.
+ * Returns true iff the seed grew (at least one missing key was resident in
+ * the snapshot and newly added) — the planTurn loop then re-runs against
+ * the enlarged slice with no RPC. A miss whose keys are all absent from
+ * the snapshot returns false, so the caller escapes to the pull path. The
+ * seed is monotonic ⊆ snapshot keys, so growth always terminates.
+ */
+function growSeedFromSnapshot(miss: unknown, snapshot: CellStore, seed: Set<string>): boolean {
+  if (!isNetError(miss) || miss.code !== "E_MISSING_STATE") return false;
+  const missing = Array.isArray(miss.detail.missing) ? (miss.detail.missing as string[]) : [];
+  let grew = false;
+  for (const key of missing) {
+    if (snapshot.has(key) && !seed.has(key)) {
+      seed.add(key);
+      grew = true;
+    }
+  }
+  return grew;
+}
+
 function translateSparsePlanningThrow(err: unknown, view: CellStore, call: ShadowTurnCall): unknown {
   if (isNetError(err)) return err;
   const woo = err as { code?: unknown; message?: unknown; value?: unknown } | null;

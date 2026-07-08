@@ -108,6 +108,92 @@ describe("planTurn → submit → accept (CO4 happy path)", () => {
   });
 });
 
+describe("slice-based planning (Phase 1 — the spine)", () => {
+  /** The harness world plus `pad` unrelated objects the turn never reads,
+   * seeded into both the authority and the derived view. */
+  function paddedHarness(tag: string, pad: number) {
+    const world = createWorld();
+    const session = world.auth(`guest:slice-${tag}`);
+    const actor = session.actor;
+    world.createObject({ id: "slice_box", name: "Slice Box", parent: "$thing", owner: actor });
+    world.defineProperty("slice_box", { name: "counter", defaultValue: 0, owner: actor, perms: "rw", typeHint: "int" });
+    expect(
+      installVerb(world, "slice_box", "bump", `verb :bump() rxd { this.counter = this.counter + 1; return this.counter; }`, null).ok
+    ).toBe(true);
+    for (let i = 0; i < pad; i++) {
+      world.createObject({ id: `slice_pad_${i}`, name: `Pad ${i}`, parent: "$thing", owner: actor });
+      world.defineProperty(`slice_pad_${i}`, { name: "n", defaultValue: i, owner: actor, perms: "rw", typeHint: "int" });
+    }
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seq.seed(cellsFromSerialized(world.exportWorld()));
+    const call = (id: string): ShadowTurnCall => ({
+      kind: "woo.turn_call.shadow.v1",
+      id,
+      route: "direct",
+      scope: SCOPE,
+      session: session.id,
+      actor,
+      target: "slice_box",
+      verb: "bump",
+      args: []
+    });
+    return { seq, call };
+  }
+
+  it("plans against the read-set slice (plan_cells flat as the view grows) and commits identically to full-view planning", async () => {
+    // Full-view plan of the SMALL world — the baseline commit.
+    const small = paddedHarness("small", 0);
+    const full = await planTurn({
+      call: small.call("full"),
+      view: derivedViewOf(small.seq.store),
+      planningScope: SCOPE,
+      classifier,
+      base: small.seq.head(),
+      idempotencyKey: "k-full",
+      stamp: small.seq.stamp()
+    });
+
+    // Slice plan of a LARGE world (300 unrelated objects the turn never
+    // reads). plan_cells must NOT grow with the padding.
+    const large = paddedHarness("large", 300);
+    const sliced = await planTurn({
+      call: large.call("slice"),
+      view: derivedViewOf(large.seq.store),
+      planningScope: SCOPE,
+      classifier,
+      base: large.seq.head(),
+      idempotencyKey: "k-slice",
+      stamp: large.seq.stamp(),
+      slicePlanning: true
+    });
+
+    // THE INVARIANT: the slice is far smaller than the padded view and
+    // ~the same size as the small full-view plan (the padding never
+    // enters planning).
+    const fullViewOfLarge = await planTurn({
+      call: large.call("full-large"),
+      view: derivedViewOf(large.seq.store),
+      planningScope: SCOPE,
+      classifier,
+      base: large.seq.head(),
+      idempotencyKey: "k-full-large",
+      stamp: large.seq.stamp()
+    });
+    expect(fullViewOfLarge.planCells).toBeGreaterThan(full.planCells + 300); // padding IS in the full view
+    expect(sliced.planCells).toBeLessThan(fullViewOfLarge.planCells); // slice excludes it
+    // Flat: the slice of the large world is no bigger than the small
+    // world's full plan plus a small constant.
+    expect(sliced.planCells).toBeLessThanOrEqual(full.planCells + 16);
+
+    // Correctness: the slice plan commits, and to the same post-state a
+    // full-view plan of the same world would (identical execution).
+    const sliceReply = large.seq.submit(sliced.submit);
+    expect(sliceReply.status).toBe("accepted");
+    if (sliceReply.status !== "accepted") return;
+    expect(sliced.submit.post_state_version).toBe(fullViewOfLarge.submit.post_state_version);
+  });
+});
+
 describe("the mini repair loop (CO2.4 + CO6 E_READ_VERSION semantics)", () => {
   it("stale view rejects with mismatched_reads; refreshing exactly those cells converges", async () => {
     const { seq, call } = harness("repair");

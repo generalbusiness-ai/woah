@@ -90,6 +90,24 @@ them, every turn → O(view). Make it O(read-set):
   lineage seed covers the common case; the bounded repair budget covers the
   tail; the load gate quantifies cold-round count.
 
+STATUS (2026-07-08): the slice machinery is LANDED and proven for
+same-scope / topology / obj-ref turns — `load:net-dev` went green
+(plan_cells 1256→flat-across-view-size), and a curated unit proof lives in
+`tests/net/plan.test.ts` ("slice-based planning (Phase 1 — the spine)":
+slice excludes 300 unrelated objects and commits to the identical
+post-state). The gateway flag `slicePlanning` is GATED OFF (commented in
+`planOnce`) pending one gap: a cross-scope TRANSITION turn (session moveto
+into another room) takes repair rounds under slicing that perturb the
+presence-mirror high-water and drop a `session_presence` row (net-ws). The
+seed must cover the transition turn's read set — the receiver-driven move
+chain (`obj:moveto`/`target:acceptable`/`exitfunc`/`enterfunc`) plus the
+from/to rooms' occupancy the presence derivation touches — so the turn
+stays attempt-1 warm (no repair) before the flag flips on. Design realized:
+keep the full consistent `view.clone()` (fix-6 intact) but build the
+planning WORLD from the seed slice, growing it FROM the snapshot on a miss
+(no RPC); a fixed-point obj-ref expansion seeds referenced objects' full
+cells so the engine's frame-attributed property miss can't strand a ref.
+
 ## Phase 2 — presence by-scope (remove O(sessions) fanout scan)
 
 `pushObservations` scans the whole presence table (`gateway-do.ts:1658`,
