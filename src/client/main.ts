@@ -26,6 +26,7 @@ import { advanceProjectionCursor, idsFromRefsOrSummaries, presentActorsFromObser
 import { settleInvalidatedOptimisticTurns, type V2LocalTurnInvalidatedMessage } from "./v2-browser-optimistic-lifecycle";
 import { v2ProjectionSnapshotFromMessage, v2TurnResultRoute, type V2AppliedFrameMessage, type V2ProjectionMessage, type V2TurnResultMessage } from "./v2-browser-messages";
 import { sessionActiveScopeFromRecord } from "../core/types";
+import { NetFeed } from "./net-feed";
 import type { ChatLine, ChatSpaceData, ChatTitleBadge, SpaceChatPanelData } from "../../catalogs/chat/ui/chat-space";
 import type { DubspaceData } from "../../catalogs/dubspace/ui/dubspace-workspace";
 import type { PinboardData } from "../../catalogs/pinboard/ui/pinboard-board";
@@ -541,6 +542,136 @@ function clearPendingToolEnters(options: { render?: boolean } = {}) {
   pendingToolEnterTimers.clear();
   pendingToolMoveRetryTimers.clear();
   if (options.render) render();
+}
+
+// ---- Net transport (client-shell phase ii — chat-first flip) -------------
+//
+// Flag-gated dual transport for the cutover bake: `?net=1` (or
+// localStorage woo:net = "1") boots the SPA's chat loop on the NET path —
+// NetFeed session + turns over /net-api, observations delivered into the
+// SAME receiveLiveEvent dispatcher the v2 socket feeds, so chat display,
+// the observations panel, and the tool-tab cues need no changes. The
+// credential is an apikey in localStorage woo:net:apikey (the bake/dev
+// mechanism; the public guest/password door over net is the remaining
+// identity work before the route switch). v2 stays byte-identical when
+// the flag is off.
+let netFeed: NetFeed | null = null;
+let netFeedOpen = false;
+// The net-mode room anchor (v2 derives this from scoped projections,
+// which net mode does not populate): seeded from the actor's live cell
+// at open, then tracked from the actor's own movement observations.
+let netCurrentRoom = "";
+
+function netMode(): boolean {
+  try {
+    if (new URLSearchParams(window.location.search).get("net") === "1") return true;
+  } catch {
+    // no window/location (tests)
+  }
+  return readStorage("woo:net") === "1";
+}
+
+function netApiKey(): string | null {
+  return readStorage("woo:net:apikey");
+}
+
+function connectNetFeed() {
+  const apiKey = netApiKey();
+  if (!apiKey) {
+    state.authStatus = "anonymous";
+    state.loginError = "Net mode requires an apikey in localStorage woo:net:apikey.";
+    render();
+    return;
+  }
+  netFeed = new NetFeed({ baseUrl: window.location.origin, apiKey });
+  netFeed.onState((feedState) => {
+    netFeedOpen = feedState.connection === "open";
+    if (feedState.actor) state.actor = feedState.actor;
+    if (feedState.session) state.session = feedState.session;
+    if (feedState.error) state.loginError = String(feedState.error.message ?? feedState.error);
+    render();
+  });
+  // Peer AND self observations flow through the one dispatcher the v2
+  // socket already feeds — chat routing (isChatObservation), tool-tab
+  // cues, and the observations panel work unchanged.
+  netFeed.onObservation((event) => {
+    const obs = event.observation as { type?: unknown; actor?: unknown; destination?: unknown; room?: unknown; source?: unknown };
+    if (obs?.actor === state.actor) {
+      if (obs?.type === "left" && typeof obs.destination === "string") netCurrentRoom = obs.destination;
+      else if (obs?.type === "entered" && typeof obs.source === "string") netCurrentRoom = obs.source;
+    }
+    receiveLiveEvent(event.observation);
+  });
+  state.authStatus = "authenticated"; // the shell renders; sends gate on netFeedOpen
+  render();
+  void netFeed
+    .open()
+    .then(async ({ actor }) => {
+      // Seed the room anchor from the actor's live cell (B1 permits
+      // reading one's own actor).
+      try {
+        const live = (await netFeed?.cell(`object_live:${actor}`)) as { value?: { location?: string | null } } | null;
+        const location = live?.value?.location;
+        if (typeof location === "string" && location && location !== "$nowhere") netCurrentRoom = location;
+      } catch {
+        // Best-effort: commands fall back to typing in whatever room the
+        // first observation names.
+      }
+      render();
+    })
+    .catch((err) => {
+      state.loginError = `net session failed: ${String(err)}`;
+      state.authStatus = "anonymous";
+      render();
+    });
+}
+
+async function netTurn(target: string, verb: string, args: unknown[], onResult?: (result: any) => void, onError?: (error: any) => void) {
+  if (!netFeed) {
+    onError?.(new Error("net feed not connected"));
+    return;
+  }
+  try {
+    const outcome = await netFeed.turn({ target, verb, args });
+    if (outcome.status !== "accepted" || outcome.error !== undefined) {
+      onError?.(outcome.error ?? outcome.raw);
+      return;
+    }
+    onResult?.(outcome.result);
+  } catch (err) {
+    onError?.(err);
+  }
+}
+
+// The SAME plan-then-dispatch discipline as v2PlanAndExecuteCommand
+// (guard-command-planning): the server's command_plan resolves the bare
+// words; the client executes whatever plan comes back (huh included —
+// the huh verb owns the messaging).
+function netPlanAndExecuteCommand(space: string, text: string, onResult?: (result: any) => void, onError?: (error: any) => void) {
+  void (async () => {
+    if (!netFeed) {
+      onError?.(new Error("net feed not connected"));
+      return;
+    }
+    try {
+      const planned = await netFeed.turn({ target: space, verb: "command_plan", args: [text] });
+      const plan = planned.result as { target?: unknown; verb?: unknown; args?: unknown } | null;
+      if (planned.status !== "accepted" || !plan || typeof plan !== "object" || typeof plan.verb !== "string") {
+        onError?.(planned.error ?? planned.raw);
+        return;
+      }
+      await netTurn(
+        typeof plan.target === "string" && plan.target ? plan.target : space,
+        plan.verb,
+        Array.isArray(plan.args) ? plan.args : [],
+        onResult,
+        onError
+      );
+    } catch (err) {
+      onError?.(err);
+    }
+  })();
+  return null;
 }
 
 function connect() {
@@ -1650,9 +1781,13 @@ let pinboardNotesHydrationBoard = "";
 // can reach them, and `const` initialization is in temporal dead zone until
 // this point. Moving this block earlier reintroduces a hard-to-spot
 // ReferenceError under specific stored-session shapes.
-state.authStatus = readStorage(sessionKey) ? "authenticated" : "anonymous";
-if (state.authStatus === "authenticated") connect();
-else render();
+if (netMode()) {
+  connectNetFeed();
+} else {
+  state.authStatus = readStorage(sessionKey) ? "authenticated" : "anonymous";
+  if (state.authStatus === "authenticated") connect();
+  else render();
+}
 
 function ensureProjectionFields(subject: string, fields: readonly string[]): void {
   projectionFiller.ensure(subject, fields);
@@ -2225,6 +2360,7 @@ function outlinerSpace() {
 }
 
 function chatRoom() {
+  if (netMode()) return netCurrentRoom;
   if (chatRoomPin && chatRoomPin.expiresAt > Date.now()) return chatRoomPin.room;
   chatRoomPin = null;
   const here = String(state.scopedProjection?.here?.id ?? "");
@@ -2447,12 +2583,17 @@ function ensureSpacePresence(space: string, onReady: () => void, onError?: (erro
 }
 
 function direct(target: string, verb: string, args: unknown[] = [], onResult?: (result: any) => void, onError?: (error: any) => void, options?: ProjectionCallOptions) {
+  if (netMode()) {
+    void netTurn(target || activeChatRoom() || "", verb, args, onResult, onError);
+    return null;
+  }
   const persistence = verb === "enter" || verb === "leave" || verb === "out" ? "durable" : "live";
   const scope = target || activeChatRoom() || desiredV2BrowserScope();
   return v2Turn({ scope, route: "direct", target, verb, args, persistence, onResult, onError, options });
 }
 
 function command(space: string, text: string, onResult?: (result: any) => void, onError?: (error: any) => void, options?: ProjectionCallOptions) {
+  if (netMode()) return netPlanAndExecuteCommand(space, text, onResult, onError);
   const id = v2PlanAndExecuteCommand(space, text, onError);
   if (id && onResult) pendingDirect.set(id, onResult);
   void options;
@@ -2464,6 +2605,7 @@ function canSendChat() {
 }
 
 function canSendV2Browser() {
+  if (netMode()) return netFeedOpen;
   return Boolean(state.actor && state.session && authToken());
 }
 
@@ -3825,7 +3967,12 @@ function mountChatComponent() {
   const present = state.chatPresent;
   const subject = activeChatRoom();
   const room = projectedObjectView(subject);
-  const inRoom = Boolean(state.actor && subject && (actorPresentInSpace(subject) || present.includes(state.actor)));
+  // Net mode (phase ii): presence truth is the feed — the session is
+  // born present at the actor's location (netCurrentRoom), so the room
+  // gate opens without v2 projections.
+  const inRoom = netMode()
+    ? Boolean(state.actor && subject && subject === netCurrentRoom)
+    : Boolean(state.actor && subject && (actorPresentInSpace(subject) || present.includes(state.actor)));
   const lines = chatLinesForSpace(subject);
   element.subject = subject;
   element.woo = createChatWooContext(subject, chatLineActorRefs(lines));
@@ -4052,6 +4199,10 @@ function sendChatInput(space: string, text: string) {
   // Local-only echo so the feed reads as a transcript; never emitted server-side.
   pushChatLine({ kind: "input", source: space, text, ts: Date.now() });
   const onError = chatErrorHandler(space);
+  if (netMode()) {
+    netPlanAndExecuteCommand(space, text, undefined, onError);
+    return;
+  }
   if (canSendChatV2()) {
     v2PlanAndExecuteCommand(space, text, onError);
     return;

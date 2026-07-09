@@ -18,7 +18,7 @@ export default defineConfig({
   // playwright.net-e2e.config.ts) — running it here would spawn a second
   // workerd under the dev-server webServer for nothing. Browser-spawning
   // lanes are explicit, like e2e:cf.
-  testIgnore: "**/net-feed.spec.ts",
+  testIgnore: ["**/net-feed.spec.ts", "**/net-spa.spec.ts"],
   timeout: 30_000,
   fullyParallel: false,
   workers: 1,

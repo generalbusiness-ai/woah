@@ -15,7 +15,7 @@ import { defineConfig, devices } from "@playwright/test";
 
 export default defineConfig({
   testDir: "./e2e",
-  testMatch: "**/net-feed.spec.ts",
+  testMatch: ["**/net-feed.spec.ts", "**/net-spa.spec.ts"],
   // Covers in-test workerd latency only; the expensive boot + seed happens
   // in beforeAll, which sets its own timeout.
   timeout: 60_000,
