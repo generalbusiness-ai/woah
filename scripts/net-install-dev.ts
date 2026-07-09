@@ -59,14 +59,15 @@ async function main(): Promise<void> {
       await runNetInstall(args, env);
       ok("re-run is a no-op-shaped success (same epoch)");
 
-      // A real turn through the client surface: mint, then call a
-      // CATALOGED verb on an installed world object — `title` on the
-      // chatroom dispatches through the installed class chain
-      // (the_chatroom → $chatroom → $room → … → $root, where the page
-      // lives). Deliberately NOT a native seed-graph verb (`look` etc.):
-      // native verbs have no bytecode pages and do not dispatch over the
-      // net planner yet — a tracked pre-cutover gap, not an install
-      // deficiency (see the cutover tooling plan note).
+      // Real turns through the client surface: mint, then the two
+      // commands a user actually types first — `look` and `say` on the
+      // room — both dispatching through the installed class chain
+      // (the_chatroom → $chatroom → $room → … where the pages live).
+      // NOTE (investigated 2026-07-08): `look` targets the ROOM — no
+      // world defines `look` on an actor (the earlier guest_1:look probe
+      // failed identically on a full v2 world); native seed-graph verbs
+      // ride as verb_bytecode cells with their handler refs and dispatch
+      // over the net planner fine.
       const minted = await fetch(`${base}/net-api/session`, {
         method: "POST",
         headers: { "content-type": "application/json", authorization: `Bearer apikey:${KEY_ID}:${KEY_SECRET}` },
@@ -74,21 +75,23 @@ async function main(): Promise<void> {
       });
       const session = ((await minted.json()) as { session?: string }).session;
       if (!minted.ok || !session) throw new Error(`mint failed: ${minted.status}`);
-      const turn = await fetch(`${base}/net-api/turn`, {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: `Bearer apikey:${KEY_ID}:${KEY_SECRET}` },
-        body: JSON.stringify({ target: "the_chatroom", verb: "title", session, idempotency_key: "install-dev-t1" })
-      });
-      const body = (await turn.json()) as { reply?: { status?: string }; result?: unknown };
-      if (!turn.ok || body.reply?.status !== "accepted") {
-        throw new Error(`turn failed: ${turn.status} ${JSON.stringify(body)}`);
+      for (const [verb, args] of [["look", []], ["say", ["hello from the cutover lane"]]] as const) {
+        const turn = await fetch(`${base}/net-api/turn`, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer apikey:${KEY_ID}:${KEY_SECRET}` },
+          body: JSON.stringify({ target: "the_chatroom", verb, args, session, idempotency_key: `install-dev-${verb}` })
+        });
+        const body = (await turn.json()) as { reply?: { status?: string } };
+        if (!turn.ok || body.reply?.status !== "accepted") {
+          throw new Error(`${verb} failed: ${turn.status} ${JSON.stringify(body)}`);
+        }
+        ok(`carried actor committed \`${verb}\` on the_chatroom through /net-api`);
       }
-      ok(`carried actor committed a real turn through /net-api (inherited catalog dispatch; title=${JSON.stringify(body.result)})`);
     });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
-  console.log(`\nsummary[net-install-dev]: ${passed}/4 steps passed`);
+  console.log(`\nsummary[net-install-dev]: ${passed}/5 steps passed`);
 }
 
 main().catch((err) => {

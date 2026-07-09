@@ -118,17 +118,21 @@ Decisions/discoveries recorded while building:
 - **Rehoming = `$system.guest_initial_room`** (the same catalog
   convention that places fresh guests); `world.moveObject` made public
   for exactly this one out-of-band consumer (documented at the method).
-- **PRE-CUTOVER BLOCKER discovered: native seed-graph verbs do not
-  dispatch over the net planner.** `look`/`who`/`help` etc. have no
-  bytecode pages (they are `native()` in the seed graph), the planner's
-  miss derivation attributes them to the TARGET object
-  (`verb_bytecode:guest_1:look`), and pull-on-miss loops to E_BUDGET.
-  Every net lane so far used installed DSL verbs, so this was never
-  exercised. Users type `look` constantly — the cutover cannot route
-  traffic until native dispatch works over net (or the seed graph's
-  universal verbs move woocode-ward, the stated direction of travel).
-  This is its own focused pass.
+- **"Native verbs don't dispatch over net" — RETRACTED after
+  investigation** (the actual cause was a bad probe target). The failing
+  probe called `look` ON THE ACTOR (`guest_1:look`) — a verb NO world
+  defines: it fails E_VERBNF identically on a full v2 world. `look` is a
+  room-resolved command. Native seed-graph verbs are ordinary VerbDefs
+  (handler ref, no program) and `cellsFromSerialized` ships EVERY
+  VerbDef, so they ride as verb_bytecode cells and dispatch over the net
+  planner fine — proven in-process: `the_chatroom:look`,
+  `the_chatroom:say`, and the NATIVE `$system:list_api_keys` all commit
+  accepted against the installed world, and the dev lane now runs `look`
+  + `say` on the room over real workerd (5/5). Left standing from the
+  same investigation: the net client surface takes {target, verb} — the
+  bare-word COMMAND PARSE ("look" → room:look) is client/superstructure
+  work the cutover's client shell must own (v2's parser does it today).
 
 REMAINING: B's export route (`/__internal/identity-export` on the v2
 worker) + C write-freeze (one v2-side change, one pre-cutover v2
-deploy); the native-verb gap above; then the owner's cutover op.
+deploy); then the owner's cutover op.
