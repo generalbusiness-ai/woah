@@ -1344,8 +1344,27 @@ export class NetGatewayDO {
     if (!cell) {
       // Unlike warmScopes this pull is a HARD requirement: without the
       // identity cell no client request can authenticate, so a failed
-      // pull surfaces (500) rather than degrading to a misleading 401.
-      await this.pull({ scope: CATALOG_SCOPE, destination: `scope:${CATALOG_SCOPE}` });
+      // pull surfaces rather than degrading to a misleading 401.
+      try {
+        await this.pull({ scope: CATALOG_SCOPE, destination: `scope:${CATALOG_SCOPE}` });
+      } catch (err) {
+        // Cutover item D: a FRESH namespace (catalog scope holds no
+        // durable state — the pre-install condition every first deploy
+        // sits in) must refuse with a NAMED verdict that clients and the
+        // install pipeline's verification probes can interpret, never a
+        // 500 E_INTERNAL wrapping the scope's miss. Any OTHER pull
+        // failure (transport, auth) still surfaces as the internal error
+        // it is.
+        if (String(err).includes("E_MISSING_STATE")) {
+          throw new ClientAuthError(
+            "world not installed: the catalog scope holds no state (run the net install pipeline)",
+            { reason: "not_installed", scope: CATALOG_SCOPE },
+            "E_NOT_INSTALLED",
+            503
+          );
+        }
+        throw err;
+      }
       cell = this.ensureView().get(key);
     }
     if (!cell) {

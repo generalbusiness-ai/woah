@@ -172,6 +172,32 @@ async function buildHarness() {
 }
 
 describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
+  it("an unseeded namespace refuses with the named E_NOT_INSTALLED verdict, not a 500 (cutover item D)", async () => {
+    // The pre-install condition every fresh deploy sits in: the catalog
+    // scope DO exists but holds NO durable state. An authenticated
+    // request must surface a verdict clients and the install pipeline's
+    // verification probes can interpret.
+    const catalogState = netState("scope-catalog-empty");
+    const scopeEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET };
+    const emptyCatalog = new NetScopeDO(catalogState.state, scopeEnv);
+    const gatewayState = netState("gateway-not-installed");
+    const gatewayEnv: NetGatewayEnv = {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_RESOLVE: (destination) => {
+        if (destination === `scope:${CATALOG_SCOPE}`) return emptyCatalog;
+        throw new Error(`unexpected destination ${destination}`);
+      }
+    };
+    const gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
+
+    const refused = await clientFetch(gateway, "POST", "/net-api/session", { token: "apikey:any:any", body: {} });
+    expect(refused.status).toBe(503);
+    expect(refused.body.error).toMatchObject({ code: "E_NOT_INSTALLED", detail: { reason: "not_installed" } });
+
+    catalogState.close();
+    gatewayState.close();
+  });
+
   it("authenticates apikeys against the catalog identity cell and refuses namedly", async () => {
     const h = await buildHarness();
 
