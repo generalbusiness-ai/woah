@@ -186,6 +186,12 @@ type SessionOpenRequest = {
   /** Optional rpc-destination override (lane fixtures); the scope name is
    * recovered from the `scope:<scopeName>` convention when it applies. */
   cluster_destination?: string;
+  /** Where the session starts (client-shell phase i — see
+   * MintSessionInput.activeScope): the client path passes the actor's
+   * live location so a fresh session is born PRESENT and receives
+   * cross-actor observations before its first move; absent = the
+   * pre-existing placeless mint. */
+  active_scope?: string | null;
 };
 
 /** /net/turn reply body. `trace` lists the failed rounds that preceded
@@ -1163,11 +1169,30 @@ export class NetGatewayDO {
       now,
       base,
       epoch: request.catalog_epoch,
-      clusterScope
+      clusterScope,
+      ...(request.active_scope !== undefined ? { activeScope: request.active_scope } : {})
     });
+    // A placed mint carries a presence transition whose room usually
+    // anchors at ANOTHER scope: ship the relate directions so the
+    // cluster routes the presence delta to the room's owner (the same
+    // sibling shape the turn path sends) instead of misclassifying it
+    // local. Room scope == cluster scope needs no directions.
+    const relateDestinations: Record<string, { destination: string; objects: string[] }> = {};
+    if (request.active_scope) {
+      const roomScope = await this.clientPlanningScope(request.active_scope, request.actor);
+      if (roomScope !== clusterScope) {
+        relateDestinations[roomScope] = { destination: `scope:${roomScope}`, objects: [request.active_scope] };
+      }
+    }
+    const withSibling = Object.keys(relateDestinations).length > 0;
     let reply: CommitReply;
     for (let attempt = 1; ; attempt += 1) {
-      reply = (await this.host.rpc(destination, "/submit", { ...submit, base })) as CommitReply;
+      const bare = { ...submit, base };
+      reply = (await this.host.rpc(
+        destination,
+        "/submit",
+        withSibling ? { submit: bare, relate_destinations: relateDestinations } : bare
+      )) as CommitReply;
       if (reply.status === "accepted" || !reply.retryable || reply.reason !== "stale_head" || attempt >= 3) break;
       base = (await this.scopeHead(destination)).head;
     }
@@ -1236,6 +1261,16 @@ export class NetGatewayDO {
       // apikey path, so an upgrade never needs a credential in its URL.
       if (request.method === "GET" && url.pathname === "/net-api/ws") {
         return await this.clientWebSocketByTicket(request, url);
+      }
+
+      // Client-shell phase i: the MCP surface (JSON-RPC over POST). Its
+      // auth model differs per method — `initialize` authenticates the
+      // mcp-token (an apikey) and mints the net session that then acts
+      // as the MCP bearer (mcp-session-id = the net session id, the same
+      // trust shape v2's MCP surface uses; sessions expire) — so it
+      // branches before the header-credential path below.
+      if (request.method === "POST" && url.pathname === "/net-api/mcp") {
+        return await this.clientMcp(request);
       }
 
       const credential = parseClientCredential(request.headers, null);
@@ -1399,11 +1434,19 @@ export class NetGatewayDO {
     // /net-api router can resolve a live session to the gateway holding
     // its view — a routing change, never a data migration.
     const session = sessionIdWithShardHint(this.shardName(), randomHex(16));
+    // Client-shell phase i: the session is born PRESENT at the actor's
+    // live location (v2 parity — cross-actor delivery routes by session
+    // presence, and a placeless session would miss everything until its
+    // first move). The location cell is in view from the cluster warm
+    // above; a location-less actor mints placeless as before.
+    const liveRow = this.ensureView().get(cellKey("object_live", actor))?.value as { location?: string | null } | undefined;
+    const bornAt = typeof liveRow?.location === "string" && liveRow.location !== "$nowhere" ? liveRow.location : null;
     const opened = await this.sessionOpen({
       session,
       actor,
       ttl_ms: clampClientTtl(body.ttl_ms),
-      catalog_epoch: epoch
+      catalog_epoch: epoch,
+      active_scope: bornAt
     });
     if (opened.reply.status !== "accepted") {
       // A mint only rejects retryably (stale_head races, already retried
@@ -1413,9 +1456,12 @@ export class NetGatewayDO {
     }
     // H1: subscribe this gateway to the actor's CLUSTER — the session's
     // authority scope, where its cell and any cluster-committed
-    // observations live. (Room subscriptions follow as the session's
-    // turns anchor there; see clientTurn.)
+    // observations live — and, for a born-present session (phase i), to
+    // the BIRTH ROOM's scope: presence routing delivers there, and
+    // without the subscription the fanout would never reach this shard's
+    // sockets/queues until the session's first turn.
     await this.selfSubscribe(opened.scope);
+    if (bornAt) await this.selfSubscribe(await this.clientPlanningScope(bornAt, actor));
     const value = opened.value as { expiresAt?: number } | null;
     return json({
       session,
@@ -1567,6 +1613,253 @@ export class NetGatewayDO {
     } catch {
       return `cluster:${actor}`;
     }
+  }
+
+  // ---- /net-api/mcp: the MCP adapter (client-shell phase i) ---------------
+  //
+  // The agent/plug surface AND the §8 "prove" instrument: the deployed
+  // walkthrough drives MCP, so this is what lets the ONE smoke scenario
+  // run against the net path. Deliberately the SMALL tool set the
+  // scenario's client contract uses — woo_call, woo_wait,
+  // woo_list_reachable_tools — each backed by the SAME machinery the
+  // HTTP client surface uses (clientSession/clientTurn/the mirror), so
+  // MCP is an ENVELOPE around the net path, never a second path.
+  //
+  // Auth: `initialize` authenticates an apikey from the `mcp-token`
+  // header and mints a net session; the returned mcp-session-id IS that
+  // net session id, and every later call validates the session cell
+  // (expiry included) — bearer semantics identical to v2's MCP surface.
+  //
+  // Observations: woo_wait long-polls a per-session in-memory queue fed
+  // by the SAME presence-routed fanout that feeds WebSocket pushes
+  // (including the submitter turn_id dedupe). In-memory like v2's wait
+  // queues: an eviction drops undelivered items; the client's next wait
+  // simply re-arms (at-most-once live delivery — CO2.7's socket rule).
+
+  /** Per-session MCP observation queues (bounded) + parked woo_wait
+   * long-polls. Registered at initialize; entries die with the DO. */
+  private readonly mcpQueues = new Map<string, { buffer: unknown[]; waiters: Array<() => void> }>();
+
+  private async clientMcp(request: Request): Promise<Response> {
+    const rpc = (await request.json().catch(() => null)) as {
+      jsonrpc?: string;
+      id?: number | string | null;
+      method?: string;
+      params?: Record<string, unknown>;
+    } | null;
+    if (!rpc || rpc.jsonrpc !== "2.0" || typeof rpc.method !== "string") {
+      return json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error: expected a JSON-RPC 2.0 request" } }, 400);
+    }
+    // Notifications (no id) acknowledge with 202 and no body — the MCP
+    // handshake's notifications/initialized.
+    if (rpc.id === undefined || rpc.id === null) {
+      return new Response(null, { status: 202 });
+    }
+    if (rpc.method === "initialize") return await this.mcpInitialize(request, rpc.id, rpc.params ?? {});
+    if (rpc.method === "tools/list") {
+      return this.mcpResult(rpc.id, { tools: MCP_TOOL_DEFS });
+    }
+    if (rpc.method === "tools/call") {
+      return await this.mcpToolsCall(request, rpc.id, rpc.params ?? {});
+    }
+    return json({ jsonrpc: "2.0", id: rpc.id, error: { code: -32601, message: `method not found: ${rpc.method}` } }, 200);
+  }
+
+  private async mcpInitialize(request: Request, id: number | string, _params: Record<string, unknown>): Promise<Response> {
+    const token = request.headers.get("mcp-token") ?? "";
+    // Reuse the exact client-auth path: the token is an apikey credential
+    // (the only client credential the net surface has).
+    const synthetic = new Headers({ "x-woo-api-key": token });
+    const credential = parseClientCredential(synthetic, null);
+    const identity = await this.catalogIdentity();
+    const { actor } = verifyApiKeyCredential(identity.map, credential);
+    this.enforceClientRate(actor, "/net-api/session"); // the mint bucket (H4 amplifier rule)
+    const opened = await this.clientSession(actor, {}, identity.epoch);
+    const body = (await opened.json()) as { session?: string };
+    if (!opened.ok || typeof body.session !== "string") {
+      return json({ jsonrpc: "2.0", id, error: { code: -32000, message: `session mint failed: ${JSON.stringify(body)}` } }, 200);
+    }
+    this.mcpQueues.set(body.session, { buffer: [], waiters: [] });
+    return json(
+      {
+        jsonrpc: "2.0",
+        id,
+        result: {
+          protocolVersion: "2025-06-18",
+          capabilities: { tools: { listChanged: false } },
+          serverInfo: { name: "woo-net", version: "1" }
+        }
+      },
+      200,
+      { "mcp-session-id": body.session }
+    );
+  }
+
+  private async mcpToolsCall(request: Request, id: number | string, params: Record<string, unknown>): Promise<Response> {
+    const session = request.headers.get("mcp-session-id") ?? "";
+    const cell = this.ensureView().get(sessionCellKey(session));
+    const verdict = validateSessionCell(cell, this.host.now());
+    if (verdict !== "ok") {
+      return json({ jsonrpc: "2.0", id, error: { code: -32000, message: `session ${verdict}` } }, 200);
+    }
+    const actor = (cell?.value as { actor?: string }).actor as string;
+    this.enforceClientRate(actor, "/net-api/mcp");
+    const name = typeof params.name === "string" ? params.name : "";
+    const args = (params.arguments ?? {}) as Record<string, unknown>;
+
+    if (name === "woo_wait") {
+      const timeout = typeof args.timeout_ms === "number" ? Math.min(Math.max(args.timeout_ms, 0), 25_000) : 1000;
+      const observations = await this.mcpWait(session, timeout);
+      return this.mcpResult(id, { observations });
+    }
+    if (name === "woo_list_reachable_tools") {
+      const limit = typeof args.limit === "number" && args.limit > 0 ? Math.min(args.limit, 500) : 200;
+      return this.mcpResult(id, { tools: this.mcpReachableTools(actor, session, limit) });
+    }
+    if (name === "woo_call") {
+      const object = typeof args.object === "string" ? args.object : "";
+      const verb = typeof args.verb === "string" ? args.verb : "";
+      if (!object || !verb) return this.mcpToolError(id, { code: "E_INVARG", message: "woo_call requires object and verb" });
+      try {
+        const identity = await this.catalogIdentity();
+        const turnResponse = await this.clientTurn(
+          actor,
+          { target: object, verb, args: Array.isArray(args.args) ? args.args : [], session },
+          identity.epoch
+        );
+        const turn = (await turnResponse.json()) as {
+          reply?: { status?: string; reason?: string; detail?: unknown };
+          result?: unknown;
+          error?: unknown;
+          [key: string]: unknown;
+        };
+        if (!turnResponse.ok) return this.mcpToolError(id, turn.error ?? turn);
+        if (turn.reply?.status !== "accepted") return this.mcpToolError(id, turn.reply ?? turn);
+        // A committed turn whose VERB raised carries the recorded error —
+        // the tool surface reports it as an error envelope (v2 parity:
+        // unwrap() throws on isError).
+        if (turn.error !== undefined) return this.mcpToolError(id, turn.error);
+        return this.mcpResult(id, turn.result ?? null);
+      } catch (err) {
+        // Taxonomy throws (E_BUDGET after the repair loop on a genuinely
+        // absent verb, etc.) are TOOL failures on this surface — the MCP
+        // envelope, never a transport 4xx/5xx (the JSON-RPC id must get
+        // its reply).
+        if (isNetError(err)) return this.mcpToolError(id, { code: err.code, message: err.message, detail: err.detail });
+        return this.mcpToolError(id, { code: "E_INTERNAL", message: String(err) });
+      }
+    }
+    return json({ jsonrpc: "2.0", id, error: { code: -32602, message: `unknown tool: ${name}` } }, 200);
+  }
+
+  /** The scenario's client contract: payloads ride
+   * `result.structuredContent.result`; errors set `isError` with the
+   * detail in structuredContent (unwrap() throws on it). */
+  private mcpResult(id: number | string, payload: unknown): Response {
+    return json({
+      jsonrpc: "2.0",
+      id,
+      result: {
+        content: [{ type: "text", text: JSON.stringify(payload) }],
+        structuredContent: { result: payload },
+        isError: false
+      }
+    });
+  }
+
+  private mcpToolError(id: number | string, detail: unknown): Response {
+    return json({
+      jsonrpc: "2.0",
+      id,
+      result: {
+        content: [{ type: "text", text: JSON.stringify(detail) }],
+        structuredContent: { error: detail },
+        isError: true
+      }
+    });
+  }
+
+  /** woo_wait: drain immediately when buffered, else park up to
+   * `timeoutMs` for the next fanout enqueue. One waiter list per
+   * session; every parked waiter wakes on the next delivery (each drains
+   * whatever is buffered at that moment — duplicates are impossible
+   * because the buffer is cleared by whichever waiter runs first). */
+  private async mcpWait(session: string, timeoutMs: number): Promise<unknown[]> {
+    const queue = this.mcpQueues.get(session);
+    if (!queue) return [];
+    if (queue.buffer.length > 0) {
+      const drained = queue.buffer.splice(0, queue.buffer.length);
+      return drained;
+    }
+    if (timeoutMs === 0) return [];
+    return await new Promise<unknown[]>((resolve) => {
+      const timer = setTimeout(() => {
+        const index = queue.waiters.indexOf(wake);
+        if (index >= 0) queue.waiters.splice(index, 1);
+        resolve(queue.buffer.splice(0, queue.buffer.length));
+      }, timeoutMs);
+      const wake = (): void => {
+        clearTimeout(timer);
+        resolve(queue.buffer.splice(0, queue.buffer.length));
+      };
+      queue.waiters.push(wake);
+    });
+  }
+
+  /** Fanout-side feed (called from pushObservations, AFTER the same
+   * submitter turn_id dedupe the sockets get). Bounded buffer: overflow
+   * drops oldest — at-most-once live delivery, the socket rule. */
+  private mcpEnqueue(session: string, observations: unknown[]): void {
+    const queue = this.mcpQueues.get(session);
+    if (!queue || observations.length === 0) return;
+    queue.buffer.push(...observations);
+    if (queue.buffer.length > MCP_QUEUE_CAP) queue.buffer.splice(0, queue.buffer.length - MCP_QUEUE_CAP);
+    const waiters = queue.waiters.splice(0, queue.waiters.length);
+    for (const wake of waiters) wake();
+  }
+
+  /** woo_list_reachable_tools: enumerate callable verbs from the VIEW —
+   * the actor, its room (live location / session activeScope), and the
+   * room's contents (mirror roster), each mapped over its class chain so
+   * inherited tool verbs list against the INSTANCE (`guest_1:wait` from
+   * $actor's page). View-resident-only by design: reachability is a
+   * UI/discovery surface, not an authority read. */
+  private mcpReachableTools(actor: string, session: string, limit: number): Array<{ object: string; verb: string }> {
+    const view = this.ensureView();
+    const bases = new Set<string>([actor]);
+    const live = view.get(cellKey("object_live", actor))?.value as { location?: string | null } | undefined;
+    if (typeof live?.location === "string" && live.location) bases.add(live.location);
+    const row = view.get(sessionCellKey(session))?.value as { activeScope?: string | null } | undefined;
+    if (typeof row?.activeScope === "string" && row.activeScope) bases.add(row.activeScope);
+    for (const base of [...bases]) {
+      for (const member of this.relationMembers("contents", base)) {
+        if (typeof member.member === "string") bases.add(member.member);
+      }
+    }
+    const tools: Array<{ object: string; verb: string }> = [];
+    const seen = new Set<string>();
+    for (const base of bases) {
+      // Walk the class chain; every chain node's verb pages surface as
+      // tools on the INSTANCE.
+      let current: string | null = base;
+      const guard = new Set<string>();
+      while (current && !guard.has(current) && tools.length < limit) {
+        guard.add(current);
+        for (const cell of view.cellsForObject(current)) {
+          if (cell.kind !== "verb_bytecode" || typeof cell.name !== "string") continue;
+          const page = cell.value as { direct_callable?: boolean; tool_exposed?: boolean };
+          if (page.direct_callable !== true && page.tool_exposed !== true) continue;
+          const key = `${base}:${cell.name}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          tools.push({ object: base, verb: cell.name });
+          if (tools.length >= limit) break;
+        }
+        const lineage = view.get(cellKey("object_lineage", current))?.value as { parent?: string | null } | undefined;
+        current = typeof lineage?.parent === "string" ? lineage.parent : null;
+      }
+    }
+    return tools;
   }
 
   /**
@@ -1796,8 +2089,9 @@ export class NetGatewayDO {
    *   Phase 4.
    */
   private pushObservations(body: FanoutBody): void {
+    // No WS surface (structural fakes / MCP-only runtimes) still feeds
+    // the MCP wait queues — delivery has two carriers, one audience.
     const getSockets = this.state.getWebSockets?.bind(this.state);
-    if (!getSockets) return; // runtime without a WS surface (structural fakes)
     if (!Array.isArray(body.observations) || body.observations.length === 0) return;
     // Phase 2: filter by the materialized owner_scope (indexed) so the scan
     // is O(occupants of body.scope), NOT O(all mirrored sessions). The
@@ -1823,7 +2117,10 @@ export class NetGatewayDO {
     });
     for (const row of rows) {
       if (body.turn_id !== undefined && this.recentClientTurns.get(body.turn_id) === row.member) continue;
-      for (const ws of getSockets(row.member)) {
+      // MCP wait queues ride the SAME audience + submitter dedupe as the
+      // sockets (client-shell phase i).
+      this.mcpEnqueue(row.member, body.observations);
+      for (const ws of getSockets ? getSockets(row.member) : []) {
         try {
           ws.send(frame);
         } catch {
@@ -2684,6 +2981,32 @@ export class NetGatewayDO {
   }
 }
 
-function json(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+function json(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
 }
+
+/** MCP adapter bounds (client-shell phase i). */
+const MCP_QUEUE_CAP = 256;
+/** The tool set the walkthrough's client contract uses — an ENVELOPE
+ * around the net client surface, never a second path. */
+const MCP_TOOL_DEFS = [
+  {
+    name: "woo_call",
+    description: "Call a verb on an object as the session's actor.",
+    inputSchema: {
+      type: "object",
+      properties: { object: { type: "string" }, verb: { type: "string" }, args: { type: "array" } },
+      required: ["object", "verb"]
+    }
+  },
+  {
+    name: "woo_wait",
+    description: "Long-poll the session's observation queue.",
+    inputSchema: { type: "object", properties: { timeout_ms: { type: "number" } } }
+  },
+  {
+    name: "woo_list_reachable_tools",
+    description: "Enumerate callable verbs on the actor, its room, and the room's contents.",
+    inputSchema: { type: "object", properties: { scope: { type: "string" }, limit: { type: "number" } } }
+  }
+] as const;

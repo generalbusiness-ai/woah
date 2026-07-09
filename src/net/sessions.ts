@@ -95,6 +95,13 @@ export type MintSessionInput = {
   epoch: string;
   /** The actor's cluster scope name (CO14: the session's authority). */
   clusterScope: string;
+  /** Where the session starts (client-shell phase i): v2 sessions are
+   * born PLACED at the actor's location, and cross-actor delivery routes
+   * by session presence — a placeless mint would miss every observation
+   * until the first move. The client path passes the actor's live
+   * location; internal/lane callers omit it (null — the pre-existing
+   * behavior; their explicit enter turns place the session). */
+  activeScope?: string | null;
 };
 
 export type MintSessionResult = {
@@ -144,7 +151,7 @@ export function mintSessionSubmit(input: MintSessionInput): MintSessionResult {
     actor: input.actor,
     started: input.now,
     expiresAt: input.now + input.ttl_ms,
-    activeScope: null
+    activeScope: input.activeScope ?? null
   };
   const body: Omit<EffectTranscript, "hash"> = {
     kind: "woo.effect_transcript.shadow.v1",
@@ -154,6 +161,14 @@ export function mintSessionSubmit(input: MintSessionInput): MintSessionResult {
     seq: 0,
     session: input.session,
     call: { actor: input.actor, target: input.actor, verb: "session_mint", args: [], body: undefined },
+    // A placed mint IS a presence transition (null → the birth room):
+    // CO13 derives session_presence rows exclusively from the recorded
+    // transition, so without this a born-present session would hold an
+    // activeScope no roster ever learned about. Post-state parity is
+    // unaffected — transitions drive projections, never authority cells.
+    ...(input.activeScope
+      ? { sessionScopeTransition: { session: input.session, actor: input.actor, from: null, to: input.activeScope } }
+      : {}),
     reads: [],
     writes: [
       {
