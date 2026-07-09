@@ -206,6 +206,28 @@ gap. A thin client is therefore: `command_plan(text)` turn → execute
 the returned plan — the SAME plan-then-dispatch discipline the v2
 browser already follows (guard-command-planning).
 
+STATUS (2026-07-09): **PHASES i AND ii COMPLETE.**
+- Phase i @ 6d9223c: /net-api/mcp adapter; THE walkthrough scenario
+  passes over the net path 10/10 on real workerd (`smoke:net-mcp`) —
+  six root-caused fixes (creates counter + collision guard; objects-mode
+  refresh; room-addressed observations riding the presence relate;
+  to:-directed audience filter; CO15 anchor normalization at install;
+  same-turn-created foreign reads bypass attestation) + the roster
+  footprint (CellStore location index; members seeded minimally).
+- Phase ii @ b79479f: the REAL SPA runs over the net path, flag-gated
+  (?net=1 + localStorage woo:net:apikey): NetFeed → the same
+  receiveLiveEvent dispatcher; command box → command_plan →
+  plan-execute; room anchor from the actor's live cell + own movement
+  observations; e2e/net-spa.spec.ts proves alice→bob chat in real
+  browsers against the real bundle. v2 byte-identical flag-off
+  (smoke:cf-dev 13/13).
+REMAINING before the §8 route switch: the PUBLIC identity door over net
+(guest entry + account/password login — today only apikeys
+authenticate, which covers agents/plugs and the bake, not anonymous
+humans); tool-space UIs over net (pinboard/outliner/tasks panels render
+from v2 projections — phase iii); then the walkthrough-parity +
+route-switch steps.
+
 Phases, smallest-risk order:
 1. **MCP adapter over /net-api** — the agent/plug surface AND the §8
    "prove" instrument (the deployed walkthrough is MCP). Re-back the
