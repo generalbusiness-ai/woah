@@ -186,7 +186,37 @@ Owner-run, in order; every step idempotent or read-only unless marked.
    the route back + delete WOO_WRITE_FREEZE — nothing else.
 6. **After the bake**: retire old prod; the §8 deletion commits.
 
-REMAINING build item before step 4 can run: the net CLIENT SHELL
-(bare-word command parse "look" → room:look, the browser/MCP surface
-over /net-api) — the last piece between "namespace proven" and "traffic
-routed". Steps 0–3 are executable today.
+REMAINING build item before step 4 can run: the net CLIENT SHELL — the
+last piece between "namespace proven" and "traffic routed". Steps 0–3
+are executable today.
+
+## The client shell, scoped (2026-07-09 — grounded, not guessed)
+
+**Foundation PROVEN and pinned** (tests/worker/net-install.test.ts):
+the REAL v2 command parser runs over the net planner with ZERO new
+engine machinery. The chat catalog's `$space:command_plan(text)` wraps
+the `plan_command` native; over `/net-api` against the installed world
+it returns executable plans for the whole vocabulary — bare verbs
+(`look` → {target: room, verb: look}), speech (`say hello there` →
+{verb: say, args: ["hello there"]}), rosters (`who`), and OBJECT
+MATCHING against the room's contents in the slice (`look lamp` →
+{verb: look_at, args: [the_lamp]}; `take mug` → persistence: durable).
+The earlier "look at the fireplace" huh was an absent object, not a
+gap. A thin client is therefore: `command_plan(text)` turn → execute
+the returned plan — the SAME plan-then-dispatch discipline the v2
+browser already follows (guard-command-planning).
+
+Phases, smallest-risk order:
+1. **MCP adapter over /net-api** — the agent/plug surface AND the §8
+   "prove" instrument (the deployed walkthrough is MCP). Re-back the
+   MCP tool set (command/look/state) with /net-api session+turn+reads.
+   Exit gate: the smoke walkthrough scenario passes against the net
+   path end-to-end.
+2. **Browser: chat-first transport flip** — NetFeed +
+   net-feed-adapter (already built, e2e-proven) drive main.ts's chat
+   loop (command box → command_plan → turn; observations → chat panel).
+   Tool-space UIs (pinboard/outliner/tasks) follow on the framework
+   adapter; the flip is per-surface, flag-gated, so the SPA can ship
+   dual-transport during the bake.
+3. **Walkthrough parity gate** — one scenario, both transports, then
+   the §8 route switch (step 4).

@@ -101,6 +101,37 @@ describe("net install end-to-end (fake-DO lane)", () => {
     expect(body.actor).toBe(carried);
     expect(body.session).toMatch(/^s_/);
 
+    // The client-shell foundation (cutover scope, proven 2026-07-09):
+    // the REAL v2 command parser — bare verbs, speech, object matching,
+    // persistence routing — runs over the net planner via the chat
+    // catalog's `command_plan` wrapper around the `plan_command` native.
+    // A thin client is: command_plan(text) → execute the returned plan.
+    // This pins that foundation against the installed world.
+    const commandPlan = async (text: string): Promise<Record<string, unknown>> => {
+      const turn = await gateway.fetch(
+        new Request("https://do/net-api/turn", {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer apikey:${KEY_ID}:${KEY_SECRET}` },
+          body: JSON.stringify({
+            target: "the_chatroom",
+            verb: "command_plan",
+            args: [text],
+            session: body.session,
+            idempotency_key: `cmd-${text.replace(/\W+/g, "-")}`
+          })
+        })
+      );
+      const reply = (await turn.json()) as { reply?: { status?: string }; result?: Record<string, unknown> };
+      expect(turn.status, text).toBe(200);
+      expect(reply.reply?.status, text).toBe("accepted");
+      return reply.result ?? {};
+    };
+    expect(await commandPlan("look")).toMatchObject({ ok: true, target: "the_chatroom", verb: "look" });
+    expect(await commandPlan("say hello there")).toMatchObject({ ok: true, verb: "say", args: ["hello there"] });
+    // Object matching resolves against the room's contents in the slice.
+    expect(await commandPlan("look lamp")).toMatchObject({ ok: true, verb: "look_at", args: ["the_lamp"] });
+    expect(await commandPlan("take mug")).toMatchObject({ ok: true, verb: "take", persistence: "durable" });
+
     states.forEach((st) => st.close());
   });
 });
