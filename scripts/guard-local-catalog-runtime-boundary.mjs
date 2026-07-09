@@ -13,6 +13,7 @@ const skippedDirs = new Set(["node_modules", "dist", ".git", "src/generated"]);
 const allowedImporters = new Map([
   ["src/core/bootstrap.ts", "empty-world bootstrap and explicit catalog install option"],
   ["src/core/protocol.ts", "catalog status/index protocol reporting"],
+  ["src/net/install.ts", "net-namespace world install pipeline (cutover item A): a lifecycle surface, never turn runtime"],
   ["src/mcp/stdio.ts", "startup parsing of auto-install configuration"],
   ["src/server/dev-server.ts", "startup parsing of auto-install configuration"],
   ["src/worker/commit-scope-do.ts", "host-scoped catalog lifecycle repair on durable scope open"],

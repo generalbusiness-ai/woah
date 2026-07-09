@@ -63,7 +63,8 @@ export default {
     // has an independent, unlocked body. Only pay the clone for the
     // /net-smoke path; every other request aliases as before.
     const isNetSmoke = url.pathname.startsWith("/net-smoke/");
-    const rawRequest = isNetSmoke ? request.clone() : request;
+    const isNetInstall = url.pathname.startsWith("/net-install/");
+    const rawRequest = isNetSmoke || isNetInstall ? request.clone() : request;
 
     // Strip any x-woo-internal-* / x-woo-host-key the public client tried to
     // inject; those headers are reserved for trusted gateway → DO forwarding.
@@ -98,6 +99,18 @@ export default {
     // trusted. The proving lanes hold the secret and sign every call.
     if (isNetSmoke) {
       return handleNetSmoke(rawRequest, env, url);
+    }
+
+    // Cutover item A: the PRODUCTION world-install conduit
+    // (notes/2026-07-08-net-cutover-tooling-plan.md). Unlike /net-smoke
+    // this is NOT dataset-gated — installing the world into the fresh net
+    // namespace is a production operation (§8 Phase 5 step 2) — so the
+    // internal SIGNATURE is the whole gate (the operator holds
+    // WOO_INTERNAL_SECRET for the cutover op), and the surface is
+    // allow-listed to exactly the install verbs: seed and head. Same H1b
+    // raw-request discipline as /net-smoke.
+    if (isNetInstall) {
+      return handleNetInstall(rawRequest, env, url);
     }
 
     // Plan 002 Phase 4 item 2: the coherence layer's PRODUCTION client
@@ -645,6 +658,68 @@ async function handleNetSmoke(request: Request, env: Env, url: URL): Promise<Res
       headers: { "content-type": "application/json" },
       body
     });
+  }
+  const signed = await signInternalRequest(netEnv, forward);
+  return stub.fetch(signed);
+}
+
+/**
+ * Cutover item A: the production install doorway —
+ * `POST /net-install/scope/<name>/seed` and
+ * `GET  /net-install/scope/<name>/head`.
+ *
+ * Trust model: the inbound internal SIGNATURE is the gate (verified on
+ * the RAW pre-sanitize request — H1b; the operator running the cutover
+ * holds WOO_INTERNAL_SECRET). The surface is deliberately narrower than
+ * /net-smoke: scope DOs only, and ONLY the two install verbs — `seed`
+ * (idempotent by the M9 epoch guard: same-epoch re-seed no-ops,
+ * different-epoch refuses, so a crashed install re-runs safely) and
+ * `head` (the verification probe). Everything else about a live world —
+ * subscribe, pull, turns — happens through the normal production
+ * surfaces, so nothing here can become a second admin path. The forward
+ * is freshly built and freshly signed; no inbound header propagates.
+ */
+async function handleNetInstall(request: Request, env: Env, url: URL): Promise<Response> {
+  const netEnv = env as unknown as NetBindingsEnv;
+  try {
+    await verifyInternalRequest(netEnv, request);
+  } catch (err) {
+    return jsonResponse(
+      { error: { code: "E_NOSESSION", message: `net-install requires a signed internal request: ${errorMessage(err)}` } },
+      401
+    );
+  }
+  const parts = url.pathname.split("/").filter(Boolean); // ["net-install", "scope", name, verb]
+  const kind = parts[1];
+  const name = parts[2] === undefined ? "" : decodeURIComponent(parts[2]);
+  const verb = parts[3];
+  const allowed = (verb === "seed" && request.method === "POST") || (verb === "head" && request.method === "GET");
+  if (kind !== "scope" || !name || parts.length !== 4 || !allowed) {
+    return jsonResponse(
+      { error: { code: "E_INVARG", message: "expected POST /net-install/scope/<name>/seed or GET /net-install/scope/<name>/head" } },
+      404
+    );
+  }
+  let stub;
+  try {
+    stub = resolveNetDestination(netEnv, `scope:${name}`);
+  } catch (err) {
+    return jsonResponse({ error: { code: "E_INTERNAL", message: errorMessage(err) } }, 500);
+  }
+  const target = new URL(`https://do/net/${verb}`);
+  let forward: Request;
+  if (request.method === "GET") {
+    forward = new Request(target);
+  } else {
+    // Same bounded-body discipline as the smoke doorway: a seed carries a
+    // scope's full cell partition — a state transfer, not a turn envelope.
+    let body: ArrayBuffer;
+    try {
+      body = await readLimitedBody(request, NET_SMOKE_MAX_BODY_BYTES);
+    } catch (err) {
+      return errorResponseFor(err);
+    }
+    forward = new Request(target, { method: "POST", headers: { "content-type": "application/json" }, body });
   }
   const signed = await signInternalRequest(netEnv, forward);
   return stub.fetch(signed);

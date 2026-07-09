@@ -83,3 +83,52 @@ B (in-process proven; the export route + C ride one v2 change) →
 then the OWNER's cutover op: freeze → export → install+import to prod
 net namespace → §8 steps 3-7 (prove, route switch, postflight, bake,
 rollback rule, deletions).
+
+## STATUS (2026-07-08)
+
+**D COMPLETE**: unseeded-namespace requests refuse 503 `E_NOT_INSTALLED`
+(reason: not_installed); any other catalog-pull failure stays E_INTERNAL.
+
+**A + B (library/scripts) COMPLETE, dev-lane proven 4/4 over real
+workerd** (`npm run install:net-dev`): identity export from an old world
+→ `runNetInstall` seeds the FULL bundled world (20 scopes — the real
+prod rooms) through the signed `/net-install` doorway → heads verified at
+the fingerprint epoch (`cat-<bundle-fingerprint>`) → idempotent re-run
+(same epoch, no-op-shaped) → carried apikey mints via `/net-api/session`
+→ a real turn commits through inherited catalog dispatch (`title` on
+the_chatroom → "Living Room"). Pieces: `src/net/install.ts`
+(planNetInstall; guard-allow-listed as a lifecycle surface),
+`src/net/identity.ts` (§8 export schema + import + abort-on-dangling
+verification), `scripts/net-install.ts` (the operator CLI),
+`scripts/net-install-dev.ts` (the workerd proof), `/net-install` worker
+doorway (signature-gated, NOT dataset-gated — the production conduit;
+allow-listed to seed+head only). In-process proofs:
+tests/net/identity.test.ts (round-trip: an OLD key authenticates in the
+NEW world; dangling refs abort) + tests/worker/net-install.test.ts.
+
+Decisions/discoveries recorded while building:
+- **`email` added to the §8 prop allow-list** (deliberate deviation,
+  flagged): account lookup for password login is BY email; a carried
+  account without it could never log in — defeating §8's own "humans
+  re-authenticate by password".
+- **Preserved-id collisions are real**: the boot snapshot ships stock
+  actors (guest_1 sits at $nowhere in a fresh world). Import ADOPTS a
+  same-class existing id (identity props overwrite; §8 rehome applies
+  only when it sits nowhere) and ABORTS on a class mismatch.
+- **Rehoming = `$system.guest_initial_room`** (the same catalog
+  convention that places fresh guests); `world.moveObject` made public
+  for exactly this one out-of-band consumer (documented at the method).
+- **PRE-CUTOVER BLOCKER discovered: native seed-graph verbs do not
+  dispatch over the net planner.** `look`/`who`/`help` etc. have no
+  bytecode pages (they are `native()` in the seed graph), the planner's
+  miss derivation attributes them to the TARGET object
+  (`verb_bytecode:guest_1:look`), and pull-on-miss loops to E_BUDGET.
+  Every net lane so far used installed DSL verbs, so this was never
+  exercised. Users type `look` constantly — the cutover cannot route
+  traffic until native dispatch works over net (or the seed graph's
+  universal verbs move woocode-ward, the stated direction of travel).
+  This is its own focused pass.
+
+REMAINING: B's export route (`/__internal/identity-export` on the v2
+worker) + C write-freeze (one v2-side change, one pre-cutover v2
+deploy); the native-verb gap above; then the owner's cutover op.

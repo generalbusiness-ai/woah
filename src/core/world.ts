@@ -8812,7 +8812,13 @@ export class WooWorld {
     if (Array.isArray(focusList) && focusList.length > 0) this.setProp(actor, "focus_list", []);
   }
 
-  private moveObject(objRef: ObjRef, targetRef: ObjRef): void {
+  /** Raw placement primitive (no hook chain — movetoChecked is the
+   * receiver-driven move). Public for exactly one out-of-band consumer:
+   * the identity import's §8 rehoming of an ADOPTED stock actor
+   * (src/net/identity.ts), which runs on a pre-export in-process world
+   * where the catalog hook chain has nothing to veto. In-world movement
+   * must keep going through the checked verbs. */
+  moveObject(objRef: ObjRef, targetRef: ObjRef): void {
     const obj = this.object(objRef);
     this.object(targetRef);
     const oldLocation = obj.location;
