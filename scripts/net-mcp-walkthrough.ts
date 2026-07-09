@@ -75,9 +75,15 @@ async function main(): Promise<void> {
         }
       };
 
+      // PARITY CONFIGURATION: the same flag set as the workerd v2 lane
+      // (scripts/smoke-cf-dev.ts) — one scenario, both transports, same
+      // steps. This IS the parity gate.
       await runSmokeWalkthrough({ alice, bob }, step, {
         runId,
         includeTakeDrop: true,
+        includeConcurrentMove: true,
+        includeCarryAcrossRooms: true,
+        includeToolSurfaceAfterMove: true,
         log: (message) => console.log(`        ${message}`)
       });
     });

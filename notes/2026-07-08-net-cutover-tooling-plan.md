@@ -240,5 +240,13 @@ Phases, smallest-risk order:
    Tool-space UIs (pinboard/outliner/tasks) follow on the framework
    adapter; the flip is per-surface, flag-gated, so the SPA can ship
    dual-transport during the bake.
-3. **Walkthrough parity gate** — one scenario, both transports, then
-   the §8 route switch (step 4).
+3. **Walkthrough parity gate — MET (2026-07-09).** `smoke:net-mcp` now
+   runs the IDENTICAL 13-step flag configuration as the v2 workerd lane
+   (`smoke:cf-dev`): takeDrop + concurrentMove (B6) + carryAcrossRooms
+   (C3) + toolSurfaceAfterMove (C3). Both lanes 13/13, fully enforced —
+   one scenario, two transports, same steps, same green. The C3 gates
+   passed on net FIRST RUN with no additional work (lineage-closed
+   transfers are the net layer's construction, not a repair). Remaining
+   before the §8 route switch (step 4): the PUBLIC identity door over
+   net (guest entry + account/password login) and the phase-iii
+   tool-space browser panels.
