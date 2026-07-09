@@ -79,6 +79,31 @@ export default {
       return jsonResponse({ error: wooError("E_NOSESSION", "internal routes require a signed internal request") }, 401);
     }
 
+    // Cutover item C: the §8 write-freeze, edge half (the DO enforces it
+    // again — defense in depth). Freezes the V2 surfaces only: the NET
+    // namespace (/net-api, /net-install) must stay fully usable during
+    // the window — installing and proving the new world is WHY the old
+    // one is frozen. GET reads continue; the WS upgrade and session mint
+    // are refused even as GETs (each opens a mutation channel). /admin
+    // stays up (operator surface, own auth).
+    if (env.WOO_WRITE_FREEZE) {
+      const frozenSurface =
+        isApiPath(url.pathname) || url.pathname === "/mcp" || url.pathname === "/connect" || url.pathname.startsWith("/v2/");
+      const mutating = request.method !== "GET" || url.pathname === "/v2/turn-network/ws" || url.pathname === "/v2/session/mint";
+      if (frozenSurface && mutating) {
+        return jsonResponse(
+          {
+            error: {
+              code: "E_MAINTENANCE",
+              message: "write-frozen for the cutover maintenance window; reads continue, writes resume after the window",
+              detail: { frozen: true }
+            }
+          },
+          503
+        );
+      }
+    }
+
     // Plan 002 Phase 3 lane surface (step 4b): the workerd smoke lane
     // (scripts/net-smoke-workerd.ts, `npm run smoke:net-dev`) drives the
     // net DOs over plain HTTP through this block. It exists ONLY for the
@@ -690,13 +715,31 @@ async function handleNetInstall(request: Request, env: Env, url: URL): Promise<R
     );
   }
   const parts = url.pathname.split("/").filter(Boolean); // ["net-install", "scope", name, verb]
+  // Cutover item B: the identity-export fetch — the ONE read the §8
+  // sequence takes from OLD prod. Forwarded freshly-signed to the world
+  // host's internal export route (read-only; runs against the frozen
+  // world — both freeze gates exempt signed internal traffic).
+  if (parts.length === 2 && parts[1] === "identity-export" && request.method === "GET") {
+    const forward = new Request(`${INTERNAL_ORIGIN}/__internal/identity-export`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}"
+    });
+    return forwardToHost(env, WORLD_HOST, forward);
+  }
   const kind = parts[1];
   const name = parts[2] === undefined ? "" : decodeURIComponent(parts[2]);
   const verb = parts[3];
   const allowed = (verb === "seed" && request.method === "POST") || (verb === "head" && request.method === "GET");
   if (kind !== "scope" || !name || parts.length !== 4 || !allowed) {
     return jsonResponse(
-      { error: { code: "E_INVARG", message: "expected POST /net-install/scope/<name>/seed or GET /net-install/scope/<name>/head" } },
+      {
+        error: {
+          code: "E_INVARG",
+          message:
+            "expected POST /net-install/scope/<name>/seed, GET /net-install/scope/<name>/head, or GET /net-install/identity-export"
+        }
+      },
       404
     );
   }

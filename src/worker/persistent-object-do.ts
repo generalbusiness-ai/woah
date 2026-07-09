@@ -42,6 +42,7 @@ import {
 } from "../core/authority-slice";
 import { shadowObjectLineagePage, shadowObjectLivePage, shadowPropertyCellPages, stampAuthorityPageRef, type AuthorityPageProvenance, type ShadowStatePage } from "../core/shadow-state-pages";
 import type { EffectTranscript } from "../core/effect-transcript";
+import { exportIdentity } from "../net/identity";
 import { installLocalCatalogs, localCatalogBundleFingerprint, localCatalogRepairFingerprint, parseAutoInstallCatalogs, runHostScopedLocalCatalogLifecycle } from "../core/local-catalogs";
 import {
   handleRestProtocolRequest,
@@ -229,6 +230,13 @@ export interface Env {
   // staging hits `woo_v1_staging` and prod hits `woo_v1_prod`; defaults
   // to `woo_v1_prod` for unset envs to fail safely toward production.
   WOO_AE_DATASET?: string;
+  // Cutover item C (§8 write-freeze): any non-empty value freezes the v2
+  // world for the maintenance window — mutating requests and new
+  // sessions/sockets refuse with the named E_MAINTENANCE verdict while
+  // GET reads and internal-signed routes (including the identity export)
+  // continue. Set/cleared via `wrangler secret`/vars; no code deploy per
+  // freeze flip.
+  WOO_WRITE_FREEZE?: string;
   // KV-fronted host-seed cache. Populated by WORLD on every host-seed
   // build (via waitUntil so the build itself isn't blocked) and read by
   // satellite cold-loads before they fall back to WORLD's DO. See
@@ -1471,6 +1479,26 @@ export class PersistentObjectDO {
 
       if (!worldGatewayHost && (pathname === "/api/auth" || pathname === "/v2/turn-network/ws")) {
         return jsonResponse({ error: { code: "E_NOTAPPLICABLE", message: `${pathname} is only available on the world gateway host` } }, 404);
+      }
+
+      // Cutover item C: the §8 write-freeze, enforced AT THE DO so a
+      // request that reaches a host by any path (edge forward, another
+      // DO, a stale route) still refuses. Internal-signed routes stay
+      // open — cross-DO reads keep working and the identity export runs
+      // against the FROZEN world (the §8 sequence). GET reads continue;
+      // every mutation-capable public entry (POSTs, and the WS upgrade,
+      // which would open a mutation channel) refuses namedly.
+      if (!internalRequest && this.env.WOO_WRITE_FREEZE && (request.method !== "GET" || pathname === "/v2/turn-network/ws")) {
+        return jsonResponse(
+          {
+            error: {
+              code: "E_MAINTENANCE",
+              message: "write-frozen for the cutover maintenance window; reads continue, writes resume after the window",
+              detail: { frozen: true }
+            }
+          },
+          503
+        );
       }
 
       // D1 crash-recovery drain: if the constructor found undrained fanout rows
@@ -4249,6 +4277,17 @@ export class PersistentObjectDO {
         return jsonResponse({ objects: await world.scopedObjectSummaries(readActor, ids) });
       }
 
+      if (request.method === "POST" && pathname === "/__internal/identity-export") {
+        // Cutover item B (§8): the identity carry-over export — api_keys
+        // verbatim plus the reachable identity actor graph, from this
+        // world's live serialized image. Read-only and internal-signed,
+        // so it runs against the FROZEN world (the freeze gate above
+        // exempts internal routes) — exactly the protocol's "final
+        // identity-export from frozen old prod". Reached from outside
+        // via the signed GET /net-install/identity-export edge doorway.
+        return jsonResponse(exportIdentity(world.exportWorld()));
+      }
+
       if (request.method === "POST" && pathname === "/__internal/room-snapshot") {
         const readActor = String(body.read_actor ?? "") as ObjRef;
         const room = String(body.room ?? "") as ObjRef;
@@ -4949,6 +4988,25 @@ export class PersistentObjectDO {
   }
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    // Cutover item C: sockets accepted BEFORE the freeze flag flipped
+    // bypass the fetch-entry gate, so the frame handler enforces it too —
+    // otherwise a long-lived client could keep mutating through the
+    // maintenance window. Frames are refused (not the socket closed):
+    // the client sees the named verdict and its connection survives the
+    // window.
+    if (this.env.WOO_WRITE_FREEZE) {
+      try {
+        ws.send(
+          JSON.stringify({
+            type: "error",
+            error: { code: "E_MAINTENANCE", message: "write-frozen for the cutover maintenance window", detail: { frozen: true } }
+          })
+        );
+      } catch {
+        // Dead socket: the close/error callbacks own cleanup.
+      }
+      return;
+    }
     const world = await this.getWorld();
     const existing = this.attachment(ws);
     if (existing?.protocol === "v2-turn-network") {

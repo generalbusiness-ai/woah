@@ -133,6 +133,60 @@ Decisions/discoveries recorded while building:
   bare-word COMMAND PARSE ("look" → room:look) is client/superstructure
   work the cutover's client shell must own (v2's parser does it today).
 
-REMAINING: B's export route (`/__internal/identity-export` on the v2
-worker) + C write-freeze (one v2-side change, one pre-cutover v2
-deploy); then the owner's cutover op.
+**B (route) + C COMPLETE (2026-07-09):** the one v2-side change.
+- Export: `GET /net-install/identity-export` (signed, edge doorway) →
+  freshly-signed forward to the world host's
+  `POST /__internal/identity-export` → `exportIdentity(world.exportWorld())`.
+  Operator CLI: `scripts/identity-export.ts` (shape-checks before
+  writing the file).
+- Freeze: `WOO_WRITE_FREEZE` (any non-empty value; vars/secret flip, no
+  code deploy) enforced at BOTH the edge and the DO (defense in depth —
+  a request reaching a host by any path still refuses), plus the WS
+  frame handler (sockets accepted before the flip would otherwise keep
+  mutating; frames refuse with the named error, the socket survives).
+  Named verdict: 503 `E_MAINTENANCE {frozen:true}`. GET reads continue;
+  WS upgrade + session mint refuse even as GETs; internal-signed routes
+  stay open (the export runs against the FROZEN world — the §8
+  sequence); /net-api + /net-install + /admin are never frozen (the NEW
+  namespace must stay usable during the window).
+- Tests (deploy-gated in curated npm test):
+  tests/worker/net-cutover-freeze.test.ts — frozen mutations 503,
+  reads 200, signed export 200 under freeze, unsigned 401, unfrozen
+  normal. Gates: npm test 782; worker 383; smoke:cf-dev 13/13 (v2
+  walkthrough — freeze inert when unfrozen); smoke:net-dev 24/24;
+  install:net-dev 5/5; load 3/3.
+
+## The cutover runbook (§8 steps → commands)
+
+Owner-run, in order; every step idempotent or read-only unless marked.
+
+0. **Pre-deploy**: merge `net-cutover`; `./scripts/deploy.sh` (ships the
+   export route + freeze flag support + install doorway). Verify the
+   walkthrough gate as usual.
+1. **Announce the window. Freeze old prod**:
+   `npx wrangler secret put WOO_WRITE_FREEZE` (value `1`) — or a vars
+   deploy. Probe: POST /api/auth → 503 E_MAINTENANCE; GET /healthz →
+   200.
+2. **Final export from frozen prod**:
+   `WOO_INTERNAL_SECRET=... npx tsx scripts/identity-export.ts
+   --base-url https://woah1.generalbusiness.ai --out identity-export.json`
+3. **Install into the net namespace + verify** (idempotent; abort =
+   re-run): `WOO_INTERNAL_SECRET=... npx tsx scripts/net-install.ts
+   --base-url https://woah1.generalbusiness.ai
+   --identity identity-export.json
+   --verify-apikey apikey:<id>:<secret>`
+   (the mint probe is §8 step 3's auth check; add a carried-account
+   password login check when the client shell lands).
+4. **Route switch**: move the public hostname to the net-serving client
+   — DNS/route change, NEVER a 308 (WS clients cannot follow redirects;
+   the woah→woah1 incident). [Requires the net client shell — the
+   remaining build item.]
+5. **Postflight + bake**: deployed walkthrough + tail thresholds; old
+   prod stays deployed AND FROZEN through the bake. Rollback = switch
+   the route back + delete WOO_WRITE_FREEZE — nothing else.
+6. **After the bake**: retire old prod; the §8 deletion commits.
+
+REMAINING build item before step 4 can run: the net CLIENT SHELL
+(bare-word command parse "look" → room:look, the browser/MCP surface
+over /net-api) — the last piece between "namespace proven" and "traffic
+routed". Steps 0–3 are executable today.
