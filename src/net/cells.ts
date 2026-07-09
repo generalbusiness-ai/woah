@@ -131,6 +131,11 @@ export class CellStore {
    * enumerate the calling actor's sessions (the move chain's primary-
    * session decision needs them all) without an O(store) key scan. */
   private readonly sessionKeysByActor = new Map<string, Set<string>>();
+  /** location id → objects whose object_live cell places them there (the
+   * ROSTER index, client-shell phase i): room-verb planning must seed the
+   * room's members (name matching, contents projection) without an
+   * O(store) scan per turn. */
+  private readonly membersByLocation = new Map<string, Set<string>>();
 
   constructor(role: StoreRole) {
     this.role = role;
@@ -165,6 +170,12 @@ export class CellStore {
       if (!sessionKeys) this.sessionKeysByActor.set(actor, (sessionKeys = new Set()));
       sessionKeys.add(cell.key);
     }
+    const location = liveLocationOf(cell);
+    if (location !== null) {
+      let members = this.membersByLocation.get(location);
+      if (!members) this.membersByLocation.set(location, (members = new Set()));
+      members.add(cell.object);
+    }
   }
 
   private unindexCell(cell: Cell): void {
@@ -179,6 +190,14 @@ export class CellStore {
       if (sessionKeys) {
         sessionKeys.delete(cell.key);
         if (sessionKeys.size === 0) this.sessionKeysByActor.delete(actor);
+      }
+    }
+    const location = liveLocationOf(cell);
+    if (location !== null) {
+      const members = this.membersByLocation.get(location);
+      if (members) {
+        members.delete(cell.object);
+        if (members.size === 0) this.membersByLocation.delete(location);
       }
     }
   }
@@ -303,6 +322,14 @@ export class CellStore {
     return out;
   }
 
+  /** Objects whose live cell places them at `location` — O(the roster)
+   * via the location index (room-verb planning seeds the room's members
+   * for name matching + the contents projection). */
+  membersAt(location: string): string[] {
+    const members = this.membersByLocation.get(location);
+    return members ? [...members] : [];
+  }
+
   /** The actor's session cells — O(the actor's own sessions) via the
    * session index (the seed-slice builder's per-turn session lookup,
    * replacing an O(store) key scan). */
@@ -316,6 +343,14 @@ export class CellStore {
     }
     return out;
   }
+}
+
+/** The location an object_live cell places its object at, or null (the
+ * roster index's extraction rule). */
+function liveLocationOf(cell: Cell): string | null {
+  if (cell.kind !== "object_live") return null;
+  const location = (cell.value as { location?: unknown } | null | undefined)?.location;
+  return typeof location === "string" && location.length > 0 ? location : null;
 }
 
 /** The actor a session cell belongs to, or null for every other cell kind

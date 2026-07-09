@@ -65,6 +65,44 @@ export async function planNetInstall(options: NetInstallOptions = {}): Promise<N
   const world = createWorld();
   installLocalCatalogs(world, catalogs);
   if (options.graft) await options.graft(world);
+  normalizeAnchors(world);
   const partitions = partitionCells(cellsFromSerialized(world.exportWorld()));
   return { epoch: netInstallEpoch(catalogs), partitions, world };
+}
+
+/**
+ * CO15 anchor normalization — healing the named seed-data debt at the
+ * ONE boundary where a world enters net topology. topology.ts documents
+ * that anchorless instances classify to the CATALOG scope and calls the
+ * bundled catalogs' missing anchors "seed-data debt, not a topology
+ * gap": an un-anchored mug would make `take` COMMIT AT THE CATALOG
+ * SCOPE — user state in the shared substrate, fanned to an audience
+ * where nobody is present. The heal: every non-class instance that
+ * carries a location but no anchor is anchored WHERE IT SITS (a room
+ * member to its room, a carried item to its carrier — anchor chains
+ * root through either). Deterministic and idempotent; classes and
+ * genuinely place-less objects are untouched.
+ */
+function normalizeAnchors(world: WooWorld): void {
+  const serialized = world.exportWorld();
+  const objects = new Map(serialized.objects.map((obj) => [obj.id, obj]));
+  const reachesActor = (id: string): boolean => {
+    let current: string | null | undefined = id;
+    const guard = new Set<string>();
+    while (current && !guard.has(current)) {
+      if (current === "$actor") return true;
+      guard.add(current);
+      current = objects.get(current)?.parent;
+    }
+    return false;
+  };
+  for (const obj of serialized.objects) {
+    if (obj.id.startsWith("$")) continue; // classes/substrate: catalog by design
+    if (obj.anchor !== null || obj.location === null || obj.location === "$nowhere") continue;
+    // Actors stay anchorless BY DESIGN: an anchorless actor classifies to
+    // its own private cluster (CO14 — the session authority), which is
+    // the model, not the debt.
+    if (reachesActor(obj.id)) continue;
+    world.object(obj.id).anchor = obj.location;
+  }
 }

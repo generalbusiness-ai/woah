@@ -29,7 +29,7 @@ import { validateSessionCell } from "./sessions";
 import { applyRelationDeltas, deriveRelationDeltas, rebuildContentsRelation, relationKey, type RelationDelta, type RelationRow } from "./relations";
 import type { ScopeStore } from "./scope-store";
 import { applyTranscript, netCellKeyFor, type EffectTranscript, type TranscriptCell } from "./transcript";
-import { cellVersion } from "./cells";
+import { cellKey, cellVersion } from "./cells";
 
 export type ScopeHead = {
   seq: number;
@@ -173,6 +173,10 @@ export class ScopeSequencer {
   readonly catalogEpoch: string;
   readonly store: CellStore;
   private headState: ScopeHead;
+  /** Lazily derived next-object allocation counter (client-shell phase i:
+   * creates over net). Null = derive from the store on next read; an
+   * accepted create advances it. See objectCounter(). */
+  private nextObjectCounter: number | null = null;
   private readonly replies = new Map<string, CommitReply>();
   private readonly tail: Array<{ seq: number; transcript_hash: string; touched: string[] }> = [];
   private readonly scheduled = new Map<string, ScheduledTurn>();
@@ -234,12 +238,38 @@ export class ScopeSequencer {
     return this.headState;
   }
 
+  /**
+   * The next-object allocation counter this authority's state implies
+   * (client-shell phase i: creates over net). The engine allocates
+   * `obj_<scope>_<n>` and SKIPS ids present in its world — but a sliced
+   * planning world only sees the slice, so the planner must START from a
+   * counter that is ≥ every id this authority has ever allocated, or a
+   * non-resident id could be re-minted and silently overwrite. Derived
+   * lazily from the store's lineage keys (numeric id suffixes), advanced
+   * by accepted creates; recycled ids may be re-used after a rehydrate —
+   * the same semantics as the engine's own has()-skip allocator. Served
+   * on /net/head so the gateway threads it into planning.
+   */
+  objectCounter(): number {
+    if (this.nextObjectCounter === null) {
+      let max = 0;
+      for (const key of this.store.keys()) {
+        if (!key.startsWith("object_lineage:obj_")) continue;
+        const match = /_(\d+)$/.exec(key);
+        if (match) max = Math.max(max, Number(match[1]));
+      }
+      this.nextObjectCounter = max + 1;
+    }
+    return this.nextObjectCounter;
+  }
+
   stamp(): EpochStamp {
     return { scope_head: `${this.headState.seq}:${this.headState.hash}`, catalog_epoch: this.catalogEpoch };
   }
 
   /** Seed authoritative cells outside a turn (bootstrap/install path). */
   seed(cells: Array<Pick<Cell, "kind" | "object" | "name" | "value">>): void {
+    this.nextObjectCounter = null; // re-derive over the seeded store
     const seeded: Cell[] = [];
     for (const cell of cells) {
       seeded.push(this.store.commit({ kind: cell.kind, object: cell.object, ...(cell.name !== undefined ? { name: cell.name } : {}), value: cell.value, stamp: this.stamp() }));
@@ -323,11 +353,18 @@ export class ScopeSequencer {
       for (const cell of entry.cells) attested.set(cell.key, cell.version);
     }
     const mismatched = new Map<string, TranscriptCell>();
+    // Reads of objects THIS transcript creates validate locally: the
+    // owner cannot attest a cell that does not exist there yet, and the
+    // planner honestly recorded such reads against pre-create absence —
+    // absent == absent below. (The v2 twin of this rule was the
+    // sameTurnRead fix; without it every create-then-read turn rejects
+    // terminal rider_unattested at a cross-scope commit.)
+    const createdHere = new Set((submit.transcript.creates ?? []).map((create) => create.object));
     for (const read of submit.transcript.reads) {
       if (read.version === undefined) continue; // negative/probe read
       const key = netCellKeyFor(read.cell);
       if (key === null) continue; // contents reads are projection reads (CA4)
-      if (this.options.owns && !this.options.owns(read.cell.object)) {
+      if (this.options.owns && !this.options.owns(read.cell.object) && !createdHere.has(read.cell.object)) {
         const attestedVersion = attested.get(key);
         if (attestedVersion === undefined) {
           // A rider read nobody attested is a protocol violation by the
@@ -357,6 +394,26 @@ export class ScopeSequencer {
       : submit.transcript.writes.every((write) => netCellKeyFor(write.cell) === null || write.writer !== undefined);
     if (!writesAuthorized) {
       return this.reject(submit, "write_unauthorized", {});
+    }
+
+    // Create-collision guard (client-shell phase i): a planned create
+    // whose id ALREADY exists here means the planner allocated against a
+    // slice that lacked the object (its counter or slice was stale).
+    // Reject as a read-version mismatch NAMING THE LINEAGE CELL: the
+    // plan effectively read that object's absence. The gateway's repair
+    // refreshes exactly that cell — installing the existing object into
+    // its view — and the re-plan's allocator then SKIPS the id (the
+    // engine's own has()-skip rule), so the loop converges instead of
+    // silently overwriting an object the planner never saw.
+    for (const create of submit.transcript.creates ?? []) {
+      if (this.store.get(cellKey("object_lineage", create.object)) !== undefined) {
+        return this.reject(submit, "read_version_mismatch", { create_collision: create.object }, [
+          // "lifecycle" is the transcript kind that keys object_lineage
+          // (netCellKeyFor) — the refresh then pulls the existing
+          // object's lineage into the planner's view.
+          { kind: "lifecycle", object: create.object } as TranscriptCell
+        ]);
+      }
     }
 
     // The head this acceptance WILL have is computable before the apply
@@ -389,6 +446,15 @@ export class ScopeSequencer {
       else this.store.delete(key);
     }
     this.headState = nextHead;
+    // Advance the allocation counter past every accepted create (phase i;
+    // no-op when the counter has not been derived yet — derivation reads
+    // the store, which now holds these ids).
+    if (this.nextObjectCounter !== null) {
+      for (const create of submit.transcript.creates ?? []) {
+        const match = /_(\d+)$/.exec(create.object);
+        if (match) this.nextObjectCounter = Math.max(this.nextObjectCounter, Number(match[1]) + 1);
+      }
+    }
     const tailEntry = { seq: nextHead.seq, transcript_hash: submit.transcript.hash, touched: applied.touched };
     this.tail.push(tailEntry);
     if (this.tail.length > this.options.tailLimit) this.tail.splice(0, this.tail.length - this.options.tailLimit);

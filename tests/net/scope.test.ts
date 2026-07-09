@@ -479,3 +479,46 @@ describe("reply-cache boundedness (H2a)", () => {
     expect(store.readReplies().length).toBe(10);
   });
 });
+
+describe("creates over net: the allocation counter + collision guard (client-shell phase i)", () => {
+  it("objectCounter derives from lineage ids, advances on accepted creates, and re-derives after seed", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seq.seed([
+      { kind: "object_lineage", object: "#thing", value: { parent: null } },
+      { kind: "object_lineage", object: `obj_${SCOPE}_5`, value: { parent: "#thing" } },
+      { kind: "property_cell", object: "#thing", name: "label", value: { value: "x" } }
+    ]);
+    expect(seq.objectCounter()).toBe(6);
+
+    // An accepted create advances the counter past its id suffix.
+    const create = transcript({
+      creates: [{ object: `obj_${SCOPE}_6`, name: "fresh", parent: "#thing", owner: "#actor", anchor: null, location: null, flags: {} }],
+      hash: "counter-c1"
+    });
+    const reply = seq.submit(submitFor(seq, create, "counter-k1"));
+    expect(reply.status).toBe("accepted");
+    expect(seq.objectCounter()).toBe(7);
+  });
+
+  it("a create colliding with an existing id rejects as a read-version mismatch naming the lineage cell (repair installs the object; the re-plan skips the id)", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seq.seed([
+      { kind: "object_lineage", object: "#thing", value: { parent: null } },
+      { kind: "object_lineage", object: `obj_${SCOPE}_3`, value: { parent: "#thing" } }
+    ]);
+    // A plan whose slice never saw obj_<scope>_3 (a stale counter) tries
+    // to create it again — the authority must never silently overwrite.
+    const colliding = transcript({
+      creates: [{ object: `obj_${SCOPE}_3`, name: "dupe", parent: "#thing", owner: "#actor", anchor: null, location: null, flags: {} }],
+      hash: "counter-c2"
+    });
+    const reply = seq.submit(submitFor(seq, colliding, "counter-k2"));
+    expect(reply.status).toBe("rejected");
+    if (reply.status !== "rejected") return;
+    expect(reply.reason).toBe("read_version_mismatch");
+    expect(reply.retryable).toBe(true);
+    expect(reply.mismatched_reads).toEqual([{ kind: "lifecycle", object: `obj_${SCOPE}_3` }]);
+    // The existing object is untouched.
+    expect(seq.store.get(`object_lineage:obj_${SCOPE}_3`)?.value).toMatchObject({ parent: "#thing" });
+  });
+});

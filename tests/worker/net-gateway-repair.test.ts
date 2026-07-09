@@ -457,20 +457,28 @@ describe("gateway turn edges (fix 5)", () => {
 
     // Divergent re-plan: simulate a key whose FIRST submit targeted
     // pin_other (pre-persisted pin) while the current plan selects
-    // repair_room. The override routes to the pinned scope, whose shell
-    // refuses the wrong-scope submit (one DO = one scope — upstream of
-    // the sequencer's scope_mismatch verdict, same terminal CO6
-    // posture): the failure SURFACES and repair_room must not commit.
+    // repair_room. The override routes to the pinned scope, whose
+    // SEQUENCER rejects the wrong-scope submit with the NAMED terminal
+    // scope_mismatch verdict (client-shell phase i legibility: the shell
+    // no longer masks it with a bare wrong-DO 500): the failure SURFACES
+    // as a terminal TurnResult and repair_room must not commit.
     gState.state.storage.sql.exec(
       "INSERT INTO net_gateway_pin (idempotency_key, scope) VALUES ('fix5c-t2', 'pin_other')"
     );
     const headBefore = (await call<{ head: { seq: number } }>(scopeDO, scopeEnv, "/head")).head.seq;
-    const { status, body } = await callRaw<{ error: unknown }>(gateway, gEnv, "/turn", {
-      ...turnRequest(bumpCall("turn-5c-2"), "fix5c-t2"),
-      scopes: { [SCOPE]: `scope:${SCOPE}`, pin_other: "scope:pin_other" }
-    });
-    expect(status).toBe(500);
-    expect(JSON.stringify(body)).toContain("pin_other");
+    const { status, body } = await callRaw<{ reply?: { status?: string; reason?: string; detail?: Record<string, unknown> } }>(
+      gateway,
+      gEnv,
+      "/turn",
+      {
+        ...turnRequest(bumpCall("turn-5c-2"), "fix5c-t2"),
+        scopes: { [SCOPE]: `scope:${SCOPE}`, pin_other: "scope:pin_other" }
+      }
+    );
+    expect(status).toBe(200);
+    expect(body.reply?.status).toBe("rejected");
+    expect(body.reply?.reason).toBe("scope_mismatch");
+    expect(JSON.stringify(body.reply?.detail)).toContain("repair_room");
     // Never double-commit elsewhere: the freshly-selected scope did NOT
     // receive the turn.
     const headAfter = (await call<{ head: { seq: number } }>(scopeDO, scopeEnv, "/head")).head.seq;

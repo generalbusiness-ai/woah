@@ -443,6 +443,22 @@ function buildSeedSlice(view: CellStore, call: ShadowTurnCall): Set<string> {
   for (const object of chain) {
     for (const cell of view.cellsForObject(object)) seed.add(cell.key);
   }
+  // ROSTER footprint (client-shell phase i): a room-verb turn matches
+  // names against the room's CONTENTS, and the planning world recomputes
+  // contents from slice-resident live cells — an absent member is
+  // silently unmatchable (no miss the growth loop could catch). Seed
+  // each named space's members MINIMALLY: lineage (the name), live (the
+  // projection membership), and the aliases property (match vocabulary).
+  // Full member cells enter only when the turn actually touches one
+  // (growth/refresh), so the slice stays ~read-set + O(room roster) —
+  // room-sized by design (CO11.1), never O(view).
+  for (const space of [...chain]) {
+    for (const member of view.membersAt(space)) {
+      for (const suffix of [`object_lineage:${member}`, `object_live:${member}`, `property_cell:${member}:aliases`]) {
+        if (view.has(suffix)) seed.add(suffix);
+      }
+    }
+  }
   // Resolve object-valued properties so obj-ref reads land on materialized
   // objects: an unmaterialized ref target makes the engine attribute the
   // downstream property miss to the frame's OWN `this` (not the ref

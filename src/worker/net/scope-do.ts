@@ -625,7 +625,19 @@ export class NetScopeDO {
         const submit = "submit" in raw ? raw.submit : raw;
         const riderDestinations = "submit" in raw ? (raw.rider_destinations ?? {}) : {};
         const relateDestinations = "submit" in raw ? (raw.relate_destinations ?? {}) : {};
-        const seq = this.ensureSequencer(submit.scope, submit.stamp.catalog_epoch);
+        // Hydrate from durable identity ONLY (no scope hint): a submit
+        // naming another scope must reach the SEQUENCER's step-2 check
+        // and reject with the NAMED terminal `scope_mismatch` — the
+        // designed verdict for the gateway's selection-pin override
+        // (fix 5c: a re-plan that migrated scopes surfaces legibly).
+        // Passing submit.scope here made ensureSequencer's wrong-DO
+        // guard throw a bare 500 first, masking the verdict. An UNSEEDED
+        // DO still needs identity from somewhere: fall back to the
+        // submit's naming (its reply then comes from a fresh sequencer
+        // that refuses everything else consistently).
+        const seq = this.seq !== null || this.store.readMeta() !== null
+          ? this.ensureSequencer(undefined, submit.stamp.catalog_epoch)
+          : this.ensureSequencer(submit.scope, submit.stamp.catalog_epoch);
         const headBefore = seq.head().seq;
         // Rider-read integrity (fix 1): capture, BEFORE the commit applies,
         // the prior version this turn observed for each rider-anchored
@@ -721,6 +733,7 @@ export class NetScopeDO {
           from_scope: string;
           seq: number;
           deltas: RelationDelta[];
+          observations?: unknown[];
         };
         const related = this.relate(body);
         // A non-empty application enqueued refan rows to this scope's own
@@ -754,7 +767,10 @@ export class NetScopeDO {
       }
       if (request.method === "GET" && url.pathname === "/net/head") {
         const seq = this.ensureSequencer();
-        return json({ scope: seq.scope, catalog_epoch: seq.catalogEpoch, head: seq.head() });
+        // object_counter (client-shell phase i): the allocation floor the
+        // gateway threads into planning so creates never re-mint an id
+        // this authority already holds. Additive field (v1 add-only).
+        return json({ scope: seq.scope, catalog_epoch: seq.catalogEpoch, head: seq.head(), object_counter: seq.objectCounter() });
       }
       if (request.method === "POST" && url.pathname === "/net/seed") {
         const body = (await request.json()) as {
@@ -1202,6 +1218,18 @@ export class NetScopeDO {
       for (const object of objects) {
         for (const cell of store.sessionCellsForActor(object)) requested.push(cell.key);
       }
+      // ROSTER footprint (client-shell phase i — mirrors the seed
+      // slice's rule in plan.ts): each NAMED object's members ride
+      // minimally (lineage + live + aliases) so a warm gateway can match
+      // names against the room's contents; full member cells arrive on
+      // actual touch via the repair loop.
+      for (const object of objects) {
+        for (const member of store.membersAt(object)) {
+          for (const key of [`object_lineage:${member}`, `object_live:${member}`, `property_cell:${member}:aliases`]) {
+            if (store.has(key)) requested.push(key);
+          }
+        }
+      }
     }
     for (const key of requested) {
       const cell = store.get(key);
@@ -1425,11 +1453,27 @@ export class NetScopeDO {
     // relate_destinations when named, else the CO15 `scope:<scopeName>`
     // convention (the DO namespace key IS the scope name).
     for (const entry of reply.relations_foreign ?? []) {
+      // Client-shell phase i: room-addressed observations RIDE WITH the
+      // presence delta to the room's owner. A movement commits at the
+      // actor's own authority (B6 — off the room sequencer), so its
+      // `left`/`entered` announcements would otherwise fan out only to
+      // the committing scope's audience, where nobody is present. The
+      // owner applies the delta and refans BOTH to its subscribers under
+      // its own head seq — the transition and its announcement arrive as
+      // one sequenced event, exactly the v2 affected-scopes delivery.
+      const owners = new Set(entry.deltas.map((delta) => delta.row.owner));
+      const roomObservations = observations.filter((obs) => {
+        const record = obs as { source?: unknown; room?: unknown } | null;
+        return (
+          (typeof record?.source === "string" && owners.has(record.source)) ||
+          (typeof record?.room === "string" && owners.has(record.room))
+        );
+      });
       this.persistOutboxRow("/relate", relateDestinations[entry.scope]?.destination ?? `scope:${entry.scope}`, {
         scope: seq.scope,
         seq: reply.head.seq,
         cells: [],
-        observations: [],
+        observations: roomObservations,
         relations: entry.deltas
       });
     }
@@ -1697,12 +1741,15 @@ export class NetScopeDO {
               });
             } else if (route === "/relate") {
               // CO13: the row's FanoutBody carries the deltas; the wire
-              // shape is (from_scope, seq, deltas) — the receiver's
-              // idempotency key plus its application input.
+              // shape is (from_scope, seq, deltas[, observations]) — the
+              // receiver's idempotency key plus its application input.
+              // Observations (phase i): the room-addressed announcements
+              // riding with the presence delta (see enqueueDeliveries).
               await this.host.rpc(row.destination, "/relate", {
                 from_scope: row.body.scope,
                 seq: row.body.seq,
-                deltas: row.body.relations ?? []
+                deltas: row.body.relations ?? [],
+                ...(row.body.observations.length > 0 ? { observations: row.body.observations } : {})
               });
             } else if (route === "/plan-scheduled") {
               // CO16: deliver the scheduled turn to the planner gateway,
@@ -2014,6 +2061,7 @@ export class NetScopeDO {
     from_scope: string;
     seq: number;
     deltas: RelationDelta[];
+    observations?: unknown[];
   }): { applied: boolean; changed: number; head: ScopeHead } {
     const seq = this.ensureSequencer();
     return this.discardSeqOnThrow(() => this.store.transaction(() => {
@@ -2039,7 +2087,12 @@ export class NetScopeDO {
             scope: seq.scope,
             seq: result.head.seq,
             cells: [],
-            observations: [],
+            // Phase i: the room-addressed announcements that rode with
+            // the presence delta refan under THIS scope's head seq, so
+            // occupants receive the transition and its announcement as
+            // one sequenced event. Redelivered relates no-op above, so
+            // the push stays at-most-once.
+            observations: body.observations ?? [],
             relations: applied
           });
         }

@@ -152,6 +152,31 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
     const missing = await call(aliceSession, "woo_call", { object: "the_chatroom", verb: "no_such_verb_xyz", args: [] });
     expect(missing.result?.isError).toBe(true);
 
+    // Cross-room move: the walkthrough's acid test (left/entered fanout).
+    const entered = await call(aliceSession, "woo_call", { object: "the_chatroom", verb: "enter", args: [] });
+    expect(entered.result?.isError, JSON.stringify(entered).slice(0, 400)).not.toBe(true);
+    await settleAll();
+    const moved = await call(aliceSession, "woo_call", { object: "the_chatroom", verb: "southeast", args: [] });
+    expect(moved.result?.isError, JSON.stringify(moved).slice(0, 600)).not.toBe(true);
+    await settleAll();
+    const waitedMove = await call(bobSession, "woo_wait", { timeout_ms: 0 });
+    const moveObs = waitedMove.result?.structuredContent?.result?.observations ?? [];
+    const left = moveObs.find((obs: any) => obs?.type === "left" && obs.actor === alice);
+    expect(left, JSON.stringify(moveObs).slice(0, 400)).toBeTruthy();
+
+    // take/drop: room-committed contents change with cross-actor fanout.
+    const back = await call(aliceSession, "woo_call", { object: "the_deck", verb: "west", args: [] });
+    expect(back.result?.isError, JSON.stringify(back).slice(0, 300)).not.toBe(true);
+    await settleAll();
+    await call(bobSession, "woo_wait", { timeout_ms: 0 }); // drain the entered
+    const took = await call(aliceSession, "woo_call", { object: "the_chatroom", verb: "take", args: ["mug"] });
+    expect(took.result?.isError, JSON.stringify(took).slice(0, 400)).not.toBe(true);
+    await settleAll();
+    const waitedTake = await call(bobSession, "woo_wait", { timeout_ms: 0 });
+    const takeObs = waitedTake.result?.structuredContent?.result?.observations ?? [];
+    const taken = takeObs.find((obs: any) => obs?.type === "taken" && obs.actor === alice);
+    expect(taken, JSON.stringify(takeObs).slice(0, 400)).toBeTruthy();
+
     states.forEach((st) => st.close());
   });
 });

@@ -792,13 +792,24 @@ export class NetGatewayDO {
       // ---- Plan (or adopt the stale_head resubmit).
       let planned: PlanTurnResult;
       let base: ScopeHead | null = null;
+      // Planning-scope head prefetch (client-shell phase i): fetched
+      // BEFORE planning so the authority's allocation counter reaches
+      // the planner — a create must mint an id fresh at the authority.
+      // Reused as the submit base when the commit scope IS the planning
+      // scope (the warm common case), keeping the warm turn at the same
+      // sync-RPC count as before; a cross-scope selection re-fetches
+      // from its own destination below.
+      let planningHead: Awaited<ReturnType<typeof this.scopeHead>> | null = null;
       if (resubmit) {
         planned = resubmit.planned;
         base = resubmit.base;
         resubmit = null;
       } else {
         try {
-          planned = await this.planOnce(request, view, classifier);
+          structure.countRpc();
+          planningHead = await this.scopeHead(this.destinationFor(request, request.planningScope));
+          this.assertTurnEpoch(planningHead, request.catalog_epoch, request.planningScope, trace);
+          planned = await this.planOnce(request, view, classifier, planningHead.object_counter);
         } catch (err) {
           if (isNetError(err) && err.code === "E_MISSING_STATE") {
             const missing = Array.isArray(err.detail.missing) ? (err.detail.missing as string[]) : [];
@@ -841,6 +852,11 @@ export class NetGatewayDO {
         );
       }
       const destination = this.destinationFor(request, targetScope);
+      if (base === null && planningHead !== null && targetScope === request.planningScope) {
+        // Same-scope commit: the prefetched planning head IS the base —
+        // no second head fetch (the warm-turn RPC budget).
+        base = planningHead.head;
+      }
       if (base === null) {
         structure.countRpc();
         // Phase 5: the head reply names the scope's durable epoch —
@@ -2109,17 +2125,36 @@ export class NetGatewayDO {
       JSON.stringify({ kind: "net_presence_scan", scope: body.scope, presence_scan_rows: rows.length, ts: Date.now() })
     );
     if (rows.length === 0) return;
-    const frame = JSON.stringify({
-      type: "observations",
-      scope: body.scope,
-      seq: body.seq,
-      observations: body.observations
-    });
+    // Session -> actor for the directed-observation filter below: the
+    // presence row body carries the session's actor (CO13 applier).
+    const actorOf = new Map<string, string | null>();
+    for (const row of rows) {
+      const detail = sqlRows<{ body: string | null }>(
+        this.state.storage.sql.exec(
+          "SELECT body FROM net_gateway_relation WHERE relation = 'session_presence' AND owner_scope = ? AND member = ?",
+          body.scope,
+          row.member
+        )
+      )[0];
+      const parsed = detail?.body ? (JSON.parse(detail.body) as { actor?: string }) : null;
+      actorOf.set(row.member, typeof parsed?.actor === "string" ? parsed.actor : null);
+    }
     for (const row of rows) {
       if (body.turn_id !== undefined && this.recentClientTurns.get(body.turn_id) === row.member) continue;
+      // v2 audience parity (client-shell phase i): a `to:`-directed
+      // observation (looked/who — private views) reaches ONLY the session
+      // whose actor it names; everything else is the room broadcast. The
+      // engine's full audience model stays server-side — this filter only
+      // honors the explicit direction the observation itself carries.
+      const actor = actorOf.get(row.member) ?? null;
+      const visible = (body.observations as Array<Record<string, unknown>>).filter(
+        (obs) => typeof obs?.to !== "string" || obs.to === actor
+      );
+      if (visible.length === 0) continue;
       // MCP wait queues ride the SAME audience + submitter dedupe as the
       // sockets (client-shell phase i).
-      this.mcpEnqueue(row.member, body.observations);
+      this.mcpEnqueue(row.member, visible);
+      const frame = JSON.stringify({ type: "observations", scope: body.scope, seq: body.seq, observations: visible });
       for (const ws of getSockets ? getSockets(row.member) : []) {
         try {
           ws.send(frame);
@@ -2540,7 +2575,12 @@ export class NetGatewayDO {
    * patched after the head fetch — `base` is an envelope field, not part
    * of the transcript hash. Catalog-scope lineage keys ride as the
    * receiver-known set (CO15: class chains never reship). */
-  private async planOnce(request: TurnRequest, view: CellStore, classifier: ScopeClassifier): Promise<PlanTurnResult> {
+  private async planOnce(
+    request: TurnRequest,
+    view: CellStore,
+    classifier: ScopeClassifier,
+    objectCounter?: number
+  ): Promise<PlanTurnResult> {
     return planTurn({
       call: request.call,
       view,
@@ -2561,14 +2601,22 @@ export class NetGatewayDO {
       // miss), so the planner world AND the fix-6 snapshot are
       // O(read-set), not O(view).
       slicePlanning: true,
-      ...(request.counters !== undefined ? { counters: request.counters } : {})
+      // Creates over net (client-shell phase i): the planning-scope
+      // authority's allocation floor, prefetched with its head, so a
+      // planned create's id is fresh at the authority. A lane fixture's
+      // explicit counters win (they built the world and know better).
+      ...(request.counters !== undefined
+        ? { counters: request.counters }
+        : objectCounter !== undefined
+          ? { counters: { objectCounter } }
+          : {})
     });
   }
 
   /** The scope's /head reply, epoch included (Phase 5: the epoch was
    * previously discarded here — the one uniform place every turn path
    * already touches). */
-  private async scopeHead(destination: string): Promise<{ head: ScopeHead; catalog_epoch?: string }> {
+  private async scopeHead(destination: string): Promise<{ head: ScopeHead; catalog_epoch?: string; object_counter?: number }> {
     return (await this.host.rpc(destination, "/head")) as { head: ScopeHead; catalog_epoch?: string };
   }
 
@@ -2682,7 +2730,16 @@ export class NetGatewayDO {
     const known = [...view.keys()].filter((key) => key.startsWith("object_lineage:"));
     for (const [destination, want] of byDestination) {
       structure?.countRpc();
-      const transfer = (await this.host.rpc(destination, "/closure", { keys: want, known })) as CellTransfer;
+      // Client-shell phase i: refresh by OBJECTS too, not bare keys. A
+      // mismatch naming a cell of an object the view never materialized
+      // (a room's exit read as class-default absence by a sparse plan)
+      // would otherwise install just the named cells — no lineage — and
+      // the re-plan's obj-ref expansion still could not seed the object,
+      // looping the mismatch to the budget. The objects-mode closure
+      // materializes each named object whole (chain + cells), so the
+      // re-plan reads real values.
+      const objects = [...new Set(want.filter((key) => !key.startsWith("session:")).map((key) => objectOfCellKey(key)))];
+      const transfer = (await this.host.rpc(destination, "/closure", { keys: want, known, objects })) as CellTransfer;
       const wanted = new Set(want);
       this.discardViewOnThrow(() =>
         this.state.storage.transactionSync(() => {
@@ -2720,7 +2777,9 @@ export class NetGatewayDO {
         if (satisfied) break;
         try {
           structure?.countRpc();
-          const transfer = (await this.host.rpc(destination, "/closure", { keys: want, known })) as CellTransfer;
+          // Objects mode here too (phase i): a convention hit must
+          // materialize the object whole, not just the named keys.
+          const transfer = (await this.host.rpc(destination, "/closure", { keys: want, known, objects: [object] })) as CellTransfer;
           if (transfer.cells.length === 0) continue;
           this.discardViewOnThrow(() =>
             this.state.storage.transactionSync(() => {
