@@ -402,3 +402,36 @@ class, recorded, not phase iii.
 
 REMAINING before the §8 route switch: the PUBLIC identity door over
 net (guest entry + account/password login — apikeys only today).
+
+## IDENTITY DOOR COMPLETE (2026-07-10, 2f5ca7c): the LAST build item
+
+Guest entry + account/password login over /net-api, proven in real
+browsers with NO stored credential (e2e 5/5: guest claim → chat;
+carol's real carried-password sign-in → chat; wrong password →
+fail-closed card). Pieces: session-bearer credential class (the
+documented Phase-5 hole — a door-minted session IS the bearer for the
+whole surface; bearer-mint refused); /net-api/login (PBKDF2 verify
+against carried $account cells in the catalog view, fail-closed v2
+message parity, email-keyed amplifier rate bucket); /net-api/guest
+(install-seeded $system.guest_pool — anonymous seats only: neither
+account- nor apikey-bound; placed at install for born-present
+sessions; EXCLUSIVE mint at the cluster sequencer refuses
+actor_occupied so concurrent claims serialize — two humans never share
+a guest; named exhaustion). §8 GAP FIXED: importIdentity now rebuilds
+account.primary_actor/actors[] from the carried actor-side bindings —
+password login resolves through primary_actor, which the allow-list
+deliberately does not carry. Installer: --verify-password
+email:password (step-3 second half, deactivate-on-failure). NetFeed
+adoptSession (expiry terminal → shell shows the door); SPA login card
+net-wired (Email label; woo:net:session persistence; logout → card).
+
+Gates @ 2f5ca7c: npm test 809, e2e:net 5/5, install 5/5, net-mcp
+13/13, net-dev 24/24, cf-dev 13/13, load 3/3 + skew 6/6; test:worker
+rotates the documented pre-existing heavy-v2 parallel flake (all green
+solo).
+
+**NOTHING REMAINS BEFORE THE §8 OP.** Every build item is done: install
+pipeline + activation barrier, identity carry (apikeys + passwords,
+both prove-able), freeze + watermarked export, client shell (MCP + SPA
+chat + panels + door), NC8 local half. The runbook's steps 0–6 are all
+executable; the cutover itself stays owner-run.
