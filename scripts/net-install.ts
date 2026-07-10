@@ -11,9 +11,12 @@
 // catalogs), grafts the carried identity when given (item B — applied
 // BEFORE export so it partitions like any other state), splits by CO15
 // topology, and seeds each scope through the signed /net-install doorway.
-// Idempotent by the M9 epoch guard: re-running the same catalog bundle
-// re-seeds at the same epoch (no-op-shaped success); a different bundle
-// refuses rather than mixing worlds.
+// Re-run posture (M9 + the destructive-reseed guard): a crashed install
+// re-runs safely while no scope has COMMITTED turns (same-epoch re-seed
+// of install cells over install cells); once any turn commits — e.g.
+// the credential probe minted — a re-seed refuses E_SEED_COMMITTED and
+// the recovery is a fresh namespace. A different catalog bundle refuses
+// E_EPOCH_MISMATCH rather than mixing worlds.
 //
 // The cutover state machine (spec/operations/net-cutover.md): the
 // namespace stays INSTALLING — the gateway refuses ALL client traffic
@@ -26,7 +29,7 @@
 // probe DEACTIVATES the namespace before aborting — safe because
 // activation always precedes the route switch, so no traffic exists yet.
 import { readFileSync } from "node:fs";
-import { netActivationCell, planNetInstall } from "../src/net/install";
+import { planNetInstall } from "../src/net/install";
 import { importIdentity, parseIdentityExport } from "../src/net/identity";
 import { CATALOG_SCOPE } from "../src/net/topology";
 import { signInternalRequest } from "../src/worker/internal-auth";
@@ -106,10 +109,24 @@ export async function runNetInstall(args: Args, env: { WOO_INTERNAL_SECRET?: str
     return body;
   };
 
-  // INSTALLING: seed every scope. Failures abort — a partial install is
-  // safe to re-run (same epoch → no-op-shaped success on the
-  // already-seeded scopes), and the missing activation cell keeps the
-  // gateway refusing client traffic the whole time.
+  // The NC1 activation state machine, as its own signed op: /net/seed
+  // refuses once a scope has committed turns (the destructive-reseed
+  // guard), so activation/deactivation never ride a seed.
+  const setActivation = async (activeEpoch: string | null): Promise<void> => {
+    const url = `${args.baseUrl}/net-install/scope/${encodeURIComponent(CATALOG_SCOPE)}/activate`;
+    const response = await signedFetch(env, new Request(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ scope: CATALOG_SCOPE, catalog_epoch: plan.epoch, active_epoch: activeEpoch })
+    }));
+    if (!response.ok) throw new Error(`activation write failed: ${response.status} ${await response.text()}`);
+  };
+
+  // INSTALLING: seed every scope. Failures abort — a PRE-COMMIT partial
+  // install is safe to re-run (same epoch, heads still 0), and the
+  // missing activation cell keeps the gateway refusing client traffic
+  // the whole time. A scope with committed turns refuses re-seeding
+  // (E_SEED_COMMITTED) by design.
   for (const [scope, cells] of scopes) {
     console.log(`seeded ${scope}: ${await seedScope(scope, cells)}`);
   }
@@ -128,7 +145,7 @@ export async function runNetInstall(args: Args, env: { WOO_INTERNAL_SECRET?: str
   // ACTIVATE: publish the verified epoch at the catalog authority. From
   // this seed on, the gateway admits client traffic — which the final
   // credential probe below depends on (it uses the REAL client surface).
-  await seedScope(CATALOG_SCOPE, [netActivationCell(plan.epoch)]);
+  await setActivation(plan.epoch);
   console.log(`activated: ${CATALOG_SCOPE} publishes epoch ${plan.epoch}`);
 
   // Verification 2 (identity rode along): a carried apikey must mint a
@@ -147,7 +164,7 @@ export async function runNetInstall(args: Args, env: { WOO_INTERNAL_SECRET?: str
     });
     const body = (await response.json().catch(() => ({}))) as { session?: string };
     if (!response.ok || typeof body.session !== "string") {
-      await seedScope(CATALOG_SCOPE, [netActivationCell(null)]);
+      await setActivation(null);
       throw new Error(
         `identity verification failed — namespace DEACTIVATED: /net-api/session ${response.status} ${JSON.stringify(body)}`
       );
@@ -173,7 +190,7 @@ export async function runNetInstall(args: Args, env: { WOO_INTERNAL_SECRET?: str
     });
     const body = (await response.json().catch(() => ({}))) as { session?: string };
     if (!response.ok || typeof body.session !== "string") {
-      await seedScope(CATALOG_SCOPE, [netActivationCell(null)]);
+      await setActivation(null);
       throw new Error(
         `password verification failed — namespace DEACTIVATED: /net-api/login ${response.status} ${JSON.stringify(body)}`
       );

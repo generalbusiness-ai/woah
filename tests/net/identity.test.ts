@@ -77,6 +77,47 @@ describe("identity import into a fresh install (item A + B)", () => {
     expect([...plan.partitions.keys()]).toContain(`cluster:${actor}`);
   });
 
+  it("multi-actor accounts keep their ORIGINAL primary_actor across the carry (reviewer finding 3)", async () => {
+    // The reviewer's repro shape: the primary is z_human, but an agent
+    // whose id sorts FIRST is also bound — a rebuild-from-first-sorted
+    // would hand password logins to the agent.
+    const world = createWorld();
+    world.createObject({ id: "z_human", name: "Zed", parent: "$human", owner: "$wiz" });
+    world.createObject({ id: "a_agent", name: "Agent", parent: "$agent", owner: "z_human" });
+    world.createObject({ id: "acct_multi", name: "Multi", parent: "$account", owner: "$wiz" });
+    world.setProp("acct_multi", "email", "multi@example.com");
+    world.setProp("acct_multi", "password_hash", "hash-multi");
+    world.setProp("acct_multi", "primary_actor", "z_human");
+    world.setProp("acct_multi", "actors", ["z_human", "a_agent"]);
+    world.setProp("z_human", "account", "acct_multi");
+    world.setProp("a_agent", "account", "acct_multi");
+    const identity = exportIdentity(world.exportWorld());
+
+    const account = identity.actors.find((entry) => entry.id === "acct_multi");
+    expect(account?.props.primary_actor).toBe("z_human");
+    expect(account?.props.actors).toEqual(["z_human", "a_agent"]);
+
+    const plan = await planNetInstall({ graft: (fresh) => importIdentity(fresh, identity) });
+    expect(plan.world.propOrNull("acct_multi", "primary_actor")).toBe("z_human");
+    expect(plan.world.propOrNull("acct_multi", "actors")).toEqual(["z_human", "a_agent"]);
+  });
+
+  it("carries deactivated_at (reviewer finding 2) and rebuilds primary_actor only as the fallback", async () => {
+    const world = createWorld();
+    world.createObject({ id: "h_only", name: "H", parent: "$human", owner: "$wiz" });
+    world.createObject({ id: "acct_fb", name: "FB", parent: "$account", owner: "$wiz" });
+    world.setProp("acct_fb", "email", "fb@example.com");
+    world.setProp("acct_fb", "password_hash", "hash-fb");
+    world.setProp("acct_fb", "deactivated_at", 12345);
+    // NO primary_actor in the old world: the import fallback rebuilds it
+    // from the actor-side binding.
+    world.setProp("h_only", "account", "acct_fb");
+    const identity = exportIdentity(world.exportWorld());
+    const plan = await planNetInstall({ graft: (fresh) => importIdentity(fresh, identity) });
+    expect(plan.world.propOrNull("acct_fb", "deactivated_at")).toBe(12345);
+    expect(plan.world.propOrNull("acct_fb", "primary_actor")).toBe("h_only");
+  });
+
   it("aborts on dangling refs — an apikey pointing at an uncarried actor fails the import (§8: abort, not warn)", async () => {
     const { world } = oldWorld();
     const identity = exportIdentity(world.exportWorld());

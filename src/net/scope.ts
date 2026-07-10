@@ -267,8 +267,23 @@ export class ScopeSequencer {
     return { scope_head: `${this.headState.seq}:${this.headState.hash}`, catalog_epoch: this.catalogEpoch };
   }
 
-  /** Seed authoritative cells outside a turn (bootstrap/install path). */
+  /** Seed authoritative cells outside a turn (bootstrap/install path).
+   *
+   * Reviewer finding 1 (destructive reseed): a seed may only land on a
+   * scope with NO committed turns. Same-epoch re-seed of a PRE-TRAFFIC
+   * scope stays the documented crash-recovery story (install cells
+   * overwriting install cells at head.seq 0); once ANY turn has
+   * committed, a re-seed would silently reset authoritative state under
+   * an unchanged head — invisible to every version check — so it
+   * refuses terminally. Activation-state changes ride the dedicated
+   * operator op (operatorActivationWrite), never a seed. */
   seed(cells: Array<Pick<Cell, "kind" | "object" | "name" | "value">>): void {
+    if (this.headState.seq > 0) {
+      throw netError("E_SEED_COMMITTED", "scope has committed turns; a re-seed would reset authoritative state", {
+        scope: this.scope,
+        head_seq: this.headState.seq
+      });
+    }
     this.nextObjectCounter = null; // re-derive over the seeded store
     const seeded: Cell[] = [];
     for (const cell of cells) {
@@ -280,6 +295,33 @@ export class ScopeSequencer {
         for (const cell of seeded) durable.writeCell(cell);
         // Meta is written on seed too, so a seeded-but-never-committed
         // scope still hydrates with its head and epoch.
+        durable.writeMeta({ scope: this.scope, catalog_epoch: this.catalogEpoch, head: this.headState });
+      });
+    }
+  }
+
+  /**
+   * The activation state-machine write (spec/operations/net-cutover.md
+   * NC1; reviewer finding 1's "dedicated operation"): sets the ONE
+   * activation cell — never a general seed, so it stays legal after the
+   * scope has committed turns (deactivation happens post-verification,
+   * which is post-mint on the carried actor's cluster... and epoch
+   * bumps at the CATALOG scope, whose head never advances by client
+   * turns). Durable like a seed write; the head is untouched (the cell's
+   * own content-address version is what consumers check).
+   */
+  operatorActivationWrite(cell: Pick<Cell, "kind" | "object" | "name" | "value">): void {
+    const committed = this.store.commit({
+      kind: cell.kind,
+      object: cell.object,
+      ...(cell.name !== undefined ? { name: cell.name } : {}),
+      value: cell.value,
+      stamp: this.stamp()
+    });
+    const durable = this.options.durable;
+    if (durable) {
+      durable.transaction(() => {
+        durable.writeCell(committed);
         durable.writeMeta({ scope: this.scope, catalog_epoch: this.catalogEpoch, head: this.headState });
       });
     }

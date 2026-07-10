@@ -17,20 +17,27 @@ import { writeFileSync } from "node:fs";
 import { parseIdentityExport } from "../src/net/identity";
 import { signInternalRequest } from "../src/worker/internal-auth";
 
-function parseArgs(argv: string[]): { baseUrl: string; out: string; allowUnfrozen: boolean } {
-  const args = { baseUrl: "", out: "identity-export.json", allowUnfrozen: false };
+function parseArgs(argv: string[]): { baseUrl: string; out: string; allowUnfrozen: boolean; acknowledgeFreeze: string | null } {
+  const args = { baseUrl: "", out: "identity-export.json", allowUnfrozen: false, acknowledgeFreeze: null as string | null };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--base-url") args.baseUrl = argv[++i] ?? "";
     else if (arg === "--out") args.out = argv[++i] ?? args.out;
     else if (arg === "--allow-unfrozen") args.allowUnfrozen = true;
+    else if (arg === "--acknowledge-freeze") args.acknowledgeFreeze = argv[++i] ?? null;
     else throw new Error(`unknown argument: ${arg}`);
   }
   if (!args.baseUrl) throw new Error("--base-url is required");
   return args;
 }
 
-type ExportEnvelope = { frozen: boolean; watermark: string; exported_at: number; identity: unknown };
+type ExportEnvelope = {
+  frozen: boolean;
+  freeze_generation: string | null;
+  watermark: string;
+  exported_at: number;
+  identity: unknown;
+};
 
 async function fetchExport(baseUrl: string, allowUnfrozen: boolean, env: { WOO_INTERNAL_SECRET?: string }): Promise<ExportEnvelope> {
   const suffix = allowUnfrozen ? "?allow-unfrozen=1" : "";
@@ -49,6 +56,23 @@ async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   const env = { WOO_INTERNAL_SECRET: process.env.WOO_INTERNAL_SECRET };
   if (!env.WOO_INTERNAL_SECRET) throw new Error("WOO_INTERNAL_SECRET is required to sign the export request");
+
+  // Finding 6: acknowledge the write fence at the AUTHORITY before
+  // exporting — the export refuses without both the env flag and this
+  // persisted generation, and the receipt records the echoed value.
+  if (args.acknowledgeFreeze) {
+    const request = new Request(`${args.baseUrl}/net-install/freeze`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ generation: args.acknowledgeFreeze })
+    });
+    const response = await fetch(await signInternalRequest(env, request));
+    const ack = (await response.json()) as { freeze_generation?: string | null };
+    if (!response.ok || ack.freeze_generation !== args.acknowledgeFreeze) {
+      throw new Error(`freeze acknowledgment failed: ${response.status} ${JSON.stringify(ack)}`);
+    }
+    console.log(`freeze acknowledged: generation ${args.acknowledgeFreeze}`);
+  }
 
   // The quiescence proof: two reads, one verdict. Equal watermarks over
   // the full serialized world show the frozen image is STABLE — every
@@ -79,7 +103,9 @@ async function main(): Promise<void> {
   console.log(
     `identity-export ok: ${Object.keys(identity.api_keys).length} api keys, ${identity.actors.length} actors → ${args.out}`
   );
-  console.log(`watermark ${second.watermark} (frozen=${second.frozen}) — record this in the cutover receipt`);
+  console.log(
+    `watermark ${second.watermark} (frozen=${second.frozen}, generation=${String(second.freeze_generation)}) — record this in the cutover receipt`
+  );
 }
 
 main().catch((err) => {

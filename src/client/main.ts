@@ -1939,9 +1939,31 @@ let pinboardNotesHydrationBoard = "";
 if (netMode()) {
   connectNetFeed();
 } else {
-  state.authStatus = readStorage(sessionKey) ? "authenticated" : "anonymous";
-  if (state.authStatus === "authenticated") connect();
-  else render();
+  // Reviewer finding 4: with NO explicit signal (?net / storage), the
+  // transport default is the DEPLOYMENT's to make — a first-time
+  // browser at bare `/` after the route switch must reach the net
+  // client, not the frozen v2 surface. One same-origin fetch per
+  // unsignaled boot; 404/failure (an old worker, offline) falls back to
+  // the v2 boot. Deliberately never persisted: the rollback story is
+  // "route back", and a stored flag would strand clients on net against
+  // a worker that cannot serve it.
+  void (async () => {
+    let netDefault = false;
+    try {
+      const response = await fetch("/client-config");
+      if (response.ok) netDefault = Boolean(((await response.json()) as { net?: unknown }).net);
+    } catch {
+      // v2 fallback
+    }
+    if (netDefault) {
+      netModeLatched = true;
+      connectNetFeed();
+      return;
+    }
+    state.authStatus = readStorage(sessionKey) ? "authenticated" : "anonymous";
+    if (state.authStatus === "authenticated") connect();
+    else render();
+  })();
 }
 
 function ensureProjectionFields(subject: string, fields: readonly string[]): void {

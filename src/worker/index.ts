@@ -79,6 +79,15 @@ export default {
       return jsonResponse({ error: wooError("E_NOSESSION", "internal routes require a signed internal request") }, 401);
     }
 
+    // Reviewer finding 4: the SPA's transport default is DEPLOYMENT
+    // state, not client state — a first-time browser at bare `/` after
+    // the route switch must boot the net client. Public, unauthenticated,
+    // tiny; the SPA fetches it once per unsignaled boot (explicit ?net=1
+    // / localStorage signals win without the fetch).
+    if (request.method === "GET" && url.pathname === "/client-config") {
+      return jsonResponse({ net: Boolean(env.WOO_NET_DEFAULT) });
+    }
+
     // Cutover item C: the §8 write-freeze, edge half (the DO enforces it
     // again — defense in depth). Freezes the V2 surfaces only: the NET
     // namespace (/net-api, /net-install) must stay fully usable during
@@ -719,6 +728,22 @@ async function handleNetInstall(request: Request, env: Env, url: URL): Promise<R
   // sequence takes from OLD prod. Forwarded freshly-signed to the world
   // host's internal export route (read-only; runs against the frozen
   // world — both freeze gates exempt signed internal traffic).
+  // Finding 6: the acknowledged write fence — persist/clear the freeze
+  // generation at the world authority (POST {generation: string|null}).
+  if (parts.length === 2 && parts[1] === "freeze" && request.method === "POST") {
+    let body: ArrayBuffer;
+    try {
+      body = await readLimitedBody(request, MAX_JSON_BODY_BYTES);
+    } catch (err) {
+      return errorResponseFor(err);
+    }
+    const forward = new Request(`${INTERNAL_ORIGIN}/__internal/freeze`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body
+    });
+    return forwardToHost(env, WORLD_HOST, forward);
+  }
   if (parts.length === 2 && parts[1] === "identity-export" && request.method === "GET") {
     // `?allow-unfrozen=1` is the REHEARSAL override for the export
     // route's freeze-first refusal (see the /__internal/identity-export
@@ -734,14 +759,20 @@ async function handleNetInstall(request: Request, env: Env, url: URL): Promise<R
   const kind = parts[1];
   const name = parts[2] === undefined ? "" : decodeURIComponent(parts[2]);
   const verb = parts[3];
-  const allowed = (verb === "seed" && request.method === "POST") || (verb === "head" && request.method === "GET");
+  const allowed =
+    (verb === "seed" && request.method === "POST") ||
+    (verb === "head" && request.method === "GET") ||
+    // The NC1 activation state machine (reviewer finding 1): activation
+    // and deactivation are a dedicated signed op, never a seed — seeds
+    // refuse once a scope has committed.
+    (verb === "activate" && request.method === "POST");
   if (kind !== "scope" || !name || parts.length !== 4 || !allowed) {
     return jsonResponse(
       {
         error: {
           code: "E_INVARG",
           message:
-            "expected POST /net-install/scope/<name>/seed, GET /net-install/scope/<name>/head, or GET /net-install/identity-export"
+            "expected POST /net-install/scope/<name>/seed, POST /net-install/scope/<name>/activate, GET /net-install/scope/<name>/head, or GET /net-install/identity-export"
         }
       },
       404

@@ -42,7 +42,10 @@ test.beforeAll(async () => {
   const port = await findFreePort();
   base = `http://127.0.0.1:${port}`;
   persistDir = mkdtempSync(join(tmpdir(), "woo-net-spa-e2e-"));
-  child = startWorkerd(port, persistDir, {}, { extraArgs: ["--assets", join(ROOT, "dist")] });
+  // WOO_NET_DEFAULT: the deployment-controlled transport default
+  // (reviewer finding 4) — the bare-/ door test depends on it; the
+  // explicit ?net=1 tests are unaffected by it.
+  child = startWorkerd(port, persistDir, { WOO_NET_DEFAULT: "1" }, { extraArgs: ["--assets", join(ROOT, "dist")] });
   await waitReady(base);
 
   // 3. Install the world + carried identity through the production
@@ -96,6 +99,23 @@ test("the real SPA over the net path: alice's chat line reaches bob's browser", 
 
   await contextA.close();
   await contextB.close();
+});
+
+test("the route switch selects the net client: bare `/` with empty storage reaches the door (finding 4)", async ({ browser }) => {
+  test.setTimeout(60_000);
+  // The exact first-time-user shape after DNS movement: no query flag,
+  // no localStorage — the deployment default (WOO_NET_DEFAULT) must
+  // boot the NET client, whose unauthenticated state is the door (the
+  // v2 shell would instead try /api/me and its own guest flow).
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  await page.goto(`${base}/`);
+  await expect(page.locator("[data-login-guest]")).toBeVisible({ timeout: 30_000 });
+  // Prove it is the NET door, end-to-end: the guest button claims a pool
+  // seat through /net-api/guest and chat boots on the session bearer.
+  await page.locator("[data-login-guest]").click();
+  await expect(page.locator("[data-chat-input]")).toBeVisible({ timeout: 30_000 });
+  await context.close();
 });
 
 test("the identity door: guest entry and password sign-in in real browsers, no stored apikey", async ({ browser }) => {

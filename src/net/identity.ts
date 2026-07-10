@@ -27,12 +27,19 @@
 import type { SerializedObject, SerializedWorld } from "../core/repository";
 import type { WooWorld } from "../core/world";
 
-/** The §8 closed allow-list of identity properties, plus `email`: the §8
- * enumeration omits it, but account lookup for password login is BY
- * email (`world.findAccountByEmail`), so a carried account without its
- * email could never log in again — which would defeat the §8 intent
- * ("humans re-authenticate by password"). The addition is deliberate and
- * surfaced here rather than silently made. */
+/** The §8 closed allow-list of identity properties, plus three deliberate
+ * additions surfaced here rather than silently made:
+ * - `email`: account lookup for password login is BY email
+ *   (`world.findAccountByEmail`) — a carried account without it could
+ *   never log in again, defeating "humans re-authenticate by password";
+ * - `deactivated_at` (reviewer finding 2): omitting it REACTIVATED
+ *   deactivated identities at cutover — the lifecycle verdict must
+ *   carry;
+ * - `primary_actor` (reviewer finding 3): the account's human UI entry
+ *   point — rebuilt-from-bindings guesses wrong for multi-actor
+ *   accounts, so the original mapping carries (export filters it to
+ *   exported actors; import verifies resolution). `actors` carries too,
+ *   filtered the same way. */
 const IDENTITY_PROPS = [
   "name",
   "account",
@@ -41,6 +48,9 @@ const IDENTITY_PROPS = [
   "password_salt",
   "password_hash",
   "email",
+  "deactivated_at",
+  "primary_actor",
+  "actors",
   "last_seen_at"
 ] as const;
 
@@ -150,8 +160,18 @@ export function exportIdentity(serialized: SerializedWorld): IdentityExport {
     const props: Record<string, unknown> = {};
     const present = propsOf(obj);
     for (const name of IDENTITY_PROPS) {
-      const value = present.get(name);
-      if (value !== undefined) props[name] = value;
+      let value = present.get(name);
+      if (value === undefined) continue;
+      // Account→actor refs carry ONLY when the referenced actor rides
+      // this export (finding 3): a filtered-out ref would dangle at
+      // import and abort the whole carry. A dropped primary_actor is
+      // then rebuilt from the actor-side bindings (the import fallback).
+      if (name === "primary_actor" && typeof value === "string" && !wanted.has(value)) continue;
+      if (name === "actors" && Array.isArray(value)) {
+        value = value.filter((ref) => typeof ref === "string" && wanted.has(ref));
+        if ((value as unknown[]).length === 0) continue;
+      }
+      props[name] = value;
     }
     actors.push({
       id,
@@ -340,6 +360,12 @@ export async function importIdentity(world: WooWorld, identity: IdentityExport):
     const account = actor.props.account;
     if (typeof account === "string" && account.length > 0 && !liveChainReaches(world, account, "$account")) {
       dangling.push(`${actor.id}: account ${account} is not a live $account descendant`);
+    }
+    // Finding 3: a carried primary_actor must resolve (export filters to
+    // exported ids, so a dangle here is a real inventory bug).
+    const primary = actor.props.primary_actor;
+    if (typeof primary === "string" && primary.length > 0 && !liveChainReaches(world, primary, "$actor")) {
+      dangling.push(`${actor.id}: primary_actor ${primary} is not a live $actor descendant`);
     }
   }
   if (dangling.length > 0) {

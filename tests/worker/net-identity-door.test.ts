@@ -160,6 +160,77 @@ describe("the identity door (/net-api/login, /net-api/guest, session bearers)", 
     h.close();
   }, 30_000);
 
+  it("deactivated identities STAY deactivated across the carry (reviewer finding 2): password and apikey both refuse", async () => {
+    const old = createWorld();
+    const human = old.auth("guest:door-deactivated").actor;
+    old.createObject({ id: "acct_gone", parent: "$account", owner: "$wiz", name: "gone" });
+    old.setProp("acct_gone", "email", "gone@example.com" as never);
+    old.setProp("acct_gone", "password_hash", (await encodePassword(PASSWORD)) as never);
+    old.setProp("acct_gone", "deactivated_at", Date.now() as never);
+    old.setProp(human, "account", "acct_gone" as never);
+    old.ensureApiKey("$wiz", human, "gone-key", "gone-secret", "deactivated identity");
+    const identity = exportIdentity(old.exportWorld());
+
+    // The carry preserves the lifecycle verdict (the reviewer's repro
+    // was this import nulling deactivated_at).
+    const plan = await planNetInstall({ graft: (fresh) => importIdentity(fresh, identity) });
+    expect(plan.world.propOrNull("acct_gone", "deactivated_at")).not.toBeNull();
+
+    const states: Array<ReturnType<typeof netState>> = [];
+    const scopeDOs = new Map<string, NetScopeDO>();
+    const resolve = (destination: string) => {
+      if (destination.startsWith("scope:")) {
+        const instance = scopeDOs.get(destination.slice("scope:".length));
+        if (instance) return instance;
+      }
+      if (destination.startsWith("gateway:")) return gateway;
+      throw new Error(`unresolvable ${destination}`);
+    };
+    const scopeEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve };
+    for (const [scope, cells] of plan.partitions) {
+      const st = netState(`deact-scope-${scope}`);
+      states.push(st);
+      const instance = new NetScopeDO(st.state, scopeEnv);
+      const request = new Request("https://do/net/seed", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ scope, catalog_epoch: plan.epoch, cells })
+      });
+      const seeded = await instance.fetch(await signInternalRequest(scopeEnv, request));
+      expect(seeded.ok).toBe(true);
+      scopeDOs.set(scope, instance);
+    }
+    const gwState = netState("deact-gateway");
+    states.push(gwState);
+    const gateway = new NetGatewayDO(gwState.state, { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve } as NetGatewayEnv);
+
+    // Password: fail-closed shared message.
+    const login = await gateway.fetch(
+      new Request("https://do/net-api/login", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ email: "gone@example.com", password: PASSWORD })
+      })
+    );
+    expect(login.status).toBe(401);
+    expect(((await login.json()) as { error: { message: string } }).error.message).toBe("invalid email or password");
+
+    // Apikey: authentication succeeds but the MINT refuses — the
+    // eligibility gate every credential path passes.
+    const mint = await gateway.fetch(
+      new Request("https://do/net-api/session", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer apikey:gone-key:gone-secret" },
+        body: JSON.stringify({ ttl_ms: 60_000 })
+      })
+    );
+    expect(mint.status).toBe(403);
+    expect(((await mint.json()) as { error: { detail?: { reason?: string } } }).error.detail?.reason).toBe(
+      "identity_deactivated"
+    );
+    states.forEach((st) => st.close());
+  }, 30_000);
+
   it("guest claims are exclusive: distinct actors per claim, occupied seats skipped, exhaustion refuses namedly", async () => {
     const h = await buildDoorHarness();
 

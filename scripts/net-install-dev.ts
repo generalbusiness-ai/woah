@@ -8,8 +8,9 @@
 //   2. runNetInstall against the live worker — the plan's partitions
 //      travel through the signed /net-install doorway, exactly the
 //      cutover's transport (NOT the /net-smoke lane surface);
-//   3. re-run the install (idempotence: same epoch → no-op-shaped
-//      success on every scope);
+//   3. re-run the install: after the first install's credential-probe
+//      COMMIT, the destructive-reseed guard must refuse namedly
+//      (E_SEED_COMMITTED) — pre-commit crashes remain rerunnable;
 //   4. the carried apikey mints a session and commits a REAL turn
 //      through /net-api — §8 step 3's "prove the new namespace" shape.
 //
@@ -55,9 +56,23 @@ async function main(): Promise<void> {
       await runNetInstall(args, env);
       ok("install + head verification + carried-key mint (real workerd)");
 
-      // Idempotent re-run: the same bundle re-seeds at the same epoch.
-      await runNetInstall(args, env);
-      ok("re-run is a no-op-shaped success (same epoch)");
+      // Destructive-reseed guard (reviewer finding 1): the FIRST install
+      // ended with the credential probe — a real commit at the carried
+      // actor's cluster — so a re-run must now REFUSE with the named
+      // verdict instead of silently resetting committed state under an
+      // unchanged head. (Idempotent re-run remains the recovery story
+      // only for crashes BEFORE any commit; after commits, the recovery
+      // is a fresh namespace.)
+      let rerunRefusal = "";
+      try {
+        await runNetInstall(args, env);
+      } catch (err) {
+        rerunRefusal = String(err);
+      }
+      if (!rerunRefusal.includes("E_SEED_COMMITTED")) {
+        throw new Error(`re-run after commits must refuse E_SEED_COMMITTED; got: ${rerunRefusal || "success"}`);
+      }
+      ok("re-run after commits refuses namedly (E_SEED_COMMITTED — the destructive-reseed guard)");
 
       // Real turns through the client surface: mint, then the two
       // commands a user actually types first — `look` and `say` on the

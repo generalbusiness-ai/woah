@@ -85,6 +85,33 @@ describe("commit acceptance (CO4)", () => {
     }
   });
 
+  it("refuses a seed once the scope has committed turns (reviewer finding 1: the destructive-reseed guard)", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seq.seed([{ kind: "property_cell", object: "#thing", name: "n", value: { value: 1 } }]);
+    // Pre-traffic re-seed stays the crash-recovery story.
+    seq.seed([{ kind: "property_cell", object: "#thing", name: "n", value: { value: 1 } }]);
+
+    const reply = seq.submit(submitFor(seq, transcript({ writes: [propWrite(2)] }), "k-seeded"));
+    expect(reply.status).toBe("accepted");
+    const headAfterCommit = seq.head();
+    expect(seq.store.get("property_cell:#thing:n")?.value).toEqual({ value: 2 });
+
+    // The reviewer's repro: a same-epoch re-seed would have silently
+    // reset the committed value to 1 UNDER AN UNCHANGED HEAD. It must
+    // refuse terminally instead, leaving state and head untouched.
+    expect(() => seq.seed([{ kind: "property_cell", object: "#thing", name: "n", value: { value: 1 } }])).toThrowError(
+      /E_SEED_COMMITTED/
+    );
+    expect(seq.store.get("property_cell:#thing:n")?.value).toEqual({ value: 2 });
+    expect(seq.head()).toEqual(headAfterCommit);
+
+    // The activation state machine stays available AFTER commits — it is
+    // a dedicated operator op, never a seed.
+    seq.operatorActivationWrite({ kind: "property_cell", object: "$system", name: "net_active_epoch", value: { value: null } });
+    expect(seq.store.get("property_cell:$system:net_active_epoch")?.value).toEqual({ value: null });
+    expect(seq.head()).toEqual(headAfterCommit);
+  });
+
   it("owns predicate routes foreign reads to attestation; without it every read validates locally (CO2.4/CO2.3)", () => {
     // Multi-scope topology: this sequencer owns #thing but not #elsewhere.
     // A transcript read of #elsewhere carries the planning view's version;

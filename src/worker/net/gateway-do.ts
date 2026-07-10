@@ -1599,29 +1599,56 @@ export class NetGatewayDO {
     return { map, epoch: cell.stamp.catalog_epoch };
   }
 
+  /** Reviewer finding 5: how stale a cached ACTIVE verdict may get
+   * before the gateway re-verifies against the catalog authority.
+   * Deactivation (the installer's failed-verification compensation, or
+   * an operator epoch retirement) therefore reaches EVERY gateway —
+   * including the one that served the activation — within this window,
+   * not just freshly-constructed shards. Env-overridable so tests can
+   * force per-request re-verification. */
+  private activationVerifiedAt = 0;
+
+  private activationTtlMs(): number {
+    const raw = Number((this.env as { NET_ACTIVATION_TTL_MS?: string }).NET_ACTIVATION_TTL_MS);
+    return Number.isFinite(raw) && raw >= 0 ? raw : 30_000;
+  }
+
   /**
    * The activation barrier (spec/operations/net-cutover.md): identity
    * cells alone only prove the CATALOG scope is seeded — a namespace
    * mid-install can hold them while other scopes are absent or a mixed
    * epoch is being untangled. Client traffic is admitted only once the
    * catalog authority publishes the fully-verified install epoch in
-   * `property_cell:$system:net_active_epoch`, seeded by the install
-   * pipeline as its LAST step. Enforced here because catalogIdentity is
-   * the one gate every authenticated client request already passes.
+   * `property_cell:$system:net_active_epoch` (the /net/activate operator
+   * op). Enforced here because catalogIdentity is the one gate every
+   * authenticated client request already passes.
    *
-   * Absence re-pulls once before refusing: activation lands AFTER a
-   * gateway may have cached the pre-activation catalog view, and the
-   * refused state must clear the moment the operator activates.
+   * The verdict is re-verified against the AUTHORITY — a targeted
+   * one-key closure — whenever the cell is absent OR the cached verdict
+   * is older than the TTL (finding 5: a deactivation must revoke the
+   * gateways that cached activation, not just future ones).
    */
   private async assertNamespaceActive(identityEpoch: string): Promise<void> {
     const key = cellKey("property_cell", "$system", "net_active_epoch");
     let cell = this.ensureView().get(key);
-    if (!cell) {
+    const now = Date.now();
+    if (!cell || now - this.activationVerifiedAt > this.activationTtlMs()) {
       try {
-        await this.pull({ scope: CATALOG_SCOPE, destination: `scope:${CATALOG_SCOPE}` });
+        const transfer = (await this.host.rpc(`scope:${CATALOG_SCOPE}`, "/closure", { keys: [key], known: [] })) as CellTransfer;
+        const fresh = transfer.cells.find((entry) => entry.key === key);
+        this.discardViewOnThrow(() =>
+          this.state.storage.transactionSync(() => {
+            const view = this.ensureView();
+            if (fresh) view.install(fresh);
+            else view.delete(key);
+            this.persistCell(view, key);
+          })
+        );
+        this.activationVerifiedAt = now;
       } catch {
-        // The refusal below names the real condition; a failed re-pull
-        // must not mask it with a transport error.
+        // Authority unreachable: within the TTL a cached verdict keeps
+        // serving (availability); with NO cached cell the refusal below
+        // names the real condition rather than a transport error.
       }
       cell = this.ensureView().get(key);
     }
@@ -1773,6 +1800,28 @@ export class NetGatewayDO {
       [CATALOG_SCOPE, { scope: `cluster:${actor}`, objects: [actor] }],
       "net_client_pull_miss_failed"
     );
+    // Identity eligibility at EVERY mint (reviewer finding 2): an actor
+    // bound to a deactivated account must not mint, whatever credential
+    // reached here (apikey, password — the door double-checks, this is
+    // the one gate every path passes). The actor's `account` prop is in
+    // the cluster warm above; the account's cells live in the catalog
+    // view the identity gate already holds.
+    const accountRef = this.ensureView().get(cellKey("property_cell", actor, "account"))?.value as
+      | { value?: unknown }
+      | undefined;
+    if (typeof accountRef?.value === "string" && accountRef.value.length > 0) {
+      const deactivated = this.ensureView().get(cellKey("property_cell", accountRef.value, "deactivated_at"))?.value as
+        | { value?: unknown }
+        | undefined;
+      if (deactivated?.value != null) {
+        throw new ClientAuthError(
+          "identity deactivated",
+          { reason: "identity_deactivated", account: accountRef.value },
+          "E_PERM",
+          403
+        );
+      }
+    }
     // Phase 6: the id carries THIS shard's name so a future multi-shard
     // /net-api router can resolve a live session to the gateway holding
     // its view — a routing change, never a data migration.

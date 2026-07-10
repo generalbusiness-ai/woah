@@ -817,6 +817,32 @@ export class NetScopeDO {
         if (body.cells.some((cell) => cell.kind === "session")) this.armSessionReapAlarm(seq);
         return json({ ok: true, scope: seq.scope, head: seq.head() });
       }
+      if (request.method === "POST" && url.pathname === "/net/activate") {
+        // The NC1 activation state machine as a DEDICATED operator op
+        // (reviewer finding 1): /net/seed refuses once a scope has
+        // committed, so activation/deactivation — which legitimately
+        // happen around verification traffic — get their own signed
+        // route that writes exactly the one activation cell.
+        const body = (await request.json()) as { scope: string; catalog_epoch: string; active_epoch: string | null };
+        const durableEpoch = this.seq?.catalogEpoch ?? this.store.readMeta()?.catalog_epoch;
+        if (durableEpoch !== undefined && durableEpoch !== body.catalog_epoch) {
+          throw netError("E_EPOCH_MISMATCH", "activation epoch disagrees with the scope's durable epoch", {
+            scope: body.scope,
+            activation_epoch: body.catalog_epoch,
+            scope_epoch: durableEpoch
+          });
+        }
+        const seq = this.ensureSequencer(body.scope, body.catalog_epoch);
+        this.discardSeqOnThrow(() =>
+          seq.operatorActivationWrite({
+            kind: "property_cell",
+            object: "$system",
+            name: "net_active_epoch",
+            value: { value: body.active_epoch }
+          })
+        );
+        return json({ ok: true, scope: seq.scope, active_epoch: body.active_epoch });
+      }
       if (request.method === "POST" && url.pathname === "/net/schedule") {
         const body = (await request.json()) as { scope: string; catalog_epoch: string; turn: ScheduledTurn };
         const seq = this.ensureSequencer(body.scope, body.catalog_epoch);

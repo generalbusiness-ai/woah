@@ -237,6 +237,13 @@ export interface Env {
   // continue. Set/cleared via `wrangler secret`/vars; no code deploy per
   // freeze flip.
   WOO_WRITE_FREEZE?: string;
+  /** Reviewer finding 4 (the route switch must SELECT the net client):
+   * when set, GET /client-config answers {net:true} and an unsignaled
+   * SPA boot (bare `/`, empty storage) enters net mode. Deliberately
+   * resolved per boot and never persisted client-side: the runbook's
+   * rollback (route back to the old worker, which 404s /client-config)
+   * then restores v2 boots with no stranded client state. */
+  WOO_NET_DEFAULT?: string;
   // KV-fronted host-seed cache. Populated by WORLD on every host-seed
   // build (via waitUntil so the build itself isn't blocked) and read by
   // satellite cold-loads before they fall back to WORLD's DO. See
@@ -540,6 +547,10 @@ const HOST_STATE_TEARING_DOWN = "tearing_down";
 // current digest and skips the full seed transfer when it matches — see
 // createHostScopedWorld below.
 const HOST_SEED_DIGEST_META_KEY = "host_seed_digest";
+/** Finding 6: the authority-persisted freeze generation ("" = unfrozen).
+ * Set/cleared by the signed /__internal/freeze route; consulted by every
+ * mutation gate alongside the env flag; required + echoed by the export. */
+const FREEZE_GENERATION_META_KEY = "woo_freeze_generation";
 const LOCAL_CATALOG_BUNDLE_FINGERPRINT_META_KEY = "local_catalog_bundle_fingerprint";
 export const LOCAL_CATALOG_BUNDLE_REPAIR_EPOCH = "resident-catalog-repair-v3";
 const RESIDENT_DERIVED_CONTENTS_REPAIR_META_KEY = "resident_derived_contents_repair_epoch";
@@ -1488,13 +1499,13 @@ export class PersistentObjectDO {
       // against the FROZEN world (the §8 sequence). GET reads continue;
       // every mutation-capable public entry (POSTs, and the WS upgrade,
       // which would open a mutation channel) refuses namedly.
-      if (!internalRequest && this.env.WOO_WRITE_FREEZE && (request.method !== "GET" || pathname === "/v2/turn-network/ws")) {
+      if (!internalRequest && this.writeFrozen() && (request.method !== "GET" || pathname === "/v2/turn-network/ws")) {
         return jsonResponse(
           {
             error: {
               code: "E_MAINTENANCE",
               message: "write-frozen for the cutover maintenance window; reads continue, writes resume after the window",
-              detail: { frozen: true }
+              detail: { frozen: true, freeze_generation: this.freezeGeneration() }
             }
           },
           503
@@ -4277,6 +4288,30 @@ export class PersistentObjectDO {
         return jsonResponse({ objects: await world.scopedObjectSummaries(readActor, ids) });
       }
 
+      if (request.method === "POST" && pathname === "/__internal/freeze") {
+        // Reviewer finding 6: the env-var freeze is deploy-configuration
+        // — strong, but not an ACKNOWLEDGED fence (a config deploy has
+        // an in-flight window, and nothing at the AUTHORITY records that
+        // the fence is held). This persists a freeze generation in the
+        // world host's own durable meta: the mutation gates consult it
+        // alongside the env flag (either freezes), the export requires
+        // AND echoes it (the receipt binds the export to an acknowledged
+        // generation), and clearing it is the explicit unfreeze half of
+        // the rollback story. Internal-signed; idempotent per generation.
+        const generation = body.generation;
+        if (generation === null) {
+          this.repo.saveMeta(FREEZE_GENERATION_META_KEY, "");
+          this.freezeGenerationCache = null;
+          return jsonResponse({ frozen: Boolean(this.env.WOO_WRITE_FREEZE), freeze_generation: null });
+        }
+        if (typeof generation !== "string" || generation.length === 0) {
+          return jsonResponse({ error: wooError("E_INVARG", "freeze requires {generation: string} (null clears)") }, 400);
+        }
+        this.repo.saveMeta(FREEZE_GENERATION_META_KEY, generation);
+        this.freezeGenerationCache = generation;
+        return jsonResponse({ frozen: true, freeze_generation: generation });
+      }
+
       if (request.method === "POST" && pathname === "/__internal/identity-export") {
         // Cutover item B (§8): the identity carry-over export — api_keys
         // verbatim plus the reachable identity actor graph, from this
@@ -4295,13 +4330,18 @@ export class PersistentObjectDO {
         // slice) so the operator tool can prove quiescence: two
         // back-to-back exports with equal watermarks show no in-flight
         // write landed between them.
-        const frozen = Boolean(this.env.WOO_WRITE_FREEZE);
-        if (!frozen && body.allow_unfrozen !== true) {
+        const frozen = this.writeFrozen();
+        const generation = this.freezeGeneration();
+        // Finding 6: a REAL cutover export requires the ACKNOWLEDGED
+        // fence — the env flag AND the authority-persisted generation
+        // (the runbook sets both; the generation is what the receipt
+        // records). The rehearsal override skips both checks, loudly.
+        if ((!frozen || generation === null) && body.allow_unfrozen !== true) {
           return jsonResponse(
             {
               error: wooError(
                 "E_INVARG",
-                "identity export refused: the world is not write-frozen (set WOO_WRITE_FREEZE, or pass allow_unfrozen for a rehearsal)"
+                "identity export refused: the write fence is not acknowledged (set WOO_WRITE_FREEZE and POST /__internal/freeze {generation}, or pass allow_unfrozen for a rehearsal)"
               )
             },
             409
@@ -4312,6 +4352,7 @@ export class PersistentObjectDO {
         const watermark = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
         return jsonResponse({
           frozen,
+          freeze_generation: generation,
           watermark,
           exported_at: Date.now(),
           identity: exportIdentity(serialized)
@@ -4992,6 +5033,26 @@ export class PersistentObjectDO {
     return world.auth(`session:${match[1]}`);
   }
 
+  /** Finding 6: the persisted half of the write fence. Cached per
+   * instance; the freeze route updates the cache in the same isolate,
+   * and a fresh isolate (deploy, eviction) re-reads durable meta. */
+  private freezeGenerationCache: string | null | undefined = undefined;
+
+  private freezeGeneration(): string | null {
+    if (this.freezeGenerationCache === undefined) {
+      const raw = this.repo.loadMeta(FREEZE_GENERATION_META_KEY);
+      this.freezeGenerationCache = typeof raw === "string" && raw.length > 0 ? raw : null;
+    }
+    return this.freezeGenerationCache;
+  }
+
+  /** The write fence: EITHER half freezes — the env flag (deploy config,
+   * global, instant per isolate) or the authority-persisted generation
+   * (durable, survives env rollback until explicitly cleared). */
+  private writeFrozen(): boolean {
+    return Boolean(this.env.WOO_WRITE_FREEZE) || this.freezeGeneration() !== null;
+  }
+
   private resolveRestObject(world: WooWorld, id: string, session: Session): ObjRef {
     if (id === "$me") return session.actor;
     world.object(id);
@@ -5024,7 +5085,7 @@ export class PersistentObjectDO {
     // maintenance window. Frames are refused (not the socket closed):
     // the client sees the named verdict and its connection survives the
     // window.
-    if (this.env.WOO_WRITE_FREEZE) {
+    if (this.writeFrozen()) {
       try {
         ws.send(
           JSON.stringify({

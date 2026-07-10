@@ -44,11 +44,28 @@ function buildHarness(vars: Record<string, string> = {}) {
     request: async (path: string, init?: RequestInit) => worker.fetch(new Request(`https://woo.test${path}`, init), env, {} as never),
     signedRequest: async (path: string, init?: RequestInit) =>
       worker.fetch(await signInternalRequest({ WOO_INTERNAL_SECRET: SECRET }, new Request(`https://woo.test${path}`, init)), env, {} as never),
+    acknowledgeFreeze: async (generation: string | null) => {
+      const request = await signInternalRequest(
+        { WOO_INTERNAL_SECRET: SECRET },
+        new Request("https://woo.test/net-install/freeze", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ generation })
+        })
+      );
+      return worker.fetch(request, env, {} as never);
+    },
     close: () => states.forEach((state) => state.close())
   };
 }
 
-type ExportEnvelope = { frozen: boolean; watermark: string; exported_at: number; identity: unknown };
+type ExportEnvelope = {
+  frozen: boolean;
+  freeze_generation: string | null;
+  watermark: string;
+  exported_at: number;
+  identity: unknown;
+};
 
 describe("cutover item B: the identity-export doorway", () => {
   it("refuses unfrozen exports, honors the rehearsal override, and the watermark tracks mutations", async () => {
@@ -124,15 +141,52 @@ describe("cutover item C: the write-freeze", () => {
     const health = await h.request("/healthz");
     expect(health.status).toBe(200);
 
+    // Finding 6: env-frozen alone is NOT the acknowledged fence — the
+    // export refuses until the authority persists a generation.
+    const unacknowledged = await h.signedRequest("/net-install/identity-export");
+    expect(unacknowledged.status, await unacknowledged.clone().text()).toBe(409);
+    const ack = await h.acknowledgeFreeze("gen-test-1");
+    expect(ack.status, await ack.clone().text()).toBe(200);
+
     // THE §8 property: the signed export runs against the frozen world,
-    // reports frozen:true, and carries the stability watermark.
+    // reports the acknowledged generation, and carries the watermark.
     const response = await h.signedRequest("/net-install/identity-export");
     expect(response.status, await response.clone().text()).toBe(200);
     const envelope = (await response.json()) as ExportEnvelope;
     expect(envelope.frozen).toBe(true);
+    expect(envelope.freeze_generation).toBe("gen-test-1");
     expect(envelope.watermark).toMatch(/^[0-9a-f]{64}$/);
     expect(parseIdentityExport(envelope.identity).kind).toBe("woo.identity_export.v1");
 
+    h.close();
+  });
+
+  it("the persisted generation freezes WITHOUT the env flag and survives until explicitly cleared (finding 6)", async () => {
+    // The env-rollback shape: an operator clears WOO_WRITE_FREEZE but the
+    // authority still holds the fence — mutations stay refused until the
+    // explicit unfreeze, so a half-rolled-back deploy can never silently
+    // reopen writes mid-cutover.
+    const h = buildHarness(); // NO env flag
+    const ack = await h.acknowledgeFreeze("gen-persist-1");
+    expect(ack.status).toBe(200);
+
+    const refused = await h.request("/api/auth", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: "guest:fence-check" })
+    });
+    expect(refused.status).toBe(503);
+    expect(((await refused.json()) as { error: { code: string } }).error.code).toBe("E_MAINTENANCE");
+
+    // Explicit unfreeze restores service.
+    const clear = await h.acknowledgeFreeze(null);
+    expect(clear.status).toBe(200);
+    const restored = await h.request("/api/auth", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: "guest:fence-clear" })
+    });
+    expect(restored.status, await restored.clone().text()).toBe(200);
     h.close();
   });
 
@@ -143,6 +197,7 @@ describe("cutover item C: the write-freeze", () => {
     // tool (scripts/identity-export.ts) enforces before the export file
     // may feed the install.
     const h = buildHarness({ WOO_WRITE_FREEZE: "1" });
+    expect((await h.acknowledgeFreeze("gen-race-1")).status).toBe(200);
 
     // Warm-up: the FIRST warm fetch runs the once-per-epoch derived-
     // contents repair (§B2.15 — $nowhere is a sink; bootstrap leaves

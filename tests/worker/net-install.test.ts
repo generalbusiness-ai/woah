@@ -198,26 +198,66 @@ describe("net install end-to-end (fake-DO lane)", () => {
     expect(barredBody.error.code).toBe("E_NOT_INSTALLED");
     expect(barredBody.error.detail?.reason).toBe("not_active");
 
+    // Activation state changes ride the DEDICATED operator op (reviewer
+    // finding 1: /net/seed refuses once a scope commits, so activation
+    // must never be a seed).
+    const { CATALOG_SCOPE } = await import("../../src/net/topology");
+    const activate = async (activeEpoch: string | null) => {
+      const instance = scopeDOs.get(CATALOG_SCOPE) as NetScopeDO;
+      const request = new Request("https://do/net/activate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ scope: CATALOG_SCOPE, catalog_epoch: plan.epoch, active_epoch: activeEpoch })
+      });
+      const response = await instance.fetch(await signInternalRequest(scopeEnv, request));
+      expect(response.ok, `activate ${String(activeEpoch)}`).toBe(true);
+    };
+
     // A MIXED-EPOCH activation (identity from this install, activation
     // from another) is an operator error to surface, never to serve through.
-    const { netActivationCell } = await import("../../src/net/install");
-    const { CATALOG_SCOPE } = await import("../../src/net/topology");
-    await seed(CATALOG_SCOPE, [{ ...netActivationCell("cat-someother"), value: { value: "cat-someother" } }]);
+    await activate("cat-someother");
     const mixed = await mint("mixed");
     expect(mixed.status).toBe(503);
     expect(((await mixed.json()) as { error: { detail?: { reason?: string } } }).error.detail?.reason).toBe("epoch_mismatch");
 
     // ACTIVE: publishing the verified epoch admits traffic.
-    await seed(CATALOG_SCOPE, [netActivationCell(plan.epoch)]);
+    await activate(plan.epoch);
     const active = await mint("active");
     expect(active.status, JSON.stringify(await active.clone().json())).toBe(200);
 
     // DEACTIVATED (the installer's failed-verification compensation):
     // a null activation refuses again on a fresh shard.
-    await seed(CATALOG_SCOPE, [netActivationCell(null)]);
+    await activate(null);
     const deactivated = await mint("deactivated");
     expect(deactivated.status).toBe(503);
     expect(((await deactivated.json()) as { error: { detail?: { reason?: string } } }).error.detail?.reason).toBe("not_active");
+
+    // Reviewer finding 5 — the SAME gateway that served under activation
+    // must observe a later deactivation (the fresh-gateway-per-probe
+    // pattern above deliberately cannot catch this). TTL 0 forces
+    // re-verification against the authority on every request.
+    const sameState = netState("gateway-same");
+    states.push(sameState);
+    const sameGateway = new NetGatewayDO(sameState.state, {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_RESOLVE: resolve,
+      NET_ACTIVATION_TTL_MS: "0"
+    } as NetGatewayEnv);
+    const mintOn = (gateway: NetGatewayDO) =>
+      gateway.fetch(
+        new Request("https://do/net-api/session", {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer apikey:${KEY_ID}:${KEY_SECRET}` },
+          body: JSON.stringify({ ttl_ms: 60_000 })
+        })
+      );
+    await activate(plan.epoch);
+    const served = await mintOn(sameGateway);
+    expect(served.status, JSON.stringify(await served.clone().json())).toBe(200);
+    await activate(null);
+    const revoked = await mintOn(sameGateway);
+    expect(revoked.status).toBe(503);
+    expect(((await revoked.json()) as { error: { detail?: { reason?: string } } }).error.detail?.reason).toBe("not_active");
 
     states.forEach((st) => st.close());
   });
