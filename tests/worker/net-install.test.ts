@@ -202,14 +202,22 @@ describe("net install end-to-end (fake-DO lane)", () => {
     // finding 1: /net/seed refuses once a scope commits, so activation
     // must never be a seed).
     const { CATALOG_SCOPE } = await import("../../src/net/topology");
-    const activate = async (activeEpoch: string | null) => {
+    const activateRaw = async (activeEpoch: string | null, expected: string | null | undefined) => {
       const instance = scopeDOs.get(CATALOG_SCOPE) as NetScopeDO;
       const request = new Request("https://do/net/activate", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ scope: CATALOG_SCOPE, catalog_epoch: plan.epoch, active_epoch: activeEpoch })
+        body: JSON.stringify({
+          scope: CATALOG_SCOPE,
+          catalog_epoch: plan.epoch,
+          active_epoch: activeEpoch,
+          ...(expected !== undefined ? { expected_active_epoch: expected } : {})
+        })
       });
-      const response = await instance.fetch(await signInternalRequest(scopeEnv, request));
+      return instance.fetch(await signInternalRequest(scopeEnv, request));
+    };
+    const activate = async (activeEpoch: string | null) => {
+      const response = await activateRaw(activeEpoch, undefined);
       expect(response.ok, `activate ${String(activeEpoch)}`).toBe(true);
     };
 
@@ -258,6 +266,17 @@ describe("net install end-to-end (fake-DO lane)", () => {
     const revoked = await mintOn(sameGateway);
     expect(revoked.status).toBe(503);
     expect(((await revoked.json()) as { error: { detail?: { reason?: string } } }).error.detail?.reason).toBe("not_active");
+
+    // V3 finding 5: activation CAS. Current active is null (just
+    // deactivated). A stale replay that expects the OLD epoch is refused
+    // (E_STALE_HEAD), so a captured activation cannot restore a revoked
+    // grant; a same-value write is idempotent.
+    const staleActivate = await activateRaw(plan.epoch, "cat-someother");
+    expect(staleActivate.ok).toBe(false);
+    expect(((await staleActivate.json()) as { error: { code: string } }).error.code).toBe("E_STALE_HEAD");
+    const idempotent = await activateRaw(null, "expected-ignored-when-equal");
+    expect(idempotent.ok).toBe(true);
+    expect(((await idempotent.json()) as { idempotent?: boolean }).idempotent).toBe(true);
 
     // V3 finding 2 (P0): an activation grant FAILS CLOSED when the
     // authority cannot re-verify it past the grace window. TTL 0 makes

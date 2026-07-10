@@ -823,7 +823,12 @@ export class NetScopeDO {
         // committed, so activation/deactivation — which legitimately
         // happen around verification traffic — get their own signed
         // route that writes exactly the one activation cell.
-        const body = (await request.json()) as { scope: string; catalog_epoch: string; active_epoch: string | null };
+        const body = (await request.json()) as {
+          scope: string;
+          catalog_epoch: string;
+          active_epoch: string | null;
+          expected_active_epoch?: string | null;
+        };
         const durableEpoch = this.seq?.catalogEpoch ?? this.store.readMeta()?.catalog_epoch;
         if (durableEpoch !== undefined && durableEpoch !== body.catalog_epoch) {
           throw netError("E_EPOCH_MISMATCH", "activation epoch disagrees with the scope's durable epoch", {
@@ -833,6 +838,28 @@ export class NetScopeDO {
           });
         }
         const seq = this.ensureSequencer(body.scope, body.catalog_epoch);
+        // V3 finding 5 (P1): activation is a STATE TRANSITION, and
+        // internal signatures replay freely within the skew window — a
+        // captured/reordered activation could restore an old state. CAS:
+        // the caller declares the value it expects to overwrite. Reading
+        // it back equal is idempotent success (safe replay); a mismatch
+        // refuses E_STALE_HEAD so a stale transition can never win.
+        if (body.expected_active_epoch !== undefined) {
+          const cur = seq.store.get(cellKey("property_cell", "$system", "net_active_epoch"))?.value as
+            | { value?: unknown }
+            | undefined;
+          const currentActive = cur && "value" in cur ? (cur.value as string | null) : null;
+          if (currentActive === body.active_epoch) {
+            return json({ ok: true, scope: seq.scope, active_epoch: body.active_epoch, idempotent: true });
+          }
+          if (currentActive !== body.expected_active_epoch) {
+            throw netError("E_STALE_HEAD", "activation CAS: expected value does not match current", {
+              scope: body.scope,
+              expected: body.expected_active_epoch,
+              current: currentActive
+            });
+          }
+        }
         this.discardSeqOnThrow(() =>
           seq.operatorActivationWrite({
             kind: "property_cell",

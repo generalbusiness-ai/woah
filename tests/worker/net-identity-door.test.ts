@@ -231,6 +231,74 @@ describe("the identity door (/net-api/login, /net-api/guest, session bearers)", 
     states.forEach((st) => st.close());
   }, 30_000);
 
+  it("V3 finding 3: mint mirrors core actorCanAuthenticate — deactivated ACTOR and deactivated AGENT-OWNER both refuse", async () => {
+    const old = createWorld();
+    // A human whose ACCOUNT is live but whose primary ACTOR is
+    // deactivated (the reviewer's "live account, deactivated primary").
+    const human = old.auth("guest:v3-human").actor;
+    old.createObject({ id: "acct_v3", parent: "$account", owner: "$wiz", name: "v3" });
+    old.setProp("acct_v3", "email", "v3@example.com" as never);
+    old.setProp(human, "account", "acct_v3" as never);
+    old.setProp(human, "deactivated_at", Date.now() as never);
+    old.ensureApiKey("$wiz", human, "v3-human-key", "v3-human-secret", "deactivated actor");
+    // An AGENT owned by a deactivated owner (the reviewer's "apikey for a
+    // deactivated agent" — here via the owner chain).
+    const owner = old.auth("guest:v3-owner").actor;
+    old.setProp(owner, "deactivated_at", Date.now() as never);
+    const agent = old.createObject({ id: "agent_v3", parent: "$agent", owner, name: "agent" }).id;
+    old.ensureApiKey("$wiz", agent, "v3-agent-key", "v3-agent-secret", "agent of deactivated owner");
+    const identity = exportIdentity(old.exportWorld());
+
+    const plan = await planNetInstall({ graft: (fresh) => importIdentity(fresh, identity) });
+    const states: Array<ReturnType<typeof netState>> = [];
+    const scopeDOs = new Map<string, NetScopeDO>();
+    const resolve = (destination: string) => {
+      if (destination.startsWith("scope:")) {
+        const instance = scopeDOs.get(destination.slice("scope:".length));
+        if (instance) return instance;
+      }
+      if (destination.startsWith("gateway:")) return gateway;
+      throw new Error(`unresolvable ${destination}`);
+    };
+    const scopeEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve };
+    for (const [scope, cells] of plan.partitions) {
+      const st = netState(`v3-scope-${scope}`);
+      states.push(st);
+      const instance = new NetScopeDO(st.state, scopeEnv);
+      const request = new Request("https://do/net/seed", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ scope, catalog_epoch: plan.epoch, cells })
+      });
+      const seeded = await instance.fetch(await signInternalRequest(scopeEnv, request));
+      expect(seeded.ok, `seed ${scope}`).toBe(true);
+      scopeDOs.set(scope, instance);
+    }
+    const gwState = netState("v3-gateway");
+    states.push(gwState);
+    const gateway = new NetGatewayDO(gwState.state, { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve } as NetGatewayEnv);
+    const mint = async (token: string) =>
+      gateway.fetch(
+        new Request("https://do/net-api/session", {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+          body: JSON.stringify({ ttl_ms: 60_000 })
+        })
+      );
+
+    const deactivatedActor = await mint("apikey:v3-human-key:v3-human-secret");
+    expect(deactivatedActor.status).toBe(403);
+    expect(((await deactivatedActor.json()) as { error: { detail?: { reason?: string } } }).error.detail?.reason).toBe(
+      "identity_deactivated"
+    );
+    const deactivatedOwner = await mint("apikey:v3-agent-key:v3-agent-secret");
+    expect(deactivatedOwner.status).toBe(403);
+    expect(((await deactivatedOwner.json()) as { error: { detail?: { reason?: string } } }).error.detail?.reason).toBe(
+      "identity_deactivated"
+    );
+    states.forEach((st) => st.close());
+  }, 30_000);
+
   it("guest claims are exclusive: distinct actors per claim, occupied seats skipped, exhaustion refuses namedly", async () => {
     const h = await buildDoorHarness();
 

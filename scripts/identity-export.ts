@@ -64,7 +64,10 @@ async function main(): Promise<void> {
     const request = new Request(`${args.baseUrl}/net-install/freeze`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ generation: args.acknowledgeFreeze })
+      // V3 finding 5: acknowledgment is CAS'd from the UNFROZEN state
+      // (expected null) — a replay after the value is set is idempotent,
+      // and it cannot silently overwrite a different operator's fence.
+      body: JSON.stringify({ generation: args.acknowledgeFreeze, expected_generation: null })
     });
     const response = await fetch(await signInternalRequest(env, request));
     const ack = (await response.json()) as { freeze_generation?: string | null };

@@ -4305,13 +4305,36 @@ export class PersistentObjectDO {
         // generation), and clearing it is the explicit unfreeze half of
         // the rollback story. Internal-signed; idempotent per generation.
         const generation = body.generation;
+        if (generation !== null && (typeof generation !== "string" || generation.length === 0)) {
+          return jsonResponse({ error: wooError("E_INVARG", "freeze requires {generation: string} (null clears)") }, 400);
+        }
+        // V3 finding 5 (P1): set/clear are STATE TRANSITIONS and internal
+        // signatures replay within the skew window — a captured clear
+        // could reopen writes mid-cutover. CAS: the caller declares the
+        // generation it expects to overwrite. Same-value = idempotent
+        // success; mismatch = 409 conflict so a stale transition loses.
+        const currentGeneration = this.freezeGeneration();
+        if (body.expected_generation !== undefined) {
+          const expected = body.expected_generation === null ? null : String(body.expected_generation);
+          if (currentGeneration === generation) {
+            return jsonResponse({ frozen: this.writeFrozen(), freeze_generation: currentGeneration, idempotent: true });
+          }
+          if (currentGeneration !== expected) {
+            return jsonResponse(
+              {
+                error: wooError("E_CONFLICT", "freeze CAS: expected generation does not match current", {
+                  expected,
+                  current: currentGeneration
+                })
+              },
+              409
+            );
+          }
+        }
         if (generation === null) {
           this.repo.saveMeta(FREEZE_GENERATION_META_KEY, "");
           this.freezeGenerationCache = null;
           return jsonResponse({ frozen: Boolean(this.env.WOO_WRITE_FREEZE), freeze_generation: null });
-        }
-        if (typeof generation !== "string" || generation.length === 0) {
-          return jsonResponse({ error: wooError("E_INVARG", "freeze requires {generation: string} (null clears)") }, 400);
         }
         this.repo.saveMeta(FREEZE_GENERATION_META_KEY, generation);
         this.freezeGenerationCache = generation;

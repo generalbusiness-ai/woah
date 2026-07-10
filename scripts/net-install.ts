@@ -112,12 +112,15 @@ export async function runNetInstall(args: Args, env: { WOO_INTERNAL_SECRET?: str
   // The NC1 activation state machine, as its own signed op: /net/seed
   // refuses once a scope has committed turns (the destructive-reseed
   // guard), so activation/deactivation never ride a seed.
-  const setActivation = async (activeEpoch: string | null): Promise<void> => {
+  // V3 finding 5: activation is CAS'd — declare the value being
+  // overwritten. Activation follows install (expected null → the epoch);
+  // deactivation-on-verification-failure expects that just-set epoch.
+  const setActivation = async (activeEpoch: string | null, expected: string | null): Promise<void> => {
     const url = `${args.baseUrl}/net-install/scope/${encodeURIComponent(CATALOG_SCOPE)}/activate`;
     const response = await signedFetch(env, new Request(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ scope: CATALOG_SCOPE, catalog_epoch: plan.epoch, active_epoch: activeEpoch })
+      body: JSON.stringify({ scope: CATALOG_SCOPE, catalog_epoch: plan.epoch, active_epoch: activeEpoch, expected_active_epoch: expected })
     }));
     if (!response.ok) throw new Error(`activation write failed: ${response.status} ${await response.text()}`);
   };
@@ -145,7 +148,7 @@ export async function runNetInstall(args: Args, env: { WOO_INTERNAL_SECRET?: str
   // ACTIVATE: publish the verified epoch at the catalog authority. From
   // this seed on, the gateway admits client traffic — which the final
   // credential probe below depends on (it uses the REAL client surface).
-  await setActivation(plan.epoch);
+  await setActivation(plan.epoch, null);
   console.log(`activated: ${CATALOG_SCOPE} publishes epoch ${plan.epoch}`);
 
   // Verification 2 (identity rode along): a carried apikey must mint a
@@ -164,7 +167,7 @@ export async function runNetInstall(args: Args, env: { WOO_INTERNAL_SECRET?: str
     });
     const body = (await response.json().catch(() => ({}))) as { session?: string };
     if (!response.ok || typeof body.session !== "string") {
-      await setActivation(null);
+      await setActivation(null, plan.epoch);
       throw new Error(
         `identity verification failed — namespace DEACTIVATED: /net-api/session ${response.status} ${JSON.stringify(body)}`
       );
@@ -190,7 +193,7 @@ export async function runNetInstall(args: Args, env: { WOO_INTERNAL_SECRET?: str
     });
     const body = (await response.json().catch(() => ({}))) as { session?: string };
     if (!response.ok || typeof body.session !== "string") {
-      await setActivation(null);
+      await setActivation(null, plan.epoch);
       throw new Error(
         `password verification failed — namespace DEACTIVATED: /net-api/login ${response.status} ${JSON.stringify(body)}`
       );

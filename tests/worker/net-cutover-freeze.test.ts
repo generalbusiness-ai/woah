@@ -56,6 +56,17 @@ function buildHarness(vars: Record<string, string> = {}) {
       );
       return worker.fetch(request, env, {} as never);
     },
+    acknowledgeFreezeCas: async (generation: string | null, expected: string | null) => {
+      const request = await signInternalRequest(
+        { WOO_INTERNAL_SECRET: SECRET },
+        new Request("https://woo.test/net-install/freeze", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ generation, expected_generation: expected })
+        })
+      );
+      return worker.fetch(request, env, {} as never);
+    },
     close: () => states.forEach((state) => state.close())
   };
 }
@@ -208,8 +219,15 @@ describe("cutover item C: the write-freeze", () => {
     expect(refused.status).toBe(503);
     expect(((await refused.json()) as { error: { code: string } }).error.code).toBe("E_MAINTENANCE");
 
-    // Explicit unfreeze restores service.
-    const clear = await h.acknowledgeFreeze(null);
+    // V3 finding 5: CAS — a REPLAYED clear from the wrong expected
+    // generation is refused (409), so a captured/reordered clear can
+    // never silently reopen writes mid-cutover.
+    const staleClear = await h.acknowledgeFreezeCas(null, "gen-persist-WRONG");
+    expect(staleClear.status).toBe(409);
+    expect(((await staleClear.json()) as { error: { code: string } }).error.code).toBe("E_CONFLICT");
+
+    // Explicit unfreeze from the correct expected value restores service.
+    const clear = await h.acknowledgeFreezeCas(null, "gen-persist-1");
     expect(clear.status).toBe(200);
     const restored = await h.request("/api/auth", {
       method: "POST",

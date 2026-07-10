@@ -1918,6 +1918,68 @@ export class NetGatewayDO {
     return json({ closed: true });
   }
 
+  /** V3 finding 3 (P1): the net mirror of core `actorCanAuthenticate`.
+   * Refuses `identity_deactivated` when the actor, its account (human),
+   * or any owner in its agent chain is deactivated. Cells read from
+   * cluster views (warmed on demand — an owner lives at its OWN
+   * cluster); a bounded walk (agent chains are shallow, guarded against
+   * cycles). A cell that cannot be pulled is treated as absent, matching
+   * core's `objects.has` guard: an agent whose owner cannot resolve is
+   * NOT eligible (fail closed). */
+  private async assertActorEligible(actor: string, epoch: string): Promise<void> {
+    void epoch; // reserved: cross-epoch warms use the identity epoch implicitly
+    const prop = (object: string, name: string): unknown => {
+      const cell = this.ensureView().get(cellKey("property_cell", object, name))?.value as { value?: unknown } | undefined;
+      return cell && "value" in cell ? cell.value : undefined;
+    };
+    const lineage = (object: string): { parent?: string | null } | undefined =>
+      this.ensureView().get(cellKey("object_lineage", object))?.value as { parent?: string | null } | undefined;
+    const reachesClass = (object: string, cls: string): boolean => {
+      let current: string | null | undefined = object;
+      const guard = new Set<string>();
+      while (current && !guard.has(current)) {
+        if (current === cls) return true;
+        guard.add(current);
+        current = lineage(current)?.parent;
+      }
+      return false;
+    };
+    const refuse = (detail: Record<string, unknown>): never => {
+      throw new ClientAuthError("identity deactivated", { reason: "identity_deactivated", ...detail }, "E_PERM", 403);
+    };
+
+    const guard = new Set<string>();
+    let current: string | null = actor;
+    while (current && !guard.has(current)) {
+      guard.add(current);
+      // The actor's OWN deactivation (core's first check).
+      if (prop(current, "deactivated_at") != null) refuse({ actor: current });
+      // ANY actor carrying an account binding is gated by that account's
+      // deactivation — stricter than core (which gates only $human) and
+      // the finding-2 rule: a deactivated account never authenticates
+      // whatever the bound actor's class.
+      const account = prop(current, "account");
+      if (typeof account === "string" && account.length > 0 && prop(account, "deactivated_at") != null) {
+        refuse({ actor: current, account });
+      }
+      // $agent: recurse up the owner chain (core's rule) — a deactivated
+      // owner disqualifies its agents. $wiz-owned agents authenticate.
+      if (reachesClass(current, "$agent")) {
+        const owner = prop(current, "owner");
+        if (owner === "$wiz") return;
+        if (typeof owner !== "string" || owner.length === 0) refuse({ actor: current, reason_detail: "agent_owner_unresolved" });
+        await this.warmScopes(
+          [{ scope: `cluster:${owner}`, objects: [owner as string] }],
+          "net_eligibility_owner_pull_failed"
+        );
+        if (!lineage(owner as string)) refuse({ actor: current, owner, reason_detail: "agent_owner_unresolved" });
+        current = owner as string;
+        continue;
+      }
+      return; // not an agent: the actor + account checks above suffice
+    }
+  }
+
   /** POST /net-api/session — see the clientApi header. */
   private async clientSession(
     actor: string,
@@ -1934,28 +1996,13 @@ export class NetGatewayDO {
       [CATALOG_SCOPE, { scope: `cluster:${actor}`, objects: [actor] }],
       "net_client_pull_miss_failed"
     );
-    // Identity eligibility at EVERY mint (reviewer finding 2): an actor
-    // bound to a deactivated account must not mint, whatever credential
-    // reached here (apikey, password — the door double-checks, this is
-    // the one gate every path passes). The actor's `account` prop is in
-    // the cluster warm above; the account's cells live in the catalog
-    // view the identity gate already holds.
-    const accountRef = this.ensureView().get(cellKey("property_cell", actor, "account"))?.value as
-      | { value?: unknown }
-      | undefined;
-    if (typeof accountRef?.value === "string" && accountRef.value.length > 0) {
-      const deactivated = this.ensureView().get(cellKey("property_cell", accountRef.value, "deactivated_at"))?.value as
-        | { value?: unknown }
-        | undefined;
-      if (deactivated?.value != null) {
-        throw new ClientAuthError(
-          "identity deactivated",
-          { reason: "identity_deactivated", account: accountRef.value },
-          "E_PERM",
-          403
-        );
-      }
-    }
+    // Identity eligibility at EVERY mint (the one gate every credential
+    // path passes). V3 finding 3 (P1): mirror core actorCanAuthenticate
+    // in FULL — the actor's OWN deactivated_at, then for a $human its
+    // account's, and for an $agent a recursive walk up the owner chain.
+    // The prior check saw only actor.account, so a deactivated primary
+    // actor or an apikey for a deactivated agent still minted.
+    await this.assertActorEligible(actor, epoch);
     // Phase 6: the id carries THIS shard's name so a future multi-shard
     // /net-api router can resolve a live session to the gateway holding
     // its view — a routing change, never a data migration.
