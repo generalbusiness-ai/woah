@@ -375,3 +375,29 @@ have evidence. Steps 0–3 of the runbook remain executable today.
 REMAINING deploy-only (unchanged): canary numbers (sustained turns/s,
 per-connection memory, cross-colo tails, cold-start stalls), tenant
 capacity limits if one shard is the ceiling.
+
+## Phase iii COMPLETE (2026-07-09, f48ad04): tool-space panels over net
+
+The pinboard/outliner/tasks panels render over the net path, proven
+cross-user in real browsers (e2e:net 4/4: alice adds a note through the
+real board UI; it renders on bob's board). The reducer layer was
+already transport-agnostic and wireNetFeed existed unwired — the build
+was five client seams (wireNetFeed into connectNetFeed; v2Turn +
+callWithError net branches carrying ALL tool moves/writes/reads;
+pinboard cold hydration via list_notes; netMode LATCH at boot — tab
+pushState dropped ?net=1 and flipped the shell to the v2 login;
+/api/me net-gated — its 401 masqueraded as session expiry) plus ONE
+real topology bug: normalizeAnchors anchored NESTED SPACES where they
+sit, demoting the pinboard from its own room:the_pinboard sequencer to
+a rider of room:the_deck — undiscoverable from anywhere but the deck
+(E_MISSING_STATE → E_BUDGET on the SPA's tab teleport; the walkthrough
+never saw it because it always enters from the deck). Spaces now stay
+anchorless by design, like actors: actors → clusters, spaces → rooms.
+
+Full-corpus npm test / test:worker rotate a 1–4 heavy-v2 timing flake
+tonight; A/B on clean 86bab99 reproduces it identically (every failing
+file passes in isolation on both trees) — pre-existing load-flake
+class, recorded, not phase iii.
+
+REMAINING before the §8 route switch: the PUBLIC identity door over
+net (guest entry + account/password login — apikeys only today).
