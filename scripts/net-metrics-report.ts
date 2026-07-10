@@ -219,6 +219,37 @@ export function buildReport(metrics: Metric[]): Record<string, unknown> {
   };
 }
 
+/**
+ * The abort signals over a report (V3 finding 6: evaluated the same way
+ * for a bounded batch and for each streaming interval — a canary must
+ * detect a divergence DURING the bake, not only after its input closes).
+ * `emptyIsAbort` off in --watch's early intervals (no turns yet ≠ dead
+ * feed); the batch path requires a minimum sample.
+ */
+export function abortSignals(
+  report: ReturnType<typeof buildReport>,
+  metricLines: number,
+  options: { emptyIsAbort?: boolean } = {}
+): string[] {
+  const r = report as {
+    outbox: { abandoned: number };
+    incidents: { fanout_gaps: number };
+    turns: { total: number; retry_rate: number };
+  };
+  const alerts: string[] = [];
+  if (options.emptyIsAbort && metricLines === 0) {
+    alerts.push("ABORT-SIGNAL: 0 metric lines parsed — the tail shape, worker, or filter is wrong (--allow-empty to override)");
+  } else if (options.emptyIsAbort && r.turns.total === 0) {
+    alerts.push("ABORT-SIGNAL: no net_turn_structure samples — the canary saw no turns (--allow-empty to override)");
+  }
+  if (r.outbox.abandoned > 0) alerts.push(`ABORT-SIGNAL: ${r.outbox.abandoned} outbox abandonment(s) — named divergence`);
+  if (r.incidents.fanout_gaps > 0) alerts.push(`ABORT-SIGNAL: ${r.incidents.fanout_gaps} fanout gap(s)`);
+  if (r.turns.total >= 20 && r.turns.retry_rate > 0.2) {
+    alerts.push(`ABORT-SIGNAL: retry rate ${(r.turns.retry_rate * 100).toFixed(0)}% > 20%`);
+  }
+  return alerts;
+}
+
 async function readInput(path: string | undefined): Promise<string> {
   if (path) return readFileSync(path, "utf8");
   const chunks: Buffer[] = [];
@@ -226,46 +257,105 @@ async function readInput(path: string | undefined): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
+/**
+ * V3 finding 6: --watch INCREMENTAL mode for the bake's long-running
+ * `wrangler tail | net-metrics-report --watch`. Parses stdin line by
+ * line as it arrives, prints a rolling report every `--interval` seconds
+ * (default 30), and EXITS 2 THE MOMENT a divergence signal fires (an
+ * abandonment / fanout gap / sustained retry) — it does not wait for the
+ * pipe to close. `--min-turns` / `--min-seconds` gate the final
+ * exit-0-only-if-enough-evidence rule when the stream ends cleanly.
+ */
+async function runWatch(intervalMs: number, minTurns: number, minSeconds: number): Promise<void> {
+  const metrics: Metric[] = [];
+  let carry = "";
+  const startedAt = Date.now();
+  const evaluate = (final: boolean): void => {
+    const report = buildReport(metrics);
+    const turns = (report as { turns: { total: number } }).turns.total;
+    console.error(`[watch ${Math.round((Date.now() - startedAt) / 1000)}s] ${metrics.length} metrics, ${turns} turns`);
+    // Divergence signals abort IMMEDIATELY, mid-bake.
+    const diverged = abortSignals(report, metrics.length, { emptyIsAbort: false });
+    if (diverged.length > 0) {
+      for (const alert of diverged) console.error(alert);
+      console.log(JSON.stringify({ metric_lines: metrics.length, ...report }, null, 2));
+      process.exit(2);
+    }
+    if (final) {
+      console.log(JSON.stringify({ metric_lines: metrics.length, ...report }, null, 2));
+      const elapsedS = (Date.now() - startedAt) / 1000;
+      const shortfalls: string[] = [];
+      if (turns < minTurns) shortfalls.push(`only ${turns} turns (need ${minTurns})`);
+      if (elapsedS < minSeconds) shortfalls.push(`only ${Math.round(elapsedS)}s (need ${minSeconds}s)`);
+      if (shortfalls.length > 0) {
+        console.error(`ABORT-SIGNAL: insufficient canary evidence — ${shortfalls.join(", ")}`);
+        process.exit(2);
+      }
+    }
+  };
+  const ticker = setInterval(() => evaluate(false), intervalMs);
+  try {
+    for await (const chunk of process.stdin) {
+      carry += (chunk as Buffer).toString("utf8");
+      const lines = carry.split("\n");
+      carry = lines.pop() ?? "";
+      for (const line of lines) if (line.trim()) collectFromLine(line, metrics);
+    }
+    if (carry.trim()) collectFromLine(carry, metrics);
+  } finally {
+    clearInterval(ticker);
+  }
+  evaluate(true);
+}
+
+/** One input line → metrics (the extractMetrics per-line logic, exposed
+ * for the streaming path). */
+function collectFromLine(line: string, out: Metric[]): void {
+  for (const metric of extractMetrics(line)) out.push(metric);
+}
+
 const invokedDirectly = process.argv[1]?.endsWith("net-metrics-report.ts") === true;
 if (invokedDirectly) {
   const args = process.argv.slice(2);
-  const json = args.includes("--json");
-  const file = args.find((arg) => !arg.startsWith("--"));
-  const allowEmpty = args.includes("--allow-empty");
-  readInput(file)
-    .then((text) => {
-      const metrics = extractMetrics(text);
-      const report = buildReport(metrics);
-      if (json) {
-        console.log(JSON.stringify({ metric_lines: metrics.length, ...report }, null, 2));
-      } else {
-        console.log(`net-metrics-report: ${metrics.length} metric lines`);
-        console.log(JSON.stringify(report, null, 2));
-      }
-      // Finding 7: NO DATA IS NOT GREEN. A canary check that parsed
-      // nothing (wrong log shape, dead tail, wrong worker) must fail
-      // closed, never report all-zero health with exit 0.
-      const r = report as {
-        outbox: { abandoned: number };
-        incidents: { fanout_gaps: number };
-        turns: { total: number; retry_rate: number };
-      };
-      const alerts: string[] = [];
-      if (metrics.length === 0 && !allowEmpty) {
-        alerts.push("ABORT-SIGNAL: 0 metric lines parsed — the tail shape, worker, or filter is wrong (--allow-empty to override)");
-      } else if (r.turns.total === 0 && !allowEmpty) {
-        alerts.push("ABORT-SIGNAL: no net_turn_structure samples — the canary saw no turns (--allow-empty to override)");
-      }
-      if (r.outbox.abandoned > 0) alerts.push(`ABORT-SIGNAL: ${r.outbox.abandoned} outbox abandonment(s) — named divergence`);
-      if (r.incidents.fanout_gaps > 0) alerts.push(`ABORT-SIGNAL: ${r.incidents.fanout_gaps} fanout gap(s)`);
-      if (r.turns.total >= 20 && r.turns.retry_rate > 0.2) {
-        alerts.push(`ABORT-SIGNAL: retry rate ${(r.turns.retry_rate * 100).toFixed(0)}% > 20%`);
-      }
-      for (const alert of alerts) console.error(alert);
-      if (alerts.length > 0) process.exit(2);
-    })
-    .catch((err) => {
+  const flag = (name: string, fallback: number): number => {
+    const i = args.indexOf(name);
+    if (i === -1) return fallback;
+    const value = Number(args[i + 1]);
+    return Number.isFinite(value) ? value : fallback;
+  };
+  if (args.includes("--watch")) {
+    void runWatch(flag("--interval", 30) * 1000, flag("--min-turns", 50), flag("--min-seconds", 120)).catch((err) => {
       console.error(String(err));
       process.exit(1);
     });
+  } else {
+    const json = args.includes("--json");
+    const file = args.find((arg) => !arg.startsWith("--") && Number.isNaN(Number(arg)));
+    const allowEmpty = args.includes("--allow-empty");
+    const minTurns = flag("--min-turns", 0);
+    readInput(file)
+      .then((text) => {
+        const metrics = extractMetrics(text);
+        const report = buildReport(metrics);
+        if (json) {
+          console.log(JSON.stringify({ metric_lines: metrics.length, ...report }, null, 2));
+        } else {
+          console.log(`net-metrics-report: ${metrics.length} metric lines`);
+          console.log(JSON.stringify(report, null, 2));
+        }
+        // Finding 7: NO DATA IS NOT GREEN. Fail closed on empty/foreign
+        // input; the batch path also enforces --min-turns when set.
+        const alerts = abortSignals(report, metrics.length, { emptyIsAbort: !allowEmpty });
+        const turns = (report as { turns: { total: number } }).turns.total;
+        if (minTurns > 0 && turns < minTurns) {
+          alerts.push(`ABORT-SIGNAL: only ${turns} turns sampled (need --min-turns ${minTurns})`);
+        }
+        for (const alert of alerts) console.error(alert);
+        if (alerts.length > 0) process.exit(2);
+      })
+      .catch((err) => {
+        console.error(String(err));
+        process.exit(1);
+      });
+  }
 }

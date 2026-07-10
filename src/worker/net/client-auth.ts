@@ -164,6 +164,18 @@ export function verifyApiKeyCredential(map: unknown, credential: ClientCredentia
 
 const PASSWORD_PBKDF2_ITERATIONS = 600_000;
 const PASSWORD_PBKDF2_KEY_BITS = 256;
+/** V3 finding 7: an UPPER bound on verifier iterations. A carried (or
+ * malicious) hash encoding a huge iteration count would turn one login
+ * into an unbounded CPU sink; anything above this ceiling never
+ * verifies (fail closed — the same posture as the minimum floor). Sized
+ * well above the 600k floor so a legitimate future re-hash has room. */
+const PASSWORD_PBKDF2_ITERATIONS_MAX = 4_000_000;
+/** V3 finding 7: strict credential byte limits. Email/password are
+ * attacker-controlled and rate-limiter keys; a megabyte email would
+ * bloat the limiter map and the account scan. Rejected before any
+ * derivation or limiter keying. */
+export const MAX_EMAIL_BYTES = 254; // RFC 5321 address ceiling
+export const MAX_PASSWORD_BYTES = 1024;
 
 /** v2 parity: account lookup is BY EMAIL, lowercased and trimmed. */
 export function normalizeEmail(value: string): string {
@@ -179,7 +191,15 @@ export async function verifyPasswordCredential(password: string, encoded: string
   const iterations = Number(parts[1]);
   const salt = parts[2];
   const expected = parts[3];
-  if (!Number.isSafeInteger(iterations) || iterations < PASSWORD_PBKDF2_ITERATIONS || !salt || !expected) return false;
+  if (
+    !Number.isSafeInteger(iterations) ||
+    iterations < PASSWORD_PBKDF2_ITERATIONS ||
+    iterations > PASSWORD_PBKDF2_ITERATIONS_MAX ||
+    !salt ||
+    !expected
+  ) {
+    return false;
+  }
   const subtle = (globalThis as unknown as { crypto: { subtle: SubtleCrypto } }).crypto.subtle;
   const keyMaterial = await subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
   const saltBytes = new Uint8Array(salt.length / 2);

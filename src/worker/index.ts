@@ -85,7 +85,16 @@ export default {
     // tiny; the SPA fetches it once per unsignaled boot (explicit ?net=1
     // / localStorage signals win without the fetch).
     if (request.method === "GET" && url.pathname === "/client-config") {
-      return jsonResponse({ net: Boolean(env.WOO_NET_DEFAULT) });
+      // V3 finding 9: the transport default is AUTHORITATIVE deployment
+      // state — no-store so a rollback (route back to the dual-stack
+      // worker, which serves net:false or 404s) is never masked by a
+      // cached net:true. The SPA lets this OVERRIDE a stored woo:net flag
+      // (a rollback un-pins net clients); only an explicit ?net=1
+      // (development) still wins client-side.
+      return new Response(JSON.stringify({ net: Boolean(env.WOO_NET_DEFAULT) }), {
+        status: 200,
+        headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }
+      });
     }
 
     // Cutover item C: the §8 write-freeze, edge half (the DO enforces it

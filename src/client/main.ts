@@ -570,14 +570,24 @@ let netCurrentRoom = "";
 // this: opening the pinboard tab reverted the app to the v2 login).
 let netModeLatched: boolean | null = null;
 
+/** An EXPLICIT development override: `?net=1` in the URL. This is the
+ * one signal that wins over the deployment's /client-config (V3 finding
+ * 9: a stored `woo:net` no longer pins a client to net — only this
+ * developer-typed flag does). */
+function netModeExplicit(): boolean {
+  try {
+    return new URLSearchParams(window.location.search).get("net") === "1";
+  } catch {
+    return false; // no window/location (tests)
+  }
+}
+
 function netMode(): boolean {
   if (netModeLatched !== null) return netModeLatched;
-  let mode = readStorage("woo:net") === "1";
-  try {
-    if (new URLSearchParams(window.location.search).get("net") === "1") mode = true;
-  } catch {
-    // no window/location (tests)
-  }
+  // Explicit dev override wins; otherwise the stored flag is a WEAK
+  // hint that the authoritative /client-config (consulted at boot) may
+  // override — so a rollback un-pins net clients.
+  const mode = netModeExplicit() || readStorage("woo:net") === "1";
   netModeLatched = mode;
   return mode;
 }
@@ -1338,8 +1348,12 @@ async function logout() {
       // best-effort
     }
     clearAccountScopedStorage();
+    // V3 finding 9: reload to BARE `/` — re-pinning `?net=1` would
+    // survive a deployment rollback and strand the client on net. The
+    // stored woo:net hint carries the net boot across the reload; the
+    // authoritative /client-config still overrides it.
     try {
-      history.replaceState({}, "", "/?net=1");
+      history.replaceState({}, "", "/");
     } catch {
       // ignore
     }
@@ -1942,29 +1956,46 @@ let pinboardNotesHydrationBoard = "";
 // can reach them, and `const` initialization is in temporal dead zone until
 // this point. Moving this block earlier reintroduces a hard-to-spot
 // ReferenceError under specific stored-session shapes.
-if (netMode()) {
+if (netModeExplicit()) {
+  // Developer override: ?net=1 wins without consulting the deployment.
+  netModeLatched = true;
   connectNetFeed();
 } else {
-  // Reviewer finding 4: with NO explicit signal (?net / storage), the
-  // transport default is the DEPLOYMENT's to make — a first-time
-  // browser at bare `/` after the route switch must reach the net
-  // client, not the frozen v2 surface. One same-origin fetch per
-  // unsignaled boot; 404/failure (an old worker, offline) falls back to
-  // the v2 boot. Deliberately never persisted: the rollback story is
-  // "route back", and a stored flag would strand clients on net against
-  // a worker that cannot serve it.
+  // Findings 4 + 9: the transport is the DEPLOYMENT's to decide, and
+  // /client-config is AUTHORITATIVE — it overrides a stored woo:net so a
+  // rollback (route back to the dual-stack worker, which serves
+  // net:false) un-pins net clients instead of stranding them. One
+  // no-store fetch per boot; only when the config is UNREACHABLE (an old
+  // worker with no such route, or offline) does the stored flag act as
+  // the fallback hint.
   void (async () => {
-    let netDefault = false;
+    let netDefault: boolean | null = null;
     try {
-      const response = await fetch("/client-config");
+      const response = await fetch("/client-config", { cache: "no-store" });
       if (response.ok) netDefault = Boolean(((await response.json()) as { net?: unknown }).net);
     } catch {
-      // v2 fallback
+      // unreachable → null → fall back to the stored hint below
     }
-    if (netDefault) {
+    const useNet = netDefault ?? (readStorage("woo:net") === "1");
+    if (useNet) {
       netModeLatched = true;
+      // Remember the resolved default so an in-session reload is stable
+      // even if the network blips (the config still wins next boot).
+      try {
+        localStorage.setItem("woo:net", "1");
+      } catch {
+        // no storage
+      }
       connectNetFeed();
       return;
+    }
+    // Config says v2 (or unreachable + no stored hint): DROP any stale
+    // net pin so the rollback fully un-pins this client.
+    netModeLatched = false;
+    try {
+      localStorage.removeItem("woo:net");
+    } catch {
+      // no storage
     }
     state.authStatus = readStorage(sessionKey) ? "authenticated" : "anonymous";
     if (state.authStatus === "authenticated") connect();

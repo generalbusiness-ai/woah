@@ -19,7 +19,7 @@ import type { CallContext, ExecutorContext, HostObjectSummary, MoveObjectResult,
 import { CFObjectRepository } from "../../src/worker/cf-repository";
 import { CommitScopeDO } from "../../src/worker/commit-scope-do";
 import { DirectoryDO } from "../../src/worker/directory-do";
-import worker from "../../src/worker/index";
+import worker, { __resetEdgeFenceForTests } from "../../src/worker/index";
 import { signInternalRequest } from "../../src/worker/internal-auth";
 import { LOCAL_CATALOG_BUNDLE_REPAIR_EPOCH, MCP_GATEWAY_ACTOR_SUPPORT_ROOTS, PersistentObjectDO, mcpGatewayScopeTopologySeed, v2FanoutEnvelopesByNode, type Env } from "../../src/worker/persistent-object-do";
 import { FakeDurableObjectNamespace, FakeDurableObjectState } from "./fake-do";
@@ -992,6 +992,7 @@ describe("v2 Worker fan-out helpers", () => {
   });
 
   it("serves the marketing homepage on woah while protocol routes bypass the redirect", async () => {
+    __resetEdgeFenceForTests(); // V3 finding 1: cold edge-fence cache so the probe fires deterministically
     const forwarded: Array<{ host: string; method: string; path: string; upgrade: string | null }> = [];
     const env = {
       ASSETS: {
@@ -1046,6 +1047,12 @@ describe("v2 Worker fan-out helpers", () => {
     expect(redirected.status).toBe(308);
     expect(redirected.headers.get("location")).toBe("https://woah1.generalbusiness.ai/some-world-route");
     expect(forwarded).toEqual([
+      // V3 finding 1: the first mutating request past the edge fence's
+      // TTL window probes the world authority's persisted freeze
+      // generation (unfrozen here → proceeds). TTL-cached, so the WS
+      // upgrade that follows within the window reuses the verdict and
+      // does NOT re-probe — the amortized ~1-per-window cost.
+      { host: "world", method: "POST", path: "/__internal/freeze-state", upgrade: null },
       { host: "world", method: "POST", path: "/mcp", upgrade: null },
       { host: "world", method: "GET", path: "/v2/turn-network/ws", upgrade: "websocket" }
     ]);

@@ -231,6 +231,21 @@ describe("the identity door (/net-api/login, /net-api/guest, session bearers)", 
     states.forEach((st) => st.close());
   }, 30_000);
 
+  it("V3 finding 7: oversized credentials refuse before any derivation, and an over-ceiling hash never verifies", async () => {
+    const { verifyPasswordCredential } = await import("../../src/worker/net/client-auth");
+    const h = await buildDoorHarness();
+    // A 300-byte email exceeds MAX_EMAIL_BYTES (254): refused with the
+    // fail-closed message, no derivation paid.
+    const bigEmail = await h.api("POST", "/net-api/login", { body: { email: "a".repeat(300) + "@x.com", password: PASSWORD } });
+    expect(bigEmail.status).toBe(401);
+    expect((bigEmail.body.error as { message?: string }).message).toBe("invalid email or password");
+    // A hash encoding an absurd iteration count never verifies (the
+    // upper ceiling, mirroring the lower floor — fail closed).
+    const overCeiling = `pbkdf2-sha256:99000000:${"0".repeat(32)}:${"0".repeat(64)}`;
+    expect(await verifyPasswordCredential("whatever", overCeiling)).toBe(false);
+    h.close();
+  }, 30_000);
+
   it("V3 finding 3: mint mirrors core actorCanAuthenticate — deactivated ACTOR and deactivated AGENT-OWNER both refuse", async () => {
     const old = createWorld();
     // A human whose ACCOUNT is live but whose primary ACTOR is

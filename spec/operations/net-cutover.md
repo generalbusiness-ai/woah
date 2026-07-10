@@ -54,13 +54,20 @@ same-epoch re-seed would silently reset authoritative state under an
 unchanged head), while activation legitimately changes around
 verification traffic.
 
+Activation writes are CAS'd (`expected_active_epoch`): a replayed or
+reordered activation within the signature skew window is refused
+`E_STALE_HEAD`, so a captured activation cannot restore a revoked grant
+(a same-value write is idempotent).
+
 **The barrier is enforced at the gateway's identity gate** (the one code
 path every authenticated client request already passes). The cached
 verdict is RE-VERIFIED against the catalog authority — a targeted
 one-key closure — whenever the cell is absent or the cached ACTIVE
-verdict is older than `NET_ACTIVATION_TTL_MS` (default 30 s), so a
-deactivation reaches every gateway, including the one that served under
-activation, within the TTL.
+verdict is older than `NET_ACTIVATION_TTL_MS` (default 30 s). A grant
+whose last SUCCESSFUL re-verification is older than the grace window
+(3×TTL) FAILS CLOSED (`503 activation_unverifiable`) — a partitioned
+gateway that cannot reach the authority stops serving rather than
+honoring a possibly-revoked namespace indefinitely.
 
 **Every install runs this machine**, including test lanes: fixtures and
 lane installs seed the activation cell together with the catalog
@@ -85,15 +92,21 @@ Freeze properties:
 - **In-flight requests** accepted before the flip may still land. The
   freeze is therefore *not* the consistency boundary by itself — the
   export watermark (NC3) is.
-- **The acknowledged fence** (persisted half): `POST /__internal/freeze
-  {generation}` (doorway `/net-install/freeze`) records a freeze
-  GENERATION in the world authority's durable meta. EITHER half freezes
-  — the env flag or the persisted generation — so a half-rolled-back
-  env deploy can never silently reopen writes; the export requires and
-  echoes the generation (the receipt binds to it).
-- **Unfreeze = rollback**: removing the flag AND clearing the persisted
-  generation (`{generation: null}`) restores v2 service unchanged. This
-  is the abort path for every pre-activation rollback point (NC6).
+- **The acknowledged, DISTRIBUTED fence** (persisted half): `POST
+  /net-install/freeze {generation, expected_generation}` records a
+  freeze GENERATION in the world authority's durable meta (CAS'd on
+  `expected_generation` — a replayed set/clear within the signature
+  skew window is refused 409, so a captured transition cannot restore an
+  old state). EITHER half freezes — the env flag or the persisted
+  generation. The persisted half reaches EVERY host: the edge (every
+  public mutation crosses it) and each satellite DO consult the world
+  authority's generation, TTL-cached (~15s), so removing the env flag
+  while the generation is held cannot reopen satellite writes. The
+  export requires and echoes the generation (the receipt binds to it).
+- **Unfreeze = rollback**: removing the env flag AND clearing the
+  persisted generation (`{generation: null, expected_generation: <the
+  held value>}`) restores v2 service unchanged. This is the abort path
+  for every pre-activation rollback point (NC6).
 - **Housekeeping is not frozen.** Deterministic convergence work (e.g.
   the one-time derived-contents repair on a cold world DO's first warm
   fetch) may still mutate the image exactly once. The watermark

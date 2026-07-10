@@ -168,21 +168,32 @@ there).
 0. **Pre-deploy**: merge `net-cutover`; `./scripts/deploy.sh` (ships the
    export route + freeze flag support + install doorway). Verify the
    walkthrough gate as usual.
-1. **Announce the window. Freeze old prod**:
-   `npx wrangler secret put WOO_WRITE_FREEZE` (value `1`) — or a vars
-   deploy. Probe: POST /api/auth → 503 E_MAINTENANCE; GET /healthz →
-   200.
-2. **Final export from frozen prod**:
+1. **Announce the window. Freeze old prod — BOTH halves** (NC2, the
+   acknowledged distributed fence): set the env flag AND persist the
+   generation. `npx wrangler secret put WOO_WRITE_FREEZE` (value `1`),
+   then `WOO_INTERNAL_SECRET=... curl -sX POST
+   $BASE/net-install/freeze -d '{"generation":"cutover-<date>",
+   "expected_generation":null}'` (signed; CAS from unfrozen — finding
+   5). The env flag is instant per isolate; the persisted generation
+   reaches every host (edge + satellites) within ~15s (finding 1).
+   Probe: POST /api/auth → 503 E_MAINTENANCE; GET /healthz → 200.
+2. **Final export from frozen prod** (the export REQUIRES the
+   acknowledged fence — NC3):
    `WOO_INTERNAL_SECRET=... npx tsx scripts/identity-export.ts
-   --base-url https://woah1.generalbusiness.ai --out identity-export.json`
-   The tool refuses an unfrozen world, exports TWICE, and requires equal
+   --base-url https://woah1.generalbusiness.ai
+   --acknowledge-freeze cutover-<date> --out identity-export.json`
+   (`--acknowledge-freeze` re-asserts the SAME generation from step 1 —
+   omitting it makes the export refuse 409). The tool exports TWICE and
+   requires equal
    watermarks (the NC3 quiescence proof; a benign one-time mismatch can
    come from cold-DO housekeeping — re-run; a PERSISTENT mismatch means
    the freeze is not holding: stop). Record the watermark line in the
    cutover receipt (NC7).
-3. **Install into the net namespace, verify, ACTIVATE** (idempotent;
-   abort = re-run; the namespace refuses ALL client traffic until the
-   installer's final activation seed — NC1):
+3. **Install into the net namespace, verify, ACTIVATE** (the namespace
+   refuses ALL client traffic until the installer's final CAS'd
+   /net/activate — NC1; PRE-COMMIT re-runs are safe, but once the
+   credential probe commits a re-run refuses E_SEED_COMMITTED and the
+   recovery is a fresh namespace — finding 1):
    `WOO_INTERNAL_SECRET=... npx tsx scripts/net-install.ts
    --base-url https://woah1.generalbusiness.ai
    --identity identity-export.json
@@ -191,23 +202,32 @@ there).
    deactivates the namespace before aborting. Add
    `--verify-password email:password` for a carried account — the §8
    step-3 second half (also deactivate-on-failure).
-4. **Route switch**: move the public hostname to the net-serving client
-   — DNS/route change, NEVER a 308 (WS clients cannot follow redirects;
-   the woah→woah1 incident). [Requires the net client shell — the
-   remaining build item.]
+4. **Route switch**: set `WOO_NET_DEFAULT=1` on the net worker (so
+   `/client-config` returns net:true — first-time browsers at bare `/`
+   boot the net client, finding 4/9; the response is no-store so a
+   rollback un-pins clients), then move the public hostname — DNS/route
+   change, NEVER a 308 (WS clients cannot follow redirects; the
+   woah→woah1 incident).
 5. **Postflight + bake**: deployed walkthrough + tail thresholds; old
-   prod stays deployed AND FROZEN through the bake. Canary dashboard:
-   `wrangler tail --format json | npx tsx scripts/net-metrics-report.ts`
-   — exits 2 on the NC8 abort signals (any outbox abandonment, any
-   fanout gap, retry rate > 20%); watch p95 wall_ms and the incident
-   counters besides. Rollback = switch the route back + delete
-   WOO_WRITE_FREEZE — nothing else — but ONLY until the first net write
-   (NC6; after that, forward recovery only).
+   prod stays deployed AND FROZEN through the bake. Canary dashboard
+   (STREAMING — evaluates during the bake, finding 6):
+   `wrangler tail --format json | npx tsx scripts/net-metrics-report.ts
+   --watch --min-turns 50 --min-seconds 120` — exits 2 the MOMENT an
+   abort signal fires (any outbox abandonment, any fanout gap, sustained
+   retry > 20%) and on insufficient evidence at stream end; watch p95
+   wall_ms and the incident counters besides. Rollback = switch the
+   route back, then unfreeze BOTH halves — delete WOO_WRITE_FREEZE AND
+   clear the persisted generation (`POST /net-install/freeze
+   {"generation":null,"expected_generation":"cutover-<date>"}`) — but
+   ONLY until the first net write (NC6; after that, forward recovery
+   only).
 6. **After the bake**: retire old prod; the §8 deletion commits.
 
-REMAINING build item before step 4 can run: the net CLIENT SHELL — the
-last piece between "namespace proven" and "traffic routed". Steps 0–3
-are executable today.
+All build items are complete; every runbook step is executable. What
+remains before a PUBLIC route switch is the NC8 enforceable-envelope
+work (gateway sharding, identity index authorities, RPC deadlines,
+owner-sequenced guest creation) plus a valid deployed-canary envelope —
+the parallel-path deploy and `--watch` canary produce the latter.
 
 ## The client shell, scoped (2026-07-09 — grounded, not guessed)
 

@@ -70,7 +70,7 @@ import { netCellKeyFor, type EffectTranscript } from "../../net/transcript";
 import type { CellTransfer } from "../../net/cells";
 import { randomHex } from "../../core/source-hash";
 import { verifyInternalRequest } from "../internal-auth";
-import { ClientAuthError, normalizeEmail, parseClientCredential, verifyApiKeyCredential, verifyPasswordCredential } from "./client-auth";
+import { ClientAuthError, MAX_EMAIL_BYTES, MAX_PASSWORD_BYTES, normalizeEmail, parseClientCredential, verifyApiKeyCredential, verifyPasswordCredential } from "./client-auth";
 import { TokenBucketLimiter } from "./rate-limit";
 import { resolveNetDestination, WorkerdHost, type NetBindingsEnv } from "./workerd-host";
 
@@ -770,6 +770,12 @@ export class NetGatewayDO {
    * the client backs off on. */
   private readonly turnQueueDepth = new Map<string, number>();
   private static readonly MAX_TURN_QUEUE_DEPTH = 32;
+  /** V3 finding 8: the per-scope cap does not bound AGGREGATE queued
+   * work across many scopes (a fan of stuck scopes each just under the
+   * per-scope cap is still unbounded memory + latency when RPCs never
+   * settle). This bounds the isolate's total in-flight queued turns. */
+  private turnQueueTotal = 0;
+  private static readonly MAX_TURN_QUEUE_TOTAL = 256;
 
   private turn(request: TurnRequest): Promise<TurnResult> {
     const key = request.planningScope;
@@ -781,6 +787,13 @@ export class NetGatewayDO {
         limit: NetGatewayDO.MAX_TURN_QUEUE_DEPTH
       });
     }
+    if (this.turnQueueTotal >= NetGatewayDO.MAX_TURN_QUEUE_TOTAL) {
+      throw netError("E_BUDGET", "gateway turn queue saturated across scopes; back off and retry", {
+        aggregate_queue: this.turnQueueTotal,
+        limit: NetGatewayDO.MAX_TURN_QUEUE_TOTAL
+      });
+    }
+    this.turnQueueTotal += 1;
     this.turnQueueDepth.set(key, depth + 1);
     const queuedAt = Date.now();
     const tail = this.turnQueues.get(key) ?? Promise.resolve();
@@ -789,6 +802,7 @@ export class NetGatewayDO {
       () => this.turnUnqueued(request, Date.now() - queuedAt) // a predecessor's failure never gates a successor
     );
     const release = () => {
+      this.turnQueueTotal = Math.max(0, this.turnQueueTotal - 1);
       const remaining = (this.turnQueueDepth.get(key) ?? 1) - 1;
       if (remaining <= 0) this.turnQueueDepth.delete(key);
       else this.turnQueueDepth.set(key, remaining);
@@ -1771,27 +1785,64 @@ export class NetGatewayDO {
    * timing. */
   private pbkdf2InFlight = 0;
   private static readonly MAX_PBKDF2_CONCURRENCY = 4;
+  /** V3 finding 7: a SUSTAINED derivation budget — a rolling 10s window
+   * cap, so an attacker who keeps exactly 4 jobs in flight forever
+   * cannot pin the isolate at 100% indefinitely (the concurrency cap
+   * alone permits that). Past the window budget, login refuses 429
+   * until the window rolls. */
+  private pbkdf2WindowStart = 0;
+  private pbkdf2WindowCount = 0;
+  private static readonly PBKDF2_WINDOW_MS = 10_000;
+  private static readonly MAX_PBKDF2_PER_WINDOW = 40;
   /** A structurally valid encoding that matches NO password: the unknown-
    * email/deactivated/hash-less paths verify against it so every login
    * attempt pays the same derivation. */
   private static readonly DUMMY_PASSWORD_HASH = `pbkdf2-sha256:600000:${"0".repeat(32)}:${"0".repeat(64)}`;
 
   private async clientLogin(body: Record<string, unknown>): Promise<Response> {
-    const email = normalizeEmail(String(body.email ?? ""));
+    const rawEmail = String(body.email ?? "");
     const password = String(body.password ?? "");
+    // V3 finding 7: strict BYTE limits BEFORE the email becomes a
+    // limiter key or scan input — an oversized credential is refused
+    // without bloating the limiter map or paying any derivation.
+    if (
+      new TextEncoder().encode(rawEmail).length > MAX_EMAIL_BYTES ||
+      new TextEncoder().encode(password).length > MAX_PASSWORD_BYTES
+    ) {
+      throw new ClientAuthError("invalid email or password", { reason: "credential_too_large" });
+    }
+    const email = normalizeEmail(rawEmail);
     // Pre-auth rate key: the normalized email rides the tight amplifier
     // bucket; a missing email shares one bucket.
     this.enforceClientRate(`login:${email || "anonymous"}`, "/net-api/session");
-    // Global admission: rotating emails can evict per-key limiter
-    // entries, but they cannot exceed the isolate-wide derivation cap.
-    if (this.pbkdf2InFlight >= NetGatewayDO.MAX_PBKDF2_CONCURRENCY) {
+    // Global admission: concurrency cap (a snapshot) AND a sustained
+    // rolling-window budget — rotating emails can evict per-key limiter
+    // entries, but neither the in-flight count nor the window budget can
+    // be exceeded isolate-wide.
+    const now = this.host.now();
+    if (now - this.pbkdf2WindowStart > NetGatewayDO.PBKDF2_WINDOW_MS) {
+      this.pbkdf2WindowStart = now;
+      this.pbkdf2WindowCount = 0;
+    }
+    if (
+      this.pbkdf2InFlight >= NetGatewayDO.MAX_PBKDF2_CONCURRENCY ||
+      this.pbkdf2WindowCount >= NetGatewayDO.MAX_PBKDF2_PER_WINDOW
+    ) {
       throw new ClientAuthError(
         "authentication is busy; retry after backoff",
-        { reason: "rate_limited", limit: { pbkdf2_concurrency: NetGatewayDO.MAX_PBKDF2_CONCURRENCY } },
+        {
+          reason: "rate_limited",
+          limit: {
+            pbkdf2_concurrency: NetGatewayDO.MAX_PBKDF2_CONCURRENCY,
+            pbkdf2_per_window: NetGatewayDO.MAX_PBKDF2_PER_WINDOW,
+            window_ms: NetGatewayDO.PBKDF2_WINDOW_MS
+          }
+        },
         "E_RATE",
         429
       );
     }
+    this.pbkdf2WindowCount += 1;
     const identity = await this.catalogIdentity(); // warms catalog view + activation barrier
     if (!email || !password) {
       throw new ClientAuthError("invalid email or password", { reason: "password_rejected" });
