@@ -17,6 +17,7 @@ import { pathToFileURL } from "node:url";
 import { installVerb } from "../src/core/authoring";
 import { createWorld } from "../src/core/bootstrap";
 import { cellsFromSerialized, type NetCellInput, type ShadowTurnCall } from "../src/net/bridge";
+import { netActivationCell } from "../src/net/install";
 import { CATALOG_SCOPE, partitionCells } from "../src/net/topology";
 import { applyTranscript } from "../src/net/transcript";
 import { ScopeSequencer, type CommitSubmit, type ScopeHead } from "../src/net/scope";
@@ -141,6 +142,10 @@ export async function buildLaneFixture() {
   const cluster = `cluster:${actor}`;
   const clusterB = `cluster:${actorB}`;
   const allPartitions = partitionCells(cellsFromSerialized(world.exportWorld()));
+  // Activation barrier: lane fixtures install pre-verified worlds, so
+  // they self-activate with the catalog partition (the production
+  // installer defers this cell until after verification).
+  allPartitions.set(CATALOG_SCOPE, [...(allPartitions.get(CATALOG_SCOPE) ?? []), netActivationCell(EPOCH)]);
   // The lanes drive exactly these partitions; the bundled world's other
   // partitions (other rooms/guests) are not part of the scenario.
   const partitions: Array<[string, NetCellInput[]]> = [ROOM, ANNEX, cluster, clusterB, CATALOG_SCOPE].map((scope) => {

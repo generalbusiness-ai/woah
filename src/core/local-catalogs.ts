@@ -270,12 +270,36 @@ export function parseAutoInstallCatalogs(value: string | undefined): string[] {
     .filter(Boolean);
 }
 
-export function installLocalCatalogs(world: WooWorld, names: readonly string[] = DEFAULT_LOCAL_CATALOGS): void {
+export type LocalCatalogInstallOptions = {
+  /** Fail-closed catalog health (the net-install activation rule —
+   * spec/operations/net-cutover.md): a failed version migration or
+   * schema plan THROWS instead of warning, so an install plan can never
+   * declare a half-migrated world ready. Deployed-world boot repair
+   * keeps the default warn-only posture: a booting world must come up
+   * even when one catalog needs operator attention. */
+  failClosed?: boolean;
+};
+
+export function installLocalCatalogs(
+  world: WooWorld,
+  names: readonly string[] = DEFAULT_LOCAL_CATALOGS,
+  options: LocalCatalogInstallOptions = {}
+): void {
   const requested = sortCatalogNames(names);
   const cleanInstalled = new Set<string>();
   for (const name of requested) {
     if (installLocalCatalog(world, name)) cleanInstalled.add(name);
   }
+
+  // Collected instead of thrown at the warn sites so warn-only callers
+  // keep today's behavior byte-for-byte and fail-closed callers see
+  // EVERY failure at once (an operator fixes the full list, not one per
+  // rerun).
+  const failures: Array<Record<string, unknown>> = [];
+  const report = (event: string, detail: Record<string, unknown>): void => {
+    if (options.failClosed) failures.push({ event, ...detail });
+    else console.warn(event, detail);
+  };
 
   // Existing worlds still need repair even when WOO_AUTO_INSTALL_CATALOGS is
   // intentionally empty. Missing dependencies of already-installed local
@@ -288,9 +312,12 @@ export function installLocalCatalogs(world: WooWorld, names: readonly string[] =
   // previous major. Without this step, an existing world keeps the old
   // surface (e.g. v0 forecast_hours) but flips its registry to the new
   // version, which is the worst of both worlds.
-  runLocalCatalogVersionMigrations(world, repairNames);
+  runLocalCatalogVersionMigrations(world, repairNames, report);
   const covered = runLocalCatalogMigrations(world, repairNames, cleanInstalled);
-  runAutoDetectedLocalCatalogSchemaSync(world, repairNames, covered);
+  runAutoDetectedLocalCatalogSchemaSync(world, repairNames, covered, report);
+  if (failures.length > 0) {
+    throw new Error(`catalog install failed closed: ${JSON.stringify(failures)}`);
+  }
 }
 
 export function installLocalCatalog(world: WooWorld, name: string, options: { adoptExisting?: boolean } = {}): boolean {
@@ -1362,7 +1389,9 @@ function runNoteTextStringShapeMigration(world: WooWorld, names: readonly string
 // the catalog registry record is updated to the new version atomically
 // with the cleanup. Idempotent: when there's no drift, no migration is
 // found, or the matching one was already applied, this is a no-op.
-function runLocalCatalogVersionMigrations(world: WooWorld, names: readonly string[]): void {
+type CatalogInstallFailureReport = (event: string, detail: Record<string, unknown>) => void;
+
+function runLocalCatalogVersionMigrations(world: WooWorld, names: readonly string[], report: CatalogInstallFailureReport): void {
   for (const name of names) {
     if (!localCatalogInstalled(world, name)) continue;
     const manifest = LOCAL_CATALOGS.get(name);
@@ -1383,7 +1412,7 @@ function runLocalCatalogVersionMigrations(world: WooWorld, names: readonly strin
         migration
       });
     } catch (err) {
-      console.warn("woo.local_catalog_version_migration_failed", { catalog: name, from: currentVersion, to: manifest.version, error: err instanceof Error ? err.message : String(err) });
+      report("woo.local_catalog_version_migration_failed", { catalog: name, from: currentVersion, to: manifest.version, error: err instanceof Error ? err.message : String(err) });
     }
   }
 }
@@ -1438,7 +1467,12 @@ function isVersionLessThan(a: string, b: string): boolean {
   return false;
 }
 
-function runAutoDetectedLocalCatalogSchemaSync(world: WooWorld, names: readonly string[], covered: ReadonlySet<string>): void {
+function runAutoDetectedLocalCatalogSchemaSync(
+  world: WooWorld,
+  names: readonly string[],
+  covered: ReadonlySet<string>,
+  report: CatalogInstallFailureReport
+): void {
   for (const name of names) {
     if (!localCatalogInstalled(world, name)) continue;
     const manifest = LOCAL_CATALOGS.get(name)!;
@@ -1459,7 +1493,7 @@ function runAutoDetectedLocalCatalogSchemaSync(world: WooWorld, names: readonly 
       reconcileSeedHooks: true
     });
     if (result.status === "completed") markMigrationApplied(world, result.plan_id);
-    else console.warn("woo.local_catalog_schema_plan_failed", { catalog: name, plan_id: result.plan_id, error: result.error ?? null, issues: result.issues });
+    else report("woo.local_catalog_schema_plan_failed", { catalog: name, plan_id: result.plan_id, error: result.error ?? null, issues: result.issues });
   }
 }
 

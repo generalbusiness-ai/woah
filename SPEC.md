@@ -122,6 +122,7 @@ Operationally visible procedures for lifecycle management: deploys, migrations, 
 - [deployments.md](spec/operations/deployments.md) — dev / staging / prod, version coordination, cross-environment sync (DP1–DP9)
 - [observability.md](spec/operations/observability.md) — logs, metrics, traces, audit (O1–O9)
 - [workflows.md](spec/operations/workflows.md) — state machines on `$space`s; role gating; transition rules (WF1–WF10)
+- [net-cutover.md](spec/operations/net-cutover.md) — net namespace installation, activation barrier, write-freeze/export watermark, rollback contract (NC1–NC8)
 
 ### Identity
 

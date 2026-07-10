@@ -48,8 +48,10 @@ function buildHarness(vars: Record<string, string> = {}) {
   };
 }
 
+type ExportEnvelope = { frozen: boolean; watermark: string; exported_at: number; identity: unknown };
+
 describe("cutover item B: the identity-export doorway", () => {
-  it("a signed GET /net-install/identity-export returns the §8 export from the live world; unsigned is refused", async () => {
+  it("refuses unfrozen exports, honors the rehearsal override, and the watermark tracks mutations", async () => {
     const h = buildHarness();
     // A live session so the world has SOME identity-adjacent state.
     const auth = await h.request("/api/auth", {
@@ -62,11 +64,33 @@ describe("cutover item B: the identity-export doorway", () => {
     const unsigned = await h.request("/net-install/identity-export");
     expect(unsigned.status).toBe(401);
 
-    const response = await h.signedRequest("/net-install/identity-export");
+    // Freeze-first contract: a signed export against an UNFROZEN world
+    // refuses — a cutover export taken while writes still land can lose
+    // the mutations that follow it.
+    const refused = await h.signedRequest("/net-install/identity-export");
+    expect(refused.status, await refused.clone().text()).toBe(409);
+
+    // The explicit rehearsal override returns the watermarked envelope.
+    const response = await h.signedRequest("/net-install/identity-export?allow-unfrozen=1");
     expect(response.status, await response.clone().text()).toBe(200);
-    const identity = parseIdentityExport(await response.json());
+    const envelope = (await response.json()) as ExportEnvelope;
+    expect(envelope.frozen).toBe(false);
+    expect(envelope.watermark).toMatch(/^[0-9a-f]{64}$/);
+    const identity = parseIdentityExport(envelope.identity);
     expect(identity.kind).toBe("woo.identity_export.v1");
     expect(typeof identity.api_keys).toBe("object");
+
+    // Positive control for the quiescence proof: a mutation between two
+    // exports MUST move the watermark (otherwise equal watermarks prove
+    // nothing).
+    const mutate = await h.request("/api/auth", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: "guest:cutover-export-2" })
+    });
+    expect(mutate.status).toBe(200);
+    const after = (await (await h.signedRequest("/net-install/identity-export?allow-unfrozen=1")).json()) as ExportEnvelope;
+    expect(after.watermark).not.toBe(envelope.watermark);
     h.close();
   });
 });
@@ -100,11 +124,51 @@ describe("cutover item C: the write-freeze", () => {
     const health = await h.request("/healthz");
     expect(health.status).toBe(200);
 
-    // THE §8 property: the signed export runs against the frozen world.
+    // THE §8 property: the signed export runs against the frozen world,
+    // reports frozen:true, and carries the stability watermark.
     const response = await h.signedRequest("/net-install/identity-export");
     expect(response.status, await response.clone().text()).toBe(200);
-    expect(parseIdentityExport(await response.json()).kind).toBe("woo.identity_export.v1");
+    const envelope = (await response.json()) as ExportEnvelope;
+    expect(envelope.frozen).toBe(true);
+    expect(envelope.watermark).toMatch(/^[0-9a-f]{64}$/);
+    expect(parseIdentityExport(envelope.identity).kind).toBe("woo.identity_export.v1");
 
+    h.close();
+  });
+
+  it("race: writes arriving during the export window are refused and the watermark stays stable", async () => {
+    // The reviewer-required cutover race: freeze on → export → a write
+    // arrives mid-window → export again. The write must refuse, and the
+    // two watermarks must be EQUAL — the quiescence verdict the operator
+    // tool (scripts/identity-export.ts) enforces before the export file
+    // may feed the install.
+    const h = buildHarness({ WOO_WRITE_FREEZE: "1" });
+
+    // Warm-up: the FIRST warm fetch runs the once-per-epoch derived-
+    // contents repair (§B2.15 — $nowhere is a sink; bootstrap leaves
+    // members in its contents mirror), which legitimately moves the
+    // image exactly once. A production world DO is long-warm so the
+    // repair epoch is already recorded; this warm-up models that. The
+    // operator tool covers the cold case by aborting on mismatch and
+    // re-running.
+    await h.signedRequest("/net-install/identity-export");
+
+    const first = (await (await h.signedRequest("/net-install/identity-export")).json()) as ExportEnvelope;
+    expect(first.watermark).toMatch(/^[0-9a-f]{64}$/);
+
+    // The racing write: a session mint (the same mutation class the
+    // positive control above proves WOULD move the watermark when
+    // unfrozen).
+    const racing = await h.request("/api/auth", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: "guest:cutover-racer" })
+    });
+    expect(racing.status).toBe(503);
+    expect(((await racing.json()) as { error: { code: string } }).error.code).toBe("E_MAINTENANCE");
+
+    const second = (await (await h.signedRequest("/net-install/identity-export")).json()) as ExportEnvelope;
+    expect(second.watermark).toBe(first.watermark);
     h.close();
   });
 

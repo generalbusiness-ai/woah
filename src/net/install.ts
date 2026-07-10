@@ -25,7 +25,27 @@ import { createWorld } from "../core/bootstrap";
 import { DEFAULT_LOCAL_CATALOGS, installLocalCatalogs, localCatalogBundleFingerprint } from "../core/local-catalogs";
 import type { WooWorld } from "../core/world";
 import { cellsFromSerialized, type NetCellInput } from "./bridge";
-import { partitionCells } from "./topology";
+import { CATALOG_SCOPE, partitionCells } from "./topology";
+
+/**
+ * The activation barrier (cutover state machine — spec/operations/
+ * net-cutover.md): a namespace is INSTALLING until the catalog authority
+ * publishes the fully-verified install epoch in this cell, and the
+ * gateway refuses ALL client traffic until then (E_NOT_INSTALLED,
+ * reason `not_active`). E_NOT_INSTALLED alone only guards a fully-unseeded
+ * namespace; this cell is what makes a PARTIALLY seeded or mixed-epoch
+ * namespace equally unobservable. The production installer seeds it LAST,
+ * after every scope head and the carried credential verify; test fixtures
+ * seed it with the catalog partition (they install pre-verified worlds).
+ */
+export const NET_ACTIVE_EPOCH_PROP = "net_active_epoch";
+
+/** The one-cell activation seed. `epoch === null` DEACTIVATES — the
+ * installer's compensation when post-activation credential verification
+ * fails (safe pre-traffic: activation always precedes the route switch). */
+export function netActivationCell(epoch: string | null): NetCellInput {
+  return { kind: "property_cell", object: "$system", name: NET_ACTIVE_EPOCH_PROP, value: { value: epoch } };
+}
 
 export type NetInstallPlan = {
   /** The install epoch every scope seeds at (`cat-<bundle fingerprint>`). */
@@ -47,6 +67,12 @@ export type NetInstallOptions = {
    * import verification rule). Async because rehoming an adopted stock
    * actor goes through the world's move chain. */
   graft?: (world: WooWorld) => unknown | Promise<unknown>;
+  /** Whether the plan includes the activation cell in the catalog
+   * partition (default true — fixtures and lanes install pre-verified
+   * worlds and want an immediately usable namespace). The PRODUCTION
+   * installer passes false and seeds `netActivationCell` as a separate
+   * final step, after all verification passes. */
+  activate?: boolean;
 };
 
 /** The deterministic install epoch for a catalog bundle. */
@@ -63,11 +89,23 @@ export function netInstallEpoch(catalogs: readonly string[] = DEFAULT_LOCAL_CATA
 export async function planNetInstall(options: NetInstallOptions = {}): Promise<NetInstallPlan> {
   const catalogs = options.catalogs ?? DEFAULT_LOCAL_CATALOGS;
   const world = createWorld();
-  installLocalCatalogs(world, catalogs);
+  // Fail-closed catalog health: a fresh install that cannot bring every
+  // catalog to a completed schema plan / version migration must ABORT
+  // the plan — an inactive namespace is recoverable; a half-migrated
+  // active one is not. (Deployed-world boot repair keeps warn-only —
+  // a booting world must come up.)
+  installLocalCatalogs(world, catalogs, { failClosed: true });
   if (options.graft) await options.graft(world);
   normalizeAnchors(world);
+  const epoch = netInstallEpoch(catalogs);
   const partitions = partitionCells(cellsFromSerialized(world.exportWorld()));
-  return { epoch: netInstallEpoch(catalogs), partitions, world };
+  if (options.activate !== false) {
+    // Pre-verified installs (fixtures, lanes): active from the first seed.
+    const catalog = partitions.get(CATALOG_SCOPE) ?? [];
+    catalog.push(netActivationCell(epoch));
+    partitions.set(CATALOG_SCOPE, catalog);
+  }
+  return { epoch, partitions, world };
 }
 
 /**

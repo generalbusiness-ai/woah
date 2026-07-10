@@ -159,6 +159,11 @@ Decisions/discoveries recorded while building:
 ## The cutover runbook (§8 steps → commands)
 
 Owner-run, in order; every step idempotent or read-only unless marked.
+NORMATIVE contract: spec/operations/net-cutover.md (NC1 state machine,
+NC3 watermark, NC4 verification, **NC6 rollback points** — know which
+phase you are in before touching anything; the point of no return is
+the FIRST NET WRITE after the route switch, forward-recovery-only from
+there).
 
 0. **Pre-deploy**: merge `net-cutover`; `./scripts/deploy.sh` (ships the
    export route + freeze flag support + install doorway). Verify the
@@ -170,20 +175,29 @@ Owner-run, in order; every step idempotent or read-only unless marked.
 2. **Final export from frozen prod**:
    `WOO_INTERNAL_SECRET=... npx tsx scripts/identity-export.ts
    --base-url https://woah1.generalbusiness.ai --out identity-export.json`
-3. **Install into the net namespace + verify** (idempotent; abort =
-   re-run): `WOO_INTERNAL_SECRET=... npx tsx scripts/net-install.ts
+   The tool refuses an unfrozen world, exports TWICE, and requires equal
+   watermarks (the NC3 quiescence proof; a benign one-time mismatch can
+   come from cold-DO housekeeping — re-run; a PERSISTENT mismatch means
+   the freeze is not holding: stop). Record the watermark line in the
+   cutover receipt (NC7).
+3. **Install into the net namespace, verify, ACTIVATE** (idempotent;
+   abort = re-run; the namespace refuses ALL client traffic until the
+   installer's final activation seed — NC1):
+   `WOO_INTERNAL_SECRET=... npx tsx scripts/net-install.ts
    --base-url https://woah1.generalbusiness.ai
    --identity identity-export.json
    --verify-apikey apikey:<id>:<secret>`
-   (the mint probe is §8 step 3's auth check; add a carried-account
-   password login check when the client shell lands).
+   `--verify-apikey` is MANDATORY with `--identity`; a failed mint probe
+   deactivates the namespace before aborting. Add a carried-account
+   password login check when the identity door lands.
 4. **Route switch**: move the public hostname to the net-serving client
    — DNS/route change, NEVER a 308 (WS clients cannot follow redirects;
    the woah→woah1 incident). [Requires the net client shell — the
    remaining build item.]
 5. **Postflight + bake**: deployed walkthrough + tail thresholds; old
    prod stays deployed AND FROZEN through the bake. Rollback = switch
-   the route back + delete WOO_WRITE_FREEZE — nothing else.
+   the route back + delete WOO_WRITE_FREEZE — nothing else — but ONLY
+   until the first net write (NC6; after that, forward recovery only).
 6. **After the bake**: retire old prod; the §8 deletion commits.
 
 REMAINING build item before step 4 can run: the net CLIENT SHELL — the
@@ -250,3 +264,61 @@ Phases, smallest-risk order:
    before the §8 route switch (step 4): the PUBLIC identity door over
    net (guest entry + account/password login) and the phase-iii
    tool-space browser panels.
+
+## Review response: deployment-readiness findings (2026-07-09)
+
+An external review (of snapshot 409331c — pre-dating d306338's freeze +
+export and 19b5e51's parity gate) found the functional substrate
+credible but the operational envelope unready. Verdict accepted; the
+four blockers are now CLOSED on this branch, and the normative contract
+moved out of this note into **spec/operations/net-cutover.md (NC1–NC8)**.
+
+**Blockers → closed:**
+1. *No consistent snapshot boundary* — partially stale (freeze + signed
+   export landed at d306338); the REAL residuals are now built: the
+   export route refuses unfrozen worlds (rehearsal override explicit),
+   returns a full-world SHA-256 WATERMARK, and the operator tool
+   exports twice requiring equal watermarks (quiescence/fence proof).
+   Race-tested: a write arriving mid-window refuses E_MAINTENANCE and
+   the watermark holds (net-cutover-freeze.test.ts). Root-caused a real
+   instability the race test caught: the one-time derived-contents
+   repair on a world DO's first warm fetch legitimately moves the image
+   once ($nowhere sink cleanup, §B2.15); the tool's re-run semantics
+   absorb it and the message names it.
+2. *No atomic activation barrier* — built (NC1): namespace state
+   machine FRESH → INSTALLING(epoch) → ACTIVE(epoch), enforced at the
+   gateway identity gate via `property_cell:$system:net_active_epoch`;
+   partial/mixed-epoch namespaces refuse E_NOT_INSTALLED
+   (not_active/epoch_mismatch) on EVERY client request; installer seeds
+   the activation cell strictly last; fixtures self-activate (they
+   install pre-verified worlds).
+3. *Unproven carried credential* — `--verify-apikey` now MANDATORY with
+   `--identity` (loud `--skip-identity-verify` override for
+   credential-less rehearsals); probe failure DEACTIVATES before
+   aborting (safe pre-traffic; NC4). Also fail-closed catalog health:
+   the install plan throws on any catalog version-migration/schema-plan
+   failure (boot repair keeps warn-only).
+4. *Doorway under-tested* — tests/worker/net-install-doorway.test.ts
+   pins the ROUTE: signature gate (unsigned/tampered/wrong-secret/
+   header-injection; secret never echoed), replay boundary (skew window
+   + idempotent in-window replay), method/path allow-list, 8MiB body
+   cap, seed/head forwarding, E_EPOCH_MISMATCH surfaced unwrapped,
+   malformed-body refusal. In curated npm test.
+
+**Items 5–11 → dispositioned honestly:**
+- 5/6/7 (gateway envelope, cross-authority latency budget, hot-scope
+  skew) — recorded as NC8 pre-deploy REQUIREMENTS; not provable in
+  workerd lanes (fidelity-ladder rule), need instrumented measurement +
+  skewed-load lanes + deployed canary. NOT yet built.
+- 8 (bounded exactly-once storage) — partial: bounded drain passes,
+  backoff, abandonment, lane directory exist from ready-to-scale;
+  retention/compaction limits + poison quarantine recorded in NC8.
+- 9 (catalog health warning-only) — CLOSED (fail-closed install, above).
+- 10 (rollback contract) — CLOSED as NC6 (six phases, point of no
+  return = first net write); runbook now names the phase per step.
+- 11 (spec normativity) — CLOSED: spec/operations/net-cutover.md is
+  normative; this note is the working log.
+
+**Deployment decision unchanged**: no production deploy until NC8's
+measurement items (skewed load, gateway envelope, canary + dashboards)
+have evidence. Steps 0–3 of the runbook remain executable today.

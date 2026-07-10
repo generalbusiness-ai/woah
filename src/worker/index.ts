@@ -720,10 +720,14 @@ async function handleNetInstall(request: Request, env: Env, url: URL): Promise<R
   // host's internal export route (read-only; runs against the frozen
   // world — both freeze gates exempt signed internal traffic).
   if (parts.length === 2 && parts[1] === "identity-export" && request.method === "GET") {
+    // `?allow-unfrozen=1` is the REHEARSAL override for the export
+    // route's freeze-first refusal (see the /__internal/identity-export
+    // handler); a real cutover export never passes it.
+    const allowUnfrozen = url.searchParams.get("allow-unfrozen") === "1";
     const forward = new Request(`${INTERNAL_ORIGIN}/__internal/identity-export`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: "{}"
+      body: JSON.stringify(allowUnfrozen ? { allow_unfrozen: true } : {})
     });
     return forwardToHost(env, WORLD_HOST, forward);
   }

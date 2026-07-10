@@ -32,6 +32,7 @@ import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../s
 import { installVerb } from "../../src/core/authoring";
 import { createWorld } from "../../src/core/bootstrap";
 import { cellsFromSerialized } from "../../src/net/bridge";
+import { netActivationCell } from "../../src/net/install";
 import { CATALOG_SCOPE, partitionCells } from "../../src/net/topology";
 import { signInternalRequest } from "../../src/worker/internal-auth";
 
@@ -230,6 +231,9 @@ async function buildHarness(gatewayEnvExtra: Partial<NetGatewayEnv> = {}) {
   world.ensureApiKey("$wiz", other, "ws-key-2", "ws-secret-2", "net-ws-test-2");
 
   const partitions = partitionCells(cellsFromSerialized(world.exportWorld()));
+  // Activation barrier: the fixture installs a pre-verified world, so it
+  // self-activates with the catalog partition.
+  partitions.set(CATALOG_SCOPE, [...(partitions.get(CATALOG_SCOPE) ?? []), netActivationCell(EPOCH)]);
   const roomScope = "room:ws_room";
   const annexScope = "room:ws_annex";
   const sideScope = "room:ws_side";

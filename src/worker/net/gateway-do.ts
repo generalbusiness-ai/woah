@@ -1423,7 +1423,57 @@ export class NetGatewayDO {
     }
     const payload = cell.value as { value?: unknown } | null | undefined;
     const map = payload && typeof payload === "object" ? payload.value : undefined;
+    await this.assertNamespaceActive(cell.stamp.catalog_epoch);
     return { map, epoch: cell.stamp.catalog_epoch };
+  }
+
+  /**
+   * The activation barrier (spec/operations/net-cutover.md): identity
+   * cells alone only prove the CATALOG scope is seeded — a namespace
+   * mid-install can hold them while other scopes are absent or a mixed
+   * epoch is being untangled. Client traffic is admitted only once the
+   * catalog authority publishes the fully-verified install epoch in
+   * `property_cell:$system:net_active_epoch`, seeded by the install
+   * pipeline as its LAST step. Enforced here because catalogIdentity is
+   * the one gate every authenticated client request already passes.
+   *
+   * Absence re-pulls once before refusing: activation lands AFTER a
+   * gateway may have cached the pre-activation catalog view, and the
+   * refused state must clear the moment the operator activates.
+   */
+  private async assertNamespaceActive(identityEpoch: string): Promise<void> {
+    const key = cellKey("property_cell", "$system", "net_active_epoch");
+    let cell = this.ensureView().get(key);
+    if (!cell) {
+      try {
+        await this.pull({ scope: CATALOG_SCOPE, destination: `scope:${CATALOG_SCOPE}` });
+      } catch {
+        // The refusal below names the real condition; a failed re-pull
+        // must not mask it with a transport error.
+      }
+      cell = this.ensureView().get(key);
+    }
+    const payload = cell?.value as { value?: unknown } | null | undefined;
+    const active = payload && typeof payload === "object" ? payload.value : undefined;
+    if (typeof active !== "string" || active.length === 0) {
+      throw new ClientAuthError(
+        "world not active: installation has not published a verified epoch (finish the net install pipeline)",
+        { reason: "not_active", scope: CATALOG_SCOPE },
+        "E_NOT_INSTALLED",
+        503
+      );
+    }
+    if (active !== identityEpoch) {
+      // A mixed-epoch namespace (identity cells from one install, an
+      // activation from another) is an operator error to surface, never
+      // to serve through.
+      throw new ClientAuthError(
+        "world epoch mismatch: the active epoch disagrees with the catalog identity epoch",
+        { reason: "epoch_mismatch", scope: CATALOG_SCOPE, active_epoch: active, identity_epoch: identityEpoch },
+        "E_NOT_INSTALLED",
+        503
+      );
+    }
   }
 
   /** This gateway shard's own name (Phase 6): the DO id's name when the

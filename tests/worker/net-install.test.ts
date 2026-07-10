@@ -134,4 +134,91 @@ describe("net install end-to-end (fake-DO lane)", () => {
 
     states.forEach((st) => st.close());
   });
+
+  it("activation barrier: client traffic refuses until the verified epoch is published, and on epoch mismatch", async () => {
+    const old = createWorld();
+    const carried = old.auth("guest:install-barrier").actor;
+    old.ensureApiKey("$wiz", carried, KEY_ID, KEY_SECRET, "install barrier");
+    const identity = exportIdentity(old.exportWorld());
+
+    // activate:false — the production installer's posture: every scope
+    // seeded (identity cells included) but no activation cell yet.
+    const plan = await planNetInstall({ activate: false, graft: (fresh) => importIdentity(fresh, identity) });
+
+    const states: Array<ReturnType<typeof netState>> = [];
+    const scopeDOs = new Map<string, NetScopeDO>();
+    const resolve = (destination: string) => {
+      if (destination.startsWith("scope:")) {
+        const instance = scopeDOs.get(destination.slice("scope:".length));
+        if (instance) return instance;
+      }
+      throw new Error(`unresolvable destination ${destination}`);
+    };
+    const scopeEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve };
+    const seed = async (scope: string, cells: unknown[]) => {
+      let instance = scopeDOs.get(scope);
+      if (!instance) {
+        const st = netState(`scope-${scope}`);
+        states.push(st);
+        instance = new NetScopeDO(st.state, scopeEnv);
+        scopeDOs.set(scope, instance);
+      }
+      const request = new Request("https://do/net/seed", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ scope, catalog_epoch: plan.epoch, cells })
+      });
+      const seeded = await instance.fetch(await signInternalRequest(scopeEnv, request));
+      expect(seeded.ok, `seed ${scope}`).toBe(true);
+    };
+    for (const [scope, cells] of plan.partitions) await seed(scope, cells);
+
+    // A FRESH gateway per probe: activation state rides the gateway's
+    // cached catalog view, and the barrier must hold for a shard that
+    // has never seen the namespace before.
+    const mint = async (label: string) => {
+      const st = netState(`gateway-${label}`);
+      states.push(st);
+      const gateway = new NetGatewayDO(st.state, { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve } as NetGatewayEnv);
+      return gateway.fetch(
+        new Request("https://do/net-api/session", {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer apikey:${KEY_ID}:${KEY_SECRET}` },
+          body: JSON.stringify({ ttl_ms: 60_000 })
+        })
+      );
+    };
+
+    // INSTALLING: fully seeded, identity present — still refused with the
+    // NAMED verdict (E_NOT_INSTALLED alone would only cover the unseeded
+    // namespace; this is the partial/unverified case the barrier exists for).
+    const barred = await mint("installing");
+    expect(barred.status).toBe(503);
+    const barredBody = (await barred.json()) as { error: { code: string; detail?: { reason?: string } } };
+    expect(barredBody.error.code).toBe("E_NOT_INSTALLED");
+    expect(barredBody.error.detail?.reason).toBe("not_active");
+
+    // A MIXED-EPOCH activation (identity from this install, activation
+    // from another) is an operator error to surface, never to serve through.
+    const { netActivationCell } = await import("../../src/net/install");
+    const { CATALOG_SCOPE } = await import("../../src/net/topology");
+    await seed(CATALOG_SCOPE, [{ ...netActivationCell("cat-someother"), value: { value: "cat-someother" } }]);
+    const mixed = await mint("mixed");
+    expect(mixed.status).toBe(503);
+    expect(((await mixed.json()) as { error: { detail?: { reason?: string } } }).error.detail?.reason).toBe("epoch_mismatch");
+
+    // ACTIVE: publishing the verified epoch admits traffic.
+    await seed(CATALOG_SCOPE, [netActivationCell(plan.epoch)]);
+    const active = await mint("active");
+    expect(active.status, JSON.stringify(await active.clone().json())).toBe(200);
+
+    // DEACTIVATED (the installer's failed-verification compensation):
+    // a null activation refuses again on a fresh shard.
+    await seed(CATALOG_SCOPE, [netActivationCell(null)]);
+    const deactivated = await mint("deactivated");
+    expect(deactivated.status).toBe(503);
+    expect(((await deactivated.json()) as { error: { detail?: { reason?: string } } }).error.detail?.reason).toBe("not_active");
+
+    states.forEach((st) => st.close());
+  });
 });

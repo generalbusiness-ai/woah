@@ -4285,7 +4285,37 @@ export class PersistentObjectDO {
         // exempts internal routes) — exactly the protocol's "final
         // identity-export from frozen old prod". Reached from outside
         // via the signed GET /net-install/identity-export edge doorway.
-        return jsonResponse(exportIdentity(world.exportWorld()));
+        //
+        // Consistency contract (spec/operations/net-cutover.md): the
+        // export REFUSES on an unfrozen world unless the caller passes
+        // the explicit `allow_unfrozen` rehearsal override — a cutover
+        // export taken while writes still land can silently lose the
+        // mutations that follow it. The reply carries a WATERMARK (a
+        // digest of the full serialized world, not just the identity
+        // slice) so the operator tool can prove quiescence: two
+        // back-to-back exports with equal watermarks show no in-flight
+        // write landed between them.
+        const frozen = Boolean(this.env.WOO_WRITE_FREEZE);
+        if (!frozen && body.allow_unfrozen !== true) {
+          return jsonResponse(
+            {
+              error: wooError(
+                "E_INVARG",
+                "identity export refused: the world is not write-frozen (set WOO_WRITE_FREEZE, or pass allow_unfrozen for a rehearsal)"
+              )
+            },
+            409
+          );
+        }
+        const serialized = world.exportWorld();
+        const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(serialized)));
+        const watermark = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+        return jsonResponse({
+          frozen,
+          watermark,
+          exported_at: Date.now(),
+          identity: exportIdentity(serialized)
+        });
       }
 
       if (request.method === "POST" && pathname === "/__internal/room-snapshot") {

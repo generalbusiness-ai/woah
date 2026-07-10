@@ -28,6 +28,7 @@ import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../s
 import { installVerb } from "../../src/core/authoring";
 import { createWorld } from "../../src/core/bootstrap";
 import { cellsFromSerialized } from "../../src/net/bridge";
+import { netActivationCell } from "../../src/net/install";
 import { CATALOG_SCOPE, partitionCells } from "../../src/net/topology";
 import type { CommitReply } from "../../src/net/scope";
 
@@ -126,6 +127,9 @@ async function buildHarness() {
   world.ensureApiKey("$wiz", other, "capi-key-2", "capi-secret-2", "net-client-api-test-2");
 
   const partitions = partitionCells(cellsFromSerialized(world.exportWorld()));
+  // Activation barrier: the fixture installs a pre-verified world, so it
+  // self-activates with the catalog partition.
+  partitions.set(CATALOG_SCOPE, [...(partitions.get(CATALOG_SCOPE) ?? []), netActivationCell(EPOCH)]);
   const roomScope = "room:capi_room";
   const clusterScope = `cluster:${actor}`;
   expect([...partitions.keys()]).toEqual(expect.arrayContaining([roomScope, clusterScope, CATALOG_SCOPE]));
