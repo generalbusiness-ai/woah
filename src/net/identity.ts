@@ -299,6 +299,36 @@ export async function importIdentity(world: WooWorld, identity: IdentityExport):
       : {};
   world.setProp("$system", "api_keys", { ...existing, ...identity.api_keys } as never);
 
+  // Rebuild the account→actor half of the binding (identity-door
+  // requirement): the §8 allow-list deliberately carries only the
+  // ACTOR-side `account` prop (`primary_actor`/`actors` reference world
+  // objects the export may not include, so carrying them risks dangling
+  // refs), but password login resolves THROUGH `account.primary_actor`
+  // (v2 authenticatePassword parity). Invert the carried bindings:
+  // first-bound actor wins primary (deterministic — export order), and
+  // `actors[]` collects every bound actor. Idempotent: re-runs find the
+  // same values.
+  for (const actor of identity.actors) {
+    const account = actor.props.account;
+    if (typeof account !== "string" || account.length === 0) continue;
+    let accountExists = true;
+    try {
+      world.object(account);
+    } catch {
+      accountExists = false;
+    }
+    if (!accountExists) continue; // the verification below names it
+    const primary = world.propOrNull(account, "primary_actor");
+    if (typeof primary !== "string" || primary.length === 0) {
+      world.setProp(account, "primary_actor", actor.id as never);
+    }
+    const boundRaw = world.propOrNull(account, "actors");
+    const bound = Array.isArray(boundRaw) ? boundRaw.filter((id): id is string => typeof id === "string") : [];
+    if (!bound.includes(actor.id)) {
+      world.setProp(account, "actors", [...bound, actor.id] as never);
+    }
+  }
+
   // §8 import verification — abort on ANY dangling ref.
   for (const [keyId, record] of Object.entries(identity.api_keys)) {
     const actor = (record as { actor?: unknown } | null)?.actor;

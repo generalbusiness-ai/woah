@@ -1136,7 +1136,15 @@ export class NetScopeDO {
         authorizeSessionSubmit(submit, {
           ownsSession: (id) => this.ownsSessionCell(seq, id),
           readSession: (id) => seq.store.get(cellKey("session", id)),
-          now: () => this.host.now()
+          now: () => this.host.now(),
+          // Identity-door exclusiveMint occupancy witness: this cluster's
+          // session cells for the actor (the store index). No residue
+          // filter needed: a session's authority IS its actor's cluster
+          // (the classification rule), so a cell for THIS actor held
+          // HERE is authoritative by construction — a foreign copy of
+          // this actor's session cannot exist at its own cluster.
+          sessionsForActor: (actor) =>
+            seq.store.sessionCellsForActor(actor).map((cell) => ({ id: cell.key.slice("session:".length), cell }))
         }),
       // Ownership wiring (Phase-3 hardening fix 2). Fixed-assignment rule,
       // in force until the Phase-3.5 topology section lands anchor-map-

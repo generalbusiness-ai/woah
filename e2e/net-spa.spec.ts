@@ -98,6 +98,54 @@ test("the real SPA over the net path: alice's chat line reaches bob's browser", 
   await contextB.close();
 });
 
+test("the identity door: guest entry and password sign-in in real browsers, no stored apikey", async ({ browser }) => {
+  test.setTimeout(120_000);
+
+  // GUEST: a fresh context with NO credential lands on the login card;
+  // "Continue as guest" claims a pool seat through /net-api/guest and
+  // the chat shell boots on the minted session bearer.
+  const guestContext = await browser.newContext();
+  const guest = await guestContext.newPage();
+  await guest.goto(`${base}/?net=1`);
+  await expect(guest.locator("[data-login-guest]")).toBeVisible({ timeout: 30_000 });
+  await guest.locator("[data-login-guest]").click();
+  await expect(guest.locator("[data-chat-input]")).toBeVisible({ timeout: 30_000 });
+  const guestLine = `door-guest-${Date.now().toString(36)}`;
+  await guest.locator("[data-chat-input]").fill(`say ${guestLine}`);
+  await guest.locator("[data-chat-input]").press("Enter");
+  await expect(guest.locator(".chat-feed")).toContainText(guestLine, { timeout: 20_000 });
+
+  // PASSWORD: carol signs in with her carried email/password (the §8
+  // human path — PBKDF2 verify at the gateway, primary_actor rebuilt by
+  // the import) and her chat works on the door session.
+  const carolContext = await browser.newContext();
+  const carol = await carolContext.newPage();
+  await carol.goto(`${base}/?net=1`);
+  await expect(carol.locator('[data-login-form] input[name="username"]')).toBeVisible({ timeout: 30_000 });
+  await carol.locator('[data-login-form] input[name="username"]').fill("carol@example.com");
+  await carol.locator('[data-login-form] input[name="password"]').fill("carols-real-password");
+  await carol.locator(".login-submit").click();
+  await expect(carol.locator("[data-chat-input]")).toBeVisible({ timeout: 30_000 });
+  const carolLine = `door-carol-${Date.now().toString(36)}`;
+  await carol.locator("[data-chat-input]").fill(`say ${carolLine}`);
+  await carol.locator("[data-chat-input]").press("Enter");
+  await expect(carol.locator(".chat-feed")).toContainText(carolLine, { timeout: 20_000 });
+
+  // A WRONG password stays on the card with the fail-closed message.
+  const malloryContext = await browser.newContext();
+  const mallory = await malloryContext.newPage();
+  await mallory.goto(`${base}/?net=1`);
+  await expect(mallory.locator('[data-login-form] input[name="username"]')).toBeVisible({ timeout: 30_000 });
+  await mallory.locator('[data-login-form] input[name="username"]').fill("carol@example.com");
+  await mallory.locator('[data-login-form] input[name="password"]').fill("not-her-password");
+  await mallory.locator(".login-submit").click();
+  await expect(mallory.locator(".login-error")).toContainText("invalid email or password", { timeout: 20_000 });
+
+  await guestContext.close();
+  await carolContext.close();
+  await malloryContext.close();
+});
+
 test("tool-space panels over net: alice's pinboard note renders on bob's board (phase iii)", async ({ browser }) => {
   test.setTimeout(120_000);
   const contextA = await browser.newContext();

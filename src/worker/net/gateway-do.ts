@@ -70,7 +70,7 @@ import { netCellKeyFor, type EffectTranscript } from "../../net/transcript";
 import type { CellTransfer } from "../../net/cells";
 import { randomHex } from "../../core/source-hash";
 import { verifyInternalRequest } from "../internal-auth";
-import { ClientAuthError, parseClientCredential, verifyApiKeyCredential } from "./client-auth";
+import { ClientAuthError, normalizeEmail, parseClientCredential, verifyApiKeyCredential, verifyPasswordCredential } from "./client-auth";
 import { TokenBucketLimiter } from "./rate-limit";
 import { resolveNetDestination, WorkerdHost, type NetBindingsEnv } from "./workerd-host";
 
@@ -192,6 +192,10 @@ type SessionOpenRequest = {
    * cross-actor observations before its first move; absent = the
    * pre-existing placeless mint. */
   active_scope?: string | null;
+  /** Identity-door guest claim (see MintSessionInput.exclusive): refuse
+   * `actor_occupied` at the cluster sequencer when another live session
+   * binds the actor. */
+  exclusive?: boolean;
 };
 
 /** /net/turn reply body. `trace` lists the failed rounds that preceded
@@ -1317,7 +1321,8 @@ export class NetGatewayDO {
       base,
       epoch: request.catalog_epoch,
       clusterScope,
-      ...(request.active_scope !== undefined ? { activeScope: request.active_scope } : {})
+      ...(request.active_scope !== undefined ? { activeScope: request.active_scope } : {}),
+      ...(request.exclusive ? { exclusive: true } : {})
     });
     // A placed mint carries a presence transition whose room usually
     // anchors at ANOTHER scope: ship the relate directions so the
@@ -1420,9 +1425,35 @@ export class NetGatewayDO {
         return await this.clientMcp(request);
       }
 
+      // The identity door: these two routes authenticate by their OWN
+      // credentials (email/password, guest claim) and mint the session
+      // that then acts as the bearer — they branch before the
+      // header-credential gate exactly like the MCP initialize.
+      if (request.method === "POST" && url.pathname === "/net-api/login") {
+        const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+        return await this.clientLogin(body);
+      }
+      if (request.method === "POST" && url.pathname === "/net-api/guest") {
+        const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+        return await this.clientGuest(body);
+      }
+
       const credential = parseClientCredential(request.headers, null);
       const identity = await this.catalogIdentity();
-      const { actor } = verifyApiKeyCredential(identity.map, credential);
+      // Two credential classes (client-auth.ts): the apikey resolves its
+      // actor from the identity map; a session bearer (minted by login/
+      // guest/session) resolves from the session cell — the MCP adapter's
+      // trust shape, generalized. The bearer session also becomes the
+      // DEFAULT session param downstream, so a door client never has to
+      // repeat it in bodies/queries.
+      let actor: string;
+      let bearerSession: string | null = null;
+      if (credential.kind === "session") {
+        actor = this.actorForSessionBearer(credential.session);
+        bearerSession = credential.session;
+      } else {
+        actor = verifyApiKeyCredential(identity.map, credential).actor;
+      }
 
       // H4: rate limiting runs AFTER authentication resolves the actor
       // (so buckets key on identity, never on spoofable request bytes)
@@ -1431,14 +1462,24 @@ export class NetGatewayDO {
 
       if (request.method === "POST" && url.pathname === "/net-api/ws-ticket") {
         const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+        if (bearerSession && body.session === undefined) body.session = bearerSession;
         return await this.mintWsTicket(actor, body);
       }
       if (request.method === "POST" && url.pathname === "/net-api/session") {
+        if (bearerSession) {
+          // A session cannot mint further sessions: re-authentication is
+          // the door's job (login/guest/apikey). Named, not silent.
+          return json(
+            { error: { code: "E_PERM", message: "a session bearer cannot mint sessions; authenticate at the door", detail: { reason: "session_bearer_mint" } } },
+            403
+          );
+        }
         const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
         return await this.clientSession(actor, body, identity.epoch);
       }
       if (request.method === "POST" && url.pathname === "/net-api/turn") {
         const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+        if (bearerSession && body.session === undefined) body.session = bearerSession;
         return await this.clientTurn(actor, body, identity.epoch);
       }
       if (request.method === "GET" && url.pathname === "/net-api/relation") {
@@ -1449,14 +1490,14 @@ export class NetGatewayDO {
         }
         // B1: reads require the caller's session (the presence anchor) and
         // are authorized against it — no global reads, no credential cells.
-        const session = this.readSession(url, actor);
+        const session = this.readSession(url, actor, bearerSession);
         this.authorizeRelationRead(actor, session, owner);
         return json({ relation, owner, members: this.relationMembers(relation, owner) });
       }
       if (request.method === "GET" && url.pathname === "/net-api/cell") {
         const key = url.searchParams.get("key") ?? "";
         if (!key) return json({ error: { code: "E_INVARG", message: "key query param is required" } }, 400);
-        const session = this.readSession(url, actor);
+        const session = this.readSession(url, actor, bearerSession);
         this.authorizeCellRead(actor, session, key);
         return json({ key, cell: this.ensureView().get(key) ?? null });
       }
@@ -1616,8 +1657,113 @@ export class NetGatewayDO {
     return typeof name === "string" && name.length > 0 ? name : null;
   }
 
+  /**
+   * POST /net-api/login {email, password, ttl_ms?} — the identity door's
+   * human half (§8 "humans re-authenticate by password"). Verifies the
+   * password against the carried $account cells in the catalog-scope view
+   * (the SAME closure the apikey gate reads identity from), resolves the
+   * account's primary actor, and mints a session through the standard
+   * machinery. Fail-closed v2 parity: unknown email, deactivated account,
+   * bad password, and unresolvable actor all share ONE message.
+   */
+  private async clientLogin(body: Record<string, unknown>): Promise<Response> {
+    const email = normalizeEmail(String(body.email ?? ""));
+    const password = String(body.password ?? "");
+    // Pre-auth rate key: the normalized email rides the tight amplifier
+    // bucket (PBKDF2 at 600k iterations is exactly the CPU amplifier the
+    // bucket exists for); a missing email shares one bucket.
+    this.enforceClientRate(`login:${email || "anonymous"}`, "/net-api/session");
+    const identity = await this.catalogIdentity(); // warms catalog view + activation barrier
+    if (!email || !password) {
+      throw new ClientAuthError("invalid email or password", { reason: "password_rejected" });
+    }
+    const account = this.accountByEmail(email);
+    const encoded = typeof account?.props.password_hash === "string" ? account.props.password_hash : "";
+    const deactivated = account?.props.deactivated_at != null;
+    const verified = !deactivated && encoded !== "" && (await verifyPasswordCredential(password, encoded));
+    const actor = typeof account?.props.primary_actor === "string" ? account.props.primary_actor : "";
+    if (!account || !verified || !actor) {
+      // One message for every failure class (v2 authenticatePassword
+      // parity) — but the METRIC names the real cause, because a carried
+      // account with a missing primary_actor is an import bug to fix,
+      // not a user typo.
+      if (account && verified && !actor) {
+        console.log(
+          "woo.metric",
+          JSON.stringify({ kind: "net_login_unbound_account", account: account.id, ts: Date.now() })
+        );
+      }
+      throw new ClientAuthError("invalid email or password", { reason: "password_rejected" });
+    }
+    return await this.clientSession(actor, body, identity.epoch);
+  }
+
+  /**
+   * POST /net-api/guest {ttl_ms?} — the identity door's anonymous half.
+   * Claims a free actor from the install-seeded pool
+   * (property_cell:$system:guest_pool — catalog DATA, so the gateway
+   * never hardcodes world names) with an EXCLUSIVE mint: the cluster
+   * sequencer refuses `actor_occupied` when a live session already binds
+   * the actor, so concurrent claims serialize and two humans never share
+   * one guest. Pool exhausted = a NAMED capacity refusal (v1 limitation,
+   * documented: v2 mints fresh guests beyond its pool; the net door does
+   * not yet).
+   */
+  private async clientGuest(body: Record<string, unknown>): Promise<Response> {
+    // One shared pre-auth bucket: guest claims are session mints.
+    this.enforceClientRate("guest:door", "/net-api/session");
+    const identity = await this.catalogIdentity();
+    const poolCell = this.ensureView().get(cellKey("property_cell", "$system", "guest_pool"));
+    const payload = poolCell?.value as { value?: unknown } | undefined;
+    const pool = Array.isArray(payload?.value) ? payload.value.filter((id): id is string => typeof id === "string") : [];
+    if (pool.length === 0) {
+      return json(
+        { error: { code: "E_RATE", message: "no guest pool is installed in this world", detail: { reason: "guest_pool_missing" } } },
+        503
+      );
+    }
+    for (const actor of pool) {
+      const response = await this.clientSession(actor, body, identity.epoch, { exclusive: true });
+      if (response.status === 409) continue; // occupied — try the next pool actor
+      return response;
+    }
+    return json(
+      { error: { code: "E_RATE", message: "all guest actors are in use; try again later", detail: { reason: "guest_pool_exhausted", pool_size: pool.length } } },
+      503
+    );
+  }
+
+  /** Linear scan of the catalog-scope view for the $account instance
+   * whose email prop matches (normalized) — v2 findAccountByEmail parity;
+   * O(accounts) over in-memory cells, same asymptotics as core's scan.
+   * Identifies accounts by their lineage parent chain reaching $account
+   * (one hop: instances parent directly to the class). */
+  private accountByEmail(email: string): { id: string; props: Record<string, unknown> } | null {
+    const view = this.ensureView();
+    for (const key of view.keys()) {
+      if (!key.startsWith("object_lineage:")) continue;
+      const object = key.slice("object_lineage:".length);
+      const lineage = view.get(key)?.value as { parent?: string | null } | undefined;
+      if (lineage?.parent !== "$account") continue;
+      const emailCell = view.get(cellKey("property_cell", object, "email"))?.value as { value?: unknown } | undefined;
+      if (typeof emailCell?.value !== "string" || normalizeEmail(emailCell.value) !== email) continue;
+      const props: Record<string, unknown> = {};
+      for (const name of ["password_hash", "password_salt", "primary_actor", "deactivated_at"]) {
+        const cell = view.get(cellKey("property_cell", object, name))?.value as { value?: unknown } | undefined;
+        if (cell && "value" in cell) props[name] = cell.value;
+      }
+      return { id: object, props };
+    }
+    return null;
+  }
+
   /** POST /net-api/session — see the clientApi header. */
-  private async clientSession(actor: string, body: Record<string, unknown>, epoch: string): Promise<Response> {
+  private async clientSession(
+    actor: string,
+    body: Record<string, unknown>,
+    epoch: string,
+    options: { exclusive?: boolean } = {}
+  ): Promise<Response> {
     // The mint needs the actor's lineage (cluster-scope derivation) in
     // view; the CO15 `cluster:<actor>` convention names the pull
     // destination without needing lineage first (the planScheduled
@@ -1643,12 +1789,23 @@ export class NetGatewayDO {
       actor,
       ttl_ms: clampClientTtl(body.ttl_ms),
       catalog_epoch: epoch,
-      active_scope: bornAt
+      active_scope: bornAt,
+      ...(options.exclusive ? { exclusive: true } : {})
     });
     if (opened.reply.status !== "accepted") {
-      // A mint only rejects retryably (stale_head races, already retried
-      // inside sessionOpen) or on epoch drift; either way the client's
-      // recovery is simply to retry.
+      // Identity-door guest claim: the occupied verdict is the caller's
+      // signal to try the next pool actor — a NAMED terminal refusal,
+      // never a retry-me.
+      const rejectDetail = (opened.reply as { detail?: Record<string, unknown> }).detail;
+      if (rejectDetail?.session_verdict === "actor_occupied") {
+        return json(
+          { error: { code: "E_PERM", message: `actor ${actor} already has a live session`, detail: rejectDetail } },
+          409
+        );
+      }
+      // Otherwise a mint only rejects retryably (stale_head races, already
+      // retried inside sessionOpen) or on epoch drift; either way the
+      // client's recovery is simply to retry.
       return json({ error: { code: "E_RETRY", message: "session mint did not commit; retry", detail: opened.reply } }, 503);
     }
     // H1: subscribe this gateway to the actor's CLUSTER — the session's
@@ -2467,12 +2624,13 @@ export class NetGatewayDO {
    * `caller` is the authenticated actor; `session` is the caller's
    * validated session id (required on reads — the presence anchor).
    */
-  /** The caller's session from `?session=`, validated as a live cell bound
-   * to the authenticated actor (B1: reads are presence-scoped, so a valid
-   * session is the anchor). Throws ClientAuthError on a missing/invalid/
-   * foreign session. */
-  private readSession(url: URL, actor: string): string {
-    const session = url.searchParams.get("session") ?? "";
+  /** The caller's session from `?session=` (or the bearer session when the
+   * request authenticated by one — the door default), validated as a live
+   * cell bound to the authenticated actor (B1: reads are presence-scoped,
+   * so a valid session is the anchor). Throws ClientAuthError on a
+   * missing/invalid/foreign session. */
+  private readSession(url: URL, actor: string, bearerSession: string | null = null): string {
+    const session = url.searchParams.get("session") || bearerSession || "";
     if (!session) {
       throw new ClientAuthError("reads require a session query param (B1: presence-scoped)", { reason: "session_required" });
     }
@@ -2481,6 +2639,19 @@ export class NetGatewayDO {
       throw new ClientAuthError(`session ${verdict}`, { session_verdict: verdict });
     }
     return session;
+  }
+
+  /** Session-bearer authentication (client-auth.ts `session:` class): the
+   * bearer's session cell must be live in this gateway's view — the MCP
+   * adapter's mcp-session-id validation, generalized to the whole /net-api
+   * surface. The named refusals mirror validateSessionCell's verdicts. */
+  private actorForSessionBearer(session: string): string {
+    const cell = this.ensureView().get(sessionCellKey(session));
+    const verdict = validateSessionCell(cell, this.host.now());
+    if (verdict !== "ok") {
+      throw new ClientAuthError(`session ${verdict}`, { session_verdict: verdict, reason: "session_bearer_rejected" });
+    }
+    return (cell?.value as { actor?: string }).actor as string;
   }
 
   private callerPresenceScopes(session: string, caller: string): Set<string> {

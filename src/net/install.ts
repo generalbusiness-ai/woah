@@ -97,6 +97,7 @@ export async function planNetInstall(options: NetInstallOptions = {}): Promise<N
   installLocalCatalogs(world, catalogs, { failClosed: true });
   if (options.graft) await options.graft(world);
   normalizeAnchors(world);
+  seedGuestPool(world);
   const epoch = netInstallEpoch(catalogs);
   const partitions = partitionCells(cellsFromSerialized(world.exportWorld()));
   if (options.activate !== false) {
@@ -106,6 +107,68 @@ export async function planNetInstall(options: NetInstallOptions = {}): Promise<N
     partitions.set(CATALOG_SCOPE, catalog);
   }
   return { epoch, partitions, world };
+}
+
+/**
+ * Identity-door guest pool: `$system.guest_pool` lists the claimable
+ * anonymous actors — every live `$guest`-descended instance NOT bound to
+ * an account (an adopted carried identity is somebody's, never a pool
+ * seat). The gateway's `/net-api/guest` reads this CELL (catalog data
+ * driving behavior — the layering rule: the gateway never hardcodes
+ * world names) and claims a seat with an exclusive mint. Seeded at
+ * install because the pool is a property of the installed WORLD;
+ * deterministic (sorted) and idempotent. v1 limitation, documented: the
+ * pool is fixed — v2 mints fresh guests beyond its pool; the net door
+ * refuses namedly when every seat is taken.
+ */
+function seedGuestPool(world: WooWorld): void {
+  const serialized = world.exportWorld();
+  const objects = new Map(serialized.objects.map((obj) => [obj.id, obj]));
+  const reachesGuestClass = (id: string): boolean => {
+    let current: string | null | undefined = objects.get(id)?.parent;
+    const guard = new Set<string>([id]);
+    while (current && !guard.has(current)) {
+      if (current === "$guest") return true;
+      guard.add(current);
+      current = objects.get(current)?.parent;
+    }
+    return false;
+  };
+  // A pool seat must be genuinely ANONYMOUS: an account-bound guest is a
+  // human's carried identity, and an apikey-bound one is an agent's —
+  // neither may be handed out at the door.
+  const apiKeysRaw = world.propOrNull("$system", "api_keys");
+  const apiKeyActors = new Set<string>();
+  if (apiKeysRaw && typeof apiKeysRaw === "object" && !Array.isArray(apiKeysRaw)) {
+    for (const record of Object.values(apiKeysRaw as Record<string, unknown>)) {
+      const actor = (record as { actor?: unknown } | null)?.actor;
+      if (typeof actor === "string") apiKeyActors.add(actor);
+    }
+  }
+  const pool = serialized.objects
+    .filter((obj) => !obj.id.startsWith("$") && reachesGuestClass(obj.id))
+    .filter((obj) => {
+      if (apiKeyActors.has(obj.id)) return false;
+      const account = obj.properties?.find(([name]) => name === "account")?.[1];
+      return typeof account !== "string" || account.length === 0;
+    })
+    .map((obj) => obj.id)
+    .sort();
+  world.setProp("$system", "guest_pool", pool as never);
+  // v2 parity: placeAllocatedGuest moves a fresh guest into
+  // `$system.guest_initial_room` at auth time. The net door mints the
+  // session at the actor's LIVE location, so pool seats are placed once
+  // at install instead — a claimed guest's session is then born present
+  // in the start room (placeless sessions miss every observation until
+  // their first move). Idempotent: only $nowhere seats move.
+  const startRaw = world.propOrNull("$system", "guest_initial_room");
+  const start = typeof startRaw === "string" && startRaw.length > 0 && objects.has(startRaw) ? startRaw : null;
+  if (start !== null) {
+    for (const id of pool) {
+      const location = objects.get(id)?.location ?? null;
+      if (location === null || location === "$nowhere") world.moveObject(id, start);
+    }
+  }
 }
 
 /**

@@ -95,11 +95,20 @@ export type NetFeedOptions = {
    * trailing slash needed; one is tolerated). The WS URL is derived by
    * swapping the scheme (http→ws / https→wss). */
   baseUrl: string;
-  /** The full woo client credential: `apikey:<id>:<secret>` (the form
-   * client-auth.ts parses). Sent as `authorization: Bearer <apiKey>` on
-   * HTTP; the WS upgrade uses a short-lived single-use TICKET minted over
-   * HTTP (B3) so this permanent secret never rides the WS URL. */
+  /** The full woo client credential: `apikey:<id>:<secret>` OR
+   * `session:<id>` (the two classes client-auth.ts parses). Sent as
+   * `authorization: Bearer <apiKey>` on HTTP; the WS upgrade uses a
+   * short-lived single-use TICKET minted over HTTP (B3) so this
+   * credential never rides the WS URL. */
   apiKey: string;
+  /** Identity-door session ADOPTION: the door routes (/net-api/login,
+   * /net-api/guest) already minted the session — open() adopts it
+   * instead of minting (a session bearer cannot mint: the gateway
+   * refuses `session_bearer_mint` by design). When the adopted session
+   * expires, the feed terminates with the named error rather than
+   * re-minting — re-authentication is the door's job, and the shell's
+   * cue to show the login again. */
+  adoptSession?: { session: string; actor: string };
   fetchImpl?: NetFetchLike;
   webSocketImpl?: NetWebSocketCtor;
   /** Reconnect backoff by attempt (1-based). Default: 250ms doubling,
@@ -259,9 +268,12 @@ export class NetFeed {
   private readonly observationSubscribers = new Set<(event: NetFeedObservationEvent) => void>();
   private readonly stateSubscribers = new Set<(state: NetFeedState) => void>();
 
+  private readonly adoptSession: { session: string; actor: string } | null;
+
   constructor(options: NetFeedOptions) {
     this.baseUrl = options.baseUrl.replace(/\/$/, "");
     this.apiKey = options.apiKey;
+    this.adoptSession = options.adoptSession ?? null;
     this.fetchImpl = options.fetchImpl ?? (globalThis.fetch?.bind(globalThis) as NetFetchLike);
     this.webSocketImpl =
       options.webSocketImpl ??
@@ -310,16 +322,21 @@ export class NetFeed {
     // re-mint bound — this is the consumer's deliberate restart.
     this.lastError = null;
     this.remintsWithoutProgress = 0;
-    const body = this.ttlMs !== undefined ? { ttl_ms: this.ttlMs } : {};
-    const reply = (await this.fetchJson("POST", "/net-api/session", body)) as SessionReply;
-    this.session = reply.session;
-    this.actor = reply.actor;
+    if (this.adoptSession) {
+      this.session = this.adoptSession.session;
+      this.actor = this.adoptSession.actor;
+    } else {
+      const body = this.ttlMs !== undefined ? { ttl_ms: this.ttlMs } : {};
+      const reply = (await this.fetchJson("POST", "/net-api/session", body)) as SessionReply;
+      this.session = reply.session;
+      this.actor = reply.actor;
+    }
     // Await the initial socket CONSTRUCTION (B3 ticket mint + connect) so
     // a caller that open()s then acts has a live socket; failures fall to
     // the background reconnect loop. Reconnects (below) stay fire-and-forget.
     await this.connectSocket();
     this.notifyState();
-    return { session: reply.session, actor: reply.actor };
+    return { session: this.session as string, actor: this.actor as string };
   }
 
   /** Stop reconnecting and close the socket. The session cell simply
@@ -351,6 +368,14 @@ export class NetFeed {
    * removes. A successful mint clears any surfaced error.
    */
   private async remintSession(): Promise<string> {
+    if (this.adoptSession) {
+      // A door-adopted session cannot re-mint (the gateway refuses
+      // session-bearer mints); its expiry is terminal here and the
+      // shell's cue to show the door again.
+      throw new NetFeedError("E_NOSESSION", "adopted session expired — re-authenticate at the door", 401, {
+        reason: "adopted_session_expired"
+      });
+    }
     if (this.remintInFlight) return this.remintInFlight;
     if (this.remintsWithoutProgress >= NetFeed.MAX_REMINTS_WITHOUT_PROGRESS) {
       throw new NetFeedError(

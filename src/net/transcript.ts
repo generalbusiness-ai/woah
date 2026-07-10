@@ -59,6 +59,12 @@ export type EffectTranscript = Omit<EngineEffectTranscript, "reads" | "writes" |
   reads: TranscriptRead[];
   writes: TranscriptWrite[];
   stateProbes?: TranscriptCell[];
+  /** Identity-door guest claim (CO14 addendum): a session mint stamped
+   * exclusive is refused (`actor_occupied`, terminal) when ANY other
+   * live session already binds the same actor — validated at the actor's
+   * cluster sequencer, so concurrent claims serialize and exactly one
+   * wins. Present-only-when-true keeps prior transcript hashes unchanged. */
+  exclusiveMint?: boolean;
 };
 
 /**

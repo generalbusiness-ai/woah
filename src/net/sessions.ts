@@ -102,6 +102,10 @@ export type MintSessionInput = {
    * location; internal/lane callers omit it (null — the pre-existing
    * behavior; their explicit enter turns place the session). */
   activeScope?: string | null;
+  /** Identity-door guest claim: stamp the transcript exclusiveMint so
+   * the cluster sequencer refuses `actor_occupied` when another live
+   * session binds the actor (two humans must never share one guest). */
+  exclusive?: boolean;
 };
 
 export type MintSessionResult = {
@@ -169,6 +173,7 @@ export function mintSessionSubmit(input: MintSessionInput): MintSessionResult {
     ...(input.activeScope
       ? { sessionScopeTransition: { session: input.session, actor: input.actor, from: null, to: input.activeScope } }
       : {}),
+    ...(input.exclusive ? { exclusiveMint: true } : {}),
     reads: [],
     writes: [
       {
@@ -225,6 +230,11 @@ export type SessionAuthDeps = {
   /** The scope's own authoritative cell for a session it owns. */
   readSession(session: string): Pick<Cell, "value"> | undefined;
   now(): number;
+  /** The scope's own session cells bound to an actor (the exclusiveMint
+   * occupancy witness). Optional for callers that never see exclusive
+   * mints (tests, planners); an exclusive mint reaching a deps without
+   * it refuses fail-closed. */
+  sessionsForActor?(actor: string): Array<{ id: string; cell: Pick<Cell, "value"> }>;
 };
 
 /**
@@ -291,6 +301,21 @@ export function authorizeSessionSubmit(submit: CommitSubmit, deps: SessionAuthDe
     if (mint) {
       const verdict = validateSessionCell({ value: mint.value }, now, transcript.call.actor);
       if (verdict !== "ok") refuse(id, verdict, { source: "mint_write" });
+      // Identity-door guest claim: an exclusive mint is refused when any
+      // OTHER live session binds this actor. Owner-sequenced, so two
+      // concurrent claims serialize and exactly one wins; a crash-retry
+      // of the SAME mint passes (its own id is excluded). Fail-closed
+      // when the deps cannot witness occupancy.
+      if (transcript.exclusiveMint === true) {
+        if (!deps.sessionsForActor) {
+          refuse(id, "actor_occupied", { source: "exclusive_mint", reason: "no_occupancy_witness" });
+          continue;
+        }
+        const occupied = deps.sessionsForActor(transcript.call.actor).some(
+          (existing) => existing.id !== id && validateSessionCell(existing.cell, now) === "ok"
+        );
+        if (occupied) refuse(id, "actor_occupied", { source: "exclusive_mint" });
+      }
       continue;
     }
     if (deps.ownsSession(id)) {

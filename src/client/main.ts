@@ -586,15 +586,95 @@ function netApiKey(): string | null {
   return readStorage("woo:net:apikey");
 }
 
-function connectNetFeed() {
-  const apiKey = netApiKey();
-  if (!apiKey) {
-    state.authStatus = "anonymous";
-    state.loginError = "Net mode requires an apikey in localStorage woo:net:apikey.";
+/** The stored net-door session (`woo:net:session`): survives reloads so
+ * a signed-in human doesn't re-authenticate per tab/navigation. Cleared
+ * on expiry, terminal feed errors, and logout. */
+function readNetSession(): { session: string; actor: string; expires_at: number | null } | null {
+  try {
+    const raw = readStorage("woo:net:session");
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { session?: unknown; actor?: unknown; expires_at?: unknown };
+    if (typeof parsed.session !== "string" || typeof parsed.actor !== "string") return null;
+    const expiresAt = typeof parsed.expires_at === "number" ? parsed.expires_at : null;
+    if (expiresAt !== null && expiresAt <= Date.now()) return null;
+    return { session: parsed.session, actor: parsed.actor, expires_at: expiresAt };
+  } catch {
+    return null;
+  }
+}
+
+function writeNetSession(value: { session: string; actor: string; expires_at: number | null }) {
+  writeStorage("woo:net:session", JSON.stringify(value));
+}
+
+function clearNetSession() {
+  try {
+    localStorage.removeItem("woo:net:session");
+  } catch {
+    // no storage
+  }
+}
+
+/** The identity door: POST /net-api/guest or /net-api/login, store the
+ * minted session, and open the feed on it as the bearer. */
+async function netDoorAuth(path: string, body: Record<string, unknown>) {
+  state.loginPending = true;
+  state.loginError = undefined;
+  render();
+  try {
+    const response = await fetch(path, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    const reply = (await response.json().catch(() => ({}))) as {
+      session?: string;
+      actor?: string;
+      expires_at?: number | null;
+      error?: { message?: string };
+    };
+    if (!response.ok || typeof reply.session !== "string" || typeof reply.actor !== "string") {
+      state.loginPending = false;
+      state.loginError = reply.error?.message ?? `sign-in failed (${response.status})`;
+      render();
+      return;
+    }
+    const minted = { session: reply.session, actor: reply.actor, expires_at: reply.expires_at ?? null };
+    writeNetSession(minted);
+    state.loginPending = false;
+    openNetFeed(`session:${minted.session}`, { session: minted.session, actor: minted.actor });
+  } catch (err) {
+    state.loginPending = false;
+    state.loginError = `sign-in failed: ${String(err)}`;
     render();
+  }
+}
+
+function connectNetFeed() {
+  // Credential precedence: an explicit apikey (agents, dev) mints its own
+  // sessions as before; a stored door session adopts; neither → the door
+  // (the login card renders with guest + email/password wired to the
+  // /net-api routes).
+  const apiKey = netApiKey();
+  if (apiKey) {
+    openNetFeed(apiKey, null);
     return;
   }
-  netFeed = new NetFeed({ baseUrl: window.location.origin, apiKey });
+  const stored = readNetSession();
+  if (stored) {
+    openNetFeed(`session:${stored.session}`, { session: stored.session, actor: stored.actor });
+    return;
+  }
+  state.authStatus = "anonymous";
+  render();
+}
+
+function openNetFeed(bearer: string, adopt: { session: string; actor: string } | null) {
+  netFeed = new NetFeed({
+    baseUrl: window.location.origin,
+    apiKey: bearer,
+    ...(adopt ? { adoptSession: adopt } : {})
+  });
   // Phase iii (tool-space panels): every feed observation — self AND
   // peer — also reduces into the client projection through the SAME
   // registry the v2 applied-frame path feeds (wireNetFeed's header
@@ -607,7 +687,19 @@ function connectNetFeed() {
     netFeedOpen = feedState.connection === "open";
     if (feedState.actor) state.actor = feedState.actor;
     if (feedState.session) state.session = feedState.session;
-    if (feedState.error) state.loginError = String(feedState.error.message ?? feedState.error);
+    if (feedState.error) {
+      // A terminal feed error on a DOOR session (expired/revoked) sends
+      // the shell back to the login card; the apikey path keeps the old
+      // inline-error behavior (agents read state, not login cards).
+      if (adopt) {
+        clearNetSession();
+        state.authStatus = "anonymous";
+        state.loginError = String(feedState.error.message ?? feedState.error);
+        render();
+        return;
+      }
+      state.loginError = String(feedState.error.message ?? feedState.error);
+    }
     render();
   });
   // Peer AND self observations flow through the one dispatcher the v2
@@ -639,6 +731,9 @@ function connectNetFeed() {
       render();
     })
     .catch((err) => {
+      // An adopted session that fails at open (expired/revoked between
+      // reloads) must not stick around for the next boot.
+      if (adopt) clearNetSession();
       state.loginError = `net session failed: ${String(err)}`;
       state.authStatus = "anonymous";
       render();
@@ -1227,6 +1322,24 @@ async function loginWithApiKey(username: string, secret: string) {
 }
 
 async function logout() {
+  if (netMode()) {
+    // The door session simply expires server-side (session cells reap);
+    // drop the stored credential and reload to the login card.
+    clearNetSession();
+    try {
+      netFeed?.close();
+    } catch {
+      // best-effort
+    }
+    clearAccountScopedStorage();
+    try {
+      history.replaceState({}, "", "/?net=1");
+    } catch {
+      // ignore
+    }
+    location.reload();
+    return;
+  }
   const sessionId = state.session;
   v2BrowserWorker?.postMessage({ kind: "disconnect" });
   v2BrowserWorker?.terminate();
@@ -3049,8 +3162,8 @@ function renderLogin() {
         </button>
         <div class="login-divider"><span>or sign in</span></div>
         <label class="login-field">
-          <span>Username</span>
-          <input type="text" name="username" autocomplete="username" required value="${escapeHtml(username)}" ${pending ? "disabled" : ""} />
+          <span>${netMode() ? "Email" : "Username"}</span>
+          <input type="text" name="username" autocomplete="${netMode() ? "email" : "username"}" required value="${escapeHtml(username)}" ${pending ? "disabled" : ""} />
         </label>
         <label class="login-field">
           <span>Password</span>
@@ -3068,6 +3181,12 @@ function renderLogin() {
 
 function bindLogin() {
   document.querySelector<HTMLButtonElement>("[data-login-guest]")?.addEventListener("click", () => {
+    // Net mode: the identity door claims a pool guest with an exclusive
+    // mint; v2 keeps its /api/auth guest token.
+    if (netMode()) {
+      void netDoorAuth("/net-api/guest", {});
+      return;
+    }
     void loginAsGuest();
   });
   const form = document.querySelector<HTMLFormElement>("[data-login-form]");
@@ -3077,6 +3196,13 @@ function bindLogin() {
     const data = new FormData(form);
     const usernameValue = String(data.get("username") ?? "").trim();
     const passwordValue = String(data.get("password") ?? "");
+    // Net mode: a REAL password login (email + PBKDF2 verify at the
+    // gateway); the v2 form's field doubles as an apikey secret instead.
+    if (netMode()) {
+      storeUsername(usernameValue);
+      void netDoorAuth("/net-api/login", { email: usernameValue, password: passwordValue });
+      return;
+    }
     void loginWithApiKey(usernameValue, passwordValue);
   });
   const usernameInput = document.querySelector<HTMLInputElement>("[data-login-form] input[name=\"username\"]");

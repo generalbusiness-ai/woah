@@ -44,7 +44,15 @@ export class ClientAuthError extends Error {
   }
 }
 
-export type ClientCredential = { id: string; secret: string };
+export type ClientCredential =
+  | { kind: "apikey"; id: string; secret: string }
+  /** The identity-door bearer (the formerly-documented Phase-5 hole):
+   * a session minted by /net-api/login, /net-api/guest, or
+   * /net-api/session is itself the credential for subsequent calls —
+   * the SAME trust shape the MCP adapter has used since phase i
+   * (initialize authenticates, mcp-session-id carries). The gateway
+   * validates the session cell and derives the actor from it. */
+  | { kind: "session"; session: string };
 
 /**
  * Parse the client credential off a request's headers. Accepted carriers,
@@ -67,43 +75,42 @@ export type ClientCredential = { id: string; secret: string };
  * carrier.
  */
 export function parseClientCredential(headers: Headers, queryToken?: string | null): ClientCredential {
+  const classify = (raw: string, carrier: string): ClientCredential => {
+    if (raw.startsWith("session:")) {
+      const session = raw.slice("session:".length);
+      if (!session) throw new ClientAuthError("session token must be session:<id>", { reason: "malformed_credential" });
+      return { kind: "session", session };
+    }
+    if (!raw.startsWith("apikey:")) {
+      throw new ClientAuthError(`${carrier} credential must be apikey:<id>:<secret> or session:<id>`, {
+        reason: "unsupported_token_class"
+      });
+    }
+    const token = raw.slice("apikey:".length);
+    const colon = token.indexOf(":");
+    const id = colon >= 0 ? token.slice(0, colon) : "";
+    const secret = colon >= 0 ? token.slice(colon + 1) : "";
+    if (!id || !secret) {
+      throw new ClientAuthError("apikey token must be apikey:<id>:<secret>", { reason: "malformed_credential" });
+    }
+    return { kind: "apikey", id, secret };
+  };
+
   const auth = headers.get("authorization")?.trim() ?? "";
   const bearerMatch = /^Bearer\s+(.+)$/i.exec(auth);
-  let token: string | null = null;
-  if (bearerMatch) {
-    const raw = bearerMatch[1].trim();
-    if (!raw.startsWith("apikey:")) {
-      throw new ClientAuthError("bearer credential must be apikey:<id>:<secret> (other token classes are Phase-5)", {
-        reason: "unsupported_token_class"
-      });
-    }
-    token = raw.slice("apikey:".length);
-  } else {
-    const headerKey = headers.get("x-woo-api-key")?.trim();
-    if (headerKey) token = headerKey.startsWith("apikey:") ? headerKey.slice("apikey:".length) : headerKey;
+  if (bearerMatch) return classify(bearerMatch[1].trim(), "bearer");
+  const headerKey = headers.get("x-woo-api-key")?.trim();
+  if (headerKey) {
+    // The x-woo-api-key carrier is apikey-only by definition; the prefix
+    // stays optional for compatibility.
+    const raw = headerKey.startsWith("apikey:") ? headerKey : `apikey:${headerKey}`;
+    return classify(raw, "x-woo-api-key");
   }
-  if (!token && queryToken) {
-    const raw = queryToken.trim();
-    if (!raw.startsWith("apikey:")) {
-      throw new ClientAuthError("query token must be apikey:<id>:<secret> (other token classes are Phase-5)", {
-        reason: "unsupported_token_class"
-      });
-    }
-    token = raw.slice("apikey:".length);
-  }
-  if (!token) {
-    throw new ClientAuthError(
-      "missing credential: send `authorization: Bearer apikey:<id>:<secret>` (or `x-woo-api-key`)",
-      { reason: "missing_credential" }
-    );
-  }
-  const colon = token.indexOf(":");
-  const id = colon >= 0 ? token.slice(0, colon) : "";
-  const secret = colon >= 0 ? token.slice(colon + 1) : "";
-  if (!id || !secret) {
-    throw new ClientAuthError("apikey token must be apikey:<id>:<secret>", { reason: "malformed_credential" });
-  }
-  return { id, secret };
+  if (queryToken) return classify(queryToken.trim(), "query");
+  throw new ClientAuthError(
+    "missing credential: send `authorization: Bearer apikey:<id>:<secret>` (or `Bearer session:<id>`, or `x-woo-api-key`)",
+    { reason: "missing_credential" }
+  );
 }
 
 /**
@@ -115,6 +122,11 @@ export function parseClientCredential(headers: Headers, queryToken?: string | nu
  * Unknown-id and revoked deliberately share one message, as core does.
  */
 export function verifyApiKeyCredential(map: unknown, credential: ClientCredential): { actor: string } {
+  if (credential.kind !== "apikey") {
+    // Assert class: callers route session credentials through the
+    // session-cell validation path (gateway clientApi), never here.
+    throw new ClientAuthError("credential is not an apikey", { reason: "unsupported_token_class" });
+  }
   const record =
     map && typeof map === "object" && !Array.isArray(map)
       ? (map as Record<string, unknown>)[credential.id]
@@ -137,4 +149,46 @@ export function verifyApiKeyCredential(map: unknown, credential: ClientCredentia
     throw new ClientAuthError("apikey secret rejected", { reason: "secret_rejected" });
   }
   return { actor };
+}
+
+// ---------------------------------------------------------------------------
+// The identity door (§8 "humans re-authenticate by password"): password
+// verification against carried $account cells. The scheme is EXACTLY
+// core's (world.ts hashPassword/verifyPassword), reimplemented narrowly
+// per this module's discipline (never import world.ts). The stored
+// `password_hash` is self-describing — `pbkdf2-sha256:<iterations>:
+// <salt-hex>:<digest-hex>` — so verification needs no other account
+// fields; the minimum-iterations floor mirrors core's anti-downgrade
+// rule (a weaker-than-current encoding never verifies).
+// ---------------------------------------------------------------------------
+
+const PASSWORD_PBKDF2_ITERATIONS = 600_000;
+const PASSWORD_PBKDF2_KEY_BITS = 256;
+
+/** v2 parity: account lookup is BY EMAIL, lowercased and trimmed. */
+export function normalizeEmail(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+/** Constant-time-compared PBKDF2-SHA256 verify of a self-describing
+ * encoded hash. Returns false (never throws) on any malformed encoding —
+ * the caller owns the single fail-closed "invalid email or password". */
+export async function verifyPasswordCredential(password: string, encoded: string): Promise<boolean> {
+  const parts = encoded.split(":");
+  if (parts.length !== 4 || parts[0] !== "pbkdf2-sha256") return false;
+  const iterations = Number(parts[1]);
+  const salt = parts[2];
+  const expected = parts[3];
+  if (!Number.isSafeInteger(iterations) || iterations < PASSWORD_PBKDF2_ITERATIONS || !salt || !expected) return false;
+  const subtle = (globalThis as unknown as { crypto: { subtle: SubtleCrypto } }).crypto.subtle;
+  const keyMaterial = await subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
+  const saltBytes = new Uint8Array(salt.length / 2);
+  for (let i = 0; i < saltBytes.length; i += 1) saltBytes[i] = Number.parseInt(salt.slice(i * 2, i * 2 + 2), 16);
+  const bits = await subtle.deriveBits(
+    { name: "PBKDF2", hash: "SHA-256", salt: saltBytes.buffer as ArrayBuffer, iterations },
+    keyMaterial,
+    PASSWORD_PBKDF2_KEY_BITS
+  );
+  const actual = [...new Uint8Array(bits)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  return constantTimeEqual(actual, expected);
 }

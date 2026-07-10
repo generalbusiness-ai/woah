@@ -119,6 +119,17 @@ Activation requires ALL of, in order:
    ACTIVE, this probe runs immediately *after* activation; a failure
    deactivates (NC1) before aborting, and no traffic can race the
    window because the route switch (NC6) is a later, separate step.
+   The §8 prove step's second half — a carried account **password**
+   login through the identity door (`/net-api/login`) — rides
+   `--verify-password email:password` with the same
+   deactivate-on-failure rule. The door itself: password login verifies
+   PBKDF2-SHA256 against carried `$account` cells in the catalog-scope
+   view (import rebuilds `primary_actor` from the actor-side bindings);
+   guest entry claims a seat from the install-seeded
+   `$system.guest_pool` with an EXCLUSIVE session mint (the cluster
+   sequencer refuses `actor_occupied`, so concurrent claims serialize
+   and two humans never share a guest); minted sessions are bearers
+   (`Bearer session:<id>`) for the whole `/net-api` surface.
 
 ## NC5. The installation doorway
 

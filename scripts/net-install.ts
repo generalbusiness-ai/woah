@@ -36,6 +36,9 @@ type Args = {
   catalogs?: string[];
   identity?: string;
   verifyApikey?: string;
+  /** §8 step-3 second half: `email:password` for a carried account — the
+   * prove step must log in with a carried apikey AND a carried password. */
+  verifyPassword?: string;
   skipIdentityVerify?: boolean;
   dryRun: boolean;
 };
@@ -48,6 +51,7 @@ function parseArgs(argv: string[]): Args {
     else if (arg === "--catalogs") args.catalogs = (argv[++i] ?? "").split(",").filter(Boolean);
     else if (arg === "--identity") args.identity = argv[++i];
     else if (arg === "--verify-apikey") args.verifyApikey = argv[++i];
+    else if (arg === "--verify-password") args.verifyPassword = argv[++i];
     else if (arg === "--skip-identity-verify") args.skipIdentityVerify = true;
     else if (arg === "--dry-run") args.dryRun = true;
     else throw new Error(`unknown argument: ${arg}`);
@@ -151,6 +155,30 @@ export async function runNetInstall(args: Args, env: { WOO_INTERNAL_SECRET?: str
     console.log(`verified: carried apikey minted session ${body.session}`);
   } else if (args.skipIdentityVerify && identity) {
     console.log("WARNING: identity imported UNVERIFIED (--skip-identity-verify) — run the mint probe before the route switch");
+  }
+
+  // Verification 3 (§8 step 3, second half): a carried account PASSWORD
+  // must authenticate through the identity door — the human
+  // re-authentication path the cutover promises. Same deactivate-on-
+  // failure rule as the apikey probe.
+  if (args.verifyPassword) {
+    const colon = args.verifyPassword.indexOf(":");
+    const email = colon >= 0 ? args.verifyPassword.slice(0, colon) : "";
+    const password = colon >= 0 ? args.verifyPassword.slice(colon + 1) : "";
+    if (!email || !password) throw new Error("--verify-password must be email:password");
+    const response = await fetch(`${args.baseUrl}/net-api/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email, password, ttl_ms: 60_000 })
+    });
+    const body = (await response.json().catch(() => ({}))) as { session?: string };
+    if (!response.ok || typeof body.session !== "string") {
+      await seedScope(CATALOG_SCOPE, [netActivationCell(null)]);
+      throw new Error(
+        `password verification failed — namespace DEACTIVATED: /net-api/login ${response.status} ${JSON.stringify(body)}`
+      );
+    }
+    console.log(`verified: carried account password minted session ${body.session}`);
   }
   console.log("net-install ok");
 }

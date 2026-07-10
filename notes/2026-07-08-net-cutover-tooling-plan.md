@@ -188,8 +188,9 @@ there).
    --identity identity-export.json
    --verify-apikey apikey:<id>:<secret>`
    `--verify-apikey` is MANDATORY with `--identity`; a failed mint probe
-   deactivates the namespace before aborting. Add a carried-account
-   password login check when the identity door lands.
+   deactivates the namespace before aborting. Add
+   `--verify-password email:password` for a carried account — the §8
+   step-3 second half (also deactivate-on-failure).
 4. **Route switch**: move the public hostname to the net-serving client
    — DNS/route change, NEVER a 308 (WS clients cannot follow redirects;
    the woah→woah1 incident). [Requires the net client shell — the
