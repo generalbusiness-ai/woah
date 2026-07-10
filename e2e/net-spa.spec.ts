@@ -97,3 +97,35 @@ test("the real SPA over the net path: alice's chat line reaches bob's browser", 
   await contextA.close();
   await contextB.close();
 });
+
+test("tool-space panels over net: alice's pinboard note renders on bob's board (phase iii)", async ({ browser }) => {
+  test.setTimeout(120_000);
+  const contextA = await browser.newContext();
+  const contextB = await browser.newContext();
+  const alice = await contextA.newPage();
+  const bob = await contextB.newPage();
+  await openSpa(alice, credentials.alice);
+  await openSpa(bob, credentials.bob);
+
+  // Opening the tab moves the actor into the board over the net turn
+  // path (enterPinboard → moveActorToToolSpace → netTurn); the create
+  // form is presence-gated, so its appearance proves the move committed
+  // AND the presence observation reduced into the projection.
+  for (const page of [alice, bob]) {
+    await page.locator('[data-tab="pinboard"]').click();
+    await expect(page.locator("[data-pinboard-create]")).toBeVisible({ timeout: 30_000 });
+  }
+
+  const text = `net-pin-${Date.now().toString(36)}`;
+  await alice.locator("[data-pinboard-new-text]").fill(text);
+  await alice.locator("[data-pinboard-create] button").click();
+
+  // Self view: the turn reply's note_added reduces through wireNetFeed.
+  await expect(alice.locator(".pin-note textarea")).toHaveValue(text, { timeout: 20_000 });
+  // Peer view: the presence-routed fanout frame reduces on bob's board —
+  // the cross-user tool-space class that motivated phase iii.
+  await expect(bob.locator(".pin-note textarea")).toHaveValue(text, { timeout: 20_000 });
+
+  await contextA.close();
+  await contextB.close();
+});

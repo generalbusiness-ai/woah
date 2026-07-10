@@ -27,6 +27,7 @@ import { settleInvalidatedOptimisticTurns, type V2LocalTurnInvalidatedMessage } 
 import { v2ProjectionSnapshotFromMessage, v2TurnResultRoute, type V2AppliedFrameMessage, type V2ProjectionMessage, type V2TurnResultMessage } from "./v2-browser-messages";
 import { sessionActiveScopeFromRecord } from "../core/types";
 import { NetFeed } from "./net-feed";
+import { wireNetFeed } from "./net-feed-adapter";
 import type { ChatLine, ChatSpaceData, ChatTitleBadge, SpaceChatPanelData } from "../../catalogs/chat/ui/chat-space";
 import type { DubspaceData } from "../../catalogs/dubspace/ui/dubspace-workspace";
 import type { PinboardData } from "../../catalogs/pinboard/ui/pinboard-board";
@@ -562,13 +563,23 @@ let netFeedOpen = false;
 // at open, then tracked from the actor's own movement observations.
 let netCurrentRoom = "";
 
+// Latched at first read: the transport is a BOOT decision. Tab
+// navigation pushes new URLs (dropping the ?net=1 query), and a
+// transport that flipped mid-session on a pushState would strand the
+// shell between two half-connected stacks (phase iii found exactly
+// this: opening the pinboard tab reverted the app to the v2 login).
+let netModeLatched: boolean | null = null;
+
 function netMode(): boolean {
+  if (netModeLatched !== null) return netModeLatched;
+  let mode = readStorage("woo:net") === "1";
   try {
-    if (new URLSearchParams(window.location.search).get("net") === "1") return true;
+    if (new URLSearchParams(window.location.search).get("net") === "1") mode = true;
   } catch {
     // no window/location (tests)
   }
-  return readStorage("woo:net") === "1";
+  netModeLatched = mode;
+  return mode;
 }
 
 function netApiKey(): string | null {
@@ -584,6 +595,14 @@ function connectNetFeed() {
     return;
   }
   netFeed = new NetFeed({ baseUrl: window.location.origin, apiKey });
+  // Phase iii (tool-space panels): every feed observation — self AND
+  // peer — also reduces into the client projection through the SAME
+  // registry the v2 applied-frame path feeds (wireNetFeed's header
+  // documents the exact delivery equivalence). This is what renders
+  // pinboard notes, outliner items, and the tasks refresh event; the
+  // receiveLiveEvent call below stays the side-effect dispatcher (chat
+  // routing, tab cues), exactly like v2's paired call sites.
+  wireNetFeed(ui, netFeed);
   netFeed.onState((feedState) => {
     netFeedOpen = feedState.connection === "open";
     if (feedState.actor) state.actor = feedState.actor;
@@ -1487,6 +1506,12 @@ async function refresh() {
 }
 
 async function refreshScopedProjection() {
+  // Phase iii: /api/me is a v2 surface with v2 auth — in net mode the
+  // 401 would masquerade as an expired session and throw the shell back
+  // to the login screen (the tab-click path calls this via
+  // ensureScopedProjectionReady). Net panels read the client projection
+  // and their components' own net-routed reads instead.
+  if (netMode()) return;
   const startedRevision = scopedProjectionLocalRevision;
   try {
     const [meResponse, catalogs] = await Promise.all([
@@ -1554,6 +1579,23 @@ function installCatalogUiIndex(index: any) {
 async function ensureScopedOverlayForTab(tab: AppTab, options: { force?: boolean } = {}): Promise<void> {
   const subject = overlaySubjectForTab(tab);
   if (!subject) return;
+  // Phase iii: net mode has no /api ui-snapshot; the pinboard's cold
+  // state hydrates through the SAME authoritative read the v2 text
+  // hydrator uses — a list_notes turn (readPinboardNotesView rides
+  // netTurn via v2Turn's net branch) folded canonical. Outliner and
+  // tasks hydrate through their components' own directCall reads
+  // (list_items / listing), which are already net-routed.
+  if (netMode()) {
+    if (tab === "pinboard") {
+      try {
+        applyPinboardNotesCanonical(subject, await readPinboardNotesView(subject));
+      } catch {
+        // Best-effort: live observations still render mutations; the
+        // next tab entry retries the cold read.
+      }
+    }
+    return;
+  }
   const key = `${tab}:${subject}`;
   const pending = pendingOverlaySnapshots.get(key);
   // `force` means bypass the cached snapshot; it must not start a second REST
@@ -2443,6 +2485,17 @@ function sendV2TurnIntent(input: Required<Pick<V2TurnInput, "id" | "route" | "sc
 
 function v2Turn(input: V2TurnInput): string {
   if (!input.scope) return "";
+  // Phase iii: EVERY v2Turn caller — tool-space moves (moveActorToTool-
+  // Space/enterRoomToolSpace), pinboard writes (pinboardCall), the
+  // list_notes hydrator — rides the net turn path in net mode. The
+  // optimistic overlay is deliberately skipped: net panels render from
+  // committed observations (wireNetFeed) and the turn reply, so there is
+  // no frame lifecycle to settle an optimistic entry against.
+  if (netMode()) {
+    const netId = input.id ?? crypto.randomUUID();
+    void netTurn(input.target || input.scope, input.verb, input.args ?? [], input.onResult, input.onError);
+    return netId;
+  }
   const id = input.id ?? crypto.randomUUID();
   ui.applyOptimisticCall(id, input.options);
   if (input.onResult) pendingDirect.set(id, input.onResult);
@@ -2533,6 +2586,17 @@ function v2PlanAndExecuteCommand(space: string, text: string, onError?: (error: 
 }
 
 function callWithError(space: string, target: string, verb: string, args: unknown[] = [], onError?: (error: any) => void, options?: ProjectionCallOptions): Promise<unknown> {
+  // Phase iii: the WooContext `.call` surface (outliner/kanban component
+  // mutations) rides the net turn path in net mode — same no-optimistic-
+  // overlay rule as v2Turn's net branch.
+  if (netMode()) {
+    return new Promise((resolve, reject) => {
+      void netTurn(target || space, verb, args, resolve, (error: any) => {
+        onError?.(error);
+        reject(error);
+      });
+    });
+  }
   const id = crypto.randomUUID();
   ui.applyOptimisticCall(id, options);
   return new Promise((resolve, reject) => {
@@ -2564,6 +2628,10 @@ function actorPresenceList(actor: string): string[] {
 function actorPresentInSpace(space: string, catalogPresent: readonly string[] = []) {
   const actor = state.actor;
   if (!actor || !space) return false;
+  // Net mode's presence truth is the room anchor (seeded from the live
+  // cell, advanced by own movement observations) — the v2 scoped
+  // projection below never fills.
+  if (netMode() && netCurrentRoom === space) return true;
   if (catalogPresent.includes(actor)) return true;
   if (sessionActiveScope(state.scopedProjection?.session) === space) return true;
   if (state.scopedProjection?.here?.id === space && state.chatPresent.includes(actor)) return true;
@@ -5499,8 +5567,16 @@ function enterPinboard() {
       });
     },
     onResult: () => {
-      // The committed frame updates the projection; forcing list_notes here
-      // puts the next user turn behind a redundant read storm.
+      // v2: the committed frame updates the projection; forcing list_notes
+      // here puts the next user turn behind a redundant read storm.
+      // Net: there IS no frame projection — the cold board state (notes
+      // that existed before this client connected) needs the one
+      // authoritative read.
+      if (netMode()) {
+        void ensureScopedOverlayForTab("pinboard").then(() => {
+          if (state.tab === "pinboard") render();
+        });
+      }
     }
   });
 }

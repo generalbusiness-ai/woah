@@ -124,11 +124,11 @@ export async function planNetInstall(options: NetInstallOptions = {}): Promise<N
 function normalizeAnchors(world: WooWorld): void {
   const serialized = world.exportWorld();
   const objects = new Map(serialized.objects.map((obj) => [obj.id, obj]));
-  const reachesActor = (id: string): boolean => {
+  const reachesClass = (id: string, marker: string): boolean => {
     let current: string | null | undefined = id;
     const guard = new Set<string>();
     while (current && !guard.has(current)) {
-      if (current === "$actor") return true;
+      if (current === marker) return true;
       guard.add(current);
       current = objects.get(current)?.parent;
     }
@@ -140,7 +140,17 @@ function normalizeAnchors(world: WooWorld): void {
     // Actors stay anchorless BY DESIGN: an anchorless actor classifies to
     // its own private cluster (CO14 — the session authority), which is
     // the model, not the debt.
-    if (reachesActor(obj.id)) continue;
+    if (reachesClass(obj.id, "$actor")) continue;
+    // Spaces stay anchorless BY DESIGN too: an anchorless space-classed
+    // root classifies to its OWN `room:<id>` sequencer (the CO15 class
+    // walk) — which is also what makes it DISCOVERABLE: the gateway's
+    // missing-object repair probes the `room:<object>` naming convention.
+    // Anchoring a nested space (the pinboard sits IN the deck) would
+    // demote a sequencer root into a rider of its container, and a turn
+    // addressed to it from anywhere but that container loops
+    // E_MISSING_STATE → E_BUDGET (phase iii found exactly this: the SPA's
+    // tab teleport into the pinboard from the chatroom).
+    if (reachesClass(obj.id, "$space")) continue;
     world.object(obj.id).anchor = obj.location;
   }
 }
