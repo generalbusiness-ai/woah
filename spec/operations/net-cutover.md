@@ -31,23 +31,36 @@ FRESH ──seed──▶ INSTALLING(epoch) ──verify──▶ ACTIVE(epoch)
   install epoch, but the catalog authority has not published an active
   epoch. Client traffic still refuses `503 E_NOT_INSTALLED`
   (`reason: not_active`). A partially seeded or crashed install rests
-  here indefinitely and safely: re-running the installer is the whole
-  recovery story (same-epoch re-seed is a no-op-shaped success; the M9
-  guard refuses a different epoch with `E_EPOCH_MISMATCH`).
+  here indefinitely and safely: while no scope has COMMITTED turns,
+  re-running the installer is the whole recovery story (same-epoch
+  re-seed of install cells; the M9 guard refuses a different epoch with
+  `E_EPOCH_MISMATCH`). Once any turn commits, seeds refuse
+  `E_SEED_COMMITTED` and the recovery is a fresh namespace — a
+  committed scope is never reseeded.
 - **ACTIVE(epoch)** — the catalog authority publishes the fully verified
   epoch in `property_cell:$system:net_active_epoch`. Client traffic is
   admitted. A mixed state (activation epoch ≠ identity-cell epoch)
   refuses `503 E_NOT_INSTALLED` (`reason: epoch_mismatch`) — an operator
   error to surface, never to serve through.
 - **DEACTIVATED** — the activation cell holds `null`. The installer's
-  compensation when post-activation verification fails. Only meaningful
-  pre-traffic (see NC5); it is not a revocation mechanism — gateways
-  that already cached the active view keep serving until they re-pull.
+  compensation when post-activation verification fails, and the
+  operator's retirement lever.
+
+**Activation state changes ride a DEDICATED operator op** —
+`POST /net/activate` at the catalog scope (doorway:
+`/net-install/scope/<name>/activate`) — never a seed: `/net/seed`
+refuses `E_SEED_COMMITTED` once a scope has committed turns (a
+same-epoch re-seed would silently reset authoritative state under an
+unchanged head), while activation legitimately changes around
+verification traffic.
 
 **The barrier is enforced at the gateway's identity gate** (the one code
-path every authenticated client request already passes), which re-pulls
-the catalog scope once when the activation cell is absent so an
-activation clears the refusal without any gateway restart.
+path every authenticated client request already passes). The cached
+verdict is RE-VERIFIED against the catalog authority — a targeted
+one-key closure — whenever the cell is absent or the cached ACTIVE
+verdict is older than `NET_ACTIVATION_TTL_MS` (default 30 s), so a
+deactivation reaches every gateway, including the one that served under
+activation, within the TTL.
 
 **Every install runs this machine**, including test lanes: fixtures and
 lane installs seed the activation cell together with the catalog
@@ -72,9 +85,15 @@ Freeze properties:
 - **In-flight requests** accepted before the flip may still land. The
   freeze is therefore *not* the consistency boundary by itself — the
   export watermark (NC3) is.
-- **Unfreeze = rollback**: removing the flag restores v2 service
-  unchanged. This is the abort path for every pre-activation rollback
-  point (NC6).
+- **The acknowledged fence** (persisted half): `POST /__internal/freeze
+  {generation}` (doorway `/net-install/freeze`) records a freeze
+  GENERATION in the world authority's durable meta. EITHER half freezes
+  — the env flag or the persisted generation — so a half-rolled-back
+  env deploy can never silently reopen writes; the export requires and
+  echoes the generation (the receipt binds to it).
+- **Unfreeze = rollback**: removing the flag AND clearing the persisted
+  generation (`{generation: null}`) restores v2 service unchanged. This
+  is the abort path for every pre-activation rollback point (NC6).
 - **Housekeeping is not frozen.** Deterministic convergence work (e.g.
   the one-time derived-contents repair on a cold world DO's first warm
   fetch) may still mutate the image exactly once. The watermark
@@ -86,10 +105,12 @@ Freeze properties:
 internal export route) is the ONE read the cutover takes from old prod.
 Its contract:
 
-- **Refuses on an unfrozen world** (`409`) unless the caller passes the
+- **Refuses without the acknowledged fence** (`409`) — both the env
+  freeze AND the persisted generation — unless the caller passes the
   explicit rehearsal override (`?allow-unfrozen=1`). A cutover export
   taken while writes still land can silently lose the mutations that
-  follow it.
+  follow it; the echoed `freeze_generation` binds the export file to
+  the acknowledged fence in the receipt.
 - Returns `{frozen, watermark, exported_at, identity}` where `watermark`
   is a SHA-256 digest of the **full serialized world** — not just the
   identity slice — so any accepted mutation anywhere moves it.
@@ -146,8 +167,10 @@ model and enforced properties (pinned at the route level by
 - **Replay boundary**: outside the skew window a captured request is
   dead; within it, a byte-identical seed replay is idempotent by the
   M9 same-epoch guard and confers nothing.
-- **Allow-list**: exactly the two scope verbs plus the export read;
-  anything else 404s. The forward is freshly built and freshly signed —
+- **Allow-list**: exactly seed (POST), head (GET), activate (POST), the
+  freeze acknowledgment (POST), and the export read; anything else
+  404s. Seeds additionally refuse `E_SEED_COMMITTED` on any scope with
+  committed turns (NC1). The forward is freshly built and freshly signed —
   no inbound header propagates.
 - **Bounded**: seed bodies cap at 8 MiB (a seed is a state transfer,
   not a turn envelope); oversized and malformed bodies refuse without
@@ -222,6 +245,18 @@ item; what remains is exactly what the workerd lanes cannot prove
   log stream (`wrangler tail --format json | tsx
   scripts/net-metrics-report.ts`). Sustained turns/s, per-connection
   memory, and tenant limits still require the deployed canary.
+- **Second-review scale caps — RECORDED, NOT BUILT** (accepted findings
+  8/9/11/12 residuals, required before public traffic beyond the bake):
+  the single `/net-api` gateway durably accumulates every visited cell
+  and cold-hydrates its whole store (shard by session/actor, bound the
+  derived cache, evict unsubscribed scopes with revision-safe re-pull);
+  identity is centralized (one `api_keys` cell, O(accounts) email scan,
+  the 8 MiB seed partition as an eventual ceiling — hashed
+  credential/account index authorities are the design); RPCs have no
+  deadline/cancellation (the per-turn budget is checked between calls,
+  not during one); guest capacity is the fixed installed pool
+  (owner-sequenced guest CREATION is the follow-up; close/release and
+  named exhaustion exist).
 - **Deployed canary — REQUIRED, NOT RUN.** Geographic separation, cold
   starts, dashboards from the report tool, and the abort criteria below,
   before any public traffic. Abort signals (the report tool exits 2 on

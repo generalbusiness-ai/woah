@@ -1329,7 +1329,7 @@ async function logout() {
     try {
       await netFeed?.closeSession();
     } catch {
-      // best-effort; TTL expiry is the backstop
+      // best-effort; TTL expiry still bounds a failed release
     }
     clearNetSession();
     try {

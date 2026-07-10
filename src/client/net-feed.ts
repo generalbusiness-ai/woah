@@ -348,7 +348,7 @@ export class NetFeed {
     try {
       await this.fetchJson("DELETE", "/net-api/session", {});
     } catch {
-      // TTL expiry remains the backstop.
+      // TTL expiry still bounds a failed release.
     }
   }
 

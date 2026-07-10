@@ -435,3 +435,39 @@ pipeline + activation barrier, identity carry (apikeys + passwords,
 both prove-able), freeze + watermarked export, client shell (MCP + SPA
 chat + panels + door), NC8 local half. The runbook's steps 0–6 are all
 executable; the cutover itself stays owner-run.
+
+## Second review response (2026-07-10, 4de8c73 + fd5c05b): findings 1-12
+
+External review of 05913fb: "functionally strong, not cutover-ready."
+Verdict accepted; findings 1-7 CLOSED with the reviewer's repros as
+negative-path tests, 10-12's buildable halves CLOSED, 8/9 + residuals
+RECORDED as NC8 scale caps (spec updated). Highlights:
+- (1) /net/seed refuses E_SEED_COMMITTED once a scope commits (the
+  reviewer's 1→2-under-unchanged-head repro is now a sequencer test);
+  activation = dedicated /net/activate operator op; dev lane ASSERTS
+  the rerun refusal; "rerunning is safe" docs corrected.
+- (2) deactivated_at carries; mint-time eligibility gate (E_PERM
+  identity_deactivated) on every credential path.
+- (3) primary_actor/actors carry (export-filtered, import-verified);
+  rebuild = fallback only. z_human/a_agent repro pinned.
+- (4) GET /client-config (WOO_NET_DEFAULT) picks the transport for
+  unsignaled boots; never persisted client-side (rollback = route
+  back); bare-/ empty-storage e2e reaches the door.
+- (5) activation TTL re-verification (NET_ACTIVATION_TTL_MS, 30s) —
+  deactivation revokes the SAME gateway that served; same-gateway test.
+- (6) acknowledged freeze fence: /__internal/freeze persists a
+  generation; either half freezes; export requires + echoes it;
+  identity-export --acknowledge-freeze; persisted-only + race tests.
+- (7) metrics tool parses CF tail logs[].message[] structurally
+  (recursively unwraps re-stringified events), unit-tested, FAILS
+  CLOSED on zero data (exit 2).
+- (10) dummy-hash timing equalization + isolate-wide PBKDF2 admission
+  cap (4). (11-half) per-scope turn-queue depth cap (32, named
+  E_BUDGET) + queue_ms in the structure metric. (12) DELETE
+  /net-api/session releases the seat (250ms-grace close + presence
+  retraction); SPA logout calls it; claim→close→SAME-seat-reclaim test.
+- RECORDED (NC8): gateway sharding/eviction (8), identity index
+  authorities (9), RPC deadlines/cancellation (11-rest),
+  owner-sequenced guest creation (12-rest). Deploy order per review:
+  parallel-path deploy → valid canary envelope → then these before the
+  route switch.
