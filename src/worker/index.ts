@@ -95,11 +95,19 @@ export default {
     // one is frozen. GET reads continue; the WS upgrade and session mint
     // are refused even as GETs (each opens a mutation channel). /admin
     // stays up (operator surface, own auth).
-    if (env.WOO_WRITE_FREEZE) {
+    {
       const frozenSurface =
         isApiPath(url.pathname) || url.pathname === "/mcp" || url.pathname === "/connect" || url.pathname.startsWith("/v2/");
       const mutating = request.method !== "GET" || url.pathname === "/v2/turn-network/ws" || url.pathname === "/v2/session/mint";
-      if (frozenSurface && mutating) {
+      // V3 finding 1 (P0): satellite-host mutations arrive at their DOs
+      // INTERNAL-SIGNED (edge-forwarded), so a DO-level persisted-fence
+      // check never fires for them — the EDGE, which every public
+      // request crosses regardless of host, is the distributed choke.
+      // env flag = instant per deploy; the persisted generation reaches
+      // here TTL-cached from the world authority. (WS FRAMES bypass the
+      // edge after upgrade — the DO frame handler holds its own
+      // distributed check.)
+      if (frozenSurface && mutating && (env.WOO_WRITE_FREEZE || (await edgeFenceFrozen(env)))) {
         return jsonResponse(
           {
             error: {
@@ -303,6 +311,56 @@ async function resolveHostForObjectRoute(
 
   const routeInfo = await resolveDirectoryObject(env, id, fallback);
   return routeInfo.host || fallback;
+}
+
+/** V3 finding 1: the edge's TTL-cached read of the world authority's
+ * PERSISTED freeze generation (isolate-scoped module cache — every
+ * public mutation crosses the edge, so this is where the persisted
+ * fence becomes distributed). Unreachable authority retains the
+ * last-known verdict and retries at quarter-TTL; a fresh isolate with
+ * no verdict defaults open (the env flag is the instant global half,
+ * and the runbook sets BOTH for the cutover window). */
+let edgeFenceCache: { frozen: boolean; checkedAt: number } | null = null;
+let edgeFenceInFlight: Promise<void> | null = null;
+const EDGE_FENCE_TTL_MS = 15_000;
+
+/** Test isolation: the fence cache is isolate-scoped and would leak a
+ * TTL'd verdict across fake-DO harnesses in one vitest worker. */
+export function __resetEdgeFenceForTests(): void {
+  edgeFenceCache = null;
+}
+
+async function edgeFenceFrozen(env: Env): Promise<boolean> {
+  const now = Date.now();
+  if (!edgeFenceCache || now - edgeFenceCache.checkedAt > EDGE_FENCE_TTL_MS) {
+    if (!edgeFenceInFlight) {
+      edgeFenceInFlight = (async () => {
+        try {
+          const probe = new Request(`${INTERNAL_ORIGIN}/__internal/freeze-state`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: "{}"
+          });
+          const response = await forwardToHost(env, WORLD_HOST, probe);
+          if (response.ok) {
+            const body = (await response.json()) as { frozen?: unknown };
+            edgeFenceCache = { frozen: Boolean(body.frozen), checkedAt: Date.now() };
+            return;
+          }
+        } catch {
+          // retain last-known below
+        }
+        edgeFenceCache = {
+          frozen: edgeFenceCache?.frozen ?? false,
+          checkedAt: Date.now() - Math.floor((EDGE_FENCE_TTL_MS * 3) / 4)
+        };
+      })().finally(() => {
+        edgeFenceInFlight = null;
+      });
+    }
+    await edgeFenceInFlight;
+  }
+  return edgeFenceCache?.frozen ?? false;
 }
 
 async function forwardToHost(env: Env, host: string, request: Request): Promise<Response> {
@@ -742,7 +800,11 @@ async function handleNetInstall(request: Request, env: Env, url: URL): Promise<R
       headers: { "content-type": "application/json" },
       body
     });
-    return forwardToHost(env, WORLD_HOST, forward);
+    const response = await forwardToHost(env, WORLD_HOST, forward);
+    // The isolate that acknowledged the fence must see it immediately
+    // (and tests must not leak a TTL'd verdict across harnesses).
+    if (response.ok) edgeFenceCache = null;
+    return response;
   }
   if (parts.length === 2 && parts[1] === "identity-export" && request.method === "GET") {
     // `?allow-unfrozen=1` is the REHEARSAL override for the export

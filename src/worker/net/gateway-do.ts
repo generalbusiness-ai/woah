@@ -1695,11 +1695,33 @@ export class NetGatewayDO {
         );
         this.activationVerifiedAt = now;
       } catch {
-        // Authority unreachable: within the TTL a cached verdict keeps
-        // serving (availability); with NO cached cell the refusal below
-        // names the real condition rather than a transport error.
+        // Authority unreachable: the cached verdict keeps serving only
+        // within the GRACE window checked below (availability for
+        // transient blips, never an indefinite stale grant); with NO
+        // cached cell the refusal below names the real condition.
       }
       cell = this.ensureView().get(key);
+      // A cell that arrived via a full pull (not this re-verify path)
+      // starts its grace clock at first observation — without this, a
+      // pull-derived grant would never age.
+      if (cell && this.activationVerifiedAt === 0) this.activationVerifiedAt = now;
+      // V3 finding 2 (P0): an activation grant whose last SUCCESSFUL
+      // re-verification is older than the grace window (3×TTL) FAILS
+      // CLOSED — otherwise a deactivation is only "guaranteed within
+      // the TTL" while the authority happens to stay reachable, and a
+      // partitioned gateway would serve a revoked namespace forever.
+      if (cell && this.activationVerifiedAt > 0 && now - this.activationVerifiedAt > this.activationTtlMs() * 3) {
+        throw new ClientAuthError(
+          "activation unverifiable: the catalog authority has not confirmed the active epoch within the grace window",
+          {
+            reason: "activation_unverifiable",
+            scope: CATALOG_SCOPE,
+            last_verified_ms_ago: now - this.activationVerifiedAt
+          },
+          "E_NOT_INSTALLED",
+          503
+        );
+      }
     }
     const payload = cell?.value as { value?: unknown } | null | undefined;
     const active = payload && typeof payload === "object" ? payload.value : undefined;

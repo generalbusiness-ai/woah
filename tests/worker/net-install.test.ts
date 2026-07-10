@@ -259,6 +259,41 @@ describe("net install end-to-end (fake-DO lane)", () => {
     expect(revoked.status).toBe(503);
     expect(((await revoked.json()) as { error: { detail?: { reason?: string } } }).error.detail?.reason).toBe("not_active");
 
+    // V3 finding 2 (P0): an activation grant FAILS CLOSED when the
+    // authority cannot re-verify it past the grace window. TTL 0 makes
+    // every request a re-verification; severing the catalog resolve
+    // must flip the same gateway from serving to the named refusal —
+    // never an indefinite stale grant.
+    let severed = false;
+    const flakyResolve = (destination: string) => {
+      if (severed && destination === `scope:${CATALOG_SCOPE}`) throw new Error("catalog authority unreachable");
+      return resolve(destination);
+    };
+    const graceState = netState("gateway-grace");
+    const graceGateway = new NetGatewayDO(graceState.state, {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_RESOLVE: flakyResolve,
+      NET_ACTIVATION_TTL_MS: "0"
+    } as NetGatewayEnv);
+    await activate(plan.epoch);
+    const graceMint = (key: string) =>
+      graceGateway.fetch(
+        new Request("https://do/net-api/session", {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer apikey:${KEY_ID}:${KEY_SECRET}` },
+          body: JSON.stringify({ ttl_ms: 60_000, idempotency_key: key })
+        })
+      );
+    const graceServed = await graceMint("grace-1");
+    expect(graceServed.status, JSON.stringify(await graceServed.clone().json())).toBe(200);
+    severed = true;
+    await new Promise((resolveSleep) => setTimeout(resolveSleep, 5)); // age past 3×TTL(0)
+    const unverifiable = await graceMint("grace-2");
+    expect(unverifiable.status).toBe(503);
+    expect(((await unverifiable.json()) as { error: { detail?: { reason?: string } } }).error.detail?.reason).toBe(
+      "activation_unverifiable"
+    );
+    graceState.close();
     states.forEach((st) => st.close());
   });
 });

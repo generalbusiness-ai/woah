@@ -6,7 +6,7 @@
 // keep answering → the signed identity export STILL runs (internal
 // traffic is exempt — "final identity-export from FROZEN old prod").
 import { describe, expect, it } from "vitest";
-import worker from "../../src/worker/index";
+import worker, { __resetEdgeFenceForTests } from "../../src/worker/index";
 import { DirectoryDO } from "../../src/worker/directory-do";
 import { PersistentObjectDO, type Env } from "../../src/worker/persistent-object-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
@@ -16,6 +16,7 @@ import { FakeDurableObjectNamespace, FakeDurableObjectState } from "./fake-do";
 const SECRET = "net-cutover-freeze-secret";
 
 function buildHarness(vars: Record<string, string> = {}) {
+  __resetEdgeFenceForTests(); // isolate-scoped fence cache must not leak across harnesses
   const states: FakeDurableObjectState[] = [];
   const directoryState = new FakeDurableObjectState("directory");
   states.push(directoryState);
@@ -158,6 +159,35 @@ describe("cutover item C: the write-freeze", () => {
     expect(envelope.watermark).toMatch(/^[0-9a-f]{64}$/);
     expect(parseIdentityExport(envelope.identity).kind).toBe("woo.identity_export.v1");
 
+    h.close();
+  });
+
+  it("the persisted fence is DISTRIBUTED (V3 finding 1): the edge refuses all public mutations while the world authority holds it", async () => {
+    // Satellite-host mutations reach their DOs INTERNAL-SIGNED (edge-
+    // forwarded), so a DO-local check never fires for them — the EDGE is
+    // the distributed choke every public request crosses regardless of
+    // which host serves it. NO env flag here: the persisted half alone
+    // must fence.
+    const h = buildHarness();
+    expect((await h.acknowledgeFreeze("gen-distributed-1")).status).toBe(200);
+
+    const refused = await h.request("/api/auth", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: "guest:edge-fenced" })
+    });
+    expect(refused.status).toBe(503);
+    expect(((await refused.json()) as { error: { code: string } }).error.code).toBe("E_MAINTENANCE");
+
+    // Clearing the fence reopens the edge immediately (the acknowledging
+    // isolate invalidates its cache).
+    expect((await h.acknowledgeFreeze(null)).status).toBe(200);
+    const reopened = await h.request("/api/auth", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: "guest:edge-open" })
+    });
+    expect(reopened.status, await reopened.clone().text()).toBe(200);
     h.close();
   });
 

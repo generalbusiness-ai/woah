@@ -1499,7 +1499,7 @@ export class PersistentObjectDO {
       // against the FROZEN world (the §8 sequence). GET reads continue;
       // every mutation-capable public entry (POSTs, and the WS upgrade,
       // which would open a mutation channel) refuses namedly.
-      if (!internalRequest && this.writeFrozen() && (request.method !== "GET" || pathname === "/v2/turn-network/ws")) {
+      if (!internalRequest && (await this.distributedFrozen()) && (request.method !== "GET" || pathname === "/v2/turn-network/ws")) {
         return jsonResponse(
           {
             error: {
@@ -4288,6 +4288,12 @@ export class PersistentObjectDO {
         return jsonResponse({ objects: await world.scopedObjectSummaries(readActor, ids) });
       }
 
+      if (request.method === "POST" && pathname === "/__internal/freeze-state") {
+        // V3 finding 1: satellites poll the PERSISTED fence from here
+        // (env is checked locally on each host).
+        return jsonResponse({ frozen: this.freezeGeneration() !== null, freeze_generation: this.freezeGeneration() });
+      }
+
       if (request.method === "POST" && pathname === "/__internal/freeze") {
         // Reviewer finding 6: the env-var freeze is deploy-configuration
         // — strong, but not an ACKNOWLEDGED fence (a config deploy has
@@ -5048,9 +5054,65 @@ export class PersistentObjectDO {
 
   /** The write fence: EITHER half freezes — the env flag (deploy config,
    * global, instant per isolate) or the authority-persisted generation
-   * (durable, survives env rollback until explicitly cleared). */
+   * (durable, survives env rollback until explicitly cleared). WORLD-HOST
+   * view only; satellites go through distributedFrozen(). */
   private writeFrozen(): boolean {
     return Boolean(this.env.WOO_WRITE_FREEZE) || this.freezeGeneration() !== null;
+  }
+
+  /** V3 finding 1 (P0): the persisted fence lives at the WORLD HOST, but
+   * object writes route to SATELLITE hosts — each of which reads only
+   * its own meta. A satellite therefore consults the world host's fence
+   * (signed internal RPC), TTL-cached: the persisted half reaches every
+   * host within WORLD_FENCE_TTL_MS, so removing the env flag while the
+   * fence is held can no longer reopen satellite writes. On an
+   * UNREACHABLE world host the last-known verdict is retained (a frozen
+   * satellite stays frozen; an unfrozen one stays open — the env flag
+   * remains the instant global mechanism, and the runbook sets BOTH). */
+  private worldFenceCache: { frozen: boolean; checkedAt: number } | null = null;
+  private worldFenceInFlight: Promise<void> | null = null;
+  private static readonly WORLD_FENCE_TTL_MS = 15_000;
+
+  private async distributedFrozen(): Promise<boolean> {
+    if (this.env.WOO_WRITE_FREEZE) return true;
+    if (this.durableHostKey() === WORLD_HOST) return this.freezeGeneration() !== null;
+    const now = Date.now();
+    if (!this.worldFenceCache || now - this.worldFenceCache.checkedAt > PersistentObjectDO.WORLD_FENCE_TTL_MS) {
+      await this.refreshWorldFence();
+    }
+    return this.worldFenceCache?.frozen ?? false;
+  }
+
+  private refreshWorldFence(): Promise<void> {
+    if (this.worldFenceInFlight) return this.worldFenceInFlight;
+    const attempt = (async () => {
+      try {
+        const id = this.env.WOO.idFromName(WORLD_HOST);
+        const request = await signInternalRequest(this.env, new Request(`${INTERNAL_ORIGIN}/__internal/freeze-state`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-woo-host-key": WORLD_HOST },
+          body: "{}"
+        }));
+        const response = await this.env.WOO.get(id).fetch(request);
+        if (response.ok) {
+          const body = (await response.json()) as { frozen?: unknown };
+          this.worldFenceCache = { frozen: Boolean(body.frozen), checkedAt: Date.now() };
+          return;
+        }
+      } catch {
+        // fall through to the retained-verdict rule below
+      }
+      // Unreachable/erroring world host: retain the last-known verdict
+      // but retry soon (a quarter TTL), never spin per-request.
+      this.worldFenceCache = {
+        frozen: this.worldFenceCache?.frozen ?? false,
+        checkedAt: Date.now() - Math.floor((PersistentObjectDO.WORLD_FENCE_TTL_MS * 3) / 4)
+      };
+    })();
+    this.worldFenceInFlight = attempt;
+    return attempt.finally(() => {
+      this.worldFenceInFlight = null;
+    });
   }
 
   private resolveRestObject(world: WooWorld, id: string, session: Session): ObjRef {
@@ -5085,7 +5147,7 @@ export class PersistentObjectDO {
     // maintenance window. Frames are refused (not the socket closed):
     // the client sees the named verdict and its connection survives the
     // window.
-    if (this.writeFrozen()) {
+    if (await this.distributedFrozen()) {
       try {
         ws.send(
           JSON.stringify({
