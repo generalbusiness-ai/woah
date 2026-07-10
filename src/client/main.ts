@@ -1323,8 +1323,14 @@ async function loginWithApiKey(username: string, secret: string) {
 
 async function logout() {
   if (netMode()) {
-    // The door session simply expires server-side (session cells reap);
-    // drop the stored credential and reload to the login card.
+    // Finding 12: RELEASE the seat server-side (a guest's logout frees
+    // the pool seat for the next claim), then drop the stored credential
+    // and reload to the login card.
+    try {
+      await netFeed?.closeSession();
+    } catch {
+      // best-effort; TTL expiry is the backstop
+    }
     clearNetSession();
     try {
       netFeed?.close();

@@ -66,6 +66,7 @@ type TurnStructureReport = {
   rpc_ms: number;
   rpc_max_ms: number;
   rpc_depth: number;
+  queue_ms: number;
   wall_ms: number;
   scope_row_writes: number;
   reconstructions: number;

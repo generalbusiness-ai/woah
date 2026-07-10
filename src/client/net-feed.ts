@@ -339,6 +339,19 @@ export class NetFeed {
     return { session: this.session as string, actor: this.actor as string };
   }
 
+  /** Finding 12: RELEASE the session server-side (DELETE /net-api/session
+   * — immediate expiry + presence retraction, freeing a guest seat for
+   * the next claim) before dropping the local state. Best-effort: a
+   * failed release still expires by TTL. */
+  async closeSession(): Promise<void> {
+    if (!this.session) return;
+    try {
+      await this.fetchJson("DELETE", "/net-api/session", {});
+    } catch {
+      // TTL expiry remains the backstop.
+    }
+  }
+
   /** Stop reconnecting and close the socket. The session cell simply
    * expires server-side; there is no unregister call to make. */
   close(): void {

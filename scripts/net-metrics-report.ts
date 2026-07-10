@@ -16,15 +16,84 @@ import { readFileSync } from "node:fs";
 
 type Metric = Record<string, unknown> & { kind?: string };
 
-function extractMetrics(text: string): Metric[] {
+/**
+ * Reviewer finding 7: the previous balanced-brace scan silently missed
+ * Cloudflare tail's shape — `{logs:[{message:["woo.metric","{…}"]}]}` —
+ * where the metric JSON is a STRING ELEMENT of a message array (and
+ * escaped when the whole event is re-stringified). The extractor is now
+ * structural first: each input line parses as JSON when it can, and
+ * every string found while walking the value tree is scanned for
+ * `woo.metric {…}` payloads (so both tail events and raw workerd/vitest
+ * lines feed the same path). Exported for tests.
+ */
+export function extractMetrics(text: string): Metric[] {
   const metrics: Metric[] = [];
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let structural: unknown = null;
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+      try {
+        structural = JSON.parse(trimmed);
+      } catch {
+        structural = null;
+      }
+    }
+    if (structural !== null) collectFromValue(structural, metrics);
+    else collectFromString(trimmed, metrics);
+  }
+  return metrics;
+}
+
+/** Walk a parsed tail event: message arrays carry console args as
+ * strings ("woo.metric" followed by the JSON payload string, or one
+ * concatenated string); nested objects/arrays walk recursively. */
+function collectFromValue(value: unknown, out: Metric[]): void {
+  if (typeof value === "string") {
+    collectFromString(value, out);
+    return;
+  }
+  if (Array.isArray(value)) {
+    // The exact console-args shape: ["woo.metric", "{...}"] — the
+    // payload string follows the marker with no marker text of its own.
+    for (let i = 0; i < value.length; i += 1) {
+      if (value[i] === "woo.metric" && typeof value[i + 1] === "string") {
+        try {
+          out.push(JSON.parse(value[i + 1] as string) as Metric);
+          i += 1;
+          continue;
+        } catch {
+          // fall through to the generic walk
+        }
+      }
+      collectFromValue(value[i], out);
+    }
+    return;
+  }
+  if (value && typeof value === "object") {
+    for (const entry of Object.values(value)) collectFromValue(entry, out);
+  }
+}
+
+/** Scan one decoded string for `woo.metric {…}` payloads (raw logs).
+ * A string that is ITSELF JSON (a re-stringified tail event — loggers
+ * love to re-quote) unwraps back into the structural walk, however
+ * deep the nesting goes. */
+function collectFromString(text: string, out: Metric[]): void {
+  const trimmed = text.trim();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      collectFromValue(JSON.parse(trimmed), out);
+      return;
+    } catch {
+      // not JSON — fall through to the marker scan
+    }
+  }
   const marker = "woo.metric";
   let index = 0;
   while ((index = text.indexOf(marker, index)) !== -1) {
     const braceStart = text.indexOf("{", index);
     if (braceStart === -1) break;
-    // Balanced-brace scan: tail formats embed the JSON in larger lines
-    // (and escape it inside strings) — a lazy regex under- or over-eats.
     let depth = 0;
     let end = -1;
     let inString = false;
@@ -46,21 +115,13 @@ function extractMetrics(text: string): Metric[] {
       }
     }
     if (end === -1) break;
-    const raw = text.slice(braceStart, end + 1);
     try {
-      // Tail JSON double-encodes log args; try the raw slice, then an
-      // unescaped variant.
-      metrics.push(JSON.parse(raw) as Metric);
+      out.push(JSON.parse(text.slice(braceStart, end + 1)) as Metric);
     } catch {
-      try {
-        metrics.push(JSON.parse(raw.replace(/\\"/g, '"')) as Metric);
-      } catch {
-        // not a metric payload — skip
-      }
+      // not a metric payload — skip
     }
     index = end + 1;
   }
-  return metrics;
 }
 
 function percentile(sorted: number[], p: number): number {
@@ -170,20 +231,31 @@ if (invokedDirectly) {
   const args = process.argv.slice(2);
   const json = args.includes("--json");
   const file = args.find((arg) => !arg.startsWith("--"));
+  const allowEmpty = args.includes("--allow-empty");
   readInput(file)
     .then((text) => {
       const metrics = extractMetrics(text);
       const report = buildReport(metrics);
       if (json) {
+        console.log(JSON.stringify({ metric_lines: metrics.length, ...report }, null, 2));
+      } else {
+        console.log(`net-metrics-report: ${metrics.length} metric lines`);
         console.log(JSON.stringify(report, null, 2));
-        return;
       }
-      console.log(`net-metrics-report: ${metrics.length} metric lines`);
-      console.log(JSON.stringify(report, null, 2));
-      // The NC8 abort criteria, evaluated inline so a canary check is one
-      // command (the runbook documents the thresholds).
-      const r = report as { outbox: { abandoned: number }; incidents: { fanout_gaps: number }; turns: { total: number; retry_rate: number } };
+      // Finding 7: NO DATA IS NOT GREEN. A canary check that parsed
+      // nothing (wrong log shape, dead tail, wrong worker) must fail
+      // closed, never report all-zero health with exit 0.
+      const r = report as {
+        outbox: { abandoned: number };
+        incidents: { fanout_gaps: number };
+        turns: { total: number; retry_rate: number };
+      };
       const alerts: string[] = [];
+      if (metrics.length === 0 && !allowEmpty) {
+        alerts.push("ABORT-SIGNAL: 0 metric lines parsed — the tail shape, worker, or filter is wrong (--allow-empty to override)");
+      } else if (r.turns.total === 0 && !allowEmpty) {
+        alerts.push("ABORT-SIGNAL: no net_turn_structure samples — the canary saw no turns (--allow-empty to override)");
+      }
       if (r.outbox.abandoned > 0) alerts.push(`ABORT-SIGNAL: ${r.outbox.abandoned} outbox abandonment(s) — named divergence`);
       if (r.incidents.fanout_gaps > 0) alerts.push(`ABORT-SIGNAL: ${r.incidents.fanout_gaps} fanout gap(s)`);
       if (r.turns.total >= 20 && r.turns.retry_rate > 0.2) {

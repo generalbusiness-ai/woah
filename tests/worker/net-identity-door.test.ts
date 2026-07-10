@@ -267,4 +267,38 @@ describe("the identity door (/net-api/login, /net-api/guest, session bearers)", 
 
     h.close();
   }, 30_000);
+
+  it("logout releases the seat (finding 12): close → the SAME seat is claimable again", async () => {
+    const h = await buildDoorHarness();
+    const first = await h.api("POST", "/net-api/guest", { body: {} });
+    expect(first.status, JSON.stringify(first.body).slice(0, 200)).toBe(200);
+    const seat = first.body.actor as string;
+    const session = first.body.session as string;
+
+    // Occupied while held: the exclusive guard hands the NEXT claim a
+    // different seat.
+    const second = await h.api("POST", "/net-api/guest", { body: {} });
+    expect(second.status).toBe(200);
+    expect(second.body.actor).not.toBe(seat);
+
+    // RELEASE via the session bearer (the SPA's logout path), then wait
+    // out the close grace (the 250ms immediate-expiry rewrite).
+    const closed = await h.api("DELETE", "/net-api/session", { token: `session:${session}` });
+    expect(closed.status, JSON.stringify(closed.body)).toBe(200);
+    expect(closed.body.closed).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    // The first-in-pool-order seat is free again — the next claim gets it.
+    const reclaimed = await h.api("POST", "/net-api/guest", { body: {} });
+    expect(reclaimed.status, JSON.stringify(reclaimed.body).slice(0, 200)).toBe(200);
+    expect(reclaimed.body.actor).toBe(seat);
+
+    // The closed session's bearer is dead — named refusal, not a zombie.
+    const zombie = await h.api("POST", "/net-api/turn", {
+      token: `session:${session}`,
+      body: { target: "the_chatroom", verb: "say", args: ["boo"], idempotency_key: "door-zombie-1" }
+    });
+    expect(zombie.status).toBe(401);
+    h.close();
+  }, 30_000);
 });

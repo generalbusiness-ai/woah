@@ -106,6 +106,13 @@ export type MintSessionInput = {
    * the cluster sequencer refuses `actor_occupied` when another live
    * session binds the actor (two humans must never share one guest). */
   exclusive?: boolean;
+  /** Session CLOSE (reviewer finding 12 — logout must release the guest
+   * seat, not just drop the local bearer): rewrites the cell with a
+   * ~250ms expiry (long enough to clear authorize's not-born-expired
+   * rule under cross-DO clock skew, short enough that the seat frees
+   * immediately after) and a presence transition to null so the room's
+   * roster retracts. ttl_ms is ignored in this mode. */
+  closing?: { priorActiveScope: string | null };
 };
 
 export type MintSessionResult = {
@@ -141,7 +148,7 @@ export function mintSessionSubmit(input: MintSessionInput): MintSessionResult {
   // external GC, so a session minted with a zero/NaN/negative TTL would
   // be immortal state (sessionLiveness treats a missing expiresAt as
   // never-expiring by SerializedSession's optionality).
-  if (!Number.isFinite(input.ttl_ms) || input.ttl_ms <= 0) {
+  if (!input.closing && (!Number.isFinite(input.ttl_ms) || input.ttl_ms <= 0)) {
     // A caller bug (the misplan class — plain Error, never a CO6 code):
     // every mint site owns its TTL (clampClientTtl on the client route),
     // so an invalid one reaching here means a broken caller, not a
@@ -154,25 +161,34 @@ export function mintSessionSubmit(input: MintSessionInput): MintSessionResult {
     id: input.session,
     actor: input.actor,
     started: input.now,
-    expiresAt: input.now + input.ttl_ms,
-    activeScope: input.activeScope ?? null
+    expiresAt: input.closing ? input.now + 250 : input.now + input.ttl_ms,
+    activeScope: input.closing ? null : (input.activeScope ?? null)
   };
   const body: Omit<EffectTranscript, "hash"> = {
     kind: "woo.effect_transcript.shadow.v1",
-    id: `session-mint:${input.session}`,
+    id: `${input.closing ? "session-close" : "session-mint"}:${input.session}`,
     route: "direct",
     scope: input.clusterScope,
     seq: 0,
     session: input.session,
-    call: { actor: input.actor, target: input.actor, verb: "session_mint", args: [], body: undefined },
+    call: { actor: input.actor, target: input.actor, verb: input.closing ? "session_close" : "session_mint", args: [], body: undefined },
     // A placed mint IS a presence transition (null → the birth room):
     // CO13 derives session_presence rows exclusively from the recorded
     // transition, so without this a born-present session would hold an
     // activeScope no roster ever learned about. Post-state parity is
     // unaffected — transitions drive projections, never authority cells.
-    ...(input.activeScope
-      ? { sessionScopeTransition: { session: input.session, actor: input.actor, from: null, to: input.activeScope } }
-      : {}),
+    ...(input.closing?.priorActiveScope
+      ? {
+          sessionScopeTransition: {
+            session: input.session,
+            actor: input.actor,
+            from: input.closing.priorActiveScope,
+            to: null
+          }
+        }
+      : input.activeScope && !input.closing
+        ? { sessionScopeTransition: { session: input.session, actor: input.actor, from: null, to: input.activeScope } }
+        : {}),
     ...(input.exclusive ? { exclusiveMint: true } : {}),
     reads: [],
     writes: [
@@ -180,7 +196,7 @@ export function mintSessionSubmit(input: MintSessionInput): MintSessionResult {
         cell: { kind: "session", object: input.session },
         value: value as unknown as TranscriptWrite["value"],
         op: "set",
-        writer: sessionWriter(input.actor, "session_mint")
+        writer: sessionWriter(input.actor, input.closing ? "session_close" : "session_mint")
       }
     ],
     creates: [],
@@ -199,7 +215,7 @@ export function mintSessionSubmit(input: MintSessionInput): MintSessionResult {
       kind: "woo.net.commit_submit.v1",
       scope: input.clusterScope,
       base: input.base,
-      idempotency_key: `session-mint:${input.session}:${value.expiresAt}`,
+      idempotency_key: `${input.closing ? "session-close" : "session-mint"}:${input.session}:${value.expiresAt}`,
       transcript,
       post_state_version: applied.postStateVersion,
       stamp

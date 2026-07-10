@@ -196,6 +196,8 @@ type SessionOpenRequest = {
    * `actor_occupied` at the cluster sequencer when another live session
    * binds the actor. */
   exclusive?: boolean;
+  /** Session close (finding 12 — see MintSessionInput.closing). */
+  closing?: { priorActiveScope: string | null };
 };
 
 /** /net/turn reply body. `trace` lists the failed rounds that preceded
@@ -288,6 +290,9 @@ export class TurnStructure {
   snapshot_cells = 0;
   /** NC8a: turn start (Date.now) for the report's wall_ms. */
   readonly started = Date.now();
+  /** Finding 11: time spent WAITING in the per-scope turn queue before
+   * this turn ran — the hot-scope serialization cost meter. */
+  queue_ms = 0;
   /** NC8a timing: awaited RPC time on the turn path. While every RPC is
    * a serial await, rpc_ms IS the critical-path RPC time; a parallel
    * group (rpcGroup) adds its LONGEST member, keeping the critical-path
@@ -388,6 +393,8 @@ type TurnStructureReport = {
    * turn's cross-authority chain ran; depth < sync_rpc measures paid
    * parallelism. */
   rpc_depth: number;
+  /** Finding 11: per-scope queue wait before the turn ran. */
+  queue_ms: number;
   /** NC8a: whole-turn wall time at the gateway. */
   wall_ms: number;
 };
@@ -757,14 +764,36 @@ export class NetGatewayDO {
    * only the self-inflicted share, and with it the wasted authority
    * round-trips. Per-scope chains, pruned when they settle. */
   private readonly turnQueues = new Map<string, Promise<unknown>>();
+  /** Finding 11: per-scope queue depth — admission control. Unbounded
+   * promise chains under a hot scope are memory growth AND unbounded
+   * client latency; past the cap the honest answer is a named refusal
+   * the client backs off on. */
+  private readonly turnQueueDepth = new Map<string, number>();
+  private static readonly MAX_TURN_QUEUE_DEPTH = 32;
 
   private turn(request: TurnRequest): Promise<TurnResult> {
     const key = request.planningScope;
+    const depth = this.turnQueueDepth.get(key) ?? 0;
+    if (depth >= NetGatewayDO.MAX_TURN_QUEUE_DEPTH) {
+      throw netError("E_BUDGET", "turn queue depth exceeded for this scope; back off and retry", {
+        scope: key,
+        queue_depth: depth,
+        limit: NetGatewayDO.MAX_TURN_QUEUE_DEPTH
+      });
+    }
+    this.turnQueueDepth.set(key, depth + 1);
+    const queuedAt = Date.now();
     const tail = this.turnQueues.get(key) ?? Promise.resolve();
     const run = tail.then(
-      () => this.turnUnqueued(request),
-      () => this.turnUnqueued(request) // a predecessor's failure never gates a successor
+      () => this.turnUnqueued(request, Date.now() - queuedAt),
+      () => this.turnUnqueued(request, Date.now() - queuedAt) // a predecessor's failure never gates a successor
     );
+    const release = () => {
+      const remaining = (this.turnQueueDepth.get(key) ?? 1) - 1;
+      if (remaining <= 0) this.turnQueueDepth.delete(key);
+      else this.turnQueueDepth.set(key, remaining);
+    };
+    void run.then(release, release);
     // Park the settled marker (not the result) so a rejection is not
     // re-observed as unhandled from the queue's copy.
     const settled = run.then(
@@ -778,9 +807,10 @@ export class NetGatewayDO {
     return run;
   }
 
-  private async turnUnqueued(request: TurnRequest): Promise<TurnResult> {
+  private async turnUnqueued(request: TurnRequest, queueMs = 0): Promise<TurnResult> {
     const trace: AttemptTraceEntry[] = [];
     const structure = new TurnStructure();
+    structure.queue_ms = queueMs;
     try {
       const result = await this.turnAttempts(request, trace, structure);
       // D2 / CO10: attach the structural budget to the result (so a unit
@@ -806,6 +836,7 @@ export class NetGatewayDO {
         rpc_ms: structure.rpc_ms,
         rpc_max_ms: structure.rpc_max_ms,
         rpc_depth: structure.rpc_depth,
+        queue_ms: structure.queue_ms,
         wall_ms: Date.now() - structure.started
       });
       // Fix 5d: a plain-Error escape (misplan bug, double transport
@@ -839,6 +870,7 @@ export class NetGatewayDO {
       rpc_ms: structure.rpc_ms,
       rpc_max_ms: structure.rpc_max_ms,
       rpc_depth: structure.rpc_depth,
+      queue_ms: structure.queue_ms,
       wall_ms: Date.now() - structure.started
     };
   }
@@ -1322,18 +1354,22 @@ export class NetGatewayDO {
       epoch: request.catalog_epoch,
       clusterScope,
       ...(request.active_scope !== undefined ? { activeScope: request.active_scope } : {}),
-      ...(request.exclusive ? { exclusive: true } : {})
+      ...(request.exclusive ? { exclusive: true } : {}),
+      ...(request.closing ? { closing: request.closing } : {})
     });
     // A placed mint carries a presence transition whose room usually
     // anchors at ANOTHER scope: ship the relate directions so the
     // cluster routes the presence delta to the room's owner (the same
     // sibling shape the turn path sends) instead of misclassifying it
-    // local. Room scope == cluster scope needs no directions.
+    // local. Room scope == cluster scope needs no directions. A CLOSE's
+    // transition retracts from the PRIOR room, so the directions target
+    // that room instead.
     const relateDestinations: Record<string, { destination: string; objects: string[] }> = {};
-    if (request.active_scope) {
-      const roomScope = await this.clientPlanningScope(request.active_scope, request.actor);
+    const presenceRoom = request.closing ? request.closing.priorActiveScope : request.active_scope;
+    if (presenceRoom) {
+      const roomScope = await this.clientPlanningScope(presenceRoom, request.actor);
       if (roomScope !== clusterScope) {
-        relateDestinations[roomScope] = { destination: `scope:${roomScope}`, objects: [request.active_scope] };
+        relateDestinations[roomScope] = { destination: `scope:${roomScope}`, objects: [presenceRoom] };
       }
     }
     const withSibling = Object.keys(relateDestinations).length > 0;
@@ -1464,6 +1500,19 @@ export class NetGatewayDO {
         const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
         if (bearerSession && body.session === undefined) body.session = bearerSession;
         return await this.mintWsTicket(actor, body);
+      }
+      if (request.method === "DELETE" && url.pathname === "/net-api/session") {
+        // Finding 12: logout RELEASES the seat — the session cell is
+        // rewritten with an immediate expiry and a presence retraction,
+        // so a closed guest's seat frees for the next claim instead of
+        // waiting out the TTL. The bearer session closes itself; an
+        // apikey caller names the session in the body.
+        const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+        const target = bearerSession ?? (typeof body.session === "string" ? body.session : null);
+        if (!target) {
+          return json({ error: { code: "E_INVARG", message: "close requires a session (bearer or body)" } }, 400);
+        }
+        return await this.clientSessionClose(actor, target, identity.epoch);
       }
       if (request.method === "POST" && url.pathname === "/net-api/session") {
         if (bearerSession) {
@@ -1693,21 +1742,52 @@ export class NetGatewayDO {
    * machinery. Fail-closed v2 parity: unknown email, deactivated account,
    * bad password, and unresolvable actor all share ONE message.
    */
+  /** Finding 10: PBKDF2 at 600k iterations is a CPU amplifier — bound the
+   * CONCURRENCY globally (per-email buckets alone are evictable by
+   * rotating cheap keys), and equalize the unknown-email path with a
+   * dummy verification so account existence does not leak through
+   * timing. */
+  private pbkdf2InFlight = 0;
+  private static readonly MAX_PBKDF2_CONCURRENCY = 4;
+  /** A structurally valid encoding that matches NO password: the unknown-
+   * email/deactivated/hash-less paths verify against it so every login
+   * attempt pays the same derivation. */
+  private static readonly DUMMY_PASSWORD_HASH = `pbkdf2-sha256:600000:${"0".repeat(32)}:${"0".repeat(64)}`;
+
   private async clientLogin(body: Record<string, unknown>): Promise<Response> {
     const email = normalizeEmail(String(body.email ?? ""));
     const password = String(body.password ?? "");
     // Pre-auth rate key: the normalized email rides the tight amplifier
-    // bucket (PBKDF2 at 600k iterations is exactly the CPU amplifier the
-    // bucket exists for); a missing email shares one bucket.
+    // bucket; a missing email shares one bucket.
     this.enforceClientRate(`login:${email || "anonymous"}`, "/net-api/session");
+    // Global admission: rotating emails can evict per-key limiter
+    // entries, but they cannot exceed the isolate-wide derivation cap.
+    if (this.pbkdf2InFlight >= NetGatewayDO.MAX_PBKDF2_CONCURRENCY) {
+      throw new ClientAuthError(
+        "authentication is busy; retry after backoff",
+        { reason: "rate_limited", limit: { pbkdf2_concurrency: NetGatewayDO.MAX_PBKDF2_CONCURRENCY } },
+        "E_RATE",
+        429
+      );
+    }
     const identity = await this.catalogIdentity(); // warms catalog view + activation barrier
     if (!email || !password) {
       throw new ClientAuthError("invalid email or password", { reason: "password_rejected" });
     }
     const account = this.accountByEmail(email);
-    const encoded = typeof account?.props.password_hash === "string" ? account.props.password_hash : "";
     const deactivated = account?.props.deactivated_at != null;
-    const verified = !deactivated && encoded !== "" && (await verifyPasswordCredential(password, encoded));
+    // Timing equalization: EVERY attempt derives — a real hash when the
+    // account is usable, the dummy otherwise (unknown email, deactivated,
+    // hash-less record). Only a real-hash success can verify.
+    const usable = account !== null && !deactivated && typeof account.props.password_hash === "string";
+    const encoded = usable ? (account.props.password_hash as string) : NetGatewayDO.DUMMY_PASSWORD_HASH;
+    this.pbkdf2InFlight += 1;
+    let verified: boolean;
+    try {
+      verified = (await verifyPasswordCredential(password, encoded)) && usable;
+    } finally {
+      this.pbkdf2InFlight -= 1;
+    }
     const actor = typeof account?.props.primary_actor === "string" ? account.props.primary_actor : "";
     if (!account || !verified || !actor) {
       // One message for every failure class (v2 authenticatePassword
@@ -1782,6 +1862,38 @@ export class NetGatewayDO {
       return { id: object, props };
     }
     return null;
+  }
+
+  /** DELETE /net-api/session — the identity door's release half
+   * (finding 12): validate the caller's binding, then commit the close
+   * (immediate expiry + presence retraction) at the cluster authority. */
+  private async clientSessionClose(actor: string, session: string, epoch: string): Promise<Response> {
+    await this.warmScopes(
+      [CATALOG_SCOPE, { scope: `cluster:${actor}`, objects: [actor] }],
+      "net_client_pull_miss_failed"
+    );
+    const cell = this.ensureView().get(sessionCellKey(session));
+    const verdict = validateSessionCell(cell, this.host.now(), actor);
+    if (verdict === "expired" || verdict === "missing") {
+      // Already released (reaped, expired, or never here) — closing is
+      // idempotent from the client's view.
+      return json({ closed: true, already: verdict });
+    }
+    if (verdict !== "ok") {
+      return json({ error: { code: "E_PERM", message: `session ${verdict}`, detail: { session_verdict: verdict } } }, 403);
+    }
+    const prior = (cell?.value as { activeScope?: string | null } | undefined)?.activeScope ?? null;
+    const opened = await this.sessionOpen({
+      session,
+      actor,
+      ttl_ms: 0, // ignored in closing mode
+      catalog_epoch: epoch,
+      closing: { priorActiveScope: prior }
+    });
+    if (opened.reply.status !== "accepted") {
+      return json({ error: { code: "E_RETRY", message: "session close did not commit; retry", detail: opened.reply } }, 503);
+    }
+    return json({ closed: true });
   }
 
   /** POST /net-api/session — see the clientApi header. */
