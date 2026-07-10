@@ -248,7 +248,19 @@ type TurnResult = {
  * a non-turn caller (/net/pull, session-open cache-fill) passes none and
  * nothing is counted, leaving their behaviour unchanged.
  */
-class TurnStructure {
+/** NC8b hard per-turn budgets (spec/operations/net-cutover.md). The
+ * attempt loop already bounds ROUNDS; these bound the work WITHIN a turn
+ * — a pathological plan fanning to many owners (attest/refresh across K
+ * scopes) must refuse with a named verdict instead of grinding. Generous
+ * by design: a legitimate cold turn (head + several repair closures +
+ * submit + install) sits far below both. */
+const MAX_TURN_SYNC_RPC = 32;
+const MAX_TURN_RPC_MS = 30_000;
+
+// Exported for the NC8 unit lane (tests/worker/net-turn-structure.test.ts):
+// the budget/parallelism mechanics are asserted directly, the integrated
+// counts through full turns.
+export class TurnStructure {
   /** Cross-host RPCs on the SYNCHRONOUS reply path (CO10 warm budget ≤ 3:
    * /head + /submit + the post-accept installTouched /closure). Post-reply
    * outbox fanout is excluded by construction — it is not on this path. */
@@ -270,12 +282,85 @@ class TurnStructure {
    * so it must stay flat as the view grows — the load gate's blocker-#1
    * invariant asserts it alongside plan_cells. */
   snapshot_cells = 0;
-  countRpc(): void {
-    this.sync_rpc += 1;
-  }
+  /** NC8a: turn start (Date.now) for the report's wall_ms. */
+  readonly started = Date.now();
+  /** NC8a timing: awaited RPC time on the turn path. While every RPC is
+   * a serial await, rpc_ms IS the critical-path RPC time; a parallel
+   * group (rpcGroup) adds its LONGEST member, keeping the critical-path
+   * meaning as reads parallelize. Wall-clock (Date.now), metrics-grade. */
+  rpc_ms = 0;
+  rpc_max_ms = 0;
+  /** NC8a critical-path depth: serial RPC STEPS. A single rpc() is one
+   * step; an rpcGroup of K parallel calls is ALSO one step (they overlap),
+   * while sync_rpc still counts all K. depth < sync_rpc therefore
+   * measures how much of the fanout the turn paid in parallel. */
+  rpc_depth = 0;
   countReconstruction(): void {
     this.reconstructions += 1;
   }
+  /** NC8b: budget gate, checked BEFORE issuing work. `mandatory` skips
+   * the gate for steps that must run regardless — the CO2.5 second
+   * submit (disambiguation is not optional) and the post-accept warm
+   * fill (the commit is already durable; refusing the fill would turn
+   * an accepted turn into an error). */
+  private assertBudget(adding: number): void {
+    if (this.sync_rpc + adding > MAX_TURN_SYNC_RPC || this.rpc_ms > MAX_TURN_RPC_MS) {
+      throw netError("E_BUDGET", "per-turn RPC budget exhausted", {
+        sync_rpc: this.sync_rpc,
+        rpc_ms: this.rpc_ms,
+        limit_rpc: MAX_TURN_SYNC_RPC,
+        limit_rpc_ms: MAX_TURN_RPC_MS
+      });
+    }
+  }
+  /** One timed, counted, budgeted RPC step. */
+  async rpc<T>(action: () => Promise<T>, options: { mandatory?: boolean } = {}): Promise<T> {
+    if (!options.mandatory) this.assertBudget(1);
+    this.sync_rpc += 1;
+    this.rpc_depth += 1;
+    const started = Date.now();
+    try {
+      return await action();
+    } finally {
+      const ms = Date.now() - started;
+      this.rpc_ms += ms;
+      this.rpc_max_ms = Math.max(this.rpc_max_ms, ms);
+    }
+  }
+  /** One PARALLEL step of independent RPCs (NC8b "parallelize
+   * independent reads"): all issued together, awaited together; counts K
+   * toward sync_rpc but ONE step of depth and its longest member toward
+   * rpc_ms. Rejections propagate after all settle (no orphaned writes
+   * mid-group). */
+  async rpcGroup<T>(actions: Array<() => Promise<T>>): Promise<T[]> {
+    if (actions.length === 0) return [];
+    this.assertBudget(actions.length);
+    this.sync_rpc += actions.length;
+    this.rpc_depth += 1;
+    const started = Date.now();
+    try {
+      const settled = await Promise.allSettled(actions.map((action) => action()));
+      const failed = settled.find((entry): entry is PromiseRejectedResult => entry.status === "rejected");
+      if (failed) throw failed.reason;
+      return (settled as Array<PromiseFulfilledResult<T>>).map((entry) => entry.value);
+    } finally {
+      const ms = Date.now() - started;
+      this.rpc_ms += ms;
+      this.rpc_max_ms = Math.max(this.rpc_max_ms, ms);
+    }
+  }
+}
+
+/** NC8a: the optional-structure adapter for shared helpers — a non-turn
+ * caller (live /net/pull, session-open cache-fill) passes no structure
+ * and the action just runs, uncounted and unbudgeted (their behavior is
+ * unchanged; they are not on a turn's reply path). */
+async function timedRpc<T>(
+  structure: TurnStructure | undefined,
+  action: () => Promise<T>,
+  options: { mandatory?: boolean } = {}
+): Promise<T> {
+  return structure ? structure.rpc(action, options) : action();
 }
 
 /** The per-turn CO10 structure attached to a TurnResult and emitted as the
@@ -290,6 +375,17 @@ type TurnStructureReport = {
   reconstructions: number;
   plan_cells: number;
   snapshot_cells: number;
+  /** NC8a: total awaited RPC time on the turn's critical path (a
+   * parallel group contributes its longest member). */
+  rpc_ms: number;
+  /** NC8a: the single slowest RPC step. */
+  rpc_max_ms: number;
+  /** NC8a: serial RPC steps (parallel groups count once) — how deep the
+   * turn's cross-authority chain ran; depth < sync_rpc measures paid
+   * parallelism. */
+  rpc_depth: number;
+  /** NC8a: whole-turn wall time at the gateway. */
+  wall_ms: number;
 };
 
 /** Retryable verdict → the CO6 taxonomy code its round is recorded as.
@@ -645,7 +741,40 @@ export class NetGatewayDO {
    * submit — `base` is an envelope field, not part of the transcript
    * hash or the post-state digest, so patching it in is sound.
    */
-  private async turn(request: TurnRequest): Promise<TurnResult> {
+  /** NC8 hot-scope serializer: this shard's own concurrent turns into
+   * one planning scope run in arrival order. Without it, N concurrent
+   * same-cell turns from one shard race each other at every RPC await
+   * (real DOs deliver events during subrequests — input gates only cover
+   * storage), and the herd burns ~one retryable round per competitor:
+   * the skew lane measured 3/10 first-wave survivors at MAX_TURN_ATTEMPTS
+   * = 6. Queued turns instead plan against the previous turn's installed
+   * post-state and accept first-attempt. Cross-SHARD contention still
+   * exists and still converges through the retry loop — this removes
+   * only the self-inflicted share, and with it the wasted authority
+   * round-trips. Per-scope chains, pruned when they settle. */
+  private readonly turnQueues = new Map<string, Promise<unknown>>();
+
+  private turn(request: TurnRequest): Promise<TurnResult> {
+    const key = request.planningScope;
+    const tail = this.turnQueues.get(key) ?? Promise.resolve();
+    const run = tail.then(
+      () => this.turnUnqueued(request),
+      () => this.turnUnqueued(request) // a predecessor's failure never gates a successor
+    );
+    // Park the settled marker (not the result) so a rejection is not
+    // re-observed as unhandled from the queue's copy.
+    const settled = run.then(
+      () => undefined,
+      () => undefined
+    );
+    this.turnQueues.set(key, settled);
+    void settled.finally(() => {
+      if (this.turnQueues.get(key) === settled) this.turnQueues.delete(key);
+    });
+    return run;
+  }
+
+  private async turnUnqueued(request: TurnRequest): Promise<TurnResult> {
     const trace: AttemptTraceEntry[] = [];
     const structure = new TurnStructure();
     try {
@@ -669,7 +798,11 @@ export class NetGatewayDO {
         scope_row_writes: 0,
         reconstructions: structure.reconstructions,
         plan_cells: structure.plan_cells,
-        snapshot_cells: structure.snapshot_cells
+        snapshot_cells: structure.snapshot_cells,
+        rpc_ms: structure.rpc_ms,
+        rpc_max_ms: structure.rpc_max_ms,
+        rpc_depth: structure.rpc_depth,
+        wall_ms: Date.now() - structure.started
       });
       // Fix 5d: a plain-Error escape (misplan bug, double transport
       // failure) after failed rounds must still explain the convergence
@@ -698,7 +831,11 @@ export class NetGatewayDO {
       scope_row_writes: result.reply.status === "accepted" ? result.reply.touched.length : 0,
       reconstructions: structure.reconstructions,
       plan_cells: structure.plan_cells,
-      snapshot_cells: structure.snapshot_cells
+      snapshot_cells: structure.snapshot_cells,
+      rpc_ms: structure.rpc_ms,
+      rpc_max_ms: structure.rpc_max_ms,
+      rpc_depth: structure.rpc_depth,
+      wall_ms: Date.now() - structure.started
     };
   }
 
@@ -806,8 +943,7 @@ export class NetGatewayDO {
         resubmit = null;
       } else {
         try {
-          structure.countRpc();
-          planningHead = await this.scopeHead(this.destinationFor(request, request.planningScope));
+          planningHead = await structure.rpc(() => this.scopeHead(this.destinationFor(request, request.planningScope)));
           this.assertTurnEpoch(planningHead, request.catalog_epoch, request.planningScope, trace);
           planned = await this.planOnce(request, view, classifier, planningHead.object_counter);
         } catch (err) {
@@ -858,12 +994,11 @@ export class NetGatewayDO {
         base = planningHead.head;
       }
       if (base === null) {
-        structure.countRpc();
         // Phase 5: the head reply names the scope's durable epoch —
         // consume it. A turn stamped with another epoch can NEVER commit
         // (re-planning re-stamps the same epoch), so fail fast here
         // instead of grinding plan → submit → reseed to E_BUDGET.
-        const live = await this.scopeHead(destination);
+        const live = await structure.rpc(() => this.scopeHead(destination));
         this.assertTurnEpoch(live, request.catalog_epoch, targetScope, trace);
         base = live.head;
       }
@@ -894,17 +1029,19 @@ export class NetGatewayDO {
       };
       let reply: CommitReply;
       try {
-        structure.countRpc();
-        reply = (await this.host.rpc(destination, "/submit", submitBody)) as CommitReply;
+        reply = (await structure.rpc(() => this.host.rpc(destination, "/submit", submitBody))) as CommitReply;
       } catch (err) {
+        // NC8b: never re-submit after a BUDGET refusal — the first submit
+        // was never issued, so there is nothing to disambiguate.
+        if (isNetError(err) && err.code === "E_BUDGET") throw err;
         // CO2.5 recovery (fix 5b): the transport died in the reply
         // window (kill_after_commit shape) — the scope may or may not
         // have durably committed. ONE resubmit with the SAME idempotency
         // key disambiguates: a committed turn returns its recorded
         // reply; an uncommitted one validates fresh. Only a second
         // transport failure surfaces (with the trace via fix 5d).
-        structure.countRpc();
-        reply = (await this.host.rpc(destination, "/submit", submitBody)) as CommitReply;
+        // MANDATORY: disambiguation must run even at the budget's edge.
+        reply = (await structure.rpc(() => this.host.rpc(destination, "/submit", submitBody), { mandatory: true })) as CommitReply;
       }
       if (reply.status === "accepted") {
         let installDegraded = false;
@@ -973,13 +1110,7 @@ export class NetGatewayDO {
 
       switch (reply.reason) {
         case "stale_head": {
-          const live = await this.tryRecovery(
-            trace,
-            async () => {
-              structure.countRpc();
-              return await this.scopeHead(destination);
-            }
-          );
+          const live = await this.tryRecovery(trace, () => structure.rpc(() => this.scopeHead(destination)));
           // Phase 5: epoch check OUTSIDE tryRecovery (the M9 pattern) —
           // a genuine epoch disagreement is terminal and must escape the
           // retry loop, while a FAILED head fetch stays on the budget
@@ -2162,9 +2293,11 @@ export class NetGatewayDO {
     // Phase 2: filter by the materialized owner_scope (indexed) so the scan
     // is O(occupants of body.scope), NOT O(all mirrored sessions). The
     // owner→scope classification happened once at write time (ownerScopeFor).
-    const rows = sqlRows<{ member: string }>(
+    // NC8a: member + body in ONE query — the previous per-member body
+    // re-read was an N+1 that scaled fanout SQL with audience size.
+    const rows = sqlRows<{ member: string; body: string | null }>(
       this.state.storage.sql.exec(
-        "SELECT member FROM net_gateway_relation WHERE relation = 'session_presence' AND owner_scope = ?",
+        "SELECT member, body FROM net_gateway_relation WHERE relation = 'session_presence' AND owner_scope = ?",
         body.scope
       )
     );
@@ -2179,16 +2312,13 @@ export class NetGatewayDO {
     // presence row body carries the session's actor (CO13 applier).
     const actorOf = new Map<string, string | null>();
     for (const row of rows) {
-      const detail = sqlRows<{ body: string | null }>(
-        this.state.storage.sql.exec(
-          "SELECT body FROM net_gateway_relation WHERE relation = 'session_presence' AND owner_scope = ? AND member = ?",
-          body.scope,
-          row.member
-        )
-      )[0];
-      const parsed = detail?.body ? (JSON.parse(detail.body) as { actor?: string }) : null;
+      const parsed = row.body ? (JSON.parse(row.body) as { actor?: string }) : null;
       actorOf.set(row.member, typeof parsed?.actor === "string" ? parsed.actor : null);
     }
+    // NC8a fanout-cost evidence: audience size and frames actually sent —
+    // the "fanout cost as audience grows" dashboard series.
+    let deliveredMembers = 0;
+    let framesSent = 0;
     for (const row of rows) {
       if (body.turn_id !== undefined && this.recentClientTurns.get(body.turn_id) === row.member) continue;
       // v2 audience parity (client-shell phase i): a `to:`-directed
@@ -2201,6 +2331,7 @@ export class NetGatewayDO {
         (obs) => typeof obs?.to !== "string" || obs.to === actor
       );
       if (visible.length === 0) continue;
+      deliveredMembers += 1;
       // MCP wait queues ride the SAME audience + submitter dedupe as the
       // sockets (client-shell phase i).
       this.mcpEnqueue(row.member, visible);
@@ -2208,11 +2339,25 @@ export class NetGatewayDO {
       for (const ws of getSockets ? getSockets(row.member) : []) {
         try {
           ws.send(frame);
+          framesSent += 1;
         } catch {
           // Dead socket: the runtime's close/error callback owns cleanup.
         }
       }
     }
+    console.log(
+      "woo.metric",
+      JSON.stringify({
+        kind: "net_push",
+        scope: body.scope,
+        seq: body.seq,
+        audience: rows.length,
+        delivered_members: deliveredMembers,
+        frames: framesSent,
+        observations: body.observations.length,
+        ts: Date.now()
+      })
+    );
   }
 
   /**
@@ -2509,16 +2654,21 @@ export class NetGatewayDO {
       byOwner.set(owner, keys);
     }
     if (byOwner.size === 0) return undefined;
-    const attestations: NonNullable<CommitSubmit["attestations"]> = {};
-    for (const [owner, keys] of byOwner) {
-      const destination = this.destinationFor(request, owner);
-      structure?.countRpc();
-      const reply = (await this.host.rpc(destination, "/attest", { keys: [...keys].sort() })) as {
+    // NC8b: independent owners attest in PARALLEL — one depth step, K
+    // RPCs. Owners are disjoint sequencers; nothing orders these reads.
+    const owners = [...byOwner.entries()];
+    const attest = (owner: string, keys: Set<string>) =>
+      this.host.rpc(this.destinationFor(request, owner), "/attest", { keys: [...keys].sort() }) as Promise<{
         owner_head: ScopeHead;
         cells: Array<{ key: string; version: string }>;
-      };
-      attestations[owner] = { owner_head: reply.owner_head, cells: reply.cells };
-    }
+      }>;
+    const replies = structure
+      ? await structure.rpcGroup(owners.map(([owner, keys]) => () => attest(owner, keys)))
+      : await Promise.all(owners.map(([owner, keys]) => attest(owner, keys)));
+    const attestations: NonNullable<CommitSubmit["attestations"]> = {};
+    owners.forEach(([owner], index) => {
+      attestations[owner] = { owner_head: replies[index].owner_head, cells: replies[index].cells };
+    });
     return attestations;
   }
 
@@ -2714,8 +2864,13 @@ export class NetGatewayDO {
     // D2: on the SYNCHRONOUS reply path (post-accept), so it counts toward
     // the sync-RPC budget — but it is the happy-path warm fill, NOT an
     // authority reconstruction, so reconstructions stays 0 on a warm turn.
-    structure?.countRpc();
-    const transfer = (await this.host.rpc(destination, "/closure", { keys: touched, known: [] })) as CellTransfer;
+    // NC8b mandatory: the commit is already durable; a budget refusal here
+    // would turn an accepted turn into an error.
+    const transfer = (await timedRpc(
+      structure,
+      () => this.host.rpc(destination, "/closure", { keys: touched, known: [] }),
+      { mandatory: true }
+    )) as CellTransfer;
     const wanted = new Set(touched);
     this.discardViewOnThrow(() =>
       this.state.storage.transactionSync(() => {
@@ -2778,18 +2933,28 @@ export class NetGatewayDO {
       }
     }
     const known = [...view.keys()].filter((key) => key.startsWith("object_lineage:"));
-    for (const [destination, want] of byDestination) {
-      structure?.countRpc();
-      // Client-shell phase i: refresh by OBJECTS too, not bare keys. A
-      // mismatch naming a cell of an object the view never materialized
-      // (a room's exit read as class-default absence by a sparse plan)
-      // would otherwise install just the named cells — no lineage — and
-      // the re-plan's obj-ref expansion still could not seed the object,
-      // looping the mismatch to the budget. The objects-mode closure
-      // materializes each named object whole (chain + cells), so the
-      // re-plan reads real values.
+    // Client-shell phase i: refresh by OBJECTS too, not bare keys. A
+    // mismatch naming a cell of an object the view never materialized
+    // (a room's exit read as class-default absence by a sparse plan)
+    // would otherwise install just the named cells — no lineage — and
+    // the re-plan's obj-ref expansion still could not seed the object,
+    // looping the mismatch to the budget. The objects-mode closure
+    // materializes each named object whole (chain + cells), so the
+    // re-plan reads real values.
+    //
+    // NC8b: independent owner closures fetch in PARALLEL (one depth
+    // step); installs run AFTER all resolve, serially inside the
+    // transaction — a rejected group installs nothing.
+    const destinations = [...byDestination.entries()];
+    const fetchOne = ([destination, want]: [string, string[]]) => {
       const objects = [...new Set(want.filter((key) => !key.startsWith("session:")).map((key) => objectOfCellKey(key)))];
-      const transfer = (await this.host.rpc(destination, "/closure", { keys: want, known, objects })) as CellTransfer;
+      return this.host.rpc(destination, "/closure", { keys: want, known, objects }) as Promise<CellTransfer>;
+    };
+    const transfers = structure
+      ? await structure.rpcGroup(destinations.map((entry) => () => fetchOne(entry)))
+      : await Promise.all(destinations.map(fetchOne));
+    destinations.forEach(([, want], index) => {
+      const transfer = transfers[index];
       const wanted = new Set(want);
       this.discardViewOnThrow(() =>
         this.state.storage.transactionSync(() => {
@@ -2804,7 +2969,7 @@ export class NetGatewayDO {
           }
         })
       );
-    }
+    });
     if (unknownOwner.length === 0) return;
     const byObject = new Map<string, string[]>();
     for (const key of unknownOwner) {
@@ -2823,13 +2988,17 @@ export class NetGatewayDO {
         this.destinationFor(request, `cluster:${object}`)
       ];
       let satisfied = false;
+      // Candidates probe SERIALLY by design — order encodes likelihood
+      // (actor's room first) and a hit stops the cascade; parallel
+      // probing would pay every candidate every time.
       for (const destination of [...new Set(candidates)]) {
         if (satisfied) break;
         try {
-          structure?.countRpc();
           // Objects mode here too (phase i): a convention hit must
           // materialize the object whole, not just the named keys.
-          const transfer = (await this.host.rpc(destination, "/closure", { keys: want, known, objects: [object] })) as CellTransfer;
+          const transfer = (await timedRpc(structure, () =>
+            this.host.rpc(destination, "/closure", { keys: want, known, objects: [object] })
+          )) as CellTransfer;
           if (transfer.cells.length === 0) continue;
           this.discardViewOnThrow(() =>
             this.state.storage.transactionSync(() => {
@@ -2840,7 +3009,9 @@ export class NetGatewayDO {
             })
           );
           satisfied = true;
-        } catch {
+        } catch (err) {
+          // NC8b: a budget refusal is the TURN's verdict, not a probe miss.
+          if (isNetError(err) && err.code === "E_BUDGET") throw err;
           // A candidate that is not a real scope (no durable state)
           // refuses — expected for convention probes; try the next.
         }
@@ -2894,8 +3065,7 @@ export class NetGatewayDO {
     // D2: a full reseed is an authority reconstruction and one sync RPC on
     // the turn path (the /net/pull live path passes no structure, unchanged).
     structure?.countReconstruction();
-    structure?.countRpc();
-    const transfer = (await this.host.rpc(destination, "/closure", { keys: ["*"], known })) as CellTransfer & {
+    const transfer = (await timedRpc(structure, () => this.host.rpc(destination, "/closure", { keys: ["*"], known }))) as CellTransfer & {
       scope: string;
       head: ScopeHead;
       catalog_epoch: string;

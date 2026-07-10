@@ -58,11 +58,30 @@ export type FanoutRow = {
 };
 
 export type OutboxOptions = {
-  /** Backoff before retrying a failed row, by attempt count (1-based). */
-  backoffMs?: (attempt: number) => number;
+  /** Backoff before retrying a failed row, by attempt count (1-based).
+   * The row id rides along so a backoff can jitter deterministically
+   * per-row (the default does); implementations may ignore it. */
+  backoffMs?: (attempt: number, id: string) => number;
   /** Attempts before a row is abandoned (named divergence, not loss). */
   maxAttempts?: number;
 };
+
+/** NC8 (review item 8): ±25% deterministic per-row jitter over the
+ * exponential base, so retry herds de-synchronize — many scopes retrying
+ * a dead subscriber must not thunder on one cadence. Deterministic BY
+ * ROW (an FNV-1a of the id, no Math.random) to preserve the module's
+ * replayable-drain contract: the same row backs off identically across
+ * reruns; different rows spread. */
+export function defaultBackoffMs(attempt: number, id: string): number {
+  const base = Math.min(30_000, 250 * 2 ** (attempt - 1));
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < id.length; i += 1) {
+    hash ^= id.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  const spread = Math.floor(base / 4);
+  return base - spread + (hash % (2 * spread + 1));
+}
 
 export type DrainResult = {
   delivered: string[];
@@ -73,11 +92,11 @@ export type DrainResult = {
 
 export class Outbox {
   private readonly rows = new Map<string, FanoutRow>();
-  private readonly backoffMs: (attempt: number) => number;
+  private readonly backoffMs: (attempt: number, id: string) => number;
   private readonly maxAttempts: number;
 
   constructor(options: OutboxOptions = {}) {
-    this.backoffMs = options.backoffMs ?? ((attempt) => Math.min(30_000, 250 * 2 ** (attempt - 1)));
+    this.backoffMs = options.backoffMs ?? defaultBackoffMs;
     this.maxAttempts = options.maxAttempts ?? 8;
   }
 
@@ -118,7 +137,7 @@ export class Outbox {
     for (const lane of lanes.values()) {
       lane.sort((a, b) => a.body.scope.localeCompare(b.body.scope) || a.body.seq - b.body.seq);
       for (const row of lane) {
-        if (row.last_attempt_at_ms !== null && now < row.last_attempt_at_ms + this.backoffMs(row.attempts)) {
+        if (row.last_attempt_at_ms !== null && now < row.last_attempt_at_ms + this.backoffMs(row.attempts, row.id)) {
           result.skipped_backoff.push(row.id);
           break; // preserve order: nothing later in this lane may jump the queue
         }

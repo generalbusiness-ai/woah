@@ -195,9 +195,13 @@ there).
    the woah→woah1 incident). [Requires the net client shell — the
    remaining build item.]
 5. **Postflight + bake**: deployed walkthrough + tail thresholds; old
-   prod stays deployed AND FROZEN through the bake. Rollback = switch
-   the route back + delete WOO_WRITE_FREEZE — nothing else — but ONLY
-   until the first net write (NC6; after that, forward recovery only).
+   prod stays deployed AND FROZEN through the bake. Canary dashboard:
+   `wrangler tail --format json | npx tsx scripts/net-metrics-report.ts`
+   — exits 2 on the NC8 abort signals (any outbox abandonment, any
+   fanout gap, retry rate > 20%); watch p95 wall_ms and the incident
+   counters besides. Rollback = switch the route back + delete
+   WOO_WRITE_FREEZE — nothing else — but ONLY until the first net write
+   (NC6; after that, forward recovery only).
 6. **After the bake**: retire old prod; the §8 deletion commits.
 
 REMAINING build item before step 4 can run: the net CLIENT SHELL — the
@@ -322,3 +326,52 @@ moved out of this note into **spec/operations/net-cutover.md (NC1–NC8)**.
 **Deployment decision unchanged**: no production deploy until NC8's
 measurement items (skewed load, gateway envelope, canary + dashboards)
 have evidence. Steps 0–3 of the runbook remain executable today.
+
+## NC8 build (2026-07-09): the capacity program's local half
+
+- **Instrumentation (NC8a)**: net_turn_structure gained wall_ms / rpc_ms
+  / rpc_max_ms / rpc_depth (critical-path steps: a parallel group counts
+  once — depth < sync_rpc measures paid parallelism); net_scope_submit
+  (per-submit ms + outbox_enqueued delta at the authority — the
+  hot-scope cost meter; depth derivable from enqueue/drain counters, no
+  per-pass COUNT scan); net_push (audience, delivered_members, frames);
+  scheduled dispatch lag_ms. pushObservations' per-member body re-read
+  (an N+1 scaling with audience) folded into the one indexed query.
+- **Budgets + parallel reads (NC8b)**: hard per-turn caps (32 sync RPCs
+  / 30s RPC time) refuse namedly as E_BUDGET, checked BEFORE issuing;
+  mandatory steps exempt (CO2.5 disambiguation resubmit, post-accept
+  warm fill); a budget refusal never triggers the resubmit (nothing was
+  issued). Foreign attests and multi-owner refresh closures now fetch in
+  PARALLEL (installs after all resolve, transactional per destination).
+- **Hot-scope serializer**: the skew lane's first honest run measured
+  the thundering herd — 10 concurrent same-cell writers through one
+  gateway, only 3 landed inside MAX_TURN_ATTEMPTS=6 (each retryable
+  round re-races the herd; real DOs interleave at subrequest awaits the
+  same way). Fix: per-planning-scope turn queues at the gateway — a
+  shard's own concurrent turns run in arrival order, each planning
+  against the previous turn's installed post-state (first-attempt
+  accepts; wave 1 now converges 10/10). Cross-shard contention still
+  converges through the retry loop; the serializer removes only the
+  self-inflicted share.
+- **Skewed-load lane (NC8c)**: tests/worker/net-load-skew.test.ts
+  (`npm run load:net-skew`, in curated npm test): hot room, large
+  audience (scan/push track occupancy, 3x off-room sessions invisible),
+  high-degree owner isolation (200-member annex adds 0 to another
+  scope's turn), 40-turn alarm backlog vs foreground (attempt=1,
+  sync_rpc≤3), slow authority (injected 60ms lands in rpc_ms), dead
+  authority (bounded amplification to the named budget).
+- **Bounded growth (NC8d)**: audit found reply-cache cap + tail rule,
+  abandoned-row 256 tail, delivered-row deletion, bounded drain passes /
+  scheduled batches, capped dedupe/pin LRUs all already built; the gap
+  was JITTER — defaultBackoffMs now spreads retries ±25% via a
+  deterministic per-row FNV hash (herds de-synchronize; drains stay
+  replayable; no Math.random).
+- **Canary equipment (NC8e)**: scripts/net-metrics-report.ts aggregates
+  woo.metric streams (raw logs or wrangler-tail JSON; balanced-brace
+  extraction) into the dashboard series + inline abort signals (exit 2:
+  abandonment > 0, fanout gap > 0, retry rate > 20%). Proven against
+  real lane output.
+
+REMAINING deploy-only (unchanged): canary numbers (sustained turns/s,
+per-connection memory, cross-colo tails, cold-start stalls), tenant
+capacity limits if one shard is the ceiling.

@@ -639,6 +639,11 @@ export class NetScopeDO {
           ? this.ensureSequencer(undefined, submit.stamp.catalog_epoch)
           : this.ensureSequencer(submit.scope, submit.stamp.catalog_epoch);
         const headBefore = seq.head().seq;
+        // NC8a authority-side evidence: per-submit wall time + fanout rows
+        // enqueued (the hot-scope serialization series — a popular room is
+        // one serialized write queue, and this is its cost meter).
+        const submitStarted = Date.now();
+        const enqueuedBefore = this.outboxEnqueuedTotal;
         // Rider-read integrity (fix 1): capture, BEFORE the commit applies,
         // the prior version this turn observed for each rider-anchored
         // cell — the adopt-time CAS input. Must run pre-submit because the
@@ -678,6 +683,18 @@ export class NetScopeDO {
         if (reply.status === "accepted" && reply.touched.some((key) => key.startsWith("session:"))) {
           this.armSessionReapAlarm(seq);
         }
+        console.log(
+          "woo.metric",
+          JSON.stringify({
+            kind: "net_scope_submit",
+            scope: seq.scope,
+            status: reply.status,
+            ...(reply.status === "accepted" ? { seq: reply.head.seq, touched: reply.touched.length } : { reason: reply.reason }),
+            outbox_enqueued: this.outboxEnqueuedTotal - enqueuedBefore,
+            ms: Date.now() - submitStarted,
+            ts: Date.now()
+          })
+        );
         return json(reply);
       }
       if (request.method === "POST" && url.pathname === "/net/subscribe") {
@@ -920,6 +937,9 @@ export class NetScopeDO {
               id: turn.id,
               at_logical_time: turn.at_logical_time,
               fired_at: now,
+              // NC8a scheduler-lag series: how far past due the dispatch
+              // ran (alarm backlog / contention shows up here first).
+              lag_ms: Math.max(0, now - turn.at_logical_time),
               planner,
               ts: Date.now()
             })
@@ -1561,7 +1581,14 @@ export class NetScopeDO {
    * route column and the Phase-3 lane/due columns). Same (route,
    * destination, scope, seq) re-enqueued is the same fact — keep the
    * earlier row and its retry state, exactly Outbox.enqueue's rule. */
+  /** NC8a: monotonic enqueue counter for the submit metric's
+   * outbox_enqueued delta — with the drain metric's delivered/abandoned
+   * counts, the report derives outbox DEPTH without a per-pass COUNT
+   * scan (which would reintroduce O(backlog) work per drain). */
+  private outboxEnqueuedTotal = 0;
+
   private persistOutboxRow(route: OutboxRoute, destination: string, body: FanoutBody): void {
+    this.outboxEnqueuedTotal += 1;
     this.state.storage.sql.exec(
       "INSERT INTO net_scope_outbox (route, id, destination, body, status, attempts, last_attempt_at_ms, scope, seq, next_attempt_at_ms) VALUES (?, ?, ?, ?, 'pending', 0, NULL, ?, ?, 0) ON CONFLICT(route, id) DO NOTHING",
       route,

@@ -4,7 +4,7 @@
 // idempotency, backoff windows).
 import { describe, expect, it } from "vitest";
 import { CellStore, makeCell, type EpochStamp } from "../../src/net/cells";
-import { applyFanout, Outbox, type FanoutBody } from "../../src/net/outbox";
+import { applyFanout, defaultBackoffMs, Outbox, type FanoutBody } from "../../src/net/outbox";
 
 const STAMP: EpochStamp = { scope_head: "h", catalog_epoch: "cat1" };
 
@@ -81,6 +81,27 @@ describe("outbox drain (D1 semantics)", () => {
     await outbox.drain(1000, async () => { throw new Error("down"); });
     const again = outbox.enqueue("shard-1", body(1));
     expect(again.attempts).toBe(1); // crash-recovery re-enqueue is not a reset
+  });
+});
+
+describe("backoff jitter (NC8, review item 8)", () => {
+  it("is deterministic per row, bounded to ±25%, and spreads across rows", () => {
+    // Deterministic: the same row backs off identically across reruns
+    // (the module's replayable-drain contract).
+    expect(defaultBackoffMs(3, "shard-1/the_room/7")).toBe(defaultBackoffMs(3, "shard-1/the_room/7"));
+    // Bounded: every value inside ±25% of the exponential base.
+    for (let attempt = 1; attempt <= 8; attempt += 1) {
+      const base = Math.min(30_000, 250 * 2 ** (attempt - 1));
+      for (let i = 0; i < 32; i += 1) {
+        const value = defaultBackoffMs(attempt, `dest-${i}/scope/${i}`);
+        expect(value).toBeGreaterThanOrEqual(base - Math.floor(base / 4));
+        expect(value).toBeLessThanOrEqual(base + Math.floor(base / 4));
+      }
+    }
+    // Spread: a herd of distinct rows must NOT share one retry instant.
+    const herd = new Set<number>();
+    for (let i = 0; i < 64; i += 1) herd.add(defaultBackoffMs(5, `dest-${i}/scope/${i}`));
+    expect(herd.size).toBeGreaterThan(16);
   });
 });
 

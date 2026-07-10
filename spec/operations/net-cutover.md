@@ -1,8 +1,10 @@
 # Net cutover — installation, activation, and migration of a live world (NC1–NC8)
 
 Status: **implemented** (state machine, freeze, export watermark, activation
-barrier, verification rules); the capacity program (NC8) is a **pre-deploy
-requirement checklist**, not yet evidence-complete.
+barrier, verification rules). NC8's local half — instrumentation, budgets,
+skewed-load lane, bounded growth, report tooling — is **built**; its
+deploy-only half (canary numbers, cross-colo tails, sustained-rate
+envelope) remains a **pre-deploy requirement**.
 
 This section is normative for moving a live v2 world into a net namespace
 (the coherence layer of [spec/protocol/coherence.md](../protocol/coherence.md))
@@ -171,28 +173,48 @@ preferred as tooling matures.)
 
 ## NC8. Capacity and operations program (pre-deploy requirements)
 
-These are required **before inviting production workloads**, and are
-requirements precisely because the workerd lanes cannot prove them
+These are required **before inviting production workloads**. Status per
+item; what remains is exactly what the workerd lanes cannot prove
 (single-process, fast reliable RPC — the fidelity-ladder rule):
 
-- **Gateway envelope**: measured max sustained turns/s per gateway shard,
-  CPU and RPC count per turn, WS count and per-connection memory, fanout
-  cost vs audience size, p95/p99 under concurrency and cold scope
-  authorities. Tenant capacity limits if one shard is the initial
-  ceiling. (Shard hints exist — `s_<shard>_<hex>` session ids — but the
-  envelope is unmeasured.)
-- **Skewed-load proof**: hot-room writers, large audiences, high-degree
-  relation owners, alarm backlog + foreground contention, cold/slow
-  downstream authority with retrying callers. Even-distribution load
-  gates (the current `load:net-dev` asymptote lane) do not cover these.
-- **Cross-authority latency budget**: instrument RPC fanout and
-  critical-path depth per turn; parallelize independent reads; bounded
-  per-turn RPC/time budgets. Deploy-only signal: cross-colo tails.
-- **Bounded growth**: outbox rows, idempotency/receipt records, session
-  cells, and dedupe state all need explicit retention and a poison-item
-  quarantine story (drain passes and abandonment exist; retention limits
-  are partial).
-- **Deployed canary** with dashboards (authority RPC latency, conflicts,
-  retries, scheduler lag, outbox depth, socket counts, fanout size,
-  install phase, active epoch), abort criteria, and geographic
-  separation, before any public traffic.
+- **Cross-authority latency budget — BUILT.** Every turn reports
+  `net_turn_structure {wall_ms, rpc_ms, rpc_max_ms, rpc_depth, sync_rpc,
+  reconstructions, plan_cells, envelope_bytes}`; independent
+  cross-authority reads (foreign attests, multi-owner refresh closures)
+  fetch in parallel (one critical-path step, `rpc_depth < sync_rpc`
+  measures the paid parallelism); hard per-turn budgets refuse namedly
+  (`E_BUDGET`, 32 RPCs / 30 s RPC time — mandatory steps exempt: the
+  CO2.5 disambiguation resubmit and the post-accept warm fill).
+- **Skewed-load proof — BUILT (in-process bounds).** `load:net-skew`
+  (curated gate): hot-room concurrent same-cell writers (converge under
+  retry with named verdicts and exact serialization — a per-scope turn
+  serializer at the gateway removes the self-inflicted herd the lane
+  originally measured at 3/10 first-wave survivors), large-audience
+  fanout (scan and push track room occupancy, never total mirrored
+  sessions), high-degree owner isolation (a 200-member scope adds
+  nothing to another scope's turn), alarm backlog under foreground
+  writes, slow authority (latency lands attributed in `rpc_ms`), dead
+  authority (bounded amplification to the named budget). What it cannot
+  prove: real cross-colo tails and cold-start stalls — canary-only.
+- **Bounded growth — BUILT.** Reply cache capped (`REPLY_CACHE_CAP`
+  1024, recovery-tail never pruned), delivered outbox rows deleted,
+  abandoned rows keep a 256-row debugging tail, drain passes and
+  scheduled batches bounded per invocation, dedupe/pin LRUs capped,
+  session reaper armed; retry backoff carries deterministic per-row
+  ±25 % jitter (herds de-synchronize; drains stay replayable). Poison
+  rows halt only their own lane and abandon namedly after the attempt
+  budget — never silent loss, never starvation of later work.
+- **Gateway envelope — MEASUREMENT TOOLING BUILT; numbers deploy-only.**
+  `scripts/net-metrics-report.ts` aggregates the metric series
+  (turn percentiles, retry/reconstruction rates, hottest scopes, fanout
+  audience, outbox health, scheduler lag, incident counters) from any
+  log stream (`wrangler tail --format json | tsx
+  scripts/net-metrics-report.ts`). Sustained turns/s, per-connection
+  memory, and tenant limits still require the deployed canary.
+- **Deployed canary — REQUIRED, NOT RUN.** Geographic separation, cold
+  starts, dashboards from the report tool, and the abort criteria below,
+  before any public traffic. Abort signals (the report tool exits 2 on
+  them): any outbox abandonment (named divergence), any fanout gap,
+  turn retry rate > 20 % over a meaningful sample; plus operator
+  judgment on p95 `wall_ms` regressions and `install_degraded` /
+  `adopt_conflict` counters.

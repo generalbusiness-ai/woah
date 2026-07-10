@@ -63,6 +63,10 @@ type TurnStructureReport = {
   attempt: number;
   envelope_bytes: number;
   sync_rpc: number;
+  rpc_ms: number;
+  rpc_max_ms: number;
+  rpc_depth: number;
+  wall_ms: number;
   scope_row_writes: number;
   reconstructions: number;
 };
@@ -173,7 +177,91 @@ describe("D2 / CO10 warm-turn structural budget", () => {
     expect(rpcLog).toEqual(["/net/head", "/net/submit", "/net/closure"]);
     expect(structure?.sync_rpc).toBe(rpcLog.length);
 
+    // NC8a: the timing/depth series ride the same report. Every warm RPC
+    // is a serial step, so depth == count here; wall covers the RPC time.
+    expect(structure?.rpc_depth).toBe(structure?.sync_rpc);
+    expect(structure?.rpc_ms).toBeGreaterThanOrEqual(0);
+    expect(structure?.rpc_max_ms).toBeLessThanOrEqual(structure?.rpc_ms ?? 0);
+    expect(structure?.wall_ms).toBeGreaterThanOrEqual(structure?.rpc_ms ?? 0);
+
     scopeState.close();
     gatewayState.close();
+  });
+});
+
+describe("NC8b: the per-turn RPC budget and parallel-group mechanics (TurnStructure)", () => {
+  it("refuses past the RPC cap with a named E_BUDGET; mandatory steps bypass", async () => {
+    const { TurnStructure } = await import("../../src/worker/net/gateway-do");
+    const structure = new TurnStructure();
+    for (let i = 0; i < 32; i += 1) {
+      await structure.rpc(async () => i);
+    }
+    expect(structure.sync_rpc).toBe(32);
+    // The 33rd is refused BEFORE issuing (the action must not run)...
+    let ran = false;
+    await expect(
+      structure.rpc(async () => {
+        ran = true;
+      })
+    ).rejects.toMatchObject({ code: "E_BUDGET" });
+    expect(ran).toBe(false);
+    // ...but a MANDATORY step (the CO2.5 disambiguation resubmit, the
+    // post-accept warm fill) still runs at the budget's edge.
+    await structure.rpc(async () => {
+      ran = true;
+    }, { mandatory: true });
+    expect(ran).toBe(true);
+  });
+
+  it("a parallel group is one depth step, K RPCs, and rejects only after all settle", async () => {
+    const { TurnStructure } = await import("../../src/worker/net/gateway-do");
+    const structure = new TurnStructure();
+    const settled: string[] = [];
+    const results = await structure.rpcGroup([
+      async () => {
+        settled.push("a");
+        return "a";
+      },
+      async () => {
+        settled.push("b");
+        return "b";
+      },
+      async () => {
+        settled.push("c");
+        return "c";
+      }
+    ]);
+    expect(results).toEqual(["a", "b", "c"]);
+    expect(structure.sync_rpc).toBe(3); // all K counted
+    expect(structure.rpc_depth).toBe(1); // ONE critical-path step
+
+    // A failing member surfaces, but only after the others finished —
+    // no orphaned in-flight write behind a thrown group.
+    await expect(
+      structure.rpcGroup([
+        async () => {
+          settled.push("late");
+          return "late";
+        },
+        async () => {
+          throw new Error("boom");
+        }
+      ])
+    ).rejects.toThrow("boom");
+    expect(settled).toContain("late");
+    expect(structure.rpc_depth).toBe(2);
+    expect(structure.sync_rpc).toBe(5);
+  });
+
+  it("a group that would cross the cap refuses whole (no partial fan-out)", async () => {
+    const { TurnStructure } = await import("../../src/worker/net/gateway-do");
+    const structure = new TurnStructure();
+    for (let i = 0; i < 30; i += 1) await structure.rpc(async () => i);
+    let issued = 0;
+    await expect(
+      structure.rpcGroup([async () => (issued += 1), async () => (issued += 1), async () => (issued += 1)])
+    ).rejects.toMatchObject({ code: "E_BUDGET" });
+    expect(issued).toBe(0);
+    expect(structure.sync_rpc).toBe(30);
   });
 });
