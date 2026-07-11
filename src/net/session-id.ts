@@ -38,3 +38,18 @@ export function sessionShardHint(session: string): string | null {
   if (parts.length !== 3 || parts[0] !== "s" || parts[1].length === 0) return null;
   return parts[1];
 }
+
+/** WebSocket tickets are durable only on the gateway that minted them.
+ * Carry the same shard hint as sessions so the edge can route the upgrade
+ * without a global ticket directory. */
+export function ticketIdWithShardHint(shard: string | null, random: string): string {
+  if (shard === null || shard.length === 0) return `wst_${random}`;
+  const hint = shard.replace(/[^A-Za-z0-9-]/g, "-");
+  return `wst_${hint}_${random}`;
+}
+
+export function ticketShardHint(ticket: string): string | null {
+  const parts = ticket.split("_");
+  if (parts.length !== 3 || parts[0] !== "wst" || parts[1].length === 0) return null;
+  return parts[1];
+}

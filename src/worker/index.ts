@@ -1,7 +1,7 @@
 // Worker entry — splits routing between Durable Objects and Workers Assets.
 //
 // Global API, /healthz, /v2/turn-network/ws      → world/gateway DO.
-// /net-api/*  (Phase-4 client surface)           → GATEWAY_NET stable shard
+// /net-api/*  (Phase-4 client surface)           → GATEWAY_NET session shard
 //                                                  (client-credentialed; see
 //                                                  handleNetApi).
 // Object REST calls and reads                    → Directory-resolved host DO
@@ -15,6 +15,7 @@ import { signInternalRequest, verifyInternalRequest } from "./internal-auth";
 import { sessionActiveScopeFromRecord, wooError } from "../core/types";
 import { handleAdmin } from "./admin";
 import { resolveNetDestination, type NetBindingsEnv } from "./net/workerd-host";
+import { parseNetGatewayShardCount, routeNetGateway } from "./net/gateway-routing";
 
 export { PersistentObjectDO } from "./persistent-object-do";
 export { DirectoryDO } from "./directory-do";
@@ -640,38 +641,30 @@ function sanitizePublicHeaders(request: Request): Request {
   return new Request(request, { headers });
 }
 
-/** The one GATEWAY_NET shard serving the whole /net-api client surface.
- *
- * Sharding decision (Phase 4 item 2, documented): ONE stable shard for
- * now. A session cell installs into the MINTING gateway's derived view,
- * and /net-api/turn validates the session from that same view — so mint
- * and turn must land on the same DO. Hash-sharding by session id (the v2
- * MCP idiom, forwardToMcpGateway above) needs a session→cluster
- * resolution story first (session ids carry no lineage, CO14), so a
- * non-minting shard could pull the cell on miss; that lands with the
- * Phase-4/5 scale work, not here. */
-const NET_API_GATEWAY_SHARD = "net-api";
-
 /**
- * Phase-4 client surface: forward /net-api/* to the stable GATEWAY_NET
- * shard. The gateway DO authenticates the client credential itself; this
- * hop only enforces the public JSON body cap (the same idiom as every
- * public route) and never signs the request.
+ * Route /net-api/* to the session's minting gateway. Session and ticket
+ * hints avoid a directory lookup; first requests distribute by credential
+ * or edge entropy. The gateway authenticates the credential itself.
  */
 async function handleNetApi(request: Request, env: Env, url: URL): Promise<Response> {
   const netEnv = env as unknown as NetBindingsEnv;
-  let stub;
-  try {
-    stub = resolveNetDestination(netEnv, `gateway:${NET_API_GATEWAY_SHARD}`);
-  } catch (err) {
-    return jsonResponse({ error: { code: "E_INTERNAL", message: errorMessage(err) } }, 500);
-  }
   const target = new URL(`https://do${url.pathname}`);
   target.search = url.search;
   // An exception escaping the DO's fetch propagates as a THROW from
   // stub.fetch here (workerd semantics) — without this guard the client
   // sees an opaque runtime 500 with a non-JSON body. Normalize it.
   try {
+    const body = request.method === "GET" ? undefined : await readLimitedBody(request);
+    const bodyText = body === undefined ? undefined : new TextDecoder().decode(body);
+    const shard = routeNetGateway({
+      pathname: url.pathname,
+      searchParams: url.searchParams,
+      headers: request.headers,
+      ...(bodyText !== undefined ? { bodyText } : {}),
+      shardCount: parseNetGatewayShardCount((env as unknown as { NET_API_GATEWAY_SHARDS?: string }).NET_API_GATEWAY_SHARDS),
+      anonymousKey: crypto.randomUUID()
+    });
+    const stub = resolveNetDestination(netEnv, `gateway:${shard}`);
     if (request.method === "GET") {
       // `new Request(target, request)` re-targets the URL while copying
       // method/headers from the inbound request — including the Upgrade
@@ -680,7 +673,6 @@ async function handleNetApi(request: Request, env: Env, url: URL): Promise<Respo
       // DO's 101 + webSocket response returns to the client unwrapped.
       return await stub.fetch(new Request(target, request));
     }
-    const body = await readLimitedBody(request);
     return await stub.fetch(new Request(target, { method: request.method, headers: request.headers, body }));
   } catch (err) {
     return errorResponseFor(err);

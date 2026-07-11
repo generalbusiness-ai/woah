@@ -36,12 +36,10 @@ head_sampling_rate = 1.0
 # string. See DEPLOY.md §WOO_AUTO_INSTALL_CATALOGS for details.
 WOO_AUTO_INSTALL_CATALOGS = "chat,demoworld,dubspace,help,note,pinboard,prog,tasks,blocks-demo"
 
-# H1: the client-surface gateway shard's own rpc destination. The worker
-# entry pins /net-api/* to the "net-api" GATEWAY_NET shard; a client
-# session auto-subscribes this gateway to the room/cluster scopes it
-# touches so peer observation push works in production without any
-# out-of-band /net/subscribe (the coherence layer's production bootstrap).
-NET_GATEWAY_SELF = "gateway:net-api"
+# Gateway DOs derive their fanout destination from their idFromName name.
+# NET_GATEWAY_SELF remains a test/legacy override and MUST be absent when
+# multiple shards are configured.
+NET_API_GATEWAY_SHARDS = "8"
 
 # Which AE dataset /admin/series queries. Must match the
 # `[[analytics_engine_datasets]].dataset` for the active env. Set

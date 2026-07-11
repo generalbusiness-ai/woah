@@ -258,9 +258,18 @@ item; what remains is exactly what the workerd lanes cannot prove
   log stream (`wrangler tail --format json | tsx
   scripts/net-metrics-report.ts`). Sustained turns/s, per-connection
   memory, and tenant limits still require the deployed canary.
+- **Gateway sharding — BUILT after the first deployed canary.** Public
+  `/net-api` routing uses `NET_API_GATEWAY_SHARDS` named shards. A session
+  or WebSocket ticket carries its minting shard; MCP headers, bearer/body/
+  query sessions, and ticket upgrades therefore return to the durable
+  cache that owns them without a global directory. Sessionless login and
+  apikey requests hash a stable credential key; anonymous guest/bootstrap
+  requests distribute using edge entropy. Hints outside the configured set
+  are ignored so untrusted ids cannot instantiate arbitrary named DOs.
 - **Second-review scale caps — RECORDED, NOT BUILT** (accepted findings
-  8/9/11/12 residuals, required before public traffic beyond the bake):
-  the single `/net-api` gateway durably accumulates every visited cell
+  9/11/12 residuals, required before public traffic beyond the bake):
+  each `/net-api` gateway durably accumulates every cell visited by its
+  sessions
   and cold-hydrates its whole store (shard by session/actor, bound the
   derived cache, evict unsubscribed scopes with revision-safe re-pull);
   identity is centralized (one `api_keys` cell, O(accounts) email scan,
@@ -270,10 +279,16 @@ item; what remains is exactly what the workerd lanes cannot prove
   not during one); guest capacity is the fixed installed pool
   (owner-sequenced guest CREATION is the follow-up; close/release and
   named exhaustion exist).
-- **Deployed canary — REQUIRED, NOT RUN.** Geographic separation, cold
-  starts, dashboards from the report tool, and the abort criteria below,
-  before any public traffic. Abort signals (the report tool exits 2 on
-  them): any outbox abandonment (named divergence), any fanout gap,
-  turn retry rate > 20 % over a meaningful sample; plus operator
-  judgment on p95 `wall_ms` regressions and `install_degraded` /
-  `adopt_conflict` counters.
+- **Deployed canary — DIAGNOSTIC RUN COMPLETE; ACCEPTANCE RERUN
+  REQUIRED.** The isolated 2026-07-11 canary proved install, session mint,
+  turn commit, and named refusals on real Cloudflare DOs. It also measured
+  42 % HTTP 500 responses at 6 guests and 12 concurrent turns, a 2.24 s
+  gateway p99, 1.1 s scope queue wait, fixed-pool guest exhaustion, and
+  inadequate `wrangler tail` sampling. The public route remains closed.
+  After the recorded scale caps are built, rerun with geographic
+  separation, cold starts, a nonsampling metrics sink, and the abort
+  criteria below. Abort signals (the report tool exits 2 on them): any
+  outbox abandonment (named divergence), any fanout gap, turn retry rate
+  > 20 % over a meaningful sample; plus operator judgment on p95
+  `wall_ms` regressions and `install_degraded` / `adopt_conflict`
+  counters.

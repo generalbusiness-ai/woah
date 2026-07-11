@@ -61,7 +61,7 @@ import { budgetExhausted, isNetError, netError, NetError, type AttemptTraceEntry
 import { applyFanout, type FanoutBody } from "../../net/outbox";
 import { relationKey, type RelationDelta, type RelationRow } from "../../net/relations";
 import { mintSessionSubmit, sessionCellKey, validateSessionCell } from "../../net/sessions";
-import { sessionIdWithShardHint } from "../../net/session-id";
+import { sessionIdWithShardHint, ticketIdWithShardHint } from "../../net/session-id";
 import { planTurn, type PlanTurnInput, type PlanTurnResult } from "../../net/plan";
 import type { ScopeClassifier } from "../../net/route";
 import { CATALOG_SCOPE, classifierFromLineage, type AnchorLineage } from "../../net/topology";
@@ -2532,7 +2532,7 @@ export class NetGatewayDO {
     const now = this.host.now();
     // Reap expired tickets on mint — bounded cleanup, no separate reaper.
     this.state.storage.sql.exec("DELETE FROM net_gateway_ws_ticket WHERE expires_at <= ?", now);
-    const ticket = `wst_${randomHex(24)}`;
+    const ticket = ticketIdWithShardHint(this.shardName(), randomHex(24));
     const expiresAt = now + 60_000;
     this.state.storage.sql.exec(
       "INSERT INTO net_gateway_ws_ticket (ticket, session, actor, expires_at) VALUES (?, ?, ?, ?)",
@@ -2828,7 +2828,11 @@ export class NetGatewayDO {
    * memoized set so the next touch retries.
    */
   private async selfSubscribe(scope: string): Promise<void> {
-    const self = this.env.NET_GATEWAY_SELF;
+    const shard = this.shardName();
+    // Explicit override wins for fake harnesses and legacy one-shard
+    // deployments whose DurableObjectId test label is not its route name.
+    // Multi-shard deployments omit it and use the actual idFromName name.
+    const self = this.env.NET_GATEWAY_SELF ?? (shard ? `gateway:${shard}` : undefined);
     if (!self || this.selfSubscribed.has(scope)) return;
     this.selfSubscribed.add(scope);
     try {

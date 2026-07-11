@@ -3,7 +3,7 @@
 // gains shards, without breaking the `:`-delimited cell-key parse or the
 // id's own `_`-delimited parse.
 import { describe, expect, it } from "vitest";
-import { sessionIdWithShardHint, sessionShardHint } from "../../src/net/session-id";
+import { sessionIdWithShardHint, sessionShardHint, ticketIdWithShardHint, ticketShardHint } from "../../src/net/session-id";
 import { sessionCellKey } from "../../src/net/sessions";
 
 describe("session-id shard hint (Phase 6)", () => {
@@ -43,5 +43,12 @@ describe("session-id shard hint (Phase 6)", () => {
     // The gateway's objectOfCellKey rule: `<kind>:<object>[:<name>]` —
     // object ids never contain ':', so split(':')[1] recovers the id.
     expect(key.split(":")[1]).toBe(id);
+  });
+
+  it("roundtrips the minting shard through a WebSocket ticket", () => {
+    const ticket = ticketIdWithShardHint("net-api-3", "abc123");
+    expect(ticket).toBe("wst_net-api-3_abc123");
+    expect(ticketShardHint(ticket)).toBe("net-api-3");
+    expect(ticketShardHint("wst_legacyrandom")).toBeNull();
   });
 });
