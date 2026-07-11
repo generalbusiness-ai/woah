@@ -52,6 +52,8 @@ WOO_INTERNAL_SECRET = "local-smoke-internal-secret"
 # observation push works without the lane's manual /net/subscribe. The
 # worker entry returns each request to its session's GATEWAY_NET shard.
 NET_API_GATEWAY_SHARDS = "8"
+NET_RPC_TIMEOUT_MS = "5000"
+NET_TURN_QUEUE_WAIT_MS = "1500"
 # D1: tail-driven post-reply delivery. Writes v2_fanout_pending rows
 # before reply and drains them after, so crash recovery re-delivers
 # rather than drops. Safe to enable in the smoke lane.

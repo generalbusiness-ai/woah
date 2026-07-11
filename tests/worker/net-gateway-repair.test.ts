@@ -280,7 +280,7 @@ describe("NetGatewayDO repair loop (CO6/CO10)", () => {
       error: { code: string; attempts?: Array<AttemptTraceEntry & { recovery_error?: string }> };
     }>(faulted, faultEnv, "/turn", turnRequest(bumpCall("turn-fault-1"), "fault-t1"));
 
-    expect(status).toBe(400);
+    expect(status).toBe(503);
     expect(body.error.code).toBe("E_BUDGET");
     // The trace explains every round: the taxonomy code that triggered
     // it and the recovery failure that kept it from converging.
@@ -414,6 +414,79 @@ describe("gateway turn edges (fix 5)", () => {
 
     // Exactly one commit at the scope (the resubmit replayed, it did not
     // double-commit): head advanced once.
+    const head = await call<{ head: { seq: number } }>(scopeDO, scopeEnv, "/head");
+    expect(head.head.seq).toBe(1);
+
+    close();
+    gState.close();
+  });
+
+  it("a submit deadline after commit disambiguates with one same-key replay", async () => {
+    const { scopeDO, scopeEnv, bumpCall, close } = await seededScope();
+    let submitCalls = 0;
+    const deadlineStub = {
+      fetch: async (request: Request) => {
+        const response = await scopeDO.fetch(request);
+        if (new URL(request.url).pathname === "/net/submit" && ++submitCalls === 1) {
+          // The authority committed, but its reply never reaches the
+          // gateway. WorkerdHost's deadline must release the first call;
+          // the second call replays the recorded reply under the same key.
+          return await new Promise<Response>(() => {});
+        }
+        return response;
+      }
+    };
+    const gState = netState("gateway-submit-deadline-replay");
+    const gEnv: NetGatewayEnv = {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_RPC_TIMEOUT_MS: "20",
+      NET_RESOLVE: () => deadlineStub
+    };
+    const gateway = new NetGatewayDO(gState.state, gEnv);
+    await call(gateway, gEnv, "/pull", { scope: SCOPE, destination: `scope:${SCOPE}` });
+
+    const result = await call<TurnBody>(gateway, gEnv, "/turn", turnRequest(bumpCall("turn-timeout-1"), "timeout-t1"));
+    expect(result.reply.status).toBe("accepted");
+    expect(result.replayed).toBe(true);
+    expect(submitCalls).toBe(2);
+    const head = await call<{ head: { seq: number } }>(scopeDO, scopeEnv, "/head");
+    expect(head.head.seq).toBe(1);
+
+    close();
+    gState.close();
+  });
+
+  it("a second submit deadline surfaces namedly as 503 without a third submit", async () => {
+    const { scopeDO, scopeEnv, bumpCall, close } = await seededScope();
+    let submitCalls = 0;
+    const wedgedReplyStub = {
+      fetch: async (request: Request) => {
+        const response = await scopeDO.fetch(request);
+        if (new URL(request.url).pathname === "/net/submit") {
+          submitCalls += 1;
+          return await new Promise<Response>(() => {});
+        }
+        return response;
+      }
+    };
+    const gState = netState("gateway-submit-deadline-terminal");
+    const gEnv: NetGatewayEnv = {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_RPC_TIMEOUT_MS: "20",
+      NET_RESOLVE: () => wedgedReplyStub
+    };
+    const gateway = new NetGatewayDO(gState.state, gEnv);
+    await call(gateway, gEnv, "/pull", { scope: SCOPE, destination: `scope:${SCOPE}` });
+
+    const { status, body } = await callRaw<{ error: { code: string; detail: Record<string, unknown> } }>(
+      gateway,
+      gEnv,
+      "/turn",
+      turnRequest(bumpCall("turn-timeout-2"), "timeout-t2")
+    );
+    expect(status).toBe(503);
+    expect(body.error).toMatchObject({ code: "E_RPC_TIMEOUT", detail: { route: "/submit" } });
+    expect(submitCalls).toBe(2);
     const head = await call<{ head: { seq: number } }>(scopeDO, scopeEnv, "/head");
     expect(head.head.seq).toBe(1);
 

@@ -266,17 +266,24 @@ item; what remains is exactly what the workerd lanes cannot prove
   apikey requests hash a stable credential key; anonymous guest/bootstrap
   requests distribute using edge entropy. Hints outside the configured set
   are ignored so untrusted ids cannot instantiate arbitrary named DOs.
+- **RPC and queue deadlines — BUILT after the first deployed canary.**
+  Every coherence-layer cross-DO fetch is aborted after
+  `NET_RPC_TIMEOUT_MS` (5 s in the deployment profile) and surfaces as
+  `503 E_RPC_TIMEOUT`. A timed-out submit remains ambiguous: the gateway
+  performs exactly one same-key replay before surfacing the timeout, so a
+  lost accepted reply cannot cause a second commit. Turns waiting behind
+  one planning scope refuse as `503 E_BUDGET` after
+  `NET_TURN_QUEUE_WAIT_MS` (1.5 s) and are skipped before execution; depth
+  and aggregate caps remain in force while expired entries drain.
 - **Second-review scale caps — RECORDED, NOT BUILT** (accepted findings
   9/11/12 residuals, required before public traffic beyond the bake):
   each `/net-api` gateway durably accumulates every cell visited by its
-  sessions
-  and cold-hydrates its whole store (shard by session/actor, bound the
+  sessions and cold-hydrates its whole store (bound the
   derived cache, evict unsubscribed scopes with revision-safe re-pull);
   identity is centralized (one `api_keys` cell, O(accounts) email scan,
   the 8 MiB seed partition as an eventual ceiling — hashed
-  credential/account index authorities are the design); RPCs have no
-  deadline/cancellation (the per-turn budget is checked between calls,
-  not during one); guest capacity is the fixed installed pool
+  credential/account index authorities are the design); guest capacity is
+  the fixed installed pool
   (owner-sequenced guest CREATION is the follow-up; close/release and
   named exhaustion exist).
 - **Deployed canary — DIAGNOSTIC RUN COMPLETE; ACCEPTANCE RERUN

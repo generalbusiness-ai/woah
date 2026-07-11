@@ -14,6 +14,7 @@
  * stubs, env shapes, and internal-auth. src/net/ must never import it.
  */
 import type { Host } from "../../net/host";
+import { netError } from "../../net/errors";
 import { signInternalRequest, type InternalAuthEnv } from "../internal-auth";
 
 /**
@@ -21,11 +22,13 @@ import { signInternalRequest, type InternalAuthEnv } from "../internal-auth";
  * kickoff: "no new flags" — fault config is test-env-only, applied at
  * the Host.rpc seam, CO7). Shape:
  *
- *   { "<routeSuffix>": { "latency_ms"?: number, "error"?: string | true,
+ *   { "<routeSuffix>": { "latency_ms"?: number, "timeout"?: boolean,
+ *                        "error"?: string | true,
  *                        "kill_after_commit"?: boolean } }
  *
  * A spec matches when the rpc route equals or ends with the suffix.
  * - latency_ms: sleep before the call (models cross-colo latency);
+ * - timeout: park until the configured RPC deadline aborts the call;
  * - error: throw before the call ever leaves (models a dead peer);
  * - kill_after_commit: perform the call — the destination commits
  *   durably — then throw before the reply reaches the caller (models
@@ -33,6 +36,7 @@ import { signInternalRequest, type InternalAuthEnv } from "../internal-auth";
  */
 export type NetFaultSpec = {
   latency_ms?: number;
+  timeout?: boolean;
   error?: string | boolean;
   kill_after_commit?: boolean;
   /** Let the first N matching calls through unfaulted — how a lane arms a
@@ -45,6 +49,8 @@ export type NetFaults = Record<string, NetFaultSpec>;
 
 export type WorkerdHostEnv = InternalAuthEnv & {
   WOO_NET_FAULTS?: string;
+  /** Hard deadline for every coherence-layer cross-DO call. */
+  NET_RPC_TIMEOUT_MS?: string;
   // Deployed-environment marker: WOO_AE_DATASET is set only by the
   // deploy configs (guard:smoke-wrangler lists it PROD_ONLY; the local
   // workerd lanes strip the Analytics Engine surface entirely). Fault
@@ -222,35 +228,64 @@ export class WorkerdHost implements Host {
     if (fault?.error) {
       throw new Error(`injected fault: ${typeof fault.error === "string" ? fault.error : `rpc error on ${route}`}`);
     }
-    if (fault?.latency_ms) {
-      await new Promise((resolve) => setTimeout(resolve, fault.latency_ms));
-    }
+    const timeoutMs = this.rpcTimeoutMs();
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const started = Date.now();
+    try {
+      if (fault?.latency_ms) await waitForAbortableDelay(fault.latency_ms, controller.signal);
+      if (fault?.timeout) await waitForAbort(controller.signal);
 
-    const stub = this.options.resolve(destination);
-    // The hostname is a placeholder — DO stubs ignore it; internal-auth
-    // signs method + path + headers, not the origin.
-    const url = `https://do/net${route}`;
-    const request =
-      body === undefined
-        ? new Request(url)
-        : new Request(url, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify(body)
-          });
-    const signed = await signInternalRequest(this.options.env, request);
-    const response = await stub.fetch(signed);
+      const stub = this.options.resolve(destination);
+      // The hostname is a placeholder — DO stubs ignore it; internal-auth
+      // signs method + path + headers, not the origin.
+      const url = `https://do/net${route}`;
+      const request =
+        body === undefined
+          ? new Request(url)
+          : new Request(url, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify(body)
+            });
+      const signed = await signInternalRequest(this.options.env, request);
+      // Real fetch observes the signal and cancels its subrequest. The
+      // explicit race also makes fake stubs and pre-call faults settle at
+      // the same deadline instead of leaving the caller parked forever.
+      const response = await raceAbort(stub.fetch(new Request(signed, { signal: controller.signal })), controller.signal);
 
-    if (fault?.kill_after_commit) {
-      // The destination has durably committed; the caller "dies" before
-      // seeing the reply. Recovery is the CO2.5 idempotent resubmit.
-      throw new Error(`injected fault: kill_after_commit after ${route}`);
+      if (fault?.kill_after_commit) {
+        // The destination has durably committed; the caller "dies" before
+        // seeing the reply. Recovery is the CO2.5 idempotent resubmit.
+        throw new Error(`injected fault: kill_after_commit after ${route}`);
+      }
+      if (!response.ok) {
+        const text = await response.text().catch(() => "");
+        throw new Error(`rpc ${destination}${route} failed: ${response.status} ${text}`.trim());
+      }
+      return await raceAbort(response.json(), controller.signal);
+    } catch (err) {
+      if (controller.signal.aborted) {
+        console.log(
+          "woo.metric",
+          JSON.stringify({ kind: "net_rpc", destination, route, status: "timeout", ms: Date.now() - started, timeout_ms: timeoutMs, ts: Date.now() })
+        );
+        throw netError("E_RPC_TIMEOUT", `rpc timed out: ${destination}${route}`, {
+          destination,
+          route,
+          timeout_ms: timeoutMs
+        });
+      }
+      throw err;
+    } finally {
+      clearTimeout(timeout);
     }
-    if (!response.ok) {
-      const text = await response.text().catch(() => "");
-      throw new Error(`rpc ${destination}${route} failed: ${response.status} ${text}`.trim());
-    }
-    return response.json();
+  }
+
+  private rpcTimeoutMs(): number {
+    const configured = Number(this.options.env.NET_RPC_TIMEOUT_MS);
+    if (!Number.isFinite(configured) || configured <= 0) return 5_000;
+    return Math.min(30_000, Math.max(10, Math.floor(configured)));
   }
 
   private faultFor(route: string): NetFaultSpec | null {
@@ -265,4 +300,25 @@ export class WorkerdHost implements Host {
     }
     return null;
   }
+}
+
+function waitForAbort(signal: AbortSignal): Promise<never> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+}
+
+async function waitForAbortableDelay(ms: number, signal: AbortSignal): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      new Promise<void>((resolve) => { timer = setTimeout(resolve, ms); }),
+      waitForAbort(signal)
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+async function raceAbort<T>(value: Promise<T> | T, signal: AbortSignal): Promise<T> {
+  return await Promise.race([Promise.resolve(value), waitForAbort(signal)]);
 }

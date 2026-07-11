@@ -20,6 +20,8 @@ export type NetErrorCode =
   | "E_SCOPE_SPLIT"    // write set spans two distinct shared scopes (CO2.3)
   | "E_LINEAGE"        // transfer lacking lineage closure — cannot occur by construction; assert
   | "E_BUDGET"         // repair budget exhausted; carries the attempt trace
+  | "E_RPC_TIMEOUT"    // a cross-authority call exceeded its transport deadline;
+                       // submit ambiguity is resolved before this surfaces
   | "E_SEED_LAG"       // KV seed behind scope head; informational
   | "E_EPOCH_MISMATCH"  // durable catalog epochs genuinely disagree (M9): a seed
                         // against a scope seeded at another epoch, or a turn whose
@@ -41,6 +43,7 @@ export const NET_ERROR_RECOVERY: Record<NetErrorCode, string> = {
   E_SCOPE_SPLIT: "terminal; named limitation until CA10",
   E_LINEAGE: "cannot occur by construction (CO7); assert/alarm",
   E_BUDGET: "terminal; reply carries the attempt trace",
+  E_RPC_TIMEOUT: "terminal for this request; retry with the same idempotency key",
   E_SEED_LAG: "informational; consumer proceeds via head-check",
   E_EPOCH_MISMATCH: "terminal; catalog install/migration must reconcile the epochs (operator concern)",
   E_SEED_COMMITTED: "terminal; a committed scope is never reseeded — a fresh namespace is the recovery (operator concern)"

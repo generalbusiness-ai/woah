@@ -494,7 +494,7 @@ async function main(): Promise<number> {
     const trace = error?.attempts ?? [];
     step(
       "faulted closure exhausts to E_BUDGET with taxonomy trace",
-      outcome.status === 400 && error?.code === "E_BUDGET" && trace.length >= 1 &&
+      outcome.status === 503 && error?.code === "E_BUDGET" && trace.length >= 1 &&
         trace.every((entry) => typeof entry.code === "string" && entry.code.startsWith("E_")),
       `code=${error?.code} trace=${trace.map((t) => t.code).join(",")}`
     );

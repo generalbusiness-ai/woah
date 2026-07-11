@@ -18,6 +18,7 @@ const ALL_CODES: NetErrorCode[] = [
   "E_SCOPE_SPLIT",
   "E_LINEAGE",
   "E_BUDGET",
+  "E_RPC_TIMEOUT",
   "E_SEED_LAG",
   "E_EPOCH_MISMATCH",
   "E_SEED_COMMITTED"
@@ -38,6 +39,7 @@ describe("net divergence taxonomy (CO6)", () => {
     // Terminal + informational codes are not retryable turn mechanics.
     expect(isRetryable(netError("E_SCOPE_SPLIT", "x"))).toBe(false);
     expect(isRetryable(netError("E_BUDGET", "x"))).toBe(false);
+    expect(isRetryable(netError("E_RPC_TIMEOUT", "x"))).toBe(false);
     expect(isRetryable(netError("E_LINEAGE", "x"))).toBe(false);
     expect(isRetryable(netError("E_SEED_LAG", "x"))).toBe(false);
     // M9: a genuine durable-epoch disagreement is terminal — retrying it

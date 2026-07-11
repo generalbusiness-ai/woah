@@ -17,6 +17,7 @@ import { describe, expect, it } from "vitest";
 import { FakeDurableObjectState } from "./fake-do";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
+import { WorkerdHost } from "../../src/worker/net/workerd-host";
 import { signInternalRequest } from "../../src/worker/internal-auth";
 import { installVerb } from "../../src/core/authoring";
 import { createWorld } from "../../src/core/bootstrap";
@@ -264,5 +265,87 @@ describe("NC8b: the per-turn RPC budget and parallel-group mechanics (TurnStruct
     ).rejects.toMatchObject({ code: "E_BUDGET" });
     expect(issued).toBe(0);
     expect(structure.sync_rpc).toBe(30);
+  });
+});
+
+describe("NC8 queue wait deadline", () => {
+  it("refuses a queued turn on time and skips it when the predecessor releases", async () => {
+    const gatewayState = netState("gateway-queue-deadline");
+    const gateway = new NetGatewayDO(gatewayState.state, {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_TURN_QUEUE_WAIT_MS: "20"
+    });
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let executions = 0;
+    const internals = gateway as unknown as {
+      turn(request: { planningScope: string }): Promise<unknown>;
+      turnUnqueued(request: { planningScope: string }, queueMs: number): Promise<unknown>;
+    };
+    // Isolate the serializer from planning: the first execution parks;
+    // the second must time out in the queue and never call turnUnqueued.
+    internals.turnUnqueued = async () => {
+      executions += 1;
+      if (executions === 1) await firstGate;
+      return { ok: true };
+    };
+
+    const request = { planningScope: "room:hot" };
+    const first = internals.turn(request);
+    await Promise.resolve();
+    const started = Date.now();
+    await expect(internals.turn(request)).rejects.toMatchObject({
+      code: "E_BUDGET",
+      detail: { reason: "queue_wait", limit_ms: 20 }
+    });
+    expect(Date.now() - started).toBeLessThan(500);
+    releaseFirst();
+    await first;
+    await Promise.resolve();
+    expect(executions).toBe(1);
+    gatewayState.close();
+  });
+});
+
+describe("net RPC deadline", () => {
+  it("aborts a hanging cross-DO fetch and surfaces E_RPC_TIMEOUT", async () => {
+    let signal: AbortSignal | undefined;
+    const host = new WorkerdHost({
+      env: { WOO_INTERNAL_SECRET: SECRET, NET_RPC_TIMEOUT_MS: "20" },
+      resolve: () => ({
+        fetch: (request) => {
+          signal = request.signal;
+          return new Promise<Response>(() => {});
+        }
+      })
+    });
+
+    const started = Date.now();
+    await expect(host.rpc("scope:wedged", "/head")).rejects.toMatchObject({
+      code: "E_RPC_TIMEOUT",
+      detail: { destination: "scope:wedged", route: "/head", timeout_ms: 20 }
+    });
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(signal?.aborted).toBe(true);
+  });
+
+  it("uses the same deadline for a deterministic pre-call timeout fault", async () => {
+    let called = false;
+    const host = new WorkerdHost({
+      env: {
+        WOO_INTERNAL_SECRET: SECRET,
+        NET_RPC_TIMEOUT_MS: "20",
+        WOO_NET_FAULTS: JSON.stringify({ "/submit": { timeout: true } })
+      },
+      resolve: () => ({
+        fetch: () => {
+          called = true;
+          return new Response("{}");
+        }
+      })
+    });
+
+    await expect(host.rpc("scope:wedged", "/submit", {})).rejects.toMatchObject({ code: "E_RPC_TIMEOUT" });
+    expect(called).toBe(false);
   });
 });

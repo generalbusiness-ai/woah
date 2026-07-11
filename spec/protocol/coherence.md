@@ -287,11 +287,14 @@ divergence. Tail metrics count by code.
 | `E_SCOPE_SPLIT` | write set spans two distinct shared scopes (CO2.3) | terminal; named limitation until CA10 |
 | `E_LINEAGE` | transfer lacking lineage closure | cannot occur by construction (CO7); assert/alarm |
 | `E_BUDGET` | repair budget exhausted | terminal; reply carries the attempt trace (each attempt's taxonomy code) |
+| `E_RPC_TIMEOUT` | a cross-authority RPC exceeded its deadline | terminal for this request; retry with the same idempotency key; an ambiguous submit is first disambiguated by one same-key replay |
 | `E_SEED_LAG` | KV seed behind scope head | informational; consumer proceeds via head-check |
 | `E_EPOCH_MISMATCH` | durable catalog epochs genuinely disagree: a seed against a scope seeded at another epoch, or a turn whose stamp still differs from the scope's durable epoch AFTER the CO8 reseed | terminal; catalog install/migration reconciles (operator concern), never a retry treadmill |
+| `E_SEED_COMMITTED` | a seed targets a scope that has already committed turns | terminal; recover into a fresh namespace rather than resetting authority under an unchanged head |
 
 Retryable codes are turn mechanics and never user-visible as failures;
-terminal codes surface to the caller with their trace.
+terminal codes surface to the caller with structured detail and an attempt
+trace where repair rounds occurred.
 
 ## CO7. Envelope and transfer discipline
 

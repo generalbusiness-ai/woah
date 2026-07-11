@@ -127,6 +127,8 @@ export type NetGatewayEnv = NetBindingsEnv & {
    * path and on unit fixtures that wire subscribers by hand — where
    * self-subscribe is a no-op (backward compatible). */
   NET_GATEWAY_SELF?: string;
+  /** Maximum time an admitted turn may wait behind its planning scope. */
+  NET_TURN_QUEUE_WAIT_MS?: string;
 };
 
 function sqlRows<T>(cursor: unknown): T[] {
@@ -409,6 +411,12 @@ const VERDICT_CODE: Partial<Record<RejectReason, NetErrorCode>> = {
   post_state_mismatch: "E_READ_VERSION"
 };
 
+/** Capacity and transport refusals are retryable by the caller with the
+ * same idempotency key; protocol/input failures remain request errors. */
+function netErrorHttpStatus(error: NetError): number {
+  return error.code === "E_BUDGET" || error.code === "E_RPC_TIMEOUT" ? 503 : 400;
+}
+
 /** `<kind>:<object>[:<name>]` → object (object ids never contain ':'). */
 function objectOfCellKey(key: string): string {
   return key.split(":")[1] ?? "";
@@ -633,7 +641,7 @@ export class NetGatewayDO {
               ...(err.attempts ? { attempts: err.attempts } : {})
             }
           },
-          400
+          netErrorHttpStatus(err)
         );
       }
       // Plain-Error escapes after failed repair rounds carry the trace
@@ -777,6 +785,12 @@ export class NetGatewayDO {
   private turnQueueTotal = 0;
   private static readonly MAX_TURN_QUEUE_TOTAL = 256;
 
+  private turnQueueWaitMs(): number {
+    const configured = Number(this.env.NET_TURN_QUEUE_WAIT_MS);
+    if (!Number.isFinite(configured) || configured <= 0) return 1_500;
+    return Math.min(30_000, Math.max(10, Math.floor(configured)));
+  }
+
   private turn(request: TurnRequest): Promise<TurnResult> {
     const key = request.planningScope;
     const depth = this.turnQueueDepth.get(key) ?? 0;
@@ -797,20 +811,52 @@ export class NetGatewayDO {
     this.turnQueueDepth.set(key, depth + 1);
     const queuedAt = Date.now();
     const tail = this.turnQueues.get(key) ?? Promise.resolve();
-    const run = tail.then(
-      () => this.turnUnqueued(request, Date.now() - queuedAt),
-      () => this.turnUnqueued(request, Date.now() - queuedAt) // a predecessor's failure never gates a successor
+    const maxWaitMs = this.turnQueueWaitMs();
+    let started = false;
+    let expired = false;
+    let waitTimer: ReturnType<typeof setTimeout> | undefined;
+    const queueTimeout = new Promise<never>((_resolve, reject) => {
+      waitTimer = setTimeout(() => {
+        if (started) return;
+        expired = true;
+        const queueMs = Date.now() - queuedAt;
+        console.log(
+          "woo.metric",
+          JSON.stringify({ kind: "net_turn_queue_refused", scope: key, queue_ms: queueMs, limit_ms: maxWaitMs, ts: Date.now() })
+        );
+        reject(netError("E_BUDGET", "turn queue wait exceeded; retry with the same idempotency key", {
+          scope: key,
+          queue_ms: queueMs,
+          limit_ms: maxWaitMs,
+          reason: "queue_wait"
+        }));
+      }, maxWaitMs);
+    });
+    const execute = async (): Promise<TurnResult> => {
+      if (expired) throw netError("E_BUDGET", "expired turn skipped before execution", { scope: key, reason: "queue_wait" });
+      started = true;
+      if (waitTimer !== undefined) clearTimeout(waitTimer);
+      return this.turnUnqueued(request, Date.now() - queuedAt);
+    };
+    const execution = tail.then(
+      execute,
+      execute // a predecessor's failure never gates a successor
     );
+    const run = Promise.race([execution, queueTimeout]);
     const release = () => {
+      if (waitTimer !== undefined) clearTimeout(waitTimer);
       this.turnQueueTotal = Math.max(0, this.turnQueueTotal - 1);
       const remaining = (this.turnQueueDepth.get(key) ?? 1) - 1;
       if (remaining <= 0) this.turnQueueDepth.delete(key);
       else this.turnQueueDepth.set(key, remaining);
     };
-    void run.then(release, release);
+    // Keep expired entries counted until their predecessor settles and
+    // their no-op executes. Otherwise a wedged predecessor could admit an
+    // unbounded series of timed-out closures behind the aggregate cap.
+    void execution.then(release, release);
     // Park the settled marker (not the result) so a rejection is not
     // re-observed as unhandled from the queue's copy.
-    const settled = run.then(
+    const settled = execution.then(
       () => undefined,
       () => undefined
     );
@@ -1582,7 +1628,7 @@ export class NetGatewayDO {
               ...(err.attempts ? { attempts: err.attempts } : {})
             }
           },
-          400
+          netErrorHttpStatus(err)
         );
       }
       return json({ error: { code: "E_INTERNAL", message: String(err) } }, 500);
