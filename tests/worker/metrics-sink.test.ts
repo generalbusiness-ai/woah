@@ -42,6 +42,23 @@ const SLOT_SOURCE = 17;
 const DBL_MS = 0;
 const DBL_SAMPLE_RATE = 1;
 const DBL_COUNT = 2;
+const DBL_QUEUE_MS = 3;
+const DBL_WALL_MS = 4;
+const DBL_RPC_MS = 5;
+const DBL_RPC_MAX_MS = 6;
+const DBL_RPC_DEPTH = 7;
+const DBL_SYNC_RPC = 8;
+const DBL_ATTEMPT = 9;
+const DBL_RECONSTRUCTIONS = 10;
+const DBL_PLAN_CELLS = 11;
+const DBL_ENVELOPE_BYTES = 12;
+const DBL_OUTBOX_ENQUEUED = 13;
+const DBL_DELIVERED = 14;
+const DBL_FAILED = 15;
+const DBL_ABANDONED = 16;
+const DBL_AUDIENCE = 17;
+const DBL_FRAMES = 18;
+const DBL_PRESENCE_SCAN_ROWS = 19;
 
 describe("metrics-sink", () => {
   describe("shouldDropForAnalytics", () => {
@@ -128,10 +145,62 @@ describe("metrics-sink", () => {
       expect(point.blobs?.[SLOT_VERB]).toBe("");
       expect(point.blobs?.[SLOT_ERROR_DETAIL]).toBe("");
 
-      expect(point.doubles).toHaveLength(3);
+      expect(point.doubles).toHaveLength(20);
       expect(point.doubles?.[DBL_MS]).toBe(12);
       expect(point.doubles?.[DBL_SAMPLE_RATE]).toBe(1);
       expect(point.doubles?.[DBL_COUNT]).toBe(0);
+    });
+
+    it("appends the complete net readiness envelope without moving legacy slots", () => {
+      const { binding, calls } = fakeAnalytics();
+      writeMetricToAnalytics({
+        kind: "net_turn_structure",
+        scope: "room:the_chatroom",
+        status: "ok",
+        queue_ms: 9,
+        wall_ms: 185,
+        rpc_ms: 170,
+        rpc_max_ms: 91,
+        rpc_depth: 3,
+        sync_rpc: 4,
+        attempt: 1,
+        reconstructions: 0,
+        plan_cells: 714,
+        envelope_bytes: 8192
+      }, "net-gateway:net-api-3", binding);
+
+      const point = calls[0]!;
+      expect(point.indexes).toEqual(["net-gateway:net-api-3"]);
+      expect(point.blobs?.[SLOT_KIND]).toBe("net_turn_structure");
+      expect(point.blobs?.[SLOT_SCOPE]).toBe("room:the_chatroom");
+      expect(point.doubles?.[DBL_MS]).toBe(0);
+      expect(point.doubles?.[DBL_SAMPLE_RATE]).toBe(1);
+      expect(point.doubles?.[DBL_QUEUE_MS]).toBe(9);
+      expect(point.doubles?.[DBL_WALL_MS]).toBe(185);
+      expect(point.doubles?.[DBL_RPC_MS]).toBe(170);
+      expect(point.doubles?.[DBL_RPC_MAX_MS]).toBe(91);
+      expect(point.doubles?.[DBL_RPC_DEPTH]).toBe(3);
+      expect(point.doubles?.[DBL_SYNC_RPC]).toBe(4);
+      expect(point.doubles?.[DBL_ATTEMPT]).toBe(1);
+      expect(point.doubles?.[DBL_RECONSTRUCTIONS]).toBe(0);
+      expect(point.doubles?.[DBL_PLAN_CELLS]).toBe(714);
+      expect(point.doubles?.[DBL_ENVELOPE_BYTES]).toBe(8192);
+    });
+
+    it("maps submit, outbox, and push capacity fields into dedicated slots", () => {
+      const { binding, calls } = fakeAnalytics();
+      writeMetricToAnalytics({ kind: "net_scope_submit", scope: "room:x", ms: 4, outbox_enqueued: 7 }, "net-scope:room:x", binding);
+      writeMetricToAnalytics({ kind: "net_scope_outbox_drain_pass", delivered: 5, failed: 1, abandoned: 2 }, "net-scope:room:x", binding);
+      writeMetricToAnalytics({ kind: "net_push", audience: 12, frames: 11 }, "net-gateway:net-api-0", binding);
+      writeMetricToAnalytics({ kind: "net_presence_scan", presence_scan_rows: 12 }, "net-gateway:net-api-0", binding);
+
+      expect(calls[0]!.doubles?.[DBL_OUTBOX_ENQUEUED]).toBe(7);
+      expect(calls[1]!.doubles?.[DBL_DELIVERED]).toBe(5);
+      expect(calls[1]!.doubles?.[DBL_FAILED]).toBe(1);
+      expect(calls[1]!.doubles?.[DBL_ABANDONED]).toBe(2);
+      expect(calls[2]!.doubles?.[DBL_AUDIENCE]).toBe(12);
+      expect(calls[2]!.doubles?.[DBL_FRAMES]).toBe(11);
+      expect(calls[3]!.doubles?.[DBL_PRESENCE_SCAN_ROWS]).toBe(12);
     });
 
     it("populates target+verb for direct_call so dashboard drill-in works", () => {

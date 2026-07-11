@@ -20,12 +20,32 @@ const PASSWORD = "correct horse battery staple";
 
 function netState(name: string) {
   const fake = new FakeDurableObjectState(name);
+  const pending = new Set<Promise<unknown>>();
   const state: NetScopeDurableState & NetGatewayDurableState = {
     id: fake.id,
-    waitUntil: () => {},
+    waitUntil: (promise) => {
+      pending.add(promise);
+      void promise.finally(() => pending.delete(promise));
+    },
     storage: { sql: fake.storage.sql, transactionSync: fake.storage.transactionSync, setAlarm: () => {}, deleteAlarm: () => {} }
   };
-  return { state, close: () => fake.close() };
+  return {
+    state,
+    pending: () => [...pending],
+    close: () => fake.close()
+  };
+}
+
+async function closeStates(states: Array<ReturnType<typeof netState>>): Promise<void> {
+  // One DO's drain calls another DO and can schedule work there after that
+  // peer looked idle. Quiesce the whole fake namespace before closing any
+  // database; per-DO concurrent teardown races the cross-DO outbox.
+  while (true) {
+    const pending = states.flatMap((state) => state.pending());
+    if (pending.length === 0) break;
+    await Promise.allSettled(pending);
+  }
+  for (const state of states) state.close();
 }
 
 /** The EXACT core encoding (world.ts hashPassword): the test mints a real
@@ -119,7 +139,7 @@ async function buildDoorHarness() {
     return { status: response.status, body: (await response.json()) as Record<string, unknown> };
   };
 
-  return { plan, human, api, close: () => states.forEach((st) => st.close()) };
+  return { plan, human, api, close: async () => closeStates(states) };
 }
 
 describe("the identity door (/net-api/login, /net-api/guest, session bearers)", () => {
@@ -167,7 +187,7 @@ describe("the identity door (/net-api/login, /net-api/guest, session bearers)", 
     expect(badBearer.status).toBe(401);
     expect((badBearer.body.error as { detail?: { reason?: string } }).detail?.reason).toBe("session_bearer_rejected");
 
-    h.close();
+    await h.close();
   }, 30_000);
 
   it("deactivated identities STAY deactivated across the carry (reviewer finding 2): password and apikey both refuse", async () => {
@@ -238,7 +258,7 @@ describe("the identity door (/net-api/login, /net-api/guest, session bearers)", 
     expect(((await mint.json()) as { error: { detail?: { reason?: string } } }).error.detail?.reason).toBe(
       "identity_deactivated"
     );
-    states.forEach((st) => st.close());
+    await closeStates(states);
   }, 30_000);
 
   it("V3 finding 7: oversized credentials refuse before any derivation, and an over-ceiling hash never verifies", async () => {
@@ -253,7 +273,7 @@ describe("the identity door (/net-api/login, /net-api/guest, session bearers)", 
     // upper ceiling, mirroring the lower floor — fail closed).
     const overCeiling = `pbkdf2-sha256:99000000:${"0".repeat(32)}:${"0".repeat(64)}`;
     expect(await verifyPasswordCredential("whatever", overCeiling)).toBe(false);
-    h.close();
+    await h.close();
   }, 30_000);
 
   it("V3 finding 3: mint mirrors core actorCanAuthenticate — deactivated ACTOR and deactivated AGENT-OWNER both refuse", async () => {
@@ -321,7 +341,7 @@ describe("the identity door (/net-api/login, /net-api/guest, session bearers)", 
     expect(((await deactivatedOwner.json()) as { error: { detail?: { reason?: string } } }).error.detail?.reason).toBe(
       "identity_deactivated"
     );
-    states.forEach((st) => st.close());
+    await closeStates(states);
   }, 30_000);
 
   it("guest claims are exclusive and overflow provisions a fresh owner-sequenced actor", async () => {
@@ -366,7 +386,7 @@ describe("the identity door (/net-api/login, /net-api/guest, session bearers)", 
     expect(turn.status, JSON.stringify(turn.body).slice(0, 300)).toBe(200);
     expect((turn.body.reply as { status?: string }).status).toBe("accepted");
 
-    h.close();
+    await h.close();
   }, 30_000);
 
   it("logout releases the seat (finding 12): close → the SAME seat is claimable again", async () => {
@@ -400,6 +420,6 @@ describe("the identity door (/net-api/login, /net-api/guest, session bearers)", 
       body: { target: "the_chatroom", verb: "say", args: ["boo"], idempotency_key: "door-zombie-1" }
     });
     expect(zombie.status).toBe(401);
-    h.close();
+    await h.close();
   }, 30_000);
 });

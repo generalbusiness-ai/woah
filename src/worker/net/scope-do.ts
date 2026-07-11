@@ -83,6 +83,7 @@ import type { ScopeMeta, ScopeStore, TailEntry } from "../../net/scope-store";
 import type { CommitReply } from "../../net/scope";
 import { netCellKeyFor } from "../../net/transcript";
 import { verifyInternalRequest } from "../internal-auth";
+import { emitMetric, type AnalyticsMetric } from "../metrics-sink";
 import { resolveNetDestination, WorkerdHost, type NetBindingsEnv } from "./workerd-host";
 
 /** The structural slice of DurableObjectState this DO uses. Matches the
@@ -600,8 +601,16 @@ export class NetScopeDO {
       resolve: (destination) => resolveNetDestination(this.env, destination),
       env,
       waitUntil: state.waitUntil?.bind(state),
-      alarmStorage: state.storage
+      alarmStorage: state.storage,
+      metric: (event) => this.metric(event)
     });
+  }
+
+  /** Scope ids are named from the authority scope. Keeping that name as the
+   * AE index isolates adaptive sampling and makes hot authorities visible. */
+  private metric(event: AnalyticsMetric): void {
+    const name = (this.state.id as { name?: unknown } | null | undefined)?.name;
+    emitMetric(event, `net-scope:${typeof name === "string" && name.length > 0 ? name : "unnamed"}`, this.env.METRICS);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -683,18 +692,14 @@ export class NetScopeDO {
         if (reply.status === "accepted" && reply.touched.some((key) => key.startsWith("session:"))) {
           this.armSessionReapAlarm(seq);
         }
-        console.log(
-          "woo.metric",
-          JSON.stringify({
-            kind: "net_scope_submit",
-            scope: seq.scope,
-            status: reply.status,
-            ...(reply.status === "accepted" ? { seq: reply.head.seq, touched: reply.touched.length } : { reason: reply.reason }),
-            outbox_enqueued: this.outboxEnqueuedTotal - enqueuedBefore,
-            ms: Date.now() - submitStarted,
-            ts: Date.now()
-          })
-        );
+        this.metric({
+          kind: "net_scope_submit",
+          scope: seq.scope,
+          status: reply.status,
+          ...(reply.status === "accepted" ? { seq: reply.head.seq, touched: reply.touched.length } : { reason: reply.reason }),
+          outbox_enqueued: this.outboxEnqueuedTotal - enqueuedBefore,
+          ms: Date.now() - submitStarted
+        });
         return json(reply);
       }
       if (request.method === "POST" && url.pathname === "/net/subscribe") {
@@ -943,18 +948,15 @@ export class NetScopeDO {
         // The specified no-planner state (CO16): rows stay parked, one
         // named metric per due turn (bounded by the batch) per firing.
         for (const turn of due) {
-          console.log(
-            "woo.metric",
-            JSON.stringify({
-              kind: "net_scope_scheduled_turn_fired",
-              scope: seq.scope,
-              id: turn.id,
-              at_logical_time: turn.at_logical_time,
-              fired_at: now,
-              note: "parked: no planner-role subscriber registered (CO16); row retained",
-              ts: Date.now()
-            })
-          );
+          this.metric({
+            kind: "net_scope_scheduled_turn_fired",
+            scope: seq.scope,
+            id: turn.id,
+            at_logical_time: turn.at_logical_time,
+            fired_at: now,
+            reason: "no_planner",
+            note: "parked: no planner-role subscriber registered (CO16); row retained"
+          });
         }
       } else {
         // Narrowed copy for the closures below (TS loses a `let`'s
@@ -982,21 +984,17 @@ export class NetScopeDO {
           })
         );
         for (const turn of due) {
-          console.log(
-            "woo.metric",
-            JSON.stringify({
-              kind: "net_scope_scheduled_turn_dispatched",
-              scope: seq.scope,
-              id: turn.id,
-              at_logical_time: turn.at_logical_time,
-              fired_at: now,
-              // NC8a scheduler-lag series: how far past due the dispatch
-              // ran (alarm backlog / contention shows up here first).
-              lag_ms: Math.max(0, now - turn.at_logical_time),
-              planner,
-              ts: Date.now()
-            })
-          );
+          this.metric({
+            kind: "net_scope_scheduled_turn_dispatched",
+            scope: seq.scope,
+            id: turn.id,
+            at_logical_time: turn.at_logical_time,
+            fired_at: now,
+            // NC8a scheduler-lag series: how far past due the dispatch
+            // ran (alarm backlog / contention shows up here first).
+            lag_ms: Math.max(0, now - turn.at_logical_time),
+            planner
+          });
         }
         this.host.defer(() => this.drainOutbox());
       }
@@ -1080,15 +1078,11 @@ export class NetScopeDO {
       })
     );
     if (result.status === "applied") {
-      console.log(
-        "woo.metric",
-        JSON.stringify({
-          kind: "net_session_reaped",
-          scope: seq.scope,
-          sessions: result.reaped.map((entry) => entry.session),
-          ts: Date.now()
-        })
-      );
+      this.metric({
+        kind: "net_session_reaped",
+        scope: seq.scope,
+        sessions: result.reaped.map((entry) => entry.session)
+      });
       this.host.defer(() => this.drainOutbox());
     }
   }
@@ -1371,17 +1365,13 @@ export class NetScopeDO {
     // Phase 0/4 observability: the load gate's cold-open invariant reads
     // this — a targeted cold-open's cells must track the session's needs,
     // never the scope's size.
-    console.log(
-      "woo.metric",
-      JSON.stringify({
-        kind: "net_scope_closure_served",
-        scope: seq.scope,
-        mode: wantAll ? "full" : objects.length > 0 ? "objects" : "keys",
-        cells: transfer.cells.length,
-        relations: relations?.length ?? 0,
-        ts: Date.now()
-      })
-    );
+    this.metric({
+      kind: "net_scope_closure_served",
+      scope: seq.scope,
+      mode: wantAll ? "full" : objects.length > 0 ? "objects" : "keys",
+      cells: transfer.cells.length,
+      relations: relations?.length ?? 0
+    });
     return {
       ...transfer,
       scope: seq.scope,
@@ -1865,16 +1855,13 @@ export class NetScopeDO {
         });
         deliveredCount += drained.delivered.length;
         for (const failedId of drained.failed) {
-          console.log(
-            "woo.metric",
-            JSON.stringify({
-              kind: "net_scope_outbox_delivery_failed",
-              route,
-              id: failedId,
-              error: deliveryErrors.get(failedId) ?? "unknown",
-              ts: Date.now()
-            })
-          );
+          this.metric({
+            kind: "net_scope_outbox_delivery_failed",
+            route,
+            id: failedId,
+            status: "error",
+            error: deliveryErrors.get(failedId) ?? "unknown"
+          });
         }
         // Write back ONLY the rows this pass attempted (Phase 3): a row
         // skipped for backoff is byte-identical in storage — rewriting it
@@ -1903,17 +1890,15 @@ export class NetScopeDO {
               );
               if (row.status === "abandoned") {
                 abandonedCount += 1;
-                console.log(
-                  "woo.metric",
-                  JSON.stringify({
-                    kind: "net_scope_outbox_abandoned",
-                    route,
-                    id: row.id,
-                    destination: row.destination,
-                    attempts: row.attempts,
-                    ts: Date.now()
-                  })
-                );
+                this.metric({
+                  kind: "net_scope_outbox_abandoned",
+                  route,
+                  id: row.id,
+                  destination: row.destination,
+                  status: "error",
+                  error: "E_OUTBOX_ABANDONED",
+                  attempts: row.attempts
+                });
               }
             }
           }
@@ -1952,19 +1937,15 @@ export class NetScopeDO {
         // Phase 0/CO10 observability for the Phase-3 invariant: rows a
         // pass considered must stay bounded as the backlog grows (the
         // load gate asserts against this).
-        console.log(
-          "woo.metric",
-          JSON.stringify({
-            kind: "net_scope_outbox_drain_pass",
-            route,
-            considered: persisted.length,
-            delivered: drained.delivered.length,
-            failed: drained.failed.length,
-            abandoned: drained.abandoned.length,
-            skipped_backoff: drained.skipped_backoff.length,
-            ts: Date.now()
-          })
-        );
+        this.metric({
+          kind: "net_scope_outbox_drain_pass",
+          route,
+          considered: persisted.length,
+          delivered: drained.delivered.length,
+          failed: drained.failed.length,
+          abandoned: drained.abandoned.length,
+          skipped_backoff: drained.skipped_backoff.length
+        });
     }
     return deliveredCount;
   }
@@ -2085,19 +2066,15 @@ export class NetScopeDO {
         priors: body.prior_versions ?? {}
       });
       for (const conflict of result.conflicts) {
-        console.log(
-          "woo.metric",
-          JSON.stringify({
-            kind: "net_adopt_conflict",
-            scope: seq.scope,
-            from_scope: body.from_scope,
-            seq: body.seq,
-            key: conflict.key,
-            ours: conflict.ours,
-            theirs: conflict.theirs,
-            ts: Date.now()
-          })
-        );
+        this.metric({
+          kind: "net_adopt_conflict",
+          scope: seq.scope,
+          from_scope: body.from_scope,
+          seq: body.seq,
+          key: conflict.key,
+          ours: conflict.ours,
+          theirs: conflict.theirs
+        });
       }
       if (result.status === "applied") {
         // Owner-observer fanout: subscribers receive the adopted cells at

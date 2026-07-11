@@ -71,6 +71,7 @@ import type { CellTransfer } from "../../net/cells";
 import { randomHex } from "../../core/source-hash";
 import { provisionGuestSubmit, type GuestTemplate } from "../../net/guest";
 import { verifyInternalRequest } from "../internal-auth";
+import { emitMetric, type AnalyticsMetric } from "../metrics-sink";
 import { ClientAuthError, MAX_EMAIL_BYTES, MAX_PASSWORD_BYTES, normalizeEmail, parseClientCredential, verifyApiKeyCredential, verifyPasswordCredential } from "./client-auth";
 import { TokenBucketLimiter } from "./rate-limit";
 import { resolveNetDestination, WorkerdHost, type NetBindingsEnv } from "./workerd-host";
@@ -572,8 +573,15 @@ export class NetGatewayDO {
       resolve: (destination) => resolveNetDestination(this.env, destination),
       env,
       waitUntil: state.waitUntil?.bind(state),
-      alarmStorage: state.storage
+      alarmStorage: state.storage,
+      metric: (event) => this.metric(event)
     });
+  }
+
+  /** Stable per-shard AE index. Named DO ids expose their name in workerd
+   * and Cloudflare; the fallback remains bounded for structural fixtures. */
+  private metric(event: AnalyticsMetric): void {
+    emitMetric(event, `net-gateway:${this.shardName() ?? "unnamed"}`, this.env.METRICS);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -705,17 +713,13 @@ export class NetGatewayDO {
         }
         // Seed lags the live head: named, informational (CO6 E_SEED_LAG),
         // and self-healing — the live path below rewrites the seed.
-        console.log(
-          "woo.metric",
-          JSON.stringify({
-            kind: "net_seed_lag",
-            code: "E_SEED_LAG",
-            scope: body.scope,
-            seed_head: seed.head,
-            live_head: live.head,
-            ts: Date.now()
-          })
-        );
+        this.metric({
+          kind: "net_seed_lag",
+          code: "E_SEED_LAG",
+          scope: body.scope,
+          seed_head: seed.head,
+          live_head: live.head
+        });
       }
     }
 
@@ -821,10 +825,7 @@ export class NetGatewayDO {
         if (started) return;
         expired = true;
         const queueMs = Date.now() - queuedAt;
-        console.log(
-          "woo.metric",
-          JSON.stringify({ kind: "net_turn_queue_refused", scope: key, queue_ms: queueMs, limit_ms: maxWaitMs, ts: Date.now() })
-        );
+        this.metric({ kind: "net_turn_queue_refused", scope: key, status: "error", error: "E_BUDGET", queue_ms: queueMs, limit_ms: maxWaitMs });
         reject(netError("E_BUDGET", "turn queue wait exceeded; retry with the same idempotency key", {
           scope: key,
           queue_ms: queueMs,
@@ -878,7 +879,7 @@ export class NetGatewayDO {
       // lane can assert it) and emit it as a metric (so staging emits the
       // evidence CO10 is measured against).
       const report = this.turnStructureReport(result, structure);
-      this.emitTurnStructure(request, report);
+      this.emitTurnStructure(request, report, result.reply.status);
       return { ...result, structure: report };
     } catch (err) {
       // D2: a failed turn still emits its repair-path structure (no reply,
@@ -899,7 +900,7 @@ export class NetGatewayDO {
         rpc_depth: structure.rpc_depth,
         queue_ms: structure.queue_ms,
         wall_ms: Date.now() - structure.started
-      });
+      }, "error", isNetError(err) ? err.code : "E_INTERNAL");
       // Fix 5d: a plain-Error escape (misplan bug, double transport
       // failure) after failed rounds must still explain the convergence
       // shape. NetErrors carry their own trace (E_BUDGET) or are
@@ -936,11 +937,19 @@ export class NetGatewayDO {
     };
   }
 
-  private emitTurnStructure(request: TurnRequest, report: TurnStructureReport): void {
-    console.log(
-      "woo.metric",
-      JSON.stringify({ kind: "net_turn_structure", idempotency_key: request.idempotency_key, ...report, ts: Date.now() })
-    );
+  private emitTurnStructure(
+    request: TurnRequest,
+    report: TurnStructureReport,
+    status: "accepted" | "rejected" | "error",
+    error?: string
+  ): void {
+    this.metric({
+      kind: "net_turn_structure",
+      idempotency_key: request.idempotency_key,
+      status,
+      ...(error ? { error } : {}),
+      ...report
+    });
   }
 
   /**
@@ -1073,16 +1082,12 @@ export class NetGatewayDO {
       if (pinned === null) {
         this.pinScope(request.idempotency_key, planned.selection.scope);
       } else if (pinned !== planned.selection.scope) {
-        console.log(
-          "woo.metric",
-          JSON.stringify({
-            kind: "net_turn_selection_pin_override",
-            idempotency_key: request.idempotency_key,
-            planned: planned.selection.scope,
-            pinned,
-            ts: Date.now()
-          })
-        );
+        this.metric({
+          kind: "net_turn_selection_pin_override",
+          idempotency_key: request.idempotency_key,
+          planned: planned.selection.scope,
+          pinned
+        });
       }
       const destination = this.destinationFor(request, targetScope);
       if (base === null && planningHead !== null && targetScope === request.planningScope) {
@@ -1151,16 +1156,13 @@ export class NetGatewayDO {
             // The stale view self-repairs next turn (read_version_
             // mismatch → targeted refresh). Named + counted.
             installDegraded = true;
-            console.log(
-              "woo.metric",
-              JSON.stringify({
-                kind: "net_turn_install_degraded",
-                scope: reply.scope,
-                touched: reply.touched.length,
-                error: String(err),
-                ts: Date.now()
-              })
-            );
+            this.metric({
+              kind: "net_turn_install_degraded",
+              scope: reply.scope,
+              status: "error",
+              touched: reply.touched.length,
+              error: String(err)
+            });
           }
         }
         // Phase-4 item 1 / B2 fix: replay is decided by the SCOPE, which
@@ -1453,10 +1455,7 @@ export class NetGatewayDO {
       await this.installTouched(view, destination, reply.touched);
     } catch (err) {
       installDegraded = true;
-      console.log(
-        "woo.metric",
-        JSON.stringify({ kind: "net_session_open_install_degraded", scope: clusterScope, error: String(err), ts: Date.now() })
-      );
+      this.metric({ kind: "net_session_open_install_degraded", scope: clusterScope, status: "error", error: String(err) });
     }
     return { reply, scope: clusterScope, value, ...(installDegraded ? { install_degraded: true } : {}) };
   }
@@ -1925,10 +1924,7 @@ export class NetGatewayDO {
       // account with a missing primary_actor is an import bug to fix,
       // not a user typo.
       if (account && verified && !actor) {
-        console.log(
-          "woo.metric",
-          JSON.stringify({ kind: "net_login_unbound_account", account: account.id, ts: Date.now() })
-        );
+        this.metric({ kind: "net_login_unbound_account", status: "error", error: "unbound_account", account: account.id });
       }
       throw new ClientAuthError("invalid email or password", { reason: "password_rejected" });
     }
@@ -2027,13 +2023,11 @@ export class NetGatewayDO {
       await this.installTouched(this.ensureView(), destination, reply.touched);
     } catch (err) {
       installDegraded = true;
-      console.log(
-        "woo.metric",
-        JSON.stringify({ kind: "net_guest_provision_install_degraded", actor, error: String(err), ts: Date.now() })
-      );
+      this.metric({ kind: "net_guest_provision_install_degraded", actor, status: "error", error: String(err) });
     }
     await this.selfSubscribe(planned.clusterScope);
     await this.selfSubscribe(roomScope);
+    this.metric({ kind: "net_guest_provisioned", actor, scope: planned.clusterScope, status: "ok" });
     return json({
       session,
       actor,
@@ -2872,10 +2866,7 @@ export class NetGatewayDO {
     );
     // Load-gate evidence (CO10): rows scanned must track occupants, flat as
     // total off-scope sessions grow.
-    console.log(
-      "woo.metric",
-      JSON.stringify({ kind: "net_presence_scan", scope: body.scope, presence_scan_rows: rows.length, ts: Date.now() })
-    );
+    this.metric({ kind: "net_presence_scan", scope: body.scope, presence_scan_rows: rows.length });
     if (rows.length === 0) return;
     // Session -> actor for the directed-observation filter below: the
     // presence row body carries the session's actor (CO13 applier).
@@ -2914,19 +2905,15 @@ export class NetGatewayDO {
         }
       }
     }
-    console.log(
-      "woo.metric",
-      JSON.stringify({
-        kind: "net_push",
-        scope: body.scope,
-        seq: body.seq,
-        audience: rows.length,
-        delivered_members: deliveredMembers,
-        frames: framesSent,
-        observations: body.observations.length,
-        ts: Date.now()
-      })
-    );
+    this.metric({
+      kind: "net_push",
+      scope: body.scope,
+      seq: body.seq,
+      audience: rows.length,
+      delivered_members: deliveredMembers,
+      frames: framesSent,
+      observations: body.observations.length
+    });
   }
 
   /**
@@ -2971,10 +2958,7 @@ export class NetGatewayDO {
       await this.pullTargeted(scope, `scope:${scope}`, []);
     } catch (err) {
       this.selfSubscribed.delete(scope);
-      console.log(
-        "woo.metric",
-        JSON.stringify({ kind: "net_self_subscribe_failed", scope, error: String(err), ts: Date.now() })
-      );
+      this.metric({ kind: "net_self_subscribe_failed", scope, status: "error", error: String(err) });
     }
   }
 
@@ -3012,7 +2996,7 @@ export class NetGatewayDO {
           await this.pullTargeted(scope, `scope:${scope}`, missing);
         }
       } catch (err) {
-        console.log("woo.metric", JSON.stringify({ kind: metricKind, scope, error: String(err), ts: Date.now() }));
+        this.metric({ kind: metricKind, scope, status: "error", error: String(err) });
       }
     }
   }
@@ -3712,10 +3696,7 @@ export class NetGatewayDO {
     // policy; the metric is the discipline now.
     const last = this.seen.get(body.scope) ?? 0;
     if (body.seq > last + 1) {
-      console.log(
-        "woo.metric",
-        JSON.stringify({ kind: "net_fanout_gap", scope: body.scope, expected: last + 1, got: body.seq, ts: Date.now() })
-      );
+      this.metric({ kind: "net_fanout_gap", scope: body.scope, status: "error", error: "E_FANOUT_GAP", expected: last + 1, got: body.seq });
     }
     const applied = this.discardViewOnThrow(() =>
       this.state.storage.transactionSync(() => {

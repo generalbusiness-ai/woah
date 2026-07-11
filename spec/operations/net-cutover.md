@@ -251,13 +251,25 @@ item; what remains is exactly what the workerd lanes cannot prove
   ±25 % jitter (herds de-synchronize; drains stay replayable). Poison
   rows halt only their own lane and abandon namedly after the attempt
   budget — never silent loss, never starvation of later work.
-- **Gateway envelope — MEASUREMENT TOOLING BUILT; numbers deploy-only.**
+- **Gateway envelope — NONSAMPLED SINK + MEASUREMENT TOOLING BUILT;
+  numbers deploy-only.**
   `scripts/net-metrics-report.ts` aggregates the metric series
   (turn percentiles, retry/reconstruction rates, hottest scopes, fanout
   audience, outbox health, scheduler lag, incident counters) from any
   log stream (`wrangler tail --format json | tsx
   scripts/net-metrics-report.ts`). Sustained turns/s, per-connection
-  memory, and tenant limits still require the deployed canary.
+  memory, and tenant limits still require the deployed canary. Every net DO
+  now writes the same event to the `METRICS` Analytics Engine binding under
+  a stable per-gateway/per-scope index; the additive 20-double schema keeps
+  queue, wall, RPC, turn-shape, outbox, push, and presence dimensions intact.
+  `metrics:net-ae` queries the canary dataset with AE sampling weights and
+  fails closed on insufficient samples, turn errors/timeouts, queue tails,
+  single-shard concentration, absent elastic provisioning, outbox
+  abandonment, fanout gaps, and degraded install/adoption signals.
+  The acceptance deployment uses `wrangler.net-canary.template.toml`: a
+  standalone workers.dev-only Worker with no `routes`, independent DO
+  namespaces, a newly created KV namespace, and `woo_v1_net_canary`. It MUST
+  NOT be represented as `[env.canary]` under the production config.
 - **Gateway sharding — BUILT after the first deployed canary.** Public
   `/net-api` routing uses `NET_API_GATEWAY_SHARDS` named shards. A session
   or WebSocket ticket carries its minting shard; MCP headers, bearer/body/
@@ -299,9 +311,9 @@ item; what remains is exactly what the workerd lanes cannot prove
   42 % HTTP 500 responses at 6 guests and 12 concurrent turns, a 2.24 s
   gateway p99, 1.1 s scope queue wait, fixed-pool guest exhaustion, and
   inadequate `wrangler tail` sampling. The public route remains closed.
-  After the recorded scale caps are built, rerun with geographic
-  separation, cold starts, a nonsampling metrics sink, and the abort
-  criteria below. Abort signals (the report tool exits 2 on them): any
+  Rerun with geographic separation, cold starts, the dedicated canary AE
+  dataset, and the abort criteria below. Abort signals (the report tool
+  exits 2 on them): any
   outbox abandonment (named divergence), any fanout gap, turn retry rate
   > 20 % over a meaningful sample; plus operator judgment on p95
   `wall_ms` regressions and `install_degraded` / `adopt_conflict`

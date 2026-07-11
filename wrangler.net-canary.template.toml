@@ -1,0 +1,65 @@
+# Dedicated net acceptance canary. This is intentionally a standalone Worker
+# config, not [env.canary]: the latter can inherit/reassign production custom
+# domains. Keep `routes` absent. Generate a temporary runnable copy by replacing
+# CANARY_HOST_SEED_KV_ID with a newly-created, canary-only KV namespace id.
+name = "woah-net-canary"
+main = "src/worker/index.ts"
+compatibility_date = "2026-04-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+[observability]
+enabled = true
+head_sampling_rate = 1.0
+
+[vars]
+WOO_AUTO_INSTALL_CATALOGS = "chat,demoworld,dubspace,help,note,pinboard,prog,tasks,blocks-demo"
+NET_API_GATEWAY_SHARDS = "8"
+NET_RPC_TIMEOUT_MS = "5000"
+NET_TURN_QUEUE_WAIT_MS = "1500"
+WOO_AE_DATASET = "woo_v1_net_canary"
+CF_ACCOUNT_ID = "6e953d231f1c9aadffbf59537a82e13a"
+
+[[durable_objects.bindings]]
+name = "WOO"
+class_name = "PersistentObjectDO"
+
+[[durable_objects.bindings]]
+name = "DIRECTORY"
+class_name = "DirectoryDO"
+
+[[durable_objects.bindings]]
+name = "COMMIT_SCOPE"
+class_name = "CommitScopeDO"
+
+[[durable_objects.bindings]]
+name = "SCOPE_NET"
+class_name = "NetScopeDO"
+
+[[durable_objects.bindings]]
+name = "GATEWAY_NET"
+class_name = "NetGatewayDO"
+
+[[kv_namespaces]]
+binding = "HOST_SEED_KV"
+id = "CANARY_HOST_SEED_KV_ID"
+
+[[analytics_engine_datasets]]
+binding = "METRICS"
+dataset = "woo_v1_net_canary"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["PersistentObjectDO"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["DirectoryDO"]
+
+[[migrations]]
+tag = "cf-do-0006"
+new_sqlite_classes = ["CommitScopeDO"]
+
+[[migrations]]
+tag = "cf-do-0004"
+new_sqlite_classes = ["NetGatewayDO", "NetScopeDO"]

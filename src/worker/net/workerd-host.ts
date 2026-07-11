@@ -16,6 +16,7 @@
 import type { Host } from "../../net/host";
 import { netError } from "../../net/errors";
 import { signInternalRequest, type InternalAuthEnv } from "../internal-auth";
+import type { AnalyticsMetric, MetricsAnalyticsBinding } from "../metrics-sink";
 
 /**
  * Test-only fault configuration, read from WOO_NET_FAULTS (Phase-3
@@ -58,6 +59,7 @@ export type WorkerdHostEnv = InternalAuthEnv & {
   // WOO_FAULT_INJECT's "never set in production", but enforced at
   // runtime instead of by convention alone.
   WOO_AE_DATASET?: string;
+  METRICS?: MetricsAnalyticsBinding;
 };
 
 /** The narrow stub surface rpc needs — satisfied by a real
@@ -115,6 +117,9 @@ export type WorkerdHostOptions = {
   /** The DO's alarm storage. Optional because a gateway that never
    * schedules can run without one; setAlarm then throws loudly. */
   alarmStorage?: AlarmStorage;
+  /** Owning DO's log+AE emitter. The host owns transport failures but not
+   * the DO identity used as the Analytics Engine index. */
+  metric?: (event: AnalyticsMetric) => void;
 };
 
 /** Parse WOO_NET_FAULTS exactly once per host (one host per DO lifetime).
@@ -171,10 +176,7 @@ export class WorkerdHost implements Host {
     // thrown: a deferred drain retries via the durable outbox, so an
     // exception here has nowhere useful to go.
     const promise = task().catch((err) => {
-      console.log(
-        "woo.metric",
-        JSON.stringify({ kind: "net_deferred_task_error", error: String(err), ts: Date.now() })
-      );
+      this.metric({ kind: "net_deferred_task_error", error: String(err) });
     });
     this.options.waitUntil?.(promise);
   }
@@ -203,10 +205,7 @@ export class WorkerdHost implements Host {
     // async rejections as a named metric (fix 8b) — the next request's
     // drain-on-reactivation / re-arm is the recovery.
     const logArmFailure = (err: unknown): void => {
-      console.log(
-        "woo.metric",
-        JSON.stringify({ kind: "net_alarm_arm_failed", key, at: earliest, error: String(err), ts: Date.now() })
-      );
+      this.metric({ kind: "net_alarm_arm_failed", key, at: earliest, error: String(err) });
     };
     try {
       void Promise.resolve(earliest === null ? storage.deleteAlarm() : storage.setAlarm(earliest)).catch(logArmFailure);
@@ -266,10 +265,15 @@ export class WorkerdHost implements Host {
       return await raceAbort(response.json(), controller.signal);
     } catch (err) {
       if (controller.signal.aborted) {
-        console.log(
-          "woo.metric",
-          JSON.stringify({ kind: "net_rpc", destination, route, status: "timeout", ms: Date.now() - started, timeout_ms: timeoutMs, ts: Date.now() })
-        );
+        this.metric({
+          kind: "net_rpc",
+          destination,
+          route,
+          status: "timeout",
+          error: "E_RPC_TIMEOUT",
+          ms: Date.now() - started,
+          timeout_ms: timeoutMs
+        });
         throw netError("E_RPC_TIMEOUT", `rpc timed out: ${destination}${route}`, {
           destination,
           route,
@@ -286,6 +290,14 @@ export class WorkerdHost implements Host {
     const configured = Number(this.options.env.NET_RPC_TIMEOUT_MS);
     if (!Number.isFinite(configured) || configured <= 0) return 5_000;
     return Math.min(30_000, Math.max(10, Math.floor(configured)));
+  }
+
+  private metric(event: AnalyticsMetric): void {
+    if (this.options.metric) {
+      this.options.metric(event);
+      return;
+    }
+    console.log("woo.metric", JSON.stringify({ ...event, ts: Date.now() }));
   }
 
   private faultFor(route: string): NetFaultSpec | null {

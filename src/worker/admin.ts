@@ -148,7 +148,8 @@ async function handlePurgeInactiveGuests(request: Request, env: Env): Promise<Re
 //   { metric, groupBy, from, to, bucket, series: [ { key, points: [[unix, value], ...] } ] }
 //
 // AE SQL spec: index1 is host_key; blob1..blob18 follow the slot map in
-// metrics-sink.ts; double1..double3 are ms, sample_rate, count. The
+// metrics-sink.ts; the first three doubles are ms, sample_rate, count
+// (later slots are net-specific and do not change this admin surface). The
 // `_sample_interval` column is AE's own adaptive-sampling multiplier;
 // `SUM(_sample_interval * doubleN)` reconstructs sums under both AE
 // and our manual sampling layers.

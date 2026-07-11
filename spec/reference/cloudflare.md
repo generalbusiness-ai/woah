@@ -544,15 +544,16 @@ The runtime is world-visible from day one — even a "first cut" deployment must
 ### R10.1 Workers Analytics Engine
 
 Standard binding `METRICS`, dataset `woo_v1_<env>` (e.g. `woo_v1_prod`).
-Every load-bearing call site emits a `MetricEvent` (`src/core/types.ts`);
+Every v2 load-bearing call site emits a `MetricEvent` (`src/core/types.ts`);
+the replacement net layer emits its catalog-agnostic structural metric shape;
 each DO funnels its events through `src/worker/metrics-sink.ts` which
 both `console.log`s and writes one data point to AE. AE handles
 aggregation; the `/admin/stats` panel queries the AE SQL API.
 
 ```ts
 env.METRICS.writeDataPoint({
-  blobs:   [/* fixed-width 17-slot dimension map; see "Slot map" below */],
-  doubles: [/* fixed-width 3-slot numeric map; see "Slot map" below */],
+  blobs:   [/* fixed-width 18-slot dimension map; see "Slot map" below */],
+  doubles: [/* fixed-width 20-slot numeric map; see "Slot map" below */],
   indexes: [host_key]                  // the only high-cardinality index
 });
 ```
@@ -567,7 +568,7 @@ hosts. This also matches the dashboard's primary pivot — "by component".
 
 #### Slot map (stable; the `/admin/stats` query layer hard-codes positions)
 
-The slot map is fixed-width: every data point fills all 18 blobs and 3
+The slot map is fixed-width: every data point fills all 18 blobs and 20
 doubles. Axes the event doesn't carry land as empty strings (blob) or 0
 (double). New axes get a NEW slot; existing slots are never reordered
 or repurposed.
@@ -595,10 +596,27 @@ or repurposed.
 | `doubles[0]` | `ms`         | latency (`ms`, `elapsed_ms`, or `total_ms`), when present |
 | `doubles[1]` | `sample_rate`| 1 by default, or the 1-in-N multiplier (see "Sampling" below) |
 | `doubles[2]` | `count`      | primary kind-specific count: `rows`, `audience_size`, `observations`, `fanout`, `hosts`, `objects`, `bytes`, or anomaly event count |
+| `doubles[3]` | `queue_ms` | net gateway planning-scope queue wait |
+| `doubles[4]` | `wall_ms` | net gateway whole-turn wall time |
+| `doubles[5]` | `rpc_ms` | net turn critical-path RPC time |
+| `doubles[6]` | `rpc_max_ms` | net turn slowest RPC step |
+| `doubles[7]` | `rpc_depth` | net turn serial RPC depth |
+| `doubles[8]` | `sync_rpc` | net turn synchronous RPC count |
+| `doubles[9]` | `attempt` | net turn attempt count |
+| `doubles[10]` | `reconstructions` | net turn authority reconstruction count |
+| `doubles[11]` | `plan_cells` | net planner input cells |
+| `doubles[12]` | `envelope_bytes` | net submitted envelope bytes |
+| `doubles[13]` | `outbox_enqueued` | authority outbox rows enqueued by a submit |
+| `doubles[14]` | `delivered` | outbox rows delivered by a drain pass |
+| `doubles[15]` | `failed` | outbox rows failed by a drain pass |
+| `doubles[16]` | `abandoned` | outbox rows abandoned by a drain pass |
+| `doubles[17]` | `audience` | net push audience rows |
+| `doubles[18]` | `frames` | net WebSocket frames sent |
+| `doubles[19]` | `presence_scan_rows` | indexed presence rows scanned |
 
-The canonical event union is `MetricEvent` in `src/core/types.ts`. That
-union is the source of truth for which kinds exist and which fields they
-carry; this spec only describes how those fields project onto AE slots.
+The canonical v2 event union is `MetricEvent` in `src/core/types.ts`; net
+metrics remain structurally typed beside the frozen stack. This table is the
+stable projection contract shared by both.
 
 `authority_slice_reconstructed` partitions the authority-slice cost that used to
 appear as opaque `/mcp` wall time. Its `reason` value is written to `blobs[15]`
@@ -632,7 +650,9 @@ Console-tail is unaffected (it sees every emission). AE-side sampling:
 - **Always written:** any event with `status:"error"` or a non-empty
   `error` field, regardless of kind. Dashboard error panes must reflect
   ground truth even during a burst.
-- **1:1:** everything else.
+- **1:1:** everything else, including the net acceptance envelope. The
+  canary uses its own dataset so diagnostic traffic cannot consume the
+  production dataset's write allowance.
 
 AE write failures are swallowed inside the sink. A broken AE binding
 must never propagate into the request path.

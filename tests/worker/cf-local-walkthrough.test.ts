@@ -37,7 +37,11 @@ function seedDerivedUniversalLineage(): Set<ObjRef> {
   return ids;
 }
 
-vi.setConfig({ testTimeout: 60_000 });
+// This case runs the complete multi-user scenario (many independently bounded
+// 15s steps) plus post-run metric/coherence audits and session teardown. A 60s
+// aggregate cap raced healthy teardown on loaded CI hosts; per-step and RPC
+// watchdogs remain the precise hang detectors.
+vi.setConfig({ testTimeout: 120_000 });
 
 const SHARDS = 4;
 const RPC_TIMEOUT_MS = 8_000;

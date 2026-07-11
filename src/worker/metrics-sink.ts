@@ -32,6 +32,11 @@
 
 import type { MetricEvent } from "../core/types";
 
+/** Net-coherence metrics live beside the frozen v2 `MetricEvent` union.
+ * Keep the sink structural so the replacement distribution layer can use
+ * the same AE dataset without teaching `src/core` about Worker/DO concerns. */
+export type AnalyticsMetric = MetricEvent | (Record<string, unknown> & { kind: string });
+
 // Structural type for the Workers Analytics Engine binding we use. Declared
 // locally (rather than referencing the global `AnalyticsEngineDataset` from
 // `@cloudflare/workers-types`) so this file and its consumers can be type-checked
@@ -43,7 +48,7 @@ export interface MetricsAnalyticsBinding {
 
 // Whether to drop this event before writing to AE. Console-tail is
 // unaffected; the per-phase apply steps are still visible there.
-export function shouldDropForAnalytics(event: MetricEvent): boolean {
+export function shouldDropForAnalytics(event: AnalyticsMetric): boolean {
   if (event.kind === "shadow_apply_step" && event.phase !== "total") return true;
   if (event.kind === "shadow_gateway_apply_step" && event.phase !== "total") return true;
   return false;
@@ -52,7 +57,7 @@ export function shouldDropForAnalytics(event: MetricEvent): boolean {
 // Inverse sample rate ("1-in-N") for AE writes. Errors are always 1.
 // The multiplier is also stored on the data point so dashboard queries
 // can multiply back up at query time.
-export function analyticsSampleRate(event: MetricEvent): number {
+export function analyticsSampleRate(event: AnalyticsMetric): number {
   const e = event as { status?: string; error?: unknown };
   if (e.status === "error" || (typeof e.error === "string" && e.error.length > 0)) return 1;
   if (event.kind === "storage_direct_write") return 10;
@@ -65,14 +70,14 @@ export function analyticsSampleRate(event: MetricEvent): number {
 // must not be reordered or repurposed. See spec/reference/cloudflare.md
 // §R10.1 for the canonical schema and the per-`kind` field mapping.
 const BLOB_SLOTS = 18;
-const DOUBLE_SLOTS = 3;
+const DOUBLE_SLOTS = 20;
 
 // Per-kind "primary count" extraction. The double goes into doubles[2] so
 // dashboard queries can `SUM(double2)` to get totals without knowing which
 // kind they're aggregating over. Kinds that carry no natural primary count
 // (do_constructor, init, etc.) leave it at 0. Diagnostic anomaly kinds use
 // one event as the count so dashboards can sum incidents directly.
-function primaryCount(event: MetricEvent): number {
+function primaryCount(event: AnalyticsMetric): number {
   const e = event as Record<string, unknown>;
   switch (event.kind) {
     case "storage_direct_write":
@@ -116,6 +121,16 @@ function primaryCount(event: MetricEvent): number {
     case "shadow_apply_step":
     case "shadow_gateway_apply_step":
       return typeof e.objects === "number" ? e.objects : 0;
+    case "net_push":
+      return typeof e.frames === "number" ? e.frames : 0;
+    case "net_presence_scan":
+      return typeof e.presence_scan_rows === "number" ? e.presence_scan_rows : 0;
+    case "net_scope_outbox_drain_pass":
+      return typeof e.delivered === "number" ? e.delivered : 0;
+    case "net_scope_outbox_abandoned":
+    case "net_fanout_gap":
+    case "net_rpc":
+      return 1;
     default:
       return 0;
   }
@@ -165,8 +180,14 @@ function primaryCount(event: MetricEvent): number {
 //                                audience_size | observations | fanout |
 //                                hosts | objects | bytes | anomaly events
 //                                (see primaryCount above)
+//   doubles[3..19] append the net-coherence envelope without changing
+//                   the v2/admin slots above: queue_ms, wall_ms, rpc_ms,
+//                   rpc_max_ms, rpc_depth, sync_rpc, attempt,
+//                   reconstructions, plan_cells, envelope_bytes,
+//                   outbox_enqueued, delivered, failed, abandoned,
+//                   audience, frames, presence_scan_rows.
 export function writeMetricToAnalytics(
-  event: MetricEvent,
+  event: AnalyticsMetric,
   hostKey: string,
   analytics: MetricsAnalyticsBinding | undefined
 ): void {
@@ -213,12 +234,49 @@ export function writeMetricToAnalytics(
   doubles[0] = ms;
   doubles[1] = rate;
   doubles[2] = primaryCount(event);
+  const netFields = [
+    "queue_ms",
+    "wall_ms",
+    "rpc_ms",
+    "rpc_max_ms",
+    "rpc_depth",
+    "sync_rpc",
+    "attempt",
+    "reconstructions",
+    "plan_cells",
+    "envelope_bytes",
+    "outbox_enqueued",
+    "delivered",
+    "failed",
+    "abandoned",
+    "audience",
+    "frames",
+    "presence_scan_rows"
+  ] as const;
+  for (let i = 0; i < netFields.length; i += 1) {
+    const value = e[netFields[i]];
+    doubles[i + 3] = typeof value === "number" && Number.isFinite(value) ? value : 0;
+  }
 
   try {
     analytics.writeDataPoint({ indexes: [hostKey], blobs, doubles });
   } catch {
     // AE writes are best-effort. A failure must never break the worker.
   }
+}
+
+/** Emit one structured metric to both observability surfaces. Keeping the
+ * two writes adjacent prevents a deployed path from looking healthy in tail
+ * while silently disappearing from the nonsampled canary dataset. */
+export function emitMetric(
+  event: AnalyticsMetric,
+  hostKey: string,
+  analytics: MetricsAnalyticsBinding | undefined
+): void {
+  const existingTs = (event as Record<string, unknown>).ts;
+  const stamped = { ...event, ts: typeof existingTs === "number" ? existingTs : Date.now() };
+  writeMetricToAnalytics(stamped, hostKey, analytics);
+  console.log("woo.metric", JSON.stringify({ ...stamped, host_key: hostKey }));
 }
 
 // Convenience for callers that don't have a `MetricEvent` value handy

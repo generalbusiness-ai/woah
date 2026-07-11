@@ -81,6 +81,8 @@ type TurnBody = {
 
 describe("D2 / CO10 warm-turn structural budget", () => {
   it("a warm same-scope accepted turn stays within the CO10 structure (1 attempt, ≤3 sync RPC, 0 reconstructions)", async () => {
+    const analytics: Array<{ indexes?: string[]; blobs?: string[]; doubles?: number[] }> = [];
+    const metrics = { writeDataPoint(point: { indexes?: string[]; blobs?: string[]; doubles?: number[] }) { analytics.push(point); } };
     // ---- Engine-real fixture: a room, a room-anchored box whose bump
     // verb writes ONLY the box (no actor rider → no cross-scope write),
     // and the actor placed in the room. The whole world is then flattened
@@ -113,7 +115,7 @@ describe("D2 / CO10 warm-turn structural budget", () => {
     // bounds. Real per-instance SQLite (fake-DO), signed /net surface.
     const cells = cellsFromSerialized(world.exportWorld());
     const scopeState = netState("scope-flat");
-    const scopeEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET };
+    const scopeEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, METRICS: metrics };
     const scopeDO = new NetScopeDO(scopeState.state, scopeEnv);
     await call(scopeDO, scopeEnv, "/seed", { scope: SCOPE, catalog_epoch: EPOCH, cells });
 
@@ -123,6 +125,7 @@ describe("D2 / CO10 warm-turn structural budget", () => {
     const gatewayState = netState("gateway-structure");
     const gatewayEnv: NetGatewayEnv = {
       WOO_INTERNAL_SECRET: SECRET,
+      METRICS: metrics,
       NET_RESOLVE: (destination) => {
         if (destination !== `scope:${SCOPE}`) throw new Error(`unexpected destination ${destination}`);
         return {
@@ -185,6 +188,15 @@ describe("D2 / CO10 warm-turn structural budget", () => {
     expect(structure?.rpc_ms).toBeGreaterThanOrEqual(0);
     expect(structure?.rpc_max_ms).toBeLessThanOrEqual(structure?.rpc_ms ?? 0);
     expect(structure?.wall_ms).toBeGreaterThanOrEqual(structure?.rpc_ms ?? 0);
+
+    // The deployed canary reads AE, not sampled tail. Prove both DO shells
+    // wrote their readiness events under stable per-instance indexes.
+    const turnPoint = analytics.filter((point) => point.blobs?.[0] === "net_turn_structure").at(-1);
+    const submitPoint = analytics.find((point) => point.blobs?.[0] === "net_scope_submit");
+    expect(turnPoint?.indexes).toEqual(["net-gateway:gateway-structure"]);
+    expect(turnPoint?.blobs?.[7]).toBe("accepted");
+    expect(turnPoint?.doubles?.[4]).toBe(structure?.wall_ms);
+    expect(submitPoint?.indexes).toEqual(["net-scope:scope-flat"]);
 
     scopeState.close();
     gatewayState.close();
