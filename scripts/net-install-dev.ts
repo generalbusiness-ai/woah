@@ -13,6 +13,8 @@
 //      (E_SEED_COMMITTED) — pre-commit crashes remain rerunnable;
 //   4. the carried apikey mints a session and commits a REAL turn
 //      through /net-api — §8 step 3's "prove the new namespace" shape.
+//   5. claims past the installed guest pool and proves the elastic actor
+//      can immediately commit through its session bearer.
 //
 // Exits non-zero on any failure; prints ok-lines in the smoke idiom.
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -74,6 +76,50 @@ async function main(): Promise<void> {
       }
       ok("re-run after commits refuses namedly (E_SEED_COMMITTED — the destructive-reseed guard)");
 
+      // Real namespace creation: keep every pool session live, then the
+      // next claim must commit a fresh actor+session at a previously
+      // unseen cluster DO. This is the behavior workerd's real
+      // idFromName/storage boundary proves and the fake lane cannot.
+      const guestSessions: string[] = [];
+      let elastic: { session: string; actor: string } | null = null;
+      for (let i = 0; i < 16 && elastic === null; i += 1) {
+        const claim = await fetch(`${base}/net-api/guest`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ ttl_ms: 60_000 })
+        });
+        const body = (await claim.json()) as { session?: string; actor?: string; elastic?: boolean; error?: unknown };
+        if (!claim.ok || !body.session || !body.actor) {
+          throw new Error(`guest claim ${i} failed: ${claim.status} ${JSON.stringify(body)}`);
+        }
+        guestSessions.push(body.session);
+        if (body.elastic === true) elastic = { session: body.session, actor: body.actor };
+      }
+      if (elastic === null) throw new Error("guest overflow never reached elastic provisioning within 16 claims");
+      const elasticTurn = await fetch(`${base}/net-api/turn`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer session:${elastic.session}` },
+        body: JSON.stringify({
+          target: "the_chatroom",
+          verb: "say",
+          args: ["hello from an elastic guest"],
+          idempotency_key: "install-dev-elastic-guest"
+        })
+      });
+      const elasticTurnBody = (await elasticTurn.json()) as { reply?: { status?: string } };
+      if (!elasticTurn.ok || elasticTurnBody.reply?.status !== "accepted") {
+        throw new Error(`elastic guest turn failed: ${elasticTurn.status} ${JSON.stringify(elasticTurnBody)}`);
+      }
+      for (const guestSession of guestSessions) {
+        const closed = await fetch(`${base}/net-api/session`, {
+          method: "DELETE",
+          headers: { "content-type": "application/json", authorization: `Bearer session:${guestSession}` },
+          body: "{}"
+        });
+        if (!closed.ok) throw new Error(`guest close failed: ${closed.status}`);
+      }
+      ok(`guest overflow provisioned ${elastic.actor} and committed a bearer turn (real workerd)`);
+
       // Real turns through the client surface: mint, then the two
       // commands a user actually types first — `look` and `say` on the
       // room — both dispatching through the installed class chain
@@ -106,7 +152,7 @@ async function main(): Promise<void> {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
-  console.log(`\nsummary[net-install-dev]: ${passed}/5 steps passed`);
+  console.log(`\nsummary[net-install-dev]: ${passed}/6 steps passed`);
 }
 
 main().catch((err) => {

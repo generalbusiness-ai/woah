@@ -66,8 +66,18 @@ async function buildDoorHarness() {
   const scopeDOs = new Map<string, NetScopeDO>();
   const resolve = (destination: string) => {
     if (destination.startsWith("scope:")) {
-      const instance = scopeDOs.get(destination.slice("scope:".length));
-      if (instance) return instance;
+      const scope = destination.slice("scope:".length);
+      let instance = scopeDOs.get(scope);
+      if (!instance) {
+        // Elastic guest actors intentionally select never-before-seen
+        // cluster DOs; real idFromName creates them lazily, so the fake
+        // namespace must do the same.
+        const st = netState(`door-scope-${scope}`);
+        states.push(st);
+        instance = new NetScopeDO(st.state, scopeEnv);
+        scopeDOs.set(scope, instance);
+      }
+      return instance;
     }
     if (destination.startsWith("gateway:")) return gateway;
     throw new Error(`unresolvable ${destination}`);
@@ -314,7 +324,7 @@ describe("the identity door (/net-api/login, /net-api/guest, session bearers)", 
     states.forEach((st) => st.close());
   }, 30_000);
 
-  it("guest claims are exclusive: distinct actors per claim, occupied seats skipped, exhaustion refuses namedly", async () => {
+  it("guest claims are exclusive and overflow provisions a fresh owner-sequenced actor", async () => {
     const h = await buildDoorHarness();
 
     // The install seeded the pool (stock guests, minus the carried
@@ -342,11 +352,19 @@ describe("the identity door (/net-api/login, /net-api/guest, session bearers)", 
       expect(claim.body.session).toMatch(/^s_/);
     }
 
-    // The pool is full: a NAMED capacity refusal, never a hang or a
-    // shared seat.
-    const exhausted = await h.api("POST", "/net-api/guest", { body: {} });
-    expect(exhausted.status).toBe(503);
-    expect((exhausted.body.error as { detail?: { reason?: string } }).detail?.reason).toBe("guest_pool_exhausted");
+    // The pool is full: provision a fresh actor + first session as one
+    // commit at cluster:<actor>, then use its bearer immediately.
+    const elastic = await h.api("POST", "/net-api/guest", { body: {} });
+    expect(elastic.status, JSON.stringify(elastic.body).slice(0, 300)).toBe(200);
+    expect(elastic.body.elastic).toBe(true);
+    expect(elastic.body.actor).toMatch(/^guest_net_[0-9a-f]{32}$/);
+    expect(claimed.has(elastic.body.actor as string)).toBe(false);
+    const turn = await h.api("POST", "/net-api/turn", {
+      token: `session:${elastic.body.session as string}`,
+      body: { target: "the_chatroom", verb: "say", args: ["elastic hello"], idempotency_key: "elastic-door-turn" }
+    });
+    expect(turn.status, JSON.stringify(turn.body).slice(0, 300)).toBe(200);
+    expect((turn.body.reply as { status?: string }).status).toBe("accepted");
 
     h.close();
   }, 30_000);

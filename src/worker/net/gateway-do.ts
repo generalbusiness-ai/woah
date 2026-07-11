@@ -69,6 +69,7 @@ import type { CommitReply, CommitSubmit, RejectReason, ScheduledTurn, ScopeHead 
 import { netCellKeyFor, type EffectTranscript } from "../../net/transcript";
 import type { CellTransfer } from "../../net/cells";
 import { randomHex } from "../../core/source-hash";
+import { provisionGuestSubmit, type GuestTemplate } from "../../net/guest";
 import { verifyInternalRequest } from "../internal-auth";
 import { ClientAuthError, MAX_EMAIL_BYTES, MAX_PASSWORD_BYTES, normalizeEmail, parseClientCredential, verifyApiKeyCredential, verifyPasswordCredential } from "./client-auth";
 import { TokenBucketLimiter } from "./rate-limit";
@@ -1436,11 +1437,10 @@ export class NetGatewayDO {
     let reply: CommitReply;
     for (let attempt = 1; ; attempt += 1) {
       const bare = { ...submit, base };
-      reply = (await this.host.rpc(
+      reply = await this.idempotentSubmit(
         destination,
-        "/submit",
         withSibling ? { submit: bare, relate_destinations: relateDestinations } : bare
-      )) as CommitReply;
+      );
       if (reply.status === "accepted" || !reply.retryable || reply.reason !== "stale_head" || attempt >= 3) break;
       base = (await this.scopeHead(destination)).head;
     }
@@ -1459,6 +1459,17 @@ export class NetGatewayDO {
       );
     }
     return { reply, scope: clusterScope, value, ...(installDegraded ? { install_degraded: true } : {}) };
+  }
+
+  /** CO2.5 for substrate commits outside the full turn loop (session
+   * open/close and elastic guest provisioning): one same-body replay
+   * disambiguates any transport failure in the commit reply window. */
+  private async idempotentSubmit(destination: string, body: unknown): Promise<CommitReply> {
+    try {
+      return (await this.host.rpc(destination, "/submit", body)) as CommitReply;
+    } catch {
+      return (await this.host.rpc(destination, "/submit", body)) as CommitReply;
+    }
   }
 
   // ---- /net-api: the Phase-4 client surface (kickoff item 2) -------------
@@ -1931,9 +1942,9 @@ export class NetGatewayDO {
    * never hardcodes world names) with an EXCLUSIVE mint: the cluster
    * sequencer refuses `actor_occupied` when a live session already binds
    * the actor, so concurrent claims serialize and two humans never share
-   * one guest. Pool exhausted = a NAMED capacity refusal (v1 limitation,
-   * documented: v2 mints fresh guests beyond its pool; the net door does
-   * not yet).
+   * one guest. The installed pool is the reuse-first tier; on exhaustion
+   * a validated `$system.guest_template` provisions a fresh actor and its
+   * first session in one commit at that actor's cluster owner.
    */
   private async clientGuest(body: Record<string, unknown>): Promise<Response> {
     // One shared pre-auth bucket: guest claims are session mints.
@@ -1942,7 +1953,8 @@ export class NetGatewayDO {
     const poolCell = this.ensureView().get(cellKey("property_cell", "$system", "guest_pool"));
     const payload = poolCell?.value as { value?: unknown } | undefined;
     const pool = Array.isArray(payload?.value) ? payload.value.filter((id): id is string => typeof id === "string") : [];
-    if (pool.length === 0) {
+    const template = this.elasticGuestTemplate();
+    if (pool.length === 0 && template === null) {
       return json(
         { error: { code: "E_RATE", message: "no guest pool is installed in this world", detail: { reason: "guest_pool_missing" } } },
         503
@@ -1953,10 +1965,83 @@ export class NetGatewayDO {
       if (response.status === 409) continue; // occupied — try the next pool actor
       return response;
     }
+    if (template !== null) return await this.clientElasticGuest(body, identity.epoch, template);
     return json(
       { error: { code: "E_RATE", message: "all guest actors are in use; try again later", detail: { reason: "guest_pool_exhausted", pool_size: pool.length } } },
       503
     );
+  }
+
+  /** Parse the install-owned template strictly. A malformed template is
+   * treated as absent: catalog data must never smuggle partial identity
+   * into an authority commit. */
+  private elasticGuestTemplate(): GuestTemplate | null {
+    const cell = this.ensureView().get(cellKey("property_cell", "$system", "guest_template"));
+    const template = (cell?.value as { value?: unknown } | undefined)?.value;
+    if (!template || typeof template !== "object" || Array.isArray(template)) return null;
+    const row = template as Record<string, unknown>;
+    if (
+      row.version !== 1 ||
+      typeof row.parent !== "string" ||
+      typeof row.owner !== "string" ||
+      typeof row.description !== "string" ||
+      typeof row.home !== "string" ||
+      typeof row.initial_room !== "string"
+    ) return null;
+    return row as GuestTemplate;
+  }
+
+  /** Provision an anonymous actor and its first session in one commit at
+   * the actor's fresh cluster owner. The random id selects an empty DO;
+   * the scope's create-collision check still fails closed if it is not. */
+  private async clientElasticGuest(
+    body: Record<string, unknown>,
+    epoch: string,
+    template: GuestTemplate
+  ): Promise<Response> {
+    const actor = `guest_net_${randomHex(16)}`;
+    const session = sessionIdWithShardHint(this.shardName(), randomHex(16));
+    const planned = provisionGuestSubmit({
+      actor,
+      session,
+      ttl_ms: clampClientTtl(body.ttl_ms),
+      now: this.host.now(),
+      epoch,
+      template
+    });
+    const roomScope = await this.clientPlanningScope(template.initial_room, actor);
+    const destination = `scope:${planned.clusterScope}`;
+    const relateDestinations = roomScope === planned.clusterScope
+      ? undefined
+      : { [roomScope]: { destination: `scope:${roomScope}`, objects: [template.initial_room] } };
+    const submitBody = relateDestinations ? { submit: planned.submit, relate_destinations: relateDestinations } : planned.submit;
+    const reply = await this.idempotentSubmit(destination, submitBody);
+    if (reply.status !== "accepted") {
+      return json(
+        { error: { code: "E_RETRY", message: "guest provisioning did not commit; retry", detail: reply } },
+        503
+      );
+    }
+    let installDegraded = false;
+    try {
+      await this.installTouched(this.ensureView(), destination, reply.touched);
+    } catch (err) {
+      installDegraded = true;
+      console.log(
+        "woo.metric",
+        JSON.stringify({ kind: "net_guest_provision_install_degraded", actor, error: String(err), ts: Date.now() })
+      );
+    }
+    await this.selfSubscribe(planned.clusterScope);
+    await this.selfSubscribe(roomScope);
+    return json({
+      session,
+      actor,
+      expires_at: planned.value.expiresAt ?? null,
+      scope: planned.clusterScope,
+      elastic: true,
+      ...(installDegraded ? { install_degraded: true } : {})
+    });
   }
 
   /** Linear scan of the catalog-scope view for the $account instance

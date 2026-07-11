@@ -117,9 +117,9 @@ export async function planNetInstall(options: NetInstallOptions = {}): Promise<N
  * driving behavior — the layering rule: the gateway never hardcodes
  * world names) and claims a seat with an exclusive mint. Seeded at
  * install because the pool is a property of the installed WORLD;
- * deterministic (sorted) and idempotent. v1 limitation, documented: the
- * pool is fixed — v2 mints fresh guests beyond its pool; the net door
- * refuses namedly when every seat is taken.
+ * deterministic (sorted) and idempotent. The pool is the reuse-first
+ * tier; `$system.guest_template` lets the net door provision a fresh
+ * owner-sequenced actor when every installed seat is occupied.
  */
 function seedGuestPool(world: WooWorld): void {
   const serialized = world.exportWorld();
@@ -168,6 +168,22 @@ function seedGuestPool(world: WooWorld): void {
       const location = objects.get(id)?.location ?? null;
       if (location === null || location === "$nowhere") world.moveObject(id, start);
     }
+  }
+  // Elastic guest creation remains catalog-data-driven: the gateway
+  // consumes this template and never embeds $guest/$wiz/start-room
+  // identities. The created actor and its session still commit at the
+  // actor's fresh cluster sequencer (see guest.ts).
+  const exemplar = pool.length > 0 ? objects.get(pool[0]) : undefined;
+  if (exemplar && start !== null) {
+    const home = exemplar.properties?.find(([name]) => name === "home")?.[1];
+    world.setProp("$system", "guest_template", {
+      version: 1,
+      parent: exemplar.parent,
+      owner: exemplar.owner,
+      description: "Temporary guest identity.",
+      home: typeof home === "string" ? home : "$nowhere",
+      initial_room: start
+    } as never);
   }
 }
 

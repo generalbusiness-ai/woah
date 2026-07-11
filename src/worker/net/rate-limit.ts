@@ -9,9 +9,9 @@
  * budget). Hibernation or eviction resets every bucket, which degrades to
  * permitting one fresh burst — never to blocking a legitimate client —
  * and matches the layer's no-new-durable-copies posture (CO5 stays at
- * five). A distributed limiter is a deliberate non-goal until /net-api is
- * sharded (the worker entry pins the whole surface to ONE gateway shard,
- * so per-isolate IS per-surface today).
+ * five). Since `/net-api` is sharded, this is a per-shard safety valve,
+ * not a global quota; durable provisioning limits belong at the owning
+ * authority when tenant policy lands.
  *
  * The map is bounded: entries idle past `idleMs` are evicted lazily on
  * take(), and a hard `maxKeys` cap evicts oldest-touched entries beyond

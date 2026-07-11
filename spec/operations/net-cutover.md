@@ -275,6 +275,14 @@ item; what remains is exactly what the workerd lanes cannot prove
   one planning scope refuse as `503 E_BUDGET` after
   `NET_TURN_QUEUE_WAIT_MS` (1.5 s) and are skipped before execution; depth
   and aggregate caps remain in force while expired entries drain.
+- **Elastic guest admission — BUILT after the first deployed canary.**
+  The install-seeded pool remains the reuse-first path. Once occupied,
+  the door reads the validated `$system.guest_template` catalog cell and
+  commits a fresh actor, its initial placement, mutable guest properties,
+  and its first exclusive session atomically at a previously unseen
+  `cluster:<actor>` owner. Contents and session-presence deltas follow the
+  normal owner outbox path. Random 128-bit actor ids select independent
+  cluster DOs; the sequencer's create-collision guard remains fail-closed.
 - **Second-review scale caps — RECORDED, NOT BUILT** (accepted findings
   9/11/12 residuals, required before public traffic beyond the bake):
   each `/net-api` gateway durably accumulates every cell visited by its
@@ -282,10 +290,9 @@ item; what remains is exactly what the workerd lanes cannot prove
   derived cache, evict unsubscribed scopes with revision-safe re-pull);
   identity is centralized (one `api_keys` cell, O(accounts) email scan,
   the 8 MiB seed partition as an eventual ceiling — hashed
-  credential/account index authorities are the design); guest capacity is
-  the fixed installed pool
-  (owner-sequenced guest CREATION is the follow-up; close/release and
-  named exhaustion exist).
+  credential/account index authorities are the design). Elastic guest
+  actors are durable identities; tenant-level creation quotas and
+  lifecycle compaction remain policy work beyond the initial public bake.
 - **Deployed canary — DIAGNOSTIC RUN COMPLETE; ACCEPTANCE RERUN
   REQUIRED.** The isolated 2026-07-11 canary proved install, session mint,
   turn commit, and named refusals on real Cloudflare DOs. It also measured
