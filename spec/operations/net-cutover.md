@@ -2,9 +2,10 @@
 
 Status: **implemented** (state machine, freeze, export watermark, activation
 barrier, verification rules). NC8's local half — instrumentation, budgets,
-skewed-load lane, bounded growth, report tooling — is **built**; its
-deploy-only half (canary numbers, cross-colo tails, sustained-rate
-envelope) remains a **pre-deploy requirement**.
+skewed-load lane, bounded growth, report tooling — is **built**. Its initial
+single-region Cloudflare stability envelope has passed; geographically
+separated cold-start and sustained-rate evidence remains a **pre-cutover
+requirement**.
 
 This section is normative for moving a live v2 world into a net namespace
 (the coherence layer of [spec/protocol/coherence.md](../protocol/coherence.md))
