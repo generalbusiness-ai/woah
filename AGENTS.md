@@ -238,3 +238,12 @@ must include a vitest case before it lands.
 - `npm run typecheck` — both tsconfigs.
 - `npm run dev` — local dev server at `http://localhost:5173`.
 - `npm run cf:migrations:check` — wrangler DO migrations in sync.
+
+**Net coherence path** (spec/protocol/coherence.md, spec/operations/net-cutover.md):
+
+- `npm run install:net-dev` — seed + activate a net world on the workerd net lane.
+- `npm run smoke:net-dev` / `npm run smoke:net-mcp` — net cross-actor smoke on workerd / deployed MCP.
+- `npm run load:net-dev` / `npm run load:net-skew` — concurrency + skewed-load drivers.
+- `npm run load:net-canary` — the deployed acceptance-canary load driver.
+- `npm run metrics:net-ae` — read the Analytics Engine acceptance gate (global-weighted p99 + per-shard diagnostics; defaults to dataset `woo_v1_net_canary`).
+- `npm run e2e:net` — real-browser cross-user net path (Playwright).

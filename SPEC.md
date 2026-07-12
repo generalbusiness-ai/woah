@@ -108,7 +108,7 @@ Host-facing interfaces for runtime execution, transport, and client bootstrap ac
 
 Concrete Cloudflare mappings for a v1 deployment target: storage, routing, quotas, and production constraints.
 
-- [cloudflare.md](spec/reference/cloudflare.md) — host-class mapping, routing, hibernation (R1–R4)
+- [cloudflare.md](spec/reference/cloudflare.md) — host-class mapping, routing, hibernation, Analytics Engine metrics (R10.1), wrangler config incl. the net DO classes + gateway sharding, and deploy procedure (R1–R14)
 - [persistence.md](spec/reference/persistence.md) — per-object SQLite schema, caching (§14, §15)
 - [quotas.md](spec/reference/quotas.md) — QuotaAccountant DO (R5)
 

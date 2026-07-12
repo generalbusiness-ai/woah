@@ -111,3 +111,13 @@ object ids; clock skew immaterial at current TTLs.
 3. **Before cutover**: H3 sharding (session-hash shards + view scoping),
    H5 owner-filtered push + presence reaping, M6-M8, T1/T2/T6, D1 gate
    suite, D3/D4 plan re-baseline, L12 ticket auth.
+
+---
+
+## RESOLVED (2026-07-12)
+
+The alignment/stability drift this review flagged ("promised gates
+unbuilt, budgets unmeasured") is closed: the CO12 gate suite is
+enforced and the deployed acceptance canary measured the envelope
+non-sampled via Analytics Engine (30 guests, 0% 5xx, global p99 397ms).
+Historical review record.

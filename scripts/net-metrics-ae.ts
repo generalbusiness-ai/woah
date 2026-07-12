@@ -7,7 +7,7 @@
  * sample or health envelope is insufficient.
  *
  *   CF_ACCOUNT_ID=... CF_ANALYTICS_TOKEN=... npm run metrics:net-ae -- \
- *     --dataset woo_v1_canary --from 2026-07-11T18:00:00Z --min-turns 500
+ *     --dataset woo_v1_net_canary --from 2026-07-11T18:00:00Z --min-turns 500
  */
 
 type AeRow = Record<string, unknown>;
@@ -203,7 +203,7 @@ async function main(): Promise<void> {
   const account = process.env.CF_ACCOUNT_ID;
   const token = process.env.CF_ANALYTICS_TOKEN;
   if (!account || !token) throw new Error("CF_ACCOUNT_ID and CF_ANALYTICS_TOKEN are required");
-  const dataset = value("--dataset") ?? "woo_v1_canary";
+  const dataset = value("--dataset") ?? "woo_v1_net_canary";
   const now = Date.now() / 1000;
   const parseTime = (raw: string | undefined, fallback: number): number => {
     if (!raw) return fallback;

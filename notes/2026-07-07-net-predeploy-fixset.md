@@ -131,3 +131,14 @@ seeded world).
 Each: code + regression test + gates; commit per fix. Final: full
 `npm test` + `test:worker` + `smoke:net-dev` + `e2e:net` + typecheck +
 diff --check, then hand the staging-deploy decision back.
+
+---
+
+## RESOLVED (2026-07-12): the deferred scale items landed
+
+The "deferred to before-cutover" list (sharding H3/M5, the CO12 gate
+suite) subsequently shipped: 8-way `/net-api` sharding in
+`src/worker/net/gateway-routing.ts`, and the CO12 taxonomy/conformance
+gate enforced (see `src/net/errors.ts` header + `spec/protocol/coherence.md`).
+The full NC8 scale envelope was canary-accepted 2026-07-12 — see
+`notes/2026-07-08-net-cutover-tooling-plan.md` "NC8 SCALE COMPLETE".

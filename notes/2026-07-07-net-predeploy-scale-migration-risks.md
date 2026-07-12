@@ -160,3 +160,15 @@ lost:
 
 Nothing here reopens the v2 freeze. This IS the simplest-system direction —
 carried through into the first deploy instead of deferred past it.
+
+---
+
+## RESOLVED (2026-07-12)
+
+The concrete defects this register cited (e.g. the outbox lacking a
+due-time/status index and `next_attempt_at_ms`) were fixed in the
+ready-to-scale phases (bounded outbox drain with the lane directory +
+`next_attempt_at_ms`), and the broader scale risks by the NC8 work
+(sharding, RPC/queue deadlines, elastic guests, AE metrics) —
+canary-accepted 2026-07-12. Historical register; see the cutover plan
+note's "NC8 SCALE COMPLETE".

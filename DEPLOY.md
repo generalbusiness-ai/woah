@@ -188,6 +188,14 @@ dataset = "woo_v1"
 
 If `env.METRICS` is undefined at runtime, all metric writes no-op. Structured logs continue.
 
+The `dataset` name is selectable per deploy via the `WOO_AE_DATASET` var
+(the net acceptance canary uses `woo_v1_net_canary` so its evidence never
+mixes with prod's `woo_v1`). The net-path percentile gate reads AE
+directly — see `scripts/net-metrics-ae.ts` / `npm run metrics:net-ae`,
+which defaults to `woo_v1_net_canary`. AE is the acceptance-gate signal
+of record because `wrangler tail` samples aggressively under load and
+cannot produce trustworthy percentile envelopes.
+
 ### R2 + Logpush (log retention)
 
 `console.log` lines reach `wrangler tail` by default. For durable retention:
@@ -209,6 +217,18 @@ Default deploy serves at `<worker-name>.<account-subdomain>.workers.dev`. To use
    ```
 
 3. Redeploy.
+
+> **Custom-domain footgun (learned the hard way — see
+> [notes/2026-07-10-canary-domain-incident.md](notes/2026-07-10-canary-domain-incident.md)).**
+> Cloudflare custom-domain routes are **account-global**, not scoped to a
+> named wrangler environment. `wrangler deploy --env <name>` from a config
+> whose top-level `routes` use `custom_domain = true` **reassigns those
+> domains to the named env's worker** — even if the `[env.<name>]` block
+> declares no routes. This once pointed the production hostnames at a
+> throwing canary worker. Never run a second/canary/staging worker as an
+> `[env.*]` of the production config against custom domains: give it a
+> **dedicated standalone config file** with no `routes` at all (see the
+> Staging and net-canary guidance below).
 
 ---
 
@@ -350,6 +370,45 @@ npm run build && npx wrangler deploy --env staging
 ```
 
 Cost: per-request + DO storage proportional to staging data. An idle staging is near-zero; a small test world is cents per month.
+
+> **Only safe while the production config has no custom-domain routes.**
+> `--env staging` inherits the top-level `routes`; if those declare
+> `custom_domain = true`, a staging deploy will reassign the production
+> hostnames to the staging worker (see the Custom-domain footgun above and
+> [notes/2026-07-10-canary-domain-incident.md](notes/2026-07-10-canary-domain-incident.md)).
+> When production serves on a custom domain, prefer a **dedicated
+> standalone config file** (its own `name`, `workers_dev = true`, no
+> `routes`) deployed with `wrangler deploy -c wrangler.<name>.toml` — the
+> pattern `wrangler.net-canary.template.toml` follows.
+
+### Net-path acceptance canary
+
+The net coherence path (`spec/protocol/coherence.md`,
+`spec/operations/net-cutover.md` NC1–NC8) ships a self-contained canary:
+`wrangler.net-canary.template.toml` — a standalone worker (`woah-net-canary`,
+`workers_dev = true`, **no routes**) with its own DO storage, its own KV,
+the net DO classes (`NetGatewayDO`/`NetScopeDO`), the eight-way gateway
+sharding config (`NET_API_GATEWAY_SHARDS = "8"`, `NET_RPC_TIMEOUT_MS`,
+`NET_TURN_QUEUE_WAIT_MS`, `NET_TURN_SCOPE_CONCURRENCY`), and its own AE
+dataset (`woo_v1_net_canary`).
+
+```sh
+# 1. Create a canary-only KV namespace, paste its id over CANARY_HOST_SEED_KV_ID
+npx wrangler kv namespace create HOST_SEED_KV   # copy the id into a working copy
+# 2. Deploy the standalone canary (never --env)
+npx wrangler deploy -c wrangler.net-canary.template.toml
+# 3. Install a world, drive load, read the percentile gate from AE
+npm run install:net-dev        # (or the deployed install path)
+npm run load:net-canary
+npm run metrics:net-ae         # global-weighted p99 gate, per-shard diagnostics
+# 4. Tear down
+npx wrangler delete -c wrangler.net-canary.template.toml   # + delete the KV
+```
+
+Because it has no `routes`, it structurally cannot touch production
+hostnames. The accepted initial-stability envelope (30 concurrent guests,
+22 elastic, 600/600 turns, all 8 shards, global p99 397ms, queue p99 0ms,
+zero 5xx) is recorded in `notes/2026-07-11-net-canary-envelope.md`.
 
 ### Onboarding smoke
 

@@ -1229,6 +1229,51 @@ for new classes when run with `--write`.
 
 Logpush configuration is per-account, not in wrangler — `wrangler logpush create` or via dashboard, targeting an R2 bucket.
 
+### R12.1 Net coherence layer bindings
+
+The net coherence path ([coherence.md](../protocol/coherence.md),
+[net-cutover.md](../operations/net-cutover.md)) adds two DO classes that
+sit **beside** the v2 classes; no production traffic routes to them until
+the Phase-5 cutover:
+
+```toml
+[[durable_objects.bindings]]
+name = "SCOPE_NET"          # NetScopeDO — scope authority (CO5 copy #1)
+class_name = "NetScopeDO"
+
+[[durable_objects.bindings]]
+name = "GATEWAY_NET"        # NetGatewayDO — session-edge derived cache (CO5 copy #2)
+class_name = "NetGatewayDO"
+
+[[migrations]]
+tag = "cf-do-0004"
+new_sqlite_classes = ["NetGatewayDO", "NetScopeDO"]
+```
+
+`GATEWAY_NET` is fanned across `NET_API_GATEWAY_SHARDS` (default `"8"`)
+distinct DO instances addressed by shard-hinted `idFromName`
+(`src/worker/net/gateway-routing.ts`): one gateway DO cannot carry all of
+`/net-api`. Sessions/tickets embed their minting shard; credentials hash
+stably (sticky routing); anonymous claims spread by edge entropy; a
+`validShardHint` check blocks arbitrary DO naming.
+
+Net turn-path `[vars]`:
+
+| Var | Default | Meaning |
+|---|---|---|
+| `NET_API_GATEWAY_SHARDS` | `"8"` | Gateway DO fan-out width. `NET_GATEWAY_SELF` is a test/legacy override that MUST be absent when >1 shard. |
+| `NET_RPC_TIMEOUT_MS` | `"5000"` | Deadline on every coherence RPC and hot-scope queue wait → `E_RPC_TIMEOUT` (HTTP 503, retryable). A submit timeout is ambiguous, so the gateway performs one CO2.5-preserving same-key replay before surfacing it. |
+| `NET_TURN_QUEUE_WAIT_MS` | `"1500"` | Per-scope serializer queue deadline. |
+| `NET_TURN_SCOPE_CONCURRENCY` | `"12"` | Bounded per-scope lanes per gateway shard. |
+| `WOO_AE_DATASET` | `"woo_v1_prod"` | Selects the AE dataset (§R10.1); the net acceptance canary sets `"woo_v1_net_canary"` so its evidence never mixes with prod's. Also a **deployed-environment marker**: when set, un-metered dev-only surfaces such as `/net-smoke` are hard-refused (`src/worker/index.ts`, `src/worker/net/workerd-host.ts`). |
+
+The acceptance canary reads AE directly for its percentile gate
+(`scripts/net-metrics-ae.ts` / `npm run metrics:net-ae`), because
+`wrangler tail` samples too aggressively under load to produce a
+trustworthy envelope. The full standalone canary config is
+`wrangler.net-canary.template.toml`; see §R14.3.1 for why it must not be
+an `[env.*]` of the production config.
+
 ---
 
 ## R13. Cost notes
@@ -1301,8 +1346,22 @@ routes = [
 the next `wrangler deploy` registers the route, Cloudflare creates the
 DNS record on the zone, and a TLS certificate is provisioned
 automatically. The zone must be on the same Cloudflare account as the
-Worker. The `workers.dev` URL continues to serve in parallel, which is
-useful for canary smoke tests during a cutover.
+Worker. The `workers.dev` URL continues to serve in parallel.
+
+> **Custom-domain routes are account-global, not env-scoped.** A
+> `wrangler deploy --env <name>` from a config whose *top-level* `routes`
+> use `custom_domain = true` reassigns those hostnames to the named env's
+> worker — even when the `[env.<name>]` block declares no routes of its
+> own. A named-env canary deploy once pointed the production hostnames at
+> a throwing canary worker for a few minutes; see
+> [notes/2026-07-10-canary-domain-incident.md](../../notes/2026-07-10-canary-domain-incident.md).
+> A canary/staging worker on an account that owns custom domains MUST use
+> a **dedicated standalone config file** (its own `name`,
+> `workers_dev = true`, **no `routes`**) deployed with
+> `wrangler deploy -c wrangler.<name>.toml`, never `--env`. Its own
+> `workers.dev` URL is the canary smoke target — **not** the production
+> worker's `workers.dev` URL, which shares the production world image.
+> `wrangler.net-canary.template.toml` is the reference example.
 
 The reference deployment ships its production route block in the
 committed `wrangler.toml` as a working example; a fork-and-deploy

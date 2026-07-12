@@ -491,3 +491,63 @@ RECORDED as NC8 scale caps (spec updated). Highlights:
   owner-sequenced guest creation (12-rest). Deploy order per review:
   parallel-path deploy → valid canary envelope → then these before the
   route switch.
+
+## NC8 SCALE COMPLETE + INITIAL-STABILITY CANARY ACCEPTED (2026-07-12)
+
+The NC8 enforceable-envelope work the prior section recorded as "before
+the route switch" has LANDED and passed a deployed acceptance canary.
+This section supersedes every earlier "REMAINING before the route
+switch" line above — those were true when written (append-only log);
+current truth is here.
+
+**Landed (branch HEAD 7416aa9; 11 commits after the door work):**
+- **8-way gateway sharding** (`gateway-routing.ts`, `NET_API_GATEWAY_SHARDS`):
+  sessions/tickets carry their minting shard; credentials hash stably;
+  anonymous claims spread by edge entropy; `validShardHint` blocks a
+  client naming an arbitrary DO. Finding 8.
+- **RPC + queue deadlines** (`NET_RPC_TIMEOUT_MS`, `NET_TURN_QUEUE_WAIT_MS`):
+  every cross-DO call aborts to `E_RPC_TIMEOUT` (→ 503 retryable), one
+  CO2.5-preserving same-key replay for submit ambiguity; queue wait
+  bounded. Finding 11 — this is what turned the canary's 42% HTTP 500
+  into 0%.
+- **Elastic guest provisioning** (`src/net/guest.ts`, `$system.guest_template`):
+  owner-sequenced fresh actor clusters when the pool is exhausted.
+  Finding 12.
+- **AE metrics sink + acceptance queries** (`metrics:net-ae`,
+  `net-metrics-ae.ts`): non-sampled application evidence, global weighted
+  p99 gate (per-shard rows for diagnosis), fail-closed. The sampled-tail
+  gap from the first canary.
+- **Delivery continuity fix** (`delivery_seq`): per-subscriber lane
+  continuity separated from authority `seq` — real fanout loss still
+  detected, false gaps eliminated.
+- Concurrency hardening: turn rebase within the recovery tail
+  (serializable-correct), 12 per-scope gateway lanes, concurrent outbox
+  lane drain, recursive-fanout cascade broken via fresh alarm events,
+  session-close authorized against the live actor-bound row.
+
+**Accepted canary (isolated `wrangler.net-canary.template.toml` worker,
+torn down after):** 30 concurrent guests (22 elastically provisioned),
+600/600 turns accepted, all 30 sessions closed, all 8 shards active;
+server latency p50 173ms / p95 349ms / p99 397ms (global weighted);
+queue p99 0ms; zero 5xx / timeouts / retries / reconstructions /
+delivery failures / abandonments / fanout gaps. Max observed server
+turn 1.78s, retained as a tail-risk signal. (Prior single-shard canary:
+42% 5xx, gateway p99 2.24s, pool locked at 8.)
+
+**REMAINING before the production route switch:**
+1. Merge `net-cutover` → main + re-baseline; redeploy prod with the
+   accepted code (the parallel surface currently runs pre-sharding code
+   on an empty net namespace). [assigned to a separate agent]
+2. **Identity-carry rehearsal** — the one major cutover path with NO
+   real-infrastructure evidence: export a real frozen v2 identity →
+   install into a fresh net namespace → confirm a real account logs in
+   by password AND a carried apikey mints. Rehearse against an isolated
+   canary namespace before the production window.
+3. **Scaling envelope** (know-before-large-audience, can follow the
+   first cutover): sustained turns/s ceiling per shard (the acceptance
+   never saturated one), fanout cost past ~30-occupant audience,
+   cross-colo tail, and confirm the 1.78s max-turn is cold-shard open
+   (warm re-run should erase it), plus a longer soak.
+4. Then the owner-run §8 runbook (freeze both halves → watermarked
+   export → install+carry → prove apikey+password → route switch → bake
+   with the AE `--watch`/`metrics:net-ae` canary → rollback boundary).

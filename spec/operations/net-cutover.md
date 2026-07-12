@@ -236,7 +236,8 @@ item; what remains is exactly what the workerd lanes cannot prove
 - **Skewed-load proof — BUILT (in-process bounds).** `load:net-skew`
   (curated gate): hot-room concurrent same-cell writers (converge under
   retry with named verdicts and exact serialization at the authority —
-  each gateway shard admits four bounded per-scope lanes, limiting the
+  each gateway shard admits twelve bounded per-scope lanes (the
+  canary-proven `NET_TURN_SCOPE_CONCURRENCY` default), limiting the
   self-inflicted herd without serializing independent turns), large-audience
   fanout (scan and push track room occupancy, never total mirrored
   sessions), high-degree owner isolation (a 200-member scope adds

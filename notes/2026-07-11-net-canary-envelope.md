@@ -92,3 +92,22 @@ public route switch (now with numbers, not just prediction):
 
 The parallel-path deploy stands (v2-equivalent, refusal behavior + door
 proven live). The cutover remains gated on the four items above.
+
+---
+
+## RESOLVED (2026-07-12)
+
+All four "Required before a public route switch" items above LANDED and
+passed a second deployed acceptance canary:
+- gateway sharding → `src/worker/net/gateway-routing.ts` (8-way,
+  `NET_API_GATEWAY_SHARDS`);
+- per-turn RPC deadlines → `NET_RPC_TIMEOUT_MS` / `E_RPC_TIMEOUT`
+  (→ 503 retryable), the fix that turned 42% 5xx into 0%;
+- elastic guest capacity → `src/net/guest.ts` (`$system.guest_template`);
+- a real metrics sink → the AE `METRICS` dataset + `scripts/net-metrics-ae.ts`.
+
+Accepted envelope (30 concurrent guests, 22 elastic, 600/600 turns, all
+8 shards, global p99 397ms, queue p99 0ms, zero 5xx/timeouts/gaps).
+Superseded by `spec/operations/net-cutover.md` NC8 and the plan note's
+"NC8 SCALE COMPLETE" section. This note is retained as the historical
+FIRST-canary failure record that motivated the fixes.

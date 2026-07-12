@@ -142,7 +142,10 @@ class_name = "CommitScopeDO"
 # Plan 002 coherence layer (spec/protocol/coherence.md). New classes sit
 # beside the v2 ones; nothing routes production traffic here until the
 # Phase-5 cutover. SCOPE_NET is the scope authority (CO5 copy #1);
-# GATEWAY_NET is the session-edge derived cache (copy #2).
+# GATEWAY_NET is the session-edge derived cache (copy #2) — fanned across
+# NET_API_GATEWAY_SHARDS shards (default 8; see the var above and
+# src/worker/net/gateway-routing.ts), so this single binding backs many
+# gateway DO instances addressed by shard-hinted idFromName.
 [[durable_objects.bindings]]
 name = "SCOPE_NET"
 class_name = "NetScopeDO"
@@ -189,6 +192,14 @@ dataset = "woo_v1_prod"
 # The staging worker gets its own DO storage namespace; cost is per-request
 # + DO storage proportional to staging data (idle stagings are near-zero).
 # See DEPLOY.md "Pre-deploy testing" for usage.
+#
+# WARNING: `--env staging` INHERITS the top-level `routes` above, including
+# the `custom_domain = true` entries. A staging deploy will therefore
+# reassign woah/woah1 to the staging worker (a named-env canary deploy did
+# exactly this — see notes/2026-07-10-canary-domain-incident.md). Only use
+# this env when the production config has no custom-domain routes; otherwise
+# run a dedicated standalone config with no `routes` (see
+# wrangler.net-canary.template.toml).
 #
 # [env.staging]
 # name = "woah-staging"

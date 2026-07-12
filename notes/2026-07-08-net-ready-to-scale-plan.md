@@ -534,3 +534,12 @@ load 2/2.
   live data (cf-do-0004 freeze).
 
 First-deploy ready-to-scale = Phases 0–5 green + Phase 6 hint stamped.
+
+---
+
+## FOLLOW-UP LANDED (2026-07-12)
+
+The "post-first-deploy by design" multi-shard `/net-api` routing has
+shipped: `src/worker/net/gateway-routing.ts` (8-way, session/ticket
+shard-hint routing), canary-accepted. See the cutover plan note's "NC8
+SCALE COMPLETE" section.
