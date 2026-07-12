@@ -1,12 +1,15 @@
 # Gap-0 native ports — status + execution-ready follow-up (2026-07-12)
 
 Net-cutover layering item 3: port cold-path native verbs to compiled
-woocode so the seeded world captures the behaviour in its own
-`verb_bytecode` cells instead of being pinned to worker code. A native has
-no bytecode, so the net planner cannot pull it (`src/net/plan.ts` → the
-pull loop hits `E_BUDGET`) — a native cold-path verb is unavailable over
-the net surface. Porting makes these verbs net-dispatchable and drains
-superstructure out of `world.ts`.
+woocode so the seeded world captures the behaviour instead of being pinned
+to worker code. Review correction: native `VerbDef` pages DO ride the net
+`verb_bytecode` cell kind, and an ephemeral planning `WooWorld` registers
+the substrate native handlers before importing those pages. Native verbs
+are therefore net-dispatchable while the matching worker capability exists;
+`tests/net/bridge.test.ts` pins this with `$actor:focus_list` through the
+cell round trip. Porting remains valuable because it drains superstructure
+out of `world.ts`, makes behavior world-owned, and removes rolling-deploy
+coupling. It is not, by itself, a cutover availability requirement.
 
 ## Done
 
@@ -20,10 +23,9 @@ the wizard flag and drive catalog installation).
 ## Deferred (grounded; do test-driven, not rushed into the permanent seed)
 
 These are all cold-path (not per-turn), so leaving them native is not a
-cutover blocker — but they should be ported before the net path becomes the
-sole surface if the verbs must ride net. Each carries authoring risk best
-resolved against the existing tests as the gate, which is why they were not
-rushed at the end of a long multi-item session.
+cutover blocker. They should still be ported to reduce substrate/catalog
+coupling. Each carries authoring risk best resolved against the existing
+tests as the gate.
 
 ### features — `add_feature` / `remove_feature` / `has_feature` (on `$actor`, `$space`)
 - Native: `world.ts` `addFeature` (9020–9038), `removeFeature` (9040–9051),
@@ -79,8 +81,8 @@ rushed at the end of a long multi-item session.
 - There is no DSL builtin for a global player-name match, and adding one
   would introduce a global-enumeration primitive into woocode — a Big-World
   violation (the same class of problem as `connected_players`, item 6). So
-  this is a design decision, not a port: either keep it native (and
-  net-unavailable — acceptable for a rarely-used convenience), or redefine
+  this is a design decision, not a port: either keep the current
+  partial/global native behavior, or redefine
   `@join` with location/connected-scoped match semantics. Recommend keeping
   it native until the semantics are decided; do not add a global
   `match_player` builtin.

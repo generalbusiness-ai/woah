@@ -301,7 +301,7 @@
               "object"
             ],
             "resolve": "object",
-            "command": { "dobj": "object", "prep": "any", "iobj": "any", "args_from": ["dobj_prefix"] }
+            "command": { "dobj": "object", "prep": "any", "iobj": "any", "args_from": ["dobj_prefix"], "persistence": "durable" }
           },
           "source": "verb :drop(object) rx { let pin = object; if (typeof(object) == \"string\") { pin = $match:match_object(object, actor); } if (pin == $failed_match) { raise { code: \"E_INVARG\", message: \"You are not carrying \" + object + \".\", value: object }; } if (pin == $ambiguous_match) { raise { code: \"E_AMBIGUOUS\", message: \"I don't know which \" + object + \" you mean.\", value: object }; } if (location(pin) != actor) { raise { code: \"E_INVARG\", message: \"You are not carrying \" + object + \".\", value: pin }; } if (!isa(pin, $note)) { raise { code: \"E_INVARG\", message: \"only notes can be dropped on the pinboard\", value: pin }; } moveto(pin, this); return pin; }"
         },
@@ -318,7 +318,7 @@
               "pin"
             ],
             "resolve": "object",
-            "command": { "dobj": "object", "prep": "any", "iobj": "any", "args_from": ["dobj_prefix"] }
+            "command": { "dobj": "object", "prep": "any", "iobj": "any", "args_from": ["dobj_prefix"], "persistence": "durable" }
           },
           "source": "verb :take(pin) rx { if (location(pin) != this) { raise { code: \"E_INVARG\", message: \"that note is not on this board\", value: pin }; } if (pin.owner != actor && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"only the pin's author may take it; board owners use eject\", value: pin }; } moveto(pin, actor); return pin; }"
         },

@@ -16,7 +16,7 @@
  * (they collapse every DO into one world image, so `connected_players` returns
  * everyone). Only a deployed canary with guests spread across >=2 real shards
  * exposes it. This check measures and reports the partial view; pass
- * `--enforce-who` to make a detected partial view a non-zero exit.
+ * `--enforce-who` to require conclusive, complete-roster evidence.
  */
 
 import { sessionShardHint } from "../src/net/session-id";
@@ -46,6 +46,11 @@ export type WhoCheckSummary = {
   partial: boolean;
   examples: Array<{ actor: string; shard: string | null; seen: number; missing: string[] }>;
 };
+
+/** Enforcement requires both a conclusive run and a complete roster. */
+export function whoCheckFailsAcceptance(summary: WhoCheckSummary): boolean {
+  return !summary.ran || summary.partial;
+}
 
 /**
  * Pure partial-view summary. A responder "sees" a guest when that guest's
@@ -321,9 +326,13 @@ async function main(): Promise<void> {
       `across ${whoCheck.distinct_shards} shards — connected_players is a global enumeration and returns a per-shard ` +
       `partial roster (Big-World violation). ${enforceWho ? "Failing (--enforce-who)." : "Reported (pass --enforce-who to gate)."}`
     );
-    if (enforceWho) process.exitCode = 3;
+    if (enforceWho && whoCheckFailsAcceptance(whoCheck)) process.exitCode = 3;
   } else if (whoCheck && !whoCheck.ran) {
     console.error(`who_all partial-view check inconclusive: ${whoCheck.reason}`);
+    // Acceptance evidence is fail-closed: a one-shard run cannot establish
+    // that the cross-shard roster is complete, so enforcement must not turn
+    // an inconclusive sample into a pass.
+    if (enforceWho && whoCheckFailsAcceptance(whoCheck)) process.exitCode = 3;
   }
   if (failures.length > 0 || closeFailures.length > 0) process.exitCode = 2;
 }

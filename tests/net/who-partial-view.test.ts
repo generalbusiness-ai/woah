@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { summarizeWhoCheck, type WhoRosterInput } from "../../scripts/net-canary-load";
+import { summarizeWhoCheck, whoCheckFailsAcceptance, type WhoRosterInput } from "../../scripts/net-canary-load";
 
 // Unit coverage for the pure partial-view summary used by the deployed-canary
 // who_all check (net-cutover layering item 6). The LIVE partial view is a
@@ -26,6 +26,7 @@ describe("summarizeWhoCheck (who_all partial-view canary logic)", () => {
     expect(out.ran).toBe(false);
     expect(out.reason).toMatch(/single shard/);
     expect(out.distinct_shards).toBe(1);
+    expect(whoCheckFailsAcceptance(out)).toBe(true);
   });
 
   it("reports no partial view when every responder sees the full connected set", () => {
@@ -39,6 +40,7 @@ describe("summarizeWhoCheck (who_all partial-view canary logic)", () => {
     expect(out.min_seen).toBe(4);
     expect(out.responders).toBe(4);
     expect(out.distinct_shards).toBe(2);
+    expect(whoCheckFailsAcceptance(out)).toBe(false);
   });
 
   it("detects the sharded partial view when each responder sees only its own shard", () => {

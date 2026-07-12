@@ -134,6 +134,29 @@ describe("serializedFromCells (the inverse)", () => {
     }));
   });
 
+  it("executes a native verb page after the net-cell round trip", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:bridge-native");
+    const cells = cellsFromSerialized(world.exportWorld());
+    const nativePage = byKey(cells, "verb_bytecode", "$actor", "focus_list")?.value as Record<string, unknown>;
+    expect(nativePage).toMatchObject({ kind: "native", native: "actor_focus_list" });
+
+    const call: ShadowTurnCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "bridge-native-focus-list",
+      route: "direct",
+      scope: "#-1",
+      session: session.id,
+      actor: session.actor,
+      target: session.actor,
+      verb: "focus_list",
+      args: []
+    };
+    const run = await runShadowTurnCallTranscript(planningWorldFromCells(cells), call);
+    expect(run.frame).toMatchObject({ op: "result", result: [] });
+    expect(run.transcript.complete).toBe(true);
+  });
+
   it("cells for an object without lineage are a closure violation (E_LINEAGE assert)", () => {
     try {
       serializedFromCells([{ kind: "object_live", object: "#ghost", value: { location: null } }]);

@@ -102,6 +102,28 @@ describe("moveto", () => {
     expect(world.object(item).location).toBe(target);
   });
 
+  it("does not dispatch an actor's moveto override on the session path", async () => {
+    const { world, auth } = await setupMovetoWorld("moveto-actor-fork");
+    definePropertyVersionedAs(world, auth.actor, auth.actor, "override_calls", 0, "rw", null, "int");
+    installVerbAs(world, auth.actor, auth.actor, "moveto", `verb :moveto(target) rxd {
+  this.override_calls = this.override_calls + 1;
+  return moveto(this, target);
+}`, null);
+
+    const result = await world.directCall(
+      "moveto-actor-fork",
+      auth.actor,
+      auth.actor,
+      "do_move",
+      [auth.actor, "the_dubspace"],
+      { sessionId: auth.id }
+    );
+
+    expect(result.op).toBe("result");
+    expect(world.activeScopeForSession(auth.id)).toBe("the_dubspace");
+    expect(world.getProp(auth.actor, "override_calls")).toBe(0);
+  });
+
   it("rejects callers that don't control the moving object with E_PERM", async () => {
     const world = createWorld();
     const owner = world.auth("guest:moveto-owner");
