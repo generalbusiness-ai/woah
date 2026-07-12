@@ -64,6 +64,34 @@ describe("outbox drain (D1 semantics)", () => {
     expect(result.failed).toEqual(["shard-bad/the_room/1"]);
   });
 
+  it("starts independent destination lanes concurrently while each lane remains ordered", async () => {
+    const outbox = new Outbox();
+    outbox.enqueue("shard-a", body(1));
+    outbox.enqueue("shard-a", body(2));
+    outbox.enqueue("shard-b", body(1, "#other"));
+    const started: string[] = [];
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+
+    const draining = outbox.drain(1000, async (row) => {
+      started.push(`${row.destination}:${row.body.seq}`);
+      if (row.body.seq === 1) await blocked;
+    });
+
+    // drain() reaches both lane-head callbacks synchronously before its
+    // Promise.all yields. A serial lane loop would contain only shard-a
+    // here and remain blocked forever waiting for release.
+    expect(started).toEqual(["shard-a:1", "shard-b:1"]);
+    release();
+    const result = await draining;
+    expect(started).toEqual(["shard-a:1", "shard-b:1", "shard-a:2"]);
+    expect(result.delivered).toEqual([
+      "shard-a/the_room/1",
+      "shard-a/the_room/2",
+      "shard-b/the_room/1"
+    ]);
+  });
+
   it("abandons a row after the attempt budget — named divergence, not silent loss", async () => {
     const outbox = new Outbox({ backoffMs: () => 0, maxAttempts: 3 });
     outbox.enqueue("shard-1", body(1));

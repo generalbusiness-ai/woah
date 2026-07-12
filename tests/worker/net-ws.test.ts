@@ -84,6 +84,7 @@ afterAll(() => {
  * enqueue nothing further), so settle() drains until quiescent. */
 function netState(name: string, deferred: Array<Promise<unknown>>) {
   const fake = new FakeDurableObjectState(name);
+  let alarmAt: number | null = null;
   const state = {
     id: fake.id,
     waitUntil: (promise: Promise<unknown>) => {
@@ -94,11 +95,22 @@ function netState(name: string, deferred: Array<Promise<unknown>>) {
     storage: {
       sql: fake.storage.sql,
       transactionSync: fake.storage.transactionSync,
-      setAlarm: (_at: number) => {},
-      deleteAlarm: () => {}
+      setAlarm: (at: number) => { alarmAt = at; },
+      deleteAlarm: () => { alarmAt = null; }
     }
   } satisfies NetScopeDurableState & NetGatewayDurableState & { acceptWebSocket: unknown; getWebSockets: unknown };
-  return { state, fake, close: () => fake.close() };
+  return {
+    state,
+    fake,
+    /** Claim one due durable alarm. Future session-reap alarms remain
+     * parked; immediate outbox continuations fire through DO.alarm(). */
+    takeDueAlarm: (now: number): boolean => {
+      if (alarmAt === null || alarmAt > now) return false;
+      alarmAt = null;
+      return true;
+    },
+    close: () => fake.close()
+  };
 }
 
 async function clientFetch(
@@ -242,6 +254,7 @@ async function buildHarness(gatewayEnvExtra: Partial<NetGatewayEnv> = {}) {
   const deferred: Array<Promise<unknown>> = [];
   const states: Array<ReturnType<typeof netState>> = [];
   const scopeDOs = new Map<string, NetScopeDO>();
+  const scopeStates = new Map<string, ReturnType<typeof netState>>();
   let gateway: NetGatewayDO;
   const resolve = (destination: string) => {
     if (destination === "gateway:net-api") return gateway;
@@ -262,11 +275,21 @@ async function buildHarness(gatewayEnvExtra: Partial<NetGatewayEnv> = {}) {
     const seeded = await instance.fetch(await signInternalRequest(scopeEnv, seedRequest));
     expect(seeded.ok).toBe(true);
     states.push(st);
+    scopeStates.set(scope, st);
     scopeDOs.set(scope, instance);
   }
 
   const gatewayState = netState("gateway-net-api", deferred);
-  const gatewayEnv: NetGatewayEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve, ...gatewayEnvExtra };
+  // The fake state's id is `gateway-net-api`, but the harness resolver
+  // deliberately registers the production-shaped logical destination
+  // `gateway:net-api`. Pin self-subscription to that same name so the
+  // fixture cannot manufacture an unresolvable duplicate subscriber.
+  const gatewayEnv: NetGatewayEnv = {
+    WOO_INTERNAL_SECRET: SECRET,
+    NET_RESOLVE: resolve,
+    NET_GATEWAY_SELF: "gateway:net-api",
+    ...gatewayEnvExtra
+  };
   gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
   states.push(gatewayState);
 
@@ -282,10 +305,24 @@ async function buildHarness(gatewayEnvExtra: Partial<NetGatewayEnv> = {}) {
     expect(response.ok).toBe(true);
   };
 
-  /** Drain every deferred delivery to quiescence (cross-DO chains). */
+  /** Drain every deferred delivery and due durable alarm to quiescence.
+   * Incoming /relate deliberately crosses an alarm event before refan
+   * (CO2.7), so a no-op alarm fake would strand the final presence row
+   * until an unrelated request happened to reactivate that scope. */
   const settle = async (): Promise<void> => {
-    while (deferred.length > 0) {
-      await deferred.shift()?.catch(() => {});
+    for (;;) {
+      while (deferred.length > 0) {
+        await deferred.shift()?.catch(() => {});
+      }
+      let fired = false;
+      const now = Date.now();
+      for (const [scope, instance] of scopeDOs) {
+        const scopeState = scopeStates.get(scope);
+        if (!scopeState?.takeDueAlarm(now)) continue;
+        fired = true;
+        await instance.alarm();
+      }
+      if (!fired && deferred.length === 0) return;
     }
   };
 

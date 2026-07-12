@@ -167,6 +167,11 @@ a crash or eviction. Actor reply time and peer-visible delivery latency
 MUST be independent of audience size; delivery cost is O(distinct occupant
 shards), never O(active_sessions).
 
+Destination lanes have no cross-lane ordering dependency and MUST drain
+concurrently, while rows within each destination remain strictly serial in
+`(scope, seq)` order. A slow or backing-off subscriber cannot add its
+delivery latency to healthy subscribers' lanes.
+
 An incoming outbox delivery MUST NOT synchronously continue another
 outbox drain in the same platform request lineage. `/adopt` and `/relate`
 persist their derived fanout/refan rows, arm an immediate Durable Object

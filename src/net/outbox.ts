@@ -124,17 +124,20 @@ export class Outbox {
    * Deliver pending rows: per destination, in (scope, seq) order, halting
    * that destination's lane on the first failure so order is preserved.
    * Rows inside their backoff window are skipped (and halt their lane —
-   * delivering seq+1 before seq would break per-scope order).
+   * delivering seq+1 before seq would break per-scope order). Distinct
+   * destinations have no ordering dependency, so their lanes run
+   * concurrently; serializing them would make one slow subscriber add its
+   * latency to every other subscriber's delivery.
    */
   async drain(now: number, deliver: (row: FanoutRow) => Promise<void>): Promise<DrainResult> {
-    const result: DrainResult = { delivered: [], failed: [], abandoned: [], skipped_backoff: [] };
     const lanes = new Map<string, FanoutRow[]>();
     for (const row of this.pending()) {
       const lane = lanes.get(row.destination) ?? [];
       lane.push(row);
       lanes.set(row.destination, lane);
     }
-    for (const lane of lanes.values()) {
+    const drainLane = async (lane: FanoutRow[]): Promise<DrainResult> => {
+      const result: DrainResult = { delivered: [], failed: [], abandoned: [], skipped_backoff: [] };
       lane.sort((a, b) => a.body.scope.localeCompare(b.body.scope) || a.body.seq - b.body.seq);
       for (const row of lane) {
         if (row.last_attempt_at_ms !== null && now < row.last_attempt_at_ms + this.backoffMs(row.attempts, row.id)) {
@@ -157,6 +160,19 @@ export class Outbox {
           break; // halt the lane; retry after backoff
         }
       }
+      return result;
+    };
+
+    // Promise.all starts every independent lane before awaiting any one of
+    // them. Merge in Map insertion order afterward so callers and metrics
+    // retain deterministic result arrays despite concurrent delivery.
+    const laneResults = await Promise.all([...lanes.values()].map(drainLane));
+    const result: DrainResult = { delivered: [], failed: [], abandoned: [], skipped_backoff: [] };
+    for (const lane of laneResults) {
+      result.delivered.push(...lane.delivered);
+      result.failed.push(...lane.failed);
+      result.abandoned.push(...lane.abandoned);
+      result.skipped_backoff.push(...lane.skipped_backoff);
     }
     return result;
   }
