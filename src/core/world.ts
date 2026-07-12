@@ -10340,7 +10340,9 @@ export class WooWorld {
         migration
       }) as unknown as WooValue;
     });
-    this.nativeHandlers.set("catalog_registry_list", () => this.propOrNull("$catalog_registry", "installed_catalogs"));
+    // catalog_registry_list is now a compiled sourceVerb (bootstrap.ts) —
+    // `verb :list() rxd { return this.installed_catalogs; }` — so it carries
+    // verb_bytecode and rides the net path; no native handler is needed.
     this.nativeHandlers.set("catalog_registry_migration_state", (_ctx, args) => {
       const alias = assertString(args[0] ?? "");
       const records = this.propOrNull("$catalog_registry", "installed_catalogs");

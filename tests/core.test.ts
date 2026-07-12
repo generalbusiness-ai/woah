@@ -919,6 +919,18 @@ describe("woo core", () => {
     expect(world.verbInfo("the_dubspace", "set_control").source).toContain("target.(name)");
     expect(world.verbInfo("the_dubspace", "start_loop").bytecode_version).toBeGreaterThan(0);
     expect(world.verbInfo("the_chatroom", "say").definer).toBe("$conversational");
+    // catalog_registry:list is now a compiled sourceVerb (net-cutover item 3),
+    // not a native — it must carry bytecode and return installed_catalogs.
+    expect(world.verbInfo("$catalog_registry", "list").bytecode_version).toBeGreaterThan(0);
+  });
+
+  it("catalog_registry:list returns installed_catalogs via the ported sourceVerb", async () => {
+    const world = createWorld();
+    const listed = await world.directCall("registry-list", "$wiz", "$catalog_registry", "list", []);
+    expect(listed.op).toBe("result");
+    if (listed.op === "result") {
+      expect(listed.result).toEqual(world.getProp("$catalog_registry", "installed_catalogs"));
+    }
   });
 
   it("can boot without demo catalogs and install them later", async () => {

@@ -1234,7 +1234,12 @@ function seedUniversal(world: WooWorld): void {
   native(world, "$space", "replay", "replay", "verb :replay(from_seq, limit) rxd { ... }", { directCallable: true });
   native(world, "$catalog_registry", "install", "catalog_registry_install", "verb :install(manifest, frontmatter, alias, provenance) rx { ... }");
   native(world, "$catalog_registry", "update", "catalog_registry_update", "verb :update(manifest, frontmatter, alias, provenance, options, migration) rx { ... }");
-  native(world, "$catalog_registry", "list", "catalog_registry_list", "verb :list() rxd { ... }", { directCallable: true });
+  // Ported from a native() to a compiled sourceVerb (net-cutover item 3): a
+  // single property read needs no native capability, and as verb_bytecode it
+  // is dispatchable over the net path (natives have no bytecode to pull). The
+  // install/update/migration_state siblings stay native — they gate on the
+  // wizard flag and drive catalog installation.
+  sourceVerb(world, "$catalog_registry", "list", "verb :list() rxd { return this.installed_catalogs; }", { directCallable: true });
   native(world, "$catalog_registry", "migration_state", "catalog_registry_migration_state", "verb :migration_state(alias) rxd { ... }", { directCallable: true });
 }
 
