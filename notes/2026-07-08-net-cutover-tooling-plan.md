@@ -33,10 +33,18 @@ the dual-stack Worker is redeployed with net selection off:
    password. An unfrozen export proves identity shape only; it does not prove
    the acknowledged freeze fence. A full rehearsal requires either a brief
    owner-approved v2 freeze or an independently consistent production snapshot.
-2. **Global presence semantics.** `connected_players()`/`who_all` and
-   `join_player` currently see a gateway-local partial world under sharding.
-   Implement scoped or aggregated presence without global object enumeration,
-   then require `load:net-canary -- --enforce-who` to pass conclusively.
+2. **Global presence semantics.** *(Code implemented 2026-07-12; deployed
+   confirmation remains.)* The global enumerations are removed: `who_all` is
+   presence-scoped (`active_actors` of the caller's room), `connected_players`
+   is retired (tombstoned `_dead_connected_players`), and `join_player`
+   resolves only an explicit `$player` ref (no `this.objects` scan). No-arg
+   `@who` now lists the caller's co-present room roster, read from the room's
+   owner-anchored presence rows — the same answer on every shard.
+   **Remaining (owner-gated):** run `load:net-canary -- --enforce-who` against
+   a deployed multi-shard canary and confirm every guest returns the complete
+   co-present roster (the driver now enters all guests into one room and fails
+   on any partial or inconclusive result). This is a deploy-only signal the
+   workerd-local lanes cannot produce.
 3. **Deployed scale envelope.** Measure per-shard saturation, sustained rate,
    a room larger than 30 occupants, geographically separated traffic, cold vs
    warm shard attribution, memory/growth during a soak, and recovery after

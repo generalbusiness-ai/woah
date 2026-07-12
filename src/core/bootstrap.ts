@@ -111,7 +111,18 @@ const PLAYER_WHO_ALL_SOURCE = `verb :who_all(names) rxd {
   if (names != null) { requested = str_trim(to_string(names)); }
   let players = [];
   if (requested == "") {
-    players = connected_players();
+    // Big-World presence: no-arg @who lists the actors CO-PRESENT in the
+    // caller's current space (the same scoped set look/room_roster show), not a
+    // global enumeration of every logged-in player. connected_players() was a
+    // global session scan that returns a per-shard partial roster under
+    // sharding; active_actors(<scope>) reads only the space's own presence
+    // rows (owner-anchored, CO13), so it is correct on any shard.
+    let here = location(this);
+    if (here != null && valid(here)) {
+      for who in active_actors(here) {
+        if (valid(who) && isa(who, $player) && !(who in players)) { players = players + [who]; }
+      }
+    }
   } else {
     let raw_tokens = str_split(requested, " ");
     for token in raw_tokens {

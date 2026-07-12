@@ -7,16 +7,18 @@
  * cross-shard authority contention. Every response is decoded and classified;
  * HTTP failures can no longer disappear behind a sampled tail.
  *
- * It also runs a `who_all` partial-view check (item 6 of the net-cutover
- * layering work): `connected_players` is a GLOBAL session enumeration
- * (src/core/world.ts connectedPlayerRefs), so on the sharded /net-api surface
- * a single gateway shard only holds its own guests' session cells. Each guest
- * running `@who` therefore sees only the ~1/N of players routed to its shard —
- * a Big-World violation that the workerd-local lanes STRUCTURALLY cannot catch
- * (they collapse every DO into one world image, so `connected_players` returns
- * everyone). Only a deployed canary with guests spread across >=2 real shards
- * exposes it. This check measures and reports the partial view; pass
- * `--enforce-who` to require conclusive, complete-roster evidence.
+ * It also runs a `who_all` roster-completeness check. `who_all` is now
+ * presence-scoped (`active_actors` of the caller's room; the global
+ * `connected_players` enumeration was retired), so a guest's `@who` must
+ * return the COMPLETE co-present roster read from the room's owner-anchored
+ * presence rows — the same answer on every gateway shard. This check enters
+ * all guests into one room, then has each run `@who` and cross-references the
+ * rosters: any shard that returns a partial roster means the room's presence
+ * is not being read completely across shards (a distributed-presence
+ * regression the workerd-local lanes STRUCTURALLY cannot catch — they collapse
+ * every DO into one world image). Only a deployed canary with guests spread
+ * across >=2 real shards exercises it. Pass `--enforce-who` to require
+ * conclusive, complete-roster evidence (fails on partial OR inconclusive).
  */
 
 import { sessionShardHint } from "../src/net/session-id";
@@ -206,6 +208,33 @@ async function main(): Promise<void> {
       guests.push({ actor: body.actor, session: body.session, elastic: body.elastic === true });
     }
 
+    // Establish co-presence: every guest enters the shared room so its session
+    // activeScope is that room. The who_all check below is presence-scoped
+    // (active_actors of the caller's room), so guests must actually be present
+    // in one room for a complete roster to be the correct answer — otherwise a
+    // guest sitting in its own cluster would correctly see only itself and the
+    // completeness assertion would be meaningless. Failures here are recorded
+    // like any other turn outcome.
+    const enterBatch = await Promise.all(guests.map(async (guest, index): Promise<Outcome> => {
+      const started = performance.now();
+      try {
+        const { response, body, ms } = await jsonFetch(`${base}/net-api/turn`, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer session:${guest.session}` },
+          body: JSON.stringify({ target: room, verb: "enter", args: [], idempotency_key: `${run}-enter-${index}` })
+        });
+        const reply = body.reply as { status?: unknown } | undefined;
+        const error = body.error as { code?: unknown } | string | undefined;
+        const code = typeof error === "object" && error !== null && typeof error.code === "string"
+          ? error.code
+          : typeof error === "string" ? error : response.ok ? String(reply?.status ?? "ok") : `HTTP_${response.status}`;
+        return { status: response.status, ms, code, accepted: response.ok && reply?.status === "accepted", detail: JSON.stringify(body).slice(0, 1_000) };
+      } catch (err) {
+        return { status: 0, ms: Math.round(performance.now() - started), code: "E_FETCH", accepted: false, detail: String(err).slice(0, 1_000) };
+      }
+    }));
+    outcomes.push(...enterBatch);
+
     for (let round = 0; round < rounds; round += 1) {
       const requests = guests.flatMap((guest, actorIndex) =>
         Array.from({ length: requestsPerActor }, (_, slot) => {
@@ -260,8 +289,11 @@ async function main(): Promise<void> {
       }
     }
 
-    // Guests are now connected (the rounds above enter/act on the room), so
-    // connected_players will count them. Measure the sharded partial view.
+    // Guests are co-present in the room (entered above), so a correct scoped
+    // who_all must return the COMPLETE co-present roster on every shard. This
+    // check now verifies that completeness (a regression gate) rather than
+    // documenting the old connected_players partial view; --enforce-who fails
+    // the run on any partial or inconclusive result.
     whoCheck = await runWhoCheck(base, guests, run);
   } finally {
     await Promise.all(guests.map(async (guest) => {

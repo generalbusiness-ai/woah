@@ -296,6 +296,20 @@ item; what remains is exactly what the workerd lanes cannot prove
   minimum duration and the full evidence envelope, and exits 2 if the
   maximum duration expires without sufficient healthy evidence. Sampled
   `wrangler tail` remains diagnostic only.
+- **Presence is scoped, never globally enumerated — BUILT; deployed
+  confirmation remains.** No public verb may enumerate all sessions or all
+  objects: that returns a per-shard partial view under sharding and violates
+  Big-World discipline. `who_all`/`@who` (no argument) is presence-scoped to
+  the caller's room via `active_actors(<scope>)`, reading the room's
+  owner-anchored session-presence rows (CO13) so the roster is complete on
+  every shard; the former `connected_players` global session scan is retired
+  (tombstoned). `@join`/`join_player` resolves only an explicit `$player`
+  reference — no global object scan and no cross-shard name directory (join by
+  human name is not supported; a co-present player is already in the room).
+  Deployed confirmation: `load:net-canary -- --enforce-who` must return a
+  complete co-present roster from every shard, failing on any partial or
+  inconclusive result — a signal the single-image workerd-local lanes cannot
+  produce.
 - **Gateway sharding — BUILT after the first deployed canary.** Public
   `/net-api` routing uses `NET_API_GATEWAY_SHARDS` named shards. A session
   or WebSocket ticket carries its minting shard; MCP headers, bearer/body/

@@ -94,7 +94,6 @@ describe("woo core", () => {
       return {
         present: present_actors("the_chatroom"),
         active: active_actors("the_chatroom"),
-        players: connected_players(),
         meta: session_metadata(actor),
         visible: visible_contents("the_chatroom"),
         obvious: obvious_verbs("builtin_verb_box")
@@ -108,7 +107,8 @@ describe("woo core", () => {
     expect(result.present).toEqual(expect.arrayContaining([actor, other.actor, observer.actor]));
     expect(result.active).toEqual(expect.arrayContaining([actor, other.actor]));
     expect(result.active).not.toContain(observer.actor);
-    expect(result.players).toEqual(expect.arrayContaining([actor, other.actor]));
+    // connected_players() retired (global enumeration); active_actors(space)
+    // above is the scoped presence primitive that replaces it.
     expect(result.visible).toEqual(expect.arrayContaining(["builtin_visible_box", "builtin_verb_box"]));
     expect(result.meta).toMatchObject({ connected: true });
     expect((result.meta as Record<string, unknown>).connected_at).toEqual(expect.any(Number));

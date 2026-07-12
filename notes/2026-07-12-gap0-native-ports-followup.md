@@ -74,18 +74,20 @@ tests as the gate.
   `record_miss` → `missed_topics`, every topic resolves) and `466–483` (the
   `*verbdoc*` readability gate: guest sees "not readable", wizard sees source).
 
-### join_player (`@join`) — BLOCKED, not a mechanical port
-- Native: `world.ts` `playerJoin` (10866–10905); registered
-  `bootstrap.ts:1147`. It resolves the target via `matchPlayerForCommand`
-  (10955), a **global enumeration of all objects** filtered to `$player`.
-- There is no DSL builtin for a global player-name match, and adding one
-  would introduce a global-enumeration primitive into woocode — a Big-World
-  violation (the same class of problem as `connected_players`, item 6). So
-  this is a design decision, not a port: either keep the current
-  partial/global native behavior, or redefine
-  `@join` with location/connected-scoped match semantics. Recommend keeping
-  it native until the semantics are decided; do not add a global
-  `match_player` builtin.
+### join_player (`@join`) — global enumeration RESOLVED (2026-07-12); DSL port still optional
+- Native: `world.ts` `playerJoin`; registered `bootstrap.ts:1147`. It
+  previously resolved the target via `matchPlayerForCommand`, a **global
+  enumeration of all objects** filtered to `$player` — a Big-World violation
+  (per-shard partial view, same class as the retired `connected_players`).
+- **Resolved:** `matchPlayerForCommand` now resolves **only an explicit,
+  valid `$player` object reference** (`this.objects.has(ref) &&
+  inheritsFrom(ref, "$player")`); the `this.objects.entries()` scan is gone.
+  `@join <ref>` / `@join #id` work; `@join <human-name>` no longer does a
+  global fuzzy lookup (there is no cross-shard name directory, and a
+  co-present player is already in the room). No `match_player` builtin was
+  added. `join_player` remains a **native** verb — porting it to DSL is
+  optional layering work (it rides the net cell round trip like any native),
+  but its presence/enumeration semantics are now Big-World-correct.
 
 ## Pattern for the ports (reference)
 Convert `native(world, obj, name, handler, "...stub...", opts)` →

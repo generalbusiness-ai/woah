@@ -10906,19 +10906,6 @@ export class WooWorld {
     return { room: dest, from: old, target, here_request: true, look_deferred: true } as unknown as WooValue;
   }
 
-  connectedPlayerRefs(): ObjRef[] {
-    const seen = new Set<ObjRef>();
-    for (const session of this.sessions.values()) {
-      if (!this.actorIsConnected(session.actor)) continue;
-      if (!this.objects.has(session.actor) || !this.inheritsFrom(session.actor, "$player")) continue;
-      seen.add(session.actor);
-    }
-    return Array.from(seen).sort((left, right) => {
-      const leftName = this.object(left).name || left;
-      const rightName = this.object(right).name || right;
-      return leftName.localeCompare(rightName) || left.localeCompare(right);
-    });
-  }
 
   private playerSessionStats(actor: ObjRef, now: number): { connected: boolean; connectedAt: number | null; connectedSeconds: number | null; idleSeconds: number | null; lastLoginAt: number | null; lastSeenAt: number | null } {
     const liveCutoff = now - IDLE_PRESENCE_LIVE_WINDOW_MS;
@@ -10955,21 +10942,17 @@ export class WooWorld {
   }
 
   private matchPlayerForCommand(input: string): ObjRef | null {
-    const wanted = input.trim().toLowerCase();
+    const wanted = input.trim();
     if (!wanted) return null;
-    const exact: ObjRef[] = [];
-    const prefix: ObjRef[] = [];
-    for (const [id, obj] of this.objects.entries()) {
-      if (!this.inheritsFrom(id, "$player")) continue;
-      const aliasesValue = this.propOrNull(id, "aliases");
-      const names = [id, obj.name, this.propOrNull(id, "name"), ...(Array.isArray(aliasesValue) ? aliasesValue : [])]
-        .filter((item): item is string => typeof item === "string" && item.length > 0)
-        .map((item) => item.toLowerCase());
-      if (names.includes(wanted)) exact.push(id);
-      else if (names.some((name) => name.startsWith(wanted))) prefix.push(id);
-    }
-    const matches = exact.length > 0 ? Array.from(new Set(exact)) : Array.from(new Set(prefix));
-    return matches.length === 1 ? matches[0] : null;
+    // Big-World: no global object enumeration. @join resolves only an
+    // explicit, valid $player object reference — a fuzzy name→player lookup
+    // would require a global scan of every object (or a cross-shard name
+    // directory that does not exist), which returns a per-shard partial view
+    // under sharding. Address the player by ref; joining a co-present player
+    // by name is redundant (they are already in the room). See
+    // spec/operations/net-cutover.md presence semantics.
+    if (this.objects.has(wanted) && this.inheritsFrom(wanted, "$player")) return wanted;
+    return null;
   }
 
   obviousCommandVerbs(target: ObjRef, options: { actor?: ObjRef; executableOnly?: boolean } = {}): VerbDef[] {

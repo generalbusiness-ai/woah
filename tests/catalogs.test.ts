@@ -2988,26 +2988,24 @@ describe("local catalogs", () => {
     const who = await world.command("lambda-who", first.id, "the_chatroom", "@who");
     expect(who.op).toBe("result");
     if (who.op === "result") {
-      expect(who.result).toEqual(expect.arrayContaining([
-        expect.objectContaining({ player: first.actor, location: "the_chatroom", connected_seconds: expect.any(Number), last_login_at: expect.any(Number) }),
-        expect.objectContaining({ player: second.actor, location: "the_deck", connected_seconds: expect.any(Number), last_login_at: expect.any(Number) })
-      ]));
+      // no-arg @who is presence-scoped to the caller's room (Big-World, no
+      // global enumeration): first is here in the_chatroom; second is in
+      // the_deck and must NOT appear in the roster.
+      expect(who.result).toEqual([
+        expect.objectContaining({ player: first.actor, location: "the_chatroom", connected_seconds: expect.any(Number), last_login_at: expect.any(Number) })
+      ]);
+      expect(who.result).not.toContainEqual(expect.objectContaining({ player: second.actor }));
       expect(who.observations).toContainEqual(expect.objectContaining({
         type: "who",
         actor: first.actor,
-        roster: expect.arrayContaining([
-          expect.objectContaining({ id: first.actor }),
-          expect.objectContaining({ id: second.actor })
-        ])
+        roster: [ expect.objectContaining({ id: first.actor }) ]
       }));
     }
     const directWhoNoArgs = await world.directCall("lambda-who-no-args", first.actor, first.actor, "who_all", []);
     expect(directWhoNoArgs.op).toBe("result");
     if (directWhoNoArgs.op === "result") {
-      expect(directWhoNoArgs.result).toEqual(expect.arrayContaining([
-        expect.objectContaining({ player: first.actor }),
-        expect.objectContaining({ player: second.actor })
-      ]));
+      // co-present only: first is alone in the_chatroom.
+      expect(directWhoNoArgs.result).toEqual([ expect.objectContaining({ player: first.actor }) ]);
     }
 
     const secondSession = world.sessions.get(second.id);

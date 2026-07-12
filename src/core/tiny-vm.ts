@@ -175,7 +175,7 @@ export const BUILTIN_NAMES = [
   "presence_status",
   "_dead_room_look_projection", "_dead_room_who_projection",
   "_dead_player_listing_projection", "_dead_object_examine_projection", "_dead_help_topic_projection",
-  "present_actors", "connected_players", "session_metadata", "visible_contents", "obvious_verbs", "remote_describe",
+  "present_actors", "_dead_connected_players", "session_metadata", "visible_contents", "obvious_verbs", "remote_describe",
   "active_actors",
   // Generic projection helpers for catalog code that must build large lists
   // without exercising woocode's functional-list allocation path.
@@ -996,10 +996,10 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         if (builtinArgs.length !== 1) throw wooError("E_INVARG", "active_actors expects one space");
         return frame.ctx.world.activeActorsIn(assertObj(builtinArgs[0])) as unknown as WooValue;
       }
-      case "connected_players": {
-        if (builtinArgs.length !== 0) throw wooError("E_INVARG", "connected_players expects no arguments");
-        return frame.ctx.world.connectedPlayerRefs() as unknown as WooValue;
-      }
+      // connected_players was a GLOBAL session enumeration (Big-World
+      // violation) whose sole consumer, $player:who_all, is now presence-scoped
+      // via active_actors. Retired; slot tombstoned as _dead_connected_players
+      // in BUILTIN_NAMES to keep bytecode indices stable.
       case "session_metadata": {
         if (builtinArgs.length !== 1) throw wooError("E_INVARG", "session_metadata expects one actor");
         return frame.ctx.world.sessionMetadataForActor(assertObj(builtinArgs[0]), frame.ctx.world.logicalNow("session_metadata.now")) as unknown as WooValue;
