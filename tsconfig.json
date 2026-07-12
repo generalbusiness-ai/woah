@@ -12,6 +12,9 @@
     "noUnusedParameters": false,
     "noFallthroughCasesInSwitch": true,
     "skipLibCheck": true,
+    "paths": {
+      "#v2-browser-worker-factory": ["./src/client/v2-browser-worker-factory.ts"]
+    },
     "types": ["node"]
   },
   "include": ["src", "tests", "e2e", "vite.config.ts", "playwright.config.ts"],

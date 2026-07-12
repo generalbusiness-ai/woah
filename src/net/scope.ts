@@ -516,7 +516,7 @@ export class ScopeSequencer {
     // single write path for contents/presence rows. Local rows apply here
     // (durably, in the same transaction below); foreign rows ride the
     // reply for the shell's /net/relate delivery.
-    const derived = deriveRelationDeltas(submit.transcript, applied, this.scope, this.options.scopeOf);
+    const derived = deriveRelationDeltas(submit.transcript, applied, this.scope, this.options.scopeOf, applied.post);
     const changedRelationKeys = applyRelationDeltas(this.relationRows, derived.local);
     const relationsForeign = [...derived.foreign.entries()].map(([scope, deltas]) => ({ scope, deltas }));
 

@@ -56,10 +56,10 @@
  * This class sits beside the v2 DO classes and shares nothing with them;
  * nothing routes production traffic here until Phase 5.
  */
-import { CellStore, cellKey, type Cell } from "../../net/cells";
+import { CellStore, cellKey, makeCell, type Cell } from "../../net/cells";
 import { budgetExhausted, isNetError, netError, NetError, type AttemptTraceEntry, type NetErrorCode } from "../../net/errors";
 import { applyFanout, type FanoutBody } from "../../net/outbox";
-import { relationKey, type RelationDelta, type RelationRow } from "../../net/relations";
+import { relationKey, type RelationDelta, type RelationRow, type SessionPresenceBody } from "../../net/relations";
 import { mintSessionSubmit, sessionCellKey, validateSessionCell } from "../../net/sessions";
 import { sessionIdWithShardHint, ticketIdWithShardHint } from "../../net/session-id";
 import { planTurn, type PlanTurnInput, type PlanTurnResult } from "../../net/plan";
@@ -69,6 +69,7 @@ import type { CommitReply, CommitSubmit, RejectReason, ScheduledTurn, ScopeHead 
 import { netCellKeyFor, type EffectTranscript } from "../../net/transcript";
 import type { CellTransfer } from "../../net/cells";
 import { randomHex } from "../../core/source-hash";
+import type { ShadowTurnCall } from "../../core/shadow-turn-call";
 import { provisionGuestSubmit, type GuestTemplate } from "../../net/guest";
 import { verifyInternalRequest } from "../internal-auth";
 import { emitMetric, type AnalyticsMetric } from "../metrics-sink";
@@ -992,15 +993,20 @@ export class NetGatewayDO {
    * legacy request-supplied classifier wholesale (never mixed with the
    * derivation — a fixture cannot half-override CO15).
    */
-  private classifierFor(request: TurnRequest, view: CellStore): ScopeClassifier {
+  private classifierFor(request: TurnRequest, view: CellStore, planningProjectionCells: readonly Cell[] = []): ScopeClassifier {
     if (request.anchors !== undefined || request.shared !== undefined) {
       return {
         scopeOf: (object) => request.anchors?.[object] ?? request.planningScope,
         isShared: (scope) => (request.shared ?? [request.planningScope]).includes(scope)
       };
     }
+    const projectedLineage = new Map(
+      planningProjectionCells
+        .filter((cell) => cell.kind === "object_lineage")
+        .map((cell) => [cell.object, cell.value as AnchorLineage])
+    );
     return classifierFromLineage(
-      (object) => (view.get(cellKey("object_lineage", object))?.value as AnchorLineage | undefined) ?? null,
+      (object) => projectedLineage.get(object) ?? (view.get(cellKey("object_lineage", object))?.value as AnchorLineage | undefined) ?? null,
       { fallback: request.planningScope }
     );
   }
@@ -1058,7 +1064,8 @@ export class NetGatewayDO {
       // with it (CO15: it is a function of the view's lineage cells, and
       // a recovery may have refreshed them).
       const view = this.ensureView();
-      const classifier = this.classifierFor(request, view);
+      const planningProjectionCells = this.presencePlanningCells(request.call, request.catalog_epoch);
+      const classifier = this.classifierFor(request, view, planningProjectionCells);
 
       // ---- Plan (or adopt the stale_head resubmit).
       let planned: PlanTurnResult;
@@ -1079,7 +1086,7 @@ export class NetGatewayDO {
         try {
           planningHead = await structure.rpc(() => this.scopeHead(this.destinationFor(request, request.planningScope)));
           this.assertTurnEpoch(planningHead, request.catalog_epoch, request.planningScope, trace);
-          planned = await this.planOnce(request, view, classifier, planningHead.object_counter);
+          planned = await this.planOnce(request, view, classifier, planningHead.object_counter, planningProjectionCells);
         } catch (err) {
           if (isNetError(err) && err.code === "E_MISSING_STATE") {
             const missing = Array.isArray(err.detail.missing) ? (err.detail.missing as string[]) : [];
@@ -3210,6 +3217,67 @@ export class NetGatewayDO {
     }));
   }
 
+  /** Ephemeral planning cells for active_actors(room). The room authority's
+   * session_presence relation is complete across gateway shards; each row
+   * carries exact authority-cell projections captured by the one relation
+   * derivation path. These cells are never persisted in the gateway view. */
+  private presencePlanningCells(call: ShadowTurnCall, catalogEpoch: string): Cell[] {
+    const view = this.ensureView();
+    if (!this.callReadsRoomPresence(view, call)) return [];
+    const session = typeof call.session === "string" ? view.get(cellKey("session", call.session)) : undefined;
+    const activeScope = (session?.value as { activeScope?: unknown } | undefined)?.activeScope;
+    const actorLive = view.get(cellKey("object_live", call.actor));
+    const actorLocation = (actorLive?.value as { location?: unknown } | undefined)?.location;
+    const room = typeof activeScope === "string" && activeScope
+      ? activeScope
+      : typeof actorLocation === "string" && actorLocation
+        ? actorLocation
+        : null;
+    if (!room) return [];
+
+    const stamp = { scope_head: "presence-projection", catalog_epoch: catalogEpoch };
+    const cells = new Map<string, Cell>();
+    const put = (cell: Cell): void => {
+      // A fresher ordinary derived cell always wins over the relation's
+      // transition-time projection.
+      if (!view.has(cell.key)) cells.set(cell.key, cell);
+    };
+    for (const row of this.relationMembers("session_presence", room)) {
+      const body = row.body as SessionPresenceBody | undefined;
+      if (!body || typeof body.actor !== "string") continue;
+      if (body.session && typeof body.session === "object") {
+        put(makeCell({ kind: "session", object: row.member, value: body.session, provenance: "derived", stamp }));
+      }
+      if (body.actor_lineage && typeof body.actor_lineage === "object") {
+        put(makeCell({ kind: "object_lineage", object: body.actor, value: body.actor_lineage, provenance: "derived", stamp }));
+      }
+      if (body.actor_live && typeof body.actor_live === "object") {
+        put(makeCell({ kind: "object_live", object: body.actor, value: body.actor_live, provenance: "derived", stamp }));
+      }
+    }
+    return [...cells.values()];
+  }
+
+  /** Resolve only enough verb metadata to decide whether the catalog declared
+   * a room-presence read. Mirrors inherited dispatch order without executing
+   * catalog code and costs O(class chain). */
+  private callReadsRoomPresence(view: CellStore, call: ShadowTurnCall): boolean {
+    let object: string | null = call.target;
+    const seen = new Set<string>();
+    while (object && !seen.has(object)) {
+      seen.add(object);
+      for (const cell of view.cellsForObject(object)) {
+        if (cell.kind !== "verb_bytecode") continue;
+        const verb = cell.value as { name?: unknown; aliases?: unknown; reads_room_presence?: unknown };
+        const names = [verb.name, ...(Array.isArray(verb.aliases) ? verb.aliases : [])];
+        if (names.includes(call.verb)) return verb.reads_room_presence === true;
+      }
+      const lineage = view.get(cellKey("object_lineage", object))?.value as { parent?: unknown } | undefined;
+      object = typeof lineage?.parent === "string" ? lineage.parent : null;
+    }
+    return false;
+  }
+
   /** The scope pinned to an idempotency key, or null (fix 5c). */
   private pinnedScope(idempotencyKey: string): string | null {
     const rows = sqlRows<{ scope: string }>(
@@ -3407,7 +3475,8 @@ export class NetGatewayDO {
     request: TurnRequest,
     view: CellStore,
     classifier: ScopeClassifier,
-    objectCounter?: number
+    objectCounter?: number,
+    planningProjectionCells: readonly Cell[] = []
   ): Promise<PlanTurnResult> {
     return planTurn({
       call: request.call,
@@ -3429,6 +3498,7 @@ export class NetGatewayDO {
       // miss), so the planner world AND the fix-6 snapshot are
       // O(read-set), not O(view).
       slicePlanning: true,
+      planningProjectionCells,
       // Creates over net (client-shell phase i): the planning-scope
       // authority's allocation floor, prefetched with its head, so a
       // planned create's id is fresh at the authority. A lane fixture's

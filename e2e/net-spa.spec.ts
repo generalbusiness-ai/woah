@@ -21,6 +21,23 @@ let base = "";
 let child: ChildProcess | null = null;
 let persistDir = "";
 let credentials: { alice: string; bob: string } = { alice: "", bob: "" };
+const legacyRequests = new WeakMap<Page, string[]>();
+
+/** Net-mode deletion gate: a successful UI assertion is insufficient when
+ * failed v2 fetches are caught as best-effort hydration. Record every legacy
+ * request so each browser proves the net shell is actually v2-independent. */
+function trackLegacyRequests(page: Page): void {
+  const seen: string[] = [];
+  legacyRequests.set(page, seen);
+  page.on("request", (request) => {
+    const pathname = new URL(request.url()).pathname;
+    if (pathname === "/connect" || pathname.startsWith("/api/") || pathname.startsWith("/v2/")) seen.push(`${request.method()} ${pathname}`);
+  });
+}
+
+function expectNoLegacyRequests(...pages: Page[]): void {
+  for (const page of pages) expect(legacyRequests.get(page) ?? []).toEqual([]);
+}
 
 function exec(command: string, args: string[]): Promise<string> {
   return new Promise((resolvePromise, rejectPromise) => {
@@ -68,6 +85,7 @@ test.afterAll(async () => {
 });
 
 async function openSpa(page: Page, apiKey: string): Promise<void> {
+  trackLegacyRequests(page);
   await page.addInitScript((key: string) => {
     localStorage.setItem("woo:net:apikey", key);
   }, apiKey);
@@ -96,6 +114,7 @@ test("the real SPA over the net path: alice's chat line reaches bob's browser", 
   await expect(alice.locator(".chat-feed")).toContainText(text, { timeout: 20_000 });
   // Peer view: presence-routed WS push into bob's reducer-driven chat.
   await expect(bob.locator(".chat-feed")).toContainText(text, { timeout: 20_000 });
+  expectNoLegacyRequests(alice, bob);
 
   await contextA.close();
   await contextB.close();
@@ -109,12 +128,14 @@ test("the route switch selects the net client: bare `/` with empty storage reach
   // v2 shell would instead try /api/me and its own guest flow).
   const context = await browser.newContext();
   const page = await context.newPage();
+  trackLegacyRequests(page);
   await page.goto(`${base}/`);
   await expect(page.locator("[data-login-guest]")).toBeVisible({ timeout: 30_000 });
   // Prove it is the NET door, end-to-end: the guest button claims a pool
   // seat through /net-api/guest and chat boots on the session bearer.
   await page.locator("[data-login-guest]").click();
   await expect(page.locator("[data-chat-input]")).toBeVisible({ timeout: 30_000 });
+  expectNoLegacyRequests(page);
   await context.close();
 });
 
@@ -126,6 +147,7 @@ test("the identity door: guest entry and password sign-in in real browsers, no s
   // the chat shell boots on the minted session bearer.
   const guestContext = await browser.newContext();
   const guest = await guestContext.newPage();
+  trackLegacyRequests(guest);
   await guest.goto(`${base}/?net=1`);
   await expect(guest.locator("[data-login-guest]")).toBeVisible({ timeout: 30_000 });
   await guest.locator("[data-login-guest]").click();
@@ -140,6 +162,7 @@ test("the identity door: guest entry and password sign-in in real browsers, no s
   // the import) and her chat works on the door session.
   const carolContext = await browser.newContext();
   const carol = await carolContext.newPage();
+  trackLegacyRequests(carol);
   await carol.goto(`${base}/?net=1`);
   await expect(carol.locator('[data-login-form] input[name="username"]')).toBeVisible({ timeout: 30_000 });
   await carol.locator('[data-login-form] input[name="username"]').fill("carol@example.com");
@@ -154,12 +177,14 @@ test("the identity door: guest entry and password sign-in in real browsers, no s
   // A WRONG password stays on the card with the fail-closed message.
   const malloryContext = await browser.newContext();
   const mallory = await malloryContext.newPage();
+  trackLegacyRequests(mallory);
   await mallory.goto(`${base}/?net=1`);
   await expect(mallory.locator('[data-login-form] input[name="username"]')).toBeVisible({ timeout: 30_000 });
   await mallory.locator('[data-login-form] input[name="username"]').fill("carol@example.com");
   await mallory.locator('[data-login-form] input[name="password"]').fill("not-her-password");
   await mallory.locator(".login-submit").click();
   await expect(mallory.locator(".login-error")).toContainText("invalid email or password", { timeout: 20_000 });
+  expectNoLegacyRequests(guest, carol, mallory);
 
   await guestContext.close();
   await carolContext.close();
@@ -193,6 +218,7 @@ test("tool-space panels over net: alice's pinboard note renders on bob's board (
   // Peer view: the presence-routed fanout frame reduces on bob's board —
   // the cross-user tool-space class that motivated phase iii.
   await expect(bob.locator(".pin-note textarea")).toHaveValue(text, { timeout: 20_000 });
+  expectNoLegacyRequests(alice, bob);
 
   await contextA.close();
   await contextB.close();

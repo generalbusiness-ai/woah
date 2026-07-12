@@ -271,7 +271,17 @@ describe("CO13 relations over the DO shells", () => {
       gatewayEnv,
       `/relation?relation=session_presence&owner=${encodeURIComponent("#room")}`
     );
-    expect(presence.members).toEqual([{ member: "s1", body: { actor: "#actor" } }]);
+    expect(presence.members).toEqual([
+      {
+        member: "s1",
+        body: expect.objectContaining({
+          actor: "#actor",
+          session: expect.objectContaining({ id: "s1", actor: "#actor" }),
+          actor_lineage: expect.objectContaining({ name: "actor" }),
+          actor_live: expect.objectContaining({ location: "#room" })
+        })
+      }
+    ]);
 
     // Redelivery of the processed relate no-ops below the high-water:
     // no row churn, no head movement, no second refan (CO2.5).

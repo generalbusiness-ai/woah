@@ -1,0 +1,29 @@
+# Deletion-readiness build profile. This is intentionally a distinct Worker
+# identity with only the net DO classes: `npm run build:net-only` proves the
+# production surface bundles without any v2 Durable Object implementation.
+name = "woah-net-only-build"
+main = "src/worker/net-only-index.ts"
+compatibility_date = "2026-04-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+run_worker_first = true
+
+[vars]
+NET_API_GATEWAY_SHARDS = "8"
+NET_RPC_TIMEOUT_MS = "5000"
+
+[[durable_objects.bindings]]
+name = "SCOPE_NET"
+class_name = "NetScopeDO"
+
+[[durable_objects.bindings]]
+name = "GATEWAY_NET"
+class_name = "NetGatewayDO"
+
+[[migrations]]
+tag = "net-only-v1"
+new_sqlite_classes = ["NetGatewayDO", "NetScopeDO"]

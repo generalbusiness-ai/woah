@@ -28,6 +28,7 @@ import { v2ProjectionSnapshotFromMessage, v2TurnResultRoute, type V2AppliedFrame
 import { sessionActiveScopeFromRecord } from "../core/types";
 import { NetFeed } from "./net-feed";
 import { wireNetFeed } from "./net-feed-adapter";
+import { createV2BrowserWorker } from "#v2-browser-worker-factory";
 import type { ChatLine, ChatSpaceData, ChatTitleBadge, SpaceChatPanelData } from "../../catalogs/chat/ui/chat-space";
 import type { DubspaceData } from "../../catalogs/dubspace/ui/dubspace-workspace";
 import type { PinboardData } from "../../catalogs/pinboard/ui/pinboard-board";
@@ -828,6 +829,9 @@ function connect() {
 }
 
 function ensureV2BrowserWorker() {
+  // Compile-time deletion boundary. The net-only Vite profile erases the
+  // Worker constructor, so Rollup does not emit the 800+ KiB v2 worker asset.
+  if (__WOO_NET_ONLY__) return;
   if (v2BrowserWorker) {
     syncV2BrowserWorkerScope();
     return;
@@ -837,7 +841,8 @@ function ensureV2BrowserWorker() {
   const token = authToken();
   if (!token) return;
   // The v2 worker owns the durable browser-side cache and reconnect loop.
-  v2BrowserWorker = new Worker(new URL("./v2-browser-worker.ts", import.meta.url), { type: "module" });
+  v2BrowserWorker = createV2BrowserWorker();
+  if (!v2BrowserWorker) return;
   if (v2TestHooksEnabled) (window as unknown as { __wooV2BrowserWorker?: Worker }).__wooV2BrowserWorker = v2BrowserWorker;
   v2BrowserWorker.addEventListener("message", (event) => {
     if (event.data?.kind === "browser_metric") queueBrowserMetric(event.data.metric);
@@ -1898,6 +1903,7 @@ async function fetchScopedObjectSummary(id: string): Promise<any | undefined> {
   if (!id) return undefined;
   const cached = state.scopedObjectSummaries[id] ?? (isCompleteScopedSummary(ui.observe(id)) ? ui.observe(id) : undefined);
   if (cached) return cached;
+  if (netMode()) return fetchNetObjectSummary(id);
   const response = await trackedFetch(`/api/objects/${encodeURIComponent(id)}/summary`, { headers: authHeaders() });
   if (!response.ok) throw new Error(`/api/objects/${id}/summary ${response.status}`);
   const summary = await response.json();
@@ -1918,12 +1924,57 @@ function isCompleteScopedSummary(summary: any): boolean {
 // navigation" cache shortcut: thin room-contents summaries carry parent and
 // ancestors, satisfying that shortcut, but still lack the props a title-badge
 // component needs. Field-level fills must hit the network.
-async function fetchObjectSummaryForFill(subject: string): Promise<void> {
+async function fetchObjectSummaryForFill(subject: string, fields: readonly string[]): Promise<void> {
+  if (netMode()) {
+    await fetchNetObjectSummary(subject, fields);
+    return;
+  }
   const response = await trackedFetch(`/api/objects/${encodeURIComponent(subject)}/summary`, { headers: authHeaders() });
   if (!response.ok) throw new Error(`/api/objects/${subject}/summary ${response.status}`);
   const summary = await response.json();
   state.scopedObjectSummaries = { ...state.scopedObjectSummaries, [subject]: summary };
   ui.ingestSnapshot(`summary:${subject}`, [summary]);
+}
+
+/** Build the client summary projection from exact, presence-authorized net
+ * cells. This is deliberately bounded by the component's declared field set:
+ * net mode must never recover missing UI data by calling the v2 whole-object
+ * summary route, and it must not enumerate an object's arbitrary properties. */
+async function fetchNetObjectSummary(subject: string, fields: readonly string[] = []): Promise<any | undefined> {
+  if (!netFeed || !netFeedOpen) return scopedObjectSummary(subject);
+  const names = [...new Set(fields.filter((field) => typeof field === "string" && field.length > 0))].sort();
+  const [lineageCell, liveCell, ...propertyCells] = await Promise.all([
+    netFeed.cell(`object_lineage:${subject}`),
+    netFeed.cell(`object_live:${subject}`),
+    ...names.map((name) => netFeed!.cell(`property_cell:${subject}:${name}`))
+  ]);
+  const lineage = netCellPayload(lineageCell);
+  if (!lineage) return scopedObjectSummary(subject);
+  const live = netCellPayload(liveCell);
+  const props: Record<string, unknown> = {};
+  for (let index = 0; index < names.length; index += 1) {
+    const payload = netCellPayload(propertyCells[index]);
+    if (payload && Object.prototype.hasOwnProperty.call(payload, "value")) props[names[index] as string] = payload.value;
+  }
+  const prior = ui.observe(subject);
+  const summary = {
+    id: subject,
+    name: typeof lineage.name === "string" ? lineage.name : prior?.name ?? subject,
+    owner: typeof lineage.owner === "string" ? lineage.owner : prior?.owner,
+    parent: typeof lineage.parent === "string" || lineage.parent === null ? lineage.parent : prior?.parent,
+    location: typeof live?.location === "string" || live?.location === null ? live.location : prior?.location,
+    flags: lineage.flags && typeof lineage.flags === "object" ? lineage.flags : undefined,
+    props: { ...(prior?.props ?? {}), ...props }
+  };
+  state.scopedObjectSummaries = { ...state.scopedObjectSummaries, [subject]: summary };
+  ui.ingestSnapshot(`net-summary:${subject}`, [summary]);
+  return summary;
+}
+
+function netCellPayload(cell: unknown): Record<string, any> | undefined {
+  if (!cell || typeof cell !== "object" || Array.isArray(cell)) return undefined;
+  const value = (cell as { value?: unknown }).value;
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, any> : undefined;
 }
 
 let projectionFillRenderQueued = false;

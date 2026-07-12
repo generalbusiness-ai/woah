@@ -33,14 +33,17 @@ the dual-stack Worker is redeployed with net selection off:
    password. An unfrozen export proves identity shape only; it does not prove
    the acknowledged freeze fence. A full rehearsal requires either a brief
    owner-approved v2 freeze or an independently consistent production snapshot.
-2. **Global presence semantics.** *(Code implemented 2026-07-12; deployed
-   confirmation remains.)* The global enumerations are removed: `who_all` is
+2. **Global presence semantics.** *(Code complete; deployed confirmation
+   remains.)* The global enumerations are removed: `who_all` is
    presence-scoped (`active_actors` of the caller's room), `connected_players`
    is retired (tombstoned `_dead_connected_players`), and `join_player`
    resolves only an explicit `$player` ref (no `this.objects` scan). No-arg
-   `@who` now lists the caller's co-present room roster, read from the room's
-   owner-anchored presence rows — the same answer on every shard.
-   **Remaining (owner-gated):** run `load:net-canary -- --enforce-who` against
+   `@who` lists the caller's co-present room roster. Sparse planning consumes
+   exact session/lineage/live projections carried by the room authority's
+   owner-sequenced `session_presence` rows; a regression test rehydrates a
+   gateway without the peer's cluster cells and still returns both actors with
+   no per-occupant RPC. **Remaining (owner-gated):** run
+   `load:net-canary -- --enforce-who` against
    a deployed multi-shard canary and confirm every guest returns the complete
    co-present roster (the driver now enters all guests into one room and fails
    on any partial or inconclusive result). This is a deploy-only signal the
@@ -52,6 +55,13 @@ the dual-stack Worker is redeployed with net selection off:
 4. **Compatibility inventory.** Confirm no production caller still requires
    v2 REST, `/connect`, or `/v2/*` after the switch. Public MCP and the browser
    are mapped; the other contracts are not.
+
+Deletion readiness now has an executable structural gate: `npm run
+build:net-only` builds the SPA without the v2 browser-worker asset and dry-runs
+`src/worker/net-only-index.ts`, whose only DO exports/bindings are
+`NetGatewayDO` and `NetScopeDO`. This proves the replacement stack can bundle
+without the large v2 server implementations; it does not close the functional
+backlog in `notes/2026-07-12-v2-compat-inventory.md`.
 
 Native Gap-0 ports are not an availability gate. Native verb definitions ride
 net verb cells and execute through planning-world native capabilities; the
@@ -66,6 +76,7 @@ Run from a clean `net-cutover` worktree:
 npm run typecheck
 npm test
 npm run test:worker
+npm run build:net-only
 npm run smoke:cf-dev
 npm run smoke:net-dev
 npm run install:net-dev

@@ -300,13 +300,19 @@ item; what remains is exactly what the workerd lanes cannot prove
   confirmation remains.** No public verb may enumerate all sessions or all
   objects: that returns a per-shard partial view under sharding and violates
   Big-World discipline. `who_all`/`@who` (no argument) is presence-scoped to
-  the caller's room via `active_actors(<scope>)`, reading the room's
-  owner-anchored session-presence rows (CO13) so the roster is complete on
-  every shard; the former `connected_players` global session scan is retired
-  (tombstoned). `@join`/`join_player` resolves only an explicit `$player`
+  the caller's room via `active_actors(<scope>)`; the former
+  `connected_players` global session scan is retired (tombstoned).
+  `@join`/`join_player` resolves only an explicit `$player`
   reference — no global object scan and no cross-shard name directory (join by
   human name is not supported; a co-present player is already in the room).
-  Deployed confirmation: `load:net-canary -- --enforce-who` must return a
+  Sparse planning consumes the room authority's owner-anchored
+  `session_presence` rows. Each row carries the exact session, actor-lineage,
+  and actor-live projections captured by the single relation-derivation path;
+  those bounded cells exist only in the ephemeral planning snapshot. A
+  multi-gateway regression rehydrates a shard without a peer's cluster cells
+  and still commits `who_all` with the complete roster, without a global scan
+  or per-occupant RPC. Deployed confirmation:
+  `load:net-canary -- --enforce-who` must return a
   complete co-present roster from every shard, failing on any partial or
   inconclusive result — a signal the single-image workerd-local lanes cannot
   produce.
@@ -364,13 +370,11 @@ item; what remains is exactly what the workerd lanes cannot prove
   per-scope gateway lanes. The public route remains closed pending the
   owner-run cutover and geographically separated/cold-start/sustained-rate
   bake.
-- **Global-presence commands — NOT READY.** `connected_players()` and
-  `join_player` enumerate a gateway-local world image. Under gateway
-  sharding, `who_all` therefore returns a partial roster. The deployed
-  load driver reports this and `--enforce-who` now fails closed on either
-  a partial or inconclusive result. Public selection requires a scoped or
-  aggregated presence design and a passing enforced canary; global object
-  enumeration is not an acceptable fix under Big-World discipline.
+- **Global-presence commands — LOCAL GATE CLOSED; DEPLOY CONFIRMATION
+  REQUIRED.** Global enumeration is removed and owner-scoped presence now
+  enters sparse planning as described above. The load driver fails closed on
+  a partial or inconclusive result; public selection still requires a passing
+  deployed multi-shard `--enforce-who` canary.
 
 The AE watch exits 2 on any RPC timeout, queue refusal, outbox delivery
 failure/abandonment, fanout gap, degraded install/adoption signal,

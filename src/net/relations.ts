@@ -10,7 +10,7 @@
  * source. Rows are rebuildable from authority cells (the bounded repair
  * path — CO13), which is what makes them projections rather than truth.
  */
-import type { Cell } from "./cells";
+import { cellKey, type Cell, type CellStore } from "./cells";
 import type { ApplyResult, EffectTranscript } from "./transcript";
 
 export type RelationRow = {
@@ -24,6 +24,17 @@ export type RelationRow = {
 export type RelationDelta = {
   op: "add" | "remove";
   row: RelationRow;
+};
+
+/** Owner-anchored planning projection for one present session. These are exact
+ * copies of the authority cells at the transition commit, not a second write
+ * path. A gateway can therefore assemble active_actors(room) without scanning
+ * its local sessions or issuing one RPC per occupant. */
+export type SessionPresenceBody = {
+  actor: string;
+  session?: Cell["value"];
+  actor_lineage?: Cell["value"];
+  actor_live?: Cell["value"];
 };
 
 export function relationKey(relation: string, owner: string, member: string): string {
@@ -55,7 +66,8 @@ export function deriveRelationDeltas(
   transcript: EffectTranscript,
   applied: Pick<ApplyResult, "projectionWrites">,
   homeScope: string,
-  scopeOf?: (object: string) => string
+  scopeOf?: (object: string) => string,
+  post?: Pick<CellStore, "get">
 ): DerivedRelationDeltas {
   const deltas = new Map<string, RelationDelta>();
   const put = (op: "add" | "remove", relation: string, owner: string, member: string, body?: unknown) => {
@@ -85,8 +97,14 @@ export function deriveRelationDeltas(
   }
   const transition = transcript.sessionScopeTransition;
   if (transition) {
-    if (transition.from) put("remove", "session_presence", transition.from, transition.session, { actor: transition.actor });
-    if (transition.to) put("add", "session_presence", transition.to, transition.session, { actor: transition.actor });
+    const body: SessionPresenceBody = {
+      actor: transition.actor,
+      ...(post?.get(cellKey("session", transition.session)) ? { session: post.get(cellKey("session", transition.session))?.value } : {}),
+      ...(post?.get(cellKey("object_lineage", transition.actor)) ? { actor_lineage: post.get(cellKey("object_lineage", transition.actor))?.value } : {}),
+      ...(post?.get(cellKey("object_live", transition.actor)) ? { actor_live: post.get(cellKey("object_live", transition.actor))?.value } : {})
+    };
+    if (transition.from) put("remove", "session_presence", transition.from, transition.session, body);
+    if (transition.to) put("add", "session_presence", transition.to, transition.session, body);
   }
 
   const local: RelationDelta[] = [];

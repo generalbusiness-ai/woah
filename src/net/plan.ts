@@ -83,6 +83,11 @@ export type PlanTurnInput = {
    * view clone — byte-identical to the pre-slice path, so non-turn
    * callers (session mint, tests) are unaffected. */
   slicePlanning?: boolean;
+  /** Bounded owner-derived rows needed by catalog reads that are not ordinary
+   * authority cells in this gateway's cache (currently room presence). They
+   * exist only in the ephemeral planning snapshot and never become gateway
+   * state or a second write path. */
+  planningProjectionCells?: readonly Cell[];
 };
 
 export type PlanTurnResult = {
@@ -129,6 +134,7 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
   // cost is O(read-set), never O(view).
   const sliceMode = input.slicePlanning === true;
   const snapshot = sliceMode ? null : view.clone();
+  if (snapshot) for (const cell of input.planningProjectionCells ?? []) snapshot.install(cell);
   // Phase 1 seed: the actor/session/target dispatch closure, built from
   // the LIVE view's object/session indexes (O(seed)). A sparse miss grows
   // it below — in-memory, never an RPC — so a warm turn (its reads
@@ -136,6 +142,17 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
   // read-set. Only a cell genuinely absent from the view escapes as
   // E_MISSING_STATE to the gateway's pull path.
   const seed = sliceMode ? buildSeedSlice(view, call) : null;
+  if (seed) {
+    for (const cell of input.planningProjectionCells ?? []) {
+      seed.add(cell.key);
+      if (cell.kind === "object_lineage") {
+        const parent = (cell.value as { parent?: unknown } | null)?.parent;
+        if (typeof parent === "string" && parent) {
+          for (const parentCell of view.cellsForObject(parent)) seed.add(parentCell.key);
+        }
+      }
+    }
+  }
   // A mid-attempt view mutation can make an attempt retry without growing
   // the seed (the re-clone picks up the changed cells). Monotonic seed
   // growth bounds the growth rounds; this caps the retry-without-growth
@@ -149,6 +166,11 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
     // The attempt's fix-6 snapshot: the seed slice (slice mode) or the
     // one full snapshot (default — no extra copy).
     const attemptStore = sliceMode && seed ? view.cloneSlice(seed) : (snapshot as CellStore);
+    if (sliceMode) {
+      for (const cell of input.planningProjectionCells ?? []) {
+        if (seed?.has(cell.key)) attemptStore.install(cell);
+      }
+    }
     planInput = storeCells(attemptStore);
     const world = planningWorldFromCells(planInput, input.counters);
     let attemptRun: Awaited<ReturnType<typeof runShadowTurnCallTranscript>>;

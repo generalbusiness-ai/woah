@@ -1068,7 +1068,10 @@ export class ProjectionFieldFiller {
   private generation = 0;
   constructor(
     private observe: (subject: string) => { props?: Record<string, unknown> } | null | undefined,
-    private fetchSummary: (subject: string) => Promise<unknown>,
+    // The requested fields travel with the fill. Net clients can therefore
+    // issue bounded, exact property-cell reads instead of falling through to
+    // the legacy whole-object summary endpoint.
+    private fetchSummary: (subject: string, fields: readonly string[]) => Promise<unknown>,
     private onResolved?: () => void
   ) {}
 
@@ -1084,7 +1087,7 @@ export class ProjectionFieldFiller {
     if (this.inFlight.has(subject)) return;
     this.inFlight.add(subject);
     const generation = this.generation;
-    void this.fetchSummary(subject)
+    void this.fetchSummary(subject, fields)
       .catch(() => undefined)
       .finally(() => {
         if (generation !== this.generation) return;

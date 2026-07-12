@@ -54,11 +54,11 @@ or be explicitly retired before freeze):**
    comment `:1715` "net mode has no /api ui-snapshot" — it falls back to a
    localStorage cold cache). `/api/catalogs/ui` (third-party catalog UI) has
    only partial net handling (`:1721`).
-7. **Object summary reads** — `/api/objects/:id/summary`
-   (`fetchScopedObjectSummary`, `:1897`). PARTIAL: net uses `netFeed.cell` for
-   live fields, but the summary path is not obviously `netMode()`-guarded at
-   its callers (`:1537,1546,1620,1875`). **Needs per-call confirmation** that
-   net mode never falls through to `/api/objects/*/summary`.
+7. **Object summary reads — CLOSED 2026-07-12.** Net mode now builds bounded
+   summaries from exact presence-authorized `object_lineage`, `object_live`,
+   and component-declared `property_cell` reads. The net browser e2e records
+   every request and fails if `/api/*`, `/v2/*`, or `/connect` is touched; all
+   six browser scenarios pass with zero legacy requests.
 
 **RETIRE-WITH-v2 (only tests/dev/legacy use them):**
 - `/api/objects/:id/stream` — already returns 410 GONE.
@@ -77,17 +77,30 @@ The browser live WS is `/v2/turn-network/ws` in v2; net mode uses
 `/net-api/ws` (+ ticket) instead — MAPPED for the browser. But `deploy.sh:421`
 and any external live client on `/v2/turn-network/ws` must move to the net WS.
 
-## Real bug found: stale `/api/state` deploy probe
+## Stale `/api/state` deploy probe — FIXED 2026-07-12
 
-`deploy.sh:331-340` probes `$WORKER_URL/api/state` and asserts the body "did
-not return JSON" only — but **`/api/state` has no handler**, so it 404s with a
-JSON error envelope that satisfies the check. The probe silently passes on a
-dead route, and the cluster-route discovery at `:390` (which parses
-`/api/state`'s objects) is therefore also dead. Fix independently of the
-cutover: point the postflight at a real endpoint (`/healthz`, or a net cell/
-relation read once net is selected) and rebuild the cluster-route check on a
-live source. Not modified here — it is an operator script whose intended
-probe target is the owner's call.
+Postflight now requires HTTP 200 from the real `/api/me` browser projection,
+validates `session.actor`, and derives bounded warm/cluster-route targets from
+its scoped self/inventory/here projection. A regression test forbids the dead
+route and global `state.objects` enumeration.
+
+## Executable deletion boundary
+
+`npm run build:net-only` is the structural removal gate. It:
+
+- builds the SPA with the v2 browser-worker factory replaced at compile time
+  and fails if a v2 worker asset or transport marker remains;
+- dry-runs `src/worker/net-only-index.ts`, which exports only `NetScopeDO` and
+  `NetGatewayDO` and explicitly returns 410 for `/api/*`, `/v2/*`, `/connect`,
+  and the post-cutover v2 identity/freeze doorway;
+- probes health through the catalog NetScopeDO rather than a legacy world DO,
+  and reports healthy only when the authority's activation cell matches the
+  catalog epoch (a merely seeded or mixed-epoch namespace fails closed).
+
+This proves the large v2 client worker and server DO implementations are not
+bundle dependencies of the replacement surface. It does not yet authorize
+production removal: the remaining functional gates below still need ports or
+explicit retirement decisions.
 
 ## Summary: what blocks removing v2
 
@@ -99,8 +112,9 @@ explicit retirement decision:
 - **Agent provisioning**: `/connect` (Hermes) is v2-only.
 - **Operator tooling**: taps + admin maintenance is v2-only.
 - **Durable backfill**: `/log` replay has no client net contract.
-- **UI reads**: ui-snapshot (cold-cache only) and the object-summary
-  fall-through need confirmation/port.
+- **UI reads**: bundled net panels have direct authoritative hydrators and
+  object-summary fall-through is closed; dynamic third-party catalog UI
+  discovery still needs a net contract or an explicit retirement decision.
 
 Apikey agents are the good case: net verifies against the *same*
 `property_cell:$system:api_keys` with the same salt/hash as core

@@ -1152,6 +1152,7 @@ function seedUniversal(world: WooWorld): void {
   sourceVerb(world, "$player", "who_all", PLAYER_WHO_ALL_SOURCE, {
     directCallable: true,
     toolExposed: true,
+    readsRoomPresence: true,
     aliases: ["@who"],
     argSpec: { args: ["names?"], command: { dobj: "any", prep: "any", iobj: "any", args_from: ["argstr"] } }
   });

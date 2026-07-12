@@ -87,6 +87,7 @@ retry_status_until() {
 }
 
 POSTFLIGHT_SESSIONS=()
+POSTFLIGHT_NET_SESSIONS=()
 cleanup_postflight_sessions() {
   local sid status
   for sid in "${POSTFLIGHT_SESSIONS[@]:-}"; do
@@ -96,6 +97,16 @@ cleanup_postflight_sessions() {
       -H "authorization: Session $sid" 2>/dev/null || true)
     if [[ "$status" != "200" && "$status" != "401" && "$status" != "404" ]]; then
       warn "postflight session cleanup for $sid returned $status"
+    fi
+  done
+  for sid in "${POSTFLIGHT_NET_SESSIONS[@]:-}"; do
+    [[ -n "$sid" ]] || continue
+    status=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+      -X DELETE "$WORKER_URL/net-api/session" \
+      -H "authorization: Bearer session:$sid" \
+      -H 'content-type: application/json' -d '{}' 2>/dev/null || true)
+    if [[ "$status" != "200" && "$status" != "204" && "$status" != "401" && "$status" != "404" ]]; then
+      warn "net postflight session cleanup for $sid returned $status"
     fi
   done
 }
@@ -309,15 +320,85 @@ healthz=$(curl -sS --max-time "$POSTFLIGHT_TIMEOUT" "$WORKER_URL/healthz") \
 echo "$healthz" | grep -q '"ok":true' || fail "healthz body unhealthy: $healthz"
 ok "healthz: $healthz"
 
+# The deployment-controlled client configuration is the authoritative stack
+# selector. Postflight must exercise the selected stack: probing v2 after a
+# net selection (or probing net before installation) produces false evidence.
+if retry_status_until 200 GET "$WORKER_URL/client-config"; then
+  client_config="$RETRY_BODY"
+else
+  fail "/client-config returned $RETRY_STATUS after $RETRY_ATTEMPTS attempts (expected 200): $RETRY_BODY"
+fi
+selected_stack=$(node -e '
+  let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
+    try { const body=JSON.parse(s); if (body.net === true) console.log("net"); else if (body.net === false) console.log("v2"); } catch {}
+  })
+' <<< "$client_config")
+[[ "$selected_stack" == "net" || "$selected_stack" == "v2" ]] \
+  || fail "/client-config 200 body lacks boolean net: $client_config"
+ok "selected stack: $selected_stack"
+
 # Unsigned public access to the reserved internal namespace must fail before
 # any DO handler trusts forwarded authority. Signed internal calls are
-# exercised below by /api/state aggregation when routed hosts are present.
+# exercised by the authenticated /api/me projection when its scoped reads
+# cross routed hosts.
 internal_status=$(curl -sS --max-time "$POSTFLIGHT_TIMEOUT" -o /dev/null -w '%{http_code}' \
   "$WORKER_URL/__internal/state") \
   || fail "unsigned internal route probe failed"
 [[ "$internal_status" == "401" ]] \
   || fail "unsigned internal route returned $internal_status (expected 401)"
 ok "unsigned internal route rejected: 401"
+
+if [[ "$selected_stack" == "net" ]]; then
+  # Claim through the public identity door, then prove the bearer can read its
+  # own authoritative live cell. This catches route, activation, identity,
+  # session-mint, and presence-scoped read failures without any v2 dependency.
+  if retry_status_until 200 POST "$WORKER_URL/net-api/guest" \
+      -H 'content-type: application/json' -d '{}'; then
+    net_auth="$RETRY_BODY"
+  else
+    fail "net guest claim returned $RETRY_STATUS after $RETRY_ATTEMPTS attempts: $RETRY_BODY"
+  fi
+  net_sid=$(node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const b=JSON.parse(s);if(typeof b.session==="string")console.log(b.session)}catch{}})' <<< "$net_auth")
+  net_actor=$(node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const b=JSON.parse(s);if(typeof b.actor==="string")console.log(b.actor)}catch{}})' <<< "$net_auth")
+  [[ -n "$net_sid" && -n "$net_actor" ]] || fail "net guest response lacks session/actor: $net_auth"
+  POSTFLIGHT_NET_SESSIONS+=("$net_sid")
+  net_cell_url="$WORKER_URL/net-api/cell?session=$(node -p 'encodeURIComponent(process.argv[1])' "$net_sid")&key=$(node -p 'encodeURIComponent(process.argv[1])' "object_live:$net_actor")"
+  if retry_status_until 200 GET "$net_cell_url" -H "authorization: Bearer session:$net_sid"; then
+    echo "$RETRY_BODY" | grep -q '"cell"' || fail "net own-cell body malformed: $RETRY_BODY"
+  else
+    fail "net own-cell read returned $RETRY_STATUS after $RETRY_ATTEMPTS attempts: $RETRY_BODY"
+  fi
+  ok "net door + session + own-cell read: actor=$net_actor"
+
+  # Worker-first invariant for the selected public MCP alias. Authentication
+  # may reject this intentionally credential-less initialize, but assets must
+  # never answer 404/405 and the Worker must return JSON.
+  mcp_probe=$(curl -sS --max-time "$POSTFLIGHT_TIMEOUT" -X POST -w '\n%{http_code}' "$WORKER_URL/mcp" \
+    -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"net-postflight","version":"1"},"capabilities":{}}}') \
+    || fail "net public MCP alias request failed"
+  mcp_status="${mcp_probe##*$'\n'}"
+  mcp_body="${mcp_probe%$'\n'*}"
+  [[ "$mcp_status" != "404" && "$mcp_status" != "405" && "${mcp_body:0:1}" == "{" ]] \
+    || fail "net public MCP alias did not reach the Worker: status=$mcp_status body=$mcp_body"
+  ok "net MCP routing: status=$mcp_status (worker-first invariant intact)"
+
+  if [[ "${WOO_DEPLOY_SMOKE:-1}" == "0" || $SKIP_SMOKE -eq 1 ]]; then
+    warn "net deploy smoke skipped (WOO_DEPLOY_SMOKE=0 or --skip-smoke)"
+  else
+    if npx --no-install tsx scripts/net-canary-load.ts --base-url "$WORKER_URL" \
+        --actors 2 --rounds 1 --requests-per-actor 1 >/tmp/woo-deploy-net-smoke.log 2>&1; then
+      ok "net smoke: two guests committed turns and released sessions"
+    else
+      tail -30 /tmp/woo-deploy-net-smoke.log
+      fail "net smoke failed against $WORKER_URL (see /tmp/woo-deploy-net-smoke.log)"
+    fi
+  fi
+
+  echo
+  echo "${GREEN}${BOLD}deploy ok${NC} version=$version_id url=$WORKER_URL stack=net"
+  exit 0
+fi
 
 # guest auth
 auth_out=$(curl -sS --max-time "$POSTFLIGHT_TIMEOUT" -X POST "$WORKER_URL/api/auth" \
@@ -328,16 +409,23 @@ sid=$(echo "$auth_out" | node -e \
 POSTFLIGHT_SESSIONS+=("$sid")
 ok "auth: session=$sid"
 
-# /api/state — exercises gateway + cluster aggregate. Capture the body so
-# we can pick a live non-universal object id for the cluster-route check
-# below without hardcoding any catalog name.
-state_body=$(curl -sS --max-time "$POSTFLIGHT_TIMEOUT" \
-  "$WORKER_URL/api/state" -H "authorization: Session $sid")
-# Avoid `echo … | head -c 2 | grep` here — pipefail trips when the body is
-# large enough that echo gets SIGPIPE before head closes the pipe.
-[[ "${state_body:0:1}" == "{" ]] \
-  || fail "/api/state did not return JSON: $(printf '%s' "$state_body" | head -c 200)"
-ok "/api/state: 200 ($(printf '%s' "$state_body" | wc -c | tr -d ' ') bytes)"
+# /api/me is the real authenticated aggregate consumed by the v2 browser.
+# Require HTTP 200 AND its actor contract. The retired /api/state probe only
+# checked that the body began with JSON, so its JSON 404 envelope passed while
+# exercising no state or cluster route at all.
+if retry_status_until 200 GET "$WORKER_URL/api/me" \
+    -H "authorization: Session $sid"; then
+  me_body="$RETRY_BODY"
+else
+  fail "/api/me returned $RETRY_STATUS after $RETRY_ATTEMPTS attempts (expected 200): $RETRY_BODY"
+fi
+me_actor=$(node -e '
+  let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
+    try { const body=JSON.parse(s); if (typeof body?.session?.actor === "string") console.log(body.session.actor); } catch {}
+  })
+' <<< "$me_body")
+[[ -n "$me_actor" ]] || fail "/api/me 200 body lacks session.actor: $(printf '%s' "$me_body" | head -c 200)"
+ok "/api/me: 200 actor=$me_actor ($(printf '%s' "$me_body" | wc -c | tr -d ' ') bytes)"
 
 # Warm a bounded set of catalog instance hosts before the heavier cross-actor
 # smoke. A Worker deploy cold-starts Durable Objects; without this, the smoke
@@ -351,15 +439,15 @@ if [[ "$POSTFLIGHT_WARM_OBJECT_LIMIT" =~ ^[0-9]+$ && "$POSTFLIGHT_WARM_OBJECT_LI
     process.stdin.on("data", d => body += d).on("end", () => {
       try {
         const state = JSON.parse(body);
-        const actor = state.actor ?? null;
-        const ids = Object.keys(state.objects ?? {})
-          .filter(id => !id.startsWith("$") && id !== actor)
-          .sort()
-          .slice(0, Math.max(0, limit));
+        const actor = state?.session?.actor ?? null;
+        const candidates = [state.self, ...(state.inventory ?? []), state.here,
+          ...(state.here?.contents ?? []), ...(state.here?.roster ?? []), ...(state.here?.exits ?? [])];
+        const ids = [...new Set(candidates.map(item => item?.id).filter(id => typeof id === "string"))]
+          .filter(id => !id.startsWith("$") && id !== actor).sort().slice(0, Math.max(0, limit));
         for (const id of ids) console.log(encodeURIComponent(id));
       } catch {}
     });
-  ' <<< "$state_body" || true)
+  ' <<< "$me_body" || true)
   warmed=0
   warm_failed=0
   while IFS= read -r target_path; do
@@ -387,21 +475,22 @@ echo "$wiz_body" | grep -q '"id":"$wiz"' \
   || fail "describe \$wiz failed: $wiz_body"
 ok "describe \$wiz: ok"
 
-# Cluster routing: discover one non-universal id from /api/state's objects
-# map and describe it. Skips $-prefixed core classes and the actor itself,
-# so it lands on a catalog-installed instance if any are present. No
-# catalog-name literal anywhere in this script (per F050).
+# Cluster routing: discover one non-universal id from /api/me's bounded scoped
+# projection and describe it. No global enumeration and no catalog-name
+# literal: this tests the same route-discovery shape the browser consumes.
 sample_target=$(node -e '
   let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
     try {
       const state = JSON.parse(s);
-      const actor = state.actor ?? null;
-      const ids = Object.keys(state.objects ?? {});
+      const actor = state?.session?.actor ?? null;
+      const candidates = [state.self, ...(state.inventory ?? []), state.here,
+        ...(state.here?.contents ?? []), ...(state.here?.roster ?? []), ...(state.here?.exits ?? [])];
+      const ids = [...new Set(candidates.map(item => item?.id).filter(id => typeof id === "string"))];
       const pick = ids.find(id => !id.startsWith("$") && id !== actor);
       if (pick) console.log(pick);
     } catch {}
   })
-' <<< "$state_body" || true)
+' <<< "$me_body" || true)
 if [[ -n "$sample_target" ]]; then
   sample_body=$(curl -sS --max-time "$POSTFLIGHT_TIMEOUT" \
     "$WORKER_URL/api/objects/$sample_target" -H "authorization: Session $sid")
@@ -409,7 +498,7 @@ if [[ -n "$sample_target" ]]; then
     || fail "describe $sample_target failed: $sample_body"
   ok "describe $sample_target: ok (catalog-routed describe round-trip)"
 else
-  warn "no non-universal object in /api/state; skipped cluster-route check"
+  warn "no non-universal object in /api/me projection; skipped cluster-route check"
 fi
 
 # WebSocket handshake: upgrade to the v2 turn-network endpoint (the legacy

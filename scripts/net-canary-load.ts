@@ -141,12 +141,13 @@ async function jsonFetch(url: string, init: RequestInit): Promise<{ response: Re
   return { response, body, ms };
 }
 
-/** Drive one `who_all` turn per guest and summarize the partial view.
+/** Drive one `who_all` turn per guest and summarize roster completeness.
  * `who_all` is a direct self-verb on $player (target = the caller's own
- * actor); its `connected_players()` read is admitted with whatever session
- * cells the routed shard already holds, which IS the partial view we measure.
- * A rejected turn is itself a finding (the global builtin has no legible
- * read-set on the net path) and counts as unreachable. */
+ * actor). The gate remains necessary after retiring connected_players:
+ * sparse planning must consume the room authority's session_presence rows,
+ * not merely whatever session cells the routed gateway already holds. A
+ * rejected turn or incomplete owner-scoped planning view counts as
+ * unreachable/partial. */
 async function runWhoCheck(base: string, guests: Guest[], run: string): Promise<WhoCheckSummary> {
   const guestActors = guests.map((guest) => guest.actor);
   const guestShards = guests.map((guest) => sessionShardHint(guest.session));
@@ -355,8 +356,8 @@ async function main(): Promise<void> {
   if (whoCheck?.ran && whoCheck.partial) {
     console.error(
       `who_all partial view under sharding: max_missing=${whoCheck.max_missing} unreachable=${whoCheck.unreachable} ` +
-      `across ${whoCheck.distinct_shards} shards — connected_players is a global enumeration and returns a per-shard ` +
-      `partial roster (Big-World violation). ${enforceWho ? "Failing (--enforce-who)." : "Reported (pass --enforce-who to gate)."}`
+      `across ${whoCheck.distinct_shards} shards — owner-scoped presence did not converge into every planning shard. ` +
+      `${enforceWho ? "Failing (--enforce-who)." : "Reported (pass --enforce-who to gate)."}`
     );
     if (enforceWho && whoCheckFailsAcceptance(whoCheck)) process.exitCode = 3;
   } else if (whoCheck && !whoCheck.ran) {

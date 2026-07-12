@@ -239,7 +239,10 @@ async function buildHarness(gatewayEnvExtra: Partial<NetGatewayEnv> = {}) {
   const placed = await world.directCall("ws-genesis-place", actor, actor, "moveto", ["ws_room"], { sessionId: session.id });
   expect(placed.op).toBe("result");
   world.ensureApiKey("$wiz", actor, KEY_ID, KEY_SECRET, "net-ws-test");
-  const other = world.auth("guest:net-ws-2").actor;
+  const otherSession = world.auth("guest:net-ws-2");
+  const other = otherSession.actor;
+  const otherPlaced = await world.directCall("ws-genesis-place-other", other, other, "moveto", ["ws_room"], { sessionId: otherSession.id });
+  expect(otherPlaced.op).toBe("result");
   world.ensureApiKey("$wiz", other, "ws-key-2", "ws-secret-2", "net-ws-test-2");
 
   const partitions = partitionCells(cellsFromSerialized(world.exportWorld()));
@@ -334,6 +337,24 @@ async function buildHarness(gatewayEnvExtra: Partial<NetGatewayEnv> = {}) {
     expect(minted.status, JSON.stringify(minted.body)).toBe(200);
     return minted.body.session as string;
   };
+  const mintOther = async (): Promise<string> => {
+    const minted = await clientFetch(gateway, "POST", "/net-api/session", {
+      token: "apikey:ws-key-2:ws-secret-2",
+      body: { ttl_ms: 600_000 }
+    });
+    expect(minted.status, JSON.stringify(minted.body)).toBe(200);
+    return minted.body.session as string;
+  };
+
+  /** Simulate another gateway shard: keep the caller and relation mirror but
+   * remove one peer's cluster cells before rehydrating the gateway object. */
+  const rehydrateWithoutPeerCells = (peerSession: string): NetGatewayDO => {
+    gatewayState.state.storage.sql.exec("DELETE FROM net_gateway_cell WHERE key = ?", `session:${peerSession}`);
+    gatewayState.state.storage.sql.exec("DELETE FROM net_gateway_cell WHERE key IN (?, ?)", `object_lineage:${other}`, `object_live:${other}`);
+    gatewayState.state.storage.sql.exec("DELETE FROM net_gateway_cell WHERE key LIKE ?", `property_cell:${other}:%`);
+    gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
+    return gateway;
+  };
 
   return {
     gateway,
@@ -346,6 +367,8 @@ async function buildHarness(gatewayEnvExtra: Partial<NetGatewayEnv> = {}) {
     subscribe,
     settle,
     mint,
+    mintOther,
+    rehydrateWithoutPeerCells,
     close: () => states.forEach((st) => st.close())
   };
 }
@@ -503,6 +526,36 @@ describe("/net-api/ws socket surface (Phase 4 item 3 chunk 1)", () => {
 });
 
 describe("gateway self-subscribe (H1)", () => {
+  it("plans who_all from owner-anchored presence when the shard lacks a peer's cluster cells", async () => {
+    const h = await buildHarness({ NET_GATEWAY_SELF: "gateway:net-api" });
+    const token = `apikey:${KEY_ID}:${KEY_SECRET}`;
+    const s1 = await h.mint();
+    const s2 = await h.mintOther();
+    const enter = async (gateway: NetGatewayDO, tokenValue: string, sid: string, key: string): Promise<void> => {
+      const entered = await clientFetch(gateway, "POST", "/net-api/turn", {
+        token: tokenValue,
+        body: { target: "ws_annex", verb: "welcome", session: sid, idempotency_key: key }
+      });
+      expect(entered.status, JSON.stringify(entered.body)).toBe(200);
+    };
+    await enter(h.gateway, token, s1, "who-presence-enter-1");
+    await enter(h.gateway, "apikey:ws-key-2:ws-secret-2", s2, "who-presence-enter-2");
+    await h.settle();
+
+    const fresh = h.rehydrateWithoutPeerCells(s2);
+    const who = await clientFetch(fresh, "POST", "/net-api/turn", {
+      token,
+      body: { target: h.actor, verb: "who_all", args: [], session: s1, idempotency_key: "who-owner-projection" }
+    });
+    expect(who.status, JSON.stringify(who.body)).toBe(200);
+    expect((who.body.reply as { status?: string })?.status, JSON.stringify(who.body)).toBe("accepted");
+    expect(who.body.result).toEqual(expect.arrayContaining([
+      expect.objectContaining({ player: h.actor }),
+      expect.objectContaining({ player: h.other })
+    ]));
+    h.close();
+  });
+
   it("auto-subscribes the gateway to the scopes a session touches, so peer push works with NO manual subscribe", async () => {
     // NET_GATEWAY_SELF set, and — crucially — NO h.subscribe() call
     // anywhere: the gateway must register itself to the annex on its own

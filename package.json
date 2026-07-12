@@ -62,6 +62,7 @@
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.worker.json",
     "prebuild": "npm run catalog:index",
     "build": "vite build",
+    "build:net-only": "WOO_NET_ONLY_BUILD=1 npm run build && node scripts/check-net-only-build.mjs && wrangler deploy --dry-run --config wrangler.net-only.toml",
     "deploy": "scripts/deploy.sh"
   },
   "dependencies": {

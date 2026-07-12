@@ -503,11 +503,13 @@ describe("client UI framework projection", () => {
 
     let fetchCalls = 0;
     let resolves = 0;
+    let requestedFields: readonly string[] = [];
     let pending: ((value: void) => void) | null = null;
     const filler = new ProjectionFieldFiller(
       (subject) => ui.observe(subject),
-      (subject) => {
+      (subject, fields) => {
         fetchCalls += 1;
+        requestedFields = fields;
         return new Promise<void>((resolve) => {
           pending = () => {
             ui.ingestSnapshot(`summary:${subject}`, [
@@ -527,6 +529,7 @@ describe("client UI framework projection", () => {
 
     filler.ensure("the_weather", ["current", "config_state"]);
     expect(fetchCalls).toBe(1);
+    expect(requestedFields).toEqual(["current", "config_state"]);
     // Concurrent re-bind while in flight: must dedupe to a single fetch.
     filler.ensure("the_weather", ["current", "config_state"]);
     expect(fetchCalls).toBe(1);

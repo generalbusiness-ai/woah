@@ -435,7 +435,12 @@ describe("plan-time session effects (CO14 fold; chunk 2)", () => {
     // …and the presence relation row derived from it (CO13).
     const presence = seq.relations().get(relationKey("session_presence", "sess_room", session.id));
     expect(presence).toBeDefined();
-    expect(presence?.body).toEqual({ actor });
+    expect(presence?.body).toMatchObject({
+      actor,
+      session: { id: session.id, actor, activeScope: "sess_room" },
+      actor_lineage: { name: "Guest 1", parent: "$guest" },
+      actor_live: { location: "sess_room" }
+    });
   });
 });
 

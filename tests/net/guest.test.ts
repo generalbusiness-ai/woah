@@ -45,7 +45,24 @@ describe("elastic guest provisioning", () => {
       relation: "session_presence",
       owner: "the_chatroom",
       member: "s_net-api-2_abc",
-      body: { actor: "guest_net_abc" }
+      body: {
+        actor: "guest_net_abc",
+        actor_lineage: {
+          anchor: null,
+          flags: {},
+          name: "Guest _net_abc",
+          owner: "$wiz",
+          parent: "$guest"
+        },
+        actor_live: { location: "the_chatroom" },
+        session: {
+          activeScope: "the_chatroom",
+          actor: "guest_net_abc",
+          expiresAt: 61_000,
+          id: "s_net-api-2_abc",
+          started: 1_000
+        }
+      }
     });
     expect(seq.submit(planned.submit)).toMatchObject({ status: "accepted", replayed: true });
   });
