@@ -540,7 +540,11 @@ One write path per fact (CO9), concretized:
   in the `unauthorized` reject detail. Three validation sources, in
   order: a transcript that WRITES the session cell (mint/refresh/
   transition) validates the **written value** (demanding pre-existence
-  would forbid minting); an **owned** session validates from the scope's
+  would forbid minting); a transcript explicitly stamped `sessionClose`
+  instead proves the currently live, actor-bound **owned** session and
+  validates that the replacement is a bounded-expiry, null-scope close
+  row (the replacement may already be expired after cross-DO latency);
+  an ordinary **owned** session validates from the scope's
   own authoritative cell; a **foreign** session composes the CO2.3
   machinery — session cells are just cells: the submit must carry the
   session read plus an owner attestation, and an attested version equal

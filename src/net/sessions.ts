@@ -108,10 +108,10 @@ export type MintSessionInput = {
   exclusive?: boolean;
   /** Session CLOSE (reviewer finding 12 — logout must release the guest
    * seat, not just drop the local bearer): rewrites the cell with a
-   * ~250ms expiry (long enough to clear authorize's not-born-expired
-   * rule under cross-DO clock skew, short enough that the seat frees
-   * immediately after) and a presence transition to null so the room's
-   * roster retracts. ttl_ms is ignored in this mode. */
+   * ~250ms expiry and a presence transition to null so the room's roster
+   * retracts. The explicit sessionClose marker authorizes against the
+   * current owned row because real cross-DO latency may outlast 250ms.
+   * ttl_ms is ignored in this mode. */
   closing?: { priorActiveScope: string | null };
 };
 
@@ -190,6 +190,7 @@ export function mintSessionSubmit(input: MintSessionInput): MintSessionResult {
         ? { sessionScopeTransition: { session: input.session, actor: input.actor, from: null, to: input.activeScope } }
         : {}),
     ...(input.exclusive ? { exclusiveMint: true } : {}),
+    ...(input.closing ? { sessionClose: true } : {}),
     reads: [],
     writes: [
       {
@@ -315,6 +316,25 @@ export function authorizeSessionSubmit(submit: CommitSubmit, deps: SessionAuthDe
   for (const id of [...ids].sort()) {
     const mint = mintWrites.get(id);
     if (mint) {
+      if (transcript.sessionClose === true) {
+        // A close is authorized by the CURRENT owner row, not by the
+        // replacement's liveness: its deliberately short expiry can pass
+        // while the request crosses gateway -> scope. The marker cannot
+        // be repurposed as a refresh — shape and expiry are bounded.
+        if (ids.size !== 1 || mintWrites.size !== 1 || transcript.session !== id || !deps.ownsSession(id)) {
+          refuse(id, "close_invalid", { source: "close_shape" });
+        }
+        const currentVerdict = validateSessionCell(deps.readSession(id), now, transcript.call.actor);
+        if (currentVerdict !== "ok") refuse(id, currentVerdict, { source: "close_owned_cell" });
+        const value = mint.value as Partial<SessionCellValue> | null;
+        if (
+          !value || value.id !== id || value.actor !== transcript.call.actor || value.activeScope !== null ||
+          typeof value.expiresAt !== "number" || !Number.isFinite(value.expiresAt) || value.expiresAt > now + 5_000
+        ) {
+          refuse(id, "close_invalid", { source: "close_write" });
+        }
+        continue;
+      }
       const verdict = validateSessionCell({ value: mint.value }, now, transcript.call.actor);
       if (verdict !== "ok") refuse(id, verdict, { source: "mint_write" });
       // Identity-door guest claim: an exclusive mint is refused when any

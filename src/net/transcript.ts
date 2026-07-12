@@ -65,6 +65,10 @@ export type EffectTranscript = Omit<EngineEffectTranscript, "reads" | "writes" |
    * cluster sequencer, so concurrent claims serialize and exactly one
    * wins. Present-only-when-true keeps prior transcript hashes unchanged. */
   exclusiveMint?: boolean;
+  /** Logout/release write (CO14): authorization proves the current owned
+   * session instead of requiring the replacement's short expiry to
+   * remain live across the cross-DO submit latency. */
+  sessionClose?: boolean;
 };
 
 /**

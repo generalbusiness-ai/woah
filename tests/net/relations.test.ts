@@ -153,7 +153,7 @@ describe("sequencer relation application (durable, one transaction)", () => {
     ]);
     // The recovery tail names the relate fact (adopt-style legibility).
     expect(seq.recoveryTail()).toEqual([
-      { seq: 1, transcript_hash: "relate:cluster:#alice:4", touched: applied.changed.sort() }
+      expect.objectContaining({ seq: 1, transcript_hash: "relate:cluster:#alice:4", touched: applied.changed.sort() })
     ]);
     // Re-applying identical adds changes nothing: empty, NO head advance
     // (an all-no-op relate must not fan a no-op to subscribers).

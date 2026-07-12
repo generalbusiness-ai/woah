@@ -173,6 +173,54 @@ describe("mintSessionSubmit → accepted at the cluster scope (CO14)", () => {
     expect(reply.retryable).toBe(false);
     expect(reply.detail).toMatchObject({ session: "s1", session_verdict: "actor_mismatch", source: "mint_write" });
   });
+
+  it("authorizes a close from the live owned row after its replacement expiry has elapsed", () => {
+    const seq = sessionSequencer("cluster:#actor");
+    seq.seed([{ kind: "session", object: "s1", value: sessionRow({ activeScope: "room:r1" }) }]);
+    // Model >250ms of real gateway -> scope latency: at authorization
+    // time NOW, the proposed close row is already expired, while the
+    // authority's current session remains live and actor-bound.
+    const { submit, value } = mintSessionSubmit({
+      session: "s1",
+      actor: "#actor",
+      ttl_ms: 0,
+      now: NOW - 1_000,
+      base: seq.head(),
+      epoch: EPOCH,
+      clusterScope: "cluster:#actor",
+      closing: { priorActiveScope: "room:r1" }
+    });
+    expect(submit.transcript.sessionClose).toBe(true);
+    expect(value.expiresAt).toBeLessThan(NOW);
+    const reply = seq.submit(submit);
+    expect(reply.status, JSON.stringify(reply)).toBe("accepted");
+    expect(validateSessionCell(seq.store.get(sessionCellKey("s1")), NOW, "#actor")).toBe("expired");
+  });
+
+  it("refuses a sessionClose marker that attempts to refresh instead", () => {
+    const seq = sessionSequencer("cluster:#actor");
+    seq.seed([{ kind: "session", object: "s1", value: sessionRow({ activeScope: "room:r1" }) }]);
+    const { submit } = mintSessionSubmit({
+      session: "s1",
+      actor: "#actor",
+      ttl_ms: 0,
+      now: NOW,
+      base: seq.head(),
+      epoch: EPOCH,
+      clusterScope: "cluster:#actor",
+      closing: { priorActiveScope: "room:r1" }
+    });
+    submit.transcript.writes[0].value = {
+      ...(submit.transcript.writes[0].value as SessionCellValue),
+      expiresAt: NOW + 60_000,
+      activeScope: "room:r1"
+    } as never;
+    const reply = seq.submit(submit);
+    expect(reply.status).toBe("rejected");
+    if (reply.status !== "rejected") return;
+    expect(reply.reason).toBe("unauthorized");
+    expect(reply.detail).toMatchObject({ session: "s1", session_verdict: "close_invalid", source: "close_write" });
+  });
 });
 
 describe("authorizeSessionSubmit at the owning scope (CO4 step 1)", () => {
