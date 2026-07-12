@@ -398,9 +398,10 @@ const OUTBOX_ROUTES = ["/fanout", "/adopt", "/relate", "/plan-scheduled"] as con
 /** Phase-3 drain bounds: one pass touches at most LANES_PER_PASS due
  * destinations per route and ROWS_PER_LANE rows per destination (a lane
  * PREFIX in (scope, seq) order — CO2.7 ordering is untouched). Remaining
- * healthy work re-drains via drainOutbox's delivered>0 loop; failed rows
- * wait for the due-time alarm. Sized generously above any current
- * subscriber fan-in; the point is a bound that exists, not a small one.
+ * healthy work continues through an immediate alarm; failed rows wait for
+ * their due-time alarm. The small per-lane quantum is intentional: a hot
+ * authority must yield between fanout slices so submit service is not
+ * trapped behind a long chain of otherwise healthy delivery RPCs.
  *
  * DECIDED (review #4): lane ENUMERATION per pass is O(active lanes) —
  * the directory is read whole and each lane head-probed until enough due
@@ -412,13 +413,13 @@ const OUTBOX_ROUTES = ["/fanout", "/adopt", "/relate", "/plan-scheduled"] as con
  * numbers do not justify. LANES_PER_PASS bounds the DELIVERY fan-out of
  * one pass, not the enumeration. */
 const OUTBOX_LANES_PER_PASS = 16;
-const OUTBOX_ROWS_PER_LANE = 32;
+const OUTBOX_ROWS_PER_LANE = 4;
 /** Passes one drain INVOCATION may run before yielding to the alarm
  * continuation (review #2): bounds a single waitUntil task's total CPU
  * under a catch-up backlog at LANES×ROWS×PASSES rows; the retry alarm —
  * which clamps to "now" while due work remains — resumes the drain on a
  * fresh invocation budget. */
-const OUTBOX_PASSES_PER_DRAIN = 8;
+const OUTBOX_PASSES_PER_DRAIN = 1;
 /** Debugging tail of abandoned rows kept after their divergence metric
  * fired; everything older is pruned (a dead subscriber must not grow
  * storage without bound). */

@@ -173,8 +173,13 @@ describe("Phase 3 — bounded outbox drain", () => {
     const BACKLOG = 100;
     for (let seq = 1; seq <= BACKLOG; seq++) insertRow(scope.state, "gateway:mirror", seq);
 
-    await kick(scopeDO, env);
-    await scope.settle();
+    // One invocation intentionally yields after four rows. Repeated fresh
+    // invocations (standing in for immediate alarm events) drain the whole
+    // backlog without any one event monopolizing the authority.
+    for (let i = 0; i < BACKLOG / 4; i += 1) {
+      await kick(scopeDO, env);
+      await scope.settle();
+    }
 
     // Everything delivered, in seq order, via multiple bounded passes.
     expect(pendingRows(scope.state)).toEqual([]);
@@ -185,7 +190,7 @@ describe("Phase 3 — bounded outbox drain", () => {
     const passes = drainPassMetrics(metricLines);
     expect(passes.length).toBeGreaterThan(1); // the bound forced multiple passes
     // THE INVARIANT: no single pass considered more than the lane bound.
-    for (const pass of passes) expect(pass.considered).toBeLessThanOrEqual(32);
+    for (const pass of passes) expect(pass.considered).toBeLessThanOrEqual(4);
     // The emptied lane left no directory residue.
     expect(laneRows(scope.state)).toEqual([]);
   });
@@ -195,28 +200,29 @@ describe("Phase 3 — bounded outbox drain", () => {
     const scope = netState("bounded-budget");
     const env: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: () => healthy.stub };
     const scopeDO = new NetScopeDO(scope.state, env);
-    // More than PASSES_PER_DRAIN × ROWS_PER_LANE (8 × 32 = 256) rows in
+    // More than PASSES_PER_DRAIN × ROWS_PER_LANE (1 × 4 = 4) rows in
     // one lane: the first kick must stop at the budget and arm an
     // immediate alarm; the alarm's fresh invocation finishes the job.
-    const BACKLOG = 300;
+    const BACKLOG = 10;
     for (let seq = 1; seq <= BACKLOG; seq++) insertRow(scope.state, "gateway:mirror", seq);
 
     const before = Date.now();
     await kick(scopeDO, env);
     await scope.settle();
-    expect(healthy.received).toHaveLength(256); // exactly the budget
-    expect(pendingRows(scope.state)).toHaveLength(BACKLOG - 256);
+    expect(healthy.received).toHaveLength(4); // exactly the budget
+    expect(pendingRows(scope.state)).toHaveLength(BACKLOG - 4);
     // The continuation: the retry alarm armed at ~now (due work remains).
     const armed = scope.alarms.filter((at): at is number => at !== null);
     expect(armed.length).toBeGreaterThanOrEqual(1);
     expect(armed[armed.length - 1]).toBeLessThanOrEqual(Date.now() + 5);
     expect(armed[armed.length - 1]).toBeGreaterThanOrEqual(before - 5);
 
-    // The next invocation (the fake's alarms never self-fire — kick
-    // stands in for the alarm's deferPendingDrain) finishes the backlog
-    // in order.
-    await kick(scopeDO, env);
-    await scope.settle();
+    // Two more invocations (the fake's alarms never self-fire — kick
+    // stands in for the alarm's deferPendingDrain) finish the backlog.
+    for (let i = 0; i < 2; i += 1) {
+      await kick(scopeDO, env);
+      await scope.settle();
+    }
     expect(pendingRows(scope.state)).toEqual([]);
     expect((healthy.received as Array<{ seq: number }>).map((b) => b.seq)).toEqual(
       Array.from({ length: BACKLOG }, (_, i) => i + 1)
@@ -364,14 +370,23 @@ describe("Phase 3 — bounded scheduled bursts", () => {
     expect(Math.min(...armed.slice(-3))).toBeLessThanOrEqual(Date.now());
     expect(Math.min(...armed.slice(-3))).toBeGreaterThanOrEqual(beforeAlarm - 5);
 
-    // Firing the wake repeatedly drains the burst in batches.
-    await scopeDO.alarm();
-    await scopeDO.alarm();
+    // Firing the scheduled wake repeatedly moves all three 32-row
+    // scheduled batches. Each alarm drain intentionally delivers only
+    // four planner rows, so continue through fresh alarm events until the
+    // 80-row outbox is empty as well.
     await scope.settle();
+    for (let i = 0; i < 2; i += 1) {
+      await scopeDO.alarm();
+      await scope.settle();
+    }
     const parkedAfterAll = (
       scope.state.storage.sql.exec("SELECT COUNT(*) AS n FROM net_scope_scheduled") as { toArray(): Array<{ n: number }> }
     ).toArray()[0].n;
     expect(Number(parkedAfterAll)).toBe(0);
+    for (let i = 0; i < 17; i += 1) {
+      await scopeDO.alarm();
+      await scope.settle();
+    }
 
     // Exactly once, all 80, at the planner.
     const ids = (planner.received as Array<{ scheduled_turn: ScheduledTurn }>).map((b) => b.scheduled_turn.id).sort();

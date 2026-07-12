@@ -27,12 +27,13 @@ SECOND REVIEW (2026-07-08, 5 findings) — ALL RESOLVED:
    due-time question) and peekDue/dueTurns/nextAlarmAt/cancel delegate;
    the in-memory map serves only durable-less sequencers.
 2. One drain invocation could still consume O(backlog) CPU (the
-   delivered>0 loop). FIXED: OUTBOX_PASSES_PER_DRAIN=8 budgets an
+   delivered>0 loop). FIXED: OUTBOX_PASSES_PER_DRAIN=1 budgets an
    invocation at LANES×ROWS×PASSES rows; leftover DUE work makes
    outboxNextRetryAt clamp to now, so the finally's retry alarm IS the
-   continuation on a fresh invocation budget (tested: 300-row backlog →
-   exactly 256 delivered on kick 1, alarm at now, kick 2 finishes, order
-   intact).
+   continuation on a fresh invocation budget. The deployed contention
+   canary subsequently fixed the quantum at 4 rows per lane and one pass:
+   a 10-row backlog delivers exactly 4 on kick 1, arms at now, and finishes
+   across two fresh invocations with order intact.
 3. The lane-directory backfill ran O(backlog) on EVERY construction.
    FIXED: all three Phase-3 backfills (outbox columns, lane directory,
    scheduled due_at) are marker-gated one-time migrations
