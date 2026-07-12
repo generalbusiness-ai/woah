@@ -172,14 +172,17 @@ concurrently, while rows within each destination remain strictly serial in
 `(scope, seq)` order. A slow or backing-off subscriber cannot add its
 delivery latency to healthy subscribers' lanes.
 
-An incoming outbox delivery MUST NOT synchronously continue another
-outbox drain in the same platform request lineage. `/adopt` and `/relate`
-persist their derived fanout/refan rows, arm an immediate Durable Object
-alarm, and return; that fresh alarm event drains the next hop. This event
-break is part of the boundedness contract: without it, a valid chain of
-owner adoption, relation delivery, and fanout can exceed Cloudflare's
-recursive subrequest-depth limit even though each individual drain pass is
-row-bounded.
+An accepted `/submit` and an incoming outbox delivery MUST NOT synchronously
+continue an outbox drain in the same platform request lineage. `/submit`,
+`/adopt`, and `/relate` persist their fanout/refan rows, arm an immediate
+Durable Object alarm, and return; that fresh alarm event drains the next hop.
+The submit boundary is necessary because its caller is a gateway and fanout
+includes that same gateway: starting even a deferred task before the reply
+leaves the scope can form a `gateway -> scope -> gateway` request cycle. These
+event breaks are part of the boundedness contract: without them, a valid
+chain of submission, owner adoption, relation delivery, and fanout can exceed
+Cloudflare's recursive subrequest-depth limit even though each individual
+drain pass is row-bounded.
 
 ### CO2.8 Durable continuations
 

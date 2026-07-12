@@ -626,7 +626,12 @@ export class NetScopeDO {
     // request lineage eventually trips the platform subrequest-depth cap.
     // Delivery handlers below arm a fresh alarm event instead.
     const incomingDelivery = request.method === "POST" && (url.pathname === "/net/adopt" || url.pathname === "/net/relate");
-    if (!incomingDelivery) this.deferPendingDrain();
+    const submitRequest = request.method === "POST" && url.pathname === "/net/submit";
+    // A submit is itself reached from a gateway. Starting an old drain
+    // before returning can call that still-waiting gateway and form a CF
+    // request cycle (gateway -> scope -> gateway). Submit and incoming
+    // delivery routes therefore continue only through a fresh alarm event.
+    if (!incomingDelivery && !submitRequest) this.deferPendingDrain();
     try {
       if (request.method === "POST" && url.pathname === "/net/submit") {
         // Bare CommitSubmit (direct submits, tests) or the gateway's
@@ -689,7 +694,12 @@ export class NetScopeDO {
         } finally {
           this.relateScopeHints.clear();
         }
-        this.host.defer(() => this.drainOutbox());
+        // Never begin fanout in the gateway -> scope submit lineage. Even a
+        // waitUntil task starts executing immediately; calling the submitting
+        // gateway before this response leaves the scope creates a platform
+        // recursion cycle. The durable row is already committed, so an
+        // immediate alarm is the crash-safe post-reply continuation.
+        this.armOutboxRetryAlarm();
         // H2b: a commit touching a session cell minted or refreshed an
         // expiry — re-derive the reap wake (gated on the touched keys so
         // the hot non-session path never pays the scan).

@@ -25,9 +25,9 @@ const EPOCH = "cat-net-fanout-1";
 const ROOM_SCOPE = "room_w";
 const CLUSTER_SCOPE = "cluster_c";
 
-/** Fake DO state + alarm slice + waitUntil capture, so tests can await
- * the deferred outbox drains WorkerdHost hands to waitUntil. Armings
- * are recorded (null = deleteAlarm) so tests can assert retry wake-ups. */
+/** Fake DO state + alarm slice + waitUntil capture. Submit fanout starts
+ * only when a test invokes DO.alarm(); nested drains then ride waitUntil.
+ * Armings are recorded (null = deleteAlarm) for retry assertions. */
 function netState(name: string) {
   const fake = new FakeDurableObjectState(name);
   const deferred: Array<Promise<unknown>> = [];
@@ -193,6 +193,9 @@ describe("NetScopeDO fanout + rider adoption over fake-DO", () => {
       rider_destinations: { [CLUSTER_SCOPE]: { destination: `scope:${CLUSTER_SCOPE}`, objects: ["#actor"] } }
     });
     expect(reply.status).toBe("accepted");
+    expect(clusterRecorder.calls).toHaveLength(0);
+    expect(gatewayRecorder.calls).toHaveLength(0);
+    await roomDO.alarm();
     await room.settle();
 
     // Rider adoption: the cluster authority now holds the ride-along
@@ -273,6 +276,7 @@ describe("NetScopeDO fanout + rider adoption over fake-DO", () => {
 
     const reply = await call<CommitReply>(faultedDO, faultedEnv, "/submit", rideAlongSubmit(head0));
     expect(reply.status).toBe("accepted");
+    await faultedDO.alarm();
     await room.settle();
 
     // The commit stands; the delivery is pending with one failed attempt
@@ -327,6 +331,7 @@ describe("outbox liveness (fix 4)", () => {
     await call(faultedDO, faultedEnv, "/subscribe", { destination: "gateway:g1" });
     const head0 = (await call<{ head: ScopeHead }>(faultedDO, faultedEnv, "/head")).head;
     expect((await call<CommitReply>(faultedDO, faultedEnv, "/submit", rideAlongSubmit(head0))).status).toBe("accepted");
+    await faultedDO.alarm();
     await room.settle();
 
     // The failed drain armed the DO alarm for the retry window — the
@@ -518,6 +523,7 @@ describe("rider adoption prior-version CAS (fix 1)", () => {
     const head0 = (await call<{ head: ScopeHead }>(roomDO, roomEnv, "/head")).head;
     const happy = rideAlongReading(head0, "cas-happy", "cas-t1", cellVersion({ value: 0 }), 1, 1);
     expect((await call<CommitReply>(roomDO, roomEnv, "/submit", { submit: happy, rider_destinations: riders })).status).toBe("accepted");
+    await roomDO.alarm();
     await room.settle();
     expect((await greetedAt()).value).toEqual({ value: 1 }); // adopted cleanly
     expect(conflicts()).toBe(0);
@@ -539,6 +545,7 @@ describe("rider adoption prior-version CAS (fix 1)", () => {
     expect((await call<CommitReply>(clusterDO, scopeEnvBase, "/submit", clusterAdvanceSubmit(clusterHead, 42))).status).toBe("accepted");
 
     expect((await call<CommitReply>(roomDO, roomEnv, "/submit", { submit: stale, rider_destinations: riders })).status).toBe("accepted");
+    await roomDO.alarm();
     await room.settle();
 
     const after = await greetedAt();
@@ -584,6 +591,7 @@ describe("rider adoption prior-version CAS (fix 1)", () => {
         })
       ).status
     ).toBe("accepted");
+    await roomDO.alarm();
     await room.settle();
 
     // A full "*" closure from the committing scope must not crash on the

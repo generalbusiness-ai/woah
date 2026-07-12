@@ -22,7 +22,7 @@ const ROOM_SCOPE = "room_w";
 const CLUSTER_SCOPE = "cluster_c";
 
 /** Fake DO state + waitUntil capture (net-scope-fanout idiom) so tests
- * can await the deferred outbox drains. */
+ * can await drains started by an explicit durable alarm event. */
 function netState(name: string) {
   const fake = new FakeDurableObjectState(name);
   const deferred: Array<Promise<unknown>> = [];
@@ -227,7 +227,12 @@ describe("CO13 relations over the DO shells", () => {
     expect(reply.relations).toBeUndefined();
     expect(reply.relations_foreign?.[0]?.scope).toBe(ROOM_SCOPE);
     expect(reply.relations_foreign?.[0]?.deltas).toHaveLength(2);
-    await cluster.settle(); // cluster drains /relate to the room
+    // Submit returns before any gateway/scope callback begins. The fresh
+    // alarm event drains /relate without a gateway -> scope -> gateway
+    // request cycle.
+    expect(roomRecorder.calls.filter((c) => c.path === "/net/relate")).toHaveLength(0);
+    await clusterDO.alarm();
+    await cluster.settle();
     // The incoming /relate MUST NOT recursively drain its refan in the
     // same CF request lineage. It arms a fresh alarm event instead.
     await room.settle();
@@ -321,6 +326,8 @@ describe("CO13 relations over the DO shells", () => {
     if (reply.status !== "accepted") return;
     expect(reply.relations).toEqual([{ op: "add", row: { relation: "contents", owner: "#room", member: "#box" } }]);
     expect(reply.relations_foreign).toBeUndefined();
+    expect(gatewayRecorder.calls.filter((c) => c.path === "/net/fanout")).toHaveLength(0);
+    await roomDO.alarm();
     await room.settle();
 
     // The local delta was applied at the room durably AND rode the
