@@ -1199,6 +1199,20 @@
       "kind": "change_parent",
       "object": "$chatroom",
       "parent": "$room"
+    },
+    {
+      "kind": "set_property",
+      "object": "$system",
+      "property": "failed_match_ref",
+      "value": "$failed_match",
+      "mode": "set_if_missing"
+    },
+    {
+      "kind": "set_property",
+      "object": "$system",
+      "property": "ambiguous_match_ref",
+      "value": "$ambiguous_match",
+      "mode": "set_if_missing"
     }
   ]
 }

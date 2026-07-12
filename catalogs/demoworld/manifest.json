@@ -280,9 +280,6 @@
       "name": "Living Room",
       "description": "A bright, open living room with a rough fireplace, bookcases on two walls, and broad windows looking south. A sliding glass door leads southeast onto a wooden deck.",
       "properties": {
-        "next_seq": 1,
-        "subscribers": [],
-        "last_snapshot_seq": 0,
         "host_placement": "self",
         "aliases": [
           "living room",
@@ -327,9 +324,6 @@
       "name": "Deck",
       "description": "A wooden deck behind the house, facing south toward the gardens. The living room is west through the glass door, and a large hot tub waits at the east end. To the south, steps lead down into the garden.",
       "properties": {
-        "next_seq": 1,
-        "subscribers": [],
-        "last_snapshot_seq": 0,
         "host_placement": "self",
         "aliases": [
           "deck",
@@ -371,9 +365,6 @@
       "description": "A molded hot tub with a bench around three sides and bubbling jets running.",
       "location": "the_deck",
       "properties": {
-        "next_seq": 1,
-        "subscribers": [],
-        "last_snapshot_seq": 0,
         "host_placement": "self",
         "aliases": [
           "hot tub",
@@ -396,9 +387,6 @@
       "name": "Garden",
       "description": "You are in a lush and tranquil garden, with gravelled paths between well-tended beds. To the south is a sign saying \"Santa's Workshop\" in small, neat lettering.",
       "properties": {
-        "next_seq": 1,
-        "subscribers": [],
-        "last_snapshot_seq": 0,
         "host_placement": "self",
         "aliases": [
           "garden"
@@ -714,9 +702,6 @@
       "description": "A shared outline pinned to the Living Room wall. Sketch a hierarchy of tasks, ideas, or anything else here together.",
       "location": "the_chatroom",
       "properties": {
-        "next_seq": 1,
-        "subscribers": [],
-        "last_snapshot_seq": 0,
         "host_placement": "self",
         "aliases": ["outline", "outliner", "tree"],
         "focus_by_actor": {},
@@ -744,9 +729,6 @@
       "description": "A shared cork-backed pinboard mounted on the Deck wall. It is a visible object in the chat world and a separate coordination space where people and agents arrange durable text notes.",
       "location": "the_deck",
       "properties": {
-        "next_seq": 1,
-        "subscribers": [],
-        "last_snapshot_seq": 0,
         "host_placement": "self",
         "aliases": [
           "pinboard",
@@ -790,9 +772,6 @@
       "description": "The first runnable sound-space instance. It owns the sequenced coordination surface for four loop slots, one channel, one filter, one delay, one percussion loop, and one default scene.",
       "location": "the_chatroom",
       "properties": {
-        "next_seq": 1,
-        "subscribers": [],
-        "last_snapshot_seq": 0,
         "host_placement": "self",
         "aliases": [
           "dubspace",

@@ -5,17 +5,18 @@ status: implemented (core M1–M5, M7; see status table)
 
 # Moveto pipeline
 
-> **Status (audited 2026-07-05):** the receiver-driven move chain is
+> **Status (audited 2026-07-12):** the receiver-driven move chain is
 > implemented and is a documented hot path; this spec is its reference.
 >
 > | Section | Verdict | Evidence |
 > |---|---|---|
-> | M1–M3 (two primitives, hook chain, authority) | implemented | `movetoChecked` `src/core/world.ts:5816`, `assertCanMoveto` `:5817`, re-entry marker `movetoStack` `:5840` |
+> | M1–M3 (two primitives, hook chain, authority) | implemented | `movetoChecked` `src/core/world.ts:5855`, `assertCanMoveto` `:5856`, re-entry marker `movetoStack` `:5879` |
+> | M2.4 (actor path) | implemented | fork at `world.ts:5857` (`inheritsFrom(objRef,"$actor")`) → `movetoActorChecked` `:5913` |
 > | M4 (cross-host moves) | implemented | deferred owner write via `ctx.deferHostEffect` in `movetoChecked` |
-> | M5 (builtin surface) | implemented | `"moveto"` in `tiny-vm.ts:112` (op `:964`), `dsl-compiler.ts:139`, `authoring.ts:14,906` |
+> | M5 (builtin surface) | implemented | `"moveto"` in `tiny-vm.ts` (op), `dsl-compiler.ts`, `authoring.ts` |
 > | M6 (diagnostic `moveto_failed` schema) | not implemented — optional by its own text ("Skip if it adds noise") | no emitter in `world.ts` |
 > | M7 (caller migration) | implemented | `moveto(` in `catalogs/chat/manifest.json`, `catalogs/pinboard/manifest.json` |
-> | M8 (tests) | covered | moveto chain + cross-host cases in `tests/core.test.ts` (e.g. `:681,:837,:961`) |
+> | M8 (tests) | covered | moveto chain + cross-host cases in `tests/core.test.ts`; actor path in `tests/executor.test.ts` |
 > | M9 | descriptive (enabled outcomes) | — |
 > | M10 | open questions — still open, non-normative | — |
 
@@ -59,6 +60,15 @@ moveto(obj, target)
 6. target:enterfunc(obj)              — fired if target defines :enterfunc
 ```
 
+The chain above is the uniform path for ordinary objects. Objects that
+descend from `$actor` take the **actor path** (M2.4) instead: the core
+forks at the top of `movetoChecked` (`world.ts:5857`,
+`inheritsFrom(objRef, "$actor")`) into `movetoActorChecked`, which keeps
+steps 2/4/6 but substitutes session-scoped presence semantics for steps
+1/3/5. This fork is normative — an actor is not a passive container item;
+its "location" is a live session's active scope, and moving it is a
+sequenced presence transition, not a bare relocate.
+
 ### M2.1. Default `:moveto` on `$thing`
 
 The default `$thing:moveto` is the no-op that just delegates back to the
@@ -97,6 +107,74 @@ hooks must not fail the move" pattern).
 Hooks may emit observations, mutate the container's audit-log
 properties (e.g. `pinboard.dates`, `pinboard.layout`), or trigger side
 effects on paired objects (e.g. `pinboard.mail_recipient:contents_added`).
+
+### M2.4. The actor path
+
+When the moving object descends from `$actor`, `movetoChecked` diverts to
+`movetoActorChecked` (`world.ts:5913`) **before** step 1, and the object's
+own `:moveto` verb is **not** dispatched. This is deliberate: an actor's
+position is not a container fact on `.location`; it is the *active scope*
+of a live session, and relocating an actor is a presence transition that
+must be sequenced and projected. The generic chain (step 1 virtual
+dispatch, step 3 host coordination on `.location`, step 5 relocate) is
+replaced as follows; steps 2 (`:acceptable`), 4 (`:exitfunc`), and 6
+(`:enterfunc`) are retained in spirit but re-keyed to the session scope.
+
+Actor-path sequence:
+
+```
+movetoActorChecked(actor, target)
+  ↓
+0. if the caller has no live session for `actor` → bare relocate + return
+   (the object-graph fallback; e.g. catalog install moving a seeded actor)
+  ↓
+1. require caller's live session (session.actor === actor) else E_NOSESSION
+  ↓
+2. assertMovementDestinationOwnerAuthority(target)   — CA11.2 occupancy
+     transition; may raise a repairable E_NEED_STATE so the destination
+     occupancy row is repaired owner-authoritatively before commit
+  ↓
+3. target:acceptable(actor)                          — same as M2 step 2
+  ↓
+4. oldLocation := session.activeScope (NOT actor.location)
+     oldLocation:exitfunc(actor)                     — M2 step 4, re-keyed
+  ↓
+5. presence remove at oldLocation
+  ↓
+6. record a session-scope transition event (CA8) when oldLocation != target,
+     including the no-op physical enter; then setSessionActiveScope(target)
+  ↓
+7. primary-session gate: only the actor's primary session performs the
+     physical relocate (or the deferred cross-host owner write); non-primary
+     sessions skip the physical move
+  ↓
+8. presence add at target
+  ↓
+9. target:enterfunc(actor)                           — same as M2 step 6
+```
+
+**Rationale and cross-references.** The old-location for an actor is its
+session's `activeScope`, not `.location`, because an actor may hold
+several sessions and only presence-at-scope is meaningful for exit/enter
+routing. Step 2 is the movement-destination case of **CA11.2 quasi-static
+topology pre-seeding** (`spec/protocol/cell-authority.md` §CA11.2): the
+destination occupancy is owner-authoritative, so a cross-owner move raises
+a repairable fault rather than writing a stale row. Step 6 records the
+first-class **session active-scope transition** of **CA8** (live delivery
+and transitive presence, `spec/protocol/cell-authority.md` §CA8), which
+drives presence projections even when the physical enter is a no-op.
+
+**Why not restore the uniform chain.** Dropping the actor fork and running
+step 1's `$actor:moveto` virtual dispatch would let a `$player:moveto`
+override intercept the move, but it would also bypass the session/presence
+machinery the live-delivery and net paths depend on (CA8 transition
+recording, CA11.2 destination authority, primary-session gating). The
+decision of record is to keep the fork and treat the actor path as
+normative. A consequence to note explicitly: a `$player`-level `:moveto`
+override is **not** consulted for actor moves; catalogs must not rely on
+one. Sender-side actor-move policy belongs in the command verbs (chat
+`enter`/`leave`) or in `:acceptable` on the destination, not in an
+actor `:moveto`.
 
 ## M3. Authority
 
@@ -250,6 +328,17 @@ In `tests/core.test.ts`, a new `describe` block:
 - non-controller caller raises `E_PERM` before invoking `:acceptable`.
 - objects without a `:moveto` override inherit `$thing:moveto` (just hits
   acceptable + relocate + enterfunc).
+
+Actor path (M2.4):
+- an actor move re-keys exit/enter to `session.activeScope` and records a
+  CA8 session-scope transition; the physical relocate is gated to the
+  primary session (covered by the cross-scope routing cases in
+  `tests/executor.test.ts` and `tests/dev-v2-cross-scope-routing.test.ts`).
+- a `$player`-level `:moveto` override is **not** dispatched for an actor
+  move (the fork skips step 1) — a regression test should assert the
+  override does not fire.
+- an actor move with no live session for the caller falls back to a bare
+  relocate (catalog-install path).
 
 ## M9. What this enables
 

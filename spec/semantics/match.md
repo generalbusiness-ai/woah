@@ -322,10 +322,10 @@ utterance.
 ## MA7. Substrate-hardcoded conventions
 
 A small vocabulary is wired into the substrate's command-resolution path
-rather than into a catalog: the pseudo-names `me` and `here`, the sentinel
-corerefs `$failed_match` / `$ambiguous_match` / `$nothing`, and the `#<id>`
-direct-object syntax. These are not catalog-extensible; any chat-shaped
-surface inherits them, and an alternate world cannot redefine them locally.
+rather than into a catalog: the pseudo-names `me` and `here`, the `$nothing`
+coreref, and the `#<id>` direct-object syntax. These are not
+catalog-extensible; any chat-shaped surface inherits them, and an alternate
+world cannot redefine them locally.
 
 This is intentional and follows LambdaMOO's `match.c`, where the same
 identifiers are baked into the C-level matcher. They are part of the
@@ -334,6 +334,19 @@ the meaning of every command pattern in every catalog. Catalog authors who
 want a different word for "the actor" or "this room" should add an alias on
 the relevant object's `aliases` property; they should not try to redefine
 `me` or `here`.
+
+**Match sentinels are catalog-configured, not substrate-hardcoded.** The
+failed- and ambiguous-match sentinels (`$failed_match` / `$ambiguous_match`)
+are ordinary objects defined by the chat catalog, not substrate seeds. Core
+must not hardcode their refs; instead the chat catalog registers them into
+`$system` at install (`set_property` seed_hooks writing
+`$system.failed_match_ref` and `$system.ambiguous_match_ref`), and the
+matcher consults that config when it produces a no-match / ambiguous-match
+result. The well-known names remain a single labelled legacy fallback in
+core for worlds installed before the config was seeded. A world that installs
+a different match surface may therefore supply its own sentinel objects and
+point the `$system` refs at them; a world with no chat surface produces
+`#-1` for these results.
 
 If a future surface needs richer parser globals (a tabletop or roguelike
 might want `north`, `up`, `target`), those are catalog-defined verbs/aliases

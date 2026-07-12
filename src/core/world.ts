@@ -10367,7 +10367,7 @@ export class WooWorld {
             direct_callable: resolved.direct_callable,
             skip_presence_check: resolved.skip_presence_check === true,
             arg_spec: resolved.arg_spec ?? {}
-          } : (this.objects.has("$failed_match") ? "$failed_match" : null);
+          } : this.matchSentinelRef("failed");
         }
         const { definer, verb } = this.resolveVerb(target, name);
         return {
@@ -10380,7 +10380,7 @@ export class WooWorld {
       } catch (err) {
         const error = normalizeError(err);
         if (error.code !== "E_VERBNF" && !isReadAvailabilityError(error)) throw err;
-        return this.objects.has("$failed_match") ? "$failed_match" : null;
+        return this.matchSentinelRef("failed");
       }
     });
     this.nativeHandlers.set("match_command_verb", async (ctx, args) => {
@@ -10388,7 +10388,7 @@ export class WooWorld {
       const target = assertObj(args[1]);
       if (!await this.canSeeCommandObject(ctx, target)) throw wooError("E_PERM", `${ctx.actor} cannot match command verbs on ${target}`, { actor: ctx.actor, target });
       const matched = await this.matchCommandVerbOnTarget(ctx, cmd, target);
-      return matched ? matched as unknown as WooValue : (this.objects.has("$failed_match") ? "$failed_match" : null);
+      return matched ? matched as unknown as WooValue : this.matchSentinelRef("failed");
     });
     this.nativeHandlers.set("plan_command", async (ctx, args) => {
       const space = assertObj(args[1] ?? ctx.caller);
@@ -11367,11 +11367,11 @@ export class WooWorld {
     if (token === "verb") return cmd.verb;
     if (token === "argstr") return cmd.argstr;
     if (token === "prep") return cmd.prep ?? "";
-    if (token === "dobj") return cmd.dobj ?? "$failed_match";
+    if (token === "dobj") return cmd.dobj ?? this.matchSentinelRef("failed") ?? "$failed_match";
     if (token === "dobjstr") return cmd.dobjstr;
-    if (token === "dobj_prefix") return cmd.dobj_prefix ?? "$failed_match";
+    if (token === "dobj_prefix") return cmd.dobj_prefix ?? this.matchSentinelRef("failed") ?? "$failed_match";
     if (token === "dobj_prefix_rest") return cmd.dobj_prefix_rest;
-    if (token === "iobj") return cmd.iobj ?? "$failed_match";
+    if (token === "iobj") return cmd.iobj ?? this.matchSentinelRef("failed") ?? "$failed_match";
     if (token === "iobjstr") return cmd.iobjstr;
     if (token === "cmd") return cmd as unknown as WooValue;
     throw wooError("E_INVARG", `unsupported command args_from token: ${token}`, token);
@@ -11703,11 +11703,23 @@ export class WooWorld {
     return this.matchSentinel("failed");
   }
 
+  // The match sentinels ($failed_match / $ambiguous_match) are catalog
+  // objects defined by the chat catalog, not substrate seeds. Core must not
+  // hardcode their refs (a layering violation): it consults $system config
+  // set at catalog install (chat writes `$system.failed_match_ref` /
+  // `ambiguous_match_ref` via set_property seed_hooks). The well-known names
+  // remain a single labelled legacy fallback for worlds installed before the
+  // config was seeded. See spec/semantics/match.md §MA7.
+  private matchSentinelRef(kind: "failed" | "ambiguous"): ObjRef | null {
+    const prop = kind === "failed" ? "failed_match_ref" : "ambiguous_match_ref";
+    const configured = this.propOrNull("$system", prop);
+    if (typeof configured === "string" && this.objects.has(configured)) return configured;
+    const legacy = kind === "failed" ? "$failed_match" : "$ambiguous_match";
+    return this.objects.has(legacy) ? legacy : null;
+  }
+
   private matchSentinel(kind: "failed" | "ambiguous"): ObjectMatch {
-    const value = kind === "failed"
-      ? (this.objects.has("$failed_match") ? "$failed_match" : "#-1")
-      : (this.objects.has("$ambiguous_match") ? "$ambiguous_match" : "#-1");
-    return { status: kind, value };
+    return { status: kind, value: this.matchSentinelRef(kind) ?? "#-1" };
   }
 
   private sweepIdempotency(): void {

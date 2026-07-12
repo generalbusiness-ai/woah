@@ -101,6 +101,25 @@ describe("match_object §MA2 resolution tiers", () => {
     expect(await callMatch(world, actor, "zebra", roomId)).toBe("$failed_match");
   });
 
+  it("seeds the match-sentinel refs into $system at chat install (MA7)", async () => {
+    // The chat catalog registers the sentinels into $system via set_property
+    // seed_hooks so core does not hardcode them (spec/semantics/match.md MA7).
+    const { world } = setupRoomWithActor("sentinel-config");
+    expect(world.getProp("$system", "failed_match_ref")).toBe("$failed_match");
+    expect(world.getProp("$system", "ambiguous_match_ref")).toBe("$ambiguous_match");
+  });
+
+  it("resolves the failed-match result via $system config, not a hardcoded ref", async () => {
+    // Repoint the failed-match ref at a custom sentinel object; core must
+    // consult $system config, so the matcher yields the reconfigured ref
+    // rather than the literal $failed_match. This proves the config path is
+    // live (not merely the legacy fallback happening to equal the default).
+    const { world, roomId, actor } = setupRoomWithActor("sentinel-configurable");
+    world.createObject({ id: "obj_custom_failed", name: "no match sentinel", parent: "$thing", owner: "$wiz" });
+    world.setProp("$system", "failed_match_ref", "obj_custom_failed");
+    expect(await callMatch(world, actor, "zebra", roomId)).toBe("obj_custom_failed");
+  });
+
   it("falls through to body (substring) tier as last resort", async () => {
     // "ndle" is a substring of "candle" but not a prefix. With no exact or
     // prefix candidate, the body tier resolves the match.
