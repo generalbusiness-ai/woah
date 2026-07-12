@@ -88,7 +88,10 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
 
     const settleAll = async () => {
       for (const st of states) await st.settle();
-      for (const st of states) await st.settle(); // second wave: relate → refan
+      // Incoming adopt/relate deliveries continue from a fresh alarm
+      // event, matching production's CF subrequest-depth boundary.
+      for (const scope of scopeDOs.values()) await scope.alarm();
+      for (const st of states) await st.settle();
     };
 
     let nextId = 10;

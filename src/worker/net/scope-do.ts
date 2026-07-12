@@ -619,11 +619,14 @@ export class NetScopeDO {
     } catch (err) {
       return json({ error: String(err) }, 401);
     }
-    // Drain-on-reactivation (CO2.7 at-least-once): pending outbox rows
-    // left by a crash or delivery fault go out on the next wake — any
-    // authenticated request suffices to kick the deferred drain.
-    this.deferPendingDrain();
     const url = new URL(request.url);
+    // Drain-on-reactivation (CO2.7 at-least-once): ordinary requests kick
+    // pending work off their reply path. An incoming outbox delivery is
+    // different: continuing /adopt -> /relate -> /fanout in the SAME CF
+    // request lineage eventually trips the platform subrequest-depth cap.
+    // Delivery handlers below arm a fresh alarm event instead.
+    const incomingDelivery = request.method === "POST" && (url.pathname === "/net/adopt" || url.pathname === "/net/relate");
+    if (!incomingDelivery) this.deferPendingDrain();
     try {
       if (request.method === "POST" && url.pathname === "/net/submit") {
         // Bare CommitSubmit (direct submits, tests) or the gateway's
@@ -744,10 +747,10 @@ export class NetScopeDO {
           prior_versions?: Record<string, string>;
         };
         const adopted = this.adopt(body);
-        // A non-empty adoption enqueued fanout rows to this scope's own
-        // subscribers (owner-sequenced commit — see adopt()); drain them
-        // off the reply path, same as /net/submit.
-        this.host.defer(() => this.drainOutbox());
+        // A non-empty adoption enqueued fanout rows. Continue from a
+        // fresh alarm event so delivery chains cannot recurse through
+        // Cloudflare's per-request subrequest-depth limit.
+        this.armOutboxRetryAlarm();
         // H2b: the folded session mint reaches its cluster authority via
         // adoption — a session cell in the batch (re)arms the reap wake.
         if (adopted.applied && body.cells.some((cell) => cell.kind === "session")) {
@@ -763,9 +766,9 @@ export class NetScopeDO {
           observations?: unknown[];
         };
         const related = this.relate(body);
-        // A non-empty application enqueued refan rows to this scope's own
-        // subscribers (see relate()); drain them off the reply path.
-        this.host.defer(() => this.drainOutbox());
+        // Refan from a fresh alarm event; never extend the incoming
+        // /relate delivery's request lineage.
+        this.armOutboxRetryAlarm();
         return json(related);
       }
       if (request.method === "POST" && url.pathname === "/net/attest") {

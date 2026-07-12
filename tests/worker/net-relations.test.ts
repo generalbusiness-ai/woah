@@ -228,7 +228,12 @@ describe("CO13 relations over the DO shells", () => {
     expect(reply.relations_foreign?.[0]?.scope).toBe(ROOM_SCOPE);
     expect(reply.relations_foreign?.[0]?.deltas).toHaveLength(2);
     await cluster.settle(); // cluster drains /relate to the room
-    await room.settle(); // room drains its refan to the gateway
+    // The incoming /relate MUST NOT recursively drain its refan in the
+    // same CF request lineage. It arms a fresh alarm event instead.
+    await room.settle();
+    expect(gatewayRecorder.calls.filter((c) => c.path === "/net/fanout")).toHaveLength(0);
+    await roomDO.alarm();
+    await room.settle(); // fresh alarm event drains the refan
 
     // The room received exactly one /net/relate with the commit's
     // (from_scope, seq) identity and applied it owner-sequenced.

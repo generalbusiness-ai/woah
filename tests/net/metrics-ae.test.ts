@@ -42,6 +42,7 @@ describe("net Analytics Engine canary report", () => {
       authorities: [],
       incidents: [
         { kind: "net_turn_queue_refused", samples: 3 },
+        { kind: "net_scope_outbox_delivery_failed", samples: 2 },
         { kind: "net_scope_outbox_abandoned", samples: 1, abandoned: 1 },
         { kind: "net_fanout_gap", samples: 1 }
       ]
@@ -52,6 +53,7 @@ describe("net Analytics Engine canary report", () => {
     expect(failures.join("\n")).toContain("RPC timeout");
     expect(failures.join("\n")).toContain("queue p99");
     expect(failures.join("\n")).toContain("only 1 gateway shard");
+    expect(failures.join("\n")).toContain("outbox delivery failure");
     expect(failures.join("\n")).toContain("outbox abandonment");
     expect(failures.join("\n")).toContain("fanout gap");
   });

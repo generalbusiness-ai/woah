@@ -145,6 +145,9 @@ export function evaluateNetAeReport(report: NetAeReport, limits: Partial<NetAeLi
     failures.push(`only ${incident("net_guest_provisioned")} elastic guest(s) observed; need ${wanted.minElasticGuests}`);
   }
   if (incident("net_turn_queue_refused") > 0) failures.push(`${incident("net_turn_queue_refused")} queue refusal(s)`);
+  if (incident("net_scope_outbox_delivery_failed") > 0) {
+    failures.push(`${incident("net_scope_outbox_delivery_failed")} outbox delivery failure(s)`);
+  }
   if (incident("net_scope_outbox_abandoned") > 0 || outboxAbandoned > 0) failures.push("outbox abandonment observed");
   if (incident("net_fanout_gap") > 0) failures.push(`${incident("net_fanout_gap")} fanout gap(s)`);
   for (const kind of ["net_turn_install_degraded", "net_session_open_install_degraded", "net_guest_provision_install_degraded", "net_self_subscribe_failed", "net_adopt_conflict"]) {

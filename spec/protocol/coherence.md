@@ -167,6 +167,15 @@ a crash or eviction. Actor reply time and peer-visible delivery latency
 MUST be independent of audience size; delivery cost is O(distinct occupant
 shards), never O(active_sessions).
 
+An incoming outbox delivery MUST NOT synchronously continue another
+outbox drain in the same platform request lineage. `/adopt` and `/relate`
+persist their derived fanout/refan rows, arm an immediate Durable Object
+alarm, and return; that fresh alarm event drains the next hop. This event
+break is part of the boundedness contract: without it, a valid chain of
+owner adoption, relation delivery, and fanout can exceed Cloudflare's
+recursive subrequest-depth limit even though each individual drain pass is
+row-bounded.
+
 ### CO2.8 Durable continuations
 
 Parked tasks (VM `SUSPEND`/`FORK` with serialized frames) and scheduled

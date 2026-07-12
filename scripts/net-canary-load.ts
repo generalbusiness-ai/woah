@@ -66,31 +66,43 @@ async function main(): Promise<void> {
         { guest, verb: "look", args: [] }
       ]);
       const batch = await Promise.all(requests.map(async ({ guest, verb, args: turnArgs }, index): Promise<Outcome> => {
-        const { response, body, ms } = await jsonFetch(`${base}/net-api/turn`, {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            authorization: `Bearer session:${guest.session}`
-          },
-          body: JSON.stringify({
-            target: room,
-            verb,
-            args: turnArgs,
-            idempotency_key: `${run}-${round}-${index}`
-          })
-        });
-        const reply = body.reply as { status?: unknown } | undefined;
-        const error = body.error as { code?: unknown } | string | undefined;
-        const code = typeof error === "object" && error !== null && typeof error.code === "string"
-          ? error.code
-          : typeof error === "string" ? error : response.ok ? String(reply?.status ?? "ok") : `HTTP_${response.status}`;
-        return {
-          status: response.status,
-          ms,
-          code,
-          accepted: response.ok && reply?.status === "accepted",
-          detail: JSON.stringify(body).slice(0, 1_000)
-        };
+        const started = performance.now();
+        try {
+          const { response, body, ms } = await jsonFetch(`${base}/net-api/turn`, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              authorization: `Bearer session:${guest.session}`
+            },
+            body: JSON.stringify({
+              target: room,
+              verb,
+              args: turnArgs,
+              idempotency_key: `${run}-${round}-${index}`
+            })
+          });
+          const reply = body.reply as { status?: unknown } | undefined;
+          const error = body.error as { code?: unknown } | string | undefined;
+          const code = typeof error === "object" && error !== null && typeof error.code === "string"
+            ? error.code
+            : typeof error === "string" ? error : response.ok ? String(reply?.status ?? "ok") : `HTTP_${response.status}`;
+          return {
+            status: response.status,
+            ms,
+            code,
+            accepted: response.ok && reply?.status === "accepted",
+            detail: JSON.stringify(body).slice(0, 1_000)
+          };
+        } catch (err) {
+          const cause = err instanceof Error && err.cause !== undefined ? ` cause=${String(err.cause)}` : "";
+          return {
+            status: 0,
+            ms: Math.round(performance.now() - started),
+            code: "E_FETCH",
+            accepted: false,
+            detail: `${String(err)}${cause}`.slice(0, 1_000)
+          };
+        }
       }));
       outcomes.push(...batch);
     }
