@@ -107,6 +107,52 @@ describe("NetScopeDO over fake-DO storage", () => {
     b.close();
   });
 
+  it("serializes concurrent independent submits from one retained base without repair", async () => {
+    const scope = makeScope("room-a", env);
+    await call(scope.instance, env, "/seed", { scope: "room-a", catalog_epoch: EPOCH, cells: seedCells() });
+    const head0 = (await call<{ head: ScopeHead }>(scope.instance, env, "/head")).head;
+    const { applyTranscript } = await import("../../src/net/transcript");
+    const { ScopeSequencer } = await import("../../src/net/scope");
+    const twin = new ScopeSequencer("room-a", EPOCH);
+    twin.seed(seedCells());
+    const makeSubmit = (index: number) => {
+      const transcript = {
+        kind: "woo.effect_transcript.shadow.v1",
+        route: "direct",
+        scope: "room-a",
+        seq: 1,
+        call: { actor: "#actor", target: "#thing", verb: "look", args: [], body: undefined },
+        reads: [],
+        writes: [],
+        creates: [],
+        moves: [],
+        observations: [{ type: "looked", to: "#actor", text: `view-${index}` }],
+        logicalInputs: [],
+        untrackedEffects: [],
+        complete: true,
+        incompleteReasons: [],
+        hash: `net-do-concurrent-${index}`
+      };
+      return {
+        kind: "woo.net.commit_submit.v1",
+        scope: "room-a",
+        base: head0,
+        idempotency_key: `concurrent-${index}`,
+        transcript,
+        post_state_version: applyTranscript(twin.store, transcript as never, { scope_head: "x", catalog_epoch: EPOCH }).postStateVersion,
+        stamp: { scope_head: "x", catalog_epoch: EPOCH }
+      };
+    };
+
+    const replies = await Promise.all(
+      Array.from({ length: 12 }, (_, index) => call<CommitReply>(scope.instance, env, "/submit", makeSubmit(index)))
+    );
+    expect(replies.every((reply) => reply.status === "accepted")).toBe(true);
+    expect(new Set(replies.map((reply) => reply.head.seq)).size).toBe(12);
+    expect((await call<{ head: ScopeHead }>(scope.instance, env, "/head")).head.seq).toBe(12);
+    scope.close();
+  });
+
   it("cold restart over the same storage: head continuity + idempotent replay (CO2.5)", async () => {
     const first = makeScope("room-a", env);
     await call(first.instance, env, "/seed", { scope: "room-a", catalog_epoch: EPOCH, cells: seedCells() });

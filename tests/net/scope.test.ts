@@ -157,10 +157,38 @@ describe("commit acceptance (CO4)", () => {
     expect(replay2.head).toEqual(first.head);
   });
 
-  it("stale base rejects retryable stale_head", () => {
+  it("rebases independent turns from the same retained head", () => {
     const seq = new ScopeSequencer(SCOPE, EPOCH);
-    const stale = submitFor(seq, transcript({ writes: [propWrite("a")] }), "k1");
-    seq.submit(submitFor(seq, transcript({ writes: [propWrite("b")], hash: "other" }), "k2"));
+    const first = submitFor(seq, transcript({ hash: "concurrent-a", observations: [{ type: "said", text: "a" }] }), "k1");
+    const second = submitFor(seq, transcript({ hash: "concurrent-b", observations: [{ type: "said", text: "b" }] }), "k2");
+    expect(seq.submit(first).status).toBe("accepted");
+    const reply = seq.submit(second);
+    expect(reply.status).toBe("accepted");
+    expect(seq.head().seq).toBe(2);
+  });
+
+  it("retained-head rebase still rejects a true read/write conflict", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seq.seed([{ kind: "property_cell", object: "#thing", name: "n", value: { value: "before" } }]);
+    const version = seq.store.get("property_cell:#thing:n")?.version;
+    const read = { cell: { kind: "prop" as const, object: "#thing", name: "n" }, version, value: { value: "before" } as never };
+    const first = submitFor(seq, transcript({ reads: [read], writes: [propWrite("a")], hash: "conflict-a" }), "k1");
+    const second = submitFor(seq, transcript({ reads: [read], writes: [propWrite("b")], hash: "conflict-b" }), "k2");
+    expect(seq.submit(first).status).toBe("accepted");
+    const reply = seq.submit(second);
+    expect(reply.status).toBe("rejected");
+    if (reply.status === "rejected") {
+      expect(reply.reason).toBe("read_version_mismatch");
+      expect(reply.mismatched_reads).toEqual([{ kind: "prop", object: "#thing", name: "n" }]);
+    }
+    expect(seq.store.get("property_cell:#thing:n")?.value).toEqual({ value: "a" });
+  });
+
+  it("rejects a stale base whose hash is not proved by the retained tail", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    const stale = submitFor(seq, transcript({ hash: "forged-stale" }), "k1");
+    expect(seq.submit(submitFor(seq, transcript({ hash: "advance" }), "k2")).status).toBe("accepted");
+    stale.base = { ...stale.base, hash: "not-an-authority-head" };
     const reply = seq.submit(stale);
     expect(reply.status).toBe("rejected");
     if (reply.status === "rejected") {
@@ -168,6 +196,18 @@ describe("commit acceptance (CO4)", () => {
       expect(reply.retryable).toBe(true);
       expect(reply.head.seq).toBe(1);
     }
+  });
+
+  it("hydrates retained-head proofs and rebases after a cold start", () => {
+    const store = new InMemoryScopeStore();
+    const warm = new ScopeSequencer(SCOPE, EPOCH, { durable: store });
+    const first = submitFor(warm, transcript({ hash: "cold-a" }), "cold-k1");
+    const second = submitFor(warm, transcript({ hash: "cold-b" }), "cold-k2");
+    expect(warm.submit(first).status).toBe("accepted");
+
+    const cold = new ScopeSequencer(SCOPE, EPOCH, { durable: store });
+    expect(cold.submit(second).status).toBe("accepted");
+    expect(cold.head().seq).toBe(2);
   });
 
   it("epoch mismatch rejects retryable stale_epoch (CO8)", () => {
@@ -382,7 +422,9 @@ describe("owner-sequenced adoption (CO2.3)", () => {
     }
     expect(seq.store.get(GREETED)?.value).toEqual({ value: 1 });
     // The recovery tail names the adoption fact in transcript_hash form.
-    expect(seq.recoveryTail()).toEqual([{ seq: 1, transcript_hash: "adopt:room_w:5", touched: result.applied }]);
+    expect(seq.recoveryTail()).toEqual([
+      expect.objectContaining({ seq: 1, transcript_hash: "adopt:room_w:5", touched: result.applied })
+    ]);
   });
 
   it("owner-wins on a prior mismatch: the conflict is named, applied cells still land, the head still advances", () => {

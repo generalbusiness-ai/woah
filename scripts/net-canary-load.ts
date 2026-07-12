@@ -9,7 +9,7 @@
  */
 
 type Guest = { actor: string; session: string; elastic: boolean };
-type Outcome = { status: number; ms: number; code: string; accepted: boolean };
+type Outcome = { status: number; ms: number; code: string; accepted: boolean; detail: string };
 
 function percentile(values: number[], p: number): number {
   if (values.length === 0) return 0;
@@ -45,6 +45,7 @@ async function main(): Promise<void> {
   const run = `canary-${Date.now().toString(36)}`;
   const guests: Guest[] = [];
   const outcomes: Outcome[] = [];
+  const closeFailures: Array<{ actor: string; status: number; detail: string }> = [];
 
   try {
     for (let i = 0; i < actors; i += 1) {
@@ -83,31 +84,62 @@ async function main(): Promise<void> {
         const code = typeof error === "object" && error !== null && typeof error.code === "string"
           ? error.code
           : typeof error === "string" ? error : response.ok ? String(reply?.status ?? "ok") : `HTTP_${response.status}`;
-        return { status: response.status, ms, code, accepted: response.ok && reply?.status === "accepted" };
+        return {
+          status: response.status,
+          ms,
+          code,
+          accepted: response.ok && reply?.status === "accepted",
+          detail: JSON.stringify(body).slice(0, 1_000)
+        };
       }));
       outcomes.push(...batch);
     }
   } finally {
-    await Promise.allSettled(guests.map((guest) => fetch(`${base}/net-api/session`, {
-      method: "DELETE",
-      headers: { "content-type": "application/json", authorization: `Bearer session:${guest.session}` },
-      body: "{}"
-    })));
+    await Promise.all(guests.map(async (guest) => {
+      let last = { status: 0, detail: "close request did not run" };
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        try {
+          const { response, body } = await jsonFetch(`${base}/net-api/session`, {
+            method: "DELETE",
+            headers: { "content-type": "application/json", authorization: `Bearer session:${guest.session}` },
+            body: "{}"
+          });
+          if (response.ok) return;
+          last = { status: response.status, detail: JSON.stringify(body).slice(0, 1_000) };
+        } catch (err) {
+          last = { status: 0, detail: String(err).slice(0, 1_000) };
+        }
+        if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, attempt * 250));
+      }
+      closeFailures.push({ actor: guest.actor, ...last });
+    }));
   }
 
   const failures = outcomes.filter((outcome) => !outcome.accepted);
   const byCode = new Map<string, number>();
   for (const failure of failures) byCode.set(failure.code, (byCode.get(failure.code) ?? 0) + 1);
   const latencies = outcomes.map((outcome) => outcome.ms);
+  const serverErrors = failures.filter((outcome) => outcome.status >= 500);
+  const statusCounts = new Map<number, number>();
+  for (const outcome of outcomes) statusCounts.set(outcome.status, (statusCounts.get(outcome.status) ?? 0) + 1);
   const report = {
     run,
     actors: guests.length,
     elastic_guests: guests.filter((guest) => guest.elastic).length,
+    sessions_closed: guests.length - closeFailures.length,
+    close_failures: closeFailures,
     turns: outcomes.length,
     accepted: outcomes.length - failures.length,
     failures: failures.length,
     error_rate: outcomes.length === 0 ? 1 : failures.length / outcomes.length,
+    server_errors: serverErrors.length,
+    server_error_rate: outcomes.length === 0 ? 1 : serverErrors.length / outcomes.length,
+    status_counts: Object.fromEntries([...statusCounts].sort((a, b) => a[0] - b[0])),
     failure_codes: Object.fromEntries([...byCode].sort()),
+    failure_examples: [...new Map(failures.map((failure) => [
+      `${failure.status}:${failure.code}:${failure.detail}`,
+      { status: failure.status, code: failure.code, detail: failure.detail }
+    ])).values()].slice(0, 12),
     edge_ms: {
       p50: percentile(latencies, 50),
       p95: percentile(latencies, 95),
@@ -116,7 +148,7 @@ async function main(): Promise<void> {
     }
   };
   console.log(JSON.stringify(report, null, 2));
-  if (failures.length > 0) process.exitCode = 2;
+  if (failures.length > 0 || closeFailures.length > 0) process.exitCode = 2;
 }
 
 void main().catch((err) => {

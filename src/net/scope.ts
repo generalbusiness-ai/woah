@@ -27,7 +27,7 @@ import { CellStore, type Cell, type EpochStamp } from "./cells";
 import { netError } from "./errors";
 import { validateSessionCell } from "./sessions";
 import { applyRelationDeltas, deriveRelationDeltas, rebuildContentsRelation, relationKey, type RelationDelta, type RelationRow } from "./relations";
-import type { ScopeStore } from "./scope-store";
+import type { ScopeStore, TailEntry } from "./scope-store";
 import { applyTranscript, netCellKeyFor, type EffectTranscript, type TranscriptCell } from "./transcript";
 import { cellKey, cellVersion } from "./cells";
 
@@ -178,7 +178,7 @@ export class ScopeSequencer {
    * accepted create advances it. See objectCounter(). */
   private nextObjectCounter: number | null = null;
   private readonly replies = new Map<string, CommitReply>();
-  private readonly tail: Array<{ seq: number; transcript_hash: string; touched: string[] }> = [];
+  private readonly tail: TailEntry[] = [];
   private readonly scheduled = new Map<string, ScheduledTurn>();
   private readonly relationRows = new Map<string, RelationRow>();
   private readonly options: Required<Pick<ScopeSequencerOptions, "tailLimit">> & ScopeSequencerOptions;
@@ -373,9 +373,13 @@ export class ScopeSequencer {
       return this.reject(submit, "incomplete_transcript", { reasons: submit.transcript.incompleteReasons });
     }
 
-    // Head freshness: a transcript planned against an older head must
-    // re-plan (the gateway treats this as E_STALE_HEAD repair).
-    if (submit.base.seq !== this.headState.seq || submit.base.hash !== this.headState.hash) {
+    // CO4 retained-head rebase: exact-current submits proceed as before;
+    // a behind base proceeds only when this authority's bounded recovery
+    // tail proves the exact (seq, hash) as an ancestor. Current read
+    // versions and post-state are still validated below, so independent
+    // concurrent turns serialize without retries while true conflicts do
+    // not. Old tail rows lack hash proofs by design and fail closed.
+    if (!this.baseIsCurrentOrRetained(submit.base)) {
       return this.reject(submit, "stale_head", { base: submit.base, head: this.headState });
     }
 
@@ -465,6 +469,7 @@ export class ScopeSequencer {
     // The stamp never affects step-10 parity: postStateVersion digests
     // cell VALUES only, so the planner (stamping with its own view's
     // epoch) derives the same digest.
+    const priorHead = this.headState;
     const nextHead: ScopeHead = {
       seq: this.headState.seq + 1,
       hash: cellVersion([this.headState.hash, this.headState.seq + 1, submit.transcript.hash])
@@ -497,7 +502,13 @@ export class ScopeSequencer {
         if (match) this.nextObjectCounter = Math.max(this.nextObjectCounter, Number(match[1]) + 1);
       }
     }
-    const tailEntry = { seq: nextHead.seq, transcript_hash: submit.transcript.hash, touched: applied.touched };
+    const tailEntry: TailEntry = {
+      seq: nextHead.seq,
+      transcript_hash: submit.transcript.hash,
+      touched: applied.touched,
+      base_hash: priorHead.hash,
+      head_hash: nextHead.hash
+    };
     this.tail.push(tailEntry);
     if (this.tail.length > this.options.tailLimit) this.tail.splice(0, this.tail.length - this.options.tailLimit);
 
@@ -612,6 +623,7 @@ export class ScopeSequencer {
     // recovery log (`adopt:<from_scope>:<from_seq>` in place of a
     // transcript hash: adoptions have no transcript of their own).
     const marker = `adopt:${input.from_scope}:${input.seq}`;
+    const priorHead = this.headState;
     const nextHead: ScopeHead = {
       seq: this.headState.seq + 1,
       hash: cellVersion([this.headState.hash, this.headState.seq + 1, marker])
@@ -634,7 +646,13 @@ export class ScopeSequencer {
     }
     appliedKeys.sort();
     this.headState = nextHead;
-    const tailEntry = { seq: nextHead.seq, transcript_hash: marker, touched: appliedKeys };
+    const tailEntry: TailEntry = {
+      seq: nextHead.seq,
+      transcript_hash: marker,
+      touched: appliedKeys,
+      base_hash: priorHead.hash,
+      head_hash: nextHead.hash
+    };
     this.tail.push(tailEntry);
     if (this.tail.length > this.options.tailLimit) this.tail.splice(0, this.tail.length - this.options.tailLimit);
 
@@ -723,13 +741,20 @@ export class ScopeSequencer {
     // One head advance for the batch; the marker digests the reaped ids
     // so the rolling hash is deterministic and the tail stays legible.
     const marker = `session_reap:${cellVersion(reaped.map((entry) => entry.session))}`;
+    const priorHead = this.headState;
     const nextHead: ScopeHead = {
       seq: this.headState.seq + 1,
       hash: cellVersion([this.headState.hash, this.headState.seq + 1, marker])
     };
     for (const key of deletedKeys) this.store.delete(key);
     this.headState = nextHead;
-    const tailEntry = { seq: nextHead.seq, transcript_hash: marker, touched: deletedKeys };
+    const tailEntry: TailEntry = {
+      seq: nextHead.seq,
+      transcript_hash: marker,
+      touched: deletedKeys,
+      base_hash: priorHead.hash,
+      head_hash: nextHead.hash
+    };
     this.tail.push(tailEntry);
     if (this.tail.length > this.options.tailLimit) this.tail.splice(0, this.tail.length - this.options.tailLimit);
 
@@ -796,12 +821,19 @@ export class ScopeSequencer {
     // adopt(), keeping the recovery tail legible (relates have no
     // transcript of their own).
     const marker = `relate:${from?.from_scope ?? this.scope}:${from?.seq ?? 0}`;
+    const priorHead = this.headState;
     const nextHead: ScopeHead = {
       seq: this.headState.seq + 1,
       hash: cellVersion([this.headState.hash, this.headState.seq + 1, marker])
     };
     this.headState = nextHead;
-    const tailEntry = { seq: nextHead.seq, transcript_hash: marker, touched: [...changed].sort() };
+    const tailEntry: TailEntry = {
+      seq: nextHead.seq,
+      transcript_hash: marker,
+      touched: [...changed].sort(),
+      base_hash: priorHead.hash,
+      head_hash: nextHead.hash
+    };
     this.tail.push(tailEntry);
     if (this.tail.length > this.options.tailLimit) this.tail.splice(0, this.tail.length - this.options.tailLimit);
     const durable = this.options.durable;
@@ -853,7 +885,7 @@ export class ScopeSequencer {
   }
 
   /** The scope's bounded recovery log (CO5: read by the scope alone). */
-  recoveryTail(): ReadonlyArray<{ seq: number; transcript_hash: string; touched: string[] }> {
+  recoveryTail(): ReadonlyArray<TailEntry> {
     return this.tail;
   }
 
@@ -976,6 +1008,23 @@ export class ScopeSequencer {
       pruned.push(entry.key);
     }
     return pruned;
+  }
+
+  /** Whether `base` is the current head or an exact ancestor proven by
+   * the retained authority tail. Each new entry proves both sides of its
+   * edge, which includes the pre-upgrade/current head on the first commit
+   * after rollout. Missing optional fields on aged rows are intentionally
+   * not inferred: unverifiable history takes the stale-head repair path. */
+  private baseIsCurrentOrRetained(base: ScopeHead): boolean {
+    if (base.seq === this.headState.seq) return base.hash === this.headState.hash;
+    if (base.seq < 0 || base.seq > this.headState.seq) return false;
+    for (let i = this.tail.length - 1; i >= 0; i -= 1) {
+      const entry = this.tail[i];
+      if (entry.seq === base.seq && entry.head_hash === base.hash) return true;
+      if (entry.seq === base.seq + 1 && entry.base_hash === base.hash) return true;
+      if (entry.seq < base.seq) break;
+    }
+    return false;
   }
 
   private reject(submit: CommitSubmit, reason: RejectReason, detail: Record<string, unknown>, mismatched?: TranscriptCell[]): CommitReply {

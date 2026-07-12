@@ -133,6 +133,17 @@ explicitly permits a stale projection read. Until such a rule is installed
 for a scope epoch, projection reads validate under the same exact-version
 rule as semantic reads.
 
+The implemented net profile installs one such rule for CA4 `contents` reads:
+they are reads of the owner-maintained relation projection, not authority
+cells, and therefore do not participate in commit validation. This exception
+does not extend to the authoritative `object_live` reads that constrain a
+move, take, drop, or other semantic mutation; those versions must still match
+at the commit scope (or through an owner attestation) under CO2.3/CO4. A
+catalog that makes correctness depend only on a `contents` snapshot is
+non-conforming: it must also read the authority cells on which the decision
+depends. The projection may consequently make a read-only listing briefly
+stale, but cannot authorize a stale mutation.
+
 ### CO2.5 Idempotency
 
 A replayed idempotency key returns the recorded reply. A redelivered fanout
@@ -249,6 +260,20 @@ buried in VTN):
   (`stale_head`, `scope_mismatch`, `permission_denied`, and
   convergence-safe `read_version_mismatch`) may skip the apply.
   `incomplete_transcript` and `nondeterministic` are never short-circuited.
+- **A current head is not required when the retained recovery tail proves a
+  rebase.** Exact `(seq, hash)` match accepts as before. A behind base may
+  continue to steps 7–10 only when the scope's bounded recovery tail proves
+  that exact head as an ancestor of the current head. Every tail entry records
+  both its prior and resulting head hashes, so this is an authority-local
+  proof rather than a caller assertion. Current read-version validation,
+  write authorization, create-collision validation, and post-state
+  re-derivation then determine whether the transcript applies cleanly to the
+  current state. A future base, a same-sequence hash mismatch, an unproved
+  base, or a base older than the retained proof window rejects `stale_head`.
+  This bounded rebase is what permits independent turns planned concurrently
+  at one hot scope to serialize without an unconditional re-execution loop.
+  It does not weaken a true read/write conflict, which still rejects
+  `read_version_mismatch`.
 
 If validation fails, no write from the transcript commits; the gateway
 repairs its planning state (per the reply's taxonomy code) and retries the
@@ -280,7 +305,7 @@ divergence. Tail metrics count by code.
 
 | Code | Meaning | Recovery |
 |---|---|---|
-| `E_STALE_HEAD` | submitted `base` behind scope head (incl. cold/evicted-scope reseed) | refetch head/closure, retry |
+| `E_STALE_HEAD` | submitted `base` is future, hash-mismatched, or too old/unproved for retained-tail rebase (incl. cold/evicted-scope reseed) | refetch head/closure, retry |
 | `E_STALE_EPOCH` | consumer copy stamped with an old `(scope_head, catalog_epoch)` | reseed that copy, retry |
 | `E_MISSING_STATE` | materialization miss under sparse execution (CO2.6) | acquire read-closure transfer, retry |
 | `E_READ_VERSION` | read set conflicts with current authority | re-plan against refreshed cells |

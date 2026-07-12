@@ -648,6 +648,7 @@ export class NetScopeDO {
           ? this.ensureSequencer(undefined, submit.stamp.catalog_epoch)
           : this.ensureSequencer(submit.scope, submit.stamp.catalog_epoch);
         const headBefore = seq.head().seq;
+        const baseLag = Math.max(0, headBefore - submit.base.seq);
         // NC8a authority-side evidence: per-submit wall time + fanout rows
         // enqueued (the hot-scope serialization series — a popular room is
         // one serialized write queue, and this is its cost meter).
@@ -697,6 +698,10 @@ export class NetScopeDO {
           scope: seq.scope,
           status: reply.status,
           ...(reply.status === "accepted" ? { seq: reply.head.seq, touched: reply.touched.length } : { reason: reply.reason }),
+          base_lag: baseLag,
+          // A cached idempotent reply can also carry an old base; only a
+          // fresh acceptance represents authority-side rebasing.
+          rebased: reply.status === "accepted" && reply.replayed !== true && baseLag > 0,
           outbox_enqueued: this.outboxEnqueuedTotal - enqueuedBefore,
           ms: Date.now() - submitStarted
         });

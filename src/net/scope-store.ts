@@ -30,6 +30,11 @@ export type TailEntry = {
   seq: number;
   transcript_hash: string;
   touched: string[];
+  /** Head-chain proof for bounded stale-base rebasing (CO4). Optional so
+   * rows written before this field existed remain readable; an old row
+   * simply cannot prove a rebase. */
+  base_hash?: string;
+  head_hash?: string;
 };
 
 /**
