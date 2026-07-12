@@ -13,6 +13,7 @@
 type AeRow = Record<string, unknown>;
 
 export type NetAeReport = {
+  summary: AeRow[];
   turns: AeRow[];
   authorities: AeRow[];
   incidents: AeRow[];
@@ -71,6 +72,25 @@ export function buildTurnSql(dataset: string, from: number, to: number): string 
   ].join("\n");
 }
 
+/** One global distribution for acceptance. Per-shard p99s are useful
+ * diagnostics but are not composable and become unstable when AE assigns a
+ * large adaptive-sampling weight to one row on a lightly used shard. */
+export function buildTurnSummarySql(dataset: string, from: number, to: number): string {
+  return [
+    "SELECT",
+    `  SUM(${WEIGHT}) AS samples,`,
+    `  SUMIf(${WEIGHT}, blob8 != 'accepted') AS errors,`,
+    `  SUMIf(${WEIGHT}, blob9 = 'E_RPC_TIMEOUT') AS rpc_timeouts,`,
+    `  quantileWeighted(0.5)(double5, toUInt32(${WEIGHT})) AS wall_p50,`,
+    `  quantileWeighted(0.95)(double5, toUInt32(${WEIGHT})) AS wall_p95,`,
+    `  quantileWeighted(0.99)(double5, toUInt32(${WEIGHT})) AS wall_p99,`,
+    `  quantileWeighted(0.99)(double4, toUInt32(${WEIGHT})) AS queue_p99,`,
+    `  max(double5) AS wall_max`,
+    `FROM ${assertDataset(dataset)}`,
+    `WHERE ${timeWhere(from, to)} AND blob1 = 'net_turn_structure'`
+  ].join("\n");
+}
+
 export function buildAuthoritySql(dataset: string, from: number, to: number): string {
   return [
     "SELECT",
@@ -126,11 +146,12 @@ function number(row: AeRow, field: string): number {
 
 export function evaluateNetAeReport(report: NetAeReport, limits: Partial<NetAeLimits> = {}): string[] {
   const wanted = { ...DEFAULT_LIMITS, ...limits };
-  const total = report.turns.reduce((sum, row) => sum + number(row, "samples"), 0);
-  const errors = report.turns.reduce((sum, row) => sum + number(row, "errors"), 0);
-  const timeouts = report.turns.reduce((sum, row) => sum + number(row, "rpc_timeouts"), 0);
-  const wallP99 = Math.max(0, ...report.turns.map((row) => number(row, "wall_p99")));
-  const queueP99 = Math.max(0, ...report.turns.map((row) => number(row, "queue_p99")));
+  const global = report.summary[0] ?? {};
+  const total = number(global, "samples");
+  const errors = number(global, "errors");
+  const timeouts = number(global, "rpc_timeouts");
+  const wallP99 = number(global, "wall_p99");
+  const queueP99 = number(global, "queue_p99");
   const gatewayShards = new Set(report.turns.filter((row) => number(row, "samples") > 0).map((row) => String(row.host_key ?? ""))).size;
   const incident = (kind: string) => report.incidents
     .filter((row) => row.kind === kind)
@@ -143,8 +164,8 @@ export function evaluateNetAeReport(report: NetAeReport, limits: Partial<NetAeLi
     failures.push(`turn error rate ${((errors / total) * 100).toFixed(2)}% exceeds ${(wanted.maxErrorRate * 100).toFixed(2)}%`);
   }
   if (timeouts > 0 || incident("net_rpc") > 0) failures.push(`${Math.max(timeouts, incident("net_rpc"))} RPC timeout(s)`);
-  if (wallP99 > wanted.maxWallP99Ms) failures.push(`worst-shard wall p99 ${wallP99}ms exceeds ${wanted.maxWallP99Ms}ms`);
-  if (queueP99 > wanted.maxQueueP99Ms) failures.push(`worst-shard queue p99 ${queueP99}ms exceeds ${wanted.maxQueueP99Ms}ms`);
+  if (wallP99 > wanted.maxWallP99Ms) failures.push(`global wall p99 ${wallP99}ms exceeds ${wanted.maxWallP99Ms}ms`);
+  if (queueP99 > wanted.maxQueueP99Ms) failures.push(`global queue p99 ${queueP99}ms exceeds ${wanted.maxQueueP99Ms}ms`);
   if (gatewayShards < wanted.minGatewayShards) failures.push(`only ${gatewayShards} gateway shard(s) carried turns; need ${wanted.minGatewayShards}`);
   if (incident("net_guest_provisioned") < wanted.minElasticGuests) {
     failures.push(`only ${incident("net_guest_provisioned")} elastic guest(s) observed; need ${wanted.minElasticGuests}`);
@@ -194,11 +215,13 @@ async function main(): Promise<void> {
   };
   const from = parseTime(value("--from"), now - 15 * 60);
   const to = parseTime(value("--to"), now);
-  const report: NetAeReport = {
-    turns: await query(account, token, buildTurnSql(dataset, from, to)),
-    authorities: await query(account, token, buildAuthoritySql(dataset, from, to)),
-    incidents: await query(account, token, buildIncidentSql(dataset, from, to))
-  };
+  const [summary, turns, authorities, incidents] = await Promise.all([
+    query(account, token, buildTurnSummarySql(dataset, from, to)),
+    query(account, token, buildTurnSql(dataset, from, to)),
+    query(account, token, buildAuthoritySql(dataset, from, to)),
+    query(account, token, buildIncidentSql(dataset, from, to))
+  ]);
+  const report: NetAeReport = { summary, turns, authorities, incidents };
   const limits: Partial<NetAeLimits> = {
     ...(value("--min-turns") ? { minTurns: Number(value("--min-turns")) } : {}),
     ...(value("--max-error-rate") ? { maxErrorRate: Number(value("--max-error-rate")) } : {}),
