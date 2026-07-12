@@ -416,9 +416,22 @@ returns a per-shard partial roster (a Big-World violation the workerd-local
 lanes structurally cannot catch — they share one world image). The load
 report includes a `who_partial_view` block (`distinct_shards`, `max_missing`,
 `unreachable`, `partial`); it is reported by default and made a non-zero
-exit with `--enforce-who`. Leave it un-enforced until `connected_players`
-is scoped or served by a cross-shard presence aggregation, then flip it on
-to assert every guest sees the full connected set.
+exit with `--enforce-who`; enforcement also fails an inconclusive one-shard
+sample. Leave it un-enforced only while diagnosing the known violation.
+Public selection requires `connected_players` to be scoped or served by a
+cross-shard presence aggregation and an enforced, conclusive pass.
+
+For a production bake, use the dataset-backed watcher rather than tail:
+
+```sh
+CF_ACCOUNT_ID=... CF_ANALYTICS_TOKEN=... npm run metrics:net-ae -- \
+  --dataset woo_v1_prod --from <ISO_START> --watch \
+  --min-seconds 120 --max-seconds 600 --min-turns 500
+```
+
+It fails immediately on integrity incidents and fails closed at the maximum
+duration if healthy evidence is insufficient. `wrangler tail` is diagnostic
+only under load.
 
 ### Onboarding smoke
 

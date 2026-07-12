@@ -1,5 +1,5 @@
 /**
- * Query the nonsampled net canary envelope from Workers Analytics Engine.
+ * Query the dataset-backed net canary envelope from Workers Analytics Engine.
  *
  * Tail is diagnostic-only under load: Cloudflare samples it before the
  * consumer sees the records. This tool reads the METRICS dataset directly,
@@ -8,6 +8,10 @@
  *
  *   CF_ACCOUNT_ID=... CF_ANALYTICS_TOKEN=... npm run metrics:net-ae -- \
  *     --dataset woo_v1_net_canary --from 2026-07-11T18:00:00Z --min-turns 500
+ *
+ * Add `--watch --min-seconds 120 --max-seconds 600` during a cutover bake.
+ * Watch mode polls a growing window, aborts immediately on integrity
+ * incidents, and fails closed if sufficient healthy evidence never arrives.
  */
 
 type AeRow = Record<string, unknown>;
@@ -38,6 +42,11 @@ const DEFAULT_LIMITS: NetAeLimits = {
 };
 
 const WEIGHT = "_sample_interval * double2";
+
+export type NetAeWatchDecision = {
+  state: "wait" | "pass" | "abort";
+  failures: string[];
+};
 
 function assertDataset(dataset: string): string {
   if (!/^[A-Za-z0-9_]+$/.test(dataset)) throw new Error(`invalid Analytics Engine dataset: ${JSON.stringify(dataset)}`);
@@ -182,6 +191,45 @@ export function evaluateNetAeReport(report: NetAeReport, limits: Partial<NetAeLi
   return failures;
 }
 
+/** Incidents that are never made acceptable by collecting more samples. */
+export function immediateNetAeFailures(report: NetAeReport): string[] {
+  const global = report.summary[0] ?? {};
+  const incident = (kind: string) => report.incidents
+    .filter((row) => row.kind === kind)
+    .reduce((sum, row) => sum + number(row, "samples"), 0);
+  const failures: string[] = [];
+  const timeouts = Math.max(number(global, "rpc_timeouts"), incident("net_rpc"));
+  if (timeouts > 0) failures.push(`${timeouts} RPC timeout(s)`);
+  if (incident("net_turn_queue_refused") > 0) failures.push(`${incident("net_turn_queue_refused")} queue refusal(s)`);
+  if (incident("net_scope_outbox_delivery_failed") > 0) failures.push(`${incident("net_scope_outbox_delivery_failed")} outbox delivery failure(s)`);
+  const abandoned = incident("net_scope_outbox_abandoned") + report.incidents.reduce((sum, row) => sum + number(row, "abandoned"), 0);
+  if (abandoned > 0) failures.push("outbox abandonment observed");
+  if (incident("net_fanout_gap") > 0) failures.push(`${incident("net_fanout_gap")} fanout gap(s)`);
+  for (const kind of ["net_turn_install_degraded", "net_session_open_install_degraded", "net_guest_provision_install_degraded", "net_self_subscribe_failed", "net_adopt_conflict"]) {
+    if (incident(kind) > 0) failures.push(`${incident(kind)} ${kind} incident(s)`);
+  }
+  return failures;
+}
+
+/** Pure watch-state evaluator, separated from polling so its fail-closed
+ * timing and incident behavior are unit-testable. */
+export function evaluateNetAeWatch(
+  report: NetAeReport,
+  limits: Partial<NetAeLimits>,
+  elapsedSeconds: number,
+  minSeconds: number,
+  maxSeconds: number
+): NetAeWatchDecision {
+  const immediate = immediateNetAeFailures(report);
+  if (immediate.length > 0) return { state: "abort", failures: immediate };
+  const failures = evaluateNetAeReport(report, limits);
+  if (elapsedSeconds >= minSeconds && failures.length === 0) return { state: "pass", failures: [] };
+  if (elapsedSeconds >= maxSeconds) {
+    return { state: "abort", failures: failures.length > 0 ? failures : [`healthy evidence did not satisfy minimum bake duration ${minSeconds}s`] };
+  }
+  return { state: "wait", failures };
+}
+
 async function query(account: string, token: string, sql: string): Promise<AeRow[]> {
   const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${account}/analytics_engine/sql`, {
     method: "POST",
@@ -194,6 +242,47 @@ async function query(account: string, token: string, sql: string): Promise<AeRow
   return body.data as AeRow[];
 }
 
+async function queryReport(account: string, token: string, dataset: string, from: number, to: number): Promise<NetAeReport> {
+  const [summary, turns, authorities, incidents] = await Promise.all([
+    query(account, token, buildTurnSummarySql(dataset, from, to)),
+    query(account, token, buildTurnSql(dataset, from, to)),
+    query(account, token, buildAuthoritySql(dataset, from, to)),
+    query(account, token, buildIncidentSql(dataset, from, to))
+  ]);
+  return { summary, turns, authorities, incidents };
+}
+
+function positiveNumber(raw: string | undefined, fallback: number, label: string): number {
+  if (raw === undefined) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) throw new Error(`${label} must be a positive number`);
+  return parsed;
+}
+
+function numericOption(raw: string | undefined, label: string, minimum: number): number | undefined {
+  if (raw === undefined) return undefined;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < minimum) throw new Error(`${label} must be a finite number >= ${minimum}`);
+  return parsed;
+}
+
+export function parseNetAeLimits(value: (name: string) => string | undefined): Partial<NetAeLimits> {
+  const minTurns = numericOption(value("--min-turns"), "--min-turns", 1);
+  const maxErrorRate = numericOption(value("--max-error-rate"), "--max-error-rate", 0);
+  const maxWallP99Ms = numericOption(value("--max-wall-p99-ms"), "--max-wall-p99-ms", 1);
+  const maxQueueP99Ms = numericOption(value("--max-queue-p99-ms"), "--max-queue-p99-ms", 0);
+  const minGatewayShards = numericOption(value("--min-gateway-shards"), "--min-gateway-shards", 1);
+  const minElasticGuests = numericOption(value("--min-elastic-guests"), "--min-elastic-guests", 0);
+  return {
+    ...(minTurns !== undefined ? { minTurns } : {}),
+    ...(maxErrorRate !== undefined ? { maxErrorRate } : {}),
+    ...(maxWallP99Ms !== undefined ? { maxWallP99Ms } : {}),
+    ...(maxQueueP99Ms !== undefined ? { maxQueueP99Ms } : {}),
+    ...(minGatewayShards !== undefined ? { minGatewayShards } : {}),
+    ...(minElasticGuests !== undefined ? { minElasticGuests } : {})
+  };
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const value = (name: string): string | undefined => {
@@ -204,6 +293,7 @@ async function main(): Promise<void> {
   const token = process.env.CF_ANALYTICS_TOKEN;
   if (!account || !token) throw new Error("CF_ACCOUNT_ID and CF_ANALYTICS_TOKEN are required");
   const dataset = value("--dataset") ?? "woo_v1_net_canary";
+  const watch = args.includes("--watch");
   const now = Date.now() / 1000;
   const parseTime = (raw: string | undefined, fallback: number): number => {
     if (!raw) return fallback;
@@ -213,27 +303,41 @@ async function main(): Promise<void> {
     if (!Number.isFinite(parsed)) throw new Error(`invalid time: ${raw}`);
     return parsed;
   };
-  const from = parseTime(value("--from"), now - 15 * 60);
+  const fromRaw = value("--from");
+  if (watch && fromRaw === undefined) throw new Error("--from is required with --watch so the bake cannot include stale evidence implicitly");
+  const from = parseTime(fromRaw, now - 15 * 60);
+  if (watch && value("--to") !== undefined) throw new Error("--to cannot be combined with --watch; the watch window grows to the current time");
   const to = parseTime(value("--to"), now);
-  const [summary, turns, authorities, incidents] = await Promise.all([
-    query(account, token, buildTurnSummarySql(dataset, from, to)),
-    query(account, token, buildTurnSql(dataset, from, to)),
-    query(account, token, buildAuthoritySql(dataset, from, to)),
-    query(account, token, buildIncidentSql(dataset, from, to))
-  ]);
-  const report: NetAeReport = { summary, turns, authorities, incidents };
-  const limits: Partial<NetAeLimits> = {
-    ...(value("--min-turns") ? { minTurns: Number(value("--min-turns")) } : {}),
-    ...(value("--max-error-rate") ? { maxErrorRate: Number(value("--max-error-rate")) } : {}),
-    ...(value("--max-wall-p99-ms") ? { maxWallP99Ms: Number(value("--max-wall-p99-ms")) } : {}),
-    ...(value("--max-queue-p99-ms") ? { maxQueueP99Ms: Number(value("--max-queue-p99-ms")) } : {}),
-    ...(value("--min-gateway-shards") ? { minGatewayShards: Number(value("--min-gateway-shards")) } : {}),
-    ...(value("--min-elastic-guests") ? { minElasticGuests: Number(value("--min-elastic-guests")) } : {})
-  };
-  console.log(JSON.stringify({ dataset, from, to, ...report }, null, 2));
-  const failures = evaluateNetAeReport(report, limits);
-  for (const failure of failures) console.error(`ABORT-SIGNAL: ${failure}`);
-  if (failures.length > 0) process.exitCode = 2;
+  const limits = parseNetAeLimits(value);
+  if (!watch) {
+    const report = await queryReport(account, token, dataset, from, to);
+    console.log(JSON.stringify({ dataset, from, to, ...report }, null, 2));
+    const failures = evaluateNetAeReport(report, limits);
+    for (const failure of failures) console.error(`ABORT-SIGNAL: ${failure}`);
+    if (failures.length > 0) process.exitCode = 2;
+    return;
+  }
+
+  const minSeconds = positiveNumber(value("--min-seconds"), 120, "--min-seconds");
+  const maxSeconds = positiveNumber(value("--max-seconds"), 600, "--max-seconds");
+  const intervalMs = positiveNumber(value("--interval-ms"), 10_000, "--interval-ms");
+  if (maxSeconds < minSeconds) throw new Error("--max-seconds must be >= --min-seconds");
+  const started = Date.now();
+  for (;;) {
+    const pollTo = Date.now() / 1000;
+    const report = await queryReport(account, token, dataset, from, pollTo);
+    const elapsed = (Date.now() - started) / 1000;
+    const decision = evaluateNetAeWatch(report, limits, elapsed, minSeconds, maxSeconds);
+    const samples = number(report.summary[0] ?? {}, "samples");
+    console.error(`AE-WATCH: state=${decision.state} elapsed=${Math.floor(elapsed)}s samples=${samples} pending=${decision.failures.join("; ") || "none"}`);
+    if (decision.state !== "wait") {
+      console.log(JSON.stringify({ dataset, from, to: pollTo, elapsed_seconds: elapsed, ...report }, null, 2));
+      for (const failure of decision.failures) console.error(`ABORT-SIGNAL: ${failure}`);
+      if (decision.state === "abort") process.exitCode = 2;
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
 }
 
 if (process.argv[1]?.endsWith("net-metrics-ae.ts")) {

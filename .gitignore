@@ -14,4 +14,8 @@ coverage/
 test-results/
 playwright-report/
 playwright/.cache/
+# Cutover exports contain password hashes, API-key verifiers, and account
+# identifiers. Keep the default and recommended artifact locations untracked.
+identity-export*.json
+cutover-artifacts/
 node_modules

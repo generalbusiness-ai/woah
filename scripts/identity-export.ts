@@ -13,7 +13,7 @@
 // mismatch means writes were still draining when the export ran: wait
 // and re-run; never feed a moving export into the cutover. The output
 // feeds scripts/net-install.ts --identity.
-import { writeFileSync } from "node:fs";
+import { closeSync, fchmodSync, fsyncSync, openSync, writeFileSync } from "node:fs";
 import { parseIdentityExport } from "../src/net/identity";
 import { signInternalRequest } from "../src/worker/internal-auth";
 
@@ -38,6 +38,19 @@ type ExportEnvelope = {
   exported_at: number;
   identity: unknown;
 };
+
+/** Write carried credential material with owner-only permissions before any
+ * bytes reach disk. fchmod also repairs a permissive pre-existing target. */
+export function writeIdentityExportFile(path: string, identity: unknown): void {
+  const fd = openSync(path, "w", 0o600);
+  try {
+    fchmodSync(fd, 0o600);
+    writeFileSync(fd, JSON.stringify(identity, null, 2));
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
 
 async function fetchExport(baseUrl: string, allowUnfrozen: boolean, env: { WOO_INTERNAL_SECRET?: string }): Promise<ExportEnvelope> {
   const suffix = allowUnfrozen ? "?allow-unfrozen=1" : "";
@@ -102,7 +115,7 @@ async function main(): Promise<void> {
   // Shape-check BEFORE writing: a malformed export must never become the
   // cutover's input file.
   const identity = parseIdentityExport(second.identity);
-  writeFileSync(args.out, JSON.stringify(identity, null, 2));
+  writeIdentityExportFile(args.out, identity);
   console.log(
     `identity-export ok: ${Object.keys(identity.api_keys).length} api keys, ${identity.actors.length} actors → ${args.out}`
   );
@@ -111,7 +124,9 @@ async function main(): Promise<void> {
   );
 }
 
-main().catch((err) => {
-  console.error(String(err));
-  process.exit(1);
-});
+if (process.argv[1]?.endsWith("identity-export.ts")) {
+  void main().catch((err) => {
+    console.error(String(err));
+    process.exitCode = 1;
+  });
+}

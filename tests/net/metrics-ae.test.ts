@@ -5,6 +5,9 @@ import {
   buildTurnSql,
   buildTurnSummarySql,
   evaluateNetAeReport,
+  evaluateNetAeWatch,
+  immediateNetAeFailures,
+  parseNetAeLimits,
   type NetAeReport
 } from "../../scripts/net-metrics-ae";
 
@@ -26,6 +29,12 @@ describe("net Analytics Engine canary report", () => {
   it("rejects dataset injection and invalid windows", () => {
     expect(() => buildTurnSql("x; DROP TABLE y", 100, 200)).toThrow("invalid Analytics Engine dataset");
     expect(() => buildTurnSql("woo_v1_canary", 200, 100)).toThrow("from < to");
+  });
+
+  it("rejects malformed or out-of-range acceptance thresholds", () => {
+    expect(() => parseNetAeLimits((name) => name === "--min-turns" ? "NaN" : undefined)).toThrow("--min-turns");
+    expect(() => parseNetAeLimits((name) => name === "--min-gateway-shards" ? "0" : undefined)).toThrow("--min-gateway-shards");
+    expect(parseNetAeLimits((name) => name === "--max-error-rate" ? "0" : undefined)).toEqual({ maxErrorRate: 0 });
   });
 
   it("accepts a distributed, error-free envelope with elastic admission", () => {
@@ -63,5 +72,35 @@ describe("net Analytics Engine canary report", () => {
     expect(failures.join("\n")).toContain("outbox delivery failure");
     expect(failures.join("\n")).toContain("outbox abandonment");
     expect(failures.join("\n")).toContain("fanout gap");
+  });
+
+  it("watches until both duration and evidence are sufficient", () => {
+    const report: NetAeReport = {
+      summary: [{ samples: 600, errors: 0, rpc_timeouts: 0, wall_p99: 280, queue_p99: 160 }],
+      turns: [
+        { host_key: "net-gateway:net-api-0", samples: 300 },
+        { host_key: "net-gateway:net-api-1", samples: 300 }
+      ],
+      authorities: [],
+      incidents: [{ kind: "net_guest_provisioned", samples: 4 }]
+    };
+    expect(evaluateNetAeWatch(report, {}, 60, 120, 600).state).toBe("wait");
+    expect(evaluateNetAeWatch(report, {}, 120, 120, 600)).toEqual({ state: "pass", failures: [] });
+  });
+
+  it("aborts integrity incidents immediately and insufficient evidence at the deadline", () => {
+    const incident: NetAeReport = {
+      summary: [{ samples: 10, rpc_timeouts: 1 }],
+      turns: [],
+      authorities: [],
+      incidents: []
+    };
+    expect(immediateNetAeFailures(incident)).toContain("1 RPC timeout(s)");
+    expect(evaluateNetAeWatch(incident, {}, 1, 120, 600).state).toBe("abort");
+
+    const insufficient: NetAeReport = { summary: [{ samples: 20 }], turns: [], authorities: [], incidents: [] };
+    const deadline = evaluateNetAeWatch(insufficient, {}, 600, 120, 600);
+    expect(deadline.state).toBe("abort");
+    expect(deadline.failures.join("\n")).toContain("only 20 turns");
   });
 });

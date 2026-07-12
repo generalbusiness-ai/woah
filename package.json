@@ -44,6 +44,7 @@
     "load:net-dev": "vitest run --reporter=dot tests/worker/net-load-asymptote.test.ts",
     "load:net-skew": "vitest run --reporter=dot tests/worker/net-load-skew.test.ts",
     "metrics:net-ae": "tsx scripts/net-metrics-ae.ts",
+    "cutover:freeze": "tsx scripts/net-freeze.ts",
     "load:net-canary": "tsx scripts/net-canary-load.ts",
     "smoke:cf-local:structural": "vitest run --reporter=dot tests/worker/cf-local-structural.test.ts",
     "gate:authority": "vitest run --reporter=dot tests/worker/cf-local-walkthrough.test.ts",

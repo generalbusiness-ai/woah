@@ -4,8 +4,10 @@
 //
 //   WOO_INTERNAL_SECRET=... npx tsx scripts/net-install.ts \
 //     --base-url https://<worker-host> [--catalogs a,b,c] \
-//     [--identity identity-export.json --verify-apikey apikey:<id>:<secret>] \
+//     [--identity identity-export.json] \
 //     [--skip-identity-verify] [--dry-run]
+// Real credential probes should be supplied as WOO_VERIFY_APIKEY and
+// WOO_VERIFY_PASSWORD so secrets do not appear in argv/process listings.
 //
 // Builds the SAME world any environment boots (bootstrap + local
 // catalogs), grafts the carried identity when given (item B — applied
@@ -46,8 +48,18 @@ type Args = {
   dryRun: boolean;
 };
 
-function parseArgs(argv: string[]): Args {
-  const args: Args = { baseUrl: "", dryRun: false };
+export function parseArgs(
+  argv: string[],
+  credentialEnv: { WOO_VERIFY_APIKEY?: string; WOO_VERIFY_PASSWORD?: string } = {}
+): Args {
+  // Real cutover secrets come from the environment so they need not appear
+  // in argv/process listings. Explicit flags remain useful for synthetic lanes.
+  const args: Args = {
+    baseUrl: "",
+    dryRun: false,
+    verifyApikey: credentialEnv.WOO_VERIFY_APIKEY,
+    verifyPassword: credentialEnv.WOO_VERIFY_PASSWORD
+  };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--base-url") args.baseUrl = argv[++i] ?? "";
@@ -75,7 +87,7 @@ export async function runNetInstall(args: Args, env: { WOO_INTERNAL_SECRET?: str
   // identity-less rehearsals of the carry machinery, and it is loud.
   if (args.identity && !args.verifyApikey && !args.skipIdentityVerify && !args.dryRun) {
     throw new Error(
-      "--identity requires --verify-apikey apikey:<id>:<secret> (the carried-credential proof); " +
+      "--identity requires WOO_VERIFY_APIKEY=apikey:<id>:<secret> or --verify-apikey (the carried-credential proof); " +
         "pass --skip-identity-verify ONLY for a rehearsal where no credential can be probed"
     );
   }
@@ -185,7 +197,7 @@ export async function runNetInstall(args: Args, env: { WOO_INTERNAL_SECRET?: str
     const colon = args.verifyPassword.indexOf(":");
     const email = colon >= 0 ? args.verifyPassword.slice(0, colon) : "";
     const password = colon >= 0 ? args.verifyPassword.slice(colon + 1) : "";
-    if (!email || !password) throw new Error("--verify-password must be email:password");
+    if (!email || !password) throw new Error("WOO_VERIFY_PASSWORD/--verify-password must be email:password");
     const response = await fetch(`${args.baseUrl}/net-api/login`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -207,7 +219,7 @@ export async function runNetInstall(args: Args, env: { WOO_INTERNAL_SECRET?: str
 // proof imports runNetInstall directly.
 const invokedDirectly = process.argv[1]?.endsWith("net-install.ts") === true;
 if (invokedDirectly) {
-  runNetInstall(parseArgs(process.argv.slice(2)), { WOO_INTERNAL_SECRET: process.env.WOO_INTERNAL_SECRET }).catch((err) => {
+  runNetInstall(parseArgs(process.argv.slice(2), process.env), { WOO_INTERNAL_SECRET: process.env.WOO_INTERNAL_SECRET }).catch((err) => {
     console.error(String(err));
     process.exit(1);
   });

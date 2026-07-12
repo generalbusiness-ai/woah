@@ -1549,7 +1549,8 @@ export class NetGatewayDO {
         return await this.clientWebSocketByTicket(request, url);
       }
 
-      // Client-shell phase i: the MCP surface (JSON-RPC over POST). Its
+      // Client-shell phase i: the MCP surface (JSON-RPC over POST plus the
+      // Streamable HTTP DELETE session close). Its
       // auth model differs per method — `initialize` authenticates the
       // mcp-token (an apikey) and mints the net session that then acts
       // as the MCP bearer (mcp-session-id = the net session id, the same
@@ -1557,6 +1558,9 @@ export class NetGatewayDO {
       // branches before the header-credential path below.
       if (request.method === "POST" && url.pathname === "/net-api/mcp") {
         return await this.clientMcp(request);
+      }
+      if (request.method === "DELETE" && url.pathname === "/net-api/mcp") {
+        return await this.clientMcpClose(request);
       }
 
       // The identity door: these two routes authenticate by their OWN
@@ -2451,6 +2455,31 @@ export class NetGatewayDO {
       return await this.mcpToolsCall(request, rpc.id, rpc.params ?? {});
     }
     return json({ jsonrpc: "2.0", id: rpc.id, error: { code: -32601, message: `method not found: ${rpc.method}` } }, 200);
+  }
+
+  /** Streamable HTTP session close. The MCP session id is the net session
+   * bearer, so DELETE must commit the same owner-sequenced close as logout. */
+  private async clientMcpClose(request: Request): Promise<Response> {
+    const session = request.headers.get("mcp-session-id") ?? "";
+    if (!session) return new Response(null, { status: 204 });
+    const cell = this.ensureView().get(sessionCellKey(session));
+    const verdict = validateSessionCell(cell, this.host.now());
+    if (verdict === "missing" || verdict === "expired") {
+      this.mcpQueues.delete(session);
+      return new Response(null, { status: 204 });
+    }
+    if (verdict !== "ok") {
+      return json({ error: { code: "E_PERM", message: `session ${verdict}` } }, 403);
+    }
+    const actor = (cell?.value as { actor?: string }).actor;
+    if (typeof actor !== "string" || !actor) {
+      return json({ error: { code: "E_NOSESSION", message: "session actor is missing" } }, 401);
+    }
+    const identity = await this.catalogIdentity();
+    const closed = await this.clientSessionClose(actor, session, identity.epoch);
+    if (!closed.ok) return closed;
+    this.mcpQueues.delete(session);
+    return new Response(null, { status: 204 });
   }
 
   private async mcpInitialize(request: Request, id: number | string, _params: Record<string, unknown>): Promise<Response> {

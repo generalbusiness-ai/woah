@@ -237,12 +237,9 @@ export interface Env {
   // continue. Set/cleared via `wrangler secret`/vars; no code deploy per
   // freeze flip.
   WOO_WRITE_FREEZE?: string;
-  /** Reviewer finding 4 (the route switch must SELECT the net client):
-   * when set, GET /client-config answers {net:true} and an unsignaled
-   * SPA boot (bare `/`, empty storage) enters net mode. Deliberately
-   * resolved per boot and never persisted client-side: the runbook's
-   * rollback (route back to the old worker, which 404s /client-config)
-   * then restores v2 boots with no stranded client state. */
+  /** Public transport switch. Explicit `1`, `true`, or `on` makes
+   * /client-config select the net SPA and maps public /mcp to
+   * /net-api/mcp. Other values, including `0`, leave v2 selected. */
   WOO_NET_DEFAULT?: string;
   // KV-fronted host-seed cache. Populated by WORLD on every host-seed
   // build (via waitUntil so the build itself isn't blocked) and read by

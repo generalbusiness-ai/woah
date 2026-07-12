@@ -38,6 +38,12 @@ const DEFAULT_MCP_GATEWAY_SHARDS = 32;
 const LANDING_HOST = "woah.generalbusiness.ai";
 const WORLD_PUBLIC_HOST = "woah1.generalbusiness.ai";
 
+/** Deployment-controlled public transport switch. Wrangler vars are strings,
+ * so Boolean("0") is unsafe: only explicit affirmative values enable net. */
+export function netDefaultEnabled(value: string | undefined): boolean {
+  return value === "1" || value?.toLowerCase() === "true" || value?.toLowerCase() === "on";
+}
+
 function isApiPath(pathname: string): boolean {
   return (
     pathname === "/healthz" ||
@@ -52,6 +58,7 @@ function isApiPath(pathname: string): boolean {
 export default {
   async fetch(request: Request, env: Env, _ctx: unknown): Promise<Response> {
     const url = new URL(request.url);
+    const netDefault = netDefaultEnabled(env.WOO_NET_DEFAULT);
 
     // Capture the request BEFORE sanitization for the one caller that must
     // read the inbound internal signature: the /net-smoke doorway (H1b).
@@ -92,7 +99,7 @@ export default {
       // cached net:true. The SPA lets this OVERRIDE a stored woo:net flag
       // (a rollback un-pins net clients); only an explicit ?net=1
       // (development) still wins client-side.
-      return new Response(JSON.stringify({ net: Boolean(env.WOO_NET_DEFAULT) }), {
+      return new Response(JSON.stringify({ net: netDefault }), {
         status: 200,
         headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }
       });
@@ -106,8 +113,12 @@ export default {
     // are refused even as GETs (each opens a mutation channel). /admin
     // stays up (operator surface, own auth).
     {
+      // Once the deployment switch is on, public /mcp is a compatibility
+      // alias for /net-api/mcp below. It must not be caught by the old-world
+      // freeze; every other v2 endpoint remains fenced during the cutover.
+      const netMcpAlias = netDefault && url.pathname === "/mcp";
       const frozenSurface =
-        isApiPath(url.pathname) || url.pathname === "/mcp" || url.pathname === "/connect" || url.pathname.startsWith("/v2/");
+        (!netMcpAlias && isApiPath(url.pathname)) || url.pathname === "/connect" || url.pathname.startsWith("/v2/");
       const mutating = request.method !== "GET" || url.pathname === "/v2/turn-network/ws" || url.pathname === "/v2/session/mint";
       // V3 finding 1 (P0): satellite-host mutations arrive at their DOs
       // INTERNAL-SIGNED (edge-forwarded), so a DO-level persisted-fence
@@ -183,6 +194,11 @@ export default {
     }
 
     if (url.pathname === "/mcp") {
+      if (netDefault) {
+        const netUrl = new URL(url);
+        netUrl.pathname = "/net-api/mcp";
+        return handleNetApi(request, env, netUrl);
+      }
       return forwardToMcpGateway(env, request);
     }
 

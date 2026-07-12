@@ -120,6 +120,9 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
         { jsonrpc: "2.0", id: nextId++, method: "tools/call", params: { name, arguments: args } },
         { "mcp-session-id": session }
       )).body as Record<string, any>;
+    const close = async (session: string) => await gateway.fetch(
+      new Request("https://do/net-api/mcp", { method: "DELETE", headers: { "mcp-session-id": session } })
+    );
 
     const aliceSession = await open("apikey:mcp-key-a:mcp-secret-a");
     const bobSession = await open("apikey:mcp-key-b:mcp-secret-b");
@@ -179,6 +182,14 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
     const takeObs = waitedTake.result?.structuredContent?.result?.observations ?? [];
     const taken = takeObs.find((obs: any) => obs?.type === "taken" && obs.actor === alice);
     expect(taken, JSON.stringify(takeObs).slice(0, 400)).toBeTruthy();
+
+    // Streamable HTTP DELETE releases the underlying net session. The
+    // session id is the bearer, so it refuses after the close protocol's
+    // 250ms in-flight grace (the same contract as browser logout).
+    expect((await close(bobSession)).status).toBe(204);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const afterClose = await call(bobSession, "woo_wait", { timeout_ms: 0 });
+    expect(afterClose).toMatchObject({ error: { message: expect.stringMatching(/session (expired|missing)/) } });
 
     states.forEach((st) => st.close());
   });

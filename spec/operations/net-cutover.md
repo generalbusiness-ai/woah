@@ -169,6 +169,7 @@ Activation requires ALL of, in order:
 ## NC5. The installation doorway
 
 `POST /net-install/scope/<name>/seed`, `GET /net-install/scope/<name>/head`,
+`POST /net-install/scope/<name>/activate`, `POST /net-install/freeze`,
 and `GET /net-install/identity-export` are the entire surface. Trust
 model and enforced properties (pinned at the route level by
 `tests/worker/net-install-doorway.test.ts`):
@@ -192,19 +193,37 @@ model and enforced properties (pinned at the route level by
 - **Faithful**: scope verdicts (notably `E_EPOCH_MISMATCH` on a
   downgrade/mix attempt) surface through the doorway unwrapped.
 
-## NC6. The rollback contract
+## NC6. Public selection and rollback
 
-Rollback points, in cutover order. "Traffic" means the public route
-(DNS) targeting the namespace — the route switch is always the LAST step
-and is always DNS-based (never a 308: WS clients cannot follow it).
+The production topology is one dual-stack Worker with v2 and net Durable
+Object bindings. Public selection is the deployment variable
+`WOO_NET_DEFAULT`, parsed explicitly: only `1`, `true`, or `on` enables
+net; `0`, `false`, an empty value, and absence select v2. Enabling it:
+
+- makes `GET /client-config` answer `{net:true}` with `no-store`, so an
+  unsignaled browser boot chooses `/net-api` and `/net-api/ws`;
+- maps the compatibility endpoint `POST /mcp` to `/net-api/mcp`, preserving
+  the public MCP URL while changing its implementation;
+- leaves `/net-api/*` directly reachable for explicit probes.
+
+This is a Worker configuration/version switch, not DNS and never a 308.
+The public hostname already targets the dual-stack Worker. The v2 REST,
+`/connect`, and `/v2/*` contracts are **not** compatibility-mapped; they
+remain old-world endpoints and stay frozen. Every production consumer of
+those surfaces must migrate to browser net, public MCP, or an explicit
+`/net-api` client before selection. A successful browser or MCP session
+mint is already a net write, so the practical rollback-only interval after
+selection is intentionally very small.
+
+Rollback points, in cutover order:
 
 | Phase | State | Rollback |
 |---|---|---|
 | Before freeze | v2 serving | Freely abort; nothing happened. |
 | After freeze, before export | v2 frozen | Unfreeze (config deploy). Full reversal. |
 | After export, before ACTIVE | net INSTALLING | Unfreeze v2; discard the namespace (it never served). Full reversal. |
-| ACTIVE, before route switch | net proven, no traffic | Deactivate + unfreeze v2; or simply never switch. Full reversal. |
-| After route switch, before first net write | net serving reads | Reverse the route, unfreeze v2. The export identity is a superset of anything read. |
+| ACTIVE, before public selection | net proven, no traffic | Deactivate + unfreeze v2; or simply never enable `WOO_NET_DEFAULT`. Full reversal. |
+| After public selection, before first net write | net serving reads | Disable `WOO_NET_DEFAULT`, then unfreeze v2. The export identity is a superset of anything read. |
 | **After first net write** | net is authoritative | **Forward recovery only.** No reverse replication exists; returning to v2 discards net-era writes. This is the point of no return and the runbook marks it. |
 
 ## NC7. The installation receipt
@@ -253,7 +272,7 @@ item; what remains is exactly what the workerd lanes cannot prove
   ±25 % jitter (herds de-synchronize; drains stay replayable). Poison
   rows halt only their own lane and abandon namedly after the attempt
   budget — never silent loss, never starvation of later work.
-- **Gateway envelope — NONSAMPLED SINK + MEASUREMENT TOOLING BUILT;
+- **Gateway envelope — DATASET SINK + MEASUREMENT TOOLING BUILT;
   numbers deploy-only.**
   `scripts/net-metrics-report.ts` aggregates the metric series
   (turn percentiles, retry/reconstruction rates, hottest scopes, fanout
@@ -272,6 +291,11 @@ item; what remains is exactly what the workerd lanes cannot prove
   standalone workers.dev-only Worker with no `routes`, independent DO
   namespaces, a newly created KV namespace, and `woo_v1_net_canary`. It MUST
   NOT be represented as `[env.canary]` under the production config.
+  During a cutover bake, `metrics:net-ae --watch` polls a growing AE
+  window, aborts immediately on integrity incidents, requires both a
+  minimum duration and the full evidence envelope, and exits 2 if the
+  maximum duration expires without sufficient healthy evidence. Sampled
+  `wrangler tail` remains diagnostic only.
 - **Gateway sharding — BUILT after the first deployed canary.** Public
   `/net-api` routing uses `NET_API_GATEWAY_SHARDS` named shards. A session
   or WebSocket ticket carries its minting shard; MCP headers, bearer/body/
@@ -324,10 +348,17 @@ item; what remains is exactly what the workerd lanes cannot prove
   server envelope was p50 173 ms, p95 349 ms, p99 397 ms (max 1.78 s).
   Production and smoke profiles therefore carry the canary-proven twelve
   per-scope gateway lanes. The public route remains closed pending the
-  owner-run cutover and geographically separated/cold-start bake.
-  Abort signals (the report tool
-  exits 2 on them): any
-  outbox abandonment (named divergence), any fanout gap, turn retry rate
-  > 20 % over a meaningful sample; plus operator judgment on p95
-  `wall_ms` regressions and `install_degraded` / `adopt_conflict`
-  counters.
+  owner-run cutover and geographically separated/cold-start/sustained-rate
+  bake.
+- **Global-presence commands — NOT READY.** `connected_players()` and
+  `join_player` enumerate a gateway-local world image. Under gateway
+  sharding, `who_all` therefore returns a partial roster. The deployed
+  load driver reports this and `--enforce-who` now fails closed on either
+  a partial or inconclusive result. Public selection requires a scoped or
+  aggregated presence design and a passing enforced canary; global object
+  enumeration is not an acceptable fix under Big-World discipline.
+
+The AE watch exits 2 on any RPC timeout, queue refusal, outbox delivery
+failure/abandonment, fanout gap, degraded install/adoption signal,
+threshold breach, or insufficient evidence at its deadline. Tail reports
+may supplement diagnosis but cannot satisfy NC8 acceptance.
