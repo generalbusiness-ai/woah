@@ -848,6 +848,7 @@
             "args": [
               "actor?"
             ],
+            "command": { "dobj": ["none", "this"], "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" },
             "authority": { "prefetch": ["scope", "target", { "path": ["actor", "home"] }] }
           },
           "source": "verb :leave(who) rxd { let dest = actor.home; if (dest == null) { dest = $nowhere; } moveto(actor, dest); observe_to_space(this, { type: \"left\", actor: actor, room: this, text: actor.name + \" left.\", ts: now() }); return { room: dest, roster: this:room_roster(), here_request: true, look_deferred: true }; }"

@@ -147,6 +147,67 @@ for (const literal of stringLiterals(clientAst, clientAst)) {
   }
 }
 
+// Durable-presence drift guard. COMMAND_PLAN_DEFAULT_DURABLE_VERBS in world.ts
+// is a *substrate fallback* that stamps `persistence: "durable"` on canonical
+// movement/handling verbs when a (possibly stale) deployed slice is missing the
+// verb's arg_spec.command.persistence hint. That fallback must never be what a
+// BUNDLED catalog relies on: the manifest cell is the source of truth. This
+// check fails if any verb named in the fallback set is defined in the chat
+// manifest without self-declaring command.persistence — so authoring drift is
+// caught at build time and the runtime list is only ever a genuine stale-slice
+// net. See spec/semantics/match.md §MA7.
+function durableFallbackVerbs(source) {
+  let names = null;
+  visit(source, (node) => {
+    if (names || !ts.isVariableDeclaration(node)) return;
+    if (!ts.isIdentifier(node.name) || node.name.text !== "COMMAND_PLAN_DEFAULT_DURABLE_VERBS") return;
+    const init = node.initializer;
+    if (!init || !ts.isNewExpression(init)) return;
+    const arg = init.arguments?.[0];
+    if (!arg || !ts.isArrayLiteralExpression(arg)) return;
+    names = arg.elements
+      .filter((el) => ts.isStringLiteral(el))
+      .map((el) => el.text);
+  });
+  return names;
+}
+
+const fallbackVerbs = durableFallbackVerbs(worldAst);
+if (!fallbackVerbs) {
+  failures.push(`${worldPath}: could not parse COMMAND_PLAN_DEFAULT_DURABLE_VERBS for durable-presence drift guard`);
+} else {
+  const chatPath = "catalogs/chat/manifest.json";
+  const chat = JSON.parse(readFileSync(chatPath, "utf8"));
+  const declaredPersistence = new Map(); // verb name -> set of command.persistence values found
+  // Movement/handling verbs live on both classes ($room take/drop, $portable
+  // give) and feature objects ($conversational enter/leave), so scan both.
+  for (const holder of [...(chat.classes ?? []), ...(chat.features ?? [])]) {
+    for (const verb of holder.verbs ?? []) {
+      if (!verb?.name) continue;
+      const persistence = verb.arg_spec?.command?.persistence ?? null;
+      if (!declaredPersistence.has(verb.name)) declaredPersistence.set(verb.name, new Set());
+      declaredPersistence.get(verb.name).add(persistence);
+    }
+  }
+  const listOnly = [];
+  for (const name of fallbackVerbs) {
+    if (!declaredPersistence.has(name)) {
+      listOnly.push(name); // in the fallback set but no chat verb resolves it (dead entry)
+      continue;
+    }
+    for (const persistence of declaredPersistence.get(name)) {
+      if (persistence !== "durable" && persistence !== "live") {
+        failures.push(`${chatPath}: movement/handling verb "${name}" is in COMMAND_PLAN_DEFAULT_DURABLE_VERBS but does not self-declare arg_spec.command.persistence — stamp it so the cell, not the substrate fallback, carries routing`);
+      }
+    }
+  }
+  if (listOnly.length > 0) {
+    // Not a failure: these names cannot rely on the fallback because no verb
+    // resolves them. Surface them so the dead list entries stay visible.
+    console.log(`guard-command-planning: note — fallback verbs with no chat definition (list-only): ${listOnly.join(", ")}`);
+  }
+}
+
 if (failures.length > 0) {
   console.error("guard-command-planning failed:");
   for (const failure of failures) console.error(`- ${failure}`);

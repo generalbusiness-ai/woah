@@ -11421,6 +11421,14 @@ export class WooWorld {
     // is treated as durable so the v2 commit fires even when the satellite's
     // arg_spec hint is missing. Catalog code can still override by setting
     // `arg_spec.command.persistence: "live"` explicitly.
+    //
+    // This fallback is a stale-slice net only: bundled catalogs must NOT rely
+    // on it. `scripts/guard-command-planning.mjs` fails the build if any verb
+    // named here is defined in the chat manifest without self-declaring
+    // `arg_spec.command.persistence`, so the manifest cell — not this list — is
+    // the source of truth for freshly-seeded worlds (spec/semantics/match.md
+    // §MA7). Reaching this branch for a bundled verb means the guard was
+    // bypassed or the deployed slice is behind its manifest.
     if (!COMMAND_PLAN_DEFAULT_DURABLE_VERBS.has(verbName)) return false;
     return await this.isDescendantOfChecked(target, "$space", ctx.hostMemo);
   }

@@ -2278,7 +2278,16 @@ describe("local catalogs", () => {
       // chat:enter is sequenced so cross-room `enter <space>` plans on the
       // target's scope; same-scope `enter` (target === caller) also routes
       // sequenced — plan.space === the_chatroom matches the caller's scope.
-      expect(chatBareEnterPlan.result).toMatchObject({ ok: true, route: "sequenced", space: "the_chatroom", target: "the_chatroom", verb: "enter", args: [] });
+      expect(chatBareEnterPlan.result).toMatchObject({ ok: true, route: "sequenced", space: "the_chatroom", target: "the_chatroom", verb: "enter", args: [], persistence: "durable" });
+    }
+
+    const chatLeavePlan = await world.directCall("plan-chat-leave", first.actor, "the_chatroom", "command_plan", ["leave"]);
+    expect(chatLeavePlan.op).toBe("result");
+    if (chatLeavePlan.op === "result") {
+      // leave now self-declares persistence in its cell (arg_spec.command),
+      // retiring reliance on the COMMAND_PLAN_DEFAULT_DURABLE_VERBS fallback
+      // (MA7). The new command block also parses the bare `leave` command.
+      expect(chatLeavePlan.result).toMatchObject({ ok: true, verb: "leave", persistence: "durable" });
     }
 
     const dubspaceFilterPlanBeforeEnter = await world.directCall("plan-dubspace-filter-before-enter", first.actor, "the_dubspace", "command_plan", ["`filter 500"]);

@@ -352,6 +352,34 @@ If a future surface needs richer parser globals (a tabletop or roguelike
 might want `north`, `up`, `target`), those are catalog-defined verbs/aliases
 on `$match` or on the room — not new substrate sentinels.
 
+### MA7.1. Durable-presence criterion for command plans
+
+When the planner turns a matched command into a plan, it stamps two pieces
+of routing metadata — `route` (`direct` | `sequenced`) and `persistence`
+(`durable` | `live`) — that decide whether the resulting call commits to
+durable `$space`-rooted cells or stays live-only. **The verb cell is the
+source of truth:** the planner reads `arg_spec.command.route` and
+`arg_spec.command.persistence` off the matched verb (see
+`spec/semantics/match.md` command-metadata rules and
+`spec/catalogs/persistent-conversation.md`). Movement- and handling-style
+verbs that mutate durable state (`enter`, `leave`, the directional exits,
+`take`, `drop`, `give`) therefore declare `persistence: "durable"` in their
+own manifest cells; `enter` additionally declares `route: "sequenced"`
+because entering a scope is a cross-scope sequenced transition.
+
+The substrate carries a fallback set, `COMMAND_PLAN_DEFAULT_DURABLE_VERBS`,
+which stamps `durable` on those canonical verb names when a *direct*-routed
+command resolves against a `$space` descendant and the matched verb cell is
+missing its `persistence` hint. This exists only for **stale deployed
+slices** — a satellite whose class-verb metadata lags a manifest bump — and
+is not the mechanism bundled catalogs rely on. `scripts/guard-command-planning.mjs`
+fails the build if any verb named in that fallback set is defined in the
+chat manifest without self-declaring `arg_spec.command.persistence`, so a
+freshly-seeded world's durability comes entirely from its own cells. The
+fallback is direct-route-only: a sequenced route is already durable, so
+`persistence` on a sequenced plan (e.g. `enter`) can only come from the
+cell.
+
 ---
 
 ## MA8. What's not in `$match`
