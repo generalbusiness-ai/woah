@@ -195,6 +195,22 @@
       ]
     }
   ],
+  "schemas": [
+    {
+      "on": "$weather_block",
+      "type": "block_data",
+      "shape": { "block": "obj", "name": "str", "value": "any", "ts": "int" },
+      "audience": "space",
+      "channel": "tool:weather"
+    },
+    {
+      "on": "$weather_block",
+      "type": "weather_open",
+      "shape": { "block": "obj" },
+      "audience": "actor",
+      "channel": "tool:weather"
+    }
+  ],
   "seed_hooks": [
     {
       "kind": "set_property",

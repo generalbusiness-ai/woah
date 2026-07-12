@@ -78,6 +78,17 @@ type CatalogSchemaDef = {
   on: string;
   type: string;
   shape: Record<string, WooValue>;
+  // Routing contract, authored in the manifest `schemas` block. The audience
+  // model (looked/who = reply-only, told/text = directed, entered/left/taken/
+  // dropped = space minus actor) is still applied by type-name in
+  // world.ts observationAudienceActors; these fields make that contract
+  // legible as schema data. defineEventSchema does NOT yet store them and the
+  // router does NOT yet consume them — converging the two is deferred
+  // (notes/2026-07-11-layering-review.md Cluster 2). Declared here so the
+  // seed manifest carries the contract and the follow-up is consume-only.
+  audience?: "space" | "reply" | "directed" | "target" | "actor";
+  audience_excludes_actor?: boolean;
+  channel?: string;
 };
 
 type CatalogSeedHook =

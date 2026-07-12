@@ -910,6 +910,12 @@ describe("woo core", () => {
     expect(world.object("$pinboard").parent).toBe("$room");
     expect(world.object("$conversational").parent).toBe("$thing");
     expect(world.object("$dubspace").eventSchemas.has("control_changed")).toBe(true);
+    // Schema-ledger hygiene (net-cutover item 2): `text` (chat's tell() type)
+    // is now declared where it was emitted-but-undeclared; the dead `help`
+    // schema (help emits no observation — it ships help text as a directed
+    // `text`) is removed.
+    expect(world.object("$conversational").eventSchemas.has("text")).toBe(true);
+    expect(world.object("$generic_help_db").eventSchemas.has("help")).toBe(false);
     expect(world.verbInfo("the_dubspace", "set_control").source).toContain("target.(name)");
     expect(world.verbInfo("the_dubspace", "start_loop").bytecode_version).toBeGreaterThan(0);
     expect(world.verbInfo("the_chatroom", "say").definer).toBe("$conversational");

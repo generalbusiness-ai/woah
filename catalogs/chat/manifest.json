@@ -1036,7 +1036,9 @@
         "source": "obj",
         "actor": "obj",
         "text": "str"
-      }
+      },
+      "audience": "space",
+      "channel": "chat"
     },
     {
       "on": "$conversational",
@@ -1046,7 +1048,9 @@
         "actor": "obj",
         "to": "obj",
         "text": "str"
-      }
+      },
+      "audience": "space",
+      "channel": "chat"
     },
     {
       "on": "$conversational",
@@ -1056,7 +1060,9 @@
         "actor": "obj",
         "style": "str",
         "text": "str"
-      }
+      },
+      "audience": "space",
+      "channel": "chat"
     },
     {
       "on": "$conversational",
@@ -1065,7 +1071,9 @@
         "source": "obj",
         "actor": "obj",
         "text": "str"
-      }
+      },
+      "audience": "space",
+      "channel": "chat"
     },
     {
       "on": "$conversational",
@@ -1074,7 +1082,9 @@
         "source": "obj",
         "actor": "obj",
         "text": "str"
-      }
+      },
+      "audience": "space",
+      "channel": "chat"
     },
     {
       "on": "$conversational",
@@ -1083,7 +1093,9 @@
         "source": "obj",
         "actor": "obj",
         "text": "str"
-      }
+      },
+      "audience": "space",
+      "channel": "chat"
     },
     {
       "on": "$conversational",
@@ -1092,7 +1104,20 @@
         "source": "obj",
         "actor": "obj",
         "text": "str"
-      }
+      },
+      "audience": "space",
+      "channel": "chat"
+    },
+    {
+      "on": "$conversational",
+      "type": "text",
+      "shape": {
+        "source": "obj?",
+        "target": "obj",
+        "text": "str"
+      },
+      "audience": "directed",
+      "channel": "chat"
     },
     {
       "on": "$conversational",
@@ -1102,7 +1127,9 @@
         "from": "obj",
         "to": "obj",
         "text": "str"
-      }
+      },
+      "audience": "directed",
+      "channel": "chat"
     },
     {
       "on": "$conversational",
@@ -1114,7 +1141,10 @@
         "origin": "obj?",
         "exit": "str?",
         "text": "str"
-      }
+      },
+      "audience": "space",
+      "audience_excludes_actor": true,
+      "channel": "chat"
     },
     {
       "on": "$conversational",
@@ -1126,7 +1156,10 @@
         "destination": "obj?",
         "exit": "str?",
         "text": "str"
-      }
+      },
+      "audience": "space",
+      "audience_excludes_actor": true,
+      "channel": "chat"
     },
     {
       "on": "$conversational",
@@ -1139,7 +1172,9 @@
         "target": "obj?",
         "text": "str",
         "look": "map"
-      }
+      },
+      "audience": "reply",
+      "channel": "chat"
     },
     {
       "on": "$conversational",
@@ -1151,7 +1186,9 @@
         "room": "obj",
         "roster": "list<map>",
         "text": "str"
-      }
+      },
+      "audience": "reply",
+      "channel": "chat"
     },
     {
       "on": "$conversational",
@@ -1161,7 +1198,9 @@
         "actor": "obj",
         "text": "str",
         "suggestion": "str?"
-      }
+      },
+      "audience": "actor",
+      "channel": "chat"
     },
     {
       "on": "$chatroom",
@@ -1171,7 +1210,9 @@
         "actor": "obj",
         "exit": "str",
         "text": "str"
-      }
+      },
+      "audience": "space",
+      "channel": "chat"
     },
     {
       "on": "$chatroom",
@@ -1181,7 +1222,10 @@
         "actor": "obj",
         "item": "obj",
         "text": "str"
-      }
+      },
+      "audience": "space",
+      "audience_excludes_actor": true,
+      "channel": "chat"
     },
     {
       "on": "$chatroom",
@@ -1192,7 +1236,10 @@
         "item": "obj",
         "room": "obj",
         "text": "str"
-      }
+      },
+      "audience": "space",
+      "audience_excludes_actor": true,
+      "channel": "chat"
     }
   ],
   "seed_hooks": [

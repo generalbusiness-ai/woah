@@ -57,9 +57,6 @@
       ]
     }
   ],
-  "schemas": [
-    { "on": "$generic_help_db", "type": "help", "shape": { "source": "obj", "actor": "obj", "topic": "str", "lines": "list<str>" } }
-  ],
   "seed_hooks": [
     {
       "kind": "create_instance",
