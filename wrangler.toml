@@ -45,7 +45,7 @@ NET_API_GATEWAY_SHARDS = "8"
 # E_RPC_TIMEOUT can surface to the caller.
 NET_RPC_TIMEOUT_MS = "5000"
 NET_TURN_QUEUE_WAIT_MS = "1500"
-NET_TURN_SCOPE_CONCURRENCY = "4"
+NET_TURN_SCOPE_CONCURRENCY = "12"
 
 # Which AE dataset /admin/series queries. Must match the
 # `[[analytics_engine_datasets]].dataset` for the active env. Set

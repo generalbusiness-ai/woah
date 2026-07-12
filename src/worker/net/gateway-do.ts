@@ -802,7 +802,7 @@ export class NetGatewayDO {
 
   private turnScopeConcurrency(): number {
     const configured = Number(this.env.NET_TURN_SCOPE_CONCURRENCY);
-    if (!Number.isFinite(configured) || configured <= 0) return 4;
+    if (!Number.isFinite(configured) || configured <= 0) return 12;
     return Math.min(16, Math.max(1, Math.floor(configured)));
   }
 

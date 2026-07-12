@@ -284,7 +284,7 @@ item; what remains is exactly what the workerd lanes cannot prove
   `503 E_RPC_TIMEOUT`. A timed-out submit remains ambiguous: the gateway
   performs exactly one same-key replay before surfacing the timeout, so a
   lost accepted reply cannot cause a second commit. Each gateway shard
-  runs four bounded concurrent lanes per planning scope (configurable by
+  runs twelve bounded concurrent lanes per planning scope (configurable by
   `NET_TURN_SCOPE_CONCURRENCY`, clamped 1–16); turns waiting behind a lane
   refuse as `503 E_BUDGET` after
   `NET_TURN_QUEUE_WAIT_MS` (1.5 s) and are skipped before execution; depth
@@ -307,14 +307,23 @@ item; what remains is exactly what the workerd lanes cannot prove
   credential/account index authorities are the design). Elastic guest
   actors are durable identities; tenant-level creation quotas and
   lifecycle compaction remain policy work beyond the initial public bake.
-- **Deployed canary — DIAGNOSTIC RUN COMPLETE; ACCEPTANCE RERUN
-  REQUIRED.** The isolated 2026-07-11 canary proved install, session mint,
+- **Deployed canary — INITIAL STABILITY ENVELOPE PASSED.** The isolated
+  2026-07-11 canary proved install, session mint,
   turn commit, and named refusals on real Cloudflare DOs. It also measured
   42 % HTTP 500 responses at 6 guests and 12 concurrent turns, a 2.24 s
   gateway p99, 1.1 s scope queue wait, fixed-pool guest exhaustion, and
-  inadequate `wrangler tail` sampling. The public route remains closed.
-  Rerun with geographic separation, cold starts, the dedicated canary AE
-  dataset, and the abort criteria below. Abort signals (the report tool
+  inadequate `wrangler tail` sampling. The resulting gateway sharding,
+  bounded deadlines, elastic guests, alarm-bounded outbox, and
+  per-subscriber delivery continuity were then exercised in two 30-guest,
+  600-turn paced runs. Both completed 600/600 with 22 elastic guests and
+  all sessions closed. The accepted window covered all eight gateway
+  shards with zero errors, timeouts, queue wait, retries, reconstructions,
+  outbox failures, abandonments, or delivery gaps; its AE-weighted global
+  server envelope was p50 173 ms, p95 349 ms, p99 397 ms (max 1.78 s).
+  Production and smoke profiles therefore carry the canary-proven twelve
+  per-scope gateway lanes. The public route remains closed pending the
+  owner-run cutover and geographically separated/cold-start bake.
+  Abort signals (the report tool
   exits 2 on them): any
   outbox abandonment (named divergence), any fanout gap, turn retry rate
   > 20 % over a meaningful sample; plus operator judgment on p95
