@@ -399,7 +399,7 @@ npx wrangler kv namespace create HOST_SEED_KV   # copy the id into a working cop
 npx wrangler deploy -c wrangler.net-canary.template.toml
 # 3. Install a world, drive load, read the percentile gate from AE
 npm run install:net-dev        # (or the deployed install path)
-npm run load:net-canary
+npm run load:net-canary        # add --enforce-who to gate on the who_all check
 npm run metrics:net-ae         # global-weighted p99 gate, per-shard diagnostics
 # 4. Tear down
 npx wrangler delete -c wrangler.net-canary.template.toml   # + delete the KV
@@ -409,6 +409,16 @@ Because it has no `routes`, it structurally cannot touch production
 hostnames. The accepted initial-stability envelope (30 concurrent guests,
 22 elastic, 600/600 turns, all 8 shards, global p99 397ms, queue p99 0ms,
 zero 5xx) is recorded in `notes/2026-07-11-net-canary-envelope.md`.
+
+`load:net-canary` also runs a **`who_all` partial-view check**: because
+`connected_players` is a global session enumeration, a sharded `/net-api`
+returns a per-shard partial roster (a Big-World violation the workerd-local
+lanes structurally cannot catch — they share one world image). The load
+report includes a `who_partial_view` block (`distinct_shards`, `max_missing`,
+`unreachable`, `partial`); it is reported by default and made a non-zero
+exit with `--enforce-who`. Leave it un-enforced until `connected_players`
+is scoped or served by a cross-shard presence aggregation, then flip it on
+to assert every guest sees the full connected set.
 
 ### Onboarding smoke
 
