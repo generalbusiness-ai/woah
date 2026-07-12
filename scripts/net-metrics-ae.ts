@@ -21,6 +21,7 @@ export type NetAeReport = {
 export type NetAeLimits = {
   minTurns: number;
   maxErrorRate: number;
+  maxWallP99Ms: number;
   maxQueueP99Ms: number;
   minGatewayShards: number;
   minElasticGuests: number;
@@ -29,6 +30,7 @@ export type NetAeLimits = {
 const DEFAULT_LIMITS: NetAeLimits = {
   minTurns: 500,
   maxErrorRate: 0.01,
+  maxWallP99Ms: 500,
   maxQueueP99Ms: 1_000,
   minGatewayShards: 2,
   minElasticGuests: 1
@@ -104,6 +106,7 @@ export function buildIncidentSql(dataset: string, from: number, to: number): str
   return [
     "SELECT",
     "  blob1 AS kind,",
+    "  blob2 AS scope,",
     "  blob9 AS error,",
     `  SUM(${WEIGHT}) AS samples,`,
     `  SUM(${WEIGHT} * double15) AS delivered,`,
@@ -111,8 +114,8 @@ export function buildIncidentSql(dataset: string, from: number, to: number): str
     `  SUM(${WEIGHT} * double17) AS abandoned`,
     `FROM ${assertDataset(dataset)}`,
     `WHERE ${timeWhere(from, to)} AND blob1 IN (${kinds})`,
-    "GROUP BY kind, error",
-    "ORDER BY kind, error"
+    "GROUP BY kind, scope, error",
+    "ORDER BY kind, scope, error"
   ].join("\n");
 }
 
@@ -126,6 +129,7 @@ export function evaluateNetAeReport(report: NetAeReport, limits: Partial<NetAeLi
   const total = report.turns.reduce((sum, row) => sum + number(row, "samples"), 0);
   const errors = report.turns.reduce((sum, row) => sum + number(row, "errors"), 0);
   const timeouts = report.turns.reduce((sum, row) => sum + number(row, "rpc_timeouts"), 0);
+  const wallP99 = Math.max(0, ...report.turns.map((row) => number(row, "wall_p99")));
   const queueP99 = Math.max(0, ...report.turns.map((row) => number(row, "queue_p99")));
   const gatewayShards = new Set(report.turns.filter((row) => number(row, "samples") > 0).map((row) => String(row.host_key ?? ""))).size;
   const incident = (kind: string) => report.incidents
@@ -139,6 +143,7 @@ export function evaluateNetAeReport(report: NetAeReport, limits: Partial<NetAeLi
     failures.push(`turn error rate ${((errors / total) * 100).toFixed(2)}% exceeds ${(wanted.maxErrorRate * 100).toFixed(2)}%`);
   }
   if (timeouts > 0 || incident("net_rpc") > 0) failures.push(`${Math.max(timeouts, incident("net_rpc"))} RPC timeout(s)`);
+  if (wallP99 > wanted.maxWallP99Ms) failures.push(`worst-shard wall p99 ${wallP99}ms exceeds ${wanted.maxWallP99Ms}ms`);
   if (queueP99 > wanted.maxQueueP99Ms) failures.push(`worst-shard queue p99 ${queueP99}ms exceeds ${wanted.maxQueueP99Ms}ms`);
   if (gatewayShards < wanted.minGatewayShards) failures.push(`only ${gatewayShards} gateway shard(s) carried turns; need ${wanted.minGatewayShards}`);
   if (incident("net_guest_provisioned") < wanted.minElasticGuests) {
@@ -197,6 +202,7 @@ async function main(): Promise<void> {
   const limits: Partial<NetAeLimits> = {
     ...(value("--min-turns") ? { minTurns: Number(value("--min-turns")) } : {}),
     ...(value("--max-error-rate") ? { maxErrorRate: Number(value("--max-error-rate")) } : {}),
+    ...(value("--max-wall-p99-ms") ? { maxWallP99Ms: Number(value("--max-wall-p99-ms")) } : {}),
     ...(value("--max-queue-p99-ms") ? { maxQueueP99Ms: Number(value("--max-queue-p99-ms")) } : {}),
     ...(value("--min-gateway-shards") ? { minGatewayShards: Number(value("--min-gateway-shards")) } : {}),
     ...(value("--min-elastic-guests") ? { minElasticGuests: Number(value("--min-elastic-guests")) } : {})

@@ -41,6 +41,8 @@ async function main(): Promise<void> {
   if (!/^https:\/\//.test(base)) throw new Error("--base-url https://... is required");
   const actors = Math.max(1, Number(value("--actors", "10")));
   const rounds = Math.max(1, Number(value("--rounds", "50")));
+  const requestsPerActor = Math.max(1, Math.min(2, Number(value("--requests-per-actor", "2"))));
+  const roundDelayMs = Math.max(0, Number(value("--round-delay-ms", "0")));
   const room = value("--room", "the_chatroom");
   const run = `canary-${Date.now().toString(36)}`;
   const guests: Guest[] = [];
@@ -61,10 +63,14 @@ async function main(): Promise<void> {
     }
 
     for (let round = 0; round < rounds; round += 1) {
-      const requests = guests.flatMap((guest, actorIndex) => [
-        { guest, verb: "say", args: [`${run} round ${round} actor ${actorIndex}`] },
-        { guest, verb: "look", args: [] }
-      ]);
+      const requests = guests.flatMap((guest, actorIndex) =>
+        Array.from({ length: requestsPerActor }, (_, slot) => {
+          const say = requestsPerActor === 2 ? slot === 0 : round % 2 === 0;
+          return say
+            ? { guest, verb: "say", args: [`${run} round ${round} actor ${actorIndex}`] }
+            : { guest, verb: "look", args: [] };
+        })
+      );
       const batch = await Promise.all(requests.map(async ({ guest, verb, args: turnArgs }, index): Promise<Outcome> => {
         const started = performance.now();
         try {
@@ -105,6 +111,9 @@ async function main(): Promise<void> {
         }
       }));
       outcomes.push(...batch);
+      if (roundDelayMs > 0 && round + 1 < rounds) {
+        await new Promise((resolve) => setTimeout(resolve, roundDelayMs));
+      }
     }
   } finally {
     await Promise.all(guests.map(async (guest) => {
@@ -141,6 +150,8 @@ async function main(): Promise<void> {
     sessions_closed: guests.length - closeFailures.length,
     close_failures: closeFailures,
     turns: outcomes.length,
+    requests_per_actor: requestsPerActor,
+    round_delay_ms: roundDelayMs,
     accepted: outcomes.length - failures.length,
     failures: failures.length,
     error_rate: outcomes.length === 0 ? 1 : failures.length / outcomes.length,

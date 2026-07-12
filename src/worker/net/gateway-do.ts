@@ -468,6 +468,9 @@ export class NetGatewayDO {
   private readonly host: WorkerdHost;
   private view: CellStore | null = null;
   private readonly seen = new Map<string, number>();
+  /** Per-subscriber outbox continuity, distinct from authority `seen`.
+   * A scope head may advance without emitting a row for this gateway. */
+  private readonly deliverySeen = new Map<string, number>();
   /**
    * Echo dedupe (Phase 4 item 3 chunk 2): turn id → the session that
    * submitted it through THIS shard's client surface. The submitting
@@ -516,7 +519,11 @@ export class NetGatewayDO {
       JSON.stringify({ v: 1 })
     );
     state.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_gateway_cell (key TEXT PRIMARY KEY, body TEXT NOT NULL)");
-    state.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_gateway_scope (scope TEXT PRIMARY KEY, seen_seq INTEGER NOT NULL)");
+    state.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_gateway_scope (scope TEXT PRIMARY KEY, seen_seq INTEGER NOT NULL, delivery_seen_seq INTEGER NOT NULL DEFAULT 0)");
+    const scopeColumns = sqlRows<{ name: string }>(state.storage.sql.exec("PRAGMA table_info(net_gateway_scope)"));
+    if (!scopeColumns.some((column) => column.name === "delivery_seen_seq")) {
+      state.storage.sql.exec("ALTER TABLE net_gateway_scope ADD COLUMN delivery_seen_seq INTEGER NOT NULL DEFAULT 0");
+    }
     // CO13 relation mirror: roster rows (contents, session_presence)
     // received via FanoutBody.relations — the client-read primitive for
     // who/contents (GET /net/relation). SQLite-only (no memory cache):
@@ -3710,18 +3717,27 @@ export class NetGatewayDO {
   /** CO2.5 receiver idempotency + copy-#2 persistence, one transaction. */
   private receiveFanout(body: FanoutBody): boolean {
     const view = this.ensureView();
-    // Receiver contiguity (fix 4c): applyFanout is idempotent by seq but
-    // deliberately applies AHEAD of a hole (a sender's earlier row may
-    // have abandoned). A skipped seq is a named divergence (CO6) — count
-    // it before applying. Whether to reseed on a gap is Phase-3.5
-    // policy; the metric is the discipline now.
-    const last = this.seen.get(body.scope) ?? 0;
-    if (body.seq > last + 1) {
-      this.metric({ kind: "net_fanout_gap", scope: body.scope, status: "error", error: "E_FANOUT_GAP", expected: last + 1, got: body.seq });
+    // Delivery continuity is per subscriber lane, not per authority head:
+    // an authority event can validly produce no row for this destination.
+    // Unstamped bodies are accepted for rolling-upgrade compatibility.
+    const lastDelivery = this.deliverySeen.get(body.scope) ?? 0;
+    if (body.delivery_seq !== undefined && body.delivery_seq > lastDelivery + 1) {
+      this.metric({
+        kind: "net_fanout_gap",
+        scope: body.scope,
+        status: "error",
+        error: "E_FANOUT_GAP",
+        expected: lastDelivery + 1,
+        got: body.delivery_seq,
+        reason: `authority_seq:${body.seq}`
+      });
     }
     const applied = this.discardViewOnThrow(() =>
       this.state.storage.transactionSync(() => {
         const advanced = applyFanout(view, this.seen, body);
+        if (body.delivery_seq !== undefined && body.delivery_seq > lastDelivery) {
+          this.deliverySeen.set(body.scope, body.delivery_seq);
+        }
         if (advanced) {
           for (const cell of body.cells) this.persistCell(view, cell.key);
           // CO13: relation deltas ride the same body and the same seq
@@ -3730,12 +3746,16 @@ export class NetGatewayDO {
           // cell-only (relation rows are not cells); the shell owns the
           // mirror table.
           for (const delta of body.relations ?? []) this.applyRelationDelta(delta);
-          this.state.storage.sql.exec(
-            "INSERT INTO net_gateway_scope (scope, seen_seq) VALUES (?, ?) ON CONFLICT(scope) DO UPDATE SET seen_seq = excluded.seen_seq",
-            body.scope,
-            body.seq
-          );
         }
+        // A pull may already have superseded this row's authority state,
+        // but receiving it still advances outbox continuity. Persist both
+        // high-waters together so a crash cannot manufacture a later gap.
+        this.state.storage.sql.exec(
+          "INSERT INTO net_gateway_scope (scope, seen_seq, delivery_seen_seq) VALUES (?, ?, ?) ON CONFLICT(scope) DO UPDATE SET seen_seq = MAX(seen_seq, excluded.seen_seq), delivery_seen_seq = MAX(delivery_seen_seq, excluded.delivery_seen_seq)",
+          body.scope,
+          this.seen.get(body.scope) ?? 0,
+          this.deliverySeen.get(body.scope) ?? 0
+        );
         return advanced;
       })
     );
@@ -3802,6 +3822,7 @@ export class NetGatewayDO {
     const discard = (): void => {
       this.view = null;
       this.seen.clear();
+      this.deliverySeen.clear();
     };
     try {
       const result = fn();
@@ -3825,10 +3846,11 @@ export class NetGatewayDO {
     for (const row of sqlRows<{ body: string }>(this.state.storage.sql.exec("SELECT body FROM net_gateway_cell"))) {
       view.install(JSON.parse(row.body) as Cell);
     }
-    for (const row of sqlRows<{ scope: string; seen_seq: number } & ScopeRow>(
-      this.state.storage.sql.exec("SELECT scope, seen_seq FROM net_gateway_scope")
+    for (const row of sqlRows<{ scope: string; seen_seq: number; delivery_seen_seq: number } & ScopeRow>(
+      this.state.storage.sql.exec("SELECT scope, seen_seq, delivery_seen_seq FROM net_gateway_scope")
     )) {
       this.seen.set(row.scope, row.seen_seq);
+      this.deliverySeen.set(row.scope, row.delivery_seen_seq);
     }
     this.view = view;
     return view;

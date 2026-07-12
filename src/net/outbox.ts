@@ -26,6 +26,11 @@ import type { RelationDelta } from "./relations";
 export type FanoutBody = {
   scope: string;
   seq: number;
+  /** Monotonic position in this scope's lane for one subscriber. Authority
+   * `seq` may legitimately skip when an event produces no row for that
+   * subscriber, so it cannot diagnose outbox loss. New senders stamp this
+   * value; receivers accept unstamped rows during rolling upgrades. */
+  delivery_seq?: number;
   /** Authority cells for the receiver to install as derived copies —
    * already lineage-closed by serializeTransfer (CO7). */
   cells: Cell[];

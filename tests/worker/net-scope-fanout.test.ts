@@ -219,9 +219,10 @@ describe("NetScopeDO fanout + rider adoption over fake-DO", () => {
     // Subscriber fanout carried the observations and the room's cells.
     const fanoutCalls = gatewayRecorder.calls.filter((c) => c.path === "/net/fanout");
     expect(fanoutCalls).toHaveLength(1);
-    const fanBody = fanoutCalls[0].body as { scope: string; seq: number; cells: Array<{ key: string }>; observations: unknown[] };
+    const fanBody = fanoutCalls[0].body as { scope: string; seq: number; delivery_seq: number; cells: Array<{ key: string }>; observations: unknown[] };
     expect(fanBody.scope).toBe(ROOM_SCOPE);
     expect(fanBody.seq).toBe(1);
+    expect(fanBody.delivery_seq).toBe(1);
     expect(fanBody.observations).toEqual([{ type: "greeted", room: "#room", who: "#actor" }]);
     expect(fanBody.cells.map((c) => c.key)).toContain("property_cell:#room:visits");
 
@@ -357,7 +358,7 @@ describe("outbox liveness (fix 4)", () => {
     gatewayState.close();
   });
 
-  it("emits net_fanout_gap when a delivery skips a seq (fix 4c) and still applies it", async () => {
+  it("detects subscriber-lane loss without treating sparse authority heads as gaps", async () => {
     const metricLines: string[] = [];
     vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
       metricLines.push(args.map(String).join(" "));
@@ -368,23 +369,34 @@ describe("outbox liveness (fix 4)", () => {
     const gatewayEnv: NetGatewayEnv = { WOO_INTERNAL_SECRET: SECRET };
     const gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
 
-    const bodyAt = (seq: number) => ({
+    const bodyAt = (seq: number, delivery_seq?: number) => ({
       scope: ROOM_SCOPE,
       seq,
+      ...(delivery_seq === undefined ? {} : { delivery_seq }),
       cells: [],
       observations: []
     });
-    // seq 1 from a fresh receiver: contiguous (expected 1), no gap.
-    expect((await call<{ applied: boolean }>(gateway, gatewayEnv, "/fanout", bodyAt(1))).applied).toBe(true);
+    // Authority heads can skip while subscriber deliveries remain
+    // contiguous. This is not loss.
+    expect((await call<{ applied: boolean }>(gateway, gatewayEnv, "/fanout", bodyAt(3, 1))).applied).toBe(true);
     expect(gaps()).toHaveLength(0);
-    // seq 3 skips 2: named divergence, applied anyway (idempotent-by-seq
-    // receivers deliberately apply ahead of a hole).
-    expect((await call<{ applied: boolean }>(gateway, gatewayEnv, "/fanout", bodyAt(3))).applied).toBe(true);
+    expect((await call<{ applied: boolean }>(gateway, gatewayEnv, "/fanout", bodyAt(7, 3))).applied).toBe(true);
     expect(gaps()).toHaveLength(1);
     expect(gaps()[0]).toContain('"expected":2');
     expect(gaps()[0]).toContain('"got":3');
-    // The late seq 2 no-ops below the high-water — and is NOT a gap.
-    expect((await call<{ applied: boolean }>(gateway, gatewayEnv, "/fanout", bodyAt(2))).applied).toBe(false);
+    // A late lost row no-ops below both high-waters and adds no new gap.
+    expect((await call<{ applied: boolean }>(gateway, gatewayEnv, "/fanout", bodyAt(6, 2))).applied).toBe(false);
+    expect(gaps()).toHaveLength(1);
+
+    // Both high-waters survive eviction. A fresh gateway continues at
+    // delivery 4 instead of reporting a phantom gap after reconstruction.
+    const reconstructed = new NetGatewayDO(gatewayState.state, gatewayEnv);
+    expect((await call<{ applied: boolean }>(reconstructed, gatewayEnv, "/fanout", bodyAt(9, 4))).applied).toBe(true);
+    expect(gaps()).toHaveLength(1);
+
+    // Legacy pending rows carry no delivery position and remain accepted
+    // during a rolling deploy without reviving authority-seq false alarms.
+    expect((await call<{ applied: boolean }>(reconstructed, gatewayEnv, "/fanout", bodyAt(20))).applied).toBe(true);
     expect(gaps()).toHaveLength(1);
 
     gatewayState.close();

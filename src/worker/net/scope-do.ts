@@ -485,20 +485,24 @@ export class NetScopeDO {
     // definition. Idempotent: a migrated (or fresh) table has the column
     // and the probe passes.
     state.storage.sql.exec(
-      "CREATE TABLE IF NOT EXISTS net_scope_subscribers (destination TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'fanout', PRIMARY KEY (destination, role))"
+      "CREATE TABLE IF NOT EXISTS net_scope_subscribers (destination TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'fanout', delivery_seq INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (destination, role))"
     );
     const subscriberColumns = sqlRows<{ name: string }>(state.storage.sql.exec("PRAGMA table_info(net_scope_subscribers)"));
     if (!subscriberColumns.some((column) => column.name === "role")) {
       state.storage.transactionSync(() => {
         state.storage.sql.exec("ALTER TABLE net_scope_subscribers RENAME TO net_scope_subscribers_legacy");
         state.storage.sql.exec(
-          "CREATE TABLE net_scope_subscribers (destination TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'fanout', PRIMARY KEY (destination, role))"
+          "CREATE TABLE net_scope_subscribers (destination TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'fanout', delivery_seq INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (destination, role))"
         );
         state.storage.sql.exec(
           "INSERT INTO net_scope_subscribers (destination, role) SELECT destination, 'fanout' FROM net_scope_subscribers_legacy"
         );
         state.storage.sql.exec("DROP TABLE net_scope_subscribers_legacy");
       });
+    }
+    const deliverySubscriberColumns = sqlRows<{ name: string }>(state.storage.sql.exec("PRAGMA table_info(net_scope_subscribers)"));
+    if (!deliverySubscriberColumns.some((column) => column.name === "delivery_seq")) {
+      state.storage.sql.exec("ALTER TABLE net_scope_subscribers ADD COLUMN delivery_seq INTEGER NOT NULL DEFAULT 0");
     }
     // Outbox columns beyond the FanoutRow mirror (ready-to-scale Phase 3;
     // must exist BEFORE any namespace holds data — cf-do-0004 freeze):
@@ -1056,11 +1060,11 @@ export class NetScopeDO {
         const reap = seq.reapExpiredSessions(now, (id) => this.ownsSessionCell(seq, id));
         if (reap.status !== "applied") return reap;
         if (reap.localRemovals.length > 0) {
-          const subscribers = sqlRows<{ destination: string }>(
-            this.state.storage.sql.exec("SELECT destination FROM net_scope_subscribers WHERE role = 'fanout'")
+          const subscribers = sqlRows<{ destination: string; delivery_seq: number }>(
+            this.state.storage.sql.exec("SELECT destination, delivery_seq FROM net_scope_subscribers WHERE role = 'fanout'")
           );
-          for (const { destination } of subscribers) {
-            this.persistOutboxRow("/fanout", destination, {
+          for (const { destination, delivery_seq } of subscribers) {
+            this.persistFanoutRow(destination, delivery_seq, {
               scope: seq.scope,
               seq: reap.head.seq,
               cells: [],
@@ -1517,13 +1521,13 @@ export class NetScopeDO {
     relateDestinations: RelateDestinations
   ): void {
     const observations = (submit.transcript.observations ?? []) as unknown[];
-    const subscribers = sqlRows<{ destination: string }>(
-      this.state.storage.sql.exec("SELECT destination FROM net_scope_subscribers WHERE role = 'fanout'")
+    const subscribers = sqlRows<{ destination: string; delivery_seq: number }>(
+      this.state.storage.sql.exec("SELECT destination, delivery_seq FROM net_scope_subscribers WHERE role = 'fanout'")
     );
     if (subscribers.length > 0) {
       const cells = this.fanoutCells(seq, reply.touched);
-      for (const { destination } of subscribers) {
-        this.persistOutboxRow("/fanout", destination, {
+      for (const { destination, delivery_seq } of subscribers) {
+        this.persistFanoutRow(destination, delivery_seq, {
           scope: seq.scope,
           seq: reply.head.seq,
           cells,
@@ -1677,6 +1681,28 @@ export class NetScopeDO {
     // passes; the drain's exit check consumes this flag (fix 4b) so they
     // are picked up before the drain releases.
     if (this.draining) this.enqueuedWhileDraining = true;
+  }
+
+  /** Stamp one fanout row with its subscriber-lane position. Authority
+   * heads are sparse for a destination: seed, reap, or pre-subscription
+   * events can advance a scope without producing a row for that receiver.
+   * The per-subscriber counter is therefore the continuity signal, while
+   * body.seq remains the authority-state idempotency high-water. Callers
+   * already run inside the mutation transaction, so counter + outbox row
+   * commit or roll back together. */
+  private persistFanoutRow(destination: string, previousDeliverySeq: number, body: FanoutBody): void {
+    const deliverySeq = Number(previousDeliverySeq) + 1;
+    // The DO is single-threaded and callers run in the authority mutation
+    // transaction. Guard the observed value without relying on UPDATE
+    // RETURNING, whose cursor behavior differs between workerd and the
+    // Node fake.
+    this.state.storage.sql.exec(
+      "UPDATE net_scope_subscribers SET delivery_seq = ? WHERE destination = ? AND role = 'fanout' AND delivery_seq = ?",
+      deliverySeq,
+      destination,
+      previousDeliverySeq
+    );
+    this.persistOutboxRow("/fanout", destination, { ...body, delivery_seq: deliverySeq });
   }
 
   /** Kick a deferred drain when pending rows exist (reactivation path —
@@ -2102,13 +2128,13 @@ export class NetScopeDO {
         // committing scope's fanout already delivered the turn's
         // observations to ITS subscribers; this delivers the owner's
         // authoritative cell state.
-        const subscribers = sqlRows<{ destination: string }>(
-          this.state.storage.sql.exec("SELECT destination FROM net_scope_subscribers WHERE role = 'fanout'")
+        const subscribers = sqlRows<{ destination: string; delivery_seq: number }>(
+          this.state.storage.sql.exec("SELECT destination, delivery_seq FROM net_scope_subscribers WHERE role = 'fanout'")
         );
         if (subscribers.length > 0) {
           const cells = this.fanoutCells(seq, result.applied);
-          for (const { destination } of subscribers) {
-            this.persistOutboxRow("/fanout", destination, {
+          for (const { destination, delivery_seq } of subscribers) {
+            this.persistFanoutRow(destination, delivery_seq, {
               scope: seq.scope,
               seq: result.head.seq,
               cells,
@@ -2163,11 +2189,11 @@ export class NetScopeDO {
         const applied = body.deltas.filter((delta) =>
           changed.has(relationKey(delta.row.relation, delta.row.owner, delta.row.member))
         );
-        const subscribers = sqlRows<{ destination: string }>(
-          this.state.storage.sql.exec("SELECT destination FROM net_scope_subscribers WHERE role = 'fanout'")
+        const subscribers = sqlRows<{ destination: string; delivery_seq: number }>(
+          this.state.storage.sql.exec("SELECT destination, delivery_seq FROM net_scope_subscribers WHERE role = 'fanout'")
         );
-        for (const { destination } of subscribers) {
-          this.persistOutboxRow("/fanout", destination, {
+        for (const { destination, delivery_seq } of subscribers) {
+          this.persistFanoutRow(destination, delivery_seq, {
             scope: seq.scope,
             seq: result.head.seq,
             cells: [],

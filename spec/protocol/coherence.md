@@ -151,6 +151,15 @@ frame is a no-op by scope head. Accepted frames carry the authority's
 acceptance timestamp so retried deliveries never mint fresh wall-clock
 values.
 
+Fanout carries two distinct monotonic positions. The authority `seq` gates
+derived state application and may skip at one subscriber when an authority
+event produces no row for that destination. A per-subscriber `delivery_seq`
+gates delivery continuity and advances once for each row enqueued to that
+destination. Receivers MUST diagnose a jump in `delivery_seq` as a named
+fanout gap; they MUST NOT infer delivery loss from a jump in authority `seq`.
+Rows without `delivery_seq` remain valid during rolling upgrades but provide
+no delivery-gap evidence.
+
 ### CO2.6 Materialization miss is not semantic absence
 
 Under sparse execution, a lookup miss for an unmaterialized id MUST surface
@@ -169,7 +178,8 @@ shards), never O(active_sessions).
 
 Destination lanes have no cross-lane ordering dependency and MUST drain
 concurrently, while rows within each destination remain strictly serial in
-`(scope, seq)` order. A slow or backing-off subscriber cannot add its
+`delivery_seq` order (which also preserves their authority enqueue order).
+A slow or backing-off subscriber cannot add its
 delivery latency to healthy subscribers' lanes.
 
 An accepted `/submit` and an incoming outbox delivery MUST NOT synchronously
