@@ -281,11 +281,38 @@ describe("NC8b: the per-turn RPC budget and parallel-group mechanics (TurnStruct
 });
 
 describe("NC8 queue wait deadline", () => {
+  it("runs four independent lanes per scope by default and queues the fifth", async () => {
+    const gatewayState = netState("gateway-queue-lanes");
+    const gateway = new NetGatewayDO(gatewayState.state, { WOO_INTERNAL_SECRET: SECRET });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let executions = 0;
+    const internals = gateway as unknown as {
+      turn(request: { planningScope: string }): Promise<unknown>;
+      turnUnqueued(request: { planningScope: string }, queueMs: number): Promise<unknown>;
+    };
+    internals.turnUnqueued = async () => {
+      executions += 1;
+      if (executions <= 4) await gate;
+      return { ok: true };
+    };
+
+    const request = { planningScope: "room:hot" };
+    const turns = Array.from({ length: 5 }, () => internals.turn(request));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(executions).toBe(4);
+    release();
+    await Promise.all(turns);
+    expect(executions).toBe(5);
+    gatewayState.close();
+  });
+
   it("refuses a queued turn on time and skips it when the predecessor releases", async () => {
     const gatewayState = netState("gateway-queue-deadline");
     const gateway = new NetGatewayDO(gatewayState.state, {
       WOO_INTERNAL_SECRET: SECRET,
-      NET_TURN_QUEUE_WAIT_MS: "20"
+      NET_TURN_QUEUE_WAIT_MS: "20",
+      NET_TURN_SCOPE_CONCURRENCY: "1"
     });
     let releaseFirst!: () => void;
     const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });

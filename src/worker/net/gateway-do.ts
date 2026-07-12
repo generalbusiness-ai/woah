@@ -131,6 +131,8 @@ export type NetGatewayEnv = NetBindingsEnv & {
   NET_GATEWAY_SELF?: string;
   /** Maximum time an admitted turn may wait behind its planning scope. */
   NET_TURN_QUEUE_WAIT_MS?: string;
+  /** Bounded concurrent planning/submission lanes per scope on this shard. */
+  NET_TURN_SCOPE_CONCURRENCY?: string;
 };
 
 function sqlRows<T>(cursor: unknown): T[] {
@@ -765,18 +767,13 @@ export class NetGatewayDO {
    * submit — `base` is an envelope field, not part of the transcript
    * hash or the post-state digest, so patching it in is sound.
    */
-  /** NC8 hot-scope serializer: this shard's own concurrent turns into
-   * one planning scope run in arrival order. Without it, N concurrent
-   * same-cell turns from one shard race each other at every RPC await
-   * (real DOs deliver events during subrequests — input gates only cover
-   * storage), and the herd burns ~one retryable round per competitor:
-   * the skew lane measured 3/10 first-wave survivors at MAX_TURN_ATTEMPTS
-   * = 6. Queued turns instead plan against the previous turn's installed
-   * post-state and accept first-attempt. Cross-SHARD contention still
-   * exists and still converges through the retry loop — this removes
-   * only the self-inflicted share, and with it the wasted authority
-   * round-trips. Per-scope chains, pruned when they settle. */
-  private readonly turnQueues = new Map<string, Promise<unknown>>();
+  /** NC8 hot-scope bounded lanes. Planning takes a synchronous detached
+   * snapshot and the scope validates current authority reads, so
+   * independent turns can overlap safely while true conflicts repair
+   * through CO4. Four lanes avoid serializing unrelated 200ms turns into
+   * a 1.5s queue while bounding conflict amplification. */
+  private readonly turnQueues = new Map<string, Array<Promise<unknown> | undefined>>();
+  private readonly turnQueueLaneDepth = new Map<string, number[]>();
   /** Finding 11: per-scope queue depth — admission control. Unbounded
    * promise chains under a hot scope are memory growth AND unbounded
    * client latency; past the cap the honest answer is a named refusal
@@ -794,6 +791,12 @@ export class NetGatewayDO {
     const configured = Number(this.env.NET_TURN_QUEUE_WAIT_MS);
     if (!Number.isFinite(configured) || configured <= 0) return 1_500;
     return Math.min(30_000, Math.max(10, Math.floor(configured)));
+  }
+
+  private turnScopeConcurrency(): number {
+    const configured = Number(this.env.NET_TURN_SCOPE_CONCURRENCY);
+    if (!Number.isFinite(configured) || configured <= 0) return 4;
+    return Math.min(16, Math.max(1, Math.floor(configured)));
   }
 
   private turn(request: TurnRequest): Promise<TurnResult> {
@@ -815,7 +818,17 @@ export class NetGatewayDO {
     this.turnQueueTotal += 1;
     this.turnQueueDepth.set(key, depth + 1);
     const queuedAt = Date.now();
-    const tail = this.turnQueues.get(key) ?? Promise.resolve();
+    const concurrency = this.turnScopeConcurrency();
+    const lanes = this.turnQueues.get(key) ?? new Array<Promise<unknown> | undefined>(concurrency);
+    const laneDepths = this.turnQueueLaneDepth.get(key) ?? new Array<number>(concurrency).fill(0);
+    let lane = 0;
+    for (let i = 1; i < laneDepths.length; i += 1) {
+      if (laneDepths[i] < laneDepths[lane]) lane = i;
+    }
+    laneDepths[lane] += 1;
+    this.turnQueues.set(key, lanes);
+    this.turnQueueLaneDepth.set(key, laneDepths);
+    const tail = lanes[lane] ?? Promise.resolve();
     const maxWaitMs = this.turnQueueWaitMs();
     let started = false;
     let expired = false;
@@ -851,6 +864,11 @@ export class NetGatewayDO {
       const remaining = (this.turnQueueDepth.get(key) ?? 1) - 1;
       if (remaining <= 0) this.turnQueueDepth.delete(key);
       else this.turnQueueDepth.set(key, remaining);
+      const depths = this.turnQueueLaneDepth.get(key);
+      if (depths) {
+        depths[lane] = Math.max(0, depths[lane] - 1);
+        if (depths.every((value) => value === 0)) this.turnQueueLaneDepth.delete(key);
+      }
     };
     // Keep expired entries counted until their predecessor settles and
     // their no-op executes. Otherwise a wedged predecessor could admit an
@@ -862,9 +880,12 @@ export class NetGatewayDO {
       () => undefined,
       () => undefined
     );
-    this.turnQueues.set(key, settled);
+    lanes[lane] = settled;
     void settled.finally(() => {
-      if (this.turnQueues.get(key) === settled) this.turnQueues.delete(key);
+      if (lanes[lane] === settled) lanes[lane] = undefined;
+      if (lanes.every((entry) => entry === undefined) && this.turnQueues.get(key) === lanes) {
+        this.turnQueues.delete(key);
+      }
     });
     return run;
   }

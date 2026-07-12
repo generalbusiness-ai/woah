@@ -234,9 +234,9 @@ item; what remains is exactly what the workerd lanes cannot prove
   CO2.5 disambiguation resubmit and the post-accept warm fill).
 - **Skewed-load proof — BUILT (in-process bounds).** `load:net-skew`
   (curated gate): hot-room concurrent same-cell writers (converge under
-  retry with named verdicts and exact serialization — a per-scope turn
-  serializer at the gateway removes the self-inflicted herd the lane
-  originally measured at 3/10 first-wave survivors), large-audience
+  retry with named verdicts and exact serialization at the authority —
+  each gateway shard admits four bounded per-scope lanes, limiting the
+  self-inflicted herd without serializing independent turns), large-audience
   fanout (scan and push track room occupancy, never total mirrored
   sessions), high-degree owner isolation (a 200-member scope adds
   nothing to another scope's turn), alarm backlog under foreground
@@ -283,8 +283,10 @@ item; what remains is exactly what the workerd lanes cannot prove
   `NET_RPC_TIMEOUT_MS` (5 s in the deployment profile) and surfaces as
   `503 E_RPC_TIMEOUT`. A timed-out submit remains ambiguous: the gateway
   performs exactly one same-key replay before surfacing the timeout, so a
-  lost accepted reply cannot cause a second commit. Turns waiting behind
-  one planning scope refuse as `503 E_BUDGET` after
+  lost accepted reply cannot cause a second commit. Each gateway shard
+  runs four bounded concurrent lanes per planning scope (configurable by
+  `NET_TURN_SCOPE_CONCURRENCY`, clamped 1–16); turns waiting behind a lane
+  refuse as `503 E_BUDGET` after
   `NET_TURN_QUEUE_WAIT_MS` (1.5 s) and are skipped before execution; depth
   and aggregate caps remain in force while expired entries drain.
 - **Elastic guest admission — BUILT after the first deployed canary.**
