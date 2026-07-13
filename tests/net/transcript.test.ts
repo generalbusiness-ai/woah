@@ -122,6 +122,41 @@ describe("applyTranscript (CO4 step 10)", () => {
     expect(result.touched).toEqual(["property_cell:#1:n"]);
   });
 
+  it("property authoring replaces or deletes the complete definition cell", () => {
+    const pre = new CellStore("authority");
+    pre.commit({
+      kind: "property_cell",
+      object: "#1",
+      name: "n",
+      value: { value: 9, def: { name: "n", defaultValue: 0, owner: "#actor", perms: "rw", version: 1 } },
+      stamp: STAMP
+    });
+    const replacement = {
+      value: 7,
+      def: { name: "n", defaultValue: 7, owner: "#actor", perms: "r", type: "int", version: 2 }
+    };
+    const replaced = applyTranscript(pre, baseTranscript({
+      writes: [{ cell: { kind: "prop", object: "#1", name: "n" }, value: replacement, op: "replace" }]
+    }), STAMP);
+    expect(replaced.post.get("property_cell:#1:n")?.value).toEqual(replacement);
+
+    const deleted = applyTranscript(replaced.post, baseTranscript({
+      writes: [{ cell: { kind: "prop", object: "#1", name: "n" }, value: replacement, op: "delete" }]
+    }), STAMP);
+    expect(deleted.post.has("property_cell:#1:n")).toBe(false);
+    expect(replaced.post.get("property_cell:#1:n")?.value).toEqual(replacement);
+  });
+
+  it("verb authoring removes the complete bytecode cell", () => {
+    const pre = new CellStore("authority");
+    pre.commit({ kind: "verb_bytecode", object: "#1", name: "run", value: { source: "return 1;" }, stamp: STAMP });
+    const result = applyTranscript(pre, baseTranscript({
+      writes: [{ cell: { kind: "verb", object: "#1", name: "run" }, value: null, op: "remove" }]
+    }), STAMP);
+    expect(result.post.has("verb_bytecode:#1:run")).toBe(false);
+    expect(pre.has("verb_bytecode:#1:run")).toBe(true);
+  });
+
   it("postStateVersion distinguishes remove-with-def, remove-without-def, and a value write", () => {
     const def = { name: "n", defaultValue: 0, owner: "#actor", perms: "rw", version: 1 };
     const withDef = new CellStore("authority");

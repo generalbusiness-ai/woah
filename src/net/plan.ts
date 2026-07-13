@@ -180,6 +180,7 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
     try {
       attemptRun = await runShadowTurnCallTranscript(world, call, {
         require_room_roster_projection: true,
+        record_authoring_cell_writes: true,
         ...(input.planningRoomRoster ? { room_rosters: [input.planningRoomRoster] } : {})
       });
     } catch (err) {

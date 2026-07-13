@@ -33,18 +33,16 @@
  * catalog scope"); properly-anchored worlds do not hit it, and the seed
  * catalogs' missing anchors are seed-data debt, not a topology gap.
  *
- * The catalog scope is NOT shared (`isShared` is false for it): catalog
- * cells change only through the install pipeline — a sequenced commit at
- * the catalog scope plus a `catalog_epoch` bump (CO15). Ordinary turns
- * must never serialize at the catalog sequencer; route.ts therefore
- * treats a catalog-scope write like a rider, and the install pipeline is
- * the one sanctioned writer.
+ * The catalog scope is NOT shared in route.ts's room-sequencer sense
+ * (`isShared` is false for it). Class-definition cells change only through
+ * the install pipeline — a sequenced catalog commit plus a `catalog_epoch`
+ * bump (CO15). Compatibility identities, sessions, and still-anchorless
+ * instances can nevertheless have catalog as their current owner; those
+ * mutable cells are live-attested and are never covered by the class cache.
  *
- * TODO(CO15 install pipeline): the KV-seeding of the catalog closure to
- * every gateway at install time — and the catalog scope's write-rejection
- * outside that pipeline — land with the install-pipeline work item
- * (spec/protocol/coherence.md CO15, "The install pipeline"), NOT here.
- * This file is the pure classification function that work builds on.
+ * The gateway refuses ordinary-turn class-definition writes before submit;
+ * the install pipeline is the only sanctioned updater. This file remains the
+ * pure ownership function used by both installation and ordinary routing.
  */
 import type { Cell, CellKind } from "./cells";
 import { netError } from "./errors";

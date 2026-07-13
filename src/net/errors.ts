@@ -18,6 +18,7 @@ export type NetErrorCode =
   | "E_MISSING_STATE"  // materialization miss under sparse execution (CO2.6)
   | "E_READ_VERSION"   // read set conflicts with current authority
   | "E_SCOPE_SPLIT"    // write set spans two distinct shared scopes (CO2.3)
+  | "E_CATALOG_MUTATION" // ordinary turn tried to mutate epoch-immutable class definition
   | "E_LINEAGE"        // transfer lacking lineage closure — cannot occur by construction; assert
   | "E_BUDGET"         // repair budget exhausted; carries the attempt trace
   | "E_RPC_TIMEOUT"    // a cross-authority call exceeded its transport deadline;
@@ -41,6 +42,7 @@ export const NET_ERROR_RECOVERY: Record<NetErrorCode, string> = {
   E_MISSING_STATE: "acquire read-closure transfer, retry",
   E_READ_VERSION: "re-plan against refreshed cells",
   E_SCOPE_SPLIT: "terminal; named limitation until CA10",
+  E_CATALOG_MUTATION: "terminal; publish class-definition changes through the catalog install pipeline",
   E_LINEAGE: "cannot occur by construction (CO7); assert/alarm",
   E_BUDGET: "terminal; reply carries the attempt trace",
   E_RPC_TIMEOUT: "terminal for this request; retry with the same idempotency key",

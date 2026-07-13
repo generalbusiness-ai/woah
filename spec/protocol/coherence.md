@@ -108,6 +108,15 @@ that seam:
    rider reads against the attestation; a rider read with no attestation
    rejects `rider_unattested` (terminal, named). The committing scope's
    `owns` predicate scopes what it validates against its own store.
+   The catalog scope has one explicit epoch-validation policy: because CO15
+   permits **class-definition cells** to change only with a `catalog_epoch`
+   bump, a gateway MAY cache attested lineage, property-definition/default,
+   and verb cells that the turn's lineage closure proves belong to classes.
+   The first miss still comes from `/net/attest`, whose reply MUST echo the
+   authority's epoch; concurrent misses MAY coalesce. An epoch mismatch fails
+   closed and never populates the cache. Sessions, identity records,
+   compatibility instances, and every non-catalog owner remain per-turn reads
+   of the live authority even when their current scope name is `catalog`.
 2. **Owner-sequenced adoption.** Rider writes reach their owner via
    `/net/adopt` and are applied as owner-ordered events with a per-cell
    prior-version CAS (the attested version the committing turn
@@ -337,6 +346,7 @@ divergence. Tail metrics count by code.
 | `E_MISSING_STATE` | materialization miss under sparse execution (CO2.6) | acquire read-closure transfer, retry |
 | `E_READ_VERSION` | read set conflicts with current authority | re-plan against refreshed cells |
 | `E_SCOPE_SPLIT` | write set spans two distinct shared scopes (CO2.3) | terminal; named limitation until CA10 |
+| `E_CATALOG_MUTATION` | ordinary turn attempted to mutate an installed catalog class definition without advancing the epoch | terminal; publish through the catalog install pipeline |
 | `E_LINEAGE` | transfer lacking lineage closure | cannot occur by construction (CO7); assert/alarm |
 | `E_BUDGET` | repair budget exhausted | terminal; reply carries the attempt trace (each attempt's taxonomy code) |
 | `E_RPC_TIMEOUT` | a cross-authority RPC exceeded its deadline | terminal for this request; retry with the same idempotency key; an ambiguous submit is first disambiguated by one same-key replay |
@@ -745,11 +755,17 @@ One write path per fact (CO9), concretized:
   class lineage, verb bytecode, identity maps. Its closure is
   read-mostly, KV-seeded to every gateway at install, and universally
   receiver-known in transfers (class chains never reship — the CO7
-  `assumes_known` mechanism's production population). Catalog cells
-  change only through the install pipeline: a sequenced commit at the
-  catalog scope plus a `catalog_epoch` bump, which every consumer heals
-  from via `E_STALE_EPOCH` reseed (the aged-world lane, CO12.6, is the
-  proof).
+  `assumes_known` mechanism's production population). Class definitions in
+  that closure (lineage, property definitions/defaults, and verb bytecode)
+  change only through the install pipeline: a sequenced catalog commit plus a
+  `catalog_epoch` bump, which every consumer heals from via `E_STALE_EPOCH`
+  reseed (the aged-world lane, CO12.6, is the proof). This narrowly identified
+  immutability is the sole basis for amortizing catalog attestations under
+  CO2.3; no scope-head cache policy applies to mutable catalog, room, or
+  cluster cells. An ordinary turn that records a write to an installed
+  catalog class definition MUST refuse with `E_CATALOG_MUTATION` before scope
+  selection is pinned or a submit is issued. Runtime authoring of non-catalog,
+  user-owned objects remains a normal sequenced turn.
 - **The install pipeline** partitions a bootstrap/exported world by the
   anchor walk (`partitionCells`): catalog cells → catalog scope; rooms +
   room-anchored → room scopes; actors + carried → cluster scopes.

@@ -241,6 +241,20 @@ export function applyTranscript(pre: CellStore, transcript: EffectTranscript, st
         break;
       }
       case "prop": {
+        if (write.op === "delete") {
+          post.delete(key);
+          break;
+        }
+        if (write.op === "replace") {
+          post.commit({
+            kind: "property_cell",
+            object: write.cell.object,
+            name: write.cell.name,
+            value: write.value,
+            stamp
+          });
+          break;
+        }
         const def = propertyCellDef(post.get(key)?.value);
         // op "remove" is LambdaMOO clear_property: drop the LOCAL value so
         // the property reverts to the inherited default (v2 parity:
@@ -278,7 +292,11 @@ export function applyTranscript(pre: CellStore, transcript: EffectTranscript, st
         break;
       }
       case "verb": {
-        post.commit({ kind: "verb_bytecode", object: write.cell.object, name: write.cell.name, value: write.value, stamp });
+        if (write.op === "remove") {
+          post.delete(key);
+        } else {
+          post.commit({ kind: "verb_bytecode", object: write.cell.object, name: write.cell.name, value: write.value, stamp });
+        }
         break;
       }
       case "contents":

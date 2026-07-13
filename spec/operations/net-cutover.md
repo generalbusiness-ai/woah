@@ -252,6 +252,11 @@ item; what remains is exactly what the workerd lanes cannot prove
   measures the paid parallelism); hard per-turn budgets refuse namedly
   (`E_BUDGET`, 32 RPCs / 30 s RPC time — mandatory steps exempt: the
   CO2.5 disambiguation resubmit and the post-accept warm fill).
+  Catalog class-definition attestations are additionally amortized per gateway
+  under the exact `catalog_epoch`: the first concurrent miss coalesces to one
+  authority RPC and later turns reuse those immutable lineage/property/verb
+  versions. Arbitrary catalog objects, identities, sessions, room state, and
+  cluster state remain live per-turn attestations.
 - **Skewed-load proof — BUILT (in-process bounds).** `load:net-skew`
   (curated gate): hot-room concurrent same-cell writers (converge under
   retry with named verdicts and exact serialization at the authority —

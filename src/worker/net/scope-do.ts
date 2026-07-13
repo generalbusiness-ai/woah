@@ -17,7 +17,7 @@
  *                           field is the gateway's CA3 rider directions
  *                           (src/net/scope.ts types stay unchanged; the
  *                           sequencer never learns rider topology)
- *       POST /net/attest    {keys} → {scope, owner_head, cells:
+ *       POST /net/attest    {keys} → {scope, catalog_epoch, owner_head, cells:
  *                           [{key, version}]} — the CO2.3 rider-read
  *                           attestation surface: the gateway fetches
  *                           this from each owner scope at plan time so
@@ -797,6 +797,7 @@ export class NetScopeDO {
         const seq = this.ensureSequencer();
         return json({
           scope: seq.scope,
+          catalog_epoch: seq.catalogEpoch,
           owner_head: seq.head(),
           cells: body.keys.map((key) => ({ key, version: seq.store.get(key)?.version ?? "absent" }))
         });

@@ -18,7 +18,7 @@ import { FakeDurableObjectState } from "./fake-do";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
-import { installVerb } from "../../src/core/authoring";
+import { installVerb, installVerbAs } from "../../src/core/authoring";
 import { createWorld } from "../../src/core/bootstrap";
 import { cellsFromSerialized, type ShadowTurnCall } from "../../src/net/bridge";
 import { CATALOG_SCOPE, partitionCells } from "../../src/net/topology";
@@ -94,6 +94,7 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
     const world = createWorld();
     const session = world.auth("guest:net-topology");
     const actor = session.actor;
+    world.object(actor).flags.programmer = true;
     world.createObject({ id: "topo_room", name: "Topo Room", parent: "$space", owner: actor });
     world.createObject({ id: "topo_box", name: "Topo Box", parent: "$thing", owner: actor, anchor: "topo_room", location: "topo_room" });
     world.defineProperty("topo_box", { name: "counter", defaultValue: 0, owner: actor, perms: "rw", typeHint: "int" });
@@ -126,10 +127,134 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
       null
     );
     expect(installed.ok).toBe(true);
+    // Install on the class, not the instance: invoking this through topo_box
+    // records genuine class-chain reads at the catalog owner. The cache may
+    // amortize these cells; it must not amortize topo_config below merely
+    // because that mutable compatibility object has the same owner.
+    const helperInstalled = installVerb(
+      world,
+      "$thing",
+      "catalog_peek_value",
+      "verb :catalog_peek_value() rxd { return 1; }",
+      null
+    );
+    expect(helperInstalled.ok).toBe(true);
+    const peekInstalled = installVerb(
+      world,
+      "$thing",
+      "catalog_peek",
+      "verb :catalog_peek() rxd { return this:catalog_peek_value(); }",
+      null
+    );
+    expect(peekInstalled.ok).toBe(true);
+    const mutateClassInstalled = installVerbAs(
+      world,
+      "$wiz",
+      "topo_box",
+      "mutate_catalog_class",
+      `verb :mutate_catalog_class() rxd {
+        return set_verb_code($thing, "catalog_peek_value", "verb :catalog_peek_value() rxd { return 2; }");
+      }`,
+      null
+    );
+    expect(mutateClassInstalled.ok, JSON.stringify(mutateClassInstalled)).toBe(true);
+    const mutateClassPropertyInstalled = installVerbAs(
+      world,
+      "$wiz",
+      "topo_box",
+      "mutate_catalog_class_property",
+      `verb :mutate_catalog_class_property() rxd {
+        add_property($thing, "runtime_catalog_property", 1, { perms: "rw", type_hint: "int" });
+        return true;
+      }`,
+      null
+    );
+    expect(mutateClassPropertyInstalled.ok, JSON.stringify(mutateClassPropertyInstalled)).toBe(true);
+    const runtimeInstall = installVerbAs(
+      world,
+      actor,
+      "topo_box",
+      "install_runtime_verb",
+      `verb :install_runtime_verb() rxd {
+        add_verb(this, { name: "runtime_value", perms: "rxd" });
+        return set_verb_code(this, "runtime_value", "verb :runtime_value() rxd { return 2; }");
+      }`,
+      null
+    );
+    expect(runtimeInstall.ok, JSON.stringify(runtimeInstall)).toBe(true);
+    const runtimeRename = installVerbAs(
+      world,
+      actor,
+      "topo_box",
+      "rename_runtime_verb",
+      `verb :rename_runtime_verb() rxd {
+        return set_verb_info(this, "runtime_value", { name: "runtime_renamed", perms: "rxd" });
+      }`,
+      null
+    );
+    expect(runtimeRename.ok, JSON.stringify(runtimeRename)).toBe(true);
+    const runtimeDelete = installVerbAs(
+      world,
+      actor,
+      "topo_box",
+      "delete_runtime_verb",
+      `verb :delete_runtime_verb() rxd {
+        delete_verb(this, "runtime_renamed");
+        return true;
+      }`,
+      null
+    );
+    expect(runtimeDelete.ok, JSON.stringify(runtimeDelete)).toBe(true);
+    const propertyInstall = installVerbAs(
+      world,
+      actor,
+      "topo_box",
+      "install_runtime_property",
+      `verb :install_runtime_property() rxd {
+        add_property(this, "runtime_property", 7, { perms: "rw", type_hint: "int" });
+        return this.runtime_property;
+      }`,
+      null
+    );
+    expect(propertyInstall.ok, JSON.stringify(propertyInstall)).toBe(true);
+    const propertyInfoUpdate = installVerbAs(
+      world,
+      actor,
+      "topo_box",
+      "update_runtime_property_info",
+      `verb :update_runtime_property_info() rxd {
+        set_property_info(this, "runtime_property", { perms: "r", type_hint: "int" });
+        return property_info(this, "runtime_property");
+      }`,
+      null
+    );
+    expect(propertyInfoUpdate.ok, JSON.stringify(propertyInfoUpdate)).toBe(true);
+    const propertyDelete = installVerbAs(
+      world,
+      actor,
+      "topo_box",
+      "delete_runtime_property",
+      `verb :delete_runtime_property() rxd {
+        delete_property(this, "runtime_property");
+        return true;
+      }`,
+      null
+    );
+    expect(propertyDelete.ok, JSON.stringify(propertyDelete)).toBe(true);
     // Genesis placement: the actor occupies the room (this also gives the
     // room partition its presence rows — genesis state, not under test).
     const placed = await world.directCall("topo-genesis-place", actor, actor, "moveto", ["topo_room"], { sessionId: session.id });
     expect(placed.op).toBe("result");
+    const wizardSession = world.createSessionForActor("$wiz", "bearer");
+    const wizardPlaced = await world.directCall(
+      "topo-genesis-place-wizard",
+      "$wiz",
+      "$wiz",
+      "moveto",
+      ["topo_room"],
+      { sessionId: wizardSession.id }
+    );
+    expect(wizardPlaced.op).toBe("result");
 
     // ---- Partition the world (CO15 install-pipeline shape) and seed one
     // scope DO per partition we drive. The DO namespace key IS the scope
@@ -165,6 +290,7 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
     // The RPC seams the turn must exercise, recorded per destination so
     // the test can assert WHERE attestations went.
     const rpcLog: string[] = [];
+    const catalogAttestKeys: string[][] = [];
     const gatewayState = netState("gateway-topology");
     const gatewayEnv: NetGatewayEnv = {
       WOO_INTERNAL_SECRET: SECRET,
@@ -173,9 +299,17 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
         const instance = scope !== null ? scopeDOs.get(scope) : undefined;
         if (!instance) throw new Error(`unexpected destination ${destination}`);
         return {
-          fetch: (request: Request) => {
-            rpcLog.push(`${destination}${new URL(request.url).pathname}`);
-            return instance.fetch(request);
+          fetch: async (request: Request) => {
+            const path = new URL(request.url).pathname;
+            rpcLog.push(`${destination}${path}`);
+            // Force the first two read-only turns to overlap at the catalog
+            // authority, proving the gateway coalesces an actual burst miss.
+            if (destination === `scope:${CATALOG_SCOPE}` && path === "/net/attest") {
+              const body = await request.clone().json() as { keys?: string[] };
+              catalogAttestKeys.push([...(body.keys ?? [])]);
+              await new Promise((resolve) => setTimeout(resolve, 50));
+            }
+            return await instance.fetch(request);
           }
         };
       }
@@ -205,7 +339,156 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
       idempotency_key: key
     });
 
+    const peekRequest = (key: string) => ({
+      call: { ...bump(key), verb: "catalog_peek" },
+      planningScope: roomScope,
+      catalog_epoch: EPOCH,
+      idempotency_key: key
+    });
+
     rpcLog.length = 0;
+    const peeks = await Promise.all([
+      call<TurnBody>(gateway, gatewayEnv, "/turn", peekRequest("topo-peek-1")),
+      call<TurnBody>(gateway, gatewayEnv, "/turn", peekRequest("topo-peek-2"))
+    ]);
+    for (const peek of peeks) {
+      expect(peek.reply.status, JSON.stringify(peek.reply)).toBe("accepted");
+      expect(peek.result).toBe(1);
+    }
+    expect(
+      rpcLog.filter((entry) => entry === `scope:${CATALOG_SCOPE}/net/attest`),
+      JSON.stringify(catalogAttestKeys)
+    ).toHaveLength(1);
+    expect(rpcLog.filter((entry) => entry === `scope:${clusterScope}/net/attest`)).toHaveLength(2);
+
+    // Runtime programmers may still edit user-owned noncatalog objects, but
+    // installed catalog classes are epoch-immutable. Refuse before submit so
+    // a mixed room/class write cannot mutate the class via rider adoption.
+    rpcLog.length = 0;
+    await expect(call<TurnBody>(gateway, gatewayEnv, "/turn", {
+      call: {
+        id: "topo-class-mutation",
+        route: "direct",
+        scope: roomScope,
+        session: wizardSession.id,
+        actor: "$wiz",
+        target: "topo_box",
+        verb: "mutate_catalog_class",
+        args: []
+      },
+      planningScope: roomScope,
+      catalog_epoch: EPOCH,
+      idempotency_key: "topo-class-mutation"
+    })).rejects.toThrow("E_CATALOG_MUTATION");
+    expect(rpcLog).not.toContain(`scope:${roomScope}/net/submit`);
+    await expect(call<TurnBody>(gateway, gatewayEnv, "/turn", {
+      call: {
+        id: "topo-class-property-mutation",
+        route: "direct",
+        scope: roomScope,
+        session: wizardSession.id,
+        actor: "$wiz",
+        target: "topo_box",
+        verb: "mutate_catalog_class_property",
+        args: []
+      },
+      planningScope: roomScope,
+      catalog_epoch: EPOCH,
+      idempotency_key: "topo-class-property-mutation"
+    })).rejects.toThrow("E_CATALOG_MUTATION");
+    expect(rpcLog).not.toContain(`scope:${roomScope}/net/submit`);
+
+    const runtimeRequest = (key: string, verb: string) => ({
+      call: { ...bump(key), verb },
+      planningScope: roomScope,
+      catalog_epoch: EPOCH,
+      idempotency_key: key
+    });
+    const runtimeCreated = await call<TurnBody>(
+      gateway,
+      gatewayEnv,
+      "/turn",
+      runtimeRequest("topo-runtime-create", "install_runtime_verb")
+    );
+    expect(runtimeCreated.reply.status).toBe("accepted");
+    expect(runtimeCreated.reply.status === "accepted" && runtimeCreated.reply.touched)
+      .toContain("verb_bytecode:topo_box:runtime_value");
+    const runtimeValue = await call<TurnBody>(
+      gateway,
+      gatewayEnv,
+      "/turn",
+      runtimeRequest("topo-runtime-value", "runtime_value")
+    );
+    expect(runtimeValue.result).toBe(2);
+
+    const runtimeRenamed = await call<TurnBody>(
+      gateway,
+      gatewayEnv,
+      "/turn",
+      runtimeRequest("topo-runtime-rename", "rename_runtime_verb")
+    );
+    expect(runtimeRenamed.reply.status).toBe("accepted");
+    if (runtimeRenamed.reply.status === "accepted") {
+      expect(runtimeRenamed.reply.touched).toEqual(expect.arrayContaining([
+        "verb_bytecode:topo_box:runtime_value",
+        "verb_bytecode:topo_box:runtime_renamed"
+      ]));
+    }
+    const renamedValue = await call<TurnBody>(
+      gateway,
+      gatewayEnv,
+      "/turn",
+      runtimeRequest("topo-runtime-renamed-value", "runtime_renamed")
+    );
+    expect(renamedValue.result).toBe(2);
+
+    const runtimeDeleted = await call<TurnBody>(
+      gateway,
+      gatewayEnv,
+      "/turn",
+      runtimeRequest("topo-runtime-delete", "delete_runtime_verb")
+    );
+    expect(runtimeDeleted.reply.status).toBe("accepted");
+    expect(runtimeDeleted.reply.status === "accepted" && runtimeDeleted.reply.touched)
+      .toContain("verb_bytecode:topo_box:runtime_renamed");
+
+    const propertyCreated = await call<TurnBody>(
+      gateway,
+      gatewayEnv,
+      "/turn",
+      runtimeRequest("topo-property-create", "install_runtime_property")
+    );
+    expect(propertyCreated.result).toBe(7);
+    expect(propertyCreated.reply.status === "accepted" && propertyCreated.reply.touched)
+      .toContain("property_cell:topo_box:runtime_property");
+    const propertyUpdated = await call<TurnBody>(
+      gateway,
+      gatewayEnv,
+      "/turn",
+      runtimeRequest("topo-property-info", "update_runtime_property_info")
+    );
+    expect(propertyUpdated.result).toMatchObject({ perms: "r", type_hint: "int" });
+    expect(propertyUpdated.reply.status === "accepted" && propertyUpdated.reply.touched)
+      .toContain("property_cell:topo_box:runtime_property");
+    const propertyDeleted = await call<TurnBody>(
+      gateway,
+      gatewayEnv,
+      "/turn",
+      runtimeRequest("topo-property-delete", "delete_runtime_property")
+    );
+    expect(propertyDeleted.reply.status).toBe("accepted");
+    expect(propertyDeleted.reply.status === "accepted" && propertyDeleted.reply.touched)
+      .toContain("property_cell:topo_box:runtime_property");
+    const propertyClosure = await call<{ cells: unknown[] }>(
+      scopeDOs.get(roomScope) as NetScopeDO,
+      scopeEnv,
+      "/closure",
+      { keys: ["property_cell:topo_box:runtime_property"], known: ["object_lineage:topo_box"] }
+    );
+    expect(propertyClosure.cells).toEqual([]);
+
+    rpcLog.length = 0;
+    catalogAttestKeys.length = 0;
     const turn1 = await call<TurnBody>(gateway, gatewayEnv, "/turn", turnRequest("topo-t1"));
     expect(turn1.reply.status, JSON.stringify(turn1.reply)).toBe("accepted");
     expect(turn1.attempt).toBe(1);
@@ -219,9 +502,11 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
     expect(turn1.result).toBe(1);
     expect(turn1.observations?.map((o) => o.type)).toContain("bumped");
     expect(turn1.replayed).toBeUndefined();
-    // Foreign reads attested at their derived owners over real RPC: the
-    // class chain at the catalog scope, the actor's cells at the cluster.
-    expect(rpcLog).toContain(`scope:${CATALOG_SCOPE}/net/attest`);
+    // The class-chain read is served by the exact-epoch cache populated by
+    // the peeks, but topo_config is an arbitrary catalog-owned object and
+    // therefore still attests live. Mutable actor cells do the same.
+    expect(rpcLog.filter((entry) => entry === `scope:${CATALOG_SCOPE}/net/attest`)).toHaveLength(1);
+    expect(catalogAttestKeys[0]).toContain("property_cell:topo_config:bonus");
     expect(rpcLog).toContain(`scope:${clusterScope}/net/attest`);
     // The submit went to the room by the `scope:<scopeName>` convention.
     expect(rpcLog).toContain(`scope:${roomScope}/net/submit`);
@@ -244,11 +529,15 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
     // ---- Second turn stays warm: install-on-accept refreshed the room
     // cells and the adopted rider version matches the view's copy, so the
     // fresh attestation agrees and no repair round fires.
+    rpcLog.length = 0;
+    catalogAttestKeys.length = 0;
     const turn2 = await call<TurnBody>(gateway, gatewayEnv, "/turn", turnRequest("topo-t2"));
     expect(turn2.reply.status, JSON.stringify(turn2.reply)).toBe("accepted");
     expect(turn2.attempt).toBe(1);
     expect(turn2.selection).toEqual({ scope: roomScope, riders: [clusterScope] });
     expect(turn2.result).toBe(2);
+    expect(rpcLog.filter((entry) => entry === `scope:${CATALOG_SCOPE}/net/attest`)).toHaveLength(1);
+    expect(catalogAttestKeys[0]).toContain("property_cell:topo_config:bonus");
 
     // Phase-4 item 1, idempotent replay: resubmitting turn 1's key returns
     // the scope's RECORDED reply (CO2.5). The world moved on (counter is
@@ -280,7 +569,91 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
     });
     expect(greeted.cells[0]?.value).toMatchObject({ value: 2 });
 
+    // A truncated multi-key authority response fails without publishing a
+    // partial cache. The next attempt must request the complete same class
+    // batch again, then succeeds from the unmodified authority response.
+    const truncatedKeys: string[][] = [];
+    const truncatedGatewayState = netState("gateway-topology-truncated-attest");
+    const truncatedGatewayEnv: NetGatewayEnv = {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_RESOLVE: (destination) => {
+        const scope = destination.startsWith("scope:") ? destination.slice("scope:".length) : null;
+        const instance = scope !== null ? scopeDOs.get(scope) : undefined;
+        if (!instance) throw new Error(`unexpected truncated-gateway destination ${destination}`);
+        return {
+          fetch: async (request: Request) => {
+            const path = new URL(request.url).pathname;
+            if (destination !== `scope:${CATALOG_SCOPE}` || path !== "/net/attest") {
+              return await instance.fetch(request);
+            }
+            const requestBody = await request.clone().json() as { keys?: string[] };
+            truncatedKeys.push([...(requestBody.keys ?? [])]);
+            const response = await instance.fetch(request);
+            if (truncatedKeys.length !== 1) return response;
+            const body = await response.json() as { cells?: unknown[] } & Record<string, unknown>;
+            return new Response(JSON.stringify({ ...body, cells: (body.cells ?? []).slice(0, -1) }), {
+              status: response.status,
+              headers: { "content-type": "application/json" }
+            });
+          }
+        };
+      }
+    };
+    const truncatedGateway = new NetGatewayDO(truncatedGatewayState.state, truncatedGatewayEnv);
+    for (const scope of [roomScope, clusterScope, CATALOG_SCOPE]) {
+      await call(truncatedGateway, truncatedGatewayEnv, "/pull", { scope, destination: `scope:${scope}` });
+    }
+    await expect(call<TurnBody>(truncatedGateway, truncatedGatewayEnv, "/turn", peekRequest("topo-truncated-1")))
+      .rejects.toThrow("catalog attestation omitted");
+    const recovered = await call<TurnBody>(
+      truncatedGateway,
+      truncatedGatewayEnv,
+      "/turn",
+      peekRequest("topo-truncated-2")
+    );
+    expect(recovered.reply.status).toBe("accepted");
+    expect(truncatedKeys).toHaveLength(2);
+    expect(truncatedKeys[0]?.length).toBeGreaterThan(1);
+    expect(truncatedKeys[1]).toEqual(truncatedKeys[0]);
+
+    // A mismatched authority epoch fails closed and does not poison a fresh
+    // gateway's cache: both attempts must reach the catalog owner and fail.
+    const badRpcLog: string[] = [];
+    const badGatewayState = netState("gateway-topology-wrong-epoch");
+    const badGatewayEnv: NetGatewayEnv = {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_RESOLVE: (destination) => {
+        const scope = destination.startsWith("scope:") ? destination.slice("scope:".length) : null;
+        const instance = scope !== null ? scopeDOs.get(scope) : undefined;
+        if (!instance) throw new Error(`unexpected bad-gateway destination ${destination}`);
+        return {
+          fetch: async (request: Request) => {
+            const path = new URL(request.url).pathname;
+            badRpcLog.push(`${destination}${path}`);
+            const response = await instance.fetch(request);
+            if (destination !== `scope:${CATALOG_SCOPE}` || path !== "/net/attest") return response;
+            const body = await response.json() as Record<string, unknown>;
+            return new Response(JSON.stringify({ ...body, catalog_epoch: "wrong-epoch" }), {
+              status: response.status,
+              headers: { "content-type": "application/json" }
+            });
+          }
+        };
+      }
+    };
+    const badGateway = new NetGatewayDO(badGatewayState.state, badGatewayEnv);
+    for (const scope of [roomScope, clusterScope, CATALOG_SCOPE]) {
+      await call(badGateway, badGatewayEnv, "/pull", { scope, destination: `scope:${scope}` });
+    }
+    await expect(call<TurnBody>(badGateway, badGatewayEnv, "/turn", peekRequest("topo-bad-1")))
+      .rejects.toThrow("E_EPOCH_MISMATCH");
+    await expect(call<TurnBody>(badGateway, badGatewayEnv, "/turn", peekRequest("topo-bad-2")))
+      .rejects.toThrow("E_EPOCH_MISMATCH");
+    expect(badRpcLog.filter((entry) => entry === `scope:${CATALOG_SCOPE}/net/attest`)).toHaveLength(2);
+
     for (const st of doStates.values()) st.close();
+    badGatewayState.close();
+    truncatedGatewayState.close();
     gatewayState.close();
   });
 });

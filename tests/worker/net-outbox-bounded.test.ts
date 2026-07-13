@@ -337,6 +337,11 @@ describe("Phase 3 — bounded scheduled bursts", () => {
   });
 
   it("a due burst dispatches in bounded batches with an immediate re-arm; every turn reaches the planner exactly once", async () => {
+    // Keep scheduling time deterministic. Serially inserting the full burst
+    // can exceed a short real-time deadline under full-suite CPU contention,
+    // which correctly makes /schedule reject the last rows as non-future.
+    let logicalNow = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => logicalNow);
     const planner = okStub();
     const scope = netState("bounded-burst");
     const env: NetScopeEnv = {
@@ -353,7 +358,7 @@ describe("Phase 3 — bounded scheduled bursts", () => {
     for (let i = 0; i < BURST; i++) {
       await call(scopeDO, env, "/schedule", { scope: SCOPE, catalog_epoch: EPOCH, turn: tick(`burst-${String(i).padStart(3, "0")}`, dueAt + (i % 7)) });
     }
-    await sleep(60);
+    logicalNow = dueAt + 10;
 
     // First firing: at most one batch (32) leaves the scheduled family;
     // the leftover due turns arm an immediate wake.

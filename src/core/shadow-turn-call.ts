@@ -73,6 +73,11 @@ export type ShadowTurnCallOptions = {
   /** Net's sparse planner must fail rather than derive a partial roster from
    * whichever session rows happened to materialize on this executor. */
   require_room_roster_projection?: boolean;
+  /** Net commits recorded cells rather than the ephemeral WooWorld. Enable
+   * recorder events for runtime verb/property-definition authoring; legacy v2
+   * execution keeps its existing materialization path until that stack is
+   * removed. */
+  record_authoring_cell_writes?: boolean;
 };
 
 // The VM-execution boundary. Accepts ONLY a `PlanningWorld` — a SerializedWorld
@@ -89,6 +94,7 @@ export async function runShadowTurnCall(
   const built = createWorldFromSerialized(world, { persist: false });
   for (const roster of options.room_rosters ?? []) built.installRoomRosterProjection(roster.room, roster.rows);
   if (options.require_room_roster_projection) built.setRequireRoomRosterProjection(true);
+  if (options.record_authoring_cell_writes) built.setRecordAuthoringCellWrites(true);
   built.setMetricsHook(options.onMetric ?? null);
   if (options.planning_cell_provenance) built.setPlanningCellProvenance(options.planning_cell_provenance);
   if (options.enforce_movement_owner_repair) built.setEnforceMovementOwnerRepair(true);
@@ -107,6 +113,7 @@ export async function runShadowTurnCallTranscript(
   const built = createWorldFromSerialized(world, { persist: false });
   for (const roster of options.room_rosters ?? []) built.installRoomRosterProjection(roster.room, roster.rows);
   if (options.require_room_roster_projection) built.setRequireRoomRosterProjection(true);
+  if (options.record_authoring_cell_writes) built.setRecordAuthoringCellWrites(true);
   if (options.onMetric) built.setMetricsHook(options.onMetric);
   if (options.planning_cell_provenance) built.setPlanningCellProvenance(options.planning_cell_provenance);
   if (options.enforce_movement_owner_repair) built.setEnforceMovementOwnerRepair(true);

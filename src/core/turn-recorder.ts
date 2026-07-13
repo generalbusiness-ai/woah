@@ -10,7 +10,7 @@ export type RecordedCell =
   | { kind: "contents"; object: ObjRef }
   | { kind: "lifecycle"; object: ObjRef };
 
-export type RecordedCellWriteOp = "set" | "create" | "move" | "add" | "remove" | "replace";
+export type RecordedCellWriteOp = "set" | "create" | "move" | "add" | "remove" | "replace" | "delete";
 export type RecordedProjectionWrite = Extract<ProjectionWrite, { table: "snapshots" | "parked_tasks" | "tombstones" | "counters" }>;
 
 // Authority is captured at the VM-frame boundary so commit validation can

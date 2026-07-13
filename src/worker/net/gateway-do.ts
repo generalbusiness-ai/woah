@@ -451,6 +451,20 @@ function clampClientTtl(raw: unknown): number {
 
 type GuestClaim = { id: string; issuedAt: number };
 
+type CatalogAttestationCache = {
+  ownerHead: ScopeHead | null;
+  versions: Map<string, string>;
+  /** One authority batch per gateway at a time. Other turn lanes await the
+   * same owner read, then request only keys that batch did not cover. */
+  inFlight: Promise<void> | null;
+};
+
+type CatalogAttestationReply = {
+  catalog_epoch?: string;
+  owner_head: ScopeHead;
+  cells: Array<{ key: string; version: string }>;
+};
+
 /** Parse the public guest idempotency bearer. Its timestamp freezes the mint
  * expiry across retries; UUID randomness makes guessing it equivalent to
  * guessing the resulting session bearer. */
@@ -838,6 +852,10 @@ export class NetGatewayDO {
    * settle). This bounds the isolate's total in-flight queued turns. */
   private turnQueueTotal = 0;
   private static readonly MAX_TURN_QUEUE_TOTAL = 256;
+  /** CO2.3/CO15: proven class-definition cells are immutable within one
+   * catalog epoch. Keep their owner-attested versions in memory so a hot shard
+   * does not synchronously hit the singleton catalog DO on every turn. */
+  private readonly catalogAttestationCaches = new Map<string, CatalogAttestationCache>();
 
   private turnQueueWaitMs(): number {
     const configured = Number(this.env.NET_TURN_QUEUE_WAIT_MS);
@@ -1149,6 +1167,7 @@ export class NetGatewayDO {
       // resubmit branch reuses the prior plan's, already the settling one).
       structure.plan_cells = planned.planCells;
       structure.snapshot_cells = planned.snapshotCells;
+      this.assertNoCatalogClassMutation(planned, view, classifier);
 
       // Selection pinning (fix 5c): the FIRST submit for this key pins
       // its scope durably BEFORE the rpc leaves. Any later round (or a
@@ -1192,7 +1211,7 @@ export class NetGatewayDO {
       // mismatch repair — which refreshes the mismatched cells from
       // their owners (refreshCells routes by the classifier) and
       // re-plans — automatically re-attests the affected owners too.
-      const attestations = await this.attestForeignReads(request, classifier, planned, targetScope, structure);
+      const attestations = await this.attestForeignReads(request, classifier, planned, view, targetScope, structure);
       const submit: CommitSubmit = {
         ...planned.submit,
         base,
@@ -3480,6 +3499,214 @@ export class NetGatewayDO {
     }
   }
 
+  private catalogAttestationCache(epoch: string): CatalogAttestationCache {
+    let cache = this.catalogAttestationCaches.get(epoch);
+    if (!cache) {
+      cache = { ownerHead: null, versions: new Map(), inFlight: null };
+      this.catalogAttestationCaches.set(epoch, cache);
+    }
+    // Catalog upgrades are rare. Retain an older entry only while one of its
+    // turns is still awaiting the authority; the next epoch's request cleans
+    // it up without invalidating that in-flight reader.
+    for (const [cachedEpoch, candidate] of this.catalogAttestationCaches) {
+      if (cachedEpoch !== epoch && candidate.inFlight === null) this.catalogAttestationCaches.delete(cachedEpoch);
+    }
+    return cache;
+  }
+
+  private missingCatalogAttestations(cache: CatalogAttestationCache, keys: ReadonlySet<string>): string[] {
+    return [...keys].filter((key) => !cache.versions.has(key)).sort();
+  }
+
+  /** Reserve one catalog-owner read without issuing it yet, so the caller can
+   * group the real RPC with mutable-owner attestations. A concurrent turn sees
+   * `inFlight` synchronously and awaits the same batch instead of amplifying a
+   * hot burst against the singleton catalog scope. */
+  private reserveCatalogAttestation(
+    request: TurnRequest,
+    keys: ReadonlySet<string>
+  ): {
+    cache: CatalogAttestationCache;
+    wait: Promise<void> | null;
+    action: (() => Promise<void>) | null;
+    cancelIfNotStarted: (error: unknown) => void;
+  } {
+    const cache = this.catalogAttestationCache(request.catalog_epoch);
+    const missing = this.missingCatalogAttestations(cache, keys);
+    const noCancel = (_error: unknown): void => {};
+    if (missing.length === 0) return { cache, wait: null, action: null, cancelIfNotStarted: noCancel };
+    if (cache.inFlight) return { cache, wait: cache.inFlight, action: null, cancelIfNotStarted: noCancel };
+
+    let resolveWait!: () => void;
+    let rejectWait!: (error: unknown) => void;
+    const wait = new Promise<void>((resolve, reject) => {
+      resolveWait = resolve;
+      rejectWait = reject;
+    });
+    // The leader's rpcGroup observes the action rejection. This handler keeps
+    // the coordination promise from becoming an unhandled rejection when no
+    // follower happened to await it.
+    void wait.catch(() => undefined);
+    cache.inFlight = wait;
+    let started = false;
+
+    const action = async (): Promise<void> => {
+      started = true;
+      try {
+        const reply = await this.host.rpc(
+          this.destinationFor(request, CATALOG_SCOPE),
+          "/attest",
+          { keys: missing }
+        ) as CatalogAttestationReply;
+        if (reply.catalog_epoch !== request.catalog_epoch) {
+          throw netError(
+            "E_EPOCH_MISMATCH",
+            "catalog attestation authority epoch differs from the turn epoch",
+            {
+              scope: CATALOG_SCOPE,
+              turn_epoch: request.catalog_epoch,
+              scope_epoch: reply.catalog_epoch ?? null
+            }
+          );
+        }
+        const received = new Map<string, string>();
+        for (const cell of reply.cells ?? []) {
+          if (typeof cell?.key !== "string" || typeof cell.version !== "string") {
+            throw new Error("catalog attestation returned a malformed cell version");
+          }
+          received.set(cell.key, cell.version);
+        }
+        // Validate the complete batch before publishing any key. A truncated
+        // authority response must not leave a partially warm cache behind.
+        for (const key of missing) {
+          if (!received.has(key)) throw new Error(`catalog attestation omitted ${key}`);
+        }
+        for (const key of missing) cache.versions.set(key, received.get(key) as string);
+        cache.ownerHead = reply.owner_head;
+        resolveWait();
+      } catch (err) {
+        rejectWait(err);
+        throw err;
+      } finally {
+        if (cache.inFlight === wait) cache.inFlight = null;
+      }
+    };
+    const cancelIfNotStarted = (error: unknown): void => {
+      if (started || cache.inFlight !== wait) return;
+      cache.inFlight = null;
+      rejectWait(error);
+    };
+    return { cache, wait, action, cancelIfNotStarted };
+  }
+
+  private cachedCatalogAttestation(
+    cache: CatalogAttestationCache,
+    keys: ReadonlySet<string>
+  ): NonNullable<CommitSubmit["attestations"]>[string] {
+    if (cache.ownerHead === null) throw new Error("catalog attestation cache has no owner head");
+    return {
+      owner_head: cache.ownerHead,
+      cells: [...keys].sort().map((key) => {
+        const version = cache.versions.get(key);
+        if (version === undefined) throw new Error(`catalog attestation cache omitted ${key}`);
+        return { key, version };
+      })
+    };
+  }
+
+  /**
+   * Catalog ownership is broader than catalog-code immutability: it also
+   * contains compatibility identities and any still-anchorless object. Cache
+   * only cells on objects that this turn's lineage closure proves are classes.
+   * A parent reference is the object model's class witness; deriving the set
+   * from the bounded read closure keeps the hot path O(read-set), not O(view).
+   */
+  private epochImmutableCatalogKeys(planned: PlanTurnResult, view: CellStore): Set<string> {
+    const readObjects = new Set(planned.transcript.reads.map((read) => read.cell.object));
+    const classObjects = new Set<string>();
+    const roots = new Set([
+      ...readObjects,
+      planned.transcript.call.actor,
+      planned.transcript.call.target
+    ]);
+    // Verb execution records the resolved page (`$thing:verb`) but need not
+    // record the receiver's lineage as a transcript read. Start from the call
+    // endpoints as well, then walk their bounded parent chains.
+    for (const root of roots) {
+      const walked = new Set<string>();
+      let object: string | null = root;
+      while (object !== null && !walked.has(object)) {
+        walked.add(object);
+        const lineage = view.get(cellKey("object_lineage", object))?.value as AnchorLineage | undefined;
+        const parent = typeof lineage?.parent === "string" && lineage.parent.length > 0
+          ? lineage.parent
+          : null;
+        if (parent !== null) classObjects.add(parent);
+        object = parent;
+      }
+    }
+
+    const immutable = new Set<string>();
+    for (const read of planned.transcript.reads) {
+      if (!classObjects.has(read.cell.object)) continue;
+      const key = netCellKeyFor(read.cell);
+      if (key === null) continue;
+      // Class liveness/location is not dispatch metadata and sessions are
+      // mutable authority. The epoch contract covers only these three class
+      // definition cell families.
+      if (
+        key.startsWith("object_lineage:") ||
+        key.startsWith("property_cell:") ||
+        key.startsWith("verb_bytecode:")
+      ) {
+        immutable.add(key);
+      }
+    }
+    return immutable;
+  }
+
+  /**
+   * CO15's cache premise is also an authoring boundary: once an object is a
+   * class in the installed catalog graph, ordinary turns cannot mutate its
+   * lineage, property definitions/defaults, or bytecode under the same epoch.
+   * Refuse before selection pinning or submission, including mixed turns whose
+   * class write would otherwise ride along from a room commit.
+   */
+  private assertNoCatalogClassMutation(
+    planned: PlanTurnResult,
+    view: CellStore,
+    classifier: ScopeClassifier
+  ): void {
+    const candidates = new Map<string, string[]>();
+    for (const write of planned.transcript.writes) {
+      if (write.cell.kind !== "lifecycle" && write.cell.kind !== "prop" && write.cell.kind !== "verb") continue;
+      if (classifier.scopeOf(write.cell.object) !== CATALOG_SCOPE) continue;
+      const key = netCellKeyFor(write.cell);
+      if (key === null) continue;
+      const keys = candidates.get(write.cell.object) ?? [];
+      keys.push(key);
+      candidates.set(write.cell.object, keys);
+    }
+    if (candidates.size === 0) return;
+
+    const classes = new Set<string>();
+    for (const key of view.keys()) {
+      if (!key.startsWith("object_lineage:")) continue;
+      const lineage = view.get(key)?.value as { parent?: unknown } | undefined;
+      if (typeof lineage?.parent === "string" && candidates.has(lineage.parent)) classes.add(lineage.parent);
+    }
+    const blocked = [...classes].sort();
+    if (blocked.length === 0) return;
+    throw netError(
+      "E_CATALOG_MUTATION",
+      "ordinary turns cannot mutate installed catalog class definitions",
+      {
+        objects: blocked,
+        keys: blocked.flatMap((object) => candidates.get(object) ?? []).sort()
+      }
+    );
+  }
+
   /**
    * Owner attestations for the planned transcript's foreign reads
    * (CO2.3 rider integrity, rule 1). Partition the reads by owning scope
@@ -3491,12 +3718,18 @@ export class NetGatewayDO {
    * read is local to the committing scope (the warm single-scope case
    * adds no RPC). Under the derived classifier, class-chain reads anchor
    * to the catalog scope, so a cross-class turn attests against the
-   * catalog sequencer like any other owner (CO15).
+   * catalog sequencer like any other owner (CO15). Proven class-definition
+   * cells are the one exception to per-turn owner IO: CO15 makes them
+   * immutable within `catalog_epoch`, so this gateway coalesces the first
+   * owner read and reuses its exact versions under that epoch. Catalog-owned
+   * identity, session, and compatibility-instance cells stay live like every
+   * other mutable owner.
    */
   private async attestForeignReads(
     request: TurnRequest,
     classifier: ScopeClassifier,
     planned: PlanTurnResult,
+    view: CellStore,
     targetScope: string,
     structure?: TurnStructure
   ): Promise<CommitSubmit["attestations"]> {
@@ -3518,21 +3751,82 @@ export class NetGatewayDO {
       byOwner.set(owner, keys);
     }
     if (byOwner.size === 0) return undefined;
-    // NC8b: independent owners attest in PARALLEL — one depth step, K
-    // RPCs. Owners are disjoint sequencers; nothing orders these reads.
+    // NC8b: independent mutable owners attest in PARALLEL. A catalog miss
+    // joins the same group; a catalog hit adds no RPC. Concurrent misses on
+    // this gateway await the leader's reserved batch.
+    const catalogKeys = byOwner.get(CATALOG_SCOPE);
+    const immutableCatalogKeys = new Set<string>();
+    if (catalogKeys) {
+      const eligible = this.epochImmutableCatalogKeys(planned, view);
+      for (const key of catalogKeys) {
+        if (eligible.has(key)) immutableCatalogKeys.add(key);
+      }
+      const mutableCatalogKeys = new Set([...catalogKeys].filter((key) => !immutableCatalogKeys.has(key)));
+      if (mutableCatalogKeys.size > 0) byOwner.set(CATALOG_SCOPE, mutableCatalogKeys);
+      else byOwner.delete(CATALOG_SCOPE);
+    }
     const owners = [...byOwner.entries()];
-    const attest = (owner: string, keys: Set<string>) =>
-      this.host.rpc(this.destinationFor(request, owner), "/attest", { keys: [...keys].sort() }) as Promise<{
+    const attest = async (owner: string, keys: Set<string>) => {
+      const reply = await this.host.rpc(this.destinationFor(request, owner), "/attest", { keys: [...keys].sort() }) as {
+        catalog_epoch?: string;
         owner_head: ScopeHead;
         cells: Array<{ key: string; version: string }>;
-      }>;
-    const replies = structure
-      ? await structure.rpcGroup(owners.map(([owner, keys]) => () => attest(owner, keys)), { phase: "attest" })
-      : await Promise.all(owners.map(([owner, keys]) => attest(owner, keys)));
+      };
+      // Catalog compatibility cells are deliberately not cached, but their
+      // authority must still agree with the turn epoch before its versions
+      // can validate a read.
+      if (owner === CATALOG_SCOPE && reply.catalog_epoch !== request.catalog_epoch) {
+        throw netError("E_EPOCH_MISMATCH", "catalog attestation authority epoch differs from the turn epoch", {
+          scope: CATALOG_SCOPE,
+          turn_epoch: request.catalog_epoch,
+          scope_epoch: reply.catalog_epoch ?? null
+        });
+      }
+      return reply;
+    };
+    const actions: Array<() => Promise<unknown>> = owners.map(([owner, keys]) => () => attest(owner, keys));
+    const reserved = immutableCatalogKeys.size > 0
+      ? this.reserveCatalogAttestation(request, immutableCatalogKeys)
+      : null;
+    if (reserved?.action) actions.push(reserved.action);
+    const group = structure
+      ? structure.rpcGroup(actions, { phase: "attest" })
+      : Promise.all(actions.map((action) => action()));
+    let replies: unknown[];
+    try {
+      [replies] = await Promise.all([
+        group,
+        Promise.all(reserved?.wait && !reserved.action ? [reserved.wait] : [])
+      ]);
+    } catch (err) {
+      reserved?.cancelIfNotStarted(err);
+      throw err;
+    }
     const attestations: NonNullable<CommitSubmit["attestations"]> = {};
     owners.forEach(([owner], index) => {
-      attestations[owner] = { owner_head: replies[index].owner_head, cells: replies[index].cells };
+      const reply = replies[index] as { owner_head: ScopeHead; cells: Array<{ key: string; version: string }> };
+      attestations[owner] = { owner_head: reply.owner_head, cells: reply.cells };
     });
+    if (immutableCatalogKeys.size > 0) {
+      // A follower may need keys outside the leader's batch. Loop until all
+      // are covered; normally this is zero iterations because burst turns of
+      // one verb share the same class closure.
+      let cache = reserved?.cache ?? this.catalogAttestationCache(request.catalog_epoch);
+      while (this.missingCatalogAttestations(cache, immutableCatalogKeys).length > 0) {
+        const followup = this.reserveCatalogAttestation(request, immutableCatalogKeys);
+        cache = followup.cache;
+        if (followup.action) {
+          await timedRpc(structure, followup.action, { phase: "attest_catalog" });
+        } else if (followup.wait) {
+          await followup.wait;
+        }
+      }
+      const cached = this.cachedCatalogAttestation(cache, immutableCatalogKeys);
+      const live = attestations[CATALOG_SCOPE];
+      attestations[CATALOG_SCOPE] = live
+        ? { owner_head: live.owner_head, cells: [...live.cells, ...cached.cells] }
+        : cached;
+    }
     return attestations;
   }
 

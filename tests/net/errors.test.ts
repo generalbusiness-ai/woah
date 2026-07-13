@@ -16,6 +16,7 @@ const ALL_CODES: NetErrorCode[] = [
   "E_MISSING_STATE",
   "E_READ_VERSION",
   "E_SCOPE_SPLIT",
+  "E_CATALOG_MUTATION",
   "E_LINEAGE",
   "E_BUDGET",
   "E_RPC_TIMEOUT",
@@ -38,6 +39,7 @@ describe("net divergence taxonomy (CO6)", () => {
     expect(retryable.sort()).toEqual(["E_MISSING_STATE", "E_READ_VERSION", "E_STALE_EPOCH", "E_STALE_HEAD"]);
     // Terminal + informational codes are not retryable turn mechanics.
     expect(isRetryable(netError("E_SCOPE_SPLIT", "x"))).toBe(false);
+    expect(isRetryable(netError("E_CATALOG_MUTATION", "x"))).toBe(false);
     expect(isRetryable(netError("E_BUDGET", "x"))).toBe(false);
     expect(isRetryable(netError("E_RPC_TIMEOUT", "x"))).toBe(false);
     expect(isRetryable(netError("E_LINEAGE", "x"))).toBe(false);

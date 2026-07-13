@@ -320,3 +320,27 @@ zero-timeout policy, so the accepted initial baseline is the paced envelope,
 not unlimited burst admission. The shell lacks `CF_ANALYTICS_TOKEN`; the
 non-sampled AE internal-wall/queue re-evaluation could not be run and remains
 an explicit owner gate rather than an inferred pass.
+
+The local follow-up removes the class-definition half of that measured
+catalog contention without weakening CO2.3. Class lineage, property
+definitions/defaults, and verb bytecode change only with a `catalog_epoch`
+bump (CO15), so each gateway now coalesces its first `/attest` miss and caches
+exact owner-returned versions under that epoch. Arbitrary catalog objects,
+identity/session cells, and every other mutable foreign owner are still
+attested on every turn; a catalog authority epoch mismatch fails closed
+without populating the cache. The three-scope topology lane forces two
+concurrent class readers to overlap and proves one catalog RPC versus two live
+cluster RPCs, then proves an anchorless catalog config is attested on every
+turn. The 595/600 result remains the last deployed evidence until a fresh
+canary rerun; the room `/head` half of that burst ceiling is intentionally
+unchanged.
+
+Review of the first cache draft found a separate correctness hole in runtime
+authoring: `add_verb`/`set_verb_code` and property-definition builtins mutated
+only the planner's ephemeral `WooWorld`, so a net turn could report success
+with no durable write. Net planning now records complete verb and property
+definition cells (including rename/delete), while v2 keeps its existing
+materialization path. User-owned, non-catalog authoring round-trips through the
+real gateway/scope lane. Installed catalog class edits refuse before submit
+with `E_CATALOG_MUTATION`; publishing those definitions remains an install
+operation that advances `catalog_epoch`.

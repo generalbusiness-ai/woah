@@ -31,6 +31,10 @@ that gates freezing/removing the v2 legacy implementations.
 - Cell reads (e.g. live location `object_live:<actor>`) → `/net-api/cell`.
 - Session mint / login / logout → `/net-api/{guest,login,session}` + DELETE.
 - Relation reads → `/net-api/relation`.
+- Runtime verb and property-definition authoring on user-owned, non-catalog
+  objects → the normal `/net-api/turn` transcript and scope commit path. Add,
+  update/rename, and delete are durable; installed catalog class edits refuse
+  with `E_CATALOG_MUTATION` because catalog publication must advance the epoch.
 
 **GATES v2 REMOVAL — no net equivalent; a caller depends on it (must migrate
 or be explicitly retired before freeze):**
@@ -46,7 +50,9 @@ or be explicitly retired before freeze):**
 4. **Operator surfaces** — `/api/tap/{install,update}`, `/api/taps` (catalog
    management), `/api/admin/{refresh-host-seeds,force-rebuild-host,
    repair-derived-contents,purge-inactive-guests}`. No net equivalents;
-   DEPLOY.md documents them as the maintenance path.
+   DEPLOY.md documents them as the maintenance path. Runtime programmer
+   builtins are not a substitute for catalog publishing: net deliberately
+   refuses class-definition mutation under an unchanged `catalog_epoch`.
 5. **Sequenced `/log` replay** — `/api/objects/:id/log` (`protocol.ts:299`),
    durable backfill. `/net/pull`/`/net/head` are *internal* `/net/*`, not a
    client `/net-api/*` contract.

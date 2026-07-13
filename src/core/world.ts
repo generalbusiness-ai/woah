@@ -613,6 +613,9 @@ export class WooWorld {
   // sparse by construction, so a local fallback would be a plausible-looking
   // partial roster rather than a safe degradation.
   private requireRoomRosterProjection = false;
+  /** Net planning commits recorder cells rather than this ephemeral graph.
+   * Keep authoring recording opt-in so the frozen v2 materializer is unchanged. */
+  private recordAuthoringCellWrites = false;
 
   constructor(private repository?: WooRepository, options: { executorContext?: ExecutorContext | null; turnRecorder?: TurnRecorder | null } = {}) {
     this.objectRepository = isObjectRepository(repository) ? repository : null;
@@ -631,6 +634,10 @@ export class WooWorld {
 
   setRequireRoomRosterProjection(required: boolean): void {
     this.requireRoomRosterProjection = required;
+  }
+
+  setRecordAuthoringCellWrites(enabled: boolean): void {
+    this.recordAuthoringCellWrites = enabled;
   }
 
   roomRosterProjection(room: ObjRef): WooValue[] {
@@ -838,6 +845,83 @@ export class WooWorld {
 
   private recordTurnEvent(event: TurnRecorderEvent): void {
     this.activeTurnRecorder?.event(this.recordedEventWithWriter(event));
+  }
+
+  /** Record one verb page in the same line-map-free shape bridge.ts stores in
+   * `verb_bytecode`. Reads provide optimistic conflict detection; writes make
+   * the net planner's ephemeral authoring mutation durable. */
+  private recordAuthoredVerbRead(objRef: ObjRef, verb: VerbDef): void {
+    if (!this.recordAuthoringCellWrites) return;
+    const { line_map: _lineMap, ...page } = this.cloneVerbSharingBytecode(verb);
+    this.recordTurnEvent({
+      kind: "cell_read",
+      cell: { kind: "verb", object: objRef, name: verb.name },
+      value: page as unknown as WooValue,
+      version: String(verb.version)
+    });
+  }
+
+  private recordAuthoredVerbAbsence(objRef: ObjRef, name: string): void {
+    if (!this.recordAuthoringCellWrites) return;
+    this.recordTurnEvent({
+      kind: "cell_read",
+      cell: { kind: "verb", object: objRef, name },
+      value: null,
+      version: "absent"
+    });
+  }
+
+  private recordAuthoredVerbWrite(objRef: ObjRef, verb: VerbDef | null, name: string): void {
+    if (!this.recordAuthoringCellWrites) return;
+    if (verb === null) {
+      this.recordTurnEvent({
+        kind: "cell_write",
+        cell: { kind: "verb", object: objRef, name },
+        value: null,
+        op: "remove"
+      });
+      return;
+    }
+    const { line_map: _lineMap, ...page } = this.cloneVerbSharingBytecode(verb);
+    this.recordTurnEvent({
+      kind: "cell_write",
+      cell: { kind: "verb", object: objRef, name: verb.name },
+      value: page as unknown as WooValue,
+      op: "set"
+    });
+  }
+
+  /** Full property-definition cells use `replace`/`delete`, distinct from an
+   * ordinary value assignment (`set`) or inherited-value clear (`remove`). */
+  private authoredPropertyCellValue(objRef: ObjRef, name: string): WooValue | null {
+    const object = this.object(objRef);
+    const def = object.propertyDefs.get(name);
+    const hasValue = object.properties.has(name);
+    if (!def && !hasValue) return null;
+    return {
+      ...(hasValue ? { value: cloneValue(object.properties.get(name) as WooValue) } : {}),
+      ...(def ? { def: cloneValue(def as unknown as WooValue) } : {})
+    } as WooValue;
+  }
+
+  private recordAuthoredPropertyRead(objRef: ObjRef, name: string, value: WooValue | null): void {
+    if (!this.recordAuthoringCellWrites) return;
+    this.recordTurnEvent({
+      kind: "cell_read",
+      cell: { kind: "prop", object: objRef, name },
+      value,
+      version: value === null ? "absent" : String(this.object(objRef).propertyVersions.get(name) ?? 0)
+    });
+  }
+
+  private recordAuthoredPropertyWrite(objRef: ObjRef, name: string, value: WooValue | null): void {
+    if (!this.recordAuthoringCellWrites) return;
+    this.recordTurnEvent({
+      kind: "cell_write",
+      cell: { kind: "prop", object: objRef, name },
+      value,
+      op: value === null ? "delete" : "replace"
+    });
   }
 
   // Local bytecode-to-bytecode calls bypass dispatch(), so the VM uses this
@@ -2132,6 +2216,7 @@ export class WooWorld {
     if (this.ownVerbExact(objRef, name)) {
       throw wooError("E_INVARG", `verb already exists: ${objRef}:${name}`, { obj: objRef, name });
     }
+    this.recordAuthoredVerbAbsence(objRef, name);
     const owner = typeof map.owner === "string" ? map.owner : actor;
     if (!this.objects.has(owner)) throw wooError("E_INVARG", `verb owner does not exist: ${owner}`, owner);
     // Verb owner is the verb's execution authority (`progr`). A non-wizard
@@ -2174,6 +2259,7 @@ export class WooWorld {
     };
     this.addVerb(objRef, verb, { append: true });
     const installed = this.ownVerbExact(objRef, name);
+    if (installed) this.recordAuthoredVerbWrite(objRef, installed, name);
     return { slot: installed?.slot ?? 0, version: installed?.version ?? 0 };
   }
 
@@ -2183,9 +2269,11 @@ export class WooWorld {
   deleteVerbForActor(actor: ObjRef, objRef: ObjRef, descriptor: WooValue): void {
     this.assertCanAuthorObject(actor, objRef);
     const verb = this.ownVerbResolve(objRef, descriptor);
+    this.recordAuthoredVerbRead(objRef, verb);
     if (!this.removeVerb(objRef, verb.name)) {
       throw wooError("E_VERBNF", `verb not found: ${objRef}:${verb.name}`, { obj: objRef, verb: verb.name });
     }
+    this.recordAuthoredVerbWrite(objRef, null, verb.name);
   }
 
   // LambdaMOO `set_verb_info(obj, desc, info)`. Updates owner / perms /
@@ -2202,6 +2290,7 @@ export class WooWorld {
     if (!this.isWizard(actor) && current.owner !== actor) {
       throw wooError("E_PERM", `${actor} cannot edit verb ${objRef}:${current.name} owned by ${current.owner}`, { actor, obj: objRef, verb: current.name, owner: current.owner });
     }
+    this.recordAuthoredVerbRead(objRef, current);
     const aliases = Array.isArray(map.aliases) ? map.aliases.map((a) => String(a)) : current.aliases;
     const argSpec = "arg_spec" in map && map.arg_spec && typeof map.arg_spec === "object" && !Array.isArray(map.arg_spec)
       ? (map.arg_spec as Record<string, WooValue>) : current.arg_spec;
@@ -2243,6 +2332,8 @@ export class WooWorld {
       version: current.version + 1
     };
     this.addVerb(objRef, next, { slot: current.slot });
+    if (next.name !== current.name) this.recordAuthoredVerbWrite(objRef, null, current.name);
+    this.recordAuthoredVerbWrite(objRef, next, next.name);
     return { slot: next.slot ?? 0, version: next.version };
   }
 
@@ -2258,6 +2349,7 @@ export class WooWorld {
     if (!this.isWizard(actor) && current.owner !== actor) {
       throw wooError("E_PERM", `${actor} cannot edit verb ${objRef}:${current.name} owned by ${current.owner}`, { actor, obj: objRef, verb: current.name, owner: current.owner });
     }
+    this.recordAuthoredVerbRead(objRef, current);
     const compiled = compileVerb(source);
     if (!compiled.ok || !compiled.bytecode) {
       return compiled.diagnostics.map((d) => d.message ?? d.code ?? "compile error") as unknown as WooValue;
@@ -2287,6 +2379,7 @@ export class WooWorld {
     };
     this.addVerb(objRef, next, { slot: current.slot });
     propagateVerbPurity(this);
+    this.recordAuthoredVerbWrite(objRef, next, next.name);
     return [] as unknown as WooValue;
   }
 
@@ -2306,6 +2399,7 @@ export class WooWorld {
     const owner = typeof map?.owner === "string" ? map.owner : actor;
     const perms = typeof map?.perms === "string" ? map.perms : "rw";
     const typeHint = typeof map?.type_hint === "string" ? map.type_hint : typeHintForValue(value);
+    this.recordAuthoredPropertyRead(objRef, name, this.authoredPropertyCellValue(objRef, name));
     await this.definePropertyChecked(actor, objRef, {
       name,
       defaultValue: value,
@@ -2313,13 +2407,16 @@ export class WooWorld {
       perms,
       typeHint
     });
+    this.recordAuthoredPropertyWrite(objRef, name, this.authoredPropertyCellValue(objRef, name));
   }
 
   // LambdaMOO `delete_property(obj, name)`. Removes a property
   // definition from `objRef`. Permission: wizard, owner of the object,
   // or owner of the property.
   async deletePropertyForActor(actor: ObjRef, objRef: ObjRef, name: string): Promise<void> {
+    this.recordAuthoredPropertyRead(objRef, name, this.authoredPropertyCellValue(objRef, name));
     await this.undefinePropertyChecked(actor, objRef, name);
+    this.recordAuthoredPropertyWrite(objRef, name, this.authoredPropertyCellValue(objRef, name));
   }
 
   // LambdaMOO `set_property_info(obj, name, info)`. Updates owner /
@@ -2328,7 +2425,9 @@ export class WooWorld {
   async setPropertyInfoForActor(actor: ObjRef, objRef: ObjRef, name: string, info: WooValue): Promise<void> {
     const map = info && typeof info === "object" && !Array.isArray(info) ? info as Record<string, WooValue> : null;
     if (!map) throw wooError("E_INVARG", "set_property_info expects info map", info);
+    this.recordAuthoredPropertyRead(objRef, name, this.authoredPropertyCellValue(objRef, name));
     await this.setPropertyInfoChecked(actor, objRef, name, map);
+    this.recordAuthoredPropertyWrite(objRef, name, this.authoredPropertyCellValue(objRef, name));
   }
 
   // LambdaMOO `is_clear_property(obj, name)`. Returns true iff the
