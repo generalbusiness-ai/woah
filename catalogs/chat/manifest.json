@@ -654,6 +654,7 @@
           "perms": "rxd",
           "direct_callable": true,
           "tool_exposed": true,
+          "reads_room_presence": true,
           "arg_spec": {
             "args": [
               "recipient",
@@ -844,6 +845,7 @@
           "perms": "rxd",
           "direct_callable": true,
           "tool_exposed": true,
+          "reads_room_presence": true,
           "arg_spec": {
             "args": [
               "actor?"

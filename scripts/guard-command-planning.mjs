@@ -219,6 +219,43 @@ if (!fallbackVerbs) {
   }
 }
 
+// Room-roster-presence guard. A verb that invokes the compact owner roster
+// (the `room_roster(this)` builtin or a `this:room_roster()` verb call) forces
+// net planning to require the room-roster projection (plan.ts
+// require_room_roster_projection). The gateway seeds that projection ONLY when
+// the DISPATCHED verb declares `reads_room_presence: true`
+// (callReadsRoomPresence resolves the dispatched verb's flag). A DISPATCHABLE
+// verb (direct_callable or tool_exposed) that calls room_roster without the
+// flag therefore hard-fails over the net path with a non-repairable
+// E_INTERNAL "room roster projection missing" — a break invisible to
+// in-process tests. Sub-dispatched internal verbs (not directly dispatchable)
+// are exempt: they run inside a turn whose dispatched verb already seeded the
+// projection.
+for (const entry of readdirSync("catalogs")) {
+  const manifestPath = join("catalogs", entry, "manifest.json");
+  let manifest;
+  try {
+    if (!statSync(manifestPath).isFile()) continue;
+    manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  } catch {
+    continue;
+  }
+  for (const holder of [...(manifest.classes ?? []), ...(manifest.features ?? [])]) {
+    for (const verb of holder.verbs ?? []) {
+      const source = typeof verb?.source === "string" ? verb.source : "";
+      // Strip the `verb :<name>(...)` signature so a verb NAMED room_roster is
+      // not a false positive; check only the body for an invocation.
+      const brace = source.indexOf("{");
+      const body = brace === -1 ? "" : source.slice(brace);
+      if (!/room_roster\s*\(/.test(body)) continue;
+      const dispatchable = verb.direct_callable === true || verb.tool_exposed === true;
+      if (dispatchable && verb.reads_room_presence !== true) {
+        failures.push(`${manifestPath}: verb "${verb.name}" invokes room_roster but is dispatchable without reads_room_presence:true — the gateway will not seed the compact owner roster and the turn hard-fails E_INTERNAL "room roster projection missing" over the net path (set reads_room_presence:true, like chat :who/:enter/:say_to/:leave)`);
+      }
+    }
+  }
+}
+
 if (failures.length > 0) {
   console.error("guard-command-planning failed:");
   for (const failure of failures) console.error(`- ${failure}`);
