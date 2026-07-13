@@ -3303,21 +3303,35 @@ export class NetGatewayDO {
   }
 
   /** Resolve only enough verb metadata to decide whether the catalog declared
-   * a room-presence read. Mirrors inherited dispatch order without executing
-   * catalog code and costs O(class chain). */
+   * a room-presence read. Mirrors parent-first then feature-chain dispatch
+   * without executing catalog code. */
   private callReadsRoomPresence(view: CellStore, call: ShadowTurnCall): boolean {
-    let object: string | null = call.target;
-    const seen = new Set<string>();
-    while (object && !seen.has(object)) {
-      seen.add(object);
-      for (const cell of view.cellsForObject(object)) {
-        if (cell.kind !== "verb_bytecode") continue;
-        const verb = cell.value as { name?: unknown; aliases?: unknown; reads_room_presence?: unknown };
-        const names = [verb.name, ...(Array.isArray(verb.aliases) ? verb.aliases : [])];
-        if (names.includes(call.verb)) return verb.reads_room_presence === true;
+    const resolveChain = (start: string): boolean | null => {
+      let object: string | null = start;
+      const seen = new Set<string>();
+      while (object && !seen.has(object)) {
+        seen.add(object);
+        for (const cell of view.cellsForObject(object)) {
+          if (cell.kind !== "verb_bytecode") continue;
+          const verb = cell.value as { name?: unknown; aliases?: unknown; reads_room_presence?: unknown };
+          const names = [verb.name, ...(Array.isArray(verb.aliases) ? verb.aliases : [])];
+          if (names.includes(call.verb)) return verb.reads_room_presence === true;
+        }
+        const lineage = view.get(cellKey("object_lineage", object))?.value as { parent?: unknown } | undefined;
+        object = typeof lineage?.parent === "string" ? lineage.parent : null;
       }
-      const lineage = view.get(cellKey("object_lineage", object))?.value as { parent?: unknown } | undefined;
-      object = typeof lineage?.parent === "string" ? lineage.parent : null;
+      return null;
+    };
+    const inherited = resolveChain(call.target);
+    if (inherited !== null) return inherited;
+
+    const featuresCell = view.get(cellKey("property_cell", call.target, "features"))?.value as { value?: unknown } | undefined;
+    const features = Array.isArray(featuresCell?.value)
+      ? featuresCell.value.filter((value): value is string => typeof value === "string")
+      : [];
+    for (const feature of features) {
+      const resolved = resolveChain(feature);
+      if (resolved !== null) return resolved;
     }
     return false;
   }

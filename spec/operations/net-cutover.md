@@ -319,7 +319,10 @@ item; what remains is exactly what the workerd lanes cannot prove
   shared scope, the gateway reads that receiver's room authority (so `enter`
   returns the destination roster); actor receivers use the session's active
   scope (so `who_all` remains caller-room scoped). This decision is derived
-  from topology, not catalog names or command words.
+  from topology, not catalog names or command words. The metadata lookup follows
+  the VM's dispatch order: receiver parent chain first, then each declared
+  feature chain. Feature-composed room verbs therefore cannot silently bypass
+  their `reads_room_presence` declaration.
 
   Recorded actor movement does not read or mutate the legacy
   `session_subscribers`/`subscribers` object-property mirrors while planning.

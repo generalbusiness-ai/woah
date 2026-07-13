@@ -22,6 +22,7 @@ import { signInternalRequest } from "../../src/worker/internal-auth";
 import { installVerb } from "../../src/core/authoring";
 import { createWorld } from "../../src/core/bootstrap";
 import { cellsFromSerialized, type ShadowTurnCall } from "../../src/net/bridge";
+import { CellStore, makeCell } from "../../src/net/cells";
 import type { AttemptTraceEntry } from "../../src/net/errors";
 import type { CommitReply } from "../../src/net/scope";
 
@@ -280,6 +281,38 @@ describe("NC8b: the per-turn RPC budget and parallel-group mechanics (TurnStruct
     ).rejects.toMatchObject({ code: "E_BUDGET" });
     expect(issued).toBe(0);
     expect(structure.sync_rpc).toBe(30);
+  });
+});
+
+describe("room-presence metadata dispatch", () => {
+  it("finds reads_room_presence on a feature-composed room verb", () => {
+    const view = new CellStore("derived");
+    const stamp = { scope_head: "h0", catalog_epoch: EPOCH };
+    const install = (kind: Parameters<typeof makeCell>[0]["kind"], object: string, value: unknown, name?: string) =>
+      view.install(makeCell({ kind, object, ...(name ? { name } : {}), value, provenance: "derived", stamp }));
+    install("object_lineage", "feature_room", { parent: "$room", name: "Feature Room" });
+    install("object_lineage", "$room", { parent: "$space", name: "$room" });
+    install("object_lineage", "$conversational", { parent: "$feature", name: "$conversational" });
+    install("property_cell", "feature_room", { value: ["$conversational"] }, "features");
+    install("verb_bytecode", "$conversational", {
+      name: "enter",
+      aliases: [],
+      reads_room_presence: true
+    }, "enter");
+    const probe = NetGatewayDO.prototype as unknown as {
+      callReadsRoomPresence(view: CellStore, call: ShadowTurnCall): boolean;
+    };
+    expect(probe.callReadsRoomPresence(view, {
+      kind: "woo.turn_call.shadow.v1",
+      id: "feature-roster-probe",
+      route: "sequenced",
+      scope: "feature_room",
+      session: "s1",
+      actor: "guest_1",
+      target: "feature_room",
+      verb: "enter",
+      args: []
+    })).toBe(true);
   });
 });
 

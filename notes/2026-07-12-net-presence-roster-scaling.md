@@ -229,3 +229,19 @@ remains the only persisted roster path. A focused test leaves a disconnected
 player physically in the destination and proves an enter neither reads that
 player's `home`/`description` nor omits the moving caller. Deployed confirmation
 remains required.
+
+### Fourth diagnosis: the projection declaration was bypassed
+
+The phase histogram contained no `room_roster` RPC at all. The gateway's
+`reads_room_presence` detector walked only the receiver's parent chain, while
+ordinary rooms receive `enter` from the `$conversational` feature chain. The VM
+resolved and executed the feature verb, but the metadata preflight never saw
+its declaration, so no transient roster was installed and every later bounded
+path was structurally unreachable.
+
+Metadata resolution now mirrors executable dispatch: receiver parent chain
+first, then each feature and its parent chain, preserving shadowing order. A
+focused Worker test constructs a room whose `enter` exists only on a feature
+and proves the declaration is found. This is the first correction that should
+produce a `room_roster` phase in the deployed move trace; deployed confirmation
+remains required.

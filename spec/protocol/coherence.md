@@ -516,6 +516,8 @@ One write path per fact (CO9), concretized:
   to its transient top-level roster and omits redundant `here` hydration; the
   client then performs the declared authoritative refresh. It does not derive
   presence from physical `contents` or dereference disconnected actor clusters.
+  Runtime metadata gates that request this projection resolve verbs through the
+  same parent-first, then feature-chain order as executable dispatch.
 - **Relation-owner topology is gateway knowledge** (the
   `rider_destinations` rule): the gateway classifies the transcript's
   relation-owner objects (move endpoints, create locations, contents
