@@ -56,7 +56,7 @@
  * This class sits beside the v2 DO classes and shares nothing with them;
  * nothing routes production traffic here until Phase 5.
  */
-import { CellStore, cellKey, type Cell } from "../../net/cells";
+import { CellStore, cellKey, makeCell, type Cell } from "../../net/cells";
 import { budgetExhausted, isNetError, netError, NetError, type AttemptTraceEntry, type NetErrorCode } from "../../net/errors";
 import { applyFanout, type FanoutBody } from "../../net/outbox";
 import { observationsForRelationOwners, relationKey, type RelationDelta, type RelationRow, type RoomRosterRow } from "../../net/relations";
@@ -1547,6 +1547,7 @@ export class NetGatewayDO {
     } catch (err) {
       installDegraded = true;
       this.metric({ kind: "net_session_open_install_degraded", scope: clusterScope, status: "error", error: String(err) });
+      this.installAcceptedSessionEcho(request.session, value, reply, request.catalog_epoch);
     }
     return { reply, scope: clusterScope, value, ...(installDegraded ? { install_degraded: true } : {}) };
   }
@@ -2136,6 +2137,7 @@ export class NetGatewayDO {
     } catch (err) {
       installDegraded = true;
       this.metric({ kind: "net_guest_provision_install_degraded", actor, status: "error", error: String(err) });
+      this.installAcceptedSessionEcho(session, planned.value, reply, epoch);
     }
     await this.selfSubscribe(planned.clusterScope);
     await this.selfSubscribe(roomScope);
@@ -3700,6 +3702,34 @@ export class NetGatewayDO {
         }
       })
     );
+  }
+
+  /** A session bearer is unusable unless its minting gateway can authenticate
+   * it. After an accepted exact-value session transcript, a failed closure
+   * warm-fill may still install that one value as a derived accepted echo at
+   * the returned authority head. This is CO2.1 cache fill, never a second
+   * write path; all other touched cells remain repair-on-read. */
+  private installAcceptedSessionEcho(
+    session: string,
+    value: unknown,
+    reply: Extract<CommitReply, { status: "accepted" }>,
+    catalogEpoch: string
+  ): void {
+    const view = this.ensureView();
+    const cell = makeCell({
+      kind: "session",
+      object: session,
+      value,
+      provenance: "derived",
+      stamp: {
+        scope_head: `${reply.head.seq}:${reply.head.hash}`,
+        catalog_epoch: catalogEpoch
+      }
+    });
+    this.discardViewOnThrow(() => this.state.storage.transactionSync(() => {
+      view.install(cell);
+      this.persistCell(view, cell.key);
+    }));
   }
 
   /** Targeted view refresh (the E_READ_VERSION / E_MISSING_STATE

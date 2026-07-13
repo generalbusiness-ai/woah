@@ -316,6 +316,45 @@ describe("room-presence metadata dispatch", () => {
   });
 });
 
+describe("accepted session echo", () => {
+  it("keeps a bearer authenticatable when the post-accept closure fill degraded", () => {
+    const holder = netState("accepted-session-echo");
+    const env: NetGatewayEnv = { WOO_INTERNAL_SECRET: SECRET };
+    const gateway = new NetGatewayDO(holder.state, env);
+    const probe = gateway as unknown as {
+      installAcceptedSessionEcho(
+        session: string,
+        value: unknown,
+        reply: Extract<CommitReply, { status: "accepted" }>,
+        epoch: string
+      ): void;
+    };
+    const session = "s_net-api-3_echo";
+    probe.installAcceptedSessionEcho(session, {
+      id: session,
+      actor: "echo_actor",
+      started: Date.now(),
+      expiresAt: Date.now() + 60_000,
+      activeScope: "echo_room"
+    }, {
+      kind: "woo.net.commit_reply.v1",
+      status: "accepted",
+      scope: "cluster:echo_actor",
+      head: { seq: 1, hash: "accepted-head" },
+      touched: [`session:${session}`],
+      post_state_version: "accepted-post"
+    }, EPOCH);
+
+    // Reconstruct the gateway from SQLite: this proves the fallback is a
+    // durable derived copy, not only an in-memory escape hatch.
+    const rehydrated = new NetGatewayDO(holder.state, env) as unknown as {
+      actorForSessionBearer(sessionId: string): string;
+    };
+    expect(rehydrated.actorForSessionBearer(session)).toBe("echo_actor");
+    holder.close();
+  });
+});
+
 describe("NC8 queue wait deadline", () => {
   it("runs twelve independent lanes per scope by default and queues the thirteenth", async () => {
     const gatewayState = netState("gateway-queue-lanes");

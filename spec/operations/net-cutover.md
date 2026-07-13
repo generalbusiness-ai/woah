@@ -371,7 +371,10 @@ item; what remains is exactly what the workerd lanes cannot prove
   deterministically derives the same actor/session and original mint time;
   an ambiguous fresh-scope timeout therefore replays one scope idempotency
   key instead of leaking another guest. Invalid, future, and expired claims
-  fail closed; old clients without a claim retain additive compatibility.
+  fail closed; old clients without a claim retain additive compatibility. If
+  the post-accept closure warm-fill degrades, the minting gateway durably
+  installs the exact accepted session value at the returned authority head;
+  it cannot return a successful bearer that its own shard rejects as missing.
 - **Gateway sharding — BUILT after the first deployed canary.** Public
   `/net-api` routing uses `NET_API_GATEWAY_SHARDS` named shards. A session
   or WebSocket ticket carries its minting shard; MCP headers, bearer/body/

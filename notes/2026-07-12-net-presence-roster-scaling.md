@@ -267,3 +267,14 @@ retain the claim across bounded 503 retries; malformed/future/expired claims
 fail closed. The same response also exposes `active_scope`, allowing the load
 driver to skip synthetic same-room enters while preserving real cross-room
 movement coverage. Final deployed retry/soak confirmation remains required.
+
+The first claim-aware deploy prevented duplicate identities but exposed the
+next post-accept boundary: one of 22 elastic mints returned `200` with
+`install_degraded`, then its shard rejected all 20 turns and logout as
+`E_NOSESSION`. The authority commit was durable; only the gateway closure fill
+had missed. Session values are exact transcript writes known to the gateway,
+so a degraded fill now durably installs that accepted value as a derived echo
+stamped with the reply head. A reconstruction test authenticates the bearer
+from SQLite through a new gateway instance, proving this is durable cache-fill
+rather than an in-memory exception. Final deployed confirmation remains
+required.

@@ -524,6 +524,10 @@ One write path per fact (CO9), concretized:
   resulting scope submit therefore retains one idempotency key even when both
   internal reply attempts time out. Invalid, future, or expired claims are
   refused; a claim is never recycled into a fresh identity.
+  Because a session bearer must be locally authenticatable, a failed
+  post-accept closure fill installs the exact accepted session value as a
+  durable derived echo stamped at the returned authority head. The transcript
+  remains the only write path; unrelated touched cells stay repair-on-read.
 - **Relation-owner topology is gateway knowledge** (the
   `rider_destinations` rule): the gateway classifies the transcript's
   relation-owner objects (move endpoints, create locations, contents
