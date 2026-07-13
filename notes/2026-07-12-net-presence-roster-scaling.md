@@ -187,10 +187,17 @@ subscriber-mirror updater before the transcript settled. That updater read
 projections as authority-cell reads. Targeted repair could never manufacture
 those cells and repeated until the 32-RPC cap.
 
-The correction makes recorded movement emit only the session transition;
+The first correction made recorded movement emit only the session transition;
 materialization already derives both compatibility mirrors from that accepted
-fact. Direct/local movement keeps eager mirror maintenance. Roster prefetch now
-uses a shared receiver's authority for room verbs and the session active room
-for actor verbs, derived from topology rather than verb names. A focused
-cross-room plan test asserts the transition, destination roster, and absence of
-both legacy projection reads. Deployed confirmation is still required.
+fact. Direct/local movement keeps eager mirror maintenance. Its deployed probe
+still failed, which exposed a second reader in the same bug family:
+`observe_to_space` fetched remote subscriber mirrors to stamp an
+`_audience_override` before recording both the source-room and destination-room
+observations. Recorded observations now carry the owner space and let owner-side
+fanout derive the audience from `session_presence`; direct cross-host calls keep
+the eager override because they have no accepted owner-side materialization.
+Roster prefetch uses a shared receiver's authority for room verbs and the
+session active room for actor verbs, derived from topology rather than verb
+names. Focused cross-room and v2-browser tests assert the transition,
+destination roster, and absence of both legacy projection reads. Deployed
+confirmation is still required.

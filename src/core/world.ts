@@ -6293,7 +6293,13 @@ export class WooWorld {
     const remote = await this.remoteHostForObject(space, ctx.hostMemo);
     if (!remote) {
       if (!this.inheritsFrom(space, "$space")) throw wooError("E_TYPE", `${space} is not a space`, space);
-    } else {
+    } else if (this.activeTurnRecorder === null) {
+      // Direct cross-host observations need an eager audience because no
+      // accepted transcript will later reach the space owner. Recorded turns
+      // deliberately omit it: the owner computes delivery from its
+      // session_presence relation. Fetching compatibility subscriber mirrors
+      // here would promote a derived projection into an authority read and can
+      // never converge through cell-closure repair.
       try {
         const sessionSubscribers = await this.getPropChecked(ctx.progr, space, "session_subscribers", ctx.hostMemo);
         if (Array.isArray(sessionSubscribers)) {

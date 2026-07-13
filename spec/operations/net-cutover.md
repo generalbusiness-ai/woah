@@ -330,6 +330,10 @@ item; what remains is exactly what the workerd lanes cannot prove
   and every materializer derives the compatibility mirrors from it. Direct
   local movement, which has no later transcript-application phase, continues
   to update the mirrors immediately.
+  The same boundary applies to `observe_to_space`: recorded observations carry
+  their space source and let that owner derive the audience from
+  `session_presence`; only a direct cross-host observation eagerly reads the
+  remote subscriber mirror to construct an audience override.
 
   Presence transition acceptance includes a freshness fence: after the actor
   scope commits, the gateway delivers the same `(from_scope, seq)` relation

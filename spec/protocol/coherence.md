@@ -508,7 +508,10 @@ One write path per fact (CO9), concretized:
   `session_subscribers`/`subscribers` properties while constructing the
   transcript. Materializers derive those mirrors from the accepted relation
   fact. A direct local move may update them eagerly because no sequenced
-  transcript will be applied afterward.
+  transcript will be applied afterward. Likewise, a recorded
+  `observe_to_space` names the owner space but does not read its subscriber
+  mirrors; owner-side fanout computes the audience from `session_presence`.
+  Direct cross-host observation retains the eager audience override path.
 - **Relation-owner topology is gateway knowledge** (the
   `rider_destinations` rule): the gateway classifies the transcript's
   relation-owner objects (move endpoints, create locations, contents
