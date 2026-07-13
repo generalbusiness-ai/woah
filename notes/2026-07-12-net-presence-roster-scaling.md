@@ -226,3 +226,10 @@ transient value so the immediate result includes the mover. The durable
 test leaves a disconnected player physically in the destination and proves an
 enter neither reads that player's `home`/`description` nor omits the moving
 caller from the returned roster. Deployed confirmation remains required.
+
+The first deployment of that correction still followed the generic
+`roomSnapshotForActor` remote-host branch before consulting the transient
+projection, so it delegated back to the legacy owner snapshot and reproduced
+the same reads. The projection check now precedes remote delegation: an
+explicit owner roster plus the bounded room planning slice is the authoritative
+planning input for `here_request` hydration.

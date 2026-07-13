@@ -4460,7 +4460,13 @@ export class WooWorld {
   }
 
   async roomSnapshotForActor(actor: ObjRef, room: ObjRef, sessionId: string | null = null, memo: HostOperationMemo = createHostOperationMemo()): Promise<RoomSnapshot> {
-    if (await this.remoteHostForObject(room, memo)) {
+    // A net planning world already holds an explicit owner roster snapshot and
+    // the room's bounded planning slice. Do not delegate back to the remote
+    // room host: its legacy full snapshot rebuilds presence from physical
+    // contents and reintroduces per-actor reads the projection was installed to
+    // eliminate.
+    const hasProjectedRoster = this.roomRosterProjections.has(room);
+    if (!hasProjectedRoster && await this.remoteHostForObject(room, memo)) {
       if (!this.executorContext?.roomSnapshot) throw wooError("E_INTERNAL", "remote host bridge room snapshots unavailable");
       return await this.executorContext.roomSnapshot(actor, room, sessionId, memo);
     }

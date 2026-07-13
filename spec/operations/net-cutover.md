@@ -340,7 +340,10 @@ item; what remains is exactly what the workerd lanes cannot prove
   are neither live roster members nor ordinary room contents, and planning must
   not dereference their actor clusters. The planning world applies the pending
   session transition to its transient roster so the immediate post-move result
-  includes the caller without creating another durable roster write.
+  includes the caller without creating another durable roster write. An
+  installed owner roster also suppresses legacy remote room-snapshot delegation:
+  the bounded room slice plus explicit owner projection are the complete
+  planning input for this response.
 
   Presence transition acceptance includes a freshness fence: after the actor
   scope commits, the gateway delivers the same `(from_scope, seq)` relation
