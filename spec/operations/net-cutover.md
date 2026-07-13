@@ -344,12 +344,15 @@ item; what remains is exactly what the workerd lanes cannot prove
   physical room contents: closed sessions may leave reusable player objects
   physically contained, but planning must not dereference those actor clusters.
 
-  Presence transition acceptance includes a freshness fence: after the actor
-  scope commits, the gateway delivers the same `(from_scope, seq)` relation
-  fact synchronously to the room owner before returning success. The actor
-  scope's durable outbox remains the crash-recovery path; its duplicate is an
-  owner-sequenced no-op. Thus a dependent `who_all` cannot race an owner that
-  has not learned the accepted enter. Gateway mirrors remain asynchronous and
+  Presence transition acceptance normally includes a freshness fence: after
+  the actor scope commits, the gateway delivers the same `(from_scope, seq)`
+  relation fact synchronously to the room owner before returning success. The
+  actor scope's durable outbox remains the crash-recovery path; its duplicate is
+  an owner-sequenced no-op. Thus a dependent `who_all` normally cannot race an
+  owner that has not learned the accepted enter. If the post-accept expedite
+  fails, the response remains accepted with `relation_expedite_degraded: true`
+  and a named metric because the write and outbox row are already durable; the
+  owner then converges asynchronously. Gateway mirrors remain asynchronous and
   are not used as roster authority. Snapshot construction excludes expired
   session values, while explicit close and the session alarm retract durable
   local/foreign presence rows through the existing owner-sequenced path. A
@@ -370,8 +373,12 @@ item; what remains is exactly what the workerd lanes cannot prove
   temporary bearer. The edge routes retries by that key and the gateway
   deterministically derives the same actor/session and original mint time;
   an ambiguous fresh-scope timeout therefore replays one scope idempotency
-  key instead of leaking another guest. Invalid, future, and expired claims
-  fail closed; old clients without a claim retain additive compatibility. If
+  key instead of leaking another guest. The claim-routed gateway first replays
+  any already-live claim-derived pool session, so a previously occupied earlier
+  seat becoming free cannot redirect a retry and leak a second seat. Invalid,
+  future, and expired claims fail closed; old clients without a claim retain
+  additive compatibility. The claim TTL comes from one browser-safe policy
+  module shared with the server clamp, preventing silent claim-body drift. If
   the post-accept closure warm-fill degrades, the minting gateway durably
   installs the exact accepted session value at the returned authority head;
   it cannot return a successful bearer that its own shard rejects as missing.

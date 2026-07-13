@@ -10,6 +10,7 @@ import { FakeDurableObjectState } from "./fake-do";
 import { createWorld } from "../../src/core/bootstrap";
 import { exportIdentity, importIdentity } from "../../src/net/identity";
 import { planNetInstall } from "../../src/net/install";
+import { CLIENT_SESSION_TTL_DEFAULT_MS } from "../../src/net/client-session-policy";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
@@ -375,7 +376,7 @@ describe("the identity door (/net-api/login, /net-api/guest, session bearers)", 
 
     // The pool is full: provision a fresh actor + first session as one
     // commit at cluster:<actor>, then use its bearer immediately.
-    const claimId = `g1.${Date.now().toString(36)}.${(30 * 60_000).toString(36)}.8c43df90-7989-46ef-a29b-947f5d1fc130`;
+    const claimId = `g1.${Date.now().toString(36)}.${CLIENT_SESSION_TTL_DEFAULT_MS.toString(36)}.8c43df90-7989-46ef-a29b-947f5d1fc130`;
     const elastic = await h.api("POST", "/net-api/guest", { body: { claim_id: claimId } });
     expect(elastic.status, JSON.stringify(elastic.body).slice(0, 300)).toBe(200);
     expect(elastic.body.elastic).toBe(true);
@@ -392,6 +393,28 @@ describe("the identity door (/net-api/login, /net-api/guest, session bearers)", 
     expect(turn.status, JSON.stringify(turn.body).slice(0, 300)).toBe(200);
     expect((turn.body.reply as { status?: string }).status).toBe("accepted");
 
+    await h.close();
+  }, 30_000);
+
+  it("retries an accepted claim on its existing pool seat after an earlier seat becomes free", async () => {
+    const h = await buildDoorHarness();
+    const occupied = await h.api("POST", "/net-api/guest", { body: {} });
+    expect(occupied.status).toBe(200);
+
+    const claimId = `g1.${Date.now().toString(36)}.${CLIENT_SESSION_TTL_DEFAULT_MS.toString(36)}.5aa81e0e-8d5c-4b2c-bde2-da3d35c720d6`;
+    const claimed = await h.api("POST", "/net-api/guest", { body: { claim_id: claimId } });
+    expect(claimed.status, JSON.stringify(claimed.body)).toBe(200);
+    expect(claimed.body.actor).not.toBe(occupied.body.actor);
+
+    const released = await h.api("DELETE", "/net-api/session", {
+      token: `session:${occupied.body.session as string}`
+    });
+    expect(released.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    const replay = await h.api("POST", "/net-api/guest", { body: { claim_id: claimId } });
+    expect(replay.status, JSON.stringify(replay.body)).toBe(200);
+    expect(replay.body).toMatchObject({ actor: claimed.body.actor, session: claimed.body.session });
     await h.close();
   }, 30_000);
 

@@ -179,6 +179,7 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
     let attemptRun: Awaited<ReturnType<typeof runShadowTurnCallTranscript>>;
     try {
       attemptRun = await runShadowTurnCallTranscript(world, call, {
+        require_room_roster_projection: true,
         ...(input.planningRoomRoster ? { room_rosters: [input.planningRoomRoster] } : {})
       });
     } catch (err) {

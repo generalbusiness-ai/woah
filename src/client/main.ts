@@ -26,6 +26,7 @@ import { advanceProjectionCursor, idsFromRefsOrSummaries, presentActorsFromObser
 import { settleInvalidatedOptimisticTurns, type V2LocalTurnInvalidatedMessage } from "./v2-browser-optimistic-lifecycle";
 import { v2ProjectionSnapshotFromMessage, v2TurnResultRoute, type V2AppliedFrameMessage, type V2ProjectionMessage, type V2TurnResultMessage } from "./v2-browser-messages";
 import { sessionActiveScopeFromRecord } from "../core/types";
+import { CLIENT_SESSION_TTL_DEFAULT_MS } from "../net/client-session-policy";
 import { NetFeed } from "./net-feed";
 import { wireNetFeed } from "./net-feed-adapter";
 import { createV2BrowserWorker } from "#v2-browser-worker-factory";
@@ -636,7 +637,7 @@ function pendingGuestClaim(): string {
   const issuedAt = match ? Number.parseInt(match[1], 36) : 0;
   const ttlMs = match ? Number.parseInt(match[2], 36) : 0;
   if (match && issuedAt + ttlMs > Date.now()) return existing as string;
-  const ttl = 30 * 60_000;
+  const ttl = CLIENT_SESSION_TTL_DEFAULT_MS;
   const claim = `g1.${Date.now().toString(36)}.${ttl.toString(36)}.${crypto.randomUUID()}`;
   writeStorage(NET_GUEST_CLAIM_KEY, claim);
   return claim;

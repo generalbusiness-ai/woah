@@ -57,6 +57,7 @@
  * nothing routes production traffic here until Phase 5.
  */
 import { CellStore, cellKey, makeCell, type Cell } from "../../net/cells";
+import { clampClientSessionTtl } from "../../net/client-session-policy";
 import { budgetExhausted, isNetError, netError, NetError, type AttemptTraceEntry, type NetErrorCode } from "../../net/errors";
 import { applyFanout, type FanoutBody } from "../../net/outbox";
 import { observationsForRelationOwners, relationKey, type RelationDelta, type RelationRow, type RoomRosterRow } from "../../net/relations";
@@ -247,6 +248,9 @@ type TurnResult = {
    * durable at the scope; the view repairs itself on the next turn via
    * read_version_mismatch → targeted refresh. Never a 500. */
   install_degraded?: boolean;
+  /** The commit is durable and its relation outbox remains authoritative, but
+   * the synchronous presence-freshness expedite failed. */
+  relation_expedite_degraded?: boolean;
   /** D2 / CO10: the turn's structural budget counts (CO12.3 "budget
    * gates"). Present on every settled TurnResult (accepted or terminal);
    * lets a unit lane assert the warm-turn structure directly rather than
@@ -441,13 +445,8 @@ function objectOfCellKey(key: string): string {
 
 /** Session TTL bounds for the /net-api client surface: default 30 min,
  * clamped to [1 min, 24 h] — a client cannot mint an immortal session. */
-const CLIENT_SESSION_TTL_DEFAULT_MS = 30 * 60_000;
-const CLIENT_SESSION_TTL_MIN_MS = 60_000;
-const CLIENT_SESSION_TTL_MAX_MS = 24 * 60 * 60_000;
-
 function clampClientTtl(raw: unknown): number {
-  const ttl = typeof raw === "number" && Number.isFinite(raw) ? raw : CLIENT_SESSION_TTL_DEFAULT_MS;
-  return Math.min(CLIENT_SESSION_TTL_MAX_MS, Math.max(CLIENT_SESSION_TTL_MIN_MS, ttl));
+  return clampClientSessionTtl(raw);
 }
 
 type GuestClaim = { id: string; issuedAt: number };
@@ -1233,7 +1232,16 @@ export class NetGatewayDO {
         // before the client can issue a dependent roster read. This delivers
         // the same idempotent fact as the committing scope's durable outbox;
         // the outbox remains crash recovery and later no-ops at the owner.
-        await this.expediteForeignRelations(reply, relateDestinations, planned.transcript.observations, structure);
+        let relationExpediteDegraded = false;
+        try {
+          await this.expediteForeignRelations(reply, relateDestinations, planned.transcript.observations, structure);
+        } catch (err) {
+          // Acceptance is the durability boundary. The scope committed the
+          // same relation fact to its outbox, so expedite failure may delay a
+          // dependent roster read but must never rewrite success into a 500.
+          relationExpediteDegraded = true;
+          this.metric({ kind: "net_relation_expedite_degraded", scope: reply.scope, status: "error", error: String(err) });
+        }
         let installDegraded = false;
         if (reply.touched.length > 0) {
           try {
@@ -1276,7 +1284,8 @@ export class NetGatewayDO {
                 ...(planned.transcript.error !== undefined ? { error: planned.transcript.error } : {}),
                 observations: planned.transcript.observations
               }),
-          ...(installDegraded ? { install_degraded: true } : {})
+          ...(installDegraded ? { install_degraded: true } : {}),
+          ...(relationExpediteDegraded ? { relation_expedite_degraded: true } : {})
         };
       }
       if (!reply.retryable) {
@@ -1467,6 +1476,7 @@ export class NetGatewayDO {
     scope: string;
     value: unknown;
     install_degraded?: boolean;
+    relation_expedite_degraded?: boolean;
   }> {
     const view = this.ensureView();
     let clusterScope: string;
@@ -1537,7 +1547,13 @@ export class NetGatewayDO {
       base = (await this.scopeHead(destination)).head;
     }
     if (reply.status !== "accepted") return { reply, scope: clusterScope, value };
-    await this.expediteForeignRelations(reply, relateDestinations, []);
+    let relationExpediteDegraded = false;
+    try {
+      await this.expediteForeignRelations(reply, relateDestinations, []);
+    } catch (err) {
+      relationExpediteDegraded = true;
+      this.metric({ kind: "net_relation_expedite_degraded", scope: reply.scope, status: "error", error: String(err) });
+    }
     // Install the accepted session cell into the view (warm cache-fill,
     // CO7) — the same degrade rule as /net/turn (fix 5a): the commit is
     // durable; a failed fill self-repairs on the next turn's read check.
@@ -1549,7 +1565,13 @@ export class NetGatewayDO {
       this.metric({ kind: "net_session_open_install_degraded", scope: clusterScope, status: "error", error: String(err) });
       this.installAcceptedSessionEcho(request.session, value, reply, request.catalog_epoch);
     }
-    return { reply, scope: clusterScope, value, ...(installDegraded ? { install_degraded: true } : {}) };
+    return {
+      reply,
+      scope: clusterScope,
+      value,
+      ...(installDegraded ? { install_degraded: true } : {}),
+      ...(relationExpediteDegraded ? { relation_expedite_degraded: true } : {})
+    };
   }
 
   /** CO2.5 for substrate commits outside the full turn loop (session
@@ -2058,10 +2080,30 @@ export class NetGatewayDO {
         503
       );
     }
+    const candidates: Array<{ actor: string; session?: string }> = [];
     for (const actor of pool) {
       const session = claim
         ? sessionIdWithShardHint(this.shardName(), await guestClaimHex(claim, `session:${actor}`))
         : undefined;
+      candidates.push({ actor, ...(session ? { session } : {}) });
+    }
+    if (claim) {
+      // A retry can arrive after an earlier occupied seat has become free. Find
+      // the claim's already-accepted deterministic session first, or the same
+      // human could claim that newly-free seat while its later pool seat remains
+      // live. Accepted session echoes persist in this claim-routed gateway view.
+      for (const { actor, session } of candidates) {
+        if (!session) continue;
+        if (validateSessionCell(this.ensureView().get(sessionCellKey(session)), this.host.now(), actor) !== "ok") continue;
+        return await this.clientSession(actor, body, identity.epoch, {
+          exclusive: true,
+          session,
+          issuedAt: claim.issuedAt,
+          ttlMs
+        });
+      }
+    }
+    for (const { actor, session } of candidates) {
       const response = await this.clientSession(actor, body, identity.epoch, {
         exclusive: true,
         ...(session ? { session, issuedAt: claim?.issuedAt, ttlMs } : {})
@@ -2207,7 +2249,11 @@ export class NetGatewayDO {
     if (opened.reply.status !== "accepted") {
       return json({ error: { code: "E_RETRY", message: "session close did not commit; retry", detail: opened.reply } }, 503);
     }
-    return json({ closed: true });
+    return json({
+      closed: true,
+      ...(opened.install_degraded ? { install_degraded: true } : {}),
+      ...(opened.relation_expedite_degraded ? { relation_expedite_degraded: true } : {})
+    });
   }
 
   /** V3 finding 3 (P1): the net mirror of core `actorCanAuthenticate`.
@@ -2348,7 +2394,9 @@ export class NetGatewayDO {
       // Clients must not guess whether this owner-committed session was born
       // present. Exposing the routing fact also keeps canaries from creating
       // artificial same-room transition storms.
-      active_scope: bornAt
+      active_scope: bornAt,
+      ...(opened.install_degraded ? { install_degraded: true } : {}),
+      ...(opened.relation_expedite_degraded ? { relation_expedite_degraded: true } : {})
     });
   }
 

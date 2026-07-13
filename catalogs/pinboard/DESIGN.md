@@ -270,13 +270,13 @@ Kanban invariants:
 
 `list_columns` returns just the `columns` field above (same per-card joined view).
 
-`room_roster()` is the canonical v2 presentation roster. Pinboard is a
-workspace, not an embodied room, so its roster rows are distinct actors from
-`session_subscribers`, enriched as `{id, name, presence, idle_seconds?}`.
+`room_roster()` is the canonical presentation roster. It adapts the substrate's
+compact owner-authoritative room projection into
+`{id, name, presence, idle_seconds?}` rows without dereferencing actor clusters.
 `live_audience(observation?)` is the separate delivery contract and returns
 live subscribed session ids after the substrate observation routing rules run.
 Future UI/API code should prefer `room_roster()` over `present_actors` or
-`subscribers`.
+`subscribers`; the latter can be partial on a distributed planning shard.
 
 **Unreadable cards.** When the calling actor cannot read a card's text
 (`note:is_readable_by(actor) → false`), the card still appears in the

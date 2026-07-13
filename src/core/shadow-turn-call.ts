@@ -70,6 +70,9 @@ export type ShadowTurnCallOptions = {
   onMetric?: (event: MetricEvent) => void;
   /** Transient compact owner projections; never persisted or exported. */
   room_rosters?: Array<{ room: string; rows: readonly Record<string, unknown>[] }>;
+  /** Net's sparse planner must fail rather than derive a partial roster from
+   * whichever session rows happened to materialize on this executor. */
+  require_room_roster_projection?: boolean;
 };
 
 // The VM-execution boundary. Accepts ONLY a `PlanningWorld` — a SerializedWorld
@@ -85,6 +88,7 @@ export async function runShadowTurnCall(
 ): Promise<ShadowTurnCallRun> {
   const built = createWorldFromSerialized(world, { persist: false });
   for (const roster of options.room_rosters ?? []) built.installRoomRosterProjection(roster.room, roster.rows);
+  if (options.require_room_roster_projection) built.setRequireRoomRosterProjection(true);
   built.setMetricsHook(options.onMetric ?? null);
   if (options.planning_cell_provenance) built.setPlanningCellProvenance(options.planning_cell_provenance);
   if (options.enforce_movement_owner_repair) built.setEnforceMovementOwnerRepair(true);
@@ -102,6 +106,7 @@ export async function runShadowTurnCallTranscript(
   // unless a caller explicitly needs that snapshot.
   const built = createWorldFromSerialized(world, { persist: false });
   for (const roster of options.room_rosters ?? []) built.installRoomRosterProjection(roster.room, roster.rows);
+  if (options.require_room_roster_projection) built.setRequireRoomRosterProjection(true);
   if (options.onMetric) built.setMetricsHook(options.onMetric);
   if (options.planning_cell_provenance) built.setPlanningCellProvenance(options.planning_cell_provenance);
   if (options.enforce_movement_owner_repair) built.setEnforceMovementOwnerRepair(true);

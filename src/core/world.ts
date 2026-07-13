@@ -609,6 +609,10 @@ export class WooWorld {
   private enforceResolutionOwnerRepair = false;
   /** Compact owner roster values exist only in an ephemeral planning world. */
   private readonly roomRosterProjections = new Map<ObjRef, WooValue[]>();
+  // Net planning explicitly enables this invariant. Its materialized world is
+  // sparse by construction, so a local fallback would be a plausible-looking
+  // partial roster rather than a safe degradation.
+  private requireRoomRosterProjection = false;
 
   constructor(private repository?: WooRepository, options: { executorContext?: ExecutorContext | null; turnRecorder?: TurnRecorder | null } = {}) {
     this.objectRepository = isObjectRepository(repository) ? repository : null;
@@ -625,16 +629,24 @@ export class WooWorld {
     this.roomRosterProjections.set(room, cloneImportedPlainData(rows) as WooValue[]);
   }
 
+  setRequireRoomRosterProjection(required: boolean): void {
+    this.requireRoomRosterProjection = required;
+  }
+
   roomRosterProjection(room: ObjRef): WooValue[] {
     const projected = this.roomRosterProjections.get(room);
     if (projected !== undefined) return cloneImportedPlainData(projected);
+
+    if (this.requireRoomRosterProjection) {
+      throw wooError("E_INTERNAL", `sparse planning room roster projection missing for ${room}`);
+    }
 
     // Non-net runtimes own a complete local session table and do not install
     // transient projections. Preserve their established who semantics while
     // net planning always installs an explicit snapshot (including []).
     const now = this.logicalNow("room_roster.now");
     const roomName = this.objects.get(room)?.name ?? room;
-    return this.activeActorsIn(room).map((actor) => {
+    return this.activeActorsIn(room).filter((actor) => this.objects.has(actor)).map((actor) => {
       const stats = this.playerSessionStats(actor, now);
       const presence = stats.connected
         ? stats.idleSeconds !== null && stats.idleSeconds >= 60 ? "idle" : "awake"

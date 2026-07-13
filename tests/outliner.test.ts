@@ -628,14 +628,14 @@ describe("outliner catalog: room_roster (presence aside)", () => {
     }
   });
 
-  it("skips stale projected presence refs instead of failing the roster", async () => {
+  it("ignores stale compatibility presence refs instead of failing the roster", async () => {
     const world = setupWorld();
     const session = world.auth("guest:roster-stale");
-    const originalPresentActorsIn = world.presentActorsIn.bind(world);
-    world.presentActorsIn = (async (ctx, space) => {
-      if (space !== "the_outline") return await originalPresentActorsIn(ctx, space);
-      return [session.actor, "guest_roster_stale_actor"];
-    }) as typeof world.presentActorsIn;
+    await expectResult(call(world, session.actor, "the_outline", "enter", []));
+    world.setProp("the_outline", "session_subscribers", [
+      { session: session.id, actor: session.actor },
+      { session: "missing-session", actor: "guest_roster_stale_actor" }
+    ]);
 
     const r = await expectResult(call(world, session.actor, "the_outline", "room_roster", []));
 

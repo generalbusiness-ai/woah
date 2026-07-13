@@ -166,7 +166,10 @@ function frames(server: FakeWebSocket): Array<Record<string, unknown>> {
 
 type Harness = Awaited<ReturnType<typeof buildHarness>>;
 
-async function buildHarness(gatewayEnvExtra: Partial<NetGatewayEnv> = {}) {
+async function buildHarness(
+  gatewayEnvExtra: Partial<NetGatewayEnv> = {},
+  faults: { relateScope?: string } = {}
+) {
   // Engine-real fixture, mirroring net-client-api.test.ts plus the
   // presence pieces: a home room with an observing box, a second room
   // (the "annex") reachable by a presence-gate-skipping :welcome (the
@@ -264,6 +267,14 @@ async function buildHarness(gatewayEnvExtra: Partial<NetGatewayEnv> = {}) {
     const scope = destination.startsWith("scope:") ? destination.slice("scope:".length) : null;
     const instance = scope !== null ? scopeDOs.get(scope) : undefined;
     if (!instance) throw new Error(`unresolvable destination ${destination}`);
+    if (scope === faults.relateScope) {
+      return {
+        fetch: async (request: Request) => {
+          if (new URL(request.url).pathname === "/net/relate") throw new Error("injected relation expedite failure");
+          return await instance.fetch(request);
+        }
+      };
+    }
     return instance;
   };
   const scopeEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve };
@@ -526,6 +537,37 @@ describe("/net-api/ws socket surface (Phase 4 item 3 chunk 1)", () => {
 });
 
 describe("gateway self-subscribe (H1)", () => {
+  it("returns an accepted session mint when its born-present expedite fails", async () => {
+    const h = await buildHarness({}, { relateScope: "room:ws_room" });
+    const opened = await clientFetch(h.gateway, "POST", "/net-api/session", {
+      token: `apikey:${KEY_ID}:${KEY_SECRET}`,
+      body: {}
+    });
+
+    expect(opened.status, JSON.stringify(opened.body)).toBe(200);
+    expect(opened.body).toMatchObject({
+      active_scope: "ws_room",
+      relation_expedite_degraded: true
+    });
+    h.close();
+  });
+
+  it("returns an accepted turn when post-accept presence expedite fails", async () => {
+    const h = await buildHarness({}, { relateScope: "room:ws_annex" });
+    const sid = await h.mint();
+    const entered = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+      token: `apikey:${KEY_ID}:${KEY_SECRET}`,
+      body: { target: "ws_annex", verb: "welcome", session: sid, idempotency_key: "expedite-degraded-enter" }
+    });
+
+    expect(entered.status, JSON.stringify(entered.body)).toBe(200);
+    expect(entered.body).toMatchObject({
+      reply: { status: "accepted" },
+      relation_expedite_degraded: true
+    });
+    h.close();
+  });
+
   it("plans who_all from owner-anchored presence when the shard lacks a peer's cluster cells", async () => {
     const h = await buildHarness({ NET_GATEWAY_SELF: "gateway:net-api" });
     const token = `apikey:${KEY_ID}:${KEY_SECRET}`;

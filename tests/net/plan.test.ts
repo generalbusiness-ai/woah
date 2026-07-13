@@ -191,6 +191,146 @@ describe("compact room-roster planning", () => {
     expect(roomRosterPlan.transcript.reads.some((read) => read.cell.object.startsWith("guest_"))).toBe(false);
   });
 
+  it.each([
+    ["pinboard", "the_pinboard"],
+    ["outliner", "the_outline"],
+    ["dubspace", "the_dubspace"]
+  ])("renders the complete compact roster through the %s catalog adapter", async (_catalog, room) => {
+    const world = createWorld();
+    const session = world.auth(`guest:compact-${_catalog}`);
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seq.seed(cellsFromSerialized(world.exportWorld()));
+    const view = derivedViewOf(seq.store);
+    const rows = Array.from({ length: 30 }, (_, index) => ({
+      player: `remote_${index}`,
+      name: `Remote ${index}`,
+      connected: true,
+      connected_at: 1_000,
+      connected_seconds: 5,
+      idle_seconds: index,
+      last_login_at: 1_000,
+      location: room,
+      location_name: room,
+      presence: "awake"
+    }));
+
+    const plan = await planTurn({
+      call: {
+        kind: "woo.turn_call.shadow.v1",
+        id: `compact-${_catalog}-roster`,
+        route: "direct",
+        scope: SCOPE,
+        session: session.id,
+        actor: session.actor,
+        target: room,
+        verb: "room_roster",
+        args: []
+      },
+      view,
+      planningScope: SCOPE,
+      classifier,
+      base: seq.head(),
+      idempotencyKey: `compact-${_catalog}-roster`,
+      stamp: seq.stamp(),
+      planningRoomRoster: { room, rows }
+    });
+
+    expect(plan.transcript.result).toHaveLength(30);
+    expect(plan.transcript.result).toEqual(expect.arrayContaining([
+      { id: "remote_0", name: "Remote 0", presence: "awake", idle_seconds: 0 },
+      { id: "remote_29", name: "Remote 29", presence: "awake", idle_seconds: 29 }
+    ]));
+    expect(plan.transcript.reads.some((read) => read.cell.object.startsWith("remote_"))).toBe(false);
+  });
+
+  it("fails loudly when sparse net planning reaches room_roster without its owner projection", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:compact-roster-metadata-miss");
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seq.seed(cellsFromSerialized(world.exportWorld()));
+
+    const plan = await planTurn({
+      call: {
+        kind: "woo.turn_call.shadow.v1",
+        id: "compact-roster-metadata-miss",
+        route: "direct",
+        scope: SCOPE,
+        session: session.id,
+        actor: session.actor,
+        target: "the_chatroom",
+        verb: "room_roster",
+        args: []
+      },
+      view: derivedViewOf(seq.store),
+      planningScope: SCOPE,
+      classifier,
+      base: seq.head(),
+      idempotencyKey: "compact-roster-metadata-miss",
+      stamp: seq.stamp()
+    });
+
+    expect(plan.transcript.result).toBeUndefined();
+    expect(plan.transcript.error).toMatchObject({
+      code: "E_INTERNAL",
+      message: "sparse planning room roster projection missing for the_chatroom"
+    });
+  });
+
+  it("uses the complete compact roster when pruning outliner per-actor state", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:compact-outliner-focus");
+    world.sessions.get(session.id)!.activeScope = "the_outline";
+    world.object(session.actor).location = "the_outline";
+    world.object("the_outline").contents.add(session.actor);
+    world.setProp("the_outline", "focus_by_actor", {
+      remote_present: null,
+      remote_stale: null
+    });
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seq.seed(cellsFromSerialized(world.exportWorld()));
+    const rows = [session.actor, "remote_present"].map((player) => ({
+      player,
+      name: player,
+      connected: true,
+      connected_at: 1_000,
+      connected_seconds: 5,
+      idle_seconds: 0,
+      last_login_at: 1_000,
+      location: "the_outline",
+      location_name: "The Outline",
+      presence: "awake"
+    }));
+
+    const plan = await planTurn({
+      call: {
+        kind: "woo.turn_call.shadow.v1",
+        id: "compact-outliner-focus",
+        route: "direct",
+        scope: SCOPE,
+        session: session.id,
+        actor: session.actor,
+        target: "the_outline",
+        verb: "focus_on",
+        args: [null]
+      },
+      view: derivedViewOf(seq.store),
+      planningScope: SCOPE,
+      classifier,
+      base: seq.head(),
+      idempotencyKey: "compact-outliner-focus",
+      stamp: seq.stamp(),
+      planningRoomRoster: { room: "the_outline", rows }
+    });
+
+    const focusWrite = plan.transcript.writes.find(
+      (write) => write.cell.kind === "prop" && write.cell.object === "the_outline" && write.cell.name === "focus_by_actor"
+    );
+    expect(focusWrite?.value).toEqual({
+      [session.actor]: null,
+      remote_present: null
+    });
+  });
+
   it("plans room entry without reading legacy subscriber projection cells", async () => {
     const world = createWorld();
     world.createObject({ id: "home", name: "Home", parent: "$room", owner: "$wiz" });

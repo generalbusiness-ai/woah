@@ -1,6 +1,6 @@
 {
   "name": "outliner",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "spec_version": "v1",
   "description": "Shared hierarchical text outliner. Each item is an $outline_item < $note tree node with .parent / .position / .hidden; the outliner is an $outliner < $room that scopes items and tracks per-actor focus + single-level undo from movement hooks. UI is minimal: collapse/expand, drag-reorder, drag-drop reparent, hidden checkbox, undo button, and embedded minichat. Chat carries 'add' / 'hide <item>' / 'focus [<item>]' commands. Items are not portable: they cannot be carried; removal recycles, with children re-attached to the removed item's former parent.",
   "license": "MIT",
@@ -155,7 +155,7 @@
           "skip_presence_check": true,
           "reads_room_presence": true,
           "arg_spec": { "args": [] },
-          "source": "verb :room_roster() rxd {\n  let rows = [];\n  for item in present_actors(this) {\n    // Presence rows are runtime-maintained, but projected snapshots can lag a\n    // recycled/disconnected actor. Treat stale refs like absent occupants.\n    let is_actor = false;\n    try { is_actor = valid(item) && isa(item, $actor); } except err { is_actor = false; }\n    if (is_actor) {\n      let idle = idle_seconds(item);\n      let row = { id: item, name: item.name, presence: presence_status(item) };\n      if (idle != null) { row[\"idle_seconds\"] = idle; }\n      rows = rows + [row];\n    }\n  }\n  return rows;\n}"
+          "source": "verb :room_roster() rxd {\n  // Adapt the compact owner projection without dereferencing actor clusters.\n  let rows = [];\n  for compact in room_roster(this) {\n    let row = { id: compact[\"player\"], name: compact[\"name\"], presence: compact[\"presence\"] };\n    if (compact[\"idle_seconds\"] != null) { row[\"idle_seconds\"] = compact[\"idle_seconds\"]; }\n    rows = rows + [row];\n  }\n  return rows;\n}"
         },
         {
           "name": "live_audience",
@@ -217,7 +217,7 @@
           "name": "_set_undo",
           "perms": "rx",
           "arg_spec": { "args": ["actor_obj", "record"] },
-          "source": "verb :_set_undo(actor_obj, record) rx {\n  let key = to_string(actor_obj);\n  let umap = this.last_undo;\n  let next = {};\n  // Prune entries for actors no longer present.\n  let present_keys = {};\n  for a in present_actors(this) { present_keys[to_string(a)] = true; }\n  for k in keys(umap) {\n    if (k != key && has(present_keys, k)) { next[k] = umap[k]; }\n  }\n  next[key] = record;\n  this.last_undo = next;\n  return true;\n}"
+          "source": "verb :_set_undo(actor_obj, record) rx {\n  let key = to_string(actor_obj);\n  let umap = this.last_undo;\n  let next = {};\n  // Prune against the owner-authoritative roster, never one shard's actors.\n  let present_keys = {};\n  for compact in room_roster(this) { present_keys[to_string(compact[\"player\"])] = true; }\n  for k in keys(umap) {\n    if (k != key && has(present_keys, k)) { next[k] = umap[k]; }\n  }\n  next[key] = record;\n  this.last_undo = next;\n  return true;\n}"
         },
         {
           "name": "_restore_item",
@@ -323,7 +323,7 @@
           "tool_exposed": true,
           "reads_room_presence": true,
           "arg_spec": { "args": ["item"] },
-          "source": "verb :focus_on(item) rx {\n  let target = null;\n  if (item != null) {\n    if (!isa(item, $outline_item)) { raise { code: \"E_NO_ITEM\", message: \"focus target must be null or an outline item\", value: item }; }\n    if (location(item) != this) { raise { code: \"E_NO_ITEM\", message: \"focus target is not in this outliner\", value: item }; }\n    target = item;\n  }\n  let key = to_string(actor);\n  let fmap = this.focus_by_actor;\n  let next = {};\n  let present_keys = {};\n  for a in present_actors(this) { present_keys[to_string(a)] = true; }\n  for k in keys(fmap) {\n    if (k != key && has(present_keys, k)) { next[k] = fmap[k]; }\n  }\n  next[key] = target;\n  this.focus_by_actor = next;\n  observe({ type: \"outline_focus_changed\", source: this, actor: actor, to: actor, outliner: this, item: target, ts: now() });\n  return target;\n}"
+          "source": "verb :focus_on(item) rx {\n  let target = null;\n  if (item != null) {\n    if (!isa(item, $outline_item)) { raise { code: \"E_NO_ITEM\", message: \"focus target must be null or an outline item\", value: item }; }\n    if (location(item) != this) { raise { code: \"E_NO_ITEM\", message: \"focus target is not in this outliner\", value: item }; }\n    target = item;\n  }\n  let key = to_string(actor);\n  let fmap = this.focus_by_actor;\n  let next = {};\n  let present_keys = {};\n  for compact in room_roster(this) { present_keys[to_string(compact[\"player\"])] = true; }\n  for k in keys(fmap) {\n    if (k != key && has(present_keys, k)) { next[k] = fmap[k]; }\n  }\n  next[key] = target;\n  this.focus_by_actor = next;\n  observe({ type: \"outline_focus_changed\", source: this, actor: actor, to: actor, outliner: this, item: target, ts: now() });\n  return target;\n}"
         },
         {
           "name": "focus_command",

@@ -55,6 +55,11 @@ Like `$pinboard`/`$kanban_board`, `$outliner` is not a subclass of any
 "document" abstraction — it reads as one because it is a room-shaped
 space with look, exit, speech, and movement-hook behavior.
 
+Its `room_roster()` presentation verb adapts the substrate's compact,
+owner-authoritative projection. It does not enumerate `present_actors(this)`,
+because a distributed planning shard need not materialize every collaborator's
+actor cluster.
+
 ## Data shapes
 
 | Property | On | Purpose |
@@ -66,8 +71,8 @@ space with look, exit, speech, and movement-hook behavior.
 | `position` | `$outline_item` | `int`. Sibling rank under `.parent`; siblings of the same parent carry a contiguous dense `1..N` numbering after any mutation. Default `0` (re-stamped on enterfunc). `perms: "r"`. |
 | `hidden` | `$outline_item` | `bool`. Default `false`. Flag is set only on items the user explicitly hid — descendant visual hiding is computed client-side. `perms: "r"`. |
 | `contents` | `$outliner` (built-in) | Items currently in the tree, plus present actors. |
-| `focus_by_actor` | `$outliner` | `map<str, objref \| null>`. Per-actor focus. Missing or `null` = root. Actor `enterfunc` clears a non-root stored focus, but it does not write an already-root/no-entry slot. Exit is observation-only for this map; stale entries are reset on the actor's next movement into the outliner or pruned by a later focus write, so durability is harmless. `perms: "r"`. |
-| `last_undo` | `$outliner` | `map<str, map \| null>`. **Single-level undo**: one slot per actor holding the inverse of their most recent mutation, or `null`/missing if there's nothing to undo. Each new mutation overwrites the slot. `:undo` applies the slot and clears it. Actor `enterfunc` wipes an existing slot so every fresh visit starts empty; exit is observation-only for this map, and later undo writes prune entries for actors not currently in `contents(this)`. `perms: "r"`. |
+| `focus_by_actor` | `$outliner` | `map<str, objref \| null>`. Per-actor focus. Missing or `null` = root. Actor `enterfunc` clears a non-root stored focus, but it does not write an already-root/no-entry slot. Exit is observation-only for this map; stale entries are reset on the actor's next movement into the outliner or pruned by a later focus write against the compact owner roster, so durability is harmless. `perms: "r"`. |
+| `last_undo` | `$outliner` | `map<str, map \| null>`. **Single-level undo**: one slot per actor holding the inverse of their most recent mutation, or `null`/missing if there's nothing to undo. Each new mutation overwrites the slot. `:undo` applies the slot and clears it. Actor `enterfunc` wipes an existing slot so every fresh visit starts empty; exit is observation-only for this map, and later undo writes prune entries for actors absent from the compact owner roster. `perms: "r"`. |
 | `mount_room` | `$outliner` | Optional room hosting the outliner for room-level activity events and for seeding the demo instance's return exit. Same shape as `$pinboard.mount_room`. `perms: "r"`. |
 
 All item-state properties and outliner-side maps are `perms: "r"` (public

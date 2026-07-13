@@ -33,12 +33,15 @@ room-like surface SHOULD provide `room_roster()` for presentation/API use and
 `{ id, name, presence, idle_seconds? }`, where `presence` is `"awake"`,
 `"idle"`, or `"sleeping"` as returned by `presence_status(actor)`. Rows are
 sorted by display `name` then `id`; `name` is the object's display title, not
-necessarily the raw `.name` property. Embodied room catalogs typically build the
-roster from contained actor bodies; workspace catalogs typically build it from
-non-expired subscribed sessions. A workspace actor whose subscribed session is
-no longer live may still appear as `"sleeping"` until the session expires or
-repair removes the subscription; live delivery remains stricter and only targets
-live sessions.
+necessarily the raw `.name` property. The substrate supplies this shape through
+`room_roster(space)`. In a distributed planning world that builtin MUST consume
+the compact, owner-authoritative room projection installed for that exact space;
+it MUST fail rather than derive a partial answer from the shard's locally
+materialized actor or session rows. Catalog `room_roster()` verbs adapt the
+compact rows to the stable presentation shape without dereferencing actor
+clusters. Authoritative local runtimes, which hold the complete session table,
+may derive the same compact rows locally. Live delivery remains a separate,
+stricter contract and only targets live sessions.
 
 ---
 

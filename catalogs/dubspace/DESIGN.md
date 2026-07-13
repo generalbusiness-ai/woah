@@ -64,8 +64,9 @@ custom events rather than private host DOM bindings.
 - A mounted-room relationship to the Living Room.
 - Presence-derived control authority for actors currently at the controls.
 
-Dubspace follows the workspace roster model. `room_roster()` returns distinct
-actors from runtime presence, enriched as `{id, name, presence, idle_seconds?}`;
+Dubspace follows the workspace roster model. `room_roster()` adapts the
+substrate's compact owner-authoritative projection into
+`{id, name, presence, idle_seconds?}` rows without actor-cluster reads;
 `live_audience(observation?)` is the separate delivery contract and delegates
 to the substrate observation routing rules. Control authority is not stored in
 a catalog-maintained operator list; verbs call `_require_present()`, which

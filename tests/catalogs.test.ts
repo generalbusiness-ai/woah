@@ -3079,8 +3079,7 @@ describe("local catalogs", () => {
     if (pinboardAudience.op === "result") expect(pinboardAudience.result).toEqual([first.id]);
 
     world.createObject({ id: "the_side_pinboard", name: "Side Pinboard", parent: "$pinboard", owner: "$wiz", location: "the_deck" });
-    world.setProp("the_side_pinboard", "session_subscribers", [{ session: first.id, actor: first.actor }] as unknown as WooValue);
-    world.setProp("the_side_pinboard", "subscribers", [first.actor]);
+    await moveActorTo(world, first.actor, "the_side_pinboard", { requestId: "roster-side-pinboard-moveto", sessionId: first.id });
     const sidePinboardRoster = await world.directCall("roster-side-pinboard", first.actor, "the_side_pinboard", "room_roster", []);
     expect(sidePinboardRoster.op).toBe("result");
     if (sidePinboardRoster.op === "result") {

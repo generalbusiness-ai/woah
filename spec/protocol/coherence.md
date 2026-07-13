@@ -523,7 +523,10 @@ One write path per fact (CO9), concretized:
   deterministically fixes the guest actor, session, and mint timestamp. The
   resulting scope submit therefore retains one idempotency key even when both
   internal reply attempts time out. Invalid, future, or expired claims are
-  refused; a claim is never recycled into a fresh identity.
+  refused; a claim is never recycled into a fresh identity. Before walking the
+  reusable pool, the claim-routed gateway checks every claim-derived session id
+  in its durable view and replays an already-live one. Thus an earlier occupied
+  seat becoming free cannot make one retry acquire a second pooled identity.
   Because a session bearer must be locally authenticatable, a failed
   post-accept closure fill installs the exact accepted session value as a
   durable derived echo stamped at the returned authority head. The transcript
@@ -535,6 +538,15 @@ One write path per fact (CO9), concretized:
   owner through the durable relation outbox. Explicit close preserves the
   marker and prior room until this reap; a concurrent live session suppresses
   retirement. Seed-pool actors carry no marker and remain reusable in place.
+- **Acceptance is not revoked by a failed relation expedite.** The committing
+  scope durably enqueues each foreign relation fact in the same transaction as
+  its accepted reply. The gateway normally delivers presence relations to the
+  room owner synchronously as a freshness fence. If that post-accept delivery
+  fails, the response remains accepted, carries
+  `relation_expedite_degraded: true`, and emits a named metric; the durable
+  outbox converges the owner asynchronously. A dependent roster read may be
+  briefly stale in this degraded case, but the caller is never told that its
+  already-durable write failed.
 - **Relation-owner topology is gateway knowledge** (the
   `rider_destinations` rule): the gateway classifies the transcript's
   relation-owner objects (move endpoints, create locations, contents

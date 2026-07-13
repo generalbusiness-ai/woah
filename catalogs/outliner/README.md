@@ -1,6 +1,6 @@
 ---
 name: outliner
-version: 1.0.0
+version: 1.0.1
 spec_version: v1
 license: MIT
 description: Shared hierarchical text outliner. Items are first-class $outline_item < $note objects with parent / position / hidden; the outliner is an $outliner < $room that scopes the tree and carries per-actor focus and single-level undo from movement hooks. Chat commands are 'add', 'hide <item>', 'focus [<item>]'.

@@ -165,6 +165,12 @@ report also separates `enter` from sustained `load` outcomes so the two failure
 classes cannot be conflated again. A fresh-namespace redeploy is required for
 the final acceptance decision.
 
+The same adapter rule now applies to the bundled collaborative tool rooms:
+pinboard 1.0.1, outliner 1.0.1, and dubspace 1.0.1 consume the compact builtin
+instead of `present_actors(this)`. Net planning also requires the exact room
+projection whenever the builtin executes, so future metadata under-detection
+fails loudly instead of returning a shard-local partial roster.
+
 ### Second deployed iteration (`a75189e`) and movement diagnosis
 
 A fresh namespace with chat 0.2.13 accepted all 600 sustained say/look turns
