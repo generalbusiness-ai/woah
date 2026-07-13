@@ -208,7 +208,7 @@ describe("NC8b: the per-turn RPC budget and parallel-group mechanics (TurnStruct
     const { TurnStructure } = await import("../../src/worker/net/gateway-do");
     const structure = new TurnStructure();
     for (let i = 0; i < 32; i += 1) {
-      await structure.rpc(async () => i);
+      await structure.rpc(async () => i, { phase: "probe" });
     }
     expect(structure.sync_rpc).toBe(32);
     // The 33rd is refused BEFORE issuing (the action must not run)...
@@ -216,8 +216,11 @@ describe("NC8b: the per-turn RPC budget and parallel-group mechanics (TurnStruct
     await expect(
       structure.rpc(async () => {
         ran = true;
-      })
-    ).rejects.toMatchObject({ code: "E_BUDGET" });
+      }, { phase: "overflow" })
+    ).rejects.toMatchObject({
+      code: "E_BUDGET",
+      detail: { next_phase: "overflow", rpc_phases: { probe: 32 } }
+    });
     expect(ran).toBe(false);
     // ...but a MANDATORY step (the CO2.5 disambiguation resubmit, the
     // post-accept warm fill) still runs at the budget's edge.

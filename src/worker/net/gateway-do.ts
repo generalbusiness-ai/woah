@@ -311,6 +311,9 @@ export class TurnStructure {
    * while sync_rpc still counts all K. depth < sync_rpc therefore
    * measures how much of the fanout the turn paid in parallel. */
   rpc_depth = 0;
+  /** Diagnostic attribution for budget refusals. Aggregate sync_rpc alone
+   * cannot distinguish healthy fanout from a repair loop on real DOs. */
+  private readonly rpcPhases = new Map<string, number>();
   countReconstruction(): void {
     this.reconstructions += 1;
   }
@@ -319,21 +322,25 @@ export class TurnStructure {
    * submit (disambiguation is not optional) and the post-accept warm
    * fill (the commit is already durable; refusing the fill would turn
    * an accepted turn into an error). */
-  private assertBudget(adding: number): void {
+  private assertBudget(adding: number, nextPhase: string): void {
     if (this.sync_rpc + adding > MAX_TURN_SYNC_RPC || this.rpc_ms > MAX_TURN_RPC_MS) {
       throw netError("E_BUDGET", "per-turn RPC budget exhausted", {
         sync_rpc: this.sync_rpc,
         rpc_ms: this.rpc_ms,
+        next_phase: nextPhase,
+        rpc_phases: Object.fromEntries([...this.rpcPhases].sort()),
         limit_rpc: MAX_TURN_SYNC_RPC,
         limit_rpc_ms: MAX_TURN_RPC_MS
       });
     }
   }
   /** One timed, counted, budgeted RPC step. */
-  async rpc<T>(action: () => Promise<T>, options: { mandatory?: boolean } = {}): Promise<T> {
-    if (!options.mandatory) this.assertBudget(1);
+  async rpc<T>(action: () => Promise<T>, options: { mandatory?: boolean; phase?: string } = {}): Promise<T> {
+    const phase = options.phase ?? "unlabeled";
+    if (!options.mandatory) this.assertBudget(1, phase);
     this.sync_rpc += 1;
     this.rpc_depth += 1;
+    this.rpcPhases.set(phase, (this.rpcPhases.get(phase) ?? 0) + 1);
     const started = Date.now();
     try {
       return await action();
@@ -348,11 +355,13 @@ export class TurnStructure {
    * toward sync_rpc but ONE step of depth and its longest member toward
    * rpc_ms. Rejections propagate after all settle (no orphaned writes
    * mid-group). */
-  async rpcGroup<T>(actions: Array<() => Promise<T>>): Promise<T[]> {
+  async rpcGroup<T>(actions: Array<() => Promise<T>>, options: { phase?: string } = {}): Promise<T[]> {
     if (actions.length === 0) return [];
-    this.assertBudget(actions.length);
+    const phase = options.phase ?? "unlabeled_group";
+    this.assertBudget(actions.length, phase);
     this.sync_rpc += actions.length;
     this.rpc_depth += 1;
+    this.rpcPhases.set(phase, (this.rpcPhases.get(phase) ?? 0) + actions.length);
     const started = Date.now();
     try {
       const settled = await Promise.allSettled(actions.map((action) => action()));
@@ -374,7 +383,7 @@ export class TurnStructure {
 async function timedRpc<T>(
   structure: TurnStructure | undefined,
   action: () => Promise<T>,
-  options: { mandatory?: boolean } = {}
+  options: { mandatory?: boolean; phase?: string } = {}
 ): Promise<T> {
   return structure ? structure.rpc(action, options) : action();
 }
@@ -1079,7 +1088,7 @@ export class NetGatewayDO {
         resubmit = null;
       } else {
         try {
-          planningHead = await structure.rpc(() => this.scopeHead(this.destinationFor(request, request.planningScope)));
+          planningHead = await structure.rpc(() => this.scopeHead(this.destinationFor(request, request.planningScope)), { phase: "planning_head" });
           this.assertTurnEpoch(planningHead, request.catalog_epoch, request.planningScope, trace);
           planned = await this.planOnce(request, view, classifier, planningHead.object_counter, planningRoomRoster);
         } catch (err) {
@@ -1130,7 +1139,7 @@ export class NetGatewayDO {
         // consume it. A turn stamped with another epoch can NEVER commit
         // (re-planning re-stamps the same epoch), so fail fast here
         // instead of grinding plan → submit → reseed to E_BUDGET.
-        const live = await structure.rpc(() => this.scopeHead(destination));
+        const live = await structure.rpc(() => this.scopeHead(destination), { phase: "selected_head" });
         this.assertTurnEpoch(live, request.catalog_epoch, targetScope, trace);
         base = live.head;
       }
@@ -1162,7 +1171,7 @@ export class NetGatewayDO {
       };
       let reply: CommitReply;
       try {
-        reply = (await structure.rpc(() => this.host.rpc(destination, "/submit", submitBody))) as CommitReply;
+        reply = (await structure.rpc(() => this.host.rpc(destination, "/submit", submitBody), { phase: "submit" })) as CommitReply;
       } catch (err) {
         // NC8b: never re-submit after a BUDGET refusal — the first submit
         // was never issued, so there is nothing to disambiguate.
@@ -1174,7 +1183,7 @@ export class NetGatewayDO {
         // reply; an uncommitted one validates fresh. Only a second
         // transport failure surfaces (with the trace via fix 5d).
         // MANDATORY: disambiguation must run even at the budget's edge.
-        reply = (await structure.rpc(() => this.host.rpc(destination, "/submit", submitBody), { mandatory: true })) as CommitReply;
+        reply = (await structure.rpc(() => this.host.rpc(destination, "/submit", submitBody), { mandatory: true, phase: "submit_disambiguate" })) as CommitReply;
       }
       if (reply.status === "accepted") {
         // Make an accepted presence transition visible at its room authority
@@ -1245,7 +1254,7 @@ export class NetGatewayDO {
 
       switch (reply.reason) {
         case "stale_head": {
-          const live = await this.tryRecovery(trace, () => structure.rpc(() => this.scopeHead(destination)));
+          const live = await this.tryRecovery(trace, () => structure.rpc(() => this.scopeHead(destination), { phase: "stale_head_refresh" }));
           // Phase 5: epoch check OUTSIDE tryRecovery (the M9 pattern) —
           // a genuine epoch disagreement is terminal and must escape the
           // retry loop, while a FAILED head fetch stays on the budget
@@ -3255,7 +3264,7 @@ export class NetGatewayDO {
       this.destinationFor(request, scope),
       "/room-roster",
       { room }
-    )) as { room?: unknown; rows?: unknown };
+    ), { phase: "room_roster" }) as { room?: unknown; rows?: unknown };
     if (response.room !== room || !Array.isArray(response.rows)) {
       throw new Error(`room-roster authority returned malformed projection for ${room}`);
     }
@@ -3281,7 +3290,7 @@ export class NetGatewayDO {
         deltas: entry.deltas,
         observations: observationsForRelationOwners(observations, entry.deltas)
       });
-      if (structure) await structure.rpc(deliver, { mandatory: true });
+      if (structure) await structure.rpc(deliver, { mandatory: true, phase: "presence_fence" });
       else await deliver();
     }
   }
@@ -3387,7 +3396,7 @@ export class NetGatewayDO {
         cells: Array<{ key: string; version: string }>;
       }>;
     const replies = structure
-      ? await structure.rpcGroup(owners.map(([owner, keys]) => () => attest(owner, keys)))
+      ? await structure.rpcGroup(owners.map(([owner, keys]) => () => attest(owner, keys)), { phase: "attest" })
       : await Promise.all(owners.map(([owner, keys]) => attest(owner, keys)));
     const attestations: NonNullable<CommitSubmit["attestations"]> = {};
     owners.forEach(([owner], index) => {
@@ -3595,7 +3604,7 @@ export class NetGatewayDO {
     const transfer = (await timedRpc(
       structure,
       () => this.host.rpc(destination, "/closure", { keys: touched, known: [] }),
-      { mandatory: true }
+      { mandatory: true, phase: "install_touched" }
     )) as CellTransfer;
     const wanted = new Set(touched);
     this.discardViewOnThrow(() =>
@@ -3677,7 +3686,7 @@ export class NetGatewayDO {
       return this.host.rpc(destination, "/closure", { keys: want, known, objects }) as Promise<CellTransfer>;
     };
     const transfers = structure
-      ? await structure.rpcGroup(destinations.map((entry) => () => fetchOne(entry)))
+      ? await structure.rpcGroup(destinations.map((entry) => () => fetchOne(entry)), { phase: "refresh_known" })
       : await Promise.all(destinations.map(fetchOne));
     destinations.forEach(([, want], index) => {
       const transfer = transfers[index];
@@ -3722,8 +3731,10 @@ export class NetGatewayDO {
         try {
           // Objects mode here too (phase i): a convention hit must
           // materialize the object whole, not just the named keys.
-          const transfer = (await timedRpc(structure, () =>
-            this.host.rpc(destination, "/closure", { keys: want, known, objects: [object] })
+          const transfer = (await timedRpc(
+            structure,
+            () => this.host.rpc(destination, "/closure", { keys: want, known, objects: [object] }),
+            { phase: "refresh_unknown" }
           )) as CellTransfer;
           if (transfer.cells.length === 0) continue;
           this.discardViewOnThrow(() =>
@@ -3791,7 +3802,7 @@ export class NetGatewayDO {
     // D2: a full reseed is an authority reconstruction and one sync RPC on
     // the turn path (the /net/pull live path passes no structure, unchanged).
     structure?.countReconstruction();
-    const transfer = (await timedRpc(structure, () => this.host.rpc(destination, "/closure", { keys: ["*"], known }))) as CellTransfer & {
+    const transfer = (await timedRpc(structure, () => this.host.rpc(destination, "/closure", { keys: ["*"], known }), { phase: "reseed" })) as CellTransfer & {
       scope: string;
       head: ScopeHead;
       catalog_epoch: string;
