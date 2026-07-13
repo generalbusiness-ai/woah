@@ -654,6 +654,77 @@ export class WooWorld {
     });
   }
 
+  /** Planning-time room snapshots must use the same compact owner roster as
+   * catalog room_roster(). Physical contents can retain disconnected player
+   * objects after their sessions close; dereferencing those actor clusters is
+   * both semantically stale and an O(room history) distributed read. */
+  private projectedRoomRosterSummaries(room: ObjRef): ScopedObjectSummary[] | null {
+    const projected = this.roomRosterProjections.get(room);
+    if (projected === undefined) return null;
+    const summaries: ScopedObjectSummary[] = [];
+    for (const value of projected) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+      const row = value as Record<string, WooValue>;
+      if (typeof row.player !== "string" || typeof row.name !== "string") continue;
+      summaries.push({
+        id: row.player,
+        name: row.name,
+        ancestors: [],
+        location: room
+      });
+    }
+    return summaries;
+  }
+
+  /** Presentation-only classification against already-loaded lineage. It must
+   * not create transcript reads for disconnected physical players that the
+   * compact presence authority deliberately omitted. */
+  private loadedInheritsFromUnrecorded(object: ObjRef, ancestor: ObjRef): boolean {
+    let current: ObjRef | null = object;
+    const seen = new Set<ObjRef>();
+    while (current && !seen.has(current)) {
+      if (current === ancestor) return true;
+      seen.add(current);
+      current = this.objects.get(current)?.parent ?? null;
+    }
+    return false;
+  }
+
+  /** Apply a planned session transition to the transient owner snapshot so
+   * move results describe post-turn presence. This mutates planning-only data;
+   * the accepted relation remains the sole durable write path. */
+  private applyTransientRoomRosterTransition(session: Session, from: ObjRef | null, to: ObjRef): void {
+    if (from) {
+      const source = this.roomRosterProjections.get(from);
+      if (source) {
+        this.roomRosterProjections.set(from, source.filter((value) =>
+          !(value && typeof value === "object" && !Array.isArray(value) && (value as Record<string, WooValue>).player === session.actor)
+        ));
+      }
+    }
+    const destination = this.roomRosterProjections.get(to);
+    if (destination === undefined) return;
+    const withoutActor = destination.filter((value) =>
+      !(value && typeof value === "object" && !Array.isArray(value) && (value as Record<string, WooValue>).player === session.actor)
+    );
+    const actorName = this.objects.get(session.actor)?.name ?? session.actor;
+    const now = this.logicalNow("room_roster.transition");
+    const started = session.started ?? now;
+    const roomName = this.objects.get(to)?.name ?? to;
+    this.roomRosterProjections.set(to, [...withoutActor, {
+      player: session.actor,
+      name: actorName,
+      connected: true,
+      connected_at: started,
+      connected_seconds: Math.max(0, Math.floor((now - started) / 1000)),
+      idle_seconds: 0,
+      last_login_at: started,
+      location: to,
+      location_name: roomName,
+      presence: "awake"
+    } as unknown as WooValue]);
+  }
+
   // CA11.2: attach the planning world's per-cell provenance so the
   // movement-boundary check in movetoActorChecked can tell whether a movement
   // destination's lineage was admitted from an owner-authoritative row or from
@@ -4395,11 +4466,22 @@ export class WooWorld {
     }
 
     const roomSummary = await this.scopedObjectSummary(actor, room, memo);
-    const presentRefs = await this.chatPresentAsync(room, actor);
-    const contentRefs = (await this.objectContents(room, memo)).filter((item) => !this.isActorForLook(item, presentRefs));
+    const projectedRoster = this.projectedRoomRosterSummaries(room);
+    const presentRefs = projectedRoster?.map((item) => item.id) ?? await this.chatPresentAsync(room, actor);
+    const contentRefs = (await this.objectContents(room, memo)).filter((item) =>
+      projectedRoster !== null
+        ? !this.loadedInheritsFromUnrecorded(item, "$player")
+        : !this.isActorForLook(item, presentRefs)
+    );
     const exits = await this.exitSummariesForRoom(actor, room, memo);
-    const present = await this.scopedObjectSummaries(actor, presentRefs, memo);
-    const roster = presentRefs.map((id) => present[id]).filter((item): item is ScopedObjectSummary => item !== undefined).map((item) => this.thinScopedObjectSummary(item));
+    let roster = projectedRoster;
+    if (roster === null) {
+      const present = await this.scopedObjectSummaries(actor, presentRefs, memo);
+      roster = presentRefs
+        .map((id) => present[id])
+        .filter((item): item is ScopedObjectSummary => item !== undefined)
+        .map((item) => this.thinScopedObjectSummary(item));
+    }
     const contents = await this.scopedObjectSummaries(actor, contentRefs, memo);
     return {
       id: room,
@@ -5993,6 +6075,9 @@ export class WooWorld {
         this.recordTurnEvent({ kind: "session_scope", session: session.id, actor, from: oldLocation ?? null, to: targetRef });
       }
       this.setSessionActiveScope(session, targetRef);
+      if (derivesPresenceFromTranscript) {
+        this.applyTransientRoomRosterTransition(session, oldLocation, targetRef);
+      }
       this.persistSession(session);
       const primary = this.primarySessionForActor(actor);
       const isPrimary = primary?.id === session.id;

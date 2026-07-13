@@ -201,3 +201,28 @@ session active room for actor verbs, derived from topology rather than verb
 names. Focused cross-room and v2-browser tests assert the transition,
 destination roster, and absence of both legacy projection reads. Deployed
 confirmation is still required.
+
+### Third deployed diagnosis: move-result hydration
+
+Phase-counted RPC refusal details made the remaining loop explicit: one actor,
+four attempts, with four planning heads, four selected heads, four submits,
+four targeted refreshes, and sixteen attestations. The preserved CO6 attempt
+trace named the same cells every round: `description` and `home` on two old
+elastic guest actors.
+
+Those two actors were exactly the successful movers from the preceding partial
+run. Session close had retracted their presence rows, but physical containment
+remained for guest-seat reuse. `enrichScopedMoveResult` handled the catalog's
+`here_request` by calling `roomSnapshotForActor`, which rebuilt its roster from
+physical room contents and dereferenced those disconnected actor clusters.
+This bypassed the compact owner roster after the verb itself had already used
+the correct path.
+
+Planning-time room snapshots now consume the installed transient owner roster,
+exclude loaded physical `$player` rows from ordinary contents without recording
+actor authority reads, and apply the planned session transition to the
+transient value so the immediate result includes the mover. The durable
+`session_presence` relation remains the only persisted roster path. A focused
+test leaves a disconnected player physically in the destination and proves an
+enter neither reads that player's `home`/`description` nor omits the moving
+caller from the returned roster. Deployed confirmation remains required.
