@@ -24,7 +24,7 @@
 import { sessionShardHint } from "../src/net/session-id";
 
 type Guest = { actor: string; session: string; elastic: boolean };
-type Outcome = { status: number; ms: number; code: string; accepted: boolean; detail: string };
+type Outcome = { phase: "enter" | "load"; status: number; ms: number; code: string; accepted: boolean; detail: string };
 
 /** One responder's `who_all` reply, reduced to what the summary needs. */
 export type WhoRosterInput = {
@@ -229,9 +229,9 @@ async function main(): Promise<void> {
         const code = typeof error === "object" && error !== null && typeof error.code === "string"
           ? error.code
           : typeof error === "string" ? error : response.ok ? String(reply?.status ?? "ok") : `HTTP_${response.status}`;
-        return { status: response.status, ms, code, accepted: response.ok && reply?.status === "accepted", detail: JSON.stringify(body).slice(0, 1_000) };
+        return { phase: "enter", status: response.status, ms, code, accepted: response.ok && reply?.status === "accepted", detail: JSON.stringify(body).slice(0, 1_000) };
       } catch (err) {
-        return { status: 0, ms: Math.round(performance.now() - started), code: "E_FETCH", accepted: false, detail: String(err).slice(0, 1_000) };
+        return { phase: "enter", status: 0, ms: Math.round(performance.now() - started), code: "E_FETCH", accepted: false, detail: String(err).slice(0, 1_000) };
       }
     }));
     outcomes.push(...enterBatch);
@@ -267,6 +267,7 @@ async function main(): Promise<void> {
             ? error.code
             : typeof error === "string" ? error : response.ok ? String(reply?.status ?? "ok") : `HTTP_${response.status}`;
           return {
+            phase: "load",
             status: response.status,
             ms,
             code,
@@ -276,6 +277,7 @@ async function main(): Promise<void> {
         } catch (err) {
           const cause = err instanceof Error && err.cause !== undefined ? ` cause=${String(err.cause)}` : "";
           return {
+            phase: "load",
             status: 0,
             ms: Math.round(performance.now() - started),
             code: "E_FETCH",
@@ -324,6 +326,14 @@ async function main(): Promise<void> {
   const serverErrors = failures.filter((outcome) => outcome.status >= 500);
   const statusCounts = new Map<number, number>();
   for (const outcome of outcomes) statusCounts.set(outcome.status, (statusCounts.get(outcome.status) ?? 0) + 1);
+  // Keep setup joins distinct from the sustained say/look envelope. A join
+  // storm and an ordinary-turn failure have different capacity implications;
+  // aggregating them concealed that distinction during the roster canary.
+  const phaseOutcomes = Object.fromEntries((["enter", "load"] as const).map((phase) => {
+    const rows = outcomes.filter((outcome) => outcome.phase === phase);
+    const failed = rows.filter((outcome) => !outcome.accepted);
+    return [phase, { turns: rows.length, accepted: rows.length - failed.length, failures: failed.length }];
+  }));
   const report = {
     run,
     actors: guests.length,
@@ -333,6 +343,7 @@ async function main(): Promise<void> {
     turns: outcomes.length,
     requests_per_actor: requestsPerActor,
     round_delay_ms: roundDelayMs,
+    phase_outcomes: phaseOutcomes,
     accepted: outcomes.length - failures.length,
     failures: failures.length,
     error_rate: outcomes.length === 0 ? 1 : failures.length / outcomes.length,

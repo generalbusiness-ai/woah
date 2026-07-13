@@ -150,3 +150,17 @@ Local evidence now includes a no-deferred-drain cross-gateway test and a
 30-occupant planner test: complete result, no per-actor transcript reads, and
 the normal 64 KiB envelope ceiling unchanged. The deployed 30-actor
 `--enforce-who` canary remains the acceptance decision.
+
+### First deployed iteration (`d09e824`)
+
+The isolated canary proved the owner projection itself: 30/30 responders on
+all eight gateway shards saw the complete 30-person roster (`min_seen=30`,
+`max_missing=0`, no unreachable responders), and 22 elastic guests provisioned.
+It also exposed a remaining superstructure caller: `$room:room_roster` and
+`$room:look_self` still used `active_actors` and per-actor dereferences. The
+30 concurrent setup enters produced 29 `E_BUDGET` responses; a 10-person
+control also produced oversized envelopes. Chat 0.2.13 now adapts the generic
+compact builtin for `room_roster`, `look_self`, `who`, and `enter`. The load
+report also separates `enter` from sustained `load` outcomes so the two failure
+classes cannot be conflated again. A fresh-namespace redeploy is required for
+the final acceptance decision.

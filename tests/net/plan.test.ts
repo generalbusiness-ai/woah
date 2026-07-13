@@ -159,6 +159,36 @@ describe("compact room-roster planning", () => {
     ]));
     expect(plan.envelopeBytes).toBeLessThan(WARM_ENVELOPE_BYTE_LIMIT);
     expect(plan.transcript.reads.some((read) => read.cell.object.startsWith("guest_"))).toBe(false);
+
+    // The chat catalog adapter used by enter/who/look preserves its stable
+    // presentation shape while consuming the same one transient value.
+    const roomRosterPlan = await planTurn({
+      call: {
+        kind: "woo.turn_call.shadow.v1",
+        id: "compact-chat-roster-30",
+        route: "direct",
+        scope: SCOPE,
+        session: session.id,
+        actor: session.actor,
+        target: room,
+        verb: "room_roster",
+        args: []
+      },
+      view,
+      planningScope: SCOPE,
+      classifier,
+      base: seq.head(),
+      idempotencyKey: "compact-chat-roster-30",
+      stamp: seq.stamp(),
+      planningRoomRoster: { room, rows }
+    });
+    expect(roomRosterPlan.transcript.result).toHaveLength(30);
+    expect(roomRosterPlan.transcript.result).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "guest_0", name: "Guest 0", presence: "awake" }),
+      expect.objectContaining({ id: "guest_29", name: "Guest 29", presence: "awake" })
+    ]));
+    expect(roomRosterPlan.envelopeBytes).toBeLessThan(WARM_ENVELOPE_BYTE_LIMIT);
+    expect(roomRosterPlan.transcript.reads.some((read) => read.cell.object.startsWith("guest_"))).toBe(false);
   });
 });
 

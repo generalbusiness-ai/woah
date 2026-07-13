@@ -1380,7 +1380,7 @@ describe("woo core", () => {
     const beforeRoster = before.seed.objects
       .find((obj) => obj.id === "$conversational")
       ?.verbs.find((verb) => verb.name === "room_roster");
-    expect(beforeRoster?.source).toContain("active_actors(this)");
+    expect(beforeRoster?.source).toContain("room_roster(this)");
 
     const current = gateway.ownVerbExact("$conversational", "room_roster");
     expect(current).toBeTruthy();

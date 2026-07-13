@@ -62,6 +62,9 @@ idle_seconds?}`. Physical `contents` remains object placement, not the roster
 source, because projected room contents can retain stale disconnected guests;
 subscriber rows are delivery audience state and can include observers who are
 not visibly in the room.
+The verb adapts the substrate's generic `room_roster(this)` compact owner
+projection rather than dereferencing each actor. This keeps the user-visible
+shape in woocode while making planning cost one room-authority read.
 `$room:live_audience(observation?)` is the separate delivery answer; it
 delegates to the substrate's observation audience rules and returns live
 subscribed session ids. Render/API code should use `room_roster()`, not

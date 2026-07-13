@@ -4243,7 +4243,7 @@ describe("CFObjectRepository production-shape coverage", () => {
 
       expect(repairedHealthz.ok).toBe(true);
       expect(harness.hostSeedFetches).toContain("the_deck");
-      expect(world.ownVerbExact("$conversational", "room_roster")?.source).toContain("valid(item)");
+      expect(world.ownVerbExact("$conversational", "room_roster")?.source).toContain("room_roster(this)");
       expect(world.ownVerbExact("$conversational", "room_roster")?.source).not.toContain("return [\"stale\"]");
     } finally {
       logSpy.mockRestore();
@@ -4280,7 +4280,7 @@ describe("CFObjectRepository production-shape coverage", () => {
 
       expect(repairedHealthz.ok).toBe(true);
       expect(harness.hostSeedFetches).toContain("the_deck");
-      expect(world.ownVerbExact("$conversational", "room_roster")?.source).toContain("active_actors(this)");
+      expect(world.ownVerbExact("$conversational", "room_roster")?.source).toContain("room_roster(this)");
       expect(world.ownVerbExact("$conversational", "room_roster")?.source).not.toContain("return [\"stale\"]");
     } finally {
       logSpy.mockRestore();

@@ -310,8 +310,12 @@ item; what remains is exactly what the workerd lanes cannot prove
   value directly before a roster-reading turn and installs it only in the
   ephemeral planning world; no per-occupant actor/session authority cells
   enter the turn's read closure. This is deliberately computed from the one
-  relation family rather than persisted as a second roster authority. The result is
-  one O(N)-byte RPC and O(1) planning inputs, with no per-occupant RPC.
+  relation family rather than persisted as a second roster authority. The
+  result is one O(N)-byte RPC and O(1) planning inputs, with no per-occupant
+  RPC. Chat's `$room:room_roster` adapts this generic value to the stable
+  catalog row shape; `look_self`, `who`, and `enter` therefore share the
+  compact path. Workspace catalogs retain their distinct focus/subscription
+  roster semantics.
 
   Presence transition acceptance includes a freshness fence: after the actor
   scope commits, the gateway delivers the same `(from_scope, seq)` relation
