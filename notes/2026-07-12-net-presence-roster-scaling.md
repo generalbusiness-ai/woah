@@ -123,3 +123,30 @@ Net: gate #2 (`--enforce-who`) is a genuine net-presence-architecture work
 item (compact projection + cross-shard completeness + reaping), not a
 `who_all` DSL tweak. The isolated canary is the validation harness for it.
 Prod is unaffected throughout (`dece153`, net OFF).
+
+## Implemented correction (post-`bd33f47`, pending deployed confirmation)
+
+The implementation follows the measured constraints but does **not** persist a
+second roster cell. The room's owner-sequenced `session_presence` family is
+already the projection authority; `POST /net/room-roster` reduces it to one
+compact value at read time. Persisting the reduction would add another durable
+write/rebuild contract while the response remains O(occupants) bytes.
+
+- `who_all` consumes the generic `room_roster(space)` builtin. Net planning
+  installs one transient owner snapshot, so no per-occupant actor
+  lineage/session/live cells enter the read closure. Non-net worlds fall back
+  to their complete local session table.
+- A gateway fetches the snapshot directly from the room authority, never its
+  asynchronously replicated mirror.
+- An accepted session transition is synchronously expedited to the room owner
+  under the same `(from_scope, seq)` idempotency identity as the durable outbox.
+  This closes the enter-reply → immediate-who race; the outbox remains recovery.
+- Snapshot reduction excludes expired session values. Explicit close and the
+  existing alarm reaper continue to retract the durable owner rows locally or
+  through `/net/relate`. Self-renames refresh the same presence row through the
+  relation derivation path, avoiding transition-time stale display names.
+
+Local evidence now includes a no-deferred-drain cross-gateway test and a
+30-occupant planner test: complete result, no per-actor transcript reads, and
+the normal 64 KiB envelope ceiling unchanged. The deployed 30-actor
+`--enforce-who` canary remains the acceptance decision.

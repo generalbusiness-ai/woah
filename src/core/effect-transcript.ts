@@ -56,6 +56,10 @@ export type TranscriptMove = {
 export type TranscriptSessionScopeTransition = {
   session: string;
   actor: ObjRef;
+  /** Compact display identity captured by the planner that owns the actor
+   * lineage. Presence owners use it for roster projection without importing
+   * the actor's authority cells into every room turn. */
+  actorName?: string;
   from: ObjRef | null;
   to: ObjRef | null;
 };

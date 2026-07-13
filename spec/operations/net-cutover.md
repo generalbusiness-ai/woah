@@ -300,18 +300,35 @@ item; what remains is exactly what the workerd lanes cannot prove
   confirmation remains.** No public verb may enumerate all sessions or all
   objects: that returns a per-shard partial view under sharding and violates
   Big-World discipline. `who_all`/`@who` (no argument) is presence-scoped to
-  the caller's room via `active_actors(<scope>)`; the former
+  the caller's room via the generic `room_roster(<scope>)` projection; the former
   `connected_players` global session scan is retired (tombstoned).
   `@join`/`join_player` resolves only an explicit `$player`
   reference — no global object scan and no cross-shard name directory (join by
   human name is not supported; a co-present player is already in the room).
-  Sparse planning consumes the room authority's owner-anchored
-  `session_presence` rows. Each row carries the exact session, actor-lineage,
-  and actor-live projections captured by the single relation-derivation path;
-  those bounded cells exist only in the ephemeral planning snapshot. A
-  multi-gateway regression rehydrates a shard without a peer's cluster cells
-  and still commits `who_all` with the complete roster, without a global scan
-  or per-occupant RPC. Deployed confirmation:
+  The room authority reduces its owner-anchored `session_presence` rows into
+  one compact roster value (`POST /net/room-roster`). The gateway fetches that
+  value directly before a roster-reading turn and installs it only in the
+  ephemeral planning world; no per-occupant actor/session authority cells
+  enter the turn's read closure. This is deliberately computed from the one
+  relation family rather than persisted as a second roster authority. The result is
+  one O(N)-byte RPC and O(1) planning inputs, with no per-occupant RPC.
+
+  Presence transition acceptance includes a freshness fence: after the actor
+  scope commits, the gateway delivers the same `(from_scope, seq)` relation
+  fact synchronously to the room owner before returning success. The actor
+  scope's durable outbox remains the crash-recovery path; its duplicate is an
+  owner-sequenced no-op. Thus a dependent `who_all` cannot race an owner that
+  has not learned the accepted enter. Gateway mirrors remain asynchronous and
+  are not used as roster authority. Snapshot construction excludes expired
+  session values, while explicit close and the session alarm retract durable
+  local/foreign presence rows through the existing owner-sequenced path. A
+  present actor's self-rename refreshes the same relation row in the rename
+  commit, so compact labels do not remain frozen at entry time.
+
+  A multi-gateway regression rehydrates a shard without a peer's cluster cells
+  and, without draining deferred fanout, still commits `who_all` with the
+  complete roster. A 30-occupant planner regression remains below the 64 KiB
+  envelope limit and records no per-actor reads. Deployed confirmation:
   `load:net-canary -- --enforce-who` must return a
   complete co-present roster from every shard, failing on any partial or
   inconclusive result — a signal the single-image workerd-local lanes cannot
@@ -370,10 +387,10 @@ item; what remains is exactly what the workerd lanes cannot prove
   per-scope gateway lanes. The public route remains closed pending the
   owner-run cutover and geographically separated/cold-start/sustained-rate
   bake.
-- **Global-presence commands — LOCAL GATE CLOSED; DEPLOY CONFIRMATION
+- **Global-presence commands — COMPACT OWNER SNAPSHOT BUILT; DEPLOY CONFIRMATION
   REQUIRED.** Global enumeration is removed and owner-scoped presence now
-  enters sparse planning as described above. The load driver fails closed on
-  a partial or inconclusive result; public selection still requires a passing
+  enters sparse planning through the freshness fence described above. The load
+  driver fails closed on a partial or inconclusive result; public selection still requires a passing
   deployed multi-shard `--enforce-who` canary.
 
 The AE watch exits 2 on any RPC timeout, queue refusal, outbox delivery

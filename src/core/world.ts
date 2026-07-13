@@ -607,6 +607,8 @@ export class WooWorld {
   // for rendering a stale room. The gateway path has the same force-owner repair
   // loop as the movement check; other planning holders leave this off.
   private enforceResolutionOwnerRepair = false;
+  /** Compact owner roster values exist only in an ephemeral planning world. */
+  private readonly roomRosterProjections = new Map<ObjRef, WooValue[]>();
 
   constructor(private repository?: WooRepository, options: { executorContext?: ExecutorContext | null; turnRecorder?: TurnRecorder | null } = {}) {
     this.objectRepository = isObjectRepository(repository) ? repository : null;
@@ -617,6 +619,39 @@ export class WooWorld {
 
   setTurnRecorder(recorder: TurnRecorder | null): void {
     this.turnRecorder = recorder;
+  }
+
+  installRoomRosterProjection(room: ObjRef, rows: readonly Record<string, unknown>[]): void {
+    this.roomRosterProjections.set(room, cloneImportedPlainData(rows) as WooValue[]);
+  }
+
+  roomRosterProjection(room: ObjRef): WooValue[] {
+    const projected = this.roomRosterProjections.get(room);
+    if (projected !== undefined) return cloneImportedPlainData(projected);
+
+    // Non-net runtimes own a complete local session table and do not install
+    // transient projections. Preserve their established who semantics while
+    // net planning always installs an explicit snapshot (including []).
+    const now = this.logicalNow("room_roster.now");
+    const roomName = this.objects.get(room)?.name ?? room;
+    return this.activeActorsIn(room).map((actor) => {
+      const stats = this.playerSessionStats(actor, now);
+      const presence = stats.connected
+        ? stats.idleSeconds !== null && stats.idleSeconds >= 60 ? "idle" : "awake"
+        : "sleeping";
+      return {
+        player: actor,
+        name: this.objects.get(actor)?.name ?? actor,
+        connected: stats.connected,
+        connected_at: stats.connectedAt,
+        connected_seconds: stats.connectedSeconds,
+        idle_seconds: stats.idleSeconds,
+        last_login_at: stats.lastLoginAt,
+        location: room,
+        location_name: roomName,
+        presence
+      } as unknown as WooValue;
+    });
   }
 
   // CA11.2: attach the planning world's per-cell provenance so the

@@ -47,14 +47,7 @@ describe("elastic guest provisioning", () => {
       member: "s_net-api-2_abc",
       body: {
         actor: "guest_net_abc",
-        actor_lineage: {
-          anchor: null,
-          flags: {},
-          name: "Guest _net_abc",
-          owner: "$wiz",
-          parent: "$guest"
-        },
-        actor_live: { location: "the_chatroom" },
+        name: "Guest _net_abc",
         session: {
           activeScope: "the_chatroom",
           actor: "guest_net_abc",

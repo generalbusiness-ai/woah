@@ -60,6 +60,7 @@ export function provisionGuestSubmit(input: ProvisionGuestInput): ProvisionGuest
     sessionScopeTransition: {
       session: input.session,
       actor: input.actor,
+      actorName: `Guest ${input.actor.slice(-8)}`,
       from: null,
       to: input.template.initial_room
     },

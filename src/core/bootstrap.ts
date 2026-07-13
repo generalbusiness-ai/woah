@@ -111,18 +111,37 @@ const PLAYER_WHO_ALL_SOURCE = `verb :who_all(names) rxd {
   if (names != null) { requested = str_trim(to_string(names)); }
   let players = [];
   if (requested == "") {
-    // Big-World presence: no-arg @who lists the actors CO-PRESENT in the
-    // caller's current space (the same scoped set look/room_roster show), not a
-    // global enumeration of every logged-in player. connected_players() was a
-    // global session scan that returns a per-shard partial roster under
-    // sharding; active_actors(<scope>) reads only the space's own presence
-    // rows (owner-anchored, CO13), so it is correct on any shard.
+    // Big-World presence: consume one compact snapshot from the caller's room
+    // authority. The snapshot contains the complete owner-sequenced roster;
+    // never dereference each actor across cluster scopes here.
     let here = location(this);
     if (here != null && valid(here)) {
-      for who in active_actors(here) {
-        if (valid(who) && isa(who, $player) && !(who in players)) { players = players + [who]; }
+      let compact_rows = room_roster(here);
+      if (length(compact_rows) > 100) {
+        this:tell("This room has more than 100 connected players; please use a narrower listing.");
+        return [];
       }
+      let compact_roster = [];
+      let compact_lines = ["Player                 Conn      Idle   Location"];
+      for compact_row in compact_rows {
+        let compact_presence = { id: compact_row["player"], name: compact_row["name"], presence: compact_row["presence"] };
+        if (compact_row["idle_seconds"] != null) { compact_presence["idle_seconds"] = compact_row["idle_seconds"]; }
+        compact_roster = compact_roster + [compact_presence];
+        let compact_conn = "unknown";
+        if (compact_row["connected"]) { compact_conn = to_string(compact_row["connected_seconds"]) + "s"; }
+        else if (compact_row["last_login_at"] != null) { compact_conn = to_string(compact_row["last_login_at"]); }
+        let compact_idle = "sleep";
+        if (compact_row["connected"]) {
+          compact_idle = "active";
+          if (compact_row["idle_seconds"] != null && compact_row["idle_seconds"] >= 60) { compact_idle = to_string(compact_row["idle_seconds"]) + "s"; }
+        }
+        compact_lines = compact_lines + [compact_row["name"] + " " + compact_conn + " " + compact_idle + " " + compact_row["location_name"]];
+      }
+      this:tell_lines(compact_lines);
+      observe({ type: "who", source: this, actor: actor, to: actor, room: here, roster: compact_roster, text: str_join(compact_lines, "\\n"), ts: now() });
+      return compact_rows;
     }
+    return [];
   } else {
     let raw_tokens = str_split(requested, " ");
     for token in raw_tokens {

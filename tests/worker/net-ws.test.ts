@@ -540,7 +540,9 @@ describe("gateway self-subscribe (H1)", () => {
     };
     await enter(h.gateway, token, s1, "who-presence-enter-1");
     await enter(h.gateway, "apikey:ws-key-2:ws-secret-2", s2, "who-presence-enter-2");
-    await h.settle();
+    // Do not drain deferred outboxes. Accepted enter must synchronously make
+    // the owner roster readable; otherwise this reproduces the deployed
+    // partial-roster race across shards.
 
     const fresh = h.rehydrateWithoutPeerCells(s2);
     const who = await clientFetch(fresh, "POST", "/net-api/turn", {

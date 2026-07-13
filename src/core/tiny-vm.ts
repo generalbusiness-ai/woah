@@ -179,7 +179,10 @@ export const BUILTIN_NAMES = [
   "active_actors",
   // Generic projection helpers for catalog code that must build large lists
   // without exercising woocode's functional-list allocation path.
-  "listinsert", "object_tree_rows", "object_siblings_ordered"
+  "listinsert", "object_tree_rows", "object_siblings_ordered",
+  // Compact owner-scoped presence projection. Appended to preserve every
+  // existing builtin bytecode index.
+  "room_roster"
 ];
 
 export async function runTinyVm(ctx: CallContext, bytecode: TinyBytecode, args: WooValue[]): Promise<WooValue> {
@@ -995,6 +998,10 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
       case "active_actors": {
         if (builtinArgs.length !== 1) throw wooError("E_INVARG", "active_actors expects one space");
         return frame.ctx.world.activeActorsIn(assertObj(builtinArgs[0])) as unknown as WooValue;
+      }
+      case "room_roster": {
+        if (builtinArgs.length !== 1) throw wooError("E_INVARG", "room_roster expects one space");
+        return frame.ctx.world.roomRosterProjection(assertObj(builtinArgs[0])) as unknown as WooValue;
       }
       // connected_players was a GLOBAL session enumeration (Big-World
       // violation) whose sole consumer, $player:who_all, is now presence-scoped

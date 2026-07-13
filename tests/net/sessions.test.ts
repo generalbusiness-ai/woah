@@ -437,9 +437,8 @@ describe("plan-time session effects (CO14 fold; chunk 2)", () => {
     expect(presence).toBeDefined();
     expect(presence?.body).toMatchObject({
       actor,
-      session: { id: session.id, actor, activeScope: "sess_room" },
-      actor_lineage: { name: "Guest 1", parent: "$guest" },
-      actor_live: { location: "sess_room" }
+      name: "Guest 1",
+      session: { id: session.id, actor, activeScope: "sess_room" }
     });
   });
 });

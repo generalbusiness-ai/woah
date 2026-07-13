@@ -276,9 +276,8 @@ describe("CO13 relations over the DO shells", () => {
         member: "s1",
         body: expect.objectContaining({
           actor: "#actor",
-          session: expect.objectContaining({ id: "s1", actor: "#actor" }),
-          actor_lineage: expect.objectContaining({ name: "actor" }),
-          actor_live: expect.objectContaining({ location: "#room" })
+          name: "actor",
+          session: expect.objectContaining({ id: "s1", actor: "#actor" })
         })
       }
     ]);

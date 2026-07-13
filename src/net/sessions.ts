@@ -102,6 +102,8 @@ export type MintSessionInput = {
    * location; internal/lane callers omit it (null — the pre-existing
    * behavior; their explicit enter turns place the session). */
   activeScope?: string | null;
+  /** Display identity for the compact room-roster projection. */
+  actorName?: string;
   /** Identity-door guest claim: stamp the transcript exclusiveMint so
    * the cluster sequencer refuses `actor_occupied` when another live
    * session binds the actor (two humans must never share one guest). */
@@ -182,12 +184,13 @@ export function mintSessionSubmit(input: MintSessionInput): MintSessionResult {
           sessionScopeTransition: {
             session: input.session,
             actor: input.actor,
+            ...(input.actorName ? { actorName: input.actorName } : {}),
             from: input.closing.priorActiveScope,
             to: null
           }
         }
       : input.activeScope && !input.closing
-        ? { sessionScopeTransition: { session: input.session, actor: input.actor, from: null, to: input.activeScope } }
+        ? { sessionScopeTransition: { session: input.session, actor: input.actor, ...(input.actorName ? { actorName: input.actorName } : {}), from: null, to: input.activeScope } }
         : {}),
     ...(input.exclusive ? { exclusiveMint: true } : {}),
     ...(input.closing ? { sessionClose: true } : {}),

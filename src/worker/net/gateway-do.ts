@@ -56,10 +56,10 @@
  * This class sits beside the v2 DO classes and shares nothing with them;
  * nothing routes production traffic here until Phase 5.
  */
-import { CellStore, cellKey, makeCell, type Cell } from "../../net/cells";
+import { CellStore, cellKey, type Cell } from "../../net/cells";
 import { budgetExhausted, isNetError, netError, NetError, type AttemptTraceEntry, type NetErrorCode } from "../../net/errors";
 import { applyFanout, type FanoutBody } from "../../net/outbox";
-import { relationKey, type RelationDelta, type RelationRow, type SessionPresenceBody } from "../../net/relations";
+import { observationsForRelationOwners, relationKey, type RelationDelta, type RelationRow, type RoomRosterRow } from "../../net/relations";
 import { mintSessionSubmit, sessionCellKey, validateSessionCell } from "../../net/sessions";
 import { sessionIdWithShardHint, ticketIdWithShardHint } from "../../net/session-id";
 import { planTurn, type PlanTurnInput, type PlanTurnResult } from "../../net/plan";
@@ -993,20 +993,15 @@ export class NetGatewayDO {
    * legacy request-supplied classifier wholesale (never mixed with the
    * derivation — a fixture cannot half-override CO15).
    */
-  private classifierFor(request: TurnRequest, view: CellStore, planningProjectionCells: readonly Cell[] = []): ScopeClassifier {
+  private classifierFor(request: TurnRequest, view: CellStore): ScopeClassifier {
     if (request.anchors !== undefined || request.shared !== undefined) {
       return {
         scopeOf: (object) => request.anchors?.[object] ?? request.planningScope,
         isShared: (scope) => (request.shared ?? [request.planningScope]).includes(scope)
       };
     }
-    const projectedLineage = new Map(
-      planningProjectionCells
-        .filter((cell) => cell.kind === "object_lineage")
-        .map((cell) => [cell.object, cell.value as AnchorLineage])
-    );
     return classifierFromLineage(
-      (object) => projectedLineage.get(object) ?? (view.get(cellKey("object_lineage", object))?.value as AnchorLineage | undefined) ?? null,
+      (object) => (view.get(cellKey("object_lineage", object))?.value as AnchorLineage | undefined) ?? null,
       { fallback: request.planningScope }
     );
   }
@@ -1064,8 +1059,8 @@ export class NetGatewayDO {
       // with it (CO15: it is a function of the view's lineage cells, and
       // a recovery may have refreshed them).
       const view = this.ensureView();
-      const planningProjectionCells = this.presencePlanningCells(request.call, request.catalog_epoch);
-      const classifier = this.classifierFor(request, view, planningProjectionCells);
+      const classifier = this.classifierFor(request, view);
+      const planningRoomRoster = await this.roomRosterProjection(request, view, classifier, structure);
 
       // ---- Plan (or adopt the stale_head resubmit).
       let planned: PlanTurnResult;
@@ -1086,7 +1081,7 @@ export class NetGatewayDO {
         try {
           planningHead = await structure.rpc(() => this.scopeHead(this.destinationFor(request, request.planningScope)));
           this.assertTurnEpoch(planningHead, request.catalog_epoch, request.planningScope, trace);
-          planned = await this.planOnce(request, view, classifier, planningHead.object_counter, planningProjectionCells);
+          planned = await this.planOnce(request, view, classifier, planningHead.object_counter, planningRoomRoster);
         } catch (err) {
           if (isNetError(err) && err.code === "E_MISSING_STATE") {
             const missing = Array.isArray(err.detail.missing) ? (err.detail.missing as string[]) : [];
@@ -1159,10 +1154,11 @@ export class NetGatewayDO {
       // rows for foreign relation deltas after commit. CommitSubmit
       // itself is unchanged — both are HTTP-body siblings, not sequencer
       // input.
+      const relateDestinations = this.relateDestinationsFor(request, classifier, planned, targetScope);
       const submitBody = {
         submit,
         rider_destinations: this.riderDestinationsFor(request, classifier, planned),
-        relate_destinations: this.relateDestinationsFor(request, classifier, planned, targetScope)
+        relate_destinations: relateDestinations
       };
       let reply: CommitReply;
       try {
@@ -1181,6 +1177,11 @@ export class NetGatewayDO {
         reply = (await structure.rpc(() => this.host.rpc(destination, "/submit", submitBody), { mandatory: true })) as CommitReply;
       }
       if (reply.status === "accepted") {
+        // Make an accepted presence transition visible at its room authority
+        // before the client can issue a dependent roster read. This delivers
+        // the same idempotent fact as the committing scope's durable outbox;
+        // the outbox remains crash recovery and later no-ops at the owner.
+        await this.expediteForeignRelations(reply, relateDestinations, planned.transcript.observations, structure);
         let installDegraded = false;
         if (reply.touched.length > 0) {
           try {
@@ -1443,9 +1444,11 @@ export class NetGatewayDO {
     const liveHead = await this.scopeHead(destination);
     this.assertTurnEpoch(liveHead, request.catalog_epoch, clusterScope, []);
     let base = liveHead.head;
+    const actorLineage = view.get(cellKey("object_lineage", request.actor))?.value as { name?: unknown } | undefined;
     const { submit, value } = mintSessionSubmit({
       session: request.session,
       actor: request.actor,
+      ...(typeof actorLineage?.name === "string" ? { actorName: actorLineage.name } : {}),
       ttl_ms: request.ttl_ms,
       now,
       base,
@@ -1482,6 +1485,7 @@ export class NetGatewayDO {
       base = (await this.scopeHead(destination)).head;
     }
     if (reply.status !== "accepted") return { reply, scope: clusterScope, value };
+    await this.expediteForeignRelations(reply, relateDestinations, []);
     // Install the accepted session cell into the view (warm cache-fill,
     // CO7) — the same degrade rule as /net/turn (fix 5a): the commit is
     // durable; a failed fill self-repairs on the next turn's read check.
@@ -3217,13 +3221,18 @@ export class NetGatewayDO {
     }));
   }
 
-  /** Ephemeral planning cells for active_actors(room). The room authority's
-   * session_presence relation is complete across gateway shards; each row
-   * carries exact authority-cell projections captured by the one relation
-   * derivation path. These cells are never persisted in the gateway view. */
-  private presencePlanningCells(call: ShadowTurnCall, catalogEpoch: string): Cell[] {
-    const view = this.ensureView();
-    if (!this.callReadsRoomPresence(view, call)) return [];
+  /** Fetch one compact roster directly from the room authority. This is a
+   * read barrier against asynchronous relation fanout: a gateway mirror may
+   * be coherent at an older owner head immediately after concurrent enters,
+   * but a roster-reading turn must not answer from that partial snapshot. */
+  private async roomRosterProjection(
+    request: TurnRequest,
+    view: CellStore,
+    classifier: ScopeClassifier,
+    structure: TurnStructure
+  ): Promise<{ room: string; rows: readonly RoomRosterRow[] } | undefined> {
+    const call = request.call;
+    if (!this.callReadsRoomPresence(view, call)) return undefined;
     const session = typeof call.session === "string" ? view.get(cellKey("session", call.session)) : undefined;
     const activeScope = (session?.value as { activeScope?: unknown } | undefined)?.activeScope;
     const actorLive = view.get(cellKey("object_live", call.actor));
@@ -3233,29 +3242,41 @@ export class NetGatewayDO {
       : typeof actorLocation === "string" && actorLocation
         ? actorLocation
         : null;
-    if (!room) return [];
-
-    const stamp = { scope_head: "presence-projection", catalog_epoch: catalogEpoch };
-    const cells = new Map<string, Cell>();
-    const put = (cell: Cell): void => {
-      // A fresher ordinary derived cell always wins over the relation's
-      // transition-time projection.
-      if (!view.has(cell.key)) cells.set(cell.key, cell);
-    };
-    for (const row of this.relationMembers("session_presence", room)) {
-      const body = row.body as SessionPresenceBody | undefined;
-      if (!body || typeof body.actor !== "string") continue;
-      if (body.session && typeof body.session === "object") {
-        put(makeCell({ kind: "session", object: row.member, value: body.session, provenance: "derived", stamp }));
-      }
-      if (body.actor_lineage && typeof body.actor_lineage === "object") {
-        put(makeCell({ kind: "object_lineage", object: body.actor, value: body.actor_lineage, provenance: "derived", stamp }));
-      }
-      if (body.actor_live && typeof body.actor_live === "object") {
-        put(makeCell({ kind: "object_live", object: body.actor, value: body.actor_live, provenance: "derived", stamp }));
-      }
+    if (!room) return undefined;
+    const scope = classifier.scopeOf(room);
+    const response = await structure.rpc(() => this.host.rpc(
+      this.destinationFor(request, scope),
+      "/room-roster",
+      { room }
+    )) as { room?: unknown; rows?: unknown };
+    if (response.room !== room || !Array.isArray(response.rows)) {
+      throw new Error(`room-roster authority returned malformed projection for ${room}`);
     }
-    return [...cells.values()];
+    return { room, rows: response.rows as RoomRosterRow[] };
+  }
+
+  private async expediteForeignRelations(
+    reply: Extract<CommitReply, { status: "accepted" }>,
+    destinations: Record<string, { destination: string; objects: string[] }>,
+    observations: readonly unknown[],
+    structure?: TurnStructure
+  ): Promise<void> {
+    for (const entry of reply.relations_foreign ?? []) {
+      // Only presence changes require the accepted-reply freshness fence.
+      // Other foreign projections retain the asynchronous durable path. If
+      // this owner batch also contains contents deltas, send the whole batch:
+      // receiver idempotency is per (from_scope, seq), not per relation row.
+      if (!entry.deltas.some((delta) => delta.row.relation === "session_presence")) continue;
+      const destination = destinations[entry.scope]?.destination ?? `scope:${entry.scope}`;
+      const deliver = () => this.host.rpc(destination, "/relate", {
+        from_scope: reply.scope,
+        seq: reply.head.seq,
+        deltas: entry.deltas,
+        observations: observationsForRelationOwners(observations, entry.deltas)
+      });
+      if (structure) await structure.rpc(deliver, { mandatory: true });
+      else await deliver();
+    }
   }
 
   /** Resolve only enough verb metadata to decide whether the catalog declared
@@ -3476,7 +3497,7 @@ export class NetGatewayDO {
     view: CellStore,
     classifier: ScopeClassifier,
     objectCounter?: number,
-    planningProjectionCells: readonly Cell[] = []
+    planningRoomRoster?: { room: string; rows: readonly RoomRosterRow[] }
   ): Promise<PlanTurnResult> {
     return planTurn({
       call: request.call,
@@ -3498,7 +3519,7 @@ export class NetGatewayDO {
       // miss), so the planner world AND the fix-6 snapshot are
       // O(read-set), not O(view).
       slicePlanning: true,
-      planningProjectionCells,
+      ...(planningRoomRoster ? { planningRoomRoster } : {}),
       // Creates over net (client-shell phase i): the planning-scope
       // authority's allocation floor, prefetched with its head, so a
       // planned create's id is fresh at the authority. A lane fixture's

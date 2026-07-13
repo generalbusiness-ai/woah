@@ -88,6 +88,9 @@ export type PlanTurnInput = {
    * exist only in the ephemeral planning snapshot and never become gateway
    * state or a second write path. */
   planningProjectionCells?: readonly Cell[];
+  /** One authority-read compact roster value, installed only in the
+   * ephemeral execution world for generic room_roster(space) reads. */
+  planningRoomRoster?: { room: string; rows: readonly Record<string, unknown>[] };
 };
 
 export type PlanTurnResult = {
@@ -175,7 +178,9 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
     const world = planningWorldFromCells(planInput, input.counters);
     let attemptRun: Awaited<ReturnType<typeof runShadowTurnCallTranscript>>;
     try {
-      attemptRun = await runShadowTurnCallTranscript(world, call);
+      attemptRun = await runShadowTurnCallTranscript(world, call, {
+        ...(input.planningRoomRoster ? { room_rosters: [input.planningRoomRoster] } : {})
+      });
     } catch (err) {
       // A sparse miss vs the attempt's slice. Grow from the LIVE view and
       // re-run; if nothing is growable the cell is genuinely absent —
@@ -309,6 +314,9 @@ function foldSessionEffects(recorded: EffectTranscript, snapshot: CellStore, cal
 
   const writes = [...recorded.writes];
   const transition = recorded.sessionScopeTransition;
+  const transitionLineage = transition && transition.session === session
+    ? snapshot.get(cellKey("object_lineage", transition.actor))?.value as { name?: unknown } | undefined
+    : undefined;
   if (transition && transition.session === session) {
     const priorRow = (prior?.value ?? {}) as Record<string, unknown>;
     const value = { ...priorRow, id: session, actor: transition.actor, activeScope: transition.to };
@@ -319,7 +327,14 @@ function foldSessionEffects(recorded: EffectTranscript, snapshot: CellStore, cal
       writer: sessionWriter(transition.actor, "session_transition")
     });
   }
-  return { ...recorded, reads, writes };
+  return {
+    ...recorded,
+    reads,
+    writes,
+    ...(transition && transition.session === session && typeof transitionLineage?.name === "string"
+      ? { sessionScopeTransition: { ...transition, actorName: transitionLineage.name } }
+      : {})
+  };
 }
 
 /**

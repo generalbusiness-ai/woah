@@ -68,6 +68,8 @@ export type ShadowTurnCallOptions = {
   // this, footprint-by-verb on /admin/ is permanently empty for v2
   // traffic. See notes/2026-05-18-v2-verb-metrics.md.
   onMetric?: (event: MetricEvent) => void;
+  /** Transient compact owner projections; never persisted or exported. */
+  room_rosters?: Array<{ room: string; rows: readonly Record<string, unknown>[] }>;
 };
 
 // The VM-execution boundary. Accepts ONLY a `PlanningWorld` — a SerializedWorld
@@ -82,6 +84,7 @@ export async function runShadowTurnCall(
   options: ShadowTurnCallOptions = {}
 ): Promise<ShadowTurnCallRun> {
   const built = createWorldFromSerialized(world, { persist: false });
+  for (const roster of options.room_rosters ?? []) built.installRoomRosterProjection(roster.room, roster.rows);
   built.setMetricsHook(options.onMetric ?? null);
   if (options.planning_cell_provenance) built.setPlanningCellProvenance(options.planning_cell_provenance);
   if (options.enforce_movement_owner_repair) built.setEnforceMovementOwnerRepair(true);
@@ -98,6 +101,7 @@ export async function runShadowTurnCallTranscript(
   // commit-scope execution should not pay for a full executor post-state export
   // unless a caller explicitly needs that snapshot.
   const built = createWorldFromSerialized(world, { persist: false });
+  for (const roster of options.room_rosters ?? []) built.installRoomRosterProjection(roster.room, roster.rows);
   if (options.onMetric) built.setMetricsHook(options.onMetric);
   if (options.planning_cell_provenance) built.setPlanningCellProvenance(options.planning_cell_provenance);
   if (options.enforce_movement_owner_repair) built.setEnforceMovementOwnerRepair(true);

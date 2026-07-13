@@ -5,13 +5,16 @@ import { describe, expect, it } from "vitest";
 import {
   applyRelationDeltas,
   deriveRelationDeltas,
+  observationsForRelationOwners,
   rebuildContentsRelation,
   relationKey,
+  roomRosterRows,
   type RelationRow
 } from "../../src/net/relations";
 import { InMemoryScopeStore } from "../../src/net/scope-store";
 import { ScopeSequencer, type CommitSubmit } from "../../src/net/scope";
 import { applyTranscript, type EffectTranscript } from "../../src/net/transcript";
+import { CellStore } from "../../src/net/cells";
 
 const EPOCH = "cat-rel-1";
 const WRITER = { progr: "#a", thisObj: "#t", verb: "v", definer: "$thing", caller: "#a", callerPerms: "#a" };
@@ -80,6 +83,32 @@ describe("deriveRelationDeltas (CO13)", () => {
     const byOp = Object.fromEntries(derived.local.map((d) => [d.op, d]));
     expect(byOp.remove.row).toMatchObject({ relation: "session_presence", owner: "room:hall", member: "s1" });
     expect(byOp.add.row).toMatchObject({ relation: "session_presence", owner: "room:den", member: "s1", body: { actor: "#alice" } });
+  });
+
+  it("refreshes an active actor's presence row when its display name changes", () => {
+    const post = new CellStore("authority");
+    const stamp = { scope_head: "rename", catalog_epoch: EPOCH };
+    post.commit({ kind: "session", object: "s1", value: { id: "s1", actor: "#alice", activeScope: "room:hall", started: 10, expiresAt: 1000 }, stamp });
+    post.commit({ kind: "property_cell", object: "#alice", name: "name", value: { value: "Renamed Alice" }, stamp });
+    post.commit({ kind: "object_lineage", object: "#alice", value: { name: "Old Alice", parent: "$player" }, stamp });
+    post.commit({ kind: "object_live", object: "#alice", value: { location: "room:hall" }, stamp });
+    const t = transcript({
+      session: "s1",
+      call: { actor: "#alice", target: "#alice", verb: "rename", args: [], body: undefined },
+      writes: [{ cell: { kind: "prop", object: "#alice", name: "name" }, value: "Renamed Alice", op: "set", writer: WRITER }]
+    });
+    const derived = deriveRelationDeltas(t, NO_WRITES, "cluster:#alice", (owner) => owner, post);
+    expect(derived.foreign.get("room:hall")).toEqual([
+      expect.objectContaining({
+        op: "add",
+        row: expect.objectContaining({
+          relation: "session_presence",
+          owner: "room:hall",
+          member: "s1",
+          body: expect.objectContaining({ actor: "#alice", name: "Renamed Alice" })
+        })
+      })
+    ]);
   });
 
   it("partitions deltas by the owner's anchor scope", () => {
@@ -210,6 +239,52 @@ describe("sequencer relation application (durable, one transaction)", () => {
 });
 
 describe("primitives", () => {
+  it("selects the same room-addressed observations for expedited and durable relation delivery", () => {
+    const observations = [
+      { type: "left", source: "room:x" },
+      { type: "entered", room: "room:y" },
+      { type: "said", source: "room:z" },
+      { type: "direct", to: "#alice" }
+    ];
+    const deltas = [
+      { op: "remove", row: { relation: "session_presence", owner: "room:x", member: "s1" } },
+      { op: "add", row: { relation: "session_presence", owner: "room:y", member: "s1" } }
+    ] as const;
+    expect(observationsForRelationOwners(observations, deltas)).toEqual(observations.slice(0, 2));
+  });
+
+  it("reduces live presence to one row per actor and excludes expired residue", () => {
+    const now = 100_000;
+    const relations: RelationRow[] = [];
+    for (let index = 0; index < 30; index += 1) {
+      relations.push({
+        relation: "session_presence",
+        owner: "room:x",
+        member: `live-${index}`,
+        body: {
+          actor: `actor-${index}`,
+          name: `Actor ${index}`,
+          session: { id: `live-${index}`, actor: `actor-${index}`, started: 90_000, expiresAt: 200_000, activeScope: "room:x" }
+        }
+      });
+    }
+    for (let index = 0; index < 90; index += 1) {
+      relations.push({
+        relation: "session_presence",
+        owner: "room:x",
+        member: `stale-${index}`,
+        body: {
+          actor: `stale-actor-${index}`,
+          session: { id: `stale-${index}`, actor: `stale-actor-${index}`, started: 1, expiresAt: 2, activeScope: "room:x" }
+        }
+      });
+    }
+    const roster = roomRosterRows(relations, "room:x", "Room X", now);
+    expect(roster).toHaveLength(30);
+    expect(roster[0]).toMatchObject({ player: "actor-0", name: "Actor 0", location_name: "Room X" });
+    expect(roster.some((row) => row.player.startsWith("stale-"))).toBe(false);
+  });
+
   it("applyRelationDeltas reports changed keys and skips no-op removes", () => {
     const rows = new Map<string, RelationRow>();
     const changed = applyRelationDeltas(rows, [

@@ -78,7 +78,7 @@ import { isNetError, netError } from "../../net/errors";
 import { Outbox, type FanoutBody, type FanoutRow } from "../../net/outbox";
 import { ScopeSequencer, type CommitSubmit, type ScheduledTurn, type ScopeHead } from "../../net/scope";
 import { authorizeSessionSubmit, validateSessionCell } from "../../net/sessions";
-import { relationKey, type RelationDelta, type RelationRow } from "../../net/relations";
+import { observationsForRelationOwners, relationKey, roomRosterRows, type RelationDelta, type RelationRow } from "../../net/relations";
 import type { ScopeMeta, ScopeStore, TailEntry } from "../../net/scope-store";
 import type { CommitReply } from "../../net/scope";
 import { netCellKeyFor } from "../../net/transcript";
@@ -800,6 +800,19 @@ export class NetScopeDO {
           owner_head: seq.head(),
           cells: body.keys.map((key) => ({ key, version: seq.store.get(key)?.version ?? "absent" }))
         });
+      }
+      if (request.method === "POST" && url.pathname === "/net/room-roster") {
+        const body = (await request.json()) as { room?: unknown };
+        if (typeof body.room !== "string" || !body.room) throw new Error("room-roster requires room");
+        const seq = this.ensureSequencer();
+        const lineage = seq.store.get(cellKey("object_lineage", body.room))?.value as { name?: unknown } | undefined;
+        const rows = roomRosterRows(
+          seq.relations().values(),
+          body.room,
+          typeof lineage?.name === "string" && lineage.name ? lineage.name : body.room,
+          this.host.now()
+        );
+        return json({ scope: seq.scope, head: seq.head(), room: body.room, rows });
       }
       if (request.method === "POST" && url.pathname === "/net/closure") {
         const body = (await request.json()) as {
@@ -1555,14 +1568,7 @@ export class NetScopeDO {
       // owner applies the delta and refans BOTH to its subscribers under
       // its own head seq — the transition and its announcement arrive as
       // one sequenced event, exactly the v2 affected-scopes delivery.
-      const owners = new Set(entry.deltas.map((delta) => delta.row.owner));
-      const roomObservations = observations.filter((obs) => {
-        const record = obs as { source?: unknown; room?: unknown } | null;
-        return (
-          (typeof record?.source === "string" && owners.has(record.source)) ||
-          (typeof record?.room === "string" && owners.has(record.room))
-        );
-      });
+      const roomObservations = observationsForRelationOwners(observations, entry.deltas);
       this.persistOutboxRow("/relate", relateDestinations[entry.scope]?.destination ?? `scope:${entry.scope}`, {
         scope: seq.scope,
         seq: reply.head.seq,

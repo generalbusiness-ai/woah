@@ -26,15 +26,32 @@ export type RelationDelta = {
   row: RelationRow;
 };
 
-/** Owner-anchored planning projection for one present session. These are exact
- * copies of the authority cells at the transition commit, not a second write
- * path. A gateway can therefore assemble active_actors(room) without scanning
- * its local sessions or issuing one RPC per occupant. */
+/** Select observations addressed to relation owners changed by one foreign
+ * delivery. The synchronous freshness fence and the durable outbox must send
+ * identical `/relate` bodies: the receiver deduplicates by (from_scope, seq),
+ * so whichever path arrives first is the only one that can refan these
+ * observations. */
+export function observationsForRelationOwners(
+  observations: readonly unknown[],
+  deltas: readonly RelationDelta[]
+): unknown[] {
+  const owners = new Set(deltas.map((delta) => delta.row.owner));
+  return observations.filter((observation) => {
+    const record = observation as { source?: unknown; room?: unknown } | null;
+    return (
+      (typeof record?.source === "string" && owners.has(record.source)) ||
+      (typeof record?.room === "string" && owners.has(record.room))
+    );
+  });
+}
+
+/** Compact owner-anchored witness for one present session. It carries only the
+ * fields required to build and expire a roster; actor lineage/live authority
+ * remains at the actor's cluster and never fattens room state. */
 export type SessionPresenceBody = {
   actor: string;
+  name?: string;
   session?: Cell["value"];
-  actor_lineage?: Cell["value"];
-  actor_live?: Cell["value"];
 };
 
 export function relationKey(relation: string, owner: string, member: string): string {
@@ -95,16 +112,47 @@ export function deriveRelationDeltas(
     if (move.from) put("remove", "contents", move.from, move.object);
     put("add", "contents", move.to, move.object);
   }
+  const presenceBody = (actor: string, session: string, fallbackName?: string): SessionPresenceBody => {
+    const nameCell = post?.get(cellKey("property_cell", actor, "name"))?.value as { value?: unknown } | undefined;
+    const lineage = post?.get(cellKey("object_lineage", actor))?.value as { name?: unknown } | undefined;
+    const name = typeof nameCell?.value === "string" && nameCell.value
+      ? nameCell.value
+      : typeof fallbackName === "string" && fallbackName
+        ? fallbackName
+        : typeof lineage?.name === "string" && lineage.name
+          ? lineage.name
+          : undefined;
+    return {
+      actor,
+      ...(name ? { name } : {}),
+      ...(post?.get(cellKey("session", session)) ? { session: post.get(cellKey("session", session))?.value } : {})
+    };
+  };
   const transition = transcript.sessionScopeTransition;
   if (transition) {
-    const body: SessionPresenceBody = {
-      actor: transition.actor,
-      ...(post?.get(cellKey("session", transition.session)) ? { session: post.get(cellKey("session", transition.session))?.value } : {}),
-      ...(post?.get(cellKey("object_lineage", transition.actor)) ? { actor_lineage: post.get(cellKey("object_lineage", transition.actor))?.value } : {}),
-      ...(post?.get(cellKey("object_live", transition.actor)) ? { actor_live: post.get(cellKey("object_live", transition.actor))?.value } : {})
-    };
+    const body = presenceBody(transition.actor, transition.session, transition.actorName);
     if (transition.from) put("remove", "session_presence", transition.from, transition.session, body);
     if (transition.to) put("add", "session_presence", transition.to, transition.session, body);
+  }
+
+  // Display names are mutable while a session remains present. Refresh the
+  // same owner row through this derivation path when an actor renames itself;
+  // otherwise a compact roster would retain its transition-time label until
+  // the next move. The session cell identifies the one room owner to update.
+  const renamedActor = transcript.writes.some(
+    (write) => write.cell.kind === "prop" && write.cell.object === transcript.call.actor && write.cell.name === "name"
+  );
+  if (renamedActor && transcript.session && post) {
+    const session = post.get(cellKey("session", transcript.session))?.value as { actor?: unknown; activeScope?: unknown } | undefined;
+    if (session?.actor === transcript.call.actor && typeof session.activeScope === "string" && session.activeScope) {
+      put(
+        "add",
+        "session_presence",
+        session.activeScope,
+        transcript.session,
+        presenceBody(transcript.call.actor, transcript.session)
+      );
+    }
   }
 
   const local: RelationDelta[] = [];
@@ -120,6 +168,60 @@ export function deriveRelationDeltas(
     }
   }
   return { local, foreign };
+}
+
+/** One compact, owner-produced roster row. The shape matches the catalog's
+ * historical who result so woocode can render it without dereferencing each
+ * actor across scopes. */
+export type RoomRosterRow = {
+  player: string;
+  name: string;
+  connected: boolean;
+  connected_at: number | null;
+  connected_seconds: number | null;
+  idle_seconds: number | null;
+  last_login_at: number | null;
+  location: string;
+  location_name: string;
+  presence: "awake" | "idle" | "sleeping";
+};
+
+/** Reduce the room owner's complete presence relation into one bounded value.
+ * Expired rows are excluded even before the asynchronous reaper retracts them.
+ * Multiple live sessions for one actor collapse to one row. */
+export function roomRosterRows(
+  relations: Iterable<RelationRow>,
+  room: string,
+  roomName: string,
+  now: number
+): RoomRosterRow[] {
+  const byActor = new Map<string, { name: string; started: number }>();
+  for (const row of relations) {
+    if (row.relation !== "session_presence" || row.owner !== room) continue;
+    const body = row.body as SessionPresenceBody | undefined;
+    if (!body || typeof body.actor !== "string") continue;
+    const session = body.session as { actor?: unknown; started?: unknown; expiresAt?: unknown; activeScope?: unknown } | undefined;
+    if (!session || session.actor !== body.actor || session.activeScope !== room) continue;
+    if (typeof session.expiresAt === "number" && session.expiresAt <= now) continue;
+    const started = typeof session.started === "number" ? session.started : now;
+    const prior = byActor.get(body.actor);
+    byActor.set(body.actor, {
+      name: typeof body.name === "string" && body.name ? body.name : prior?.name ?? body.actor,
+      started: prior ? Math.min(prior.started, started) : started
+    });
+  }
+  return [...byActor.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([actor, entry]) => ({
+    player: actor,
+    name: entry.name,
+    connected: true,
+    connected_at: entry.started,
+    connected_seconds: Math.max(0, Math.floor((now - entry.started) / 1000)),
+    idle_seconds: 0,
+    last_login_at: entry.started,
+    location: room,
+    location_name: roomName,
+    presence: "awake"
+  }));
 }
 
 /** Apply deltas to a relation map (the in-memory row family). Returns

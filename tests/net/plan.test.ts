@@ -108,6 +108,60 @@ describe("planTurn → submit → accept (CO4 happy path)", () => {
   });
 });
 
+describe("compact room-roster planning", () => {
+  it("renders 30 occupants from one transient value without per-actor closure cells", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:compact-roster");
+    const cells = cellsFromSerialized(world.exportWorld());
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seq.seed(cells);
+    const view = derivedViewOf(seq.store);
+    const now = Date.now();
+    const room = (view.get(`object_live:${session.actor}`)?.value as { location?: string }).location ?? "$nowhere";
+    const roomName = (view.get(`object_lineage:${room}`)?.value as { name?: string } | undefined)?.name ?? room;
+    const rows = Array.from({ length: 30 }, (_, index) => ({
+      player: `guest_${index}`,
+      name: `Guest ${index}`,
+      connected: true,
+      connected_at: now - 5_000,
+      connected_seconds: 5,
+      idle_seconds: 0,
+      last_login_at: now - 5_000,
+      location: room,
+      location_name: roomName,
+      presence: "awake"
+    }));
+    const plan = await planTurn({
+      call: {
+        kind: "woo.turn_call.shadow.v1",
+        id: "compact-roster-30",
+        route: "direct",
+        scope: SCOPE,
+        session: session.id,
+        actor: session.actor,
+        target: session.actor,
+        verb: "who_all",
+        args: []
+      },
+      view,
+      planningScope: SCOPE,
+      classifier,
+      base: seq.head(),
+      idempotencyKey: "compact-roster-30",
+      stamp: seq.stamp(),
+      planningRoomRoster: { room, rows }
+    });
+
+    expect(plan.transcript.result).toHaveLength(30);
+    expect(plan.transcript.result).toEqual(expect.arrayContaining([
+      expect.objectContaining({ player: "guest_0", name: "Guest 0" }),
+      expect.objectContaining({ player: "guest_29", name: "Guest 29" })
+    ]));
+    expect(plan.envelopeBytes).toBeLessThan(WARM_ENVELOPE_BYTE_LIMIT);
+    expect(plan.transcript.reads.some((read) => read.cell.object.startsWith("guest_"))).toBe(false);
+  });
+});
+
 describe("slice-based planning (Phase 1 — the spine)", () => {
   /** The harness world plus `pad` unrelated objects the turn never reads,
    * seeded into both the authority and the derived view. */
