@@ -334,16 +334,12 @@ item; what remains is exactly what the workerd lanes cannot prove
   their space source and let that owner derive the audience from
   `session_presence`; only a direct cross-host observation eagerly reads the
   remote subscriber mirror to construct an audience override.
-  Move-result `here_request` hydration also consumes the transient compact
-  roster instead of rebuilding a roster from physical room contents. Closed
-  sessions may leave player objects physically contained for later reuse; they
-  are neither live roster members nor ordinary room contents, and planning must
-  not dereference their actor clusters. The planning world applies the pending
-  session transition to its transient roster so the immediate post-move result
-  includes the caller without creating another durable roster write. An
-  installed owner roster also suppresses legacy remote room-snapshot delegation:
-  the bounded room slice plus explicit owner projection are the complete
-  planning input for this response.
+  For a roster-backed move result with `look_deferred: true`, planning omits the
+  redundant `here` snapshot. The result's top-level roster is advanced by the
+  pending session transition so it includes the caller, and the client performs
+  the declared authoritative refresh. This avoids rebuilding presence from
+  physical room contents: closed sessions may leave reusable player objects
+  physically contained, but planning must not dereference those actor clusters.
 
   Presence transition acceptance includes a freshness fence: after the actor
   scope commits, the gateway delivers the same `(from_scope, seq)` relation

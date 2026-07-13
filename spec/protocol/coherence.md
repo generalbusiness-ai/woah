@@ -512,10 +512,10 @@ One write path per fact (CO9), concretized:
   `observe_to_space` names the owner space but does not read its subscriber
   mirrors; owner-side fanout computes the audience from `session_presence`.
   Direct cross-host observation retains the eager audience override path.
-  Planning-time room snapshots use the same transient owner roster and apply
-  the pending session transition to that value when predicting post-turn
-  results. They do not derive presence from physical `contents` or dereference
-  disconnected actor clusters.
+  A roster-backed move with `look_deferred: true` applies the pending transition
+  to its transient top-level roster and omits redundant `here` hydration; the
+  client then performs the declared authoritative refresh. It does not derive
+  presence from physical `contents` or dereference disconnected actor clusters.
 - **Relation-owner topology is gateway knowledge** (the
   `rider_destinations` rule): the gateway classifies the transcript's
   relation-owner objects (move endpoints, create locations, contents

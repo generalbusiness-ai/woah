@@ -218,18 +218,14 @@ physical room contents and dereferenced those disconnected actor clusters.
 This bypassed the compact owner roster after the verb itself had already used
 the correct path.
 
-Planning-time room snapshots now consume the installed transient owner roster,
-exclude loaded physical `$player` rows from ordinary contents without recording
-actor authority reads, and apply the planned session transition to the
-transient value so the immediate result includes the mover. The durable
-`session_presence` relation remains the only persisted roster path. A focused
-test leaves a disconnected player physically in the destination and proves an
-enter neither reads that player's `home`/`description` nor omits the moving
-caller from the returned roster. Deployed confirmation remains required.
-
-The first deployment of that correction still followed the generic
-`roomSnapshotForActor` remote-host branch before consulting the transient
-projection, so it delegated back to the legacy owner snapshot and reproduced
-the same reads. The projection check now precedes remote delegation: an
-explicit owner roster plus the bounded room planning slice is the authoritative
-planning input for `here_request` hydration.
+The bounded contract is simpler than adapting the legacy snapshot. A move
+result already says `look_deferred: true`; the client immediately performs the
+authoritative room refresh. When an explicit owner roster is installed,
+planning therefore omits the redundant `here` snapshot and applies the pending
+session transition to the result's transient top-level roster so the immediate
+reply still includes the mover. Direct/local paths without a transient roster
+retain their existing `here` behavior. The durable `session_presence` relation
+remains the only persisted roster path. A focused test leaves a disconnected
+player physically in the destination and proves an enter neither reads that
+player's `home`/`description` nor omits the moving caller. Deployed confirmation
+remains required.

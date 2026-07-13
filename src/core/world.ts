@@ -654,42 +654,6 @@ export class WooWorld {
     });
   }
 
-  /** Planning-time room snapshots must use the same compact owner roster as
-   * catalog room_roster(). Physical contents can retain disconnected player
-   * objects after their sessions close; dereferencing those actor clusters is
-   * both semantically stale and an O(room history) distributed read. */
-  private projectedRoomRosterSummaries(room: ObjRef): ScopedObjectSummary[] | null {
-    const projected = this.roomRosterProjections.get(room);
-    if (projected === undefined) return null;
-    const summaries: ScopedObjectSummary[] = [];
-    for (const value of projected) {
-      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
-      const row = value as Record<string, WooValue>;
-      if (typeof row.player !== "string" || typeof row.name !== "string") continue;
-      summaries.push({
-        id: row.player,
-        name: row.name,
-        ancestors: [],
-        location: room
-      });
-    }
-    return summaries;
-  }
-
-  /** Presentation-only classification against already-loaded lineage. It must
-   * not create transcript reads for disconnected physical players that the
-   * compact presence authority deliberately omitted. */
-  private loadedInheritsFromUnrecorded(object: ObjRef, ancestor: ObjRef): boolean {
-    let current: ObjRef | null = object;
-    const seen = new Set<ObjRef>();
-    while (current && !seen.has(current)) {
-      if (current === ancestor) return true;
-      seen.add(current);
-      current = this.objects.get(current)?.parent ?? null;
-    }
-    return false;
-  }
-
   /** Apply a planned session transition to the transient owner snapshot so
    * move results describe post-turn presence. This mutates planning-only data;
    * the accepted relation remains the sole durable write path. */
@@ -4050,6 +4014,12 @@ export class WooWorld {
     if (!result || typeof result !== "object" || Array.isArray(result)) return result;
     const map = result as Record<string, WooValue>;
     if (map.here !== undefined || map.here_request !== true || typeof map.room !== "string") return result;
+    // Net planning has already consumed the room owner's compact roster, and
+    // look_deferred requires the client to refresh the authoritative room view
+    // after movement. Building a second `here` snapshot here would walk
+    // physical contents (including disconnected reusable player objects) and
+    // turn that history into cross-cluster reads on the commit path.
+    if (map.look_deferred === true && this.roomRosterProjections.has(map.room)) return result;
     const memo = ctx.hostMemo ?? createHostOperationMemo();
     const hereLocation = await this.primaryRoomForLocation(map.room, memo);
     if (!hereLocation) return result;
@@ -4460,34 +4430,17 @@ export class WooWorld {
   }
 
   async roomSnapshotForActor(actor: ObjRef, room: ObjRef, sessionId: string | null = null, memo: HostOperationMemo = createHostOperationMemo()): Promise<RoomSnapshot> {
-    // A net planning world already holds an explicit owner roster snapshot and
-    // the room's bounded planning slice. Do not delegate back to the remote
-    // room host: its legacy full snapshot rebuilds presence from physical
-    // contents and reintroduces per-actor reads the projection was installed to
-    // eliminate.
-    const hasProjectedRoster = this.roomRosterProjections.has(room);
-    if (!hasProjectedRoster && await this.remoteHostForObject(room, memo)) {
+    if (await this.remoteHostForObject(room, memo)) {
       if (!this.executorContext?.roomSnapshot) throw wooError("E_INTERNAL", "remote host bridge room snapshots unavailable");
       return await this.executorContext.roomSnapshot(actor, room, sessionId, memo);
     }
 
     const roomSummary = await this.scopedObjectSummary(actor, room, memo);
-    const projectedRoster = this.projectedRoomRosterSummaries(room);
-    const presentRefs = projectedRoster?.map((item) => item.id) ?? await this.chatPresentAsync(room, actor);
-    const contentRefs = (await this.objectContents(room, memo)).filter((item) =>
-      projectedRoster !== null
-        ? !this.loadedInheritsFromUnrecorded(item, "$player")
-        : !this.isActorForLook(item, presentRefs)
-    );
+    const presentRefs = await this.chatPresentAsync(room, actor);
+    const contentRefs = (await this.objectContents(room, memo)).filter((item) => !this.isActorForLook(item, presentRefs));
     const exits = await this.exitSummariesForRoom(actor, room, memo);
-    let roster = projectedRoster;
-    if (roster === null) {
-      const present = await this.scopedObjectSummaries(actor, presentRefs, memo);
-      roster = presentRefs
-        .map((id) => present[id])
-        .filter((item): item is ScopedObjectSummary => item !== undefined)
-        .map((item) => this.thinScopedObjectSummary(item));
-    }
+    const present = await this.scopedObjectSummaries(actor, presentRefs, memo);
+    const roster = presentRefs.map((id) => present[id]).filter((item): item is ScopedObjectSummary => item !== undefined).map((item) => this.thinScopedObjectSummary(item));
     const contents = await this.scopedObjectSummaries(actor, contentRefs, memo);
     return {
       id: room,
