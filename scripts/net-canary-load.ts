@@ -23,8 +23,14 @@
 
 import { sessionShardHint } from "../src/net/session-id";
 
-type Guest = { actor: string; session: string; elastic: boolean };
+export type CanaryGuest = { actor: string; session: string; elastic: boolean; activeScope: string | null };
 type Outcome = { phase: "enter" | "load"; status: number; ms: number; code: string; accepted: boolean; detail: string };
+
+/** A mint may already be present in the requested room. Re-entering that room
+ * is not setup, so only sessions whose authoritative scope differs move. */
+export function guestsNeedingEnter(guests: readonly CanaryGuest[], room: string): CanaryGuest[] {
+  return guests.filter((guest) => guest.activeScope !== room);
+}
 
 /** One responder's `who_all` reply, reduced to what the summary needs. */
 export type WhoRosterInput = {
@@ -148,7 +154,7 @@ async function jsonFetch(url: string, init: RequestInit): Promise<{ response: Re
  * not merely whatever session cells the routed gateway already holds. A
  * rejected turn or incomplete owner-scoped planning view counts as
  * unreachable/partial. */
-async function runWhoCheck(base: string, guests: Guest[], run: string): Promise<WhoCheckSummary> {
+async function runWhoCheck(base: string, guests: CanaryGuest[], run: string): Promise<WhoCheckSummary> {
   const guestActors = guests.map((guest) => guest.actor);
   const guestShards = guests.map((guest) => sessionShardHint(guest.session));
   // No network round-trips when the input structurally can't produce a signal.
@@ -191,7 +197,7 @@ async function main(): Promise<void> {
   const room = value("--room", "the_chatroom");
   const enforceWho = args.includes("--enforce-who");
   const run = `canary-${Date.now().toString(36)}`;
-  const guests: Guest[] = [];
+  const guests: CanaryGuest[] = [];
   const outcomes: Outcome[] = [];
   const closeFailures: Array<{ actor: string; status: number; detail: string }> = [];
   let whoCheck: WhoCheckSummary | null = null;
@@ -206,7 +212,12 @@ async function main(): Promise<void> {
       if (!response.ok || typeof body.actor !== "string" || typeof body.session !== "string") {
         throw new Error(`guest ${i} failed: ${response.status} ${JSON.stringify(body)}`);
       }
-      guests.push({ actor: body.actor, session: body.session, elastic: body.elastic === true });
+      guests.push({
+        actor: body.actor,
+        session: body.session,
+        elastic: body.elastic === true,
+        activeScope: typeof body.active_scope === "string" ? body.active_scope : null
+      });
     }
 
     // Establish co-presence: every guest enters the shared room so its session
@@ -216,7 +227,7 @@ async function main(): Promise<void> {
     // guest sitting in its own cluster would correctly see only itself and the
     // completeness assertion would be meaningless. Failures here are recorded
     // like any other turn outcome.
-    const enterBatch = await Promise.all(guests.map(async (guest, index): Promise<Outcome> => {
+    const enterBatch = await Promise.all(guestsNeedingEnter(guests, room).map(async (guest, index): Promise<Outcome> => {
       const started = performance.now();
       try {
         const { response, body, ms } = await jsonFetch(`${base}/net-api/turn`, {

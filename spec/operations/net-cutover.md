@@ -363,7 +363,9 @@ item; what remains is exactly what the workerd lanes cannot prove
   `load:net-canary -- --enforce-who` must return a
   complete co-present roster from every shard, failing on any partial or
   inconclusive result — a signal the single-image workerd-local lanes cannot
-  produce.
+  produce. Guest/session mint responses include the owner-committed
+  `active_scope`; the driver skips setup movement when a session is already
+  born in the requested room, so the enter phase measures real transitions.
 - **Gateway sharding — BUILT after the first deployed canary.** Public
   `/net-api` routing uses `NET_API_GATEWAY_SHARDS` named shards. A session
   or WebSocket ticket carries its minting shard; MCP headers, bearer/body/

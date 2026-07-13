@@ -2092,6 +2092,7 @@ export class NetGatewayDO {
       actor,
       expires_at: planned.value.expiresAt ?? null,
       scope: planned.clusterScope,
+      active_scope: template.initial_room,
       elastic: true,
       ...(installDegraded ? { install_degraded: true } : {})
     });
@@ -2286,7 +2287,11 @@ export class NetGatewayDO {
       session,
       actor,
       expires_at: typeof value?.expiresAt === "number" ? value.expiresAt : null,
-      scope: opened.scope
+      scope: opened.scope,
+      // Clients must not guess whether this owner-committed session was born
+      // present. Exposing the routing fact also keeps canaries from creating
+      // artificial same-room transition storms.
+      active_scope: bornAt
     });
   }
 

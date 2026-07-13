@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { summarizeWhoCheck, whoCheckFailsAcceptance, type WhoRosterInput } from "../../scripts/net-canary-load";
+import {
+  guestsNeedingEnter,
+  summarizeWhoCheck,
+  whoCheckFailsAcceptance,
+  type CanaryGuest,
+  type WhoRosterInput
+} from "../../scripts/net-canary-load";
 
 // Unit coverage for the pure partial-view summary used by the deployed-canary
 // who_all check (net-cutover layering item 6). The LIVE partial view is a
@@ -73,5 +79,16 @@ describe("summarizeWhoCheck (who_all partial-view canary logic)", () => {
     expect(out.unreachable).toBe(1);
     expect(out.partial).toBe(true);
     expect(out.responders).toBe(1);
+  });
+});
+
+describe("deployed canary room setup", () => {
+  it("does not manufacture an enter turn for sessions born in the requested room", () => {
+    const guests: CanaryGuest[] = [
+      { actor: "already", session: "s_1", elastic: false, activeScope: "the_chatroom" },
+      { actor: "elsewhere", session: "s_2", elastic: true, activeScope: "the_lounge" },
+      { actor: "unknown", session: "s_3", elastic: false, activeScope: null }
+    ];
+    expect(guestsNeedingEnter(guests, "the_chatroom").map((guest) => guest.actor)).toEqual(["elsewhere", "unknown"]);
   });
 });

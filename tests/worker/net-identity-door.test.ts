@@ -370,6 +370,7 @@ describe("the identity door (/net-api/login, /net-api/guest, session bearers)", 
       // Guest sessions are born PRESENT in the start room (the install
       // placed the seats), so observations reach them immediately.
       expect(claim.body.session).toMatch(/^s_/);
+      expect(claim.body.active_scope).toBe("the_chatroom");
     }
 
     // The pool is full: provision a fresh actor + first session as one
@@ -378,6 +379,7 @@ describe("the identity door (/net-api/login, /net-api/guest, session bearers)", 
     expect(elastic.status, JSON.stringify(elastic.body).slice(0, 300)).toBe(200);
     expect(elastic.body.elastic).toBe(true);
     expect(elastic.body.actor).toMatch(/^guest_net_[0-9a-f]{32}$/);
+    expect(elastic.body.active_scope).toBe("the_chatroom");
     expect(claimed.has(elastic.body.actor as string)).toBe(false);
     const turn = await h.api("POST", "/net-api/turn", {
       token: `session:${elastic.body.session as string}`,

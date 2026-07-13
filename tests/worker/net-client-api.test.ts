@@ -320,6 +320,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     const sid = minted.body.session as string;
     expect(sid).toMatch(/^s_/);
     expect(minted.body.expires_at as number).toBeGreaterThanOrEqual(before + 600_000);
+    expect(minted.body.active_scope).toBe("capi_room");
 
     // Another authenticated identity presenting THIS actor's session:
     // the actor binding refuses it (actor_mismatch).
@@ -383,7 +384,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     const token = `apikey:${KEY_ID}:${KEY_SECRET}`;
     const minted = await clientFetch(h.gateway, "POST", "/net-api/session", { token, body: { ttl_ms: 600_000 } });
     expect(minted.status, JSON.stringify(minted.body)).toBe(200);
-    for (const key of ["session", "actor", "expires_at"]) {
+    for (const key of ["session", "actor", "expires_at", "active_scope"]) {
       expect(Object.keys(minted.body), `session.${key}`).toContain(key);
     }
     const sid = minted.body.session as string;
