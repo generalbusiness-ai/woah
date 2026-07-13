@@ -164,3 +164,33 @@ compact builtin for `room_roster`, `look_self`, `who`, and `enter`. The load
 report also separates `enter` from sustained `load` outcomes so the two failure
 classes cannot be conflated again. A fresh-namespace redeploy is required for
 the final acceptance decision.
+
+### Second deployed iteration (`a75189e`) and movement diagnosis
+
+A fresh namespace with chat 0.2.13 accepted all 600 sustained say/look turns
+for 30 guests and returned the complete 30-person roster to every responder
+(`min_seen=30`, `max_missing=0`; 22 elastic guests). The remaining 29/30 setup
+failures were isolated to `enter`, not the compact roster or sustained room
+load.
+
+An alternate-room probe disproved the initial "redundant same-room setup"
+hypothesis: 26/30 real moves completed, four reached `E_BUDGET`, and the roster
+split exactly matched the four actors correctly left in the source room. A
+single later move also exhausted 29 synchronous RPCs. Cloudflare trace showed
+repeated owner closures returning relation rows but zero cells for the legacy
+presence properties.
+
+The cause was a one-write-path violation in planning. `movetoActorChecked`
+recorded the authoritative session transition but also called the local
+subscriber-mirror updater before the transcript settled. That updater read
+`session_subscribers` and `subscribers`, so the submit treated derived relation
+projections as authority-cell reads. Targeted repair could never manufacture
+those cells and repeated until the 32-RPC cap.
+
+The correction makes recorded movement emit only the session transition;
+materialization already derives both compatibility mirrors from that accepted
+fact. Direct/local movement keeps eager mirror maintenance. Roster prefetch now
+uses a shared receiver's authority for room verbs and the session active room
+for actor verbs, derived from topology rather than verb names. A focused
+cross-room plan test asserts the transition, destination roster, and absence of
+both legacy projection reads. Deployed confirmation is still required.

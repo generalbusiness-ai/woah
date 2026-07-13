@@ -502,6 +502,13 @@ One write path per fact (CO9), concretized:
   so a refan at an unadvanced head would silently no-op. An all-no-op
   batch (idempotent re-adds, removes of absent rows) advances nothing
   and refans nothing; the sender high-water still moves.
+- **Planning never promotes a relation projection into an authority-cell
+  dependency.** In particular, recorded session movement emits one
+  `sessionScopeTransition`; it does not read or write the compatibility
+  `session_subscribers`/`subscribers` properties while constructing the
+  transcript. Materializers derive those mirrors from the accepted relation
+  fact. A direct local move may update them eagerly because no sequenced
+  transcript will be applied afterward.
 - **Relation-owner topology is gateway knowledge** (the
   `rider_destinations` rule): the gateway classifies the transcript's
   relation-owner objects (move endpoints, create locations, contents

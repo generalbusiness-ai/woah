@@ -190,6 +190,70 @@ describe("compact room-roster planning", () => {
     expect(roomRosterPlan.envelopeBytes).toBeLessThan(WARM_ENVELOPE_BYTE_LIMIT);
     expect(roomRosterPlan.transcript.reads.some((read) => read.cell.object.startsWith("guest_"))).toBe(false);
   });
+
+  it("plans room entry without reading legacy subscriber projection cells", async () => {
+    const world = createWorld();
+    world.createObject({ id: "home", name: "Home", parent: "$room", owner: "$wiz" });
+    const session = world.auth("guest:compact-enter");
+    await world.directCall("compact-enter-setup", session.actor, "the_chatroom", "leave", [], { sessionId: session.id });
+    world.setProp("home", "session_subscribers", [{ session: session.id, actor: session.actor }]);
+    world.setProp("home", "subscribers", [session.actor]);
+    const destination = "the_chatroom";
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seq.seed(cellsFromSerialized(world.exportWorld()));
+    const view = derivedViewOf(seq.store);
+    const movementClassifier: ScopeClassifier = {
+      scopeOf: (object) => object === session.actor ? `cluster:${session.actor}` : SCOPE,
+      isShared: (scope) => scope === SCOPE
+    };
+    const destinationRows = [{
+      player: session.actor,
+      name: "Compact Enter",
+      connected: true,
+      connected_at: Date.now(),
+      connected_seconds: 0,
+      idle_seconds: 0,
+      last_login_at: Date.now(),
+      location: destination,
+      location_name: "The Chatroom",
+      presence: "awake"
+    }];
+    const plan = await planTurn({
+      call: {
+        kind: "woo.turn_call.shadow.v1",
+        id: "compact-enter-deck",
+        route: "sequenced",
+        scope: SCOPE,
+        session: session.id,
+        actor: session.actor,
+        target: destination,
+        verb: "enter",
+        args: []
+      },
+      view,
+      planningScope: SCOPE,
+      classifier: movementClassifier,
+      base: seq.head(),
+      idempotencyKey: "compact-enter-deck",
+      stamp: seq.stamp(),
+      slicePlanning: true,
+      planningRoomRoster: { room: destination, rows: destinationRows }
+    });
+
+    expect(plan.transcript.sessionScopeTransition).toMatchObject({
+      session: session.id,
+      actor: session.actor,
+      to: destination
+    });
+    expect(plan.transcript.result).toMatchObject({
+      room: destination,
+      roster: [expect.objectContaining({ id: session.actor, name: "Compact Enter" })]
+    });
+    expect(plan.transcript.reads).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ cell: expect.objectContaining({ kind: "prop", name: "subscribers" }) }),
+      expect.objectContaining({ cell: expect.objectContaining({ kind: "prop", name: "session_subscribers" }) })
+    ]));
+  });
 });
 
 describe("slice-based planning (Phase 1 — the spine)", () => {

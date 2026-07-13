@@ -315,7 +315,21 @@ item; what remains is exactly what the workerd lanes cannot prove
   RPC. Chat's `$room:room_roster` adapts this generic value to the stable
   catalog row shape; `look_self`, `who`, and `enter` therefore share the
   compact path. Workspace catalogs retain their distinct focus/subscription
-  roster semantics.
+  roster semantics. For a roster-reading verb whose receiver anchors to a
+  shared scope, the gateway reads that receiver's room authority (so `enter`
+  returns the destination roster); actor receivers use the session's active
+  scope (so `who_all` remains caller-room scoped). This decision is derived
+  from topology, not catalog names or command words.
+
+  Recorded actor movement does not read or mutate the legacy
+  `session_subscribers`/`subscribers` object-property mirrors while planning.
+  Those values are relation-derived projections, not authority cells; treating
+  them as plan reads creates a repair loop because an owner closure can return
+  the corresponding relation rows but correctly has no authority cell to
+  attest. The accepted `sessionScopeTransition` is the sole planning output,
+  and every materializer derives the compatibility mirrors from it. Direct
+  local movement, which has no later transcript-application phase, continues
+  to update the mirrors immediately.
 
   Presence transition acceptance includes a freshness fence: after the actor
   scope commits, the gateway delivers the same `(from_scope, seq)` relation

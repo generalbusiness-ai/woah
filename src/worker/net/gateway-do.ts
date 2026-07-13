@@ -3237,11 +3237,18 @@ export class NetGatewayDO {
     const activeScope = (session?.value as { activeScope?: unknown } | undefined)?.activeScope;
     const actorLive = view.get(cellKey("object_live", call.actor));
     const actorLocation = (actorLive?.value as { location?: unknown } | undefined)?.location;
-    const room = typeof activeScope === "string" && activeScope
-      ? activeScope
-      : typeof actorLocation === "string" && actorLocation
-        ? actorLocation
-        : null;
+    // Room verbs read the receiver's roster (enter must return the destination
+    // roster); actor verbs such as who_all read the caller's active room. Use
+    // topology rather than catalog names so this remains a generic substrate
+    // rule for any shared scope supplied by an installed catalog.
+    const targetScope = classifier.scopeOf(call.target);
+    const receiverRoom = classifier.isShared(targetScope) ? call.target : null;
+    const room = receiverRoom
+      ?? (typeof activeScope === "string" && activeScope
+        ? activeScope
+        : typeof actorLocation === "string" && actorLocation
+          ? actorLocation
+          : null);
     if (!room) return undefined;
     const scope = classifier.scopeOf(room);
     const response = await structure.rpc(() => this.host.rpc(

@@ -408,7 +408,7 @@ describe("v2 browser local turn planning", () => {
     }));
   });
 
-  it("records session-scope movement over stale subscriber projection rows", async () => {
+  it("records session-scope movement without promoting stale subscriber projections to authority reads", async () => {
     const anchor = createWorld();
     const session = anchor.auth("guest:v2-browser-local-outliner-scrub");
     anchor.setProp("the_outline", "session_subscribers", [{ session: "expired:test", actor: "stale_actor" }]);
@@ -451,17 +451,11 @@ describe("v2 browser local turn planning", () => {
       from: "the_chatroom",
       to: "the_outline"
     });
-    expect(local.transcript.reads).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        cell: { kind: "prop", object: "the_outline", name: "session_subscribers" },
-        value: expect.arrayContaining([
-          expect.objectContaining({ session: "expired:test", actor: "stale_actor" })
-        ])
-      }),
-      expect.objectContaining({
-        cell: { kind: "prop", object: "the_outline", name: "subscribers" },
-        value: expect.arrayContaining(["stale_actor"])
-      })
+    // The accepted session transition derives both compatibility mirrors.
+    // Planning must not validate stale projection rows as authority cells.
+    expect(local.transcript.reads).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ cell: { kind: "prop", object: "the_outline", name: "session_subscribers" } }),
+      expect.objectContaining({ cell: { kind: "prop", object: "the_outline", name: "subscribers" } })
     ]));
     expect(local.transcript.writes).not.toEqual(expect.arrayContaining([
       expect.objectContaining({ cell: { kind: "prop", object: "the_outline", name: "session_subscribers" } }),

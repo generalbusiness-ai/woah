@@ -5973,7 +5973,15 @@ export class WooWorld {
       if (oldLocation && (this.objects.has(oldLocation) || await this.remoteHostForObject(oldLocation, ctx.hostMemo))) {
         await this.invokeContainerHookSwallow(ctx, oldLocation, "exitfunc", [actor]);
       }
-      if (oldLocation && await this.spaceLikeOrRemote(oldLocation, ctx.hostMemo)) {
+      // A recorded turn derives subscriber mirrors from the accepted session
+      // transition. Reading and mutating those mirrors while planning would
+      // turn projection rows into authority reads; net authorities correctly
+      // serve them as relations, so such reads can never be refreshed as
+      // cells and would grind the repair loop to E_BUDGET. Direct/local moves
+      // still maintain the mirrors immediately because no later transcript
+      // materialization exists on that path.
+      const derivesPresenceFromTranscript = this.activeTurnRecorder !== null;
+      if (!derivesPresenceFromTranscript && oldLocation && await this.spaceLikeOrRemote(oldLocation, ctx.hostMemo)) {
         await this.updatePresenceChecked(actor, oldLocation, false, ctx);
       }
       // Record the session active-scope transition as a first-class turn effect
@@ -6012,7 +6020,7 @@ export class WooWorld {
           await this.moveObjectChecked(actor, targetRef);
         }
       }
-      if (await this.spaceLikeOrRemote(targetRef, ctx.hostMemo)) {
+      if (!derivesPresenceFromTranscript && await this.spaceLikeOrRemote(targetRef, ctx.hostMemo)) {
         await this.updatePresenceChecked(actor, targetRef, true, ctx);
       }
       if (this.objects.has(targetRef) || await this.remoteHostForObject(targetRef, ctx.hostMemo)) {
