@@ -366,6 +366,12 @@ item; what remains is exactly what the workerd lanes cannot prove
   produce. Guest/session mint responses include the owner-committed
   `active_scope`; the driver skips setup movement when a session is already
   born in the requested room, so the enter phase measures real transitions.
+  Guest claims carry a high-entropy timestamped `claim_id`, treated as a
+  temporary bearer. The edge routes retries by that key and the gateway
+  deterministically derives the same actor/session and original mint time;
+  an ambiguous fresh-scope timeout therefore replays one scope idempotency
+  key instead of leaking another guest. Invalid, future, and expired claims
+  fail closed; old clients without a claim retain additive compatibility.
 - **Gateway sharding — BUILT after the first deployed canary.** Public
   `/net-api` routing uses `NET_API_GATEWAY_SHARDS` named shards. A session
   or WebSocket ticket carries its minting shard; MCP headers, bearer/body/

@@ -204,11 +204,25 @@ async function main(): Promise<void> {
 
   try {
     for (let i = 0; i < actors; i += 1) {
-      const { response, body } = await jsonFetch(`${base}/net-api/guest`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ ttl_ms: 10 * 60_000 })
-      });
+      // Keep one claim bearer across transport retries. The edge routes it to
+      // one shard and the gateway derives the same actor/session submit, so a
+      // timeout after commit cannot leak a second anonymous identity.
+      const claimBody = {
+        ttl_ms: 10 * 60_000,
+        claim_id: `g1.${Date.now().toString(36)}.${(10 * 60_000).toString(36)}.${crypto.randomUUID()}`
+      };
+      let result: Awaited<ReturnType<typeof jsonFetch>> | null = null;
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        result = await jsonFetch(`${base}/net-api/guest`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(claimBody)
+        });
+        if (result.response.status !== 503 || attempt === 3) break;
+        await new Promise((resolve) => setTimeout(resolve, attempt * 250));
+      }
+      if (!result) throw new Error(`guest ${i} did not run`);
+      const { response, body } = result;
       if (!response.ok || typeof body.actor !== "string" || typeof body.session !== "string") {
         throw new Error(`guest ${i} failed: ${response.status} ${JSON.stringify(body)}`);
       }

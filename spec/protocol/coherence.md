@@ -518,6 +518,12 @@ One write path per fact (CO9), concretized:
   presence from physical `contents` or dereference disconnected actor clusters.
   Runtime metadata gates that request this projection resolve verbs through the
   same parent-first, then feature-chain order as executable dispatch.
+- **Anonymous identity claims preserve CO2.5 across the public retry boundary.**
+  A high-entropy timestamped claim bearer routes retries to one gateway and
+  deterministically fixes the guest actor, session, and mint timestamp. The
+  resulting scope submit therefore retains one idempotency key even when both
+  internal reply attempts time out. Invalid, future, or expired claims are
+  refused; a claim is never recycled into a fresh identity.
 - **Relation-owner topology is gateway knowledge** (the
   `rider_destinations` rule): the gateway classifies the transcript's
   relation-owner objects (move endpoints, create locations, contents

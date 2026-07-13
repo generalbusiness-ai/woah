@@ -203,6 +203,9 @@ type SessionOpenRequest = {
    * `actor_occupied` at the cluster sequencer when another live session
    * binds the actor. */
   exclusive?: boolean;
+  /** Retry-stable wall clock for a public guest claim. Internal callers that
+   * omit it retain the gateway host's current time. */
+  issued_at_ms?: number;
   /** Session close (finding 12 — see MintSessionInput.closing). */
   closing?: { priorActiveScope: string | null };
 };
@@ -445,6 +448,39 @@ const CLIENT_SESSION_TTL_MAX_MS = 24 * 60 * 60_000;
 function clampClientTtl(raw: unknown): number {
   const ttl = typeof raw === "number" && Number.isFinite(raw) ? raw : CLIENT_SESSION_TTL_DEFAULT_MS;
   return Math.min(CLIENT_SESSION_TTL_MAX_MS, Math.max(CLIENT_SESSION_TTL_MIN_MS, ttl));
+}
+
+type GuestClaim = { id: string; issuedAt: number };
+
+/** Parse the public guest idempotency bearer. Its timestamp freezes the mint
+ * expiry across retries; UUID randomness makes guessing it equivalent to
+ * guessing the resulting session bearer. */
+function guestClaim(raw: unknown, now: number, ttlMs: number): GuestClaim | null {
+  if (raw === undefined) return null; // additive compatibility for old clients
+  if (typeof raw !== "string") throw new ClientAuthError("invalid guest claim", { reason: "guest_claim_invalid" }, "E_PERM", 400);
+  const match = /^g1\.([0-9a-z]+)\.([0-9a-z]+)\.([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/.exec(raw);
+  const issuedAt = match ? Number.parseInt(match[1], 36) : Number.NaN;
+  const claimedTtl = match ? Number.parseInt(match[2], 36) : Number.NaN;
+  if (
+    !match ||
+    !Number.isSafeInteger(issuedAt) ||
+    !Number.isSafeInteger(claimedTtl) ||
+    claimedTtl !== ttlMs ||
+    clampClientTtl(claimedTtl) !== claimedTtl ||
+    issuedAt > now + 60_000
+  ) {
+    throw new ClientAuthError("invalid guest claim", { reason: "guest_claim_invalid" }, "E_PERM", 400);
+  }
+  if (issuedAt + ttlMs <= now) {
+    throw new ClientAuthError("guest claim expired", { reason: "guest_claim_expired" }, "E_PERM", 409);
+  }
+  return { id: raw, issuedAt };
+}
+
+async function guestClaimHex(claim: GuestClaim, purpose: string): Promise<string> {
+  const bytes = new TextEncoder().encode(`${purpose}\0${claim.id}`);
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  return Array.from(digest.slice(0, 16), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 /** What a gateway WebSocket carries across hibernation (Phase 4 item 3):
@@ -1453,7 +1489,7 @@ export class NetGatewayDO {
     }
     const destination = request.cluster_destination ?? `scope:${clusterScope}`;
 
-    const now = this.host.now();
+    const now = request.issued_at_ms ?? this.host.now();
     // Phase 5: the session mint stamps request.catalog_epoch; a cluster
     // scope at another durable epoch would reject every submit, so fail
     // fast at the head fetch (same rule as the turn path).
@@ -1991,7 +2027,11 @@ export class NetGatewayDO {
   }
 
   /**
-   * POST /net-api/guest {ttl_ms?} — the identity door's anonymous half.
+   * POST /net-api/guest {ttl_ms?, claim_id?} — the identity door's
+   * anonymous half. New clients send a high-entropy claim_id: edge routing
+   * and deterministic identity derivation make response-lost retries replay
+   * the exact same authority submit. It is a temporary bearer and expires
+   * with the requested session TTL. Omission remains additive compatibility.
    * Claims a free actor from the install-seeded pool
    * (property_cell:$system:guest_pool — catalog DATA, so the gateway
    * never hardcodes world names) with an EXCLUSIVE mint: the cluster
@@ -2004,6 +2044,8 @@ export class NetGatewayDO {
   private async clientGuest(body: Record<string, unknown>): Promise<Response> {
     // One shared pre-auth bucket: guest claims are session mints.
     this.enforceClientRate("guest:door", "/net-api/session");
+    const ttlMs = clampClientTtl(body.ttl_ms);
+    const claim = guestClaim(body.claim_id, this.host.now(), ttlMs);
     const identity = await this.catalogIdentity();
     const poolCell = this.ensureView().get(cellKey("property_cell", "$system", "guest_pool"));
     const payload = poolCell?.value as { value?: unknown } | undefined;
@@ -2016,11 +2058,17 @@ export class NetGatewayDO {
       );
     }
     for (const actor of pool) {
-      const response = await this.clientSession(actor, body, identity.epoch, { exclusive: true });
+      const session = claim
+        ? sessionIdWithShardHint(this.shardName(), await guestClaimHex(claim, `session:${actor}`))
+        : undefined;
+      const response = await this.clientSession(actor, body, identity.epoch, {
+        exclusive: true,
+        ...(session ? { session, issuedAt: claim?.issuedAt, ttlMs } : {})
+      });
       if (response.status === 409) continue; // occupied — try the next pool actor
       return response;
     }
-    if (template !== null) return await this.clientElasticGuest(body, identity.epoch, template);
+    if (template !== null) return await this.clientElasticGuest(identity.epoch, template, claim, ttlMs);
     return json(
       { error: { code: "E_RATE", message: "all guest actors are in use; try again later", detail: { reason: "guest_pool_exhausted", pool_size: pool.length } } },
       503
@@ -2047,20 +2095,25 @@ export class NetGatewayDO {
   }
 
   /** Provision an anonymous actor and its first session in one commit at
-   * the actor's fresh cluster owner. The random id selects an empty DO;
-   * the scope's create-collision check still fails closed if it is not. */
+   * the actor's fresh cluster owner. A claim-derived id is retry-stable; a
+   * legacy random id still selects an empty DO. The scope's create-collision
+   * check fails closed either way. */
   private async clientElasticGuest(
-    body: Record<string, unknown>,
     epoch: string,
-    template: GuestTemplate
+    template: GuestTemplate,
+    claim: GuestClaim | null,
+    ttlMs: number
   ): Promise<Response> {
-    const actor = `guest_net_${randomHex(16)}`;
-    const session = sessionIdWithShardHint(this.shardName(), randomHex(16));
+    const actor = `guest_net_${claim ? await guestClaimHex(claim, "actor") : randomHex(16)}`;
+    const session = sessionIdWithShardHint(
+      this.shardName(),
+      claim ? await guestClaimHex(claim, `session:${actor}`) : randomHex(16)
+    );
     const planned = provisionGuestSubmit({
       actor,
       session,
-      ttl_ms: clampClientTtl(body.ttl_ms),
-      now: this.host.now(),
+      ttl_ms: ttlMs,
+      now: claim?.issuedAt ?? this.host.now(),
       epoch,
       template
     });
@@ -2221,7 +2274,7 @@ export class NetGatewayDO {
     actor: string,
     body: Record<string, unknown>,
     epoch: string,
-    options: { exclusive?: boolean } = {}
+    options: { exclusive?: boolean; session?: string; issuedAt?: number; ttlMs?: number } = {}
   ): Promise<Response> {
     // The mint needs the actor's lineage (cluster-scope derivation) in
     // view; the CO15 `cluster:<actor>` convention names the pull
@@ -2242,7 +2295,7 @@ export class NetGatewayDO {
     // Phase 6: the id carries THIS shard's name so a future multi-shard
     // /net-api router can resolve a live session to the gateway holding
     // its view — a routing change, never a data migration.
-    const session = sessionIdWithShardHint(this.shardName(), randomHex(16));
+    const session = options.session ?? sessionIdWithShardHint(this.shardName(), randomHex(16));
     // Client-shell phase i: the session is born PRESENT at the actor's
     // live location (v2 parity — cross-actor delivery routes by session
     // presence, and a placeless session would miss everything until its
@@ -2253,9 +2306,10 @@ export class NetGatewayDO {
     const opened = await this.sessionOpen({
       session,
       actor,
-      ttl_ms: clampClientTtl(body.ttl_ms),
+      ttl_ms: options.ttlMs ?? clampClientTtl(body.ttl_ms),
       catalog_epoch: epoch,
       active_scope: bornAt,
+      ...(options.issuedAt !== undefined ? { issued_at_ms: options.issuedAt } : {}),
       ...(options.exclusive ? { exclusive: true } : {})
     });
     if (opened.reply.status !== "accepted") {

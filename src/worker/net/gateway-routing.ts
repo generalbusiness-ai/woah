@@ -48,7 +48,19 @@ export function routeNetGateway(input: NetGatewayRouteInput): string {
   const email = input.pathname === "/net-api/login" && typeof body?.email === "string"
     ? body.email.trim().toLowerCase()
     : "";
-  const key = credentialKey ? `apikey:${credentialKey}` : email ? `email:${email}` : input.anonymousKey;
+  // A guest claim id is a temporary bearer/idempotency key. Route every
+  // retry to the same gateway so its deterministic session carries the same
+  // shard hint and the scope can replay the exact original submit.
+  const guestClaim = input.pathname === "/net-api/guest" && typeof body?.claim_id === "string"
+    ? body.claim_id
+    : "";
+  const key = credentialKey
+    ? `apikey:${credentialKey}`
+    : email
+      ? `email:${email}`
+      : guestClaim
+        ? `guest:${guestClaim}`
+        : input.anonymousKey;
   return netGatewayShardName(stableHash(key) % input.shardCount, input.shardCount);
 }
 

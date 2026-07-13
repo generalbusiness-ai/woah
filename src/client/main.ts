@@ -626,6 +626,30 @@ function clearNetSession() {
   }
 }
 
+const NET_GUEST_CLAIM_KEY = "woo:net:guest-claim";
+
+/** Keep the anonymous claim bearer until mint succeeds. A response-lost retry
+ * must name the same authority submit, including across a page reload. */
+function pendingGuestClaim(): string {
+  const existing = readStorage(NET_GUEST_CLAIM_KEY);
+  const match = /^g1\.([0-9a-z]+)\.([0-9a-z]+)\.[0-9a-f-]{36}$/.exec(existing ?? "");
+  const issuedAt = match ? Number.parseInt(match[1], 36) : 0;
+  const ttlMs = match ? Number.parseInt(match[2], 36) : 0;
+  if (match && issuedAt + ttlMs > Date.now()) return existing as string;
+  const ttl = 30 * 60_000;
+  const claim = `g1.${Date.now().toString(36)}.${ttl.toString(36)}.${crypto.randomUUID()}`;
+  writeStorage(NET_GUEST_CLAIM_KEY, claim);
+  return claim;
+}
+
+function clearGuestClaim() {
+  try {
+    localStorage.removeItem(NET_GUEST_CLAIM_KEY);
+  } catch {
+    // Storage is optional; the in-flight request still retains its claim.
+  }
+}
+
 /** The identity door: POST /net-api/guest or /net-api/login, store the
  * minted session, and open the feed on it as the bearer. */
 async function netDoorAuth(path: string, body: Record<string, unknown>) {
@@ -633,24 +657,35 @@ async function netDoorAuth(path: string, body: Record<string, unknown>) {
   state.loginError = undefined;
   render();
   try {
-    const response = await fetch(path, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body)
-    });
-    const reply = (await response.json().catch(() => ({}))) as {
+    const guest = path === "/net-api/guest";
+    const requestBody = guest ? { ...body, claim_id: pendingGuestClaim() } : body;
+    let response: Response | null = null;
+    let reply: {
       session?: string;
       actor?: string;
       expires_at?: number | null;
       error?: { message?: string };
-    };
+    } = {};
+    for (let attempt = 1; attempt <= (guest ? 3 : 1); attempt += 1) {
+      response = await fetch(path, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(requestBody)
+      });
+      reply = (await response.json().catch(() => ({}))) as typeof reply;
+      if (response.status !== 503 || attempt === 3) break;
+      await new Promise((resolve) => setTimeout(resolve, attempt * 250));
+    }
+    if (!response) throw new Error("sign-in request did not run");
     if (!response.ok || typeof reply.session !== "string" || typeof reply.actor !== "string") {
+      if (guest && response.status === 409) clearGuestClaim();
       state.loginPending = false;
       state.loginError = reply.error?.message ?? `sign-in failed (${response.status})`;
       render();
       return;
     }
     const minted = { session: reply.session, actor: reply.actor, expires_at: reply.expires_at ?? null };
+    if (guest) clearGuestClaim();
     writeNetSession(minted);
     state.loginPending = false;
     openNetFeed(`session:${minted.session}`, { session: minted.session, actor: minted.actor });

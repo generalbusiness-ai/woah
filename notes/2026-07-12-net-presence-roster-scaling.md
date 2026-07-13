@@ -245,3 +245,25 @@ focused Worker test constructs a room whose `enter` exists only on a feature
 and proves the declaration is found. This is the first correction that should
 produce a `room_roster` phase in the deployed move trace; deployed confirmation
 remains required.
+
+### Deployed acceptance and the guest retry finding
+
+Canary version `11b0ca17-5306-40a5-b1fa-6e5095e83423` confirmed the metadata
+fix: a single real move to `the_deck` accepted, then all 30 concurrent moves
+accepted. The 30-guest run completed 598/600 sustained turns (two named 1500ms
+queue refusals, 0.32%) and every responder across all eight gateway shards saw
+all 30 occupants. A paced warm run completed 512/512 with complete rosters
+across five shards (edge p50 433ms, p99 1043ms; edge timing is not the AE
+internal-wall gate).
+
+The next default-room run then timed out both internal attempts to provision
+its first elastic guest on a cold fresh cluster. The scope submit was already
+same-body idempotent, but an external `/guest` retry generated another random
+actor/session, leaving an ambiguous committed claim behind. Public guest
+claims now carry a timestamped high-entropy `claim_id`: routing selects one
+gateway from it, and the gateway deterministically derives the candidate
+sessions, elastic actor, and original mint time. Browser and canary clients
+retain the claim across bounded 503 retries; malformed/future/expired claims
+fail closed. The same response also exposes `active_scope`, allowing the load
+driver to skip synthetic same-room enters while preserving real cross-room
+movement coverage. Final deployed retry/soak confirmation remains required.

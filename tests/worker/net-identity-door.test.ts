@@ -375,12 +375,16 @@ describe("the identity door (/net-api/login, /net-api/guest, session bearers)", 
 
     // The pool is full: provision a fresh actor + first session as one
     // commit at cluster:<actor>, then use its bearer immediately.
-    const elastic = await h.api("POST", "/net-api/guest", { body: {} });
+    const claimId = `g1.${Date.now().toString(36)}.${(30 * 60_000).toString(36)}.8c43df90-7989-46ef-a29b-947f5d1fc130`;
+    const elastic = await h.api("POST", "/net-api/guest", { body: { claim_id: claimId } });
     expect(elastic.status, JSON.stringify(elastic.body).slice(0, 300)).toBe(200);
     expect(elastic.body.elastic).toBe(true);
     expect(elastic.body.actor).toMatch(/^guest_net_[0-9a-f]{32}$/);
     expect(elastic.body.active_scope).toBe("the_chatroom");
     expect(claimed.has(elastic.body.actor as string)).toBe(false);
+    const replay = await h.api("POST", "/net-api/guest", { body: { claim_id: claimId } });
+    expect(replay.status, JSON.stringify(replay.body).slice(0, 300)).toBe(200);
+    expect(replay.body).toMatchObject({ actor: elastic.body.actor, session: elastic.body.session, elastic: true });
     const turn = await h.api("POST", "/net-api/turn", {
       token: `session:${elastic.body.session as string}`,
       body: { target: "the_chatroom", verb: "say", args: ["elastic hello"], idempotency_key: "elastic-door-turn" }
@@ -388,6 +392,33 @@ describe("the identity door (/net-api/login, /net-api/guest, session bearers)", 
     expect(turn.status, JSON.stringify(turn.body).slice(0, 300)).toBe(200);
     expect((turn.body.reply as { status?: string }).status).toBe("accepted");
 
+    await h.close();
+  }, 30_000);
+
+  it("fails closed on malformed or expired guest claim bearers", async () => {
+    const h = await buildDoorHarness();
+    const malformed = await h.api("POST", "/net-api/guest", { body: { claim_id: "not-a-claim" } });
+    expect(malformed.status).toBe(400);
+    expect(malformed.body.error).toMatchObject({ code: "E_PERM", detail: { reason: "guest_claim_invalid" } });
+
+    const mismatched = await h.api("POST", "/net-api/guest", {
+      body: {
+        ttl_ms: 60_000,
+        claim_id: `g1.${Date.now().toString(36)}.${(120_000).toString(36)}.8c43df90-7989-46ef-a29b-947f5d1fc130`
+      }
+    });
+    expect(mismatched.status).toBe(400);
+    expect(mismatched.body.error).toMatchObject({ code: "E_PERM", detail: { reason: "guest_claim_invalid" } });
+
+    const expiredAt = Date.now() - 2 * 60_000;
+    const expired = await h.api("POST", "/net-api/guest", {
+      body: {
+        ttl_ms: 60_000,
+        claim_id: `g1.${expiredAt.toString(36)}.${(60_000).toString(36)}.8c43df90-7989-46ef-a29b-947f5d1fc130`
+      }
+    });
+    expect(expired.status).toBe(409);
+    expect(expired.body.error).toMatchObject({ code: "E_PERM", detail: { reason: "guest_claim_expired" } });
     await h.close();
   }, 30_000);
 

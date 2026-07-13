@@ -47,4 +47,9 @@ describe("net gateway edge routing", () => {
       route({ pathname: "/net-api/session", headers, anonymousKey: "b" })
     );
   });
+
+  it("routes retries of one guest claim to the same shard", () => {
+    const bodyText = JSON.stringify({ claim_id: "g1.mriny123.cuyo0.8c43df90-7989-46ef-a29b-947f5d1fc130" });
+    expect(route({ bodyText, anonymousKey: "edge-a" })).toBe(route({ bodyText, anonymousKey: "edge-b" }));
+  });
 });
