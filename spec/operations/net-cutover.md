@@ -405,8 +405,9 @@ item; what remains is exactly what the workerd lanes cannot prove
   commits a fresh actor, its initial placement, mutable guest properties,
   and its first exclusive session atomically at a previously unseen
   `cluster:<actor>` owner. Contents and session-presence deltas follow the
-  normal owner outbox path. Random 128-bit actor ids select independent
-  cluster DOs; the sequencer's create-collision guard remains fail-closed.
+  normal owner outbox path. Claim-derived ids retain 128 bits of random
+  entropy while making retries stable and select independent cluster DOs;
+  the sequencer's create-collision guard remains fail-closed.
 - **Second-review scale caps — RECORDED, NOT BUILT** (accepted findings
   9/11/12 residuals, required before public traffic beyond the bake):
   each `/net-api` gateway durably accumulates every cell visited by its
@@ -430,6 +431,16 @@ item; what remains is exactly what the workerd lanes cannot prove
   shards with zero errors, timeouts, queue wait, retries, reconstructions,
   outbox failures, abandonments, or delivery gaps; its AE-weighted global
   server envelope was p50 173 ms, p95 349 ms, p99 397 ms (max 1.78 s).
+  The 2026-07-12 roster/lifecycle follow-up used a fresh namespace and
+  completed: 600/600 immediate default-room turns with 22 elastic guests;
+  a repeated-namespace paced soak at 640/640 with eight elastic guests
+  (edge p50 435 ms, p99 732 ms); and 30/30 real cross-room moves plus
+  600/600 paced destination turns. Every conclusive roster check was
+  complete across seven or eight shards and every session closed. A repeated
+  60-request hot-room burst remained memory-stable but hit five named 5 s RPC
+  deadlines (595/600, 0.83%): this is the measured burst ceiling, not part of
+  the zero-timeout stable envelope. Non-sampled AE re-evaluation remains an
+  owner gate when `CF_ANALYTICS_TOKEN` is available.
   Production and smoke profiles therefore carry the canary-proven twelve
   per-scope gateway lanes. The public route remains closed pending the
   owner-run cutover and geographically separated/cold-start/sustained-rate

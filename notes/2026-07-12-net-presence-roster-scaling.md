@@ -291,3 +291,26 @@ authoritative live cell to `$nowhere`, and removes both `session_presence` and
 unmarked and placed for reuse. A fresh namespace is required for final load
 evidence because already-reaped legacy canary sessions no longer retain enough
 authority data to identify their old actors safely.
+
+### Fresh-namespace final evidence (`1aa16ce`)
+
+A new standalone worker/KV namespace installed and activated all 20 scopes,
+then produced three clean acceptance runs:
+
+- immediate default room: 30 guests (22 elastic), zero setup enters,
+  600/600 turns, all sessions closed, complete 30-person rosters on all eight
+  shards;
+- repeated-namespace paced soak: 16 guests (eight elastic), 640/640 turns,
+  all sessions closed, complete rosters on all eight shards, edge p50 435ms /
+  p95 626ms / p99 732ms;
+- real cross-room path: 30/30 enters to `the_deck`, then 600/600 paced turns,
+  all sessions closed, complete 30-person rosters across seven shards.
+
+A second unpaced 60-request hot-room burst no longer reset an isolate or lost
+a bearer, but five turns hit named 5s RPC deadlines (595/600, 0.83%; catalog
+`/attest` and room `/head`). That remains the measured burst ceiling. It is
+below the original `<1%` external error target but not the stricter AE
+zero-timeout policy, so the accepted initial baseline is the paced envelope,
+not unlimited burst admission. The shell lacks `CF_ANALYTICS_TOKEN`; the
+non-sampled AE internal-wall/queue re-evaluation could not be run and remains
+an explicit owner gate rather than an inferred pass.
