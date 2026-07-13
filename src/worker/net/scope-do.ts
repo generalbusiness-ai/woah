@@ -24,6 +24,9 @@
  *                           the committing scope can validate foreign
  *                           reads (absent cells attest "absent")
  *       POST /net/closure   {keys, known?} → lineage-closed CellTransfer
+ *       GET  /net/probe     signed, state-free install-secret readiness
+ *                           probe; deliberately answered before sequencer
+ *                           hydration or pending-work drain
  *       GET  /net/head      {scope, catalog_epoch, head}
  *       POST /net/seed      bootstrap/install path (also how tests build
  *                           a scope; the catalog install pipeline adopts
@@ -625,6 +628,13 @@ export class NetScopeDO {
       return json({ error: String(err) }, 401);
     }
     const url = new URL(request.url);
+    // Installation must prove that a freshly deployed secret reached BOTH
+    // the edge and the destination DO before the first seed. Answer before
+    // sequencer hydration and drain scheduling so this route cannot create
+    // world authority, advance a head, or kick deferred work.
+    if (request.method === "GET" && url.pathname === "/net/probe") {
+      return json({ ok: true, service: "net-scope" });
+    }
     // Drain-on-reactivation (CO2.7 at-least-once): ordinary requests kick
     // pending work off their reply path. An incoming outbox delivery is
     // different: continuing /adopt -> /relate -> /fanout in the SAME CF

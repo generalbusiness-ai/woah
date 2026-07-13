@@ -321,19 +321,64 @@ not unlimited burst admission. The shell lacks `CF_ANALYTICS_TOKEN`; the
 non-sampled AE internal-wall/queue re-evaluation could not be run and remains
 an explicit owner gate rather than an inferred pass.
 
-The local follow-up removes the class-definition half of that measured
-catalog contention without weakening CO2.3. Class lineage, property
-definitions/defaults, and verb bytecode change only with a `catalog_epoch`
-bump (CO15), so each gateway now coalesces its first `/attest` miss and caches
-exact owner-returned versions under that epoch. Arbitrary catalog objects,
-identity/session cells, and every other mutable foreign owner are still
-attested on every turn; a catalog authority epoch mismatch fails closed
-without populating the cache. The three-scope topology lane forces two
-concurrent class readers to overlap and proves one catalog RPC versus two live
-cluster RPCs, then proves an anchorless catalog config is attested on every
-turn. The 595/600 result remains the last deployed evidence until a fresh
-canary rerun; the room `/head` half of that burst ceiling is intentionally
-unchanged.
+The first local follow-up attempted to remove the class-definition half of
+that contention with a per-gateway, epoch-keyed attestation cache. Its first
+deployed cold burst exposed a Cloudflare-only design failure: 594/600 turns
+accepted and six failed `Subrequest depth limit exceeded`; the next warm
+60/60 controls were clean. The cache shared an I/O-backed promise between
+concurrent Durable Object invocations, joining otherwise-independent request
+lineages. That is incompatible with the same platform depth bound CO2.7's
+alarm boundaries protect.
+
+The corrected design removes both the singleton read and the cross-invocation
+coordination. Class lineage, property definitions/defaults, and verb bytecode
+change only with a `catalog_epoch` bump (CO15), their versions are content
+addresses, and the gateway has already verified that epoch is active. It can
+therefore construct the CO2.3 proof from a derived class-definition cell only
+when that cell's own stamp matches the turn epoch. A differently stamped copy
+falls back to live `/net/attest`; arbitrary catalog objects, identity/session
+cells, and every other mutable foreign owner are still attested every turn,
+and a live catalog authority epoch mismatch fails closed. The three-scope lane
+proves two concurrent class readers cause zero catalog RPCs versus two live
+cluster RPCs, proves stale-stamped definitions fall back to live authority,
+and proves an anchorless catalog config is attested on every turn. Fresh
+deployed evidence for this corrected design follows below.
+
+### Epoch-certificate canary (`2edb120b-9130-45b6-ab04-5bb95fe09e9b`)
+
+The standalone `workers.dev` canary retained the accumulated room authority
+from the failed cache run (more than 900 commits) but deployed fresh gateway
+code. This exercised cold gateway instances against a non-pristine hot scope:
+
+- unpaced, 30 guests / 60 simultaneous requests per round: 597/600 accepted;
+  the three refusals were named 1500 ms room-queue admission limits
+  (`E_BUDGET`, HTTP 503, 0.5%). There were no `E_INTERNAL`, subrequest-depth,
+  RPC-timeout, bearer, cleanup, or roster failures. Edge p50/p95/p99/max was
+  1091/2178/2336/2852 ms;
+- 250 ms round pacing with the same 30 guests and 600 turns: 600/600 accepted,
+  all sessions closed, and every responder saw all 30 occupants across all
+  eight shards. Edge p50/p95/p99/max was 1056/1566/1651/1768 ms.
+
+This closes the catalog-attestation regression and leaves the already-named
+single-room burst envelope intact: paced initial traffic is clean; a
+deliberately unpaced 60-request room burst receives bounded, retryable
+backpressure below the original one-percent external-error target. Raising the
+queue deadline would trade that honest admission signal for worse tail latency
+and is not the fix. The shell still has no `CF_ANALYTICS_TOKEN`, so Analytics
+Engine's non-sampled internal queue/wall percentile query remains owner-gated.
+
+One deployment footnote is operationally relevant. `wrangler secret put`
+reported a 100% secret-change deployment and listed `WOO_INTERNAL_SECRET`, but
+the live install doorway briefly executed without the binding and refused the
+first two pre-seed requests. Redeploying the same standalone config after the
+secret existed produced a version that actually carried it, after which all
+20 scopes installed normally. Canary/runbook setup must therefore deploy the
+config once more after creating a first-time secret. The installer now enforces
+the second half: before any seed it signs `GET /net-install/probe`; the edge
+verifies it and freshly signs a state-free `/net/probe` hop to the catalog DO.
+`--probe-only` exposes the same gate for deployment rehearsal. A successful
+probe proves both live bindings without hydrating a sequencer, advancing a
+head, or draining pending work.
 
 Review of the first cache draft found a separate correctness hole in runtime
 authoring: `add_verb`/`set_verb_code` and property-definition builtins mutated

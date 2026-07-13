@@ -2,7 +2,7 @@
 // production install conduit is the highest-risk trust boundary on the
 // worker edge, so its guarantees are pinned against the REAL
 // `worker.fetch` routing — signature gate, method/path allow-list, body
-// cap, epoch-downgrade refusal, seed/head forwarding, and secret-safe
+// cap, epoch-downgrade refusal, probe/install forwarding, and secret-safe
 // error text — not against the DO handlers the route forwards to
 // (tests/worker/net-install.test.ts covers those).
 import { describe, expect, it } from "vitest";
@@ -17,6 +17,7 @@ const EPOCH = "cat-doorway-1";
 
 function buildHarness() {
   const states: FakeDurableObjectState[] = [];
+  const scopeStates = new Map<string, FakeDurableObjectState>();
   const scopeDOs = new Map<string, NetScopeDO>();
   const resolve = (destination: string) => {
     if (!destination.startsWith("scope:")) throw new Error(`unexpected destination ${destination}`);
@@ -25,6 +26,7 @@ function buildHarness() {
     if (!instance) {
       const fake = new FakeDurableObjectState(`scope-${name}`);
       states.push(fake);
+      scopeStates.set(name, fake);
       const state: NetScopeDurableState = {
         id: fake.id,
         waitUntil: () => {},
@@ -49,6 +51,7 @@ function buildHarness() {
     request: async (path: string, init?: RequestInit) => worker.fetch(new Request(`https://woo.test${path}`, init), env, {} as never),
     signedRequest: async (path: string, init?: RequestInit) =>
       worker.fetch(await signInternalRequest({ WOO_INTERNAL_SECRET: SECRET }, new Request(`https://woo.test${path}`, init)), env, {} as never),
+    scopeStates,
     close: () => states.forEach((state) => state.close())
   };
 }
@@ -61,6 +64,21 @@ const seedBody = (scope: string, epoch = EPOCH, cells: unknown[] = []) =>
   });
 
 describe("the /net-install doorway (route level)", () => {
+  it("probes the edge and catalog DO signing path without creating world authority", async () => {
+    const h = buildHarness();
+    const response = await h.signedRequest("/net-install/probe");
+    expect(response.status, await response.clone().text()).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, service: "net-scope" });
+
+    const catalog = h.scopeStates.get("catalog");
+    expect(catalog, "probe must route specifically to the catalog scope").toBeDefined();
+    const meta = catalog!.storage.sql.exec("SELECT body FROM net_scope_meta WHERE id = 'meta'").toArray();
+    const cells = catalog!.storage.sql.exec("SELECT key FROM net_scope_cell").toArray();
+    expect(meta).toEqual([]);
+    expect(cells).toEqual([]);
+    h.close();
+  });
+
   it("gates on the internal signature: unsigned, tampered, and header-injection callers are refused", async () => {
     const h = buildHarness();
     // Unsigned.
@@ -123,13 +141,14 @@ describe("the /net-install doorway (route level)", () => {
     h.close();
   });
 
-  it("allow-lists exactly seed (POST) and head (GET); everything else 404s", async () => {
+  it("allow-lists probe (GET), scope install verbs, and no wider scope RPC surface", async () => {
     const h = buildHarness();
     // Wrong verb on a valid path shape.
     expect((await h.signedRequest("/net-install/scope/room%3Ax/subscribe", seedBody("room:x"))).status).toBe(404);
     // Wrong method for the verb.
     expect((await h.signedRequest("/net-install/scope/room%3Ax/seed")).status).toBe(404);
     expect((await h.signedRequest("/net-install/scope/room%3Ax/head", seedBody("room:x"))).status).toBe(404);
+    expect((await h.signedRequest("/net-install/probe", { method: "POST" })).status).toBe(404);
     // Wrong kind and truncated paths.
     expect((await h.signedRequest("/net-install/gateway/g1/seed", seedBody("room:x"))).status).toBe(404);
     expect((await h.signedRequest("/net-install/scope//seed", seedBody("room:x"))).status).toBe(404);

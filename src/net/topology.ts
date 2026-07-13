@@ -38,7 +38,9 @@
  * the install pipeline — a sequenced catalog commit plus a `catalog_epoch`
  * bump (CO15). Compatibility identities, sessions, and still-anchorless
  * instances can nevertheless have catalog as their current owner; those
- * mutable cells are live-attested and are never covered by the class cache.
+ * mutable cells are live-attested. Exact-epoch class definitions use the
+ * active epoch plus their content-addressed versions as the owner certificate;
+ * a differently stamped copy falls back to live attestation.
  *
  * The gateway refuses ordinary-turn class-definition writes before submit;
  * the install pipeline is the only sanctioned updater. This file remains the

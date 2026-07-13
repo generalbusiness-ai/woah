@@ -123,6 +123,16 @@ async function handleNetInstall(request: Request, env: NetOnlyEnv, url: URL): Pr
     return json({ error: { code: "E_NOSESSION", message: `net-install requires a signed internal request: ${errorMessage(error)}` } }, 401);
   }
   const parts = url.pathname.split("/").filter(Boolean);
+  // Match the dual-stack doorway: prove the secret through a freshly signed
+  // catalog-DO hop before an operator is allowed to mutate install state.
+  if (parts.length === 2 && parts[1] === "probe" && request.method === "GET") {
+    try {
+      const stub = resolveNetDestination(env, `scope:${CATALOG_SCOPE}`);
+      return await stub.fetch(await signInternalRequest(env, new Request("https://do/net/probe")));
+    } catch (error) {
+      return publicError(error);
+    }
+  }
   if (parts.length === 2 && (parts[1] === "identity-export" || parts[1] === "freeze")) {
     return json({ error: { code: "E_OBJNF", message: "v2 migration doorway retired after cutover" } }, 410);
   }
@@ -132,7 +142,7 @@ async function handleNetInstall(request: Request, env: NetOnlyEnv, url: URL): Pr
     parts[1] === "scope" && parts.length === 4 && Boolean(name) &&
     ((request.method === "POST" && (verb === "seed" || verb === "activate")) || (request.method === "GET" && verb === "head"));
   if (!allowed) {
-    return json({ error: { code: "E_INVARG", message: "expected a signed net scope seed, activate, or head operation" } }, 404);
+    return json({ error: { code: "E_INVARG", message: "expected a signed net install probe, scope seed, activate, or head operation" } }, 404);
   }
   try {
     const stub = resolveNetDestination(env, `scope:${name}`);

@@ -6,6 +6,8 @@
 //     --base-url https://<worker-host> [--catalogs a,b,c] \
 //     [--identity identity-export.json] \
 //     [--skip-identity-verify] [--dry-run]
+//   WOO_INTERNAL_SECRET=... npx tsx scripts/net-install.ts \
+//     --base-url https://<worker-host> --probe-only
 // Real credential probes should be supplied as WOO_VERIFY_APIKEY and
 // WOO_VERIFY_PASSWORD so secrets do not appear in argv/process listings.
 //
@@ -45,6 +47,7 @@ type Args = {
    * prove step must log in with a carried apikey AND a carried password. */
   verifyPassword?: string;
   skipIdentityVerify?: boolean;
+  probeOnly?: boolean;
   dryRun: boolean;
 };
 
@@ -68,10 +71,13 @@ export function parseArgs(
     else if (arg === "--verify-apikey") args.verifyApikey = argv[++i];
     else if (arg === "--verify-password") args.verifyPassword = argv[++i];
     else if (arg === "--skip-identity-verify") args.skipIdentityVerify = true;
+    else if (arg === "--probe-only") args.probeOnly = true;
     else if (arg === "--dry-run") args.dryRun = true;
     else throw new Error(`unknown argument: ${arg}`);
   }
-  if (!args.baseUrl && !args.dryRun) throw new Error("--base-url is required (or use --dry-run)");
+  if (!args.baseUrl && (!args.dryRun || args.probeOnly)) {
+    throw new Error("--base-url is required (or use --dry-run without --probe-only)");
+  }
   return args;
 }
 
@@ -79,7 +85,25 @@ async function signedFetch(env: { WOO_INTERNAL_SECRET?: string }, request: Reque
   return fetch(await signInternalRequest(env, request));
 }
 
+/** Prove the install HMAC through the complete edge → catalog-DO path.
+ * This must run before any seed because a first-time secret deployment can
+ * briefly leave the live route and its target DO on different bindings. */
+export async function probeNetInstall(baseUrl: string, env: { WOO_INTERNAL_SECRET?: string }): Promise<void> {
+  if (!env.WOO_INTERNAL_SECRET) throw new Error("WOO_INTERNAL_SECRET is required to sign the install probe");
+  const response = await signedFetch(env, new Request(`${baseUrl}/net-install/probe`));
+  const body = (await response.json().catch(() => null)) as { ok?: unknown; service?: unknown } | null;
+  if (!response.ok || body?.ok !== true || body.service !== "net-scope") {
+    throw new Error(`net-install probe failed: ${response.status} ${JSON.stringify(body)}`);
+  }
+  console.log("verified: install secret reached edge and catalog scope");
+}
+
 export async function runNetInstall(args: Args, env: { WOO_INTERNAL_SECRET?: string }): Promise<void> {
+  if (args.probeOnly) {
+    await probeNetInstall(args.baseUrl, env);
+    console.log("net-install probe ok");
+    return;
+  }
   // Fail-closed identity rule (spec/operations/net-cutover.md): an
   // install that carries identity but cannot PROVE a carried credential
   // authenticates must not activate — a world nobody can log into is not
@@ -108,6 +132,9 @@ export async function runNetInstall(args: Args, env: { WOO_INTERNAL_SECRET?: str
     return;
   }
   if (!env.WOO_INTERNAL_SECRET) throw new Error("WOO_INTERNAL_SECRET is required to sign the install");
+  // No install mutation occurs until the complete signing path has answered.
+  // This turns secret propagation from an operator assumption into a gate.
+  await probeNetInstall(args.baseUrl, env);
 
   const seedScope = async (scope: string, cells: unknown[]): Promise<string> => {
     const url = `${args.baseUrl}/net-install/scope/${encodeURIComponent(scope)}/seed`;

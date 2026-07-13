@@ -13,6 +13,7 @@
 import type { Env } from "./persistent-object-do";
 import { signInternalRequest, verifyInternalRequest } from "./internal-auth";
 import { sessionActiveScopeFromRecord, wooError } from "../core/types";
+import { CATALOG_SCOPE } from "../net/topology";
 import { handleAdmin } from "./admin";
 import { resolveNetDestination, type NetBindingsEnv } from "./net/workerd-host";
 import { parseNetGatewayShardCount, routeNetGateway } from "./net/gateway-routing";
@@ -774,16 +775,18 @@ async function handleNetSmoke(request: Request, env: Env, url: URL): Promise<Res
 
 /**
  * Cutover item A: the production install doorway —
- * `POST /net-install/scope/<name>/seed` and
- * `GET  /net-install/scope/<name>/head`.
+ * `GET  /net-install/probe`,
+ * `POST /net-install/scope/<name>/{seed,activate}`, and
+ * `GET  /net-install/scope/<name>/head`, plus the migration-only freeze
+ * acknowledgment and identity export described below.
  *
  * Trust model: the inbound internal SIGNATURE is the gate (verified on
  * the RAW pre-sanitize request — H1b; the operator running the cutover
  * holds WOO_INTERNAL_SECRET). The surface is deliberately narrower than
- * /net-smoke: scope DOs only, and ONLY the two install verbs — `seed`
- * (idempotent by the M9 epoch guard: same-epoch re-seed no-ops,
- * different-epoch refuses, so a crashed install re-runs safely) and
- * `head` (the verification probe). Everything else about a live world —
+ * /net-smoke: only the NC5 allow-list is reachable. Scope operations are
+ * `probe`, `seed` (idempotent by the M9 epoch guard before committed turns),
+ * `activate` (CAS'd install state), and `head` (epoch verification).
+ * Everything else about a live world —
  * subscribe, pull, turns — happens through the normal production
  * surfaces, so nothing here can become a second admin path. The forward
  * is freshly built and freshly signed; no inbound header propagates.
@@ -799,6 +802,18 @@ async function handleNetInstall(request: Request, env: Env, url: URL): Promise<R
     );
   }
   const parts = url.pathname.split("/").filter(Boolean); // ["net-install", "scope", name, verb]
+  // Secret-rollout preflight: the inbound signature proves the edge binding;
+  // a fresh signed hop to the catalog scope proves the target DO binding.
+  // /net/probe returns before sequencer hydration, so this check cannot seed
+  // authority state or accidentally turn a readiness test into an install.
+  if (parts.length === 2 && parts[1] === "probe" && request.method === "GET") {
+    try {
+      const stub = resolveNetDestination(netEnv, `scope:${CATALOG_SCOPE}`);
+      return stub.fetch(await signInternalRequest(netEnv, new Request("https://do/net/probe")));
+    } catch (err) {
+      return jsonResponse({ error: { code: "E_INTERNAL", message: errorMessage(err) } }, 500);
+    }
+  }
   // Cutover item B: the identity-export fetch — the ONE read the §8
   // sequence takes from OLD prod. Forwarded freshly-signed to the world
   // host's internal export route (read-only; runs against the frozen
@@ -851,7 +866,7 @@ async function handleNetInstall(request: Request, env: Env, url: URL): Promise<R
         error: {
           code: "E_INVARG",
           message:
-            "expected POST /net-install/scope/<name>/seed, POST /net-install/scope/<name>/activate, GET /net-install/scope/<name>/head, or GET /net-install/identity-export"
+            "expected GET /net-install/probe, POST /net-install/scope/<name>/seed, POST /net-install/scope/<name>/activate, GET /net-install/scope/<name>/head, or GET /net-install/identity-export"
         }
       },
       404

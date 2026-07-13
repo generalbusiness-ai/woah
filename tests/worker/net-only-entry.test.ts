@@ -35,6 +35,15 @@ function harness() {
 }
 
 describe("net-only Worker entry", () => {
+  it("retains the signed, world-state-free install readiness probe", async () => {
+    const { env, close } = harness();
+    const request = await signInternalRequest(env, new Request("https://woo.test/net-install/probe"));
+    const response = await worker.fetch(request, env);
+    expect(response.status, await response.clone().text()).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, service: "net-scope" });
+    close();
+  });
+
   it("serves an authoritative net default and probes the catalog scope", async () => {
     const { env, close } = harness();
     const config = await worker.fetch(new Request("https://woo.test/client-config"), env);

@@ -110,13 +110,17 @@ that seam:
    `owns` predicate scopes what it validates against its own store.
    The catalog scope has one explicit epoch-validation policy: because CO15
    permits **class-definition cells** to change only with a `catalog_epoch`
-   bump, a gateway MAY cache attested lineage, property-definition/default,
+   bump, the active epoch itself certifies lineage, property-definition/default,
    and verb cells that the turn's lineage closure proves belong to classes.
-   The first miss still comes from `/net/attest`, whose reply MUST echo the
-   authority's epoch; concurrent misses MAY coalesce. An epoch mismatch fails
-   closed and never populates the cache. Sessions, identity records,
-   compatibility instances, and every non-catalog owner remain per-turn reads
-   of the live authority even when their current scope name is `catalog`.
+   Their versions are content addresses, so a gateway MAY construct the
+   attestation from its derived cell only when that cell's own stamp matches the
+   turn epoch. A differently stamped copy falls back to live `/net/attest`; a
+   live catalog response MUST echo the authority epoch and mismatch fails
+   closed. Sessions, identity records, compatibility instances, and every
+   non-catalog owner remain per-turn reads of the live authority even when
+   their current scope name is `catalog`. Cross-invocation promises MUST NOT
+   coalesce authority I/O: they join otherwise-independent platform request
+   lineages and can violate the CO2.7 subrequest-depth bound.
 2. **Owner-sequenced adoption.** Rider writes reach their owner via
    `/net/adopt` and are applied as owner-ordered events with a per-cell
    prior-version CAS (the attested version the committing turn

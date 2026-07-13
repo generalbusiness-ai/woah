@@ -302,12 +302,9 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
           fetch: async (request: Request) => {
             const path = new URL(request.url).pathname;
             rpcLog.push(`${destination}${path}`);
-            // Force the first two read-only turns to overlap at the catalog
-            // authority, proving the gateway coalesces an actual burst miss.
             if (destination === `scope:${CATALOG_SCOPE}` && path === "/net/attest") {
               const body = await request.clone().json() as { keys?: string[] };
               catalogAttestKeys.push([...(body.keys ?? [])]);
-              await new Promise((resolve) => setTimeout(resolve, 50));
             }
             return await instance.fetch(request);
           }
@@ -355,10 +352,10 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
       expect(peek.reply.status, JSON.stringify(peek.reply)).toBe("accepted");
       expect(peek.result).toBe(1);
     }
-    expect(
-      rpcLog.filter((entry) => entry === `scope:${CATALOG_SCOPE}/net/attest`),
-      JSON.stringify(catalogAttestKeys)
-    ).toHaveLength(1);
+    // Exact-epoch class definitions are certified by the active epoch and
+    // their content-addressed versions. Even concurrent cold turns perform no
+    // catalog I/O and therefore cannot join Cloudflare request lineages.
+    expect(rpcLog.filter((entry) => entry === `scope:${CATALOG_SCOPE}/net/attest`)).toHaveLength(0);
     expect(rpcLog.filter((entry) => entry === `scope:${clusterScope}/net/attest`)).toHaveLength(2);
 
     // Runtime programmers may still edit user-owned noncatalog objects, but
@@ -502,9 +499,9 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
     expect(turn1.result).toBe(1);
     expect(turn1.observations?.map((o) => o.type)).toContain("bumped");
     expect(turn1.replayed).toBeUndefined();
-    // The class-chain read is served by the exact-epoch cache populated by
-    // the peeks, but topo_config is an arbitrary catalog-owned object and
-    // therefore still attests live. Mutable actor cells do the same.
+    // The class-chain read uses its exact-epoch certificate, but topo_config
+    // is an arbitrary catalog-owned object and therefore still attests live.
+    // Mutable actor cells do the same.
     expect(rpcLog.filter((entry) => entry === `scope:${CATALOG_SCOPE}/net/attest`)).toHaveLength(1);
     expect(catalogAttestKeys[0]).toContain("property_cell:topo_config:bonus");
     expect(rpcLog).toContain(`scope:${clusterScope}/net/attest`);
@@ -569,9 +566,9 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
     });
     expect(greeted.cells[0]?.value).toMatchObject({ value: 2 });
 
-    // A truncated multi-key authority response fails without publishing a
-    // partial cache. The next attempt must request the complete same class
-    // batch again, then succeeds from the unmodified authority response.
+    // A truncated live authority response fails before submit. The next
+    // attempt requests the same mutable catalog key and succeeds from the
+    // complete response; local epoch certification never masks live skew.
     const truncatedKeys: string[][] = [];
     const truncatedGatewayState = netState("gateway-topology-truncated-attest");
     const truncatedGatewayEnv: NetGatewayEnv = {
@@ -583,12 +580,25 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
         return {
           fetch: async (request: Request) => {
             const path = new URL(request.url).pathname;
-            if (destination !== `scope:${CATALOG_SCOPE}` || path !== "/net/attest") {
-              return await instance.fetch(request);
-            }
-            const requestBody = await request.clone().json() as { keys?: string[] };
-            truncatedKeys.push([...(requestBody.keys ?? [])]);
+            const requestBody = destination === `scope:${CATALOG_SCOPE}` && path === "/net/attest"
+              ? await request.clone().json() as { keys?: string[] }
+              : null;
             const response = await instance.fetch(request);
+            if (destination === `scope:${CATALOG_SCOPE}` && path === "/net/closure") {
+              // Simulate a derived copy stamped at another epoch. Definition
+              // values remain intact, but they are ineligible for the local
+              // epoch certificate and must fall back to live attestation.
+              const body = await response.json() as { cells?: Array<Record<string, unknown>> } & Record<string, unknown>;
+              return new Response(JSON.stringify({
+                ...body,
+                cells: (body.cells ?? []).map((cell) => ({
+                  ...cell,
+                  stamp: { ...(cell.stamp as Record<string, unknown>), catalog_epoch: "stale-copy-epoch" }
+                }))
+              }), { status: response.status, headers: { "content-type": "application/json" } });
+            }
+            if (destination !== `scope:${CATALOG_SCOPE}` || path !== "/net/attest") return response;
+            truncatedKeys.push([...(requestBody?.keys ?? [])]);
             if (truncatedKeys.length !== 1) return response;
             const body = await response.json() as { cells?: unknown[] } & Record<string, unknown>;
             return new Response(JSON.stringify({ ...body, cells: (body.cells ?? []).slice(0, -1) }), {
@@ -604,7 +614,7 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
       await call(truncatedGateway, truncatedGatewayEnv, "/pull", { scope, destination: `scope:${scope}` });
     }
     await expect(call<TurnBody>(truncatedGateway, truncatedGatewayEnv, "/turn", peekRequest("topo-truncated-1")))
-      .rejects.toThrow("catalog attestation omitted");
+      .rejects.toThrow("attestation from catalog omitted");
     const recovered = await call<TurnBody>(
       truncatedGateway,
       truncatedGatewayEnv,
@@ -616,8 +626,8 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
     expect(truncatedKeys[0]?.length).toBeGreaterThan(1);
     expect(truncatedKeys[1]).toEqual(truncatedKeys[0]);
 
-    // A mismatched authority epoch fails closed and does not poison a fresh
-    // gateway's cache: both attempts must reach the catalog owner and fail.
+    // A mismatched live authority epoch fails closed: both mutable-catalog
+    // turns must reach the owner and fail.
     const badRpcLog: string[] = [];
     const badGatewayState = netState("gateway-topology-wrong-epoch");
     const badGatewayEnv: NetGatewayEnv = {
@@ -645,9 +655,9 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
     for (const scope of [roomScope, clusterScope, CATALOG_SCOPE]) {
       await call(badGateway, badGatewayEnv, "/pull", { scope, destination: `scope:${scope}` });
     }
-    await expect(call<TurnBody>(badGateway, badGatewayEnv, "/turn", peekRequest("topo-bad-1")))
+    await expect(call<TurnBody>(badGateway, badGatewayEnv, "/turn", turnRequest("topo-bad-1")))
       .rejects.toThrow("E_EPOCH_MISMATCH");
-    await expect(call<TurnBody>(badGateway, badGatewayEnv, "/turn", peekRequest("topo-bad-2")))
+    await expect(call<TurnBody>(badGateway, badGatewayEnv, "/turn", turnRequest("topo-bad-2")))
       .rejects.toThrow("E_EPOCH_MISMATCH");
     expect(badRpcLog.filter((entry) => entry === `scope:${CATALOG_SCOPE}/net/attest`)).toHaveLength(2);
 

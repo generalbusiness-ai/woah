@@ -168,7 +168,8 @@ Activation requires ALL of, in order:
 
 ## NC5. The installation doorway
 
-`POST /net-install/scope/<name>/seed`, `GET /net-install/scope/<name>/head`,
+`GET /net-install/probe`, `POST /net-install/scope/<name>/seed`,
+`GET /net-install/scope/<name>/head`,
 `POST /net-install/scope/<name>/activate`, `POST /net-install/freeze`,
 and `GET /net-install/identity-export` are the entire surface. Trust
 model and enforced properties (pinned at the route level by
@@ -183,15 +184,20 @@ model and enforced properties (pinned at the route level by
   dead; within it, a byte-identical seed replay is idempotent by the
   M9 same-epoch guard and confers nothing.
 - **Allow-list**: exactly seed (POST), head (GET), activate (POST), the
-  freeze acknowledgment (POST), and the export read; anything else
-  404s. Seeds additionally refuse `E_SEED_COMMITTED` on any scope with
-  committed turns (NC1). The forward is freshly built and freshly signed —
+  signed readiness probe (GET), freeze acknowledgment (POST), and the export
+  read; anything else 404s. Seeds additionally refuse `E_SEED_COMMITTED` on
+  any scope with committed turns (NC1). The forward is freshly built and freshly signed —
   no inbound header propagates.
 - **Bounded**: seed bodies cap at 8 MiB (a seed is a state transfer,
   not a turn envelope); oversized and malformed bodies refuse without
   reaching a scope.
 - **Faithful**: scope verdicts (notably `E_EPOCH_MISMATCH` on a
   downgrade/mix attempt) surface through the doorway unwrapped.
+- **Pre-mutation readiness**: the installer first signs `GET
+  /net-install/probe`; the edge verifies it and freshly signs a state-free
+  `/net/probe` hop to the catalog scope. Both bindings must return the named
+  success shape before any seed is sent. The scope answers before sequencer
+  hydration or pending-work drain, so readiness cannot create world authority.
 
 ## NC6. Public selection and rollback
 
@@ -252,11 +258,12 @@ item; what remains is exactly what the workerd lanes cannot prove
   measures the paid parallelism); hard per-turn budgets refuse namedly
   (`E_BUDGET`, 32 RPCs / 30 s RPC time — mandatory steps exempt: the
   CO2.5 disambiguation resubmit and the post-accept warm fill).
-  Catalog class-definition attestations are additionally amortized per gateway
-  under the exact `catalog_epoch`: the first concurrent miss coalesces to one
-  authority RPC and later turns reuse those immutable lineage/property/verb
-  versions. Arbitrary catalog objects, identities, sessions, room state, and
-  cluster state remain live per-turn attestations.
+  Catalog class-definition attestations add no authority RPC under the exact
+  `catalog_epoch`: the active epoch certifies immutable lineage/property/verb
+  definitions and their derived versions are content addresses. A definition
+  copy stamped at any other epoch falls back to live owner attestation.
+  Arbitrary catalog objects, identities, sessions, room state, and cluster
+  state remain live per-turn attestations.
 - **Skewed-load proof — BUILT (in-process bounds).** `load:net-skew`
   (curated gate): hot-room concurrent same-cell writers (converge under
   retry with named verdicts and exact serialization at the authority —
