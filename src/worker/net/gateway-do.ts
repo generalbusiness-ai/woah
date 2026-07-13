@@ -939,12 +939,19 @@ export class NetGatewayDO {
         queue_ms: structure.queue_ms,
         wall_ms: Date.now() - structure.started
       }, "error", isNetError(err) ? err.code : "E_INTERNAL");
-      // Fix 5d: a plain-Error escape (misplan bug, double transport
-      // failure) after failed rounds must still explain the convergence
-      // shape. NetErrors carry their own trace (E_BUDGET) or are
-      // terminal-by-taxonomy; for plain Errors, attach the accumulated
-      // trace as a structured field — the fetch handler surfaces it
-      // beside the error string in the 500 reply.
+      // A budget gate can fire inside TurnStructure before turnAttempts reaches
+      // its budgetExhausted() footer. Preserve the rounds already observed so
+      // every turn-level E_BUDGET still satisfies CO6's trace contract.
+      if (isNetError(err) && err.code === "E_BUDGET" && !err.attempts && trace.length > 0) {
+        throw new NetError(
+          "E_BUDGET",
+          err.message.replace(/^E_BUDGET:\s*/, ""),
+          err.detail,
+          trace
+        );
+      }
+      // Fix 5d: a plain-Error escape (misplan bug, double transport failure)
+      // after failed rounds carries the same convergence context.
       if (!isNetError(err) && err instanceof Error && trace.length > 0) {
         (err as Error & { attempts?: AttemptTraceEntry[] }).attempts = trace;
       }
