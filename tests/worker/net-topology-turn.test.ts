@@ -21,7 +21,7 @@ import { signInternalRequest } from "../../src/worker/internal-auth";
 import { installVerb, installVerbAs } from "../../src/core/authoring";
 import { createWorld } from "../../src/core/bootstrap";
 import { cellsFromSerialized, type ShadowTurnCall } from "../../src/net/bridge";
-import { CATALOG_SCOPE, partitionCells } from "../../src/net/topology";
+import { CATALOG_SCOPE, isEpochImmutableDefinition, partitionCells } from "../../src/net/topology";
 import type { AttemptTraceEntry } from "../../src/net/errors";
 import type { CommitReply, ScopeHead } from "../../src/net/scope";
 
@@ -139,6 +139,30 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
       null
     );
     expect(helperInstalled.ok).toBe(true);
+    // A leaf catalog class has no loaded child/instance that a sparse gateway
+    // can use as a class witness. Its installed-catalog membership must travel
+    // on its own lineage row, which is the regression shape for CO15's
+    // same-epoch mutation guard.
+    world.createObject({ id: "$topo_leaf_class", name: "$topo_leaf_class", parent: "$thing", owner: "$wiz" });
+    const leafInstalled = installVerb(
+      world,
+      "$topo_leaf_class",
+      "leaf_value",
+      "verb :leaf_value() rxd { return 1; }",
+      null
+    );
+    expect(leafInstalled.ok).toBe(true);
+    world.setProp("$catalog_registry", "installed_catalogs", [{
+      tap: "@local",
+      catalog: "topology-fixture",
+      alias: "topology-fixture",
+      version: "1.0.0",
+      installed_at: 1,
+      owner: "$wiz",
+      objects: { "$topo_leaf_class": "$topo_leaf_class" },
+      seeds: {},
+      provenance: {}
+    }] as never);
     const peekInstalled = installVerb(
       world,
       "$thing",
@@ -153,7 +177,7 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
       "topo_box",
       "mutate_catalog_class",
       `verb :mutate_catalog_class() rxd {
-        return set_verb_code($thing, "catalog_peek_value", "verb :catalog_peek_value() rxd { return 2; }");
+        return set_verb_code("$topo_leaf_class", "leaf_value", "verb :leaf_value() rxd { return 2; }");
       }`,
       null
     );
@@ -263,6 +287,15 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
     const roomScope = "room:topo_room";
     const clusterScope = `cluster:${actor}`;
     expect([...partitions.keys()]).toEqual(expect.arrayContaining([roomScope, clusterScope, CATALOG_SCOPE]));
+    const catalogCells = partitions.get(CATALOG_SCOPE) ?? [];
+    const leafLineage = catalogCells.find(
+      (cell) => cell.kind === "object_lineage" && cell.object === "$topo_leaf_class"
+    );
+    expect(isEpochImmutableDefinition(leafLineage?.value)).toBe(true);
+    expect(catalogCells.some(
+      (cell) => cell.kind === "object_lineage" &&
+        (cell.value as { parent?: unknown }).parent === "$topo_leaf_class"
+    )).toBe(false);
 
     const doStates = new Map<string, ReturnType<typeof netState>>();
     const scopeDOs = new Map<string, NetScopeDO>();
@@ -359,8 +392,10 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
     expect(rpcLog.filter((entry) => entry === `scope:${clusterScope}/net/attest`)).toHaveLength(2);
 
     // Runtime programmers may still edit user-owned noncatalog objects, but
-    // installed catalog classes are epoch-immutable. Refuse before submit so
-    // a mixed room/class write cannot mutate the class via rider adoption.
+    // installed catalog classes are epoch-immutable. This target has no child
+    // in the gateway view: the refusal must use its own install marker, not a
+    // loaded-child witness. Refuse before submit so a mixed room/class write
+    // cannot mutate the class via rider adoption.
     rpcLog.length = 0;
     await expect(call<TurnBody>(gateway, gatewayEnv, "/turn", {
       call: {

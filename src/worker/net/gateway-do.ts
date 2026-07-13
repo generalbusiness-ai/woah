@@ -65,7 +65,7 @@ import { mintSessionSubmit, sessionCellKey, validateSessionCell } from "../../ne
 import { sessionIdWithShardHint, ticketIdWithShardHint } from "../../net/session-id";
 import { planTurn, type PlanTurnInput, type PlanTurnResult } from "../../net/plan";
 import type { ScopeClassifier } from "../../net/route";
-import { CATALOG_SCOPE, classifierFromLineage, type AnchorLineage } from "../../net/topology";
+import { CATALOG_SCOPE, classifierFromLineage, isEpochImmutableDefinition, type AnchorLineage } from "../../net/topology";
 import type { CommitReply, CommitSubmit, RejectReason, ScheduledTurn, ScopeHead } from "../../net/scope";
 import { netCellKeyFor, type EffectTranscript } from "../../net/transcript";
 import type { CellTransfer } from "../../net/cells";
@@ -429,7 +429,8 @@ const VERDICT_CODE: Partial<Record<RejectReason, NetErrorCode>> = {
   stale_head: "E_STALE_HEAD",
   stale_epoch: "E_STALE_EPOCH",
   read_version_mismatch: "E_READ_VERSION",
-  post_state_mismatch: "E_READ_VERSION"
+  post_state_mismatch: "E_READ_VERSION",
+  catalog_mutation: "E_CATALOG_MUTATION"
 };
 
 /** Capacity and transport refusals are retryable by the caller with the
@@ -3483,38 +3484,14 @@ export class NetGatewayDO {
   /**
    * Catalog ownership is broader than catalog-code immutability: it also
    * contains compatibility identities and any still-anchorless object. Cache
-   * only cells on objects that this turn's lineage closure proves are classes.
-   * A parent reference is the object model's class witness; deriving the set
-   * from the bounded read closure keeps the hot path O(read-set), not O(view).
+   * only cells whose OWN lineage carries the install-time immutable-definition
+   * marker. Missing metadata fails safe to live owner attestation; class status
+   * is never inferred from which children happen to be in this sparse view.
    */
   private epochImmutableCatalogKeys(request: TurnRequest, planned: PlanTurnResult, view: CellStore): Set<string> {
-    const readObjects = new Set(planned.transcript.reads.map((read) => read.cell.object));
-    const classObjects = new Set<string>();
-    const roots = new Set([
-      ...readObjects,
-      planned.transcript.call.actor,
-      planned.transcript.call.target
-    ]);
-    // Verb execution records the resolved page (`$thing:verb`) but need not
-    // record the receiver's lineage as a transcript read. Start from the call
-    // endpoints as well, then walk their bounded parent chains.
-    for (const root of roots) {
-      const walked = new Set<string>();
-      let object: string | null = root;
-      while (object !== null && !walked.has(object)) {
-        walked.add(object);
-        const lineage = view.get(cellKey("object_lineage", object))?.value as AnchorLineage | undefined;
-        const parent = typeof lineage?.parent === "string" && lineage.parent.length > 0
-          ? lineage.parent
-          : null;
-        if (parent !== null) classObjects.add(parent);
-        object = parent;
-      }
-    }
-
     const immutable = new Set<string>();
     for (const read of planned.transcript.reads) {
-      if (!classObjects.has(read.cell.object)) continue;
+      if (!isEpochImmutableDefinition(view.get(cellKey("object_lineage", read.cell.object))?.value)) continue;
       const key = netCellKeyFor(read.cell);
       if (key === null) continue;
       // Class liveness/location is not dispatch metadata and sessions are
@@ -3582,32 +3559,24 @@ export class NetGatewayDO {
     view: CellStore,
     classifier: ScopeClassifier
   ): void {
-    const candidates = new Map<string, string[]>();
+    const blockedWrites = new Map<string, string[]>();
     for (const write of planned.transcript.writes) {
       if (write.cell.kind !== "lifecycle" && write.cell.kind !== "prop" && write.cell.kind !== "verb") continue;
       if (classifier.scopeOf(write.cell.object) !== CATALOG_SCOPE) continue;
       const key = netCellKeyFor(write.cell);
       if (key === null) continue;
-      const keys = candidates.get(write.cell.object) ?? [];
+      const keys = blockedWrites.get(write.cell.object) ?? [];
       keys.push(key);
-      candidates.set(write.cell.object, keys);
+      blockedWrites.set(write.cell.object, keys);
     }
-    if (candidates.size === 0) return;
-
-    const classes = new Set<string>();
-    for (const key of view.keys()) {
-      if (!key.startsWith("object_lineage:")) continue;
-      const lineage = view.get(key)?.value as { parent?: unknown } | undefined;
-      if (typeof lineage?.parent === "string" && candidates.has(lineage.parent)) classes.add(lineage.parent);
-    }
-    const blocked = [...classes].sort();
+    const blocked = [...blockedWrites.keys()].sort();
     if (blocked.length === 0) return;
     throw netError(
       "E_CATALOG_MUTATION",
       "ordinary turns cannot mutate installed catalog class definitions",
       {
         objects: blocked,
-        keys: blocked.flatMap((object) => candidates.get(object) ?? []).sort()
+        keys: blocked.flatMap((object) => blockedWrites.get(object) ?? []).sort()
       }
     );
   }

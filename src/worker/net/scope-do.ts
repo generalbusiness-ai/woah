@@ -44,7 +44,9 @@
  *                           head advances once per applied batch, and
  *                           the adopted cells fan out to this scope's
  *                           own subscribers; idempotent by (from_scope,
- *                           seq)
+ *                           seq). The catalog owner terminally acknowledges
+ *                           but never installs marked definition riders
+ *                           (CO15's authority enforcement).
  *       POST /net/relate    {from_scope, seq, deltas} → CO13 relation
  *                           delivery: deltas derived at another scope
  *                           whose owner objects anchor here apply to
@@ -85,6 +87,7 @@ import { observationsForRelationOwners, relationKey, roomRosterRows, type Relati
 import type { ScopeMeta, ScopeStore, TailEntry } from "../../net/scope-store";
 import type { CommitReply } from "../../net/scope";
 import { netCellKeyFor } from "../../net/transcript";
+import { CATALOG_SCOPE } from "../../net/topology";
 import { verifyInternalRequest } from "../internal-auth";
 import { emitMetric, type AnalyticsMetric } from "../metrics-sink";
 import { resolveNetDestination, WorkerdHost, type NetBindingsEnv } from "./workerd-host";
@@ -467,6 +470,12 @@ export class NetScopeDO {
    * submit the map is empty → every delta classifies local (the
    * documented no-hints behavior). */
   private readonly relateScopeHints = new Map<string, string>();
+  /** Catalog-bound rider objects for the current submit. Unlike ordinary
+   * foreign mutable riders, lifecycle/property/verb writes to catalog-owned
+   * objects are install-pipeline-only (CO15). The sequencer callback reads
+   * this set synchronously during submit, before any local residue or fanout
+   * can be committed. */
+  private readonly catalogRiderObjects = new Set<string>();
 
   constructor(
     private readonly state: NetScopeDurableState,
@@ -688,8 +697,12 @@ export class NetScopeDO {
         // relation deltas (see relateScopeHints). Cleared in finally so a
         // reject/throw can never leak hints into the next request.
         this.relateScopeHints.clear();
+        this.catalogRiderObjects.clear();
         for (const [scope, entry] of Object.entries(relateDestinations)) {
           for (const object of entry.objects) this.relateScopeHints.set(object, scope);
+        }
+        for (const object of riderDestinations[CATALOG_SCOPE]?.objects ?? []) {
+          this.catalogRiderObjects.add(object);
         }
         try {
           // The commit write-through and the outbox enqueue share ONE
@@ -708,6 +721,7 @@ export class NetScopeDO {
           );
         } finally {
           this.relateScopeHints.clear();
+          this.catalogRiderObjects.clear();
         }
         // Never begin fanout in the gateway -> scope submit lineage. Even a
         // waitUntil task starts executing immediately; calling the submitting
@@ -1276,7 +1290,15 @@ export class NetScopeDO {
       // the same rule as rider_destinations); an unhinted owner is local.
       // The closure reads the mutable hint map so one sequencer instance
       // serves every submit (hints are loaded/cleared per request).
-      scopeOf: (object) => this.relateScopeHints.get(object) ?? seq.scope
+      scopeOf: (object) => this.relateScopeHints.get(object) ?? seq.scope,
+      // CO15 authority enforcement. At the catalog authority every ordinary
+      // lifecycle/property/verb write is install-pipeline-only. At another
+      // committing scope, the gateway's normal CA3 rider routing identifies
+      // catalog-owned targets; reject before that scope can retain/fan out a
+      // poisoned foreign copy. /adopt reaches the catalog authority and is
+      // covered by the first branch even for an old sender.
+      catalogMutationForbidden: (object) =>
+        resolvedScope === CATALOG_SCOPE || this.catalogRiderObjects.has(object)
     });
     this.seq = seq;
     return this.seq;
@@ -2117,15 +2139,21 @@ export class NetScopeDO {
    * fanout rows (CO2.7).
    *
    * Idempotent by the (from_scope, seq) high-water, which advances even
-   * on an all-conflict adoption: the fact WAS processed; redelivery must
-   * not flap the verdict.
+   * on an all-conflict or terminally rejected adoption: the fact WAS
+   * processed; redelivery must not flap the verdict or retry forever.
    */
   private adopt(body: {
     from_scope: string;
     seq: number;
     cells: Cell[];
     prior_versions?: Record<string, string>;
-  }): { applied: boolean; installed: number; conflicts: number; head: ScopeHead } {
+  }): {
+    applied: boolean;
+    installed: number;
+    conflicts: number;
+    head: ScopeHead;
+    rejected?: { reason: "catalog_mutation"; detail: Record<string, unknown> };
+  } {
     const seq = this.ensureSequencer();
     return this.discardSeqOnThrow(() => this.store.transaction(() => {
       const rows = sqlRows<{ seq: number }>(
@@ -2139,6 +2167,20 @@ export class NetScopeDO {
         cells: body.cells,
         priors: body.prior_versions ?? {}
       });
+      if (result.status === "rejected") {
+        // Terminal owner refusal: acknowledge this delivery by advancing the
+        // sender high-water below, but install nothing. Returning 200 with a
+        // structured refusal keeps the durable sender outbox from retrying a
+        // definition write that can never become valid under this epoch.
+        this.metric({
+          kind: "net_adopt_rejected",
+          scope: seq.scope,
+          from_scope: body.from_scope,
+          seq: body.seq,
+          reason: result.reason,
+          ...(result.detail ?? {})
+        });
+      }
       for (const conflict of result.conflicts) {
         this.metric({
           kind: "net_adopt_conflict",
@@ -2177,7 +2219,15 @@ export class NetScopeDO {
         body.from_scope,
         body.seq
       );
-      return { applied: true, installed: result.applied.length, conflicts: result.conflicts.length, head: result.head };
+      return {
+        applied: result.status !== "rejected",
+        installed: result.applied.length,
+        conflicts: result.conflicts.length,
+        head: result.head,
+        ...(result.status === "rejected"
+          ? { rejected: { reason: result.reason as "catalog_mutation", detail: result.detail ?? {} } }
+          : {})
+      };
     }));
   }
 

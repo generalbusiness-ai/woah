@@ -13,8 +13,9 @@ import { FakeDurableObjectState } from "./fake-do";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
-import { cellKey } from "../../src/net/cells";
+import { cellKey, cellVersion } from "../../src/net/cells";
 import type { CommitReply, ScopeHead } from "../../src/net/scope";
+import { CATALOG_SCOPE } from "../../src/net/topology";
 
 const SECRET = "net-do-test-secret";
 const EPOCH = "cat-net-1";
@@ -388,6 +389,202 @@ describe("NetScopeDO over fake-DO storage", () => {
     });
     expect(rejected.status).toBe("rejected");
     expect(rejected.status === "rejected" && rejected.reason).toBe("read_version_mismatch");
+    scope.close();
+  });
+
+  it("catalog authority rejects a same-epoch definition write even when the gateway guard is bypassed", async () => {
+    // The most important authority check runs at the COMMITTING room, before a
+    // catalog-bound rider can become room residue or fan out a poisoned class
+    // cell. This invokes /submit directly, bypassing the gateway guard while
+    // preserving the gateway's ordinary CA3 routing hints.
+    const room = makeScope("room:malicious", env);
+    await call(room.instance, env, "/seed", {
+      scope: "room:malicious",
+      catalog_epoch: EPOCH,
+      cells: seedCells()
+    });
+    const roomHead = (await call<{ head: ScopeHead }>(room.instance, env, "/head")).head;
+    const roomTranscript = {
+      kind: "woo.effect_transcript.shadow.v1",
+      route: "direct",
+      scope: "room:malicious",
+      seq: 1,
+      call: { actor: "#actor", target: "#thing", verb: "mutate", args: [], body: undefined },
+      reads: [],
+      writes: [{
+        cell: { kind: "prop", object: "$leaf_class", name: "value" },
+        value: 2,
+        op: "set",
+        writer: WRITER
+      }],
+      creates: [],
+      moves: [],
+      observations: [],
+      logicalInputs: [],
+      untrackedEffects: [],
+      complete: true,
+      incompleteReasons: [],
+      hash: "catalog-rider-mutation"
+    };
+    const { applyTranscript } = await import("../../src/net/transcript");
+    const { ScopeSequencer } = await import("../../src/net/scope");
+    const roomTwin = new ScopeSequencer("room:malicious", EPOCH);
+    roomTwin.seed(seedCells());
+    const roomReply = await call<CommitReply>(room.instance, env, "/submit", {
+      submit: {
+        kind: "woo.net.commit_submit.v1",
+        scope: "room:malicious",
+        base: roomHead,
+        idempotency_key: "catalog-rider-mutation",
+        transcript: roomTranscript,
+        post_state_version: applyTranscript(
+          roomTwin.store,
+          roomTranscript as never,
+          { scope_head: "x", catalog_epoch: EPOCH }
+        ).postStateVersion,
+        stamp: { scope_head: "x", catalog_epoch: EPOCH }
+      },
+      rider_destinations: {
+        [CATALOG_SCOPE]: { destination: `scope:${CATALOG_SCOPE}`, objects: ["$leaf_class"] }
+      }
+    });
+    expect(roomReply.status).toBe("rejected");
+    expect(roomReply.status === "rejected" && roomReply.reason).toBe("catalog_mutation");
+    expect((await call<{ head: ScopeHead }>(room.instance, env, "/head")).head).toEqual(roomHead);
+    const roomResidue = await call<{ cells: unknown[] }>(room.instance, env, "/closure", {
+      keys: ["property_cell:$leaf_class:value"],
+      known: []
+    });
+    expect(roomResidue.cells).toEqual([]);
+    room.close();
+
+    const scope = makeScope(CATALOG_SCOPE, env);
+    const definitionCells = [
+      {
+        kind: "object_lineage" as const,
+        object: "$leaf_class",
+        value: {
+          parent: "$thing",
+          owner: "$wiz",
+          name: "$leaf_class",
+          anchor: null,
+          flags: {},
+          epoch_immutable_definition: true
+        }
+      },
+      { kind: "property_cell" as const, object: "$leaf_class", name: "value", value: { value: 1 } }
+    ];
+    await call(scope.instance, env, "/seed", {
+      scope: CATALOG_SCOPE,
+      catalog_epoch: EPOCH,
+      cells: definitionCells
+    });
+    const head = (await call<{ head: ScopeHead }>(scope.instance, env, "/head")).head;
+
+    const transcript = {
+      kind: "woo.effect_transcript.shadow.v1",
+      route: "direct",
+      scope: CATALOG_SCOPE,
+      seq: 1,
+      call: { actor: "$wiz", target: "$leaf_class", verb: "mutate", args: [], body: undefined },
+      reads: [],
+      writes: [{
+        cell: { kind: "prop", object: "$leaf_class", name: "value" },
+        value: 2,
+        op: "set",
+        writer: { ...WRITER, progr: "$wiz", thisObj: "$leaf_class", definer: "$leaf_class", caller: "$wiz", callerPerms: "$wiz" }
+      }],
+      creates: [],
+      moves: [],
+      observations: [],
+      logicalInputs: [],
+      untrackedEffects: [],
+      complete: true,
+      incompleteReasons: [],
+      hash: "catalog-authority-mutation"
+    };
+    const twin = new ScopeSequencer(CATALOG_SCOPE, EPOCH);
+    twin.seed(definitionCells);
+    const reply = await call<CommitReply>(scope.instance, env, "/submit", {
+      kind: "woo.net.commit_submit.v1",
+      scope: CATALOG_SCOPE,
+      base: head,
+      idempotency_key: "catalog-authority-mutation",
+      transcript,
+      post_state_version: applyTranscript(
+        twin.store,
+        transcript as never,
+        { scope_head: "x", catalog_epoch: EPOCH }
+      ).postStateVersion,
+      stamp: { scope_head: "x", catalog_epoch: EPOCH }
+    });
+
+    expect(reply.status).toBe("rejected");
+    expect(reply.status === "rejected" && reply.reason).toBe("catalog_mutation");
+    expect(reply.status === "rejected" && reply.retryable).toBe(false);
+    expect(reply.status === "rejected" && reply.detail).toEqual({
+      objects: ["$leaf_class"],
+      keys: ["property_cell:$leaf_class:value"]
+    });
+    expect((await call<{ head: ScopeHead }>(scope.instance, env, "/head")).head).toEqual(head);
+    const closure = await call<{ cells: Array<{ value: unknown }> }>(scope.instance, env, "/closure", {
+      keys: ["property_cell:$leaf_class:value"],
+      known: ["object_lineage:$leaf_class"]
+    });
+    expect(closure.cells[0]?.value).toEqual({ value: 1 });
+
+    // The real mixed-scope bypass shape reaches the catalog owner through
+    // CA3 /adopt after a room commit. It must be terminally acknowledged but
+    // install nothing, otherwise a skipped gateway check still corrupts the
+    // exact-epoch certificate premise (or poisons the sender outbox forever).
+    const adoptedValue = { value: 3 };
+    const adopted = await call<{
+      applied: boolean;
+      installed: number;
+      rejected?: { reason: string; detail: Record<string, unknown> };
+    }>(scope.instance, env, "/adopt", {
+      from_scope: "room:malicious",
+      seq: 1,
+      cells: [{
+        key: "property_cell:$leaf_class:value",
+        kind: "property_cell",
+        object: "$leaf_class",
+        name: "value",
+        value: adoptedValue,
+        version: cellVersion(adoptedValue),
+        provenance: "authoritative",
+        stamp: { scope_head: "1:foreign", catalog_epoch: EPOCH }
+      }],
+      prior_versions: { "property_cell:$leaf_class:value": cellVersion({ value: 1 }) }
+    });
+    expect(adopted).toMatchObject({
+      applied: false,
+      installed: 0,
+      rejected: {
+        reason: "catalog_mutation",
+        detail: {
+          objects: ["$leaf_class"],
+          keys: ["property_cell:$leaf_class:value"]
+        }
+      }
+    });
+    expect((await call<{ head: ScopeHead }>(scope.instance, env, "/head")).head).toEqual(head);
+    const afterAdopt = await call<{ cells: Array<{ value: unknown }> }>(scope.instance, env, "/closure", {
+      keys: ["property_cell:$leaf_class:value"],
+      known: ["object_lineage:$leaf_class"]
+    });
+    expect(afterAdopt.cells[0]?.value).toEqual({ value: 1 });
+
+    // Receiver high-water records the terminal refusal: redelivery is an
+    // idempotent no-op, not an infinite outbox retry loop.
+    const replay = await call<{ applied: boolean; rejected?: unknown }>(scope.instance, env, "/adopt", {
+      from_scope: "room:malicious",
+      seq: 1,
+      cells: [],
+      prior_versions: {}
+    });
+    expect(replay).toEqual(expect.objectContaining({ applied: false }));
+    expect(replay.rejected).toBeUndefined();
     scope.close();
   });
 

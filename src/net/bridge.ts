@@ -15,7 +15,8 @@
  * | net cell                      | SerializedWorld                        |
  * |-------------------------------|----------------------------------------|
  * | object_lineage:<id>           | {parent, owner, name, anchor, flags,   |
- * |                               |  eventSchemas?} — identity only; never |
+ * |                               |  eventSchemas?, epoch-immutable        |
+ * |                               |  marker?} — identity only; never       |
  * |                               |  created/modified timestamps           |
  * | object_live:<id>              | {location}                             |
  * | property_cell:<id>:<name>     | {value?, def?} (PropertyCellPayload)   |
@@ -69,7 +70,40 @@ type LineagePayload = {
   anchor: string | null;
   flags: SerializedObject["flags"];
   eventSchemas?: SerializedObject["eventSchemas"];
+  /** CO15: this installed definition may use exact-epoch owner certificates.
+   * The planning-world inverse ignores the field; the net cell remains its
+   * durable source of truth. */
+  epoch_immutable_definition?: true;
 };
+
+/**
+ * Definition objects eligible for CO15's exact-epoch certificate.
+ *
+ * Installed catalog records are the explicit class/feature membership ledger,
+ * including leaf classes with no instances. Bootstrap definitions predate that
+ * ledger, so `$`-named objects that are parents in the exported seed graph are
+ * also covered. This is eligibility, not a complete class taxonomy: anything
+ * unmarked remains mutable and pays live owner attestation.
+ */
+function epochImmutableDefinitionObjects(world: SerializedWorld): Set<string> {
+  const definitions = new Set<string>();
+  for (const object of world.objects) {
+    if (object.id.startsWith("$") && object.children.length > 0) definitions.add(object.id);
+  }
+
+  const registry = world.objects.find((object) => object.id === "$catalog_registry");
+  const installed = registry?.properties.find(([name]) => name === "installed_catalogs")?.[1];
+  if (!Array.isArray(installed)) return definitions;
+  for (const record of installed) {
+    if (!record || typeof record !== "object" || Array.isArray(record)) continue;
+    const objects = (record as { objects?: unknown }).objects;
+    if (!objects || typeof objects !== "object" || Array.isArray(objects)) continue;
+    for (const object of Object.values(objects)) {
+      if (typeof object === "string" && object.length > 0) definitions.add(object);
+    }
+  }
+  return definitions;
+}
 
 /**
  * SerializedWorld → net cell inputs, one authoritative fact per cell.
@@ -78,6 +112,7 @@ type LineagePayload = {
  */
 export function cellsFromSerialized(world: SerializedWorld): NetCellInput[] {
   const cells: NetCellInput[] = [];
+  const epochImmutableDefinitions = epochImmutableDefinitionObjects(world);
   for (const obj of world.objects) {
     const lineage: LineagePayload = {
       parent: obj.parent,
@@ -85,7 +120,8 @@ export function cellsFromSerialized(world: SerializedWorld): NetCellInput[] {
       name: obj.name,
       anchor: obj.anchor,
       flags: obj.flags ?? {},
-      ...(obj.eventSchemas.length > 0 ? { eventSchemas: obj.eventSchemas } : {})
+      ...(obj.eventSchemas.length > 0 ? { eventSchemas: obj.eventSchemas } : {}),
+      ...(epochImmutableDefinitions.has(obj.id) ? { epoch_immutable_definition: true as const } : {})
     };
     cells.push({ kind: "object_lineage", object: obj.id, value: lineage });
     cells.push({ kind: "object_live", object: obj.id, value: { location: obj.location } });

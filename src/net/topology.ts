@@ -42,9 +42,12 @@
  * active epoch plus their content-addressed versions as the owner certificate;
  * a differently stamped copy falls back to live attestation.
  *
- * The gateway refuses ordinary-turn class-definition writes before submit;
- * the install pipeline is the only sanctioned updater. This file remains the
- * pure ownership function used by both installation and ordinary routing.
+ * The gateway refuses ordinary-turn class-definition writes before submit,
+ * and scope authorities independently reject catalog-owned definition-cell
+ * writes on direct submit or rider adoption. Exact-epoch READ certificates
+ * consume the definition object's own install marker; the install pipeline is
+ * the only sanctioned updater. This file remains the pure ownership function
+ * used by both installation and ordinary routing.
  */
 import type { Cell, CellKind } from "./cells";
 import { netError } from "./errors";
@@ -55,7 +58,25 @@ export const CATALOG_SCOPE = "catalog";
 
 /** The slice of the bridge's `object_lineage` payload the anchor walk
  * consumes (bridge.ts LineagePayload is structurally assignable). */
-export type AnchorLineage = { parent: string | null; anchor: string | null };
+export type AnchorLineage = {
+  parent: string | null;
+  anchor: string | null;
+  /** Install-time certificate eligibility. This is intentionally explicit:
+   * catalog ownership alone also covers mutable identities/configuration, and
+   * a sparse planning view cannot infer class status from loaded children. */
+  epoch_immutable_definition?: true;
+};
+
+/** Whether a lineage row names a definition whose content is fixed for the
+ * row's catalog epoch. Absence fails safe to live owner attestation. */
+export function isEpochImmutableDefinition(value: unknown): boolean {
+  return Boolean(
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    (value as { epoch_immutable_definition?: unknown }).epoch_immutable_definition === true
+  );
+}
 
 /** Lineage lookup: `null` means the object has no lineage payload in the
  * consulted set — for `scopeNameOf` that is an unclosed input (E_LINEAGE,

@@ -68,6 +68,7 @@ export type RejectReason =
   | "incomplete_transcript" // step 4 — never short-circuited
   | "read_version_mismatch" // step 7
   | "rider_unattested"    // step 7 — foreign read with no owner attestation (CO2.3); terminal
+  | "catalog_mutation"    // step 5 — epoch-immutable definition write without an epoch transition
   | "write_unauthorized"  // step 9
   | "post_state_mismatch"; // step 10
 
@@ -147,6 +148,12 @@ export type ScopeSequencerOptions = {
    * partition derived relation deltas into local rows vs rows owned by
    * another scope. Absent → every delta is local (single-scope). */
   scopeOf?: (object: string) => string;
+  /** CO15 authority enforcement. The shell classifies direct catalog commits and
+   * catalog-bound riders before submit. Ordinary submits have no epoch-
+   * transition operation, so lifecycle/property/verb writes to those objects
+   * refuse terminally; the catalog install/upgrade path changes definitions
+   * outside ordinary submit while publishing a new epoch. */
+  catalogMutationForbidden?: (object: string) => boolean;
   /** Bounded recovery tail length (the scope's own log — CO5 note). */
   tailLimit?: number;
   /** H2a: reply-cache bound — the TOTAL number of recorded replies the
@@ -373,6 +380,31 @@ export class ScopeSequencer {
       return this.reject(submit, "incomplete_transcript", { reasons: submit.transcript.incompleteReasons });
     }
 
+    // Step 5 / CO15: the durable owner independently enforces the premise
+    // behind exact-epoch catalog certificates. This check uses authoritative
+    // pre-state through the shell-provided predicate, so a stale or modified
+    // gateway cannot bypass it. Ordinary submits cannot carry an epoch bump;
+    // catalog installation uses the dedicated seed/upgrade path instead.
+    const catalogMutationKeys = new Map<string, string[]>();
+    if (this.options.catalogMutationForbidden) {
+      for (const write of submit.transcript.writes) {
+        if (write.cell.kind !== "lifecycle" && write.cell.kind !== "prop" && write.cell.kind !== "verb") continue;
+        if (!this.options.catalogMutationForbidden(write.cell.object)) continue;
+        const key = netCellKeyFor(write.cell);
+        if (key === null) continue;
+        const keys = catalogMutationKeys.get(write.cell.object) ?? [];
+        keys.push(key);
+        catalogMutationKeys.set(write.cell.object, keys);
+      }
+    }
+    if (catalogMutationKeys.size > 0) {
+      const objects = [...catalogMutationKeys.keys()].sort();
+      return this.reject(submit, "catalog_mutation", {
+        objects,
+        keys: objects.flatMap((object) => catalogMutationKeys.get(object) ?? []).sort()
+      });
+    }
+
     // CO4 retained-head rebase: exact-current submits proceed as before;
     // a behind base proceeds only when this authority's bounded recovery
     // tail proves the exact (seq, hash) as an ancestor. Current read
@@ -584,20 +616,50 @@ export class ScopeSequencer {
    *   owner-head advance with CO8-correct stamps), a tail entry is
    *   appended, and the durable write-through covers cells + meta + tail
    *   in one transaction exactly like submit's accept path.
-   * - Adoption does NOT run CO4 validation: the writes were already
+   * - Adoption does NOT rerun ordinary CO4 validation: the writes were already
    *   validated at the committing scope against this owner's plan-time
    *   attestations (CO2.3 rule 1); re-validating here would make two
-   *   validation authorities disagree about one turn. Sender idempotency
+   *   validation authorities disagree about one turn. The exception is CO15's
+   *   catalog-definition boundary: the catalog owner MUST refuse ordinary
+   *   definition cells even when a stale gateway let them ride through another
+   *   scope. Sender idempotency
    *   — the (from_scope, seq) high-water — is the SHELL's job
    *   (NetScopeDO), which is why this method must be called exactly once
    *   per adoption fact.
    */
   adopt(input: { from_scope: string; seq: number; cells: Cell[]; priors: Record<string, string> }): {
-    status: "applied" | "empty";
+    status: "applied" | "empty" | "rejected";
     head: ScopeHead;
     applied: string[];
     conflicts: Array<{ key: string; ours: string; theirs: string }>;
+    reason?: "catalog_mutation";
+    detail?: { objects: string[]; keys: string[] };
   } {
+    const catalogMutationKeys = new Map<string, string[]>();
+    if (this.options.catalogMutationForbidden) {
+      for (const cell of input.cells) {
+        if (cell.kind !== "object_lineage" && cell.kind !== "property_cell" && cell.kind !== "verb_bytecode") continue;
+        if (!this.options.catalogMutationForbidden(cell.object)) continue;
+        const keys = catalogMutationKeys.get(cell.object) ?? [];
+        keys.push(cell.key);
+        catalogMutationKeys.set(cell.object, keys);
+      }
+    }
+    if (catalogMutationKeys.size > 0) {
+      const objects = [...catalogMutationKeys.keys()].sort();
+      return {
+        status: "rejected",
+        reason: "catalog_mutation",
+        detail: {
+          objects,
+          keys: objects.flatMap((object) => catalogMutationKeys.get(object) ?? []).sort()
+        },
+        head: this.headState,
+        applied: [],
+        conflicts: []
+      };
+    }
+
     const accepted: Cell[] = [];
     const conflicts: Array<{ key: string; ours: string; theirs: string }> = [];
     for (const cell of input.cells) {

@@ -278,7 +278,9 @@ unchanged:
 2. Scope and epoch match.
 3. Idempotency-key replay check.
 4. Transcript is complete and targets this scope.
-5. VM/catalog/verb hashes accepted for the scope epoch.
+5. VM/catalog/verb hashes accepted for the scope epoch; an ordinary write to
+   an epoch-immutable installed definition is refused independently by the
+   catalog authority.
 6. Logical inputs valid and not duplicated.
 7. Read versions match current state (CO2.4).
 8. Permission reads and policy checks present in the read set.
@@ -766,10 +768,25 @@ One write path per fact (CO9), concretized:
   reseed (the aged-world lane, CO12.6, is the proof). This narrowly identified
   immutability is the sole basis for amortizing catalog attestations under
   CO2.3; no scope-head cache policy applies to mutable catalog, room, or
-  cluster cells. An ordinary turn that records a write to an installed
-  catalog class definition MUST refuse with `E_CATALOG_MUTATION` before scope
-  selection is pinned or a submit is issued. Runtime authoring of non-catalog,
-  user-owned objects remains a normal sequenced turn.
+  cluster cells. Eligibility is explicit on the definition object's own
+  `object_lineage` row (`epoch_immutable_definition: true`), minted from the
+  installed catalog graph; it is never inferred from children loaded into a
+  sparse turn view. An absent marker fails safe to live owner attestation.
+  The marker controls certificate eligibility, not write permission. An
+  ordinary turn that records a lifecycle, property, or verb write owned by the
+  catalog scope MUST refuse
+  with `E_CATALOG_MUTATION` before scope selection is pinned or a submit is
+  issued. Mutable catalog data is still read through live owner attestation;
+  its mutation uses dedicated authority/operator paths rather than ordinary
+  turns. The committing scope MUST independently reject a catalog-bound rider
+  before accepting `/submit`, so no poisoned foreign residue can commit or fan
+  out. The catalog authority applies the same terminal `catalog_mutation`
+  refusal to direct `/submit` and CA3 `/adopt`: a definition-cell rider is
+  acknowledged as a terminal
+  refusal, advances the sender high-water, and installs no cell, so a stale or
+  faulty gateway can neither violate the certificate premise nor poison an
+  outbox with futile retries. Runtime authoring of non-catalog, user-owned
+  objects remains a normal sequenced turn.
 - **The install pipeline** partitions a bootstrap/exported world by the
   anchor walk (`partitionCells`): catalog cells → catalog scope; rooms +
   room-anchored → room scopes; actors + carried → cluster scopes.
