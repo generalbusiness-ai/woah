@@ -43,7 +43,14 @@ import { applyTranscript, type EffectTranscript, type TranscriptWrite } from "./
 /** The session cell value IS the bridge's SerializedSession row (see the
  * header shape rule). Task-vocabulary mapping: created_at → `started`,
  * expires_at → `expiresAt`, scope → `activeScope`. */
-export type SessionCellValue = SerializedSession;
+export type SessionCellValue = SerializedSession & {
+  /** The actor was provisioned only for this anonymous session. Once no live
+   * session remains, the owner reaper retires its physical room placement. */
+  ephemeralActor?: boolean;
+  /** Physical room to retract when an explicit close has already nulled the
+   * session's activeScope before the alarm retires an ephemeral actor. */
+  retireFromScope?: string;
+};
 
 /** Canonical authority-cell key for a session id. */
 export function sessionCellKey(session: string): string {
@@ -114,7 +121,7 @@ export type MintSessionInput = {
    * retracts. The explicit sessionClose marker authorizes against the
    * current owned row because real cross-DO latency may outlast 250ms.
    * ttl_ms is ignored in this mode. */
-  closing?: { priorActiveScope: string | null };
+  closing?: { priorActiveScope: string | null; ephemeralActor?: boolean };
 };
 
 export type MintSessionResult = {
@@ -164,7 +171,13 @@ export function mintSessionSubmit(input: MintSessionInput): MintSessionResult {
     actor: input.actor,
     started: input.now,
     expiresAt: input.closing ? input.now + 250 : input.now + input.ttl_ms,
-    activeScope: input.closing ? null : (input.activeScope ?? null)
+    activeScope: input.closing ? null : (input.activeScope ?? null),
+    ...(input.closing?.ephemeralActor
+      ? {
+          ephemeralActor: true,
+          ...(input.closing.priorActiveScope ? { retireFromScope: input.closing.priorActiveScope } : {})
+        }
+      : {})
   };
   const body: Omit<EffectTranscript, "hash"> = {
     kind: "woo.effect_transcript.shadow.v1",

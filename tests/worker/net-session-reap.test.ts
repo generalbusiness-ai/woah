@@ -69,11 +69,11 @@ async function call<T>(target: Fetchable, env: { WOO_INTERNAL_SECRET?: string },
   return decoded;
 }
 
-function sessionSeed(id: string, actor: string, expiresAt: number, activeScope: string | null) {
+function sessionSeed(id: string, actor: string, expiresAt: number, activeScope: string | null, ephemeralActor = false) {
   return {
     kind: "session" as const,
     object: id,
-    value: { id, actor, started: expiresAt - 60_000, expiresAt, activeScope }
+    value: { id, actor, started: expiresAt - 60_000, expiresAt, activeScope, ...(ephemeralActor ? { ephemeralActor: true } : {}) }
   };
 }
 
@@ -119,7 +119,9 @@ describe("session reaper on the scope alarm (H2b)", () => {
       from_scope: "setup-lane",
       seq: 1,
       deltas: [
-        { op: "add", row: { relation: "session_presence", owner: "far_room", member: "s_far", body: { actor: "reap_actor" } } }
+        { op: "add", row: { relation: "session_presence", owner: "far_room", member: "s_far", body: { actor: "reap_actor" } } },
+        { op: "add", row: { relation: "session_presence", owner: "far_room", member: "s_elastic", body: { actor: "elastic_actor" } } },
+        { op: "add", row: { relation: "contents", owner: "far_room", member: "elastic_actor" } }
       ]
     });
 
@@ -130,7 +132,11 @@ describe("session reaper on the scope alarm (H2b)", () => {
       catalog_epoch: EPOCH,
       cells: [
         { kind: "object_lineage", object: "local_room", value: { object: "local_room", parents: [] } },
-        sessionSeed("s_far", "reap_actor", now - 10_000, "far_room"),
+        { kind: "object_live", object: "reap_actor", value: { location: "far_room" } },
+        { kind: "object_lineage", object: "elastic_actor", value: { parent: "$guest", name: "Elastic" } },
+        { kind: "object_live", object: "elastic_actor", value: { location: "far_room" } },
+        sessionSeed("s_far", "reap_actor", now - 10_000, "far_room", true),
+        sessionSeed("s_elastic", "elastic_actor", now - 10_000, "far_room", true),
         sessionSeed("s_local", "reap_actor", now - 10_000, "local_room"),
         sessionSeed("s_live", "reap_actor", liveExpiry, null)
       ]
@@ -156,7 +162,7 @@ describe("session reaper on the scope alarm (H2b)", () => {
     await farState.settle();
 
     // Expired cells deleted; the live one survives.
-    const closure = await call<{ cells: Array<{ key: string }>; head: { seq: number }; relations?: Array<{ owner: string; member: string }> }>(
+    const closure = await call<{ cells: Array<{ key: string; value?: { location?: string } }>; head: { seq: number }; relations?: Array<{ owner: string; member: string }> }>(
       clusterDO,
       env,
       "/closure",
@@ -165,7 +171,12 @@ describe("session reaper on the scope alarm (H2b)", () => {
     const keys = closure.cells.map((cell) => cell.key);
     expect(keys).not.toContain("session:s_far");
     expect(keys).not.toContain("session:s_local");
+    expect(keys).not.toContain("session:s_elastic");
     expect(keys).toContain("session:s_live");
+    expect(closure.cells.find((cell) => cell.key === "object_live:elastic_actor")?.value?.location).toBe("$nowhere");
+    // An ephemeral marker cannot retire an actor that still has another live
+    // session; only the one-session elastic identity above is reset.
+    expect(closure.cells.find((cell) => cell.key === "object_live:reap_actor")?.value?.location).toBe("far_room");
     // ONE owner-sequenced head advance for the whole batch (seed = 0,
     // the setup relate advanced to 1, the reap batch to 2 — exactly one).
     expect(closure.head.seq).toBe(2);
@@ -179,6 +190,7 @@ describe("session reaper on the scope alarm (H2b)", () => {
     expect(refan?.relations).toContainEqual(
       expect.objectContaining({ op: "remove", row: expect.objectContaining({ owner: "local_room", member: "s_local" }) })
     );
+    expect(refan?.cells).toContainEqual(expect.objectContaining({ key: "object_live:elastic_actor", value: { location: "$nowhere" } }));
 
     // The FOREIGN presence row was removed at the far room via /net/relate
     // (addressed by the room:<owner> convention).
@@ -187,6 +199,8 @@ describe("session reaper on the scope alarm (H2b)", () => {
       known: []
     });
     expect(farClosure.relations ?? []).not.toContainEqual(expect.objectContaining({ owner: "far_room", member: "s_far" }));
+    expect(farClosure.relations ?? []).not.toContainEqual(expect.objectContaining({ owner: "far_room", member: "s_elastic" }));
+    expect(farClosure.relations ?? []).not.toContainEqual(expect.objectContaining({ owner: "far_room", member: "elastic_actor" }));
 
     // The alarm re-armed for the next FUTURE expiry (s_live).
     expect(clusterState.alarms).toContain(liveExpiry);

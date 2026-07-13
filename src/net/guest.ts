@@ -45,7 +45,8 @@ export function provisionGuestSubmit(input: ProvisionGuestInput): ProvisionGuest
     actor: input.actor,
     started: input.now,
     expiresAt: input.now + input.ttl_ms,
-    activeScope: input.template.initial_room
+    activeScope: input.template.initial_room,
+    ephemeralActor: true
   };
   const writer = sessionWriter(input.actor, "guest_provision");
   const body: Omit<EffectTranscript, "hash"> = {

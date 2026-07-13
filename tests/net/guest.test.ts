@@ -37,6 +37,7 @@ describe("elastic guest provisioning", () => {
     expect(seq.store.get("session:s_net-api-2_abc")?.value).toMatchObject({
       actor: "guest_net_abc",
       activeScope: "the_chatroom",
+      ephemeralActor: true,
       expiresAt: 61_000
     });
     const relations = [...seq.relations().values()];
@@ -51,6 +52,7 @@ describe("elastic guest provisioning", () => {
         session: {
           activeScope: "the_chatroom",
           actor: "guest_net_abc",
+          ephemeralActor: true,
           expiresAt: 61_000,
           id: "s_net-api-2_abc",
           started: 1_000

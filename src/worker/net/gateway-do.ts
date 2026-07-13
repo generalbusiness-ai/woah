@@ -207,7 +207,7 @@ type SessionOpenRequest = {
    * omit it retain the gateway host's current time. */
   issued_at_ms?: number;
   /** Session close (finding 12 — see MintSessionInput.closing). */
-  closing?: { priorActiveScope: string | null };
+  closing?: { priorActiveScope: string | null; ephemeralActor?: boolean };
 };
 
 /** /net/turn reply body. `trace` lists the failed rounds that preceded
@@ -2195,13 +2195,14 @@ export class NetGatewayDO {
     if (verdict !== "ok") {
       return json({ error: { code: "E_PERM", message: `session ${verdict}`, detail: { session_verdict: verdict } } }, 403);
     }
-    const prior = (cell?.value as { activeScope?: string | null } | undefined)?.activeScope ?? null;
+    const priorValue = cell?.value as { activeScope?: string | null; ephemeralActor?: boolean } | undefined;
+    const prior = priorValue?.activeScope ?? null;
     const opened = await this.sessionOpen({
       session,
       actor,
       ttl_ms: 0, // ignored in closing mode
       catalog_epoch: epoch,
-      closing: { priorActiveScope: prior }
+      closing: { priorActiveScope: prior, ...(priorValue?.ephemeralActor ? { ephemeralActor: true } : {}) }
     });
     if (opened.reply.status !== "accepted") {
       return json({ error: { code: "E_RETRY", message: "session close did not commit; retry", detail: opened.reply } }, 503);

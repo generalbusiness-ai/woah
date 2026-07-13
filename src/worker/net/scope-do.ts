@@ -1072,7 +1072,12 @@ export class NetScopeDO {
       this.store.transaction(() => {
         const reap = seq.reapExpiredSessions(now, (id) => this.ownsSessionCell(seq, id));
         if (reap.status !== "applied") return reap;
-        if (reap.localRemovals.length > 0) {
+        const retiredCells = reap.reaped.flatMap((entry) => {
+          if (!entry.retiredActor || entry.actor === null) return [];
+          const cell = seq.store.get(cellKey("object_live", entry.actor));
+          return cell ? [cell] : [];
+        });
+        if (reap.localRemovals.length > 0 || retiredCells.length > 0) {
           const subscribers = sqlRows<{ destination: string; delivery_seq: number }>(
             this.state.storage.sql.exec("SELECT destination, delivery_seq FROM net_scope_subscribers WHERE role = 'fanout'")
           );
@@ -1080,7 +1085,7 @@ export class NetScopeDO {
             this.persistFanoutRow(destination, delivery_seq, {
               scope: seq.scope,
               seq: reap.head.seq,
-              cells: [],
+              cells: retiredCells,
               observations: [],
               relations: reap.localRemovals
             });
@@ -1096,10 +1101,17 @@ export class NetScopeDO {
           // A room whose lineage this scope holds is a LOCAL owner — its
           // row (if any) was removed in the batch above.
           if (seq.store.has(cellKey("object_lineage", entry.activeScope))) continue;
-          const row = { relation: "session_presence", owner: entry.activeScope, member: entry.session };
-          if (locallyRemoved.has(relationKey(row.relation, row.owner, row.member))) continue;
           const owningScope = `room:${entry.activeScope}`;
-          byScope.set(owningScope, [...(byScope.get(owningScope) ?? []), { op: "remove", row }]);
+          const rows = [
+            { relation: "session_presence", owner: entry.activeScope, member: entry.session },
+            ...(entry.retiredActor && entry.actor !== null
+              ? [{ relation: "contents", owner: entry.activeScope, member: entry.actor }]
+              : [])
+          ];
+          for (const row of rows) {
+            if (locallyRemoved.has(relationKey(row.relation, row.owner, row.member))) continue;
+            byScope.set(owningScope, [...(byScope.get(owningScope) ?? []), { op: "remove", row }]);
+          }
         }
         for (const [owningScope, deltas] of byScope) {
           this.persistOutboxRow("/relate", `scope:${owningScope}`, {

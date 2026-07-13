@@ -528,6 +528,13 @@ One write path per fact (CO9), concretized:
   post-accept closure fill installs the exact accepted session value as a
   durable derived echo stamped at the returned authority head. The transcript
   remains the only write path; unrelated touched cells stay repair-on-read.
+  Elastic guest sessions additionally carry an `ephemeralActor` lifecycle
+  marker. When the last live session is gone, the actor-cluster alarm reaper
+  advances one owner head, moves that actor's authoritative live cell to
+  `$nowhere`, and removes both presence and physical-contents rows at the room
+  owner through the durable relation outbox. Explicit close preserves the
+  marker and prior room until this reap; a concurrent live session suppresses
+  retirement. Seed-pool actors carry no marker and remain reusable in place.
 - **Relation-owner topology is gateway knowledge** (the
   `rider_destinations` rule): the gateway classifies the transcript's
   relation-owner objects (move endpoints, create locations, contents

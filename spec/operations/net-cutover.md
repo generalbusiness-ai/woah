@@ -375,6 +375,11 @@ item; what remains is exactly what the workerd lanes cannot prove
   the post-accept closure warm-fill degrades, the minting gateway durably
   installs the exact accepted session value at the returned authority head;
   it cannot return a successful bearer that its own shard rejects as missing.
+  Elastic sessions mark their one-use actors for alarm-driven retirement.
+  After close/expiry and only when no live sibling session remains, the actor
+  cluster resets physical placement to `$nowhere` and durably retracts both
+  room presence and contents. Repeated anonymous admission therefore cannot
+  grow a hot room's physical roster without bound.
 - **Gateway sharding — BUILT after the first deployed canary.** Public
   `/net-api` routing uses `NET_API_GATEWAY_SHARDS` named shards. A session
   or WebSocket ticket carries its minting shard; MCP headers, bearer/body/

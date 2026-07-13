@@ -188,10 +188,12 @@ describe("mintSessionSubmit → accepted at the cluster scope (CO14)", () => {
       base: seq.head(),
       epoch: EPOCH,
       clusterScope: "cluster:#actor",
-      closing: { priorActiveScope: "room:r1" }
+      closing: { priorActiveScope: "room:r1", ephemeralActor: true }
     });
     expect(submit.transcript.sessionClose).toBe(true);
     expect(value.expiresAt).toBeLessThan(NOW);
+    expect(value.ephemeralActor).toBe(true);
+    expect(value.retireFromScope).toBe("room:r1");
     const reply = seq.submit(submit);
     expect(reply.status, JSON.stringify(reply)).toBe("accepted");
     expect(validateSessionCell(seq.store.get(sessionCellKey("s1")), NOW, "#actor")).toBe("expired");

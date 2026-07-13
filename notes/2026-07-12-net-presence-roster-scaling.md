@@ -278,3 +278,16 @@ stamped with the reply head. A reconstruction test authenticates the bearer
 from SQLite through a new gateway instance, proving this is durable cache-fill
 rather than an in-memory exception. Final deployed confirmation remains
 required.
+
+The next 30-guest run made every bearer usable and closed all 30 sessions, but
+an accumulated canary room then reset its DO for memory pressure (152/600
+turns failed). Presence cleanup was not enough: every one-use elastic actor
+remained a physical room member after logout, so room planning and contents
+state grew with historical admissions. Elastic session cells now carry an
+`ephemeralActor` marker. The owner alarm reaper preserves it through explicit
+close, checks that no other live session binds the actor, resets the actor's
+authoritative live cell to `$nowhere`, and removes both `session_presence` and
+`contents` at the room owner through the durable outbox. Pool seats remain
+unmarked and placed for reuse. A fresh namespace is required for final load
+evidence because already-reaped legacy canary sessions no longer retain enough
+authority data to identify their old actors safely.

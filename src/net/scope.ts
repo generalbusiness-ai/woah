@@ -717,20 +717,35 @@ export class ScopeSequencer {
   ): {
     status: "applied" | "empty";
     head: ScopeHead;
-    reaped: Array<{ session: string; activeScope: string | null }>;
+    reaped: Array<{ session: string; actor: string | null; activeScope: string | null; retiredActor: boolean }>;
     localRemovals: RelationDelta[];
   } {
-    const reaped: Array<{ session: string; activeScope: string | null }> = [];
+    const reaped: Array<{ session: string; actor: string | null; activeScope: string | null; retiredActor: boolean }> = [];
     const deletedKeys: string[] = [];
+    const liveActors = new Set<string>();
+    for (const key of this.store.keys()) {
+      if (!key.startsWith("session:")) continue;
+      const cell = this.store.get(key);
+      const value = cell?.value as { actor?: unknown } | null | undefined;
+      if (cell && validateSessionCell(cell, now) === "ok" && typeof value?.actor === "string") liveActors.add(value.actor);
+    }
     for (const key of [...this.store.keys()].sort()) {
       if (!key.startsWith("session:")) continue;
       const cell = this.store.get(key);
       if (!cell || !ownsSession(cell.object)) continue;
       if (validateSessionCell(cell, now) !== "expired") continue;
-      const value = cell.value as { activeScope?: unknown } | null;
+      const value = cell.value as { actor?: unknown; activeScope?: unknown; ephemeralActor?: unknown; retireFromScope?: unknown } | null;
+      const actor = typeof value?.actor === "string" ? value.actor : null;
+      const activeScope = typeof value?.activeScope === "string" && value.activeScope
+        ? value.activeScope
+        : typeof value?.retireFromScope === "string" && value.retireFromScope
+          ? value.retireFromScope
+          : null;
       reaped.push({
         session: cell.object,
-        activeScope: typeof value?.activeScope === "string" && value.activeScope ? value.activeScope : null
+        actor,
+        activeScope,
+        retiredActor: value?.ephemeralActor === true && actor !== null && !liveActors.has(actor)
       });
       deletedKeys.push(key);
     }
@@ -748,10 +763,25 @@ export class ScopeSequencer {
     };
     for (const key of deletedKeys) this.store.delete(key);
     this.headState = nextHead;
+    const retiredLiveKeys: string[] = [];
+    for (const entry of reaped) {
+      if (!entry.retiredActor || entry.actor === null) continue;
+      const key = cellKey("object_live", entry.actor);
+      const live = this.store.get(key);
+      if (!live) continue;
+      const prior = (live.value ?? {}) as Record<string, unknown>;
+      this.store.commit({
+        kind: "object_live",
+        object: entry.actor,
+        value: { ...prior, location: "$nowhere" },
+        stamp: this.stamp()
+      });
+      retiredLiveKeys.push(key);
+    }
     const tailEntry: TailEntry = {
       seq: nextHead.seq,
       transcript_hash: marker,
-      touched: deletedKeys,
+      touched: [...deletedKeys, ...retiredLiveKeys].sort(),
       base_hash: priorHead.hash,
       head_hash: nextHead.hash
     };
@@ -760,9 +790,17 @@ export class ScopeSequencer {
 
     // Local presence rows naming a reaped session: remove and report.
     const reapedIds = new Set(reaped.map((entry) => entry.session));
+    const retiredContents = new Set(
+      reaped
+        .filter((entry) => entry.retiredActor && entry.actor !== null && entry.activeScope !== null)
+        .map((entry) => relationKey("contents", entry.activeScope as string, entry.actor as string))
+    );
     const localRemovals: RelationDelta[] = [];
     for (const row of this.relationRows.values()) {
-      if (row.relation === "session_presence" && reapedIds.has(row.member)) {
+      if (
+        (row.relation === "session_presence" && reapedIds.has(row.member)) ||
+        (row.relation === "contents" && retiredContents.has(relationKey(row.relation, row.owner, row.member)))
+      ) {
         localRemovals.push({ op: "remove", row });
       }
     }
@@ -772,6 +810,10 @@ export class ScopeSequencer {
     if (durable) {
       durable.transaction(() => {
         for (const key of deletedKeys) durable.deleteCell(key);
+        for (const key of retiredLiveKeys) {
+          const cell = this.store.get(key);
+          if (cell) durable.writeCell(cell);
+        }
         durable.writeMeta({ scope: this.scope, catalog_epoch: this.catalogEpoch, head: this.headState });
         durable.appendTail(tailEntry);
         durable.trimTail(this.options.tailLimit);
