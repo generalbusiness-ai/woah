@@ -380,6 +380,14 @@ verifies it and freshly signs a state-free `/net/probe` hop to the catalog DO.
 probe proves both live bindings without hydrating a sequencer, advancing a
 head, or draining pending work.
 
+The final acceptance check deployed commit `91fd5b1` to the standalone
+workers.dev canary, rotated a canary-only secret, and then redeployed as
+version `e8b9013b-aa7e-4c01-a4ba-dd8d32156ec2`. Running the production
+installer with `--probe-only` returned both named success lines before any
+seed request. The worker then returned 404 after deletion, its dedicated KV
+namespace was absent from the account listing, and the local config and secret
+were removed. Production routes and namespaces were not touched.
+
 Review of the first cache draft found a separate correctness hole in runtime
 authoring: `add_verb`/`set_verb_code` and property-definition builtins mutated
 only the planner's ephemeral `WooWorld`, so a net turn could report success
