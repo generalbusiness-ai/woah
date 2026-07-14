@@ -1633,32 +1633,92 @@ function legacyPosition(world: WooWorld, ref: ObjRef, positionProp: string): num
  * instance; no renumber. See the `reindex_ordered_edges` step doc above.
  */
 function reindexOrderedEdges(world: WooWorld, classRef: ObjRef, parentProp: string, positionProp: string, edgeProp: string): void {
-  const groups = new Map<string, { container: ObjRef; parent: ObjRef | null; items: ObjRef[] }>();
+  // 1. Collect placed instances with their container; index the valid item set
+  //    per container (a parent is valid only if it is such an instance in the
+  //    SAME container).
+  const items: ObjRef[] = [];
+  const containerOf = new Map<ObjRef, ObjRef>();
+  const itemsInContainer = new Map<ObjRef, Set<ObjRef>>();
   for (const ref of classAndDescendants(world, classRef)) {
     if (ref === classRef) continue; // the class itself is not a placed item
-    const obj = world.object(ref);
-    const container = obj.location;
+    const container = world.object(ref).location;
     if (!container || container === "$nowhere") continue; // unplaced instances get no edge
-    const rawParent = obj.properties.get(parentProp);
-    const parent = typeof rawParent === "string" ? rawParent : null;
-    const key = `${container} ${parent ?? ""}`;
-    let group = groups.get(key);
-    if (!group) groups.set(key, (group = { container, parent, items: [] }));
-    group.items.push(ref);
+    items.push(ref);
+    containerOf.set(ref, container);
+    (itemsInContainer.get(container) ?? itemsInContainer.set(container, new Set()).get(container)!).add(ref);
+  }
+
+  // 2. Resolve each item's parent, repairing dangling / cross-container refs to
+  //    root (P1.3): NEVER copy a parent blindly, or a node vanishes once the
+  //    legacy source is dropped (v2 renders only from null-parent roots).
+  const repairs = { dangling: 0, cross: 0, cycle: 0 };
+  const parentOf = new Map<ObjRef, ObjRef | null>();
+  for (const ref of items) {
+    const rawParent = world.object(ref).properties.get(parentProp);
+    let parent = typeof rawParent === "string" ? rawParent : null;
+    if (parent !== null) {
+      const container = containerOf.get(ref)!;
+      const sameContainer = itemsInContainer.get(container);
+      if (!sameContainer || !sameContainer.has(parent)) {
+        if (containerOf.has(parent) && containerOf.get(parent) !== container) repairs.cross += 1;
+        else repairs.dangling += 1;
+        parent = null;
+      }
+    }
+    parentOf.set(ref, parent);
+  }
+
+  // 3. Break cycles at the LOWEST-id node. Each node has <= 1 parent (a
+  //    functional graph), so cycles are disjoint simple loops; a DFS along
+  //    parents that revisits a node on the current path found one.
+  const state = new Map<ObjRef, 0 | 1 | 2>(); // 0 unseen, 1 on path, 2 done
+  for (const start of items) {
+    if ((state.get(start) ?? 0) !== 0) continue;
+    const path: ObjRef[] = [];
+    let cur: ObjRef | null = start;
+    while (cur !== null && (state.get(cur) ?? 0) === 0) {
+      state.set(cur, 1);
+      path.push(cur);
+      cur = parentOf.get(cur) ?? null;
+    }
+    if (cur !== null && state.get(cur) === 1) {
+      // `cur` is on the current path -> the cycle is path[indexOf(cur)..].
+      const cycle = path.slice(path.indexOf(cur));
+      const lowest = cycle.reduce((m, x) => (x < m ? x : m), cycle[0]);
+      parentOf.set(lowest, null);
+      repairs.cycle += 1;
+    }
+    for (const n of path) state.set(n, 2);
+  }
+
+  // 4. Assign fractional ranks per (container, resolved-parent) group, ordered
+  //    by (position, id) so re-deriving from the same input is byte-identical
+  //    (idempotent). The NUL join keeps container/parent ids unambiguous.
+  const groups = new Map<string, ObjRef[]>();
+  for (const ref of items) {
+    const key = `${containerOf.get(ref)}\u0000${parentOf.get(ref) ?? ""}`;
+    (groups.get(key) ?? groups.set(key, []).get(key)!).push(ref);
   }
   for (const group of groups.values()) {
-    group.items.sort((a, b) => {
+    group.sort((a, b) => {
       const pa = legacyPosition(world, a, positionProp);
       const pb = legacyPosition(world, b, positionProp);
       if (pa !== pb) return pa - pb;
       return a < b ? -1 : a > b ? 1 : 0;
     });
     let last: string | null = null;
-    for (const ref of group.items) {
+    for (const ref of group) {
       const rank: string = last === null ? firstRank() : rankAfter(last);
-      world.setProp(ref, edgeProp, { parent: group.parent, rank });
+      world.setProp(ref, edgeProp, { parent: parentOf.get(ref) ?? null, rank });
       last = rank;
     }
+  }
+
+  if (repairs.dangling + repairs.cross + repairs.cycle > 0) {
+    console.warn(
+      `reindex_ordered_edges: repaired ${repairs.dangling} dangling, ${repairs.cross} cross-container, ` +
+      `${repairs.cycle} cyclic parent(s) to root while building ${edgeProp} for ${classRef}`
+    );
   }
 }
 

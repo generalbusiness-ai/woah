@@ -72,16 +72,51 @@ const AGED: Item[] = [
   { id: "it_n", parent: null, position: 2, container: "mo2" }
 ];
 
-function buildAgedV1(world: ReturnType<typeof createWorld>): void {
+// Adversarial v1 fixture (P1.3): a<->b cycle, c -> missing parent, d -> a
+// cross-container parent (adv_x lives in amo2). A migration that copies parents
+// blindly preserves all three invalid edges, and — since v2 renders only from
+// null-parent roots — every one of a/b/c/d then VANISHES.
+const ADVERSARIAL: Item[] = [
+  { id: "adv_a", parent: "adv_b", position: 1, container: "amo" },
+  { id: "adv_b", parent: "adv_a", position: 2, container: "amo" },
+  { id: "adv_c", parent: "ghost_missing", position: 3, container: "amo" },
+  { id: "adv_d", parent: "adv_x", position: 4, container: "amo" },
+  { id: "adv_x", parent: null, position: 1, container: "amo2" }
+];
+
+function buildV1(world: ReturnType<typeof createWorld>, items: Item[]): void {
   installCatalogManifest(world, V1, { tap: "@local", alias: "outliner" });
-  for (const outliner of ["mo", "mo2"]) {
-    world.createObject({ id: outliner, name: outliner, parent: "$outliner", owner: "$wiz" });
+  for (const container of new Set(items.map((i) => i.container))) {
+    world.createObject({ id: container, name: container, parent: "$outliner", owner: "$wiz" });
   }
-  for (const item of AGED) {
+  for (const item of items) {
     world.createObject({ id: item.id, name: item.id, parent: "$outline_item", owner: "$wiz", location: item.container });
     world.setProp(item.id, "parent", item.parent);
     world.setProp(item.id, "position", item.position);
   }
+}
+
+function buildAgedV1(world: ReturnType<typeof createWorld>): void {
+  buildV1(world, AGED);
+}
+
+/** Items reachable by walking edges DOWN from the null-parent roots (what v2's
+ * `object_tree_rows` renders). Anything unreachable has vanished. */
+function reachableFromRoots(world: ReturnType<typeof createWorld>, items: Item[]): Set<string> {
+  const byParent = new Map<string | null, string[]>();
+  for (const it of items) {
+    const parent = edgeOf(world, it.id).parent;
+    (byParent.get(parent) ?? byParent.set(parent, []).get(parent)!).push(it.id);
+  }
+  const seen = new Set<string>();
+  const queue = [...(byParent.get(null) ?? [])];
+  while (queue.length > 0) {
+    const n = queue.shift()!;
+    if (seen.has(n)) continue;
+    seen.add(n);
+    for (const child of byParent.get(n) ?? []) queue.push(child);
+  }
+  return seen;
 }
 
 function migrate(world: ReturnType<typeof createWorld>): ReturnType<typeof updateCatalogManifest> {
@@ -185,6 +220,79 @@ describe("outliner v1 -> v2 migration", () => {
     // Ranks are strictly increasing in sibling order (a real total order).
     const roots = ["it_b", "it_c", "it_a"].map((id) => edgeOf(a, id).rank);
     for (let i = 1; i < roots.length; i += 1) expect(roots[i - 1] < roots[i]).toBe(true);
+  });
+
+  // P1.3 (reviewer repro): the migration must ENFORCE the four validations on
+  // real (possibly malformed) input, with deterministic repair, BEFORE it drops
+  // the legacy source props — otherwise it copies invalid parents blindly, the
+  // nodes vanish from list_items (which renders only null-parent roots), and the
+  // v1 source is then destroyed under corruption.
+  it("enforces the four validations on a malformed v1 tree with deterministic repair, on SQLite", () => {
+    const { dir, path } = tempDb();
+    try {
+      const seedRepo = new LocalSQLiteRepository(path);
+      const seedWorld = createWorld({ repository: seedRepo, catalogs: false });
+      buildV1(seedWorld, ADVERSARIAL);
+      seedRepo.close();
+
+      const upgradeRepo = new LocalSQLiteRepository(path);
+      const upgradeWorld = createWorld({ repository: upgradeRepo, catalogs: false });
+      const record = upgradeRepo.transaction(() => migrate(upgradeWorld));
+      expect(record.migration_state).toMatchObject({ status: "completed", to_version: "2.0.0" });
+
+      const validItems: Record<string, string[]> = {
+        amo: ["adv_a", "adv_b", "adv_c", "adv_d"],
+        amo2: ["adv_x"]
+      };
+      for (const item of ADVERSARIAL) {
+        const e = edgeOf(upgradeWorld, item.id);
+        // (1) exactly one edge, non-empty rank.
+        expect(typeof e.rank).toBe("string");
+        expect(e.rank.length).toBeGreaterThan(0);
+        // (2) no dangling / cross-container parent: null or a same-outliner item.
+        if (e.parent !== null) {
+          expect(validItems[item.container], `${item.id} parent ${e.parent} not in ${item.container}`).toContain(e.parent);
+        }
+        // (3) no cycles: child -> parent walk terminates.
+        const seen = new Set<string>();
+        let cur: string | null = item.id;
+        while (cur !== null) {
+          expect(seen.has(cur), `cycle at ${cur}`).toBe(false);
+          seen.add(cur);
+          cur = edgeOf(upgradeWorld, cur).parent;
+        }
+        // legacy source dropped only AFTER a valid edge exists.
+        expect(upgradeWorld.propOrNull(item.id, "parent")).toBeNull();
+        expect(upgradeWorld.propOrNull(item.id, "position")).toBeNull();
+      }
+      // No vanished nodes: every item is reachable from a root.
+      const reachable = reachableFromRoots(upgradeWorld, ADVERSARIAL);
+      for (const item of ADVERSARIAL) expect(reachable.has(item.id), `${item.id} vanished`).toBe(true);
+
+      // Deterministic repair details:
+      //  - cycle {adv_a, adv_b} broken at the lowest id (adv_a -> root, adv_b -> adv_a);
+      //  - dangling adv_c -> root; cross-container adv_d -> root.
+      expect(edgeOf(upgradeWorld, "adv_a").parent).toBeNull();
+      expect(edgeOf(upgradeWorld, "adv_b").parent).toBe("adv_a");
+      expect(edgeOf(upgradeWorld, "adv_c").parent).toBeNull();
+      expect(edgeOf(upgradeWorld, "adv_d").parent).toBeNull();
+      upgradeRepo.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("repairs a malformed tree DETERMINISTICALLY (idempotent across identical inputs)", () => {
+    const a = createWorld({ catalogs: false });
+    const b = createWorld({ catalogs: false });
+    buildV1(a, ADVERSARIAL);
+    buildV1(b, ADVERSARIAL);
+    migrate(a);
+    migrate(b);
+    for (const item of ADVERSARIAL) {
+      expect(edgeOf(b, item.id).parent).toBe(edgeOf(a, item.id).parent);
+      expect(edgeOf(b, item.id).rank, `rank drift for ${item.id}`).toBe(edgeOf(a, item.id).rank);
+    }
   });
 
   it("is applied AUTOMATICALLY on boot: installLocalCatalogs upgrades an aged v1 outliner to v2 (the prod deploy path)", () => {
