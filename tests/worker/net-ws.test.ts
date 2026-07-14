@@ -628,7 +628,14 @@ describe("gateway self-subscribe (H1)", () => {
       token
     });
     const members = (roster.body.members as Array<{ member: string }>).map((row) => row.member);
-    expect(members).toEqual(expect.arrayContaining([s1, s2]));
+    // The client presence view is ACTOR-level: a session id is a bearer
+    // credential and is never exposed to a peer (see net-session-leak.test.ts;
+    // all these sessions belong to one actor, so the view collapses to that
+    // actor). Fixture sanity = the annex has a present actor; the per-SESSION
+    // push targeting is proven by the socket assertions below.
+    expect(members.length, JSON.stringify(roster.body)).toBeGreaterThan(0);
+    expect(members, `no bearer id leaks: ${JSON.stringify(roster.body)}`).not.toContain(s1);
+    expect(members).not.toContain(s2);
 
     const a = await upgrade(h, s1);
     const b = await upgrade(h, s2);
@@ -698,8 +705,15 @@ describe("observation push via session_presence (Phase 4 item 3 chunk 2)", () =>
       token
     });
     const members = (roster.body.members as Array<{ member: string }>).map((row) => row.member);
-    expect(members).toEqual(expect.arrayContaining([s1, s2, s4]));
-    expect(members).not.toContain(s3);
+    // Actor-level presence view (no bearer session ids exposed; all four
+    // sessions are one actor, so the annex roster is that single actor).
+    // Sanity: the annex has a present actor; the push assertions below prove
+    // which SESSIONS receive the observation (s2 socket yes; s3 side-room no;
+    // s4 no-socket skipped).
+    expect(members.length, JSON.stringify(roster.body)).toBeGreaterThan(0);
+    for (const sid of [s1, s2, s3, s4]) {
+      expect(members, `no bearer id leaks: ${JSON.stringify(roster.body)}`).not.toContain(sid);
+    }
 
     const a = await upgrade(h, s1);
     const b = await upgrade(h, s2);

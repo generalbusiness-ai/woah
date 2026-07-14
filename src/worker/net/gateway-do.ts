@@ -60,7 +60,7 @@ import { CellStore, cellKey, makeCell, type Cell } from "../../net/cells";
 import { clampClientSessionTtl } from "../../net/client-session-policy";
 import { budgetExhausted, isNetError, netError, NetError, type AttemptTraceEntry, type NetErrorCode } from "../../net/errors";
 import { applyFanout, type FanoutBody } from "../../net/outbox";
-import { observationsForRelationOwners, relationKey, type RelationDelta, type RelationRow, type RoomRosterRow } from "../../net/relations";
+import { observationsForRelationOwners, relationKey, roomRosterRows, type RelationDelta, type RelationRow, type RoomRosterRow } from "../../net/relations";
 import { mintSessionSubmit, sessionCellKey, validateSessionCell } from "../../net/sessions";
 import { sessionIdWithShardHint, ticketIdWithShardHint } from "../../net/session-id";
 import { planTurn, type PlanTurnInput, type PlanTurnResult } from "../../net/plan";
@@ -1730,7 +1730,10 @@ export class NetGatewayDO {
         // are authorized against it — no global reads, no credential cells.
         const session = this.readSession(url, actor, bearerSession);
         this.authorizeRelationRead(actor, session, owner);
-        return json({ relation, owner, members: this.relationMembers(relation, owner) });
+        // SECURITY: the client-facing projection strips session bearer ids
+        // and session cell values from presence (clientRelationMembers) —
+        // a co-present peer's session id IS their credential.
+        return json({ relation, owner, members: this.clientRelationMembers(relation, owner) });
       }
       if (request.method === "GET" && url.pathname === "/net-api/cell") {
         const key = url.searchParams.get("key") ?? "";
@@ -3304,6 +3307,14 @@ export class NetGatewayDO {
     // session cell.
     if (object === caller) return;
     if (kind === "session" && object === session) return;
+    // SECURITY (session bearer-token leak, P0 defense-in-depth): a session id
+    // IS a bearer credential. A session cell is readable ONLY by its own
+    // session (handled just above) — NEVER via the co-presence path below.
+    // Refuse any other session-cell read explicitly rather than relying on
+    // the co-presence checks happening to fail for a session id.
+    if (kind === "session") {
+      throw new ClientAuthError("session cells are readable only by their owner", { key }, "E_PERM", 403);
+    }
     // Co-presence: the object IS one of the caller's rooms, or it LIVES in
     // one. The object's own live cell location is the authoritative,
     // lag-free membership signal (the contents relation mirror only
@@ -3346,6 +3357,58 @@ export class NetGatewayDO {
       member: row.member,
       ...(row.body !== null ? { body: JSON.parse(row.body) as unknown } : {})
     }));
+  }
+
+  /**
+   * SECURITY (session bearer-token leak, P0): the CLIENT-facing view of a
+   * relation's members. A net session id IS the bearer credential
+   * (`Authorization: Bearer session:<id>`), so it must NEVER reach any
+   * actor other than that session's owner.
+   *
+   * The `session_presence` relation stores `member = <session id>` and
+   * `body.session = <the session cell value>` — structurally required
+   * server-side (roomRosterRows derives liveness from the cell;
+   * pushObservations routes by it), but both are credentials. Serving the
+   * raw `relationMembers` rows to a co-present peer therefore enumerates
+   * every occupant's bearer token, and a leaked token authenticates as the
+   * victim (account takeover).
+   *
+   * So presence is projected here to actor-level roster rows
+   * (RoomRosterRow: player + name + presence + timings) with the session
+   * id and cell stripped entirely. A caller learns WHO is present (the
+   * same actor-level fact `who` already discloses), never HOW to
+   * impersonate them. Every other relation names plain object ids as
+   * members (contents, …) and passes through unchanged.
+   */
+  private clientRelationMembers(relation: string, owner: string): Array<{ member: string; body?: unknown }> {
+    if (relation !== "session_presence") return this.relationMembers(relation, owner);
+    const rows: RelationRow[] = sqlRows<{ member: string; body: string | null }>(
+      this.state.storage.sql.exec(
+        "SELECT member, body FROM net_gateway_relation WHERE relation = 'session_presence' AND owner = ?",
+        owner
+      )
+    ).map((row) => ({
+      relation: "session_presence",
+      owner,
+      member: row.member,
+      ...(row.body !== null ? { body: JSON.parse(row.body) as unknown } : {})
+    }));
+    // roomRosterRows consumes the (server-side) session cell in each body
+    // for liveness/dedup and emits RoomRosterRow, which carries no session
+    // id or cell. Member becomes the ACTOR id — the client-safe identity.
+    const roster = roomRosterRows(rows, owner, this.roomDisplayName(owner), this.host.now());
+    return roster.map((row) => ({ member: row.player, body: row }));
+  }
+
+  /** A room's cosmetic display name from the view (lineage, then a name
+   * property), falling back to the object id. Used only to populate the
+   * non-sensitive `location_name` of a client roster row. */
+  private roomDisplayName(owner: string): string {
+    const lineage = this.ensureView().get(cellKey("object_lineage", owner))?.value as { name?: unknown } | undefined;
+    if (typeof lineage?.name === "string" && lineage.name) return lineage.name;
+    const prop = this.ensureView().get(cellKey("property_cell", owner, "name"))?.value as { value?: unknown } | undefined;
+    if (typeof prop?.value === "string" && prop.value) return prop.value;
+    return owner;
   }
 
   /** Fetch one compact roster directly from the room authority. This is a
