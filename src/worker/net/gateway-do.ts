@@ -439,6 +439,14 @@ function netErrorHttpStatus(error: NetError): number {
   return error.code === "E_BUDGET" || error.code === "E_RPC_TIMEOUT" ? 503 : 400;
 }
 
+/** Runtime object ids are opaque except for `:`, which the net protocol
+ * reserves as its compound cell-key delimiter. Catalog aliases containing
+ * that character must have resolved during installation, never at this
+ * transport boundary. */
+function isConcreteRuntimeObjectId(id: string): boolean {
+  return id.length > 0 && !id.includes(":");
+}
+
 /** `<kind>:<object>[:<name>]` → object (object ids never contain ':'). */
 function objectOfCellKey(key: string): string {
   return key.split(":")[1] ?? "";
@@ -2441,6 +2449,25 @@ export class NetGatewayDO {
     const verb = typeof body.verb === "string" ? body.verb : "";
     if (!target || !verb) {
       return json({ error: { code: "E_INVARG", message: "turn body requires target and verb" } }, 400);
+    }
+    // Catalog-qualified names are manifest syntax, resolved by the catalog
+    // installer before objects reach the runtime. Rejecting one here is also
+    // required for key safety: every net cell-key parser treats `:` as a
+    // delimiter and therefore cannot represent a colon-bearing object id.
+    // Keep this after session validation so malformed input cannot bypass the
+    // authenticated actor/session binding, but before target pull and repair
+    // so a client typo cannot become a retry-budget failure.
+    if (!isConcreteRuntimeObjectId(target)) {
+      return json(
+        {
+          error: {
+            code: "E_INVARG",
+            message: "turn target is not a valid runtime object id",
+            detail: { field: "target", reason: "invalid_object_id" }
+          }
+        },
+        400
+      );
     }
     const args = (Array.isArray(body.args) ? body.args : []) as PlanTurnInput["call"]["args"];
 

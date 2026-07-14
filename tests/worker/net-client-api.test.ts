@@ -19,6 +19,8 @@
 //     location-derived scope, commits route:"sequenced" through the
 //     normal /net/turn machinery, and returns the item-1
 //     result/observations;
+//   - catalog-qualified manifest references are rejected as invalid
+//     runtime targets before target-scope pull or repair;
 //   - client idempotency keys replay per the item-1 contract;
 //   - the authenticated GET reads (cell probe, relation roster) serve.
 import { describe, expect, it } from "vitest";
@@ -137,7 +139,12 @@ async function buildHarness() {
   const states: Array<ReturnType<typeof netState>> = [];
   const scopeDOs = new Map<string, NetScopeDO>();
   const gateways = new Map<string, NetGatewayDO>();
+  // Record actual DO crossings so boundary regressions can distinguish a
+  // prompt input refusal from the repair loop that an invalid target used to
+  // trigger. Direct fixture seeding intentionally does not enter this log.
+  const resolvedDestinations: string[] = [];
   const resolve = (destination: string) => {
+    resolvedDestinations.push(destination);
     if (destination.startsWith("scope:")) {
       const instance = scopeDOs.get(destination.slice("scope:".length));
       if (!instance) throw new Error(`unresolvable destination ${destination}`);
@@ -172,7 +179,7 @@ async function buildHarness() {
   gateways.set("net-api", gateway);
   states.push(gatewayState);
 
-  return { gateway, actor, other, roomScope, close: () => states.forEach((st) => st.close()) };
+  return { gateway, actor, other, roomScope, resolvedDestinations, close: () => states.forEach((st) => st.close()) };
 }
 
 describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
@@ -371,6 +378,36 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     const roster = await clientFetch(h.gateway, "GET", `/net-api/relation?session=${sid}&relation=contents&owner=capi_room`, { token });
     expect(roster.status).toBe(200);
     expect(Array.isArray(roster.body.members)).toBe(true);
+
+    h.close();
+  });
+
+  it("rejects a catalog-qualified target before target-scope pull or repair", async () => {
+    const h = await buildHarness();
+    const token = `apikey:${KEY_ID}:${KEY_SECRET}`;
+    const minted = await clientFetch(h.gateway, "POST", "/net-api/session", { token, body: { ttl_ms: 600_000 } });
+    expect(minted.status, JSON.stringify(minted.body)).toBe(200);
+    const sid = minted.body.session as string;
+
+    // Catalog manifests may spell this shape as `alias:seed`, but the
+    // installer must replace it with the seed's concrete id. Before this
+    // boundary check, the colon-bearing value entered missing-state repair
+    // and surfaced as 503 E_BUDGET after six fruitless attempts.
+    h.resolvedDestinations.length = 0;
+    const invalid = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+      token,
+      body: { target: "tasks:the_taskboard", verb: "listing", session: sid }
+    });
+
+    expect(invalid.status).toBe(400);
+    expect(invalid.body.error).toMatchObject({
+      code: "E_INVARG",
+      detail: { field: "target", reason: "invalid_object_id" }
+    });
+    // Credential authentication still consults the catalog scope. Nothing
+    // else — especially the room planning scope — may be contacted for this
+    // malformed target.
+    expect(h.resolvedDestinations.filter((destination) => destination !== `scope:${CATALOG_SCOPE}`)).toEqual([]);
 
     h.close();
   });

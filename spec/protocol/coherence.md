@@ -679,7 +679,16 @@ One write path per fact (CO9), concretized:
     the named session cell — presence, expiry, and actor binding to the
     AUTHENTICATED apikey actor — before planning; the turn then runs
     route:`sequenced` so the committing scope's authorize revalidates
-    end-to-end (the gateway authenticates; scopes authorize).
+    end-to-end (the gateway authenticates; scopes authorize). `target`
+    is a concrete runtime object id, not a catalog-manifest reference:
+    installed-alias forms such as `tasks:the_taskboard` have already
+    resolved to their concrete seed id before runtime. A concrete object
+    id cannot contain `:` because net cell keys reserve that delimiter.
+    The gateway refuses a colon-bearing target as HTTP 400 `E_INVARG`
+    after session validation but before target-scope planning, pull, or
+    repair. A syntactically valid id that is not present remains a
+    distributed lookup/authority result; the gateway must not replace
+    that path with global enumeration.
   - **planningScope from the session cell:** the anchor object is the
     session's `activeScope` when set, else the actor's live location
     from the view, else the actor itself; the anchor classifies through
