@@ -112,7 +112,7 @@ export type PlanTurnInput = {
    * in the ephemeral execution world for generic ordered_children(parent)
    * reads. The ordering analogue of planningRoomRoster; keeps sibling order
    * off the O(N)-edge-cell read closure. */
-  planningOrderedChildren?: readonly { parent: string | null; rows: readonly Record<string, unknown>[] }[];
+  planningOrderedChildren?: readonly { parent: string | null; rows: readonly Record<string, unknown>[]; version: string }[];
 };
 
 export type PlanTurnResult = {
@@ -288,6 +288,14 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
   const withSession = foldSessionEffects(run.transcript, planStore, call);
   const selection = selectCommitScope(withSession, planningScope, classifier);
   const transcript = submitTranscript(withSession, planStore, selection.scope);
+  // P1.1: attest every ordered-children projection this plan was given (a read
+  // can only resolve to a supplied projection — else it misses and repairs into
+  // one), so the committing scope serializes concurrent same-parent inserts by
+  // re-validating each ordering version. A supplied-but-unread projection is a
+  // stable empty target ordering, so attesting it is harmless.
+  if (input.planningOrderedChildren && input.planningOrderedChildren.length > 0) {
+    transcript.orderingReads = input.planningOrderedChildren.map((p) => ({ parent: p.parent, version: p.version }));
+  }
 
   // Planner-parity post-state: same apply, same prior cells (the settled
   // attempt's store is a read-through of authority, and every write

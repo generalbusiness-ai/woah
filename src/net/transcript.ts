@@ -69,6 +69,14 @@ export type EffectTranscript = Omit<EngineEffectTranscript, "reads" | "writes" |
    * session instead of requiring the replacement's short expiry to
    * remain live across the cross-DO submit latency. */
   sessionClose?: boolean;
+  /** Ordered-children projections this plan read, each attested at the
+   * authority content `version` at read time (P1.1). The owning scope
+   * re-derives each parent's ordering version from its CURRENT edge cells at
+   * submit and rejects the plan (read_version_mismatch) if any differs — so a
+   * concurrent same-parent insert that lands between plan and submit
+   * invalidates the neighbour read that produced the rank. Present-only-when-
+   * nonempty keeps prior transcript hashes unchanged. */
+  orderingReads?: Array<{ parent: string | null; version: string }>;
 };
 
 /**

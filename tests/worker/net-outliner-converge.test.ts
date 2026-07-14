@@ -262,6 +262,47 @@ describe("outliner add over the net path converges", () => {
     expect(turn.attempt, `scale add took ${turn.attempt} attempts`).toBeLessThanOrEqual(3);
   });
 
+  it("P1.1: two concurrent same-slot inserts commit DISTINCT ranks (the ordering read is attested)", async () => {
+    // Both turns plan against the SAME empty root (a barrier holds both submits
+    // until both have planned), so each computes the first rank ("V"). Without
+    // attesting the ordering projection, the second rebases behind the first's
+    // committed head and commits the SAME rank -> two children at "V". The
+    // ordering read must be authority-versioned so the second is rejected,
+    // re-plans against the now-nonempty ordering, and gets a DISTINCT rank.
+    const { world, theOutline, session, actor, epoch } = await outlinerWorld();
+    const roomScope = `room:${theOutline}`;
+    const ctx = { theOutline, roomScope, epoch, session, actor };
+    let pending = 0;
+    let release: () => void = () => {};
+    const bothPlanned = new Promise<void>((r) => { release = r; });
+    const { gateway, gatewayEnv, scopeDOs } = await mountNet(world, epoch, {
+      intercept: async (scope, path) => {
+        // Delay (never override) the first submit of each turn until BOTH have
+        // planned — forcing the second to have planned a stale ordering.
+        if (scope === roomScope && path === "/net/submit") {
+          pending += 1;
+          if (pending >= 2) release();
+          await bothPlanned;
+        }
+        return null;
+      }
+    });
+    const [ra, rb] = await Promise.all([
+      addTurn(gateway, gatewayEnv, ctx, "concurrent-a", "alpha"),
+      addTurn(gateway, gatewayEnv, ctx, "concurrent-b", "beta")
+    ]);
+    expect(ra.reply.status, `A trace=${JSON.stringify(ra.trace)}`).toBe("accepted");
+    expect(rb.reply.status, `B trace=${JSON.stringify(rb.trace)}`).toBe("accepted");
+    // Authority proof: the root's children carry DISTINCT ranks (no collision).
+    const roomDO = scopeDOs.get(roomScope)!;
+    const roots = await call<{ rows: Array<{ child: string; rank: string }> }>(
+      roomDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { parent: null }
+    );
+    const ranks = roots.rows.map((r) => r.rank);
+    expect(roots.rows.length, "both inserts committed").toBeGreaterThanOrEqual(2);
+    expect(new Set(ranks).size, `duplicate ranks: ${JSON.stringify(roots.rows)}`).toBe(ranks.length);
+  });
+
   it("P1.2: net eject_item detaches + re-homes children after projection repair (miss not swallowed)", async () => {
     // eject_item(p) -> recycle(p) -> $outline_item:recycle
     //   `try { here:_detach_item(this,...) } except err {}`, and the substrate's

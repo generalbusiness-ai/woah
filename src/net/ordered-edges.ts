@@ -49,7 +49,7 @@
  * roster is. The only edge cell a mutation touches is the ONE it writes.
  */
 import { ORDERED_EDGE_PROP, type OrderedChildRow, type OrderedEdgeValue } from "../core/ordered-edge";
-import { cellKey, type Cell } from "./cells";
+import { cellKey, cellVersion, type Cell } from "./cells";
 
 export { ORDERED_EDGE_PROP, type OrderedChildRow, type OrderedEdgeValue };
 
@@ -97,4 +97,18 @@ export function orderedChildrenRows(cells: Iterable<Cell>, parent: string | null
   }
   rows.sort((a, b) => (a.rank < b.rank ? -1 : a.rank > b.rank ? 1 : a.child < b.child ? -1 : a.child > b.child ? 1 : 0));
   return rows;
+}
+
+/**
+ * A content version of a parent's ordered children — the content address of
+ * the sorted rows (P1.1). A mutation attests the version it read; the owning
+ * scope re-derives the version from its CURRENT edge cells at submit and
+ * rejects a stale plan (read_version_mismatch). This is what makes concurrent
+ * inserts into the SAME parent serialize: the ordering is a read the transcript
+ * carries, so a same-parent insert that lands between plan and submit
+ * invalidates the neighbour read that produced the rank. A change under a
+ * DIFFERENT parent does not touch these rows, so it does not conflict.
+ */
+export function orderedChildrenVersion(rows: readonly OrderedChildRow[]): string {
+  return cellVersion(rows as unknown[]);
 }

@@ -143,6 +143,11 @@ function sqlRows<T>(cursor: unknown): T[] {
 
 type ScopeRow = { seen_seq: number };
 
+/** One owner-computed ordered-children projection the gateway fetched for a
+ * turn: the bounded rows plus the authority `version` (content address) the
+ * plan attests so a concurrent same-parent insert makes the submit stale (P1.1). */
+type OrderedChildrenProjection = { rows: readonly Record<string, unknown>[]; version: string };
+
 /** CO10: the ratified repair budget for one /net/turn. */
 export const REPAIR_BUDGET_MS = 12_000;
 
@@ -1120,7 +1125,7 @@ export class NetGatewayDO {
     // + new parent). The map only grows and is threaded into every re-plan, so
     // a fetched projection is STICKY: the same parent never re-misses, and a
     // turn reading several parents converges one repair round per new parent.
-    const orderedChildrenByParent = new Map<string | null, readonly Record<string, unknown>[]>();
+    const orderedChildrenByParent = new Map<string | null, OrderedChildrenProjection>();
 
     for (let attempt = 1; attempt <= MAX_TURN_ATTEMPTS; attempt += 1) {
       // The budget bounds rounds two onward; the first attempt always
@@ -1140,7 +1145,7 @@ export class NetGatewayDO {
       // reads. Idempotent: skipped once the target is already in the map.
       await this.seedTargetOrderedChildren(request, view, classifier, structure, orderedChildrenByParent);
       const planningOrderedChildren = orderedChildrenByParent.size > 0
-        ? [...orderedChildrenByParent.entries()].map(([parent, rows]) => ({ parent, rows }))
+        ? [...orderedChildrenByParent.entries()].map(([parent, projection]) => ({ parent, rows: projection.rows, version: projection.version }))
         : undefined;
 
       // ---- Plan (or adopt the stale_head resubmit).
@@ -1181,9 +1186,9 @@ export class NetGatewayDO {
                 // missed it — non-convergent (a planner/catalog bug), surfaced
                 // as E_NONCONVERGENT_READ rather than grinding to E_BUDGET.
                 if (orderedChildrenByParent.has(parent)) continue;
-                const rows = await this.tryRecovery(trace, () => this.fetchOrderedChildren(request, classifier, structure, parent));
-                if (rows === undefined) continue; // fetch failed; recovery_error recorded
-                orderedChildrenByParent.set(parent, rows);
+                const projection = await this.tryRecovery(trace, () => this.fetchOrderedChildren(request, classifier, structure, parent));
+                if (projection === undefined) continue; // fetch failed; recovery_error recorded
+                orderedChildrenByParent.set(parent, projection);
                 progressed = true;
               }
               if (!progressed) {
@@ -1392,6 +1397,17 @@ export class NetGatewayDO {
         }
         case "read_version_mismatch":
         case "post_state_mismatch": {
+          // P1.1: an ordered-children ordering conflict — a concurrent
+          // same-parent insert moved the ordering the plan attested. Drop the
+          // named parents' cached projections so the next attempt re-fetches
+          // the CURRENT ordering (and recomputes a distinct rank), then re-plan.
+          const orderingConflicts = Array.isArray((reply.detail as { ordering_conflicts?: unknown } | undefined)?.ordering_conflicts)
+            ? ((reply.detail as { ordering_conflicts: (string | null)[] }).ordering_conflicts)
+            : [];
+          if (orderingConflicts.length > 0) {
+            for (const parent of orderingConflicts) orderedChildrenByParent.delete(parent);
+            break; // re-plan next round with the refreshed ordering
+          }
           // Refresh exactly the named cells (or, for a post_state
           // disagreement naming nothing, reseed the scope's closure)
           // and re-plan.
@@ -3497,17 +3513,19 @@ export class NetGatewayDO {
     classifier: ScopeClassifier,
     structure: TurnStructure,
     parent: string | null
-  ): Promise<readonly Record<string, unknown>[]> {
+  ): Promise<OrderedChildrenProjection> {
     const scope = classifier.scopeOf(typeof parent === "string" ? parent : request.call.target);
     const response = await structure.rpc(() => this.host.rpc(
       this.destinationFor(request, scope),
       "/ordered-children",
       { parent }
-    ), { phase: "ordered_children" }) as { parent?: unknown; rows?: unknown };
+    ), { phase: "ordered_children" }) as { parent?: unknown; rows?: unknown; version?: unknown };
     if (response.parent !== parent || !Array.isArray(response.rows)) {
       throw new Error(`ordered-children authority returned malformed projection for ${parent ?? "<root>"}`);
     }
-    return response.rows as Record<string, unknown>[];
+    // The authority's content version of the ordering (P1.1): the plan attests
+    // it so a concurrent same-parent insert makes the submit stale.
+    return { rows: response.rows as Record<string, unknown>[], version: typeof response.version === "string" ? response.version : "" };
   }
 
   /** Seed the call target's ordering into the per-turn projection map, once,
@@ -3520,7 +3538,7 @@ export class NetGatewayDO {
     view: CellStore,
     classifier: ScopeClassifier,
     structure: TurnStructure,
-    accumulated: Map<string | null, readonly Record<string, unknown>[]>
+    accumulated: Map<string | null, OrderedChildrenProjection>
   ): Promise<void> {
     const target = request.call.target;
     if (accumulated.has(target) || !this.callReadsOrderedChildren(view, request.call)) return;
@@ -3945,7 +3963,7 @@ export class NetGatewayDO {
     objectCounter?: number,
     planningRoomRoster?: { room: string; rows: readonly RoomRosterRow[] },
     seedObjects?: ReadonlySet<string>,
-    planningOrderedChildren?: readonly { parent: string | null; rows: readonly Record<string, unknown>[] }[]
+    planningOrderedChildren?: readonly { parent: string | null; rows: readonly Record<string, unknown>[]; version: string }[]
   ): Promise<PlanTurnResult> {
     return planTurn({
       call: request.call,

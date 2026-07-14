@@ -146,7 +146,7 @@ describe("owner-computed ordered-children projection in planning", () => {
       base: seq.head(),
       idempotencyKey: "oc-120",
       stamp: seq.stamp(),
-      planningOrderedChildren: [{ parent: "the_list", rows }]
+      planningOrderedChildren: [{ parent: "the_list", rows, version: "v0" }]
     });
 
     // The verb returned the full ordered projection...

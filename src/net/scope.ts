@@ -27,6 +27,7 @@ import { CellStore, type Cell, type EpochStamp } from "./cells";
 import { netError } from "./errors";
 import { validateSessionCell } from "./sessions";
 import { applyRelationDeltas, deriveRelationDeltas, rebuildContentsRelation, relationKey, type RelationDelta, type RelationRow } from "./relations";
+import { orderedChildrenRows, orderedChildrenVersion } from "./ordered-edges";
 import type { ScopeStore, TailEntry } from "./scope-store";
 import { applyTranscript, netCellKeyFor, type EffectTranscript, type TranscriptCell } from "./transcript";
 import { cellKey, cellVersion } from "./cells";
@@ -464,6 +465,27 @@ export class ScopeSequencer {
     }
     if (mismatched.size > 0) {
       return this.reject(submit, "read_version_mismatch", {}, [...mismatched.values()]);
+    }
+
+    // Step 7b (P1.1): validate ordered-children projection reads. Each names a
+    // parent and the authority content `version` the plan read; re-derive the
+    // ordering from THIS scope's current edge cells and reject if it moved.
+    // This is what serializes concurrent same-parent inserts — the ordering is
+    // a read the transcript carries, so a same-parent insert that landed
+    // between plan and submit invalidates the neighbour read behind the rank.
+    // Skipped for foreign-owned reads (a cross-scope ordering is that scope's
+    // to attest; this authority only re-derives what it owns).
+    const orderingConflicts: (string | null)[] = [];
+    for (const read of submit.transcript.orderingReads ?? []) {
+      const owned = read.parent === null || !this.options.owns || this.options.owns(read.parent);
+      if (!owned) continue;
+      const current = orderedChildrenVersion(orderedChildrenRows(this.store.allCells(), read.parent));
+      if (current !== read.version) orderingConflicts.push(read.parent);
+    }
+    if (orderingConflicts.length > 0) {
+      // Retryable: the gateway re-fetches the named parents' projections and
+      // re-plans (the recomputed rank then reflects the concurrent insert).
+      return this.reject(submit, "read_version_mismatch", { ordering_conflicts: orderingConflicts });
     }
 
     // Step 9: per-write authority (recorded VM frame, never owner union).
