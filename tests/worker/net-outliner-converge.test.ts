@@ -55,7 +55,26 @@ type TurnBody = {
   trace: AttemptTraceEntry[];
   envelopeBytes?: number;
   result?: unknown;
+  observations?: Array<Record<string, unknown>>;
 };
+
+/** Drive any verb over the gateway (eject/undo/list_items etc.). */
+function verbTurn(
+  gateway: NetGatewayDO,
+  gatewayEnv: NetGatewayEnv,
+  ctx: { theOutline: string; roomScope: string; epoch: string; session: { id: string }; actor: string },
+  key: string,
+  verb: string,
+  args: unknown[]
+): Promise<TurnBody> {
+  return call<TurnBody>(gateway, gatewayEnv, "/turn", {
+    call: {
+      kind: "woo.turn_call.shadow.v1", id: key, route: "direct", scope: ctx.roomScope,
+      session: ctx.session.id, actor: ctx.actor, target: ctx.theOutline, verb, args
+    },
+    planningScope: ctx.roomScope, catalog_epoch: ctx.epoch, idempotency_key: key
+  });
+}
 
 // The warm-envelope ceiling the planner enforces (plan.ts
 // WARM_ENVELOPE_BYTE_LIMIT). Mirrored here for the scale gate's assertion.
@@ -92,7 +111,7 @@ async function mountNet(
   world: WooWorld,
   epoch: string,
   opts: { pull?: (scope: string) => boolean; intercept?: Intercept } = {}
-): Promise<{ gateway: NetGatewayDO; gatewayEnv: NetGatewayEnv }> {
+): Promise<{ gateway: NetGatewayDO; gatewayEnv: NetGatewayEnv; scopeDOs: Map<string, NetScopeDO> }> {
   const partitions = partitionCells(cellsFromSerialized(world.exportWorld()));
   const scopeDOs = new Map<string, NetScopeDO>();
   const scopeEnv: NetScopeEnv = {
@@ -131,7 +150,7 @@ async function mountNet(
     if (opts.pull && !opts.pull(scope)) continue;
     await call(gateway, gatewayEnv, "/pull", { scope, destination: `scope:${scope}` });
   }
-  return { gateway, gatewayEnv };
+  return { gateway, gatewayEnv, scopeDOs };
 }
 
 function addTurn(
@@ -241,6 +260,94 @@ describe("outliner add over the net path converges", () => {
     // Bounded repair: seed the target ordering (1 fetch) then commit — a
     // per-sibling regression would need ~SIBLINGS rounds.
     expect(turn.attempt, `scale add took ${turn.attempt} attempts`).toBeLessThanOrEqual(3);
+  });
+
+  it("P1.2: net eject_item detaches + re-homes children after projection repair (miss not swallowed)", async () => {
+    // eject_item(p) -> recycle(p) -> $outline_item:recycle
+    //   `try { here:_detach_item(this,...) } except err {}`, and the substrate's
+    // invokeRecycleHandler ALSO catches handler errors. _detach reads
+    // ordered_children(p) + ordered_children(former_parent) — ABSENT in the
+    // sparse gateway plan. If the miss were catchable, both catches would
+    // swallow it, _detach would abort, and p's children would keep edges to the
+    // recycled p (orphaned / vanished from list_items). The uncatchable miss
+    // must instead escape to the gateway repair so the detach actually runs.
+    const { world, theOutline, session, actor, epoch } = await outlinerWorld();
+    const roomScope = `room:${theOutline}`;
+    const ctx = { theOutline, roomScope, epoch, session, actor };
+    // Build p at root with two children, in-memory via the real verbs.
+    const p = ((await world.directCall("seed-p", actor, theOutline, "add_item", ["parent", null, null], { sessionId: session.id })) as { result: string }).result;
+    const c1 = ((await world.directCall("seed-c1", actor, theOutline, "add_item", ["child one", p, null], { sessionId: session.id })) as { result: string }).result;
+    const c2 = ((await world.directCall("seed-c2", actor, theOutline, "add_item", ["child two", p, null], { sessionId: session.id })) as { result: string }).result;
+
+    // eject_item is outliner-owner-or-wizard; grant the actor wizard so the
+    // turn is permitted and exercises the pure recycle->_detach projection path
+    // (unlike remove_item, eject does NOT pre-capture the projections).
+    world.object(actor).flags.wizard = true;
+    const { gateway, gatewayEnv, scopeDOs } = await mountNet(world, epoch);
+    const eject = await verbTurn(gateway, gatewayEnv, ctx, "eject-p", "eject_item", [p]);
+    expect(eject.reply.status, `attempts=${eject.attempt} trace=${JSON.stringify(eject.trace)}`).toBe("accepted");
+    // The miss ESCAPED (not swallowed) → the gateway ran a repair round: > 1
+    // attempt. A swallowed miss commits trivially at attempt 1 with no detach.
+    expect(eject.attempt, `attempts=${eject.attempt}`).toBeGreaterThan(1);
+    // _detach ran to completion (after repair) — it re-homes children THEN
+    // emits outline_item_removed, all in one committed transcript. A swallowed
+    // miss aborts _detach before both.
+    const removed = (eject.observations ?? []).find((o) => o.type === "outline_item_removed" && o.item === p);
+    expect(removed, "eject must emit outline_item_removed (detach ran, not swallowed)").toBeTruthy();
+    expect(removed?.reparented_to ?? null).toBeNull(); // p was at root
+
+    // Concrete proof from the AUTHORITY: the room scope's ordered-children of
+    // root now includes c1/c2 (re-homed), each with a valid rank — NOT orphaned
+    // to the recycled p.
+    const roomDO = scopeDOs.get(`room:${theOutline}`)!;
+    const roots = await call<{ rows: Array<{ child: string; rank: string }> }>(
+      roomDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { parent: null }
+    );
+    const rootChildren = new Map(roots.rows.map((r) => [r.child, r.rank]));
+    expect(rootChildren.has(c1), "c1 re-homed to root in the authority").toBe(true);
+    expect(rootChildren.has(c2), "c2 re-homed to root in the authority").toBe(true);
+    expect((rootChildren.get(c1) ?? "").length).toBeGreaterThan(0);
+    // And they are no longer edged to the recycled parent p.
+    const underP = await call<{ rows: Array<{ child: string }> }>(
+      roomDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { parent: p }
+    );
+    expect(underP.rows.map((r) => r.child), "no orphaned edge to the recycled parent").not.toContain(c1);
+  });
+
+  it("P1.2: net undo of remove_item re-homes captured children under the restored node (miss not swallowed)", async () => {
+    // undo -> _restore_item, whose child restore is
+    //   `try { this:move_item(kid, item, kid_idx, true) } except err {}`.
+    // move_item reads ordered_children(kid's parent) + ordered_children(new
+    // item) — ABSENT in the sparse gateway plan. A catchable miss would be
+    // swallowed by the `except`, leaving the captured children at root instead
+    // of back under the restored node. The uncatchable miss must escape to the
+    // gateway repair so move_item actually runs.
+    const { world, theOutline, session, actor, epoch } = await outlinerWorld();
+    const roomScope = `room:${theOutline}`;
+    const ctx = { theOutline, roomScope, epoch, session, actor };
+    const p = ((await world.directCall("u-seed-p", actor, theOutline, "add_item", ["parent", null, null], { sessionId: session.id })) as { result: string }).result;
+    const c1 = ((await world.directCall("u-seed-c1", actor, theOutline, "add_item", ["child one", p, null], { sessionId: session.id })) as { result: string }).result;
+    // remove_item captures p + its direct children and re-homes them to root,
+    // and records the _restore_item inverse in the actor's undo slot (in-memory).
+    const rem = await world.directCall("u-remove", actor, theOutline, "remove_item", [p], { sessionId: session.id });
+    expect((rem as { op: string }).op).toBe("result");
+
+    const { gateway, gatewayEnv, scopeDOs } = await mountNet(world, epoch);
+    const undo = await verbTurn(gateway, gatewayEnv, ctx, "undo-restore", "undo", []);
+    expect(undo.reply.status, `attempts=${undo.attempt} trace=${JSON.stringify(undo.trace)}`).toBe("accepted");
+    expect(undo.attempt, `attempts=${undo.attempt}`).toBeGreaterThan(1); // repair happened
+    // _restore_item returns the restored node's (new) id via the undo result.
+    const restored = undo.result as string;
+    expect(typeof restored).toBe("string");
+
+    // Authority proof: the restored node's ordered children now include c1/c2 —
+    // move_item ran after repair (not swallowed, which would strand them at root).
+    const roomDO = scopeDOs.get(`room:${theOutline}`)!;
+    const kids = await call<{ rows: Array<{ child: string }> }>(
+      roomDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { parent: restored }
+    );
+    const kidIds = kids.rows.map((r) => r.child);
+    expect(kidIds, "captured child re-homed under the restored node").toContain(c1);
   });
 
   it("fails FAST and NAMED (E_NONCONVERGENT_READ, not E_BUDGET) when a read cannot converge", async () => {

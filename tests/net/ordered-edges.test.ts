@@ -193,6 +193,59 @@ describe("owner-computed ordered-children projection in planning", () => {
     });
   });
 
+  // P1.2 (reviewer repro): the projection-miss control signal MUST escape an
+  // ordinary woocode `except` — otherwise a verb like $outline_item:recycle
+  // (`try { here:_detach_item(...) } except err {}`) or _restore_item
+  // (`try { this:move_item(...) } except err {}`) SWALLOWS the miss, the
+  // transcript "succeeds", the gateway never repairs, and children keep edges
+  // to a recycled/moved node. The miss must be uncatchable like E_TICKS /
+  // E_NEED_STATE so it always reaches the gateway's repair path.
+  it("a projection miss is UNCATCHABLE by woocode except — it escapes to the gateway repair", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:oc-swallow");
+    world.createObject({ id: "the_list", name: "The List", parent: "$thing", owner: session.actor });
+    // The verb wraps the ordering read in a try/except that would otherwise
+    // swallow the miss and return a bogus success.
+    const installed = installVerb(
+      world,
+      "the_list",
+      "swallow_children",
+      `verb :swallow_children() rxd { try { return ordered_children(this); } except err { return "swallowed"; } }`,
+      null
+    );
+    expect(installed.ok).toBe(true);
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seq.seed(cellsFromSerialized(world.exportWorld()));
+
+    const planOnce = planTurn({
+      call: {
+        kind: "woo.turn_call.shadow.v1",
+        id: "oc-swallow",
+        route: "direct",
+        scope: SCOPE,
+        session: session.id,
+        actor: session.actor,
+        target: "the_list",
+        verb: "swallow_children",
+        args: []
+      },
+      view: derivedViewOf(seq.store),
+      planningScope: SCOPE,
+      classifier,
+      base: seq.head(),
+      idempotencyKey: "oc-swallow",
+      stamp: seq.stamp()
+    });
+
+    // The `except` must NOT swallow the miss: planTurn must still escape a
+    // repairable E_MISSING_STATE naming the parent, never resolve with the
+    // bogus "swallowed" result.
+    await expect(planOnce).rejects.toMatchObject({
+      code: "E_MISSING_STATE",
+      detail: { missing_ordered_children: ["the_list"] }
+    });
+  });
+
   it("errors terminally (no repair) for a genuinely malformed parent argument", async () => {
     // A non-ref argument is a verb bug, caught by the builtin's assertObj —
     // a terminal type error, NOT a repairable projection miss (so the gateway

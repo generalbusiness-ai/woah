@@ -54,6 +54,21 @@ import { redactSensitiveSerializedPropertyValues } from "./sensitive-serializati
 import { ORDERED_EDGE_PROP, type OrderedChildRow, type OrderedEdgeValue } from "./ordered-edge";
 
 export type NativeHandler = (ctx: CallContext, args: WooValue[]) => WooValue | Promise<WooValue>;
+
+/**
+ * Control signals that must propagate to the gateway repair path and NEVER be
+ * swallowed by an ordinary error catch (woocode `except` OR a native
+ * handler-invoke try/catch). The VM enforces the same set for `except`; native
+ * dispatch sites that catch handler errors (e.g. `invokeRecycleHandler`) must
+ * re-throw these first. E_NEED_STATE = missing authority cell; the
+ * ordered-children miss = missing owner projection (P1.2).
+ */
+function isUncatchableControlSignal(err: unknown): boolean {
+  if (isVmSuspendSignal(err) || isVmReadSignal(err)) return true;
+  const code = isErrorValue(err) ? err.code : undefined;
+  return code === "E_NEED_STATE" || code === "E_NEED_ORDERED_CHILDREN";
+}
+
 const GUEST_SESSION_GRACE_MS = 60_000;
 const GUEST_SESSION_TTL_MS = 5 * 60_000;
 const CREDENTIAL_SESSION_GRACE_MS = 5 * 60_000;
@@ -5161,6 +5176,14 @@ export class WooWorld {
       await this.dispatch(handlerCtx, objRef, "recycle", []);
     } catch (err) {
       if (isErrorValue(err) && err.code === "E_VERBNF") return;
+      // Control signals (sparse-planning state/projection misses, VM
+      // suspend/read) are NOT ordinary handler failures — they must escape to
+      // the gateway repair, not be swallowed into a $recycle_handler_error and
+      // let recycle proceed. Otherwise a recycle whose :recycle handler re-homes
+      // children via ordered_children (e.g. the outliner) would tombstone the
+      // node with its children still edged to it. Same discipline as the VM's
+      // uncatchable-signal rethrow (P1.2).
+      if (isUncatchableControlSignal(err)) throw err;
       const code = isErrorValue(err) ? err.code : "E_INTERNAL";
       const message = isErrorValue(err) ? err.message ?? "" : err instanceof Error ? err.message : String(err);
       const event: Observation = {

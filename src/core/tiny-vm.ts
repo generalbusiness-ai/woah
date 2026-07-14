@@ -760,7 +760,14 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
       if (isVmSuspendSignal(err)) throw err;
       if (isVmReadSignal(err)) throw err;
       const error = attachVmTrace(normalizeVmError(err), frames, currentPc);
-      if (error.code === "E_NEED_STATE") throw error;
+      // Control signals bypass woocode `except` and escape the VM (P1.2): a
+      // sparse-planning state miss must ALWAYS reach the gateway's repair path,
+      // never be swallowed by an ordinary catch. E_NEED_STATE is the missing-
+      // cell signal; E_NEED_ORDERED_CHILDREN is the missing owner-projection
+      // signal (a verb reads sibling order the planning world does not hold) —
+      // if woocode could catch it, a `try { ...detach... } except {}` would
+      // "succeed" with children still edged to a recycled/moved node.
+      if (error.code === "E_NEED_STATE" || error.code === "E_NEED_ORDERED_CHILDREN") throw error;
       if (!raise(error)) throw error;
     }
   }
