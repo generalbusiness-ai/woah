@@ -7,6 +7,7 @@ import {
   isRetryable,
   NET_ERROR_RECOVERY,
   netError,
+  nonconvergentRead,
   type NetErrorCode
 } from "../../src/net/errors";
 
@@ -19,6 +20,7 @@ const ALL_CODES: NetErrorCode[] = [
   "E_CATALOG_MUTATION",
   "E_LINEAGE",
   "E_BUDGET",
+  "E_NONCONVERGENT_READ",
   "E_RPC_TIMEOUT",
   "E_SEED_LAG",
   "E_EPOCH_MISMATCH",
@@ -41,6 +43,9 @@ describe("net divergence taxonomy (CO6)", () => {
     expect(isRetryable(netError("E_SCOPE_SPLIT", "x"))).toBe(false);
     expect(isRetryable(netError("E_CATALOG_MUTATION", "x"))).toBe(false);
     expect(isRetryable(netError("E_BUDGET", "x"))).toBe(false);
+    // A read that cannot converge is a planner/catalog bug, not a turn
+    // mechanic — terminal, so it surfaces named instead of retrying forever.
+    expect(isRetryable(netError("E_NONCONVERGENT_READ", "x"))).toBe(false);
     expect(isRetryable(netError("E_RPC_TIMEOUT", "x"))).toBe(false);
     expect(isRetryable(netError("E_LINEAGE", "x"))).toBe(false);
     expect(isRetryable(netError("E_SEED_LAG", "x"))).toBe(false);
@@ -68,5 +73,15 @@ describe("net divergence taxonomy (CO6)", () => {
     expect(err.attempts).toHaveLength(2);
     expect(err.attempts?.[0].code).toBe("E_MISSING_STATE");
     expect(err.attempts?.[1].attempt).toBe(2);
+  });
+
+  it("E_NONCONVERGENT_READ carries the trace and names the stuck cell", () => {
+    const err = nonconvergentRead("read cannot converge", [
+      { attempt: 1, code: "E_READ_VERSION", missing: ["property_cell:the_outline:position"], elapsed_ms: 15 },
+      { attempt: 2, code: "E_READ_VERSION", missing: ["property_cell:the_outline:position"], elapsed_ms: 31 }
+    ], { stuck: [{ key: "property_cell:the_outline:position", authority_version: "v1", planned_version: "absent" }] });
+    expect(err.code).toBe("E_NONCONVERGENT_READ");
+    expect(err.attempts).toHaveLength(2);
+    expect((err.detail.stuck as Array<{ key: string }>)[0].key).toBe("property_cell:the_outline:position");
   });
 });

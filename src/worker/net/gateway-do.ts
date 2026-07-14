@@ -58,7 +58,7 @@
  */
 import { CellStore, cellKey, makeCell, type Cell } from "../../net/cells";
 import { clampClientSessionTtl } from "../../net/client-session-policy";
-import { budgetExhausted, isNetError, netError, NetError, type AttemptTraceEntry, type NetErrorCode } from "../../net/errors";
+import { budgetExhausted, isNetError, netError, nonconvergentRead, NetError, type AttemptTraceEntry, type NetErrorCode } from "../../net/errors";
 import { applyFanout, type FanoutBody } from "../../net/outbox";
 import { observationsForRelationOwners, relationKey, type RelationDelta, type RelationRow, type RoomRosterRow } from "../../net/relations";
 import { mintSessionSubmit, sessionCellKey, validateSessionCell } from "../../net/sessions";
@@ -1104,6 +1104,15 @@ export class NetGatewayDO {
     // and re-default the same read — the fix for the two-level-retry
     // oscillation that grinds a sibling-property mismatch to E_BUDGET.
     const repairedObjects = new Set<string>();
+    // By-construction non-convergence detector: per turn, the authority
+    // version we last REFRESHED each mismatched key to. If a key mismatches
+    // again AFTER a refresh to the SAME authority version, refreshing cannot
+    // help — the plan records that read at a version the authority will
+    // never hold (a planner/catalog bug). We surface E_NONCONVERGENT_READ
+    // naming the key instead of grinding to an opaque E_BUDGET. Genuine
+    // contention moves the authority version every round, so a contended key
+    // never satisfies the "same version twice" condition and keeps repairing.
+    const refreshedTo = new Map<string, string>();
 
     for (let attempt = 1; attempt <= MAX_TURN_ATTEMPTS; attempt += 1) {
       // The budget bounds rounds two onward; the first attempt always
@@ -1337,11 +1346,41 @@ export class NetGatewayDO {
           // Refresh exactly the named cells (or, for a post_state
           // disagreement naming nothing, reseed the scope's closure)
           // and re-plan.
-          await this.tryRecovery(trace, async () => {
+          const recovered = await this.tryRecovery(trace, async () => {
             if (mismatchKeys.length > 0) await this.refreshCells(request, classifier, view, mismatchKeys, structure);
             else await this.reseedFromScope(view, destination, undefined, structure);
+            return true;
           });
           for (const key of mismatchKeys) repairedObjects.add(objectOfCellKey(key));
+          // Non-convergence detector (see refreshedTo above). Only when the
+          // refresh SUCCEEDED: a key we ALREADY refreshed to this exact
+          // authority version — and that mismatched AGAIN — can never
+          // converge, so fail fast and named. A FAILED recovery (e.g. a
+          // downed closure lane) leaves the view unchanged, so "same version
+          // twice" would misclassify a recovery outage as a planner bug —
+          // that must stay on the E_BUDGET path (recovery_error explains it).
+          if (recovered) {
+            const stuck = mismatchKeys
+              .map((key) => {
+                const authorityVersion = view.get(key)?.version ?? "absent";
+                if (refreshedTo.get(key) === authorityVersion) {
+                  const plannedRead = submit.transcript.reads.find((read) => netCellKeyFor(read.cell) === key);
+                  return { key, authority_version: authorityVersion, planned_version: String(plannedRead?.version ?? "absent") };
+                }
+                // First refresh to this authority version (or the version
+                // moved — contention): record and keep repairing.
+                refreshedTo.set(key, authorityVersion);
+                return null;
+              })
+              .filter((entry): entry is { key: string; authority_version: string; planned_version: string } => entry !== null);
+            if (stuck.length > 0) {
+              throw nonconvergentRead(
+                "a recorded read cannot converge: refreshed to a stable authority version twice but the plan re-recorded a mismatching version",
+                trace,
+                { stuck, scope: targetScope }
+              );
+            }
+          }
           break;
         }
         case "stale_epoch": {
