@@ -115,7 +115,12 @@ const LANE_ONLY_VARS = new Set([
 ]);
 const PROD_ONLY_VARS = new Set([
   // Analytics Engine dataset name; the lanes strip the AE binding entirely.
-  "WOO_AE_DATASET"
+  "WOO_AE_DATASET",
+  // NC6 public-selection flag: prod serves the net stack. The smoke and
+  // cf-e2e lanes deliberately exercise the v2 cross-actor walkthrough, so
+  // they must NOT default to net — enabling it in a lane would route that
+  // walkthrough to /net-api and break it. Prod-only by design.
+  "WOO_NET_DEFAULT"
 ]);
 
 function wooVars(text) {
