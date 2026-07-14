@@ -21,6 +21,15 @@ enabled = true
 head_sampling_rate = 1.0
 
 [vars]
+# Net cutover (spec/operations/net-cutover.md §NC6): public selection of the
+# coherence (net) stack. Parsed explicitly — only "1", "true", or "on" enable
+# net; "0"/"false"/empty/absent select v2. Enabling it makes GET /client-config
+# answer {net:true} and maps public POST /mcp to /net-api/mcp, while the v2
+# /v2/*, /connect, and REST contracts remain frozen old-world endpoints. The
+# net namespace was installed and activated at epoch cat-1926a87fb31f4ea4 and
+# proven (guest mint + cross-shard complete roster) before this flip.
+WOO_NET_DEFAULT = "on"
+
 # Cloudflare deploys auto-install the bundled local catalogs listed here
 # at first-light bootstrap (empty storage). The list runs once and the
 # resulting bundle is persisted forever; flipping this variable on an
