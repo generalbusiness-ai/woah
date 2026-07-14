@@ -83,6 +83,23 @@ export type PlanTurnInput = {
    * view clone — byte-identical to the pre-slice path, so non-turn
    * callers (session mint, tests) are unaffected. */
   slicePlanning?: boolean;
+  /** Objects the gateway has already repaired earlier in THIS turn (a
+   * read-version-mismatch refresh or an E_MISSING_STATE pull). The
+   * two-level retry rebuilds the seed slice from scratch on every
+   * re-plan, so without this the slice would DROP the freshly-pulled
+   * cells and the VM would re-read the same instance property at its
+   * CLASS DEFAULT — stamping the read version "absent" and re-triggering
+   * the identical mismatch, oscillating to E_BUDGET. (The canonical
+   * trigger is a contents/sibling scan reading a sibling item's
+   * non-default `parent`/`position`: the object is surfaced by the
+   * contents projection but its own property cells were never seeded, so
+   * the default read looks valid and never escapes as a miss.) Seeding
+   * each repaired object's full view cell set makes the repair STICKY
+   * across re-plans so the turn converges. Bounded to the read-set that
+   * actually mismatched — never a whole-view or whole-room pull; a
+   * genuinely-default read never mismatches, never refreshes, and so
+   * never becomes sticky. */
+  seedObjects?: ReadonlySet<string>;
   /** Bounded owner-derived rows needed by catalog reads that are not ordinary
    * authority cells in this gateway's cache (currently room presence). They
    * exist only in the ephemeral planning snapshot and never become gateway
@@ -155,6 +172,22 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
         }
       }
     }
+    // Sticky repairs (see PlanTurnInput.seedObjects): every cell the live
+    // view holds for a previously-repaired object rides in the seed, so a
+    // re-plan reads the authority's real property values instead of
+    // re-defaulting them and re-triggering the same read-version mismatch.
+    let seededRepair = false;
+    for (const object of input.seedObjects ?? []) {
+      for (const cell of view.cellsForObject(object)) {
+        if (!seed.has(cell.key)) {
+          seed.add(cell.key);
+          seededRepair = true;
+        }
+      }
+    }
+    // A repaired cell may reference further objects (an item's parent, an
+    // undo record's target); close over them the same way a grown miss does.
+    if (seededRepair) expandObjRefs(seed, view);
   }
   // A mid-attempt view mutation can make an attempt retry without growing
   // the seed (the re-clone picks up the changed cells). Monotonic seed

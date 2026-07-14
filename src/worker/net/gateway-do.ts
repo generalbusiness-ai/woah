@@ -1098,6 +1098,12 @@ export class NetGatewayDO {
     // planned transcript is still valid — the next round submits it
     // against the fresh head instead of paying a re-plan.
     let resubmit: { planned: PlanTurnResult; base: ScopeHead } | null = null;
+    // Objects this turn's recovery rounds have pulled (read-version
+    // mismatch refresh or E_MISSING_STATE closure). They ride into every
+    // subsequent plan's seed slice so a re-plan does not drop the repair
+    // and re-default the same read — the fix for the two-level-retry
+    // oscillation that grinds a sibling-property mismatch to E_BUDGET.
+    const repairedObjects = new Set<string>();
 
     for (let attempt = 1; attempt <= MAX_TURN_ATTEMPTS; attempt += 1) {
       // The budget bounds rounds two onward; the first attempt always
@@ -1132,12 +1138,13 @@ export class NetGatewayDO {
         try {
           planningHead = await structure.rpc(() => this.scopeHead(this.destinationFor(request, request.planningScope)), { phase: "planning_head" });
           this.assertTurnEpoch(planningHead, request.catalog_epoch, request.planningScope, trace);
-          planned = await this.planOnce(request, view, classifier, planningHead.object_counter, planningRoomRoster);
+          planned = await this.planOnce(request, view, classifier, planningHead.object_counter, planningRoomRoster, repairedObjects);
         } catch (err) {
           if (isNetError(err) && err.code === "E_MISSING_STATE") {
             const missing = Array.isArray(err.detail.missing) ? (err.detail.missing as string[]) : [];
             trace.push({ attempt, code: "E_MISSING_STATE", missing, elapsed_ms: elapsed() });
             await this.tryRecovery(trace, () => this.refreshCells(request, classifier, view, missing, structure));
+            for (const key of missing) repairedObjects.add(objectOfCellKey(key));
             continue;
           }
           // Terminal NetError codes and plain Errors (misplan bugs,
@@ -1334,6 +1341,7 @@ export class NetGatewayDO {
             if (mismatchKeys.length > 0) await this.refreshCells(request, classifier, view, mismatchKeys, structure);
             else await this.reseedFromScope(view, destination, undefined, structure);
           });
+          for (const key of mismatchKeys) repairedObjects.add(objectOfCellKey(key));
           break;
         }
         case "stale_epoch": {
@@ -3793,7 +3801,8 @@ export class NetGatewayDO {
     view: CellStore,
     classifier: ScopeClassifier,
     objectCounter?: number,
-    planningRoomRoster?: { room: string; rows: readonly RoomRosterRow[] }
+    planningRoomRoster?: { room: string; rows: readonly RoomRosterRow[] },
+    seedObjects?: ReadonlySet<string>
   ): Promise<PlanTurnResult> {
     return planTurn({
       call: request.call,
@@ -3803,6 +3812,9 @@ export class NetGatewayDO {
       base: { seq: 0, hash: "provisional" },
       idempotencyKey: request.idempotency_key,
       stamp: { scope_head: "gateway", catalog_epoch: request.catalog_epoch },
+      // Repaired objects ride into the seed slice so a re-plan keeps the
+      // cells a prior round pulled (see PlanTurnInput.seedObjects).
+      ...(seedObjects && seedObjects.size > 0 ? { seedObjects } : {}),
       // The callback form runs over the settled plan SLICE, not the whole
       // view — with slicePlanning below this keeps the entire warm turn
       // (snapshot clone, scratch, closure, catalog classification) at
