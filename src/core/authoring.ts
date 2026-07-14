@@ -933,6 +933,7 @@ const VALID_BUILTINS = new Set([
   "active_actors",
   "room_roster",
   "ordered_children",
+  "ordered_neighbors",
   "rank_between",
   "session_metadata",
   "visible_contents",

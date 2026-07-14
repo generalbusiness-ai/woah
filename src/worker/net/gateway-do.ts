@@ -63,6 +63,7 @@ import { applyFanout, type FanoutBody } from "../../net/outbox";
 import { observationsForRelationOwners, relationKey, type RelationDelta, type RelationRow, type RoomRosterRow } from "../../net/relations";
 import { mintSessionSubmit, sessionCellKey, validateSessionCell } from "../../net/sessions";
 import { sessionIdWithShardHint, ticketIdWithShardHint } from "../../net/session-id";
+import { orderedNeighborsQueryKey, type OrderedNeighborsQuery } from "../../net/ordered-edges";
 import { planTurn, type PlanTurnInput, type PlanTurnResult } from "../../net/plan";
 import type { ScopeClassifier } from "../../net/route";
 import { CATALOG_SCOPE, classifierFromLineage, isEpochImmutableDefinition, type AnchorLineage } from "../../net/topology";
@@ -147,6 +148,12 @@ type ScopeRow = { seen_seq: number };
  * turn: the bounded rows plus the authority `version` (content address) the
  * plan attests so a concurrent same-parent insert makes the submit stale (P1.1). */
 type OrderedChildrenProjection = { rows: readonly Record<string, unknown>[]; version: string };
+
+/** One owner-answered bounded neighbour query (P2.4): the O(1)
+ * {count, index, before, after, child_index} answer plus the same authority
+ * ordering `version` a full projection carries, so the attestation is
+ * identical — only the payload shrinks from O(width) to constant. */
+type OrderedNeighborsProjection = { query: OrderedNeighborsQuery; value: Record<string, unknown>; version: string };
 
 /** CO10: the ratified repair budget for one /net/turn. */
 export const REPAIR_BUDGET_MS = 12_000;
@@ -1126,6 +1133,12 @@ export class NetGatewayDO {
     // a fetched projection is STICKY: the same parent never re-misses, and a
     // turn reading several parents converges one repair round per new parent.
     const orderedChildrenByParent = new Map<string | null, OrderedChildrenProjection>();
+    // Bounded neighbour answers fetched this turn (P2.4), keyed by the
+    // canonical query key. Same lifecycle as the map above: grown by the
+    // ordered-neighbours repair path, threaded into every re-plan (sticky),
+    // and purged per-parent on an ordering conflict so the next attempt
+    // re-fetches the CURRENT slot answer.
+    const orderedNeighborsByKey = new Map<string, OrderedNeighborsProjection>();
 
     for (let attempt = 1; attempt <= MAX_TURN_ATTEMPTS; attempt += 1) {
       // The budget bounds rounds two onward; the first attempt always
@@ -1147,6 +1160,9 @@ export class NetGatewayDO {
       const planningOrderedChildren = orderedChildrenByParent.size > 0
         ? [...orderedChildrenByParent.entries()].map(([parent, projection]) => ({ parent, rows: projection.rows, version: projection.version }))
         : undefined;
+      const planningOrderedNeighbors = orderedNeighborsByKey.size > 0
+        ? [...orderedNeighborsByKey.values()]
+        : undefined;
 
       // ---- Plan (or adopt the stale_head resubmit).
       let planned: PlanTurnResult;
@@ -1167,7 +1183,7 @@ export class NetGatewayDO {
         try {
           planningHead = await structure.rpc(() => this.scopeHead(this.destinationFor(request, request.planningScope)), { phase: "planning_head" });
           this.assertTurnEpoch(planningHead, request.catalog_epoch, request.planningScope, trace);
-          planned = await this.planOnce(request, view, classifier, planningHead.object_counter, planningRoomRoster, repairedObjects, planningOrderedChildren);
+          planned = await this.planOnce(request, view, classifier, planningHead.object_counter, planningRoomRoster, repairedObjects, planningOrderedChildren, planningOrderedNeighbors);
         } catch (err) {
           if (isNetError(err) && err.code === "E_MISSING_STATE") {
             // Ordered-children projection miss: fetch the named parent(s)'
@@ -1200,6 +1216,36 @@ export class NetGatewayDO {
                   "ordered-children projection unrecoverable (already resident or fetch failed)",
                   trace,
                   { missing_ordered_children: missingOrdered }
+                );
+              }
+              continue;
+            }
+            // Ordered-neighbours miss (P2.4): answer the named bounded
+            // query with ONE O(1) authority fetch and re-plan. Handled
+            // before the cell path for the same reason as above — its
+            // detail carries `missing_ordered_neighbors`, not `missing`.
+            const missingNeighbors = Array.isArray(err.detail.missing_ordered_neighbors)
+              ? (err.detail.missing_ordered_neighbors as OrderedNeighborsQuery[])
+              : [];
+            if (missingNeighbors.length > 0) {
+              trace.push({ attempt, code: "E_MISSING_STATE", missing: missingNeighbors.map((q) => `neighbors:${q.parent ?? "<root>"}`), elapsed_ms: elapsed() });
+              let progressed = false;
+              for (const query of missingNeighbors) {
+                // Anti-loop: an already-answered query must not re-fetch. If
+                // EVERY named query is already resident, the re-plan still
+                // missed it — non-convergent (a planner/catalog bug).
+                const key = orderedNeighborsQueryKey(query);
+                if (orderedNeighborsByKey.has(key)) continue;
+                const projection = await this.tryRecovery(trace, () => this.fetchOrderedNeighbors(request, classifier, structure, query));
+                if (projection === undefined) continue; // fetch failed; recovery_error recorded
+                orderedNeighborsByKey.set(key, projection);
+                progressed = true;
+              }
+              if (!progressed) {
+                throw nonconvergentRead(
+                  "ordered-neighbours answer unrecoverable (already resident or fetch failed)",
+                  trace,
+                  { missing_ordered_neighbors: missingNeighbors }
                 );
               }
               continue;
@@ -1405,7 +1451,15 @@ export class NetGatewayDO {
             ? ((reply.detail as { ordering_conflicts: (string | null)[] }).ordering_conflicts)
             : [];
           if (orderingConflicts.length > 0) {
-            for (const parent of orderingConflicts) orderedChildrenByParent.delete(parent);
+            for (const parent of orderingConflicts) {
+              orderedChildrenByParent.delete(parent);
+              // Neighbour answers derive from the same per-parent ordering:
+              // drop every cached query under a conflicted parent too, or a
+              // re-plan would re-attest the stale version forever.
+              for (const [key, cached] of orderedNeighborsByKey) {
+                if (cached.query.parent === parent) orderedNeighborsByKey.delete(key);
+              }
+            }
             break; // re-plan next round with the refreshed ordering
           }
           // Refresh exactly the named cells (or, for a post_state
@@ -3528,6 +3582,40 @@ export class NetGatewayDO {
     return { rows: response.rows as Record<string, unknown>[], version: typeof response.version === "string" ? response.version : "" };
   }
 
+  /** Answer ONE bounded neighbour query at the parent's scope authority
+   * (P2.4). The response is constant-size — two ranks, a count, and the
+   * ordering's content version — so repairing a mutation's slot read under a
+   * 10k-child parent costs the same bytes as under an empty one. Scope
+   * resolution matches `fetchOrderedChildren`: a null parent (the ordering
+   * roots) is owned by the call target's scope. */
+  private async fetchOrderedNeighbors(
+    request: TurnRequest,
+    classifier: ScopeClassifier,
+    structure: TurnStructure,
+    query: OrderedNeighborsQuery
+  ): Promise<OrderedNeighborsProjection> {
+    const scope = classifier.scopeOf(typeof query.parent === "string" ? query.parent : request.call.target);
+    const response = await structure.rpc(() => this.host.rpc(
+      this.destinationFor(request, scope),
+      "/ordered-neighbors",
+      { parent: query.parent, index: query.index, exclude: query.exclude, child: query.child }
+    ), { phase: "ordered_neighbors" }) as { parent?: unknown; count?: unknown; index?: unknown; before?: unknown; after?: unknown; child_index?: unknown; version?: unknown };
+    if (response.parent !== query.parent || typeof response.count !== "number" || typeof response.index !== "number") {
+      throw new Error(`ordered-neighbours authority returned a malformed answer for ${query.parent ?? "<root>"}`);
+    }
+    return {
+      query,
+      value: {
+        count: response.count,
+        index: response.index,
+        before: typeof response.before === "string" ? response.before : null,
+        after: typeof response.after === "string" ? response.after : null,
+        child_index: typeof response.child_index === "number" ? response.child_index : null
+      },
+      version: typeof response.version === "string" ? response.version : ""
+    };
+  }
+
   /** Seed the call target's ordering into the per-turn projection map, once,
    * if the dispatched verb declares `reads_ordered_children`. This is the
    * bounded warm-path optimization: the common case (a verb whose parent IS
@@ -3963,7 +4051,8 @@ export class NetGatewayDO {
     objectCounter?: number,
     planningRoomRoster?: { room: string; rows: readonly RoomRosterRow[] },
     seedObjects?: ReadonlySet<string>,
-    planningOrderedChildren?: readonly { parent: string | null; rows: readonly Record<string, unknown>[]; version: string }[]
+    planningOrderedChildren?: readonly { parent: string | null; rows: readonly Record<string, unknown>[]; version: string }[],
+    planningOrderedNeighbors?: readonly OrderedNeighborsProjection[]
   ): Promise<PlanTurnResult> {
     return planTurn({
       call: request.call,
@@ -3990,6 +4079,7 @@ export class NetGatewayDO {
       slicePlanning: true,
       ...(planningRoomRoster ? { planningRoomRoster } : {}),
       ...(planningOrderedChildren && planningOrderedChildren.length > 0 ? { planningOrderedChildren } : {}),
+      ...(planningOrderedNeighbors && planningOrderedNeighbors.length > 0 ? { planningOrderedNeighbors } : {}),
       // Creates over net (client-shell phase i): the planning-scope
       // authority's allocation floor, prefetched with its head, so a
       // planned create's id is fresh at the authority. A lane fixture's

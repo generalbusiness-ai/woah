@@ -17,6 +17,8 @@ import {
   ORDERED_EDGE_PROP,
   orderedChildrenRows,
   orderedEdgeCellKey,
+  orderedNeighborsFromRows,
+  orderedNeighborsQueryKey,
   readOrderedEdge
 } from "../../src/net/ordered-edges";
 import { planTurn, WARM_ENVELOPE_BYTE_LIMIT } from "../../src/net/plan";
@@ -358,5 +360,69 @@ describe("reads_ordered_children verb flag round-trip", () => {
     );
     expect(verbCell).toBeDefined();
     expect((verbCell!.value as { reads_ordered_children?: unknown }).reads_ordered_children).toBe(true);
+  });
+});
+
+describe("bounded neighbour answers (orderedNeighborsFromRows, P2.4)", () => {
+  // The one shared reduction both the authority endpoint and the local
+  // runtime run — they must clamp, exclude, and index identically or a
+  // repaired plan would disagree with the ordering version it attested.
+  const rows = [
+    { child: "a", rank: "V" },
+    { child: "b", rank: "hV" },
+    { child: "c", rank: "n" },
+    { child: "d", rank: "s" }
+  ];
+
+  it("answers an interior slot with the two bounding ranks + count", () => {
+    const q = orderedNeighborsFromRows(rows, { index: 2, exclude: null, child: null });
+    expect(q).toEqual({ count: 4, index: 2, before: "hV", after: "n", child_index: null });
+  });
+
+  it("treats index null as append (slot = count, after = null)", () => {
+    const q = orderedNeighborsFromRows(rows, { index: null, exclude: null, child: null });
+    expect(q).toEqual({ count: 4, index: 4, before: "s", after: null, child_index: null });
+  });
+
+  it("CLAMPS an out-of-range slot instead of erroring (range policy stays in the verb)", () => {
+    expect(orderedNeighborsFromRows(rows, { index: -3, exclude: null, child: null }).index).toBe(0);
+    expect(orderedNeighborsFromRows(rows, { index: 99, exclude: null, child: null })).toEqual(
+      { count: 4, index: 4, before: "s", after: null, child_index: null }
+    );
+    // Fractional indexes floor, matching the verbs' floor(idx).
+    expect(orderedNeighborsFromRows(rows, { index: 2.9, exclude: null, child: null }).index).toBe(2);
+  });
+
+  it("excludes one child from the neighbour computation (same-parent move)", () => {
+    // Excluding "b": filtered = [a, c, d]; slot 1 sits between a and c.
+    const q = orderedNeighborsFromRows(rows, { index: 1, exclude: "b", child: null });
+    expect(q).toEqual({ count: 3, index: 1, before: "V", after: "n", child_index: null });
+  });
+
+  it("reports the queried child's slot in the UNFILTERED ordering (the mutation's old index)", () => {
+    // exclude === child (the moving item): child_index still measures the
+    // pre-move ordering, so a verb's no-op check (idx == old_idx) works in
+    // the same coordinates the original full-list scan used.
+    const q = orderedNeighborsFromRows(rows, { index: 2, exclude: "c", child: "c" });
+    expect(q.child_index).toBe(2);
+    expect(q.count).toBe(3);
+    // Inserting c back at slot 2 of [a, b, d] = between b and d.
+    expect(q.before).toBe("hV");
+    expect(q.after).toBe("s");
+  });
+
+  it("answers an absent child with child_index null and an empty parent with nulls", () => {
+    expect(orderedNeighborsFromRows(rows, { index: 0, exclude: null, child: "zz" }).child_index).toBeNull();
+    expect(orderedNeighborsFromRows([], { index: null, exclude: null, child: null })).toEqual(
+      { count: 0, index: 0, before: null, after: null, child_index: null }
+    );
+  });
+
+  it("keys a query canonically (repair install and re-planned read agree)", () => {
+    const q = { parent: "p1", index: 3, exclude: "x", child: "x" };
+    expect(orderedNeighborsQueryKey(q)).toBe(orderedNeighborsQueryKey({ ...q }));
+    expect(orderedNeighborsQueryKey(q)).not.toBe(orderedNeighborsQueryKey({ ...q, index: null }));
+    expect(orderedNeighborsQueryKey({ parent: null, index: null, exclude: null, child: null }))
+      .not.toBe(orderedNeighborsQueryKey({ parent: "null", index: null, exclude: null, child: null }));
   });
 });

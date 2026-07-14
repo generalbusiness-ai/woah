@@ -48,10 +48,26 @@
  * `ordered_children` builtin + `planningOrderedChildren`), precisely as the
  * roster is. The only edge cell a mutation touches is the ONE it writes.
  */
-import { ORDERED_EDGE_PROP, type OrderedChildRow, type OrderedEdgeValue } from "../core/ordered-edge";
+import {
+  ORDERED_EDGE_PROP,
+  orderedNeighborsFromRows,
+  orderedNeighborsQueryKey,
+  type OrderedChildRow,
+  type OrderedEdgeValue,
+  type OrderedNeighborsQuery,
+  type OrderedNeighborsValue
+} from "../core/ordered-edge";
 import { cellKey, cellVersion, type Cell } from "./cells";
 
-export { ORDERED_EDGE_PROP, type OrderedChildRow, type OrderedEdgeValue };
+export {
+  ORDERED_EDGE_PROP,
+  orderedNeighborsFromRows,
+  orderedNeighborsQueryKey,
+  type OrderedChildRow,
+  type OrderedEdgeValue,
+  type OrderedNeighborsQuery,
+  type OrderedNeighborsValue
+};
 
 /** The cell key of a child's edge (the O(1) by-child index). */
 export function orderedEdgeCellKey(child: string): string {

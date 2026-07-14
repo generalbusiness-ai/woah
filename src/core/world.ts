@@ -51,7 +51,14 @@ import {
 } from "./turn-effects";
 import { readObjectPropertyValue } from "./property-read";
 import { redactSensitiveSerializedPropertyValues } from "./sensitive-serialization";
-import { ORDERED_EDGE_PROP, type OrderedChildRow, type OrderedEdgeValue } from "./ordered-edge";
+import {
+  ORDERED_EDGE_PROP,
+  orderedNeighborsFromRows,
+  orderedNeighborsQueryKey,
+  type OrderedChildRow,
+  type OrderedEdgeValue,
+  type OrderedNeighborsQuery
+} from "./ordered-edge";
 
 export type NativeHandler = (ctx: CallContext, args: WooValue[]) => WooValue | Promise<WooValue>;
 
@@ -66,7 +73,9 @@ export type NativeHandler = (ctx: CallContext, args: WooValue[]) => WooValue | P
 function isUncatchableControlSignal(err: unknown): boolean {
   if (isVmSuspendSignal(err) || isVmReadSignal(err)) return true;
   const code = isErrorValue(err) ? err.code : undefined;
-  return code === "E_NEED_STATE" || code === "E_NEED_ORDERED_CHILDREN";
+  // E_NEED_ORDERED_NEIGHBORS is the bounded-slot variant of the
+  // ordered-children miss (P2.4) — same repair path, same swallowing hazard.
+  return code === "E_NEED_STATE" || code === "E_NEED_ORDERED_CHILDREN" || code === "E_NEED_ORDERED_NEIGHBORS";
 }
 
 const GUEST_SESSION_GRACE_MS = 60_000;
@@ -634,9 +643,16 @@ export class WooWorld {
    * ephemeral planning world; keyed by the parent ref (null → the sentinel
    * below for ordering roots). */
   private readonly orderedChildrenProjections = new Map<string, WooValue[]>();
+  /** Owner-answered bounded neighbour queries (P2.4), keyed by the canonical
+   * query key. A mutation's slot read resolves here so a wide parent never
+   * pulls its full sibling list into planning; installed only in an
+   * ephemeral planning world, exactly like the full-ordering projections. */
+  private readonly orderedNeighborsProjections = new Map<string, WooValue>();
   // Net planning enables this so a sparse world FAILS LOUDLY rather than
   // deriving a partial ordering from whichever edge cells happened to
-  // materialize (mirror of requireRoomRosterProjection).
+  // materialize (mirror of requireRoomRosterProjection). Guards BOTH
+  // ordering reads: the full ordered_children projection and the bounded
+  // ordered_neighbors query.
   private requireOrderedChildrenProjection = false;
   /** Net planning commits recorder cells rather than this ephemeral graph.
    * Keep authoring recording opt-in so the frozen v2 materializer is unchanged. */
@@ -804,6 +820,57 @@ export class WooWorld {
     }
     rows.sort((a, b) => (a.rank < b.rank ? -1 : a.rank > b.rank ? 1 : a.child < b.child ? -1 : a.child > b.child ? 1 : 0));
     return rows as unknown as WooValue[];
+  }
+
+  installOrderedNeighborsProjection(query: OrderedNeighborsQuery, value: Record<string, unknown>): void {
+    this.orderedNeighborsProjections.set(
+      orderedNeighborsQueryKey(query),
+      cloneImportedPlainData(value) as WooValue
+    );
+  }
+
+  /** The bounded `{count, index, before, after, child_index}` answer for one
+   * mutation slot under `parent` (P2.4 — the O(1) alternative to reading the
+   * parent's full ordered children). Resolution order on a sparse net
+   * planning world:
+   *   1. the exact installed query answer (a prior repair round fetched it);
+   *   2. a resident FULL ordering for the parent (free ride — same authority
+   *      version, so the attestation is identical);
+   *   3. otherwise a repairable `E_NEED_ORDERED_NEIGHBORS` naming the full
+   *      query, which the gateway answers with ONE O(1) authority fetch
+   *      (POST /net/ordered-neighbors) — never the O(width) list.
+   * A complete local runtime computes the answer from its own edge scan via
+   * the shared `orderedNeighborsFromRows`, so both paths clamp and exclude
+   * identically. */
+  orderedNeighborsProjection(
+    parent: ObjRef | null,
+    query: Pick<OrderedNeighborsQuery, "index" | "exclude" | "child">,
+    container: ObjRef | null = null
+  ): WooValue {
+    const full: OrderedNeighborsQuery = { parent, index: query.index, exclude: query.exclude, child: query.child };
+    const installed = this.orderedNeighborsProjections.get(orderedNeighborsQueryKey(full));
+    if (installed !== undefined) return cloneImportedPlainData(installed);
+
+    const residentOrdering = this.orderedChildrenProjections.get(WooWorld.orderedChildrenKey(parent));
+    if (residentOrdering !== undefined) {
+      return orderedNeighborsFromRows(residentOrdering as unknown as OrderedChildRow[], query) as unknown as WooValue;
+    }
+
+    if (this.requireOrderedChildrenProjection) {
+      // The whole query rides in `value` so the planner/gateway can fetch
+      // exactly this answer. Distinct code so it routes through the
+      // ordered-neighbours repair path, not the cell-pull path.
+      throw wooError(
+        "E_NEED_ORDERED_NEIGHBORS",
+        `ordered-neighbours answer not resident for ${parent ?? "<root>"}`,
+        { parent, index: query.index, exclude: query.exclude, child: query.child }
+      );
+    }
+
+    // Local fallback: the same edge scan the full ordering uses, reduced by
+    // the shared helper so local and owner answers agree byte-for-byte.
+    const rows = this.orderedChildrenProjection(parent, container) as unknown as OrderedChildRow[];
+    return orderedNeighborsFromRows(rows, query) as unknown as WooValue;
   }
 
   // CA11.2: attach the planning world's per-cell provenance so the

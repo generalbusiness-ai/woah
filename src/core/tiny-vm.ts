@@ -195,7 +195,11 @@ export const BUILTIN_NAMES = [
   "ordered_children",
   // Fractional rank midpoint (src/core/fractional-rank). Appended last; keeps
   // ordered indices stable. Lets catalog code place an edge between neighbours.
-  "rank_between"
+  "rank_between",
+  // Bounded ordering slot query (P2.4): the O(1) {count, index, before,
+  // after, child_index} answer a MUTATION reads instead of the parent's full
+  // ordered_children list. Appended last to keep every bytecode index stable.
+  "ordered_neighbors"
 ];
 
 export async function runTinyVm(ctx: CallContext, bytecode: TinyBytecode, args: WooValue[]): Promise<WooValue> {
@@ -767,7 +771,9 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
       // signal (a verb reads sibling order the planning world does not hold) —
       // if woocode could catch it, a `try { ...detach... } except {}` would
       // "succeed" with children still edged to a recycled/moved node.
-      if (error.code === "E_NEED_STATE" || error.code === "E_NEED_ORDERED_CHILDREN") throw error;
+      // E_NEED_ORDERED_NEIGHBORS is the bounded-slot variant of the same
+      // miss (P2.4) and would be swallowed identically.
+      if (error.code === "E_NEED_STATE" || error.code === "E_NEED_ORDERED_CHILDREN" || error.code === "E_NEED_ORDERED_NEIGHBORS") throw error;
       if (!raise(error)) throw error;
     }
   }
@@ -1036,6 +1042,39 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         // ordering roots to THIS room — otherwise a multi-outliner world would
         // mix roots across outliners.
         return frame.ctx.world.orderedChildrenProjection(parent, frame.ctx.space) as unknown as WooValue;
+      }
+      case "ordered_neighbors": {
+        // Bounded ordering slot query (P2.4): ordered_neighbors(parent, query)
+        // where query is a map with optional `index` (0-based insertion slot;
+        // null/absent = append), `exclude` (drop one child from the neighbour
+        // computation — a same-parent move must not neighbour against itself)
+        // and `child` (report that child's current slot in the unfiltered
+        // ordering). Returns {count, index, before, after, child_index} — see
+        // world.orderedNeighborsProjection. A mutation reads THIS instead of
+        // the parent's full ordered_children list, so a wide parent never
+        // drags its sibling list into the turn.
+        if (builtinArgs.length !== 2) throw wooError("E_INVARG", "ordered_neighbors expects (parent, query)");
+        const parentArg = builtinArgs[0];
+        const parent = parentArg === null ? null : assertObj(parentArg);
+        const spec = builtinArgs[1];
+        if (spec !== null && (typeof spec !== "object" || Array.isArray(spec))) {
+          throw wooError("E_INVARG", "ordered_neighbors query must be a map (or null)", spec);
+        }
+        const specMap = (spec ?? {}) as Record<string, WooValue>;
+        const rawIndex = specMap.index ?? null;
+        if (rawIndex !== null && typeof rawIndex !== "number") {
+          throw wooError("E_INVARG", "ordered_neighbors query.index must be a number (or null)", rawIndex);
+        }
+        const rawExclude = specMap.exclude ?? null;
+        const rawChild = specMap.child ?? null;
+        const query = {
+          index: rawIndex,
+          exclude: rawExclude === null ? null : assertObj(rawExclude),
+          child: rawChild === null ? null : assertObj(rawChild)
+        };
+        // Same container scoping as ordered_children: the local fallback's
+        // whole-world scan must confine ordering roots to THIS room.
+        return frame.ctx.world.orderedNeighborsProjection(parent, query, frame.ctx.space) as unknown as WooValue;
       }
       // connected_players was a GLOBAL session enumeration (Big-World
       // violation) whose sole consumer, $player:who_all, is now presence-scoped

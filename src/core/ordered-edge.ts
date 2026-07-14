@@ -29,3 +29,68 @@ export type OrderedChildRow = {
   child: string;
   rank: string;
 };
+
+/** A bounded ordering query for ONE mutation slot (P2.4). All coordinates
+ * are 0-based insertion slots (`index` ∈ [0, count]); `index: null` means
+ * append. `exclude` drops one child from the neighbour computation (a
+ * same-parent move must not neighbour against itself); `child` asks for
+ * that child's current slot in the UNFILTERED ordering (the mutation's
+ * old position, for undo records and no-op checks). */
+export type OrderedNeighborsQuery = {
+  parent: string | null;
+  index: number | null;
+  exclude: string | null;
+  child: string | null;
+};
+
+/** The O(1) answer to an `OrderedNeighborsQuery`: the sibling count (after
+ * exclusion), the effective (clamped) insertion slot, the two ranks bounding
+ * that slot, and the queried child's current slot (or null when absent).
+ * Constant-size regardless of how wide the parent is — this is the whole
+ * point: a mutation reads THIS instead of the full sibling list. */
+export type OrderedNeighborsValue = {
+  count: number;
+  index: number;
+  before: string | null;
+  after: string | null;
+  child_index: number | null;
+};
+
+/** Canonical identity of a neighbours query — the key the sparse planning
+ * world and the gateway's per-turn projection cache agree on, so a repaired
+ * query is found again by the re-planned read that missed it. */
+export function orderedNeighborsQueryKey(query: OrderedNeighborsQuery): string {
+  return [
+    query.parent ?? "\0root",
+    query.index === null ? "append" : String(query.index),
+    query.exclude ?? "",
+    query.child ?? ""
+  ].join("\0");
+}
+
+/** Answer a neighbours query from a parent's full ordered rows. Pure and
+ * shared: the owning scope runs it against its authoritative edge index
+ * (the /net/ordered-neighbors endpoint), and a complete local runtime runs
+ * it against its own scan — both must clamp and exclude identically or a
+ * repaired plan would disagree with the authority it attested. The slot is
+ * clamped (never an error) so range POLICY stays in the calling verb, which
+ * validates its raw index against `count` before using the ranks. */
+export function orderedNeighborsFromRows(
+  rows: readonly OrderedChildRow[],
+  query: Pick<OrderedNeighborsQuery, "index" | "exclude" | "child">
+): OrderedNeighborsValue {
+  let child_index: number | null = null;
+  if (query.child !== null) {
+    const at = rows.findIndex((row) => row.child === query.child);
+    child_index = at >= 0 ? at : null;
+  }
+  const filtered = query.exclude !== null ? rows.filter((row) => row.child !== query.exclude) : rows;
+  const count = filtered.length;
+  let index = query.index === null ? count : Math.floor(query.index);
+  if (!Number.isFinite(index)) index = count;
+  if (index < 0) index = 0;
+  if (index > count) index = count;
+  const before = index > 0 ? filtered[index - 1].rank : null;
+  const after = index < count ? filtered[index].rank : null;
+  return { count, index, before, after, child_index };
+}

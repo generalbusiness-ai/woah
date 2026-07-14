@@ -34,6 +34,7 @@ import {
 } from "./bridge";
 import { CellStore, cellKey, cellVersion, serializeTransfer, type Cell, type EpochStamp } from "./cells";
 import { isNetError, netError, type NetError } from "./errors";
+import type { OrderedNeighborsQuery } from "./ordered-edges";
 import { selectCommitScope, type ScopeClassifier, type ScopeSelection } from "./route";
 import type { CommitSubmit, ScopeHead } from "./scope";
 import { sessionWriter } from "./sessions";
@@ -113,6 +114,13 @@ export type PlanTurnInput = {
    * reads. The ordering analogue of planningRoomRoster; keeps sibling order
    * off the O(N)-edge-cell read closure. */
   planningOrderedChildren?: readonly { parent: string | null; rows: readonly Record<string, unknown>[]; version: string }[];
+  /** Owner-answered bounded neighbour queries (P2.4), installed only in the
+   * ephemeral execution world for generic ordered_neighbors(parent, query)
+   * reads. Each carries the SAME authority ordering `version` a full
+   * projection would, so the attestation below serializes concurrent
+   * same-parent mutations identically — the answer is just O(1) instead of
+   * O(width). */
+  planningOrderedNeighbors?: readonly { query: OrderedNeighborsQuery; value: Record<string, unknown>; version: string }[];
 };
 
 export type PlanTurnResult = {
@@ -223,6 +231,9 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
         ...(input.planningRoomRoster ? { room_rosters: [input.planningRoomRoster] } : {}),
         ...(input.planningOrderedChildren && input.planningOrderedChildren.length > 0
           ? { ordered_children: [...input.planningOrderedChildren] }
+          : {}),
+        ...(input.planningOrderedNeighbors && input.planningOrderedNeighbors.length > 0
+          ? { ordered_neighbors: input.planningOrderedNeighbors.map((n) => ({ query: n.query, value: n.value })) }
           : {})
       });
     } catch (err) {
@@ -233,6 +244,8 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
       // normally RECORDED, handled just below the try; this covers the throw.
       const thrownOrdered = orderedChildrenMiss(err as { code?: unknown; value?: unknown } | null);
       if (thrownOrdered) throw orderedChildrenMissState(thrownOrdered);
+      const thrownNeighbors = orderedNeighborsMiss(err as { code?: unknown; value?: unknown } | null);
+      if (thrownNeighbors) throw orderedNeighborsMissState(thrownNeighbors);
       // A sparse miss vs the attempt's slice. Grow from the LIVE view and
       // re-run; if nothing is growable the cell is genuinely absent —
       // surface the miss against the VIEW so the gateway pulls exactly
@@ -259,6 +272,8 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
     // ordered-children repair, naming the parent(s) whose projection to fetch.
     const recordedOrdered = orderedChildrenMiss(attemptRun.transcript.error as { code?: unknown; value?: unknown } | undefined);
     if (recordedOrdered) throw orderedChildrenMissState(recordedOrdered);
+    const recordedNeighbors = orderedNeighborsMiss(attemptRun.transcript.error as { code?: unknown; value?: unknown } | undefined);
+    if (recordedNeighbors) throw orderedNeighborsMissState(recordedNeighbors);
     // CO2.6 second half: the engine RECORDS a dispatch miss in the
     // transcript rather than throwing. Same grow-or-escape vs the slice.
     const recordedVsAttempt = sparseMissFromRecordedError(attemptRun.transcript, attemptStore);
@@ -293,8 +308,17 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
   // one), so the committing scope serializes concurrent same-parent inserts by
   // re-validating each ordering version. A supplied-but-unread projection is a
   // stable empty target ordering, so attesting it is harmless.
-  if (input.planningOrderedChildren && input.planningOrderedChildren.length > 0) {
-    transcript.orderingReads = input.planningOrderedChildren.map((p) => ({ parent: p.parent, version: p.version }));
+  // Bounded neighbour answers attest the SAME (parent, version) pair a full
+  // projection would — the authority re-derives one ordering version per
+  // parent at submit either way. Dedupe identical pairs; if the two maps ever
+  // carried DIFFERENT versions for one parent (a mid-turn fetch race), attest
+  // both — the authority check then rejects the stale one and the turn
+  // re-plans, rather than a dedupe silently laundering it through.
+  const orderingReads = new Map<string, { parent: string | null; version: string }>();
+  for (const p of input.planningOrderedChildren ?? []) orderingReads.set(`${p.parent ?? "\0root"}\0${p.version}`, { parent: p.parent, version: p.version });
+  for (const n of input.planningOrderedNeighbors ?? []) orderingReads.set(`${n.query.parent ?? "\0root"}\0${n.version}`, { parent: n.query.parent, version: n.version });
+  if (orderingReads.size > 0) {
+    transcript.orderingReads = [...orderingReads.values()];
   }
 
   // Planner-parity post-state: same apply, same prior cells (the settled
@@ -673,6 +697,39 @@ function orderedChildrenMissState(parents: (string | null)[]): NetError {
     "E_MISSING_STATE",
     `sparse planning ordered-children projection not yet fetched: ${parents.map((p) => p ?? "<root>").join(", ")}`,
     { missing_ordered_children: parents }
+  );
+}
+
+/**
+ * The bounded neighbour query named by an ordered-neighbours miss (P2.4), or
+ * null if `errorish` is not one. The world's require-getter throws
+ * `E_NEED_ORDERED_NEIGHBORS` with the FULL query in `value` when a mutation
+ * reads a slot the sparse planning world cannot answer; both the thrown and
+ * the recorded (transcript.error) forms carry the same shape.
+ */
+function orderedNeighborsMiss(errorish: { code?: unknown; value?: unknown } | null | undefined): OrderedNeighborsQuery | null {
+  if (!errorish || errorish.code !== "E_NEED_ORDERED_NEIGHBORS") return null;
+  const value = errorish.value as { parent?: unknown; index?: unknown; exclude?: unknown; child?: unknown } | null | undefined;
+  if (!value || typeof value !== "object") return null; // malformed — terminal
+  const parent = value.parent === null || typeof value.parent === "string" ? value.parent : undefined;
+  if (parent === undefined) return null;
+  return {
+    parent,
+    index: typeof value.index === "number" ? value.index : null,
+    exclude: typeof value.exclude === "string" ? value.exclude : null,
+    child: typeof value.child === "string" ? value.child : null
+  };
+}
+
+/** Package an ordered-neighbours miss as the repairable escape the gateway's
+ * turn loop recovers with ONE O(1) authority fetch: a distinct
+ * `missing_ordered_neighbors` detail keeps it off both the cell-pull path
+ * (`detail.missing`) and the full-projection path (`missing_ordered_children`). */
+function orderedNeighborsMissState(query: OrderedNeighborsQuery): NetError {
+  return netError(
+    "E_MISSING_STATE",
+    `sparse planning ordered-neighbours answer not yet fetched for ${query.parent ?? "<root>"}`,
+    { missing_ordered_neighbors: [query] }
   );
 }
 

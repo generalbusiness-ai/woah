@@ -262,6 +262,96 @@ describe("outliner add over the net path converges", () => {
     expect(turn.attempt, `scale add took ${turn.attempt} attempts`).toBeLessThanOrEqual(3);
   });
 
+  // P2.4 — the bounded-read acceptance tests. A MUTATION picks its insertion
+  // slot from the O(1) /net/ordered-neighbors reply (two ranks + count),
+  // never the O(width) full sibling list: at 120 siblings the full list is
+  // ~6 KB per fetch and grows with the outline, while the neighbour reply is
+  // constant-size. The intercept records every ordering fetch the GATEWAY
+  // makes during the turn, so a regression back to a full-list read (either
+  // the reads_ordered_children pre-seed or an ordered_children repair fetch)
+  // fails loudly with the offending payload sizes.
+  const NEIGHBOR_REPLY_BYTE_CEILING = 512;
+
+  async function recordOrderingFetches(): Promise<{
+    fetches: Array<{ path: string; bytes: number }>;
+    intercept: Intercept;
+  }> {
+    const fetches: Array<{ path: string; bytes: number }> = [];
+    const intercept: Intercept = async (_scope, path, _request, real) => {
+      if (path !== "/net/ordered-children" && path !== "/net/ordered-neighbors") return null;
+      const res = await real();
+      const text = await res.text();
+      fetches.push({ path, bytes: text.length });
+      return new Response(text, { status: res.status, headers: { "content-type": "application/json" } });
+    };
+    return { fetches, intercept };
+  }
+
+  it("P2.4: a wide-parent add reads O(1) ordering neighbours, never the full sibling list", async () => {
+    const { world, theOutline, session, actor, epoch } = await outlinerWorld();
+    const roomScope = `room:${theOutline}`;
+    const ctx = { theOutline, roomScope, epoch, session, actor };
+
+    const SIBLINGS = 120;
+    for (let i = 0; i < SIBLINGS; i += 1) {
+      const r = await world.directCall(`w-seed-${i}`, actor, theOutline, "add", [`seed ${i}`], { sessionId: session.id });
+      expect(r.op, `seed add ${i}: ${JSON.stringify(r)}`).toBe("result");
+    }
+
+    const { fetches, intercept } = await recordOrderingFetches();
+    const { gateway, gatewayEnv } = await mountNet(world, epoch, { intercept });
+    const turn = await addTurn(gateway, gatewayEnv, ctx, "wide-add", "one more");
+    expect(turn.reply.status, `attempts=${turn.attempt} trace=${JSON.stringify(turn.trace)}`).toBe("accepted");
+
+    // The mutation must never fetch a full sibling list — neither as the
+    // verb-flag pre-seed nor as an ordered-children repair round.
+    const fullList = fetches.filter((f) => f.path === "/net/ordered-children");
+    expect(fullList, `full-list ordering fetches: ${JSON.stringify(fetches)}`).toEqual([]);
+    // The slot is picked from bounded neighbour replies: present, and each
+    // constant-size (two ranks + count — never O(width)).
+    const neighbours = fetches.filter((f) => f.path === "/net/ordered-neighbors");
+    expect(neighbours.length, `ordering fetches: ${JSON.stringify(fetches)}`).toBeGreaterThan(0);
+    for (const f of neighbours) expect(f.bytes, `neighbour reply too large: ${JSON.stringify(fetches)}`).toBeLessThan(NEIGHBOR_REPLY_BYTE_CEILING);
+  });
+
+  it("P2.4: a wide-parent reorder converges on bounded neighbour reads (index + exclusion, no full list)", async () => {
+    const { world, theOutline, session, actor, epoch } = await outlinerWorld();
+    const roomScope = `room:${theOutline}`;
+    const ctx = { theOutline, roomScope, epoch, session, actor };
+
+    // Seed with add_item to capture item ids; reorder needs a target row.
+    const SIBLINGS = 120;
+    const ids: string[] = [];
+    for (let i = 0; i < SIBLINGS; i += 1) {
+      const r = await world.directCall(`r-seed-${i}`, actor, theOutline, "add_item", [`seed ${i}`, null, null], { sessionId: session.id });
+      expect(r.op, `seed add_item ${i}: ${JSON.stringify(r)}`).toBe("result");
+      ids.push((r as { result: string }).result);
+    }
+
+    const { fetches, intercept } = await recordOrderingFetches();
+    const { gateway, gatewayEnv, scopeDOs } = await mountNet(world, epoch, { intercept });
+    // Move the LAST item to slot 3 — exercises the child-index lookup (the
+    // old position for undo/no-op) and the exclude-self neighbour read.
+    const moved = ids[ids.length - 1];
+    const turn = await verbTurn(gateway, gatewayEnv, ctx, "wide-reorder", "reorder_item", [moved, 3]);
+    expect(turn.reply.status, `attempts=${turn.attempt} trace=${JSON.stringify(turn.trace)}`).toBe("accepted");
+
+    const fullList = fetches.filter((f) => f.path === "/net/ordered-children");
+    expect(fullList, `full-list ordering fetches: ${JSON.stringify(fetches)}`).toEqual([]);
+    const neighbours = fetches.filter((f) => f.path === "/net/ordered-neighbors");
+    expect(neighbours.length, `ordering fetches: ${JSON.stringify(fetches)}`).toBeGreaterThan(0);
+    for (const f of neighbours) expect(f.bytes, `neighbour reply too large: ${JSON.stringify(fetches)}`).toBeLessThan(NEIGHBOR_REPLY_BYTE_CEILING);
+
+    // Authority proof: the item actually landed at slot 3 (0-based) of the
+    // root ordering — the bounded read produced a CORRECT rank, not just a
+    // cheap one.
+    const roomDO = scopeDOs.get(roomScope)!;
+    const roots = await call<{ rows: Array<{ child: string; rank: string }> }>(
+      roomDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { parent: null }
+    );
+    expect(roots.rows[3]?.child, `root order: ${JSON.stringify(roots.rows.slice(0, 6))}`).toBe(moved);
+  });
+
   it("P1.1: two concurrent same-slot inserts commit DISTINCT ranks (the ordering read is attested)", async () => {
     // Both turns plan against the SAME empty root (a barrier holds both submits
     // until both have planned), so each computes the first rank ("V"). Without

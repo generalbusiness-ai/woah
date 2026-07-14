@@ -84,7 +84,7 @@ import { Outbox, type FanoutBody, type FanoutRow } from "../../net/outbox";
 import { ScopeSequencer, type CommitSubmit, type ScheduledTurn, type ScopeHead } from "../../net/scope";
 import { authorizeSessionSubmit, validateSessionCell } from "../../net/sessions";
 import { observationsForRelationOwners, relationKey, roomRosterRows, type RelationDelta, type RelationRow } from "../../net/relations";
-import { orderedChildrenRows, orderedChildrenVersion } from "../../net/ordered-edges";
+import { orderedChildrenRows, orderedChildrenVersion, orderedNeighborsFromRows } from "../../net/ordered-edges";
 import type { ScopeMeta, ScopeStore, TailEntry } from "../../net/scope-store";
 import type { CommitReply } from "../../net/scope";
 import { netCellKeyFor } from "../../net/transcript";
@@ -861,22 +861,29 @@ export class NetScopeDO {
         return json({ scope: seq.scope, head: seq.head(), parent, rows, version: orderedChildrenVersion(rows) });
       }
       if (request.method === "POST" && url.pathname === "/net/ordered-neighbors") {
-        // BOUNDED neighbour read for a mutation (P2.4): returns only the two
-        // ranks bounding a target `index` (plus the sibling count and the
-        // ordering version), NEVER the full sibling list — so the response is
-        // O(1) regardless of how wide the parent is. `index: null` = append.
-        const body = (await request.json()) as { parent?: unknown; index?: unknown };
+        // BOUNDED neighbour read for a mutation (P2.4): answers ONE
+        // OrderedNeighborsQuery — the two ranks bounding an insertion slot
+        // (`index: null` = append; the slot is CLAMPED, range policy stays in
+        // the verb), the sibling count after `exclude`, and the queried
+        // `child`'s current slot — NEVER the full sibling list, so the
+        // response is O(1) regardless of how wide the parent is. Computed by
+        // the shared `orderedNeighborsFromRows` so this authority answer and
+        // the local runtime's own scan agree exactly. `version` is the same
+        // per-parent ordering content address the full projection carries;
+        // the plan attests it identically (P1.1).
+        const body = (await request.json()) as { parent?: unknown; index?: unknown; exclude?: unknown; child?: unknown };
         const parent = body.parent === null ? null
           : typeof body.parent === "string" && body.parent ? body.parent
           : undefined;
         if (parent === undefined) throw new Error("ordered-neighbors requires parent (string ref or null)");
         const seq = this.ensureSequencer();
         const rows = seq.store.orderedEdgeChildren(parent);
-        const count = rows.length;
-        const idx = typeof body.index === "number" && Number.isFinite(body.index) ? Math.floor(body.index) : count;
-        const before = idx > 0 && idx - 1 < count ? rows[idx - 1].rank : null;
-        const after = idx >= 0 && idx < count ? rows[idx].rank : null;
-        return json({ scope: seq.scope, head: seq.head(), parent, before, after, count, version: orderedChildrenVersion(rows) });
+        const answer = orderedNeighborsFromRows(rows, {
+          index: typeof body.index === "number" && Number.isFinite(body.index) ? body.index : null,
+          exclude: typeof body.exclude === "string" && body.exclude ? body.exclude : null,
+          child: typeof body.child === "string" && body.child ? body.child : null
+        });
+        return json({ scope: seq.scope, head: seq.head(), parent, ...answer, version: orderedChildrenVersion(rows) });
       }
       if (request.method === "POST" && url.pathname === "/net/closure") {
         const body = (await request.json()) as {
