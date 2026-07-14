@@ -1113,6 +1113,14 @@ export class NetGatewayDO {
     // contention moves the authority version every round, so a contended key
     // never satisfies the "same version twice" condition and keeps repairing.
     const refreshedTo = new Map<string, string>();
+    // Owner-computed ordered-children projections fetched this turn, keyed by
+    // parent (null = the ordering roots). Seeded with the call target's
+    // ordering, then GROWN by the ordered-children repair path as the verb
+    // reads further parents (a nested add_item's parent_arg, a reparent's old
+    // + new parent). The map only grows and is threaded into every re-plan, so
+    // a fetched projection is STICKY: the same parent never re-misses, and a
+    // turn reading several parents converges one repair round per new parent.
+    const orderedChildrenByParent = new Map<string | null, readonly Record<string, unknown>[]>();
 
     for (let attempt = 1; attempt <= MAX_TURN_ATTEMPTS; attempt += 1) {
       // The budget bounds rounds two onward; the first attempt always
@@ -1127,7 +1135,13 @@ export class NetGatewayDO {
       const view = this.ensureView();
       const classifier = this.classifierFor(request, view);
       const planningRoomRoster = await this.roomRosterProjection(request, view, classifier, structure);
-      const planningOrderedChildren = await this.orderedChildrenProjection(request, view, classifier, structure);
+      // Seed the call target's ordering once (the generic "children of the
+      // target" projection); repair rounds add any further parents the verb
+      // reads. Idempotent: skipped once the target is already in the map.
+      await this.seedTargetOrderedChildren(request, view, classifier, structure, orderedChildrenByParent);
+      const planningOrderedChildren = orderedChildrenByParent.size > 0
+        ? [...orderedChildrenByParent.entries()].map(([parent, rows]) => ({ parent, rows }))
+        : undefined;
 
       // ---- Plan (or adopt the stale_head resubmit).
       let planned: PlanTurnResult;
@@ -1151,6 +1165,40 @@ export class NetGatewayDO {
           planned = await this.planOnce(request, view, classifier, planningHead.object_counter, planningRoomRoster, repairedObjects, planningOrderedChildren);
         } catch (err) {
           if (isNetError(err) && err.code === "E_MISSING_STATE") {
+            // Ordered-children projection miss: fetch the named parent(s)'
+            // owner projection and re-plan (the ordering analogue of a
+            // targeted cell refresh). Handled BEFORE the cell path — its
+            // detail carries `missing_ordered_children`, not `missing`.
+            const missingOrdered = Array.isArray(err.detail.missing_ordered_children)
+              ? (err.detail.missing_ordered_children as (string | null)[])
+              : [];
+            if (missingOrdered.length > 0) {
+              trace.push({ attempt, code: "E_MISSING_STATE", missing: missingOrdered.map((p) => p ?? "<root>"), elapsed_ms: elapsed() });
+              let progressed = false;
+              for (const parent of missingOrdered) {
+                // Anti-loop: a parent already fetched must not be re-fetched.
+                // If EVERY named parent is already resident, the re-plan still
+                // missed it — non-convergent (a planner/catalog bug), surfaced
+                // as E_NONCONVERGENT_READ rather than grinding to E_BUDGET.
+                if (orderedChildrenByParent.has(parent)) continue;
+                const rows = await this.tryRecovery(trace, () => this.fetchOrderedChildren(request, classifier, structure, parent));
+                if (rows === undefined) continue; // fetch failed; recovery_error recorded
+                orderedChildrenByParent.set(parent, rows);
+                progressed = true;
+              }
+              if (!progressed) {
+                // No parent could be newly fetched — every named parent is
+                // either already resident (a re-miss the install did not cure)
+                // or its fetch failed (recovery_error in the trace). Terminal:
+                // surface E_NONCONVERGENT_READ rather than grinding to E_BUDGET.
+                throw nonconvergentRead(
+                  "ordered-children projection unrecoverable (already resident or fetch failed)",
+                  trace,
+                  { missing_ordered_children: missingOrdered }
+                );
+              }
+              continue;
+            }
             const missing = Array.isArray(err.detail.missing) ? (err.detail.missing as string[]) : [];
             trace.push({ attempt, code: "E_MISSING_STATE", missing, elapsed_ms: elapsed() });
             await this.tryRecovery(trace, () => this.refreshCells(request, classifier, view, missing, structure));
@@ -3437,32 +3485,46 @@ export class NetGatewayDO {
     return { room, rows: response.rows as RoomRosterRow[] };
   }
 
-  /** Fetch the bounded ordered-children projection from the parent's scope
+  /** Fetch ONE bounded ordered-children projection from the parent's scope
    * authority — the ordering analogue of `roomRosterProjection`. Computed
    * owner-side (scan the scope's authored edge cells for the parent, sort by
    * rank) so a listing/mutation reads sibling order as ONE value instead of
    * dragging every sibling's edge cell into the turn's read closure. The
-   * parent whose ordering the verb reads is the call TARGET (generic:
-   * "ordered children of the target"). */
-  private async orderedChildrenProjection(
+   * root ordering (`parent === null`) is owned by the scope the call operates
+   * in, so it resolves against the call target's scope. */
+  private async fetchOrderedChildren(
     request: TurnRequest,
-    view: CellStore,
     classifier: ScopeClassifier,
-    structure: TurnStructure
-  ): Promise<Array<{ parent: string | null; rows: readonly Record<string, unknown>[] }> | undefined> {
-    const call = request.call;
-    if (!this.callReadsOrderedChildren(view, call)) return undefined;
-    const parent = call.target;
-    const scope = classifier.scopeOf(parent);
+    structure: TurnStructure,
+    parent: string | null
+  ): Promise<readonly Record<string, unknown>[]> {
+    const scope = classifier.scopeOf(typeof parent === "string" ? parent : request.call.target);
     const response = await structure.rpc(() => this.host.rpc(
       this.destinationFor(request, scope),
       "/ordered-children",
       { parent }
     ), { phase: "ordered_children" }) as { parent?: unknown; rows?: unknown };
     if (response.parent !== parent || !Array.isArray(response.rows)) {
-      throw new Error(`ordered-children authority returned malformed projection for ${parent}`);
+      throw new Error(`ordered-children authority returned malformed projection for ${parent ?? "<root>"}`);
     }
-    return [{ parent, rows: response.rows as Record<string, unknown>[] }];
+    return response.rows as Record<string, unknown>[];
+  }
+
+  /** Seed the call target's ordering into the per-turn projection map, once,
+   * if the dispatched verb declares `reads_ordered_children`. This is the
+   * bounded warm-path optimization: the common case (a verb whose parent IS
+   * the target) needs no repair round. Further parents are filled on demand
+   * by the ordered-children repair path in `turnAttempts`. */
+  private async seedTargetOrderedChildren(
+    request: TurnRequest,
+    view: CellStore,
+    classifier: ScopeClassifier,
+    structure: TurnStructure,
+    accumulated: Map<string | null, readonly Record<string, unknown>[]>
+  ): Promise<void> {
+    const target = request.call.target;
+    if (accumulated.has(target) || !this.callReadsOrderedChildren(view, request.call)) return;
+    accumulated.set(target, await this.fetchOrderedChildren(request, classifier, structure, target));
   }
 
   private async expediteForeignRelations(

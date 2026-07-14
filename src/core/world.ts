@@ -742,17 +742,32 @@ export class WooWorld {
   }
 
   /** The ordered `[{child, rank}]` list of `parent`'s direct children. On a
-   * sparse net planning world the owner projection MUST have been installed
-   * (missing => a hard E_INTERNAL, never a partial local derivation). A
-   * complete local runtime (in-memory / SQLite dev) derives it by scanning
-   * objects' local edge property — the ordering analogue of
-   * `roomRosterProjection`'s local-session fallback. */
+   * sparse net planning world the owner projection MUST have been installed;
+   * a MISSING one is a REPAIRABLE miss, not terminal: the gateway does not
+   * know ahead of time which parents a data-dependent verb will read (an
+   * add_item into a nested parent_arg, a reparent to an arbitrary sub-item),
+   * so it seeds only the call target's ordering up front. Reading any other
+   * parent throws `E_NEED_ORDERED_CHILDREN` naming that parent; the gateway's
+   * repair loop fetches that parent's projection (POST /net/ordered-children)
+   * and re-plans, exactly as a missing-cell read triggers a targeted refresh.
+   * A genuinely malformed parent argument is caught earlier by the builtin's
+   * `assertObj` (terminal E_TYPE/E_INVARG) and never reaches this getter. A
+   * complete local runtime (in-memory / SQLite dev) has no require flag and
+   * derives the ordering by scanning objects' local edge property — the
+   * ordering analogue of `roomRosterProjection`'s local-session fallback. */
   orderedChildrenProjection(parent: ObjRef | null): WooValue[] {
     const projected = this.orderedChildrenProjections.get(WooWorld.orderedChildrenKey(parent));
     if (projected !== undefined) return cloneImportedPlainData(projected);
 
     if (this.requireOrderedChildrenProjection) {
-      throw wooError("E_INTERNAL", `sparse planning ordered-children projection missing for ${parent ?? "<root>"}`);
+      // The parent rides in `value` so the planner/gateway can name exactly
+      // which projection to fetch. Distinct code (not E_NEED_STATE) so it
+      // routes through the ordered-children repair path, not the cell-pull path.
+      throw wooError(
+        "E_NEED_ORDERED_CHILDREN",
+        `ordered-children projection not resident for ${parent ?? "<root>"}`,
+        { parent }
+      );
     }
 
     // Local fallback: scan every object's LOCAL edge property. Edges are a

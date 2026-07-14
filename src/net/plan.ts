@@ -33,7 +33,7 @@ import {
   type ShadowTurnCall
 } from "./bridge";
 import { CellStore, cellKey, cellVersion, serializeTransfer, type Cell, type EpochStamp } from "./cells";
-import { isNetError, netError } from "./errors";
+import { isNetError, netError, type NetError } from "./errors";
 import { selectCommitScope, type ScopeClassifier, type ScopeSelection } from "./route";
 import type { CommitSubmit, ScopeHead } from "./scope";
 import { sessionWriter } from "./sessions";
@@ -226,6 +226,13 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
           : {})
       });
     } catch (err) {
+      // An ordered-children projection miss escapes to the gateway's
+      // ordered-children repair path (it fetches the named parent's owner
+      // projection and re-plans) rather than the cell-pull path — there is
+      // no cell to grow from the view. Defensive: the builtin miss is
+      // normally RECORDED, handled just below the try; this covers the throw.
+      const thrownOrdered = orderedChildrenMiss(err as { code?: unknown; value?: unknown } | null);
+      if (thrownOrdered) throw orderedChildrenMissState(thrownOrdered);
       // A sparse miss vs the attempt's slice. Grow from the LIVE view and
       // re-run; if nothing is growable the cell is genuinely absent —
       // surface the miss against the VIEW so the gateway pulls exactly
@@ -246,6 +253,12 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
       }
       throw translateSparsePlanningThrow(err, view, call);
     }
+    // An ordered-children projection miss the engine RECORDED (the normal
+    // path — the builtin throw is caught by dispatch and stored as the
+    // transcript error). No cell to grow: escape immediately to the gateway's
+    // ordered-children repair, naming the parent(s) whose projection to fetch.
+    const recordedOrdered = orderedChildrenMiss(attemptRun.transcript.error as { code?: unknown; value?: unknown } | undefined);
+    if (recordedOrdered) throw orderedChildrenMissState(recordedOrdered);
     // CO2.6 second half: the engine RECORDS a dispatch miss in the
     // transcript rather than throwing. Same grow-or-escape vs the slice.
     const recordedVsAttempt = sparseMissFromRecordedError(attemptRun.transcript, attemptStore);
@@ -627,6 +640,32 @@ function missIsResidentNow(miss: unknown, view: CellStore): boolean {
   if (!isNetError(miss) || miss.code !== "E_MISSING_STATE") return false;
   const missing = Array.isArray(miss.detail.missing) ? (miss.detail.missing as string[]) : [];
   return missing.length > 0 && missing.every((key) => view.has(key));
+}
+
+/**
+ * The parent(s) named by an ordered-children projection miss, or null if
+ * `errorish` is not one. The world's require-getter throws
+ * `E_NEED_ORDERED_CHILDREN` with `value = { parent }` when a verb reads a
+ * parent's ordering that the sparse planning world does not hold; both the
+ * thrown and the recorded (transcript.error) forms carry the same shape.
+ */
+function orderedChildrenMiss(errorish: { code?: unknown; value?: unknown } | null | undefined): (string | null)[] | null {
+  if (!errorish || errorish.code !== "E_NEED_ORDERED_CHILDREN") return null;
+  const value = errorish.value as { parent?: unknown } | null | undefined;
+  const parent = value && typeof value === "object" ? (value as { parent?: unknown }).parent : undefined;
+  if (parent === null || typeof parent === "string") return [parent];
+  return null; // malformed value — treat as a non-miss (terminal)
+}
+
+/** Package an ordered-children miss as the repairable escape the gateway's
+ * turn loop recovers: a distinct `missing_ordered_children` detail keeps it
+ * off the cell-pull path (which reads `detail.missing`). */
+function orderedChildrenMissState(parents: (string | null)[]): NetError {
+  return netError(
+    "E_MISSING_STATE",
+    `sparse planning ordered-children projection not yet fetched: ${parents.map((p) => p ?? "<root>").join(", ")}`,
+    { missing_ordered_children: parents }
+  );
 }
 
 function translateSparsePlanningThrow(err: unknown, view: CellStore, call: ShadowTurnCall): unknown {

@@ -162,9 +162,12 @@ describe("owner-computed ordered-children projection in planning", () => {
     expect(readsAnyEdgeCell).toBe(false);
   });
 
-  it("fails loudly when sparse net planning reaches ordered_children without its owner projection", async () => {
+  it("escapes as a REPAIRABLE ordered-children miss (not terminal) when the projection is absent", async () => {
+    // planTurn is the gateway planner; a missing projection is a repairable
+    // E_MISSING_STATE naming the parent (`missing_ordered_children`), so the
+    // gateway repair loop can fetch it and re-plan — never a terminal error.
     const { session, seq } = harness("miss");
-    const plan = await planTurn({
+    const planOnce = planTurn({
       call: {
         kind: "woo.turn_call.shadow.v1",
         id: "oc-miss",
@@ -184,11 +187,54 @@ describe("owner-computed ordered-children projection in planning", () => {
       stamp: seq.stamp()
     });
 
-    expect(plan.transcript.result).toBeUndefined();
-    expect(plan.transcript.error).toMatchObject({
-      code: "E_INTERNAL",
-      message: "sparse planning ordered-children projection missing for the_list"
+    await expect(planOnce).rejects.toMatchObject({
+      code: "E_MISSING_STATE",
+      detail: { missing_ordered_children: ["the_list"] }
     });
+  });
+
+  it("errors terminally (no repair) for a genuinely malformed parent argument", async () => {
+    // A non-ref argument is a verb bug, caught by the builtin's assertObj —
+    // a terminal type error, NOT a repairable projection miss (so the gateway
+    // never enters an unbounded fetch loop for it).
+    const world = createWorld();
+    const session = world.auth("guest:oc-badarg");
+    world.createObject({ id: "bad_list", name: "Bad List", parent: "$thing", owner: session.actor });
+    const installed = installVerb(
+      world,
+      "bad_list",
+      "bad_children",
+      `verb :bad_children() rxd { return ordered_children(42); }`,
+      null
+    );
+    expect(installed.ok).toBe(true);
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seq.seed(cellsFromSerialized(world.exportWorld()));
+
+    const plan = await planTurn({
+      call: {
+        kind: "woo.turn_call.shadow.v1",
+        id: "oc-badarg",
+        route: "direct",
+        scope: SCOPE,
+        session: session.id,
+        actor: session.actor,
+        target: "bad_list",
+        verb: "bad_children",
+        args: []
+      },
+      view: derivedViewOf(seq.store),
+      planningScope: SCOPE,
+      classifier,
+      base: seq.head(),
+      idempotencyKey: "oc-badarg",
+      stamp: seq.stamp()
+    });
+    // A terminal verb error is RECORDED (planTurn returns), not a repairable
+    // escape: the transcript carries the type error and no projection miss.
+    expect(plan.transcript.result).toBeUndefined();
+    expect((plan.transcript.error as { code?: string }).code).not.toBe("E_NEED_ORDERED_CHILDREN");
+    expect(["E_TYPE", "E_INVARG"]).toContain((plan.transcript.error as { code?: string }).code);
   });
 });
 
