@@ -932,6 +932,7 @@ const VALID_BUILTINS = new Set([
   "present_actors",
   "active_actors",
   "room_roster",
+  "ordered_children",
   "session_metadata",
   "visible_contents",
   "obvious_verbs",

@@ -1,0 +1,232 @@
+// Ordered-edge index — the room-owned authored-cell ordering primitive and
+// its owner-computed bounded projection. These tests pin the two properties
+// the net path depends on:
+//   1. the authority-side scan (orderedChildrenRows) reduces a scope's edge
+//      cells into ONE rank-sorted list, filtered by parent; and
+//   2. a verb reads that ordering as one installed projection value in
+//      planning — never by pulling every sibling's edge cell into the turn's
+//      attestable read closure (the O(N) closure that blows the warm
+//      envelope). This mirrors the compact room-roster planning tests.
+import { describe, expect, it } from "vitest";
+import { installVerb } from "../../src/core/authoring";
+import { createWorld } from "../../src/core/bootstrap";
+import { installCatalogManifest } from "../../src/core/catalog-installer";
+import { cellsFromSerialized, storeCells } from "../../src/net/bridge";
+import { CellStore, makeCell, type EpochStamp } from "../../src/net/cells";
+import {
+  ORDERED_EDGE_PROP,
+  orderedChildrenRows,
+  orderedEdgeCellKey,
+  readOrderedEdge
+} from "../../src/net/ordered-edges";
+import { planTurn, WARM_ENVELOPE_BYTE_LIMIT } from "../../src/net/plan";
+import type { ScopeClassifier } from "../../src/net/route";
+import { ScopeSequencer } from "../../src/net/scope";
+import { propertyCellPayload } from "../../src/net/transcript";
+
+const SCOPE = "home";
+const EPOCH = "cat1";
+const STAMP: EpochStamp = { scope_head: "h0", catalog_epoch: EPOCH };
+
+// Every object anchors to the one shared scope the sequencer owns.
+const classifier: ScopeClassifier = {
+  scopeOf: () => SCOPE,
+  isShared: (scope) => scope === SCOPE
+};
+
+function derivedViewOf(authority: CellStore): CellStore {
+  const view = new CellStore("derived");
+  for (const cell of storeCells(authority)) view.install(cell);
+  return view;
+}
+
+/** An authored edge cell: a property_cell on the CHILD under ORDERED_EDGE_PROP
+ * holding `{ parent, rank }` (wrapped by the property-cell payload). */
+function edgeCell(child: string, parent: string | null, rank: string) {
+  return makeCell({
+    kind: "property_cell",
+    object: child,
+    name: ORDERED_EDGE_PROP,
+    value: propertyCellPayload({ hasValue: true, value: { parent, rank } }),
+    provenance: "authoritative",
+    stamp: STAMP
+  });
+}
+
+describe("ordered-edge cell representation", () => {
+  it("keys an edge by its child object (O(1) by-child lookup)", () => {
+    expect(orderedEdgeCellKey("item_7")).toBe(`property_cell:item_7:${ORDERED_EDGE_PROP}`);
+  });
+
+  it("reads a well-formed edge and rejects malformed payloads", () => {
+    expect(readOrderedEdge(propertyCellPayload({ hasValue: true, value: { parent: "p", rank: "V" } }))).toEqual({ parent: "p", rank: "V" });
+    expect(readOrderedEdge(propertyCellPayload({ hasValue: true, value: { parent: null, rank: "V" } }))).toEqual({ parent: null, rank: "V" });
+    // Missing/empty rank, wrong parent type, and non-object all reject.
+    expect(readOrderedEdge(propertyCellPayload({ hasValue: true, value: { parent: "p" } }))).toBeNull();
+    expect(readOrderedEdge(propertyCellPayload({ hasValue: true, value: { parent: 5, rank: "V" } }))).toBeNull();
+    expect(readOrderedEdge(propertyCellPayload({ hasValue: false }))).toBeNull();
+    expect(readOrderedEdge(null)).toBeNull();
+  });
+});
+
+describe("owner-side ordered-children scan (orderedChildrenRows)", () => {
+  it("filters by parent and sorts by fractional rank, tie-breaking by child id", () => {
+    const store = new CellStore("authority");
+    // Two parents; ranks intentionally out of insertion order.
+    store.install(edgeCell("c_b", "root", "W"));
+    store.install(edgeCell("c_a", "root", "V"));
+    store.install(edgeCell("c_c", "root", "X"));
+    store.install(edgeCell("other", "elsewhere", "V")); // different parent
+    store.install(edgeCell("r_1", null, "M")); // an ordering root (parent null)
+    // Non-edge cells must be ignored.
+    store.install(makeCell({ kind: "object_live", object: "c_a", value: { location: "root" }, provenance: "authoritative", stamp: STAMP }));
+
+    expect(orderedChildrenRows(store.allCells(), "root")).toEqual([
+      { child: "c_a", rank: "V" },
+      { child: "c_b", rank: "W" },
+      { child: "c_c", rank: "X" }
+    ]);
+    expect(orderedChildrenRows(store.allCells(), "elsewhere")).toEqual([{ child: "other", rank: "V" }]);
+    expect(orderedChildrenRows(store.allCells(), null)).toEqual([{ child: "r_1", rank: "M" }]);
+    expect(orderedChildrenRows(store.allCells(), "no_such_parent")).toEqual([]);
+  });
+
+  it("breaks a rank tie deterministically by child id", () => {
+    const store = new CellStore("authority");
+    store.install(edgeCell("z", "root", "V"));
+    store.install(edgeCell("a", "root", "V"));
+    expect(orderedChildrenRows(store.allCells(), "root")).toEqual([
+      { child: "a", rank: "V" },
+      { child: "z", rank: "V" }
+    ]);
+  });
+});
+
+describe("owner-computed ordered-children projection in planning", () => {
+  /** A container plus a verb that reads its children's order via the builtin. */
+  function harness(tag: string) {
+    const world = createWorld();
+    const session = world.auth(`guest:oc-${tag}`);
+    world.createObject({ id: "the_list", name: "The List", parent: "$thing", owner: session.actor });
+    const installed = installVerb(
+      world,
+      "the_list",
+      "list_children",
+      `verb :list_children() rxd { return ordered_children(this); }`,
+      null
+    );
+    expect(installed.ok).toBe(true);
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seq.seed(cellsFromSerialized(world.exportWorld()));
+    return { world, session, seq };
+  }
+
+  it("renders 120 ordered children from one transient value, no per-child closure cells", async () => {
+    const { session, seq } = harness("120");
+    const rows = Array.from({ length: 120 }, (_, i) => ({
+      child: `item_${String(i).padStart(3, "0")}`,
+      rank: `V${String(i).padStart(3, "0")}`
+    }));
+
+    const plan = await planTurn({
+      call: {
+        kind: "woo.turn_call.shadow.v1",
+        id: "oc-120",
+        route: "direct",
+        scope: SCOPE,
+        session: session.id,
+        actor: session.actor,
+        target: "the_list",
+        verb: "list_children",
+        args: []
+      },
+      view: derivedViewOf(seq.store),
+      planningScope: SCOPE,
+      classifier,
+      base: seq.head(),
+      idempotencyKey: "oc-120",
+      stamp: seq.stamp(),
+      planningOrderedChildren: [{ parent: "the_list", rows }]
+    });
+
+    // The verb returned the full ordered projection...
+    expect(plan.transcript.result).toHaveLength(120);
+    expect(plan.transcript.result).toEqual(rows);
+    // ...as ONE bounded value: the warm envelope stays well under the ceiling
+    // and no per-child edge cell was pulled into the attestable read closure.
+    expect(plan.envelopeBytes).toBeLessThan(WARM_ENVELOPE_BYTE_LIMIT);
+    const readsAnyEdgeCell = plan.transcript.reads.some(
+      (read) => (read.cell as { name?: unknown }).name === ORDERED_EDGE_PROP
+        || (typeof read.cell.object === "string" && read.cell.object.startsWith("item_"))
+    );
+    expect(readsAnyEdgeCell).toBe(false);
+  });
+
+  it("fails loudly when sparse net planning reaches ordered_children without its owner projection", async () => {
+    const { session, seq } = harness("miss");
+    const plan = await planTurn({
+      call: {
+        kind: "woo.turn_call.shadow.v1",
+        id: "oc-miss",
+        route: "direct",
+        scope: SCOPE,
+        session: session.id,
+        actor: session.actor,
+        target: "the_list",
+        verb: "list_children",
+        args: []
+      },
+      view: derivedViewOf(seq.store),
+      planningScope: SCOPE,
+      classifier,
+      base: seq.head(),
+      idempotencyKey: "oc-miss",
+      stamp: seq.stamp()
+    });
+
+    expect(plan.transcript.result).toBeUndefined();
+    expect(plan.transcript.error).toMatchObject({
+      code: "E_INTERNAL",
+      message: "sparse planning ordered-children projection missing for the_list"
+    });
+  });
+});
+
+describe("reads_ordered_children verb flag round-trip", () => {
+  it("survives catalog install into the verb_bytecode cell (the gateway's flag source)", () => {
+    const world = createWorld();
+    const manifest = {
+      name: "ordered-flag-test",
+      version: "0.0.1",
+      spec_version: "v1",
+      description: "Flag round-trip coverage for the ordered-children projection gate.",
+      license: "MIT",
+      depends: [],
+      seed_hooks: [],
+      classes: [
+        {
+          local_name: "$oc_holder",
+          parent: "$thing",
+          verbs: [
+            {
+              name: "children",
+              perms: "rxd",
+              direct_callable: true,
+              reads_ordered_children: true,
+              arg_spec: { args: [] },
+              source: `verb :children() rxd { return ordered_children(this); }`
+            }
+          ]
+        }
+      ]
+    };
+    installCatalogManifest(world, manifest, { tap: "@local", alias: manifest.name, actor: "$wiz" });
+
+    const cells = cellsFromSerialized(world.exportWorld());
+    const verbCell = cells.find(
+      (cell) => cell.kind === "verb_bytecode" && cell.object === "$oc_holder" && cell.name === "children"
+    );
+    expect(verbCell).toBeDefined();
+    expect((verbCell!.value as { reads_ordered_children?: unknown }).reads_ordered_children).toBe(true);
+  });
+});

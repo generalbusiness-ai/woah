@@ -53,6 +53,9 @@ export type RemoteToolDescriptor = {
   arg_spec: Record<string, WooValue>;
   direct: boolean;
   reads_room_presence?: boolean;
+  /** This verb reads sibling ORDER (the ordered-children projection), so a
+   * sparse gateway must seed it from the parent's scope authority. */
+  reads_ordered_children?: boolean;
   source: string;
   enclosingSpace: ObjRef | null;
   source_rows?: Array<{ table: "objects"; authority_scope: ObjRef; key: ObjRef }>;
@@ -191,6 +194,10 @@ export type VerbDef =
       // depends on a room/workspace roster, so a gateway that only holds
       // session stubs must seed current Directory presence for candidate rooms.
       reads_room_presence?: boolean;
+      // Catalog metadata for sparse gateways: this verb reads sibling ORDER
+      // (the ordered-children projection), so the gateway seeds it from the
+      // parent's scope authority (the ordering analogue of reads_room_presence).
+      reads_ordered_children?: boolean;
       // Declares the verb performs no observable state mutation: no property
       // writes, no moveto, no observe-with-side-effects, no recycle, no host
       // effects. May be set by the static analyzer (derived from bytecode +
@@ -228,6 +235,7 @@ export type VerbDef =
       skip_presence_check?: boolean;
       tool_exposed?: boolean;
       reads_room_presence?: boolean;
+      reads_ordered_children?: boolean;
       pure?: boolean;
       pure_declared?: boolean;
       calls?: VerbCallSite[];

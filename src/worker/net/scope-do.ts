@@ -84,6 +84,7 @@ import { Outbox, type FanoutBody, type FanoutRow } from "../../net/outbox";
 import { ScopeSequencer, type CommitSubmit, type ScheduledTurn, type ScopeHead } from "../../net/scope";
 import { authorizeSessionSubmit, validateSessionCell } from "../../net/sessions";
 import { observationsForRelationOwners, relationKey, roomRosterRows, type RelationDelta, type RelationRow } from "../../net/relations";
+import { orderedChildrenRows } from "../../net/ordered-edges";
 import type { ScopeMeta, ScopeStore, TailEntry } from "../../net/scope-store";
 import type { CommitReply } from "../../net/scope";
 import { netCellKeyFor } from "../../net/transcript";
@@ -838,6 +839,20 @@ export class NetScopeDO {
           this.host.now()
         );
         return json({ scope: seq.scope, head: seq.head(), room: body.room, rows });
+      }
+      if (request.method === "POST" && url.pathname === "/net/ordered-children") {
+        // Owner-computed ordered children of a parent (the ordering analogue
+        // of /net/room-roster). Scans this scope's authored edge cells for the
+        // parent and returns one bounded, rank-sorted list — never the O(N)
+        // edge cells themselves. `parent: null` lists the ordering roots.
+        const body = (await request.json()) as { parent?: unknown };
+        const parent = body.parent === null ? null
+          : typeof body.parent === "string" && body.parent ? body.parent
+          : undefined;
+        if (parent === undefined) throw new Error("ordered-children requires parent (string ref or null)");
+        const seq = this.ensureSequencer();
+        const rows = orderedChildrenRows(seq.store.allCells(), parent);
+        return json({ scope: seq.scope, head: seq.head(), parent, rows });
       }
       if (request.method === "POST" && url.pathname === "/net/closure") {
         const body = (await request.json()) as {

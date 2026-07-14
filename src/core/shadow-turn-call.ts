@@ -73,6 +73,12 @@ export type ShadowTurnCallOptions = {
   /** Net's sparse planner must fail rather than derive a partial roster from
    * whichever session rows happened to materialize on this executor. */
   require_room_roster_projection?: boolean;
+  /** Transient owner-computed ordered-children projections (one per parent);
+   * the ordering analogue of room_rosters. Never persisted or exported. */
+  ordered_children?: Array<{ parent: string | null; rows: readonly Record<string, unknown>[] }>;
+  /** Net's sparse planner must fail rather than derive a partial ordering from
+   * whichever edge cells happened to materialize (mirror of the roster flag). */
+  require_ordered_children_projection?: boolean;
   /** Net commits recorded cells rather than the ephemeral WooWorld. Enable
    * recorder events for runtime verb/property-definition authoring; legacy v2
    * execution keeps its existing materialization path until that stack is
@@ -94,6 +100,8 @@ export async function runShadowTurnCall(
   const built = createWorldFromSerialized(world, { persist: false });
   for (const roster of options.room_rosters ?? []) built.installRoomRosterProjection(roster.room, roster.rows);
   if (options.require_room_roster_projection) built.setRequireRoomRosterProjection(true);
+  for (const ordering of options.ordered_children ?? []) built.installOrderedChildrenProjection(ordering.parent, ordering.rows);
+  if (options.require_ordered_children_projection) built.setRequireOrderedChildrenProjection(true);
   if (options.record_authoring_cell_writes) built.setRecordAuthoringCellWrites(true);
   built.setMetricsHook(options.onMetric ?? null);
   if (options.planning_cell_provenance) built.setPlanningCellProvenance(options.planning_cell_provenance);
@@ -113,6 +121,8 @@ export async function runShadowTurnCallTranscript(
   const built = createWorldFromSerialized(world, { persist: false });
   for (const roster of options.room_rosters ?? []) built.installRoomRosterProjection(roster.room, roster.rows);
   if (options.require_room_roster_projection) built.setRequireRoomRosterProjection(true);
+  for (const ordering of options.ordered_children ?? []) built.installOrderedChildrenProjection(ordering.parent, ordering.rows);
+  if (options.require_ordered_children_projection) built.setRequireOrderedChildrenProjection(true);
   if (options.record_authoring_cell_writes) built.setRecordAuthoringCellWrites(true);
   if (options.onMetric) built.setMetricsHook(options.onMetric);
   if (options.planning_cell_provenance) built.setPlanningCellProvenance(options.planning_cell_provenance);

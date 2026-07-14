@@ -108,6 +108,11 @@ export type PlanTurnInput = {
   /** One authority-read compact roster value, installed only in the
    * ephemeral execution world for generic room_roster(space) reads. */
   planningRoomRoster?: { room: string; rows: readonly Record<string, unknown>[] };
+  /** Owner-computed ordered-children values (one per parent), installed only
+   * in the ephemeral execution world for generic ordered_children(parent)
+   * reads. The ordering analogue of planningRoomRoster; keeps sibling order
+   * off the O(N)-edge-cell read closure. */
+  planningOrderedChildren?: readonly { parent: string | null; rows: readonly Record<string, unknown>[] }[];
 };
 
 export type PlanTurnResult = {
@@ -213,8 +218,12 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
     try {
       attemptRun = await runShadowTurnCallTranscript(world, call, {
         require_room_roster_projection: true,
+        require_ordered_children_projection: true,
         record_authoring_cell_writes: true,
-        ...(input.planningRoomRoster ? { room_rosters: [input.planningRoomRoster] } : {})
+        ...(input.planningRoomRoster ? { room_rosters: [input.planningRoomRoster] } : {}),
+        ...(input.planningOrderedChildren && input.planningOrderedChildren.length > 0
+          ? { ordered_children: [...input.planningOrderedChildren] }
+          : {})
       });
     } catch (err) {
       // A sparse miss vs the attempt's slice. Grow from the LIVE view and

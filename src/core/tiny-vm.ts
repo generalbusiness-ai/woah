@@ -182,7 +182,10 @@ export const BUILTIN_NAMES = [
   "listinsert", "object_tree_rows", "object_siblings_ordered",
   // Compact owner-scoped presence projection. Appended to preserve every
   // existing builtin bytecode index.
-  "room_roster"
+  "room_roster",
+  // Owner-computed ordered-children projection (the ordering analogue of
+  // room_roster). Appended last to keep every existing bytecode index stable.
+  "ordered_children"
 ];
 
 export async function runTinyVm(ctx: CallContext, bytecode: TinyBytecode, args: WooValue[]): Promise<WooValue> {
@@ -1002,6 +1005,15 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
       case "room_roster": {
         if (builtinArgs.length !== 1) throw wooError("E_INVARG", "room_roster expects one space");
         return frame.ctx.world.roomRosterProjection(assertObj(builtinArgs[0])) as unknown as WooValue;
+      }
+      case "ordered_children": {
+        // Owner-computed ordered children of a parent within a room, keyed by
+        // fractional rank. One arg: the parent ref, or null for the ordering
+        // roots. Returns [{child, rank}] ascending — see world.orderedChildrenProjection.
+        if (builtinArgs.length !== 1) throw wooError("E_INVARG", "ordered_children expects one parent (or null)");
+        const parentArg = builtinArgs[0];
+        const parent = parentArg === null ? null : assertObj(parentArg);
+        return frame.ctx.world.orderedChildrenProjection(parent) as unknown as WooValue;
       }
       // connected_players was a GLOBAL session enumeration (Big-World
       // violation) whose sole consumer, $player:who_all, is now presence-scoped

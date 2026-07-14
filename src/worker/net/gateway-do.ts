@@ -1127,6 +1127,7 @@ export class NetGatewayDO {
       const view = this.ensureView();
       const classifier = this.classifierFor(request, view);
       const planningRoomRoster = await this.roomRosterProjection(request, view, classifier, structure);
+      const planningOrderedChildren = await this.orderedChildrenProjection(request, view, classifier, structure);
 
       // ---- Plan (or adopt the stale_head resubmit).
       let planned: PlanTurnResult;
@@ -1147,7 +1148,7 @@ export class NetGatewayDO {
         try {
           planningHead = await structure.rpc(() => this.scopeHead(this.destinationFor(request, request.planningScope)), { phase: "planning_head" });
           this.assertTurnEpoch(planningHead, request.catalog_epoch, request.planningScope, trace);
-          planned = await this.planOnce(request, view, classifier, planningHead.object_counter, planningRoomRoster, repairedObjects);
+          planned = await this.planOnce(request, view, classifier, planningHead.object_counter, planningRoomRoster, repairedObjects, planningOrderedChildren);
         } catch (err) {
           if (isNetError(err) && err.code === "E_MISSING_STATE") {
             const missing = Array.isArray(err.detail.missing) ? (err.detail.missing as string[]) : [];
@@ -3436,6 +3437,34 @@ export class NetGatewayDO {
     return { room, rows: response.rows as RoomRosterRow[] };
   }
 
+  /** Fetch the bounded ordered-children projection from the parent's scope
+   * authority — the ordering analogue of `roomRosterProjection`. Computed
+   * owner-side (scan the scope's authored edge cells for the parent, sort by
+   * rank) so a listing/mutation reads sibling order as ONE value instead of
+   * dragging every sibling's edge cell into the turn's read closure. The
+   * parent whose ordering the verb reads is the call TARGET (generic:
+   * "ordered children of the target"). */
+  private async orderedChildrenProjection(
+    request: TurnRequest,
+    view: CellStore,
+    classifier: ScopeClassifier,
+    structure: TurnStructure
+  ): Promise<Array<{ parent: string | null; rows: readonly Record<string, unknown>[] }> | undefined> {
+    const call = request.call;
+    if (!this.callReadsOrderedChildren(view, call)) return undefined;
+    const parent = call.target;
+    const scope = classifier.scopeOf(parent);
+    const response = await structure.rpc(() => this.host.rpc(
+      this.destinationFor(request, scope),
+      "/ordered-children",
+      { parent }
+    ), { phase: "ordered_children" }) as { parent?: unknown; rows?: unknown };
+    if (response.parent !== parent || !Array.isArray(response.rows)) {
+      throw new Error(`ordered-children authority returned malformed projection for ${parent}`);
+    }
+    return [{ parent, rows: response.rows as Record<string, unknown>[] }];
+  }
+
   private async expediteForeignRelations(
     reply: Extract<CommitReply, { status: "accepted" }>,
     destinations: Record<string, { destination: string; objects: string[] }>,
@@ -3460,10 +3489,10 @@ export class NetGatewayDO {
     }
   }
 
-  /** Resolve only enough verb metadata to decide whether the catalog declared
-   * a room-presence read. Mirrors parent-first then feature-chain dispatch
-   * without executing catalog code. */
-  private callReadsRoomPresence(view: CellStore, call: ShadowTurnCall): boolean {
+  /** Resolve only enough verb metadata to read a boolean dispatch flag the
+   * catalog declared on the target verb. Mirrors parent-first then
+   * feature-chain dispatch without executing catalog code. */
+  private callReadsVerbFlag(view: CellStore, call: ShadowTurnCall, flag: "reads_room_presence" | "reads_ordered_children"): boolean {
     const resolveChain = (start: string): boolean | null => {
       let object: string | null = start;
       const seen = new Set<string>();
@@ -3471,9 +3500,9 @@ export class NetGatewayDO {
         seen.add(object);
         for (const cell of view.cellsForObject(object)) {
           if (cell.kind !== "verb_bytecode") continue;
-          const verb = cell.value as { name?: unknown; aliases?: unknown; reads_room_presence?: unknown };
+          const verb = cell.value as { name?: unknown; aliases?: unknown; [k: string]: unknown };
           const names = [verb.name, ...(Array.isArray(verb.aliases) ? verb.aliases : [])];
-          if (names.includes(call.verb)) return verb.reads_room_presence === true;
+          if (names.includes(call.verb)) return verb[flag] === true;
         }
         const lineage = view.get(cellKey("object_lineage", object))?.value as { parent?: unknown } | undefined;
         object = typeof lineage?.parent === "string" ? lineage.parent : null;
@@ -3492,6 +3521,18 @@ export class NetGatewayDO {
       if (resolved !== null) return resolved;
     }
     return false;
+  }
+
+  /** Whether the dispatched verb declared `reads_room_presence` (the gateway
+   * then seeds the compact owner roster into planning). */
+  private callReadsRoomPresence(view: CellStore, call: ShadowTurnCall): boolean {
+    return this.callReadsVerbFlag(view, call, "reads_room_presence");
+  }
+
+  /** Whether the dispatched verb declared `reads_ordered_children` (the
+   * gateway then seeds the ordered-children projection into planning). */
+  private callReadsOrderedChildren(view: CellStore, call: ShadowTurnCall): boolean {
+    return this.callReadsVerbFlag(view, call, "reads_ordered_children");
   }
 
   /** The scope pinned to an idempotency key, or null (fix 5c). */
@@ -3841,7 +3882,8 @@ export class NetGatewayDO {
     classifier: ScopeClassifier,
     objectCounter?: number,
     planningRoomRoster?: { room: string; rows: readonly RoomRosterRow[] },
-    seedObjects?: ReadonlySet<string>
+    seedObjects?: ReadonlySet<string>,
+    planningOrderedChildren?: readonly { parent: string | null; rows: readonly Record<string, unknown>[] }[]
   ): Promise<PlanTurnResult> {
     return planTurn({
       call: request.call,
@@ -3867,6 +3909,7 @@ export class NetGatewayDO {
       // O(read-set), not O(view).
       slicePlanning: true,
       ...(planningRoomRoster ? { planningRoomRoster } : {}),
+      ...(planningOrderedChildren && planningOrderedChildren.length > 0 ? { planningOrderedChildren } : {}),
       // Creates over net (client-shell phase i): the planning-scope
       // authority's allocation floor, prefetched with its head, so a
       // planned create's id is fresh at the authority. A lane fixture's

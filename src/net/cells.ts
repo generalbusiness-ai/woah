@@ -214,6 +214,13 @@ export class CellStore {
     return this.cells.keys();
   }
 
+  /** Every cell in the store (for owner-side projections that reduce the
+   * whole scope, e.g. the ordered-children scan — O(store), on the authority
+   * only, producing ONE bounded value). */
+  allCells(): IterableIterator<Cell> {
+    return this.cells.values();
+  }
+
   get size(): number {
     return this.cells.size;
   }

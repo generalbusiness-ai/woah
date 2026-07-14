@@ -51,6 +51,7 @@ import {
 } from "./turn-effects";
 import { readObjectPropertyValue } from "./property-read";
 import { redactSensitiveSerializedPropertyValues } from "./sensitive-serialization";
+import { ORDERED_EDGE_PROP, type OrderedChildRow, type OrderedEdgeValue } from "./ordered-edge";
 
 export type NativeHandler = (ctx: CallContext, args: WooValue[]) => WooValue | Promise<WooValue>;
 const GUEST_SESSION_GRACE_MS = 60_000;
@@ -613,6 +614,15 @@ export class WooWorld {
   // sparse by construction, so a local fallback would be a plausible-looking
   // partial roster rather than a safe degradation.
   private requireRoomRosterProjection = false;
+  /** Owner-computed ordered-children values (one bounded list per parent),
+   * the ordering analogue of `roomRosterProjections`. Installed only in an
+   * ephemeral planning world; keyed by the parent ref (null → the sentinel
+   * below for ordering roots). */
+  private readonly orderedChildrenProjections = new Map<string, WooValue[]>();
+  // Net planning enables this so a sparse world FAILS LOUDLY rather than
+  // deriving a partial ordering from whichever edge cells happened to
+  // materialize (mirror of requireRoomRosterProjection).
+  private requireOrderedChildrenProjection = false;
   /** Net planning commits recorder cells rather than this ephemeral graph.
    * Keep authoring recording opt-in so the frozen v2 materializer is unchanged. */
   private recordAuthoringCellWrites = false;
@@ -706,6 +716,59 @@ export class WooWorld {
       location_name: roomName,
       presence: "awake"
     } as unknown as WooValue]);
+  }
+
+  // ── Owner-computed ordered-children projection ─────────────────────────
+  // The ordering analogue of the room roster: net planning fetches the
+  // bounded ordered list of a parent's children from the room authority and
+  // installs it here, so a verb reads sibling order as ONE value instead of
+  // pulling every sibling's edge cell into the turn's read closure. Only the
+  // ephemeral planning world holds these; they never persist or export.
+
+  /** null parent (an ordering root) maps to a reserved, un-ref-like key. */
+  private static orderedChildrenKey(parent: ObjRef | null): string {
+    return parent === null ? "\0ordered_root" : parent;
+  }
+
+  installOrderedChildrenProjection(parent: ObjRef | null, rows: readonly Record<string, unknown>[]): void {
+    this.orderedChildrenProjections.set(
+      WooWorld.orderedChildrenKey(parent),
+      cloneImportedPlainData(rows) as WooValue[]
+    );
+  }
+
+  setRequireOrderedChildrenProjection(required: boolean): void {
+    this.requireOrderedChildrenProjection = required;
+  }
+
+  /** The ordered `[{child, rank}]` list of `parent`'s direct children. On a
+   * sparse net planning world the owner projection MUST have been installed
+   * (missing => a hard E_INTERNAL, never a partial local derivation). A
+   * complete local runtime (in-memory / SQLite dev) derives it by scanning
+   * objects' local edge property — the ordering analogue of
+   * `roomRosterProjection`'s local-session fallback. */
+  orderedChildrenProjection(parent: ObjRef | null): WooValue[] {
+    const projected = this.orderedChildrenProjections.get(WooWorld.orderedChildrenKey(parent));
+    if (projected !== undefined) return cloneImportedPlainData(projected);
+
+    if (this.requireOrderedChildrenProjection) {
+      throw wooError("E_INTERNAL", `sparse planning ordered-children projection missing for ${parent ?? "<root>"}`);
+    }
+
+    // Local fallback: scan every object's LOCAL edge property. Edges are a
+    // per-item local value, so an inherited class default never participates.
+    const rows: OrderedChildRow[] = [];
+    for (const obj of this.objects.values()) {
+      const raw = obj.properties.get(ORDERED_EDGE_PROP) as OrderedEdgeValue | undefined;
+      if (!raw || typeof raw !== "object") continue;
+      const rank = (raw as OrderedEdgeValue).rank;
+      const edgeParent = (raw as OrderedEdgeValue).parent ?? null;
+      if (typeof rank !== "string" || rank.length === 0) continue;
+      if (edgeParent !== parent) continue;
+      rows.push({ child: obj.id, rank });
+    }
+    rows.sort((a, b) => (a.rank < b.rank ? -1 : a.rank > b.rank ? 1 : a.child < b.child ? -1 : a.child > b.child ? 1 : 0));
+    return rows as unknown as WooValue[];
   }
 
   // CA11.2: attach the planning world's per-cell provenance so the
@@ -2185,6 +2248,7 @@ export class WooWorld {
       direct_callable: verb.direct_callable === true,
       tool_exposed: verb.tool_exposed === true,
       reads_room_presence: verb.reads_room_presence === true,
+      reads_ordered_children: verb.reads_ordered_children === true,
       source_hash: verb.source_hash ?? ""
     };
   }
@@ -5820,6 +5884,7 @@ export class WooWorld {
       direct_callable: verb.direct_callable === true,
       tool_exposed: verb.tool_exposed === true,
       reads_room_presence: verb.reads_room_presence === true,
+      reads_ordered_children: verb.reads_ordered_children === true,
       readable
     };
     if (readable && options.includeSource) {
@@ -12543,6 +12608,7 @@ function cloneImportedVerb(verb: VerbDef, slot: number): VerbDef {
     perms: parsedPerms.perms,
     direct_callable: parsedPerms.directCallable,
     reads_room_presence: verb.reads_room_presence === true ? true : undefined,
+    reads_ordered_children: verb.reads_ordered_children === true ? true : undefined,
     slot
   };
   if (verb.kind === "bytecode") {
