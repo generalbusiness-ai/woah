@@ -1,8 +1,8 @@
 {
   "name": "outliner",
-  "version": "1.0.1",
+  "version": "2.0.0",
   "spec_version": "v1",
-  "description": "Shared hierarchical text outliner. Each item is an $outline_item < $note tree node with .parent / .position / .hidden; the outliner is an $outliner < $room that scopes items and tracks per-actor focus + single-level undo from movement hooks. UI is minimal: collapse/expand, drag-reorder, drag-drop reparent, hidden checkbox, undo button, and embedded minichat. Chat carries 'add' / 'hide <item>' / 'focus [<item>]' commands. Items are not portable: they cannot be carried; removal recycles, with children re-attached to the removed item's former parent.",
+  "description": "Shared hierarchical text outliner. Each item is an $outline_item < $note tree node whose parent + sibling order live in ONE room-owned `__ordered_edge` { parent, rank } cell (fractional-rank ordered index — the sole structural authority; no per-item position/renumber). The outliner is an $outliner < $room that scopes items and tracks per-actor focus + single-level undo. Items are not portable; removal recycles and re-homes children to the removed item's former parent.",
   "license": "MIT",
   "depends": [
     "@local:chat",
@@ -24,7 +24,12 @@
         "surface": "main",
         "subject": "$outliner",
         "neighborhood": {
-          "include": ["subject", "contents", "session_subscribers", "actor"]
+          "include": [
+            "subject",
+            "contents",
+            "session_subscribers",
+            "actor"
+          ]
         }
       }
     ],
@@ -35,8 +40,18 @@
         "view": "default",
         "layout": "space-workspace",
         "regions": {
-          "main": [{ "component": "outliner.tree", "subject": "this" }],
-          "chat": [{ "component": "chat:chat.space-mini", "subject": "this" }]
+          "main": [
+            {
+              "component": "outliner.tree",
+              "subject": "this"
+            }
+          ],
+          "chat": [
+            {
+              "component": "chat:chat.space-mini",
+              "subject": "this"
+            }
+          ]
         }
       }
     ],
@@ -60,7 +75,11 @@
     "chat_formatters": [
       {
         "module": "outliner-ui",
-        "types": ["outliner_entered", "outliner_left", "outliner_activity"]
+        "types": [
+          "outliner_entered",
+          "outliner_left",
+          "outliner_activity"
+        ]
       }
     ]
   },
@@ -68,56 +87,92 @@
     {
       "local_name": "$outline_item",
       "parent": "$note",
-      "description": "One node in an outliner tree. Holds the inherited $note text/name/description/writers shape plus its own .parent (objref of containing item or null = top-level), .position (1-indexed sibling rank; siblings carry a dense 1..N), and .hidden (per-item flag). NOT portable: cannot be taken into actor inventory or moved anywhere that isn't an $outliner or $nowhere. Removal recycles; the :recycle handler detaches from the outliner so children remain parented at the former parent.",
+      "description": "One node in an outliner tree. Holds the inherited $note text/name/description/writers shape plus its own `.__ordered_edge` { parent, rank } (the sole structural authority: parent objref or null = top-level, and a fractional rank among siblings) and `.hidden`. NOT portable. Removal recycles; the :recycle handler detaches from the outliner so children re-home to the former parent.",
       "properties": [
-        { "name": "portable", "type": "bool", "default": false, "perms": "r" },
-        { "name": "parent", "type": "obj|null", "default": null, "perms": "r" },
-        { "name": "position", "type": "int", "default": 0, "perms": "r" },
-        { "name": "hidden", "type": "bool", "default": false, "perms": "r" }
+        {
+          "name": "portable",
+          "type": "bool",
+          "default": false,
+          "perms": "r"
+        },
+        {
+          "name": "hidden",
+          "type": "bool",
+          "default": false,
+          "perms": "r"
+        },
+        {
+          "name": "__ordered_edge",
+          "type": "map|null",
+          "default": null,
+          "perms": "r",
+          "description": "Sole structural authority: { parent: <objref|null>, rank: <fractional-rank string> }. Room-owned edge cell scanned by the ordered_children projection; null = unset."
+        }
       ],
       "verbs": [
         {
           "name": "moveto",
           "perms": "rxd",
           "direct_callable": true,
-          "arg_spec": { "args": ["target"] },
+          "arg_spec": {
+            "args": [
+              "target"
+            ]
+          },
           "source": "verb :moveto(target) rx {\n  // Restrict $outline_item to outliners and $nowhere (recycle). Reject\n  // any attempt to move into an actor's inventory, a room, or another\n  // non-outliner container; this is what makes the class not-carryable.\n  // Cross-outliner moves are allowed for the item owner, source-outliner\n  // owner, or wizard.\n  if (target == $nowhere) {\n    moveto(this, target);\n    return true;\n  }\n  if (!isa(target, $outliner)) {\n    raise { code: \"E_NOT_PORTABLE\", message: \"outline items can only live in an $outliner\", value: { item: this, target: target } };\n  }\n  let here = location(this);\n  if (here != target && isa(here, $outliner)) {\n    let allowed = false;\n    if (this.owner == actor) { allowed = true; }\n    if (here.owner == actor) { allowed = true; }\n    if (has_flag(actor, \"wizard\")) { allowed = true; }\n    if (!allowed) {\n      raise { code: \"E_PERM\", message: \"only the item owner, source outliner owner, or a wizard can move an item across outliners\", value: { item: this, from: here, to: target } };\n    }\n  }\n  moveto(this, target);\n  return true;\n}"
         },
         {
           "name": "recycle",
           "perms": "rx",
-          "arg_spec": { "args": [] },
+          "arg_spec": {
+            "args": []
+          },
           "source": "verb :recycle() rx {\n  // Defensive cleanup: substrate recycle does not fire :exitfunc, so a\n  // direct recycle(item) would otherwise leave children pointing at a\n  // tombstoned .parent. Detach from the containing outliner first.\n  let here = location(this);\n  if (isa(here, $outliner)) {\n    try { here:_detach_item(this, { emit: true, clear_item: true }); } except err { }\n  }\n  return true;\n}"
         },
         {
           "name": "set_hidden",
           "perms": "rx",
-          "arg_spec": { "args": ["hidden"] },
+          "arg_spec": {
+            "args": [
+              "hidden"
+            ]
+          },
           "source": "verb :set_hidden(hidden) rx {\n  if (typeof(hidden) != \"boolean\") {\n    if (hidden == 0) { hidden = false; }\n    else { if (hidden == 1) { hidden = true; } else { raise { code: \"E_INVARG\", message: \"set_hidden requires a boolean\", value: hidden }; } }\n  }\n  let here = location(this);\n  let allowed = false;\n  if (isa(here, $outliner)) {\n    let actor_loc = location(actor);\n    if (actor_loc == here) { allowed = true; }\n  }\n  if (this.owner == actor) { allowed = true; }\n  if (has_flag(actor, \"wizard\")) { allowed = true; }\n  if (!allowed) { raise { code: \"E_PERM\", message: \"cannot toggle hidden on this item\", value: this }; }\n  this.hidden = hidden;\n  return true;\n}"
-        },
-        {
-          "name": "set_position",
-          "perms": "rx",
-          "arg_spec": { "args": ["position"] },
-          "source": "verb :set_position(position) rx {\n  if (typeof(position) != \"number\") { raise { code: \"E_INVARG\", message: \"position must be an int\", value: position }; }\n  if (position < 0) { raise { code: \"E_INVARG\", message: \"position must be >= 0 (0 = transient cleared marker)\", value: position }; }\n  let here = location(this);\n  let allowed = false;\n  if (isa(here, $outliner)) {\n    if (location(actor) == here) { allowed = true; }\n  }\n  if (this.owner == actor) { allowed = true; }\n  if (has_flag(actor, \"wizard\")) { allowed = true; }\n  if (!allowed) { raise { code: \"E_PERM\", message: \"cannot set item position\", value: this }; }\n  this.position = floor(position);\n  return true;\n}"
-        },
-        {
-          "name": "set_parent",
-          "perms": "rx",
-          "arg_spec": { "args": ["new_parent"] },
-          "source": "verb :set_parent(new_parent) rx {\n  let here = location(this);\n  if (!isa(here, $outliner)) { raise { code: \"E_INVARG\", message: \"item is not in an outliner\", value: this }; }\n  if (new_parent != null) {\n    if (!isa(new_parent, $outline_item)) { raise { code: \"E_INVARG\", message: \"parent must be an $outline_item or null\", value: new_parent }; }\n    if (location(new_parent) != here) { raise { code: \"E_INVARG\", message: \"parent must be in the same outliner\", value: new_parent }; }\n    if (new_parent == this) { raise { code: \"E_CYCLE\", message: \"item cannot be its own parent\", value: this }; }\n    let p = new_parent.parent;\n    while (p != null) {\n      if (p == this) { raise { code: \"E_CYCLE\", message: \"cycle detected\", value: { item: this, parent: new_parent } }; }\n      p = p.parent;\n    }\n  }\n  let allowed = false;\n  if (location(actor) == here) { allowed = true; }\n  if (this.owner == actor) { allowed = true; }\n  if (has_flag(actor, \"wizard\")) { allowed = true; }\n  if (!allowed) { raise { code: \"E_PERM\", message: \"cannot reparent item\", value: this }; }\n  this.parent = new_parent;\n  return true;\n}"
         }
       ]
     },
     {
       "local_name": "$outliner",
       "parent": "$room",
-      "description": "Shared hierarchical text outliner: a $room that scopes a tree of $outline_item children. Tree shape (parent / position / hidden) lives on the items themselves; the outliner stores only visit-scoped per-actor maps for focus and single-level undo, plus standard room presence. Chat commands: 'add <text>' (creates a new item under caller's focus), 'hide <item>' (sets the hidden flag), 'focus [<item>]' (sets per-actor focus, null = root).",
+      "description": "Shared hierarchical text outliner: a $room that scopes a tree of $outline_item children. Tree shape and order live ONLY in each item's `__ordered_edge` { parent, rank } cell (the room-owned ordered-edge index); the outliner stores visit-scoped per-actor focus + single-level undo maps plus standard room presence. Chat commands: 'add <text>', 'hide <item>', 'focus [<item>]'.",
       "properties": [
-        { "name": "focus_by_actor", "type": "map<str, obj|null>", "default": {}, "perms": "r" },
-        { "name": "last_undo", "type": "map<str, map|null>", "default": {}, "perms": "r" },
-        { "name": "mount_room", "type": "obj|null", "default": null, "perms": "r" },
-        { "name": "suppressed_inherited_tools", "type": "list<str>", "default": ["enter", "leave"], "perms": "r" }
+        {
+          "name": "focus_by_actor",
+          "type": "map<str, obj|null>",
+          "default": {},
+          "perms": "r"
+        },
+        {
+          "name": "last_undo",
+          "type": "map<str, map|null>",
+          "default": {},
+          "perms": "r"
+        },
+        {
+          "name": "mount_room",
+          "type": "obj|null",
+          "default": null,
+          "perms": "r"
+        },
+        {
+          "name": "suppressed_inherited_tools",
+          "type": "list<str>",
+          "default": [
+            "enter",
+            "leave"
+          ],
+          "perms": "r"
+        }
       ],
       "verbs": [
         {
@@ -125,18 +180,25 @@
           "perms": "rxd",
           "direct_callable": true,
           "skip_presence_check": true,
-          "arg_spec": { "args": [] },
+          "arg_spec": {
+            "args": []
+          },
           "source": "verb :title() rxd { return this.name + \" (outliner)\"; }"
         },
         {
           "name": "look",
-          "aliases": ["l@ook", "ex@amine"],
+          "aliases": [
+            "l@ook",
+            "ex@amine"
+          ],
           "perms": "rxd",
           "direct_callable": true,
           "skip_presence_check": true,
           "reads_room_presence": true,
           "tool_exposed": true,
-          "arg_spec": { "args": [] },
+          "arg_spec": {
+            "args": []
+          },
           "source": "verb :look() rxd { let view = this:look_self(); observe({ type: \"looked\", actor: actor, to: actor, room: location(this), target: this, text: view[\"summary\"], look: view, ts: now() }); return view; }"
         },
         {
@@ -145,7 +207,9 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "reads_room_presence": true,
-          "arg_spec": { "args": [] },
+          "arg_spec": {
+            "args": []
+          },
           "source": "verb :look_self() rxd {\n  let items = this:list_items();\n  let n = length(items);\n  let summary = this.name + \" has \" + to_string(n) + \" item\";\n  if (n != 1) { summary = summary + \"s\"; }\n  summary = summary + \".\";\n  let focus = null;\n  let key = to_string(actor);\n  let fmap = this.focus_by_actor;\n  if (has(fmap, key)) { focus = fmap[key]; }\n  return { id: this, title: this.name, description: this.description, summary: summary, item_count: n, items: items, roster: this:room_roster(), focus: focus };\n}"
         },
         {
@@ -154,7 +218,9 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "reads_room_presence": true,
-          "arg_spec": { "args": [] },
+          "arg_spec": {
+            "args": []
+          },
           "source": "verb :room_roster() rxd {\n  // Adapt the compact owner projection without dereferencing actor clusters.\n  let rows = [];\n  for compact in room_roster(this) {\n    let row = { id: compact[\"player\"], name: compact[\"name\"], presence: compact[\"presence\"] };\n    if (compact[\"idle_seconds\"] != null) { row[\"idle_seconds\"] = compact[\"idle_seconds\"]; }\n    rows = rows + [row];\n  }\n  return rows;\n}"
         },
         {
@@ -162,26 +228,45 @@
           "perms": "rxd",
           "direct_callable": true,
           "skip_presence_check": true,
-          "arg_spec": { "args": ["observation?"] },
+          "arg_spec": {
+            "args": [
+              "observation?"
+            ]
+          },
           "source": "verb :live_audience(observation) rxd { let out = []; for row in this.session_subscribers { if (typeof(row) == \"map\" && has(row, \"session\")) { out = out + [row[\"session\"]]; } } return out; }",
-          "implementation": { "kind": "native", "handler": "space_live_audience" }
+          "implementation": {
+            "kind": "native",
+            "handler": "space_live_audience"
+          }
         },
         {
           "name": "acceptable",
           "perms": "rxd",
-          "arg_spec": { "args": ["object"] },
+          "arg_spec": {
+            "args": [
+              "object"
+            ]
+          },
           "source": "verb :acceptable(object) rxd { return isa(object, $outline_item) || isa(object, $actor); }"
         },
         {
           "name": "enterfunc",
           "perms": "rx",
-          "arg_spec": { "args": ["object"] },
-          "source": "verb :enterfunc(object) rx {\n  if (isa(object, $actor)) {\n    // Visit-scoped editing state is reset by movement, but absence already means\n    // root focus / no undo. Avoid no-op shared-map writes on ordinary entry.\n    let key = to_string(object);\n    let fmap = this.focus_by_actor;\n    if (has(fmap, key) && fmap[key] != null) {\n      fmap[key] = null;\n      this.focus_by_actor = fmap;\n    }\n    let umap = this.last_undo;\n    if (has(umap, key)) {\n      let next = {};\n      for k in keys(umap) { if (k != key) { next[k] = umap[k]; } }\n      this.last_undo = next;\n    }\n    let text = object.name + \" opens \" + this.name + \".\";\n    observe({ type: \"outliner_entered\", source: this, actor: object, outliner: this, origin: this.mount_room, text: text, ts: now() });\n    if (this.mount_room != null) {\n      observe_to_space(this.mount_room, { type: \"outliner_activity\", source: this.mount_room, outliner: this, actor: object, text: text, ts: now() });\n    }\n    return true;\n  }\n  if (isa(object, $outline_item)) {\n    // Validate parent: if set, must point at a same-outliner item.\n    let p = null;\n    try { p = object.parent; } except err { p = null; }\n    if (p != null) {\n      if (!isa(p, $outline_item) || location(p) != this) {\n        // Inconsistent — clear to root rather than leaving a dangling parent.\n        object:set_parent(null);\n        p = null;\n      }\n    }\n    // If position isn't set or is 0, allocate at end of the sibling list.\n    let pos = 0;\n    try { pos = object.position; } except err { pos = 0; }\n    if (typeof(pos) != \"number\" || pos < 1) {\n      let siblings = this:_siblings_ordered(p);\n      this:_renumber_siblings(p, siblings);\n    } else {\n      // Position present; trust it. (Renumber is the caller's job for moves.)\n    }\n    let siblings_after = this:_siblings_ordered(p);\n    let idx = 0; let i = 1;\n    for s in siblings_after { if (s == object) { idx = i - 1; } i = i + 1; }\n    let body = \"\";\n    try { body = object:text(); } except err { body = \"\"; }\n    observe({ type: \"outline_item_added\", source: this, actor: actor, outliner: this, item: object, parent_id: p, index: idx, text: body, ts: now() });\n  }\n  return true;\n}"
+          "arg_spec": {
+            "args": [
+              "object"
+            ]
+          },
+          "source": "verb :enterfunc(object) rx {\n  if (isa(object, $actor)) {\n    // Visit-scoped editing state is reset by movement, but absence already means\n    // root focus / no undo. Avoid no-op shared-map writes on ordinary entry.\n    let key = to_string(object);\n    let fmap = this.focus_by_actor;\n    if (has(fmap, key) && fmap[key] != null) {\n      fmap[key] = null;\n      this.focus_by_actor = fmap;\n    }\n    let umap = this.last_undo;\n    if (has(umap, key)) {\n      let next = {};\n      for k in keys(umap) { if (k != key) { next[k] = umap[k]; } }\n      this.last_undo = next;\n    }\n    let text = object.name + \" opens \" + this.name + \".\";\n    observe({ type: \"outliner_entered\", source: this, actor: object, outliner: this, origin: this.mount_room, text: text, ts: now() });\n    if (this.mount_room != null) {\n      observe_to_space(this.mount_room, { type: \"outliner_activity\", source: this.mount_room, outliner: this, actor: object, text: text, ts: now() });\n    }\n    return true;\n  }\n  // Items no longer self-place on enter: add_item / move_item / _restore_item\n  // own edge placement and emit the observation. The edge index is the sole\n  // structural authority, so a physical enter is a no-op for items.\n  return true;\n}"
         },
         {
           "name": "exitfunc",
           "perms": "rx",
-          "arg_spec": { "args": ["object"] },
+          "arg_spec": {
+            "args": [
+              "object"
+            ]
+          },
           "source": "verb :exitfunc(object) rx {\n  if (isa(object, $actor)) {\n    // Entry and user mutations clean up visit-scoped focus/undo maps. Exit stays\n    // observation-only to avoid shared-map conflicts during cross-scope moves.\n    let text = object.name + \" closes \" + this.name + \".\";\n    observe({ type: \"outliner_left\", source: this, actor: object, outliner: this, destination: this.mount_room, text: text, ts: now() });\n    if (this.mount_room != null) {\n      observe_to_space(this.mount_room, { type: \"outliner_activity\", source: this.mount_room, outliner: this, actor: object, text: text, ts: now() });\n    }\n    return true;\n  }\n  if (isa(object, $outline_item)) {\n    this:_detach_item(object, { emit: true, clear_item: true });\n  }\n  return true;\n}"
         },
         {
@@ -190,40 +275,43 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "tool_exposed": true,
-          "arg_spec": { "args": [] },
-          "source": "verb :list_items() rxd {\n  // Native projection helper keeps the catalog's item-owned tree model but\n  // avoids building large joined views through woocode's functional-list\n  // allocation path. It preserves stale-ref tolerance, position ordering,\n  // depth-first traversal, and the item:text() read gate.\n  return object_tree_rows(this, $outline_item, \"parent\", \"position\", \"text\", \"hidden\");\n}"
-        },
-        {
-          "name": "_siblings_ordered",
-          "perms": "rxd",
-          "direct_callable": true,
-          "skip_presence_check": true,
-          "arg_spec": { "args": ["parent_id"] },
-          "source": "verb :_siblings_ordered(parent_id) rxd {\n  // The substrate helper performs the same contents scan and stale-ref guard\n  // as the old woocode loop, but returns the sorted list without quadratic\n  // VM list-allocation accounting on large outlines.\n  return object_siblings_ordered(this, $outline_item, \"parent\", \"position\", parent_id);\n}"
-        },
-        {
-          "name": "_renumber_siblings",
-          "perms": "rx",
-          "arg_spec": { "args": ["parent_id", "ordered"] },
-          "source": "verb :_renumber_siblings(parent_id, ordered) rx {\n  let i = 1;\n  for it in ordered {\n    // Internal composer path: callers have already built a valid sibling\n    // order for this outliner, so use catalog-owner authority instead of the\n    // public item:set_position presence gate.\n    it.position = i;\n    i = i + 1;\n  }\n  return true;\n}"
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :list_items() rxd {\n  // Edge-based whole-tree read: object_tree_rows derives the tree shape and\n  // each row's index from the items' `__ordered_edge` { parent, rank } cells\n  // (fractional-rank order), never from separate parent/position props.\n  return object_tree_rows(this, $outline_item, \"__ordered_edge\", \"text\", \"hidden\");\n}"
         },
         {
           "name": "_detach_item",
           "perms": "rx",
-          "arg_spec": { "args": ["item", "opts"] },
-          "source": "verb :_detach_item(item, opts) rx {\n  if (typeof(opts) != \"map\") { opts = {}; }\n  let emit = true;\n  if (has(opts, \"emit\")) { emit = opts[\"emit\"]; }\n  let clear_item = true;\n  if (has(opts, \"clear_item\")) { clear_item = opts[\"clear_item\"]; }\n  let former_parent = null;\n  try { former_parent = item.parent; } except err { former_parent = null; }\n  // Snapshot direct children of the leaving item, sorted, and reparent them.\n  let kids = this:_siblings_ordered(item);\n  let parent_siblings = this:_siblings_ordered(former_parent);\n  // Build new sibling order under former_parent: existing siblings, with\n  // kids spliced in adjacent to where the leaving item sat.\n  let item_idx = 0;\n  let i = 1;\n  for s in parent_siblings { if (s == item) { item_idx = i - 1; } i = i + 1; }\n  let new_parent_order = [];\n  let cur = 0;\n  for s in parent_siblings {\n    if (s == item) {\n      // Don't include the leaving item.\n      for kid in kids { new_parent_order = new_parent_order + [kid]; }\n    } else {\n      new_parent_order = new_parent_order + [s];\n    }\n    cur = cur + 1;\n  }\n  // Reparent kids to former_parent.\n  for kid in kids { kid:set_parent(former_parent); }\n  // Renumber siblings under former_parent (kids land at the leaving item's slot).\n  this:_renumber_siblings(former_parent, new_parent_order);\n  if (clear_item) {\n    item:set_parent(null);\n    item:set_position(0);\n  }\n  if (emit) {\n    observe({ type: \"outline_item_removed\", source: this, actor: actor, outliner: this, item: item, reparented_to: former_parent, ts: now() });\n  }\n  return true;\n}"
+          "arg_spec": {
+            "args": [
+              "item",
+              "opts"
+            ]
+          },
+          "source": "verb :_detach_item(item, opts) rx {\n  if (typeof(opts) != \"map\") { opts = {}; }\n  let emit = true;\n  if (has(opts, \"emit\")) { emit = opts[\"emit\"]; }\n  let clear_item = true;\n  if (has(opts, \"clear_item\")) { clear_item = opts[\"clear_item\"]; }\n  // Former parent from the leaving item's own edge.\n  let e = item.__ordered_edge; let former_parent = null;\n  if (typeof(e) == \"map\") { former_parent = e[\"parent\"]; }\n  // Re-home DIRECT children to former_parent, appended after its current\n  // siblings — one edge rewrite per direct child (bounded to direct children).\n  let kids = ordered_children(item);\n  let base = ordered_children(former_parent);\n  let last = null;\n  if (length(base) > 0) { last = base[length(base)][\"rank\"]; }\n  for kr in kids {\n    let kid = kr[\"child\"];\n    let nr = rank_between(last, null);\n    kid.__ordered_edge = { parent: former_parent, rank: nr };\n    last = nr;\n  }\n  if (clear_item) {\n    // Detach the leaving item itself (empty rank = no effective edge).\n    item.__ordered_edge = { parent: null, rank: \"\" };\n  }\n  if (emit) {\n    observe({ type: \"outline_item_removed\", source: this, actor: actor, outliner: this, item: item, reparented_to: former_parent, ts: now() });\n  }\n  return true;\n}"
         },
         {
           "name": "_set_undo",
           "perms": "rx",
-          "arg_spec": { "args": ["actor_obj", "record"] },
+          "arg_spec": {
+            "args": [
+              "actor_obj",
+              "record"
+            ]
+          },
           "source": "verb :_set_undo(actor_obj, record) rx {\n  let key = to_string(actor_obj);\n  let umap = this.last_undo;\n  let next = {};\n  // Prune against the owner-authoritative roster, never one shard's actors.\n  let present_keys = {};\n  for compact in room_roster(this) { present_keys[to_string(compact[\"player\"])] = true; }\n  for k in keys(umap) {\n    if (k != key && has(present_keys, k)) { next[k] = umap[k]; }\n  }\n  next[key] = record;\n  this.last_undo = next;\n  return true;\n}"
         },
         {
           "name": "_restore_item",
           "perms": "rx",
-          "arg_spec": { "args": ["state", "_no_store"] },
-          "source": "verb :_restore_item(state, _no_store) rx {\n  if (typeof(state) != \"map\") { raise { code: \"E_INVARG\", message: \"_restore_item requires a state map\", value: state }; }\n  let parent_id = null;\n  if (has(state, \"parent_id\")) { parent_id = state[\"parent_id\"]; }\n  if (parent_id != null) {\n    if (!isa(parent_id, $outline_item) || location(parent_id) != this || is_recycled(parent_id)) { parent_id = null; }\n  }\n  let writers = [];\n  if (has(state, \"writers\")) {\n    for w in state[\"writers\"] {\n      if (!is_recycled(w)) { writers = writers + [w]; }\n    }\n  }\n  let item_name = \"\";\n  if (has(state, \"name\")) { item_name = state[\"name\"]; }\n  let item_desc = \"\";\n  if (has(state, \"description\")) { item_desc = state[\"description\"]; }\n  let item_owner = actor;\n  if (has(state, \"owner\")) {\n    if (!is_recycled(state[\"owner\"])) { item_owner = state[\"owner\"]; }\n  }\n  let body = \"\";\n  if (has(state, \"text\")) { body = state[\"text\"]; }\n  let hidden = false;\n  if (has(state, \"hidden\")) { hidden = state[\"hidden\"]; }\n  let captured_index = 0;\n  if (has(state, \"index\")) { captured_index = state[\"index\"]; }\n  // Create the new item.\n  let opts = { owner: item_owner, name: item_name, description: item_desc, location: this };\n  let item = create($outline_item, opts);\n  item:set_parent(parent_id);\n  // Insert into parent's siblings at captured_index (clamped).\n  let siblings = this:_siblings_ordered(parent_id);\n  // Filter out item if enterfunc already placed it via renumber.\n  let without = [];\n  for s in siblings { if (s != item) { without = without + [s]; } }\n  let target_idx = captured_index;\n  if (target_idx < 0) { target_idx = 0; }\n  if (target_idx > length(without)) { target_idx = length(without); }\n  let new_order = [];\n  let cur = 0;\n  let inserted = false;\n  for s in without {\n    if (cur == target_idx && !inserted) {\n      new_order = new_order + [item];\n      inserted = true;\n    }\n    new_order = new_order + [s];\n    cur = cur + 1;\n  }\n  if (!inserted) { new_order = new_order + [item]; }\n  this:_renumber_siblings(parent_id, new_order);\n  item:set_hidden(hidden);\n  for w in writers { item:add_writer(w); }\n  item:set_text(body);\n  // Restore captured children: move each back under the new item at its captured rank.\n  if (has(state, \"children\")) {\n    let kid_idx = 0;\n    for entry in state[\"children\"] {\n      let kid = entry[\"item\"];\n      if (!is_recycled(kid)) {\n        if (isa(kid, $outline_item)) {\n          try { this:move_item(kid, item, kid_idx, true); } except err { }\n        }\n      }\n      kid_idx = kid_idx + 1;\n    }\n  }\n  if (!_no_store) {\n    this:_set_undo(actor, { verb: \"remove_item\", args: [item] });\n  }\n  return item;\n}"
+          "arg_spec": {
+            "args": [
+              "state",
+              "_no_store"
+            ]
+          },
+          "source": "verb :_restore_item(state, _no_store) rx {\n  if (typeof(state) != \"map\") { raise { code: \"E_INVARG\", message: \"_restore_item requires a state map\", value: state }; }\n  let parent_id = null;\n  if (has(state, \"parent_id\")) { parent_id = state[\"parent_id\"]; }\n  if (parent_id != null) {\n    if (!isa(parent_id, $outline_item) || location(parent_id) != this || is_recycled(parent_id)) { parent_id = null; }\n  }\n  let writers = [];\n  if (has(state, \"writers\")) {\n    for w in state[\"writers\"] {\n      if (!is_recycled(w)) { writers = writers + [w]; }\n    }\n  }\n  let item_name = \"\";\n  if (has(state, \"name\")) { item_name = state[\"name\"]; }\n  let item_desc = \"\";\n  if (has(state, \"description\")) { item_desc = state[\"description\"]; }\n  let item_owner = actor;\n  if (has(state, \"owner\")) {\n    if (!is_recycled(state[\"owner\"])) { item_owner = state[\"owner\"]; }\n  }\n  let body = \"\";\n  if (has(state, \"text\")) { body = state[\"text\"]; }\n  let hidden = false;\n  if (has(state, \"hidden\")) { hidden = state[\"hidden\"]; }\n  let captured_index = 0;\n  if (has(state, \"index\")) { captured_index = state[\"index\"]; }\n  let item = create($outline_item, { owner: item_owner, name: item_name, description: item_desc, location: this });\n  // Insert at the captured index under parent_id via one fractional edge.\n  let rows = ordered_children(parent_id);\n  let n = length(rows);\n  let idx = captured_index;\n  if (typeof(idx) != \"number\") { idx = n; }\n  idx = floor(idx);\n  if (idx < 0) { idx = 0; }\n  if (idx > n) { idx = n; }\n  let lo = null; let hi = null;\n  if (idx > 0) { lo = rows[idx][\"rank\"]; }\n  if (idx < n) { hi = rows[idx + 1][\"rank\"]; }\n  item.__ordered_edge = { parent: parent_id, rank: rank_between(lo, hi) };\n  item:set_hidden(hidden);\n  for w in writers { item:add_writer(w); }\n  item:set_text(body);\n  // Restore captured children under the new item at their captured indices.\n  if (has(state, \"children\")) {\n    let kid_idx = 0;\n    for entry in state[\"children\"] {\n      let kid = entry[\"item\"];\n      if (!is_recycled(kid)) {\n        if (isa(kid, $outline_item)) {\n          try { this:move_item(kid, item, kid_idx, true); } except err { }\n        }\n      }\n      kid_idx = kid_idx + 1;\n    }\n  }\n  if (!_no_store) {\n    this:_set_undo(actor, { verb: \"remove_item\", args: [item] });\n  }\n  return item;\n}"
         },
         {
           "name": "add_item",
@@ -231,8 +319,16 @@
           "direct_callable": true,
           "tool_exposed": true,
           "reads_room_presence": true,
-          "arg_spec": { "args": ["text", "parent_id?", "index?", "_no_store?"] },
-          "source": "verb :add_item(text, parent_id, index, _no_store) rx {\n  if (typeof(text) != \"string\") { raise { code: \"E_INVARG\", message: \"add_item requires text\", value: text }; }\n  if (text == \"\") { raise { code: \"E_INVARG\", message: \"add_item requires non-empty text\", value: text }; }\n  // Default parent: caller's focus when parent_id is null.\n  let p = parent_id;\n  if (p == null) {\n    let key = to_string(actor);\n    let fmap = this.focus_by_actor;\n    if (has(fmap, key)) { p = fmap[key]; }\n  }\n  if (p != null) {\n    if (!isa(p, $outline_item)) { raise { code: \"E_INVARG\", message: \"parent must be an outline item\", value: p }; }\n    if (location(p) != this) { raise { code: \"E_INVARG\", message: \"parent is not in this outliner\", value: p }; }\n  }\n  let siblings = this:_siblings_ordered(p);\n  let n = length(siblings);\n  let idx = index;\n  if (typeof(idx) != \"number\") { idx = n; }\n  idx = floor(idx);\n  if (idx < 0 || idx > n) { raise { code: \"E_INDEX\", message: \"index out of range\", value: { index: idx, n: n } }; }\n  let item = create($outline_item, { owner: actor, location: this, name: \"\" });\n  item:set_parent(p);\n  let new_order = listinsert(siblings, idx + 1, item);\n  this:_renumber_siblings(p, new_order);\n  item:set_text(text);\n  observe({ type: \"outline_item_added\", source: this, actor: actor, outliner: this, item: item, parent_id: p, index: idx, text: text, ts: now() });\n  if (!_no_store) {\n    this:_set_undo(actor, { verb: \"remove_item\", args: [item] });\n  }\n  return item;\n}"
+          "arg_spec": {
+            "args": [
+              "text",
+              "parent_id?",
+              "index?",
+              "_no_store?"
+            ]
+          },
+          "source": "verb :add_item(text, parent_id, index, _no_store) rx {\n  if (typeof(text) != \"string\") { raise { code: \"E_INVARG\", message: \"add_item requires text\", value: text }; }\n  if (text == \"\") { raise { code: \"E_INVARG\", message: \"add_item requires non-empty text\", value: text }; }\n  // Default parent: caller's focus when parent_id is null.\n  let p = parent_id;\n  if (p == null) {\n    let key = to_string(actor);\n    let fmap = this.focus_by_actor;\n    if (has(fmap, key)) { p = fmap[key]; }\n  }\n  if (p != null) {\n    if (!isa(p, $outline_item)) { raise { code: \"E_INVARG\", message: \"parent must be an outline item\", value: p }; }\n    if (location(p) != this) { raise { code: \"E_INVARG\", message: \"parent is not in this outliner\", value: p }; }\n  }\n  // Bounded read: the owner-computed ordered children of `p` (rows carry ranks).\n  let rows = ordered_children(p);\n  let n = length(rows);\n  let idx = index;\n  if (typeof(idx) != \"number\") { idx = n; }\n  idx = floor(idx);\n  if (idx < 0 || idx > n) { raise { code: \"E_INDEX\", message: \"index out of range\", value: { index: idx, n: n } }; }\n  // Neighbour ranks at the insert slot; one fractional rank strictly between.\n  let lo = null; let hi = null;\n  if (idx > 0) { lo = rows[idx][\"rank\"]; }\n  if (idx < n) { hi = rows[idx + 1][\"rank\"]; }\n  let rank = rank_between(lo, hi);\n  // Room-anchored item (create sets anchor = this outliner's scope), then ONE\n  // authored edge cell. No contents scan, no renumber.\n  let item = create($outline_item, { owner: actor, location: this, name: \"\" });\n  item.__ordered_edge = { parent: p, rank: rank };\n  item:set_text(text);\n  observe({ type: \"outline_item_added\", source: this, actor: actor, outliner: this, item: item, parent_id: p, index: idx, text: text, ts: now() });\n  if (!_no_store) {\n    this:_set_undo(actor, { verb: \"remove_item\", args: [item] });\n  }\n  return item;\n}",
+          "reads_ordered_children": true
         },
         {
           "name": "set_item_text",
@@ -240,7 +336,13 @@
           "direct_callable": true,
           "tool_exposed": true,
           "reads_room_presence": true,
-          "arg_spec": { "args": ["item", "text", "_no_store?"] },
+          "arg_spec": {
+            "args": [
+              "item",
+              "text",
+              "_no_store?"
+            ]
+          },
           "source": "verb :set_item_text(item, text, _no_store) rx {\n  if (!isa(item, $outline_item)) { raise { code: \"E_NO_ITEM\", message: \"not an outline item\", value: item }; }\n  if (location(item) != this) { raise { code: \"E_NO_ITEM\", message: \"item is not in this outliner\", value: item }; }\n  let old_text = \"\";\n  try { old_text = item.text; } except err { old_text = \"\"; }\n  item:set_text(text);\n  if (!_no_store) {\n    this:_set_undo(actor, { verb: \"set_item_text\", args: [item, old_text] });\n  }\n  return true;\n}"
         },
         {
@@ -249,8 +351,16 @@
           "direct_callable": true,
           "tool_exposed": true,
           "reads_room_presence": true,
-          "arg_spec": { "args": ["item", "new_parent_id", "index?", "_no_store?"] },
-          "source": "verb :move_item(item, new_parent_id, index, _no_store) rx {\n  if (!isa(item, $outline_item)) { raise { code: \"E_NO_ITEM\", message: \"not an outline item\", value: item }; }\n  if (location(item) != this) { raise { code: \"E_NO_ITEM\", message: \"item is not in this outliner\", value: item }; }\n  if (new_parent_id != null) {\n    if (!isa(new_parent_id, $outline_item)) { raise { code: \"E_INVARG\", message: \"parent must be outline item or null\", value: new_parent_id }; }\n    if (location(new_parent_id) != this) { raise { code: \"E_INVARG\", message: \"parent is in a different outliner\", value: new_parent_id }; }\n    if (new_parent_id == item) { raise { code: \"E_CYCLE\", message: \"item cannot be its own parent\", value: item }; }\n    let p = new_parent_id.parent;\n    while (p != null) {\n      if (p == item) { raise { code: \"E_CYCLE\", message: \"cycle detected\", value: { item: item, parent: new_parent_id } }; }\n      p = p.parent;\n    }\n  }\n  let old_parent = item.parent;\n  let old_siblings = this:_siblings_ordered(old_parent);\n  let old_idx = 0; let i = 1;\n  for it in old_siblings { if (it == item) { old_idx = i - 1; } i = i + 1; }\n  let cross = (new_parent_id != old_parent);\n  let dest_siblings = old_siblings;\n  if (cross) { dest_siblings = this:_siblings_ordered(new_parent_id); }\n  // Compute dest length excluding the item if it's already in dest.\n  let dest_without = [];\n  for it in dest_siblings { if (it != item) { dest_without = dest_without + [it]; } }\n  let max_idx = length(dest_without);\n  let idx = index;\n  if (typeof(idx) != \"number\") { idx = max_idx; }\n  idx = floor(idx);\n  if (idx < 0 || idx > max_idx) { raise { code: \"E_INDEX\", message: \"index out of range\", value: { index: idx, max: max_idx } }; }\n  // No-op detect.\n  if (!cross && idx == old_idx) { return false; }\n  // Build new dest order.\n  let new_dest = [];\n  let cur = 0;\n  let inserted = false;\n  for it in dest_without {\n    if (cur == idx && !inserted) { new_dest = new_dest + [item]; inserted = true; }\n    new_dest = new_dest + [it];\n    cur = cur + 1;\n  }\n  if (!inserted) { new_dest = new_dest + [item]; }\n  item:set_parent(new_parent_id);\n  this:_renumber_siblings(new_parent_id, new_dest);\n  if (cross) {\n    let old_remaining = [];\n    for it in old_siblings { if (it != item) { old_remaining = old_remaining + [it]; } }\n    this:_renumber_siblings(old_parent, old_remaining);\n  }\n  observe({ type: \"outline_item_moved\", source: this, actor: actor, outliner: this, item: item, from_parent: old_parent, from_index: old_idx, to_parent: new_parent_id, to_index: idx, ts: now() });\n  if (!_no_store) {\n    this:_set_undo(actor, { verb: \"move_item\", args: [item, old_parent, old_idx] });\n  }\n  return true;\n}"
+          "arg_spec": {
+            "args": [
+              "item",
+              "new_parent_id",
+              "index?",
+              "_no_store?"
+            ]
+          },
+          "source": "verb :move_item(item, new_parent_id, index, _no_store) rx {\n  if (!isa(item, $outline_item)) { raise { code: \"E_NO_ITEM\", message: \"not an outline item\", value: item }; }\n  if (location(item) != this) { raise { code: \"E_NO_ITEM\", message: \"item is not in this outliner\", value: item }; }\n  if (new_parent_id != null) {\n    if (!isa(new_parent_id, $outline_item)) { raise { code: \"E_INVARG\", message: \"parent must be outline item or null\", value: new_parent_id }; }\n    if (location(new_parent_id) != this) { raise { code: \"E_INVARG\", message: \"parent is in a different outliner\", value: new_parent_id }; }\n    if (new_parent_id == item) { raise { code: \"E_CYCLE\", message: \"item cannot be its own parent\", value: item }; }\n    // Cycle guard: walk the new parent's ancestor edges (bounded by depth).\n    let pe = new_parent_id.__ordered_edge; let pp = null;\n    if (typeof(pe) == \"map\") { pp = pe[\"parent\"]; }\n    while (pp != null) {\n      if (pp == item) { raise { code: \"E_CYCLE\", message: \"cycle detected\", value: { item: item, parent: new_parent_id } }; }\n      let ge = pp.__ordered_edge; let gp = null;\n      if (typeof(ge) == \"map\") { gp = ge[\"parent\"]; }\n      pp = gp;\n    }\n  }\n  // Old parent + old index (for the observation + undo), from the item's edge.\n  let oe = item.__ordered_edge; let old_parent = null;\n  if (typeof(oe) == \"map\") { old_parent = oe[\"parent\"]; }\n  let old_rows = ordered_children(old_parent);\n  let old_idx = 0; let i = 0;\n  for r in old_rows { if (r[\"child\"] == item) { old_idx = i; } i = i + 1; }\n  let cross = (new_parent_id != old_parent);\n  let dest_rows = old_rows;\n  if (cross) { dest_rows = ordered_children(new_parent_id); }\n  // Neighbour list excludes the moving item.\n  let dest = [];\n  for r in dest_rows { if (r[\"child\"] != item) { dest = dest + [r]; } }\n  let max_idx = length(dest);\n  let idx = index;\n  if (typeof(idx) != \"number\") { idx = max_idx; }\n  idx = floor(idx);\n  if (idx < 0 || idx > max_idx) { raise { code: \"E_INDEX\", message: \"index out of range\", value: { index: idx, max: max_idx } }; }\n  if (!cross && idx == old_idx) { return false; }\n  let lo = null; let hi = null;\n  if (idx > 0) { lo = dest[idx][\"rank\"]; }\n  if (idx < max_idx) { hi = dest[idx + 1][\"rank\"]; }\n  let rank = rank_between(lo, hi);\n  // ONE edge rewrite; the old-parent siblings keep their ranks (no renumber).\n  item.__ordered_edge = { parent: new_parent_id, rank: rank };\n  observe({ type: \"outline_item_moved\", source: this, actor: actor, outliner: this, item: item, from_parent: old_parent, from_index: old_idx, to_parent: new_parent_id, to_index: idx, ts: now() });\n  if (!_no_store) {\n    this:_set_undo(actor, { verb: \"move_item\", args: [item, old_parent, old_idx] });\n  }\n  return true;\n}",
+          "reads_ordered_children": true
         },
         {
           "name": "reorder_item",
@@ -258,8 +368,15 @@
           "direct_callable": true,
           "tool_exposed": true,
           "reads_room_presence": true,
-          "arg_spec": { "args": ["item", "index", "_no_store?"] },
-          "source": "verb :reorder_item(item, index, _no_store) rx {\n  if (!isa(item, $outline_item)) { raise { code: \"E_NO_ITEM\", message: \"not an outline item\", value: item }; }\n  if (location(item) != this) { raise { code: \"E_NO_ITEM\", message: \"item is not in this outliner\", value: item }; }\n  let parent_id = item.parent;\n  let siblings = this:_siblings_ordered(parent_id);\n  let old_idx = 0; let i = 1;\n  for it in siblings { if (it == item) { old_idx = i - 1; } i = i + 1; }\n  let without = [];\n  for it in siblings { if (it != item) { without = without + [it]; } }\n  let max_idx = length(without);\n  let idx = index;\n  if (typeof(idx) != \"number\") { raise { code: \"E_INVARG\", message: \"reorder_item requires an index\", value: idx }; }\n  idx = floor(idx);\n  if (idx < 0 || idx > max_idx) { raise { code: \"E_INDEX\", message: \"index out of range\", value: { index: idx, max: max_idx } }; }\n  if (idx == old_idx) { return false; }\n  let new_order = [];\n  let cur = 0;\n  let inserted = false;\n  for it in without {\n    if (cur == idx && !inserted) { new_order = new_order + [item]; inserted = true; }\n    new_order = new_order + [it];\n    cur = cur + 1;\n  }\n  if (!inserted) { new_order = new_order + [item]; }\n  this:_renumber_siblings(parent_id, new_order);\n  observe({ type: \"outline_item_reordered\", source: this, actor: actor, outliner: this, item: item, parent_id: parent_id, from_index: old_idx, to_index: idx, ts: now() });\n  if (!_no_store) {\n    this:_set_undo(actor, { verb: \"reorder_item\", args: [item, old_idx] });\n  }\n  return true;\n}"
+          "arg_spec": {
+            "args": [
+              "item",
+              "index",
+              "_no_store?"
+            ]
+          },
+          "source": "verb :reorder_item(item, index, _no_store) rx {\n  if (!isa(item, $outline_item)) { raise { code: \"E_NO_ITEM\", message: \"not an outline item\", value: item }; }\n  if (location(item) != this) { raise { code: \"E_NO_ITEM\", message: \"item is not in this outliner\", value: item }; }\n  let oe = item.__ordered_edge; let parent_id = null;\n  if (typeof(oe) == \"map\") { parent_id = oe[\"parent\"]; }\n  let rows = ordered_children(parent_id);\n  let old_idx = 0; let i = 0;\n  for r in rows { if (r[\"child\"] == item) { old_idx = i; } i = i + 1; }\n  let without = [];\n  for r in rows { if (r[\"child\"] != item) { without = without + [r]; } }\n  let max_idx = length(without);\n  let idx = index;\n  if (typeof(idx) != \"number\") { raise { code: \"E_INVARG\", message: \"reorder_item requires an index\", value: idx }; }\n  idx = floor(idx);\n  if (idx < 0 || idx > max_idx) { raise { code: \"E_INDEX\", message: \"index out of range\", value: { index: idx, max: max_idx } }; }\n  if (idx == old_idx) { return false; }\n  let lo = null; let hi = null;\n  if (idx > 0) { lo = without[idx][\"rank\"]; }\n  if (idx < max_idx) { hi = without[idx + 1][\"rank\"]; }\n  let rank = rank_between(lo, hi);\n  item.__ordered_edge = { parent: parent_id, rank: rank };\n  observe({ type: \"outline_item_reordered\", source: this, actor: actor, outliner: this, item: item, parent_id: parent_id, from_index: old_idx, to_index: idx, ts: now() });\n  if (!_no_store) {\n    this:_set_undo(actor, { verb: \"reorder_item\", args: [item, old_idx] });\n  }\n  return true;\n}",
+          "reads_ordered_children": true
         },
         {
           "name": "hide",
@@ -267,20 +384,38 @@
           "direct_callable": true,
           "tool_exposed": true,
           "reads_room_presence": true,
-          "arg_spec": { "args": ["item", "hidden", "_no_store?"] },
+          "arg_spec": {
+            "args": [
+              "item",
+              "hidden",
+              "_no_store?"
+            ]
+          },
           "source": "verb :hide(item, hidden, _no_store) rx {\n  if (!isa(item, $outline_item)) { raise { code: \"E_NO_ITEM\", message: \"not an outline item\", value: item }; }\n  if (location(item) != this) { raise { code: \"E_NO_ITEM\", message: \"item is not in this outliner\", value: item }; }\n  if (typeof(hidden) != \"boolean\") {\n    if (hidden == 0) { hidden = false; } else { if (hidden == 1) { hidden = true; } else { raise { code: \"E_INVARG\", message: \"hide requires a boolean\", value: hidden }; } }\n  }\n  let was = false;\n  try { was = item.hidden; } except err { was = false; }\n  item:set_hidden(hidden);\n  observe({ type: \"outline_item_hidden\", source: this, actor: actor, outliner: this, item: item, hidden: hidden, ts: now() });\n  if (!_no_store) {\n    this:_set_undo(actor, { verb: \"hide\", args: [item, was] });\n  }\n  return true;\n}"
         },
         {
           "name": "hide_command",
-          "aliases": ["hide"],
+          "aliases": [
+            "hide"
+          ],
           "perms": "rxd",
           "direct_callable": true,
           "tool_exposed": true,
           "reads_room_presence": true,
           "arg_spec": {
-            "args": ["item"],
+            "args": [
+              "item"
+            ],
             "resolve": "object",
-            "command": { "dobj": "object", "prep": "any", "iobj": "any", "args_from": ["dobj_prefix"], "persistence": "durable" }
+            "command": {
+              "dobj": "object",
+              "prep": "any",
+              "iobj": "any",
+              "args_from": [
+                "dobj_prefix"
+              ],
+              "persistence": "durable"
+            }
           },
           "source": "verb :hide_command(item) rx {\n  let target = item;\n  if (typeof(target) == \"string\") { target = $match:match_object(target, this); }\n  if (target == $failed_match || target == $ambiguous_match) { raise { code: \"E_INVARG\", message: \"hide which item?\", value: item }; }\n  return this:hide(target, true);\n}"
         },
@@ -290,8 +425,14 @@
           "direct_callable": true,
           "tool_exposed": true,
           "reads_room_presence": true,
-          "arg_spec": { "args": ["item", "_no_store?"] },
-          "source": "verb :remove_item(item, _no_store) rx {\n  if (!isa(item, $outline_item)) { raise { code: \"E_NO_ITEM\", message: \"not an outline item\", value: item }; }\n  if (location(item) != this) { raise { code: \"E_NO_ITEM\", message: \"item is not in this outliner\", value: item }; }\n  if (item.owner != actor && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"only the item author or a wizard can remove it; outliner owners use eject\", value: item }; }\n  // Capture state for undo.\n  let captured = this:_capture_item(item);\n  recycle(item);\n  if (!_no_store) {\n    this:_set_undo(actor, { verb: \"_restore_item\", args: [captured] });\n  }\n  return true;\n}"
+          "arg_spec": {
+            "args": [
+              "item",
+              "_no_store?"
+            ]
+          },
+          "source": "verb :remove_item(item, _no_store) rx {\n  if (!isa(item, $outline_item)) { raise { code: \"E_NO_ITEM\", message: \"not an outline item\", value: item }; }\n  if (location(item) != this) { raise { code: \"E_NO_ITEM\", message: \"item is not in this outliner\", value: item }; }\n  if (item.owner != actor && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"only the item author or a wizard can remove it; outliner owners use eject\", value: item }; }\n  // Capture state for undo.\n  let captured = this:_capture_item(item);\n  recycle(item);\n  if (!_no_store) {\n    this:_set_undo(actor, { verb: \"_restore_item\", args: [captured] });\n  }\n  return true;\n}",
+          "reads_ordered_children": true
         },
         {
           "name": "eject_item",
@@ -299,22 +440,34 @@
           "direct_callable": true,
           "tool_exposed": true,
           "reads_room_presence": true,
-          "arg_spec": { "args": ["item"] },
-          "source": "verb :eject_item(item) rx {\n  if (!isa(item, $outline_item)) { raise { code: \"E_NO_ITEM\", message: \"not an outline item\", value: item }; }\n  if (location(item) != this) { raise { code: \"E_NO_ITEM\", message: \"item is not in this outliner\", value: item }; }\n  if (this.owner != actor && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"only the outliner owner or a wizard can eject items\", value: item }; }\n  // No undo for curator path.\n  recycle(item);\n  return true;\n}"
+          "arg_spec": {
+            "args": [
+              "item"
+            ]
+          },
+          "source": "verb :eject_item(item) rx {\n  if (!isa(item, $outline_item)) { raise { code: \"E_NO_ITEM\", message: \"not an outline item\", value: item }; }\n  if (location(item) != this) { raise { code: \"E_NO_ITEM\", message: \"item is not in this outliner\", value: item }; }\n  if (this.owner != actor && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"only the outliner owner or a wizard can eject items\", value: item }; }\n  // No undo for curator path.\n  recycle(item);\n  return true;\n}",
+          "reads_ordered_children": true
         },
         {
           "name": "_capture_item",
           "perms": "rx",
-          "arg_spec": { "args": ["item"] },
-          "source": "verb :_capture_item(item) rx {\n  let siblings = this:_siblings_ordered(item.parent);\n  let idx = 0; let i = 1;\n  for it in siblings { if (it == item) { idx = i - 1; } i = i + 1; }\n  let kids = this:_siblings_ordered(item);\n  let kid_entries = [];\n  for kid in kids {\n    let kpos = 0;\n    try { kpos = kid.position; } except err { kpos = 0; }\n    kid_entries = kid_entries + [{ item: kid, position: kpos }];\n  }\n  let text = \"\";\n  try { text = item.text; } except err { text = \"\"; }\n  let writers = [];\n  try { writers = item.writers; } except err { writers = []; }\n  let hidden = false;\n  try { hidden = item.hidden; } except err { hidden = false; }\n  return {\n    text: text,\n    name: item.name,\n    description: item.description,\n    writers: writers,\n    hidden: hidden,\n    owner: item.owner,\n    parent_id: item.parent,\n    index: idx,\n    children: kid_entries\n  };\n}"
+          "arg_spec": {
+            "args": [
+              "item"
+            ]
+          },
+          "source": "verb :_capture_item(item) rx {\n  let e = item.__ordered_edge; let ep = null;\n  if (typeof(e) == \"map\") { ep = e[\"parent\"]; }\n  let rows = ordered_children(ep);\n  let idx = 0; let i = 0;\n  for r in rows { if (r[\"child\"] == item) { idx = i; } i = i + 1; }\n  let kids = ordered_children(item);\n  let kid_entries = [];\n  let ki = 0;\n  for kr in kids {\n    kid_entries = kid_entries + [{ item: kr[\"child\"], index: ki }];\n    ki = ki + 1;\n  }\n  let text = \"\";\n  try { text = item.text; } except err { text = \"\"; }\n  let writers = [];\n  try { writers = item.writers; } except err { writers = []; }\n  let hidden = false;\n  try { hidden = item.hidden; } except err { hidden = false; }\n  return {\n    text: text,\n    name: item.name,\n    description: item.description,\n    writers: writers,\n    hidden: hidden,\n    owner: item.owner,\n    parent_id: ep,\n    index: idx,\n    children: kid_entries\n  };\n}"
         },
         {
           "name": "undo",
           "perms": "rxd",
           "direct_callable": true,
           "tool_exposed": true,
-          "arg_spec": { "args": [] },
-          "source": "verb :undo() rx {\n  let key = to_string(actor);\n  let umap = this.last_undo;\n  if (!has(umap, key)) { return false; }\n  let record = umap[key];\n  if (record == null) { return false; }\n  // Clear slot before dispatch so the dispatched verb doesn't re-write it.\n  let next = {};\n  for k in keys(umap) { if (k != key) { next[k] = umap[k]; } }\n  this.last_undo = next;\n  let verb_name = record[\"verb\"];\n  let inverse_args = record[\"args\"];\n  // Append the no-store marker so dispatched composers skip slot writes.\n  let full_args = [];\n  for a in inverse_args { full_args = full_args + [a]; }\n  full_args = full_args + [true];\n  let result = null;\n  try { result = dispatch(this, verb_name, full_args); } except err {\n    observe({ type: \"outline_undone\", source: this, actor: actor, outliner: this, inverse_op: record, error: err, ts: now() });\n    return false;\n  }\n  observe({ type: \"outline_undone\", source: this, actor: actor, outliner: this, inverse_op: record, ts: now() });\n  return result;\n}"
+          "arg_spec": {
+            "args": []
+          },
+          "source": "verb :undo() rx {\n  let key = to_string(actor);\n  let umap = this.last_undo;\n  if (!has(umap, key)) { return false; }\n  let record = umap[key];\n  if (record == null) { return false; }\n  // Clear slot before dispatch so the dispatched verb doesn't re-write it.\n  let next = {};\n  for k in keys(umap) { if (k != key) { next[k] = umap[k]; } }\n  this.last_undo = next;\n  let verb_name = record[\"verb\"];\n  let inverse_args = record[\"args\"];\n  // Append the no-store marker so dispatched composers skip slot writes.\n  let full_args = [];\n  for a in inverse_args { full_args = full_args + [a]; }\n  full_args = full_args + [true];\n  let result = null;\n  try { result = dispatch(this, verb_name, full_args); } except err {\n    observe({ type: \"outline_undone\", source: this, actor: actor, outliner: this, inverse_op: record, error: err, ts: now() });\n    return false;\n  }\n  observe({ type: \"outline_undone\", source: this, actor: actor, outliner: this, inverse_op: record, ts: now() });\n  return result;\n}",
+          "reads_ordered_children": true
         },
         {
           "name": "focus_on",
@@ -322,33 +475,57 @@
           "direct_callable": true,
           "tool_exposed": true,
           "reads_room_presence": true,
-          "arg_spec": { "args": ["item"] },
+          "arg_spec": {
+            "args": [
+              "item"
+            ]
+          },
           "source": "verb :focus_on(item) rx {\n  let target = null;\n  if (item != null) {\n    if (!isa(item, $outline_item)) { raise { code: \"E_NO_ITEM\", message: \"focus target must be null or an outline item\", value: item }; }\n    if (location(item) != this) { raise { code: \"E_NO_ITEM\", message: \"focus target is not in this outliner\", value: item }; }\n    target = item;\n  }\n  let key = to_string(actor);\n  let fmap = this.focus_by_actor;\n  let next = {};\n  let present_keys = {};\n  for compact in room_roster(this) { present_keys[to_string(compact[\"player\"])] = true; }\n  for k in keys(fmap) {\n    if (k != key && has(present_keys, k)) { next[k] = fmap[k]; }\n  }\n  next[key] = target;\n  this.focus_by_actor = next;\n  observe({ type: \"outline_focus_changed\", source: this, actor: actor, to: actor, outliner: this, item: target, ts: now() });\n  return target;\n}"
         },
         {
           "name": "focus_command",
-          "aliases": ["focus"],
+          "aliases": [
+            "focus"
+          ],
           "perms": "rxd",
           "direct_callable": true,
           "tool_exposed": true,
           "reads_room_presence": true,
           "arg_spec": {
-            "args": ["item"],
+            "args": [
+              "item"
+            ],
             "resolve": "object",
-            "command": { "dobj": "object", "prep": "any", "iobj": "any", "args_from": ["dobj_prefix"], "persistence": "durable" }
+            "command": {
+              "dobj": "object",
+              "prep": "any",
+              "iobj": "any",
+              "args_from": [
+                "dobj_prefix"
+              ],
+              "persistence": "durable"
+            }
           },
           "source": "verb :focus_command(item) rx {\n  let target = item;\n  if (typeof(target) == \"string\") { target = $match:match_object(target, this); }\n  if (target == $failed_match || target == $ambiguous_match) { raise { code: \"E_INVARG\", message: \"focus which item?\", value: item }; }\n  return this:focus_on(target);\n}"
         },
         {
           "name": "focus_root_command",
-          "aliases": ["focus"],
+          "aliases": [
+            "focus"
+          ],
           "perms": "rxd",
           "direct_callable": true,
           "tool_exposed": true,
           "reads_room_presence": true,
           "arg_spec": {
             "args": [],
-            "command": { "dobj": "none", "prep": "none", "iobj": "none", "args_from": [], "persistence": "durable" }
+            "command": {
+              "dobj": "none",
+              "prep": "none",
+              "iobj": "none",
+              "args_from": [],
+              "persistence": "durable"
+            }
           },
           "source": "verb :focus_root_command() rx { return this:focus_on(null); }"
         },
@@ -359,26 +536,131 @@
           "tool_exposed": true,
           "reads_room_presence": true,
           "arg_spec": {
-            "args": ["text"],
-            "command": { "dobj": "string", "prep": "any", "iobj": "any", "args_from": ["argstr"], "persistence": "durable" }
+            "args": [
+              "text"
+            ],
+            "command": {
+              "dobj": "string",
+              "prep": "any",
+              "iobj": "any",
+              "args_from": [
+                "argstr"
+              ],
+              "persistence": "durable"
+            }
           },
-          "source": "verb :add(text) rx {\n  if (typeof(text) != \"string\") { raise { code: \"E_INVARG\", message: \"add requires text\", value: text }; }\n  text = str_trim(text);\n  if (text == \"\") { raise { code: \"E_INVARG\", message: \"add requires non-empty text\", value: text }; }\n  return this:add_item(text);\n}"
+          "source": "verb :add(text) rx {\n  if (typeof(text) != \"string\") { raise { code: \"E_INVARG\", message: \"add requires text\", value: text }; }\n  text = str_trim(text);\n  if (text == \"\") { raise { code: \"E_INVARG\", message: \"add requires non-empty text\", value: text }; }\n  return this:add_item(text);\n}",
+          "reads_ordered_children": true
         }
       ]
     }
   ],
   "features": [],
   "schemas": [
-    { "on": "$outliner", "type": "outliner_entered", "shape": { "actor": "obj", "outliner": "obj", "origin": "obj|null", "text": "str" } },
-    { "on": "$outliner", "type": "outliner_left", "shape": { "actor": "obj", "outliner": "obj", "destination": "obj|null", "text": "str" } },
-    { "on": "$outliner", "type": "outline_item_added", "shape": { "actor": "obj", "outliner": "obj", "item": "obj", "parent_id": "obj|null", "index": "int", "text": "str" } },
-    { "on": "$outliner", "type": "outline_item_removed", "shape": { "actor": "obj", "outliner": "obj", "item": "obj", "reparented_to": "obj|null" } },
-    { "on": "$outliner", "type": "outline_item_moved", "shape": { "actor": "obj", "outliner": "obj", "item": "obj", "from_parent": "obj|null", "from_index": "int", "to_parent": "obj|null", "to_index": "int" } },
-    { "on": "$outliner", "type": "outline_item_reordered", "shape": { "actor": "obj", "outliner": "obj", "item": "obj", "parent_id": "obj|null", "from_index": "int", "to_index": "int" } },
-    { "on": "$outliner", "type": "outline_item_hidden", "shape": { "actor": "obj", "outliner": "obj", "item": "obj", "hidden": "bool" } },
-    { "on": "$outliner", "type": "outline_focus_changed", "shape": { "actor": "obj", "outliner": "obj", "item": "obj|null" } },
-    { "on": "$outliner", "type": "outline_undone", "shape": { "actor": "obj", "outliner": "obj", "inverse_op": "map" } },
-    { "on": "$outliner", "type": "outliner_activity", "shape": { "outliner": "obj", "actor": "obj", "text": "str" } }
+    {
+      "on": "$outliner",
+      "type": "outliner_entered",
+      "shape": {
+        "actor": "obj",
+        "outliner": "obj",
+        "origin": "obj|null",
+        "text": "str"
+      }
+    },
+    {
+      "on": "$outliner",
+      "type": "outliner_left",
+      "shape": {
+        "actor": "obj",
+        "outliner": "obj",
+        "destination": "obj|null",
+        "text": "str"
+      }
+    },
+    {
+      "on": "$outliner",
+      "type": "outline_item_added",
+      "shape": {
+        "actor": "obj",
+        "outliner": "obj",
+        "item": "obj",
+        "parent_id": "obj|null",
+        "index": "int",
+        "text": "str"
+      }
+    },
+    {
+      "on": "$outliner",
+      "type": "outline_item_removed",
+      "shape": {
+        "actor": "obj",
+        "outliner": "obj",
+        "item": "obj",
+        "reparented_to": "obj|null"
+      }
+    },
+    {
+      "on": "$outliner",
+      "type": "outline_item_moved",
+      "shape": {
+        "actor": "obj",
+        "outliner": "obj",
+        "item": "obj",
+        "from_parent": "obj|null",
+        "from_index": "int",
+        "to_parent": "obj|null",
+        "to_index": "int"
+      }
+    },
+    {
+      "on": "$outliner",
+      "type": "outline_item_reordered",
+      "shape": {
+        "actor": "obj",
+        "outliner": "obj",
+        "item": "obj",
+        "parent_id": "obj|null",
+        "from_index": "int",
+        "to_index": "int"
+      }
+    },
+    {
+      "on": "$outliner",
+      "type": "outline_item_hidden",
+      "shape": {
+        "actor": "obj",
+        "outliner": "obj",
+        "item": "obj",
+        "hidden": "bool"
+      }
+    },
+    {
+      "on": "$outliner",
+      "type": "outline_focus_changed",
+      "shape": {
+        "actor": "obj",
+        "outliner": "obj",
+        "item": "obj|null"
+      }
+    },
+    {
+      "on": "$outliner",
+      "type": "outline_undone",
+      "shape": {
+        "actor": "obj",
+        "outliner": "obj",
+        "inverse_op": "map"
+      }
+    },
+    {
+      "on": "$outliner",
+      "type": "outliner_activity",
+      "shape": {
+        "outliner": "obj",
+        "actor": "obj",
+        "text": "str"
+      }
+    }
   ],
   "seed_hooks": []
 }

@@ -933,6 +933,7 @@ const VALID_BUILTINS = new Set([
   "active_actors",
   "room_roster",
   "ordered_children",
+  "rank_between",
   "session_metadata",
   "visible_contents",
   "obvious_verbs",
@@ -976,7 +977,6 @@ const VALID_BUILTINS = new Set([
   "set_object_name",
   "listinsert",
   "object_tree_rows",
-  "object_siblings_ordered",
   "is_remote_object",
   "presence_status"
 ]);

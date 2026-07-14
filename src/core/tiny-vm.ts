@@ -13,6 +13,7 @@ import {
   valuesEqual,
   wooError
 } from "./types";
+import { rankBetween } from "./fractional-rank";
 import type { CallContext } from "./world";
 
 export type VmHandler = {
@@ -179,13 +180,22 @@ export const BUILTIN_NAMES = [
   "active_actors",
   // Generic projection helpers for catalog code that must build large lists
   // without exercising woocode's functional-list allocation path.
-  "listinsert", "object_tree_rows", "object_siblings_ordered",
+  // object_tree_rows is now the EDGE-based whole-tree builder (child edge
+  // {parent, rank} via a reserved property). object_siblings_ordered was the
+  // O(N) parent/position sibling scan; it is retired in favour of the
+  // owner-computed `ordered_children` projection. Slot tombstoned as
+  // _dead_object_siblings_ordered to keep every later builtin's bytecode
+  // index stable.
+  "listinsert", "object_tree_rows", "_dead_object_siblings_ordered",
   // Compact owner-scoped presence projection. Appended to preserve every
   // existing builtin bytecode index.
   "room_roster",
   // Owner-computed ordered-children projection (the ordering analogue of
   // room_roster). Appended last to keep every existing bytecode index stable.
-  "ordered_children"
+  "ordered_children",
+  // Fractional rank midpoint (src/core/fractional-rank). Appended last; keeps
+  // ordered indices stable. Lets catalog code place an edge between neighbours.
+  "rank_between"
 ];
 
 export async function runTinyVm(ctx: CallContext, bytecode: TinyBytecode, args: WooValue[]): Promise<WooValue> {
@@ -1175,32 +1185,40 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         if (index < 1 || index > list.length + 1) throw wooError("E_RANGE", "listinsert index out of range", index);
         return [...list.slice(0, index - 1), builtinArgs[2] ?? null, ...list.slice(index - 1)];
       }
-      case "object_siblings_ordered": {
-        if (builtinArgs.length !== 5) throw wooError("E_INVARG", "object_siblings_ordered expects container, item_class, parent_prop, position_prop, and parent_id");
-        const parent = builtinArgs[4] === null ? null : assertObj(builtinArgs[4]);
-        const records = await collectObjectTreeRecords(
-          frame,
-          assertObj(builtinArgs[0]),
-          assertObj(builtinArgs[1]),
-          assertString(builtinArgs[2]),
-          assertString(builtinArgs[3])
-        );
-        return orderedSiblings(records, parent).map((record) => record.id);
-      }
       case "object_tree_rows": {
-        if (builtinArgs.length < 5 || builtinArgs.length > 6) {
-          throw wooError("E_INVARG", "object_tree_rows expects container, item_class, parent_prop, position_prop, text_verb, and optional hidden_prop");
+        // Edge-based whole-tree builder: (container, item_class, edge_prop,
+        // text_verb, hidden_prop?). Each item carries its structure in ONE
+        // reserved property `edge_prop` = { parent, rank }; the tree shape and
+        // per-sibling index are DERIVED from those edges (fractional-rank
+        // order), never from separate parent/position props. This is a
+        // whole-tree READ (look/hydration), inherently O(tree); mutation
+        // paths use the bounded `ordered_children` projection instead.
+        if (builtinArgs.length < 4 || builtinArgs.length > 5) {
+          throw wooError("E_INVARG", "object_tree_rows expects container, item_class, edge_prop, text_verb, and optional hidden_prop");
         }
-        const textVerb = assertString(builtinArgs[4]);
-        const hiddenProp = builtinArgs.length >= 6 && builtinArgs[5] !== null ? assertString(builtinArgs[5]) : "hidden";
+        const edgeProp = assertString(builtinArgs[2]);
+        const textVerb = assertString(builtinArgs[3]);
+        const hiddenProp = builtinArgs.length >= 5 && builtinArgs[4] !== null ? assertString(builtinArgs[4]) : "hidden";
         const records = await collectObjectTreeRecords(
           frame,
           assertObj(builtinArgs[0]),
           assertObj(builtinArgs[1]),
-          assertString(builtinArgs[2]),
-          assertString(builtinArgs[3])
+          edgeProp
         );
         return await buildObjectTreeRows(frame, records, textVerb, hiddenProp);
+      }
+      case "rank_between": {
+        // Fractional rank strictly between two neighbour keys (null = open
+        // end). One key per insertion, bounded length growth — the substrate
+        // ordering primitive behind the edge index. See fractional-rank.ts.
+        if (builtinArgs.length !== 2) throw wooError("E_INVARG", "rank_between expects (a, b) — string or null bounds");
+        const lo = builtinArgs[0] === null ? null : assertString(builtinArgs[0]);
+        const hi = builtinArgs[1] === null ? null : assertString(builtinArgs[1]);
+        try {
+          return rankBetween(lo, hi);
+        } catch (err) {
+          throw wooError("E_INVARG", `rank_between: ${(err as Error).message}`, { a: lo as WooValue, b: hi as WooValue });
+        }
       }
       case "builder_create_object":
         if (builtinArgs.length < 1 || builtinArgs.length > 2) throw wooError("E_INVARG", "builder_create_object expects parent and optional opts");
@@ -1473,11 +1491,12 @@ function chargeTicks(frame: VmFrame, ticks: number): void {
 type TreeRecord = {
   id: ObjRef;
   parent: ObjRef | null;
-  position: number;
+  /** Fractional rank among siblings; "" = unranked (sorts last). */
+  rank: string;
   order: number;
 };
 
-async function collectObjectTreeRecords(frame: VmFrame, container: ObjRef, itemClass: ObjRef, parentProp: string, positionProp: string): Promise<TreeRecord[]> {
+async function collectObjectTreeRecords(frame: VmFrame, container: ObjRef, itemClass: ObjRef, edgeProp: string): Promise<TreeRecord[]> {
   const contents = await frame.ctx.world.contentsForExecution(frame.ctx, container);
   chargeTicks(frame, contents.length);
   const records: TreeRecord[] = [];
@@ -1495,21 +1514,23 @@ async function collectObjectTreeRecords(frame: VmFrame, container: ObjRef, itemC
       isItem = false;
     }
     if (!isItem) continue;
+    // Read the single edge property `{ parent, rank }` (sole structural
+    // authority). A missing/malformed edge sorts as an unranked root.
     let parent: ObjRef | null = null;
+    let rank = "";
     try {
-      const rawParent = await frame.ctx.world.getPropChecked(frame.ctx.progr, id, parentProp, frame.ctx.hostMemo);
-      parent = rawParent === null ? null : assertObj(rawParent);
+      const edge = await frame.ctx.world.getPropChecked(frame.ctx.progr, id, edgeProp, frame.ctx.hostMemo);
+      if (edge && typeof edge === "object" && !Array.isArray(edge)) {
+        const p = (edge as Record<string, WooValue>).parent;
+        if (typeof p === "string") parent = p;
+        const r = (edge as Record<string, WooValue>).rank;
+        if (typeof r === "string") rank = r;
+      }
     } catch {
       parent = null;
+      rank = "";
     }
-    let position = 0;
-    try {
-      const rawPosition = await frame.ctx.world.getPropChecked(frame.ctx.progr, id, positionProp, frame.ctx.hostMemo);
-      if (typeof rawPosition === "number" && Number.isFinite(rawPosition)) position = Math.floor(rawPosition);
-    } catch {
-      position = 0;
-    }
-    records.push({ id, parent, position, order: records.length });
+    records.push({ id, parent, rank, order: records.length });
   }
   return records;
 }
@@ -1519,17 +1540,15 @@ function treeParentKey(parent: ObjRef | null): string {
 }
 
 function compareTreeRecords(a: TreeRecord, b: TreeRecord): number {
-  const ar = a.position >= 1 ? a.position : Number.POSITIVE_INFINITY;
-  const br = b.position >= 1 ? b.position : Number.POSITIVE_INFINITY;
-  if (ar !== br) return ar - br;
-  if (a.position >= 1 && b.position >= 1 && a.id !== b.id) return a.id < b.id ? -1 : 1;
+  // Rank order is plain string compare (the fractional-rank contract).
+  // Unranked ("") sorts LAST; ties break by id then insertion order so the
+  // derived index is total and reproducible.
+  const au = a.rank === "";
+  const bu = b.rank === "";
+  if (au !== bu) return au ? 1 : -1;
+  if (!au && a.rank !== b.rank) return a.rank < b.rank ? -1 : 1;
+  if (a.id !== b.id) return a.id < b.id ? -1 : 1;
   return a.order - b.order;
-}
-
-function orderedSiblings(records: TreeRecord[], parent: ObjRef | null): TreeRecord[] {
-  return records
-    .filter((record) => record.parent === parent)
-    .sort(compareTreeRecords);
 }
 
 async function buildObjectTreeRows(frame: VmFrame, records: TreeRecord[], textVerb: string, hiddenProp: string): Promise<WooValue[]> {

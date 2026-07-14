@@ -211,29 +211,22 @@ describe("outliner add over the net path converges", () => {
     expect(turn.attempt, `many-sibling add took ${turn.attempt} attempts`).toBeLessThanOrEqual(3);
   });
 
-  // SCALE GATE — SKIPPED, pending the v2 edge-index redesign
-  // (notes/2026-07-13-outliner-edge-index-v2.md). The convergence fix above
-  // makes an add COMMIT, but the outliner add reads and renumbers EVERY
-  // top-level sibling (`_siblings_ordered` + `_renumber_siblings`), so its
-  // read/write closure grows O(siblings) and the planner trips the 64 KiB
-  // warm-envelope ceiling past ~17 top-level items — well below prod's
-  // 120-item the_outline. Only the v2 edge-index redesign (fractional/sparse
-  // positions, neighbour-only reads/writes) bounds the closure.
-  //
-  // TODO(v2): once the edge-index redesign lands, DELETE the `.skip` — this
-  // gate must then PASS (a large-outline add commits with a bounded
-  // envelope). It is skipped rather than run as an xfail because building
-  // ~40 items + committing under the parallel worker lane is expensive and
-  // must not add flake pressure to the committed baseline.
-  it.skip("SCALE (pending v2 edge-index redesign): a large-outline add stays under the warm-envelope ceiling", async () => {
+  // SCALE GATE — the v2 edge-index acceptance test. With the ordered-edge
+  // index (catalogs/outliner v2.0.0), an `add` into a large outline reads the
+  // parent's ordering as ONE owner-computed projection and writes exactly ONE
+  // edge cell — O(1) in sibling count, no renumber. So the add commits with a
+  // bounded read/write closure well under the 64 KiB warm-envelope ceiling
+  // even at 120 children (above prod's the_outline). A regression to an
+  // O(siblings) read/write closure fails this by tripping the ceiling.
+  it("SCALE: a 120-child-outline add stays under the warm-envelope ceiling with O(1) edge writes", async () => {
     const { world, theOutline, session, actor, epoch } = await outlinerWorld();
     const roomScope = `room:${theOutline}`;
     const ctx = { theOutline, roomScope, epoch, session, actor };
 
-    // ~40 top-level siblings — above the current ~17-sibling envelope ceiling
-    // and approaching prod scale. Today the add throws E_INTERNAL (oversized
-    // warm envelope) before it can commit.
-    const SIBLINGS = 40;
+    // 120 top-level siblings — at/above prod scale. The pre-v2 add tripped
+    // E_INTERNAL (oversized warm envelope) past ~17 items; the edge index must
+    // now commit an add here with a bounded closure.
+    const SIBLINGS = 120;
     for (let i = 0; i < SIBLINGS; i += 1) {
       const r = await world.directCall(`seed-${i}`, actor, theOutline, "add", [`seed ${i}`], { sessionId: session.id });
       expect(r.op, `seed add ${i}: ${JSON.stringify(r)}`).toBe("result");
@@ -241,9 +234,13 @@ describe("outliner add over the net path converges", () => {
 
     const { gateway, gatewayEnv } = await mountNet(world, epoch);
     const turn = await addTurn(gateway, gatewayEnv, ctx, "outliner-add-scale", "one more");
-    // Post-v2 acceptance: the add commits with a bounded read/write closure.
-    expect(turn.reply.status).toBe("accepted");
+    // Acceptance: the add commits with a bounded read/write closure.
+    expect(turn.reply.status, `attempts=${turn.attempt} trace=${JSON.stringify(turn.trace)}`).toBe("accepted");
     expect(turn.envelopeBytes ?? 0).toBeLessThanOrEqual(WARM_ENVELOPE_BYTE_LIMIT);
+    expect(turn.envelopeBytes ?? 0).toBeGreaterThan(0);
+    // Bounded repair: seed the target ordering (1 fetch) then commit — a
+    // per-sibling regression would need ~SIBLINGS rounds.
+    expect(turn.attempt, `scale add took ${turn.attempt} attempts`).toBeLessThanOrEqual(3);
   });
 
   it("fails FAST and NAMED (E_NONCONVERGENT_READ, not E_BUDGET) when a read cannot converge", async () => {

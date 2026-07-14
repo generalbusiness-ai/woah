@@ -371,12 +371,20 @@ export class WooOutlinerTreeElement extends HTMLElement {
     const looksLikeOutlineItem = projected.parent === "$outline_item" || ancestors.includes("$outline_item");
     if (!looksLikeOutlineItem) return null;
     const textKnown = typeof props.text === "string";
+    // Structural parent lives in the room-owned edge cell `__ordered_edge`
+    // ({ parent, rank }); the rank is not an index, so this degraded
+    // single-item projection places at the front (0) until the authoritative
+    // list_items hydration supplies the real derived index.
+    const edge = props.__ordered_edge;
+    const edgeParent = edge && typeof edge === "object" && !Array.isArray(edge)
+      ? (edge as { parent?: unknown }).parent
+      : null;
     return {
       id: projected.id,
       name: typeof projected.name === "string" ? projected.name : projected.id,
       text: textKnown ? props.text as string : "",
-      parent_id: outlinerParent(props.parent),
-      index: outlinerIndex(props.position, 0),
+      parent_id: outlinerParent(edgeParent),
+      index: 0,
       hidden: props.hidden === true,
       owner: typeof projected.owner === "string" ? projected.owner : "",
       writers: Array.isArray(props.writers) ? props.writers.filter((item): item is string => typeof item === "string") : [],

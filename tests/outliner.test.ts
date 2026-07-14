@@ -42,22 +42,51 @@ async function addItem(
   return r.result as string;
 }
 
-function position(world: ReturnType<typeof createWorld>, item: string): number {
-  return world.propOrNull(item, "position") as number;
+/** The item's `{ parent, rank }` edge (the sole structural authority). */
+function edgeOf(world: ReturnType<typeof createWorld>, item: string): { parent: string | null; rank: string } | null {
+  const e = world.propOrNull(item, "__ordered_edge") as { parent?: unknown; rank?: unknown } | null;
+  if (!e || typeof e !== "object") return null;
+  return { parent: (typeof e.parent === "string" ? e.parent : null), rank: typeof e.rank === "string" ? e.rank : "" };
 }
 
 function parentOf(world: ReturnType<typeof createWorld>, item: string): string | null {
-  return world.propOrNull(item, "parent") as string | null;
+  return edgeOf(world, item)?.parent ?? null;
 }
 
+/** Derived 1-based position among the item's siblings, computed from the
+ * edge ranks (fractional-rank order) — the replacement for the removed dense
+ * `.position` prop, so ordering assertions still read [1, 2, 3, …]. */
+function position(world: ReturnType<typeof createWorld>, item: string): number {
+  const self = edgeOf(world, item);
+  if (!self || self.rank === "") return 0;
+  const parent = self.parent;
+  const siblings: Array<{ id: string; rank: string }> = [];
+  for (const obj of world.exportWorld().objects) {
+    if (obj.parent !== "$outline_item") continue; // direct $outline_item instances
+    const raw = new Map(obj.properties).get("__ordered_edge") as { parent?: unknown; rank?: unknown } | undefined;
+    if (!raw || typeof raw !== "object") continue;
+    const rank = typeof raw.rank === "string" ? raw.rank : "";
+    const p = typeof raw.parent === "string" ? raw.parent : null;
+    if (rank === "" || p !== parent) continue;
+    siblings.push({ id: obj.id, rank });
+  }
+  siblings.sort((a, b) => (a.rank < b.rank ? -1 : a.rank > b.rank ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  const idx = siblings.findIndex((s) => s.id === item);
+  return idx < 0 ? 0 : idx + 1;
+}
+
+/** Seed an item directly with an edge whose rank sorts by `position`
+ * (zero-padded so plain string compare matches numeric order). */
 function seedOutlineItem(world: ReturnType<typeof createWorld>, text: string, position: number, parent: string | null = null): string {
   const item = world.createRuntimeObject("$outline_item", "$wiz", "the_outline", {
     progr: "$wiz",
     location: "the_outline",
     name: ""
   });
-  world.setProp(item, "parent", parent);
-  world.setProp(item, "position", position);
+  // Zero-padded position keeps string-compare == numeric order; the trailing
+  // "1" keeps every seeded rank a VALID fractional-rank key (no trailing zero,
+  // so rank_between can append after the last seeded item).
+  world.setProp(item, "__ordered_edge", { parent, rank: `${String(position).padStart(6, "0")}1` });
   world.setProp(item, "text", text);
   return item;
 }

@@ -238,6 +238,37 @@ describe("owner-computed ordered-children projection in planning", () => {
   });
 });
 
+describe("rank_between builtin (fractional-rank access from the DSL)", () => {
+  async function evalRank(expr: string): Promise<unknown> {
+    const world = createWorld();
+    const session = world.auth("guest:rankb");
+    world.createObject({ id: "rb", name: "RB", parent: "$thing", owner: session.actor });
+    const installed = installVerb(world, "rb", "rb", `verb :rb() rxd { return ${expr}; }`, null);
+    expect(installed.ok, JSON.stringify(installed.diagnostics)).toBe(true);
+    const r = await world.directCall("rb", session.actor, "rb", "rb", [], { sessionId: session.id });
+    return (r as { op: string; result?: unknown; error?: unknown }).op === "result"
+      ? (r as { result: unknown }).result
+      : { error: (r as { error: unknown }).error };
+  }
+
+  it("returns a key strictly between two bounds and handles open ends", async () => {
+    const first = await evalRank("rank_between(null, null)");
+    expect(typeof first).toBe("string");
+    const after = await evalRank(`rank_between(${JSON.stringify(first)}, null)`);
+    const before = await evalRank(`rank_between(null, ${JSON.stringify(first)})`);
+    expect(String(before) < String(first)).toBe(true);
+    expect(String(first) < String(after)).toBe(true);
+    const mid = await evalRank(`rank_between(${JSON.stringify(before)}, ${JSON.stringify(after)})`);
+    expect(String(before) < String(mid)).toBe(true);
+    expect(String(mid) < String(after)).toBe(true);
+  });
+
+  it("raises E_INVARG for an out-of-order or malformed bound", async () => {
+    expect(await evalRank(`rank_between("W", "V")`)).toMatchObject({ error: { code: "E_INVARG" } });
+    expect(await evalRank(`rank_between("V0", null)`)).toMatchObject({ error: { code: "E_INVARG" } });
+  });
+});
+
 describe("reads_ordered_children verb flag round-trip", () => {
   it("survives catalog install into the verb_bytecode cell (the gateway's flag source)", () => {
     const world = createWorld();

@@ -1,0 +1,7 @@
+{
+  "from_version": "1.x.x",
+  "to_version": "2.0.0",
+  "spec_version": "v1",
+  "note": "STUB (stage 3). The v2 outliner makes the ordered-edge index (each item's `__ordered_edge` { parent, rank }) the SOLE structural authority and removes the `.parent`/`.position` item props. A real data migration must, for every existing $outline_item, DERIVE an edge from its (parent, position) tie-broken by item id (total, reproducible order), assign initial fractional ranks in that order, make edges authoritative, then drop the legacy parent/position fields. That per-item fractional-rank derivation is stage 4 (see notes/2026-07-13-outliner-edge-index-v2.md §Migration). Stage 3 ships v2 working for FRESH outlines + the (empty) demo seed only; this file exists so the catalog-migration guard passes at the v2 bump. Applying these (empty) steps to an aged v1 world does NOT lose data, but leaves items unranked (flat) until stage 4's derivation lands.",
+  "steps": []
+}

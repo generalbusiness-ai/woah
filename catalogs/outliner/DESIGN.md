@@ -1,5 +1,24 @@
 # Outliner — design
 
+> **v2.0.0 — ordered-edge index (structural authority change).** Tree shape
+> and sibling order are now the **sole** responsibility of ONE room-owned edge
+> cell per item: `$outline_item.__ordered_edge = { parent, rank }`, where
+> `rank` is a base-62 **fractional-rank** string (`src/core/fractional-rank`).
+> Siblings sort by plain string compare of their ranks; there is **no dense
+> `.position` and no renumber**. The removed `.parent` / `.position` item
+> props are replaced by this single edge. A mutation reads its parent's
+> ordering via the owner-computed `ordered_children(parent)` projection (ONE
+> bounded value, not an O(N) sibling scan) and writes exactly ONE edge cell —
+> so an `add`/`move`/`reorder`/`remove` stays O(1) in sibling count and under
+> the 64 KiB net warm-envelope even at 120+ children (the pre-v2 add tripped
+> the ceiling past ~17 items). User-visible behaviour and every observation /
+> `list_items` shape are unchanged — `parent_id`, `index`, `from/to_index`,
+> `reparented_to`, `has_children` are now **derived** from edges. Sections
+> below that describe the v1 `.parent`/`.position`/renumber mechanics are
+> superseded by this model; see `notes/2026-07-13-outliner-edge-index-v2.md`.
+> The v1→v2 data migration (deriving edges from legacy `(parent, position)`)
+> is stage 4 (`migration-v1-to-v2.json` currently a documented stub).
+
 A persisted shared hierarchy of short text items, with extremely minimal
 UI: tab movement, collapse/expand, drag-reorder within siblings,
 drag-drop across the tree, an undo button, and a per-item hidden

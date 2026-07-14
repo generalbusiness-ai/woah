@@ -652,28 +652,29 @@ describe("v2 browser local turn planning", () => {
     });
     if (firstLocal.ok || !firstLocal.key) throw new Error("expected repairable local list plan");
 
-    const repairTransfer = buildShadowCellPageTransfer({
-      serialized: added.serializedAfter,
-      key: firstLocal.key
-    });
-    const local = await planV2BrowserLocalTurn({
-      node: "browser:outline-tail",
-      actor: session.actor,
-      session: session.id,
-      head: { kind: "woo.scope_head.shadow.v1", scope: "the_outline", epoch: 1, seq: 2, hash: "tail" },
-      id: "outline-tail-list-repaired",
-      route: "direct",
-      scope: "the_outline",
-      target: "the_outline",
-      verb: "list_items",
-      args: [],
-      persistence: "live",
-      transfers: [
-        v2ExecutableTransferRecord(transfer, 1),
-        promoted.record,
-        v2ExecutableTransferRecord(repairTransfer, 3)
-      ]
-    });
+    // The edge-based list_items read closure fills in bounded rounds (the
+    // item's edge, then its text via item:text()). Repair-until-converged,
+    // bounded — a robust match for the sparse browser repair loop.
+    let local: Awaited<ReturnType<typeof planV2BrowserLocalTurn>> = firstLocal;
+    const extra: ReturnType<typeof v2ExecutableTransferRecord>[] = [];
+    let seq = 3;
+    for (let round = 0; round < 6 && !local.ok && local.reason === "missing_state" && local.key; round += 1) {
+      extra.push(v2ExecutableTransferRecord(buildShadowCellPageTransfer({ serialized: added.serializedAfter, key: local.key }), seq += 1));
+      local = await planV2BrowserLocalTurn({
+        node: "browser:outline-tail",
+        actor: session.actor,
+        session: session.id,
+        head: { kind: "woo.scope_head.shadow.v1", scope: "the_outline", epoch: 1, seq: 2, hash: "tail" },
+        id: "outline-tail-list-repaired",
+        route: "direct",
+        scope: "the_outline",
+        target: "the_outline",
+        verb: "list_items",
+        args: [],
+        persistence: "live",
+        transfers: [v2ExecutableTransferRecord(transfer, 1), promoted.record, ...extra]
+      });
+    }
 
     expect(local).toMatchObject({
       ok: true,
@@ -768,25 +769,29 @@ describe("v2 browser local turn planning", () => {
     });
     if (firstList.ok || !firstList.key) throw new Error("expected repairable local list_items plan");
 
-    const repairTransfer = buildShadowCellPageTransfer({
-      serialized: added.serializedAfter,
-      key: firstList.key
-    });
-    const localList = await planV2BrowserLocalTurn({
-      node: "browser:outline-tentative-text",
-      actor: session.actor,
-      session: session.id,
-      head,
-      id: "outline-tentative-list-repaired",
-      route: "direct",
-      scope: "the_outline",
-      target: "the_outline",
-      verb: "list_items",
-      args: [],
-      persistence: "live",
-      transfers: [...transfers, v2ExecutableTransferRecord(repairTransfer, 3)],
-      tentative_transcripts: [localEnter.transcript, localAdd.transcript]
-    });
+    // Edge-based list_items fills its read closure in bounded rounds; repair
+    // until converged (bounded).
+    let localList: Awaited<ReturnType<typeof planV2BrowserLocalTurn>> = firstList;
+    const extra: ReturnType<typeof v2ExecutableTransferRecord>[] = [];
+    let seq = 3;
+    for (let round = 0; round < 6 && !localList.ok && localList.reason === "missing_state" && localList.key; round += 1) {
+      extra.push(v2ExecutableTransferRecord(buildShadowCellPageTransfer({ serialized: added.serializedAfter, key: localList.key }), seq += 1));
+      localList = await planV2BrowserLocalTurn({
+        node: "browser:outline-tentative-text",
+        actor: session.actor,
+        session: session.id,
+        head,
+        id: "outline-tentative-list-repaired",
+        route: "direct",
+        scope: "the_outline",
+        target: "the_outline",
+        verb: "list_items",
+        args: [],
+        persistence: "live",
+        transfers: [...transfers, ...extra],
+        tentative_transcripts: [localEnter.transcript, localAdd.transcript]
+      });
+    }
 
     expect(localList).toMatchObject({
       ok: true,
