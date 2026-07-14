@@ -27,7 +27,7 @@ import { CellStore, type Cell, type EpochStamp } from "./cells";
 import { netError } from "./errors";
 import { validateSessionCell } from "./sessions";
 import { applyRelationDeltas, deriveRelationDeltas, rebuildContentsRelation, relationKey, type RelationDelta, type RelationRow } from "./relations";
-import { orderedChildrenRows, orderedChildrenVersion } from "./ordered-edges";
+import { orderedChildrenVersion } from "./ordered-edges";
 import type { ScopeStore, TailEntry } from "./scope-store";
 import { applyTranscript, netCellKeyFor, type EffectTranscript, type TranscriptCell } from "./transcript";
 import { cellKey, cellVersion } from "./cells";
@@ -479,7 +479,7 @@ export class ScopeSequencer {
     for (const read of submit.transcript.orderingReads ?? []) {
       const owned = read.parent === null || !this.options.owns || this.options.owns(read.parent);
       if (!owned) continue;
-      const current = orderedChildrenVersion(orderedChildrenRows(this.store.allCells(), read.parent));
+      const current = orderedChildrenVersion(this.store.orderedEdgeChildren(read.parent));
       if (current !== read.version) orderingConflicts.push(read.parent);
     }
     if (orderingConflicts.length > 0) {

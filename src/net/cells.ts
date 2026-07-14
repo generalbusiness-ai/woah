@@ -21,6 +21,7 @@
  * note).
  */
 import { hashSource } from "../core/source-hash";
+import { ORDERED_EDGE_PROP } from "../core/ordered-edge";
 import { netError } from "./errors";
 
 /** CO5 provenance, simplified from v2's five sources:
@@ -136,9 +137,32 @@ export class CellStore {
    * room's members (name matching, contents projection) without an
    * O(store) scan per turn. */
   private readonly membersByLocation = new Map<string, Set<string>>();
+  /** parent (or the "\0root" sentinel for null) → keys of the ordered-edge
+   * cells whose edge names that parent (P2.4). Lets a mutation's neighbour read
+   * and the ordering-version check touch O(children-of-parent), not O(whole
+   * scope): the alternative — scanning every edge cell in the scope and sorting
+   * all siblings — makes authority work unbounded as the outliner grows. */
+  private readonly edgeChildrenByParent = new Map<string, Set<string>>();
 
   constructor(role: StoreRole) {
     this.role = role;
+  }
+
+  /** The parent an ordered-edge property_cell names, or `undefined` if the cell
+   * is not a valid ordered edge. The payload is `{ value: { parent, rank } }`. */
+  private static orderedEdgeParent(cell: Cell): string | null | undefined {
+    if (cell.kind !== "property_cell" || cell.name !== ORDERED_EDGE_PROP) return undefined;
+    const inner = (cell.value as { value?: unknown } | null)?.value;
+    if (!inner || typeof inner !== "object") return undefined;
+    const rank = (inner as { rank?: unknown }).rank;
+    if (typeof rank !== "string" || rank.length === 0) return undefined; // cleared/unranked
+    const parent = (inner as { parent?: unknown }).parent;
+    if (parent !== null && typeof parent !== "string") return undefined;
+    return (parent as string | null) ?? null;
+  }
+
+  private static edgeParentKey(parent: string | null): string {
+    return parent === null ? "\0root" : parent;
   }
 
   /** Single internal write path: every insert/overwrite goes through here
@@ -176,6 +200,13 @@ export class CellStore {
       if (!members) this.membersByLocation.set(location, (members = new Set()));
       members.add(cell.object);
     }
+    const edgeParent = CellStore.orderedEdgeParent(cell);
+    if (edgeParent !== undefined) {
+      const key = CellStore.edgeParentKey(edgeParent);
+      let children = this.edgeChildrenByParent.get(key);
+      if (!children) this.edgeChildrenByParent.set(key, (children = new Set()));
+      children.add(cell.key);
+    }
   }
 
   private unindexCell(cell: Cell): void {
@@ -200,6 +231,34 @@ export class CellStore {
         if (members.size === 0) this.membersByLocation.delete(location);
       }
     }
+    const edgeParent = CellStore.orderedEdgeParent(cell);
+    if (edgeParent !== undefined) {
+      const key = CellStore.edgeParentKey(edgeParent);
+      const children = this.edgeChildrenByParent.get(key);
+      if (children) {
+        children.delete(cell.key);
+        if (children.size === 0) this.edgeChildrenByParent.delete(key);
+      }
+    }
+  }
+
+  /** The ordered children of `parent`, rank-sorted, via the per-parent edge
+   * index — O(children-of-parent), NOT O(whole scope). The bounded read behind
+   * the ordering projection, the ordering-version check, and neighbour lookup
+   * (P2.4). Tie-break by child id keeps the order total. */
+  orderedEdgeChildren(parent: string | null): Array<{ child: string; rank: string }> {
+    const children = this.edgeChildrenByParent.get(CellStore.edgeParentKey(parent));
+    if (!children) return [];
+    const rows: Array<{ child: string; rank: string }> = [];
+    for (const key of children) {
+      const cell = this.cells.get(key);
+      if (!cell) continue;
+      const rank = ((cell.value as { value?: { rank?: unknown } } | null)?.value?.rank);
+      if (typeof rank !== "string" || rank.length === 0) continue;
+      rows.push({ child: cell.object, rank });
+    }
+    rows.sort((a, b) => (a.rank < b.rank ? -1 : a.rank > b.rank ? 1 : a.child < b.child ? -1 : a.child > b.child ? 1 : 0));
+    return rows;
   }
 
   get(key: string): Cell | undefined {

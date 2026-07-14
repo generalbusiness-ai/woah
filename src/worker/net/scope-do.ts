@@ -851,11 +851,32 @@ export class NetScopeDO {
           : undefined;
         if (parent === undefined) throw new Error("ordered-children requires parent (string ref or null)");
         const seq = this.ensureSequencer();
-        const rows = orderedChildrenRows(seq.store.allCells(), parent);
+        // Bounded scan (P2.4): the per-parent edge index, O(children-of-parent),
+        // not a whole-scope cell scan. This full list is for DISPLAY
+        // (list_items); a MUTATION uses /net/ordered-neighbors below instead.
+        const rows = seq.store.orderedEdgeChildren(parent);
         // `version` is the content address of the ordering (P1.1): the reader
         // attests it, and this scope re-derives + validates it at submit so a
         // concurrent same-parent insert makes the plan stale.
         return json({ scope: seq.scope, head: seq.head(), parent, rows, version: orderedChildrenVersion(rows) });
+      }
+      if (request.method === "POST" && url.pathname === "/net/ordered-neighbors") {
+        // BOUNDED neighbour read for a mutation (P2.4): returns only the two
+        // ranks bounding a target `index` (plus the sibling count and the
+        // ordering version), NEVER the full sibling list — so the response is
+        // O(1) regardless of how wide the parent is. `index: null` = append.
+        const body = (await request.json()) as { parent?: unknown; index?: unknown };
+        const parent = body.parent === null ? null
+          : typeof body.parent === "string" && body.parent ? body.parent
+          : undefined;
+        if (parent === undefined) throw new Error("ordered-neighbors requires parent (string ref or null)");
+        const seq = this.ensureSequencer();
+        const rows = seq.store.orderedEdgeChildren(parent);
+        const count = rows.length;
+        const idx = typeof body.index === "number" && Number.isFinite(body.index) ? Math.floor(body.index) : count;
+        const before = idx > 0 && idx - 1 < count ? rows[idx - 1].rank : null;
+        const after = idx >= 0 && idx < count ? rows[idx].rank : null;
+        return json({ scope: seq.scope, head: seq.head(), parent, before, after, count, version: orderedChildrenVersion(rows) });
       }
       if (request.method === "POST" && url.pathname === "/net/closure") {
         const body = (await request.json()) as {
