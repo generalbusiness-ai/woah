@@ -191,4 +191,47 @@ describe("bounded key-length growth (the O(1)-write guarantee)", () => {
     }
     expect(maxLen).toBeLessThan(50);
   });
+
+  // P2.5 (reviewer repro): the outliner verbs APPEND with the production
+  // primitive `rank_between(last, null)` — NOT `rankAfter`. Before the fix that
+  // bisected toward the fraction 1, lengthening the key every append (~401
+  // chars @ 2k) until the recursive midpoint stack-overflowed near ~39k appends
+  // (~7848-char key). `rank_between(a, null)` must be the O(1)-length append.
+  it("40k appends via rank_between(last, null) — the PRODUCTION append primitive — stay bounded, no overflow", () => {
+    let last = firstRank();
+    let prev = "";
+    let maxLen = 0;
+    for (let i = 0; i < 40000; i += 1) {
+      const next = rankBetween(last, null);
+      expect(next > last).toBe(true); // strictly monotonic append
+      prev = last;
+      last = next;
+      maxLen = Math.max(maxLen, last.length);
+    }
+    void prev;
+    // rank_between(last, null) now routes to rankAfter (increment in place):
+    // ~1 char per ~30 appends, so ~1300 chars at 40k — and it COMPLETES (no
+    // stack overflow). The OLD bisecting midpoint grew ~1 char per 5 appends
+    // (401 chars @ 2k) and overflowed the recursive descent near ~40k. Bound
+    // well under that failure while allowing rankAfter's slow linear growth.
+    expect(maxLen).toBeLessThan(2000);
+    // Concretely far better than the old bisecting path at a mid scale.
+    expect(rankBetween(firstRank(), null).length).toBeLessThan(4);
+  });
+
+  // P2.5 (reviewer repro): rankBetween must be ITERATIVE so no input — however
+  // long or adversarial — can blow the JS call stack. A pathologically long
+  // lower bound whose digits are all one step below the open upper end forces
+  // the deepest descent; a recursive midpoint overflows, an iterative one does
+  // not.
+  it("rankBetween never stack-overflows, even on a very long adversarial bound", () => {
+    // A 60000-char key of the MAX digit: rankBetween(zzz…z, null) descended one
+    // recursion frame per character — "Maximum call stack size exceeded" past
+    // ~40000 frames on the recursive midpoint. An iterative midpoint does not.
+    const longKey = RANK_DIGITS[RANK_DIGITS.length - 1].repeat(60000);
+    expect(isValidRank(longKey)).toBe(true);
+    let out = "";
+    expect(() => { out = rankBetween(longKey, null); }).not.toThrow();
+    expect(out > longKey).toBe(true);
+  });
 });

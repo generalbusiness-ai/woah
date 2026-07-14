@@ -63,40 +63,46 @@ function midpoint(a: string, b: string | null): string {
   if (b !== null && a >= b) {
     throw new Error(`fractional-rank: midpoint lower bound ${JSON.stringify(a)} >= upper bound ${JSON.stringify(b)}`);
   }
-  if (a.endsWith(ZERO) || (b !== null && b.endsWith(ZERO))) {
-    // Would break the string-compare == fraction-compare invariant.
-    throw new Error(`fractional-rank: midpoint bound ends in the zero digit (${JSON.stringify(a)}, ${JSON.stringify(b)})`);
-  }
-  if (b !== null) {
-    // Copy the shared leading run (treating a missing digit of `a` as the
-    // zero digit) and recurse on the divergent tails. This keeps the
-    // produced key close to its neighbours instead of jumping to the
-    // absolute middle of a narrow interval.
-    let n = 0;
-    while ((a[n] ?? ZERO) === b[n]) n++;
-    if (n > 0) {
-      return b.slice(0, n) + midpoint(a.slice(n), b.slice(n));
+  // ITERATIVE (P2.5): a recursive descent overflows the JS stack on a long
+  // bound (one frame per digit — "Maximum call stack size exceeded" past
+  // ~40000 chars). Walk index pointers over `a`/`b` instead, accumulating the
+  // shared/kept prefix, so depth is O(1) regardless of key length. `ai`/`bi`
+  // are cursors; a null `b` means the upper bound is the fraction 1. `a`'s
+  // digits past its end read as the zero digit (the fraction 0.a…000).
+  let prefix = "";
+  let ai = 0;
+  let bi = 0;
+  for (;;) {
+    // Copy the shared leading run (treating a missing digit of `a` as zero).
+    // This keeps the produced key close to its neighbours rather than jumping
+    // to the absolute middle of a narrow interval.
+    if (b !== null) {
+      while (bi < b.length && (a[ai] ?? ZERO) === b[bi]) {
+        prefix += b[bi];
+        ai += 1;
+        bi += 1;
+      }
     }
+    const digitA = ai < a.length ? digitOf(a[ai]) : 0;
+    const digitB = b !== null && bi < b.length ? digitOf(b[bi]) : BASE;
+    if (digitB - digitA > 1) {
+      // Room for a whole digit strictly between them: pick the middle one.
+      return prefix + RANK_DIGITS[Math.round((digitA + digitB) / 2)];
+    }
+    // Leading digits are consecutive: no single digit fits between them.
+    if (b !== null && bi + 1 < b.length) {
+      // `b`'s first remaining digit alone is > `a`'s remaining prefix and < `b`
+      // (it has a nonempty tail), and cannot end in zero here.
+      return prefix + b[bi];
+    }
+    // `b` is unbounded (or a single digit adjacent to `a`'s digit): keep `a`'s
+    // digit and descend into its tail against an unbounded upper bound
+    // (e.g. midpoint("49","5") -> "4" + midpoint("9", null) -> "495").
+    prefix += RANK_DIGITS[digitA];
+    ai += 1;
+    b = null;
+    bi = 0;
   }
-  // The leading digits differ (or `b` is unbounded).
-  const digitA = a.length > 0 ? digitOf(a[0]) : 0;
-  const digitB = b !== null ? digitOf(b[0]) : BASE;
-  if (digitB - digitA > 1) {
-    // Room for a whole digit strictly between them: pick the middle one.
-    const mid = Math.round((digitA + digitB) / 2);
-    return RANK_DIGITS[mid];
-  }
-  // Leading digits are consecutive: no single digit fits between them.
-  if (b !== null && b.length > 1) {
-    // `b`'s first digit alone is already > `a`'s prefix and < `b`, and it
-    // does not end in zero unless b[0] is zero — which cannot happen here
-    // because digitB - digitA <= 1 and digitA >= 0 means b[0] != '0'.
-    return b.slice(0, 1);
-  }
-  // `b` is unbounded, or a single digit adjacent to `a`'s first digit.
-  // Keep `a`'s first digit and descend into its tail against an unbounded
-  // upper bound (e.g. midpoint("49","5") -> "4" + midpoint("9",null)).
-  return RANK_DIGITS[digitA] + midpoint(a.slice(1), null);
 }
 
 /**
@@ -111,9 +117,16 @@ export function rankBetween(a: string | null, b: string | null): string {
   if (a !== null && b !== null && a >= b) {
     throw new Error(`fractional-rank: lower bound ${JSON.stringify(a)} >= upper bound ${JSON.stringify(b)}`);
   }
-  // `midpoint` treats an empty lower bound as the fraction 0; a null upper
-  // bound as the fraction 1.
-  return midpoint(a ?? "", b);
+  // P2.5: the open-ended cases are the outliner's hot append/prepend path
+  // (`rank_between(last, null)` / `rank_between(null, first)`). Route them
+  // through the O(1)-length `rankAfter`/`rankBefore` INCREMENT primitives —
+  // NOT the bisecting midpoint, which lengthens the key on every append and
+  // eventually feeds an unbounded key back in. Only the genuinely two-sided
+  // case needs the midpoint.
+  if (b === null) return a === null ? midpoint("", null) : rankAfter(a);
+  if (a === null) return rankBefore(b);
+  // `midpoint` treats an empty lower bound as the fraction 0.
+  return midpoint(a, b);
 }
 
 /** The first key for an empty order (room to insert on either side). */
