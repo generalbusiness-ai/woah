@@ -755,7 +755,7 @@ export class WooWorld {
    * complete local runtime (in-memory / SQLite dev) has no require flag and
    * derives the ordering by scanning objects' local edge property — the
    * ordering analogue of `roomRosterProjection`'s local-session fallback. */
-  orderedChildrenProjection(parent: ObjRef | null): WooValue[] {
+  orderedChildrenProjection(parent: ObjRef | null, container: ObjRef | null = null): WooValue[] {
     const projected = this.orderedChildrenProjections.get(WooWorld.orderedChildrenKey(parent));
     if (projected !== undefined) return cloneImportedPlainData(projected);
 
@@ -772,6 +772,10 @@ export class WooWorld {
 
     // Local fallback: scan every object's LOCAL edge property. Edges are a
     // per-item local value, so an inherited class default never participates.
+    // `container` scopes ordering ROOTS to one room (the net path scope-fetches
+    // one room's edges; the whole-world scan must not mix roots across rooms).
+    // For a non-null parent the children are inherently in the parent's room,
+    // so the container filter is a no-op there.
     const rows: OrderedChildRow[] = [];
     for (const obj of this.objects.values()) {
       const raw = obj.properties.get(ORDERED_EDGE_PROP) as OrderedEdgeValue | undefined;
@@ -780,6 +784,7 @@ export class WooWorld {
       const edgeParent = (raw as OrderedEdgeValue).parent ?? null;
       if (typeof rank !== "string" || rank.length === 0) continue;
       if (edgeParent !== parent) continue;
+      if (container !== null && obj.location !== container) continue;
       rows.push({ child: obj.id, rank });
     }
     rows.sort((a, b) => (a.rank < b.rank ? -1 : a.rank > b.rank ? 1 : a.child < b.child ? -1 : a.child > b.child ? 1 : 0));

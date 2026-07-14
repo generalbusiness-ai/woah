@@ -2,6 +2,16 @@
   "from_version": "1.x.x",
   "to_version": "2.0.0",
   "spec_version": "v1",
-  "note": "STUB (stage 3). The v2 outliner makes the ordered-edge index (each item's `__ordered_edge` { parent, rank }) the SOLE structural authority and removes the `.parent`/`.position` item props. A real data migration must, for every existing $outline_item, DERIVE an edge from its (parent, position) tie-broken by item id (total, reproducible order), assign initial fractional ranks in that order, make edges authoritative, then drop the legacy parent/position fields. That per-item fractional-rank derivation is stage 4 (see notes/2026-07-13-outliner-edge-index-v2.md §Migration). Stage 3 ships v2 working for FRESH outlines + the (empty) demo seed only; this file exists so the catalog-migration guard passes at the v2 bump. Applying these (empty) steps to an aged v1 world does NOT lose data, but leaves items unranked (flat) until stage 4's derivation lands.",
-  "steps": []
+  "note": "v1 stored an item's tree shape in per-item `.parent` (objref|null) + dense `.position` (1..N). v2 makes the room-owned ordered-edge index (`__ordered_edge` = { parent, rank }) the SOLE structural authority. This migration derives each item's edge from its legacy (parent, position) — grouping siblings by (containing outliner, parent), ordering by (position, then item id for a total/reproducible tie-break), and assigning fractional ranks in that order — then drops the legacy props so there is no second write path. Idempotent: re-deriving from the same input yields byte-identical ranks.",
+  "steps": [
+    {
+      "kind": "reindex_ordered_edges",
+      "class": "$outline_item",
+      "parent_prop": "parent",
+      "position_prop": "position",
+      "edge_prop": "__ordered_edge"
+    },
+    { "kind": "drop_property", "class": "$outline_item", "name": "position" },
+    { "kind": "drop_property", "class": "$outline_item", "name": "parent" }
+  ]
 }

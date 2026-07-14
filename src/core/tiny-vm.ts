@@ -1023,7 +1023,12 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         if (builtinArgs.length !== 1) throw wooError("E_INVARG", "ordered_children expects one parent (or null)");
         const parentArg = builtinArgs[0];
         const parent = parentArg === null ? null : assertObj(parentArg);
-        return frame.ctx.world.orderedChildrenProjection(parent) as unknown as WooValue;
+        // Pass the calling verb's enclosing space as the container: over the
+        // net the projection is already scope-fetched (one room), but the
+        // in-memory / SQLite fallback scans the whole world, so it must scope
+        // ordering roots to THIS room — otherwise a multi-outliner world would
+        // mix roots across outliners.
+        return frame.ctx.world.orderedChildrenProjection(parent, frame.ctx.space) as unknown as WooValue;
       }
       // connected_players was a GLOBAL session enumeration (Big-World
       // violation) whose sole consumer, $player:who_all, is now presence-scoped

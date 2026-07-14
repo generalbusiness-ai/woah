@@ -1,4 +1,5 @@
 import { analyzeBytecodePurity, combineVerbPurity, compileVerb, findUnresolvedThisCalls, propagateVerbPurity } from "./authoring";
+import { firstRank, rankAfter } from "./fractional-rank";
 import { hashSource } from "./source-hash";
 import { wooError, type ErrorValue, type ObjRef, type PresenceProjectionDef, type TinyBytecode, type VerbCallSite, type VerbDef, type WooValue } from "./types";
 import { normalizeVerbPerms } from "./verb-perms";
@@ -130,6 +131,18 @@ export type CatalogMigrationStep =
   | { kind: "change_parent"; class: string; parent: string }
   | { kind: "rename_class"; from: string; to: string }
   | { kind: "transform_property"; class: string; name: string; transform: CatalogMigrationTransform }
+  // Derive a room-owned ordered-edge index from a class's legacy
+  // (parent, position) props. GENERIC (parameterised by prop names — knows
+  // nothing of any catalog): for every placed instance of `class`, group by
+  // (container = its location, `parent_prop`), order each group by
+  // (`position_prop`, then object id — a total, reproducible tie-break), and
+  // write `edge_prop` = { parent, rank } with fractional ranks (fractional-rank
+  // helper). Deterministic, so re-deriving from the same input yields identical
+  // ranks (idempotent). Legacy props are removed by following `drop_property`
+  // steps. This is the substrate primitive behind the ordered-edge index
+  // (spec/discovery/catalogs.md CT14); it does NOT run woocode, so it fits the
+  // synchronous migration flow.
+  | { kind: "reindex_ordered_edges"; class: string; parent_prop: string; position_prop: string; edge_prop: string }
   | { kind: "custom"; verb: string };
 
 export type CatalogMigrationTransform =
@@ -1592,8 +1605,60 @@ function applyMigrationStep(
       for (const objRef of classAndDescendants(world, classRef)) transformPropertyLocal(world, objRef, step.name, step.transform);
       return;
     }
+    case "reindex_ordered_edges": {
+      const classRef = resolveObjectRef(world, step.class, localObjects, localSeeds, installed);
+      reindexOrderedEdges(world, classRef, step.parent_prop, step.position_prop, step.edge_prop);
+      return;
+    }
     case "custom":
       throw wooError("E_NOT_IMPLEMENTED", "catalog custom migrations are deferred", step as unknown as WooValue);
+  }
+}
+
+/** Legacy 1-indexed sibling position, floored; unset/invalid → 0 (sorts first,
+ * before any positive position, matching the v1 "position 0 = unplaced" seam). */
+function legacyPosition(world: WooWorld, ref: ObjRef, positionProp: string): number {
+  const value = world.object(ref).properties.get(positionProp);
+  return typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : 0;
+}
+
+/**
+ * Build the ordered-edge index for `class` from its legacy (parent, position)
+ * props. Siblings are the placed instances that share a (container, parent);
+ * container is the instance's `location` (the room that owns the index). Each
+ * group is ordered by (position, id) — the id tie-break makes the order total
+ * and reproducible even when v1 positions collide — and assigned fractional
+ * ranks via a fixed `firstRank → rankAfter` chain, so re-deriving from the same
+ * input yields byte-identical edges (idempotent). One `edge_prop` write per
+ * instance; no renumber. See the `reindex_ordered_edges` step doc above.
+ */
+function reindexOrderedEdges(world: WooWorld, classRef: ObjRef, parentProp: string, positionProp: string, edgeProp: string): void {
+  const groups = new Map<string, { container: ObjRef; parent: ObjRef | null; items: ObjRef[] }>();
+  for (const ref of classAndDescendants(world, classRef)) {
+    if (ref === classRef) continue; // the class itself is not a placed item
+    const obj = world.object(ref);
+    const container = obj.location;
+    if (!container || container === "$nowhere") continue; // unplaced instances get no edge
+    const rawParent = obj.properties.get(parentProp);
+    const parent = typeof rawParent === "string" ? rawParent : null;
+    const key = `${container} ${parent ?? ""}`;
+    let group = groups.get(key);
+    if (!group) groups.set(key, (group = { container, parent, items: [] }));
+    group.items.push(ref);
+  }
+  for (const group of groups.values()) {
+    group.items.sort((a, b) => {
+      const pa = legacyPosition(world, a, positionProp);
+      const pb = legacyPosition(world, b, positionProp);
+      if (pa !== pb) return pa - pb;
+      return a < b ? -1 : a > b ? 1 : 0;
+    });
+    let last: string | null = null;
+    for (const ref of group.items) {
+      const rank: string = last === null ? firstRank() : rankAfter(last);
+      world.setProp(ref, edgeProp, { parent: group.parent, rank });
+      last = rank;
+    }
   }
 }
 
@@ -1661,14 +1726,13 @@ function renamePropertyLocal(world: WooWorld, objRef: ObjRef, from: string, to: 
 }
 
 function dropPropertyLocal(world: WooWorld, objRef: ObjRef, name: string): void {
-  const obj = world.object(objRef);
-  obj.propertyDefs.delete(name);
-  obj.properties.delete(name);
-  obj.propertyVersions.delete(name);
-  if (name === "subscribers" || name === "session_subscribers") {
-    world.invalidatePresenceIndex();
-  }
-  touchObject(world, objRef);
+  // Route through the world's canonical deletion path so the removal is
+  // PERSISTED: `deleteProp` records a property-delete for the incremental
+  // object-repository flush (and invalidates presence). A direct Map mutation
+  // would leave the stale row in SQLite, so a dropped prop would reappear on
+  // the next reload (a v1 `.parent`/`.position` value resurrecting after the
+  // v1->v2 migration). No-op (returns false) if the object lacks the property.
+  world.deleteProp(objRef, name);
 }
 
 function renameVerbLocal(world: WooWorld, objRef: ObjRef, from: string, to: string): void {
@@ -1708,6 +1772,8 @@ function migrationStepId(step: CatalogMigrationStep, index: number): string {
       return `${index + 1}:rename_class:${step.from}->${step.to}`;
     case "transform_property":
       return `${index + 1}:transform_property:${step.class}.${step.name}`;
+    case "reindex_ordered_edges":
+      return `${index + 1}:reindex_ordered_edges:${step.class}.${step.edge_prop}`;
     case "custom":
       return `${index + 1}:custom`;
   }

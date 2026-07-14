@@ -60,9 +60,11 @@ function position(world: ReturnType<typeof createWorld>, item: string): number {
   const self = edgeOf(world, item);
   if (!self || self.rank === "") return 0;
   const parent = self.parent;
+  const container = world.object(item).location; // siblings share the same outliner
   const siblings: Array<{ id: string; rank: string }> = [];
   for (const obj of world.exportWorld().objects) {
     if (obj.parent !== "$outline_item") continue; // direct $outline_item instances
+    if (obj.location !== container) continue; // scope roots to one outliner
     const raw = new Map(obj.properties).get("__ordered_edge") as { parent?: unknown; rank?: unknown } | undefined;
     if (!raw || typeof raw !== "object") continue;
     const rank = typeof raw.rank === "string" ? raw.rank : "";
@@ -277,6 +279,33 @@ describe("outliner catalog: not portable / defensive recycle", () => {
     const r = await call(world, session.actor, a, "moveto", [session.actor]);
     expect(r.op).toBe("error");
     if (r.op === "error") expect(r.error.code).toBe("E_NOT_PORTABLE");
+  });
+
+  it("cross-outliner moveto re-homes the item as a root in the destination; children stay behind (no stale parent ref)", async () => {
+    const world = setupWorld();
+    const session = world.auth("guest:xoutline");
+    const actor = session.actor;
+    // A second outliner in the same room.
+    world.createObject({ id: "the_outline_2", name: "Outline 2", parent: "$outliner", owner: actor, location: "the_chatroom" });
+    await expectResult(call(world, actor, "the_outline", "enter", []));
+    const a = await addItem(world, actor, "a");
+    const b = await addItem(world, actor, "b", a); // b is a child of a
+    const c = await addItem(world, actor, "c", b); // c is a child of b
+    // Move b (a nested item with its own child) into the second outliner.
+    const r = await expectResult(call(world, actor, b, "moveto", ["the_outline_2"]));
+    // b now lives in outliner 2 as a ROOT with a fresh valid edge — the stale
+    // cross-outliner parent ref (a, in the source) is gone.
+    expect(world.object(b).location).toBe("the_outline_2");
+    const eb = edgeOf(world, b);
+    expect(eb?.parent).toBeNull();
+    expect((eb?.rank ?? "").length).toBeGreaterThan(0);
+    // c stayed behind, re-homed to b's former parent (a) in the source outliner.
+    expect(world.object(c).location).toBe("the_outline");
+    expect(parentOf(world, c)).toBe(a);
+    // enterfunc announced b's arrival in outliner 2 (the destination UI needs it).
+    expect(r.observations.some((o) => o.type === "outline_item_added" && o.item === b && o.outliner === "the_outline_2")).toBe(true);
+    // The destination now lists b as a visible root.
+    expect(position(world, b)).toBe(1);
   });
 
   it("remove_item reparents direct children to the removed item's parent", async () => {

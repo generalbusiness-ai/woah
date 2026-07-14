@@ -696,7 +696,8 @@ The v1 migration vocabulary is intentionally minimal. Runtime status is listed p
 - `change_parent` — implemented through the normal authored `chparent` path.
 - `rename_class` — deferred; changing corename/object identity safely requires object-reference migration.
 - `transform_property` — implemented for the v1 declarative-op vocabulary listed below; rewrites locally-set values across a class and its descendants. Inline-verb transforms (verb-source bodies, typed signatures) remain deferred.
-- `custom` — deferred; needs a stable migration-verb execution contract.
+- `reindex_ordered_edges` — implemented; derives a room-owned ordered-edge index from a class's legacy `(parent, position)` props. Parameterised by `class`, `parent_prop`, `position_prop`, `edge_prop` (it is generic — it knows nothing of any catalog). For every placed instance of `class` it groups siblings by (container = the instance's `location`, `parent_prop`), orders each group by `(position_prop, then object id)` for a total/reproducible tie-break, and writes `edge_prop = { parent, rank }` with fractional ranks (`src/core/fractional-rank`). Deterministic, so re-deriving from the same input yields byte-identical ranks (idempotent per §CT14.4). It is a synchronous data-transform (no woocode dispatch); pair it with following `drop_property` steps to remove the legacy props. Used by `catalogs/outliner/migration-v1-to-v2.json` (the ordered-edge index — see the outliner `DESIGN.md`).
+- `custom` — deferred; needs a stable migration-verb execution contract. (Per-instance computed transforms that would otherwise need `custom` — e.g. deriving an ordered index — are covered by the parameterised `reindex_ordered_edges` step above.)
 
 The v1 `transform` ops (passed as a JSON object on the step):
 
