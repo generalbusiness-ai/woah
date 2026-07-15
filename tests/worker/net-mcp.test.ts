@@ -158,6 +158,24 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
     const missing = await call(aliceSession, "woo_call", { object: "the_chatroom", verb: "no_such_verb_xyz", args: [] });
     expect(missing.result?.isError).toBe(true);
 
+    // Catalog-qualified references are installer syntax, not runtime object
+    // ids. Pin the MCP adapter's error envelope as well as the shared REST
+    // refusal so this transport cannot regress back to E_BUDGET repair.
+    const invalidTarget = await call(aliceSession, "woo_call", {
+      object: "tasks:the_taskboard",
+      verb: "listing",
+      args: []
+    });
+    expect(invalidTarget.result).toMatchObject({
+      isError: true,
+      structuredContent: {
+        error: {
+          code: "E_INVARG",
+          detail: { field: "target", reason: "invalid_object_id" }
+        }
+      }
+    });
+
     // Cross-room move: the walkthrough's acid test (left/entered fanout).
     const entered = await call(aliceSession, "woo_call", { object: "the_chatroom", verb: "enter", args: [] });
     expect(entered.result?.isError, JSON.stringify(entered).slice(0, 400)).not.toBe(true);

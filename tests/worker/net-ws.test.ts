@@ -487,6 +487,24 @@ describe("/net-api/ws socket surface (Phase 4 item 3 chunk 1)", () => {
       expect(Object.keys(turnFrame as Record<string, unknown>), `turn_result.${key}`).toContain(key);
     }
 
+    // Catalog-qualified references are installer syntax, not runtime object
+    // ids. The socket must carry the shared refusal in a correlated
+    // turn_result frame, without entering repair or closing the connection.
+    await h.gateway.webSocketMessage(
+      server as unknown as WebSocket,
+      JSON.stringify({ type: "turn", id: "bad-target", target: "tasks:the_taskboard", verb: "listing" })
+    );
+    expect(frames(server).at(-1)).toMatchObject({
+      type: "turn_result",
+      id: "bad-target",
+      status: 400,
+      error: {
+        code: "E_INVARG",
+        detail: { field: "target", reason: "invalid_object_id" }
+      }
+    });
+    expect(server.readyState).toBe(1);
+
     // A frame claiming ANOTHER session still runs on the socket's own:
     // the reply is a normal accepted turn, not an actor_mismatch — the
     // frame's session field is ignored by design.
