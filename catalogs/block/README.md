@@ -66,13 +66,14 @@ the full token before putting it into a plug's secret store:
 export WOO_BASE_URL="https://woo.example.com"
 export WOO_APIKEY="apikey:<id>:<secret>"
 
-curl -fsS "$WOO_BASE_URL/api/auth" \
+curl -fsS "$WOO_BASE_URL/net-api/session" \
+  -H "Authorization: Bearer $WOO_APIKEY" \
   -H "content-type: application/json" \
-  --data "{\"token\":\"$WOO_APIKEY\"}"
+  --data '{}'
 ```
 
-A valid block key returns JSON with `actor` equal to the block id and
-`token_class: "apikey"`. `E_NOSESSION` means the id/secret pair is wrong,
+A valid block key returns JSON with `actor` equal to the block id and a net
+`session`. `E_NOSESSION` means the id/secret pair is wrong,
 unknown, or revoked.
 
 ## Subclassing

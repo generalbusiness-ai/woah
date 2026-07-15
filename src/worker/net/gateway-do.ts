@@ -45,6 +45,7 @@
  * plus the CLIENT-facing /net-api surface (Phase 4 item 2 — apikey
  * credentials instead of internal signing; see the clientApi block):
  *       POST /net-api/session, POST /net-api/turn,
+ *       POST /net-api/browser-metrics,
  *       GET /net-api/relation, GET /net-api/cell
  *
  * Topology (Plan 002 Phase 3.5 item 2, CO15): the gateway derives its
@@ -150,6 +151,7 @@ function sqlRows<T>(cursor: unknown): T[] {
 }
 
 type ScopeRow = { seen_seq: number };
+const MAX_NET_BROWSER_METRICS_BATCH = 50;
 
 /** One owner-computed ordered-children projection the gateway fetched for a
  * turn: the bounded rows plus the authority `version` (content address) the
@@ -1958,6 +1960,11 @@ export class NetGatewayDO {
         if (bearerSession && body.session === undefined) body.session = bearerSession;
         return await this.clientTurn(actor, body, identity.epoch);
       }
+      if (request.method === "POST" && url.pathname === "/net-api/browser-metrics") {
+        const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+        if (bearerSession && body.session === undefined) body.session = bearerSession;
+        return await this.clientBrowserMetrics(actor, body);
+      }
       if (request.method === "GET" && url.pathname === "/net-api/relation") {
         const relation = url.searchParams.get("relation") ?? "";
         const owner = url.searchParams.get("owner") ?? "";
@@ -2719,6 +2726,21 @@ export class NetGatewayDO {
       [{ scope: planningScope, objects: [target, anchorObject] }],
       "net_client_pull_miss_failed"
     );
+    // Match the existing gateway contract in CA14: catalog metadata may name
+    // deterministic authority roots/property paths.  Resolve those paths
+    // generically before planning so a cold movement does not spend one repair
+    // round each on the exit, destination, and destination lineage.
+    await this.warmDeclaredAuthorityPrefetch({
+      kind: "woo.turn_call.shadow.v1",
+      id: "prefetch",
+      route: "sequenced",
+      scope: anchorObject,
+      session,
+      actor,
+      target,
+      verb,
+      args
+    }, planningScope);
     // Client retries reuse their supplied idempotency key (CO2.5); an
     // unkeyed request gets a fresh turn identity.
     const key =
@@ -2765,6 +2787,45 @@ export class NetGatewayDO {
     // the reply names its verdict; thrown taxonomy errors (E_BUDGET etc.)
     // surface through the clientApi catch instead.
     return json(result);
+  }
+
+  /** Net-native browser telemetry. Authentication above establishes the
+   * actor; the live session binding prevents a stale/revoked credential from
+   * writing diagnostics, and payload actor fields are intentionally ignored.
+   * Metrics are bounded diagnostics and never participate in world state. */
+  private async clientBrowserMetrics(actor: string, body: Record<string, unknown>): Promise<Response> {
+    const session = typeof body.session === "string" && body.session.length > 0 ? body.session : null;
+    if (!session) {
+      return json({ error: { code: "E_NOSESSION", message: "browser metrics require a live session" } }, 401);
+    }
+    await this.warmScopes([{ scope: `cluster:${actor}`, objects: [actor] }], "net_browser_metric_session_pull_failed");
+    const verdict = validateSessionCell(this.ensureView().get(sessionCellKey(session)), this.host.now(), actor);
+    if (verdict !== "ok") {
+      return json({ error: { code: "E_NOSESSION", message: `session ${verdict}`, detail: { session_verdict: verdict } } }, 401);
+    }
+    const rawMetrics = Array.isArray(body.metrics) ? body.metrics : [];
+    let accepted = 0;
+    let sampled = Math.max(0, rawMetrics.length - MAX_NET_BROWSER_METRICS_BATCH);
+    for (const raw of rawMetrics.slice(0, MAX_NET_BROWSER_METRICS_BATCH)) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+      const input = raw as Record<string, unknown>;
+      if (input.kind !== "browser_activity" || typeof input.phase !== "string" || input.phase.length === 0) continue;
+      const ms = typeof input.ms === "number" && Number.isFinite(input.ms) && input.ms >= 0 ? input.ms : 0;
+      this.metric({
+        kind: "browser_activity",
+        source: input.source === "v2_browser_worker" ? "v2_browser_worker" : "main",
+        phase: input.phase.slice(0, 160),
+        actor,
+        ms,
+        status: input.status === "error" ? "error" : "ok",
+        ...(typeof input.error === "string" && input.error.length > 0 ? { error: input.error.slice(0, 512) } : {})
+      });
+      accepted += 1;
+    }
+    // Invalid entries are dropped rather than reflected: this is a lossy
+    // diagnostic path, and callers must not gain a payload-validation oracle.
+    sampled += rawMetrics.slice(0, MAX_NET_BROWSER_METRICS_BATCH).length - accepted;
+    return json({ ok: true, accepted, sampled });
   }
 
   /** The space object a client turn anchors to — see clientTurn. */
@@ -3883,6 +3944,138 @@ export class NetGatewayDO {
       if (resolved !== null) return resolved;
     }
     return false;
+  }
+
+  /** Resolve the executable verb page in the same parent-first then feature-
+   * chain order used by the projection metadata gates.  Metadata is catalog
+   * data; callers interpret only generic fields. */
+  private callVerbPage(view: CellStore, call: ShadowTurnCall): Record<string, unknown> | null {
+    const resolveChain = (start: string): Record<string, unknown> | null => {
+      let object: string | null = start;
+      const seen = new Set<string>();
+      while (object && !seen.has(object)) {
+        seen.add(object);
+        for (const cell of view.cellsForObject(object)) {
+          if (cell.kind !== "verb_bytecode") continue;
+          const verb = cell.value as Record<string, unknown>;
+          const names = [verb.name, ...(Array.isArray(verb.aliases) ? verb.aliases : [])];
+          if (names.includes(call.verb)) return verb;
+        }
+        const lineage = view.get(cellKey("object_lineage", object))?.value as { parent?: unknown } | undefined;
+        object = typeof lineage?.parent === "string" ? lineage.parent : null;
+      }
+      return null;
+    };
+    const inherited = resolveChain(call.target);
+    if (inherited) return inherited;
+    const featuresCell = view.get(cellKey("property_cell", call.target, "features"))?.value as { value?: unknown } | undefined;
+    const features = Array.isArray(featuresCell?.value)
+      ? featuresCell.value.filter((value): value is string => typeof value === "string")
+      : [];
+    for (const feature of features) {
+      const resolved = resolveChain(feature);
+      if (resolved) return resolved;
+    }
+    return null;
+  }
+
+  /** CA14 deterministic owner prefetch for the deployed net client path.
+   * The grammar deliberately matches the legacy gateway's generic
+   * roots/path/first forms; no command word, room id, or catalog property is
+   * embedded here. */
+  private async warmDeclaredAuthorityPrefetch(call: ShadowTurnCall, planningScope: string): Promise<void> {
+    const page = this.callVerbPage(this.ensureView(), call);
+    const argSpec = page?.arg_spec;
+    if (!argSpec || typeof argSpec !== "object" || Array.isArray(argSpec)) return;
+    const authority = (argSpec as Record<string, unknown>).authority;
+    if (!authority || typeof authority !== "object" || Array.isArray(authority)) return;
+    const entries = (authority as Record<string, unknown>).prefetch;
+    if (!Array.isArray(entries)) return;
+    for (const entry of entries) {
+      const resolved = await this.resolveNetAuthorityPrefetch(entry, call, planningScope);
+      for (const object of resolved) await this.warmNetPrefetchObject(object, planningScope);
+    }
+  }
+
+  private async resolveNetAuthorityPrefetch(
+    value: unknown,
+    call: ShadowTurnCall,
+    planningScope: string
+  ): Promise<string[]> {
+    if (typeof value === "string") {
+      const root = this.netAuthorityPrefetchRoot(value, call);
+      return root ? [root] : [];
+    }
+    if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+    const map = value as Record<string, unknown>;
+    if (Array.isArray(map.first)) {
+      for (const item of map.first) {
+        const resolved = await this.resolveNetAuthorityPrefetch(item, call, planningScope);
+        if (resolved.length > 0) return resolved;
+      }
+      return [];
+    }
+    if (!Array.isArray(map.path) || map.path.length === 0 || typeof map.path[0] !== "string") return [];
+    let cursor: unknown = this.netAuthorityPrefetchRoot(map.path[0], call);
+    for (const rawPart of map.path.slice(1)) {
+      const part = this.netAuthorityPrefetchPathPart(rawPart, call);
+      if (part === null) return [];
+      if (typeof cursor === "string") {
+        await this.warmNetPrefetchObject(cursor, planningScope);
+        cursor = this.netObjectProperty(cursor, part);
+      } else if (cursor && typeof cursor === "object" && !Array.isArray(cursor)) {
+        cursor = (cursor as Record<string, unknown>)[part];
+      } else {
+        return [];
+      }
+    }
+    return typeof cursor === "string" && cursor.length > 0 ? [cursor] : [];
+  }
+
+  private netAuthorityPrefetchRoot(root: string, call: ShadowTurnCall): string | null {
+    if (root === "scope") return call.scope;
+    if (root === "target") return call.target;
+    if (root === "actor") return call.actor;
+    return null;
+  }
+
+  private netAuthorityPrefetchPathPart(raw: unknown, call: ShadowTurnCall): string | null {
+    if (typeof raw === "string") return raw === "$verb" ? call.verb : raw;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+    const arg = (raw as { arg?: unknown }).arg;
+    if (typeof arg !== "number" || !Number.isInteger(arg) || arg < 0) return null;
+    const value = call.args[arg];
+    return typeof value === "string" ? value.trim() : null;
+  }
+
+  /** Read an effective property from the derived view, walking inherited
+   * defaults.  The property-cell payload's `value` slot is the only catalog
+   * value exposed to the generic path interpreter. */
+  private netObjectProperty(object: string, name: string): unknown {
+    const view = this.ensureView();
+    let current: string | null = object;
+    const seen = new Set<string>();
+    while (current && !seen.has(current)) {
+      seen.add(current);
+      const payload = view.get(cellKey("property_cell", current, name))?.value as { value?: unknown } | undefined;
+      if (payload && Object.prototype.hasOwnProperty.call(payload, "value")) return payload.value;
+      const lineage = view.get(cellKey("object_lineage", current))?.value as { parent?: unknown } | undefined;
+      current = typeof lineage?.parent === "string" ? lineage.parent : null;
+    }
+    return undefined;
+  }
+
+  /** Materialize one ref using topology-derived likely owners.  The current
+   * planning scope is the strong first candidate for anchored helpers such as
+   * exits; room/cluster naming conventions cover a terminal scope or actor.
+   * Failed candidates are harmless closure misses and the normal repair loop
+   * remains the correctness fallback. */
+  private async warmNetPrefetchObject(object: string, planningScope: string): Promise<void> {
+    if (!object || object === "$nowhere" || this.ensureView().has(cellKey("object_lineage", object))) return;
+    for (const scope of [...new Set([planningScope, `room:${object}`, `cluster:${object}`])]) {
+      await this.warmScopes([{ scope, objects: [object] }], "net_authority_prefetch_failed");
+      if (this.ensureView().has(cellKey("object_lineage", object))) return;
+    }
   }
 
   /** Whether the dispatched verb declared `reads_room_presence` (the gateway

@@ -145,7 +145,10 @@ Activation requires ALL of, in order:
    repair is a *boot* posture (a deployed world must come up); an
    *install* must never declare a half-migrated world ready.
 2. **Scope heads.** Every seeded scope answers `/head` at the install
-   epoch.
+   epoch. The seed body includes the scope's complete initial derived
+   `contents` rows, computed from the whole install image and partitioned by
+   the containing object's scope; head-only verification is not evidence of a
+   usable room projection unless these rows rode the seed.
 3. **Carried credential** (when an identity export rode along). A
    carried apikey must mint a session through the real `/net-api/session`
    surface. `--verify-apikey` is **mandatory** with `--identity`; the
@@ -171,7 +174,11 @@ Activation requires ALL of, in order:
 `GET /net-install/probe`, `POST /net-install/scope/<name>/seed`,
 `GET /net-install/scope/<name>/head`,
 `POST /net-install/scope/<name>/activate`, `POST /net-install/freeze`,
-and `GET /net-install/identity-export` are the entire surface. Trust
+`POST /net-install/scope/<name>/repair-relations`, and
+`GET /net-install/identity-export` are the entire surface. The repair operation
+is an idempotent, add-only recovery for initial `contents` rows omitted by an
+older installer; it accepts only rows whose owner object is authoritative at
+the addressed scope and refans newly added rows at an advanced owner head. Trust
 model and enforced properties (pinned at the route level by
 `tests/worker/net-install-doorway.test.ts`):
 
@@ -352,7 +359,12 @@ item; what remains is exactly what the workerd lanes cannot prove
   For a roster-backed move result with `look_deferred: true`, planning omits the
   redundant `here` snapshot. The result's top-level roster is advanced by the
   pending session transition so it includes the caller, and the client performs
-  the declared authoritative refresh. This avoids rebuilding presence from
+  the declared authoritative refresh. On the net client that refresh hydrates
+  the bounded `here` projection from the destination owner's `contents` and
+  `session_presence` relations plus presence-authorized lineage/live/display
+  cells. It must not install a sparse planner-built `here` snapshot: a missing
+  member or exit is unavailable state, not evidence that the object or exit is
+  absent. This avoids rebuilding presence from
   physical room contents: closed sessions may leave reusable player objects
   physically contained, but planning must not dereference those actor clusters.
 

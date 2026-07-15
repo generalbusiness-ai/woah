@@ -32,6 +32,12 @@ const env: WeatherPlugEnv = {
   BLOCK_ID: "the_weather_block"
 };
 
+const propertyReply = (value: unknown): Reply => ({ status: 200, body: { cell: { value: { value } } } });
+const turnReply = (result: unknown = null): Reply => ({
+  status: 200,
+  body: { reply: { status: "accepted" }, result, observations: [] }
+});
+
 describe("runLoggedWeatherTick", () => {
   let logSpy: ReturnType<typeof vi.spyOn>;
   let lines: any[];
@@ -50,15 +56,15 @@ describe("runLoggedWeatherTick", () => {
   it("emits tick_start then tick_ok for a successful run, with duration_ms and place", async () => {
     const { fetchImpl } = makeFetch([
       () => ({ status: 200, body: { actor: "the_weather_block", session: "sess", expires_at: null, token_class: "apikey" } }),
-      () => ({ status: 200, body: { value: "Mountain View, CA" } }),
-      () => ({ status: 200, body: { value: "imperial" } }),
-      () => ({ status: 200, body: { value: "America/Los_Angeles" } }),
-      () => ({ status: 200, body: { value: {} } }),     // prior timeseries (cold start)
-      () => ({ status: 200, body: { value: [] } }),     // prior daily (cold start)
+      () => propertyReply("Mountain View, CA"),
+      () => propertyReply("imperial"),
+      () => propertyReply("America/Los_Angeles"),
+      () => propertyReply({}),     // prior timeseries (cold start)
+      () => propertyReply([]),     // prior daily (cold start)
       () => ({ status: 200, body: { data: { time: "2026-05-05T18:00:00Z", values: { temperature: 70 } } } }),
       () => ({ status: 200, body: { timelines: { hourly: [], daily: [] } } }),
       () => ({ status: 200, body: { timelines: { hourly: [], daily: [] } } }),
-      () => ({ status: 200, body: { result: { ok: true }, observations: [] } })
+      () => turnReply({ ok: true })
     ]);
 
     let tick = 1000;
@@ -99,8 +105,8 @@ describe("runLoggedWeatherTick", () => {
   it("emits tick_error with category=weather_config:E_NO_PLACE when the owner hasn't set place", async () => {
     const { fetchImpl } = makeFetch([
       () => ({ status: 200, body: { actor: "the_weather_block", session: "sess", expires_at: null, token_class: "apikey" } }),
-      () => ({ status: 200, body: { value: "" } }),
-      () => ({ status: 200, body: { result: null, observations: [] } })
+      () => propertyReply(""),
+      () => turnReply()
     ]);
 
     await expect(runLoggedWeatherTick(env, "fetch", { fetchImpl })).rejects.toMatchObject({ code: "E_NO_PLACE" });
@@ -115,11 +121,11 @@ describe("runLoggedWeatherTick", () => {
   it("emits tick_error with category=tomorrow:rate_limit on 429", async () => {
     const { fetchImpl } = makeFetch([
       () => ({ status: 200, body: { actor: "the_weather_block", session: "sess", expires_at: null, token_class: "apikey" } }),
-      () => ({ status: 200, body: { value: "Mountain View, CA" } }),
-      () => ({ status: 200, body: { value: "imperial" } }),
-      () => ({ status: 200, body: { value: "America/Los_Angeles" } }),
-      () => ({ status: 200, body: { value: {} } }),
-      () => ({ status: 200, body: { value: [] } }),
+      () => propertyReply("Mountain View, CA"),
+      () => propertyReply("imperial"),
+      () => propertyReply("America/Los_Angeles"),
+      () => propertyReply({}),
+      () => propertyReply([]),
       ({ url }) => url.includes("api.tomorrow.io")
         ? { status: 429, body: { code: 429001, message: "rate limit" }, headers: { "Retry-After": "60" } }
         : { status: 200, body: {} },
@@ -129,7 +135,7 @@ describe("runLoggedWeatherTick", () => {
       ({ url }) => url.includes("api.tomorrow.io")
         ? { status: 429, body: { code: 429001, message: "rate limit" }, headers: { "Retry-After": "60" } }
         : { status: 200, body: {} },
-      () => ({ status: 200, body: { result: null, observations: [] } })
+      () => turnReply()
     ]);
 
     await expect(runLoggedWeatherTick(env, "cron", { fetchImpl })).rejects.toThrow();
@@ -143,11 +149,11 @@ describe("runLoggedWeatherTick", () => {
   it("emits tick_error with category=tomorrow:auth on 401 from tomorrow.io", async () => {
     const { fetchImpl } = makeFetch([
       () => ({ status: 200, body: { actor: "the_weather_block", session: "sess", expires_at: null, token_class: "apikey" } }),
-      () => ({ status: 200, body: { value: "Mountain View, CA" } }),
-      () => ({ status: 200, body: { value: "imperial" } }),
-      () => ({ status: 200, body: { value: "America/Los_Angeles" } }),
-      () => ({ status: 200, body: { value: {} } }),
-      () => ({ status: 200, body: { value: [] } }),
+      () => propertyReply("Mountain View, CA"),
+      () => propertyReply("imperial"),
+      () => propertyReply("America/Los_Angeles"),
+      () => propertyReply({}),
+      () => propertyReply([]),
       ({ url }) => url.includes("api.tomorrow.io")
         ? { status: 401, body: { error: "bad key" } }
         : { status: 200, body: {} },
@@ -157,7 +163,7 @@ describe("runLoggedWeatherTick", () => {
       ({ url }) => url.includes("api.tomorrow.io")
         ? { status: 401, body: { error: "bad key" } }
         : { status: 200, body: {} },
-      () => ({ status: 200, body: { result: null, observations: [] } })
+      () => turnReply()
     ]);
 
     await expect(runLoggedWeatherTick(env, "cron", { fetchImpl })).rejects.toThrow();

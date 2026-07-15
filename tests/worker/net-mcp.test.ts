@@ -71,7 +71,7 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
       const request = new Request("https://do/net/seed", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ scope, catalog_epoch: plan.epoch, cells })
+        body: JSON.stringify({ scope, catalog_epoch: plan.epoch, cells, relations: plan.relations.get(scope) ?? [] })
       });
       const seeded = await instance.fetch(await signInternalRequest(scopeEnv, request));
       expect(seeded.ok, `seed ${scope}`).toBe(true);

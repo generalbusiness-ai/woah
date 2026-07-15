@@ -4409,7 +4409,7 @@ export class WooWorld {
     // after movement. Building a second `here` snapshot here would walk
     // physical contents (including disconnected reusable player objects) and
     // turn that history into cross-cluster reads on the commit path.
-    if (map.look_deferred === true && this.roomRosterProjections.has(map.room)) return result;
+    if (map.look_deferred === true && (this.requireRoomRosterProjection || this.roomRosterProjections.has(map.room))) return result;
     const memo = ctx.hostMemo ?? createHostOperationMemo();
     const hereLocation = await this.primaryRoomForLocation(map.room, memo);
     if (!hereLocation) return result;

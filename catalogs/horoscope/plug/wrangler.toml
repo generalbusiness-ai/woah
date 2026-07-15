@@ -3,9 +3,9 @@ main = "src/index.ts"
 compatibility_date = "2026-01-01"
 compatibility_flags = ["nodejs_compat", "global_fetch_strictly_public"]
 
-# Drain the queue every 15 minutes. Each plug tick wakes WORLD via
-# /api/objects/the_horoscope/calls/next_pending and pinned its host
-# queue for 19-26 s of v2-relay setup (see
+# Drain the queue every 15 minutes. Each plug tick runs a sequenced net turn
+# against the horoscope block. The former v2 relay pinned its host queue for
+# 19-26 s of setup (see
 # notes/2026-05-22-horoscope-blocking-world.md). Minute-cadence polling
 # was using ~30% of WORLD's wall time on overhead alone for a queue
 # that's empty most of the time. 15-minute polling is plenty for a
@@ -32,7 +32,7 @@ binding = "AI"
 #   wrangler deploy
 [vars]
 # Public routing/config values. Secrets still go through `wrangler secret put`.
-WOO_BASE_URL = "https://woah.generalbusiness.ai"
+WOO_BASE_URL = "https://woah1.generalbusiness.ai"
 BLOCK_ID = "the_horoscope"
 MAX_TOKENS = "350"
 MAX_ORDERS_PER_TICK = "10"

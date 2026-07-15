@@ -29,6 +29,7 @@
  *   POST /net-api/turn {target,verb,args,session,idempotency_key} → TurnResult
  *   GET  /net-api/cell?key=                    → {key, cell}
  *   GET  /net-api/relation?relation=&owner=    → {relation, owner, members}
+ *   POST /net-api/browser-metrics              → {ok, accepted, sampled}
  *   POST /net-api/ws-ticket {session}          → {ticket, expires_at}  (B3)
  *   GET  /net-api/ws?ticket=                   → WebSocket upgrade
  *     client→server frames: {type:"turn", id, target, verb, args, idempotency_key}
@@ -642,6 +643,16 @@ export class NetFeed {
     const members = Array.isArray(reply.members) ? reply.members : [];
     this.readCache.set(cacheKey, members);
     return members;
+  }
+
+  /** Transport-neutral browser diagnostics. Keeping this on NetFeed makes
+   * the client credential private to the transport and prevents net mode
+   * from falling back to the legacy `/api/browser-metrics` namespace. */
+  async reportBrowserMetrics(metrics: readonly unknown[]): Promise<void> {
+    await this.fetchJson("POST", "/net-api/browser-metrics", {
+      session: this.requireSession(),
+      metrics
+    });
   }
 
   // ---- Socket plumbing -----------------------------------------------------

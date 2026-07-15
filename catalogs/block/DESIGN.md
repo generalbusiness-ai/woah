@@ -101,13 +101,14 @@ should validate the full token before storing it in Worker secrets:
 export WOO_BASE_URL="https://woo.example.com"
 export WOO_APIKEY="apikey:<id>:<secret>"
 
-curl -fsS "$WOO_BASE_URL/api/auth" \
+curl -fsS "$WOO_BASE_URL/net-api/session" \
+  -H "Authorization: Bearer $WOO_APIKEY" \
   -H "content-type: application/json" \
-  --data "{\"token\":\"$WOO_APIKEY\"}"
+  --data '{}'
 ```
 
-Success returns `{ actor, session, token_class: "apikey", ... }`, with
-`actor` equal to the block object. `E_NOSESSION` means the key is unknown,
+Success returns `{ actor, session, expires_at, ... }`, with `actor` equal to
+the block object. `E_NOSESSION` means the key is unknown,
 malformed, secret-mismatched, or revoked.
 
 ## Look surface
@@ -140,7 +141,7 @@ needed.
 - Subclasses (`$weather_block`, `$dispenser_block`, `$horoscope_block`)
   ship in their own catalogs.
 - The plug process itself — that's an external CF Worker (or any
-  WS/REST client) deployed independently.
+  authenticated net client) deployed independently.
 - Ephemeral property tier (in-memory, skip-storage). Deferred until a
   workload genuinely needs it.
 

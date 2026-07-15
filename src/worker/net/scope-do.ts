@@ -948,6 +948,7 @@ export class NetScopeDO {
           scope: string;
           catalog_epoch: string;
           cells: Array<Pick<Cell, "kind" | "object" | "name" | "value">>;
+          relations?: RelationRow[];
         };
         // M9 seed-time epoch guard: a scope seeded at epoch A must refuse
         // a seed stamped with epoch B — without this, ensureSequencer
@@ -966,10 +967,56 @@ export class NetScopeDO {
           });
         }
         const seq = this.ensureSequencer(body.scope, body.catalog_epoch);
-        this.discardSeqOnThrow(() => seq.seed(body.cells));
+        this.discardSeqOnThrow(() => seq.seed(body.cells, body.relations ?? []));
         // H2b: seeded session cells arm the reap wake too.
         if (body.cells.some((cell) => cell.kind === "session")) this.armSessionReapAlarm(seq);
         return json({ ok: true, scope: seq.scope, head: seq.head() });
+      }
+      if (request.method === "POST" && url.pathname === "/net/repair-relations") {
+        const body = (await request.json()) as { relations?: RelationRow[] };
+        const rows = Array.isArray(body.relations) ? body.relations : [];
+        const seq = this.ensureSequencer();
+        for (const row of rows) {
+          if (row.relation !== "contents" || !row.owner || !row.member) {
+            throw netError("E_INVARG", "relation repair accepts only concrete contents rows", { row });
+          }
+          // A contents row belongs here only when this authority owns the
+          // containing object.  This admits cross-scope members (pinboard in
+          // deck) while refusing an operator request aimed at the wrong room.
+          if (!seq.store.has(cellKey("object_lineage", row.owner))) {
+            throw netError("E_INVARG", "relation repair owner is not authoritative at this scope", {
+              scope: seq.scope,
+              owner: row.owner,
+              member: row.member
+            });
+          }
+        }
+        const repaired = this.discardSeqOnThrow(() => this.store.transaction(() => {
+          const deltas: RelationDelta[] = rows.map((row) => ({ op: "add", row }));
+          const result = seq.applyForeignRelationDeltas(deltas, {
+            from_scope: "operator:install-contents",
+            seq: seq.head().seq + 1
+          });
+          if (result.status === "applied") {
+            const changed = new Set(result.changed);
+            const applied = deltas.filter((delta) => changed.has(relationKey(delta.row.relation, delta.row.owner, delta.row.member)));
+            const subscribers = sqlRows<{ destination: string; delivery_seq: number }>(
+              this.state.storage.sql.exec("SELECT destination, delivery_seq FROM net_scope_subscribers WHERE role = 'fanout'")
+            );
+            for (const { destination, delivery_seq } of subscribers) {
+              this.persistFanoutRow(destination, delivery_seq, {
+                scope: seq.scope,
+                seq: result.head.seq,
+                cells: [],
+                observations: [],
+                relations: applied
+              });
+            }
+          }
+          return result;
+        }));
+        this.armOutboxRetryAlarm();
+        return json({ ok: true, scope: seq.scope, ...repaired });
       }
       if (request.method === "POST" && url.pathname === "/net/activate") {
         // The NC1 activation state machine as a DEDICATED operator op

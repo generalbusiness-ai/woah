@@ -39,6 +39,17 @@ describe("net install end-to-end (fake-DO lane)", () => {
 
     // The install plan for the fresh namespace.
     const plan = await planNetInstall({ graft: (fresh) => importIdentity(fresh, identity) });
+    // Initial relation derivation runs over the COMPLETE image before cell
+    // partitioning. Self-hosted spaces own their live cell, but the containing
+    // room must own their membership row.
+    expect(plan.relations.get("room:the_chatroom")).toEqual(expect.arrayContaining([
+      { relation: "contents", owner: "the_chatroom", member: "the_dubspace" },
+      { relation: "contents", owner: "the_chatroom", member: "the_weather" }
+    ]));
+    expect(plan.relations.get("room:the_deck")).toEqual(expect.arrayContaining([
+      { relation: "contents", owner: "the_deck", member: "the_pinboard" },
+      { relation: "contents", owner: "the_deck", member: "the_horoscope" }
+    ]));
 
     // Seed one scope DO per partition — what scripts/net-install.ts does
     // through the /net-install doorway, driven directly here.
@@ -66,7 +77,12 @@ describe("net install end-to-end (fake-DO lane)", () => {
     for (const [scope, cells] of plan.partitions) {
       const st = netState(`scope-${scope}`);
       const instance = new NetScopeDO(st.state, scopeEnv);
-      const seeded = await call(instance, "/net/seed", { scope, catalog_epoch: plan.epoch, cells });
+      const seeded = await call(instance, "/net/seed", {
+        scope,
+        catalog_epoch: plan.epoch,
+        cells,
+        relations: plan.relations.get(scope) ?? []
+      });
       expect(seeded.ok, `seed ${scope}`).toBe(true);
       states.push(st);
       scopeDOs.set(scope, instance);
@@ -77,7 +93,12 @@ describe("net install end-to-end (fake-DO lane)", () => {
     for (const [scope, cells] of plan.partitions) {
       const head = (await (await call(scopeDOs.get(scope) as NetScopeDO, "/net/head")).json()) as { catalog_epoch: string };
       expect(head.catalog_epoch, scope).toBe(plan.epoch);
-      const reseed = await call(scopeDOs.get(scope) as NetScopeDO, "/net/seed", { scope, catalog_epoch: plan.epoch, cells });
+      const reseed = await call(scopeDOs.get(scope) as NetScopeDO, "/net/seed", {
+        scope,
+        catalog_epoch: plan.epoch,
+        cells,
+        relations: plan.relations.get(scope) ?? []
+      });
       expect(reseed.ok, `re-seed ${scope}`).toBe(true);
     }
 
@@ -132,6 +153,45 @@ describe("net install end-to-end (fake-DO lane)", () => {
     expect(await commandPlan("look lamp")).toMatchObject({ ok: true, verb: "look_at", args: ["the_lamp"] });
     expect(await commandPlan("take mug")).toMatchObject({ ok: true, verb: "take", persistence: "durable" });
 
+    const turn = async (target: string, verb: string, args: unknown[] = []) => {
+      const response = await gateway.fetch(new Request("https://do/net-api/turn", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer apikey:${KEY_ID}:${KEY_SECRET}` },
+        body: JSON.stringify({
+          target,
+          verb,
+          args,
+          session: body.session,
+          idempotency_key: `topology-${target}-${verb}-${Math.random()}`
+        })
+      }));
+      const decoded = await response.json() as { attempt?: number; result?: Record<string, unknown>; error?: unknown };
+      expect(response.status, JSON.stringify(decoded)).toBe(200);
+      return decoded;
+    };
+
+    // Cold topology must be complete, never a plausible partial success.
+    const livingWays = await turn(carried, "ways", [""]);
+    expect((livingWays.result?.exits as string[]).sort()).toEqual([
+      "exit_living_room_dubspace",
+      "exit_living_room_outline",
+      "exit_living_room_south",
+      "exit_living_room_southeast"
+    ]);
+    const deckMove = await turn("the_chatroom", "southeast");
+    expect(deckMove.attempt).toBe(1);
+    expect(deckMove.result).toMatchObject({ room: "the_deck", look_deferred: true });
+    const deckWays = await turn(carried, "ways", [""]);
+    expect((deckWays.result?.exits as string[]).sort()).toEqual([
+      "exit_deck_east",
+      "exit_deck_pinboard",
+      "exit_deck_south",
+      "exit_deck_west"
+    ]);
+    const east = await turn("the_deck", "east");
+    expect(east.attempt).toBe(1);
+    expect(east.result).toMatchObject({ room: "the_hot_tub", look_deferred: true });
+
     states.forEach((st) => st.close());
   });
 
@@ -166,7 +226,7 @@ describe("net install end-to-end (fake-DO lane)", () => {
       const request = new Request("https://do/net/seed", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ scope, catalog_epoch: plan.epoch, cells })
+        body: JSON.stringify({ scope, catalog_epoch: plan.epoch, cells, relations: plan.relations.get(scope) ?? [] })
       });
       const seeded = await instance.fetch(await signInternalRequest(scopeEnv, request));
       expect(seeded.ok, `seed ${scope}`).toBe(true);

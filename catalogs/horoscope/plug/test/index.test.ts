@@ -46,12 +46,12 @@ const authReply = (): Reply => ({
 
 const callReply = (result: unknown): Reply => ({
   status: 200,
-  body: { result, observations: [] }
+  body: { reply: { status: "accepted" }, result, observations: [] }
 });
 
 const propertyReply = (value: unknown): Reply => ({
   status: 200,
-  body: { value }
+  body: { cell: { value: { value } } }
 });
 
 describe("runHoroscopeTick", () => {
@@ -79,12 +79,15 @@ describe("runHoroscopeTick", () => {
     expect(aiCall0.messages[1]).toEqual({ role: "user", content: "scorpio" });
     expect(aiCall0.max_tokens).toBe(200);
 
-    expect(calls[0].url).toBe("https://woo.example/api/auth");
-    expect(calls[1].url).toBe("https://woo.example/api/objects/the_horoscope_block/properties/system_prompt");
-    expect(calls[2].url).toBe("https://woo.example/api/objects/the_horoscope_block/calls/next_pending");
+    expect(calls[0].url).toBe("https://woo.example/net-api/session");
+    expect(calls[1].url).toContain("/net-api/cell?");
+    expect(calls[1].url).toContain("property_cell%3Athe_horoscope_block%3Asystem_prompt");
+    expect(calls[2].url).toBe("https://woo.example/net-api/turn");
+    expect(calls[2].body).toMatchObject({ target: "the_horoscope_block", verb: "next_pending", session: "sess_h" });
 
     const deliver1 = calls[3];
-    expect(deliver1.url).toBe("https://woo.example/api/objects/the_horoscope_block/calls/deliver");
+    expect(deliver1.url).toBe("https://woo.example/net-api/turn");
+    expect(deliver1.body).toMatchObject({ target: "the_horoscope_block", verb: "deliver" });
     expect((deliver1.body as { args: unknown[] }).args).toEqual([
       "ord_1",
       "Horoscope: Scorpio",
@@ -100,7 +103,8 @@ describe("runHoroscopeTick", () => {
       expect.stringContaining("leo")
     ]);
     const heartbeat = calls[7];
-    expect(heartbeat.url).toBe("https://woo.example/api/objects/the_horoscope_block/calls/set_properties");
+    expect(heartbeat.url).toBe("https://woo.example/net-api/turn");
+    expect(heartbeat.body).toMatchObject({ target: "the_horoscope_block", verb: "set_properties" });
     expect((heartbeat.body as { args: [Record<string, unknown>] }).args[0]).toMatchObject({ last_pushed_at: expect.any(Number), last_error: null });
   });
 
@@ -141,7 +145,7 @@ describe("runHoroscopeTick", () => {
     // The plug now calls :deliver with a non-empty placeholder string instead
     // of leaving the order at the queue head where it would block every
     // following request.
-    const deliver = calls.find((c) => c.url.includes("/calls/deliver"));
+    const deliver = calls.find((c) => (c.body as { verb?: string } | undefined)?.verb === "deliver");
     expect(deliver).toBeDefined();
     const args = (deliver!.body as { args: unknown[] }).args;
     expect(args[0]).toBe("ord_1");
@@ -154,7 +158,7 @@ describe("runHoroscopeTick", () => {
     // Fallback delivery is degraded service — last_error must surface that
     // so :look_self / status reports don't show a healthy block while the
     // user is silently receiving placeholder text.
-    const heartbeat = calls.find((c) => c.url.includes("/calls/set_properties"));
+    const heartbeat = calls.find((c) => (c.body as { verb?: string } | undefined)?.verb === "set_properties");
     const recordedError = (heartbeat?.body as { args: [Record<string, unknown>] }).args[0].last_error;
     expect(typeof recordedError).toBe("string");
     expect(recordedError as string).toContain("ai fallback");
@@ -199,9 +203,9 @@ describe("runHoroscopeTick", () => {
 
     expect(first.delivered).toBe(0);
     expect(second.delivered).toBe(0);
-    expect(calls.filter((c) => c.url.includes("/properties/system_prompt"))).toHaveLength(1);
-    expect(calls.filter((c) => c.url.includes("/calls/set_properties"))).toHaveLength(1);
-    expect(calls.filter((c) => c.url.includes("/calls/next_pending"))).toHaveLength(2);
+    expect(calls.filter((c) => c.url.includes("property_cell%3Athe_horoscope_block%3Asystem_prompt"))).toHaveLength(1);
+    expect(calls.filter((c) => (c.body as { verb?: string } | undefined)?.verb === "set_properties")).toHaveLength(1);
+    expect(calls.filter((c) => (c.body as { verb?: string } | undefined)?.verb === "next_pending")).toHaveLength(2);
   });
 
   it("works when system_prompt is unset (uses the default)", async () => {
@@ -234,13 +238,13 @@ describe("runHoroscopeTick session cache", () => {
     tokenClass: "apikey"
   });
 
-  it("warm cache hits skip /api/auth and reuse the cached session header", async () => {
+  it("warm cache hits skip /net-api/session and reuse the cached session", async () => {
     const ai = { run: vi.fn().mockResolvedValue({ response: "ok" }) };
     const env = makeEnv(ai);
     const sessionCache = createSessionCache();
     sessionCache.set(farFuture());
 
-    // No authReply: a warm hit must not POST to /api/auth.
+    // No authReply: a warm hit must not POST to /net-api/session.
     const { fetchImpl, calls } = makeFetch([
       () => propertyReply("p"),
       () => callReply({ order_id: "ord_1", requester: "g", request: "x", ts: 1 }),
@@ -251,15 +255,15 @@ describe("runHoroscopeTick session cache", () => {
 
     const result = await runHoroscopeTick(env, { fetchImpl, sessionCache, now: () => T_NOW });
     // authMode === "warm" + delivered:1 (which requires an authenticated
-    // call into :next_pending and :deliver) + the absence of /api/auth in
+    // call into :next_pending and :deliver) + the absence of a session mint in
     // the request log is the three-way proof that the cached session was
     // actually used. WooClient throws E_NOSESSION before issuing any
     // request when no session is set, so completing the tick proves the
     // adopted session reached the wire.
     expect(result.authMode).toBe("warm");
     expect(result.delivered).toBe(1);
-    expect(calls.find((c) => c.url === "https://woo.example/api/auth")).toBeUndefined();
-    expect(calls[0].url).toBe("https://woo.example/api/objects/the_horoscope_block/properties/system_prompt");
+    expect(calls.find((c) => c.url === "https://woo.example/net-api/session")).toBeUndefined();
+    expect(calls[0].url).toContain("/net-api/cell?");
   });
 
   it("re-authenticates when the cached session is within REAUTH_MARGIN_MS of expiry", async () => {
@@ -283,7 +287,7 @@ describe("runHoroscopeTick session cache", () => {
 
     const result = await runHoroscopeTick(env, { fetchImpl, sessionCache, now: () => T_NOW });
     expect(result.authMode).toBe("cold");
-    expect(calls[0].url).toBe("https://woo.example/api/auth");
+    expect(calls[0].url).toBe("https://woo.example/net-api/session");
   });
 
   it("re-authenticates when the cached session has unknown expiresAt", async () => {
@@ -301,7 +305,7 @@ describe("runHoroscopeTick session cache", () => {
 
     const result = await runHoroscopeTick(env, { fetchImpl, sessionCache, now: () => T_NOW });
     expect(result.authMode).toBe("cold");
-    expect(calls[0].url).toBe("https://woo.example/api/auth");
+    expect(calls[0].url).toBe("https://woo.example/net-api/session");
   });
 
   it("populates the cache after a cold auth so the next tick can warm-hit", async () => {
@@ -325,7 +329,7 @@ describe("runHoroscopeTick session cache", () => {
     expect(cached).toMatchObject({ session: "sess_minted", expiresAt: futureExpiry, tokenClass: "apikey" });
   });
 
-  it("invalidates the cache when /api/objects/.../properties returns E_NOSESSION", async () => {
+  it("invalidates the cache when a net property-cell read returns E_NOSESSION", async () => {
     const ai = { run: vi.fn().mockResolvedValue({ response: "ok" }) };
     const env = makeEnv(ai);
     const sessionCache = createSessionCache();

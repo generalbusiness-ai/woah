@@ -30,7 +30,7 @@ import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../s
 import { installVerb } from "../../src/core/authoring";
 import { createWorld } from "../../src/core/bootstrap";
 import { cellsFromSerialized } from "../../src/net/bridge";
-import { netActivationCell } from "../../src/net/install";
+import { netActivationCell, partitionInstallRelations } from "../../src/net/install";
 import { CATALOG_SCOPE, partitionCells } from "../../src/net/topology";
 import type { CommitReply } from "../../src/net/scope";
 
@@ -128,7 +128,9 @@ async function buildHarness() {
   const other = world.auth("guest:net-client-api-2").actor;
   world.ensureApiKey("$wiz", other, "capi-key-2", "capi-secret-2", "net-client-api-test-2");
 
-  const partitions = partitionCells(cellsFromSerialized(world.exportWorld()));
+  const installCells = cellsFromSerialized(world.exportWorld());
+  const partitions = partitionCells(installCells);
+  const relations = partitionInstallRelations(installCells);
   // Activation barrier: the fixture installs a pre-verified world, so it
   // self-activates with the catalog partition.
   partitions.set(CATALOG_SCOPE, [...(partitions.get(CATALOG_SCOPE) ?? []), netActivationCell(EPOCH)]);
@@ -166,7 +168,12 @@ async function buildHarness() {
   for (const scope of [roomScope, clusterScope, CATALOG_SCOPE, `cluster:${other}`]) {
     const st = netState(`scope-${scope}`);
     const instance = new NetScopeDO(st.state, scopeEnv);
-    const seeded = await signedTo(instance, "/net/seed", { scope, catalog_epoch: EPOCH, cells: partitions.get(scope) ?? [] });
+    const seeded = await signedTo(instance, "/net/seed", {
+      scope,
+      catalog_epoch: EPOCH,
+      cells: partitions.get(scope) ?? [],
+      relations: relations.get(scope) ?? []
+    });
     expect(seeded.ok).toBe(true);
     states.push(st);
     scopeDOs.set(scope, instance);
@@ -174,12 +181,17 @@ async function buildHarness() {
 
   // The client gateway shard: EMPTY view — every warm-up is pull-on-miss.
   const gatewayState = netState("gateway-net-api");
-  const gatewayEnv: NetGatewayEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve };
+  const metricPoints: Array<{ indexes?: string[]; blobs?: string[]; doubles?: number[] }> = [];
+  const gatewayEnv: NetGatewayEnv = {
+    WOO_INTERNAL_SECRET: SECRET,
+    NET_RESOLVE: resolve,
+    METRICS: { writeDataPoint: (point) => metricPoints.push(point) }
+  };
   const gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
   gateways.set("net-api", gateway);
   states.push(gatewayState);
 
-  return { gateway, actor, other, roomScope, resolvedDestinations, close: () => states.forEach((st) => st.close()) };
+  return { gateway, actor, other, roomScope, resolvedDestinations, metricPoints, close: () => states.forEach((st) => st.close()) };
 }
 
 describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
@@ -281,6 +293,7 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     // ALLOW: the room's contents relation (a room the caller is in).
     const roster = await clientFetch(h.gateway, "GET", `/net-api/relation?session=${sid}&relation=contents&owner=capi_room`, { token });
     expect(roster.status, JSON.stringify(roster.body)).toBe(200);
+    expect((roster.body.members as Array<{ member?: string }>).map((row) => row.member)).toContain("capi_box");
 
     // DENY: a relation whose owner is a scope the caller is not present in.
     const foreign = await clientFetch(h.gateway, "GET", `/net-api/relation?session=${sid}&relation=contents&owner=room:elsewhere`, { token });
@@ -291,6 +304,32 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     expect(noSession.status).toBe(401);
     expect(noSession.body.error).toMatchObject({ detail: { reason: "session_required" } });
 
+    h.close();
+  });
+
+  it("accepts bounded browser diagnostics on the net namespace without trusting payload identity", async () => {
+    const h = await buildHarness();
+    const token = `apikey:${KEY_ID}:${KEY_SECRET}`;
+    const minted = await clientFetch(h.gateway, "POST", "/net-api/session", { token, body: { ttl_ms: 600_000 } });
+    const sid = minted.body.session as string;
+    const reported = await clientFetch(h.gateway, "POST", "/net-api/browser-metrics", {
+      token,
+      body: {
+        session: sid,
+        metrics: [{ kind: "browser_activity", source: "main", phase: "net_room_projection", ms: 12, status: "ok", actor: "spoofed" }]
+      }
+    });
+    expect(reported.status, JSON.stringify(reported.body)).toBe(200);
+    expect(reported.body).toMatchObject({ ok: true, accepted: 1, sampled: 0 });
+    const point = h.metricPoints.find((item) => item.blobs?.[0] === "browser_activity");
+    expect(point?.blobs?.[5]).toBe("net_room_projection");
+    expect(point?.blobs?.[13]).toBe(h.actor);
+
+    const missingSession = await clientFetch(h.gateway, "POST", "/net-api/browser-metrics", {
+      token,
+      body: { metrics: [] }
+    });
+    expect(missingSession.status).toBe(401);
     h.close();
   });
 
