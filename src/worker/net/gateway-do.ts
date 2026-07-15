@@ -4021,7 +4021,11 @@ export class NetGatewayDO {
       const part = this.netAuthorityPrefetchPathPart(rawPart, call);
       if (part === null) return [];
       if (typeof cursor === "string") {
-        await this.warmNetPrefetchObject(cursor, planningScope);
+        // Path traversal needs the explicit property page even when lineage
+        // is already warm. An aged gateway may otherwise walk an inherited
+        // default (for example `$room.exits = {}`) and mistake it for the
+        // authoritative instance value forever.
+        await this.refreshNetPrefetchPathCursor(cursor, part, planningScope);
         cursor = this.netObjectProperty(cursor, part);
       } else if (cursor && typeof cursor === "object" && !Array.isArray(cursor)) {
         cursor = (cursor as Record<string, unknown>)[part];
@@ -4029,7 +4033,56 @@ export class NetGatewayDO {
         return [];
       }
     }
-    return typeof cursor === "string" && cursor.length > 0 ? [cursor] : [];
+    return this.netAuthorityPrefetchRefs(cursor);
+  }
+
+  /** Collect object refs named by a terminal prefetch value. Maps represent
+   * keyed structural indexes such as a room's exits, so only VALUES are
+   * refs; keys are labels. The fixed cap prevents catalog metadata from
+   * amplifying one turn into unbounded owner probes. */
+  private netAuthorityPrefetchRefs(value: unknown, limit = 128): string[] {
+    const refs = new Set<string>();
+    const visit = (candidate: unknown): void => {
+      if (refs.size >= limit) return;
+      if (typeof candidate === "string") {
+        if (candidate.length > 0) refs.add(candidate);
+        return;
+      }
+      if (Array.isArray(candidate)) {
+        for (const item of candidate) visit(item);
+        return;
+      }
+      if (candidate && typeof candidate === "object") {
+        for (const item of Object.values(candidate as Record<string, unknown>)) visit(item);
+      }
+    };
+    visit(value);
+    return [...refs];
+  }
+
+  /** Refresh a path cursor at the committing/planning owner even if its
+   * lineage is cached. This is deliberately best-effort like the rest of
+   * prefetch; a miss is named and normal E_MISSING_STATE repair takes over. */
+  private async refreshNetPrefetchPathCursor(object: string, property: string, planningScope: string): Promise<void> {
+    if (!object || object === "$nowhere") return;
+    // The planning owner is the common anchored-helper case. The derived
+    // object owner covers roots such as `actor` whose property lives at its
+    // cluster even while the turn itself commits in a room.
+    const scopes = [...new Set([planningScope, this.ownerScopeFor(object)])];
+    let pulled = false;
+    for (const scope of scopes) {
+      try {
+        await this.pullTargeted(scope, `scope:${scope}`, [object]);
+        pulled = true;
+        // Stop once the authority supplied the instance page sought by this
+        // path. This avoids probing a speculative classifier fallback after
+        // the common planning-owner pull has already answered completely.
+        if (this.ensureView().has(cellKey("property_cell", object, property))) return;
+      } catch (err) {
+        this.metric({ kind: "net_authority_prefetch_failed", scope, status: "error", error: String(err) });
+      }
+    }
+    if (!pulled) await this.warmNetPrefetchObject(object, planningScope);
   }
 
   private netAuthorityPrefetchRoot(root: string, call: ShadowTurnCall): string | null {

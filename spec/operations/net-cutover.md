@@ -175,11 +175,17 @@ Activation requires ALL of, in order:
 `GET /net-install/scope/<name>/head`,
 `POST /net-install/scope/<name>/activate`, `POST /net-install/freeze`,
 `POST /net-install/scope/<name>/repair-relations`, and
+`POST /net-install/scope/catalog/repair-definitions`, and
 `GET /net-install/identity-export` are the entire surface. The repair operation
 is an idempotent, add-only recovery for initial `contents` rows omitted by an
 older installer; it accepts only rows whose owner object is authoritative at
-the addressed scope and refans newly added rows at an advanced owner head. Trust
-model and enforced properties (pinned at the route level by
+the addressed scope and refans newly added rows at an advanced owner head.
+The definition repair is the corresponding aged-world migration for bootstrap
+verb pages: it accepts only existing `$`-object `verb_bytecode` cells at the
+catalog scope, commits replacements at an advanced head, and refans the delta;
+its CLI supplies values only from a fresh install plan and an explicit operator
+allow-list. Runtime deployment alone never implies this durable-world update.
+The trust model and enforced properties (pinned at the route level by
 `tests/worker/net-install-doorway.test.ts`):
 
 - **Signature-gated, not dataset-gated**: the inbound internal HMAC

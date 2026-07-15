@@ -26,6 +26,7 @@
     "cf:migrations:check": "node scripts/sync-wrangler-do-migrations.mjs --check",
     "plugs:bootstrap:v2": "node scripts/bootstrap-demo-plugs.mjs",
     "repair:net-relations": "tsx scripts/net-repair-relations.ts",
+    "repair:net-definitions": "tsx scripts/net-repair-definitions.ts",
     "storage:profile": "tsx scripts/profile-storage-writes.ts",
     "task:time": "node scripts/task-time.mjs",
     "test:guards": "npm run catalog:index && npm run catalog:check && npm run guard:object-names && npm run guard:layering && npm run guard:catalog-layering && npm run guard:catalog-runtime-boundary && npm run guard:tool-workspace-ui && npm run guard:catalog-migrations && npm run guard:client-imports && npm run guard:command-planning && npm run guard:vocabulary && npm run guard:turn-effects && npm run guard:serialized-access && npm run guard:smoke-wrangler",

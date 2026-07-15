@@ -80,11 +80,12 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
     }
     const gatewayState = netState("gateway-net-api");
     states.push(gatewayState);
-    gateway = new NetGatewayDO(gatewayState.state, {
+    const gatewayEnv = {
       WOO_INTERNAL_SECRET: SECRET,
       NET_RESOLVE: resolve,
       NET_GATEWAY_SELF: "gateway:net-api"
-    } as NetGatewayEnv);
+    } as NetGatewayEnv;
+    gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
 
     const settleAll = async () => {
       for (const st of states) await st.settle();
@@ -200,6 +201,27 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
     const takeObs = waitedTake.result?.structuredContent?.result?.observations ?? [];
     const taken = takeObs.find((obs: any) => obs?.type === "taken" && obs.actor === alice);
     expect(taken, JSON.stringify(takeObs).slice(0, 400)).toBeTruthy();
+
+    // Aged gateway regression: lineage and the inherited `$room.exits = {}`
+    // default are warm, but the room's explicit exits page is absent. The
+    // ways metadata must force-refresh the path cursor and materialize every
+    // referenced exit before the verb runs; otherwise this falsely reports
+    // "No obvious exits" until unrelated movement happens to warm one edge.
+    gatewayState.state.storage.sql.exec(
+      "DELETE FROM net_gateway_cell WHERE key = 'property_cell:the_chatroom:exits'"
+    );
+    gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
+    const agedWays = await call(aliceSession, "woo_call", { object: alice, verb: "ways", args: [""] });
+    expect(agedWays.result?.isError, JSON.stringify(agedWays).slice(0, 800)).not.toBe(true);
+    const waysResult = agedWays.result?.structuredContent?.result as { exits?: string[]; text?: string };
+    expect(waysResult.exits).toEqual(expect.arrayContaining([
+      "exit_living_room_southeast",
+      "exit_living_room_south",
+      "exit_living_room_outline",
+      "exit_living_room_dubspace"
+    ]));
+    expect(waysResult.exits).toHaveLength(4);
+    expect(waysResult.text).toContain("Obvious exits:");
 
     // Streamable HTTP DELETE releases the underlying net session. The
     // session id is the bearer, so it refuses after the close protocol's

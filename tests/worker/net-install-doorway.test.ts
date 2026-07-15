@@ -215,6 +215,84 @@ describe("the /net-install doorway (route level)", () => {
     h.close();
   });
 
+  it("repairs only existing bootstrap verb pages at catalog authority and replays idempotently", async () => {
+    const h = buildHarness();
+    const original = {
+      kind: "verb_bytecode",
+      object: "$player",
+      name: "ways",
+      value: { name: "ways", bytecode: [{ op: "RETURN", value: "old" }], arg_spec: { args: ["room?"] } }
+    };
+    const seeded = await h.signedRequest("/net-install/scope/catalog/seed", seedBody("catalog", EPOCH, [original]));
+    expect(seeded.status, await seeded.clone().text()).toBe(200);
+    // Model an already-subscribed gateway without letting the fake resolve
+    // drain it; the operator event must enter the same durable fanout lane as
+    // ordinary catalog authority changes.
+    h.scopeStates.get("catalog")!.storage.sql.exec(
+      "INSERT INTO net_scope_subscribers (destination, role) VALUES ('gateway:aged', 'fanout')"
+    );
+    const replacement = {
+      ...original,
+      value: {
+        name: "ways",
+        bytecode: [{ op: "RETURN", value: "complete" }],
+        arg_spec: { args: ["room?"], authority: { prefetch: ["scope", { path: ["scope", "exits"] }] } }
+      }
+    };
+    const body = {
+      method: "POST" as const,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ cells: [replacement] })
+    };
+
+    expect((await h.request("/net-install/scope/catalog/repair-definitions", body)).status).toBe(401);
+    const repaired = await h.signedRequest("/net-install/scope/catalog/repair-definitions", body);
+    expect(repaired.status, await repaired.clone().text()).toBe(200);
+    expect(await repaired.json()).toMatchObject({
+      ok: true,
+      scope: "catalog",
+      status: "applied",
+      head: { seq: 1 },
+      changed: ["verb_bytecode:$player:ways"]
+    });
+    const replayed = await h.signedRequest("/net-install/scope/catalog/repair-definitions", body);
+    expect(await replayed.json()).toMatchObject({ ok: true, status: "empty", head: { seq: 1 }, changed: [] });
+    const durable = h.scopeStates.get("catalog")!.storage.sql;
+    const stored = durable.exec("SELECT body FROM net_scope_cell WHERE key = 'verb_bytecode:$player:ways'").toArray();
+    expect(JSON.parse(String(stored[0]!.body))).toMatchObject({ value: replacement.value, stamp: { scope_head: expect.stringMatching(/^1:/) } });
+    expect(durable.exec("SELECT seq FROM net_scope_tail ORDER BY seq").toArray()).toEqual([{ seq: 1 }]);
+    const fanout = durable.exec("SELECT body FROM net_scope_outbox WHERE route = '/fanout'").toArray();
+    expect(JSON.parse(String(fanout[0]!.body))).toMatchObject({
+      scope: "catalog",
+      seq: 1,
+      delivery_seq: 1,
+      cells: [{ key: "verb_bytecode:$player:ways", value: replacement.value }]
+    });
+
+    const wrongScope = await h.signedRequest("/net-install/scope/room%3Ax/seed", seedBody("room:x", EPOCH, [original]));
+    expect(wrongScope.status).toBe(200);
+    expect((await h.signedRequest("/net-install/scope/room%3Ax/repair-definitions", body)).status).toBe(400);
+    const missing = { ...replacement, name: "missing" };
+    expect((await h.signedRequest("/net-install/scope/catalog/repair-definitions", {
+      ...body,
+      body: JSON.stringify({ cells: [missing] })
+    })).status).toBe(400);
+    const property = { kind: "property_cell", object: "$player", name: "ways", value: { value: "no" } };
+    expect((await h.signedRequest("/net-install/scope/catalog/repair-definitions", {
+      ...body,
+      body: JSON.stringify({ cells: [property] })
+    })).status).toBe(400);
+    expect((await h.signedRequest("/net-install/scope/catalog/repair-definitions", {
+      ...body,
+      body: JSON.stringify({ cells: [null] })
+    })).status).toBe(400);
+    expect((await h.signedRequest("/net-install/scope/catalog/repair-definitions", {
+      ...body,
+      body: JSON.stringify({ cells: [{ ...replacement, value: { ...replacement.value, name: "not_ways" } }] })
+    })).status).toBe(400);
+    h.close();
+  });
+
   it("malformed seed bodies surface as errors, not crashes or silent success", async () => {
     const h = buildHarness();
     const malformed = await h.signedRequest("/net-install/scope/room%3Abad/seed", {
