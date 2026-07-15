@@ -8,6 +8,7 @@
 // These tests drive real outliner adds through the in-process fake-DO net
 // harness and assert bounded convergence (not merely under-budget).
 import { describe, expect, it } from "vitest";
+import { installVerb } from "../../src/core/authoring";
 import { FakeDurableObjectState } from "./fake-do";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
@@ -560,6 +561,79 @@ describe("outliner add over the net path converges", () => {
     );
     const kidIds = kids.rows.map((r) => r.child);
     expect(kidIds, "captured child re-homed under the restored node").toContain(c1);
+  });
+
+  // R1 — same-turn mutations must see each other's ordering effects. The
+  // planning world's ordering answers are fetched from the PRE-TURN
+  // authority; without overlaying this turn's own __ordered_edge writes,
+  // a second same-parent mutation in one turn reads a stale count/rank
+  // (losing restored children to a spurious E_INDEX, or committing
+  // duplicate ranks from one cached append answer).
+  it("R1: net undo of a TWO-child remove re-homes BOTH children under the restored node", async () => {
+    const { world, theOutline, session, actor, epoch } = await outlinerWorld();
+    const roomScope = `room:${theOutline}`;
+    const ctx = { theOutline, roomScope, epoch, session, actor };
+    const p = ((await world.directCall("r1u-seed-p", actor, theOutline, "add_item", ["parent", null, null], { sessionId: session.id })) as { result: string }).result;
+    const c1 = ((await world.directCall("r1u-seed-c1", actor, theOutline, "add_item", ["child one", p, null], { sessionId: session.id })) as { result: string }).result;
+    const c2 = ((await world.directCall("r1u-seed-c2", actor, theOutline, "add_item", ["child two", p, null], { sessionId: session.id })) as { result: string }).result;
+    const rem = await world.directCall("r1u-remove", actor, theOutline, "remove_item", [p], { sessionId: session.id });
+    expect((rem as { op: string }).op).toBe("result");
+
+    const { gateway, gatewayEnv, scopeDOs } = await mountNet(world, epoch);
+    const undo = await verbTurn(gateway, gatewayEnv, ctx, "r1u-undo", "undo", []);
+    expect(undo.reply.status, `attempts=${undo.attempt} trace=${JSON.stringify(undo.trace)}`).toBe("accepted");
+    const restored = undo.result as string;
+    expect(typeof restored).toBe("string");
+
+    // Authority proof: BOTH captured children re-homed under the restored
+    // node, in captured order, with DISTINCT ranks. Before the overlay the
+    // second move_item read the restored node's PRE-TURN (empty) ordering,
+    // raised E_INDEX at index 1, was swallowed, and stranded c2 at root.
+    const roomDO = scopeDOs.get(roomScope)!;
+    const kids = await call<{ rows: Array<{ child: string; rank: string }> }>(
+      roomDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { parent: restored }
+    );
+    const kidIds = kids.rows.map((r) => r.child);
+    expect(kidIds, `restored children: ${JSON.stringify(kids.rows)}`).toEqual([c1, c2]);
+    const kidRanks = kids.rows.map((r) => r.rank);
+    expect(new Set(kidRanks).size, `duplicate ranks: ${JSON.stringify(kids.rows)}`).toBe(kidRanks.length);
+  });
+
+  it("R1: two adds in ONE turn commit DISTINCT ranks in call order (no cached-answer reuse)", async () => {
+    const { world, theOutline, session, actor, epoch } = await outlinerWorld();
+    const roomScope = `room:${theOutline}`;
+    const ctx = { theOutline, roomScope, epoch, session, actor };
+    // A composite verb performing two same-parent appends in one turn. Both
+    // reads hit the same append query; without the same-turn overlay the
+    // second reuses the first's cached answer and computes the SAME rank.
+    const installed = installVerb(
+      world,
+      theOutline,
+      "add_twice",
+      // _no_store: skip the per-actor undo bookkeeping — its room_roster
+      // read needs the reads_room_presence pre-seed that this ad-hoc test
+      // verb does not declare, and undo is not what this test is about.
+      `verb :add_twice(a, b) rxd {\n  let i1 = this:add_item(a, null, null, true);\n  let i2 = this:add_item(b, null, null, true);\n  return [i1, i2];\n}`,
+      null
+    );
+    expect(installed.ok, JSON.stringify(installed)).toBe(true);
+    // One pre-existing sibling so the appends land after a real rank.
+    const first = ((await world.directCall("r1d-seed", actor, theOutline, "add_item", ["first", null, null], { sessionId: session.id })) as { result: string }).result;
+
+    const { gateway, gatewayEnv, scopeDOs } = await mountNet(world, epoch);
+    const turn = await verbTurn(gateway, gatewayEnv, ctx, "r1d-twice", "add_twice", ["alpha", "beta"]);
+    expect(turn.reply.status, `attempts=${turn.attempt} trace=${JSON.stringify(turn.trace)}`).toBe("accepted");
+    expect((turn as Record<string, unknown>).error, `turn error: ${JSON.stringify((turn as Record<string, unknown>).error)}`).toBeUndefined();
+    const [ia, ib] = turn.result as [string, string];
+
+    const roomDO = scopeDOs.get(roomScope)!;
+    const roots = await call<{ rows: Array<{ child: string; rank: string }> }>(
+      roomDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { parent: null }
+    );
+    const ranks = roots.rows.map((r) => r.rank);
+    expect(new Set(ranks).size, `duplicate ranks: ${JSON.stringify(roots.rows)}`).toBe(ranks.length);
+    // Call order preserved: first, then alpha, then beta.
+    expect(roots.rows.map((r) => r.child), `root order: ${JSON.stringify(roots.rows)}`).toEqual([first, ia, ib]);
   });
 
   it("fails FAST and NAMED (E_NONCONVERGENT_READ, not E_BUDGET) when a read cannot converge", async () => {

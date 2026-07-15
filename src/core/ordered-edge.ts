@@ -30,6 +30,19 @@ export type OrderedChildRow = {
   rank: string;
 };
 
+/** Parse a RAW `__ordered_edge` property value (as stored on an object, not
+ * the net property-cell wrapper — see ordered-edges.ts `readOrderedEdge` for
+ * that) into a well-formed edge, or null when the value is absent/cleared/
+ * malformed (an empty rank is the "detached" convention). */
+export function orderedEdgeFromPropertyValue(raw: unknown): OrderedEdgeValue | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const parent = (raw as { parent?: unknown }).parent;
+  const rank = (raw as { rank?: unknown }).rank;
+  if (typeof rank !== "string" || rank.length === 0) return null;
+  if (parent !== null && typeof parent !== "string") return null;
+  return { parent: (parent as string | null) ?? null, rank };
+}
+
 /** A bounded ordering query for ONE mutation slot (P2.4). All coordinates
  * are 0-based insertion slots (`index` ∈ [0, count]); `index: null` means
  * append. `exclude` drops one child from the neighbour computation (a
