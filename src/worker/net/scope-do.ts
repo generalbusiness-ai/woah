@@ -84,7 +84,7 @@ import { Outbox, type FanoutBody, type FanoutRow } from "../../net/outbox";
 import { ScopeSequencer, type CommitSubmit, type ScheduledTurn, type ScopeHead } from "../../net/scope";
 import { authorizeSessionSubmit, validateSessionCell } from "../../net/sessions";
 import { observationsForRelationOwners, relationKey, roomRosterRows, type RelationDelta, type RelationRow } from "../../net/relations";
-import { orderedChildrenRows, orderedChildrenVersion, orderedNeighborsFromRows } from "../../net/ordered-edges";
+import { orderedChildrenVersion, orderedNeighborsFromRows } from "../../net/ordered-edges";
 import type { ScopeMeta, ScopeStore, TailEntry } from "../../net/scope-store";
 import type { CommitReply } from "../../net/scope";
 import { netCellKeyFor } from "../../net/transcript";
@@ -821,12 +821,13 @@ export class NetScopeDO {
         // parent the same way — an ordering with no edges attests the
         // empty-rows version, the ordering analogue of "absent". Read-only:
         // no state changes, no head movement.
-        const body = (await request.json()) as { keys: string[]; ordering_parents?: (string | null)[] };
+        const body = (await request.json()) as { keys: string[]; ordering_parents?: Array<{ container?: unknown; parent?: unknown }> };
         const seq = this.ensureSequencer();
         const orderingParents = Array.isArray(body.ordering_parents) ? body.ordering_parents : [];
-        for (const parent of orderingParents) {
-          if (parent !== null && !(typeof parent === "string" && parent)) {
-            throw netError("E_INVARG", "attest ordering_parents entries must be nonempty string refs or null", { parent });
+        for (const ordering of orderingParents) {
+          if (typeof ordering?.container !== "string" || !ordering.container
+            || (ordering.parent !== null && !(typeof ordering.parent === "string" && ordering.parent))) {
+            throw netError("E_INVARG", "attest ordering_parents entries require container plus parent (nonempty ref or null)", { ordering });
           }
         }
         return json({
@@ -835,7 +836,11 @@ export class NetScopeDO {
           owner_head: seq.head(),
           cells: body.keys.map((key) => ({ key, version: seq.store.get(key)?.version ?? "absent" })),
           ...(orderingParents.length > 0
-            ? { orderings: orderingParents.map((parent) => ({ parent, version: orderedChildrenVersion(seq.store.orderedEdgeChildren(parent)) })) }
+            ? { orderings: orderingParents.map((ordering) => ({
+                container: ordering.container as string,
+                parent: ordering.parent as string | null,
+                version: orderedChildrenVersion(seq.orderedChildren(ordering.container as string, ordering.parent as string | null))
+              })) }
             : {})
         });
       }
@@ -854,10 +859,14 @@ export class NetScopeDO {
       }
       if (request.method === "POST" && url.pathname === "/net/ordered-children") {
         // Owner-computed ordered children of a parent (the ordering analogue
-        // of /net/room-roster). Scans this scope's authored edge cells for the
-        // parent and returns one bounded, rank-sorted list — never the O(N)
-        // edge cells themselves. `parent: null` lists the ordering roots.
-        const body = (await request.json()) as { parent?: unknown };
+        // of /net/room-roster). Reads this scope's write-time-sorted authored
+        // and foreign-relation indexes for the parent and returns one bounded
+        // list — never the edge cells themselves or a whole-scope scan.
+        // `parent: null` lists the ordering roots.
+        const body = (await request.json()) as { container?: unknown; parent?: unknown };
+        if (typeof body.container !== "string" || !body.container) {
+          throw netError("E_INVARG", "ordered-children requires a nonempty container ref", { container: body.container ?? null });
+        }
         const parent = body.parent === null ? null
           : typeof body.parent === "string" && body.parent ? body.parent
           : undefined;
@@ -868,11 +877,11 @@ export class NetScopeDO {
         // Bounded scan (P2.4): the per-parent edge index, O(children-of-parent),
         // not a whole-scope cell scan. This full list is for DISPLAY
         // (list_items); a MUTATION uses /net/ordered-neighbors below instead.
-        const rows = seq.store.orderedEdgeChildren(parent);
+        const rows = seq.orderedChildren(body.container, parent);
         // `version` is the content address of the ordering (P1.1): the reader
         // attests it, and this scope re-derives + validates it at submit so a
         // concurrent same-parent insert makes the plan stale.
-        return json({ scope: seq.scope, head: seq.head(), parent, rows, version: orderedChildrenVersion(rows) });
+        return json({ scope: seq.scope, head: seq.head(), container: body.container, parent, rows, version: orderedChildrenVersion(rows) });
       }
       if (request.method === "POST" && url.pathname === "/net/ordered-neighbors") {
         // BOUNDED neighbour read for a mutation (P2.4): answers ONE
@@ -885,7 +894,10 @@ export class NetScopeDO {
         // the local runtime's own scan agree exactly. `version` is the same
         // per-parent ordering content address the full projection carries;
         // the plan attests it identically (P1.1).
-        const body = (await request.json()) as { parent?: unknown; index?: unknown; exclude?: unknown; child?: unknown };
+        const body = (await request.json()) as { container?: unknown; parent?: unknown; index?: unknown; exclude?: unknown; child?: unknown };
+        if (typeof body.container !== "string" || !body.container) {
+          throw netError("E_INVARG", "ordered-neighbors requires a nonempty container ref", { container: body.container ?? null });
+        }
         const parent = body.parent === null ? null
           : typeof body.parent === "string" && body.parent ? body.parent
           : undefined;
@@ -907,13 +919,13 @@ export class NetScopeDO {
           throw netError("E_INVARG", "ordered-neighbors child must be a nonempty string ref (or null/absent)", { child: body.child });
         }
         const seq = this.ensureSequencer();
-        const rows = seq.store.orderedEdgeChildren(parent);
+        const rows = seq.orderedChildren(body.container, parent);
         const answer = orderedNeighborsFromRows(rows, {
           index: body.index === undefined || body.index === null ? null : (body.index as number),
           exclude: (body.exclude as string | undefined) ?? null,
           child: (body.child as string | undefined) ?? null
         });
-        return json({ scope: seq.scope, head: seq.head(), parent, ...answer, version: orderedChildrenVersion(rows) });
+        return json({ scope: seq.scope, head: seq.head(), container: body.container, parent, ...answer, version: orderedChildrenVersion(rows) });
       }
       if (request.method === "POST" && url.pathname === "/net/closure") {
         const body = (await request.json()) as {

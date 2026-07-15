@@ -63,7 +63,14 @@ import { applyFanout, type FanoutBody } from "../../net/outbox";
 import { observationsForRelationOwners, relationKey, type RelationDelta, type RelationRow, type RoomRosterRow } from "../../net/relations";
 import { mintSessionSubmit, sessionCellKey, validateSessionCell } from "../../net/sessions";
 import { sessionIdWithShardHint, ticketIdWithShardHint } from "../../net/session-id";
-import { orderedNeighborsQueryKey, type OrderedNeighborsQuery } from "../../net/ordered-edges";
+import {
+  ORDERED_EDGE_RELATION,
+  orderedNeighborsQueryKey,
+  orderedProjectionKey,
+  type OrderedNeighborsQuery,
+  type OrderedNeighborsRequest,
+  type OrderedProjectionKey
+} from "../../net/ordered-edges";
 import { planTurn, type PlanTurnInput, type PlanTurnResult } from "../../net/plan";
 import type { ScopeClassifier } from "../../net/route";
 import { CATALOG_SCOPE, classifierFromLineage, isEpochImmutableDefinition, type AnchorLineage } from "../../net/topology";
@@ -147,13 +154,40 @@ type ScopeRow = { seen_seq: number };
 /** One owner-computed ordered-children projection the gateway fetched for a
  * turn: the bounded rows plus the authority `version` (content address) the
  * plan attests so a concurrent same-parent insert makes the submit stale (P1.1). */
-type OrderedChildrenProjection = { scope: string; rows: readonly Record<string, unknown>[]; version: string };
+type OrderedChildrenProjection = { container: string; scope: string; parent: string | null; rows: readonly Record<string, unknown>[]; version: string };
 
 /** One owner-answered bounded neighbour query (P2.4): the O(1)
  * {count, index, before, after, child_index} answer plus the same authority
  * ordering `version` a full projection carries, so the attestation is
  * identical — only the payload shrinks from O(width) to constant. */
-type OrderedNeighborsProjection = { query: OrderedNeighborsQuery; scope: string; value: Record<string, unknown>; version: string };
+type OrderedNeighborsProjection = { container: string; query: OrderedNeighborsQuery; scope: string; value: Record<string, unknown>; version: string };
+type OrderingConflict = { scope: string; container: string; parent: string | null };
+
+function validOrderedProjectionKey(value: unknown): value is OrderedProjectionKey {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as { container?: unknown; parent?: unknown };
+  return typeof candidate.container === "string" && candidate.container.length > 0
+    && (candidate.parent === null || typeof candidate.parent === "string");
+}
+
+function validOrderedNeighborsRequest(value: unknown): value is OrderedNeighborsRequest {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as { container?: unknown; query?: unknown };
+  if (typeof candidate.container !== "string" || !candidate.container || !candidate.query || typeof candidate.query !== "object" || Array.isArray(candidate.query)) return false;
+  const query = candidate.query as Partial<OrderedNeighborsQuery>;
+  return (query.parent === null || typeof query.parent === "string")
+    && (query.index === null || typeof query.index === "number")
+    && (query.exclude === null || typeof query.exclude === "string")
+    && (query.child === null || typeof query.child === "string");
+}
+
+function validOrderingConflict(value: unknown): value is OrderingConflict {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as { scope?: unknown; container?: unknown; parent?: unknown };
+  return typeof candidate.scope === "string" && candidate.scope.length > 0
+    && typeof candidate.container === "string" && candidate.container.length > 0
+    && (candidate.parent === null || typeof candidate.parent === "string");
+}
 
 /** CO10: the ratified repair budget for one /net/turn. */
 export const REPAIR_BUDGET_MS = 12_000;
@@ -1125,14 +1159,18 @@ export class NetGatewayDO {
     // contention moves the authority version every round, so a contended key
     // never satisfies the "same version twice" condition and keeps repairing.
     const refreshedTo = new Map<string, string>();
+    // Same detector for compact ordering reads. The key is
+    // (authority scope, container, parent), because two container roots in one
+    // cross-scope turn both use null.
+    const refreshedOrderingTo = new Map<string, string>();
     // Owner-computed ordered-children projections fetched this turn, keyed by
-    // parent (null = the ordering roots). Seeded with the call target's
+    // (container,parent); null names only that container's roots. Seeded with the call target's
     // ordering, then GROWN by the ordered-children repair path as the verb
     // reads further parents (a nested add_item's parent_arg, a reparent's old
     // + new parent). The map only grows and is threaded into every re-plan, so
     // a fetched projection is STICKY: the same parent never re-misses, and a
     // turn reading several parents converges one repair round per new parent.
-    const orderedChildrenByParent = new Map<string | null, OrderedChildrenProjection>();
+    const orderedChildrenByParent = new Map<string, OrderedChildrenProjection>();
     // Bounded neighbour answers fetched this turn (P2.4), keyed by the
     // canonical query key. Same lifecycle as the map above: grown by the
     // ordered-neighbours repair path, threaded into every re-plan (sticky),
@@ -1158,7 +1196,7 @@ export class NetGatewayDO {
       // reads. Idempotent: skipped once the target is already in the map.
       await this.seedTargetOrderedChildren(request, view, classifier, structure, orderedChildrenByParent, trace);
       const planningOrderedChildren = orderedChildrenByParent.size > 0
-        ? [...orderedChildrenByParent.entries()].map(([parent, projection]) => ({ parent, scope: projection.scope, rows: projection.rows, version: projection.version }))
+        ? [...orderedChildrenByParent.values()].map((projection) => ({ container: projection.container, parent: projection.parent, scope: projection.scope, rows: projection.rows, version: projection.version }))
         : undefined;
       const planningOrderedNeighbors = orderedNeighborsByKey.size > 0
         ? [...orderedNeighborsByKey.values()]
@@ -1191,10 +1229,10 @@ export class NetGatewayDO {
             // targeted cell refresh). Handled BEFORE the cell path — its
             // detail carries `missing_ordered_children`, not `missing`.
             const missingOrdered = Array.isArray(err.detail.missing_ordered_children)
-              ? (err.detail.missing_ordered_children as (string | null)[])
+              ? (err.detail.missing_ordered_children as OrderedProjectionKey[]).filter(validOrderedProjectionKey)
               : [];
             if (missingOrdered.length > 0) {
-              trace.push({ attempt, code: "E_MISSING_STATE", missing: missingOrdered.map((p) => p ?? "<root>"), elapsed_ms: elapsed() });
+              trace.push({ attempt, code: "E_MISSING_STATE", missing: missingOrdered.map((o) => `${o.container}:${o.parent ?? "<root>"}`), elapsed_ms: elapsed() });
               // Anti-loop (R2-corrected): only "EVERY named parent is already
               // resident yet the re-plan still missed it" is the terminal
               // planner/catalog-bug shape (installing again cannot cure a
@@ -1204,12 +1242,13 @@ export class NetGatewayDO {
               // loop (recovery_error in the trace; retried next round;
               // E_BUDGET explains a persistent outage).
               let allAlreadyResident = true;
-              for (const parent of missingOrdered) {
-                if (orderedChildrenByParent.has(parent)) continue;
+              for (const ordering of missingOrdered) {
+                const key = orderedProjectionKey(ordering.container, ordering.parent);
+                if (orderedChildrenByParent.has(key)) continue;
                 allAlreadyResident = false;
-                const projection = await this.tryRecovery(trace, () => this.fetchOrderedChildren(request, classifier, structure, parent));
+                const projection = await this.tryRecovery(trace, () => this.fetchOrderedChildren(request, classifier, structure, ordering));
                 if (projection === undefined) continue; // fetch failed; recovery_error recorded
-                orderedChildrenByParent.set(parent, projection);
+                orderedChildrenByParent.set(key, projection);
               }
               if (allAlreadyResident) {
                 throw nonconvergentRead(
@@ -1225,19 +1264,19 @@ export class NetGatewayDO {
             // before the cell path for the same reason as above — its
             // detail carries `missing_ordered_neighbors`, not `missing`.
             const missingNeighbors = Array.isArray(err.detail.missing_ordered_neighbors)
-              ? (err.detail.missing_ordered_neighbors as OrderedNeighborsQuery[])
+              ? (err.detail.missing_ordered_neighbors as OrderedNeighborsRequest[]).filter(validOrderedNeighborsRequest)
               : [];
             if (missingNeighbors.length > 0) {
-              trace.push({ attempt, code: "E_MISSING_STATE", missing: missingNeighbors.map((q) => `neighbors:${q.parent ?? "<root>"}`), elapsed_ms: elapsed() });
+              trace.push({ attempt, code: "E_MISSING_STATE", missing: missingNeighbors.map((r) => `neighbors:${r.container}:${r.query.parent ?? "<root>"}`), elapsed_ms: elapsed() });
               // Anti-loop (R2-corrected, mirror of the children branch): only
               // an already-resident re-miss is terminal non-convergence; a
               // failed fetch stays on the bounded attempt loop.
               let allAlreadyResident = true;
-              for (const query of missingNeighbors) {
-                const key = orderedNeighborsQueryKey(query);
+              for (const requestForNeighbors of missingNeighbors) {
+                const key = orderedNeighborsQueryKey(requestForNeighbors.container, requestForNeighbors.query);
                 if (orderedNeighborsByKey.has(key)) continue;
                 allAlreadyResident = false;
-                const projection = await this.tryRecovery(trace, () => this.fetchOrderedNeighbors(request, classifier, structure, query));
+                const projection = await this.tryRecovery(trace, () => this.fetchOrderedNeighbors(request, classifier, structure, requestForNeighbors));
                 if (projection === undefined) continue; // fetch failed; recovery_error recorded
                 orderedNeighborsByKey.set(key, projection);
               }
@@ -1448,17 +1487,42 @@ export class NetGatewayDO {
           // named parents' cached projections so the next attempt re-fetches
           // the CURRENT ordering (and recomputes a distinct rank), then re-plan.
           const orderingConflicts = Array.isArray((reply.detail as { ordering_conflicts?: unknown } | undefined)?.ordering_conflicts)
-            ? ((reply.detail as { ordering_conflicts: (string | null)[] }).ordering_conflicts)
+            ? ((reply.detail as { ordering_conflicts: OrderingConflict[] }).ordering_conflicts).filter(validOrderingConflict)
             : [];
           if (orderingConflicts.length > 0) {
-            for (const parent of orderingConflicts) {
-              orderedChildrenByParent.delete(parent);
+            const stuck: Array<{ scope: string; container: string; parent: string | null; authority_version: string }> = [];
+            for (const ordering of orderingConflicts) {
+              const orderingKey = `${ordering.scope}\0${orderedProjectionKey(ordering.container, ordering.parent)}`;
+              const children = [...orderedChildrenByParent.values()].find((cached) =>
+                cached.scope === ordering.scope && cached.container === ordering.container && cached.parent === ordering.parent
+              );
+              const neighbor = [...orderedNeighborsByKey.values()].find((cached) =>
+                cached.scope === ordering.scope && cached.container === ordering.container && cached.query.parent === ordering.parent
+              );
+              const authorityVersion = children?.version ?? neighbor?.version;
+              if (authorityVersion !== undefined) {
+                if (refreshedOrderingTo.get(orderingKey) === authorityVersion) {
+                  stuck.push({ ...ordering, authority_version: authorityVersion });
+                } else {
+                  refreshedOrderingTo.set(orderingKey, authorityVersion);
+                }
+              }
+              for (const [key, cached] of orderedChildrenByParent) {
+                if (cached.scope === ordering.scope && cached.container === ordering.container && cached.parent === ordering.parent) orderedChildrenByParent.delete(key);
+              }
               // Neighbour answers derive from the same per-parent ordering:
               // drop every cached query under a conflicted parent too, or a
               // re-plan would re-attest the stale version forever.
               for (const [key, cached] of orderedNeighborsByKey) {
-                if (cached.query.parent === parent) orderedNeighborsByKey.delete(key);
+                if (cached.scope === ordering.scope && cached.container === ordering.container && cached.query.parent === ordering.parent) orderedNeighborsByKey.delete(key);
               }
+            }
+            if (stuck.length > 0) {
+              throw nonconvergentRead(
+                "an ordering read cannot converge: re-installed a stable authority version but the plan re-recorded a mismatching version",
+                trace,
+                { stuck, scope: targetScope }
+              );
             }
             break; // re-plan next round with the refreshed ordering
           }
@@ -3555,56 +3619,61 @@ export class NetGatewayDO {
     return { room, rows: response.rows as RoomRosterRow[] };
   }
 
-  /** Fetch ONE bounded ordered-children projection from the parent's scope
+  /** Fetch ONE bounded ordered-children projection from the container's scope
    * authority — the ordering analogue of `roomRosterProjection`. Computed
-   * owner-side (scan the scope's authored edge cells for the parent, sort by
-   * rank) so a listing/mutation reads sibling order as ONE value instead of
-   * dragging every sibling's edge cell into the turn's read closure. The
-   * root ordering (`parent === null`) is owned by the scope the call operates
-   * in, so it resolves against the call target's scope. */
+   * owner-side from write-time-sorted authored/relation indexes so a
+   * listing/mutation reads sibling order as ONE value instead of dragging
+   * every sibling's edge cell into the turn's read closure. The
+   * root ordering (`parent === null`) resolves from the explicit container;
+   * inferring it from the call target is wrong during cross-container hooks. */
   private async fetchOrderedChildren(
     request: TurnRequest,
     classifier: ScopeClassifier,
     structure: TurnStructure,
-    parent: string | null
+    ordering: OrderedProjectionKey
   ): Promise<OrderedChildrenProjection> {
-    const scope = classifier.scopeOf(typeof parent === "string" ? parent : request.call.target);
+    const { container, parent } = ordering;
+    // The container owner holds the COMPLETE projection. A non-root parent can
+    // retain an immutable anchor in another scope after a cross-container move;
+    // routing by the parent would query that incomplete source index.
+    const scope = classifier.scopeOf(container);
     const response = await structure.rpc(() => this.host.rpc(
       this.destinationFor(request, scope),
       "/ordered-children",
-      { parent }
-    ), { phase: "ordered_children" }) as { scope?: unknown; parent?: unknown; rows?: unknown; version?: unknown };
+      { container, parent }
+    ), { phase: "ordered_children" }) as { scope?: unknown; container?: unknown; parent?: unknown; rows?: unknown; version?: unknown };
     // Full reply validation (Adv-a): a wrong-scope echo or a versionless
     // reply must be a FAILED fetch (retried on the bounded attempt loop),
     // never an answer the plan attests.
-    if (response.scope !== scope || response.parent !== parent || !Array.isArray(response.rows)
+    if (response.scope !== scope || response.container !== container || response.parent !== parent || !Array.isArray(response.rows)
       || typeof response.version !== "string" || response.version.length === 0) {
       throw new Error(`ordered-children authority returned a malformed projection for ${parent ?? "<root>"} at ${scope}`);
     }
     // The authority's content version of the ordering (P1.1): the plan attests
     // it so a concurrent same-parent insert makes the submit stale. The owning
     // scope rides along (R3) so cross-scope commits owner-attest the read.
-    return { scope, rows: response.rows as Record<string, unknown>[], version: response.version };
+    return { container, scope, parent, rows: response.rows as Record<string, unknown>[], version: response.version };
   }
 
-  /** Answer ONE bounded neighbour query at the parent's scope authority
+  /** Answer ONE bounded neighbour query at the container's scope authority
    * (P2.4). The response is constant-size — two ranks, a count, and the
    * ordering's content version — so repairing a mutation's slot read under a
    * 10k-child parent costs the same bytes as under an empty one. Scope
-   * resolution matches `fetchOrderedChildren`: a null parent (the ordering
-   * roots) is owned by the call target's scope. */
+   * resolution matches `fetchOrderedChildren`: a null parent names the
+   * explicitly supplied container's roots. */
   private async fetchOrderedNeighbors(
     request: TurnRequest,
     classifier: ScopeClassifier,
     structure: TurnStructure,
-    query: OrderedNeighborsQuery
+    requested: OrderedNeighborsRequest
   ): Promise<OrderedNeighborsProjection> {
-    const scope = classifier.scopeOf(typeof query.parent === "string" ? query.parent : request.call.target);
+    const { container, query } = requested;
+    const scope = classifier.scopeOf(container);
     const response = await structure.rpc(() => this.host.rpc(
       this.destinationFor(request, scope),
       "/ordered-neighbors",
-      { parent: query.parent, index: query.index, exclude: query.exclude, child: query.child }
-    ), { phase: "ordered_neighbors" }) as { scope?: unknown; parent?: unknown; count?: unknown; index?: unknown; before?: unknown; after?: unknown; child_index?: unknown; version?: unknown };
+      { container, parent: query.parent, index: query.index, exclude: query.exclude, child: query.child }
+    ), { phase: "ordered_neighbors" }) as { scope?: unknown; container?: unknown; parent?: unknown; count?: unknown; index?: unknown; before?: unknown; after?: unknown; child_index?: unknown; version?: unknown };
     // Full reply validation (Adv-a): scope echo, a nonempty ordering version,
     // integral count/slot within range, rank fields consistent with the slot
     // (a slot with a live neighbour must carry its rank), and a sane
@@ -3614,6 +3683,7 @@ export class NetGatewayDO {
     const index = response.index;
     const malformed =
       response.scope !== scope
+      || response.container !== container
       || response.parent !== query.parent
       || typeof response.version !== "string" || response.version.length === 0
       || typeof count !== "number" || !Number.isInteger(count) || count < 0
@@ -3626,6 +3696,7 @@ export class NetGatewayDO {
     }
     return {
       query,
+      container,
       scope,
       value: {
         count,
@@ -3648,17 +3719,18 @@ export class NetGatewayDO {
     view: CellStore,
     classifier: ScopeClassifier,
     structure: TurnStructure,
-    accumulated: Map<string | null, OrderedChildrenProjection>,
+    accumulated: Map<string, OrderedChildrenProjection>,
     trace: AttemptTraceEntry[]
   ): Promise<void> {
     const target = request.call.target;
-    if (accumulated.has(target) || !this.callReadsOrderedChildren(view, request.call)) return;
+    const key = orderedProjectionKey(target, target);
+    if (accumulated.has(key) || !this.callReadsOrderedChildren(view, request.call)) return;
     // The pre-seed is a warm-path OPTIMIZATION, so its fetch failing must not
     // kill the turn (R2): skip it (recovery_error traced) and let the verb's
     // read miss into the repair path, which retries on the bounded attempt
     // loop and explains a persistent outage as E_BUDGET.
-    const projection = await this.tryRecovery(trace, () => this.fetchOrderedChildren(request, classifier, structure, target));
-    if (projection !== undefined) accumulated.set(target, projection);
+    const projection = await this.tryRecovery(trace, () => this.fetchOrderedChildren(request, classifier, structure, { container: target, parent: target }));
+    if (projection !== undefined) accumulated.set(key, projection);
   }
 
   private async expediteForeignRelations(
@@ -3668,11 +3740,15 @@ export class NetGatewayDO {
     structure?: TurnStructure
   ): Promise<void> {
     for (const entry of reply.relations_foreign ?? []) {
-      // Only presence changes require the accepted-reply freshness fence.
-      // Other foreign projections retain the asynchronous durable path. If
-      // this owner batch also contains contents deltas, send the whole batch:
+      // Presence and ordered-container changes require the accepted-reply
+      // freshness fence: after a move returns, peers must see the actor in the
+      // room and the moved item in its destination ordering. Other foreign
+      // projections retain the asynchronous durable path. If this owner batch
+      // also contains contents deltas, send the whole batch:
       // receiver idempotency is per (from_scope, seq), not per relation row.
-      if (!entry.deltas.some((delta) => delta.row.relation === "session_presence")) continue;
+      if (!entry.deltas.some((delta) =>
+        delta.row.relation === "session_presence" || delta.row.relation === ORDERED_EDGE_RELATION
+      )) continue;
       const destination = destinations[entry.scope]?.destination ?? `scope:${entry.scope}`;
       const deliver = () => this.host.rpc(destination, "/relate", {
         from_scope: reply.scope,
@@ -3912,12 +3988,12 @@ export class NetGatewayDO {
     // ordering version per parent, so a foreign insert between plan and
     // attest makes the committing scope reject the stale read. An owner
     // with only ordering reads still gets its attest RPC.
-    const orderingsByOwner = new Map<string, Set<string | null>>();
+    const orderingsByOwner = new Map<string, Map<string, { container: string; parent: string | null }>>();
     for (const read of planned.transcript.orderingReads ?? []) {
       if (read.scope === targetScope) continue; // validated locally
-      const parents = orderingsByOwner.get(read.scope) ?? new Set<string | null>();
-      parents.add(read.parent);
-      orderingsByOwner.set(read.scope, parents);
+      const orderings = orderingsByOwner.get(read.scope) ?? new Map<string, { container: string; parent: string | null }>();
+      orderings.set(orderedProjectionKey(read.container, read.parent), { container: read.container, parent: read.parent });
+      orderingsByOwner.set(read.scope, orderings);
       if (!byOwner.has(read.scope)) byOwner.set(read.scope, new Set<string>());
     }
     if (byOwner.size === 0) return undefined;
@@ -3940,13 +4016,13 @@ export class NetGatewayDO {
       const reply = await this.host.rpc(this.destinationFor(request, owner), "/attest", {
         keys: [...keys].sort(),
         ...(orderingParents && orderingParents.size > 0
-          ? { ordering_parents: [...orderingParents].sort((a, b) => String(a).localeCompare(String(b))) }
+          ? { ordering_parents: [...orderingParents.values()].sort((a, b) => orderedProjectionKey(a.container, a.parent).localeCompare(orderedProjectionKey(b.container, b.parent))) }
           : {})
       }) as {
         catalog_epoch?: string;
         owner_head: ScopeHead;
         cells: Array<{ key: string; version: string }>;
-        orderings?: Array<{ parent: string | null; version: string }>;
+        orderings?: Array<{ container: string; parent: string | null; version: string }>;
       };
       // Catalog compatibility cells are deliberately not cached, but their
       // authority must still agree with the turn epoch before its versions
@@ -3969,15 +4045,19 @@ export class NetGatewayDO {
         if (!received.has(key)) throw new Error(`attestation from ${owner} omitted ${key}`);
       }
       if (orderingParents && orderingParents.size > 0) {
-        const attestedParents = new Map<string | null, string>();
+        const attestedParents = new Map<string, string>();
         for (const ordering of reply.orderings ?? []) {
-          if ((ordering?.parent !== null && typeof ordering?.parent !== "string") || typeof ordering?.version !== "string" || ordering.version.length === 0) {
+          if (typeof ordering?.container !== "string" || !ordering.container
+            || (ordering.parent !== null && typeof ordering.parent !== "string")
+            || typeof ordering.version !== "string" || ordering.version.length === 0) {
             throw new Error(`attestation from ${owner} returned a malformed ordering version`);
           }
-          attestedParents.set(ordering.parent, ordering.version);
+          attestedParents.set(orderedProjectionKey(ordering.container, ordering.parent), ordering.version);
         }
-        for (const parent of orderingParents) {
-          if (!attestedParents.has(parent)) throw new Error(`attestation from ${owner} omitted ordering ${parent ?? "<root>"}`);
+        for (const ordering of orderingParents.values()) {
+          if (!attestedParents.has(orderedProjectionKey(ordering.container, ordering.parent))) {
+            throw new Error(`attestation from ${owner} omitted ordering ${ordering.container}:${ordering.parent ?? "<root>"}`);
+          }
         }
       }
       return reply;
@@ -3988,7 +4068,7 @@ export class NetGatewayDO {
       : await Promise.all(actions.map((action) => action()));
     const attestations: NonNullable<CommitSubmit["attestations"]> = {};
     owners.forEach(([owner], index) => {
-      const reply = replies[index] as { owner_head: ScopeHead; cells: Array<{ key: string; version: string }>; orderings?: Array<{ parent: string | null; version: string }> };
+      const reply = replies[index] as { owner_head: ScopeHead; cells: Array<{ key: string; version: string }>; orderings?: Array<{ container: string; parent: string | null; version: string }> };
       attestations[owner] = {
         owner_head: reply.owner_head,
         cells: reply.cells,
@@ -4115,7 +4195,7 @@ export class NetGatewayDO {
     objectCounter?: number,
     planningRoomRoster?: { room: string; rows: readonly RoomRosterRow[] },
     seedObjects?: ReadonlySet<string>,
-    planningOrderedChildren?: readonly { parent: string | null; scope: string; rows: readonly Record<string, unknown>[]; version: string }[],
+    planningOrderedChildren?: readonly OrderedChildrenProjection[],
     planningOrderedNeighbors?: readonly OrderedNeighborsProjection[]
   ): Promise<PlanTurnResult> {
     return planTurn({

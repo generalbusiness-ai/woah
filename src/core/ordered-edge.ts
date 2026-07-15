@@ -30,6 +30,15 @@ export type OrderedChildRow = {
   rank: string;
 };
 
+/** Identity of one owner-computed ordering. `parent: null` is meaningful only
+ * inside its container, so every transient projection/miss/cache key carries
+ * both coordinates. Non-root parents retain the container too: keeping one shape
+ * end-to-end prevents a root-only special case from being dropped by a wrapper. */
+export type OrderedProjectionKey = {
+  container: string;
+  parent: string | null;
+};
+
 /** Parse a RAW `__ordered_edge` property value (as stored on an object, not
  * the net property-cell wrapper — see ordered-edges.ts `readOrderedEdge` for
  * that) into a well-formed edge, or null when the value is absent/cleared/
@@ -56,6 +65,12 @@ export type OrderedNeighborsQuery = {
   child: string | null;
 };
 
+/** One bounded neighbour request plus the identity of the ordering it reads. */
+export type OrderedNeighborsRequest = {
+  container: string;
+  query: OrderedNeighborsQuery;
+};
+
 /** The O(1) answer to an `OrderedNeighborsQuery`: the sibling count (after
  * exclusion), the effective (clamped) insertion slot, the two ranks bounding
  * that slot, and the queried child's current slot (or null when absent).
@@ -72,8 +87,16 @@ export type OrderedNeighborsValue = {
 /** Canonical identity of a neighbours query — the key the sparse planning
  * world and the gateway's per-turn projection cache agree on, so a repaired
  * query is found again by the re-planned read that missed it. */
-export function orderedNeighborsQueryKey(query: OrderedNeighborsQuery): string {
+export function orderedProjectionKey(container: string, parent: string | null): string {
+  return `${container}\0${parent ?? "\0root"}`;
+}
+
+/** Canonical identity includes the ordering's container. Two root queries in one
+ * turn may belong to different containers (for example a cross-outliner move)
+ * and must never alias merely because both have `parent: null`. */
+export function orderedNeighborsQueryKey(container: string, query: OrderedNeighborsQuery): string {
   return [
+    container,
     query.parent ?? "\0root",
     query.index === null ? "append" : String(query.index),
     query.exclude ?? "",

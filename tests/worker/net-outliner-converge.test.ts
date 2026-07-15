@@ -348,7 +348,7 @@ describe("outliner add over the net path converges", () => {
     // cheap one.
     const roomDO = scopeDOs.get(roomScope)!;
     const roots = await call<{ rows: Array<{ child: string; rank: string }> }>(
-      roomDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { parent: null }
+      roomDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { container: theOutline, parent: null }
     );
     expect(roots.rows[3]?.child, `root order: ${JSON.stringify(roots.rows.slice(0, 6))}`).toBe(moved);
   });
@@ -468,7 +468,7 @@ describe("outliner add over the net path converges", () => {
     // Authority proof: the root's children carry DISTINCT ranks (no collision).
     const roomDO = scopeDOs.get(roomScope)!;
     const roots = await call<{ rows: Array<{ child: string; rank: string }> }>(
-      roomDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { parent: null }
+      roomDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { container: theOutline, parent: null }
     );
     const ranks = roots.rows.map((r) => r.rank);
     expect(roots.rows.length, "both inserts committed").toBeGreaterThanOrEqual(2);
@@ -514,7 +514,7 @@ describe("outliner add over the net path converges", () => {
     // to the recycled p.
     const roomDO = scopeDOs.get(`room:${theOutline}`)!;
     const roots = await call<{ rows: Array<{ child: string; rank: string }> }>(
-      roomDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { parent: null }
+      roomDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { container: theOutline, parent: null }
     );
     const rootChildren = new Map(roots.rows.map((r) => [r.child, r.rank]));
     expect(rootChildren.has(c1), "c1 re-homed to root in the authority").toBe(true);
@@ -522,9 +522,94 @@ describe("outliner add over the net path converges", () => {
     expect((rootChildren.get(c1) ?? "").length).toBeGreaterThan(0);
     // And they are no longer edged to the recycled parent p.
     const underP = await call<{ rows: Array<{ child: string }> }>(
-      roomDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { parent: p }
+      roomDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { container: theOutline, parent: p }
     );
     expect(underP.rows.map((r) => r.child), "no orphaned edge to the recycled parent").not.toContain(c1);
+  });
+
+  it("cross-outliner moveto repairs BOTH scoped root orderings and completes both hooks", async () => {
+    const { world, theOutline, session, actor, epoch } = await outlinerWorld();
+    const sourceScope = `room:${theOutline}`;
+    const destination = "the_outline_2";
+    const destinationScope = `room:${destination}`;
+    world.createObject({ id: destination, name: "Outline 2", parent: "$outliner", owner: actor, location: "the_chatroom" });
+
+    // Give the destination a non-empty root ordering. If null-root caches alias
+    // by parent alone, enterfunc will append against the SOURCE roots instead.
+    expect((await world.directCall("cross-enter-dest", actor, actor, "moveto", [destination], { sessionId: session.id })).op).toBe("result");
+    const destinationRoots: string[] = [];
+    for (const text of ["dest one", "dest two", "dest three"]) {
+      const added = await world.directCall(`cross-dest-${text}`, actor, destination, "add_item", [text, null, null], { sessionId: session.id });
+      destinationRoots.push((added as { result: string }).result);
+    }
+    expect((await world.directCall("cross-enter-source", actor, actor, "moveto", [theOutline], { sessionId: session.id })).op).toBe("result");
+
+    // Move a nested item with one child. Source exitfunc must re-home the child
+    // under the former parent; destination enterfunc must append the item as a
+    // destination root. Both hooks read orderings during one moveto pipeline.
+    const formerParent = ((await world.directCall("cross-parent", actor, theOutline, "add_item", ["parent", null, null], { sessionId: session.id })) as { result: string }).result;
+    const moving = ((await world.directCall("cross-moving", actor, theOutline, "add_item", ["moving", formerParent, null], { sessionId: session.id })) as { result: string }).result;
+    const child = ((await world.directCall("cross-child", actor, theOutline, "add_item", ["child", moving, null], { sessionId: session.id })) as { result: string }).result;
+    const destinationSession = world.auth("guest:cross-destination-writer");
+    expect((await world.directCall(
+      "cross-place-destination-writer",
+      destinationSession.actor,
+      destinationSession.actor,
+      "moveto",
+      [destination],
+      { sessionId: destinationSession.id }
+    )).op).toBe("result");
+
+    const { gateway, gatewayEnv, scopeDOs } = await mountNet(world, epoch);
+    const moved = await call<TurnBody>(gateway, gatewayEnv, "/turn", {
+      call: {
+        kind: "woo.turn_call.shadow.v1", id: "cross-outliner-move", route: "direct", scope: sourceScope,
+        session: session.id, actor, target: moving, verb: "moveto", args: [destination]
+      },
+      planningScope: sourceScope, catalog_epoch: epoch, idempotency_key: "cross-outliner-move"
+    });
+    expect(moved.reply.status, `attempts=${moved.attempt} trace=${JSON.stringify(moved.trace)}`).toBe("accepted");
+    expect(moved.attempt, "hook ordering misses must escape and trigger repair").toBeGreaterThan(1);
+    expect(moved.observations?.some((o) => o.type === "outline_item_removed" && o.item === moving)).toBe(true);
+    expect(moved.observations?.some((o) => o.type === "outline_item_added" && o.item === moving && o.outliner === destination)).toBe(true);
+
+    const sourceDO = scopeDOs.get(sourceScope)!;
+    const formerParentRows = await call<{ rows: Array<{ child: string }> }>(
+      sourceDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { container: theOutline, parent: formerParent }
+    );
+    expect(formerParentRows.rows.map((row) => row.child)).toContain(child);
+    expect(formerParentRows.rows.map((row) => row.child)).not.toContain(moving);
+
+    const destinationDO = scopeDOs.get(destinationScope)!;
+    expect(destinationDO, `missing destination authority ${destinationScope}`).toBeTruthy();
+    const destinationAfter = await call<{ rows: Array<{ child: string }> }>(
+      destinationDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { container: destination, parent: null }
+    );
+    expect(destinationAfter.rows.map((row) => row.child)).toEqual([...destinationRoots, moving]);
+
+    // The moved parent keeps its immutable SOURCE anchor, while these existing
+    // children are anchored at the DESTINATION. Ordering authority must follow
+    // the explicit container, not the non-root parent's anchor: otherwise the
+    // second insertion reads an empty source-side subset and rejects index 1.
+    const destinationCtx = {
+      theOutline: destination,
+      roomScope: destinationScope,
+      epoch,
+      session: destinationSession,
+      actor: destinationSession.actor
+    };
+    const nestedFirst = await verbTurn(
+      gateway, gatewayEnv, destinationCtx, "cross-nest-first", "move_item", [destinationRoots[0], moving, 0]
+    );
+    expect(nestedFirst.reply.status, JSON.stringify(nestedFirst.trace)).toBe("accepted");
+    const nestedSecond = await verbTurn(
+      gateway, gatewayEnv, destinationCtx, "cross-nest-second", "move_item", [destinationRoots[1], moving, 1]
+    );
+    expect(nestedSecond.reply.status, JSON.stringify(nestedSecond.trace)).toBe("accepted");
+    const nestedRows = await call<{ rows: Array<{ child: string }> }>(
+      destinationDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { container: destination, parent: moving }
+    );
+    expect(nestedRows.rows.map((row) => row.child)).toEqual(destinationRoots.slice(0, 2));
   });
 
   it("P1.2: net undo of remove_item re-homes captured children under the restored node (miss not swallowed)", async () => {
@@ -557,7 +642,7 @@ describe("outliner add over the net path converges", () => {
     // move_item ran after repair (not swallowed, which would strand them at root).
     const roomDO = scopeDOs.get(`room:${theOutline}`)!;
     const kids = await call<{ rows: Array<{ child: string }> }>(
-      roomDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { parent: restored }
+      roomDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { container: theOutline, parent: restored }
     );
     const kidIds = kids.rows.map((r) => r.child);
     expect(kidIds, "captured child re-homed under the restored node").toContain(c1);
@@ -591,7 +676,7 @@ describe("outliner add over the net path converges", () => {
     // raised E_INDEX at index 1, was swallowed, and stranded c2 at root.
     const roomDO = scopeDOs.get(roomScope)!;
     const kids = await call<{ rows: Array<{ child: string; rank: string }> }>(
-      roomDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { parent: restored }
+      roomDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { container: theOutline, parent: restored }
     );
     const kidIds = kids.rows.map((r) => r.child);
     expect(kidIds, `restored children: ${JSON.stringify(kids.rows)}`).toEqual([c1, c2]);
@@ -628,7 +713,7 @@ describe("outliner add over the net path converges", () => {
 
     const roomDO = scopeDOs.get(roomScope)!;
     const roots = await call<{ rows: Array<{ child: string; rank: string }> }>(
-      roomDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { parent: null }
+      roomDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { container: theOutline, parent: null }
     );
     const ranks = roots.rows.map((r) => r.rank);
     expect(new Set(ranks).size, `duplicate ranks: ${JSON.stringify(roots.rows)}`).toBe(ranks.length);
@@ -647,15 +732,15 @@ describe("outliner add over the net path converges", () => {
     const roomDO = scopeDOs.get(roomScope)!;
     const env = { WOO_INTERNAL_SECRET: SECRET };
     // A stringly index must not silently become "append".
-    await expect(call(roomDO, env, "/ordered-neighbors", { parent: null, index: "0" }))
+    await expect(call(roomDO, env, "/ordered-neighbors", { container: theOutline, parent: null, index: "0" }))
       .rejects.toThrow(/E_INVARG/);
     // A non-string exclude must not silently become "no exclusion".
-    await expect(call(roomDO, env, "/ordered-neighbors", { parent: null, exclude: 42 }))
+    await expect(call(roomDO, env, "/ordered-neighbors", { container: theOutline, parent: null, exclude: 42 }))
       .rejects.toThrow(/E_INVARG/);
     // A malformed parent is a structured E_INVARG, not a plain 500.
-    await expect(call(roomDO, env, "/ordered-neighbors", { parent: 7 }))
+    await expect(call(roomDO, env, "/ordered-neighbors", { container: theOutline, parent: 7 }))
       .rejects.toThrow(/E_INVARG/);
-    await expect(call(roomDO, env, "/ordered-children", { parent: 7 }))
+    await expect(call(roomDO, env, "/ordered-children", { container: theOutline, parent: 7 }))
       .rejects.toThrow(/E_INVARG/);
   });
 
@@ -705,7 +790,7 @@ describe("outliner add over the net path converges", () => {
       "probe_order",
       // Reads one foreign cell (name) and the foreign ordering, then writes
       // locally — commit scope = the chatroom, ordering owner = the outline.
-      `verb :probe_order(item, slate) rxd {\n  let nm = item.name;\n  let q = ordered_neighbors(item, { index: null });\n  slate.probe_count = q["count"];\n  return q["count"];\n}`,
+      `verb :probe_order(item, slate) rxd {\n  let nm = item.name;\n  let q = ordered_neighbors(item, { index: null }, location(item));\n  slate.probe_count = q["count"];\n  return q["count"];\n}`,
       null
     );
     expect(installed.ok, JSON.stringify(installed)).toBe(true);
@@ -794,6 +879,32 @@ describe("outliner add over the net path converges", () => {
     expect(err).toContain("E_NONCONVERGENT_READ");
     expect(err, "must name the offending cell").toContain(focusKey);
     expect(err, "must NOT be the opaque budget error").not.toContain("E_BUDGET");
+  });
+
+  it("fails FAST and NAMED when a stable ordering answer is rejected twice", async () => {
+    const { world, theOutline, session, actor, epoch } = await outlinerWorld();
+    const roomScope = `room:${theOutline}`;
+    const ctx = { theOutline, roomScope, epoch, session, actor };
+    const { gateway, gatewayEnv } = await mountNet(world, epoch, {
+      intercept: async (scope, path) => {
+        if (scope === roomScope && path === "/net/submit") {
+          return jsonResponse({
+            status: "rejected",
+            reason: "read_version_mismatch",
+            retryable: true,
+            detail: { ordering_conflicts: [{ scope: roomScope, container: theOutline, parent: null }] }
+          });
+        }
+        return null;
+      }
+    });
+    const err = await addTurn(gateway, gatewayEnv, ctx, "nonconvergent-ordering", "x").then(
+      (ok) => { throw new Error(`expected rejection, got ${JSON.stringify(ok.reply)}`); },
+      (e: unknown) => String(e)
+    );
+    expect(err).toContain("E_NONCONVERGENT_READ");
+    expect(err, "must name the owning root ordering").toContain(roomScope);
+    expect(err).not.toContain("E_BUDGET");
   });
 
   it("does NOT trip the detector under genuine contention (authority version moves each round)", async () => {

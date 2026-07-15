@@ -78,7 +78,7 @@ function buildFixture() {
   world.createObject({ id: "ocp_root", name: "Outline Root", parent: "$thing", owner: actor });
   // Two-level tree: p_a, p_b under the root; a1,a2 under p_a; b1 under p_b.
   for (const id of ["p_a", "p_b", "c_a1", "c_a2", "c_b1"]) {
-    world.createObject({ id, name: id, parent: "$thing", owner: actor });
+    world.createObject({ id, name: id, parent: "$thing", owner: actor, location: "ocp_root" });
   }
   // Authored ordered-edge cells (property_cell:<child>:__ordered_edge).
   const edge = (child: string, parent: string | null, rank: string) => world.setProp(child, "__ordered_edge", { parent, rank });
@@ -88,8 +88,8 @@ function buildFixture() {
   edge("c_a2", "p_a", "W");
   edge("c_b1", "p_b", "V");
 
-  installVerb(world, "ocp_root", "children_of", `verb :children_of(who) rxd { return ordered_children(who); }`, null);
-  installVerb(world, "ocp_root", "two_parents", `verb :two_parents(p1, p2) rxd { return [ordered_children(p1), ordered_children(p2)]; }`, null);
+  installVerb(world, "ocp_root", "children_of", `verb :children_of(who) rxd { return ordered_children(who, this); }`, null);
+  installVerb(world, "ocp_root", "two_parents", `verb :two_parents(p1, p2) rxd { return [ordered_children(p1, this), ordered_children(p2, this)]; }`, null);
 
   return { world, session, actor };
 }

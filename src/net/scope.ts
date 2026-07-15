@@ -27,7 +27,13 @@ import { CellStore, type Cell, type EpochStamp } from "./cells";
 import { netError } from "./errors";
 import { validateSessionCell } from "./sessions";
 import { applyRelationDeltas, deriveRelationDeltas, rebuildContentsRelation, relationKey, type RelationDelta, type RelationRow } from "./relations";
-import { orderedChildrenVersion } from "./ordered-edges";
+import {
+  ORDERED_EDGE_RELATION,
+  orderedChildrenForContainer,
+  orderedChildrenVersion,
+  orderedProjectionKey,
+  type OrderedChildRow
+} from "./ordered-edges";
 import type { ScopeStore, TailEntry } from "./scope-store";
 import { applyTranscript, netCellKeyFor, type EffectTranscript, type TranscriptCell } from "./transcript";
 import { cellKey, cellVersion } from "./cells";
@@ -64,7 +70,7 @@ export type CommitSubmit = {
     /** R3: the owner's CURRENT ordering version per attested parent, taken
      * at the same /net/attest freshness point as the cell versions, so a
      * foreign ordering read validates exactly like a foreign cell read. */
-    orderings?: Array<{ parent: string | null; version: string }>;
+    orderings?: Array<{ container: string; parent: string | null; version: string }>;
   }>;
 };
 
@@ -196,6 +202,13 @@ export class ScopeSequencer {
   private readonly tail: TailEntry[] = [];
   private readonly scheduled = new Map<string, ScheduledTurn>();
   private readonly relationRows = new Map<string, RelationRow>();
+  /** CO13 ordered-edge relation buckets, maintained in (rank, child) order
+   * when rows change. Relation rows are keyed by member, so the reverse map
+   * lets an overwrite/reparent remove the old bucket entry before adding the
+   * new one. Reads therefore touch only one parent width, never every relation
+   * in a room scope. */
+  private readonly orderedRelationsByProjection = new Map<string, OrderedChildRow[]>();
+  private readonly orderedRelationLocationByKey = new Map<string, { projection: string; child: string; rank: string }>();
   private readonly options: Required<Pick<ScopeSequencerOptions, "tailLimit">> & ScopeSequencerOptions;
 
   constructor(scope: string, catalogEpoch: string, options: ScopeSequencerOptions = {}) {
@@ -246,6 +259,7 @@ export class ScopeSequencer {
       // delegate). The in-memory map serves only durable-less
       // sequencers.
       for (const row of durable.readRelations()) this.relationRows.set(relationKey(row.relation, row.owner, row.member), row);
+      this.syncOrderedRelationIndex(this.relationRows.keys());
     }
   }
 
@@ -487,28 +501,29 @@ export class ScopeSequencer {
     const attestedOrderings = new Map<string, string>();
     for (const [owner, entry] of Object.entries(submit.attestations ?? {})) {
       for (const ordering of entry.orderings ?? []) {
-        attestedOrderings.set(`${owner}\0${ordering.parent ?? "\0root"}`, ordering.version);
+        attestedOrderings.set(`${owner}\0${ordering.container}\0${ordering.parent ?? "\0root"}`, ordering.version);
       }
     }
-    const orderingConflicts: (string | null)[] = [];
+    const orderingConflicts: Array<{ scope: string; container: string; parent: string | null }> = [];
     for (const read of submit.transcript.orderingReads ?? []) {
       if (read.scope !== this.scope) {
-        const attested = attestedOrderings.get(`${read.scope}\0${read.parent ?? "\0root"}`);
+        const attested = attestedOrderings.get(`${read.scope}\0${read.container}\0${read.parent ?? "\0root"}`);
         if (attested === undefined) {
           // A foreign ordering read nobody attested is a protocol violation
           // by the submitter, not a stale-view condition — terminal, named
           // (the pre-R3 behavior silently skipped these reads).
           return this.reject(submit, "rider_unattested", { ordering_parent: read.parent, ordering_scope: read.scope });
         }
-        if (attested !== read.version) orderingConflicts.push(read.parent);
+        if (attested !== read.version) orderingConflicts.push({ scope: read.scope, container: read.container, parent: read.parent });
         continue;
       }
-      const current = orderedChildrenVersion(this.store.orderedEdgeChildren(read.parent));
-      if (current !== read.version) orderingConflicts.push(read.parent);
+      const current = orderedChildrenVersion(this.orderedChildren(read.container, read.parent));
+      if (current !== read.version) orderingConflicts.push({ scope: read.scope, container: read.container, parent: read.parent });
     }
     if (orderingConflicts.length > 0) {
-      // Retryable: the gateway re-fetches the named parents' projections and
-      // re-plans (the recomputed rank then reflects the concurrent insert).
+      // Retryable: the gateway re-fetches the named (scope,parent)
+      // projections and re-plans. Scope is part of the identity because two
+      // independent root orderings can both have `parent: null` in one turn.
       return this.reject(submit, "read_version_mismatch", { ordering_conflicts: orderingConflicts });
     }
 
@@ -596,6 +611,7 @@ export class ScopeSequencer {
     // reply for the shell's /net/relate delivery.
     const derived = deriveRelationDeltas(submit.transcript, applied, this.scope, this.options.scopeOf, applied.post);
     const changedRelationKeys = applyRelationDeltas(this.relationRows, derived.local);
+    this.syncOrderedRelationIndex(changedRelationKeys);
     const relationsForeign = [...derived.foreign.entries()].map(([scope, deltas]) => ({ scope, deltas }));
 
     const reply: CommitReply = {
@@ -789,6 +805,14 @@ export class ScopeSequencer {
     return this.relationRows;
   }
 
+  /** Owner-complete ordering for exactly one `(container, parent)` bucket.
+   * Local authored cells and foreign relation projections are both already
+   * write-time indexed; the merge is O(children-of-parent). */
+  orderedChildren(container: string, parent: string | null): OrderedChildRow[] {
+    const projected = this.orderedRelationsByProjection.get(orderedProjectionKey(container, parent)) ?? [];
+    return orderedChildrenForContainer(this.store, projected, container, parent);
+  }
+
   /**
    * H2b: reap EXPIRED session cells this scope owns, as ONE
    * owner-sequenced cleanup event (the coherent path, chosen over a
@@ -913,6 +937,7 @@ export class ScopeSequencer {
       }
     }
     const changedRelationKeys = applyRelationDeltas(this.relationRows, localRemovals);
+    this.syncOrderedRelationIndex(changedRelationKeys);
 
     const durable = this.options.durable;
     if (durable) {
@@ -964,6 +989,7 @@ export class ScopeSequencer {
     from?: { from_scope: string; seq: number }
   ): { status: "applied" | "empty"; head: ScopeHead; changed: string[] } {
     const changed = applyRelationDeltas(this.relationRows, deltas);
+    this.syncOrderedRelationIndex(changed);
     if (changed.length === 0) {
       return { status: "empty", head: this.headState, changed: [] };
     }
@@ -1002,16 +1028,60 @@ export class ScopeSequencer {
     return { status: "applied", head: this.headState, changed };
   }
 
-  /** CO13 bounded repair: recompute the contents relation from authority
-   * live cells (presence rows are preserved — they rebuild from session
-   * cells once CO14 lands). Replaces rows in memory and durably.
+  /** Synchronize changed relation-map keys into the write-time-sorted ordered
+   * projection index. This is the single index mutation path for hydration,
+   * local derivation, reaping, and foreign `/net/relate` delivery. */
+  private syncOrderedRelationIndex(keys: Iterable<string>): void {
+    for (const key of keys) {
+      const prior = this.orderedRelationLocationByKey.get(key);
+      if (prior) {
+        const bucket = this.orderedRelationsByProjection.get(prior.projection);
+        if (bucket) {
+          const at = ScopeSequencer.orderedRelationSlot(bucket, prior.rank, prior.child);
+          if (at < bucket.length && bucket[at].child === prior.child && bucket[at].rank === prior.rank) bucket.splice(at, 1);
+          if (bucket.length === 0) this.orderedRelationsByProjection.delete(prior.projection);
+        }
+        this.orderedRelationLocationByKey.delete(key);
+      }
+
+      const row = this.relationRows.get(key);
+      if (!row || row.relation !== ORDERED_EDGE_RELATION) continue;
+      const body = row.body as { parent?: unknown; rank?: unknown } | undefined;
+      if (!body || (body.parent !== null && typeof body.parent !== "string") || typeof body.rank !== "string" || !body.rank) continue;
+      const projection = orderedProjectionKey(row.owner, body.parent as string | null);
+      const bucket = this.orderedRelationsByProjection.get(projection) ?? [];
+      const at = ScopeSequencer.orderedRelationSlot(bucket, body.rank, row.member);
+      bucket.splice(at, 0, { child: row.member, rank: body.rank });
+      this.orderedRelationsByProjection.set(projection, bucket);
+      this.orderedRelationLocationByKey.set(key, { projection, child: row.member, rank: body.rank });
+    }
+  }
+
+  /** Lower-bound locator in the total `(rank, child)` order. */
+  private static orderedRelationSlot(rows: readonly OrderedChildRow[], rank: string, child: string): number {
+    let lo = 0;
+    let hi = rows.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      const row = rows[mid];
+      if (row.rank < rank || (row.rank === rank && row.child < child)) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  }
+
+  /** CO13 bounded repair: recompute the locally knowable contents relation
+   * from authority live cells. Presence and ordered-edge rows are preserved:
+   * their defining cells may live at foreign immutable anchors, so they repair
+   * only through their single transcript-derivation + `/net/relate` path.
+   * Replaces contents rows in memory and durably.
    *
    * When `scopeOf` is wired (multi-scope), candidates whose OWNER is
    * anchored elsewhere are dropped: those rows belong at the owning
    * scope (they were delivered there via /net/relate at derivation
    * time), and rebuilding them here would mint a second copy of another
    * scope's row family — the CO9 dual-write this module exists to
-   * prevent. Single-scope rebuilds keep everything. */
+   * prevent. Single-scope contents rebuilds keep everything. */
   rebuildRelations(): void {
     const rebuilt = rebuildContentsRelation([...this.store.keys()].map((key) => this.store.get(key)).filter((c): c is Cell => Boolean(c)));
     if (this.options.scopeOf) {

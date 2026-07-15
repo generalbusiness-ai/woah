@@ -15,6 +15,7 @@ import { InMemoryScopeStore } from "../../src/net/scope-store";
 import { ScopeSequencer, type CommitSubmit } from "../../src/net/scope";
 import { applyTranscript, type EffectTranscript } from "../../src/net/transcript";
 import { CellStore } from "../../src/net/cells";
+import { ORDERED_EDGE_PROP } from "../../src/net/ordered-edges";
 
 const EPOCH = "cat-rel-1";
 const WRITER = { progr: "#a", thisObj: "#t", verb: "v", definer: "$thing", caller: "#a", callerPerms: "#a" };
@@ -46,9 +47,49 @@ describe("deriveRelationDeltas (CO13)", () => {
   it("moves derive remove-at-source and add-at-destination contents deltas", () => {
     const t = transcript({ moves: [{ object: "#alice", from: "room:hall", to: "room:den" }] });
     const derived = deriveRelationDeltas(t, NO_WRITES, "room:hall");
-    expect(derived.local.map((d) => `${d.op}:${d.row.owner}:${d.row.member}`).sort()).toEqual([
+    expect(derived.local.filter((d) => d.row.relation === "contents").map((d) => `${d.op}:${d.row.owner}:${d.row.member}`).sort()).toEqual([
       "add:room:den:#alice",
       "remove:room:hall:#alice"
+    ]);
+    expect(derived.local.filter((d) => d.row.relation === "ordered_edge")).toEqual([]);
+  });
+
+  it("a moved-and-cleared edge retracts only its source relation", () => {
+    const post = new CellStore("authority");
+    const stamp = { scope_head: "cleared-edge", catalog_epoch: EPOCH };
+    post.commit({ kind: "object_live", object: "#item", value: { location: "$nowhere" }, stamp });
+    const t = transcript({
+      moves: [{ object: "#item", from: "room:hall", to: "$nowhere" }],
+      writes: [{ cell: { kind: "prop", object: "#item", name: ORDERED_EDGE_PROP }, value: null, op: "remove", writer: WRITER }]
+    });
+    const derived = deriveRelationDeltas(t, NO_WRITES, "room:hall", (owner) => owner, post);
+    expect(derived.local.filter((d) => d.row.relation === "ordered_edge")).toEqual([
+      { op: "remove", row: { relation: "ordered_edge", owner: "room:hall", member: "#item" } }
+    ]);
+    expect(derived.foreign.get("$nowhere")?.filter((d) => d.row.relation === "ordered_edge") ?? []).toEqual([]);
+  });
+
+  it("moves project a foreign-anchored authored edge into the destination ordering", () => {
+    const post = new CellStore("authority");
+    const stamp = { scope_head: "edge", catalog_epoch: EPOCH };
+    post.commit({ kind: "object_live", object: "#alice", value: { location: "room:den" }, stamp });
+    post.commit({
+      kind: "property_cell",
+      object: "#alice",
+      name: ORDERED_EDGE_PROP,
+      value: { value: { parent: null, rank: "V" } },
+      stamp
+    });
+    const t = transcript({ moves: [{ object: "#alice", from: "room:hall", to: "room:den" }] });
+    const derived = deriveRelationDeltas(t, NO_WRITES, "room:hall", (owner) => owner, post);
+    expect(derived.local.filter((d) => d.row.relation === "ordered_edge")).toEqual([
+      { op: "remove", row: { relation: "ordered_edge", owner: "room:hall", member: "#alice" } }
+    ]);
+    expect(derived.foreign.get("room:den")?.filter((d) => d.row.relation === "ordered_edge")).toEqual([
+      {
+        op: "add",
+        row: { relation: "ordered_edge", owner: "room:den", member: "#alice", body: { parent: null, rank: "V" } }
+      }
     ]);
   });
 
@@ -114,8 +155,8 @@ describe("deriveRelationDeltas (CO13)", () => {
   it("partitions deltas by the owner's anchor scope", () => {
     const t = transcript({ moves: [{ object: "#alice", from: "room:hall", to: "room:den" }] });
     const derived = deriveRelationDeltas(t, NO_WRITES, "room:hall", (owner) => (owner === "room:hall" ? "room:hall" : "room:den"));
-    expect(derived.local.map((d) => d.op)).toEqual(["remove"]);
-    expect(derived.foreign.get("room:den")?.map((d) => d.op)).toEqual(["add"]);
+    expect(derived.local.filter((d) => d.row.relation === "contents").map((d) => d.op)).toEqual(["remove"]);
+    expect(derived.foreign.get("room:den")?.filter((d) => d.row.relation === "contents").map((d) => d.op)).toEqual(["add"]);
   });
 });
 

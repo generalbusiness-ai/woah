@@ -74,13 +74,14 @@ export type ShadowTurnCallOptions = {
   /** Net's sparse planner must fail rather than derive a partial roster from
    * whichever session rows happened to materialize on this executor. */
   require_room_roster_projection?: boolean;
-  /** Transient owner-computed ordered-children projections (one per parent);
+  /** Transient owner-computed ordered-children projections (one per
+   * container/parent identity);
    * the ordering analogue of room_rosters. Never persisted or exported. */
-  ordered_children?: Array<{ parent: string | null; rows: readonly Record<string, unknown>[] }>;
+  ordered_children?: Array<{ container: string; parent: string | null; rows: readonly Record<string, unknown>[] }>;
   /** Transient owner-answered bounded neighbour queries (P2.4) — one O(1)
    * `{count, index, before, after, child_index}` answer per exact query, so a
    * mutation under a wide parent never needs the full ordering above. */
-  ordered_neighbors?: Array<{ query: OrderedNeighborsQuery; value: Record<string, unknown> }>;
+  ordered_neighbors?: Array<{ container: string; query: OrderedNeighborsQuery; value: Record<string, unknown> }>;
   /** Net's sparse planner must fail rather than derive a partial ordering from
    * whichever edge cells happened to materialize (mirror of the roster flag).
    * Guards both ordered_children and ordered_neighbors reads. */
@@ -106,8 +107,8 @@ export async function runShadowTurnCall(
   const built = createWorldFromSerialized(world, { persist: false });
   for (const roster of options.room_rosters ?? []) built.installRoomRosterProjection(roster.room, roster.rows);
   if (options.require_room_roster_projection) built.setRequireRoomRosterProjection(true);
-  for (const ordering of options.ordered_children ?? []) built.installOrderedChildrenProjection(ordering.parent, ordering.rows);
-  for (const neighbors of options.ordered_neighbors ?? []) built.installOrderedNeighborsProjection(neighbors.query, neighbors.value);
+  for (const ordering of options.ordered_children ?? []) built.installOrderedChildrenProjection(ordering.container, ordering.parent, ordering.rows);
+  for (const neighbors of options.ordered_neighbors ?? []) built.installOrderedNeighborsProjection(neighbors.container, neighbors.query, neighbors.value);
   if (options.require_ordered_children_projection) built.setRequireOrderedChildrenProjection(true);
   if (options.record_authoring_cell_writes) built.setRecordAuthoringCellWrites(true);
   built.setMetricsHook(options.onMetric ?? null);
@@ -128,8 +129,8 @@ export async function runShadowTurnCallTranscript(
   const built = createWorldFromSerialized(world, { persist: false });
   for (const roster of options.room_rosters ?? []) built.installRoomRosterProjection(roster.room, roster.rows);
   if (options.require_room_roster_projection) built.setRequireRoomRosterProjection(true);
-  for (const ordering of options.ordered_children ?? []) built.installOrderedChildrenProjection(ordering.parent, ordering.rows);
-  for (const neighbors of options.ordered_neighbors ?? []) built.installOrderedNeighborsProjection(neighbors.query, neighbors.value);
+  for (const ordering of options.ordered_children ?? []) built.installOrderedChildrenProjection(ordering.container, ordering.parent, ordering.rows);
+  for (const neighbors of options.ordered_neighbors ?? []) built.installOrderedNeighborsProjection(neighbors.container, neighbors.query, neighbors.value);
   if (options.require_ordered_children_projection) built.setRequireOrderedChildrenProjection(true);
   if (options.record_authoring_cell_writes) built.setRecordAuthoringCellWrites(true);
   if (options.onMetric) built.setMetricsHook(options.onMetric);

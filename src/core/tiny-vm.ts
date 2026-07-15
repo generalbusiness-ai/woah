@@ -1030,21 +1030,22 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         return frame.ctx.world.roomRosterProjection(assertObj(builtinArgs[0])) as unknown as WooValue;
       }
       case "ordered_children": {
-        // Owner-computed ordered children of a parent within a room, keyed by
-        // fractional rank. One arg: the parent ref, or null for the ordering
-        // roots. Returns [{child, rank}] ascending — see world.orderedChildrenProjection.
-        if (builtinArgs.length !== 1) throw wooError("E_INVARG", "ordered_children expects one parent (or null)");
+        // Owner-computed ordered children of a parent within a container,
+        // keyed by fractional rank. One arg: the parent ref, or null for the
+        // ordering roots. An optional second argument explicitly identifies
+        // the container; root order is not identifiable from `null` alone.
+        // Returns [{child, rank}] ascending — see world.orderedChildrenProjection.
+        if (builtinArgs.length < 1 || builtinArgs.length > 2) throw wooError("E_INVARG", "ordered_children expects (parent, container?)");
         const parentArg = builtinArgs[0];
         const parent = parentArg === null ? null : assertObj(parentArg);
-        // Pass the calling verb's enclosing space as the container: over the
-        // net the projection is already scope-fetched (one room), but the
-        // in-memory / SQLite fallback scans the whole world, so it must scope
-        // ordering roots to THIS room — otherwise a multi-outliner world would
-        // mix roots across outliners.
-        return frame.ctx.world.orderedChildrenProjection(parent, frame.ctx.space) as unknown as WooValue;
+        // Default to the calling verb's enclosing space for compatibility;
+        // catalog mutation hooks pass the container explicitly because a move
+        // may be executing in the source space while ordering the destination.
+        const orderingContainer = builtinArgs.length === 2 ? assertObj(builtinArgs[1]) : frame.ctx.space;
+        return frame.ctx.world.orderedChildrenProjection(parent, orderingContainer) as unknown as WooValue;
       }
       case "ordered_neighbors": {
-        // Bounded ordering slot query (P2.4): ordered_neighbors(parent, query)
+        // Bounded ordering slot query (P2.4): ordered_neighbors(parent, query, container?)
         // where query is a map with optional `index` (0-based insertion slot;
         // null/absent = append), `exclude` (drop one child from the neighbour
         // computation — a same-parent move must not neighbour against itself)
@@ -1053,7 +1054,7 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
         // world.orderedNeighborsProjection. A mutation reads THIS instead of
         // the parent's full ordered_children list, so a wide parent never
         // drags its sibling list into the turn.
-        if (builtinArgs.length !== 2) throw wooError("E_INVARG", "ordered_neighbors expects (parent, query)");
+        if (builtinArgs.length < 2 || builtinArgs.length > 3) throw wooError("E_INVARG", "ordered_neighbors expects (parent, query, container?)");
         const parentArg = builtinArgs[0];
         const parent = parentArg === null ? null : assertObj(parentArg);
         const spec = builtinArgs[1];
@@ -1072,9 +1073,10 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
           exclude: rawExclude === null ? null : assertObj(rawExclude),
           child: rawChild === null ? null : assertObj(rawChild)
         };
-        // Same container scoping as ordered_children: the local fallback's
-        // whole-world scan must confine ordering roots to THIS room.
-        return frame.ctx.world.orderedNeighborsProjection(parent, query, frame.ctx.space) as unknown as WooValue;
+        // Same compatibility default as ordered_children; cross-container
+        // mutation hooks pass the destination container explicitly.
+        const orderingContainer = builtinArgs.length === 3 ? assertObj(builtinArgs[2]) : frame.ctx.space;
+        return frame.ctx.world.orderedNeighborsProjection(parent, query, orderingContainer) as unknown as WooValue;
       }
       // connected_players was a GLOBAL session enumeration (Big-World
       // violation) whose sole consumer, $player:who_all, is now presence-scoped

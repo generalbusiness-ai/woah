@@ -34,7 +34,7 @@ import {
 } from "./bridge";
 import { CellStore, cellKey, cellVersion, serializeTransfer, type Cell, type EpochStamp } from "./cells";
 import { isNetError, netError, type NetError } from "./errors";
-import type { OrderedNeighborsQuery } from "./ordered-edges";
+import type { OrderedNeighborsQuery, OrderedNeighborsRequest, OrderedProjectionKey } from "./ordered-edges";
 import { selectCommitScope, type ScopeClassifier, type ScopeSelection } from "./route";
 import type { CommitSubmit, ScopeHead } from "./scope";
 import { sessionWriter } from "./sessions";
@@ -109,18 +109,18 @@ export type PlanTurnInput = {
   /** One authority-read compact roster value, installed only in the
    * ephemeral execution world for generic room_roster(space) reads. */
   planningRoomRoster?: { room: string; rows: readonly Record<string, unknown>[] };
-  /** Owner-computed ordered-children values (one per parent), installed only
-   * in the ephemeral execution world for generic ordered_children(parent)
+  /** Owner-computed ordered-children values (one per container + parent), installed only
+   * in the ephemeral execution world for generic ordered_children(parent, container)
    * reads. The ordering analogue of planningRoomRoster; keeps sibling order
    * off the O(N)-edge-cell read closure. */
-  planningOrderedChildren?: readonly { parent: string | null; scope: string; rows: readonly Record<string, unknown>[]; version: string }[];
+  planningOrderedChildren?: readonly { container: string; parent: string | null; scope: string; rows: readonly Record<string, unknown>[]; version: string }[];
   /** Owner-answered bounded neighbour queries (P2.4), installed only in the
-   * ephemeral execution world for generic ordered_neighbors(parent, query)
+   * ephemeral execution world for generic ordered_neighbors(parent, query, container)
    * reads. Each carries the SAME authority ordering `version` a full
-   * projection would, so the attestation below serializes concurrent
+   * projection would. `container` disambiguates null-root queries, so the attestation below serializes concurrent
    * same-parent mutations identically — the answer is just O(1) instead of
    * O(width). */
-  planningOrderedNeighbors?: readonly { query: OrderedNeighborsQuery; scope: string; value: Record<string, unknown>; version: string }[];
+  planningOrderedNeighbors?: readonly { container: string; query: OrderedNeighborsQuery; scope: string; value: Record<string, unknown>; version: string }[];
 };
 
 export type PlanTurnResult = {
@@ -230,10 +230,10 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
         record_authoring_cell_writes: true,
         ...(input.planningRoomRoster ? { room_rosters: [input.planningRoomRoster] } : {}),
         ...(input.planningOrderedChildren && input.planningOrderedChildren.length > 0
-          ? { ordered_children: [...input.planningOrderedChildren] }
+          ? { ordered_children: input.planningOrderedChildren.map((o) => ({ container: o.container, parent: o.parent, rows: o.rows })) }
           : {}),
         ...(input.planningOrderedNeighbors && input.planningOrderedNeighbors.length > 0
-          ? { ordered_neighbors: input.planningOrderedNeighbors.map((n) => ({ query: n.query, value: n.value })) }
+          ? { ordered_neighbors: input.planningOrderedNeighbors.map((n) => ({ container: n.container, query: n.query, value: n.value })) }
           : {})
       });
     } catch (err) {
@@ -317,9 +317,9 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
   // The owning `scope` rides along (R3) so a cross-scope commit validates
   // foreign entries against that owner's attestation instead of skipping
   // them — and `parent: null` names exactly one scope's roots.
-  const orderingReads = new Map<string, { parent: string | null; scope: string; version: string }>();
-  for (const p of input.planningOrderedChildren ?? []) orderingReads.set(`${p.scope}\0${p.parent ?? "\0root"}\0${p.version}`, { parent: p.parent, scope: p.scope, version: p.version });
-  for (const n of input.planningOrderedNeighbors ?? []) orderingReads.set(`${n.scope}\0${n.query.parent ?? "\0root"}\0${n.version}`, { parent: n.query.parent, scope: n.scope, version: n.version });
+  const orderingReads = new Map<string, { container: string; parent: string | null; scope: string; version: string }>();
+  for (const p of input.planningOrderedChildren ?? []) orderingReads.set(`${p.scope}\0${p.container}\0${p.parent ?? "\0root"}\0${p.version}`, { container: p.container, parent: p.parent, scope: p.scope, version: p.version });
+  for (const n of input.planningOrderedNeighbors ?? []) orderingReads.set(`${n.scope}\0${n.container}\0${n.query.parent ?? "\0root"}\0${n.version}`, { container: n.container, parent: n.query.parent, scope: n.scope, version: n.version });
   if (orderingReads.size > 0) {
     transcript.orderingReads = [...orderingReads.values()];
   }
@@ -684,22 +684,23 @@ function missIsResidentNow(miss: unknown, view: CellStore): boolean {
  * parent's ordering that the sparse planning world does not hold; both the
  * thrown and the recorded (transcript.error) forms carry the same shape.
  */
-function orderedChildrenMiss(errorish: { code?: unknown; value?: unknown } | null | undefined): (string | null)[] | null {
+function orderedChildrenMiss(errorish: { code?: unknown; value?: unknown } | null | undefined): OrderedProjectionKey[] | null {
   if (!errorish || errorish.code !== "E_NEED_ORDERED_CHILDREN") return null;
-  const value = errorish.value as { parent?: unknown } | null | undefined;
+  const value = errorish.value as { container?: unknown; parent?: unknown } | null | undefined;
+  const container = value && typeof value === "object" ? value.container : undefined;
   const parent = value && typeof value === "object" ? (value as { parent?: unknown }).parent : undefined;
-  if (parent === null || typeof parent === "string") return [parent];
+  if (typeof container === "string" && container && (parent === null || typeof parent === "string")) return [{ container, parent }];
   return null; // malformed value — treat as a non-miss (terminal)
 }
 
 /** Package an ordered-children miss as the repairable escape the gateway's
  * turn loop recovers: a distinct `missing_ordered_children` detail keeps it
  * off the cell-pull path (which reads `detail.missing`). */
-function orderedChildrenMissState(parents: (string | null)[]): NetError {
+function orderedChildrenMissState(orderings: OrderedProjectionKey[]): NetError {
   return netError(
     "E_MISSING_STATE",
-    `sparse planning ordered-children projection not yet fetched: ${parents.map((p) => p ?? "<root>").join(", ")}`,
-    { missing_ordered_children: parents }
+    `sparse planning ordered-children projection not yet fetched: ${orderings.map((o) => `${o.container}:${o.parent ?? "<root>"}`).join(", ")}`,
+    { missing_ordered_children: orderings }
   );
 }
 
@@ -710,17 +711,21 @@ function orderedChildrenMissState(parents: (string | null)[]): NetError {
  * reads a slot the sparse planning world cannot answer; both the thrown and
  * the recorded (transcript.error) forms carry the same shape.
  */
-function orderedNeighborsMiss(errorish: { code?: unknown; value?: unknown } | null | undefined): OrderedNeighborsQuery | null {
+function orderedNeighborsMiss(errorish: { code?: unknown; value?: unknown } | null | undefined): OrderedNeighborsRequest | null {
   if (!errorish || errorish.code !== "E_NEED_ORDERED_NEIGHBORS") return null;
-  const value = errorish.value as { parent?: unknown; index?: unknown; exclude?: unknown; child?: unknown } | null | undefined;
+  const value = errorish.value as { container?: unknown; parent?: unknown; index?: unknown; exclude?: unknown; child?: unknown } | null | undefined;
   if (!value || typeof value !== "object") return null; // malformed — terminal
+  if (typeof value.container !== "string" || !value.container) return null;
   const parent = value.parent === null || typeof value.parent === "string" ? value.parent : undefined;
   if (parent === undefined) return null;
   return {
-    parent,
-    index: typeof value.index === "number" ? value.index : null,
-    exclude: typeof value.exclude === "string" ? value.exclude : null,
-    child: typeof value.child === "string" ? value.child : null
+    container: value.container,
+    query: {
+      parent,
+      index: typeof value.index === "number" ? value.index : null,
+      exclude: typeof value.exclude === "string" ? value.exclude : null,
+      child: typeof value.child === "string" ? value.child : null
+    }
   };
 }
 
@@ -728,11 +733,11 @@ function orderedNeighborsMiss(errorish: { code?: unknown; value?: unknown } | nu
  * turn loop recovers with ONE O(1) authority fetch: a distinct
  * `missing_ordered_neighbors` detail keeps it off both the cell-pull path
  * (`detail.missing`) and the full-projection path (`missing_ordered_children`). */
-function orderedNeighborsMissState(query: OrderedNeighborsQuery): NetError {
+function orderedNeighborsMissState(request: OrderedNeighborsRequest): NetError {
   return netError(
     "E_MISSING_STATE",
-    `sparse planning ordered-neighbours answer not yet fetched for ${query.parent ?? "<root>"}`,
-    { missing_ordered_neighbors: [query] }
+    `sparse planning ordered-neighbours answer not yet fetched for ${request.container}:${request.query.parent ?? "<root>"}`,
+    { missing_ordered_neighbors: [request] }
   );
 }
 

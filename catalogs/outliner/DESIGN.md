@@ -7,10 +7,10 @@
 > Siblings sort by plain string compare of their ranks; there is **no dense
 > `.position` and no renumber**. The removed `.parent` / `.position` item
 > props are replaced by this single edge. A hot mutation (`add`/`move`/
-> `reorder`) reads its slot via the O(1) `ordered_neighbors(parent, query)`
+> `reorder`) reads its slot via the O(1) `ordered_neighbors(parent, query, this)`
 > answer (two bounding ranks + count — constant-size at ANY parent width);
 > listing and the capture/detach/restore internals read the owner-computed
-> `ordered_children(parent)` projection (ONE bounded value, not an O(N)
+> `ordered_children(parent, this)` projection (ONE bounded value, not an O(N)
 > sibling-cell scan). Every mutation writes exactly ONE edge cell — so an
 > `add`/`move`/`reorder`/`remove` stays O(1) in sibling count and under
 > the 64 KiB net warm-envelope even at 120+ children (the pre-v2 add tripped
@@ -59,7 +59,7 @@ $thing
   ├── $portable
   │     └── $note
   │           └── $outline_item        (catalogs/outliner)
-  │                 .parent            objref | null — another item in the same outliner, or null for top-level
+  │                 .__ordered_edge    {parent, rank} — sole hierarchy/order authority
   │                 .hidden            bool — per-item hidden flag
   │                 .portable          bool = false (overrides inherited $portable default)
   │                 :moveto override   rejects targets that aren't $outliner (or recycling)
@@ -99,22 +99,24 @@ actor cluster.
 All item-state properties and outliner-side maps are `perms: "r"` (public
 read, owner+wizard direct-write). Mutations route through verbs.
 
-### Data model: room-owned ordered-edge index
+### Data model: container-complete ordered-edge index
 
 Tree shape and sibling order are the sole responsibility of ONE authored cell
-per item — the child's `__ordered_edge` `{ parent, rank }` — owned by the
-outliner room (the item is room-anchored, so its edge cell lives in the room's
-scope authority). This is the substrate ordered-edge index (stages 1-3 of
+per item — the child's `__ordered_edge` `{ parent, rank }`. Its authored cell
+stays at the item's immutable anchor. The current outliner owner combines its
+locally-anchored cells with owner-delivered `ordered_edge` relation rows for
+items moved in from another outliner, so cross-outliner roots remain complete
+without re-anchoring or global enumeration. This is the substrate ordered-edge index (stages 1-3 of
 `notes/2026-07-13-outliner-edge-index-v2.md`):
 
 - **Bounded reads.** Listing a parent's ordered children is an owner-computed
-  projection (`ordered_children(parent)`), fetched once as a single value —
+  projection (`ordered_children(parent, this)`), fetched once as a single value —
   never an O(N) scan of every sibling's cells. Over the net this is
   scope-fetched (mirroring `room_roster`); a data-dependent parent is filled by
   the gateway's repairable ordered-children path.
 - **O(1) mutation-slot reads.** The hot mutation verbs (`add_item`,
   `move_item`, `reorder_item`) do not read even the full projection: they call
-  `ordered_neighbors(parent, {index, exclude, child})`, which answers with the
+  `ordered_neighbors(parent, {index, exclude, child}, this)`, which answers with the
   two ranks bounding the target slot, the sibling count, and the moving item's
   current slot — a constant-size owner answer (`/net/ordered-neighbors`)
   regardless of parent width. The answer carries the same per-parent ordering
@@ -210,9 +212,9 @@ directly; everything routes through the outliner surface.
 | room movement / `out` | inherited | Actors arrive through the substrate `moveto` chain, normally from browser tab activation or an exit. `out` is the inherited room command resolved through an exit whose destination is seeded by the world catalog. `$outliner` defines no public lifecycle verbs of its own. |
 | `list_items()` | anyone | Joined depth-first view: `[{id, name, text, parent_id, index, hidden, owner, writers, has_children}, …]`. Built by the generic `object_tree_rows` substrate helper: scan `contents(this)`, keep `$outline_item` descendants, group by each item's `__ordered_edge.parent`, sort each group by `rank`, and walk depth-first. `index` is the derived (rank-order) sibling index. Items the actor cannot read return `text: ""`. The helper exists because building this large joined view with repeated woocode list concatenation exceeds the VM memory model on thousand-item outlines. |
 | `acceptable(object)` | anyone | `isa(object, $outline_item) \|\| isa(object, $actor)`. |
-| `enterfunc(object)` | core | For actors: reset a non-root `focus_by_actor[actor]` to root, clear that actor's undo slot if present, and emit `outliner_entered` plus mounted-room activity. A first entry at implicit root does not materialize a `focus_by_actor` row, avoiding no-op shared-map conflicts between independent actors. For items: a FRESH item (from `create` in `add_item`/`_restore_item`) still has no edge here — the composer writes it right after create — so leave it. A CROSS-OUTLINER arrival (whose edge the source `:exitfunc` cleared) is re-homed as a root at the END of this outliner's ordering (`ordered_children(null)` → `rank_between(last, null)`) and announced with `outline_item_added`, so no stale cross-outliner parent ref survives. |
+| `enterfunc(object)` | core | For actors: reset a non-root `focus_by_actor[actor]` to root, clear that actor's undo slot if present, and emit `outliner_entered` plus mounted-room activity. A first entry at implicit root does not materialize a `focus_by_actor` row, avoiding no-op shared-map conflicts between independent actors. For items: a FRESH item (from `create` in `add_item`/`_restore_item`) still has no edge here — the composer writes it right after create — so leave it. A CROSS-OUTLINER arrival (whose edge the source `:exitfunc` cleared) is re-homed as a root at the END of this outliner's explicitly scoped ordering (`ordered_children(null, this)` → `rank_between(last, null)`) and announced with `outline_item_added`, so no stale cross-outliner parent ref survives. |
 | `exitfunc(object)` | core | For actors: emit `outliner_left` plus mounted-room activity without mutating `focus_by_actor` or `last_undo`. Fresh-visit cleanup happens on the next `enterfunc`; keeping exit observation-only avoids shared-map conflicts on cross-scope movement commits. For items leaving this outliner by `moveto`, calls `_detach_item(object, {emit: true, clear_item: true})`. This re-homes direct children (one edge rewrite each) to the item's former parent, clears the moving item's edge so a destination outliner can place it as top-level, and emits `outline_item_removed`. Recycle does not call `exitfunc`; the item-level `:recycle` handler calls the same helper. |
-| `add_item(text, parent_id?, index?)` | anyone present | Composite: read the insert slot's bounded `ordered_neighbors(p, {index})` answer, `create($outline_item, {owner: actor, location: this})`, write ONE edge `{ parent: p, rank: rank_between(before, after) }`, then `set_text`. `parent_id` defaults to caller's focus (or `null` if focus is root). `index` chooses where among siblings; default is end. Emits `outline_item_added`. Sets caller's `last_undo` slot to `{verb: "remove_item", args: [new_item]}`. |
+| `add_item(text, parent_id?, index?)` | anyone present | Composite: read the insert slot's bounded `ordered_neighbors(p, {index}, this)` answer, `create($outline_item, {owner: actor, location: this})`, write ONE edge `{ parent: p, rank: rank_between(before, after) }`, then `set_text`. `parent_id` defaults to caller's focus (or `null` if focus is root). `index` chooses where among siblings; default is end. Emits `outline_item_added`. Sets caller's `last_undo` slot to `{verb: "remove_item", args: [new_item]}`. |
 | `set_item_text(item, text)` | item author / writers / wizard | Composite: capture old text for undo, call `item:set_text(text)`, and let inherited `$note:set_text` emit `note_edited`. The outliner does not re-emit text changes. Sets caller's `last_undo` slot to `{verb: "set_item_text", args: [item, old_text]}`. |
 | `move_item(item, new_parent_id, index?)` | anyone present | Re-parent and/or reorder. `new_parent_id == null` means root. Validates same-outliner and no-cycle (raises `E_CYCLE` if `new_parent_id` is `item` or a descendant). Reads the destination slot's bounded `ordered_neighbors` answer (a same-parent move gets old slot + destination neighbours from ONE query, excluding the moving item; a cross-parent move adds a child-slot query on the old parent), computes ONE fractional rank at the target `index`, and writes the item's single edge `{ new_parent, rank }` — the old-parent siblings keep their ranks (no renumber). Idempotent at current `(parent, index)`: no-op. Emits **exactly one** `outline_item_moved`. Sets caller's `last_undo` slot to `{verb: "move_item", args: [item, old_parent, old_index]}`. |
 | `reorder_item(item, index)` | anyone present | Intra-sibling reorder. Same as `move_item` with the current parent, but emits the distinct `outline_item_reordered` so UIs can animate intra-sibling motion separately. Idempotent. Sets caller's `last_undo` slot to `{verb: "reorder_item", args: [item, old_index]}`. |
@@ -220,7 +222,7 @@ directly; everything routes through the outliner surface.
 | `_detach_item(item, opts?)` | internal | Shared cleanup helper. Reads the item's edge parent, re-homes its DIRECT children (one appended edge each) to that former parent, optionally clears the item's own edge (`{ parent: null, rank: "" }`), and optionally emits one `outline_item_removed`. Idempotent enough for recycle paths: if there are no direct children left, it only performs the remaining clear/emit work requested by `opts`. |
 | `remove_item(item)` | item owner / wizard | Controller path. Captures the full restorable state — see "Undo capture" below — then calls `recycle(item)`. `$outline_item:recycle` calls `_detach_item` before the item is tombstoned, so children are reparented on the same cleanup path used by direct recycle. Sets caller's `last_undo` slot to `{verb: "_restore_item", args: [<captured_state>]}` after recycle succeeds. The restored item from undo is a *new* objref. |
 | `eject_item(item)` | outliner owner / wizard | Curator path: bypasses author-only gate. Same recycle path as `remove_item`, except eject does *not* touch the ejecting curator's `last_undo` slot. |
-| `_restore_item(state)` | (internal; called only by undo) | Re-create an item from a captured state record. Creates with `{owner, name, description, location: this}`, writes ONE edge at the captured `index` under the captured parent (bounded `ordered_neighbors` slot answer; the index CLAMPS into range — restore is best-effort placement, never a range error), then restores `hidden`, `writers`, and text. Then each child captured in `state.children` is moved back under the restored item at its captured index via `move_item` (one `outline_item_moved` each). Sets caller's `last_undo` slot to `{verb: "remove_item", args: [new_item]}`. Returns the new item objref. |
+| `_restore_item(state)` | (internal; called only by undo) | Re-create an item from a captured state record. Creates with `{owner, name, description, location: this}`, writes ONE edge at the captured `index` under the captured parent (bounded `ordered_neighbors(parent, query, this)` slot answer; the index CLAMPS into range — restore is best-effort placement, never a range error), then restores `hidden`, `writers`, and text. Then each child captured in `state.children` is moved back under the restored item at its captured index via `move_item` (one `outline_item_moved` each). Sets caller's `last_undo` slot to `{verb: "remove_item", args: [new_item]}`. Returns the new item objref. |
 | `undo()` | actor | Read the actor's `last_undo` slot, clear it, dispatch the inverse op. Emits `outline_undone` with the consumed record. No-op (and no observation) if the slot is empty. |
 | `focus_on(item?)` | actor | Set `focus_by_actor[actor] = item` (or `null` if no arg). Validates that `item` is in this outliner. Emits `outline_focus_changed` directed to the actor only. |
 
@@ -760,7 +762,11 @@ Two catalog-version migrations ship with the outliner:
   ordering each group by `(position, then item id)` for a total, reproducible
   tie-break, and assigning fractional ranks in that order — then drops the
   legacy `.parent`/`.position` props so there is no second write path. It is
-  idempotent: re-deriving from the same input yields byte-identical ranks.
+  idempotent: re-deriving from the same legacy input yields byte-identical
+  ranks, and replay after the legacy properties have been dropped recognizes a
+  complete, valid existing edge index and preserves it byte-for-byte. Partial,
+  malformed, cyclic, or duplicate-rank indexes are repaired from legacy input
+  when that input is still available.
 
   The derivation runs as a generic, parameterised migration step,
   `reindex_ordered_edges` (`src/core/catalog-installer`), which knows nothing of
@@ -770,7 +776,8 @@ Two catalog-version migrations ship with the outliner:
   flow, and it reads the legacy props BEFORE the following `drop_property`
   steps remove them. The migration + its four validations (no duplicate edges,
   no dangling parents, no cycles, stable ordering) are test-run on a local
-  SQLite woo in `tests/outliner-migration.test.ts`.
+  SQLite woo in `tests/outliner-migration.test.ts`, including same-world replay
+  after `.parent` and `.position` are gone.
 
 No local-boot migration, DO migration, or spec-version bump is required for
 either.

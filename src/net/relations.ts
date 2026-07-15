@@ -2,15 +2,19 @@
  * Relations — derived rows with one write path (coherence.md CO13, CO9).
  *
  * A relation row materializes a fact that is DEFINED by authority cells
- * (contents by `live:location`, presence by session-scope transitions)
+ * (contents by `live:location`, presence by session-scope transitions,
+ * ordered edges by the child's authored edge plus current container)
  * and is derived at exactly one place: the committing scope, from the
  * accepted transcript. Rows whose owner object is anchored elsewhere are
  * delivered to the owning scope (the shell's /net/relate, riding the
  * durable outbox); nothing ever writes a relation row from a second
- * source. Rows are rebuildable from authority cells (the bounded repair
- * path — CO13), which is what makes them projections rather than truth.
+ * source. Local contents rows rebuild from local authority cells; foreign
+ * presence and ordered-edge rows re-derive at their defining immutable anchor
+ * and return through this same delivery path. No relation row becomes truth or
+ * acquires a second writer (CO13).
  */
 import { cellKey, type Cell, type CellStore } from "./cells";
+import { ORDERED_EDGE_PROP, ORDERED_EDGE_RELATION, readOrderedEdge } from "./ordered-edges";
 import type { ApplyResult, EffectTranscript } from "./transcript";
 
 export type RelationRow = {
@@ -87,6 +91,12 @@ export function deriveRelationDeltas(
   post?: Pick<CellStore, "get">
 ): DerivedRelationDeltas {
   const deltas = new Map<string, RelationDelta>();
+  const orderedEdgeWriters = new Set(
+    transcript.writes
+      .filter((write) => write.cell.kind === "prop" && write.cell.name === ORDERED_EDGE_PROP)
+      .map((write) => write.cell.object)
+  );
+  const movedObjects = new Set((transcript.moves ?? []).map((move) => move.object));
   const put = (op: "add" | "remove", relation: string, owner: string, member: string, body?: unknown) => {
     if (!owner || !member) return;
     // Set semantics: one final delta per (op, row); a later opposite op
@@ -111,6 +121,36 @@ export function deriveRelationDeltas(
   for (const move of transcript.moves ?? []) {
     if (move.from) put("remove", "contents", move.from, move.object);
     put("add", "contents", move.to, move.object);
+
+    // Ordered edges remain authored cells at the child's immutable anchor.
+    // When the child crosses containers, project its final edge into the
+    // destination owner's index and retract the source row. This keeps
+    // ordered_children(container roots) complete without re-anchoring or a
+    // forbidden global scan.
+    const edgeCell = post?.get(cellKey("property_cell", move.object, ORDERED_EDGE_PROP));
+    const edge = edgeCell ? readOrderedEdge(edgeCell.value) : null;
+    // Ordinary moved objects have no ordered-edge row to retract. Gate this
+    // relation family on either a surviving edge or an edge write (the latter
+    // covers a hook that cleared the edge while leaving no post cell).
+    if (edge || orderedEdgeWriters.has(move.object)) {
+      if (move.from) put("remove", ORDERED_EDGE_RELATION, move.from, move.object);
+      if (edge) put("add", ORDERED_EDGE_RELATION, move.to, move.object, edge);
+    }
+  }
+  // An in-place reparent/reorder updates the same owner row. Local children
+  // are also readable directly from cells; storing the relation uniformly
+  // makes a later cross-container move a simple remove/add transition.
+  for (const write of transcript.writes) {
+    if (write.cell.kind !== "prop" || write.cell.name !== ORDERED_EDGE_PROP || !post) continue;
+    const live = post.get(cellKey("object_live", write.cell.object))?.value as { location?: unknown } | undefined;
+    if (typeof live?.location !== "string" || !live.location) continue;
+    const edgeCell = post.get(cellKey("property_cell", write.cell.object, ORDERED_EDGE_PROP));
+    const edge = edgeCell ? readOrderedEdge(edgeCell.value) : null;
+    if (edge) put("add", ORDERED_EDGE_RELATION, live.location, write.cell.object, edge);
+    // A moved-and-cleared edge was retracted from its SOURCE above. Do not mint
+    // a redundant removal at the destination/$nowhere merely because its live
+    // cell already reflects the move.
+    else if (!movedObjects.has(write.cell.object)) put("remove", ORDERED_EDGE_RELATION, live.location, write.cell.object);
   }
   const presenceBody = (actor: string, session: string, fallbackName?: string): SessionPresenceBody => {
     const nameCell = post?.get(cellKey("property_cell", actor, "name"))?.value as { value?: unknown } | undefined;

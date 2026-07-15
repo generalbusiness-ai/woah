@@ -24,6 +24,7 @@ import {
 import { planTurn, WARM_ENVELOPE_BYTE_LIMIT } from "../../src/net/plan";
 import type { ScopeClassifier } from "../../src/net/route";
 import { ScopeSequencer } from "../../src/net/scope";
+import { InMemoryScopeStore } from "../../src/net/scope-store";
 import { propertyCellPayload } from "../../src/net/transcript";
 
 const SCOPE = "home";
@@ -148,7 +149,7 @@ describe("owner-computed ordered-children projection in planning", () => {
       base: seq.head(),
       idempotencyKey: "oc-120",
       stamp: seq.stamp(),
-      planningOrderedChildren: [{ parent: "the_list", scope: SCOPE, rows, version: "v0" }]
+      planningOrderedChildren: [{ container: "#-1", parent: "the_list", scope: SCOPE, rows, version: "v0" }]
     });
 
     // The verb returned the full ordered projection...
@@ -191,7 +192,7 @@ describe("owner-computed ordered-children projection in planning", () => {
 
     await expect(planOnce).rejects.toMatchObject({
       code: "E_MISSING_STATE",
-      detail: { missing_ordered_children: ["the_list"] }
+      detail: { missing_ordered_children: [{ container: "#-1", parent: "the_list" }] }
     });
   });
 
@@ -244,7 +245,7 @@ describe("owner-computed ordered-children projection in planning", () => {
     // bogus "swallowed" result.
     await expect(planOnce).rejects.toMatchObject({
       code: "E_MISSING_STATE",
-      detail: { missing_ordered_children: ["the_list"] }
+      detail: { missing_ordered_children: [{ container: "#-1", parent: "the_list" }] }
     });
   });
 
@@ -420,10 +421,11 @@ describe("bounded neighbour answers (orderedNeighborsFromRows, P2.4)", () => {
 
   it("keys a query canonically (repair install and re-planned read agree)", () => {
     const q = { parent: "p1", index: 3, exclude: "x", child: "x" };
-    expect(orderedNeighborsQueryKey(q)).toBe(orderedNeighborsQueryKey({ ...q }));
-    expect(orderedNeighborsQueryKey(q)).not.toBe(orderedNeighborsQueryKey({ ...q, index: null }));
-    expect(orderedNeighborsQueryKey({ parent: null, index: null, exclude: null, child: null }))
-      .not.toBe(orderedNeighborsQueryKey({ parent: "null", index: null, exclude: null, child: null }));
+    expect(orderedNeighborsQueryKey("scope-a", q)).toBe(orderedNeighborsQueryKey("scope-a", { ...q }));
+    expect(orderedNeighborsQueryKey("scope-a", q)).not.toBe(orderedNeighborsQueryKey("scope-a", { ...q, index: null }));
+    expect(orderedNeighborsQueryKey("scope-a", q)).not.toBe(orderedNeighborsQueryKey("scope-b", q));
+    expect(orderedNeighborsQueryKey("scope-a", { parent: null, index: null, exclude: null, child: null }))
+      .not.toBe(orderedNeighborsQueryKey("scope-a", { parent: "null", index: null, exclude: null, child: null }));
   });
 });
 
@@ -472,5 +474,52 @@ describe("write-time-sorted per-parent edge index (Adv-b)", () => {
     expect(store.orderedEdgeChildren("p1")).toEqual([]);
     store.install(edge("a", null, "V")); // root ordering
     expect(store.orderedEdgeChildren(null)).toEqual([{ child: "a", rank: "V" }]);
+  });
+});
+
+describe("write-time-sorted foreign ordered-edge relation index", () => {
+  it("isolates container/parent buckets and relocates an overwritten child", () => {
+    const durable = new InMemoryScopeStore();
+    const seq = new ScopeSequencer(SCOPE, EPOCH, { durable });
+    const add = (owner: string, child: string, parent: string | null, rank: string) => ({
+      op: "add" as const,
+      row: { relation: "ordered_edge", owner, member: child, body: { parent, rank } }
+    });
+
+    // Deliver out of order: the sequencer indexes at write time, so reads do
+    // no whole-relation scan and no per-request sort.
+    seq.applyForeignRelationDeltas([
+      add("outline-a", "c", null, "n"),
+      add("outline-a", "a", null, "V"),
+      add("outline-a", "b", "parent-1", "hV"),
+      add("outline-b", "z", null, "V")
+    ]);
+    expect(seq.orderedChildren("outline-a", null)).toEqual([
+      { child: "a", rank: "V" },
+      { child: "c", rank: "n" }
+    ]);
+    expect(seq.orderedChildren("outline-a", "parent-1")).toEqual([{ child: "b", rank: "hV" }]);
+    expect(seq.orderedChildren("outline-b", null)).toEqual([{ child: "z", rank: "V" }]);
+
+    // The relation key is (owner, child), so reparenting overwrites the row;
+    // the reverse index must retract the prior bucket before inserting anew.
+    seq.applyForeignRelationDeltas([add("outline-a", "a", "parent-1", "s")]);
+    expect(seq.orderedChildren("outline-a", null)).toEqual([{ child: "c", rank: "n" }]);
+    expect(seq.orderedChildren("outline-a", "parent-1")).toEqual([
+      { child: "b", rank: "hV" },
+      { child: "a", rank: "s" }
+    ]);
+
+    seq.applyForeignRelationDeltas([{
+      op: "remove",
+      row: { relation: "ordered_edge", owner: "outline-a", member: "a", body: { parent: "parent-1", rank: "s" } }
+    }]);
+    expect(seq.orderedChildren("outline-a", "parent-1")).toEqual([{ child: "b", rank: "hV" }]);
+
+    // The sorted projection index is reconstructed from durable relation rows
+    // after a cold start; it is not an in-memory-only optimization.
+    const rehydrated = new ScopeSequencer(SCOPE, EPOCH, { durable });
+    expect(rehydrated.orderedChildren("outline-a", null)).toEqual([{ child: "c", rank: "n" }]);
+    expect(rehydrated.orderedChildren("outline-a", "parent-1")).toEqual([{ child: "b", rank: "hV" }]);
   });
 });

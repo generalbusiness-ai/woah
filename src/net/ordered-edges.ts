@@ -1,8 +1,8 @@
 /**
- * Ordered-edge index — a room-owned, authored authority cell per child
+ * Ordered-edge index — an authored authority cell per child
  * that records the child's parent and its fractional rank among its
- * siblings, plus the owner-side reduction that turns a scope's edge cells
- * into ONE bounded ordered-children value.
+ * siblings, plus the owner-side reduction that turns local edge cells and
+ * foreign-child relation rows into ONE bounded container ordering.
  *
  * This is the read-bounded replacement for reading every sibling's
  * `parent`/`position` property and renumbering them on every insert (the
@@ -18,11 +18,10 @@
  *
  * WHY this shape (deliverable 2):
  *
- *  (a) Room-scope-owned. A child item is anchored to its room's scope, so
- *      the child's cells — this edge included — are sequenced by that one
- *      room-scope authority. Ordering therefore has a single owner (no
- *      cross-scope dual write), exactly like presence rows living at the
- *      room's scope.
+ *  (a) Single authored owner. The edge stays with the child's immutable
+ *      anchor. If the child moves to another container scope, CO13 projects
+ *      that fact as an `ordered_edge` relation at the container owner; the
+ *      relation is rebuildable and never becomes a second authority write.
  *
  *  (b) Keyed by child. `object = child` makes the by-child lookup O(1):
  *      `cellKey("property_cell", child, ORDERED_EDGE_PROP)` yields the
@@ -43,7 +42,7 @@
  *      fields) and version-stable like any other property.
  *
  * Reads NEVER pull the edge cells into a turn's attestable closure: the
- * ordered-children value is computed OWNER-SIDE by `orderedChildrenRows`
+ * ordered-children value is computed OWNER-SIDE by `orderedChildrenForContainer`
  * and installed only in the ephemeral planning world (see the
  * `ordered_children` builtin + `planningOrderedChildren`), precisely as the
  * roster is. The only edge cell a mutation touches is the ONE it writes.
@@ -52,20 +51,33 @@ import {
   ORDERED_EDGE_PROP,
   orderedNeighborsFromRows,
   orderedNeighborsQueryKey,
+  orderedProjectionKey,
   type OrderedChildRow,
   type OrderedEdgeValue,
   type OrderedNeighborsQuery,
+  type OrderedNeighborsRequest,
+  type OrderedProjectionKey,
   type OrderedNeighborsValue
 } from "../core/ordered-edge";
 import { cellKey, cellVersion, type Cell } from "./cells";
+import type { CellStore } from "./cells";
+
+/** Derived owner projection used when an ordered child is anchored outside
+ * its current container's scope. The authored edge cell remains truth at the
+ * child's immutable anchor; this row makes the container's bounded index
+ * complete without global enumeration. */
+export const ORDERED_EDGE_RELATION = "ordered_edge";
 
 export {
   ORDERED_EDGE_PROP,
   orderedNeighborsFromRows,
   orderedNeighborsQueryKey,
+  orderedProjectionKey,
   type OrderedChildRow,
   type OrderedEdgeValue,
   type OrderedNeighborsQuery,
+  type OrderedNeighborsRequest,
+  type OrderedProjectionKey,
   type OrderedNeighborsValue
 };
 
@@ -127,4 +139,48 @@ export function orderedChildrenRows(cells: Iterable<Cell>, parent: string | null
  */
 export function orderedChildrenVersion(rows: readonly OrderedChildRow[]): string {
   return cellVersion(rows as unknown[]);
+}
+
+/** Complete ordering for one container: locally-anchored edge cells whose
+ * authoritative location is this container, overlaid with the already-indexed
+ * owner-delivered rows for foreign-anchored children. Both inputs derive from
+ * the same authored edge/location facts; the relation is a rebuildable
+ * projection. The caller supplies only this `(container, parent)` relation
+ * bucket, preserving the O(children-of-parent) bound. */
+export function orderedChildrenForContainer(
+  store: Pick<CellStore, "orderedEdgeChildren" | "get">,
+  projectedChildren: Iterable<OrderedChildRow>,
+  container: string,
+  parent: string | null
+): OrderedChildRow[] {
+  const projected = [...projectedChildren];
+  const projectedIds = new Set(projected.map((row) => row.child));
+  const local: OrderedChildRow[] = [];
+  for (const row of store.orderedEdgeChildren(parent)) {
+    const live = store.get(cellKey("object_live", row.child))?.value as { location?: unknown } | undefined;
+    // Relation projection wins if a duplicate exists. Local children normally
+    // have an identical derived row; preferring it also makes a delivered
+    // relation update atomic from this reader's perspective.
+    if (live?.location === container && !projectedIds.has(row.child)) local.push(row);
+  }
+  // Both indexes are maintained in this exact total order at write time. A
+  // linear merge preserves the no-per-request-sort Adv-b contract.
+  const out: OrderedChildRow[] = [];
+  let localAt = 0;
+  let projectedAt = 0;
+  while (localAt < local.length || projectedAt < projected.length) {
+    if (projectedAt >= projected.length) {
+      out.push(local[localAt++]);
+      continue;
+    }
+    if (localAt >= local.length) {
+      out.push(projected[projectedAt++]);
+      continue;
+    }
+    const a = local[localAt];
+    const b = projected[projectedAt];
+    if (a.rank < b.rank || (a.rank === b.rank && a.child < b.child)) out.push(local[localAt++]);
+    else out.push(projected[projectedAt++]);
+  }
+  return out;
 }

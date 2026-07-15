@@ -61,4 +61,4 @@ ended.
 
 See [DESIGN.md](DESIGN.md) for the full behavior contract — class
 shapes, verb signatures, observation envelopes, undo capture, the
-sibling-rank renumbering scheme, and the test plan.
+fractional sibling-ranking scheme, and the test plan.

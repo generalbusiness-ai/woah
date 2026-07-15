@@ -56,6 +56,7 @@ import {
   orderedEdgeFromPropertyValue,
   orderedNeighborsFromRows,
   orderedNeighborsQueryKey,
+  orderedProjectionKey,
   type OrderedChildRow,
   type OrderedEdgeValue,
   type OrderedNeighborsQuery
@@ -648,10 +649,10 @@ export class WooWorld {
   // sparse by construction, so a local fallback would be a plausible-looking
   // partial roster rather than a safe degradation.
   private requireRoomRosterProjection = false;
-  /** Owner-computed ordered-children values (one bounded list per parent),
+  /** Owner-computed ordered-children values (one bounded list per container + parent),
    * the ordering analogue of `roomRosterProjections`. Installed only in an
-   * ephemeral planning world; keyed by the parent ref (null → the sentinel
-   * below for ordering roots). */
+   * ephemeral planning world. Container is essential for ordering roots: two
+   * independent roots both have `parent: null`. */
   private readonly orderedChildrenProjections = new Map<string, WooValue[]>();
   /** Owner-answered bounded neighbour queries (P2.4), keyed by the canonical
    * query key. A mutation's slot read resolves here so a wide parent never
@@ -781,14 +782,9 @@ export class WooWorld {
   // pulling every sibling's edge cell into the turn's read closure. Only the
   // ephemeral planning world holds these; they never persist or export.
 
-  /** null parent (an ordering root) maps to a reserved, un-ref-like key. */
-  private static orderedChildrenKey(parent: ObjRef | null): string {
-    return parent === null ? "\0ordered_root" : parent;
-  }
-
-  installOrderedChildrenProjection(parent: ObjRef | null, rows: readonly Record<string, unknown>[]): void {
+  installOrderedChildrenProjection(container: ObjRef, parent: ObjRef | null, rows: readonly Record<string, unknown>[]): void {
     this.orderedChildrenProjections.set(
-      WooWorld.orderedChildrenKey(parent),
+      orderedProjectionKey(container, parent),
       cloneImportedPlainData(rows) as WooValue[]
     );
   }
@@ -812,12 +808,13 @@ export class WooWorld {
    * derives the ordering by scanning objects' local edge property — the
    * ordering analogue of `roomRosterProjection`'s local-session fallback. */
   orderedChildrenProjection(parent: ObjRef | null, container: ObjRef | null = null): WooValue[] {
-    const projected = this.orderedChildrenProjections.get(WooWorld.orderedChildrenKey(parent));
+    const projectionKey = container === null ? null : orderedProjectionKey(container, parent);
+    const projected = projectionKey === null ? undefined : this.orderedChildrenProjections.get(projectionKey);
     if (projected !== undefined) {
       // R1: the installed rows are a PRE-TURN authority snapshot; overlay
       // this run's own edge writes when any touch this parent's ordering.
-      return this.orderingAffectedThisRun(parent)
-        ? this.overlaySameRunEdges(projected as unknown as readonly Record<string, unknown>[], parent)
+      return this.orderingAffectedThisRun(container, parent)
+        ? this.overlaySameRunEdges(projected as unknown as readonly Record<string, unknown>[], container, parent)
         : cloneImportedPlainData(projected);
     }
 
@@ -825,7 +822,7 @@ export class WooWorld {
       // A parent created THIS run has no authority ordering to fetch — its
       // children are exactly this run's own edge writes (R1).
       if (parent !== null && this.createdThisRun.has(parent)) {
-        return this.overlaySameRunEdges([], parent);
+        return this.overlaySameRunEdges([], container, parent);
       }
       // The parent rides in `value` so the planner/gateway can name exactly
       // which projection to fetch. Distinct code (not E_NEED_STATE) so it
@@ -833,7 +830,7 @@ export class WooWorld {
       throw wooError(
         "E_NEED_ORDERED_CHILDREN",
         `ordered-children projection not resident for ${parent ?? "<root>"}`,
-        { parent }
+        { container, parent }
       );
     }
 
@@ -858,9 +855,9 @@ export class WooWorld {
     return rows as unknown as WooValue[];
   }
 
-  installOrderedNeighborsProjection(query: OrderedNeighborsQuery, value: Record<string, unknown>): void {
+  installOrderedNeighborsProjection(container: ObjRef, query: OrderedNeighborsQuery, value: Record<string, unknown>): void {
     this.orderedNeighborsProjections.set(
-      orderedNeighborsQueryKey(query),
+      orderedNeighborsQueryKey(container, query),
       cloneImportedPlainData(value) as WooValue
     );
   }
@@ -887,16 +884,16 @@ export class WooWorld {
     // pre-turn O(1) answer for it is stale — resolve via the FULL ordering
     // (installed + overlay, created-run synthesis, or the ordered-children
     // escalation miss) so this turn's writes participate in the slot answer.
-    if (this.orderingAffectedThisRun(parent)) {
+    if (this.orderingAffectedThisRun(container, parent)) {
       const rows = this.orderedChildrenProjection(parent, container) as unknown as OrderedChildRow[];
       return orderedNeighborsFromRows(rows, query) as unknown as WooValue;
     }
 
     const full: OrderedNeighborsQuery = { parent, index: query.index, exclude: query.exclude, child: query.child };
-    const installed = this.orderedNeighborsProjections.get(orderedNeighborsQueryKey(full));
+    const installed = container === null ? undefined : this.orderedNeighborsProjections.get(orderedNeighborsQueryKey(container, full));
     if (installed !== undefined) return cloneImportedPlainData(installed);
 
-    const residentOrdering = this.orderedChildrenProjections.get(WooWorld.orderedChildrenKey(parent));
+    const residentOrdering = container === null ? undefined : this.orderedChildrenProjections.get(orderedProjectionKey(container, parent));
     if (residentOrdering !== undefined) {
       return orderedNeighborsFromRows(residentOrdering as unknown as OrderedChildRow[], query) as unknown as WooValue;
     }
@@ -908,7 +905,7 @@ export class WooWorld {
       throw wooError(
         "E_NEED_ORDERED_NEIGHBORS",
         `ordered-neighbours answer not resident for ${parent ?? "<root>"}`,
-        { parent, index: query.index, exclude: query.exclude, child: query.child }
+        { container, parent, index: query.index, exclude: query.exclude, child: query.child }
       );
     }
 
@@ -944,12 +941,12 @@ export class WooWorld {
    * writer now lives under it, previously lived under it, has an unknown
    * pre-state, or the parent itself was created this run (its authority
    * ordering cannot exist, so only same-run writes can populate it). */
-  private orderingAffectedThisRun(parent: ObjRef | null): boolean {
+  private orderingAffectedThisRun(container: ObjRef | null, parent: ObjRef | null): boolean {
     if (parent !== null && this.createdThisRun.has(parent)) return true;
     if (this.orderedEdgeWritesThisRun.size === 0) return false;
     for (const [child, prior] of this.orderedEdgeWritesThisRun) {
       const current = this.currentOrderedEdge(child);
-      if (current && current.parent === parent) return true;
+      if (current && current.parent === parent && (container === null || this.objects.get(child)?.location === container)) return true;
       if (!prior.known) return true;
       if (prior.known && prior.member && prior.parent === parent) return true;
     }
@@ -961,7 +958,7 @@ export class WooWorld {
    * CURRENT edge lives under `parent`, and re-sort with the shared
    * (rank, child) comparator so the answer matches what the authority will
    * derive after this turn's transcript applies. */
-  private overlaySameRunEdges(rows: readonly Record<string, unknown>[], parent: ObjRef | null): WooValue[] {
+  private overlaySameRunEdges(rows: readonly Record<string, unknown>[], container: ObjRef | null, parent: ObjRef | null): WooValue[] {
     const out: { child: string; rank: string }[] = [];
     for (const row of rows) {
       const child = (row as { child?: unknown }).child;
@@ -970,7 +967,9 @@ export class WooWorld {
     }
     for (const child of this.orderedEdgeWritesThisRun.keys()) {
       const current = this.currentOrderedEdge(child);
-      if (current && current.parent === parent) out.push({ child, rank: current.rank });
+      if (current && current.parent === parent && (container === null || this.objects.get(child)?.location === container)) {
+        out.push({ child, rank: current.rank });
+      }
     }
     out.sort((a, b) => (a.rank < b.rank ? -1 : a.rank > b.rank ? 1 : a.child < b.child ? -1 : a.child > b.child ? 1 : 0));
     return out as unknown as WooValue[];
@@ -6527,6 +6526,11 @@ export class WooWorld {
     try {
       await this.dispatch({ ...ctx, caller: ctx.thisObj, callerPerms: ctx.progr }, target, name, args);
     } catch (err) {
+      // Sparse-planning misses are control signals, not hook failures. They
+      // must reach the gateway so it can fetch the missing owner projection
+      // and replay the WHOLE move; swallowing one would commit relocation
+      // while silently skipping the hook's ordered-edge writes/observations.
+      if (isUncatchableControlSignal(err)) throw err;
       if (isErrorValue(err) && err.code === "E_VERBNF") return; // hook absent
       // Per the spec, post-move hooks must not fail the move. Swallow
       // and continue. Wizards reading transcripts will still see the

@@ -2,7 +2,7 @@
   "from_version": "1.x.x",
   "to_version": "2.0.0",
   "spec_version": "v1",
-  "note": "v1 stored an item's tree shape in per-item `.parent` (objref|null) + dense `.position` (1..N). v2 makes the room-owned ordered-edge index (`__ordered_edge` = { parent, rank }) the SOLE structural authority. This migration derives each item's edge from its legacy (parent, position) — grouping siblings by (containing outliner, parent), ordering by (position, then item id for a total/reproducible tie-break), and assigning fractional ranks in that order — then drops the legacy props so there is no second write path. Idempotent: re-deriving from the same input yields byte-identical ranks.",
+  "note": "v1 stored an item's tree shape in per-item `.parent` (objref|null) + dense `.position` (1..N). v2 makes the room-owned ordered-edge index (`__ordered_edge` = { parent, rank }) the SOLE structural authority. This migration derives each item's edge from its legacy (parent, position) — grouping siblings by (containing outliner, parent), ordering by (position, then item id for a total/reproducible tie-break), and assigning fractional ranks in that order — then drops the legacy props so there is no second write path. Idempotent: a complete valid existing edge index is preserved byte-for-byte, including after the legacy inputs have been dropped.",
   "steps": [
     {
       "kind": "reindex_ordered_edges",

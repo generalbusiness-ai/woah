@@ -1,5 +1,6 @@
 import { analyzeBytecodePurity, combineVerbPurity, compileVerb, findUnresolvedThisCalls, propagateVerbPurity } from "./authoring";
 import { firstRank, rankAfter } from "./fractional-rank";
+import { orderedEdgeFromPropertyValue, type OrderedEdgeValue } from "./ordered-edge";
 import { hashSource } from "./source-hash";
 import { wooError, type ErrorValue, type ObjRef, type PresenceProjectionDef, type TinyBytecode, type VerbCallSite, type VerbDef, type WooValue } from "./types";
 import { normalizeVerbPerms } from "./verb-perms";
@@ -1648,6 +1649,14 @@ function reindexOrderedEdges(world: WooWorld, classRef: ObjRef, parentProp: stri
     (itemsInContainer.get(container) ?? itemsInContainer.set(container, new Set()).get(container)!).add(ref);
   }
 
+  // Migration steps may be replayed after their legacy source properties were
+  // already dropped (for example recovery after the transform completed but
+  // before the catalog ledger advanced). A complete valid edge index is the
+  // durable completion marker for THIS step. Preserve it byte-for-byte: using
+  // absent parent/position values as defaults would flatten the tree and sort
+  // siblings by id on the second run, violating migration idempotency.
+  if (validExistingOrderedEdgeIndex(world, items, containerOf, itemsInContainer, edgeProp)) return;
+
   // 2. Resolve each item's parent, repairing dangling / cross-container refs to
   //    root (P1.3): NEVER copy a parent blindly, or a node vanishes once the
   //    legacy source is dropped (v2 renders only from null-parent roots).
@@ -1720,6 +1729,45 @@ function reindexOrderedEdges(world: WooWorld, classRef: ObjRef, parentProp: stri
       `${repairs.cycle} cyclic parent(s) to root while building ${edgeProp} for ${classRef}`
     );
   }
+}
+
+/** Whether every placed item already participates in one structurally valid
+ * ordered-edge index. This is intentionally stricter than “has a map”: parents
+ * must stay in the same container, sibling ranks must be unique, and parent
+ * walks must terminate. A malformed or partial index therefore falls through
+ * to the legacy-data repair path instead of being mistaken for completion. */
+function validExistingOrderedEdgeIndex(
+  world: WooWorld,
+  items: readonly ObjRef[],
+  containerOf: ReadonlyMap<ObjRef, ObjRef>,
+  itemsInContainer: ReadonlyMap<ObjRef, ReadonlySet<ObjRef>>,
+  edgeProp: string
+): boolean {
+  if (items.length === 0) return false;
+  const edges = new Map<ObjRef, OrderedEdgeValue>();
+  const ranksByGroup = new Map<string, Set<string>>();
+  for (const ref of items) {
+    const edge = orderedEdgeFromPropertyValue(world.object(ref).properties.get(edgeProp));
+    if (!edge) return false;
+    const container = containerOf.get(ref)!;
+    if (edge.parent !== null && !itemsInContainer.get(container)?.has(edge.parent)) return false;
+    const group = `${container}\u0000${edge.parent ?? ""}`;
+    const ranks = ranksByGroup.get(group) ?? new Set<string>();
+    if (ranks.has(edge.rank)) return false;
+    ranks.add(edge.rank);
+    ranksByGroup.set(group, ranks);
+    edges.set(ref, edge);
+  }
+  for (const ref of items) {
+    const seen = new Set<ObjRef>();
+    let current: ObjRef | null = ref;
+    while (current !== null) {
+      if (seen.has(current)) return false;
+      seen.add(current);
+      current = edges.get(current)?.parent ?? null;
+    }
+  }
+  return true;
 }
 
 function transformPropertyLocal(world: WooWorld, objRef: ObjRef, name: string, transform: CatalogMigrationTransform): void {

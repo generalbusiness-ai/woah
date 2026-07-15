@@ -19,7 +19,8 @@ import { installLocalCatalogs } from "../src/core/local-catalogs";
 import { LocalSQLiteRepository } from "../src/server/sqlite-repository";
 
 const catalogsRoot = join(__dirname, "..", "catalogs");
-function readMigration(): NonNullable<Parameters<typeof updateCatalogManifest>[2]>["migration"] {
+type MigrationManifest = NonNullable<NonNullable<Parameters<typeof updateCatalogManifest>[2]>["migration"]>;
+function readMigration(): MigrationManifest {
   return JSON.parse(readFileSync(join(catalogsRoot, "outliner", "migration-v1-to-v2.json"), "utf8"));
 }
 function tempDb(): { dir: string; path: string } {
@@ -123,6 +124,24 @@ function migrate(world: ReturnType<typeof createWorld>): ReturnType<typeof updat
   return updateCatalogManifest(world, V2, { tap: "@local", alias: "outliner", acceptMajor: true, migration: readMigration() });
 }
 
+/** Replay the real reindex step after v2 has already dropped its source props.
+ * A synthetic next major lets the public migration pipeline execute the step
+ * again against the SAME world, which is the crash/recovery idempotency shape. */
+function replayReindex(world: ReturnType<typeof createWorld>): ReturnType<typeof updateCatalogManifest> {
+  const real = readMigration();
+  return updateCatalogManifest(world, { ...V2, version: "3.0.0" }, {
+    tap: "@local",
+    alias: "outliner",
+    acceptMajor: true,
+    migration: {
+      ...real,
+      from_version: "2.x.x",
+      to_version: "3.0.0",
+      steps: [real.steps[0]]
+    }
+  });
+}
+
 function edgeOf(world: ReturnType<typeof createWorld>, id: string): { parent: string | null; rank: string } {
   const e = world.propOrNull(id, "__ordered_edge") as { parent?: unknown; rank?: unknown } | null;
   expect(e && typeof e === "object", `item ${id} has no edge`).toBe(true);
@@ -220,6 +239,33 @@ describe("outliner v1 -> v2 migration", () => {
     // Ranks are strictly increasing in sibling order (a real total order).
     const roots = ["it_b", "it_c", "it_a"].map((id) => edgeOf(a, id).rank);
     for (let i = 1; i < roots.length; i += 1) expect(roots[i - 1] < roots[i]).toBe(true);
+  });
+
+  it("is idempotent on the SAME migrated SQLite world after legacy props are gone", () => {
+    const { dir, path } = tempDb();
+    try {
+      const repo = new LocalSQLiteRepository(path);
+      const world = createWorld({ repository: repo, catalogs: false });
+      buildAgedV1(world);
+      repo.transaction(() => migrate(world));
+      const before = new Map(AGED.map((item) => [item.id, edgeOf(world, item.id)]));
+
+      // This is the reviewer repro: execute reindex_ordered_edges again after
+      // drop_property removed both legacy inputs. It must recognize the valid
+      // edge index as completed rather than flattening everything to roots.
+      repo.transaction(() => replayReindex(world));
+      for (const item of AGED) expect(edgeOf(world, item.id)).toEqual(before.get(item.id));
+      expect(ordered(world, "mo", null)).toEqual(["it_b", "it_c", "it_a"]);
+      expect(ordered(world, "mo", "it_b")).toEqual(["it_x", "it_y"]);
+      repo.close();
+
+      const verifyRepo = new LocalSQLiteRepository(path);
+      const verifyWorld = createWorld({ repository: verifyRepo, catalogs: false });
+      for (const item of AGED) expect(edgeOf(verifyWorld, item.id)).toEqual(before.get(item.id));
+      verifyRepo.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   // P1.3 (reviewer repro): the migration must ENFORCE the four validations on
