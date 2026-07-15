@@ -24,7 +24,8 @@ const ALL_CODES: NetErrorCode[] = [
   "E_RPC_TIMEOUT",
   "E_SEED_LAG",
   "E_EPOCH_MISMATCH",
-  "E_SEED_COMMITTED"
+  "E_SEED_COMMITTED",
+  "E_INVARG"
 ];
 
 describe("net divergence taxonomy (CO6)", () => {

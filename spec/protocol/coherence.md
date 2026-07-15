@@ -121,6 +121,18 @@ that seam:
    their current scope name is `catalog`. Cross-invocation promises MUST NOT
    coalesce authority I/O: they join otherwise-independent platform request
    lineages and can violate the CO2.7 subrequest-depth bound.
+   **Ordering reads follow the same rule.** An owner-computed ordering read
+   (`ordered_children` / `ordered_neighbors`) records
+   `{parent, scope, version}` in the transcript's `orderingReads`, where
+   `scope` is the owning authority the answer was fetched from
+   (`parent: null` names exactly that scope's ordering roots). The
+   committing scope re-derives versions for entries it owns; a FOREIGN
+   entry validates against `orderings: [{parent, version}]` carried in the
+   same owner attestation (the `/net/attest` reply reports current ordering
+   versions alongside cell versions). A foreign ordering read with no
+   attestation rejects `rider_unattested`; a version mismatch rejects
+   `read_version_mismatch` with `ordering_conflicts`, and the gateway
+   re-fetches those parents' answers and re-plans.
 2. **Owner-sequenced adoption.** Rider writes reach their owner via
    `/net/adopt` and are applied as owner-ordered events with a per-cell
    prior-version CAS (the attested version the committing turn
@@ -359,6 +371,8 @@ divergence. Tail metrics count by code.
 | `E_SEED_LAG` | KV seed behind scope head | informational; consumer proceeds via head-check |
 | `E_EPOCH_MISMATCH` | durable catalog epochs genuinely disagree: a seed against a scope seeded at another epoch, or a turn whose stamp still differs from the scope's durable epoch AFTER the CO8 reseed | terminal; catalog install/migration reconciles (operator concern), never a retry treadmill |
 | `E_SEED_COMMITTED` | a seed targets a scope that has already committed turns | terminal; recover into a fresh namespace rather than resetting authority under an unchanged head |
+| `E_NONCONVERGENT_READ` | a recorded read cannot converge: the gateway refreshed a mismatched cell (or re-installed an ordering answer) to a STABLE authority version and re-planned, yet the re-plan re-recorded a version that still mismatches that same authority version — a planner/catalog-verb bug, not contention (contention moves the authority version each round and never trips this) | terminal and NAMED; surfaces the offending cell/ordering with the attempt trace instead of grinding to `E_BUDGET` |
+| `E_INVARG` | a malformed internal request field (wrong type or shape) | terminal for this request; refused with the offending field named — never silently coerced into a different-but-valid request |
 
 Retryable codes are turn mechanics and never user-visible as failures;
 terminal codes surface to the caller with structured detail and an attempt
