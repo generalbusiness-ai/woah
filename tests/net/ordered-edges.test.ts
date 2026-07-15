@@ -148,7 +148,7 @@ describe("owner-computed ordered-children projection in planning", () => {
       base: seq.head(),
       idempotencyKey: "oc-120",
       stamp: seq.stamp(),
-      planningOrderedChildren: [{ parent: "the_list", rows, version: "v0" }]
+      planningOrderedChildren: [{ parent: "the_list", scope: SCOPE, rows, version: "v0" }]
     });
 
     // The verb returned the full ordered projection...
@@ -424,5 +424,53 @@ describe("bounded neighbour answers (orderedNeighborsFromRows, P2.4)", () => {
     expect(orderedNeighborsQueryKey(q)).not.toBe(orderedNeighborsQueryKey({ ...q, index: null }));
     expect(orderedNeighborsQueryKey({ parent: null, index: null, exclude: null, child: null }))
       .not.toBe(orderedNeighborsQueryKey({ parent: "null", index: null, exclude: null, child: null }));
+  });
+});
+
+describe("write-time-sorted per-parent edge index (Adv-b)", () => {
+  // The per-parent index is maintained in (rank, child) order at write time,
+  // so orderedEdgeChildren never re-sorts. These pin the splice bookkeeping —
+  // the regression-prone part — under out-of-order installs, rank UPDATES
+  // (overwrite must relocate, never duplicate), re-parenting, clears, and
+  // deletes.
+  function edge(child: string, parent: string | null, rank: string) {
+    return edgeCell(child, parent, rank);
+  }
+
+  it("keeps rank order under out-of-order installs and tie-breaks by child id", () => {
+    const store = new CellStore("authority");
+    for (const [child, rank] of [["c", "n"], ["a", "V"], ["d", "n"], ["b", "hV"]] as const) {
+      store.install(edge(child, "p1", rank));
+    }
+    expect(store.orderedEdgeChildren("p1")).toEqual([
+      { child: "a", rank: "V" },
+      { child: "b", rank: "hV" },
+      { child: "c", rank: "n" }, // rank tie with d — child id breaks it
+      { child: "d", rank: "n" }
+    ]);
+  });
+
+  it("relocates (never duplicates) a child whose rank is overwritten", () => {
+    const store = new CellStore("authority");
+    store.install(edge("a", "p1", "V"));
+    store.install(edge("b", "p1", "n"));
+    store.install(edge("a", "p1", "s")); // a moves after b
+    expect(store.orderedEdgeChildren("p1")).toEqual([
+      { child: "b", rank: "n" },
+      { child: "a", rank: "s" }
+    ]);
+  });
+
+  it("moves a re-parented child between arrays and drops a cleared edge", () => {
+    const store = new CellStore("authority");
+    store.install(edge("a", "p1", "V"));
+    store.install(edge("b", "p1", "n"));
+    store.install(edge("a", "p2", "V")); // re-parent
+    expect(store.orderedEdgeChildren("p1")).toEqual([{ child: "b", rank: "n" }]);
+    expect(store.orderedEdgeChildren("p2")).toEqual([{ child: "a", rank: "V" }]);
+    store.install(edge("b", null, "")); // cleared edge = detached
+    expect(store.orderedEdgeChildren("p1")).toEqual([]);
+    store.install(edge("a", null, "V")); // root ordering
+    expect(store.orderedEdgeChildren(null)).toEqual([{ child: "a", rank: "V" }]);
   });
 });
