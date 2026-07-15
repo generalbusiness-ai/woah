@@ -12,12 +12,11 @@ implementations.
 
 ## Connect
 
-The legacy `/ws` plug transport has been removed. Production plug
-integrations should use the catalog-specific HTTP/MCP surface for the
-block they drive until the v2 plug transport is specified. Keep using an
-apikey credential for non-human agents; authenticate by posting it to
-`/api/auth` and use the returned session with the relevant REST or MCP
-calls.
+Production plugs use the net client surface. Keep the block-bound apikey in
+the plug's secret store, mint a session with `POST /net-api/session` and
+`Authorization: Bearer apikey:<id>:<secret>`, then use that same credential
+plus the returned session for exact cell reads and `/net-api/turn` calls.
+Operational verbs do not need to be exposed as MCP tools.
 
 ## What apikey to use
 
@@ -38,13 +37,13 @@ to the horoscope dispenser.
 
 ## Push data
 
-Once authenticated, the plug calls `:set_property` on the block to
-push data:
+Once authenticated, the plug calls `:set_property` on the block through a
+sequenced net turn:
 
 ```json
 {
-  "type": "call",
-  "id": "<correlation-id>",
+  "session": "<net-session>",
+  "idempotency_key": "<stable-correlation-id>",
   "target": "<block-id>",
   "verb": "set_property",
   "args": ["current", {"temperature": 18, "condition": "partly cloudy"}]
@@ -62,44 +61,29 @@ Each `:set_property` call:
 3. Emits a `block_data` observation to the block's room and to
    anyone focused on the block.
 
-The wire frame for the set_property call returns either a `result`
-(direct call) or `applied` frame (sequenced) depending on the verb's
-declaration.
+An accepted response has `reply.status: "accepted"` and carries the verb's
+`result` and observations. A rejected response carries a named error.
 
-## Listen for verb calls
+## Drain queued work
 
-The plug subscribes to its own block's room (which it does by
-default — the block's actor is in the room). It receives `event`
-frames for any verb call routed to the block, including `:ask`
-queries and `:order` requests.
-
-```json
-{
-  "type": "event",
-  "event": {
-    "type": "ask_request",
-    "source": "<block>",
-    "actor": "<requester>",
-    "query": "<the question>",
-    "request_id": "<correlation-id>"
-  }
-}
-```
-
-The plug processes the request (calling its external system), then
-responds via another verb call back to the block:
+Dispenser-style blocks persist requests in a catalog-defined queue. A
+scheduled plug calls the block's private queue-drain verb (for example
+`:next_pending`), processes the returned order, then calls the matching
+completion verb:
 
 ```json
 {
-  "type": "call",
+  "session": "<net-session>",
+  "idempotency_key": "deliver:<request_id>",
   "target": "<block>",
   "verb": "ask_reply",
   "args": ["<request_id>", {"answer": "..."}]
 }
 ```
 
-The block routes the answer back to the requester (typically by
-emitting an observation directed at the requesting actor).
+The block routes the answer back to the requester (typically by minting an
+artifact and emitting a directed observation). Queue verbs can remain hidden
+from MCP discovery because the actor-bound plug invokes them through net turns.
 
 The exact shape (`ask_request` / `ask_reply`, or
 `order_placed` / `deliver`) is class-defined. Read the block's
@@ -108,24 +92,11 @@ class source and the dispenser pattern in
 
 ## React to config changes
 
-Config properties are owner-writable. When the owner changes a
-config property, the plug sees a `block_data` observation with
-`kind: "config"`:
-
-```json
-{
-  "type": "block_data",
-  "source": "<block>",
-  "name": "place",
-  "value": "New York, NY",
-  "kind": "config",
-  "ts": ...
-}
-```
-
-The plug should react: re-fetch with the new config, restart any
-schedule, etc. **The plug doesn't poll for config changes** — it
-listens.
+Config properties are owner-writable. Scheduled plugs read the exact required
+`property_cell:<block>:<name>` cells through `/net-api/cell` on each tick (or
+through a short, explicit cache). Persistent plugs may additionally use the
+net WebSocket observation feed as an invalidation signal, but must re-read
+authoritative cells after a change.
 
 ## Connection modes
 
@@ -151,10 +122,9 @@ mode if you wanted to ask it about other locations or hours.
 
 ## Idempotency and retry
 
-Use a stable `id` on every `call` frame. If you lose the connection
-mid-call, reconnect and re-send with the same `id`; the gateway
-returns the cached result for direct calls, or the same applied
-frame for sequenced calls (5-minute cache window).
+Use a stable `idempotency_key` on every `/net-api/turn`. If you lose the
+connection mid-call, re-send with the same key; the committing scope returns
+the recorded result instead of executing the effect twice.
 
 For a scheduled push, **don't push the same data twice with the
 same `last_pushed_at`** — the timestamp is your truth-of-recency
@@ -182,13 +152,18 @@ In rough pseudo-code (real implementations have reconnection,
 backoff, observability):
 
 ```python
-session = post("https://deployment/api/auth", {"token": "apikey:..."})["session"]
+token = "apikey:<id>:<secret>"
+session = post("https://deployment/net-api/session", {}, bearer=token)["session"]
 
 while True:
     data = fetch_external()
-    post("https://deployment/api/objects/the_my_block/calls/set_properties", {
-        "args": [{"current": data, "last_pushed_at": now_ms()}]
-    }, session=session)
+    post("https://deployment/net-api/turn", {
+        "target": "the_my_block",
+        "verb": "set_properties",
+        "args": [{"current": data, "last_pushed_at": now_ms()}],
+        "session": session,
+        "idempotency_key": stable_tick_key(),
+    }, bearer=token)
     sleep_until_next_schedule()
 ```
 
