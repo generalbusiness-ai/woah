@@ -729,7 +729,7 @@ function normalizeFlagsForCompare(flags: Record<string, unknown> | undefined): R
 function normalizeVerbForCompare(verb: VerbDef): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(verb as Record<string, unknown>)) {
-    if (k === "direct_callable" || k === "skip_presence_check" || k === "tool_exposed" || k === "reads_room_presence" || k === "pure" || k === "pure_declared") {
+    if (k === "direct_callable" || k === "skip_presence_check" || k === "tool_exposed" || k === "reads_room_presence" || k === "reads_ordered_children" || k === "pure" || k === "pure_declared") {
       if (v === true) out[k] = true;
       continue;
     }
@@ -787,6 +787,7 @@ function verbMetadataDiff(a: VerbDef, b: VerbDef): string | null {
   if ((a.skip_presence_check === true) !== (b.skip_presence_check === true)) return "skip_presence_check";
   if ((a.tool_exposed === true) !== (b.tool_exposed === true)) return "tool_exposed";
   if ((a.reads_room_presence === true) !== (b.reads_room_presence === true)) return "reads_room_presence";
+  if ((a.reads_ordered_children === true) !== (b.reads_ordered_children === true)) return "reads_ordered_children";
   if ((a.pure === true) !== (b.pure === true)) return "pure";
   if ((a.pure_declared === true) !== (b.pure_declared === true)) return "pure_declared";
   if (a.kind !== b.kind) return "kind";

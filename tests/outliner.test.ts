@@ -42,22 +42,53 @@ async function addItem(
   return r.result as string;
 }
 
-function position(world: ReturnType<typeof createWorld>, item: string): number {
-  return world.propOrNull(item, "position") as number;
+/** The item's `{ parent, rank }` edge (the sole structural authority). */
+function edgeOf(world: ReturnType<typeof createWorld>, item: string): { parent: string | null; rank: string } | null {
+  const e = world.propOrNull(item, "__ordered_edge") as { parent?: unknown; rank?: unknown } | null;
+  if (!e || typeof e !== "object") return null;
+  return { parent: (typeof e.parent === "string" ? e.parent : null), rank: typeof e.rank === "string" ? e.rank : "" };
 }
 
 function parentOf(world: ReturnType<typeof createWorld>, item: string): string | null {
-  return world.propOrNull(item, "parent") as string | null;
+  return edgeOf(world, item)?.parent ?? null;
 }
 
+/** Derived 1-based position among the item's siblings, computed from the
+ * edge ranks (fractional-rank order) — the replacement for the removed dense
+ * `.position` prop, so ordering assertions still read [1, 2, 3, …]. */
+function position(world: ReturnType<typeof createWorld>, item: string): number {
+  const self = edgeOf(world, item);
+  if (!self || self.rank === "") return 0;
+  const parent = self.parent;
+  const container = world.object(item).location; // siblings share the same outliner
+  const siblings: Array<{ id: string; rank: string }> = [];
+  for (const obj of world.exportWorld().objects) {
+    if (obj.parent !== "$outline_item") continue; // direct $outline_item instances
+    if (obj.location !== container) continue; // scope roots to one outliner
+    const raw = new Map(obj.properties).get("__ordered_edge") as { parent?: unknown; rank?: unknown } | undefined;
+    if (!raw || typeof raw !== "object") continue;
+    const rank = typeof raw.rank === "string" ? raw.rank : "";
+    const p = typeof raw.parent === "string" ? raw.parent : null;
+    if (rank === "" || p !== parent) continue;
+    siblings.push({ id: obj.id, rank });
+  }
+  siblings.sort((a, b) => (a.rank < b.rank ? -1 : a.rank > b.rank ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  const idx = siblings.findIndex((s) => s.id === item);
+  return idx < 0 ? 0 : idx + 1;
+}
+
+/** Seed an item directly with an edge whose rank sorts by `position`
+ * (zero-padded so plain string compare matches numeric order). */
 function seedOutlineItem(world: ReturnType<typeof createWorld>, text: string, position: number, parent: string | null = null): string {
   const item = world.createRuntimeObject("$outline_item", "$wiz", "the_outline", {
     progr: "$wiz",
     location: "the_outline",
     name: ""
   });
-  world.setProp(item, "parent", parent);
-  world.setProp(item, "position", position);
+  // Zero-padded position keeps string-compare == numeric order; the trailing
+  // "1" keeps every seeded rank a VALID fractional-rank key (no trailing zero,
+  // so rank_between can append after the last seeded item).
+  world.setProp(item, "__ordered_edge", { parent, rank: `${String(position).padStart(6, "0")}1` });
   world.setProp(item, "text", text);
   return item;
 }
@@ -248,6 +279,33 @@ describe("outliner catalog: not portable / defensive recycle", () => {
     const r = await call(world, session.actor, a, "moveto", [session.actor]);
     expect(r.op).toBe("error");
     if (r.op === "error") expect(r.error.code).toBe("E_NOT_PORTABLE");
+  });
+
+  it("cross-outliner moveto re-homes the item as a root in the destination; children stay behind (no stale parent ref)", async () => {
+    const world = setupWorld();
+    const session = world.auth("guest:xoutline");
+    const actor = session.actor;
+    // A second outliner in the same room.
+    world.createObject({ id: "the_outline_2", name: "Outline 2", parent: "$outliner", owner: actor, location: "the_chatroom" });
+    await expectResult(call(world, actor, "the_outline", "enter", []));
+    const a = await addItem(world, actor, "a");
+    const b = await addItem(world, actor, "b", a); // b is a child of a
+    const c = await addItem(world, actor, "c", b); // c is a child of b
+    // Move b (a nested item with its own child) into the second outliner.
+    const r = await expectResult(call(world, actor, b, "moveto", ["the_outline_2"]));
+    // b now lives in outliner 2 as a ROOT with a fresh valid edge — the stale
+    // cross-outliner parent ref (a, in the source) is gone.
+    expect(world.object(b).location).toBe("the_outline_2");
+    const eb = edgeOf(world, b);
+    expect(eb?.parent).toBeNull();
+    expect((eb?.rank ?? "").length).toBeGreaterThan(0);
+    // c stayed behind, re-homed to b's former parent (a) in the source outliner.
+    expect(world.object(c).location).toBe("the_outline");
+    expect(parentOf(world, c)).toBe(a);
+    // enterfunc announced b's arrival in outliner 2 (the destination UI needs it).
+    expect(r.observations.some((o) => o.type === "outline_item_added" && o.item === b && o.outliner === "the_outline_2")).toBe(true);
+    // The destination now lists b as a visible root.
+    expect(position(world, b)).toBe(1);
   });
 
   it("remove_item reparents direct children to the removed item's parent", async () => {

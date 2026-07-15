@@ -33,7 +33,8 @@ import {
   type ShadowTurnCall
 } from "./bridge";
 import { CellStore, cellKey, cellVersion, serializeTransfer, type Cell, type EpochStamp } from "./cells";
-import { isNetError, netError } from "./errors";
+import { isNetError, netError, type NetError } from "./errors";
+import type { OrderedNeighborsQuery, OrderedNeighborsRequest, OrderedProjectionKey } from "./ordered-edges";
 import { selectCommitScope, type ScopeClassifier, type ScopeSelection } from "./route";
 import type { CommitSubmit, ScopeHead } from "./scope";
 import { sessionWriter } from "./sessions";
@@ -83,6 +84,23 @@ export type PlanTurnInput = {
    * view clone — byte-identical to the pre-slice path, so non-turn
    * callers (session mint, tests) are unaffected. */
   slicePlanning?: boolean;
+  /** Objects the gateway has already repaired earlier in THIS turn (a
+   * read-version-mismatch refresh or an E_MISSING_STATE pull). The
+   * two-level retry rebuilds the seed slice from scratch on every
+   * re-plan, so without this the slice would DROP the freshly-pulled
+   * cells and the VM would re-read the same instance property at its
+   * CLASS DEFAULT — stamping the read version "absent" and re-triggering
+   * the identical mismatch, oscillating to E_BUDGET. (The canonical
+   * trigger is a contents/sibling scan reading a sibling item's
+   * non-default `parent`/`position`: the object is surfaced by the
+   * contents projection but its own property cells were never seeded, so
+   * the default read looks valid and never escapes as a miss.) Seeding
+   * each repaired object's full view cell set makes the repair STICKY
+   * across re-plans so the turn converges. Bounded to the read-set that
+   * actually mismatched — never a whole-view or whole-room pull; a
+   * genuinely-default read never mismatches, never refreshes, and so
+   * never becomes sticky. */
+  seedObjects?: ReadonlySet<string>;
   /** Bounded owner-derived rows needed by catalog reads that are not ordinary
    * authority cells in this gateway's cache (currently room presence). They
    * exist only in the ephemeral planning snapshot and never become gateway
@@ -91,6 +109,18 @@ export type PlanTurnInput = {
   /** One authority-read compact roster value, installed only in the
    * ephemeral execution world for generic room_roster(space) reads. */
   planningRoomRoster?: { room: string; rows: readonly Record<string, unknown>[] };
+  /** Owner-computed ordered-children values (one per container + parent), installed only
+   * in the ephemeral execution world for generic ordered_children(parent, container)
+   * reads. The ordering analogue of planningRoomRoster; keeps sibling order
+   * off the O(N)-edge-cell read closure. */
+  planningOrderedChildren?: readonly { container: string; parent: string | null; scope: string; rows: readonly Record<string, unknown>[]; version: string }[];
+  /** Owner-answered bounded neighbour queries (P2.4), installed only in the
+   * ephemeral execution world for generic ordered_neighbors(parent, query, container)
+   * reads. Each carries the SAME authority ordering `version` a full
+   * projection would. `container` disambiguates null-root queries, so the attestation below serializes concurrent
+   * same-parent mutations identically — the answer is just O(1) instead of
+   * O(width). */
+  planningOrderedNeighbors?: readonly { container: string; query: OrderedNeighborsQuery; scope: string; value: Record<string, unknown>; version: string }[];
 };
 
 export type PlanTurnResult = {
@@ -155,6 +185,22 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
         }
       }
     }
+    // Sticky repairs (see PlanTurnInput.seedObjects): every cell the live
+    // view holds for a previously-repaired object rides in the seed, so a
+    // re-plan reads the authority's real property values instead of
+    // re-defaulting them and re-triggering the same read-version mismatch.
+    let seededRepair = false;
+    for (const object of input.seedObjects ?? []) {
+      for (const cell of view.cellsForObject(object)) {
+        if (!seed.has(cell.key)) {
+          seed.add(cell.key);
+          seededRepair = true;
+        }
+      }
+    }
+    // A repaired cell may reference further objects (an item's parent, an
+    // undo record's target); close over them the same way a grown miss does.
+    if (seededRepair) expandObjRefs(seed, view);
   }
   // A mid-attempt view mutation can make an attempt retry without growing
   // the seed (the re-clone picks up the changed cells). Monotonic seed
@@ -180,10 +226,26 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
     try {
       attemptRun = await runShadowTurnCallTranscript(world, call, {
         require_room_roster_projection: true,
+        require_ordered_children_projection: true,
         record_authoring_cell_writes: true,
-        ...(input.planningRoomRoster ? { room_rosters: [input.planningRoomRoster] } : {})
+        ...(input.planningRoomRoster ? { room_rosters: [input.planningRoomRoster] } : {}),
+        ...(input.planningOrderedChildren && input.planningOrderedChildren.length > 0
+          ? { ordered_children: input.planningOrderedChildren.map((o) => ({ container: o.container, parent: o.parent, rows: o.rows })) }
+          : {}),
+        ...(input.planningOrderedNeighbors && input.planningOrderedNeighbors.length > 0
+          ? { ordered_neighbors: input.planningOrderedNeighbors.map((n) => ({ container: n.container, query: n.query, value: n.value })) }
+          : {})
       });
     } catch (err) {
+      // An ordered-children projection miss escapes to the gateway's
+      // ordered-children repair path (it fetches the named parent's owner
+      // projection and re-plans) rather than the cell-pull path — there is
+      // no cell to grow from the view. Defensive: the builtin miss is
+      // normally RECORDED, handled just below the try; this covers the throw.
+      const thrownOrdered = orderedChildrenMiss(err as { code?: unknown; value?: unknown } | null);
+      if (thrownOrdered) throw orderedChildrenMissState(thrownOrdered);
+      const thrownNeighbors = orderedNeighborsMiss(err as { code?: unknown; value?: unknown } | null);
+      if (thrownNeighbors) throw orderedNeighborsMissState(thrownNeighbors);
       // A sparse miss vs the attempt's slice. Grow from the LIVE view and
       // re-run; if nothing is growable the cell is genuinely absent —
       // surface the miss against the VIEW so the gateway pulls exactly
@@ -204,6 +266,14 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
       }
       throw translateSparsePlanningThrow(err, view, call);
     }
+    // An ordered-children projection miss the engine RECORDED (the normal
+    // path — the builtin throw is caught by dispatch and stored as the
+    // transcript error). No cell to grow: escape immediately to the gateway's
+    // ordered-children repair, naming the parent(s) whose projection to fetch.
+    const recordedOrdered = orderedChildrenMiss(attemptRun.transcript.error as { code?: unknown; value?: unknown } | undefined);
+    if (recordedOrdered) throw orderedChildrenMissState(recordedOrdered);
+    const recordedNeighbors = orderedNeighborsMiss(attemptRun.transcript.error as { code?: unknown; value?: unknown } | undefined);
+    if (recordedNeighbors) throw orderedNeighborsMissState(recordedNeighbors);
     // CO2.6 second half: the engine RECORDS a dispatch miss in the
     // transcript rather than throwing. Same grow-or-escape vs the slice.
     const recordedVsAttempt = sparseMissFromRecordedError(attemptRun.transcript, attemptStore);
@@ -233,6 +303,26 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
   const withSession = foldSessionEffects(run.transcript, planStore, call);
   const selection = selectCommitScope(withSession, planningScope, classifier);
   const transcript = submitTranscript(withSession, planStore, selection.scope);
+  // P1.1: attest every ordered-children projection this plan was given (a read
+  // can only resolve to a supplied projection — else it misses and repairs into
+  // one), so the committing scope serializes concurrent same-parent inserts by
+  // re-validating each ordering version. A supplied-but-unread projection is a
+  // stable empty target ordering, so attesting it is harmless.
+  // Bounded neighbour answers attest the SAME (scope, parent, version) a
+  // full projection would — the authority re-derives one ordering version
+  // per parent at submit either way. Dedupe identical triples; if the two
+  // maps ever carried DIFFERENT versions for one parent (a mid-turn fetch
+  // race), attest both — the authority check then rejects the stale one and
+  // the turn re-plans, rather than a dedupe silently laundering it through.
+  // The owning `scope` rides along (R3) so a cross-scope commit validates
+  // foreign entries against that owner's attestation instead of skipping
+  // them — and `parent: null` names exactly one scope's roots.
+  const orderingReads = new Map<string, { container: string; parent: string | null; scope: string; version: string }>();
+  for (const p of input.planningOrderedChildren ?? []) orderingReads.set(`${p.scope}\0${p.container}\0${p.parent ?? "\0root"}\0${p.version}`, { container: p.container, parent: p.parent, scope: p.scope, version: p.version });
+  for (const n of input.planningOrderedNeighbors ?? []) orderingReads.set(`${n.scope}\0${n.container}\0${n.query.parent ?? "\0root"}\0${n.version}`, { container: n.container, parent: n.query.parent, scope: n.scope, version: n.version });
+  if (orderingReads.size > 0) {
+    transcript.orderingReads = [...orderingReads.values()];
+  }
 
   // Planner-parity post-state: same apply, same prior cells (the settled
   // attempt's store is a read-through of authority, and every write
@@ -585,6 +675,70 @@ function missIsResidentNow(miss: unknown, view: CellStore): boolean {
   if (!isNetError(miss) || miss.code !== "E_MISSING_STATE") return false;
   const missing = Array.isArray(miss.detail.missing) ? (miss.detail.missing as string[]) : [];
   return missing.length > 0 && missing.every((key) => view.has(key));
+}
+
+/**
+ * The parent(s) named by an ordered-children projection miss, or null if
+ * `errorish` is not one. The world's require-getter throws
+ * `E_NEED_ORDERED_CHILDREN` with `value = { parent }` when a verb reads a
+ * parent's ordering that the sparse planning world does not hold; both the
+ * thrown and the recorded (transcript.error) forms carry the same shape.
+ */
+function orderedChildrenMiss(errorish: { code?: unknown; value?: unknown } | null | undefined): OrderedProjectionKey[] | null {
+  if (!errorish || errorish.code !== "E_NEED_ORDERED_CHILDREN") return null;
+  const value = errorish.value as { container?: unknown; parent?: unknown } | null | undefined;
+  const container = value && typeof value === "object" ? value.container : undefined;
+  const parent = value && typeof value === "object" ? (value as { parent?: unknown }).parent : undefined;
+  if (typeof container === "string" && container && (parent === null || typeof parent === "string")) return [{ container, parent }];
+  return null; // malformed value — treat as a non-miss (terminal)
+}
+
+/** Package an ordered-children miss as the repairable escape the gateway's
+ * turn loop recovers: a distinct `missing_ordered_children` detail keeps it
+ * off the cell-pull path (which reads `detail.missing`). */
+function orderedChildrenMissState(orderings: OrderedProjectionKey[]): NetError {
+  return netError(
+    "E_MISSING_STATE",
+    `sparse planning ordered-children projection not yet fetched: ${orderings.map((o) => `${o.container}:${o.parent ?? "<root>"}`).join(", ")}`,
+    { missing_ordered_children: orderings }
+  );
+}
+
+/**
+ * The bounded neighbour query named by an ordered-neighbours miss (P2.4), or
+ * null if `errorish` is not one. The world's require-getter throws
+ * `E_NEED_ORDERED_NEIGHBORS` with the FULL query in `value` when a mutation
+ * reads a slot the sparse planning world cannot answer; both the thrown and
+ * the recorded (transcript.error) forms carry the same shape.
+ */
+function orderedNeighborsMiss(errorish: { code?: unknown; value?: unknown } | null | undefined): OrderedNeighborsRequest | null {
+  if (!errorish || errorish.code !== "E_NEED_ORDERED_NEIGHBORS") return null;
+  const value = errorish.value as { container?: unknown; parent?: unknown; index?: unknown; exclude?: unknown; child?: unknown } | null | undefined;
+  if (!value || typeof value !== "object") return null; // malformed — terminal
+  if (typeof value.container !== "string" || !value.container) return null;
+  const parent = value.parent === null || typeof value.parent === "string" ? value.parent : undefined;
+  if (parent === undefined) return null;
+  return {
+    container: value.container,
+    query: {
+      parent,
+      index: typeof value.index === "number" ? value.index : null,
+      exclude: typeof value.exclude === "string" ? value.exclude : null,
+      child: typeof value.child === "string" ? value.child : null
+    }
+  };
+}
+
+/** Package an ordered-neighbours miss as the repairable escape the gateway's
+ * turn loop recovers with ONE O(1) authority fetch: a distinct
+ * `missing_ordered_neighbors` detail keeps it off both the cell-pull path
+ * (`detail.missing`) and the full-projection path (`missing_ordered_children`). */
+function orderedNeighborsMissState(request: OrderedNeighborsRequest): NetError {
+  return netError(
+    "E_MISSING_STATE",
+    `sparse planning ordered-neighbours answer not yet fetched for ${request.container}:${request.query.parent ?? "<root>"}`,
+    { missing_ordered_neighbors: [request] }
+  );
 }
 
 function translateSparsePlanningThrow(err: unknown, view: CellStore, call: ShadowTurnCall): unknown {

@@ -84,6 +84,7 @@ import { Outbox, type FanoutBody, type FanoutRow } from "../../net/outbox";
 import { ScopeSequencer, type CommitSubmit, type ScheduledTurn, type ScopeHead } from "../../net/scope";
 import { authorizeSessionSubmit, validateSessionCell } from "../../net/sessions";
 import { observationsForRelationOwners, relationKey, roomRosterRows, type RelationDelta, type RelationRow } from "../../net/relations";
+import { orderedChildrenVersion, orderedNeighborsFromRows } from "../../net/ordered-edges";
 import type { ScopeMeta, ScopeStore, TailEntry } from "../../net/scope-store";
 import type { CommitReply } from "../../net/scope";
 import { netCellKeyFor } from "../../net/transcript";
@@ -815,15 +816,32 @@ export class NetScopeDO {
         // version for each requested cell key, plus the head the report
         // was taken at. Absent cells attest "absent" — the same token
         // read-version validation uses, so an attested absence compares
-        // directly against a planned "absent" read. Read-only: no state
-        // changes, no head movement.
-        const body = (await request.json()) as { keys: string[] };
+        // directly against a planned "absent" read. `ordering_parents`
+        // (R3) asks for the current ordering content version of each named
+        // parent the same way — an ordering with no edges attests the
+        // empty-rows version, the ordering analogue of "absent". Read-only:
+        // no state changes, no head movement.
+        const body = (await request.json()) as { keys: string[]; ordering_parents?: Array<{ container?: unknown; parent?: unknown }> };
         const seq = this.ensureSequencer();
+        const orderingParents = Array.isArray(body.ordering_parents) ? body.ordering_parents : [];
+        for (const ordering of orderingParents) {
+          if (typeof ordering?.container !== "string" || !ordering.container
+            || (ordering.parent !== null && !(typeof ordering.parent === "string" && ordering.parent))) {
+            throw netError("E_INVARG", "attest ordering_parents entries require container plus parent (nonempty ref or null)", { ordering });
+          }
+        }
         return json({
           scope: seq.scope,
           catalog_epoch: seq.catalogEpoch,
           owner_head: seq.head(),
-          cells: body.keys.map((key) => ({ key, version: seq.store.get(key)?.version ?? "absent" }))
+          cells: body.keys.map((key) => ({ key, version: seq.store.get(key)?.version ?? "absent" })),
+          ...(orderingParents.length > 0
+            ? { orderings: orderingParents.map((ordering) => ({
+                container: ordering.container as string,
+                parent: ordering.parent as string | null,
+                version: orderedChildrenVersion(seq.orderedChildren(ordering.container as string, ordering.parent as string | null))
+              })) }
+            : {})
         });
       }
       if (request.method === "POST" && url.pathname === "/net/room-roster") {
@@ -838,6 +856,76 @@ export class NetScopeDO {
           this.host.now()
         );
         return json({ scope: seq.scope, head: seq.head(), room: body.room, rows });
+      }
+      if (request.method === "POST" && url.pathname === "/net/ordered-children") {
+        // Owner-computed ordered children of a parent (the ordering analogue
+        // of /net/room-roster). Reads this scope's write-time-sorted authored
+        // and foreign-relation indexes for the parent and returns one bounded
+        // list — never the edge cells themselves or a whole-scope scan.
+        // `parent: null` lists the ordering roots.
+        const body = (await request.json()) as { container?: unknown; parent?: unknown };
+        if (typeof body.container !== "string" || !body.container) {
+          throw netError("E_INVARG", "ordered-children requires a nonempty container ref", { container: body.container ?? null });
+        }
+        const parent = body.parent === null ? null
+          : typeof body.parent === "string" && body.parent ? body.parent
+          : undefined;
+        if (parent === undefined) {
+          throw netError("E_INVARG", "ordered-children requires parent (nonempty string ref or null)", { parent: body.parent ?? null });
+        }
+        const seq = this.ensureSequencer();
+        // Bounded scan (P2.4): the per-parent edge index, O(children-of-parent),
+        // not a whole-scope cell scan. This full list is for DISPLAY
+        // (list_items); a MUTATION uses /net/ordered-neighbors below instead.
+        const rows = seq.orderedChildren(body.container, parent);
+        // `version` is the content address of the ordering (P1.1): the reader
+        // attests it, and this scope re-derives + validates it at submit so a
+        // concurrent same-parent insert makes the plan stale.
+        return json({ scope: seq.scope, head: seq.head(), container: body.container, parent, rows, version: orderedChildrenVersion(rows) });
+      }
+      if (request.method === "POST" && url.pathname === "/net/ordered-neighbors") {
+        // BOUNDED neighbour read for a mutation (P2.4): answers ONE
+        // OrderedNeighborsQuery — the two ranks bounding an insertion slot
+        // (`index: null` = append; the slot is CLAMPED, range policy stays in
+        // the verb), the sibling count after `exclude`, and the queried
+        // `child`'s current slot — NEVER the full sibling list, so the
+        // response is O(1) regardless of how wide the parent is. Computed by
+        // the shared `orderedNeighborsFromRows` so this authority answer and
+        // the local runtime's own scan agree exactly. `version` is the same
+        // per-parent ordering content address the full projection carries;
+        // the plan attests it identically (P1.1).
+        const body = (await request.json()) as { container?: unknown; parent?: unknown; index?: unknown; exclude?: unknown; child?: unknown };
+        if (typeof body.container !== "string" || !body.container) {
+          throw netError("E_INVARG", "ordered-neighbors requires a nonempty container ref", { container: body.container ?? null });
+        }
+        const parent = body.parent === null ? null
+          : typeof body.parent === "string" && body.parent ? body.parent
+          : undefined;
+        if (parent === undefined) {
+          throw netError("E_INVARG", "ordered-neighbors requires parent (nonempty string ref or null)", { parent: body.parent ?? null });
+        }
+        // Strict field validation (Adv-a): a malformed optional field must be
+        // REFUSED, never silently coerced into a different-but-valid query
+        // (index:"0" is not an append; exclude:42 is not "no exclusion").
+        // Out-of-RANGE numeric indices stay clamped by design — range policy
+        // lives in the calling verb; TYPE policy lives here.
+        if (body.index !== undefined && body.index !== null && !(typeof body.index === "number" && Number.isFinite(body.index))) {
+          throw netError("E_INVARG", "ordered-neighbors index must be a finite number (or null/absent for append)", { index: body.index });
+        }
+        if (body.exclude !== undefined && body.exclude !== null && !(typeof body.exclude === "string" && body.exclude)) {
+          throw netError("E_INVARG", "ordered-neighbors exclude must be a nonempty string ref (or null/absent)", { exclude: body.exclude });
+        }
+        if (body.child !== undefined && body.child !== null && !(typeof body.child === "string" && body.child)) {
+          throw netError("E_INVARG", "ordered-neighbors child must be a nonempty string ref (or null/absent)", { child: body.child });
+        }
+        const seq = this.ensureSequencer();
+        const rows = seq.orderedChildren(body.container, parent);
+        const answer = orderedNeighborsFromRows(rows, {
+          index: body.index === undefined || body.index === null ? null : (body.index as number),
+          exclude: (body.exclude as string | undefined) ?? null,
+          child: (body.child as string | undefined) ?? null
+        });
+        return json({ scope: seq.scope, head: seq.head(), container: body.container, parent, ...answer, version: orderedChildrenVersion(rows) });
       }
       if (request.method === "POST" && url.pathname === "/net/closure") {
         const body = (await request.json()) as {

@@ -69,6 +69,19 @@ export type EffectTranscript = Omit<EngineEffectTranscript, "reads" | "writes" |
    * session instead of requiring the replacement's short expiry to
    * remain live across the cross-DO submit latency. */
   sessionClose?: boolean;
+  /** Ordering projections this plan read (full ordered-children lists and
+   * bounded neighbour answers alike), each attested at the authority content
+   * `version` at read time (P1.1), the explicit container identity, and the
+   * OWNING scope the answer was fetched from (R3 — `parent: null` names the
+   * roots of exactly that container, so root ownership is never ambiguous).
+   * The committing scope re-derives the ordering version for entries it OWNS
+   * from its current edge cells and rejects the plan (read_version_mismatch)
+   * if any differ; FOREIGN entries validate against the owner's ordering
+   * attestation carried in the submit (mirror of foreign cell reads) — so a
+   * concurrent same-parent insert that lands between plan and submit
+   * invalidates the read that produced the rank, in-scope or cross-scope.
+   * Present-only-when-nonempty keeps prior transcript hashes unchanged. */
+  orderingReads?: Array<{ container: string; parent: string | null; scope: string; version: string }>;
 };
 
 /**

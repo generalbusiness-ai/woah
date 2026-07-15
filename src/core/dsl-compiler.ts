@@ -135,12 +135,12 @@ const FRAME_GLOBALS = new Map<string, string>([
 const BUILTINS = new Set([
   "length", "keys", "values", "has", "typeof", "to_string", "tostr", "to_int", "toint", "to_float", "tofloat", "min", "max", "floor", "ceil", "round", "abs",
   "str_trim", "str_lower", "str_starts", "str_index", "str_slice", "str_char", "str_join", "str_split",
-  "listinsert", "object_tree_rows", "object_siblings_ordered",
+  "listinsert", "object_tree_rows", "rank_between",
   "now", "create", "recycle", "move", "moveto", "chparent", "has_flag", "isa", "is_recycled", "directory_reconcile_corenames", "random", "contents", "location", "task_perms", "caller_perms",
   "set_task_perms", "set_presence", "observe_to_space", "tell", "dispatch", "execute_command_plan", "collect_prop",
   "current_location", "current_session", "session_location", "all_locations", "primary_session",
   "is_connected", "idle_seconds",
-  "describe_object", "present_actors", "active_actors", "session_metadata", "room_roster",
+  "describe_object", "present_actors", "active_actors", "session_metadata", "room_roster", "ordered_children", "ordered_neighbors",
   "visible_contents", "obvious_verbs", "remote_describe",
   // builder_create_object and builder_chparent stay native. The other
   // builder_*/programmer_* surface builtins were removed (see

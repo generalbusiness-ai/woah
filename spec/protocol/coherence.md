@@ -121,6 +121,21 @@ that seam:
    their current scope name is `catalog`. Cross-invocation promises MUST NOT
    coalesce authority I/O: they join otherwise-independent platform request
    lineages and can violate the CO2.7 subrequest-depth bound.
+   **Ordering reads follow the same rule.** An owner-computed ordering read
+   (`ordered_children` / `ordered_neighbors`) records
+   `{container, parent, scope, version}` in the transcript's `orderingReads`,
+   where `container` distinguishes contextual roots, and `scope` is the owning
+   authority the answer was fetched from. `parent: null` therefore names the
+   roots of exactly `(scope, container)`, never a process-global null root. The
+   committing scope re-derives versions for entries it owns; a FOREIGN
+   entry validates against `orderings: [{container, parent, version}]` carried in the
+   same owner attestation (the `/net/attest` reply reports current ordering
+   versions alongside cell versions). A foreign ordering read with no
+   attestation rejects `rider_unattested`; a version mismatch rejects
+   `read_version_mismatch` with scoped/container-qualified
+   `ordering_conflicts`, and the gateway re-fetches those exact answers and
+   re-plans. Reinstalling the same stable authority version twice and still
+   recording a mismatch is `E_NONCONVERGENT_READ`, not budget exhaustion.
 2. **Owner-sequenced adoption.** Rider writes reach their owner via
    `/net/adopt` and are applied as owner-ordered events with a per-cell
    prior-version CAS (the attested version the committing turn
@@ -359,6 +374,8 @@ divergence. Tail metrics count by code.
 | `E_SEED_LAG` | KV seed behind scope head | informational; consumer proceeds via head-check |
 | `E_EPOCH_MISMATCH` | durable catalog epochs genuinely disagree: a seed against a scope seeded at another epoch, or a turn whose stamp still differs from the scope's durable epoch AFTER the CO8 reseed | terminal; catalog install/migration reconciles (operator concern), never a retry treadmill |
 | `E_SEED_COMMITTED` | a seed targets a scope that has already committed turns | terminal; recover into a fresh namespace rather than resetting authority under an unchanged head |
+| `E_NONCONVERGENT_READ` | a recorded read cannot converge: the gateway refreshed a mismatched cell (or re-installed an ordering answer) to a STABLE authority version and re-planned, yet the re-plan re-recorded a version that still mismatches that same authority version — a planner/catalog-verb bug, not contention (contention moves the authority version each round and never trips this) | terminal and NAMED; surfaces the offending cell/ordering with the attempt trace instead of grinding to `E_BUDGET` |
+| `E_INVARG` | a malformed internal request field (wrong type or shape) | terminal for this request; refused with the offending field named — never silently coerced into a different-but-valid request |
 
 Retryable codes are turn mechanics and never user-visible as failures;
 terminal codes surface to the caller with structured detail and an attempt
@@ -503,12 +520,22 @@ One write path per fact (CO9), concretized:
 - **The applier runs at the committing scope.** On accept, the scope
   derives relation deltas from the transcript: `projectionWrites`
   (contents add/remove), moves (contents of the source and destination
-  parents), and session-scope transitions (presence). Local deltas apply
+  parents), ordered-edge writes/moves (`ordered_edge` rows at the current
+  container), and session-scope transitions (presence). The ordered-edge row
+  is required when an item's immutable anchor differs from its current
+  container: the authored edge cell remains truth at the anchor, while the
+  container owner gets a complete bounded ordering without global enumeration.
+  Each scope maintains these rows in a write-time-sorted
+  `(container, parent)` index, so projection and neighbour reads remain bounded
+  by that parent's width rather than scanning the scope's relation family.
+  Local deltas apply
   in the SAME transaction as the commit; deltas whose owner object is
   anchored elsewhere are delivered to the owning scope via the durable
   outbox (`POST /net/relate`, idempotent by `(from_scope, seq)` — a
   high-water separate from `/net/adopt`'s, because one turn can produce
-  both facts at the same `(from_scope, seq)`).
+  both facts at the same `(from_scope, seq)`). Presence and ordered-edge
+  foreign batches also take the synchronous accepted-reply freshness fence;
+  the durable row remains the retry path and receiver idempotency dedupes them.
 - **Relation delivery applies owner-sequenced.** The owner applies a
   delivered batch as one owner event — its head advances once, with a
   `relate:<from_scope>:<seq>` recovery-tail entry (the adoption
@@ -556,9 +583,9 @@ One write path per fact (CO9), concretized:
   retirement. Seed-pool actors carry no marker and remain reusable in place.
 - **Acceptance is not revoked by a failed relation expedite.** The committing
   scope durably enqueues each foreign relation fact in the same transaction as
-  its accepted reply. The gateway normally delivers presence relations to the
-  room owner synchronously as a freshness fence. If that post-accept delivery
-  fails, the response remains accepted, carries
+  its accepted reply. The gateway normally delivers presence and ordered-edge
+  relations to the owner synchronously as a freshness fence. If that
+  post-accept delivery fails, the response remains accepted, carries
   `relation_expedite_degraded: true`, and emits a named metric; the durable
   outbox converges the owner asynchronously. A dependent roster read may be
   briefly stale in this degraded case, but the caller is never told that its
@@ -575,6 +602,10 @@ One write path per fact (CO9), concretized:
   repair path, bounded by scope size — CO11.1). A multi-scope rebuild
   drops candidates whose owner is anchored elsewhere: those rows belong
   at the owning scope, and a local copy would be the CO9 dual write.
+  Presence and ordered-edge rows have the same cross-scope shape: their
+  defining session/edge cells remain at another immutable anchor, so they
+  re-derive through the committing authority's single transcript-applier path
+  and `/net/relate`, not from an incomplete local scan at the relation owner.
 - **The gateway mirror** is fed by `FanoutBody.relations` (a commit's
   local deltas, or a `/net/relate` refan) under the same per-scope seq
   high-water that gates cells, plus one coherence companion: a closure

@@ -1,4 +1,6 @@
 import { analyzeBytecodePurity, combineVerbPurity, compileVerb, findUnresolvedThisCalls, propagateVerbPurity } from "./authoring";
+import { firstRank, rankAfter } from "./fractional-rank";
+import { orderedEdgeFromPropertyValue, type OrderedEdgeValue } from "./ordered-edge";
 import { hashSource } from "./source-hash";
 import { wooError, type ErrorValue, type ObjRef, type PresenceProjectionDef, type TinyBytecode, type VerbCallSite, type VerbDef, type WooValue } from "./types";
 import { normalizeVerbPerms } from "./verb-perms";
@@ -70,6 +72,7 @@ type CatalogVerbDef = {
   skip_presence_check?: boolean;
   tool_exposed?: boolean;
   reads_room_presence?: boolean;
+  reads_ordered_children?: boolean;
   pure?: boolean;
   implementation?: { kind: "native"; handler: string };
 };
@@ -129,6 +132,18 @@ export type CatalogMigrationStep =
   | { kind: "change_parent"; class: string; parent: string }
   | { kind: "rename_class"; from: string; to: string }
   | { kind: "transform_property"; class: string; name: string; transform: CatalogMigrationTransform }
+  // Derive a room-owned ordered-edge index from a class's legacy
+  // (parent, position) props. GENERIC (parameterised by prop names — knows
+  // nothing of any catalog): for every placed instance of `class`, group by
+  // (container = its location, `parent_prop`), order each group by
+  // (`position_prop`, then object id — a total, reproducible tie-break), and
+  // write `edge_prop` = { parent, rank } with fractional ranks (fractional-rank
+  // helper). Deterministic, so re-deriving from the same input yields identical
+  // ranks (idempotent). Legacy props are removed by following `drop_property`
+  // steps. This is the substrate primitive behind the ordered-edge index
+  // (spec/discovery/catalogs.md CT14); it does NOT run woocode, so it fits the
+  // synchronous migration flow.
+  | { kind: "reindex_ordered_edges"; class: string; parent_prop: string; position_prop: string; edge_prop: string }
   | { kind: "custom"; verb: string };
 
 export type CatalogMigrationTransform =
@@ -1276,6 +1291,7 @@ function installVerbDef(world: WooWorld, obj: ObjRef, def: CatalogVerbDef, owner
         skip_presence_check: existing.skip_presence_check || def.skip_presence_check === true,
         tool_exposed: existing.tool_exposed || def.tool_exposed === true,
         reads_room_presence: existing.reads_room_presence || def.reads_room_presence === true,
+        reads_ordered_children: existing.reads_ordered_children || def.reads_ordered_children === true,
         // pure_declared mirrors the manifest assertion exactly — declarations
         // can be added or removed without changing source. The derived `pure`
         // is left to propagation.
@@ -1289,6 +1305,7 @@ function installVerbDef(world: WooWorld, obj: ObjRef, def: CatalogVerbDef, owner
         next.skip_presence_check !== existing.skip_presence_check ||
         next.tool_exposed !== existing.tool_exposed ||
         next.reads_room_presence !== existing.reads_room_presence ||
+        next.reads_ordered_children !== existing.reads_ordered_children ||
         next.pure_declared !== existing.pure_declared ||
         stableStringify(next.aliases ?? []) !== stableStringify(existing.aliases ?? []) ||
         stableStringify(next.arg_spec ?? {}) !== stableStringify(existing.arg_spec ?? {})
@@ -1308,6 +1325,7 @@ function installVerbDef(world: WooWorld, obj: ObjRef, def: CatalogVerbDef, owner
       (existing.skip_presence_check === true) !== (repaired.skip_presence_check === true) ||
       (existing.tool_exposed === true) !== (repaired.tool_exposed === true) ||
       (existing.reads_room_presence === true) !== (repaired.reads_room_presence === true) ||
+      (existing.reads_ordered_children === true) !== (repaired.reads_ordered_children === true) ||
       (existing.pure_declared === true) !== (repaired.pure_declared === true) ||
       (
         repaired.kind !== "native" &&
@@ -1349,7 +1367,8 @@ function compileCatalogVerbDef(obj: ObjRef, def: CatalogVerbDef, owner: ObjRef, 
     direct_callable: parsedPerms.directCallable,
     skip_presence_check: def.skip_presence_check === true,
     tool_exposed: def.tool_exposed === true,
-    reads_room_presence: def.reads_room_presence === true
+    reads_room_presence: def.reads_room_presence === true,
+    reads_ordered_children: def.reads_ordered_children === true
   };
 
   if (allowImplementationHints && def.implementation?.kind === "native") {
@@ -1402,6 +1421,7 @@ function compileCatalogVerb(obj: ObjRef, def: CatalogVerbDef, owner: ObjRef, ver
     skip_presence_check: def.skip_presence_check === true,
     tool_exposed: def.tool_exposed === true,
     reads_room_presence: def.reads_room_presence === true,
+    reads_ordered_children: def.reads_ordered_children === true,
     pure: pure || undefined,
     pure_declared: def.pure === true ? true : undefined,
     calls
@@ -1586,9 +1606,168 @@ function applyMigrationStep(
       for (const objRef of classAndDescendants(world, classRef)) transformPropertyLocal(world, objRef, step.name, step.transform);
       return;
     }
+    case "reindex_ordered_edges": {
+      const classRef = resolveObjectRef(world, step.class, localObjects, localSeeds, installed);
+      reindexOrderedEdges(world, classRef, step.parent_prop, step.position_prop, step.edge_prop);
+      return;
+    }
     case "custom":
       throw wooError("E_NOT_IMPLEMENTED", "catalog custom migrations are deferred", step as unknown as WooValue);
   }
+}
+
+/** Legacy 1-indexed sibling position, floored; unset/invalid → 0 (sorts first,
+ * before any positive position, matching the v1 "position 0 = unplaced" seam). */
+function legacyPosition(world: WooWorld, ref: ObjRef, positionProp: string): number {
+  const value = world.object(ref).properties.get(positionProp);
+  return typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : 0;
+}
+
+/**
+ * Build the ordered-edge index for `class` from its legacy (parent, position)
+ * props. Siblings are the placed instances that share a (container, parent);
+ * container is the instance's `location` (the room that owns the index). Each
+ * group is ordered by (position, id) — the id tie-break makes the order total
+ * and reproducible even when v1 positions collide — and assigned fractional
+ * ranks via a fixed `firstRank → rankAfter` chain, so re-deriving from the same
+ * input yields byte-identical edges (idempotent). One `edge_prop` write per
+ * instance; no renumber. See the `reindex_ordered_edges` step doc above.
+ */
+function reindexOrderedEdges(world: WooWorld, classRef: ObjRef, parentProp: string, positionProp: string, edgeProp: string): void {
+  // 1. Collect placed instances with their container; index the valid item set
+  //    per container (a parent is valid only if it is such an instance in the
+  //    SAME container).
+  const items: ObjRef[] = [];
+  const containerOf = new Map<ObjRef, ObjRef>();
+  const itemsInContainer = new Map<ObjRef, Set<ObjRef>>();
+  for (const ref of classAndDescendants(world, classRef)) {
+    if (ref === classRef) continue; // the class itself is not a placed item
+    const container = world.object(ref).location;
+    if (!container || container === "$nowhere") continue; // unplaced instances get no edge
+    items.push(ref);
+    containerOf.set(ref, container);
+    (itemsInContainer.get(container) ?? itemsInContainer.set(container, new Set()).get(container)!).add(ref);
+  }
+
+  // Migration steps may be replayed after their legacy source properties were
+  // already dropped (for example recovery after the transform completed but
+  // before the catalog ledger advanced). A complete valid edge index is the
+  // durable completion marker for THIS step. Preserve it byte-for-byte: using
+  // absent parent/position values as defaults would flatten the tree and sort
+  // siblings by id on the second run, violating migration idempotency.
+  if (validExistingOrderedEdgeIndex(world, items, containerOf, itemsInContainer, edgeProp)) return;
+
+  // 2. Resolve each item's parent, repairing dangling / cross-container refs to
+  //    root (P1.3): NEVER copy a parent blindly, or a node vanishes once the
+  //    legacy source is dropped (v2 renders only from null-parent roots).
+  const repairs = { dangling: 0, cross: 0, cycle: 0 };
+  const parentOf = new Map<ObjRef, ObjRef | null>();
+  for (const ref of items) {
+    const rawParent = world.object(ref).properties.get(parentProp);
+    let parent = typeof rawParent === "string" ? rawParent : null;
+    if (parent !== null) {
+      const container = containerOf.get(ref)!;
+      const sameContainer = itemsInContainer.get(container);
+      if (!sameContainer || !sameContainer.has(parent)) {
+        if (containerOf.has(parent) && containerOf.get(parent) !== container) repairs.cross += 1;
+        else repairs.dangling += 1;
+        parent = null;
+      }
+    }
+    parentOf.set(ref, parent);
+  }
+
+  // 3. Break cycles at the LOWEST-id node. Each node has <= 1 parent (a
+  //    functional graph), so cycles are disjoint simple loops; a DFS along
+  //    parents that revisits a node on the current path found one.
+  const state = new Map<ObjRef, 0 | 1 | 2>(); // 0 unseen, 1 on path, 2 done
+  for (const start of items) {
+    if ((state.get(start) ?? 0) !== 0) continue;
+    const path: ObjRef[] = [];
+    let cur: ObjRef | null = start;
+    while (cur !== null && (state.get(cur) ?? 0) === 0) {
+      state.set(cur, 1);
+      path.push(cur);
+      cur = parentOf.get(cur) ?? null;
+    }
+    if (cur !== null && state.get(cur) === 1) {
+      // `cur` is on the current path -> the cycle is path[indexOf(cur)..].
+      const cycle = path.slice(path.indexOf(cur));
+      const lowest = cycle.reduce((m, x) => (x < m ? x : m), cycle[0]);
+      parentOf.set(lowest, null);
+      repairs.cycle += 1;
+    }
+    for (const n of path) state.set(n, 2);
+  }
+
+  // 4. Assign fractional ranks per (container, resolved-parent) group, ordered
+  //    by (position, id) so re-deriving from the same input is byte-identical
+  //    (idempotent). The NUL join keeps container/parent ids unambiguous.
+  const groups = new Map<string, ObjRef[]>();
+  for (const ref of items) {
+    const key = `${containerOf.get(ref)}\u0000${parentOf.get(ref) ?? ""}`;
+    (groups.get(key) ?? groups.set(key, []).get(key)!).push(ref);
+  }
+  for (const group of groups.values()) {
+    group.sort((a, b) => {
+      const pa = legacyPosition(world, a, positionProp);
+      const pb = legacyPosition(world, b, positionProp);
+      if (pa !== pb) return pa - pb;
+      return a < b ? -1 : a > b ? 1 : 0;
+    });
+    let last: string | null = null;
+    for (const ref of group) {
+      const rank: string = last === null ? firstRank() : rankAfter(last);
+      world.setProp(ref, edgeProp, { parent: parentOf.get(ref) ?? null, rank });
+      last = rank;
+    }
+  }
+
+  if (repairs.dangling + repairs.cross + repairs.cycle > 0) {
+    console.warn(
+      `reindex_ordered_edges: repaired ${repairs.dangling} dangling, ${repairs.cross} cross-container, ` +
+      `${repairs.cycle} cyclic parent(s) to root while building ${edgeProp} for ${classRef}`
+    );
+  }
+}
+
+/** Whether every placed item already participates in one structurally valid
+ * ordered-edge index. This is intentionally stricter than “has a map”: parents
+ * must stay in the same container, sibling ranks must be unique, and parent
+ * walks must terminate. A malformed or partial index therefore falls through
+ * to the legacy-data repair path instead of being mistaken for completion. */
+function validExistingOrderedEdgeIndex(
+  world: WooWorld,
+  items: readonly ObjRef[],
+  containerOf: ReadonlyMap<ObjRef, ObjRef>,
+  itemsInContainer: ReadonlyMap<ObjRef, ReadonlySet<ObjRef>>,
+  edgeProp: string
+): boolean {
+  if (items.length === 0) return false;
+  const edges = new Map<ObjRef, OrderedEdgeValue>();
+  const ranksByGroup = new Map<string, Set<string>>();
+  for (const ref of items) {
+    const edge = orderedEdgeFromPropertyValue(world.object(ref).properties.get(edgeProp));
+    if (!edge) return false;
+    const container = containerOf.get(ref)!;
+    if (edge.parent !== null && !itemsInContainer.get(container)?.has(edge.parent)) return false;
+    const group = `${container}\u0000${edge.parent ?? ""}`;
+    const ranks = ranksByGroup.get(group) ?? new Set<string>();
+    if (ranks.has(edge.rank)) return false;
+    ranks.add(edge.rank);
+    ranksByGroup.set(group, ranks);
+    edges.set(ref, edge);
+  }
+  for (const ref of items) {
+    const seen = new Set<ObjRef>();
+    let current: ObjRef | null = ref;
+    while (current !== null) {
+      if (seen.has(current)) return false;
+      seen.add(current);
+      current = edges.get(current)?.parent ?? null;
+    }
+  }
+  return true;
 }
 
 function transformPropertyLocal(world: WooWorld, objRef: ObjRef, name: string, transform: CatalogMigrationTransform): void {
@@ -1655,14 +1834,13 @@ function renamePropertyLocal(world: WooWorld, objRef: ObjRef, from: string, to: 
 }
 
 function dropPropertyLocal(world: WooWorld, objRef: ObjRef, name: string): void {
-  const obj = world.object(objRef);
-  obj.propertyDefs.delete(name);
-  obj.properties.delete(name);
-  obj.propertyVersions.delete(name);
-  if (name === "subscribers" || name === "session_subscribers") {
-    world.invalidatePresenceIndex();
-  }
-  touchObject(world, objRef);
+  // Route through the world's canonical deletion path so the removal is
+  // PERSISTED: `deleteProp` records a property-delete for the incremental
+  // object-repository flush (and invalidates presence). A direct Map mutation
+  // would leave the stale row in SQLite, so a dropped prop would reappear on
+  // the next reload (a v1 `.parent`/`.position` value resurrecting after the
+  // v1->v2 migration). No-op (returns false) if the object lacks the property.
+  world.deleteProp(objRef, name);
 }
 
 function renameVerbLocal(world: WooWorld, objRef: ObjRef, from: string, to: string): void {
@@ -1702,6 +1880,8 @@ function migrationStepId(step: CatalogMigrationStep, index: number): string {
       return `${index + 1}:rename_class:${step.from}->${step.to}`;
     case "transform_property":
       return `${index + 1}:transform_property:${step.class}.${step.name}`;
+    case "reindex_ordered_edges":
+      return `${index + 1}:reindex_ordered_edges:${step.class}.${step.edge_prop}`;
     case "custom":
       return `${index + 1}:custom`;
   }
@@ -1927,6 +2107,7 @@ function catalogVerbDrift(actual: VerbDef, expected: VerbDef): string[] {
   if ((actual.skip_presence_check === true) !== (expected.skip_presence_check === true)) drift.push("skip_presence_check");
   if ((actual.tool_exposed === true) !== (expected.tool_exposed === true)) drift.push("tool_exposed");
   if ((actual.reads_room_presence === true) !== (expected.reads_room_presence === true)) drift.push("reads_room_presence");
+  if ((actual.reads_ordered_children === true) !== (expected.reads_ordered_children === true)) drift.push("reads_ordered_children");
   // Drift on the manifest-declared bit only. The derived `pure` flag is
   // owned by propagation and may diverge from a freshly-compiled expected
   // (because expected hasn't been propagated against the world). Comparing
@@ -1958,6 +2139,7 @@ function catalogVerbSummary(verb: VerbDef): Record<string, WooValue> {
     skip_presence_check: verb.skip_presence_check === true,
     tool_exposed: verb.tool_exposed === true,
     reads_room_presence: verb.reads_room_presence === true,
+    reads_ordered_children: verb.reads_ordered_children === true,
     pure: verb.pure === true,
     pure_declared: verb.pure_declared === true,
     source_hash: verb.source_hash,

@@ -51,8 +51,44 @@ import {
 } from "./turn-effects";
 import { readObjectPropertyValue } from "./property-read";
 import { redactSensitiveSerializedPropertyValues } from "./sensitive-serialization";
+import {
+  ORDERED_EDGE_PROP,
+  orderedEdgeFromPropertyValue,
+  orderedNeighborsFromRows,
+  orderedNeighborsQueryKey,
+  orderedProjectionKey,
+  type OrderedChildRow,
+  type OrderedEdgeValue,
+  type OrderedNeighborsQuery
+} from "./ordered-edge";
+
+/** What a same-run ordered-edge writer's PRE-WRITE ordering membership was
+ * (R1 overlay). `known: false` = the sparse planning world had no local value
+ * for the child's edge, so the authority may hold a membership this slice
+ * never saw — conservatively treated as affecting every parent's ordering. */
+type PriorOrderingMembership =
+  | { known: false }
+  | { known: true; member: false }
+  | { known: true; member: true; parent: string | null };
 
 export type NativeHandler = (ctx: CallContext, args: WooValue[]) => WooValue | Promise<WooValue>;
+
+/**
+ * Control signals that must propagate to the gateway repair path and NEVER be
+ * swallowed by an ordinary error catch (woocode `except` OR a native
+ * handler-invoke try/catch). The VM enforces the same set for `except`; native
+ * dispatch sites that catch handler errors (e.g. `invokeRecycleHandler`) must
+ * re-throw these first. E_NEED_STATE = missing authority cell; the
+ * ordered-children miss = missing owner projection (P1.2).
+ */
+function isUncatchableControlSignal(err: unknown): boolean {
+  if (isVmSuspendSignal(err) || isVmReadSignal(err)) return true;
+  const code = isErrorValue(err) ? err.code : undefined;
+  // E_NEED_ORDERED_NEIGHBORS is the bounded-slot variant of the
+  // ordered-children miss (P2.4) — same repair path, same swallowing hazard.
+  return code === "E_NEED_STATE" || code === "E_NEED_ORDERED_CHILDREN" || code === "E_NEED_ORDERED_NEIGHBORS";
+}
+
 const GUEST_SESSION_GRACE_MS = 60_000;
 const GUEST_SESSION_TTL_MS = 5 * 60_000;
 const CREDENTIAL_SESSION_GRACE_MS = 5 * 60_000;
@@ -613,6 +649,37 @@ export class WooWorld {
   // sparse by construction, so a local fallback would be a plausible-looking
   // partial roster rather than a safe degradation.
   private requireRoomRosterProjection = false;
+  /** Owner-computed ordered-children values (one bounded list per container + parent),
+   * the ordering analogue of `roomRosterProjections`. Installed only in an
+   * ephemeral planning world. Container is essential for ordering roots: two
+   * independent roots both have `parent: null`. */
+  private readonly orderedChildrenProjections = new Map<string, WooValue[]>();
+  /** Owner-answered bounded neighbour queries (P2.4), keyed by the canonical
+   * query key. A mutation's slot read resolves here so a wide parent never
+   * pulls its full sibling list into planning; installed only in an
+   * ephemeral planning world, exactly like the full-ordering projections. */
+  private readonly orderedNeighborsProjections = new Map<string, WooValue>();
+  /** Same-run ordered-edge mutations (R1): every child whose `__ordered_edge`
+   * this execution wrote (or recycled away), with its pre-write membership.
+   * The installed ordering projections are PRE-TURN authority snapshots, so a
+   * second same-parent mutation in one turn must overlay these writes onto
+   * any ordering answer — otherwise it reads a stale count/rank (losing a
+   * restored child to a spurious E_INDEX, or reusing one cached append answer
+   * for two inserts and committing duplicate ranks). Tracked only when
+   * `requireOrderedChildrenProjection` is set (a sparse net planning world),
+   * so a long-lived complete runtime — whose ordering reads scan live
+   * objects and need no overlay — never accumulates entries. */
+  private readonly orderedEdgeWritesThisRun = new Map<ObjRef, PriorOrderingMembership>();
+  /** Objects created by THIS execution (same gating as above). A parent
+   * created this run has no authority ordering to fetch — its children are
+   * exactly this run's own edge writes, synthesized without any RPC. */
+  private readonly createdThisRun = new Set<ObjRef>();
+  // Net planning enables this so a sparse world FAILS LOUDLY rather than
+  // deriving a partial ordering from whichever edge cells happened to
+  // materialize (mirror of requireRoomRosterProjection). Guards BOTH
+  // ordering reads: the full ordered_children projection and the bounded
+  // ordered_neighbors query.
+  private requireOrderedChildrenProjection = false;
   /** Net planning commits recorder cells rather than this ephemeral graph.
    * Keep authoring recording opt-in so the frozen v2 materializer is unchanged. */
   private recordAuthoringCellWrites = false;
@@ -706,6 +773,206 @@ export class WooWorld {
       location_name: roomName,
       presence: "awake"
     } as unknown as WooValue]);
+  }
+
+  // ── Owner-computed ordered-children projection ─────────────────────────
+  // The ordering analogue of the room roster: net planning fetches the
+  // bounded ordered list of a parent's children from the room authority and
+  // installs it here, so a verb reads sibling order as ONE value instead of
+  // pulling every sibling's edge cell into the turn's read closure. Only the
+  // ephemeral planning world holds these; they never persist or export.
+
+  installOrderedChildrenProjection(container: ObjRef, parent: ObjRef | null, rows: readonly Record<string, unknown>[]): void {
+    this.orderedChildrenProjections.set(
+      orderedProjectionKey(container, parent),
+      cloneImportedPlainData(rows) as WooValue[]
+    );
+  }
+
+  setRequireOrderedChildrenProjection(required: boolean): void {
+    this.requireOrderedChildrenProjection = required;
+  }
+
+  /** The ordered `[{child, rank}]` list of `parent`'s direct children. On a
+   * sparse net planning world the owner projection MUST have been installed;
+   * a MISSING one is a REPAIRABLE miss, not terminal: the gateway does not
+   * know ahead of time which parents a data-dependent verb will read (an
+   * add_item into a nested parent_arg, a reparent to an arbitrary sub-item),
+   * so it seeds only the call target's ordering up front. Reading any other
+   * parent throws `E_NEED_ORDERED_CHILDREN` naming that parent; the gateway's
+   * repair loop fetches that parent's projection (POST /net/ordered-children)
+   * and re-plans, exactly as a missing-cell read triggers a targeted refresh.
+   * A genuinely malformed parent argument is caught earlier by the builtin's
+   * `assertObj` (terminal E_TYPE/E_INVARG) and never reaches this getter. A
+   * complete local runtime (in-memory / SQLite dev) has no require flag and
+   * derives the ordering by scanning objects' local edge property — the
+   * ordering analogue of `roomRosterProjection`'s local-session fallback. */
+  orderedChildrenProjection(parent: ObjRef | null, container: ObjRef | null = null): WooValue[] {
+    const projectionKey = container === null ? null : orderedProjectionKey(container, parent);
+    const projected = projectionKey === null ? undefined : this.orderedChildrenProjections.get(projectionKey);
+    if (projected !== undefined) {
+      // R1: the installed rows are a PRE-TURN authority snapshot; overlay
+      // this run's own edge writes when any touch this parent's ordering.
+      return this.orderingAffectedThisRun(container, parent)
+        ? this.overlaySameRunEdges(projected as unknown as readonly Record<string, unknown>[], container, parent)
+        : cloneImportedPlainData(projected);
+    }
+
+    if (this.requireOrderedChildrenProjection) {
+      // A parent created THIS run has no authority ordering to fetch — its
+      // children are exactly this run's own edge writes (R1).
+      if (parent !== null && this.createdThisRun.has(parent)) {
+        return this.overlaySameRunEdges([], container, parent);
+      }
+      // The parent rides in `value` so the planner/gateway can name exactly
+      // which projection to fetch. Distinct code (not E_NEED_STATE) so it
+      // routes through the ordered-children repair path, not the cell-pull path.
+      throw wooError(
+        "E_NEED_ORDERED_CHILDREN",
+        `ordered-children projection not resident for ${parent ?? "<root>"}`,
+        { container, parent }
+      );
+    }
+
+    // Local fallback: scan every object's LOCAL edge property. Edges are a
+    // per-item local value, so an inherited class default never participates.
+    // `container` scopes ordering ROOTS to one room (the net path scope-fetches
+    // one room's edges; the whole-world scan must not mix roots across rooms).
+    // For a non-null parent the children are inherently in the parent's room,
+    // so the container filter is a no-op there.
+    const rows: OrderedChildRow[] = [];
+    for (const obj of this.objects.values()) {
+      const raw = obj.properties.get(ORDERED_EDGE_PROP) as OrderedEdgeValue | undefined;
+      if (!raw || typeof raw !== "object") continue;
+      const rank = (raw as OrderedEdgeValue).rank;
+      const edgeParent = (raw as OrderedEdgeValue).parent ?? null;
+      if (typeof rank !== "string" || rank.length === 0) continue;
+      if (edgeParent !== parent) continue;
+      if (container !== null && obj.location !== container) continue;
+      rows.push({ child: obj.id, rank });
+    }
+    rows.sort((a, b) => (a.rank < b.rank ? -1 : a.rank > b.rank ? 1 : a.child < b.child ? -1 : a.child > b.child ? 1 : 0));
+    return rows as unknown as WooValue[];
+  }
+
+  installOrderedNeighborsProjection(container: ObjRef, query: OrderedNeighborsQuery, value: Record<string, unknown>): void {
+    this.orderedNeighborsProjections.set(
+      orderedNeighborsQueryKey(container, query),
+      cloneImportedPlainData(value) as WooValue
+    );
+  }
+
+  /** The bounded `{count, index, before, after, child_index}` answer for one
+   * mutation slot under `parent` (P2.4 — the O(1) alternative to reading the
+   * parent's full ordered children). Resolution order on a sparse net
+   * planning world:
+   *   1. the exact installed query answer (a prior repair round fetched it);
+   *   2. a resident FULL ordering for the parent (free ride — same authority
+   *      version, so the attestation is identical);
+   *   3. otherwise a repairable `E_NEED_ORDERED_NEIGHBORS` naming the full
+   *      query, which the gateway answers with ONE O(1) authority fetch
+   *      (POST /net/ordered-neighbors) — never the O(width) list.
+   * A complete local runtime computes the answer from its own edge scan via
+   * the shared `orderedNeighborsFromRows`, so both paths clamp and exclude
+   * identically. */
+  orderedNeighborsProjection(
+    parent: ObjRef | null,
+    query: Pick<OrderedNeighborsQuery, "index" | "exclude" | "child">,
+    container: ObjRef | null = null
+  ): WooValue {
+    // R1: once this run's own edge writes touch the parent's ordering, every
+    // pre-turn O(1) answer for it is stale — resolve via the FULL ordering
+    // (installed + overlay, created-run synthesis, or the ordered-children
+    // escalation miss) so this turn's writes participate in the slot answer.
+    if (this.orderingAffectedThisRun(container, parent)) {
+      const rows = this.orderedChildrenProjection(parent, container) as unknown as OrderedChildRow[];
+      return orderedNeighborsFromRows(rows, query) as unknown as WooValue;
+    }
+
+    const full: OrderedNeighborsQuery = { parent, index: query.index, exclude: query.exclude, child: query.child };
+    const installed = container === null ? undefined : this.orderedNeighborsProjections.get(orderedNeighborsQueryKey(container, full));
+    if (installed !== undefined) return cloneImportedPlainData(installed);
+
+    const residentOrdering = container === null ? undefined : this.orderedChildrenProjections.get(orderedProjectionKey(container, parent));
+    if (residentOrdering !== undefined) {
+      return orderedNeighborsFromRows(residentOrdering as unknown as OrderedChildRow[], query) as unknown as WooValue;
+    }
+
+    if (this.requireOrderedChildrenProjection) {
+      // The whole query rides in `value` so the planner/gateway can fetch
+      // exactly this answer. Distinct code so it routes through the
+      // ordered-neighbours repair path, not the cell-pull path.
+      throw wooError(
+        "E_NEED_ORDERED_NEIGHBORS",
+        `ordered-neighbours answer not resident for ${parent ?? "<root>"}`,
+        { container, parent, index: query.index, exclude: query.exclude, child: query.child }
+      );
+    }
+
+    // Local fallback: the same edge scan the full ordering uses, reduced by
+    // the shared helper so local and owner answers agree byte-for-byte.
+    const rows = this.orderedChildrenProjection(parent, container) as unknown as OrderedChildRow[];
+    return orderedNeighborsFromRows(rows, query) as unknown as WooValue;
+  }
+
+  /** The pre-write ordering membership recorded for a same-run edge writer
+   * (R1). A child created this run is known-empty; a resident local value
+   * decides membership; an absent local value on a sparse world is UNKNOWN
+   * (the authority may hold an edge this slice never saw). */
+  private priorOrderingMembership(objRef: ObjRef, hadValue: boolean, before: WooValue | undefined): PriorOrderingMembership {
+    if (this.createdThisRun.has(objRef)) return { known: true, member: false };
+    if (hadValue) {
+      const edge = orderedEdgeFromPropertyValue(before);
+      return edge ? { known: true, member: true, parent: edge.parent } : { known: true, member: false };
+    }
+    return { known: false };
+  }
+
+  /** A same-run edge writer's CURRENT edge, or null when the child is
+   * recycled/absent or its edge is cleared/malformed. */
+  private currentOrderedEdge(child: ObjRef): OrderedEdgeValue | null {
+    if (this.isRecycled(child)) return null;
+    const obj = this.objects.get(child);
+    if (!obj) return null;
+    return orderedEdgeFromPropertyValue(obj.properties.get(ORDERED_EDGE_PROP));
+  }
+
+  /** Whether THIS run's edge writes touch `parent`'s ordering (R1): some
+   * writer now lives under it, previously lived under it, has an unknown
+   * pre-state, or the parent itself was created this run (its authority
+   * ordering cannot exist, so only same-run writes can populate it). */
+  private orderingAffectedThisRun(container: ObjRef | null, parent: ObjRef | null): boolean {
+    if (parent !== null && this.createdThisRun.has(parent)) return true;
+    if (this.orderedEdgeWritesThisRun.size === 0) return false;
+    for (const [child, prior] of this.orderedEdgeWritesThisRun) {
+      const current = this.currentOrderedEdge(child);
+      if (current && current.parent === parent && (container === null || this.objects.get(child)?.location === container)) return true;
+      if (!prior.known) return true;
+      if (prior.known && prior.member && prior.parent === parent) return true;
+    }
+    return false;
+  }
+
+  /** Overlay this run's edge writes onto a pre-turn ordering snapshot (R1):
+   * drop every same-run writer from the authority rows, add back those whose
+   * CURRENT edge lives under `parent`, and re-sort with the shared
+   * (rank, child) comparator so the answer matches what the authority will
+   * derive after this turn's transcript applies. */
+  private overlaySameRunEdges(rows: readonly Record<string, unknown>[], container: ObjRef | null, parent: ObjRef | null): WooValue[] {
+    const out: { child: string; rank: string }[] = [];
+    for (const row of rows) {
+      const child = (row as { child?: unknown }).child;
+      if (typeof child === "string" && this.orderedEdgeWritesThisRun.has(child)) continue;
+      out.push({ child: String(child), rank: String((row as { rank?: unknown }).rank ?? "") });
+    }
+    for (const child of this.orderedEdgeWritesThisRun.keys()) {
+      const current = this.currentOrderedEdge(child);
+      if (current && current.parent === parent && (container === null || this.objects.get(child)?.location === container)) {
+        out.push({ child, rank: current.rank });
+      }
+    }
+    out.sort((a, b) => (a.rank < b.rank ? -1 : a.rank > b.rank ? 1 : a.child < b.child ? -1 : a.child > b.child ? 1 : 0));
+    return out as unknown as WooValue[];
   }
 
   // CA11.2: attach the planning world's per-cell provenance so the
@@ -1267,6 +1534,10 @@ export class WooWorld {
       eventSchemas: new Map()
     };
     this.objects.set(obj.id, obj);
+    // R1: a planning world knows its own creates, so an ordering read under a
+    // created parent synthesizes from this run's edge writes with no fetch,
+    // and a created child's pre-write membership is known-empty.
+    if (this.requireOrderedChildrenProjection) this.createdThisRun.add(obj.id);
     if (obj.parent) this.objects.get(obj.parent)?.children.add(obj.id);
     if (obj.location) this.objects.get(obj.location)?.contents.add(obj.id);
     this.persistObject(obj.id);
@@ -1509,6 +1780,13 @@ export class WooWorld {
         });
       }
       return false;
+    }
+    // R1: record a same-run ordered-edge write (with its pre-write
+    // membership) so ordering answers overlay it. First write wins — the
+    // overlay reads the CURRENT value at answer time, so only the original
+    // pre-state matters for relevance. No-op equal writes returned above.
+    if (this.requireOrderedChildrenProjection && name === ORDERED_EDGE_PROP && !this.orderedEdgeWritesThisRun.has(objRef)) {
+      this.orderedEdgeWritesThisRun.set(objRef, this.priorOrderingMembership(objRef, hadValue, before));
     }
     obj.properties.set(name, cloneValue(value));
     obj.propertyVersions.set(name, (obj.propertyVersions.get(name) ?? 0) + 1);
@@ -2185,6 +2463,7 @@ export class WooWorld {
       direct_callable: verb.direct_callable === true,
       tool_exposed: verb.tool_exposed === true,
       reads_room_presence: verb.reads_room_presence === true,
+      reads_ordered_children: verb.reads_ordered_children === true,
       source_hash: verb.source_hash ?? ""
     };
   }
@@ -5077,6 +5356,14 @@ export class WooWorld {
       await this.dispatch(handlerCtx, objRef, "recycle", []);
     } catch (err) {
       if (isErrorValue(err) && err.code === "E_VERBNF") return;
+      // Control signals (sparse-planning state/projection misses, VM
+      // suspend/read) are NOT ordinary handler failures — they must escape to
+      // the gateway repair, not be swallowed into a $recycle_handler_error and
+      // let recycle proceed. Otherwise a recycle whose :recycle handler re-homes
+      // children via ordered_children (e.g. the outliner) would tombstone the
+      // node with its children still edged to it. Same discipline as the VM's
+      // uncatchable-signal rethrow (P1.2).
+      if (isUncatchableControlSignal(err)) throw err;
       const code = isErrorValue(err) ? err.code : "E_INTERNAL";
       const message = isErrorValue(err) ? err.message ?? "" : err instanceof Error ? err.message : String(err);
       const event: Observation = {
@@ -5820,6 +6107,7 @@ export class WooWorld {
       direct_callable: verb.direct_callable === true,
       tool_exposed: verb.tool_exposed === true,
       reads_room_presence: verb.reads_room_presence === true,
+      reads_ordered_children: verb.reads_ordered_children === true,
       readable
     };
     if (readable && options.includeSource) {
@@ -6238,6 +6526,11 @@ export class WooWorld {
     try {
       await this.dispatch({ ...ctx, caller: ctx.thisObj, callerPerms: ctx.progr }, target, name, args);
     } catch (err) {
+      // Sparse-planning misses are control signals, not hook failures. They
+      // must reach the gateway so it can fetch the missing owner projection
+      // and replay the WHOLE move; swallowing one would commit relocation
+      // while silently skipping the hook's ordered-edge writes/observations.
+      if (isUncatchableControlSignal(err)) throw err;
       if (isErrorValue(err) && err.code === "E_VERBNF") return; // hook absent
       // Per the spec, post-move hooks must not fail the move. Swallow
       // and continue. Wizards reading transcripts will still see the
@@ -6754,6 +7047,16 @@ export class WooWorld {
     if (location && this.objects.has(location)) {
       this.object(location).contents.delete(objRef);
       this.persistObject(location);
+    }
+    // R1: a recycled object must vanish from same-run ordering answers even
+    // when nothing cleared its edge first (the outliner detaches before
+    // recycling, but the substrate must not depend on that).
+    if (this.requireOrderedChildrenProjection && !this.orderedEdgeWritesThisRun.has(objRef)) {
+      const obj2 = this.objects.get(objRef);
+      this.orderedEdgeWritesThisRun.set(
+        objRef,
+        this.priorOrderingMembership(objRef, obj2?.properties.has(ORDERED_EDGE_PROP) === true, obj2?.properties.get(ORDERED_EDGE_PROP))
+      );
     }
     // Steps 8/9: storage delete and tombstone insert.
     this.objects.delete(objRef);
@@ -12543,6 +12846,7 @@ function cloneImportedVerb(verb: VerbDef, slot: number): VerbDef {
     perms: parsedPerms.perms,
     direct_callable: parsedPerms.directCallable,
     reads_room_presence: verb.reads_room_presence === true ? true : undefined,
+    reads_ordered_children: verb.reads_ordered_children === true ? true : undefined,
     slot
   };
   if (verb.kind === "bytecode") {

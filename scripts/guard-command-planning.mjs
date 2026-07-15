@@ -247,10 +247,16 @@ for (const entry of readdirSync("catalogs")) {
       // not a false positive; check only the body for an invocation.
       const brace = source.indexOf("{");
       const body = brace === -1 ? "" : source.slice(brace);
-      if (!/room_roster\s*\(/.test(body)) continue;
       const dispatchable = verb.direct_callable === true || verb.tool_exposed === true;
-      if (dispatchable && verb.reads_room_presence !== true) {
+      if (/room_roster\s*\(/.test(body) && dispatchable && verb.reads_room_presence !== true) {
         failures.push(`${manifestPath}: verb "${verb.name}" invokes room_roster but is dispatchable without reads_room_presence:true — the gateway will not seed the compact owner roster and the turn hard-fails E_INTERNAL "room roster projection missing" over the net path (set reads_room_presence:true, like chat :who/:enter/:say_to/:leave)`);
+      }
+      // The ordering analogue: a dispatchable verb that reads sibling order
+      // (the `ordered_children(...)` builtin) forces net planning to require
+      // the ordered-children projection; the gateway seeds it only when the
+      // dispatched verb declares `reads_ordered_children: true`.
+      if (/ordered_children\s*\(/.test(body) && dispatchable && verb.reads_ordered_children !== true) {
+        failures.push(`${manifestPath}: verb "${verb.name}" invokes ordered_children but is dispatchable without reads_ordered_children:true — the gateway will not seed the ordered-children projection and the turn hard-fails E_INTERNAL "ordered-children projection missing" over the net path (set reads_ordered_children:true)`);
       }
     }
   }

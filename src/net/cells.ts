@@ -21,6 +21,7 @@
  * note).
  */
 import { hashSource } from "../core/source-hash";
+import { ORDERED_EDGE_PROP } from "../core/ordered-edge";
 import { netError } from "./errors";
 
 /** CO5 provenance, simplified from v2's five sources:
@@ -136,9 +137,52 @@ export class CellStore {
    * room's members (name matching, contents projection) without an
    * O(store) scan per turn. */
   private readonly membersByLocation = new Map<string, Set<string>>();
+  /** parent (or the "\0root" sentinel for null) → that parent's children,
+   * kept RANK-SORTED (tie-break by child id) at write time (P2.4, Adv-b).
+   * Lets a mutation's neighbour read and the ordering-version check touch
+   * O(children-of-parent) — never an O(whole-scope) scan — and answer
+   * count/child-index/predecessor/successor with NO per-request sort: an
+   * edge write is one binary-search insert/remove into its parent's array.
+   * (The ordering's content-address `version` still hashes all rows — that
+   * O(width) is inherent to a content address and unchanged here.) */
+  private readonly edgeChildrenByParent = new Map<string, Array<{ child: string; rank: string }>>();
 
   constructor(role: StoreRole) {
     this.role = role;
+  }
+
+  /** The `{parent, rank}` edge an ordered-edge property_cell carries, or
+   * `undefined` if the cell is not a valid ordered edge. The payload is
+   * `{ value: { parent, rank } }`. */
+  private static orderedEdgeOf(cell: Cell): { parent: string | null; rank: string } | undefined {
+    if (cell.kind !== "property_cell" || cell.name !== ORDERED_EDGE_PROP) return undefined;
+    const inner = (cell.value as { value?: unknown } | null)?.value;
+    if (!inner || typeof inner !== "object") return undefined;
+    const rank = (inner as { rank?: unknown }).rank;
+    if (typeof rank !== "string" || rank.length === 0) return undefined; // cleared/unranked
+    const parent = (inner as { parent?: unknown }).parent;
+    if (parent !== null && typeof parent !== "string") return undefined;
+    return { parent: (parent as string | null) ?? null, rank };
+  }
+
+  private static edgeParentKey(parent: string | null): string {
+    return parent === null ? "\0root" : parent;
+  }
+
+  /** The slot of `(rank, child)` in a rank-sorted sibling array (lower
+   * bound): the index of the first entry >= the probe in (rank, child)
+   * order. Exact entries are unique — a child has ONE edge cell — so this
+   * doubles as the removal locator. */
+  private static edgeSlot(rows: ReadonlyArray<{ child: string; rank: string }>, rank: string, child: string): number {
+    let lo = 0;
+    let hi = rows.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      const row = rows[mid];
+      if (row.rank < rank || (row.rank === rank && row.child < child)) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
   }
 
   /** Single internal write path: every insert/overwrite goes through here
@@ -176,6 +220,13 @@ export class CellStore {
       if (!members) this.membersByLocation.set(location, (members = new Set()));
       members.add(cell.object);
     }
+    const edge = CellStore.orderedEdgeOf(cell);
+    if (edge !== undefined) {
+      const key = CellStore.edgeParentKey(edge.parent);
+      let children = this.edgeChildrenByParent.get(key);
+      if (!children) this.edgeChildrenByParent.set(key, (children = []));
+      children.splice(CellStore.edgeSlot(children, edge.rank, cell.object), 0, { child: cell.object, rank: edge.rank });
+    }
   }
 
   private unindexCell(cell: Cell): void {
@@ -200,6 +251,34 @@ export class CellStore {
         if (members.size === 0) this.membersByLocation.delete(location);
       }
     }
+    const edge = CellStore.orderedEdgeOf(cell);
+    if (edge !== undefined) {
+      const key = CellStore.edgeParentKey(edge.parent);
+      const children = this.edgeChildrenByParent.get(key);
+      if (children) {
+        // The prior cell carries the OLD rank, so the removal locator finds
+        // the exact entry (setCell always unindexes the prior cell before
+        // indexing an overwrite — the array never holds two entries for one
+        // child).
+        const at = CellStore.edgeSlot(children, edge.rank, cell.object);
+        if (at < children.length && children[at].child === cell.object && children[at].rank === edge.rank) {
+          children.splice(at, 1);
+        }
+        if (children.length === 0) this.edgeChildrenByParent.delete(key);
+      }
+    }
+  }
+
+  /** The ordered children of `parent`, rank-sorted, via the per-parent edge
+   * index — O(children-of-parent) to COPY, with NO per-request sort (Adv-b:
+   * the array is maintained in (rank, child) order at write time, so count/
+   * child-index/predecessor/successor queries never re-sort a wide parent).
+   * The bounded read behind the ordering projection, the ordering-version
+   * check, and neighbour lookup (P2.4). */
+  orderedEdgeChildren(parent: string | null): Array<{ child: string; rank: string }> {
+    const children = this.edgeChildrenByParent.get(CellStore.edgeParentKey(parent));
+    if (!children) return [];
+    return children.map((row) => ({ child: row.child, rank: row.rank }));
   }
 
   get(key: string): Cell | undefined {
@@ -212,6 +291,13 @@ export class CellStore {
 
   keys(): IterableIterator<string> {
     return this.cells.keys();
+  }
+
+  /** Every cell in the store (for owner-side projections that reduce the
+   * whole scope, e.g. the ordered-children scan — O(store), on the authority
+   * only, producing ONE bounded value). */
+  allCells(): IterableIterator<Cell> {
+    return this.cells.values();
   }
 
   get size(): number {
