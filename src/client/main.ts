@@ -4453,9 +4453,23 @@ function currentRoomContents(room: string): any[] {
 
 function chatFrameComponentTag(): string | null {
   const subject = activeChatRoom();
-  const resolved = subject ? ui.catalogUi.resolveFrame(subject, undefined, clientClassDistance) : undefined;
-  const firstMainNode = resolved?.frame.regions.main?.[0];
-  const component = firstMainNode ? ui.catalogUi.component(firstMainNode.component, resolved?.catalog.alias) : undefined;
+  // A space-workspace frame's `main` region is the full tool surface; its
+  // compact conversation belongs in the separate `chat` region.  Reusing the
+  // main node here mounted (for example) the Tasks kanban as the Chat tab when
+  // an actor's live room was the taskboard.  The kanban's lifecycle read then
+  // synchronously notified NetFeed state, rerendered Chat, and constructed a
+  // new kanban until the browser exhausted its stack.  Chat must select only
+  // components that explicitly declare the `chat` surface.
+  const component = ui.catalogUi.componentsForSurface("chat")
+    .map((candidate) => {
+      const constraint = candidate.declaration.subject;
+      const distance = subject && typeof constraint === "string"
+        ? clientClassDistance(subject, constraint)
+        : false;
+      return distance === false ? null : { candidate, distance };
+    })
+    .filter((entry): entry is { candidate: ReturnType<typeof ui.catalogUi.componentsForSurface>[number]; distance: number } => entry !== null)
+    .sort((left, right) => left.distance - right.distance)[0]?.candidate;
   return (component ?? ui.catalogUi.component("chat.space", "chat"))?.declaration.tag ?? null;
 }
 
@@ -4680,6 +4694,14 @@ function renderChatCommandResult(action: ChatCommandUiAction, result: any, origi
     setTab("pinboard", { mode: "push", leaveCurrent: false });
     // The v2 projection/accepted frame already carries the board and note
     // projection. Do not queue list_notes or another overlay fetch on entry.
+    requestSpaceChatFocus(target);
+    return;
+  }
+  if (verb === "enter" && target === tasksSpace()) {
+    // The task registry is a room-like workspace just like the other bundled
+    // tools.  Keep command-driven entry on its declared main surface; leaving
+    // it on Chat used to expose the main/chat surface-selection bug above.
+    setTab("tasks", { mode: "push", leaveCurrent: false });
     requestSpaceChatFocus(target);
     return;
   }
