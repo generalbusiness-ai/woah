@@ -65,6 +65,7 @@ import {
 import { buildLaneFixture } from "./net-smoke-fixture";
 import type { CommitReply, ScopeHead } from "../src/net/scope";
 import type { AttemptTraceEntry } from "../src/net/errors";
+import { sessionShardHint } from "../src/net/session-id";
 
 const GATEWAY = "lane-gw";
 
@@ -363,9 +364,27 @@ async function main(): Promise<number> {
     const enteredA = await enterAnnex(sA, "lane-ws-enter-a");
     const enteredB = await enterAnnex(sB, "lane-ws-enter-b");
     step("two client sessions enter the annex (sequenced transitions)", enteredA && enteredB);
-    // The presence rows are the push audience — they must reach the
-    // client shard's mirror (via the annex refan) before the wave.
-    const wsPresence = await poll(async () => {
+    // The raw presence rows are the push audience — they must reach the
+    // client shard's INTERNAL mirror (via the annex refan) before the wave.
+    // Session ids are bearer credentials, so the public relation endpoint
+    // deliberately maps these rows to a deduplicated actor roster instead.
+    const clientShard = sessionShardHint(sA);
+    if (!clientShard || sessionShardHint(sB) !== clientShard) {
+      throw new Error(`same-key smoke sessions did not route to one named shard: ${sA}, ${sB}`);
+    }
+    const internalWsPresence = await poll(async () => {
+      const body = await get<{ members?: Array<{ member: string }> }>(
+        base,
+        "gateway",
+        clientShard,
+        `relation?relation=session_presence&owner=${encodeURIComponent("net_lane_annex")}`
+      );
+      const members = (body.members ?? []).map((m) => m.member);
+      return members.includes(sA) && members.includes(sB) ? body : null;
+    });
+    step("client sessions' presence rows reach the internal gateway mirror", internalWsPresence !== null);
+
+    const publicWsPresence = await poll(async () => {
       const res = await fetch(
         `${base}/net-api/relation?session=${sA}&relation=session_presence&owner=${encodeURIComponent("net_lane_annex")}`,
         { headers: { authorization: `Bearer ${wsToken}` } }
@@ -373,9 +392,9 @@ async function main(): Promise<number> {
       if (res.status !== 200) return null;
       const body = (await res.json()) as { members?: Array<{ member: string }> };
       const members = (body.members ?? []).map((m) => m.member);
-      return members.includes(sA) && members.includes(sB) ? body : null;
+      return members.length === 1 && members[0] === fixture.actor && !members.includes(sA) && !members.includes(sB) ? body : null;
     });
-    step("client sessions' presence rows reach the net-api mirror", wsPresence !== null);
+    step("public presence roster deduplicates actors and hides session credentials", publicWsPresence !== null);
 
     const openSocket = async (sid: string): Promise<{ ws: WebSocket; frames: Array<Record<string, unknown>> }> => {
       // B3: mint a single-use ticket over authenticated HTTP, then connect

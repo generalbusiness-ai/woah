@@ -87,13 +87,14 @@ Validate the minted token before storing it:
 export WOO_BASE_URL="https://woo.example.com"
 export WOO_APIKEY="apikey:<id>:<secret>"
 
-curl -fsS "$WOO_BASE_URL/api/auth" \
+curl -fsS "$WOO_BASE_URL/net-api/session" \
+  -H "Authorization: Bearer $WOO_APIKEY" \
   -H "content-type: application/json" \
-  --data "{\"token\":\"$WOO_APIKEY\"}"
+  --data '{}'
 ```
 
 The response should include `actor` equal to the horoscope block and
-`token_class: "apikey"`. Use the full `apikey:<id>:<secret>` token;
+a net `session`. Use the full `apikey:<id>:<secret>` token;
 `apikey:<secret>` is not the documented token form.
 
 After deploy, `:order("scorpio")` returns immediately with a ticket;

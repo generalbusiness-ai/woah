@@ -14,11 +14,11 @@ Cron-triggered every minute. Each tick:
 1. Reuses a cached woo session if one is still warm in this CF isolate
    (apikey-class sessions are valid for 24h; the plug re-authenticates
    only when the cached session is within 1h of expiry, or when the
-   isolate cold-started). Otherwise POSTs to `/api/auth` with the
+   isolate cold-started). Otherwise POSTs to `/net-api/session` with the
    actor-bound apikey for the block. The `tick_ok` log line carries
    `auth: "warm" | "cold"` so the cache hit rate is greppable from
    `wrangler tail`.
-2. GETs the block's `system_prompt` through a short in-isolate TTL cache
+2. Reads the block's exact `system_prompt` cell through a short in-isolate TTL cache
    (`SYSTEM_PROMPT_TTL_MS`, default 5 minutes). Owner changes may take a
    few ticks to reach a warm plug isolate; cold starts still read it once.
 3. Loops up to `MAX_ORDERS_PER_TICK`:
@@ -59,11 +59,11 @@ write it when `HEARTBEAT_INTERVAL_MS` has elapsed (default 5 minutes);
 ticks that delivered an order or need to surface `last_error` still write
 immediately.
 
-## Why REST, not MCP
+## Why net turns, not MCP
 
 The plug's calls are operational (queue drain, artifact production), not
-agent tool discovery. REST hits woo's perm system directly without going
-through MCP's `tool_exposed` gate, which keeps `:next_pending` and
+agent tool discovery. Authenticated net turns enforce woo permissions without
+going through MCP's `tool_exposed` gate, which keeps `:next_pending` and
 `:deliver` hidden from agent tool listings while the block's apikey-bound
 session can still call them. See `src/mcp-client.ts` for an MCP-attached
 variant kept for the day we want event-driven (`woo_wait`) drain instead
@@ -91,13 +91,14 @@ Validate `WOO_APIKEY` against woo before storing it:
 export WOO_BASE_URL="https://woo.example.com"
 export WOO_APIKEY="apikey:<id>:<secret>"
 
-curl -fsS "$WOO_BASE_URL/api/auth" \
+curl -fsS "$WOO_BASE_URL/net-api/session" \
+  -H "Authorization: Bearer $WOO_APIKEY" \
   -H "content-type: application/json" \
-  --data "{\"token\":\"$WOO_APIKEY\"}"
+  --data '{}'
 ```
 
-Success returns `token_class: "apikey"` and `actor` equal to the
-horoscope block. `E_NOSESSION` means the token is malformed, unknown,
+Success returns `actor` equal to the horoscope block and a net `session`.
+`E_NOSESSION` means the token is malformed, unknown,
 secret-mismatched, or revoked. Use the full `apikey:<id>:<secret>`
 token; `apikey:<secret>` is not the documented token form.
 

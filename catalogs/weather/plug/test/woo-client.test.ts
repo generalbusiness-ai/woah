@@ -42,7 +42,7 @@ describe("WooClient", () => {
           actor: "the_weather_block",
           session: "sess_abc",
           expires_at: 1234567890,
-          token_class: "apikey"
+          scope: "cluster:the_weather_block"
         }
       }
     ]);
@@ -58,9 +58,10 @@ describe("WooClient", () => {
     expect(client.currentSession?.session).toBe("sess_abc");
     expect(calls).toHaveLength(1);
     expect(calls[0]).toMatchObject({
-      url: "https://woo.example.com/api/auth",
+      url: "https://woo.example.com/net-api/session",
       method: "POST",
-      body: { token: "apikey:abc:def" }
+      headers: { Authorization: "Bearer apikey:abc:def", "Content-Type": "application/json" },
+      body: {}
     });
   });
 
@@ -72,7 +73,7 @@ describe("WooClient", () => {
       },
       {
         status: 200,
-        body: { value: "Mountain View, CA", version: 7 }
+        body: { cell: { value: { value: "Mountain View, CA" }, version: 7 } }
       }
     ]);
     const client = new WooClient({ baseUrl: "https://w.example", fetchImpl });
@@ -81,9 +82,9 @@ describe("WooClient", () => {
 
     expect(place).toBe("Mountain View, CA");
     expect(calls[1]).toMatchObject({
-      url: "https://w.example/api/objects/the_weather_block/properties/place",
+      url: "https://w.example/net-api/cell?session=sess_xyz&key=property_cell%3Athe_weather_block%3Aplace",
       method: "GET",
-      headers: { Authorization: "Session sess_xyz" }
+      headers: { Authorization: "Bearer apikey:a:b" }
     });
   });
 
@@ -95,7 +96,7 @@ describe("WooClient", () => {
       },
       {
         status: 200,
-        body: { result: { ok: true }, observations: [] }
+        body: { reply: { status: "accepted" }, result: { ok: true }, observations: [] }
       }
     ]);
     const client = new WooClient({ baseUrl: "https://w", fetchImpl });
@@ -106,10 +107,16 @@ describe("WooClient", () => {
 
     expect(result).toEqual({ ok: true });
     expect(calls[1]).toMatchObject({
-      url: "https://w/api/objects/the_weather_block/calls/set_properties",
+      url: "https://w/net-api/turn",
       method: "POST",
-      headers: { Authorization: "Session sess_q", "Content-Type": "application/json" },
-      body: { args: [{ current: { value: 72 }, last_pushed_at: 1700000000000 }] }
+      headers: { Authorization: "Bearer apikey:a:b", "Content-Type": "application/json" }
+    });
+    expect(calls[1].body).toMatchObject({
+      target: "the_weather_block",
+      verb: "set_properties",
+      args: [{ current: { value: 72 }, last_pushed_at: 1700000000000 }],
+      session: "sess_q",
+      idempotency_key: expect.stringMatching(/^plug:/)
     });
   });
 

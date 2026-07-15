@@ -116,7 +116,7 @@ export class WeatherConfigError extends Error {
 
 export async function runWeatherTick(
   env: WeatherPlugEnv,
-  deps: { fetchImpl?: typeof fetch } = {}
+  deps: { fetchImpl?: typeof fetch; now?: () => number } = {}
 ): Promise<WeatherTickResult> {
   const fetchImpl = deps.fetchImpl ?? globalThis.fetch.bind(globalThis);
   const client = new WooClient({ baseUrl: env.WOO_BASE_URL, fetchImpl });
@@ -147,7 +147,7 @@ export async function runWeatherTick(
   // Read what the plug has previously written so we can accumulate past
   // observations beyond tomorrow.io's free-tier window (24 h hourly /
   // 2 d daily). Cold start: both come back as `{}` / `[]` defaults; the
-  // merge functions handle that. The cost is two extra woo REST calls
+  // merge functions handle that. The cost is two extra exact net-cell reads
   // per tick — no tomorrow.io quota impact.
   const priorTimeseries = coerceTimeseries(await getOptionalProperty(client, env.BLOCK_ID, "timeseries"));
   const priorDaily = coerceDaily(await getOptionalProperty(client, env.BLOCK_ID, "daily"));
@@ -159,7 +159,8 @@ export async function runWeatherTick(
       place: tomorrowPlace,
       timezone,
       units,
-      fetchImpl
+      fetchImpl,
+      now: deps.now
     });
   } catch (err) {
     const message = formatLastError(err, place);
@@ -196,7 +197,7 @@ export async function runWeatherTick(
   return { block: env.BLOCK_ID, place, fetched_at: snapshot.fetched_at };
 }
 
-// Light shape guards at the woo-REST boundary. The block defaults
+// Light shape guards at the woo-net boundary. The block defaults
 // `timeseries` to `{}` and `daily` to `[]`, so a cold-start tick sees
 // "empty but not null" — coerce to `null` so the merge code can take
 // the simple "no prior" branch.

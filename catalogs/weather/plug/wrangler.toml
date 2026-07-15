@@ -23,5 +23,5 @@ crons = ["0 * * * *"]
 #   wrangler deploy
 [vars]
 # Public routing/config values. Secrets still go through `wrangler secret put`.
-WOO_BASE_URL = "https://woah.generalbusiness.ai"
+WOO_BASE_URL = "https://woah1.generalbusiness.ai"
 BLOCK_ID = "the_weather"

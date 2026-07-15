@@ -24,7 +24,9 @@ const PLUGS = {
 };
 
 function usage() {
-  return `Usage: npm run plugs:bootstrap -- [options]
+  return `LEGACY V2-ONLY helper — do not use against a net deployment.
+
+Usage: npm run plugs:bootstrap:v2 -- [options]
 
 Mints fresh woo apikeys bound to the demo weather/horoscope blocks, updates
 public Wrangler vars, stores secrets, and optionally deploys/triggers the plug

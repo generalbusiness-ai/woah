@@ -140,9 +140,10 @@ async function runTurn(
   );
 }
 
-/** Both sessions must appear in the annex's session_presence mirror at the
- * net-api shard BEFORE the wave: the mirror rows are the push audience. */
-async function waitForAnnexPresence(sessions: string[]): Promise<void> {
+/** Both actors must appear in the public annex roster before the wave. The
+ * underlying session rows are the push audience, but their member ids are
+ * bearer credentials and the client projection must never expose them. */
+async function waitForAnnexPresence(sessions: string[], actors: string[]): Promise<void> {
   await expect
     .poll(
       async () => {
@@ -155,7 +156,7 @@ async function waitForAnnexPresence(sessions: string[]): Promise<void> {
         if (res.status !== 200) return false;
         const body = (await res.json()) as { members?: Array<{ member: string }> };
         const members = (body.members ?? []).map((m) => m.member);
-        return sessions.every((s) => members.includes(s));
+        return actors.every((actor) => members.includes(actor)) && sessions.every((session) => !members.includes(session));
       },
       { timeout: 20_000, message: "annex session_presence mirror never showed both sessions" }
     )
@@ -213,7 +214,7 @@ test("cross-user: peer observation frame + mirror re-read, both directions", asy
     expect(enterB.status).toBe("accepted");
     const sessionA = (await pageA.locator("#state").getAttribute("data-session")) as string;
     const sessionB = (await pageB.locator("#state").getAttribute("data-session")) as string;
-    await waitForAnnexPresence([sessionA, sessionB]);
+    await waitForAnnexPresence([sessionA, sessionB], [actorA as string, actorB as string]);
 
     // ---- direction 1: A acts, B sees --------------------------------------
     const waveA = await runTurn(pageA, "net_lane_annex", "wave");

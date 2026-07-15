@@ -141,7 +141,7 @@ export async function runNetInstall(args: Args, env: { WOO_INTERNAL_SECRET?: str
     const response = await signedFetch(env, new Request(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ scope, catalog_epoch: plan.epoch, cells })
+      body: JSON.stringify({ scope, catalog_epoch: plan.epoch, cells, relations: plan.relations.get(scope) ?? [] })
     }));
     const body = await response.text();
     if (!response.ok) throw new Error(`seed ${scope} failed: ${response.status} ${body}`);

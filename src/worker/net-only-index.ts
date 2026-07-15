@@ -140,9 +140,9 @@ async function handleNetInstall(request: Request, env: NetOnlyEnv, url: URL): Pr
   const verb = parts[3];
   const allowed =
     parts[1] === "scope" && parts.length === 4 && Boolean(name) &&
-    ((request.method === "POST" && (verb === "seed" || verb === "activate")) || (request.method === "GET" && verb === "head"));
+    ((request.method === "POST" && (verb === "seed" || verb === "activate" || verb === "repair-relations")) || (request.method === "GET" && verb === "head"));
   if (!allowed) {
-    return json({ error: { code: "E_INVARG", message: "expected a signed net install probe, scope seed, activate, or head operation" } }, 404);
+    return json({ error: { code: "E_INVARG", message: "expected a signed net install probe, scope seed, activate, repair-relations, or head operation" } }, 404);
   }
   try {
     const stub = resolveNetDestination(env, `scope:${name}`);

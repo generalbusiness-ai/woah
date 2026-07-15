@@ -1,7 +1,7 @@
 # Weather plug
 
 Cloudflare Worker that fetches weather from [tomorrow.io](https://tomorrow.io)
-and writes it into a `$weather_block` instance via the woo REST API.
+and writes it into a `$weather_block` instance via woo's net API.
 
 This is the outside-world half of the weather block. The catalog half (the
 `$weather_block` class, manifest, UI components) lives elsewhere in
@@ -11,12 +11,12 @@ This is the outside-world half of the weather block. The catalog half (the
 
 Cron-triggered hourly. Each tick:
 
-1. POSTs to `/api/auth` with the actor-bound apikey for the weather block.
-2. GETs the block's owner-set config (`place`, `timezone`, `units`).
+1. POSTs to `/net-api/session` with the actor-bound apikey for the weather block.
+2. Reads the block's exact owner-set config cells (`place`, `timezone`, `units`).
 3. Fetches three tomorrow.io endpoints in parallel: `weather/realtime`,
    `weather/forecast` (1h+1d timesteps), and `weather/history/recent`
    (1h+1d timesteps).
-4. POSTs `:set_properties` with `current` (flat scalar bundle, including
+4. POSTs a sequenced `/net-api/turn` for `:set_properties` with `current` (flat scalar bundle, including
    `local_date` — the calendar date in the configured timezone at
    observation time, used by the block's chat verbs to resolve "today"),
    `daily` (per-day rollup array, each entry stamped with a 3-letter
@@ -81,13 +81,14 @@ Validate `WOO_APIKEY` against woo before storing it:
 export WOO_BASE_URL="https://woo.example.com"
 export WOO_APIKEY="apikey:<id>:<secret>"
 
-curl -fsS "$WOO_BASE_URL/api/auth" \
+curl -fsS "$WOO_BASE_URL/net-api/session" \
+  -H "Authorization: Bearer $WOO_APIKEY" \
   -H "content-type: application/json" \
-  --data "{\"token\":\"$WOO_APIKEY\"}"
+  --data '{}'
 ```
 
-Success returns `token_class: "apikey"` and `actor` equal to the weather
-block. `E_NOSESSION` means the token is malformed, unknown, secret-
+Success returns `actor` equal to the weather block and a net `session`.
+`E_NOSESSION` means the token is malformed, unknown, secret-
 mismatched, or revoked. Use the full `apikey:<id>:<secret>` token;
 `apikey:<secret>` is not the documented token form.
 

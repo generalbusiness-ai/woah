@@ -1,7 +1,7 @@
 // Minimal MCP client for plug Workers, talking to woo's streamable-HTTP MCP
 // gateway (src/mcp/gateway.ts).
 //
-// **NOT CURRENTLY WIRED.** The production plug uses REST via woo-client.ts.
+// **NOT CURRENTLY WIRED.** The production plug uses net turns via woo-client.ts.
 // This module is preserved for the future long-lived "event-driven" plug
 // variant — when the catalog is ready and we want a persistent session that
 // drains via `woo_wait` instead of cron polling, this is the transport.
@@ -9,7 +9,7 @@
 // `woo_call` requires verbs to be `tool_exposed: true` and reachable
 // (server.ts:129, host.ts:588). For dispenser-style plugs that's a deliberate
 // catalog policy decision: hide :next_pending / :deliver from agent
-// discovery (current default) → use REST; expose them as MCP tools →
+// discovery (current default) → use authenticated net turns; expose them as MCP tools →
 // switch to this client.
 //
 // Transport: HTTP POST per JSON-RPC request. First POST carries

@@ -668,7 +668,8 @@ Startup storage instrumentation is emitted by the DO/repository wrapper before t
 
 Browser activity instrumentation is first-class because v2 open latency spans
 the browser cache, the network, the gateway, and CommitScopeDO. The browser
-worker posts `browser_activity` batches to `/api/browser-metrics`; the gateway
+worker posts `browser_activity` batches to the active transport's metrics route
+(`/api/browser-metrics` for v2, `/net-api/browser-metrics` for net); the gateway
 authenticates the session, overwrites the actor with the session actor, and
 emits them under host key `browser`. Required activity coverage includes
 worker commands, WebSocket connect/readiness/send, frame decode/process, cache

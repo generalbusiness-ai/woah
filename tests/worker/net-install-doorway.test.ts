@@ -189,6 +189,32 @@ describe("the /net-install doorway (route level)", () => {
     h.close();
   });
 
+  it("repairs initial contents rows through the signed add-only operator path", async () => {
+    const h = buildHarness();
+    const room = {
+      kind: "object_lineage",
+      object: "repair_room",
+      value: { parent: "$space", owner: "$wiz", name: "Repair Room", anchor: null, flags: {} }
+    };
+    const seeded = await h.signedRequest("/net-install/scope/room%3Arepair_room/seed", seedBody("room:repair_room", EPOCH, [room]));
+    expect(seeded.status, await seeded.clone().text()).toBe(200);
+    const repairBody = {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        relations: [{ relation: "contents", owner: "repair_room", member: "mounted_tool" }]
+      })
+    };
+    const repaired = await h.signedRequest("/net-install/scope/room%3Arepair_room/repair-relations", repairBody);
+    expect(repaired.status, await repaired.clone().text()).toBe(200);
+    expect(await repaired.json()).toMatchObject({ ok: true, status: "applied", changed: ["relation:contents:repair_room:mounted_tool"] });
+    const replayed = await h.signedRequest("/net-install/scope/room%3Arepair_room/repair-relations", repairBody);
+    expect(await replayed.json()).toMatchObject({ ok: true, status: "empty", changed: [] });
+    const rows = h.scopeStates.get("room:repair_room")!.storage.sql.exec("SELECT body FROM net_scope_relation").toArray();
+    expect(rows).toHaveLength(1);
+    h.close();
+  });
+
   it("malformed seed bodies surface as errors, not crashes or silent success", async () => {
     const h = buildHarness();
     const malformed = await h.signedRequest("/net-install/scope/room%3Abad/seed", {

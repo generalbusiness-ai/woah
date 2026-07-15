@@ -25,7 +25,8 @@ import { createWorld } from "../core/bootstrap";
 import { DEFAULT_LOCAL_CATALOGS, installLocalCatalogs, localCatalogBundleFingerprint } from "../core/local-catalogs";
 import type { WooWorld } from "../core/world";
 import { cellsFromSerialized, type NetCellInput } from "./bridge";
-import { CATALOG_SCOPE, partitionCells } from "./topology";
+import { CATALOG_SCOPE, classifierFromLineage, partitionCells, type AnchorLineage } from "./topology";
+import type { RelationRow } from "./relations";
 
 /**
  * The activation barrier (cutover state machine — spec/operations/
@@ -52,6 +53,11 @@ export type NetInstallPlan = {
   epoch: string;
   /** CO15 partition: scope name → the cells it anchors. */
   partitions: Map<string, NetCellInput[]>;
+  /** Initial derived contents rows, partitioned by the LOCATION owner's
+   * scope. These cannot be reconstructed one seed partition at a time:
+   * self-hosted spaces such as the pinboard own their live cell while their
+   * containing room owns the corresponding contents row. */
+  relations: Map<string, RelationRow[]>;
   /** The built world — callers verify against it (e.g. that an imported
    * apikey authenticates) and mine it for reports. */
   world: WooWorld;
@@ -99,14 +105,40 @@ export async function planNetInstall(options: NetInstallOptions = {}): Promise<N
   normalizeAnchors(world);
   seedGuestPool(world);
   const epoch = netInstallEpoch(catalogs);
-  const partitions = partitionCells(cellsFromSerialized(world.exportWorld()));
+  const cells = cellsFromSerialized(world.exportWorld());
+  const partitions = partitionCells(cells);
+  const relations = partitionInstallRelations(cells);
   if (options.activate !== false) {
     // Pre-verified installs (fixtures, lanes): active from the first seed.
     const catalog = partitions.get(CATALOG_SCOPE) ?? [];
     catalog.push(netActivationCell(epoch));
     partitions.set(CATALOG_SCOPE, catalog);
   }
-  return { epoch, partitions, world };
+  return { epoch, partitions, relations, world };
+}
+
+/** Derive the install-time `contents` family from the complete world image and
+ * route each row by its OWNER's CO15 scope. This is intentionally a whole-
+ * install operation: doing it inside individual scope seeds loses cross-scope
+ * facts such as `the_pinboard` living on `the_deck`. */
+export function partitionInstallRelations(cells: readonly NetCellInput[]): Map<string, RelationRow[]> {
+  const lineage = new Map<string, AnchorLineage>();
+  for (const cell of cells) {
+    if (cell.kind === "object_lineage") lineage.set(cell.object, cell.value as AnchorLineage);
+  }
+  const classifier = classifierFromLineage((object) => lineage.get(object) ?? null);
+  const out = new Map<string, RelationRow[]>();
+  for (const cell of cells) {
+    if (cell.kind !== "object_live") continue;
+    const location = (cell.value as { location?: unknown } | null)?.location;
+    if (typeof location !== "string" || !location || location === "$nowhere") continue;
+    const scope = classifier.scopeOf(location);
+    const rows = out.get(scope) ?? [];
+    rows.push({ relation: "contents", owner: location, member: cell.object });
+    out.set(scope, rows);
+  }
+  for (const rows of out.values()) rows.sort((a, b) => `${a.owner}\0${a.member}`.localeCompare(`${b.owner}\0${b.member}`));
+  return out;
 }
 
 /**

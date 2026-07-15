@@ -45,12 +45,12 @@ const authReply = (): Reply => ({
 
 const callReply = (result: unknown): Reply => ({
   status: 200,
-  body: { result, observations: [] }
+  body: { reply: { status: "accepted" }, result, observations: [] }
 });
 
 const propertyReply = (value: unknown): Reply => ({
   status: 200,
-  body: { value }
+  body: { cell: { value: { value } } }
 });
 
 describe("runLoggedHoroscopeTick", () => {
@@ -198,9 +198,9 @@ describe("runLoggedHoroscopeTick", () => {
     expect(result.errors).toEqual([{ order_id: "ord_1", message: "upstream timed out" }]);
     // No :cancel was attempted — transient errors leave the order alone so a
     // momentary upstream blip doesn't silently drop a user's request.
-    expect(calls.find((c) => c.url.includes("/calls/cancel"))).toBeUndefined();
+    expect(calls.find((c) => (c.body as { verb?: string } | undefined)?.verb === "cancel")).toBeUndefined();
     // The tick still wraps up with set_properties so last_error is recorded.
-    const heartbeat = calls.find((c) => c.url.includes("/calls/set_properties"));
+    const heartbeat = calls.find((c) => (c.body as { verb?: string } | undefined)?.verb === "set_properties");
     expect((heartbeat?.body as { args: [Record<string, unknown>] }).args[0].last_error).toBe("upstream timed out");
     const events = lines.map((l) => l.event);
     expect(events).toContain("order_error");

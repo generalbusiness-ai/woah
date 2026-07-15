@@ -12,11 +12,10 @@
 // queue entry and creates a $note). Lost wakeups don't matter — the next
 // tick catches up.
 //
-// Transport choice: REST. The plug's calls are operational (queue drain,
-// artifact production), not agent tool discovery. REST hits woo's perm
-// system directly without going through MCP's `tool_exposed` gate, which
-// keeps :next_pending and :deliver hidden from agent tool listings while
-// the block's apikey-bound session can still call them. See
+// Transport choice: net turns. The plug's calls are operational (queue drain,
+// artifact production), not agent tool discovery. Authenticated net turns
+// enforce woo permissions without going through MCP's `tool_exposed` gate,
+// keeping :next_pending and :deliver hidden from agent tool listings. See
 // `mcp-client.ts` for the long-lived MCP-attached variant kept for the
 // day we want event-driven (`woo_wait`) drain instead of cron polling.
 
@@ -226,7 +225,7 @@ export type HoroscopeTickResult = {
   block: string;
   delivered: number;
   errors: Array<{ order_id: string; message: string }>;
-  /** "warm" when the session cache hit and we skipped /api/auth, "cold"
+  /** "warm" when the session cache hit and skipped /net-api/session, "cold"
    * when we authenticated. Surfaced in the `tick_ok` log so dashboards can
    * compute a cache hit rate from `wrangler tail`. */
   authMode: "warm" | "cold";
@@ -252,14 +251,14 @@ export async function runHoroscopeTick(
   const client = new WooClient({ baseUrl: env.WOO_BASE_URL, fetchImpl });
 
   // Warm-path reuse: an apikey-class session minted on a prior tick is
-  // still good for ~24h. Skipping /api/auth here is the whole point of
-  // the cache — each fresh authenticate() spends a /api/auth round trip
-  // AND triggers a directory `register-session` write. Re-auth only when
+  // still good for ~24h. Skipping /net-api/session here is the point of
+  // the cache — each fresh authenticate() commits a new presence session.
+  // Re-auth only when
   // we'd otherwise be running into the expiry boundary mid-tick.
   const cached = sessionCache.get();
   let authMode: "warm" | "cold";
   if (cached && cached.expiresAt !== null && cached.expiresAt - now() > REAUTH_MARGIN_MS) {
-    client.adoptSession(cached);
+    client.adoptSession(cached, env.WOO_APIKEY);
     authMode = "warm";
   } else {
     const fresh = await client.authenticate(env.WOO_APIKEY);

@@ -478,12 +478,15 @@ function flushBrowserMetrics(options: { keepalive?: boolean } = {}): void {
   const metrics = browserMetricQueue.splice(0, browserMetricBatchLimit);
   browserMetricFlushInFlight = true;
   browserMetricLastFlushAt = performance.now();
-  void fetch("/api/browser-metrics", {
-    method: "POST",
-    headers: authHeaders({ "content-type": "application/json" }),
-    body: JSON.stringify({ metrics }),
-    keepalive: options.keepalive === true
-  }).catch(() => {
+  const request = netMode() && netFeed
+    ? netFeed.reportBrowserMetrics(metrics)
+    : fetch("/api/browser-metrics", {
+        method: "POST",
+        headers: authHeaders({ "content-type": "application/json" }),
+        body: JSON.stringify({ metrics }),
+        keepalive: options.keepalive === true
+      }).then(() => undefined);
+  void request.catch(() => {
     // Metrics are diagnostic only. Dropping a failed batch avoids creating
     // back-pressure on the UI when the network is already unhealthy.
   }).finally(() => {
@@ -731,6 +734,7 @@ function openNetFeed(bearer: string, adopt: { session: string; actor: string } |
   // routing, tab cues), exactly like v2's paired call sites.
   wireNetFeed(ui, netFeed);
   netFeed.onState((feedState) => {
+    const becameOpen = feedState.connection === "open" && !netFeedOpen;
     netFeedOpen = feedState.connection === "open";
     if (feedState.actor) state.actor = feedState.actor;
     if (feedState.session) state.session = feedState.session;
@@ -748,17 +752,28 @@ function openNetFeed(bearer: string, adopt: { session: string; actor: string } |
       state.loginError = String(feedState.error.message ?? feedState.error);
     }
     render();
+    // The socket-open transition is the first point at which bounded net
+    // projection reads are guaranteed to have a live session.  Hydrate the
+    // room then; the initial REST mint may finish before the socket does.
+    if (becameOpen) void refreshNetRoomProjection();
   });
   // Peer AND self observations flow through the one dispatcher the v2
   // socket already feeds — chat routing (isChatObservation), tool-tab
   // cues, and the observations panel work unchanged.
   netFeed.onObservation((event) => {
     const obs = event.observation as { type?: unknown; actor?: unknown; destination?: unknown; room?: unknown; source?: unknown };
+    let roomChanged = false;
     if (obs?.actor === state.actor) {
-      if (obs?.type === "left" && typeof obs.destination === "string") netCurrentRoom = obs.destination;
-      else if (obs?.type === "entered" && typeof obs.source === "string") netCurrentRoom = obs.source;
+      if (obs?.type === "left" && typeof obs.destination === "string") {
+        roomChanged = netCurrentRoom !== obs.destination;
+        netCurrentRoom = obs.destination;
+      } else if (obs?.type === "entered" && typeof obs.source === "string") {
+        roomChanged = netCurrentRoom !== obs.source;
+        netCurrentRoom = obs.source;
+      }
     }
     receiveLiveEvent(event.observation);
+    if (roomChanged) void refreshNetRoomProjection();
   });
   state.authStatus = "authenticated"; // the shell renders; sends gate on netFeedOpen
   render();
@@ -775,6 +790,9 @@ function openNetFeed(bearer: string, adopt: { session: string; actor: string } |
         // Best-effort: commands fall back to typing in whatever room the
         // first observation names.
       }
+      // Socket-open can precede this actor-cell read, so the state callback's
+      // eager refresh may legitimately have had no room anchor yet.
+      await refreshNetRoomProjection();
       render();
     })
     .catch((err) => {
@@ -1685,7 +1703,10 @@ async function refreshScopedProjection() {
   // to the login screen (the tab-click path calls this via
   // ensureScopedProjectionReady). Net panels read the client projection
   // and their components' own net-routed reads instead.
-  if (netMode()) return;
+  if (netMode()) {
+    await refreshNetRoomProjection();
+    return;
+  }
   const startedRevision = scopedProjectionLocalRevision;
   try {
     const [meResponse, catalogs] = await Promise.all([
@@ -2011,6 +2032,71 @@ function netCellPayload(cell: unknown): Record<string, any> | undefined {
   if (!cell || typeof cell !== "object" || Array.isArray(cell)) return undefined;
   const value = (cell as { value?: unknown }).value;
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, any> : undefined;
+}
+
+/** Hydrate the bounded room neighborhood used by the existing projection-
+ * driven shell while running on net.  Static contents come from the room
+ * owner's `contents` relation; exact object fields come from presence-gated
+ * cells.  This is the net equivalent of `/api/me`'s `here` slice, not a
+ * whole-world or arbitrary-property enumeration. */
+async function refreshNetRoomProjection(): Promise<void> {
+  const feed = netFeed;
+  const room = netCurrentRoom;
+  if (!feed || !netFeedOpen || !room || !state.actor || !state.session) return;
+  try {
+    const [contentRows, presenceRows, roomSummary] = await Promise.all([
+      feed.relation("contents", room),
+      feed.relation("session_presence", room),
+      fetchNetObjectSummary(room, ["description", "aliases", "features"])
+    ]);
+    // A move may complete while these reads are in flight.  Never install the
+    // old room as current after the accepted result advanced netCurrentRoom.
+    if (room !== netCurrentRoom) return;
+    const contentIds = Array.from(new Set(contentRows
+      .map((row) => row.member)
+      .filter((id): id is string => typeof id === "string" && id.length > 0 && id !== state.actor)));
+    const contents = (await Promise.all(contentIds.map((id) => fetchNetObjectSummary(id, ["description", "aliases", "features"]))))
+      .filter((item): item is Record<string, unknown> => Boolean(item));
+    const roster = presenceRows.map((row) => {
+      const body = row.body && typeof row.body === "object" && !Array.isArray(row.body)
+        ? row.body as Record<string, unknown>
+        : {};
+      const id = typeof body.player === "string" ? body.player : row.member;
+      return { ...body, id, name: typeof body.name === "string" ? body.name : id };
+    });
+    const here = {
+      id: room,
+      name: String(roomSummary?.name ?? room),
+      parent: roomSummary?.parent,
+      description: roomSummary?.props?.description ?? null,
+      props: roomSummary?.props ?? {},
+      contents,
+      roster,
+      exits: []
+    };
+    state.scopedProjection = {
+      ...(state.scopedProjection ?? { inventory: [], overlays: {} }),
+      self: ui.observe(state.actor) ?? { id: state.actor },
+      session: {
+        id: state.session,
+        actor: state.actor,
+        active_scope: room,
+        current_location: room
+      },
+      here,
+      inventory: state.scopedProjection?.inventory ?? [],
+      overlays: state.scopedProjection?.overlays ?? {}
+    };
+    ui.ingestSnapshot("net-here", roomSnapshotObjects(here));
+    state.chatPresent = roster.map((item) => String(item.id));
+    lastObservedChatRoom = room;
+    render();
+  } catch (err) {
+    // Keep the last coherent room projection visible.  The feed invalidates
+    // its read cache on every accepted/fanout change, so the next refresh is a
+    // fresh retry rather than a permanent partial snapshot.
+    console.warn("woo.net room projection refresh failed", err);
+  }
 }
 
 let projectionFillRenderQueued = false;

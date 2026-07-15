@@ -517,6 +517,16 @@ One write path per fact (CO9), concretized:
   JSON body, stored at the scope that owns the relation's OWNER object
   (a sixth scope row family), mirrored into gateway views for reads, and
   fanned to subscribers alongside cells (`FanoutBody.relations`).
+- **Installation derives initial contents before partitioning.** The installer
+  computes `object_live.location` memberships from the complete world image,
+  then partitions each row by the location OWNER's scope and seeds cells plus
+  relations atomically. Per-scope reconstruction is insufficient: a
+  self-hosted space owns its live cell while its containing room owns the
+  membership row (for example, the pinboard's row belongs to the Deck).
+  Same-epoch pre-traffic reseed replaces the complete seeded relation family.
+  For namespaces created before this rule, the signed add-only
+  `repair-relations` operator operation advances the owner head only when a row
+  is missing and refans that delta; replay is an idempotent no-op.
 - **The applier runs at the committing scope.** On accept, the scope
   derives relation deltas from the transcript: `projectionWrites`
   (contents add/remove), moves (contents of the source and destination
@@ -680,12 +690,11 @@ One write path per fact (CO9), concretized:
   Phase-4 transport in front of `/net/session-open` — implemented as
   `/net-api` (below).
 - **The `/net-api` client surface (implemented — Phase 4 item 2).** The
-  worker entry routes `/net-api/*` to ONE stable GATEWAY_NET shard
-  (`net-api`): a session cell installs into the MINTING gateway's
-  derived view and `/net-api/turn` validates the session from that same
-  view, so mint and turn must land on the same DO; hash-sharding by
-  session id waits on a session→cluster pull-on-miss story (session ids
-  carry no lineage). No internal signing rides this path — the gateway
+  worker entry routes `/net-api/*` across a bounded configured set of
+  GATEWAY_NET shards. A session id carries its minting shard hint, so its
+  cell installs into the minting gateway's derived view and later turns,
+  reads, metrics, tickets, and WebSocket upgrades return to that same DO.
+  No internal signing rides this path — the gateway
   authenticates the client credential itself: `authorization: Bearer
   apikey:<id>:<secret>` (or `x-woo-api-key`) verified against the
   catalog identity cell `property_cell:$system:api_keys` (pull-on-miss
@@ -734,6 +743,11 @@ One write path per fact (CO9), concretized:
     accept always digest-matches its plan).
   - `GET /net-api/relation` / `GET /net-api/cell` are the authenticated
     client reads over the CO13 roster mirror and the view cell probe.
+  - `POST /net-api/browser-metrics {session, metrics}` accepts at most 50
+    bounded `browser_activity` diagnostics per batch after validating the
+    session/actor binding. Payload actor fields are ignored; the authenticated
+    actor is written to Analytics Engine. This keeps net clients off the v2
+    `/api/browser-metrics` namespace and does not mutate world state.
   - **`GET /net-api/ws` (implemented — Phase 4 item 3; ticket auth per
     pre-deploy fix B3)** upgrades to a WebSocket. The upgrade
     authenticates by a SHORT-LIVED SINGLE-USE TICKET, never the apikey:
