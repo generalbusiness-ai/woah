@@ -120,6 +120,30 @@ test("the real SPA over the net path: alice's chat line reaches bob's browser", 
   await contextB.close();
 });
 
+test("entering and leaving Tasks keeps workspace and chat component surfaces separate", async ({ browser }) => {
+  test.setTimeout(120_000);
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const pageErrors: string[] = [];
+  page.on("pageerror", (error) => pageErrors.push(`${error.name}: ${error.message}`));
+  await openSpa(page, credentials.alice);
+
+  await page.getByRole("button", { name: "Tasks" }).click();
+  await expect(page.getByRole("button", { name: "Tasks" })).toHaveClass(/active/);
+  await expect(page.locator("woo-tasks-kanban[data-tasks-board]")).toBeVisible({ timeout: 30_000 });
+  // Presence proves the enter turn settled; the regression only occurred once
+  // Chat rendered while the actor's live room was the task registry.
+  await expect(page.locator("woo-space-chat-panel[data-space-chat-panel]")).toBeVisible({ timeout: 30_000 });
+
+  await page.getByRole("button", { name: "Chat", exact: true }).click();
+  await expect(page.locator("woo-chat-space[data-chat-space-host]")).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator("woo-tasks-kanban[data-chat-space-host]")).toHaveCount(0);
+  expect(pageErrors).toEqual([]);
+  expectNoLegacyRequests(page);
+
+  await context.close();
+});
+
 test("the route switch selects the net client: bare `/` with empty storage reaches the door (finding 4)", async ({ browser }) => {
   test.setTimeout(60_000);
   // The exact first-time-user shape after DNS movement: no query flag,
