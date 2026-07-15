@@ -1,8 +1,9 @@
 // Idempotent operator repair for namespaces installed before install-time
 // contents relations were seeded. The required object allow-list prevents a
 // fresh bootstrap image from resurrecting a bundled object that operators
-// deliberately moved after installation. Live guest/human locations are never
-// inferred from bootstrap state, even when explicitly named.
+// deliberately moved after installation. Live player/guest locations are never
+// inferred from bootstrap state, even when explicitly named; anchored block
+// actors remain eligible because they are static fixtures, not players.
 import { planNetInstall } from "../src/net/install";
 import { signInternalRequest } from "../src/worker/internal-auth";
 
@@ -17,27 +18,27 @@ async function main(): Promise<void> {
   const plan = await planNetInstall({ activate: false });
   const serialized = plan.world.exportWorld();
   const objects = new Map(serialized.objects.map((object) => [object.id, object]));
-  const isActor = (id: string): boolean => {
+  const isPlayer = (id: string): boolean => {
     let current: string | null | undefined = id;
     const seen = new Set<string>();
     while (current && !seen.has(current)) {
-      if (current === "$actor") return true;
+      if (current === "$player") return true;
       seen.add(current);
       current = objects.get(current)?.parent;
     }
     return false;
   };
   const eligible = new Set(
-    [...plan.relations.values()].flat().filter((row) => !isActor(row.member)).map((row) => row.member)
+    [...plan.relations.values()].flat().filter((row) => !isPlayer(row.member)).map((row) => row.member)
   );
   const missing = [...requested].filter((id) => !eligible.has(id));
   if (missing.length > 0) {
-    throw new Error(`refused: requested ids are not bundled non-actor static memberships: ${missing.join(", ")}`);
+    throw new Error(`refused: requested ids are not bundled non-player static memberships: ${missing.join(", ")}`);
   }
 
   let added = 0;
   for (const [scope, rows] of [...plan.relations].sort(([a], [b]) => a.localeCompare(b))) {
-    const relations = rows.filter((row) => requested.has(row.member) && !isActor(row.member));
+    const relations = rows.filter((row) => requested.has(row.member) && !isPlayer(row.member));
     if (relations.length === 0) continue;
     const url = `${baseUrl}/net-install/scope/${encodeURIComponent(scope)}/repair-relations`;
     const request = await signInternalRequest(
