@@ -9,6 +9,7 @@ import { FakeDurableObjectState } from "./fake-do";
 import { createWorld } from "../../src/core/bootstrap";
 import { exportIdentity, importIdentity } from "../../src/net/identity";
 import { planNetInstall } from "../../src/net/install";
+import { cellVersion } from "../../src/net/cells";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
@@ -54,6 +55,7 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
 
     // Seed every partition; the gateway self-resolves for subscriptions.
     const states: Array<ReturnType<typeof netState>> = [];
+    const scopeStates = new Map<string, ReturnType<typeof netState>>();
     const scopeDOs = new Map<string, NetScopeDO>();
     let gateway: NetGatewayDO;
     const resolve = (destination: string) => {
@@ -76,6 +78,7 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
       const seeded = await instance.fetch(await signInternalRequest(scopeEnv, request));
       expect(seeded.ok, `seed ${scope}`).toBe(true);
       states.push(st);
+      scopeStates.set(scope, st);
       scopeDOs.set(scope, instance);
     }
     const gatewayState = netState("gateway-net-api");
@@ -203,12 +206,27 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
     expect(taken, JSON.stringify(takeObs).slice(0, 400)).toBeTruthy();
 
     // Aged gateway regression: lineage and the inherited `$room.exits = {}`
-    // default are warm, but the room's explicit exits page is absent. The
-    // ways metadata must force-refresh the path cursor and materialize every
-    // referenced exit before the verb runs; otherwise this falsely reports
-    // "No obvious exits" until unrelated movement happens to warm one edge.
+    // default are warm, the room's explicit exits page is absent, AND the
+    // cached `$player:ways` page predates its authority-prefetch metadata.
+    // The catalog pull must subscribe this gateway and replace that stale
+    // page before the call; otherwise an already-committed definition repair
+    // is invisible and this falsely reports "No obvious exits" until an
+    // unrelated movement happens to warm one edge.
     gatewayState.state.storage.sql.exec(
       "DELETE FROM net_gateway_cell WHERE key = 'property_cell:the_chatroom:exits'"
+    );
+    const waysRows = Array.from(
+      gatewayState.state.storage.sql.exec(
+        "SELECT body FROM net_gateway_cell WHERE key = 'verb_bytecode:$player:ways'"
+      ) as Iterable<{ body: string }>
+    );
+    expect(waysRows).toHaveLength(1);
+    const staleWays = JSON.parse(waysRows[0].body);
+    delete staleWays.value.arg_spec.authority;
+    staleWays.version = cellVersion(staleWays.value);
+    gatewayState.state.storage.sql.exec(
+      "UPDATE net_gateway_cell SET body = ? WHERE key = 'verb_bytecode:$player:ways'",
+      JSON.stringify(staleWays)
     );
     gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
     const agedWays = await call(aliceSession, "woo_call", { object: alice, verb: "ways", args: [""] });
@@ -222,6 +240,14 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
     ]));
     expect(waysResult.exits).toHaveLength(4);
     expect(waysResult.text).toContain("Obvious exits:");
+    const catalogState = scopeStates.get("catalog");
+    expect(catalogState).toBeTruthy();
+    const catalogSubscribers = Array.from(
+      catalogState!.state.storage.sql.exec(
+        "SELECT destination FROM net_scope_subscribers WHERE role = 'fanout' AND destination = 'gateway:net-api'"
+      ) as Iterable<{ destination: string }>
+    );
+    expect(catalogSubscribers).toEqual([{ destination: "gateway:net-api" }]);
 
     // Streamable HTTP DELETE releases the underlying net session. The
     // session id is the bearer, so it refuses after the close protocol's

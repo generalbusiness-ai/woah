@@ -3460,6 +3460,14 @@ export class NetGatewayDO {
    * not the scope. Best-effort: a failed subscribe/backfill is a named
    * metric, never a thrown turn error; the scope is dropped from the
    * memoized set so the next touch retries.
+   *
+   * Catalog is the bounded shared-substrate exception: its first
+   * subscription is followed by a FULL pull. A gateway may already hold a
+   * catalog high-water and stale verb page from before it subscribed; a
+   * roster-only targeted closure would advance that high-water without
+   * replacing the stale definition. Subscribe-then-pull closes both that
+   * aged-shard case and the race with a definition repair committed just
+   * before registration.
    */
   private async selfSubscribe(scope: string): Promise<void> {
     const shard = this.shardName();
@@ -3471,7 +3479,11 @@ export class NetGatewayDO {
     this.selfSubscribed.add(scope);
     try {
       await this.host.rpc(`scope:${scope}`, "/subscribe", { destination: self });
-      await this.pullTargeted(scope, `scope:${scope}`, []);
+      if (scope === CATALOG_SCOPE) {
+        await this.pull({ scope, destination: `scope:${scope}` });
+      } else {
+        await this.pullTargeted(scope, `scope:${scope}`, []);
+      }
     } catch (err) {
       this.selfSubscribed.delete(scope);
       this.metric({ kind: "net_self_subscribe_failed", scope, status: "error", error: String(err) });
@@ -3496,9 +3508,15 @@ export class NetGatewayDO {
       visited.add(scope);
       try {
         if (typeof entry === "string") {
-          // Full pull: once per scope, keyed on the fanout high-water.
-          if (this.seen.has(scope)) continue;
-          await this.pull({ scope, destination: `scope:${scope}` });
+          // Subscription is independent of the cached fanout high-water: an
+          // old gateway can have a catalog page without having registered for
+          // later definition fanout. selfSubscribe performs the first full
+          // catch-up after registration. When self-subscription is disabled
+          // (the internal lane and hand-wired fixtures), the ordinary unseen
+          // pull below still warms the catalog without doing a duplicate full
+          // transfer on subscribed cold gateways.
+          await this.selfSubscribe(scope);
+          if (!this.seen.has(scope)) await this.pull({ scope, destination: `scope:${scope}` });
         } else {
           // Targeted: the guard is per OBJECT, not per scope — a scope
           // warmed for one object must still pull a LATER object's chain

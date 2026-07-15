@@ -644,6 +644,15 @@ One write path per fact (CO9), concretized:
   until a later remove delta heals it; a fresh shard's mirror is exact.
   `GET /net/relation?relation=&owner=` is the client-read primitive for
   who/contents.
+- **Every gateway that warms the catalog subscribes to catalog fanout.**
+  Catalog is the bounded shared-substrate exception to targeted cold-open:
+  after registering, the gateway pulls one full catalog closure. The order is
+  deliberate. An aged gateway can already hold a catalog high-water and a
+  stale definition page from before it subscribed; a roster-only closure must
+  not advance that high-water while retaining the stale page. The
+  subscribe-then-full-pull catch-up also closes the race with a definition
+  repair committed immediately before registration. Later catalog changes
+  ride ordinary fanout.
 - **Fanout audiences** are computed from the `session_presence` relation
   (owner = the space, members = live sessions) — CO2.7's
   "O(distinct occupant shards)" gets its production definition here.
