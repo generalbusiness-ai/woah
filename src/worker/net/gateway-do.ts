@@ -1156,7 +1156,7 @@ export class NetGatewayDO {
       // Seed the call target's ordering once (the generic "children of the
       // target" projection); repair rounds add any further parents the verb
       // reads. Idempotent: skipped once the target is already in the map.
-      await this.seedTargetOrderedChildren(request, view, classifier, structure, orderedChildrenByParent);
+      await this.seedTargetOrderedChildren(request, view, classifier, structure, orderedChildrenByParent, trace);
       const planningOrderedChildren = orderedChildrenByParent.size > 0
         ? [...orderedChildrenByParent.entries()].map(([parent, projection]) => ({ parent, rows: projection.rows, version: projection.version }))
         : undefined;
@@ -1195,25 +1195,25 @@ export class NetGatewayDO {
               : [];
             if (missingOrdered.length > 0) {
               trace.push({ attempt, code: "E_MISSING_STATE", missing: missingOrdered.map((p) => p ?? "<root>"), elapsed_ms: elapsed() });
-              let progressed = false;
+              // Anti-loop (R2-corrected): only "EVERY named parent is already
+              // resident yet the re-plan still missed it" is the terminal
+              // planner/catalog-bug shape (installing again cannot cure a
+              // re-miss) — surfaced as E_NONCONVERGENT_READ rather than
+              // grinding to E_BUDGET. A FAILED fetch is transient transport
+              // state, not non-convergence: it stays on the bounded attempt
+              // loop (recovery_error in the trace; retried next round;
+              // E_BUDGET explains a persistent outage).
+              let allAlreadyResident = true;
               for (const parent of missingOrdered) {
-                // Anti-loop: a parent already fetched must not be re-fetched.
-                // If EVERY named parent is already resident, the re-plan still
-                // missed it — non-convergent (a planner/catalog bug), surfaced
-                // as E_NONCONVERGENT_READ rather than grinding to E_BUDGET.
                 if (orderedChildrenByParent.has(parent)) continue;
+                allAlreadyResident = false;
                 const projection = await this.tryRecovery(trace, () => this.fetchOrderedChildren(request, classifier, structure, parent));
                 if (projection === undefined) continue; // fetch failed; recovery_error recorded
                 orderedChildrenByParent.set(parent, projection);
-                progressed = true;
               }
-              if (!progressed) {
-                // No parent could be newly fetched — every named parent is
-                // either already resident (a re-miss the install did not cure)
-                // or its fetch failed (recovery_error in the trace). Terminal:
-                // surface E_NONCONVERGENT_READ rather than grinding to E_BUDGET.
+              if (allAlreadyResident) {
                 throw nonconvergentRead(
-                  "ordered-children projection unrecoverable (already resident or fetch failed)",
+                  "ordered-children projection re-missed while resident (install cannot cure it)",
                   trace,
                   { missing_ordered_children: missingOrdered }
                 );
@@ -1229,21 +1229,21 @@ export class NetGatewayDO {
               : [];
             if (missingNeighbors.length > 0) {
               trace.push({ attempt, code: "E_MISSING_STATE", missing: missingNeighbors.map((q) => `neighbors:${q.parent ?? "<root>"}`), elapsed_ms: elapsed() });
-              let progressed = false;
+              // Anti-loop (R2-corrected, mirror of the children branch): only
+              // an already-resident re-miss is terminal non-convergence; a
+              // failed fetch stays on the bounded attempt loop.
+              let allAlreadyResident = true;
               for (const query of missingNeighbors) {
-                // Anti-loop: an already-answered query must not re-fetch. If
-                // EVERY named query is already resident, the re-plan still
-                // missed it — non-convergent (a planner/catalog bug).
                 const key = orderedNeighborsQueryKey(query);
                 if (orderedNeighborsByKey.has(key)) continue;
+                allAlreadyResident = false;
                 const projection = await this.tryRecovery(trace, () => this.fetchOrderedNeighbors(request, classifier, structure, query));
                 if (projection === undefined) continue; // fetch failed; recovery_error recorded
                 orderedNeighborsByKey.set(key, projection);
-                progressed = true;
               }
-              if (!progressed) {
+              if (allAlreadyResident) {
                 throw nonconvergentRead(
-                  "ordered-neighbours answer unrecoverable (already resident or fetch failed)",
+                  "ordered-neighbours answer re-missed while resident (install cannot cure it)",
                   trace,
                   { missing_ordered_neighbors: missingNeighbors }
                 );
@@ -3626,11 +3626,17 @@ export class NetGatewayDO {
     view: CellStore,
     classifier: ScopeClassifier,
     structure: TurnStructure,
-    accumulated: Map<string | null, OrderedChildrenProjection>
+    accumulated: Map<string | null, OrderedChildrenProjection>,
+    trace: AttemptTraceEntry[]
   ): Promise<void> {
     const target = request.call.target;
     if (accumulated.has(target) || !this.callReadsOrderedChildren(view, request.call)) return;
-    accumulated.set(target, await this.fetchOrderedChildren(request, classifier, structure, target));
+    // The pre-seed is a warm-path OPTIMIZATION, so its fetch failing must not
+    // kill the turn (R2): skip it (recovery_error traced) and let the verb's
+    // read miss into the repair path, which retries on the bounded attempt
+    // loop and explains a persistent outage as E_BUDGET.
+    const projection = await this.tryRecovery(trace, () => this.fetchOrderedChildren(request, classifier, structure, target));
+    if (projection !== undefined) accumulated.set(target, projection);
   }
 
   private async expediteForeignRelations(

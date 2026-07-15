@@ -352,6 +352,87 @@ describe("outliner add over the net path converges", () => {
     expect(roots.rows[3]?.child, `root order: ${JSON.stringify(roots.rows.slice(0, 6))}`).toBe(moved);
   });
 
+  // R2 — a FAILED ordering fetch is transient, not non-convergence. Only
+  // "every named query already resident yet the re-plan still missed" is the
+  // terminal planner-bug shape; a transport failure must stay on the bounded
+  // attempt loop (retry next round; E_BUDGET with recovery_error trace if the
+  // outage persists) — never an instant E_NONCONVERGENT_READ.
+  it("R2: a ONE-SHOT ordered-neighbours fetch failure retries and commits", async () => {
+    const { world, theOutline, session, actor, epoch } = await outlinerWorld();
+    const roomScope = `room:${theOutline}`;
+    const ctx = { theOutline, roomScope, epoch, session, actor };
+    let failures = 0;
+    const { gateway, gatewayEnv } = await mountNet(world, epoch, {
+      intercept: async (_scope, path) => {
+        if (path === "/net/ordered-neighbors" && failures === 0) {
+          failures += 1;
+          return new Response("injected outage", { status: 500 });
+        }
+        return null;
+      }
+    });
+    const turn = await addTurn(gateway, gatewayEnv, ctx, "r2-oneshot-nb", "survives one outage");
+    expect(failures, "the fault actually fired").toBe(1);
+    expect(turn.reply.status, `attempts=${turn.attempt} trace=${JSON.stringify(turn.trace)}`).toBe("accepted");
+  });
+
+  it("R2: a PERSISTENT ordered-neighbours outage exhausts to E_BUDGET, not E_NONCONVERGENT_READ", async () => {
+    const { world, theOutline, session, actor, epoch } = await outlinerWorld();
+    const roomScope = `room:${theOutline}`;
+    const ctx = { theOutline, roomScope, epoch, session, actor };
+    const { gateway, gatewayEnv } = await mountNet(world, epoch, {
+      intercept: async (_scope, path) =>
+        path === "/net/ordered-neighbors" ? new Response("injected outage", { status: 500 }) : null
+    });
+    const err = await addTurn(gateway, gatewayEnv, ctx, "r2-persist-nb", "x").then(
+      (ok) => { throw new Error(`expected rejection, got ${JSON.stringify(ok.reply)}`); },
+      (e: unknown) => String(e)
+    );
+    expect(err, "an outage is not a planner bug").not.toContain("E_NONCONVERGENT_READ");
+    expect(err, "persistent outage exhausts the budget with the trace explaining it").toContain("E_BUDGET");
+  });
+
+  it("R2: a ONE-SHOT ordered-children fetch failure retries and commits", async () => {
+    const { world, theOutline, session, actor, epoch } = await outlinerWorld();
+    const roomScope = `room:${theOutline}`;
+    const ctx = { theOutline, roomScope, epoch, session, actor };
+    // eject_item drives _detach_item, whose kids read uses the FULL
+    // ordered_children projection — the children repair branch.
+    const p = ((await world.directCall("r2-seed-p", actor, theOutline, "add_item", ["parent", null, null], { sessionId: session.id })) as { result: string }).result;
+    world.object(actor).flags.wizard = true;
+    let failures = 0;
+    const { gateway, gatewayEnv } = await mountNet(world, epoch, {
+      intercept: async (_scope, path) => {
+        if (path === "/net/ordered-children" && failures === 0) {
+          failures += 1;
+          return new Response("injected outage", { status: 500 });
+        }
+        return null;
+      }
+    });
+    const turn = await verbTurn(gateway, gatewayEnv, ctx, "r2-oneshot-oc", "eject_item", [p]);
+    expect(failures, "the fault actually fired").toBe(1);
+    expect(turn.reply.status, `attempts=${turn.attempt} trace=${JSON.stringify(turn.trace)}`).toBe("accepted");
+  });
+
+  it("R2: a PERSISTENT ordered-children outage exhausts to E_BUDGET, not E_NONCONVERGENT_READ", async () => {
+    const { world, theOutline, session, actor, epoch } = await outlinerWorld();
+    const roomScope = `room:${theOutline}`;
+    const ctx = { theOutline, roomScope, epoch, session, actor };
+    const p = ((await world.directCall("r2p-seed-p", actor, theOutline, "add_item", ["parent", null, null], { sessionId: session.id })) as { result: string }).result;
+    world.object(actor).flags.wizard = true;
+    const { gateway, gatewayEnv } = await mountNet(world, epoch, {
+      intercept: async (_scope, path) =>
+        path === "/net/ordered-children" ? new Response("injected outage", { status: 500 }) : null
+    });
+    const err = await verbTurn(gateway, gatewayEnv, ctx, "r2-persist-oc", "eject_item", [p]).then(
+      (ok) => { throw new Error(`expected rejection, got ${JSON.stringify(ok.reply)}`); },
+      (e: unknown) => String(e)
+    );
+    expect(err, "an outage is not a planner bug").not.toContain("E_NONCONVERGENT_READ");
+    expect(err, "persistent outage exhausts the budget with the trace explaining it").toContain("E_BUDGET");
+  });
+
   it("P1.1: two concurrent same-slot inserts commit DISTINCT ranks (the ordering read is attested)", async () => {
     // Both turns plan against the SAME empty root (a barrier holds both submits
     // until both have planned), so each computes the first rank ("V"). Without
