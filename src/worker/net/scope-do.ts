@@ -849,7 +849,9 @@ export class NetScopeDO {
         const parent = body.parent === null ? null
           : typeof body.parent === "string" && body.parent ? body.parent
           : undefined;
-        if (parent === undefined) throw new Error("ordered-children requires parent (string ref or null)");
+        if (parent === undefined) {
+          throw netError("E_INVARG", "ordered-children requires parent (nonempty string ref or null)", { parent: body.parent ?? null });
+        }
         const seq = this.ensureSequencer();
         // Bounded scan (P2.4): the per-parent edge index, O(children-of-parent),
         // not a whole-scope cell scan. This full list is for DISPLAY
@@ -875,13 +877,29 @@ export class NetScopeDO {
         const parent = body.parent === null ? null
           : typeof body.parent === "string" && body.parent ? body.parent
           : undefined;
-        if (parent === undefined) throw new Error("ordered-neighbors requires parent (string ref or null)");
+        if (parent === undefined) {
+          throw netError("E_INVARG", "ordered-neighbors requires parent (nonempty string ref or null)", { parent: body.parent ?? null });
+        }
+        // Strict field validation (Adv-a): a malformed optional field must be
+        // REFUSED, never silently coerced into a different-but-valid query
+        // (index:"0" is not an append; exclude:42 is not "no exclusion").
+        // Out-of-RANGE numeric indices stay clamped by design — range policy
+        // lives in the calling verb; TYPE policy lives here.
+        if (body.index !== undefined && body.index !== null && !(typeof body.index === "number" && Number.isFinite(body.index))) {
+          throw netError("E_INVARG", "ordered-neighbors index must be a finite number (or null/absent for append)", { index: body.index });
+        }
+        if (body.exclude !== undefined && body.exclude !== null && !(typeof body.exclude === "string" && body.exclude)) {
+          throw netError("E_INVARG", "ordered-neighbors exclude must be a nonempty string ref (or null/absent)", { exclude: body.exclude });
+        }
+        if (body.child !== undefined && body.child !== null && !(typeof body.child === "string" && body.child)) {
+          throw netError("E_INVARG", "ordered-neighbors child must be a nonempty string ref (or null/absent)", { child: body.child });
+        }
         const seq = this.ensureSequencer();
         const rows = seq.store.orderedEdgeChildren(parent);
         const answer = orderedNeighborsFromRows(rows, {
-          index: typeof body.index === "number" && Number.isFinite(body.index) ? body.index : null,
-          exclude: typeof body.exclude === "string" && body.exclude ? body.exclude : null,
-          child: typeof body.child === "string" && body.child ? body.child : null
+          index: body.index === undefined || body.index === null ? null : (body.index as number),
+          exclude: (body.exclude as string | undefined) ?? null,
+          child: (body.child as string | undefined) ?? null
         });
         return json({ scope: seq.scope, head: seq.head(), parent, ...answer, version: orderedChildrenVersion(rows) });
       }

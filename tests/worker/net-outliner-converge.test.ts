@@ -636,6 +636,50 @@ describe("outliner add over the net path converges", () => {
     expect(roots.rows.map((r) => r.child), `root order: ${JSON.stringify(roots.rows)}`).toEqual([first, ia, ib]);
   });
 
+  // Adv-a — the ordering endpoints must REFUSE malformed queries with a
+  // structured E_INVARG (never silently coerce a bad field into a
+  // different-but-valid query), and the gateway must refuse a malformed
+  // authority reply (wrong scope echo) as a failed fetch.
+  it("Adv-a: /net/ordered-neighbors refuses malformed query fields with structured E_INVARG", async () => {
+    const { world, theOutline, epoch } = await outlinerWorld();
+    const roomScope = `room:${theOutline}`;
+    const { scopeDOs } = await mountNet(world, epoch);
+    const roomDO = scopeDOs.get(roomScope)!;
+    const env = { WOO_INTERNAL_SECRET: SECRET };
+    // A stringly index must not silently become "append".
+    await expect(call(roomDO, env, "/ordered-neighbors", { parent: null, index: "0" }))
+      .rejects.toThrow(/E_INVARG/);
+    // A non-string exclude must not silently become "no exclusion".
+    await expect(call(roomDO, env, "/ordered-neighbors", { parent: null, exclude: 42 }))
+      .rejects.toThrow(/E_INVARG/);
+    // A malformed parent is a structured E_INVARG, not a plain 500.
+    await expect(call(roomDO, env, "/ordered-neighbors", { parent: 7 }))
+      .rejects.toThrow(/E_INVARG/);
+    await expect(call(roomDO, env, "/ordered-children", { parent: 7 }))
+      .rejects.toThrow(/E_INVARG/);
+  });
+
+  it("Adv-a: the gateway refuses an ordering reply whose scope echo disagrees (failed fetch, not a commit)", async () => {
+    const { world, theOutline, session, actor, epoch } = await outlinerWorld();
+    const roomScope = `room:${theOutline}`;
+    const ctx = { theOutline, roomScope, epoch, session, actor };
+    const { gateway, gatewayEnv } = await mountNet(world, epoch, {
+      intercept: async (_scope, path, _request, real) => {
+        if (path !== "/net/ordered-neighbors") return null;
+        const res = await real();
+        const body = (await res.json()) as Record<string, unknown>;
+        body.scope = "scope-imposter"; // a reply from the wrong authority
+        return jsonResponse(body);
+      }
+    });
+    const err = await addTurn(gateway, gatewayEnv, ctx, "adva-scope-echo", "x").then(
+      (ok) => { throw new Error(`expected rejection, got ${JSON.stringify(ok.reply)}`); },
+      (e: unknown) => String(e)
+    );
+    // Persistently-wrong replies exhaust the bounded loop as failed fetches.
+    expect(err).toContain("E_BUDGET");
+  });
+
   it("fails FAST and NAMED (E_NONCONVERGENT_READ, not E_BUDGET) when a read cannot converge", async () => {
     // A pathological authority that rejects the SAME read at the SAME stable
     // version every round models a planner/catalog bug the repair loop can

@@ -3573,13 +3573,17 @@ export class NetGatewayDO {
       this.destinationFor(request, scope),
       "/ordered-children",
       { parent }
-    ), { phase: "ordered_children" }) as { parent?: unknown; rows?: unknown; version?: unknown };
-    if (response.parent !== parent || !Array.isArray(response.rows)) {
-      throw new Error(`ordered-children authority returned malformed projection for ${parent ?? "<root>"}`);
+    ), { phase: "ordered_children" }) as { scope?: unknown; parent?: unknown; rows?: unknown; version?: unknown };
+    // Full reply validation (Adv-a): a wrong-scope echo or a versionless
+    // reply must be a FAILED fetch (retried on the bounded attempt loop),
+    // never an answer the plan attests.
+    if (response.scope !== scope || response.parent !== parent || !Array.isArray(response.rows)
+      || typeof response.version !== "string" || response.version.length === 0) {
+      throw new Error(`ordered-children authority returned a malformed projection for ${parent ?? "<root>"} at ${scope}`);
     }
     // The authority's content version of the ordering (P1.1): the plan attests
     // it so a concurrent same-parent insert makes the submit stale.
-    return { rows: response.rows as Record<string, unknown>[], version: typeof response.version === "string" ? response.version : "" };
+    return { rows: response.rows as Record<string, unknown>[], version: response.version };
   }
 
   /** Answer ONE bounded neighbour query at the parent's scope authority
@@ -3599,20 +3603,36 @@ export class NetGatewayDO {
       this.destinationFor(request, scope),
       "/ordered-neighbors",
       { parent: query.parent, index: query.index, exclude: query.exclude, child: query.child }
-    ), { phase: "ordered_neighbors" }) as { parent?: unknown; count?: unknown; index?: unknown; before?: unknown; after?: unknown; child_index?: unknown; version?: unknown };
-    if (response.parent !== query.parent || typeof response.count !== "number" || typeof response.index !== "number") {
-      throw new Error(`ordered-neighbours authority returned a malformed answer for ${query.parent ?? "<root>"}`);
+    ), { phase: "ordered_neighbors" }) as { scope?: unknown; parent?: unknown; count?: unknown; index?: unknown; before?: unknown; after?: unknown; child_index?: unknown; version?: unknown };
+    // Full reply validation (Adv-a): scope echo, a nonempty ordering version,
+    // integral count/slot within range, rank fields consistent with the slot
+    // (a slot with a live neighbour must carry its rank), and a sane
+    // child_index. Anything else is a FAILED fetch — retried on the bounded
+    // attempt loop — never an answer the plan computes a rank from.
+    const count = response.count;
+    const index = response.index;
+    const malformed =
+      response.scope !== scope
+      || response.parent !== query.parent
+      || typeof response.version !== "string" || response.version.length === 0
+      || typeof count !== "number" || !Number.isInteger(count) || count < 0
+      || typeof index !== "number" || !Number.isInteger(index) || index < 0 || index > count
+      || (index > 0 ? typeof response.before !== "string" || response.before.length === 0 : response.before !== null)
+      || (index < count ? typeof response.after !== "string" || response.after.length === 0 : response.after !== null)
+      || (response.child_index !== null && (typeof response.child_index !== "number" || !Number.isInteger(response.child_index) || response.child_index < 0));
+    if (malformed) {
+      throw new Error(`ordered-neighbours authority returned a malformed answer for ${query.parent ?? "<root>"} at ${scope}`);
     }
     return {
       query,
       value: {
-        count: response.count,
-        index: response.index,
-        before: typeof response.before === "string" ? response.before : null,
-        after: typeof response.after === "string" ? response.after : null,
-        child_index: typeof response.child_index === "number" ? response.child_index : null
+        count,
+        index,
+        before: (response.before as string | null),
+        after: (response.after as string | null),
+        child_index: (response.child_index as number | null)
       },
-      version: typeof response.version === "string" ? response.version : ""
+      version: response.version as string
     };
   }
 

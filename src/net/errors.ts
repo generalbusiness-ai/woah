@@ -38,10 +38,13 @@ export type NetErrorCode =
                         // against a scope seeded at another epoch, or a turn whose
                         // stamp still differs from the scope's durable epoch AFTER
                         // the CO8 reseed — terminal, never a retry treadmill
-  | "E_SEED_COMMITTED"; // a seed against a scope that has COMMITTED turns: a
+  | "E_SEED_COMMITTED" // a seed against a scope that has COMMITTED turns: a
                         // re-seed there would silently reset authoritative state
                         // under an unchanged head (invisible to every version
                         // check) — terminal; a committed scope is never reseeded
+  | "E_INVARG";        // a malformed internal request field (wrong type/shape) —
+                       // refused with the offending field named, never silently
+                       // coerced into a different-but-valid request (Adv-a)
 
 /** Recovery action per code (CO6 table). Kept as data so tail metrics and
  * operator tooling can render the defined recovery without a lookup table
@@ -58,6 +61,7 @@ export const NET_ERROR_RECOVERY: Record<NetErrorCode, string> = {
   E_NONCONVERGENT_READ: "terminal; the plan records a read at a version the authority will never hold — a planner or catalog-verb bug, not a transient conflict",
   E_RPC_TIMEOUT: "terminal for this request; retry with the same idempotency key",
   E_SEED_LAG: "informational; consumer proceeds via head-check",
+  E_INVARG: "terminal for this request; fix the malformed field the detail names",
   E_EPOCH_MISMATCH: "terminal; catalog install/migration must reconcile the epochs (operator concern)",
   E_SEED_COMMITTED: "terminal; a committed scope is never reseeded — a fresh namespace is the recovery (operator concern)"
 };
