@@ -147,13 +147,13 @@ type ScopeRow = { seen_seq: number };
 /** One owner-computed ordered-children projection the gateway fetched for a
  * turn: the bounded rows plus the authority `version` (content address) the
  * plan attests so a concurrent same-parent insert makes the submit stale (P1.1). */
-type OrderedChildrenProjection = { rows: readonly Record<string, unknown>[]; version: string };
+type OrderedChildrenProjection = { scope: string; rows: readonly Record<string, unknown>[]; version: string };
 
 /** One owner-answered bounded neighbour query (P2.4): the O(1)
  * {count, index, before, after, child_index} answer plus the same authority
  * ordering `version` a full projection carries, so the attestation is
  * identical — only the payload shrinks from O(width) to constant. */
-type OrderedNeighborsProjection = { query: OrderedNeighborsQuery; value: Record<string, unknown>; version: string };
+type OrderedNeighborsProjection = { query: OrderedNeighborsQuery; scope: string; value: Record<string, unknown>; version: string };
 
 /** CO10: the ratified repair budget for one /net/turn. */
 export const REPAIR_BUDGET_MS = 12_000;
@@ -1158,7 +1158,7 @@ export class NetGatewayDO {
       // reads. Idempotent: skipped once the target is already in the map.
       await this.seedTargetOrderedChildren(request, view, classifier, structure, orderedChildrenByParent, trace);
       const planningOrderedChildren = orderedChildrenByParent.size > 0
-        ? [...orderedChildrenByParent.entries()].map(([parent, projection]) => ({ parent, rows: projection.rows, version: projection.version }))
+        ? [...orderedChildrenByParent.entries()].map(([parent, projection]) => ({ parent, scope: projection.scope, rows: projection.rows, version: projection.version }))
         : undefined;
       const planningOrderedNeighbors = orderedNeighborsByKey.size > 0
         ? [...orderedNeighborsByKey.values()]
@@ -3582,8 +3582,9 @@ export class NetGatewayDO {
       throw new Error(`ordered-children authority returned a malformed projection for ${parent ?? "<root>"} at ${scope}`);
     }
     // The authority's content version of the ordering (P1.1): the plan attests
-    // it so a concurrent same-parent insert makes the submit stale.
-    return { rows: response.rows as Record<string, unknown>[], version: response.version };
+    // it so a concurrent same-parent insert makes the submit stale. The owning
+    // scope rides along (R3) so cross-scope commits owner-attest the read.
+    return { scope, rows: response.rows as Record<string, unknown>[], version: response.version };
   }
 
   /** Answer ONE bounded neighbour query at the parent's scope authority
@@ -3625,6 +3626,7 @@ export class NetGatewayDO {
     }
     return {
       query,
+      scope,
       value: {
         count,
         index,
@@ -3905,6 +3907,19 @@ export class NetGatewayDO {
       keys.add(key);
       byOwner.set(owner, keys);
     }
+    // R3: foreign ORDERING reads owner-attest exactly like foreign cell
+    // reads — the same /net/attest reply reports the owner's CURRENT
+    // ordering version per parent, so a foreign insert between plan and
+    // attest makes the committing scope reject the stale read. An owner
+    // with only ordering reads still gets its attest RPC.
+    const orderingsByOwner = new Map<string, Set<string | null>>();
+    for (const read of planned.transcript.orderingReads ?? []) {
+      if (read.scope === targetScope) continue; // validated locally
+      const parents = orderingsByOwner.get(read.scope) ?? new Set<string | null>();
+      parents.add(read.parent);
+      orderingsByOwner.set(read.scope, parents);
+      if (!byOwner.has(read.scope)) byOwner.set(read.scope, new Set<string>());
+    }
     if (byOwner.size === 0) return undefined;
     // NC8b: independent mutable owners attest in parallel. Immutable catalog
     // definitions add no RPC; their active-epoch certificate is folded below.
@@ -3921,10 +3936,17 @@ export class NetGatewayDO {
     }
     const owners = [...byOwner.entries()];
     const attest = async (owner: string, keys: Set<string>) => {
-      const reply = await this.host.rpc(this.destinationFor(request, owner), "/attest", { keys: [...keys].sort() }) as {
+      const orderingParents = orderingsByOwner.get(owner);
+      const reply = await this.host.rpc(this.destinationFor(request, owner), "/attest", {
+        keys: [...keys].sort(),
+        ...(orderingParents && orderingParents.size > 0
+          ? { ordering_parents: [...orderingParents].sort((a, b) => String(a).localeCompare(String(b))) }
+          : {})
+      }) as {
         catalog_epoch?: string;
         owner_head: ScopeHead;
         cells: Array<{ key: string; version: string }>;
+        orderings?: Array<{ parent: string | null; version: string }>;
       };
       // Catalog compatibility cells are deliberately not cached, but their
       // authority must still agree with the turn epoch before its versions
@@ -3946,6 +3968,18 @@ export class NetGatewayDO {
       for (const key of keys) {
         if (!received.has(key)) throw new Error(`attestation from ${owner} omitted ${key}`);
       }
+      if (orderingParents && orderingParents.size > 0) {
+        const attestedParents = new Map<string | null, string>();
+        for (const ordering of reply.orderings ?? []) {
+          if ((ordering?.parent !== null && typeof ordering?.parent !== "string") || typeof ordering?.version !== "string" || ordering.version.length === 0) {
+            throw new Error(`attestation from ${owner} returned a malformed ordering version`);
+          }
+          attestedParents.set(ordering.parent, ordering.version);
+        }
+        for (const parent of orderingParents) {
+          if (!attestedParents.has(parent)) throw new Error(`attestation from ${owner} omitted ordering ${parent ?? "<root>"}`);
+        }
+      }
       return reply;
     };
     const actions: Array<() => Promise<unknown>> = owners.map(([owner, keys]) => () => attest(owner, keys));
@@ -3954,8 +3988,12 @@ export class NetGatewayDO {
       : await Promise.all(actions.map((action) => action()));
     const attestations: NonNullable<CommitSubmit["attestations"]> = {};
     owners.forEach(([owner], index) => {
-      const reply = replies[index] as { owner_head: ScopeHead; cells: Array<{ key: string; version: string }> };
-      attestations[owner] = { owner_head: reply.owner_head, cells: reply.cells };
+      const reply = replies[index] as { owner_head: ScopeHead; cells: Array<{ key: string; version: string }>; orderings?: Array<{ parent: string | null; version: string }> };
+      attestations[owner] = {
+        owner_head: reply.owner_head,
+        cells: reply.cells,
+        ...(reply.orderings && reply.orderings.length > 0 ? { orderings: reply.orderings } : {})
+      };
     });
     if (immutableCatalogKeys.size > 0) {
       const certified = this.epochCatalogAttestation(request, view, immutableCatalogKeys);
@@ -4077,7 +4115,7 @@ export class NetGatewayDO {
     objectCounter?: number,
     planningRoomRoster?: { room: string; rows: readonly RoomRosterRow[] },
     seedObjects?: ReadonlySet<string>,
-    planningOrderedChildren?: readonly { parent: string | null; rows: readonly Record<string, unknown>[]; version: string }[],
+    planningOrderedChildren?: readonly { parent: string | null; scope: string; rows: readonly Record<string, unknown>[]; version: string }[],
     planningOrderedNeighbors?: readonly OrderedNeighborsProjection[]
   ): Promise<PlanTurnResult> {
     return planTurn({

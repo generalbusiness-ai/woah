@@ -58,7 +58,14 @@ export type CommitSubmit = {
    * skipping it. Only consulted when `owns` is wired (multi-scope
    * topologies); single-scope sequencers validate every read locally
    * and ignore this field. */
-  attestations?: Record<string, { owner_head: ScopeHead; cells: Array<{ key: string; version: string }> }>;
+  attestations?: Record<string, {
+    owner_head: ScopeHead;
+    cells: Array<{ key: string; version: string }>;
+    /** R3: the owner's CURRENT ordering version per attested parent, taken
+     * at the same /net/attest freshness point as the cell versions, so a
+     * foreign ordering read validates exactly like a foreign cell read. */
+    orderings?: Array<{ parent: string | null; version: string }>;
+  }>;
 };
 
 export type RejectReason =
@@ -467,18 +474,35 @@ export class ScopeSequencer {
       return this.reject(submit, "read_version_mismatch", {}, [...mismatched.values()]);
     }
 
-    // Step 7b (P1.1): validate ordered-children projection reads. Each names a
-    // parent and the authority content `version` the plan read; re-derive the
-    // ordering from THIS scope's current edge cells and reject if it moved.
-    // This is what serializes concurrent same-parent inserts — the ordering is
-    // a read the transcript carries, so a same-parent insert that landed
-    // between plan and submit invalidates the neighbour read behind the rank.
-    // Skipped for foreign-owned reads (a cross-scope ordering is that scope's
-    // to attest; this authority only re-derives what it owns).
+    // Step 7b (P1.1): validate ordering projection reads. Each names a
+    // parent, the OWNING scope the answer came from, and the authority
+    // content `version` the plan read. An entry THIS scope owns re-derives
+    // from its current edge cells; a FOREIGN entry validates against the
+    // owner's ordering attestation carried by the submit (R3 — the exact
+    // mirror of foreign cell reads above: never skipped, never checked
+    // against a store that does not hold the edges). This is what
+    // serializes concurrent same-parent inserts, in-scope or cross-scope —
+    // the ordering is a read the transcript carries, so an insert that
+    // landed between plan and submit invalidates the read behind the rank.
+    const attestedOrderings = new Map<string, string>();
+    for (const [owner, entry] of Object.entries(submit.attestations ?? {})) {
+      for (const ordering of entry.orderings ?? []) {
+        attestedOrderings.set(`${owner}\0${ordering.parent ?? "\0root"}`, ordering.version);
+      }
+    }
     const orderingConflicts: (string | null)[] = [];
     for (const read of submit.transcript.orderingReads ?? []) {
-      const owned = read.parent === null || !this.options.owns || this.options.owns(read.parent);
-      if (!owned) continue;
+      if (read.scope !== this.scope) {
+        const attested = attestedOrderings.get(`${read.scope}\0${read.parent ?? "\0root"}`);
+        if (attested === undefined) {
+          // A foreign ordering read nobody attested is a protocol violation
+          // by the submitter, not a stale-view condition — terminal, named
+          // (the pre-R3 behavior silently skipped these reads).
+          return this.reject(submit, "rider_unattested", { ordering_parent: read.parent, ordering_scope: read.scope });
+        }
+        if (attested !== read.version) orderingConflicts.push(read.parent);
+        continue;
+      }
       const current = orderedChildrenVersion(this.store.orderedEdgeChildren(read.parent));
       if (current !== read.version) orderingConflicts.push(read.parent);
     }

@@ -680,6 +680,90 @@ describe("outliner add over the net path converges", () => {
     expect(err).toContain("E_BUDGET");
   });
 
+  // R3 — a FOREIGN ordering read must be attested by its owner at submit
+  // time, exactly like a foreign cell read. A turn committing at scope B
+  // that read an ordering owned by scope A previously skipped validation at
+  // B ("not mine") and carried no owner attestation — so an A-side mutation
+  // landing between plan and submit committed a stale-ordering-dependent
+  // result. The probe verb also reads a foreign CELL (item.name) so the
+  // /net/attest hold below engages both before and after the fix.
+  it("R3: a cross-scope ordering read is owner-attested (a concurrent foreign insert re-plans, never commits stale)", async () => {
+    const { world, theOutline, session, actor, epoch } = await outlinerWorld();
+    // The probed parent item lives in the outline room's scope...
+    const item = ((await world.directCall("r3-seed-item", actor, theOutline, "add_item", ["probe parent", null, null], { sessionId: session.id })) as { result: string }).result;
+    // ...while the probe object (the turn's write set) lives in the chatroom.
+    const chatroom = world.exportWorld().objects.find((o) => o.id === "the_chatroom");
+    expect(chatroom, "bundled world has the_chatroom").toBeTruthy();
+    // probe_thing carries the verb, so it partitions as a class definition
+    // (epoch-immutable); the WRITE lands on the verbless probe_slate, whose
+    // chatroom anchor makes the chatroom the commit scope.
+    world.createObject({ id: "probe_thing", name: "Probe Thing", parent: "$thing", owner: "$wiz", location: "the_chatroom", anchor: "the_chatroom" });
+    world.createObject({ id: "probe_slate", name: "Probe Slate", parent: "$thing", owner: "$wiz", location: "the_chatroom", anchor: "the_chatroom" });
+    const installed = installVerb(
+      world,
+      "probe_thing",
+      "probe_order",
+      // Reads one foreign cell (name) and the foreign ordering, then writes
+      // locally — commit scope = the chatroom, ordering owner = the outline.
+      `verb :probe_order(item, slate) rxd {\n  let nm = item.name;\n  let q = ordered_neighbors(item, { index: null });\n  slate.probe_count = q["count"];\n  return q["count"];\n}`,
+      null
+    );
+    expect(installed.ok, JSON.stringify(installed)).toBe(true);
+    // The probing actor sits in the chatroom; a second guest stays in the
+    // outline to run the concurrent insert.
+    const placed = await world.directCall("r3-move", actor, actor, "moveto", ["the_chatroom"], { sessionId: session.id });
+    expect(placed.op).toBe("result");
+    const sessionB = world.auth("guest:r3-writer");
+    const placedB = await world.directCall("r3-move-b", sessionB.actor, sessionB.actor, "moveto", [theOutline], { sessionId: sessionB.id });
+    expect(placedB.op).toBe("result");
+
+    const outlineScope = `room:${theOutline}`;
+    const chatScope = "room:the_chatroom";
+    // Hold the probe turn's owner attestation until the concurrent insert
+    // has fully committed at the outline scope: the attest reply then
+    // reports the POST-insert ordering version, and the probe's planned
+    // (pre-insert) ordering read must mismatch and re-plan.
+    let holdAttest: Promise<void> | null = null;
+    let releaseProbe: () => void = () => {};
+    const probeHeld = new Promise<void>((r) => { releaseProbe = r; });
+    let attestHeld: () => void = () => {};
+    const attestArrived = new Promise<void>((r) => { attestHeld = r; });
+    const { gateway, gatewayEnv } = await mountNet(world, epoch, {
+      intercept: async (scope, path) => {
+        if (scope === outlineScope && path === "/net/attest" && holdAttest) {
+          attestHeld();
+          await holdAttest;
+        }
+        return null;
+      }
+    });
+    holdAttest = probeHeld;
+
+    const probe = call<TurnBody>(gateway, gatewayEnv, "/turn", {
+      call: {
+        kind: "woo.turn_call.shadow.v1", id: "r3-probe", route: "direct", scope: chatScope,
+        session: session.id, actor, target: "probe_thing", verb: "probe_order", args: [item, "probe_slate"]
+      },
+      planningScope: chatScope, catalog_epoch: epoch, idempotency_key: "r3-probe"
+    });
+    await attestArrived; // probe has planned (count 0) and is attesting
+    holdAttest = null;   // the writer's turn must not be held
+    const write = await call<TurnBody>(gateway, gatewayEnv, "/turn", {
+      call: {
+        kind: "woo.turn_call.shadow.v1", id: "r3-write", route: "direct", scope: outlineScope,
+        session: sessionB.id, actor: sessionB.actor, target: theOutline, verb: "add_item", args: ["kid", item, null]
+      },
+      planningScope: outlineScope, catalog_epoch: epoch, idempotency_key: "r3-write"
+    });
+    expect(write.reply.status, `writer trace=${JSON.stringify(write.trace)}`).toBe("accepted");
+    releaseProbe();
+    const probed = await probe;
+    expect(probed.reply.status, `probe trace=${JSON.stringify(probed.trace)}`).toBe("accepted");
+    // The probe must observe the POST-insert ordering (count 1), proving the
+    // stale plan was rejected and re-planned — not committed.
+    expect(probed.result, `probe committed a stale foreign ordering read (trace=${JSON.stringify(probed.trace)})`).toBe(1);
+  });
+
   it("fails FAST and NAMED (E_NONCONVERGENT_READ, not E_BUDGET) when a read cannot converge", async () => {
     // A pathological authority that rejects the SAME read at the SAME stable
     // version every round models a planner/catalog bug the repair loop can

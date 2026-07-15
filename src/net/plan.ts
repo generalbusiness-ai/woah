@@ -113,14 +113,14 @@ export type PlanTurnInput = {
    * in the ephemeral execution world for generic ordered_children(parent)
    * reads. The ordering analogue of planningRoomRoster; keeps sibling order
    * off the O(N)-edge-cell read closure. */
-  planningOrderedChildren?: readonly { parent: string | null; rows: readonly Record<string, unknown>[]; version: string }[];
+  planningOrderedChildren?: readonly { parent: string | null; scope: string; rows: readonly Record<string, unknown>[]; version: string }[];
   /** Owner-answered bounded neighbour queries (P2.4), installed only in the
    * ephemeral execution world for generic ordered_neighbors(parent, query)
    * reads. Each carries the SAME authority ordering `version` a full
    * projection would, so the attestation below serializes concurrent
    * same-parent mutations identically — the answer is just O(1) instead of
    * O(width). */
-  planningOrderedNeighbors?: readonly { query: OrderedNeighborsQuery; value: Record<string, unknown>; version: string }[];
+  planningOrderedNeighbors?: readonly { query: OrderedNeighborsQuery; scope: string; value: Record<string, unknown>; version: string }[];
 };
 
 export type PlanTurnResult = {
@@ -308,15 +308,18 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
   // one), so the committing scope serializes concurrent same-parent inserts by
   // re-validating each ordering version. A supplied-but-unread projection is a
   // stable empty target ordering, so attesting it is harmless.
-  // Bounded neighbour answers attest the SAME (parent, version) pair a full
-  // projection would — the authority re-derives one ordering version per
-  // parent at submit either way. Dedupe identical pairs; if the two maps ever
-  // carried DIFFERENT versions for one parent (a mid-turn fetch race), attest
-  // both — the authority check then rejects the stale one and the turn
-  // re-plans, rather than a dedupe silently laundering it through.
-  const orderingReads = new Map<string, { parent: string | null; version: string }>();
-  for (const p of input.planningOrderedChildren ?? []) orderingReads.set(`${p.parent ?? "\0root"}\0${p.version}`, { parent: p.parent, version: p.version });
-  for (const n of input.planningOrderedNeighbors ?? []) orderingReads.set(`${n.query.parent ?? "\0root"}\0${n.version}`, { parent: n.query.parent, version: n.version });
+  // Bounded neighbour answers attest the SAME (scope, parent, version) a
+  // full projection would — the authority re-derives one ordering version
+  // per parent at submit either way. Dedupe identical triples; if the two
+  // maps ever carried DIFFERENT versions for one parent (a mid-turn fetch
+  // race), attest both — the authority check then rejects the stale one and
+  // the turn re-plans, rather than a dedupe silently laundering it through.
+  // The owning `scope` rides along (R3) so a cross-scope commit validates
+  // foreign entries against that owner's attestation instead of skipping
+  // them — and `parent: null` names exactly one scope's roots.
+  const orderingReads = new Map<string, { parent: string | null; scope: string; version: string }>();
+  for (const p of input.planningOrderedChildren ?? []) orderingReads.set(`${p.scope}\0${p.parent ?? "\0root"}\0${p.version}`, { parent: p.parent, scope: p.scope, version: p.version });
+  for (const n of input.planningOrderedNeighbors ?? []) orderingReads.set(`${n.scope}\0${n.query.parent ?? "\0root"}\0${n.version}`, { parent: n.query.parent, scope: n.scope, version: n.version });
   if (orderingReads.size > 0) {
     transcript.orderingReads = [...orderingReads.values()];
   }

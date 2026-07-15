@@ -816,15 +816,27 @@ export class NetScopeDO {
         // version for each requested cell key, plus the head the report
         // was taken at. Absent cells attest "absent" — the same token
         // read-version validation uses, so an attested absence compares
-        // directly against a planned "absent" read. Read-only: no state
-        // changes, no head movement.
-        const body = (await request.json()) as { keys: string[] };
+        // directly against a planned "absent" read. `ordering_parents`
+        // (R3) asks for the current ordering content version of each named
+        // parent the same way — an ordering with no edges attests the
+        // empty-rows version, the ordering analogue of "absent". Read-only:
+        // no state changes, no head movement.
+        const body = (await request.json()) as { keys: string[]; ordering_parents?: (string | null)[] };
         const seq = this.ensureSequencer();
+        const orderingParents = Array.isArray(body.ordering_parents) ? body.ordering_parents : [];
+        for (const parent of orderingParents) {
+          if (parent !== null && !(typeof parent === "string" && parent)) {
+            throw netError("E_INVARG", "attest ordering_parents entries must be nonempty string refs or null", { parent });
+          }
+        }
         return json({
           scope: seq.scope,
           catalog_epoch: seq.catalogEpoch,
           owner_head: seq.head(),
-          cells: body.keys.map((key) => ({ key, version: seq.store.get(key)?.version ?? "absent" }))
+          cells: body.keys.map((key) => ({ key, version: seq.store.get(key)?.version ?? "absent" })),
+          ...(orderingParents.length > 0
+            ? { orderings: orderingParents.map((parent) => ({ parent, version: orderedChildrenVersion(seq.store.orderedEdgeChildren(parent)) })) }
+            : {})
         });
       }
       if (request.method === "POST" && url.pathname === "/net/room-roster") {
