@@ -44,6 +44,12 @@ export type ScopeHead = {
   hash: string;
 };
 
+export type OperatorDefinitionRepair = {
+  status: "applied" | "empty";
+  head: ScopeHead;
+  cells: Cell[];
+};
+
 export type CommitSubmit = {
   kind: "woo.net.commit_submit.v1";
   scope: string;
@@ -367,6 +373,56 @@ export class ScopeSequencer {
         durable.writeMeta({ scope: this.scope, catalog_epoch: this.catalogEpoch, head: this.headState });
       });
     }
+  }
+
+  /** Signed operator migration for already-installed bootstrap definition
+   * pages. Ordinary turns may never mutate catalog definitions (CO15); this
+   * explicit path advances the catalog owner head, stamps the replacement
+   * pages authoritatively, and records a tail entry so fanout/catch-up observe
+   * one ordered migration event. The Worker shell restricts inputs to existing
+   * `$`-object verb_bytecode cells before calling this method. */
+  operatorRepairDefinitions(cells: Array<Pick<Cell, "kind" | "object" | "name" | "value">>): OperatorDefinitionRepair {
+    const changed = cells.filter((cell) => {
+      const existing = this.store.get(cellKey(cell.kind, cell.object, cell.name));
+      return existing?.version !== cellVersion(cell.value);
+    });
+    if (changed.length === 0) return { status: "empty", head: this.headState, cells: [] };
+
+    const marker = `operator_definition_repair:${cellVersion(changed.map((cell) => [cell.kind, cell.object, cell.name ?? null, cell.value]))}`;
+    const priorHead = this.headState;
+    const nextHead: ScopeHead = {
+      seq: priorHead.seq + 1,
+      hash: cellVersion([priorHead.hash, priorHead.seq + 1, marker])
+    };
+    const nextStamp: EpochStamp = { scope_head: `${nextHead.seq}:${nextHead.hash}`, catalog_epoch: this.catalogEpoch };
+    const committed = changed.map((cell) => this.store.commit({
+      kind: cell.kind,
+      object: cell.object,
+      ...(cell.name !== undefined ? { name: cell.name } : {}),
+      value: cell.value,
+      stamp: nextStamp
+    }));
+    const touched = committed.map((cell) => cell.key).sort();
+    this.headState = nextHead;
+    const tailEntry: TailEntry = {
+      seq: nextHead.seq,
+      transcript_hash: marker,
+      touched,
+      base_hash: priorHead.hash,
+      head_hash: nextHead.hash
+    };
+    this.tail.push(tailEntry);
+    if (this.tail.length > this.options.tailLimit) this.tail.splice(0, this.tail.length - this.options.tailLimit);
+    const durable = this.options.durable;
+    if (durable) {
+      durable.transaction(() => {
+        for (const cell of committed) durable.writeCell(cell);
+        durable.writeMeta({ scope: this.scope, catalog_epoch: this.catalogEpoch, head: this.headState });
+        durable.appendTail(tailEntry);
+        durable.trimTail(this.options.tailLimit);
+      });
+    }
+    return { status: "applied", head: this.headState, cells: committed };
   }
 
   /**

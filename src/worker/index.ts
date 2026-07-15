@@ -776,7 +776,7 @@ async function handleNetSmoke(request: Request, env: Env, url: URL): Promise<Res
 /**
  * Cutover item A: the production install doorway —
  * `GET  /net-install/probe`,
- * `POST /net-install/scope/<name>/{seed,activate,repair-relations}`, and
+ * `POST /net-install/scope/<name>/{seed,activate,repair-relations,repair-definitions}`, and
  * `GET  /net-install/scope/<name>/head`, plus the migration-only freeze
  * acknowledgment and identity export described below.
  *
@@ -856,6 +856,7 @@ async function handleNetInstall(request: Request, env: Env, url: URL): Promise<R
   const allowed =
     (verb === "seed" && request.method === "POST") ||
     (verb === "repair-relations" && request.method === "POST") ||
+    (verb === "repair-definitions" && request.method === "POST") ||
     (verb === "head" && request.method === "GET") ||
     // The NC1 activation state machine (reviewer finding 1): activation
     // and deactivation are a dedicated signed op, never a seed — seeds
@@ -867,7 +868,7 @@ async function handleNetInstall(request: Request, env: Env, url: URL): Promise<R
         error: {
           code: "E_INVARG",
           message:
-            "expected GET /net-install/probe, POST /net-install/scope/<name>/seed, POST /net-install/scope/<name>/activate, POST /net-install/scope/<name>/repair-relations, GET /net-install/scope/<name>/head, or GET /net-install/identity-export"
+            "expected GET /net-install/probe, POST /net-install/scope/<name>/seed, POST /net-install/scope/<name>/activate, POST /net-install/scope/<name>/repair-relations, POST /net-install/scope/catalog/repair-definitions, GET /net-install/scope/<name>/head, or GET /net-install/identity-export"
         }
       },
       404

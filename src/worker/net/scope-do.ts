@@ -1018,6 +1018,51 @@ export class NetScopeDO {
         this.armOutboxRetryAlarm();
         return json({ ok: true, scope: seq.scope, ...repaired });
       }
+      if (request.method === "POST" && url.pathname === "/net/repair-definitions") {
+        const body = (await request.json()) as {
+          cells?: Array<Pick<Cell, "kind" | "object" | "name" | "value">>;
+        };
+        const cells = Array.isArray(body.cells) ? body.cells : [];
+        const seq = this.ensureSequencer();
+        if (seq.scope !== CATALOG_SCOPE || cells.length === 0 || cells.length > 16) {
+          throw netError("E_INVARG", "definition repair requires 1..16 catalog cells", { scope: seq.scope, count: cells.length });
+        }
+        const keys = new Set<string>();
+        for (const cell of cells) {
+          if (!cell || typeof cell !== "object" || typeof cell.kind !== "string" ||
+              typeof cell.object !== "string" || typeof cell.name !== "string" ||
+              !Object.prototype.hasOwnProperty.call(cell, "value")) {
+            throw netError("E_INVARG", "definition repair requires complete verb cells");
+          }
+          const key = cellKey(cell.kind, cell.object, cell.name);
+          const page = cell.value as Record<string, unknown> | null;
+          if (cell.kind !== "verb_bytecode" || !cell.object.startsWith("$") || !cell.name ||
+              !page || typeof page !== "object" || Array.isArray(page) || page.name !== cell.name ||
+              !seq.store.has(key) || keys.has(key)) {
+            throw netError("E_INVARG", "definition repair accepts unique existing bootstrap verb pages only", { key });
+          }
+          keys.add(key);
+        }
+        const repaired = this.discardSeqOnThrow(() => this.store.transaction(() => {
+          const result = seq.operatorRepairDefinitions(cells);
+          if (result.status === "applied") {
+            const subscribers = sqlRows<{ destination: string; delivery_seq: number }>(
+              this.state.storage.sql.exec("SELECT destination, delivery_seq FROM net_scope_subscribers WHERE role = 'fanout'")
+            );
+            for (const { destination, delivery_seq } of subscribers) {
+              this.persistFanoutRow(destination, delivery_seq, {
+                scope: seq.scope,
+                seq: result.head.seq,
+                cells: result.cells,
+                observations: []
+              });
+            }
+          }
+          return result;
+        }));
+        this.armOutboxRetryAlarm();
+        return json({ ok: true, scope: seq.scope, status: repaired.status, head: repaired.head, changed: repaired.cells.map((cell) => cell.key) });
+      }
       if (request.method === "POST" && url.pathname === "/net/activate") {
         // The NC1 activation state machine as a DEDICATED operator op
         // (reviewer finding 1): /net/seed refuses once a scope has

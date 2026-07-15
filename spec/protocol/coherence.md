@@ -527,6 +527,15 @@ One write path per fact (CO9), concretized:
   For namespaces created before this rule, the signed add-only
   `repair-relations` operator operation advances the owner head only when a row
   is missing and refans that delta; replay is an idempotent no-op.
+- **Persisted bootstrap definitions upgrade as ordered catalog events.** A
+  runtime deployment does not rewrite verb pages already installed in an
+  active world. The signed `repair-definitions` operator operation therefore
+  accepts only existing `verb_bytecode` cells on `$` objects at catalog
+  authority, advances the catalog head once, durably appends the tail event,
+  and refans the replacement pages. An unchanged replay is a no-op. The
+  operator script further requires an explicit `$object:verb` allow-list and
+  obtains each replacement from the fresh local install plan; arbitrary
+  bytecode and new definition creation are not an operator input.
 - **The applier runs at the committing scope.** On accept, the scope
   derives relation deltas from the transcript: `projectionWrites`
   (contents add/remove), moves (contents of the source and destination

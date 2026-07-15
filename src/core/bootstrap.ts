@@ -1187,7 +1187,14 @@ function seedUniversal(world: WooWorld): void {
     directCallable: true,
     toolExposed: true,
     aliases: ["@ways"],
-    argSpec: { args: ["room?"], command: { dobj: "any", prep: "any", iobj: "any", args_from: ["argstr"] } }
+    argSpec: {
+      args: ["room?"],
+      command: { dobj: "any", prep: "any", iobj: "any", args_from: ["argstr"] },
+      // A complete listing depends on the room's explicit exit map and on
+      // every referenced exit page. Generic net prefetch resolves map values;
+      // the planner's ordinary miss repair remains the correctness fallback.
+      authority: { prefetch: ["scope", { path: ["scope", "exits"] }] }
+    }
   });
   sourceVerb(world, "$player", "examine_detailed", PLAYER_EXAMINE_DETAILED_SOURCE, {
     directCallable: true,
