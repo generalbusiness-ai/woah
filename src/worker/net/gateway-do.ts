@@ -583,10 +583,10 @@ export class NetGatewayDO {
    * Boundedness, documented: an insertion-ordered Map capped at
    * RECENT_CLIENT_TURN_CAP — plenty for the window between a submit and
    * its own fanout (same-scope, one commit). In-memory only, ON PURPOSE:
-   * losing an entry (hibernation, cap overflow) degrades to ONE
-   * duplicate frame for the submitter — never a missed frame for anyone
-   * else — which matches the layer's at-most-once, no-durability
-   * observation posture (kickoff rule).
+   * losing an entry (hibernation, cap overflow) sends ONE redundant frame
+   * to the submitter, never a missed frame for anyone else. The frame carries
+   * turn_id, so NetFeed buffers/drops that self echo even when it beats the
+   * turn reply; the LRU remains the bandwidth optimization, not correctness.
    */
   private readonly recentClientTurns = new Map<string, string>();
 
@@ -1860,7 +1860,7 @@ export class NetGatewayDO {
   //       {type:"ping", id?} → {type:"pong", id}
   //       anything else → {type:"error", id?, error:{code, message}}
   //     Observation push (item 3 chunk 2) delivers
-  //     {type:"observations", scope, seq, observations} frames to
+  //     {type:"observations", scope, seq, turn_id?, observations} frames to
   //     sockets whose session is present (CO13 session_presence) in a
   //     fanout's scope — see pushObservations.
 
@@ -3350,7 +3350,7 @@ export class NetGatewayDO {
    *   (net_gateway_relation): a presence row whose owner space anchors
    *   to the fanout's scope names a member session; that session's
    *   tagged sockets (getWebSockets(session)) receive one
-   *   {type:"observations", scope, seq, observations} frame. Sessions on
+   *   {type:"observations", scope, seq, turn_id?, observations} frame. Sessions on
    *   other gateway shards are those shards' concern — they subscribe to
    *   the same scope and run this same routine.
    * - Owner→scope goes through the view-lineage classifier (CO15 walk),
@@ -3412,7 +3412,13 @@ export class NetGatewayDO {
       // MCP wait queues ride the SAME audience + submitter dedupe as the
       // sockets (client-shell phase i).
       this.mcpEnqueue(row.member, visible);
-      const frame = JSON.stringify({ type: "observations", scope: body.scope, seq: body.seq, observations: visible });
+      const frame = JSON.stringify({
+        type: "observations",
+        scope: body.scope,
+        seq: body.seq,
+        ...(body.turn_id !== undefined ? { turn_id: body.turn_id } : {}),
+        observations: visible
+      });
       for (const ws of getSockets ? getSockets(row.member) : []) {
         try {
           ws.send(frame);

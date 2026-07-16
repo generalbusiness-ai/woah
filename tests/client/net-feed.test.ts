@@ -343,6 +343,81 @@ describe("NetFeed observation frames (the peer path)", () => {
     socket.frame({ type: "observations", scope: "room:hall", seq: 5, observations: [{ type: "waved", actor: "#alice" }] });
     expect(events).toHaveLength(1);
   });
+
+  it("buffers a self fanout that beats turn_result and renders the reply exactly once", async () => {
+    const { feed, socket, events } = await openFeed();
+    const turn = feed.turn({ target: "#bob", verb: "wave" });
+    await tick();
+    const turnId = socket.sent[0].id as string;
+
+    // Gateway hibernation can lose its in-memory recentClientTurns entry.
+    // The ordered fanout may then beat the reply; turn_id lets the client
+    // recognize and hold this as its own echo instead of rendering it as peer.
+    socket.frame({
+      type: "observations",
+      scope: "room:hall",
+      seq: 5,
+      turn_id: turnId,
+      observations: [{ type: "waved", actor: "#alice" }]
+    });
+    expect(events).toEqual([]);
+
+    socket.frame({ type: "turn_result", id: turnId, status: 200, ...acceptedTurnResult() });
+    const outcome = await turn;
+    expect(outcome.observations).toEqual([{ type: "waved", actor: "#alice" }]);
+    expect(events).toEqual([
+      {
+        source: "self",
+        scope: "room:hall",
+        seq: 5,
+        turn_id: turnId,
+        observation: { type: "waved", actor: "#alice" }
+      }
+    ]);
+
+    // The modern turn-id guard is cross-scope; reply scope alone cannot
+    // describe every observation fanout a multi-scope turn may produce.
+    socket.frame({
+      type: "observations",
+      scope: "room:annex",
+      seq: 9,
+      turn_id: turnId,
+      observations: [{ type: "waved", actor: "#alice" }]
+    });
+    expect(events).toHaveLength(1);
+  });
+
+  it("uses a buffered self fanout when an idempotent replay omits observations", async () => {
+    const { feed, socket, events } = await openFeed();
+    const turn = feed.turn({ target: "#bob", verb: "wave" });
+    await tick();
+    const turnId = socket.sent[0].id as string;
+    socket.frame({
+      type: "observations",
+      scope: "room:hall",
+      seq: 5,
+      turn_id: turnId,
+      observations: [{ type: "waved", actor: "#alice" }]
+    });
+    socket.frame({
+      type: "turn_result",
+      id: turnId,
+      status: 200,
+      ...acceptedTurnResult({ replayed: true, result: undefined, observations: undefined })
+    });
+    const outcome = await turn;
+    expect(outcome.replayed).toBe(true);
+    expect(outcome.observations).toEqual([{ type: "waved", actor: "#alice" }]);
+    expect(events).toEqual([
+      {
+        source: "self",
+        scope: "room:hall",
+        seq: 5,
+        turn_id: turnId,
+        observation: { type: "waved", actor: "#alice" }
+      }
+    ]);
+  });
 });
 
 describe("NetFeed reconnect", () => {

@@ -120,6 +120,31 @@ test("the real SPA over the net path: alice's chat line reaches bob's browser", 
   await contextB.close();
 });
 
+test("the submitting browser renders take and drop acknowledgements exactly once", async ({ browser }, testInfo) => {
+  test.setTimeout(120_000);
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  await openSpa(page, credentials.alice);
+
+  const input = page.locator("[data-chat-input]");
+  await input.fill("get mug");
+  await input.press("Enter");
+  await expect(page.getByText("You take Mug.", { exact: true })).toHaveCount(1, { timeout: 30_000 });
+  await page.waitForTimeout(1_000);
+  await expect(page.getByText("You take Mug.", { exact: true })).toHaveCount(1);
+
+  await input.fill("drop mug");
+  await input.press("Enter");
+  await expect(page.getByText("You drop Mug.", { exact: true })).toHaveCount(1, { timeout: 30_000 });
+  await page.waitForTimeout(1_000);
+  await expect(page.getByText("You drop Mug.", { exact: true })).toHaveCount(1);
+  expectNoLegacyRequests(page);
+  const screenshot = testInfo.outputPath("take-drop-once-workerd.png");
+  await page.screenshot({ path: screenshot, fullPage: true });
+  await testInfo.attach("take-drop-once-workerd", { path: screenshot, contentType: "image/png" });
+  await context.close();
+});
+
 test("entering Tasks keeps workspace and chat component surfaces separate and responsive", async ({ browser }) => {
   test.setTimeout(120_000);
   const context = await browser.newContext();

@@ -262,8 +262,20 @@ async function buildHarness(
   const scopeDOs = new Map<string, NetScopeDO>();
   const scopeStates = new Map<string, ReturnType<typeof netState>>();
   let gateway: NetGatewayDO;
+  let gatewayFanoutGate: Promise<void> | null = null;
+  let releaseGatewayFanout: (() => void) | null = null;
+  const gatewayResolver = {
+    fetch: async (request: Request): Promise<Response> => {
+      const gate = gatewayFanoutGate;
+      if (gate && new URL(request.url).pathname === "/net/fanout") {
+        gatewayFanoutGate = null;
+        await gate;
+      }
+      return await gateway.fetch(request);
+    }
+  };
   const resolve = (destination: string) => {
-    if (destination === "gateway:net-api") return gateway;
+    if (destination === "gateway:net-api") return gatewayResolver;
     const scope = destination.startsWith("scope:") ? destination.slice("scope:".length) : null;
     const instance = scope !== null ? scopeDOs.get(scope) : undefined;
     if (!instance) throw new Error(`unresolvable destination ${destination}`);
@@ -366,6 +378,25 @@ async function buildHarness(
     gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
     return gateway;
   };
+  /** Recreate the gateway object over the same durable state and socket
+   * registry. This models hibernation: persisted mirrors survive, while
+   * the in-memory recent-client-turn echo LRU is intentionally empty. */
+  const rehydrateGateway = (): NetGatewayDO => {
+    gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
+    return gateway;
+  };
+  /** Hold the next scope→gateway fanout at the RPC boundary. Tests use
+   * this to put a real hibernation/rehydration boundary between commit
+   * and delivery without reaching into the gateway's private LRU. */
+  const pauseNextGatewayFanout = (): (() => void) => {
+    gatewayFanoutGate = new Promise<void>((resolveGate) => {
+      releaseGatewayFanout = resolveGate;
+    });
+    return () => {
+      releaseGatewayFanout?.();
+      releaseGatewayFanout = null;
+    };
+  };
 
   return {
     gateway,
@@ -379,6 +410,8 @@ async function buildHarness(
     settle,
     mint,
     mintOther,
+    pauseNextGatewayFanout,
+    rehydrateGateway,
     rehydrateWithoutPeerCells,
     close: () => states.forEach((st) => st.close())
   };
@@ -675,7 +708,7 @@ describe("gateway self-subscribe (H1)", () => {
     expect((peerObservations[0].observations as Array<{ type?: string }>).map((o) => o.type)).toContain("waved");
     // Phase 5 v1 contract freeze: the push frame's field names are pinned
     // (add-only, never rename).
-    for (const key of ["type", "scope", "seq", "observations"]) {
+    for (const key of ["type", "scope", "seq", "turn_id", "observations"]) {
       expect(Object.keys(peerObservations[0] as Record<string, unknown>), `observations.${key}`).toContain(key);
     }
 
@@ -684,6 +717,60 @@ describe("gateway self-subscribe (H1)", () => {
 });
 
 describe("observation push via session_presence (Phase 4 item 3 chunk 2)", () => {
+  it("labels a redundant submitter frame after gateway hibernation loses the echo LRU", async () => {
+    const h = await buildHarness();
+    const token = `apikey:${KEY_ID}:${KEY_SECRET}`;
+    await h.subscribe(h.annexScope);
+    const session = await h.mint();
+    const entered = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+      token,
+      body: {
+        target: "ws_annex",
+        verb: "welcome",
+        session,
+        idempotency_key: "ws-rehydrate-enter"
+      }
+    });
+    expect(entered.status, JSON.stringify(entered.body)).toBe(200);
+    await h.settle();
+
+    const opened = await upgrade(h, session);
+    expect(opened.status).toBe(101);
+    const socket = opened.server as FakeWebSocket;
+    const releaseFanout = h.pauseNextGatewayFanout();
+    await h.gateway.webSocketMessage(
+      socket as unknown as WebSocket,
+      JSON.stringify({
+        type: "turn",
+        id: "rehydrate-wave",
+        target: "ws_wave_box",
+        verb: "wave",
+        idempotency_key: "ws-rehydrate-wave"
+      })
+    );
+    expect(frames(socket).at(-1)).toMatchObject({
+      type: "turn_result",
+      id: "rehydrate-wave",
+      status: 200
+    });
+
+    // The commit queued its fanout, but a hibernation boundary clears the
+    // submitter LRU before delivery. The gateway must send the redundant
+    // frame with enough identity for NetFeed to suppress it visibly.
+    h.rehydrateGateway();
+    releaseFanout();
+    await h.settle();
+    expect(frames(socket).filter((frame) => frame.type === "observations")).toEqual([
+      expect.objectContaining({
+        scope: h.annexScope,
+        turn_id: "ws-rehydrate-wave",
+        observations: expect.arrayContaining([expect.objectContaining({ type: "waved" })])
+      })
+    ]);
+
+    h.close();
+  });
+
   it("pushes a turn's observations to present peers, skipping the submitter and absent sessions", async () => {
     const h = await buildHarness();
     const token = `apikey:${KEY_ID}:${KEY_SECRET}`;
@@ -780,7 +867,7 @@ describe("observation push via session_presence (Phase 4 item 3 chunk 2)", () =>
     // The present PEER receives the observations frame from the fanout.
     const peerObservations = frames(socketB).filter((frame) => frame.type === "observations");
     expect(peerObservations).toHaveLength(1);
-    expect(peerObservations[0]).toMatchObject({ scope: h.annexScope });
+    expect(peerObservations[0]).toMatchObject({ scope: h.annexScope, turn_id: "ws-wave-1" });
     expect((peerObservations[0].observations as Array<{ type?: string }>).map((o) => o.type)).toContain("waved");
 
     // The SUBMITTER's socket gets nothing via fanout (turn-id dedupe:

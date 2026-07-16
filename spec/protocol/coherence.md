@@ -798,12 +798,17 @@ One write path per fact (CO9), concretized:
     bullet; the WS `turn_result` frame carries them). Peers receive them
     via fanout: the gateway routes an applied fanout's observations to
     the sockets of sessions PRESENT in the fanout's scope per its CO13
-    mirror, as `{type:"observations", scope, seq, observations}` frames.
+    mirror, as `{type:"observations", scope, seq, turn_id?, observations}`
+    frames. `turn_id` is copied from `FanoutBody.turn_id` when the fanout
+    announces a client turn.
     Echo dedupe is `FanoutBody.turn_id` matched against a bounded
     in-memory LRU of recently client-submitted turn ids (recorded before
-    the submit leaves, so the fanout can never race past it); losing an
-    entry (hibernation, cap) degrades to one duplicate frame for the
-    submitter, never a missed frame for a peer. Delivery is
+    the submit leaves, so the usual fanout cannot race past it). If
+    hibernation or the cap loses that entry, the client uses the frame's
+    `turn_id` to buffer an echo that arrives before `turn_result`, prefers
+    the full reply on settlement, and drops later echoes; a replay with no
+    observations may consume the buffered visible copy. Thus LRU loss costs
+    one redundant frame, not a duplicate user-visible observation. Delivery is
     AT-MOST-ONCE and never durable: the per-scope seq gate drops
     redeliveries, dead sockets are skipped, and missed-observation
     catch-up is deliberately NOT promised in Phase 4.

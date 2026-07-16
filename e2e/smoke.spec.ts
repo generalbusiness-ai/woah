@@ -1368,6 +1368,7 @@ test("two browser agents execute locally and are sequenced by the devserver", as
 
     timings.firstTake = await sendChatAndExpectSequenced(first, firstV2, "take mug", "take", "applied_frame");
     await expect(first.locator(".chat-feed")).toContainText("You take Mug.", { timeout: 5_000 });
+    await expect(first.getByText("You take Mug.", { exact: true })).toHaveCount(1);
 
     timings.firstMoveOut = await sendChatAndExpectSequenced(first, firstV2, "se", "southeast", "applied_frame");
     await expect(first.locator(".toolbar h1")).toHaveText("Deck", { timeout: 5_000 });
@@ -1375,6 +1376,7 @@ test("two browser agents execute locally and are sequenced by the devserver", as
 
     timings.firstDrop = await sendChatAndExpectSequenced(first, firstV2, "drop mug", "drop", "applied_frame");
     await expect(first.locator(".chat-feed")).toContainText("You drop Mug.", { timeout: 5_000 });
+    await expect(first.getByText("You drop Mug.", { exact: true })).toHaveCount(1);
 
     timings.secondSay = await sendChatAndExpectSequenced(second, secondV2, `say ${secondLine}`, "say", "turn_result");
     await expect(second.locator(".chat-feed")).toContainText(secondLine, { timeout: 5_000 });
@@ -1385,9 +1387,11 @@ test("two browser agents execute locally and are sequenced by the devserver", as
 
     timings.secondTake = await sendChatAndExpectSequenced(second, secondV2, "take mug", "take", "applied_frame");
     await expect(second.locator(".chat-feed")).toContainText("You take Mug.", { timeout: 5_000 });
+    await expect(second.getByText("You take Mug.", { exact: true })).toHaveCount(1);
 
     timings.secondDrop = await sendChatAndExpectSequenced(second, secondV2, "drop mug", "drop", "applied_frame");
     await expect(second.locator(".chat-feed")).toContainText("You drop Mug.", { timeout: 5_000 });
+    await expect(second.getByText("You drop Mug.", { exact: true })).toHaveCount(1);
 
     await first.waitForTimeout(1_200);
     await second.waitForTimeout(1_200);
