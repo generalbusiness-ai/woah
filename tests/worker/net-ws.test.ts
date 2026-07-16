@@ -34,6 +34,7 @@ import { createWorld } from "../../src/core/bootstrap";
 import { cellsFromSerialized } from "../../src/net/bridge";
 import { netActivationCell } from "../../src/net/install";
 import { CATALOG_SCOPE, partitionCells } from "../../src/net/topology";
+import { turnEchoId } from "../../src/net/turn-echo";
 import { signInternalRequest } from "../../src/worker/internal-auth";
 
 const SECRET = "net-ws-test-secret";
@@ -708,7 +709,7 @@ describe("gateway self-subscribe (H1)", () => {
     expect((peerObservations[0].observations as Array<{ type?: string }>).map((o) => o.type)).toContain("waved");
     // Phase 5 v1 contract freeze: the push frame's field names are pinned
     // (add-only, never rename).
-    for (const key of ["type", "scope", "seq", "turn_id", "observations"]) {
+    for (const key of ["type", "scope", "seq", "echo_id", "observations"]) {
       expect(Object.keys(peerObservations[0] as Record<string, unknown>), `observations.${key}`).toContain(key);
     }
 
@@ -763,7 +764,7 @@ describe("observation push via session_presence (Phase 4 item 3 chunk 2)", () =>
     expect(frames(socket).filter((frame) => frame.type === "observations")).toEqual([
       expect.objectContaining({
         scope: h.annexScope,
-        turn_id: "ws-rehydrate-wave",
+        echo_id: turnEchoId("ws-rehydrate-wave"),
         observations: expect.arrayContaining([expect.objectContaining({ type: "waved" })])
       })
     ]);
@@ -845,7 +846,7 @@ describe("observation push via session_presence (Phase 4 item 3 chunk 2)", () =>
     });
 
     // s1 waves over ITS socket; the commit's fanout (annex scope, with
-    // the turn id riding — src/net/outbox.ts FanoutBody.turn_id) then
+    // the safe echo id riding — src/net/outbox.ts FanoutBody.echo_id) then
     // fans to the subscribed mirror.
     await h.gateway.webSocketMessage(
       socketA as unknown as WebSocket,
@@ -867,7 +868,12 @@ describe("observation push via session_presence (Phase 4 item 3 chunk 2)", () =>
     // The present PEER receives the observations frame from the fanout.
     const peerObservations = frames(socketB).filter((frame) => frame.type === "observations");
     expect(peerObservations).toHaveLength(1);
-    expect(peerObservations[0]).toMatchObject({ scope: h.annexScope, turn_id: "ws-wave-1" });
+    expect(peerObservations[0]).toMatchObject({
+      scope: h.annexScope,
+      echo_id: turnEchoId("ws-wave-1")
+    });
+    expect(peerObservations[0]).not.toHaveProperty("turn_id");
+    expect(JSON.stringify(peerObservations[0])).not.toContain("ws-wave-1");
     expect((peerObservations[0].observations as Array<{ type?: string }>).map((o) => o.type)).toContain("waved");
 
     // The SUBMITTER's socket gets nothing via fanout (turn-id dedupe:
@@ -887,6 +893,27 @@ describe("observation push via session_presence (Phase 4 item 3 chunk 2)", () =>
     // grow this count.
     logSpy.mockRestore();
     expect(scanRows).toEqual([3]);
+
+    // SECURITY: the only correlation value the peer learns is a one-way
+    // digest. Reusing it as an idempotency key must execute the peer's own
+    // turn, never replay the victim's recorded reply.
+    const stolenEchoId = String(peerObservations[0].echo_id);
+    await h.gateway.webSocketMessage(
+      socketB as unknown as WebSocket,
+      JSON.stringify({
+        type: "turn",
+        id: "peer-replay-attempt",
+        target: "ws_wave_box",
+        verb: "wave",
+        idempotency_key: stolenEchoId
+      })
+    );
+    const peerAttempt = frames(socketB).find((frame) => frame.id === "peer-replay-attempt") as
+      | { reply?: { status?: string }; result?: unknown; replayed?: boolean }
+      | undefined;
+    expect(peerAttempt?.reply?.status).toBe("accepted");
+    expect(peerAttempt?.replayed).not.toBe(true);
+    expect(peerAttempt?.result).toBe(2);
 
     h.close();
   });

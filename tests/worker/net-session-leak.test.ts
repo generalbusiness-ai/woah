@@ -9,11 +9,11 @@
 // removes every session id/value from what a co-present peer receives
 // while keeping the legitimate actor-level roster intact.
 //
-// Surface under test: GET /net-api/relation?relation=session_presence.
-// The presence relation stores `member = <session id>` and
-// `body.session = <the session cell value>`; the raw relationMembers
-// output therefore enumerates every co-present bearer token to any caller
-// authorized to read the room (i.e. anyone standing in it).
+// Surfaces under test:
+// - GET /net-api/relation?relation=session_presence
+// - GET /net-api/cell?key=property_cell:<room>:<presence property>
+// Both projections contain raw session ids; every client-facing path must
+// refuse or redact them before a co-present peer can observe the payload.
 import { describe, expect, it } from "vitest";
 import { FakeDurableObjectState } from "./fake-do";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
@@ -226,6 +226,30 @@ function containsSessionCell(value: unknown): boolean {
 }
 
 describe("net session bearer-token leak (P0)", () => {
+  it("REGRESSION: a co-present guest cannot read a session-keyed presence property cell", async () => {
+    const h = await buildHarness();
+    const sidA = await joinAndAct(h, h.tokenA);
+    const sidB = await joinAndAct(h, h.tokenB);
+
+    const key = "property_cell:leak_room:session_subscribers";
+    const read = await clientFetch(
+      h.gateway,
+      "GET",
+      `/net-api/cell?session=${encodeURIComponent(sidA)}&key=${encodeURIComponent(key)}`,
+      { token: h.tokenA }
+    );
+
+    // On vulnerable code this is 200 and the cell value contains both
+    // {session:sidA, actor:A} and {session:sidB, actor:B}. The generic
+    // definition-driven guard now refuses every presence/key=session
+    // property regardless of its catalog-defined name.
+    expect(read.status, JSON.stringify(read.body)).toBe(403);
+    expect(containsSessionId(read.body, sidA), JSON.stringify(read.body)).toBe(false);
+    expect(containsSessionId(read.body, sidB), JSON.stringify(read.body)).toBe(false);
+
+    h.close();
+  });
+
   it("REGRESSION (was EXPLOIT): a co-present guest CANNOT enumerate a peer's bearer token via /net-api/relation", async () => {
     // The reproduced attack, now permanently guarded. On the VULNERABLE
     // code this exact read returned `members[].member === sidB` (the

@@ -11,6 +11,7 @@ import {
   type NetFeedState,
   type NetSocketLike
 } from "../../src/client/net-feed";
+import { turnEchoId } from "../../src/net/turn-echo";
 
 const API_KEY = "apikey:k1:secret-1";
 const BASE = "https://woo.test";
@@ -190,7 +191,7 @@ describe("NetFeed turn() over WS", () => {
         source: "self",
         scope: "room:hall",
         seq: 5,
-        turn_id: frame.id,
+        turn_id: String(frame.id),
         observation: { type: "waved", actor: "#alice" }
       }
     ]);
@@ -351,13 +352,13 @@ describe("NetFeed observation frames (the peer path)", () => {
     const turnId = socket.sent[0].id as string;
 
     // Gateway hibernation can lose its in-memory recentClientTurns entry.
-    // The ordered fanout may then beat the reply; turn_id lets the client
+    // The ordered fanout may then beat the reply; echo_id lets the client
     // recognize and hold this as its own echo instead of rendering it as peer.
     socket.frame({
       type: "observations",
       scope: "room:hall",
       seq: 5,
-      turn_id: turnId,
+      echo_id: turnEchoId(turnId),
       observations: [{ type: "waved", actor: "#alice" }]
     });
     expect(events).toEqual([]);
@@ -381,7 +382,7 @@ describe("NetFeed observation frames (the peer path)", () => {
       type: "observations",
       scope: "room:annex",
       seq: 9,
-      turn_id: turnId,
+      echo_id: turnEchoId(turnId),
       observations: [{ type: "waved", actor: "#alice" }]
     });
     expect(events).toHaveLength(1);
@@ -396,7 +397,7 @@ describe("NetFeed observation frames (the peer path)", () => {
       type: "observations",
       scope: "room:hall",
       seq: 5,
-      turn_id: turnId,
+      echo_id: turnEchoId(turnId),
       observations: [{ type: "waved", actor: "#alice" }]
     });
     socket.frame({

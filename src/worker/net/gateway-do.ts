@@ -79,6 +79,7 @@ import type { CommitReply, CommitSubmit, RejectReason, ScheduledTurn, ScopeHead 
 import { netCellKeyFor, type EffectTranscript } from "../../net/transcript";
 import type { CellTransfer } from "../../net/cells";
 import { randomHex } from "../../core/source-hash";
+import { turnEchoId } from "../../net/turn-echo";
 import type { ShadowTurnCall } from "../../core/shadow-turn-call";
 import { provisionGuestSubmit, type GuestTemplate } from "../../net/guest";
 import { verifyInternalRequest } from "../internal-auth";
@@ -585,7 +586,7 @@ export class NetGatewayDO {
    * its own fanout (same-scope, one commit). In-memory only, ON PURPOSE:
    * losing an entry (hibernation, cap overflow) sends ONE redundant frame
    * to the submitter, never a missed frame for anyone else. The frame carries
-   * turn_id, so NetFeed buffers/drops that self echo even when it beats the
+   * echo_id, so NetFeed buffers/drops that self echo even when it beats the
    * turn reply; the LRU remains the bandwidth optimization, not correctness.
    */
   private readonly recentClientTurns = new Map<string, string>();
@@ -3356,7 +3357,7 @@ export class NetGatewayDO {
    *   (net_gateway_relation): a presence row whose owner space anchors
    *   to the fanout's scope names a member session; that session's
    *   tagged sockets (getWebSockets(session)) receive one
-   *   {type:"observations", scope, seq, turn_id?, observations} frame. Sessions on
+   *   {type:"observations", scope, seq, echo_id?, observations} frame. Sessions on
    *   other gateway shards are those shards' concern — they subscribe to
    *   the same scope and run this same routine.
    * - Owner→scope goes through the view-lineage classifier (CO15 walk),
@@ -3403,7 +3404,10 @@ export class NetGatewayDO {
     let deliveredMembers = 0;
     let framesSent = 0;
     for (const row of rows) {
-      if (body.turn_id !== undefined && this.recentClientTurns.get(body.turn_id) === row.member) continue;
+      if (
+        body.submitter_turn_id !== undefined
+        && this.recentClientTurns.get(body.submitter_turn_id) === row.member
+      ) continue;
       // v2 audience parity (client-shell phase i): a `to:`-directed
       // observation (looked/who — private views) reaches ONLY the session
       // whose actor it names; everything else is the room broadcast. The
@@ -3422,7 +3426,9 @@ export class NetGatewayDO {
         type: "observations",
         scope: body.scope,
         seq: body.seq,
-        ...(body.turn_id !== undefined ? { turn_id: body.turn_id } : {}),
+        // SECURITY: never expose submitter_turn_id here. It is the scope's
+        // idempotent-reply replay credential. echo_id is a one-way digest.
+        ...(body.echo_id !== undefined ? { echo_id: body.echo_id } : {}),
         observations: visible
       });
       for (const ws of getSockets ? getSockets(row.member) : []) {
@@ -3644,9 +3650,45 @@ export class NetGatewayDO {
     return false;
   }
 
+  /**
+   * Presence projections keyed by session contain bearer credentials even
+   * when the property has a catalog-defined name. Authorization therefore
+   * follows the property definition contract, never a bundled-name blacklist.
+   */
+  private isSessionKeyedPresenceCell(key: string): boolean {
+    const cell = this.ensureView().get(key);
+    if (cell?.kind !== "property_cell" || typeof cell.name !== "string") return false;
+    let object: string | null = cell.object;
+    const seen = new Set<string>();
+    while (object && !seen.has(object)) {
+      seen.add(object);
+      const property = this.ensureView().get(cellKey("property_cell", object, cell.name));
+      const value = property?.value;
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        const def = (value as { def?: unknown }).def;
+        if (def && typeof def === "object" && !Array.isArray(def)) {
+          const definition = def as {
+            kind?: unknown;
+            key?: unknown;
+            presenceProjection?: unknown;
+          };
+          const rawPresence = definition.presenceProjection ?? definition;
+          if (!rawPresence || typeof rawPresence !== "object" || Array.isArray(rawPresence)) return false;
+          const presence = rawPresence as { kind?: unknown; key?: unknown };
+          return presence.kind === "presence" && presence.key === "session";
+        }
+      }
+      const lineage = this.ensureView().get(cellKey("object_lineage", object))?.value as
+        | { parent?: unknown }
+        | undefined;
+      object = typeof lineage?.parent === "string" ? lineage.parent : null;
+    }
+    return false;
+  }
+
   /** Authorize a cell read; throws ClientAuthError(403) on denial. */
   private authorizeCellRead(caller: string, session: string, key: string): void {
-    if (this.denyProtectedCell(key)) {
+    if (this.denyProtectedCell(key) || this.isSessionKeyedPresenceCell(key)) {
       throw new ClientAuthError("cell not readable", { key }, "E_PERM", 403);
     }
     const parts = key.split(":");
@@ -3938,7 +3980,9 @@ export class NetGatewayDO {
         seq: reply.head.seq,
         deltas: entry.deltas,
         observations: observationsForRelationOwners(observations, entry.deltas),
-        ...(turnId !== undefined ? { turn_id: turnId } : {})
+        ...(turnId !== undefined
+          ? { submitter_turn_id: turnId, echo_id: turnEchoId(turnId) }
+          : {})
       });
       if (structure) await structure.rpc(deliver, { mandatory: true, phase: "presence_fence" });
       else await deliver();

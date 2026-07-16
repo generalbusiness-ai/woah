@@ -15,6 +15,7 @@ import type { NetStub } from "../../src/worker/net/workerd-host";
 import { applyTranscript } from "../../src/net/transcript";
 import { ScopeSequencer, type CommitReply, type CommitSubmit, type ScopeHead } from "../../src/net/scope";
 import type { RelationDelta } from "../../src/net/relations";
+import { turnEchoId } from "../../src/net/turn-echo";
 
 const SECRET = "net-relations-test-secret";
 const EPOCH = "cat-net-relations-1";
@@ -256,11 +257,13 @@ describe("CO13 relations over the DO shells", () => {
       seq: number;
       deltas: RelationDelta[];
       observations?: unknown[];
-      turn_id?: string;
+      submitter_turn_id?: string;
+      echo_id?: string;
     };
     expect(relateBody.from_scope).toBe(CLUSTER_SCOPE);
     expect(relateBody.seq).toBe(1);
-    expect(relateBody.turn_id).toBe("relations-move-1");
+    expect(relateBody.submitter_turn_id).toBe("relations-move-1");
+    expect(relateBody.echo_id).toBe(turnEchoId("relations-move-1"));
     expect(relateBody.observations).toEqual([
       expect.objectContaining({ type: "entered", source: "#room", actor: "#actor" })
     ]);
@@ -281,12 +284,14 @@ describe("CO13 relations over the DO shells", () => {
       cells: unknown[];
       observations?: unknown[];
       relations?: RelationDelta[];
-      turn_id?: string;
+      submitter_turn_id?: string;
+      echo_id?: string;
     };
     expect(fanBody.scope).toBe(ROOM_SCOPE);
     expect(fanBody.seq).toBe(1);
     expect(fanBody.cells).toEqual([]);
-    expect(fanBody.turn_id).toBe("relations-move-1");
+    expect(fanBody.submitter_turn_id).toBe("relations-move-1");
+    expect(fanBody.echo_id).toBe(turnEchoId("relations-move-1"));
     expect(fanBody.observations).toEqual([
       expect.objectContaining({ type: "entered", source: "#room", actor: "#actor" })
     ]);

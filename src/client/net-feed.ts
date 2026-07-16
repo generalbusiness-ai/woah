@@ -1,3 +1,5 @@
+import { turnEchoId } from "../net/turn-echo";
+
 /**
  * NetFeed — the client-side projection consumer + optimistic echo overlay
  * over the /net-api surface (Plan 002 Phase 4 item 4; plan §3.6, the B9
@@ -35,7 +37,7 @@
  *     client→server frames: {type:"turn", id, target, verb, args, idempotency_key}
  *                           {type:"ping", id?}
  *     server→client frames: {type:"turn_result", id, status, ...TurnResult|{error}}
- *                           {type:"observations", scope, seq, turn_id?, observations}
+ *                           {type:"observations", scope, seq, echo_id?, observations}
  *                           {type:"pong", id} / {type:"error", id?, error}
  *   Errors everywhere: {error:{code, message, detail?}} — surfaced here
  *   as NetFeedError.
@@ -49,7 +51,8 @@
  *     a frame at seq ≤ the scope's high-water is a redelivery — dropped.
  *   - Defensive self-echo guard: the gateway's echo dedupe is a bounded
  *     in-memory LRU that may lose entries (hibernation). Observation frames
- *     therefore carry the committed turn_id. A frame matching one of our
+ *     therefore carry a one-way echo_id derived from the committed turn's
+ *     idempotency key. A frame matching one of our
  *     pending turns is buffered until its reply settles: the full reply wins,
  *     while a replay/transport-loss reply can fall back to the buffered
  *     visible observations. A bounded settled-turn set drops later echoes.
@@ -253,6 +256,9 @@ export class NetFeed {
 
   /** The echo overlay (intent-pending; see the header). */
   private readonly pending = new Map<string, NetPendingTurn>();
+  /** Public one-way echo id → private idempotency key for pending turns.
+   * Avoids an O(pending turns) digest scan on every peer frame. */
+  private readonly pendingEchoToTurn = new Map<string, string>();
   /** In-flight WS turn correlation: frame id → settle callbacks. */
   private readonly wsInFlight = new Map<
     string,
@@ -263,9 +269,9 @@ export class NetFeed {
   private readonly frameSeen = new Map<string, number>();
   /** Self-settled (scope:seq) pairs — the defensive self-echo guard. */
   private readonly selfSettled = new Set<string>();
-  /** Settled client turn ids — cross-scope self-echo guard for frames that
-   * carry the modern turn_id field. */
-  private readonly settledTurnIds = new Set<string>();
+  /** Settled public echo ids — cross-scope self-echo guard. These are
+   * one-way digests, never the replay-capable idempotency keys. */
+  private readonly settledEchoIds = new Set<string>();
   /** A self fanout can beat its turn_result after gateway hibernation loses
    * the server-side LRU. Buffer it rather than rendering it as peer traffic;
    * settlement chooses the full reply or this visible fallback exactly once. */
@@ -467,6 +473,7 @@ export class NetFeed {
   async turn(input: { target: string; verb: string; args?: unknown[] }): Promise<NetTurnOutcome> {
     if (!this.session) throw new NetFeedError("E_NOSESSION", "open() the feed before submitting turns", 0);
     const turnId = randomTurnId();
+    const echoId = turnEchoId(turnId);
     const args = input.args ?? [];
     this.pending.set(turnId, {
       turn_id: turnId,
@@ -475,6 +482,7 @@ export class NetFeed {
       args,
       submitted_at: this.now()
     });
+    this.pendingEchoToTurn.set(echoId, turnId);
     this.notifyState();
     let settled = false;
     try {
@@ -488,18 +496,19 @@ export class NetFeed {
       } else {
         body = await this.turnOverRest(turnId, input.target, input.verb, args);
       }
-      const outcome = this.settleTurn(turnId, body);
+      const outcome = this.settleTurn(turnId, echoId, body);
       settled = true;
       return outcome;
     } finally {
       // A committed WS turn can fan out before the socket dies and the REST
       // replay attempt fails. The buffered frame is then the only surviving
       // observation carrier; release it rather than leaking or losing it.
-      if (!settled) this.emitBufferedSelfFrames(turnId);
+      if (!settled) this.emitBufferedSelfFrames(turnId, echoId);
       // Settled OR failed: the intent is no longer pending either way
       // (a thrown transport/taxonomy error drops the echo — the caller
       // owns retry policy, and a retried call mints a fresh intent).
       this.pending.delete(turnId);
+      this.pendingEchoToTurn.delete(echoId);
       this.notifyState();
     }
   }
@@ -575,7 +584,7 @@ export class NetFeed {
    * the self-settled (scope, seq) pair, and emit the turn's observations
    * as source:"self".
    */
-  private settleTurn(turnId: string, body: Record<string, unknown>): NetTurnOutcome {
+  private settleTurn(turnId: string, echoId: string, body: Record<string, unknown>): NetTurnOutcome {
     // M10: a turn that reached the gateway and settled (accepted OR
     // rejected) proves the session is live — real progress, so the
     // re-mint bound resets.
@@ -597,7 +606,7 @@ export class NetFeed {
           (item) => item && typeof item === "object" && !Array.isArray(item)
         ) as Record<string, unknown>[])
       : [];
-    const buffered = this.takeBufferedSelfFrames(turnId);
+    const buffered = this.takeBufferedSelfFrames(echoId);
     const deliveredObservations =
       accepted && observations.length === 0
         ? buffered.flatMap((frame) => frame.observations)
@@ -605,7 +614,7 @@ export class NetFeed {
 
     if (accepted) {
       this.readCache.clear();
-      this.recordSettledTurnId(turnId);
+      this.recordSettledEchoId(echoId);
       if (scope && seq !== null) this.recordSelfSettled(scope, seq);
       if (observations.length > 0) {
         for (const observation of observations) {
@@ -646,28 +655,28 @@ export class NetFeed {
     }
   }
 
-  private recordSettledTurnId(turnId: string): void {
-    this.settledTurnIds.delete(turnId);
-    this.settledTurnIds.add(turnId);
-    while (this.settledTurnIds.size > SELF_SETTLED_CAP) {
-      const oldest = this.settledTurnIds.values().next().value as string | undefined;
+  private recordSettledEchoId(echoId: string): void {
+    this.settledEchoIds.delete(echoId);
+    this.settledEchoIds.add(echoId);
+    while (this.settledEchoIds.size > SELF_SETTLED_CAP) {
+      const oldest = this.settledEchoIds.values().next().value as string | undefined;
       if (oldest === undefined) break;
-      this.settledTurnIds.delete(oldest);
+      this.settledEchoIds.delete(oldest);
     }
   }
 
   private takeBufferedSelfFrames(
-    turnId: string
+    echoId: string
   ): Array<{ scope: string; seq: number; observations: Record<string, unknown>[] }> {
-    const buffered = this.pendingSelfFrames.get(turnId) ?? [];
-    this.pendingSelfFrames.delete(turnId);
+    const buffered = this.pendingSelfFrames.get(echoId) ?? [];
+    this.pendingSelfFrames.delete(echoId);
     return buffered;
   }
 
-  private emitBufferedSelfFrames(turnId: string): void {
-    const buffered = this.takeBufferedSelfFrames(turnId);
+  private emitBufferedSelfFrames(turnId: string, echoId: string): void {
+    const buffered = this.takeBufferedSelfFrames(echoId);
     if (buffered.length === 0) return;
-    this.recordSettledTurnId(turnId);
+    this.recordSettledEchoId(echoId);
     this.readCache.clear();
     for (const frame of buffered) {
       for (const observation of frame.observations) {
@@ -886,18 +895,19 @@ export class NetFeed {
     const seen = this.frameSeen.get(scope) ?? 0;
     if (seq <= seen) return; // redelivery on the ordered lane
     this.frameSeen.set(scope, seq);
-    const turnId = typeof frame.turn_id === "string" && frame.turn_id ? frame.turn_id : null;
-    if (turnId && this.settledTurnIds.has(turnId)) return;
+    const echoId = typeof frame.echo_id === "string" && frame.echo_id ? frame.echo_id : null;
+    if (echoId && this.settledEchoIds.has(echoId)) return;
     const observations = Array.isArray(frame.observations)
       ? (frame.observations.filter(
           (item) => item && typeof item === "object" && !Array.isArray(item)
         ) as Record<string, unknown>[])
       : [];
-    if (turnId && this.pending.has(turnId)) {
+    const pendingTurnId = echoId ? this.pendingEchoToTurn.get(echoId) ?? null : null;
+    if (echoId && pendingTurnId) {
       this.recordSelfSettled(scope, seq);
-      const buffered = this.pendingSelfFrames.get(turnId) ?? [];
+      const buffered = this.pendingSelfFrames.get(echoId) ?? [];
       buffered.push({ scope, seq, observations });
-      this.pendingSelfFrames.set(turnId, buffered);
+      this.pendingSelfFrames.set(echoId, buffered);
       return;
     }
     if (this.selfSettled.has(`${scope}\0${seq}`)) {

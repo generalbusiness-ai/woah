@@ -40,13 +40,15 @@ export type FanoutBody = {
   removed_cells?: string[];
   /** Observations for live delivery at the destination. */
   observations: unknown[];
-  /** The committed turn's idempotency key (Phase 4 item 3): lets a
-   * receiving gateway skip pushing `observations` to the SUBMITTING
-   * session's sockets — that session already received them on its turn
-   * reply (item 1), so a fanout push would be a duplicate. Present only
-   * on commit-announcing fanout and relation refans that carry the same
-   * room-addressed observations; adoption rows carry no observations. */
-  turn_id?: string;
+  /** Trusted-internal replay key. Receiving gateways use it only to skip the
+   * submitting session from peer fanout. It must never be copied onto a
+   * client-visible frame: possession of this value can replay the recorded
+   * commit reply. */
+  submitter_turn_id?: string;
+  /** One-way public correlation token derived from `submitter_turn_id`.
+   * Browsers use it to dedupe an echo that beats the turn reply without
+   * learning the replay credential. */
+  echo_id?: string;
   /** CO13: relation deltas riding alongside cells — the LOCAL deltas of
    * the commit this body announces, or the applied deltas of a
    * /net/relate refan. `applyFanout` stays cell-only by design (relation

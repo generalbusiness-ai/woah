@@ -670,10 +670,11 @@ One write path per fact (CO9), concretized:
   `observations` are pushed to the WebSocket(s) of every session whose
   presence row's owner anchors to the fanout's scope, read from that
   shard's own mirror (sessions on other shards are those shards'
-  concern). `FanoutBody.turn_id` (the committed turn's idempotency key)
-  rides commit-announcing fanout so the shard that submitted the turn
-  skips the SUBMITTING session's sockets — that session already received
-  the observations on its turn reply (CO14 `/net-api` bullet below).
+  concern). Commit-announcing fanout carries two deliberately separate
+  correlation values: trusted-internal `submitter_turn_id` (the committed
+  idempotency key), used only by the receiving gateway to skip the submitting
+  session, and public `echo_id`, a domain-separated SHA-256 digest of that key.
+  The raw replay credential must never appear on a client-visible frame.
 
 ## CO14. Session authority and authentication
 
@@ -768,7 +769,12 @@ One write path per fact (CO9), concretized:
     digest mismatch omits them and marks `replayed: true` (a fresh
     accept always digest-matches its plan).
   - `GET /net-api/relation` / `GET /net-api/cell` are the authenticated
-    client reads over the CO13 roster mirror and the view cell probe.
+    client reads over the CO13 roster mirror and the view cell probe. Session
+    ids are bearer credentials: relation reads expose only actor-level
+    presence, session cells are owner-only, and any property whose inherited
+    definition declares a `presenceProjection` with
+    `{kind:"presence", key:"session"}` is not client-readable regardless of
+    the catalog-defined property name.
   - `POST /net-api/browser-metrics {session, metrics}` accepts at most 50
     bounded `browser_activity` diagnostics per batch after validating the
     session/actor binding. Payload actor fields are ignored; the authenticated
@@ -798,14 +804,14 @@ One write path per fact (CO9), concretized:
     bullet; the WS `turn_result` frame carries them). Peers receive them
     via fanout: the gateway routes an applied fanout's observations to
     the sockets of sessions PRESENT in the fanout's scope per its CO13
-    mirror, as `{type:"observations", scope, seq, turn_id?, observations}`
-    frames. `turn_id` is copied from `FanoutBody.turn_id` when the fanout
-    announces a client turn.
-    Echo dedupe is `FanoutBody.turn_id` matched against a bounded
-    in-memory LRU of recently client-submitted turn ids (recorded before
-    the submit leaves, so the usual fanout cannot race past it). If
-    hibernation or the cap loses that entry, the client uses the frame's
-    `turn_id` to buffer an echo that arrives before `turn_result`, prefers
+    mirror, as `{type:"observations", scope, seq, echo_id?, observations}`
+    frames. The gateway never copies the internal submitter id onto this
+    frame. Server-side echo dedupe matches `submitter_turn_id` against a
+    bounded in-memory LRU of recently client-submitted turn ids (recorded
+    before the submit leaves, so the usual fanout cannot race past it). If
+    hibernation or the cap loses that entry, the client computes the same
+    one-way `echo_id` before submit and uses the frame's digest to buffer an
+    echo that arrives before `turn_result`, prefers
     the full reply on settlement, and drops later echoes; a replay with no
     observations may consume the buffered visible copy. Thus LRU loss costs
     one redundant frame, not a duplicate user-visible observation. Delivery is
