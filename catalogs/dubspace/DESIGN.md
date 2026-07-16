@@ -62,6 +62,13 @@ that same projection and repaint the active workspace. This keeps the catalog
 as the source of truth for both cold entry and subsequent shared edits, without
 teaching the substrate or generic projection layer about Dubspace.
 
+The frame repeats that fixed role map as declarative UI state. A net world may
+outlive the bundle that installed it, so clients connected to a pre-1.0.2
+Dubspace cannot call `controls_view()`. On only the named missing-verb or repair-
+budget failures, the client uses the frame map to read the same 27 public
+property cells in parallel. This bounded compatibility read neither enumerates
+objects nor guesses control roles; fresh worlds keep the single-view path.
+
 ## Surface
 
 - One shared space.

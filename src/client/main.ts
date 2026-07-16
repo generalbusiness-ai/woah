@@ -19,6 +19,7 @@ import * as tasksUiModule from "../../catalogs/tasks/ui/kanban-board";
 import * as weatherUiModule from "../../catalogs/weather/ui/weather-badge";
 import { appliedFrameErrorObservations, chatErrorText } from "./chat-errors";
 import { chatObservationSpace, updateEnteredLeftChatPresence } from "./chat-state";
+import { isAgedDubspaceControlsError, readAgedDubspaceControlCells } from "./dubspace-net-hydration";
 import { CoalescedViewHydrator, createWooClientFramework, displayTextCacheKey, escapeHtml, liveProjectionKey, ProjectionFieldFiller, pruneDisplayTextCaches, readDisplayTextCache, writeDisplayTextCache, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
 import { isPinboardObservation } from "./pinboard-observation";
 import { clearProvisionalChatLines, provisionalChatErrorLine, upsertProvisionalChatLine } from "./provisional-chat";
@@ -2434,9 +2435,18 @@ function projectedDubspace(meta: any = dubspaceMeta()) {
   return Object.fromEntries(dubspaceObjectIds(meta).map((id: string) => [id, projectedObjectView(id)]).filter(([, view]) => view));
 }
 
+function bundledDubspaceControlRoles(): Record<string, any> {
+  const frame = (dubspaceManifest as any)?.ui?.frames?.find((candidate: any) => candidate?.id === "dubspace.workspace");
+  const roles = frame?.state?.control_roles;
+  return roles && typeof roles === "object" && !Array.isArray(roles) ? roles : {};
+}
+
 function dubspaceMeta(): any {
   const space = dubspaceSpace();
   const hydrated = space ? ui.observe(space)?.catalogState?.dubspace_controls : null;
+  // The bundled frame carries the semantic IDs needed to read an aged net
+  // world's fixed controls when its installed catalog predates controls_view.
+  const bundled = bundledDubspaceControlRoles();
   const objects = overlaySnapshotObjects(dubspaceOverlaySnapshot());
   const byClass = (localName: string) => {
     const ids = objects
@@ -2449,12 +2459,12 @@ function dubspaceMeta(): any {
   };
   return {
     space: byClass("$dubspace")[0] ?? space,
-    slots: Array.isArray(hydrated?.slots) ? hydrated.slots : byClass("$loop_slot"),
-    channel: hydrated?.channel || byClass("$channel")[0],
-    filter: hydrated?.filter || byClass("$filter")[0],
-    delay: hydrated?.delay || byClass("$delay")[0],
-    drum: hydrated?.drum || byClass("$drum_loop")[0],
-    scene: hydrated?.scene || byClass("$scene")[0]
+    slots: Array.isArray(hydrated?.slots) ? hydrated.slots : Array.isArray(bundled.slots) ? bundled.slots : byClass("$loop_slot"),
+    channel: hydrated?.channel || bundled.channel || byClass("$channel")[0],
+    filter: hydrated?.filter || bundled.filter || byClass("$filter")[0],
+    delay: hydrated?.delay || bundled.delay || byClass("$delay")[0],
+    drum: hydrated?.drum || bundled.drum || byClass("$drum_loop")[0],
+    scene: hydrated?.scene || bundled.scene || byClass("$scene")[0]
   };
 }
 
@@ -3136,7 +3146,25 @@ function readDubspaceControlsView(space: string): Promise<any> {
       // execution attempt or an optimistic prediction.
       readOnly: true,
       onResult: resolve,
-      onError: reject
+      onError: (error) => {
+        if (!netMode() || !isAgedDubspaceControlsError(error)) {
+          reject(error);
+          return;
+        }
+        // Durable worlds are not implicitly upgraded by a client bundle
+        // deploy. Pre-controls_view worlds retain the same public property
+        // cells, so hydrate that fixed, declared surface without enumeration.
+        if (!netFeed || !netFeedOpen) {
+          reject(new Error("dubspace net cells are unavailable"));
+          return;
+        }
+        void readAgedDubspaceControlCells({
+          space,
+          roles: dubspaceMeta(),
+          readCell: (key) => netFeed!.cell(key),
+          nameOf: objectName
+        }).then(resolve, reject);
+      }
     });
   });
 }

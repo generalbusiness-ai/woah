@@ -1,6 +1,6 @@
 {
   "name": "dubspace",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "spec_version": "v1",
   "description": "Shared dub-mix sound space demo objects.",
   "license": "MIT",
@@ -33,6 +33,16 @@
         "subject": "$dubspace",
         "view": "default",
         "layout": "space-workspace",
+        "state": {
+          "control_roles": {
+            "slots": ["slot_1", "slot_2", "slot_3", "slot_4"],
+            "channel": "channel_1",
+            "filter": "filter_1",
+            "delay": "delay_1",
+            "drum": "drum_1",
+            "scene": "default_scene"
+          }
+        },
         "regions": {
           "main": [{ "component": "dubspace.workspace", "subject": "this" }],
           "chat": [{ "component": "chat:chat.space-mini", "subject": "this" }]
@@ -370,7 +380,7 @@
           "arg_spec": {
             "args": []
           },
-          "source": "verb :controls_view() rxd { return { space: { id: this, name: this.name, description: this.description }, meta: { slots: [\"slot_1\", \"slot_2\", \"slot_3\", \"slot_4\"], channel: \"channel_1\", filter: \"filter_1\", delay: \"delay_1\", drum: \"drum_1\", scene: \"scene_1\" }, controls: [{ id: \"slot_1\", name: \"slot_1\".name, props: { loop_id: \"slot_1\".loop_id, playing: \"slot_1\".playing, gain: \"slot_1\".gain, freq: \"slot_1\".freq } }, { id: \"slot_2\", name: \"slot_2\".name, props: { loop_id: \"slot_2\".loop_id, playing: \"slot_2\".playing, gain: \"slot_2\".gain, freq: \"slot_2\".freq } }, { id: \"slot_3\", name: \"slot_3\".name, props: { loop_id: \"slot_3\".loop_id, playing: \"slot_3\".playing, gain: \"slot_3\".gain, freq: \"slot_3\".freq } }, { id: \"slot_4\", name: \"slot_4\".name, props: { loop_id: \"slot_4\".loop_id, playing: \"slot_4\".playing, gain: \"slot_4\".gain, freq: \"slot_4\".freq } }, { id: \"channel_1\", name: \"channel_1\".name, props: { gain: \"channel_1\".gain } }, { id: \"filter_1\", name: \"filter_1\".name, props: { cutoff: \"filter_1\".cutoff } }, { id: \"delay_1\", name: \"delay_1\".name, props: { send: \"delay_1\".send, time: \"delay_1\".time, feedback: \"delay_1\".feedback, wet: \"delay_1\".wet } }, { id: \"drum_1\", name: \"drum_1\".name, props: { bpm: \"drum_1\".bpm, playing: \"drum_1\".playing, started_at: \"drum_1\".started_at, step_count: \"drum_1\".step_count, pattern: \"drum_1\".pattern } }] }; }"
+          "source": "verb :controls_view() rxd { return { space: { id: this, name: this.name, description: this.description }, meta: { slots: [\"slot_1\", \"slot_2\", \"slot_3\", \"slot_4\"], channel: \"channel_1\", filter: \"filter_1\", delay: \"delay_1\", drum: \"drum_1\", scene: \"default_scene\" }, controls: [{ id: \"slot_1\", name: \"slot_1\".name, props: { loop_id: \"slot_1\".loop_id, playing: \"slot_1\".playing, gain: \"slot_1\".gain, freq: \"slot_1\".freq } }, { id: \"slot_2\", name: \"slot_2\".name, props: { loop_id: \"slot_2\".loop_id, playing: \"slot_2\".playing, gain: \"slot_2\".gain, freq: \"slot_2\".freq } }, { id: \"slot_3\", name: \"slot_3\".name, props: { loop_id: \"slot_3\".loop_id, playing: \"slot_3\".playing, gain: \"slot_3\".gain, freq: \"slot_3\".freq } }, { id: \"slot_4\", name: \"slot_4\".name, props: { loop_id: \"slot_4\".loop_id, playing: \"slot_4\".playing, gain: \"slot_4\".gain, freq: \"slot_4\".freq } }, { id: \"channel_1\", name: \"channel_1\".name, props: { gain: \"channel_1\".gain } }, { id: \"filter_1\", name: \"filter_1\".name, props: { cutoff: \"filter_1\".cutoff } }, { id: \"delay_1\", name: \"delay_1\".name, props: { send: \"delay_1\".send, time: \"delay_1\".time, feedback: \"delay_1\".feedback, wet: \"delay_1\".wet } }, { id: \"drum_1\", name: \"drum_1\".name, props: { bpm: \"drum_1\".bpm, playing: \"drum_1\".playing, started_at: \"drum_1\".started_at, step_count: \"drum_1\".step_count, pattern: \"drum_1\".pattern } }] }; }"
         },
         {
           "name": "set_control",

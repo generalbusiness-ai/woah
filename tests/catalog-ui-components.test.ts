@@ -197,6 +197,18 @@ describe("bundled catalog UI components", () => {
     expect(registry.resolveFrame("the_taskboard", undefined, (_subject, classRef) => classRef === "$task_registry" ? 1 : false)?.frame.id).toBe("tasks.kanban");
     expect(registry.componentsForSurface("title-badge").map((component) => component.declaration.tag)).toContain("woo-weather-badge");
 
+    const dubspaceFrame = (dubspaceManifest as any).ui.frames.find((frame: any) => frame.id === "dubspace.workspace");
+    expect(dubspaceFrame?.state?.control_roles).toEqual({
+      slots: ["slot_1", "slot_2", "slot_3", "slot_4"],
+      channel: "channel_1",
+      filter: "filter_1",
+      delay: "delay_1",
+      drum: "drum_1",
+      scene: "default_scene"
+    });
+    const dubspaceClass = (dubspaceManifest as any).classes.find((item: any) => item.local_name === "$dubspace");
+    expect(dubspaceClass?.verbs.find((verb: any) => verb.name === "controls_view")?.source).toContain('scene: "default_scene"');
+
     const weatherBadge = registry.componentsForSurface("title-badge").find((component) => component.declaration.tag === "woo-weather-badge");
     // The badge launches the chart overlay, so its required projection
     // fields must include everything the chart consumes — otherwise the
