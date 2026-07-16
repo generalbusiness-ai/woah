@@ -1,12 +1,4 @@
-export type DubspaceControlRoles = {
-  slots?: unknown;
-  channel?: unknown;
-  filter?: unknown;
-  delay?: unknown;
-  drum?: unknown;
-  scene?: unknown;
-  space?: unknown;
-};
+import { dubspaceControlDefinitions, type DubspaceControlRoles } from "./model";
 
 export type DubspaceControlCellView = {
   space: { id: string; name: string };
@@ -64,13 +56,7 @@ export async function readAgedDubspaceControlCells(input: {
   const { space, roles, readCell, defaults = {} } = input;
   const nameOf = input.nameOf ?? ((id: string) => id);
   const pause = input.wait ?? wait;
-  const definitions = ([
-    ...(Array.isArray(roles.slots) ? roles.slots.map((id) => [String(id ?? ""), ["loop_id", "playing", "gain", "freq"]] as [string, string[]]) : []),
-    [String(roles.channel ?? ""), ["gain"]],
-    [String(roles.filter ?? ""), ["cutoff"]],
-    [String(roles.delay ?? ""), ["send", "time", "feedback", "wet"]],
-    [String(roles.drum ?? ""), ["bpm", "playing", "started_at", "step_count", "pattern"]]
-  ] as Array<[string, string[]]>).filter(([id]) => Boolean(id));
+  const definitions = dubspaceControlDefinitions(roles, defaults);
   const requested = definitions.flatMap(([id, names]) => names.map((name) => ({ id, name })));
   const cells: unknown[] = [];
   // Shell startup already consumes much of the shared 50/s, burst-100 net

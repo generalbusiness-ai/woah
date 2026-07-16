@@ -139,6 +139,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
   // Accepted structural observations advance this revision, invalidating an
   // older in-flight read before requesting the post-mutation tree.
   private itemHydrationRevision = 0;
+  private itemRefreshScheduled = false;
   // Once list_items lands, its parent/index rows outrank the unversioned
   // observation overlay. Live structural observations update this model too;
   // an older catalogState stamp must not overwrite either source on render.
@@ -151,6 +152,10 @@ export class WooOutlinerTreeElement extends HTMLElement {
   // cache; guards against rewriting unchanged text on every SPA render.
   private lastCachedTextSignature = "";
   private readonly itemHydrator = new CoalescedViewHydrator<OutlinerItem[]>({
+    // A revision identifies stale results, but a persistent permission or
+    // missing-object failure belongs to the outliner read surface itself.
+    // Keep its backoff across observation-driven revision invalidations.
+    retryKey: (subject) => subject,
     read: async (subject) => {
       if (!this.woo) return [];
       // Whole-tree display hydration is read-only. Route to the authoritative
@@ -464,8 +469,15 @@ export class WooOutlinerTreeElement extends HTMLElement {
     // Drop the completed prior revision and invalidate any older in-flight
     // result. This also bounds the hydrator's memoized keys for a long-lived,
     // frequently edited outline.
-    this.itemHydrator.reset();
-    this.requestItemsFromList();
+    this.itemHydrator.invalidate();
+    // A committed frame can contain several structural observations. Apply
+    // all DOM-local mutations now, then verify their final tree with one read.
+    if (this.itemRefreshScheduled) return;
+    this.itemRefreshScheduled = true;
+    queueMicrotask(() => {
+      this.itemRefreshScheduled = false;
+      this.requestItemsFromList();
+    });
   }
 
   private requestRosterFromServer(): void {

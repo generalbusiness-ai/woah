@@ -970,7 +970,9 @@ export class NetScopeDO {
           });
         }
         const seq = this.ensureSequencer(body.scope, body.catalog_epoch);
-        this.discardSeqOnThrow(() => seq.seed(body.cells, body.relations ?? []));
+        // Preserve the distinction between a legacy omitted relation field
+        // and an explicit complete empty family on an installer re-seed.
+        this.discardSeqOnThrow(() => seq.seed(body.cells, body.relations));
         // H2b: seeded session cells arm the reap wake too.
         if (body.cells.some((cell) => cell.kind === "session")) this.armSessionReapAlarm(seq);
         return json({ ok: true, scope: seq.scope, head: seq.head() });

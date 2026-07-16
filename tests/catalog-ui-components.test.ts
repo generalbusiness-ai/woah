@@ -10,6 +10,7 @@ import outlinerManifest from "../catalogs/outliner/manifest.json";
 import pinboardManifest from "../catalogs/pinboard/manifest.json";
 import tasksManifest from "../catalogs/tasks/manifest.json";
 import weatherManifest from "../catalogs/weather/manifest.json";
+import { DUBSPACE_DRUM_VOICES, dubspaceControlDefinitions } from "../catalogs/dubspace/ui/model";
 import {
   CatalogUiRegistry,
   preserveAmbientCompanionPanel,
@@ -213,7 +214,19 @@ describe("bundled catalog UI components", () => {
     }
     expect(Object.keys(dubspaceFrame?.state?.control_defaults ?? {})).toHaveLength(8);
     const dubspaceClass = (dubspaceManifest as any).classes.find((item: any) => item.local_name === "$dubspace");
-    expect(dubspaceClass?.verbs.find((verb: any) => verb.name === "controls_view")?.source).toContain('scene: "default_scene"');
+    const controlsViewSource = String(dubspaceClass?.verbs.find((verb: any) => verb.name === "controls_view")?.source ?? "");
+    expect(controlsViewSource).toContain('scene: "default_scene"');
+    // The TS compatibility reader and the catalog verb must evolve as one
+    // declared surface; this catches a property/voice addition before deploy.
+    for (const [id, names] of dubspaceControlDefinitions(
+      dubspaceFrame.state.control_roles,
+      dubspaceFrame.state.control_defaults
+    )) {
+      for (const name of names) expect(controlsViewSource).toContain(`"${id}".${name}`);
+    }
+    expect(Object.keys(dubspaceFrame.state.control_defaults.drum_1.pattern)).toEqual(
+      DUBSPACE_DRUM_VOICES.map((voice) => voice.id)
+    );
 
     const weatherBadge = registry.componentsForSurface("title-badge").find((component) => component.declaration.tag === "woo-weather-badge");
     // The badge launches the chart overlay, so its required projection

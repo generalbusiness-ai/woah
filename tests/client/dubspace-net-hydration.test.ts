@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { installedDubspaceSupportsControlsView, isAgedDubspaceControlsError, readAgedDubspaceControlCells } from "../../src/client/dubspace-net-hydration";
+import { installedDubspaceSupportsControlsView, isAgedDubspaceControlsError, readAgedDubspaceControlCells } from "../../catalogs/dubspace/ui/net-hydration";
 
 const roles = {
   slots: ["slot_1", "slot_2", "slot_3", "slot_4"],

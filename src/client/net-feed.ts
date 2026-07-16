@@ -57,7 +57,7 @@ import { turnEchoId } from "../net/turn-echo";
  *     while a replay/transport-loss reply can fall back to the buffered
  *     visible observations. A bounded settled-turn set drops later echoes.
  *     The older (scope, seq) guard remains for rolling gateways that omit
- *     turn_id. Reply settlement never advances the FRAME high-water — that
+ *     echo_id. Reply settlement never advances the FRAME high-water — that
  *     would drop an in-flight earlier peer frame on the ordered lane.
  *
  * Read-cache posture, documented per the kickoff: correctness comes from
@@ -119,6 +119,9 @@ export type NetFeedOptions = {
   /** Reconnect backoff by attempt (1-based). Default: 250ms doubling,
    * capped at 10s. Tests inject () => 0. */
   backoffMs?: (attempt: number) => number;
+  /** A silent half-open socket must not hold a turn forever. After this
+   * interval the same idempotency key falls back to REST. Default 30s. */
+  wsTurnTimeoutMs?: number;
   /** Session TTL request, forwarded to POST /net-api/session (the
    * gateway clamps it). */
   ttlMs?: number;
@@ -227,6 +230,7 @@ export class NetFeed {
   private readonly backoffMs: (attempt: number) => number;
   private readonly ttlMs: number | undefined;
   private readonly now: () => number;
+  private readonly wsTurnTimeoutMs: number;
 
   private session: string | null = null;
   private actor: string | null = null;
@@ -299,6 +303,7 @@ export class NetFeed {
     this.backoffMs = options.backoffMs ?? defaultBackoff;
     this.ttlMs = options.ttlMs;
     this.now = options.now ?? Date.now;
+    this.wsTurnTimeoutMs = Math.max(1, options.wsTurnTimeoutMs ?? 30_000);
   }
 
   // ---- Subscriber API (plain callbacks; no framework coupling) ----------
@@ -530,18 +535,33 @@ export class NetFeed {
     const socket = this.socket;
     if (!socket) return Promise.resolve(WS_INTERRUPTED);
     return new Promise((resolve) => {
-      this.wsInFlight.set(turnId, {
-        resolve: (body) => resolve(body),
+      let timeout: ReturnType<typeof setTimeout> | null = null;
+      const finish = (body: Record<string, unknown> | typeof WS_INTERRUPTED): void => {
+        if (timeout !== null) clearTimeout(timeout);
+        timeout = null;
+        resolve(body);
+      };
+      const waiter = {
+        resolve: (body: Record<string, unknown>) => finish(body),
         // Socket death before the reply: fall back to REST (same key).
-        reject: () => resolve(WS_INTERRUPTED)
-      });
+        reject: (_error: unknown) => finish(WS_INTERRUPTED)
+      };
+      this.wsInFlight.set(turnId, waiter);
+      // A browser can retain a half-open WebSocket without onclose/onerror.
+      // Bound the wait and replay over REST with the same key; CO2.5 makes a
+      // commit whose reply was lost return its recorded result.
+      timeout = setTimeout(() => {
+        if (this.wsInFlight.get(turnId) !== waiter) return;
+        this.wsInFlight.delete(turnId);
+        waiter.reject(new Error("WebSocket turn timed out"));
+      }, this.wsTurnTimeoutMs);
       try {
         socket.send(
           JSON.stringify({ type: "turn", id: turnId, target, verb, args, idempotency_key: turnId })
         );
       } catch {
         this.wsInFlight.delete(turnId);
-        resolve(WS_INTERRUPTED);
+        waiter.reject(new Error("WebSocket send failed"));
       }
     });
   }
@@ -746,6 +766,23 @@ export class NetFeed {
     const members = Array.isArray(reply.members) ? reply.members : [];
     this.readCache.set(cacheKey, members);
     return members;
+  }
+
+  /** Installed catalog metadata is a bounded bootstrap ledger, used by the
+   * shell to select versioned catalog read surfaces without speculatively
+   * executing verbs against aged durable worlds. */
+  async catalogs(): Promise<Array<Record<string, unknown>>> {
+    const cacheKey = "catalogs";
+    if (this.readCache.has(cacheKey)) return this.readCache.get(cacheKey) as Array<Record<string, unknown>>;
+    const reply = (await this.fetchJson(
+      "GET",
+      `/net-api/catalogs?session=${encodeURIComponent(this.requireSession())}`
+    )) as { catalogs?: unknown };
+    const catalogs = Array.isArray(reply.catalogs)
+      ? reply.catalogs.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object" && !Array.isArray(item)))
+      : [];
+    this.readCache.set(cacheKey, catalogs);
+    return catalogs;
   }
 
   /** Transport-neutral browser diagnostics. Keeping this on NetFeed makes

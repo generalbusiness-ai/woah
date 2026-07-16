@@ -611,6 +611,24 @@ describe("woo core", () => {
     }
   });
 
+  it("lists healthy room exits when the exits map also contains a dangling ref", async () => {
+    const { world, session, actor } = authedWorld();
+    const exits = { ...(world.getProp("the_chatroom", "exits") as Record<string, WooValue>) };
+    exits.dangling = "recycled_exit_that_no_longer_exists";
+    world.setProp("the_chatroom", "exits", exits);
+    expect((await world.directCall("dangling-ways-enter", actor, "the_chatroom", "enter", [], { sessionId: session.id })).op).toBe("result");
+
+    const result = await world.directCall("dangling-ways-list", actor, actor, "ways", [""], { sessionId: session.id });
+
+    expect(result.op).toBe("result");
+    if (result.op === "result") {
+      const view = result.result as { exits: string[]; text: string };
+      expect(view.exits.length).toBeGreaterThan(0);
+      expect(view.exits).not.toContain("recycled_exit_that_no_longer_exists");
+      expect(view.text).toContain("Obvious exits:");
+    }
+  });
+
   it("examines visible remote objects through host summaries instead of local object lookup", async () => {
     const home = createWorld();
     const remote = createWorld({ catalogs: false });

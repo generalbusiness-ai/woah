@@ -104,7 +104,7 @@ function acceptedTurnResult(overrides: Record<string, unknown> = {}): Record<str
 
 function feedWith(
   routes: Record<string, (call: FetchCall) => { status?: number; body: unknown }>,
-  options: { webSocket?: boolean } = {}
+  options: { webSocket?: boolean; wsTurnTimeoutMs?: number } = {}
 ) {
   FakeSocket.instances = [];
   const { impl, calls } = fakeFetch(routes);
@@ -113,6 +113,7 @@ function feedWith(
     apiKey: API_KEY,
     fetchImpl: impl,
     ...(options.webSocket === false ? {} : { webSocketImpl: FakeSocket }),
+    ...(options.wsTurnTimeoutMs !== undefined ? { wsTurnTimeoutMs: options.wsTurnTimeoutMs } : {}),
     backoffMs: () => 0
   });
   return { feed, calls };
@@ -218,6 +219,23 @@ describe("NetFeed turn() over WS", () => {
     expect(outcome.status).toBe("rejected");
     expect(outcome.observations).toEqual([]);
     expect(feed.state().pending).toHaveLength(0);
+  });
+
+  it("falls back to same-key REST when a half-open socket never settles the turn", async () => {
+    const { feed, calls } = feedWith({
+      ...SESSION_ROUTE,
+      "POST /net-api/turn": () => ({ body: acceptedTurnResult() })
+    }, { wsTurnTimeoutMs: 1 });
+    await feed.open();
+    const socket = FakeSocket.instances[0];
+    socket.open();
+
+    const outcome = await feed.turn({ target: "#bob", verb: "wave" });
+    const frame = socket.sent.find((item) => item.type === "turn")!;
+    const rest = calls.find((call) => call.method === "POST" && call.path === "/net-api/turn")!;
+
+    expect(outcome.status).toBe("accepted");
+    expect((rest.body as Record<string, unknown>).idempotency_key).toBe(frame.idempotency_key);
   });
 
   it("releases a committed early fanout even when the correlated reply rejects", async () => {
@@ -614,6 +632,20 @@ describe("NetFeed session re-mint (M10)", () => {
 });
 
 describe("NetFeed reads + cache", () => {
+  it("reads and caches the installed catalog ledger", async () => {
+    const { feed, calls } = feedWith({
+      ...SESSION_ROUTE,
+      "GET /net-api/catalogs": () => ({
+        body: { catalogs: [{ alias: "dubspace", catalog: "dubspace", version: "1.0.4" }] }
+      })
+    }, { webSocket: false });
+    await feed.open();
+
+    await expect(feed.catalogs()).resolves.toEqual([{ alias: "dubspace", catalog: "dubspace", version: "1.0.4" }]);
+    await expect(feed.catalogs()).resolves.toHaveLength(1);
+    expect(calls.filter((call) => call.path.startsWith("/net-api/catalogs?"))).toHaveLength(1);
+  });
+
   it("caches relation reads and invalidates on an applied observations frame", async () => {
     const members = [{ member: "s_2", body: { actor: "#bob" } }];
     const { feed, calls } = feedWith({

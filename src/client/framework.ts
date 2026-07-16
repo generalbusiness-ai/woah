@@ -1114,6 +1114,7 @@ export type CoalescedViewHydratorOptions<T> = {
   completeOnError?: boolean;
   retryDelaysMs?: readonly number[];
   now?: () => number;
+  retryKey?: (subject: string, signature: string) => string;
 };
 
 const DEFAULT_VIEW_RETRY_DELAYS_MS = [250, 1_000, 5_000, 30_000] as const;
@@ -1235,23 +1236,24 @@ export class CoalescedViewHydrator<T = unknown> {
   ensure(subject: string, signature: string): void {
     if (!subject || !signature) return;
     const key = viewHydrationKey(subject, signature);
-    if (this.completed.has(key) || this.inFlight.has(key) || !this.retryGate.canAttempt(key)) return;
+    const retryKey = this.options.retryKey?.(subject, signature) ?? key;
+    if (this.completed.has(key) || this.inFlight.has(key) || !this.retryGate.canAttempt(retryKey)) return;
     this.inFlight.add(key);
     const generation = this.generation;
     void this.options.read(subject, signature)
       .then((value) => {
         if (generation !== this.generation) return;
         this.completed.add(key);
-        this.retryGate.recordSuccess(key);
+        this.retryGate.recordSuccess(retryKey);
         this.options.apply(value, subject, signature);
       })
       .catch((error) => {
         if (generation !== this.generation) return;
         if (this.options.completeOnError === true) {
           this.completed.add(key);
-          this.retryGate.recordSuccess(key);
+          this.retryGate.recordSuccess(retryKey);
         } else {
-          this.retryGate.recordFailure(key);
+          this.retryGate.recordFailure(retryKey);
         }
         this.options.onError?.(error, subject, signature);
       })
@@ -1262,10 +1264,16 @@ export class CoalescedViewHydrator<T = unknown> {
   }
 
   reset(): void {
+    this.invalidate();
+    this.retryGate.reset();
+  }
+
+  /** Invalidate completed/in-flight results after a model mutation while
+   * retaining failure backoff for the same underlying read surface. */
+  invalidate(): void {
     this.generation += 1;
     this.inFlight.clear();
     this.completed.clear();
-    this.retryGate.reset();
   }
 }
 

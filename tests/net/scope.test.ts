@@ -112,6 +112,20 @@ describe("commit acceptance (CO4)", () => {
     expect(seq.head()).toEqual(headAfterCommit);
   });
 
+  it("preserves seeded relations when a legacy same-epoch re-seed omits the relation field", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    const cells = [{ kind: "object_lineage" as const, object: "#thing", value: { parent: null } }];
+    const row = { relation: "contents", owner: "#room", member: "#thing" };
+
+    seq.seed(cells, [row]);
+    seq.seed(cells);
+    expect([...seq.relations().values()]).toEqual([row]);
+
+    // Presence of [] remains an explicit complete empty relation family.
+    seq.seed(cells, []);
+    expect(seq.relations().size).toBe(0);
+  });
+
   it("owns predicate routes foreign reads to attestation; without it every read validates locally (CO2.4/CO2.3)", () => {
     // Multi-scope topology: this sequencer owns #thing but not #elsewhere.
     // A transcript read of #elsewhere carries the planning view's version;

@@ -4,7 +4,7 @@
 // actor resolution, woo_call for verbs, woo_wait for cross-actor
 // observations — driven end-to-end against the INSTALLED world with two
 // carried (apikey) actors born present in the chatroom.
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { FakeDurableObjectState } from "./fake-do";
 import { createWorld } from "../../src/core/bootstrap";
 import { exportIdentity, importIdentity } from "../../src/net/identity";
@@ -13,6 +13,7 @@ import { cellVersion } from "../../src/net/cells";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
+import { turnEchoId } from "../../src/net/turn-echo";
 
 const SECRET = "net-mcp-test-secret";
 
@@ -143,6 +144,8 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
     // fanout → the MCP queue; both sessions born present in the room).
     const said = await call(aliceSession, "woo_call", { object: "the_chatroom", verb: "say", args: ["hello bob mcp-run"] });
     expect(said.result?.isError, JSON.stringify(said)).not.toBe(true);
+    const ownTurnId = [...((gateway as any).recentClientTurns as Map<string, string>).keys()].at(-1);
+    expect(ownTurnId).toMatch(/^mcp:/);
     await settleAll();
     const waited = await call(bobSession, "woo_wait", { timeout_ms: 0 });
     const observations = waited.result?.structuredContent?.result?.observations ?? [];
@@ -150,6 +153,18 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
       (obs: any) => obs?.type === "said" && typeof obs.text === "string" && obs.text.includes("hello bob mcp-run")
     );
     expect(match, JSON.stringify(observations).slice(0, 400)).toBeTruthy();
+
+    // The session-local echo guard remains after the shared recent-turn LRU
+    // is lost (cap/eviction). A delayed self fanout must not leak into wait.
+    ((gateway as any).recentClientTurns as Map<string, string>).clear();
+    (gateway as any).pushObservations({
+      scope: "room:the_chatroom",
+      seq: 999,
+      echo_id: turnEchoId(String(ownTurnId)),
+      observations: [{ type: "looked", to: alice, text: "delayed self echo" }]
+    });
+    const ownWait = await call(aliceSession, "woo_wait", { timeout_ms: 0 });
+    expect(ownWait.result?.structuredContent?.result?.observations ?? []).toEqual([]);
 
     // The thin-shell command round trip: plan then execute.
     const planned = await call(aliceSession, "woo_call", { object: "the_chatroom", verb: "command_plan", args: ["look"] });
@@ -240,6 +255,17 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
     ]));
     expect(waysResult.exits).toHaveLength(4);
     expect(waysResult.text).toContain("Obvious exits:");
+
+    // Once the exact room.exits page is warm, repeated read-only commands must
+    // use the fanout-coherent gateway copy instead of paying another blocking
+    // owner /closure RPC for every declared path cursor.
+    const fetchSpies = [...scopeDOs.values()].map((scope) => vi.spyOn(scope, "fetch"));
+    const warmWays = await call(aliceSession, "woo_call", { object: alice, verb: "ways", args: [""] });
+    expect(warmWays.result?.isError, JSON.stringify(warmWays).slice(0, 800)).not.toBe(true);
+    const closureReads = fetchSpies.flatMap((spy) => spy.mock.calls)
+      .filter(([request]) => new URL((request as Request).url).pathname === "/closure");
+    for (const spy of fetchSpies) spy.mockRestore();
+    expect(closureReads, "a warm ways call should not synchronously refresh explicit path cells").toEqual([]);
     const catalogState = scopeStates.get("catalog");
     expect(catalogState).toBeTruthy();
     const catalogSubscribers = Array.from(

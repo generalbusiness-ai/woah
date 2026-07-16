@@ -17,9 +17,10 @@ import * as outlinerUiModule from "../../catalogs/outliner/ui/outliner-tree";
 import * as pinboardUiModule from "../../catalogs/pinboard/ui/pinboard-board";
 import * as tasksUiModule from "../../catalogs/tasks/ui/kanban-board";
 import * as weatherUiModule from "../../catalogs/weather/ui/weather-badge";
+import { DUBSPACE_DRUM_VOICES, LOOP_DEFAULT_SEMITONES, NOTE_NAMES, PITCH_MAX_SEMITONE, PITCH_MIN_SEMITONE, PITCH_ROOT_FREQ, PITCH_ROOT_MIDI, dubspaceControlDefinitions } from "../../catalogs/dubspace/ui/model";
+import { installedDubspaceSupportsControlsView, isAgedDubspaceControlsError, readAgedDubspaceControlCells } from "../../catalogs/dubspace/ui/net-hydration";
 import { appliedFrameErrorObservations, chatErrorText } from "./chat-errors";
 import { chatObservationSpace, updateEnteredLeftChatPresence } from "./chat-state";
-import { installedDubspaceSupportsControlsView, isAgedDubspaceControlsError, readAgedDubspaceControlCells } from "./dubspace-net-hydration";
 import { CoalescedViewHydrator, createWooClientFramework, displayTextCacheKey, escapeHtml, liveProjectionKey, ProjectionFieldFiller, pruneDisplayTextCaches, readDisplayTextCache, RetryBackoffGate, writeDisplayTextCache, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
 import { isPinboardObservation } from "./pinboard-observation";
 import { clearProvisionalChatLines, provisionalChatErrorLine, upsertProvisionalChatLine } from "./provisional-chat";
@@ -332,19 +333,8 @@ const scopedProjectionSmokeEnabled = new URLSearchParams(location.search).has("s
 const v2TestHooksEnabled = new URLSearchParams(location.search).has("v2TestHooks");
 const chatHistoryLimit = 80;
 const chatFeedLimit = 160;
-const drumVoices = [
-  { id: "kick", label: "Kick" },
-  { id: "snare", label: "Snare" },
-  { id: "hat", label: "Hat" },
-  { id: "tone", label: "Tone" }
-] as const;
-const PITCH_ROOT_FREQ = 110;
-const PITCH_ROOT_MIDI = 45;
-const PITCH_MIN_SEMITONE = -12;
-const PITCH_MAX_SEMITONE = 36;
-const LOOP_DEFAULT_SEMITONES = [0, 5, 10, 15];
 const TONE_TRACK_SEMITONES = [19, 22, 24, 27];
-const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+const drumVoices = DUBSPACE_DRUM_VOICES;
 const directThrottle = new Map<string, number>();
 const pendingDirect = new Map<string, (result: any) => void>();
 const pendingFrameErrors = new Map<string, (error: unknown) => void>();
@@ -806,6 +796,21 @@ function openNetFeed(bearer: string, adopt: { session: string; actor: string } |
   void netFeed
     .open()
     .then(async ({ actor }) => {
+      // Net does not use `/api/me`, so hydrate the small bootstrap catalog
+      // ledger explicitly. Catalog UIs can then select versioned bounded
+      // reads from live installed state instead of from the client bundle.
+      try {
+        const catalogs = await netFeed?.catalogs();
+        if (catalogs) {
+          state.scopedProjection = {
+            ...(state.scopedProjection ?? { inventory: [], overlays: {} }),
+            catalogs: { catalogs }
+          };
+        }
+      } catch {
+        // Best-effort compatibility: catalog components retain their declared
+        // aged-world fallbacks when the registry read is unavailable.
+      }
       // Seed the room anchor from the actor's live cell (B1 permits
       // reading one's own actor).
       try {
@@ -3245,10 +3250,9 @@ function readDubspaceControlsView(space: string): Promise<any> {
   if (!space || !canSendDubspaceV2()) {
     return Promise.reject(new Error("dubspace controls view is unavailable"));
   }
-  // Net projections do not currently expose the authoritative installed-
-  // catalog registry. Without proof that this durable world has the view,
-  // start with the bounded cell surface instead of waiting for a doomed
-  // missing-verb repair loop to exhaust its budget.
+  // The net bootstrap ledger proves whether this durable world has the view.
+  // If that evidence is unavailable or predates the verb, start with the
+  // bounded cell surface instead of spending a missing-verb repair budget.
   if (netMode() && !netInstalledDubspaceSupportsControlsView()) {
     return readDubspaceControlCellsView(space);
   }
@@ -3336,13 +3340,7 @@ function applyDubspaceControlsCanonical(space: string, view: any): boolean {
 }
 
 function dubspaceControlProjectionComplete(dub: Record<string, any>, meta: any): boolean {
-  const required: Array<[string, string[]]> = [
-    ...(Array.isArray(meta.slots) ? meta.slots.map((id: string) => [id, ["loop_id", "playing", "gain", "freq"]] as [string, string[]]) : []),
-    [String(meta.channel ?? ""), ["gain"]],
-    [String(meta.filter ?? ""), ["cutoff"]],
-    [String(meta.delay ?? ""), ["send", "time", "feedback", "wet"]],
-    [String(meta.drum ?? ""), ["bpm", "playing", "started_at", "step_count", "pattern"]]
-  ];
+  const required = dubspaceControlDefinitions(meta, bundledDubspaceControlDefaults());
   return required.every(([id, names]) => {
     const props = id ? dub[id]?.props : null;
     return props && names.every((name) => Object.prototype.hasOwnProperty.call(props, name));

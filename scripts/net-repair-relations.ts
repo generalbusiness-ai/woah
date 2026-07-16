@@ -1,11 +1,18 @@
 // Idempotent operator repair for namespaces installed before install-time
-// contents relations were seeded. The required object allow-list prevents a
-// fresh bootstrap image from resurrecting a bundled object that operators
-// deliberately moved after installation. Live player/guest locations are never
-// inferred from bootstrap state, even when explicitly named; anchored block
-// actors remain eligible because they are static fixtures, not players.
+// contents relations were seeded. The required object allow-list prevents
+// arbitrary/user objects from being inferred from a fresh bootstrap image;
+// naming a bundled static fixture explicitly is operator authorization to
+// restore its seeded membership. Live player/guest locations are never inferred
+// from bootstrap state, even when explicitly named; anchored block actors remain
+// eligible because they are static fixtures, not players.
+import { pathToFileURL } from "node:url";
 import { planNetInstall } from "../src/net/install";
 import { signInternalRequest } from "../src/worker/internal-auth";
+
+export function changedRelationCount(body: string): number {
+  const parsed = JSON.parse(body) as { changed?: unknown };
+  return Array.isArray(parsed.changed) ? parsed.changed.filter((key) => typeof key === "string").length : 0;
+}
 
 async function main(): Promise<void> {
   const baseUrl = process.argv[2]?.replace(/\/$/, "") ?? "";
@@ -52,13 +59,16 @@ async function main(): Promise<void> {
     const response = await fetch(request);
     const body = await response.text();
     if (!response.ok) throw new Error(`repair ${scope} failed: ${response.status} ${body}`);
-    added += relations.length;
+    added += changedRelationCount(body);
     console.log(`repaired ${scope}: ${body}`);
   }
   console.log(`net relation repair ok: replayed ${added} allow-listed static memberships`);
 }
 
-main().catch((error) => {
-  console.error(String(error));
-  process.exit(1);
-});
+const entry = process.argv[1];
+if (entry && import.meta.url === pathToFileURL(entry).href) {
+  main().catch((error) => {
+    console.error(String(error));
+    process.exit(1);
+  });
+}

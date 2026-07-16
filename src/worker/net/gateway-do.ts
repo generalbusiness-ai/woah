@@ -496,6 +496,13 @@ function isConcreteRuntimeObjectId(id: string): boolean {
   return id.length > 0 && !id.includes(":");
 }
 
+const OBJECT_ARGUMENT_NAMES = new Set([
+  "actor", "actor?", "actor_obj", "child", "exit", "item", "location",
+  "new_parent_id", "obj", "object", "objects", "origin?", "parent",
+  "parent_id?", "pin", "recipient", "source", "source_ref", "target",
+  "target_space", "thing"
+]);
+
 /** `<kind>:<object>[:<name>]` → object (object ids never contain ':'). */
 function objectOfCellKey(key: string): string {
   return key.split(":")[1] ?? "";
@@ -1867,7 +1874,7 @@ export class NetGatewayDO {
   //       {type:"ping", id?} → {type:"pong", id}
   //       anything else → {type:"error", id?, error:{code, message}}
   //     Observation push (item 3 chunk 2) delivers
-  //     {type:"observations", scope, seq, turn_id?, observations} frames to
+  //     {type:"observations", scope, seq, echo_id?, observations} frames to
   //     sockets whose session is present (CO13 session_presence) in a
   //     fanout's scope — see pushObservations.
 
@@ -1972,6 +1979,16 @@ export class NetGatewayDO {
         const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
         if (bearerSession && body.session === undefined) body.session = bearerSession;
         return await this.clientBrowserMetrics(actor, body);
+      }
+      if (request.method === "GET" && url.pathname === "/net-api/catalogs") {
+        // The installed-catalog ledger is the bootstrap registry's public
+        // read surface (legacy `/api/catalogs` exposes the same records). It
+        // is already present after catalogIdentity's authenticated full pull;
+        // return only the property value, never its definition/stamp cell.
+        this.readSession(url, actor, bearerSession);
+        const key = cellKey("property_cell", "$catalog_registry", "installed_catalogs");
+        const payload = this.ensureView().get(key)?.value as { value?: unknown } | undefined;
+        return json({ catalogs: Array.isArray(payload?.value) ? payload.value : [] });
       }
       if (request.method === "GET" && url.pathname === "/net-api/relation") {
         const relation = url.searchParams.get("relation") ?? "";
@@ -2714,6 +2731,18 @@ export class NetGatewayDO {
         400
       );
     }
+    if (!isConcreteRuntimeObjectId(verb)) {
+      return json(
+        {
+          error: {
+            code: "E_INVARG",
+            message: "turn verb is not a valid runtime verb name",
+            detail: { field: "verb", reason: "invalid_verb_name" }
+          }
+        },
+        400
+      );
+    }
     const args = (Array.isArray(body.args) ? body.args : []) as PlanTurnInput["call"]["args"];
 
     // planningScope from the session cell (the CO14 Phase-4 refinement):
@@ -2734,6 +2763,60 @@ export class NetGatewayDO {
       [{ scope: planningScope, objects: [target, anchorObject] }],
       "net_client_pull_miss_failed"
     );
+    // `arg_spec.params` is compiler-owned metadata naming the positional
+    // inputs. Parameters with object-role names denote refs; reject
+    // manifest-qualified values in those
+    // slots before the planner can turn a client typo into missing-state
+    // repair. Text/value slots remain unrestricted (messages may contain ':').
+    const validationCall = {
+      kind: "woo.turn_call.shadow.v1",
+      id: "validate",
+      route: "sequenced",
+      scope: anchorObject,
+      session,
+      actor,
+      target,
+      verb,
+      args
+    } as const;
+    let page = this.callVerbPage(this.ensureView(), validationCall);
+    // A targeted room backfill can materialize an object's lineage without
+    // every definition page. Only suspicious colon-bearing inputs pay for a
+    // forced object closure; ordinary turns retain the warm zero-RPC path.
+    // This also resolves inherited verb metadata through the returned chain.
+    if (!page && args.some((value) =>
+      (Array.isArray(value) ? value : [value]).some((part) => typeof part === "string" && part.includes(":"))
+    )) {
+      try {
+        await this.pullTargeted(planningScope, `scope:${planningScope}`, [target]);
+        page = this.callVerbPage(this.ensureView(), validationCall);
+      } catch (err) {
+        this.metric({ kind: "net_client_arg_validation_pull_failed", scope: planningScope, status: "error", error: String(err) });
+      }
+    }
+    const declaredArgs = page?.arg_spec && typeof page.arg_spec === "object" && !Array.isArray(page.arg_spec)
+      ? (page.arg_spec as { params?: unknown }).params
+      : undefined;
+    if (Array.isArray(declaredArgs)) {
+      const invalidIndex = args.findIndex((value, index) => {
+        const name = declaredArgs[index];
+        if (typeof name !== "string" || !OBJECT_ARGUMENT_NAMES.has(name)) return false;
+        const refs = Array.isArray(value) ? value : [value];
+        return refs.some((ref) => typeof ref === "string" && ref.includes(":"));
+      });
+      if (invalidIndex >= 0) {
+        return json(
+          {
+            error: {
+              code: "E_INVARG",
+              message: "turn object argument is not a valid runtime object id",
+              detail: { field: `args[${invalidIndex}]`, reason: "invalid_object_id" }
+            }
+          },
+          400
+        );
+      }
+    }
     // Match the existing gateway contract in CA14: catalog metadata may name
     // deterministic authority roots/property paths.  Resolve those paths
     // generically before planning so a cold movement does not spend one repair
@@ -2891,13 +2974,13 @@ export class NetGatewayDO {
   //
   // Observations: woo_wait long-polls a per-session in-memory queue fed
   // by the SAME presence-routed fanout that feeds WebSocket pushes
-  // (including the submitter turn_id dedupe). In-memory like v2's wait
+  // (including server-side submitter echo dedupe). In-memory like v2's wait
   // queues: an eviction drops undelivered items; the client's next wait
   // simply re-arms (at-most-once live delivery — CO2.7's socket rule).
 
   /** Per-session MCP observation queues (bounded) + parked woo_wait
    * long-polls. Registered at initialize; entries die with the DO. */
-  private readonly mcpQueues = new Map<string, { buffer: unknown[]; waiters: Array<() => void> }>();
+  private readonly mcpQueues = new Map<string, { buffer: unknown[]; waiters: Array<() => void>; ownEchoIds: Set<string> }>();
 
   private async clientMcp(request: Request): Promise<Response> {
     const rpc = (await request.json().catch(() => null)) as {
@@ -2963,7 +3046,7 @@ export class NetGatewayDO {
     if (!opened.ok || typeof body.session !== "string") {
       return json({ jsonrpc: "2.0", id, error: { code: -32000, message: `session mint failed: ${JSON.stringify(body)}` } }, 200);
     }
-    this.mcpQueues.set(body.session, { buffer: [], waiters: [] });
+    this.mcpQueues.set(body.session, { buffer: [], waiters: [], ownEchoIds: new Set() });
     return json(
       {
         jsonrpc: "2.0",
@@ -3006,9 +3089,19 @@ export class NetGatewayDO {
       if (!object || !verb) return this.mcpToolError(id, { code: "E_INVARG", message: "woo_call requires object and verb" });
       try {
         const identity = await this.catalogIdentity();
+        const turnId = `mcp:${crypto.randomUUID()}`;
+        const ownEchoIds = this.mcpQueues.get(session)?.ownEchoIds;
+        if (ownEchoIds) {
+          ownEchoIds.add(turnEchoId(turnId));
+          while (ownEchoIds.size > MCP_QUEUE_CAP) {
+            const oldest = ownEchoIds.values().next().value as string | undefined;
+            if (oldest === undefined) break;
+            ownEchoIds.delete(oldest);
+          }
+        }
         const turnResponse = await this.clientTurn(
           actor,
-          { target: object, verb, args: Array.isArray(args.args) ? args.args : [], session },
+          { target: object, verb, args: Array.isArray(args.args) ? args.args : [], session, idempotency_key: turnId },
           identity.epoch
         );
         const turn = (await turnResponse.json()) as {
@@ -3091,7 +3184,7 @@ export class NetGatewayDO {
   }
 
   /** Fanout-side feed (called from pushObservations, AFTER the same
-   * submitter turn_id dedupe the sockets get). Bounded buffer: overflow
+   * server-side submitter echo dedupe the sockets get). Bounded buffer: overflow
    * drops oldest — at-most-once live delivery, the socket rule. */
   private mcpEnqueue(session: string, observations: unknown[]): void {
     const queue = this.mcpQueues.get(session);
@@ -3407,6 +3500,14 @@ export class NetGatewayDO {
       if (
         body.submitter_turn_id !== undefined
         && this.recentClientTurns.get(body.submitter_turn_id) === row.member
+      ) continue;
+      // MCP has no client-side observation-frame carrier on which to apply
+      // NetFeed's echo digest. Keep an independent per-session bounded guard
+      // so eviction of the shard-wide bandwidth LRU cannot duplicate the
+      // submitter's own turn into its later woo_wait response.
+      if (
+        body.echo_id !== undefined
+        && this.mcpQueues.get(row.member)?.ownEchoIds.has(body.echo_id)
       ) continue;
       // v2 audience parity (client-shell phase i): a `to:`-directed
       // observation (looked/who — private views) reaches ONLY the session
@@ -4142,6 +4243,11 @@ export class NetGatewayDO {
    * prefetch; a miss is named and normal E_MISSING_STATE repair takes over. */
   private async refreshNetPrefetchPathCursor(object: string, property: string, planningScope: string): Promise<void> {
     if (!object || object === "$nowhere") return;
+    // An explicit instance page in the gateway view is kept coherent by the
+    // normal scope fanout lane. Only absence is ambiguous with an inherited
+    // default and requires an owner closure read. This keeps repeated command
+    // and direction turns off the blocking cross-DO refresh path.
+    if (this.ensureView().has(cellKey("property_cell", object, property))) return;
     // The planning owner is the common anchored-helper case. The derived
     // object owner covers roots such as `actor` whose property lives at its
     // cluster even while the turn itself commits in a room.

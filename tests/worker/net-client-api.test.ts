@@ -121,9 +121,24 @@ async function buildHarness() {
     null
   );
   expect(installed.ok).toBe(true);
+  expect(installVerb(
+    world,
+    "capi_box",
+    "probe_target",
+    "verb :probe_target(target) rxd { return target; }",
+    null
+  ).ok).toBe(true);
   const placed = await world.directCall("capi-genesis-place", actor, actor, "moveto", ["capi_room"], { sessionId: session.id });
   expect(placed.op).toBe("result");
   world.ensureApiKey("$wiz", actor, KEY_ID, KEY_SECRET, "net-client-api-test");
+  world.setProp("$catalog_registry", "installed_catalogs", [{
+    alias: "dubspace",
+    catalog: "dubspace",
+    version: "1.0.4",
+    provenance: "bundled",
+    owner: "$wiz",
+    objects: { room: "capi_room" }
+  }]);
   // A second authenticated identity for the actor_mismatch case.
   const other = world.auth("guest:net-client-api-2").actor;
   world.ensureApiKey("$wiz", other, "capi-key-2", "capi-secret-2", "net-client-api-test-2");
@@ -263,6 +278,9 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     const minted = await clientFetch(h.gateway, "POST", "/net-api/session", { token, body: { ttl_ms: 600_000 } });
     expect(minted.status, JSON.stringify(minted.body)).toBe(200);
     const sid = minted.body.session as string;
+    const catalogs = await clientFetch(h.gateway, "GET", `/net-api/catalogs?session=${sid}`, { token });
+    expect(catalogs.status, JSON.stringify(catalogs.body)).toBe(200);
+    expect(catalogs.body.catalogs).toEqual([expect.objectContaining({ alias: "dubspace", version: "1.0.4" })]);
     // A bump turn pulls capi_room into the gateway view; the caller is
     // present where its actor stands (capi_room, from genesis placement),
     // so its own-room cells/relation are readable with no transition.
@@ -447,6 +465,26 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     // else — especially the room planning scope — may be contacted for this
     // malformed target.
     expect(h.resolvedDestinations.filter((destination) => destination !== `scope:${CATALOG_SCOPE}`)).toEqual([]);
+
+    const invalidVerb = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+      token,
+      body: { target: "capi_box", verb: "catalog:probe_target", args: [], session: sid }
+    });
+    expect(invalidVerb.status).toBe(400);
+    expect(invalidVerb.body.error).toMatchObject({
+      code: "E_INVARG",
+      detail: { field: "verb", reason: "invalid_verb_name" }
+    });
+
+    const invalidArg = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+      token,
+      body: { target: "capi_box", verb: "probe_target", args: ["catalog:capi_room"], session: sid }
+    });
+    expect(invalidArg.status).toBe(400);
+    expect(invalidArg.body.error).toMatchObject({
+      code: "E_INVARG",
+      detail: { field: "args[0]", reason: "invalid_object_id" }
+    });
 
     h.close();
   });

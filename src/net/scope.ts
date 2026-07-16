@@ -315,7 +315,7 @@ export class ScopeSequencer {
    * operator op (operatorActivationWrite), never a seed. */
   seed(
     cells: Array<Pick<Cell, "kind" | "object" | "name" | "value">>,
-    relations: RelationRow[] = []
+    relations?: RelationRow[]
   ): void {
     if (this.headState.seq > 0) {
       throw netError("E_SEED_COMMITTED", "scope has committed turns; a re-seed would reset authoritative state", {
@@ -328,20 +328,25 @@ export class ScopeSequencer {
     for (const cell of cells) {
       seeded.push(this.store.commit({ kind: cell.kind, object: cell.object, ...(cell.name !== undefined ? { name: cell.name } : {}), value: cell.value, stamp: this.stamp() }));
     }
-    // Installation supplies the COMPLETE initial relation family for this
-    // scope. Replace it on a legal pre-traffic same-epoch re-seed so crash
-    // recovery cannot retain a partial first attempt.
-    this.relationRows.clear();
-    this.orderedRelationsByProjection.clear();
-    this.orderedRelationLocationByKey.clear();
-    for (const row of relations) this.relationRows.set(relationKey(row.relation, row.owner, row.member), row);
-    this.syncOrderedRelationIndex(this.relationRows.keys());
+    // A present relation field is the COMPLETE initial family and replaces a
+    // partial first attempt. Legacy seed callers omitted the field entirely;
+    // omission must preserve their already-seeded rows, not silently mean an
+    // explicit empty family on a same-epoch retry.
+    if (relations !== undefined) {
+      this.relationRows.clear();
+      this.orderedRelationsByProjection.clear();
+      this.orderedRelationLocationByKey.clear();
+      for (const row of relations) this.relationRows.set(relationKey(row.relation, row.owner, row.member), row);
+      this.syncOrderedRelationIndex(this.relationRows.keys());
+    }
     const durable = this.options.durable;
     if (durable) {
       durable.transaction(() => {
         for (const cell of seeded) durable.writeCell(cell);
-        for (const row of durable.readRelations()) durable.deleteRelation(relationKey(row.relation, row.owner, row.member));
-        for (const [key, row] of this.relationRows) durable.writeRelation(key, row);
+        if (relations !== undefined) {
+          for (const row of durable.readRelations()) durable.deleteRelation(relationKey(row.relation, row.owner, row.member));
+          for (const [key, row] of this.relationRows) durable.writeRelation(key, row);
+        }
         // Meta is written on seed too, so a seeded-but-never-committed
         // scope still hydrates with its head and epoch.
         durable.writeMeta({ scope: this.scope, catalog_epoch: this.catalogEpoch, head: this.headState });

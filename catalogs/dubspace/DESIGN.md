@@ -72,7 +72,10 @@ declared defaults because sparse net storage legitimately omits unchanged
 values, then overlays every materialized cell. The reads are paced beneath the
 shared client-operation rate and retry only the gateway's named, recoverable
 `E_RATE`, so shell hydration cannot exhaust the burst and discard the whole
-view. It neither enumerates objects nor guesses control roles or values.
+view. The compatibility reader and shared control vocabulary live with the
+catalog UI under `catalogs/dubspace/ui/`; drift tests require every declared
+default property and drum voice to remain represented by `controls_view()`.
+The reader neither enumerates objects nor guesses control roles or values.
 
 ## Surface
 

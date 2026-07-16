@@ -8,6 +8,7 @@ import {
   type WooComponentRegistry,
   type WooContext
 } from "../../../src/client/framework";
+import { DUBSPACE_DRUM_VOICES, LOOP_DEFAULT_SEMITONES, NOTE_NAMES, PITCH_MAX_SEMITONE, PITCH_MIN_SEMITONE, PITCH_ROOT_FREQ, PITCH_ROOT_MIDI } from "./model";
 
 export type DubspaceControlMap = Record<string, { id?: string; name?: string; props?: Record<string, unknown> }>;
 
@@ -29,21 +30,7 @@ export type DubspaceData = {
   cuePlaying: Record<string, boolean>;
 };
 
-type DrumVoice = { id: string; label: string };
-
-const DRUM_VOICES: DrumVoice[] = [
-  { id: "kick", label: "Kick" },
-  { id: "snare", label: "Snare" },
-  { id: "hat", label: "Hat" },
-  { id: "tone", label: "Tone" }
-];
-
-const PITCH_ROOT_FREQ = 110;
-const PITCH_ROOT_MIDI = 45;
-const PITCH_MIN_SEMITONE = -12;
-const PITCH_MAX_SEMITONE = 36;
-const LOOP_DEFAULT_SEMITONES = [0, 5, 10, 15];
-const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+const DRUM_VOICES = DUBSPACE_DRUM_VOICES;
 
 export class WooDubspaceWorkspaceElement extends HTMLElement {
   woo?: WooContext;

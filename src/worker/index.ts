@@ -784,7 +784,7 @@ async function handleNetSmoke(request: Request, env: Env, url: URL): Promise<Res
  * the RAW pre-sanitize request — H1b; the operator running the cutover
  * holds WOO_INTERNAL_SECRET). The surface is deliberately narrower than
  * /net-smoke: only the NC5 allow-list is reachable. Scope operations are
- * `probe`, `seed` (idempotent by the M9 epoch guard before committed turns),
+ * `probe`, `seed` (same-epoch retryable by the M9 epoch guard before committed turns),
  * `activate` (CAS'd install state), and `head` (epoch verification).
  * Everything else about a live world —
  * subscribe, pull, turns — happens through the normal production

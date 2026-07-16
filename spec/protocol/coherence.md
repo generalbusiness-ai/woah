@@ -417,7 +417,10 @@ scope's durable epoch after a successful reseed — the condition is the
 terminal `E_EPOCH_MISMATCH` (CO6), surfaced with its attempt trace instead
 of grinding the repair budget; reconciliation is the catalog
 install/migration path's job. Idempotent re-seed at the SAME epoch remains
-a success. This generalizes the E1 discipline that landed for v2
+a success. A present seed `relations` field is the complete initial relation
+family (including an explicit empty array); omission by a legacy seed request
+preserves existing same-epoch relation rows. This generalizes the E1 discipline
+that landed for v2
 scope repair, and makes the aged-world lane (CO12) meaningful: an upgraded
 world converges by reseeding stamped copies, with the reseeds visible in
 tail metrics by code.
@@ -819,11 +822,23 @@ One write path per fact (CO9), concretized:
     does not invalidate an already committed buffered fanout from another
     scope; the client releases that authoritative frame. Closing or replacing a
     socket MUST also release every in-flight WS waiter to the same-key REST
-    fallback rather than withholding buffered observations indefinitely. Thus
-    LRU loss costs one redundant frame, not a duplicate user-visible observation. Delivery is
-    AT-MOST-ONCE and never durable: the per-scope seq gate drops
+    fallback rather than withholding buffered observations indefinitely. A
+    bounded turn-result timer MUST do the same for a silent half-open socket
+    that emits no close/error callback. Thus
+    For WebSocket clients, LRU loss costs one redundant wire frame, not a
+    duplicate user-visible observation, while the bounded client echo window
+    retains the digest. MCP wait queues have no client echo carrier, so each
+    session keeps an independent bounded set of its own submitted echo digests;
+    a fanout delayed beyond both bounded windows may appear once redundantly.
+    Delivery is never durable: the per-scope seq gate drops
     redeliveries, dead sockets are skipped, and missed-observation
     catch-up is deliberately NOT promised in Phase 4.
+  - **Installed catalog read:** authenticated clients may read the bounded
+    `$catalog_registry.installed_catalogs` value through `GET /net-api/catalogs`.
+    The response exposes ledger records only, not the property cell definition
+    or authority stamp. Net shells use this live version evidence to choose a
+    catalog's declared read surface; they must not infer installed versions
+    from their bundled manifests.
 - **Every planned submit carries its session read** (folded in by
   `plan.ts` when the engine transcript lacks it — the engine cannot
   record session-kind cells), versioned through the plan snapshot, so

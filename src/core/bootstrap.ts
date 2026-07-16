@@ -483,19 +483,23 @@ const PLAYER_WAYS_SOURCE = `verb :ways(room_name) rxd {
   for key in keys(exit_map) {
     let exit = exit_map[key];
     if (!(exit in exits)) {
-      // Exit refs in a room's map are structural facts.  Do not turn an
-      // unavailable referenced object into "not obvious": sparse planners
-      // must surface the miss, fetch that exit, and retry the whole listing.
-      let obvious = exit.obvious;
+      // authority.prefetch materializes valid structural refs before this
+      // verb executes on net. A dangling/recycled ref must not make every
+      // healthy exit unusable, so isolate the residual unavailable object.
+      let obvious = false;
+      try { obvious = exit.obvious; } except err { obvious = false; }
       if (obvious) { exits = exits + [exit]; }
     }
   }
   let labels = [];
   for exit in exits {
-    let label = exit.name;
-    let aliases = exit.aliases;
-    if (length(aliases) > 0) { label = label + " (" + str_join(aliases, ", ") + ")"; }
-    labels = labels + [label];
+    let label = "";
+    try {
+      label = exit.name;
+      let aliases = exit.aliases;
+      if (length(aliases) > 0) { label = label + " (" + str_join(aliases, ", ") + ")"; }
+    } except err2 { label = ""; }
+    if (label) { labels = labels + [label]; }
   }
   let text = "";
   if (length(labels) == 0) { text = "No obvious exits."; }
