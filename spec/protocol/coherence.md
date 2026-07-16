@@ -528,14 +528,22 @@ One write path per fact (CO9), concretized:
   `repair-relations` operator operation advances the owner head only when a row
   is missing and refans that delta; replay is an idempotent no-op.
 - **Persisted bootstrap definitions upgrade as ordered catalog events.** A
-  runtime deployment does not rewrite verb pages already installed in an
+  runtime deployment does not rewrite definition pages already installed in an
   active world. The signed `repair-definitions` operator operation therefore
-  accepts only existing `verb_bytecode` cells on `$` objects at catalog
-  authority, advances the catalog head once, durably appends the tail event,
-  and refans the replacement pages. An unchanged replay is a no-op. The
-  operator script further requires an explicit `$object:verb` allow-list and
-  obtains each replacement from the fresh local install plan; arbitrary
-  bytecode and new definition creation are not an operator input.
+  accepts replacement of existing `verb_bytecode` cells, installation or
+  replacement of property-definition `property_cell`s, and removal of either
+  definition kind on installed `$` objects at catalog authority. It advances
+  the catalog head once, durably appends the tail event, and refans replacements
+  plus removed cell keys under the same high-water. An unchanged replay is a
+  no-op. A later full catalog pull also removes local verb/property definition
+  pages absent from the authoritative closure, covering gateways that were
+  offline for the fanout while leaving ordinary instance property cells alone.
+  The operator script requires an explicit `$object:verb` or
+  `prop:$object:name` allow-list, obtains replacements from the fresh local
+  install plan, and permits drops only when a bundled migration declares the
+  corresponding `drop_verb` or `drop_property` and the current bundle no longer
+  defines that page; arbitrary definitions and deletion of current definitions
+  are not operator inputs.
 - **The applier runs at the committing scope.** On accept, the scope
   derives relation deltas from the transcript: `projectionWrites`
   (contents add/remove), moves (contents of the source and destination

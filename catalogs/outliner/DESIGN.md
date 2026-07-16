@@ -761,7 +761,9 @@ Two catalog-version migrations ship with the outliner:
   `(parent, position)` — grouping siblings by (containing outliner, parent),
   ordering each group by `(position, then item id)` for a total, reproducible
   tie-break, and assigning fractional ranks in that order — then drops the
-  legacy `.parent`/`.position` props so there is no second write path. It is
+  legacy `.parent`/`.position` props and the retired
+  `set_position`/`set_parent`/`_siblings_ordered`/`_renumber_siblings` verbs so
+  there is no second write path. It is
   idempotent: re-deriving from the same legacy input yields byte-identical
   ranks, and replay after the legacy properties have been dropped recognizes a
   complete, valid existing edge index and preserves it byte-for-byte. Partial,

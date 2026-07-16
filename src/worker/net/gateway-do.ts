@@ -803,6 +803,7 @@ export class NetGatewayDO {
         if (live.head.seq === seed.head.seq && live.head.hash === seed.head.hash) {
           this.discardViewOnThrow(() =>
             this.state.storage.transactionSync(() => {
+              this.removeAbsentCatalogDefinitions(view, body.scope, seed.cells);
               for (const cell of seed.cells) {
                 // Copy #3 provenance: these cells came through KV, not the
                 // authority — mark them honestly (planning treats derived
@@ -4880,6 +4881,10 @@ export class NetGatewayDO {
     };
     this.discardViewOnThrow(() =>
       this.state.storage.transactionSync(() => {
+        // `known` makes the transfer partial: absence then means "receiver
+        // already knows it", not authoritative deletion. Exact catalog
+        // cleanup is safe only for an unfiltered full closure.
+        if (known.length === 0) this.removeAbsentCatalogDefinitions(view, transfer.scope, transfer.cells);
         for (const cell of transfer.cells) {
           view.install(cell);
           this.persistCell(view, cell.key);
@@ -4905,6 +4910,31 @@ export class NetGatewayDO {
       })
     );
     return transfer;
+  }
+
+  /** A full catalog closure is authoritative for the complete bootstrap
+   * definition set, not merely an upsert batch. Remove verb and property-
+   * definition pages absent from that closure before installing it so an
+   * aged/offline gateway cannot resurrect a retired v1 definition after
+   * missing the ordered removal fanout. Ordinary instance property cells are
+   * not definitions and retain their existing upsert posture. */
+  private removeAbsentCatalogDefinitions(view: CellStore, scope: string, cells: readonly Cell[]): void {
+    if (scope !== CATALOG_SCOPE) return;
+    const isDefinition = (cell: Cell): boolean => {
+      if (cell.kind === "verb_bytecode") return true;
+      if (cell.kind !== "property_cell" || !cell.value || typeof cell.value !== "object" || Array.isArray(cell.value)) {
+        return false;
+      }
+      const def = (cell.value as { def?: unknown }).def;
+      return Boolean(def && typeof def === "object" && !Array.isArray(def));
+    };
+    const present = new Set(cells.filter(isDefinition).map((cell) => cell.key));
+    for (const key of [...view.keys()]) {
+      const local = view.get(key);
+      if (!local || !isDefinition(local) || present.has(key)) continue;
+      view.delete(key);
+      this.persistCell(view, key);
+    }
   }
 
   /** Raise a scope's fanout high-water to `seq` (never lowers) — memory
@@ -4948,6 +4978,7 @@ export class NetGatewayDO {
         }
         if (advanced) {
           for (const cell of body.cells) this.persistCell(view, cell.key);
+          for (const key of body.removed_cells ?? []) this.persistCell(view, key);
           // CO13: relation deltas ride the same body and the same seq
           // gate — a redelivered body no-ops above (applyFanout), so the
           // mirror never double-applies. applyFanout itself stays

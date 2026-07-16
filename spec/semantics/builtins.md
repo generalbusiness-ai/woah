@@ -127,13 +127,17 @@ skips stale refs that cannot be resolved, and returns the object refs whose
 with object id as a stable tie-breaker. Unranked items sort after ranked
 items in contents order.
 
-`object_tree_rows(container, item_class, parent_prop, position_prop, text_verb,
-hidden_prop?)` performs the same scan and sibling ordering, then returns a
-depth-first joined tree view with rows shaped as `{id, name, text, parent_id,
-index, hidden, owner, writers, has_children}`. `text` is read by dispatching
-`text_verb` on each row object; failures produce `text: ""`, matching catalog
-read-gate projections. The helper is for catalog display projections that
-would otherwise allocate quadratic intermediate lists in woocode.
+`object_tree_rows(container, item_class, edge_prop, text_verb, hidden_prop?)`
+scans `contents(container)`, keeps descendants of `item_class`, and derives
+each item's parent plus sibling order from its single `edge_prop = { parent,
+rank }` cell. It returns a depth-first joined tree view with rows shaped as
+`{id, name, text, parent_id, index, hidden, owner, writers, has_children}`.
+`text` is read by dispatching `text_verb` on each row object; failures produce
+`text: ""`, matching catalog read-gate projections. The helper is for catalog
+display projections that would otherwise allocate quadratic intermediate
+lists in woocode. The retired six-argument `(parent_prop, position_prop)` form
+is not accepted; v2 tree structure has one edge authority, never parallel
+parent/position properties.
 
 The authoring-facing contract for compile/install, expected-version conflicts,
 and diagnostics is in [../authoring/minimal-ide.md](../authoring/minimal-ide.md).

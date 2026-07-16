@@ -637,6 +637,36 @@ test("generic tool view mounts a catalog space-workspace frame", async ({ page }
   await expect(tree.getByRole("button", { name: "Leave" })).toHaveCount(0);
 });
 
+test("outliner space chat look renders without a builtin contract error", async ({ page }, testInfo) => {
+  const pageErrors: string[] = [];
+  const serverErrors: string[] = [];
+  page.on("pageerror", (error) => pageErrors.push(`${error.name}: ${error.message}`));
+  page.on("response", (response) => {
+    if (response.status() >= 500) serverErrors.push(`${response.status()} ${response.url()}`);
+  });
+
+  await page.goto("/");
+  await continueAsGuestIfPrompted(page);
+  await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
+  await page.getByRole("button", { name: "Outliner" }).click();
+  const tree = page.locator("woo-outliner-tree[data-outliner-tree]");
+  await waitForOutlinerWritable(tree);
+  const panel = tree.locator("woo-space-chat-panel[data-space-chat-panel]");
+  const input = panel.locator("[data-space-chat-input]");
+  await expect(input).toBeVisible();
+  await input.fill("look");
+  await input.press("Enter");
+  await expect(panel.locator(".chat-line.input")).toContainText("look");
+  await expect(panel).toContainText(/Outline has \d+ items?\./, { timeout: 15_000 });
+  await expect(panel).not.toContainText("object_tree_rows expects");
+  expect(pageErrors).toEqual([]);
+  expect(serverErrors).toEqual([]);
+
+  const screenshot = testInfo.outputPath("outliner-look-localdev.png");
+  await page.screenshot({ path: screenshot, fullPage: true });
+  await testInfo.attach("outliner-look-localdev", { path: screenshot, contentType: "image/png" });
+});
+
 test("outliner displays items added via the UI", async ({ page }) => {
   // Regression: item text can be absent from generic projection even when the
   // row structure is present, because $note readability is catalog-defined.

@@ -181,10 +181,16 @@ is an idempotent, add-only recovery for initial `contents` rows omitted by an
 older installer; it accepts only rows whose owner object is authoritative at
 the addressed scope and refans newly added rows at an advanced owner head.
 The definition repair is the corresponding aged-world migration for bootstrap
-verb pages: it accepts only existing `$`-object `verb_bytecode` cells at the
-catalog scope, commits replacements at an advanced head, and refans the delta;
-its CLI supplies values only from a fresh install plan and an explicit operator
-allow-list. Runtime deployment alone never implies this durable-world update.
+verb and property-definition pages. At the catalog scope it accepts replacement
+of existing `$`-object `verb_bytecode` cells and installation/replacement of
+`property_cell` definitions; removals are limited to installed bootstrap
+classes. It commits at most 32 replacements/removals at one advanced head and
+refans the delta. Its CLI supplies replacement values only from a fresh install
+plan, requires an explicit operator allow-list (`$object:verb` or
+`prop:$object:name`), and permits removal only when a bundled catalog migration
+declares the corresponding `drop_verb` or `drop_property` and the current bundle
+no longer defines that page. Runtime deployment alone never implies this
+durable-world update.
 The trust model and enforced properties (pinned at the route level by
 `tests/worker/net-install-doorway.test.ts`):
 

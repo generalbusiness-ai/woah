@@ -34,6 +34,10 @@ export type FanoutBody = {
   /** Authority cells for the receiver to install as derived copies —
    * already lineage-closed by serializeTransfer (CO7). */
   cells: Cell[];
+  /** Authority cell keys deleted by this ordered event. Deletions must ride
+   * the same per-scope high-water as replacements; otherwise a durable
+   * derived gateway can retain a definition the catalog authority removed. */
+  removed_cells?: string[];
   /** Observations for live delivery at the destination. */
   observations: unknown[];
   /** The committed turn's idempotency key (Phase 4 item 3): lets a
@@ -193,6 +197,7 @@ export function applyFanout(store: CellStore, seen: Map<string, number>, body: F
   const last = seen.get(body.scope) ?? 0;
   if (body.seq <= last) return false; // redelivery — harmless no-op
   for (const cell of body.cells) store.install(cell);
+  for (const key of body.removed_cells ?? []) store.delete(key);
   seen.set(body.scope, body.seq);
   return true;
 }

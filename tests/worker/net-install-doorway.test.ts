@@ -215,15 +215,38 @@ describe("the /net-install doorway (route level)", () => {
     h.close();
   });
 
-  it("repairs only existing bootstrap verb pages at catalog authority and replays idempotently", async () => {
+  it("repairs bootstrap definition pages at catalog authority and replays idempotently", async () => {
     const h = buildHarness();
+    const playerLineage = {
+      kind: "object_lineage",
+      object: "$player",
+      value: { parent: null, owner: "$wiz", name: "$player", anchor: null, flags: {} }
+    };
     const original = {
       kind: "verb_bytecode",
       object: "$player",
       name: "ways",
       value: { name: "ways", bytecode: [{ op: "RETURN", value: "old" }], arg_spec: { args: ["room?"] } }
     };
-    const seeded = await h.signedRequest("/net-install/scope/catalog/seed", seedBody("catalog", EPOCH, [original]));
+    const retired = {
+      kind: "verb_bytecode",
+      object: "$player",
+      name: "retired",
+      value: { name: "retired", bytecode: [{ op: "RETURN", value: "legacy" }], arg_spec: { args: [] } }
+    };
+    const retiredProperty = {
+      kind: "property_cell",
+      object: "$player",
+      name: "legacy_slot",
+      value: {
+        value: null,
+        def: { name: "legacy_slot", defaultValue: null, typeHint: "obj|null", owner: "$wiz", perms: "r", version: 1 }
+      }
+    };
+    const seeded = await h.signedRequest(
+      "/net-install/scope/catalog/seed",
+      seedBody("catalog", EPOCH, [playerLineage, original, retired, retiredProperty])
+    );
     expect(seeded.status, await seeded.clone().text()).toBe(200);
     // Model an already-subscribed gateway without letting the fake resolve
     // drain it; the operator event must enter the same durable fanout lane as
@@ -239,10 +262,25 @@ describe("the /net-install doorway (route level)", () => {
         arg_spec: { args: ["room?"], authority: { prefetch: ["scope", { path: ["scope", "exits"] }] } }
       }
     };
+    const replacementProperty = {
+      kind: "property_cell",
+      object: "$player",
+      name: "current_slot",
+      value: {
+        value: null,
+        def: { name: "current_slot", defaultValue: null, typeHint: "obj|null", owner: "$wiz", perms: "r", version: 1 }
+      }
+    };
     const body = {
       method: "POST" as const,
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ cells: [replacement] })
+      body: JSON.stringify({
+        cells: [replacement, replacementProperty],
+        remove: [
+          { kind: "verb_bytecode", object: "$player", name: "retired" },
+          { kind: "property_cell", object: "$player", name: "legacy_slot" }
+        ]
+      })
     };
 
     expect((await h.request("/net-install/scope/catalog/repair-definitions", body)).status).toBe(401);
@@ -253,20 +291,37 @@ describe("the /net-install doorway (route level)", () => {
       scope: "catalog",
       status: "applied",
       head: { seq: 1 },
-      changed: ["verb_bytecode:$player:ways"]
+      changed: [
+        "property_cell:$player:current_slot",
+        "property_cell:$player:legacy_slot",
+        "verb_bytecode:$player:retired",
+        "verb_bytecode:$player:ways"
+      ],
+      removed: ["verb_bytecode:$player:retired", "property_cell:$player:legacy_slot"]
     });
     const replayed = await h.signedRequest("/net-install/scope/catalog/repair-definitions", body);
-    expect(await replayed.json()).toMatchObject({ ok: true, status: "empty", head: { seq: 1 }, changed: [] });
+    expect(await replayed.json()).toMatchObject({ ok: true, status: "empty", head: { seq: 1 }, changed: [], removed: [] });
     const durable = h.scopeStates.get("catalog")!.storage.sql;
     const stored = durable.exec("SELECT body FROM net_scope_cell WHERE key = 'verb_bytecode:$player:ways'").toArray();
     expect(JSON.parse(String(stored[0]!.body))).toMatchObject({ value: replacement.value, stamp: { scope_head: expect.stringMatching(/^1:/) } });
+    const storedProperty = durable.exec("SELECT body FROM net_scope_cell WHERE key = 'property_cell:$player:current_slot'").toArray();
+    expect(JSON.parse(String(storedProperty[0]!.body))).toMatchObject({
+      value: replacementProperty.value,
+      stamp: { scope_head: expect.stringMatching(/^1:/) }
+    });
+    expect(durable.exec("SELECT body FROM net_scope_cell WHERE key = 'verb_bytecode:$player:retired'").toArray()).toHaveLength(0);
+    expect(durable.exec("SELECT body FROM net_scope_cell WHERE key = 'property_cell:$player:legacy_slot'").toArray()).toHaveLength(0);
     expect(durable.exec("SELECT seq FROM net_scope_tail ORDER BY seq").toArray()).toEqual([{ seq: 1 }]);
     const fanout = durable.exec("SELECT body FROM net_scope_outbox WHERE route = '/fanout'").toArray();
     expect(JSON.parse(String(fanout[0]!.body))).toMatchObject({
       scope: "catalog",
       seq: 1,
       delivery_seq: 1,
-      cells: [{ key: "verb_bytecode:$player:ways", value: replacement.value }]
+      cells: [
+        { key: "verb_bytecode:$player:ways", value: replacement.value },
+        { key: "property_cell:$player:current_slot", value: replacementProperty.value }
+      ],
+      removed_cells: ["verb_bytecode:$player:retired", "property_cell:$player:legacy_slot"]
     });
 
     const wrongScope = await h.signedRequest("/net-install/scope/room%3Ax/seed", seedBody("room:x", EPOCH, [original]));
@@ -289,6 +344,63 @@ describe("the /net-install doorway (route level)", () => {
     expect((await h.signedRequest("/net-install/scope/catalog/repair-definitions", {
       ...body,
       body: JSON.stringify({ cells: [{ ...replacement, value: { ...replacement.value, name: "not_ways" } }] })
+    })).status).toBe(400);
+    expect((await h.signedRequest("/net-install/scope/catalog/repair-definitions", {
+      ...body,
+      body: JSON.stringify({
+        cells: [replacement],
+        remove: [{ kind: "verb_bytecode", object: "$player", name: "ways" }]
+      })
+    })).status).toBe(400);
+    expect((await h.signedRequest("/net-install/scope/catalog/repair-definitions", {
+      ...body,
+      body: JSON.stringify({
+        cells: [],
+        remove: [{ kind: "verb_bytecode", object: "$missing_class", name: "retired" }]
+      })
+    })).status).toBe(400);
+    h.close();
+  });
+
+  it("keeps a production-sized definition repair in one ordered event", async () => {
+    const h = buildHarness();
+    const lineage = {
+      kind: "object_lineage",
+      object: "$repair_fixture",
+      value: { parent: null, owner: "$wiz", name: "$repair_fixture", anchor: null, flags: {} }
+    };
+    expect((await h.signedRequest(
+      "/net-install/scope/catalog/seed",
+      seedBody("catalog", EPOCH, [lineage])
+    )).status).toBe(200);
+
+    // The Outliner v1→v2 production repair has 18 changes. Keep that batch
+    // below the route's bounded ceiling so it advances exactly one catalog
+    // head instead of exposing a partially upgraded definition surface.
+    const definitions = Array.from({ length: 18 }, (_, index) => ({
+      kind: "property_cell",
+      object: "$repair_fixture",
+      name: `slot_${index}`,
+      value: {
+        value: null,
+        def: { name: `slot_${index}`, defaultValue: null, typeHint: "obj|null", owner: "$wiz", perms: "r", version: 1 }
+      }
+    }));
+    const repaired = await h.signedRequest("/net-install/scope/catalog/repair-definitions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ cells: definitions })
+    });
+    expect(repaired.status, await repaired.clone().text()).toBe(200);
+    const repairedBody = await repaired.json() as { status: string; head: { seq: number }; changed: string[] };
+    expect(repairedBody).toMatchObject({ status: "applied", head: { seq: 1 } });
+    expect(repairedBody.changed).toHaveLength(18);
+
+    const oversized = Array.from({ length: 33 }, (_, index) => ({ ...definitions[0], name: `too_many_${index}` }));
+    expect((await h.signedRequest("/net-install/scope/catalog/repair-definitions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ cells: oversized })
     })).status).toBe(400);
     h.close();
   });

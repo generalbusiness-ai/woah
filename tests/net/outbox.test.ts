@@ -146,4 +146,23 @@ describe("receiver idempotency (CO2.5)", () => {
     expect(applyFanout(store, seen, body(2))).toBe(false);
     expect(seen.get("the_room")).toBe(3);
   });
+
+  it("removes retired cells under the same durable sequence high-water", () => {
+    const store = new CellStore("derived");
+    const seen = new Map<string, number>();
+    expect(applyFanout(store, seen, body(1))).toBe(true);
+    expect(store.get("object_live:#o1")).toBeDefined();
+
+    const removal: FanoutBody = {
+      scope: "the_room",
+      seq: 2,
+      cells: [],
+      removed_cells: ["object_live:#o1"],
+      observations: []
+    };
+    expect(applyFanout(store, seen, removal)).toBe(true);
+    expect(store.get("object_live:#o1")).toBeUndefined();
+    expect(applyFanout(store, seen, removal)).toBe(false);
+    expect(seen.get("the_room")).toBe(2);
+  });
 });

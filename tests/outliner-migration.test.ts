@@ -8,7 +8,8 @@
 // the legacy props. These tests exercise the REAL migration file against an
 // aged v1 world (nested items, duplicate positions to force the id tie-break,
 // two outliners to prove per-container grouping), on a local SQLite woo per the
-// AGENTS.md migration discipline, and assert the four validations + idempotency.
+// AGENTS.md migration discipline, and assert the four validations, retired
+// verb cleanup, and idempotency.
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -33,12 +34,22 @@ function tempDb(): { dir: string; path: string } {
 const V1: CatalogManifest = {
   name: "outliner", version: "1.0.1", spec_version: "v1", license: "MIT", depends: [],
   classes: [
-    { local_name: "$outliner", parent: "$thing", properties: [] },
+    {
+      local_name: "$outliner", parent: "$thing", properties: [],
+      verbs: [
+        { name: "_siblings_ordered", perms: "rxd", source: "verb :_siblings_ordered(parent_id) rxd { return []; }" },
+        { name: "_renumber_siblings", perms: "rx", source: "verb :_renumber_siblings(parent_id, ordered) rx { return true; }" }
+      ]
+    },
     {
       local_name: "$outline_item", parent: "$thing",
       properties: [
         { name: "parent", type: "obj|null", default: null, perms: "r" },
         { name: "position", type: "int", default: 0, perms: "r" }
+      ],
+      verbs: [
+        { name: "set_position", perms: "rx", source: "verb :set_position(position) rx { this.position = position; return true; }" },
+        { name: "set_parent", perms: "rx", source: "verb :set_parent(new_parent) rx { this.parent = new_parent; return true; }" }
       ]
     }
   ]
@@ -184,6 +195,13 @@ function assertValidations(world: ReturnType<typeof createWorld>): void {
   }
 }
 
+function assertRetiredVerbsRemoved(world: ReturnType<typeof createWorld>): void {
+  expect(world.ownVerbExact("$outline_item", "set_position")).toBeNull();
+  expect(world.ownVerbExact("$outline_item", "set_parent")).toBeNull();
+  expect(world.ownVerbExact("$outliner", "_siblings_ordered")).toBeNull();
+  expect(world.ownVerbExact("$outliner", "_renumber_siblings")).toBeNull();
+}
+
 describe("outliner v1 -> v2 migration", () => {
   it("derives edges from (parent, position) on a local SQLite woo, tie-breaking duplicate positions by id", () => {
     const { dir, path } = tempDb();
@@ -208,6 +226,7 @@ describe("outliner v1 -> v2 migration", () => {
       expect(edgeOf(upgradeWorld, "it_x").parent).toBe("it_b");
       expect(edgeOf(upgradeWorld, "it_a").parent).toBeNull();
       assertValidations(upgradeWorld);
+      assertRetiredVerbsRemoved(upgradeWorld);
       upgradeRepo.close();
 
       // ---- Reload once more: the migrated edges + dropped props persist.
@@ -215,6 +234,7 @@ describe("outliner v1 -> v2 migration", () => {
       const verifyWorld = createWorld({ repository: verifyRepo, catalogs: false });
       expect(ordered(verifyWorld, "mo", null)).toEqual(["it_b", "it_c", "it_a"]);
       assertValidations(verifyWorld);
+      assertRetiredVerbsRemoved(verifyWorld);
       verifyRepo.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -352,12 +372,22 @@ describe("outliner v1 -> v2 migration", () => {
     const v1Full: CatalogManifest = {
       name: "outliner", version: "1.0.1", spec_version: "v1", license: "MIT", depends: ["@local:chat", "@local:note"],
       classes: [
-        { local_name: "$outliner", parent: "$room", properties: [] },
+        {
+          local_name: "$outliner", parent: "$room", properties: [],
+          verbs: [
+            { name: "_siblings_ordered", perms: "rxd", source: "verb :_siblings_ordered(parent_id) rxd { return []; }" },
+            { name: "_renumber_siblings", perms: "rx", source: "verb :_renumber_siblings(parent_id, ordered) rx { return true; }" }
+          ]
+        },
         {
           local_name: "$outline_item", parent: "$note",
           properties: [
             { name: "parent", type: "obj|null", default: null, perms: "r" },
             { name: "position", type: "int", default: 0, perms: "r" }
+          ],
+          verbs: [
+            { name: "set_position", perms: "rx", source: "verb :set_position(position) rx { this.position = position; return true; }" },
+            { name: "set_parent", perms: "rx", source: "verb :set_parent(new_parent) rx { this.parent = new_parent; return true; }" }
           ]
         }
       ]
@@ -383,5 +413,6 @@ describe("outliner v1 -> v2 migration", () => {
     expect(eb.rank < ea.rank).toBe(true); // bi_b (position 1) before bi_a (position 2)
     expect(world.propOrNull("bi_a", "position")).toBeNull();
     expect(world.propOrNull("bi_a", "parent")).toBeNull();
+    assertRetiredVerbsRemoved(world);
   });
 });

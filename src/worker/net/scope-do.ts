@@ -1021,30 +1021,54 @@ export class NetScopeDO {
       if (request.method === "POST" && url.pathname === "/net/repair-definitions") {
         const body = (await request.json()) as {
           cells?: Array<Pick<Cell, "kind" | "object" | "name" | "value">>;
+          remove?: Array<Pick<Cell, "kind" | "object" | "name">>;
         };
         const cells = Array.isArray(body.cells) ? body.cells : [];
+        const removals = Array.isArray(body.remove) ? body.remove : [];
         const seq = this.ensureSequencer();
-        if (seq.scope !== CATALOG_SCOPE || cells.length === 0 || cells.length > 16) {
-          throw netError("E_INVARG", "definition repair requires 1..16 catalog cells", { scope: seq.scope, count: cells.length });
+        const count = cells.length + removals.length;
+        if (seq.scope !== CATALOG_SCOPE || count === 0 || count > 32) {
+          throw netError("E_INVARG", "definition repair requires 1..32 catalog changes", { scope: seq.scope, count });
         }
         const keys = new Set<string>();
         for (const cell of cells) {
           if (!cell || typeof cell !== "object" || typeof cell.kind !== "string" ||
               typeof cell.object !== "string" || typeof cell.name !== "string" ||
               !Object.prototype.hasOwnProperty.call(cell, "value")) {
-            throw netError("E_INVARG", "definition repair requires complete verb cells");
+            throw netError("E_INVARG", "definition repair requires complete definition cells");
           }
           const key = cellKey(cell.kind, cell.object, cell.name);
           const page = cell.value as Record<string, unknown> | null;
-          if (cell.kind !== "verb_bytecode" || !cell.object.startsWith("$") || !cell.name ||
-              !page || typeof page !== "object" || Array.isArray(page) || page.name !== cell.name ||
-              !seq.store.has(key) || keys.has(key)) {
-            throw netError("E_INVARG", "definition repair accepts unique existing bootstrap verb pages only", { key });
+          const installedClass = seq.store.has(cellKey("object_lineage", cell.object));
+          const validVerb = cell.kind === "verb_bytecode" && page?.name === cell.name && seq.store.has(key);
+          const def = page && typeof page === "object" && !Array.isArray(page) ? page.def : null;
+          const validProperty = cell.kind === "property_cell" && def !== null && typeof def === "object" &&
+            !Array.isArray(def) && (def as Record<string, unknown>).name === cell.name;
+          if (!cell.object.startsWith("$") || !cell.name || !installedClass ||
+              !page || typeof page !== "object" || Array.isArray(page) ||
+              (!validVerb && !validProperty) || keys.has(key)) {
+            throw netError("E_INVARG", "definition repair accepts unique bootstrap definition pages only", { key });
+          }
+          keys.add(key);
+        }
+        for (const cell of removals) {
+          if (!cell || typeof cell !== "object" || typeof cell.kind !== "string" ||
+              typeof cell.object !== "string" || typeof cell.name !== "string") {
+            throw netError("E_INVARG", "definition removal requires complete definition identities");
+          }
+          const key = cellKey(cell.kind, cell.object, cell.name);
+          // An absent page is accepted so the signed operator operation is
+          // idempotent. The class lineage must exist, which keeps removals on
+          // the installed bootstrap surface even on an empty replay.
+          if ((cell.kind !== "verb_bytecode" && cell.kind !== "property_cell") ||
+              !cell.object.startsWith("$") || !cell.name ||
+              !seq.store.has(cellKey("object_lineage", cell.object)) || keys.has(key)) {
+            throw netError("E_INVARG", "definition removal accepts unique bootstrap definition identities only", { key });
           }
           keys.add(key);
         }
         const repaired = this.discardSeqOnThrow(() => this.store.transaction(() => {
-          const result = seq.operatorRepairDefinitions(cells);
+          const result = seq.operatorRepairDefinitions(cells, removals);
           if (result.status === "applied") {
             const subscribers = sqlRows<{ destination: string; delivery_seq: number }>(
               this.state.storage.sql.exec("SELECT destination, delivery_seq FROM net_scope_subscribers WHERE role = 'fanout'")
@@ -1054,6 +1078,7 @@ export class NetScopeDO {
                 scope: seq.scope,
                 seq: result.head.seq,
                 cells: result.cells,
+                removed_cells: result.removed,
                 observations: []
               });
             }
@@ -1061,7 +1086,14 @@ export class NetScopeDO {
           return result;
         }));
         this.armOutboxRetryAlarm();
-        return json({ ok: true, scope: seq.scope, status: repaired.status, head: repaired.head, changed: repaired.cells.map((cell) => cell.key) });
+        return json({
+          ok: true,
+          scope: seq.scope,
+          status: repaired.status,
+          head: repaired.head,
+          changed: [...repaired.cells.map((cell) => cell.key), ...repaired.removed].sort(),
+          removed: repaired.removed
+        });
       }
       if (request.method === "POST" && url.pathname === "/net/activate") {
         // The NC1 activation state machine as a DEDICATED operator op

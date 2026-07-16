@@ -151,6 +151,38 @@ test("entering Tasks keeps workspace and chat component surfaces separate and re
   await context.close();
 });
 
+test("Outliner chat look uses the edge-based definition in the real workerd SPA", async ({ browser }, testInfo) => {
+  test.setTimeout(120_000);
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const pageErrors: string[] = [];
+  const serverErrors: string[] = [];
+  page.on("pageerror", (error) => pageErrors.push(`${error.name}: ${error.message}`));
+  page.on("response", (response) => {
+    if (response.status() >= 500) serverErrors.push(`${response.status()} ${response.url()}`);
+  });
+  await openSpa(page, credentials.alice);
+
+  await page.getByRole("button", { name: "Outliner" }).click();
+  const tree = page.locator("woo-outliner-tree[data-outliner-tree]");
+  await expect(tree).toBeVisible({ timeout: 30_000 });
+  const panel = tree.locator("woo-space-chat-panel[data-space-chat-panel]");
+  const input = panel.locator("[data-space-chat-input]");
+  await expect(input).toBeVisible({ timeout: 30_000 });
+  await input.fill("look");
+  await input.press("Enter");
+  await expect(panel).toContainText(/Outline has \d+ items?\./, { timeout: 30_000 });
+  await expect(panel).not.toContainText("object_tree_rows expects");
+  expect(pageErrors).toEqual([]);
+  expect(serverErrors).toEqual([]);
+  expectNoLegacyRequests(page);
+
+  const screenshot = testInfo.outputPath("outliner-look-workerd.png");
+  await page.screenshot({ path: screenshot, fullPage: true });
+  await testInfo.attach("outliner-look-workerd", { path: screenshot, contentType: "image/png" });
+  await context.close();
+});
+
 test("Dubspace hydrates its persisted percussion pattern and repaints committed step changes", async ({ browser }) => {
   test.setTimeout(120_000);
   const context = await browser.newContext();

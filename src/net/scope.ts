@@ -48,6 +48,7 @@ export type OperatorDefinitionRepair = {
   status: "applied" | "empty";
   head: ScopeHead;
   cells: Cell[];
+  removed: string[];
 };
 
 export type CommitSubmit = {
@@ -379,16 +380,27 @@ export class ScopeSequencer {
    * pages. Ordinary turns may never mutate catalog definitions (CO15); this
    * explicit path advances the catalog owner head, stamps the replacement
    * pages authoritatively, and records a tail entry so fanout/catch-up observe
-   * one ordered migration event. The Worker shell restricts inputs to existing
-   * `$`-object verb_bytecode cells before calling this method. */
-  operatorRepairDefinitions(cells: Array<Pick<Cell, "kind" | "object" | "name" | "value">>): OperatorDefinitionRepair {
+   * one ordered migration event. The Worker shell restricts inputs to bundled
+   * `$`-object verb/property definition pages before calling this method. */
+  operatorRepairDefinitions(
+    cells: Array<Pick<Cell, "kind" | "object" | "name" | "value">>,
+    removals: Array<Pick<Cell, "kind" | "object" | "name">> = []
+  ): OperatorDefinitionRepair {
     const changed = cells.filter((cell) => {
       const existing = this.store.get(cellKey(cell.kind, cell.object, cell.name));
       return existing?.version !== cellVersion(cell.value);
     });
-    if (changed.length === 0) return { status: "empty", head: this.headState, cells: [] };
+    const removed = removals
+      .map((cell) => cellKey(cell.kind, cell.object, cell.name))
+      .filter((key) => this.store.has(key));
+    if (changed.length === 0 && removed.length === 0) {
+      return { status: "empty", head: this.headState, cells: [], removed: [] };
+    }
 
-    const marker = `operator_definition_repair:${cellVersion(changed.map((cell) => [cell.kind, cell.object, cell.name ?? null, cell.value]))}`;
+    const marker = `operator_definition_repair:${cellVersion({
+      replacements: changed.map((cell) => [cell.kind, cell.object, cell.name ?? null, cell.value]),
+      removals: removed
+    })}`;
     const priorHead = this.headState;
     const nextHead: ScopeHead = {
       seq: priorHead.seq + 1,
@@ -402,7 +414,8 @@ export class ScopeSequencer {
       value: cell.value,
       stamp: nextStamp
     }));
-    const touched = committed.map((cell) => cell.key).sort();
+    for (const key of removed) this.store.delete(key);
+    const touched = [...committed.map((cell) => cell.key), ...removed].sort();
     this.headState = nextHead;
     const tailEntry: TailEntry = {
       seq: nextHead.seq,
@@ -417,12 +430,13 @@ export class ScopeSequencer {
     if (durable) {
       durable.transaction(() => {
         for (const cell of committed) durable.writeCell(cell);
+        for (const key of removed) durable.deleteCell(key);
         durable.writeMeta({ scope: this.scope, catalog_epoch: this.catalogEpoch, head: this.headState });
         durable.appendTail(tailEntry);
         durable.trimTail(this.options.tailLimit);
       });
     }
-    return { status: "applied", head: this.headState, cells: committed };
+    return { status: "applied", head: this.headState, cells: committed, removed };
   }
 
   /**

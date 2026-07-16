@@ -41,6 +41,11 @@ function netState(name: string): { state: NetScopeDurableState & NetGatewayDurab
   return { state, alarms, close: () => fake.close() };
 }
 
+function durableRows(state: NetScopeDurableState & NetGatewayDurableState, query: string, ...bindings: unknown[]): unknown[] {
+  const sql = state.storage.sql as { exec(statement: string, ...values: unknown[]): { toArray(): unknown[] } };
+  return sql.exec(query, ...bindings).toArray();
+}
+
 type Fetchable = { fetch(request: Request): Promise<Response> | Response };
 
 /** Signed call helper — the same internal-auth surface production uses. */
@@ -608,6 +613,113 @@ describe("NetScopeDO over fake-DO storage", () => {
 });
 
 describe("NetGatewayDO end-to-end over fake-DO", () => {
+  it("treats a full catalog pull as exact for definition pages missed while offline", async () => {
+    const scopeEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET };
+    const catalog = makeScope("catalog-exact", scopeEnv);
+    await call(catalog.instance, scopeEnv, "/seed", {
+      scope: CATALOG_SCOPE,
+      catalog_epoch: EPOCH,
+      cells: [
+        {
+          kind: "object_lineage",
+          object: "$outliner",
+          value: { parent: null, owner: "$wiz", name: "$outliner", anchor: null, flags: {} }
+        },
+        {
+          kind: "verb_bytecode",
+          object: "$outliner",
+          name: "list_items",
+          value: { name: "list_items", bytecode: [{ op: "RETURN", value: [] }], arg_spec: { args: [] } }
+        },
+        {
+          kind: "property_cell",
+          object: "$outliner",
+          name: "current_slot",
+          value: {
+            value: null,
+            def: { name: "current_slot", defaultValue: null, typeHint: "obj|null", owner: "$wiz", perms: "r", version: 1 }
+          }
+        }
+      ]
+    });
+
+    const gatewayState = netState("gateway-catalog-exact");
+    const gatewayEnv: NetGatewayEnv = {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_RESOLVE: (destination) => {
+        if (destination === "scope:catalog") return catalog.instance;
+        throw new Error(`unexpected destination ${destination}`);
+      }
+    };
+    const gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
+    const staleKey = "verb_bytecode:$outliner:_siblings_ordered";
+    const stalePropertyKey = "property_cell:$outliner:parent";
+    const ordinaryPropertyKey = "property_cell:$outliner:runtime_marker";
+    expect((await call<{ applied: boolean }>(gateway, gatewayEnv, "/fanout", {
+      scope: CATALOG_SCOPE,
+      seq: 1,
+      cells: [
+        {
+          key: staleKey,
+          kind: "verb_bytecode",
+          object: "$outliner",
+          name: "_siblings_ordered",
+          value: { name: "_siblings_ordered", bytecode: [{ op: "RETURN", value: [] }], arg_spec: { args: [] } },
+          version: "stale-v1",
+          provenance: "authoritative",
+          stamp: { scope_head: "1:stale", catalog_epoch: EPOCH }
+        },
+        {
+          key: stalePropertyKey,
+          kind: "property_cell",
+          object: "$outliner",
+          name: "parent",
+          value: {
+            value: null,
+            def: { name: "parent", defaultValue: null, typeHint: "obj|null", owner: "$wiz", perms: "r", version: 1 }
+          },
+          version: "stale-property-v1",
+          provenance: "authoritative",
+          stamp: { scope_head: "1:stale", catalog_epoch: EPOCH }
+        },
+        {
+          key: ordinaryPropertyKey,
+          kind: "property_cell",
+          object: "$outliner",
+          name: "runtime_marker",
+          value: { value: "keep-me" },
+          version: "ordinary-property",
+          provenance: "authoritative",
+          stamp: { scope_head: "1:stale", catalog_epoch: EPOCH }
+        }
+      ],
+      observations: []
+    })).applied).toBe(true);
+    expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", staleKey)).toHaveLength(1);
+    expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", stalePropertyKey)).toHaveLength(1);
+
+    const pulled = await call<{ source: string; installed: number }>(gateway, gatewayEnv, "/pull", {
+      scope: CATALOG_SCOPE,
+      destination: "scope:catalog"
+    });
+    expect(pulled).toMatchObject({ source: "live", installed: 3 });
+    expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", staleKey)).toHaveLength(0);
+    expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", stalePropertyKey)).toHaveLength(0);
+    expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", ordinaryPropertyKey)).toHaveLength(1);
+    expect(durableRows(gatewayState.state,
+      "SELECT body FROM net_gateway_cell WHERE key = 'verb_bytecode:$outliner:list_items'"
+    )).toHaveLength(1);
+
+    // Cold hydration must not resurrect the deleted page from SQLite.
+    const restarted = new NetGatewayDO(gatewayState.state, gatewayEnv);
+    await call(restarted, gatewayEnv, "/pull", { scope: CATALOG_SCOPE, destination: "scope:catalog" });
+    expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", staleKey)).toHaveLength(0);
+    expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", stalePropertyKey)).toHaveLength(0);
+    expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", ordinaryPropertyKey)).toHaveLength(1);
+    catalog.close();
+    gatewayState.close();
+  });
+
   it("pulls a view, plans and submits a real turn, installs accepted cells; fanout no-ops replays", async () => {
     const scopeEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET };
     const scope = makeScope("room-a", scopeEnv);
@@ -679,10 +791,25 @@ describe("NetGatewayDO end-to-end over fake-DO", () => {
     expect((await call<{ applied: boolean }>(gateway, gatewayEnv, "/fanout", body)).applied).toBe(true);
     expect((await call<{ applied: boolean }>(gateway, gatewayEnv, "/fanout", body)).applied).toBe(false);
 
+    // Definition retirement uses the same ordered fanout stream. The removal
+    // must delete durable gateway state, not merely hide it in this instance.
+    const removal = {
+      scope: "room-a",
+      seq: 2,
+      cells: [],
+      removed_cells: ["property_cell:#thing:label"],
+      observations: []
+    };
+    expect((await call<{ applied: boolean }>(gateway, gatewayEnv, "/fanout", removal)).applied).toBe(true);
+    expect(durableRows(gatewayState.state,
+      "SELECT body FROM net_gateway_cell WHERE key = 'property_cell:#thing:label'"
+    )).toHaveLength(0);
+
     // Restart the gateway over the same storage: the high-water survives,
     // so the replay is still a no-op (durable CO2.5 at the receiver).
     const gateway2 = new NetGatewayDO(gatewayState.state, gatewayEnv);
     expect((await call<{ applied: boolean }>(gateway2, gatewayEnv, "/fanout", body)).applied).toBe(false);
+    expect((await call<{ applied: boolean }>(gateway2, gatewayEnv, "/fanout", removal)).applied).toBe(false);
     scope.close();
   });
 
