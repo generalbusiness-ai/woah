@@ -3896,7 +3896,7 @@ function mountDubspaceComponent() {
     void ensureScopedOverlayForTab("dubspace").then(() => {
       if (state.tab === "dubspace") render();
     }).catch((error) => {
-      console.error("dubspace controls hydration failed", error);
+      reportDubspaceHydrationError(error);
     });
   }
   const lines = chatLinesForSpace(spaceId);
@@ -4036,8 +4036,15 @@ function refreshDubspaceOverlayAfterEntry(): void {
     // Leaving Dubspace can revoke presence while its entry hydration is still
     // in flight. That abandoned read is expected; only surface failures while
     // the workspace still needs the data.
-    if (state.tab === "dubspace") console.error("dubspace controls hydration failed", error);
+    reportDubspaceHydrationError(error);
   });
+}
+
+function reportDubspaceHydrationError(error: unknown): void {
+  const space = dubspaceSpace();
+  if (state.tab === "dubspace" && actorPresentInSpace(space, dubspacePresentActors())) {
+    console.error("dubspace controls hydration failed", error);
+  }
 }
 
 function enterDubspace() {
