@@ -95,6 +95,14 @@ async function openSpa(page: Page, apiKey: string): Promise<void> {
   await expect(page.locator("[data-chat-input]")).toBeVisible({ timeout: 30_000 });
 }
 
+async function openGuestSpa(page: Page): Promise<void> {
+  trackLegacyRequests(page);
+  await page.goto(`${base}/?net=1`);
+  await expect(page.locator("[data-login-guest]")).toBeVisible({ timeout: 30_000 });
+  await page.locator("[data-login-guest]").click();
+  await expect(page.locator("[data-chat-input]")).toBeVisible({ timeout: 30_000 });
+}
+
 test("the real SPA over the net path: alice's chat line reaches bob's browser", async ({ browser }) => {
   test.setTimeout(120_000);
   const contextA = await browser.newContext();
@@ -196,6 +204,12 @@ test("Outliner hydrates a complete nested tree in a fresh real-workerd session",
   const childText = `workerd-child-${suffix}`;
   const addInput = tree.locator("[data-outliner-add] input[name=text]");
   await expect(addInput).toBeVisible({ timeout: 30_000 });
+  // Entry intentionally retries companion-chat focus through 900 ms so a
+  // freshly mounted custom element receives focus after its first renders.
+  // Let that lifecycle settle before testing Enter in the item composer;
+  // otherwise the delayed focus can move the keystroke into companion chat.
+  await expect(tree.locator("woo-space-chat-panel[data-space-chat-panel]")).toBeVisible({ timeout: 30_000 });
+  await page.waitForTimeout(1_000);
   await addInput.fill(parentText);
   await addInput.press("Enter");
   const parentRow = tree.locator("[data-outliner-row]").filter({ hasText: parentText }).first();
@@ -397,20 +411,19 @@ test("tool-space panels over net: alice's pinboard note renders on bob's board (
 test("Chat returns from mounted nested tools to their parent room", async ({ browser }) => {
   test.setTimeout(180_000);
   const pageErrors: string[] = [];
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  page.on("pageerror", (error) => pageErrors.push(`${error.name}: ${error.message}`));
+  // Use a fresh door principal so this navigation gate measures its own turn
+  // and read traffic rather than the earlier carried actors' cumulative rate
+  // budget. One session also reproduces the hosted Dubspace → Chat → Outliner
+  // → Chat sequence that originally exposed the intermittent projection gap.
+  await openGuestSpa(page);
 
-  // Keep this cold-session navigation regression last. Each principal's Net
-  // read budget is intentionally bounded, and adding cold boots before the
-  // heavier Outliner/Dubspace completeness scenarios would test cumulative
-  // fixture traffic rather than navigation behavior.
   for (const tool of [
-    { name: "Dubspace", workspace: "woo-dubspace-workspace[data-dubspace-workspace]", settled: "woo-space-chat-panel[data-space-chat-panel]", apiKey: credentials.alice },
-    { name: "Outliner", workspace: "woo-outliner-tree[data-outliner-tree]", settled: "[data-outliner-add] input[name=text]", apiKey: credentials.bob }
+    { name: "Dubspace", workspace: "woo-dubspace-workspace[data-dubspace-workspace]", settled: "woo-space-chat-panel[data-space-chat-panel]" },
+    { name: "Outliner", workspace: "woo-outliner-tree[data-outliner-tree]", settled: "[data-outliner-add] input[name=text]" }
   ]) {
-    const context = await browser.newContext();
-    const page = await context.newPage();
-    page.on("pageerror", (error) => pageErrors.push(`${tool.name}: ${error.name}: ${error.message}`));
-    await openSpa(page, tool.apiKey);
-
     await page.getByRole("button", { name: tool.name, exact: true }).click();
     const workspace = page.locator(tool.workspace);
     await expect(workspace).toBeVisible({ timeout: 30_000 });
@@ -424,12 +437,18 @@ test("Chat returns from mounted nested tools to their parent room", async ({ bro
     await expect(page.locator(".toolbar h1")).toHaveText("Living Room", { timeout: 30_000 });
     const chatInput = page.locator("[data-chat-input]");
     await expect(chatInput).toBeVisible({ timeout: 30_000 });
-    await chatInput.fill("look");
-    await chatInput.press("Enter");
-    await expect(page.locator(".chat-feed")).toContainText("A bright, open living room", { timeout: 30_000 });
-    expectNoLegacyRequests(page);
-    await context.close();
+    // The client-origin turn limiter is deliberately burst-bounded. Keep this
+    // navigation test about routing/projection convergence rather than issuing
+    // the next human action inside the prior turn's one-second rate window.
+    await page.waitForTimeout(1_100);
   }
 
+  await expect(page.locator(".chat-feed .chat-line").filter({ hasText: /closes Outline\./ })).toHaveCount(1);
+  const chatInput = page.locator("[data-chat-input]");
+  await chatInput.fill("look");
+  await chatInput.press("Enter");
+  await expect(page.locator(".chat-feed")).toContainText("A bright, open living room", { timeout: 30_000 });
   expect(pageErrors).toEqual([]);
+  expectNoLegacyRequests(page);
+  await context.close();
 });

@@ -23,7 +23,7 @@ import { installedDubspaceSupportsControlsView, isAgedDubspaceControlsError, rea
 import { CoalescedViewHydrator, createWooClientFramework, displayTextCacheKey, escapeHtml, liveProjectionKey, ProjectionFieldFiller, pruneDisplayTextCaches, readDisplayTextCache, writeDisplayTextCache, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
 import { isPinboardObservation } from "./pinboard-observation";
 import { clearProvisionalChatLines, provisionalChatErrorLine, upsertProvisionalChatLine } from "./provisional-chat";
-import { advanceProjectionCursor, idsFromRefsOrSummaries, presentActorsFromObservation, scopedHerePresentActors, scopedModelWithMoveResult, type ScopedProjectionStateModel } from "./scoped-projection";
+import { advanceProjectionCursor, idsFromRefsOrSummaries, presentActorsFromObservation, resolveOptionalRoomContents, scopedHerePresentActors, scopedModelWithMoveResult, type ScopedProjectionStateModel } from "./scoped-projection";
 import { settleInvalidatedOptimisticTurns, type V2LocalTurnInvalidatedMessage } from "./v2-browser-optimistic-lifecycle";
 import { v2ProjectionSnapshotFromMessage, v2TurnResultRoute, type V2AppliedFrameMessage, type V2ProjectionMessage, type V2TurnResultMessage } from "./v2-browser-messages";
 import { sessionActiveScopeFromRecord } from "../core/types";
@@ -2107,11 +2107,6 @@ async function refreshNetRoomProjection(): Promise<void> {
     // A move may complete while these reads are in flight.  Never install the
     // old room as current after the accepted result advanced netCurrentRoom.
     if (room !== netCurrentRoom) return;
-    const contentIds = Array.from(new Set(contentRows
-      .map((row) => row.member)
-      .filter((id): id is string => typeof id === "string" && id.length > 0 && id !== state.actor)));
-    const contents = (await Promise.all(contentIds.map((id) => fetchNetObjectSummary(id, ["description", "aliases", "features"]))))
-      .filter((item): item is Record<string, unknown> => Boolean(item));
     const roster = presenceRows.map((row) => {
       const body = row.body && typeof row.body === "object" && !Array.isArray(row.body)
         ? row.body as Record<string, unknown>
@@ -2119,6 +2114,13 @@ async function refreshNetRoomProjection(): Promise<void> {
       const id = typeof body.player === "string" ? body.player : row.member;
       return { ...body, id, name: typeof body.name === "string" ? body.name : id };
     });
+    // Contents are a moving neighborhood, not part of the room's identity.
+    // A peer or portable object can leave after the relation read but before
+    // its presence-authorized cells arrive. Keep the readable room/roster and
+    // omit that stale optional row instead of discarding the whole projection.
+    const contents = await resolveOptionalRoomContents(contentRows, roster, (id) =>
+      fetchNetObjectSummary(id, ["description", "aliases", "features"])
+    );
     const here = {
       id: room,
       name: String(roomSummary?.name ?? room),
@@ -4377,6 +4379,7 @@ function applyScopedMoveResult(result: any) {
   if (!result || typeof result !== "object" || Array.isArray(result)) return;
   if (!state.scopedProjection) state.scopedProjection = { inventory: [], overlays: {} };
   const movedRoom = typeof result.room === "string" ? result.room : "";
+  const netRoomChanged = Boolean(movedRoom && netMode() && movedRoom !== netCurrentRoom);
   // Net observations usually advance this anchor, but generic $space:leave
   // emits `left` without a destination.  Its authoritative result still names
   // the actor's new room, so consume that result instead of leaving Chat
@@ -4388,6 +4391,10 @@ function applyScopedMoveResult(result: any) {
     syncV2BrowserWorkerScope(movedRoom || undefined);
   }
   applyScopedProjectionModel();
+  // Hosted REST replies can settle before the corresponding WebSocket
+  // movement observation. If the result advanced the room first, the later
+  // observation sees no change and will not start hydration, so do it here.
+  if (netRoomChanged && state.tab === "chat") void refreshNetRoomProjection();
   if (movedRoom && state.tab === "chat") syncUrlFromCurrentState("replace");
 }
 

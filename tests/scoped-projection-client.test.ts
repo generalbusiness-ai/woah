@@ -4,12 +4,34 @@ import {
   advanceProjectionCursor,
   idsFromRefsOrSummaries,
   presentActorsFromObservation,
+  resolveOptionalRoomContents,
   scopedHerePresentActors,
   scopedModelWithMoveResult,
   type ScopedProjectionStateModel
 } from "../src/client/scoped-projection";
 
 describe("scoped client projection helpers", () => {
+  it("keeps room assembly when an optional content row becomes unreadable", async () => {
+    const reads: string[] = [];
+    const contents = await resolveOptionalRoomContents(
+      [
+        { member: "actor_peer" },
+        { member: "the_couch" },
+        { member: "the_couch" },
+        { member: "moving_mug" }
+      ],
+      [{ id: "actor_peer", name: "Peer" }],
+      async (id) => {
+        reads.push(id);
+        if (id === "moving_mug") throw new Error("cell not readable in the caller's presence");
+        return { id };
+      }
+    );
+
+    expect(reads).toEqual(["the_couch", "moving_mug"]);
+    expect(contents).toEqual([{ id: "the_couch" }]);
+  });
+
   it("applies move-result here snapshots without mutating the original /api/me snapshot", () => {
     const me = {
       session: { id: "session_1", actor: "guest_1", active_scope: "room_a", current_location: "room_a", all_locations: ["room_a"] },

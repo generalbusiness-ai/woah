@@ -109,7 +109,14 @@ function crossScopeMoveSubmit(base: ScopeHead): CommitSubmit {
     creates: [],
     moves: [{ object: "#actor", from: null, to: "#room" }],
     sessionScopeTransition: { session: "s1", actor: "#actor", from: null, to: "#room" },
-    observations: [],
+    observations: [
+      {
+        type: "entered",
+        source: "#room",
+        actor: "#actor",
+        text: "actor enters room"
+      }
+    ],
     logicalInputs: [],
     untrackedEffects: [],
     complete: true,
@@ -244,9 +251,19 @@ describe("CO13 relations over the DO shells", () => {
     // (from_scope, seq) identity and applied it owner-sequenced.
     const relateCalls = roomRecorder.calls.filter((c) => c.path === "/net/relate");
     expect(relateCalls).toHaveLength(1);
-    const relateBody = relateCalls[0].body as { from_scope: string; seq: number; deltas: RelationDelta[] };
+    const relateBody = relateCalls[0].body as {
+      from_scope: string;
+      seq: number;
+      deltas: RelationDelta[];
+      observations?: unknown[];
+      turn_id?: string;
+    };
     expect(relateBody.from_scope).toBe(CLUSTER_SCOPE);
     expect(relateBody.seq).toBe(1);
+    expect(relateBody.turn_id).toBe("relations-move-1");
+    expect(relateBody.observations).toEqual([
+      expect.objectContaining({ type: "entered", source: "#room", actor: "#actor" })
+    ]);
     expect(scopeRelationRows(room.state).map((r) => r.key)).toEqual([
       "relation:contents:#room:#actor",
       "relation:session_presence:#room:s1"
@@ -258,10 +275,21 @@ describe("CO13 relations over the DO shells", () => {
     // FanoutBody.relations at the room's advanced seq…
     const fanoutCalls = gatewayRecorder.calls.filter((c) => c.path === "/net/fanout");
     expect(fanoutCalls).toHaveLength(1);
-    const fanBody = fanoutCalls[0].body as { scope: string; seq: number; cells: unknown[]; relations?: RelationDelta[] };
+    const fanBody = fanoutCalls[0].body as {
+      scope: string;
+      seq: number;
+      cells: unknown[];
+      observations?: unknown[];
+      relations?: RelationDelta[];
+      turn_id?: string;
+    };
     expect(fanBody.scope).toBe(ROOM_SCOPE);
     expect(fanBody.seq).toBe(1);
     expect(fanBody.cells).toEqual([]);
+    expect(fanBody.turn_id).toBe("relations-move-1");
+    expect(fanBody.observations).toEqual([
+      expect.objectContaining({ type: "entered", source: "#room", actor: "#actor" })
+    ]);
     expect(fanBody.relations).toHaveLength(2);
     // …and the gateway's client-read primitive serves the roster.
     const contents = await call<RelationRead>(gateway, gatewayEnv, `/relation?relation=contents&owner=${encodeURIComponent("#room")}`);

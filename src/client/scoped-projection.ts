@@ -28,6 +28,27 @@ export function scopedHerePresentActors(here: any): string[] {
   return idsFromRefsOrSummaries(Array.isArray(here?.roster) ? here.roster : Array.isArray(here?.present_actors) ? here.present_actors : []);
 }
 
+/** Resolve the optional object rows surrounding a room without coupling the
+ * room's identity to a moment-in-time contents relation. Presence actors belong
+ * to the roster, and any other member may move before its authorized read
+ * completes; either case must not make the room projection disappear. */
+export async function resolveOptionalRoomContents<T>(
+  contentRows: readonly { member?: unknown }[],
+  roster: readonly unknown[],
+  read: (id: string) => Promise<T | undefined>
+): Promise<Awaited<T>[]> {
+  const rosterIds = new Set(idsFromRefsOrSummaries([...roster]));
+  const contentIds = Array.from(new Set(contentRows
+    .map((row) => row.member)
+    .filter((id): id is string => typeof id === "string" && id.length > 0 && !rosterIds.has(id))));
+  const summaries = await Promise.allSettled(contentIds.map((id) => read(id)));
+  const resolved: Awaited<T>[] = [];
+  for (const item of summaries) {
+    if (item.status === "fulfilled" && item.value !== undefined) resolved.push(item.value as Awaited<T>);
+  }
+  return resolved;
+}
+
 // `who` puts roster at the top level of the observation; `looked` (built by
 // chat's `:look_at`) nests the room view — including its roster — under
 // `look`. The look-derived list is only meaningful

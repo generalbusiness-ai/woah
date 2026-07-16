@@ -804,6 +804,7 @@ export class NetScopeDO {
           seq: number;
           deltas: RelationDelta[];
           observations?: unknown[];
+          turn_id?: string;
         };
         const related = this.relate(body);
         // Refan from a fresh alarm event; never extend the incoming
@@ -1831,7 +1832,11 @@ export class NetScopeDO {
         seq: reply.head.seq,
         cells: [],
         observations: roomObservations,
-        relations: entry.deltas
+        relations: entry.deltas,
+        // The room refan is still part of this client turn. Preserve the
+        // idempotency key so the submitter can dedupe the cross-scope echo
+        // against the same observations carried on its turn reply.
+        turn_id: submit.idempotency_key
       });
     }
     for (const rider of Object.values(riderDestinations)) {
@@ -2127,15 +2132,17 @@ export class NetScopeDO {
               });
             } else if (route === "/relate") {
               // CO13: the row's FanoutBody carries the deltas; the wire
-              // shape is (from_scope, seq, deltas[, observations]) — the
+              // shape is (from_scope, seq, deltas[, observations, turn_id]) — the
               // receiver's idempotency key plus its application input.
               // Observations (phase i): the room-addressed announcements
               // riding with the presence delta (see enqueueDeliveries).
+              // turn_id preserves submitter echo dedupe across this hop.
               await this.host.rpc(row.destination, "/relate", {
                 from_scope: row.body.scope,
                 seq: row.body.seq,
                 deltas: row.body.relations ?? [],
-                ...(row.body.observations.length > 0 ? { observations: row.body.observations } : {})
+                ...(row.body.observations.length > 0 ? { observations: row.body.observations } : {}),
+                ...(row.body.turn_id !== undefined ? { turn_id: row.body.turn_id } : {})
               });
             } else if (route === "/plan-scheduled") {
               // CO16: deliver the scheduled turn to the planner gateway,
@@ -2463,6 +2470,7 @@ export class NetScopeDO {
     seq: number;
     deltas: RelationDelta[];
     observations?: unknown[];
+    turn_id?: string;
   }): { applied: boolean; changed: number; head: ScopeHead } {
     const seq = this.ensureSequencer();
     return this.discardSeqOnThrow(() => this.store.transaction(() => {
@@ -2494,6 +2502,7 @@ export class NetScopeDO {
             // one sequenced event. Redelivered relates no-op above, so
             // the push stays at-most-once.
             observations: body.observations ?? [],
+            ...(body.turn_id !== undefined ? { turn_id: body.turn_id } : {}),
             relations: applied
           });
         }

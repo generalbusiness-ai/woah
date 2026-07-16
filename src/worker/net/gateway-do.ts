@@ -1401,7 +1401,13 @@ export class NetGatewayDO {
         // the outbox remains crash recovery and later no-ops at the owner.
         let relationExpediteDegraded = false;
         try {
-          await this.expediteForeignRelations(reply, relateDestinations, planned.transcript.observations, structure);
+          await this.expediteForeignRelations(
+            reply,
+            relateDestinations,
+            planned.transcript.observations,
+            request.idempotency_key,
+            structure
+          );
         } catch (err) {
           // Acceptance is the durability boundary. The scope committed the
           // same relation fact to its outbox, so expedite failure may delay a
@@ -3913,6 +3919,7 @@ export class NetGatewayDO {
     reply: Extract<CommitReply, { status: "accepted" }>,
     destinations: Record<string, { destination: string; objects: string[] }>,
     observations: readonly unknown[],
+    turnId?: string,
     structure?: TurnStructure
   ): Promise<void> {
     for (const entry of reply.relations_foreign ?? []) {
@@ -3930,7 +3937,8 @@ export class NetGatewayDO {
         from_scope: reply.scope,
         seq: reply.head.seq,
         deltas: entry.deltas,
-        observations: observationsForRelationOwners(observations, entry.deltas)
+        observations: observationsForRelationOwners(observations, entry.deltas),
+        ...(turnId !== undefined ? { turn_id: turnId } : {})
       });
       if (structure) await structure.rpc(deliver, { mandatory: true, phase: "presence_fence" });
       else await deliver();

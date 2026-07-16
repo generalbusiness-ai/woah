@@ -160,7 +160,7 @@ export type NetFeedObservationEvent = {
   /** The scope's committed seq (reply.head.seq / frame.seq); null when
    * the reply did not carry a head (defensive — it always should). */
   seq: number | null;
-  /** The client turn id, present on self events only. */
+  /** The client turn id when the reply/fanout carrier provides it. */
   turn_id?: string;
   observation: Record<string, unknown>;
 };
