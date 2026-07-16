@@ -716,9 +716,39 @@ Other component-owned surfaces:
   client doesn't need to track slot state.
 - Embedded chat mount point.
 
-Client wire path: pinboard/kanban-pattern. `list_items` for hydration;
-incremental observations applied as reducers. v2 commit plane for
-mutations; v2 direct plane for read-only hydration.
+Client wire path: pinboard/kanban-pattern. Generic neighborhood
+projection is an immediate-paint accelerator, not a completeness
+signal: a newly opened session can legitimately have zero or only some
+item refs. Each mounted outliner therefore performs one coalesced,
+server-authoritative `list_items` read for the whole tree, even when
+the projected rows already carry text. Accepted structural
+observations update the DOM immediately and advance the hydration
+revision; an older in-flight read is ignored and a new read verifies
+the post-mutation tree.
+
+The v2 room-owned `__ordered_edge {parent, rank}` remains the sole
+persisted structural authority. While a committed add/move observation
+is ahead of generic projection, the client reducer stores its
+`parent_id` and derived `index` in catalog-owned
+`catalogState.outliner_tree`. It must not patch the retired v1
+per-item `parent` / `position` properties. The component consumes that
+overlay until the authoritative `list_items` result arrives, which
+keeps a newly-created child nested rather than briefly or permanently
+promoting it to the root.
+
+Mutations use the v2 commit plane; the whole-tree hydration uses the v2
+direct plane with an authoritative server read.
+
+Presence follows the same completeness rule. The cheap subscriber
+projection paints immediately, but once the host confirms that the
+actor has entered and opens the companion panel, the component performs
+one coalesced, server-authoritative `room_roster` read. Enter/leave
+observations update the panel immediately and advance its roster
+hydration revision so a pre-entry empty read cannot win later. Because
+owner presence can become visible to the host one cache turn before
+`room_roster` catches up, an empty post-entry read temporarily shows
+the current actor (never the contradictory "No one is here") and makes
+a bounded set of authoritative retries to recover the full roster.
 
 ## Frontend implications
 

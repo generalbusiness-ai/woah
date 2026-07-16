@@ -667,7 +667,7 @@ test("outliner space chat look renders without a builtin contract error", async 
   await testInfo.attach("outliner-look-localdev", { path: screenshot, contentType: "image/png" });
 });
 
-test("outliner displays items added via the UI", async ({ page }) => {
+test("outliner displays complete nested items added via the UI", async ({ page }, testInfo) => {
   // Regression: item text can be absent from generic projection even when the
   // row structure is present, because $note readability is catalog-defined.
   // The tree must preserve observation-sourced text across projection refreshes
@@ -710,6 +710,7 @@ test("outliner displays items added via the UI", async ({ page }) => {
   await childInput.press("Enter");
   const childRow = tree.locator(".outliner-row").filter({ hasText: childText });
   await expect(childRow).toHaveCount(1, { timeout: 5_000 });
+  await expect(childRow.first()).toHaveAttribute("style", /--indent:\s*20px/);
   const childId = await childRow.first().getAttribute("data-id");
   expect(childId, "new child row id").toBeTruthy();
 
@@ -746,6 +747,12 @@ test("outliner displays items added via the UI", async ({ page }) => {
     }, { timeout: 10_000 }).toBe(text);
   }
   await expect(reloadedTree.locator(".outliner-row").filter({ hasText: "(empty)" })).toHaveCount(0);
+  await expect(reloadedTree.locator(".outliner-row").filter({ hasText: childText }).first()).toHaveAttribute("style", /--indent:\s*20px/);
+  await expect(reloadedTree.locator(".presence-list")).toContainText(/Guest/);
+
+  const screenshot = testInfo.outputPath("outliner-complete-nested-localdev.png");
+  await page.screenshot({ path: screenshot, fullPage: true });
+  await testInfo.attach("outliner-complete-nested-localdev", { path: screenshot, contentType: "image/png" });
 });
 
 test("space chat panel bottoms are visually aligned", async ({ page, request }) => {
@@ -1192,6 +1199,7 @@ test("pinboard shared notes survive a peer reload", async ({ browser }) => {
 });
 
 test("outliner shares committed items with another user and survives reload", async ({ browser }) => {
+  test.setTimeout(120_000);
   const firstContext = await browser.newContext();
   const secondContext = await browser.newContext();
   try {
@@ -1200,12 +1208,16 @@ test("outliner shares committed items with another user and survives reload", as
     const firstV2 = await installV2Diagnostics(first, "outlinerFirst");
     const secondV2 = await installV2Diagnostics(second, "outlinerSecond");
     await Promise.all([
-      first.goto("/objects/the_outline?view=tool&v2TestHooks"),
-      second.goto("/objects/the_outline?view=tool&v2TestHooks")
+      first.goto("/?v2TestHooks"),
+      second.goto("/?v2TestHooks")
     ]);
     await Promise.all([continueAsGuestIfPrompted(first), continueAsGuestIfPrompted(second)]);
     await expect(first.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
     await expect(second.locator(".actor")).not.toHaveText("connecting...", { timeout: 5_000 });
+    await Promise.all([
+      first.getByRole("button", { name: "Outliner" }).click(),
+      second.getByRole("button", { name: "Outliner" }).click()
+    ]);
     const firstTree = first.locator("woo-outliner-tree").first();
     const secondTree = second.locator("woo-outliner-tree").first();
     await expect(firstTree).toBeVisible({ timeout: 5_000 });
@@ -1216,13 +1228,38 @@ test("outliner shares committed items with another user and survives reload", as
     await expect.poll(() => firstV2.appliedVerbs, { timeout: 5_000 }).toContain("moveto");
     await expect.poll(() => secondV2.appliedVerbs, { timeout: 5_000 }).toContain("moveto");
 
-    const text = `shared-outline-${Date.now()}`;
+    const suffix = Date.now();
+    const text = `shared-outline-${suffix}`;
+    const childText = `child-outline-${suffix}`;
     await first.waitForTimeout(250);
     await firstTree.locator("[data-outliner-add] input[name=text]").fill(text);
     await firstTree.locator("[data-outliner-add]").getByRole("button", { name: "Add" }).click();
     await expect.poll(() => firstV2.appliedVerbs, { timeout: 5_000 }).toContain("add");
     await expect(firstTree.locator(".outliner-row").filter({ hasText: text })).toHaveCount(1, { timeout: 5_000 });
     await expect(secondTree.locator(".outliner-row").filter({ hasText: text })).toHaveCount(1, { timeout: 10_000 });
+    const firstParent = firstTree.locator(".outliner-row").filter({ hasText: text }).first();
+    await firstParent.click();
+    await firstParent.getByRole("button", { name: "add child" }).click();
+    await firstTree.locator("[data-outliner-add-child] input[name=text]").fill(childText);
+    await firstTree.locator("[data-outliner-add-child] input[name=text]").press("Enter");
+    await expect(firstTree.locator(".outliner-row").filter({ hasText: childText })).toHaveCount(1, { timeout: 5_000 });
+    const secondChild = secondTree.locator(".outliner-row").filter({ hasText: childText });
+    await expect(secondChild).toHaveCount(1, { timeout: 10_000 });
+    await expect(secondChild.first()).toHaveAttribute("style", /--indent:\s*20px/);
+
+    const panel = secondTree.locator("woo-space-chat-panel[data-space-chat-panel]");
+    const input = panel.locator("[data-space-chat-input]");
+    const countLines = panel.locator(".chat-line").filter({ hasText: /Outline has \d+ items?\./ });
+    const previousCountLines = await countLines.count();
+    await input.fill("look");
+    await input.press("Enter");
+    await expect(countLines).toHaveCount(previousCountLines + 1, { timeout: 15_000 });
+    const countLine = countLines.last();
+    const renderedCount = await secondTree.locator("[data-outliner-row]").count();
+    await expect.poll(async () => {
+      const countText = await countLine.textContent();
+      return Number(countText?.match(/Outline has (\d+) items?\./)?.[1] ?? -1);
+    }, { timeout: 15_000 }).toBe(renderedCount);
     expectNoV2Failures(firstV2);
     expectNoV2Failures(secondV2);
 
@@ -1233,6 +1270,9 @@ test("outliner shares committed items with another user and survives reload", as
     await expect(reloadedSecondTree).toBeVisible({ timeout: 5_000 });
     await waitForOutlinerWritable(reloadedSecondTree);
     await expect(reloadedSecondTree.locator(".outliner-row").filter({ hasText: text })).toHaveCount(1, { timeout: 10_000 });
+    const reloadedChild = reloadedSecondTree.locator(".outliner-row").filter({ hasText: childText });
+    await expect(reloadedChild).toHaveCount(1, { timeout: 10_000 });
+    await expect(reloadedChild.first()).toHaveAttribute("style", /--indent:\s*20px/);
     expectNoV2Failures(secondV2);
   } finally {
     await firstContext.close();

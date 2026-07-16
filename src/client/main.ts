@@ -5322,9 +5322,10 @@ function mountOutlinerComponent() {
   element.showCompanion = actorPresentInSpace(id);
   element.syncFromProjection?.();
   // The outliner renders cheap structural state from projection on every SPA
-  // render. Its one-time hydrate hook may issue list_items when generic note
-  // text is read-gated out of the projection; keep that outside the render
-  // loop so refreshes do not create repeated read turns.
+  // render. Its one-time hydrate hook verifies the complete tree with
+  // list_items; keep that outside the render loop so refreshes do not create
+  // repeated read turns. The component separately hydrates room_roster when
+  // showCompanion flips true after movement settles.
   if (subjectChanged || element.dataset.outlinerHydrated !== "true") {
     element.dataset.outlinerHydrated = "true";
     void element.hydrate?.();

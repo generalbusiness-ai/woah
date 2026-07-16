@@ -94,7 +94,7 @@ describe("net feed → catalog panel reducers (phase iii)", () => {
     expect((projection.observe("the_pinboard")?.catalogState?.pinboard_presence as Record<string, unknown>)?.["#bob"]).toBe(false);
   });
 
-  it("a peer outline_item_added renders into the outliner projection (object + text/parent/position props)", () => {
+  it("a peer outline_item_added renders text plus catalog-owned tree structure into projection", () => {
     const { projection, emit } = wiredRegistry(outlinerHandlers);
     emit({
       observation: {
@@ -112,7 +112,10 @@ describe("net feed → catalog panel reducers (phase iii)", () => {
     });
     const item = projection.observe("obj_item_1");
     expect(item?.location).toBe("the_outline");
-    expect(item?.props).toMatchObject({ text: "first item", position: 0, hidden: false });
+    expect(item?.props).toMatchObject({ text: "first item", hidden: false });
+    expect(item?.props).not.toHaveProperty("parent");
+    expect(item?.props).not.toHaveProperty("position");
+    expect(item?.catalogState?.outliner_tree).toEqual({ parent_id: null, index: 0 });
   });
 
   it("a peer task_created dispatches the woo-tasks-refresh window event the kanban re-fetches on", async () => {

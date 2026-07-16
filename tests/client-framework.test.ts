@@ -276,7 +276,7 @@ describe("client UI framework projection", () => {
         type: "outline_item_added",
         outliner: "the_outline",
         item: "outline_item_optimistic",
-        parent_id: null,
+        parent_id: "outline_parent",
         index: 0,
         text: "fast row",
         actor: "guest_1"
@@ -287,7 +287,8 @@ describe("client UI framework projection", () => {
     expect(ui.observe("outline_item_optimistic")).toMatchObject({
       parent: "$outline_item",
       location: "the_outline",
-      props: { text: "fast row", parent: null, position: 0, hidden: false }
+      props: { text: "fast row", hidden: false },
+      catalogState: { outliner_tree: { parent_id: "outline_parent", index: 0 } }
     });
 
     ui.failOptimisticCall("call-add-outline");
@@ -317,14 +318,16 @@ describe("client UI framework projection", () => {
     expect(ui.observe("outline_item_live")).toMatchObject({
       parent: "$outline_item",
       location: "the_outline",
-      props: { text: "peer row", parent: null, position: 0, hidden: false }
+      props: { text: "peer row", hidden: false },
+      catalogState: { outliner_tree: { parent_id: null, index: 0 } }
     });
 
     ui.prune(Date.now() + 2_000);
     expect(ui.observe("outline_item_live")).toMatchObject({
       parent: "$outline_item",
       location: "the_outline",
-      props: { text: "peer row", parent: null, position: 0, hidden: false }
+      props: { text: "peer row", hidden: false },
+      catalogState: { outliner_tree: { parent_id: null, index: 0 } }
     });
   });
 

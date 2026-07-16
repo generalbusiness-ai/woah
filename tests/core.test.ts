@@ -2374,7 +2374,7 @@ describe("woo core", () => {
       filter: "filter_1",
       delay: "delay_1",
       drum: "drum_1",
-      scene: "scene_1"
+      scene: "default_scene"
     });
     expect(view.controls).toHaveLength(8);
     expect(view.controls.find((control) => control.id === "drum_1")?.props).toMatchObject({

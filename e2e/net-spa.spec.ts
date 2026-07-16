@@ -176,7 +176,7 @@ test("entering Tasks keeps workspace and chat component surfaces separate and re
   await context.close();
 });
 
-test("Outliner chat look uses the edge-based definition in the real workerd SPA", async ({ browser }, testInfo) => {
+test("Outliner hydrates a complete nested tree in a fresh real-workerd session", async ({ browser }, testInfo) => {
   test.setTimeout(120_000);
   const context = await browser.newContext();
   const page = await context.newPage();
@@ -191,20 +191,76 @@ test("Outliner chat look uses the edge-based definition in the real workerd SPA"
   await page.getByRole("button", { name: "Outliner" }).click();
   const tree = page.locator("woo-outliner-tree[data-outliner-tree]");
   await expect(tree).toBeVisible({ timeout: 30_000 });
-  const panel = tree.locator("woo-space-chat-panel[data-space-chat-panel]");
+  const suffix = Date.now();
+  const parentText = `workerd-parent-${suffix}`;
+  const childText = `workerd-child-${suffix}`;
+  const addInput = tree.locator("[data-outliner-add] input[name=text]");
+  await expect(addInput).toBeVisible({ timeout: 30_000 });
+  await addInput.fill(parentText);
+  await addInput.press("Enter");
+  const parentRow = tree.locator("[data-outliner-row]").filter({ hasText: parentText }).first();
+  await expect(parentRow).toBeVisible({ timeout: 30_000 });
+  await parentRow.click();
+  await parentRow.getByRole("button", { name: "add child" }).click();
+  const childInput = tree.locator("[data-outliner-add-child] input[name=text]");
+  await childInput.fill(childText);
+  await childInput.press("Enter");
+  const childRow = tree.locator("[data-outliner-row]").filter({ hasText: childText }).first();
+  await expect(childRow).toBeVisible({ timeout: 30_000 });
+  await expect(childRow).toHaveAttribute("style", /--indent:\s*20px/);
+
+  // A separate principal starts with no browser projection/cache from the
+  // creator. Its first mounted tree must still perform list_items and render the
+  // whole authoritative hierarchy.
+  const freshContext = await browser.newContext();
+  const fresh = await freshContext.newPage();
+  fresh.on("pageerror", (error) => pageErrors.push(`${error.name}: ${error.message}`));
+  fresh.on("response", (response) => {
+    if (response.status() >= 500) serverErrors.push(`${response.status()} ${response.url()}`);
+  });
+  await openSpa(fresh, credentials.bob);
+  await fresh.getByRole("button", { name: "Outliner" }).click();
+  const freshTree = fresh.locator("woo-outliner-tree[data-outliner-tree]");
+  await expect(freshTree).toBeVisible({ timeout: 30_000 });
+  await expect(freshTree.locator("[data-outliner-row]").filter({ hasText: parentText })).toHaveCount(1, { timeout: 30_000 });
+  const freshChild = freshTree.locator("[data-outliner-row]").filter({ hasText: childText }).first();
+  await expect(freshChild).toBeVisible({ timeout: 30_000 });
+  await expect(freshChild).toHaveAttribute("style", /--indent:\s*20px/);
+
+  const panel = freshTree.locator("woo-space-chat-panel[data-space-chat-panel]");
   const input = panel.locator("[data-space-chat-input]");
+  const countLines = panel.locator(".chat-line").filter({ hasText: /Outline has \d+ items?\./ });
+  const previousCountLines = await countLines.count();
   await expect(input).toBeVisible({ timeout: 30_000 });
   await input.fill("look");
   await input.press("Enter");
-  await expect(panel).toContainText(/Outline has \d+ items?\./, { timeout: 30_000 });
+  await expect(countLines).toHaveCount(previousCountLines + 1, { timeout: 30_000 });
+  const renderedCount = await freshTree.locator("[data-outliner-row]").count();
+  await expect.poll(async () => {
+    const countText = await countLines.last().textContent();
+    return Number(countText?.match(/Outline has (\d+) items?\./)?.[1] ?? -1);
+  }, { timeout: 30_000 }).toBe(renderedCount);
+  const authoritativeRoster = await freshTree.evaluate(async (element) => {
+    const treeElement = element as HTMLElement & {
+      subject?: string;
+      woo?: { directCall: (subject: string, verb: string, args: unknown[], options?: { serverRead?: boolean }) => Promise<unknown> };
+    };
+    return treeElement.woo?.directCall(treeElement.subject ?? "", "room_roster", [], { serverRead: true });
+  });
+  expect(authoritativeRoster).toEqual(expect.arrayContaining([expect.objectContaining({ id: expect.any(String) })]));
+  await expect(freshTree.locator(".presence-list")).not.toContainText("No one is here.", { timeout: 30_000 });
+
+  // Keep the original stale-bytecode contract check in this production-shaped
+  // path as well.
   await expect(panel).not.toContainText("object_tree_rows expects");
   expect(pageErrors).toEqual([]);
   expect(serverErrors).toEqual([]);
-  expectNoLegacyRequests(page);
+  expectNoLegacyRequests(page, fresh);
 
-  const screenshot = testInfo.outputPath("outliner-look-workerd.png");
-  await page.screenshot({ path: screenshot, fullPage: true });
-  await testInfo.attach("outliner-look-workerd", { path: screenshot, contentType: "image/png" });
+  const screenshot = testInfo.outputPath("outliner-complete-nested-workerd.png");
+  await fresh.screenshot({ path: screenshot, fullPage: true });
+  await testInfo.attach("outliner-complete-nested-workerd", { path: screenshot, contentType: "image/png" });
+  await freshContext.close();
   await context.close();
 });
 

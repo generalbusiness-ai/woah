@@ -77,7 +77,11 @@ export type OutlinerItem = {
   has_children: boolean;
 };
 
-type ProjectedOutlinerItem = OutlinerItem & { textKnown: boolean };
+type ProjectedOutlinerItem = OutlinerItem & {
+  textKnown: boolean;
+  parentKnown: boolean;
+  indexKnown: boolean;
+};
 
 // One row delivered by $outliner:room_roster — the same shape chat/dubspace
 // use. `presence` ("online" / "idle" / "offline") drives the dot class.
@@ -129,31 +133,76 @@ export class WooOutlinerTreeElement extends HTMLElement {
   private hydrateAttempted = false;
   private bound = false;
   private itemHydrationSubject = "";
-  private projectionMissingItemTextSignature = "";
+  // Generic projection is deliberately incomplete: an empty or partial
+  // neighborhood does not prove the outline itself is empty or partial. Every
+  // mounted subject therefore performs one coalesced authoritative list read.
+  // Accepted structural observations advance this revision, invalidating an
+  // older in-flight read before requesting the post-mutation tree.
+  private itemHydrationRevision = 0;
+  private rosterHydrationRevision = 0;
+  private rosterAuthoritative = false;
+  private rosterRetryAttempt = 0;
+  private rosterRetryTimer: ReturnType<typeof setTimeout> | null = null;
   // Content signature of the item text last written to the localStorage display
   // cache; guards against rewriting unchanged text on every SPA render.
   private lastCachedTextSignature = "";
-  private readonly itemTextHydrator = new CoalescedViewHydrator<OutlinerItem[]>({
+  private readonly itemHydrator = new CoalescedViewHydrator<OutlinerItem[]>({
     read: async (subject) => {
       if (!this.woo) return [];
-      // Read-only text hydration: route to the authoritative server read instead
-      // of the browser local-execution path, which otherwise pays an
-      // execution-cache rebuild + state-transfer repair storm to fill per-item
-      // text. See notes/2026-06-09-note-content-hydration.md.
+      // Whole-tree display hydration is read-only. Route to the authoritative
+      // server read instead of the browser local-execution path, which otherwise
+      // pays an execution-cache rebuild + state-transfer repair storm for a
+      // completeness check. See notes/2026-06-09-note-content-hydration.md.
       const items = normalizeOutlinerItems(await this.woo.directCall(subject, "list_items", [], { serverRead: true }));
       if (!items) throw new Error("list_items did not return outline rows");
       return items;
     },
     apply: (items, subject, signature) => {
-      if (this.subject !== subject || this.projectionMissingItemTextSignature !== signature) return;
+      if (this.subject !== subject || this.itemHydrationSignature() !== signature) return;
       this.model = { ...this.model, items };
       if (this.selectedId && !items.some((item) => item.id === this.selectedId)) {
         this.selectedId = null;
         this.addingChild = false;
       }
-      this.projectionMissingItemTextSignature = "";
       this.cacheKnownItemText();
       this.render();
+    }
+  });
+  private readonly rosterHydrator = new CoalescedViewHydrator<OutlinerRosterRow[]>({
+    read: async (subject) => {
+      if (!this.woo) return [];
+      return normalizeOutlinerRoster(await this.woo.directCall(subject, "room_roster", [], { serverRead: true }));
+    },
+    apply: (roster, subject, signature) => {
+      if (this.subject !== subject || this.rosterHydrationSignature() !== signature) return;
+      const actor = this.woo?.actor;
+      // A just-entered actor can become visible to the client one owner-cache
+      // turn before room_roster catches up. Never render "No one is here" for
+      // the actor who is visibly using the companion; show self as a bounded
+      // local fallback while retrying the authoritative full roster.
+      const visibleRoster = roster.length === 0 && this.companionVisible && actor
+        ? [{ id: actor, name: this.woo?.observe(actor)?.name }]
+        : roster;
+      this.rosterAuthoritative = roster.length > 0 || !this.companionVisible;
+      this.model = { ...this.model, roster: visibleRoster };
+      this.render();
+      if (roster.length === 0 && visibleRoster.length > 0) {
+        this.scheduleRosterRetry();
+      } else {
+        this.clearRosterRetry();
+      }
+    },
+    onError: (_error, subject, signature) => {
+      if (this.subject !== subject || this.rosterHydrationSignature() !== signature) return;
+      const actor = this.woo?.actor;
+      if (!this.companionVisible || !actor) return;
+      this.rosterAuthoritative = false;
+      this.model = {
+        ...this.model,
+        roster: [{ id: actor, name: this.woo?.observe(actor)?.name }]
+      };
+      this.render();
+      this.scheduleRosterRetry();
     }
   });
 
@@ -163,9 +212,8 @@ export class WooOutlinerTreeElement extends HTMLElement {
     // data shape cannot replace the outliner model and crash render().
     const next = normalizeOutlinerData(value, this.model, this.subject);
     if (!next) return;
-    this.resetItemHydrationIfSubjectChanged(next.outlinerId || this.subject || "");
+    this.resetHydrationIfSubjectChanged(next.outlinerId || this.subject || "");
     this.model = next;
-    this.projectionMissingItemTextSignature = "";
     this.render();
   }
 
@@ -174,13 +222,25 @@ export class WooOutlinerTreeElement extends HTMLElement {
     if (this.companionVisible === next) return;
     this.companionVisible = next;
     this.render();
+    // The host flips this only after movement into the outliner has settled.
+    // Hydrate then, not during the earlier cold projection mount, so the roster
+    // cannot be memoized as empty just before the actor enters.
+    if (next) this.requestRosterFromServer();
+    else this.clearRosterRetry();
   }
 
   set entering(value: boolean) {
     const next = Boolean(value);
     if (this.enterPending === next) return;
+    const wasPending = this.enterPending;
     this.enterPending = next;
     this.render();
+    // Presence projection can report the actor in-space one render before the
+    // host clears its pending-enter marker. If the companion opened during that
+    // overlap, wait for this transition before reading the authoritative roster.
+    if (wasPending && !next && this.companionVisible) {
+      this.refreshRosterAfterPresenceMutation();
+    }
   }
 
   connectedCallback(): void {
@@ -204,7 +264,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
 
   syncFromProjection(): void {
     if (!this.woo || !this.subject) return;
-    this.resetItemHydrationIfSubjectChanged(this.subject);
+    this.resetHydrationIfSubjectChanged(this.subject);
     const projection = this.woo.observe(this.subject);
     const focusMap = (projection?.props?.focus_by_actor ?? {}) as Record<string, string | null>;
     const actor = this.woo.actor;
@@ -261,6 +321,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
     if (!this.subject || outlinerId !== this.subject) return;
     if (type === "outliner_entered" || type === "outliner_left") {
       this.applyPresenceObservation(type, observation);
+      this.refreshRosterAfterPresenceMutation();
       return;
     }
     if (type === "outline_item_added") {
@@ -277,18 +338,22 @@ export class WooOutlinerTreeElement extends HTMLElement {
         writers: [],
         has_children: false
       });
+      this.refreshItemsAfterMutation();
       return;
     }
     if (type === "outline_item_removed") {
       this.removeItem(String(observation.item ?? ""), outlinerParent(observation.reparented_to));
+      this.refreshItemsAfterMutation();
       return;
     }
     if (type === "outline_item_moved") {
       this.moveItem(String(observation.item ?? ""), outlinerParent(observation.to_parent), outlinerIndex(observation.to_index, this.model.items.length));
+      this.refreshItemsAfterMutation();
       return;
     }
     if (type === "outline_item_reordered") {
       this.moveItem(String(observation.item ?? ""), outlinerParent(observation.parent_id), outlinerIndex(observation.to_index, this.model.items.length));
+      this.refreshItemsAfterMutation();
       return;
     }
     if (type === "outline_item_hidden") {
@@ -297,6 +362,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
         item.hidden = Boolean(observation.hidden);
         this.render();
       }
+      this.refreshItemsAfterMutation();
       return;
     }
   }
@@ -306,9 +372,13 @@ export class WooOutlinerTreeElement extends HTMLElement {
     const rows = this.woo.neighborhood.refs
       .map((ref) => this.outlinerItemFromProjection(ref))
       .filter((item): item is ProjectedOutlinerItem => item !== null);
-    const projectedItems = rows.map(({ textKnown: _textKnown, ...item }) => item);
+    const projectedItems = rows.map(({
+      textKnown: _textKnown,
+      parentKnown: _parentKnown,
+      indexKnown: _indexKnown,
+      ...item
+    }) => item);
     if (rows.length === 0 && this.model.items.length > 0) {
-      this.updateProjectionMissingItemText([]);
       return this.model.items;
     }
     let result: OutlinerItem[];
@@ -324,19 +394,20 @@ export class WooOutlinerTreeElement extends HTMLElement {
       // "not present" view.
       const byId = new Map(this.model.items.map((item) => [item.id, { ...item }]));
       for (const projected of rows) {
-        const { textKnown, ...row } = projected;
+        const { textKnown, parentKnown, indexKnown, ...row } = projected;
         const previous = byId.get(row.id);
         const projectionCarriesDisplayText = textKnown && row.text !== "";
         const text = projectionCarriesDisplayText ? row.text : previous?.text ?? row.text;
+        const parent_id = parentKnown ? row.parent_id : previous?.parent_id ?? row.parent_id;
+        const index = indexKnown ? row.index : previous?.index ?? row.index;
         if (text === "") missingTextIds.push(row.id);
-        byId.set(row.id, { ...(previous ?? {}), ...row, text });
+        byId.set(row.id, { ...(previous ?? {}), ...row, text, parent_id, index });
       }
       result = orderedOutlinerItems([...byId.values()]);
     }
-    this.updateProjectionMissingItemText(missingTextIds);
     // Paint last-seen text from the localStorage cache for any item whose text
-    // isn't in the projection yet, so a cold reload isn't blank for the seconds
-    // the hydration read (already queued via the missing signature) takes. Run on
+    // isn't in the projection yet, so a cold reload isn't blank while the
+    // authoritative hydration read is in flight. Run on
     // EVERY sync with missing text, not just the first: the cache is keyed by the
     // viewing actor, which can be unset on the first reload sync and become known
     // a render later — re-reading here recovers that case. The authoritative read
@@ -347,20 +418,83 @@ export class WooOutlinerTreeElement extends HTMLElement {
     return result.map((item) => (item.text === "" && cache[item.id]) ? { ...item, text: cache[item.id] } : item);
   }
 
-  private updateProjectionMissingItemText(ids: string[]): void {
-    this.projectionMissingItemTextSignature = [...new Set(ids)].sort().join("|");
+  private itemHydrationSignature(): string {
+    return `tree:${this.itemHydrationRevision}`;
   }
 
-  private resetItemHydrationIfSubjectChanged(subject: string): void {
+  private rosterHydrationSignature(): string {
+    return `roster:${this.rosterHydrationRevision}`;
+  }
+
+  private resetHydrationIfSubjectChanged(subject: string): void {
     if (!subject || this.itemHydrationSubject === subject) return;
     this.itemHydrationSubject = subject;
-    this.projectionMissingItemTextSignature = "";
-    this.itemTextHydrator.reset();
+    this.itemHydrationRevision = 0;
+    this.rosterHydrationRevision = 0;
+    this.rosterAuthoritative = false;
+    this.clearRosterRetry();
+    this.itemHydrator.reset();
+    this.rosterHydrator.reset();
   }
 
   private requestItemsFromList(): void {
-    if (!this.woo || !this.subject || !this.projectionMissingItemTextSignature) return;
-    this.itemTextHydrator.ensure(this.subject, this.projectionMissingItemTextSignature);
+    if (!this.woo || !this.subject) return;
+    this.itemHydrator.ensure(this.subject, this.itemHydrationSignature());
+  }
+
+  private refreshItemsAfterMutation(): void {
+    this.itemHydrationRevision += 1;
+    // Drop the completed prior revision and invalidate any older in-flight
+    // result. This also bounds the hydrator's memoized keys for a long-lived,
+    // frequently edited outline.
+    this.itemHydrator.reset();
+    this.requestItemsFromList();
+  }
+
+  private requestRosterFromServer(): void {
+    if (!this.woo || !this.subject || !this.companionVisible || this.enterPending) return;
+    if (!this.rosterAuthoritative) {
+      const actor = this.woo.actor;
+      if (actor && this.model.roster.length === 0) {
+        this.model = {
+          ...this.model,
+          roster: [{ id: actor, name: this.woo.observe(actor)?.name }]
+        };
+        this.render();
+      }
+      // This is also a watchdog for an owner read that never settles. A fast
+      // authoritative result clears the timer; otherwise the bounded retry
+      // advances the revision and issues a fresh read.
+      this.scheduleRosterRetry();
+    }
+    this.rosterHydrator.ensure(this.subject, this.rosterHydrationSignature());
+  }
+
+  private refreshRosterAfterPresenceMutation(): void {
+    this.rosterHydrationRevision += 1;
+    this.rosterAuthoritative = false;
+    this.rosterHydrator.reset();
+    this.requestRosterFromServer();
+  }
+
+  private scheduleRosterRetry(): void {
+    if (this.rosterRetryTimer !== null || this.rosterRetryAttempt >= 4) return;
+    const delays = [150, 400, 1_000, 2_000];
+    const delay = delays[this.rosterRetryAttempt] ?? delays[delays.length - 1];
+    this.rosterRetryAttempt += 1;
+    this.rosterRetryTimer = setTimeout(() => {
+      this.rosterRetryTimer = null;
+      if (!this.companionVisible) return;
+      this.refreshRosterAfterPresenceMutation();
+    }, delay);
+  }
+
+  private clearRosterRetry(): void {
+    if (this.rosterRetryTimer !== null) {
+      clearTimeout(this.rosterRetryTimer);
+      this.rosterRetryTimer = null;
+    }
+    this.rosterRetryAttempt = 0;
   }
 
   private outlinerItemFromProjection(ref: string): ProjectedOutlinerItem | null {
@@ -371,25 +505,40 @@ export class WooOutlinerTreeElement extends HTMLElement {
     const looksLikeOutlineItem = projected.parent === "$outline_item" || ancestors.includes("$outline_item");
     if (!looksLikeOutlineItem) return null;
     const textKnown = typeof props.text === "string";
+    // Structural observations arrive before the generic projection necessarily
+    // contains the room-owned __ordered_edge. Keep their parent/index in
+    // catalog-owned client projection state rather than reviving the retired
+    // v1 `parent` / `position` properties on the object.
+    const projectedTree = projected.catalogState?.outliner_tree;
+    const tree = projectedTree && typeof projectedTree === "object" && !Array.isArray(projectedTree)
+      ? projectedTree as { parent_id?: unknown; index?: unknown }
+      : null;
+    const treeHasParent = tree !== null && Object.prototype.hasOwnProperty.call(tree, "parent_id");
+    const treeHasIndex = tree !== null && Object.prototype.hasOwnProperty.call(tree, "index");
     // Structural parent lives in the room-owned edge cell `__ordered_edge`
     // ({ parent, rank }); the rank is not an index, so this degraded
     // single-item projection places at the front (0) until the authoritative
     // list_items hydration supplies the real derived index.
     const edge = props.__ordered_edge;
-    const edgeParent = edge && typeof edge === "object" && !Array.isArray(edge)
-      ? (edge as { parent?: unknown }).parent
+    const edgeRecord = edge && typeof edge === "object" && !Array.isArray(edge)
+      ? edge as { parent?: unknown }
       : null;
+    const edgeHasParent = edgeRecord !== null && Object.prototype.hasOwnProperty.call(edgeRecord, "parent");
+    const parentKnown = treeHasParent || edgeHasParent;
+    const parent = treeHasParent ? tree?.parent_id : edgeRecord?.parent;
     return {
       id: projected.id,
       name: typeof projected.name === "string" ? projected.name : projected.id,
       text: textKnown ? props.text as string : "",
-      parent_id: outlinerParent(edgeParent),
-      index: 0,
+      parent_id: outlinerParent(parent),
+      index: treeHasIndex ? outlinerIndex(tree?.index, 0) : 0,
       hidden: props.hidden === true,
       owner: typeof projected.owner === "string" ? projected.owner : "",
       writers: Array.isArray(props.writers) ? props.writers.filter((item): item is string => typeof item === "string") : [],
       has_children: false,
-      textKnown
+      textKnown,
+      parentKnown,
+      indexKnown: treeHasIndex
     };
   }
 
@@ -579,7 +728,15 @@ export class WooOutlinerTreeElement extends HTMLElement {
   // before the viewer enters, and the chat presence list is the wrong scope
   // in that case.
   private renderPresence(data: OutlinerData): string {
-    const rows = Array.isArray(data.roster) ? data.roster : [];
+    const roster = Array.isArray(data.roster) ? data.roster : [];
+    // Last-resort local invariant, matching Pinboard: an actor using the live
+    // companion is necessarily present, even if the owner roster read is still
+    // pending or retrying. Never contradict the active workspace with an empty
+    // presence panel.
+    const actor = this.woo?.actor;
+    const rows = roster.length > 0 || !this.companionVisible || !actor
+      ? roster
+      : [{ id: actor, name: this.woo?.observe(actor)?.name }];
     const buttons = rows.map((row) => {
       const id = typeof row?.id === "string" ? row.id : "";
       if (!id) return "";
@@ -991,9 +1148,11 @@ export function registerWooObservationHandlers(registry: ObservationRegistry): v
           });
           draft.patchObjectProps(id, {
             text: typeof envelope.observation.text === "string" ? envelope.observation.text : "",
-            parent: outlinerParent(envelope.observation.parent_id),
-            position: outlinerIndex(envelope.observation.index, 0),
             hidden: false
+          });
+          draft.patchCatalogState(id, "outliner_tree", {
+            parent_id: outlinerParent(envelope.observation.parent_id),
+            index: outlinerIndex(envelope.observation.index, 0)
           });
         }
       } else if (type === "outline_item_removed") {
@@ -1001,15 +1160,15 @@ export function registerWooObservationHandlers(registry: ObservationRegistry): v
         if (id) draft.patchObject(id, { location: null });
       } else if (type === "outline_item_moved") {
         const id = String(envelope.observation.item ?? "");
-        if (id) draft.patchObjectProps(id, {
-          parent: outlinerParent(envelope.observation.to_parent),
-          position: outlinerIndex(envelope.observation.to_index, 0)
+        if (id) draft.patchCatalogState(id, "outliner_tree", {
+          parent_id: outlinerParent(envelope.observation.to_parent),
+          index: outlinerIndex(envelope.observation.to_index, 0)
         });
       } else if (type === "outline_item_reordered") {
         const id = String(envelope.observation.item ?? "");
-        if (id) draft.patchObjectProps(id, {
-          parent: outlinerParent(envelope.observation.parent_id),
-          position: outlinerIndex(envelope.observation.to_index, 0)
+        if (id) draft.patchCatalogState(id, "outliner_tree", {
+          parent_id: outlinerParent(envelope.observation.parent_id),
+          index: outlinerIndex(envelope.observation.to_index, 0)
         });
       } else if (type === "outline_item_hidden") {
         const id = String(envelope.observation.item ?? "");
