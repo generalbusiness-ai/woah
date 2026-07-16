@@ -19,7 +19,7 @@ import * as tasksUiModule from "../../catalogs/tasks/ui/kanban-board";
 import * as weatherUiModule from "../../catalogs/weather/ui/weather-badge";
 import { appliedFrameErrorObservations, chatErrorText } from "./chat-errors";
 import { chatObservationSpace, updateEnteredLeftChatPresence } from "./chat-state";
-import { isAgedDubspaceControlsError, readAgedDubspaceControlCells } from "./dubspace-net-hydration";
+import { installedDubspaceSupportsControlsView, isAgedDubspaceControlsError, readAgedDubspaceControlCells } from "./dubspace-net-hydration";
 import { CoalescedViewHydrator, createWooClientFramework, displayTextCacheKey, escapeHtml, liveProjectionKey, ProjectionFieldFiller, pruneDisplayTextCaches, readDisplayTextCache, writeDisplayTextCache, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
 import { isPinboardObservation } from "./pinboard-observation";
 import { clearProvisionalChatLines, provisionalChatErrorLine, upsertProvisionalChatLine } from "./provisional-chat";
@@ -2441,6 +2441,12 @@ function bundledDubspaceControlRoles(): Record<string, any> {
   return roles && typeof roles === "object" && !Array.isArray(roles) ? roles : {};
 }
 
+function bundledDubspaceControlDefaults(): Record<string, Record<string, unknown>> {
+  const frame = (dubspaceManifest as any)?.ui?.frames?.find((candidate: any) => candidate?.id === "dubspace.workspace");
+  const defaults = frame?.state?.control_defaults;
+  return defaults && typeof defaults === "object" && !Array.isArray(defaults) ? defaults : {};
+}
+
 function dubspaceMeta(): any {
   const space = dubspaceSpace();
   const hydrated = space ? ui.observe(space)?.catalogState?.dubspace_controls : null;
@@ -3134,6 +3140,13 @@ function readDubspaceControlsView(space: string): Promise<any> {
   if (!space || !canSendDubspaceV2()) {
     return Promise.reject(new Error("dubspace controls view is unavailable"));
   }
+  // Net projections do not currently expose the authoritative installed-
+  // catalog registry. Without proof that this durable world has the view,
+  // start with the bounded cell surface instead of waiting for a doomed
+  // missing-verb repair loop to exhaust its budget.
+  if (netMode() && !netInstalledDubspaceSupportsControlsView()) {
+    return readDubspaceControlCellsView(space);
+  }
   return new Promise((resolve, reject) => {
     v2Turn({
       scope: space,
@@ -3154,18 +3167,29 @@ function readDubspaceControlsView(space: string): Promise<any> {
         // Durable worlds are not implicitly upgraded by a client bundle
         // deploy. Pre-controls_view worlds retain the same public property
         // cells, so hydrate that fixed, declared surface without enumeration.
-        if (!netFeed || !netFeedOpen) {
-          reject(new Error("dubspace net cells are unavailable"));
-          return;
-        }
-        void readAgedDubspaceControlCells({
-          space,
-          roles: dubspaceMeta(),
-          readCell: (key) => netFeed!.cell(key),
-          nameOf: objectName
-        }).then(resolve, reject);
+        void readDubspaceControlCellsView(space).then(resolve, reject);
       }
     });
+  });
+}
+
+function netInstalledDubspaceSupportsControlsView(): boolean {
+  const installed = Array.isArray(state.scopedProjection?.catalogs?.catalogs)
+    ? state.scopedProjection.catalogs.catalogs
+    : Array.isArray(catalogUiCache?.catalogs)
+      ? catalogUiCache.catalogs
+      : [];
+  return installedDubspaceSupportsControlsView(installed);
+}
+
+function readDubspaceControlCellsView(space: string): Promise<any> {
+  if (!netFeed || !netFeedOpen) return Promise.reject(new Error("dubspace net cells are unavailable"));
+  return readAgedDubspaceControlCells({
+    space,
+    roles: dubspaceMeta(),
+    defaults: bundledDubspaceControlDefaults(),
+    readCell: (key) => netFeed!.cell(key),
+    nameOf: objectName
   });
 }
 

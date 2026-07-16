@@ -1,6 +1,6 @@
 {
   "name": "dubspace",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "spec_version": "v1",
   "description": "Shared dub-mix sound space demo objects.",
   "license": "MIT",
@@ -41,6 +41,27 @@
             "delay": "delay_1",
             "drum": "drum_1",
             "scene": "default_scene"
+          },
+          "control_defaults": {
+            "slot_1": { "loop_id": "loop-1", "playing": false, "gain": 0.75, "freq": 110 },
+            "slot_2": { "loop_id": "loop-2", "playing": false, "gain": 0.75, "freq": 146.83 },
+            "slot_3": { "loop_id": "loop-3", "playing": false, "gain": 0.75, "freq": 196 },
+            "slot_4": { "loop_id": "loop-4", "playing": false, "gain": 0.75, "freq": 261.63 },
+            "channel_1": { "gain": 0.8 },
+            "filter_1": { "cutoff": 1000 },
+            "delay_1": { "send": 0.3, "time": 0.25, "feedback": 0.35, "wet": 0.4 },
+            "drum_1": {
+              "bpm": 118,
+              "playing": false,
+              "started_at": 0,
+              "step_count": 8,
+              "pattern": {
+                "kick": [true, false, false, false, true, false, false, false],
+                "snare": [false, false, true, false, false, false, true, false],
+                "hat": [true, true, true, true, true, true, true, true],
+                "tone": [false, false, false, true, false, false, false, true]
+              }
+            }
           }
         },
         "regions": {

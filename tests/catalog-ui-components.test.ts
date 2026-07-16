@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import chatManifest from "../catalogs/chat/manifest.json";
+import demoworldManifest from "../catalogs/demoworld/manifest.json";
 import dubspaceManifest from "../catalogs/dubspace/manifest.json";
 import outlinerManifest from "../catalogs/outliner/manifest.json";
 import pinboardManifest from "../catalogs/pinboard/manifest.json";
@@ -206,6 +207,11 @@ describe("bundled catalog UI components", () => {
       drum: "drum_1",
       scene: "default_scene"
     });
+    for (const [id, defaults] of Object.entries(dubspaceFrame?.state?.control_defaults ?? {})) {
+      const seed = (demoworldManifest as any).seed_hooks.find((hook: any) => hook.kind === "create_instance" && hook.as === id);
+      expect(seed?.properties, `${id} frame defaults must match its demoworld seed`).toMatchObject(defaults as object);
+    }
+    expect(Object.keys(dubspaceFrame?.state?.control_defaults ?? {})).toHaveLength(8);
     const dubspaceClass = (dubspaceManifest as any).classes.find((item: any) => item.local_name === "$dubspace");
     expect(dubspaceClass?.verbs.find((verb: any) => verb.name === "controls_view")?.source).toContain('scene: "default_scene"');
 

@@ -52,22 +52,27 @@ mount point. The SPA host supplies scoped projection data, audio services, and
 transport callbacks; the component communicates back through `woo-dubspace-*`
 custom events rather than private host DOM bindings.
 
-On the net client, initial control state is hydrated through the catalog-owned
-read-only `controls_view()` verb. The view returns the persisted values for the
-fixed demo controls and their semantic role map as one bounded result; the
-client folds both into its canonical projection before rendering. The explicit
-role map is required because the net room projection does not enumerate the
-catalog's internal control objects. Committed control observations then patch
-that same projection and repaint the active workspace. This keeps the catalog
-as the source of truth for both cold entry and subsequent shared edits, without
-teaching the substrate or generic projection layer about Dubspace.
+The catalog-owned read-only `controls_view()` verb returns the persisted values
+for the fixed demo controls and their semantic role map as one bounded result.
+Clients that have authoritative installed-catalog metadata proving the view is
+available use it directly. The explicit role map is required because the net
+room projection does not enumerate the catalog's internal control objects.
+Committed control observations then patch that same canonical projection and
+repaint the active workspace.
 
-The frame repeats that fixed role map as declarative UI state. A net world may
+The frame repeats that fixed role map and its demo seed defaults as declarative
+UI state. A net world may
 outlive the bundle that installed it, so clients connected to a pre-1.0.2
-Dubspace cannot call `controls_view()`. On only the named missing-verb or repair-
-budget failures, the client uses the frame map to read the same 27 public
-property cells in parallel. This bounded compatibility read neither enumerates
-objects nor guesses control roles; fresh worlds keep the single-view path.
+Dubspace cannot call `controls_view()`. When the net projection does not prove
+the installed version, the client immediately uses the frame map to read the
+same 27 public property cells; it must not wait behind speculative verb repair.
+A proven view that nevertheless returns the named missing-verb or repair-budget
+failure uses the same fallback. This bounded compatibility read starts from the
+declared defaults because sparse net storage legitimately omits unchanged
+values, then overlays every materialized cell. The reads are paced beneath the
+shared client-operation rate and retry only the gateway's named, recoverable
+`E_RATE`, so shell hydration cannot exhaust the burst and discard the whole
+view. It neither enumerates objects nor guesses control roles or values.
 
 ## Surface
 
