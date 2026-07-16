@@ -2035,6 +2035,15 @@ describe("bundled catalog UI components", () => {
     };
     element.data = data;
 
+    const kickOne = element.querySelector<HTMLButtonElement>('[data-step="kick:0"]')!;
+    const kickTwo = element.querySelector<HTMLButtonElement>('[data-step="kick:1"]')!;
+    expect(kickOne.getAttribute("aria-pressed")).toBe("true");
+    expect(kickTwo.getAttribute("aria-pressed")).toBe("false");
+    let stepDetail: any;
+    element.addEventListener("woo-dubspace-step", (event: Event) => { stepDetail = (event as CustomEvent).detail; });
+    kickTwo.click();
+    expect(stepDetail).toEqual({ voice: "kick", step: 1, enabled: true });
+
     let detail: any;
     element.addEventListener("woo-dubspace-control-commit", (event: Event) => { detail = (event as CustomEvent).detail; });
     const cutoff = element.querySelector<HTMLInputElement>('[data-target="filter_1"][data-name="cutoff"]')!;

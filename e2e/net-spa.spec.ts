@@ -151,6 +151,32 @@ test("entering Tasks keeps workspace and chat component surfaces separate and re
   await context.close();
 });
 
+test("Dubspace hydrates its persisted percussion pattern and repaints committed step changes", async ({ browser }) => {
+  test.setTimeout(120_000);
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const pageErrors: string[] = [];
+  page.on("pageerror", (error) => pageErrors.push(`${error.name}: ${error.message}`));
+  await openSpa(page, credentials.bob);
+
+  await page.getByRole("button", { name: "Dubspace" }).click();
+  const kickOne = page.getByRole("button", { name: "Kick step 1" });
+  const kickTwo = page.getByRole("button", { name: "Kick step 2" });
+  const hatOne = page.getByRole("button", { name: "Hat step 1" });
+  await expect(kickOne).toHaveAttribute("aria-pressed", "true", { timeout: 30_000 });
+  await expect(kickTwo).toHaveAttribute("aria-pressed", "false");
+  await expect(hatOne).toHaveAttribute("aria-pressed", "true");
+
+  await kickTwo.click();
+  await expect(kickTwo).toHaveAttribute("aria-pressed", "true", { timeout: 30_000 });
+  await kickTwo.click();
+  await expect(kickTwo).toHaveAttribute("aria-pressed", "false", { timeout: 30_000 });
+  expect(pageErrors).toEqual([]);
+  expectNoLegacyRequests(page);
+
+  await context.close();
+});
+
 test("the route switch selects the net client: bare `/` with empty storage reaches the door (finding 4)", async ({ browser }) => {
   test.setTimeout(60_000);
   // The exact first-time-user shape after DNS movement: no query flag,

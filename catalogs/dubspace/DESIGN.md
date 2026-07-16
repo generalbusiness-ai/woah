@@ -52,6 +52,16 @@ mount point. The SPA host supplies scoped projection data, audio services, and
 transport callbacks; the component communicates back through `woo-dubspace-*`
 custom events rather than private host DOM bindings.
 
+On the net client, initial control state is hydrated through the catalog-owned
+read-only `controls_view()` verb. The view returns the persisted values for the
+fixed demo controls and their semantic role map as one bounded result; the
+client folds both into its canonical projection before rendering. The explicit
+role map is required because the net room projection does not enumerate the
+catalog's internal control objects. Committed control observations then patch
+that same projection and repaint the active workspace. This keeps the catalog
+as the source of truth for both cold entry and subsequent shared edits, without
+teaching the substrate or generic projection layer about Dubspace.
+
 ## Surface
 
 - One shared space.

@@ -288,7 +288,7 @@ function renderStepRow(voice: string, label: string, steps: boolean[]): string {
   return `
     <div class="step-row">
       <span>${escapeHtml(label)}</span>
-      ${steps.map((enabled, index) => `<button class="step ${enabled ? "active" : ""}" data-step="${escapeHtml(`${voice}:${index}`)}" data-enabled="${enabled ? "true" : "false"}" aria-label="${escapeHtml(`${label} step ${index + 1}`)}"></button>`).join("")}
+      ${steps.map((enabled, index) => `<button class="step ${enabled ? "active" : ""}" data-step="${escapeHtml(`${voice}:${index}`)}" data-enabled="${enabled ? "true" : "false"}" aria-pressed="${enabled ? "true" : "false"}" aria-label="${escapeHtml(`${label} step ${index + 1}`)}"></button>`).join("")}
     </div>
   `;
 }

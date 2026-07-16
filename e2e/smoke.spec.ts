@@ -424,6 +424,29 @@ test("dubspace sends committed controls through the v2 intent path", async ({ pa
   await expect.poll(() => appliedVerb, { timeout: 5_000 }).toBe("set_control");
 });
 
+test("Dubspace percussion loads its persisted pattern and toggles steps in localdev", async ({ page }) => {
+  const pageErrors: string[] = [];
+  page.on("pageerror", (error) => pageErrors.push(`${error.name}: ${error.message}`));
+  await page.goto("/");
+  await continueAsGuestIfPrompted(page);
+  await expect(page.locator(".actor")).not.toHaveText("connecting...", { timeout: 10_000 });
+
+  await page.getByRole("button", { name: "Dubspace" }).click();
+  await expect(page.locator(".dubspace-presence")).toContainText(/Guest|guest_/, { timeout: 10_000 });
+  const kickOne = page.getByRole("button", { name: "Kick step 1" });
+  const kickTwo = page.getByRole("button", { name: "Kick step 2" });
+  const hatOne = page.getByRole("button", { name: "Hat step 1" });
+  await expect(kickOne).toHaveAttribute("aria-pressed", "true");
+  await expect(kickTwo).toHaveAttribute("aria-pressed", "false");
+  await expect(hatOne).toHaveAttribute("aria-pressed", "true");
+
+  await kickTwo.click();
+  await expect(kickTwo).toHaveAttribute("aria-pressed", "true", { timeout: 10_000 });
+  await kickTwo.click();
+  await expect(kickTwo).toHaveAttribute("aria-pressed", "false", { timeout: 10_000 });
+  expect(pageErrors).toEqual([]);
+});
+
 test("chat boot uses /api/me and moves without /api/state", async ({ page, request }) => {
   const diagnostics = await installV2Diagnostics(page, "chat_boot_local_command_plan");
   const stateCalls: string[] = [];

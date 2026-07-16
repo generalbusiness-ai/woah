@@ -2360,6 +2360,33 @@ describe("woo core", () => {
     if (start.op === "applied") expect(start.observations[0].type).toBe("transport_started");
   });
 
+  it("returns the persisted Dubspace control view for cold UI hydration", async () => {
+    const { world, actor } = authedWorld();
+    const result = await world.directCall("dubspace-controls-view", actor, "the_dubspace", "controls_view", []);
+    expect(result.op).toBe("result");
+    if (result.op !== "result") return;
+
+    const view = result.result as { space: { id: string; name: string }; meta: Record<string, unknown>; controls: Array<{ id: string; props: Record<string, unknown> }> };
+    expect(view.space).toMatchObject({ id: "the_dubspace", name: "Dubspace" });
+    expect(view.meta).toEqual({
+      slots: ["slot_1", "slot_2", "slot_3", "slot_4"],
+      channel: "channel_1",
+      filter: "filter_1",
+      delay: "delay_1",
+      drum: "drum_1",
+      scene: "scene_1"
+    });
+    expect(view.controls).toHaveLength(8);
+    expect(view.controls.find((control) => control.id === "drum_1")?.props).toMatchObject({
+      bpm: 118,
+      playing: false,
+      pattern: {
+        kick: [true, false, false, false, true, false, false, false],
+        hat: [true, true, true, true, true, true, true, true]
+      }
+    });
+  });
+
   it("runs direct dubspace previews as live-only observations", async () => {
     const { world, actor } = authedWorld();
     const entered = await moveActorTo(world, actor, "the_dubspace", { requestId: "move-dubspace-preview" });
