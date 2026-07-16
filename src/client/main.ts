@@ -4086,6 +4086,11 @@ function applyScopedMoveResult(result: any) {
   if (!result || typeof result !== "object" || Array.isArray(result)) return;
   if (!state.scopedProjection) state.scopedProjection = { inventory: [], overlays: {} };
   const movedRoom = typeof result.room === "string" ? result.room : "";
+  // Net observations usually advance this anchor, but generic $space:leave
+  // emits `left` without a destination.  Its authoritative result still names
+  // the actor's new room, so consume that result instead of leaving Chat
+  // stranded on the departed tool space with an empty presence panel.
+  if (movedRoom && netMode()) netCurrentRoom = movedRoom;
   state.scopedProjection = scopedModelWithMoveResult(state.scopedProjection, result);
   if (movedRoom || (result.here && typeof result.here === "object" && !Array.isArray(result.here))) {
     scopedProjectionLocalRevision += 1;
@@ -5900,7 +5905,10 @@ function leaveRoomToolSpace(options: RoomToolLifecycleOptions, done?: () => void
       applyScopedMoveResult(result);
       options.onResult?.(result);
       if (waitForLeaveResult) done?.();
-      if (state.tab === tab) render();
+      // The default fast tab switch finalizes before this durable leave
+      // settles. If the user is now on Chat, repaint it from the authoritative
+      // destination applied above; otherwise do not disturb a newer tool tab.
+      if (state.tab === tab || state.tab === "chat") render();
     },
     onError: (error) => {
       options.onError?.(error);

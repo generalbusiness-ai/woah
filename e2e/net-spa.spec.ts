@@ -138,6 +138,9 @@ test("entering and leaving Tasks keeps workspace and chat component surfaces sep
   await page.getByRole("button", { name: "Chat", exact: true }).click();
   await expect(page.locator("woo-chat-space[data-chat-space-host]")).toBeVisible({ timeout: 30_000 });
   await expect(page.locator("woo-tasks-kanban[data-chat-space-host]")).toHaveCount(0);
+  // The fixture actor may have no home (and therefore lands in $nowhere), but
+  // a settled leave repaint must not retain the departed workspace title.
+  await expect(page.locator("woo-chat-space[data-chat-space-host] h1")).not.toHaveText("Tasks", { timeout: 30_000 });
   expect(pageErrors).toEqual([]);
   expectNoLegacyRequests(page);
 
