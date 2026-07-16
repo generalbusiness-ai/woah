@@ -120,7 +120,7 @@ test("the real SPA over the net path: alice's chat line reaches bob's browser", 
   await contextB.close();
 });
 
-test("entering and leaving Tasks keeps workspace and chat component surfaces separate", async ({ browser }) => {
+test("entering Tasks keeps workspace and chat component surfaces separate and responsive", async ({ browser }) => {
   test.setTimeout(120_000);
   const context = await browser.newContext();
   const page = await context.newPage();
@@ -138,9 +138,13 @@ test("entering and leaving Tasks keeps workspace and chat component surfaces sep
   await page.getByRole("button", { name: "Chat", exact: true }).click();
   await expect(page.locator("woo-chat-space[data-chat-space-host]")).toBeVisible({ timeout: 30_000 });
   await expect(page.locator("woo-tasks-kanban[data-chat-space-host]")).toHaveCount(0);
-  // The fixture actor may have no home (and therefore lands in $nowhere), but
-  // a settled leave repaint must not retain the departed workspace title.
-  await expect(page.locator("woo-chat-space[data-chat-space-host] h1")).not.toHaveText("Tasks", { timeout: 30_000 });
+  // Tasks has no mount_room and pooled guests intentionally have $nowhere as
+  // home. Switching surfaces therefore keeps taskboard presence; prove the
+  // room anchor with an authoritative command rather than its cacheable title.
+  const input = page.locator("[data-chat-input]");
+  await input.fill("look");
+  await input.press("Enter");
+  await expect(page.locator(".chat-feed")).toContainText("registry that coordinates work items", { timeout: 30_000 });
   expect(pageErrors).toEqual([]);
   expectNoLegacyRequests(page);
 

@@ -270,8 +270,7 @@ const TOOL_TAB_DEFINITIONS: ToolTabDefinition[] = [
     elementSelector: "[data-tasks-board]",
     elementTagAttrs: (subject) => `data-tasks-board data-tasks-registry="${escapeHtml(subject)}"`,
     mount: () => bindTasks(),
-    enter: () => enterTasks(),
-    leave: (done) => leaveTasks(done)
+    enter: () => enterTasks()
   },
   {
     tab: "outliner",
@@ -5748,13 +5747,12 @@ type RoomToolLifecycleOptions = {
   canSend: () => boolean;
   route?: "direct" | "sequenced";
   isPresent?: () => boolean;
-  waitForLeaveResult?: boolean;
   onAlreadyPresent?: () => void;
   onResult?: (result: any) => void;
   onError?: (error: any) => void;
 };
 
-type ToolMoveOptions = Omit<RoomToolLifecycleOptions, "route" | "waitForLeaveResult">;
+type ToolMoveOptions = Omit<RoomToolLifecycleOptions, "route">;
 
 function scheduleToolMoveRetry(options: ToolMoveOptions) {
   const { tab, space } = options;
@@ -5882,54 +5880,8 @@ function enterRoomToolSpace(options: RoomToolLifecycleOptions) {
   }
 }
 
-function leaveRoomToolSpace(options: RoomToolLifecycleOptions, done?: () => void) {
-  const { tab, space, canSend, route = "direct" } = options;
-  if (!space || !canSend()) {
-    done?.();
-    return;
-  }
-  if (!(options.isPresent ?? (() => actorPresentInSpace(space)))()) {
-    done?.();
-    return;
-  }
-  const waitForLeaveResult = options.waitForLeaveResult === true;
-  if (!waitForLeaveResult) done?.();
-  const turnId = v2Turn({
-    scope: space,
-    route,
-    target: space,
-    verb: "leave",
-    args: [],
-    persistence: "durable",
-    onResult: (result) => {
-      applyScopedMoveResult(result);
-      options.onResult?.(result);
-      if (waitForLeaveResult) done?.();
-      // The default fast tab switch finalizes before this durable leave
-      // settles. If the user is now on Chat, repaint it from the authoritative
-      // destination applied above; otherwise do not disturb a newer tool tab.
-      if (state.tab === tab || state.tab === "chat") render();
-    },
-    onError: (error) => {
-      options.onError?.(error);
-      if (waitForLeaveResult) done?.();
-      if (state.tab === tab) render();
-    }
-  });
-  if (!turnId) {
-    const error = new Error(`failed to send ${tab} leave`);
-    options.onError?.(error);
-    if (waitForLeaveResult) done?.();
-    if (state.tab === tab) render();
-  }
-}
-
 function enterTasks() {
   enterRoomToolSpace({ tab: "tasks", space: tasksSpace(), canSend: canSendV2Browser });
-}
-
-function leaveTasks(done?: () => void) {
-  leaveRoomToolSpace({ tab: "tasks", space: tasksSpace(), canSend: canSendV2Browser }, done);
 }
 
 function enterOutliner() {
