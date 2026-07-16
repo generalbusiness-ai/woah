@@ -393,3 +393,43 @@ test("tool-space panels over net: alice's pinboard note renders on bob's board (
   await contextA.close();
   await contextB.close();
 });
+
+test("Chat returns from mounted nested tools to their parent room", async ({ browser }) => {
+  test.setTimeout(180_000);
+  const pageErrors: string[] = [];
+
+  // Keep this cold-session navigation regression last. Each principal's Net
+  // read budget is intentionally bounded, and adding cold boots before the
+  // heavier Outliner/Dubspace completeness scenarios would test cumulative
+  // fixture traffic rather than navigation behavior.
+  for (const tool of [
+    { name: "Dubspace", workspace: "woo-dubspace-workspace[data-dubspace-workspace]", settled: "woo-space-chat-panel[data-space-chat-panel]", apiKey: credentials.alice },
+    { name: "Outliner", workspace: "woo-outliner-tree[data-outliner-tree]", settled: "[data-outliner-add] input[name=text]", apiKey: credentials.bob }
+  ]) {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    page.on("pageerror", (error) => pageErrors.push(`${tool.name}: ${error.name}: ${error.message}`));
+    await openSpa(page, tool.apiKey);
+
+    await page.getByRole("button", { name: tool.name, exact: true }).click();
+    const workspace = page.locator(tool.workspace);
+    await expect(workspace).toBeVisible({ timeout: 30_000 });
+    // Wait for the movement/presence turn to settle so background component
+    // hydration is not deliberately abandoned mid-read by the navigation test.
+    await expect(workspace.locator(tool.settled)).toBeVisible({ timeout: 30_000 });
+
+    await page.getByRole("button", { name: "Chat", exact: true }).click();
+    await expect(page).toHaveURL(/\/objects\/the_chatroom$/, { timeout: 30_000 });
+    await expect(page.locator("woo-chat-space[data-chat-space-host]")).toBeVisible({ timeout: 30_000 });
+    await expect(page.locator(".toolbar h1")).toHaveText("Living Room", { timeout: 30_000 });
+    const chatInput = page.locator("[data-chat-input]");
+    await expect(chatInput).toBeVisible({ timeout: 30_000 });
+    await chatInput.fill("look");
+    await chatInput.press("Enter");
+    await expect(page.locator(".chat-feed")).toContainText("A bright, open living room", { timeout: 30_000 });
+    expectNoLegacyRequests(page);
+    await context.close();
+  }
+
+  expect(pageErrors).toEqual([]);
+});

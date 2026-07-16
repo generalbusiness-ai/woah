@@ -141,6 +141,12 @@ function bundledSeedRefs(manifest: any, classRef: string): string[] {
     .map((hook: any) => String(hook.as));
 }
 
+function bundledSeedMountRoom(manifest: any, classRef: string): string | null {
+  const seed = manifest?.seed_hooks?.find((hook: any) => hook?.kind === "create_instance" && hook?.class === classRef);
+  const mountRoom = seed?.properties?.mount_room;
+  return typeof mountRoom === "string" && mountRoom ? mountRoom : null;
+}
+
 type RenderFocusSnapshot = {
   tab: AppTab;
   selector: string;
@@ -217,6 +223,13 @@ const state: AppState = {
 let audio: DubAudio | undefined;
 const ui = createWooClientFramework();
 let chatRoomPin: ChatRoomPin | null = null;
+// Parent chat room captured before entering a mounted tool. NetFeed reconnects
+// from the parent scope to the tool scope during entry, so the later Chat click
+// cannot rely on being able to fetch mount metadata at that exact moment.
+const toolReturnRooms = new Map<string, string>();
+// Distinguish a successfully inspected unmounted tool (Tasks: Chat should remain
+// in the task room) from a mounted tool whose parent metadata is merely missing.
+const resolvedToolMountMetadata = new Set<string>();
 // Demo tool seeds live in demoworld's manifest now (the
 // demoworld-dependency-inversion). Read from demoworld so the SPA can route
 // to them on first load. Tasks still self-seeds its board with no location
@@ -226,6 +239,16 @@ const bundledToolSeeds = {
   pinboard: bundledSeedRef(demoworldManifest, "$pinboard"),
   outliner: bundledSeedRef(demoworldManifest, "$outliner"),
   tasks: bundledSeedRef(tasksManifest, "$task_registry")
+} as const;
+// Bundled navigation metadata is part of the same seed contract that supplies
+// each toolbar destination. Reading it locally avoids spending a Net cell read
+// on immutable install-time defaults; a projected live value still wins below
+// when a tool has subsequently been remounted.
+const bundledToolMountRooms = {
+  dubspace: bundledSeedMountRoom(demoworldManifest, "$dubspace"),
+  pinboard: bundledSeedMountRoom(demoworldManifest, "$pinboard"),
+  outliner: bundledSeedMountRoom(demoworldManifest, "$outliner"),
+  tasks: bundledSeedMountRoom(tasksManifest, "$task_registry")
 } as const;
 const TOOL_TAB_DEFINITIONS: ToolTabDefinition[] = [
   {
@@ -375,6 +398,7 @@ let pinboardViewAnimationTimer: number | undefined;
 let lastPinboardViewportPublishAt = 0;
 let lastPinboardViewportSent: PinNoteBox & { scale: number } | undefined;
 let pendingChatDestinationRoom = "";
+let pendingNetChatRoom = "";
 const pinNoteClientZ = new Map<string, number>();
 const PINBOARD_OPTIMISTIC_TTL_MS = 5_000;
 const TOOL_ENTER_PENDING_TIMEOUT_MS = 8_000;
@@ -1630,11 +1654,17 @@ function enterTabDestination(tab: AppTab) {
   toolDefinition(tab)?.enter?.();
 }
 
-function setTab(tab: AppTab, options: { mode?: "replace" | "push"; leaveCurrent?: boolean } = {}, done?: () => void) {
+function setTab(
+  tab: AppTab,
+  options: { mode?: "replace" | "push"; leaveCurrent?: boolean; chatDestinationRoom?: string } = {},
+  done?: () => void
+) {
   const mode = options.mode ?? "push";
   const leaveCurrent = options.leaveCurrent ?? true;
   const current = state.tab;
-  if (tab === "chat") pendingChatDestinationRoom = chatDestinationRoomForPreviousTab(current);
+  if (tab === "chat") {
+    pendingChatDestinationRoom = options.chatDestinationRoom ?? chatDestinationRoomForPreviousTab(current);
+  }
   if (current === "tasks" && tab !== "tasks") {
     focusTasksChatOnEntry = false;
   } else if (current !== "tasks" && tab === "tasks") {
@@ -2788,7 +2818,7 @@ function outlinerSpace() {
 }
 
 function chatRoom() {
-  if (netMode()) return netCurrentRoom;
+  if (netMode()) return pendingNetChatRoom || netCurrentRoom;
   if (chatRoomPin && chatRoomPin.expiresAt > Date.now()) return chatRoomPin.room;
   chatRoomPin = null;
   const here = String(state.scopedProjection?.here?.id ?? "");
@@ -2807,21 +2837,78 @@ function activeChatRoom() {
 }
 
 function chatDestinationRoomForPreviousTab(previousTab: AppTab): string {
-  const previousSubject = previousTab === "tool"
-    ? state.genericToolSubject
-    : isToolTab(previousTab)
-      ? toolSpace(previousTab)
-      : "";
-  const mountRoom = toolMountRoom(previousSubject);
-  if (mountRoom) return mountRoom;
-  if (chatRoomPin?.room) return chatRoomPin.room;
-  return activeChatRoom();
+  const previousSubject = toolSubjectForTab(previousTab);
+  const parentRoom = nestedSpaceParentRoom(previousSubject);
+  if (parentRoom) return parentRoom;
+  const rememberedRoom = toolReturnRooms.get(previousSubject);
+  if (rememberedRoom) return rememberedRoom;
+  if (previousSubject && resolvedToolMountMetadata.has(previousSubject)) return activeChatRoom();
+  if (chatRoomPin?.room && chatRoomPin.room !== previousSubject) return chatRoomPin.room;
+  const active = activeChatRoom();
+  return active !== previousSubject ? active : "";
+}
+
+function toolSubjectForTab(tab: AppTab): string {
+  if (tab === "tool") return state.genericToolSubject;
+  return isToolTab(tab) ? toolSpace(tab) : "";
 }
 
 function toolMountRoom(subject: string): string {
   if (!subject) return "";
   const value = projectedObjectView(subject)?.props?.mount_room;
   return typeof value === "string" && value ? value : "";
+}
+
+async function prepareToolNavigation(tab: AppTab): Promise<void> {
+  const subject = toolSubjectForTab(tab);
+  if (!subject) return;
+  const projectedParentRoom = nestedSpaceParentRoom(subject);
+  if (projectedParentRoom && projectedParentRoom !== subject) {
+    resolvedToolMountMetadata.add(subject);
+    toolReturnRooms.set(subject, projectedParentRoom);
+    return;
+  }
+  // Known bundled seeds already declare whether they are mounted. Tasks is
+  // deliberately unmounted, so recording the successful null result preserves
+  // its existing "Chat stays in the task room" behavior without a Net request.
+  if (isToolTab(tab)) {
+    const definition = toolDefinition(tab);
+    const bundledSubject = definition
+      ? activeInstalledCatalogSeed(definition.seedCatalogAlias, bundledToolSeeds[tab])
+      : "";
+    if (subject === bundledSubject) {
+      resolvedToolMountMetadata.add(subject);
+      const bundledParentRoom = bundledToolMountRooms[tab];
+      if (bundledParentRoom && bundledParentRoom !== subject) {
+        toolReturnRooms.set(subject, bundledParentRoom);
+      }
+      return;
+    }
+  }
+  // Resolve the return room before setTab reconnects NetFeed to the tool scope.
+  // Generic third-party tools have no bundled seed metadata, so use an exact
+  // single-property read rather than a whole-object enumeration.
+  if (netMode() && !toolMountRoom(subject)) {
+    const summary = await fetchNetObjectSummary(subject, ["mount_room"]).catch(() => undefined);
+    if (summary) resolvedToolMountMetadata.add(subject);
+  }
+  const parentRoom = nestedSpaceParentRoom(subject);
+  if (parentRoom && parentRoom !== subject) toolReturnRooms.set(subject, parentRoom);
+}
+
+async function resolveChatDestinationRoomForPreviousTab(previousTab: AppTab): Promise<string> {
+  const previousSubject = toolSubjectForTab(previousTab);
+  // Localdev `/api/me` and UI snapshots include ordinary readable props, but
+  // net summaries fetch only explicitly requested property cells. Chat
+  // navigation depends on the catalog-defined mount_room, so fetch that exact
+  // bounded cell before leaving a tool instead of mistaking the actor's current
+  // tool scope for its parent room. The object-live location remains the
+  // compatibility fallback for an older tool definition without mount_room.
+  if (previousSubject && netMode() && !resolvedToolMountMetadata.has(previousSubject) && !toolMountRoom(previousSubject)) {
+    const summary = await fetchNetObjectSummary(previousSubject, ["mount_room"]).catch(() => undefined);
+    if (summary) resolvedToolMountMetadata.add(previousSubject);
+  }
+  return chatDestinationRoomForPreviousTab(previousTab);
 }
 
 type V2TurnInput = {
@@ -3064,6 +3151,13 @@ function canSendV2Browser() {
 }
 
 function canSendChatV2() {
+  if (netMode()) {
+    // NetFeed.turn deliberately falls back to REST while its WebSocket is
+    // reconnecting. Chat navigation is a durable movement turn, so gating it
+    // on netFeedOpen silently dropped clicks during tool-scope transitions and
+    // left the Chat surface routed to the tool itself.
+    return Boolean(netFeed && state.actor && state.session);
+  }
   return canSendV2Browser();
 }
 
@@ -3683,8 +3777,21 @@ function bindCommon() {
   document.querySelectorAll<HTMLButtonElement>("[data-tab]").forEach((button) => {
     button.addEventListener("click", async () => {
       const next = button.dataset.tab as AppTab;
+      const previous = state.tab;
       if (next !== "ide") void ensureScopedProjectionReady();
-      setTab(next, { mode: "push" }, () => {
+      if (isToolTab(next) || next === "tool") await prepareToolNavigation(next);
+      const chatDestinationRoom = next === "chat"
+        ? await resolveChatDestinationRoomForPreviousTab(previous)
+        : undefined;
+      // A mounted tool must not silently reinterpret "Chat" as the tool itself
+      // when its parent metadata is temporarily unavailable. Staying on the
+      // current surface is safer than issuing a self-move that emits another
+      // tool-entered event and forces the tab straight back.
+      if (next === "chat" && (isToolTab(previous) || previous === "tool") && !chatDestinationRoom) {
+        console.error(`cannot resolve parent chat room for ${previous}`);
+        return;
+      }
+      setTab(next, { mode: "push", chatDestinationRoom }, () => {
         enterTabDestination(next);
       });
     });
@@ -3920,6 +4027,17 @@ function bindDubspace() {
   document.querySelectorAll<HTMLElement>("[data-pitch-dial]").forEach((dial) => bindPitchDial(dial));
 }
 
+function refreshDubspaceOverlayAfterEntry(): void {
+  void ensureScopedOverlayForTab("dubspace").then(() => {
+    if (state.tab === "dubspace") render();
+  }).catch((error) => {
+    // Leaving Dubspace can revoke presence while its entry hydration is still
+    // in flight. That abandoned read is expected; only surface failures while
+    // the workspace still needs the data.
+    if (state.tab === "dubspace") console.error("dubspace controls hydration failed", error);
+  });
+}
+
 function enterDubspace() {
   const space = dubspaceSpace();
   moveActorToToolSpace({
@@ -3927,16 +4045,8 @@ function enterDubspace() {
     space,
     canSend: canSendDubspaceV2,
     isPresent: () => actorPresentInSpace(space, dubspacePresentActors()),
-    onAlreadyPresent: () => {
-      void ensureScopedOverlayForTab("dubspace").then(() => {
-        if (state.tab === "dubspace") render();
-      });
-    },
-    onResult: () => {
-      void ensureScopedOverlayForTab("dubspace").then(() => {
-        if (state.tab === "dubspace") render();
-      });
-    }
+    onAlreadyPresent: refreshDubspaceOverlayAfterEntry,
+    onResult: refreshDubspaceOverlayAfterEntry
   });
 }
 
@@ -3995,15 +4105,33 @@ function normalizePattern(raw: any): Record<string, boolean[]> {
 function enterChat() {
   const room = pendingChatDestinationRoom || activeChatRoom();
   pendingChatDestinationRoom = "";
-  if (!room || !canSendChat() || !state.actor) return;
+  if (!room || !state.actor) return;
+  if (netMode()) pendingNetChatRoom = room;
   setCurrentChatRoom(room);
-  const onError = chatErrorHandler(room);
+  const reportError = chatErrorHandler(room);
+  const onError = (error: any) => {
+    if (netMode() && pendingNetChatRoom === room) {
+      pendingNetChatRoom = "";
+      syncUrlFromCurrentState("replace");
+      if (state.tab === "chat") render();
+    }
+    reportError(error);
+  };
   const onResult = (result: any) => {
+    if (netMode() && pendingNetChatRoom === room) pendingNetChatRoom = "";
     applyScopedMoveResult(result);
     setCurrentChatRoom(room);
     setChatPresent(result);
     if (state.tab === "chat") render();
   };
+  // NetFeed.turn can use REST while its WebSocket is reconnecting. Invoke that
+  // path directly: a transient socket state must not turn an explicit Chat
+  // navigation click into a silent no-op.
+  if (netMode()) {
+    void netTurn(state.actor, "moveto", [room], onResult, onError);
+    return;
+  }
+  if (!canSendChat()) return;
   if (canSendChatV2()) {
     v2Turn({
       scope: room,
@@ -4402,7 +4530,7 @@ function nestedSpaceParentRoom(space: string): string {
   const mountRoom = obj?.props?.mount_room;
   if (typeof mountRoom === "string" && mountRoom) return mountRoom;
   const location = obj?.location;
-  return typeof location === "string" ? location : "";
+  return typeof location === "string" && location !== "$nowhere" ? location : "";
 }
 
 function markNestedSpaceDeparture(space: string) {
@@ -4841,7 +4969,7 @@ function renderChatCommandResult(action: ChatCommandUiAction, result: any, origi
   const { verb, target } = action;
   if (verb === "enter" && target === dubspaceSpace()) {
     setTab("dubspace", { mode: "push", leaveCurrent: false });
-    void ensureScopedOverlayForTab("dubspace");
+    refreshDubspaceOverlayAfterEntry();
     requestSpaceChatFocus(target);
     return;
   }
