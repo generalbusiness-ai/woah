@@ -1112,7 +1112,45 @@ export type CoalescedViewHydratorOptions<T> = {
   apply: (value: T, subject: string, signature: string) => void;
   onError?: (error: unknown, subject: string, signature: string) => void;
   completeOnError?: boolean;
+  retryDelaysMs?: readonly number[];
+  now?: () => number;
 };
+
+const DEFAULT_VIEW_RETRY_DELAYS_MS = [250, 1_000, 5_000, 30_000] as const;
+
+/** Prevent a render-driven caller from turning a persistent read failure into
+ * a request loop. The caller still decides when to try again; this gate only
+ * makes repeated eligibility checks cheap and bounded. */
+export class RetryBackoffGate {
+  private failures = new Map<string, { attempts: number; retryAt: number }>();
+
+  constructor(
+    private readonly delaysMs: readonly number[] = DEFAULT_VIEW_RETRY_DELAYS_MS,
+    private readonly now: () => number = Date.now
+  ) {}
+
+  canAttempt(key: string): boolean {
+    const failure = this.failures.get(key);
+    return !failure || this.now() >= failure.retryAt;
+  }
+
+  recordFailure(key: string): number {
+    const previous = this.failures.get(key);
+    const attempts = (previous?.attempts ?? 0) + 1;
+    const last = Math.max(0, this.delaysMs.length - 1);
+    const delay = this.delaysMs.length === 0 ? 0 : Math.max(0, this.delaysMs[Math.min(attempts - 1, last)] ?? 0);
+    this.failures.set(key, { attempts, retryAt: this.now() + delay });
+    return delay;
+  }
+
+  recordSuccess(key: string): void {
+    this.failures.delete(key);
+  }
+
+  reset(): void {
+    this.failures.clear();
+  }
+}
 
 export type CoalescedRefreshControllerOptions = {
   run: () => Promise<void> | void;
@@ -1188,24 +1226,33 @@ export class CoalescedViewHydrator<T = unknown> {
   private inFlight = new Set<string>();
   private completed = new Set<string>();
   private generation = 0;
+  private readonly retryGate: RetryBackoffGate;
 
-  constructor(private options: CoalescedViewHydratorOptions<T>) {}
+  constructor(private options: CoalescedViewHydratorOptions<T>) {
+    this.retryGate = new RetryBackoffGate(options.retryDelaysMs, options.now);
+  }
 
   ensure(subject: string, signature: string): void {
     if (!subject || !signature) return;
     const key = viewHydrationKey(subject, signature);
-    if (this.completed.has(key) || this.inFlight.has(key)) return;
+    if (this.completed.has(key) || this.inFlight.has(key) || !this.retryGate.canAttempt(key)) return;
     this.inFlight.add(key);
     const generation = this.generation;
     void this.options.read(subject, signature)
       .then((value) => {
         if (generation !== this.generation) return;
         this.completed.add(key);
+        this.retryGate.recordSuccess(key);
         this.options.apply(value, subject, signature);
       })
       .catch((error) => {
         if (generation !== this.generation) return;
-        if (this.options.completeOnError === true) this.completed.add(key);
+        if (this.options.completeOnError === true) {
+          this.completed.add(key);
+          this.retryGate.recordSuccess(key);
+        } else {
+          this.retryGate.recordFailure(key);
+        }
         this.options.onError?.(error, subject, signature);
       })
       .finally(() => {
@@ -1218,6 +1265,7 @@ export class CoalescedViewHydrator<T = unknown> {
     this.generation += 1;
     this.inFlight.clear();
     this.completed.clear();
+    this.retryGate.reset();
   }
 }
 

@@ -1499,6 +1499,11 @@ Components SHOULD use standard custom-element lifecycle methods:
 - `disconnectedCallback()` to stop timers, subscriptions, and observers,
 - property setters or reactive fields for `woo`, `subject`, and `node`.
 
+Component hydration or semantic-fill reads that can be requested from render
+MUST coalesce identical in-flight work and MUST apply bounded retry backoff
+after failure. A persistent permission, missing-object, or transport failure
+must not turn observation-driven renders into a request-per-render loop.
+
 The host MAY preserve component instances across route changes when subject,
 component id, and stable frame-node identity are unchanged. Components MUST
 not depend on instance preservation for correctness.

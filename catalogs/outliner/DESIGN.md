@@ -561,13 +561,14 @@ a dedicated **Outliner** tab (between Tasks and Inspector). Routing:
   coalesced view hydrator to call `list_items` once for that missing-text
   signature.
 
-The component treats projection as structural data: ids, parent,
+The component treats projection as provisional structural data: ids, parent,
 position, hidden state, and roster are cheap to render immediately. The
-joined `list_items` view is the semantic display authority for item text,
-because `$note.text` readability is catalog-defined and generic
-projection may omit it. Structural observations patch the local model so
-normal add/edit/move turns stay responsive; weaker projection snapshots
-must not erase text learned from observations or `list_items`. Tab state,
+joined `list_items` view is the display authority for both readable item text
+and derived parent/index ordering, because `$note.text` readability is
+catalog-defined and the observation-time structural overlay is unversioned.
+Structural observations patch the local model so normal add/edit/move turns
+stay responsive; after `list_items` lands, a weaker projection snapshot must
+not erase text or restore older structure. Tab state,
 presence, and route URLs follow the same shape as Pinboard / Tasks
 (`outliner` view hint, `routedSubjects.outliner`,
 `scopedToolSubject("outliner")`).
@@ -734,7 +735,10 @@ is ahead of generic projection, the client reducer stores its
 per-item `parent` / `position` properties. The component consumes that
 overlay until the authoritative `list_items` result arrives, which
 keeps a newly-created child nested rather than briefly or permanently
-promoting it to the root.
+promoting it to the root. Once that result arrives, its parent/index rows
+outrank the retained unversioned overlay on later SPA renders. Live structural
+observations continue to update the same local model and advance the next
+authoritative read revision.
 
 Mutations use the v2 commit plane; the whole-tree hydration uses the v2
 direct plane with an authoritative server read.

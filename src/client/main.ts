@@ -20,7 +20,7 @@ import * as weatherUiModule from "../../catalogs/weather/ui/weather-badge";
 import { appliedFrameErrorObservations, chatErrorText } from "./chat-errors";
 import { chatObservationSpace, updateEnteredLeftChatPresence } from "./chat-state";
 import { installedDubspaceSupportsControlsView, isAgedDubspaceControlsError, readAgedDubspaceControlCells } from "./dubspace-net-hydration";
-import { CoalescedViewHydrator, createWooClientFramework, displayTextCacheKey, escapeHtml, liveProjectionKey, ProjectionFieldFiller, pruneDisplayTextCaches, readDisplayTextCache, writeDisplayTextCache, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
+import { CoalescedViewHydrator, createWooClientFramework, displayTextCacheKey, escapeHtml, liveProjectionKey, ProjectionFieldFiller, pruneDisplayTextCaches, readDisplayTextCache, RetryBackoffGate, writeDisplayTextCache, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
 import { isPinboardObservation } from "./pinboard-observation";
 import { clearProvisionalChatLines, provisionalChatErrorLine, upsertProvisionalChatLine } from "./provisional-chat";
 import { advanceProjectionCursor, idsFromRefsOrSummaries, presentActorsFromObservation, resolveOptionalRoomContents, scopedHerePresentActors, scopedModelWithMoveResult, type ScopedProjectionStateModel } from "./scoped-projection";
@@ -355,6 +355,7 @@ const pendingToolEnterTimers = new Map<string, number>();
 const pendingToolMoveRetryTimers = new Map<string, number>();
 const pendingOverlaySnapshots = new Map<string, Promise<void>>();
 const pendingDubspaceViewReads = new Map<string, Promise<void>>();
+const dubspaceViewRetryGate = new RetryBackoffGate();
 let scopedProjectionLocalRevision = 0;
 let connectInFlight: Promise<void> | null = null;
 const reconnectBaseDelayMs = 500;
@@ -1816,6 +1817,10 @@ async function ensureScopedOverlayForTab(tab: AppTab, options: { force?: boolean
       if (!actorPresentInSpace(subject, dubspacePresentActors())) return;
       const pending = pendingDubspaceViewReads.get(subject);
       if (pending) return await pending;
+      // Mount and committed-observation renders all reach this function. A
+      // durable missing/recycled control can make every compatibility read
+      // fail, so only start a new 27-cell sweep when its backoff has elapsed.
+      if (!dubspaceViewRetryGate.canAttempt(subject)) return;
       // Install the coalescing barrier before NetFeed.turn() can synchronously
       // notify pending state and re-enter render. Starting in a microtask makes
       // that ordering explicit and prevents a mount/read/render recursion.
@@ -1831,6 +1836,10 @@ async function ensureScopedOverlayForTab(tab: AppTab, options: { force?: boolean
       pendingDubspaceViewReads.set(subject, request);
       try {
         await request;
+        dubspaceViewRetryGate.recordSuccess(subject);
+      } catch (error) {
+        dubspaceViewRetryGate.recordFailure(subject);
+        throw error;
       } finally {
         if (pendingDubspaceViewReads.get(subject) === request) pendingDubspaceViewReads.delete(subject);
       }

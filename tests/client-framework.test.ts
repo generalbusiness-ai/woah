@@ -686,8 +686,9 @@ describe("client UI framework projection", () => {
     expect(applied).toEqual(["the_outline:item_1"]);
   });
 
-  it("CoalescedViewHydrator retries failed view reads by default", async () => {
+  it("CoalescedViewHydrator backs off failed reads before retrying", async () => {
     let reads = 0;
+    let now = 1_000;
     const errors: string[] = [];
     const applied: string[] = [];
     const hydrator = new CoalescedViewHydrator<string>({
@@ -701,13 +702,20 @@ describe("client UI framework projection", () => {
       },
       onError: (error) => {
         errors.push(error instanceof Error ? error.message : String(error));
-      }
+      },
+      now: () => now
     });
 
     hydrator.ensure("the_outline", "item_1");
     await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
+    hydrator.ensure("the_outline", "item_1");
+    expect(reads).toBe(1);
+    now += 249;
+    hydrator.ensure("the_outline", "item_1");
+    expect(reads).toBe(1);
+    now += 1;
     hydrator.ensure("the_outline", "item_1");
     await Promise.resolve();
     await Promise.resolve();

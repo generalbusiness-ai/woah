@@ -493,6 +493,52 @@ describe("outliner-tree presence aside", () => {
     expect(element.querySelector<HTMLElement>('[data-id="child_1"]')?.style.getPropertyValue("--indent")).toBe("20px");
   });
 
+  it("does not let an old structural projection overwrite an authoritative list", async () => {
+    const authoritative = [
+      { id: "item_2", name: "item_2", text: "second moved first", parent_id: null, index: 0, hidden: false, owner: "guest_1", writers: [], has_children: false },
+      { id: "item_1", name: "item_1", text: "first moved second", parent_id: null, index: 1, hidden: false, owner: "guest_1", writers: [], has_children: false }
+    ];
+    const projection = (id: string, index: number) => ({
+      id,
+      name: id,
+      parent: "$outline_item",
+      ancestors: ["$note", "$outline_item"],
+      owner: "guest_1",
+      location: "the_outline",
+      props: { text: id, hidden: false },
+      // This stamp represents the observation-time ordering before a peer
+      // reorder. It remains in generic projection after list_items returns.
+      catalogState: { outliner_tree: { parent_id: null, index } }
+    });
+    const directCall = vi.fn(async () => authoritative);
+    const element = document.createElement("woo-outliner-tree") as WooOutlinerTreeElement & {
+      hydrate: () => Promise<void>;
+      syncFromProjection: () => void;
+      subject: string;
+    };
+    element.subject = "the_outline";
+    element.woo = ctx({}, {
+      refs: ["item_1", "item_2"],
+      directCall,
+      projections: {
+        the_outline: { id: "the_outline", name: "Outline", props: {}, catalogState: {} },
+        item_1: projection("item_1", 0),
+        item_2: projection("item_2", 1)
+      }
+    });
+    document.body.append(element);
+
+    await element.hydrate();
+    await flushPromises();
+    expect([...element.querySelectorAll<HTMLElement>("[data-outliner-row]")].map((row) => row.dataset.id)).toEqual(["item_2", "item_1"]);
+
+    // main.ts invokes this again on every SPA render. The unversioned old
+    // catalogState must not reassert its pre-reorder indexes.
+    element.syncFromProjection();
+    expect([...element.querySelectorAll<HTMLElement>("[data-outliner-row]")].map((row) => row.dataset.id)).toEqual(["item_2", "item_1"]);
+    expect(directCall).toHaveBeenCalledTimes(1);
+  });
+
   it("renders an observed child from catalog projection state before authoritative hydration completes", async () => {
     let releaseRead!: () => void;
     const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });

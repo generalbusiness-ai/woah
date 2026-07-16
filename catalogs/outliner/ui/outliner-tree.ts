@@ -139,6 +139,10 @@ export class WooOutlinerTreeElement extends HTMLElement {
   // Accepted structural observations advance this revision, invalidating an
   // older in-flight read before requesting the post-mutation tree.
   private itemHydrationRevision = 0;
+  // Once list_items lands, its parent/index rows outrank the unversioned
+  // observation overlay. Live structural observations update this model too;
+  // an older catalogState stamp must not overwrite either source on render.
+  private itemStructureAuthoritative = false;
   private rosterHydrationRevision = 0;
   private rosterAuthoritative = false;
   private rosterRetryAttempt = 0;
@@ -159,6 +163,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
     },
     apply: (items, subject, signature) => {
       if (this.subject !== subject || this.itemHydrationSignature() !== signature) return;
+      this.itemStructureAuthoritative = true;
       this.model = { ...this.model, items };
       if (this.selectedId && !items.some((item) => item.id === this.selectedId)) {
         this.selectedId = null;
@@ -254,6 +259,12 @@ export class WooOutlinerTreeElement extends HTMLElement {
       this.hydrate().catch(() => undefined);
     }
     this.render();
+  }
+
+  disconnectedCallback(): void {
+    // The app shell may preserve and reattach this element. Keep successful
+    // view memoization, but never leave a detached roster watchdog running.
+    this.clearRosterRetry();
   }
 
   async hydrate(): Promise<void> {
@@ -398,8 +409,13 @@ export class WooOutlinerTreeElement extends HTMLElement {
         const previous = byId.get(row.id);
         const projectionCarriesDisplayText = textKnown && row.text !== "";
         const text = projectionCarriesDisplayText ? row.text : previous?.text ?? row.text;
-        const parent_id = parentKnown ? row.parent_id : previous?.parent_id ?? row.parent_id;
-        const index = indexKnown ? row.index : previous?.index ?? row.index;
+        const keepAuthoritativeStructure = this.itemStructureAuthoritative && previous !== undefined;
+        const parent_id = keepAuthoritativeStructure
+          ? previous.parent_id
+          : parentKnown ? row.parent_id : previous?.parent_id ?? row.parent_id;
+        const index = keepAuthoritativeStructure
+          ? previous.index
+          : indexKnown ? row.index : previous?.index ?? row.index;
         if (text === "") missingTextIds.push(row.id);
         byId.set(row.id, { ...(previous ?? {}), ...row, text, parent_id, index });
       }
@@ -430,6 +446,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
     if (!subject || this.itemHydrationSubject === subject) return;
     this.itemHydrationSubject = subject;
     this.itemHydrationRevision = 0;
+    this.itemStructureAuthoritative = false;
     this.rosterHydrationRevision = 0;
     this.rosterAuthoritative = false;
     this.clearRosterRetry();
