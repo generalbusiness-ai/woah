@@ -655,6 +655,8 @@ describe("NetGatewayDO end-to-end over fake-DO", () => {
     const staleKey = "verb_bytecode:$outliner:_siblings_ordered";
     const stalePropertyKey = "property_cell:$outliner:parent";
     const ordinaryPropertyKey = "property_cell:$outliner:runtime_marker";
+    const roomVerbKey = "verb_bytecode:custom_room:operator_authored";
+    const roomDefinitionKey = "property_cell:custom_room:operator_slot";
     expect((await call<{ applied: boolean }>(gateway, gatewayEnv, "/fanout", {
       scope: CATALOG_SCOPE,
       seq: 1,
@@ -691,6 +693,29 @@ describe("NetGatewayDO end-to-end over fake-DO", () => {
           version: "ordinary-property",
           provenance: "authoritative",
           stamp: { scope_head: "1:stale", catalog_epoch: EPOCH }
+        },
+        {
+          key: roomVerbKey,
+          kind: "verb_bytecode",
+          object: "custom_room",
+          name: "operator_authored",
+          value: { name: "operator_authored", bytecode: [{ op: "RETURN", value: "keep" }], arg_spec: { args: [] } },
+          version: "room-verb",
+          provenance: "authoritative",
+          stamp: { scope_head: "1:stale", catalog_epoch: EPOCH }
+        },
+        {
+          key: roomDefinitionKey,
+          kind: "property_cell",
+          object: "custom_room",
+          name: "operator_slot",
+          value: {
+            value: null,
+            def: { name: "operator_slot", defaultValue: null, typeHint: "obj|null", owner: "$wiz", perms: "r", version: 1 }
+          },
+          version: "room-property",
+          provenance: "authoritative",
+          stamp: { scope_head: "1:stale", catalog_epoch: EPOCH }
         }
       ],
       observations: []
@@ -706,6 +731,8 @@ describe("NetGatewayDO end-to-end over fake-DO", () => {
     expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", staleKey)).toHaveLength(0);
     expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", stalePropertyKey)).toHaveLength(0);
     expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", ordinaryPropertyKey)).toHaveLength(1);
+    expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", roomVerbKey)).toHaveLength(1);
+    expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", roomDefinitionKey)).toHaveLength(1);
     expect(durableRows(gatewayState.state,
       "SELECT body FROM net_gateway_cell WHERE key = 'verb_bytecode:$outliner:list_items'"
     )).toHaveLength(1);
@@ -716,6 +743,8 @@ describe("NetGatewayDO end-to-end over fake-DO", () => {
     expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", staleKey)).toHaveLength(0);
     expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", stalePropertyKey)).toHaveLength(0);
     expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", ordinaryPropertyKey)).toHaveLength(1);
+    expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", roomVerbKey)).toHaveLength(1);
+    expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", roomDefinitionKey)).toHaveLength(1);
     catalog.close();
     gatewayState.close();
   });

@@ -4972,10 +4972,11 @@ export class NetGatewayDO {
 
   /** A full catalog closure is authoritative for the complete bootstrap
    * definition set, not merely an upsert batch. Remove verb and property-
-   * definition pages absent from that closure before installing it so an
-   * aged/offline gateway cannot resurrect a retired v1 definition after
-   * missing the ordered removal fanout. Ordinary instance property cells are
-   * not definitions and retain their existing upsert posture. */
+   * catalog-scoped definition pages absent from that closure before installing
+   * it so an aged/offline gateway cannot resurrect a retired v1 definition
+   * after missing the ordered removal fanout. Runtime-authored definitions on
+   * ordinary objects are not members of the catalog image and retain their
+   * existing upsert posture. */
   private removeAbsentCatalogDefinitions(view: CellStore, scope: string, cells: readonly Cell[]): void {
     if (scope !== CATALOG_SCOPE) return;
     const isDefinition = (cell: Cell): boolean => {
@@ -4989,7 +4990,7 @@ export class NetGatewayDO {
     const present = new Set(cells.filter(isDefinition).map((cell) => cell.key));
     for (const key of [...view.keys()]) {
       const local = view.get(key);
-      if (!local || !isDefinition(local) || present.has(key)) continue;
+      if (!local || !local.object.startsWith("$") || !isDefinition(local) || present.has(key)) continue;
       view.delete(key);
       this.persistCell(view, key);
     }

@@ -379,6 +379,10 @@ export class NetFeed {
       this.reconnectTimer = null;
     }
     const socket = this.socket;
+    // Detaching first makes attachSocket.onclose's identity guard ignore the
+    // event. Flush waiters here so every in-flight turn reaches its same-key
+    // REST fallback instead of hanging forever after an intentional close.
+    this.failInFlightTurns();
     this.socket = null;
     this.setConnection("closed");
     try {
@@ -447,6 +451,9 @@ export class NetFeed {
       this.reconnectTimer = null;
     }
     const socket = this.socket;
+    // As in close(), the terminal path detaches the socket before closing it;
+    // release WS waiters explicitly because onclose will intentionally no-op.
+    this.failInFlightTurns();
     this.socket = null;
     // notifyState even if the connection value is unchanged: the error is
     // the news here, and setConnection would swallow a no-op transition.
@@ -607,10 +614,10 @@ export class NetFeed {
         ) as Record<string, unknown>[])
       : [];
     const buffered = this.takeBufferedSelfFrames(echoId);
-    const deliveredObservations =
-      accepted && observations.length === 0
-        ? buffered.flatMap((frame) => frame.observations)
-        : observations;
+    const bufferedObservations = buffered.flatMap((frame) => frame.observations);
+    const deliveredObservations = accepted
+      ? observations.length === 0 ? bufferedObservations : observations
+      : bufferedObservations;
 
     if (accepted) {
       this.readCache.clear();
@@ -633,6 +640,11 @@ export class NetFeed {
           }
         }
       }
+    } else if (buffered.length > 0) {
+      // A multi-scope committed fanout can arrive before a later conflict or
+      // authorization rejection settles the submit scope. The fanout is still
+      // an authoritative committed fact; rejecting the reply must not erase it.
+      this.emitTakenBufferedSelfFrames(turnId, echoId, buffered);
     }
     return {
       status: accepted ? "accepted" : "rejected",
@@ -676,6 +688,14 @@ export class NetFeed {
   private emitBufferedSelfFrames(turnId: string, echoId: string): void {
     const buffered = this.takeBufferedSelfFrames(echoId);
     if (buffered.length === 0) return;
+    this.emitTakenBufferedSelfFrames(turnId, echoId, buffered);
+  }
+
+  private emitTakenBufferedSelfFrames(
+    turnId: string,
+    echoId: string,
+    buffered: Array<{ scope: string; seq: number; observations: Record<string, unknown>[] }>
+  ): void {
     this.recordSettledEchoId(echoId);
     this.readCache.clear();
     for (const frame of buffered) {

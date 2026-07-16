@@ -536,8 +536,10 @@ One write path per fact (CO9), concretized:
   the catalog head once, durably appends the tail event, and refans replacements
   plus removed cell keys under the same high-water. An unchanged replay is a
   no-op. A later full catalog pull also removes local verb/property definition
-  pages absent from the authoritative closure, covering gateways that were
-  offline for the fanout while leaving ordinary instance property cells alone.
+  pages on `$` catalog objects that are absent from the authoritative closure,
+  covering gateways that were offline for the fanout. Definition-shaped cells
+  authored at runtime on ordinary objects, as well as ordinary instance
+  property cells, are outside the catalog image and remain untouched.
   The operator script requires an explicit `$object:verb` or
   `prop:$object:name` allow-list, obtains replacements from the fresh local
   install plan, and permits drops only when a bundled migration declares the
@@ -813,8 +815,12 @@ One write path per fact (CO9), concretized:
     one-way `echo_id` before submit and uses the frame's digest to buffer an
     echo that arrives before `turn_result`, prefers
     the full reply on settlement, and drops later echoes; a replay with no
-    observations may consume the buffered visible copy. Thus LRU loss costs
-    one redundant frame, not a duplicate user-visible observation. Delivery is
+    observations may consume the buffered visible copy. A later rejected reply
+    does not invalidate an already committed buffered fanout from another
+    scope; the client releases that authoritative frame. Closing or replacing a
+    socket MUST also release every in-flight WS waiter to the same-key REST
+    fallback rather than withholding buffered observations indefinitely. Thus
+    LRU loss costs one redundant frame, not a duplicate user-visible observation. Delivery is
     AT-MOST-ONCE and never durable: the per-scope seq gate drops
     redeliveries, dead sockets are skipped, and missed-observation
     catch-up is deliberately NOT promised in Phase 4.

@@ -220,6 +220,42 @@ describe("NetFeed turn() over WS", () => {
     expect(feed.state().pending).toHaveLength(0);
   });
 
+  it("releases a committed early fanout even when the correlated reply rejects", async () => {
+    const { feed } = feedWith(SESSION_ROUTE);
+    const events: NetFeedObservationEvent[] = [];
+    feed.onObservation((event) => events.push(event));
+    await feed.open();
+    const socket = FakeSocket.instances[0];
+    socket.open();
+    const turn = feed.turn({ target: "#bob", verb: "wave" });
+    await tick();
+    const turnId = socket.sent[0].id as string;
+    socket.frame({
+      type: "observations",
+      scope: "room:annex",
+      seq: 9,
+      echo_id: turnEchoId(turnId),
+      observations: [{ type: "entered", actor: "#alice" }]
+    });
+    socket.frame({
+      type: "turn_result",
+      id: turnId,
+      status: 200,
+      reply: { status: "rejected", scope: "room:hall", reason: "conflict", retryable: true, head: { seq: 5, hash: "h5" } }
+    });
+
+    const outcome = await turn;
+    expect(outcome.status).toBe("rejected");
+    expect(outcome.observations).toEqual([{ type: "entered", actor: "#alice" }]);
+    expect(events).toEqual([{
+      source: "self",
+      scope: "room:annex",
+      seq: 9,
+      turn_id: turnId,
+      observation: { type: "entered", actor: "#alice" }
+    }]);
+  });
+
   it("omits observations on a detected replay (replayed:true)", async () => {
     const { feed } = feedWith(SESSION_ROUTE);
     const events: NetFeedObservationEvent[] = [];
@@ -477,6 +513,26 @@ describe("NetFeed reconnect", () => {
     expect(feed.state().connection).toBe("closed");
     await tick();
     expect(FakeSocket.instances).toHaveLength(1); // no reconnect
+  });
+
+  it("close() releases an in-flight WS turn to its idempotent REST fallback", async () => {
+    const { feed, calls } = feedWith({
+      ...SESSION_ROUTE,
+      "POST /net-api/turn": () => ({ body: acceptedTurnResult() })
+    });
+    await feed.open();
+    const socket = FakeSocket.instances[0];
+    socket.open();
+    const turn = feed.turn({ target: "#bob", verb: "wave" });
+    await tick();
+    const wsKey = socket.sent[0].idempotency_key;
+
+    feed.close();
+    const outcome = await turn;
+
+    expect(outcome.status).toBe("accepted");
+    const rest = calls.find((call) => call.path === "/net-api/turn");
+    expect((rest?.body as Record<string, unknown>).idempotency_key).toBe(wsKey);
   });
 });
 
