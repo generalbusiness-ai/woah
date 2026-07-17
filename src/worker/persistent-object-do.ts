@@ -79,7 +79,12 @@ import {
 } from "../core/shadow-relay-cache";
 import { parseShadowScopeHeadJson } from "../core/shadow-scope-head";
 import { buildTransportErrorEnvelope, decodeEnvelope, encodeEnvelope, type ShadowEnvelope } from "../core/shadow-envelope";
-import type { ShadowStateTransfer, ShadowTurnExecReply } from "../core/shadow-turn-exec";
+import {
+  shadowPlannedTurnExecCommitScope,
+  type ShadowStateTransfer,
+  type ShadowTurnExecReply,
+  type ShadowTurnExecRequest
+} from "../core/shadow-turn-exec";
 import { runShadowTurnCall } from "../core/shadow-turn-call";
 import { authoritativePlanningWorld } from "../core/planning-world";
 import {
@@ -5451,18 +5456,26 @@ export class PersistentObjectDO {
     }
     const encoded = typeof message === "string" ? message : new TextDecoder().decode(message);
     try {
-      const authorityIds = v2SocketEnvelopeAuthorityObjectIds(encoded, att.scope, att.actor);
-      const result = await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(att.scope, "/v2/envelope", {
+      // One browser socket is anchored to its visible scope, but a locally
+      // planned pure relocation belongs to the moved object's authority. Route
+      // the transcript proof to that singleton CommitScopeDO; sending it to the
+      // socket scope would create a second sequencer that can mint the same
+      // actor sequence number and make the accepted move look like a duplicate.
+      const plannedCommitScope = v2SocketEnvelopePlannedCommitScope(encoded);
+      const commitScope = plannedCommitScope ?? att.scope;
+      const authorityIds = v2SocketEnvelopeAuthorityObjectIds(encoded, commitScope, att.actor);
+      const result = await this.v2CommitScopePost<CommitScopeEnvelopeResponse>(commitScope, "/v2/envelope", {
         ...executorAuthorityPayload(world, authorityIds),
-        scope: att.scope,
+        scope: commitScope,
         node: att.node,
         token: att.token,
         session: att.sessionId,
         actor: att.actor,
+        ...(plannedCommitScope ? { planned_transcript_commit: true } : {}),
         ...(this.browserProjectionHolderEnabled() ? { receiver_profile: "browser" as const } : {}),
         envelope: encoded
       });
-      await this.deliverV2Fanout(world, att.scope, result, att.sessionId, att.node);
+      await this.deliverV2Fanout(world, commitScope, result, att.sessionId, att.node);
       await this.applyV2CommittedTranscript(world, result.reply, att.sessionId);
       const receiverReply = result.receiver_reply ?? result.reply;
       if (receiverReply) ws.send(receiverReply);
@@ -8295,6 +8308,17 @@ function v2SocketEnvelopeAuthorityObjectIds(encoded: string, fallbackScope: ObjR
     return executorAuthorityObjectIds({ scope, target, actor, args, body: requestBody }, fallbackScope);
   } catch {
     return executorAuthorityObjectIds({ scope: fallbackScope, actor: fallbackActor }, fallbackScope);
+  }
+}
+
+function v2SocketEnvelopePlannedCommitScope(encoded: string): ObjRef | null {
+  try {
+    const envelope = decodeEnvelope<ShadowTurnExecRequest>(encoded);
+    if (envelope.type !== "woo.turn.exec.request.shadow.v1") return null;
+    if (envelope.body?.kind !== "woo.turn.exec.request.shadow.v1") return null;
+    return shadowPlannedTurnExecCommitScope(envelope.body);
+  } catch {
+    return null;
   }
 }
 

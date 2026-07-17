@@ -1604,10 +1604,26 @@ async function validateTurnExecReplyStateTransfer(envelope: ShadowEnvelope<Shado
   if (!reply.state_transfer) return;
   if (!envelope.reply_to) throw new Error("turn execution state transfer is missing reply_to");
   const request = pendingTurnExecRequests.get(envelope.reply_to) ?? await pendingTurnExecRequest(envelope.reply_to);
-  if (!request) throw new Error("turn execution state transfer has no pending request");
   const acceptedKey = reply.ok === true && reply.transcript
     ? shadowTurnKeyFromTranscript(reply.transcript)
-    : request.key;
+    : request?.key;
+  if (!acceptedKey) throw new Error("turn execution state transfer has no pending request");
+  if (!request) {
+    // Commit fanout can overtake the submitter's direct reply. The fanout
+    // installs the accepted frame and clears the pending row; the later direct
+    // reply is still the only frame carrying the cache-warm transfer. Treat it
+    // as correlated only when the exact authoritative position/hash is already
+    // installed. Truly unsolicited transfers still fail closed below.
+    const accepted = reply.ok === true && reply.commit?.kind === "woo.commit.accepted.shadow.v1"
+      ? reply.commit
+      : undefined;
+    const committed = accepted
+      ? await appliedFrameFor(accepted.position.scope, accepted.position.seq)
+      : undefined;
+    if (!committed || !accepted || !sameAcceptedCommitIdentity(committed, accepted)) {
+      throw new Error("turn execution state transfer has no pending request");
+    }
+  }
   // A server-repaired or server-planned turn may accept a fuller closure than
   // the request key the browser originally persisted. The bundled cache-warm
   // transfer is authored from that accepted transcript, so validate the capsule
@@ -1618,10 +1634,19 @@ async function validateTurnExecReplyStateTransfer(envelope: ShadowEnvelope<Shado
     scope: acceptedKey.scope,
     key: acceptedKey,
     actor: acceptedKey.actor,
-    session: request.call.session ?? null,
+    session: request?.call.session ?? reply.transcript?.session ?? null,
     target: acceptedKey.target,
     verb: acceptedKey.verb
   });
+}
+
+function sameAcceptedCommitIdentity(left: ShadowCommitAccepted, right: ShadowCommitAccepted): boolean {
+  return left.position.scope === right.position.scope &&
+    left.position.epoch === right.position.epoch &&
+    left.position.seq === right.position.seq &&
+    left.position.hash === right.position.hash &&
+    left.transcript_hash === right.transcript_hash &&
+    left.post_state_hash === right.post_state_hash;
 }
 
 async function envelopeWithValidatedTurnExecStateTransfer(

@@ -17,6 +17,9 @@ type V2TimelineEvent = {
   t: number;
   optimistic?: boolean;
   reason?: string;
+  replyTo?: string;
+  scope?: string;
+  seq?: number;
 };
 
 type V2Diagnostics = {
@@ -91,21 +94,39 @@ async function installV2Diagnostics(page: Page, label: string): Promise<V2Diagno
     }
   });
   await page.addInitScript(({ recordApplied, recordLocalFallback, recordLocalDelegation, recordLocalPlan, recordTerminalError, recordTransportError, recordTimeline }) => {
-    const recordEvent = (event: { kind: string; id?: unknown; verb?: unknown; optimistic?: unknown; reason?: unknown }) => {
+    const recordEvent = (event: {
+      kind: string;
+      id?: unknown;
+      verb?: unknown;
+      optimistic?: unknown;
+      reason?: unknown;
+      replyTo?: unknown;
+      scope?: unknown;
+      seq?: unknown;
+    }) => {
       void (window as unknown as Record<string, (value: unknown) => Promise<void>>)[recordTimeline]({
         kind: event.kind,
         id: typeof event.id === "string" ? event.id : "",
         verb: typeof event.verb === "string" ? event.verb : "",
         t: performance.now(),
         ...(typeof event.optimistic === "boolean" ? { optimistic: event.optimistic } : {}),
-        ...(typeof event.reason === "string" ? { reason: event.reason } : {})
+        ...(typeof event.reason === "string" ? { reason: event.reason } : {}),
+        ...(typeof event.replyTo === "string" ? { replyTo: event.replyTo } : {}),
+        ...(typeof event.scope === "string" ? { scope: event.scope } : {}),
+        ...(typeof event.seq === "number" ? { seq: event.seq } : {})
       });
     };
     window.addEventListener("woo.v2.applied_frame", (event) => {
       const detail = (event as CustomEvent<any>).detail;
       const verb = String(detail?.applied?.message?.verb ?? "");
       void (window as unknown as Record<string, (value: unknown) => Promise<void>>)[recordApplied](verb);
-      recordEvent({ kind: "applied_frame", id: detail?.applied?.id, verb });
+      recordEvent({
+        kind: "applied_frame",
+        id: detail?.applied?.id,
+        verb,
+        scope: detail?.applied?.position?.scope,
+        seq: detail?.applied?.position?.seq
+      });
     });
     window.addEventListener("woo.v2.local_turn_fallback", (event) => {
       const detail = (event as CustomEvent<any>).detail;
@@ -126,6 +147,17 @@ async function installV2Diagnostics(page: Page, label: string): Promise<V2Diagno
       const envelope = (event as CustomEvent<any>).detail;
       if (envelope?.type === "woo.transport.error.v1") {
         void (window as unknown as Record<string, (value: unknown) => Promise<void>>)[recordTransportError](envelope.body);
+      }
+      if (envelope?.type === "woo.turn.exec.reply.shadow.v1") {
+        recordEvent({
+          kind: "turn_exec_reply",
+          id: envelope.body?.id,
+          replyTo: envelope.reply_to,
+          verb: envelope.body?.transcript?.call?.verb,
+          reason: envelope.body?.reason,
+          scope: envelope.body?.commit?.position?.scope,
+          seq: envelope.body?.commit?.position?.seq
+        });
       }
     });
     window.addEventListener("woo.v2.turn_result", (event) => {
@@ -228,13 +260,20 @@ async function sendChatAndExpectSequenced(
     timelineAfter(diagnostics, cursor).some((event) => event.kind === "local_turn_planned" && event.verb === selectedVerb),
   { timeout: timeoutMs, message: `${text}: browser did not locally plan ${selectedVerb}` }).toBe(true);
 
-  await expect.poll(() =>
-    timelineAfter(diagnostics, cursor).some((event) =>
-      confirmation === "applied_frame"
-        ? event.kind === "applied_frame" && event.verb === selectedVerb
-        : event.kind === "turn_result" && event.verb === selectedVerb && event.optimistic !== true
-    ),
-  { timeout: timeoutMs, message: `${text}: server did not confirm ${selectedVerb}` }).toBe(true);
+  try {
+    await expect.poll(() =>
+      timelineAfter(diagnostics, cursor).some((event) =>
+        confirmation === "applied_frame"
+          ? event.kind === "applied_frame" && event.verb === selectedVerb
+          : event.kind === "turn_result" && event.verb === selectedVerb && event.optimistic !== true
+      ),
+    { timeout: timeoutMs, message: `${text}: server did not confirm ${selectedVerb}` }).toBe(true);
+  } catch (err) {
+    // Preserve the correlation and commit position in CI output. A raw browser
+    // console preview collapses nested reply objects to "Object", which hid the
+    // pending-request race this test is intended to catch.
+    throw new Error(`${text}: server did not confirm ${selectedVerb}; timeline=${JSON.stringify(timelineAfter(diagnostics, cursor))}`, { cause: err });
+  }
 
   const local = timelineAfter(diagnostics, cursor).find((event) => event.kind === "local_turn_planned" && event.verb === selectedVerb);
   const server = timelineAfter(diagnostics, cursor).find((event) =>

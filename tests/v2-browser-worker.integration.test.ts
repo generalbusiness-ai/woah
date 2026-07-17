@@ -1511,6 +1511,23 @@ describe("v2 browser worker integration", () => {
       }
     });
 
+    // A committed fanout may reach the submitter before the direct reply. It
+    // reconciles the proposal and removes the pending request, but carries no
+    // executor cache-warm transfer. The later direct reply must still be able
+    // to install its transfer when it names the exact frame already accepted.
+    socket.receive(encodeEnvelope({
+      ...relayEnvelope(browser, "accepted-key-transfer-fanout", "woo.turn.exec.reply.shadow.v1", {
+        kind: "woo.turn.exec.reply.shadow.v1",
+        ok: true,
+        id: request.id,
+        outcome: { result: null },
+        transcript,
+        commit: accepted
+      } satisfies ShadowTurnExecReply),
+      reply_to: "accepted-key-transfer-request"
+    }));
+    await waitForMessage(posted, (message) => isKind(message, "applied_frame"));
+
     socket.receive(encodeEnvelope({
       ...relayEnvelope(browser, "accepted-key-transfer-reply", "woo.turn.exec.reply.shadow.v1", {
         kind: "woo.turn.exec.reply.shadow.v1",
@@ -1524,9 +1541,6 @@ describe("v2 browser worker integration", () => {
       reply_to: "accepted-key-transfer-request"
     }));
 
-    expect(await waitForMessage(posted, (message) => isKind(message, "applied_frame"))).toMatchObject({
-      kind: "applied_frame"
-    });
     expect(await waitForMessage(posted, (message) => {
       if (!isKind(message, "frame")) return false;
       const envelope = (message as { envelope?: { id?: unknown } }).envelope;

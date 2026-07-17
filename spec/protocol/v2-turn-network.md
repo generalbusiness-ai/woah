@@ -2190,6 +2190,20 @@ A cache fill from one authority MUST NOT overwrite rows owned by another
 authority unless the transfer proof explicitly names that owner and the row kind
 is in the owner's authority set.
 
+A browser-local `TurnExecRequest` follows the same authority rule. When the
+write-set selector chooses a scope other than the call/planning scope, or the
+transcript carries a session-scope transition, the request MUST carry both
+`planned_transcript` and `planned_frame`; omitting them would cause the
+planning-scope relay to re-run the VM and create a second sequencer for the
+selected owner. A transport with one WebSocket anchored to the visible scope
+MUST decode that proof and dispatch the envelope to the selected commit scope,
+not blindly to the socket's scope. An authenticated gateway MAY satisfy the
+open/adopt step atomically while cold-seeding that selected authority from its
+versioned authority slice; in that case the authority uses its current head
+when the request's `expected` head names the planning scope. Same-scope planned
+turns without a session transition SHOULD omit the transcript and frame and use
+the normal executor path.
+
 ### VTN14.5 Optimistic UI and reconciliation
 
 The UI applies browser-local execution through an optimistic layer keyed by

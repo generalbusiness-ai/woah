@@ -2323,6 +2323,8 @@ describe("CFObjectRepository production-shape coverage", () => {
         call,
         key: shadowTurnKeyFromTranscript(planned.transcript),
         expected: browser.relay.commit_scope.head,
+        planned_transcript: planned.transcript,
+        planned_frame: planned.frame,
         persistence: "durable" as const
       };
       const encoded = encodeEnvelope(shadowBrowserEnvelope(browser, request.kind, request, "cf-v2-session-location-env"));
@@ -2350,6 +2352,13 @@ describe("CFObjectRepository production-shape coverage", () => {
 
       const replies = ws.sent.map((frame) => JSON.parse(frame) as Record<string, any>);
       expect(replies[0]?.body).toMatchObject({ ok: true, id: "cf-v2-session-location-move" });
+      // The socket remains attached to the chatroom, but the browser-provided
+      // relocation proof must be sequenced by the actor's singleton DO. This
+      // prevents the chatroom relay and actor relay from independently minting
+      // the same actor@seq1 frame.
+      expect(commitStates.get(session.actor)).toBeDefined();
+      expect(sqlRows(commitStates.get(session.actor)!.storage.sql.exec("SELECT seq FROM v2_commit_scope_accepted_frame"))).toEqual([{ seq: 1 }]);
+      expect(sqlRows(commitStates.get("the_chatroom")!.storage.sql.exec("SELECT seq FROM v2_commit_scope_accepted_frame"))).toEqual([]);
       expect(world.activeScopeForSession(session.id)).toBe("the_deck");
       expect(world.exportSessions()).toContainEqual(expect.objectContaining({
         id: session.id,

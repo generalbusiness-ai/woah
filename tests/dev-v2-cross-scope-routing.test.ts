@@ -20,10 +20,18 @@ import {
   shadowBrowserSessionBearer
 } from "../src/core/shadow-browser-node";
 import { encodeEnvelope } from "../src/core/shadow-envelope";
-import { buildVerbThrewReplyEnvelope, decodeTurnIntentForRecovery, resolveTurnEnvelopeRouting, resolveTurnEnvelopeScope } from "../src/server/dev-v2-helpers";
+import {
+  buildVerbThrewReplyEnvelope,
+  decodeTurnIntentForRecovery,
+  resolvePlannedTurnCommitScope,
+  resolveTurnEnvelopeRouting,
+  resolveTurnEnvelopeScope
+} from "../src/server/dev-v2-helpers";
 import { v2BrowserCacheMutationsForEnvelope } from "../src/client/v2-browser-cache";
 import { v2TurnResultMessageFromReply } from "../src/client/v2-browser-messages";
 import { serializedFor } from "../src/core/shadow-commit-scope";
+import type { ShadowTurnExecRequest } from "../src/core/shadow-turn-exec";
+import { shadowTurnKeyFromTranscript } from "../src/core/turn-key";
 import type { ObjRef } from "../src/core/types";
 
 function refreshRelaySessions(
@@ -179,6 +187,38 @@ describe("dev v2 cross-scope WS routing", () => {
     expect(reply.body.transcript?.call).toMatchObject({ target: session.actor, verb: "moveto", args: ["the_dubspace"] });
     expect(reply.body.commit?.position.scope).toBe(session.actor);
     expect(reply.body.commit).not.toHaveProperty("transaction");
+
+    const plannedExec = shadowBrowserEnvelope(browser, "woo.turn.exec.request.shadow.v1", {
+      kind: "woo.turn.exec.request.shadow.v1",
+      id: "planned-cross-scope-regression",
+      call: {
+        kind: "woo.turn_call.shadow.v1",
+        id: "planned-cross-scope-regression",
+        route: "direct",
+        scope: chatroomScope,
+        session: session.id,
+        actor: session.actor,
+        target: session.actor,
+        verb: "moveto",
+        args: ["the_dubspace"]
+      },
+      key: shadowTurnKeyFromTranscript(reply.body.transcript!),
+      expected: relay.commit_scope.head,
+      persistence: "durable",
+      planned_transcript: reply.body.transcript,
+      planned_frame: {
+        op: "result",
+        id: "planned-cross-scope-regression",
+        result: reply.body.transcript!.result ?? null,
+        observations: reply.body.transcript!.observations,
+        audience: reply.body.transcript!.scope
+      }
+    } satisfies ShadowTurnExecRequest);
+    // The call was planned while connected to the chatroom, but its only
+    // authoritative location write belongs to the actor. Localdev must choose
+    // the same singleton relay that durable intents and workerd use, rather
+    // than minting a second guest_1@seq1 under the room relay.
+    expect(resolvePlannedTurnCommitScope(encodeEnvelope(plannedExec))).toBe(session.actor);
   });
 
   it("commits an outliner 'add' intent end-to-end through the same WS handler logic the SPA uses", async () => {

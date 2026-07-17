@@ -1,7 +1,7 @@
 import { runShadowTurnCallTranscript } from "../core/shadow-turn-call";
 import { buildPlanningWorld } from "../core/planning-world";
 import type { EffectTranscript } from "../core/effect-transcript";
-import type { ShadowScopeHead } from "../core/shadow-commit-scope";
+import { shadowCommitScopeForTranscript, type ShadowScopeHead } from "../core/shadow-commit-scope";
 import { executeShadowTurnCallOrNeedState, missingAtomsForShadowTurn, type ShadowMissingAtom, type ShadowTurnExecRequest } from "../core/shadow-turn-exec";
 import { shadowAtomHash, shadowTurnKeyFromTranscript } from "../core/turn-key";
 import type { ShadowTurnKey } from "../core/turn-key";
@@ -84,7 +84,7 @@ export async function planV2BrowserLocalTurn(input: V2BrowserLocalTurnInput): Pr
     buildPlanningWorld(executionNode.serialized, executionNode.cellProvenance ?? new Map(), { enforceMissingProvenance: true }),
     call);
   const key = shadowTurnKeyFromTranscript(planned.transcript);
-  const request: ShadowTurnExecRequest = {
+  const baseRequest: ShadowTurnExecRequest = {
     kind: "woo.turn.exec.request.shadow.v1",
     id: input.id,
     call,
@@ -98,16 +98,29 @@ export async function planV2BrowserLocalTurn(input: V2BrowserLocalTurnInput): Pr
     persistence: input.persistence
   };
   const missing = missingAtomsForShadowTurn(executionNode, key);
-  if (missing.length > 0) return { ok: false, reason: "missing_state", missing_atoms: missing, key, request };
-  const executed = await executeShadowTurnCallOrNeedState(executionNode, request);
+  if (missing.length > 0) return { ok: false, reason: "missing_state", missing_atoms: missing, key, request: baseRequest };
+  const executed = await executeShadowTurnCallOrNeedState(executionNode, baseRequest);
   if (executed.ok === false) {
-    if (executed.reason === "missing_state") return { ok: false, reason: "missing_state", missing_atoms: executed.missing_atoms, key, request };
+    if (executed.reason === "missing_state") return { ok: false, reason: "missing_state", missing_atoms: executed.missing_atoms, key, request: baseRequest };
     return { ok: false, reason: "commit_rejected" };
   }
   const materializationMiss = missingObjectAtomsFromErrorFrame(executed.frame);
   if (materializationMiss.length > 0) {
-    return { ok: false, reason: "missing_state", missing_atoms: materializationMiss, key, request };
+    return { ok: false, reason: "missing_state", missing_atoms: materializationMiss, key, request: baseRequest };
   }
+  const selectedCommitScope = shadowCommitScopeForTranscript(executed.transcript, input.scope).scope;
+  // A cross-scope/transition plan has already performed the VM work needed to
+  // choose its authority. Preserve that proof on the wire, just as the core
+  // executor does, so the receiving authority validates and commits it instead
+  // of re-running the call through a relay anchored to the planning scope.
+  const request: ShadowTurnExecRequest =
+    selectedCommitScope !== input.scope || executed.transcript.sessionScopeTransition !== undefined
+      ? {
+          ...baseRequest,
+          planned_transcript: executed.transcript,
+          planned_frame: executed.frame
+        }
+      : baseRequest;
   return {
     ok: true,
     request,

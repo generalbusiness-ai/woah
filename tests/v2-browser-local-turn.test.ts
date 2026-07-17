@@ -132,6 +132,9 @@ describe("v2 browser local turn planning", () => {
       },
       transcript_hash: planned.transcript.hash
     });
+    if (!local.ok) throw new Error("expected local set-control plan");
+    expect(local.request).not.toHaveProperty("planned_transcript");
+    expect(local.request).not.toHaveProperty("planned_frame");
   });
 
   it("reports no executable state before the browser has learned cell pages", async () => {
@@ -512,7 +515,13 @@ describe("v2 browser local turn planning", () => {
 
     expect(planned).toMatchObject({
       ok: true,
-      request: { call: { target: second.actor, verb: "moveto", args: ["the_pinboard"] } },
+      request: {
+        call: { target: second.actor, verb: "moveto", args: ["the_pinboard"] },
+        planned_transcript: expect.objectContaining({
+          call: expect.objectContaining({ actor: second.actor, target: second.actor, verb: "moveto" })
+        }),
+        planned_frame: expect.any(Object)
+      },
       optimistic_frame: {
         op: "result",
         result: { room: "the_pinboard" }

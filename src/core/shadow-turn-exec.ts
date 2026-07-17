@@ -257,6 +257,21 @@ export type ShadowTurnExecRequest = {
   persistence?: "durable" | "live";
 };
 
+/**
+ * Return the write-set-selected authority carried by a browser-planned turn.
+ * The call scope is where planning happened; a pure relocation is sequenced by
+ * the moved object instead. Transport adapters use this before dispatch so a
+ * planned transcript never creates a second, private sequencer under the call
+ * scope. Unplanned/delegated requests return null and keep their normal route.
+ */
+export function shadowPlannedTurnExecCommitScope(request: ShadowTurnExecRequest): ObjRef | null {
+  if (!request.planned_transcript) return null;
+  return selectCommitScopeForTranscript(
+    request.planned_transcript,
+    request.planned_transcript.scope
+  ).scope;
+}
+
 export type ShadowTurnExecReply =
   | {
       kind: "woo.turn.exec.reply.shadow.v1";

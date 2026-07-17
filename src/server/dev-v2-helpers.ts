@@ -23,7 +23,12 @@
 // CommitScopeDO surface.
 
 import type { EffectTranscript } from "../core/effect-transcript";
-import { serializedFor, transcriptSessionActiveScope, transcriptTouchedObjectIds, type ShadowCommitAccepted } from "../core/shadow-commit-scope";
+import {
+  serializedFor,
+  transcriptSessionActiveScope,
+  transcriptTouchedObjectIds,
+  type ShadowCommitAccepted
+} from "../core/shadow-commit-scope";
 import { fanOutHostWrites, partitionProjectionWritesByHost } from "../core/object-host-write-through";
 import {
   browserProfileProjectionContext,
@@ -40,7 +45,12 @@ import {
   type V2FanoutPeer
 } from "../core/v2-fanout-projection";
 import { decodeEnvelope, encodeEnvelope, type ShadowEnvelope, type ShadowEnvelopeAuth } from "../core/shadow-envelope";
-import type { ShadowStateTransfer, ShadowTurnExecReply } from "../core/shadow-turn-exec";
+import {
+  shadowPlannedTurnExecCommitScope,
+  type ShadowStateTransfer,
+  type ShadowTurnExecReply,
+  type ShadowTurnExecRequest
+} from "../core/shadow-turn-exec";
 import {
   executorAuthorityPayload,
   submitTurnIntent,
@@ -513,6 +523,28 @@ export function decodeTurnIntentCall(encoded: string, sessionId: string, token: 
       persistence: b.persistence === "live" ? "live" : "durable",
       token
     };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve the authority for a browser-planned exec request before localdev
+ * executes it. Browser planning happens in the visible room, but a relocation
+ * transcript commits at the moved object's scope. Routing solely by call.scope
+ * creates a second, private foreign-scope sequencer under the room relay; both
+ * it and the real per-scope relay can then mint `actor@seq 1`, and the browser
+ * correctly drops the later move as an old frame.
+ *
+ * Production and localdev both resolve this before dispatch; the only
+ * difference is whether the selected authority is a DO or an in-process relay.
+ */
+export function resolvePlannedTurnCommitScope(encoded: string): ObjRef | null {
+  try {
+    const envelope = decodeEnvelope<ShadowTurnExecRequest>(encoded);
+    if (envelope.type !== "woo.turn.exec.request.shadow.v1") return null;
+    if (envelope.body?.kind !== "woo.turn.exec.request.shadow.v1") return null;
+    return shadowPlannedTurnExecCommitScope(envelope.body);
   } catch {
     return null;
   }

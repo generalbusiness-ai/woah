@@ -57,6 +57,7 @@ import {
   executeDevV2DurableTurnWsReply,
   materializeDevV2CommitLocally,
   planDevV2BrowserFanout,
+  resolvePlannedTurnCommitScope,
   resolveTurnEnvelopeRouting
 } from "./dev-v2-helpers";
 import { stableShadowJson } from "../core/shadow-cell-version";
@@ -744,7 +745,9 @@ async function handleV2ShadowFrame(
     const routing = resolveTurnEnvelopeRouting(world, encoded);
     const callScope = routing?.scope ?? null;
     const callTarget = routing?.target ?? null;
-    const crossScope = !!callScope && callScope !== browser.relay.commit_scope.scope;
+    const plannedCommitScope = resolvePlannedTurnCommitScope(encoded);
+    const relayScope = plannedCommitScope ?? callScope;
+    const crossScope = !!relayScope && relayScope !== browser.relay.commit_scope.scope;
     // Verbs commonly iterate `contents(this)` and call isa/prop reads on each
     // member (e.g. $outliner:list_items, $room:look_self). The relay's
     // serialized snapshot must therefore include those contained objects, not
@@ -752,7 +755,7 @@ async function handleV2ShadowFrame(
     // by earlier commits in the same session. The REST path's per-request
     // relay reuses a fully-refreshed shim so it hits this naturally; the WS
     // path's persistent relay misses it unless we ask explicitly.
-    const baseTarget = crossScope ? callScope! : browser.relay.commit_scope.scope;
+    const baseTarget = callScope ?? browser.relay.commit_scope.scope;
     const containerForContents = callTarget ?? baseTarget;
     const containerContents = world.objects.has(containerForContents)
       ? Array.from(world.object(containerForContents).contents)
@@ -768,7 +771,7 @@ async function handleV2ShadowFrame(
       seenExplicitRows.add(id);
       explicitRows.push(id);
     }
-    const targetRelay = crossScope ? v2RelayForScope(callScope!) : browser.relay;
+    const targetRelay = crossScope ? v2RelayForScope(relayScope!) : browser.relay;
     // Refresh wipes session_auth and then re-registers wire tokens only
     // for browsers tracked in `relay.browsers`. The WS-bound `browser` is
     // subscribed there at WS open, so its wire token survives the
@@ -778,7 +781,7 @@ async function handleV2ShadowFrame(
     refreshDevV2RelaySessions(targetRelay, explicitRows);
     ensureDevV2SerializedSession(targetRelay, session);
     const turnBrowser = crossScope
-      ? v2ShadowBrowser(browser.node, token, session, callScope!)
+      ? v2ShadowBrowser(browser.node, token, session, relayScope!)
       : browser;
     const receipt = receiveShadowBrowserEnvelopeReceipt(turnBrowser, encoded);
     const stateReply = executeDevV2StateTransferWsReply({
