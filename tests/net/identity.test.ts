@@ -181,3 +181,26 @@ describe("customer attribution seeding (audit.md AU3.1)", () => {
     expect(again.unattributed).toEqual(first.unattributed);
   });
 });
+
+describe("scope attribution at install (AU3.3)", () => {
+  it("stamps the catalog scope to operator and each cluster to its actor's customer", async () => {
+    const { world, actor } = oldWorld();
+    const identity = exportIdentity(world.exportWorld());
+    const plan = await planNetInstall({ graft: (fresh) => importIdentity(fresh, identity) });
+    expect(plan.attributions.get(CATALOG_SCOPE)).toMatchObject({
+      customer: "operator",
+      derived_via: "operator",
+      stamped_at_epoch: plan.epoch
+    });
+    expect(plan.attributions.get(`cluster:${actor}`)).toMatchObject({
+      customer: "acct_1",
+      derived_via: "cluster_actor"
+    });
+    // Wizard-owned rooms in the bundled world attribute to operator.
+    for (const [scope, attr] of plan.attributions) {
+      if (scope.startsWith("room:")) {
+        expect(attr.customer.length).toBeGreaterThan(0);
+      }
+    }
+  });
+});

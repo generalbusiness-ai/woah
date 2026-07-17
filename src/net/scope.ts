@@ -34,7 +34,8 @@ import {
   orderedProjectionKey,
   type OrderedChildRow
 } from "./ordered-edges";
-import type { ScopeStore, TailEntry } from "./scope-store";
+import type { ScopeAttribution } from "./attribution";
+import type { ScopeMeta, ScopeStore, TailEntry } from "./scope-store";
 import { applyTranscript, netCellKeyFor, type EffectTranscript, type TranscriptCell } from "./transcript";
 import { cellKey, cellVersion } from "./cells";
 
@@ -207,6 +208,10 @@ export class ScopeSequencer {
   private nextObjectCounter: number | null = null;
   private readonly replies = new Map<string, CommitReply>();
   private readonly tail: TailEntry[] = [];
+  /** AU3.3 scope attribution, hydrated from meta and stamped at seed.
+   * Held here so every meta rewrite (commit, adopt, schedule) carries it
+   * forward — a fresh {scope, epoch, head} row must never drop it. */
+  private attribution: ScopeAttribution | null = null;
   private readonly scheduled = new Map<string, ScheduledTurn>();
   private readonly relationRows = new Map<string, RelationRow>();
   /** CO13 ordered-edge relation buckets, maintained in (rank, child) order
@@ -255,6 +260,7 @@ export class ScopeSequencer {
           });
         }
         this.headState = meta.head;
+        this.attribution = meta.attribution ?? null;
       }
       for (const cell of durable.readCells()) this.store.install(cell);
       for (const { key, reply } of durable.readReplies()) this.replies.set(key, reply);
@@ -313,9 +319,28 @@ export class ScopeSequencer {
    * an unchanged head — invisible to every version check — so it
    * refuses terminally. Activation-state changes ride the dedicated
    * operator op (operatorActivationWrite), never a seed. */
+  /** The complete durable meta row. Centralized so no write site can
+   * construct a partial row that drops the stamped attribution. */
+  private metaRow(): ScopeMeta {
+    return {
+      scope: this.scope,
+      catalog_epoch: this.catalogEpoch,
+      head: this.headState,
+      ...(this.attribution !== null ? { attribution: this.attribution } : {})
+    };
+  }
+
+  /** AU3.3: the stamped owning customer of this scope's anchor, or null
+   * when unstamped (pre-attribution seeds; record minting attributes
+   * unstamped scopes to the operator and flags them). */
+  scopeAttribution(): ScopeAttribution | null {
+    return this.attribution;
+  }
+
   seed(
     cells: Array<Pick<Cell, "kind" | "object" | "name" | "value">>,
-    relations?: RelationRow[]
+    relations?: RelationRow[],
+    attribution?: ScopeAttribution
   ): void {
     if (this.headState.seq > 0) {
       throw netError("E_SEED_COMMITTED", "scope has committed turns; a re-seed would reset authoritative state", {
@@ -324,6 +349,10 @@ export class ScopeSequencer {
       });
     }
     this.nextObjectCounter = null; // re-derive over the seeded store
+    // Same-epoch idempotent re-seed may re-stamp (same pipeline, same
+    // value); an omitted field on a re-seed preserves the prior stamp
+    // (legacy-caller posture, mirroring the relations rule below).
+    if (attribution !== undefined) this.attribution = attribution;
     const seeded: Cell[] = [];
     for (const cell of cells) {
       seeded.push(this.store.commit({ kind: cell.kind, object: cell.object, ...(cell.name !== undefined ? { name: cell.name } : {}), value: cell.value, stamp: this.stamp() }));
@@ -349,7 +378,7 @@ export class ScopeSequencer {
         }
         // Meta is written on seed too, so a seeded-but-never-committed
         // scope still hydrates with its head and epoch.
-        durable.writeMeta({ scope: this.scope, catalog_epoch: this.catalogEpoch, head: this.headState });
+        durable.writeMeta(this.metaRow());
       });
     }
   }
@@ -376,7 +405,7 @@ export class ScopeSequencer {
     if (durable) {
       durable.transaction(() => {
         durable.writeCell(committed);
-        durable.writeMeta({ scope: this.scope, catalog_epoch: this.catalogEpoch, head: this.headState });
+        durable.writeMeta(this.metaRow());
       });
     }
   }
@@ -436,7 +465,7 @@ export class ScopeSequencer {
       durable.transaction(() => {
         for (const cell of committed) durable.writeCell(cell);
         for (const key of removed) durable.deleteCell(key);
-        durable.writeMeta({ scope: this.scope, catalog_epoch: this.catalogEpoch, head: this.headState });
+        durable.writeMeta(this.metaRow());
         durable.appendTail(tailEntry);
         durable.trimTail(this.options.tailLimit);
       });
@@ -729,7 +758,7 @@ export class ScopeSequencer {
           if (cell) durable.writeCell(cell);
           else durable.deleteCell(key);
         }
-        durable.writeMeta({ scope: this.scope, catalog_epoch: this.catalogEpoch, head: this.headState });
+        durable.writeMeta(this.metaRow());
         durable.writeReply(submit.idempotency_key, reply);
         durable.appendTail(tailEntry);
         durable.trimTail(this.options.tailLimit);
@@ -879,7 +908,7 @@ export class ScopeSequencer {
           const cell = this.store.get(key);
           if (cell) durable.writeCell(cell);
         }
-        durable.writeMeta({ scope: this.scope, catalog_epoch: this.catalogEpoch, head: this.headState });
+        durable.writeMeta(this.metaRow());
         durable.appendTail(tailEntry);
         durable.trimTail(this.options.tailLimit);
       });
@@ -1035,7 +1064,7 @@ export class ScopeSequencer {
           const cell = this.store.get(key);
           if (cell) durable.writeCell(cell);
         }
-        durable.writeMeta({ scope: this.scope, catalog_epoch: this.catalogEpoch, head: this.headState });
+        durable.writeMeta(this.metaRow());
         durable.appendTail(tailEntry);
         durable.trimTail(this.options.tailLimit);
         for (const key of changedRelationKeys) {
@@ -1108,7 +1137,7 @@ export class ScopeSequencer {
           if (row) durable.writeRelation(key, row);
           else durable.deleteRelation(key);
         }
-        durable.writeMeta({ scope: this.scope, catalog_epoch: this.catalogEpoch, head: this.headState });
+        durable.writeMeta(this.metaRow());
         durable.appendTail(tailEntry);
         durable.trimTail(this.options.tailLimit);
       });

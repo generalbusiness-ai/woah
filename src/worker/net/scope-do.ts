@@ -77,6 +77,7 @@
  * the standing v2 freeze continues, nothing routes production traffic
  * here until Phase 5.
  */
+import { normalizeScopeAttribution } from "../../net/attribution";
 import type { Cell } from "../../net/cells";
 import { cellKey, lineageClosureKeys, serializeTransfer, type CellTransfer } from "../../net/cells";
 import { isNetError, netError } from "../../net/errors";
@@ -966,6 +967,9 @@ export class NetScopeDO {
           catalog_epoch: string;
           cells: Array<Pick<Cell, "kind" | "object" | "name" | "value">>;
           relations?: RelationRow[];
+          /** AU3.3 stamp from the install pipeline; shape-guarded here —
+           * a malformed stamp seeds unstamped rather than poisoning meta. */
+          attribution?: unknown;
         };
         // M9 seed-time epoch guard: a scope seeded at epoch A must refuse
         // a seed stamped with epoch B — without this, ensureSequencer
@@ -986,7 +990,8 @@ export class NetScopeDO {
         const seq = this.ensureSequencer(body.scope, body.catalog_epoch);
         // Preserve the distinction between a legacy omitted relation field
         // and an explicit complete empty family on an installer re-seed.
-        this.discardSeqOnThrow(() => seq.seed(body.cells, body.relations));
+        const attribution = normalizeScopeAttribution(body.attribution) ?? undefined;
+        this.discardSeqOnThrow(() => seq.seed(body.cells, body.relations, attribution));
         // H2b: seeded session cells arm the reap wake too.
         if (body.cells.some((cell) => cell.kind === "session")) this.armSessionReapAlarm(seq);
         return json({ ok: true, scope: seq.scope, head: seq.head() });

@@ -101,6 +101,37 @@ export function deriveCustomerAttribution(
   return null;
 }
 
+/**
+ * Scope-level attribution (AU3.3): the customer owning the scope's
+ * anchor, stamped into scope meta at seed/install time — anchor lineage
+ * carries an owner OBJREF, not an account, so this must be pre-stamped
+ * by the install pipeline (which has the whole graph) and can never be
+ * derived by the scope at runtime. Rewritten only by audited
+ * ownership-transfer admin actions.
+ */
+export type ScopeAttribution = {
+  customer: string;
+  derived_via: "cluster_actor" | "anchor_owner" | "operator" | "transfer";
+  stamped_at_epoch: string;
+};
+
+/** Read guard for scope meta's attribution value. */
+export function normalizeScopeAttribution(raw: unknown): ScopeAttribution | null {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const v = raw as Record<string, unknown>;
+  if (typeof v.customer !== "string" || v.customer.length === 0) return null;
+  if (
+    v.derived_via !== "cluster_actor" &&
+    v.derived_via !== "anchor_owner" &&
+    v.derived_via !== "operator" &&
+    v.derived_via !== "transfer"
+  ) {
+    return null;
+  }
+  if (typeof v.stamped_at_epoch !== "string" || v.stamped_at_epoch.length === 0) return null;
+  return { customer: v.customer, derived_via: v.derived_via, stamped_at_epoch: v.stamped_at_epoch };
+}
+
 /** Cell key for an actor's attribution: `property_cell:<actor>:customer_of`. */
 export function customerOfCellKey(actor: string): string {
   return cellKey("property_cell", actor, PROP_CUSTOMER_OF);

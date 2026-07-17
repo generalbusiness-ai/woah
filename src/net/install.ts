@@ -22,6 +22,12 @@
  * decision, not a re-seed.)
  */
 import { createWorld, GUEST_RESET_NATIVE } from "../core/bootstrap";
+import {
+  normalizeCustomerAttribution,
+  OPERATOR_CUSTOMER_ID,
+  PROP_CUSTOMER_OF,
+  type ScopeAttribution
+} from "./attribution";
 import { DEFAULT_LOCAL_CATALOGS, installLocalCatalogs, localCatalogBundleFingerprint } from "../core/local-catalogs";
 import type { WooWorld } from "../core/world";
 import { cellsFromSerialized, type NetCellInput } from "./bridge";
@@ -61,6 +67,10 @@ export type NetInstallPlan = {
   /** The built world — callers verify against it (e.g. that an imported
    * apikey authenticates) and mine it for reports. */
   world: WooWorld;
+  /** AU3.3 per-scope owning customer, resolved from the anchor owner's
+   * `customer_of` while the whole graph is in hand. Scopes with an
+   * unattributable anchor owner are ABSENT (unstamped), never guessed. */
+  attributions: Map<string, ScopeAttribution>;
 };
 
 export type NetInstallOptions = {
@@ -114,7 +124,75 @@ export async function planNetInstall(options: NetInstallOptions = {}): Promise<N
     catalog.push(netActivationCell(epoch));
     partitions.set(CATALOG_SCOPE, catalog);
   }
-  return { epoch, partitions, relations, world };
+  const attributions = deriveScopeAttributions(world, [...partitions.keys()], epoch);
+  return { epoch, partitions, relations, world, attributions };
+}
+
+/**
+ * AU3.3: compute each scope's owning customer while the whole graph is
+ * in hand — anchor lineage only carries an owner OBJREF, so this is the
+ * one place the objref → customer resolution may happen. Scopes whose
+ * anchor owner has no `customer_of` stay UNSTAMPED (absent from the
+ * map): record minting later attributes them to the operator and flags
+ * them, per the spec — the installer never guesses.
+ */
+export function deriveScopeAttributions(
+  world: WooWorld,
+  scopes: readonly string[],
+  epoch: string
+): Map<string, ScopeAttribution> {
+  const attributions = new Map<string, ScopeAttribution>();
+  const customerOf = (obj: string): ReturnType<typeof normalizeCustomerAttribution> => {
+    try {
+      return normalizeCustomerAttribution(world.propOrNull(obj, PROP_CUSTOMER_OF));
+    } catch {
+      return null;
+    }
+  };
+  const isWizard = (obj: string): boolean => {
+    try {
+      return obj === "$wiz" || world.object(obj).flags.wizard === true;
+    } catch {
+      return false;
+    }
+  };
+  for (const scope of scopes) {
+    if (scope === CATALOG_SCOPE) {
+      // The shared substrate is the operator's by definition.
+      attributions.set(scope, { customer: OPERATOR_CUSTOMER_ID, derived_via: "operator", stamped_at_epoch: epoch });
+      continue;
+    }
+    if (scope.startsWith("cluster:")) {
+      const actor = scope.slice("cluster:".length);
+      const attr = customerOf(actor);
+      if (attr) {
+        attributions.set(scope, { customer: attr.customer, derived_via: "cluster_actor", stamped_at_epoch: epoch });
+      } else if (isWizard(actor)) {
+        attributions.set(scope, { customer: OPERATOR_CUSTOMER_ID, derived_via: "operator", stamped_at_epoch: epoch });
+      }
+      continue;
+    }
+    if (scope.startsWith("room:")) {
+      const space = scope.slice("room:".length);
+      let owner: string | null = null;
+      try {
+        owner = world.object(space).owner;
+      } catch {
+        owner = null;
+      }
+      if (owner === null) continue;
+      if (isWizard(owner)) {
+        attributions.set(scope, { customer: OPERATOR_CUSTOMER_ID, derived_via: "operator", stamped_at_epoch: epoch });
+        continue;
+      }
+      const attr = customerOf(owner);
+      if (attr) {
+        attributions.set(scope, { customer: attr.customer, derived_via: "anchor_owner", stamped_at_epoch: epoch });
+      }
+      continue;
+    }
+  }
+  return attributions;
 }
 
 /** Derive the install-time `contents` family from the complete world image and

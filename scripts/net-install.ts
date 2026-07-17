@@ -151,7 +151,15 @@ export async function runNetInstall(args: NetInstallArgs, env: { WOO_INTERNAL_SE
     const response = await signedFetch(env, new Request(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ scope, catalog_epoch: plan.epoch, cells, relations: plan.relations.get(scope) ?? [] })
+      body: JSON.stringify({
+        scope,
+        catalog_epoch: plan.epoch,
+        cells,
+        relations: plan.relations.get(scope) ?? [],
+        // AU3.3: stamp the scope's owning customer at seed; absent for
+        // scopes the plan could not attribute (never guessed here).
+        ...(plan.attributions.has(scope) ? { attribution: plan.attributions.get(scope) } : {})
+      })
     }));
     const body = await response.text();
     if (!response.ok) throw new Error(`seed ${scope} failed: ${response.status} ${body}`);

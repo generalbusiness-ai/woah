@@ -16,6 +16,7 @@
  * store. There is no lazy partial hydration in Phase 3 (scopes are
  * room-sized; CA12.1 cell-keyed splitting is the deferred scale lever).
  */
+import type { ScopeAttribution } from "./attribution";
 import type { Cell } from "./cells";
 import type { RelationRow } from "./relations";
 import type { CommitReply, ScheduledTurn, ScopeHead } from "./scope";
@@ -24,6 +25,10 @@ export type ScopeMeta = {
   scope: string;
   catalog_epoch: string;
   head: ScopeHead;
+  /** AU3.3 scope attribution: the customer owning the scope's anchor,
+   * stamped at seed/install (additive — rows written before this field
+   * existed read back without it and count as unstamped). */
+  attribution?: ScopeAttribution;
 };
 
 export type TailEntry = {

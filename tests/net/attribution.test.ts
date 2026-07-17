@@ -9,9 +9,12 @@ import {
   customerOfCellKey,
   GUEST_CUSTOMER_ID,
   normalizeCustomerAttribution,
+  normalizeScopeAttribution,
   OPERATOR_CUSTOMER_ID,
   type AttributionSource
 } from "../../src/net/attribution";
+import { ScopeSequencer } from "../../src/net/scope";
+import { InMemoryScopeStore } from "../../src/net/scope-store";
 
 /** Fixture world: a flat description of actors for the derivation rules. */
 function source(fixture: {
@@ -118,4 +121,34 @@ describe("normalizeCustomerAttribution", () => {
       expect(normalizeCustomerAttribution(value)).toBeNull();
     });
   }
+});
+
+describe("scope attribution stamping (AU3.3)", () => {
+  it("seed stamps meta; later meta rewrites and rehydration preserve it; omitted re-seed keeps the prior stamp", () => {
+    const store = new InMemoryScopeStore();
+    const stamp = {
+      customer: "#acct1",
+      derived_via: "anchor_owner",
+      stamped_at_epoch: "cat-attr-1"
+    } as const;
+    const seq = new ScopeSequencer("room:the_room", "cat-attr-1", { durable: store });
+    seq.seed([], undefined, stamp);
+    expect(seq.scopeAttribution()).toEqual(stamp);
+    expect(store.readMeta()?.attribution).toEqual(stamp);
+
+    // A re-seed that omits the field preserves the stamp (legacy-caller
+    // posture), and a rehydrated sequencer still carries it.
+    seq.seed([]);
+    expect(store.readMeta()?.attribution).toEqual(stamp);
+    const rehydrated = new ScopeSequencer("room:the_room", "cat-attr-1", { durable: store });
+    expect(rehydrated.scopeAttribution()).toEqual(stamp);
+  });
+
+  it("normalizeScopeAttribution rejects malformed stamps", () => {
+    expect(normalizeScopeAttribution({ customer: "#a", derived_via: "anchor_owner", stamped_at_epoch: "e" }))
+      .not.toBeNull();
+    expect(normalizeScopeAttribution({ customer: "#a", derived_via: "vibes", stamped_at_epoch: "e" })).toBeNull();
+    expect(normalizeScopeAttribution({ customer: "", derived_via: "operator", stamped_at_epoch: "e" })).toBeNull();
+    expect(normalizeScopeAttribution({ customer: "#a", derived_via: "operator" })).toBeNull();
+  });
 });
