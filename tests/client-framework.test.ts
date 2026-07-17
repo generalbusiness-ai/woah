@@ -1203,6 +1203,17 @@ describe("catalog UI registry", () => {
     expect(mapFrame?.frame.id).toBe("pinboard.map");
   });
 
+  it("resolves a component's declaring frame without object lineage", () => {
+    const registry = new CatalogUiRegistry();
+    registry.installCatalogUi(pkg);
+
+    // A sparse remote projection may not yet prove that the concrete board is
+    // a $pinboard. The shell nevertheless knows which declared component it
+    // mounted, and that declaration must select the same default frame.
+    expect(registry.resolveFrame("the_board", undefined, () => false)).toBeUndefined();
+    expect(registry.frameForComponent("pinboard.board", "pinboard")?.frame.id).toBe("pinboard.default");
+  });
+
   it("validates module tag registration against manifest declarations", () => {
     const registry = new CatalogUiRegistry();
     registry.installCatalogUi(pkg);

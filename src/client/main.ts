@@ -20,7 +20,7 @@ import * as weatherUiModule from "../../catalogs/weather/ui/weather-badge";
 import { DUBSPACE_DRUM_VOICES, LOOP_DEFAULT_SEMITONES, NOTE_NAMES, PITCH_MAX_SEMITONE, PITCH_MIN_SEMITONE, PITCH_ROOT_FREQ, PITCH_ROOT_MIDI } from "../../catalogs/dubspace/ui/model";
 import { appliedFrameErrorObservations, chatErrorText } from "./chat-errors";
 import { chatObservationSpace, updateEnteredLeftChatPresence } from "./chat-state";
-import { CoalescedViewHydrator, createWooClientFramework, displayTextCacheKey, escapeHtml, liveProjectionKey, ProjectionFieldFiller, pruneDisplayTextCaches, readDisplayTextCache, writeDisplayTextCache, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type WooContext, type WooElement, type WooViewHydrationContext } from "./framework";
+import { CoalescedViewHydrator, createWooClientFramework, displayTextCacheKey, escapeHtml, liveProjectionKey, ProjectionFieldFiller, pruneDisplayTextCaches, readDisplayTextCache, writeDisplayTextCache, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type ResolvedFrame, type WooContext, type WooElement, type WooViewHydrationContext } from "./framework";
 import { isPinboardObservation } from "./pinboard-observation";
 import { clearProvisionalChatLines, provisionalChatErrorLine, upsertProvisionalChatLine } from "./provisional-chat";
 import { advanceProjectionCursor, idsFromRefsOrSummaries, presentActorsFromObservation, resolveOptionalRoomContents, scopedHerePresentActors, scopedModelWithMoveResult, type ScopedProjectionStateModel } from "./scoped-projection";
@@ -896,6 +896,7 @@ function connect() {
     projectionFiller.reset();
     resetPinboardNotesHydration();
     catalogViewHydrator.reset();
+    catalogViewFrames.clear();
     render();
     try {
       await refresh();
@@ -1615,6 +1616,18 @@ function toolFrameForSubject(subject: string, summary?: any) {
   return ui.catalogUi.resolveFrame(subject, undefined, (candidate, classRef) => clientClassDistance(candidate, classRef, candidate === subject ? summary : undefined));
 }
 
+function toolFrameForTab(tab: ToolTab, subject = toolSpace(tab)): ResolvedFrame | undefined {
+  const resolved = toolFrameForSubject(subject);
+  if (resolved) return resolved;
+  const definition = toolDefinition(tab);
+  // Sparse Net room projections may omit class lineage even though the shell
+  // has already selected the component from this data-driven tool definition.
+  // Reuse that declaration so frame-owned behavior and rendering cannot drift.
+  return definition
+    ? ui.catalogUi.frameForComponent(definition.frameComponent, definition.catalogAlias)
+    : undefined;
+}
+
 async function applyLocationRoute(mode: "replace" | "push", route: RouteLocation | null = parseLocationRoute(location.pathname, location.search)) {
   if (!route || !route.objectId) {
     syncUrlFromCurrentState(mode);
@@ -1816,7 +1829,7 @@ async function ensureScopedOverlayForTab(tab: AppTab, options: { force?: boolean
     // Frame-declared catalog hydrations own their semantic read and patch
     // shape. The shell contributes only presence, transport, and projection
     // capabilities; CoalescedViewHydrator supplies one shared retry policy.
-    if (ensureCatalogViewHydration(subject)) return;
+    if (ensureCatalogViewHydration(subject, isToolTab(tab) ? toolFrameForTab(tab, subject) : toolFrameForSubject(subject))) return;
     if (tab === "pinboard") {
       try {
         applyPinboardNotesCanonical(subject, await readPinboardNotesView(subject));
@@ -2166,8 +2179,7 @@ function installedCatalogRecords(): readonly unknown[] {
   return Array.isArray(catalogUiCache?.catalogs) ? catalogUiCache.catalogs : [];
 }
 
-function catalogViewHydrationContext(subject: string): WooViewHydrationContext | null {
-  const resolved = toolFrameForSubject(subject);
+function catalogViewHydrationContext(subject: string, resolved = catalogViewFrames.get(subject) ?? toolFrameForSubject(subject)): WooViewHydrationContext | null {
   if (!ui.catalogUi.viewHydration(resolved)) return null;
   return {
     subject,
@@ -2184,11 +2196,16 @@ function catalogViewHydrationContext(subject: string): WooViewHydrationContext |
   };
 }
 
+// The mounted component is enough to select its declaring frame even when a
+// sparse Net projection has not yielded object lineage. Retain that generic
+// resolution across the asynchronous hydration read and error callback.
+const catalogViewFrames = new Map<string, ResolvedFrame>();
+
 const catalogViewHydrator = new CoalescedViewHydrator<ProjectionPatch[]>({
   read: async (subject, signature) => {
-    const resolved = toolFrameForSubject(subject);
+    const resolved = catalogViewFrames.get(subject) ?? toolFrameForSubject(subject);
     const registered = ui.catalogUi.viewHydration(resolved);
-    const context = catalogViewHydrationContext(subject);
+    const context = catalogViewHydrationContext(subject, resolved);
     if (!registered || registered.id !== signature || !context) throw new Error(`catalog view hydration disappeared: ${signature}`);
     return registered.hydration.read(context);
   },
@@ -2197,9 +2214,9 @@ const catalogViewHydrator = new CoalescedViewHydrator<ProjectionPatch[]>({
     if (objectIdForTab(state.tab) === subject) render();
   },
   onError: (error, subject, signature) => {
-    const resolved = toolFrameForSubject(subject);
+    const resolved = catalogViewFrames.get(subject) ?? toolFrameForSubject(subject);
     const registered = ui.catalogUi.viewHydration(resolved);
-    const context = catalogViewHydrationContext(subject);
+    const context = catalogViewHydrationContext(subject, resolved);
     // A move away can revoke the cell-read permission while hydration is in
     // flight. Report only a still-active, still-incomplete view; the generic
     // backoff gate retains the failure for a later eligible render.
@@ -2214,11 +2231,11 @@ const catalogViewHydrator = new CoalescedViewHydrator<ProjectionPatch[]>({
 /** Start a frame-declared Net view hydration when one exists. Returning true
  * means the frame owns this cold-read path even when presence/completeness
  * makes the current render a no-op. */
-function ensureCatalogViewHydration(subject: string): boolean {
+function ensureCatalogViewHydration(subject: string, resolved = toolFrameForSubject(subject)): boolean {
   if (!netMode() || !subject) return false;
-  const resolved = toolFrameForSubject(subject);
+  if (resolved) catalogViewFrames.set(subject, resolved);
   const registered = ui.catalogUi.viewHydration(resolved);
-  const context = catalogViewHydrationContext(subject);
+  const context = catalogViewHydrationContext(subject, resolved);
   if (!registered || !context) return false;
   if (context.present && !registered.hydration.complete(context)) {
     catalogViewHydrator.ensure(subject, registered.id);
@@ -3533,7 +3550,15 @@ function render() {
     }
     bindCommon();
     if (state.tab === "chat") mountChatComponent();
-    if (isToolTab(state.tab)) toolDefinition(state.tab)?.mount();
+    if (isToolTab(state.tab)) {
+      const definition = toolDefinition(state.tab);
+      const subject = toolSpace(state.tab);
+      // Rendering and hydration share the same frame declaration. This also
+      // covers sparse Net projections that cannot resolve a frame by lineage
+      // until after its catalog-owned hydration has completed.
+      ensureCatalogViewHydration(subject, toolFrameForTab(state.tab, subject));
+      definition?.mount();
+    }
     if (state.tab === "tool") mountGenericToolComponent();
     if (state.tab === "ide") bindIde();
     if (!restoreRenderFocus(focus) && state.tab === "chat") focusChatInput();
@@ -3821,10 +3846,6 @@ function mountDubspaceComponent() {
   const space = spaceId ? projectedObjectView(spaceId) ?? dub[spaceId] : null;
   const present = dubspacePresentActors();
   const inSpace = actorPresentInSpace(spaceId, present);
-  // Entry and presence arrive on separate Net signals. If the lifecycle hook
-  // ran early, the mounted frame retries its declared hydration here; the
-  // generic hydrator owns coalescing, completeness, and failure backoff.
-  if (netMode() && inSpace) ensureCatalogViewHydration(spaceId);
   const lines = chatLinesForSpace(spaceId);
   element.subject = spaceId;
   element.woo = createChatWooContext(spaceId, [...chatLineActorRefs(lines), ...present]);

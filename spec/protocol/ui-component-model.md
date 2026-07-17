@@ -342,6 +342,11 @@ module MUST register the same id through `registerWooViewHydrations()` (UCM7).
 The declaration belongs to the frame rather than a client tab: any host that
 resolves that frame can run the same semantic hydration without recognizing a
 catalog alias, command word, or catalog-specific projection shape.
+When a host has selected a manifest-declared component but a sparse remote
+projection does not yet carry enough subject lineage to repeat frame matching,
+the host MUST use the default frame in that component's declaring catalog that
+mounts the selected component. Rendering and hydration therefore use one
+declaration; missing projection metadata cannot silently suppress the cold read.
 
 Returning `undefined` means "this observation is not a chat line right
 now"; the host drops it. Returning `{}` accepts the line with no

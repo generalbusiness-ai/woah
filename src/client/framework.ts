@@ -455,6 +455,25 @@ export class CatalogUiRegistry {
     return resolved ? this.components.get(resolved) : undefined;
   }
 
+  /** Resolve the default frame that declares a component. Tool shells already
+   * know which component they mounted, so this is the authoritative fallback
+   * when a sparse remote projection has not supplied enough lineage to match
+   * the frame's subject constraint yet. Keeping the lookup in the registry
+   * avoids teaching the shell catalog-specific frame identities. */
+  frameForComponent(id: string, declaringAlias?: string): ResolvedFrame | undefined {
+    const component = this.component(id, declaringAlias);
+    if (!component) return undefined;
+    const frames = (component.catalog.ui.frames ?? []).flatMap((frame) => {
+      const rank = frameRank(frame, undefined);
+      if (rank === undefined) return [];
+      const declaresComponent = Object.values(frame.regions ?? {}).flat().some((node) =>
+        this.resolveComponentId(node.component, component.catalog.alias) === component.qualifiedId
+      );
+      return declaresComponent ? [{ catalog: component.catalog, frame, rank, distance: 0 }] : [];
+    });
+    return frames.sort((left, right) => left.rank - right.rank || String(left.frame.id ?? "").localeCompare(String(right.frame.id ?? "")))[0];
+  }
+
   componentsForSurface(surface: string): RegisteredComponent[] {
     const wanted = String(surface ?? "");
     if (!wanted) return [];
