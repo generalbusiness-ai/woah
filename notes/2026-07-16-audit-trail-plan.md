@@ -21,14 +21,24 @@ rate refusals) — the gateway is authoritative for those and is the
 second (and last) producer.
 
 **2. Customer id is threaded data, not a lookup.** "Ultimate owner of
-the actor" = the account (auth.md A2: account owns actors; credential →
-actor binding is what the gateway already authenticates per CO14). The
-`Principal` envelope {customer, team?, actor, session, credential,
-on_behalf_of?} is stamped once at the gateway trust boundary, validated
-at commit (actor-match), and carried through riders, outbox rows, and
-scheduled rows. No component ever resolves an account downstream —
-Big-World: no global lookups on the delivery path, routing key travels
-with the record.
+the actor" = the account (auth.md A2), but auth resolves credential →
+**actor only** (`client-auth.ts` returns `{actor}`), and the ownership
+graph ($human.account, $agent.owner→$human|$wiz, $account.actors) is
+world objects spread across scopes — unwalkable at runtime. So AU3.1
+materializes attribution at **binding time**: a `customer_of:<actor>`
+cell authoritative at the actor's cluster scope (same home and same
+gateway pull machinery as session cells), written only by the identity
+pipeline (signup, agent provisioning, cutover identity import — which
+already carries the whole account graph, `src/net/identity.ts` — and
+audited transfers). The `Principal` envelope (now discriminated:
+`authenticated | credentialed | anonymous`; customer/actor mandatory
+only when authenticated) is stamped at the gateway, validated at
+commit (actor-match; customer re-check when the committing scope owns
+the cell), and carried through riders, outbox rows, and scheduled rows
+(additive field on `ScheduledTurn` — attribution only, CO16's deferred
+authority field untouched). Recognized-but-rejected credentials
+attribute via the retained (even revoked) `api_keys` record; unknown
+credentials are `anonymous` → operator partition.
 
 **3. OTel literally on the wire, not literally in-process.** Adopt the
 OTel data model + W3C traceparent + OTLP export verbatim — the win is
@@ -57,20 +67,43 @@ disqualified).
 
 ## Phases
 
-**Phase 1 — thread the ids (no pipeline yet, immediate ops win).**
-- `Principal` type in `src/net/identity.ts`; gateway stamps it at
-  `/net-api` auth (credential → actor → account via catalog identity
-  cells; add the account-binding cell if `$account`→actors isn't in the
-  catalog closure yet — check first).
-- Trace context: mint/adopt traceparent at the gateway; carry
-  `{trace_id, span_id}` + principal in the turn envelope, transcript,
-  outbox rows, adoption riders, scheduled rows. Commit-side actor-match
-  validation in `authorize`.
-- Immediately stamp `woo.customer` + `trace_id` onto existing AE
-  metrics (`net_turn_structure`, `turn_phase_timing`, `net_rpc`) — ops
-  correlation before any new storage exists.
+**Phase 0 — the attribution pipeline (prerequisite; AU3.1/AU3.3).**
+- `customer_of:<actor>` cell kind + derivation function (the closed
+  AU3.1 rules) in `src/net/`; seeding from the identity import
+  (`src/net/identity.ts` walk already has account→actors in hand);
+  write hooks in the provisioning flows (signup/actor-bind, agent
+  provision with owner capture, guest→account upgrade) and an audited
+  transfer path.
+- `scope_attribution` meta stamped at scope seed/install
+  (`partitionCells` knows the anchor; derive its owner's `customer_of`
+  during install, when the whole graph is present); cluster scopes
+  attribute as their actor.
+- Backfill for the live world: one idempotent maintenance pass over
+  known accounts (bounded by the account set, not an object scan).
+- Tests: derivation rules table-driven; import seeds cells; unstamped
+  scope → `operator` + flag.
+
+**Phase 1 — thread the ids (immediate ops win).**
+- `Principal` (AU3.2 discriminated shape) + `TraceContext`
+  (`{traceparent, tracestate?, origin}` — W3C strings verbatim, AU2) in
+  `src/net/`; gateway stamps both at `/net-api` auth; `customer_of`
+  pull-on-miss + session-cached.
+- Carriers per AU2's closed list: REST/MCP `traceparent` header, WS
+  turn-frame `trace` field, turn envelope, transcript, outbox rows (all
+  lanes), rider envelopes, `ScheduledTurn` additive fields. Invalid
+  header → mint, never reject. Commit-side actor-match (+ owned-cell
+  customer re-check) in `authorize`.
+- Stamp onto existing **net** AE metrics — `net_turn_structure`,
+  `net_scope_submit`, `net_rpc` (NOT `turn_phase_timing`; that is
+  v2-only and retires with NC9). AE schema: `BLOB_SLOTS` is 18 of an
+  AE max of 20 — additive `blob19 = woo.customer`,
+  `blob20 = trace_id` per the R10.1 new-axes-get-new-slots rule. That
+  spends the last two blob slots deliberately; the `/admin/stats`
+  query layer gains the two columns in the same change. AE stays
+  sampled — these stamps are ops correlation, not the trail.
 - Tests: envelope round-trip; scheduled-turn attribution; rider
-  principal survival; actor-mismatch reject.
+  principal survival; actor-mismatch reject; traceparent adopt/mint
+  matrix (valid/invalid/absent).
 
 **Phase 2 — the audit lane and shards.**
 - Scope: mint `AuditRecord` rows in the commit transaction; new outbox
@@ -78,9 +111,12 @@ disqualified).
   blocks fanout). Gateway: durable edge-event lane for refusals.
 - Audit shard DO: idempotent append, segment build + hash chain, R2
   flush, per-customer index. Dual attribution (resource-owner copy)
-  decided by comparing principal.customer to the scope anchor's owning
-  account — the anchor owner is resolvable at *mint* time in the scope
-  (it owns the anchor cells), so this too is threading, not lookup.
+  decided by comparing principal.customer to the scope's **stamped
+  `scope_attribution`** (Phase 0 — anchor lineage carries an owner
+  objref, not an account, so this must be pre-stamped, not derived).
+  Foreign-owner effects: the owner's adoption commit mints the
+  resource-owner-only record with `cause: {scope, seq}` (AU1) — and
+  never an acting record (single-count gate, AU10.1).
 - Retirement interplay: a retiring scope (CO17) drains its audit lane
   in step 2 like every lane; audit segments OUTLIVE the scope — they're
   the durable memory of it.
@@ -99,8 +135,9 @@ disqualified).
   sampled per O2; OTLP exporter (queue/tail); traceparent adoption on
   MCP surface (M-spec touch); AU10.3 join gate; dashboards.
 
-Ordering: Phase 1 is prerequisite to everything and is worth shipping
-alone. Phase 2 before 3/4. Phase 4 can proceed in parallel with 3.
+Ordering: Phase 0 → 1 strictly (stamping needs the cells to exist);
+Phases 0+1 together are worth shipping alone. Phase 2 before 3/4.
+Phase 4 can proceed in parallel with 3.
 
 ## Open decisions (flagged, with defaults chosen in the spec)
 
@@ -110,9 +147,8 @@ alone. Phase 2 before 3/4. Phase 4 can proceed in parallel with 3.
 - **Routing key = account, team as attribute**: teams change
   membership; records are immutable. Team-level views group at query
   time. Revisit only if a hard team-tenancy model lands in teams.md.
-- **Guest actors**: guests have no account. Default: partition
-  `guest:<world>` owned by the operator — a guest's trail is the
-  operator's business until the actor binds to an account (A-spec
-  upgrade path re-homes *future* records only; history doesn't move).
+- **Guest actors**: resolved in AU3.1 rule 4 — distinguished `guest`
+  attribution routed to the operator partition; account binding
+  re-writes the `customer_of` cell and re-homes *future* records only.
 - **Retention default**: 400 days audit / 7 days traces, per-customer
   override. Pick real numbers when pricing is modeled.
