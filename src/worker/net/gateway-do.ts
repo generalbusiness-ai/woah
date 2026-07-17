@@ -61,7 +61,7 @@ import { CellStore, cellKey, makeCell, type Cell } from "../../net/cells";
 import { clampClientSessionTtl } from "../../net/client-session-policy";
 import { budgetExhausted, isNetError, netError, nonconvergentRead, NetError, type AttemptTraceEntry, type NetErrorCode } from "../../net/errors";
 import { applyFanout, type FanoutBody } from "../../net/outbox";
-import { observationsForRelationOwners, relationKey, roomRosterRows, type RelationDelta, type RelationRow, type RoomRosterRow } from "../../net/relations";
+import { observationsForRelationOwners, relationKey, roomRosterRows, SESSION_PRESENCE_RELATION, type RelationDelta, type RelationRow, type RoomRosterRow } from "../../net/relations";
 import { mintSessionSubmit, sessionCellKey, validateSessionCell } from "../../net/sessions";
 import { sessionIdWithShardHint, ticketIdWithShardHint } from "../../net/session-id";
 import {
@@ -81,12 +81,10 @@ import type { CellTransfer } from "../../net/cells";
 import { randomHex } from "../../core/source-hash";
 import {
   GUEST_RESET_NATIVE,
-  GUEST_RESET_OBJECT,
-  GUEST_RESET_VERB,
-  guestResetVerbPage,
+  guestResetVerbPageFor,
   guestResetVerbSlot,
-  isCurrentGuestResetVerbPage,
-  isRecognizedGuestResetVerbPage
+  isCurrentGuestResetVerbPageFor,
+  isRecognizedGuestResetVerbPageFor
 } from "../../core/bootstrap";
 import { turnEchoId } from "../../net/turn-echo";
 import type { ShadowTurnCall } from "../../core/shadow-turn-call";
@@ -2390,21 +2388,6 @@ export class NetGatewayDO {
     const ttlMs = clampClientTtl(body.ttl_ms);
     const claim = guestClaim(body.claim_id, this.host.now(), ttlMs);
     const identity = await this.catalogIdentity();
-    try {
-      await this.ensureGuestResetDefinition();
-    } catch (err) {
-      this.metric({ kind: "net_guest_reset_definition", status: "error", error: String(err) });
-      return json(
-        {
-          error: {
-            code: "E_RETRY",
-            message: "guest entry is unavailable until its reset definition is repaired",
-            detail: { reason: "guest_reset_definition" }
-          }
-        },
-        503
-      );
-    }
     const poolCell = this.ensureView().get(cellKey("property_cell", "$system", "guest_pool"));
     const payload = poolCell?.value as { value?: unknown } | undefined;
     const pool = Array.isArray(payload?.value) ? payload.value.filter((id): id is string => typeof id === "string") : [];
@@ -2416,6 +2399,21 @@ export class NetGatewayDO {
             code: "E_RETRY",
             message: "guest entry is unavailable until its reset template is repaired",
             detail: { reason: "guest_template_missing", pool_size: pool.length }
+          }
+        },
+        503
+      );
+    }
+    try {
+      await this.ensureGuestResetDefinition(template);
+    } catch (err) {
+      this.metric({ kind: "net_guest_reset_definition", status: "error", error: String(err) });
+      return json(
+        {
+          error: {
+            code: "E_RETRY",
+            message: "guest entry is unavailable until its reset definition is repaired",
+            detail: { reason: "guest_reset_definition" }
           }
         },
         503
@@ -2442,7 +2440,7 @@ export class NetGatewayDO {
           issuedAt: claim.issuedAt,
           ttlMs
         });
-        return await this.normalizePooledGuestEntry(actor, template.initial_room, response, identity.epoch);
+        return await this.normalizePooledGuestEntry(actor, template, response, identity.epoch);
       }
     }
     for (const { actor, session } of candidates) {
@@ -2451,7 +2449,7 @@ export class NetGatewayDO {
         ...(session ? { session, issuedAt: claim?.issuedAt, ttlMs } : {})
       });
       if (response.status === 409) continue; // occupied — try the next pool actor
-      return await this.normalizePooledGuestEntry(actor, template.initial_room, response, identity.epoch);
+      return await this.normalizePooledGuestEntry(actor, template, response, identity.epoch);
     }
     return await this.clientElasticGuest(identity.epoch, template, claim, ttlMs);
   }
@@ -2464,9 +2462,10 @@ export class NetGatewayDO {
    * same signed, ordered catalog operation exposed to operators, then reread
    * from authority. Missing or unknown pages fail closed.
    */
-  private async ensureGuestResetDefinition(): Promise<void> {
-    const key = cellKey("verb_bytecode", GUEST_RESET_OBJECT, GUEST_RESET_VERB);
-    if (isCurrentGuestResetVerbPage(this.ensureView().get(key)?.value)) return;
+  private async ensureGuestResetDefinition(template: GuestTemplate): Promise<void> {
+    const definition = { verb: template.reset_verb, owner: template.maintenance_principal };
+    const key = cellKey("verb_bytecode", template.reset_definer, template.reset_verb);
+    if (isCurrentGuestResetVerbPageFor(this.ensureView().get(key)?.value, definition)) return;
     if (this.guestResetDefinitionRepair) return this.guestResetDefinitionRepair;
     const now = this.host.now();
     if (now < this.guestResetDefinitionRetryAt) {
@@ -2482,10 +2481,10 @@ export class NetGatewayDO {
         known: []
       }) as CellTransfer;
       const authoritative = beforeTransfer.cells.find((cell) => cell.key === key);
-      if (!authoritative || !isRecognizedGuestResetVerbPage(authoritative.value)) {
+      if (!authoritative || !isRecognizedGuestResetVerbPageFor(authoritative.value, definition)) {
         throw new Error(`refused unrecognized ${key}; expected native ${GUEST_RESET_NATIVE}`);
       }
-      if (isCurrentGuestResetVerbPage(authoritative.value)) {
+      if (isCurrentGuestResetVerbPageFor(authoritative.value, definition)) {
         this.discardViewOnThrow(() =>
           this.state.storage.transactionSync(() => {
             const view = this.ensureView();
@@ -2498,9 +2497,9 @@ export class NetGatewayDO {
       }
 
       const existing = authoritative.value;
-      const desired = guestResetVerbPage(guestResetVerbSlot(existing));
+      const desired = guestResetVerbPageFor(definition, guestResetVerbSlot(existing));
       const result = await this.host.rpc(`scope:${CATALOG_SCOPE}`, "/repair-definitions", {
-        cells: [{ kind: "verb_bytecode", object: GUEST_RESET_OBJECT, name: GUEST_RESET_VERB, value: desired }],
+        cells: [{ kind: "verb_bytecode", object: template.reset_definer, name: template.reset_verb, value: desired }],
         remove: []
       }) as { status?: unknown };
       if (result.status !== "applied" && result.status !== "empty") {
@@ -2515,7 +2514,7 @@ export class NetGatewayDO {
         known: []
       }) as CellTransfer;
       const fresh = transfer.cells.find((cell) => cell.key === key);
-      if (!fresh || !isCurrentGuestResetVerbPage(fresh.value)) {
+      if (!fresh || !isCurrentGuestResetVerbPageFor(fresh.value, definition)) {
         throw new Error(`catalog authority did not return the current ${key}`);
       }
       this.discardViewOnThrow(() =>
@@ -2553,7 +2552,7 @@ export class NetGatewayDO {
    */
   private async normalizePooledGuestEntry(
     actor: string,
-    initialRoom: string,
+    template: GuestTemplate,
     response: Response,
     epoch: string
   ): Promise<Response> {
@@ -2565,6 +2564,7 @@ export class NetGatewayDO {
     };
     const session = typeof payload.session === "string" ? payload.session : null;
     if (!session) return response;
+    const initialRoom = template.initial_room;
 
     try {
       const actorScope = await this.clientPlanningScope(actor, actor);
@@ -2594,9 +2594,9 @@ export class NetGatewayDO {
           id: resetKey,
           route: "direct",
           scope: before,
-          actor: "$wiz",
+          actor: template.maintenance_principal,
           target: actor,
-          verb: "on_disfunc",
+          verb: template.reset_verb,
           args: [initialRoom]
         },
         planningScope: currentScope,
@@ -2662,14 +2662,41 @@ export class NetGatewayDO {
     if (!template || typeof template !== "object" || Array.isArray(template)) return null;
     const row = template as Record<string, unknown>;
     if (
-      row.version !== 1 ||
       typeof row.parent !== "string" ||
       typeof row.owner !== "string" ||
       typeof row.description !== "string" ||
       typeof row.home !== "string" ||
       typeof row.initial_room !== "string"
     ) return null;
-    return row as GuestTemplate;
+    if (
+      row.version === 2 &&
+      typeof row.reset_definer === "string" && row.reset_definer.length > 0 &&
+      typeof row.reset_verb === "string" && row.reset_verb.length > 0 &&
+      typeof row.maintenance_principal === "string" && row.maintenance_principal.length > 0
+    ) return row as GuestTemplate;
+    if (row.version !== 1) return null;
+
+    // Compatibility for active Net worlds installed before template v2. The
+    // old row already carries parent/owner; discover the one matching reset
+    // primitive on that parent's bounded own-cell index instead of restoring
+    // the old $guest/$wiz/on_disfunc identity literals in the worker.
+    const candidates = this.ensureView().cellsForObject(row.parent).filter((cell) => {
+      if (cell.kind !== "verb_bytecode" || typeof cell.name !== "string") return false;
+      const page = cell.value as { kind?: unknown; native?: unknown; owner?: unknown } | null;
+      return page?.kind === "native" && page.native === GUEST_RESET_NATIVE && page.owner === row.owner;
+    });
+    if (candidates.length !== 1) return null;
+    return {
+      version: 2,
+      parent: row.parent,
+      owner: row.owner,
+      description: row.description,
+      home: row.home,
+      initial_room: row.initial_room,
+      reset_definer: row.parent,
+      reset_verb: candidates[0].name!,
+      maintenance_principal: row.owner
+    };
   }
 
   /** Provision an anonymous actor and its first session in one commit at
@@ -3738,7 +3765,8 @@ export class NetGatewayDO {
     // re-read was an N+1 that scaled fanout SQL with audience size.
     const rows = sqlRows<{ member: string; body: string | null }>(
       this.state.storage.sql.exec(
-        "SELECT member, body FROM net_gateway_relation WHERE relation = 'session_presence' AND owner_scope = ?",
+        "SELECT member, body FROM net_gateway_relation WHERE relation = ? AND owner_scope = ?",
+        SESSION_PRESENCE_RELATION,
         body.scope
       )
     );
@@ -3989,7 +4017,8 @@ export class NetGatewayDO {
     if (typeof active === "string" && active) scopes.add(active);
     const rows = sqlRows<{ owner: string }>(
       this.state.storage.sql.exec(
-        "SELECT owner FROM net_gateway_relation WHERE relation = 'session_presence' AND member = ?",
+        "SELECT owner FROM net_gateway_relation WHERE relation = ? AND member = ?",
+        SESSION_PRESENCE_RELATION,
         session
       )
     );
@@ -4134,14 +4163,15 @@ export class NetGatewayDO {
    * members (contents, …) and passes through unchanged.
    */
   private clientRelationMembers(relation: string, owner: string): Array<{ member: string; body?: unknown }> {
-    if (relation !== "session_presence") return this.relationMembers(relation, owner);
+    if (relation !== SESSION_PRESENCE_RELATION) return this.relationMembers(relation, owner);
     const rows: RelationRow[] = sqlRows<{ member: string; body: string | null }>(
       this.state.storage.sql.exec(
-        "SELECT member, body FROM net_gateway_relation WHERE relation = 'session_presence' AND owner = ?",
+        "SELECT member, body FROM net_gateway_relation WHERE relation = ? AND owner = ?",
+        SESSION_PRESENCE_RELATION,
         owner
       )
     ).map((row) => ({
-      relation: "session_presence",
+      relation: SESSION_PRESENCE_RELATION,
       owner,
       member: row.member,
       ...(row.body !== null ? { body: JSON.parse(row.body) as unknown } : {})
@@ -4486,7 +4516,7 @@ export class NetGatewayDO {
       // also contains contents deltas, send the whole batch:
       // receiver idempotency is per (from_scope, seq), not per relation row.
       if (!entry.deltas.some((delta) =>
-        delta.row.relation === "session_presence" || delta.row.relation === ORDERED_EDGE_RELATION
+        delta.row.relation === SESSION_PRESENCE_RELATION || delta.row.relation === ORDERED_EDGE_RELATION
       )) continue;
       const destination = destinations[entry.scope]?.destination ?? `scope:${entry.scope}`;
       const deliver = () => this.host.rpc(destination, "/relate", {

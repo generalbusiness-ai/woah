@@ -7,12 +7,15 @@ import { ScopeSequencer } from "../../src/net/scope";
 
 const EPOCH = "cat-guest-provision-1";
 const TEMPLATE: GuestTemplate = {
-  version: 1,
+  version: 2,
   parent: "$guest",
   owner: "$wiz",
   description: "Temporary guest identity.",
   home: "$nowhere",
-  initial_room: "the_chatroom"
+  initial_room: "the_chatroom",
+  reset_definer: "$guest",
+  reset_verb: "on_disfunc",
+  maintenance_principal: "$wiz"
 };
 
 describe("elastic guest provisioning", () => {

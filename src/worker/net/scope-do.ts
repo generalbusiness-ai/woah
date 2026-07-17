@@ -84,7 +84,7 @@ import { Outbox, type FanoutBody, type FanoutRow } from "../../net/outbox";
 import { turnEchoId } from "../../net/turn-echo";
 import { ScopeSequencer, type CommitSubmit, type ScheduledTurn, type ScopeHead } from "../../net/scope";
 import { authorizeSessionSubmit, validateSessionCell } from "../../net/sessions";
-import { observationsForRelationOwners, relationKey, roomRosterRows, type RelationDelta, type RelationRow } from "../../net/relations";
+import { observationsForRelationOwners, relationKey, roomRosterRows, SESSION_PRESENCE_RELATION, type RelationDelta, type RelationRow } from "../../net/relations";
 import { orderedChildrenVersion, orderedNeighborsFromRows } from "../../net/ordered-edges";
 import type { ScopeMeta, ScopeStore, TailEntry } from "../../net/scope-store";
 import type { CommitReply } from "../../net/scope";
@@ -1345,7 +1345,7 @@ export class NetScopeDO {
           if (seq.store.has(cellKey("object_lineage", entry.activeScope))) continue;
           const owningScope = `room:${entry.activeScope}`;
           const rows = [
-            { relation: "session_presence", owner: entry.activeScope, member: entry.session },
+            { relation: SESSION_PRESENCE_RELATION, owner: entry.activeScope, member: entry.session },
             ...(entry.retiredActor && entry.actor !== null
               ? [{ relation: "contents", owner: entry.activeScope, member: entry.actor }]
               : [])

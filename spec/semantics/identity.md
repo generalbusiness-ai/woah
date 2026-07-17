@@ -178,7 +178,26 @@ verb $guest:on_disfunc(destination?) {
 
 This is the LambdaCore `@disfunc` pattern under a clearer name. Guest inventory is ejected before the guest is moved home: an item with its own valid `home` returns there, otherwise it falls back to the disconnect room, then the guest's home. The guest `home` property is conventionally `$nowhere` (a seeded `$thing`; see [bootstrap.md §B6](bootstrap.md#b6-demo-instances)); operators may override per-guest if they want named lounges.
 
-The disfunc runs with `progr = this.owner` (typically `$wiz`), so it has authority to reset state regardless of what permission flips occurred during the session. The optional destination is a trusted cleanup override: ordinary reap omits it and retains the conventional `home`/`$nowhere` behavior; the net identity door passes the install-owned guest template's `initial_room` after it has exclusively claimed the seat, so a prior user's room is never exposed to the new session. Before allocating a session, the door also verifies the installed `$guest:on_disfunc` page against the runtime's shared bootstrap contract. A recognized stale native page is repaired through the signed, ordered catalog authority and reread before admission; a missing or unrecognized page, an unavailable authority, or a missing/malformed guest template fails closed. Returning an unreset pooled actor would disclose the previous user's durable location, inventory, description, aliases, or features.
+The disfunc runs with `progr = this.owner` (typically `$wiz`), so it has authority to reset state regardless of what permission flips occurred during the session. The optional destination is a trusted cleanup override: ordinary reap omits it and retains the conventional `home`/`$nowhere` behavior; the net identity door passes the install-owned guest template's `initial_room` after it has exclusively claimed the seat, so a prior user's room is never exposed to the new session.
+
+Net admission does not encode those conventional identities. The validated
+`$system.guest_template` v2 row declares the reset definition owner
+(`reset_definer`), verb (`reset_verb`), and trusted caller
+(`maintenance_principal`) alongside the actor parent/owner and initial room.
+The installer derives all three from the seeded world's reset-native page. An
+aged v1 template is normalized by looking for exactly one matching intrinsic
+reset primitive among the declared parent's own cells; this is bounded by that
+one object's definition count and does not enumerate catalog authority.
+
+Before allocating a session, the door verifies the template-selected page
+against the runtime's shared native contract. Repository-backed monolithic and
+SQLite worlds already converge that metadata during the ordinary idempotent
+bootstrap merge. Active Net worlds retain a separate persisted catalog cell,
+so a recognized stale page is repaired through the signed, ordered catalog
+authority and reread before admission; a missing or unrecognized page, an
+unavailable authority, an ambiguous v1 contract, or a missing/malformed
+template fails closed. Returning an unreset pooled actor would disclose the
+previous user's durable location, inventory, description, aliases, or features.
 
 ---
 

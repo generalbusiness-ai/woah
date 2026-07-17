@@ -30,6 +30,11 @@ export type RelationDelta = {
   row: RelationRow;
 };
 
+/** Protocol-defined presence projection relation (CO13/CO14). Catalogs may
+ * choose their own presence property names; this relation name is substrate
+ * vocabulary shared by scopes, gateways, and session lifecycle code. */
+export const SESSION_PRESENCE_RELATION = "session_presence";
+
 /** Select observations addressed to relation owners changed by one foreign
  * delivery. The synchronous freshness fence and the durable outbox must send
  * identical `/relate` bodies: the receiver deduplicates by (from_scope, seq),
@@ -171,8 +176,8 @@ export function deriveRelationDeltas(
   const transition = transcript.sessionScopeTransition;
   if (transition) {
     const body = presenceBody(transition.actor, transition.session, transition.actorName);
-    if (transition.from) put("remove", "session_presence", transition.from, transition.session, body);
-    if (transition.to) put("add", "session_presence", transition.to, transition.session, body);
+    if (transition.from) put("remove", SESSION_PRESENCE_RELATION, transition.from, transition.session, body);
+    if (transition.to) put("add", SESSION_PRESENCE_RELATION, transition.to, transition.session, body);
   }
 
   // Display names are mutable while a session remains present. Refresh the
@@ -187,7 +192,7 @@ export function deriveRelationDeltas(
     if (session?.actor === transcript.call.actor && typeof session.activeScope === "string" && session.activeScope) {
       put(
         "add",
-        "session_presence",
+        SESSION_PRESENCE_RELATION,
         session.activeScope,
         transcript.session,
         presenceBody(transcript.call.actor, transcript.session)
@@ -237,7 +242,7 @@ export function roomRosterRows(
 ): RoomRosterRow[] {
   const byActor = new Map<string, { name: string; started: number }>();
   for (const row of relations) {
-    if (row.relation !== "session_presence" || row.owner !== room) continue;
+    if (row.relation !== SESSION_PRESENCE_RELATION || row.owner !== room) continue;
     const body = row.body as SessionPresenceBody | undefined;
     if (!body || typeof body.actor !== "string") continue;
     const session = body.session as { actor?: unknown; started?: unknown; expiresAt?: unknown; activeScope?: unknown } | undefined;

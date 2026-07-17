@@ -24,15 +24,25 @@ export const GUEST_RESET_ARG_SPEC = { args: ["target?"] } as const;
 
 export type GuestResetVerbPage = Omit<Extract<VerbDef, { kind: "native" }>, "line_map">;
 
+export type GuestResetDefinitionContract = {
+  verb: string;
+  owner: string;
+};
+
+const DEFAULT_GUEST_RESET_DEFINITION: GuestResetDefinitionContract = {
+  verb: GUEST_RESET_VERB,
+  owner: "$wiz"
+};
+
 /** The wire page produced by a fresh bootstrap install (debug line maps do
  * not cross the net cell bridge). Preserve the live slot during repair so
  * replacing this one definition cannot reorder sibling verbs. */
-export function guestResetVerbPage(slot = 1): GuestResetVerbPage {
+export function guestResetVerbPageFor(contract: GuestResetDefinitionContract, slot = 1): GuestResetVerbPage {
   return {
     kind: "native",
-    name: GUEST_RESET_VERB,
+    name: contract.verb,
     aliases: [],
-    owner: "$wiz",
+    owner: contract.owner,
     perms: "r",
     arg_spec: { args: [...GUEST_RESET_ARG_SPEC.args] },
     source: GUEST_RESET_SOURCE,
@@ -46,21 +56,33 @@ export function guestResetVerbPage(slot = 1): GuestResetVerbPage {
   };
 }
 
+export function guestResetVerbPage(slot = 1): GuestResetVerbPage {
+  return guestResetVerbPageFor(DEFAULT_GUEST_RESET_DEFINITION, slot);
+}
+
 /** Only a page already identifying the trusted bootstrap native is eligible
  * for automatic repair. Unknown/missing definitions remain operator errors;
  * admission must not turn a request into arbitrary catalog mutation. */
-export function isRecognizedGuestResetVerbPage(value: unknown): value is Record<string, unknown> {
+export function isRecognizedGuestResetVerbPageFor(
+  value: unknown,
+  contract: GuestResetDefinitionContract
+): value is Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const page = value as Record<string, unknown>;
   return page.kind === "native" &&
-    page.name === GUEST_RESET_VERB &&
+    page.name === contract.verb &&
     page.native === GUEST_RESET_NATIVE &&
-    page.owner === "$wiz";
+    page.owner === contract.owner;
+}
+
+export function isRecognizedGuestResetVerbPage(value: unknown): value is Record<string, unknown> {
+  return isRecognizedGuestResetVerbPageFor(value, DEFAULT_GUEST_RESET_DEFINITION);
 }
 
 export function guestResetVerbSlot(value: unknown): number {
-  if (!isRecognizedGuestResetVerbPage(value)) return 1;
-  return Number.isSafeInteger(value.slot) && Number(value.slot) > 0 ? Number(value.slot) : 1;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return 1;
+  const slot = (value as { slot?: unknown }).slot;
+  return Number.isSafeInteger(slot) && Number(slot) > 0 ? Number(slot) : 1;
 }
 
 export function isCurrentGuestResetVerbPage(value: unknown): boolean {
@@ -68,6 +90,14 @@ export function isCurrentGuestResetVerbPage(value: unknown): boolean {
   return valuesEqual(
     value as WooValue,
     guestResetVerbPage(guestResetVerbSlot(value)) as unknown as WooValue
+  );
+}
+
+export function isCurrentGuestResetVerbPageFor(value: unknown, contract: GuestResetDefinitionContract): boolean {
+  if (!isRecognizedGuestResetVerbPageFor(value, contract)) return false;
+  return valuesEqual(
+    value as WooValue,
+    guestResetVerbPageFor(contract, guestResetVerbSlot(value)) as unknown as WooValue
   );
 }
 

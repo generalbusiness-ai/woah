@@ -80,6 +80,8 @@ async function encodePassword(password: string): Promise<string> {
 
 async function buildDoorHarness(options: {
   omitGuestTemplate?: boolean;
+  legacyGuestTemplate?: boolean;
+  renamedGuestResetVerb?: string;
   staleGuestResetDefinition?: boolean;
   unknownGuestResetDefinition?: boolean;
 } = {}) {
@@ -128,6 +130,35 @@ async function buildDoorHarness(options: {
     const seededCells = cells
       .filter((cell) => !(options.omitGuestTemplate && cell.kind === "property_cell" && cell.object === "$system" && cell.name === "guest_template"))
       .map((cell) => {
+        if (options.legacyGuestTemplate && cell.kind === "property_cell" && cell.object === "$system" && cell.name === "guest_template") {
+          const payload = cell.value as { value?: Record<string, unknown> };
+          const current = payload.value ?? {};
+          return {
+            ...cell,
+            value: {
+              ...payload,
+              value: {
+                version: 1,
+                parent: current.parent,
+                owner: current.owner,
+                description: current.description,
+                home: current.home,
+                initial_room: current.initial_room
+              }
+            }
+          };
+        }
+        if (options.renamedGuestResetVerb && cell.kind === "property_cell" && cell.object === "$system" && cell.name === "guest_template") {
+          const payload = cell.value as { value?: Record<string, unknown> };
+          return { ...cell, value: { ...payload, value: { ...payload.value, reset_verb: options.renamedGuestResetVerb } } };
+        }
+        if (options.renamedGuestResetVerb && cell.kind === "verb_bytecode" && cell.object === GUEST_RESET_OBJECT && cell.name === GUEST_RESET_VERB) {
+          return {
+            ...cell,
+            name: options.renamedGuestResetVerb,
+            value: { ...(cell.value as Record<string, unknown>), name: options.renamedGuestResetVerb }
+          };
+        }
         if ((!options.staleGuestResetDefinition && !options.unknownGuestResetDefinition) || cell.kind !== "verb_bytecode" ||
             cell.object !== GUEST_RESET_OBJECT || cell.name !== GUEST_RESET_VERB) return cell;
         return {
@@ -184,7 +215,7 @@ async function buildDoorHarness(options: {
     human,
     api,
     catalogDefinition: async () => {
-      const key = cellKey("verb_bytecode", GUEST_RESET_OBJECT, GUEST_RESET_VERB);
+      const key = cellKey("verb_bytecode", GUEST_RESET_OBJECT, options.renamedGuestResetVerb ?? GUEST_RESET_VERB);
       const request = new Request("https://do/net/closure", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -203,6 +234,27 @@ async function buildDoorHarness(options: {
 }
 
 describe("the identity door (/net-api/login, /net-api/guest, session bearers)", () => {
+  it("dispatches the template-declared reset verb rather than a worker command literal", async () => {
+    const h = await buildDoorHarness({ renamedGuestResetVerb: "restore_pool_identity" });
+    const claimed = await h.api("POST", "/net-api/guest", { body: {} });
+    expect(claimed.status, JSON.stringify(claimed.body)).toBe(200);
+    expect((await h.catalogDefinition())?.value).toMatchObject({
+      name: "restore_pool_identity",
+      native: "guest_on_disfunc"
+    });
+    await h.close();
+  }, 30_000);
+
+  it("derives the reset contract for a version-1 template without worker identity literals", async () => {
+    const h = await buildDoorHarness({ legacyGuestTemplate: true });
+    const claimed = await h.api("POST", "/net-api/guest", { body: {} });
+    expect(claimed.status, JSON.stringify(claimed.body)).toBe(200);
+    // The current definition needs no repair; compatibility is a bounded
+    // lookup on the template's declared parent, not catalog-wide discovery.
+    expect(h.catalogTailSeqs()).toEqual([]);
+    await h.close();
+  }, 30_000);
+
   it("repairs a recognized aged guest-reset definition before allocating a session", async () => {
     const h = await buildDoorHarness({ staleGuestResetDefinition: true });
     expect(isCurrentGuestResetVerbPage((await h.catalogDefinition())?.value)).toBe(false);

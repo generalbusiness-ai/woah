@@ -10,12 +10,18 @@ import type { CommitSubmit, ScopeHead } from "./scope";
 import { applyTranscript, type EffectTranscript, type TranscriptWrite } from "./transcript";
 
 export type GuestTemplate = {
-  version: 1;
+  version: 2;
   parent: string;
   owner: string;
   description: string;
   home: string;
   initial_room: string;
+  /** Class page that defines the pooled-identity reset contract. */
+  reset_definer: string;
+  /** Verb dispatched on the claimed actor after exclusive session minting. */
+  reset_verb: string;
+  /** Trusted principal used for the maintenance turn. */
+  maintenance_principal: string;
 };
 
 export type ProvisionGuestInput = {

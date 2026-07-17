@@ -21,7 +21,7 @@
  * keeps the epoch. A reinstall over such a change is a fresh-namespace
  * decision, not a re-seed.)
  */
-import { createWorld } from "../core/bootstrap";
+import { createWorld, GUEST_RESET_NATIVE } from "../core/bootstrap";
 import { DEFAULT_LOCAL_CATALOGS, installLocalCatalogs, localCatalogBundleFingerprint } from "../core/local-catalogs";
 import type { WooWorld } from "../core/world";
 import { cellsFromSerialized, type NetCellInput } from "./bridge";
@@ -206,15 +206,24 @@ function seedGuestPool(world: WooWorld): void {
   // identities. The created actor and its session still commit at the
   // actor's fresh cluster sequencer (see guest.ts).
   const exemplar = pool.length > 0 ? objects.get(pool[0]) : undefined;
-  if (exemplar && start !== null) {
+  if (exemplar && typeof exemplar.parent === "string" && start !== null) {
     const home = exemplar.properties?.find(([name]) => name === "home")?.[1];
+    // Discover the reset page by its intrinsic native primitive. The template
+    // records the world identities and verb word consumed by the Net door, so
+    // admission remains data-driven if a deployment uses another guest class,
+    // maintenance principal, or reset verb name.
+    const reset = world.object(exemplar.parent).verbs.find((verb) => verb.kind === "native" && verb.native === GUEST_RESET_NATIVE);
+    if (!reset) throw new Error(`guest template exemplar ${exemplar.id} has no ${GUEST_RESET_NATIVE} reset contract`);
     world.setProp("$system", "guest_template", {
-      version: 1,
+      version: 2,
       parent: exemplar.parent,
       owner: exemplar.owner,
       description: "Temporary guest identity.",
       home: typeof home === "string" ? home : "$nowhere",
-      initial_room: start
+      initial_room: start,
+      reset_definer: exemplar.parent,
+      reset_verb: reset.name,
+      maintenance_principal: reset.owner
     } as never);
   }
 }

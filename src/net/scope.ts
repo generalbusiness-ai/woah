@@ -26,7 +26,7 @@
 import { CellStore, type Cell, type EpochStamp } from "./cells";
 import { netError } from "./errors";
 import { validateSessionCell } from "./sessions";
-import { applyRelationDeltas, deriveRelationDeltas, rebuildContentsRelation, relationKey, type RelationDelta, type RelationRow } from "./relations";
+import { applyRelationDeltas, deriveRelationDeltas, rebuildContentsRelation, relationKey, SESSION_PRESENCE_RELATION, type RelationDelta, type RelationRow } from "./relations";
 import {
   ORDERED_EDGE_RELATION,
   orderedChildrenForContainer,
@@ -1018,7 +1018,7 @@ export class ScopeSequencer {
     const localRemovals: RelationDelta[] = [];
     for (const row of this.relationRows.values()) {
       if (
-        (row.relation === "session_presence" && reapedIds.has(row.member)) ||
+        (row.relation === SESSION_PRESENCE_RELATION && reapedIds.has(row.member)) ||
         (row.relation === "contents" && retiredContents.has(relationKey(row.relation, row.owner, row.member)))
       ) {
         localRemovals.push({ op: "remove", row });

@@ -461,7 +461,13 @@ item; what remains is exactly what the workerd lanes cannot prove
   `cluster:<actor>` owner. Contents and session-presence deltas follow the
   normal owner outbox path. Claim-derived ids retain 128 bits of random
   entropy while making retries stable and select independent cluster DOs;
-  the sequencer's create-collision guard remains fail-closed.
+  the sequencer's create-collision guard remains fail-closed. Template v2
+  also declares `reset_definer`, `reset_verb`, and
+  `maintenance_principal`; the gateway neither names the seed guest class nor
+  assumes a verb word or wizard object. Version-1 rows remain readable by a
+  bounded own-cell lookup on their declared parent for the intrinsic reset
+  primitive, allowing an active aged Net world to move forward without global
+  enumeration.
 - **Second-review scale caps — RECORDED, NOT BUILT** (accepted findings
   9/11/12 residuals, required before public traffic beyond the bake):
   each `/net-api` gateway durably accumulates every cell visited by its
