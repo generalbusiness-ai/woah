@@ -5,6 +5,8 @@
 import { describe, expect, it } from "vitest";
 
 import chatManifest from "../catalogs/chat/manifest.json";
+import dubspaceManifest from "../catalogs/dubspace/manifest.json";
+import * as dubspaceUiModule from "../catalogs/dubspace/ui/dubspace-workspace";
 import { registerWooObservationHandlers as registerDubspaceObservationHandlers } from "../catalogs/dubspace/ui/dubspace-workspace";
 import { registerWooObservationHandlers as registerOutlinerObservationHandlers } from "../catalogs/outliner/ui/outliner-tree";
 import { registerWooObservationHandlers as registerPinboardObservationHandlers } from "../catalogs/pinboard/ui/pinboard-board";
@@ -725,6 +727,35 @@ describe("client UI framework projection", () => {
     expect(applied).toEqual(["the_outline:item_1"]);
   });
 
+  it("CoalescedViewHydrator retries when applying a malformed result throws", async () => {
+    let now = 1_000;
+    let reads = 0;
+    let applies = 0;
+    const hydrator = new CoalescedViewHydrator<string>({
+      read: async () => {
+        reads += 1;
+        return reads === 1 ? "malformed" : "valid";
+      },
+      apply: (value) => {
+        applies += 1;
+        if (value === "malformed") throw new Error("malformed catalog view");
+      },
+      now: () => now
+    });
+
+    hydrator.ensure("tool", "view");
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    now += 250;
+    hydrator.ensure("tool", "view");
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(reads).toBe(2);
+    expect(applies).toBe(2);
+  });
+
   it("CoalescedRefreshController collapses bursts to one queued follow-up", async () => {
     const runs: string[] = [];
     const releases: Array<() => void> = [];
@@ -1214,6 +1245,21 @@ describe("catalog UI registry", () => {
       subject: "$space"
     });
     expect(registry.resolveFrame("$chatroom", undefined, () => false)?.frame.id).toBe("chat.room");
+  });
+
+  it("resolves a frame-declared catalog view hydration from its module", () => {
+    const ui = createBareWooClientFramework();
+    expect(ui.catalogUi.installCatalogUi({
+      alias: "dubspace",
+      catalog: "dubspace",
+      objects: { "$dubspace": "$dubspace" },
+      ui: (dubspaceManifest as any).ui
+    })).toEqual([]);
+    ui.catalogUi.registerModuleExports("dubspace", "dubspace-ui", dubspaceUiModule, ui.observations, ui.chatFormatters);
+
+    const frame = ui.catalogUi.resolveFrame("$dubspace", undefined, () => false);
+    expect(frame?.frame.hydration).toEqual({ module: "dubspace-ui", id: "controls" });
+    expect(ui.catalogUi.viewHydration(frame)?.id).toBe("dubspace:dubspace-ui:controls");
   });
 });
 

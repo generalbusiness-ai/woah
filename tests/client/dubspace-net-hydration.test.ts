@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { installedDubspaceSupportsControlsView, isAgedDubspaceControlsError, readAgedDubspaceControlCells } from "../../catalogs/dubspace/ui/net-hydration";
+import { dubspaceControlsHydration, installedDubspaceSupportsControlsView, isAgedDubspaceControlsError, readAgedDubspaceControlCells } from "../../catalogs/dubspace/ui/net-hydration";
 
 const roles = {
   slots: ["slot_1", "slot_2", "slot_3", "slot_4"],
@@ -11,6 +11,34 @@ const roles = {
 };
 
 describe("aged Dubspace net hydration", () => {
+  it("owns controls-view validation and emits only generic projection patches", async () => {
+    const view = {
+      space: { id: "the_dubspace", name: "Dubspace" },
+      meta: { slots: [], channel: "", filter: "", delay: "", drum: "drum_1", scene: "scene_1" },
+      controls: [{ id: "drum_1", name: "Drums", props: { bpm: 118, playing: false, started_at: 0, step_count: 8, pattern: { kick: [true] } } }]
+    };
+    const calls: string[] = [];
+    const patches = await dubspaceControlsHydration.read({
+      subject: "the_dubspace",
+      frameState: { control_roles: view.meta, control_defaults: {} },
+      present: true,
+      installedCatalogs: [{ alias: "dubspace", version: "1.0.4" }],
+      observe: () => null,
+      call: async (_target, verb) => {
+        calls.push(verb);
+        return view;
+      },
+      readCell: async () => null,
+      nameOf: (id) => id
+    });
+
+    expect(calls).toEqual(["controls_view"]);
+    expect(patches).toEqual(expect.arrayContaining([
+      expect.objectContaining({ subject: "the_dubspace", catalogState: { dubspace_controls: view.meta } }),
+      expect.objectContaining({ subject: "drum_1", props: view.controls[0].props })
+    ]));
+  });
+
   it("requires authoritative installed-version evidence before calling controls_view", () => {
     expect(installedDubspaceSupportsControlsView(undefined)).toBe(false);
     expect(installedDubspaceSupportsControlsView([{ alias: "dubspace", version: "1.0.1" }])).toBe(false);

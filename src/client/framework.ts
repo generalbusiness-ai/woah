@@ -269,6 +269,10 @@ export type UiFrameDecl = {
   subject: string;
   view?: string;
   layout: string;
+  /** Optional catalog-owned cold-view hydration. The named module registers
+   * the implementation; the shell supplies transport/projection capabilities
+   * and applies the returned generic patches without learning catalog state. */
+  hydration?: { module: string; id: string };
   regions: Record<string, UiNodeDecl[]>;
   state?: Record<string, unknown>;
 };
@@ -332,10 +336,39 @@ type ModuleExports = {
   registerWooComponents?: (registry: WooComponentRegistry) => void;
   registerWooObservationHandlers?: (registry: ObservationRegistry) => void;
   registerWooChatFormatters?: (registry: ChatFormatterRegistry) => void;
+  registerWooViewHydrations?: (registry: WooViewHydrationRegistry) => void;
 };
 
 export type WooComponentRegistry = {
   defineTag(tag: string, ctor: CustomElementConstructor): void;
+};
+
+export type WooViewHydrationContext = {
+  subject: string;
+  frameState: Readonly<Record<string, unknown>>;
+  present: boolean;
+  installedCatalogs: readonly unknown[];
+  observe(ref: string): ObjectProjection | null;
+  call(target: string, verb: string, args?: unknown[], options?: ProjectionCallOptions): Promise<unknown>;
+  readCell(key: string): Promise<unknown>;
+  nameOf(ref: string): string;
+};
+
+/** Catalog-owned semantic hydration. `complete` must be cheap and side-effect
+ * free because render paths may ask repeatedly; `read` returns only generic
+ * projection patches, keeping catalog vocabulary out of the shell. */
+export type WooViewHydration = {
+  complete(context: WooViewHydrationContext): boolean;
+  read(context: WooViewHydrationContext): Promise<ProjectionPatch[]>;
+};
+
+export type WooViewHydrationRegistry = {
+  define(id: string, hydration: WooViewHydration): void;
+};
+
+export type RegisteredViewHydration = {
+  id: string;
+  hydration: WooViewHydration;
 };
 
 export type WooNeighborhood = {
@@ -399,6 +432,7 @@ export class CatalogUiRegistry {
   private declaredTags = new Map<string, RegisteredComponent>();
   private definedTags = new Map<string, CustomElementConstructor>();
   private loadedModules = new Set<string>();
+  private viewHydrations = new Map<string, WooViewHydration>();
 
   installCatalogUi(pkg: CatalogUiPackage): string[] {
     if (pkg.ui.abi !== "woo-ui/v1") return [`unsupported UI ABI for ${pkg.alias}: ${pkg.ui.abi}`];
@@ -455,6 +489,24 @@ export class CatalogUiRegistry {
     this.definedTags.set(tag, ctor);
   }
 
+  defineViewHydration(alias: string, moduleId: string, id: string, hydration: WooViewHydration): void {
+    const pkg = this.catalogs.get(alias);
+    if (!pkg) throw new Error(`unknown catalog UI alias: ${alias}`);
+    const declared = (pkg.ui.frames ?? []).some((frame) => frame.hydration?.module === moduleId && frame.hydration.id === id);
+    if (!declared) throw new Error(`view hydration ${id} is not declared for ${alias}:${moduleId}`);
+    const key = `${alias}:${moduleId}:${id}`;
+    if (this.viewHydrations.has(key)) throw new Error(`view hydration already registered: ${key}`);
+    this.viewHydrations.set(key, hydration);
+  }
+
+  viewHydration(resolved: ResolvedFrame | undefined): RegisteredViewHydration | undefined {
+    const declaration = resolved?.frame.hydration;
+    if (!resolved || !declaration) return undefined;
+    const id = `${resolved.catalog.alias}:${declaration.module}:${declaration.id}`;
+    const hydration = this.viewHydrations.get(id);
+    return hydration ? { id, hydration } : undefined;
+  }
+
   async loadModule(
     alias: string,
     moduleId: string,
@@ -472,6 +524,7 @@ export class CatalogUiRegistry {
     mod.registerWooComponents?.({ defineTag: (tag, ctor) => this.defineTag(alias, moduleId, tag, ctor) });
     mod.registerWooObservationHandlers?.(observations);
     mod.registerWooChatFormatters?.(chatFormatters);
+    mod.registerWooViewHydrations?.({ define: (id, hydration) => this.defineViewHydration(alias, moduleId, id, hydration) });
     this.loadedModules.add(key);
   }
 
@@ -484,6 +537,7 @@ export class CatalogUiRegistry {
     mod.registerWooComponents?.({ defineTag: (tag, ctor) => this.defineTag(alias, moduleId, tag, ctor) });
     mod.registerWooObservationHandlers?.(observations);
     mod.registerWooChatFormatters?.(chatFormatters);
+    mod.registerWooViewHydrations?.({ define: (id, hydration) => this.defineViewHydration(alias, moduleId, id, hydration) });
     this.loadedModules.add(key);
   }
 
@@ -1243,9 +1297,12 @@ export class CoalescedViewHydrator<T = unknown> {
     void this.options.read(subject, signature)
       .then((value) => {
         if (generation !== this.generation) return;
+        // Apply before memoizing success. A catalog hydration may reject a
+        // structurally malformed reply while translating it into projection
+        // patches; marking first would make that failure permanently complete.
+        this.options.apply(value, subject, signature);
         this.completed.add(key);
         this.retryGate.recordSuccess(retryKey);
-        this.options.apply(value, subject, signature);
       })
       .catch((error) => {
         if (generation !== this.generation) return;

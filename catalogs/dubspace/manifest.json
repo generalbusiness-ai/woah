@@ -33,6 +33,10 @@
         "subject": "$dubspace",
         "view": "default",
         "layout": "space-workspace",
+        "hydration": {
+          "module": "dubspace-ui",
+          "id": "controls"
+        },
         "state": {
           "control_roles": {
             "slots": ["slot_1", "slot_2", "slot_3", "slot_4"],

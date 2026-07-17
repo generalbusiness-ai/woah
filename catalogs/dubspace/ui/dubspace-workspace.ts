@@ -6,9 +6,11 @@ import {
   type ChatFormatterRegistry,
   type ObservationRegistry,
   type WooComponentRegistry,
-  type WooContext
+  type WooContext,
+  type WooViewHydrationRegistry
 } from "../../../src/client/framework";
 import { DUBSPACE_DRUM_VOICES, LOOP_DEFAULT_SEMITONES, NOTE_NAMES, PITCH_MAX_SEMITONE, PITCH_MIN_SEMITONE, PITCH_ROOT_FREQ, PITCH_ROOT_MIDI } from "./model";
+import { dubspaceControlsHydration } from "./net-hydration";
 
 export type DubspaceControlMap = Record<string, { id?: string; name?: string; props?: Record<string, unknown> }>;
 
@@ -300,6 +302,10 @@ function loopPitch(freq: number): { freq: number; semitone: number; note: string
 
 export function registerWooComponents(registry: WooComponentRegistry): void {
   registry.defineTag("woo-dubspace-workspace", WooDubspaceWorkspaceElement);
+}
+
+export function registerWooViewHydrations(registry: WooViewHydrationRegistry): void {
+  registry.define("controls", dubspaceControlsHydration);
 }
 
 export function registerWooObservationHandlers(registry: ObservationRegistry): void {

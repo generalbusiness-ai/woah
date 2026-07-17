@@ -1,9 +1,123 @@
 import { dubspaceControlDefinitions, type DubspaceControlRoles } from "./model";
+import type {
+  ProjectionPatch,
+  WooViewHydration,
+  WooViewHydrationContext
+} from "../../../src/client/framework";
 
 export type DubspaceControlCellView = {
   space: { id: string; name: string };
   meta: DubspaceControlRoles;
   controls: Array<{ id: string; name: string; props: Record<string, unknown> }>;
+};
+
+function record(value: unknown): Record<string, any> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, any> : null;
+}
+
+function frameRoles(context: WooViewHydrationContext): DubspaceControlRoles {
+  return record(context.frameState.control_roles) ?? {};
+}
+
+function frameDefaults(context: WooViewHydrationContext): Record<string, Record<string, unknown>> {
+  return record(context.frameState.control_defaults) ?? {};
+}
+
+function projectedRoles(context: WooViewHydrationContext): DubspaceControlRoles {
+  return record(context.observe(context.subject)?.catalogState?.dubspace_controls) ?? frameRoles(context);
+}
+
+/** Translate the catalog's controls view into the shell's generic projection
+ * patch format. Role vocabulary remains here with the catalog model; callers
+ * apply the result without rebuilding or interpreting that vocabulary. */
+export function dubspaceControlsProjectionPatches(space: string, view: unknown): ProjectionPatch[] | null {
+  const value = record(view);
+  const meta = record(value?.meta);
+  if (!value || !meta || !Array.isArray(meta.slots)) return null;
+  const rows = [value.space, ...(Array.isArray(value.controls) ? value.controls : [])];
+  const patches: ProjectionPatch[] = [];
+  for (const row of rows) {
+    const id = String(row?.id ?? "");
+    if (!id) continue;
+    patches.push({
+      subject: id,
+      fields: {
+        ...(typeof row?.name === "string" ? { name: row.name } : {}),
+        ...(typeof row?.description === "string" ? { description: row.description } : {})
+      },
+      props: record(row?.props) ?? {}
+    });
+  }
+  const spacePatch = patches.find((patch) => patch.subject === space);
+  if (!spacePatch) return null;
+  spacePatch.catalogState = {
+    dubspace_controls: {
+      slots: meta.slots.filter((id: unknown): id is string => typeof id === "string" && Boolean(id)),
+      channel: typeof meta.channel === "string" ? meta.channel : "",
+      filter: typeof meta.filter === "string" ? meta.filter : "",
+      delay: typeof meta.delay === "string" ? meta.delay : "",
+      drum: typeof meta.drum === "string" ? meta.drum : "",
+      scene: typeof meta.scene === "string" ? meta.scene : ""
+    }
+  };
+  return patches;
+}
+
+function projectionComplete(context: WooViewHydrationContext): boolean {
+  const definitions = dubspaceControlDefinitions(projectedRoles(context), frameDefaults(context));
+  return definitions.length > 0 && definitions.every(([id, names]) => {
+    const props = id ? context.observe(id)?.props : null;
+    return Boolean(props && names.every((name) => Object.prototype.hasOwnProperty.call(props, name)));
+  });
+}
+
+function viewComplete(context: WooViewHydrationContext, patches: readonly ProjectionPatch[]): boolean {
+  const byId = new Map(patches.map((patch) => [patch.subject, patch.props ?? {}]));
+  const spacePatch = patches.find((patch) => patch.subject === context.subject);
+  const roles = record(spacePatch?.catalogState?.dubspace_controls) ?? frameRoles(context);
+  const definitions = dubspaceControlDefinitions(roles, frameDefaults(context));
+  return definitions.length > 0 && definitions.every(([id, names]) => {
+    const props = byId.get(id);
+    return Boolean(props && names.every((name) => Object.prototype.hasOwnProperty.call(props, name)));
+  });
+}
+
+async function readControlsView(context: WooViewHydrationContext): Promise<unknown> {
+  if (!installedDubspaceSupportsControlsView(context.installedCatalogs)) {
+    return readAgedDubspaceControlCells({
+      space: context.subject,
+      roles: frameRoles(context),
+      defaults: frameDefaults(context),
+      readCell: context.readCell,
+      nameOf: context.nameOf
+    });
+  }
+  try {
+    return await context.call(context.subject, "controls_view", [], { serverRead: true });
+  } catch (error) {
+    if (!isAgedDubspaceControlsError(error)) throw error;
+    return readAgedDubspaceControlCells({
+      space: context.subject,
+      roles: frameRoles(context),
+      defaults: frameDefaults(context),
+      readCell: context.readCell,
+      nameOf: context.nameOf
+    });
+  }
+}
+
+/** Frame-declared cold hydration contract registered by dubspace-workspace.
+ * The generic shell owns coalescing/backoff; this catalog owns every semantic
+ * detail of reading, validating, and projecting its control surface. */
+export const dubspaceControlsHydration: WooViewHydration = {
+  complete: projectionComplete,
+  async read(context) {
+    if (!context.present) throw new Error("dubspace controls require room presence");
+    const patches = dubspaceControlsProjectionPatches(context.subject, await readControlsView(context));
+    if (!patches) throw new Error("dubspace controls view was malformed");
+    if (!viewComplete(context, patches)) throw new Error("dubspace controls view was incomplete");
+    return patches;
+  }
 };
 
 const CELL_READ_PACE_MS = 25;

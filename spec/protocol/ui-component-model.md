@@ -240,6 +240,7 @@ A catalog manifest MAY include a top-level `ui` object.
         "subject": "$pinboard",
         "view": "default",
         "layout": "space-workspace",
+        "hydration": { "module": "pinboard-ui", "id": "board" },
         "regions": {
           "main": [
             {
@@ -335,6 +336,13 @@ type ChatFormatter = {
 };
 ```
 
+`ui.frames[].hydration` optionally declares a catalog-owned cold-view read.
+`module` names a `ui.modules[]` entry and `id` is local to that module. The
+module MUST register the same id through `registerWooViewHydrations()` (UCM7).
+The declaration belongs to the frame rather than a client tab: any host that
+resolves that frame can run the same semantic hydration without recognizing a
+catalog alias, command word, or catalog-specific projection shape.
+
 Returning `undefined` means "this observation is not a chat line right
 now"; the host drops it. Returning `{}` accepts the line with no
 overrides, so kind defaults to the observation type and text falls back
@@ -418,6 +426,37 @@ export function registerWooChatFormatters(
 manifest declaration. The host calls this hook at module load time so
 chat-eligibility lookups for the declared types resolve as soon as
 observations begin to flow.
+
+A module MAY also implement a frame-declared cold-view hydration:
+
+```ts
+type WooViewHydrationContext = {
+  subject: string;
+  frameState: Readonly<Record<string, unknown>>;
+  present: boolean;
+  installedCatalogs: readonly unknown[];
+  observe(ref: string): ObjectProjection | null;
+  call(target: string, verb: string, args?: unknown[], options?: { serverRead?: boolean }): Promise<unknown>;
+  readCell(key: string): Promise<unknown>;
+  nameOf(ref: string): string;
+};
+
+type WooViewHydration = {
+  complete(context: WooViewHydrationContext): boolean;
+  read(context: WooViewHydrationContext): Promise<ProjectionPatch[]>;
+};
+
+export function registerWooViewHydrations(registry: {
+  define(id: string, hydration: WooViewHydration): void;
+}): void;
+```
+
+The catalog owns the read vocabulary, compatibility fallbacks, completeness
+predicate, and translation to generic `ProjectionPatch[]`. The host owns
+transport capabilities, coalescing, retry backoff, canonical patch application,
+and active-frame error reporting. A hydration MUST validate its result before
+returning; malformed or incomplete results reject and remain retryable. The host
+MUST reject registration not named by a frame declaration for that module.
 
 ---
 
@@ -1503,6 +1542,9 @@ Component hydration or semantic-fill reads that can be requested from render
 MUST coalesce identical in-flight work and MUST apply bounded retry backoff
 after failure. A persistent permission, missing-object, or transport failure
 must not turn observation-driven renders into a request-per-render loop.
+Frame-declared hydrations use the host's shared coalescing/backoff policy; a
+component that performs its own semantic read remains responsible for the same
+bounds.
 
 The host MAY preserve component instances across route changes when subject,
 component id, and stable frame-node identity are unchanged. Components MUST

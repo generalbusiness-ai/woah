@@ -61,7 +61,11 @@ Committed control observations then patch that same canonical projection and
 repaint the active workspace.
 
 The frame repeats that fixed role map and its demo seed defaults as declarative
-UI state. A net world may
+UI state and declares the catalog module's `controls` hydration contract. The
+generic shell supplies presence, call, cell-read, and projection capabilities;
+the catalog module selects `controls_view` versus the aged-cell fallback,
+validates completeness, and returns generic projection patches. No shell branch
+names Dubspace or rebuilds the role map. A net world may
 outlive the bundle that installed it, so clients connected to a pre-1.0.2
 Dubspace cannot call `controls_view()`. When the net projection does not prove
 the installed version, the client immediately uses the frame map to read the

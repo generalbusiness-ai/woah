@@ -17,11 +17,10 @@ import * as outlinerUiModule from "../../catalogs/outliner/ui/outliner-tree";
 import * as pinboardUiModule from "../../catalogs/pinboard/ui/pinboard-board";
 import * as tasksUiModule from "../../catalogs/tasks/ui/kanban-board";
 import * as weatherUiModule from "../../catalogs/weather/ui/weather-badge";
-import { DUBSPACE_DRUM_VOICES, LOOP_DEFAULT_SEMITONES, NOTE_NAMES, PITCH_MAX_SEMITONE, PITCH_MIN_SEMITONE, PITCH_ROOT_FREQ, PITCH_ROOT_MIDI, dubspaceControlDefinitions } from "../../catalogs/dubspace/ui/model";
-import { installedDubspaceSupportsControlsView, isAgedDubspaceControlsError, readAgedDubspaceControlCells } from "../../catalogs/dubspace/ui/net-hydration";
+import { DUBSPACE_DRUM_VOICES, LOOP_DEFAULT_SEMITONES, NOTE_NAMES, PITCH_MAX_SEMITONE, PITCH_MIN_SEMITONE, PITCH_ROOT_FREQ, PITCH_ROOT_MIDI } from "../../catalogs/dubspace/ui/model";
 import { appliedFrameErrorObservations, chatErrorText } from "./chat-errors";
 import { chatObservationSpace, updateEnteredLeftChatPresence } from "./chat-state";
-import { CoalescedViewHydrator, createWooClientFramework, displayTextCacheKey, escapeHtml, liveProjectionKey, ProjectionFieldFiller, pruneDisplayTextCaches, readDisplayTextCache, RetryBackoffGate, writeDisplayTextCache, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type WooContext, type WooElement } from "./framework";
+import { CoalescedViewHydrator, createWooClientFramework, displayTextCacheKey, escapeHtml, liveProjectionKey, ProjectionFieldFiller, pruneDisplayTextCaches, readDisplayTextCache, writeDisplayTextCache, type CatalogUiPackage, type ProjectionCallOptions, type ProjectionPatch, type WooContext, type WooElement, type WooViewHydrationContext } from "./framework";
 import { isPinboardObservation } from "./pinboard-observation";
 import { clearProvisionalChatLines, provisionalChatErrorLine, upsertProvisionalChatLine } from "./provisional-chat";
 import { advanceProjectionCursor, idsFromRefsOrSummaries, presentActorsFromObservation, resolveOptionalRoomContents, scopedHerePresentActors, scopedModelWithMoveResult, type ScopedProjectionStateModel } from "./scoped-projection";
@@ -344,8 +343,6 @@ const pendingToolEnters = new Set<string>();
 const pendingToolEnterTimers = new Map<string, number>();
 const pendingToolMoveRetryTimers = new Map<string, number>();
 const pendingOverlaySnapshots = new Map<string, Promise<void>>();
-const pendingDubspaceViewReads = new Map<string, Promise<void>>();
-const dubspaceViewRetryGate = new RetryBackoffGate();
 let scopedProjectionLocalRevision = 0;
 let connectInFlight: Promise<void> | null = null;
 const reconnectBaseDelayMs = 500;
@@ -898,6 +895,7 @@ function connect() {
     state.session = session;
     projectionFiller.reset();
     resetPinboardNotesHydration();
+    catalogViewHydrator.reset();
     render();
     try {
       await refresh();
@@ -1815,41 +1813,10 @@ async function ensureScopedOverlayForTab(tab: AppTab, options: { force?: boolean
   // views hydrate semantic state that generic room summaries omit; outliner
   // and tasks instead hydrate through their components' directCall reads.
   if (netMode()) {
-    if (tab === "dubspace") {
-      // Wait for the authoritative move before asking for the control view.
-      // This also prevents the generic tab-finalize hook and the move-result
-      // hook from issuing duplicate reads during entry.
-      if (!actorPresentInSpace(subject, dubspacePresentActors())) return;
-      const pending = pendingDubspaceViewReads.get(subject);
-      if (pending) return await pending;
-      // Mount and committed-observation renders all reach this function. A
-      // durable missing/recycled control can make every compatibility read
-      // fail, so only start a new 27-cell sweep when its backoff has elapsed.
-      if (!dubspaceViewRetryGate.canAttempt(subject)) return;
-      // Install the coalescing barrier before NetFeed.turn() can synchronously
-      // notify pending state and re-enter render. Starting in a microtask makes
-      // that ordering explicit and prevents a mount/read/render recursion.
-      const request = Promise.resolve().then(async () => {
-        const view = await readDubspaceControlsView(subject);
-        if (!applyDubspaceControlsCanonical(subject, view)) throw new Error("dubspace controls view was malformed");
-        // Treat a structurally valid but incomplete catalog reply as a failed
-        // hydration. Otherwise mount would repeatedly repaint and reread it.
-        if (!dubspaceControlProjectionComplete(projectedDubspace(), dubspaceMeta())) {
-          throw new Error("dubspace controls view was incomplete");
-        }
-      });
-      pendingDubspaceViewReads.set(subject, request);
-      try {
-        await request;
-        dubspaceViewRetryGate.recordSuccess(subject);
-      } catch (error) {
-        dubspaceViewRetryGate.recordFailure(subject);
-        throw error;
-      } finally {
-        if (pendingDubspaceViewReads.get(subject) === request) pendingDubspaceViewReads.delete(subject);
-      }
-      return;
-    }
+    // Frame-declared catalog hydrations own their semantic read and patch
+    // shape. The shell contributes only presence, transport, and projection
+    // capabilities; CoalescedViewHydrator supplies one shared retry policy.
+    if (ensureCatalogViewHydration(subject)) return;
     if (tab === "pinboard") {
       try {
         applyPinboardNotesCanonical(subject, await readPinboardNotesView(subject));
@@ -2194,6 +2161,71 @@ const pinboardNotesHydrator = new CoalescedViewHydrator<any[]>({
 });
 let pinboardNotesHydrationBoard = "";
 
+function installedCatalogRecords(): readonly unknown[] {
+  if (Array.isArray(state.scopedProjection?.catalogs?.catalogs)) return state.scopedProjection.catalogs.catalogs;
+  return Array.isArray(catalogUiCache?.catalogs) ? catalogUiCache.catalogs : [];
+}
+
+function catalogViewHydrationContext(subject: string): WooViewHydrationContext | null {
+  const resolved = toolFrameForSubject(subject);
+  if (!ui.catalogUi.viewHydration(resolved)) return null;
+  return {
+    subject,
+    frameState: resolved?.frame.state ?? {},
+    present: actorPresentInSpace(subject),
+    installedCatalogs: installedCatalogRecords(),
+    observe: (ref) => ui.observe(ref) ?? null,
+    call: (target, verb, args = [], options) => callWithError(subject, target, verb, args, undefined, options),
+    readCell: async (key) => {
+      if (!netFeed) throw new Error("net catalog cell reader is unavailable");
+      return netFeed.cell(key);
+    },
+    nameOf: objectName
+  };
+}
+
+const catalogViewHydrator = new CoalescedViewHydrator<ProjectionPatch[]>({
+  read: async (subject, signature) => {
+    const resolved = toolFrameForSubject(subject);
+    const registered = ui.catalogUi.viewHydration(resolved);
+    const context = catalogViewHydrationContext(subject);
+    if (!registered || registered.id !== signature || !context) throw new Error(`catalog view hydration disappeared: ${signature}`);
+    return registered.hydration.read(context);
+  },
+  apply: (patches, subject) => {
+    ui.applyCanonical(patches);
+    if (objectIdForTab(state.tab) === subject) render();
+  },
+  onError: (error, subject, signature) => {
+    const resolved = toolFrameForSubject(subject);
+    const registered = ui.catalogUi.viewHydration(resolved);
+    const context = catalogViewHydrationContext(subject);
+    // A move away can revoke the cell-read permission while hydration is in
+    // flight. Report only a still-active, still-incomplete view; the generic
+    // backoff gate retains the failure for a later eligible render.
+    if (
+      registered?.id === signature && context?.present &&
+      objectIdForTab(state.tab) === subject &&
+      !registered.hydration.complete(context)
+    ) console.error(`catalog view hydration failed (${signature})`, error);
+  }
+});
+
+/** Start a frame-declared Net view hydration when one exists. Returning true
+ * means the frame owns this cold-read path even when presence/completeness
+ * makes the current render a no-op. */
+function ensureCatalogViewHydration(subject: string): boolean {
+  if (!netMode() || !subject) return false;
+  const resolved = toolFrameForSubject(subject);
+  const registered = ui.catalogUi.viewHydration(resolved);
+  const context = catalogViewHydrationContext(subject);
+  if (!registered || !context) return false;
+  if (context.present && !registered.hydration.complete(context)) {
+    catalogViewHydrator.ensure(subject, registered.id);
+  }
+  return true;
+}
+
 // Initial connect must run AFTER the projection/view hydrators are declared
 // above:
 // `connect()` → `refreshScopedProjection` → `applyScopedProjectionSnapshot`
@@ -2485,12 +2517,6 @@ function bundledDubspaceControlRoles(): Record<string, any> {
   const frame = (dubspaceManifest as any)?.ui?.frames?.find((candidate: any) => candidate?.id === "dubspace.workspace");
   const roles = frame?.state?.control_roles;
   return roles && typeof roles === "object" && !Array.isArray(roles) ? roles : {};
-}
-
-function bundledDubspaceControlDefaults(): Record<string, Record<string, unknown>> {
-  const frame = (dubspaceManifest as any)?.ui?.frames?.find((candidate: any) => candidate?.id === "dubspace.workspace");
-  const defaults = frame?.state?.control_defaults;
-  return defaults && typeof defaults === "object" && !Array.isArray(defaults) ? defaults : {};
 }
 
 function dubspaceMeta(): any {
@@ -3246,107 +3272,6 @@ function callDubspaceMutation(verb: string, args: unknown[], options?: Projectio
   return id;
 }
 
-function readDubspaceControlsView(space: string): Promise<any> {
-  if (!space || !canSendDubspaceV2()) {
-    return Promise.reject(new Error("dubspace controls view is unavailable"));
-  }
-  // The net bootstrap ledger proves whether this durable world has the view.
-  // If that evidence is unavailable or predates the verb, start with the
-  // bounded cell surface instead of spending a missing-verb repair budget.
-  if (netMode() && !netInstalledDubspaceSupportsControlsView()) {
-    return readDubspaceControlCellsView(space);
-  }
-  return new Promise((resolve, reject) => {
-    v2Turn({
-      scope: space,
-      route: "direct",
-      target: space,
-      verb: "controls_view",
-      args: [],
-      persistence: "live",
-      // Display hydration needs authoritative catalog state, not a local
-      // execution attempt or an optimistic prediction.
-      readOnly: true,
-      onResult: resolve,
-      onError: (error) => {
-        if (!netMode() || !isAgedDubspaceControlsError(error)) {
-          reject(error);
-          return;
-        }
-        // Durable worlds are not implicitly upgraded by a client bundle
-        // deploy. Pre-controls_view worlds retain the same public property
-        // cells, so hydrate that fixed, declared surface without enumeration.
-        void readDubspaceControlCellsView(space).then(resolve, reject);
-      }
-    });
-  });
-}
-
-function netInstalledDubspaceSupportsControlsView(): boolean {
-  const installed = Array.isArray(state.scopedProjection?.catalogs?.catalogs)
-    ? state.scopedProjection.catalogs.catalogs
-    : Array.isArray(catalogUiCache?.catalogs)
-      ? catalogUiCache.catalogs
-      : [];
-  return installedDubspaceSupportsControlsView(installed);
-}
-
-function readDubspaceControlCellsView(space: string): Promise<any> {
-  if (!netFeed || !netFeedOpen) return Promise.reject(new Error("dubspace net cells are unavailable"));
-  return readAgedDubspaceControlCells({
-    space,
-    roles: dubspaceMeta(),
-    defaults: bundledDubspaceControlDefaults(),
-    readCell: (key) => netFeed!.cell(key),
-    nameOf: objectName
-  });
-}
-
-function applyDubspaceControlsCanonical(space: string, view: any): boolean {
-  if (!view || typeof view !== "object" || Array.isArray(view)) return false;
-  const meta = view.meta && typeof view.meta === "object" && !Array.isArray(view.meta) ? view.meta : null;
-  if (!meta || !Array.isArray(meta.slots)) return false;
-  const rows = [view.space, ...(Array.isArray(view.controls) ? view.controls : [])];
-  const patches: ProjectionPatch[] = [];
-  for (const row of rows) {
-    const id = String(row?.id ?? "");
-    if (!id) continue;
-    patches.push({
-      subject: id,
-      fields: {
-        ...(typeof row?.name === "string" ? { name: row.name } : {}),
-        ...(typeof row?.description === "string" ? { description: row.description } : {})
-      },
-      props: row?.props && typeof row.props === "object" && !Array.isArray(row.props) ? row.props : {}
-    });
-  }
-  // A malformed response must never erase a previously good projection.
-  const spacePatch = patches.find((patch) => patch.subject === space);
-  if (!spacePatch) return false;
-  // Object roles are catalog semantics, not inferable from a sparse net room
-  // projection. Store the view's explicit role map beside the canonical rows.
-  spacePatch.catalogState = {
-    dubspace_controls: {
-      slots: meta.slots.filter((id: unknown): id is string => typeof id === "string" && Boolean(id)),
-      channel: typeof meta.channel === "string" ? meta.channel : "",
-      filter: typeof meta.filter === "string" ? meta.filter : "",
-      delay: typeof meta.delay === "string" ? meta.delay : "",
-      drum: typeof meta.drum === "string" ? meta.drum : "",
-      scene: typeof meta.scene === "string" ? meta.scene : ""
-    }
-  };
-  ui.applyCanonical(patches);
-  return true;
-}
-
-function dubspaceControlProjectionComplete(dub: Record<string, any>, meta: any): boolean {
-  const required = dubspaceControlDefinitions(meta, bundledDubspaceControlDefaults());
-  return required.every(([id, names]) => {
-    const props = id ? dub[id]?.props : null;
-    return props && names.every((name) => Object.prototype.hasOwnProperty.call(props, name));
-  });
-}
-
 function patternWithStep(rawPattern: any, voice: string, step: number, enabled: boolean) {
   // Used for local optimistic drum-button patches. Since dubspace 0.2.4,
   // server `drum_step_changed` observations carry the full pattern snapshot.
@@ -3896,16 +3821,10 @@ function mountDubspaceComponent() {
   const space = spaceId ? projectedObjectView(spaceId) ?? dub[spaceId] : null;
   const present = dubspacePresentActors();
   const inSpace = actorPresentInSpace(spaceId, present);
-  if (netMode() && inSpace && !dubspaceControlProjectionComplete(dub, meta)) {
-    // Entry and presence arrive on separate net signals. If the lifecycle
-    // callback ran before presence became visible, let the mounted workspace
-    // self-heal by starting the same coalesced catalog read now.
-    void ensureScopedOverlayForTab("dubspace").then(() => {
-      if (state.tab === "dubspace") render();
-    }).catch((error) => {
-      reportDubspaceHydrationError(error);
-    });
-  }
+  // Entry and presence arrive on separate Net signals. If the lifecycle hook
+  // ran early, the mounted frame retries its declared hydration here; the
+  // generic hydrator owns coalescing, completeness, and failure backoff.
+  if (netMode() && inSpace) ensureCatalogViewHydration(spaceId);
   const lines = chatLinesForSpace(spaceId);
   element.subject = spaceId;
   element.woo = createChatWooContext(spaceId, [...chatLineActorRefs(lines), ...present]);
@@ -4037,21 +3956,7 @@ function bindDubspace() {
 }
 
 function refreshDubspaceOverlayAfterEntry(): void {
-  void ensureScopedOverlayForTab("dubspace").then(() => {
-    if (state.tab === "dubspace") render();
-  }).catch((error) => {
-    // Leaving Dubspace can revoke presence while its entry hydration is still
-    // in flight. That abandoned read is expected; only surface failures while
-    // the workspace still needs the data.
-    reportDubspaceHydrationError(error);
-  });
-}
-
-function reportDubspaceHydrationError(error: unknown): void {
-  const space = dubspaceSpace();
-  if (state.tab === "dubspace" && actorPresentInSpace(space, dubspacePresentActors())) {
-    console.error("dubspace controls hydration failed", error);
-  }
+  void ensureScopedOverlayForTab("dubspace");
 }
 
 function enterDubspace() {
@@ -4988,46 +4893,19 @@ function chatCommandUiActionFromPlan(plan: any): ChatCommandUiAction {
 function renderChatCommandResult(action: ChatCommandUiAction, result: any, originalText: string) {
   applyScopedMoveResult(result);
   const { verb, target } = action;
-  if (verb === "enter" && target === dubspaceSpace()) {
-    setTab("dubspace", { mode: "push", leaveCurrent: false });
-    refreshDubspaceOverlayAfterEntry();
+  const tool = TOOL_TAB_DEFINITIONS.find((definition) => toolSpace(definition.tab) === target);
+  if (verb === "enter" && tool) {
+    if (tool.tab === "pinboard") setPinboardPresent(result);
+    setTab(tool.tab, { mode: "push", leaveCurrent: false });
+    ensureCatalogViewHydration(target);
     requestSpaceChatFocus(target);
     return;
   }
-  if ((verb === "leave" || verb === "out") && target === dubspaceSpace()) {
-    setTab("chat", { mode: "push", leaveCurrent: false });
-    focusChatInput();
-    return;
-  }
-  if ((verb === "leave" || verb === "out") && target === pinboardSpace()) {
-    setPinboardPresent(result);
-    clearPinboardViewports();
-    setTab("chat", { mode: "push", leaveCurrent: false });
-    focusChatInput();
-    return;
-  }
-  if (verb === "enter" && target === pinboardSpace()) {
-    setPinboardPresent(result);
-    setTab("pinboard", { mode: "push", leaveCurrent: false });
-    // The v2 projection/accepted frame already carries the board and note
-    // projection. Do not queue list_notes or another overlay fetch on entry.
-    requestSpaceChatFocus(target);
-    return;
-  }
-  if (verb === "enter" && target === tasksSpace()) {
-    // The task registry is a room-like workspace just like the other bundled
-    // tools.  Keep command-driven entry on its declared main surface; leaving
-    // it on Chat used to expose the main/chat surface-selection bug above.
-    setTab("tasks", { mode: "push", leaveCurrent: false });
-    requestSpaceChatFocus(target);
-    return;
-  }
-  if (verb === "enter" && target === outlinerSpace()) {
-    setTab("outliner", { mode: "push", leaveCurrent: false });
-    requestSpaceChatFocus(target);
-    return;
-  }
-  if ((verb === "leave" || verb === "out") && target === outlinerSpace()) {
+  if ((verb === "leave" || verb === "out") && tool) {
+    if (tool.tab === "pinboard") {
+      setPinboardPresent(result);
+      clearPinboardViewports();
+    }
     setTab("chat", { mode: "push", leaveCurrent: false });
     focusChatInput();
     return;
