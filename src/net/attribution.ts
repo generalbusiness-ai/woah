@@ -1,105 +1,29 @@
 /**
- * Customer attribution (spec/operations/audit.md AU3.1/AU3.3).
+ * Customer attribution — net-layer surface (audit.md AU3).
  *
- * "Who is the ultimate owner of this actor" is materialized ONCE, at
- * binding time, as a per-actor `customer_of` property cell — never
- * walked through the identity graph at runtime. The cell is an ordinary
- * `property_cell:<actor>:customer_of`, so the anchor walk partitions it
- * to the actor's own cluster scope (the same home as the actor's
- * session cells), where the gateway's existing cluster warm serves it.
+ * The derivation rules and the `CustomerAttribution` value live in
+ * src/core/attribution.ts (the identity LIFECYCLE writes them, and core
+ * cannot import src/net). This module re-exports them and adds the
+ * net-only machinery: the attribution CELL addressing, the AU3.2
+ * `Principal` envelope, and the AU3.3 `ScopeAttribution` stamp.
  *
- * Writers (the identity pipeline only): the cutover identity import
- * (src/net/identity.ts), guest provisioning (src/net/guest.ts), and
- * audited ownership-transfer admin actions. Runtime code READS the cell
- * (normalizeCustomerAttribution) and never derives.
- *
- * Layering: pure derivation over a narrow world-view interface — no
- * WooWorld, Host, or platform imports.
+ * The `customer_of` cell is an ordinary `property_cell` on the actor,
+ * so the anchor walk partitions it to the actor's own cluster scope
+ * (the same home as its session cells) and the gateway's existing
+ * cluster warm serves it. Writes are identity-pipeline-only: the name
+ * is RESERVED below ordinary authoring (world.ts), and the committing
+ * sequencer refuses transcript writes to it from non-identity writers.
  */
 import { cellKey } from "./cells";
 
-/** Distinguished customer id for operator-owned activity (AU3.1 rule 3,
- * AU5 operator partition). */
-export const OPERATOR_CUSTOMER_ID = "operator";
-/** Distinguished attribution for unbound guests (AU3.1 rule 4); routed
- * to the operator partition until the actor binds to an account. */
-export const GUEST_CUSTOMER_ID = "guest";
-/** The reserved per-actor property name. */
-export const PROP_CUSTOMER_OF = "customer_of";
-
-export type CustomerAttribution = {
-  /** Account id, or a distinguished id (`operator` / `guest`). */
-  customer: string;
-  /** Owning team at binding time, if any (identity/teams.md). */
-  team?: string;
-  /** Which AU3.1 rule produced this value. */
-  derived_via: "account" | "agent_owner" | "operator" | "guest" | "transfer";
-  /** Producer clock at binding, ms — absent for import-derived cells
-   * (the import pipeline has no authoritative clock). */
-  bound_at?: number;
-};
-
-/** The narrow world view the derivation rules read. Implemented over
- * WooWorld by the identity import and over fixtures by tests. */
-export type AttributionSource = {
-  /** Live parent-chain reachability (isa), e.g. isa(actor, "$agent"). */
-  isa(obj: string, ancestor: string): boolean;
-  /** Property value or null (world.propOrNull). */
-  prop(obj: string, name: string): unknown;
-  /** The object's owner field (an objref), or null when unresolvable. */
-  ownerOf(obj: string): string | null;
-  /** flags.wizard === true. */
-  isWizard(obj: string): boolean;
-};
-
-function accountOf(source: AttributionSource, obj: string): string | null {
-  const account = source.prop(obj, "account");
-  return typeof account === "string" && account.length > 0 ? account : null;
-}
-
-/**
- * The closed AU3.1 derivation rules, applied in order. Returns null for
- * an actor no rule covers — the caller's policy decides (the import
- * reports it; record minting later surfaces `unattributed` to the
- * operator partition). Never throws, never walks more than one
- * ownership hop ($agent.owner is a single principal by AP4.2).
- */
-export function deriveCustomerAttribution(
-  source: AttributionSource,
-  actor: string
-): CustomerAttribution | null {
-  // Rule 1: actor bound to an account ($human, multi-character players,
-  // account-bound service actors).
-  const account = accountOf(source, actor);
-  if (account) return { customer: account, derived_via: "account" };
-
-  // Rule 2: $agent — attribute through the owning principal.
-  if (source.isa(actor, "$agent")) {
-    const owner = source.ownerOf(actor);
-    if (owner !== null) {
-      if (owner === "$wiz" || source.isWizard(owner)) {
-        return { customer: OPERATOR_CUSTOMER_ID, derived_via: "operator" };
-      }
-      const ownerAccount = accountOf(source, owner);
-      if (ownerAccount) return { customer: ownerAccount, derived_via: "agent_owner" };
-    }
-    // An agent with an unattributable owner falls through: rules 3/4
-    // can still catch a wizard-flagged or guest-classed agent, and an
-    // uncovered one is the named pipeline bug, not a silent guess.
-  }
-
-  // Rule 3: wizard/operator actors.
-  if (actor === "$wiz" || source.isWizard(actor)) {
-    return { customer: OPERATOR_CUSTOMER_ID, derived_via: "operator" };
-  }
-
-  // Rule 4: unbound guests.
-  if (source.isa(actor, "$guest")) {
-    return { customer: GUEST_CUSTOMER_ID, derived_via: "guest" };
-  }
-
-  return null;
-}
+export {
+  deriveCustomerAttribution,
+  normalizeCustomerAttribution,
+  GUEST_CUSTOMER_ID,
+  OPERATOR_CUSTOMER_ID,
+  PROP_CUSTOMER_OF
+} from "../core/attribution";
+export type { AttributionSource, CustomerAttribution } from "../core/attribution";
 
 /**
  * The principal envelope (AU3.2): who a turn runs as, stamped ONCE by
@@ -107,12 +31,12 @@ export function deriveCustomerAttribution(
  * client input. Discriminated — full attribution is unknowable before
  * successful authentication, and the shape does not pretend otherwise:
  * - `authenticated`: customer + actor are present (a committed turn
- *   always carries this form);
+ *   only ever carries this form — the sequencer refuses the others);
  * - `credentialed`: the credential was recognized but rejected
- *   (expired/revoked/actor-mismatch) — credential set, customer the
- *   customer-of-record for it, actor possibly absent;
- * - `anonymous`: unknown or malformed credential — no customer, no
- *   actor (gateway edge records only).
+ *   (expired/revoked/actor-mismatch) — credential REQUIRED, customer
+ *   the customer-of-record for it when known, actor possibly absent;
+ * - `anonymous`: unknown or malformed credential — customer and actor
+ *   MUST be absent (gateway edge records only).
  */
 export type Principal = {
   attribution: "authenticated" | "credentialed" | "anonymous";
@@ -124,7 +48,9 @@ export type Principal = {
   on_behalf_of?: string;
 };
 
-/** Read guard for carried principals (durable rows, transcripts). */
+/** Read guard for carried principals (durable rows, transcripts). The
+ * per-variant field rules are enforced here so a semantically malformed
+ * principal can never round-trip through a durable carrier. */
 export function normalizePrincipal(raw: unknown): Principal | null {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
   const v = raw as Record<string, unknown>;
@@ -135,19 +61,25 @@ export function normalizePrincipal(raw: unknown): Principal | null {
   const out: Principal = { attribution: v.attribution };
   const customer = str(v.customer);
   const actor = str(v.actor);
+  const credential = str(v.credential);
   if (customer !== undefined) out.customer = customer;
   if (actor !== undefined) out.actor = actor;
+  if (credential !== undefined) out.credential = credential;
+  // Variant rules (AU3.2):
   if (v.attribution === "authenticated" && (customer === undefined || actor === undefined)) {
-    // AU3.2: authenticated principals REQUIRE customer + actor.
-    return null;
+    return null; // authenticated REQUIRES customer + actor
+  }
+  if (v.attribution === "credentialed" && credential === undefined) {
+    return null; // credentialed REQUIRES the credential that was recognized
+  }
+  if (v.attribution === "anonymous" && (customer !== undefined || actor !== undefined)) {
+    return null; // anonymous means exactly that — no attribution claims
   }
   const team = str(v.team);
   const session = str(v.session);
-  const credential = str(v.credential);
   const onBehalfOf = str(v.on_behalf_of);
   if (team !== undefined) out.team = team;
   if (session !== undefined) out.session = session;
-  if (credential !== undefined) out.credential = credential;
   if (onBehalfOf !== undefined) out.on_behalf_of = onBehalfOf;
   return out;
 }
@@ -185,34 +117,5 @@ export function normalizeScopeAttribution(raw: unknown): ScopeAttribution | null
 
 /** Cell key for an actor's attribution: `property_cell:<actor>:customer_of`. */
 export function customerOfCellKey(actor: string): string {
-  return cellKey("property_cell", actor, PROP_CUSTOMER_OF);
-}
-
-/**
- * Read guard for the cell/prop value (the runtime never trusts shape).
- * Accepts the canonical property-cell payload (`{value: attribution}`)
- * or the bare attribution (the world-side prop value); returns null on
- * anything else.
- */
-export function normalizeCustomerAttribution(raw: unknown): CustomerAttribution | null {
-  let value = raw;
-  if (value !== null && typeof value === "object" && !Array.isArray(value) && "value" in (value as object)) {
-    value = (value as { value: unknown }).value;
-  }
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
-  const v = value as Record<string, unknown>;
-  if (typeof v.customer !== "string" || v.customer.length === 0) return null;
-  if (
-    v.derived_via !== "account" &&
-    v.derived_via !== "agent_owner" &&
-    v.derived_via !== "operator" &&
-    v.derived_via !== "guest" &&
-    v.derived_via !== "transfer"
-  ) {
-    return null;
-  }
-  const out: CustomerAttribution = { customer: v.customer, derived_via: v.derived_via };
-  if (typeof v.team === "string" && v.team.length > 0) out.team = v.team;
-  if (typeof v.bound_at === "number" && Number.isFinite(v.bound_at)) out.bound_at = v.bound_at;
-  return out;
+  return cellKey("property_cell", actor, "customer_of");
 }

@@ -183,3 +183,41 @@ Deviations from the plan as written:
   write — covered, but by a different writer than elastic guests.
 
 Next: Phase 2 (audit lane + shard + records) per the phase list above.
+
+## Review fixes (2026-07-17, second review round)
+
+Five findings, all confirmed real, all fixed with tests:
+
+1. **Lifecycle coverage (P1)**: derivation moved to `src/core/attribution.ts`
+   (core owns the identity lifecycle; net re-exports). Writers now cover
+   the whole lifecycle: `bindHumanToAccount` (signup AND guest→account
+   promotion rebind), `provisionActorInternal` (humans + agents), the
+   identity import, the guest mint, and a whole-world
+   `materializeCustomerAttributions` pass in `planNetInstall` (preseeded
+   pool guests, catalog-seeded actors). This surfaced a real gap the
+   original rules missed: acting APPLIANCES (the_weather/the_horoscope)
+   → new AU3.1 rule 5, a generalized one-hop owner walk ordered after
+   the guest rule. Stock-world install now reports zero unattributed.
+2. **Forgeability (P1)**: `customer_of` is a reserved property —
+   `assertOrdinaryPropertyName` refuses setProp/defineProperty/verb
+   writes with E_PERM; the privileged shape-validated
+   `world.setCustomerOf` is the only writer. AttributionSource exposes
+   semantic predicates (isAgent/isGuest) so core/attribution.ts holds no
+   class names (layering guard).
+3. **Principal strictness (P2)**: normalizePrincipal enforces per-variant
+   field rules (credentialed requires credential; anonymous may claim
+   nothing); the sequencer rejects non-authenticated principals on
+   commits (`not_authenticated`) and refuses an edge-claimed customer
+   when it owns the actor but holds no cell (`customer_unverifiable`).
+4. **Seed epoch binding (P2)**: /net/seed refuses an attribution stamped
+   at a different epoch (E_EPOCH_MISMATCH, M9 posture).
+5. **Traceparent suffix (P2)**: future-version parse requires a `-`
+   delimiter at char 55; glued suffixes mint instead of adopt.
+
+Validation: all touched suites green solo; `npm test` full-gate runs
+during this round showed 1-5 UNSTABLE timeout failures from cross-
+session machine contention (load avg 4-10, failing set differed every
+run, every member passed solo including 142/142 at load 10). First
+quiet-machine run of the day was 987/987. smoke:net-dev 25/25 with the
+installer now sending real attribution stamps. Re-run `npm test` on a
+quiet machine before merge.

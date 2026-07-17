@@ -533,22 +533,39 @@ export class ScopeSequencer {
       if (normalizePrincipal(principal) === null) {
         return this.reject(submit, "unauthorized", { principal_verdict: "malformed_principal" });
       }
-      if (principal.attribution === "authenticated" && principal.actor !== submit.transcript.call.actor) {
+      // AU3.2: a COMMITTED turn only ever carries the authenticated form.
+      // `credentialed`/`anonymous` are gateway edge-record shapes; on a
+      // submit they are a stamping bug or a forgery, never acceptable.
+      if (principal.attribution !== "authenticated") {
+        return this.reject(submit, "unauthorized", {
+          principal_verdict: "not_authenticated",
+          attribution: principal.attribution
+        });
+      }
+      if (principal.actor !== submit.transcript.call.actor) {
         return this.reject(submit, "unauthorized", {
           principal_verdict: "actor_mismatch",
           principal_actor: principal.actor,
           transcript_actor: submit.transcript.call.actor
         });
       }
-      if (
-        principal.attribution === "authenticated" &&
-        principal.actor !== undefined &&
-        this.options.owns?.(principal.actor) === true
-      ) {
+      if (principal.actor !== undefined && this.options.owns?.(principal.actor) === true) {
+        // The committing scope IS the actor's home: the claimed customer
+        // must be durably checkable. An absent cell with a claimed
+        // customer is refused — trusting the edge here would let a buggy
+        // or compromised gateway invent attribution for an actor whose
+        // durable authority holds none. (A turn with NO principal still
+        // commits: unattributed is a named gap, not a forgery.)
         const owned = normalizeCustomerAttribution(
           this.store.get(customerOfCellKey(principal.actor))?.value
         );
-        if (owned !== null && owned.customer !== principal.customer) {
+        if (owned === null) {
+          return this.reject(submit, "unauthorized", {
+            principal_verdict: "customer_unverifiable",
+            principal_customer: principal.customer
+          });
+        }
+        if (owned.customer !== principal.customer) {
           return this.reject(submit, "unauthorized", {
             principal_verdict: "customer_mismatch",
             principal_customer: principal.customer,

@@ -9,6 +9,7 @@ import {
   customerOfCellKey,
   GUEST_CUSTOMER_ID,
   normalizeCustomerAttribution,
+  normalizePrincipal,
   normalizeScopeAttribution,
   OPERATOR_CUSTOMER_ID,
   type AttributionSource
@@ -25,9 +26,8 @@ function source(fixture: {
   owners?: Record<string, string>; // obj -> owner objref
 }): AttributionSource {
   return {
-    isa: (obj, ancestor) =>
-      (ancestor === "$agent" && (fixture.agents ?? []).includes(obj)) ||
-      (ancestor === "$guest" && (fixture.guests ?? []).includes(obj)),
+    isAgent: (obj) => (fixture.agents ?? []).includes(obj),
+    isGuest: (obj) => (fixture.guests ?? []).includes(obj),
     prop: (obj, name) => (name === "account" ? (fixture.accounts ?? {})[obj] ?? null : null),
     ownerOf: (obj) => (fixture.owners ?? {})[obj] ?? null,
     isWizard: (obj) => (fixture.wizards ?? []).includes(obj)
@@ -151,4 +151,23 @@ describe("scope attribution stamping (AU3.3)", () => {
     expect(normalizeScopeAttribution({ customer: "", derived_via: "operator", stamped_at_epoch: "e" })).toBeNull();
     expect(normalizeScopeAttribution({ customer: "#a", derived_via: "operator" })).toBeNull();
   });
+});
+
+describe("normalizePrincipal variant rules (AU3.2)", () => {
+  const cases: Array<[string, unknown, boolean]> = [
+    ["authenticated full", { attribution: "authenticated", customer: "#a", actor: "#h" }, true],
+    ["authenticated without customer", { attribution: "authenticated", actor: "#h" }, false],
+    ["authenticated without actor", { attribution: "authenticated", customer: "#a" }, false],
+    ["credentialed with credential", { attribution: "credentialed", credential: "key1", customer: "#a" }, true],
+    ["credentialed WITHOUT credential", { attribution: "credentialed", customer: "#a" }, false],
+    ["anonymous bare", { attribution: "anonymous" }, true],
+    ["anonymous claiming a customer", { attribution: "anonymous", customer: "#a" }, false],
+    ["anonymous claiming an actor", { attribution: "anonymous", actor: "#h" }, false],
+    ["unknown attribution", { attribution: "vibes" }, false]
+  ];
+  for (const [label, value, ok] of cases) {
+    it(`${ok ? "accepts" : "rejects"} ${label}`, () => {
+      expect(normalizePrincipal(value) !== null).toBe(ok);
+    });
+  }
 });

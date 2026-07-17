@@ -138,7 +138,23 @@ durable per-actor cell:
   4. guest actors → the distinguished `guest` attribution; their
      records route to the operator partition. A guest later binding to
      an account re-writes the cell; **history does not move** — records
-     are immutable and stamped at event time.
+     are immutable and stamped at event time;
+  5. any remaining actor attributes through its owner, one hop — the
+     rule-2 walk generalized past `$agent`. The canonical case is
+     catalog-seeded *acting appliances* (actor-classed world furniture
+     that is neither agent nor guest): wizard-owned → `operator`; an
+     owner bound to an account → that account. Ordered after rule 4 so
+     `$wiz`-owned pool guests stay guest-attributed. No class names are
+     special-cased — the rule reads only ownership and account binding.
+- **The write contract is enforced below ordinary authoring**
+  (implemented): `customer_of` is a reserved property name — `setProp`,
+  `defineProperty`, and every verb write funnel through the reservation
+  and refuse with `E_PERM`, so an object's *owner* cannot rewrite an
+  owned actor's attribution. The identity pipeline writes through the
+  privileged, shape-validated `world.setCustomerOf`, and the install
+  pipeline closes the "every actor" invariant with a whole-world
+  materialization pass (`materializeCustomerAttributions`) before
+  partitioning — preseeded pools and catalog-seeded actors included.
 - Every actor that can act has an attribution cell; a turn whose actor
   has none is an *identity-pipeline bug*, surfaced as a named record in
   the operator partition (`outcome: "unattributed"`) — never a dropped
@@ -176,12 +192,18 @@ interface Principal {
   committed turn always carries `authenticated`.
 - **Stamped by the gateway**, never accepted from client input.
 - **Validated at commit** (implemented, `ScopeSequencer.submit` step
-  1b): a carried principal is shape-checked, actor-matched against the
-  transcript, and — when the committing scope owns the actor's
-  `customer_of` cell — customer-checked against durable authority.
-  Violations fold into the CO14 `unauthorized` reject with a named
-  `principal_verdict`: `malformed_principal`, `actor_mismatch`, or
-  `customer_mismatch`. Otherwise the scope records the edge's
+  1b): a carried principal is shape-checked (per-variant field rules —
+  `credentialed` requires its credential, `anonymous` may claim no
+  customer or actor), must be `authenticated` (the edge-record forms
+  never commit), is actor-matched against the transcript, and — when
+  the committing scope owns the actor — is customer-checked against the
+  durable `customer_of` cell, **refusing when the cell is absent**
+  rather than trusting the edge's claim. Violations fold into the CO14
+  `unauthorized` reject with a named `principal_verdict`:
+  `malformed_principal`, `not_authenticated`, `actor_mismatch`,
+  `customer_unverifiable`, or `customer_mismatch`. A turn carrying NO
+  principal still commits (unattributed is a named gap, not a forgery).
+  For scopes that don't own the actor, the scope records the edge's
   attestation; the credential id keeps the attestation itself
   auditable.
 - **Carried through every indirection**: adoption riders carry the

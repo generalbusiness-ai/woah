@@ -110,3 +110,18 @@ describe("normalizeTraceContext (durable-row guard)", () => {
     });
   }
 });
+
+describe("future-version suffix discipline (review fix P2c)", () => {
+  const base = "cc-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+  it("rejects a bare suffix glued to the flags", () => {
+    expect(parseTraceparent(`${base}evil`)).toBeNull();
+    expect(parseTraceparent(`${base}_`)).toBeNull();
+  });
+  it("accepts exactly-55 future version and dash-delimited extra fields", () => {
+    expect(parseTraceparent(base)).not.toBeNull();
+    expect(parseTraceparent(`${base}-extra-fields`)).not.toBeNull();
+  });
+  it("adoptOrMint mints (never adopts) a glued-suffix header", () => {
+    expect(adoptOrMintTraceContext(`${base}evil`).origin).toBe("minted");
+  });
+});

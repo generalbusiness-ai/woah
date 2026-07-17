@@ -30,6 +30,13 @@ import {
 import type { ObjectRepository, ParkedTaskRecord, SeedWorld, SerializedAuthoritySlice, SerializedObject, SerializedProperty, SerializedSession, SerializedWorld, SpaceSnapshotRecord, WorldRepository } from "./repository";
 import { isVmReadSignal, isVmSuspendSignal, runSerializedTinyVmTask, runSerializedTinyVmTaskWithInput, runTinyVm, type SerializedVmTask } from "./tiny-vm";
 import { installCatalogManifest, updateCatalogManifest, type CatalogManifest, type CatalogMigrationManifest } from "./catalog-installer";
+import {
+  deriveCustomerAttribution,
+  normalizeCustomerAttribution,
+  PROP_CUSTOMER_OF,
+  type AttributionSource,
+  type CustomerAttribution
+} from "./attribution";
 import { normalizeVerbPerms } from "./verb-perms";
 import { analyzeBytecodePurity, combineVerbPurity, compileVerb, propagateVerbPurity } from "./authoring";
 import { hashSource, randomHex, constantTimeEqual } from "./source-hash";
@@ -1970,10 +1977,66 @@ export class WooWorld {
     return true;
   }
 
+  /** True only inside setCustomerOf: the ONE writer allowed to touch the
+   * reserved attribution property (audit.md AU3.1 write contract). */
+  private reservedAttributionWrite = false;
+
   private assertOrdinaryPropertyName(name: string): void {
     if (name === "owner") {
       throw wooError("E_PERM", "owner is a read-only core field", { property: name });
     }
+    if (name === PROP_CUSTOMER_OF && !this.reservedAttributionWrite) {
+      // AU3.1: attribution is identity-pipeline state. Ordinary authoring
+      // (setProp, defineProperty, verb writes — which all funnel here)
+      // must not rewrite it; an object's OWNER rewriting an owned agent's
+      // customer is exactly the forgery this blocks. The pipeline writes
+      // through setCustomerOf below.
+      throw wooError("E_PERM", "customer_of is identity-pipeline state (audit.md AU3.1); it cannot be written by ordinary authoring", { property: name });
+    }
+  }
+
+  /**
+   * The identity pipeline's privileged attribution write (AU3.1): shape-
+   * validated, and the only path past the reserved-name guard. Callers
+   * are the lifecycle sites only — account binding, actor provisioning,
+   * the identity import, and audited transfers. Idempotent (setProp
+   * no-ops on equal values).
+   */
+  setCustomerOf(objRef: ObjRef, attribution: CustomerAttribution): void {
+    const valid = normalizeCustomerAttribution(attribution);
+    if (valid === null) {
+      throw wooError("E_INVARG", "malformed customer attribution", { object: objRef });
+    }
+    this.reservedAttributionWrite = true;
+    try {
+      this.setProp(objRef, PROP_CUSTOMER_OF, valid as unknown as WooValue);
+    } finally {
+      this.reservedAttributionWrite = false;
+    }
+  }
+
+  /** The AU3.1 derivation view over this world (core/attribution.ts). */
+  attributionSource(): AttributionSource {
+    const chainReaches = (obj: string, ancestor: string): boolean => {
+      try {
+        return this.inheritsFrom(obj, ancestor);
+      } catch {
+        return false;
+      }
+    };
+    return {
+      isAgent: (obj) => chainReaches(obj, "$agent"),
+      isGuest: (obj) => chainReaches(obj, "$guest"),
+      prop: (obj, name) => {
+        try {
+          return this.propOrNull(obj, name);
+        } catch {
+          return null;
+        }
+      },
+      ownerOf: (obj) => this.objects.get(obj)?.owner ?? null,
+      isWizard: (obj) => this.objects.get(obj)?.flags.wizard === true
+    };
   }
 
   getProp(objRef: ObjRef, name: string): WooValue {
@@ -3455,6 +3518,11 @@ export class WooWorld {
       if (!actors.includes(actor)) this.setProp(account, "actors", [...actors, actor]);
       this.setProp(actor, "account", account);
       this.setProp(actor, "name", this.accountDisplayName(account));
+      // AU3.1 rule 1 at binding time: signup and guest→account promotion
+      // rewrite the attribution (a promoted elastic guest must stop
+      // attributing to `guest`). History does not move — records already
+      // minted keep their stamped value.
+      this.setCustomerOf(actor, { customer: account, derived_via: "account", bound_at: now });
     }
 
     private accountDisplayName(account: ObjRef): string {
@@ -3506,6 +3574,13 @@ export class WooWorld {
         this.setProp(id, "scope", typeof attrs.scope === "string" ? attrs.scope : "write");
         if (typeof attrs.profile_id === "string") this.setProp(id, "profile_id", attrs.profile_id);
       }
+      // AU3.1 at provisioning time: derive the new actor's attribution
+      // while the owner/account binding is in hand (rule 1 for humans
+      // with accounts, rule 2 for agents through their owner, rule 3 for
+      // wizard-owned). An uncovered actor stays unattributed — a named
+      // gap the audit trail surfaces, never a guess.
+      const derived = deriveCustomerAttribution(this.attributionSource(), id);
+      if (derived !== null) this.setCustomerOf(id, { ...derived, bound_at: Date.now() });
       this.recordWizardAction(caller, "actor_provisioned", { actor: id, class: classRef, owner });
       return { actor: id };
     }

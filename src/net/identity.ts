@@ -26,7 +26,37 @@
  */
 import type { SerializedObject, SerializedWorld } from "../core/repository";
 import type { WooWorld } from "../core/world";
-import { deriveCustomerAttribution, PROP_CUSTOMER_OF, type AttributionSource } from "./attribution";
+import { deriveCustomerAttribution, PROP_CUSTOMER_OF } from "./attribution";
+
+/**
+ * AU3.1 "every actor" closure for a BUILT world (install pipeline):
+ * derive and materialize `customer_of` for every live `$actor`
+ * descendant instance that does not already carry one — the preseeded
+ * guest pool, `$wiz`, and any catalog-seeded actors, which the
+ * per-lifecycle writers (import, provisioning, guest mint) never see.
+ * Returns the ids no rule covers. Idempotent; install-time only (the
+ * whole-world walk is the install pipeline's privilege, never the
+ * runtime's).
+ */
+export function materializeCustomerAttributions(world: WooWorld): string[] {
+  const source = world.attributionSource();
+  const unattributed: string[] = [];
+  for (const obj of world.exportWorld().objects) {
+    if (obj.id.startsWith("$")) {
+      // Seed-class objects: only $wiz is itself an acting principal.
+      if (obj.id !== "$wiz") continue;
+    }
+    if (!liveChainReaches(world, obj.id, "$actor")) continue;
+    if (world.propOrNull(obj.id, PROP_CUSTOMER_OF) !== null) continue;
+    const derived = deriveCustomerAttribution(source, obj.id);
+    if (derived === null) {
+      unattributed.push(obj.id);
+      continue;
+    }
+    world.setCustomerOf(obj.id, derived);
+  }
+  return unattributed;
+}
 
 /** The §8 closed allow-list of identity properties, plus three deliberate
  * additions surfaced here rather than silently made:
@@ -356,43 +386,22 @@ export async function importIdentity(
   // Customer attribution (audit.md AU3.1): materialize `customer_of` on
   // every imported actor now, while the whole account graph is in hand —
   // the runtime never walks the graph. Derivation is the closed AU3.1
-  // rule set; setProp no-ops on equal values so re-imports stay
-  // idempotent. An uncovered actor is REPORTED, not aborted: unlike a
-  // dangling ref (a broken inventory), a missing attribution is a named
-  // pipeline gap the audit trail surfaces per-record (`unattributed`).
-  const attributionSource: AttributionSource = {
-    isa: (obj, ancestor) => liveChainReaches(world, obj, ancestor),
-    prop: (obj, name) => {
-      try {
-        return world.propOrNull(obj, name);
-      } catch {
-        return null;
-      }
-    },
-    ownerOf: (obj) => {
-      try {
-        return world.object(obj).owner;
-      } catch {
-        return null;
-      }
-    },
-    isWizard: (obj) => {
-      try {
-        return world.object(obj).flags.wizard === true;
-      } catch {
-        return false;
-      }
-    }
-  };
+  // rule set through the privileged setter (the property is reserved
+  // below ordinary authoring); setCustomerOf no-ops on equal values so
+  // re-imports stay idempotent. An uncovered actor is REPORTED, not
+  // aborted: unlike a dangling ref (a broken inventory), a missing
+  // attribution is a named pipeline gap the audit trail surfaces
+  // per-record (`unattributed`).
   const unattributed: string[] = [];
+  const source = world.attributionSource();
   for (const actor of identity.actors) {
     if (!liveChainReaches(world, actor.id, "$actor")) continue; // verification below names it
-    const derived = deriveCustomerAttribution(attributionSource, actor.id);
+    const derived = deriveCustomerAttribution(source, actor.id);
     if (derived === null) {
       unattributed.push(actor.id);
       continue;
     }
-    world.setProp(actor.id, PROP_CUSTOMER_OF, derived as never);
+    world.setCustomerOf(actor.id, derived);
   }
 
   // §8 import verification — abort on ANY dangling ref.

@@ -81,11 +81,32 @@ describe("net install end-to-end (fake-DO lane)", () => {
         scope,
         catalog_epoch: plan.epoch,
         cells,
-        relations: plan.relations.get(scope) ?? []
+        relations: plan.relations.get(scope) ?? [],
+        // AU3.3: the production installer sends the stamp; the fake lane
+        // exercises the same body shape.
+        ...(plan.attributions.has(scope) ? { attribution: plan.attributions.get(scope) } : {})
       });
       expect(seeded.ok, `seed ${scope}`).toBe(true);
       states.push(st);
       scopeDOs.set(scope, instance);
+    }
+
+    // AU3.3 epoch binding (review fix P2b): an attribution stamped at a
+    // DIFFERENT epoch than the seed refuses with the named code — a
+    // stale stamp must never ride a current seed.
+    {
+      const st = netState("scope-stale-attr");
+      const instance = new NetScopeDO(st.state, scopeEnv);
+      const staleSeed = await call(instance, "/net/seed", {
+        scope: "room:stale_attr_room",
+        catalog_epoch: plan.epoch,
+        cells: [],
+        attribution: { customer: "operator", derived_via: "operator", stamped_at_epoch: "cat-older" }
+      });
+      expect(staleSeed.ok).toBe(false);
+      const refusal = (await staleSeed.json()) as { error?: { code?: string } };
+      expect(refusal.error?.code).toBe("E_EPOCH_MISMATCH");
+      st.close();
     }
 
     // Verification 1: every head answers at the install epoch, and a

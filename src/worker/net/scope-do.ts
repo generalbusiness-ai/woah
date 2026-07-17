@@ -1008,6 +1008,18 @@ export class NetScopeDO {
         // Preserve the distinction between a legacy omitted relation field
         // and an explicit complete empty family on an installer re-seed.
         const attribution = normalizeScopeAttribution(body.attribution) ?? undefined;
+        // AU3.3 epoch binding: a stamp derived under one catalog epoch
+        // must not ride a seed at another — a stale attribution stored
+        // with a current seed would silently misattribute every record
+        // this scope ever mints. Same M9 posture as the epoch guard
+        // above: named refusal, reconciliation is the installer's job.
+        if (attribution !== undefined && attribution.stamped_at_epoch !== body.catalog_epoch) {
+          throw netError("E_EPOCH_MISMATCH", "seed attribution stamped at a different epoch than the seed", {
+            scope: body.scope,
+            seed_epoch: body.catalog_epoch,
+            attribution_epoch: attribution.stamped_at_epoch
+          });
+        }
         this.discardSeqOnThrow(() => seq.seed(body.cells, body.relations, attribution));
         // H2b: seeded session cells arm the reap wake too.
         if (body.cells.some((cell) => cell.kind === "session")) this.armSessionReapAlarm(seq);

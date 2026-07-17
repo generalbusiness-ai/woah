@@ -26,7 +26,7 @@ const classifier: ScopeClassifier = {
 
 /** The plan.test.ts harness, plus a customer_of cell on the actor so the
  * authority can re-validate the principal's customer (AU3.2). */
-function harness(tag: string) {
+function harness(tag: string, options: { attribute?: boolean } = {}) {
   const world = createWorld();
   const session = world.auth(`guest:audit-${tag}`);
   const actor = session.actor;
@@ -44,7 +44,13 @@ function harness(tag: string) {
     null
   );
   expect(installed.ok).toBe(true);
-  world.setProp(actor, PROP_CUSTOMER_OF, { customer: "acct_audit", derived_via: "account" } as never);
+  // The reserved property refuses ordinary setProp (AU3.1 write
+  // contract); the identity pipeline's privileged setter is the writer.
+  // `attribute: false` builds the unattributed-actor variant for the
+  // customer_unverifiable case.
+  if (options.attribute !== false) {
+    world.setCustomerOf(actor, { customer: "acct_audit", derived_via: "account" });
+  }
 
   // Single-scope harness: the sequencer owns every object (so ordinary
   // writes are local), which includes the actor's customer_of cell —
@@ -174,5 +180,48 @@ describe("sequencer principal validation (AU3.2 → CO14 unauthorized)", () => {
     const plan = await plannedWith(h, h.principal(), "k-ok");
     const reply = h.seq.submit(plan.submit);
     expect(reply.status).toBe("accepted");
+  });
+});
+
+describe("review fixes: strict principal states on commits (AU3.2)", () => {
+  it("rejects a non-authenticated principal on a committed turn", async () => {
+    const h = harness("edgeform");
+    const plan = await planTurn({
+      call: h.call("k-cred"),
+      principal: { attribution: "credentialed", credential: "key1", customer: "acct_audit" },
+      view: h.view,
+      planningScope: SCOPE,
+      classifier,
+      base: h.seq.head(),
+      idempotencyKey: "k-cred",
+      stamp: h.seq.stamp()
+    });
+    expect(h.seq.submit(plan.submit)).toMatchObject({
+      status: "rejected",
+      reason: "unauthorized",
+      detail: { principal_verdict: "not_authenticated" }
+    });
+  });
+
+  it("rejects customer_unverifiable when the owned cell is absent but a customer is claimed", async () => {
+    // A harness WITHOUT the customer_of cell: the committing scope owns
+    // the actor, so an edge-claimed customer with no durable backing is
+    // refused rather than trusted.
+    const h = harness("unverif", { attribute: false });
+    const plan = await planTurn({
+      call: h.call("k-unverif"),
+      principal: h.principal({ customer: "acct_invented" }),
+      view: h.view,
+      planningScope: SCOPE,
+      classifier,
+      base: h.seq.head(),
+      idempotencyKey: "k-unverif",
+      stamp: h.seq.stamp()
+    });
+    expect(h.seq.submit(plan.submit)).toMatchObject({
+      status: "rejected",
+      reason: "unauthorized",
+      detail: { principal_verdict: "customer_unverifiable" }
+    });
   });
 });

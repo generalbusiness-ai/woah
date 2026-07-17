@@ -42,9 +42,14 @@ const TRACEPARENT_RE = /^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2
  */
 export function parseTraceparent(header: string | null | undefined): ParsedTraceparent | null {
   if (!header) return null;
-  // Future versions may append fields after the flags; W3C says parse the
-  // first four fields and ignore the rest for versions > 00.
-  const m = TRACEPARENT_RE.exec(header) ?? TRACEPARENT_RE.exec(header.slice(0, 55));
+  // Future versions may append fields after the flags; W3C says parse
+  // the first four fields and ignore the rest for versions > 00 — but
+  // ONLY when the extra data is a proper `-`-delimited field. A bare
+  // suffix glued to the flags (`…-01evil`) is malformed, not
+  // forward-compatible, and must mint instead of adopt.
+  const m =
+    TRACEPARENT_RE.exec(header) ??
+    (header.length > 55 && header[55] === "-" ? TRACEPARENT_RE.exec(header.slice(0, 55)) : null);
   if (!m) return null;
   const [, version, traceId, spanId, flags] = m;
   if (version === "ff") return null;

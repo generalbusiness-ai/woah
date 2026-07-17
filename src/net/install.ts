@@ -31,6 +31,7 @@ import {
 import { DEFAULT_LOCAL_CATALOGS, installLocalCatalogs, localCatalogBundleFingerprint } from "../core/local-catalogs";
 import type { WooWorld } from "../core/world";
 import { cellsFromSerialized, type NetCellInput } from "./bridge";
+import { materializeCustomerAttributions } from "./identity";
 import { CATALOG_SCOPE, classifierFromLineage, partitionCells, type AnchorLineage } from "./topology";
 import type { RelationRow } from "./relations";
 
@@ -71,6 +72,9 @@ export type NetInstallPlan = {
    * `customer_of` while the whole graph is in hand. Scopes with an
    * unattributable anchor owner are ABSENT (unstamped), never guessed. */
   attributions: Map<string, ScopeAttribution>;
+  /** AU3.1 named gaps: live actors no derivation rule covers. Installers
+   * surface these; they are never silently attributed. */
+  unattributedActors: string[];
 };
 
 export type NetInstallOptions = {
@@ -114,6 +118,12 @@ export async function planNetInstall(options: NetInstallOptions = {}): Promise<N
   if (options.graft) await options.graft(world);
   normalizeAnchors(world);
   seedGuestPool(world);
+  // AU3.1 "every actor": the lifecycle writers (import, provisioning,
+  // guest mint) cover actors THEY create; the preseeded pool and any
+  // catalog-seeded actors are attributed here, before the world image
+  // is partitioned — so no installed world ships an actor without its
+  // customer_of cell unless no derivation rule covers it (reported).
+  const unattributedActors = materializeCustomerAttributions(world);
   const epoch = netInstallEpoch(catalogs);
   const cells = cellsFromSerialized(world.exportWorld());
   const partitions = partitionCells(cells);
@@ -125,7 +135,7 @@ export async function planNetInstall(options: NetInstallOptions = {}): Promise<N
     partitions.set(CATALOG_SCOPE, catalog);
   }
   const attributions = deriveScopeAttributions(world, [...partitions.keys()], epoch);
-  return { epoch, partitions, relations, world, attributions };
+  return { epoch, partitions, relations, world, attributions, unattributedActors };
 }
 
 /**
