@@ -549,6 +549,13 @@ One write path per fact (CO9), concretized:
   corresponding `drop_verb` or `drop_property` and the current bundle no longer
   defines that page; arbitrary definitions and deletion of current definitions
   are not operator inputs.
+  A safety-critical identity admission path MAY invoke that same signed,
+  ordered operation internally before allocating a credential, but only for
+  an exact bundled page whose existing native handler and owner are already
+  recognized. It MUST reread and verify the authoritative replacement before
+  admission, coalesce concurrent repairs, back off after failure, and fail
+  closed for missing or unrecognized pages. This is not a general client-
+  controlled catalog-repair surface.
 - **The applier runs at the committing scope.** On accept, the scope
   derives relation deltas from the transcript: `projectionWrites`
   (contents add/remove), moves (contents of the source and destination

@@ -12,6 +12,65 @@ type BootstrapOptions = {
   catalogs?: readonly string[] | false;
 };
 
+/** The pooled-guest reset is an identity boundary, not merely cosmetic
+ * bootstrap behavior. Its install page and the net admission repair share
+ * this exact contract because runtime deployment does not rewrite an active
+ * world's persisted bootstrap definition pages. */
+export const GUEST_RESET_OBJECT = "$guest";
+export const GUEST_RESET_VERB = "on_disfunc";
+export const GUEST_RESET_NATIVE = "guest_on_disfunc";
+export const GUEST_RESET_SOURCE = "verb :on_disfunc(target?) r { ... }";
+export const GUEST_RESET_ARG_SPEC = { args: ["target?"] } as const;
+
+export type GuestResetVerbPage = Omit<Extract<VerbDef, { kind: "native" }>, "line_map">;
+
+/** The wire page produced by a fresh bootstrap install (debug line maps do
+ * not cross the net cell bridge). Preserve the live slot during repair so
+ * replacing this one definition cannot reorder sibling verbs. */
+export function guestResetVerbPage(slot = 1): GuestResetVerbPage {
+  return {
+    kind: "native",
+    name: GUEST_RESET_VERB,
+    aliases: [],
+    owner: "$wiz",
+    perms: "r",
+    arg_spec: { args: [...GUEST_RESET_ARG_SPEC.args] },
+    source: GUEST_RESET_SOURCE,
+    source_hash: hashSource(GUEST_RESET_SOURCE),
+    version: 1,
+    native: GUEST_RESET_NATIVE,
+    direct_callable: true,
+    skip_presence_check: false,
+    tool_exposed: false,
+    slot
+  };
+}
+
+/** Only a page already identifying the trusted bootstrap native is eligible
+ * for automatic repair. Unknown/missing definitions remain operator errors;
+ * admission must not turn a request into arbitrary catalog mutation. */
+export function isRecognizedGuestResetVerbPage(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const page = value as Record<string, unknown>;
+  return page.kind === "native" &&
+    page.name === GUEST_RESET_VERB &&
+    page.native === GUEST_RESET_NATIVE &&
+    page.owner === "$wiz";
+}
+
+export function guestResetVerbSlot(value: unknown): number {
+  if (!isRecognizedGuestResetVerbPage(value)) return 1;
+  return Number.isSafeInteger(value.slot) && Number(value.slot) > 0 ? Number(value.slot) : 1;
+}
+
+export function isCurrentGuestResetVerbPage(value: unknown): boolean {
+  if (!isRecognizedGuestResetVerbPage(value)) return false;
+  return valuesEqual(
+    value as WooValue,
+    guestResetVerbPage(guestResetVerbSlot(value)) as unknown as WooValue
+  );
+}
+
 const bootSnapshotCache = new Map<string, SerializedWorld>();
 
 const ACTOR_LOOK_SELF_SOURCE = `verb :look_self() rxd {
@@ -1225,10 +1284,10 @@ function seedUniversal(world: WooWorld): void {
   // Net session cleanup runs this through a trusted direct maintenance turn.
   // It remains non-tool-exposed, and `r` plus the native handler still denies
   // ordinary guests; only the object's owner/wizard can execute the reset.
-  native(world, "$guest", "on_disfunc", "guest_on_disfunc", "verb :on_disfunc(target?) r { ... }", {
+  native(world, "$guest", GUEST_RESET_VERB, GUEST_RESET_NATIVE, GUEST_RESET_SOURCE, {
     perms: "r",
     directCallable: true,
-    argSpec: { args: ["target?"] }
+    argSpec: { args: [...GUEST_RESET_ARG_SPEC.args] }
   });
   native(world, "$system", "return_guest", "return_guest", "verb :return_guest(guest) r { ... }", { perms: "r" });
   native(world, "$system", "set_object_flags", "set_object_flags", "verb :set_object_flags(target, flags) rxd { /* native: wizard-only flag mutation. flags is a map; allowed keys: wizard, programmer, fertile. Returns the resulting flags. Required for the auth.md A11 \"mint a backup wizard\" flow. */ }", { directCallable: true, perms: "rxd", argSpec: { args: ["target", "flags"] } });

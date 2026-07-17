@@ -7,7 +7,13 @@
 import { describe, expect, it } from "vitest";
 import { webcrypto } from "node:crypto";
 import { FakeDurableObjectState } from "./fake-do";
-import { createWorld } from "../../src/core/bootstrap";
+import {
+  createWorld,
+  GUEST_RESET_OBJECT,
+  GUEST_RESET_VERB,
+  isCurrentGuestResetVerbPage
+} from "../../src/core/bootstrap";
+import { cellKey, type CellTransfer } from "../../src/net/cells";
 import { exportIdentity, importIdentity } from "../../src/net/identity";
 import { planNetInstall } from "../../src/net/install";
 import { CLIENT_SESSION_TTL_DEFAULT_MS } from "../../src/net/client-session-policy";
@@ -72,7 +78,11 @@ async function encodePassword(password: string): Promise<string> {
   return `pbkdf2-sha256:${iterations}:${salt}:${digest}`;
 }
 
-async function buildDoorHarness(options: { omitGuestTemplate?: boolean } = {}) {
+async function buildDoorHarness(options: {
+  omitGuestTemplate?: boolean;
+  staleGuestResetDefinition?: boolean;
+  unknownGuestResetDefinition?: boolean;
+} = {}) {
   // The OLD world: one human actor bound to an account with a REAL
   // password hash (actor-side binding only — primary_actor is NOT
   // carried by §8; the import must rebuild it), plus an apikey.
@@ -89,6 +99,7 @@ async function buildDoorHarness(options: { omitGuestTemplate?: boolean } = {}) {
 
   const states: Array<ReturnType<typeof netState>> = [];
   const scopeDOs = new Map<string, NetScopeDO>();
+  const scopeStates = new Map<string, ReturnType<typeof netState>>();
   const resolve = (destination: string) => {
     if (destination.startsWith("scope:")) {
       const scope = destination.slice("scope:".length);
@@ -99,6 +110,7 @@ async function buildDoorHarness(options: { omitGuestTemplate?: boolean } = {}) {
         // namespace must do the same.
         const st = netState(`door-scope-${scope}`);
         states.push(st);
+        scopeStates.set(scope, st);
         instance = new NetScopeDO(st.state, scopeEnv);
         scopeDOs.set(scope, instance);
       }
@@ -111,16 +123,32 @@ async function buildDoorHarness(options: { omitGuestTemplate?: boolean } = {}) {
   for (const [scope, cells] of plan.partitions) {
     const st = netState(`door-scope-${scope}`);
     states.push(st);
+    scopeStates.set(scope, st);
     const instance = new NetScopeDO(st.state, scopeEnv);
+    const seededCells = cells
+      .filter((cell) => !(options.omitGuestTemplate && cell.kind === "property_cell" && cell.object === "$system" && cell.name === "guest_template"))
+      .map((cell) => {
+        if ((!options.staleGuestResetDefinition && !options.unknownGuestResetDefinition) || cell.kind !== "verb_bytecode" ||
+            cell.object !== GUEST_RESET_OBJECT || cell.name !== GUEST_RESET_VERB) return cell;
+        return {
+          ...cell,
+          value: {
+            ...(cell.value as Record<string, unknown>),
+            arg_spec: { args: [] },
+            source: "verb :on_disfunc() r { ... }",
+            source_hash: "aged-guest-reset-source",
+            direct_callable: false,
+            ...(options.unknownGuestResetDefinition ? { native: "untrusted_guest_reset" } : {})
+          }
+        };
+      });
     const request = new Request("https://do/net/seed", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         scope,
         catalog_epoch: plan.epoch,
-        cells: options.omitGuestTemplate
-          ? cells.filter((cell) => !(cell.kind === "property_cell" && cell.object === "$system" && cell.name === "guest_template"))
-          : cells,
+        cells: seededCells,
         relations: plan.relations.get(scope) ?? []
       })
     });
@@ -155,12 +183,60 @@ async function buildDoorHarness(options: { omitGuestTemplate?: boolean } = {}) {
     plan,
     human,
     api,
+    catalogDefinition: async () => {
+      const key = cellKey("verb_bytecode", GUEST_RESET_OBJECT, GUEST_RESET_VERB);
+      const request = new Request("https://do/net/closure", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ keys: [key], known: [] })
+      });
+      const response = await scopeDOs.get("catalog")!.fetch(await signInternalRequest(scopeEnv, request));
+      expect(response.status, await response.clone().text()).toBe(200);
+      const transfer = await response.json() as CellTransfer;
+      return transfer.cells.find((cell) => cell.key === key);
+    },
+    catalogTailSeqs: () => (scopeStates.get("catalog")!.state.storage.sql
+      .exec("SELECT seq FROM net_scope_tail ORDER BY seq") as { toArray(): Array<{ seq: number }> }).toArray(),
     settle: async () => settleStates(states),
     close: async () => closeStates(states)
   };
 }
 
 describe("the identity door (/net-api/login, /net-api/guest, session bearers)", () => {
+  it("repairs a recognized aged guest-reset definition before allocating a session", async () => {
+    const h = await buildDoorHarness({ staleGuestResetDefinition: true });
+    expect(isCurrentGuestResetVerbPage((await h.catalogDefinition())?.value)).toBe(false);
+
+    const claimId = `g1.${Date.now().toString(36)}.${CLIENT_SESSION_TTL_DEFAULT_MS.toString(36)}.e68f08f0-33c8-4f87-8168-619f0ed09e76`;
+    const claimed = await h.api("POST", "/net-api/guest", { body: { claim_id: claimId } });
+    expect(claimed.status, JSON.stringify(claimed.body)).toBe(200);
+    expect(isCurrentGuestResetVerbPage((await h.catalogDefinition())?.value)).toBe(true);
+    expect(h.catalogTailSeqs()).toEqual([{ seq: 1 }]);
+
+    // The deterministic replay uses the repaired gateway page and must not
+    // append another catalog event.
+    const replay = await h.api("POST", "/net-api/guest", { body: { claim_id: claimId } });
+    expect(replay.status, JSON.stringify(replay.body)).toBe(200);
+    expect(replay.body).toMatchObject({ actor: claimed.body.actor, session: claimed.body.session });
+    expect(h.catalogTailSeqs()).toEqual([{ seq: 1 }]);
+    await h.close();
+  }, 30_000);
+
+  it("refuses an unrecognized guest-reset definition without mutating catalog authority", async () => {
+    const h = await buildDoorHarness({ unknownGuestResetDefinition: true });
+    const before = await h.catalogDefinition();
+    expect((before?.value as { native?: string }).native).toBe("untrusted_guest_reset");
+
+    const claim = await h.api("POST", "/net-api/guest", { body: {} });
+    expect(claim.status).toBe(503);
+    expect(claim.body).toMatchObject({
+      error: { code: "E_RETRY", detail: { reason: "guest_reset_definition" } }
+    });
+    expect((await h.catalogDefinition())?.value).toEqual(before?.value);
+    expect(h.catalogTailSeqs()).toEqual([]);
+    await h.close();
+  }, 30_000);
+
   it("fails guest admission closed when the install-owned reset template is absent", async () => {
     const h = await buildDoorHarness({ omitGuestTemplate: true });
 
@@ -169,6 +245,9 @@ describe("the identity door (/net-api/login, /net-api/guest, session bearers)", 
     expect(claim.body).toMatchObject({
       error: { code: "E_RETRY", detail: { reason: "guest_template_missing" } }
     });
+    // A fresh install already matches the shared contract; the verification
+    // itself must not create catalog churn.
+    expect(h.catalogTailSeqs()).toEqual([]);
 
     await h.close();
   }, 30_000);

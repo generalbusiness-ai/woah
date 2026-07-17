@@ -79,6 +79,15 @@ import type { CommitReply, CommitSubmit, RejectReason, ScheduledTurn, ScopeHead 
 import { netCellKeyFor, type EffectTranscript } from "../../net/transcript";
 import type { CellTransfer } from "../../net/cells";
 import { randomHex } from "../../core/source-hash";
+import {
+  GUEST_RESET_NATIVE,
+  GUEST_RESET_OBJECT,
+  GUEST_RESET_VERB,
+  guestResetVerbPage,
+  guestResetVerbSlot,
+  isCurrentGuestResetVerbPage,
+  isRecognizedGuestResetVerbPage
+} from "../../core/bootstrap";
 import { turnEchoId } from "../../net/turn-echo";
 import type { ShadowTurnCall } from "../../core/shadow-turn-call";
 import { provisionGuestSubmit, type GuestTemplate } from "../../net/guest";
@@ -573,6 +582,10 @@ const CLIENT_RATE_BURST = 100;
  * tabs at once; sustained abuse throttles to 5/s). */
 const CLIENT_MINT_RATE_PER_SEC = 5;
 const CLIENT_MINT_RATE_BURST = 20;
+/** A broken/partitioned catalog authority must not turn anonymous admission
+ * traffic into a multi-Hz repair loop. The next request may retry after this
+ * bounded brake; success is cached naturally by the repaired view page. */
+const GUEST_RESET_REPAIR_BACKOFF_MS = 5_000;
 
 export class NetGatewayDO {
   private readonly host: WorkerdHost;
@@ -614,6 +627,8 @@ export class NetGatewayDO {
     ratePerSec: CLIENT_MINT_RATE_PER_SEC,
     burst: CLIENT_MINT_RATE_BURST
   });
+  private guestResetDefinitionRepair: Promise<void> | null = null;
+  private guestResetDefinitionRetryAt = 0;
 
   constructor(
     private readonly state: NetGatewayDurableState,
@@ -2344,6 +2359,21 @@ export class NetGatewayDO {
     const ttlMs = clampClientTtl(body.ttl_ms);
     const claim = guestClaim(body.claim_id, this.host.now(), ttlMs);
     const identity = await this.catalogIdentity();
+    try {
+      await this.ensureGuestResetDefinition();
+    } catch (err) {
+      this.metric({ kind: "net_guest_reset_definition", status: "error", error: String(err) });
+      return json(
+        {
+          error: {
+            code: "E_RETRY",
+            message: "guest entry is unavailable until its reset definition is repaired",
+            detail: { reason: "guest_reset_definition" }
+          }
+        },
+        503
+      );
+    }
     const poolCell = this.ensureView().get(cellKey("property_cell", "$system", "guest_pool"));
     const payload = poolCell?.value as { value?: unknown } | undefined;
     const pool = Array.isArray(payload?.value) ? payload.value.filter((id): id is string => typeof id === "string") : [];
@@ -2393,6 +2423,89 @@ export class NetGatewayDO {
       return await this.normalizePooledGuestEntry(actor, template.initial_room, response, identity.epoch);
     }
     return await this.clientElasticGuest(identity.epoch, template, claim, ttlMs);
+  }
+
+  /**
+   * Active net worlds retain bootstrap definition pages across runtime
+   * deployments. Guest reset became direct-callable after some worlds were
+   * installed, so anonymous admission verifies this security-critical page
+   * before allocating a bearer. A recognized stale native is replaced by the
+   * same signed, ordered catalog operation exposed to operators, then reread
+   * from authority. Missing or unknown pages fail closed.
+   */
+  private async ensureGuestResetDefinition(): Promise<void> {
+    const key = cellKey("verb_bytecode", GUEST_RESET_OBJECT, GUEST_RESET_VERB);
+    if (isCurrentGuestResetVerbPage(this.ensureView().get(key)?.value)) return;
+    if (this.guestResetDefinitionRepair) return this.guestResetDefinitionRepair;
+    const now = this.host.now();
+    if (now < this.guestResetDefinitionRetryAt) {
+      throw new Error(`guest reset definition repair is backing off until ${this.guestResetDefinitionRetryAt}`);
+    }
+
+    const repair = (async () => {
+      // Recognition is made against a targeted authority read, not a possibly
+      // stale gateway copy. Otherwise an old cache could overwrite an
+      // operator's newer/unrecognized definition with no compare-and-swap.
+      const beforeTransfer = await this.host.rpc(`scope:${CATALOG_SCOPE}`, "/closure", {
+        keys: [key],
+        known: []
+      }) as CellTransfer;
+      const authoritative = beforeTransfer.cells.find((cell) => cell.key === key);
+      if (!authoritative || !isRecognizedGuestResetVerbPage(authoritative.value)) {
+        throw new Error(`refused unrecognized ${key}; expected native ${GUEST_RESET_NATIVE}`);
+      }
+      if (isCurrentGuestResetVerbPage(authoritative.value)) {
+        this.discardViewOnThrow(() =>
+          this.state.storage.transactionSync(() => {
+            const view = this.ensureView();
+            view.install(authoritative);
+            this.persistCell(view, key);
+          })
+        );
+        this.guestResetDefinitionRetryAt = 0;
+        return;
+      }
+
+      const existing = authoritative.value;
+      const desired = guestResetVerbPage(guestResetVerbSlot(existing));
+      const result = await this.host.rpc(`scope:${CATALOG_SCOPE}`, "/repair-definitions", {
+        cells: [{ kind: "verb_bytecode", object: GUEST_RESET_OBJECT, name: GUEST_RESET_VERB, value: desired }],
+        remove: []
+      }) as { status?: unknown };
+      if (result.status !== "applied" && result.status !== "empty") {
+        throw new Error(`guest reset definition repair returned ${JSON.stringify(result)}`);
+      }
+
+      // Fanout is asynchronous. Read the accepted page directly from catalog
+      // authority before admitting the request, and persist that exact page in
+      // the gateway view so subsequent claims pay no repair RPC.
+      const transfer = await this.host.rpc(`scope:${CATALOG_SCOPE}`, "/closure", {
+        keys: [key],
+        known: []
+      }) as CellTransfer;
+      const fresh = transfer.cells.find((cell) => cell.key === key);
+      if (!fresh || !isCurrentGuestResetVerbPage(fresh.value)) {
+        throw new Error(`catalog authority did not return the current ${key}`);
+      }
+      this.discardViewOnThrow(() =>
+        this.state.storage.transactionSync(() => {
+          const view = this.ensureView();
+          view.install(fresh);
+          this.persistCell(view, key);
+        })
+      );
+      this.guestResetDefinitionRetryAt = 0;
+      this.metric({ kind: "net_guest_reset_definition", status: result.status });
+    })();
+    this.guestResetDefinitionRepair = repair;
+    try {
+      await repair;
+    } catch (err) {
+      this.guestResetDefinitionRetryAt = this.host.now() + GUEST_RESET_REPAIR_BACKOFF_MS;
+      throw err;
+    } finally {
+      if (this.guestResetDefinitionRepair === repair) this.guestResetDefinitionRepair = null;
+    }
   }
 
   /**
