@@ -38,8 +38,11 @@ permissions, or the normal Net turn authority rules.
 
 The stdio entry is a transport bridge. It forwards JSON-RPC messages to this
 HTTP surface, retains the returned session id, and closes the session when
-stdin closes. It must not create an in-process world or dispatch verbs through
-a second host.
+stdin closes. A pipelined pre-session prefix is ordered behind `initialize` so
+every later request carries the returned session id. Once initialized,
+independent requests are forwarded concurrently: a long `woo_wait` must not
+head-of-line-block calls or MCP keepalive traffic. The bridge must not create an
+in-process world or dispatch verbs through a second host.
 
 ## M2. Tool surface
 

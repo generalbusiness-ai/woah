@@ -28,6 +28,11 @@ export class NetMcpStdioProxy {
     this.fetchImpl = options.fetchImpl ?? fetch;
   }
 
+  /** True only after initialize has installed the Net HTTP session id. */
+  get sessionReady(): boolean {
+    return this.sessionId !== null;
+  }
+
   /** Forward one already-validated stdio message. Notifications produce no
    * stdout message because the Net endpoint acknowledges them with 202. */
   async forward(message: JSONRPCMessage): Promise<JSONRPCMessage | null> {
@@ -49,10 +54,10 @@ export class NetMcpStdioProxy {
       const text = await response.text();
       if (!text) throw new Error(`Net MCP returned ${response.status} with an empty body`);
       const decoded = JSONRPCMessageSchema.parse(parseMcpBody(text, response.headers.get("content-type")));
-      if (!response.ok) {
-        throw new Error(`Net MCP returned ${response.status}: ${text.slice(0, 500)}`);
-      }
-      if (isInitialize(message)) {
+      // Streamable HTTP may attach a useful JSON-RPC error to a non-2xx
+      // response. Preserve that protocol error; synthesize -32000 only when
+      // the response cannot be decoded as an MCP message at all.
+      if (response.ok && isInitialize(message)) {
         const session = response.headers.get("mcp-session-id");
         if (!session) throw new Error("Net MCP initialize response omitted mcp-session-id");
         this.sessionId = session;

@@ -4,6 +4,7 @@
 // The process is intentionally only a JSON-RPC transport bridge; all tool and
 // turn behavior remains in the Net gateway's `/net-api/mcp` implementation.
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { NetMcpStdioDispatcher } from "./net-stdio-dispatcher";
 import { NetMcpStdioProxy } from "./net-stdio-proxy";
 
 async function main(): Promise<void> {
@@ -17,28 +18,25 @@ async function main(): Promise<void> {
   const endpoint = process.env.WOO_MCP_URL ?? "http://127.0.0.1:5173/net-api/mcp";
   const proxy = new NetMcpStdioProxy({ endpoint, token });
   const transport = new StdioServerTransport();
-  let forwarding = Promise.resolve();
+  const dispatcher = new NetMcpStdioDispatcher(
+    proxy,
+    (message) => transport.send(message),
+    (error) => process.stderr.write(`net MCP stdio bridge error: ${errorMessage(error)}\n`)
+  );
   let shuttingDown = false;
 
   const shutdown = async (): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
-    await forwarding.catch(() => undefined);
+    await dispatcher.idle();
     await proxy.close();
     await transport.close();
   };
 
-  // Serialize messages so initialize's returned session id is installed before
-  // notifications/initialized or the first tools request can leave. MCP clients
-  // normally await initialize, but the bridge should remain correct for a
-  // pipelined stdio writer too.
+  // The dispatcher serializes only the pre-session prefix. After initialize,
+  // independent MCP requests run concurrently so woo_wait cannot block pings.
   transport.onmessage = (message) => {
-    forwarding = forwarding.then(async () => {
-      const reply = await proxy.forward(message);
-      if (reply) await transport.send(reply);
-    }).catch((error) => {
-      process.stderr.write(`net MCP stdio bridge error: ${errorMessage(error)}\n`);
-    });
+    void dispatcher.dispatch(message);
   };
   transport.onerror = (error) => {
     process.stderr.write(`net MCP stdio transport error: ${errorMessage(error)}\n`);
