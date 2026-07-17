@@ -92,7 +92,8 @@ Language and runtime foundations: object/verb/value semantics and execution beha
 
 Host-facing interfaces for runtime execution, transport, and client bootstrap across local and edge hosts.
 
-- [coherence.md](spec/protocol/coherence.md) — **the coherence layer**: normative contract for the `src/net/` distribution layer (Plan 002) — invariants, effect transcript, validation order, named-copy registry, divergence taxonomy, SLOs, conformance gates, relations, sessions, topology, scheduled-turn execution (CO1–CO16, **adopted**; governs where it overlaps v2-turn-network.md / cell-authority.md)
+- [coherence.md](spec/protocol/coherence.md) — **the coherence layer**: normative contract for the `src/net/` distribution layer (Plan 002) — invariants, effect transcript, validation order, named-copy registry, divergence taxonomy, SLOs, conformance gates, relations, sessions, topology, scheduled-turn execution, scope retirement (CO1–CO16 **adopted**, CO17 **draft**; governs where it overlaps v2-turn-network.md / cell-authority.md)
+- [transport.md](spec/protocol/transport.md) — substrate transport: the `Host.rpc` seam, destination naming, data-only payload rule, delivery/deadline/failure semantics, and transport bindings — signed-HTTP (current), platform-native DO RPC (target), non-DO transports (reserved) (TR1–TR6/TR8 **adopted**, TR7.2 **draft**)
 - [hosts.md](spec/protocol/hosts.md) — three host classes, task migration, trust boundaries (§3)
 - [host-seeds.md](spec/protocol/host-seeds.md) — host-seed contents and the per-subject merge rule for cross-host reconciliation (HS1–HS5, **draft**)
 - [wire.md](spec/protocol/wire.md) — JSON WebSocket message format (§17)
@@ -121,8 +122,9 @@ Operationally visible procedures for lifecycle management: deploys, migrations, 
 - [backups.md](spec/operations/backups.md) — world export format, restore, disaster recovery (B1–B8)
 - [deployments.md](spec/operations/deployments.md) — dev / staging / prod, version coordination, cross-environment sync (DP1–DP9)
 - [observability.md](spec/operations/observability.md) — logs, metrics, traces, audit (O1–O9)
+- [audit.md](spec/operations/audit.md) — **the audit trail**: unified audit/observability correlation — OTel-semantics trace context, the principal envelope threading the customer (account) through unrelated objects, audit records as projections of committed transcripts, per-customer routed delivery, query/export, integrity (AU1–AU10, **draft**)
 - [workflows.md](spec/operations/workflows.md) — state machines on `$space`s; role gating; transition rules (WF1–WF10)
-- [net-cutover.md](spec/operations/net-cutover.md) — net namespace installation, activation barrier, write-freeze/export watermark, rollback contract (NC1–NC8)
+- [net-cutover.md](spec/operations/net-cutover.md) — net namespace installation, activation barrier, write-freeze/export watermark, rollback contract, v2 stack decommission (NC1–NC8; NC9 **draft**)
 
 ### Identity
 

@@ -23,6 +23,11 @@ Each addresses a different operator question. Logs answer "what just happened?" 
 
 ## O2. Per-call traces
 
+> Correlation ids and propagation for these traces are specified in
+> [audit.md §AU2](audit.md#au2-correlation-otel-semantics-w3c-propagation)
+> (**draft**): `trace_id` follows the OTel/W3C model, is minted or
+> adopted at the gateway, and joins these spans to the audit trail.
+
 Every `$space:call` produces a structured trace:
 
 ```ts
@@ -110,6 +115,11 @@ These let operators see who's consuming what, surface noisy actors, and bound te
 ---
 
 ## O5. Audit log
+
+> Generalized by [audit.md](audit.md) (**draft**): the wizard/privileged
+> channel below becomes the operator partition of the unified audit
+> trail (`action.kind: "admin"`, AU5). The requirements here remain
+> normative for that partition.
 
 Wizard actions and high-privilege operations log to a separate, immutable, append-only audit channel:
 

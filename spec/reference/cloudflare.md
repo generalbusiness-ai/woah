@@ -127,6 +127,39 @@ race; `E_OBJNF` flags a stale ULID dereference.)
 bootstrap floor, so the trigger never fires. The Directory DO itself
 also never tears down.
 
+### R1.9 Net scope teardown
+
+> Status: **draft** — binding mechanics for
+> [coherence.md §CO17](../protocol/coherence.md#co17-scope-retirement)
+> (scope retirement). Not yet implemented; today no net DO ever calls
+> `deleteAll`, so retired rooms and deleted actors retain SQLite storage
+> indefinitely.
+
+`NetScopeDO` binds CO17 step 4 (reclaim) as: `storage.deleteAlarm()`
+then `storage.deleteAll()`, run off the reply path by the scope's own
+alarm-driven retirement drive (the same re-derive-from-durable-state
+discipline as the outbox). `deleteAll()` is the only operation that
+reclaims a SQLite DO's storage — deleting rows or dropping tables leaves
+internal metadata and continues to bill; this mirrors R1.8, which is
+today the sole `deleteAll` site in the substrate.
+
+The DO id remains reachable after teardown; the CO17 cold-activation
+rule applies (empty scope answers `E_STALE_HEAD`; the copy-#3 tombstone
+in `HOST_SEED_KV` at `net:seed:<scope>` is what turns the gateway's
+seed-and-retry into terminal `E_SCOPE_RETIRED`). The scope DO itself
+needs no tombstone knowledge.
+
+Gateway shards never tear down (fixed, bounded population); their
+per-scope and per-session residue is already lease- or LRU-bounded
+(`net_gateway_pin` pruning, WS-ticket TTL reaping, session-cell
+reaping). The catalog scope never retires.
+
+Reclamation of **retired DO classes** (the v2 stack) is a different
+mechanism entirely: a `deleted_classes` wrangler migration deletes every
+instance's storage platform-wide — see
+[net-cutover.md §NC9](../operations/net-cutover.md#nc9-v2-stack-decommission)
+and §R14.6.
+
 ---
 
 ## R2. Singleton DOs
@@ -318,6 +351,16 @@ The concrete CF SQLite encoding lives in [persistence.md](persistence.md). The s
 | `recycle(id, force?)` | Object destruction per [recycle.md](../semantics/recycle.md). |
 
 Transport: CF Workers RPC (`env.WOO.get(id).method(...)`). Each DO method is `async`; cross-DO awaits show up as task yield points.
+
+> **Implementation status / drift note (2026-07-16).** The implementation
+> never adopted Workers RPC for this surface: v2 cross-DO calls are
+> HMAC-signed HTTP against each DO's `fetch()` handler
+> (`/__internal/*` routes). With the net cutover complete this whole
+> surface is **frozen for retirement** with the v2 stack
+> ([net-cutover.md §NC9](../operations/net-cutover.md#nc9-v2-stack-decommission));
+> do not migrate it to native RPC. The live transport contract — and the
+> native-RPC target binding — is
+> [protocol/transport.md](../protocol/transport.md) (TR1–TR9).
 
 ### R5.1 RPC envelope
 

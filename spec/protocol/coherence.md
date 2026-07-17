@@ -376,6 +376,7 @@ divergence. Tail metrics count by code.
 | `E_SEED_COMMITTED` | a seed targets a scope that has already committed turns | terminal; recover into a fresh namespace rather than resetting authority under an unchanged head |
 | `E_NONCONVERGENT_READ` | a recorded read cannot converge: the gateway refreshed a mismatched cell (or re-installed an ordering answer) to a STABLE authority version and re-planned, yet the re-plan re-recorded a version that still mismatches that same authority version — a planner/catalog-verb bug, not contention (contention moves the authority version each round and never trips this) | terminal and NAMED; surfaces the offending cell/ordering with the attempt trace instead of grinding to `E_BUDGET` |
 | `E_INVARG` | a malformed internal request field (wrong type or shape) | terminal for this request; refused with the offending field named — never silently coerced into a different-but-valid request |
+| `E_SCOPE_RETIRED` | a submit, adopt, seed, or head read targets a scope past its retirement head (CO17) — its anchor root was recycled and the scope's storage reclaimed | terminal; a session repins to a live scope; an outbox sender treats it as terminal-acknowledge (advances high-water, installs nothing); a gateway seed path refuses to re-seed the tombstoned name at the same epoch |
 
 Retryable codes are turn mechanics and never user-visible as failures;
 terminal codes surface to the caller with structured detail and an attempt
@@ -961,3 +962,74 @@ One write path per fact (CO9), concretized:
 - Engine-side `schedules`/`cancellations` transcript fields (VTN18.2)
   remain deferred until the DSL exposes scheduling; `/net/schedule` is
   the substrate surface until then.
+
+## CO17. Scope retirement
+
+> Status: **draft**. Adopted invariants above are unchanged by this
+> section; nothing here is implemented yet. Binding mechanics live in
+> [reference/cloudflare.md §R1.9](../reference/cloudflare.md#r19-net-scope-teardown).
+
+Scopes have an end of life. Without one, every room and every actor
+cluster that ever existed retains durable storage forever — a direct
+violation of the Big-World posture (CO11.4) with a monotonically growing
+cost curve. Idle **eviction** is not retirement: an evicted scope keeps
+its storage and rehydrates on demand; retirement **reclaims** it.
+
+**Triggers.** A `room:<space>` scope retires when its anchor space is
+recycled; a `cluster:<actor>` scope retires when its actor account is
+deleted ([identity/provisioning.md](../identity/provisioning.md)). Both
+arrive as ordinary committed lifecycle writes in the scope itself. The
+catalog scope and gateway shards never retire.
+
+**The retirement sequence** (normative order; each step idempotent and
+re-derivable from durable state on re-activation, per the CO2.8 alarm
+discipline):
+
+1. **Final turn.** The sequenced turn that recycles the anchor root is
+   the scope's last accepted turn; its head is the **retirement head**.
+   From that commit on, `/submit`, `/adopt`, `/relate`, and `/seed`
+   answer `E_SCOPE_RETIRED` (CO6). The retirement mark is a durable meta
+   row written in the same transaction as the final commit.
+2. **Drain.** All outbox lanes drain to empty under the normal
+   alarm-driven retry discipline — the final turn's fanout (the recycle
+   observation subscribers use to unpin) included. Undeliverable rows
+   age out by the existing dead-subscriber pruning; drain completion is
+   "no undelivered rows", not "every peer acknowledged".
+3. **Tombstone.** The scope's copy-#3 seed record (`net:seed:<scope>`)
+   is replaced with a tombstone `{retired: true, head, catalog_epoch}`.
+   The tombstone is the *only* durable trace of the scope after step 4,
+   so it is written before storage is released, never after.
+4. **Reclaim.** The binding releases all durable storage for the scope
+   (§R1.9: `deleteAlarm()` then `deleteAll()`).
+
+**The cold-activation rule.** After step 4 the scope's name remains
+reachable (a stale gateway or peer can still address it). A scope that is
+empty at activation answers `E_STALE_HEAD` exactly like a never-seeded
+scope — the scope itself cannot and need not distinguish the two. The
+authority for the difference is the tombstone: the gateway cold path
+(CO7's `E_STALE_HEAD` → seed-and-retry) MUST consult copy #3 before
+seeding and, on a tombstone, surface terminal `E_SCOPE_RETIRED` instead
+of re-seeding. A crash between steps 3 and 4 therefore converges (empty
+or partial storage + tombstone ⇒ retired); a crash before step 3 leaves
+the scope durably intact and retirement resumes from the meta row.
+
+**Peers and sessions.** An outbox delivering to a retired scope receives
+`E_SCOPE_RETIRED` as a terminal-acknowledge — the sender advances its
+high-water and installs nothing (the same posture CO15 specifies for the
+catalog-mutation refusal, and for the same reason: no futile retry
+loops). Sessions still pinned to the scope get the terminal code on
+their next turn and repin via the normal join path. Derived relations in
+*other* scopes that referenced the recycled anchor are the recycle
+semantics' concern ([semantics/recycle.md](../semantics/recycle.md)),
+not retirement's.
+
+**Name reuse.** A retired scope name is reusable only through the
+install pipeline at a **new** `catalog_epoch` (the explicit operator
+path — the same recovery posture as `E_SEED_COMMITTED`: fresh authority
+is never minted under an unchanged identity by a runtime request).
+
+**Conformance** (extends CO12): a retirement lane — retire a scope
+mid-outbox-backlog, kill between each pair of steps (TR8 faults), then
+verify a stale gateway's submit gets `E_SCOPE_RETIRED`, a peer outbox
+terminal-acknowledges, the tombstone blocks re-seeding, and storage for
+the scope is empty.

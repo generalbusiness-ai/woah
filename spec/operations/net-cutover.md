@@ -1,4 +1,4 @@
-# Net cutover — installation, activation, and migration of a live world (NC1–NC8)
+# Net cutover — installation, activation, and migration of a live world (NC1–NC9)
 
 Status: **implemented** (state machine, freeze, export watermark, activation
 barrier, verification rules). NC8's local half — instrumentation, budgets,
@@ -515,3 +515,43 @@ The AE watch exits 2 on any RPC timeout, queue refusal, outbox delivery
 failure/abandonment, fanout gap, degraded install/adoption signal,
 threshold breach, or insufficient evidence at its deadline. Tail reports
 may supplement diagnosis but cannot satisfy NC8 acceptance.
+
+## NC9. v2 stack decommission
+
+> Status: **draft**. Preconditions: NC8 acceptance complete and rollback
+> to the v2 stack formally renounced (NC6's rollback contract expires
+> with it).
+
+The cutover left the v2 Durable Object classes deployed and their
+storage intact: every `PersistentObjectDO`, `CommitScopeDO`, and
+v2-only Directory row from the pre-cutover world still holds SQLite
+storage and bills for it. Instance-by-instance cleanup is impossible by
+design (no DO enumeration in the runtime; the world was cut over fresh,
+so nobody will ever address those ids again). The reclamation mechanism
+is class deletion: a wrangler migration with `deleted_classes` deletes
+**all storage for every instance of the class, platform-wide**
+([reference/cloudflare.md §R14.6](../reference/cloudflare.md#r146-first-deploy-and-upgrade-discipline)).
+
+Order is normative, one deploy per step, each gated:
+
+1. **Traffic gate.** A class is a deletion candidate only after AE
+   metrics (by `host_key`/class) show zero requests to it across a full
+   bake window. Anything still calling it — an un-migrated route, a
+   cron, an admin tool — is found now, not after deletion.
+2. **Code removal.** Remove the class's routes, bindings, and exports;
+   deploy; re-run the traffic gate (a build that cannot address the
+   class is the real proof).
+3. **Backup.** A final world export (operations/backups.md) covering
+   anything the class stored, taken and verified restorable before
+   deletion. Deletion is irreversible.
+4. **`deleted_classes` migration** via `npm run cf:migrations` (tag
+   discipline per R14.6; `tests/cf-do-migrations.test.ts` and the
+   `cf:migrations:check` build gate must stay green).
+
+Candidate order: `CommitScopeDO` first (net replaces it wholesale), then
+the v2-only surface of `PersistentObjectDO` and the world/Directory
+singletons once every remaining consumer (auth, admin, catalog install,
+MCP session bootstrap) is confirmed migrated or retired by the step-1
+gate. This section makes no claim about which consumers remain today —
+the traffic gate is the authority, not an inventory taken at authoring
+time.

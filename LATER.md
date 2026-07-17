@@ -7,7 +7,36 @@ New items go at the top.  Move to the bottom when final.
 
 ## random stuff to do
 
-- consolidate DO shared paths
+- single audit/observability infrastructure for all world operations
+
+- DO stuff
+  - Constructor DDL on every cold start. CommitScopeDO executes 17 CREATE TABLE IF NOT EXISTS statements synchronously in its constructor (commit-scope-do.ts:219-263); NetScopeDO
+  additionally runs PRAGMA-based migrations with table recreation (scope-do.ts:504-539); NetGatewayDO runs DDL plus ALTER TABLE probes (gateway-do.ts:666-730); PersistentObjectDO
+  runs repository migration plus a projection-cache DDL block plus a COUNT probe (persistent-object-do.ts:667-676). Race-wise this is fine (synchronous, input gate closed), but
+  it's paid on every eviction wake — and cold-owner-timeout is our known deployed-smoke flake, so constructor cost is on the exact path that's already marginal. The rules'
+  recommended shape fixes this cheaply: read one schema-version row (or PRAGMA user_version) first and skip the whole DDL block when current. Only DirectoryDO already does the
+  lazy-guard variant (schemaEnsured, directory-do.ts:104-114).
+
+  - Singletons. Rule: "Do not create a single global Durable Object." DirectoryDO is a hard singleton (idFromName("directory")) and sits on the session-routing path (~2.3
+  lookups/turn per the notes in wrangler.toml:90-97); the divergent-session-state race we've seen lives in exactly this routing-coherence area. It's read-mostly by design, which
+  keeps it viable for now, but the rework direction should be gateway-side caching of session_route reads with lease-based invalidation, before traffic growth makes the singleton
+  the ceiling (~500-1k req/s per the rules). The world PersistentObjectDO funnel (index.ts:192-245 and onward) is a rule violation on its face, but it's now the legacy stack — the
+  right rework is retirement, not sharding.
+
+— Alarm-handler drift and hibernation heartbeats
+
+  - PersistentObjectDO has no alarm() method, yet spec R7 describes its parked-task alarms and the code defensively calls deleteAlarm (persistent-object-do.ts:1913). If anything
+  ever sets an alarm on one of these DOs, the platform retries a handler-less alarm with backoff — silent wasted wakeups. Either implement the handler the spec describes or fix
+  the spec; the current state is exactly the spec/code drift AGENTS.md forbids.
+
+  - setWebSocketAutoResponse is unused. If the browser client sends any periodic ping/heartbeat frame, every one of them wakes the hibernated NetGatewayDO and defeats the cost
+  benefit of hibernation. Worth one check of the client's WS keepalive behavior; if it heartbeats, wire the auto-responder.
+
+- shadcn UI?
+    "Port the design language, keep the architecture" plus chat "port the component, not the framework"
+    adopt shadcn's token values and component recipes into our token system, and rebuild the chat feed inside chat-space.ts to the shape of shadcn's Message/Bubble/Marker with proper scroll anchoring
+
+- "case rooms": security case, bug, incident, ticket, etc
 
 - syntax for @-someone
 
