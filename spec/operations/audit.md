@@ -1,6 +1,6 @@
 ---
 date: 2026-07-16
-status: draft
+status: partial — AU2 (context threading), AU3 (attribution pipeline + principal envelope) implemented on the net stack; AU1/AU4–AU10 (records, delivery, query) draft
 ---
 
 # The audit trail — unified audit and observability (AU1–AU10)
@@ -175,11 +175,13 @@ interface Principal {
   gateway producer emits `credentialed`/`anonymous` principals; a
   committed turn always carries `authenticated`.
 - **Stamped by the gateway**, never accepted from client input.
-- **Validated at commit**: the scope's authorize step (CO4) checks
-  `principal.actor` equals the transcript's actor (the existing
-  `actor_mismatch` verdict), and — when the committing scope is the
-  actor's own cluster — re-validates `customer` against the
-  `customer_of` cell it owns. Otherwise the scope records the edge's
+- **Validated at commit** (implemented, `ScopeSequencer.submit` step
+  1b): a carried principal is shape-checked, actor-matched against the
+  transcript, and — when the committing scope owns the actor's
+  `customer_of` cell — customer-checked against durable authority.
+  Violations fold into the CO14 `unauthorized` reject with a named
+  `principal_verdict`: `malformed_principal`, `actor_mismatch`, or
+  `customer_mismatch`. Otherwise the scope records the edge's
   attestation; the credential id keeps the attestation itself
   auditable.
 - **Carried through every indirection**: adoption riders carry the

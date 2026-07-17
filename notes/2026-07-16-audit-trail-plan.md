@@ -152,3 +152,34 @@ Phase 4 can proceed in parallel with 3.
   re-writes the `customer_of` cell and re-homes *future* records only.
 - **Retention default**: 400 days audit / 7 days traces, per-customer
   override. Pick real numbers when pricing is modeled.
+
+## Status (2026-07-17, worktree audit-attribution)
+
+Phases 0 and 1 are IMPLEMENTED and green (curated `npm test` 987 tests,
+`test:worker` 483, `smoke:cf-dev` 13/13, `smoke:net-dev` 25/25 —
+including the real-alarm scheduled-turn step that exercises the
+principal/trace carry).
+
+Landed: src/net/attribution.ts (derivation + Principal + scope
+attribution + guards), src/net/trace.ts (W3C context), import/guest/
+install seeding, ScopeMeta.attribution with centralized metaRow(),
+transcript principal/trace folded in the hashed body by the planner,
+gateway stamping (REST/MCP header + WS frame trace carriers,
+net_turn_unattributed on a missing cell), sequencer step-1b principal
+validation (malformed_principal / actor_mismatch / customer_mismatch as
+CO14 unauthorized verdicts), ScheduledTurn + /adopt-row carriers with
+`cause`, AE blob19/blob20 + /admin/stats columns.
+
+Deviations from the plan as written:
+- `net_rpc` AE stamping deferred to Phase 4: the transport seam stays
+  principal-agnostic (TR1), and trace propagation on internal RPC
+  belongs with span emission, not before it.
+- `/net/schedule` CALLERS do not yet capture principal/trace at
+  schedule time — the row type and the dispatch-side carry are in
+  place; capture lands with the first real scheduling surface (today's
+  callers are lanes/tooling).
+- Guest-pool claim actors (pre-seeded pool, as opposed to elastic
+  mints) get customer_of from the INSTALL derivation, not a mint-time
+  write — covered, but by a different writer than elastic guests.
+
+Next: Phase 2 (audit lane + shard + records) per the phase list above.
