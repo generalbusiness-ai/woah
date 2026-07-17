@@ -314,11 +314,18 @@ if [[ $SKIP_POSTFLIGHT -eq 1 ]]; then
   exit 0
 fi
 
-# /healthz
-healthz=$(curl -sS --max-time "$POSTFLIGHT_TIMEOUT" "$WORKER_URL/healthz") \
-  || fail "healthz request failed"
+# /healthz participates in the same edge-rollout retry contract as every
+# later postflight route. A deploy can briefly route the public Worker to a
+# Durable Object generation that is still restarting; one transient 5xx must
+# not abort after the version was successfully published, while six failures
+# still stop the release loudly.
+if retry_status_until 200 GET "$WORKER_URL/healthz"; then
+  healthz="$RETRY_BODY"
+else
+  fail "healthz returned $RETRY_STATUS after $RETRY_ATTEMPTS attempts (expected 200): $RETRY_BODY"
+fi
 echo "$healthz" | grep -q '"ok":true' || fail "healthz body unhealthy: $healthz"
-ok "healthz: $healthz"
+ok "healthz (${RETRY_ATTEMPTS} attempt(s)): $healthz"
 
 # The deployment-controlled client configuration is the authoritative stack
 # selector. Postflight must exercise the selected stack: probing v2 after a

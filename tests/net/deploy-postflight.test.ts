@@ -4,6 +4,12 @@ import { describe, expect, it } from "vitest";
 const deploy = readFileSync(new URL("../../scripts/deploy.sh", import.meta.url), "utf8");
 
 describe("deploy postflight contract", () => {
+  it("retries health across edge rollout before inspecting its body", () => {
+    expect(deploy).toContain('retry_status_until 200 GET "$WORKER_URL/healthz"');
+    expect(deploy).toContain('healthz="$RETRY_BODY"');
+    expect(deploy).toContain('"ok":true');
+  });
+
   it("probes the live authenticated projection with an explicit 200 contract", () => {
     expect(deploy).not.toContain("$WORKER_URL/api/state");
     expect(deploy).toContain('retry_status_until 200 GET "$WORKER_URL/api/me"');
