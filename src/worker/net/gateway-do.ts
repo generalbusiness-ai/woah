@@ -334,6 +334,10 @@ type TurnResult = {
  * submit + install) sits far below both. */
 const MAX_TURN_SYNC_RPC = 32;
 const MAX_TURN_RPC_MS = 30_000;
+// One room presentation read may expand only its direct membership. This is
+// the same boundedness contract as the legacy sparse-MCP authority expansion:
+// it is O(one room), never a recursive/world enumeration.
+const MAX_ROOM_CONTENT_AUTHORITY_OBJECTS = 128;
 
 // Exported for the NC8 unit lane (tests/worker/net-turn-structure.test.ts):
 // the budget/parallelism mechanics are asserted directly, the integrated
@@ -453,6 +457,23 @@ async function timedRpc<T>(
   return structure ? structure.rpc(action, options) : action();
 }
 
+/** Convention probes intentionally address scope names that may never have
+ * existed. WorkerdHost preserves the signed peer's structured 404 in the
+ * message; suppress only the exact empty-DO verdict, never auth, timeout, or a
+ * populated scope's operational failure. */
+function isAbsentScopeProbe(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  const emptyDurableObject = message.includes("/closure failed: 404")
+    && message.includes('"code":"E_MISSING_STATE"')
+    && message.includes('"has_meta":false');
+  // Structural fake namespaces enumerate only seeded DOs instead of modeling
+  // Cloudflare's idFromName (which always resolves and then returns the empty
+  // durable-state verdict above). Accept only their exact convention-probe
+  // miss; a missing production binding says "cannot resolve" and still fails.
+  const absentStructuralStub = /^unresolvable destination scope:(?:cluster|room):[^/]+$/.test(message);
+  return emptyDurableObject || absentStructuralStub;
+}
+
 /** The per-turn CO10 structure attached to a TurnResult and emitted as the
  * `net_turn_structure` metric so the deployed profile emits the evidence
  * CO10 is measured against. */
@@ -568,6 +589,9 @@ const RECENT_CLIENT_TURN_CAP = 512;
  * reply-cache bound (scope.ts REPLY_CACHE_CAP) so the pin never
  * outlives the reply it protects by more than the window. */
 const GATEWAY_PIN_LIMIT = 1024;
+/** Bounded per-isolate classification memo for offline room members. Losing an
+ * entry costs one cold convention probe; lineage fanout invalidates it. */
+const ROOM_PRESENTATION_ACTOR_CACHE_CAP = 256;
 
 /** H4 rate limits (wire.md inbound rule): the standard per-actor budget
  * for every /net-api operation — REST requests and WS turn frames share
@@ -617,6 +641,7 @@ export class NetGatewayDO {
    * (idempotent server-side) — a dropped entry costs one redundant
    * subscribe/pull, never a lost subscription. */
   private readonly selfSubscribed = new Set<string>();
+  private readonly roomPresentationActors = new Map<string, true>();
 
   /** H4 token buckets, PER-ISOLATE by design (see rate-limit.ts header):
    * `clientRate` covers every authenticated /net-api operation (REST +
@@ -1211,6 +1236,12 @@ export class NetGatewayDO {
     // and purged per-parent on an ordering conflict so the next attempt
     // re-fetches the CURRENT slot answer.
     const orderedNeighborsByKey = new Map<string, OrderedNeighborsProjection>();
+    // A cold contents relation can name offline actors whose owner cells are
+    // intentionally absent from this gateway. The first presentation probe
+    // classifies those cluster roots from the generic host-placement marker;
+    // retain that bounded answer across repair rounds so one look never
+    // re-probes the same offline seats.
+    const roomPresentationActors = new Set(this.roomPresentationActors.keys());
 
     for (let attempt = 1; attempt <= MAX_TURN_ATTEMPTS; attempt += 1) {
       // The budget bounds rounds two onward; the first attempt always
@@ -1224,7 +1255,7 @@ export class NetGatewayDO {
       // a recovery may have refreshed them).
       const view = this.ensureView();
       const classifier = this.classifierFor(request, view);
-      const planningRoomRoster = await this.roomRosterProjection(request, view, classifier, structure);
+      const planningRoomRoster = await this.roomRosterProjection(request, view, classifier, structure, roomPresentationActors);
       // Seed the call target's ordering once (the generic "children of the
       // target" projection); repair rounds add any further parents the verb
       // reads. Idempotent: skipped once the target is already in the map.
@@ -4141,7 +4172,8 @@ export class NetGatewayDO {
     request: TurnRequest,
     view: CellStore,
     classifier: ScopeClassifier,
-    structure: TurnStructure
+    structure: TurnStructure,
+    knownPresenceActors: Set<string>
   ): Promise<{ room: string; rows: readonly RoomRosterRow[] } | undefined> {
     const call = request.call;
     if (!this.callReadsRoomPresence(view, call)) return undefined;
@@ -4171,7 +4203,158 @@ export class NetGatewayDO {
     if (response.room !== room || !Array.isArray(response.rows)) {
       throw new Error(`room-roster authority returned malformed projection for ${room}`);
     }
-    return { room, rows: response.rows as RoomRosterRow[] };
+    const rows = response.rows as RoomRosterRow[];
+    await this.warmRoomPresentationContents(request, room, scope, rows, classifier, structure, knownPresenceActors);
+    return { room, rows };
+  }
+
+  /** Materialize direct non-presence room members needed by presentation verbs.
+   *
+   * A targeted room closure deliberately carries only local member stubs. A
+   * nested space (`room:<id>`) or self-hosted actor/block (`cluster:<id>`) is
+   * therefore only a relation ref on a cold gateway. `visible_contents()`
+   * cannot distinguish that sparse ref from a recycled object and omits it;
+   * the catalog's defensive dangling-member catches then turn the omission
+   * into a successful but incomplete `look`.
+   *
+   * `reads_room_presence` is the catalog declaration for the complete room
+   * presentation path. Use its already-fetched compact roster to exclude live
+   * actors, then probe the two topology naming conventions in parallel phases.
+   * A cluster root without the substrate's `host_placement: "self"` marker is
+   * another presence actor, not a room card; this generic structural marker
+   * avoids teaching the gateway any catalog class name. The first successful
+   * component/space closure installs the whole object and class/anchor chain.
+   * Warm gateways pay zero RPCs because lineage remains in the derived view;
+   * genuinely dangling refs remain absent and catalogs may skip them safely. */
+  private async warmRoomPresentationContents(
+    request: TurnRequest,
+    room: string,
+    roomScope: string,
+    roster: readonly RoomRosterRow[],
+    classifier: ScopeClassifier,
+    structure: TurnStructure,
+    knownPresenceActors: Set<string>
+  ): Promise<void> {
+    const liveActors = new Set(roster.map((row) => row.player));
+    const direct = this.relationMembers("contents", room)
+      .slice(0, MAX_ROOM_CONTENT_AUTHORITY_OBJECTS)
+      .map((row) => row.member)
+      .filter((member) => !liveActors.has(member) && !knownPresenceActors.has(member));
+    let missing = direct.filter((member) => !this.ensureView().has(cellKey("object_lineage", member)));
+    if (missing.length === 0) return;
+
+    // The targeted entry closure intentionally seeded room-owned objects as
+    // lineage stubs. Fill those known-local direct members in one owner RPC
+    // while this is demonstrably a cold presentation. Besides completing
+    // their cosmetic properties, this prevents the first plan from recording
+    // stale stub versions and spending a second repair attempt.
+    const localMembers = direct.filter((member) =>
+      this.ensureView().has(cellKey("object_lineage", member)) && classifier.scopeOf(member) === roomScope
+    );
+    if (localMembers.length > 0) {
+      const transfer = await structure.rpc(
+        () => this.fetchTargeted(roomScope, this.destinationFor(request, roomScope), localMembers, false),
+        { phase: "room_contents_local_owner" }
+      );
+      this.installTargeted(transfer, false);
+    }
+
+    let probes = 0;
+    let classifiedPresenceActors = 0;
+    const probe = async (scopeFor: (member: string) => string, phase: string): Promise<void> => {
+      const candidates = missing.map((member) => ({ member, scope: scopeFor(member) }))
+        .filter(({ scope }) => scope !== roomScope);
+      const transfers = await structure.rpcGroup(
+        candidates.map(({ member, scope }) => async () => {
+          try {
+            return await this.fetchTargeted(scope, this.destinationFor(request, scope), [member], false);
+          } catch (error) {
+            if (isAbsentScopeProbe(error)) return null;
+            throw error;
+          }
+        }),
+        { phase }
+      );
+      probes += candidates.length;
+      for (let index = 0; index < transfers.length; index += 1) {
+        const transfer = transfers[index];
+        if (!transfer) continue;
+        const member = candidates[index]!.member;
+        // A populated convention scope can outlive a recycled object. Treat
+        // that as a miss so a later owner convention still gets a chance;
+        // property absence alone is not evidence that this object is an actor.
+        if (!transfer.cells.some((cell) => cell.kind === "object_lineage" && cell.object === member)) continue;
+        // A successful cluster:<member> probe identifies an actor-rooted
+        // object. Self-hosted components are explicitly stamped by the
+        // substrate installer and do render as room cards; an unstamped root
+        // is an offline presence actor already represented by the roster when
+        // live. Retain only that classification, avoiding one attestation per
+        // offline seat and any catalog-specific class test in the gateway.
+        if (phase === "room_contents_cluster_owner" && this.transferObjectProperty(transfer, member, "host_placement") !== "self") {
+          knownPresenceActors.add(member);
+          this.rememberRoomPresentationActor(member);
+          classifiedPresenceActors += 1;
+          continue;
+        }
+        this.installTargeted(transfer, false);
+      }
+      missing = missing.filter((member) => !this.ensureView().has(cellKey("object_lineage", member)));
+      missing = missing.filter((member) => !knownPresenceActors.has(member));
+    };
+
+    // Actor-like objects (including the ordinarily numerous offline presence
+    // seats and self-hosted blocks) are rooted at cluster:<id>; nested spaces
+    // are self-sequenced at room:<id>. Probe clusters first so classification
+    // removes offline actors before the smaller space-owner phase. A
+    // room-owned ordinary item was already included as a stub by the target
+    // room closure and is not in `missing`.
+    await probe((member) => `cluster:${member}`, "room_contents_cluster_owner");
+    if (missing.length > 0) await probe((member) => `room:${member}`, "room_contents_room_owner");
+
+    this.metric({
+      kind: "net_room_contents_warm",
+      room,
+      candidates: direct.length,
+      probes,
+      materialized: direct.length - missing.length - classifiedPresenceActors,
+      presence_actors: classifiedPresenceActors,
+      missing: missing.length,
+      cap: MAX_ROOM_CONTENT_AUTHORITY_OBJECTS
+    });
+  }
+
+  /** Read one structural instance property without installing the fetched
+   * closure. `host_placement` is a substrate-owned routing marker stamped on
+   * every self-hosted instance, so no inherited catalog default is needed. */
+  private transferObjectProperty(transfer: CellTransfer, object: string, name: string): unknown {
+    const cell = transfer.cells.find((candidate) =>
+      candidate.kind === "property_cell" && candidate.object === object && candidate.key === cellKey("property_cell", object, name)
+    );
+    return (cell?.value as { value?: unknown } | undefined)?.value;
+  }
+
+  private rememberRoomPresentationActor(object: string): void {
+    this.roomPresentationActors.delete(object);
+    this.roomPresentationActors.set(object, true);
+    while (this.roomPresentationActors.size > ROOM_PRESENTATION_ACTOR_CACHE_CAP) {
+      const oldest = this.roomPresentationActors.keys().next().value;
+      if (oldest === undefined) break;
+      this.roomPresentationActors.delete(oldest);
+    }
+  }
+
+  /** Classification depends on both object identity and the structural
+   * self-hosting marker. Either page changing makes the memo stale. */
+  private invalidateRoomPresentationActor(cell: Pick<Cell, "kind" | "object" | "name">): void {
+    if (cell.kind === "object_lineage" || (cell.kind === "property_cell" && cell.name === "host_placement")) {
+      this.roomPresentationActors.delete(cell.object);
+    }
+  }
+
+  private invalidateRoomPresentationActorKey(key: string): void {
+    if (key.startsWith("object_lineage:") || (key.startsWith("property_cell:") && key.endsWith(":host_placement"))) {
+      this.roomPresentationActors.delete(objectOfCellKey(key));
+    }
   }
 
   /** Fetch ONE bounded ordered-children projection from the container's scope
@@ -5237,23 +5420,46 @@ export class NetGatewayDO {
    * backfill (the selfSubscribe case).
    */
   private async pullTargeted(scope: string, destination: string, objects: string[]): Promise<void> {
-    const view = this.ensureView();
-    const transfer = (await this.host.rpc(destination, "/closure", {
+    const transfer = await this.fetchTargeted(scope, destination, objects, true);
+    this.installTargeted(transfer, true);
+  }
+
+  /** Fetch half of a targeted pull. Kept separate so independent sparse
+   * presentation-owner probes can overlap, then install only after the whole
+   * phase settles (no partially-mutated view when one peer RPC rejects). */
+  private async fetchTargeted(
+    _scope: string,
+    destination: string,
+    objects: string[],
+    relations: boolean
+  ): Promise<CellTransfer & { scope: string; head: ScopeHead; relations?: RelationRow[] }> {
+    return (await this.host.rpc(destination, "/closure", {
       keys: [],
       known: [],
       objects,
-      relations: true
+      relations
     })) as CellTransfer & { scope: string; head: ScopeHead; relations?: RelationRow[] };
+  }
+
+  /** Install half of a targeted pull. Presentation-only object probes do not
+   * request relation rows and therefore must not advance the scope high-water:
+   * doing so could suppress a later subscribed relation backfill. */
+  private installTargeted(
+    transfer: CellTransfer & { scope: string; head: ScopeHead; relations?: RelationRow[] },
+    advanceSeen: boolean
+  ): void {
+    const view = this.ensureView();
     this.discardViewOnThrow(() =>
       this.state.storage.transactionSync(() => {
         for (const cell of transfer.cells) {
+          this.invalidateRoomPresentationActor(cell);
           view.install(cell);
           this.persistCell(view, cell.key);
         }
         for (const row of transfer.relations ?? []) {
           this.applyRelationDelta({ op: "add", row });
         }
-        this.advanceSeen(transfer.scope, transfer.head.seq);
+        if (advanceSeen) this.advanceSeen(transfer.scope, transfer.head.seq);
       })
     );
   }
@@ -5372,8 +5578,14 @@ export class NetGatewayDO {
           this.deliverySeen.set(body.scope, body.delivery_seq);
         }
         if (advanced) {
-          for (const cell of body.cells) this.persistCell(view, cell.key);
-          for (const key of body.removed_cells ?? []) this.persistCell(view, key);
+          for (const cell of body.cells) {
+            this.invalidateRoomPresentationActor(cell);
+            this.persistCell(view, cell.key);
+          }
+          for (const key of body.removed_cells ?? []) {
+            this.invalidateRoomPresentationActorKey(key);
+            this.persistCell(view, key);
+          }
           // CO13: relation deltas ride the same body and the same seq
           // gate — a redelivered body no-ops above (applyFanout), so the
           // mirror never double-applies. applyFanout itself stays

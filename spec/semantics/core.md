@@ -393,9 +393,14 @@ Reads and live-only interaction verbs (`:describe`, `:look`, `:who`, `:say`, `:t
 Roster-rendering verbs may additionally carry `reads_room_presence: true`. That
 flag has no permission meaning; it is a read-dependency hint used by sparse
 transport gateways to seed the compact, owner-authoritative room roster before
-dispatch. A sparse net planning execution that reaches `room_roster(space)`
-without an installed projection for `space` fails loudly; it never falls back to
-the planning shard's necessarily partial local session materialization.
+dispatch. For a room-presentation verb, the same hint also requires the gateway
+to materialize bounded direct non-presence contents from their owner scopes before
+dispatch; an installed nested space or self-hosted block must not disappear just
+because its object authority is cold on that shard. Expansion is capped at 128
+direct members and never recurses. A sparse net planning execution that reaches
+`room_roster(space)` without an installed projection for `space` fails loudly;
+it never falls back to the planning shard's necessarily partial local session
+materialization.
 
 ---
 

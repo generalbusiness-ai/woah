@@ -913,6 +913,23 @@ fan-in. After an accepted MCP or REST commit, the gateway installs any
 as `source:"cache"` so the following turn can plan from the accepted state
 without pre-plan owner fan-in.
 
+The net gateway applies the equivalent bounded expansion when dispatched verb
+metadata declares `reads_room_presence: true`. Its targeted room closure already
+supplies room-owned member stubs; one batched owner read completes those stubs.
+For direct members still missing lineage it probes the topology conventions
+(`cluster:<member>` for actor-like/self-hosted objects, then `room:<member>` for
+nested spaces) in parallel phases and installs the first owner-authoritative
+object closure. Connected actors are represented by the compact room-roster
+projection. A cluster root without the substrate-owned
+`host_placement: "self"` marker is classified as an offline presence actor and
+excluded from the presentation read set, avoiding one foreign attestation per
+seat without branching on a catalog class. That classification memo is bounded
+and lineage fanout invalidates it; losing the memo costs one cold probe, never
+an incorrect row.
+Empty convention scopes are ordinary probe misses. Other RPC failures propagate.
+The direct-members cap is 128 and the turn RPC budget remains an independent
+upper bound.
+
 Room membership used for MCP command resolution and visibility is also a
 repair-gated read. A sparse MCP shard may hold gateway projection rows for an
 active room, but those rows are stamped projection/cache, not owner authority.

@@ -355,6 +355,17 @@ item; what remains is exactly what the workerd lanes cannot prove
   feature chain. Feature-composed room verbs therefore cannot silently bypass
   their `reads_room_presence` declaration.
 
+  The declaration covers the complete bounded room-presentation dependency, not
+  only live players. Before planning, the net gateway also materializes any
+  direct non-presence contents absent from its targeted room closure by probing
+  their topology owner conventions in parallel. It also completes the known
+  room-owned stubs in one authority read, preventing a second repair attempt.
+  This keeps nested tools and self-hosted blocks visible on a cold shard. It
+  does not recurse beyond direct contents, is capped at 128 members, skips
+  connected roster actors, and retains a bounded lineage-invalidated memo of
+  structurally classified offline presence actors so repeated renders do not
+  become an owner-read storm.
+
   Recorded actor movement does not read or mutate the legacy
   `session_subscribers`/`subscribers` object-property mirrors while planning.
   Those values are relation-derived projections, not authority cells; treating

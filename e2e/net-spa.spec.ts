@@ -336,6 +336,14 @@ test("the identity door: guest entry and password sign-in in real browsers, no s
   await expect(guest.locator("[data-login-guest]")).toBeVisible({ timeout: 30_000 });
   await guest.locator("[data-login-guest]").click();
   await expect(guest.locator("[data-chat-input]")).toBeVisible({ timeout: 30_000 });
+  // A fresh gateway starts with only room-owned stubs. Exercise the complete
+  // user-visible room model through the real browser/workerd path: the remote
+  // self-hosted block and both nested tool spaces must survive that cold look.
+  await guest.locator("[data-chat-input]").fill("look");
+  await guest.locator("[data-chat-input]").press("Enter");
+  await expect(guest.locator(".chat-feed")).toContainText("Weather for", { timeout: 20_000 });
+  await expect(guest.getByRole("button", { name: "Dubspace", exact: true })).toBeVisible({ timeout: 20_000 });
+  await expect(guest.getByRole("button", { name: "Outliner", exact: true })).toBeVisible({ timeout: 20_000 });
   const guestLine = `door-guest-${Date.now().toString(36)}`;
   await guest.locator("[data-chat-input]").fill(`say ${guestLine}`);
   await guest.locator("[data-chat-input]").press("Enter");

@@ -252,6 +252,40 @@ describe("the identity door (/net-api/login, /net-api/guest, session bearers)", 
     await h.close();
   }, 30_000);
 
+  it("renders every installed non-presence room member on a cold guest gateway", async () => {
+    const h = await buildDoorHarness();
+    const claim = await h.api("POST", "/net-api/guest", { body: {} });
+    expect(claim.status, JSON.stringify(claim.body)).toBe(200);
+
+    const turn = await h.api("POST", "/net-api/turn", {
+      token: `session:${claim.body.session as string}`,
+      body: { target: "the_chatroom", verb: "look", args: [], idempotency_key: "cold-room-look" }
+    });
+    expect(turn.status, JSON.stringify(turn.body).slice(0, 500)).toBe(200);
+    expect(turn.body.result).toMatchObject({
+      id: "the_chatroom",
+      contents: expect.arrayContaining([
+        expect.objectContaining({ id: "the_dubspace" }),
+        expect.objectContaining({ id: "the_outline" }),
+        expect.objectContaining({ id: "the_weather", title: expect.stringContaining("Weather for") })
+      ])
+    });
+    expect((turn.body.structure as { attempt?: number }).attempt).toBe(1);
+    expect((turn.body.structure as { sync_rpc?: number }).sync_rpc).toBeLessThanOrEqual(24);
+
+    // Offline pooled actors were classified during the cold expansion but
+    // never admitted into the room presentation read set. The isolate memo
+    // keeps the next look on the warm path instead of probing every seat again.
+    const warm = await h.api("POST", "/net-api/turn", {
+      token: `session:${claim.body.session as string}`,
+      body: { target: "the_chatroom", verb: "look", args: [], idempotency_key: "warm-room-look" }
+    });
+    expect(warm.status, JSON.stringify(warm.body).slice(0, 500)).toBe(200);
+    expect((warm.body.structure as { sync_rpc?: number }).sync_rpc).toBeLessThanOrEqual(10);
+
+    await h.close();
+  }, 30_000);
+
   it("a carried account password logs in, the session is a bearer for the whole surface, and failures share one message", async () => {
     const h = await buildDoorHarness();
 

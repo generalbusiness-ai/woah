@@ -376,6 +376,9 @@ with normalized `perms: "rx"` and `direct_callable: true`. Catalogs may also set
 stored form after install. Catalogs may also set `reads_room_presence: true` on
 verbs that render room/workspace roster state; MCP sparse gateway shards use
 that metadata to seed live Directory presence without hardcoding command names.
+For net room-presentation verbs the same declaration also requests bounded
+owner hydration of direct non-presence contents, so a cold shard returns one
+complete room model rather than silently omitting remote blocks or nested tools.
 
 Property definitions may carry substrate metadata when the property is a
 catalog-visible compatibility surface for a projection. Presence projections use
@@ -550,7 +553,8 @@ A verb is exposed as an agent tool only if **either**:
 `reads_room_presence: true` is orthogonal to exposure. It does not advertise a
 tool or grant authority; it only says the verb's execution reads roster
 presence and therefore needs a sparse gateway to include current session stubs
-for the relevant room scopes.
+for the relevant room scopes and, on the net room-presentation path, bounded
+direct non-presence member authority.
 
 A catalog with neither `agent_manifest.json` nor any `tool_exposed: true` verbs is invisible to agent tool discovery — that's the safe default. Operators who want to expose a catalog's tools but lack publisher cooperation can install a thin local catalog that wraps the upstream's verbs with `tool_exposed: true` annotations.
 
