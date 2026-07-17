@@ -77,7 +77,8 @@
  * the standing v2 freeze continues, nothing routes production traffic
  * here until Phase 5.
  */
-import { normalizeScopeAttribution } from "../../net/attribution";
+import { normalizeScopeAttribution, type Principal } from "../../net/attribution";
+import type { TraceContext } from "../../net/trace";
 import type { Cell } from "../../net/cells";
 import { cellKey, lineageClosureKeys, serializeTransfer, type CellTransfer } from "../../net/cells";
 import { isNetError, netError } from "../../net/errors";
@@ -142,7 +143,17 @@ type SubscriberRole = "fanout" | "planner";
  * src/net/outbox.ts FanoutBody type stays unchanged (Outbox carries the
  * body opaquely and the JSON round-trip through net_scope_outbox keeps
  * the field). */
-type AdoptOutboxBody = FanoutBody & { prior_versions?: Record<string, string> };
+type AdoptOutboxBody = FanoutBody & {
+  prior_versions?: Record<string, string>;
+  /** AU3.2/AU2/AU1: the originating turn's attribution, trace context,
+   * and commit citation, carried so the owner-side adoption commit can
+   * mint its resource-owner audit record (and ONLY that — adoption
+   * never mints an acting record; the originating commit already did).
+   * Extra fields only, same opaque-JSON carry as prior_versions. */
+  principal?: Principal;
+  trace?: TraceContext;
+  cause?: { scope: string; seq: number };
+};
 
 /** The /plan-scheduled outbox body (CO16): FanoutBody plus the scheduled
  * turn and the epoch the planner must plan under. `seq` is NOT a scope
@@ -1910,7 +1921,10 @@ export class NetScopeDO {
         cells: transfer.cells,
         // Observations fan out to subscribers; adoption is cell-only.
         observations: [],
-        prior_versions: priorVersions
+        prior_versions: priorVersions,
+        ...(submit.transcript.principal ? { principal: submit.transcript.principal } : {}),
+        ...(submit.transcript.trace ? { trace: submit.transcript.trace } : {}),
+        cause: { scope: seq.scope, seq: reply.head.seq }
       };
       this.persistOutboxRow("/adopt", rider.destination, adoptBody);
       // Residue ledger: from now on these keys are a cache of the owner's

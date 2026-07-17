@@ -102,6 +102,57 @@ export function deriveCustomerAttribution(
 }
 
 /**
+ * The principal envelope (AU3.2): who a turn runs as, stamped ONCE by
+ * the gateway at the authentication boundary and never accepted from
+ * client input. Discriminated — full attribution is unknowable before
+ * successful authentication, and the shape does not pretend otherwise:
+ * - `authenticated`: customer + actor are present (a committed turn
+ *   always carries this form);
+ * - `credentialed`: the credential was recognized but rejected
+ *   (expired/revoked/actor-mismatch) — credential set, customer the
+ *   customer-of-record for it, actor possibly absent;
+ * - `anonymous`: unknown or malformed credential — no customer, no
+ *   actor (gateway edge records only).
+ */
+export type Principal = {
+  attribution: "authenticated" | "credentialed" | "anonymous";
+  customer?: string;
+  team?: string;
+  actor?: string;
+  session?: string;
+  credential?: string;
+  on_behalf_of?: string;
+};
+
+/** Read guard for carried principals (durable rows, transcripts). */
+export function normalizePrincipal(raw: unknown): Principal | null {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const v = raw as Record<string, unknown>;
+  if (v.attribution !== "authenticated" && v.attribution !== "credentialed" && v.attribution !== "anonymous") {
+    return null;
+  }
+  const str = (x: unknown): string | undefined => (typeof x === "string" && x.length > 0 ? x : undefined);
+  const out: Principal = { attribution: v.attribution };
+  const customer = str(v.customer);
+  const actor = str(v.actor);
+  if (customer !== undefined) out.customer = customer;
+  if (actor !== undefined) out.actor = actor;
+  if (v.attribution === "authenticated" && (customer === undefined || actor === undefined)) {
+    // AU3.2: authenticated principals REQUIRE customer + actor.
+    return null;
+  }
+  const team = str(v.team);
+  const session = str(v.session);
+  const credential = str(v.credential);
+  const onBehalfOf = str(v.on_behalf_of);
+  if (team !== undefined) out.team = team;
+  if (session !== undefined) out.session = session;
+  if (credential !== undefined) out.credential = credential;
+  if (onBehalfOf !== undefined) out.on_behalf_of = onBehalfOf;
+  return out;
+}
+
+/**
  * Scope-level attribution (AU3.3): the customer owning the scope's
  * anchor, stamped into scope meta at seed/install time — anchor lineage
  * carries an owner OBJREF, not an account, so this must be pre-stamped

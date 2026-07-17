@@ -35,7 +35,9 @@ import type {
   TranscriptWrite as EngineTranscriptWrite
 } from "../core/effect-transcript";
 import { finalWritesByCell } from "../core/shadow-commit-scope";
+import type { Principal } from "./attribution";
 import { CellStore, cellKey, cellVersion, type EpochStamp } from "./cells";
+import type { TraceContext } from "./trace";
 import { netError } from "./errors";
 
 /**
@@ -82,6 +84,16 @@ export type EffectTranscript = Omit<EngineEffectTranscript, "reads" | "writes" |
    * invalidates the read that produced the rank, in-scope or cross-scope.
    * Present-only-when-nonempty keeps prior transcript hashes unchanged. */
   orderingReads?: Array<{ container: string; parent: string | null; scope: string; version: string }>;
+  /** Audit attribution (audit.md AU3.2): stamped by the gateway at the
+   * trust boundary, never accepted from client input. Lives INSIDE the
+   * transcript so it participates in the transcript hash and survives
+   * into the durable record. Present-only-when-set keeps prior
+   * transcript hashes unchanged. */
+  principal?: Principal;
+  /** W3C trace context (audit.md AU2): adopted from the caller or minted
+   * at the gateway; joins this commit to the operational trace and to
+   * the customer's own systems. Present-only-when-set. */
+  trace?: TraceContext;
 };
 
 /**

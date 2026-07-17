@@ -57,7 +57,14 @@
  * This class sits beside the v2 DO classes and shares nothing with them;
  * nothing routes production traffic here until Phase 5.
  */
+import {
+  customerOfCellKey,
+  normalizeCustomerAttribution,
+  normalizePrincipal,
+  type Principal
+} from "../../net/attribution";
 import { CellStore, cellKey, cellVersion, makeCell, type Cell } from "../../net/cells";
+import { adoptOrMintTraceContext, normalizeTraceContext, type TraceContext } from "../../net/trace";
 import { clampClientSessionTtl } from "../../net/client-session-policy";
 import { budgetExhausted, isNetError, netError, nonconvergentRead, NetError, type AttemptTraceEntry, type NetErrorCode } from "../../net/errors";
 import { applyFanout, type FanoutBody } from "../../net/outbox";
@@ -210,6 +217,12 @@ export const MAX_TURN_ATTEMPTS = 6;
 
 type TurnRequest = {
   call: PlanTurnInput["call"];
+  /** AU3.2 principal, stamped by the gateway auth boundary — never from
+   * client input. Folded into the transcript body by the planner. */
+  principal?: Principal;
+  /** AU2 trace context (adopted from the caller's traceparent or minted
+   * here); folded into the transcript body alongside the principal. */
+  trace?: TraceContext;
   planningScope: string;
   catalog_epoch: string;
   idempotency_key: string;
@@ -1752,6 +1765,13 @@ export class NetGatewayDO {
       "net_plan_scheduled_pull_miss_failed"
     );
     const key = `sched:${turn.id}:${turn.at_logical_time}`;
+    // AU3.2/AU2: the scheduled row carried the scheduling turn's
+    // principal and trace (captured at schedule time); thread them into
+    // the dispatch so the eventual commit stays attributable and joins
+    // the originating trace. Shape-guarded — a malformed carried value
+    // degrades to absent, never rejects the dispatch.
+    const scheduledPrincipal = normalizePrincipal(turn.principal);
+    const scheduledTrace = normalizeTraceContext(turn.trace);
     return this.turn({
       call: {
         kind: "woo.turn_call.shadow.v1",
@@ -1763,6 +1783,8 @@ export class NetGatewayDO {
         verb: turn.call.verb,
         args: turn.call.args as PlanTurnInput["call"]["args"]
       },
+      ...(scheduledPrincipal ? { principal: scheduledPrincipal } : {}),
+      ...(scheduledTrace ? { trace: scheduledTrace } : {}),
       planningScope: body.scope,
       catalog_epoch: body.catalog_epoch,
       idempotency_key: key
@@ -2043,7 +2065,13 @@ export class NetGatewayDO {
       if (request.method === "POST" && url.pathname === "/net-api/turn") {
         const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
         if (bearerSession && body.session === undefined) body.session = bearerSession;
-        return await this.clientTurn(actor, body, identity.epoch);
+        return await this.clientTurn(actor, body, identity.epoch, {
+          ...(credential.kind === "apikey" ? { credential: credential.id } : {}),
+          trace: adoptOrMintTraceContext(
+            request.headers.get("traceparent"),
+            request.headers.get("tracestate")
+          )
+        });
       }
       if (request.method === "POST" && url.pathname === "/net-api/browser-metrics") {
         const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
@@ -2989,7 +3017,12 @@ export class NetGatewayDO {
   }
 
   /** POST /net-api/turn — see the clientApi header. */
-  private async clientTurn(actor: string, body: Record<string, unknown>, epoch: string): Promise<Response> {
+  private async clientTurn(
+    actor: string,
+    body: Record<string, unknown>,
+    epoch: string,
+    audit?: { credential?: string; trace?: TraceContext }
+  ): Promise<Response> {
     // CO14 Phase-4 rule: client-originated turns REQUIRE a session. The
     // gateway refuses session-less turns up front (named), and the turn
     // still runs route:"sequenced" so the committing scope's authorize
@@ -3157,6 +3190,40 @@ export class NetGatewayDO {
     // post-reply registration could let the fanout push arrive first and
     // duplicate the reply's observations at the submitter.
     this.noteClientTurn(key, session);
+    // AU3.2: the principal is stamped HERE, at the trust boundary — any
+    // client-supplied `principal` in the body is ignored by construction
+    // (it is never read). The customer comes from the actor's
+    // customer_of cell, already in the view via the cluster warm above;
+    // a missing cell is a named identity-pipeline gap (the turn still
+    // commits, unattributed) — never a runtime graph walk.
+    const attribution = normalizeCustomerAttribution(
+      this.ensureView().get(customerOfCellKey(actor))?.value
+    );
+    if (!attribution) {
+      this.metric({ kind: "net_turn_unattributed", scope: planningScope, actor, status: "warn" });
+    }
+    const principal: Principal | null = attribution
+      ? {
+          attribution: "authenticated",
+          customer: attribution.customer,
+          ...(attribution.team ? { team: attribution.team } : {}),
+          actor,
+          session,
+          ...(audit?.credential ? { credential: audit.credential } : {})
+        }
+      : null;
+    // AU2: adopt the caller's context (REST/MCP header via audit.trace,
+    // WS frame `trace` field via the body) or mint — never reject.
+    const bodyTrace =
+      body.trace !== null && typeof body.trace === "object" && !Array.isArray(body.trace)
+        ? (body.trace as Record<string, unknown>)
+        : null;
+    const trace =
+      audit?.trace ??
+      adoptOrMintTraceContext(
+        typeof bodyTrace?.traceparent === "string" ? bodyTrace.traceparent : null,
+        typeof bodyTrace?.tracestate === "string" ? bodyTrace.tracestate : null
+      );
     const result = await this.turn({
       call: {
         kind: "woo.turn_call.shadow.v1",
@@ -3169,6 +3236,8 @@ export class NetGatewayDO {
         verb,
         args
       },
+      ...(principal ? { principal } : {}),
+      trace,
       planningScope,
       catalog_epoch: epoch,
       idempotency_key: key
@@ -3457,6 +3526,11 @@ export class NetGatewayDO {
     );
   }
 
+  /** AU2: adopt the MCP request's traceparent for a tool-invoked turn. */
+  private mcpTraceOf(request: Request): TraceContext {
+    return adoptOrMintTraceContext(request.headers.get("traceparent"), request.headers.get("tracestate"));
+  }
+
   private async mcpToolsCall(request: Request, id: number | string, params: Record<string, unknown>): Promise<Response> {
     const session = request.headers.get("mcp-session-id") ?? "";
     const cell = this.ensureView().get(sessionCellKey(session));
@@ -3516,10 +3590,10 @@ export class NetGatewayDO {
         candidate.object === object && (candidate.verb === verb || candidate.aliases.includes(verb))
       );
       if (!tool) return this.mcpToolError(id, { code: "E_PERM", message: `tool is not available in this session context: ${object}:${verb}` });
-      return this.mcpInvokeTurn(id, actor, session, tool.object, tool.verb, Array.isArray(args.args) ? args.args : []);
+      return this.mcpInvokeTurn(id, actor, session, tool.object, tool.verb, Array.isArray(args.args) ? args.args : [], this.mcpTraceOf(request));
     }
     const dynamic = this.mcpContextTools(actor, session).find((tool) => tool.name === name);
-    if (dynamic) return this.mcpInvokeTurn(id, actor, session, dynamic.object, dynamic.verb, mcpNamedArgs(dynamic, args));
+    if (dynamic) return this.mcpInvokeTurn(id, actor, session, dynamic.object, dynamic.verb, mcpNamedArgs(dynamic, args), this.mcpTraceOf(request));
     return json({ jsonrpc: "2.0", id, error: { code: -32602, message: `unknown tool: ${name}` } }, 200);
   }
 
@@ -3563,7 +3637,8 @@ export class NetGatewayDO {
     session: string,
     object: string,
     verb: string,
-    args: unknown[]
+    args: unknown[],
+    trace?: TraceContext
   ): Promise<Response> {
     try {
       const identity = await this.catalogIdentity();
@@ -3580,7 +3655,11 @@ export class NetGatewayDO {
       const turnResponse = await this.clientTurn(
         actor,
         { target: object, verb, args, session, idempotency_key: turnId },
-        identity.epoch
+        identity.epoch,
+        // AU2 MCP carrier (threaded from mcpToolsCall, which holds the
+        // request): an MCP agent framework that emits traceparent joins
+        // its trace to this turn's commit.
+        trace ? { trace } : undefined
       );
       const turn = (await turnResponse.json()) as {
         reply?: { status?: string; reason?: string; detail?: unknown };
@@ -5761,6 +5840,8 @@ export class NetGatewayDO {
   ): Promise<PlanTurnResult> {
     return planTurn({
       call: request.call,
+      ...(request.principal ? { principal: request.principal } : {}),
+      ...(request.trace ? { trace: request.trace } : {}),
       view,
       planningScope: request.planningScope,
       classifier,

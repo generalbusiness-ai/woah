@@ -32,7 +32,9 @@ import {
   type SerializedFromCellsOptions,
   type ShadowTurnCall
 } from "./bridge";
+import type { Principal } from "./attribution";
 import { CellStore, cellKey, cellVersion, serializeTransfer, type Cell, type EpochStamp } from "./cells";
+import type { TraceContext } from "./trace";
 import { isNetError, netError, type NetError } from "./errors";
 import type { OrderedNeighborsQuery, OrderedNeighborsRequest, OrderedProjectionKey } from "./ordered-edges";
 import { selectCommitScope, type ScopeClassifier, type ScopeSelection } from "./route";
@@ -46,6 +48,13 @@ export const CROSS_SCOPE_ENVELOPE_BYTE_LIMIT = 256 * 1024;
 
 export type PlanTurnInput = {
   call: ShadowTurnCall;
+  /** AU3.2 principal, stamped by the gateway at the auth boundary. The
+   * planner folds it into the transcript BODY so it participates in the
+   * transcript hash and survives into the durable record. */
+  principal?: Principal;
+  /** AU2 trace context (adopted or minted at the gateway), folded into
+   * the transcript body alongside the principal. */
+  trace?: TraceContext;
   /** The gateway's derived planning view (CO5 copy #2). */
   view: CellStore;
   /** The scope the session plans in (the read-only/ride-along fallback). */
@@ -302,7 +311,10 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
   // selection, so the folded write participates in the write-set routing.
   const withSession = foldSessionEffects(run.transcript, planStore, call);
   const selection = selectCommitScope(withSession, planningScope, classifier);
-  const transcript = submitTranscript(withSession, planStore, selection.scope);
+  const transcript = submitTranscript(withSession, planStore, selection.scope, {
+    ...(input.principal ? { principal: input.principal } : {}),
+    ...(input.trace ? { trace: input.trace } : {})
+  });
   // P1.1: attest every ordered-children projection this plan was given (a read
   // can only resolve to a supplied projection — else it misses and repairs into
   // one), so the committing scope serializes concurrent same-parent inserts by
@@ -444,7 +456,12 @@ function foldSessionEffects(recorded: EffectTranscript, snapshot: CellStore, cal
  *   rewrite the hash must content-address what is actually submitted
  *   (the scope folds it into its head digest), so re-address canonically.
  */
-function submitTranscript(recorded: EffectTranscript, view: CellStore, scope: string): EffectTranscript {
+function submitTranscript(
+  recorded: EffectTranscript,
+  view: CellStore,
+  scope: string,
+  audit?: { principal?: Principal; trace?: TraceContext }
+): EffectTranscript {
   const reads = recorded.reads.map((read) => {
     const key = netCellKeyFor(read.cell);
     // Projection reads (contents, CA4) keep their recorded version: they
@@ -452,7 +469,15 @@ function submitTranscript(recorded: EffectTranscript, view: CellStore, scope: st
     if (key === null) return read;
     return { ...read, version: view.get(key)?.version ?? "absent" };
   });
-  const { hash: _engineHash, ...body } = { ...recorded, reads, scope: scope as EffectTranscript["scope"] };
+  const { hash: _engineHash, ...body } = {
+    ...recorded,
+    reads,
+    scope: scope as EffectTranscript["scope"],
+    // AU3.2/AU2: attribution and trace ride the hashed body (present-
+    // only-when-set keeps principal-less transcript hashes unchanged).
+    ...(audit?.principal ? { principal: audit.principal } : {}),
+    ...(audit?.trace ? { trace: audit.trace } : {})
+  };
   return { ...body, hash: cellVersion(body) };
 }
 

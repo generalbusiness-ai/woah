@@ -34,7 +34,14 @@ import {
   orderedProjectionKey,
   type OrderedChildRow
 } from "./ordered-edges";
-import type { ScopeAttribution } from "./attribution";
+import {
+  customerOfCellKey,
+  normalizeCustomerAttribution,
+  normalizePrincipal,
+  type Principal,
+  type ScopeAttribution
+} from "./attribution";
+import type { TraceContext } from "./trace";
 import type { ScopeMeta, ScopeStore, TailEntry } from "./scope-store";
 import { applyTranscript, netCellKeyFor, type EffectTranscript, type TranscriptCell } from "./transcript";
 import { cellKey, cellVersion } from "./cells";
@@ -145,6 +152,15 @@ export type ScheduledTurn = {
   id: string;
   at_logical_time: number;
   call: { actor: string; target: string; verb: string; args: unknown[] };
+  /** AU3.2: attribution captured at SCHEDULE time, so the session-less
+   * scheduled turn stays attributable when it eventually runs. This is
+   * attribution only — CO16's deferred engine-side authority field is a
+   * separate concern, and the captured principal never widens authority
+   * (the turn still runs as an actor-authority direct-route turn). */
+  principal?: Principal;
+  /** AU2: the scheduling turn's trace context, carried in the durable
+   * row so the eventual dispatch joins the originating trace. */
+  trace?: TraceContext;
 };
 
 export type ScopeSequencerOptions = {
@@ -504,6 +520,42 @@ export class ScopeSequencer {
           ? (err.detail as Record<string, unknown>)
           : {};
       return this.reject(submit, "unauthorized", { error: String(err), ...structured });
+    }
+
+    // Step 1b (audit.md AU3.2): a carried principal must agree with the
+    // transcript it rides. The gateway is the authenticating edge — the
+    // scope validates the attestation's internal consistency, and, when
+    // it OWNS the actor's customer_of cell (the actor's own cluster),
+    // re-validates the customer against durable authority. Both checks
+    // fold into the CO14 unauthorized reject with a named verdict.
+    const principal = submit.transcript.principal;
+    if (principal !== undefined) {
+      if (normalizePrincipal(principal) === null) {
+        return this.reject(submit, "unauthorized", { principal_verdict: "malformed_principal" });
+      }
+      if (principal.attribution === "authenticated" && principal.actor !== submit.transcript.call.actor) {
+        return this.reject(submit, "unauthorized", {
+          principal_verdict: "actor_mismatch",
+          principal_actor: principal.actor,
+          transcript_actor: submit.transcript.call.actor
+        });
+      }
+      if (
+        principal.attribution === "authenticated" &&
+        principal.actor !== undefined &&
+        this.options.owns?.(principal.actor) === true
+      ) {
+        const owned = normalizeCustomerAttribution(
+          this.store.get(customerOfCellKey(principal.actor))?.value
+        );
+        if (owned !== null && owned.customer !== principal.customer) {
+          return this.reject(submit, "unauthorized", {
+            principal_verdict: "customer_mismatch",
+            principal_customer: principal.customer,
+            authoritative_customer: owned.customer
+          });
+        }
+      }
     }
 
     // Step 2: scope and epoch.
