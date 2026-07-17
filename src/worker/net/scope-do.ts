@@ -78,7 +78,7 @@
  * here until Phase 5.
  */
 import { normalizeScopeAttribution, type Principal } from "../../net/attribution";
-import type { TraceContext } from "../../net/trace";
+import { parseTraceparent, type TraceContext } from "../../net/trace";
 import type { Cell } from "../../net/cells";
 import { cellKey, lineageClosureKeys, serializeTransfer, type CellTransfer } from "../../net/cells";
 import { isNetError, netError } from "../../net/errors";
@@ -767,6 +767,12 @@ export class NetScopeDO {
           kind: "net_scope_submit",
           scope: seq.scope,
           status: reply.status,
+          // AU8: correlation stamps from the submitted transcript
+          // (blobs 19/20) — telemetry only, never the audit trail.
+          ...(submit.transcript.principal?.customer ? { customer: submit.transcript.principal.customer } : {}),
+          ...(submit.transcript.trace
+            ? { trace_id: parseTraceparent(submit.transcript.trace.traceparent)?.traceId }
+            : {}),
           ...(reply.status === "accepted" ? { seq: reply.head.seq, touched: reply.touched.length } : { reason: reply.reason }),
           base_lag: baseLag,
           // A cached idempotent reply can also carry an old base; only a

@@ -184,7 +184,7 @@ async function handlePurgeInactiveGuests(request: Request, env: AdminEnv): Promi
 // Returns:
 //   { metric, groupBy, from, to, bucket, series: [ { key, points: [[unix, value], ...] } ] }
 //
-// AE SQL spec: index1 is host_key; blob1..blob18 follow the slot map in
+// AE SQL spec: index1 is host_key; blob1..blob20 follow the slot map in
 // metrics-sink.ts; the first three doubles are ms, sample_rate, count
 // (later slots are net-specific and do not change this admin surface). The
 // `_sample_interval` column is AE's own adaptive-sampling multiplier;
@@ -210,7 +210,10 @@ const ALLOWED_GROUP_BY: Record<string, string> = {
   path: "blob15",
   reason: "blob16",
   error_detail: "blob17",
-  source: "blob18"
+  source: "blob18",
+  // audit.md AU8 correlation stamps (metrics-sink blobs[18]/blobs[19]).
+  customer: "blob19",
+  trace_id: "blob20"
 };
 
 const BUCKET_SECONDS: Record<string, number> = {

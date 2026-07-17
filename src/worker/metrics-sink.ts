@@ -69,7 +69,7 @@ export function analyticsSampleRate(event: AnalyticsMetric): number {
 // hard-codes them. New axes get a NEW slot; the existing slot indices
 // must not be reordered or repurposed. See spec/reference/cloudflare.md
 // §R10.1 for the canonical schema and the per-`kind` field mapping.
-const BLOB_SLOTS = 18;
+const BLOB_SLOTS = 20;
 const DOUBLE_SLOTS = 20;
 
 // Per-kind "primary count" extraction. The double goes into doubles[2] so
@@ -174,6 +174,15 @@ function primaryCount(event: AnalyticsMetric): number {
 //                                browser fallback/cache reason
 //   blobs[16]   = error_detail   bounded diagnostic detail for uncoded errors
 //   blobs[17]   = source         browser_activity.source ("main"|"v2_browser_worker")
+//   blobs[18]   = customer       audit.md AU8 `woo.customer` — the acting
+//                                principal's customer (account id or
+//                                operator/guest) on net turn metrics
+//   blobs[19]   = trace_id       audit.md AU2 — the 32-hex W3C trace id
+//                                joining this event to the audit trail and
+//                                the caller's own traces.
+//                                NOTE: 20 is the AE blob maximum — these two
+//                                slots spend the last headroom deliberately
+//                                (2026-07-16 audit plan Phase 1).
 //   doubles[0]  = ms             latency (ms, elapsed_ms, or total_ms when present)
 //   doubles[1]  = sample_rate    1 (default) or the 1-in-N multiplier
 //   doubles[2]  = count          primary kind-specific count: rows |
@@ -230,6 +239,8 @@ export function writeMetricToAnalytics(
   blobs[15] = stringOrEmpty(e.reason ?? e.mode ?? e.cause ?? e.repair_reason);
   blobs[16] = stringOrEmpty(e.error_detail);
   blobs[17] = stringOrEmpty(e.source);
+  blobs[18] = stringOrEmpty(e.customer);
+  blobs[19] = stringOrEmpty(e.trace_id);
 
   doubles[0] = ms;
   doubles[1] = rate;

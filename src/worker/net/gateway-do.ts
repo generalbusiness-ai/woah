@@ -64,7 +64,7 @@ import {
   type Principal
 } from "../../net/attribution";
 import { CellStore, cellKey, cellVersion, makeCell, type Cell } from "../../net/cells";
-import { adoptOrMintTraceContext, normalizeTraceContext, type TraceContext } from "../../net/trace";
+import { adoptOrMintTraceContext, normalizeTraceContext, parseTraceparent, type TraceContext } from "../../net/trace";
 import { clampClientSessionTtl } from "../../net/client-session-policy";
 import { budgetExhausted, isNetError, netError, nonconvergentRead, NetError, type AttemptTraceEntry, type NetErrorCode } from "../../net/errors";
 import { applyFanout, type FanoutBody } from "../../net/outbox";
@@ -1157,11 +1157,18 @@ export class NetGatewayDO {
     status: "accepted" | "rejected" | "error",
     error?: string
   ): void {
+    // AU8 ops correlation: stamp the acting customer and the W3C trace
+    // id onto the turn metric (blobs 19/20). AE stays SAMPLED — these
+    // stamps are telemetry correlation, never the audit trail (AU6).
+    const traceId = request.trace ? parseTraceparent(request.trace.traceparent)?.traceId : undefined;
     this.metric({
       kind: "net_turn_structure",
       idempotency_key: request.idempotency_key,
       status,
       ...(error ? { error } : {}),
+      ...(request.principal?.customer ? { customer: request.principal.customer } : {}),
+      ...(request.principal?.actor ? { actor: request.principal.actor } : {}),
+      ...(traceId ? { trace_id: traceId } : {}),
       ...report
     });
   }

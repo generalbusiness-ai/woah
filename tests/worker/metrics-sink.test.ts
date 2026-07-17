@@ -131,7 +131,7 @@ describe("metrics-sink", () => {
 
       // Empty axes still occupy their slot — fixed-width is what /admin/stats
       // SQL relies on.
-      expect(point.blobs).toHaveLength(18);
+      expect(point.blobs).toHaveLength(20);
       expect(point.blobs?.[SLOT_KIND]).toBe("do_handler");
       expect(point.blobs?.[SLOT_CLASS]).toBe("DirectoryDO");
       expect(point.blobs?.[SLOT_ROUTE]).toBe("/register-session");
@@ -571,5 +571,31 @@ describe("metrics-sink", () => {
       expect(calls[0]!.doubles?.[DBL_MS]).toBe(7);
       expect(calls[0]!.doubles?.[DBL_SAMPLE_RATE]).toBe(1);
     });
+  });
+});
+
+// audit.md AU8: the correlation stamps land in the two appended slots
+// (blob19 customer / blob20 trace_id in AE SQL terms) and stay empty for
+// events that carry neither.
+describe("audit correlation slots (blobs[18]/blobs[19])", () => {
+  it("packs customer and trace_id when present, empty otherwise", () => {
+    const calls: Array<{ indexes?: string[]; blobs?: string[]; doubles?: number[] }> = [];
+    const binding = { writeDataPoint: (p: { indexes?: string[]; blobs?: string[]; doubles?: number[] }) => calls.push(p) };
+    writeMetricToAnalytics(
+      {
+        kind: "net_turn_structure",
+        scope: "room:the_room",
+        status: "accepted",
+        customer: "acct_1",
+        trace_id: "4bf92f3577b34da6a3ce929d0e0e4736"
+      },
+      "gateway-1",
+      binding
+    );
+    writeMetricToAnalytics({ kind: "net_rpc", status: "ok" }, "gateway-1", binding);
+    expect(calls[0]?.blobs?.[18]).toBe("acct_1");
+    expect(calls[0]?.blobs?.[19]).toBe("4bf92f3577b34da6a3ce929d0e0e4736");
+    expect(calls[1]?.blobs?.[18]).toBe("");
+    expect(calls[1]?.blobs?.[19]).toBe("");
   });
 });
