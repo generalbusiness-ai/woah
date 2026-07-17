@@ -1,0 +1,31 @@
+# Interactive local Net backend. Vite serves the SPA/HMR on :5173 and proxies
+# only public Net routes here; workerd supplies real per-DO SQLite, RPC, alarms,
+# and WebSocket upgrades. State persists under .woo/net-dev via the wrapper's
+# --persist-to argument.
+name = "woah-net-dev"
+main = "src/worker/net-only-index.ts"
+compatibility_date = "2026-04-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = false
+
+[observability]
+enabled = false
+
+[vars]
+WOO_INTERNAL_SECRET = "local-net-dev-internal-secret"
+NET_API_GATEWAY_SHARDS = "8"
+NET_RPC_TIMEOUT_MS = "5000"
+NET_TURN_QUEUE_WAIT_MS = "1500"
+NET_TURN_SCOPE_CONCURRENCY = "12"
+
+[[durable_objects.bindings]]
+name = "SCOPE_NET"
+class_name = "NetScopeDO"
+
+[[durable_objects.bindings]]
+name = "GATEWAY_NET"
+class_name = "NetGatewayDO"
+
+[[migrations]]
+tag = "net-dev-v1"
+new_sqlite_classes = ["NetGatewayDO", "NetScopeDO"]

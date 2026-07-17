@@ -133,12 +133,38 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
     const bobSession = await open("apikey:mcp-key-b:mcp-secret-b");
     await settleAll(); // mint fanout + presence relate settle
 
+    // Protocol methods use protocol result shapes. In particular, the MCP
+    // SDK validates tools/list as {result:{tools:[...]}}; the tools/call
+    // content/structuredContent envelope is not valid here.
+    const listed = await mcp(
+      { jsonrpc: "2.0", id: nextId++, method: "tools/list", params: {} },
+      { "mcp-session-id": aliceSession }
+    );
+    expect(listed.body?.result?.tools?.map((tool: { name: string }) => tool.name).sort()).toEqual([
+      "woo_call",
+      "woo_list_reachable_tools",
+      "woo_wait"
+    ]);
+    const waitDefinition = listed.body?.result?.tools?.find((tool: { name: string }) => tool.name === "woo_wait");
+    expect(waitDefinition?.inputSchema?.properties).toMatchObject({
+      timeout_ms: { type: "number" },
+      limit: { type: "number" }
+    });
+
     // Actor resolution — the smoke SmokeSession.open contract: a guest_*
     // object carrying an actor-control verb (wait) in the tool list.
     const tools = await call(aliceSession, "woo_list_reachable_tools", { scope: "all", limit: 200 });
     const list = tools.result?.structuredContent?.result?.tools ?? [];
     const self = list.find((tool: any) => typeof tool?.object === "string" && /^guest_/.test(tool.object) && tool.verb === "wait");
     expect(self?.object, JSON.stringify(list.slice(0, 12))).toBe(alice);
+
+    // The stable wait contract is bounded: a caller can consume part of a
+    // burst without discarding the remainder from its session-local queue.
+    (gateway as any).mcpEnqueue(bobSession, [{ marker: "first" }, { marker: "second" }]);
+    const firstWait = await call(bobSession, "woo_wait", { timeout_ms: 0, limit: 1 });
+    expect(firstWait.result?.structuredContent?.result?.observations).toEqual([{ marker: "first" }]);
+    const secondWait = await call(bobSession, "woo_wait", { timeout_ms: 0, limit: 1 });
+    expect(secondWait.result?.structuredContent?.result?.observations).toEqual([{ marker: "second" }]);
 
     // Cross-actor: alice says; bob's woo_wait sees it (presence-routed
     // fanout → the MCP queue; both sessions born present in the room).

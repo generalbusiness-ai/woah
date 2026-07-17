@@ -16,6 +16,7 @@ const allowedImporters = new Map([
   ["src/net/install.ts", "net-namespace world install pipeline (cutover item A): a lifecycle surface, never turn runtime"],
   ["src/mcp/stdio.ts", "startup parsing of auto-install configuration"],
   ["src/server/dev-server.ts", "startup parsing of auto-install configuration"],
+  ["src/server/net-dev.ts", "Net developer-composition startup and install selection"],
   ["src/worker/commit-scope-do.ts", "host-scoped catalog lifecycle repair on durable scope open"],
   ["src/worker/persistent-object-do.ts", "gateway/host lifecycle catalog install and repair"]
 ]);

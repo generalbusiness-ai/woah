@@ -1,97 +1,54 @@
 # For LLM agents
 
-woah exposes an MCP (Model Context Protocol) endpoint at `/mcp`
-(streamable HTTP). An agent connects, gets an actor identity, and from
-that point onwards drives the world the same way a human player does:
-by calling verbs and observing what happens.
-
-The defining property of the MCP surface is that the **tool list
-tracks the session's active scope**. In `the_chatroom` you see
-`say` / `look` / `take`. Walk to `the_dubspace` and the tools shift to
-`set_control` / `save_scene`. The protocol is dynamic; your client
-must support `notifications/tools/list_changed` (or fall back to
-explicit re-listing) to keep up.
+woah's Net deployment exposes streamable HTTP MCP at `/net-api/mcp`. An agent
+authenticates with an issued API key, receives an actor-bound session, calls
+world verbs, and pulls live observations from the same fanout path as browser
+sessions.
 
 ## Read in this order
 
-1. **[connecting.md](connecting.md)** — token vocabulary, sessions,
-   the MCP endpoint, what an "actor" is.
-2. **[tools-and-actions.md](tools-and-actions.md)** — `woo_list_reachable_tools`,
-   `woo_call`, `woo_focus`, dynamic per-location tools.
-3. **[observations.md](observations.md)** — pulling events with
-   `woo_wait`, sequenced vs direct calls, idempotent retry.
-4. **[../using/](../using/)** — the verbs you'll actually be calling.
+1. [connecting.md](connecting.md) — endpoint, API-key sessions, and stdio.
+2. [tools-and-actions.md](tools-and-actions.md) — discovery and `woo_call`.
+3. [observations.md](observations.md) — live events through `woo_wait`.
+4. [../using/](../using/) — the catalog verbs agents encounter.
 
-## The agent loop, distilled
+## The current Net loop
 
 ```
-list reachable tools         (or trust your cached list)
+list reachable {object, verb} pairs
    ↓
-pick a tool, call it          (woo_call or the named tool)
+call one through woo_call
    ↓
-read observations             (woo_wait — pulls everything since last)
+pull peer observations through woo_wait
    ↓
-re-list if location changed   (notifications/tools/list_changed hint)
+re-list after movement
    ↓
 repeat
 ```
 
-That's the whole protocol. The richness comes from the world the agent
-inhabits, not from MCP-specific machinery.
-
-## The four control tools you can always count on
-
-These exist regardless of where the actor is:
+The stable surface is deliberately small:
 
 | Tool | Purpose |
-|---|---|
-| `woo_list_reachable_tools(scope?, object?, query?, limit?, cursor?, include_schema?)` | Paged tool listing. Default scope is `active`. |
-| `woo_call(object, verb, args?)` | Call any reachable verb directly, even if the dynamic tool name is stale. |
-| `woo_focus(target)` / `woo_unfocus(target)` | Add/remove an object from your working set so its verbs stay reachable as you move. |
-| `woo_wait(timeout_ms?, limit?)` | Long-poll for observations. |
+| --- | --- |
+| `woo_list_reachable_tools(scope?, limit?)` | Discover callable object/verb pairs in the current gateway view. |
+| `woo_call(object, verb, args?)` | Invoke one reachable verb through the Net turn path. |
+| `woo_wait(timeout_ms?, limit?)` | Long-poll live observations queued for this session. |
 
-The control tools are wrappers around real verbs on `$actor` (`focus`,
-`unfocus`, `wait`); you can also call them as ordinary verbs through
-`woo_call`. The wrapper layer exists for clients whose tool metadata
-lags the live world.
+The full MCP specification also defines dynamic named tools, focus/unfocus,
+schemas, paging, filters, and list-change notifications. Those features exist
+on the classic rollback host but are explicit Net migration gaps; they are not
+part of the current deployed surface.
 
-## What an authoring agent sees
+## What an authoring agent can call
 
-If your actor inherits from `$builder` or `$programmer`, the
-authoring tools attach to **your own actor**. There's no separate
-"tools object" to focus. Builder-class actors see `inspect`,
-`search`, `create`, `chparent`, `recycle`, `set_property`.
-Programmer-class actors see those plus `install_verb`,
-`set_verb_info`, `set_property_info`, `edit_verb`, `eval`, and
-more.
+Authority still comes from the actor. If its reachable class chain exposes
+builder or programmer verbs, discovery returns those `{object, verb}` pairs and
+the agent invokes them with `woo_call`. MCP never grants builder/programmer
+authority by itself. See
+[../designing/builder-and-programmer.md](../designing/builder-and-programmer.md)
+and [../designing/eval.md](../designing/eval.md).
 
-For a programmer agent, `eval` is the high-leverage tool — it
-collapses chained `woo_call`s into a single woocode statement
-block. See [../designing/eval.md](../designing/eval.md).
-
-The full builder/programmer surface (verbs, chat-command equivalents,
-authority gates) is in
-[../designing/builder-and-programmer.md](../designing/builder-and-programmer.md).
-
-## Why your tools change as you move
-
-Reachability — the set of objects whose verbs become tools — is
-computed from your **actor's scope**: yourself, your active scope,
-the visible contents of that scope, your inventory, any objects
-you've focused, and the catalog singletons your role can see. Move,
-focus, or unfocus, and the scope changes; the gateway sends a
-`notifications/tools/list_changed` hint, and your next `tools/list`
-returns the new set.
-
-See [tools-and-actions.md](tools-and-actions.md#reachability) for the
-full reachability rules and how to extend your scope deliberately
-with `focus`.
-
-## Where the spec lives
-
-The normative MCP behavior is [`../../spec/protocol/mcp.md`](../../spec/protocol/mcp.md).
-The shared call/observation semantics (which the WebSocket and REST
-transports also implement) live in
-[`../../spec/semantics/space.md`](../../spec/semantics/space.md) and
-[`../../spec/semantics/events.md`](../../spec/semantics/events.md).
-Identity and authentication: [`../../spec/identity/auth.md`](../../spec/identity/auth.md).
+The normative target is
+[`../../spec/protocol/mcp.md`](../../spec/protocol/mcp.md). Net-decommission
+readiness and remaining parity gaps are tracked in
+[`../../spec/operations/net-cutover.md §NC9`](../../spec/operations/net-cutover.md#nc9-v2-stack-decommission).

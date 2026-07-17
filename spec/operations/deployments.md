@@ -30,7 +30,26 @@ This section does **not** apply to in-memory or local SQLite modes. Those runtim
 ### DP1.1 Local test and single-target systems
 
 - **In-memory mode** (tests). Run with `LocalSQLiteRepository(":memory:")` from [`src/server/sqlite-repository.ts`](../../src/server/sqlite-repository.ts); no disk persistence and reset on process exit.
-- **Local SQLite mode** (single-node local system). Use `npm run dev` (default `WOO_DB=.woo/dev.sqlite`) or set `WOO_DB` for custom path/in-memory behavior.
+- **Interactive Net development** (default). `npm run dev` runs the Net-only
+  Worker entry under local workerd with Durable Object SQLite persisted below
+  `.woo/net-dev`, installs and activates the current bundled-catalog plan on a
+  fresh namespace, and fronts it with Vite for browser HMR. Vite proxies only
+  the public Net/config/health surfaces; it does not reimplement turns,
+  sessions, MCP, or WebSocket delivery. A catalog epoch mismatch fails loudly
+  instead of overwriting committed local state; `npm run dev -- --reset` is the
+  explicit destructive reset. This is the primary local behavior surface.
+- **Classic local SQLite rollback mode** (single-node legacy system).
+  `npm run dev:classic` retains the pre-Net `LocalSQLiteRepository` composition
+  while the NC8 rollback contract remains live. `WOO_DB` configures this mode
+  only. It is not evidence for Net behavior and is removed with the classic
+  transport stack under NC9.
+- **Net MCP stdio bridge.** `npm run mcp:stdio` is a framing adapter to the
+  already-running `/net-api/mcp` surface (default
+  `http://127.0.0.1:5173/net-api/mcp`). It carries the configured API key on
+  initialize, propagates the returned MCP/Net session id, and forwards later
+  JSON-RPC messages unchanged. It MUST NOT implement tool discovery or verb
+  dispatch. `npm run mcp:stdio:classic` retains the in-memory legacy host only
+  for rollback testing.
 - **Cloudflare-shape smoke (three-lane ladder)**. One cross-actor scenario
   ([`scripts/smoke/scenario.ts`](../../scripts/smoke/scenario.ts)) runs on three
   lanes of increasing fidelity before a real deploy:

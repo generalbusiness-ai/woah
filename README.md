@@ -26,8 +26,8 @@ Connect external data with interactive "blocks" and "plugs".
 
 ## Current Status
 
-Early availability and testing. Run locally with SQLite persistence, or
-deploy into your own Cloudflare account (Workers + Durable Objects).
+Early availability and testing. Run the production-shaped Net locally under
+workerd, or deploy into your own Cloudflare account (Workers + Durable Objects).
 
 Homepage: https://woah.generalbusiness.ai/
 
@@ -35,12 +35,12 @@ Production world: https://woah1.generalbusiness.ai/
 
 ## Connect an Agent (MCP)
 
-The world exposes an MCP server at `/mcp` (streamable HTTP). Point any MCP
-client at `https://woah1.generalbusiness.ai/mcp` with header
-`mcp-token: guest:<name>` (or a wizard token). Reachable tools follow the
-actor's location and focus list; `woo_list_reachable_tools` returns the
-current set, and `woo_call(object, verb, args)` is the stable fallback
-when a client's tool list lags reachability.
+The Net world exposes streamable HTTP MCP at `/net-api/mcp`. Point a client at
+`https://woah1.generalbusiness.ai/net-api/mcp` with an issued API-key header
+`mcp-token: apikey:<id>:<secret>`. Net MCP intentionally exposes three stable
+tools: `woo_list_reachable_tools`, `woo_call(object, verb, args)`, and
+`woo_wait`. The stdio bridge uses the same endpoint rather than running a
+second in-process world.
 
 ## Documentation
 
@@ -61,7 +61,10 @@ npm test                          # fast guarded local gate
 npm run dev
 ```
 
-Then open <http://localhost:5173>.
+Then open <http://localhost:5173>. The first run installs a Net world into
+`.woo/net-dev`; use `npm run dev -- --reset` only when you intend to replace
+that local state. See [DEPLOY.md](DEPLOY.md#local-net-development) for MCP and
+classic rollback commands.
 
 ## Deploy your own world
 

@@ -3287,7 +3287,11 @@ export class NetGatewayDO {
     }
     if (rpc.method === "initialize") return await this.mcpInitialize(request, rpc.id, rpc.params ?? {});
     if (rpc.method === "tools/list") {
-      return this.mcpResult(rpc.id, { tools: MCP_TOOL_DEFS });
+      // tools/list is an MCP protocol result, not a tools/call result. The
+      // SDK validates `result.tools` directly; wrapping it in content and
+      // structuredContent makes the endpoint unusable by conforming clients
+      // even though hand-authored JSON-RPC probes can overlook the shape.
+      return json({ jsonrpc: "2.0", id: rpc.id, result: { tools: MCP_TOOL_DEFS } });
     }
     if (rpc.method === "tools/call") {
       return await this.mcpToolsCall(request, rpc.id, rpc.params ?? {});
@@ -3364,7 +3368,10 @@ export class NetGatewayDO {
 
     if (name === "woo_wait") {
       const timeout = typeof args.timeout_ms === "number" ? Math.min(Math.max(args.timeout_ms, 0), 25_000) : 1000;
-      const observations = await this.mcpWait(session, timeout);
+      const limit = typeof args.limit === "number" && Number.isFinite(args.limit) && args.limit > 0
+        ? Math.min(Math.max(Math.floor(args.limit), 1), MCP_QUEUE_CAP)
+        : 64;
+      const observations = await this.mcpWait(session, timeout, limit);
       return this.mcpResult(id, { observations });
     }
     if (name === "woo_list_reachable_tools") {
@@ -3446,14 +3453,14 @@ export class NetGatewayDO {
 
   /** woo_wait: drain immediately when buffered, else park up to
    * `timeoutMs` for the next fanout enqueue. One waiter list per
-   * session; every parked waiter wakes on the next delivery (each drains
-   * whatever is buffered at that moment — duplicates are impossible
-   * because the buffer is cleared by whichever waiter runs first). */
-  private async mcpWait(session: string, timeoutMs: number): Promise<unknown[]> {
+   * session; every parked waiter wakes on the next delivery. Each wake drains
+   * at most the caller's limit and leaves the remainder queued. Concurrent
+   * waiters cannot duplicate a row because splice claims each prefix once. */
+  private async mcpWait(session: string, timeoutMs: number, limit: number): Promise<unknown[]> {
     const queue = this.mcpQueues.get(session);
     if (!queue) return [];
     if (queue.buffer.length > 0) {
-      const drained = queue.buffer.splice(0, queue.buffer.length);
+      const drained = queue.buffer.splice(0, limit);
       return drained;
     }
     if (timeoutMs === 0) return [];
@@ -3461,11 +3468,11 @@ export class NetGatewayDO {
       const timer = setTimeout(() => {
         const index = queue.waiters.indexOf(wake);
         if (index >= 0) queue.waiters.splice(index, 1);
-        resolve(queue.buffer.splice(0, queue.buffer.length));
+        resolve(queue.buffer.splice(0, limit));
       }, timeoutMs);
       const wake = (): void => {
         clearTimeout(timer);
-        resolve(queue.buffer.splice(0, queue.buffer.length));
+        resolve(queue.buffer.splice(0, limit));
       };
       queue.waiters.push(wake);
     });
@@ -5768,7 +5775,7 @@ const MCP_TOOL_DEFS = [
   {
     name: "woo_wait",
     description: "Long-poll the session's observation queue.",
-    inputSchema: { type: "object", properties: { timeout_ms: { type: "number" } } }
+    inputSchema: { type: "object", properties: { timeout_ms: { type: "number" }, limit: { type: "number" } } }
   },
   {
     name: "woo_list_reachable_tools",

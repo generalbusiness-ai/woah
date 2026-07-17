@@ -1,41 +1,47 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { startNetDevBackend, type NetDevBackend } from "../src/server/net-dev";
 
 type ToolResult = {
   isError?: boolean;
   structuredContent?: {
     result?: unknown;
-    observations?: Array<Record<string, unknown>>;
     error?: unknown;
   };
 };
-
-const runId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
 function assertOk(name: string, result: ToolResult): ToolResult {
   if (result.isError) throw new Error(`${name} failed: ${JSON.stringify(result.structuredContent ?? result)}`);
   return result;
 }
 
-function observations(result: ToolResult): Array<Record<string, unknown>> {
-  const value = result.structuredContent?.observations;
-  return Array.isArray(value) ? value : [];
-}
-
-function hasObservation(result: ToolResult, type: string): boolean {
-  return observations(result).some((observation) => observation.type === type);
-}
-
+/**
+ * Exercise the default stdio command through a real workerd Net backend.
+ * Supplying WOO_MCP_URL and WOO_MCP_TOKEN reuses an already-running `npm run
+ * dev`; otherwise the smoke owns an isolated temporary backend. Either way,
+ * no in-process WooWorld or classic MCP gateway participates.
+ */
 async function main(): Promise<void> {
-  const client = new Client({ name: "woo-local-mcp-smoke", version: "0.0.0" });
+  let backend: NetDevBackend | null = null;
+  let persistDir: string | null = null;
+  let endpoint = process.env.WOO_MCP_URL;
+  let token = process.env.WOO_MCP_TOKEN;
+  if (!endpoint || !token) {
+    persistDir = mkdtempSync(join(tmpdir(), "woo-net-stdio-"));
+    backend = await startNetDevBackend({ persistDir, quiet: true });
+    endpoint = `${backend.baseUrl}/net-api/mcp`;
+    token = backend.apiKey;
+  }
+
+  const client = new Client({ name: "woo-net-stdio-smoke", version: "0.0.0" });
   const transport = new StdioClientTransport({
     command: "npx",
-    args: ["tsx", "src/mcp/stdio.ts"],
+    args: ["tsx", "src/mcp/net-stdio.ts"],
     cwd: process.cwd(),
-    env: {
-      ...process.env,
-      WOO_MCP_TOKEN: `guest:stdio-smoke-${runId}`
-    },
+    env: { ...process.env, WOO_MCP_URL: endpoint, WOO_MCP_TOKEN: token },
     stderr: "pipe"
   });
   const stderrChunks: Buffer[] = [];
@@ -44,72 +50,51 @@ async function main(): Promise<void> {
   try {
     await client.connect(transport);
     const listed = await client.listTools();
-    const names = listed.tools.map((tool) => tool.name);
-    for (const required of ["woo_list_reachable_tools", "woo_call", "woo_focus", "woo_unfocus", "woo_wait"]) {
-      if (!names.includes(required)) throw new Error(`missing MCP tool: ${required}`);
+    const names = listed.tools.map((tool) => tool.name).sort();
+    const expected = ["woo_call", "woo_list_reachable_tools", "woo_wait"];
+    if (JSON.stringify(names) !== JSON.stringify(expected)) {
+      throw new Error(`unexpected Net MCP tools: ${JSON.stringify(names)}`);
     }
 
-    assertOk("woo_list_reachable_tools", await client.callTool({
+    const reachable = assertOk("woo_list_reachable_tools", await client.callTool({
       name: "woo_list_reachable_tools",
-      arguments: { scope: "active", include_schema: true, limit: 20 }
+      arguments: { scope: "all", limit: 200 }
     }) as ToolResult);
+    const tools = (reachable.structuredContent?.result as { tools?: Array<{ object?: string; verb?: string }> } | undefined)?.tools ?? [];
+    if (!tools.some((tool) => /^guest_/.test(tool.object ?? "") && tool.verb === "wait")) {
+      throw new Error(`Net MCP did not resolve its carried actor: ${JSON.stringify(tools.slice(0, 12))}`);
+    }
 
-    const looked = assertOk("woo_call look", await client.callTool({
+    const planned = assertOk("woo_call command_plan", await client.callTool({
       name: "woo_call",
-      arguments: { object: "the_chatroom", verb: "look", args: [] }
+      arguments: { object: "the_chatroom", verb: "command_plan", args: ["look"] }
     }) as ToolResult);
-    if (!hasObservation(looked, "looked")) throw new Error("woo_call look returned no looked observation");
-
-    const said = assertOk("woo_call say", await client.callTool({
+    const command = planned.structuredContent?.result as { ok?: boolean; target?: string; verb?: string; args?: unknown[] } | undefined;
+    if (!command?.ok || !command.target || !command.verb) {
+      throw new Error(`command_plan did not return an executable command: ${JSON.stringify(command)}`);
+    }
+    assertOk("woo_call planned look", await client.callTool({
       name: "woo_call",
-      arguments: { object: "the_chatroom", verb: "say", args: [`stdio MCP smoke ${runId}`] }
+      arguments: { object: command.target, verb: command.verb, args: command.args ?? [] }
     }) as ToolResult);
-    if (!hasObservation(said, "said")) throw new Error("woo_call say returned no said observation");
-
-    assertOk("woo_call southeast", await client.callTool({
-      name: "woo_call",
-      arguments: { object: "the_chatroom", verb: "southeast", args: [] }
-    }) as ToolResult);
-
-    assertOk("woo_focus", await client.callTool({
-      name: "woo_focus",
-      arguments: { target: "the_pinboard" }
-    }) as ToolResult);
-
-    assertOk("woo_list_reachable_tools focused", await client.callTool({
-      name: "woo_list_reachable_tools",
-      arguments: { scope: "focus", query: "pinboard", limit: 20 }
-    }) as ToolResult);
-
-    const refreshed = await client.listTools();
-    const dynamicLook = refreshed.tools.find((tool) => tool.name.endsWith("__look"));
-    if (!dynamicLook) throw new Error("no dynamic look tool available after focus");
-    assertOk(`dynamic ${dynamicLook.name}`, await client.callTool({
-      name: dynamicLook.name,
-      arguments: {}
-    }) as ToolResult);
-
-    assertOk("woo_unfocus", await client.callTool({
-      name: "woo_unfocus",
-      arguments: { target: "the_pinboard" }
-    }) as ToolResult);
-
     assertOk("woo_wait", await client.callTool({
       name: "woo_wait",
       arguments: { timeout_ms: 0, limit: 10 }
     }) as ToolResult);
 
-    console.log(`MCP stdio smoke passed (${listed.tools.length} initial tools, ${refreshed.tools.length} focused tools)`);
-  } catch (err) {
+    console.log(`Net MCP stdio smoke passed (${listed.tools.length} stable tools)`);
+  } catch (error) {
     const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
     if (stderr) console.error(stderr);
-    throw err;
+    throw error;
   } finally {
-    await client.close();
+    await client.close().catch(() => undefined);
+    await backend?.stop().catch(() => undefined);
+    if (persistDir) rmSync(persistDir, { recursive: true, force: true });
   }
 }
 
-main().catch((err) => {
-  console.error((err as Error).stack ?? String(err));
+main().catch((error) => {
+  console.error(error instanceof Error ? error.stack ?? error.message : String(error));
   process.exit(1);
 });

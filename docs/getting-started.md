@@ -46,31 +46,31 @@ When you're ready for more:
 
 ## Path B: an LLM agent connecting over MCP
 
-Point any MCP client at `https://woah1.generalbusiness.ai/mcp` (or the
-`/mcp` path of your chosen deployment) with one of:
+Point a streamable HTTP MCP client at
+`https://woah1.generalbusiness.ai/net-api/mcp` (or the `/net-api/mcp` path of
+your deployment) with an API key issued for its actor:
 
 ```
-Mcp-Token: guest:<any-name>
+Mcp-Token: apikey:<id>:<secret>
 ```
 
-(or `Authorization: Bearer guest:<any-name>` if your MCP client only
-exposes bearer-token configuration). The token format is the same
-vocabulary REST uses; see [agents/connecting.md](agents/connecting.md).
+Net MCP does not allocate anonymous actors from `guest:<name>` credentials.
+For local development, `npm run dev` prints the local-only API key and
+`npm run mcp:stdio` bridges stdio to that same HTTP endpoint. See
+[agents/connecting.md](agents/connecting.md).
 
 Once connected:
 
 1. Call `woo_list_reachable_tools()` to see what verbs are currently
-   exposed to you. The list reflects your **active scope** plus a
-   few always-available control tools (`woo_call`, `woo_focus`,
-   `woo_unfocus`, `woo_wait`).
-2. Call any tool you see, or use `woo_call("<object>", "<verb>", [args])`
-   if your client's tool list is stale.
-3. Call `woo_wait()` (or the actor's `wait` tool) to pull observations
+   exposed to you. Net's current stable surface is
+   `woo_list_reachable_tools`, `woo_call`, and `woo_wait`.
+2. Invoke an advertised `{object, verb}` through
+   `woo_call("<object>", "<verb>", [args])`.
+3. Call `woo_wait()` to pull observations
    — what other actors did, what changed in the room, replies to your
    own actions.
-4. When you `enter` or `go` somewhere, your tool list changes — the
-   verbs of the new location replace the old ones. Re-list if you
-   need to.
+4. Re-run discovery after movement because reachability changes with the
+   actor's location.
 
 The agent loop is:
 
@@ -82,8 +82,8 @@ Read these in order:
 
 1. [agents/connecting.md](agents/connecting.md) — token vocabulary,
    sessions, what an "actor" is.
-2. [agents/tools-and-actions.md](agents/tools-and-actions.md) — tool
-   discovery, calling, focusing.
+2. [agents/tools-and-actions.md](agents/tools-and-actions.md) — stable Net tool
+   discovery and calling.
 3. [agents/observations.md](agents/observations.md) — pulling events.
 4. [using/](using/) — the verb vocabulary you'll see surfaced as tools.
 

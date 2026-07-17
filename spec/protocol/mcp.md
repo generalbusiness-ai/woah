@@ -9,6 +9,15 @@ status: implemented
 
 Model Context Protocol surface that lets an LLM agent inhabit a woo world. The agent connects, gets an actor, and from then on its tool list tracks the session's active scope: in `the_chatroom` it sees `say`/`look`/`take`; if it enters `the_dubspace` the toolset shifts to `set_control`/`save_scene`. The wire shape is standard MCP (tools, notifications); the woo-specific behavior is which tools materialize for which actor at which moment.
 
+> **Net migration status.** The classic rollback host implements the complete
+> contract below. The Net gateway currently implements standard initialize,
+> tools/list, and the stable `woo_list_reachable_tools`, `woo_call`, and
+> `woo_wait` envelopes over API-key sessions. Dynamic named tools,
+> focus/unfocus wrappers, schema-rich discovery/paging, list-change
+> notifications, and inline observation/applied result fields remain NC9
+> migration gaps. This note records implementation status; it does not weaken
+> the normative contract. See the dated classic-to-Net contract matrix.
+
 The two existing inbound surfaces — [v2-turn-network.md](v2-turn-network.md) (browser turn network) and [rest.md](rest.md) (HTTP) — target browser clients and HTTP integrations respectively. MCP is the third, oriented at LLM agents that need affordances they can introspect, dry-run, and call without prior knowledge of the world's object graph. All three protocols hit the same call/applied/observe semantics; they differ only in framing and discovery.
 
 This spec assumes the MCP client supports dynamic tool lists (`notifications/tools/list_changed`). Clients that cache tool metadata or require a static manifest at connect time can still drive woo through the stable control tools in §M2.0, or through whatever room verb the catalog provides as a parser entry point (e.g., `the_chatroom:command(text)`). They lose some of the per-location affordance, but they do not lose access to the world.
@@ -24,6 +33,15 @@ agent ──(MCP)──► woo MCP gateway ──(internal)──► gateway DO 
 One MCP connection binds to one woo session, which binds to one actor. The session is established the same way a REST or WS session is ([../identity/auth.md](../identity/auth.md)): the agent presents a token (`guest:<...>`, `bearer:<...>`, `apikey:<...>`, or — for development — `wizard:<bootstrap-token>`), the gateway resolves it to a session and an actor, and that pair is the trust boundary for the duration of the connection.
 
 For Streamable HTTP, the first request carries that woo token in `Mcp-Token`. Clients that only expose bearer-token configuration may instead send `Authorization: Bearer <woo-token>`; the bearer envelope is transport syntax, not a separate woo token class. Subsequent requests carry `Mcp-Session-Id`.
+
+The repository's stdio entry is a transport bridge, not another MCP gateway.
+It forwards each validated stdio JSON-RPC message to the Streamable HTTP
+surface, remembers the `Mcp-Session-Id` returned by `initialize`, and closes
+that remote session when stdin closes. Consequently stdio and HTTP expose the
+same tools, authorization, session expiry, observation queue, and defects. A
+stdio implementation that constructs an in-process world or dispatches verbs
+itself is a separate execution stack and is non-conforming once Net is the
+deployment default.
 
 - One actor per connection. Multi-actor multiplexing is not part of this MCP contract.
 - The connection's **caller authority** is the actor's identity. Inside the VM, a verb's `progr` ([../semantics/permissions.md](../semantics/permissions.md)) is the verb owner — set at compile time and carried in every frame. The MCP gateway does not invent `progr`; it dispatches calls under the actor's identity, and verb dispatch then derives `progr` from the verb being called per the standard rule. MCP does not elevate authority; an agent connected as `$guest_42` can do exactly what a browser-attached `$guest_42` can do.

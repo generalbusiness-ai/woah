@@ -532,6 +532,15 @@ is class deletion: a wrangler migration with `deleted_classes` deletes
 **all storage for every instance of the class, platform-wide**
 ([reference/cloudflare.md §R14.6](../reference/cloudflare.md#r146-first-deploy-and-upgrade-discipline)).
 
+Code deletion also requires the repository's primary development and test
+consumers to have moved first. The default interactive browser server and
+stdio command MUST exercise the Net-only entry and `/net-api/mcp`; any classic
+versions remain explicitly named rollback commands. Before a classic transport
+test is removed, a contract matrix MUST name the behavior it protected and
+either its Net replacement lane or the reason the contract was retired. Tests
+of the shared `src/core` object/VM/DSL substrate are not classic-stack tests and
+MUST NOT be deleted merely because a legacy transport imported the same code.
+
 Order is normative, one deploy per step, each gated:
 
 1. **Traffic gate.** A class is a deletion candidate only after AE

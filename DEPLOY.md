@@ -2,14 +2,14 @@
 
 woah is built to be **fork-and-deploy**. This document is the operator quick reference for:
 
-- local test/single-node deployment (`npm run dev`, local SQLite, and in-memory testing), and
+- local Net development (`npm run dev`, persistent workerd Durable Objects), and
 - production deployment on your own Cloudflare account.
 
 For the normative Cloudflare deployment contract, see [spec/reference/cloudflare.md §R14](spec/reference/cloudflare.md#r14-deploying-your-own-world).
 
 ---
 
-## Local deployment (tests and single-node systems)
+## Local Net development
 
 For local dev, secrets live in `.dev.vars` (gitignored) instead of Cloudflare secret storage. Copy the example:
 
@@ -19,42 +19,43 @@ cp .dev.vars.example .dev.vars
 npm run dev
 ```
 
-The local dev server reads `.dev.vars` automatically via `tsx`/`vite`. Defaults in the example are safe for local-only experimentation.
+The local composition reads `.dev.vars`, starts the Net-only Worker under real
+workerd, installs a fresh world when needed, and puts Vite HMR in front of the
+Worker. State persists under `.woo/net-dev`. The browser and MCP therefore use
+the same Net gateway, sessions, scopes, and catalog install path as production.
+Defaults in the example are safe for local-only experimentation.
 
-For local UI login as `$wiz`, you may provide an explicit dev-only apikey:
-
-```sh
-WOO_LOCALDEV_WIZ_API_ID=localwiz
-WOO_LOCALDEV_WIZ_API_KEY=localwiz-secret
-npm run dev
-```
-
-On startup, the dev server ensures that key exists, is bound to `$wiz`,
-and prints the username/password pair for the login form. If the id
-already exists for `$wiz` with the same secret it is reused; if it exists
-for another actor or with another secret, startup fails loudly. This
-convenience exists only in `src/server/dev-server.ts`; Cloudflare
-deployments do not read these variables.
-
-By default, local development uses the persistent `.woo/dev.sqlite` file:
+To erase that local world and reinstall it explicitly:
 
 ```sh
-WOO_DB=.woo/dev.sqlite
+npm run dev -- --reset
 ```
 
-For a short-lived in-memory local DB (helpful for CI and throwaway test systems), run:
+Changing `WOO_NET_DEV_APIKEY` after the first install does not mutate the
+persisted identity. Startup verifies the configured key and fails with the
+reset instruction if it does not match.
+
+For an agent over stdio, keep `npm run dev` running and configure the process:
 
 ```sh
-WOO_DB=:memory: npm run dev
+WOO_MCP_TOKEN=apikey:local-dev:local-dev-secret npm run mcp:stdio
 ```
 
-For other local DB locations:
+`npm run smoke:mcp:stdio` starts an isolated workerd backend when no URL/token
+are supplied, or can reuse the running dev server through `WOO_MCP_URL` and
+`WOO_MCP_TOKEN`.
+
+The former Node/SQLite transport remains available only as a rollback lane:
 
 ```sh
-WOO_DB=.woo/test.sqlite npm run dev
+npm run dev:classic
+npm run mcp:stdio:classic
 ```
 
-For ephemeral world systems (no on-disk file), pass `:memory:` to `LocalSQLiteRepository`:
+Local SQLite is still a supported substrate and useful for focused tests or
+small embedded systems; it is no longer the default interactive transport.
+For an ephemeral world (no on-disk file), pass `:memory:` directly to
+`LocalSQLiteRepository`:
 
 ```ts
 import { createWorld } from "./src/core/bootstrap";
@@ -63,7 +64,7 @@ import { LocalSQLiteRepository } from "./src/server/sqlite-repository";
 const world = createWorld({ repository: new LocalSQLiteRepository(":memory:") });
 ```
 
-That mode resets when the process exits.
+That repository resets when the process exits.
 
 When you need production hosting, continue to the Cloudflare section below.
 
@@ -145,7 +146,9 @@ The v1 Worker does **not** read a seed phrase or salt object-id allocation. Seed
 
 ### `WOO_AUTO_INSTALL_CATALOGS`
 
-The local Node server leaves this unset by default, which means clone/run first-light installs every bundled catalog discovered under `catalogs/`.
+The local Net developer composition leaves this unset by default, which means
+its first install includes every bundled catalog discovered under `catalogs/`.
+The classic Node rollback server follows the same unset behavior.
 
 The Cloudflare `wrangler.toml` ships with the full demo bundle so that a fresh fork-and-deploy lands a populated world matching woah1.generalbusiness.ai:
 

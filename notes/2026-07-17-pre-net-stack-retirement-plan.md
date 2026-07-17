@@ -43,6 +43,10 @@ until the rollback contract is renounced under NC9.
 
 ## 2. Replace local development and stdio
 
+Status: implemented and validated on the `net-dev-default` worktree. The work
+also corrected Net MCP's non-standard `tools/list` envelope, which a real SDK
+client rejected, and made bounded `woo_wait` reads preserve queued remainder.
+
 Current default commands are classic compositions:
 
 - `npm run dev` starts `src/server/dev-server.ts`,
@@ -69,6 +73,13 @@ explicitly (`dev:classic`, `mcp:stdio:classic`) so they cannot masquerade as the
 primary architecture.
 
 ## 3. Re-home classic transport coverage
+
+Status: first classification, lane split, and independent Net/classic lane
+validation complete. See
+`notes/2026-07-17-classic-net-test-contract-matrix.md`. The matrix identifies
+full MCP discovery/control parity and a default-localdev browser scenario as
+remaining deletion blockers; no classic implementation or test has been
+deleted.
 
 The default suite intentionally contains many classic consumers. Deletion must
 classify tests by contract, not by import name:

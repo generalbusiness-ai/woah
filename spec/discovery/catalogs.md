@@ -237,7 +237,12 @@ Boot-time auto-install is controlled by `WOO_AUTO_INSTALL_CATALOGS` (a comma-sep
 - `WOO_AUTO_INSTALL_CATALOGS=` (empty) — clean world; operators install what they want.
 - Each entry is a catalog name resolved against `@local:<name>`.
 
-The repository's local Node server intentionally uses the **unset** case for local development: clone, run, and see the bundled demos. The repository's Cloudflare `wrangler.toml` intentionally ships with the **empty** case so fork-and-deploy operators start from a clean core world unless they opt into bundled local catalogs before deploy.
+The repository's default local Net composition intentionally uses the **unset**
+case for local development: clone, run, and see the bundled demos installed by
+the production installer. The classic Node rollback server uses the same unset
+case. The repository's Cloudflare `wrangler.toml` intentionally ships with the
+**empty** case so fork-and-deploy operators start from a clean core world unless
+they opt into bundled local catalogs before deploy.
 
 Auto-install is idempotent: if a catalog is already in `$catalog_registry`, the boot-time pass skips it without appending a no-op registry log row. Boot-time local auto-install is part of deterministic world construction, so it installs directly from the bundled manifest and records the catalog in `$catalog_registry` state without routing through `$catalog_registry:call`. Runtime catalog install/update operations are sequenced through `$catalog_registry` and audited. Runtime uninstall uses the same pattern once implemented.
 

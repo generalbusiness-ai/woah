@@ -1,207 +1,112 @@
-# Tools and actions
+# Tools and actions on Net MCP
 
-An agent acts by calling **tools**. A tool is just a verb on some
-object, projected through MCP. Discovery and invocation are the two
-operations you'll perform constantly.
+An agent discovers callable world verbs, then invokes them through the stable
+`woo_call` envelope. The current Net MCP endpoint does not publish one dynamic
+MCP tool per verb.
 
 ## Discovery: `woo_list_reachable_tools`
 
 ```
 woo_list_reachable_tools(
-  scope?: "active" | "here" | "focus" | "object" | "space" | "all",
-  object?: <object-ref>,
-  query?: <substring-filter>,
-  limit?: <int>,
-  cursor?: <string>,
-  include_schema?: <bool>
+  scope?: string,
+  limit?: int
 )
 ```
 
-Returns `{ scope, object, query, limit, cursor, next_cursor, total, tools }`.
+The current result is:
 
-| Scope | What you see |
-|---|---|
-| `active` (default) | You + active scope + inventory + other live scopes + focus list. Bounded. |
-| `here` | Active scope plus its visible contents. |
-| `focus` | Focused objects only. |
-| `object` | One reachable object (passed as `object`). |
-| `space` | One reachable space, or active scope if omitted, plus its visible contents. |
-| `all` | All directly reachable categories. Does *not* expand every space's contents — use `space` for that. |
+```json
+{
+  "tools": [
+    { "object": "the_chatroom", "verb": "look" },
+    { "object": "guest_1", "verb": "wait" }
+  ]
+}
+```
 
-Each tool descriptor includes the **canonical call form**
-`<object>:<verb>(args)`. That handle is stable even when the MCP tool
-name (a sanitized, collision-resistant alias) changes between
-sessions. If you persist any reference to a tool across sessions,
-persist the canonical form, not the MCP name.
+The gateway builds this bounded list from its current view of:
 
-## Invocation: named tool, or `woo_call`
+1. the actor;
+2. the actor's live location and the session's active scope;
+3. the current room's mirrored contents; and
+4. each object's inherited verb pages marked `direct_callable` or
+   `tool_exposed`.
 
-You can invoke a tool either by its MCP name (`the_pinboard__list_pins`)
-or by its canonical form via `woo_call`:
+The list is view-resident discovery, not an authority read or a global scan.
+An omitted page can become visible after normal closure warming. Re-list after
+movement or when a newly installed/repaired definition reaches the view.
+
+The `scope` argument is accepted for forward compatibility but Net currently
+uses the same bounded projection for every value. `limit` is capped at 500.
+Schema-rich descriptors, query/cursor paging, and focused-object projections
+remain unimplemented Net protocol contracts.
+
+## Invocation: `woo_call`
 
 ```
 woo_call(
-  object: "the_pinboard",
-  verb: "list_pins",
+  object: "the_chatroom",
+  verb: "look",
   args: []
 )
 ```
 
-Use `woo_call` whenever your tool list might be stale — for instance,
-right after the actor moved and you haven't re-listed yet. The
-gateway resolves the verb against your *current* reachable scope, so
-it never breaks just because the cached MCP name became invalid.
+`args` is a positional list of JSON Woo values. The gateway validates the
+target and verb, plans through the same client-turn machinery used by the
+browser, and submits to the owning Net scope. A successful tool result has the
+verb return value at `structuredContent.result`. A committed verb error sets
+`isError: true` and puts the structured error at
+`structuredContent.error`.
 
-`args` is a **positional list of woah values**, not a stringified
-argv. Numbers, booleans, strings, lists, maps all pass through.
+Immediate observations are not duplicated into the `woo_call` result. Live
+peer/space fanout is pulled separately through `woo_wait`; the submitter's own
+committed echo is deduplicated by its opaque echo id.
 
-## What comes back
+## Command-text round trip
 
-The tool result is shaped:
-
-```
-{
-  "content": [{ "type": "text", "text": "<one-line summary>" }],
-  "structuredContent": {
-    "result": <verb return value>,
-    "observations": [<observation>, ...],
-    "applied": { "space": <obj>, "seq": <int>, "ts": <ms> }    // sequenced calls only
-  },
-  "isError": false
-}
-```
-
-- `content[0].text` is a human-readable summary. Useful when you're
-  about to reply to a user.
-- `structuredContent.result` is the verb's actual return value.
-- `structuredContent.observations` are the events emitted by this
-  call that you (the actor) are entitled to see. (More events may
-  arrive later via `woo_wait`; this is the immediate-return slice.)
-- `structuredContent.applied` is present only for **sequenced** calls
-  (see [observations.md](observations.md)) and gives the seq/ts you
-  need for replay.
-
-## Reachability
-
-The set of reachable objects — and therefore the set of available
-tools — is the union of:
-
-1. **Self.** Your actor object. Verbs like `focus`, `wait`, `unfocus`
-   come from `$actor` and are always reachable.
-2. **Active scope.** The room or space your session is focused on. Its `look`,
-   `who`, `say`, `enter`, `go` come from here.
-3. **Active-scope contents.** Visible objects in the active scope.
-   Other actors and `$block` descendants appear here, but they're
-   projected through **obvious verbs only** — readable verbs marked
-   with command metadata. You don't get another actor's `focus` or
-   `wait`; you do get `the_cockatoo:squawk` if it's command-shaped.
-4. **Inventory.** Non-actor objects in your `contents`. After
-   `take lamp`, the lamp's verbs follow you between rooms.
-5. **Other live locations.** If the same actor has another live
-   session somewhere else, that location's verbs are reachable too.
-6. **Working set (focus list).** Objects you've explicitly added
-   with `woo_focus`. Capped (default 32 entries).
-7. **Catalog-visible singletons.** What the catalog registry exposes
-   to your actor's class/role. Wizards usually see more here than
-   ordinary actors.
-
-This is specified in [`../../spec/protocol/mcp.md §M3`](../../spec/protocol/mcp.md#m3-reachability--what-shows-up-where).
-
-## The working set: `woo_focus`
-
-The working set is how you keep an object's verbs reachable as you
-move. The classic case: you call `the_taskboard:listing()` and
-get back a list of task object refs. Those tasks aren't automatically
-reachable — they're contents of the registry, not of your current
-location. You focus the ones you care about:
+To use a room's parser without inventing target/verb routing in the agent:
 
 ```
-woo_focus(target: "#01HX...task42")
+woo_call("the_chatroom", "command_plan", ["look"])
 ```
 
-Now `task42`'s verbs (`claim`, `pass`, `release`, `yield`) join
-your tool list. They stay reachable until you `woo_unfocus(...)` or
-the entry is evicted (capped at 32, oldest evicted first).
+The returned plan contains `target`, `verb`, and `args`. Submit those fields in
+a second `woo_call`. This is the same thin-client round trip used by the Net
+browser.
 
-The focus list **persists with the actor across connections**. It's
-a property on the actor, not a session-scoped thing. You can
-introspect it via `woo_call("$me", "describe", [])` (the `focus_list`
-field) or call `$actor:focus_list()` directly.
+## Movement and reachability
 
-## Direct vs sequenced — the routing distinction
+Movement changes the actor's location and therefore discovery. After an
+`enter`, direction, or `go` call, list reachable tools again before choosing a
+location-specific verb. Net MCP does not yet send
+`notifications/tools/list_changed`.
 
-When you call a tool, the gateway picks the route from the verb's
-metadata:
-
-- **Direct** (`direct_callable: true`): live observation, no log
-  entry. Examples: `say`, `look`, `set_control`, `take`, `drop`.
-  The result returns immediately.
-- **Sequenced** (the verb is `tool_exposed` but mutating): the call
-  goes through the verb's enclosing space, gets a sequence number,
-  and lands in the durable log. Examples: `create_task`, `claim`,
-  `pass`, `transition`. The applied frame is the tool result.
-
-You don't usually need to think about which route a call takes; the
-gateway picks correctly. But sequenced calls give you back a
-`{space, seq, ts}` triple in `structuredContent.applied`, which you
-can use for replay or gap recovery. See
-[observations.md](observations.md) for what to do with that.
+Focus/unfocus remains available as ordinary actor verbs only when discovery
+marks them callable; the stable `woo_focus` and `woo_unfocus` protocol wrappers
+are not implemented on Net yet.
 
 ## Common patterns
 
-**"What can I do here?"**
+**Look around**
 
 ```
-woo_list_reachable_tools(scope: "here")
+woo_call("the_chatroom", "look", [])
 ```
 
-**"What's in my inventory?"**
+**Speak, then poll live observations**
 
 ```
-woo_call("$me", "describe", [])
-# look at result.contents
+woo_call("the_chatroom", "say", ["hello"])
+woo_wait(timeout_ms: 1000, limit: 50)
 ```
 
-**"Who else is around?"**
+**Discover again after moving**
 
 ```
-woo_call("$here", "who", [])
+woo_call("the_chatroom", "southeast", [])
+woo_list_reachable_tools(scope: "all", limit: 200)
 ```
 
-(`$here` is a corename for your active scope resolved per
-request.)
-
-**"Find a task by name from the registry and start working on it."**
-
-```
-woo_call("the_taskboard", "listing", [])
-# pick result[i].task
-woo_focus("#01HX...the-task-id")
-woo_call("#01HX...the-task-id", "claim", [])
-```
-
-**"My tool list looks stale, redo discovery."**
-
-```
-woo_list_reachable_tools(scope: "active")
-```
-
-If your client supports `notifications/tools/list_changed`, you only
-need to re-list when notified. Otherwise, re-list whenever you've
-moved, focused, or unfocused.
-
-**"Run several woocode statements as one MCP turn."** (programmer
-agents only)
-
-```
-woo_call("$me", "eval", [
-  "let t = the_taskboard:create_task(\"task\", \"foo\", \"\", [], null);\nt:claim();\nreturn t;",
-  {mode: "stmts"}
-])
-```
-
-The `eval` verb on `$programmer` compiles and runs woocode under
-your `progr`, returning the result. Cheaper than chaining individual
-`woo_call`s when the operations belong together. See
-[../designing/eval.md](../designing/eval.md). Authority: requires
-`$programmer` ancestry plus the `programmer` flag (or wizard).
+The complete target contract is
+[`../../spec/protocol/mcp.md`](../../spec/protocol/mcp.md); the current gaps are
+deletion blockers in the NC9 migration matrix, not silently retired behavior.

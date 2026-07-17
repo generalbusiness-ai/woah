@@ -33,12 +33,12 @@
 // probe DEACTIVATES the namespace before aborting — safe because
 // activation always precedes the route switch, so no traffic exists yet.
 import { readFileSync } from "node:fs";
-import { planNetInstall } from "../src/net/install";
+import { planNetInstall, type NetInstallOptions } from "../src/net/install";
 import { importIdentity, parseIdentityExport } from "../src/net/identity";
 import { CATALOG_SCOPE } from "../src/net/topology";
 import { signInternalRequest } from "../src/worker/internal-auth";
 
-type Args = {
+export type NetInstallArgs = {
   baseUrl: string;
   catalogs?: string[];
   identity?: string;
@@ -49,15 +49,19 @@ type Args = {
   skipIdentityVerify?: boolean;
   probeOnly?: boolean;
   dryRun: boolean;
+  /** Composition-only extension used by local Net development to add its
+   * deterministic dev credential. The production CLI has no flag for this:
+   * carried live identity still enters only through the export file. */
+  graft?: NetInstallOptions["graft"];
 };
 
 export function parseArgs(
   argv: string[],
   credentialEnv: { WOO_VERIFY_APIKEY?: string; WOO_VERIFY_PASSWORD?: string } = {}
-): Args {
+): NetInstallArgs {
   // Real cutover secrets come from the environment so they need not appear
   // in argv/process listings. Explicit flags remain useful for synthetic lanes.
-  const args: Args = {
+  const args: NetInstallArgs = {
     baseUrl: "",
     dryRun: false,
     verifyApikey: credentialEnv.WOO_VERIFY_APIKEY,
@@ -98,7 +102,7 @@ export async function probeNetInstall(baseUrl: string, env: { WOO_INTERNAL_SECRE
   console.log("verified: install secret reached edge and catalog scope");
 }
 
-export async function runNetInstall(args: Args, env: { WOO_INTERNAL_SECRET?: string }): Promise<void> {
+export async function runNetInstall(args: NetInstallArgs, env: { WOO_INTERNAL_SECRET?: string }): Promise<void> {
   if (args.probeOnly) {
     await probeNetInstall(args.baseUrl, env);
     console.log("net-install probe ok");
@@ -119,10 +123,16 @@ export async function runNetInstall(args: Args, env: { WOO_INTERNAL_SECRET?: str
   // activate:false — the namespace must stay INSTALLING (client traffic
   // refused) until every verification below passes; this script seeds
   // the activation cell as its last act.
+  const graft: NetInstallOptions["graft"] | undefined = identity || args.graft
+    ? async (world) => {
+        if (identity) importIdentity(world, identity);
+        await args.graft?.(world);
+      }
+    : undefined;
   const plan = await planNetInstall({
     activate: false,
     ...(args.catalogs ? { catalogs: args.catalogs } : {}),
-    ...(identity ? { graft: (world) => importIdentity(world, identity) } : {})
+    ...(graft ? { graft } : {})
   });
   const scopes = [...plan.partitions.entries()].sort(([a], [b]) => a.localeCompare(b));
   console.log(`net-install: epoch=${plan.epoch} scopes=${scopes.length} cells=${scopes.reduce((n, [, c]) => n + c.length, 0)}`);

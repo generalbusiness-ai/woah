@@ -4,14 +4,9 @@
 # These are NOT used in production deploys — for that, set Cloudflare secrets
 # via `wrangler secret put` (see DEPLOY.md).
 
-# Single-use token for claiming the $wiz binding at first auth.
-# Local default is fine for dev; production must set a high-entropy value via
-# `wrangler secret put WOO_INITIAL_WIZARD_TOKEN`.
-WOO_INITIAL_WIZARD_TOKEN=local-dev-wizard-token
-
 # HMAC key for Worker/Directory/Durable Object internal requests.
-# Local default is fine for dev; production must set a high-entropy value via
-# `wrangler secret put WOO_INTERNAL_SECRET`.
+# The checked-in Net dev composition has a local-only default; override it
+# here when exercising custom internal-auth scenarios.
 WOO_INTERNAL_SECRET=local-dev-internal-secret
 
 # Cloudflare Turnstile siteverify secret for self-service signup in Worker
@@ -19,11 +14,19 @@ WOO_INTERNAL_SECRET=local-dev-internal-secret
 # this is configured.
 # TURNSTILE_SECRET_KEY=1x0000000000000000000000000000000AA
 
-# Local SQLite database path. Created on first run.
-WOO_DB=.woo/dev.sqlite
+# Persistent workerd Durable Object state used by the default `npm run dev`.
+# WOO_NET_DEV_PERSIST=.woo/net-dev
 
-# Optional: local-only wizard login for the browser UI. If both are set,
-# `npm run dev` ensures this apikey is bound to $wiz and prints it.
+# API key carried into the Net world on its first install. The default is
+# local-only and is also the credential for `npm run mcp:stdio`.
+WOO_NET_DEV_APIKEY=apikey:local-dev:local-dev-secret
+# WOO_MCP_TOKEN=apikey:local-dev:local-dev-secret
+# WOO_MCP_URL=http://127.0.0.1:5173/net-api/mcp
+
+# Classic rollback-only settings (`npm run dev:classic`). They are not read by
+# the default Net composition.
+# WOO_DB=.woo/dev.sqlite
+# WOO_INITIAL_WIZARD_TOKEN=local-dev-wizard-token
 # WOO_LOCALDEV_WIZ_API_ID=localwiz
 # WOO_LOCALDEV_WIZ_API_KEY=localwiz-secret
 
