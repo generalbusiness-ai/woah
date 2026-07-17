@@ -4,6 +4,7 @@
 // end-to-end through world.auth, not by comparing maps.
 import { describe, expect, it } from "vitest";
 import { createWorld } from "../../src/core/bootstrap";
+import { normalizeCustomerAttribution, PROP_CUSTOMER_OF } from "../../src/net/attribution";
 import { exportIdentity, importIdentity, parseIdentityExport } from "../../src/net/identity";
 import { netInstallEpoch, planNetInstall } from "../../src/net/install";
 import { CATALOG_SCOPE } from "../../src/net/topology";
@@ -68,7 +69,7 @@ describe("identity import into a fresh install (item A + B)", () => {
     // Idempotent re-import (the migration rule): same counts, no throw,
     // and the key still authenticates.
     const again = await importIdentity(plan.world, identity);
-    expect(again).toEqual({ actors: identity.actors.length, api_keys: 1 });
+    expect(again).toEqual({ actors: identity.actors.length, api_keys: 1, unattributed: [] });
     expect(plan.world.auth(`apikey:${KEY_ID}:${KEY_SECRET}`).actor).toBe(actor);
 
     // The carried identity partitioned like any other world state: the
@@ -126,5 +127,57 @@ describe("identity import into a fresh install (item A + B)", () => {
       api_keys: { ...identity.api_keys, ghost: { hash: "h", salt: "s", actor: "obj_never_carried", label: null, created_at: 1 } }
     };
     await expect(planNetInstall({ graft: (fresh) => importIdentity(fresh, broken) })).rejects.toThrow(/dangling refs[\s\S]*obj_never_carried/);
+  });
+});
+
+describe("customer attribution seeding (audit.md AU3.1)", () => {
+  it("derives customer_of for every imported actor and partitions it to the actor's cluster", async () => {
+    const { world, actor } = oldWorld();
+    const identity = exportIdentity(world.exportWorld());
+    const plan = await planNetInstall({ graft: (fresh) => importIdentity(fresh, identity) });
+
+    // The account-bound actor attributes to its account (rule 1)...
+    const attr = normalizeCustomerAttribution(plan.world.propOrNull(actor, PROP_CUSTOMER_OF));
+    expect(attr).toEqual({ customer: "acct_1", derived_via: "account" });
+
+    // ...and the cell partitions to the actor's OWN cluster scope, the
+    // same home as its session cells (AU3.1: gateway warm serves it).
+    const cluster = plan.partitions.get(`cluster:${actor}`) ?? [];
+    const cell = cluster.find(
+      (c) => c.kind === "property_cell" && c.object === actor && c.name === PROP_CUSTOMER_OF
+    );
+    expect(cell).toBeDefined();
+    expect(normalizeCustomerAttribution(cell?.value)).toEqual({ customer: "acct_1", derived_via: "account" });
+  });
+
+  it("reports uncovered actors as unattributed instead of guessing or aborting", async () => {
+    // A synthetic plain $actor: no account, no wizard flag, not a guest —
+    // no AU3.1 rule covers it. Self-owned so the ref inventory verifies.
+    const identity = {
+      kind: "woo.identity_export.v1" as const,
+      exported_at: 0,
+      api_keys: {},
+      actors: [
+        {
+          id: "plain_actor_1",
+          parent: "$actor",
+          name: "Plain",
+          owner: "plain_actor_1",
+          flags: {},
+          props: {}
+        }
+      ]
+    };
+    const result = await importIdentity(createWorld(), identity);
+    expect(result.unattributed).toEqual(["plain_actor_1"]);
+  });
+
+  it("re-import is idempotent for attribution (no value churn)", async () => {
+    const { world } = oldWorld();
+    const identity = exportIdentity(world.exportWorld());
+    const fresh = createWorld();
+    const first = await importIdentity(fresh, identity);
+    const again = await importIdentity(fresh, identity);
+    expect(again.unattributed).toEqual(first.unattributed);
   });
 });

@@ -2,6 +2,11 @@
 // side database write. This lane proves the actor, properties, session,
 // placement relations, replay, and collision guard at the pure sequencer.
 import { describe, expect, it } from "vitest";
+import {
+  GUEST_CUSTOMER_ID,
+  normalizeCustomerAttribution,
+  PROP_CUSTOMER_OF
+} from "../../src/net/attribution";
 import { provisionGuestSubmit, type GuestTemplate } from "../../src/net/guest";
 import { ScopeSequencer } from "../../src/net/scope";
 
@@ -82,6 +87,28 @@ describe("elastic guest provisioning", () => {
       status: "rejected",
       reason: "read_version_mismatch",
       detail: { create_collision: "guest_net_collision" }
+    });
+  });
+});
+
+describe("guest attribution (audit.md AU3.1 rule 4)", () => {
+  it("mints customer_of=guest in the same commit that creates the actor", () => {
+    const planned = provisionGuestSubmit({
+      actor: "guest_net_attr",
+      session: "s_net-api-2_attr",
+      ttl_ms: 60_000,
+      now: 1_000,
+      epoch: EPOCH,
+      template: TEMPLATE
+    });
+    const write = planned.submit.transcript.writes.find(
+      (w) => w.cell.kind === "prop" && w.cell.name === PROP_CUSTOMER_OF
+    );
+    expect(write?.cell.object).toBe("guest_net_attr");
+    expect(normalizeCustomerAttribution(write?.value)).toEqual({
+      customer: GUEST_CUSTOMER_ID,
+      derived_via: "guest",
+      bound_at: 1_000
     });
   });
 });

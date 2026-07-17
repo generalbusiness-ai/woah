@@ -26,6 +26,7 @@
  */
 import type { SerializedObject, SerializedWorld } from "../core/repository";
 import type { WooWorld } from "../core/world";
+import { deriveCustomerAttribution, PROP_CUSTOMER_OF, type AttributionSource } from "./attribution";
 
 /** The §8 closed allow-list of identity properties, plus three deliberate
  * additions surfaced here rather than silently made:
@@ -220,7 +221,10 @@ function liveChainReaches(world: WooWorld, id: string, cls: string): boolean {
  * every account binding resolves, every owner resolves. Any dangling ref
  * throws — abort, not warn (§8).
  */
-export async function importIdentity(world: WooWorld, identity: IdentityExport): Promise<{ actors: number; api_keys: number }> {
+export async function importIdentity(
+  world: WooWorld,
+  identity: IdentityExport
+): Promise<{ actors: number; api_keys: number; unattributed: string[] }> {
   const exportedIds = new Set(identity.actors.map((actor) => actor.id));
   const dangling: string[] = [];
 
@@ -349,6 +353,48 @@ export async function importIdentity(world: WooWorld, identity: IdentityExport):
     }
   }
 
+  // Customer attribution (audit.md AU3.1): materialize `customer_of` on
+  // every imported actor now, while the whole account graph is in hand —
+  // the runtime never walks the graph. Derivation is the closed AU3.1
+  // rule set; setProp no-ops on equal values so re-imports stay
+  // idempotent. An uncovered actor is REPORTED, not aborted: unlike a
+  // dangling ref (a broken inventory), a missing attribution is a named
+  // pipeline gap the audit trail surfaces per-record (`unattributed`).
+  const attributionSource: AttributionSource = {
+    isa: (obj, ancestor) => liveChainReaches(world, obj, ancestor),
+    prop: (obj, name) => {
+      try {
+        return world.propOrNull(obj, name);
+      } catch {
+        return null;
+      }
+    },
+    ownerOf: (obj) => {
+      try {
+        return world.object(obj).owner;
+      } catch {
+        return null;
+      }
+    },
+    isWizard: (obj) => {
+      try {
+        return world.object(obj).flags.wizard === true;
+      } catch {
+        return false;
+      }
+    }
+  };
+  const unattributed: string[] = [];
+  for (const actor of identity.actors) {
+    if (!liveChainReaches(world, actor.id, "$actor")) continue; // verification below names it
+    const derived = deriveCustomerAttribution(attributionSource, actor.id);
+    if (derived === null) {
+      unattributed.push(actor.id);
+      continue;
+    }
+    world.setProp(actor.id, PROP_CUSTOMER_OF, derived as never);
+  }
+
   // §8 import verification — abort on ANY dangling ref.
   for (const [keyId, record] of Object.entries(identity.api_keys)) {
     const actor = (record as { actor?: unknown } | null)?.actor;
@@ -371,5 +417,5 @@ export async function importIdentity(world: WooWorld, identity: IdentityExport):
   if (dangling.length > 0) {
     throw new Error(`identity import verification failed (${dangling.length} dangling refs):\n  ${dangling.join("\n  ")}`);
   }
-  return { actors: identity.actors.length, api_keys: Object.keys(identity.api_keys).length };
+  return { actors: identity.actors.length, api_keys: Object.keys(identity.api_keys).length, unattributed };
 }

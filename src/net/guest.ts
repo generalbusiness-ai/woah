@@ -4,6 +4,7 @@
  * ordinary sequenced submit. Catalog-specific identities arrive only in
  * GuestTemplate data installed at $system.guest_template.
  */
+import { GUEST_CUSTOMER_ID, PROP_CUSTOMER_OF } from "./attribution";
 import { CellStore, cellVersion, type EpochStamp } from "./cells";
 import { sessionWriter, type SessionCellValue } from "./sessions";
 import type { CommitSubmit, ScopeHead } from "./scope";
@@ -92,6 +93,20 @@ export function provisionGuestSubmit(input: ProvisionGuestInput): ProvisionGuest
       {
         cell: { kind: "prop", object: input.actor, name: "home" },
         value: input.template.home as TranscriptWrite["value"],
+        op: "set",
+        writer
+      },
+      {
+        // AU3.1 rule 4: a freshly minted guest attributes to the
+        // distinguished guest customer (operator partition) until it
+        // binds to an account. Written here, in the same commit that
+        // creates the actor, so no guest ever exists unattributed.
+        cell: { kind: "prop", object: input.actor, name: PROP_CUSTOMER_OF },
+        value: {
+          customer: GUEST_CUSTOMER_ID,
+          derived_via: "guest",
+          bound_at: input.now
+        } as TranscriptWrite["value"],
         op: "set",
         writer
       },
