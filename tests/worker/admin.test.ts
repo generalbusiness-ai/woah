@@ -144,7 +144,7 @@ describe("/admin/purge-inactive-guests", () => {
     expect(res.status).toBe(410);
     expect(await res.json()).toMatchObject({
       error: {
-        code: "E_OBJNF",
+        code: "E_GONE",
         detail: { net: true, lifecycle: "automatic" }
       }
     });

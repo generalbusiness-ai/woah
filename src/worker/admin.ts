@@ -122,7 +122,7 @@ async function handlePurgeInactiveGuests(request: Request, env: Env): Promise<Re
     // detached-socket heuristic would add a second Net liveness authority.
     return jsonResponse({
       error: {
-        code: "E_OBJNF",
+        code: "E_GONE",
         message: "inactive guest purge is retired on Net; guest lifecycle cleanup is automatic",
         detail: { net: true, lifecycle: "automatic" }
       }

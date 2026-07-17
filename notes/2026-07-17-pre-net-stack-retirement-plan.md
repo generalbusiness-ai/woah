@@ -34,7 +34,7 @@ A literal Net port would be incorrect:
   session-liveness authority.
 
 Decision: with `WOO_NET_DEFAULT` enabled, the authenticated admin POST returns
-`410 E_OBJNF` without resolving `WOO`. Selector-off rollback deployments retain
+`410 E_GONE` without resolving `WOO`. Selector-off rollback deployments retain
 the existing signed WORLD/Directory purge. The edge-routing regression must
 fail if the Net-default request touches the classic namespace.
 

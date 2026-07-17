@@ -85,8 +85,22 @@ describe("net cutover public routing", () => {
 
     expect(response.status).toBe(410);
     expect(await response.json()).toMatchObject({
-      error: { code: "E_OBJNF", detail: { net: true, lifecycle: "automatic" } }
+      error: { code: "E_GONE", detail: { net: true, lifecycle: "automatic" } }
     });
     expect(classicTouched).toBe(false);
+  });
+
+  it("authenticates the retired Net guest purge before revealing its lifecycle", async () => {
+    const response = await worker.fetch(
+      new Request("https://woo.test/admin/purge-inactive-guests", { method: "POST" }),
+      {
+        ...env("true"),
+        ADMIN_PASSWORD: "hunter2"
+      } as unknown as Parameters<typeof worker.fetch>[1],
+      undefined
+    );
+
+    expect(response.status).toBe(401);
+    expect(response.headers.get("www-authenticate")?.toLowerCase()).toContain("basic");
   });
 });

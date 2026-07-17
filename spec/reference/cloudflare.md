@@ -931,7 +931,7 @@ and grace windows.
 
 That purge contract is **classic/v2 rollback-only**. With `WOO_NET_DEFAULT`
 enabled, authenticated `POST /admin/purge-inactive-guests` returns
-`410 E_OBJNF` and MUST NOT resolve or call the `WOO` namespace. Net session
+`410 E_GONE` and MUST NOT resolve or call the `WOO` namespace. Net session
 expiry and presence cleanup are owner-alarm driven; elastic guests retire when
 their last session expires, while pooled guests are reset under an exclusive
 claim before reuse (CO14). There is therefore no truthful Net equivalent of the
