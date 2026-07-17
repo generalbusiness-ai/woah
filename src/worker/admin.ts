@@ -9,7 +9,7 @@
 //   GET /admin/              — HTML page (HTTP Basic gated)
 //   GET /admin/series        — JSON time-series, proxies AE SQL API
 //   POST /admin/purge-inactive-guests
-//                            — operator-triggered lifecycle cleanup
+//                            — v2 rollback lifecycle cleanup; retired on Net
 //
 // Auth model: HTTP Basic, single user `admin`, password from
 // `env.ADMIN_PASSWORD`. Fails closed when the secret is unset (503).
@@ -21,6 +21,7 @@
 
 import type { Env } from "./persistent-object-do";
 import { signInternalRequest } from "./internal-auth";
+import { netDefaultEnabled } from "./net-default";
 
 const REALM = "woah-admin";
 const ADMIN_USER = "admin";
@@ -112,6 +113,20 @@ function constantTimeEqual(a: string, b: string): boolean {
 async function handlePurgeInactiveGuests(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") {
     return jsonResponse({ error: { code: "E_METHOD", message: "use POST /admin/purge-inactive-guests" } }, 405, { allow: "POST" });
+  }
+  if (netDefaultEnabled(env.WOO_NET_DEFAULT)) {
+    // This is deliberately a retirement response, not a successful no-op.
+    // Net's owner alarms reap expired sessions, elastic actors retire with
+    // their last session, and pooled seats normalize under an exclusive claim.
+    // Calling WORLD here would mutate the rollback world; recreating WORLD's
+    // detached-socket heuristic would add a second Net liveness authority.
+    return jsonResponse({
+      error: {
+        code: "E_OBJNF",
+        message: "inactive guest purge is retired on Net; guest lifecycle cleanup is automatic",
+        detail: { net: true, lifecycle: "automatic" }
+      }
+    }, 410);
   }
   if (!env.WOO_INTERNAL_SECRET) {
     return jsonResponse({ error: { code: "E_BOOTSTRAP_TOKEN_MISSING", message: "set WOO_INTERNAL_SECRET via wrangler secret put" } }, 503);

@@ -123,6 +123,33 @@ describe("/admin/purge-inactive-guests", () => {
       hostHeader: "world"
     });
   });
+
+  it("retires the classic purge on the Net default without resolving WORLD", async () => {
+    let classicTouched = false;
+    const env = envOf({
+      ADMIN_PASSWORD: "hunter2",
+      WOO_NET_DEFAULT: "true",
+      WOO: {
+        idFromName: () => {
+          classicTouched = true;
+          throw new Error("the Net-default route must not resolve the classic namespace");
+        }
+      } as unknown as DurableObjectNamespace
+    });
+
+    const res = await call(env, "/admin/purge-inactive-guests", {
+      method: "POST",
+      headers: authHeaders
+    });
+    expect(res.status).toBe(410);
+    expect(await res.json()).toMatchObject({
+      error: {
+        code: "E_OBJNF",
+        detail: { net: true, lifecycle: "automatic" }
+      }
+    });
+    expect(classicTouched).toBe(false);
+  });
 });
 
 describe("/admin/series", () => {

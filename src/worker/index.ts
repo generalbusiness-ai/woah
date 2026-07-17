@@ -15,8 +15,11 @@ import { signInternalRequest, verifyInternalRequest } from "./internal-auth";
 import { sessionActiveScopeFromRecord, wooError } from "../core/types";
 import { CATALOG_SCOPE } from "../net/topology";
 import { handleAdmin } from "./admin";
+import { netDefaultEnabled } from "./net-default";
 import { resolveNetDestination, type NetBindingsEnv } from "./net/workerd-host";
 import { parseNetGatewayShardCount, routeNetGateway } from "./net/gateway-routing";
+
+export { netDefaultEnabled } from "./net-default";
 
 export { PersistentObjectDO } from "./persistent-object-do";
 export { DirectoryDO } from "./directory-do";
@@ -38,12 +41,6 @@ const MCP_GATEWAY_SHARD_PREFIX = "mcp-gateway-";
 const DEFAULT_MCP_GATEWAY_SHARDS = 32;
 const LANDING_HOST = "woah.generalbusiness.ai";
 const WORLD_PUBLIC_HOST = "woah1.generalbusiness.ai";
-
-/** Deployment-controlled public transport switch. Wrangler vars are strings,
- * so Boolean("0") is unsafe: only explicit affirmative values enable net. */
-export function netDefaultEnabled(value: string | undefined): boolean {
-  return value === "1" || value?.toLowerCase() === "true" || value?.toLowerCase() === "on";
-}
 
 function isApiPath(pathname: string): boolean {
   return (

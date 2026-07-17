@@ -621,6 +621,13 @@ One write path per fact (CO9), concretized:
   owner through the durable relation outbox. Explicit close preserves the
   marker and prior room until this reap; a concurrent live session suppresses
   retirement. Seed-pool actors carry no marker and remain reusable in place.
+  Every pooled claim first acquires an exclusive session at the actor's cluster
+  and only then runs the install-declared reset contract, so a reused seat is
+  normalized before its bearer is exposed and cannot race another claimant.
+  Consequently Net has no detached-session guest purge: expiry is owner-alarm
+  driven, elastic actors retire automatically, and pooled actors reset under
+  the exclusive claim. Importing the classic host's socket-attachment cutoff
+  would create a second session-liveness authority and is non-conforming.
 - **Acceptance is not revoked by a failed relation expedite.** The committing
   scope durably enqueues each foreign relation fact in the same transaction as
   its accepted reply. The gateway normally delivers presence and ordered-edge

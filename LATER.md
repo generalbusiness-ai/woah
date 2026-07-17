@@ -7,6 +7,16 @@ New items go at the top.  Move to the bottom when final.
 
 ## random stuff to do
 
+- pre-Net stack retirement, in order (see
+  `notes/2026-07-17-pre-net-stack-retirement-plan.md`)
+  - replace the classic-only `npm run dev` and `npm run mcp:stdio` compositions
+    with interactive Net hosts, make those the defaults, and retain any classic
+    command only as an explicitly named rollback tool until NC9
+  - classify and re-home transport tests before deleting v2 classes: preserve
+    shared `src/core`/World/VM coverage, port distinct persistence/session/
+    cross-scope/browser-local guarantees to Net, and delete only proven
+    duplicate classic assertions
+
 - single audit/observability infrastructure for all world operations
 
 - DO stuff

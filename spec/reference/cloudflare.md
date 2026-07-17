@@ -929,6 +929,18 @@ that first registered the row. This stricter rule is limited to the operator
 recovery path; normal request/session liveness continues to use the guest TTL
 and grace windows.
 
+That purge contract is **classic/v2 rollback-only**. With `WOO_NET_DEFAULT`
+enabled, authenticated `POST /admin/purge-inactive-guests` returns
+`410 E_OBJNF` and MUST NOT resolve or call the `WOO` namespace. Net session
+expiry and presence cleanup are owner-alarm driven; elastic guests retire when
+their last session expires, while pooled guests are reset under an exclusive
+claim before reuse (CO14). There is therefore no truthful Net equivalent of the
+classic detached-socket heuristic, and the operator endpoint is retired rather
+than introducing a second liveness authority. Method and Basic-auth checks
+remain in force before the retirement response. When the deployment selector
+is off, the existing WORLD/Directory recovery route remains available for the
+rollback world.
+
 Sparse MCP session projection may include Directory-derived actor
 lineage/properties and scope presence rows as `projection` authority pages. It
 must not treat Directory's `current_location` as actor movement truth. To satisfy

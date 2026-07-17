@@ -59,4 +59,34 @@ describe("net cutover public routing", () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ label: "net", path: "/net-api/mcp" });
   });
+
+  it("does not resolve the classic world for the retired Net guest purge", async () => {
+    let classicTouched = false;
+    const selected = {
+      ...env("true"),
+      ADMIN_PASSWORD: "hunter2",
+      WOO: {
+        idFromName: () => {
+          classicTouched = true;
+          throw new Error("Net-default admin traffic reached the classic world");
+        }
+      }
+    } as unknown as Parameters<typeof worker.fetch>[1];
+    const authorization = `Basic ${Buffer.from("admin:hunter2").toString("base64")}`;
+
+    const response = await worker.fetch(
+      new Request("https://woo.test/admin/purge-inactive-guests", {
+        method: "POST",
+        headers: { authorization }
+      }),
+      selected,
+      undefined
+    );
+
+    expect(response.status).toBe(410);
+    expect(await response.json()).toMatchObject({
+      error: { code: "E_OBJNF", detail: { net: true, lifecycle: "automatic" } }
+    });
+    expect(classicTouched).toBe(false);
+  });
 });
