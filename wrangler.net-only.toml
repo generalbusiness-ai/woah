@@ -27,6 +27,14 @@ class_name = "NetScopeDO"
 name = "GATEWAY_NET"
 class_name = "NetGatewayDO"
 
+[[durable_objects.bindings]]
+name = "AUDIT_NET"
+class_name = "NetAuditDO"
+
 [[migrations]]
 tag = "net-only-v1"
 new_sqlite_classes = ["NetGatewayDO", "NetScopeDO"]
+
+[[migrations]]
+tag = "cf-do-0007"
+new_sqlite_classes = [ "NetAuditDO" ]

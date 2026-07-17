@@ -81,6 +81,11 @@ export type NetBindingsEnv = WorkerdHostEnv & {
   NET_RESOLVE?: (destination: string) => NetStub;
   SCOPE_NET?: NetNamespace;
   GATEWAY_NET?: NetNamespace;
+  /** Audit shard namespace (audit.md AU6; `audit:<shard>` destinations). */
+  AUDIT_NET?: NetNamespace;
+  /** Bounded audit shard count. Absent/0 → the audit lane is disabled
+   * (scopes enqueue nothing) — lanes without the binding stay green. */
+  NET_AUDIT_SHARDS?: string;
 };
 
 /** destination = "<kind>:<name>". Shared by NetGatewayDO and NetScopeDO
@@ -91,7 +96,8 @@ export function resolveNetDestination(env: NetBindingsEnv, destination: string):
   const split = destination.indexOf(":");
   const kind = split === -1 ? destination : destination.slice(0, split);
   const name = split === -1 ? "" : destination.slice(split + 1);
-  const namespace = kind === "scope" ? env.SCOPE_NET : kind === "gateway" ? env.GATEWAY_NET : undefined;
+  const namespace =
+    kind === "scope" ? env.SCOPE_NET : kind === "gateway" ? env.GATEWAY_NET : kind === "audit" ? env.AUDIT_NET : undefined;
   if (!namespace || !name) {
     throw new Error(`cannot resolve rpc destination ${destination}`);
   }

@@ -16,6 +16,7 @@ import { resolveNetDestination, type NetBindingsEnv } from "./net/workerd-host";
 
 export { NetGatewayDO } from "./net/gateway-do";
 export { NetScopeDO } from "./net/scope-do";
+export { NetAuditDO } from "./net/audit-do";
 
 // AdminEnv carries only operator secrets + Analytics Engine vars; the dashboard
 // needs no WORLD binding (its live routes hit AE directly and the classic guest

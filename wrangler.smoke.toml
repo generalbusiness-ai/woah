@@ -98,6 +98,14 @@ class_name = "NetScopeDO"
 name = "GATEWAY_NET"
 class_name = "NetGatewayDO"
 
+# Audit shards (spec/operations/audit.md AU6): bounded fleet addressed
+# audit:<shard>, sharded by customer partition. NET_AUDIT_SHARDS gates
+# the whole lane — unset/0 disables enqueue (owner decision to enable
+# in production; smoke lanes exercise it).
+[[durable_objects.bindings]]
+name = "AUDIT_NET"
+class_name = "NetAuditDO"
+
 [[kv_namespaces]]
 binding = "HOST_SEED_KV"
 # id is ignored in local mode (wrangler dev --local uses a local KV store);
@@ -123,3 +131,7 @@ new_sqlite_classes = [ "NetGatewayDO", "NetScopeDO" ]
 [[migrations]]
 tag = "cf-do-0005"
 deleted_classes = [ "CommitScopeDO", "DirectoryDO", "PersistentObjectDO" ]
+
+[[migrations]]
+tag = "cf-do-0007"
+new_sqlite_classes = [ "NetAuditDO" ]

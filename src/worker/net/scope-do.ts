@@ -77,8 +77,14 @@
  * the standing v2 freeze continues, nothing routes production traffic
  * here until Phase 5.
  */
-import { normalizeScopeAttribution, type Principal } from "../../net/attribution";
-import { parseTraceparent, type TraceContext } from "../../net/trace";
+import { normalizePrincipal, normalizeScopeAttribution, type Principal } from "../../net/attribution";
+import {
+  auditShardFor,
+  mintAdoptionAuditRecord,
+  mintCommitAuditRecords,
+  type RoutedAuditRecord
+} from "../../net/audit";
+import { normalizeTraceContext, parseTraceparent, type TraceContext } from "../../net/trace";
 import type { Cell } from "../../net/cells";
 import { cellKey, lineageClosureKeys, serializeTransfer, type CellTransfer } from "../../net/cells";
 import { isNetError, netError } from "../../net/errors";
@@ -130,7 +136,7 @@ type RelateDestinations = Record<string, { destination: string; objects: string[
  * destination carrying several cannot collide row ids, and adoption/
  * relation/planner delivery cannot be held behind a slow subscriber (or
  * vice versa). */
-type OutboxRoute = "/fanout" | "/adopt" | "/relate" | "/plan-scheduled";
+type OutboxRoute = "/fanout" | "/adopt" | "/relate" | "/plan-scheduled" | "/audit";
 
 /** Subscriber roles (CO16): `fanout` receives /net/fanout deliveries;
  * `planner` registers a planner gateway that executes scheduled turns
@@ -143,6 +149,11 @@ type SubscriberRole = "fanout" | "planner";
  * src/net/outbox.ts FanoutBody type stays unchanged (Outbox carries the
  * body opaquely and the JSON round-trip through net_scope_outbox keeps
  * the field). */
+/** The /audit outbox body (AU6.1): FanoutBody plus the routed records
+ * for one shard destination. Same extra-field-only carry as the other
+ * lane bodies; `cells`/`observations` stay empty (audit is record-only). */
+type AuditOutboxBody = FanoutBody & { audit_records: RoutedAuditRecord[] };
+
 type AdoptOutboxBody = FanoutBody & {
   prior_versions?: Record<string, string>;
   /** AU3.2/AU2/AU1: the originating turn's attribution, trace context,
@@ -413,7 +424,7 @@ const SESSION_ALARM_KEY = "session-reap";
 const OUTBOX_BACKOFF_MS = (attempt: number): number => Math.min(30_000, 250 * 2 ** (attempt - 1));
 
 /** The outbox's route lanes, in drain order (matches OutboxRoute). */
-const OUTBOX_ROUTES = ["/fanout", "/adopt", "/relate", "/plan-scheduled"] as const;
+const OUTBOX_ROUTES = ["/fanout", "/adopt", "/relate", "/plan-scheduled", "/audit"] as const;
 
 /** Phase-3 drain bounds: one pass touches at most LANES_PER_PASS due
  * destinations per route and ROWS_PER_LANE rows per destination (a lane
@@ -818,6 +829,9 @@ export class NetScopeDO {
           seq: number;
           cells: Cell[];
           prior_versions?: Record<string, string>;
+          principal?: unknown;
+          trace?: unknown;
+          cause?: unknown;
         };
         const adopted = this.adopt(body);
         // A non-empty adoption enqueued fanout rows. Continue from a
@@ -1862,6 +1876,23 @@ export class NetScopeDO {
     riderPriors: Map<string, string>,
     relateDestinations: RelateDestinations
   ): void {
+    // AU1.1/AU6.1: the audit records are minted IN the commit transaction
+    // (this method runs inside the /submit mutation transaction), so a
+    // turn cannot commit without its records and a crash between commit
+    // and drain redelivers rather than loses. The lane drains
+    // independently of fanout — a dead audit sink never blocks delivery
+    // (CO2.7 lane independence).
+    this.enqueueAuditRecords(
+      mintCommitAuditRecords({
+        submit,
+        head: reply.head,
+        scopeAttribution: seq.scopeAttribution(),
+        now: this.host.now()
+      }),
+      seq.scope,
+      reply.head.seq
+    );
+
     const observations = (submit.transcript.observations ?? []) as unknown[];
     const subscribers = sqlRows<{ destination: string; delivery_seq: number }>(
       this.state.storage.sql.exec("SELECT destination, delivery_seq FROM net_scope_subscribers WHERE role = 'fanout'")
@@ -2004,12 +2035,39 @@ export class NetScopeDO {
    * scan (which would reintroduce O(backlog) work per drain). */
   private outboxEnqueuedTotal = 0;
 
-  private persistOutboxRow(route: OutboxRoute, destination: string, body: FanoutBody): void {
+  /** AU6.1/AU6.2: group routed records by shard destination and enqueue
+   * one durable /audit row per shard. Callers run inside the mutation
+   * transaction, so records commit or roll back with the event they
+   * describe. `idSuffix` distinguishes adoption-minted rows from the
+   * commit-minted row at the same owner seq. */
+  private enqueueAuditRecords(
+    routed: RoutedAuditRecord[],
+    scope: string,
+    seq: number,
+    idSuffix = ""
+  ): void {
+    if (routed.length === 0) return;
+    const shardCount = Number(this.env.NET_AUDIT_SHARDS ?? 0);
+    if (!Number.isFinite(shardCount) || shardCount <= 0) return; // audit sink not configured (lanes without a shard binding)
+    const byDestination = new Map<string, RoutedAuditRecord[]>();
+    for (const entry of routed) {
+      const destination = `audit:${auditShardFor(entry.partition, shardCount)}`;
+      const bucket = byDestination.get(destination) ?? [];
+      bucket.push(entry);
+      byDestination.set(destination, bucket);
+    }
+    for (const [destination, records] of byDestination) {
+      const body: AuditOutboxBody = { scope, seq, cells: [], observations: [], audit_records: records };
+      this.persistOutboxRow("/audit", destination, body, idSuffix);
+    }
+  }
+
+  private persistOutboxRow(route: OutboxRoute, destination: string, body: FanoutBody, idSuffix = ""): void {
     this.outboxEnqueuedTotal += 1;
     this.state.storage.sql.exec(
       "INSERT INTO net_scope_outbox (route, id, destination, body, status, attempts, last_attempt_at_ms, scope, seq, next_attempt_at_ms) VALUES (?, ?, ?, ?, 'pending', 0, NULL, ?, ?, 0) ON CONFLICT(route, id) DO NOTHING",
       route,
-      `${destination}/${body.scope}/${body.seq}`,
+      `${destination}/${body.scope}/${body.seq}${idSuffix}`,
       destination,
       JSON.stringify(body),
       body.scope,
@@ -2208,7 +2266,13 @@ export class NetScopeDO {
                 seq: adoptBody.seq,
                 cells: adoptBody.cells,
                 // The pre-commit observations for the owner's CAS (fix 1).
-                ...(adoptBody.prior_versions !== undefined ? { prior_versions: adoptBody.prior_versions } : {})
+                ...(adoptBody.prior_versions !== undefined ? { prior_versions: adoptBody.prior_versions } : {}),
+                // AU3.2/AU2/AU1: attribution + citation ride to the owner
+                // so its adoption commit can mint the resource-owner
+                // audit record (and only that).
+                ...(adoptBody.principal !== undefined ? { principal: adoptBody.principal } : {}),
+                ...(adoptBody.trace !== undefined ? { trace: adoptBody.trace } : {}),
+                ...(adoptBody.cause !== undefined ? { cause: adoptBody.cause } : {})
               });
             } else if (route === "/relate") {
               // CO13: the row's FanoutBody carries the deltas; the wire
@@ -2244,6 +2308,15 @@ export class NetScopeDO {
                 scheduled_turn: schedBody.scheduled_turn,
                 scope: schedBody.scope,
                 catalog_epoch: schedBody.catalog_epoch
+              });
+            } else if (route === "/audit") {
+              // AU6.2: at-least-once append; the shard no-ops on
+              // (partition, idempotency), so redelivery is harmless.
+              const auditBody = row.body as AuditOutboxBody;
+              await this.host.rpc(row.destination, "/audit-append", {
+                from_scope: auditBody.scope,
+                seq: auditBody.seq,
+                records: auditBody.audit_records
               });
             } else {
               await this.host.rpc(row.destination, "/fanout", row.body);
@@ -2452,6 +2525,9 @@ export class NetScopeDO {
     seq: number;
     cells: Cell[];
     prior_versions?: Record<string, string>;
+    principal?: unknown;
+    trace?: unknown;
+    cause?: unknown;
   }): {
     applied: boolean;
     installed: number;
@@ -2517,6 +2593,31 @@ export class NetScopeDO {
               observations: []
             });
           }
+        }
+        // AU1: the adoption commit mints ONLY the resource-owner audit
+        // record (the originating commit already minted the acting one).
+        // Shape-guarded carried fields; a malformed carry degrades to an
+        // unattributed owner record, never a lost adoption.
+        const carriedCause =
+          body.cause !== null && typeof body.cause === "object" && !Array.isArray(body.cause)
+            ? (body.cause as { scope?: unknown; seq?: unknown })
+            : null;
+        const adoptionRecord = mintAdoptionAuditRecord({
+          ownerScope: seq.scope,
+          ownerAttribution: seq.scopeAttribution(),
+          ownerSeq: result.head.seq,
+          ownerHead: result.head.hash,
+          principal: normalizePrincipal(body.principal),
+          trace: normalizeTraceContext(body.trace),
+          cause:
+            carriedCause && typeof carriedCause.scope === "string" && typeof carriedCause.seq === "number"
+              ? { scope: carriedCause.scope, seq: carriedCause.seq }
+              : { scope: body.from_scope, seq: body.seq },
+          subjects: [...new Set(body.cells.map((cell) => cell.object))].sort(),
+          now: this.host.now()
+        });
+        if (adoptionRecord !== null) {
+          this.enqueueAuditRecords([adoptionRecord], seq.scope, result.head.seq, ":adopt");
         }
       }
       this.state.storage.sql.exec(

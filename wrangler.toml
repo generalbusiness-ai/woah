@@ -154,6 +154,14 @@ class_name = "NetScopeDO"
 name = "GATEWAY_NET"
 class_name = "NetGatewayDO"
 
+# Audit shards (spec/operations/audit.md AU6): bounded fleet addressed
+# audit:<shard>, sharded by customer partition. NET_AUDIT_SHARDS gates
+# the whole lane — unset/0 disables enqueue (owner decision to enable
+# in production; smoke lanes exercise it).
+[[durable_objects.bindings]]
+name = "AUDIT_NET"
+class_name = "NetAuditDO"
+
 # KV-fronted host-seed cache. WORLD writes (host, digest, seed_bytes)
 # tuples on every host-seed build; cold satellites read from KV via a
 # Worker route before falling back to WORLD's DO. Per-region cached at
@@ -239,3 +247,10 @@ new_sqlite_classes = [ "NetGatewayDO", "NetScopeDO" ]
 [[migrations]]
 tag = "cf-do-0005"
 deleted_classes = [ "CommitScopeDO", "DirectoryDO", "PersistentObjectDO" ]
+
+# NetAuditDO joined AFTER the NC9 class deletions claimed cf-do-0005 —
+# migration history is append-only, so the audit shard takes the next
+# free tag (0006 is the historical CommitScopeDO create above).
+[[migrations]]
+tag = "cf-do-0007"
+new_sqlite_classes = [ "NetAuditDO" ]

@@ -41,6 +41,10 @@ class_name = "NetScopeDO"
 name = "GATEWAY_NET"
 class_name = "NetGatewayDO"
 
+[[durable_objects.bindings]]
+name = "AUDIT_NET"
+class_name = "NetAuditDO"
+
 [[kv_namespaces]]
 binding = "HOST_SEED_KV"
 id = "CANARY_HOST_SEED_KV_ID"
@@ -64,3 +68,7 @@ new_sqlite_classes = ["CommitScopeDO"]
 [[migrations]]
 tag = "cf-do-0004"
 new_sqlite_classes = ["NetGatewayDO", "NetScopeDO"]
+
+[[migrations]]
+tag = "cf-do-0007"
+new_sqlite_classes = [ "NetAuditDO" ]
