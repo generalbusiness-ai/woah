@@ -46,7 +46,7 @@ the target for runtime-created objects, but it is not active in v1.
 | `$actor` | class | `$root` | `$wiz` | — | Defines `features`, `features_version`, `focus_list` | `:add_feature(f)`, `:remove_feature(f)`, `:has_feature(f)`, `:huh(text,reason?,source?)`, `:wait(timeout_ms?,limit?)`, `:focus(target)`, `:unfocus(target)`, `:focus_list()` | Base class for principals that originate messages and carry actor-scoped features and MCP focus state. |
 | `$player` | class | `$actor` | `$wiz` | — | Defines `home` | `:on_disfunc()`, `:moveto(target)`, `:tell(text)`, `:tell_lines(lines)`, `:help(topic?)`, `:who_all(names?)`, `:join_player(name)`, `:ways(room?)`, `:examine_detailed(name)` | Session-capable actor class for humans, agents, and tools connected over the wire. |
 | `$wiz` | instance/class | `$player` | `$wiz` | wizard, programmer | Inherits player state; owns the seed graph | Inherits player/actor/root verbs | Seed administrator player used to bootstrap, inspect, and repair code, schema, and seeded objects. |
-| `$guest` | class | `$player` | `$wiz` | — | Inherits player state | Overrides `:on_disfunc()` | Reusable temporary player class. Guest instances bind to short-lived sessions and return to the free pool on reap. |
+| `$guest` | class | `$player` | `$wiz` | — | Inherits player state | Overrides `:on_disfunc(destination?)` | Reusable temporary player class. Guest instances bind to short-lived sessions and return to the free pool on reap. |
 | `$account` | class | `$root` | `$wiz` | — | Defines credential, actor-binding, quota, and lifecycle properties | Inherits root verbs | Credential record class. Accounts are not actors; `$human.account` points at one account, and agent quotas live there. |
 | `$human` | class | `$player` | `$wiz` | — | Defines `account` | Agent self-service verbs | Credentialed human actor class. Humans authenticate through their account and can provision owned `$agent` actors. |
 | `$agent` | class | `$player` | `$wiz` | — | Defines API-key, profile, purpose, scope, and lifecycle properties | Inherits player/actor/root verbs | Programmatic actor class for API-key-authenticated tools and service identities. |
@@ -157,7 +157,7 @@ Session lifecycle is **not** carried on the player. Live session data lives only
 
 ### B2.8 `$guest` verbs
 
-`$guest:on_disfunc()` overrides the default to reset state per [identity.md §I6.4](identity.md#i64-guest-reset-the-on_disfunc-convention): eject inventory to each item's `home` (or the disconnect room, then the guest home), move the guest to `home` (or `$nowhere`), clear `description`/`aliases`/`features`, and return to the free pool via `$system:return_guest(this)`.
+`$guest:on_disfunc(destination?)` overrides the default to reset state per [identity.md §I6.4](identity.md#i64-guest-reset-the-on_disfunc-convention): eject inventory to each item's `home` (or the disconnect room, then the guest home), move the guest to the trusted cleanup destination when supplied or otherwise `home`/`$nowhere`, clear `description`/`aliases`/`features`, and return to the free pool via `$system:return_guest(this)`.
 
 ### B2.9 `$account` properties
 

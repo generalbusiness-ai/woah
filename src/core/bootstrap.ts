@@ -1222,7 +1222,14 @@ function seedUniversal(world: WooWorld): void {
     aliases: ["?", "info", "information", "@help"],
     argSpec: { args: ["topic?"], command: { dobj: "any", prep: "any", iobj: "any", args_from: ["argstr"] } }
   });
-  native(world, "$guest", "on_disfunc", "guest_on_disfunc", "verb :on_disfunc() r { ... }", { perms: "r" });
+  // Net session cleanup runs this through a trusted direct maintenance turn.
+  // It remains non-tool-exposed, and `r` plus the native handler still denies
+  // ordinary guests; only the object's owner/wizard can execute the reset.
+  native(world, "$guest", "on_disfunc", "guest_on_disfunc", "verb :on_disfunc(target?) r { ... }", {
+    perms: "r",
+    directCallable: true,
+    argSpec: { args: ["target?"] }
+  });
   native(world, "$system", "return_guest", "return_guest", "verb :return_guest(guest) r { ... }", { perms: "r" });
   native(world, "$system", "set_object_flags", "set_object_flags", "verb :set_object_flags(target, flags) rxd { /* native: wizard-only flag mutation. flags is a map; allowed keys: wizard, programmer, fertile. Returns the resulting flags. Required for the auth.md A11 \"mint a backup wizard\" flow. */ }", { directCallable: true, perms: "rxd", argSpec: { args: ["target", "flags"] } });
   native(world, "$system", "mint_session_for", "mint_session_for", "verb :mint_session_for(actor) rxd { /* native: wizard-only. Creates a fresh bearer session bound to the named actor and returns {id, actor, expires_at, token_class}. Use the returned session id with `Authorization: Session <id>` to act as that actor. Audited as a wizard_action. */ }", { directCallable: true, perms: "rxd", argSpec: { args: ["actor"] } });

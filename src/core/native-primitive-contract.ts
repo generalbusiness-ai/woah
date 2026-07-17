@@ -68,6 +68,35 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     },
     note: "Player movement is transcript-safe through movetoActorChecked, which records physical location and session-scope presence transitions."
   },
+  guest_on_disfunc: {
+    kind: "woo.native_primitive_contract.shadow.v1",
+    handler: "guest_on_disfunc",
+    version: 1,
+    transcript: "tracked",
+    deterministic: true,
+    reads: [
+      "guest ancestry",
+      "guest.home",
+      "optional reset destination",
+      "guest.location",
+      "guest.contents",
+      "carried-item home and location",
+      "reset destination existence",
+      "container contents projections",
+      "guest.features_version"
+    ],
+    writes: [
+      "carried-item location",
+      "guest.location",
+      "container.contents",
+      "guest.description",
+      "guest.aliases",
+      "guest.features",
+      "guest.features_version"
+    ],
+    emits: ["object_move", "cell_write"],
+    note: "Guest reset is transcript-safe because inventory ejection and actor placement use recorded movement, while every durable reset field uses recorded property writes. The optional destination is a trusted cleanup override; omitted calls retain home/$nowhere behavior. returnGuest only updates the classic runtime's in-memory allocator and is a no-op while a live exclusive session owns the actor."
+  },
   thing_moveto: {
     kind: "woo.native_primitive_contract.shadow.v1",
     handler: "thing_moveto",

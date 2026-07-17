@@ -2348,9 +2348,15 @@ export class NetGatewayDO {
     const payload = poolCell?.value as { value?: unknown } | undefined;
     const pool = Array.isArray(payload?.value) ? payload.value.filter((id): id is string => typeof id === "string") : [];
     const template = this.elasticGuestTemplate();
-    if (pool.length === 0 && template === null) {
+    if (template === null) {
       return json(
-        { error: { code: "E_RATE", message: "no guest pool is installed in this world", detail: { reason: "guest_pool_missing" } } },
+        {
+          error: {
+            code: "E_RETRY",
+            message: "guest entry is unavailable until its reset template is repaired",
+            detail: { reason: "guest_template_missing", pool_size: pool.length }
+          }
+        },
         503
       );
     }
@@ -2369,12 +2375,13 @@ export class NetGatewayDO {
       for (const { actor, session } of candidates) {
         if (!session) continue;
         if (validateSessionCell(this.ensureView().get(sessionCellKey(session)), this.host.now(), actor) !== "ok") continue;
-        return await this.clientSession(actor, body, identity.epoch, {
+        const response = await this.clientSession(actor, body, identity.epoch, {
           exclusive: true,
           session,
           issuedAt: claim.issuedAt,
           ttlMs
         });
+        return await this.normalizePooledGuestEntry(actor, template.initial_room, response, identity.epoch);
       }
     }
     for (const { actor, session } of candidates) {
@@ -2383,18 +2390,128 @@ export class NetGatewayDO {
         ...(session ? { session, issuedAt: claim?.issuedAt, ttlMs } : {})
       });
       if (response.status === 409) continue; // occupied — try the next pool actor
-      return response;
+      return await this.normalizePooledGuestEntry(actor, template.initial_room, response, identity.epoch);
     }
-    if (template !== null) return await this.clientElasticGuest(identity.epoch, template, claim, ttlMs);
-    return json(
-      { error: { code: "E_RATE", message: "all guest actors are in use; try again later", detail: { reason: "guest_pool_exhausted", pool_size: pool.length } } },
-      503
-    );
+    return await this.clientElasticGuest(identity.epoch, template, claim, ttlMs);
   }
 
-  /** Parse the install-owned template strictly. A malformed template is
-   * treated as absent: catalog data must never smuggle partial identity
-   * into an authority commit. */
+  /**
+   * Reused pool actors are durable objects, so their physical location can
+   * outlive the session that moved them. Exclusive minting must happen first
+   * (otherwise two claims could race one actor); once this caller owns the
+   * seat, run the guest's tracked reset at actor authority to clear inventory
+   * and mutable profile state and restore its declared initial room. A second,
+   * sequenced no-op `moveto` is needed only when the newly minted session's
+   * active scope was the stale room: that updates session presence after the
+   * reset's physical move. Pulling through actor authority throughout keeps
+   * location, contents projections, and presence convergent for seats left
+   * stale by deployments that only retracted sessions.
+   */
+  private async normalizePooledGuestEntry(
+    actor: string,
+    initialRoom: string,
+    response: Response,
+    epoch: string
+  ): Promise<Response> {
+    if (response.status !== 200) return response;
+    const payload = await response.clone().json() as {
+      session?: unknown;
+      active_scope?: unknown;
+      [key: string]: unknown;
+    };
+    const session = typeof payload.session === "string" ? payload.session : null;
+    if (!session) return response;
+
+    try {
+      const actorScope = await this.clientPlanningScope(actor, actor);
+      const refreshActor = async (): Promise<string | null> => {
+        await this.pullTargeted(actorScope, `scope:${actorScope}`, [actor]);
+        const live = this.ensureView().get(cellKey("object_live", actor))?.value as
+          | { location?: unknown }
+          | undefined;
+        return typeof live?.location === "string" ? live.location : null;
+      };
+      const initialRoomScope = await this.clientPlanningScope(initialRoom, actor);
+      await this.pullTargeted(initialRoomScope, `scope:${initialRoomScope}`, [initialRoom]);
+      // Pull the actor AFTER the destination so an old room projection cannot
+      // overwrite its authoritative location in the planning image.
+      const before = await refreshActor();
+      if (!before) throw new Error("guest reset could not resolve the actor's authoritative location");
+      // Always submit the deterministic reset, even when the actor is already
+      // in the initial room: description, features, and inventory can still
+      // leak. A response-lost retry replays the same reset idempotency key.
+      const currentScope = await this.clientPlanningScope(before, actor);
+      await this.pullTargeted(currentScope, `scope:${currentScope}`, [before]);
+      await refreshActor();
+      const resetKey = `guest-reset:${session}`;
+      const reset = await this.turn({
+        call: {
+          kind: "woo.turn_call.shadow.v1",
+          id: resetKey,
+          route: "direct",
+          scope: before,
+          actor: "$wiz",
+          target: actor,
+          verb: "on_disfunc",
+          args: [initialRoom]
+        },
+        planningScope: currentScope,
+        catalog_epoch: epoch,
+        idempotency_key: resetKey
+      });
+      if (reset.reply.status !== "accepted" || reset.error !== undefined) {
+        throw new Error(`guest reset rejected: reply=${JSON.stringify(reset.reply)} error=${JSON.stringify(reset.error ?? null)}`);
+      }
+      const resetLocation = await refreshActor();
+      if (resetLocation !== initialRoom) {
+        throw new Error(`guest reset left actor at ${String(resetLocation)}`);
+      }
+
+      if (payload.active_scope === initialRoom) return json({ ...payload, active_scope: initialRoom });
+
+      const key = `guest-entry:${session}:${initialRoom}`;
+      const result = await this.turn({
+        call: {
+          kind: "woo.turn_call.shadow.v1",
+          id: key,
+          route: "sequenced",
+          scope: initialRoom,
+          session,
+          actor,
+          target: actor,
+          verb: "moveto",
+          args: [initialRoom]
+        },
+        planningScope: initialRoomScope,
+        catalog_epoch: epoch,
+        idempotency_key: key
+      });
+      if (result.reply.status === "accepted" && result.error === undefined) {
+        const after = await refreshActor();
+        if (after !== initialRoom) {
+          throw new Error(`guest entry turn left actor at ${String(after)}: ${JSON.stringify(result.result ?? null)}`);
+        }
+        return json({ ...payload, active_scope: initialRoom });
+      }
+      throw new Error(
+        `guest entry turn rejected: reply=${result.reply.status} error=${JSON.stringify(result.error ?? null)}`
+      );
+    } catch (err) {
+      // Do not strand an exclusively claimed pool seat when its mandatory
+      // reset fails. Closing is best-effort here; the named retry response
+      // prevents the browser from entering with another user's room state.
+      await this.clientSessionClose(actor, session, epoch).catch(() => undefined);
+      this.metric({ kind: "net_guest_entry_normalize", actor, room: initialRoom, status: "error", error: String(err) });
+      return json(
+        { error: { code: "E_RETRY", message: "guest entry could not restore its initial room; retry", detail: { reason: "guest_entry_normalize" } } },
+        503
+      );
+    }
+  }
+
+  /** Parse the install-owned template strictly. A malformed template makes
+   * guest admission fail closed: catalog data must neither smuggle partial
+   * identity into an authority commit nor bypass mandatory pooled-seat reset. */
   private elasticGuestTemplate(): GuestTemplate | null {
     const cell = this.ensureView().get(cellKey("property_cell", "$system", "guest_template"));
     const template = (cell?.value as { value?: unknown } | undefined)?.value;

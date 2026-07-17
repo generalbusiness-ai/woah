@@ -37,7 +37,7 @@ function netState(name: string) {
   };
 }
 
-async function closeStates(states: Array<ReturnType<typeof netState>>): Promise<void> {
+async function settleStates(states: Array<ReturnType<typeof netState>>): Promise<void> {
   // One DO's drain calls another DO and can schedule work there after that
   // peer looked idle. Quiesce the whole fake namespace before closing any
   // database; per-DO concurrent teardown races the cross-DO outbox.
@@ -46,6 +46,10 @@ async function closeStates(states: Array<ReturnType<typeof netState>>): Promise<
     if (pending.length === 0) break;
     await Promise.allSettled(pending);
   }
+}
+
+async function closeStates(states: Array<ReturnType<typeof netState>>): Promise<void> {
+  await settleStates(states);
   for (const state of states) state.close();
 }
 
@@ -68,7 +72,7 @@ async function encodePassword(password: string): Promise<string> {
   return `pbkdf2-sha256:${iterations}:${salt}:${digest}`;
 }
 
-async function buildDoorHarness() {
+async function buildDoorHarness(options: { omitGuestTemplate?: boolean } = {}) {
   // The OLD world: one human actor bound to an account with a REAL
   // password hash (actor-side binding only — primary_actor is NOT
   // carried by §8; the import must rebuild it), plus an apikey.
@@ -111,7 +115,14 @@ async function buildDoorHarness() {
     const request = new Request("https://do/net/seed", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ scope, catalog_epoch: plan.epoch, cells, relations: plan.relations.get(scope) ?? [] })
+      body: JSON.stringify({
+        scope,
+        catalog_epoch: plan.epoch,
+        cells: options.omitGuestTemplate
+          ? cells.filter((cell) => !(cell.kind === "property_cell" && cell.object === "$system" && cell.name === "guest_template"))
+          : cells,
+        relations: plan.relations.get(scope) ?? []
+      })
     });
     const seeded = await instance.fetch(await signInternalRequest(scopeEnv, request));
     expect(seeded.ok, `seed ${scope}`).toBe(true);
@@ -140,10 +151,28 @@ async function buildDoorHarness() {
     return { status: response.status, body: (await response.json()) as Record<string, unknown> };
   };
 
-  return { plan, human, api, close: async () => closeStates(states) };
+  return {
+    plan,
+    human,
+    api,
+    settle: async () => settleStates(states),
+    close: async () => closeStates(states)
+  };
 }
 
 describe("the identity door (/net-api/login, /net-api/guest, session bearers)", () => {
+  it("fails guest admission closed when the install-owned reset template is absent", async () => {
+    const h = await buildDoorHarness({ omitGuestTemplate: true });
+
+    const claim = await h.api("POST", "/net-api/guest", { body: {} });
+    expect(claim.status).toBe(503);
+    expect(claim.body).toMatchObject({
+      error: { code: "E_RETRY", detail: { reason: "guest_template_missing" } }
+    });
+
+    await h.close();
+  }, 30_000);
+
   it("a carried account password logs in, the session is a bearer for the whole surface, and failures share one message", async () => {
     const h = await buildDoorHarness();
 
@@ -452,6 +481,33 @@ describe("the identity door (/net-api/login, /net-api/guest, session bearers)", 
     const seat = first.body.actor as string;
     const session = first.body.session as string;
 
+    // Leave durable actor state somewhere other than the install-declared
+    // guest room. Closing releases only the session row; the next claim must
+    // normalize this reused seat before exposing it to a different person.
+    const moved = await h.api("POST", "/net-api/turn", {
+      token: `session:${session}`,
+      body: {
+        target: "the_chatroom",
+        verb: "southeast",
+        args: [],
+        idempotency_key: "door-reused-seat-move"
+      }
+    });
+    expect(moved.status, JSON.stringify(moved.body).slice(0, 300)).toBe(200);
+    expect((moved.body.reply as { status?: string }).status).toBe("accepted");
+    expect((moved.body.result as { room?: string }).room).toBe("the_deck");
+    const described = await h.api("POST", "/net-api/turn", {
+      token: `session:${session}`,
+      body: {
+        target: seat,
+        verb: "set_description",
+        args: ["private prior-user description"],
+        idempotency_key: "door-reused-seat-description"
+      }
+    });
+    expect(described.status, JSON.stringify(described.body).slice(0, 300)).toBe(200);
+    expect((described.body.reply as { status?: string }).status).toBe("accepted");
+
     // Occupied while held: the exclusive guard hands the NEXT claim a
     // different seat.
     const second = await h.api("POST", "/net-api/guest", { body: {} });
@@ -469,6 +525,18 @@ describe("the identity door (/net-api/login, /net-api/guest, session bearers)", 
     const reclaimed = await h.api("POST", "/net-api/guest", { body: {} });
     expect(reclaimed.status, JSON.stringify(reclaimed.body).slice(0, 200)).toBe(200);
     expect(reclaimed.body.actor).toBe(seat);
+    expect(reclaimed.body.active_scope).toBe("the_chatroom");
+    await h.settle();
+    const reclaimedLive = await h.api("GET", `/net-api/cell?key=object_live:${seat}`, {
+      token: `session:${reclaimed.body.session as string}`
+    });
+    expect(reclaimedLive.status, JSON.stringify(reclaimedLive.body).slice(0, 300)).toBe(200);
+    expect((reclaimedLive.body.cell as { value?: { location?: string } }).value?.location).toBe("the_chatroom");
+    const reclaimedDescription = await h.api("GET", `/net-api/cell?key=property_cell:${seat}:description`, {
+      token: `session:${reclaimed.body.session as string}`
+    });
+    expect(reclaimedDescription.status, JSON.stringify(reclaimedDescription.body).slice(0, 300)).toBe(200);
+    expect((reclaimedDescription.body.cell as { value?: { value?: string } }).value?.value).toBe("");
 
     // The closed session's bearer is dead — named refusal, not a zombie.
     const zombie = await h.api("POST", "/net-api/turn", {

@@ -10533,9 +10533,17 @@ export class WooWorld {
       return { room: target, here_request: true, look_deferred: true };
     });
     this.nativeHandlers.set("player_join", (ctx, args) => this.playerJoin(ctx, args));
-    this.nativeHandlers.set("guest_on_disfunc", async (ctx) => {
+    this.nativeHandlers.set("guest_on_disfunc", async (ctx, args) => {
       const homeValue = this.propOrNull(ctx.thisObj, "home");
-      const home = typeof homeValue === "string" && this.objects.has(homeValue) ? homeValue : "$nowhere";
+      // The optional destination is for trusted session cleanup (the net guest
+      // door restores a claimed seat to its catalog-declared initial room).
+      // Ordinary disfunc keeps the historical home/$nowhere behavior.
+      const requested = args[0];
+      const home = typeof requested === "string" && this.objects.has(requested)
+        ? requested
+        : typeof homeValue === "string" && this.objects.has(homeValue)
+          ? homeValue
+          : "$nowhere";
       const fallback = this.guestInventoryFallback(ctx.thisObj, home);
       const carried = await this.objectContents(ctx.thisObj, ctx.hostMemo);
       for (const item of carried) {

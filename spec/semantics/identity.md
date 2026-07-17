@@ -159,15 +159,15 @@ After reap, the *actor* may persist or not depending on its class:
 
 Guests accumulate state during their session — they may have moved rooms, picked up artifacts, set their description, attached features. None of that should leak to the next user of that guest objref.
 
-The convention is `:on_disfunc()` on `$guest`:
+The convention is `:on_disfunc(destination?)` on `$guest`:
 
 ```woo
-verb $guest:on_disfunc() {
+verb $guest:on_disfunc(destination?) {
   let where = this.location;       // room at disconnect time, if valid
   for item in this.contents {      // eject everything held
     item:moveto(item.home || where || this.home);
   }
-  this:moveto(this.home);          // back to $nowhere
+  this:moveto(destination || this.home); // net claims may restore their declared initial room
   this.description = "";           // wipe self-description
   this.aliases = [];               // wipe aliases
   this.features = [];              // detach all features
@@ -178,7 +178,7 @@ verb $guest:on_disfunc() {
 
 This is the LambdaCore `@disfunc` pattern under a clearer name. Guest inventory is ejected before the guest is moved home: an item with its own valid `home` returns there, otherwise it falls back to the disconnect room, then the guest's home. The guest `home` property is conventionally `$nowhere` (a seeded `$thing`; see [bootstrap.md §B6](bootstrap.md#b6-demo-instances)); operators may override per-guest if they want named lounges.
 
-The disfunc runs with `progr = this.owner` (typically `$wiz`), so it has authority to reset state regardless of what permission flips occurred during the session.
+The disfunc runs with `progr = this.owner` (typically `$wiz`), so it has authority to reset state regardless of what permission flips occurred during the session. The optional destination is a trusted cleanup override: ordinary reap omits it and retains the conventional `home`/`$nowhere` behavior; the net identity door passes the install-owned guest template's `initial_room` after it has exclusively claimed the seat, so a prior user's room is never exposed to the new session. Net guest admission fails closed when that template is missing or malformed; returning an unreset pooled actor would disclose the previous user's durable location, inventory, description, aliases, or features.
 
 ---
 
