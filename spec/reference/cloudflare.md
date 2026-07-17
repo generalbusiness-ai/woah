@@ -841,9 +841,10 @@ to `mcp-gateway-<n>`. A shard cold-loads only the Directory session rows whose
 for the session actor's own MCP control tools. The Directory query is indexed
 and paged by `mcp_shard`; a shard must rebind every returned live session, not
 re-hash the id and silently discard rows it just loaded. Directory session rows
-preserve the original session start time, actor display name, and the actor's
-MCP `focus_list`, so a sparse reload does not change primary-session ordering,
-degrade roster names to ids, or drop focused tool surfaces. It rebinds MCP
+preserve the original session start time, actor display name, and (on the
+classic rollback path) the actor's focus list, so a sparse reload does not
+change primary-session ordering or degrade roster names to ids. Net MCP does
+not consume that list for tool reachability. The classic shard rebinds MCP
 queues from those rows and fetches object authority lazily through the v2
 authority-slice path when a turn actually needs it. Verbs that render room
 presence declare `reads_room_presence: true`; sparse shards consult that verb

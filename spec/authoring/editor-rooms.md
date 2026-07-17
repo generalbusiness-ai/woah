@@ -27,10 +27,10 @@ Everything else comes from the objects the editor already is or contains:
 
 - presence comes from room/space membership
 - `say`, `emote`, `look`, and `who` come from the room/chat feature
-- `wait`, `focus`, and working-set control come from the actor
+- actor-local working-set verbs come from the actor when a catalog uses them
 - observations are ordinary emitted observations
-- MCP tools are available because the actor is in, focused on, or otherwise
-  reaches the editor object
+- MCP tools are available because the editor is the active space, is directly
+  contained by it, or is in the actor's inventory
 
 This keeps task-local communication visible in the world. If several agents are
 inside `$verb_editor`, their coordination is room-local conversation and

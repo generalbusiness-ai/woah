@@ -7,6 +7,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { FakeDurableObjectState } from "./fake-do";
 import { createWorld } from "../../src/core/bootstrap";
+import { installVerb } from "../../src/core/authoring";
 import { exportIdentity, importIdentity } from "../../src/net/identity";
 import { planNetInstall } from "../../src/net/install";
 import { cellVersion } from "../../src/net/cells";
@@ -51,15 +52,72 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
     const bob = old.auth("guest:mcp-bob").actor;
     old.ensureApiKey("$wiz", alice, "mcp-key-a", "mcp-secret-a", "alice");
     old.ensureApiKey("$wiz", bob, "mcp-key-b", "mcp-secret-b", "bob");
+    let taskRef = "";
     const identity = exportIdentity(old.exportWorld());
-    const plan = await planNetInstall({ graft: (fresh) => importIdentity(fresh, identity) });
+    const plan = await planNetInstall({
+      graft: async (fresh) => {
+        importIdentity(fresh, identity);
+        const commandOnly = {
+          argSpec: { command: { dobj: "none", prep: "any", iobj: "any", args_from: [] } }
+        };
+        expect(installVerb(
+          fresh,
+          alice,
+          "command_only_probe",
+          "verb :command_only_probe() rxd { return true; }",
+          null,
+          commandOnly
+        ).ok).toBe(true);
+        expect(installVerb(
+          fresh,
+          "the_mug",
+          "command_only_probe",
+          "verb :command_only_probe() rxd { return true; }",
+          null,
+          commandOnly
+        ).ok).toBe(true);
+        const seededPolicy = await fresh.directCall(
+          "mcp-seed-policy",
+          "$wiz",
+          "the_taskboard",
+          "seed_minimal_policy",
+          [alice],
+          { forceDirect: true, forceReason: "test fixture" }
+        );
+        expect(seededPolicy.op).toBe("result");
+        const createdTask = await fresh.directCall(
+          "mcp-create-context-task",
+          alice,
+          "the_taskboard",
+          "create_task",
+          ["task", "Context navigation", "Exercise structural MCP context", [], null],
+          { forceDirect: true, forceReason: "test fixture" }
+        );
+        expect(createdTask.op).toBe("result");
+        taskRef = createdTask.op === "result" ? String(createdTask.result) : "";
+      }
+    });
+    expect(taskRef).toBeTruthy();
+    const commandOnlyPage = [...plan.partitions.values()].flat().find((cell) =>
+      cell.kind === "verb_bytecode"
+      && cell.object === "the_mug"
+      && cell.name === "command_only_probe"
+    );
+    expect(commandOnlyPage?.value).toMatchObject({
+      arg_spec: { command: { args_from: [] } },
+      tool_exposed: undefined
+    });
+    const taskClaimTool = `${taskRef.replace(/^\$/, "").replace(/[^a-zA-Z0-9_]/g, "_")}__claim`;
+    const taskPassTool = `${taskRef.replace(/^\$/, "").replace(/[^a-zA-Z0-9_]/g, "_")}__pass`;
 
     // Seed every partition; the gateway self-resolves for subscriptions.
     const states: Array<ReturnType<typeof netState>> = [];
     const scopeStates = new Map<string, ReturnType<typeof netState>>();
     const scopeDOs = new Map<string, NetScopeDO>();
+    const resolvedDestinations: string[] = [];
     let gateway: NetGatewayDO;
     const resolve = (destination: string) => {
+      resolvedDestinations.push(destination);
       if (destination === "gateway:net-api") return gateway;
       if (destination.startsWith("scope:")) {
         const instance = scopeDOs.get(destination.slice("scope:".length));
@@ -140,23 +198,95 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
       { jsonrpc: "2.0", id: nextId++, method: "tools/list", params: {} },
       { "mcp-session-id": aliceSession }
     );
-    expect(listed.body?.result?.tools?.map((tool: { name: string }) => tool.name).sort()).toEqual([
+    const initialToolNames = listed.body?.result?.tools?.map((tool: { name: string }) => tool.name) ?? [];
+    expect(initialToolNames).toEqual(expect.arrayContaining([
       "woo_call",
       "woo_list_reachable_tools",
-      "woo_wait"
-    ]);
+      "woo_wait",
+      "the_chatroom__look",
+      "the_chatroom__say",
+      "the_cockatoo__squawk"
+    ]));
+    // A co-present person is social context, not an object administration
+    // target. Room say/tell remains the interaction path.
+    expect(initialToolNames.some((name: string) => name.startsWith(`${bob}__`))).toBe(false);
+    expect(initialToolNames.some((name: string) => /^guest_[2-8]__/.test(name))).toBe(false);
+    expect(initialToolNames).not.toContain(`${alice}__command_only_probe`);
     const waitDefinition = listed.body?.result?.tools?.find((tool: { name: string }) => tool.name === "woo_wait");
     expect(waitDefinition?.inputSchema?.properties).toMatchObject({
       timeout_ms: { type: "number" },
       limit: { type: "number" }
     });
+    const sayDefinition = listed.body?.result?.tools?.find((tool: { name: string }) => tool.name === "the_chatroom__say");
+    expect(sayDefinition?.inputSchema).toMatchObject({
+      type: "object",
+      properties: { text: { type: "string" } },
+      required: ["text"]
+    });
 
-    // Actor resolution — the smoke SmokeSession.open contract: a guest_*
-    // object carrying an actor-control verb (wait) in the tool list.
+    const discoveredPage = await call(aliceSession, "woo_list_reachable_tools", {
+      scope: "active",
+      query: "squawk",
+      limit: 1,
+      include_schema: true
+    });
+    expect(discoveredPage.result?.structuredContent?.result).toMatchObject({
+      scope: "active",
+      query: "squawk",
+      limit: 1,
+      cursor: null,
+      total: expect.any(Number),
+      tools: [expect.objectContaining({
+        name: "the_cockatoo__squawk",
+        object: "the_cockatoo",
+        verb: "squawk",
+        input_schema: expect.objectContaining({ type: "object" })
+      })]
+    });
+    const commandOnlyDiscovery = await call(aliceSession, "woo_list_reachable_tools", {
+      scope: "active",
+      query: "command_only_probe",
+      limit: 10
+    });
+    const commandOnlyNames = (commandOnlyDiscovery.result?.structuredContent?.result?.tools ?? [])
+      .map((tool: { name: string }) => tool.name);
+    expect(commandOnlyNames).toContain("the_mug__command_only_probe");
+    expect(commandOnlyNames).not.toContain(`${alice}__command_only_probe`);
+
+    // A dangling contextual row gets one targeted probe and then enters the
+    // bounded retry gate; repeated model listings do not create a read storm.
+    gatewayState.state.storage.sql.exec(
+      "INSERT INTO net_gateway_relation (key, relation, owner, member, body, owner_scope, member_scope) VALUES (?, 'contents', 'the_chatroom', 'dangling_context_fixture', NULL, 'room:the_chatroom', 'room:dangling_context_fixture')",
+      "relation:contents:the_chatroom:dangling_context_fixture"
+    );
+    const missingScopeBefore = resolvedDestinations.filter((value) => value === "scope:room:dangling_context_fixture").length;
+    await mcp(
+      { jsonrpc: "2.0", id: nextId++, method: "tools/list", params: {} },
+      { "mcp-session-id": aliceSession }
+    );
+    await mcp(
+      { jsonrpc: "2.0", id: nextId++, method: "tools/list", params: {} },
+      { "mcp-session-id": aliceSession }
+    );
+    const missingScopeAfter = resolvedDestinations.filter((value) => value === "scope:room:dangling_context_fixture").length;
+    expect(missingScopeAfter - missingScopeBefore).toBe(1);
+    gatewayState.state.storage.sql.exec(
+      "DELETE FROM net_gateway_relation WHERE key = ?",
+      "relation:contents:the_chatroom:dangling_context_fixture"
+    );
+
+    // Actor resolution remains explicit in initialize instructions and in the
+    // contextual discovery descriptors; native actor controls are not
+    // advertised as dynamic Net tools because they have no portable bytecode.
     const tools = await call(aliceSession, "woo_list_reachable_tools", { scope: "all", limit: 200 });
     const list = tools.result?.structuredContent?.result?.tools ?? [];
-    const self = list.find((tool: any) => typeof tool?.object === "string" && /^guest_/.test(tool.object) && tool.verb === "wait");
+    const self = list.find((tool: any) => tool?.object === alice);
     expect(self?.object, JSON.stringify(list.slice(0, 12))).toBe(alice);
+
+    // Dynamic-name invocation uses the same descriptor and authoritative turn
+    // path as woo_call; no focus step is involved.
+    const squawked = await call(aliceSession, "the_cockatoo__squawk", {});
+    expect(squawked.result?.isError, JSON.stringify(squawked)).not.toBe(true);
 
     // The stable wait contract is bounded: a caller can consume part of a
     // burst without discarding the remainder from its session-local queue.
@@ -221,6 +351,14 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
       }
     });
 
+    // A globally known task is not callable until it is in this session's
+    // structural context. woo_call is not an object-id escape hatch.
+    const unreachableTask = await call(aliceSession, "woo_call", { object: taskRef, verb: "claim", args: [] });
+    expect(unreachableTask.result).toMatchObject({
+      isError: true,
+      structuredContent: { error: { code: "E_PERM" } }
+    });
+
     // Cross-room move: the walkthrough's acid test (left/entered fanout).
     const entered = await call(aliceSession, "woo_call", { object: "the_chatroom", verb: "enter", args: [] });
     expect(entered.result?.isError, JSON.stringify(entered).slice(0, 400)).not.toBe(true);
@@ -232,6 +370,42 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
     const moveObs = waitedMove.result?.structuredContent?.result?.observations ?? [];
     const left = moveObs.find((obs: any) => obs?.type === "left" && obs.actor === alice);
     expect(left, JSON.stringify(moveObs).slice(0, 400)).toBeTruthy();
+
+    // Structural navigation replaces focus choreography. Walk through the
+    // garden to the task board; its contained task immediately contributes
+    // dynamic lifecycle tools.
+    const toGarden = await call(aliceSession, "woo_call", { object: "the_deck", verb: "south", args: [] });
+    expect(toGarden.result?.isError, JSON.stringify(toGarden).slice(0, 400)).not.toBe(true);
+    await settleAll();
+    const toTasks = await call(aliceSession, "woo_call", { object: "the_garden", verb: "south", args: [] });
+    expect(toTasks.result?.isError, JSON.stringify(toTasks).slice(0, 400)).not.toBe(true);
+    await settleAll();
+    const atTaskboard = await mcp(
+      { jsonrpc: "2.0", id: nextId++, method: "tools/list", params: {} },
+      { "mcp-session-id": aliceSession }
+    );
+    const taskboardNames = atTaskboard.body?.result?.tools?.map((tool: { name: string }) => tool.name) ?? [];
+    expect(taskboardNames).toContain(taskClaimTool);
+    expect(taskboardNames).not.toContain("the_cockatoo__squawk");
+    expect(taskboardNames.some((name: string) => name === "woo_focus" || name.endsWith("__focus"))).toBe(false);
+
+    const claimed = await call(aliceSession, taskClaimTool, {});
+    expect(claimed.result?.isError, JSON.stringify(claimed).slice(0, 600)).not.toBe(true);
+    await settleAll();
+    const outToGarden = await call(aliceSession, "woo_call", { object: "the_taskboard", verb: "out", args: [] });
+    expect(outToGarden.result?.isError, JSON.stringify(outToGarden).slice(0, 400)).not.toBe(true);
+    await settleAll();
+    const afterClaimMove = await mcp(
+      { jsonrpc: "2.0", id: nextId++, method: "tools/list", params: {} },
+      { "mcp-session-id": aliceSession }
+    );
+    const inventoryNames = afterClaimMove.body?.result?.tools?.map((tool: { name: string }) => tool.name) ?? [];
+    expect(inventoryNames).toContain(taskPassTool);
+
+    // Return to the living room for the existing take/drop scenario.
+    const gardenNorth = await call(aliceSession, "woo_call", { object: "the_garden", verb: "north", args: [] });
+    expect(gardenNorth.result?.isError, JSON.stringify(gardenNorth).slice(0, 400)).not.toBe(true);
+    await settleAll();
 
     // take/drop: room-committed contents change with cross-actor fanout.
     const back = await call(aliceSession, "woo_call", { object: "the_deck", verb: "west", args: [] });
@@ -308,6 +482,11 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
     await new Promise((resolve) => setTimeout(resolve, 300));
     const afterClose = await call(bobSession, "woo_wait", { timeout_ms: 0 });
     expect(afterClose).toMatchObject({ error: { message: expect.stringMatching(/session (expired|missing)/) } });
+    const listAfterClose = await mcp(
+      { jsonrpc: "2.0", id: nextId++, method: "tools/list", params: {} },
+      { "mcp-session-id": bobSession }
+    );
+    expect(listAfterClose.body).toMatchObject({ error: { message: expect.stringMatching(/session (expired|missing)/) } });
 
     states.forEach((st) => st.close());
   });

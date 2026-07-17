@@ -30,9 +30,10 @@ duplicate emitted observations into that call result. Pull peer and room
 events separately through `woo_wait`. The gateway suppresses a submitter's own
 committed fanout echo, so an agent does not see its own action twice.
 
-After movement, re-run `woo_list_reachable_tools`: the actor's presence moved
-to a different room and the callable projection changed. Net currently has no
-MCP list-change notification or stable focus/unfocus wrapper.
+After movement, re-run standard `tools/list` (or
+`woo_list_reachable_tools`): the actor's presence moved to a different room and
+the callable projection changed. Net currently has no MCP list-change
+notification; focus is not part of the MCP context model.
 
 ## Common shapes
 
@@ -63,6 +64,5 @@ For a passive live observer, repeat waits with a timeout at or below 25
 seconds. For a turn-based agent, use `timeout_ms: 0` after each action and keep
 draining until the returned observation list is empty.
 
-The normative target protocol is
-[`../../spec/protocol/mcp.md`](../../spec/protocol/mcp.md); this page describes
-the current Net deployment while that migration is incomplete.
+The normative protocol is
+[`../../spec/protocol/mcp.md`](../../spec/protocol/mcp.md).

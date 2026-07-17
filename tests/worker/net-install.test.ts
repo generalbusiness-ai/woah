@@ -43,12 +43,12 @@ describe("net install end-to-end (fake-DO lane)", () => {
     // partitioning. Self-hosted spaces own their live cell, but the containing
     // room must own their membership row.
     expect(plan.relations.get("room:the_chatroom")).toEqual(expect.arrayContaining([
-      { relation: "contents", owner: "the_chatroom", member: "the_dubspace" },
-      { relation: "contents", owner: "the_chatroom", member: "the_weather" }
+      { relation: "contents", owner: "the_chatroom", member: "the_dubspace", member_scope: "room:the_dubspace" },
+      { relation: "contents", owner: "the_chatroom", member: "the_weather", member_scope: "cluster:the_weather" }
     ]));
     expect(plan.relations.get("room:the_deck")).toEqual(expect.arrayContaining([
-      { relation: "contents", owner: "the_deck", member: "the_pinboard" },
-      { relation: "contents", owner: "the_deck", member: "the_horoscope" }
+      { relation: "contents", owner: "the_deck", member: "the_pinboard", member_scope: "room:the_pinboard" },
+      { relation: "contents", owner: "the_deck", member: "the_horoscope", member_scope: "cluster:the_horoscope" }
     ]));
 
     // Seed one scope DO per partition — what scripts/net-install.ts does

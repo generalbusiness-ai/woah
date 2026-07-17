@@ -366,7 +366,10 @@ describe("CO13 relations over the DO shells", () => {
     const reply = await call<CommitReply>(roomDO, roomEnv, "/submit", localMoveSubmit(head0));
     expect(reply.status).toBe("accepted");
     if (reply.status !== "accepted") return;
-    expect(reply.relations).toEqual([{ op: "add", row: { relation: "contents", owner: "#room", member: "#box" } }]);
+    expect(reply.relations).toEqual([{
+      op: "add",
+      row: { relation: "contents", owner: "#room", member: "#box", member_scope: ROOM_SCOPE }
+    }]);
     expect(reply.relations_foreign).toBeUndefined();
     expect(gatewayRecorder.calls.filter((c) => c.path === "/net/fanout")).toHaveLength(0);
     await roomDO.alarm();

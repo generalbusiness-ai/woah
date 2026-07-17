@@ -190,10 +190,16 @@ describe("sequencer relation application (durable, one transaction)", () => {
     // room:den.
     expect(seq.relations().size).toBe(0); // remove of an absent row = no row
     expect(reply.relations).toEqual([
-      { op: "remove", row: { relation: "contents", owner: "room:hall", member: "#alice" } }
+      { op: "remove", row: { relation: "contents", owner: "room:hall", member: "#alice", member_scope: "room:hall" } }
     ]);
     expect(reply.relations_foreign).toEqual([
-      { scope: "room:den", deltas: [{ op: "add", row: { relation: "contents", owner: "room:den", member: "#alice" } }] }
+      {
+        scope: "room:den",
+        deltas: [{
+          op: "add",
+          row: { relation: "contents", owner: "room:den", member: "#alice", member_scope: "room:hall" }
+        }]
+      }
     ]);
 
     // The foreign owner applies the delivered deltas durably.

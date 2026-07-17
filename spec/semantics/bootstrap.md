@@ -43,7 +43,7 @@ the target for runtime-created objects, but it is not active in v1.
 |---|---|---|---|---|---|---|---|
 | `$system` | singleton | none | `$wiz` | wizard | `description`; `wizard_actions=[]`; `bootstrap_token_used=false`; `applied_migrations=[]`; credential/provisioning ledgers | `:return_guest(guest)` plus auth/provisioning primitives | Bootstrap object and world registry root. It owns the reserved `#0` identity, carries wizard authority, and anchors world-level metadata. |
 | `$root` | class | `$system` | `$wiz` | — | Defines `name`, `description`, `aliases`, `host_placement`, `help` | `:set_value(value)`, `:set_prop(name,value)`, `:describe()`, `:title()`, `:look_self()` | Universal base class for ordinary persistent objects. Most object parent chains terminate here before reaching `$system`. |
-| `$actor` | class | `$root` | `$wiz` | — | Defines `features`, `features_version`, `focus_list` | `:add_feature(f)`, `:remove_feature(f)`, `:has_feature(f)`, `:huh(text,reason?,source?)`, `:wait(timeout_ms?,limit?)`, `:focus(target)`, `:unfocus(target)`, `:focus_list()` | Base class for principals that originate messages and carry actor-scoped features and MCP focus state. |
+| `$actor` | class | `$root` | `$wiz` | — | Defines `features`, `features_version`, `focus_list` | `:add_feature(f)`, `:remove_feature(f)`, `:has_feature(f)`, `:huh(text,reason?,source?)`, `:wait(timeout_ms?,limit?)`, `:focus(target)`, `:unfocus(target)`, `:focus_list()` | Base class for principals that originate messages and carry actor-scoped features plus an optional in-world working set. Net MCP reachability is structural and does not consume `focus_list`. |
 | `$player` | class | `$actor` | `$wiz` | — | Defines `home` | `:on_disfunc()`, `:moveto(target)`, `:tell(text)`, `:tell_lines(lines)`, `:help(topic?)`, `:who_all(names?)`, `:join_player(name)`, `:ways(room?)`, `:examine_detailed(name)` | Session-capable actor class for humans, agents, and tools connected over the wire. |
 | `$wiz` | instance/class | `$player` | `$wiz` | wizard, programmer | Inherits player state; owns the seed graph | Inherits player/actor/root verbs | Seed administrator player used to bootstrap, inspect, and repair code, schema, and seeded objects. |
 | `$guest` | class | `$player` | `$wiz` | — | Inherits player state | Overrides `:on_disfunc(destination?)` | Reusable temporary player class. Guest instances bind to short-lived sessions and return to the free pool on reap. |
@@ -125,10 +125,10 @@ has no ordinary parent chain; `$nowhere` inherits descriptive slots from
 | `:has_feature(f)` rxd | obj | Predicate. |
 | `:look_self()` rxd | — | Actor-authored view. Returns the generic title/description plus `carrying`, and appends the current inventory sentence to `description`. This is woocode seeded on `$actor`, not a substrate special case. |
 | `:huh(text, reason?, source?)` rxd | str, str?, obj? | Actor-owned parse-miss output. Emits a private `huh` observation to `this` with `source` naming the command surface when available. Default reason is `I don't understand that.` |
-| `:wait(timeout_ms?, limit?)` rxd | int?, int? | MCP observation drain for the actor's session queue. Tool-exposed. |
-| `:focus(target)` rxd | obj | Add an existing, readable object/space to `focus_list`. Tool-exposed; MCP's stable `woo_focus` wrapper additionally requires the target to be currently reachable. |
-| `:unfocus(target)` rxd | obj | Remove an object/space from `focus_list`. Tool-exposed. |
-| `:focus_list()` rxd | — | Return the current focus list. Tool-exposed. |
+| `:wait(timeout_ms?, limit?)` rxd | int?, int? | In-world observation drain on hosts that provide the native actor queue. Net MCP uses the stable protocol-level `woo_wait` queue instead. |
+| `:focus(target)` rxd | obj | Add an existing, readable object/space to the actor's optional in-world `focus_list`. It does not broaden Net MCP context. |
+| `:unfocus(target)` rxd | obj | Remove an object/space from the in-world `focus_list`. |
+| `:focus_list()` rxd | — | Return the in-world focus list. |
 
 ### B2.6 `$player` additional properties
 

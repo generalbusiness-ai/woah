@@ -695,6 +695,12 @@ export class NetGatewayDO {
     if (!relationColumns.some((column) => column.name === "owner_scope")) {
       state.storage.sql.exec("ALTER TABLE net_gateway_relation ADD COLUMN owner_scope TEXT");
     }
+    if (!relationColumns.some((column) => column.name === "member_scope")) {
+      // Additive mirror metadata: new relation producers attach the member's
+      // immutable authority scope so cold contextual reads stay targeted.
+      // Legacy NULL rows remain valid and use the bounded owner fallback.
+      state.storage.sql.exec("ALTER TABLE net_gateway_relation ADD COLUMN member_scope TEXT");
+    }
     state.storage.sql.exec(
       "CREATE INDEX IF NOT EXISTS net_gateway_relation_scope ON net_gateway_relation (relation, owner_scope)"
     );
@@ -791,7 +797,14 @@ export class NetGatewayDO {
         const relation = url.searchParams.get("relation") ?? "";
         const owner = url.searchParams.get("owner") ?? "";
         if (!relation || !owner) throw new Error("relation and owner query params are required");
-        return json({ relation, owner, members: this.relationMembers(relation, owner) });
+        // `member_scope` only tells this gateway where to warm a contextual
+        // object. It is not part of CO13's relation-read contract, even on
+        // the signed lane probe.
+        const members = this.relationMembers(relation, owner).map((row) => ({
+          member: row.member,
+          ...(row.body !== undefined ? { body: row.body } : {})
+        }));
+        return json({ relation, owner, members });
       }
       return json({ error: `no such route: ${request.method} ${url.pathname}` }, 404);
     } catch (err) {
@@ -3249,11 +3262,10 @@ export class NetGatewayDO {
   //
   // The agent/plug surface AND the §8 "prove" instrument: the deployed
   // walkthrough drives MCP, so this is what lets the ONE smoke scenario
-  // run against the net path. Deliberately the SMALL tool set the
-  // scenario's client contract uses — woo_call, woo_wait,
-  // woo_list_reachable_tools — each backed by the SAME machinery the
-  // HTTP client surface uses (clientSession/clientTurn/the mirror), so
-  // MCP is an ENVELOPE around the net path, never a second path.
+  // run against the net path. Three stable controls plus the structural
+  // dynamic projection are backed by the SAME machinery the HTTP client
+  // surface uses (clientSession/clientTurn/the mirror), so MCP is an
+  // ENVELOPE around the net path, never a second path.
   //
   // Auth: `initialize` authenticates an apikey from the `mcp-token`
   // header and mints a net session; the returned mcp-session-id IS that
@@ -3269,6 +3281,13 @@ export class NetGatewayDO {
   /** Per-session MCP observation queues (bounded) + parked woo_wait
    * long-polls. Registered at initialize; entries die with the DO. */
   private readonly mcpQueues = new Map<string, { buffer: unknown[]; waiters: Array<() => void>; ownEchoIds: Set<string> }>();
+  /** Backoff for dangling/stale contextual relation refs. A missing member
+   * must not turn repeated tools/list calls into a multi-Hz closure storm. */
+  private readonly mcpContextWarmFailures = new Map<string, { attempts: number; retryAt: number }>();
+  /** A lineage row can arrive in a sparse room transfer without the object's
+   * own verb pages. Record completed object pulls separately so per-instance
+   * tools are neither missed nor re-pulled on every tools/list. */
+  private readonly mcpContextWarmSuccesses = new Set<string>();
 
   private async clientMcp(request: Request): Promise<Response> {
     const rpc = (await request.json().catch(() => null)) as {
@@ -3286,13 +3305,7 @@ export class NetGatewayDO {
       return new Response(null, { status: 202 });
     }
     if (rpc.method === "initialize") return await this.mcpInitialize(request, rpc.id, rpc.params ?? {});
-    if (rpc.method === "tools/list") {
-      // tools/list is an MCP protocol result, not a tools/call result. The
-      // SDK validates `result.tools` directly; wrapping it in content and
-      // structuredContent makes the endpoint unusable by conforming clients
-      // even though hand-authored JSON-RPC probes can overlook the shape.
-      return json({ jsonrpc: "2.0", id: rpc.id, result: { tools: MCP_TOOL_DEFS } });
-    }
+    if (rpc.method === "tools/list") return await this.mcpToolsList(request, rpc.id, rpc.params ?? {});
     if (rpc.method === "tools/call") {
       return await this.mcpToolsCall(request, rpc.id, rpc.params ?? {});
     }
@@ -3346,7 +3359,8 @@ export class NetGatewayDO {
         result: {
           protocolVersion: "2025-06-18",
           capabilities: { tools: { listChanged: false } },
-          serverInfo: { name: "woo-net", version: "1" }
+          serverInfo: { name: "woo-net", version: "1" },
+          instructions: `You are woo actor ${actor}. Dynamic tools track your current space, its contextual objects, and your inventory. Re-list tools after navigation.`
         }
       },
       200,
@@ -3361,7 +3375,10 @@ export class NetGatewayDO {
     if (verdict !== "ok") {
       return json({ jsonrpc: "2.0", id, error: { code: -32000, message: `session ${verdict}` } }, 200);
     }
-    const actor = (cell?.value as { actor?: string }).actor as string;
+    const actor = (cell?.value as { actor?: unknown }).actor;
+    if (typeof actor !== "string" || !actor) {
+      return json({ jsonrpc: "2.0", id, error: { code: -32000, message: "session actor is missing" } }, 200);
+    }
     this.enforceClientRate(actor, "/net-api/mcp");
     const name = typeof params.name === "string" ? params.name : "";
     const args = (params.arguments ?? {}) as Record<string, unknown>;
@@ -3374,54 +3391,118 @@ export class NetGatewayDO {
       const observations = await this.mcpWait(session, timeout, limit);
       return this.mcpResult(id, { observations });
     }
+    // The relation mirror can be newer than this gateway's object-cell view.
+    // Materialize only the bounded structural context before discovery or
+    // invocation so the advertised set and the accepted set remain equal.
+    await this.warmMcpContext(actor, session);
     if (name === "woo_list_reachable_tools") {
-      const limit = typeof args.limit === "number" && args.limit > 0 ? Math.min(args.limit, 500) : 200;
-      return this.mcpResult(id, { tools: this.mcpReachableTools(actor, session, limit) });
+      try {
+        const page = this.mcpToolPage(actor, session, args);
+        const includeSchema = args.include_schema === true;
+        return this.mcpResult(id, {
+          scope: page.scope,
+          object: page.object,
+          query: page.query,
+          limit: page.limit,
+          cursor: page.cursor,
+          next_cursor: page.nextCursor,
+          total: page.total,
+          tools: page.tools.map((tool) => mcpToolSummary(tool, includeSchema))
+        });
+      } catch (err) {
+        if (isNetError(err)) return this.mcpToolError(id, { code: err.code, message: err.message, detail: err.detail });
+        return this.mcpToolError(id, { code: "E_INVARG", message: String(err) });
+      }
     }
     if (name === "woo_call") {
       const object = typeof args.object === "string" ? args.object : "";
       const verb = typeof args.verb === "string" ? args.verb : "";
       if (!object || !verb) return this.mcpToolError(id, { code: "E_INVARG", message: "woo_call requires object and verb" });
-      try {
-        const identity = await this.catalogIdentity();
-        const turnId = `mcp:${crypto.randomUUID()}`;
-        const ownEchoIds = this.mcpQueues.get(session)?.ownEchoIds;
-        if (ownEchoIds) {
-          ownEchoIds.add(turnEchoId(turnId));
-          while (ownEchoIds.size > MCP_QUEUE_CAP) {
-            const oldest = ownEchoIds.values().next().value as string | undefined;
-            if (oldest === undefined) break;
-            ownEchoIds.delete(oldest);
-          }
-        }
-        const turnResponse = await this.clientTurn(
-          actor,
-          { target: object, verb, args: Array.isArray(args.args) ? args.args : [], session, idempotency_key: turnId },
-          identity.epoch
-        );
-        const turn = (await turnResponse.json()) as {
-          reply?: { status?: string; reason?: string; detail?: unknown };
-          result?: unknown;
-          error?: unknown;
-          [key: string]: unknown;
-        };
-        if (!turnResponse.ok) return this.mcpToolError(id, turn.error ?? turn);
-        if (turn.reply?.status !== "accepted") return this.mcpToolError(id, turn.reply ?? turn);
-        // A committed turn whose VERB raised carries the recorded error —
-        // the tool surface reports it as an error envelope (v2 parity:
-        // unwrap() throws on isError).
-        if (turn.error !== undefined) return this.mcpToolError(id, turn.error);
-        return this.mcpResult(id, turn.result ?? null);
-      } catch (err) {
-        // Taxonomy throws (E_BUDGET after the repair loop on a genuinely
-        // absent verb, etc.) are TOOL failures on this surface — the MCP
-        // envelope, never a transport 4xx/5xx (the JSON-RPC id must get
-        // its reply).
-        if (isNetError(err)) return this.mcpToolError(id, { code: err.code, message: err.message, detail: err.detail });
-        return this.mcpToolError(id, { code: "E_INTERNAL", message: String(err) });
+      if (!isConcreteRuntimeObjectId(object)) {
+        return this.mcpToolError(id, { code: "E_INVARG", message: "target must be a concrete runtime object id", detail: { field: "target", reason: "invalid_object_id", value: object } });
       }
+      const tool = this.mcpContextTools(actor, session).find((candidate) =>
+        candidate.object === object && (candidate.verb === verb || candidate.aliases.includes(verb))
+      );
+      if (!tool) return this.mcpToolError(id, { code: "E_PERM", message: `tool is not available in this session context: ${object}:${verb}` });
+      return this.mcpInvokeTurn(id, actor, session, tool.object, tool.verb, Array.isArray(args.args) ? args.args : []);
     }
+    const dynamic = this.mcpContextTools(actor, session).find((tool) => tool.name === name);
+    if (dynamic) return this.mcpInvokeTurn(id, actor, session, dynamic.object, dynamic.verb, mcpNamedArgs(dynamic, args));
     return json({ jsonrpc: "2.0", id, error: { code: -32602, message: `unknown tool: ${name}` } }, 200);
+  }
+
+  /** Standard MCP tools/list. Dynamic descriptors are computed from the same
+   * bounded structural-context resolver used by woo_call, so listing and
+   * invocation cannot disagree about reachability. */
+  private async mcpToolsList(request: Request, id: number | string, params: Record<string, unknown>): Promise<Response> {
+    const session = request.headers.get("mcp-session-id") ?? "";
+    const cell = this.ensureView().get(sessionCellKey(session));
+    const verdict = validateSessionCell(cell, this.host.now());
+    if (verdict !== "ok") {
+      return json({ jsonrpc: "2.0", id, error: { code: -32000, message: `session ${verdict}` } }, 200);
+    }
+    const actor = (cell?.value as { actor?: string }).actor;
+    if (typeof actor !== "string" || !actor) {
+      return json({ jsonrpc: "2.0", id, error: { code: -32000, message: "session actor is missing" } }, 200);
+    }
+    this.enforceClientRate(actor, "/net-api/mcp");
+    await this.warmMcpContext(actor, session);
+    const cursor = mcpCursor(params.cursor);
+    const all = [...MCP_TOOL_DEFS, ...this.mcpContextTools(actor, session).map(mcpProtocolTool)];
+    const tools = all.slice(cursor, cursor + MCP_STANDARD_TOOL_PAGE);
+    const next = cursor + tools.length;
+    return json({
+      jsonrpc: "2.0",
+      id,
+      result: {
+        tools,
+        ...(next < all.length ? { nextCursor: String(next) } : {})
+      }
+    });
+  }
+
+  private async mcpInvokeTurn(
+    id: number | string,
+    actor: string,
+    session: string,
+    object: string,
+    verb: string,
+    args: unknown[]
+  ): Promise<Response> {
+    try {
+      const identity = await this.catalogIdentity();
+      const turnId = `mcp:${crypto.randomUUID()}`;
+      const ownEchoIds = this.mcpQueues.get(session)?.ownEchoIds;
+      if (ownEchoIds) {
+        ownEchoIds.add(turnEchoId(turnId));
+        while (ownEchoIds.size > MCP_QUEUE_CAP) {
+          const oldest = ownEchoIds.values().next().value as string | undefined;
+          if (oldest === undefined) break;
+          ownEchoIds.delete(oldest);
+        }
+      }
+      const turnResponse = await this.clientTurn(
+        actor,
+        { target: object, verb, args, session, idempotency_key: turnId },
+        identity.epoch
+      );
+      const turn = (await turnResponse.json()) as {
+        reply?: { status?: string; reason?: string; detail?: unknown };
+        result?: unknown;
+        error?: unknown;
+        [key: string]: unknown;
+      };
+      if (!turnResponse.ok) return this.mcpToolError(id, turn.error ?? turn);
+      if (turn.reply?.status !== "accepted") return this.mcpToolError(id, turn.reply ?? turn);
+      if (turn.error !== undefined) return this.mcpToolError(id, turn.error);
+      return this.mcpResult(id, turn.result ?? null);
+    } catch (err) {
+      // Taxonomy throws are tool failures on this surface. The JSON-RPC
+      // request must receive a tool envelope, never an HTTP transport error.
+      if (isNetError(err)) return this.mcpToolError(id, { code: err.code, message: err.message, detail: err.detail });
+      return this.mcpToolError(id, { code: "E_INTERNAL", message: String(err) });
+    }
   }
 
   /** The scenario's client contract: payloads ride
@@ -3490,48 +3571,300 @@ export class NetGatewayDO {
     for (const wake of waiters) wake();
   }
 
-  /** woo_list_reachable_tools: enumerate callable verbs from the VIEW —
-   * the actor, its room (live location / session activeScope), and the
-   * room's contents (mirror roster), each mapped over its class chain so
-   * inherited tool verbs list against the INSTANCE (`guest_1:wait` from
-   * $actor's page). View-resident-only by design: reachability is a
-   * UI/discovery surface, not an authority read. */
-  private mcpReachableTools(actor: string, session: string, limit: number): Array<{ object: string; verb: string }> {
-    const view = this.ensureView();
-    const bases = new Set<string>([actor]);
-    const live = view.get(cellKey("object_live", actor))?.value as { location?: string | null } | undefined;
-    if (typeof live?.location === "string" && live.location) bases.add(live.location);
-    const row = view.get(sessionCellKey(session))?.value as { activeScope?: string | null } | undefined;
-    if (typeof row?.activeScope === "string" && row.activeScope) bases.add(row.activeScope);
-    for (const base of [...bases]) {
-      for (const member of this.relationMembers("contents", base)) {
-        if (typeof member.member === "string") bases.add(member.member);
+  /** Resolve a paged discovery request against structural MCP context. The
+   * scope vocabulary changes presentation only; it never grants reachability. */
+  private mcpToolPage(actor: string, session: string, args: Record<string, unknown>): NetMcpToolPage {
+    const scope = mcpToolScope(args.scope);
+    const object = typeof args.object === "string" && args.object ? args.object : null;
+    const query = typeof args.query === "string" && args.query.trim() ? args.query.trim() : null;
+    const limit = mcpLimit(args.limit, MCP_DISCOVERY_DEFAULT_PAGE, MCP_DISCOVERY_MAX_PAGE);
+    const cursor = mcpCursor(args.cursor);
+    const context = this.mcpContextObjects(actor, session);
+    let selected = context;
+    let commandObjects = this.mcpActiveCommandContext(actor, session);
+
+    if (scope === "here") {
+      selected = new Set();
+      commandObjects = new Set();
+      const active = this.mcpActiveScope(actor, session);
+      if (active) {
+        selected.add(active);
+        commandObjects.add(active);
+        for (const id of this.mcpContentsContext(active, actor)) {
+          selected.add(id);
+          commandObjects.add(id);
+        }
+      }
+    } else if (scope === "object") {
+      selected = new Set();
+      if (object && context.has(object)) selected.add(object);
+      commandObjects = new Set(object && commandObjects.has(object) ? [object] : []);
+    } else if (scope === "space") {
+      selected = new Set();
+      commandObjects = new Set();
+      const active = this.mcpActiveScope(actor, session);
+      const target = object ?? active;
+      if (target && context.has(target)) {
+        selected.add(target);
+        commandObjects.add(target);
+        for (const id of this.mcpContentsContext(target, actor)) {
+          selected.add(id);
+          commandObjects.add(id);
+        }
       }
     }
-    const tools: Array<{ object: string; verb: string }> = [];
-    const seen = new Set<string>();
-    for (const base of bases) {
-      // Walk the class chain; every chain node's verb pages surface as
-      // tools on the INSTANCE.
-      let current: string | null = base;
-      const guard = new Set<string>();
-      while (current && !guard.has(current) && tools.length < limit) {
-        guard.add(current);
-        for (const cell of view.cellsForObject(current)) {
-          if (cell.kind !== "verb_bytecode" || typeof cell.name !== "string") continue;
-          const page = cell.value as { direct_callable?: boolean; tool_exposed?: boolean };
-          if (page.direct_callable !== true && page.tool_exposed !== true) continue;
-          const key = `${base}:${cell.name}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          tools.push({ object: base, verb: cell.name });
-          if (tools.length >= limit) break;
+
+    const normalized = query?.toLowerCase() ?? "";
+    const all = this.mcpToolsForObjects(actor, selected, commandObjects).filter((tool) =>
+      !normalized || tool.name.toLowerCase().includes(normalized) ||
+      tool.object.toLowerCase().includes(normalized) ||
+      tool.verb.toLowerCase().includes(normalized) ||
+      tool.description.toLowerCase().includes(normalized) ||
+      tool.aliases.some((alias) => alias.toLowerCase().includes(normalized))
+    );
+    const tools = all.slice(cursor, cursor + limit);
+    const next = cursor + tools.length;
+    return {
+      scope,
+      object,
+      query,
+      limit,
+      cursor: args.cursor === undefined ? null : String(cursor),
+      nextCursor: next < all.length ? String(next) : null,
+      total: all.length,
+      tools
+    };
+  }
+
+  /** The exact dynamic set advertised by standard tools/list and accepted by
+   * both dynamic-name calls and woo_call. Keep this one resolver authoritative. */
+  private mcpContextTools(actor: string, session: string): NetMcpDynamicTool[] {
+    return this.mcpToolsForObjects(
+      actor,
+      this.mcpContextObjects(actor, session),
+      this.mcpActiveCommandContext(actor, session)
+    );
+  }
+
+  /** The active command surface and its visible contents receive
+   * command-shaped "obvious" affordances. Self and inventory require
+   * explicit tool exposure. */
+  private mcpActiveCommandContext(actor: string, session: string): Set<string> {
+    const active = this.mcpActiveScope(actor, session);
+    if (!active) return new Set();
+    const out = this.mcpContentsContext(active, actor);
+    out.add(active);
+    return out;
+  }
+
+  private mcpContextObjects(actor: string, session: string): Set<string> {
+    const out = new Set<string>();
+    out.add(actor);
+    const active = this.mcpActiveScope(actor, session);
+    if (active) {
+      out.add(active);
+      for (const id of this.mcpContentsContext(active, actor)) out.add(id);
+    }
+    // Inventory is ordinary structural context and follows the actor across
+    // spaces. Do not recursively expand inventory containers.
+    for (const row of this.relationMembers("contents", actor)) out.add(row.member);
+    return out;
+  }
+
+  /** Complete the cells behind structural context without enumerating a
+   * scope. Relation rows carry each member's immutable authority scope; aged
+   * rows without the additive hint fall back to the relation owner's scope,
+   * which is exact for ordinary room fixtures and actor-owned inventory.
+   *
+   * The cap is shared with room-presentation hydration. Unresolved rows are
+   * memoized with exponential backoff, so a dangling member costs bounded
+   * probes rather than one retry per model tools/list call. */
+  private async warmMcpContext(actor: string, session: string): Promise<void> {
+    const active = this.mcpActiveScope(actor, session);
+    const candidates: Array<{ object: string; scope: string }> = [];
+    const addRows = (rows: ReturnType<NetGatewayDO["relationMembers"]>, fallbackScope: string): void => {
+      for (const row of rows) {
+        if (candidates.length >= MAX_ROOM_CONTENT_AUTHORITY_OBJECTS) break;
+        const scope = row.member_scope ?? fallbackScope;
+        if (this.mcpContextWarmSuccesses.has(`${scope}\0${row.member}`)) continue;
+        candidates.push({ object: row.member, scope });
+      }
+    };
+    if (active) addRows(this.relationMembers("contents", active), this.ownerScopeFor(active));
+    addRows(this.relationMembers("contents", actor), this.ownerScopeFor(actor));
+    if (candidates.length === 0) return;
+
+    const now = this.host.now();
+    const byScope = new Map<string, Set<string>>();
+    for (const candidate of candidates) {
+      const key = `${candidate.scope}\0${candidate.object}`;
+      const failure = this.mcpContextWarmFailures.get(key);
+      if (failure && failure.retryAt > now) continue;
+      const objects = byScope.get(candidate.scope) ?? new Set<string>();
+      objects.add(candidate.object);
+      byScope.set(candidate.scope, objects);
+    }
+    if (byScope.size === 0) return;
+    const pulledScopes = new Set<string>();
+    for (const [scope, objects] of byScope) {
+      try {
+        // Do not use warmScopes here: its general sparse-planning fast path
+        // deliberately skips objects whose lineage is present, while MCP
+        // needs the full per-object verb surface at least once.
+        await this.pullTargeted(scope, `scope:${scope}`, [...objects]);
+        pulledScopes.add(scope);
+      } catch (err) {
+        this.metric({ kind: "net_mcp_context_warm_failed", scope, status: "error", error: String(err) });
+      }
+    }
+
+    for (const [scope, objects] of byScope) {
+      for (const object of objects) {
+        const key = `${scope}\0${object}`;
+        if (pulledScopes.has(scope) && this.ensureView().has(cellKey("object_lineage", object))) {
+          this.mcpContextWarmFailures.delete(key);
+          this.mcpContextWarmSuccesses.delete(key);
+          this.mcpContextWarmSuccesses.add(key);
+          continue;
         }
-        const lineage = view.get(cellKey("object_lineage", current))?.value as { parent?: string | null } | undefined;
+        const attempts = Math.min((this.mcpContextWarmFailures.get(key)?.attempts ?? 0) + 1, 8);
+        const retryAt = now + Math.min(30_000, 250 * (2 ** (attempts - 1)));
+        this.mcpContextWarmFailures.set(key, { attempts, retryAt });
+      }
+    }
+    while (this.mcpContextWarmFailures.size > MCP_CONTEXT_WARM_FAILURE_CAP) {
+      const oldest = this.mcpContextWarmFailures.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.mcpContextWarmFailures.delete(oldest);
+    }
+    while (this.mcpContextWarmSuccesses.size > MCP_CONTEXT_WARM_SUCCESS_CAP) {
+      const oldest = this.mcpContextWarmSuccesses.values().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.mcpContextWarmSuccesses.delete(oldest);
+    }
+  }
+
+  private mcpActiveScope(actor: string, session: string): string | null {
+    const view = this.ensureView();
+    const row = view.get(sessionCellKey(session))?.value as { activeScope?: unknown; active_scope?: unknown } | undefined;
+    const scoped = typeof row?.activeScope === "string" ? row.activeScope : typeof row?.active_scope === "string" ? row.active_scope : null;
+    if (scoped) return scoped;
+    const live = view.get(cellKey("object_live", actor))?.value as { location?: unknown } | undefined;
+    return typeof live?.location === "string" && live.location ? live.location : null;
+  }
+
+  /** Contents normally expose their full explicit tool surface. A different
+   * live presence actor is social context, not an invocation target, so its
+   * object surface is omitted; interaction still goes through the room's
+   * say/tell verbs. `host_placement:self` is the
+   * generic structural marker for an appliance/workspace that owns a session;
+   * those objects retain their normal tool projection. */
+  private mcpContentsContext(space: string, actor: string): Set<string> {
+    const out = new Set<string>();
+    const presenceActors = new Set(
+      this.clientRelationMembers(SESSION_PRESENCE_RELATION, space)
+        .map((row) => row.member)
+        .filter((value): value is string => typeof value === "string")
+    );
+    for (const row of this.relationMembers("contents", space)) {
+      const member = row.member;
+      // Self is already the explicit actor category; do not reclassify it as
+      // a visible-content object and accidentally broaden its tool surface.
+      if (member === actor) continue;
+      const placement = this.ensureView().get(cellKey("property_cell", member, "host_placement"))?.value as { value?: unknown } | undefined;
+      const activeActorSession = this.ensureView().sessionCellsForActor(member).some((cell) => {
+        const value = cell.value as { activeScope?: unknown; active_scope?: unknown };
+        return value.activeScope === space || value.active_scope === space;
+      });
+      // Topology already distinguishes an actor cluster from a self-hosted
+      // appliance: both are cluster roots, but only the latter declares the
+      // generic host-placement marker. This also excludes offline players,
+      // which have no session_presence row but must not become maintenance
+      // tool targets merely because their body remains in the room.
+      const authorityScope = row.member_scope ?? this.ownerScopeFor(member);
+      const actorClusterRoot = authorityScope === `cluster:${member}`;
+      const otherActor = member !== actor
+        && (presenceActors.has(member) || activeActorSession || actorClusterRoot)
+        && placement?.value !== "self";
+      if (!otherActor) out.add(member);
+    }
+    return out;
+  }
+
+  private mcpToolsForObjects(
+    actor: string,
+    objects: Set<string>,
+    commandObjects: Set<string>
+  ): NetMcpDynamicTool[] {
+    const drafts: NetMcpToolDraft[] = [];
+    for (const object of [...objects].sort((a, b) => a.localeCompare(b))) {
+      drafts.push(...this.mcpObjectToolDrafts(actor, object, commandObjects.has(object)));
+    }
+    drafts.sort((a, b) => a.object.localeCompare(b.object) || a.verb.localeCompare(b.verb));
+    const used = new Set<string>();
+    return drafts.map((draft) => {
+      const base = `${mcpSanitizeId(draft.object)}__${mcpSanitizeId(draft.verb)}`;
+      let name = base;
+      let suffix = 2;
+      while (used.has(name)) name = `${base}_${suffix++}`;
+      used.add(name);
+      return { ...draft, name };
+    });
+  }
+
+  private mcpObjectToolDrafts(actor: string, object: string, allowCommandShaped: boolean): NetMcpToolDraft[] {
+    const view = this.ensureView();
+    const out: NetMcpToolDraft[] = [];
+    const seenVerbs = new Set<string>();
+    const chains: string[] = [object];
+    const features = view.get(cellKey("property_cell", object, "features"))?.value as { value?: unknown } | undefined;
+    if (Array.isArray(features?.value)) {
+      for (const feature of features.value) if (typeof feature === "string") chains.push(feature);
+    }
+    const actorLineage = view.get(cellKey("object_lineage", actor))?.value as { flags?: { wizard?: boolean } } | undefined;
+    const wizard = actorLineage?.flags?.wizard === true;
+
+    for (const start of chains) {
+      let current: string | null = start;
+      const walked = new Set<string>();
+      while (current && !walked.has(current)) {
+        walked.add(current);
+        const pages = view.cellsForObject(current)
+          .filter((cell) => cell.kind === "verb_bytecode" && typeof cell.name === "string")
+          .sort((a, b) => String(a.name).localeCompare(String(b.name)));
+        for (const cell of pages) {
+          const verb = cell.name as string;
+          if (seenVerbs.has(verb)) continue;
+          seenVerbs.add(verb); // an override hides every inherited page, exposed or not
+          const page = cell.value as Record<string, unknown>;
+          if (page.kind !== "bytecode") continue;
+          const argSpec = mcpRecord(page.arg_spec);
+          const command = mcpRecord(argSpec.command);
+          const commandShaped = Object.keys(command).length > 0;
+          const exposed = page.tool_exposed === true || (allowCommandShaped && commandShaped);
+          if (!exposed) continue;
+          const perms = typeof page.perms === "string" ? page.perms : "";
+          const owner = typeof page.owner === "string" ? page.owner : "";
+          if (!wizard && owner !== actor && !perms.includes("x")) continue;
+          const aliases = Array.isArray(page.aliases) ? page.aliases.filter((value): value is string => typeof value === "string") : [];
+          const source = typeof page.source === "string" ? page.source : "";
+          const input = mcpInputSchema(argSpec);
+          const callForm = `${object}:${verb}(${input.args.join(", ")})`;
+          const paragraph = mcpFirstParagraph(source);
+          out.push({
+            object,
+            verb,
+            aliases,
+            description: paragraph ? `${paragraph}\n\nCall: ${callForm}` : `Call: ${callForm}`,
+            inputSchema: input.schema,
+            argNames: input.args
+          });
+        }
+        const lineage = view.get(cellKey("object_lineage", current))?.value as { parent?: unknown } | undefined;
         current = typeof lineage?.parent === "string" ? lineage.parent : null;
       }
     }
-    return tools;
+    return out;
   }
 
   /**
@@ -4135,15 +4468,16 @@ export class NetGatewayDO {
     throw new ClientAuthError("relation not readable in the caller's presence", { owner }, "E_PERM", 403);
   }
 
-  private relationMembers(relation: string, owner: string): Array<{ member: string; body?: unknown }> {
-    return sqlRows<{ member: string; body: string | null }>(
+  private relationMembers(relation: string, owner: string): Array<{ member: string; member_scope?: string; body?: unknown }> {
+    return sqlRows<{ member: string; member_scope: string | null; body: string | null }>(
       this.state.storage.sql.exec(
-        "SELECT member, body FROM net_gateway_relation WHERE relation = ? AND owner = ? ORDER BY member ASC",
+        "SELECT member, member_scope, body FROM net_gateway_relation WHERE relation = ? AND owner = ? ORDER BY member ASC",
         relation,
         owner
       )
     ).map((row) => ({
       member: row.member,
+      ...(row.member_scope !== null ? { member_scope: row.member_scope } : {}),
       ...(row.body !== null ? { body: JSON.parse(row.body) as unknown } : {})
     }));
   }
@@ -4170,7 +4504,14 @@ export class NetGatewayDO {
    * members (contents, …) and passes through unchanged.
    */
   private clientRelationMembers(relation: string, owner: string): Array<{ member: string; body?: unknown }> {
-    if (relation !== SESSION_PRESENCE_RELATION) return this.relationMembers(relation, owner);
+    if (relation !== SESSION_PRESENCE_RELATION) {
+      // `member_scope` is internal routing metadata, not part of the public
+      // relation shape. Do not accidentally grow the client surface.
+      return this.relationMembers(relation, owner).map((row) => ({
+        member: row.member,
+        ...(row.body !== undefined ? { body: row.body } : {})
+      }));
+    }
     const rows: RelationRow[] = sqlRows<{ member: string; body: string | null }>(
       this.state.storage.sql.exec(
         "SELECT member, body FROM net_gateway_relation WHERE relation = ? AND owner = ?",
@@ -5658,13 +5999,14 @@ export class NetGatewayDO {
     const key = relationKey(delta.row.relation, delta.row.owner, delta.row.member);
     if (delta.op === "add") {
       this.state.storage.sql.exec(
-        "INSERT INTO net_gateway_relation (key, relation, owner, member, body, owner_scope) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET body = excluded.body, owner_scope = excluded.owner_scope",
+        "INSERT INTO net_gateway_relation (key, relation, owner, member, body, owner_scope, member_scope) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET body = excluded.body, owner_scope = excluded.owner_scope, member_scope = excluded.member_scope",
         key,
         delta.row.relation,
         delta.row.owner,
         delta.row.member,
         delta.row.body !== undefined ? JSON.stringify(delta.row.body) : null,
-        this.ownerScopeFor(delta.row.owner)
+        this.ownerScopeFor(delta.row.owner),
+        delta.row.member_scope ?? null
       );
     } else {
       this.state.storage.sql.exec("DELETE FROM net_gateway_relation WHERE key = ?", key);
@@ -5760,6 +6102,148 @@ function json(body: unknown, status = 200, headers: Record<string, string> = {})
 
 /** MCP adapter bounds (client-shell phase i). */
 const MCP_QUEUE_CAP = 256;
+const MCP_STANDARD_TOOL_PAGE = 128;
+const MCP_DISCOVERY_DEFAULT_PAGE = 64;
+const MCP_DISCOVERY_MAX_PAGE = 256;
+const MCP_CONTEXT_WARM_FAILURE_CAP = 512;
+const MCP_CONTEXT_WARM_SUCCESS_CAP = 512;
+
+type NetMcpToolScope = "active" | "here" | "object" | "space" | "all";
+
+type NetMcpToolDraft = {
+  object: string;
+  verb: string;
+  aliases: string[];
+  description: string;
+  inputSchema: Record<string, unknown>;
+  argNames: string[];
+};
+
+type NetMcpDynamicTool = NetMcpToolDraft & { name: string };
+
+type NetMcpToolPage = {
+  scope: NetMcpToolScope;
+  object: string | null;
+  query: string | null;
+  limit: number;
+  cursor: string | null;
+  nextCursor: string | null;
+  total: number;
+  tools: NetMcpDynamicTool[];
+};
+
+function mcpRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function mcpToolScope(value: unknown): NetMcpToolScope {
+  if (value === undefined || value === null || value === "") return "active";
+  if (value === "active" || value === "here" || value === "object" || value === "space" || value === "all") return value;
+  throw new Error("scope must be one of active, here, object, space, all");
+}
+
+function mcpLimit(value: unknown, fallback: number, cap: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return fallback;
+  return Math.min(Math.max(Math.floor(value), 1), cap);
+}
+
+function mcpCursor(value: unknown): number {
+  if (value === undefined || value === null || value === "") return 0;
+  if (typeof value !== "string" && typeof value !== "number") return 0;
+  const parsed = Number.parseInt(String(value), 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+function mcpSanitizeId(value: string): string {
+  return value.replace(/^\$/, "").replace(/[^a-zA-Z0-9_]/g, "_");
+}
+
+function mcpFirstParagraph(source: string): string {
+  const block = /\/\*([\s\S]*?)\*\//.exec(source);
+  if (block) return block[1].split(/\n\s*\n/)[0].replace(/^\s*\*?\s?/gm, "").trim();
+  const line = /^\s*\/\/\s?(.*)$/m.exec(source);
+  return line?.[1]?.trim() ?? "";
+}
+
+function mcpInputSchema(argSpec: Record<string, unknown>): { schema: Record<string, unknown>; args: string[] } {
+  const raw = Array.isArray(argSpec.args) ? argSpec.args : Array.isArray(argSpec.params) ? argSpec.params : [];
+  const declarations = raw.filter((value): value is string => typeof value === "string");
+  const types = mcpRecord(argSpec.types);
+  const command = mcpRecord(argSpec.command);
+  const argumentSources = Array.isArray(command.args_from)
+    ? command.args_from.filter((value): value is string => typeof value === "string")
+    : [];
+  const args: string[] = [];
+  const properties: Record<string, unknown> = {};
+  const required: string[] = [];
+  for (const [index, declaration] of declarations.entries()) {
+    const optional = declaration.endsWith("?");
+    const name = optional ? declaration.slice(0, -1) : declaration;
+    if (!name) continue;
+    args.push(name);
+    const explicitHint = typeof types[name] === "string" ? types[name] as string : "";
+    properties[name] = explicitHint
+      ? mcpSchemaForHint(explicitHint)
+      : mcpSchemaForCommandSource(argumentSources[index]);
+    if (!optional) required.push(name);
+  }
+  return {
+    args,
+    schema: {
+      type: "object",
+      properties,
+      ...(required.length > 0 ? { required } : {})
+    }
+  };
+}
+
+/** Command parsing metadata is also useful schema metadata. These sources
+ * have stable runtime shapes (MA4.1), so preserve them when a catalog has not
+ * supplied the optional `arg_spec.types` extension. */
+function mcpSchemaForCommandSource(source: string | undefined): Record<string, unknown> {
+  if (!source) return {};
+  if (["text", "verb", "argstr", "prep", "dobjstr", "dobj_prefix_rest", "iobjstr"].includes(source)) {
+    return { type: "string" };
+  }
+  if (["dobj", "dobj_prefix", "iobj"].includes(source)) return { type: "string" };
+  if (source === "cmd") return { type: "object" };
+  return {};
+}
+
+function mcpSchemaForHint(raw: string): Record<string, unknown> {
+  const hint = raw.trim().toLowerCase();
+  if (!hint) return {};
+  if (hint.includes("|")) return { anyOf: hint.split("|").map((part) => mcpSchemaForHint(part)) };
+  if (hint.startsWith("list")) return { type: "array", items: {} };
+  if (hint === "int" || hint === "integer") return { type: "integer" };
+  if (hint === "num" || hint === "number" || hint === "float") return { type: "number" };
+  if (hint === "bool" || hint === "boolean") return { type: "boolean" };
+  if (hint === "map" || hint === "object") return { type: "object" };
+  if (hint === "str" || hint === "string" || hint === "obj") return { type: "string" };
+  if (hint === "null") return { type: "null" };
+  return {};
+}
+
+function mcpNamedArgs(tool: NetMcpDynamicTool, values: Record<string, unknown>): unknown[] {
+  return tool.argNames.map((name) => values[name] ?? null);
+}
+
+function mcpProtocolTool(tool: NetMcpDynamicTool): { name: string; description: string; inputSchema: Record<string, unknown> } {
+  return { name: tool.name, description: tool.description, inputSchema: tool.inputSchema };
+}
+
+function mcpToolSummary(tool: NetMcpDynamicTool, includeSchema: boolean): Record<string, unknown> {
+  return {
+    name: tool.name,
+    object: tool.object,
+    verb: tool.verb,
+    aliases: tool.aliases,
+    args: tool.argNames,
+    description: tool.description,
+    ...(includeSchema ? { input_schema: tool.inputSchema } : {})
+  };
+}
+
 /** The tool set the walkthrough's client contract uses — an ENVELOPE
  * around the net client surface, never a second path. */
 const MCP_TOOL_DEFS = [
@@ -5779,7 +6263,17 @@ const MCP_TOOL_DEFS = [
   },
   {
     name: "woo_list_reachable_tools",
-    description: "Enumerate callable verbs on the actor, its room, and the room's contents.",
-    inputSchema: { type: "object", properties: { scope: { type: "string" }, limit: { type: "number" } } }
+    description: "Page and filter dynamic tools in the session's structural context.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        scope: { type: "string", enum: ["active", "here", "object", "space", "all"] },
+        object: { type: "string" },
+        query: { type: "string" },
+        limit: { type: "number" },
+        cursor: { type: "string" },
+        include_schema: { type: "boolean" }
+      }
+    }
   }
 ] as const;

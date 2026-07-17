@@ -50,10 +50,19 @@ async function main(): Promise<void> {
   try {
     await client.connect(transport);
     const listed = await client.listTools();
-    const names = listed.tools.map((tool) => tool.name).sort();
-    const expected = ["woo_call", "woo_list_reachable_tools", "woo_wait"];
-    if (JSON.stringify(names) !== JSON.stringify(expected)) {
-      throw new Error(`unexpected Net MCP tools: ${JSON.stringify(names)}`);
+    const listedTools = [...listed.tools];
+    let nextCursor = listed.nextCursor;
+    for (let page = 1; nextCursor && page < 16; page += 1) {
+      const next = await client.listTools({ cursor: nextCursor });
+      listedTools.push(...next.tools);
+      nextCursor = next.nextCursor;
+    }
+    if (nextCursor) throw new Error("Net MCP tools/list exceeded the bounded 16-page smoke limit");
+    const names = listedTools.map((tool) => tool.name).sort();
+    if (new Set(names).size !== names.length) throw new Error("Net MCP tools/list returned duplicate names across pages");
+    const stable = ["woo_call", "woo_list_reachable_tools", "woo_wait"];
+    if (!stable.every((name) => names.includes(name)) || !names.includes("the_chatroom__look")) {
+      throw new Error(`Net MCP omitted stable or contextual tools: ${JSON.stringify(names)}`);
     }
 
     const reachable = assertOk("woo_list_reachable_tools", await client.callTool({
@@ -61,7 +70,7 @@ async function main(): Promise<void> {
       arguments: { scope: "all", limit: 200 }
     }) as ToolResult);
     const tools = (reachable.structuredContent?.result as { tools?: Array<{ object?: string; verb?: string }> } | undefined)?.tools ?? [];
-    if (!tools.some((tool) => /^guest_/.test(tool.object ?? "") && tool.verb === "wait")) {
+    if (!tools.some((tool) => /^guest_/.test(tool.object ?? ""))) {
       throw new Error(`Net MCP did not resolve its carried actor: ${JSON.stringify(tools.slice(0, 12))}`);
     }
 
@@ -82,7 +91,7 @@ async function main(): Promise<void> {
       arguments: { timeout_ms: 0, limit: 10 }
     }) as ToolResult);
 
-    console.log(`Net MCP stdio smoke passed (${listed.tools.length} stable tools)`);
+    console.log(`Net MCP stdio smoke passed (${stable.length} stable + ${listedTools.length - stable.length} contextual tools)`);
   } catch (error) {
     const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
     if (stderr) console.error(stderr);

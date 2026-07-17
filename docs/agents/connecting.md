@@ -51,18 +51,18 @@ The API key resolves to a **session + actor** pair:
 MCP adds no authority. Verb permissions are evaluated for the actor bound to
 the API key, exactly as on the browser Net path.
 
-The current Net surface has three stable tools:
+The Net surface publishes dynamic named tools from the actor's current space,
+its direct contents, and inventory. It also has three stable controls:
 
-- `woo_list_reachable_tools` discovers callable `{object, verb}` pairs from the
-  gateway's current actor/room/contents view.
+- `woo_list_reachable_tools` provides filtering, paging, schemas, and canonical
+  object/verb descriptors.
 - `woo_call` submits one of those calls through the normal Net turn path.
 - `woo_wait` long-polls the same presence-routed fanout used by WebSocket
   sessions.
 
-Dynamic MCP-named verbs, focus/unfocus wrappers, schema-rich paged discovery,
-and `notifications/tools/list_changed` remain part of the full protocol
-contract but are not yet implemented by Net. Do not write a Net agent that
-depends on them until the NC9 migration matrix marks those contracts covered.
+MCP focus/unfocus wrappers are intentionally not part of reachability.
+`notifications/tools/list_changed` is not yet implemented; re-list after
+navigation or a containment-changing action.
 
 ## Disconnect and reconnect
 
@@ -75,15 +75,15 @@ survive gateway eviction.
 
 ## Quick connectivity check
 
-Call:
+Use standard `tools/list`, or call:
 
 ```
 woo_list_reachable_tools(scope: "all", limit: 200)
 ```
 
-The current implementation returns `{tools: [{object, verb}, ...]}`. A carried
-guest development identity should include its actor's inherited `wait` verb and
-the starting room's callable verbs.
+The result contains paged descriptors with tool name, object, verb, aliases,
+arguments, and description. A development identity should see starting-room
+tools and tools on contextual fixtures.
 
 ## Common configuration mistakes
 

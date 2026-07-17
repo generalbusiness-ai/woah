@@ -134,7 +134,12 @@ export function partitionInstallRelations(cells: readonly NetCellInput[]): Map<s
     if (typeof location !== "string" || !location || location === "$nowhere") continue;
     const scope = classifier.scopeOf(location);
     const rows = out.get(scope) ?? [];
-    rows.push({ relation: "contents", owner: location, member: cell.object });
+    rows.push({
+      relation: "contents",
+      owner: location,
+      member: cell.object,
+      member_scope: classifier.scopeOf(cell.object)
+    });
     out.set(scope, rows);
   }
   for (const rows of out.values()) rows.sort((a, b) => `${a.owner}\0${a.member}`.localeCompare(`${b.owner}\0${b.member}`));

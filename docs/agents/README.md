@@ -12,10 +12,10 @@ sessions.
 3. [observations.md](observations.md) — live events through `woo_wait`.
 4. [../using/](../using/) — the catalog verbs agents encounter.
 
-## The current Net loop
+## The Net loop
 
 ```
-list reachable {object, verb} pairs
+list dynamic tools
    ↓
 call one through woo_call
    ↓
@@ -26,18 +26,18 @@ re-list after movement
 repeat
 ```
 
-The stable surface is deliberately small:
+Dynamic object tools are the primary surface. Three stable controls support
+compact discovery, stale-metadata recovery, and observation polling:
 
 | Tool | Purpose |
 | --- | --- |
-| `woo_list_reachable_tools(scope?, limit?)` | Discover callable object/verb pairs in the current gateway view. |
+| `woo_list_reachable_tools(scope?, object?, query?, limit?, cursor?, include_schema?)` | Page and filter canonical descriptors in structural context. |
 | `woo_call(object, verb, args?)` | Invoke one reachable verb through the Net turn path. |
 | `woo_wait(timeout_ms?, limit?)` | Long-poll live observations queued for this session. |
 
-The full MCP specification also defines dynamic named tools, focus/unfocus,
-schemas, paging, filters, and list-change notifications. Those features exist
-on the classic rollback host but are explicit Net migration gaps; they are not
-part of the current deployed surface.
+Net publishes schema-backed dynamic named tools. It deliberately does not use
+MCP focus/unfocus wrappers. List-change notifications remain deferred, so
+re-list after navigation or containment changes.
 
 ## What an authoring agent can call
 

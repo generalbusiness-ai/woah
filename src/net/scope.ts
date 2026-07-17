@@ -1171,7 +1171,10 @@ export class ScopeSequencer {
    * scope's row family — the CO9 dual-write this module exists to
    * prevent. Single-scope contents rebuilds keep everything. */
   rebuildRelations(): void {
-    const rebuilt = rebuildContentsRelation([...this.store.keys()].map((key) => this.store.get(key)).filter((c): c is Cell => Boolean(c)));
+    const rebuilt = rebuildContentsRelation(
+      [...this.store.keys()].map((key) => this.store.get(key)).filter((c): c is Cell => Boolean(c)),
+      this.scope
+    );
     if (this.options.scopeOf) {
       for (const [key, row] of [...rebuilt]) {
         if (this.options.scopeOf(row.owner) !== this.scope) rebuilt.delete(key);

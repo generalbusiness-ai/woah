@@ -21,6 +21,12 @@ export type RelationRow = {
   relation: string;
   owner: string;
   member: string;
+  /** Immutable authority scope for the member object, when the producer can
+   * classify it. This is a routing hint, not a second copy of object truth:
+   * consumers use it only to issue a targeted closure read at the member's
+   * one authority. Presence rows omit it because their member is a session
+   * bearer rather than an ordinary object ref. */
+  member_scope?: string;
   /** Small JSON payload (e.g. presence rows carry the actor). */
   body?: unknown;
 };
@@ -203,6 +209,12 @@ export function deriveRelationDeltas(
   const local: RelationDelta[] = [];
   const foreign = new Map<string, RelationDelta[]>();
   for (const delta of deltas.values()) {
+    if (scopeOf && delta.row.relation === "contents") {
+      // Object anchors do not change when the object moves. Carrying this
+      // compact hint with the derived membership lets a cold consumer fetch
+      // a contextual member without a forbidden global object lookup.
+      delta.row.member_scope = scopeOf(delta.row.member);
+    }
     const ownerScope = scopeOf ? scopeOf(delta.row.owner) : homeScope;
     if (ownerScope === homeScope) {
       local.push(delta);
@@ -280,10 +292,10 @@ export function applyRelationDeltas(rows: Map<string, RelationRow>, deltas: Rela
     const key = relationKey(delta.row.relation, delta.row.owner, delta.row.member);
     if (delta.op === "add") {
       const existing = rows.get(key);
-      // Same key ⇒ relation/owner/member already match; only the body can
-      // differ. Bodies come from the single derivation path, so plain
-      // JSON comparison is stable here.
-      if (existing && JSON.stringify(existing.body) === JSON.stringify(delta.row.body)) continue;
+      // Same key ⇒ relation/owner/member already match. The projection
+      // body and immutable member-authority hint can both evolve as an aged
+      // row is refreshed, so compare the complete row.
+      if (existing && JSON.stringify(existing) === JSON.stringify(delta.row)) continue;
       rows.set(key, delta.row);
     } else {
       if (!rows.delete(key)) continue; // removing an absent row changes nothing
@@ -304,13 +316,18 @@ export function applyRelationDeltas(rows: Map<string, RelationRow>, deltas: Rela
  * commits + /net/relate delivery); single-scope worlds rebuild both from
  * the same store because everything anchors together there.
  */
-export function rebuildContentsRelation(cells: Iterable<Cell>): Map<string, RelationRow> {
+export function rebuildContentsRelation(cells: Iterable<Cell>, memberScope?: string): Map<string, RelationRow> {
   const rows = new Map<string, RelationRow>();
   for (const cell of cells) {
     if (cell.kind !== "object_live") continue;
     const location = (cell.value as { location?: unknown } | null)?.location;
     if (typeof location !== "string" || !location) continue;
-    const row: RelationRow = { relation: "contents", owner: location, member: cell.object };
+    const row: RelationRow = {
+      relation: "contents",
+      owner: location,
+      member: cell.object,
+      ...(memberScope ? { member_scope: memberScope } : {})
+    };
     rows.set(relationKey("contents", location, cell.object), row);
   }
   return rows;

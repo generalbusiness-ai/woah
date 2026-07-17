@@ -135,23 +135,21 @@ than failing.
 
 ---
 
-## AR5. Human navigation and MCP focus
+## AR5. Human navigation and agent context
 
-`$actor.focus_list` remains the MCP working set: agents use it to make
-objects reachable through tools. Browser URL navigation is human UI
-state. The two concepts are related but not the same contract:
+Browser URL navigation is client UI state. Net MCP context is structural:
+the session actor, active space, its direct contents, and inventory. Neither
+surface consumes `$actor.focus_list`.
 
-- A human client navigating to `/objects/X` MAY call `$me:focus(X)` as
-  a convenience so the object also joins the actor's MCP working set.
-- A client MUST NOT treat arbitrary `$me:focus(X)` calls as browser
-  navigation commands. Agents use MCP focus for their own working set;
-  their focus changes should not make a human browser tab jump.
-- If a deployment wants shared human/agent co-navigation, it should be
-  an explicit collaboration feature layered on top of this spec, not
-  default URL behavior.
+- Browser navigation MUST NOT mutate `focus_list` merely to make MCP tools
+  appear.
+- An in-world `focus` call MUST NOT make a browser tab jump or broaden Net MCP
+  reachability.
+- Shared human/agent co-navigation is an explicit collaboration feature, not
+  implicit coupling between URL state and actor properties.
 
-For v1, URL state is the client's primary navigation state. MCP focus
-is optional integration state.
+For v1, URL state remains the browser's primary navigation state and movement
+changes MCP context through the ordinary session active-space transition.
 
 ---
 
@@ -307,8 +305,7 @@ actor, not the sharer's.
 
 Clients SHOULD use the browser History API (`pushState` /
 `replaceState`) so back / forward work natively. No additional
-substrate hooks are needed; navigation is client state. An
-implementation MAY also update `$actor.focus_list` per AR5.
+substrate hooks are needed; navigation is client state.
 
 Restoring a tab from history MUST re-fetch the object's current state
 (the world may have moved since the URL was first visited). Clients
@@ -325,8 +322,8 @@ A client conforms to this section if:
    dispatches to the matching renderer (AR2, AR4).
 2. In-app navigation updates the URL via History API or equivalent
    (AR11).
-3. Browser URL changes do not require MCP focus changes, and MCP focus
-   changes do not drive browser navigation (AR5).
+3. Browser URL changes and in-world focus changes neither drive each other nor
+   alter Net MCP structural context (AR5).
 4. `?view=<name>` is honoured when the renderer recognises the value;
    unknown values fall back to the class default (AR3, AR4).
 5. Navigation generation for "share link" and cross-view jumps
@@ -354,8 +351,7 @@ all catalog classes have navigation verbs. The minimum profile is:
    generic, not-found, and no-access fallbacks.
 3. Update the URL when the user navigates between already-known bundled
    renderers.
-4. Treat MCP focus as optional integration state, not as browser
-   navigation input.
+4. Keep browser URL state independent from the actor's in-world focus list.
 
 That profile is enough for refresh/back/share-by-copying-the-current
 URL. `:locate()` blocks only generated share links and catalog-authored
@@ -411,10 +407,9 @@ isn't in this revision.
   `$actor.bookmarks` property; not in v1. Per-actor state already
   exists for focus; bookmarks are a separate persistent store.
 
-- **Primary-vs-auxiliary focus split (AR5).** v1 treats browser
-  navigation and MCP focus as separate surfaces. A clean substrate
-  split into "primary" and "auxiliary" focus may still be useful for
-  agent tooling, but it is not required for URL routing.
+- **Primary-vs-auxiliary focus split (AR5).** Net MCP no longer uses focus as a
+  protocol working set. Catalogs may still define richer in-world working-set
+  semantics, but they are unrelated to URL routing.
 
 - **Server-side rendering / SEO.** A non-SPA HTML response for
   `/objects/<id>` (so crawlers and link-preview unfurlers get

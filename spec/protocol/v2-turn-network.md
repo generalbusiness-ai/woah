@@ -2470,8 +2470,9 @@ The first production deployment of this wire path targets a separate
 namespace where v1 compatibility is not maintained. On that namespace, MCP is
 the first v2 consumer: McpGateway is a pure v2 client for world/object verb
 calls (live versus durable persistence follows `arg_spec.command.persistence`,
-with both modes submitted through `/v2/envelope`), while MCP queue/focus
-controls remain local protocol state.
+with both modes submitted through `/v2/envelope`), while its classic MCP queue
+and focus controls remain local rollback-protocol state. Net MCP uses
+structural context and the Net client-turn path instead.
 The legacy production namespace stays on v1 unchanged; browsers and v1 MCP
 clients continue to use it. See
 [notes/2026-05-13-mcp-first-v2.md](../../notes/2026-05-13-mcp-first-v2.md)

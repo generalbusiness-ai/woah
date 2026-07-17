@@ -76,10 +76,11 @@ primary architecture.
 
 Status: first classification, lane split, and independent Net/classic lane
 validation complete. See
-`notes/2026-07-17-classic-net-test-contract-matrix.md`. The matrix identifies
-full MCP discovery/control parity and a default-localdev browser scenario as
-remaining deletion blockers; no classic implementation or test has been
-deleted.
+`notes/2026-07-17-classic-net-test-contract-matrix.md`. Dynamic MCP discovery,
+schema-rich paging, and structural navigation are now covered; the remaining
+MCP lifecycle decision is `tools/list_changed`. The matrix also identifies a
+default-localdev browser scenario as a deletion blocker. No classic
+implementation or test has been deleted.
 
 The default suite intentionally contains many classic consumers. Deletion must
 classify tests by contract, not by import name:

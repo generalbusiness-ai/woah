@@ -20,7 +20,7 @@ gates.
 | `shadow-browser-node`, `shadow-commit-scope`, `shadow-relay-cache`, `shadow-turn-exec`, `v2-state-transfer-warmfill`, `v2-capability-gossip-routing`, `v2-browser-delegation` | v2 relay/cache authority, state transfer proofs, commit-scope selection, executor gossip/delegation | Net scope ownership and conflict rules: `net/scope`, `net/scope-store`, `worker/net-do`, `worker/net-topology-turn`, `worker/net-turn-structure`; durable delivery: `worker/net-scope-fanout`, `worker/net-outbox-bounded` | `test:classic`; Net evidence in default/worker lanes | **Retire v2 mechanisms.** Net does not route by executor gossip or accept browser-signed execution capsules. Keep classic tests until rollback ends. |
 | `dev-v2-durable-turn-parity`, `dev-v2-fanout`, `dev-v2-commit`, `v2-fanout-projection`, `v2-reply-predicates`, `v2-turn-network-spec` | Local dev parity with CF commit/reply/fanout, cross-room audience, SQLite restart, v2 wire predicates | Default `npm run dev` now runs the Net-only Worker under workerd; `worker/net-do`, `worker/net-scope-fanout`, `worker/net-ws`, `client/net-feed`, `smoke:net-dev`, and the stdio smoke exercise the replacement path | `test:classic`; Net fake-DO + workerd | **Covered for Net outcomes; classic wire retired.** Keep rollback tests until NC9. |
 | `session-lifecycle.test.ts` and classic Directory/session cases | Close/reap, bounded session count, stale sessions excluded from movement/location | `net/sessions`, `net/client-session-policy`, `worker/net-session-reap`, `worker/net-client-api`, `client/net-feed` re-mint/close/reconnect | `test:classic`; Net default/worker | **Covered.** Net session cells and presence rows replace classic socket/Directory attachment state; the storage shapes are intentionally different. |
-| `mcp.test.ts`, `mcp-warm-authority`, `smoke/v2-mcp-smoke`, `v2-mcp-e2e` | MCP handshake/session, tool discovery and schemas, direct/sequenced calls, focus, dynamic list-change, observations, HTTP transport | `worker/net-mcp.test.ts` covers initialize, SDK-valid `tools/list`, carried actor discovery, call/error envelopes, command planning, cross-actor wait, movement, take/drop, and close; `net-stdio-proxy` unit tests plus `smoke:mcp:stdio` cover the real SDK over workerd/stdio | Net default + worker + workerd; classic rollback | **Partially covered; deletion blocked.** Net still lacks dynamic named tools, `woo_focus`/`woo_unfocus`, schema-rich paging/filtering, `notifications/tools/list_changed`, and classic inline `observations`/`applied` result fields. |
+| `mcp.test.ts`, `mcp-warm-authority`, `smoke/v2-mcp-smoke`, `v2-mcp-e2e` | MCP handshake/session, dynamic discovery and schemas, invocation, navigation robustness, observations, HTTP transport | `worker/net-mcp.test.ts` covers initialize, SDK-valid dynamic `tools/list`, schema-rich paging/filtering, shared discovery/invocation reachability, cold contextual tasks, inventory continuity, cross-actor exclusion/wait, movement, take/drop, backoff, and close; `net-stdio-proxy` unit tests plus `smoke:mcp:stdio` cover the real SDK over workerd/stdio | Net default + worker + workerd; classic rollback | **Substantially covered; notification gap remains.** Focus wrappers and inline classic applied/observation fields are intentionally retired by the structural-context/`woo_wait` contract. Net still lacks session-specific `notifications/tools/list_changed`. |
 | `scope-executor-garden-probe`, `a2-fanout-lineage-closure`, `b-i-read-closure-parity`, `b-iii-incremental-merge`, classic portions of `worker/rpc-fault-inject` and `worker/cf-local-structural` | v2 sparse repair, authority slices, reconstruction, crash windows, tail delivery and structural budgets | Net repair/conflict/budget/fault coverage lives in `worker/net-gateway-repair`, `worker/net-turn-structure`, `worker/net-outbox-bounded`, `worker/net-scope-fanout`, and Net load/workerd lanes | classic rollback; Net worker/workerd | **Mechanism-specific tests remain rollback-only.** Port any user-visible guarantee found missing; do not port authority-slice vocabulary into Net. |
 | `cf-do-migrations.test.ts`, classic Worker binding/route tests | Wrangler migration history and ability to address rollback DO classes | No replacement until class deletion; Net-only build proves the replacement bundle excludes classic classes | `npm test`, deploy preflight | **Keep through deletion migration.** This is an operator safety gate, not stale behavior coverage. |
 
@@ -40,9 +40,11 @@ the named replacement column above is the evidence.
 
 ## Open deletion blockers discovered by the matrix
 
-1. **Full MCP discovery/control parity.** Net's three stable envelope tools are
-   sufficient for current browser-independent agent loops but do not satisfy
-   the implemented MCP specification's dynamic-tool and focus contracts.
+1. **MCP list-change lifecycle.** Dynamic tools, schema-rich discovery, and
+   structural navigation are covered. Net still advertises `listChanged:false`;
+   implement the session-specific notification or explicitly retain the
+   re-list-after-navigation profile before deleting the classic notification
+   tests.
 2. **Default-localdev browser coverage.** The existing `e2e:net` lane targets a
    configured Net Worker. Add and run a first-run/install/persisted-restart
    scenario against `npm run dev`; HTTP, SDK stdio, fake-DO, and workerd
@@ -50,9 +52,8 @@ the named replacement column above is the evidence.
 
 ## Next port order
 
-1. Implement Net MCP focus/unfocus and schema-rich discovery, then dynamic
-   named tools/list-change if the protocol remains normative; port the exact
-   `mcp.test.ts` cases as each contract lands.
+1. Decide and test the Net `tools/list_changed` lifecycle. Do not reintroduce
+   focus wrappers: structural context is now the normative navigation model.
 2. Run `e2e:net` against the new default local composition and add a dedicated
    first-run/install/persisted-restart browser scenario.
 3. Only after the NC9 traffic and backup gates, delete v2 client/host/DO tests
