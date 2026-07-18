@@ -26,6 +26,7 @@
 import { describe, expect, it } from "vitest";
 import { FakeDurableObjectState } from "./fake-do";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
+import { NetAuditDO } from "../../src/worker/net/audit-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
 import { installVerb } from "../../src/core/authoring";
 import { createWorld } from "../../src/core/bootstrap";
@@ -131,6 +132,7 @@ async function buildHarness() {
   const placed = await world.directCall("capi-genesis-place", actor, actor, "moveto", ["capi_room"], { sessionId: session.id });
   expect(placed.op).toBe("result");
   world.ensureApiKey("$wiz", actor, KEY_ID, KEY_SECRET, "net-client-api-test");
+  world.setCustomerOf(actor, { customer: "acct_capi", derived_via: "account" });
   world.setProp("$catalog_registry", "installed_catalogs", [{
     alias: "dubspace",
     catalog: "dubspace",
@@ -142,6 +144,7 @@ async function buildHarness() {
   // A second authenticated identity for the actor_mismatch case.
   const other = world.auth("guest:net-client-api-2").actor;
   world.ensureApiKey("$wiz", other, "capi-key-2", "capi-secret-2", "net-client-api-test-2");
+  world.setCustomerOf(other, { customer: "acct_other", derived_via: "account" });
 
   const installCells = cellsFromSerialized(world.exportWorld());
   const partitions = partitionCells(installCells);
@@ -172,9 +175,12 @@ async function buildHarness() {
       if (!instance) throw new Error(`unresolvable destination ${destination}`);
       return instance;
     }
+    if (destination === "audit:audit-0") return auditDO;
     throw new Error(`unresolvable destination ${destination}`);
   };
-  const scopeEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve };
+  const scopeEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: resolve, NET_AUDIT_SHARDS: "1" };
+  const auditState = netState("audit-0");
+  const auditDO = new NetAuditDO(auditState.state, { WOO_INTERNAL_SECRET: SECRET });
   const { signInternalRequest } = await import("../../src/worker/internal-auth");
   const signedTo = async (instance: NetScopeDO | NetGatewayDO, path: string, body: unknown) => {
     const req = new Request(`https://do${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -200,13 +206,15 @@ async function buildHarness() {
   const gatewayEnv: NetGatewayEnv = {
     WOO_INTERNAL_SECRET: SECRET,
     NET_RESOLVE: resolve,
+    NET_AUDIT_SHARDS: "1",
     METRICS: { writeDataPoint: (point) => metricPoints.push(point) }
   };
   const gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
   gateways.set("net-api", gateway);
   states.push(gatewayState);
 
-  return { gateway, actor, other, roomScope, resolvedDestinations, metricPoints, close: () => states.forEach((st) => st.close()) };
+  states.push(auditState);
+  return { gateway, actor, other, roomScope, resolvedDestinations, metricPoints, auditDO, scopeEnv, close: () => states.forEach((st) => st.close()) };
 }
 
 describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
@@ -580,6 +588,78 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     const read = await clientFetch(h.gateway, "GET", "/net-api/cell?key=object_live:capi_box", { token });
     expect(read.status).toBe(401);
 
+    h.close();
+  });
+});
+
+describe("/net-api/audit — the customer query surface (audit.md AU7/AU10.5)", () => {
+  it("a customer sees exactly their partition; naming another partition is a named refusal; the operator may name any", async () => {
+    const h = await buildHarness();
+    // Mint a session and commit one turn so the acting partition has a record.
+    const session = await clientFetch(h.gateway, "POST", "/net-api/session", {
+      token: `apikey:${KEY_ID}:${KEY_SECRET}`,
+      body: {}
+    });
+    expect(session.status).toBe(200);
+    const turn = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+      token: `apikey:${KEY_ID}:${KEY_SECRET}`,
+      body: { target: "capi_box", verb: "bump", session: (session.body as { session?: string }).session }
+    });
+    expect(turn.status).toBe(200);
+    // Kick pending scope drains (fake lane: no alarms), then settle.
+    await clientFetch(h.gateway, "POST", "/net-api/turn", {
+      token: `apikey:${KEY_ID}:${KEY_SECRET}`,
+      body: { target: "capi_box", verb: "bump", session: (session.body as { session?: string }).session }
+    });
+    for (let i = 0; i < 6; i += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+
+    // AU10.5: the caller's own partition is implicit and populated...
+    const mine = await clientFetch(h.gateway, "POST", "/net-api/audit", {
+      token: `apikey:${KEY_ID}:${KEY_SECRET}`,
+      body: {}
+    });
+    expect(mine.status).toBe(200);
+    expect(mine.body.partition).toBe("acct_capi");
+    const records = mine.body.records as Array<{ outcome: string; action: { verb?: string } }>;
+    expect(records.length).toBeGreaterThan(0);
+    expect(records.every((r) => r.outcome === "ok")).toBe(true);
+
+    // ...naming someone else's partition is refused at identity level...
+    const stolen = await clientFetch(h.gateway, "POST", "/net-api/audit", {
+      token: `apikey:${KEY_ID}:${KEY_SECRET}`,
+      body: { partition: "acct_other" }
+    });
+    expect(stolen.status).toBe(403);
+
+    // ...and the other customer's partition holds none of these records.
+    const theirs = await clientFetch(h.gateway, "POST", "/net-api/audit", {
+      token: "apikey:capi-key-2:capi-secret-2",
+      body: {}
+    });
+    expect(theirs.status).toBe(200);
+    expect(theirs.body.partition).toBe("acct_other");
+    expect(theirs.body.records).toEqual([]);
+    h.close();
+  });
+
+  it("a refused credential lands as a gateway edge record in the operator partition (AU1.2)", async () => {
+    const h = await buildHarness();
+    const refused = await clientFetch(h.gateway, "GET", "/net-api/cell?key=object_live:capi_box", {
+      token: "apikey:no-such-key:nope"
+    });
+    expect(refused.status).toBe(401);
+    for (let i = 0; i < 6; i += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    const { signInternalRequest } = await import("../../src/worker/internal-auth");
+    const req = new Request("https://do/net/audit-query", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ partition: "operator", outcome: "unknown_or_revoked" })
+    });
+    const res = (await (await h.auditDO.fetch(await signInternalRequest(h.scopeEnv, req))).json()) as {
+      records: Array<{ principal?: { attribution?: string; credential?: string } }>;
+    };
+    expect(res.records.length).toBeGreaterThan(0);
+    expect(res.records[0]?.principal).toMatchObject({ attribution: "credentialed", credential: "no-such-key" });
     h.close();
   });
 });

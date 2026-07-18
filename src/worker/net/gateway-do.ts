@@ -61,8 +61,10 @@ import {
   customerOfCellKey,
   normalizeCustomerAttribution,
   normalizePrincipal,
+  OPERATOR_CUSTOMER_ID,
   type Principal
 } from "../../net/attribution";
+import { auditShardFor, mintGatewayAuditRecord } from "../../net/audit";
 import { CellStore, cellKey, cellVersion, makeCell, type Cell } from "../../net/cells";
 import { adoptOrMintTraceContext, normalizeTraceContext, parseTraceparent, type TraceContext } from "../../net/trace";
 import { clampClientSessionTtl } from "../../net/client-session-policy";
@@ -741,6 +743,11 @@ export class NetGatewayDO {
     // pinScope).
     state.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS net_gateway_pin (idempotency_key TEXT PRIMARY KEY, scope TEXT NOT NULL)"
+    );
+    // AU1.2 durable edge-event lane: refusal records buffered here and
+    // drained to the audit shards (see recordEdgeAudit).
+    this.state.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS net_gateway_audit_outbox (id TEXT PRIMARY KEY, destination TEXT NOT NULL, body TEXT NOT NULL)"
     );
     // B3: short-lived single-use WebSocket tickets. A ticket authenticates
     // one upgrade so the permanent apikey never rides the WS URL. Durable
@@ -1969,7 +1976,138 @@ export class NetGatewayDO {
   //     sockets whose session is present (CO13 session_presence) in a
   //     fanout's scope — see pushObservations.
 
+  /**
+   * AU1.2/AU6.1: durable gateway edge-event lane. Rows persist in the
+   * same isolate write as the refusal and drain to the audit shards via
+   * defer + re-drain on the next request. LIVENESS CAVEAT (documented in
+   * the plan): a gateway that never receives another request holds its
+   * tail rows until it does — gateways are high-traffic by design, and
+   * an alarm-driven drain is the follow-up if tails prove real.
+   */
+  private recordEdgeAudit(
+    kind: "auth" | "session" | "refusal",
+    outcome: string,
+    path: string,
+    credential: string | null,
+    actor: string | null
+  ): void {
+    try {
+      const shardCount = Number(this.env.NET_AUDIT_SHARDS ?? 0);
+      if (!Number.isFinite(shardCount) || shardCount <= 0) return;
+      const attribution = actor
+        ? normalizeCustomerAttribution(this.ensureView().get(customerOfCellKey(actor))?.value)
+        : null;
+      const principal: Principal =
+        actor !== null
+          ? attribution
+            ? {
+                attribution: "authenticated",
+                customer: attribution.customer,
+                actor,
+                ...(credential ? { credential } : {})
+              }
+            : credential
+              ? { attribution: "credentialed", credential, actor }
+              : { attribution: "anonymous" }
+          : credential
+            ? { attribution: "credentialed", credential }
+            : { attribution: "anonymous" };
+      const routed = mintGatewayAuditRecord({
+        gateway: `net-gateway:${this.shardName() ?? "unnamed"}`,
+        eventId: `edge:${crypto.randomUUID()}`,
+        kind,
+        principal,
+        outcome,
+        target: path,
+        now: this.host.now()
+      });
+      for (const entry of routed) {
+        this.state.storage.sql.exec(
+          "INSERT OR IGNORE INTO net_gateway_audit_outbox (id, destination, body) VALUES (?, ?, ?)",
+          `${entry.partition}/${entry.record.idempotency}`,
+          `audit:${auditShardFor(entry.partition, shardCount)}`,
+          JSON.stringify(entry)
+        );
+      }
+      this.host.defer(() => this.drainEdgeAudit());
+    } catch (err) {
+      // Edge auditing must never turn a refusal into a 500.
+      this.metric({ kind: "net_gateway_audit_error", status: "error", error: String(err) });
+    }
+  }
+
+  /** At-least-once push of edge rows to their shards; delivered rows
+   * delete, failures stay for the next request's drain. */
+  private async drainEdgeAudit(): Promise<void> {
+    const rows = sqlRows<{ id: string; destination: string; body: string }>(
+      this.state.storage.sql.exec("SELECT id, destination, body FROM net_gateway_audit_outbox LIMIT 64")
+    );
+    const byDestination = new Map<string, Array<{ id: string; body: string }>>();
+    for (const row of rows) {
+      const bucket = byDestination.get(row.destination) ?? [];
+      bucket.push({ id: row.id, body: row.body });
+      byDestination.set(row.destination, bucket);
+    }
+    for (const [destination, bucket] of byDestination) {
+      try {
+        await this.host.rpc(destination, "/audit-append", {
+          from_scope: `net-gateway:${this.shardName() ?? "unnamed"}`,
+          seq: 0,
+          records: bucket.map((row) => JSON.parse(row.body) as unknown)
+        });
+        for (const row of bucket) {
+          this.state.storage.sql.exec("DELETE FROM net_gateway_audit_outbox WHERE id = ?", row.id);
+        }
+      } catch (err) {
+        this.metric({ kind: "net_gateway_audit_error", status: "error", error: String(err), destination });
+      }
+    }
+  }
+
+  /** AU7: partition-scoped query. The caller's customer_of names the
+   * partition; the operator partition may name any. */
+  private async clientAuditQuery(actor: string, body: Record<string, unknown>): Promise<Response> {
+    const shardCount = Number(this.env.NET_AUDIT_SHARDS ?? 0);
+    if (!Number.isFinite(shardCount) || shardCount <= 0) {
+      return json({ error: { code: "E_OBJNF", message: "audit trail is not enabled on this deployment" } }, 404);
+    }
+    await this.warmScopes([CATALOG_SCOPE, { scope: `cluster:${actor}`, objects: [actor] }], "net_client_pull_miss_failed");
+    const attribution = normalizeCustomerAttribution(this.ensureView().get(customerOfCellKey(actor))?.value);
+    if (attribution === null) {
+      return json(
+        { error: { code: "E_PERM", message: "actor has no customer attribution (audit.md AU3.1); audit access requires one" } },
+        403
+      );
+    }
+    const requested = typeof body.partition === "string" && body.partition.length > 0 ? body.partition : null;
+    const partition =
+      requested !== null && attribution.customer === OPERATOR_CUSTOMER_ID ? requested : attribution.customer;
+    if (requested !== null && partition !== requested) {
+      // AU10.5: identity-level isolation — a non-operator naming any
+      // partition (even their own) is answered from their OWN identity,
+      // and naming someone else's is a named refusal, not a filter.
+      return json({ error: { code: "E_PERM", message: "partition is operator-only; your own partition is implicit" } }, 403);
+    }
+    const filters: Record<string, unknown> = {};
+    for (const field of ["actor", "verb", "target", "outcome", "trace_id"] as const) {
+      if (typeof body[field] === "string" && (body[field] as string).length > 0) filters[field] = body[field];
+    }
+    for (const field of ["from_ts", "to_ts", "limit"] as const) {
+      if (typeof body[field] === "number" && Number.isFinite(body[field])) filters[field] = body[field];
+    }
+    const reply = (await this.host.rpc(`audit:${auditShardFor(partition, shardCount)}`, "/audit-query", {
+      partition,
+      ...filters
+    })) as { records?: unknown[] };
+    return json({ partition, records: reply.records ?? [] });
+  }
+
   private async clientApi(request: Request, url: URL): Promise<Response> {
+    // AU1.2 edge-record capture: what the auth boundary learned before a
+    // refusal, so the catch below can attribute the attempt. Assigned as
+    // the try progresses; never trusted from client input.
+    let auditCredential: string | null = null;
+    let auditActor: string | null = null;
     try {
       // B3: the WS upgrade authenticates by a short-lived single-use
       // TICKET (?ticket=), NOT the apikey. The WebSocket API cannot set
@@ -2018,6 +2156,7 @@ export class NetGatewayDO {
       }
 
       const credential = parseClientCredential(request.headers, null);
+      auditCredential = credential.kind === "apikey" ? credential.id : `session:${credential.session}`;
       const identity = await this.catalogIdentity();
       // Two credential classes (client-auth.ts): the apikey resolves its
       // actor from the identity map; a session bearer (minted by login/
@@ -2037,7 +2176,18 @@ export class NetGatewayDO {
       // H4: rate limiting runs AFTER authentication resolves the actor
       // (so buckets key on identity, never on spoofable request bytes)
       // and BEFORE any dispatch — a throttled client costs one map lookup.
+      auditActor = actor;
       this.enforceClientRate(actor, url.pathname);
+
+      // AU7: the customer audit-query surface. The PARTITION comes from
+      // the caller's own attribution (customer_of) — a customer cannot
+      // name someone else's partition (AU10.5 isolation is identity-
+      // level, not filter-level). The operator partition may name any
+      // partition explicitly (the operator sees everything by design).
+      if (request.method === "POST" && url.pathname === "/net-api/audit") {
+        const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+        return await this.clientAuditQuery(actor, body);
+      }
 
       if (request.method === "POST" && url.pathname === "/net-api/ws-ticket") {
         const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
@@ -2120,6 +2270,19 @@ export class NetGatewayDO {
       return json({ error: { code: "E_OBJNF", message: `no such route: ${request.method} ${url.pathname}` } }, 404);
     } catch (err) {
       if (err instanceof ClientAuthError) {
+        // AU1.2: an attempt that never committed still audits. The
+        // principal names exactly what the boundary learned: nothing
+        // (anonymous), a recognized-but-rejected credential
+        // (credentialed), or an authenticated actor refused later
+        // (rate/session refusals).
+        // The specific verdict (unknown_or_revoked, missing_credential,
+        // expired…) is the audit-valuable outcome; the coarse code is
+        // recoverable from it.
+        const reason =
+          err.detail && typeof err.detail === "object" && typeof (err.detail as { reason?: unknown }).reason === "string"
+            ? ((err.detail as { reason: string }).reason)
+            : err.code;
+        this.recordEdgeAudit(err.code === "E_RATE" ? "refusal" : "auth", reason, url.pathname, auditCredential, auditActor);
         return json({ error: { code: err.code, message: err.message, detail: err.detail } }, err.status);
       }
       if (isNetError(err)) {

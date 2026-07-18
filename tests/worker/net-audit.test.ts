@@ -41,7 +41,7 @@ function doState(name: string) {
   };
 }
 
-async function call(instance: NetScopeDO | NetAuditDO, env: { WOO_INTERNAL_SECRET: string }, path: string, body?: unknown) {
+async function call(instance: NetScopeDO | NetAuditDO, env: { WOO_INTERNAL_SECRET?: string }, path: string, body?: unknown) {
   const request =
     body === undefined
       ? new Request(`https://do${path}`)

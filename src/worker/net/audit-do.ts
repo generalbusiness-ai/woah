@@ -40,14 +40,15 @@ export type NetAuditDurableState = {
   id: unknown;
   waitUntil?: (promise: Promise<unknown>) => void;
   storage: {
-    sql: { exec(query: string, ...bindings: unknown[]): { toArray?: () => unknown[] } & Iterable<unknown> };
+    sql: { exec(query: string, ...bindings: unknown[]): unknown };
     transactionSync<T>(fn: () => T): T;
     setAlarm?: (at: number) => void | Promise<void>;
     deleteAlarm?: () => void | Promise<void>;
   };
 };
 
-function sqlRows<T>(result: { toArray?: () => unknown[] } & Iterable<unknown>): T[] {
+function sqlRows<T>(cursor: unknown): T[] {
+  const result = cursor as { toArray?: () => unknown[] } & Iterable<unknown>;
   if (typeof result.toArray === "function") return result.toArray() as T[];
   return [...result] as T[];
 }
