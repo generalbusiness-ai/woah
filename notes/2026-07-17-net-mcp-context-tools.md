@@ -67,10 +67,10 @@ planner.
 This work keeps API-key-only initialization. Bearer and guest credential
 carriers are not an initial parity condition.
 
-Durable observation queues and Streamable HTTP server notifications remain
-separate MCP lifecycle work. Until `notifications/tools/list_changed` lands,
-clients must re-list after a successful navigation or containment-changing
-call. No temporary result field substitutes for the normative MCP
+Durable observation queues remain separate MCP lifecycle work. Net now carries
+`notifications/tools/list_changed` over a bounded Streamable HTTP GET/SSE
+listen and through the stdio bridge. Hints are session-specific and coalesce
+until re-list; no temporary result field substitutes for the normative MCP
 notification.
 
 Cold gateways also need enough information to fetch contextual object cells.

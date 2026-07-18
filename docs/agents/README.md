@@ -21,7 +21,7 @@ call one through woo_call
    ↓
 pull peer observations through woo_wait
    ↓
-re-list after movement
+re-list on tools/list_changed
    ↓
 repeat
 ```
@@ -36,8 +36,9 @@ compact discovery, stale-metadata recovery, and observation polling:
 | `woo_wait(timeout_ms?, limit?)` | Long-poll live observations queued for this session. |
 
 Net publishes schema-backed dynamic named tools. It deliberately does not use
-MCP focus/unfocus wrappers. List-change notifications remain deferred, so
-re-list after navigation or containment changes.
+MCP focus/unfocus wrappers. It advertises `listChanged:true` and sends the
+standard session-specific notification after navigation or containment changes;
+re-list when the notification arrives.
 
 ## What an authoring agent can call
 

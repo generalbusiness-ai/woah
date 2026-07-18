@@ -30,10 +30,11 @@ duplicate emitted observations into that call result. Pull peer and room
 events separately through `woo_wait`. The gateway suppresses a submitter's own
 committed fanout echo, so an agent does not see its own action twice.
 
-After movement, re-run standard `tools/list` (or
-`woo_list_reachable_tools`): the actor's presence moved to a different room and
-the callable projection changed. Net currently has no MCP list-change
-notification; focus is not part of the MCP context model.
+After `notifications/tools/list_changed`, re-run standard `tools/list` (or
+`woo_list_reachable_tools`): the actor's presence or containment context
+changed and the callable projection may be different. This is a live
+session-specific hint, not an observation in `woo_wait`; focus is not part of
+the MCP context model.
 
 ## Common shapes
 

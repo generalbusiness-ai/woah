@@ -42,7 +42,10 @@ stdin closes. A pipelined pre-session prefix is ordered behind `initialize` so
 every later request carries the returned session id. Once initialized,
 independent requests are forwarded concurrently: a long `woo_wait` must not
 head-of-line-block calls or MCP keepalive traffic. The bridge must not create an
-in-process world or dispatch verbs through a second host.
+in-process world or dispatch verbs through a second host. After forwarding
+`notifications/initialized`, it opens the session's Streamable HTTP GET/SSE
+channel and forwards each server notification as one newline-delimited stdio
+message. Closing stdio aborts that channel before deleting the Net session.
 
 ## M2. Tool surface
 
@@ -222,19 +225,51 @@ an observation is returned to at most one waiter.
 
 ## M6. Dynamic-list lifecycle
 
-The initial Net profile advertises `capabilities.tools.listChanged:false`.
-Clients must re-list after navigation or a containment-changing call. The
-`initialize.instructions` string states this explicitly and names the bound
-actor.
+Net advertises `capabilities.tools.listChanged:true`. A successful standard
+`tools/list` or `woo_list_reachable_tools` response records an exact baseline
+digest for that session from the same bounded structural resolver used by
+invocation. The digest includes the active space, contextual object set, and
+complete dynamic protocol descriptors. It is not a catalog revision or a
+global-world digest.
 
-`notifications/tools/list_changed` is deferred lifecycle work. When added, it
-must be session-specific and a hint only; the current structural resolver
-remains the freshness and authorization boundary. No temporary result field
-substitutes for the standard notification.
+After a relevant authoritative fanout applies, the gateway compares that
+resolver for only the affected live MCP sessions on the shard. Ordinary room
+and actor-scope fanout selects sessions from that scope's presence rows and
+the changed actor's own sessions; a verb-definition fanout may select all live
+MCP sessions on that gateway because definition changes are rare and can alter
+inherited descriptors in every context. Selection never enumerates world
+objects or sessions on another gateway.
+
+When a baseline changes, the gateway sends exactly the standard hint:
+
+```json
+{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}
+```
+
+The hint is session-specific. Changes coalesce until that session re-lists:
+after one hint is pending or delivered, further changes do not create a storm.
+Re-listing atomically installs the current baseline and clears any undelivered
+stale hint. A session with no baseline receives no hint; initialize followed by
+the client's first list is not itself a change.
+
+Streamable HTTP clients receive unsolicited hints through `GET /net-api/mcp`
+with `Accept: text/event-stream` and the normal `Mcp-Session-Id`. The gateway
+returns a bounded SSE listen: a pending hint is delivered immediately;
+otherwise the listen closes after at most 25 seconds and the client reconnects.
+At most one open stream receives a given hint. A disconnect before delivery
+leaves the hint pending, while delivery is live and not resumable. Missing,
+expired, or malformed sessions are rejected before a stream is opened.
+
+The notification is a freshness hint only. Clients re-run `tools/list`; the
+current structural resolver remains the authorization boundary. No temporary
+tool-result field substitutes for the standard notification, and a client may
+re-list at any time even if it missed a live hint.
 
 ## M7. Security and scaling invariants
 
 - API-key authentication happens before session creation.
+- A present Streamable HTTP `Origin` must exactly match the MCP endpoint's
+  request origin; headless clients may omit the header.
 - Every non-initialize method validates `Mcp-Session-Id` and its expiry.
 - Other actors' session bearers never appear in tools, relation results, or
   observations.
@@ -246,7 +281,7 @@ substitutes for the standard notification.
 
 ## M8. Deferred extensions
 
-- `notifications/tools/list_changed` and durable observation delivery;
+- durable observation delivery;
 - additional credential carriers;
 - explicit typed returned-object references;
 - MCP resources such as `woo://here` or `woo://object/{id}`;

@@ -44,6 +44,39 @@ function netState(name: string) {
 
 type Rpc = { jsonrpc: "2.0"; id?: number; method: string; params?: unknown };
 
+async function nextSseMessage(response: Response, timeoutMs = 1_000): Promise<Record<string, unknown> | null> {
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("SSE response has no body");
+  const decoder = new TextDecoder();
+  let buffered = "";
+  const timeout = Symbol("timeout");
+  try {
+    for (;;) {
+      const result = await Promise.race([
+        reader.read(),
+        new Promise<typeof timeout>((resolve) => setTimeout(() => resolve(timeout), timeoutMs))
+      ]);
+      if (result === timeout) {
+        await reader.cancel();
+        return null;
+      }
+      if (result.done) return null;
+      buffered += decoder.decode(result.value, { stream: true });
+      const events = buffered.split(/\r?\n\r?\n/);
+      buffered = events.pop() ?? "";
+      for (const event of events) {
+        const data = event.split(/\r?\n/)
+          .filter((line) => line.startsWith("data:"))
+          .map((line) => line.slice("data:".length).trimStart())
+          .join("\n");
+        if (data) return JSON.parse(data) as Record<string, unknown>;
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 describe("MCP adapter over /net-api (client-shell phase i)", () => {
   it("two carried actors: initialize, resolve self, say → peer woo_wait, command_plan round trip, error envelope", async () => {
     // OLD world: two guests, one apikey each.
@@ -172,6 +205,7 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
     const open = async (token: string): Promise<string> => {
       const init = await mcp({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }, { "mcp-token": token });
       expect(init.status, JSON.stringify(init.body)).toBe(200);
+      expect(init.body?.result?.capabilities?.tools?.listChanged).toBe(true);
       const session = init.headers.get("mcp-session-id");
       expect(session).toBeTruthy();
       const notified = await mcp({ jsonrpc: "2.0", method: "notifications/initialized" }, { "mcp-session-id": session as string });
@@ -186,9 +220,27 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
     const close = async (session: string) => await gateway.fetch(
       new Request("https://do/net-api/mcp", { method: "DELETE", headers: { "mcp-session-id": session } })
     );
+    const listen = async (session: string): Promise<Response> => {
+      const response = await gateway.fetch(new Request("https://do/net-api/mcp", {
+        method: "GET",
+        headers: { accept: "text/event-stream", "mcp-session-id": session, origin: "https://do" }
+      }));
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-type")).toContain("text/event-stream");
+      return response;
+    };
 
     const aliceSession = await open("apikey:mcp-key-a:mcp-secret-a");
     const bobSession = await open("apikey:mcp-key-b:mcp-secret-b");
+    const foreignOrigin = await gateway.fetch(new Request("https://do/net-api/mcp", {
+      method: "GET",
+      headers: {
+        accept: "text/event-stream",
+        "mcp-session-id": aliceSession,
+        origin: "https://hostile.example"
+      }
+    }));
+    expect(foreignOrigin.status).toBe(403);
     await settleAll(); // mint fanout + presence relate settle
 
     // Protocol methods use protocol result shapes. In particular, the MCP
@@ -359,6 +411,16 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
       structuredContent: { error: { code: "E_PERM" } }
     });
 
+    // Standard Streamable HTTP GET carries one session-specific freshness
+    // hint. Bob gets a baseline too, so Alice leaving can prove that another
+    // person's presence is social context and does not perturb Bob's tools.
+    await mcp(
+      { jsonrpc: "2.0", id: nextId++, method: "tools/list", params: {} },
+      { "mcp-session-id": bobSession }
+    );
+    const aliceToolEvents = await listen(aliceSession);
+    const bobToolEvents = await listen(bobSession);
+
     // Cross-room move: the walkthrough's acid test (left/entered fanout).
     const entered = await call(aliceSession, "woo_call", { object: "the_chatroom", verb: "enter", args: [] });
     expect(entered.result?.isError, JSON.stringify(entered).slice(0, 400)).not.toBe(true);
@@ -370,6 +432,19 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
     const moveObs = waitedMove.result?.structuredContent?.result?.observations ?? [];
     const left = moveObs.find((obs: any) => obs?.type === "left" && obs.actor === alice);
     expect(left, JSON.stringify(moveObs).slice(0, 400)).toBeTruthy();
+    expect(await nextSseMessage(aliceToolEvents)).toEqual({
+      jsonrpc: "2.0",
+      method: "notifications/tools/list_changed"
+    });
+    expect(await nextSseMessage(bobToolEvents, 30)).toBeNull();
+
+    // Re-listing consumes the hint and installs the moved context as the next
+    // exact baseline; later structural changes may notify this session again.
+    const afterMoveTools = await mcp(
+      { jsonrpc: "2.0", id: nextId++, method: "tools/list", params: {} },
+      { "mcp-session-id": aliceSession }
+    );
+    expect(afterMoveTools.body?.result?.tools).toEqual(expect.any(Array));
 
     // Structural navigation replaces focus choreography. Walk through the
     // garden to the task board; its contained task immediately contributes
@@ -380,6 +455,14 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
     const toTasks = await call(aliceSession, "woo_call", { object: "the_garden", verb: "south", args: [] });
     expect(toTasks.result?.isError, JSON.stringify(toTasks).slice(0, 400)).not.toBe(true);
     await settleAll();
+    // No SSE stream was open for the two moves. The first change remains
+    // pending, the second coalesces, and a later GET receives exactly one
+    // hint rather than losing it or producing a navigation storm.
+    expect(await nextSseMessage(await listen(aliceSession))).toEqual({
+      jsonrpc: "2.0",
+      method: "notifications/tools/list_changed"
+    });
+    expect(await nextSseMessage(await listen(aliceSession), 30)).toBeNull();
     const atTaskboard = await mcp(
       { jsonrpc: "2.0", id: nextId++, method: "tools/list", params: {} },
       { "mcp-session-id": aliceSession }
@@ -487,6 +570,11 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
       { "mcp-session-id": bobSession }
     );
     expect(listAfterClose.body).toMatchObject({ error: { message: expect.stringMatching(/session (expired|missing)/) } });
+    const eventsAfterClose = await gateway.fetch(new Request("https://do/net-api/mcp", {
+      method: "GET",
+      headers: { accept: "text/event-stream", "mcp-session-id": bobSession }
+    }));
+    expect(eventsAfterClose.status).toBe(404);
 
     states.forEach((st) => st.close());
   });
