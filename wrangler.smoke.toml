@@ -52,6 +52,9 @@ WOO_INTERNAL_SECRET = "local-smoke-internal-secret"
 # observation push works without the lane's manual /net/subscribe. The
 # worker entry returns each request to its session's GATEWAY_NET shard.
 NET_API_GATEWAY_SHARDS = "8"
+# Audit lane enabled on the smoke lane so workerd exercises the shard
+# (audit.md AU6); production leaves it unset until the owner enables it.
+NET_AUDIT_SHARDS = "1"
 NET_RPC_TIMEOUT_MS = "5000"
 NET_TURN_QUEUE_WAIT_MS = "1500"
 NET_TURN_SCOPE_CONCURRENCY = "12"

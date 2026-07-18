@@ -1,6 +1,6 @@
 ---
 date: 2026-07-16
-status: partial — AU2 (context threading), AU3 (attribution pipeline + principal envelope) implemented on the net stack; AU1/AU4–AU10 (records, delivery, query) draft
+status: partial — AU1–AU7 implemented on the net stack (records minted in the commit transaction; durable /audit lane; NetAuditDO shards with hash-chained SQLite segments; gateway edge records; /net-api/audit identity-scoped query; AU10 gates 1/2/4/5/6 in the curated suite). Remaining draft: AU6.3 object-storage segment offload, AU7 push export + OTLP, AU8 span emission, AU9 retention/redaction policy machinery, CO17-interplay drain rules
 ---
 
 # The audit trail — unified audit and observability (AU1–AU10)

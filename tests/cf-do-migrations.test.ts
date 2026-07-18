@@ -12,9 +12,10 @@ describe("Cloudflare Durable Object migration management", () => {
     expect(analysis.ok).toBe(true);
     // The v2 classes (PersistentObjectDO, DirectoryDO, CommitScopeDO) are
     // retired: unbound and reclaimed by the cf-do-0005 deleted_classes
-    // migration. Only the net classes remain bound and active.
-    expect(analysis.boundClasses).toEqual(["NetGatewayDO", "NetScopeDO"]);
-    expect(analysis.activeClasses).toEqual(["NetGatewayDO", "NetScopeDO"]);
+    // migration. NetAuditDO joined for the audit trail (cf-do-0007;
+    // audit.md AU6) beside the two net classes.
+    expect(analysis.boundClasses).toEqual(["NetAuditDO", "NetGatewayDO", "NetScopeDO"]);
+    expect(analysis.activeClasses).toEqual(["NetAuditDO", "NetGatewayDO", "NetScopeDO"]);
     expect(analysis.duplicateTags).toEqual([]);
   });
 

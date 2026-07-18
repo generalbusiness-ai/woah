@@ -221,3 +221,39 @@ run, every member passed solo including 142/142 at load 10). First
 quiet-machine run of the day was 987/987. smoke:net-dev 25/25 with the
 installer now sending real attribution stamps. Re-run `npm test` on a
 quiet machine before merge.
+
+## Phase 2/3 status (2026-07-17 late, same worktree)
+
+IMPLEMENTED and green (npm test 1026/1026 across 93 files — clean run;
+test:worker 488/488; smoke:net-dev 25/25 with NET_AUDIT_SHARDS=1 live
+on real workerd):
+
+- src/net/audit.ts: AuditRecord + minting (acting/dual/adoption/
+  gateway-edge) + FNV shard routing + wire guard (15 tests).
+- Scope commits mint records INSIDE the mutation transaction and
+  enqueue on the new durable /audit outbox lane; drains independent of
+  fanout (fault-proven). Adoption wire now carries principal/trace/
+  cause (Phase 1 put them on the row; the dispatch dropped them) and
+  the owner mints the resource-owner-only record.
+- NetAuditDO (cf-do-0005, AUDIT_NET in all five wrangler configs):
+  idempotent append on (partition, idempotency), filter-columned
+  records, hash-chained immutable segments sealed at
+  NET_AUDIT_SEGMENT_ROWS, bounded query, /net/audit-verify chain walk.
+  Segments live in shard SQLite; R2 offload is the deployed-profile
+  follow-up (AU6.3 note).
+- Gateway edge records (durable lane, drain-on-defer+next-request;
+  liveness caveat documented) with the specific verdict as outcome;
+  /net-api/audit with IDENTITY-level partition isolation (caller's
+  customer_of; operator may name any partition).
+- AU10 gates in curated npm test: completeness+dual (net-audit e2e),
+  idempotency (replay + redelivery), verification (seal+verify+query),
+  isolation (two-customer client-api test), loss posture (fault test).
+
+Deliberate limits, named:
+- NET_AUDIT_SHARDS unset in production wrangler.toml — enabling the
+  lane in prod is an owner decision (bindings + migration are deployed
+  either way; cf-do-0005 must ride the next deploy).
+- Gateway edge lane has no alarm: a quiet gateway holds tail rows until
+  its next request.
+- AU10.3 (trace join gate) lands with Phase 4 span emission; segment
+  retention/expiry (AU9) and push export (AU7) not started.
