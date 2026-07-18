@@ -119,6 +119,59 @@ describe("Net MCP stdio transport bridge", () => {
     await proxy.close();
   });
 
+  it.each([401, 404])("opens after a 204 initialized ack and reports terminal GET %s exactly once", async (status) => {
+    vi.useFakeTimers();
+    try {
+      let getCount = 0;
+      const errors: unknown[] = [];
+      const fetchImpl: typeof fetch = async (_input, init) => {
+        const method = init?.method ?? "GET";
+        if (method === "DELETE") return new Response(null, { status: 204 });
+        if (method === "GET") {
+          getCount += 1;
+          return Response.json({ error: { code: "E_NOSESSION", message: "session expired" } }, { status });
+        }
+        const body = JSON.parse(String(init?.body)) as { id?: number; method?: string };
+        if (body.method === "initialize") {
+          return Response.json(
+            {
+              jsonrpc: "2.0",
+              id: body.id,
+              result: {
+                protocolVersion: "2025-06-18",
+                capabilities: { tools: { listChanged: true } },
+                serverInfo: { name: "woo-net", version: "1" }
+              }
+            },
+            { headers: { "mcp-session-id": `s_terminal_${status}` } }
+          );
+        }
+        return new Response(null, { status: 204 });
+      };
+      const proxy = new NetMcpStdioProxy({
+        endpoint: "http://127.0.0.1:5173/net-api/mcp",
+        token: "apikey:local-dev:secret",
+        fetchImpl,
+        onError: (error) => { errors.push(error); }
+      });
+
+      await proxy.forward({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+      await proxy.forward({ jsonrpc: "2.0", method: "notifications/initialized" });
+      await vi.waitFor(() => {
+        expect(getCount).toBe(1);
+        expect(errors).toHaveLength(1);
+      });
+      expect(String(errors[0])).toContain(String(status));
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(getCount).toBe(1);
+      expect(errors).toHaveLength(1);
+      await proxy.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("serializes the pre-session prefix but does not let woo_wait block later messages", async () => {
     let releaseInitialize!: () => void;
     let releaseWait!: () => void;

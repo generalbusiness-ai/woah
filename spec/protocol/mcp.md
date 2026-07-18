@@ -45,7 +45,8 @@ head-of-line-block calls or MCP keepalive traffic. The bridge must not create an
 in-process world or dispatch verbs through a second host. After forwarding
 `notifications/initialized`, it opens the session's Streamable HTTP GET/SSE
 channel and forwards each server notification as one newline-delimited stdio
-message. Closing stdio aborts that channel before deleting the Net session.
+message. Either successful empty acknowledgement (`202` or `204`) starts the
+channel. Closing stdio aborts that channel before deleting the Net session.
 
 ## M2. Tool surface
 
@@ -251,6 +252,16 @@ after one hint is pending or delivered, further changes do not create a storm.
 Re-listing atomically installs the current baseline and clears any undelivered
 stale hint. A session with no baseline receives no hint; initialize followed by
 the client's first list is not itself a change.
+
+Per-session MCP queues, echo ids, list baselines, and SSE listeners are live
+transport state, not durable session authority. A gateway retains at most 512
+such states. On insertion pressure it first disposes entries whose mirrored
+session cell is missing or expired, then evicts the least-recently client-used
+live entry if necessary. Disposal wakes parked waits and closes listeners. It
+does not close a still-valid Net session: that session may reconstruct an empty
+transport state on its next request and receives the conservative post-eviction
+re-list hint described above. Thus abandoned MCP clients cannot grow a hot
+gateway without bound, while eviction costs only live at-most-once delivery.
 
 Streamable HTTP clients receive unsolicited hints through `GET /net-api/mcp`
 with `Accept: text/event-stream` and the normal `Mcp-Session-Id`. The gateway

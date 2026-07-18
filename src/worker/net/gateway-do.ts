@@ -3404,8 +3404,7 @@ export class NetGatewayDO {
     const cell = this.ensureView().get(sessionCellKey(session));
     const verdict = validateSessionCell(cell, this.host.now());
     if (verdict === "missing" || verdict === "expired") {
-      this.mcpCloseSseWaiters(session);
-      this.mcpQueues.delete(session);
+      this.mcpDisposeSessionState(session);
       return new Response(null, { status: 204 });
     }
     if (verdict !== "ok") {
@@ -3418,8 +3417,7 @@ export class NetGatewayDO {
     const identity = await this.catalogIdentity();
     const closed = await this.clientSessionClose(actor, session, identity.epoch);
     if (!closed.ok) return closed;
-    this.mcpCloseSseWaiters(session);
-    this.mcpQueues.delete(session);
+    this.mcpDisposeSessionState(session);
     return new Response(null, { status: 204 });
   }
 
@@ -3437,7 +3435,7 @@ export class NetGatewayDO {
     if (!opened.ok || typeof body.session !== "string") {
       return json({ jsonrpc: "2.0", id, error: { code: -32000, message: `session mint failed: ${JSON.stringify(body)}` } }, 200);
     }
-    this.mcpQueues.set(body.session, mcpSessionState(actor));
+    this.mcpSessionState(body.session, actor);
     return json(
       {
         jsonrpc: "2.0",
@@ -3669,7 +3667,16 @@ export class NetGatewayDO {
    * initialize installs state explicitly and therefore emits no false change. */
   private mcpSessionState(session: string, actor: string, notifyOnRecover = false): NetMcpSessionState {
     const existing = this.mcpQueues.get(session);
-    if (existing) return existing;
+    if (existing && existing.actor === actor) {
+      // Map insertion order is the LRU: only authenticated client activity
+      // touches an entry. Fanout delivery alone must not make an abandoned
+      // session look active forever.
+      this.mcpQueues.delete(session);
+      this.mcpQueues.set(session, existing);
+      return existing;
+    }
+    if (existing) this.mcpDisposeSessionState(session);
+    this.mcpMakeRoomForSessionState();
     const created = mcpSessionState(actor);
     if (notifyOnRecover) {
       created.listChangedDirty = true;
@@ -3677,6 +3684,44 @@ export class NetGatewayDO {
     }
     this.mcpQueues.set(session, created);
     return created;
+  }
+
+  /** Bound live transport memory independently of durable session authority.
+   * New-state pressure first reaps entries whose mirrored bearer is already
+   * unusable, then evicts the least-recently client-used live entry. The next
+   * authenticated request for an evicted live session reconstructs state and
+   * receives the conservative list-change hint. */
+  private mcpMakeRoomForSessionState(): void {
+    if (this.mcpQueues.size < MCP_SESSION_STATE_CAP) return;
+    const view = this.ensureView();
+    const now = this.host.now();
+    for (const session of [...this.mcpQueues.keys()]) {
+      if (validateSessionCell(view.get(sessionCellKey(session)), now) === "ok") continue;
+      this.mcpDisposeSessionState(session);
+    }
+    while (this.mcpQueues.size >= MCP_SESSION_STATE_CAP) {
+      const oldest = this.mcpQueues.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.mcpDisposeSessionState(oldest);
+    }
+  }
+
+  /** Dispose every closure that can retain a session state. Parked waits wake
+   * with the now-empty live buffer; SSE clients reconnect and, if their Net
+   * session is still valid, lazily reconstruct through mcpSessionState. */
+  private mcpDisposeSessionState(session: string): void {
+    const state = this.mcpQueues.get(session);
+    if (!state) return;
+    this.mcpQueues.delete(session);
+    state.buffer.length = 0;
+    state.ownEchoIds.clear();
+    state.toolListDigest = null;
+    state.listChangedDirty = false;
+    state.listChangedPending = false;
+    const waiters = state.waiters.splice(0, state.waiters.length);
+    for (const wake of waiters) wake();
+    const streams = state.sseWaiters.splice(0, state.sseWaiters.length);
+    for (const stream of streams) stream.close();
   }
 
   /** The exact standard-list digest: structural identity plus the complete
@@ -3729,13 +3774,6 @@ export class NetGatewayDO {
       state.listChangedPending = false;
       return;
     }
-  }
-
-  private mcpCloseSseWaiters(session: string): void {
-    const state = this.mcpQueues.get(session);
-    if (!state) return;
-    const waiters = state.sseWaiters.splice(0, state.sseWaiters.length);
-    for (const waiter of waiters) waiter.close();
   }
 
   /** Compare only sessions plausibly affected by this applied fanout. Room
@@ -6317,6 +6355,7 @@ function json(body: unknown, status = 200, headers: Record<string, string> = {})
 
 /** MCP adapter bounds (client-shell phase i). */
 const MCP_QUEUE_CAP = 256;
+const MCP_SESSION_STATE_CAP = 512;
 const MCP_STANDARD_TOOL_PAGE = 128;
 const MCP_DISCOVERY_DEFAULT_PAGE = 64;
 const MCP_DISCOVERY_MAX_PAGE = 256;

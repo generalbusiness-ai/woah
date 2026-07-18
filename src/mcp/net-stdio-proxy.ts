@@ -65,7 +65,7 @@ export class NetMcpStdioProxy {
         body: JSON.stringify(message)
       });
       if (response.status === 202 || response.status === 204) {
-        if (response.status === 202 && isInitialized(message)) this.startNotifications();
+        if (isInitialized(message)) this.startNotifications();
         return null;
       }
 

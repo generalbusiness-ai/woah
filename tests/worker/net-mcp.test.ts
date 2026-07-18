@@ -10,7 +10,7 @@ import { createWorld } from "../../src/core/bootstrap";
 import { installVerb } from "../../src/core/authoring";
 import { exportIdentity, importIdentity } from "../../src/net/identity";
 import { planNetInstall } from "../../src/net/install";
-import { cellVersion } from "../../src/net/cells";
+import { cellVersion, makeCell } from "../../src/net/cells";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
@@ -577,5 +577,64 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
     expect(eventsAfterClose.status).toBe(404);
 
     states.forEach((st) => st.close());
+  });
+
+  it("bounds abandoned per-session transport state, reaping expired entries before LRU eviction", () => {
+    const state = netState("gateway-mcp-state-bound");
+    const gateway = new NetGatewayDO(state.state, {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_GATEWAY_SELF: "gateway:mcp-state-bound",
+      NET_RESOLVE: () => { throw new Error("the state-bound test performs no RPC"); }
+    } as NetGatewayEnv);
+    const internal = gateway as any;
+    const view = internal.ensureView();
+    const now = Date.now();
+    const sessionCell = (session: string, expiresAt: number) => makeCell({
+      kind: "session",
+      object: session,
+      value: { id: session, actor: "mcp_state_actor", expiresAt, activeScope: "state_room" },
+      provenance: "derived",
+      stamp: { scope_head: "state-test", catalog_epoch: "state-test" }
+    });
+
+    for (let index = 0; index < 512; index += 1) {
+      const session = `s_state_${index}`;
+      view.install(sessionCell(session, now + 60_000));
+      internal.mcpSessionState(session, "mcp_state_actor");
+    }
+    const queues = internal.mcpQueues as Map<string, any>;
+    expect(queues.size).toBe(512);
+
+    // Under pressure, a known-expired entry is disposed before any live LRU
+    // entry. Disposal must release callbacks that otherwise retain the state.
+    const expiredState = queues.get("s_state_1");
+    let waitWakes = 0;
+    let streamCloses = 0;
+    expiredState.waiters.push(() => { waitWakes += 1; });
+    expiredState.sseWaiters.push({ deliver: () => false, close: () => { streamCloses += 1; } });
+    expiredState.buffer.push({ retained: true });
+    expiredState.ownEchoIds.add("echo:retained");
+    view.install(sessionCell("s_state_1", now - 1));
+    view.install(sessionCell("s_state_512", now + 60_000));
+    internal.mcpSessionState("s_state_512", "mcp_state_actor");
+    expect(queues.size).toBe(512);
+    expect(queues.has("s_state_1")).toBe(false);
+    expect(queues.has("s_state_0")).toBe(true);
+    expect(waitWakes).toBe(1);
+    expect(streamCloses).toBe(1);
+    expect(expiredState.buffer).toEqual([]);
+    expect(expiredState.ownEchoIds.size).toBe(0);
+
+    // Touching a live state moves it to the MRU end; when no expired state is
+    // available, the next insertion evicts the least-recently used live one.
+    internal.mcpSessionState("s_state_0", "mcp_state_actor");
+    view.install(sessionCell("s_state_513", now + 60_000));
+    internal.mcpSessionState("s_state_513", "mcp_state_actor");
+    expect(queues.size).toBe(512);
+    expect(queues.has("s_state_0")).toBe(true);
+    expect(queues.has("s_state_2")).toBe(false);
+    expect(queues.has("s_state_513")).toBe(true);
+
+    state.close();
   });
 });
