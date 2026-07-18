@@ -7,17 +7,20 @@ NC9 order in `spec/operations/net-cutover.md`.
 
 ## Decisions taken
 
-1. **Residual MCP capabilities are RETIRED, not ported.** Net MCP already carries
-   dynamic context tools + schema-rich discovery (a9b9288) and concurrent stdio
-   (4b4665a). The remaining classic-only capabilities are deliberately dropped:
-   - `notifications/tools/list_changed` — Net stays `listChanged: false`; clients
-     re-list after navigation (the `tools/list` instructions already say so).
-   - `woo_focus` / `woo_unfocus` — no Net equivalent; the dynamic context-tool
-     set already tracks the actor's space/objects/inventory.
-   - Classic inline `observations` / `applied` result fields on tool calls.
+1. **Residual MCP capabilities: `list_changed` PORTED; `focus`/`unfocus` and inline
+   fields RETIRED.** Net MCP carries dynamic context tools + schema-rich discovery
+   (a9b9288) and concurrent stdio (4b4665a).
+   - `notifications/tools/list_changed` — **implemented** on Net (branch
+     net-mcp-list-changed, 942f05c + 4253945): `listChanged: true` with an
+     authenticated Streamable-HTTP GET/SSE carrier, per-session coalesced hints,
+     stdio-bridge forwarding. Reviewed security-clean. So `tests/mcp.test.ts`'s
+     list-changed contract has a Net equivalent (`net-mcp.test.ts`), not a retirement.
+   - `woo_focus` / `woo_unfocus` — RETIRED; no Net equivalent (the dynamic
+     context-tool set already tracks the actor's space/objects/inventory).
+   - Classic inline `observations` / `applied` result fields on tool calls — RETIRED.
    Consequence: the classic MCP host (`src/mcp/server.ts`, `src/mcp/gateway.ts`)
-   and `tests/mcp.test.ts` / `mcp-warm-authority` assertions for these become
-   deletable — their contract is retired, not owed a Net port.
+   and the focus/unfocus + inline-field assertions in `tests/mcp.test.ts` /
+   `mcp-warm-authority` become deletable — those specific contracts are retired.
 
 2. **v2 rollback is renounced.** NC6's rollback contract is given up. This clears
    the NC9 precondition ("rollback to the v2 stack formally renounced"). The
