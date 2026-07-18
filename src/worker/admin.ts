@@ -19,7 +19,6 @@
 // Spec: see spec/reference/cloudflare.md §R10.1 (the AE slot map) and
 // notes/2026-05-17-admin-stats.md (the step-by-step plan).
 
-import type { Env } from "./persistent-object-do";
 import { signInternalRequest } from "./internal-auth";
 import { netDefaultEnabled } from "./net-default";
 
@@ -28,7 +27,24 @@ const ADMIN_USER = "admin";
 const WORLD_HOST = "world";
 const INTERNAL_ORIGIN = "https://woo.internal";
 
-export async function handleAdmin(request: Request, env: Env, url: URL): Promise<Response> {
+// The admin panel needs only operator secrets and the Analytics Engine vars;
+// its one WORLD-touching route (classic guest purge) is retired on Net and
+// otherwise reaches the world DO only when the deployment selector is off.
+// Declaring that narrow surface here (rather than importing the classic
+// `Env`) lets the Net-only Worker mount the dashboard without depending on
+// PersistentObjectDO. `WOO` is optional: present on the dual-stack Env, absent
+// on the Net-only Env, and only dereferenced on the selector-off purge path.
+export interface AdminEnv {
+  ADMIN_PASSWORD?: string;
+  WOO_NET_DEFAULT?: string;
+  WOO_INTERNAL_SECRET?: string;
+  CF_ANALYTICS_TOKEN?: string;
+  CF_ACCOUNT_ID?: string;
+  WOO_AE_DATASET?: string;
+  WOO?: DurableObjectNamespace;
+}
+
+export async function handleAdmin(request: Request, env: AdminEnv, url: URL): Promise<Response> {
   // Fail closed when the admin secret isn't set. Surfacing as 503 (not
   // 401) so operators don't think "wrong password" — they need to set
   // the secret before /admin/ is usable at all.
@@ -110,7 +126,7 @@ function constantTimeEqual(a: string, b: string): boolean {
 // WORLD so the actual purge runs in the same serialized DO context as normal
 // session lifecycle cleanup.
 
-async function handlePurgeInactiveGuests(request: Request, env: Env): Promise<Response> {
+async function handlePurgeInactiveGuests(request: Request, env: AdminEnv): Promise<Response> {
   if (request.method !== "POST") {
     return jsonResponse({ error: { code: "E_METHOD", message: "use POST /admin/purge-inactive-guests" } }, 405, { allow: "POST" });
   }
@@ -130,6 +146,12 @@ async function handlePurgeInactiveGuests(request: Request, env: Env): Promise<Re
   }
   if (!env.WOO_INTERNAL_SECRET) {
     return jsonResponse({ error: { code: "E_BOOTSTRAP_TOKEN_MISSING", message: "set WOO_INTERNAL_SECRET via wrangler secret put" } }, 503);
+  }
+  if (!env.WOO) {
+    // Reached only with the selector off (net returns 410 above). A build with
+    // no WORLD binding — i.e. the Net-only Worker — cannot serve the classic
+    // purge; fail closed rather than dereference a missing namespace.
+    return jsonResponse({ error: { code: "E_GONE", message: "classic guest purge is unavailable without the WORLD binding" } }, 410);
   }
 
   const headers = new Headers({ "content-type": "application/json; charset=utf-8", "x-woo-host-key": WORLD_HOST });
@@ -197,7 +219,7 @@ const BUCKET_SECONDS: Record<string, number> = {
   "1h": 3600
 };
 
-async function handleSeries(env: Env, url: URL): Promise<Response> {
+async function handleSeries(env: AdminEnv, url: URL): Promise<Response> {
   if (!env.CF_ANALYTICS_TOKEN || !env.CF_ACCOUNT_ID) {
     return jsonResponse({
       error: {
@@ -286,7 +308,7 @@ async function handleSeries(env: Env, url: URL): Promise<Response> {
 // Returns:
 //   { groupBy, from, to, rows: [ { key, samples, p50_ms, p95_ms, error_rate } ] }
 
-async function handleFootprint(_request: Request, env: Env, url: URL): Promise<Response> {
+async function handleFootprint(_request: Request, env: AdminEnv, url: URL): Promise<Response> {
   if (!env.CF_ANALYTICS_TOKEN || !env.CF_ACCOUNT_ID) {
     return jsonResponse({
       error: { code: "E_AE_NOT_CONFIGURED", message: "CF_ANALYTICS_TOKEN secret and CF_ACCOUNT_ID var must both be set to query Analytics Engine" }

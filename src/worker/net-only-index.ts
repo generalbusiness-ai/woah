@@ -9,6 +9,7 @@
  */
 import { wooError } from "../core/types";
 import { cellKey, type CellTransfer } from "../net/cells";
+import { handleAdmin, type AdminEnv } from "./admin";
 import { signInternalRequest, verifyInternalRequest } from "./internal-auth";
 import { parseNetGatewayShardCount, routeNetGateway } from "./net/gateway-routing";
 import { resolveNetDestination, type NetBindingsEnv } from "./net/workerd-host";
@@ -16,7 +17,11 @@ import { resolveNetDestination, type NetBindingsEnv } from "./net/workerd-host";
 export { NetGatewayDO } from "./net/gateway-do";
 export { NetScopeDO } from "./net/scope-do";
 
-export type NetOnlyEnv = NetBindingsEnv & {
+// AdminEnv carries only operator secrets + Analytics Engine vars; the dashboard
+// needs no WORLD binding (its live routes hit AE directly and the classic guest
+// purge is Net-retired to 410). Including it keeps `/admin` operable on the
+// Net-only entry without importing PersistentObjectDO.
+export type NetOnlyEnv = NetBindingsEnv & AdminEnv & {
   ASSETS?: Fetcher;
   NET_API_GATEWAY_SHARDS?: string;
 };
@@ -46,6 +51,14 @@ export default {
       return handleNetApi(request, env, alias);
     }
     if (install) return handleNetInstall(raw, env, url);
+
+    // Operator dashboard. Must be matched before the asset fallback or `/admin`
+    // silently serves the SPA shell. Its live routes (series/footprint) read
+    // Analytics Engine directly and the guest purge is Net-retired (410), so no
+    // WORLD binding is required here.
+    if (url.pathname === "/admin" || url.pathname.startsWith("/admin/")) {
+      return handleAdmin(request, env, url);
+    }
 
     // These paths cannot silently reappear through the asset fallback after
     // the legacy DO classes are removed.

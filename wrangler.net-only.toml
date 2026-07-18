@@ -15,6 +15,9 @@ run_worker_first = true
 [vars]
 NET_API_GATEWAY_SHARDS = "8"
 NET_RPC_TIMEOUT_MS = "5000"
+# The Net-only Worker is Net by definition; this makes the admin guest-purge
+# route return its Net-retirement 410 instead of seeking the absent WORLD DO.
+WOO_NET_DEFAULT = "on"
 
 [[durable_objects.bindings]]
 name = "SCOPE_NET"

@@ -88,4 +88,30 @@ describe("net-only Worker entry", () => {
     }
     close();
   });
+
+  it("mounts the operator admin dashboard without a WORLD binding", async () => {
+    const { env, close } = harness();
+    // Wired to handleAdmin, not the SPA fallback: with no ADMIN_PASSWORD it must
+    // fail closed (503), never serve the asset shell.
+    const disabled = await worker.fetch(new Request("https://woo.test/admin/"), env);
+    expect(disabled.status).toBe(503);
+    expect(await disabled.json()).toMatchObject({ error: { code: "E_ADMIN_DISABLED" } });
+
+    // With the secret set: unauthenticated → 401 (auth precedes everything).
+    env.ADMIN_PASSWORD = "hunter2";
+    env.WOO_NET_DEFAULT = "on";
+    const unauthorized = await worker.fetch(new Request("https://woo.test/admin/"), env);
+    expect(unauthorized.status).toBe(401);
+
+    // Authenticated guest purge returns the Net retirement 410 — and crucially
+    // does not throw despite the Net-only env having no WOO namespace.
+    const authorization = `Basic ${Buffer.from("admin:hunter2").toString("base64")}`;
+    const purge = await worker.fetch(
+      new Request("https://woo.test/admin/purge-inactive-guests", { method: "POST", headers: { authorization } }),
+      env
+    );
+    expect(purge.status).toBe(410);
+    expect(await purge.json()).toMatchObject({ error: { code: "E_GONE", detail: { net: true } } });
+    close();
+  });
 });
