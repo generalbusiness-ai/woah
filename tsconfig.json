@@ -13,7 +13,7 @@
     "noFallthroughCasesInSwitch": true,
     "skipLibCheck": true,
     "paths": {
-      "#v2-browser-worker-factory": ["./src/client/v2-browser-worker-factory.ts"]
+      "#v2-browser-worker-factory": ["./src/client/v2-browser-worker-factory.net-only.ts"]
     },
     "types": ["node"]
   },
