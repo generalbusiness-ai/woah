@@ -4333,8 +4333,11 @@ function applyScopedMoveResult(result: any) {
   applyScopedProjectionModel();
   // Hosted REST replies can settle before the corresponding WebSocket
   // movement observation. If the result advanced the room first, the later
-  // observation sees no change and will not start hydration, so do it here.
-  if (netRoomChanged && state.tab === "chat") void refreshNetRoomProjection();
+  // observation sees no change and will not start hydration, so do it here for
+  // every space. Tool tabs need the same generic room identity/presence model
+  // as Chat; their catalog hydration intentionally owns only semantic view
+  // state and cannot supply a missing subject name.
+  if (netRoomChanged) void refreshNetRoomProjection();
   if (movedRoom && state.tab === "chat") syncUrlFromCurrentState("replace");
 }
 

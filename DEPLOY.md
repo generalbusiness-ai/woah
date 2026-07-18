@@ -45,6 +45,16 @@ WOO_MCP_TOKEN=apikey:local-dev:local-dev-secret npm run mcp:stdio
 are supplied, or can reuse the running dev server through `WOO_MCP_URL` and
 `WOO_MCP_TOKEN`.
 
+The dedicated browser gate proves the default command can install a fresh
+world, accept a catalog UI write, stop, and recover that write after a
+same-directory process restart:
+
+```sh
+npm run e2e:net-dev
+```
+
+It uses an isolated temporary namespace and never modifies `.woo/net-dev`.
+
 The former Node/SQLite transport remains available only as a rollback lane:
 
 ```sh

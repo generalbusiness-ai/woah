@@ -1,5 +1,6 @@
 ---
 date: 2026-04-30
+updated: 2026-07-17
 status: partial
 ---
 
@@ -38,6 +39,15 @@ This section does **not** apply to in-memory or local SQLite modes. Those runtim
   sessions, MCP, or WebSocket delivery. A catalog epoch mismatch fails loudly
   instead of overwriting committed local state; `npm run dev -- --reset` is the
   explicit destructive reset. This is the primary local behavior surface.
+  Its browser acceptance gate MUST launch that literal default command against
+  an absent, isolated persistence directory; enter through the bare-URL Net
+  identity door with empty browser storage; commit a user-visible durable
+  change; terminate and restart the command against the same directory; and
+  observe the change after browser reload. The gate MUST fail if the browser
+  makes any `/api/*`, `/v2/*`, or `/connect` request, so a usable shell cannot
+  conceal a fallback to the classic transport. Direct `wrangler dev`, a
+  preinstalled fixture, or a backend-helper test does not satisfy this
+  composition contract.
 - **Classic local SQLite rollback mode** (single-node legacy system).
   `npm run dev:classic` retains the pre-Net `LocalSQLiteRepository` composition
   while the NC8 rollback contract remains live. `WOO_DB` configures this mode

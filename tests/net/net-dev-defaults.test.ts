@@ -11,6 +11,7 @@ describe("Net-default local development composition", () => {
     expect(pkg.scripts["dev:classic"]).toBe("tsx src/server/dev-server.ts");
     expect(pkg.scripts["mcp:stdio"]).toBe("tsx src/mcp/net-stdio.ts");
     expect(pkg.scripts["mcp:stdio:classic"]).toBe("tsx src/mcp/stdio.ts");
+    expect(pkg.scripts["e2e:net-dev"]).toBe("playwright test --config playwright.net-dev-e2e.config.ts");
   });
 
   it("keeps classic transport coverage explicit and out of the fast default gate", () => {

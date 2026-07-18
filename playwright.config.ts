@@ -14,11 +14,11 @@ const useExternalBaseUrl = Boolean(process.env.WOO_E2E_BASE_URL);
 
 export default defineConfig({
   testDir: "./e2e",
-  // net-feed.spec.ts manages its own wrangler-dev backend (npm run e2e:net,
-  // playwright.net-e2e.config.ts) — running it here would spawn a second
-  // workerd under the dev-server webServer for nothing. Browser-spawning
-  // lanes are explicit, like e2e:cf.
-  testIgnore: ["**/net-feed.spec.ts", "**/net-spa.spec.ts"],
+  // Net browser specs own production-shaped lifecycles: e2e:net starts its
+  // workerd fixtures, while e2e:net-dev starts and restarts the literal
+  // default composition. Running either under this config's webServer would
+  // attach to the wrong namespace. Browser-spawning lanes stay explicit.
+  testIgnore: ["**/net-feed.spec.ts", "**/net-spa.spec.ts", "**/net-dev-lifecycle.spec.ts"],
   timeout: 30_000,
   fullyParallel: false,
   workers: 1,

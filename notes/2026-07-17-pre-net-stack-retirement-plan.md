@@ -46,16 +46,22 @@ until the rollback contract is renounced under NC9.
 Status: implemented and validated on the `net-dev-default` worktree. The work
 also corrected Net MCP's non-standard `tools/list` envelope, which a real SDK
 client rejected, and made bounded `woo_wait` reads preserve queued remainder.
+The F6 browser deletion gate is now complete: `npm run e2e:net-dev` exercises
+the literal default command through first install, guest entry, a durable
+Pinboard write, full process restart, and persisted browser recovery with no
+classic transport requests.
 
-Current default commands are classic compositions:
+Current default commands are Net compositions:
 
-- `npm run dev` starts `src/server/dev-server.ts`,
-  `LocalSQLiteRepository`, `McpGateway`, `shadow-browser-node`, and the v2 turn
-  network WebSocket.
-- `npm run mcp:stdio` starts the in-memory classic `McpHost`.
+- `npm run dev` starts the persistent workerd Net composition through
+  `src/server/net-dev.ts`.
+- `npm run mcp:stdio` starts the stdio adapter over the Net MCP/session HTTP
+  surface.
+- `npm run dev:classic` and `npm run mcp:stdio:classic` preserve the explicit
+  rollback compositions during the NC8 bake.
 
-Before deleting `src/server/*` or `src/mcp/gateway.ts`, provide interactive Net
-compositions using the same `src/net` pipeline as production:
+The replacement work delivered interactive Net compositions using the same
+`src/net` pipeline as production:
 
 1. A local persistent Host binding and bootstrap/install path suitable for the
    browser dev server.
@@ -67,10 +73,11 @@ compositions using the same `src/net` pipeline as production:
    usable as the current inner loop.
 5. Browser-local smoke before workerd, followed by the existing workerd lane.
 
-Only after parity is demonstrated should `npm run dev` and `npm run mcp:stdio`
-change defaults. If rollback tools remain during the NC8 bake, name them
-explicitly (`dev:classic`, `mcp:stdio:classic`) so they cannot masquerade as the
-primary architecture.
+The F6 lifecycle scenario is the browser proof for items 1–2 and 5. The stdio
+unit and smoke lanes cover item 3; explicit classic command names satisfy the
+rollback requirement. Reset and diagnostics remain maintained as part of the
+default Net dev composition rather than as a reason to retain a classic
+default.
 
 ## 3. Re-home classic transport coverage
 
@@ -79,7 +86,7 @@ validation complete. See
 `notes/2026-07-17-classic-net-test-contract-matrix.md`. Dynamic MCP discovery,
 schema-rich paging, and structural navigation are now covered; the remaining
 MCP lifecycle decision is `tools/list_changed`. The matrix also identifies a
-default-localdev browser scenario as a deletion blocker. No classic
+default-localdev browser scenario, now closed by `e2e:net-dev`. No classic
 implementation or test has been deleted.
 
 The default suite intentionally contains many classic consumers. Deletion must
