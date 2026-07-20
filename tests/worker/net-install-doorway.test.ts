@@ -6,11 +6,10 @@
 // error text — not against the DO handlers the route forwards to
 // (tests/worker/net-install.test.ts covers those).
 import { describe, expect, it } from "vitest";
-import worker from "../../src/worker/index";
+import worker, { type NetOnlyEnv } from "../../src/worker/net-only-index";
 import { FakeDurableObjectState } from "./fake-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
-import type { Env } from "../../src/worker/persistent-object-do";
 
 const SECRET = "net-install-doorway-secret";
 const EPOCH = "cat-doorway-1";
@@ -45,12 +44,12 @@ function buildHarness() {
   const env = {
     WOO_INTERNAL_SECRET: SECRET,
     NET_RESOLVE: resolve
-  } as unknown as Env;
+  } as unknown as NetOnlyEnv;
   return {
     env,
-    request: async (path: string, init?: RequestInit) => worker.fetch(new Request(`https://woo.test${path}`, init), env, {} as never),
+    request: async (path: string, init?: RequestInit) => worker.fetch(new Request(`https://woo.test${path}`, init), env),
     signedRequest: async (path: string, init?: RequestInit) =>
-      worker.fetch(await signInternalRequest({ WOO_INTERNAL_SECRET: SECRET }, new Request(`https://woo.test${path}`, init)), env, {} as never),
+      worker.fetch(await signInternalRequest({ WOO_INTERNAL_SECRET: SECRET }, new Request(`https://woo.test${path}`, init)), env),
     scopeStates,
     close: () => states.forEach((state) => state.close())
   };
@@ -97,8 +96,7 @@ describe("the /net-install doorway (route level)", () => {
         { WOO_INTERNAL_SECRET: "not-the-secret" },
         new Request("https://woo.test/net-install/scope/room%3Ax/seed", seedBody("room:x"))
       ),
-      h.env,
-      {} as never
+      h.env
     );
     expect(wrongSecret.status).toBe(401);
     // Refusal text never echoes the configured secret.
@@ -122,7 +120,7 @@ describe("the /net-install doorway (route level)", () => {
     // Re-stamping the ts breaks the HMAC too, but pin the WINDOW rule by
     // re-signing at the old timestamp via a fresh signed request whose
     // clock we shift: simplest honest probe is the tampered-ts refusal.
-    const tampered = await worker.fetch(new Request(stale, { headers }), h.env, {} as never);
+    const tampered = await worker.fetch(new Request(stale, { headers }), h.env);
     expect(tampered.status).toBe(401);
     // WITHIN the window, a byte-identical replay of a real seed is safe:
     // the M9 same-epoch guard makes it a no-op-shaped success (the
@@ -132,9 +130,9 @@ describe("the /net-install doorway (route level)", () => {
       { WOO_INTERNAL_SECRET: SECRET },
       new Request("https://woo.test/net-install/scope/room%3Areplay/seed", seedBody("room:replay", EPOCH, cells))
     );
-    const first = await worker.fetch(original.clone(), h.env, {} as never);
+    const first = await worker.fetch(original.clone(), h.env);
     expect(first.status, await first.clone().text()).toBe(200);
-    const replayed = await worker.fetch(original, h.env, {} as never);
+    const replayed = await worker.fetch(original, h.env);
     expect(replayed.status).toBe(200);
     const head = await h.signedRequest("/net-install/scope/room%3Areplay/head");
     expect(((await head.json()) as { catalog_epoch?: string }).catalog_epoch).toBe(EPOCH);

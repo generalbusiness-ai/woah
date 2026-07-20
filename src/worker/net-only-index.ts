@@ -173,7 +173,7 @@ async function handleNetInstall(request: Request, env: NetOnlyEnv, url: URL): Pr
   }
 }
 
-function sanitizePublicHeaders(request: Request): Request {
+export function sanitizePublicHeaders(request: Request): Request {
   const headers = new Headers(request.headers);
   for (const name of [...headers.keys()]) {
     const lower = name.toLowerCase();

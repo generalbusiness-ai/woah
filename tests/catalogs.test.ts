@@ -6,7 +6,6 @@ import { createWorld, createWorldFromSerialized, mergeHostScopedSeed, nonEmptyHo
 import { installCatalogManifest, updateCatalogManifest, type CatalogManifest as RuntimeCatalogManifest } from "../src/core/catalog-installer";
 import { bundledCatalogAliases, installLocalCatalogs, localCatalogStatuses, runHostScopedDataMigrations, runHostScopedLocalCatalogLifecycle } from "../src/core/local-catalogs";
 import type { AppliedFrame, DirectResultFrame, ErrorFrame, Message, VerbDef, WooValue } from "../src/core/types";
-import { McpHost } from "../src/mcp/host";
 
 type CatalogManifest = {
   name: string;
@@ -199,17 +198,17 @@ describe("local catalogs", () => {
     expect(world.getProp("exit_pinboard_out", "dest")).toBe("the_deck");
 
     const session = world.auth("guest:movement-model-tools");
-    const host = new McpHost(world);
-    host.bindSession(session.id, session.actor);
     for (const target of ["the_pinboard", "the_dubspace"]) {
       const moved = await moveActorTo(world, session.actor, target, { requestId: `move-tools-${target}`, sessionId: session.id });
       expect(moved.op).toBe("result");
-      const verbs = (await host.enumerateTools(session.actor))
-        .filter((tool) => tool.object === target)
-        .map((tool) => tool.verb);
+      // A tool-room offers `out` (the room's exit verb, definer $room) but not
+      // the scoped enter/leave as object-command verbs. obviousCommandVerbs is
+      // the substrate command-verb primitive the MCP tool enumerator builds on;
+      // the classic McpHost enumerator is retired.
+      const verbs = world.obviousCommandVerbs(target, { actor: session.actor }).map((verb) => verb.name);
       expect(verbs).not.toContain("enter");
       expect(verbs).not.toContain("leave");
-      expect(verbs).toContain("out");
+      expect(world.verbInfo(target, "out").definer).toBe("$room");
     }
   });
 
@@ -1201,33 +1200,10 @@ describe("local catalogs", () => {
     const freshRef = fresh.op === "result" ? String(fresh.result) : "";
     const reclaim = await world.directCall(undefined, session.actor, freshRef, "claim", [], { forceDirect: true, forceReason: "test" });
     expect(reclaim.op).toBe("result");
-    const host = new McpHost(world);
-    host.bindSession(session.id, session.actor);
-    const tools = await host.enumerateTools(session.actor);
-    const lookup = (object: string, verb: string) => tools.find((t) => t.object === object && t.verb === verb);
-    const claimTool = lookup(freshRef, "claim");
-    expect(claimTool, `claim tool missing: ${tools.map((t) => `${t.object}:${t.verb}`).join(",")}`).toBeDefined();
-    expect(claimTool!.description).toMatch(/Take responsibility for delivering this task/);
-    expect(claimTool!.description).toMatch(/the current step is waiting on you/);
-    const passTool = lookup(freshRef, "pass");
-    expect(passTool!.description).toMatch(/Record the current step as done/);
-    const dropTool = lookup(freshRef, "drop_terminal");
-    expect(dropTool!.description).toMatch(/Mark the task final/);
-    const yieldTool = lookup(freshRef, "yield");
-    expect(yieldTool!.description).toMatch(/Add a new task linked to this one/);
-    // Registry-side verbs — claim_task / listing / set_role / set_obligation / set_policy.
-    const listingTool = lookup("the_taskboard", "listing");
-    expect(listingTool!.description).toMatch(/List every task this registry has minted/);
-    const createTool = lookup("the_taskboard", "create_task");
-    expect(createTool!.description).toMatch(/Create a new task on this registry/);
-    expect(createTool!.description).toMatch(/Pick a workflow by name/);
-    const setRoleTool = lookup("the_taskboard", "set_role");
-    expect(setRoleTool!.description).toMatch(/A role groups people who can claim and finish/);
-    const setObTool = lookup("the_taskboard", "set_obligation");
-    expect(setObTool!.description).toMatch(/A step is a named gate/);
-    expect(setObTool!.description).toMatch(/conditions of satisfaction/i);
-    const setPolicyTool = lookup("the_taskboard", "set_policy");
-    expect(setPolicyTool!.description).toMatch(/A workflow is the ordered list of steps/);
+    // NOTE: the classic McpHost tool-description enumeration is retired here.
+    // The tasks catalog descriptions are unchanged in catalogs/tasks/manifest.json;
+    // their MCP surfacing is covered by tests/worker/net-mcp.test.ts. A dedicated
+    // task-tool-description assertion on the net path is a follow-up coverage item.
   });
 
   it("installs pinboard from source and keeps notes as board-contained pin objects", async () => {
