@@ -22,7 +22,7 @@
 # classes, their sqlite migrations, the KV host-seed binding, and the
 # auto-installed demo world — matches production.
 name = "woah-smoke"
-main = "src/worker/index.ts"
+main = "src/worker/net-only-index.ts"
 compatibility_date = "2026-04-01"
 compatibility_flags = ["nodejs_compat"]
 workers_dev = false
@@ -87,22 +87,9 @@ WOO_V2_TAIL_RETENTION_BYTES = "524288"
 #
 # WOO_FAULT_INJECT = ""
 
-[[durable_objects.bindings]]
-name = "WOO"
-class_name = "PersistentObjectDO"
-
-[[durable_objects.bindings]]
-name = "DIRECTORY"
-class_name = "DirectoryDO"
-
-[[durable_objects.bindings]]
-name = "COMMIT_SCOPE"
-class_name = "CommitScopeDO"
-
-# Plan 002 coherence layer (spec/protocol/coherence.md). New classes sit
-# beside the v2 ones; nothing routes production traffic here until the
-# Phase-5 cutover. SCOPE_NET is the scope authority (CO5 copy #1);
-# GATEWAY_NET is the session-edge derived cache (copy #2).
+# v2 DO classes retired; only the net classes remain (kept in lockstep with
+# wrangler.toml — guard:smoke-wrangler enforces this). SCOPE_NET is the scope
+# authority (CO5 copy #1); GATEWAY_NET is the session-edge derived cache (copy #2).
 [[durable_objects.bindings]]
 name = "SCOPE_NET"
 class_name = "NetScopeDO"
@@ -132,3 +119,7 @@ new_sqlite_classes = ["CommitScopeDO"]
 [[migrations]]
 tag = "cf-do-0004"
 new_sqlite_classes = [ "NetGatewayDO", "NetScopeDO" ]
+
+[[migrations]]
+tag = "cf-do-0005"
+deleted_classes = [ "CommitScopeDO", "DirectoryDO", "PersistentObjectDO" ]

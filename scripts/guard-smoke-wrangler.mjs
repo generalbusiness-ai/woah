@@ -27,7 +27,7 @@ import { analyzeDoMigrations, parseWranglerDoState } from "./sync-wrangler-do-mi
 
 const PROD_CONFIG = "wrangler.toml";
 // All local-dev wrangler configs that duplicate the DO surface must stay in sync.
-const LOCAL_CONFIGS = ["wrangler.smoke.toml", "wrangler.cf-e2e.toml"];
+const LOCAL_CONFIGS = ["wrangler.smoke.toml"];
 
 // Canonical, order-preserving signature of the DO bindings + migration history.
 // Migrations are order-sensitive (they replay to compute the active class set),

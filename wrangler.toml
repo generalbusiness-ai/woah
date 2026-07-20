@@ -1,5 +1,5 @@
 name = "woah"
-main = "src/worker/index.ts"
+main = "src/worker/net-only-index.ts"
 compatibility_date = "2026-04-01"
 compatibility_flags = ["nodejs_compat"]
 
@@ -136,25 +136,16 @@ not_found_handling = "single-page-application"
 # API routes reachable.
 run_worker_first = true
 
-[[durable_objects.bindings]]
-name = "WOO"
-class_name = "PersistentObjectDO"
-
-[[durable_objects.bindings]]
-name = "DIRECTORY"
-class_name = "DirectoryDO"
-
-[[durable_objects.bindings]]
-name = "COMMIT_SCOPE"
-class_name = "CommitScopeDO"
-
-# Plan 002 coherence layer (spec/protocol/coherence.md). New classes sit
-# beside the v2 ones; nothing routes production traffic here until the
-# Phase-5 cutover. SCOPE_NET is the scope authority (CO5 copy #1);
-# GATEWAY_NET is the session-edge derived cache (copy #2) — fanned across
-# NET_API_GATEWAY_SHARDS shards (default 8; see the var above and
-# src/worker/net/gateway-routing.ts), so this single binding backs many
-# gateway DO instances addressed by shard-hinted idFromName.
+# The v2 Durable Object classes (PersistentObjectDO, DirectoryDO,
+# CommitScopeDO) are retired. Their bindings are removed and their storage is
+# reclaimed by the deleted_classes migration below. The net stack is the only
+# runtime.
+#
+# SCOPE_NET is the scope authority (CO5 copy #1); GATEWAY_NET is the
+# session-edge derived cache (copy #2) — fanned across NET_API_GATEWAY_SHARDS
+# shards (default 8; see the var above and src/worker/net/gateway-routing.ts),
+# so this single binding backs many gateway DO instances addressed by
+# shard-hinted idFromName.
 [[durable_objects.bindings]]
 name = "SCOPE_NET"
 class_name = "NetScopeDO"
@@ -244,3 +235,7 @@ dataset = "woo_v1_prod"
 [[migrations]]
 tag = "cf-do-0004"
 new_sqlite_classes = [ "NetGatewayDO", "NetScopeDO" ]
+
+[[migrations]]
+tag = "cf-do-0005"
+deleted_classes = [ "CommitScopeDO", "DirectoryDO", "PersistentObjectDO" ]

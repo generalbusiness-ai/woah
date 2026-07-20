@@ -12,13 +12,8 @@ const skippedDirs = new Set(["node_modules", "dist", ".git", "src/generated"]);
 
 const allowedImporters = new Map([
   ["src/core/bootstrap.ts", "empty-world bootstrap and explicit catalog install option"],
-  ["src/core/protocol.ts", "catalog status/index protocol reporting"],
   ["src/net/install.ts", "net-namespace world install pipeline (cutover item A): a lifecycle surface, never turn runtime"],
-  ["src/mcp/stdio.ts", "startup parsing of auto-install configuration"],
-  ["src/server/dev-server.ts", "startup parsing of auto-install configuration"],
-  ["src/server/net-dev.ts", "Net developer-composition startup and install selection"],
-  ["src/worker/commit-scope-do.ts", "host-scoped catalog lifecycle repair on durable scope open"],
-  ["src/worker/persistent-object-do.ts", "gateway/host lifecycle catalog install and repair"]
+  ["src/server/net-dev.ts", "Net developer-composition startup and install selection"]
 ]);
 
 const importPattern = /from\s+["']([^"']*local-catalogs)["']|import\(["']([^"']*local-catalogs)["']\)/g;

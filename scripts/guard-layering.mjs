@@ -22,20 +22,17 @@ const legacyDebtFiles = new Set([
   "src/core/repository.ts",
   "src/core/tiny-vm.ts",
   "src/core/types.ts",
-  "src/core/world.ts",
-  "src/mcp/host.ts"
+  "src/core/world.ts"
 ]);
 
 const objectRefPattern = /\$[A-Za-z_][A-Za-z0-9_]*/g;
 const hits = [];
 
-const forbiddenTransportCatalogCouplings = [
-  { file: "src/mcp/gateway.ts", snippet: 'verb === "leave"', reason: "MCP transport must read deterministic movement rules from verb metadata, not command words" },
-  { file: "src/mcp/gateway.ts", snippet: 'verb === "out"', reason: "MCP transport must read deterministic movement rules from verb metadata, not command words" },
-  { file: "src/mcp/gateway.ts", snippet: '"mount_room"', reason: "MCP transport must not know mounted-tool catalog properties" },
-  { file: "src/mcp/gateway.ts", snippet: '"exits"', reason: "MCP transport must not know room-topology catalog properties" },
-  { file: "src/mcp/gateway.ts", snippet: '"dest"', reason: "MCP transport must not know room-topology catalog properties" }
-];
+// The classic v2 MCP gateway (src/mcp/gateway.ts) is retired. Its
+// transport/catalog-coupling checks are removed with it; the net MCP surface in
+// src/worker/net/gateway-do.ts reads deterministic movement rules from verb
+// metadata by construction (see reads_room_presence / host_placement).
+const forbiddenTransportCatalogCouplings = [];
 
 function normalize(path) {
   return relative(root, path).split(sep).join("/");

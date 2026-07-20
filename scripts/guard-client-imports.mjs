@@ -26,9 +26,7 @@ import { dirname, join, relative, resolve } from "node:path";
 const root = process.cwd();
 const entries = [
   // Browser bundle: anything reachable from main.ts ends up in the SPA bundle.
-  "src/client/main.ts",
-  // Web worker bundle for v2 turn-network browser cache.
-  "src/client/v2-browser-worker.ts"
+  "src/client/main.ts"
 ];
 
 const visited = new Set();
