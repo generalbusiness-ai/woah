@@ -23,7 +23,7 @@
 //     runtime targets before target-scope pull or repair;
 //   - client idempotency keys replay per the item-1 contract;
 //   - the authenticated GET reads (cell probe, relation roster) serve.
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { FakeDurableObjectState } from "./fake-do";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetAuditDO } from "../../src/worker/net/audit-do";
@@ -660,6 +660,50 @@ describe("/net-api/audit — the customer query surface (audit.md AU7/AU10.5)", 
     };
     expect(res.records.length).toBeGreaterThan(0);
     expect(res.records[0]?.principal).toMatchObject({ attribution: "credentialed", credential: "no-such-key" });
+    h.close();
+  });
+});
+
+describe("AU10.3 join gate: one trace id across gateway span, scope span, and audit record", () => {
+  it("an adopted sampled traceparent joins net.turn, net.commit, and the audit record", async () => {
+    const h = await buildHarness();
+    const TRACEPARENT = "00-feedfacefeedfacefeedfacefeedface-a1b2c3d4e5f60718-01";
+    const spanLines: Array<Record<string, unknown>> = [];
+    const logSpy = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+      if (args[0] === "woo.span" && typeof args[1] === "string") {
+        spanLines.push(JSON.parse(args[1]) as Record<string, unknown>);
+      }
+    });
+    try {
+      const session = await clientFetch(h.gateway, "POST", "/net-api/session", {
+        token: `apikey:${KEY_ID}:${KEY_SECRET}`,
+        body: {}
+      });
+      const turn = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+        token: `apikey:${KEY_ID}:${KEY_SECRET}`,
+        headers: { traceparent: TRACEPARENT },
+        body: { target: "capi_box", verb: "bump", session: (session.body as { session?: string }).session }
+      });
+      expect(turn.status).toBe(200);
+      for (let i = 0; i < 6; i += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    } finally {
+      logSpy.mockRestore();
+    }
+
+    const traceId = "feedfacefeedfacefeedfacefeedface";
+    const names = spanLines.filter((s) => s.trace_id === traceId).map((s) => s.name);
+    expect(names).toEqual(expect.arrayContaining(["net.turn", "net.commit"]));
+    // The adopted caller's span parents the gateway root.
+    const turnSpan = spanLines.find((s) => s.name === "net.turn" && s.trace_id === traceId);
+    expect(turnSpan?.parent_span_id).toBe("a1b2c3d4e5f60718");
+
+    // ...and the audit record carries the SAME trace id (the join).
+    const mine = await clientFetch(h.gateway, "POST", "/net-api/audit", {
+      token: `apikey:${KEY_ID}:${KEY_SECRET}`,
+      body: { trace_id: traceId }
+    });
+    expect(mine.status).toBe(200);
+    expect((mine.body.records as unknown[]).length).toBeGreaterThan(0);
     h.close();
   });
 });

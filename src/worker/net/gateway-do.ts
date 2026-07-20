@@ -66,6 +66,8 @@ import {
 } from "../../net/attribution";
 import { auditShardFor, mintGatewayAuditRecord } from "../../net/audit";
 import { CellStore, cellKey, cellVersion, makeCell, type Cell } from "../../net/cells";
+import { spanSampled, turnSpans } from "../../net/spans";
+import { exportSpans, spanSampleRate } from "./span-export";
 import { adoptOrMintTraceContext, normalizeTraceContext, parseTraceparent, type TraceContext } from "../../net/trace";
 import { clampClientSessionTtl } from "../../net/client-session-policy";
 import { budgetExhausted, isNetError, netError, nonconvergentRead, NetError, type AttemptTraceEntry, type NetErrorCode } from "../../net/errors";
@@ -1178,6 +1180,33 @@ export class NetGatewayDO {
       ...(traceId ? { trace_id: traceId } : {}),
       ...report
     });
+    // AU8 span tree: root `net.turn` + phase children from the measured
+    // report buckets. Adopted contexts follow the caller's sampled flag;
+    // minted contexts are gated by NET_SPAN_SAMPLE. Export is
+    // best-effort (woo.span log + optional OTLP push off the reply
+    // path) and never the audit trail.
+    if (request.trace && spanSampled(request.trace, spanSampleRate(this.env))) {
+      exportSpans(
+        this.env,
+        this.host,
+        turnSpans({
+          trace: request.trace,
+          now_ms: this.host.now(),
+          wall_ms: report.wall_ms,
+          queue_ms: report.queue_ms,
+          rpc_ms: report.rpc_ms,
+          status: status === "accepted" ? "ok" : "error",
+          attributes: {
+            "woo.scope": report.scope,
+            "woo.verb": request.call.verb,
+            ...(request.principal?.customer ? { "woo.customer": request.principal.customer } : {}),
+            ...(request.principal?.actor ? { "woo.actor": request.principal.actor } : {}),
+            ...(error ? { "woo.error": error } : {})
+          }
+        }),
+        { service: "woo-net-gateway", instance: `net-gateway:${this.shardName() ?? "unnamed"}` }
+      );
+    }
   }
 
   /**

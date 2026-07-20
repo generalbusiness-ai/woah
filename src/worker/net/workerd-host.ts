@@ -86,6 +86,11 @@ export type NetBindingsEnv = WorkerdHostEnv & {
   /** Bounded audit shard count. Absent/0 → the audit lane is disabled
    * (scopes enqueue nothing) — lanes without the binding stay green. */
   NET_AUDIT_SHARDS?: string;
+  /** AU8 span export (span-export.ts): OTLP/HTTP traces endpoint and
+   * the 1-in-N sample rate for minted traces. Both optional; absent =
+   * woo.span logging only / minted traces unsampled. */
+  WOO_OTLP_ENDPOINT?: string;
+  NET_SPAN_SAMPLE?: string;
 };
 
 /** destination = "<kind>:<name>". Shared by NetGatewayDO and NetScopeDO

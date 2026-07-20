@@ -257,3 +257,32 @@ Deliberate limits, named:
   its next request.
 - AU10.3 (trace join gate) lands with Phase 4 span emission; segment
   retention/expiry (AU9) and push export (AU7) not started.
+
+## Phase 4 status (2026-07-20)
+
+IMPLEMENTED (npm test 1032/1032 across 94 files; worker 489/489;
+smoke:net-dev 25/25):
+
+- src/net/spans.ts: OTel span shape (hex ids, links), deterministic
+  sampling (adopted contexts follow the caller's W3C sampled flag;
+  minted contexts gated 1-in-N by NET_SPAN_SAMPLE, hashed by trace id
+  so gateway and scope agree), turn span tree from the structure
+  report's measured buckets, OTLP/HTTP JSON payload builder.
+- src/worker/net/span-export.ts: woo.span structured-log channel
+  always; OTLP push via Host.defer when WOO_OTLP_ENDPOINT is set.
+- Emission: gateway net.turn root + queue/rpc phase children
+  (emitTurnStructure site); scope net.commit span (submit site). Both
+  parent to the CARRIED context's span id — a flat tree under the
+  caller's trace.
+- AU10.3 join gate (curated, net-client-api): one adopted traceparent →
+  net.turn span, net.commit span, and the audit record share the trace
+  id; the gateway root parents under the caller's span.
+
+Deliberate exclusions, named:
+- Per-Host.rpc child spans: need per-call context threading through the
+  TR1 seam (an ambient field races under NET_TURN_SCOPE_CONCURRENCY=12).
+  Design with the TR7.2 native-RPC work, which touches the same seam.
+- net_rpc AE trace stamping rides the same future seam change.
+- Span timing inside the turn is reconstructed from measured phase
+  buckets (queue/rpc laid sequentially inside the wall) — honest about
+  totals, approximate about overlap.

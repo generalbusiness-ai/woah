@@ -1,6 +1,6 @@
 ---
 date: 2026-07-16
-status: partial — AU1–AU7 implemented on the net stack (records minted in the commit transaction; durable /audit lane; NetAuditDO shards with hash-chained SQLite segments; gateway edge records; /net-api/audit identity-scoped query; AU10 gates 1/2/4/5/6 in the curated suite). Remaining draft: AU6.3 object-storage segment offload, AU7 push export + OTLP, AU8 span emission, AU9 retention/redaction policy machinery, CO17-interplay drain rules
+status: partial — AU1–AU8 implemented on the net stack (records minted in the commit transaction; durable /audit lane; NetAuditDO shards with hash-chained SQLite segments; gateway edge records; /net-api/audit identity-scoped query; AU8 span emission at the turn/commit seams with woo.span logs + optional OTLP/HTTP push, adopted-flag/minted-rate sampling; AU10 gates 1/2/3/4/5/6 in the curated suite). Remaining draft: AU6.3 object-storage segment offload, AU7 push export, AU9 retention/redaction policy machinery, per-Host.rpc child spans (needs context threading through the seam — TR1 — not an ambient field that races under turn concurrency), CO17-interplay drain rules
 ---
 
 # The audit trail — unified audit and observability (AU1–AU10)

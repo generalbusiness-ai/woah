@@ -84,7 +84,9 @@ import {
   mintCommitAuditRecords,
   type RoutedAuditRecord
 } from "../../net/audit";
+import { mintSpanId, spanSampled } from "../../net/spans";
 import { normalizeTraceContext, parseTraceparent, type TraceContext } from "../../net/trace";
+import { exportSpans, spanSampleRate } from "./span-export";
 import type { Cell } from "../../net/cells";
 import { cellKey, lineageClosureKeys, serializeTransfer, type CellTransfer } from "../../net/cells";
 import { isNetError, netError } from "../../net/errors";
@@ -792,6 +794,40 @@ export class NetScopeDO {
           outbox_enqueued: this.outboxEnqueuedTotal - enqueuedBefore,
           ms: Date.now() - submitStarted
         });
+        // AU8: the commit span, joined to the turn's trace. It parents
+        // to the CARRIED context's span id (the caller's span for
+        // adopted traces), so gateway and scope spans sit as siblings
+        // under the customer's own trace — a flat, honest tree until
+        // rpc-level context threading lands.
+        const spanTrace = submit.transcript.trace;
+        if (spanTrace && spanSampled(spanTrace, spanSampleRate(this.env))) {
+          const parsed = parseTraceparent(spanTrace.traceparent);
+          if (parsed) {
+            exportSpans(
+              this.env,
+              this.host,
+              [
+                {
+                  trace_id: parsed.traceId,
+                  span_id: mintSpanId(),
+                  ...(spanTrace.origin === "adopted" ? { parent_span_id: parsed.spanId } : {}),
+                  name: "net.commit",
+                  start_ms: submitStarted,
+                  end_ms: Date.now(),
+                  status: reply.status === "accepted" ? "ok" : "error",
+                  attributes: {
+                    "woo.scope": seq.scope,
+                    ...(reply.status === "accepted" ? { "woo.seq": reply.head.seq } : { "woo.reason": reply.reason }),
+                    ...(submit.transcript.principal?.customer
+                      ? { "woo.customer": submit.transcript.principal.customer }
+                      : {})
+                  }
+                }
+              ],
+              { service: "woo-net-scope", instance: seq.scope }
+            );
+          }
+        }
         return json(reply);
       }
       if (request.method === "POST" && url.pathname === "/net/subscribe") {
