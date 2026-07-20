@@ -384,10 +384,17 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
       { jsonrpc: "2.0", id: nextId++, method: "tools/list", params: {} },
       { "mcp-session-id": aliceSession }
     );
-    const taskboardNames = atTaskboard.body?.result?.tools?.map((tool: { name: string }) => tool.name) ?? [];
+    const taskboardTools = atTaskboard.body?.result?.tools ?? [];
+    const taskboardNames = taskboardTools.map((tool: { name: string }) => tool.name);
     expect(taskboardNames).toContain(taskClaimTool);
     expect(taskboardNames).not.toContain("the_cockatoo__squawk");
     expect(taskboardNames.some((name: string) => name === "woo_focus" || name.endsWith("__focus"))).toBe(false);
+    // The tasks catalog's tool descriptions surface through the Net MCP tool
+    // list (this replaces the retired classic McpHost enumeration assertion in
+    // tests/catalogs.test.ts). The description text lives in
+    // catalogs/tasks/manifest.json, not the transport.
+    const claimToolDef = taskboardTools.find((tool: { name: string }) => tool.name === taskClaimTool);
+    expect(claimToolDef?.description).toMatch(/Take responsibility for delivering this task/);
 
     const claimed = await call(aliceSession, taskClaimTool, {});
     expect(claimed.result?.isError, JSON.stringify(claimed).slice(0, 600)).not.toBe(true);

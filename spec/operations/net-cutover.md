@@ -518,9 +518,13 @@ may supplement diagnosis but cannot satisfy NC8 acceptance.
 
 ## NC9. v2 stack decommission
 
-> Status: **draft**. Preconditions: NC8 acceptance complete and rollback
-> to the v2 stack formally renounced (NC6's rollback contract expires
-> with it).
+> Status: **code removal staged (2026-07-20)**; operator deploy gates
+> pending. Rollback to the v2 stack has been formally renounced (NC6's
+> rollback contract has expired). The classic/v2 implementation is deleted
+> and the deployed entry switched to Net-only on branch `prenet-removal`
+> (see "Execution" below); the remaining preconditions — NC8 acceptance,
+> the per-class traffic gate, and a verified backup — are operator steps
+> that gate the deploy and the irreversible `deleted_classes` migration.
 
 The cutover left the v2 Durable Object classes deployed and their
 storage intact: every `PersistentObjectDO`, `CommitScopeDO`, and
@@ -557,10 +561,32 @@ Order is normative, one deploy per step, each gated:
    discipline per R14.6; `tests/cf-do-migrations.test.ts` and the
    `cf:migrations:check` build gate must stay green).
 
-Candidate order: `CommitScopeDO` first (net replaces it wholesale), then
-the v2-only surface of `PersistentObjectDO` and the world/Directory
-singletons once every remaining consumer (auth, admin, catalog install,
-MCP session bootstrap) is confirmed migrated or retired by the step-1
-gate. This section makes no claim about which consumers remain today —
-the traffic gate is the authority, not an inventory taken at authoring
-time.
+Candidate order: the two-wave split (`CommitScopeDO` first, then
+`PersistentObjectDO`/`DirectoryDO`) collapsed once the consumer
+investigation confirmed the Net stack fully owns every remaining v2
+consumer — auth/login/session and MCP bootstrap resolve through
+`/net-api/login`|`/net-api/guest`|`/net-api/mcp` and the catalog identity
+cell (no Directory), catalog install runs through the `/net-install`
+doorway, and the `/admin` dashboard is served by the Net-only entry off
+Analytics Engine with no WORLD binding (its guest-purge route is
+Net-retired to 410). So all three classes are unbound together and
+reclaimed by a single `cf-do-0005 deleted_classes` migration. The traffic
+gate remains the authority: it must show zero requests to each class
+across a full bake window before the code-removal deploy, catching any
+consumer this inventory missed.
+
+### Execution (branch `prenet-removal`, 2026-07-20)
+
+The code-removal step (NC9 step 2, minus the deploy) is done and green:
+the deployed `main` is `src/worker/net-only-index.ts`, the three v2 DO
+bindings are removed, the classic transports/host/dev-server/browser
+client and their tests are deleted (shared `src/core` transcript/commit
+machinery kept), and `cf-do-0005 deleted_classes = [ "CommitScopeDO",
+"DirectoryDO", "PersistentObjectDO" ]` is authored in `wrangler.toml`.
+Gates green: `typecheck`, `npm test`, `test:worker`, `cf:migrations:check`,
+`build:net-only`. The branch is **not merged or deployed**. The operator
+still owns: NC8 acceptance, the per-class traffic gate, the verified
+backup (NC9 step 3), then the deploy that switches the entry live and,
+only after that gate re-confirms zero traffic, the `deleted_classes`
+migration (NC9 step 4) — irreversible, wiping all v2 instance storage
+platform-wide.
