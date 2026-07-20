@@ -48,38 +48,36 @@ This section does **not** apply to in-memory or local SQLite modes. Those runtim
   conceal a fallback to the classic transport. Direct `wrangler dev`, a
   preinstalled fixture, or a backend-helper test does not satisfy this
   composition contract.
-- **Classic local SQLite rollback mode** (single-node legacy system).
-  `npm run dev:classic` retains the pre-Net `LocalSQLiteRepository` composition
-  while the NC8 rollback contract remains live. `WOO_DB` configures this mode
-  only. It is not evidence for Net behavior and is removed with the classic
-  transport stack under NC9.
+- **Classic local SQLite rollback mode** — *removed (2026-07 net-only cutover)*.
+  The pre-Net `npm run dev:classic` composition and its `/api/*` + `/v2/*` +
+  `/connect` classic transports were deleted with the classic/v2 stack (commit
+  `cbe9811`); the NC8 rollback contract was renounced. Local durable development
+  is now the Net-only `npm run dev` above. (The `LocalSQLiteRepository` class from
+  [`src/server/sqlite-repository.ts`](../../src/server/sqlite-repository.ts)
+  survives for in-memory/test hosts; only the classic dev/transport composition
+  is gone.)
 - **Net MCP stdio bridge.** `npm run mcp:stdio` is a framing adapter to the
   already-running `/net-api/mcp` surface (default
   `http://127.0.0.1:5173/net-api/mcp`). It carries the configured API key on
   initialize, propagates the returned MCP/Net session id, and forwards later
   JSON-RPC messages unchanged. It MUST NOT implement tool discovery or verb
-  dispatch. `npm run mcp:stdio:classic` retains the in-memory legacy host only
-  for rollback testing.
-- **Cloudflare-shape smoke (three-lane ladder)**. One cross-actor scenario
-  ([`scripts/smoke/scenario.ts`](../../scripts/smoke/scenario.ts)) runs on three
-  lanes of increasing fidelity before a real deploy:
-  1. `npm run smoke:cf-local` — the in-process fake Durable Object namespaces
-     ([`tests/worker/fake-do.ts`](../../tests/worker/fake-do.ts)). Drives the
-     Worker entrypoint through MCP gateway shards, CommitScopeDOs, host seeds, and
-     HOST_SEED_KV. Fast, but every DO is one synchronous in-process object sharing
-     one imported world: it does **not** model cold start, RPC timeouts, per-DO
-     storage isolation, or serialization boundaries.
-  2. `npm run smoke:cf-dev` — **real workerd** via `wrangler dev`
-     ([`wrangler.smoke.toml`](../../wrangler.smoke.toml)): real per-DO storage,
-     cross-DO RPC, and host-seed merge. Catches storage/RPC/merge regressions the
-     fake cannot. Run before a real Cloudflare deploy.
-  3. The deployed walkthrough ([`scripts/smoke-walkthrough.ts`](../../scripts/smoke-walkthrough.ts))
-     over MCP HTTP — the most expensive lane.
+  dispatch. (The classic in-memory `mcp:stdio:classic` host was removed with the
+  classic stack.)
+- **Net Cloudflare-shape smoke.** One cross-actor scenario runs on the Net smoke
+  lanes before a real deploy:
+  1. `npm run smoke:net-dev` — the Net worker under **real workerd** via
+     `wrangler dev` ([`scripts/net-smoke-workerd.ts`](../../scripts/net-smoke-workerd.ts)):
+     real per-DO storage, cross-DO RPC across `NetScopeDO`/`NetGatewayDO`, and
+     host-seed merge. Catches storage/RPC/merge regressions before a real deploy.
+  2. `npm run smoke:net-mcp` / the deployed walkthrough
+     ([`scripts/smoke-walkthrough.ts`](../../scripts/smoke-walkthrough.ts)) over
+     MCP HTTP against the deployed worker — the most expensive lane.
 
   Fidelity is a ladder, not a guarantee: workerd-local still runs every DO in one
   process with fast reliable RPC, so cross-colo-latency / cold-owner-timeout
   authority gaps remain a deploy-only signal until fault injection lands
-  (`notes/2026-06-09-cf-smoke-unified-lanes.md`).
+  (`notes/2026-06-09-cf-smoke-unified-lanes.md`). The retired classic
+  `smoke:cf-local`/`smoke:cf-dev` fake-DO lanes were removed with the classic stack.
 
 ---
 

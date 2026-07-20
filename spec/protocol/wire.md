@@ -8,9 +8,11 @@ status: legacy
 > Part of the [woo specification](../../SPEC.md). Layer: **protocol**.
 
 The removed v1 JSON message format that used to run on `/ws` between client
-and player host. New clients use the v2 turn network
-([v2-turn-network.md](v2-turn-network.md)); this document remains as a
-historical reference for old frame shapes and migration tests.
+and player host. This transport is retired; live delivery now runs over the
+Net coherence path ([coherence.md](coherence.md)). (The v2 turn network that
+briefly succeeded it — [v2-turn-network.md](v2-turn-network.md) — is likewise
+retired.) This document remains as a historical reference for old frame shapes
+and migration tests.
 
 Browser bootstrap details (transient host installation, host-to-host RPC) are in [browser-host.md](browser-host.md). Cross-world federation frames are in [../deferred/federation.md §24](../deferred/federation.md#24-federation).
 

@@ -341,9 +341,16 @@ configurable horizon with the same backup/restore caveat as §14.2.1.
 
 All writes within a single opcode are atomic (CF DOs give us SQLite transactions). A verb body is *not* atomic across yield points; cross-DO ops give other tasks a chance to interleave on each DO. Authors who need atomicity across multiple ops use `with_lock(obj) { ... }` (deferred to phase 2; simply documented for v1).
 
-### 14.4 CommitScopeDO v2 authority schema
+### 14.4 Scope-authority commit schema
 
-`CommitScopeDO` owns v2 commit authority state, not ordinary hosted object
+> **Owner class (2026-07 net-only cutover).** This commit-authority schema is
+> owned by `NetScopeDO` in the deployed Net stack; the historical
+> `CommitScopeDO` class it was written for was removed with the classic/v2
+> stack. The row shapes are unchanged — the Net commit path reuses the same
+> effect-transcript / authority-slice / projection-delta machinery — so the
+> schema below is current; only the owning DO class was renamed/retired.
+
+The scope-authority DO owns v2 commit authority state, not ordinary hosted object
 storage, so it does not implement the `ObjectRepository` interface. Its
 Cloudflare encoding still follows the same row-shaped rule: state that grows
 with world size is split into rows, and accepted commits rewrite only rows
@@ -512,10 +519,12 @@ tool surfaces, and those markers need not appear in `projection_writes`.
 
 ### 14.5 Gateway projection cache schema
 
-MCP gateway shards use their `PersistentObjectDO` SQLite database as a durable
-projection cache. These rows are cache state, not execution authority. They
-survive hibernation so descriptor reads and accepted fanout do not require
-rebuilding an executable `WooWorld` mirror before serving a session.
+Gateway shards use their DO SQLite database as a durable projection cache
+(the `NetGatewayDO` database in the deployed Net stack; historically the MCP
+gateway shard's `PersistentObjectDO` database before the net-only cutover).
+These rows are cache state, not execution authority. They survive hibernation
+so descriptor reads and accepted fanout do not require rebuilding an executable
+`WooWorld` mirror before serving a session.
 
 ```sql
 CREATE TABLE gateway_projection_scope (

@@ -404,10 +404,12 @@ storage is gone and any reactivation answers `E_HOST_RECYCLED`.
 
 **Status: partial.** §RC11.1 (trigger), §RC11.2 (host_state), §RC11.3
 (teardown sequence), §RC11.5 (concurrent operations), and §RC11.6
-(cold-load guard) are implemented in the worker (`PersistentObjectDO`,
-`DirectoryDO`). §RC11.4's lookup branch is wired into Directory's
-`/resolve-object`. §RC11.7 items remain deferred (multi-cluster
-teardown, per-host signing keys, vacuum). Catalog removal, owner-
+(cold-load guard) are implemented in the net DOs (`src/net/scope.ts`,
+`src/worker/net/gateway-do.ts`); §RC11.4's lookup branch is wired into the
+net routing/topology layer. (Before the 2026-07 net-only cutover this path
+lived in the retired classic worker DOs `PersistentObjectDO`/`DirectoryDO`.)
+§RC11.7 items remain deferred (multi-cluster teardown, per-host signing keys,
+vacuum). Catalog removal, owner-
 initiated room destruction, and factory cleanup of decommissioned
 instances now all use this path.
 

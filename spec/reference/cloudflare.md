@@ -7,6 +7,20 @@ status: partial
 
 > Part of the [woo specification](../../SPEC.md). Layer: **reference**. Concrete mapping of woo's abstract host model and persistence onto Cloudflare's primitives. Other implementations are possible; this document is the reference plan.
 
+> **Deployed-reference note (2026-07 net-only cutover).** The classic/v2 DO
+> host model that most of §R1–§R11 describes — the `PersistentObjectDO`,
+> `DirectoryDO`, and `CommitScopeDO` classes, one-DO-per-object routing, and
+> the `/api/*` + `/v2/*` Worker routes — is **retired**. The deployed worker
+> entry is now [`src/worker/net-only-index.ts`](../../src/worker/net-only-index.ts);
+> the only bound Durable Object classes are `NetScopeDO` and `NetGatewayDO`
+> (§R12.1), and the three classic classes are reclaimed by the `cf-do-0005`
+> `deleted_classes` migration. The live commit/authority contract is
+> [coherence.md](../protocol/coherence.md). Sections below that still name the
+> classic classes as "the host" or "the durable authority" document the retired
+> implementation; the Net stack reuses the same effect-transcript / authority-slice /
+> projection-delta machinery over its signed-HTTP internal surface, but its
+> authority DOs are the net classes, not `CommitScopeDO`.
+
 ---
 
 ## R1. Host mapping
@@ -996,7 +1010,9 @@ read-boundary repair that prevents stale shard contents from deciding
 `take mug`/tool reachability while preserving warm-cache planning for already
 owner-authoritative cells.
 
-`CommitScopeDO` is the durable authority for v2 scope heads. On first open for
+In the retired v2 stack, `CommitScopeDO` was the durable authority for v2 scope
+heads (the deployed Net stack uses `NetScopeDO` for the equivalent role). On
+first open for
 a scope it materializes the gateway-supplied authority seed into row-shaped DO
 SQLite state: one row per materialized object, one row per session, one row per
 sequenced log entry, and small metadata/tail tables for the head, counters,
@@ -1260,21 +1276,34 @@ The Directory's session routing row is a routing cache, not the canonical sessio
 
 ## R12. wrangler config
 
-Skeleton `wrangler.toml`:
+> **Retired classic bindings (2026-07).** The `WOO`/`PersistentObjectDO` and
+> `DIRECTORY`/`DirectoryDO` bindings shown in this skeleton are historical: the
+> net-only cutover removed them, and the classic classes are reclaimed by the
+> `cf-do-0005` `deleted_classes` migration. The **live** DO binding set is the
+> net classes in [§R12.1](#r121-net-coherence-layer-bindings) (`SCOPE_NET`/`NetScopeDO`,
+> `GATEWAY_NET`/`NetGatewayDO`), and the worker entry is
+> `src/worker/net-only-index.ts`. The historical create-migration tags (`v1`,
+> `v2`, `cf-do-0006`) remain in the ledger because create migrations cannot be
+> removed from history; only their classes are dropped.
+
+Skeleton `wrangler.toml` (historical classic shape, retained for the
+class-history ledger; see the note above for the live bindings):
 
 ```toml
 name = "woah"
-main = "src/worker/index.ts"
+main = "src/worker/net-only-index.ts"
 compatibility_date = "2026-04-01"
 compatibility_flags = ["nodejs_als"]
 
-[[durable_objects.bindings]]
-name = "WOO"
-class_name = "PersistentObjectDO"
-
-[[durable_objects.bindings]]
-name = "DIRECTORY"
-class_name = "DirectoryDO"
+# Retired classic bindings (reclaimed by the cf-do-0005 deleted_classes
+# migration; no longer bound). The live bindings are the net classes in R12.1.
+# [[durable_objects.bindings]]
+# name = "WOO"
+# class_name = "PersistentObjectDO"
+#
+# [[durable_objects.bindings]]
+# name = "DIRECTORY"
+# class_name = "DirectoryDO"
 
 [[migrations]]
 tag = "v1"
@@ -1306,9 +1335,10 @@ Logpush configuration is per-account, not in wrangler — `wrangler logpush crea
 ### R12.1 Net coherence layer bindings
 
 The net coherence path ([coherence.md](../protocol/coherence.md),
-[net-cutover.md](../operations/net-cutover.md)) adds two DO classes that
-sit **beside** the v2 classes; no production traffic routes to them until
-the Phase-5 cutover:
+[net-cutover.md](../operations/net-cutover.md)) defines two DO classes.
+Since the 2026-07 net-only cutover these are the **only** bound DO classes and
+carry all production traffic; the classic `PersistentObjectDO`/`DirectoryDO`/`CommitScopeDO`
+classes they replaced are reclaimed by the `cf-do-0005` `deleted_classes` migration:
 
 ```toml
 [[durable_objects.bindings]]
@@ -1322,6 +1352,10 @@ class_name = "NetGatewayDO"
 [[migrations]]
 tag = "cf-do-0004"
 new_sqlite_classes = ["NetGatewayDO", "NetScopeDO"]
+
+[[migrations]]
+tag = "cf-do-0005"
+deleted_classes = ["CommitScopeDO", "DirectoryDO", "PersistentObjectDO"]
 ```
 
 `GATEWAY_NET` is fanned across `NET_API_GATEWAY_SHARDS` (default `"8"`)
@@ -1339,7 +1373,7 @@ Net turn-path `[vars]`:
 | `NET_RPC_TIMEOUT_MS` | `"5000"` | Deadline on every coherence RPC and hot-scope queue wait → `E_RPC_TIMEOUT` (HTTP 503, retryable). A submit timeout is ambiguous, so the gateway performs one CO2.5-preserving same-key replay before surfacing it. |
 | `NET_TURN_QUEUE_WAIT_MS` | `"1500"` | Per-scope serializer queue deadline. |
 | `NET_TURN_SCOPE_CONCURRENCY` | `"12"` | Bounded per-scope lanes per gateway shard. |
-| `WOO_AE_DATASET` | `"woo_v1_prod"` | Selects the AE dataset (§R10.1); the net acceptance canary sets `"woo_v1_net_canary"` so its evidence never mixes with prod's. Also a **deployed-environment marker**: when set, un-metered dev-only surfaces such as `/net-smoke` are hard-refused (`src/worker/index.ts`, `src/worker/net/workerd-host.ts`). |
+| `WOO_AE_DATASET` | `"woo_v1_prod"` | Selects the AE dataset (§R10.1); the net acceptance canary sets `"woo_v1_net_canary"` so its evidence never mixes with prod's. Also a **deployed-environment marker**: when set, un-metered dev-only surfaces such as `/net-smoke` are hard-refused (`src/worker/net-only-index.ts`, `src/worker/net/workerd-host.ts`). |
 
 The acceptance canary reads AE directly for its percentile gate
 (`scripts/net-metrics-ae.ts` / `npm run metrics:net-ae`), because

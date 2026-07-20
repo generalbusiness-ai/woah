@@ -1,19 +1,28 @@
 ---
 date: 2026-05-12
-status: draft
+status: retired
 ---
 
 # V2 turn network protocol
 
 > Part of the [woo specification](../../SPEC.md). Layer: **protocol**.
 >
-> **Superseded-by note (2026-07-05, Plan 002):** the ratified semantics of
-> this draft — VTN0 (coherence invariant and target claims), VTN7 (effect
-> transcript), VTN8 (validation order, write-set scope selection), VTN10.1
-> (materialization miss), VTN18.2 (scheduled turns) — are carried forward
-> verbatim by [coherence.md](coherence.md), which **governs** where the two
-> overlap. The rest of this document describes the v2 mechanism scheduled
-> for deletion at Plan 002 Phase 5 and remains as design history.
+> **Status: retired (2026-07).** The v2 transport described here — the
+> `/v2/session/mint`, `/v2/turn-network/ws`, `/v2/open`, and `/v2/envelope`
+> endpoints, the `CommitScopeDO` commit authority, and the in-browser v2
+> node — was deleted with the classic/v2 stack in the net-only cutover
+> (commit `cbe9811`). It is no longer a deployed surface.
+>
+> **The shared commit machinery it describes is NOT retired.** The ratified
+> semantics of this draft — VTN0 (coherence invariant and target claims),
+> VTN7 (effect transcript), VTN8 (validation order, write-set scope
+> selection), VTN10.1 (materialization miss), VTN18.2 (scheduled turns) —
+> are carried forward verbatim by [coherence.md](coherence.md), which
+> **governs** where the two overlap, and the Net stack's commit path
+> (`NetScopeDO`/`NetGatewayDO`) reuses the same effect-transcript, authority-slice,
+> and projection-delta machinery over its own signed-HTTP internal surface.
+> The rest of this document describes the retired v2 endpoint/DO/browser
+> mechanism and remains as design history.
 
 This document specifies the first buildable protocol draft for the v2 node
 network sketched in [notes/2026-05-12-woo-v2-actor-local-vm-turns.md](../../notes/2026-05-12-woo-v2-actor-local-vm-turns.md).

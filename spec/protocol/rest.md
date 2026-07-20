@@ -1,11 +1,18 @@
 ---
 date: 2026-04-30
-status: implemented
+status: retired
 ---
 
 # REST API
 
 > Part of the [woo specification](../../SPEC.md). Layer: **protocol**.
+
+> Status: retired — the classic `/api/*` REST transport described here was
+> removed with the classic/v2 stack in the 2026-07 net-only cutover (commit
+> `cbe9811`). The deployed worker no longer serves `/api/auth`, `/api/me`,
+> `/api/session`, or `/api/objects/*`; agent and integration ingress is the
+> Net MCP surface at `/net-api/mcp` ([mcp.md](mcp.md)). This document is
+> retained as a historical reference for the retired endpoint shapes.
 
 An HTTP alternative to the browser turn network ([v2-turn-network.md](v2-turn-network.md)), exposing the same call/applied/observe semantics in a request-response shape that agents and integrations can consume natively.
 

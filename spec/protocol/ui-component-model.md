@@ -21,6 +21,15 @@ in [discovery/catalogs.md](../discovery/catalogs.md), and the object model in
 
 ## UCM1. Scope and status
 
+> **Transport note (2026-07 net-only cutover).** The classic browser transport
+> this draft assumed — the `/api/me` REST projection boot and the v2 browser
+> turn client — was removed with the classic/v2 stack. The surviving framework
+> slice (`src/client/framework.ts`, `v2-browser-messages.ts`, the optimistic
+> reconciliation layer) now boots and streams over the Net session surface, not
+> `/api/*`. References to `/api/me` below name the retired classic projection
+> endpoint; the projection *shape* (scoped snapshot + cursor) is unchanged and
+> is served by the Net boot path.
+
 This is a **draft** design for the browser client framework. An initial
 implementation slice exists in `src/client/framework.ts`: catalog UI
 registration, frame resolution, frame-local state/actions, observation

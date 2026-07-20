@@ -57,7 +57,7 @@ The sequencer is **not** an executor. The sequencer's job is to *order* transcri
 
 Any node may hold a cache of cell versions for objects it cares about. State holders maintain currency by playing the agreed sequence forward — applying accepted frames from a scope's sequencer in order. A state holder is **never authoritative** for changes; cell version is the only authority on freshness (§DT4).
 
-State holders include hosted PersistentObjectDOs (durable replicas, `host_placement` directs which objects are likely to be held where), browsers (volatile replicas of the open scope), and MCP shards (per-session replicas).
+State holders include the net scope-authority DOs (`NetScopeDO`, durable replicas of a scope's committed state), the net gateway shards (`NetGatewayDO`, session-edge derived caches), and browsers (volatile replicas of the open scope). (Before the 2026-07 net-only cutover these were hosted `PersistentObjectDO`s and per-session MCP shards; the role is unchanged.)
 
 `host_placement`, `instances_self_host`, and similar object properties are **cache hints**, not authority claims. A node holding an object's cells at a given version may serve reads; "the host" is the node most likely to have those cells warm, not the node that owns them.
 
@@ -111,7 +111,7 @@ A small set of objects (`$wiz`, `$system`, `$root`, `$thing`, catalog class defi
 
 Each scope has exactly one **sequencer identity** at any time. The identity is derived from the scope's ObjRef: `sequencer_id = derive(scope_id)`. The mapping is deterministic — any node holding a scope's ObjRef can compute, without consulting any registry, which node sequences that scope.
 
-In the v1 Cloudflare reference (§[cloudflare.md R8](../reference/cloudflare.md)), `derive` is `env.COMMIT_SCOPE.idFromName(String(scope))` — the scope's ObjRef *is* the CommitScopeDO instance's name. There is exactly one CommitScopeDO per scope, instantiated lazily on first use; later requests reach the same instance because the derivation is deterministic.
+In the v1 Cloudflare reference ([coherence.md](../protocol/coherence.md)), `derive` is `env.SCOPE_NET.idFromName(String(scope))` — the scope's ObjRef *is* the `NetScopeDO` instance's name. There is exactly one `NetScopeDO` per scope, instantiated lazily on first use; later requests reach the same instance because the derivation is deterministic. (Before the 2026-07 net-only cutover the sequencer DO was `CommitScopeDO` via `env.COMMIT_SCOPE`; the derivation shape is unchanged.)
 
 The model permits the derivation function to change in future versions (e.g., to support sequencer migration or election) but requires it to be:
 
@@ -201,19 +201,24 @@ The lint guard `npm run guard:vocabulary` checks new source code against this vo
 
 ## DT7. What this section does **not** specify
 
-- **Sequencer placement and election.** v1 places the sequencer at a known DO (`CommitScopeDO`) per scope. Election, migration, and recovery are deferred. The semantics in §DT1–§DT4 hold regardless of how a scope's sequencer is chosen.
+- **Sequencer placement and election.** v1 places the sequencer at a known DO (`NetScopeDO`) per scope. Election, migration, and recovery are deferred. The semantics in §DT1–§DT4 hold regardless of how a scope's sequencer is chosen.
 - **Persistence of state holders.** Whether a holder uses SQLite, IndexedDB, or in-memory storage is a deployment concern. The model requires only that holders play forward from accepted frames.
-- **Cross-scope ordering.** Two scopes have no shared order. Cross-scope coordination protocols are specified in [v2-turn-network.md](../protocol/v2-turn-network.md).
+- **Cross-scope ordering.** Two scopes have no shared order. Cross-scope coordination protocols are specified in [coherence.md](../protocol/coherence.md).
 - **Conflict resolution beyond head-match.** v1 rejects out-of-head proposals and asks the executor to rebase. CRDT-style merge across concurrent executors is deferred.
 
 ---
 
 ## DT8. Mapping to the implementation
 
+Since the 2026-07 net-only cutover the implementation surfaces are the
+`src/net/` coherence layer and the net DOs; the retired classic surfaces
+(`src/core/executor.ts`, `src/worker/commit-scope-do.ts`,
+`src/worker/persistent-object-do.ts`, `src/mcp/host.ts`) were removed.
+
 | Role | Implementation surface |
 |---|---|
-| Execute | `src/core/executor.ts` (the `Executor` interface and `submitTurnIntent` protocol). Implementations: hosted DO, browser, MCP. |
-| Sequence | `src/worker/commit-scope-do.ts` (`CommitScopeDO`). One per scope. |
-| Hold | `src/worker/persistent-object-do.ts` (durable holder), `src/client/` (browser holder), `src/mcp/host.ts` (MCP-shard holder). |
+| Execute | `src/net/bridge.ts` + `src/net/plan.ts` + `src/net/transcript.ts` (turn planning and effect-transcript build). |
+| Sequence | `src/worker/net/scope-do.ts` (`NetScopeDO`). One per scope. |
+| Hold | `NetScopeDO` (durable scope replica), `src/worker/net/gateway-do.ts` (`NetGatewayDO`, session-edge derived cache), `src/client/` (browser holder). |
 
 Code surface naming should reinforce these roles, not contradict them. Renames in flight to match: `HostBridge` → `ExecutorContext`, `v2-turn-gateway.ts` → `executor.ts`. Several legacy names still suggest the older "host owns object" framing and are being retired; see the vocabulary guard for the migration list.
