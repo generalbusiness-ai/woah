@@ -1,23 +1,23 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { handleAdmin } from "../../src/worker/admin";
+import { handleAdmin, type AdminEnv } from "../../src/worker/admin";
 import { verifyInternalRequest } from "../../src/worker/internal-auth";
-import type { Env } from "../../src/worker/persistent-object-do";
+
 import { FakeDurableObjectNamespace } from "./fake-do";
 
 // Tiny stub Env. Tests only set what each case needs.
-function envOf(overrides: Partial<Env>): Env {
+function envOf(overrides: Partial<AdminEnv>): AdminEnv {
   return {
     WOO: {} as unknown as DurableObjectNamespace,
     DIRECTORY: {} as unknown as DurableObjectNamespace,
     ...overrides
-  } as Env;
+  } as AdminEnv;
 }
 
 function basicAuthHeader(user: string, pass: string): string {
   return "Basic " + Buffer.from(`${user}:${pass}`).toString("base64");
 }
 
-async function call(env: Env, path: string, init?: RequestInit): Promise<Response> {
+async function call(env: AdminEnv, path: string, init?: RequestInit): Promise<Response> {
   const url = new URL(`https://woah.example${path}`);
   const request = new Request(url.toString(), init);
   return handleAdmin(request, env, url);
@@ -154,7 +154,7 @@ describe("/admin/purge-inactive-guests", () => {
 
 describe("/admin/series", () => {
   const authHeaders = { authorization: basicAuthHeader("admin", "hunter2") };
-  const baseEnv = (extras: Partial<Env> = {}): Env =>
+  const baseEnv = (extras: Partial<AdminEnv> = {}): AdminEnv =>
     envOf({ ADMIN_PASSWORD: "hunter2", CF_ANALYTICS_TOKEN: "tok", CF_ACCOUNT_ID: "acct", ...extras });
 
   it("returns 503 when CF_ANALYTICS_TOKEN or CF_ACCOUNT_ID is unset", async () => {
@@ -276,7 +276,7 @@ describe("/admin/series", () => {
 
 describe("/admin/footprint", () => {
   const authHeaders = { authorization: basicAuthHeader("admin", "hunter2") };
-  const baseEnv = (extras: Partial<Env> = {}): Env =>
+  const baseEnv = (extras: Partial<AdminEnv> = {}): AdminEnv =>
     envOf({ ADMIN_PASSWORD: "hunter2", CF_ANALYTICS_TOKEN: "tok", CF_ACCOUNT_ID: "acct", ...extras });
 
   it("returns 503 when CF_ANALYTICS_TOKEN or CF_ACCOUNT_ID is unset", async () => {

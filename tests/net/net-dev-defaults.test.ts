@@ -5,26 +5,28 @@ import { netDevCredentialGraft } from "../../src/server/net-dev";
 import { planNetInstall } from "../../src/net/install";
 
 describe("Net-default local development composition", () => {
-  it("makes Net primary while retaining explicitly named classic rollback commands", () => {
+  it("makes Net the only local development composition", () => {
     const pkg = JSON.parse(readFileSync("package.json", "utf8")) as { scripts: Record<string, string> };
     expect(pkg.scripts.dev).toBe("tsx src/server/net-dev.ts");
-    expect(pkg.scripts["dev:classic"]).toBe("tsx src/server/dev-server.ts");
     expect(pkg.scripts["mcp:stdio"]).toBe("tsx src/mcp/net-stdio.ts");
-    expect(pkg.scripts["mcp:stdio:classic"]).toBe("tsx src/mcp/stdio.ts");
     expect(pkg.scripts["e2e:net-dev"]).toBe("playwright test --config playwright.net-dev-e2e.config.ts");
+    // v2 rollback is renounced: the classic dev/stdio commands are removed, not
+    // retained.
+    expect(pkg.scripts["dev:classic"]).toBeUndefined();
+    expect(pkg.scripts["mcp:stdio:classic"]).toBeUndefined();
   });
 
-  it("keeps classic transport coverage explicit and out of the fast default gate", () => {
+  it("removes the classic transport test lanes; the gate is Net-only", () => {
     const pkg = JSON.parse(readFileSync("package.json", "utf8")) as { scripts: Record<string, string> };
-    expect(pkg.scripts["test:classic"]).toContain("tests/v2-browser-local-turn.test.ts");
-    expect(pkg.scripts["test:classic"]).toContain("tests/mcp.test.ts");
+    // The classic quarantine lanes are gone with the classic stack.
+    expect(pkg.scripts["test:classic"]).toBeUndefined();
+    expect(pkg.scripts["test:worker:classic"]).toBeUndefined();
+    expect(pkg.scripts["test:worker:all"]).toBeUndefined();
+    // The fast gate keeps the Net MCP coverage and holds no classic transport test.
     expect(pkg.scripts.test).toContain("tests/worker/net-mcp.test.ts");
-    expect(pkg.scripts.test).not.toMatch(/v2-browser|shadow-|tests\/mcp\.test|session-lifecycle/);
+    expect(pkg.scripts.test).not.toMatch(/v2-browser|shadow-|tests\/mcp\.test|session-lifecycle|tests\/executor\.test/);
     expect(pkg.scripts["test:worker"]).toContain("tests/worker/net-*.test.ts");
-    expect(pkg.scripts["test:worker"]).toContain("--exclude tests/worker/net-cutover-freeze.test.ts");
-    expect(pkg.scripts["test:worker"]).not.toMatch(/cf-repository|v2-mcp-e2e|rpc-fault-inject/);
-    expect(pkg.scripts["test:worker:classic"]).toContain("tests/v2-mcp-e2e.test.ts");
-    expect(pkg.scripts["test:worker:all"]).toContain("tests/worker tests/v2-mcp-e2e.test.ts tests/smoke");
+    expect(pkg.scripts["test:worker"]).not.toMatch(/cf-repository|v2-mcp-e2e|rpc-fault-inject|metric-errors|net-cutover-freeze/);
   });
 
   it("uses the Net-only Worker entry and no classic Durable Object binding", () => {
