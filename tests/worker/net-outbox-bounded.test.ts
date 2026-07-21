@@ -19,7 +19,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { FakeDurableObjectState } from "./fake-do";
 import type { ScheduledTurn } from "../../src/net/scope";
-import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
+import { NetScopeDO, withDeliverySeq, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
 import type { NetStub } from "../../src/worker/net/workerd-host";
 
@@ -93,6 +93,40 @@ function okStub(): { stub: NetStub; received: unknown[] } {
   };
 }
 
+/** 200-replying stub whose deliveries block on a gate until released —
+ * the interleaving harness for mid-drain races (concurrent enqueue,
+ * submit arrival). `firstArrived` resolves when the first request REACHES
+ * the stub (before the gate), so tests can act inside the await window. */
+function gatedStub(): {
+  stub: NetStub;
+  received: unknown[];
+  release: () => void;
+  firstArrived: Promise<void>;
+} {
+  const received: unknown[] = [];
+  let releaseFn!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    releaseFn = resolve;
+  });
+  let arrivedFn!: () => void;
+  const firstArrived = new Promise<void>((resolve) => {
+    arrivedFn = resolve;
+  });
+  return {
+    received,
+    release: releaseFn,
+    firstArrived,
+    stub: {
+      fetch: async (request: Request) => {
+        arrivedFn();
+        await gate;
+        received.push(request.method === "POST" ? await request.json() : undefined);
+        return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+    }
+  };
+}
+
 /** 500-replying stub (host.rpc throws on !ok) recording attempts. */
 function downStub(): { stub: NetStub; received: unknown[] } {
   const received: unknown[] = [];
@@ -144,10 +178,21 @@ function laneRows(state: NetScopeDurableState): Array<{ route: string; destinati
 
 /** Parse the pass metrics a drain emitted (Phase-0 observability for the
  * bounded-pass invariant). */
-function drainPassMetrics(lines: string[]): Array<{ considered: number; delivered: number; ms: number }> {
+function drainPassMetrics(
+  lines: string[]
+): Array<{ considered: number; delivered: number; ms: number; rpc_ms: number; sql_ms: number }> {
   return lines
     .filter((line) => line.includes("net_scope_outbox_drain_pass"))
-    .map((line) => JSON.parse(line.slice(line.indexOf("{"))) as { considered: number; delivered: number; ms: number });
+    .map(
+      (line) =>
+        JSON.parse(line.slice(line.indexOf("{"))) as {
+          considered: number;
+          delivered: number;
+          ms: number;
+          rpc_ms: number;
+          sql_ms: number;
+        }
+    );
 }
 
 /** All emitted metric events of one kind, parsed off the console mirror. */
@@ -162,6 +207,19 @@ function tick(id: string, atMs: number): ScheduledTurn {
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+describe("withDeliverySeq — single-stringify fanout bodies", () => {
+  it("splices delivery_seq byte-equivalently to a full re-stringify", () => {
+    const base = {
+      scope: "room:x",
+      seq: 42,
+      cells: [{ key: "k", value: { v: 'quote"and{brace}' } }],
+      observations: [{ text: "nested } tail" }]
+    };
+    const spliced = withDeliverySeq(JSON.stringify(base), 9);
+    expect(spliced).toBe(JSON.stringify({ ...base, delivery_seq: 9 }));
+  });
+});
 
 describe("Phase 3 — bounded outbox drain", () => {
   afterEach(() => {
@@ -240,6 +298,158 @@ describe("Phase 3 — bounded outbox drain", () => {
     }
     // Hydration stays once-per-lifetime: the drain did not rebuild it.
     expect(metricsOfKind(metricLines, "net_scope_hydrated")).toHaveLength(1);
+    scope.close();
+  });
+
+  it("delivers /fanout rows as their exact stored bytes and splits pass duration into rpc_ms/sql_ms", async () => {
+    const metricLines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+      metricLines.push(args.map(String).join(" "));
+    });
+    const healthy = okStub();
+    const scope = netState("bounded-raw-bytes");
+    const env: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: () => healthy.stub };
+    const scopeDO = new NetScopeDO(scope.state, env);
+    // A body with fields the drain itself never reads: raw pass-through
+    // must deliver them byte-faithfully without a parse/re-stringify trip.
+    const body = { scope: SCOPE, seq: 7, cells: [], observations: [{ type: "said", text: "raw ✓" }], delivery_seq: 3 };
+    scope.state.storage.sql.exec(
+      "INSERT INTO net_scope_outbox (route, id, destination, body, status, attempts, last_attempt_at_ms, scope, seq, next_attempt_at_ms) VALUES ('/fanout', ?, ?, ?, 'pending', 0, NULL, ?, ?, 0)",
+      `gateway:mirror/${SCOPE}/7`,
+      "gateway:mirror",
+      JSON.stringify(body),
+      SCOPE,
+      7
+    );
+    scope.state.storage.sql.exec(
+      "INSERT OR IGNORE INTO net_scope_outbox_lane (route, destination) VALUES ('/fanout', ?)",
+      "gateway:mirror"
+    );
+    await kick(scopeDO, env);
+    await scope.settle();
+
+    expect(healthy.received).toHaveLength(1);
+    expect(healthy.received[0]).toEqual(body);
+    expect(pendingRows(scope.state)).toEqual([]);
+    // Provable-empty prune: one lane, one row, delivered — the directory
+    // row is gone without needing the EXISTS probe branch.
+    expect(laneRows(scope.state)).toEqual([]);
+    const passes = drainPassMetrics(metricLines);
+    expect(passes).toHaveLength(1);
+    expect(typeof passes[0]!.rpc_ms).toBe("number");
+    expect(typeof passes[0]!.sql_ms).toBe("number");
+    // The two halves partition the pass: neither may exceed the total.
+    expect(passes[0]!.rpc_ms).toBeLessThanOrEqual(passes[0]!.ms);
+    expect(passes[0]!.sql_ms).toBeLessThanOrEqual(passes[0]!.ms);
+    scope.close();
+  });
+
+  it("a drain invocation yields to an in-flight submit and the retry alarm resumes it", async () => {
+    const metricLines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+      metricLines.push(args.map(String).join(" "));
+    });
+    const healthy = okStub();
+    const scope = netState("bounded-submit-priority");
+    const env: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: () => healthy.stub };
+    const scopeDO = new NetScopeDO(scope.state, env);
+    insertRow(scope.state, "gateway:mirror", 1);
+
+    // Simulate a commit executing on this DO (the fetch path uses these
+    // methods around /net/submit; driving a full CommitSubmit here would
+    // test the sequencer, not the scheduling edge).
+    const submitOccupancy = scopeDO as unknown as { startSubmit(): void; finishSubmit(): void };
+    submitOccupancy.startSubmit();
+    await kick(scopeDO, env);
+    await scope.settle();
+    // Nothing delivered — the invocation gave way before any route pass —
+    // and, critically, no due-now alarm is armed while the submit remains
+    // active (that would spin alarm invocations until it finishes).
+    expect(healthy.received).toHaveLength(0);
+    expect(pendingRows(scope.state)).toHaveLength(1);
+    expect(scope.alarms).toEqual([]);
+
+    // The last submit completion arms exactly one continuation; its fresh
+    // invocation then drains normally.
+    submitOccupancy.finishSubmit();
+    expect(scope.alarms.filter((at) => at !== null)).toHaveLength(1);
+    await kick(scopeDO, env);
+    await scope.settle();
+    expect(healthy.received).toHaveLength(1);
+    expect(pendingRows(scope.state)).toEqual([]);
+    scope.close();
+  });
+
+  it("a row enqueued into a lane during the delivery await survives the prune and is delivered (at-least-once)", async () => {
+    const gated = gatedStub();
+    const scope = netState("bounded-concurrent-enqueue");
+    const env: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: () => gated.stub };
+    const scopeDO = new NetScopeDO(scope.state, env);
+    insertRow(scope.state, "gateway:mirror", 1);
+
+    // Start the drain; row 1's delivery parks on the gate.
+    await kick(scopeDO, env);
+    await gated.firstArrived;
+    // A commit lands mid-await: its outbox row INSERTs and the lane
+    // directory INSERT OR IGNORE no-ops against the still-present row —
+    // exactly the window where a selection-time "provably empty" prune
+    // would orphan it. (Direct SQL stands in for persistOutboxRow; the
+    // durable rows are identical.)
+    insertRow(scope.state, "gateway:mirror", 2);
+    gated.release();
+    await scope.settle();
+
+    // Row 1 delivered; row 2 still pending AND still discoverable: the
+    // guarded delete must have kept the lane directory row.
+    expect(gated.received).toHaveLength(1);
+    expect(pendingRows(scope.state).map((r) => r.seq)).toEqual([2]);
+    expect(laneRows(scope.state)).toEqual([{ route: "/fanout", destination: "gateway:mirror" }]);
+
+    // The next drain finds and delivers it — nothing stranded.
+    await kick(scopeDO, env);
+    await scope.settle();
+    expect(gated.received).toHaveLength(2);
+    expect(pendingRows(scope.state)).toEqual([]);
+    expect(laneRows(scope.state)).toEqual([]);
+    scope.close();
+  });
+
+  it("a submit arriving during a lane's delivery await halts the quantum between rows", async () => {
+    const metricLines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+      metricLines.push(args.map(String).join(" "));
+    });
+    const gated = gatedStub();
+    const scope = netState("bounded-midlane-yield");
+    const env: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: () => gated.stub };
+    const scopeDO = new NetScopeDO(scope.state, env);
+    for (let seq = 1; seq <= 3; seq += 1) insertRow(scope.state, "gateway:mirror", seq);
+
+    // Row 1's delivery is in flight when the submit arrives. The lane must
+    // finish that row (it was already attempted) and then stop — rows 2-3
+    // untouched, no attempt counted — instead of pinning the drain for the
+    // rest of the quantum.
+    await kick(scopeDO, env);
+    await gated.firstArrived;
+    const submitOccupancy = scopeDO as unknown as { startSubmit(): void; finishSubmit(): void };
+    submitOccupancy.startSubmit();
+    gated.release();
+    await scope.settle();
+
+    expect(gated.received).toHaveLength(1);
+    const remaining = pendingRows(scope.state);
+    expect(remaining.map((r) => r.seq)).toEqual([2, 3]);
+    expect(remaining.every((r) => r.attempts === 0)).toBe(true);
+    expect(metricsOfKind(metricLines, "net_scope_drain_yield").some((m) => m.phase === "lane")).toBe(true);
+    expect(scope.alarms).toEqual([]);
+
+    // Submit done: one continuation is armed and delivery resumes in order.
+    submitOccupancy.finishSubmit();
+    expect(scope.alarms.filter((at) => at !== null)).toHaveLength(1);
+    await kick(scopeDO, env);
+    await scope.settle();
+    expect(gated.received).toHaveLength(3);
+    expect(pendingRows(scope.state)).toEqual([]);
     scope.close();
   });
 
