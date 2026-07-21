@@ -1,20 +1,21 @@
 import { configDefaults, defineConfig } from "vitest/config";
 import { fileURLToPath } from "node:url";
 
-const netOnly = process.env.WOO_NET_ONLY_BUILD === "1";
-
 export default defineConfig({
   root: ".",
   publicDir: "public",
-  // The net-only deletion gate compiles the same SPA entry with its v2 Worker
-  // construction erased. Dual-stack builds leave the flag false.
+  // Net-only is the ONLY build since the classic/v2 stack deletion (NC9):
+  // the dual-stack factory file no longer exists, so the former
+  // WOO_NET_ONLY_BUILD flag has nothing to select between. The flag is
+  // ignored; every build compiles the SPA with v2 Worker construction
+  // erased.
   define: {
-    __WOO_NET_ONLY__: JSON.stringify(netOnly)
+    __WOO_NET_ONLY__: JSON.stringify(true)
   },
   resolve: {
     alias: {
       "#v2-browser-worker-factory": fileURLToPath(new URL(
-        netOnly ? "./src/client/v2-browser-worker-factory.net-only.ts" : "./src/client/v2-browser-worker-factory.ts",
+        "./src/client/v2-browser-worker-factory.net-only.ts",
         import.meta.url
       ))
     }
