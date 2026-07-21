@@ -539,23 +539,33 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     const h = await buildHarness();
     const token = `apikey:${KEY_ID}:${KEY_SECRET}`;
 
-    // Exhaust the standard bucket with cheap reads (each consumes ONE
-    // token after auth; the 401 session_required they return is
-    // irrelevant to the budget — rate limiting runs before dispatch).
-    for (let i = 0; i < 100; i += 1) {
-      const res = await clientFetch(h.gateway, "GET", "/net-api/cell?key=object_live:capi_box", { token });
-      expect(res.status, `op ${i}`).toBe(401); // session_required, NOT rate limited
+    // Pin the clock the token bucket reads (WorkerdHost.now = Date.now):
+    // under CPU contention 100 sequential requests take long enough for
+    // the 50/s refill to grant extra tokens, turning the 101st request's
+    // expected 429 into a flaky 401 (review finding). A pinned clock
+    // makes exhaustion exact; advancing it replaces the wall-clock sleep.
+    const clock = { t: Date.now() };
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => clock.t);
+    try {
+      // Exhaust the standard bucket with cheap reads (each consumes ONE
+      // token after auth; the 401 session_required they return is
+      // irrelevant to the budget — rate limiting runs before dispatch).
+      for (let i = 0; i < 100; i += 1) {
+        const res = await clientFetch(h.gateway, "GET", "/net-api/cell?key=object_live:capi_box", { token });
+        expect(res.status, `op ${i}`).toBe(401); // session_required, NOT rate limited
+      }
+      const throttled = await clientFetch(h.gateway, "GET", "/net-api/cell?key=object_live:capi_box", { token });
+      expect(throttled.status).toBe(429);
+      expect(throttled.body.error).toMatchObject({ code: "E_RATE", detail: { reason: "rate_limited" } });
+
+      // The bucket refills on the clock (50/s): one advanced second
+      // restores tokens and the same request passes rate limiting again.
+      clock.t += 1_000;
+      const recovered = await clientFetch(h.gateway, "GET", "/net-api/cell?key=object_live:capi_box", { token });
+      expect(recovered.status).toBe(401); // back to session_required — not 429
+    } finally {
+      nowSpy.mockRestore();
     }
-    const throttled = await clientFetch(h.gateway, "GET", "/net-api/cell?key=object_live:capi_box", { token });
-    expect(throttled.status).toBe(429);
-    expect(throttled.body.error).toMatchObject({ code: "E_RATE", detail: { reason: "rate_limited" } });
-
-    // The bucket refills on the clock (50/s): after ~150ms at least a few
-    // tokens are back and the same request passes rate limiting again.
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    const recovered = await clientFetch(h.gateway, "GET", "/net-api/cell?key=object_live:capi_box", { token });
-    expect(recovered.status).toBe(401); // back to session_required — not 429
-
     h.close();
   });
 

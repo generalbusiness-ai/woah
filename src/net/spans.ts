@@ -10,10 +10,12 @@
  * OTLP/HTTP JSON payload pushed off the reply path.
  *
  * Sampling (AU2): the W3C sampled flag governs span EXPORT only —
- * audit records are minted regardless. An adopted context carries its
- * caller's flag; minted contexts are gated by NET_SPAN_SAMPLE (1-in-N;
- * 0/absent = spans off for minted traces). Deterministic by trace id so
- * one trace samples consistently across gateway and scope.
+ * audit records are minted regardless. The decision is made exactly
+ * once: an adopted context carries its caller's flag verbatim; a minted
+ * context rolls NET_SPAN_SAMPLE (1-in-N, crypto-random) at MINT time
+ * and encodes the outcome in its flags. Every producer then reads the
+ * flag (spanSampled) and never re-decides, so one trace samples
+ * consistently across gateway and scope.
  *
  * Emission sites read timings the pipeline already measures (the turn
  * structure report, the scope submit clock) — no new clocks on hot
