@@ -315,3 +315,34 @@ now INCLUDING net-client-api + span-export in the curated list; worker
 6. OTLP push bounded: 5s abort deadline, 8 in-flight per isolate,
    counted drops beyond (net_span_export_dropped); six direct exporter
    tests (success/failure isolation/timeout/saturation).
+
+## Rebase onto post-NC9 main (2026-07-21)
+
+The branch was rebased onto main AFTER the classic/v2 stack deletion
+(NC9 code removal: net-only entry, three v2 DO classes unbound and
+reclaimed by main's cf-do-0005 deleted_classes migration). Resolution
+decisions, recorded:
+
+- **cf-do tag renumber**: main claimed cf-do-0005 for the deleted_classes
+  migration, so NetAuditDO's create migration is **cf-do-0007** (0006 is
+  the historical CommitScopeDO create). All four wrangler configs agree;
+  cf:migrations:check green. cf-do-0005 was never deployed with the
+  NetAuditDO meaning anywhere, so the renumber is safe.
+- **Deleted files accepted**: src/worker/index.ts and wrangler.cf-e2e.toml
+  are gone with the classic stack; the NetAuditDO export lives in
+  net-only-index.ts (the deployed entry).
+- **MCP trace carrier re-threaded**: main refactored woo_call into
+  mcpInvokeTurn (context-tool gating, no Request in scope); the AU2
+  traceparent adoption now threads via mcpTraceOf(request) at the
+  mcpToolsCall dispatch sites, sampling decided at mint as before.
+- **Docs**: main had landed the ORIGINAL planning drafts of audit.md and
+  this note (1ada5f0); our evolved versions supersede them. Main's
+  net-cutover.md NC9 (with execution records) supersedes our draft NC9.
+- Review nits from the final pass are included (crypto-random sampling
+  comment; rate-limit test pins Date.now so bucket exhaustion is exact
+  under CPU contention).
+
+Post-rebase gates (the curated corpus is smaller on main since the
+classic test deletion): npm test 681/681 (71 files, includes the audit
+e2e + AU10.3 join gates), test:worker 234/234, smoke:net-dev 25/25,
+typecheck clean, build:net-only clean.
