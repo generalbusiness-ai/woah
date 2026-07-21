@@ -110,6 +110,19 @@ describe("outbox drain (D1 semantics)", () => {
     const again = outbox.enqueue("shard-1", body(1));
     expect(again.attempts).toBe(1); // crash-recovery re-enqueue is not a reset
   });
+
+  it("preserves explicit durable identities for distinct facts at the same scope seq", () => {
+    const outbox = new Outbox();
+    const ordinary = outbox.enqueue("audit:0", body(1), { id: "audit:0/the_room/1" });
+    const adoption = outbox.enqueue("audit:0", body(1), { id: "audit:0/the_room/1:adopt" });
+
+    expect(ordinary.id).toBe("audit:0/the_room/1");
+    expect(adoption.id).toBe("audit:0/the_room/1:adopt");
+    expect(outbox.pending().map((row) => row.id)).toEqual([
+      "audit:0/the_room/1",
+      "audit:0/the_room/1:adopt"
+    ]);
+  });
 });
 
 describe("backoff jitter (NC8, review item 8)", () => {

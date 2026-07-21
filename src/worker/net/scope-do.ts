@@ -2286,7 +2286,11 @@ export class NetScopeDO {
         const outbox = new Outbox({ backoffMs: OUTBOX_BACKOFF_MS });
         const rows: FanoutRow[] = [];
         for (const p of persisted) {
-          const row = outbox.enqueue(p.destination, JSON.parse(p.body) as FanoutBody);
+          // The SQL id is authoritative. Audit adoption rows use a suffix
+          // to coexist with the ordinary commit row at the same owner seq;
+          // reconstructing the conventional id here would deliver but fail
+          // to delete/update that durable row, creating an endless retry.
+          const row = outbox.enqueue(p.destination, JSON.parse(p.body) as FanoutBody, { id: p.id });
           // Rehydrate retry state: enqueue mints a fresh row; restore the
           // persisted attempts/backoff so semantics match the in-memory
           // outbox exactly (a row mid-backoff stays mid-backoff).

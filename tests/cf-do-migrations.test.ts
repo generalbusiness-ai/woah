@@ -31,9 +31,14 @@ class_name = "AuditDO"
 
     expect(result.changed).toBe(true);
     expect(result.errors).toEqual([]);
-    // cf-do-0004/0005/0006 are taken; the next free append tag is 0007.
-    expect(result.text).toContain('tag = "cf-do-0007"');
-    expect(result.text).toContain('new_sqlite_classes = [ "AuditDO" ]');
+    // NetAuditDO already occupies cf-do-0007; prove the generator adds a
+    // genuinely new migration rather than matching that existing text.
+    expect(result.analysis.migrations.at(-1)).toMatchObject({
+      tag: "cf-do-0008",
+      new_sqlite_classes: ["AuditDO"],
+      deleted_classes: []
+    });
+    expect(result.text.slice(currentWrangler.length)).toContain('tag = "cf-do-0008"');
     expect(analyzeDoMigrations(result.text).ok).toBe(true);
   });
 

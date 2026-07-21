@@ -89,7 +89,7 @@ function harness(tag: string, options: { failAudit?: { failing: boolean } } = {}
     NET_AUDIT_SHARDS: "1"
   };
   const scopeDO = new NetScopeDO(scope.state as never, scopeEnv);
-  return { auditDO, auditEnv, scopeDO, scopeEnv, close: () => (audit.close(), scope.close()) };
+  return { auditDO, auditEnv, scopeDO, scopeEnv, scopeState: scope.state, close: () => (audit.close(), scope.close()) };
 }
 
 async function planBump(fixture: ReturnType<typeof worldFixture>, principal: Principal, key: string, base: { seq: number; hash: string }) {
@@ -131,6 +131,70 @@ const PRINCIPAL = (fixture: ReturnType<typeof worldFixture>): Principal => ({
 });
 
 describe("audit lane end-to-end (AU6, fake-DO)", () => {
+  it("deletes a delivered adoption-suffixed row by its durable identity", async () => {
+    const h = harness("adoption-row-id");
+    const destination = "audit:audit-0";
+    const id = `${destination}/${SCOPE}/7:adopt`;
+    const body = {
+      scope: SCOPE,
+      seq: 7,
+      cells: [],
+      observations: [],
+      audit_records: [
+        {
+          partition: "acct_owner",
+          record: {
+            ts: 7,
+            idempotency: `${SCOPE}:7:adopt`,
+            outcome: "ok",
+            producer: { kind: "scope", name: SCOPE },
+            action: { kind: "commit", scope: SCOPE, seq: 7, head: "head-7" },
+            subjects: ["lane_box"],
+            cause: { scope: "origin", seq: 3 }
+          }
+        }
+      ]
+    };
+    h.scopeState.storage.sql.exec(
+      "INSERT INTO net_scope_outbox (route, id, destination, body, status, attempts, last_attempt_at_ms, scope, seq, next_attempt_at_ms) VALUES ('/audit', ?, ?, ?, 'pending', 0, NULL, ?, ?, 0)",
+      id,
+      destination,
+      JSON.stringify(body),
+      SCOPE,
+      7
+    );
+    h.scopeState.storage.sql.exec(
+      "INSERT INTO net_scope_outbox_lane (route, destination) VALUES ('/audit', ?)",
+      destination
+    );
+
+    // Any ordinary request kicks the detached durable drain. Before the
+    // regression fix, hydration rebuilt the unsuffixed id: delivery
+    // succeeded, but DELETE targeted a nonexistent row and left this one
+    // pending forever.
+    await call(h.scopeDO, h.scopeEnv, "/net/head");
+    await settle();
+    const delivered = (await (
+      await call(h.auditDO, h.auditEnv, "/net/audit-query", { partition: "acct_owner" })
+    ).json()) as { records: unknown[] };
+    expect(delivered.records).toHaveLength(1);
+    const pending = (
+      h.scopeState.storage.sql.exec("SELECT id FROM net_scope_outbox WHERE route = '/audit'") as unknown as {
+        toArray(): Array<{ id: string }>;
+      }
+    ).toArray();
+    expect(pending).toEqual([]);
+
+    // A second drain cannot redeliver a zombie row.
+    await call(h.scopeDO, h.scopeEnv, "/net/head");
+    await settle();
+    const after = (await (
+      await call(h.auditDO, h.auditEnv, "/net/audit-query", { partition: "acct_owner" })
+    ).json()) as { records: unknown[] };
+    expect(after.records).toHaveLength(1);
+    h.close();
+  });
+
   it("a committed turn yields the acting record AND the resource-owner copy; citation verifies; replay adds nothing", async () => {
     const fixture = worldFixture("e2e");
     const h = harness("e2e");

@@ -76,6 +76,17 @@ export type OutboxOptions = {
   maxAttempts?: number;
 };
 
+export type EnqueueOptions = {
+  /**
+   * Preserve the durable row identity when hydrating an Outbox from
+   * storage. Some routes deliberately distinguish multiple facts at the
+   * same (destination, scope, seq), so reconstructing the conventional
+   * id would alias them and make the subsequent durable write-back target
+   * the wrong row.
+   */
+  id?: string;
+};
+
 /** NC8 (review item 8): ±25% deterministic per-row jitter over the
  * exponential base, so retry herds de-synchronize — many scopes retrying
  * a dead subscriber must not thunder on one cadence. Deterministic BY
@@ -111,9 +122,9 @@ export class Outbox {
   }
 
   /** Durable enqueue — call BEFORE returning the commit reply (CO2.7). */
-  enqueue(destination: string, body: FanoutBody): FanoutRow {
+  enqueue(destination: string, body: FanoutBody, options: EnqueueOptions = {}): FanoutRow {
     const row: FanoutRow = {
-      id: `${destination}/${body.scope}/${body.seq}`,
+      id: options.id ?? `${destination}/${body.scope}/${body.seq}`,
       destination,
       body,
       status: "pending",
