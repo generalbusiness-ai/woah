@@ -190,13 +190,13 @@ type OrderedNeighborsProjection = { container: string; query: OrderedNeighborsQu
 type PlanningOrderedNeighborsProjection = Omit<OrderedNeighborsProjection, "authority_head">;
 type OrderingConflict = { scope: string; container: string; parent: string | null };
 
-/** One successful targeted refresh, identified by the authority's monotonic
- * head as well as the cell's content version. The head is essential: content
- * can legitimately cycle A -> B -> A under contention, while a scope head
- * never repeats. Only receipts backed by an established owner participate in
- * terminal non-convergence detection. */
+/** One successful targeted refresh, identified by the authority's sequenced
+ * head as well as the cell's content version. Only receipts backed by an
+ * established owner and a mutation-complete head participate in terminal
+ * non-convergence detection. */
 type AuthorityReadReceipt = { scope: string; head: ScopeHead; version: string };
 type AuthorityCellTransfer = CellTransfer & { scope?: unknown; head?: unknown };
+const HEAD_STABLE_ACTIVATION_KEY = cellKey("property_cell", "$system", "net_active_epoch");
 
 function validScopeHead(value: unknown): value is ScopeHead {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -207,6 +207,20 @@ function validScopeHead(value: unknown): value is ScopeHead {
 
 function authorityReceiptIdentity(receipt: AuthorityReadReceipt): string {
   return `${receipt.scope}\0${receipt.head.seq}\0${receipt.head.hash}\0${receipt.version}`;
+}
+
+/** ScopeHead is a sequenced-commit head, not a generation for every write.
+ * Same-epoch seed can rewrite arbitrary cells/relations while seq=0, and the
+ * dedicated activation operation can rewrite its one cell at any head. Those
+ * paths are deliberately ineligible rather than pretending a stable receipt
+ * proves stable authority. After seq>0 seed is refused, and every other
+ * authoritative cell/ordering mutation advances the head. */
+function authorityCellReceiptEligible(key: string, head: ScopeHead): boolean {
+  return head.seq > 0 && key !== HEAD_STABLE_ACTIVATION_KEY;
+}
+
+function authorityOrderingReceiptEligible(head: ScopeHead): boolean {
+  return head.seq > 0;
 }
 
 function validOrderedProjectionKey(value: unknown): value is OrderedProjectionKey {
@@ -1311,13 +1325,11 @@ export class NetGatewayDO {
     // oscillation that grinds a sibling-property mismatch to E_BUDGET.
     const repairedObjects = new Set<string>();
     // By-construction non-convergence detector: per turn, the authority
-    // RECEIPT we last refreshed each mismatched key to. A receipt includes the
-    // owner scope and its monotonic head as well as the content version: using
-    // content alone misclassifies legitimate A -> B -> A contention. If a key
-    // mismatches again after the exact same authoritative receipt, refreshing
-    // cannot help — the plan records a read that authority at that head will
-    // never hold (a planner/catalog bug). Owner-unknown probes produce no
-    // receipt and therefore can never trigger this terminal diagnosis.
+    // RECEIPT we last refreshed each mismatched key to. Eligible receipts
+    // include the owner scope and sequenced head as well as content: using
+    // content alone misclassifies A -> B -> A contention. Seed-phase reads,
+    // activation-state reads, and owner-unknown probes produce no receipt
+    // because their apparent head is not a complete authority generation.
     const refreshedTo = new Map<string, string>();
     // Same detector for compact ordering reads. The key is
     // (authority scope, container, parent), because two container roots in one
@@ -1674,7 +1686,7 @@ export class NetGatewayDO {
               );
               const authorityVersion = children?.version ?? neighbor?.version;
               const authorityHead = children?.authority_head ?? neighbor?.authority_head;
-              if (authorityVersion !== undefined && authorityHead !== undefined) {
+              if (authorityVersion !== undefined && authorityHead !== undefined && authorityOrderingReceiptEligible(authorityHead)) {
                 const receipt = authorityReceiptIdentity({ scope: ordering.scope, head: authorityHead, version: authorityVersion });
                 if (refreshedOrderingTo.get(orderingKey) === receipt) {
                   stuck.push({ ...ordering, authority_version: authorityVersion, authority_head: authorityHead });
@@ -6366,7 +6378,7 @@ export class NetGatewayDO {
         for (const key of want) {
           // A destination override may accidentally alias two logical scopes.
           // Only the scope that classification selected can attest this key.
-          if (expectedScopeByKey.get(key) === scope) {
+          if (expectedScopeByKey.get(key) === scope && authorityCellReceiptEligible(key, head)) {
             receipts.set(key, { scope, head, version: view.get(key)?.version ?? "absent" });
           }
         }
@@ -6422,7 +6434,11 @@ export class NetGatewayDO {
           const authority = transfer as AuthorityCellTransfer;
           if (ownerLineage && typeof authority.scope === "string" && validScopeHead(authority.head)) {
             const { scope, head } = authority;
-            for (const key of want) receipts.set(key, { scope, head, version: view.get(key)?.version ?? "absent" });
+            for (const key of want) {
+              if (authorityCellReceiptEligible(key, head)) {
+                receipts.set(key, { scope, head, version: view.get(key)?.version ?? "absent" });
+              }
+            }
           }
           satisfied = true;
         } catch (err) {

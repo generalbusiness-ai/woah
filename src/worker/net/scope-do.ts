@@ -1288,14 +1288,7 @@ export class NetScopeDO {
             });
           }
         }
-        this.discardSeqOnThrow(() =>
-          seq.operatorActivationWrite({
-            kind: "property_cell",
-            object: "$system",
-            name: "net_active_epoch",
-            value: { value: body.active_epoch }
-          })
-        );
+        this.discardSeqOnThrow(() => seq.operatorActivationWrite(body.active_epoch));
         return json({ ok: true, scope: seq.scope, active_epoch: body.active_epoch });
       }
       if (request.method === "POST" && url.pathname === "/net/schedule") {

@@ -853,9 +853,10 @@ describe("outliner add over the net path converges", () => {
     const { world, theOutline, session, actor, epoch } = await outlinerWorld();
     const roomScope = `room:${theOutline}`;
     const ctx = { theOutline, roomScope, epoch, session, actor };
+    let rejectOrdering = false;
     const { gateway, gatewayEnv } = await mountNet(world, epoch, {
       intercept: async (scope, path) => {
-        if (scope === roomScope && path === "/net/submit") {
+        if (rejectOrdering && scope === roomScope && path === "/net/submit") {
           return jsonResponse({
             status: "rejected",
             reason: "read_version_mismatch",
@@ -866,6 +867,12 @@ describe("outliner add over the net path converges", () => {
         return null;
       }
     });
+    // Close the seed-only phase with one real commit. At head zero, a
+    // same-epoch re-seed can rewrite ordering rows without moving the head,
+    // so no ordering receipt is eligible for a terminal diagnosis.
+    const primed = await addTurn(gateway, gatewayEnv, ctx, "prime-ordering", "first");
+    expect(primed.reply.status).toBe("accepted");
+    rejectOrdering = true;
     const err = await addTurn(gateway, gatewayEnv, ctx, "nonconvergent-ordering", "x").then(
       (ok) => { throw new Error(`expected rejection, got ${JSON.stringify(ok.reply)}`); },
       (e: unknown) => String(e)

@@ -134,9 +134,16 @@ that seam:
    attestation rejects `rider_unattested`; a version mismatch rejects
    `read_version_mismatch` with scoped/container-qualified
    `ordering_conflicts`, and the gateway re-fetches those exact answers and
-   re-plans. Reinstalling the exact same owner-attested scope head and content
-   version twice and still recording a mismatch is `E_NONCONVERGENT_READ`, not
-   budget exhaustion; content repetition at a later head remains contention.
+   re-plans. For a receipt-eligible read, reinstalling the exact same
+   owner-attested scope head and content version twice and still recording a
+   mismatch is `E_NONCONVERGENT_READ`, not budget exhaustion. Eligibility is
+   conservative: `head.seq` MUST be greater than zero (same-epoch seed may
+   rewrite arbitrary cells and relations at head zero), and the dedicated
+   `$system.net_active_epoch` cell is NEVER eligible because `/net/activate`
+   intentionally writes it without advancing the head. Ineligible repeats
+   stay on the bounded `E_BUDGET` path. For the remaining cells and ordering
+   reads, every authoritative mutation advances the sequenced head, so content
+   repetition at a later head remains contention rather than non-convergence.
 2. **Owner-sequenced adoption.** Rider writes reach their owner via
    `/net/adopt` and are applied as owner-ordered events with a per-cell
    prior-version CAS (the attested version the committing turn
@@ -386,7 +393,7 @@ divergence. Tail metrics count by code.
 | `E_SEED_LAG` | KV seed behind scope head | informational; consumer proceeds via head-check |
 | `E_EPOCH_MISMATCH` | durable catalog epochs genuinely disagree: a seed against a scope seeded at another epoch, or a turn whose stamp still differs from the scope's durable epoch AFTER the CO8 reseed | terminal; catalog install/migration reconciles (operator concern), never a retry treadmill |
 | `E_SEED_COMMITTED` | a seed targets a scope that has already committed turns | terminal; recover into a fresh namespace rather than resetting authority under an unchanged head |
-| `E_NONCONVERGENT_READ` | a recorded read cannot converge: after resolving the owner, the gateway refreshed a mismatched cell (or re-installed an ordering answer) to an authority receipt `(scope, head, content-version)` and re-planned, yet the re-plan still mismatched the exact same receipt — a planner/catalog-verb bug, not contention. The monotonic scope head distinguishes legitimate content cycles such as A → B → A; failed or owner-unresolved refreshes produce no receipt and cannot trigger this code. | terminal and NAMED; surfaces the offending cell/ordering, authority receipt, and attempt trace instead of grinding to `E_BUDGET` |
+| `E_NONCONVERGENT_READ` | an eligible recorded read cannot converge: after resolving the owner, the gateway refreshed a mismatched cell (or re-installed an ordering answer) to an authority receipt `(scope, head, content-version)` and re-planned, yet the re-plan still mismatched the exact same receipt — a planner/catalog-verb bug, not contention. Only post-seed (`head.seq > 0`) reads participate, and `$system.net_active_epoch` never participates; failed, owner-unresolved, seed-phase, and activation-state refreshes produce no receipt and cannot trigger this code. Within that eligible set every authoritative mutation advances the sequenced head, distinguishing legitimate content cycles such as A → B → A. | terminal and NAMED; surfaces the offending cell/ordering, authority receipt, and attempt trace instead of grinding to `E_BUDGET` |
 | `E_INVARG` | a malformed internal request field (wrong type or shape) | terminal for this request; refused with the offending field named — never silently coerced into a different-but-valid request |
 | `E_SCOPE_RETIRED` | a submit, adopt, seed, or head read targets a scope past its retirement head (CO17) — its anchor root was recycled and the scope's storage reclaimed | terminal; a session repins to a live scope; an outbox sender treats it as terminal-acknowledge (advances high-water, installs nothing); a gateway seed path refuses to re-seed the tombstoned name at the same epoch |
 

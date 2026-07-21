@@ -409,12 +409,12 @@ export class ScopeSequencer {
    * turns). Durable like a seed write; the head is untouched (the cell's
    * own content-address version is what consumers check).
    */
-  operatorActivationWrite(cell: Pick<Cell, "kind" | "object" | "name" | "value">): void {
+  operatorActivationWrite(activeEpoch: string | null): void {
     const committed = this.store.commit({
-      kind: cell.kind,
-      object: cell.object,
-      ...(cell.name !== undefined ? { name: cell.name } : {}),
-      value: cell.value,
+      kind: "property_cell",
+      object: "$system",
+      name: "net_active_epoch",
+      value: { value: activeEpoch },
       stamp: this.stamp()
     });
     const durable = this.options.durable;

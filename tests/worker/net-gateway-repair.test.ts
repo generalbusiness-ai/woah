@@ -163,13 +163,16 @@ function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 }
 
-/** Scope wrapper that forces the named retryable read mismatch while leaving every
- * authority read real. Detector tests vary only the closure receipt, so they
- * exercise the production repair loop without depending on any catalog. */
+/** Scope wrapper that forces the named retryable read mismatch while leaving
+ * every authority read real. The optional hook can drive the real sequencer
+ * between closure snapshots without depending on any catalog. */
 function mismatchScope(
   scopeDO: Fetchable,
   cell: { kind: "prop"; object: string; name: string },
-  mapClosure?: (body: Record<string, unknown>, requestBody: Record<string, unknown>) => Record<string, unknown>
+  mapClosure?: (
+    body: Record<string, unknown>,
+    requestBody: Record<string, unknown>
+  ) => Record<string, unknown> | Promise<Record<string, unknown>>
 ): Fetchable {
   return {
     async fetch(request: Request): Promise<Response> {
@@ -183,7 +186,7 @@ function mismatchScope(
       const response = await scopeDO.fetch(request);
       if (path !== "/net/closure" || !mapClosure) return response;
       const body = await response.json() as Record<string, unknown>;
-      return jsonResponse(mapClosure(body, requestBody), response.status);
+      return jsonResponse(await mapClosure(body, requestBody), response.status);
     }
   };
 }
@@ -202,6 +205,19 @@ function turnRequest(bump: ShadowTurnCall, idempotencyKey: string) {
     // path is covered by tests/worker/net-topology-turn.test.ts.
     shared: [SCOPE]
   };
+}
+
+/** Advance the real authority past its seed-only phase. Detector tests use
+ * this to distinguish receipts protected by the sequenced head from the
+ * deliberately head-stable install phase. */
+async function advanceScopeOnce(scopeDO: Fetchable, bumpCall: (id: string) => ShadowTurnCall, label: string): Promise<void> {
+  const state = netState(`gateway-prime-${label}`);
+  const env = gatewayEnvFor(scopeDO);
+  const gateway = new NetGatewayDO(state.state, env);
+  await call(gateway, env, "/pull", { scope: SCOPE, destination: `scope:${SCOPE}` });
+  const primed = await call<TurnBody>(gateway, env, "/turn", turnRequest(bumpCall(`turn-prime-${label}`), `prime-${label}`));
+  expect(primed.reply.status).toBe("accepted");
+  state.close();
 }
 
 type TurnBody = {
@@ -326,6 +342,7 @@ describe("NetGatewayDO repair loop (CO6/CO10)", () => {
 
   it("fails named after the exact same owner/head/content receipt repeats and reports the exact attempt", async () => {
     const { scopeDO, bumpCall, close } = await seededScope();
+    await advanceScopeOnce(scopeDO, bumpCall, "stable-receipt");
     const stuckCell = { kind: "prop" as const, object: "repair_box", name: "counter" };
     const pathological = mismatchScope(scopeDO, stuckCell);
     const analytics: Array<{ blobs?: string[]; doubles?: number[] }> = [];
@@ -350,7 +367,7 @@ describe("NetGatewayDO repair loop (CO6/CO10)", () => {
     expect(body.error.code).toBe("E_NONCONVERGENT_READ");
     const stuck = body.error.detail?.stuck?.[0];
     expect(stuck?.authority_scope).toBe(SCOPE);
-    expect(stuck?.authority_head).toMatchObject({ seq: 0 });
+    expect(stuck?.authority_head).toMatchObject({ seq: 1 });
     expect(stuck?.authority_version).toEqual(expect.any(String));
     const lastAttempt = body.error.attempts?.at(-1)?.attempt;
     expect(lastAttempt).toBe(2);
@@ -362,6 +379,117 @@ describe("NetGatewayDO repair loop (CO6/CO10)", () => {
 
     close();
     gState.close();
+  });
+
+  it("keeps a real head-zero seed A -> B -> A cycle ineligible for terminal detection", async () => {
+    const { scopeDO, scopeEnv, bumpCall, close } = await seededScope();
+    const key = "property_cell:repair_box:counter";
+    const stuckCell = { kind: "prop" as const, object: "repair_box", name: "counter" };
+    const snapshots: Array<{ head: ScopeHead; version: string }> = [];
+    const middle: Array<{ head: ScopeHead; version: string }> = [];
+    const cycling = mismatchScope(scopeDO, stuckCell, async (body, requestBody) => {
+      const keys = Array.isArray(requestBody.keys) ? requestBody.keys : [];
+      if (!keys.includes(key)) return body;
+      const cell = (body.cells as Array<{ key: string; version: string; value: unknown }>).find((candidate) => candidate.key === key);
+      snapshots.push({ head: body.head as ScopeHead, version: String(cell?.version) });
+      if (snapshots.length === 1) {
+        await call(scopeDO, scopeEnv, "/seed", {
+          scope: SCOPE,
+          catalog_epoch: EPOCH,
+          cells: [{ kind: "property_cell", object: "repair_box", name: "counter", value: { value: 1 } }]
+        });
+        const atB = await call<{ head: ScopeHead; cells: Array<{ key: string; version: string }> }>(
+          scopeDO,
+          scopeEnv,
+          "/closure",
+          { keys: [key], known: ["object_lineage:repair_box"] }
+        );
+        middle.push({ head: atB.head, version: String(atB.cells.find((candidate) => candidate.key === key)?.version) });
+        await call(scopeDO, scopeEnv, "/seed", {
+          scope: SCOPE,
+          catalog_epoch: EPOCH,
+          cells: [{ kind: "property_cell", object: "repair_box", name: "counter", value: structuredClone(cell?.value) }]
+        });
+      }
+      return body;
+    });
+    const state = netState("gateway-seed-aba");
+    const env = gatewayEnvFor(cycling);
+    const gateway = new NetGatewayDO(state.state, env);
+    await call(gateway, env, "/pull", { scope: SCOPE, destination: `scope:${SCOPE}` });
+
+    const { status, body } = await callRaw<{ error: { code: string } }>(
+      gateway,
+      env,
+      "/turn",
+      turnRequest(bumpCall("turn-seed-aba"), "seed-aba")
+    );
+
+    expect(status).toBe(503);
+    expect(body.error.code).toBe("E_BUDGET");
+    expect(snapshots.length).toBe(MAX_TURN_ATTEMPTS);
+    expect(snapshots[0]).toEqual(snapshots[1]);
+    expect(middle[0]?.head).toEqual(snapshots[0]?.head);
+    expect(middle[0]?.version).not.toBe(snapshots[0]?.version);
+    expect(snapshots[0]?.head.seq).toBe(0);
+
+    close();
+    state.close();
+  });
+
+  it("keeps a real post-traffic activation A -> null -> A cycle ineligible for terminal detection", async () => {
+    const { scopeDO, scopeEnv, bumpCall, close } = await seededScope();
+    await advanceScopeOnce(scopeDO, bumpCall, "activation-aba");
+    const key = "property_cell:$system:net_active_epoch";
+    const stuckCell = { kind: "prop" as const, object: "$system", name: "net_active_epoch" };
+    const activate = (activeEpoch: string | null) => call(scopeDO, scopeEnv, "/activate", {
+      scope: SCOPE,
+      catalog_epoch: EPOCH,
+      active_epoch: activeEpoch
+    });
+    await activate("A");
+    const snapshots: Array<{ head: ScopeHead; version: string }> = [];
+    const middle: Array<{ head: ScopeHead; version: string }> = [];
+    const cycling = mismatchScope(scopeDO, stuckCell, async (body, requestBody) => {
+      const keys = Array.isArray(requestBody.keys) ? requestBody.keys : [];
+      if (!keys.includes(key)) return body;
+      const cell = (body.cells as Array<{ key: string; version: string }>).find((candidate) => candidate.key === key);
+      snapshots.push({ head: body.head as ScopeHead, version: String(cell?.version) });
+      if (snapshots.length === 1) {
+        await activate(null);
+        const atNull = await call<{ head: ScopeHead; cells: Array<{ key: string; version: string }> }>(
+          scopeDO,
+          scopeEnv,
+          "/closure",
+          { keys: [key], known: ["object_lineage:$system"] }
+        );
+        middle.push({ head: atNull.head, version: String(atNull.cells.find((candidate) => candidate.key === key)?.version) });
+        await activate("A");
+      }
+      return body;
+    });
+    const state = netState("gateway-activation-aba");
+    const env = gatewayEnvFor(cycling);
+    const gateway = new NetGatewayDO(state.state, env);
+    await call(gateway, env, "/pull", { scope: SCOPE, destination: `scope:${SCOPE}` });
+
+    const { status, body } = await callRaw<{ error: { code: string } }>(
+      gateway,
+      env,
+      "/turn",
+      turnRequest(bumpCall("turn-activation-aba"), "activation-aba")
+    );
+
+    expect(status).toBe(503);
+    expect(body.error.code).toBe("E_BUDGET");
+    expect(snapshots.length).toBe(MAX_TURN_ATTEMPTS);
+    expect(snapshots[0]).toEqual(snapshots[1]);
+    expect(middle[0]?.head).toEqual(snapshots[0]?.head);
+    expect(middle[0]?.version).not.toBe(snapshots[0]?.version);
+    expect(snapshots[0]?.head.seq).toBeGreaterThan(0);
+
+    close();
+    state.close();
   });
 
   it("does not misclassify A -> B -> A contention when content repeats at a later authority head", async () => {

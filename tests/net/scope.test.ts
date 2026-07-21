@@ -107,7 +107,7 @@ describe("commit acceptance (CO4)", () => {
 
     // The activation state machine stays available AFTER commits — it is
     // a dedicated operator op, never a seed.
-    seq.operatorActivationWrite({ kind: "property_cell", object: "$system", name: "net_active_epoch", value: { value: null } });
+    seq.operatorActivationWrite(null);
     expect(seq.store.get("property_cell:$system:net_active_epoch")?.value).toEqual({ value: null });
     expect(seq.head()).toEqual(headAfterCommit);
   });
