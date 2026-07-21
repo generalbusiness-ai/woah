@@ -54,25 +54,29 @@ export function mintSpanId(): string {
 }
 
 /**
- * Should spans be exported for this context? Adopted contexts follow
- * the caller's sampled flag verbatim (their trace, their decision).
- * Minted contexts sample 1-in-N deterministically by trace id, so every
- * producer that sees the trace makes the same call.
+ * Should spans be exported for this context? ONE rule for every
+ * producer: the W3C sampled flag, decided exactly once — by the caller
+ * for adopted contexts, by the gateway at MINT time (mintTraceContext's
+ * `sampled` argument, fed by mintSampleDecision) for minted ones. No
+ * producer re-decides, so a trace can never be half-exported (review
+ * finding 2).
  */
-export function spanSampled(trace: TraceContext | undefined, sampleRate: number): boolean {
+export function spanSampled(trace: TraceContext | undefined): boolean {
   if (!trace) return false;
   const parsed = parseTraceparent(trace.traceparent);
   if (!parsed) return false;
-  if (trace.origin === "adopted") return (parseInt(parsed.flags, 16) & 0x01) === 0x01;
-  if (!Number.isFinite(sampleRate) || sampleRate <= 0) return false;
-  const rate = Math.floor(sampleRate);
-  if (rate <= 1) return true;
-  let hash = 0x811c9dc5;
-  for (let i = 0; i < parsed.traceId.length; i += 1) {
-    hash ^= parsed.traceId.charCodeAt(i);
-    hash = Math.imul(hash, 0x01000193) >>> 0;
-  }
-  return hash % rate === 0;
+  return (parseInt(parsed.flags, 16) & 0x01) === 0x01;
+}
+
+/** The gateway's 1-in-N mint-time sampling decision (crypto-random —
+ * there is no trace id yet to hash). rate 0/absent = never sampled. */
+export function mintSampleDecision(rate: number): boolean {
+  if (!Number.isFinite(rate) || rate <= 0) return false;
+  const n = Math.floor(rate);
+  if (n <= 1) return true;
+  const buf = new Uint32Array(1);
+  crypto.getRandomValues(buf);
+  return buf[0] % n === 0;
 }
 
 /** Emit one span on the structured-log channel (R10.2). The `woo.span`
@@ -127,9 +131,18 @@ export function otlpTracePayload(
 /**
  * Build the turn span tree from the gateway's structure report: one
  * root `net.turn` span plus phase children reconstructed from the
- * measured millisecond buckets (queue wait, rpc time inside the wall).
- * The parent span id is the CALLER's span (from the adopted
- * traceparent) so the tree hangs under the customer's own trace.
+ * measured millisecond buckets.
+ *
+ * Timing (review finding 1): `wall_ms` is measured AFTER the queue wait,
+ * so the root spans queue + wall — the queue child lays at the front and
+ * the rpc child inside the execution window, and every child interval is
+ * clamped inside the root (contention traces must be structurally valid).
+ *
+ * Identity (review finding 2): for a MINTED context the carried span id
+ * IS the turn root, so downstream producers that parent to the carried
+ * context (the scope's commit span) attach to this root — one tree, one
+ * root. For an ADOPTED context the root is a fresh span under the
+ * caller's span id.
  */
 export function turnSpans(input: {
   trace: TraceContext;
@@ -142,13 +155,16 @@ export function turnSpans(input: {
 }): NetSpan[] {
   const parsed = parseTraceparent(input.trace.traceparent);
   if (!parsed) return [];
+  const queueMs = Number.isFinite(input.queue_ms) && input.queue_ms > 0 ? input.queue_ms : 0;
+  const wallMs = Number.isFinite(input.wall_ms) && input.wall_ms > 0 ? input.wall_ms : 0;
   const root: NetSpan = {
     trace_id: parsed.traceId,
-    span_id: mintSpanId(),
-    // Adopted context: hang under the caller's span. Minted: root.
+    // Minted: the carried context's span IS this root (scope commit
+    // spans parent to it). Adopted: fresh span under the caller's.
+    span_id: input.trace.origin === "minted" ? parsed.spanId : mintSpanId(),
     ...(input.trace.origin === "adopted" ? { parent_span_id: parsed.spanId } : {}),
     name: "net.turn",
-    start_ms: input.now_ms - input.wall_ms,
+    start_ms: input.now_ms - wallMs - queueMs,
     end_ms: input.now_ms,
     status: input.status,
     attributes: input.attributes
@@ -157,19 +173,21 @@ export function turnSpans(input: {
   let cursor = root.start_ms;
   const phase = (name: string, ms: number): void => {
     if (!Number.isFinite(ms) || ms <= 0) return;
+    const end = Math.min(cursor + ms, root.end_ms); // containment, always
+    if (end <= cursor) return;
     spans.push({
       trace_id: root.trace_id,
       span_id: mintSpanId(),
       parent_span_id: root.span_id,
       name,
       start_ms: cursor,
-      end_ms: cursor + ms,
+      end_ms: end,
       status: "ok",
       attributes: {}
     });
-    cursor += ms;
+    cursor = end;
   };
-  phase("net.turn.queue", input.queue_ms);
+  phase("net.turn.queue", queueMs);
   phase("net.turn.rpc", input.rpc_ms);
   return spans;
 }

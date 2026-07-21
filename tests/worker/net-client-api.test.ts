@@ -685,25 +685,60 @@ describe("AU10.3 join gate: one trace id across gateway span, scope span, and au
         body: { target: "capi_box", verb: "bump", session: (session.body as { session?: string }).session }
       });
       expect(turn.status).toBe(200);
-      for (let i = 0; i < 6; i += 1) await new Promise((resolve) => setTimeout(resolve, 5));
     } finally {
+      // Deterministic settle: poll the audit partition (each query's
+      // cluster warm also kicks the scope's pending drains) until the
+      // record lands — no arbitrary sleeps.
       logSpy.mockRestore();
     }
 
     const traceId = "feedfacefeedfacefeedfacefeedface";
-    const names = spanLines.filter((s) => s.trace_id === traceId).map((s) => s.name);
-    expect(names).toEqual(expect.arrayContaining(["net.turn", "net.commit"]));
-    // The adopted caller's span parents the gateway root.
-    const turnSpan = spanLines.find((s) => s.name === "net.turn" && s.trace_id === traceId);
-    expect(turnSpan?.parent_span_id).toBe("a1b2c3d4e5f60718");
+    let records: Array<{
+      outcome: string;
+      idempotency: string;
+      trace_id?: string;
+      principal?: { customer?: string };
+      action: { kind: string; verb?: string; scope?: string; seq?: number };
+    }> = [];
+    for (let attempt = 0; attempt < 40 && records.length === 0; attempt += 1) {
+      const mine = await clientFetch(h.gateway, "POST", "/net-api/audit", {
+        token: `apikey:${KEY_ID}:${KEY_SECRET}`,
+        body: { trace_id: traceId }
+      });
+      expect(mine.status).toBe(200);
+      records = mine.body.records as typeof records;
+      if (records.length === 0) await new Promise((resolve) => setTimeout(resolve, 10));
+    }
 
-    // ...and the audit record carries the SAME trace id (the join).
-    const mine = await clientFetch(h.gateway, "POST", "/net-api/audit", {
-      token: `apikey:${KEY_ID}:${KEY_SECRET}`,
-      body: { trace_id: traceId }
+    // Exact record: THE committed turn, attributed and cited.
+    expect(records).toHaveLength(1);
+    const record = records[0];
+    expect(record).toMatchObject({
+      outcome: "ok",
+      trace_id: traceId,
+      principal: { customer: "acct_capi" },
+      action: { kind: "commit", verb: "bump" }
     });
-    expect(mine.status).toBe(200);
-    expect((mine.body.records as unknown[]).length).toBeGreaterThan(0);
+    expect(record.idempotency).toBe(`${record.action.scope}:${record.action.seq}`);
+
+    // Exact span relationships: the fresh commit span is net.commit (a
+    // replay would be net.scope.submit), and BOTH spans hang under the
+    // adopted caller's span id — one connected trace.
+    const traced = spanLines.filter((s) => s.trace_id === traceId);
+    const turnSpan = traced.find((s) => s.name === "net.turn");
+    const commitSpan = traced.find((s) => s.name === "net.commit");
+    expect(turnSpan?.parent_span_id).toBe("a1b2c3d4e5f60718");
+    expect(commitSpan?.parent_span_id).toBe("a1b2c3d4e5f60718");
+    expect((commitSpan?.attributes as Record<string, unknown>)?.["woo.seq"]).toBe(record.action.seq);
+    // Structural validity (review finding 1): children contained in roots.
+    for (const span of traced) {
+      expect((span.end_ms as number) >= (span.start_ms as number)).toBe(true);
+    }
+    const rootSpan = turnSpan as { span_id?: string; start_ms?: number; end_ms?: number };
+    for (const child of traced.filter((s) => s.parent_span_id === rootSpan.span_id)) {
+      expect(child.start_ms as number).toBeGreaterThanOrEqual(rootSpan.start_ms as number);
+      expect(child.end_ms as number).toBeLessThanOrEqual(rootSpan.end_ms as number);
+    }
     h.close();
   });
 });

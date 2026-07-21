@@ -67,11 +67,19 @@ function randomHex(bytes: number): string {
   return out;
 }
 
-/** Mint a fresh root context. The sampled flag is set: woo's own spans
- * are sample-governed downstream at export, not at mint (AU2). */
-export function mintTraceContext(): TraceContext {
+/**
+ * Mint a fresh root context. The SAMPLING DECISION IS MADE HERE, once,
+ * and encoded in the W3C flags — every downstream producer (gateway
+ * span emission, scope span emission) reads the flag and never
+ * re-decides, so one trace samples consistently everywhere (review
+ * finding 2: a flag that says sampled while export declines, or two
+ * producers deciding independently, produces contradictory traces).
+ * Default unsampled: minted spans are off unless the caller passes the
+ * gateway's NET_SPAN_SAMPLE decision.
+ */
+export function mintTraceContext(sampled = false): TraceContext {
   return {
-    traceparent: `00-${randomHex(16)}-${randomHex(8)}-01`,
+    traceparent: `00-${randomHex(16)}-${randomHex(8)}-${sampled ? "01" : "00"}`,
     origin: "minted"
   };
 }
@@ -80,14 +88,17 @@ export function mintTraceContext(): TraceContext {
  * The single entry point for inbound context (REST/MCP `traceparent`
  * header, WS turn-frame `trace` field): adopt when valid, mint when
  * absent or malformed. A tracestate without a valid traceparent is
- * dropped (W3C: tracestate is meaningless alone).
+ * dropped (W3C: tracestate is meaningless alone). `mintSampled` is the
+ * gateway's one-time sampling decision for the minted case; adopted
+ * contexts keep their caller's flag verbatim.
  */
 export function adoptOrMintTraceContext(
   traceparent: string | null | undefined,
-  tracestate?: string | null
+  tracestate?: string | null,
+  mintSampled = false
 ): TraceContext {
   const parsed = parseTraceparent(traceparent);
-  if (!parsed) return mintTraceContext();
+  if (!parsed) return mintTraceContext(mintSampled);
   const ctx: TraceContext = { traceparent: traceparent as string, origin: "adopted" };
   // Bound the opaque carry: W3C caps combined tracestate at 512 chars of
   // list-members; anything larger is droppable by spec, and we drop

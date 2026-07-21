@@ -66,7 +66,7 @@ import {
 } from "../../net/attribution";
 import { auditShardFor, mintGatewayAuditRecord } from "../../net/audit";
 import { CellStore, cellKey, cellVersion, makeCell, type Cell } from "../../net/cells";
-import { spanSampled, turnSpans } from "../../net/spans";
+import { mintSampleDecision, spanSampled, turnSpans } from "../../net/spans";
 import { exportSpans, spanSampleRate } from "./span-export";
 import { adoptOrMintTraceContext, normalizeTraceContext, parseTraceparent, type TraceContext } from "../../net/trace";
 import { clampClientSessionTtl } from "../../net/client-session-policy";
@@ -1185,7 +1185,7 @@ export class NetGatewayDO {
     // minted contexts are gated by NET_SPAN_SAMPLE. Export is
     // best-effort (woo.span log + optional OTLP push off the reply
     // path) and never the audit trail.
-    if (request.trace && spanSampled(request.trace, spanSampleRate(this.env))) {
+    if (request.trace && spanSampled(request.trace)) {
       exportSpans(
         this.env,
         this.host,
@@ -2255,7 +2255,8 @@ export class NetGatewayDO {
           ...(credential.kind === "apikey" ? { credential: credential.id } : {}),
           trace: adoptOrMintTraceContext(
             request.headers.get("traceparent"),
-            request.headers.get("tracestate")
+            request.headers.get("tracestate"),
+            mintSampleDecision(spanSampleRate(this.env))
           )
         });
       }
@@ -3421,7 +3422,8 @@ export class NetGatewayDO {
       audit?.trace ??
       adoptOrMintTraceContext(
         typeof bodyTrace?.traceparent === "string" ? bodyTrace.traceparent : null,
-        typeof bodyTrace?.tracestate === "string" ? bodyTrace.tracestate : null
+        typeof bodyTrace?.tracestate === "string" ? bodyTrace.tracestate : null,
+        mintSampleDecision(spanSampleRate(this.env))
       );
     const result = await this.turn({
       call: {
@@ -3727,7 +3729,11 @@ export class NetGatewayDO {
 
   /** AU2: adopt the MCP request's traceparent for a tool-invoked turn. */
   private mcpTraceOf(request: Request): TraceContext {
-    return adoptOrMintTraceContext(request.headers.get("traceparent"), request.headers.get("tracestate"));
+    return adoptOrMintTraceContext(
+      request.headers.get("traceparent"),
+      request.headers.get("tracestate"),
+      mintSampleDecision(spanSampleRate(this.env))
+    );
   }
 
   private async mcpToolsCall(request: Request, id: number | string, params: Record<string, unknown>): Promise<Response> {

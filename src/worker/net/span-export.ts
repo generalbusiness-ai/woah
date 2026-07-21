@@ -23,6 +23,22 @@ export function spanSampleRate(env: SpanExportEnv): number {
   return Number.isFinite(rate) && rate > 0 ? Math.floor(rate) : 0;
 }
 
+/** Hard deadline per OTLP push. A slow collector must never hold a
+ * deferred task open indefinitely. */
+const OTLP_PUSH_TIMEOUT_MS = 5_000;
+/** In-flight pushes per isolate. Beyond this, batches are DROPPED (and
+ * counted) — spans are droppable telemetry (AU8); adopted callers can
+ * demand sampling regardless of our rate, so a dead collector must not
+ * accumulate unbounded deferred work. */
+const OTLP_MAX_INFLIGHT = 8;
+let otlpInflight = 0;
+let otlpDropped = 0;
+
+/** Test/telemetry visibility into the drop policy. */
+export function otlpExportState(): { inflight: number; dropped: number } {
+  return { inflight: otlpInflight, dropped: otlpDropped };
+}
+
 export function exportSpans(
   env: SpanExportEnv,
   host: Pick<Host, "defer">,
@@ -33,14 +49,28 @@ export function exportSpans(
   for (const span of spans) logSpan(span);
   const endpoint = env.WOO_OTLP_ENDPOINT;
   if (!endpoint) return;
+  if (otlpInflight >= OTLP_MAX_INFLIGHT) {
+    otlpDropped += spans.length;
+    console.log("woo.metric", JSON.stringify({ kind: "net_span_export_dropped", spans: spans.length, dropped_total: otlpDropped }));
+    return;
+  }
+  otlpInflight += 1;
   host.defer(async () => {
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(otlpTracePayload(spans, resource))
-    });
-    if (!response.ok) {
-      throw new Error(`otlp push failed: ${response.status}`);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), OTLP_PUSH_TIMEOUT_MS);
+    try {
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(otlpTracePayload(spans, resource)),
+        signal: controller.signal
+      });
+      if (!response.ok) {
+        throw new Error(`otlp push failed: ${response.status}`);
+      }
+    } finally {
+      clearTimeout(timer);
+      otlpInflight -= 1;
     }
   });
 }

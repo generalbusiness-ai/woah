@@ -4,7 +4,8 @@
  * payload mapping (hex ids, nano times, status codes).
  */
 import { describe, expect, it } from "vitest";
-import { otlpTracePayload, spanSampled, turnSpans, type NetSpan } from "../../src/net/spans";
+import { mintSampleDecision, otlpTracePayload, spanSampled, turnSpans, type NetSpan } from "../../src/net/spans";
+import { mintTraceContext } from "../../src/net/trace";
 import type { TraceContext } from "../../src/net/trace";
 
 const SAMPLED = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
@@ -12,25 +13,30 @@ const UNSAMPLED = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00";
 const adopted = (traceparent: string): TraceContext => ({ traceparent, origin: "adopted" });
 const minted = (traceparent: string): TraceContext => ({ traceparent, origin: "minted" });
 
-describe("spanSampled (AU2: sampled flag governs export only)", () => {
-  it("adopted contexts follow the caller's flag verbatim", () => {
-    expect(spanSampled(adopted(SAMPLED), 0)).toBe(true);
-    expect(spanSampled(adopted(UNSAMPLED), 1)).toBe(false);
-  });
-  it("minted contexts are off without a rate, always-on at 1, deterministic at N", () => {
-    expect(spanSampled(minted(SAMPLED), 0)).toBe(false);
-    expect(spanSampled(minted(SAMPLED), 1)).toBe(true);
-    const at100 = spanSampled(minted(SAMPLED), 100);
-    expect(spanSampled(minted(SAMPLED), 100)).toBe(at100); // same trace, same verdict
+describe("spanSampled (one decision, encoded in the flags — review finding 2)", () => {
+  it("reads the W3C sampled flag uniformly for adopted and minted contexts", () => {
+    expect(spanSampled(adopted(SAMPLED))).toBe(true);
+    expect(spanSampled(adopted(UNSAMPLED))).toBe(false);
+    expect(spanSampled(minted(SAMPLED))).toBe(true);
+    expect(spanSampled(minted(UNSAMPLED))).toBe(false);
   });
   it("absent or malformed context never samples", () => {
-    expect(spanSampled(undefined, 1)).toBe(false);
-    expect(spanSampled({ traceparent: "junk", origin: "minted" }, 1)).toBe(false);
+    expect(spanSampled(undefined)).toBe(false);
+    expect(spanSampled({ traceparent: "junk", origin: "minted" })).toBe(false);
+  });
+  it("mintSampleDecision: off at 0, always at 1", () => {
+    expect(mintSampleDecision(0)).toBe(false);
+    expect(mintSampleDecision(1)).toBe(true);
+  });
+  it("mintTraceContext encodes the decision in the flags", () => {
+    expect(mintTraceContext(true).traceparent.endsWith("-01")).toBe(true);
+    expect(mintTraceContext(false).traceparent.endsWith("-00")).toBe(true);
+    expect(mintTraceContext().traceparent.endsWith("-00")).toBe(true); // default: unsampled
   });
 });
 
 describe("turnSpans", () => {
-  it("hangs the root under the caller's span for adopted contexts and lays phases inside the wall", () => {
+  it("root spans queue + wall (review finding 1) and every child is contained in it", () => {
     const spans = turnSpans({
       trace: adopted(SAMPLED),
       now_ms: 10_000,
@@ -46,14 +52,35 @@ describe("turnSpans", () => {
       trace_id: "4bf92f3577b34da6a3ce929d0e0e4736",
       parent_span_id: "00f067aa0ba902b7",
       name: "net.turn",
-      start_ms: 9_900,
+      start_ms: 9_880, // now - wall - queue: the wall clock starts AFTER the queue wait
       end_ms: 10_000
     });
-    expect(queue).toMatchObject({ name: "net.turn.queue", parent_span_id: root.span_id, start_ms: 9_900, end_ms: 9_920 });
-    expect(rpc).toMatchObject({ name: "net.turn.rpc", parent_span_id: root.span_id, start_ms: 9_920, end_ms: 9_950 });
+    expect(queue).toMatchObject({ name: "net.turn.queue", parent_span_id: root.span_id, start_ms: 9_880, end_ms: 9_900 });
+    expect(rpc).toMatchObject({ name: "net.turn.rpc", parent_span_id: root.span_id, start_ms: 9_900, end_ms: 9_930 });
+    for (const child of [queue, rpc]) {
+      expect(child.start_ms).toBeGreaterThanOrEqual(root.start_ms);
+      expect(child.end_ms).toBeLessThanOrEqual(root.end_ms);
+    }
   });
 
-  it("minted contexts root the tree (no parent) and zero phases are elided", () => {
+  it("children are clamped inside the root even when reported buckets overrun", () => {
+    const spans = turnSpans({
+      trace: adopted(SAMPLED),
+      now_ms: 1_000,
+      wall_ms: 10,
+      queue_ms: 5,
+      rpc_ms: 500, // pathological report: rpc bucket larger than the wall
+      status: "ok",
+      attributes: {}
+    });
+    const root = spans[0];
+    for (const child of spans.slice(1)) {
+      expect(child.start_ms).toBeGreaterThanOrEqual(root.start_ms);
+      expect(child.end_ms).toBeLessThanOrEqual(root.end_ms);
+    }
+  });
+
+  it("minted contexts root the tree at the CARRIED span id (review finding 2: scope spans attach to it)", () => {
     const spans = turnSpans({
       trace: minted(SAMPLED),
       now_ms: 100,
@@ -65,6 +92,7 @@ describe("turnSpans", () => {
     });
     expect(spans).toHaveLength(1);
     expect(spans[0]?.parent_span_id).toBeUndefined();
+    expect(spans[0]?.span_id).toBe("00f067aa0ba902b7"); // the minted context's own span id
     expect(spans[0]?.status).toBe("error");
   });
 });

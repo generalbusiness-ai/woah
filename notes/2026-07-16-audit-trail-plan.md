@@ -286,3 +286,32 @@ Deliberate exclusions, named:
 - Span timing inside the turn is reconstructed from measured phase
   buckets (queue/rpc laid sequentially inside the wall) — honest about
   totals, approximate about overlap.
+
+## Phase 4 review fixes (2026-07-21)
+
+Six findings, all real, all fixed (npm test 1053/1053 across 96 files —
+now INCLUDING net-client-api + span-export in the curated list; worker
+496/496; smoke:net-dev 25/25):
+
+1. Root spans now cover queue + wall (the wall clock starts after the
+   queue wait); children clamped inside the root; containment asserted
+   in unit + join-gate tests.
+2. Sampling is decided ONCE at mint and encoded in the W3C flags
+   (mintTraceContext(sampled), gateway mintSampleDecision); spanSampled
+   is flag-only for every producer, and the scope no longer needs the
+   rate env. Minted traces root at the CARRIED span id, and the scope
+   span always parents to it — one connected tree for no-header traffic.
+3. Only fresh acceptance emits net.commit (with woo.seq); replays emit
+   net.scope.submit with woo.replayed and no seq; rejections emit
+   net.scope.submit with woo.reason and error status. Tested.
+4. Spec AU8 status corrected to PARTIAL with the missing normative
+   seams enumerated (plan/repair subspans, VM-run span, per-rpc spans,
+   async link emission).
+5. The AU10.3 join gate is now actually curated; fixed sleeps replaced
+   by a bounded poll (whose warm pulls also kick scope drains); exact
+   record assertions (idempotency = scope:seq, principal, verb) and
+   exact span topology (both spans under the caller's span; commit
+   woo.seq matches the record; containment).
+6. OTLP push bounded: 5s abort deadline, 8 in-flight per isolate,
+   counted drops beyond (net_span_export_dropped); six direct exporter
+   tests (success/failure isolation/timeout/saturation).

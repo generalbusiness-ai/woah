@@ -6,7 +6,7 @@
  * AU10.2 idempotent redelivery, AU10.6 lane independence (a dead audit
  * sink never blocks commits; records deliver after it heals).
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { FakeDurableObjectState } from "./fake-do";
 import { installVerb } from "../../src/core/authoring";
 import { createWorld } from "../../src/core/bootstrap";
@@ -285,5 +285,58 @@ describe("NetAuditDO segments and verification (AU6.3/AU7)", () => {
     ).json()) as { records: unknown[] };
     expect(other.records).toHaveLength(0);
     st.close();
+  });
+});
+
+describe("submit span honesty (review finding 3)", () => {
+  it("fresh acceptance emits net.commit; replays and rejections emit net.scope.submit", async () => {
+    const fixture = worldFixture("spans");
+    const h = harness("spans");
+    await call(h.scopeDO, h.scopeEnv, "/net/seed", {
+      scope: SCOPE,
+      catalog_epoch: EPOCH,
+      cells: cellsFromSerialized(fixture.world.exportWorld())
+    });
+    const head = (await (await call(h.scopeDO, h.scopeEnv, "/net/head")).json()) as { head: { seq: number; hash: string } };
+    const plan = await planBump(fixture, PRINCIPAL(fixture), "k-span-1", head.head);
+
+    const spans: Array<Record<string, unknown>> = [];
+    const spy = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+      if (args[0] === "woo.span" && typeof args[1] === "string") spans.push(JSON.parse(args[1]) as Record<string, unknown>);
+    });
+    try {
+      // Fresh acceptance → net.commit with the new seq.
+      const fresh = (await (await call(h.scopeDO, h.scopeEnv, "/net/submit", plan.submit)).json()) as {
+        status: string;
+        head: { seq: number };
+      };
+      expect(fresh.status).toBe("accepted");
+      expect(spans.map((s) => s.name)).toEqual(["net.commit"]);
+      expect((spans[0]?.attributes as Record<string, unknown>)["woo.seq"]).toBe(fresh.head.seq);
+
+      // Idempotent replay → net.scope.submit, marked, NO manufactured commit.
+      spans.length = 0;
+      const replayed = (await (await call(h.scopeDO, h.scopeEnv, "/net/submit", plan.submit)).json()) as {
+        replayed?: boolean;
+      };
+      expect(replayed.replayed).toBe(true);
+      expect(spans.map((s) => s.name)).toEqual(["net.scope.submit"]);
+      expect((spans[0]?.attributes as Record<string, unknown>)["woo.replayed"]).toBe("true");
+      expect((spans[0]?.attributes as Record<string, unknown>)["woo.seq"]).toBeUndefined();
+
+      // Rejection (stale base under a new key) → net.scope.submit with the verdict.
+      spans.length = 0;
+      const stale = await planBump(fixture, PRINCIPAL(fixture), "k-span-2", head.head);
+      const rejected = (await (
+        await call(h.scopeDO, h.scopeEnv, "/net/submit", { ...stale.submit, base: { seq: 999, hash: "future" } })
+      ).json()) as { status: string };
+      expect(rejected.status).toBe("rejected");
+      expect(spans.map((s) => s.name)).toEqual(["net.scope.submit"]);
+      expect((spans[0]?.attributes as Record<string, unknown>)["woo.reason"]).toBeDefined();
+      expect(spans[0]?.status).toBe("error");
+    } finally {
+      spy.mockRestore();
+    }
+    h.close();
   });
 });

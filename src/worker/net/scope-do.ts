@@ -86,7 +86,7 @@ import {
 } from "../../net/audit";
 import { mintSpanId, spanSampled } from "../../net/spans";
 import { normalizeTraceContext, parseTraceparent, type TraceContext } from "../../net/trace";
-import { exportSpans, spanSampleRate } from "./span-export";
+import { exportSpans } from "./span-export";
 import type { Cell } from "../../net/cells";
 import { cellKey, lineageClosureKeys, serializeTransfer, type CellTransfer } from "../../net/cells";
 import { isNetError, netError } from "../../net/errors";
@@ -794,15 +794,20 @@ export class NetScopeDO {
           outbox_enqueued: this.outboxEnqueuedTotal - enqueuedBefore,
           ms: Date.now() - submitStarted
         });
-        // AU8: the commit span, joined to the turn's trace. It parents
-        // to the CARRIED context's span id (the caller's span for
-        // adopted traces), so gateway and scope spans sit as siblings
-        // under the customer's own trace — a flat, honest tree until
-        // rpc-level context threading lands.
+        // AU8: the submit-side span, joined to the turn's trace. It
+        // ALWAYS parents to the carried context's span id — for a
+        // minted context that id is the gateway's net.turn root, so the
+        // tree stays connected under one root; for an adopted context it
+        // hangs beside net.turn under the caller's own span. Naming is
+        // honest (review finding 3): only a FRESH acceptance is a
+        // commit — rejections and idempotent replays emit
+        // `net.scope.submit` with their verdict, never a manufactured
+        // commit at a stale sequence number.
         const spanTrace = submit.transcript.trace;
-        if (spanTrace && spanSampled(spanTrace, spanSampleRate(this.env))) {
+        if (spanTrace && spanSampled(spanTrace)) {
           const parsed = parseTraceparent(spanTrace.traceparent);
           if (parsed) {
+            const freshCommit = reply.status === "accepted" && reply.replayed !== true;
             exportSpans(
               this.env,
               this.host,
@@ -810,14 +815,16 @@ export class NetScopeDO {
                 {
                   trace_id: parsed.traceId,
                   span_id: mintSpanId(),
-                  ...(spanTrace.origin === "adopted" ? { parent_span_id: parsed.spanId } : {}),
-                  name: "net.commit",
+                  parent_span_id: parsed.spanId,
+                  name: freshCommit ? "net.commit" : "net.scope.submit",
                   start_ms: submitStarted,
                   end_ms: Date.now(),
                   status: reply.status === "accepted" ? "ok" : "error",
                   attributes: {
                     "woo.scope": seq.scope,
-                    ...(reply.status === "accepted" ? { "woo.seq": reply.head.seq } : { "woo.reason": reply.reason }),
+                    ...(freshCommit ? { "woo.seq": reply.head.seq } : {}),
+                    ...(reply.status === "accepted" && reply.replayed === true ? { "woo.replayed": "true" } : {}),
+                    ...(reply.status !== "accepted" ? { "woo.reason": reply.reason } : {}),
                     ...(submit.transcript.principal?.customer
                       ? { "woo.customer": submit.transcript.principal.customer }
                       : {})
