@@ -185,6 +185,43 @@
       ]
     },
     {
+      "local_name": "$kind_lanes",
+      "parent": "$projection",
+      "description": "Second-surface proof projection (acts kernel S8.2 tier B3): one row per task kind with counts of tasks in each state - { kind, open, claimed, closed }. Folds the same recorded tasks.* acts as the board with zero domain-verb edits and zero edits to existing folds. task_states is the fold-private per-task index (kind + live state) needed because claim/release/close payloads carry no kind and close does not say whether the task was held.",
+      "properties": [
+        {
+          "name": "consumes",
+          "type": "list",
+          "default": [
+            "tasks.opened",
+            "tasks.claimed",
+            "tasks.released",
+            "tasks.closed"
+          ],
+          "perms": ""
+        },
+        {
+          "name": "task_states",
+          "type": "map",
+          "default": {},
+          "perms": ""
+        }
+      ],
+      "verbs": [
+        {
+          "name": "fold",
+          "perms": "rx",
+          "arg_spec": {
+            "args": [
+              "act"
+            ]
+          },
+          "source": "verb :fold(act) rx {\n  /* Sole writer of this.rows and this.task_states (acts kernel S2.3).\n     One row per task kind: { kind, open, claimed, closed } - counts of\n     tasks currently in each state for that kind. The claimed/released/\n     closed payloads carry no kind, and tasks.closed does not say whether\n     the task was held, so the fold keeps a per-task state index\n     (task_states) alongside the lane rows. Both maps are projection\n     state written only here, so fold(recorded acts) reproduces both.\n     Deterministic given (projection state, act): uses the injected\n     act[\"seq\"], no clock, no foreign reads, O(payload) work per act.\n     Raising aborts the whole turn (fail-closed); E_QUOTA refuses lane\n     overflow at row_cap. */\n  let ty = act[\"type\"];\n  let p = act[\"payload\"];\n  let key = to_string(p[\"task\"]);\n  let rows = this.rows;\n  let states = this.task_states;\n  if (ty == \"tasks.opened\") {\n    let kind = p[\"kind\"];\n    if (!(kind in rows)) {\n      if (length(rows) >= this.row_cap) { raise { code: \"E_QUOTA\", message: \"kind lane cap\", value: this.row_cap }; }\n      rows[kind] = { \"kind\": kind, \"open\": 0, \"claimed\": 0, \"closed\": 0 };\n    }\n    let opened = rows[kind];\n    opened[\"open\"] = opened[\"open\"] + 1;\n    rows[kind] = opened;\n    states[key] = { \"kind\": kind, \"state\": \"open\" };\n  } else {\n    if (!(key in states)) { raise { code: \"E_INVARG\", message: \"act for unknown task\", value: key }; }\n    let st = states[key];\n    let lk = st[\"kind\"];\n    let lane = rows[lk];\n    if (ty == \"tasks.claimed\") {\n      if (st[\"state\"] == \"open\") {\n        lane[\"open\"] = lane[\"open\"] - 1;\n        lane[\"claimed\"] = lane[\"claimed\"] + 1;\n        st[\"state\"] = \"claimed\";\n      }\n    } else if (ty == \"tasks.released\") {\n      if (st[\"state\"] == \"claimed\") {\n        lane[\"claimed\"] = lane[\"claimed\"] - 1;\n        lane[\"open\"] = lane[\"open\"] + 1;\n        st[\"state\"] = \"open\";\n      }\n    } else if (ty == \"tasks.closed\") {\n      /* Close from whichever live state the task held; a repeat close is\n         a no-op on the counts, so double emission cannot skew lanes. */\n      if (st[\"state\"] == \"open\") {\n        lane[\"open\"] = lane[\"open\"] - 1;\n        lane[\"closed\"] = lane[\"closed\"] + 1;\n        st[\"state\"] = \"closed\";\n      } else if (st[\"state\"] == \"claimed\") {\n        lane[\"claimed\"] = lane[\"claimed\"] - 1;\n        lane[\"closed\"] = lane[\"closed\"] + 1;\n        st[\"state\"] = \"closed\";\n      }\n    }\n    rows[lk] = lane;\n    states[key] = st;\n  }\n  this.rows = rows;\n  this.task_states = states;\n  this.at_seq = act[\"seq\"];\n}",
+          "skip_presence_check": true
+        }
+      ]
+    },
+    {
       "local_name": "$case",
       "parent": "$room",
       "flags": {

@@ -243,3 +243,98 @@ describe("acts kernel proof: rebuild invariant (gate 1)", () => {
     expect(copyResult).toEqual(liveResult);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Part 3 — the second surface (§8.2 tier B3): the $kind_lanes projection folds
+// the same recorded tasks.* acts into per-kind lane counts, attached alongside
+// the board with zero edits to domain verbs, existing folds, or schemas.
+// ---------------------------------------------------------------------------
+
+async function lanesCase(id: string) {
+  // A proof case with the board (from :initialize) plus a $kind_lanes
+  // projection co-anchored in the case (same anchor cluster, §2.3).
+  const w = await proofCase();
+  w.world.createObject({ id, name: "lanes", parent: "$kind_lanes", owner: w.actor, location: "proof_case" });
+  w.world.setProp("proof_case", "projections", [w.board, id]);
+  return w;
+}
+
+async function lanesView(w: SeqWorld, id: string) {
+  const r = await w.world.directCall(`klv-${Math.random()}`, w.actor, id, "view", [{}], { sessionId: w.session.id });
+  expect(r.op).toBe("result");
+  return (r as unknown as { op: "result"; result: { page: Array<Record<string, unknown>>; at_seq: number } }).result;
+}
+
+describe("acts kernel proof: second surface — kind lanes (tier B3)", () => {
+  it("folds per-kind lane counts live, alongside the board", async () => {
+    const w = await lanesCase("proof_lanes");
+
+    // Two tasks of one kind, one of another.
+    const a1 = await seqCall(w, "open_task", ["alpha one", "", "kind:a", [], []], "kl-a1");
+    expect(a1.op).toBe("applied");
+    const t1 = (a1 as { op: "applied"; result: unknown }).result as string;
+    expect((await seqCall(w, "open_task", ["alpha two", "", "kind:a", [], []], "kl-a2")).op).toBe("applied");
+    expect((await seqCall(w, "open_task", ["beta one", "", "kind:b", [], []], "kl-b1")).op).toBe("applied");
+
+    let v = await lanesView(w, "proof_lanes");
+    expect(v.page).toEqual([
+      { kind: "kind:a", open: 2, claimed: 0, closed: 0 },
+      { kind: "kind:b", open: 1, claimed: 0, closed: 0 }
+    ]);
+    expect(typeof v.at_seq).toBe("number");
+
+    // Claim one: it leaves the open lane for the claimed lane.
+    expect((await seqCall(w, "claim", [t1], "kl-claim")).op).toBe("applied");
+    v = await lanesView(w, "proof_lanes");
+    expect(v.page[0]).toEqual({ kind: "kind:a", open: 1, claimed: 1, closed: 0 });
+
+    // Close the held one: claimed lane drains into closed.
+    expect((await seqCall(w, "close_task", [t1, "done"], "kl-close")).op).toBe("applied");
+    v = await lanesView(w, "proof_lanes");
+    expect(v.page).toEqual([
+      { kind: "kind:a", open: 1, claimed: 0, closed: 1 },
+      { kind: "kind:b", open: 1, claimed: 0, closed: 0 }
+    ]);
+
+    // The board folded the same acts, untouched (zero edits to existing folds).
+    const bv = await boardView(w);
+    expect(bv.page).toHaveLength(3);
+    expect(bv.at_seq).toBe(v.at_seq);
+  });
+
+  it("rebuild_from recorded acts equals the live lanes view (gate 1)", async () => {
+    const w = await lanesCase("proof_lanes");
+
+    // Lifecycle exercising every consumed transition, including release
+    // (claimed back to open) and close-from-open.
+    const a1 = await seqCall(w, "open_task", ["alpha one", "", "kind:a", [], []], "kr-a1");
+    const t1 = (a1 as { op: "applied"; result: unknown }).result as string;
+    const b1 = await seqCall(w, "open_task", ["beta one", "", "kind:b", [], []], "kr-b1");
+    const t2 = (b1 as { op: "applied"; result: unknown }).result as string;
+    await seqCall(w, "claim", [t1], "kr-claim1");
+    await seqCall(w, "release", [t1], "kr-rel1");
+    await seqCall(w, "claim", [t2], "kr-claim2");
+    await seqCall(w, "close_task", [t2, "done"], "kr-close2");
+    await seqCall(w, "close_task", [t1, "wontfix"], "kr-close1");
+
+    // A fresh projection, seeded empty, folded from the recorded log only.
+    w.world.createObject({ id: "proof_lanes2", name: "lanes2", parent: "$kind_lanes", owner: w.actor, location: "proof_case" });
+    const rebuilt = await w.world.directCall("kl-rebuild", w.actor, "proof_lanes2", "rebuild_from", ["proof_case", 1], { sessionId: w.session.id });
+    expect(rebuilt.op).toBe("result");
+
+    const live = await lanesView(w, "proof_lanes");
+    const copy = await lanesView(w, "proof_lanes2");
+    expect(copy).toEqual(live);
+    // Sanity: the shared view is the fully drained lifecycle, not empty.
+    expect(live.page).toEqual([
+      { kind: "kind:a", open: 0, claimed: 0, closed: 1 },
+      { kind: "kind:b", open: 0, claimed: 0, closed: 1 }
+    ]);
+    // The rebuild invariant quantifies over ALL fold-written projection
+    // state, not just the viewed rows: the auxiliary task_states index
+    // must reproduce too (this is the auxiliary-state contract question
+    // the trial surfaced, answered affirmatively).
+    expect(w.world.getProp("proof_lanes2", "task_states")).toEqual(w.world.getProp("proof_lanes", "task_states"));
+    expect(w.world.getProp("proof_lanes2", "rows")).toEqual(w.world.getProp("proof_lanes", "rows"));
+  });
+});
