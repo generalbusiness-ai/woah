@@ -342,7 +342,11 @@ decisions, recorded:
   comment; rate-limit test pins Date.now so bucket exhaustion is exact
   under CPU contention).
 
-Post-rebase gates (the curated corpus is smaller on main since the
-classic test deletion): npm test 681/681 (71 files, includes the audit
-e2e + AU10.3 join gates), test:worker 234/234, smoke:net-dev 25/25,
-typecheck clean, build:net-only clean.
+Post-integration gates after merging `drain-occupancy` and resolving the
+shared outbox path: npm test 688/688 (71 files, includes the audit e2e +
+AU10.3 join gates), test:worker 240/240, test:full 1545/1545 (123 files),
+smoke:net-dev 25/25, typecheck clean, build:net-only clean, and
+cf:migrations:check clean. The merge also pins two final-review failures:
+durable audit-adoption row ids survive outbox hydration/write-back, and a
+drain that yields for an active submit defers its due-now wake until the
+last submit completes (no alarm/yield/re-arm loop).
