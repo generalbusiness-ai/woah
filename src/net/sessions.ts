@@ -36,6 +36,7 @@
  * against identity cells is the Phase-4 transport story.
  */
 import type { SerializedSession } from "../core/repository";
+import { GUEST_CUSTOMER_ID, PROP_CUSTOMER_OF } from "./attribution";
 import { CellStore, cellKey, cellVersion, type Cell, type EpochStamp } from "./cells";
 import type { CommitSubmit, ScopeHead } from "./scope";
 import { applyTranscript, type EffectTranscript, type TranscriptWrite } from "./transcript";
@@ -115,6 +116,17 @@ export type MintSessionInput = {
    * the cluster sequencer refuses `actor_occupied` when another live
    * session binds the actor (two humans must never share one guest). */
   exclusive?: boolean;
+  /** AU3.1 rule 4 backfill for aged worlds: a pool actor seeded BEFORE
+   * the audit lane existed has no `customer_of` cell (fresh installs
+   * stamp the pool via materializeCustomerAttributions; the live
+   * cutover world predates that). When the identity door claims such a
+   * seat, this rides the SAME mint commit so the actor never serves a
+   * turn unattributed — the exact guarantee the elastic mint makes in
+   * provisionGuestSubmit. Callers set it only on exclusive (pool)
+   * claims whose warmed view shows no valid attribution; other actors
+   * missing `customer_of` are identity-pipeline gaps that must stay
+   * visible, never papered over with the guest customer. */
+  stampGuestCustomerOf?: boolean;
   /** Session CLOSE (reviewer finding 12 — logout must release the guest
    * seat, not just drop the local bearer): rewrites the cell with a
    * ~250ms expiry and a presence transition to null so the room's roster
@@ -209,6 +221,23 @@ export function mintSessionSubmit(input: MintSessionInput): MintSessionResult {
     ...(input.closing ? { sessionClose: true } : {}),
     reads: [],
     writes: [
+      // Aged-world pool backfill (see MintSessionInput.stampGuestCustomerOf):
+      // same write shape as provisionGuestSubmit's AU3.1 rule-4 stamp, in
+      // the same commit as the claim.
+      ...(input.stampGuestCustomerOf && !input.closing
+        ? [
+            {
+              cell: { kind: "prop", object: input.actor, name: PROP_CUSTOMER_OF },
+              value: {
+                customer: GUEST_CUSTOMER_ID,
+                derived_via: "guest",
+                bound_at: input.now
+              } as TranscriptWrite["value"],
+              op: "set",
+              writer: sessionWriter(input.actor, "session_mint")
+            } as TranscriptWrite
+          ]
+        : []),
       {
         cell: { kind: "session", object: input.session },
         value: value as unknown as TranscriptWrite["value"],

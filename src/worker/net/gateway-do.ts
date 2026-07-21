@@ -1894,6 +1894,20 @@ export class NetGatewayDO {
     this.assertTurnEpoch(liveHead, request.catalog_epoch, clusterScope, []);
     let base = liveHead.head;
     const actorLineage = view.get(cellKey("object_lineage", request.actor))?.value as { name?: unknown } | undefined;
+    // AU3.1 rule-4 backfill: an EXCLUSIVE mint is definitionally an
+    // identity-door pool claim, and a pool actor with no valid
+    // customer_of predates the audit lane (the live cutover world's
+    // seats; fresh installs stamp the pool at install time). The claim's
+    // caller warmed the cluster with objects:[actor], so an absent cell
+    // here is durably absent — stamp the guest attribution in the mint
+    // commit rather than serving unattributed turns (the
+    // net_turn_unattributed 29% finding, 2026-07-21). Non-exclusive
+    // mints never backfill: a $human/agent missing customer_of is a
+    // pipeline gap that must stay visible.
+    const stampGuestCustomerOf =
+      request.exclusive === true &&
+      !request.closing &&
+      normalizeCustomerAttribution(view.get(customerOfCellKey(request.actor))?.value) === null;
     const { submit, value } = mintSessionSubmit({
       session: request.session,
       actor: request.actor,
@@ -1905,6 +1919,7 @@ export class NetGatewayDO {
       clusterScope,
       ...(request.active_scope !== undefined ? { activeScope: request.active_scope } : {}),
       ...(request.exclusive ? { exclusive: true } : {}),
+      ...(stampGuestCustomerOf ? { stampGuestCustomerOf: true } : {}),
       ...(request.closing ? { closing: request.closing } : {})
     });
     // A placed mint carries a presence transition whose room usually

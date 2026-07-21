@@ -13,7 +13,7 @@ import { describe, expect, it } from "vitest";
 import { installVerb } from "../../src/core/authoring";
 import { createWorld } from "../../src/core/bootstrap";
 import { cellsFromSerialized, storeCells, type ShadowTurnCall } from "../../src/net/bridge";
-import { CellStore, cellVersion } from "../../src/net/cells";
+import { CellStore, cellKey, cellVersion } from "../../src/net/cells";
 import { planTurn } from "../../src/net/plan";
 import { relationKey } from "../../src/net/relations";
 import type { ScopeClassifier } from "../../src/net/route";
@@ -150,6 +150,56 @@ describe("mintSessionSubmit → accepted at the cluster scope (CO14)", () => {
     // per B2), no double commit.
     expect(seq.submit(submit)).toEqual({ ...reply, replayed: true });
     expect(seq.head().seq).toBe(1);
+  });
+
+  it("stampGuestCustomerOf rides the exclusive mint commit with the AU3.1 rule-4 shape (aged-world pool backfill)", () => {
+    // The exclusive mint requires the occupancy witness (an empty pool
+    // seat: no live sessions bind the actor).
+    const seq: ScopeSequencer = new ScopeSequencer("cluster:#actor", EPOCH, {
+      authorize: (submit) =>
+        authorizeSessionSubmit(submit, {
+          ownsSession: (id) => seq.store.has(sessionCellKey(id)),
+          readSession: (id) => seq.store.get(sessionCellKey(id)),
+          now: () => NOW,
+          sessionsForActor: () => []
+        })
+    });
+    const { submit } = mintSessionSubmit({
+      session: "s-pool",
+      actor: "#actor",
+      ttl_ms: 60_000,
+      now: NOW,
+      base: seq.head(),
+      epoch: EPOCH,
+      clusterScope: "cluster:#actor",
+      exclusive: true,
+      stampGuestCustomerOf: true
+    });
+    const reply = seq.submit(submit);
+    expect(reply.status, JSON.stringify(reply)).toBe("accepted");
+    // Same commit, same shape as provisionGuestSubmit's stamp: the actor
+    // never serves a turn unattributed, and the value passes the runtime
+    // read guard.
+    const cell = seq.store.get(cellKey("property_cell", "#actor", "customer_of"));
+    expect(cell?.provenance).toBe("authoritative");
+    // The store holds the canonical property-cell payload ({value: …}) —
+    // exactly the shape the runtime read guard unwraps.
+    expect(cell?.value).toMatchObject({ value: { customer: expect.any(String), derived_via: "guest", bound_at: NOW } });
+
+    // Without the flag no attribution write rides: a missing customer_of
+    // on a non-pool actor must stay a VISIBLE pipeline gap.
+    const seq2 = sessionSequencer("cluster:#other");
+    const plain = mintSessionSubmit({
+      session: "s-plain",
+      actor: "#other",
+      ttl_ms: 60_000,
+      now: NOW,
+      base: seq2.head(),
+      epoch: EPOCH,
+      clusterScope: "cluster:#other"
+    });
+    expect(seq2.submit(plain.submit).status).toBe("accepted");
+    expect(seq2.store.get(cellKey("property_cell", "#other", "customer_of"))).toBeUndefined();
   });
 
   it("refuses a mint whose written value binds another actor", () => {
