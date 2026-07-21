@@ -251,26 +251,27 @@ else
   fi
 fi
 
-# Local workerd smoke (item 1). Runs the SAME cross-actor scenario as the
-# deployed smoke below, but against `wrangler dev` (real workerd, real per-DO
-# storage, real cross-DO RPC and host-seed merge) — a far higher-fidelity
-# pre-deploy gate than the in-process fake (`smoke:cf-local`, run by `npm test`
-# above). It is NOT a full prod replica: workerd-local runs every DO in one
-# process with fast reliable RPC, so cross-colo-latency / cold-owner-timeout
-# authority gaps remain a deploy-only signal. Gate it independently so a flaky
-# local workerd never blocks an emergency redeploy.
+# Local workerd smoke (item 1). Cross-actor net scenario against `wrangler
+# dev` (real workerd, real per-DO storage, real cross-DO RPC) — a far
+# higher-fidelity pre-deploy gate than the in-process fake run by `npm test`
+# above. (The classic `smoke:cf-dev` lane retired with the v2 stack; the net
+# workerd lane is the same fidelity rung on the net path.) It is NOT a full
+# prod replica: workerd-local runs every DO in one process with fast reliable
+# RPC, so cross-colo-latency / cold-owner-timeout authority gaps remain a
+# deploy-only signal. Gate it independently so a flaky local workerd never
+# blocks an emergency redeploy.
 if [[ "${WOO_DEPLOY_CF_DEV:-1}" == "0" || $SKIP_TESTS -eq 1 ]]; then
-  warn "skipping local workerd smoke (smoke:cf-dev)"
+  warn "skipping local workerd smoke (smoke:net-dev)"
 else
-  cf_dev_log=$(mktemp -t woo-deploy-cf-dev.XXXXXX.log)
-  if npm run smoke:cf-dev >"$cf_dev_log" 2>&1; then
-    cf_dev_summary=$(grep -a -oE 'summary\[[a-z0-9]+\]: [0-9]+/[0-9]+ steps passed' "$cf_dev_log" | head -1 || true)
-    rm -f "$cf_dev_log"
-    ok "workerd smoke: ${cf_dev_summary:-npm run smoke:cf-dev}"
+  net_dev_log=$(mktemp -t woo-deploy-net-dev.XXXXXX.log)
+  if npm run smoke:net-dev >"$net_dev_log" 2>&1; then
+    net_dev_summary=$(grep -a -oE 'summary\[[a-z0-9-]+\]: [0-9]+/[0-9]+ steps passed' "$net_dev_log" | head -1 || true)
+    rm -f "$net_dev_log"
+    ok "workerd smoke: ${net_dev_summary:-npm run smoke:net-dev}"
   else
-    grep -aE '^(  ok|  FAIL|summary\[|smoke-cf-dev)' "$cf_dev_log" | tail -20 || tail -20 "$cf_dev_log"
-    rm -f "$cf_dev_log"
-    fail "local workerd smoke failed — run: npm run smoke:cf-dev"
+    grep -aE '^(  ok|  FAIL|summary\[)' "$net_dev_log" | tail -20 || tail -20 "$net_dev_log"
+    rm -f "$net_dev_log"
+    fail "local workerd smoke failed — run: npm run smoke:net-dev"
   fi
 fi
 
