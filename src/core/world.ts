@@ -2214,6 +2214,34 @@ export class WooWorld {
     this.persist();
   }
 
+  /** The declared shape for one event type, resolved the way verb dispatch
+   * resolves names (spec/semantics/introspection.md `event_schema`): the
+   * object's parent chain first, then — for feature carriers — each feature's
+   * parent chain in declared order. Returns a defensive copy so callers
+   * cannot mutate the installed schema; null when no chain declares the type. */
+  eventSchemaFor(objRef: ObjRef, type: string): Record<string, WooValue> | null {
+    const fromChain = (startRef: ObjRef): Record<string, WooValue> | null => {
+      let current: ObjRef | null = startRef;
+      while (current) {
+        const obj = this.parentWalkLookup(startRef, current);
+        if (!obj) break;
+        const shape = obj.eventSchemas.get(type);
+        if (shape !== undefined) return cloneValue(shape as WooValue) as Record<string, WooValue>;
+        current = obj.parent;
+      }
+      return null;
+    };
+    const own = fromChain(objRef);
+    if (own !== null) return own;
+    if (this.canCarryFeatures(objRef)) {
+      for (const feature of this.featureList(objRef)) {
+        const fromFeature = fromChain(feature);
+        if (fromFeature !== null) return fromFeature;
+      }
+    }
+    return null;
+  }
+
   resolveVerb(objRef: ObjRef, name: string): ResolvedVerb {
     // Dispatching to a recycled/tombstoned target must raise E_OBJNF, not
     // fall through to E_VERBNF. The parent-chain walk inside
@@ -10855,6 +10883,10 @@ export class WooWorld {
       const limit = Number(args[1] ?? 100);
       return this.replay(ctx.thisObj, from, limit).map((entry) => ({
         seq: entry.seq,
+        // The entry's committed wall-clock time was always persisted
+        // (SpaceLogEntry.ts) but omitted here; acts-kernel projections
+        // resolve row timestamps from it at view time, so expose it.
+        ts: entry.ts,
         message: entry.message as unknown as WooValue,
         observations: entry.observations as unknown as WooValue,
         applied_ok: entry.applied_ok,

@@ -233,6 +233,12 @@ caller-controlled work; non-wizard frames cannot use it to escalate.
 `subscribe(self, source, type)`, `unsubscribe`,  
 `event_schema(obj, type)`, `declare_event(obj, type, schema)`.
 
+`event_schema(obj, type)` is implemented: it returns a defensive copy of the
+declared shape for `type`, resolved with verb-dispatch precedence — `obj`'s
+parent chain first, then (for feature carriers) each feature's parent chain in
+declared list order — or `null` when no chain declares the type. The acts
+kernel validates act payloads against it. `declare_event` remains unimplemented.
+
 `observe_to_space(space, event)` records `event` on the current invocation route
 but routes live delivery to the session audience of `space`. It is for ordinary
 object behavior such as a mounted pinboard or control surface emitting visible

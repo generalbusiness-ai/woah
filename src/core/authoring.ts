@@ -876,6 +876,7 @@ const VALID_OPS = new Set([
 ]);
 
 const VALID_BUILTINS = new Set([
+  "event_schema",
   "length",
   "keys",
   "values",

@@ -199,7 +199,11 @@ export const BUILTIN_NAMES = [
   // Bounded ordering slot query (P2.4): the O(1) {count, index, before,
   // after, child_index} answer a MUTATION reads instead of the parent's full
   // ordered_children list. Appended last to keep every bytecode index stable.
-  "ordered_neighbors"
+  "ordered_neighbors",
+  // Declared event-schema lookup (spec/semantics/introspection.md): the shape
+  // for one event type via class-then-features precedence, or null. The acts
+  // kernel validates act payloads against it. Appended last; keeps indices.
+  "event_schema"
 ];
 
 export async function runTinyVm(ctx: CallContext, bytecode: TinyBytecode, args: WooValue[]): Promise<WooValue> {
@@ -1105,6 +1109,10 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
       case "isa": {
         if (builtinArgs.length !== 2) throw wooError("E_INVARG", "isa expects object and ancestor");
         return frame.ctx.world.isDescendantOfChecked(assertObj(builtinArgs[0]), assertObj(builtinArgs[1]), frame.ctx.hostMemo);
+      }
+      case "event_schema": {
+        if (builtinArgs.length !== 2) throw wooError("E_INVARG", "event_schema expects object and type");
+        return frame.ctx.world.eventSchemaFor(assertObj(builtinArgs[0]), assertString(builtinArgs[1] ?? "")) as unknown as WooValue;
       }
       case "is_recycled": {
         if (builtinArgs.length !== 1) throw wooError("E_INVARG", "is_recycled expects one object");
