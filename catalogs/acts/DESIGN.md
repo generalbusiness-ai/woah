@@ -19,10 +19,13 @@ lease). Rows store seqs, not timestamps; times resolve from the log.
 
 | Class | Parent | Role |
 |---|---|---|
-| `$acts` (feature) | `$thing` | Internal emission primitive `:act(type, payload)` + `_validate_payload`. Mounted per case instance by `:initialize` ($space instances own-seed an empty `features` list; the class-level attach in the seed hook exists for the installer's static this-call resolution). |
-| `$projection` | `$thing` | `consumes` + `:fold` + `rows` + `:view`/`:view_row` + `:rebuild_from`. `rows`/`consumes`/`row_cap`/`at_seq` are perms-empty: only catalog-author verbs write them. |
-| `$task_board` | `$projection` | The Tasks proof projection: coordination state only. |
-| `$case` | `$room` | Domain verbs (open/claim/release/pass_obligation/close_task) that validate, apply physical effects, and emit acts in one turn; `:board` delegates to the projection view; `:journal` is a paged log read (the log IS the journal — no materialized copy). |
+| `$acts` (feature) | `$thing` | Internal emission primitive `:act(type, payload)` + `_validate_payload`. Mounted per consumer instance ($space instances own-seed an empty `features` list; a consumer-catalog class-level attach satisfies the installer's static this-call resolution). |
+| `$projection` | `$thing` | `consumes` + `:fold` + `rows` + `:view`/`:view_row` + incremental idempotent `:rebuild_from`. `rows`/`consumes`/`row_cap`/`at_seq`/`rebuild_scan_seq` are perms-empty: only catalog-author verbs write them. |
+
+Domain classes, schemas, and concrete projections live in consuming
+catalogs — the proof set (`$case`, `$task_board`, `$kind_lanes`, the
+`tasks.*` schemas) is in `catalogs/casework/`, retired when the real
+tasks migration lands.
 
 ## Emission contract (enforced, tested)
 
