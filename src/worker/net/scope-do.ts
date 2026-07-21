@@ -483,6 +483,13 @@ export class NetScopeDO {
     private readonly state: NetScopeDurableState,
     private readonly env: NetScopeEnv
   ) {
+    // Wake visibility (2026-07-20 bake finding): hot-authority stall
+    // episodes were undecidable because net DOs stamped no durations —
+    // a mid-run eviction+rehydration is invisible without this. The
+    // constructor stamp plus net_scope_hydrated (ensureSequencer) let AE
+    // correlate stall windows with restarts.
+    const constructedAt = Date.now();
+    this.constructedAt = constructedAt;
     this.store = new SqliteScopeStore(state.storage);
     // Shell-level tables (not ScopeStore row families — they are the DO's
     // delivery bookkeeping, not sequencer state): fanout subscribers, the
@@ -623,7 +630,14 @@ export class NetScopeDO {
       alarmStorage: state.storage,
       metric: (event) => this.metric(event)
     });
+    // Constructor cost is dominated by the DDL probes above; ms > a few
+    // dozen here on a wake means storage-layer pressure, not app logic.
+    this.metric({ kind: "do_constructor", class: "NetScopeDO", ms: Date.now() - constructedAt });
   }
+
+  /** Wake timestamp — net_scope_hydrated reports its distance from first
+   * hydration so eviction churn (wake→hydrate gaps) is measurable. */
+  private readonly constructedAt: number;
 
   /** Scope ids are named from the authority scope. Keeping that name as the
    * AE index isolates adaptive sampling and makes hot authorities visible. */
@@ -1450,6 +1464,11 @@ export class NetScopeDO {
       }
       return this.seq;
     }
+    // Time the full rebuild (meta read + sequencer construction): a slow
+    // hydration on a heavy scope is the prime suspect for the episodic
+    // multi-second submit stalls the 2026-07-20 bake measured, and this
+    // event is the only way AE can tell "rehydrated mid-run" from "warm".
+    const hydrateStarted = Date.now();
     const meta = this.store.readMeta();
     const resolvedScope = meta?.scope ?? scope;
     const resolvedEpoch = meta?.catalog_epoch ?? catalogEpoch;
@@ -1518,6 +1537,15 @@ export class NetScopeDO {
         resolvedScope === CATALOG_SCOPE || this.catalogRiderObjects.has(object)
     });
     this.seq = seq;
+    this.metric({
+      kind: "net_scope_hydrated",
+      scope: resolvedScope,
+      ms: Date.now() - hydrateStarted,
+      // Wake→hydrate distance: ~0 means the first request after a wake
+      // paid the hydration (eviction churn); large means a warm instance
+      // discarded its sequencer (transaction abort discard path).
+      since_construct_ms: hydrateStarted - this.constructedAt
+    });
     return this.seq;
   }
 
@@ -1546,6 +1574,10 @@ export class NetScopeDO {
     objects: string[] = [],
     withRelations = false
   ): CellTransfer & { scope: string; head: ScopeHead; catalog_epoch: string; relations?: RelationRow[] } {
+    // Serving a large closure is synchronous cell reading on the
+    // authority's thread — a stall candidate the bake finding needs
+    // attributable (see net_scope_hydrated).
+    const closureStarted = Date.now();
     const seq = this.ensureSequencer();
     const store = seq.store;
     const wantAll = keys.length === 1 && keys[0] === "*";
@@ -1668,7 +1700,8 @@ export class NetScopeDO {
       scope: seq.scope,
       mode: wantAll ? "full" : objects.length > 0 ? "objects" : "keys",
       cells: transfer.cells.length,
-      relations: relations?.length ?? 0
+      relations: relations?.length ?? 0,
+      ms: Date.now() - closureStarted
     });
     return {
       ...transfer,
@@ -2058,6 +2091,11 @@ export class NetScopeDO {
     let deliveredCount = 0;
     const dueAt = this.host.now();
     for (const route of OUTBOX_ROUTES) {
+        // Pass duration includes delivery RPC awaits; what it bounds is
+        // how long this route's pass occupied the DO between fresh
+        // requests — the drain-vs-submit contention axis of the
+        // 2026-07-20 stall finding.
+        const passStarted = Date.now();
         // Actionable lanes: the directory row exists and the lane HEAD
         // (first pending row in (scope, seq) order — one indexed probe)
         // is due. A lane whose head is mid-backoff is skipped whole: by
@@ -2269,7 +2307,8 @@ export class NetScopeDO {
           delivered: drained.delivered.length,
           failed: drained.failed.length,
           abandoned: drained.abandoned.length,
-          skipped_backoff: drained.skipped_backoff.length
+          skipped_backoff: drained.skipped_backoff.length,
+          ms: Date.now() - passStarted
         });
     }
     return deliveredCount;

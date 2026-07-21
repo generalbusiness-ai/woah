@@ -144,10 +144,17 @@ function laneRows(state: NetScopeDurableState): Array<{ route: string; destinati
 
 /** Parse the pass metrics a drain emitted (Phase-0 observability for the
  * bounded-pass invariant). */
-function drainPassMetrics(lines: string[]): Array<{ considered: number; delivered: number }> {
+function drainPassMetrics(lines: string[]): Array<{ considered: number; delivered: number; ms: number }> {
   return lines
     .filter((line) => line.includes("net_scope_outbox_drain_pass"))
-    .map((line) => JSON.parse(line.slice(line.indexOf("{"))) as { considered: number; delivered: number });
+    .map((line) => JSON.parse(line.slice(line.indexOf("{"))) as { considered: number; delivered: number; ms: number });
+}
+
+/** All emitted metric events of one kind, parsed off the console mirror. */
+function metricsOfKind(lines: string[], kind: string): Array<Record<string, unknown>> {
+  return lines
+    .filter((line) => line.startsWith("woo.metric") && line.includes(`"kind":"${kind}"`))
+    .map((line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>);
 }
 
 function tick(id: string, atMs: number): ScheduledTurn {
@@ -193,6 +200,47 @@ describe("Phase 3 — bounded outbox drain", () => {
     for (const pass of passes) expect(pass.considered).toBeLessThanOrEqual(4);
     // The emptied lane left no directory residue.
     expect(laneRows(scope.state)).toEqual([]);
+  });
+
+  it("stamps wake, hydration, and drain-pass durations (2026-07-20 hot-room stall attribution)", async () => {
+    const metricLines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+      metricLines.push(args.map(String).join(" "));
+    });
+    const healthy = okStub();
+    const scope = netState("bounded-durations");
+    const env: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: () => healthy.stub };
+    const scopeDO = new NetScopeDO(scope.state, env);
+
+    // The wake stamp comes from the constructor itself — a mid-run
+    // eviction shows up as a fresh do_constructor next to the stall.
+    const wakes = metricsOfKind(metricLines, "do_constructor");
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]!.class).toBe("NetScopeDO");
+    expect(typeof wakes[0]!.ms).toBe("number");
+
+    // Seeding builds the sequencer: exactly one hydration event per DO
+    // lifetime, carrying its cost and its distance from the wake.
+    await call(scopeDO, env, "/seed", { scope: SCOPE, catalog_epoch: EPOCH, cells: [], relations: [] });
+    const hydrations = metricsOfKind(metricLines, "net_scope_hydrated");
+    expect(hydrations).toHaveLength(1);
+    expect(hydrations[0]!.scope).toBe(SCOPE);
+    expect(typeof hydrations[0]!.ms).toBe("number");
+    expect(typeof hydrations[0]!.since_construct_ms).toBe("number");
+
+    // A drain pass reports how long it occupied the authority.
+    insertRow(scope.state, "gateway:mirror", 1);
+    await kick(scopeDO, env);
+    await scope.settle();
+    const passes = drainPassMetrics(metricLines);
+    expect(passes.length).toBeGreaterThanOrEqual(1);
+    for (const pass of passes) {
+      expect(typeof pass.ms).toBe("number");
+      expect(pass.ms).toBeGreaterThanOrEqual(0);
+    }
+    // Hydration stays once-per-lifetime: the drain did not rebuild it.
+    expect(metricsOfKind(metricLines, "net_scope_hydrated")).toHaveLength(1);
+    scope.close();
   });
 
   it("one drain invocation is budgeted: a catch-up backlog yields to the alarm continuation instead of consuming the invocation (review #2)", async () => {

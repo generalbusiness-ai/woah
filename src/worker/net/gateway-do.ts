@@ -657,6 +657,10 @@ export class NetGatewayDO {
     private readonly state: NetGatewayDurableState,
     private readonly env: NetGatewayEnv
   ) {
+    // Wake visibility (2026-07-20 bake finding): stamp construction like
+    // the scope DO so shard restarts are correlatable with latency
+    // episodes in AE (net DOs previously emitted no wake signal at all).
+    const constructedAt = Date.now();
     // CREATE IF NOT EXISTS on every construction — same idiom as
     // SqliteScopeStore: cheap, idempotent, no separate first-boot path.
     // Phase 5 durable-format stamp (mirrors net_scope_meta's row): the
@@ -739,6 +743,7 @@ export class NetGatewayDO {
       alarmStorage: state.storage,
       metric: (event) => this.metric(event)
     });
+    this.metric({ kind: "do_constructor", class: "NetGatewayDO", ms: Date.now() - constructedAt });
   }
 
   /** Stable per-shard AE index. Named DO ids expose their name in workerd

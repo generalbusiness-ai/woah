@@ -203,6 +203,41 @@ describe("metrics-sink", () => {
       expect(calls[3]!.doubles?.[DBL_PRESENCE_SCAN_ROWS]).toBe(12);
     });
 
+    it("packs the net wake/stall attribution events (2026-07-20 bake finding) into the ms slot", () => {
+      // These four are the authority-side duration series the hot-room
+      // stall diagnosis needs: DO wake, sequencer hydration, closure
+      // serving, and drain-pass occupancy. All ride the generic ms slot
+      // (double1) with class/scope for drill-in — no schema change.
+      const { binding, calls } = fakeAnalytics();
+      writeMetricToAnalytics({ kind: "do_constructor", class: "NetScopeDO", ms: 17 }, "net-scope:room:x", binding);
+      writeMetricToAnalytics({ kind: "do_constructor", class: "NetGatewayDO", ms: 3 }, "net-gateway:net-api-0", binding);
+      writeMetricToAnalytics(
+        { kind: "net_scope_hydrated", scope: "room:x", ms: 240, since_construct_ms: 2 },
+        "net-scope:room:x",
+        binding
+      );
+      writeMetricToAnalytics(
+        { kind: "net_scope_closure_served", scope: "room:x", mode: "objects", cells: 900, relations: 4, ms: 31 },
+        "net-scope:room:x",
+        binding
+      );
+      writeMetricToAnalytics(
+        { kind: "net_scope_outbox_drain_pass", delivered: 5, failed: 0, abandoned: 0, ms: 44 },
+        "net-scope:room:x",
+        binding
+      );
+
+      expect(calls[0]!.blobs?.[SLOT_CLASS]).toBe("NetScopeDO");
+      expect(calls[0]!.doubles?.[DBL_MS]).toBe(17);
+      expect(calls[1]!.blobs?.[SLOT_CLASS]).toBe("NetGatewayDO");
+      expect(calls[1]!.doubles?.[DBL_MS]).toBe(3);
+      expect(calls[2]!.blobs?.[SLOT_SCOPE]).toBe("room:x");
+      expect(calls[2]!.doubles?.[DBL_MS]).toBe(240);
+      expect(calls[3]!.doubles?.[DBL_MS]).toBe(31);
+      expect(calls[4]!.doubles?.[DBL_MS]).toBe(44);
+      expect(calls[4]!.doubles?.[DBL_DELIVERED]).toBe(5);
+    });
+
     it("populates target+verb for direct_call so dashboard drill-in works", () => {
       const { binding, calls } = fakeAnalytics();
       const event: MetricEvent = {

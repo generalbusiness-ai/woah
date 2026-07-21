@@ -675,6 +675,20 @@ The canonical v2 event union is `MetricEvent` in `src/core/types.ts`; net
 metrics remain structurally typed beside the frozen stack. This table is the
 stable projection contract shared by both.
 
+Authority-side duration events (added after the 2026-07-20 bake measured
+episodic multi-second hot-room stalls that AE could not attribute): every
+net DO stamps `do_constructor` (`class` = `NetScopeDO` | `NetGatewayDO`,
+`ms` = construction cost) at wake, and the scope authority emits
+`net_scope_hydrated {scope, ms, since_construct_ms}` once per in-memory
+lifetime when its sequencer rebuilds from durable storage. `ms` also rides
+`net_scope_closure_served` (synchronous cell serving) and
+`net_scope_outbox_drain_pass` (per-pass occupancy, delivery RPC awaits
+included); `net_scope_submit.ms` is the authority-side service time. A
+latency episode is therefore attributable by joining the stall window
+against these series: a coincident `do_constructor`/`net_scope_hydrated`
+means eviction churn, a slow `closure_served`/`drain_pass` means serving
+occupancy, and none of them means the stall is upstream of the authority.
+
 `authority_slice_reconstructed` partitions the authority-slice cost that used to
 appear as opaque `/mcp` wall time. Its `reason` value is written to `blobs[15]`
 and MUST distinguish warm turn refresh, cold open, missing-state repair,
