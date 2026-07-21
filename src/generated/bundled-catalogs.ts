@@ -3,30 +3,31 @@
 // and any migration-vN-to-v(N+1).json files in the catalog directory.
 
 import type { CatalogManifest, CatalogMigrationManifest } from "../core/catalog-installer";
-import manifest0 from "../../catalogs/block/manifest.json";
-import manifest1 from "../../catalogs/blocks-demo/manifest.json";
-import manifest2 from "../../catalogs/chat/manifest.json";
-import manifest3 from "../../catalogs/core/manifest.json";
-import manifest4 from "../../catalogs/demoworld/manifest.json";
-import manifest5 from "../../catalogs/dispenser/manifest.json";
-import manifest6 from "../../catalogs/dubspace/manifest.json";
-import migration7 from "../../catalogs/dubspace/migration-v0-to-v1.json";
-import manifest8 from "../../catalogs/help/manifest.json";
-import manifest9 from "../../catalogs/horoscope/manifest.json";
-import manifest10 from "../../catalogs/note/manifest.json";
-import migration11 from "../../catalogs/note/migration-v0-to-v1.json";
-import migration12 from "../../catalogs/note/migration-v1-to-v2.json";
-import manifest13 from "../../catalogs/outliner/manifest.json";
-import migration14 from "../../catalogs/outliner/migration-v0-to-v1.json";
-import migration15 from "../../catalogs/outliner/migration-v1-to-v2.json";
-import manifest16 from "../../catalogs/perm/manifest.json";
-import manifest17 from "../../catalogs/pinboard/manifest.json";
-import migration18 from "../../catalogs/pinboard/migration-v0-to-v1.json";
-import manifest19 from "../../catalogs/prog/manifest.json";
-import manifest20 from "../../catalogs/tasks/manifest.json";
-import migration21 from "../../catalogs/tasks/migration-v0-to-v1.json";
-import manifest22 from "../../catalogs/weather/manifest.json";
-import migration23 from "../../catalogs/weather/migration-v0-to-v1.json";
+import manifest0 from "../../catalogs/acts/manifest.json";
+import manifest1 from "../../catalogs/block/manifest.json";
+import manifest2 from "../../catalogs/blocks-demo/manifest.json";
+import manifest3 from "../../catalogs/chat/manifest.json";
+import manifest4 from "../../catalogs/core/manifest.json";
+import manifest5 from "../../catalogs/demoworld/manifest.json";
+import manifest6 from "../../catalogs/dispenser/manifest.json";
+import manifest7 from "../../catalogs/dubspace/manifest.json";
+import migration8 from "../../catalogs/dubspace/migration-v0-to-v1.json";
+import manifest9 from "../../catalogs/help/manifest.json";
+import manifest10 from "../../catalogs/horoscope/manifest.json";
+import manifest11 from "../../catalogs/note/manifest.json";
+import migration12 from "../../catalogs/note/migration-v0-to-v1.json";
+import migration13 from "../../catalogs/note/migration-v1-to-v2.json";
+import manifest14 from "../../catalogs/outliner/manifest.json";
+import migration15 from "../../catalogs/outliner/migration-v0-to-v1.json";
+import migration16 from "../../catalogs/outliner/migration-v1-to-v2.json";
+import manifest17 from "../../catalogs/perm/manifest.json";
+import manifest18 from "../../catalogs/pinboard/manifest.json";
+import migration19 from "../../catalogs/pinboard/migration-v0-to-v1.json";
+import manifest20 from "../../catalogs/prog/manifest.json";
+import manifest21 from "../../catalogs/tasks/manifest.json";
+import migration22 from "../../catalogs/tasks/migration-v0-to-v1.json";
+import manifest23 from "../../catalogs/weather/manifest.json";
+import migration24 from "../../catalogs/weather/migration-v0-to-v1.json";
 
 export type BundledCatalogEntry = {
   readonly path: string;
@@ -35,20 +36,21 @@ export type BundledCatalogEntry = {
 };
 
 export const BUNDLED_CATALOGS: readonly BundledCatalogEntry[] = [
-  { path: "catalogs/block/manifest.json", manifest: manifest0 as unknown as CatalogManifest, migrations: [] },
-  { path: "catalogs/blocks-demo/manifest.json", manifest: manifest1 as unknown as CatalogManifest, migrations: [] },
-  { path: "catalogs/chat/manifest.json", manifest: manifest2 as unknown as CatalogManifest, migrations: [] },
-  { path: "catalogs/core/manifest.json", manifest: manifest3 as unknown as CatalogManifest, migrations: [] },
-  { path: "catalogs/demoworld/manifest.json", manifest: manifest4 as unknown as CatalogManifest, migrations: [] },
-  { path: "catalogs/dispenser/manifest.json", manifest: manifest5 as unknown as CatalogManifest, migrations: [] },
-  { path: "catalogs/dubspace/manifest.json", manifest: manifest6 as unknown as CatalogManifest, migrations: [migration7 as unknown as CatalogMigrationManifest] },
-  { path: "catalogs/help/manifest.json", manifest: manifest8 as unknown as CatalogManifest, migrations: [] },
-  { path: "catalogs/horoscope/manifest.json", manifest: manifest9 as unknown as CatalogManifest, migrations: [] },
-  { path: "catalogs/note/manifest.json", manifest: manifest10 as unknown as CatalogManifest, migrations: [migration11 as unknown as CatalogMigrationManifest, migration12 as unknown as CatalogMigrationManifest] },
-  { path: "catalogs/outliner/manifest.json", manifest: manifest13 as unknown as CatalogManifest, migrations: [migration14 as unknown as CatalogMigrationManifest, migration15 as unknown as CatalogMigrationManifest] },
-  { path: "catalogs/perm/manifest.json", manifest: manifest16 as unknown as CatalogManifest, migrations: [] },
-  { path: "catalogs/pinboard/manifest.json", manifest: manifest17 as unknown as CatalogManifest, migrations: [migration18 as unknown as CatalogMigrationManifest] },
-  { path: "catalogs/prog/manifest.json", manifest: manifest19 as unknown as CatalogManifest, migrations: [] },
-  { path: "catalogs/tasks/manifest.json", manifest: manifest20 as unknown as CatalogManifest, migrations: [migration21 as unknown as CatalogMigrationManifest] },
-  { path: "catalogs/weather/manifest.json", manifest: manifest22 as unknown as CatalogManifest, migrations: [migration23 as unknown as CatalogMigrationManifest] }
+  { path: "catalogs/acts/manifest.json", manifest: manifest0 as unknown as CatalogManifest, migrations: [] },
+  { path: "catalogs/block/manifest.json", manifest: manifest1 as unknown as CatalogManifest, migrations: [] },
+  { path: "catalogs/blocks-demo/manifest.json", manifest: manifest2 as unknown as CatalogManifest, migrations: [] },
+  { path: "catalogs/chat/manifest.json", manifest: manifest3 as unknown as CatalogManifest, migrations: [] },
+  { path: "catalogs/core/manifest.json", manifest: manifest4 as unknown as CatalogManifest, migrations: [] },
+  { path: "catalogs/demoworld/manifest.json", manifest: manifest5 as unknown as CatalogManifest, migrations: [] },
+  { path: "catalogs/dispenser/manifest.json", manifest: manifest6 as unknown as CatalogManifest, migrations: [] },
+  { path: "catalogs/dubspace/manifest.json", manifest: manifest7 as unknown as CatalogManifest, migrations: [migration8 as unknown as CatalogMigrationManifest] },
+  { path: "catalogs/help/manifest.json", manifest: manifest9 as unknown as CatalogManifest, migrations: [] },
+  { path: "catalogs/horoscope/manifest.json", manifest: manifest10 as unknown as CatalogManifest, migrations: [] },
+  { path: "catalogs/note/manifest.json", manifest: manifest11 as unknown as CatalogManifest, migrations: [migration12 as unknown as CatalogMigrationManifest, migration13 as unknown as CatalogMigrationManifest] },
+  { path: "catalogs/outliner/manifest.json", manifest: manifest14 as unknown as CatalogManifest, migrations: [migration15 as unknown as CatalogMigrationManifest, migration16 as unknown as CatalogMigrationManifest] },
+  { path: "catalogs/perm/manifest.json", manifest: manifest17 as unknown as CatalogManifest, migrations: [] },
+  { path: "catalogs/pinboard/manifest.json", manifest: manifest18 as unknown as CatalogManifest, migrations: [migration19 as unknown as CatalogMigrationManifest] },
+  { path: "catalogs/prog/manifest.json", manifest: manifest20 as unknown as CatalogManifest, migrations: [] },
+  { path: "catalogs/tasks/manifest.json", manifest: manifest21 as unknown as CatalogManifest, migrations: [migration22 as unknown as CatalogMigrationManifest] },
+  { path: "catalogs/weather/manifest.json", manifest: manifest23 as unknown as CatalogManifest, migrations: [migration24 as unknown as CatalogMigrationManifest] }
 ];

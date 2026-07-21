@@ -1,0 +1,361 @@
+{
+  "name": "acts",
+  "version": "0.1.0",
+  "spec_version": "v1",
+  "description": "Acts kernel proof (notes/2026-07-21-acts-projection-model.md): schema-validated acts on a room's sequenced log as the one authoritative record of coordination state, with every work surface derived as a projection fold. Ships the $acts emission feature, the $projection base class, the $case room, and the $task_board proof projection.",
+  "license": "MIT",
+  "depends": [
+    "@local:chat",
+    "@local:note"
+  ],
+  "features": [
+    {
+      "local_name": "$acts",
+      "parent": "$thing",
+      "description": "Stateless feature carrying the internal act-emission primitive. Mounted on a $case (or any $space subclass that adopts the kernel), its effective surface is <space>:act. Emission requires a sequenced turn on the consumer's own log and an internal caller; payloads validate against event_schema; attached projections fold in the same turn, fail-closed.",
+      "properties": [],
+      "verbs": [
+        {
+          "name": "can_be_attached_by",
+          "perms": "rxd",
+          "arg_spec": {
+            "args": [
+              "who"
+            ]
+          },
+          "source": "verb :can_be_attached_by(who) rxd {\n  /* Mounting the acts feature is a seed/owner act on the consumer side\n     ($case:initialize); the feature itself is freely attachable. */\n  return true;\n}",
+          "direct_callable": true
+        },
+        {
+          "name": "act",
+          "perms": "rx",
+          "arg_spec": {
+            "args": [
+              "type",
+              "payload"
+            ]
+          },
+          "source": "verb :act(type, payload) rx {\n  /* Internal emission primitive (acts kernel S2.4). Requires a sequenced\n     turn on this room's own log (direct routes carry seq == -1), called\n     from this room's own verbs (caller == this). Validates the payload\n     against the declared event schema, folds every attached projection\n     inside the same turn, then records the act observation. Any fold\n     failure aborts the whole turn: fail-closed. */\n  if (seq < 1 || space != this) { raise { code: \"E_INVARG\", message: \"acts require a sequenced turn on this room\" }; }\n  if (caller != this) { raise { code: \"E_PERM\", message: \"acts are emitted by room verbs only\" }; }\n  let shape = event_schema(this, type);\n  if (shape == null) { raise { code: \"E_INVARG\", message: \"unknown act type\", value: type }; }\n  this:_validate_payload(type, shape, payload);\n  let act = { \"type\": type, \"version\": 1, \"payload\": payload };\n  /* Folds receive the act plus its envelope seq, injected here (live) or\n     by :rebuild_from (recorded). The observed act body stays free of\n     envelope fields \u2014 the log entry is the envelope. */\n  let fold_input = { \"type\": type, \"version\": 1, \"payload\": payload, \"seq\": seq };\n  for p in this.projections {\n    if (valid(p) && (type in p.consumes)) { p:fold(fold_input); }\n  }\n  observe(act);\n  return act;\n}",
+          "skip_presence_check": true
+        },
+        {
+          "name": "_validate_payload",
+          "perms": "rx",
+          "arg_spec": {
+            "args": [
+              "type",
+              "shape",
+              "payload"
+            ]
+          },
+          "source": "verb :_validate_payload(type, shape, payload) rx {\n  /* Closed flat shape subset (S2.2): obj, str, bool, int, float, num,\n     list, map. Every declared key is required; undeclared keys refuse. */\n  if (typeof(payload) != \"map\") { raise { code: \"E_INVARG\", message: \"act payload must be a map\", value: type }; }\n  for pk, pv in payload {\n    if (!(pk in shape)) { raise { code: \"E_INVARG\", message: \"undeclared act payload key\", value: pk }; }\n  }\n  for k, t in shape {\n    if (!(k in payload)) { raise { code: \"E_INVARG\", message: \"missing act payload key\", value: k }; }\n    let val = payload[k];\n    let ok = false;\n    if (t == \"obj\") { ok = typeof(val) == \"string\" && valid(val); }\n    else if (t == \"str\") { ok = typeof(val) == \"string\"; }\n    else if (t == \"bool\") { ok = typeof(val) == \"boolean\"; }\n    else if (t == \"int\") { ok = typeof(val) == \"number\" && floor(val) == val; }\n    else if (t == \"float\" || t == \"num\") { ok = typeof(val) == \"number\"; }\n    else if (t == \"list\") { ok = typeof(val) == \"list\"; }\n    else if (t == \"map\") { ok = typeof(val) == \"map\"; }\n    else { raise { code: \"E_INVARG\", message: \"unsupported shape tag\", value: t }; }\n    if (!ok) { raise { code: \"E_INVARG\", message: \"act payload type mismatch\", value: k }; }\n  }\n  return true;\n}",
+          "skip_presence_check": true
+        }
+      ]
+    }
+  ],
+  "classes": [
+    {
+      "local_name": "$projection",
+      "parent": "$thing",
+      "flags": {
+        "fertile": true
+      },
+      "description": "Base class for act projections (acts kernel S2.3): consumes + fold + rows + view. rows/consumes/row_cap/at_seq are perms-empty so only catalog-author verbs write them \u2014 the fold is the sole writer of coordination rows. A projection lives in its room's anchor cluster so fold writes share the turn's atomicity.",
+      "properties": [
+        {
+          "name": "rows",
+          "type": "map",
+          "default": {},
+          "perms": ""
+        },
+        {
+          "name": "consumes",
+          "type": "list",
+          "default": [],
+          "perms": ""
+        },
+        {
+          "name": "row_cap",
+          "type": "int",
+          "default": 1000,
+          "perms": ""
+        },
+        {
+          "name": "at_seq",
+          "type": "int",
+          "default": 0,
+          "perms": ""
+        }
+      ],
+      "verbs": [
+        {
+          "name": "fold",
+          "perms": "rx",
+          "arg_spec": {
+            "args": [
+              "act"
+            ]
+          },
+          "source": "verb :fold(act) rx {\n  /* Subclass responsibility (S2.3): deterministic given (rows, act), the\n     sole writer of this.rows, O(payload), no clock, no foreign reads.\n     The act input carries the envelope seq as act[\"seq\"]. The base\n     refuses so an unimplemented projection fails loudly. */\n  raise { code: \"E_VERBNF\", message: \"projection must implement :fold\" };\n}",
+          "skip_presence_check": true
+        },
+        {
+          "name": "view",
+          "perms": "rxd",
+          "arg_spec": {
+            "args": [
+              "opts"
+            ]
+          },
+          "source": "verb :view(opts) rxd {\n  /* The one authoritative bounded read (S2.3). Pages rows in key order;\n     each row is rendered by :view_row so subclasses can join\n     object-authoritative facts (artifact name, physical location) at\n     view time without mirroring them into rows. */\n  if (typeof(opts) != \"map\") { opts = {}; }\n  let limit = 50;\n  if (\"limit\" in opts) { limit = toint(opts[\"limit\"]); }\n  if (limit < 1 || limit > 200) { limit = 50; }\n  let page = [];\n  let has_more = false;\n  for k in keys(this.rows) {\n    if (length(page) >= limit) { has_more = true; break; }\n    page = page + [this:view_row(k, this.rows[k])];\n  }\n  return { \"page\": page, \"at_seq\": this.at_seq, \"has_more\": has_more };\n}",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "tool_exposed": true
+        },
+        {
+          "name": "view_row",
+          "perms": "rx",
+          "arg_spec": {
+            "args": [
+              "key",
+              "row"
+            ]
+          },
+          "source": "verb :view_row(key, row) rx {\n  /* Default rendering: the stored row itself. */\n  return row;\n}",
+          "skip_presence_check": true
+        },
+        {
+          "name": "rebuild_from",
+          "perms": "rxd",
+          "arg_spec": {
+            "args": [
+              "source_space",
+              "from_seq"
+            ]
+          },
+          "source": "verb :rebuild_from(source_space, from_seq) rxd {\n  /* Operator rebuild (gate 1): re-fold the recorded acts from the source\n     log into this projection, proving fold(recorded acts) == rows and\n     that rebuild never re-executes verbs. Owner/wizard only. Skips\n     failed entries (an aborted turn contributes nothing). */\n  if (actor != this.owner && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"rebuild is owner-only\" }; }\n  let from = 1;\n  if (typeof(from_seq) == \"number\" && from_seq > 0) { from = toint(from_seq); }\n  let more = true;\n  while (more) {\n    let entries = source_space:replay(from, 100);\n    if (length(entries) == 0) { more = false; break; }\n    for e in entries {\n      from = e[\"seq\"] + 1;\n      if (!e[\"applied_ok\"]) { continue; }\n      for o in e[\"observations\"] {\n        if (typeof(o) == \"map\" && (\"type\" in o) && (\"payload\" in o) && (\"version\" in o) && (o[\"type\"] in this.consumes)) {\n          let input = o;\n          input[\"seq\"] = e[\"seq\"];\n          this:fold(input);\n        }\n      }\n    }\n    if (length(entries) < 100) { more = false; }\n  }\n  return this.at_seq;\n}",
+          "direct_callable": true,
+          "skip_presence_check": true
+        }
+      ]
+    },
+    {
+      "local_name": "$task_board",
+      "parent": "$projection",
+      "description": "The Tasks proof projection (S5): coordination state only \u2014 no artifact names, no holder, no timestamps. view_row joins name and the lease at view time; times resolve from row seqs via the log.",
+      "properties": [
+        {
+          "name": "consumes",
+          "type": "list",
+          "default": [
+            "tasks.opened",
+            "tasks.claimed",
+            "tasks.released",
+            "tasks.passed",
+            "tasks.closed"
+          ],
+          "perms": ""
+        }
+      ],
+      "verbs": [
+        {
+          "name": "fold",
+          "perms": "rx",
+          "arg_spec": {
+            "args": [
+              "act"
+            ]
+          },
+          "source": "verb :fold(act) rx {\n  /* Sole writer of this.rows. Raising here aborts the whole turn,\n     including the domain verb's physical effects (fail-closed, S2.3);\n     E_QUOTA at row_cap is the declared refuse-overflow policy. Uses the\n     injected act[\"seq\"], never the frame global, so rebuild outside a\n     sequenced turn reproduces rows exactly. */\n  let ty = act[\"type\"];\n  let p = act[\"payload\"];\n  let rows = this.rows;\n  if (ty == \"tasks.opened\") {\n    if (length(rows) >= this.row_cap) { raise { code: \"E_QUOTA\", message: \"board row cap\", value: this.row_cap }; }\n    rows[to_string(p[\"task\"])] = { \"task\": p[\"task\"], \"kind\": p[\"kind\"], \"labels\": p[\"labels\"], \"obligations\": p[\"obligations\"], \"waits\": [], \"links\": [], \"phase\": \"active\", \"opened_seq\": act[\"seq\"], \"last_change_seq\": act[\"seq\"] };\n  } else {\n    let key = to_string(p[\"task\"]);\n    if (!(key in rows)) { raise { code: \"E_INVARG\", message: \"act for unknown task\", value: key }; }\n    let row = rows[key];\n    if (ty == \"tasks.passed\") {\n      let obs = [];\n      for o in row[\"obligations\"] {\n        if (typeof(o) == \"map\" && o[\"key\"] == p[\"obligation\"]) { let m = o; m[\"met\"] = true; obs = obs + [m]; }\n        else { obs = obs + [o]; }\n      }\n      row[\"obligations\"] = obs;\n    } else if (ty == \"tasks.closed\") {\n      row[\"phase\"] = \"closed\";\n    }\n    row[\"last_change_seq\"] = act[\"seq\"];\n    rows[key] = row;\n  }\n  this.rows = rows;\n  this.at_seq = act[\"seq\"];\n}",
+          "skip_presence_check": true
+        },
+        {
+          "name": "view_row",
+          "perms": "rx",
+          "arg_spec": {
+            "args": [
+              "key",
+              "row"
+            ]
+          },
+          "source": "verb :view_row(key, row) rx {\n  /* Joins per page row (S5.2): artifact name and the single lease fact\n     read at view time, never mirrored. claimed iff the task is not in\n     the case. Obligation cursor computed from row state. */\n  let t = row[\"task\"];\n  let name = null;\n  let holder = null;\n  let claimed = false;\n  if (valid(t)) {\n    name = t.name;\n    let loc = location(t);\n    if (loc != location(this)) { holder = loc; claimed = true; }\n  }\n  let met = 0;\n  let total = 0;\n  let cursor = null;\n  for o in row[\"obligations\"] {\n    total = total + 1;\n    if (o[\"met\"]) { met = met + 1; }\n    else if (cursor == null) { cursor = o[\"key\"]; }\n  }\n  return { \"task\": t, \"name\": name, \"kind\": row[\"kind\"], \"labels\": row[\"labels\"], \"phase\": row[\"phase\"], \"claimed\": claimed, \"holder\": holder, \"cursor\": cursor, \"obligations_met\": met, \"obligations_total\": total, \"opened_seq\": row[\"opened_seq\"], \"last_change_seq\": row[\"last_change_seq\"] };\n}",
+          "skip_presence_check": true
+        }
+      ]
+    },
+    {
+      "local_name": "$case",
+      "parent": "$room",
+      "flags": {
+        "fertile": true
+      },
+      "description": "A room whose work is recorded as acts on its own sequenced log (case = room, 2026-07-12 gravity model; content model = acts kernel). Domain verbs validate against board rows, apply physical effects, and emit acts in the same turn. The journal is a paged log read.",
+      "properties": [
+        {
+          "name": "projections",
+          "type": "list",
+          "default": [],
+          "perms": ""
+        }
+      ],
+      "verbs": [
+        {
+          "name": "initialize",
+          "perms": "rxd",
+          "arg_spec": {
+            "args": [
+              "row_cap"
+            ]
+          },
+          "source": "verb :initialize(row_cap) rxd {\n  /* Seed-time setup: create the board projection co-anchored with the\n     case (same anchor cluster, so SL2 atomicity covers fold writes).\n     The $acts feature is attached per instance here ($space instances\n     own-seed an empty features list, so the class-level attach \u2014 which\n     exists to satisfy the installer's static this-call resolution \u2014\n     does not reach them). Owner/wizard only. */\n  if (actor != this.owner && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"case initialize is owner-only\" }; }\n  this:add_feature($acts);\n  let board = create($task_board, { owner: this.owner, name: \"board\", location: this });\n  if (typeof(row_cap) == \"number\" && row_cap > 0) { board.row_cap = toint(row_cap); }\n  this.projections = [board];\n  return board;\n}",
+          "direct_callable": true,
+          "skip_presence_check": true
+        },
+        {
+          "name": "open_task",
+          "perms": "rxd",
+          "arg_spec": {
+            "args": [
+              "name",
+              "text",
+              "kind",
+              "labels",
+              "obligations"
+            ]
+          },
+          "source": "verb :open_task(name, text, kind, labels, obligations) rxd {\n  /* Domain verb: mints the task artifact (object-authoritative content),\n     then records the coordination fact as an act in the same turn. */\n  if (typeof(name) != \"string\" || name == \"\") { raise { code: \"E_INVARG\", message: \"task name required\" }; }\n  if (typeof(labels) != \"list\") { labels = []; }\n  if (typeof(obligations) != \"list\") { obligations = []; }\n  let obs = [];\n  for k in obligations { obs = obs + [{ \"key\": to_string(k), \"met\": false }]; }\n  let t = create($note, { owner: actor, name: name, location: this });\n  if (typeof(text) == \"string\" && text != \"\") { t:set_text(text); }\n  this:act(\"tasks.opened\", { \"task\": t, \"kind\": to_string(kind), \"labels\": labels, \"obligations\": obs });\n  return t;\n}",
+          "direct_callable": true,
+          "tool_exposed": true
+        },
+        {
+          "name": "claim",
+          "perms": "rxd",
+          "arg_spec": {
+            "args": [
+              "task"
+            ]
+          },
+          "source": "verb :claim(task) rxd {\n  /* The move IS the lease; the act records the coordination fact in the\n     same sequenced turn. Fail-closed: if the fold refuses, the move\n     rolls back with it. */\n  if (!valid(task) || location(task) != this) { raise { code: \"E_INVARG\", message: \"task not open here\", value: task }; }\n  moveto(task, actor);\n  this:act(\"tasks.claimed\", { \"task\": task, \"holder\": actor });\n  return task;\n}",
+          "direct_callable": true,
+          "tool_exposed": true
+        },
+        {
+          "name": "release",
+          "perms": "rxd",
+          "arg_spec": {
+            "args": [
+              "task"
+            ]
+          },
+          "source": "verb :release(task) rxd {\n  if (!valid(task) || location(task) != actor) { raise { code: \"E_INVARG\", message: \"you do not hold that task\", value: task }; }\n  moveto(task, this);\n  this:act(\"tasks.released\", { \"task\": task });\n  return task;\n}",
+          "direct_callable": true,
+          "tool_exposed": true
+        },
+        {
+          "name": "pass_obligation",
+          "perms": "rxd",
+          "arg_spec": {
+            "args": [
+              "task",
+              "obligation"
+            ]
+          },
+          "source": "verb :pass_obligation(task, obligation) rxd {\n  if (!valid(task) || location(task) != actor) { raise { code: \"E_INVARG\", message: \"you do not hold that task\", value: task }; }\n  this:act(\"tasks.passed\", { \"task\": task, \"obligation\": to_string(obligation) });\n  return true;\n}",
+          "direct_callable": true,
+          "tool_exposed": true
+        },
+        {
+          "name": "close_task",
+          "perms": "rxd",
+          "arg_spec": {
+            "args": [
+              "task",
+              "outcome_code"
+            ]
+          },
+          "source": "verb :close_task(task, outcome_code) rxd {\n  if (!valid(task)) { raise { code: \"E_INVARG\", message: \"no such task\", value: task }; }\n  if (location(task) == actor) { moveto(task, this); }\n  this:act(\"tasks.closed\", { \"task\": task, \"outcome_code\": to_string(outcome_code) });\n  return true;\n}",
+          "direct_callable": true,
+          "tool_exposed": true
+        },
+        {
+          "name": "board",
+          "perms": "rxd",
+          "arg_spec": {
+            "args": [
+              "opts"
+            ]
+          },
+          "source": "verb :board(opts) rxd {\n  /* Authoritative board read: delegates to the projection's view. */\n  if (length(this.projections) < 1) { raise { code: \"E_INVARG\", message: \"case has no board; run initialize\" }; }\n  let b = this.projections[1];\n  return b:view(opts);\n}",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "tool_exposed": true
+        },
+        {
+          "name": "journal",
+          "perms": "rxd",
+          "arg_spec": {
+            "args": [
+              "from_seq",
+              "limit"
+            ]
+          },
+          "source": "verb :journal(from_seq, limit) rxd {\n  /* Paged log read (S3): the log IS the journal \u2014 no materialized copy.\n     Returns act-typed observations with their envelope seq and ts. */\n  let entries = this:replay(from_seq, limit);\n  let out = [];\n  for e in entries {\n    for o in e[\"observations\"] {\n      if (typeof(o) == \"map\" && (\"type\" in o) && (\"payload\" in o) && (\"version\" in o)) {\n        out = out + [{ \"seq\": e[\"seq\"], \"ts\": e[\"ts\"], \"type\": o[\"type\"], \"payload\": o[\"payload\"] }];\n      }\n    }\n  }\n  return out;\n}",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "tool_exposed": true
+        }
+      ]
+    }
+  ],
+  "schemas": [
+    {
+      "on": "$case",
+      "type": "tasks.opened",
+      "shape": {
+        "task": "obj",
+        "kind": "str",
+        "labels": "list",
+        "obligations": "list"
+      }
+    },
+    {
+      "on": "$case",
+      "type": "tasks.claimed",
+      "shape": {
+        "task": "obj",
+        "holder": "obj"
+      }
+    },
+    {
+      "on": "$case",
+      "type": "tasks.released",
+      "shape": {
+        "task": "obj"
+      }
+    },
+    {
+      "on": "$case",
+      "type": "tasks.passed",
+      "shape": {
+        "task": "obj",
+        "obligation": "str"
+      }
+    },
+    {
+      "on": "$case",
+      "type": "tasks.closed",
+      "shape": {
+        "task": "obj",
+        "outcome_code": "str"
+      }
+    }
+  ],
+  "seed_hooks": [
+    {
+      "kind": "attach_feature",
+      "consumer": "$case",
+      "feature": "$acts"
+    }
+  ]
+}
