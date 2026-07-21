@@ -57,7 +57,7 @@
  * This class sits beside the v2 DO classes and shares nothing with them;
  * nothing routes production traffic here until Phase 5.
  */
-import { CellStore, cellKey, makeCell, type Cell } from "../../net/cells";
+import { CellStore, cellKey, cellVersion, makeCell, type Cell } from "../../net/cells";
 import { clampClientSessionTtl } from "../../net/client-session-policy";
 import { budgetExhausted, isNetError, netError, nonconvergentRead, NetError, type AttemptTraceEntry, type NetErrorCode } from "../../net/errors";
 import { applyFanout, type FanoutBody } from "../../net/outbox";
@@ -1953,15 +1953,23 @@ export class NetGatewayDO {
         return await this.clientWebSocketByTicket(request, url);
       }
 
-      // Client-shell phase i: the MCP surface (JSON-RPC over POST plus the
-      // Streamable HTTP DELETE session close). Its
+      // Client-shell phase i: the MCP surface (JSON-RPC over POST, bounded
+      // GET/SSE server notifications, plus Streamable HTTP DELETE close). Its
       // auth model differs per method — `initialize` authenticates the
       // mcp-token (an apikey) and mints the net session that then acts
       // as the MCP bearer (mcp-session-id = the net session id, the same
       // trust shape v2's MCP surface uses; sessions expire) — so it
       // branches before the header-credential path below.
+      if (url.pathname === "/net-api/mcp"
+        && (request.method === "POST" || request.method === "GET" || request.method === "DELETE")) {
+        const rejectedOrigin = rejectForeignMcpOrigin(request, url);
+        if (rejectedOrigin) return rejectedOrigin;
+      }
       if (request.method === "POST" && url.pathname === "/net-api/mcp") {
         return await this.clientMcp(request);
+      }
+      if (request.method === "GET" && url.pathname === "/net-api/mcp") {
+        return this.clientMcpEvents(request);
       }
       if (request.method === "DELETE" && url.pathname === "/net-api/mcp") {
         return await this.clientMcpClose(request);
@@ -3283,9 +3291,10 @@ export class NetGatewayDO {
   // queues: an eviction drops undelivered items; the client's next wait
   // simply re-arms (at-most-once live delivery — CO2.7's socket rule).
 
-  /** Per-session MCP observation queues (bounded) + parked woo_wait
-   * long-polls. Registered at initialize; entries die with the DO. */
-  private readonly mcpQueues = new Map<string, { buffer: unknown[]; waiters: Array<() => void>; ownEchoIds: Set<string> }>();
+  /** Per-session observation queues, dynamic-list baseline, and bounded
+   * GET/SSE listeners. This is live transport state: entries die with the DO,
+   * and a reconnect after eviction receives a conservative re-list hint. */
+  private readonly mcpQueues = new Map<string, NetMcpSessionState>();
   /** Backoff for dangling/stale contextual relation refs. A missing member
    * must not turn repeated tools/list calls into a multi-Hz closure storm. */
   private readonly mcpContextWarmFailures = new Map<string, { attempts: number; retryAt: number }>();
@@ -3317,6 +3326,81 @@ export class NetGatewayDO {
     return json({ jsonrpc: "2.0", id: rpc.id, error: { code: -32601, message: `method not found: ${rpc.method}` } }, 200);
   }
 
+  /** Streamable HTTP's optional standalone GET/SSE carrier. The listen is
+   * deliberately bounded: an idle Durable Object request must not become a
+   * permanent synchronous dependency. Standard clients reconnect after the
+   * stream closes, while a not-yet-delivered hint remains pending in the
+   * session state and is handed to exactly one later stream. */
+  private clientMcpEvents(request: Request): Response {
+    const accept = request.headers.get("accept") ?? "";
+    if (!accept.toLowerCase().includes("text/event-stream")) {
+      return json({ error: { code: "E_INVARG", message: "MCP GET requires Accept: text/event-stream" } }, 406);
+    }
+    const session = request.headers.get("mcp-session-id") ?? "";
+    const cell = this.ensureView().get(sessionCellKey(session));
+    const verdict = validateSessionCell(cell, this.host.now());
+    if (verdict !== "ok") {
+      return json({ error: { code: "E_NOSESSION", message: `session ${verdict}` } }, 404);
+    }
+    const actor = (cell?.value as { actor?: unknown }).actor;
+    if (typeof actor !== "string" || !actor) {
+      return json({ error: { code: "E_NOSESSION", message: "session actor is missing" } }, 404);
+    }
+    this.enforceClientRate(actor, "/net-api/mcp");
+    const state = this.mcpSessionState(session, actor, true);
+    const gateway = this;
+    let waiter: NetMcpSseWaiter | null = null;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let closed = false;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        // A retry field flushes headers immediately and asks conforming clients
+        // to reconnect gently after the bounded listen closes.
+        controller.enqueue(MCP_SSE_CONNECTED);
+        const detach = (): void => {
+          if (timer !== null) clearTimeout(timer);
+          timer = null;
+          if (!waiter) return;
+          const index = state.sseWaiters.indexOf(waiter);
+          if (index >= 0) state.sseWaiters.splice(index, 1);
+        };
+        const close = (): void => {
+          if (closed) return;
+          closed = true;
+          detach();
+          try { controller.close(); } catch { /* a cancelled stream is already closed */ }
+        };
+        waiter = {
+          close,
+          deliver(message) {
+            if (closed) return false;
+            try {
+              controller.enqueue(mcpSseMessage(message));
+              close();
+              return true;
+            } catch {
+              close();
+              return false;
+            }
+          }
+        };
+        state.sseWaiters.push(waiter);
+        timer = setTimeout(close, MCP_SSE_LISTEN_MS);
+        gateway.mcpFlushListChanged(state);
+      },
+      cancel() {
+        waiter?.close();
+      }
+    });
+    return new Response(stream, {
+      status: 200,
+      headers: {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache, no-transform"
+      }
+    });
+  }
+
   /** Streamable HTTP session close. The MCP session id is the net session
    * bearer, so DELETE must commit the same owner-sequenced close as logout. */
   private async clientMcpClose(request: Request): Promise<Response> {
@@ -3325,7 +3409,7 @@ export class NetGatewayDO {
     const cell = this.ensureView().get(sessionCellKey(session));
     const verdict = validateSessionCell(cell, this.host.now());
     if (verdict === "missing" || verdict === "expired") {
-      this.mcpQueues.delete(session);
+      this.mcpDisposeSessionState(session);
       return new Response(null, { status: 204 });
     }
     if (verdict !== "ok") {
@@ -3338,7 +3422,7 @@ export class NetGatewayDO {
     const identity = await this.catalogIdentity();
     const closed = await this.clientSessionClose(actor, session, identity.epoch);
     if (!closed.ok) return closed;
-    this.mcpQueues.delete(session);
+    this.mcpDisposeSessionState(session);
     return new Response(null, { status: 204 });
   }
 
@@ -3356,16 +3440,16 @@ export class NetGatewayDO {
     if (!opened.ok || typeof body.session !== "string") {
       return json({ jsonrpc: "2.0", id, error: { code: -32000, message: `session mint failed: ${JSON.stringify(body)}` } }, 200);
     }
-    this.mcpQueues.set(body.session, { buffer: [], waiters: [], ownEchoIds: new Set() });
+    this.mcpSessionState(body.session, actor);
     return json(
       {
         jsonrpc: "2.0",
         id,
         result: {
           protocolVersion: "2025-06-18",
-          capabilities: { tools: { listChanged: false } },
+          capabilities: { tools: { listChanged: true } },
           serverInfo: { name: "woo-net", version: "1" },
-          instructions: `You are woo actor ${actor}. Dynamic tools track your current space, its contextual objects, and your inventory. Re-list tools after navigation.`
+          instructions: `You are woo actor ${actor}. Dynamic tools track your current space, its contextual objects, and your inventory. Re-list tools when notifications/tools/list_changed arrives.`
         }
       },
       200,
@@ -3384,6 +3468,7 @@ export class NetGatewayDO {
     if (typeof actor !== "string" || !actor) {
       return json({ jsonrpc: "2.0", id, error: { code: -32000, message: "session actor is missing" } }, 200);
     }
+    this.mcpSessionState(session, actor, true);
     this.enforceClientRate(actor, "/net-api/mcp");
     const name = typeof params.name === "string" ? params.name : "";
     const args = (params.arguments ?? {}) as Record<string, unknown>;
@@ -3403,6 +3488,7 @@ export class NetGatewayDO {
     if (name === "woo_list_reachable_tools") {
       try {
         const page = this.mcpToolPage(actor, session, args);
+        this.mcpMarkToolListSeen(session, actor);
         const includeSchema = args.include_schema === true;
         return this.mcpResult(id, {
           scope: page.scope,
@@ -3451,10 +3537,14 @@ export class NetGatewayDO {
     if (typeof actor !== "string" || !actor) {
       return json({ jsonrpc: "2.0", id, error: { code: -32000, message: "session actor is missing" } }, 200);
     }
+    this.mcpSessionState(session, actor, true);
     this.enforceClientRate(actor, "/net-api/mcp");
     await this.warmMcpContext(actor, session);
     const cursor = mcpCursor(params.cursor);
-    const all = [...MCP_TOOL_DEFS, ...this.mcpContextTools(actor, session).map(mcpProtocolTool)];
+    const context = this.mcpContextObjects(actor, session);
+    const dynamic = this.mcpToolsForObjects(actor, context, this.mcpActiveCommandContext(actor, session));
+    const all = [...MCP_TOOL_DEFS, ...dynamic.map(mcpProtocolTool)];
+    this.mcpMarkToolListSeen(session, actor, this.mcpToolListDigest(actor, session, dynamic, context));
     const tools = all.slice(cursor, cursor + MCP_STANDARD_TOOL_PAGE);
     const next = cursor + tools.length;
     return json({
@@ -3574,6 +3664,162 @@ export class NetGatewayDO {
     if (queue.buffer.length > MCP_QUEUE_CAP) queue.buffer.splice(0, queue.buffer.length - MCP_QUEUE_CAP);
     const waiters = queue.waiters.splice(0, queue.waiters.length);
     for (const wake of waiters) wake();
+  }
+
+  /** Lazily reconstruct live MCP transport state after a DO eviction. A
+   * reconnecting GET cannot recover the client's last descriptor baseline, so
+   * it receives one conservative hint and re-lists. An ordinary first
+   * initialize installs state explicitly and therefore emits no false change. */
+  private mcpSessionState(session: string, actor: string, notifyOnRecover = false): NetMcpSessionState {
+    const existing = this.mcpQueues.get(session);
+    if (existing && existing.actor === actor) {
+      // Map insertion order is the LRU: only authenticated client activity
+      // touches an entry. Fanout delivery alone must not make an abandoned
+      // session look active forever.
+      this.mcpQueues.delete(session);
+      this.mcpQueues.set(session, existing);
+      return existing;
+    }
+    if (existing) this.mcpDisposeSessionState(session);
+    this.mcpMakeRoomForSessionState();
+    const created = mcpSessionState(actor);
+    if (notifyOnRecover) {
+      created.listChangedDirty = true;
+      created.listChangedPending = true;
+    }
+    this.mcpQueues.set(session, created);
+    return created;
+  }
+
+  /** Bound live transport memory independently of durable session authority.
+   * New-state pressure first reaps entries whose mirrored bearer is already
+   * unusable, then evicts the least-recently client-used live entry. The next
+   * authenticated request for an evicted live session reconstructs state and
+   * receives the conservative list-change hint. */
+  private mcpMakeRoomForSessionState(): void {
+    if (this.mcpQueues.size < MCP_SESSION_STATE_CAP) return;
+    const view = this.ensureView();
+    const now = this.host.now();
+    for (const session of [...this.mcpQueues.keys()]) {
+      if (validateSessionCell(view.get(sessionCellKey(session)), now) === "ok") continue;
+      this.mcpDisposeSessionState(session);
+    }
+    while (this.mcpQueues.size >= MCP_SESSION_STATE_CAP) {
+      const oldest = this.mcpQueues.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.mcpDisposeSessionState(oldest);
+    }
+  }
+
+  /** Dispose every closure that can retain a session state. Parked waits wake
+   * with the now-empty live buffer; SSE clients reconnect and, if their Net
+   * session is still valid, lazily reconstruct through mcpSessionState. */
+  private mcpDisposeSessionState(session: string): void {
+    const state = this.mcpQueues.get(session);
+    if (!state) return;
+    this.mcpQueues.delete(session);
+    state.buffer.length = 0;
+    state.ownEchoIds.clear();
+    state.toolListDigest = null;
+    state.listChangedDirty = false;
+    state.listChangedPending = false;
+    const waiters = state.waiters.splice(0, state.waiters.length);
+    for (const wake of waiters) wake();
+    const streams = state.sseWaiters.splice(0, state.sseWaiters.length);
+    for (const stream of streams) stream.close();
+  }
+
+  /** The exact standard-list digest: structural identity plus the complete
+   * protocol descriptors produced by the invocation resolver. cellVersion's
+   * canonical JSON hashing makes property order irrelevant. */
+  private mcpToolListDigest(
+    actor: string,
+    session: string,
+    tools?: NetMcpDynamicTool[],
+    context?: Set<string>
+  ): string {
+    const contextualObjects = context ?? this.mcpContextObjects(actor, session);
+    const descriptors = tools ?? this.mcpToolsForObjects(
+      actor,
+      contextualObjects,
+      this.mcpActiveCommandContext(actor, session)
+    );
+    return cellVersion({
+      active_space: this.mcpActiveScope(actor, session),
+      // A cold contextual member may not have descriptors in this view yet.
+      // Keeping the bounded object ids in the digest ensures its arrival still
+      // asks the client to re-list, whose warmMcpContext then materializes it.
+      contextual_objects: [...contextualObjects].sort((a, b) => a.localeCompare(b)),
+      tools: descriptors.map(mcpProtocolTool)
+    });
+  }
+
+  private mcpMarkToolListSeen(session: string, actor: string, digest?: string): void {
+    const state = this.mcpSessionState(session, actor);
+    state.toolListDigest = digest ?? this.mcpToolListDigest(actor, session);
+    state.listChangedDirty = false;
+    state.listChangedPending = false;
+  }
+
+  private mcpMaybeListChanged(session: string): void {
+    const state = this.mcpQueues.get(session);
+    if (!state || state.toolListDigest === null || state.listChangedDirty) return;
+    const current = this.mcpToolListDigest(state.actor, session);
+    if (current === state.toolListDigest) return;
+    state.listChangedDirty = true;
+    state.listChangedPending = true;
+    this.mcpFlushListChanged(state);
+  }
+
+  private mcpFlushListChanged(state: NetMcpSessionState): void {
+    if (!state.listChangedPending) return;
+    while (state.sseWaiters.length > 0) {
+      const waiter = state.sseWaiters.shift()!;
+      if (!waiter.deliver(MCP_LIST_CHANGED_NOTIFICATION)) continue;
+      state.listChangedPending = false;
+      return;
+    }
+  }
+
+  /** Compare only sessions plausibly affected by this applied fanout. Room
+   * sessions come from the indexed presence projection; an actor-cluster
+   * fanout also selects that actor's own sessions. Verb pages are inherited
+   * across contexts, so rare definition changes conservatively select this
+   * shard's live MCP sessions — never world objects or other gateways. */
+  private mcpRefreshToolListHints(body: FanoutBody): void {
+    if (this.mcpQueues.size === 0) return;
+    const definitionChanged = [...body.cells.map((cell) => cell.key), ...(body.removed_cells ?? [])]
+      .some((key) => key.startsWith("verb_bytecode:"));
+    const candidates = new Set<string>();
+    if (definitionChanged) {
+      for (const session of this.mcpQueues.keys()) candidates.add(session);
+    } else {
+      const present = sqlRows<{ member: string }>(
+        this.state.storage.sql.exec(
+          "SELECT member FROM net_gateway_relation WHERE relation = ? AND owner_scope = ?",
+          SESSION_PRESENCE_RELATION,
+          body.scope
+        )
+      );
+      for (const row of present) if (this.mcpQueues.has(row.member)) candidates.add(row.member);
+      for (const [session, state] of this.mcpQueues) {
+        if (body.scope === `cluster:${state.actor}`) candidates.add(session);
+      }
+    }
+    for (const session of candidates) {
+      try {
+        this.mcpMaybeListChanged(session);
+      } catch (error) {
+        // The fanout is already committed and applied. A best-effort freshness
+        // hint must never turn that delivery into a retry/failure loop.
+        this.metric({
+          kind: "net_mcp_list_changed_refresh_failed",
+          scope: body.scope,
+          status: "error",
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
   }
 
   /** Resolve a paged discovery request against structural MCP context. The
@@ -5993,7 +6239,14 @@ export class NetGatewayDO {
     // audience (an enter's add is visible; a leave's remove already
     // excludes the leaver). The seq gate above makes the push
     // at-most-once per socket per turn: redeliveries never reach here.
-    if (applied) this.pushObservations(body);
+    if (applied) {
+      // Descriptor freshness follows the same committed/fanout-coherent view
+      // as invocation. Run before observation delivery so a movement's new
+      // presence row can notify its own session even when echo dedupe suppresses
+      // that session's observation frame.
+      this.mcpRefreshToolListHints(body);
+      this.pushObservations(body);
+    }
     return applied;
   }
 
@@ -6107,11 +6360,65 @@ function json(body: unknown, status = 200, headers: Record<string, string> = {})
 
 /** MCP adapter bounds (client-shell phase i). */
 const MCP_QUEUE_CAP = 256;
+const MCP_SESSION_STATE_CAP = 512;
 const MCP_STANDARD_TOOL_PAGE = 128;
 const MCP_DISCOVERY_DEFAULT_PAGE = 64;
 const MCP_DISCOVERY_MAX_PAGE = 256;
 const MCP_CONTEXT_WARM_FAILURE_CAP = 512;
 const MCP_CONTEXT_WARM_SUCCESS_CAP = 512;
+const MCP_SSE_LISTEN_MS = 25_000;
+const MCP_SSE_CONNECTED = new TextEncoder().encode("retry: 1000\n\n");
+const MCP_LIST_CHANGED_NOTIFICATION = {
+  jsonrpc: "2.0",
+  method: "notifications/tools/list_changed"
+} as const;
+
+type NetMcpSseWaiter = {
+  deliver(message: unknown): boolean;
+  close(): void;
+};
+
+type NetMcpSessionState = {
+  actor: string;
+  buffer: unknown[];
+  waiters: Array<() => void>;
+  ownEchoIds: Set<string>;
+  toolListDigest: string | null;
+  listChangedDirty: boolean;
+  listChangedPending: boolean;
+  sseWaiters: NetMcpSseWaiter[];
+};
+
+function mcpSessionState(actor: string): NetMcpSessionState {
+  return {
+    actor,
+    buffer: [],
+    waiters: [],
+    ownEchoIds: new Set(),
+    toolListDigest: null,
+    listChangedDirty: false,
+    listChangedPending: false,
+    sseWaiters: []
+  };
+}
+
+function mcpSseMessage(message: unknown): Uint8Array {
+  return new TextEncoder().encode(`event: message\ndata: ${JSON.stringify(message)}\n\n`);
+}
+
+/** Streamable HTTP accepts headless clients without an Origin header. Browser
+ * requests do carry one, and must be same-origin to prevent a hostile page
+ * from using a locally reachable MCP server as a DNS-rebinding target. */
+function rejectForeignMcpOrigin(request: Request, target: URL): Response | null {
+  const raw = request.headers.get("origin");
+  if (raw === null) return null;
+  try {
+    if (new URL(raw).origin === target.origin) return null;
+  } catch {
+    // Malformed and opaque origins are not a trustworthy same-origin claim.
+  }
+  return json({ error: { code: "E_PERM", message: "foreign MCP Origin is not allowed" } }, 403);
+}
 
 type NetMcpToolScope = "active" | "here" | "object" | "space" | "all";
 

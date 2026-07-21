@@ -85,9 +85,10 @@ same thin-client path used by the Net browser.
 
 ## Navigation
 
-After an `enter`, direction, or `go` call, run `tools/list` again before the
-next decision. Net currently advertises `listChanged:false` and does not send
-`notifications/tools/list_changed`.
+After an `enter`, direction, or `go` call, Net sends
+`notifications/tools/list_changed`. Run `tools/list` again before the next
+decision. Hints coalesce until re-list, so one notification may represent
+several rapid structural changes.
 
 MCP does not use the in-world focus list. A task on the current board is
 available immediately; after `claim`, its tools follow you in inventory. There

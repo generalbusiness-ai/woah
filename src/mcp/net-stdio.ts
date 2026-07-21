@@ -16,12 +16,20 @@ async function main(): Promise<void> {
     throw new Error("WOO_MCP_TOKEN must be a Net apikey:<id>:<secret> credential");
   }
   const endpoint = process.env.WOO_MCP_URL ?? "http://127.0.0.1:5173/net-api/mcp";
-  const proxy = new NetMcpStdioProxy({ endpoint, token });
   const transport = new StdioServerTransport();
+  const reportError = (error: unknown): void => {
+    process.stderr.write(`net MCP stdio bridge error: ${errorMessage(error)}\n`);
+  };
+  const proxy = new NetMcpStdioProxy({
+    endpoint,
+    token,
+    onNotification: (message) => transport.send(message),
+    onError: reportError
+  });
   const dispatcher = new NetMcpStdioDispatcher(
     proxy,
     (message) => transport.send(message),
-    (error) => process.stderr.write(`net MCP stdio bridge error: ${errorMessage(error)}\n`)
+    reportError
   );
   let shuttingDown = false;
 

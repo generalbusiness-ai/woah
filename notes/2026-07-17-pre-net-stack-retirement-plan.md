@@ -84,8 +84,8 @@ default.
 Status: first classification, lane split, and independent Net/classic lane
 validation complete. See
 `notes/2026-07-17-classic-net-test-contract-matrix.md`. Dynamic MCP discovery,
-schema-rich paging, and structural navigation are now covered; the remaining
-MCP lifecycle decision is `tools/list_changed`. The matrix also identifies a
+schema-rich paging, structural navigation, and the session-specific
+`tools/list_changed` lifecycle are now covered. The matrix also identifies a
 default-localdev browser scenario, now closed by `e2e:net-dev`. No classic
 implementation or test has been deleted.
 

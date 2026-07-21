@@ -61,8 +61,10 @@ its direct contents, and inventory. It also has three stable controls:
   sessions.
 
 MCP focus/unfocus wrappers are intentionally not part of reachability.
-`notifications/tools/list_changed` is not yet implemented; re-list after
-navigation or a containment-changing action.
+Net advertises `listChanged:true`. After the first tool list, navigation or a
+containment-changing action sends `notifications/tools/list_changed` on the
+session's Streamable HTTP GET/SSE channel. Treat it as a hint and re-list; the
+new list remains the authoritative invocation surface.
 
 ## Disconnect and reconnect
 
@@ -70,6 +72,8 @@ Closing streamable HTTP MCP with `DELETE /net-api/mcp` and the session header
 commits the same owner-sequenced close as browser logout. The stdio bridge sends
 that DELETE when stdin closes. If a process disappears without closing, the
 session expires and is reaped; reconnect with the API key and rediscover tools.
+The stdio bridge forwards GET/SSE list-change notifications as normal stdio
+JSON-RPC messages.
 Undelivered `woo_wait` observations are live, at-most-once data and do not
 survive gateway eviction.
 

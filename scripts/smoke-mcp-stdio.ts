@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { startNetDevBackend, type NetDevBackend } from "../src/server/net-dev";
 
 type ToolResult = {
@@ -37,6 +38,13 @@ async function main(): Promise<void> {
   }
 
   const client = new Client({ name: "woo-net-stdio-smoke", version: "0.0.0" });
+  let listChangedCount = 0;
+  let wakeListChanged: (() => void) | null = null;
+  client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
+    listChangedCount += 1;
+    wakeListChanged?.();
+    wakeListChanged = null;
+  });
   const transport = new StdioClientTransport({
     command: "npx",
     args: ["tsx", "src/mcp/net-stdio.ts"],
@@ -90,6 +98,31 @@ async function main(): Promise<void> {
       name: "woo_wait",
       arguments: { timeout_ms: 0, limit: 10 }
     }) as ToolResult);
+
+    // The official SDK must receive the standard notification through the
+    // stdio bridge's HTTP GET/SSE carrier, then observe a genuinely different
+    // descriptor set after re-listing in the destination room.
+    const beforeMoveNotifications = listChangedCount;
+    const changed = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("timed out waiting for notifications/tools/list_changed")), 5_000);
+      wakeListChanged = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+    });
+    assertOk("woo_call southeast", await client.callTool({
+      name: "woo_call",
+      arguments: { object: "the_chatroom", verb: "southeast", args: [] }
+    }) as ToolResult);
+    await changed;
+    if (listChangedCount !== beforeMoveNotifications + 1) {
+      throw new Error(`Net MCP emitted ${listChangedCount - beforeMoveNotifications} list_changed notifications for one move`);
+    }
+    const movedTools = await client.listTools();
+    const movedNames = movedTools.tools.map((tool) => tool.name);
+    if (!movedNames.some((name) => name.startsWith("the_deck__")) || movedNames.includes("the_cockatoo__squawk")) {
+      throw new Error(`Net MCP re-list did not reflect the destination context: ${JSON.stringify(movedNames)}`);
+    }
 
     console.log(`Net MCP stdio smoke passed (${stable.length} stable + ${listedTools.length - stable.length} contextual tools)`);
   } catch (error) {
