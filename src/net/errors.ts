@@ -22,15 +22,15 @@ export type NetErrorCode =
   | "E_LINEAGE"        // transfer lacking lineage closure — cannot occur by construction; assert
   | "E_BUDGET"         // repair budget exhausted; carries the attempt trace
   | "E_NONCONVERGENT_READ" // a recorded read cannot converge: the gateway refreshed a
-                       // mismatched cell to a STABLE authority version and re-planned,
-                       // yet the re-plan re-recorded a version that still mismatches the
-                       // same authority version. Refreshing to an unchanged version
-                       // twice cannot help — the plan records the read at a version the
-                       // authority will never hold (a planner/catalog-verb bug, e.g. a
-                       // sparse default read stamped "absent"). Terminal and NAMED so it
+                       // mismatched cell to an owner-attested scope head + content
+                       // version and re-planned, yet the re-plan still mismatched the
+                       // exact same receipt. Repeating an unchanged authority receipt
+                       // cannot help — the plan records a read that authority at that
+                       // head will never hold (a planner/catalog-verb bug, e.g. a sparse
+                       // default read stamped "absent"). Terminal and NAMED so it
                        // surfaces the offending cell instead of grinding to E_BUDGET;
-                       // carries the attempt trace. Genuine contention moves the
-                       // authority version each round, so it never trips on contention.
+                       // carries the attempt trace. The monotonic head distinguishes
+                       // legitimate A -> B -> A content cycles under contention.
   | "E_RPC_TIMEOUT"    // a cross-authority call exceeded its transport deadline;
                        // submit ambiguity is resolved before this surfaces
   | "E_SEED_LAG"       // KV seed behind scope head; informational
@@ -58,7 +58,7 @@ export const NET_ERROR_RECOVERY: Record<NetErrorCode, string> = {
   E_CATALOG_MUTATION: "terminal; publish class-definition changes through the catalog install pipeline",
   E_LINEAGE: "cannot occur by construction (CO7); assert/alarm",
   E_BUDGET: "terminal; reply carries the attempt trace",
-  E_NONCONVERGENT_READ: "terminal; the plan records a read at a version the authority will never hold — a planner or catalog-verb bug, not a transient conflict",
+  E_NONCONVERGENT_READ: "terminal; the plan still mismatches an unchanged owner-attested scope head and content version — a planner or catalog-verb bug, not a transient conflict",
   E_RPC_TIMEOUT: "terminal for this request; retry with the same idempotency key",
   E_SEED_LAG: "informational; consumer proceeds via head-check",
   E_INVARG: "terminal for this request; fix the malformed field the detail names",

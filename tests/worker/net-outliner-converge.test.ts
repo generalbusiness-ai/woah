@@ -849,38 +849,6 @@ describe("outliner add over the net path converges", () => {
     expect(probed.result, `probe committed a stale foreign ordering read (trace=${JSON.stringify(probed.trace)})`).toBe(1);
   });
 
-  it("fails FAST and NAMED (E_NONCONVERGENT_READ, not E_BUDGET) when a read cannot converge", async () => {
-    // A pathological authority that rejects the SAME read at the SAME stable
-    // version every round models a planner/catalog bug the repair loop can
-    // never satisfy. The detector must surface it named — with the offending
-    // cell — instead of grinding six rounds to an opaque E_BUDGET.
-    const { world, theOutline, session, actor, epoch } = await outlinerWorld();
-    const roomScope = `room:${theOutline}`;
-    const ctx = { theOutline, roomScope, epoch, session, actor };
-    const stuckCell = { kind: "prop", object: theOutline, name: "focus_by_actor" };
-    const focusKey = `property_cell:${theOutline}:focus_by_actor`;
-
-    const { gateway, gatewayEnv } = await mountNet(world, epoch, {
-      intercept: async (scope, path) => {
-        // Real /closure keeps returning focus_by_actor at its unchanging
-        // version (nothing ever commits); only /submit is forced to reject,
-        // so the gateway refreshes to the SAME version twice → detector.
-        if (scope === roomScope && path === "/net/submit") {
-          return jsonResponse({ status: "rejected", reason: "read_version_mismatch", retryable: true, mismatched_reads: [stuckCell] });
-        }
-        return null;
-      }
-    });
-
-    const err = await addTurn(gateway, gatewayEnv, ctx, "nonconvergent", "x").then(
-      (ok) => { throw new Error(`expected rejection, got ${JSON.stringify(ok.reply)}`); },
-      (e: unknown) => String(e)
-    );
-    expect(err).toContain("E_NONCONVERGENT_READ");
-    expect(err, "must name the offending cell").toContain(focusKey);
-    expect(err, "must NOT be the opaque budget error").not.toContain("E_BUDGET");
-  });
-
   it("fails FAST and NAMED when a stable ordering answer is rejected twice", async () => {
     const { world, theOutline, session, actor, epoch } = await outlinerWorld();
     const roomScope = `room:${theOutline}`;
@@ -907,43 +875,42 @@ describe("outliner add over the net path converges", () => {
     expect(err).not.toContain("E_BUDGET");
   });
 
-  it("does NOT trip the detector under genuine contention (authority version moves each round)", async () => {
-    // Same forced rejection, but now the authority version MOVES every round
-    // (a real concurrent writer). map.get(key) !== the new version each time,
-    // so the detector never fires; unresolved contention correctly exhausts
-    // to E_BUDGET — never a false E_NONCONVERGENT_READ.
+  it("does not misclassify repeated ordering content at a later authority head", async () => {
     const { world, theOutline, session, actor, epoch } = await outlinerWorld();
     const roomScope = `room:${theOutline}`;
     const ctx = { theOutline, roomScope, epoch, session, actor };
-    const stuckCell = { kind: "prop", object: theOutline, name: "focus_by_actor" };
-    const focusKey = `property_cell:${theOutline}:focus_by_actor`;
-    let round = 0;
-
+    let orderingFetch = 0;
     const { gateway, gatewayEnv } = await mountNet(world, epoch, {
       intercept: async (scope, path, _request, real) => {
         if (scope !== roomScope) return null;
         if (path === "/net/submit") {
-          round += 1;
-          return jsonResponse({ status: "rejected", reason: "read_version_mismatch", retryable: true, mismatched_reads: [stuckCell] });
+          return jsonResponse({
+            status: "rejected",
+            reason: "read_version_mismatch",
+            retryable: true,
+            detail: { ordering_conflicts: [{ scope: roomScope, container: theOutline, parent: null }] }
+          });
         }
-        if (path === "/net/closure") {
-          // Move focus_by_actor's version each round: contention, not a stuck plan.
-          const res = await real();
-          const body = (await res.json()) as { cells?: Array<{ key: string; version: string }> };
-          for (const cell of body.cells ?? []) {
-            if (cell.key === focusKey) cell.version = `contention-${round}`;
-          }
-          return jsonResponse(body);
+        if (path === "/net/ordered-children" || path === "/net/ordered-neighbors") {
+          const response = await real();
+          const body = await response.json() as Record<string, unknown>;
+          orderingFetch += 1;
+          // Preserve the content-addressed ordering version while advancing
+          // the owner head: this is the ordering form of A -> B -> A. The old
+          // version-only detector called it terminal on the second conflict.
+          return jsonResponse({ ...body, head: { seq: 100 + orderingFetch, hash: `ordering-aba-${orderingFetch}` } });
         }
         return null;
       }
     });
 
-    const err = await addTurn(gateway, gatewayEnv, ctx, "contention", "x").then(
+    const err = await addTurn(gateway, gatewayEnv, ctx, "ordering-aba", "x").then(
       (ok) => { throw new Error(`expected rejection, got ${JSON.stringify(ok.reply)}`); },
       (e: unknown) => String(e)
     );
-    expect(err, "moving version must NOT be misread as non-convergence").not.toContain("E_NONCONVERGENT_READ");
-    expect(err, "unresolved contention exhausts to the budget").toContain("E_BUDGET");
+    expect(err).toContain("E_BUDGET");
+    expect(err).not.toContain("E_NONCONVERGENT_READ");
+    expect(orderingFetch).toBeGreaterThan(1);
   });
+
 });

@@ -159,6 +159,35 @@ function gatewayEnvFor(scopeDO: Fetchable, faults?: Record<string, unknown>): Ne
   };
 }
 
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+}
+
+/** Scope wrapper that forces the named retryable read mismatch while leaving every
+ * authority read real. Detector tests vary only the closure receipt, so they
+ * exercise the production repair loop without depending on any catalog. */
+function mismatchScope(
+  scopeDO: Fetchable,
+  cell: { kind: "prop"; object: string; name: string },
+  mapClosure?: (body: Record<string, unknown>, requestBody: Record<string, unknown>) => Record<string, unknown>
+): Fetchable {
+  return {
+    async fetch(request: Request): Promise<Response> {
+      const path = new URL(request.url).pathname;
+      if (path === "/net/submit") {
+        return jsonResponse({ status: "rejected", reason: "read_version_mismatch", retryable: true, mismatched_reads: [cell] });
+      }
+      const requestBody = path === "/net/closure"
+        ? await request.clone().json() as Record<string, unknown>
+        : {};
+      const response = await scopeDO.fetch(request);
+      if (path !== "/net/closure" || !mapClosure) return response;
+      const body = await response.json() as Record<string, unknown>;
+      return jsonResponse(mapClosure(body, requestBody), response.status);
+    }
+  };
+}
+
 function turnRequest(bump: ShadowTurnCall, idempotencyKey: string) {
   return {
     call: bump,
@@ -293,6 +322,102 @@ describe("NetGatewayDO repair loop (CO6/CO10)", () => {
     close();
     gState.close();
     g2State.close();
+  });
+
+  it("fails named after the exact same owner/head/content receipt repeats and reports the exact attempt", async () => {
+    const { scopeDO, bumpCall, close } = await seededScope();
+    const stuckCell = { kind: "prop" as const, object: "repair_box", name: "counter" };
+    const pathological = mismatchScope(scopeDO, stuckCell);
+    const analytics: Array<{ blobs?: string[]; doubles?: number[] }> = [];
+    const metrics = { writeDataPoint(point: { blobs?: string[]; doubles?: number[] }) { analytics.push(point); } };
+    const gState = netState("gateway-nonconvergent-stable");
+    const gEnv: NetGatewayEnv = {
+      ...gatewayEnvFor(pathological),
+      METRICS: metrics
+    };
+    const gateway = new NetGatewayDO(gState.state, gEnv);
+    await call(gateway, gEnv, "/pull", { scope: SCOPE, destination: `scope:${SCOPE}` });
+
+    const { status, body } = await callRaw<{
+      error: {
+        code: string;
+        attempts?: AttemptTraceEntry[];
+        detail?: { stuck?: Array<{ authority_scope?: string; authority_head?: ScopeHead; authority_version?: string }> };
+      };
+    }>(gateway, gEnv, "/turn", turnRequest(bumpCall("turn-stable-receipt"), "stable-receipt"));
+
+    expect(status).toBe(400);
+    expect(body.error.code).toBe("E_NONCONVERGENT_READ");
+    const stuck = body.error.detail?.stuck?.[0];
+    expect(stuck?.authority_scope).toBe(SCOPE);
+    expect(stuck?.authority_head).toMatchObject({ seq: 0 });
+    expect(stuck?.authority_version).toEqual(expect.any(String));
+    const lastAttempt = body.error.attempts?.at(-1)?.attempt;
+    expect(lastAttempt).toBe(2);
+    // AE doubles[9] is the stable `attempt` slot. The old trace.length + 1
+    // accounting emitted 3 here even though the detector threw in round 2.
+    const point = analytics.filter((entry) => entry.blobs?.[0] === "net_turn_structure").at(-1);
+    expect(point?.blobs?.[8]).toBe("E_NONCONVERGENT_READ");
+    expect(point?.doubles?.[9]).toBe(lastAttempt);
+
+    close();
+    gState.close();
+  });
+
+  it("does not misclassify A -> B -> A contention when content repeats at a later authority head", async () => {
+    const { scopeDO, bumpCall, close } = await seededScope();
+    const stuckCell = { kind: "prop" as const, object: "repair_box", name: "counter" };
+    let refreshRound = 0;
+    const contended = mismatchScope(scopeDO, stuckCell, (body, requestBody) => {
+      const keys = Array.isArray(requestBody.keys) ? requestBody.keys : [];
+      if (!keys.includes("property_cell:repair_box:counter")) return body;
+      refreshRound += 1;
+      // The cell's content/version is deliberately unchanged (the second A),
+      // while the monotonic owner head proves authority advanced through an
+      // intervening state. Content-only detection false-positived on round 2.
+      return { ...body, head: { seq: 100 + refreshRound, hash: `aba-head-${refreshRound}` } };
+    });
+    const gState = netState("gateway-nonconvergent-aba");
+    const gEnv = gatewayEnvFor(contended);
+    const gateway = new NetGatewayDO(gState.state, gEnv);
+    await call(gateway, gEnv, "/pull", { scope: SCOPE, destination: `scope:${SCOPE}` });
+
+    const { status, body } = await callRaw<{ error: { code: string; attempts?: AttemptTraceEntry[] } }>(
+      gateway,
+      gEnv,
+      "/turn",
+      turnRequest(bumpCall("turn-aba-contention"), "aba-contention")
+    );
+    expect(status).toBe(503);
+    expect(body.error.code).toBe("E_BUDGET");
+    expect(body.error.attempts).toHaveLength(MAX_TURN_ATTEMPTS);
+    expect(refreshRound).toBe(MAX_TURN_ATTEMPTS);
+
+    close();
+    gState.close();
+  });
+
+  it("does not mint an authority receipt when every owner-unknown probe misses", async () => {
+    const { scopeDO, bumpCall, close } = await seededScope();
+    const unknownCell = { kind: "prop" as const, object: "unroutable_ghost", name: "value" };
+    const unresolved = mismatchScope(scopeDO, unknownCell);
+    const gState = netState("gateway-nonconvergent-unresolved-owner");
+    const gEnv = gatewayEnvFor(unresolved);
+    const gateway = new NetGatewayDO(gState.state, gEnv);
+    await call(gateway, gEnv, "/pull", { scope: SCOPE, destination: `scope:${SCOPE}` });
+
+    const { status, body } = await callRaw<{ error: { code: string; attempts?: AttemptTraceEntry[] } }>(
+      gateway,
+      gEnv,
+      "/turn",
+      turnRequest(bumpCall("turn-unresolved-owner"), "unresolved-owner")
+    );
+    expect(status).toBe(503);
+    expect(body.error.code).toBe("E_BUDGET");
+    expect(body.error.attempts?.every((entry) => entry.code === "E_READ_VERSION")).toBe(true);
+
+    close();
+    gState.close();
   });
 });
 

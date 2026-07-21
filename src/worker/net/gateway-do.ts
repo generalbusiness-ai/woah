@@ -179,14 +179,35 @@ const GATEWAY_AUDIT_RETRY_MS = 5_000;
 /** One owner-computed ordered-children projection the gateway fetched for a
  * turn: the bounded rows plus the authority `version` (content address) the
  * plan attests so a concurrent same-parent insert makes the submit stale (P1.1). */
-type OrderedChildrenProjection = { container: string; scope: string; parent: string | null; rows: readonly Record<string, unknown>[]; version: string };
+type OrderedChildrenProjection = { container: string; scope: string; parent: string | null; rows: readonly Record<string, unknown>[]; version: string; authority_head: ScopeHead };
+type PlanningOrderedChildrenProjection = Omit<OrderedChildrenProjection, "authority_head">;
 
 /** One owner-answered bounded neighbour query (P2.4): the O(1)
  * {count, index, before, after, child_index} answer plus the same authority
  * ordering `version` a full projection carries, so the attestation is
  * identical — only the payload shrinks from O(width) to constant. */
-type OrderedNeighborsProjection = { container: string; query: OrderedNeighborsQuery; scope: string; value: Record<string, unknown>; version: string };
+type OrderedNeighborsProjection = { container: string; query: OrderedNeighborsQuery; scope: string; value: Record<string, unknown>; version: string; authority_head: ScopeHead };
+type PlanningOrderedNeighborsProjection = Omit<OrderedNeighborsProjection, "authority_head">;
 type OrderingConflict = { scope: string; container: string; parent: string | null };
+
+/** One successful targeted refresh, identified by the authority's monotonic
+ * head as well as the cell's content version. The head is essential: content
+ * can legitimately cycle A -> B -> A under contention, while a scope head
+ * never repeats. Only receipts backed by an established owner participate in
+ * terminal non-convergence detection. */
+type AuthorityReadReceipt = { scope: string; head: ScopeHead; version: string };
+type AuthorityCellTransfer = CellTransfer & { scope?: unknown; head?: unknown };
+
+function validScopeHead(value: unknown): value is ScopeHead {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as { seq?: unknown; hash?: unknown };
+  return typeof candidate.seq === "number" && Number.isInteger(candidate.seq) && candidate.seq >= 0
+    && typeof candidate.hash === "string" && candidate.hash.length > 0;
+}
+
+function authorityReceiptIdentity(receipt: AuthorityReadReceipt): string {
+  return `${receipt.scope}\0${receipt.head.seq}\0${receipt.head.hash}\0${receipt.version}`;
+}
 
 function validOrderedProjectionKey(value: unknown): value is OrderedProjectionKey {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -362,6 +383,10 @@ const MAX_ROOM_CONTENT_AUTHORITY_OBJECTS = 128;
 // the budget/parallelism mechanics are asserted directly, the integrated
 // counts through full turns.
 export class TurnStructure {
+  /** Exact repair-loop round currently executing. Unlike trace length, this
+   * stays correct for failures after the current round has already appended
+   * its trace entry and for failures before a round appends one. */
+  current_attempt = 0;
   /** Cross-host RPCs on the SYNCHRONOUS reply path (CO10 warm budget ≤ 3:
    * /head + /submit + the post-accept installTouched /closure). Post-reply
    * outbox fanout is excluded by construction — it is not on this path. */
@@ -1108,7 +1133,7 @@ export class NetGatewayDO {
       // exactly the evidence a CO10 investigation wants.
       this.emitTurnStructure(request, {
         scope: request.planningScope,
-        attempt: trace.length + 1,
+        attempt: Math.max(1, structure.current_attempt),
         envelope_bytes: 0,
         sync_rpc: structure.sync_rpc,
         scope_row_writes: 0,
@@ -1286,13 +1311,13 @@ export class NetGatewayDO {
     // oscillation that grinds a sibling-property mismatch to E_BUDGET.
     const repairedObjects = new Set<string>();
     // By-construction non-convergence detector: per turn, the authority
-    // version we last REFRESHED each mismatched key to. If a key mismatches
-    // again AFTER a refresh to the SAME authority version, refreshing cannot
-    // help — the plan records that read at a version the authority will
-    // never hold (a planner/catalog bug). We surface E_NONCONVERGENT_READ
-    // naming the key instead of grinding to an opaque E_BUDGET. Genuine
-    // contention moves the authority version every round, so a contended key
-    // never satisfies the "same version twice" condition and keeps repairing.
+    // RECEIPT we last refreshed each mismatched key to. A receipt includes the
+    // owner scope and its monotonic head as well as the content version: using
+    // content alone misclassifies legitimate A -> B -> A contention. If a key
+    // mismatches again after the exact same authoritative receipt, refreshing
+    // cannot help — the plan records a read that authority at that head will
+    // never hold (a planner/catalog bug). Owner-unknown probes produce no
+    // receipt and therefore can never trigger this terminal diagnosis.
     const refreshedTo = new Map<string, string>();
     // Same detector for compact ordering reads. The key is
     // (authority scope, container, parent), because two container roots in one
@@ -1323,6 +1348,7 @@ export class NetGatewayDO {
       // The budget bounds rounds two onward; the first attempt always
       // runs (a zero-attempt turn could never converge or explain itself).
       if (attempt > 1 && this.host.now() >= deadline) break;
+      structure.current_attempt = attempt;
       const elapsed = () => this.host.now() - startedAt;
       // Re-acquire the view per attempt (fix 3): a failed durable write in
       // a prior round discarded this.view; the loop must plan against the
@@ -1637,7 +1663,7 @@ export class NetGatewayDO {
             ? ((reply.detail as { ordering_conflicts: OrderingConflict[] }).ordering_conflicts).filter(validOrderingConflict)
             : [];
           if (orderingConflicts.length > 0) {
-            const stuck: Array<{ scope: string; container: string; parent: string | null; authority_version: string }> = [];
+            const stuck: Array<{ scope: string; container: string; parent: string | null; authority_version: string; authority_head: ScopeHead }> = [];
             for (const ordering of orderingConflicts) {
               const orderingKey = `${ordering.scope}\0${orderedProjectionKey(ordering.container, ordering.parent)}`;
               const children = [...orderedChildrenByParent.values()].find((cached) =>
@@ -1647,11 +1673,13 @@ export class NetGatewayDO {
                 cached.scope === ordering.scope && cached.container === ordering.container && cached.query.parent === ordering.parent
               );
               const authorityVersion = children?.version ?? neighbor?.version;
-              if (authorityVersion !== undefined) {
-                if (refreshedOrderingTo.get(orderingKey) === authorityVersion) {
-                  stuck.push({ ...ordering, authority_version: authorityVersion });
+              const authorityHead = children?.authority_head ?? neighbor?.authority_head;
+              if (authorityVersion !== undefined && authorityHead !== undefined) {
+                const receipt = authorityReceiptIdentity({ scope: ordering.scope, head: authorityHead, version: authorityVersion });
+                if (refreshedOrderingTo.get(orderingKey) === receipt) {
+                  stuck.push({ ...ordering, authority_version: authorityVersion, authority_head: authorityHead });
                 } else {
-                  refreshedOrderingTo.set(orderingKey, authorityVersion);
+                  refreshedOrderingTo.set(orderingKey, receipt);
                 }
               }
               for (const [key, cached] of orderedChildrenByParent) {
@@ -1666,7 +1694,7 @@ export class NetGatewayDO {
             }
             if (stuck.length > 0) {
               throw nonconvergentRead(
-                "an ordering read cannot converge: re-installed a stable authority version but the plan re-recorded a mismatching version",
+                "an ordering read cannot converge: re-installed the same authority head and content but the plan re-recorded a mismatching version",
                 trace,
                 { stuck, scope: targetScope }
               );
@@ -1676,36 +1704,44 @@ export class NetGatewayDO {
           // Refresh exactly the named cells (or, for a post_state
           // disagreement naming nothing, reseed the scope's closure)
           // and re-plan.
-          const recovered = await this.tryRecovery(trace, async () => {
-            if (mismatchKeys.length > 0) await this.refreshCells(request, classifier, view, mismatchKeys, structure);
-            else await this.reseedFromScope(view, destination, undefined, structure);
-            return true;
+          const receipts = await this.tryRecovery(trace, async () => {
+            if (mismatchKeys.length > 0) return await this.refreshCells(request, classifier, view, mismatchKeys, structure);
+            await this.reseedFromScope(view, destination, undefined, structure);
+            return new Map<string, AuthorityReadReceipt>();
           });
           for (const key of mismatchKeys) repairedObjects.add(objectOfCellKey(key));
           // Non-convergence detector (see refreshedTo above). Only when the
-          // refresh SUCCEEDED: a key we ALREADY refreshed to this exact
-          // authority version — and that mismatched AGAIN — can never
-          // converge, so fail fast and named. A FAILED recovery (e.g. a
-          // downed closure lane) leaves the view unchanged, so "same version
-          // twice" would misclassify a recovery outage as a planner bug —
-          // that must stay on the E_BUDGET path (recovery_error explains it).
-          if (recovered) {
+          // refresh produced an AUTHORITATIVE RECEIPT: a key already refreshed
+          // to this exact owner head + content version that mismatched again
+          // cannot converge, so fail fast and named. Failed recovery and
+          // unresolved owner probes yield no receipt and stay on E_BUDGET.
+          // Including the head prevents A -> B -> A contention from looking
+          // stable merely because content-address A repeated.
+          if (receipts) {
             const stuck = mismatchKeys
               .map((key) => {
-                const authorityVersion = view.get(key)?.version ?? "absent";
-                if (refreshedTo.get(key) === authorityVersion) {
+                const receipt = receipts.get(key);
+                if (!receipt) return null;
+                const identity = authorityReceiptIdentity(receipt);
+                if (refreshedTo.get(key) === identity) {
                   const plannedRead = submit.transcript.reads.find((read) => netCellKeyFor(read.cell) === key);
-                  return { key, authority_version: authorityVersion, planned_version: String(plannedRead?.version ?? "absent") };
+                  return {
+                    key,
+                    authority_scope: receipt.scope,
+                    authority_head: receipt.head,
+                    authority_version: receipt.version,
+                    planned_version: String(plannedRead?.version ?? "absent")
+                  };
                 }
-                // First refresh to this authority version (or the version
-                // moved — contention): record and keep repairing.
-                refreshedTo.set(key, authorityVersion);
+                // First refresh to this receipt (or authority advanced): record
+                // it and keep repairing.
+                refreshedTo.set(key, identity);
                 return null;
               })
-              .filter((entry): entry is { key: string; authority_version: string; planned_version: string } => entry !== null);
+              .filter((entry): entry is { key: string; authority_scope: string; authority_head: ScopeHead; authority_version: string; planned_version: string } => entry !== null);
             if (stuck.length > 0) {
               throw nonconvergentRead(
-                "a recorded read cannot converge: refreshed to a stable authority version twice but the plan re-recorded a mismatching version",
+                "a recorded read cannot converge: refreshed to the same authority head and content twice but the plan re-recorded a mismatching version",
                 trace,
                 { stuck, scope: targetScope }
               );
@@ -5341,18 +5377,18 @@ export class NetGatewayDO {
       this.destinationFor(request, scope),
       "/ordered-children",
       { container, parent }
-    ), { phase: "ordered_children" }) as { scope?: unknown; container?: unknown; parent?: unknown; rows?: unknown; version?: unknown };
+    ), { phase: "ordered_children" }) as { scope?: unknown; head?: unknown; container?: unknown; parent?: unknown; rows?: unknown; version?: unknown };
     // Full reply validation (Adv-a): a wrong-scope echo or a versionless
     // reply must be a FAILED fetch (retried on the bounded attempt loop),
     // never an answer the plan attests.
-    if (response.scope !== scope || response.container !== container || response.parent !== parent || !Array.isArray(response.rows)
+    if (response.scope !== scope || !validScopeHead(response.head) || response.container !== container || response.parent !== parent || !Array.isArray(response.rows)
       || typeof response.version !== "string" || response.version.length === 0) {
       throw new Error(`ordered-children authority returned a malformed projection for ${parent ?? "<root>"} at ${scope}`);
     }
     // The authority's content version of the ordering (P1.1): the plan attests
     // it so a concurrent same-parent insert makes the submit stale. The owning
     // scope rides along (R3) so cross-scope commits owner-attest the read.
-    return { container, scope, parent, rows: response.rows as Record<string, unknown>[], version: response.version };
+    return { container, scope, parent, rows: response.rows as Record<string, unknown>[], version: response.version, authority_head: response.head };
   }
 
   /** Answer ONE bounded neighbour query at the container's scope authority
@@ -5373,7 +5409,7 @@ export class NetGatewayDO {
       this.destinationFor(request, scope),
       "/ordered-neighbors",
       { container, parent: query.parent, index: query.index, exclude: query.exclude, child: query.child }
-    ), { phase: "ordered_neighbors" }) as { scope?: unknown; container?: unknown; parent?: unknown; count?: unknown; index?: unknown; before?: unknown; after?: unknown; child_index?: unknown; version?: unknown };
+    ), { phase: "ordered_neighbors" }) as { scope?: unknown; head?: unknown; container?: unknown; parent?: unknown; count?: unknown; index?: unknown; before?: unknown; after?: unknown; child_index?: unknown; version?: unknown };
     // Full reply validation (Adv-a): scope echo, a nonempty ordering version,
     // integral count/slot within range, rank fields consistent with the slot
     // (a slot with a live neighbour must carry its rank), and a sane
@@ -5383,6 +5419,7 @@ export class NetGatewayDO {
     const index = response.index;
     const malformed =
       response.scope !== scope
+      || !validScopeHead(response.head)
       || response.container !== container
       || response.parent !== query.parent
       || typeof response.version !== "string" || response.version.length === 0
@@ -5405,7 +5442,8 @@ export class NetGatewayDO {
         after: (response.after as string | null),
         child_index: (response.child_index as number | null)
       },
-      version: response.version as string
+      version: response.version as string,
+      authority_head: response.head as ScopeHead
     };
   }
 
@@ -6089,8 +6127,8 @@ export class NetGatewayDO {
     objectCounter?: number,
     planningRoomRoster?: { room: string; rows: readonly RoomRosterRow[] },
     seedObjects?: ReadonlySet<string>,
-    planningOrderedChildren?: readonly OrderedChildrenProjection[],
-    planningOrderedNeighbors?: readonly OrderedNeighborsProjection[]
+    planningOrderedChildren?: readonly PlanningOrderedChildrenProjection[],
+    planningOrderedNeighbors?: readonly PlanningOrderedNeighborsProjection[]
   ): Promise<PlanTurnResult> {
     return planTurn({
       call: request.call,
@@ -6248,8 +6286,9 @@ export class NetGatewayDO {
     view: CellStore,
     keys: string[],
     structure?: TurnStructure
-  ): Promise<void> {
-    if (keys.length === 0) return;
+  ): Promise<Map<string, AuthorityReadReceipt>> {
+    const receipts = new Map<string, AuthorityReadReceipt>();
+    if (keys.length === 0) return receipts;
     // D2: a targeted refresh IS an authority reconstruction (view rebuilt
     // from owner closures) — one per call, regardless of how many owner
     // closures it fans to; each of those closures counts as a sync RPC.
@@ -6266,15 +6305,20 @@ export class NetGatewayDO {
     // about the cell's existence. Still-missing keys stay missing; the
     // next repair round's trace names them (bounded by the budget).
     const byDestination = new Map<string, string[]>();
+    const expectedScopeByKey = new Map<string, string>();
     const unknownOwner: string[] = [];
     for (const key of keys) {
       const object = objectOfCellKey(key);
       if (key.startsWith("session:")) {
-        const destination = this.destinationFor(request, classifier.scopeOf(request.call.actor));
+        const expectedScope = classifier.scopeOf(request.call.actor);
+        const destination = this.destinationFor(request, expectedScope);
         byDestination.set(destination, [...(byDestination.get(destination) ?? []), key]);
+        expectedScopeByKey.set(key, expectedScope);
       } else if (view.has(cellKey("object_lineage", object))) {
-        const destination = this.destinationFor(request, classifier.scopeOf(object));
+        const expectedScope = classifier.scopeOf(object);
+        const destination = this.destinationFor(request, expectedScope);
         byDestination.set(destination, [...(byDestination.get(destination) ?? []), key]);
+        expectedScopeByKey.set(key, expectedScope);
       } else {
         unknownOwner.push(key);
       }
@@ -6316,8 +6360,19 @@ export class NetGatewayDO {
           }
         })
       );
+      const authority = transfer as AuthorityCellTransfer;
+      if (typeof authority.scope === "string" && validScopeHead(authority.head)) {
+        const { scope, head } = authority;
+        for (const key of want) {
+          // A destination override may accidentally alias two logical scopes.
+          // Only the scope that classification selected can attest this key.
+          if (expectedScopeByKey.get(key) === scope) {
+            receipts.set(key, { scope, head, version: view.get(key)?.version ?? "absent" });
+          }
+        }
+      }
     });
-    if (unknownOwner.length === 0) return;
+    if (unknownOwner.length === 0) return receipts;
     const byObject = new Map<string, string[]>();
     for (const key of unknownOwner) {
       const object = objectOfCellKey(key);
@@ -6357,6 +6412,18 @@ export class NetGatewayDO {
               }
             })
           );
+          // A nonempty convention probe only proves ownership when the
+          // object's own lineage page is authoritative at the responding
+          // scope. Rider residue or unrelated closure cells may warm the view,
+          // but must not authorize a terminal non-convergence verdict.
+          const ownerLineage = transfer.cells.find((cell) =>
+            cell.key === cellKey("object_lineage", object) && cell.provenance === "authoritative"
+          );
+          const authority = transfer as AuthorityCellTransfer;
+          if (ownerLineage && typeof authority.scope === "string" && validScopeHead(authority.head)) {
+            const { scope, head } = authority;
+            for (const key of want) receipts.set(key, { scope, head, version: view.get(key)?.version ?? "absent" });
+          }
           satisfied = true;
         } catch (err) {
           // NC8b: a budget refusal is the TURN's verdict, not a probe miss.
@@ -6366,6 +6433,7 @@ export class NetGatewayDO {
         }
       }
     }
+    return receipts;
   }
 
   /** Full-closure install from the scope — the CO8 named reseed and the
