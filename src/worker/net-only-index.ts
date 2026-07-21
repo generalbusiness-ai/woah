@@ -33,8 +33,13 @@ const CATALOG_SCOPE = "catalog";
 export default {
   async fetch(request: Request, env: NetOnlyEnv): Promise<Response> {
     const url = new URL(request.url);
+    // Both doorways verify the INBOUND internal signature, which
+    // sanitizePublicHeaders strips — hand them the raw clone (H1b). Clone,
+    // don't alias: building the sanitized Request locks the original's
+    // body stream on real workerd.
     const install = url.pathname.startsWith("/net-install/");
-    const raw = install ? request.clone() : request;
+    const smoke = url.pathname.startsWith("/net-smoke/");
+    const raw = install || smoke ? request.clone() : request;
     request = sanitizePublicHeaders(request);
 
     if (url.pathname.startsWith("/__internal/")) {
@@ -51,6 +56,7 @@ export default {
       return handleNetApi(request, env, alias);
     }
     if (install) return handleNetInstall(raw, env, url);
+    if (smoke) return handleNetSmoke(raw, env, url);
 
     // Operator dashboard. Must be matched before the asset fallback or `/admin`
     // silently serves the SPA shell. Its live routes (series/footprint) read
@@ -127,6 +133,66 @@ async function handleNetApi(request: Request, env: NetOnlyEnv, url: URL): Promis
   } catch (error) {
     return publicError(error);
   }
+}
+
+/**
+ * Local proving-lane doorway: `/net-smoke/{scope|gateway}/<name>/<route...>`
+ * forwards to the named net DO. Exists ONLY for the workerd smoke/load
+ * lanes (`npm run smoke:net-dev`, `load:net-dev`) — ported from the
+ * dual-stack entry when it was deleted (NC9), because the pre-deploy
+ * workerd gate still drives the DOs through it.
+ *
+ * Trust posture is unchanged (H1b): deployed environments set
+ * WOO_AE_DATASET, so the doorway 404s there indistinguishably from any
+ * unknown route; everywhere else the INBOUND request must carry a valid
+ * internal signature (the lanes hold WOO_INTERNAL_SECRET and sign), and
+ * the forward to the DO is a FRESH signed request — no inbound header
+ * survives into the trusted hop.
+ */
+async function handleNetSmoke(request: Request, env: NetOnlyEnv, url: URL): Promise<Response> {
+  if (env.WOO_AE_DATASET !== undefined) {
+    return json({ error: { code: "E_OBJNF", message: `no such route: ${url.pathname}` } }, 404);
+  }
+  try {
+    await verifyInternalRequest(env, request);
+  } catch (error) {
+    return json({ error: { code: "E_NOSESSION", message: `net-smoke requires a signed internal request: ${errorMessage(error)}` } }, 401);
+  }
+  const parts = url.pathname.split("/").filter(Boolean); // ["net-smoke", kind, name, ...route]
+  const kind = parts[1];
+  const name = parts[2];
+  const route = parts.slice(3).map((part) => decodeURIComponent(part)).join("/");
+  if ((kind !== "scope" && kind !== "gateway") || !name || !route) {
+    return json({ error: { code: "E_INVARG", message: "expected /net-smoke/{scope|gateway}/<name>/<route...>" } }, 404);
+  }
+  let stub;
+  try {
+    stub = resolveNetDestination(env, `${kind}:${decodeURIComponent(name)}`);
+  } catch (error) {
+    return json({ error: { code: "E_INTERNAL", message: errorMessage(error) } }, 500);
+  }
+  const target = new URL(`https://do/net/${route}`);
+  target.search = url.search;
+  let forward: Request;
+  if (request.method === "GET") {
+    forward = new Request(target);
+  } else {
+    // The 8 MiB cap matches the install doorway for the same reason:
+    // /net/seed carries a full bootstrap-world cell closure, a state
+    // transfer rather than a turn envelope.
+    let body: ArrayBuffer;
+    try {
+      body = await readLimitedBody(request, MAX_INSTALL_BODY_BYTES);
+    } catch (error) {
+      return publicError(error);
+    }
+    forward = new Request(target, {
+      method: request.method,
+      headers: { "content-type": "application/json" },
+      body
+    });
+  }
+  return stub.fetch(await signInternalRequest(env, forward));
 }
 
 async function handleNetInstall(request: Request, env: NetOnlyEnv, url: URL): Promise<Response> {

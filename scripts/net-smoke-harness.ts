@@ -197,6 +197,17 @@ export async function waitReady(base: string): Promise<void> {
     try {
       const response = await fetch(`${base}/healthz`);
       if (response.ok) return;
+      // Net-only /healthz probes the catalog scope, and a FRESH workerd
+      // has no world installed yet — the smoke seeds it after startup.
+      // That state answers a named 503 (catalog_unavailable /
+      // E_MISSING_STATE), which for readiness purposes means the worker
+      // is up and routing; only that specific shape is accepted so a
+      // real startup failure (R14.7 secret checks, thrown init) still
+      // times out loudly.
+      if (response.status === 503) {
+        const body = (await response.json().catch(() => null)) as { reason?: string } | null;
+        if (body?.reason === "catalog_unavailable") return;
+      }
     } catch {
       /* not up yet */
     }
