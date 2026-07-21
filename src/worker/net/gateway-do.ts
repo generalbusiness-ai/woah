@@ -171,6 +171,10 @@ function sqlRows<T>(cursor: unknown): T[] {
 
 type ScopeRow = { seen_seq: number };
 const MAX_NET_BROWSER_METRICS_BATCH = 50;
+/** Edge-audit outbox continuation (CO2.7 fresh-lineage rule): the append
+ * RPC runs from the alarm event, never a request-deferred task. */
+const GATEWAY_AUDIT_ALARM_KEY = "gateway:audit-drain";
+const GATEWAY_AUDIT_RETRY_MS = 5_000;
 
 /** One owner-computed ordered-children projection the gateway fetched for a
  * turn: the bounded rows plus the authority `version` (content address) the
@@ -2007,11 +2011,12 @@ export class NetGatewayDO {
 
   /**
    * AU1.2/AU6.1: durable gateway edge-event lane. Rows persist in the
-   * same isolate write as the refusal and drain to the audit shards via
-   * defer + re-drain on the next request. LIVENESS CAVEAT (documented in
-   * the plan): a gateway that never receives another request holds its
-   * tail rows until it does — gateways are high-traffic by design, and
-   * an alarm-driven drain is the follow-up if tails prove real.
+   * same isolate write as the refusal and drain to the audit shards from
+   * the DO ALARM event — never a request-deferred task, whose inherited
+   * lineage compounded into the platform's subrequest-depth limit under
+   * burst load (CO2.7's event-break rule, learned live 2026-07-21). The
+   * alarm also closes the old liveness caveat: a quiet gateway's tail
+   * rows deliver on the armed wake, not the next request.
    */
   private recordEdgeAudit(
     kind: "auth" | "session" | "refusal",
@@ -2058,15 +2063,36 @@ export class NetGatewayDO {
           JSON.stringify(entry)
         );
       }
-      this.host.defer(() => this.drainEdgeAudit());
+      // CO2.7 event break: the append RPC must NOT run in this request's
+      // lineage. A deferred (waitUntil) task inherits it, and under burst
+      // load the inherited chains compound into the platform's
+      // "Subrequest depth limit exceeded" — observed on turn responses the
+      // first time this path deployed. An immediate storage alarm is a
+      // FRESH event with fresh lineage; rows are durable, so the alarm is
+      // the crash-safe continuation (the same rule the scope applies to
+      // its post-submit outbox drain).
+      this.host.setAlarm(GATEWAY_AUDIT_ALARM_KEY, this.host.now(), async () => {});
     } catch (err) {
       // Edge auditing must never turn a refusal into a 500.
       this.metric({ kind: "net_gateway_audit_error", status: "error", error: String(err) });
     }
   }
 
+  /**
+   * DO alarm wake — the gateway's only alarm consumer today is the edge
+   * audit outbox (the CO2.7 fresh-lineage continuation for
+   * drainEdgeAudit). Like the scope's alarm(), it re-derives due work
+   * from durable state: rows either drain or re-arm below, so an alarm
+   * armed by an evicted lifetime still lands somewhere useful.
+   */
+  async alarm(): Promise<void> {
+    this.host.setAlarm(GATEWAY_AUDIT_ALARM_KEY, null, async () => {});
+    await this.drainEdgeAudit();
+  }
+
   /** At-least-once push of edge rows to their shards; delivered rows
-   * delete, failures stay for the next request's drain. */
+   * delete, failures re-arm the alarm with a short backoff (a quiet
+   * shard must not strand rows until its next request). */
   private async drainEdgeAudit(): Promise<void> {
     const rows = sqlRows<{ id: string; destination: string; body: string }>(
       this.state.storage.sql.exec("SELECT id, destination, body FROM net_gateway_audit_outbox LIMIT 64")
@@ -2090,6 +2116,14 @@ export class NetGatewayDO {
       } catch (err) {
         this.metric({ kind: "net_gateway_audit_error", status: "error", error: String(err), destination });
       }
+    }
+    // Residue (a failed shard, or rows enqueued since the SELECT): re-arm
+    // rather than strand until the next audited request on this shard.
+    const remaining = sqlRows<{ n: number }>(
+      this.state.storage.sql.exec("SELECT EXISTS(SELECT 1 FROM net_gateway_audit_outbox) AS n")
+    )[0];
+    if (remaining && Number(remaining.n) > 0) {
+      this.host.setAlarm(GATEWAY_AUDIT_ALARM_KEY, this.host.now() + GATEWAY_AUDIT_RETRY_MS, async () => {});
     }
   }
 

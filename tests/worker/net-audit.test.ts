@@ -16,6 +16,7 @@ import { CellStore } from "../../src/net/cells";
 import { planTurn } from "../../src/net/plan";
 import type { ScopeClassifier } from "../../src/net/route";
 import { NetAuditDO, type NetAuditEnv } from "../../src/worker/net/audit-do";
+import { NetGatewayDO, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetScopeDO, type NetScopeEnv } from "../../src/worker/net/scope-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
 
@@ -298,6 +299,79 @@ describe("audit lane end-to-end (AU6, fake-DO)", () => {
     ).json()) as { records: unknown[] };
     expect(after.records).toHaveLength(1);
     h.close();
+  });
+});
+
+describe("gateway edge-audit lane (AU1.2/AU6.1) — fresh-lineage continuation", () => {
+  it("a refusal enqueues durably, delivers only from the alarm event, and a dead shard re-arms", async () => {
+    // Recording audit stub that can be toggled unhealthy — the AU10.6
+    // posture for the edge lane.
+    const received: unknown[] = [];
+    let healthy = true;
+    const auditStub = {
+      fetch: async (request: Request) => {
+        if (!healthy) return new Response("audit shard down", { status: 500 });
+        received.push(await request.json());
+        return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+    };
+    const fake = new FakeDurableObjectState("edge-audit-gateway");
+    const alarms: Array<number | null> = [];
+    const state = {
+      id: fake.id,
+      waitUntil: () => {},
+      storage: {
+        sql: fake.storage.sql,
+        transactionSync: fake.storage.transactionSync,
+        setAlarm: (at: number) => {
+          alarms.push(at);
+        },
+        deleteAlarm: () => {
+          alarms.push(null);
+        }
+      }
+    };
+    const env: NetGatewayEnv = {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_AUDIT_SHARDS: "1",
+      NET_RESOLVE: (destination: string) => {
+        if (destination.startsWith("audit:")) return auditStub;
+        throw new Error(`edge-audit test resolved unexpected destination ${destination}`);
+      }
+    } as NetGatewayEnv;
+    const gateway = new NetGatewayDO(state as never, env);
+
+    // A credential-less client call refuses at the edge and mints the
+    // audit record in the same isolate write.
+    const refused = await gateway.fetch(new Request("https://do/net-api/cell?key=object_live:someone"));
+    expect(refused.status).toBeGreaterThanOrEqual(400);
+    const outboxCount = () =>
+      Number(
+        (fake.storage.sql.exec("SELECT COUNT(*) AS n FROM net_gateway_audit_outbox") as unknown as { toArray(): Array<{ n: number }> }).toArray()[0]!.n
+      );
+    expect(outboxCount()).toBeGreaterThan(0);
+    await settle();
+    // CO2.7: NOTHING delivered from the request lineage — a deferred
+    // (waitUntil) append inherits the request's subrequest chain, which
+    // compounded to "Subrequest depth limit exceeded" in production. The
+    // request only ARMS the alarm; the alarm event delivers.
+    expect(received).toHaveLength(0);
+    expect(alarms.some((at) => at !== null)).toBe(true);
+
+    // Dead shard: the alarm drain fails, rows stay, a retry alarm arms.
+    healthy = false;
+    const armedBefore = alarms.length;
+    await gateway.alarm();
+    expect(received).toHaveLength(0);
+    expect(outboxCount()).toBeGreaterThan(0);
+    expect(alarms.slice(armedBefore).some((at) => at !== null)).toBe(true);
+
+    // Healed: the next alarm delivers and clears the outbox.
+    healthy = true;
+    await gateway.alarm();
+    expect(received).toHaveLength(1);
+    expect(outboxCount()).toBe(0);
+    fake.close();
   });
 });
 

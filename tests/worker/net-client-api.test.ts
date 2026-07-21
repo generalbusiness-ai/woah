@@ -658,7 +658,11 @@ describe("/net-api/audit — the customer query surface (audit.md AU7/AU10.5)", 
       token: "apikey:no-such-key:nope"
     });
     expect(refused.status).toBe(401);
-    for (let i = 0; i < 6; i += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    // Edge rows deliver from the ALARM event, never the refused request's
+    // lineage (CO2.7 — deferred appends compounded into the platform's
+    // subrequest-depth limit in production). The fake has no alarm
+    // dispatcher, so fire the handler directly.
+    await h.gateway.alarm();
     const { signInternalRequest } = await import("../../src/worker/internal-auth");
     const req = new Request("https://do/net/audit-query", {
       method: "POST",
