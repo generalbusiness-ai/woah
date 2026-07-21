@@ -684,16 +684,17 @@ lifetime when its sequencer rebuilds from durable storage. `ms` also rides
 `net_scope_closure_served` (synchronous cell serving) and
 `net_scope_outbox_drain_pass` (per-pass total); `net_scope_submit.ms` is
 the authority-side service time. Drain passes additionally split their
-total: `rpc_ms` (double6) spans the delivery awaits — during which the DO
-can interleave other requests — and `sql_ms` (console event only) is the
-synchronous storage work, so `ms − rpc_ms` approximates the occupancy that
-actually blocks a concurrent submit. A latency episode is therefore
-attributable by joining the stall window against these series: a
-coincident `do_constructor`/`net_scope_hydrated` means eviction churn, a
-slow `closure_served` or high drain `ms − rpc_ms` means serving occupancy,
-and none of them means the stall is upstream of the authority. A
-`net_scope_drain_yield` event marks a drain giving way to an in-flight
-submit (the CO2.7 submit-priority rule).
+total: `rpc_ms` (double6) is the wall time of the delivery phase — RPC
+awaits plus per-row bookkeeping, so an upper bound on interleavable time,
+not a pure await span — and `sql_ms` (console event only) is the measured
+synchronous storage work: the direct submit-blocking signal. A latency
+episode is therefore attributable by joining the stall window against
+these series: a coincident `do_constructor`/`net_scope_hydrated` means
+eviction churn, a slow `closure_served` or high drain `sql_ms` means
+serving occupancy, and none of them means the stall is upstream of the
+authority. A `net_scope_drain_yield` event marks a drain giving way to an
+in-flight submit (the CO2.7 submit-priority rule); `phase: "lane"` marks a
+yield inside a lane quantum rather than between route passes.
 
 `authority_slice_reconstructed` partitions the authority-slice cost that used to
 appear as opaque `/mcp` wall time. Its `reason` value is written to `blobs[15]`

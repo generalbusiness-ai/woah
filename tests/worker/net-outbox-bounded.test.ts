@@ -93,6 +93,40 @@ function okStub(): { stub: NetStub; received: unknown[] } {
   };
 }
 
+/** 200-replying stub whose deliveries block on a gate until released —
+ * the interleaving harness for mid-drain races (concurrent enqueue,
+ * submit arrival). `firstArrived` resolves when the first request REACHES
+ * the stub (before the gate), so tests can act inside the await window. */
+function gatedStub(): {
+  stub: NetStub;
+  received: unknown[];
+  release: () => void;
+  firstArrived: Promise<void>;
+} {
+  const received: unknown[] = [];
+  let releaseFn!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    releaseFn = resolve;
+  });
+  let arrivedFn!: () => void;
+  const firstArrived = new Promise<void>((resolve) => {
+    arrivedFn = resolve;
+  });
+  return {
+    received,
+    release: releaseFn,
+    firstArrived,
+    stub: {
+      fetch: async (request: Request) => {
+        arrivedFn();
+        await gate;
+        received.push(request.method === "POST" ? await request.json() : undefined);
+        return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+    }
+  };
+}
+
 /** 500-replying stub (host.rpc throws on !ok) recording attempts. */
 function downStub(): { stub: NetStub; received: unknown[] } {
   const received: unknown[] = [];
@@ -339,6 +373,77 @@ describe("Phase 3 — bounded outbox drain", () => {
     await kick(scopeDO, env);
     await scope.settle();
     expect(healthy.received).toHaveLength(1);
+    expect(pendingRows(scope.state)).toEqual([]);
+    scope.close();
+  });
+
+  it("a row enqueued into a lane during the delivery await survives the prune and is delivered (at-least-once)", async () => {
+    const gated = gatedStub();
+    const scope = netState("bounded-concurrent-enqueue");
+    const env: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: () => gated.stub };
+    const scopeDO = new NetScopeDO(scope.state, env);
+    insertRow(scope.state, "gateway:mirror", 1);
+
+    // Start the drain; row 1's delivery parks on the gate.
+    await kick(scopeDO, env);
+    await gated.firstArrived;
+    // A commit lands mid-await: its outbox row INSERTs and the lane
+    // directory INSERT OR IGNORE no-ops against the still-present row —
+    // exactly the window where a selection-time "provably empty" prune
+    // would orphan it. (Direct SQL stands in for persistOutboxRow; the
+    // durable rows are identical.)
+    insertRow(scope.state, "gateway:mirror", 2);
+    gated.release();
+    await scope.settle();
+
+    // Row 1 delivered; row 2 still pending AND still discoverable: the
+    // guarded delete must have kept the lane directory row.
+    expect(gated.received).toHaveLength(1);
+    expect(pendingRows(scope.state).map((r) => r.seq)).toEqual([2]);
+    expect(laneRows(scope.state)).toEqual([{ route: "/fanout", destination: "gateway:mirror" }]);
+
+    // The next drain finds and delivers it — nothing stranded.
+    await kick(scopeDO, env);
+    await scope.settle();
+    expect(gated.received).toHaveLength(2);
+    expect(pendingRows(scope.state)).toEqual([]);
+    expect(laneRows(scope.state)).toEqual([]);
+    scope.close();
+  });
+
+  it("a submit arriving during a lane's delivery await halts the quantum between rows", async () => {
+    const metricLines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+      metricLines.push(args.map(String).join(" "));
+    });
+    const gated = gatedStub();
+    const scope = netState("bounded-midlane-yield");
+    const env: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: () => gated.stub };
+    const scopeDO = new NetScopeDO(scope.state, env);
+    for (let seq = 1; seq <= 3; seq += 1) insertRow(scope.state, "gateway:mirror", seq);
+
+    // Row 1's delivery is in flight when the submit arrives. The lane must
+    // finish that row (it was already attempted) and then stop — rows 2-3
+    // untouched, no attempt counted — instead of pinning the drain for the
+    // rest of the quantum.
+    await kick(scopeDO, env);
+    await gated.firstArrived;
+    (scopeDO as unknown as { submitsInFlight: number }).submitsInFlight = 1;
+    gated.release();
+    await scope.settle();
+
+    expect(gated.received).toHaveLength(1);
+    const remaining = pendingRows(scope.state);
+    expect(remaining.map((r) => r.seq)).toEqual([2, 3]);
+    expect(remaining.every((r) => r.attempts === 0)).toBe(true);
+    expect(metricsOfKind(metricLines, "net_scope_drain_yield").some((m) => m.phase === "lane")).toBe(true);
+    expect(scope.alarms.some((at) => at !== null)).toBe(true);
+
+    // Submit done: delivery resumes in order.
+    (scopeDO as unknown as { submitsInFlight: number }).submitsInFlight = 0;
+    await kick(scopeDO, env);
+    await scope.settle();
+    expect(gated.received).toHaveLength(3);
     expect(pendingRows(scope.state)).toEqual([]);
     scope.close();
   });

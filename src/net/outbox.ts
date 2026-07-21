@@ -98,6 +98,10 @@ export type DrainResult = {
   failed: string[];
   abandoned: string[];
   skipped_backoff: string[];
+  /** True when `shouldYield` halted at least one lane mid-quantum. Halted
+   * rows were never attempted (no attempt count, no backoff): they stay
+   * pending and the caller's retry alarm resumes them. */
+  yielded?: boolean;
 };
 
 export class Outbox {
@@ -138,18 +142,34 @@ export class Outbox {
    * destinations have no ordering dependency, so their lanes run
    * concurrently; serializing them would make one slow subscriber add its
    * latency to every other subscriber's delivery.
+   *
+   * `shouldYield` makes the lane quantum interruptible: it is consulted
+   * before each row, and a true answer halts the lane exactly like
+   * end-of-lane — remaining rows untouched (pending, no attempt), order
+   * preserved. The caller uses it for submit priority: without it, a lane
+   * of slow deliveries pins the drain for rows × RPC-timeout after a
+   * commit has arrived.
    */
-  async drain(now: number, deliver: (row: FanoutRow) => Promise<void>): Promise<DrainResult> {
+  async drain(
+    now: number,
+    deliver: (row: FanoutRow) => Promise<void>,
+    shouldYield?: () => boolean
+  ): Promise<DrainResult> {
     const lanes = new Map<string, FanoutRow[]>();
     for (const row of this.pending()) {
       const lane = lanes.get(row.destination) ?? [];
       lane.push(row);
       lanes.set(row.destination, lane);
     }
+    let yielded = false;
     const drainLane = async (lane: FanoutRow[]): Promise<DrainResult> => {
       const result: DrainResult = { delivered: [], failed: [], abandoned: [], skipped_backoff: [] };
       lane.sort((a, b) => a.body.scope.localeCompare(b.body.scope) || a.body.seq - b.body.seq);
       for (const row of lane) {
+        if (shouldYield?.()) {
+          yielded = true;
+          break; // untouched rows stay pending; the retry alarm resumes them
+        }
         if (row.last_attempt_at_ms !== null && now < row.last_attempt_at_ms + this.backoffMs(row.attempts, row.id)) {
           result.skipped_backoff.push(row.id);
           break; // preserve order: nothing later in this lane may jump the queue
@@ -184,6 +204,7 @@ export class Outbox {
       result.abandoned.push(...lane.abandoned);
       result.skipped_backoff.push(...lane.skipped_backoff);
     }
+    if (yielded) result.yielded = true;
     return result;
   }
 }

@@ -1040,14 +1040,18 @@ export class NetScopeDO {
             const subscribers = sqlRows<{ destination: string; delivery_seq: number }>(
               this.state.storage.sql.exec("SELECT destination, delivery_seq FROM net_scope_subscribers WHERE role = 'fanout'")
             );
+            // Shared payload: stringify once, splice delivery_seq per
+            // subscriber (see withDeliverySeq).
+            const repairBody: FanoutBody = {
+              scope: seq.scope,
+              seq: result.head.seq,
+              cells: [],
+              observations: [],
+              relations: applied
+            };
+            const repairText = JSON.stringify(repairBody);
             for (const { destination, delivery_seq } of subscribers) {
-              this.persistFanoutRow(destination, delivery_seq, {
-                scope: seq.scope,
-                seq: result.head.seq,
-                cells: [],
-                observations: [],
-                relations: applied
-              });
+              this.persistFanoutRow(destination, delivery_seq, repairBody, repairText);
             }
           }
           return result;
@@ -1110,14 +1114,18 @@ export class NetScopeDO {
             const subscribers = sqlRows<{ destination: string; delivery_seq: number }>(
               this.state.storage.sql.exec("SELECT destination, delivery_seq FROM net_scope_subscribers WHERE role = 'fanout'")
             );
+            // Shared payload: stringify once, splice delivery_seq per
+            // subscriber (see withDeliverySeq).
+            const defsBody: FanoutBody = {
+              scope: seq.scope,
+              seq: result.head.seq,
+              cells: result.cells,
+              removed_cells: result.removed,
+              observations: []
+            };
+            const defsText = JSON.stringify(defsBody);
             for (const { destination, delivery_seq } of subscribers) {
-              this.persistFanoutRow(destination, delivery_seq, {
-                scope: seq.scope,
-                seq: result.head.seq,
-                cells: result.cells,
-                removed_cells: result.removed,
-                observations: []
-              });
+              this.persistFanoutRow(destination, delivery_seq, defsBody, defsText);
             }
           }
           return result;
@@ -1357,14 +1365,18 @@ export class NetScopeDO {
           const subscribers = sqlRows<{ destination: string; delivery_seq: number }>(
             this.state.storage.sql.exec("SELECT destination, delivery_seq FROM net_scope_subscribers WHERE role = 'fanout'")
           );
+          // Shared payload: stringify once, splice delivery_seq per
+          // subscriber (see withDeliverySeq).
+          const reapBody: FanoutBody = {
+            scope: seq.scope,
+            seq: reap.head.seq,
+            cells: retiredCells,
+            observations: [],
+            relations: reap.localRemovals
+          };
+          const reapText = JSON.stringify(reapBody);
           for (const { destination, delivery_seq } of subscribers) {
-            this.persistFanoutRow(destination, delivery_seq, {
-              scope: seq.scope,
-              seq: reap.head.seq,
-              cells: retiredCells,
-              observations: [],
-              relations: reap.localRemovals
-            });
+            this.persistFanoutRow(destination, delivery_seq, reapBody, reapText);
           }
         }
         // Foreign presence rows: group remove deltas per owning scope.
@@ -2140,11 +2152,12 @@ export class NetScopeDO {
           this.metric({ kind: "net_scope_drain_yield", route });
           break;
         }
-        // Pass duration includes delivery RPC awaits (during which the DO
-        // can interleave other requests); `rpc_ms` below isolates that
-        // await span so ms − rpc_ms approximates the synchronous occupancy
-        // that actually blocks submits — the drain-vs-submit contention
-        // axis of the 2026-07-20 stall finding.
+        // Pass duration includes delivery awaits (during which the DO can
+        // interleave other requests). `rpc_ms` below is the wall time of
+        // the whole delivery phase — awaits plus per-row bookkeeping, so
+        // an upper bound on interleavable time, not a pure await span —
+        // and `sql_ms` is the measured synchronous storage work: THE
+        // submit-blocking signal of the 2026-07-20 stall finding.
         const passStarted = Date.now();
         let sqlMs = 0;
         let sqlStarted = Date.now();
@@ -2236,7 +2249,9 @@ export class NetScopeDO {
         // below on EVERY failed attempt, not only at abandonment.
         const deliveryErrors = new Map<string, string>();
         const rpcStarted = Date.now();
-        const drained = await outbox.drain(this.host.now(), async (row) => {
+        const drained = await outbox.drain(
+          this.host.now(),
+          async (row) => {
           try {
             if (route === "/adopt") {
               const adoptBody = row.body as AdoptOutboxBody;
@@ -2291,8 +2306,15 @@ export class NetScopeDO {
             deliveryErrors.set(row.id, String(err));
             throw err;
           }
-        });
+          },
+          // Submit priority reaches INSIDE the lane quantum: without this,
+          // a lane of slow deliveries pins the drain for rows × RPC-timeout
+          // after a commit has arrived. Halted rows are untouched (pending,
+          // no attempt) and the retry alarm resumes them.
+          () => this.submitsInFlight > 0
+        );
         const rpcMs = Date.now() - rpcStarted;
+        if (drained.yielded) this.metric({ kind: "net_scope_drain_yield", route, phase: "lane" });
         deliveredCount += drained.delivered.length;
         for (const failedId of drained.failed) {
           this.metric({
@@ -2374,29 +2396,22 @@ export class NetScopeDO {
           }
           // Prune emptied lanes from the directory — a lane row must vanish
           // when its last pending row does, or the directory grows with
-          // dead destinations forever. The pass outcome decides for free in
-          // the common cases: any undelivered residue (failed, abandoned,
-          // skipped, halted-behind-a-failure) makes delivered ≠ selected —
-          // lane non-empty, skip entirely; a lane whose ENTIRE pending set
-          // fit under the row cap and fully delivered is empty by
-          // construction — delete without probing. Only a lane that filled
-          // the cap and fully delivered (more rows may exist behind the
-          // cap) still pays the EXISTS probe.
+          // dead destinations forever. Skip lanes with undelivered residue
+          // (failed, abandoned, skipped, yield-halted: all make delivered ≠
+          // selected — provably non-empty, the delete would no-op). For
+          // fully delivered lanes the emptiness check MUST be atomic with
+          // the delete: a same-lane row enqueued during the delivery await
+          // found the directory row present (INSERT OR IGNORE no-oped), so
+          // a delete keyed on the pass's selection-time count would orphan
+          // it — no directory row, no enumeration, no alarm: a stranded
+          // at-least-once violation. The guarded single-statement DELETE
+          // re-reads live pending state at delete time.
           for (const lane of lanes) {
-            const selected = laneSelected.get(lane) ?? 0;
-            if ((laneDelivered.get(lane) ?? 0) !== selected) continue;
-            if (selected === OUTBOX_ROWS_PER_LANE) {
-              const remains = sqlRows<{ n: number }>(
-                this.state.storage.sql.exec(
-                  "SELECT EXISTS(SELECT 1 FROM net_scope_outbox WHERE route = ? AND destination = ? AND status = 'pending') AS n",
-                  route,
-                  lane
-                )
-              )[0];
-              if (remains && Number(remains.n) > 0) continue;
-            }
+            if ((laneDelivered.get(lane) ?? 0) !== (laneSelected.get(lane) ?? 0)) continue;
             this.state.storage.sql.exec(
-              "DELETE FROM net_scope_outbox_lane WHERE route = ? AND destination = ?",
+              "DELETE FROM net_scope_outbox_lane WHERE route = ? AND destination = ? AND NOT EXISTS (SELECT 1 FROM net_scope_outbox WHERE route = ? AND destination = ? AND status = 'pending')",
+              route,
+              lane,
               route,
               lane
             );
@@ -2415,9 +2430,9 @@ export class NetScopeDO {
           abandoned: drained.abandoned.length,
           skipped_backoff: drained.skipped_backoff.length,
           ms: Date.now() - passStarted,
-          // rpc_ms spans the delivery awaits (interleavable); sql_ms is the
-          // synchronous storage work. ms − rpc_ms ≈ the occupancy that
-          // actually blocks a concurrent submit (R10.1 attribution recipe).
+          // rpc_ms = delivery-phase wall (awaits + per-row bookkeeping;
+          // mostly interleavable). sql_ms = measured synchronous storage
+          // occupancy — the direct submit-blocking signal (R10.1).
           rpc_ms: rpcMs,
           sql_ms: sqlMs
         });
@@ -2582,14 +2597,17 @@ export class NetScopeDO {
           this.state.storage.sql.exec("SELECT destination, delivery_seq FROM net_scope_subscribers WHERE role = 'fanout'")
         );
         if (subscribers.length > 0) {
-          const cells = this.fanoutCells(seq, result.applied);
+          // Shared payload: stringify once, splice delivery_seq per
+          // subscriber (see withDeliverySeq).
+          const adoptFanBody: FanoutBody = {
+            scope: seq.scope,
+            seq: result.head.seq,
+            cells: this.fanoutCells(seq, result.applied),
+            observations: []
+          };
+          const adoptFanText = JSON.stringify(adoptFanBody);
           for (const { destination, delivery_seq } of subscribers) {
-            this.persistFanoutRow(destination, delivery_seq, {
-              scope: seq.scope,
-              seq: result.head.seq,
-              cells,
-              observations: []
-            });
+            this.persistFanoutRow(destination, delivery_seq, adoptFanBody, adoptFanText);
           }
         }
       }
@@ -2652,23 +2670,30 @@ export class NetScopeDO {
         const subscribers = sqlRows<{ destination: string; delivery_seq: number }>(
           this.state.storage.sql.exec("SELECT destination, delivery_seq FROM net_scope_subscribers WHERE role = 'fanout'")
         );
+        // Shared payload: stringify once, splice delivery_seq per
+        // subscriber (see withDeliverySeq). The refan is on the movement
+        // path — an occupied room refans every presence transition — so
+        // per-subscriber re-serialization was hot-room commit-transaction
+        // cost, same as the submit fanout.
+        const refanBody: FanoutBody = {
+          scope: seq.scope,
+          seq: result.head.seq,
+          cells: [],
+          // Phase i: the room-addressed announcements that rode with
+          // the presence delta refan under THIS scope's head seq, so
+          // occupants receive the transition and its announcement as
+          // one sequenced event. Redelivered relates no-op above, so
+          // the push stays at-most-once.
+          observations: body.observations ?? [],
+          ...(body.submitter_turn_id !== undefined
+            ? { submitter_turn_id: body.submitter_turn_id }
+            : {}),
+          ...(body.echo_id !== undefined ? { echo_id: body.echo_id } : {}),
+          relations: applied
+        };
+        const refanText = JSON.stringify(refanBody);
         for (const { destination, delivery_seq } of subscribers) {
-          this.persistFanoutRow(destination, delivery_seq, {
-            scope: seq.scope,
-            seq: result.head.seq,
-            cells: [],
-            // Phase i: the room-addressed announcements that rode with
-            // the presence delta refan under THIS scope's head seq, so
-            // occupants receive the transition and its announcement as
-            // one sequenced event. Redelivered relates no-op above, so
-            // the push stays at-most-once.
-            observations: body.observations ?? [],
-            ...(body.submitter_turn_id !== undefined
-              ? { submitter_turn_id: body.submitter_turn_id }
-              : {}),
-            ...(body.echo_id !== undefined ? { echo_id: body.echo_id } : {}),
-            relations: applied
-          });
+          this.persistFanoutRow(destination, delivery_seq, refanBody, refanText);
         }
       }
       this.state.storage.sql.exec(
