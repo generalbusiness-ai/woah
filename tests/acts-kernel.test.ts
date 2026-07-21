@@ -104,10 +104,20 @@ type SeqWorld = Awaited<ReturnType<typeof proofCase>>;
 async function seqCall(w: SeqWorld, verb: string, args: unknown[], id: string) {
   return w.world.call(id, w.session.id, "proof_case", { actor: w.actor, target: "proof_case", verb, args: args as never[] });
 }
-async function boardView(w: SeqWorld) {
-  const r = await w.world.directCall(`bv-${Math.random()}`, w.actor, "proof_case", "board", [{}], { sessionId: w.session.id });
+async function boardView(w: SeqWorld, opts: Record<string, unknown> = {}) {
+  const r = await w.world.directCall(`bv-${Math.random()}`, w.actor, "proof_case", "board", [opts as never], { sessionId: w.session.id });
   expect(r.op).toBe("result");
-  return (r as unknown as { op: "result"; result: { page: Array<Record<string, unknown>>; at_seq: number } }).result;
+  return (r as unknown as { op: "result"; result: { page: Array<Record<string, unknown>>; at_seq: number; cursor: unknown; has_more: boolean } }).result;
+}
+// rebuild_from is incremental (resumes past at_seq/rebuild_scan_seq),
+// idempotent, and bounded to one replay page per call — drive it to done.
+async function rebuildAll(w: SeqWorld, projection: string) {
+  for (let i = 0; i < 50; i++) {
+    const r = await w.world.directCall(`rb-${projection}-${i}`, w.actor, projection, "rebuild_from", ["proof_case", 100], { sessionId: w.session.id });
+    expect(r.op).toBe("result");
+    if ((r as unknown as { result: { done: boolean } }).result.done) return;
+  }
+  throw new Error("rebuild did not converge in 50 pages");
 }
 
 describe("acts kernel proof: lifecycle on the board", () => {
@@ -230,9 +240,9 @@ describe("acts kernel proof: rebuild invariant (gate 1)", () => {
     await seqCall(w, "release", [task], "r-rel");
 
     // A fresh projection, seeded empty, folded from the recorded log only.
+    // rebuild_from is incremental and bounded per call: loop until done.
     w.world.createObject({ id: "proof_board2", name: "board2", parent: "$task_board", owner: w.actor, location: "proof_case" });
-    const rebuilt = await w.world.directCall("r-rebuild", w.actor, "proof_board2", "rebuild_from", ["proof_case", 1], { sessionId: w.session.id });
-    expect(rebuilt.op).toBe("result");
+    await rebuildAll(w, "proof_board2");
 
     const live = await w.world.directCall("r-v1", w.actor, "proof_case", "board", [{}], { sessionId: w.session.id });
     const copy = await w.world.directCall("r-v2", w.actor, "proof_board2", "view", [{}], { sessionId: w.session.id });
@@ -319,12 +329,20 @@ describe("acts kernel proof: second surface — kind lanes (tier B3)", () => {
 
     // A fresh projection, seeded empty, folded from the recorded log only.
     w.world.createObject({ id: "proof_lanes2", name: "lanes2", parent: "$kind_lanes", owner: w.actor, location: "proof_case" });
-    const rebuilt = await w.world.directCall("kl-rebuild", w.actor, "proof_lanes2", "rebuild_from", ["proof_case", 1], { sessionId: w.session.id });
-    expect(rebuilt.op).toBe("result");
+    await rebuildAll(w, "proof_lanes2");
 
     const live = await lanesView(w, "proof_lanes");
     const copy = await lanesView(w, "proof_lanes2");
     expect(copy).toEqual(live);
+
+    // Review finding 2 (2026-07-21): rebuild is idempotent — running it
+    // again on the SAME projection must not double-fold anything.
+    await rebuildAll(w, "proof_lanes2");
+    expect(await lanesView(w, "proof_lanes2")).toEqual(live);
+
+    // Review finding 3: terminal eviction — every task in this scenario
+    // is closed, so the auxiliary index must be empty (and bounded).
+    expect(w.world.getProp("proof_lanes", "task_states")).toEqual({});
     // Sanity: the shared view is the fully drained lifecycle, not empty.
     expect(live.page).toEqual([
       { kind: "kind:a", open: 0, claimed: 0, closed: 1 },
@@ -336,5 +354,84 @@ describe("acts kernel proof: second surface — kind lanes (tier B3)", () => {
     // the trial surfaced, answered affirmatively).
     expect(w.world.getProp("proof_lanes2", "task_states")).toEqual(w.world.getProp("proof_lanes", "task_states"));
     expect(w.world.getProp("proof_lanes2", "rows")).toEqual(w.world.getProp("proof_lanes", "rows"));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Part 4 — 2026-07-21 review fixes: the domain state machine, exact str
+// typing, and view paging with a continuation cursor.
+// ---------------------------------------------------------------------------
+
+describe("acts kernel review fixes: domain state machine (finding 1)", () => {
+  it("refuses close→claim, double close, and post-close release", async () => {
+    const w = await proofCase();
+    const opened = await seqCall(w, "open_task", ["once", "", "k", [], []], "sm-open");
+    const task = (opened as { op: "applied"; result: unknown }).result as string;
+    expect((await seqCall(w, "close_task", [task, "done"], "sm-close")).op).toBe("applied");
+
+    // close_task returned the task home physically — but the board row is
+    // terminal, and every lifecycle verb validates against the row.
+    for (const [verb, args, id] of [
+      ["claim", [task], "sm-reclaim"],
+      ["close_task", [task, "again"], "sm-reclose"],
+      ["release", [task], "sm-rerelease"],
+      ["pass_obligation", [task, "x"], "sm-repass"]
+    ] as const) {
+      const refused = await seqCall(w, verb, [...args], id);
+      expect(refused.op).toBe("applied");
+      const obs = (refused as { op: "applied"; observations?: Array<Record<string, unknown>> }).observations ?? [];
+      expect(obs).toHaveLength(1);
+      expect(obs[0]).toMatchObject({ type: "$error", code: "E_TRANSITION" });
+    }
+
+    // The board still shows exactly one closed, unclaimed task.
+    const view = await boardView(w);
+    expect(view.page).toHaveLength(1);
+    expect(view.page[0]).toMatchObject({ phase: "closed", claimed: false, holder: null });
+  });
+});
+
+describe("acts kernel review fixes: exact str typing (qualification)", () => {
+  it("a live object ref is refused in a str payload field, fail-closed", async () => {
+    const w = await proofCase();
+    const opened = await seqCall(w, "open_task", ["typed", "", "k", [], []], "ty-open");
+    const task = (opened as { op: "applied"; result: unknown }).result as string;
+
+    // outcome_code is declared "str"; passing the task ref itself must
+    // refuse (obj refs are strings at the VM level — exact typing keeps
+    // an object out of a code/label field), and the refusal is fail-closed:
+    // the task stays open and closable.
+    const refused = await seqCall(w, "close_task", [task, task], "ty-close-ref");
+    expect(refused.op).toBe("applied");
+    const obs = (refused as { op: "applied"; observations?: Array<Record<string, unknown>> }).observations ?? [];
+    expect(obs[0]).toMatchObject({ type: "$error", code: "E_INVARG" });
+    let view = await boardView(w);
+    expect(view.page[0]).toMatchObject({ phase: "active" });
+
+    expect((await seqCall(w, "close_task", [task, "done"], "ty-close-ok")).op).toBe("applied");
+    view = await boardView(w);
+    expect(view.page[0]).toMatchObject({ phase: "closed" });
+  });
+});
+
+describe("acts kernel review fixes: view continuation cursor (qualification)", () => {
+  it("pages beyond the first page via opts.after", async () => {
+    const w = await proofCase();
+    const ids: string[] = [];
+    for (const n of ["p1", "p2", "p3"]) {
+      const opened = await seqCall(w, "open_task", [n, "", "k", [], []], `pg-${n}`);
+      ids.push((opened as { op: "applied"; result: unknown }).result as string);
+    }
+    const first = await boardView(w, { limit: 2 });
+    expect(first.page).toHaveLength(2);
+    expect(first.has_more).toBe(true);
+    expect(first.cursor).toBeTruthy();
+
+    const second = await boardView(w, { limit: 2, after: first.cursor });
+    expect(second.page).toHaveLength(1);
+    expect(second.has_more).toBe(false);
+
+    const seen = [...first.page, ...second.page].map((r) => r.task);
+    expect(seen.sort()).toEqual([...ids].sort());
   });
 });
