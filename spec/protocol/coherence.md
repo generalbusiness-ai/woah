@@ -210,6 +210,14 @@ concurrently, while rows within each destination remain strictly serial in
 A slow or backing-off subscriber cannot add its
 delivery latency to healthy subscribers' lanes.
 
+Commits outrank delivery on the authority's thread: a drain invocation that
+finds a `/submit` executing on the same scope MUST yield between route
+passes (never mid-transaction) and resume via the retry alarm once the
+commit has replied. Fanout is latency-tolerant by contract — at-least-once,
+alarm-resumed — while submit latency is the user-visible hot-room tail (the
+2026-07-20 bake measured sustained drain occupancy as multi-second p99
+stall episodes). Yielding defers rows, never drops them.
+
 An accepted `/submit` and an incoming outbox delivery MUST NOT synchronously
 continue an outbox drain in the same platform request lineage. `/submit`,
 `/adopt`, and `/relate` persist their fanout/refan rows, arm an immediate

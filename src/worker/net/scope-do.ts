@@ -439,6 +439,16 @@ const OUTBOX_ABANDONED_KEEP = 256;
  * transaction. */
 const SCHEDULED_BATCH_PER_ALARM = 32;
 
+/** Append `delivery_seq` to an already-serialized FanoutBody. The base text
+ * is a JSON object with at least `scope`/`seq`, so splicing before the
+ * closing brace is byte-equivalent to `JSON.stringify({...body,
+ * delivery_seq})` — this is what lets a 30-subscriber fanout serialize its
+ * shared cells payload exactly once inside the commit transaction.
+ * Exported for the byte-equivalence unit test. */
+export function withDeliverySeq(baseText: string, deliverySeq: number): string {
+  return `${baseText.slice(0, -1)},"delivery_seq":${deliverySeq}}`;
+}
+
 export class NetScopeDO {
   private readonly store: SqliteScopeStore;
   private readonly host: WorkerdHost;
@@ -446,6 +456,10 @@ export class NetScopeDO {
   /** One drain at a time; a re-kick while draining is dropped (the next
    * request or defer re-kicks — rows are durable, nothing is lost). */
   private draining = false;
+  /** Commits currently executing on this DO. The drain reads it between
+   * route passes to yield the thread to waiting submits (2026-07-21 stall
+   * attribution: sustained drain occupancy was the hot-room p99 tail). */
+  private submitsInFlight = 0;
   /** Set by persistOutboxRow when an enqueue lands mid-drain (fix 4b):
    * the drain loop re-passes before releasing, so such rows never strand
    * until the next request. This replaces the old fresh-row COUNT probe,
@@ -672,6 +686,10 @@ export class NetScopeDO {
     // request cycle (gateway -> scope -> gateway). Submit and incoming
     // delivery routes therefore continue only through a fresh alarm event.
     if (!incomingDelivery && !submitRequest) this.deferPendingDrain();
+    // Submit-priority signal for the drain (2026-07-21 stall attribution):
+    // while a commit is in flight, drain invocations yield between route
+    // passes instead of stacking more delivery work in front of it.
+    if (submitRequest) this.submitsInFlight += 1;
     try {
       if (request.method === "POST" && url.pathname === "/net/submit") {
         // Bare CommitSubmit (direct submits, tests) or the gateway's
@@ -1186,6 +1204,8 @@ export class NetScopeDO {
         return json({ error: { code: err.code, message: err.message, detail: err.detail } }, err.code === "E_MISSING_STATE" ? 404 : 400);
       }
       return json({ error: String(err) }, 500);
+    } finally {
+      if (submitRequest) this.submitsInFlight -= 1;
     }
   }
 
@@ -1834,19 +1854,25 @@ export class NetScopeDO {
     );
     if (subscribers.length > 0) {
       const cells = this.fanoutCells(seq, reply.touched);
+      const base: FanoutBody = {
+        scope: seq.scope,
+        seq: reply.head.seq,
+        cells,
+        observations,
+        // The raw idempotency key is trusted-internal only: receiving
+        // gateways need it to identify the submitting session, while peers
+        // receive only the one-way echo id below.
+        submitter_turn_id: submit.idempotency_key,
+        echo_id: turnEchoId(submit.idempotency_key),
+        ...(reply.relations && reply.relations.length > 0 ? { relations: reply.relations } : {})
+      };
+      // One stringify for the whole audience: the body differs per
+      // subscriber ONLY by delivery_seq, and this runs inside the commit
+      // transaction — N× re-serializing a cells payload here was a direct
+      // submit-latency cost on hot rooms (2026-07-20 stall finding).
+      const baseText = JSON.stringify(base);
       for (const { destination, delivery_seq } of subscribers) {
-        this.persistFanoutRow(destination, delivery_seq, {
-          scope: seq.scope,
-          seq: reply.head.seq,
-          cells,
-          observations,
-          // The raw idempotency key is trusted-internal only: receiving
-          // gateways need it to identify the submitting session, while peers
-          // receive only the one-way echo id below.
-          submitter_turn_id: submit.idempotency_key,
-          echo_id: turnEchoId(submit.idempotency_key),
-          ...(reply.relations && reply.relations.length > 0 ? { relations: reply.relations } : {})
-        });
+        this.persistFanoutRow(destination, delivery_seq, base, baseText);
       }
     }
     // CO13: foreign relation deltas go to their owner scopes as durable
@@ -1967,14 +1993,14 @@ export class NetScopeDO {
    * scan (which would reintroduce O(backlog) work per drain). */
   private outboxEnqueuedTotal = 0;
 
-  private persistOutboxRow(route: OutboxRoute, destination: string, body: FanoutBody): void {
+  private persistOutboxRow(route: OutboxRoute, destination: string, body: FanoutBody, bodyText?: string): void {
     this.outboxEnqueuedTotal += 1;
     this.state.storage.sql.exec(
       "INSERT INTO net_scope_outbox (route, id, destination, body, status, attempts, last_attempt_at_ms, scope, seq, next_attempt_at_ms) VALUES (?, ?, ?, ?, 'pending', 0, NULL, ?, ?, 0) ON CONFLICT(route, id) DO NOTHING",
       route,
       `${destination}/${body.scope}/${body.seq}`,
       destination,
-      JSON.stringify(body),
+      bodyText ?? JSON.stringify(body),
       body.scope,
       body.seq
     );
@@ -1996,7 +2022,10 @@ export class NetScopeDO {
    * body.seq remains the authority-state idempotency high-water. Callers
    * already run inside the mutation transaction, so counter + outbox row
    * commit or roll back together. */
-  private persistFanoutRow(destination: string, previousDeliverySeq: number, body: FanoutBody): void {
+  /** `bodyText` is the caller's pre-serialized `body` (sans delivery_seq)
+   * when it fans one payload to many subscribers — the single-stringify
+   * path. One-off callers omit it and pay one stringify here. */
+  private persistFanoutRow(destination: string, previousDeliverySeq: number, body: FanoutBody, bodyText?: string): void {
     const deliverySeq = Number(previousDeliverySeq) + 1;
     // The DO is single-threaded and callers run in the authority mutation
     // transaction. Guard the observed value without relying on UPDATE
@@ -2008,7 +2037,12 @@ export class NetScopeDO {
       destination,
       previousDeliverySeq
     );
-    this.persistOutboxRow("/fanout", destination, { ...body, delivery_seq: deliverySeq });
+    this.persistOutboxRow(
+      "/fanout",
+      destination,
+      { ...body, delivery_seq: deliverySeq },
+      withDeliverySeq(bodyText ?? JSON.stringify(body), deliverySeq)
+    );
   }
 
   /** Kick a deferred drain when pending rows exist (reactivation path —
@@ -2056,6 +2090,11 @@ export class NetScopeDO {
       // continuation — the next alarm invocation resumes with a fresh
       // budget.
       for (let pass = 1; ; pass += 1) {
+        // Submit priority: a drain invocation arriving while a commit is
+        // executing gives way immediately — pending rows are durable and
+        // the finally's alarm (clamped to "now" for due work) resumes
+        // delivery on a fresh invocation once the submit has replied.
+        if (this.submitsInFlight > 0) break;
         this.enqueuedWhileDraining = false;
         const delivered = await this.drainOutboxPass();
         if (delivered === 0 && !this.enqueuedWhileDraining) break;
@@ -2091,11 +2130,24 @@ export class NetScopeDO {
     let deliveredCount = 0;
     const dueAt = this.host.now();
     for (const route of OUTBOX_ROUTES) {
-        // Pass duration includes delivery RPC awaits; what it bounds is
-        // how long this route's pass occupied the DO between fresh
-        // requests — the drain-vs-submit contention axis of the
-        // 2026-07-20 stall finding.
+        // Submit priority (2026-07-21 stall attribution): a waiting commit
+        // outranks fanout delivery, which is latency-tolerant by design
+        // (at-least-once, alarm-resumed). Yield BETWEEN route passes only —
+        // never mid-transaction — and let the finally's retry alarm (which
+        // clamps to "now" while due work remains) resume on a fresh
+        // invocation after the submit has had the thread.
+        if (this.submitsInFlight > 0) {
+          this.metric({ kind: "net_scope_drain_yield", route });
+          break;
+        }
+        // Pass duration includes delivery RPC awaits (during which the DO
+        // can interleave other requests); `rpc_ms` below isolates that
+        // await span so ms − rpc_ms approximates the synchronous occupancy
+        // that actually blocks submits — the drain-vs-submit contention
+        // axis of the 2026-07-20 stall finding.
         const passStarted = Date.now();
+        let sqlMs = 0;
+        let sqlStarted = Date.now();
         // Actionable lanes: the directory row exists and the lane HEAD
         // (first pending row in (scope, seq) order — one indexed probe)
         // is due. A lane whose head is mid-backoff is skipped whole: by
@@ -2121,34 +2173,55 @@ export class NetScopeDO {
           id: string;
           destination: string;
           body: string;
+          scope: string;
+          seq: number;
           attempts: number;
           last_attempt_at_ms: number | null;
         }> = [];
+        // Per-lane pass accounting for provable-empty pruning below: a lane
+        // whose ENTIRE pending set fit under the row cap and fully
+        // delivered is empty by construction — no EXISTS probe needed.
+        const laneSelected = new Map<string, number>();
         for (const lane of lanes) {
-          persisted.push(
-            ...sqlRows<{
-              id: string;
-              destination: string;
-              body: string;
-              attempts: number;
-              last_attempt_at_ms: number | null;
-            }>(
-              this.state.storage.sql.exec(
-                "SELECT id, destination, body, attempts, last_attempt_at_ms FROM net_scope_outbox WHERE route = ? AND destination = ? AND status = 'pending' ORDER BY scope, seq LIMIT ?",
-                route,
-                lane,
-                OUTBOX_ROWS_PER_LANE
-              )
+          const laneRows = sqlRows<{
+            id: string;
+            destination: string;
+            body: string;
+            scope: string;
+            seq: number;
+            attempts: number;
+            last_attempt_at_ms: number | null;
+          }>(
+            this.state.storage.sql.exec(
+              "SELECT id, destination, body, scope, seq, attempts, last_attempt_at_ms FROM net_scope_outbox WHERE route = ? AND destination = ? AND status = 'pending' ORDER BY scope, seq LIMIT ?",
+              route,
+              lane,
+              OUTBOX_ROWS_PER_LANE
             )
           );
+          laneSelected.set(lane, laneRows.length);
+          persisted.push(...laneRows);
         }
         if (persisted.length === 0) continue;
+        sqlMs += Date.now() - sqlStarted;
         // Backoff injected explicitly so it stays in lockstep with the
         // alarm's retry-time computation (see OUTBOX_BACKOFF_MS).
         const outbox = new Outbox({ backoffMs: OUTBOX_BACKOFF_MS });
         const rows: FanoutRow[] = [];
+        // Raw stored bytes per row id. /fanout deliveries (the hot path —
+        // one row per subscriber per commit) never parse the body at all:
+        // ordering needs only (scope, seq), which are COLUMNS, and the
+        // stored TEXT is already the exact wire payload (host.rpc bodyText).
+        // /relate, /adopt, and /plan-scheduled destructure body fields at
+        // delivery time and stay parsed — they are low-volume lanes.
+        const rawBodies = new Map<string, string>();
         for (const p of persisted) {
-          const row = outbox.enqueue(p.destination, JSON.parse(p.body) as FanoutBody);
+          const body: FanoutBody =
+            route === "/fanout"
+              ? { scope: p.scope, seq: Number(p.seq), cells: [], observations: [] }
+              : (JSON.parse(p.body) as FanoutBody);
+          const row = outbox.enqueue(p.destination, body);
+          rawBodies.set(row.id, p.body);
           // Rehydrate retry state: enqueue mints a fresh row; restore the
           // persisted attempts/backoff so semantics match the in-memory
           // outbox exactly (a row mid-backoff stays mid-backoff).
@@ -2162,6 +2235,7 @@ export class NetScopeDO {
         // silent caps"). The error surfaces on the failed row's metric
         // below on EVERY failed attempt, not only at abandonment.
         const deliveryErrors = new Map<string, string>();
+        const rpcStarted = Date.now();
         const drained = await outbox.drain(this.host.now(), async (row) => {
           try {
             if (route === "/adopt") {
@@ -2209,13 +2283,16 @@ export class NetScopeDO {
                 catalog_epoch: schedBody.catalog_epoch
               });
             } else {
-              await this.host.rpc(row.destination, "/fanout", row.body);
+              // Raw pass-through: the stored TEXT is the wire body (see
+              // rawBodies above) — no parse, no re-stringify.
+              await this.host.rpc(row.destination, "/fanout", undefined, rawBodies.get(row.id));
             }
           } catch (err) {
             deliveryErrors.set(row.id, String(err));
             throw err;
           }
         });
+        const rpcMs = Date.now() - rpcStarted;
         deliveredCount += drained.delivered.length;
         for (const failedId of drained.failed) {
           this.metric({
@@ -2230,39 +2307,58 @@ export class NetScopeDO {
         // skipped for backoff is byte-identical in storage — rewriting it
         // would make every pass O(batch) writes regardless of progress.
         const touched = new Set([...drained.delivered, ...drained.failed, ...drained.abandoned]);
+        // Per-lane delivered count for the prune decision below. Delivered
+        // == selected is the complete "nothing left that we saw" signal: a
+        // failed, abandoned, skipped, or halted-behind-a-failure row is by
+        // definition not delivered, so any residue makes the counts differ.
+        const laneDelivered = new Map<string, number>();
+        for (const row of rows) {
+          if (row.status === "delivered") {
+            laneDelivered.set(row.destination, (laneDelivered.get(row.destination) ?? 0) + 1);
+          }
+        }
         let abandonedCount = 0;
+        sqlStarted = Date.now();
         this.state.storage.transactionSync(() => {
+          // One batched DELETE for the delivered set (bounded at
+          // LANES_PER_PASS × ROWS_PER_LANE ids): per-row DELETEs made the
+          // healthy path pay a statement per subscriber per commit.
+          if (drained.delivered.length > 0) {
+            this.state.storage.sql.exec(
+              `DELETE FROM net_scope_outbox WHERE route = ? AND id IN (${drained.delivered.map(() => "?").join(",")})`,
+              route,
+              ...drained.delivered
+            );
+          }
+          // Failed/abandoned writebacks stay per-row: lane-halt semantics
+          // bound them to at most one attempted failure per lane per pass.
           for (const row of rows) {
-            if (!touched.has(row.id)) continue;
-            if (row.status === "delivered") {
-              this.state.storage.sql.exec("DELETE FROM net_scope_outbox WHERE route = ? AND id = ?", route, row.id);
-            } else {
-              // last_attempt_at_ms was just stamped by the attempt, so the
-              // due-time lands exactly where Outbox.drain's skip window and
-              // outboxNextRetryAt expect it (one backoff formula, three
-              // readers).
-              const nextAttemptAt = Number(row.last_attempt_at_ms) + OUTBOX_BACKOFF_MS(row.attempts);
-              this.state.storage.sql.exec(
-                "UPDATE net_scope_outbox SET status = ?, attempts = ?, last_attempt_at_ms = ?, next_attempt_at_ms = ? WHERE route = ? AND id = ?",
-                row.status,
-                row.attempts,
-                row.last_attempt_at_ms,
-                nextAttemptAt,
+            if (!touched.has(row.id) || row.status === "delivered") continue;
+            // last_attempt_at_ms was just stamped by the attempt, so the
+            // due-time lands exactly where Outbox.drain's skip window and
+            // outboxNextRetryAt expect it (one backoff formula, three
+            // readers).
+            const nextAttemptAt = Number(row.last_attempt_at_ms) + OUTBOX_BACKOFF_MS(row.attempts);
+            this.state.storage.sql.exec(
+              "UPDATE net_scope_outbox SET status = ?, attempts = ?, last_attempt_at_ms = ?, next_attempt_at_ms = ? WHERE route = ? AND id = ?",
+              row.status,
+              row.attempts,
+              row.last_attempt_at_ms,
+              nextAttemptAt,
+              route,
+              row.id
+            );
+            if (row.status === "abandoned") {
+              abandonedCount += 1;
+              this.metric({
+                kind: "net_scope_outbox_abandoned",
                 route,
-                row.id
-              );
-              if (row.status === "abandoned") {
-                abandonedCount += 1;
-                this.metric({
-                  kind: "net_scope_outbox_abandoned",
-                  route,
-                  id: row.id,
-                  destination: row.destination,
-                  status: "error",
-                  error: "E_OUTBOX_ABANDONED",
-                  attempts: row.attempts
-                });
-              }
+                id: row.id,
+                destination: row.destination,
+                status: "error",
+                error: "E_OUTBOX_ABANDONED",
+                attempts: row.attempts
+              });
             }
           }
           if (abandonedCount > 0) {
@@ -2276,27 +2372,37 @@ export class NetScopeDO {
               OUTBOX_ABANDONED_KEEP
             );
           }
-          // Prune emptied lanes from the directory (one EXISTS probe per
-          // lane this pass touched — a lane row must vanish when its last
-          // pending row does, or the directory grows with dead
-          // destinations forever).
+          // Prune emptied lanes from the directory — a lane row must vanish
+          // when its last pending row does, or the directory grows with
+          // dead destinations forever. The pass outcome decides for free in
+          // the common cases: any undelivered residue (failed, abandoned,
+          // skipped, halted-behind-a-failure) makes delivered ≠ selected —
+          // lane non-empty, skip entirely; a lane whose ENTIRE pending set
+          // fit under the row cap and fully delivered is empty by
+          // construction — delete without probing. Only a lane that filled
+          // the cap and fully delivered (more rows may exist behind the
+          // cap) still pays the EXISTS probe.
           for (const lane of lanes) {
-            const remains = sqlRows<{ n: number }>(
-              this.state.storage.sql.exec(
-                "SELECT EXISTS(SELECT 1 FROM net_scope_outbox WHERE route = ? AND destination = ? AND status = 'pending') AS n",
-                route,
-                lane
-              )
-            )[0];
-            if (!remains || Number(remains.n) === 0) {
-              this.state.storage.sql.exec(
-                "DELETE FROM net_scope_outbox_lane WHERE route = ? AND destination = ?",
-                route,
-                lane
-              );
+            const selected = laneSelected.get(lane) ?? 0;
+            if ((laneDelivered.get(lane) ?? 0) !== selected) continue;
+            if (selected === OUTBOX_ROWS_PER_LANE) {
+              const remains = sqlRows<{ n: number }>(
+                this.state.storage.sql.exec(
+                  "SELECT EXISTS(SELECT 1 FROM net_scope_outbox WHERE route = ? AND destination = ? AND status = 'pending') AS n",
+                  route,
+                  lane
+                )
+              )[0];
+              if (remains && Number(remains.n) > 0) continue;
             }
+            this.state.storage.sql.exec(
+              "DELETE FROM net_scope_outbox_lane WHERE route = ? AND destination = ?",
+              route,
+              lane
+            );
           }
         });
+        sqlMs += Date.now() - sqlStarted;
         // Phase 0/CO10 observability for the Phase-3 invariant: rows a
         // pass considered must stay bounded as the backlog grows (the
         // load gate asserts against this).
@@ -2308,7 +2414,12 @@ export class NetScopeDO {
           failed: drained.failed.length,
           abandoned: drained.abandoned.length,
           skipped_backoff: drained.skipped_backoff.length,
-          ms: Date.now() - passStarted
+          ms: Date.now() - passStarted,
+          // rpc_ms spans the delivery awaits (interleavable); sql_ms is the
+          // synchronous storage work. ms − rpc_ms ≈ the occupancy that
+          // actually blocks a concurrent submit (R10.1 attribution recipe).
+          rpc_ms: rpcMs,
+          sql_ms: sqlMs
         });
     }
     return deliveredCount;

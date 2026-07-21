@@ -19,7 +19,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { FakeDurableObjectState } from "./fake-do";
 import type { ScheduledTurn } from "../../src/net/scope";
-import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
+import { NetScopeDO, withDeliverySeq, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
 import type { NetStub } from "../../src/worker/net/workerd-host";
 
@@ -144,10 +144,21 @@ function laneRows(state: NetScopeDurableState): Array<{ route: string; destinati
 
 /** Parse the pass metrics a drain emitted (Phase-0 observability for the
  * bounded-pass invariant). */
-function drainPassMetrics(lines: string[]): Array<{ considered: number; delivered: number; ms: number }> {
+function drainPassMetrics(
+  lines: string[]
+): Array<{ considered: number; delivered: number; ms: number; rpc_ms: number; sql_ms: number }> {
   return lines
     .filter((line) => line.includes("net_scope_outbox_drain_pass"))
-    .map((line) => JSON.parse(line.slice(line.indexOf("{"))) as { considered: number; delivered: number; ms: number });
+    .map(
+      (line) =>
+        JSON.parse(line.slice(line.indexOf("{"))) as {
+          considered: number;
+          delivered: number;
+          ms: number;
+          rpc_ms: number;
+          sql_ms: number;
+        }
+    );
 }
 
 /** All emitted metric events of one kind, parsed off the console mirror. */
@@ -162,6 +173,19 @@ function tick(id: string, atMs: number): ScheduledTurn {
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+describe("withDeliverySeq — single-stringify fanout bodies", () => {
+  it("splices delivery_seq byte-equivalently to a full re-stringify", () => {
+    const base = {
+      scope: "room:x",
+      seq: 42,
+      cells: [{ key: "k", value: { v: 'quote"and{brace}' } }],
+      observations: [{ text: "nested } tail" }]
+    };
+    const spliced = withDeliverySeq(JSON.stringify(base), 9);
+    expect(spliced).toBe(JSON.stringify({ ...base, delivery_seq: 9 }));
+  });
+});
 
 describe("Phase 3 — bounded outbox drain", () => {
   afterEach(() => {
@@ -240,6 +264,82 @@ describe("Phase 3 — bounded outbox drain", () => {
     }
     // Hydration stays once-per-lifetime: the drain did not rebuild it.
     expect(metricsOfKind(metricLines, "net_scope_hydrated")).toHaveLength(1);
+    scope.close();
+  });
+
+  it("delivers /fanout rows as their exact stored bytes and splits pass duration into rpc_ms/sql_ms", async () => {
+    const metricLines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+      metricLines.push(args.map(String).join(" "));
+    });
+    const healthy = okStub();
+    const scope = netState("bounded-raw-bytes");
+    const env: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: () => healthy.stub };
+    const scopeDO = new NetScopeDO(scope.state, env);
+    // A body with fields the drain itself never reads: raw pass-through
+    // must deliver them byte-faithfully without a parse/re-stringify trip.
+    const body = { scope: SCOPE, seq: 7, cells: [], observations: [{ type: "said", text: "raw ✓" }], delivery_seq: 3 };
+    scope.state.storage.sql.exec(
+      "INSERT INTO net_scope_outbox (route, id, destination, body, status, attempts, last_attempt_at_ms, scope, seq, next_attempt_at_ms) VALUES ('/fanout', ?, ?, ?, 'pending', 0, NULL, ?, ?, 0)",
+      `gateway:mirror/${SCOPE}/7`,
+      "gateway:mirror",
+      JSON.stringify(body),
+      SCOPE,
+      7
+    );
+    scope.state.storage.sql.exec(
+      "INSERT OR IGNORE INTO net_scope_outbox_lane (route, destination) VALUES ('/fanout', ?)",
+      "gateway:mirror"
+    );
+    await kick(scopeDO, env);
+    await scope.settle();
+
+    expect(healthy.received).toHaveLength(1);
+    expect(healthy.received[0]).toEqual(body);
+    expect(pendingRows(scope.state)).toEqual([]);
+    // Provable-empty prune: one lane, one row, delivered — the directory
+    // row is gone without needing the EXISTS probe branch.
+    expect(laneRows(scope.state)).toEqual([]);
+    const passes = drainPassMetrics(metricLines);
+    expect(passes).toHaveLength(1);
+    expect(typeof passes[0]!.rpc_ms).toBe("number");
+    expect(typeof passes[0]!.sql_ms).toBe("number");
+    // The two halves partition the pass: neither may exceed the total.
+    expect(passes[0]!.rpc_ms).toBeLessThanOrEqual(passes[0]!.ms);
+    expect(passes[0]!.sql_ms).toBeLessThanOrEqual(passes[0]!.ms);
+    scope.close();
+  });
+
+  it("a drain invocation yields to an in-flight submit and the retry alarm resumes it", async () => {
+    const metricLines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+      metricLines.push(args.map(String).join(" "));
+    });
+    const healthy = okStub();
+    const scope = netState("bounded-submit-priority");
+    const env: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: () => healthy.stub };
+    const scopeDO = new NetScopeDO(scope.state, env);
+    insertRow(scope.state, "gateway:mirror", 1);
+
+    // Simulate a commit executing on this DO (the fetch path increments
+    // this around /net/submit; driving a full CommitSubmit here would test
+    // the sequencer, not the yield).
+    (scopeDO as unknown as { submitsInFlight: number }).submitsInFlight = 1;
+    await kick(scopeDO, env);
+    await scope.settle();
+    // Nothing delivered — the invocation gave way before any route pass —
+    // and the retry alarm is armed so delivery is not lost, only deferred.
+    expect(healthy.received).toHaveLength(0);
+    expect(pendingRows(scope.state)).toHaveLength(1);
+    expect(scope.alarms.length).toBeGreaterThan(0);
+    expect(scope.alarms.some((at) => at !== null)).toBe(true);
+
+    // Submit finished: the next invocation drains normally.
+    (scopeDO as unknown as { submitsInFlight: number }).submitsInFlight = 0;
+    await kick(scopeDO, env);
+    await scope.settle();
+    expect(healthy.received).toHaveLength(1);
+    expect(pendingRows(scope.state)).toEqual([]);
     scope.close();
   });
 

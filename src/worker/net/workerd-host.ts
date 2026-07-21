@@ -222,7 +222,12 @@ export class WorkerdHost implements Host {
    * JSON. Faults (test lanes only — see parseNetFaults) apply here and
    * only here.
    */
-  async rpc(destination: string, route: string, body?: unknown): Promise<unknown> {
+  /** `bodyText` short-circuits serialization: the caller already holds the
+   * exact JSON bytes (e.g. an outbox row stored as TEXT), so re-parsing and
+   * re-stringifying it per delivery attempt would be pure CPU on the
+   * authority's thread — the drain-occupancy axis of the 2026-07-20 stall
+   * finding. When provided it IS the wire body; `body` is ignored. */
+  async rpc(destination: string, route: string, body?: unknown, bodyText?: string): Promise<unknown> {
     const fault = this.faultFor(route);
     if (fault?.error) {
       throw new Error(`injected fault: ${typeof fault.error === "string" ? fault.error : `rpc error on ${route}`}`);
@@ -239,13 +244,14 @@ export class WorkerdHost implements Host {
       // The hostname is a placeholder — DO stubs ignore it; internal-auth
       // signs method + path + headers, not the origin.
       const url = `https://do/net${route}`;
+      const wireBody = bodyText ?? (body === undefined ? undefined : JSON.stringify(body));
       const request =
-        body === undefined
+        wireBody === undefined
           ? new Request(url)
           : new Request(url, {
               method: "POST",
               headers: { "content-type": "application/json" },
-              body: JSON.stringify(body)
+              body: wireBody
             });
       const signed = await signInternalRequest(this.options.env, request);
       // Real fetch observes the signal and cancels its subrequest. The
