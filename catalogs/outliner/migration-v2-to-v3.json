@@ -1,0 +1,6 @@
+{
+  "from": "2.x.x",
+  "to": "3.0.0",
+  "description": "v3 adopts the acts kernel for the five structural events: outline_item_added/removed/moved/reordered/hidden are emitted as schema-validated acts whose domain fields are enveloped under `payload` ({type, version, payload}) instead of flat observation fields. No stored object state changes shape - items, edges, focus, and undo state are untouched - so this migration performs no data rewrites. Consumers (client reducers, formatters) must accept both shapes while pre-v3 definitions remain deployed; the movement-hook echo path (enterfunc capture, exitfunc detach under a foreign authority) still emits legacy flat observations until cross-space act routing exists.",
+  "operations": []
+}

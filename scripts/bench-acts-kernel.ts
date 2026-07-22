@@ -5,7 +5,12 @@
 // curve of rows-as-one-map-prop at 10/100/1000 rows (the whole-map write
 // amplification that motivates the per-row relation-storage substrate ask).
 //
-// In-memory numbers are RELATIVE indicators — no DO storage, no network, no
+// FIRST RELATIVE INDICATORS ONLY (review 2026-07-22): single run per
+// config, fixed order, no warmup, and `say` is not an artifact-creating
+// control, so p99 moves materially between runs. Before recording a p99
+// budget: repeated randomized runs, an equivalent no-act domain control
+// (a verb that creates a $note without emitting), confidence ranges,
+// and the workerd lane. In-memory numbers are RELATIVE indicators — no DO storage, no network, no
 // serialization boundary. The workerd lane produces the budget numbers.
 //
 // Run: npx tsx scripts/bench-acts-kernel.ts

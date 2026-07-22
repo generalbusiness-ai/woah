@@ -111,6 +111,7 @@ function installDemoworldDependencyClosure(
     "note",
     "weather",
     "tasks",
+    "acts",
     "outliner",
     "pinboard",
     "dispenser",

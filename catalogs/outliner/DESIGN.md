@@ -1,5 +1,19 @@
 # Outliner — design
 
+*Amended 2026-07-22 (v3, acts adoption — supersedes stale passages
+below): outliner depends on `@local:acts`; the five structural events
+(`outline_item_added/removed/moved/reordered/hidden`) are emitted as
+schema-validated acts whose domain fields are enveloped under `payload`
+(`{type, version, payload}`), not flat observation fields — client
+reducers migrate with dual-shape tolerance. Two movement-hook paths
+stay explicitly OUTSIDE the act model until cross-space act routing
+exists: `enterfunc`'s capture echo and `exitfunc`→`_detach_item` when
+running under another space's authority (a guarded act there would be
+refused and swallowed by the hook contract, silently losing the fact) —
+those paths emit legacy flat observations, so a cross-outliner move
+yields an enveloped `added` on the destination and a flat `removed`
+from the source hook.*
+
 > **v2.0.0 — ordered-edge index (structural authority change).** Tree shape
 > and sibling order are now the **sole** responsibility of ONE room-owned edge
 > cell per item: `$outline_item.__ordered_edge = { parent, rank }`, where

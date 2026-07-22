@@ -31,9 +31,10 @@ tasks migration lands.
 
 `:act` requires `seq >= 1 && space == this` (direct routes carry `seq == -1`)
 and `caller == this` (only room verbs emit). Payloads validate against
-`event_schema(this, type)` — the closed flat shape subset (`obj`, `str`,
-`bool`, `int`, `float`, `num`, `list`, `map`), every declared key required,
-undeclared keys refused. Folds receive the act plus its envelope `seq`
+`event_schema(this, type)` — the closed flat shape vocabulary (`obj`, `str`,
+`bool`, `int`, `float`, `num`, `list`, `map`, `null`, with `a|b` unions —
+earned by the outliner migration), every declared key required,
+undeclared keys refused; `str` refuses live object refs. Folds receive the act plus its envelope `seq`
 injected by the kernel (live) or by `:rebuild_from` (recorded); the observed
 act body stays free of envelope fields.
 
@@ -60,6 +61,7 @@ v0.1.0 is the kernel proof, in-memory lane: `tests/acts-kernel.test.ts`
 covers the seams, the lifecycle, emission authority, fail-closed atomicity,
 and the rebuild invariant. Not yet: the full tasks-catalog field migration
 and parity golden (kernel note §5.3), the workerd lane, client kanban
-adoption, act-rate/storage budget measurements (§8 Tier C), and everything
+adoption, further Tier C measurement (first in-memory relative indicators exist —
+`scripts/bench-acts-kernel.ts`; workerd produces the budgets), and everything
 the vision note defers (actor emission, dynamic attach/genesis, routing,
 practices).

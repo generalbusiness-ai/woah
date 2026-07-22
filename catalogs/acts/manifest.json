@@ -134,7 +134,7 @@
           "arg_spec": {
             "args": [
               "source_space",
-              "from_seq"
+              "page_budget"
             ]
           },
           "source": "verb :rebuild_from(source_space, page_budget) rxd {\n  /* Operator rebuild (gate 1): re-fold recorded acts from the source\n     log. Incremental and idempotent: resumes after the furthest of\n     at_seq (live folds) and rebuild_scan_seq (prior rebuild scans), so\n     repeated calls never double-fold. Bounded: processes at most one\n     replay page per call - callers loop while done == false. A\n     reset/reseed path belongs with genesis replacement, not here.\n     Owner/wizard only. Skips failed entries. */\n  if (actor != this.owner && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"rebuild is owner-only\" }; }\n  let budget = 100;\n  if (typeof(page_budget) == \"number\" && page_budget >= 1 && page_budget <= 100) { budget = toint(page_budget); }\n  let from = this.at_seq;\n  if (this.rebuild_scan_seq > from) { from = this.rebuild_scan_seq; }\n  from = from + 1;\n  let entries = source_space:replay(from, budget);\n  let scanned = from - 1;\n  for e in entries {\n    scanned = e[\"seq\"];\n    if (!e[\"applied_ok\"]) { continue; }\n    for o in e[\"observations\"] {\n      if (typeof(o) == \"map\" && (\"type\" in o) && (\"payload\" in o) && (\"version\" in o) && (o[\"type\"] in this.consumes)) {\n        let input = o;\n        input[\"seq\"] = e[\"seq\"];\n        this:fold(input);\n      }\n    }\n  }\n  this.rebuild_scan_seq = scanned;\n  return { \"at_seq\": this.at_seq, \"scanned_seq\": scanned, \"done\": length(entries) < budget };\n}",
