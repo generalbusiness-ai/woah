@@ -12,6 +12,11 @@ type CallResult =
   | { op: "result"; result: unknown; observations: Array<Record<string, unknown>> }
   | { op: "error"; error: { code: string; message?: string; value?: unknown } };
 
+// Structure mutations emit acts, and acts require the sequenced route on the
+// outliner's own log (the production path post-net-cutover). These verbs go
+// through world.call with the actor's session; everything else stays direct.
+const SEQUENCED_VERBS = new Set(["add_item", "move_item", "reorder_item", "hide", "remove_item", "eject_item", "undo", "add", "hide_command"]);
+
 async function call(
   world: ReturnType<typeof createWorld>,
   actor: string,
@@ -20,6 +25,22 @@ async function call(
   args: unknown[],
   reqId = `${verb}-${Math.random().toString(36).slice(2, 7)}`
 ): Promise<CallResult> {
+  if (SEQUENCED_VERBS.has(verb)) {
+    let sessionId: string | null = null;
+    for (const [id, s] of world.sessions) if (s.actor === actor) { sessionId = id; break; }
+    if (sessionId) {
+      const f = await world.call(reqId, sessionId, target, { actor, target, verb, args: args as never[] });
+      if (f.op === "applied") {
+        const obs = ((f as { observations?: Array<Record<string, unknown>> }).observations ?? []);
+        // A refused turn commits as a failed entry whose only observation is
+        // the $error — map it back to the error shape assertions expect.
+        const err = obs.find((o) => o && (o as { type?: unknown }).type === "$error");
+        if (err) return { op: "error", error: err as unknown as { code: string; message?: string; value?: unknown } };
+        return { op: "result", result: (f as { result: unknown }).result, observations: obs };
+      }
+      return f as unknown as CallResult;
+    }
+  }
   return (await world.directCall(reqId, actor, target, verb, args as never[])) as CallResult;
 }
 
@@ -264,7 +285,10 @@ describe("outliner catalog: move / reorder / hide", () => {
     const a = await addItem(world, session.actor, "secret");
     const r = await expectResult(call(world, session.actor, "the_outline", "hide", [a, true]));
     expect(world.propOrNull(a, "hidden")).toBe(true);
-    expect(r.observations.some((o) => o.type === "outline_item_hidden" && o.hidden === true)).toBe(true);
+    // Acts envelope the domain fields under payload (kernel S2.1) — the
+    // observation wire shape changed with the acts migration; client
+    // reducers migrate in the adoption chunk.
+    expect(r.observations.some((o) => o.type === "outline_item_hidden" && (o.payload as Record<string, unknown> | undefined)?.hidden === true)).toBe(true);
     await expectResult(call(world, session.actor, "the_outline", "hide", [a, false]));
     expect(world.propOrNull(a, "hidden")).toBe(false);
   });
