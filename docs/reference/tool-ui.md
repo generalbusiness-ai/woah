@@ -95,6 +95,27 @@ same actor `moveto` path as room exits. A tool-space class puts entry and
 exit side effects in `enterfunc` / `exitfunc`; the way back is an `out`
 exit seeded by the world catalog, not a component-specific leave button.
 
+## Complete semantic collections
+
+Do not infer that a projected collection is complete: a thin neighborhood can
+legitimately omit rows. A tool whose server exposes one bounded authoritative
+view should register it with `registerWooViews` and consume it through
+`WooContext.view()` plus `WooViewController`. The definition owns the catalog
+verb, result validation, projection seed, and invalidation match; the framework
+owns principal-scoped sharing, one-read coalescing, stale-result rejection, and
+refresh state.
+
+Only a `complete/current` snapshot may replace a whole collection. Partial
+projection data is an immediate paint, not proof of emptiness; stale complete
+data may remain visible during refresh but must not overwrite a just-accepted
+local observation. Keep optimistic presentation local, and never mutate the
+shared snapshot value.
+
+Outliner is the reference adopter: `outliner.tree` reads the watermarked
+`tree_view`, while the element keeps its separate roster watchdog and display
+text accelerator. See the normative contract in
+[`spec/protocol/ui-component-model.md` §UCM24.1](../../spec/protocol/ui-component-model.md#ucm241-reactive-semantic-views).
+
 ## Do Not
 
 - Do not hand-roll a second chat panel for a normal tool space.
@@ -115,6 +136,8 @@ exit seeded by the world catalog, not a component-specific leave button.
 - Do not add Enter/Leave controls to a tool component. Tool presence is
   actor movement, and browser tab activation owns that move.
 - Do not store presence only in client-local state.
+- Do not rebuild collection hydration generations, in-flight maps, or refresh
+  queues inside a component when a bounded semantic view can declare them once.
 - Do not copy a tool's domain UI as the pattern. Copy the frame shape and
   workspace shell contract; the domain UI should remain catalog-specific.
 

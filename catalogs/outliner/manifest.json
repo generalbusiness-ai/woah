@@ -69,7 +69,8 @@
           "outline_item_hidden",
           "outline_focus_changed",
           "outline_undone",
-          "note_edited"
+          "note_edited",
+          "note_writers_changed"
         ]
       }
     ],

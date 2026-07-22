@@ -333,6 +333,10 @@ verb :tree_view() rxd {
 - Track non-acted changes (item text, writer grants, movement-hook
   echoes) with a separate read-generation — the structural watermark
   does not cover them.
+- In browser UI, put that read-generation in the generic semantic-view facade,
+  not in a component-owned hydrator. Outliner registers `outliner.tree`, reads
+  `tree_view`, and invalidates for both structural acts and the non-acted
+  changes above.
 - Prune `this.projections` when you touch it — the kernel reads
   `consumes` on every entry, so one dead ref breaks every emission.
 - Wrap `isa()`/`location()` on stored refs in try/except and treat

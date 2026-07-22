@@ -337,6 +337,7 @@ type ModuleExports = {
   registerWooObservationHandlers?: (registry: ObservationRegistry) => void;
   registerWooChatFormatters?: (registry: ChatFormatterRegistry) => void;
   registerWooViewHydrations?: (registry: WooViewHydrationRegistry) => void;
+  registerWooViews?: (registry: WooViewRegistry) => void;
 };
 
 export type WooComponentRegistry = {
@@ -378,6 +379,58 @@ export type WooNeighborhood = {
   has(ref: string): boolean;
 };
 
+export type WooViewCompleteness = "unknown" | "partial" | "complete";
+export type WooViewFreshness = "stale" | "current";
+export type WooViewFetchStatus = "idle" | "loading" | "refreshing" | "error";
+
+export type WooViewSnapshot<T> = Readonly<{
+  data: T | null;
+  completeness: WooViewCompleteness;
+  freshness: WooViewFreshness;
+  fetchStatus: WooViewFetchStatus;
+  revision: number;
+  error: unknown | null;
+}>;
+
+export type WooView<T> = {
+  getSnapshot(): WooViewSnapshot<T>;
+  subscribe(listener: () => void): () => void;
+  refresh(): void;
+};
+
+export type WooViewRequest = {
+  view: string;
+  subject: string;
+  args?: readonly unknown[];
+};
+
+export type WooViewSeedContext = {
+  projection: ClientProjection;
+  woo: WooContext;
+  subject: string;
+  args: readonly unknown[];
+};
+
+export type WooViewReadContext = WooViewSeedContext;
+
+export type WooViewInvalidationContext = WooViewSeedContext & {
+  observation: Record<string, unknown>;
+  delivered: DeliveredObservation;
+};
+
+export type WooViewDefinition<T> = {
+  id: string;
+  seed?: (context: WooViewSeedContext) => T | null;
+  read: (context: WooViewReadContext) => Promise<unknown>;
+  parse: (result: unknown) => T;
+  invalidateOn?: readonly string[];
+  affects?: (context: WooViewInvalidationContext) => boolean;
+};
+
+export type WooViewRegistry = {
+  view<T>(definition: WooViewDefinition<T>): void;
+};
+
 export type WooFrameContext = {
   id: string;
   subject: string;
@@ -394,6 +447,10 @@ export type WooContext = {
   call(target: string, verb: string, args?: unknown[], options?: ProjectionCallOptions): Promise<unknown>;
   send(command: string, space?: string, options?: ProjectionCallOptions): Promise<unknown>;
   directCall(target: string, verb: string, args?: unknown[], options?: ProjectionCallOptions): Promise<unknown>;
+  /** Catalog-defined bounded semantic reads. Optional only for compatibility
+   * with UI contexts authored before the additive facade; new collection
+   * components should require it rather than rebuilding hydration locally. */
+  view?<T>(request: WooViewRequest): WooView<T>;
   emit(action: WooUiAction): boolean;
 };
 
@@ -433,6 +490,7 @@ export class CatalogUiRegistry {
   private definedTags = new Map<string, CustomElementConstructor>();
   private loadedModules = new Set<string>();
   private viewHydrations = new Map<string, WooViewHydration>();
+  private views = new Map<string, WooViewDefinition<unknown>>();
 
   installCatalogUi(pkg: CatalogUiPackage): string[] {
     if (pkg.ui.abi !== "woo-ui/v1") return [`unsupported UI ABI for ${pkg.alias}: ${pkg.ui.abi}`];
@@ -526,6 +584,33 @@ export class CatalogUiRegistry {
     return hydration ? { id, hydration } : undefined;
   }
 
+  defineView<T>(alias: string, definition: WooViewDefinition<T>): void {
+    if (!this.catalogs.has(alias)) throw new Error(`unknown catalog UI alias: ${alias}`);
+    const id = String(definition.id ?? "");
+    if (!id || id.includes(":")) throw new Error(`view id must be nonempty and unqualified: ${id}`);
+    const qualified = `${alias}:${id}`;
+    if (this.views.has(qualified)) throw new Error(`view already registered: ${qualified}`);
+    this.views.set(qualified, definition as WooViewDefinition<unknown>);
+  }
+
+  resolveView<T>(id: string, declaringAlias?: string): { id: string; definition: WooViewDefinition<T> } | undefined {
+    const raw = String(id ?? "");
+    if (!raw) return undefined;
+    if (raw.includes(":")) {
+      const definition = this.views.get(raw);
+      return definition ? { id: raw, definition: definition as WooViewDefinition<T> } : undefined;
+    }
+    if (declaringAlias) {
+      const qualified = `${declaringAlias}:${raw}`;
+      const definition = this.views.get(qualified);
+      if (definition) return { id: qualified, definition: definition as WooViewDefinition<T> };
+    }
+    const matches = [...this.views.entries()].filter(([qualified]) => qualified.endsWith(`:${raw}`));
+    return matches.length === 1
+      ? { id: matches[0][0], definition: matches[0][1] as WooViewDefinition<T> }
+      : undefined;
+  }
+
   async loadModule(
     alias: string,
     moduleId: string,
@@ -544,6 +629,7 @@ export class CatalogUiRegistry {
     mod.registerWooObservationHandlers?.(observations);
     mod.registerWooChatFormatters?.(chatFormatters);
     mod.registerWooViewHydrations?.({ define: (id, hydration) => this.defineViewHydration(alias, moduleId, id, hydration) });
+    mod.registerWooViews?.({ view: (definition) => this.defineView(alias, definition) });
     this.loadedModules.add(key);
   }
 
@@ -557,6 +643,7 @@ export class CatalogUiRegistry {
     mod.registerWooObservationHandlers?.(observations);
     mod.registerWooChatFormatters?.(chatFormatters);
     mod.registerWooViewHydrations?.({ define: (id, hydration) => this.defineViewHydration(alias, moduleId, id, hydration) });
+    mod.registerWooViews?.({ view: (definition) => this.defineView(alias, definition) });
     this.loadedModules.add(key);
   }
 
@@ -841,6 +928,247 @@ export class ClientProjection {
   }
 }
 
+type WooViewEntry<T> = {
+  definition: WooViewDefinition<T>;
+  subject: string;
+  args: readonly unknown[];
+  woo: WooContext;
+  snapshot: WooViewSnapshot<T>;
+  listeners: Set<() => void>;
+  requestedRevision: number;
+  generation: number;
+  inFlight: Promise<void> | null;
+  inactiveAt: number | null;
+  facade: WooView<T>;
+};
+
+const EMPTY_VIEW_SNAPSHOT: WooViewSnapshot<never> = Object.freeze({
+  data: null,
+  completeness: "unknown",
+  freshness: "current",
+  fetchStatus: "idle",
+  revision: 0,
+  error: null
+});
+
+/** Principal-scoped cache for bounded catalog semantic reads. Projection is a
+ * fast partial seed only; completeness always comes from the registered read.
+ * Entries retain the last complete value across refreshes and use a requested
+ * revision to reject results overtaken by accepted observations. */
+export class WooViewStore {
+  private readonly entries = new Map<string, WooViewEntry<unknown>>();
+  private readonly anonymousPrincipals = new WeakMap<WooContext, string>();
+  private nextAnonymousPrincipal = 1;
+
+  constructor(
+    private readonly registry: CatalogUiRegistry,
+    private readonly projection: ClientProjection,
+    private readonly now: () => number = Date.now,
+    private readonly inactiveTtlMs = 30_000
+  ) {}
+
+  view<T>(principal: string | null | undefined, woo: WooContext, request: WooViewRequest): WooView<T> {
+    const resolved = this.registry.resolveView<T>(request.view);
+    if (!resolved) throw new Error(`unknown semantic view: ${request.view}`);
+    const subject = String(request.subject ?? "");
+    if (!subject) throw new Error(`semantic view ${resolved.id} requires a subject`);
+    // Detach structured arguments from caller-owned objects. Otherwise a
+    // mutation after lookup could make the read inputs disagree with the key
+    // that selected this shared entry.
+    const serializedArgs = canonicalViewArgs(request.args ?? []);
+    const args = Object.freeze(JSON.parse(serializedArgs) as unknown[]);
+    const principalKey = principal || this.anonymousPrincipal(woo);
+    const key = `${principalKey}\u0000${resolved.id}\u0000${subject}\u0000${serializedArgs}`;
+    const existing = this.entries.get(key) as WooViewEntry<T> | undefined;
+    if (existing) {
+      // Contexts are cheap and may be recreated by the shell. The cache identity
+      // is principal/view/subject/args; use the latest transport capabilities.
+      existing.woo = woo;
+      existing.inactiveAt = null;
+      return existing.facade;
+    }
+
+    let data: T | null = null;
+    let completeness: WooViewCompleteness = "unknown";
+    if (resolved.definition.seed) {
+      data = resolved.definition.seed({ projection: this.projection, woo, subject, args });
+      if (data !== null) completeness = "partial";
+    }
+    const entry = {} as WooViewEntry<T>;
+    entry.definition = resolved.definition;
+    entry.subject = subject;
+    entry.args = args;
+    entry.woo = woo;
+    entry.snapshot = Object.freeze({ data, completeness, freshness: "current", fetchStatus: "idle", revision: 0, error: null });
+    entry.listeners = new Set();
+    entry.requestedRevision = 0;
+    entry.generation = 0;
+    entry.inFlight = null;
+    entry.inactiveAt = null;
+    entry.facade = {
+      getSnapshot: () => entry.snapshot,
+      subscribe: (listener) => {
+        entry.listeners.add(listener);
+        entry.inactiveAt = null;
+        if (entry.listeners.size === 1 && (entry.snapshot.completeness !== "complete" || entry.snapshot.freshness === "stale")) this.startRead(entry);
+        return () => {
+          entry.listeners.delete(listener);
+          if (entry.listeners.size === 0) entry.inactiveAt = this.now();
+        };
+      },
+      refresh: () => this.invalidateEntry(entry)
+    };
+    this.entries.set(key, entry as WooViewEntry<unknown>);
+    return entry.facade;
+  }
+
+  invalidate(observation: Record<string, unknown>, delivered: DeliveredObservation): void {
+    this.invalidateBatch([observation], delivered);
+  }
+
+  /** One accepted frame is one invalidation boundary. Several observations in
+   * the same frame may describe one mutation; refresh each affected instance
+   * once after projection reducers have consumed the whole frame. */
+  invalidateBatch(observations: readonly Record<string, unknown>[], delivered: DeliveredObservation): void {
+    for (const raw of this.entries.values()) {
+      const entry = raw as WooViewEntry<unknown>;
+      if (entry.listeners.size === 0) continue;
+      const affected = observations.some((observation) => {
+        const type = String(observation.type ?? "");
+        if (!type || !entry.definition.invalidateOn?.includes(type)) return false;
+        const context = {
+          projection: this.projection,
+          woo: entry.woo,
+          subject: entry.subject,
+          args: entry.args,
+          observation,
+          delivered
+        };
+        return entry.definition.affects
+          ? entry.definition.affects(context)
+          : defaultViewSubjectMatch(entry.subject, observation, delivered);
+      });
+      if (affected) this.invalidateEntry(entry);
+    }
+  }
+
+  prune(now = this.now()): number {
+    let removed = 0;
+    for (const [key, entry] of this.entries) {
+      if (entry.listeners.size > 0 || entry.inactiveAt === null || now - entry.inactiveAt < this.inactiveTtlMs) continue;
+      entry.generation += 1;
+      this.entries.delete(key);
+      removed += 1;
+    }
+    return removed;
+  }
+
+  private anonymousPrincipal(woo: WooContext): string {
+    const existing = this.anonymousPrincipals.get(woo);
+    if (existing) return existing;
+    const next = `anonymous:${this.nextAnonymousPrincipal++}`;
+    this.anonymousPrincipals.set(woo, next);
+    return next;
+  }
+
+  private invalidateEntry<T>(entry: WooViewEntry<T>): void {
+    entry.requestedRevision += 1;
+    const complete = entry.snapshot.completeness === "complete";
+    this.publish(entry, {
+      ...entry.snapshot,
+      freshness: complete ? "stale" : entry.snapshot.freshness,
+      error: null
+    });
+    if (entry.listeners.size > 0 && !entry.inFlight) this.startRead(entry);
+  }
+
+  private startRead<T>(entry: WooViewEntry<T>): void {
+    if (entry.inFlight) return;
+    const requestedRevision = entry.requestedRevision;
+    const generation = entry.generation;
+    this.publish(entry, {
+      ...entry.snapshot,
+      fetchStatus: entry.snapshot.completeness === "complete" ? "refreshing" : "loading",
+      error: null
+    });
+    const read = Promise.resolve(entry.definition.read({
+      projection: this.projection,
+      woo: entry.woo,
+      subject: entry.subject,
+      args: entry.args
+    })).then((result) => {
+      if (entry.generation !== generation || entry.requestedRevision !== requestedRevision) return;
+      const data = entry.definition.parse(result);
+      this.publish(entry, {
+        data,
+        completeness: "complete",
+        freshness: "current",
+        fetchStatus: "idle",
+        revision: entry.snapshot.revision,
+        error: null
+      });
+    }).catch((error) => {
+      if (entry.generation !== generation || entry.requestedRevision !== requestedRevision) return;
+      this.publish(entry, { ...entry.snapshot, fetchStatus: "error", error });
+    }).finally(() => {
+      if (entry.inFlight !== read) return;
+      entry.inFlight = null;
+      if (entry.listeners.size > 0 && entry.requestedRevision !== requestedRevision) this.startRead(entry);
+    });
+    entry.inFlight = read;
+  }
+
+  private publish<T>(entry: WooViewEntry<T>, next: Omit<WooViewSnapshot<T>, "revision"> & { revision?: number }): void {
+    const candidate: WooViewSnapshot<T> = Object.freeze({
+      ...next,
+      revision: snapshotsEqual(entry.snapshot, next) ? entry.snapshot.revision : entry.snapshot.revision + 1
+    });
+    if (snapshotsEqual(entry.snapshot, candidate)) return;
+    entry.snapshot = candidate;
+    for (const listener of [...entry.listeners]) {
+      try { listener(); } catch {
+        // One component's render failure is local to that component. It must
+        // not turn a successful authoritative read into a store error or keep
+        // sibling subscribers from observing the same publication.
+      }
+    }
+  }
+}
+
+function snapshotsEqual<T>(left: WooViewSnapshot<T>, right: Omit<WooViewSnapshot<T>, "revision"> & { revision?: number }): boolean {
+  return left.data === right.data
+    && left.completeness === right.completeness
+    && left.freshness === right.freshness
+    && left.fetchStatus === right.fetchStatus
+    && left.error === right.error;
+}
+
+function defaultViewSubjectMatch(subject: string, observation: Record<string, unknown>, delivered: DeliveredObservation): boolean {
+  return [observation.source, observation.subject, delivered.space].some((value) => value === subject);
+}
+
+function canonicalViewArgs(value: unknown): string {
+  const seen = new Set<object>();
+  const encode = (item: unknown): unknown => {
+    if (item === null || typeof item === "string" || typeof item === "boolean") return item;
+    if (typeof item === "number") {
+      if (!Number.isFinite(item)) throw new Error("semantic view args must contain finite numbers");
+      return item;
+    }
+    if (Array.isArray(item)) return item.map(encode);
+    if (typeof item === "object") {
+      if (seen.has(item)) throw new Error("semantic view args must not contain cycles");
+      seen.add(item);
+      const result: Record<string, unknown> = {};
+      for (const key of Object.keys(item as Record<string, unknown>).sort()) result[key] = encode((item as Record<string, unknown>)[key]);
+      seen.delete(item);
+      return result;
+    }
+    throw new Error(`unsupported semantic view arg: ${typeof item}`);
+  };
+  return JSON.stringify(encode(value));
+}
+
 export class ObservationRegistry {
   private handlers: WooObservationHandler[] = [];
 
@@ -850,14 +1178,15 @@ export class ObservationRegistry {
     this.handlers.push(handler);
   }
 
-  deliver(observation: Record<string, unknown>, delivered: DeliveredObservation) {
+  deliver(observation: Record<string, unknown>, delivered: DeliveredObservation): boolean {
     const type = String(observation?.type ?? "");
-    if (!type) return;
+    if (!type) return false;
     const envelope = { observation, delivered };
     if (delivered.route === "live") {
       const livePatches: ProjectionPatch[] = [];
       const canonicalPatches: ProjectionPatch[] = [];
       const canonicalClears: string[] = [];
+      let accepted = false;
       for (const handler of this.handlers) {
         if (!handler.types.includes(type)) continue;
         if (handler.route && handler.route !== "both" && handler.route !== delivered.route) continue;
@@ -866,6 +1195,7 @@ export class ObservationRegistry {
         const patches = draft.consume();
         const clears = draft.consumeAuthoritativeClears();
         if (handler.liveProjection === "canonical") {
+          accepted = true;
           canonicalPatches.push(...patches);
           canonicalClears.push(...clears);
         } else {
@@ -877,7 +1207,7 @@ export class ObservationRegistry {
       for (const patch of livePatches) {
         this.projection.applyLive(liveProjectionKey(type, patch.subject, livePatchDiscriminator(patch)), [patch]);
       }
-      return;
+      return accepted;
     }
 
     const draft = new ProjectionDraft();
@@ -888,9 +1218,10 @@ export class ObservationRegistry {
     }
     const patches = draft.consume();
     const authoritativeClears = draft.consumeAuthoritativeClears();
-    if (patches.length === 0 && authoritativeClears.length === 0) return;
+    if (patches.length === 0 && authoritativeClears.length === 0) return true;
     for (const subject of authoritativeClears) this.projection.clearAuthoritative(subject, { notify: patches.length === 0 });
     this.projection.applySequenced(patches);
+    return true;
   }
 
   optimisticPatches(observations: unknown[], delivered: DeliveredObservation): ProjectionPatch[] {
@@ -1031,6 +1362,9 @@ export class WooClientFramework {
   readonly chatFormatters = new ChatFormatterRegistry();
   readonly frames = new FrameStateStore();
   readonly catalogUi = new CatalogUiRegistry();
+  readonly views = new WooViewStore(this.catalogUi, this.projection);
+  private pendingViewInvalidations = new Map<string, { observations: Record<string, unknown>[]; delivered: DeliveredObservation }>();
+  private viewInvalidationFlushQueued = false;
 
   constructor() {
     registerCoreObservationHandlers(this.observations);
@@ -1048,16 +1382,55 @@ export class WooClientFramework {
       frameId: typeof frame?.id === "string" ? frame.id : undefined,
       receivedAt: Date.now()
     };
+    const accepted: Record<string, unknown>[] = [];
     for (const observation of frame?.observations ?? []) {
       if (observation && typeof observation === "object" && !Array.isArray(observation)) {
-        this.observations.deliver(observation, delivered);
+        if (this.observations.deliver(observation, delivered)) accepted.push(observation);
       }
     }
+    this.views.invalidateBatch(accepted, delivered);
   }
 
   ingestLiveObservation(observation: any) {
     if (!observation || typeof observation !== "object" || Array.isArray(observation)) return;
-    this.observations.deliver(observation, { route: "live", receivedAt: Date.now() });
+    const delivered: DeliveredObservation = { route: "live", receivedAt: Date.now() };
+    this.ingestDeliveredObservation(observation, delivered);
+  }
+
+  /** Canonical transport-neutral observation boundary. Adapters must enter
+   * here, rather than calling the reducer registry directly, so projection
+   * reduction and semantic-view invalidation cannot drift apart. */
+  ingestDeliveredObservation(observation: Record<string, unknown>, delivered: DeliveredObservation): boolean {
+    if (!observation || typeof observation !== "object" || Array.isArray(observation)) return false;
+    const accepted = this.observations.deliver(observation, delivered);
+    if (accepted) this.queueViewInvalidation(observation, delivered);
+    return accepted;
+  }
+
+  /** NetFeed exposes one callback per observation even when several share one
+   * committed carrier. Reducers remain synchronous, while view invalidation is
+   * coalesced to that carrier so one turn schedules one authoritative read. */
+  private queueViewInvalidation(observation: Record<string, unknown>, delivered: DeliveredObservation): void {
+    if (delivered.route !== "sequenced" || (delivered.seq === undefined && !delivered.frameId)) {
+      this.views.invalidate(observation, delivered);
+      return;
+    }
+    const key = `${delivered.route}\u0000${delivered.space ?? ""}\u0000${delivered.seq ?? ""}\u0000${delivered.frameId ?? ""}`;
+    const pending = this.pendingViewInvalidations.get(key);
+    if (pending) pending.observations.push(observation);
+    else this.pendingViewInvalidations.set(key, { observations: [observation], delivered });
+    if (this.viewInvalidationFlushQueued) return;
+    this.viewInvalidationFlushQueued = true;
+    queueMicrotask(() => {
+      this.viewInvalidationFlushQueued = false;
+      const batches = [...this.pendingViewInvalidations.values()];
+      this.pendingViewInvalidations.clear();
+      for (const batch of batches) this.views.invalidateBatch(batch.observations, batch.delivered);
+    });
+  }
+
+  view<T>(principal: string | null | undefined, woo: WooContext, request: WooViewRequest): WooView<T> {
+    return this.views.view(principal, woo, request);
   }
 
   observe(ref: string) {
@@ -1118,7 +1491,9 @@ export class WooClientFramework {
   }
 
   prune(now = Date.now()) {
-    return this.projection.prune(now);
+    const projectionChanged = this.projection.prune(now);
+    this.views.prune(now);
+    return projectionChanged;
   }
 
   refs() {
@@ -1128,6 +1503,59 @@ export class WooClientFramework {
 
 export function createWooClientFramework() {
   return new WooClientFramework();
+}
+
+/** Vanilla custom-element adapter for WooView. It owns late woo/subject
+ * binding, subscription replacement, and disconnect/reconnect behavior so a
+ * component cannot accidentally render a partial collection as final. */
+export class WooViewController<T> {
+  private view: WooView<T> | null = null;
+  private unsubscribe: (() => void) | null = null;
+  private isConnected = false;
+
+  constructor(
+    private readonly host: HTMLElement,
+    private readonly request: () => WooViewRequest | null,
+    private readonly render: () => void
+  ) {
+    void this.host;
+  }
+
+  get snapshot(): WooViewSnapshot<T> {
+    return this.view?.getSnapshot() ?? (EMPTY_VIEW_SNAPSHOT as WooViewSnapshot<T>);
+  }
+
+  bind(woo: WooContext | undefined): void {
+    const request = this.request();
+    const next = woo?.view && request ? woo.view<T>(request) : null;
+    if (next === this.view) return;
+    this.unsubscribe?.();
+    this.unsubscribe = null;
+    this.view = next;
+    if (this.isConnected && this.view) this.subscribe();
+    this.render();
+  }
+
+  connected(): void {
+    if (this.isConnected) return;
+    this.isConnected = true;
+    if (this.view) this.subscribe();
+  }
+
+  disconnected(): void {
+    this.isConnected = false;
+    this.unsubscribe?.();
+    this.unsubscribe = null;
+  }
+
+  refresh(): void {
+    this.view?.refresh();
+  }
+
+  private subscribe(): void {
+    if (!this.view || this.unsubscribe) return;
+    this.unsubscribe = this.view.subscribe(() => this.render());
+  }
 }
 
 // Room-contents snapshots are thin by design (no props), so a viewer who just

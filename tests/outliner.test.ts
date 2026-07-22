@@ -735,6 +735,40 @@ describe("outliner catalog: room_roster (presence aside)", () => {
 });
 
 describe("outliner acts: watermark projection + tree_view", () => {
+  it("tree_view stays byte-for-byte equal to list_items through every structural verb", async () => {
+    const world = setupWorld();
+    const session = world.auth("guest:wm-parity");
+    await expectResult(call(world, session.actor, "the_outline", "enter", []));
+    let watermark = 0;
+    const parity = async (advances: boolean) => {
+      const view = (await expectResult(call(world, session.actor, "the_outline", "tree_view", []))).result as { items: unknown[]; structure_at_seq: number };
+      const rows = (await expectResult(call(world, session.actor, "the_outline", "list_items", []))).result;
+      expect(view.items).toEqual(rows);
+      if (advances) expect(view.structure_at_seq).toBeGreaterThan(watermark);
+      else expect(view.structure_at_seq).toBe(watermark);
+      watermark = view.structure_at_seq;
+    };
+
+    // Empty/new is the same genesis as an upgraded outline with no v3 acts.
+    await parity(false);
+    const a = await addItem(world, session.actor, "a");
+    await parity(true);
+    const b = await addItem(world, session.actor, "b");
+    await parity(true);
+    const child = await addItem(world, session.actor, "child", a);
+    await parity(true);
+    await expectResult(call(world, session.actor, "the_outline", "move_item", [child, b, 0]));
+    await parity(true);
+    await expectResult(call(world, session.actor, "the_outline", "reorder_item", [b, 0]));
+    await parity(true);
+    await expectResult(call(world, session.actor, "the_outline", "hide", [child, true]));
+    await parity(true);
+    await expectResult(call(world, session.actor, "the_outline", "set_item_text", [child, "child edited"]));
+    await parity(false);
+    await expectResult(call(world, session.actor, "the_outline", "remove_item", [a]));
+    await parity(true);
+  });
+
   it("structure_at_seq tracks acted structural changes, rebuilds, and gates tree_view", async () => {
     const world = setupWorld();
     const session = world.auth("guest:wm");

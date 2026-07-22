@@ -23,7 +23,7 @@ function wiredRegistry(register: (registry: ObservationRegistry) => void): { pro
   const registry = new ObservationRegistry(projection);
   register(registry);
   let handler: Parameters<NetFeedSource["onObservation"]>[0] = () => {};
-  wireNetFeed({ observations: registry }, {
+  wireNetFeed({ ingestDeliveredObservation: (observation, delivered) => { registry.deliver(observation, delivered); } }, {
     onObservation: (fn) => {
       handler = fn;
       return () => {};

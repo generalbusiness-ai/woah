@@ -422,7 +422,7 @@ describe("outliner v1 -> v2 migration", () => {
     expect(world.ownVerbExact("$outliner", "tree_view")).not.toBeNull();
   }
 
-  it("boot-upgrades an aged v1 outliner to the bundled v3 (composed v1→v2→v3 chain, the prod deploy path)", () => {
+  it("boot-upgrades an aged v1 outliner to the bundled v3 (composed v1→v2→v3 chain, the prod deploy path)", async () => {
     const world = createWorld({ catalogs: false });
     installLocalCatalogs(world, ["chat", "note"]);
     // A synthetic v1 outliner (real class names/ancestors) with aged items.
@@ -440,6 +440,22 @@ describe("outliner v1 -> v2 migration", () => {
     installLocalCatalogs(world, ["chat", "note", "outliner"]);
 
     assertBootUpgraded(world);
+    // Migration derives the substrate edges but must not invent historical
+    // acts. The authoritative tree is immediately readable while its
+    // structural watermark remains at the explicit legacy genesis (0) until
+    // the first v3 structural mutation.
+    const result = await world.directCall("legacy-tree-view", "$wiz", "boot_mo", "tree_view", []);
+    expect(result).toMatchObject({
+      op: "result",
+      result: {
+        structure_at_seq: 0,
+        items: [
+          { id: "bi_b", index: 0, parent_id: null },
+          { id: "bi_a", index: 1, parent_id: null }
+        ]
+      }
+    });
+    expect(world.getProp("boot_mo", "projections")).toEqual([]);
   });
 
   it("boot-upgrades an aged v0 outliner to the bundled v3 (composed v0→v1→v2→v3 chain)", () => {

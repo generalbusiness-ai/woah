@@ -37,6 +37,16 @@ dead/foreign `projections` entries, since the kernel's fold loop reads
 `.consumes` on every entry and one bad ref would refuse every later
 act.*
 
+*The browser now consumes that read through the generic reactive semantic-view
+facade as `outliner.tree`. Thin projection still paints immediately, but only a
+validated `tree_view` result is `complete/current` and may replace the whole
+collection. Accepted structural acts, flat movement-hook echoes, `note_edited`,
+and `note_writers_changed` invalidate the view once per applied frame. The
+facade owns principal-scoped sharing, stale-result rejection, and refresh
+failure state; the element retains only its UI-local optimistic overlay, roster
+watchdog, and principal-scoped text accelerator. Stale complete data is never
+re-applied over an accepted local update.*
+
 > **v2.0.0 — ordered-edge index (structural authority change).** Tree shape
 > and sibling order are now the **sole** responsibility of ONE room-owned edge
 > cell per item: `$outline_item.__ordered_edge = { parent, rank }`, where
@@ -599,19 +609,19 @@ a dedicated **Outliner** tab (between Tasks and Inspector). Routing:
 - `renderOutliner()` emits the `<woo-outliner-tree data-outliner-tree>`
   tag, resolved via `toolFrameComponentTag(outlinerSpace(), …)`.
 - `mountOutlinerComponent()` sets `subject` and `woo` on the element
-  and lets it render from projection. If the generic projection has the
-  tree structure but not readable note text, the component uses the shared
-  coalesced view hydrator to call `list_items` once for that missing-text
-  signature.
+  and lets it render from projection. The generic `outliner.tree` semantic
+  view then performs one shared authoritative `tree_view` read; only its
+  validated `complete/current` result may replace the whole collection.
 
 The component treats projection as provisional structural data: ids, parent,
 position, hidden state, and roster are cheap to render immediately. The
-joined `list_items` view is the display authority for both readable item text
-and derived parent/index ordering, because `$note.text` readability is
-catalog-defined and the observation-time structural overlay is unversioned.
-Structural observations patch the local model so normal add/edit/move turns
-stay responsive; after `list_items` lands, a weaker projection snapshot must
-not erase text or restore older structure. Tab state,
+watermarked `tree_view` (whose `items` are the joined `list_items` result) is
+the display authority for readable text and derived parent/index ordering,
+because `$note.text` readability is catalog-defined and the observation-time
+structural overlay is unversioned. Structural observations patch the local
+model immediately; the facade invalidates once per accepted frame, rejects an
+overtaken read, and prevents weaker projection or stale complete data from
+erasing that accepted state. Tab state,
 presence, and route URLs follow the same shape as Pinboard / Tasks
 (`outliner` view hint, `routedSubjects.outliner`,
 `scopedToolSubject("outliner")`).
@@ -760,15 +770,13 @@ Other component-owned surfaces:
   client doesn't need to track slot state.
 - Embedded chat mount point.
 
-Client wire path: pinboard/kanban-pattern. Generic neighborhood
-projection is an immediate-paint accelerator, not a completeness
-signal: a newly opened session can legitimately have zero or only some
-item refs. Each mounted outliner therefore performs one coalesced,
-server-authoritative `list_items` read for the whole tree, even when
-the projected rows already carry text. Accepted structural
-observations update the DOM immediately and advance the hydration
-revision; an older in-flight read is ignored and a new read verifies
-the post-mutation tree.
+Client wire path: generic semantic-view facade. Generic neighborhood projection
+is an immediate-paint accelerator, not a completeness signal: a newly opened
+session can legitimately have zero or only some item refs. All mounted
+consumers for the same principal/outliner share one authoritative `tree_view`.
+Accepted structural or content observations update the DOM immediately and
+invalidate that entry; an older in-flight result is ignored and at most one
+follow-up read verifies the post-mutation tree.
 
 The v2 room-owned `__ordered_edge {parent, rank}` remains the sole
 persisted structural authority. While a committed add/move observation
@@ -776,15 +784,15 @@ is ahead of generic projection, the client reducer stores its
 `parent_id` and derived `index` in catalog-owned
 `catalogState.outliner_tree`. It must not patch the retired v1
 per-item `parent` / `position` properties. The component consumes that
-overlay until the authoritative `list_items` result arrives, which
+overlay until the authoritative `tree_view` result arrives, which
 keeps a newly-created child nested rather than briefly or permanently
 promoting it to the root. Once that result arrives, its parent/index rows
 outrank the retained unversioned overlay on later SPA renders. Live structural
-observations continue to update the same local model and advance the next
-authoritative read revision.
+observations continue to update the same local model and invalidate the shared
+semantic view.
 
-Mutations use the v2 commit plane; the whole-tree hydration uses the v2
-direct plane with an authoritative server read.
+Mutations use the active sequenced commit plane; whole-tree hydration uses the
+transport's authoritative direct-read path.
 
 Presence follows the same completeness rule. The cheap subscriber
 projection paints immediately, but once the host confirms that the

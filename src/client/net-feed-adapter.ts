@@ -1,8 +1,8 @@
 /**
  * NetFeed → framework adapter (Plan 002 Phase 4 item 4 chunk 2).
  *
- * Translates NetFeed observation events into EXACTLY the reducer input
- * framework.ts's ObservationRegistry consumes — the same
+ * Translates NetFeed observation events into EXACTLY the canonical framework
+ * observation boundary — the same
  * (observation, DeliveredObservation) pair the v2 path builds in
  * WooClientFramework.ingestAppliedFrame for committed frames:
  * route:"sequenced" with the committed seq and the emitting space. The
@@ -27,8 +27,8 @@
  * chain). Cluster-committed turns have no sequencing space; `space` is
  * honestly omitted, exactly like a v2 direct-route frame.
  *
- * Nothing in production imports this yet: wireNetFeed is the entry the
- * Phase-5 cutover calls (kickoff item 4; v2 stays untouched until then).
+ * The Net shell installs wireNetFeed beside its side-effect dispatcher; v2
+ * keeps using ingestAppliedFrame. Both enter the same framework boundary.
  */
 import type { DeliveredObservation } from "./framework";
 import type { NetFeedObservationEvent } from "./net-feed";
@@ -44,9 +44,7 @@ export type NetFeedSource = {
  * ObservationRegistry — and reducer tests can pass a registry-holding
  * literal). */
 export type NetFeedReducerTarget = {
-  observations: {
-    deliver(observation: Record<string, unknown>, delivered: DeliveredObservation): void;
-  };
+  ingestDeliveredObservation(observation: Record<string, unknown>, delivered: DeliveredObservation): void;
 };
 
 /**
@@ -56,13 +54,17 @@ export type NetFeedReducerTarget = {
 export function wireNetFeed(target: NetFeedReducerTarget, feed: NetFeedSource): () => void {
   return feed.onObservation((event) => {
     const space = event.scope.startsWith("room:") ? event.scope.slice("room:".length) : undefined;
+    // Peer fanout has no client turn id, so derive a carrier id from the full
+    // Net scope + committed seq. This keeps framework invalidation batching
+    // scoped correctly even when two non-room scopes share the same seq.
+    const carrierId = event.turn_id ?? (event.seq !== null ? `net:${event.scope}:${event.seq}` : undefined);
     const delivered: DeliveredObservation = {
       route: "sequenced",
       ...(event.seq !== null ? { seq: event.seq } : {}),
       ...(space !== undefined && space !== "" ? { space } : {}),
-      ...(event.turn_id !== undefined ? { frameId: event.turn_id } : {}),
+      ...(carrierId !== undefined ? { frameId: carrierId } : {}),
       receivedAt: Date.now()
     };
-    target.observations.deliver(event.observation, delivered);
+    target.ingestDeliveredObservation(event.observation, delivered);
   });
 }

@@ -36,9 +36,9 @@ function ctx(calls: Calls): WooContext {
     observe: (ref) => ({ id: ref, name: ref, props: {}, catalogState: {} }),
     directCall: async (subject, verb, args = []) => {
       calls.push({ subject, verb, args });
-      // Suppress the hydrate's list_items / room_roster fetches so they
+      // Suppress the hydrate's tree_view / room_roster fetches so they
       // don't show up alongside the verb the test is asserting on.
-      if (verb === "list_items") return [];
+      if (verb === "tree_view") return [];
       if (verb === "room_roster") return [];
       return undefined;
     },
@@ -226,7 +226,7 @@ describe("outliner-tree create-in-place (client-local selection)", () => {
     // handler). No focus_on, no add_item, no add, no clear-selection
     // round-trip — those would indicate the row-click handler stole the
     // event from the checkbox.
-    const unexpected = calls.filter((c) => c.verb !== "hide" && c.verb !== "list_items" && c.verb !== "room_roster");
+    const unexpected = calls.filter((c) => c.verb !== "hide" && c.verb !== "tree_view" && c.verb !== "room_roster");
     expect(unexpected, "no extra verbs called").toEqual([]);
   });
 });

@@ -55,8 +55,10 @@ authority durably appends accepted sequenced entries with its seq/ts, and
 pages participate in normal local-or-attested read validation. A fresh
 `$outline_meta` rebuild converges to the live watermark through a sparse
 Net planner, while real workerd proves the same durable page repair over
-SQLite/RPC (26/26). Outstanding: outliner parity/deletion delta, then the
-dispenser and Tasks migrations, E4/E5 gate, and cold-case cost. The ordered
+SQLite/RPC (26/26). RESOLVED (2026-07-22): Outliner client adoption uses the
+generic semantic-view facade over `tree_view`; full structural parity, legacy
+genesis, stale-read rejection, and deletion accounting are pinned. Outstanding:
+the Dispenser and Tasks migrations, E4/E5 gate, and cold-case cost. The ordered
 queue is §7.1.*
 
 ---
@@ -573,12 +575,19 @@ Parity tests:
 
 Net replay is complete: a sparse planner repairs from the semantic room's
 durable authority log; the exact Outliner rebuild test and real-workerd
-storage/RPC lane are green.
+storage/RPC lane are green. Outliner closure is also complete: the generic
+reactive semantic-view facade now reads `tree_view`, parity is pinned after
+every structural verb, and an upgraded outline with pre-v3 rows is pinned at
+`structure_at_seq: 0` with no minted projection. Deletion accounting is honest:
+the element lost its item hydrator, four generation/scheduling fields, and
+three item-hydration methods, replaced by one shared `WooViewController`; the
+catalog UI file is nevertheless +21 physical lines (146 added/125 removed)
+because it now owns the view declaration/result validator and closes the
+previously missed `note_writers_changed` path. The useful delta is eight
+bespoke lifecycle concepts removed and one shared controller added, not a
+claimed net-LoC reduction.
 
-1. **Close Outliner.** Finish parity and deletion-delta accounting, pin the
-   empty legacy-genesis behavior, and keep `__ordered_edge` as the sole
-   structure authority.
-2. **Migrate Dispenser.** Keep Net-authenticated `:order`, `:deliver`, and
+1. **Migrate Dispenser.** Keep Net-authenticated `:order`, `:deliver`, and
    `:cancel` as the public surface; emit fixed acts internally; replace the
    directly-written queue and admission maps with `$dispenser_queue`; carry
    the delivered note by reference; and prove dropped-reply idempotency,
@@ -586,10 +595,10 @@ storage/RPC lane are green.
    eviction, an absolute queue cap, zero extra queue writers, and a net
    deletion delta. The field disposition and non-goals are explicit in
    [`catalogs/dispenser/DESIGN.md`](../catalogs/dispenser/DESIGN.md#acts-migration-next-major).
-3. **Migrate Tasks.** Retire the temporary casework proof through the full
+2. **Migrate Tasks.** Retire the temporary casework proof through the full
    field-disposition, parity-golden, client-kanban, and deletion-delta gates
    in §5.
-4. **Close the remaining release gates.** Run the E4/E5 adversarial lane,
+3. **Close the remaining release gates.** Run the E4/E5 adversarial lane,
    cold-case measurement, and workerd Tier C budgets.
 
 ### 7.2 Kernel decisions deferred

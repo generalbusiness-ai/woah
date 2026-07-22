@@ -2113,7 +2113,12 @@ async function refreshNetRoomProjection(): Promise<void> {
     // its presence-authorized cells arrive. Keep the readable room/roster and
     // omit that stale optional row instead of discarding the whole projection.
     const contents = await resolveOptionalRoomContents(contentRows, roster, (id) =>
-      fetchNetObjectSummary(id, ["description", "aliases", "features"])
+      // A room relation can contain dozens of objects. Hydrate only the
+      // lineage/live identity needed to list and route them; components fetch
+      // their explicitly declared fields through ProjectionFieldFiller when
+      // they become visible. Eagerly reading three optional properties here
+      // multiplied one bounded relation into a rate-limit-sized startup burst.
+      fetchNetObjectSummary(id)
     );
     const here = {
       id: room,
@@ -4783,7 +4788,7 @@ function createChatWooContext(subject: string, extraRefs: string[] = []): WooCon
   const frameId = `chat:${subject || "room"}`;
   ui.frames.ensureFrame(frameId, subject, "default");
   const neighborhoodRefs = new Set([subject, ...(state.chatPresent ?? []), ...extraRefs, ...v2ProjectionObjectRefs(subject), ...uiProjectionObjectRefs(subject), ...(state.actor ? [state.actor] : [])].filter(Boolean));
-  return {
+  const context: WooContext = {
     actor: state.actor ?? null,
     frame: {
       id: frameId,
@@ -4807,8 +4812,10 @@ function createChatWooContext(subject: string, extraRefs: string[] = []): WooCon
     directCall: (target, verb, args = [], options) => new Promise((resolve, reject) => {
       direct(target, verb, args, resolve, reject, options);
     }),
+    view: (request) => ui.view(state.actor, context, request),
     emit: (action) => ui.frames.emit(action)
   };
+  return context;
 }
 
 function v2ProjectionObjectRefs(scope: string): string[] {

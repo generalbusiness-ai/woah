@@ -472,6 +472,17 @@ and active-frame error reporting. A hydration MUST validate its result before
 returning; malformed or incomplete results reject and remain retryable. The host
 MUST reject registration not named by a frame declaration for that module.
 
+A module MAY also register bounded reactive semantic views:
+
+```ts
+export function registerWooViews(registry: WooViewRegistry): void;
+```
+
+Semantic-view definitions and lifecycle are specified in
+[UCM24.1](#ucm241-reactive-semantic-views). Unlike frame hydration, a semantic
+view returns catalog-shaped data to subscribing components; it does not
+translate the result into generic projection patches.
+
 ---
 
 ## UCM8. Component declarations
@@ -981,6 +992,8 @@ type WooContext = {
     options?: DirectCallOptions
   ): Promise<CallResult>;
   send(command: string, space?: string, options?: SendOptions): Promise<CallResult>;
+
+  view<T>(request: WooViewRequest): WooView<T>;
 
   navigate(target: string, options?: { view?: string }): void;
   emit(action: WooUiAction): void;
@@ -1563,6 +1576,84 @@ bounds.
 The host MAY preserve component instances across route changes when subject,
 component id, and stable frame-node identity are unchanged. Components MUST
 not depend on instance preservation for correctness.
+
+### UCM24.1 Reactive semantic views
+
+A generic object projection does not prove that a bounded catalog collection
+is complete. Catalog UI modules MAY therefore register semantic-view
+definitions, and components MAY consume them through `WooContext.view()`:
+
+```ts
+type WooViewRequest = {
+  view: string;
+  subject: string;
+  args?: readonly unknown[];
+};
+
+type WooViewSnapshot<T> = Readonly<{
+  data: T | null;
+  completeness: "unknown" | "partial" | "complete";
+  freshness: "stale" | "current";
+  fetchStatus: "idle" | "loading" | "refreshing" | "error";
+  revision: number;
+  error: unknown | null;
+}>;
+
+type WooView<T> = {
+  getSnapshot(): WooViewSnapshot<T>;
+  subscribe(listener: () => void): () => void;
+  refresh(): void;
+};
+
+type WooViewDefinition<T> = {
+  id: string;
+  seed?(context: WooViewSeedContext): T | null;
+  read(context: WooViewReadContext): Promise<unknown>;
+  parse(result: unknown): T;
+  invalidateOn?: readonly string[];
+  affects?(context: WooViewInvalidationContext): boolean;
+};
+```
+
+The cache key MUST include principal, qualified view id, subject, and a
+canonical serialization of arguments. Unresolved principals MUST NOT share
+entries. View ids are catalog-qualified at module registration; an unqualified
+request resolves only when it identifies one installed definition
+unambiguously.
+
+Projection-derived seeds are useful but always `partial`; only a successful
+bounded authoritative read followed by successful parsing publishes
+`complete/current`. `data:null, completeness:"unknown"` is distinct from an
+authoritative empty collection. `getSnapshot()` MUST preserve object identity
+until an exposed field changes, and each changed publication MUST advance its
+client-local revision.
+
+The first subscriber starts one shared authoritative read. Accepted sequenced
+observations and committed canonical live fanout matching `invalidateOn` plus
+`affects` mark complete data stale and schedule one refresh per accepted frame.
+Lossy live previews and optimistic frames do not establish completeness and
+MUST NOT invalidate by themselves. An invalidation received during a read
+overtakes that result and schedules at most one follow-up read; the older result
+MUST NOT publish. Subject, principal, view, or argument changes bind a distinct
+entry.
+
+Transport adapters MUST enter through the framework's canonical observation
+boundary, which performs projection reduction and view invalidation together;
+calling the reducer registry directly is incomplete. If a transport exposes a
+frame's observations as separate callbacks, the framework MUST coalesce their
+view invalidation by that transport carrier while keeping reducers ordered.
+
+Refresh keeps the last complete value visible. A read or parse failure exposes
+`fetchStatus:"error"`; it does not convert unknown into empty or erase complete
+stale data. Inactive entries MAY remain briefly in memory, but MUST eventually
+be collected. Listener failures are isolated to that subscriber.
+
+Vanilla custom elements SHOULD use the framework `WooViewController` adapter,
+which owns late `woo`/`subject` binding and disconnect/reconnect subscription
+replacement. Catalog components may keep local optimistic presentation, but
+MUST NOT mutate the shared view value and MUST NOT replace accepted local
+updates from a stale complete snapshot. A whole collection may be replaced
+only from `complete/current` data.
 
 ---
 

@@ -6,9 +6,10 @@ import { describe, expect, it } from "vitest";
 
 import chatManifest from "../catalogs/chat/manifest.json";
 import dubspaceManifest from "../catalogs/dubspace/manifest.json";
+import outlinerManifest from "../catalogs/outliner/manifest.json";
 import * as dubspaceUiModule from "../catalogs/dubspace/ui/dubspace-workspace";
 import { registerWooObservationHandlers as registerDubspaceObservationHandlers } from "../catalogs/dubspace/ui/dubspace-workspace";
-import { registerWooObservationHandlers as registerOutlinerObservationHandlers } from "../catalogs/outliner/ui/outliner-tree";
+import * as outlinerUiModule from "../catalogs/outliner/ui/outliner-tree";
 import { registerWooObservationHandlers as registerPinboardObservationHandlers } from "../catalogs/pinboard/ui/pinboard-board";
 import {
   CatalogUiRegistry,
@@ -30,7 +31,7 @@ import {
 function createWooClientFramework() {
   const ui = createBareWooClientFramework();
   registerDubspaceObservationHandlers(ui.observations);
-  registerOutlinerObservationHandlers(ui.observations);
+  outlinerUiModule.registerWooObservationHandlers(ui.observations);
   registerPinboardObservationHandlers(ui.observations);
   return ui;
 }
@@ -1309,6 +1310,14 @@ describe("catalog UI registry", () => {
     const frame = ui.catalogUi.resolveFrame("$dubspace", undefined, () => false);
     expect(frame?.frame.hydration).toEqual({ module: "dubspace-ui", id: "controls" });
     expect(ui.catalogUi.viewHydration(frame)?.id).toBe("dubspace:dubspace-ui:controls");
+  });
+
+  it("registers and resolves a module-owned semantic view", () => {
+    const ui = createBareWooClientFramework();
+    expect(ui.catalogUi.installCatalogUi({ alias: "outliner", catalog: "outliner", ui: (outlinerManifest as any).ui })).toEqual([]);
+    ui.catalogUi.registerModuleExports("outliner", "outliner-ui", outlinerUiModule, ui.observations, ui.chatFormatters);
+    expect(ui.catalogUi.resolveView("outliner.tree")?.id).toBe("outliner:outliner.tree");
+    expect(ui.catalogUi.resolveView("outliner:outliner.tree")?.definition.invalidateOn).toContain("note_writers_changed");
   });
 });
 

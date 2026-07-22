@@ -23,6 +23,40 @@ let persistDir = "";
 let credentials: { alice: string; bob: string } = { alice: "", bob: "" };
 const legacyRequests = new WeakMap<Page, string[]>();
 
+/** Record named Net turn failures carried over WebSocket. HTTP response
+ * listeners cannot see these correlated turn_result frames, which previously
+ * left a failed component mutation looking like a generic DOM timeout. */
+type TrackedNetFrame = { id: string; verb?: string; error?: unknown; payload: string };
+
+function trackNetTurns(page: Page): { sent: TrackedNetFrame[]; received: TrackedNetFrame[] } {
+  const turns = { sent: [] as TrackedNetFrame[], received: [] as TrackedNetFrame[] };
+  page.on("websocket", (socket) => {
+    socket.on("framesent", ({ payload }) => {
+      if (typeof payload !== "string") return;
+      try {
+        const frame = JSON.parse(payload) as { type?: unknown; id?: unknown; verb?: unknown };
+        if (frame.type === "turn" && typeof frame.id === "string") {
+          turns.sent.push({ id: frame.id, verb: typeof frame.verb === "string" ? frame.verb : undefined, payload });
+        }
+      } catch {
+        // NetFeed owns malformed-protocol handling; this is diagnostics only.
+      }
+    });
+    socket.on("framereceived", ({ payload }) => {
+      if (typeof payload !== "string") return;
+      try {
+        const frame = JSON.parse(payload) as { type?: unknown; id?: unknown; error?: unknown };
+        if (frame.type !== "turn_result" || typeof frame.id !== "string") return;
+        turns.received.push({ id: frame.id, error: frame.error, payload });
+      } catch {
+        // Non-JSON frames are already a protocol failure handled by NetFeed;
+        // this helper only adds context for named turn_result failures.
+      }
+    });
+  });
+  return turns;
+}
+
 /** Net-mode deletion gate: a successful UI assertion is insufficient when
  * failed v2 fetches are caught as best-effort hydration. Record every legacy
  * request so each browser proves the net shell is actually v2-independent. */
@@ -190,6 +224,7 @@ test("Outliner hydrates a complete nested tree in a fresh real-workerd session",
   const page = await context.newPage();
   const pageErrors: string[] = [];
   const serverErrors: string[] = [];
+  const netTurns = trackNetTurns(page);
   page.on("pageerror", (error) => pageErrors.push(`${error.name}: ${error.message}`));
   page.on("response", (response) => {
     if (response.status() >= 500) serverErrors.push(`${response.status()} ${response.url()}`);
@@ -211,9 +246,20 @@ test("Outliner hydrates a complete nested tree in a fresh real-workerd session",
   await expect(tree.locator("woo-space-chat-panel[data-space-chat-panel]")).toBeVisible({ timeout: 30_000 });
   await page.waitForTimeout(1_000);
   await addInput.fill(parentText);
+  const sentBeforeAdd = netTurns.sent.length;
   await addInput.press("Enter");
+  await expect.poll(() => netTurns.sent.slice(sentBeforeAdd).find((frame) => frame.verb === "add")?.id ?? "", {
+    message: "the add form should submit a Net turn"
+  }).not.toBe("");
+  const addTurn = netTurns.sent.slice(sentBeforeAdd).find((frame) => frame.verb === "add")!;
   const parentRow = tree.locator("[data-outliner-row]").filter({ hasText: parentText }).first();
-  await expect(parentRow).toBeVisible({ timeout: 30_000 });
+  await expect.poll(async () => await parentRow.count() + Number(netTurns.received.some((frame) => frame.id === addTurn.id)), {
+    message: "the add turn should render its row or expose its named Net refusal",
+    timeout: 30_000
+  }).toBeGreaterThan(0);
+  const addReply = netTurns.received.find((frame) => frame.id === addTurn.id);
+  expect(addReply?.error, `the add turn was refused: ${addReply?.payload ?? "no reply"}`).toBeUndefined();
+  await expect(parentRow, `the add turn settled without a rendered row: ${addReply?.payload ?? "no reply"}`).toBeVisible();
   await parentRow.click();
   await parentRow.getByRole("button", { name: "add child" }).click();
   const childInput = tree.locator("[data-outliner-add-child] input[name=text]");
@@ -224,7 +270,7 @@ test("Outliner hydrates a complete nested tree in a fresh real-workerd session",
   await expect(childRow).toHaveAttribute("style", /--indent:\s*20px/);
 
   // A separate principal starts with no browser projection/cache from the
-  // creator. Its first mounted tree must still perform list_items and render the
+  // creator. Its first mounted tree must still perform tree_view and render the
   // whole authoritative hierarchy.
   const freshContext = await browser.newContext();
   const fresh = await freshContext.newPage();
