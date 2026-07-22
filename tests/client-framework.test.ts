@@ -333,6 +333,44 @@ describe("client UI framework projection", () => {
     });
   });
 
+  it("folds an act-enveloped outliner live fanout identically to the flat shape", () => {
+    // v3 emits the structural events as acts ({type, version, payload}); pre-v3
+    // definitions and the movement-hook echo paths still emit flat fields. Both
+    // shapes must land the same canonical projection
+    // (catalogs/outliner/migration-v2-to-v3.json).
+    const ui = createWooClientFramework();
+    ui.ingestSnapshot(v2SnapshotKey("the_outline", 0), [
+      { id: "the_outline", name: "Outline", props: {} }
+    ]);
+
+    ui.ingestLiveObservation({
+      type: "outline_item_added",
+      version: 1,
+      payload: {
+        outliner: "the_outline",
+        item: "outline_item_act",
+        parent_id: null,
+        index: 0,
+        text: "peer act row",
+        actor: "guest_2"
+      }
+    });
+
+    expect(ui.observe("outline_item_act")).toMatchObject({
+      parent: "$outline_item",
+      location: "the_outline",
+      props: { text: "peer act row", hidden: false },
+      catalogState: { outliner_tree: { parent_id: null, index: 0 } }
+    });
+
+    ui.ingestLiveObservation({
+      type: "outline_item_hidden",
+      version: 1,
+      payload: { outliner: "the_outline", item: "outline_item_act", hidden: true }
+    });
+    expect(ui.observe("outline_item_act")?.props).toMatchObject({ hidden: true });
+  });
+
   it("keeps pinboard layout overlays sparse across sequential partial updates", () => {
     const ui = createWooClientFramework();
     ui.ingestSnapshot("overlay:pinboard:the_pinboard", [

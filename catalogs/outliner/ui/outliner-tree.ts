@@ -333,7 +333,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
       }
       return;
     }
-    const outlinerId = String(observation.outliner ?? observation.source ?? "");
+    const outlinerId = String(actField(observation, "outliner") ?? observation.source ?? "");
     if (!this.subject || outlinerId !== this.subject) return;
     if (type === "outliner_entered" || type === "outliner_left") {
       this.applyPresenceObservation(type, observation);
@@ -341,16 +341,17 @@ export class WooOutlinerTreeElement extends HTMLElement {
       return;
     }
     if (type === "outline_item_added") {
-      const id = String(observation.item ?? "");
+      const id = String(actField(observation, "item") ?? "");
       if (!id) return;
+      const text = actField(observation, "text");
       this.upsertItem({
         id,
         name: id,
-        text: typeof observation.text === "string" ? observation.text : "",
-        parent_id: outlinerParent(observation.parent_id),
-        index: outlinerIndex(observation.index, this.model.items.length),
+        text: typeof text === "string" ? text : "",
+        parent_id: outlinerParent(actField(observation, "parent_id")),
+        index: outlinerIndex(actField(observation, "index"), this.model.items.length),
         hidden: false,
-        owner: String(observation.actor ?? ""),
+        owner: String(actField(observation, "actor") ?? ""),
         writers: [],
         has_children: false
       });
@@ -358,24 +359,24 @@ export class WooOutlinerTreeElement extends HTMLElement {
       return;
     }
     if (type === "outline_item_removed") {
-      this.removeItem(String(observation.item ?? ""), outlinerParent(observation.reparented_to));
+      this.removeItem(String(actField(observation, "item") ?? ""), outlinerParent(actField(observation, "reparented_to")));
       this.refreshItemsAfterMutation();
       return;
     }
     if (type === "outline_item_moved") {
-      this.moveItem(String(observation.item ?? ""), outlinerParent(observation.to_parent), outlinerIndex(observation.to_index, this.model.items.length));
+      this.moveItem(String(actField(observation, "item") ?? ""), outlinerParent(actField(observation, "to_parent")), outlinerIndex(actField(observation, "to_index"), this.model.items.length));
       this.refreshItemsAfterMutation();
       return;
     }
     if (type === "outline_item_reordered") {
-      this.moveItem(String(observation.item ?? ""), outlinerParent(observation.parent_id), outlinerIndex(observation.to_index, this.model.items.length));
+      this.moveItem(String(actField(observation, "item") ?? ""), outlinerParent(actField(observation, "parent_id")), outlinerIndex(actField(observation, "to_index"), this.model.items.length));
       this.refreshItemsAfterMutation();
       return;
     }
     if (type === "outline_item_hidden") {
-      const item = this.model.items.find((candidate) => candidate.id === String(observation.item ?? ""));
+      const item = this.model.items.find((candidate) => candidate.id === String(actField(observation, "item") ?? ""));
       if (item) {
-        item.hidden = Boolean(observation.hidden);
+        item.hidden = Boolean(actField(observation, "hidden"));
         this.render();
       }
       this.refreshItemsAfterMutation();
@@ -1165,43 +1166,45 @@ export function registerWooObservationHandlers(registry: ObservationRegistry): v
       // Keep these projection patches aligned with applyObservation above;
       // optimistic frames use only this path and accepted frames use both.
       const type = String(envelope.observation.type ?? "");
-      const outlinerId = String(envelope.observation.outliner ?? envelope.observation.source ?? "");
+      const outlinerId = String(actField(envelope.observation, "outliner") ?? envelope.observation.source ?? "");
       if (type === "outline_item_added") {
-        const id = String(envelope.observation.item ?? "");
+        const id = String(actField(envelope.observation, "item") ?? "");
         if (id && outlinerId) {
+          const actor = actField(envelope.observation, "actor");
+          const text = actField(envelope.observation, "text");
           draft.patchObject(id, {
             name: id,
-            owner: typeof envelope.observation.actor === "string" ? envelope.observation.actor : undefined,
+            owner: typeof actor === "string" ? actor : undefined,
             parent: "$outline_item",
             location: outlinerId
           });
           draft.patchObjectProps(id, {
-            text: typeof envelope.observation.text === "string" ? envelope.observation.text : "",
+            text: typeof text === "string" ? text : "",
             hidden: false
           });
           draft.patchCatalogState(id, "outliner_tree", {
-            parent_id: outlinerParent(envelope.observation.parent_id),
-            index: outlinerIndex(envelope.observation.index, 0)
+            parent_id: outlinerParent(actField(envelope.observation, "parent_id")),
+            index: outlinerIndex(actField(envelope.observation, "index"), 0)
           });
         }
       } else if (type === "outline_item_removed") {
-        const id = String(envelope.observation.item ?? "");
+        const id = String(actField(envelope.observation, "item") ?? "");
         if (id) draft.patchObject(id, { location: null });
       } else if (type === "outline_item_moved") {
-        const id = String(envelope.observation.item ?? "");
+        const id = String(actField(envelope.observation, "item") ?? "");
         if (id) draft.patchCatalogState(id, "outliner_tree", {
-          parent_id: outlinerParent(envelope.observation.to_parent),
-          index: outlinerIndex(envelope.observation.to_index, 0)
+          parent_id: outlinerParent(actField(envelope.observation, "to_parent")),
+          index: outlinerIndex(actField(envelope.observation, "to_index"), 0)
         });
       } else if (type === "outline_item_reordered") {
-        const id = String(envelope.observation.item ?? "");
+        const id = String(actField(envelope.observation, "item") ?? "");
         if (id) draft.patchCatalogState(id, "outliner_tree", {
-          parent_id: outlinerParent(envelope.observation.parent_id),
-          index: outlinerIndex(envelope.observation.to_index, 0)
+          parent_id: outlinerParent(actField(envelope.observation, "parent_id")),
+          index: outlinerIndex(actField(envelope.observation, "to_index"), 0)
         });
       } else if (type === "outline_item_hidden") {
-        const id = String(envelope.observation.item ?? "");
-        if (id) draft.patchObjectProps(id, { hidden: Boolean(envelope.observation.hidden) });
+        const id = String(actField(envelope.observation, "item") ?? "");
+        if (id) draft.patchObjectProps(id, { hidden: Boolean(actField(envelope.observation, "hidden")) });
       }
       // Optimistic frames are represented by projection patches so failure can
       // roll them back. DOM-local model edits are reserved for accepted frames.
@@ -1212,6 +1215,19 @@ export function registerWooObservationHandlers(registry: ObservationRegistry): v
       }
     }
   });
+}
+
+// Dual-shape field read for the five structural events. v3 emits them as acts
+// ({type, version, payload: {...domain fields...}}) while pre-v3 deployed
+// definitions and the movement-hook echo paths (enterfunc capture; exitfunc
+// detach under a foreign authority) still emit flat fields on the observation
+// itself — both shapes stay live indefinitely, so every reducer read goes
+// through this helper. Contract: catalogs/outliner/migration-v2-to-v3.json.
+function actField(observation: Record<string, unknown>, key: string): unknown {
+  const payload = observation.payload;
+  return payload !== null && typeof payload === "object" && key in payload
+    ? (payload as Record<string, unknown>)[key]
+    : observation[key];
 }
 
 function outlinerParent(value: unknown): string | null {

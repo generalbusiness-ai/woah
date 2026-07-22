@@ -943,4 +943,56 @@ describe("outliner-tree presence aside", () => {
 
     expect(directCall).toHaveBeenCalledTimes(2);
   });
+
+  // Dual-shape tolerance: v3 emits the five structural events as acts
+  // ({type, version, payload: {...domain fields...}}) while pre-v3 deployed
+  // definitions and the movement-hook echo paths still emit flat fields on the
+  // observation itself. The same event sequence in either shape must reduce to
+  // the identical tree model (catalogs/outliner/migration-v2-to-v3.json).
+  it("reduces act-enveloped structural events identically to flat ones", () => {
+    type ObservingElement = WooOutlinerTreeElement & {
+      applyObservation: (observation: Record<string, unknown>) => void;
+      subject: string;
+    };
+    // The reduced tree model is private; the test reads it through a cast so it
+    // can compare the two reducers' results field-for-field.
+    const modelOf = (element: WooOutlinerTreeElement): OutlinerData => (element as unknown as { model: OutlinerData }).model;
+    const mount = (): ObservingElement => {
+      const element = document.createElement("woo-outliner-tree") as ObservingElement;
+      element.subject = "the_outline";
+      element.woo = ctx({}, {
+        refs: [],
+        directCall: async () => [],
+        projections: { the_outline: { id: "the_outline", name: "Outline", props: {}, catalogState: {} } }
+      });
+      document.body.append(element);
+      return element;
+    };
+    // One sequence exercising all five types and every field the reducer reads.
+    const events: Record<string, unknown>[] = [
+      { type: "outline_item_added", outliner: "the_outline", item: "item_1", parent_id: null, index: 0, text: "first", actor: "guest_1" },
+      { type: "outline_item_added", outliner: "the_outline", item: "item_2", parent_id: "item_1", index: 0, text: "child", actor: "guest_2" },
+      { type: "outline_item_added", outliner: "the_outline", item: "item_3", parent_id: null, index: 1, text: "third", actor: "guest_1" },
+      { type: "outline_item_moved", outliner: "the_outline", item: "item_2", to_parent: null, to_index: 0 },
+      { type: "outline_item_reordered", outliner: "the_outline", item: "item_3", parent_id: null, to_index: 0 },
+      { type: "outline_item_hidden", outliner: "the_outline", item: "item_2", hidden: true },
+      { type: "outline_item_removed", outliner: "the_outline", item: "item_1", reparented_to: null }
+    ];
+    const envelop = ({ type, ...fields }: Record<string, unknown>): Record<string, unknown> => ({ type, version: 1, payload: fields });
+
+    const flat = mount();
+    const acts = mount();
+    for (const event of events) {
+      flat.applyObservation(event);
+      acts.applyObservation(envelop(event));
+    }
+
+    // The flat sequence lands the expected structure (proving each event took
+    // effect), and the enveloped sequence lands the exact same model.
+    expect(modelOf(flat).items).toMatchObject([
+      { id: "item_3", text: "third", parent_id: null, index: 0, hidden: false, owner: "guest_1" },
+      { id: "item_2", text: "child", parent_id: null, index: 1, hidden: true, owner: "guest_2" }
+    ]);
+    expect(modelOf(acts).items).toEqual(modelOf(flat).items);
+  });
 });

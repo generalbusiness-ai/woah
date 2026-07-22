@@ -118,6 +118,34 @@ describe("net feed → catalog panel reducers (phase iii)", () => {
     expect(item?.catalogState?.outliner_tree).toEqual({ parent_id: null, index: 0 });
   });
 
+  // v3 emits the same event as an act ({type, version, payload}); the reducer
+  // must land the identical projection as the flat shape above
+  // (catalogs/outliner/migration-v2-to-v3.json).
+  it("a peer act-enveloped outline_item_added reduces identically to the flat shape", () => {
+    const { projection, emit } = wiredRegistry(outlinerHandlers);
+    emit({
+      observation: {
+        type: "outline_item_added",
+        version: 1,
+        payload: {
+          outliner: "the_outline",
+          actor: "#alice",
+          item: "obj_item_1",
+          text: "first item",
+          parent_id: null,
+          index: 0
+        }
+      },
+      source: "peer",
+      scope: "room:the_outline",
+      seq: 3
+    });
+    const item = projection.observe("obj_item_1");
+    expect(item?.location).toBe("the_outline");
+    expect(item?.props).toMatchObject({ text: "first item", hidden: false });
+    expect(item?.catalogState?.outliner_tree).toEqual({ parent_id: null, index: 0 });
+  });
+
   it("a peer task_created dispatches the woo-tasks-refresh window event the kanban re-fetches on", async () => {
     const { emit } = wiredRegistry(tasksHandlers);
     const target = (globalThis as { window?: EventTarget }).window ?? windowStub;

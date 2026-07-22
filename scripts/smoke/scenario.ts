@@ -398,7 +398,10 @@ export async function runSmokeWalkthrough(
     await drain(bob, cfg, ctx.signal);
     const text = `outline-${runId}`;
     await alice.call("the_outline", "add_item", [text], ctx.signal);
-    await waitFor(bob, (obs) => obs.type === "outline_item_added" && obs.text === text, waitMs, ctx.signal, cfg);
+    // v3 emits outline_item_added as an act ({type, version, payload}); pre-v3
+    // worlds emit flat fields. Match either shape
+    // (catalogs/outliner/migration-v2-to-v3.json).
+    await waitFor(bob, (obs) => obs.type === "outline_item_added" && (obs.payload?.text ?? obs.text) === text, waitMs, ctx.signal, cfg);
   });
 
   // Taskboard navigation: chatroom -> southeast -> the_deck -> south toward
