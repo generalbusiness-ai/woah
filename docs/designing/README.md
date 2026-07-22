@@ -29,9 +29,9 @@ overview before diving into the per-task pages below.
   workflow for buffer-style editing.
 - **[catalogs.md](catalogs.md)** — packaging classes into a catalog,
   the manifest shape, install discipline.
-- **[acts-and-projections.md](acts-and-projections.md)** — building a
-  feature on the acts kernel: schema-validated acts on a room's log,
-  with boards and counters derived as projection folds.
+- **[acts-and-projections.md](acts-and-projections.md)** — patterns for
+  collection views on the acts kernel: tracked collections, lane
+  counters, and relation checkpoints derived as projection folds.
 
 ## Authoring authority
 
