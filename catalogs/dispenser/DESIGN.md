@@ -91,16 +91,53 @@ All checks run *before* the queue append, so rejected orders do not
 pollute the queue. The mutating queue append lives in an internal helper
 verb and is not direct-callable; public callers enter through `:order`.
 
-## Sequencing
+The v0.2 bounds do not fully close state growth: `last_request_at` retains
+every requester forever, and `max_pending_orders = 0` permits an unbounded
+queue. The acts migration must not preserve either leak. Its projection has
+an absolute `row_cap`; owner configuration may lower, never remove, that
+cap. The requester index needs a deterministic cap and eviction rule, and
+an inline request always keeps a catalog hard length ceiling (otherwise the
+act carries an artifact reference instead).
 
-`order_placed`, `delivered`, and `canceled` are emitted via
-`observe_to_space(location(this), ...)` — they are sequenced when the
-verb is invoked through `$space:call` (the normal command path) and
-live when invoked via direct call. In v0.1 the room-level command path
-makes `:order` and `:cancel` sequenced; `:deliver` is plug-driven via
-direct call, so the `delivered` observation is live. The note arrival
-in the requester's inventory is durable regardless; direct requester text
-is a live notification and may not survive a reconnect.
+## Transport and sequencing
+
+`observe_to_space(location(this), ...)` chooses the room audience; the
+invocation route chooses sequencing. The Net-backed plug path calls
+`:next_pending`, `:deliver`, and `:cancel` through authenticated
+`/net-api/turn`, so accepted calls are sequenced in the session's active
+space. Legacy direct calls remain live while supported. Observation fanout
+and direct requester text are best-effort; after reconnect, the queue and
+the delivered note are the durable facts.
+
+## Acts migration (next major)
+
+The v0.2 properties are an interim implementation: `pending_orders` and
+its admission indexes are written directly by several verbs. The next
+major moves the queue to acts without exposing generic emission to the
+plug:
+
+1. `:order`, `:deliver`, and `:cancel` remain the only mutation surface.
+   The plug invokes them through Net; each verb authorizes and validates
+   the domain operation, then emits one fixed internal act:
+   `dispenser.ordered`, `dispenser.delivered`, or `dispenser.canceled`.
+2. `$dispenser_queue < $projection` is the sole writer of pending rows and
+   the bounded admission indexes, including the next order counter and a
+   deterministically evicted requester-rate index.
+   `:order` reads the projected next id and its fold advances the counter;
+   `:next_pending` and `:status` read the projection view. The direct
+   `pending_orders`, `next_order_seq`, `last_request_at`, and `last_order_at`
+   block properties disappear.
+3. `:deliver` creates the `$dispensed_note` and records its reference in
+   `dispenser.delivered`; the projection never copies note content. Note
+   creation, act recording, and queue removal share one fail-closed turn.
+4. Rebuild must reproduce all projection-owned state from recorded acts.
+   The catalog migration must give every legacy pending row one
+   deterministic genesis act, or explicitly require an empty queue; it may
+   not seed projection rows behind the fold.
+
+The base dispenser has no approval or failure lifecycle today, so it does
+not speculate `approved` or `failed` acts. A subclass can earn those facts
+when it has a real policy and state transition to record.
 
 ## Ephemeral by drop
 

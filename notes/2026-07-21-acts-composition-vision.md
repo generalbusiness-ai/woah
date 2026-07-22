@@ -290,27 +290,32 @@ last activity — the agent-orientation surface on entry, and the
 per-practice metrics feed (§3). Deferred only because the slice must
 stay thin; both are ordinary projections with nothing novel.
 
-### 5.7 Migration order: tasks → dispenser → rest
+### 5.7 Migration order: outliner → dispenser → tasks → rest
 
 Stated so the sequence is a decision, not drift:
 
-1. **Tasks** (the kernel v1 slice) — proves the contracts.
-2. **Dispenser** — the next one-rule violation in the bundled set, and
-   the most valuable: its directly-written `pending_orders` list *is*
-   the E5 propose-don't-act approval buffer. Re-expressed as
-   `orders.placed / orders.approved / orders.delivered / orders.failed`
-   acts with a `pending` projection, it is a strictly better E5:
-   approval state is fold-derived from a sequenced `orders.approved`
-   act naming the approver, `:next_pending` reads the projection (and
-   structurally cannot return unapproved rows), and the whole approval
-   history is recorded acts. Idempotent `:deliver` maps to act identity.
-3. **Workflows** — `workflows.md` predates acts: `:set_status` writes
+1. **Outliner** — landed as the first real consumer. Its structural
+   relation remains substrate-authoritative; the acts projection supplies
+   the completeness checkpoint without mirroring tree rows.
+2. **Dispenser** — next, and the first plug-backed consumer. The plug keeps
+   calling typed `:order`, `:deliver`, and `:cancel` verbs through Net; it
+   never emits raw acts. Those verbs record `dispenser.ordered`,
+   `dispenser.delivered`, and `dispenser.canceled`, while one pending
+   projection owns queue membership and deterministically bounded admission
+   indexes. `:next_pending` reads that projection; delivery carries the
+   produced note by reference and remains idempotent on `order_id`.
+   Approval and failure acts wait for a real policy transition rather than
+   being invented by the base class.
+3. **Tasks** — the temporary casework slice has proved the kernel; the real
+   migration now proves field disposition, client parity, and deletion
+   delta.
+4. **Workflows** — `workflows.md` predates acts: `:set_status` writes
    a status prop directly. It should emit `workflow.status_changed`
    acts (status becomes a fold target), which matters doubly because
    the practice-promotion workflow (§3) leans on exactly those
    predicates. Spec amendment lands when the acts contracts promote.
-4. **Rest** (outliner, pinboard order state) — each per the same
-   playbook, opportunistically.
+5. **Rest** (pinboard order state and later coordination surfaces) — each
+   per the same playbook, opportunistically.
 
 ### 5.8 Pattern-language additions (acts era)
 

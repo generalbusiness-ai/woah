@@ -7,6 +7,7 @@ import { CellStore, cellVersion } from "../../src/net/cells";
 import { applyTranscript, type EffectTranscript } from "../../src/net/transcript";
 import { ScopeSequencer, type CommitSubmit } from "../../src/net/scope";
 import { InMemoryScopeStore } from "../../src/net/scope-store";
+import { replayPageVersion } from "../../src/net/replay-pages";
 
 const SCOPE = "the_room";
 const EPOCH = "cat1";
@@ -377,6 +378,57 @@ describe("rider read attestation (CO2.3)", () => {
     // consulted when `owns` is wired.
     const submit = { ...submitFor(seq, riderReadTranscript(version), "k1"), attestations: attestationAt("some-other-version") };
     expect(seq.submit(submit).status).toBe("accepted");
+  });
+});
+
+describe("replay-page read attestation (SL4/CO2.4)", () => {
+  const foreignRead = { space: "other_room", from: 1, limit: 100, scope: "room:other_room", version: "page-v1" };
+
+  function replayReadTranscript(read = foreignRead): EffectTranscript {
+    return transcript({ writes: [propWrite("v1")], replayReads: [read] });
+  }
+
+  it("requires a foreign page attestation and rejects a changed version retryably", () => {
+    const missingOwner = new ScopeSequencer(SCOPE, EPOCH, { owns: (object) => object === "#thing" });
+    const missing = missingOwner.submit(submitFor(missingOwner, replayReadTranscript(), "replay-missing"));
+    expect(missing).toMatchObject({ status: "rejected", reason: "rider_unattested", retryable: false });
+
+    const staleOwner = new ScopeSequencer(SCOPE, EPOCH, { owns: (object) => object === "#thing" });
+    const stale = staleOwner.submit({
+      ...submitFor(staleOwner, replayReadTranscript(), "replay-stale"),
+      attestations: {
+        [foreignRead.scope]: {
+          owner_head: { seq: 3, hash: "owner-h3" },
+          cells: [],
+          replays: [{ space: foreignRead.space, from: foreignRead.from, limit: foreignRead.limit, version: "page-v2" }]
+        }
+      }
+    });
+    expect(stale).toMatchObject({
+      status: "rejected",
+      reason: "read_version_mismatch",
+      retryable: true,
+      detail: { replay_conflicts: [{ scope: foreignRead.scope, space: foreignRead.space, from: 1, limit: 100 }] }
+    });
+  });
+
+  it("accepts matching foreign and locally re-derived empty page versions", () => {
+    const foreignOwner = new ScopeSequencer(SCOPE, EPOCH, { owns: (object) => object === "#thing" });
+    const foreign = foreignOwner.submit({
+      ...submitFor(foreignOwner, replayReadTranscript(), "replay-foreign-ok"),
+      attestations: {
+        [foreignRead.scope]: {
+          owner_head: { seq: 3, hash: "owner-h3" },
+          cells: [],
+          replays: [{ space: foreignRead.space, from: 1, limit: 100, version: foreignRead.version }]
+        }
+      }
+    });
+    expect(foreign.status).toBe("accepted");
+
+    const localOwner = new ScopeSequencer(SCOPE, EPOCH);
+    const localRead = { space: SCOPE, from: 1, limit: 100, scope: SCOPE, version: replayPageVersion([]) };
+    expect(localOwner.submit(submitFor(localOwner, replayReadTranscript(localRead), "replay-local-ok")).status).toBe("accepted");
   });
 });
 

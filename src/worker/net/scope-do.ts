@@ -96,6 +96,7 @@ import { ScopeSequencer, type CommitSubmit, type ScheduledTurn, type ScopeHead }
 import { authorizeSessionSubmit, validateSessionCell } from "../../net/sessions";
 import { observationsForRelationOwners, relationKey, roomRosterRows, SESSION_PRESENCE_RELATION, type RelationDelta, type RelationRow } from "../../net/relations";
 import { orderedChildrenVersion, orderedNeighborsFromRows } from "../../net/ordered-edges";
+import { replayPageVersion, validReplayPageBounds, type ReplayLogEntry } from "../../net/replay-pages";
 import type { ScopeMeta, ScopeStore, TailEntry } from "../../net/scope-store";
 import type { CommitReply } from "../../net/scope";
 import { netCellKeyFor } from "../../net/transcript";
@@ -249,6 +250,14 @@ export class SqliteScopeStore implements ScopeStore {
     this.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_net_scope_scheduled_due ON net_scope_scheduled (due_at)");
     // Sixth row family (CO13): derived relation rows this scope owns.
     this.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_scope_relation (key TEXT PRIMARY KEY, body TEXT NOT NULL)");
+    // Seventh row family (sequenced-log.md SL1/SL4): the committed
+    // sequenced log, keyed by (SEMANTIC space id, space-log seq). Appended
+    // inside the accept transaction; paged on demand off the primary key —
+    // never hydrated wholesale (it outgrows the live cell set without
+    // bound, the scheduled-family precedent).
+    this.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS net_scope_log (space TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY (space, seq))"
+    );
   }
 
   transaction<T>(fn: () => T): T {
@@ -419,6 +428,32 @@ export class SqliteScopeStore implements ScopeStore {
 
   deleteRelation(key: string): void {
     this.storage.sql.exec("DELETE FROM net_scope_relation WHERE key = ?", key);
+  }
+
+  appendLogEntry(entry: ReplayLogEntry): void {
+    // The accept transaction also records the reply, so idempotent retries
+    // return before append. A duplicate (space, seq) here is therefore a
+    // broken allocator, not an upsert opportunity; let SQLite abort the
+    // transaction instead of overwriting history.
+    this.storage.sql.exec(
+      "INSERT INTO net_scope_log (space, seq, body) VALUES (?, ?, ?)",
+      entry.space,
+      entry.seq,
+      JSON.stringify(entry)
+    );
+  }
+
+  readLogPage(space: string, from: number, limit: number): ReplayLogEntry[] {
+    // SL2 window semantics off the primary-key index: O(page), never
+    // O(log). `limit` is validated at the endpoint (1..1000).
+    return sqlRows<{ body: string }>(
+      this.storage.sql.exec(
+        "SELECT body FROM net_scope_log WHERE space = ? AND seq >= ? ORDER BY seq ASC LIMIT ?",
+        space,
+        from,
+        limit
+      )
+    ).map((row) => JSON.parse(row.body) as ReplayLogEntry);
   }
 }
 
@@ -945,13 +980,36 @@ export class NetScopeDO {
         // parent the same way — an ordering with no edges attests the
         // empty-rows version, the ordering analogue of "absent". Read-only:
         // no state changes, no head movement.
-        const body = (await request.json()) as { keys: string[]; ordering_parents?: Array<{ container?: unknown; parent?: unknown }> };
+        const body = (await request.json()) as {
+          keys: string[];
+          ordering_parents?: Array<{ container?: unknown; parent?: unknown }>;
+          replay_pages?: Array<{ space?: unknown; from?: unknown; limit?: unknown }>;
+        };
         const seq = this.ensureSequencer();
         const orderingParents = Array.isArray(body.ordering_parents) ? body.ordering_parents : [];
         for (const ordering of orderingParents) {
           if (typeof ordering?.container !== "string" || !ordering.container
             || (ordering.parent !== null && !(typeof ordering.parent === "string" && ordering.parent))) {
             throw netError("E_INVARG", "attest ordering_parents entries require container plus parent (nonempty ref or null)", { ordering });
+          }
+        }
+        // Replay-page attestation (SL4): the current content version of each
+        // named committed-log window, at the same freshness point as the
+        // cell/ordering versions. An empty page attests the empty-page
+        // version — the log analogue of "absent".
+        const replayPages = Array.isArray(body.replay_pages) ? body.replay_pages : [];
+        for (const page of replayPages) {
+          if (typeof page?.space !== "string" || !page.space
+            || typeof page.from !== "number" || typeof page.limit !== "number"
+            || !validReplayPageBounds(page.from, page.limit)) {
+            throw netError("E_INVARG", "attest replay_pages entries require space plus SL2-legal from/limit", { page });
+          }
+          // Never authenticate an empty page for a space this DO does not
+          // own. Ownership is the same lineage witness supplied to the
+          // sequencer below; answering from the wrong scope would turn a
+          // routing bug into a silently truncated journal.
+          if (!seq.store.has(cellKey("object_lineage", page.space))) {
+            throw netError("E_INVARG", "scope cannot attest a replay page for a foreign space", { space: page.space });
           }
         }
         return json({
@@ -964,6 +1022,14 @@ export class NetScopeDO {
                 container: ordering.container as string,
                 parent: ordering.parent as string | null,
                 version: orderedChildrenVersion(seq.orderedChildren(ordering.container as string, ordering.parent as string | null))
+              })) }
+            : {}),
+          ...(replayPages.length > 0
+            ? { replays: replayPages.map((page) => ({
+                space: page.space as string,
+                from: page.from as number,
+                limit: page.limit as number,
+                version: replayPageVersion(seq.replayPage(page.space as string, page.from as number, page.limit as number))
               })) }
             : {})
         });
@@ -1050,6 +1116,48 @@ export class NetScopeDO {
           child: (body.child as string | undefined) ?? null
         });
         return json({ scope: seq.scope, head: seq.head(), container: body.container, parent, ...answer, version: orderedChildrenVersion(rows) });
+      }
+      if (request.method === "POST" && url.pathname === "/net/replay-page") {
+        // Owner-served committed replay page (sequenced-log.md SL4): one
+        // bounded window of this authority's durable sequenced log, in the
+        // native replay shape. `space` is the SEMANTIC space id (the
+        // gateway routed here by the authority ADDRESS — scopeOf(space));
+        // entries keep that semantic identity so planning-world reads stay
+        // lane-identical. Strict field validation (Adv-a): malformed
+        // bounds are a structured refusal, never a silently-different
+        // window — the exact (space, from, limit) query is the attested
+        // identity, so coercion here would attest a page the plan never
+        // asked for. `version` is the page's content address; the plan
+        // attests it and this scope re-derives it at submit (step 7c), so
+        // an append inside the window between plan and submit makes the
+        // read stale. Committed rows only, by construction: entries are
+        // appended inside the accept transaction and never before.
+        const body = (await request.json()) as { space?: unknown; from?: unknown; limit?: unknown };
+        if (typeof body.space !== "string" || !body.space) {
+          throw netError("E_INVARG", "replay-page requires a nonempty semantic space ref", { space: body.space ?? null });
+        }
+        if (typeof body.from !== "number" || typeof body.limit !== "number" || !validReplayPageBounds(body.from, body.limit)) {
+          // SL2 range policy, surfaced as the structured refusal the net
+          // taxonomy carries (E_INVARG, like the ordering endpoints).
+          throw netError("E_INVARG", "replay-page requires integer from >= 1 and limit in 1..1000", {
+            from: body.from ?? null,
+            limit: body.limit ?? null
+          });
+        }
+        const seq = this.ensureSequencer();
+        if (!seq.store.has(cellKey("object_lineage", body.space))) {
+          throw netError("E_INVARG", "scope cannot serve a replay page for a foreign space", { space: body.space });
+        }
+        const entries = seq.replayPage(body.space, body.from, body.limit);
+        return json({
+          scope: seq.scope,
+          head: seq.head(),
+          space: body.space,
+          from: body.from,
+          limit: body.limit,
+          entries,
+          version: replayPageVersion(entries)
+        });
       }
       if (request.method === "POST" && url.pathname === "/net/closure") {
         const body = (await request.json()) as {
@@ -1627,6 +1735,9 @@ export class NetScopeDO {
     }
     const seq: ScopeSequencer = new ScopeSequencer(resolvedScope, resolvedEpoch, {
       durable: this.store,
+      // Committed-log acceptance timestamps (CO2.5) come from the host
+      // clock, so tests with a fixture clock and workerd agree.
+      now: () => this.host.now(),
       // CO4 step 1 (CO14): validate the submit's session story — every
       // session read plus the transcript's session field — from this
       // authority's own cells when owned, else via the CO2.3 attestation

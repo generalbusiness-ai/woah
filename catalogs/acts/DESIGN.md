@@ -11,9 +11,12 @@ derived as a projection fold. Design note:
 
 Every stored row of coordination state is written by exactly one path: a
 projection `:fold(act)` inside the same sequenced turn that recorded the act.
-Two carve-outs stay object-authoritative and are **joined at view time, never
-mirrored**: artifact content (`$note` name/text) and physical location (the
-lease). Rows store seqs, not timestamps; times resolve from the log.
+Three carve-outs stay authoritative outside projection rows and are **joined
+at view time, never mirrored**: artifact content (`$note` name/text), physical
+location (the lease), and substrate relations already maintained by a single
+writer. A relation-checkpoint projection may add vocabulary and a completeness
+watermark, but no copied rows. Rows store seqs, not timestamps; times resolve
+from the log.
 
 ## Classes
 
@@ -57,11 +60,15 @@ the persisted `ts` on `$space:replay()` results.
 
 ## Proof status
 
-v0.1.0 is the kernel proof, in-memory lane: `tests/acts-kernel.test.ts`
-covers the seams, the lifecycle, emission authority, fail-closed atomicity,
-and the rebuild invariant. Not yet: the full tasks-catalog field migration
-and parity golden (kernel note §5.3), the workerd lane, client kanban
-adoption, further Tier C measurement (first in-memory relative indicators exist —
-`scripts/bench-acts-kernel.ts`; workerd produces the budgets), and everything
-the vision note defers (actor emission, dynamic attach/genesis, routing,
-practices).
+v0.1.0 proved the kernel in memory; Outliner then proved a real
+relation-checkpoint consumer. Net replay is also closed: a fresh Outliner
+projection rebuilds from the room authority's durable log through a sparse
+planner, with page attestation and real-workerd SQLite/RPC repair covered.
+Next is the Outliner parity/deletion close, followed by Dispenser, the first
+plug-backed migration: its typed Net verbs emit acts internally and
+`$dispenser_queue` replaces the directly-written queue. Tasks follows with the
+full field migration and parity golden (kernel note §5.3).
+Still open: client kanban adoption, further Tier C measurement (first
+in-memory relative indicators exist — `scripts/bench-acts-kernel.ts`;
+workerd produces the budgets), and the vision note's deferred actor emission,
+dynamic attach/genesis, routing, and practices.

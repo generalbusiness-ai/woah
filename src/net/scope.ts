@@ -42,8 +42,9 @@ import {
   type ScopeAttribution
 } from "./attribution";
 import type { TraceContext } from "./trace";
+import { replayPageVersion, type ReplayLogEntry } from "./replay-pages";
 import type { ScopeMeta, ScopeStore, TailEntry } from "./scope-store";
-import { applyTranscript, netCellKeyFor, type EffectTranscript, type TranscriptCell } from "./transcript";
+import { applyTranscript, isSequencedAllocationCell, netCellKeyFor, type EffectTranscript, type TranscriptCell } from "./transcript";
 import { cellKey, cellVersion } from "./cells";
 
 export type ScopeHead = {
@@ -109,6 +110,11 @@ export type CommitSubmit = {
      * at the same /net/attest freshness point as the cell versions, so a
      * foreign ordering read validates exactly like a foreign cell read. */
     orderings?: Array<{ container: string; parent: string | null; version: string }>;
+    /** The owner's CURRENT replay-page version per attested `(space, from,
+     * limit)` query (sequenced-log.md SL4), taken at the same /net/attest
+     * freshness point — a foreign committed-log read validates exactly
+     * like a foreign cell or ordering read. */
+    replays?: Array<{ space: string; from: number; limit: number; version: string }>;
   }>;
 };
 
@@ -217,6 +223,10 @@ export type ScopeSequencerOptions = {
   catalogMutationForbidden?: (object: string) => boolean;
   /** Bounded recovery tail length (the scope's own log — CO5 note). */
   tailLimit?: number;
+  /** Clock for the committed-log acceptance timestamp (CO2.5: accepted
+   * frames carry the authority's acceptance time). Default Date.now; the
+   * DO shell injects host.now so tests and workerd agree on the source. */
+  now?: () => number;
   /** H2a: reply-cache bound — the TOTAL number of recorded replies the
    * cache holds (default REPLY_CACHE_CAP). Within-window replies (still
    * covered by the recovery tail) are never pruned but DO count toward
@@ -260,6 +270,12 @@ export class ScopeSequencer {
    * in a room scope. */
   private readonly orderedRelationsByProjection = new Map<string, OrderedChildRow[]>();
   private readonly orderedRelationLocationByKey = new Map<string, { projection: string; child: string; rank: string }>();
+  /** Committed sequenced-log rows for DURABLE-LESS sequencers only (unit
+   * tests / in-process fixtures): space → (seq → entry). With a durable
+   * store the log is never held in memory — it is the one row family
+   * besides `scheduled` that can outgrow the live cell set without bound,
+   * so pages are read from the store on demand (scope-store.ts). */
+  private readonly memoryLogRows = new Map<string, Map<number, ReplayLogEntry>>();
   private readonly options: Required<Pick<ScopeSequencerOptions, "tailLimit">> & ScopeSequencerOptions;
 
   constructor(scope: string, catalogEpoch: string, options: ScopeSequencerOptions = {}) {
@@ -611,6 +627,20 @@ export class ScopeSequencer {
       return this.reject(submit, "incomplete_transcript", { reasons: submit.transcript.incompleteReasons });
     }
 
+    // SL1/CO2.3: new net-planned sequenced transcripts preserve their
+    // semantic space explicitly. When this scope owns that space, the
+    // reserved next_seq allocation must be exactly one honest pre-state
+    // read plus one `seq + 1` write. The write bypasses ordinary VM-frame
+    // authority because it is sequencer bookkeeping, so this structural
+    // check is its equivalent authority proof. A commit away from the
+    // space (CA3 pure movement) must carry no allocation at all. Transcripts
+    // without `space` are the rolling-upgrade/legacy shape and retain the
+    // old out-of-band sequencer behavior.
+    const allocationError = this.sequencedAllocationError(submit.transcript);
+    if (allocationError !== null) {
+      return this.reject(submit, "write_unauthorized", { sequenced_allocation: allocationError });
+    }
+
     // Step 5 / CO15: the durable owner independently enforces the premise
     // behind exact-epoch catalog certificates. This check uses authoritative
     // pre-state through the shell-provided predicate, so a stale or modified
@@ -697,6 +727,16 @@ export class ScopeSequencer {
       return this.reject(submit, "read_version_mismatch", {}, [...mismatched.values()]);
     }
 
+    // The allocation's version has now passed the normal retryable CAS
+    // check. Only at this point compare its claimed logical value with the
+    // authority value: doing this before step 7 would turn an ordinary
+    // concurrent allocation into a terminal write_unauthorized refusal
+    // instead of the expected refresh/replan.
+    const allocationValueError = this.sequencedAllocationAuthorityValueError(submit.transcript);
+    if (allocationValueError !== null) {
+      return this.reject(submit, "write_unauthorized", { sequenced_allocation: allocationValueError });
+    }
+
     // Step 7b (P1.1): validate ordering projection reads. Each names a
     // parent, the OWNING scope the answer came from, and the authority
     // content `version` the plan read. An entry THIS scope owns re-derives
@@ -734,6 +774,44 @@ export class ScopeSequencer {
       // projections and re-plans. Scope is part of the identity because two
       // independent root orderings can both have `parent: null` in one turn.
       return this.reject(submit, "read_version_mismatch", { ordering_conflicts: orderingConflicts });
+    }
+
+    // Step 7c (sequenced-log.md SL4): validate replay-page reads exactly
+    // like ordering reads. An entry THIS scope owns re-derives its page
+    // from the durable committed log — an append landing inside the window
+    // between plan and submit changes the page's content version and the
+    // stale read rejects retryable (the gateway re-fetches the page and
+    // re-plans). A FOREIGN entry validates against the owner's `replays`
+    // attestation carried by the submit; one with no attestation is a
+    // submitter protocol violation (terminal rider_unattested, the R3
+    // mirror). Validation runs BEFORE this turn's own log append below, so
+    // a sequenced turn reading its own space's log never self-invalidates.
+    const attestedReplays = new Map<string, string>();
+    for (const [owner, entry] of Object.entries(submit.attestations ?? {})) {
+      for (const page of entry.replays ?? []) {
+        attestedReplays.set(`${owner}\0${page.space}\0${page.from}\0${page.limit}`, page.version);
+      }
+    }
+    const replayConflicts: Array<{ scope: string; space: string; from: number; limit: number }> = [];
+    for (const read of submit.transcript.replayReads ?? []) {
+      if (read.scope !== this.scope) {
+        const attested = attestedReplays.get(`${read.scope}\0${read.space}\0${read.from}\0${read.limit}`);
+        if (attested === undefined) {
+          return this.reject(submit, "rider_unattested", {
+            replay_space: read.space,
+            replay_scope: read.scope
+          });
+        }
+        if (attested !== read.version) replayConflicts.push({ scope: read.scope, space: read.space, from: read.from, limit: read.limit });
+        continue;
+      }
+      const current = replayPageVersion(this.replayPage(read.space, read.from, read.limit));
+      if (current !== read.version) replayConflicts.push({ scope: read.scope, space: read.space, from: read.from, limit: read.limit });
+    }
+    if (replayConflicts.length > 0) {
+      // Retryable: the gateway drops its cached pages for the named
+      // queries, re-fetches, and re-plans (the ordering-conflict shape).
+      return this.reject(submit, "read_version_mismatch", { replay_conflicts: replayConflicts });
     }
 
     // Step 9: per-write authority (recorded VM frame, never owner union).
@@ -814,6 +892,23 @@ export class ScopeSequencer {
     this.tail.push(tailEntry);
     if (this.tail.length > this.options.tailLimit) this.tail.splice(0, this.tail.length - this.options.tailLimit);
 
+    // Committed sequenced log (sequenced-log.md SL1/SL4): every accepted
+    // SEQUENCED transcript that consumed this space's seq appends one
+    // durable entry under its SEMANTIC
+    // space id and space-log seq — the row `$space:replay(from, limit)`
+    // pages read through /net/replay-page. `ts` is minted HERE, once, as
+    // the authority acceptance time (CO2.5), so page content versions are
+    // stable across re-reads. Failed turns append with applied_ok: false
+    // (a refused verb still consumed its seq); direct-route commits and
+    // adoption never log. The idempotent-replay early return above means
+    // this runs at most once per turn.
+    const logEntry = this.committedLogEntry(submit.transcript);
+    if (logEntry && !this.options.durable) {
+      const rows = this.memoryLogRows.get(logEntry.space) ?? new Map<number, ReplayLogEntry>();
+      rows.set(logEntry.seq, logEntry);
+      this.memoryLogRows.set(logEntry.space, rows);
+    }
+
     // CO13: derive relation deltas from the accepted transcript — the
     // single write path for contents/presence rows. Local rows apply here
     // (durably, in the same transaction below); foreign rows ride the
@@ -854,6 +949,7 @@ export class ScopeSequencer {
         durable.writeReply(submit.idempotency_key, reply);
         durable.appendTail(tailEntry);
         durable.trimTail(this.options.tailLimit);
+        if (logEntry) durable.appendLogEntry(logEntry);
         for (const key of prunedReplies) durable.deleteReply(key);
         for (const key of changedRelationKeys) {
           const row = this.relationRows.get(key);
@@ -1020,6 +1116,111 @@ export class ScopeSequencer {
   orderedChildren(container: string, parent: string | null): OrderedChildRow[] {
     const projected = this.orderedRelationsByProjection.get(orderedProjectionKey(container, parent)) ?? [];
     return orderedChildrenForContainer(this.store, projected, container, parent);
+  }
+
+  /**
+   * One committed replay page of a space this authority owns
+   * (sequenced-log.md SL2 window semantics: entries with `seq >= from`,
+   * at most `limit`, in seq order). `space` is the SEMANTIC space id.
+   * Served from the durable log family on demand — never hydrated — or
+   * from the in-memory rows on a durable-less test sequencer. A space
+   * with no committed entries (or one this scope does not own) yields
+   * the empty page, whose version is still well-defined and attestable.
+   */
+  replayPage(space: string, from: number, limit: number): ReplayLogEntry[] {
+    const durable = this.options.durable;
+    if (durable) return durable.readLogPage(space, from, limit);
+    const rows = this.memoryLogRows.get(space);
+    if (!rows) return [];
+    return [...rows.values()]
+      .filter((entry) => entry.seq >= from)
+      .sort((a, b) => a.seq - b.seq)
+      .slice(0, limit)
+      .map((entry) => structuredClone(entry));
+  }
+
+  /** Validate the explicit SL1 allocation carried by the new net transcript
+   * shape. See the submit call site for the compatibility boundary. */
+  private sequencedAllocationError(transcript: EffectTranscript): string | null {
+    if (transcript.route !== "sequenced" || transcript.space === undefined) return null;
+    const space = transcript.space;
+    const writes = transcript.writes.filter((write) => isSequencedAllocationCell(transcript, write.cell));
+    // Omitting `owns` means a single-scope authority (the same convention
+    // step 7 uses for ordinary reads), so it owns every object in its store
+    // even when the transport scope name differs from the semantic space id.
+    // Multi-scope hosts always provide the predicate and therefore still
+    // reject/strip allocations committed away from the room owner.
+    const ownedHere = this.options.owns ? this.options.owns(space) : true;
+    if (!ownedHere) return writes.length === 0 ? null : "foreign commit carried the space allocation";
+    if (!Number.isInteger(transcript.seq) || transcript.seq < 1) return "seq must be a positive integer";
+    if (writes.length !== 1) return `expected one next_seq write, got ${writes.length}`;
+    const write = writes[0];
+    if (write.op !== "set" || write.value !== transcript.seq + 1) return "next_seq write must set seq + 1";
+    // submitTranscript re-versions READS against the authority view, while
+    // write.prior/next retain the ephemeral world's local counters. The
+    // serialized authority CAS is therefore the read version, not equality
+    // between those two version domains.
+    const matchingReads = transcript.reads.filter((read) =>
+      isSequencedAllocationCell(transcript, read.cell)
+      && read.value === transcript.seq
+      && read.version !== undefined
+    );
+    return matchingReads.length === 1 ? null : `expected one matching next_seq pre-read, got ${matchingReads.length}`;
+  }
+
+  /** After the allocation read's version passes step 7, prove its claimed
+   * logical value is the authority's actual allocator value. This closes the
+   * forged-value/current-version gap without relabelling honest concurrency
+   * as a terminal refusal. */
+  private sequencedAllocationAuthorityValueError(transcript: EffectTranscript): string | null {
+    if (transcript.route !== "sequenced" || transcript.space === undefined) return null;
+    const write = transcript.writes.find((candidate) => isSequencedAllocationCell(transcript, candidate.cell));
+    if (!write) return null; // legitimate off-space CA3 commit
+    const current = this.store.get(netCellKeyFor(write.cell) ?? "");
+    const currentPayload = current?.value as { value?: unknown } | undefined;
+    // A never-used space may inherit `$sequenced_log.next_seq == 1` and
+    // therefore have no instance property cell yet. The first accepted Net
+    // turn materializes it; every later allocation reads the stored value.
+    const authorityNextSeq = current === undefined ? 1 : currentPayload?.value;
+    return authorityNextSeq === transcript.seq ? null : "seq must equal the authority next_seq value";
+  }
+
+  /** The committed-log row an accepted transcript appends, or null for
+   * routes that never log (direct commits, adoption, session mints). The
+   * SEMANTIC space rides in `transcript.space` (preserved by the planner
+   * when it retargets `scope` at this authority's address); an engine-
+   * shaped transcript without the field logs under its `scope`, which IS
+   * the semantic space there. */
+  private committedLogEntry(transcript: EffectTranscript): ReplayLogEntry | null {
+    if (transcript.route !== "sequenced") return null;
+    const space = transcript.space ?? transcript.scope;
+    if (typeof space !== "string" || space.length === 0 || typeof transcript.seq !== "number") return null;
+    // Only a turn that actually CONSUMED a seq here logs: the planner keeps
+    // the space's `next_seq` allocation write exactly when the commit scope
+    // owns the space (plan.ts stripUnownedSequencedAllocation), so this
+    // guard both prevents a foreign scope from minting rows for a space it
+    // does not own and keeps the (space, seq) key collision-free — a
+    // CA3 pure-movement turn commits at the actor's cluster with the
+    // allocation stripped and appends nothing.
+    const consumedSeq = transcript.writes.some(
+      (write) => write.cell.kind === "prop" && write.cell.object === space && write.cell.name === "next_seq"
+    );
+    if (!consumedSeq) return null;
+    return {
+      space,
+      seq: transcript.seq,
+      ts: (this.options.now ?? Date.now)(),
+      actor: transcript.call.actor,
+      message: structuredClone({
+        actor: transcript.call.actor,
+        target: transcript.call.target,
+        verb: transcript.call.verb,
+        args: transcript.call.args
+      }),
+      observations: structuredClone(transcript.observations) as unknown[],
+      applied_ok: transcript.error === undefined,
+      ...(transcript.error !== undefined ? { error: structuredClone(transcript.error) } : {})
+    };
   }
 
   /**

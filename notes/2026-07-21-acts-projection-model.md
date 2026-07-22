@@ -28,7 +28,8 @@ static this-call resolution. RETARGET (user decision, same day): **Outliner repl
 Tasks as the first real migration target** — user-ready, its net repair
 loop is the model's motivating bug, and the facade note already chose
 it as the client's first adopter; casework keeps the tasks-shaped
-proof, and Tasks migrates second. Split landed: `acts` is the generic
+proof. **Dispenser migrates next as the first plug-backed consumer;
+Tasks follows.** Split landed: `acts` is the generic
 kernel; `casework` is the temporary proof catalog. Outliner phase 1
 landed (validated guarded emission on the five structural verbs against
 the existing `outline_item_*` schemas; unions/null earned in the shape
@@ -46,9 +47,17 @@ five structural acts, keeps no rows (the `__ordered_edge` relation
 stays the current-state authority; carve-out 3 in §1), and
 `$outliner:tree_view` returns the substrate tree plus the
 `structure_at_seq` checkpoint; undo's `_restore_item` re-emits the
-added act so restores advance it. Outstanding: legacy-genesis seeding
-for deployed outlines, outliner parity/deletion delta, then the Tasks
-migration, workerd lane, E4/E5 gate, cold-case cost.*
+added act so restores advance it. Legacy genesis is empty by construction:
+deployed relations remain authoritative, the checkpoint begins at 0, and
+the first v3 structural act makes it current. RESOLVED (2026-07-22): Net
+replay reads exact pages from the semantic room's Scope authority; that
+authority durably appends accepted sequenced entries with its seq/ts, and
+pages participate in normal local-or-attested read validation. A fresh
+`$outline_meta` rebuild converges to the live watermark through a sparse
+Net planner, while real workerd proves the same durable page repair over
+SQLite/RPC (26/26). Outstanding: outliner parity/deletion delta, then the
+dispenser and Tasks migrations, E4/E5 gate, and cold-case cost. The ordered
+queue is §7.1.*
 
 ---
 
@@ -558,7 +567,32 @@ Parity tests:
    external effect occurs without the human approval required by E5.
    (Poisoned-correlation fixtures belong to the v1.5 router gates.)
 
-## 7. Deferred decisions
+## 7. Adoption queue and deferred decisions
+
+### 7.1 Ordered adoption queue
+
+Net replay is complete: a sparse planner repairs from the semantic room's
+durable authority log; the exact Outliner rebuild test and real-workerd
+storage/RPC lane are green.
+
+1. **Close Outliner.** Finish parity and deletion-delta accounting, pin the
+   empty legacy-genesis behavior, and keep `__ordered_edge` as the sole
+   structure authority.
+2. **Migrate Dispenser.** Keep Net-authenticated `:order`, `:deliver`, and
+   `:cancel` as the public surface; emit fixed acts internally; replace the
+   directly-written queue and admission maps with `$dispenser_queue`; carry
+   the delivered note by reference; and prove dropped-reply idempotency,
+   legacy genesis, full-state rebuild, deterministic rotating-requester
+   eviction, an absolute queue cap, zero extra queue writers, and a net
+   deletion delta. The field disposition and non-goals are explicit in
+   [`catalogs/dispenser/DESIGN.md`](../catalogs/dispenser/DESIGN.md#acts-migration-next-major).
+3. **Migrate Tasks.** Retire the temporary casework proof through the full
+   field-disposition, parity-golden, client-kanban, and deletion-delta gates
+   in §5.
+4. **Close the remaining release gates.** Run the E4/E5 adversarial lane,
+   cold-case measurement, and workerd Tier C budgets.
+
+### 7.2 Kernel decisions deferred
 
 1. **Shape-language depth**: flat key → type-tag now; when
    optionality/nesting/class-constrained refs are needed, does
@@ -669,9 +703,9 @@ Recorded as stated budgets that set the v1.5 envelope:
   change; any additional core edit is a *discovered seam*, documented
   with its layering justification, and counts against the "small
   generic completion" claim.
-- **Deferred decisions get evidence.** The prototype resolves §7(1)
+- **Deferred decisions get evidence.** The prototype resolves §7.2(1)
   (where shape validation lives) from experience, and produces the
-  measured cost curve for §7(2).
+  measured cost curve for §7.2(2).
 
 ### 8.5 Falsifiers (outcomes that revise or kill)
 

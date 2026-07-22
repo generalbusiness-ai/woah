@@ -25,9 +25,12 @@ The substrate primitives that make this work:
   `$system:create_api_key_for_owner`), pastes the secret into the plug's
   secret store, and the plug authenticates as the block. Revoke closes
   any session minted from the key.
-- **Live observation route.** Property writes emit a `block_data`
-  observation to `location(this)`. The substrate does not log
-  `block_data`; reconnects re-read current values via `:get_data`.
+- **Net turn route.** Production plugs authenticate as the block and call
+  its verbs through `/net-api/turn`. Accepted calls are sequenced in the
+  session's active space; reconnects still re-read current values via
+  `:get_data`, because `block_data` announces current state rather than
+  defining a history API. Legacy direct calls remain live while that
+  compatibility route exists.
 
 ## Anchored
 
@@ -72,11 +75,32 @@ observe_to_space(location(this), {
 
 `$block` is an actor, not a space — `observe()` alone reaches nobody.
 `observe_to_space(location(this), ...)` routes to the containing room's
-audience. Live route: not in the space log, not sequenced, no replay.
+audience; it does not choose durability. The enclosing call does that:
+the production Net route is sequenced, while a legacy direct call is live.
+Fanout to connected clients is best-effort in either case, so reconnecting
+clients recover by reading the block, not by treating observations as a
+current-state replica.
 
-Subclasses that need replay (e.g. `$dispenser_block` events) emit
-sequenced observations from their own verbs; the base class is
-deliberately log-free.
+The base class deliberately promises current state, not a coordination
+log. A Net-sequenced `block_data` observation may appear in the room log,
+but no base projection consumes it and direct compatibility calls may be
+unrecorded.
+
+## Net and acts
+
+Net and acts solve different problems. Net authenticates the plug, routes
+the call, and serializes the turn. Acts record woo-owned domain facts and
+drive projections. The base block therefore does **not** turn every pushed
+property value into an act: those values mirror an outside authority, and a
+second act-derived copy would create two authorities.
+
+A subclass uses acts when a typed verb changes coordination state. The plug
+still calls that verb through Net; after authorization and validation, the
+verb emits its fixed act internally and the projection becomes the sole
+writer of derived rows. The plug never receives a raw `:act` surface.
+Machine-rate inputs should be reduced to bounded checkpoints before they
+become acts. The dispenser queue is the first plug-backed migration of this
+pattern.
 
 ## Credential surface
 

@@ -29,7 +29,10 @@ See [DESIGN.md](DESIGN.md) for the full pattern, including:
 
 - writability tiers (`writable_owner`, `writable_self`) as ordinary
   class properties
-- live `block_data` observation route (no sequencing, no replay)
+- Net-sequenced production calls, best-effort observation delivery, and
+  current-state recovery via `:get_data`
+- the acts boundary: external-authoritative values stay block properties;
+  typed coordination verbs emit acts internally
 - credential management (mint/revoke/list apikeys via the block)
 - summary-vs-detail tier filtering for `RoomSnapshot`
 

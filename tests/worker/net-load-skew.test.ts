@@ -377,16 +377,27 @@ describe("load:net-skew — skewed-workload bounds (NC8)", () => {
     // Backlog: 40 near-due turns with NO planner-role subscriber — the
     // alarm parks them (rows retained). This is the pathological shape:
     // a scope whose scheduled family is saturated.
-    const due = Date.now() + 20;
-    for (let i = 0; i < 40; i += 1) {
-      await call(scopeDO, h.scopeEnv, "/schedule", {
-        scope: h.roomScope,
-        catalog_epoch: EPOCH,
-        turn: { id: `skew-sched-${i}`, at_logical_time: due, call: { actor: "#a", target: "#t", verb: "tick", args: [] } } satisfies ScheduledTurn
-      });
+    // Pin logical time while filling the batch. A wall-clock `now + 20ms`
+    // deadline can expire during the 40 signed requests under a busy full
+    // suite, making /schedule correctly refuse the tail as no longer future.
+    // Advancing the same clock explicitly keeps this an alarm-backlog test,
+    // not a machine-speed test.
+    const scheduledAt = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(scheduledAt);
+    const due = scheduledAt + 20;
+    try {
+      for (let i = 0; i < 40; i += 1) {
+        await call(scopeDO, h.scopeEnv, "/schedule", {
+          scope: h.roomScope,
+          catalog_epoch: EPOCH,
+          turn: { id: `skew-sched-${i}`, at_logical_time: due, call: { actor: "#a", target: "#t", verb: "tick", args: [] } } satisfies ScheduledTurn
+        });
+      }
+      clock.mockReturnValue(due + 20);
+      await scopeDO.alarm();
+    } finally {
+      clock.mockRestore();
     }
-    await new Promise((resolve) => setTimeout(resolve, 40));
-    await scopeDO.alarm();
     await h.settle();
 
     // Foreground turns land first-attempt with the warm RPC budget —

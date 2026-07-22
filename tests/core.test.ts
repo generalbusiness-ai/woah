@@ -1922,6 +1922,15 @@ describe("woo core", () => {
     expect(world.replay("the_dubspace", 2, 1).map((entry) => entry.seq)).toEqual([2]);
   });
 
+  it("refuses fractional replay bounds instead of attesting a truncated page", async () => {
+    const { world } = authedWorld();
+    for (const [from, limit] of [[1.5, 10], [1, 2.5]]) {
+      const result = await world.directCall(`bad-replay-${from}-${limit}`, "$wiz", "the_dubspace", "replay", [from, limit]);
+      expect(result.op).toBe("error");
+      if (result.op === "error") expect(result.error.code).toBe("E_RANGE");
+    }
+  });
+
   it("emits metrics for direct and sequenced call routes", async () => {
     const { world, session, actor } = authedWorld();
     const metrics: MetricEvent[] = [];

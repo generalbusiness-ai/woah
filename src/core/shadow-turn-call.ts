@@ -86,6 +86,14 @@ export type ShadowTurnCallOptions = {
    * whichever edge cells happened to materialize (mirror of the roster flag).
    * Guards both ordered_children and ordered_neighbors reads. */
   require_ordered_children_projection?: boolean;
+  /** Transient owner-served committed replay pages (sequenced-log.md SL4) —
+   * one page per exact `(space, from, limit)` query, entries in the native
+   * replay shape with SEMANTIC space identity. Never persisted or exported. */
+  replay_pages?: Array<{ space: string; from: number; limit: number; entries: readonly Record<string, unknown>[] }>;
+  /** Net's sparse planner must fail (repairable E_NEED_REPLAY_PAGE) rather
+   * than answer a replay read from its intentionally-absent local log tail
+   * (mirror of the roster/ordering flags). */
+  require_replay_page_projection?: boolean;
   /** Net commits recorded cells rather than the ephemeral WooWorld. Enable
    * recorder events for runtime verb/property-definition authoring; legacy v2
    * execution keeps its existing materialization path until that stack is
@@ -110,6 +118,8 @@ export async function runShadowTurnCall(
   for (const ordering of options.ordered_children ?? []) built.installOrderedChildrenProjection(ordering.container, ordering.parent, ordering.rows);
   for (const neighbors of options.ordered_neighbors ?? []) built.installOrderedNeighborsProjection(neighbors.container, neighbors.query, neighbors.value);
   if (options.require_ordered_children_projection) built.setRequireOrderedChildrenProjection(true);
+  for (const page of options.replay_pages ?? []) built.installReplayPageProjection(page.space, page.from, page.limit, page.entries);
+  if (options.require_replay_page_projection) built.setRequireReplayPageProjection(true);
   if (options.record_authoring_cell_writes) built.setRecordAuthoringCellWrites(true);
   built.setMetricsHook(options.onMetric ?? null);
   if (options.planning_cell_provenance) built.setPlanningCellProvenance(options.planning_cell_provenance);
@@ -132,6 +142,8 @@ export async function runShadowTurnCallTranscript(
   for (const ordering of options.ordered_children ?? []) built.installOrderedChildrenProjection(ordering.container, ordering.parent, ordering.rows);
   for (const neighbors of options.ordered_neighbors ?? []) built.installOrderedNeighborsProjection(neighbors.container, neighbors.query, neighbors.value);
   if (options.require_ordered_children_projection) built.setRequireOrderedChildrenProjection(true);
+  for (const page of options.replay_pages ?? []) built.installReplayPageProjection(page.space, page.from, page.limit, page.entries);
+  if (options.require_replay_page_projection) built.setRequireReplayPageProjection(true);
   if (options.record_authoring_cell_writes) built.setRecordAuthoringCellWrites(true);
   if (options.onMetric) built.setMetricsHook(options.onMetric);
   if (options.planning_cell_provenance) built.setPlanningCellProvenance(options.planning_cell_provenance);

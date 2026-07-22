@@ -68,6 +68,7 @@ import {
   type OrderedEdgeValue,
   type OrderedNeighborsQuery
 } from "./ordered-edge";
+import { REPLAY_PAGE_DEFAULT_LIMIT, replayPageQueryKey, validReplayPageBounds } from "./replay-page";
 
 /** What a same-run ordered-edge writer's PRE-WRITE ordering membership was
  * (R1 overlay). `known: false` = the sparse planning world had no local value
@@ -687,6 +688,17 @@ export class WooWorld {
   // ordering reads: the full ordered_children projection and the bounded
   // ordered_neighbors query.
   private requireOrderedChildrenProjection = false;
+  /** Owner-served committed replay pages (sequenced-log.md SL2/SL4), keyed
+   * by the exact `(space, from, limit)` query — the log-read analogue of
+   * the ordering projections above. Entries carry their SEMANTIC space
+   * identity and the authority-minted `ts`; installed only in an ephemeral
+   * planning world, never persisted or exported. */
+  private readonly replayPageProjections = new Map<string, WooValue[]>();
+  // Net planning enables this so a sparse world FAILS LOUDLY (repairable
+  // E_NEED_REPLAY_PAGE) rather than answering a replay read from its
+  // intentionally-absent local log tail — which would silently return []
+  // and let a rebuild/journal verb conclude the log is empty.
+  private requireReplayPageProjection = false;
   /** Net planning commits recorder cells rather than this ephemeral graph.
    * Keep authoring recording opt-in so the frozen v2 materializer is unchanged. */
   private recordAuthoringCellWrites = false;
@@ -867,6 +879,44 @@ export class WooWorld {
       orderedNeighborsQueryKey(container, query),
       cloneImportedPlainData(value) as WooValue
     );
+  }
+
+  /** Install one owner-served committed replay page for the EXACT
+   * `(space, from, limit)` query (sequenced-log.md SL4). `space` is the
+   * SEMANTIC space id; `entries` are the authority's committed log rows in
+   * the native replay shape (`{seq, ts, actor, message, observations,
+   * applied_ok, error?}`). Planning-only, like the ordering projections. */
+  installReplayPageProjection(space: ObjRef, from: number, limit: number, entries: readonly Record<string, unknown>[]): void {
+    this.replayPageProjections.set(
+      replayPageQueryKey({ space, from, limit }),
+      cloneImportedPlainData(entries) as WooValue[]
+    );
+  }
+
+  setRequireReplayPageProjection(required: boolean): void {
+    this.requireReplayPageProjection = required;
+  }
+
+  /** The committed log page a `replay(from, limit)` read resolves to. On a
+   * sparse net planning world the exact owner page MUST have been installed;
+   * a missing one is a REPAIRABLE miss (`E_NEED_REPLAY_PAGE` naming the full
+   * query), which the gateway answers with one authority fetch
+   * (POST /net/replay-page) and a re-plan — exactly the ordered-children
+   * repair shape. The code is on the VM's uncatchable list so a woocode
+   * `try { space:replay(...) } except` cannot swallow the miss into a
+   * silently-empty journal. A complete local runtime answers from its own
+   * durable log (`this.replay`), so both lanes return the same shape. */
+  private replayPageForVm(space: ObjRef, from: number, limit: number): SpaceLogEntry[] {
+    const projected = this.replayPageProjections.get(replayPageQueryKey({ space, from, limit }));
+    if (projected !== undefined) return cloneImportedPlainData(projected) as unknown as SpaceLogEntry[];
+    if (this.requireReplayPageProjection) {
+      throw wooError(
+        "E_NEED_REPLAY_PAGE",
+        `sparse planning replay page not resident for ${space} from ${from} limit ${limit}`,
+        { space, from, limit } as unknown as WooValue
+      );
+    }
+    return this.replay(space, from, limit);
   }
 
   /** The bounded `{count, index, before, after, child_index}` answer for one
@@ -1087,6 +1137,42 @@ export class WooWorld {
       this.activeTurnRecorder = previous;
       this.currentTurnWriter = previousWriter;
     }
+  }
+
+  /** Record the sequenced-call seq allocation as ordinary transcript
+   * read/write events. The preamble reads and increments the space's
+   * `next_seq` BEFORE `withTurnRecording` opens the recorder (VTN10.1 —
+   * a preamble miss must not fire the in-run lifecycle probe), so without
+   * this a net-planned sequenced transcript carried NO trace of the
+   * allocation: the authority's `next_seq` cell never advanced and every
+   * planned turn re-allocated seq 1, breaking the committed log's seq
+   * identity (sequenced-log.md SL1: `append` is the only blessed
+   * increment). Recording it as a normal read+write makes the allocation
+   * an authority-cell fact — the committing scope validates the read
+   * (serializing concurrent allocations exactly like the local lane's
+   * atomic append) and applies the write, and the entry's `seq` is then
+   * honest on every lane. No-op when no recorder is active (the ordinary
+   * local path), so local behavior is unchanged. */
+  private recordSequencedAllocation(spaceRef: ObjRef, seq: number, actor: ObjRef): void {
+    if (!this.activeTurnRecorder) return;
+    const afterVersion = this.propertyVersionForRecording(spaceRef, "next_seq");
+    const beforeVersion = typeof afterVersion === "number" ? afterVersion - 1 : afterVersion;
+    this.recordTurnEvent({ kind: "prop_read", object: spaceRef, name: "next_seq", value: seq, ...(beforeVersion !== undefined ? { version: beforeVersion } : {}) });
+    this.recordTurnEvent({
+      kind: "prop_write",
+      object: spaceRef,
+      name: "next_seq",
+      hadValue: true,
+      before: seq,
+      after: seq + 1,
+      changed: true,
+      ...(beforeVersion !== undefined ? { beforeVersion } : {}),
+      ...(afterVersion !== undefined ? { afterVersion } : {}),
+      // The allocation is the sequencer's own act, not any verb frame's:
+      // name the space's call machinery as the recording authority (the
+      // sessionWriter precedent for engine-folded writes).
+      writer: { progr: actor, thisObj: spaceRef, verb: "call", definer: spaceRef, caller: "#-1", callerPerms: actor }
+    });
   }
 
   // Called by the VM whenever execution changes frames. The recorder annotates
@@ -4615,6 +4701,9 @@ export class WooWorld {
           { id, route: "sequenced", scope: spaceRef, seq, session: sessionId, actor: message.actor, target: message.target, verb: message.verb, args: message.args, body: message.body },
           async (activeRecorder) => {
             if (ctx.hostMemo) ctx.hostMemo.turnRecorder = activeRecorder;
+            // The preamble's seq allocation, recorded as ordinary transcript
+            // events so a net-planned turn commits the sequencer advance.
+            this.recordSequencedAllocation(spaceRef, seq, message.actor);
             // Live-presence scrub is ordinary gateway maintenance. The helper
             // no-ops under shadow recording so user-turn transcripts do not
             // gain hidden system-authority writes.
@@ -4729,6 +4818,8 @@ export class WooWorld {
             { id, route: "sequenced", scope: spaceRef, seq, session: sessionId, actor: message.actor, target: message.target, verb: message.verb, args: message.args, body: message.body },
             async (activeRecorder) => {
               if (ctx.hostMemo) ctx.hostMemo.turnRecorder = activeRecorder;
+              // Same recorded seq allocation as the in-memory path.
+              this.recordSequencedAllocation(spaceRef, seq, message.actor);
               // Same maintenance boundary as the in-memory path: repository
               // hosts may clean stale live rows, but recorded shadow turns
               // must not carry those cleanup writes.
@@ -8154,11 +8245,13 @@ export class WooWorld {
     }
 
     const logEntry = this.effects.transcriptLogEntry(transcript);
+    // Store under the entry's SEMANTIC space id (transcriptLogEntry resolves
+    // it); host-slice routing still keys on the transcript's commit scope.
     if (logEntry && belongsHere(transcript.scope)) {
-      const entries = this.logs.get(transcript.scope) ?? [];
+      const entries = this.logs.get(logEntry.space) ?? [];
       this.effects.mergeTranscriptLogEntry(entries, logEntry);
-      this.logs.set(transcript.scope, entries);
-      this.activeObjectRepository()?.saveCommittedLogEntry(transcript.scope, logEntry);
+      this.logs.set(logEntry.space, entries);
+      this.activeObjectRepository()?.saveCommittedLogEntry(logEntry.space, logEntry);
       logs += 1;
     }
 
@@ -8342,9 +8435,10 @@ export class WooWorld {
     stepStartedAt = Date.now();
     const logEntry = this.effects.transcriptLogEntry(transcript);
     if (logEntry) {
-      const entries = this.logs.get(transcript.scope) ?? [];
+      // Semantic-space keying (see the host-slice twin above).
+      const entries = this.logs.get(logEntry.space) ?? [];
       this.effects.mergeTranscriptLogEntry(entries, logEntry);
-      this.logs.set(transcript.scope, entries);
+      this.logs.set(logEntry.space, entries);
     }
     profile?.("apply_log", stepStartedAt);
 
@@ -10880,8 +10974,18 @@ export class WooWorld {
     this.nativeHandlers.set("has_feature", (ctx, args) => this.featureList(ctx.thisObj).includes(assertObj(args[0])));
     this.nativeHandlers.set("replay", (ctx, args) => {
       const from = Number(args[0] ?? 1);
-      const limit = Number(args[1] ?? 100);
-      return this.replay(ctx.thisObj, from, limit).map((entry) => ({
+      const limit = Number(args[1] ?? REPLAY_PAGE_DEFAULT_LIMIT);
+      // SL2/SL8: `from < 1` or `limit` outside 1..1000 is E_RANGE. The
+      // bounds also normalize the net replay-page query, so the page a
+      // sparse plan attests and the page the authority re-derives at
+      // commit describe the same exact window.
+      if (!validReplayPageBounds(from, limit)) {
+        throw wooError("E_RANGE", "replay requires from >= 1 and limit in 1..1000", {
+          from: (args[0] ?? null) as WooValue,
+          limit: (args[1] ?? null) as WooValue
+        } as unknown as WooValue);
+      }
+      return this.replayPageForVm(ctx.thisObj, from, limit).map((entry) => ({
         seq: entry.seq,
         // The entry's committed wall-clock time was always persisted
         // (SpaceLogEntry.ts) but omitted here; acts-kernel projections

@@ -36,6 +36,22 @@ export async function buildLaneFixture() {
   const session = world.auth("guest:net-lane");
   const actor = session.actor;
   world.createObject({ id: "net_lane_room", name: "Lane Room", parent: "$space", owner: actor });
+  // SL4 workerd proof: the client first commits a sequenced click below,
+  // then this room verb reads that entry through $space:replay. The Net
+  // planner is deliberately sparse, so the read can succeed only after the
+  // gateway fetches the exact page from the room Scope authority.
+  const replayCountInstalled = installVerb(
+    world,
+    "net_lane_room",
+    "replay_count",
+    `verb :replay_count(from_seq, limit) rxd {
+      return length(this:replay(from_seq, limit));
+    }`,
+    null
+  );
+  if (!replayCountInstalled.ok) {
+    throw new Error(`fixture replay_count install failed: ${JSON.stringify(replayCountInstalled)}`);
+  }
   world.createObject({ id: "lane_box", name: "Lane Box", parent: "$thing", owner: actor, anchor: "net_lane_room", location: "net_lane_room" });
   world.defineProperty("lane_box", { name: "counter", defaultValue: 0, owner: actor, perms: "rw", typeHint: "int" });
   const installed = installVerb(

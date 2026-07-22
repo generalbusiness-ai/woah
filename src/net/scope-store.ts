@@ -19,6 +19,7 @@
 import type { ScopeAttribution } from "./attribution";
 import type { Cell } from "./cells";
 import type { RelationRow } from "./relations";
+import type { ReplayLogEntry } from "./replay-pages";
 import type { CommitReply, ScheduledTurn, ScopeHead } from "./scope";
 
 export type ScopeMeta = {
@@ -43,7 +44,7 @@ export type TailEntry = {
 };
 
 /**
- * The five row families of a scope's durable state. Implementations must
+ * The row families of a scope's durable state. Implementations must
  * make `transaction` atomic (all-or-nothing) so a crash between the
  * commit reply and the fanout drain can never leave head/cells/reply
  * disagreeing — that atomicity is what makes idempotent replay after
@@ -94,6 +95,21 @@ export interface ScopeStore {
   readRelations(): RelationRow[];
   writeRelation(key: string, row: RelationRow): void;
   deleteRelation(key: string): void;
+
+  /** Seventh row family (sequenced-log.md SL1/SL4): the committed sequenced
+   * log this authority owns — one row per accepted SEQUENCED transcript,
+   * keyed by (SEMANTIC space id, space-log seq). This is the durable log
+   * SL1 promises ("the log itself is durable storage backed by the host"):
+   * appended inside the accept transaction, never hydrated wholesale (like
+   * the scheduled family, it can outgrow the live cell set without bound —
+   * every consumer question is a bounded page question answered here).
+   * The key is collision-refusing: idempotent submit replay returns from
+   * the reply cache before append, while any different second row at the
+   * same `(space, seq)` is a broken allocator and must abort the commit. */
+  appendLogEntry(entry: ReplayLogEntry): void;
+  /** Up to `limit` committed entries of `space` with `seq >= from`, in seq
+   * order — exactly the native `replay(from, limit)` window (SL2). */
+  readLogPage(space: string, from: number, limit: number): ReplayLogEntry[];
 }
 
 /** Reference implementation for tests and the in-process host. The
@@ -107,6 +123,8 @@ export class InMemoryScopeStore implements ScopeStore {
   private tail: TailEntry[] = [];
   private readonly scheduled = new Map<string, ScheduledTurn>();
   private readonly relations = new Map<string, RelationRow>();
+  /** Committed sequenced-log rows: space → (seq → entry). */
+  private readonly logRows = new Map<string, Map<number, ReplayLogEntry>>();
 
   transaction<T>(fn: () => T): T {
     return fn();
@@ -205,5 +223,26 @@ export class InMemoryScopeStore implements ScopeStore {
 
   deleteRelation(key: string): void {
     this.relations.delete(key);
+  }
+
+  appendLogEntry(entry: ReplayLogEntry): void {
+    const rows = this.logRows.get(entry.space) ?? new Map<number, ReplayLogEntry>();
+    const existing = rows.get(entry.seq);
+    if (existing !== undefined) {
+      if (JSON.stringify(existing) === JSON.stringify(entry)) return;
+      throw new Error(`sequenced log collision for ${entry.space}:${entry.seq}`);
+    }
+    rows.set(entry.seq, structuredClone(entry));
+    this.logRows.set(entry.space, rows);
+  }
+
+  readLogPage(space: string, from: number, limit: number): ReplayLogEntry[] {
+    const rows = this.logRows.get(space);
+    if (!rows) return [];
+    return [...rows.values()]
+      .filter((entry) => entry.seq >= from)
+      .sort((a, b) => a.seq - b.seq)
+      .slice(0, limit)
+      .map((entry) => structuredClone(entry));
   }
 }

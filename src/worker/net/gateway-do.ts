@@ -84,6 +84,7 @@ import {
   type OrderedProjectionKey
 } from "../../net/ordered-edges";
 import { planTurn, type PlanTurnInput, type PlanTurnResult } from "../../net/plan";
+import { replayPageQueryKey, replayPageVersion, validReplayLogPage, validReplayPageQuery, type ReplayPageQuery } from "../../net/replay-pages";
 import type { ScopeClassifier } from "../../net/route";
 import { CATALOG_SCOPE, classifierFromLineage, isEpochImmutableDefinition, type AnchorLineage } from "../../net/topology";
 import { assertEnvelopeCeiling, submitEnvelopeBytes, type CommitReply, type CommitSubmit, type RejectReason, type ScheduledTurn, type ScopeHead } from "../../net/scope";
@@ -189,6 +190,25 @@ type PlanningOrderedChildrenProjection = Omit<OrderedChildrenProjection, "author
 type OrderedNeighborsProjection = { container: string; query: OrderedNeighborsQuery; scope: string; value: Record<string, unknown>; version: string; authority_head: ScopeHead };
 type PlanningOrderedNeighborsProjection = Omit<OrderedNeighborsProjection, "authority_head">;
 type OrderingConflict = { scope: string; container: string; parent: string | null };
+
+/** One owner-served committed replay page the gateway fetched for a turn
+ * (sequenced-log.md SL4): the entries for one exact `(space, from, limit)`
+ * window in the planning shape, plus the authority page `version` the plan
+ * attests so a committed-log append inside the window makes the submit
+ * stale. `space` is the SEMANTIC space id; `scope` is the owning authority
+ * the page came from (routed via classifier.scopeOf(space)). */
+type ReplayPageProjection = { space: string; from: number; limit: number; scope: string; entries: readonly Record<string, unknown>[]; version: string; authority_head: ScopeHead };
+type PlanningReplayPageProjection = Omit<ReplayPageProjection, "authority_head">;
+type ReplayConflict = { scope: string; space: string; from: number; limit: number };
+
+function validReplayConflict(value: unknown): value is ReplayConflict {
+  const conflict = value as { scope?: unknown; space?: unknown; from?: unknown; limit?: unknown } | null;
+  return Boolean(
+    conflict && typeof conflict === "object" &&
+    typeof conflict.scope === "string" && conflict.scope.length > 0 &&
+    validReplayPageQuery(conflict)
+  );
+}
 
 /** One successful targeted refresh, identified by the authority's sequenced
  * head as well as the cell's content version. Only receipts backed by an
@@ -1310,6 +1330,9 @@ export class NetGatewayDO {
     // (authority scope, container, parent), because two container roots in one
     // cross-scope turn both use null.
     const refreshedOrderingTo = new Map<string, string>();
+    // Same detector for replay-page reads, keyed by
+    // (authority scope, space, from, limit) — the exact attested query.
+    const refreshedReplayTo = new Map<string, string>();
     // Owner-computed ordered-children projections fetched this turn, keyed by
     // (container,parent); null names only that container's roots. Seeded with the call target's
     // ordering, then GROWN by the ordered-children repair path as the verb
@@ -1324,6 +1347,12 @@ export class NetGatewayDO {
     // and purged per-parent on an ordering conflict so the next attempt
     // re-fetches the CURRENT slot answer.
     const orderedNeighborsByKey = new Map<string, OrderedNeighborsProjection>();
+    // Owner-served committed replay pages fetched this turn (SL4), keyed
+    // by the exact (space, from, limit) query. Same lifecycle again: grown
+    // by the replay-page repair path, sticky across re-plans, and purged
+    // per-query on a replay conflict so the next attempt re-fetches the
+    // CURRENT page (a committed append moved the window's content).
+    const replayPagesByQuery = new Map<string, ReplayPageProjection>();
     // A cold contents relation can name offline actors whose owner cells are
     // intentionally absent from this gateway. The first presentation probe
     // classifies those cluster roots from the generic host-placement marker;
@@ -1355,6 +1384,9 @@ export class NetGatewayDO {
       const planningOrderedNeighbors = orderedNeighborsByKey.size > 0
         ? [...orderedNeighborsByKey.values()]
         : undefined;
+      const planningReplayPages = replayPagesByQuery.size > 0
+        ? [...replayPagesByQuery.values()].map((page) => ({ space: page.space, from: page.from, limit: page.limit, scope: page.scope, entries: page.entries, version: page.version }))
+        : undefined;
 
       // ---- Plan (or adopt the stale_head resubmit).
       let planned: PlanTurnResult;
@@ -1375,7 +1407,7 @@ export class NetGatewayDO {
         try {
           planningHead = await structure.rpc(() => this.scopeHead(this.destinationFor(request, request.planningScope)), { phase: "planning_head" });
           this.assertTurnEpoch(planningHead, request.catalog_epoch, request.planningScope, trace);
-          planned = await this.planOnce(request, view, classifier, planningHead.object_counter, planningRoomRoster, repairedObjects, planningOrderedChildren, planningOrderedNeighbors);
+          planned = await this.planOnce(request, view, classifier, planningHead.object_counter, planningRoomRoster, repairedObjects, planningOrderedChildren, planningOrderedNeighbors, planningReplayPages);
         } catch (err) {
           if (isNetError(err) && err.code === "E_MISSING_STATE") {
             // Ordered-children projection miss: fetch the named parent(s)'
@@ -1439,6 +1471,37 @@ export class NetGatewayDO {
                   "ordered-neighbours answer re-missed while resident (install cannot cure it)",
                   trace,
                   { missing_ordered_neighbors: missingNeighbors }
+                );
+              }
+              continue;
+            }
+            // Replay-page miss (SL4): fetch the named committed-log window
+            // from its owning authority and re-plan. Handled before the
+            // cell path for the same reason as the ordering branches — its
+            // detail carries `missing_replay_pages`, not `missing`, and
+            // there is no cell to grow from the view. Anti-loop mirrors
+            // the ordering branches: an already-resident re-miss is the
+            // terminal planner-bug shape; a failed fetch is transient and
+            // stays on the bounded attempt loop.
+            const missingReplayPages = Array.isArray(err.detail.missing_replay_pages)
+              ? (err.detail.missing_replay_pages as ReplayPageQuery[]).filter(validReplayPageQuery)
+              : [];
+            if (missingReplayPages.length > 0) {
+              trace.push({ attempt, code: "E_MISSING_STATE", missing: missingReplayPages.map((q) => `replay:${q.space}@${q.from}+${q.limit}`), elapsed_ms: elapsed() });
+              let allAlreadyResident = true;
+              for (const query of missingReplayPages) {
+                const key = replayPageQueryKey(query);
+                if (replayPagesByQuery.has(key)) continue;
+                allAlreadyResident = false;
+                const page = await this.tryRecovery(trace, () => this.fetchReplayPage(request, classifier, structure, query));
+                if (page === undefined) continue; // fetch failed; recovery_error recorded
+                replayPagesByQuery.set(key, page);
+              }
+              if (allAlreadyResident) {
+                throw nonconvergentRead(
+                  "replay page re-missed while resident (install cannot cure it)",
+                  trace,
+                  { missing_replay_pages: missingReplayPages }
                 );
               }
               continue;
@@ -1695,6 +1758,46 @@ export class NetGatewayDO {
               );
             }
             break; // re-plan next round with the refreshed ordering
+          }
+          // SL4: a replay-page conflict — a committed sequenced entry
+          // landed inside an attested window between plan and submit.
+          // Drop the named queries' cached pages so the next attempt
+          // re-fetches the CURRENT page (via the replay-page miss path)
+          // and re-plans against it. Non-convergence mirrors the ordering
+          // detector: the same authority head + page version rejected
+          // twice is a planner bug, named — never ground to E_BUDGET.
+          const replayConflicts = Array.isArray((reply.detail as { replay_conflicts?: unknown } | undefined)?.replay_conflicts)
+            ? ((reply.detail as { replay_conflicts: ReplayConflict[] }).replay_conflicts).filter(validReplayConflict)
+            : [];
+          if (replayConflicts.length > 0) {
+            const stuck: Array<ReplayConflict & { authority_version: string; authority_head: ScopeHead }> = [];
+            for (const conflict of replayConflicts) {
+              const conflictKey = `${conflict.scope}\0${replayPageQueryKey(conflict)}`;
+              const cached = [...replayPagesByQuery.values()].find((page) =>
+                page.scope === conflict.scope && page.space === conflict.space && page.from === conflict.from && page.limit === conflict.limit
+              );
+              if (cached !== undefined && authorityOrderingReceiptEligible(cached.authority_head)) {
+                const receipt = authorityReceiptIdentity({ scope: conflict.scope, head: cached.authority_head, version: cached.version });
+                if (refreshedReplayTo.get(conflictKey) === receipt) {
+                  stuck.push({ ...conflict, authority_version: cached.version, authority_head: cached.authority_head });
+                } else {
+                  refreshedReplayTo.set(conflictKey, receipt);
+                }
+              }
+              for (const [key, page] of replayPagesByQuery) {
+                if (page.scope === conflict.scope && page.space === conflict.space && page.from === conflict.from && page.limit === conflict.limit) {
+                  replayPagesByQuery.delete(key);
+                }
+              }
+            }
+            if (stuck.length > 0) {
+              throw nonconvergentRead(
+                "a replay-page read cannot converge: re-installed the same authority head and page content but the plan re-recorded a mismatching version",
+                trace,
+                { stuck, scope: targetScope }
+              );
+            }
+            break; // re-plan next round with the refreshed page
           }
           // Refresh exactly the named cells (or, for a post_state
           // disagreement naming nothing, reseed the scope's closure)
@@ -5442,6 +5545,47 @@ export class NetGatewayDO {
     };
   }
 
+  /** Fetch ONE committed replay page from the space's owning authority
+   * (sequenced-log.md SL4) — the log analogue of `fetchOrderedChildren`.
+   * The SEMANTIC space id routes through the classifier to the authority
+   * ADDRESS (`scopeOf(space)`); the page's entries keep their semantic
+   * identity so the planning-world `replay` read is lane-identical. The
+   * authority `version` (page content address) is what the plan attests;
+   * a committed append inside the window then rejects the submit stale. */
+  private async fetchReplayPage(
+    request: TurnRequest,
+    classifier: ScopeClassifier,
+    structure: TurnStructure,
+    query: ReplayPageQuery
+  ): Promise<ReplayPageProjection> {
+    const scope = classifier.scopeOf(query.space);
+    const response = await structure.rpc(() => this.host.rpc(
+      this.destinationFor(request, scope),
+      "/replay-page",
+      { space: query.space, from: query.from, limit: query.limit }
+    ), { phase: "replay_page" }) as { scope?: unknown; head?: unknown; space?: unknown; from?: unknown; limit?: unknown; entries?: unknown; version?: unknown };
+    // Full reply validation (Adv-a): a wrong-scope echo, a mutated query
+    // echo, or a versionless reply is a FAILED fetch (retried on the
+    // bounded attempt loop) — never a page the plan attests. Entry count
+    // must respect the requested window, or the attested version would
+    // describe a different query than the one the commit re-derives.
+    if (response.scope !== scope || !validScopeHead(response.head)
+      || response.space !== query.space || response.from !== query.from || response.limit !== query.limit
+      || !validReplayLogPage(response.entries, query)
+      || typeof response.version !== "string" || response.version.length === 0) {
+      throw new Error(`replay-page authority returned a malformed page for ${query.space}@${query.from}+${query.limit} at ${scope}`);
+    }
+    const authorityEntries = response.entries;
+    if (replayPageVersion(authorityEntries) !== response.version) {
+      throw new Error(`replay-page authority returned a content/version mismatch for ${query.space}@${query.from}+${query.limit} at ${scope}`);
+    }
+    // Strip the redundant per-entry space key for the planning shape; the
+    // attested `version` stays the authority's (computed over its own
+    // stored rows), which is also what it re-derives at submit.
+    const entries = authorityEntries.map(({ space: _space, ...entry }) => entry);
+    return { space: query.space, from: query.from, limit: query.limit, scope, entries, version: response.version, authority_head: response.head };
+  }
+
   /** Seed the call target's ordering into the per-turn projection map, once,
    * if the dispatched verb declares `reads_ordered_children`. This is the
    * bounded warm-path optimization: the common case (a verb whose parent IS
@@ -5923,6 +6067,18 @@ export class NetGatewayDO {
       orderingsByOwner.set(read.scope, orderings);
       if (!byOwner.has(read.scope)) byOwner.set(read.scope, new Set<string>());
     }
+    // Foreign REPLAY-PAGE reads owner-attest the same way (SL4): the
+    // /net/attest reply reports the owner's CURRENT page version per exact
+    // query, so a committed append inside the window between plan and
+    // attest makes the committing scope reject the stale read.
+    const replaysByOwner = new Map<string, Map<string, ReplayPageQuery>>();
+    for (const read of planned.transcript.replayReads ?? []) {
+      if (read.scope === targetScope) continue; // validated locally
+      const replays = replaysByOwner.get(read.scope) ?? new Map<string, ReplayPageQuery>();
+      replays.set(replayPageQueryKey(read), { space: read.space, from: read.from, limit: read.limit });
+      replaysByOwner.set(read.scope, replays);
+      if (!byOwner.has(read.scope)) byOwner.set(read.scope, new Set<string>());
+    }
     if (byOwner.size === 0) return undefined;
     // NC8b: independent mutable owners attest in parallel. Immutable catalog
     // definitions add no RPC; their active-epoch certificate is folded below.
@@ -5940,16 +6096,21 @@ export class NetGatewayDO {
     const owners = [...byOwner.entries()];
     const attest = async (owner: string, keys: Set<string>) => {
       const orderingParents = orderingsByOwner.get(owner);
+      const replayQueries = replaysByOwner.get(owner);
       const reply = await this.host.rpc(this.destinationFor(request, owner), "/attest", {
         keys: [...keys].sort(),
         ...(orderingParents && orderingParents.size > 0
           ? { ordering_parents: [...orderingParents.values()].sort((a, b) => orderedProjectionKey(a.container, a.parent).localeCompare(orderedProjectionKey(b.container, b.parent))) }
+          : {}),
+        ...(replayQueries && replayQueries.size > 0
+          ? { replay_pages: [...replayQueries.values()].sort((a, b) => replayPageQueryKey(a).localeCompare(replayPageQueryKey(b))) }
           : {})
       }) as {
         catalog_epoch?: string;
         owner_head: ScopeHead;
         cells: Array<{ key: string; version: string }>;
         orderings?: Array<{ container: string; parent: string | null; version: string }>;
+        replays?: Array<{ space: string; from: number; limit: number; version: string }>;
       };
       // Catalog compatibility cells are deliberately not cached, but their
       // authority must still agree with the turn epoch before its versions
@@ -5987,6 +6148,21 @@ export class NetGatewayDO {
           }
         }
       }
+      if (replayQueries && replayQueries.size > 0) {
+        const attestedPages = new Map<string, string>();
+        for (const page of reply.replays ?? []) {
+          if (!validReplayPageQuery(page)
+            || typeof page.version !== "string" || page.version.length === 0) {
+            throw new Error(`attestation from ${owner} returned a malformed replay-page version`);
+          }
+          attestedPages.set(replayPageQueryKey(page), page.version);
+        }
+        for (const query of replayQueries.values()) {
+          if (!attestedPages.has(replayPageQueryKey(query))) {
+            throw new Error(`attestation from ${owner} omitted replay page ${query.space}@${query.from}+${query.limit}`);
+          }
+        }
+      }
       return reply;
     };
     const actions: Array<() => Promise<unknown>> = owners.map(([owner, keys]) => () => attest(owner, keys));
@@ -5995,18 +6171,21 @@ export class NetGatewayDO {
       : await Promise.all(actions.map((action) => action()));
     const attestations: NonNullable<CommitSubmit["attestations"]> = {};
     owners.forEach(([owner], index) => {
-      const reply = replies[index] as { owner_head: ScopeHead; cells: Array<{ key: string; version: string }>; orderings?: Array<{ container: string; parent: string | null; version: string }> };
+      const reply = replies[index] as { owner_head: ScopeHead; cells: Array<{ key: string; version: string }>; orderings?: Array<{ container: string; parent: string | null; version: string }>; replays?: Array<{ space: string; from: number; limit: number; version: string }> };
       attestations[owner] = {
         owner_head: reply.owner_head,
         cells: reply.cells,
-        ...(reply.orderings && reply.orderings.length > 0 ? { orderings: reply.orderings } : {})
+        ...(reply.orderings && reply.orderings.length > 0 ? { orderings: reply.orderings } : {}),
+        ...(reply.replays && reply.replays.length > 0 ? { replays: reply.replays } : {})
       };
     });
     if (immutableCatalogKeys.size > 0) {
       const certified = this.epochCatalogAttestation(request, view, immutableCatalogKeys);
       const live = attestations[CATALOG_SCOPE];
       attestations[CATALOG_SCOPE] = live
-        ? { owner_head: live.owner_head, cells: [...live.cells, ...certified.cells] }
+        // Merge certified definition cells INTO the live attestation —
+        // preserving any ordering/replay attestations it carries.
+        ? { ...live, cells: [...live.cells, ...certified.cells] }
         : certified;
     }
     return attestations;
@@ -6122,7 +6301,8 @@ export class NetGatewayDO {
     planningRoomRoster?: { room: string; rows: readonly RoomRosterRow[] },
     seedObjects?: ReadonlySet<string>,
     planningOrderedChildren?: readonly PlanningOrderedChildrenProjection[],
-    planningOrderedNeighbors?: readonly PlanningOrderedNeighborsProjection[]
+    planningOrderedNeighbors?: readonly PlanningOrderedNeighborsProjection[],
+    planningReplayPages?: readonly PlanningReplayPageProjection[]
   ): Promise<PlanTurnResult> {
     return planTurn({
       call: request.call,
@@ -6146,6 +6326,7 @@ export class NetGatewayDO {
       ...(planningRoomRoster ? { planningRoomRoster } : {}),
       ...(planningOrderedChildren && planningOrderedChildren.length > 0 ? { planningOrderedChildren } : {}),
       ...(planningOrderedNeighbors && planningOrderedNeighbors.length > 0 ? { planningOrderedNeighbors } : {}),
+      ...(planningReplayPages && planningReplayPages.length > 0 ? { planningReplayPages } : {}),
       // Creates over net (client-shell phase i): the planning-scope
       // authority's allocation floor, prefetched with its head, so a
       // planned create's id is fresh at the authority. A lane fixture's

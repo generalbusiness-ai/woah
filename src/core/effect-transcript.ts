@@ -74,6 +74,15 @@ export type EffectTranscript = {
   id?: string;
   route: TurnStart["route"];
   scope: ObjRef;
+  /** The SEMANTIC sequencing space of a sequenced turn, preserved when net
+   * planning retargets `scope` at the commit-scope AUTHORITY ADDRESS
+   * (`the_room` vs `room:the_room` — plan.ts submitTranscript). Committed
+   * log entries key on THIS identity (sequenced-log.md SL4), so
+   * `space == this` guards, journal output, and `rebuild_from(room, ...)`
+   * read the same ids on every lane. Absent on engine-recorded transcripts
+   * (there `scope` IS the semantic space) and on direct routes;
+   * present-only-when-set keeps prior transcript hashes unchanged. */
+  space?: ObjRef;
   seq: number;
   session?: string | null;
   call: Pick<TurnStart, "actor" | "target" | "verb" | "args" | "body">;
@@ -534,10 +543,44 @@ export function applyPresenceProjectionRowDelta(
   return Array.from(new Set([...without, delta.actor] as ObjRef[])).sort() as unknown as WooValue;
 }
 
+/**
+ * The sequenced-call seq-allocation cell of a transcript: the sequencing
+ * space's reserved `next_seq` property (sequenced-log.md SL1 — `append` is
+ * the only blessed increment, and user code may never write the name), or
+ * null for non-sequenced routes. The engine folds the allocation into the
+ * transcript as an ordinary read+write (world.recordSequencedAllocation);
+ * commit-scope selection treats it as sequencer BOOKKEEPING rather than a
+ * verb effect — a CA3 pure-movement turn must not be dragged onto the room
+ * sequencer by its own allocation — and a turn that commits away from the
+ * space's own scope strips it (consuming no seq; see plan.ts).
+ */
+export function sequencedAllocationCell(transcript: Pick<EffectTranscript, "route" | "scope" | "space">): { kind: "prop"; object: ObjRef; name: "next_seq" } | null {
+  if (transcript.route !== "sequenced") return null;
+  const space = transcript.space ?? transcript.scope;
+  if (typeof space !== "string" || space.length === 0) return null;
+  return { kind: "prop", object: space, name: "next_seq" };
+}
+
+/** True when `cell` is `transcript`'s own seq-allocation cell. */
+export function isSequencedAllocationCell(
+  transcript: Pick<EffectTranscript, "route" | "scope" | "space">,
+  cell: { kind: string; object: ObjRef; name?: string }
+): boolean {
+  const allocation = sequencedAllocationCell(transcript);
+  return allocation !== null && cell.kind === "prop" && cell.object === allocation.object && cell.name === "next_seq";
+}
+
 function readMatchesSequencedAllocation(transcript: EffectTranscript, read: TranscriptRead, actual: TranscriptCellRead): boolean {
   if (!actual.ok) return false;
   if (transcript.route !== "sequenced") return false;
-  if (read.cell.kind !== "prop" || read.cell.object !== transcript.scope || read.cell.name !== "next_seq") return false;
+  const allocation = sequencedAllocationCell(transcript);
+  if (allocation === null || !sameCell(read.cell, allocation)) return false;
+  // New net transcripts carry the allocation as an explicit pre-state
+  // read+write pair. That read validates normally; a later verb-body read
+  // validates against the same-turn write. This compatibility exception is
+  // only for older/local transcripts whose preamble increment happened
+  // before recording opened.
+  if (transcript.writes.some((write) => isSequencedAllocationCell(transcript, write.cell))) return false;
   if (typeof actual.value !== "number" || typeof read.value !== "number") return false;
   if (actual.value !== transcript.seq || read.value !== transcript.seq + 1) return false;
   const actualVersion = numericVersion(actual.version);

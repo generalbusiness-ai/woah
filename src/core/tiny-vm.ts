@@ -776,8 +776,11 @@ async function runVmFrames(frames: VmFrame[]): Promise<VmRunResult> {
       // if woocode could catch it, a `try { ...detach... } except {}` would
       // "succeed" with children still edged to a recycled/moved node.
       // E_NEED_ORDERED_NEIGHBORS is the bounded-slot variant of the same
-      // miss (P2.4) and would be swallowed identically.
-      if (error.code === "E_NEED_STATE" || error.code === "E_NEED_ORDERED_CHILDREN" || error.code === "E_NEED_ORDERED_NEIGHBORS") throw error;
+      // miss (P2.4) and would be swallowed identically. E_NEED_REPLAY_PAGE
+      // is the committed-log-page variant: a catchable miss would let a
+      // `try { space:replay(...) } except` treat "page not fetched yet" as
+      // "log is empty" and silently truncate a journal/rebuild.
+      if (error.code === "E_NEED_STATE" || error.code === "E_NEED_ORDERED_CHILDREN" || error.code === "E_NEED_ORDERED_NEIGHBORS" || error.code === "E_NEED_REPLAY_PAGE") throw error;
       if (!raise(error)) throw error;
     }
   }

@@ -378,6 +378,17 @@ const CONTRACTS: Record<string, NativePrimitiveContract> = {
     writes: [],
     emits: [],
     note: "Focus-list reads are deterministic actor-local property reads."
+  },
+  replay: {
+    kind: "woo.native_primitive_contract.shadow.v1",
+    handler: "replay",
+    version: 1,
+    transcript: "tracked",
+    deterministic: true,
+    reads: ["owner-attested committed replay page (transcript.replayReads)"],
+    writes: [],
+    emits: [],
+    note: "The sequenced-log read wrapper (sequenced-log.md SL2/SL4) is transcript-safe on the sparse planning path because it resolves ONLY to an owner-served committed page installed for the exact (space, from, limit) query — attested in replayReads and re-derived by the owning scope at commit — and misses uncatchably (E_NEED_REPLAY_PAGE) otherwise. A complete local runtime reads its own durable log, which is equally deterministic pre-commit."
   }
 };
 

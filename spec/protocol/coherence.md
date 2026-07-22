@@ -97,6 +97,18 @@ authority that makes this turn's writes atomic:
   `E_SCOPE_SPLIT` (CO6) — a named limitation, not a silent commit to the
   planning scope. Lifting it is the CA10 growth path (CO11).
 
+**Sequenced-log ownership.** A Net-planned sequenced transcript preserves
+the semantic sequencing space separately from the selected authority
+address. Its reserved `next_seq` allocation is an ordinary versioned
+read/write pair only when the selected commit scope owns that space; the
+authority appends the final log row in the same transaction. If write-set
+routing selects another scope (the pure-movement case), the planner strips
+the allocation and the turn consumes no room seq and appends no room log
+row. This is the necessary consequence of off-room CA3 atomicity: the system
+does not pretend an asynchronous second commit is one atomic `$space:call`.
+Acts avoid the exception because their projection fold is a room-owned write
+and therefore selects the room authority.
+
 **Rider integrity (amendment, 2026-07-06).** Ride-along writes touch cells
 whose authority is another scope; three rules keep CO2.4 intact across
 that seam:
@@ -179,6 +191,15 @@ catalog that makes correctness depend only on a `contents` snapshot is
 non-conforming: it must also read the authority cells on which the decision
 depends. The projection may consequently make a read-only listing briefly
 stale, but cannot authorize a stale mutation.
+
+Sequenced-log replay is another projection read, but not an unvalidated one.
+The sparse planner acquires the exact `(semantic space, from, limit)` page
+from its owner and records its content version in `transcript.replayReads`.
+The committing scope re-derives local pages and checks foreign pages against
+the owner's `/net/attest` response. A changed page rejects
+`read_version_mismatch` with `replay_conflicts`; an unattested foreign page
+rejects terminal `rider_unattested`. The gateway drops and refetches only the
+named page before replanning.
 
 ### CO2.5 Idempotency
 
@@ -316,7 +337,8 @@ unchanged:
    an epoch-immutable installed definition is refused independently by the
    catalog authority.
 6. Logical inputs valid and not duplicated.
-7. Read versions match current state (CO2.4).
+7. Cell, ordering, and replay-page read versions match current authority
+   state (CO2.4).
 8. Permission reads and policy checks present in the read set.
 9. Writes authorized per recorded VM frame (and any lease/fence token).
 10. **Applying the transcript's writes to a clone of validated pre-state
@@ -363,7 +385,7 @@ gate (CO12) enforces it. Every copy is epoch-stamped (CO8).
 
 | # | Copy | Provenance | Freshness bound | Reseed path |
 |---|---|---|---|---|
-| 1 | Scope authority (ScopeDO SQLite; includes the parked-task/scheduled queue and a bounded recovery tail *that only the scope itself reads*) | `authoritative` | is the truth | — |
+| 1 | Scope authority (ScopeDO SQLite; includes the committed sequenced log, parked-task/scheduled queue, and a bounded recovery tail *that only the scope itself reads*) | `authoritative` | is the truth | — |
 | 2 | Gateway cache (GatewayDO SQLite; includes the MCP tool-surface projection, [projection-cache.md PC1](../semantics/projection-cache.md); in-memory views are reads of this copy, not additional copies) | `derived` | stamped `(scope_head, catalog_epoch)` | `E_STALE_EPOCH` → refetch closure from scope |
 | 3 | KV seed | `seed` | stamped epoch; may lag | overwritten on checkpoint; consumers head-check with the scope before trusting |
 | 4 | Browser cache (IDB/localStorage) | `derived` + `echo` overlay | stamped as #2 | epoch mismatch → drop and rehydrate |
@@ -383,7 +405,7 @@ divergence. Tail metrics count by code.
 |---|---|---|
 | `E_STALE_HEAD` | submitted `base` is future, hash-mismatched, or too old/unproved for retained-tail rebase (incl. cold/evicted-scope reseed) | refetch head/closure, retry |
 | `E_STALE_EPOCH` | consumer copy stamped with an old `(scope_head, catalog_epoch)` | reseed that copy, retry |
-| `E_MISSING_STATE` | materialization miss under sparse execution (CO2.6) | acquire the missing cells via lineage-closed transfer, retry |
+| `E_MISSING_STATE` | materialization miss under sparse execution (CO2.6), including an owner-computed ordering or committed replay page | acquire the named cells/projection/page from its authority, retry |
 | `E_READ_VERSION` | read set conflicts with current authority | re-plan against refreshed cells |
 | `E_SCOPE_SPLIT` | write set spans two distinct shared scopes (CO2.3) | terminal; named limitation until CA10 |
 | `E_CATALOG_MUTATION` | ordinary turn attempted to mutate an installed catalog class definition without advancing the epoch | terminal; publish through the catalog install pipeline |
@@ -809,6 +831,10 @@ One write path per fact (CO9), concretized:
     from the view, else the actor itself; the anchor classifies through
     view lineage (CO15 walk; convention pull `room:<anchor>` on miss),
     falling back to the actor's cluster when it cannot classify.
+  - A route:`sequenced` Net turn consumes a semantic-space log seq only when
+    CO2.3 selects that space's authority. Pure movement remains off the room
+    sequencer and is not represented as a room-log entry; any turn emitting
+    a room-owned act necessarily rides at the room and logs atomically.
   - Accepted turn replies carry the planned transcript's `result`,
     `error`, and `observations` (the gateway holds the planned
     transcript; `error` matters because an errored verb still commits

@@ -40,10 +40,11 @@ import { CellStore, cellKey, cellVersion, type Cell, type EpochStamp } from "./c
 import type { TraceContext } from "./trace";
 import { isNetError, netError, type NetError } from "./errors";
 import type { OrderedNeighborsQuery, OrderedNeighborsRequest, OrderedProjectionKey } from "./ordered-edges";
+import { validReplayPageQuery, type ReplayPageQuery } from "./replay-pages";
 import { selectCommitScope, type ScopeClassifier, type ScopeSelection } from "./route";
 import type { CommitSubmit, ScopeHead } from "./scope";
 import { sessionWriter } from "./sessions";
-import { applyTranscript, netCellKeyFor, type EffectTranscript, type TranscriptRead, type TranscriptWrite } from "./transcript";
+import { applyTranscript, isSequencedAllocationCell, netCellKeyFor, type EffectTranscript, type TranscriptRead, type TranscriptWrite } from "./transcript";
 
 export type PlanTurnInput = {
   call: ShadowTurnCall;
@@ -120,6 +121,15 @@ export type PlanTurnInput = {
    * same-parent mutations identically — the answer is just O(1) instead of
    * O(width). */
   planningOrderedNeighbors?: readonly { container: string; query: OrderedNeighborsQuery; scope: string; value: Record<string, unknown>; version: string }[];
+  /** Owner-served committed replay pages (sequenced-log.md SL4), one per
+   * exact `(space, from, limit)` query, installed only in the ephemeral
+   * execution world for `space:replay(from, limit)` reads. `space` is the
+   * SEMANTIC space id; `scope` is the owning authority the page was
+   * fetched from; `version` is the page's authority content address (the
+   * attestation below carries it, so a committed-log append between plan
+   * and submit invalidates the read). `entries` are already in the
+   * planning shape (no per-entry space key). */
+  planningReplayPages?: readonly { space: string; from: number; limit: number; scope: string; entries: readonly Record<string, unknown>[]; version: string }[];
 };
 
 export type PlanTurnResult = {
@@ -223,6 +233,7 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
       attemptRun = await runShadowTurnCallTranscript(world, call, {
         require_room_roster_projection: true,
         require_ordered_children_projection: true,
+        require_replay_page_projection: true,
         record_authoring_cell_writes: true,
         ...(input.planningRoomRoster ? { room_rosters: [input.planningRoomRoster] } : {}),
         ...(input.planningOrderedChildren && input.planningOrderedChildren.length > 0
@@ -230,6 +241,9 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
           : {}),
         ...(input.planningOrderedNeighbors && input.planningOrderedNeighbors.length > 0
           ? { ordered_neighbors: input.planningOrderedNeighbors.map((n) => ({ container: n.container, query: n.query, value: n.value })) }
+          : {}),
+        ...(input.planningReplayPages && input.planningReplayPages.length > 0
+          ? { replay_pages: input.planningReplayPages.map((p) => ({ space: p.space, from: p.from, limit: p.limit, entries: p.entries })) }
           : {})
       });
     } catch (err) {
@@ -242,6 +256,8 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
       if (thrownOrdered) throw orderedChildrenMissState(thrownOrdered);
       const thrownNeighbors = orderedNeighborsMiss(err as { code?: unknown; value?: unknown } | null);
       if (thrownNeighbors) throw orderedNeighborsMissState(thrownNeighbors);
+      const thrownReplay = replayPageMiss(err as { code?: unknown; value?: unknown } | null);
+      if (thrownReplay) throw replayPageMissState(thrownReplay);
       // A sparse miss vs the attempt's slice. Grow from the LIVE view and
       // re-run; if nothing is growable the cell is genuinely absent —
       // surface the miss against the VIEW so the gateway pulls exactly
@@ -270,6 +286,8 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
     if (recordedOrdered) throw orderedChildrenMissState(recordedOrdered);
     const recordedNeighbors = orderedNeighborsMiss(attemptRun.transcript.error as { code?: unknown; value?: unknown } | undefined);
     if (recordedNeighbors) throw orderedNeighborsMissState(recordedNeighbors);
+    const recordedReplay = replayPageMiss(attemptRun.transcript.error as { code?: unknown; value?: unknown } | undefined);
+    if (recordedReplay) throw replayPageMissState(recordedReplay);
     // CO2.6 second half: the engine RECORDS a dispatch miss in the
     // transcript rather than throwing. Same grow-or-escape vs the slice.
     const recordedVsAttempt = sparseMissFromRecordedError(attemptRun.transcript, attemptStore);
@@ -298,7 +316,16 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
   // selection, so the folded write participates in the write-set routing.
   const withSession = foldSessionEffects(run.transcript, planStore, call);
   const selection = selectCommitScope(withSession, planningScope, classifier);
-  const transcript = submitTranscript(withSession, planStore, selection.scope, {
+  // Sequenced seq-allocation ownership (SL1): the space's `next_seq`
+  // advance can only apply — and serialize — at the scope that OWNS the
+  // space, where the accepted turn also appends its committed log entry.
+  // When the write set routes the commit elsewhere (CA3 pure movement at
+  // the actor's cluster), the turn consumes NO seq: strip the allocation
+  // read+write instead of shipping a foreign-cell rider, which would
+  // CAS-collide with real allocations (a duplicate space seq) and chain
+  // movement latency to the room's attestation freshness.
+  const forSubmit = stripUnownedSequencedAllocation(withSession, selection.scope, classifier);
+  const transcript = submitTranscript(forSubmit, planStore, selection.scope, {
     ...(input.principal ? { principal: input.principal } : {}),
     ...(input.trace ? { trace: input.trace } : {})
   });
@@ -321,6 +348,18 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
   for (const n of input.planningOrderedNeighbors ?? []) orderingReads.set(`${n.scope}\0${n.container}\0${n.query.parent ?? "\0root"}\0${n.version}`, { container: n.container, parent: n.query.parent, scope: n.scope, version: n.version });
   if (orderingReads.size > 0) {
     transcript.orderingReads = [...orderingReads.values()];
+  }
+  // Replay pages attest identically (SL4): every page this plan was given
+  // rides in `replayReads` with the authority content version it was
+  // fetched at — a supplied-but-unread page is a stable window whose
+  // attestation is harmless, and dual versions for one query (a mid-turn
+  // fetch race) attest both so the authority rejects the stale one.
+  const replayReads = new Map<string, { space: string; from: number; limit: number; scope: string; version: string }>();
+  for (const p of input.planningReplayPages ?? []) {
+    replayReads.set(`${p.scope}\0${p.space}\0${p.from}\0${p.limit}\0${p.version}`, { space: p.space, from: p.from, limit: p.limit, scope: p.scope, version: p.version });
+  }
+  if (replayReads.size > 0) {
+    transcript.replayReads = [...replayReads.values()];
   }
 
   // Planner-parity post-state: same apply, same prior cells (the settled
@@ -412,6 +451,37 @@ function foldSessionEffects(recorded: EffectTranscript, snapshot: CellStore, cal
 }
 
 /**
+ * Sequenced seq-allocation ownership (see the call site): keep the
+ * engine-folded `next_seq` read+write only when the SELECTED commit scope
+ * owns the sequencing space; otherwise remove both. Selection already
+ * ignores the allocation (route.ts), so this never changes the chosen
+ * scope — it only keeps the submitted write set honest about where a seq
+ * was actually consumed. The classifier throw-fallback assumes the
+ * production shape (a sequenced turn plans at its space's own scope).
+ */
+function stripUnownedSequencedAllocation(
+  recorded: EffectTranscript,
+  selectedScope: string,
+  classifier: ScopeClassifier
+): EffectTranscript {
+  const allocation = recorded.writes.some((write) => isSequencedAllocationCell(recorded, write.cell));
+  if (!allocation) return recorded;
+  const space = recorded.space ?? recorded.scope;
+  let spaceScope: string;
+  try {
+    spaceScope = classifier.scopeOf(space);
+  } catch {
+    spaceScope = selectedScope;
+  }
+  if (spaceScope === selectedScope) return recorded;
+  return {
+    ...recorded,
+    reads: recorded.reads.filter((read) => !isSequencedAllocationCell(recorded, read.cell)),
+    writes: recorded.writes.filter((write) => !isSequencedAllocationCell(recorded, write.cell))
+  };
+}
+
+/**
  * The transcript the gateway submits: recorded reads re-versioned through
  * the view (the version rule), retargeted at the selected commit scope,
  * and re-content-addressed. `view` is the plan-time SNAPSHOT (fix 6),
@@ -443,6 +513,14 @@ function submitTranscript(
     ...recorded,
     reads,
     scope: scope as EffectTranscript["scope"],
+    // Semantic/authority identity split (sequenced-log.md SL4): the scope
+    // rewrite above retargets the transcript at the commit AUTHORITY
+    // ADDRESS, so a sequenced turn preserves its SEMANTIC sequencing space
+    // here — the identity the authority's committed log entry keys on.
+    // The engine recorded it as the pre-rewrite scope (the space the call
+    // dispatched on). Present-only-for-sequenced keeps direct-route
+    // transcript hashes unchanged.
+    ...(recorded.route === "sequenced" ? { space: recorded.scope } : {}),
     // AU3.2/AU2: attribution and trace ride the hashed body (present-
     // only-when-set keeps principal-less transcript hashes unchanged).
     ...(audit?.principal ? { principal: audit.principal } : {}),
@@ -674,6 +752,31 @@ function orderedNeighborsMissState(request: OrderedNeighborsRequest): NetError {
     "E_MISSING_STATE",
     `sparse planning ordered-neighbours answer not yet fetched for ${request.container}:${request.query.parent ?? "<root>"}`,
     { missing_ordered_neighbors: [request] }
+  );
+}
+
+/**
+ * The exact page query named by a replay-page miss (SL4), or null if
+ * `errorish` is not one. The world's require-getter throws
+ * `E_NEED_REPLAY_PAGE` with `value = {space, from, limit}` when a verb
+ * reads a committed-log window the sparse planning world does not hold;
+ * both the thrown and the recorded (transcript.error) forms carry the same
+ * shape. Bounds are re-validated here so a malformed value is terminal,
+ * never a fetch the authority would refuse.
+ */
+function replayPageMiss(errorish: { code?: unknown; value?: unknown } | null | undefined): ReplayPageQuery | null {
+  if (!errorish || errorish.code !== "E_NEED_REPLAY_PAGE") return null;
+  return validReplayPageQuery(errorish.value) ? { space: errorish.value.space, from: errorish.value.from, limit: errorish.value.limit } : null;
+}
+
+/** Package a replay-page miss as the repairable escape the gateway's turn
+ * loop recovers with one authority page fetch: a distinct
+ * `missing_replay_pages` detail keeps it off the cell-pull path. */
+function replayPageMissState(query: ReplayPageQuery): NetError {
+  return netError(
+    "E_MISSING_STATE",
+    `sparse planning replay page not yet fetched for ${query.space} from ${query.from} limit ${query.limit}`,
+    { missing_replay_pages: [query] }
   );
 }
 

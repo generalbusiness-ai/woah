@@ -941,6 +941,206 @@ describe("outliner add over the net path converges", () => {
     expect(err).not.toContain("E_BUDGET");
   });
 
+  // ── SL4: the owner-attested replay-page input ─────────────────────────
+  // Sparse planning worlds intentionally omit the sequenced-log tail
+  // (bridge.ts: log:* is never a planning input), so before the replay-page
+  // input every `space:replay(from, limit)` through the net path silently
+  // returned [] — journal read as empty, rebuild_from never converged.
+  // These tests drive real structural acts SEQUENCED through the gateway
+  // (the scope authority appends its durable committed log), then read the
+  // log back through the same gateway: the miss must escape as a
+  // repairable replay-page fetch, entries must surface with their SEMANTIC
+  // space identity and the authority acceptance ts, and the attested page
+  // version must hold the read-integrity discipline.
+
+  /** The casework journal verb verbatim (catalogs/casework §S3): the log IS
+   * the journal. Installed on the outline instance pre-mount so the net
+   * turn exercises the real catalog read shape. */
+  const JOURNAL_SOURCE = "verb :journal(from_seq, limit) rxd {\n  let entries = this:replay(from_seq, limit);\n  let out = [];\n  for e in entries {\n    for o in e[\"observations\"] {\n      if (typeof(o) == \"map\" && (\"type\" in o) && (\"payload\" in o) && (\"version\" in o)) {\n        out = out + [{ \"seq\": e[\"seq\"], \"ts\": e[\"ts\"], \"type\": o[\"type\"], \"payload\": o[\"payload\"] }];\n      }\n    }\n  }\n  return out;\n}";
+
+  it("SL4: journal over the net path returns committed acts with semantic ids and authority ts", async () => {
+    const { world, theOutline, session, actor, epoch } = await outlinerWorld();
+    const roomScope = `room:${theOutline}`;
+    const ctx = { theOutline, roomScope, epoch, session, actor };
+    const installed = installVerb(world, theOutline, "journal", JOURNAL_SOURCE, null);
+    expect(installed.ok, JSON.stringify(installed)).toBe(true);
+
+    const { gateway, gatewayEnv } = await mountNet(world, epoch);
+    // Drive the structural acts SEQUENCED through the gateway — the scope
+    // authority is the only place these committed entries exist.
+    const ids: string[] = [];
+    for (let i = 1; i <= 3; i += 1) {
+      const turn = await verbTurn(gateway, gatewayEnv, ctx, `sl4-add-${i}`, "add_item", [`entry ${i}`, null, null]);
+      expect(turn.reply.status, `add #${i} trace=${JSON.stringify(turn.trace)}`).toBe("accepted");
+      ids.push(turn.result as string);
+    }
+
+    const journal = await verbTurn(gateway, gatewayEnv, ctx, "sl4-journal", "journal", [1, 100]);
+    expect(journal.reply.status, `journal reply=${JSON.stringify(journal.reply)} trace=${JSON.stringify(journal.trace)}`).toBe("accepted");
+    // The replay read MISSED on the sparse plan and repaired via one
+    // authority page fetch — never a silent [].
+    expect(journal.attempt, `journal attempts=${journal.attempt}`).toBeGreaterThan(1);
+    expect(journal.attempt, `journal attempts=${journal.attempt}`).toBeLessThanOrEqual(3);
+
+    const rows = journal.result as Array<{ seq: number; ts: number; type: string; payload: Record<string, unknown> }>;
+    const added = rows.filter((row) => row.type === "outline_item_added");
+    expect(added.length, `journal rows: ${JSON.stringify(rows)}`).toBe(3);
+    // Envelope seq/ts: the three adds are this fresh scope's first
+    // sequenced commits, and ts is the authority acceptance time (CO2.5).
+    expect(added.map((row) => row.seq)).toEqual([1, 2, 3]);
+    for (const row of added) expect(row.ts, `entry ts must be the authority acceptance time: ${JSON.stringify(row)}`).toBeGreaterThan(0);
+    // SEMANTIC identity: payloads name the space and items by their
+    // semantic ids, never the room:<id> authority address.
+    for (const row of added) expect(row.payload.outliner, JSON.stringify(row)).toBe(theOutline);
+    expect(added.map((row) => row.payload.item)).toEqual(ids);
+  });
+
+  it("SL4/Adv-a: replay-page bounds and authority content/version mismatches fail closed", async () => {
+    const { world, theOutline, session, actor, epoch } = await outlinerWorld();
+    const roomScope = `room:${theOutline}`;
+    const ctx = { theOutline, roomScope, epoch, session, actor };
+    const installed = installVerb(world, theOutline, "journal", JOURNAL_SOURCE, null);
+    expect(installed.ok, JSON.stringify(installed)).toBe(true);
+
+    let corrupted = 0;
+    const { gateway, gatewayEnv, scopeDOs } = await mountNet(world, epoch, {
+      intercept: async (_scope, path, _request, real) => {
+        if (path !== "/net/replay-page") return null;
+        const response = await real();
+        const body = (await response.json()) as { entries: Array<Record<string, unknown>> } & Record<string, unknown>;
+        if (body.entries.length > 0) {
+          body.entries[0] = { ...body.entries[0], ts: Number(body.entries[0].ts) + 1 };
+          corrupted += 1; // keep the old version: gateway must recompute and refuse
+        }
+        return jsonResponse(body);
+      }
+    });
+    const roomDO = scopeDOs.get(roomScope)!;
+    const env = { WOO_INTERNAL_SECRET: SECRET };
+    await expect(call(roomDO, env, "/replay-page", { space: theOutline, from: 1.5, limit: 10 }))
+      .rejects.toThrow(/E_INVARG/);
+    await expect(call(roomDO, env, "/replay-page", { space: theOutline, from: 1, limit: 1001 }))
+      .rejects.toThrow(/E_INVARG/);
+    await expect(call(roomDO, env, "/replay-page", { space: "the_chatroom", from: 1, limit: 10 }))
+      .rejects.toThrow(/foreign space/);
+    await expect(call(roomDO, env, "/attest", {
+      keys: [],
+      replay_pages: [{ space: "the_chatroom", from: 1, limit: 10 }]
+    })).rejects.toThrow(/foreign space/);
+
+    const add = await verbTurn(gateway, gatewayEnv, ctx, "sl4-adva-add", "add_item", ["entry", null, null]);
+    expect(add.reply.status, JSON.stringify(add.trace)).toBe("accepted");
+    const err = await verbTurn(gateway, gatewayEnv, ctx, "sl4-adva-journal", "journal", [1, 100]).then(
+      (ok) => { throw new Error(`expected rejection, got ${JSON.stringify(ok.reply)}`); },
+      (e: unknown) => String(e)
+    );
+    expect(corrupted, "the corrupting replay-page interceptor fired").toBeGreaterThan(0);
+    expect(err).toContain("E_BUDGET");
+  });
+
+  it("SL4: a fresh $outline_meta rebuild_from over the net path converges to the live watermark", async () => {
+    const { world, theOutline, session, actor, epoch } = await outlinerWorld();
+    const roomScope = `room:${theOutline}`;
+    const ctx = { theOutline, roomScope, epoch, session, actor };
+    // A FRESH watermark projection, room-anchored so it commits at the
+    // outline's scope. Its at_seq starts at the class default 0; only
+    // rebuild_from (reading the authoritative committed log through the
+    // net path) can walk it to the live watermark.
+    const metaId = "meta_rebuild";
+    world.createObject({ id: metaId, name: "rebuild meta", parent: "$outline_meta", owner: actor, location: theOutline, anchor: theOutline });
+
+    const { gateway, gatewayEnv, scopeDOs } = await mountNet(world, epoch);
+    for (let i = 1; i <= 4; i += 1) {
+      const turn = await verbTurn(gateway, gatewayEnv, ctx, `sl4-rb-add-${i}`, "add_item", [`row ${i}`, null, null]);
+      expect(turn.reply.status, `add #${i} trace=${JSON.stringify(turn.trace)}`).toBe("accepted");
+    }
+    // The LIVE watermark: the bundled outline_meta folds each structural
+    // act as it commits; tree_view surfaces its at_seq.
+    const view = await verbTurn(gateway, gatewayEnv, ctx, "sl4-rb-view", "tree_view", []);
+    expect(view.reply.status, JSON.stringify(view.trace)).toBe("accepted");
+    const liveWatermark = (view.result as { structure_at_seq: number }).structure_at_seq;
+    expect(liveWatermark, "acts folded live").toBeGreaterThan(0);
+
+    // Rebuild the fresh projection from the recorded acts, page by page,
+    // through the gateway (owner/wizard gate: the actor owns metaId).
+    let result: { at_seq: number; scanned_seq: number; done: boolean } | undefined;
+    let firstAttempts = 0;
+    for (let round = 1; round <= 5 && (result === undefined || !result.done); round += 1) {
+      const rebuild = await call<TurnBody>(gateway, gatewayEnv, "/turn", {
+        call: {
+          kind: "woo.turn_call.shadow.v1", id: `sl4-rebuild-${round}`, route: "sequenced", scope: theOutline,
+          session: session.id, actor, target: metaId, verb: "rebuild_from", args: [theOutline, 100]
+        },
+        planningScope: roomScope, catalog_epoch: epoch, idempotency_key: `sl4-rebuild-${round}`
+      });
+      expect(rebuild.reply.status, `rebuild round ${round} trace=${JSON.stringify(rebuild.trace)}`).toBe("accepted");
+      if (round === 1) firstAttempts = rebuild.attempt;
+      result = rebuild.result as { at_seq: number; scanned_seq: number; done: boolean };
+    }
+    // The first round's replay read repaired through the authority page
+    // fetch (the log is never resident in the sparse plan).
+    expect(firstAttempts, "rebuild must repair via the replay-page fetch").toBeGreaterThan(1);
+    expect(result?.done, JSON.stringify(result)).toBe(true);
+    // CONVERGED: the fresh projection's watermark equals the live one.
+    expect(result?.at_seq, `rebuild ${JSON.stringify(result)} vs live ${liveWatermark}`).toBe(liveWatermark);
+
+    // Authority proof: the committed at_seq cell at the room scope agrees.
+    const roomDO = scopeDOs.get(roomScope)!;
+    const attested = await call<{ cells: Array<{ key: string; version: string }> }>(
+      roomDO, { WOO_INTERNAL_SECRET: SECRET }, "/attest", { keys: [`property_cell:${metaId}:at_seq`] }
+    );
+    expect(attested.cells[0]?.version, "rebuild committed a real at_seq cell").not.toBe("absent");
+  });
+
+  it("SL4/R3: a cross-scope replay read is owner-attested and validated at the committing scope", async () => {
+    const { world, theOutline, session, actor, epoch } = await outlinerWorld();
+    const outlineScope = `room:${theOutline}`;
+    const chatScope = "room:the_chatroom";
+    // The probe writes at the chatroom (its commit scope) while reading the
+    // OUTLINE's committed log — a foreign replay read that must carry the
+    // owner's page attestation or reject terminal rider_unattested.
+    world.createObject({ id: "probe_log_thing", name: "Probe Log Thing", parent: "$thing", owner: "$wiz", location: "the_chatroom", anchor: "the_chatroom" });
+    world.createObject({ id: "probe_log_slate", name: "Probe Log Slate", parent: "$thing", owner: "$wiz", location: "the_chatroom", anchor: "the_chatroom" });
+    const installed = installVerb(
+      world,
+      "probe_log_thing",
+      "probe_log",
+      `verb :probe_log(log_space, slate) rxd {\n  let entries = log_space:replay(1, 50);\n  slate.probe_seen = length(entries);\n  return length(entries);\n}`,
+      null
+    );
+    expect(installed.ok, JSON.stringify(installed)).toBe(true);
+    // The probing actor sits in the chatroom; a second guest stays in the
+    // outline to commit the entries the probe will read.
+    expect((await world.directCall("sl4-r3-move", actor, actor, "moveto", ["the_chatroom"], { sessionId: session.id })).op).toBe("result");
+    const writer = world.auth("guest:sl4-r3-writer");
+    expect((await world.directCall("sl4-r3-place", writer.actor, writer.actor, "moveto", [theOutline], { sessionId: writer.id })).op).toBe("result");
+
+    const { gateway, gatewayEnv } = await mountNet(world, epoch);
+    for (let i = 1; i <= 2; i += 1) {
+      const add = await call<TurnBody>(gateway, gatewayEnv, "/turn", {
+        call: {
+          kind: "woo.turn_call.shadow.v1", id: `sl4-r3-add-${i}`, route: "sequenced", scope: theOutline,
+          session: writer.id, actor: writer.actor, target: theOutline, verb: "add_item", args: [`foreign ${i}`, null, null]
+        },
+        planningScope: outlineScope, catalog_epoch: epoch, idempotency_key: `sl4-r3-add-${i}`
+      });
+      expect(add.reply.status, `writer add #${i} trace=${JSON.stringify(add.trace)}`).toBe("accepted");
+    }
+
+    const probe = await call<TurnBody>(gateway, gatewayEnv, "/turn", {
+      call: {
+        kind: "woo.turn_call.shadow.v1", id: "sl4-r3-probe", route: "direct", scope: chatScope,
+        session: session.id, actor, target: "probe_log_thing", verb: "probe_log", args: [theOutline, "probe_log_slate"]
+      },
+      planningScope: chatScope, catalog_epoch: epoch, idempotency_key: "sl4-r3-probe"
+    });
+    // Accepted — meaning the chatroom commit validated the foreign replay
+    // read against the outline owner's attestation (a missing one is a
+    // terminal rider_unattested reject, which would fail here loudly).
+    expect(probe.reply.status, `probe trace=${JSON.stringify(probe.trace)}`).toBe("accepted");
+    expect(probe.result, "probe read the outline's committed entries").toBe(2);
+  });
+
   it("does not misclassify repeated ordering content at a later authority head", async () => {
     const { world, theOutline, session, actor, epoch } = await outlinerWorld();
     const roomScope = `room:${theOutline}`;

@@ -34,6 +34,12 @@ import type {
   TranscriptRead as EngineTranscriptRead,
   TranscriptWrite as EngineTranscriptWrite
 } from "../core/effect-transcript";
+import { isSequencedAllocationCell } from "../core/effect-transcript";
+
+// The sequenced seq-allocation classifier (SL1's reserved `next_seq`
+// bookkeeping), re-exported at the bridge so route selection and the
+// planner treat it uniformly with the engine's own commit classifiers.
+export { isSequencedAllocationCell };
 import { finalWritesByCell } from "../core/shadow-commit-scope";
 import type { Principal } from "./attribution";
 import { CellStore, cellKey, cellVersion, type EpochStamp } from "./cells";
@@ -84,6 +90,18 @@ export type EffectTranscript = Omit<EngineEffectTranscript, "reads" | "writes" |
    * invalidates the read that produced the rank, in-scope or cross-scope.
    * Present-only-when-nonempty keeps prior transcript hashes unchanged. */
   orderingReads?: Array<{ container: string; parent: string | null; scope: string; version: string }>;
+  /** Replay pages this plan read (sequenced-log.md SL4): one entry per exact
+   * `(space, from, limit)` query, attested at the page's authority content
+   * `version` and the OWNING scope it was fetched from. `space` is the
+   * SEMANTIC space id; `scope` is the authority address the page came from
+   * (`classifier.scopeOf(space)`). Validation mirrors orderingReads: the
+   * committing scope re-derives pages it OWNS from its durable log and
+   * rejects the plan (`read_version_mismatch` with `replay_conflicts`) when
+   * an append landed inside the window between plan and submit; FOREIGN
+   * pages validate against the owner's `replays` attestation carried in the
+   * submit. Present-only-when-nonempty keeps prior transcript hashes
+   * unchanged. */
+  replayReads?: Array<{ space: string; from: number; limit: number; scope: string; version: string }>;
   /** Audit attribution (audit.md AU3.2): stamped by the gateway at the
    * trust boundary, never accepted from client input. Lives INSIDE the
    * transcript so it participates in the transcript hash and survives

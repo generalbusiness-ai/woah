@@ -2,6 +2,20 @@
 
 Date: 2026-05-05
 
+> **2026-07-22 transport and acts amendment.** The transport sections below
+> predate the Net cutover. Production plugs now enter through authenticated
+> `/net-api/turn`; accepted calls are sequenced in the session's active
+> space. `observe_to_space` selects an audience, not durability, and live
+> delivery to connected clients remains best-effort. Base block values are
+> outside-authoritative current state and do not automatically become acts.
+> Subclasses with woo-owned coordination state expose typed domain verbs;
+> those verbs emit acts internally and projections own the derived rows. A
+> plug never calls raw `:act`. See
+> [`catalogs/block/DESIGN.md`](../catalogs/block/DESIGN.md) for the current
+> contract and the acts note's dispenser migration task for the queue
+> conversion. The remainder of this note preserves the original rationale
+> and pre-Net implementation description.
+
 ## Concept
 
 A `$block` is an in-world actor that bridges woo to an outside-world data
