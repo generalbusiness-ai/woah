@@ -271,6 +271,24 @@ source/schema sync repeatable and declaration-free. Explicit one-shot boot
 migrations remain only for data conversions or compatibility repairs that cannot
 be inferred from a manifest diff.
 
+**Bundled catalog version upgrades.** Before the drift pass, boot compares each
+installed `@local` catalog's recorded version against its bundled manifest.
+When the bundle is ahead, boot applies the bundled §CT14 migration whose
+declared range covers the jump, through the ordinary update path with
+`accept_major`. Catalogs ship exactly one migration file per **major edge**
+(`migration-v(N-1)-to-vN.json`, enforced by the migrations guard), so a world
+more than one major behind matches no single file; boot then **composes** the
+adjacent per-major-edge migrations into one — a v1 world booting a v3 bundle
+runs v1→v2's steps then v2→v3's as a single composed migration (steps
+concatenated in edge order; §CT14.4 idempotency makes a composed re-run after
+partial failure safe). A major jump with no covering single file or chain is
+reported as a boot event rather than silently schema-syncing the new
+definitions without their data rewrites. Migration manifests are
+shape-validated (`{from_version, to_version, spec_version, steps}`) at build
+time by the bundled-index generator and the migrations guard, and again at
+module load, so a malformed file fails with the catalog and file named instead
+of failing inside the version matcher on a deployed world.
+
 In multi-host deployments, every host that owns catalog data must run its own
 host-scoped local lifecycle at cold init. Gateway repair cannot see or safely
 convert state stored in self-hosted object DOs, and a copied

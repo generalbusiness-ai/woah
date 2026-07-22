@@ -39,18 +39,23 @@ exactly one write path per fact, so that entire bug class cannot occur:
 if the fold ran, the row is right; if it didn't, the act isn't in the
 log either.
 
-Two kinds of state deliberately stay **outside** the record, and your
+Three kinds of state deliberately stay **outside** the record, and your
 projections must never copy them into rows:
 
 1. **Artifact content** — a `$note`'s name, description, and text.
    Acts carry a *reference* to the note; the row stores the reference.
 2. **Physical location** — where an object actually is (who is holding
    the task). The substrate `moveto` relation is the only holder fact.
+3. **Substrate-owned relations** — a relation the domain verbs write
+   directly and owner-computed builtins read, like the outliner's
+   `__ordered_edge` tree. Such a relation already has one writer per
+   fact; a projection *checkpoints* it, never copies it (section 5).
 
-Both are **joined at view time**: when a page of rows is rendered, the
-view reads `task.name` and `location(task)` right then. There is no
-"keep the row's copy of the name in sync" problem because there is no
-copy.
+The first two are **joined at view time**: when a page of rows is
+rendered, the view reads `task.name` and `location(task)` right then.
+There is no "keep the row's copy of the name in sync" problem because
+there is no copy. The third is read straight from its own authority;
+the projection contributes only the watermark.
 
 ## 2. Declaring your vocabulary
 
@@ -307,7 +312,7 @@ claim:
 fold(recorded acts, in order) == the live projection state
 ```
 
-## 5. The watermark pattern
+## 5. The watermark pattern (relation-checkpoint projections)
 
 Sometimes the structure you want to project **already has a substrate
 authority**. The outliner's tree is the example: each item carries an
@@ -317,7 +322,7 @@ relation *is* the tree's single writer-per-fact record.
 
 Do not mirror it. A projection that folded `outline_item_added` into
 its own tree rows would recreate two authorities for one structure —
-the exact disease. Instead the outliner ships a **watermark-only
+the exact disease. Instead the outliner ships a **relation-checkpoint
 projection**, `$outline_meta`: it consumes the five structural act
 types, keeps no rows at all, and its entire fold is one line:
 
@@ -327,23 +332,47 @@ verb :fold(act) rx {
 }
 ```
 
+The name matters: this is *not* "the relation is the fold". Rebuilding
+the recorded acts reconstructs the **checkpoint** (the watermark), not
+the tree — the relation stays the current-state authority, while the
+act log is the semantic/audit authority for acted transitions. The
+projection checkpoints the relation; it never copies it.
+
 The authoritative read then joins the substrate read with the
-watermark:
+watermark, through a validated lookup — never positional trust in
+`this.projections[1]`, which any stale or foreign entry would satisfy:
 
 ```
 verb :tree_view() rxd {
+  let meta = this:_acts_meta();   /* validated: live, $outline_meta-descended, co-located */
   let ws = 0;
-  if (length(this.projections) >= 1) { ws = this.projections[1].at_seq; }
-  return { "items": this:list_items(), "at_seq": ws };
+  if (meta != null) { ws = meta.at_seq; }
+  return { "items": this:list_items(), "structure_at_seq": ws };
 }
 ```
 
-Clients get the tree from its real authority plus an `at_seq` that
-tells them how current it is. Use this pattern whenever a substrate
-relation already owns the shape: acts still record *that* changes
-happened (validated, refusable, replayable), and the projection layer
-adds only what the substrate doesn't have — the completeness
-watermark, and any act-derived indexes the substrate can't provide.
+**The watermark is structural only.** The returned key is
+`structure_at_seq` (the `$projection.at_seq` *property* keeps its
+kernel-generic name — the rename is the read's contract, not the
+kernel's). It advances exactly when one of the consumed structural
+acts folds on this room's own log, and for nothing else. Two whole
+categories of change move the *returned rows* without moving it:
+
+- **content edits** — item `name`/`text`/`hidden`-cosmetics/`writers`
+  change through non-acted verbs (`set_item_text`, writer grants);
+- **flat hook echoes** — the movement-hook paths (`enterfunc` capture,
+  foreign-authority `exitfunc` detach) that bypass the act model
+  entirely until cross-space act routing exists.
+
+A facade that caches rows must therefore keep its **own
+read-generation** for `note_edited`, writer changes, and flat hook
+echoes; `structure_at_seq` orders structure and only structure.
+
+Use this pattern whenever a substrate relation already owns the shape:
+acts still record *that* changes happened (validated, refusable,
+replayable), and the projection layer adds only what the substrate
+doesn't have — the completeness checkpoint, and any act-derived
+indexes the substrate can't provide.
 
 ## 6. DSL survival notes for fold authors
 
@@ -409,6 +438,6 @@ Where the examples live:
   — the full worked example: `$case`, `$task_board`, `$kind_lanes`.
 - [`../../catalogs/outliner/manifest.json`](../../catalogs/outliner/manifest.json)
   — guarded emission on real verbs, and the `$outline_meta` /
-  `tree_view` watermark pattern.
+  `tree_view` relation-checkpoint pattern.
 - [`../../notes/2026-07-21-acts-projection-model.md`](../../notes/2026-07-21-acts-projection-model.md)
   — the design note behind all of it.

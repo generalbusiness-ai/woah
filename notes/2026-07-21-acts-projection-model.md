@@ -40,14 +40,15 @@ another space's turn — cross-space capture emission is a v1.5 routing
 question). Tier C first data (in-memory): act turn 1.31×/1.20×
 baseline p50/p99 — inside the ≤1.5× proposal; +0.32ms per extra fold
 (~6% vs ~5% target); storage ~224 B/row, 228KB whole-map rewrite at
-1000 rows. Outstanding: outliner tree projection + watermarked
-`list_items` (design question: the `__ordered_edge` relation is already
-substrate-authoritative post-converge, so the projection layer adds the
-completeness watermark and act-derived indexes rather than mirroring
-the tree — resolve against the no-mirror rule), legacy-genesis seeding
-for deployed outlines, client/facade adoption + both-shape tolerance,
-outliner parity/deletion delta, then the Tasks migration, workerd lane,
-E4/E5 gate, cold-case cost.*
+1000 rows. RESOLVED (2026-07-22): the outliner tree question landed as
+a **relation-checkpoint projection** — `$outline_meta` consumes the
+five structural acts, keeps no rows (the `__ordered_edge` relation
+stays the current-state authority; carve-out 3 in §1), and
+`$outliner:tree_view` returns the substrate tree plus the
+`structure_at_seq` checkpoint; undo's `_restore_item` re-emits the
+added act so restores advance it. Outstanding: legacy-genesis seeding
+for deployed outlines, outliner parity/deletion delta, then the Tasks
+migration, workerd lane, E4/E5 gate, cold-case cost.*
 
 ---
 
@@ -65,24 +66,40 @@ that spine. The discipline is one sentence:
 > list, status, order, or assignment directly; no read ever
 > scans-and-recomputes.
 
-Two things remain object-authoritative by design, and projections must
-not mirror them:
+Three things remain object-authoritative by design, and projections
+must not mirror them:
 
 1. **Artifact content** — `$note` name/description/text. Acts reference
    documents; rows never copy their fields.
 2. **Physical location** — the substrate `moveto` relation (the tasks
    lease). Rows never store a holder; reads derive it (§5.2).
+3. **Substrate-owned relations** — e.g. the outliner's
+   `__ordered_edge`, written directly by the domain verbs and read
+   through owner-computed builtins (`object_tree_rows`,
+   `ordered_children`/`ordered_neighbors`). The relation already has
+   exactly one writer per fact; a projection that folded the same acts
+   into its own rows would be the second authority. Projections
+   **checkpoint** such relations (a *relation-checkpoint projection*:
+   watermark + any act-derived indexes the relation can't answer) and
+   never copy them.
 
 Substrate backing: `$sequenced_log` atomic append (SL2), per-entry
 recorded `observations` (`SpaceLogEntry`, src/core/types.ts:579), the
 outer behavior savepoint around sequenced dispatch
 (src/core/world.ts:4594), deterministic replay (SL3), snapshots.
 
-The invariant, per projection:
+The invariant, per projection — scoped to **projection-owned state**
+(`rows` plus auxiliary fold state; NOT the carve-outs above, which the
+fold never writes and a rebuild therefore never reconstructs):
 
 ```
 fold(recorded acts since the projection's seed, in (seq,index) order) == rows
 ```
+
+For a relation-checkpoint projection this reads: rebuilding the
+recorded acts reconstructs the *checkpoint*, not the relation — the
+relation stays the current-state authority, while the act log is the
+semantic/audit authority for acted transitions.
 
 Rebuild input is the **recorded** observations — never re-execution of
 verbs. Verb changes cannot invalidate a projection; only fold changes

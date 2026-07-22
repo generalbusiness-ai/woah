@@ -968,7 +968,11 @@ describe("outliner-tree presence aside", () => {
       document.body.append(element);
       return element;
     };
-    // One sequence exercising all five types and every field the reducer reads.
+    // One sequence exercising all five types and every field the reducer
+    // reads. The final added event is an UNDO RESTORE: server-side,
+    // _restore_item re-emits outline_item_added for the re-created row (a new
+    // objref, item_4) after the remove — the client must hydrate it exactly
+    // like any other added act.
     const events: Record<string, unknown>[] = [
       { type: "outline_item_added", outliner: "the_outline", item: "item_1", parent_id: null, index: 0, text: "first", actor: "guest_1" },
       { type: "outline_item_added", outliner: "the_outline", item: "item_2", parent_id: "item_1", index: 0, text: "child", actor: "guest_2" },
@@ -976,7 +980,8 @@ describe("outliner-tree presence aside", () => {
       { type: "outline_item_moved", outliner: "the_outline", item: "item_2", to_parent: null, to_index: 0 },
       { type: "outline_item_reordered", outliner: "the_outline", item: "item_3", parent_id: null, to_index: 0 },
       { type: "outline_item_hidden", outliner: "the_outline", item: "item_2", hidden: true },
-      { type: "outline_item_removed", outliner: "the_outline", item: "item_1", reparented_to: null }
+      { type: "outline_item_removed", outliner: "the_outline", item: "item_1", reparented_to: null },
+      { type: "outline_item_added", outliner: "the_outline", item: "item_4", parent_id: null, index: 2, text: "first", actor: "guest_1" }
     ];
     const envelop = ({ type, ...fields }: Record<string, unknown>): Record<string, unknown> => ({ type, version: 1, payload: fields });
 
@@ -988,10 +993,12 @@ describe("outliner-tree presence aside", () => {
     }
 
     // The flat sequence lands the expected structure (proving each event took
-    // effect), and the enveloped sequence lands the exact same model.
+    // effect, including the restored row), and the enveloped sequence lands
+    // the exact same model.
     expect(modelOf(flat).items).toMatchObject([
       { id: "item_3", text: "third", parent_id: null, index: 0, hidden: false, owner: "guest_1" },
-      { id: "item_2", text: "child", parent_id: null, index: 1, hidden: true, owner: "guest_2" }
+      { id: "item_2", text: "child", parent_id: null, index: 1, hidden: true, owner: "guest_2" },
+      { id: "item_4", text: "first", parent_id: null, index: 2, hidden: false, owner: "guest_1" }
     ]);
     expect(modelOf(acts).items).toEqual(modelOf(flat).items);
   });

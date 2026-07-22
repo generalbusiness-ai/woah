@@ -735,7 +735,7 @@ describe("outliner catalog: room_roster (presence aside)", () => {
 });
 
 describe("outliner acts: watermark projection + tree_view", () => {
-  it("at_seq tracks acted structural changes, rebuilds, and gates tree_view", async () => {
+  it("structure_at_seq tracks acted structural changes, rebuilds, and gates tree_view", async () => {
     const world = setupWorld();
     const session = world.auth("guest:wm");
     await expectResult(call(world, session.actor, "the_outline", "enter", []));
@@ -743,17 +743,21 @@ describe("outliner acts: watermark projection + tree_view", () => {
     await addItem(world, session.actor, "second");
     await expectResult(call(world, session.actor, "the_outline", "hide", [a, true]));
 
-    // tree_view: substrate-authoritative items + the act watermark.
+    // tree_view: substrate-authoritative items + the STRUCTURAL act
+    // watermark. The key is structure_at_seq, not at_seq: the returned value
+    // covers only the five acted structural events, never content edits or
+    // flat hook echoes (the $outline_meta property keeps the kernel-generic
+    // at_seq name).
     const tv = await expectResult(call(world, session.actor, "the_outline", "tree_view", []));
-    const view = tv.result as { items: unknown[]; at_seq: number };
+    const view = tv.result as { items: unknown[]; structure_at_seq: number };
     const flat = await expectResult(call(world, session.actor, "the_outline", "list_items", []));
     expect(view.items).toEqual(flat.result);
-    expect(view.at_seq).toBeGreaterThan(0);
+    expect(view.structure_at_seq).toBeGreaterThan(0);
 
     // The watermark equals the last acted structural entry's seq, and the
     // meta projection holds NO tree rows (no-mirror rule).
     const meta = (world.getProp("the_outline", "projections") as string[])[0];
-    expect(world.getProp(meta, "at_seq")).toBe(view.at_seq);
+    expect(world.getProp(meta, "at_seq")).toBe(view.structure_at_seq);
     expect(world.getProp(meta, "rows")).toEqual({});
 
     // Rebuild reproduces the watermark from recorded acts alone.
@@ -763,6 +767,107 @@ describe("outliner acts: watermark projection + tree_view", () => {
       if (r.op !== "result" || !r.result) throw new Error("rebuild failed");
       if (r.result.done) break;
     }
-    expect(world.getProp("wm2", "at_seq")).toBe(view.at_seq);
+    expect(world.getProp("wm2", "at_seq")).toBe(view.structure_at_seq);
+  });
+
+  it("structure_at_seq does NOT advance for content edits (structural watermark only)", async () => {
+    const world = setupWorld();
+    const session = world.auth("guest:wm-content");
+    await expectResult(call(world, session.actor, "the_outline", "enter", []));
+    const a = await addItem(world, session.actor, "body v1");
+    const before = (await expectResult(call(world, session.actor, "the_outline", "tree_view", []))).result as { structure_at_seq: number };
+
+    // A content edit changes what tree_view RETURNS but is not a structural
+    // act — the watermark must hold still. Facades cache-bust content via
+    // their own read-generation, not this value.
+    await expectResult(call(world, session.actor, "the_outline", "set_item_text", [a, "body v2"]));
+    const after = (await expectResult(call(world, session.actor, "the_outline", "tree_view", []))).result as { items: unknown[]; structure_at_seq: number };
+    expect(after.structure_at_seq).toBe(before.structure_at_seq);
+    expect(JSON.stringify(after.items)).toContain("body v2");
+  });
+
+  it("_ensure_acts / tree_view reject a foreign projections entry and mint the real $outline_meta", async () => {
+    const world = setupWorld();
+    const session = world.auth("guest:wm-robust");
+    await expectResult(call(world, session.actor, "the_outline", "enter", []));
+    // Poison the slot: a nonempty projections list whose entry is NOT a live
+    // co-located $outline_meta. Positional trust (projections[1]) would
+    // accept it and never mint the real projection.
+    world.createObject({ id: "fake_meta", name: "fake", parent: "$thing", owner: "$wiz" });
+    world.setProp("the_outline", "projections", ["fake_meta"]);
+
+    const a = await addItem(world, session.actor, "row");
+    await expectResult(call(world, session.actor, "the_outline", "hide", [a, true]));
+
+    // The validated lookup refused the foreign entry, _ensure_acts PRUNED it
+    // (the kernel's fold loop reads .consumes on every entry — a foreign ref
+    // left in place would refuse every later act), and a real live meta was
+    // minted; tree_view reads that one.
+    const projections = world.getProp("the_outline", "projections") as string[];
+    expect(projections).not.toContain("fake_meta");
+    const minted = projections.find((ref) => world.objects.has(ref) && world.object(ref).parent === "$outline_meta");
+    expect(minted).toBeTruthy();
+    const view = (await expectResult(call(world, session.actor, "the_outline", "tree_view", []))).result as { structure_at_seq: number };
+    expect(view.structure_at_seq).toBeGreaterThan(0);
+    expect(world.getProp(minted!, "at_seq")).toBe(view.structure_at_seq);
+  });
+});
+
+describe("outliner acts: undo emits structural acts (P1-2)", () => {
+  it("leaf remove→undo emits exactly one added act for the restored row and advances the watermark", async () => {
+    const world = setupWorld();
+    const session = world.auth("guest:undo-act-leaf");
+    await expectResult(call(world, session.actor, "the_outline", "enter", []));
+    const a = await addItem(world, session.actor, "keep");
+    await addItem(world, session.actor, "doomed");
+    // Focus assertions on the LAST undo slot: remove "doomed".
+    const doomed = (await expectResult(call(world, session.actor, "the_outline", "list_items", []))).result as Array<{ id: string; text: string }>;
+    const target = doomed.find((row) => row.text === "doomed")!.id;
+    await expectResult(call(world, session.actor, "the_outline", "remove_item", [target]));
+    const removedView = (await expectResult(call(world, session.actor, "the_outline", "tree_view", []))).result as { structure_at_seq: number };
+
+    const undoR = await expectResult(call(world, session.actor, "the_outline", "undo", []));
+    const restored = undoR.result as string;
+
+    // Exactly one enveloped outline_item_added act, for the restored row, at
+    // its ACTUAL restored slot (index 1: after "keep").
+    const added = undoR.observations.filter((o) => o.type === "outline_item_added");
+    expect(added).toHaveLength(1);
+    expect(added[0]).toMatchObject({
+      version: 1,
+      payload: { item: restored, parent_id: null, index: 1, text: "doomed", outliner: "the_outline", actor: session.actor }
+    });
+    expect(parentOf(world, restored)).toBeNull();
+    expect(position(world, a)).toBe(1);
+    expect(position(world, restored)).toBe(2);
+
+    // The watermark moved past the remove-time value: undo is a structural
+    // change like any other (this was the stale-watermark repro).
+    const restoredView = (await expectResult(call(world, session.actor, "the_outline", "tree_view", []))).result as { structure_at_seq: number };
+    expect(restoredView.structure_at_seq).toBeGreaterThan(removedView.structure_at_seq);
+  });
+
+  it("subtree remove→undo emits added for the parent and moved acts for each restored child", async () => {
+    const world = setupWorld();
+    const session = world.auth("guest:undo-act-subtree");
+    await expectResult(call(world, session.actor, "the_outline", "enter", []));
+    const groceries = await addItem(world, session.actor, "groceries");
+    const milk = await addItem(world, session.actor, "milk", groceries);
+    const bread = await addItem(world, session.actor, "bread", groceries);
+    await expectResult(call(world, session.actor, "the_outline", "remove_item", [groceries]));
+
+    const undoR = await expectResult(call(world, session.actor, "the_outline", "undo", []));
+    const restored = undoR.result as string;
+
+    const added = undoR.observations.filter((o) => o.type === "outline_item_added");
+    expect(added).toHaveLength(1);
+    expect(added[0]).toMatchObject({ version: 1, payload: { item: restored, text: "groceries" } });
+    const moved = undoR.observations.filter((o) => o.type === "outline_item_moved");
+    const movedItems = moved.map((o) => (o.payload as { item: string }).item).sort();
+    expect(movedItems).toEqual([bread, milk].sort());
+    for (const o of moved) expect(o).toMatchObject({ version: 1, payload: { to_parent: restored } });
+    // The added act precedes the child moves in the recorded order.
+    const types = undoR.observations.map((o) => o.type);
+    expect(types.indexOf("outline_item_added")).toBeLessThan(types.indexOf("outline_item_moved"));
   });
 });

@@ -1,5 +1,6 @@
 import { readdirSync, readFileSync, existsSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { migrationShapeProblems } from "./lib/validate-migration-shape.mjs";
 
 const root = process.cwd();
 const catalogsDir = join(root, "catalogs");
@@ -43,6 +44,27 @@ for (const entry of readdirSync(catalogsDir)) {
     const file = `migration-v${k - 1}-to-v${k}.json`;
     if (!existsSync(join(catalogDir, file))) {
       errors.push(`${entry}: manifest at version ${version} (major ${major}) requires ${file} (see spec/discovery/catalogs.md §CT14.1)`);
+    }
+  }
+
+  // Shape gate: every migration file must carry the runtime's
+  // {from_version, to_version, spec_version, steps} contract (shared rule in
+  // scripts/lib/validate-migration-shape.mjs) and agree with the manifest's
+  // spec_version — a mis-shaped file would otherwise only fail at boot,
+  // inside the upgrade picker, on a deployed world.
+  for (const file of readdirSync(catalogDir).filter((name) => /^migration-v\d+-to-v\d+\.json$/.test(name)).sort()) {
+    let migration;
+    try {
+      migration = JSON.parse(readFileSync(join(catalogDir, file), "utf8"));
+    } catch (err) {
+      errors.push(`${entry}/${file}: cannot parse JSON (${err.message})`);
+      continue;
+    }
+    for (const problem of migrationShapeProblems(`${entry}/${file}`, migration)) {
+      errors.push(`${entry}/${file}: ${problem}`);
+    }
+    if (typeof migration?.spec_version === "string" && typeof manifest.spec_version === "string" && migration.spec_version !== manifest.spec_version) {
+      errors.push(`${entry}/${file}: spec_version "${migration.spec_version}" does not match manifest spec_version "${manifest.spec_version}"`);
     }
   }
 }

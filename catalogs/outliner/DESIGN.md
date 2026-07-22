@@ -5,7 +5,10 @@ below): outliner depends on `@local:acts`; the five structural events
 (`outline_item_added/removed/moved/reordered/hidden`) are emitted as
 schema-validated acts whose domain fields are enveloped under `payload`
 (`{type, version, payload}`), not flat observation fields — client
-reducers migrate with dual-shape tolerance. Two movement-hook paths
+reducers migrate with dual-shape tolerance. This includes undo:
+`_restore_item` re-emits `outline_item_added` for the re-created row
+(at its ACTUAL clamped slot), so a restore advances the watermark like
+any other structural change. Two movement-hook paths
 stay explicitly OUTSIDE the act model until cross-space act routing
 exists: `enterfunc`'s capture echo and `exitfunc`→`_detach_item` when
 running under another space's authority (a guarded act there would be
@@ -13,6 +16,26 @@ refused and swallowed by the hook contract, silently losing the fact) —
 those paths emit legacy flat observations, so a cross-outliner move
 yields an enveloped `added` on the destination and a flat `removed`
 from the source hook.*
+
+*The v3 projection is a **relation-checkpoint projection** (see
+[`docs/designing/acts-and-projections.md`](../../docs/designing/acts-and-projections.md)
+§5): `$outline_meta < $projection` consumes the five structural acts
+and keeps NO tree rows — `__ordered_edge` stays the current-state
+authority (the no-mirror rule; carve-out 3 in the acts model note),
+while the act log is the semantic/audit authority for acted
+transitions. Its whole fold advances `at_seq`; rebuilding recorded
+acts reconstructs the checkpoint, not the tree. `$outliner:tree_view`
+joins `list_items()` with that checkpoint as `structure_at_seq` — a
+STRUCTURAL watermark only. It does not advance for content edits
+(`set_item_text` → `note_edited`, writer changes, item name edits)
+nor for the flat movement-hook echoes above; a facade caching rows
+keeps its own read-generation for those. Both `_ensure_acts` (mount)
+and `tree_view` (read) locate the meta through the validated
+`_acts_meta` lookup — live, `$outline_meta`-descended, co-located —
+never positional trust in `projections[1]`; `_ensure_acts` also prunes
+dead/foreign `projections` entries, since the kernel's fold loop reads
+`.consumes` on every entry and one bad ref would refuse every later
+act.*
 
 > **v2.0.0 — ordered-edge index (structural authority change).** Tree shape
 > and sibling order are now the **sole** responsibility of ONE room-owned edge
@@ -48,7 +71,8 @@ Like other `$space` surfaces, it carries an embedded chat panel.
 | Class | Parent | Description |
 |---|---|---|
 | `$outline_item` | `$note` | One tree node. Text lives in the inherited `.text` slot; its `.__ordered_edge` `{ parent, rank }` is the sole structural authority (parent objref or `null` = top-level, plus a fractional rank among siblings); `.hidden` is a per-item flag. Optional `.name` distinguishes nodes for `$match`. **Not portable**: overrides inherited `.portable` to `false` for room `take` UX, and also overrides `:moveto` so direct movement cannot put it anywhere except an `$outliner` or `$nowhere`. Removal recycles. |
-| `$outliner` | `$room` | Holds items in `.contents`; tracks per-actor focus and per-actor single-level undo in side maps. Tree shape and item state live on the items themselves. |
+| `$outliner` | `$room` | Holds items in `.contents`; tracks per-actor focus and per-actor single-level undo in side maps. Tree shape and item state live on the items themselves. Carries the `$acts` feature (mounted lazily by `_ensure_acts`) and a `projections` list holding its `$outline_meta`. |
+| `$outline_meta` | `$projection` (catalogs/acts) | The relation-checkpoint projection: consumes the five structural act types, holds NO tree rows, and its fold is one line — `this.at_seq = act["seq"]`. `at_seq` (the kernel-generic property name) is the seq of the last structural act on this outliner's own log; `tree_view` surfaces it as `structure_at_seq`. Minted per instance by `_ensure_acts`, one per outliner, living in the outliner's `contents`. |
 
 Items are first-class objects (objref-addressable), matching the
 `$pin < $note` / kanban-card pattern. This keeps content/permissions
@@ -236,9 +260,12 @@ directly; everything routes through the outliner surface.
 | `_detach_item(item, opts?)` | internal | Shared cleanup helper. Reads the item's edge parent, re-homes its DIRECT children (one appended edge each) to that former parent, optionally clears the item's own edge (`{ parent: null, rank: "" }`), and optionally emits one `outline_item_removed`. Idempotent enough for recycle paths: if there are no direct children left, it only performs the remaining clear/emit work requested by `opts`. |
 | `remove_item(item)` | item owner / wizard | Controller path. Captures the full restorable state — see "Undo capture" below — then calls `recycle(item)`. `$outline_item:recycle` calls `_detach_item` before the item is tombstoned, so children are reparented on the same cleanup path used by direct recycle. Sets caller's `last_undo` slot to `{verb: "_restore_item", args: [<captured_state>]}` after recycle succeeds. The restored item from undo is a *new* objref. |
 | `eject_item(item)` | outliner owner / wizard | Curator path: bypasses author-only gate. Same recycle path as `remove_item`, except eject does *not* touch the ejecting curator's `last_undo` slot. |
-| `_restore_item(state)` | (internal; called only by undo) | Re-create an item from a captured state record. Creates with `{owner, name, description, location: this}`, writes ONE edge at the captured `index` under the captured parent (bounded `ordered_neighbors(parent, query, this)` slot answer; the index CLAMPS into range — restore is best-effort placement, never a range error), then restores `hidden`, `writers`, and text. Then each child captured in `state.children` is moved back under the restored item at its captured index via `move_item` (one `outline_item_moved` each). Sets caller's `last_undo` slot to `{verb: "remove_item", args: [new_item]}`. Returns the new item objref. |
+| `_restore_item(state)` | (internal; called only by undo) | Re-create an item from a captured state record. Creates with `{owner, name, description, location: this}`, writes ONE edge at the captured `index` under the captured parent (bounded `ordered_neighbors(parent, query, this)` slot answer; the index CLAMPS into range — restore is best-effort placement, never a range error), then restores `hidden`, `writers`, and text. Emits ONE `outline_item_added` act for the restored row, with the ACTUAL clamped slot as `index` — undo is a structural change and must advance the watermark, not leave `structure_at_seq` stale under a changed tree. Then each child captured in `state.children` is moved back under the restored item at its captured index via `move_item` (one `outline_item_moved` act each, after the added act). Sets caller's `last_undo` slot to `{verb: "remove_item", args: [new_item]}`. Returns the new item objref. |
 | `undo()` | actor | Read the actor's `last_undo` slot, clear it, dispatch the inverse op. Emits `outline_undone` with the consumed record. No-op (and no observation) if the slot is empty. |
 | `focus_on(item?)` | actor | Set `focus_by_actor[actor] = item` (or `null` if no arg). Validates that `item` is in this outliner. Emits `outline_focus_changed` directed to the actor only. |
+| `tree_view()` | anyone | The watermarked authoritative read for the client facade: `{ items: <list_items()>, structure_at_seq: <meta.at_seq or 0> }`. `structure_at_seq` covers exactly the five acted structural events on this outliner's own log — NOT content edits and NOT the flat movement-hook echoes (see the v3 amendment above). 0 until the first structural act. |
+| `_acts_meta()` | internal | Validated lookup for the watermark projection: the first live, `$outline_meta`-descended, co-located entry in `this.projections`, or `null`. Positional trust (`projections[1]`) would let any nonempty list pass; a stale ref that makes `isa()`/`location()` raise is skipped, never trusted. Used by both `_ensure_acts` and `tree_view`. |
+| `_ensure_acts()` | internal | Lazy per-instance mount of the acts surface: mints the `$outline_meta` when `_acts_meta()` finds none, prunes `projections` entries that are not live co-located `$projection` descendants (the kernel fold loop reads `.consumes` on every entry — one dead/foreign ref would refuse every later act), and attaches the `$acts` feature. Idempotent; called by every act-emitting composer. |
 
 ### Chat verbs
 
@@ -340,7 +367,6 @@ state, possibly with children. The captured state record is:
   owner:        ObjRef,              // item.owner (so restore re-owns correctly)
   parent_id:    ObjRef | null,       // former parent
   index:        int,                 // former 0-based sibling index (rank order)
-  index:        int,                 // former sibling index
   children: [                        // direct children, in original sibling order
     { item: ObjRef, index: int },    // each child's pre-remove 0-based index
     ...
@@ -352,14 +378,17 @@ At remove time, `remove_item` reparents the captured children to
 `parent_id` (so they remain visible). At undo time, `_restore_item`:
 
 1. Creates a new `$outline_item` with the captured `{owner, name,
-   description, writers, parent_id, position, hidden}`. If `position`
-   is now occupied under `parent_id`, it computes a fresh position from
-   the captured `index`. `set_text` writes the text.
-2. For each `(child, old_position)`, calls `move_item` to put the
+   description, writers, hidden}` and writes ONE edge under the
+   captured `parent_id` at the captured `index` (the bounded
+   `ordered_neighbors` answer clamps it into range). `set_text` writes
+   the text.
+2. Emits one `outline_item_added` act for the restored row, carrying
+   the ACTUAL clamped index — so the watermark advances and clients
+   hydrate the restored row.
+3. For each `(child, old_index)`, calls `move_item` to put the
    child back under the new item at its original position, restoring
-   the subtree shape.
-3. Emits one `outline_item_added` for the restored row, then one
-   `outline_item_moved` per re-parented child.
+   the subtree shape (one `outline_item_moved` act per child, after
+   the added act).
 
 Edge cases:
 - If a captured child was itself recycled after the original remove,
@@ -798,7 +827,11 @@ exits; custom worlds that mount an outliner should do the same.
 
 ## Migrations
 
-Two catalog-version migrations ship with the outliner:
+Three catalog-version migrations ship with the outliner — one per major
+edge, as `scripts/guard-catalog-migrations.mjs` requires. All use the
+runtime's `{from_version, to_version, spec_version, steps}` manifest
+shape (`src/core/catalog-installer` `CatalogMigrationManifest`), which
+the bundled-index generator and the guard both validate at build time.
 
 - **`migration-v0-to-v1.json`** promotes `$outliner` from `$space` to `$room`
   and removes the class-owned public `enter`/`leave`/`out` lifecycle verbs in
@@ -829,8 +862,31 @@ Two catalog-version migrations ship with the outliner:
   SQLite woo in `tests/outliner-migration.test.ts`, including same-world replay
   after `.parent` and `.position` are gone.
 
+- **`migration-v2-to-v3.json`** covers the acts adoption (the v3
+  amendment at the top of this document). It performs **no data
+  rewrites** — items, edges, focus, and undo state are untouched —
+  so its `steps` list is empty; the manifest update itself delivers
+  the act-emitting verbs, `$outline_meta`, `tree_view`, and the
+  `@local:acts` dependency. It exists so an installed v2 world's
+  boot upgrade has a covering migration edge (and so the guard's
+  every-major-edge rule holds).
+
+**Composition.** Local boot applies ONE migration for the whole
+installed→bundled jump (`runLocalCatalogVersionMigrations` in
+`src/core/local-catalogs.ts`). When no single file covers the jump,
+`composeMigrationChain` chains the adjacent per-major-edge files: a
+world installed at v1 booting into the v3 bundle runs v1→v2's steps
+then v2→v3's (i.e. nothing) as one composed migration, and a v0 world
+runs all three edges. Every step is idempotent per the migration
+contract, so a composed re-run after partial failure is safe. A major
+jump with NO covering chain is reported as
+`woo.local_catalog_version_migration_missing` instead of silently
+schema-syncing the definitions without their data rewrites. The
+v0→v3, v1→v3, and v2→v3 boot paths are test-run in
+`tests/outliner-migration.test.ts`.
+
 No local-boot migration, DO migration, or spec-version bump is required for
-either.
+any of the three.
 
 ## Tests
 

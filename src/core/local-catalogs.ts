@@ -26,6 +26,32 @@ export type LocalCatalogStatus = CatalogManifestStatus & {
 
 const LOCAL_CATALOGS = new Map(BUNDLED_CATALOGS.map((entry) => [entry.manifest.name, entry.manifest] as const));
 const LOCAL_CATALOG_MIGRATIONS = new Map(BUNDLED_CATALOGS.map((entry) => [entry.manifest.name, entry.migrations] as const));
+
+// Load-time shape gate for bundled migration manifests. The boot-upgrade
+// picker reads `from_version`/`to_version` off every migration; a file
+// authored with the wrong keys (e.g. `{from, to, operations}`) used to
+// surface only as `undefined.split` deep inside versionPatternMatches on a
+// deployed world. Fail HERE, at module load, naming the catalog and file —
+// the build gates (catalog:index, guard-catalog-migrations) enforce the same
+// contract earlier, this is the last line of defense.
+for (const entry of BUNDLED_CATALOGS) {
+  entry.migrations.forEach((migration, index) => {
+    const file = entry.migration_paths[index] ?? `migrations[${index}]`;
+    const record = migration as unknown as Record<string, unknown>;
+    const bad =
+      !migration || typeof migration !== "object" ||
+      typeof record.from_version !== "string" ||
+      typeof record.to_version !== "string" ||
+      typeof record.spec_version !== "string" ||
+      !Array.isArray(record.steps);
+    if (bad) {
+      throw new Error(
+        `bundled catalog "${entry.manifest.name}" migration ${file} is malformed: ` +
+        `expected {from_version, to_version, spec_version, steps[]}, found keys [${Object.keys(record ?? {}).join(", ")}]`
+      );
+    }
+  });
+}
 const LOCAL_CATALOG_SOURCE_MIGRATION = "2026-04-30-source-catalog-verbs";
 const LOCAL_CATALOG_PLACEMENT_MIGRATION = "2026-04-30-catalog-placement-metadata";
 const LOCAL_CATALOG_CHAT_COCKATOO_MIGRATION = "2026-04-30-chat-cockatoo";
@@ -1400,8 +1426,19 @@ function runLocalCatalogVersionMigrations(world: WooWorld, names: readonly strin
     const currentVersion = installedLocalCatalogVersion(world, name);
     if (!currentVersion || currentVersion === manifest.version) continue;
     if (!isVersionLessThan(currentVersion, manifest.version)) continue;
-    const migration = pickMatchingMigration(migrations, currentVersion, manifest.version);
-    if (!migration) continue;
+    const migration = composeMigrationChain(migrations, currentVersion, manifest.version);
+    if (!migration) {
+      // Minor/patch drift within one major needs no migration file (the
+      // guard only requires major edges) — the auto schema sync covers it.
+      // A MAJOR jump with no covering migration (single or composed chain)
+      // is a packaging defect: the world would be schema-synced to the new
+      // definitions WITHOUT its data rewrites. Report it loudly instead of
+      // silently falling through.
+      if (majorVersionOf(currentVersion) !== majorVersionOf(manifest.version)) {
+        report("woo.local_catalog_version_migration_missing", { catalog: name, from: currentVersion, to: manifest.version });
+      }
+      continue;
+    }
     try {
       updateCatalogManifest(world, manifest, {
         tap: "@local",
@@ -1446,6 +1483,64 @@ function pickMatchingMigration(
     }
   }
   return null;
+}
+
+/** Compose bundled migrations into one manifest covering (fromVersion ->
+ * toVersion).
+ *
+ * The guard convention (scripts/guard-catalog-migrations.mjs) ships one file
+ * per MAJOR edge — `migration-v(N-1)-to-vN.json` — but local boot applies a
+ * SINGLE migration for the full installed→bundled jump. A world installed at
+ * v1 booting into a v3 bundle therefore needs v1→v2 and v2→v3 chained, or it
+ * would match nothing and be schema-synced without its data rewrites.
+ *
+ * A direct single-file match wins (the common one-major upgrade, and the only
+ * way a wildcard `to_version` like weather's "1.x.x" can terminate). Otherwise
+ * walk adjacent edges: follow the migration whose `from_version` pattern
+ * matches the cursor, advance the cursor to that migration's `to_version`
+ * (wildcard minor/patch resolve to 0 — the next edge's `from_version` is a
+ * major-wide pattern by the same convention), and stop when an edge's
+ * `to_version` covers the target. The composed manifest concatenates the
+ * steps in order; each step is idempotent by the migration contract
+ * (spec/discovery/catalogs.md §CT14), so a chain re-run after partial failure
+ * is safe. Returns null when no chain connects (caller decides how loudly to
+ * complain). */
+function composeMigrationChain(
+  migrations: readonly CatalogMigrationManifest[],
+  fromVersion: string,
+  toVersion: string
+): CatalogMigrationManifest | null {
+  const direct = pickMatchingMigration(migrations, fromVersion, toVersion);
+  if (direct) return direct;
+  const chain: CatalogMigrationManifest[] = [];
+  const used = new Set<CatalogMigrationManifest>();
+  let cursor = fromVersion;
+  // Each hop consumes one distinct migration, so the walk is bounded by the
+  // file count; `used` also breaks any accidental version-pattern cycle.
+  for (let hop = 0; hop < migrations.length; hop++) {
+    const next = migrations.find((m) => !used.has(m) && versionPatternMatches(m.from_version, cursor)) ?? null;
+    if (!next) return null;
+    used.add(next);
+    chain.push(next);
+    if (versionPatternMatches(next.to_version, toVersion)) {
+      // Chain complete. spec_versions must agree for validateCatalogMigration
+      // (it checks the composed value against the manifest); a mixed chain is
+      // unmergeable, and the shape guards make it a build error anyway.
+      if (chain.some((m) => m.spec_version !== chain[0].spec_version)) return null;
+      return {
+        from_version: chain[0].from_version,
+        to_version: next.to_version,
+        spec_version: chain[0].spec_version,
+        steps: chain.flatMap((m) => m.steps)
+      };
+    }
+    cursor = next.to_version.split(".").map((part) => (part === "x" ? "0" : part)).join(".");
+  }
+  return null;
+}
+
+function majorVersionOf(version: string): number {
+  return Number(version.split(/[+-]/)[0].split(".")[0]) || 0;
 }
 
 function versionPatternMatches(pattern: string, version: string): boolean {

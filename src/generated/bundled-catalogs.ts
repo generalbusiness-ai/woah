@@ -35,25 +35,28 @@ export type BundledCatalogEntry = {
   readonly path: string;
   readonly manifest: CatalogManifest;
   readonly migrations: readonly CatalogMigrationManifest[];
+  /** Repo-relative source file of each migrations[i] — for load-time shape
+   * errors that name the offending file. */
+  readonly migration_paths: readonly string[];
 };
 
 export const BUNDLED_CATALOGS: readonly BundledCatalogEntry[] = [
-  { path: "catalogs/acts/manifest.json", manifest: manifest0 as unknown as CatalogManifest, migrations: [] },
-  { path: "catalogs/block/manifest.json", manifest: manifest1 as unknown as CatalogManifest, migrations: [] },
-  { path: "catalogs/blocks-demo/manifest.json", manifest: manifest2 as unknown as CatalogManifest, migrations: [] },
-  { path: "catalogs/casework/manifest.json", manifest: manifest3 as unknown as CatalogManifest, migrations: [] },
-  { path: "catalogs/chat/manifest.json", manifest: manifest4 as unknown as CatalogManifest, migrations: [] },
-  { path: "catalogs/core/manifest.json", manifest: manifest5 as unknown as CatalogManifest, migrations: [] },
-  { path: "catalogs/demoworld/manifest.json", manifest: manifest6 as unknown as CatalogManifest, migrations: [] },
-  { path: "catalogs/dispenser/manifest.json", manifest: manifest7 as unknown as CatalogManifest, migrations: [] },
-  { path: "catalogs/dubspace/manifest.json", manifest: manifest8 as unknown as CatalogManifest, migrations: [migration9 as unknown as CatalogMigrationManifest] },
-  { path: "catalogs/help/manifest.json", manifest: manifest10 as unknown as CatalogManifest, migrations: [] },
-  { path: "catalogs/horoscope/manifest.json", manifest: manifest11 as unknown as CatalogManifest, migrations: [] },
-  { path: "catalogs/note/manifest.json", manifest: manifest12 as unknown as CatalogManifest, migrations: [migration13 as unknown as CatalogMigrationManifest, migration14 as unknown as CatalogMigrationManifest] },
-  { path: "catalogs/outliner/manifest.json", manifest: manifest15 as unknown as CatalogManifest, migrations: [migration16 as unknown as CatalogMigrationManifest, migration17 as unknown as CatalogMigrationManifest, migration18 as unknown as CatalogMigrationManifest] },
-  { path: "catalogs/perm/manifest.json", manifest: manifest19 as unknown as CatalogManifest, migrations: [] },
-  { path: "catalogs/pinboard/manifest.json", manifest: manifest20 as unknown as CatalogManifest, migrations: [migration21 as unknown as CatalogMigrationManifest] },
-  { path: "catalogs/prog/manifest.json", manifest: manifest22 as unknown as CatalogManifest, migrations: [] },
-  { path: "catalogs/tasks/manifest.json", manifest: manifest23 as unknown as CatalogManifest, migrations: [migration24 as unknown as CatalogMigrationManifest] },
-  { path: "catalogs/weather/manifest.json", manifest: manifest25 as unknown as CatalogManifest, migrations: [migration26 as unknown as CatalogMigrationManifest] }
+  { path: "catalogs/acts/manifest.json", manifest: manifest0 as unknown as CatalogManifest, migrations: [], migration_paths: [] },
+  { path: "catalogs/block/manifest.json", manifest: manifest1 as unknown as CatalogManifest, migrations: [], migration_paths: [] },
+  { path: "catalogs/blocks-demo/manifest.json", manifest: manifest2 as unknown as CatalogManifest, migrations: [], migration_paths: [] },
+  { path: "catalogs/casework/manifest.json", manifest: manifest3 as unknown as CatalogManifest, migrations: [], migration_paths: [] },
+  { path: "catalogs/chat/manifest.json", manifest: manifest4 as unknown as CatalogManifest, migrations: [], migration_paths: [] },
+  { path: "catalogs/core/manifest.json", manifest: manifest5 as unknown as CatalogManifest, migrations: [], migration_paths: [] },
+  { path: "catalogs/demoworld/manifest.json", manifest: manifest6 as unknown as CatalogManifest, migrations: [], migration_paths: [] },
+  { path: "catalogs/dispenser/manifest.json", manifest: manifest7 as unknown as CatalogManifest, migrations: [], migration_paths: [] },
+  { path: "catalogs/dubspace/manifest.json", manifest: manifest8 as unknown as CatalogManifest, migrations: [migration9 as unknown as CatalogMigrationManifest], migration_paths: ["catalogs/dubspace/migration-v0-to-v1.json"] },
+  { path: "catalogs/help/manifest.json", manifest: manifest10 as unknown as CatalogManifest, migrations: [], migration_paths: [] },
+  { path: "catalogs/horoscope/manifest.json", manifest: manifest11 as unknown as CatalogManifest, migrations: [], migration_paths: [] },
+  { path: "catalogs/note/manifest.json", manifest: manifest12 as unknown as CatalogManifest, migrations: [migration13 as unknown as CatalogMigrationManifest, migration14 as unknown as CatalogMigrationManifest], migration_paths: ["catalogs/note/migration-v0-to-v1.json","catalogs/note/migration-v1-to-v2.json"] },
+  { path: "catalogs/outliner/manifest.json", manifest: manifest15 as unknown as CatalogManifest, migrations: [migration16 as unknown as CatalogMigrationManifest, migration17 as unknown as CatalogMigrationManifest, migration18 as unknown as CatalogMigrationManifest], migration_paths: ["catalogs/outliner/migration-v0-to-v1.json","catalogs/outliner/migration-v1-to-v2.json","catalogs/outliner/migration-v2-to-v3.json"] },
+  { path: "catalogs/perm/manifest.json", manifest: manifest19 as unknown as CatalogManifest, migrations: [], migration_paths: [] },
+  { path: "catalogs/pinboard/manifest.json", manifest: manifest20 as unknown as CatalogManifest, migrations: [migration21 as unknown as CatalogMigrationManifest], migration_paths: ["catalogs/pinboard/migration-v0-to-v1.json"] },
+  { path: "catalogs/prog/manifest.json", manifest: manifest22 as unknown as CatalogManifest, migrations: [], migration_paths: [] },
+  { path: "catalogs/tasks/manifest.json", manifest: manifest23 as unknown as CatalogManifest, migrations: [migration24 as unknown as CatalogMigrationManifest], migration_paths: ["catalogs/tasks/migration-v0-to-v1.json"] },
+  { path: "catalogs/weather/manifest.json", manifest: manifest25 as unknown as CatalogManifest, migrations: [migration26 as unknown as CatalogMigrationManifest], migration_paths: ["catalogs/weather/migration-v0-to-v1.json"] }
 ];

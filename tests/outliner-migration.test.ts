@@ -361,58 +361,144 @@ describe("outliner v1 -> v2 migration", () => {
     }
   });
 
-  it("is applied AUTOMATICALLY on boot: installLocalCatalogs upgrades an aged v1 outliner to v2 (the prod deploy path)", () => {
-    // This is exactly how a deployed build reaches an already-installed world:
-    // booting with the bundled (now v2) catalogs runs
-    // `runLocalCatalogVersionMigrations`, which sees the installed outliner at
-    // v1 < the bundled v2.0.0 and applies the bundled migration-v1-to-v2.json.
-    const world = createWorld({ catalogs: false });
-    installLocalCatalogs(world, ["chat", "note"]);
-    // A synthetic v1 outliner (real class names/ancestors) with aged items.
-    const v1Full: CatalogManifest = {
-      name: "outliner", version: "1.0.1", spec_version: "v1", license: "MIT", depends: ["@local:chat", "@local:note"],
-      classes: [
-        {
-          local_name: "$outliner", parent: "$room", properties: [],
-          verbs: [
-            { name: "_siblings_ordered", perms: "rxd", source: "verb :_siblings_ordered(parent_id) rxd { return []; }" },
-            { name: "_renumber_siblings", perms: "rx", source: "verb :_renumber_siblings(parent_id, ordered) rx { return true; }" }
-          ]
-        },
-        {
-          local_name: "$outline_item", parent: "$note",
-          properties: [
-            { name: "parent", type: "obj|null", default: null, perms: "r" },
-            { name: "position", type: "int", default: 0, perms: "r" }
-          ],
-          verbs: [
-            { name: "set_position", perms: "rx", source: "verb :set_position(position) rx { this.position = position; return true; }" },
-            { name: "set_parent", perms: "rx", source: "verb :set_parent(new_parent) rx { this.parent = new_parent; return true; }" }
-          ]
-        }
-      ]
-    } as unknown as CatalogManifest;
-    installCatalogManifest(world, v1Full, { tap: "@local", alias: "outliner" });
+  // ---- Boot-upgrade lane: installLocalCatalogs against the REAL bundled
+  // outliner (now v3.0.0). Local boot applies ONE migration for the whole
+  // installed→bundled jump, so aged worlds rely on composeMigrationChain
+  // (src/core/local-catalogs.ts) chaining the per-major-edge files the guard
+  // requires: v0→v1 (reparent + retire lifecycle verbs), v1→v2 (edge
+  // derivation), v2→v3 (acts adoption — no data rewrites).
+
+  /** The @local outliner record's version in $catalog_registry. */
+  function installedOutlinerVersion(world: ReturnType<typeof createWorld>): string | null {
+    const raw = world.propOrNull("$catalog_registry", "installed_catalogs") as Array<Record<string, unknown>> | null;
+    const record = (raw ?? []).find((item) => item && item.tap === "@local" && (item.alias === "outliner" || item.catalog === "outliner"));
+    return typeof record?.version === "string" ? record.version : null;
+  }
+
+  /** Real legacy class shapes shared by the v0/v1 boot fixtures. */
+  const legacyItemClass = {
+    local_name: "$outline_item", parent: "$note",
+    properties: [
+      { name: "parent", type: "obj|null", default: null, perms: "r" },
+      { name: "position", type: "int", default: 0, perms: "r" }
+    ],
+    verbs: [
+      { name: "set_position", perms: "rx", source: "verb :set_position(position) rx { this.position = position; return true; }" },
+      { name: "set_parent", perms: "rx", source: "verb :set_parent(new_parent) rx { this.parent = new_parent; return true; }" }
+    ]
+  };
+  const legacyOutlinerVerbs = [
+    { name: "_siblings_ordered", perms: "rxd", source: "verb :_siblings_ordered(parent_id) rxd { return []; }" },
+    { name: "_renumber_siblings", perms: "rx", source: "verb :_renumber_siblings(parent_id, ordered) rx { return true; }" }
+  ];
+
+  /** Seed one legacy outliner with two root items in reversed position order,
+   * so a derived edge order proves the reindex ran on the aged data. */
+  function seedLegacyBootWorld(world: ReturnType<typeof createWorld>): void {
     world.createObject({ id: "boot_mo", name: "mo", parent: "$outliner", owner: "$wiz" });
     for (const [id, pos] of [["bi_a", 2], ["bi_b", 1]] as const) {
       world.createObject({ id, name: id, parent: "$outline_item", owner: "$wiz", location: "boot_mo" });
       world.setProp(id, "parent", null);
       world.setProp(id, "position", pos);
     }
+  }
 
-    // Boot with the bundled catalogs — the auto-upgrade trigger.
-    installLocalCatalogs(world, ["chat", "note", "outliner"]);
-
+  function assertBootUpgraded(world: ReturnType<typeof createWorld>): void {
     // Edges derived by (position) order; legacy props dropped.
     const ea = world.propOrNull("bi_a", "__ordered_edge") as { parent: string | null; rank: string };
     const eb = world.propOrNull("bi_b", "__ordered_edge") as { parent: string | null; rank: string };
     expect(ea.parent).toBeNull();
     expect(eb.parent).toBeNull();
     // Deriving edges FROM the legacy position order (bi_b before bi_a) proves
-    // the migration ran on aged v1 data — a fresh v2 install has no positions.
+    // the migration ran on aged v1 data — a fresh install has no positions.
     expect(eb.rank < ea.rank).toBe(true); // bi_b (position 1) before bi_a (position 2)
     expect(world.propOrNull("bi_a", "position")).toBeNull();
     expect(world.propOrNull("bi_a", "parent")).toBeNull();
     assertRetiredVerbsRemoved(world);
+    // The registry landed on the bundled version — the composed chain updated
+    // it atomically with the data rewrites.
+    expect(installedOutlinerVersion(world)).toBe("3.0.0");
+    // v3 delivered the acts-era surface.
+    expect(world.ownVerbExact("$outliner", "tree_view")).not.toBeNull();
+  }
+
+  it("boot-upgrades an aged v1 outliner to the bundled v3 (composed v1→v2→v3 chain, the prod deploy path)", () => {
+    const world = createWorld({ catalogs: false });
+    installLocalCatalogs(world, ["chat", "note"]);
+    // A synthetic v1 outliner (real class names/ancestors) with aged items.
+    const v1Full: CatalogManifest = {
+      name: "outliner", version: "1.0.1", spec_version: "v1", license: "MIT", depends: ["@local:chat", "@local:note"],
+      classes: [
+        { local_name: "$outliner", parent: "$room", properties: [], verbs: legacyOutlinerVerbs },
+        legacyItemClass
+      ]
+    } as unknown as CatalogManifest;
+    installCatalogManifest(world, v1Full, { tap: "@local", alias: "outliner" });
+    seedLegacyBootWorld(world);
+
+    // Boot with the bundled catalogs — the auto-upgrade trigger.
+    installLocalCatalogs(world, ["chat", "note", "outliner"]);
+
+    assertBootUpgraded(world);
+  });
+
+  it("boot-upgrades an aged v0 outliner to the bundled v3 (composed v0→v1→v2→v3 chain)", () => {
+    const world = createWorld({ catalogs: false });
+    installLocalCatalogs(world, ["chat", "note"]);
+    // v0 shape: $outliner still parented on $space with its own public
+    // enter/leave/out lifecycle verbs (what migration-v0-to-v1 retires).
+    const v0Full: CatalogManifest = {
+      name: "outliner", version: "0.3.0", spec_version: "v1", license: "MIT", depends: ["@local:chat", "@local:note"],
+      classes: [
+        {
+          local_name: "$outliner", parent: "$space", properties: [],
+          verbs: [
+            ...legacyOutlinerVerbs,
+            { name: "enter", perms: "rxd", source: "verb :enter() rxd { return true; }" },
+            { name: "leave", perms: "rxd", source: "verb :leave() rxd { return true; }" },
+            { name: "out", perms: "rxd", source: "verb :out() rxd { return true; }" }
+          ]
+        },
+        legacyItemClass
+      ]
+    } as unknown as CatalogManifest;
+    installCatalogManifest(world, v0Full, { tap: "@local", alias: "outliner" });
+    seedLegacyBootWorld(world);
+
+    installLocalCatalogs(world, ["chat", "note", "outliner"]);
+
+    assertBootUpgraded(world);
+    // The v0→v1 hop's own steps also ran: the class was reparented off $space
+    // and the class-owned lifecycle verbs are gone (the bundled v3 manifest
+    // does not redefine any of the three).
+    expect(world.object("$outliner").parent).toBe("$room");
+    expect(world.ownVerbExact("$outliner", "out")).toBeNull();
+  });
+
+  it("boot-upgrades an installed v2 outliner to the bundled v3 (single no-rewrite edge, edges untouched)", () => {
+    const world = createWorld({ catalogs: false });
+    installLocalCatalogs(world, ["chat", "note"]);
+    // v2 shape: edge index already the structural authority.
+    const v2Full: CatalogManifest = {
+      name: "outliner", version: "2.0.0", spec_version: "v1", license: "MIT", depends: ["@local:chat", "@local:note"],
+      classes: [
+        { local_name: "$outliner", parent: "$room", properties: [] },
+        {
+          local_name: "$outline_item", parent: "$note",
+          properties: [{ name: "__ordered_edge", type: "map|null", default: null, perms: "r" }]
+        }
+      ]
+    } as unknown as CatalogManifest;
+    installCatalogManifest(world, v2Full, { tap: "@local", alias: "outliner" });
+    world.createObject({ id: "boot_mo", name: "mo", parent: "$outliner", owner: "$wiz" });
+    world.createObject({ id: "bi_a", name: "bi_a", parent: "$outline_item", owner: "$wiz", location: "boot_mo" });
+    world.setProp("bi_a", "__ordered_edge", { parent: null, rank: "V1" });
+
+    installLocalCatalogs(world, ["chat", "note", "outliner"]);
+
+    // v2→v3 performs no data rewrites: the authored edge survives byte-for-byte.
+    expect(world.propOrNull("bi_a", "__ordered_edge")).toEqual({ parent: null, rank: "V1" });
+    expect(installedOutlinerVersion(world)).toBe("3.0.0");
+    expect(world.ownVerbExact("$outliner", "tree_view")).not.toBeNull();
   });
 });

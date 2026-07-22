@@ -1,5 +1,6 @@
-import { mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
+import { migrationShapeProblems } from "./lib/validate-migration-shape.mjs";
 
 const repoRoot = new URL("..", import.meta.url).pathname;
 const catalogsRoot = join(repoRoot, "catalogs");
@@ -33,20 +34,41 @@ for (const dir of catalogDirs) {
     .filter((name) => /^migration-v\d+-to-v\d+\.json$/.test(name))
     .sort();
   const migrationVars = [];
+  const migrationPaths = [];
   for (const name of migrationFiles) {
+    // Build-time shape gate: a malformed migration file (wrong keys, missing
+    // steps) must fail HERE with the file named, not later as an
+    // `undefined.split` inside the boot-upgrade picker. The runtime repeats
+    // this check at module load (src/core/local-catalogs.ts) as defense in
+    // depth; guard-catalog-migrations.mjs enforces it in `npm test` too.
+    const migrationPath = join(dir, name);
+    const fileFromRoot = relative(repoRoot, migrationPath).replaceAll("\\", "/");
+    validateMigrationShape(fileFromRoot, JSON.parse(readFileSync(migrationPath, "utf8")));
     const v = `migration${importIndex++}`;
     importLines.push(
-      `import ${v} from "${importPath(join(dir, name))}";`
+      `import ${v} from "${importPath(migrationPath)}";`
     );
     migrationVars.push(v);
+    migrationPaths.push(fileFromRoot);
   }
   const fromRoot = relative(repoRoot, manifestPath).replaceAll("\\", "/");
   const migrationsExpr = migrationVars.length === 0
     ? "[]"
     : `[${migrationVars.map((v) => `${v} as unknown as CatalogMigrationManifest`).join(", ")}]`;
   entryLines.push(
-    `  { path: ${JSON.stringify(fromRoot)}, manifest: ${manifestVar} as unknown as CatalogManifest, migrations: ${migrationsExpr} }`
+    `  { path: ${JSON.stringify(fromRoot)}, manifest: ${manifestVar} as unknown as CatalogManifest, migrations: ${migrationsExpr}, migration_paths: ${JSON.stringify(migrationPaths)} }`
   );
+}
+
+/** Shared shape contract: scripts/lib/validate-migration-shape.mjs. Failing
+ * here (catalog:index) keeps a mis-shaped file out of the generated bundle
+ * entirely; the guard and the runtime loader repeat the check. */
+function validateMigrationShape(file, migration) {
+  const problems = migrationShapeProblems(file, migration);
+  if (problems.length > 0) {
+    for (const problem of problems) console.error(`bundled catalog migration ${file}: ${problem}`);
+    process.exit(1);
+  }
 }
 
 function importPath(absPath) {
@@ -67,6 +89,9 @@ export type BundledCatalogEntry = {
   readonly path: string;
   readonly manifest: CatalogManifest;
   readonly migrations: readonly CatalogMigrationManifest[];
+  /** Repo-relative source file of each migrations[i] — for load-time shape
+   * errors that name the offending file. */
+  readonly migration_paths: readonly string[];
 };
 
 export const BUNDLED_CATALOGS: readonly BundledCatalogEntry[] = [

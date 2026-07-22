@@ -1300,13 +1300,32 @@ export class NetGatewayDO {
    */
   private catalogKnownKeys(view: CellStore, classifier: ScopeClassifier): Set<string> {
     const known = new Set<string>();
+    // Objects whose lineage row carries the explicit CO15 marker: their
+    // content is fixed for the catalog epoch, so every scope's KV-seeded
+    // catalog closure already holds it.
+    const immutableDefinitions = new Set<string>();
     for (const key of view.keys()) {
       if (!key.startsWith("object_lineage:")) continue;
+      const object = objectOfCellKey(key);
       try {
-        if (classifier.scopeOf(objectOfCellKey(key)) === CATALOG_SCOPE) known.add(key);
+        if (classifier.scopeOf(object) === CATALOG_SCOPE) {
+          known.add(key);
+          if (isEpochImmutableDefinition(view.get(key)?.value)) immutableDefinitions.add(object);
+        }
       } catch {
         // Unclosed walk: leave the key out; the cell ships normally.
       }
+    }
+    // CO15: the catalog closure is receiver-known for class DEFINITIONS —
+    // lineage and verb bytecode — not just lineage. Without this, every
+    // verb a turn dispatches reships its epoch-pinned bytecode in the read
+    // closure; a deep chain (undo → _restore_item → move_item → act →
+    // fold) carries ~45 KB of bytecode and trips the warm-envelope
+    // ceiling. Eligibility uses the explicit epoch_immutable_definition
+    // lineage marker (never inference), per the CO15 mutation rules.
+    for (const key of view.keys()) {
+      if (!key.startsWith("verb_bytecode:")) continue;
+      if (immutableDefinitions.has(objectOfCellKey(key))) known.add(key);
     }
     return known;
   }

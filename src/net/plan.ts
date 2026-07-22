@@ -74,14 +74,20 @@ export type PlanTurnInput = {
    * deterministic given the counter). Turns that do not create run fine
    * at the bridge defaults. */
   counters?: SerializedFromCellsOptions;
-  /** Lineage keys the receiver universally holds (CO15: the catalog
-   * scope's closure is receiver-known in every transfer — class chains
-   * never reship). The read closure omits these cells and declares them
-   * `assumes_known` instead; only `object_lineage:*` keys belong here.
-   * The function form is invoked with the PLANNING STORE (the seed slice
-   * under slicePlanning) once the run settles, so a caller can classify
-   * just the lineage keys the plan can actually reference instead of
-   * scanning its whole view per turn (ready-to-scale blocker #1). */
+  /** Definition keys the receiver universally holds (CO15: the catalog
+   * scope's closure — class lineage AND the verb bytecode of
+   * epoch-immutable definitions — is receiver-known in every transfer;
+   * class chains never reship). The read closure omits these cells and
+   * declares them `assumes_known` instead. `object_lineage:*` keys of
+   * catalog-scope objects and `verb_bytecode:*` keys of
+   * `epoch_immutable_definition` classes belong here; a deep dispatch
+   * chain (undo → _restore_item → move_item → act → fold) would
+   * otherwise ship tens of KB of epoch-pinned bytecode per turn and trip
+   * the warm-envelope ceiling. The function form is invoked with the
+   * PLANNING STORE (the seed slice under slicePlanning) once the run
+   * settles, so a caller can classify just the keys the plan can
+   * actually reference instead of scanning its whole view per turn
+   * (ready-to-scale blocker #1). */
   receiverKnown?: ReadonlySet<string> | ((planStore: CellStore) => ReadonlySet<string>);
   /** Phase 1 (slice-based planning): when true, the planner runs the VM
    * against the turn's SEED SLICE (actor/session/target + their class
@@ -502,7 +508,12 @@ function readClosureCells(
   const objects = new Set<string>();
   const add = (key: string | null, object?: string): void => {
     if (object !== undefined) objects.add(object);
-    if (key !== null && view.has(key)) keys.add(key);
+    // Receiver-known definition cells (CO15) never ride the closure —
+    // the transfer declares them `assumes_known` instead. This covers
+    // catalog class lineage AND epoch-immutable verb bytecode; the
+    // transcript still records their read versions, so a stale epoch is
+    // caught by the submit's version/epoch checks, not by reshipping.
+    if (key !== null && view.has(key) && !receiverKnown.has(key)) keys.add(key);
   };
 
   for (const read of transcript.reads) add(netCellKeyFor(read.cell), read.cell.object);
