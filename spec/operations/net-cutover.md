@@ -516,6 +516,29 @@ failure/abandonment, fanout gap, degraded install/adoption signal,
 threshold breach, or insufficient evidence at its deadline. Tail reports
 may supplement diagnosis but cannot satisfy NC8 acceptance.
 
+**Latency acceptance (re-scoped 2026-07-22, operator decision).** The
+wall bound applies at **p95 ≤ 750 ms**; p99 is bounded by the RPC-timeout
+ceiling (5 s) with ZERO tolerance for actual timeouts. Measured
+gentle-shape gate windows on the aged prod world read p95 525–596 ms
+(the fresh-canary calibration was 349–500 ms), including the drivers'
+synchronized who/close phase; 750 accepts measured reality with
+headroom, and the lever for tightening back toward 500 is roster-turn
+(`who_all`) cost. Rationale,
+measured across every build and load shape 2026-07-20→22: deployed prod
+exhibits episodic 1–5 s single-DO event-loop stalls (~one per few
+minutes) that are uncorrelated with every application series, strike
+multiple gateways simultaneously when a shared authority is in flight,
+and are unmeasurable in-isolate (workerd freezes `Date.now()` within
+synchronous execution — [reference/cloudflare.md §R10.1](../reference/cloudflare.md#r101-workers-analytics-engine)).
+This is the platform scheduling/GC tail — the fidelity ladder's
+deploy-only class — and at bake sample sizes (~1 500–2 000 turns) a
+handful of episode-struck turns lands p99 above any sub-second bound
+regardless of application health. The original 500 ms p99 figure was
+calibrated on an isolated fresh canary and is not reliably achievable on
+a real aged world. Application-attributable latency remains fully gated:
+p95 ≤ 750 ms, queue p99 ≤ 1 s, zero timeouts/refusals/gaps. Evidence:
+`notes/2026-07-20-nc8-bake-attempt-1.md`.
+
 ## NC9. v2 stack decommission
 
 > Status: **code removal staged (2026-07-20)**; operator deploy gates

@@ -26,16 +26,33 @@ export type NetAeReport = {
 export type NetAeLimits = {
   minTurns: number;
   maxErrorRate: number;
+  maxWallP95Ms: number;
   maxWallP99Ms: number;
   maxQueueP99Ms: number;
   minGatewayShards: number;
   minElasticGuests: number;
 };
 
+// Acceptance envelope re-scope (operator decision, 2026-07-22): the wall
+// bound moved from p99 to p95, at 750ms. Measured gentle-shape gate
+// windows on the aged prod world read p95 525-596ms (the fresh-canary
+// calibration was 349-500ms), including the drivers' synchronized
+// who/close phase; 750 accepts measured reality with headroom, and the
+// lever for tightening back toward 500 is roster-turn (who_all) cost. Deployed prod exhibits episodic 1-5s
+// single-DO event-loop stalls (~1 per few minutes; measured across every
+// build and load shape 2026-07-20→22, uncorrelated with any application
+// series and unmeasurable in-isolate under the workerd clock freeze —
+// platform scheduling/GC tail, the fidelity-ladder's deploy-only class).
+// At bake sample sizes (~1500-2000 turns) a handful of episode-struck
+// turns lands p99 above any sub-second bound regardless of application
+// health, so p99 is bounded by the RPC-timeout ceiling instead — with
+// ZERO tolerance for actual timeouts, which remain an immediate abort.
+// Evidence: notes/2026-07-20-nc8-bake-attempt-1.md.
 const DEFAULT_LIMITS: NetAeLimits = {
   minTurns: 500,
   maxErrorRate: 0.01,
-  maxWallP99Ms: 500,
+  maxWallP95Ms: 750,
+  maxWallP99Ms: 5_000,
   maxQueueP99Ms: 1_000,
   minGatewayShards: 2,
   minElasticGuests: 1
@@ -159,6 +176,7 @@ export function evaluateNetAeReport(report: NetAeReport, limits: Partial<NetAeLi
   const total = number(global, "samples");
   const errors = number(global, "errors");
   const timeouts = number(global, "rpc_timeouts");
+  const wallP95 = number(global, "wall_p95");
   const wallP99 = number(global, "wall_p99");
   const queueP99 = number(global, "queue_p99");
   const gatewayShards = new Set(report.turns.filter((row) => number(row, "samples") > 0).map((row) => String(row.host_key ?? ""))).size;
@@ -173,7 +191,8 @@ export function evaluateNetAeReport(report: NetAeReport, limits: Partial<NetAeLi
     failures.push(`turn error rate ${((errors / total) * 100).toFixed(2)}% exceeds ${(wanted.maxErrorRate * 100).toFixed(2)}%`);
   }
   if (timeouts > 0 || incident("net_rpc") > 0) failures.push(`${Math.max(timeouts, incident("net_rpc"))} RPC timeout(s)`);
-  if (wallP99 > wanted.maxWallP99Ms) failures.push(`global wall p99 ${wallP99}ms exceeds ${wanted.maxWallP99Ms}ms`);
+  if (wallP95 > wanted.maxWallP95Ms) failures.push(`global wall p95 ${wallP95}ms exceeds ${wanted.maxWallP95Ms}ms`);
+  if (wallP99 > wanted.maxWallP99Ms) failures.push(`global wall p99 ${wallP99}ms exceeds ${wanted.maxWallP99Ms}ms (platform-episode ceiling; see DEFAULT_LIMITS)`);
   if (queueP99 > wanted.maxQueueP99Ms) failures.push(`global queue p99 ${queueP99}ms exceeds ${wanted.maxQueueP99Ms}ms`);
   if (gatewayShards < wanted.minGatewayShards) failures.push(`only ${gatewayShards} gateway shard(s) carried turns; need ${wanted.minGatewayShards}`);
   if (incident("net_guest_provisioned") < wanted.minElasticGuests) {
@@ -269,6 +288,7 @@ function numericOption(raw: string | undefined, label: string, minimum: number):
 export function parseNetAeLimits(value: (name: string) => string | undefined): Partial<NetAeLimits> {
   const minTurns = numericOption(value("--min-turns"), "--min-turns", 1);
   const maxErrorRate = numericOption(value("--max-error-rate"), "--max-error-rate", 0);
+  const maxWallP95Ms = numericOption(value("--max-wall-p95-ms"), "--max-wall-p95-ms", 1);
   const maxWallP99Ms = numericOption(value("--max-wall-p99-ms"), "--max-wall-p99-ms", 1);
   const maxQueueP99Ms = numericOption(value("--max-queue-p99-ms"), "--max-queue-p99-ms", 0);
   const minGatewayShards = numericOption(value("--min-gateway-shards"), "--min-gateway-shards", 1);
@@ -276,6 +296,7 @@ export function parseNetAeLimits(value: (name: string) => string | undefined): P
   return {
     ...(minTurns !== undefined ? { minTurns } : {}),
     ...(maxErrorRate !== undefined ? { maxErrorRate } : {}),
+    ...(maxWallP95Ms !== undefined ? { maxWallP95Ms } : {}),
     ...(maxWallP99Ms !== undefined ? { maxWallP99Ms } : {}),
     ...(maxQueueP99Ms !== undefined ? { maxQueueP99Ms } : {}),
     ...(minGatewayShards !== undefined ? { minGatewayShards } : {}),
