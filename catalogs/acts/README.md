@@ -18,4 +18,5 @@ log of schema-validated acts - with work surfaces derived as projection
 folds. Design: `notes/2026-07-21-acts-projection-model.md`; contracts
 and findings: [DESIGN.md](DESIGN.md). Domain classes and concrete projections live
 in consuming catalogs (`casework` is the proof; `outliner` is the first
-real consumer).
+real consumer). Builder's guide:
+[docs/designing/acts-and-projections.md](../../docs/designing/acts-and-projections.md).
