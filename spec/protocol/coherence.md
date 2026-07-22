@@ -35,7 +35,7 @@ client (projection consumer + optimistic echo)
    ▼                                   ▼
 GATEWAY  — session edge: auth, planning, derived cache (incl. the MCP
            tool-surface projection), fanout delivery
-   │ envelope = transcript + read-closure (the only shape; CO7)
+   │ envelope = transcript + attestations + routing metadata (the only shape; CO7)
    ▼
 SCOPE    — the authority: one sequencer per commit scope; validates,
            commits, owns the cells anchored to it; durable outbox;
@@ -383,7 +383,7 @@ divergence. Tail metrics count by code.
 |---|---|---|
 | `E_STALE_HEAD` | submitted `base` is future, hash-mismatched, or too old/unproved for retained-tail rebase (incl. cold/evicted-scope reseed) | refetch head/closure, retry |
 | `E_STALE_EPOCH` | consumer copy stamped with an old `(scope_head, catalog_epoch)` | reseed that copy, retry |
-| `E_MISSING_STATE` | materialization miss under sparse execution (CO2.6) | acquire read-closure transfer, retry |
+| `E_MISSING_STATE` | materialization miss under sparse execution (CO2.6) | acquire the missing cells via lineage-closed transfer, retry |
 | `E_READ_VERSION` | read set conflicts with current authority | re-plan against refreshed cells |
 | `E_SCOPE_SPLIT` | write set spans two distinct shared scopes (CO2.3) | terminal; named limitation until CA10 |
 | `E_CATALOG_MUTATION` | ordinary turn attempted to mutate an installed catalog class definition without advancing the epoch | terminal; publish through the catalog install pipeline |
@@ -403,13 +403,22 @@ trace where repair rounds occurred.
 
 ## CO7. Envelope and transfer discipline
 
-- **One envelope shape.** A commit submission is the transcript plus its
-  **read-closure** — the actor row, session rows, `read_set` cells, write
-  preimages, and their lineage closure. Nothing scope-wide, no authority
-  slices, no execution capsule, no alternate warm/slim modes. Byte
-  ceilings are enforced by construction and by gate: **< 64 KB** warm
-  same-scope, **< 256 KB** cross-scope. `line_map`/debug info never ships
-  in an envelope or transfer; it is fetched on demand.
+- **One envelope shape.** A commit submission is the transcript plus the
+  owner **attestations** for its foreign-anchored reads (CO2.3) and the
+  post-commit routing metadata the scope shell forwards (rider `/adopt`
+  and relation-owner `/relate` destinations, CA3/CO13). No read state
+  ships: the committing scope validates locally-owned read versions
+  against its own authority cells and foreign reads against their
+  owners' attestations, then re-derives post-state by applying the
+  recorded writes — it never re-executes bytecode, so a shipped read
+  closure would buy nothing. Nothing scope-wide, no authority slices,
+  no execution capsule, no alternate warm/slim modes. Byte ceilings are
+  enforced on the **actual serialized submit body**, measured at the
+  gateway immediately before the submit RPC (never on a modeled shape):
+  **< 64 KB** warm same-scope, **< 256 KB** cross-scope; a breach is a
+  misplan bug surfaced as a plain error, not a repairable divergence.
+  `line_map`/debug info never ships in an envelope or transfer; it is
+  fetched on demand.
 - **Lineage closure is part of the transfer type.** A page transfer that
   does not close over `object_lineage` does not serialize (`E_LINEAGE` is
   an assertion, not an operational error). Dangling parent references are

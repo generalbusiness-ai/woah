@@ -59,6 +59,29 @@ export type OperatorDefinitionRepair = {
   removed: string[];
 };
 
+/** CO7/CO10 envelope byte ceilings. Enforced by the gateway on the ACTUAL
+ * serialized submit RPC body ({submit, rider/relation destinations}),
+ * measured immediately before the submit RPC — never on a modeled shape. */
+export const WARM_ENVELOPE_BYTE_LIMIT = 64 * 1024;
+export const CROSS_SCOPE_ENVELOPE_BYTE_LIMIT = 256 * 1024;
+
+/** UTF-8 byte size of a submit RPC body as serialized on the wire. */
+export function submitEnvelopeBytes(body: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(body)).byteLength;
+}
+
+/** CO7 ceiling gate. A breach is a plain Error (misplan bug — the planner
+ * built an envelope the protocol refuses; fix the plan, never raise the
+ * ceiling), not a NetError the repair loop could grind on. */
+export function assertEnvelopeCeiling(envelopeBytes: number, warm: boolean): void {
+  const limit = warm ? WARM_ENVELOPE_BYTE_LIMIT : CROSS_SCOPE_ENVELOPE_BYTE_LIMIT;
+  if (envelopeBytes > limit) {
+    throw new Error(
+      `oversized ${warm ? "warm" : "cross-scope"} envelope: ${envelopeBytes} bytes > ${limit} (misplan bug — shrink the transcript, do not raise the ceiling)`
+    );
+  }
+}
+
 export type CommitSubmit = {
   kind: "woo.net.commit_submit.v1";
   scope: string;

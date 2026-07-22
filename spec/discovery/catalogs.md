@@ -281,9 +281,15 @@ more than one major behind matches no single file; boot then **composes** the
 adjacent per-major-edge migrations into one — a v1 world booting a v3 bundle
 runs v1→v2's steps then v2→v3's as a single composed migration (steps
 concatenated in edge order; §CT14.4 idempotency makes a composed re-run after
-partial failure safe). A major jump with no covering single file or chain is
-reported as a boot event rather than silently schema-syncing the new
-definitions without their data rewrites. Migration manifests are
+partial failure safe). A major jump with no covering single file or chain —
+or a version migration that fails — is reported as a boot event and **blocks
+that catalog**: every later boot repair phase (one-shot boot migrations and
+the drift schema sync) excludes it, so a warn-only boot leaves the catalog's
+recorded version, its old definitions, and its legacy data untouched for
+operator attention instead of schema-syncing the new definitions without
+their data rewrites. The fail-closed install path (the net-install
+activation rule) aborts at this point, before any boot migration or schema
+sync mutates the world. Migration manifests are
 shape-validated (`{from_version, to_version, spec_version, steps}`) at build
 time by the bundled-index generator and the migrations guard, and again at
 module load, so a malformed file fails with the catalog and file named instead

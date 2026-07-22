@@ -5029,3 +5029,123 @@ describe("local catalogs", () => {
 
   });
 });
+
+describe("blocked catalogs: missing major-version migration chain (§CT5.4.1)", () => {
+  // The packaging defect §CT5.4.1 requires boot to report AND block on: a
+  // bundled catalog whose manifest is a major ahead of the installed world
+  // with no covering migration file or composed chain. No real bundled
+  // catalog ships in that state (the migrations guard forbids it), so the
+  // bundled index is swapped for a fixture via vi.doMock — non-hoisted and
+  // scoped to the fresh dynamic imports below; the top-level imports used
+  // by every other test in this file are untouched.
+  //
+  // Fixture: catalog "migfix" bundled at v3.0.0 shipping ONLY the v2→v3
+  // edge; the aged world has migfix installed at v1.0.0 with legacy data.
+  // v1→v3 is a major jump that composeMigrationChain cannot connect.
+  const MIGFIX_V1: RuntimeCatalogManifest = {
+    name: "migfix", version: "1.0.0", spec_version: "v1", license: "MIT", depends: [],
+    classes: [
+      {
+        local_name: "$migfix_thing", parent: "$thing",
+        properties: [{ name: "legacy_text", type: "str", default: "", perms: "rw" }],
+        verbs: [{ name: "legacy_read", perms: "rxd", source: "verb :legacy_read() rxd { return this.legacy_text; }" }]
+      }
+    ]
+  } as unknown as RuntimeCatalogManifest;
+  const MIGFIX_V3: RuntimeCatalogManifest = {
+    name: "migfix", version: "3.0.0", spec_version: "v1", license: "MIT", depends: [],
+    classes: [
+      {
+        local_name: "$migfix_thing", parent: "$thing",
+        // v3 renames the payload property — the major's data rewrite (the
+        // v1→v2 edge this fixture deliberately does NOT ship) would have
+        // moved legacy_text into marker. Schema-syncing v3 without it
+        // would add `marker` while the data stays in the dropped shape.
+        properties: [{ name: "marker", type: "str", default: "v3", perms: "rw" }],
+        verbs: [{ name: "read_marker", perms: "rxd", source: "verb :read_marker() rxd { return this.marker; }" }]
+      }
+    ]
+  } as unknown as RuntimeCatalogManifest;
+
+  /** Fresh module graph with the mocked bundled index, plus the aged world
+   * (migfix @ v1.0.0 with instance data). */
+  async function agedMigfixWorld() {
+    vi.resetModules();
+    vi.doMock("../src/generated/bundled-catalogs", () => ({
+      BUNDLED_CATALOGS: [
+        {
+          path: "catalogs/migfix/manifest.json",
+          manifest: MIGFIX_V3,
+          migrations: [{ from_version: "2.x.x", to_version: "3.0.0", spec_version: "v1", steps: [] }],
+          migration_paths: ["catalogs/migfix/migration-v2-to-v3.json"]
+        }
+      ]
+    }));
+    const bootstrap = await import("../src/core/bootstrap");
+    const installer = await import("../src/core/catalog-installer");
+    const locals = await import("../src/core/local-catalogs");
+    const world = bootstrap.createWorld({ catalogs: false });
+    installer.installCatalogManifest(world, MIGFIX_V1, { tap: "@local", alias: "migfix" });
+    world.createObject({ id: "migfix_inst", name: "inst", parent: "$migfix_thing", owner: "$wiz" });
+    world.setProp("migfix_inst", "legacy_text", "precious");
+    return { world, locals };
+  }
+
+  function migfixVersion(world: { propOrNull(obj: string, name: string): unknown }): string | null {
+    const raw = world.propOrNull("$catalog_registry", "installed_catalogs") as Array<Record<string, unknown>> | null;
+    const record = (raw ?? []).find((item) => item && item.tap === "@local" && (item.alias === "migfix" || item.catalog === "migfix"));
+    return typeof record?.version === "string" ? record.version : null;
+  }
+
+  /** The blocked catalog's version, legacy data AND definitions are all
+   * untouched: no v3 property/verb landed, the v1 surface survives, and no
+   * schema-sync ledger row was recorded for it. */
+  function assertMigfixUntouched(world: Awaited<ReturnType<typeof agedMigfixWorld>>["world"]): void {
+    expect(migfixVersion(world)).toBe("1.0.0");
+    expect(world.propOrNull("migfix_inst", "legacy_text")).toBe("precious");
+    expect(world.object("$migfix_thing").propertyDefs.has("marker")).toBe(false);
+    expect(world.object("$migfix_thing").propertyDefs.has("legacy_text")).toBe(true);
+    expect(world.ownVerbExact("$migfix_thing", "read_marker")).toBeNull();
+    expect(world.ownVerbExact("$migfix_thing", "legacy_read")).not.toBeNull();
+    const applied = (world.propOrNull("$system", "applied_migrations") as string[] | null) ?? [];
+    expect(applied.some((id) => id.startsWith("local-catalog-schema:migfix:"))).toBe(false);
+  }
+
+  it("warn-only boot reports the missing chain and excludes the catalog from migrations + schema sync", async () => {
+    const { world, locals } = await agedMigfixWorld();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      locals.installLocalCatalogs(world, ["migfix"]);
+      // (1) the boot event was emitted, naming the uncovered jump.
+      expect(warn).toHaveBeenCalledWith(
+        "woo.local_catalog_version_migration_missing",
+        { catalog: "migfix", from: "1.0.0", to: "3.0.0" }
+      );
+      // (2)(3) version, legacy data and definitions untouched — the boot
+      // proceeded (warn-only) but every later repair phase skipped migfix.
+      assertMigfixUntouched(world);
+    } finally {
+      warn.mockRestore();
+      vi.doUnmock("../src/generated/bundled-catalogs");
+      vi.resetModules();
+    }
+  });
+
+  it("fail-closed boot aborts BEFORE any schema mutation", async () => {
+    const { world, locals } = await agedMigfixWorld();
+    try {
+      const before = world.exportWorld();
+      // (4) the throw happens at the version-migration phase, before any
+      // boot migration or schema sync runs.
+      expect(() => locals.installLocalCatalogs(world, ["migfix"], { failClosed: true }))
+        .toThrow(/woo\.local_catalog_version_migration_missing/);
+      // Nothing mutated at all — not the catalog, not the migration
+      // ledger: the abort preceded every schema-mutation phase.
+      expect(world.exportWorld()).toEqual(before);
+      assertMigfixUntouched(world);
+    } finally {
+      vi.doUnmock("../src/generated/bundled-catalogs");
+      vi.resetModules();
+    }
+  });
+});

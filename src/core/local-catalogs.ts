@@ -338,9 +338,21 @@ export function installLocalCatalogs(
   // previous major. Without this step, an existing world keeps the old
   // surface (e.g. v0 forecast_hours) but flips its registry to the new
   // version, which is the worst of both worlds.
-  runLocalCatalogVersionMigrations(world, repairNames, report);
-  const covered = runLocalCatalogMigrations(world, repairNames, cleanInstalled);
-  runAutoDetectedLocalCatalogSchemaSync(world, repairNames, covered, report);
+  const blocked = runLocalCatalogVersionMigrations(world, repairNames, report);
+  // Fail-closed (the net-install activation rule): a missing or failed
+  // major-version migration aborts HERE, before any boot migration or
+  // schema sync mutates the world — an install plan must never do schema
+  // work on a world it already knows it cannot migrate.
+  if (failures.length > 0) {
+    throw new Error(`catalog install failed closed: ${JSON.stringify(failures)}`);
+  }
+  // Warn-only boot: blocked catalogs are excluded from every later repair
+  // phase, so their old definitions and data stay untouched for operator
+  // attention (§CT5.4.1) — a schema sync would otherwise install the new
+  // definitions without the major's data rewrites.
+  const repairableNames = blocked.size > 0 ? repairNames.filter((name) => !blocked.has(name)) : repairNames;
+  const covered = runLocalCatalogMigrations(world, repairableNames, cleanInstalled);
+  runAutoDetectedLocalCatalogSchemaSync(world, repairableNames, covered, report);
   if (failures.length > 0) {
     throw new Error(`catalog install failed closed: ${JSON.stringify(failures)}`);
   }
@@ -1417,7 +1429,15 @@ function runNoteTextStringShapeMigration(world: WooWorld, names: readonly string
 // found, or the matching one was already applied, this is a no-op.
 type CatalogInstallFailureReport = (event: string, detail: Record<string, unknown>) => void;
 
-function runLocalCatalogVersionMigrations(world: WooWorld, names: readonly string[], report: CatalogInstallFailureReport): void {
+/** Returns the BLOCKED catalog set: catalogs whose required major-version
+ * migration is missing or failed. A blocked catalog must be excluded from
+ * every later boot repair phase (one-shot boot migrations and the drift
+ * schema sync) — running them anyway would install the new definitions
+ * WITHOUT the major's data rewrites, leaving the worst of both worlds
+ * (spec/discovery/catalogs.md §CT5.4.1). The world keeps its old
+ * definitions, data, and recorded version for operator attention. */
+function runLocalCatalogVersionMigrations(world: WooWorld, names: readonly string[], report: CatalogInstallFailureReport): Set<string> {
+  const blocked = new Set<string>();
   for (const name of names) {
     if (!localCatalogInstalled(world, name)) continue;
     const manifest = LOCAL_CATALOGS.get(name);
@@ -1432,10 +1452,11 @@ function runLocalCatalogVersionMigrations(world: WooWorld, names: readonly strin
       // guard only requires major edges) — the auto schema sync covers it.
       // A MAJOR jump with no covering migration (single or composed chain)
       // is a packaging defect: the world would be schema-synced to the new
-      // definitions WITHOUT its data rewrites. Report it loudly instead of
-      // silently falling through.
+      // definitions WITHOUT its data rewrites. Report it loudly AND block
+      // the catalog from every later repair phase.
       if (majorVersionOf(currentVersion) !== majorVersionOf(manifest.version)) {
         report("woo.local_catalog_version_migration_missing", { catalog: name, from: currentVersion, to: manifest.version });
+        blocked.add(name);
       }
       continue;
     }
@@ -1450,8 +1471,14 @@ function runLocalCatalogVersionMigrations(world: WooWorld, names: readonly strin
       });
     } catch (err) {
       report("woo.local_catalog_version_migration_failed", { catalog: name, from: currentVersion, to: manifest.version, error: err instanceof Error ? err.message : String(err) });
+      // A failed major migration leaves the same hazard as a missing one:
+      // schema-syncing now would flip definitions without the data
+      // rewrites. Block; the migration is idempotent, so the next boot
+      // (or the operator) can re-run it safely.
+      blocked.add(name);
     }
   }
+  return blocked;
 }
 
 function installedLocalCatalogVersion(world: WooWorld, name: string): string | null {

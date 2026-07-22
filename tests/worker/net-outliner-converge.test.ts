@@ -87,8 +87,9 @@ function verbTurn(
   });
 }
 
-// The warm-envelope ceiling the planner enforces (plan.ts
-// WARM_ENVELOPE_BYTE_LIMIT). Mirrored here for the scale gate's assertion.
+// The warm-envelope ceiling the gateway enforces on the actual serialized
+// submit RPC body (scope.ts WARM_ENVELOPE_BYTE_LIMIT). Mirrored here for
+// the scale gate's assertion.
 const WARM_ENVELOPE_BYTE_LIMIT = 64 * 1024;
 
 /** Seed a mutation through the SEQUENCED route (world.call). The act-emitting
@@ -684,6 +685,14 @@ describe("outliner add over the net path converges", () => {
     const undo = await verbTurn(gateway, gatewayEnv, ctx, "undo-restore", "undo", []);
     expect(undo.reply.status, `attempts=${undo.attempt} trace=${JSON.stringify(undo.trace)}`).toBe("accepted");
     expect(undo.attempt, `attempts=${undo.attempt}`).toBeGreaterThan(1); // repair happened
+    // CO7 re-verification: envelopeBytes is now the ACTUAL serialized submit
+    // RPC body (transcript + attestations + routing metadata) measured at the
+    // gateway before the RPC — the deep undo dispatch chain must commit under
+    // the real warm ceiling (the modeled read closure that once tripped it at
+    // ~70.5 KB no longer exists, because no read state ships with a submit).
+    // Measured at 18,855 bytes when this assertion landed.
+    expect(undo.envelopeBytes ?? 0).toBeGreaterThan(0);
+    expect(undo.envelopeBytes ?? 0).toBeLessThanOrEqual(WARM_ENVELOPE_BYTE_LIMIT);
     // _restore_item returns the restored node's (new) id via the undo result.
     const restored = undo.result as string;
     expect(typeof restored).toBe("string");

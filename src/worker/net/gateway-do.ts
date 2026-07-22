@@ -86,7 +86,7 @@ import {
 import { planTurn, type PlanTurnInput, type PlanTurnResult } from "../../net/plan";
 import type { ScopeClassifier } from "../../net/route";
 import { CATALOG_SCOPE, classifierFromLineage, isEpochImmutableDefinition, type AnchorLineage } from "../../net/topology";
-import type { CommitReply, CommitSubmit, RejectReason, ScheduledTurn, ScopeHead } from "../../net/scope";
+import { assertEnvelopeCeiling, submitEnvelopeBytes, type CommitReply, type CommitSubmit, type RejectReason, type ScheduledTurn, type ScopeHead } from "../../net/scope";
 import { netCellKeyFor, type EffectTranscript } from "../../net/transcript";
 import type { CellTransfer } from "../../net/cells";
 import { randomHex } from "../../core/source-hash";
@@ -329,6 +329,8 @@ type SessionOpenRequest = {
 type TurnResult = {
   reply: CommitReply;
   selection: { scope: string; riders: string[] };
+  /** Actual serialized submit RPC body bytes of the settling round,
+   * measured immediately before the submit RPC (CO7). */
   envelopeBytes: number;
   attempt: number;
   trace: AttemptTraceEntry[];
@@ -1284,52 +1286,6 @@ export class NetGatewayDO {
     return request.scopes?.[scope] ?? `scope:${scope}`;
   }
 
-  /**
-   * The catalog scope's lineage keys held by the given store (CO15): the
-   * shared substrate is universally receiver-known in transfers, so the
-   * planner's read closure never reships class chains. An unclassifiable
-   * lineage cell (mid-walk gap during a partial refresh) simply ships —
-   * the known-set is an envelope optimization and must never fail a plan.
-   * Under the legacy override classifier no scope is ever "catalog", so
-   * the set is empty and legacy envelopes are unchanged.
-   *
-   * Called by the planner with the settled PLAN SLICE (blocker #1: the
-   * closure can only reference slice lineage keys, so classifying just
-   * those is equivalent to — and O(view) cheaper than — scanning the
-   * whole resident view per turn).
-   */
-  private catalogKnownKeys(view: CellStore, classifier: ScopeClassifier): Set<string> {
-    const known = new Set<string>();
-    // Objects whose lineage row carries the explicit CO15 marker: their
-    // content is fixed for the catalog epoch, so every scope's KV-seeded
-    // catalog closure already holds it.
-    const immutableDefinitions = new Set<string>();
-    for (const key of view.keys()) {
-      if (!key.startsWith("object_lineage:")) continue;
-      const object = objectOfCellKey(key);
-      try {
-        if (classifier.scopeOf(object) === CATALOG_SCOPE) {
-          known.add(key);
-          if (isEpochImmutableDefinition(view.get(key)?.value)) immutableDefinitions.add(object);
-        }
-      } catch {
-        // Unclosed walk: leave the key out; the cell ships normally.
-      }
-    }
-    // CO15: the catalog closure is receiver-known for class DEFINITIONS —
-    // lineage and verb bytecode — not just lineage. Without this, every
-    // verb a turn dispatches reships its epoch-pinned bytecode in the read
-    // closure; a deep chain (undo → _restore_item → move_item → act →
-    // fold) carries ~45 KB of bytecode and trips the warm-envelope
-    // ceiling. Eligibility uses the explicit epoch_immutable_definition
-    // lineage marker (never inference), per the CO15 mutation rules.
-    for (const key of view.keys()) {
-      if (!key.startsWith("verb_bytecode:")) continue;
-      if (immutableDefinitions.has(objectOfCellKey(key))) known.add(key);
-    }
-    return known;
-  }
-
   private async turnAttempts(request: TurnRequest, trace: AttemptTraceEntry[], structure: TurnStructure): Promise<TurnResult> {
     const startedAt = this.host.now();
     const deadline = startedAt + REPAIR_BUDGET_MS;
@@ -1565,6 +1521,14 @@ export class NetGatewayDO {
         rider_destinations: this.riderDestinationsFor(request, classifier, planned),
         relate_destinations: relateDestinations
       };
+      // CO7: envelope_bytes is the ACTUAL serialized submit RPC body —
+      // transcript, attestations, and rider/relation routing metadata —
+      // measured here, immediately before the RPC (never a modeled
+      // shape; the scope validates versions/attestations and re-applies
+      // recorded writes, so no read state ships). The ceiling gate lives
+      // on the same measurement: a breach is a plain misplan Error.
+      const envelopeBytes = submitEnvelopeBytes(submitBody);
+      assertEnvelopeCeiling(envelopeBytes, targetScope === request.planningScope && planned.selection.riders.length === 0);
       let reply: CommitReply;
       try {
         reply = (await structure.rpc(() => this.host.rpc(destination, "/submit", submitBody), { phase: "submit" })) as CommitReply;
@@ -1634,7 +1598,7 @@ export class NetGatewayDO {
         return {
           reply,
           selection: planned.selection,
-          envelopeBytes: planned.envelopeBytes,
+          envelopeBytes,
           attempt,
           trace,
           ...(replayed
@@ -1650,7 +1614,7 @@ export class NetGatewayDO {
       }
       if (!reply.retryable) {
         // Terminal verdict: surface the scope's reply immediately (CO6).
-        return { reply, selection: planned.selection, envelopeBytes: planned.envelopeBytes, attempt, trace };
+        return { reply, selection: planned.selection, envelopeBytes, attempt, trace };
       }
 
       // ---- Retryable verdict: record the round, run the defined recovery.
@@ -6149,8 +6113,7 @@ export class NetGatewayDO {
 
   /** One planning pass against the current view. The provisional base is
    * patched after the head fetch — `base` is an envelope field, not part
-   * of the transcript hash. Catalog-scope lineage keys ride as the
-   * receiver-known set (CO15: class chains never reship). */
+   * of the transcript hash. */
   private async planOnce(
     request: TurnRequest,
     view: CellStore,
@@ -6174,12 +6137,6 @@ export class NetGatewayDO {
       // Repaired objects ride into the seed slice so a re-plan keeps the
       // cells a prior round pulled (see PlanTurnInput.seedObjects).
       ...(seedObjects && seedObjects.size > 0 ? { seedObjects } : {}),
-      // The callback form runs over the settled plan SLICE, not the whole
-      // view — with slicePlanning below this keeps the entire warm turn
-      // (snapshot clone, scratch, closure, catalog classification) at
-      // O(read-set); load:net-dev asserts both plan_cells and
-      // snapshot_cells stay flat as the view grows (blocker #1).
-      receiverKnown: (planStore) => this.catalogKnownKeys(planStore, classifier),
       // Phase 1: the gateway turn path plans against the read-set SLICE
       // (built from the actor/session/target closure via the view's
       // object/session indexes, slice-cloned per attempt, grown on a

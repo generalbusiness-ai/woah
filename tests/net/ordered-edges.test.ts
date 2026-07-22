@@ -21,9 +21,9 @@ import {
   orderedNeighborsQueryKey,
   readOrderedEdge
 } from "../../src/net/ordered-edges";
-import { planTurn, WARM_ENVELOPE_BYTE_LIMIT } from "../../src/net/plan";
+import { planTurn } from "../../src/net/plan";
 import type { ScopeClassifier } from "../../src/net/route";
-import { ScopeSequencer } from "../../src/net/scope";
+import { ScopeSequencer, submitEnvelopeBytes, WARM_ENVELOPE_BYTE_LIMIT } from "../../src/net/scope";
 import { InMemoryScopeStore } from "../../src/net/scope-store";
 import { propertyCellPayload } from "../../src/net/transcript";
 
@@ -155,9 +155,9 @@ describe("owner-computed ordered-children projection in planning", () => {
     // The verb returned the full ordered projection...
     expect(plan.transcript.result).toHaveLength(120);
     expect(plan.transcript.result).toEqual(rows);
-    // ...as ONE bounded value: the warm envelope stays well under the ceiling
-    // and no per-child edge cell was pulled into the attestable read closure.
-    expect(plan.envelopeBytes).toBeLessThan(WARM_ENVELOPE_BYTE_LIMIT);
+    // ...as ONE bounded value: the actual serialized submit body stays well
+    // under the ceiling and no per-child edge cell entered the read set.
+    expect(submitEnvelopeBytes({ submit: plan.submit, rider_destinations: {}, relate_destinations: {} })).toBeLessThan(WARM_ENVELOPE_BYTE_LIMIT);
     const readsAnyEdgeCell = plan.transcript.reads.some(
       (read) => (read.cell as { name?: unknown }).name === ORDERED_EDGE_PROP
         || (typeof read.cell.object === "string" && read.cell.object.startsWith("item_"))

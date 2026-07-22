@@ -340,7 +340,7 @@ item; what remains is exactly what the workerd lanes cannot prove
   one compact roster value (`POST /net/room-roster`). The gateway fetches that
   value directly before a roster-reading turn and installs it only in the
   ephemeral planning world; no per-occupant actor/session authority cells
-  enter the turn's read closure. This is deliberately computed from the one
+  enter the turn's read set. This is deliberately computed from the one
   relation family rather than persisted as a second roster authority. The
   result is one O(N)-byte RPC and O(1) planning inputs, with no per-occupant
   RPC. Chat's `$room:room_roster` adapts this generic value to the stable

@@ -662,7 +662,7 @@ or repurposed.
 | `doubles[9]` | `attempt` | net turn attempt count |
 | `doubles[10]` | `reconstructions` | net turn authority reconstruction count |
 | `doubles[11]` | `plan_cells` | net planner input cells |
-| `doubles[12]` | `envelope_bytes` | net submitted envelope bytes |
+| `doubles[12]` | `envelope_bytes` | net submit envelope bytes: the actual serialized submit RPC body (transcript + attestations + routing metadata), measured at the gateway immediately before the submit RPC (CO7) |
 | `doubles[13]` | `outbox_enqueued` | authority outbox rows enqueued by a submit |
 | `doubles[14]` | `delivered` | outbox rows delivered by a drain pass |
 | `doubles[15]` | `failed` | outbox rows failed by a drain pass |

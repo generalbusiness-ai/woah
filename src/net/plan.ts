@@ -16,9 +16,12 @@
  * 4. Predict `post_state_version` by running the SAME applyTranscript
  *    the scope runs, against an authority-role scratch copy of the view
  *    (CellStore.scratchAuthorityFrom — planner parity only, discarded).
- * 5. Account the read-closure envelope bytes (CO7 ceilings). A breach is
- *    a plain Error: the planner built an oversized closure — a misplan
- *    bug to fix, not a divergence to repair (never a NetError code).
+ *
+ * Envelope bytes (CO7 ceilings) are NOT accounted here: the committing
+ * scope validates read versions and attestations and never re-executes
+ * bytecode, so no read state ships with a submit. The gateway measures
+ * the ACTUAL serialized submit RPC body and enforces the ceiling
+ * immediately before the RPC (scope.ts assertEnvelopeCeiling).
  *
  * The caller (gateway loop) submits the returned CommitSubmit; a
  * retryable rejection's `mismatched_reads` names exactly the view cells
@@ -33,7 +36,7 @@ import {
   type ShadowTurnCall
 } from "./bridge";
 import type { Principal } from "./attribution";
-import { CellStore, cellKey, cellVersion, serializeTransfer, type Cell, type EpochStamp } from "./cells";
+import { CellStore, cellKey, cellVersion, type Cell, type EpochStamp } from "./cells";
 import type { TraceContext } from "./trace";
 import { isNetError, netError, type NetError } from "./errors";
 import type { OrderedNeighborsQuery, OrderedNeighborsRequest, OrderedProjectionKey } from "./ordered-edges";
@@ -41,10 +44,6 @@ import { selectCommitScope, type ScopeClassifier, type ScopeSelection } from "./
 import type { CommitSubmit, ScopeHead } from "./scope";
 import { sessionWriter } from "./sessions";
 import { applyTranscript, netCellKeyFor, type EffectTranscript, type TranscriptRead, type TranscriptWrite } from "./transcript";
-
-/** CO7/CO10 envelope byte ceilings, enforced at plan time. */
-export const WARM_ENVELOPE_BYTE_LIMIT = 64 * 1024;
-export const CROSS_SCOPE_ENVELOPE_BYTE_LIMIT = 256 * 1024;
 
 export type PlanTurnInput = {
   call: ShadowTurnCall;
@@ -74,26 +73,11 @@ export type PlanTurnInput = {
    * deterministic given the counter). Turns that do not create run fine
    * at the bridge defaults. */
   counters?: SerializedFromCellsOptions;
-  /** Definition keys the receiver universally holds (CO15: the catalog
-   * scope's closure — class lineage AND the verb bytecode of
-   * epoch-immutable definitions — is receiver-known in every transfer;
-   * class chains never reship). The read closure omits these cells and
-   * declares them `assumes_known` instead. `object_lineage:*` keys of
-   * catalog-scope objects and `verb_bytecode:*` keys of
-   * `epoch_immutable_definition` classes belong here; a deep dispatch
-   * chain (undo → _restore_item → move_item → act → fold) would
-   * otherwise ship tens of KB of epoch-pinned bytecode per turn and trip
-   * the warm-envelope ceiling. The function form is invoked with the
-   * PLANNING STORE (the seed slice under slicePlanning) once the run
-   * settles, so a caller can classify just the keys the plan can
-   * actually reference instead of scanning its whole view per turn
-   * (ready-to-scale blocker #1). */
-  receiverKnown?: ReadonlySet<string> | ((planStore: CellStore) => ReadonlySet<string>);
   /** Phase 1 (slice-based planning): when true, the planner runs the VM
    * against the turn's SEED SLICE (actor/session/target + their class
    * chain), slice-cloned per attempt from the live view's indexes and
    * grown on a sparse miss — so the WHOLE warm turn (clone, execution,
-   * rewrite, scratch, closure) costs O(read-set), not O(view) (blocker
+   * rewrite, scratch) costs O(read-set), not O(view) (blocker
    * #1). Genuinely-absent cells still escape as E_MISSING_STATE to the
    * gateway's pull path. Default (absent/false) plans against one full
    * view clone — byte-identical to the pre-slice path, so non-turn
@@ -127,7 +111,7 @@ export type PlanTurnInput = {
   /** Owner-computed ordered-children values (one per container + parent), installed only
    * in the ephemeral execution world for generic ordered_children(parent, container)
    * reads. The ordering analogue of planningRoomRoster; keeps sibling order
-   * off the O(N)-edge-cell read closure. */
+   * out of the O(N)-edge-cell read set. */
   planningOrderedChildren?: readonly { container: string; parent: string | null; scope: string; rows: readonly Record<string, unknown>[]; version: string }[];
   /** Owner-answered bounded neighbour queries (P2.4), installed only in the
    * ephemeral execution world for generic ordered_neighbors(parent, query, container)
@@ -141,20 +125,17 @@ export type PlanTurnInput = {
 export type PlanTurnResult = {
   submit: CommitSubmit;
   selection: ScopeSelection;
-  /** UTF-8 bytes of the full CO7 envelope (transcript + read-closure). */
-  envelopeBytes: number;
   /** The submitted transcript (rewritten reads, commit-scope target). */
   transcript: EffectTranscript;
   /** Phase 0 / CO10: the number of cells fed to `planningWorldFromCells`
    * — the planner's INPUT size, the thing that scales with view size on
    * the current (pre-slice) path and must stay ~read-set once planning is
    * slice-based (the `plan_cells` structural counter). Sourced from the
-   * exact array so it measures the resident-view clone/rebuild CPU, not
-   * the post-hoc read closure. */
+   * exact array so it measures the resident-view clone/rebuild CPU. */
   planCells: number;
   /** Phase 0 (honesty): cells in the fix-6 SNAPSHOT the settled attempt
    * planned against. Under slicePlanning this is the seed SLICE (the
-   * clone, scratch, rewrite and closure all operate on it), so it must
+   * clone, scratch and rewrite all operate on it), so it must
    * stay flat as the view grows — the load gate's blocker-#1 invariant.
    * On the default path it is the full `view.clone()`, O(view). */
   snapshotCells: number;
@@ -166,7 +147,7 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
   // ONE consistent snapshot per planning attempt, taken synchronously
   // (fix 6: the version-laundering window). The cells the ephemeral world
   // executes against, the versions the recorded reads are rewritten with,
-  // the post-state pre-image, and the read-closure bytes must all come
+  // and the post-state pre-image must all come
   // from the same instant: the VM run below yields the event loop, and a
   // concurrent fanout/refresh mutating the live view mid-plan would
   // otherwise stamp the reads with versions the execution never saw —
@@ -177,8 +158,8 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
   // (Phase 1 / ready-to-scale blocker #1) instead clones ONLY the seed
   // slice's keys, re-cloned from the live view at the top of every
   // attempt: each clone is synchronous, so the fix-6 single-instant
-  // property holds for the attempt that settles (its execution, rewrite,
-  // scratch and closure all read the SAME detached slice), while the copy
+  // property holds for the attempt that settles (its execution, rewrite
+  // and scratch all read the SAME detached slice), while the copy
   // cost is O(read-set), never O(view).
   const sliceMode = input.slicePlanning === true;
   const snapshot = sliceMode ? null : view.clone();
@@ -352,22 +333,6 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
   // post-state ever disagrees.
   const applied = applyTranscript(CellStore.scratchAuthorityFrom(planStore), transcript, stamp);
 
-  // The function form classifies just the settled store's lineage keys
-  // (O(slice)) instead of a per-turn whole-view scan (blocker #1).
-  const receiverKnown =
-    typeof input.receiverKnown === "function" ? input.receiverKnown(planStore) : input.receiverKnown ?? new Set<string>();
-  const closure = serializeTransfer(readClosureCells(planStore, transcript, call, receiverKnown), receiverKnown);
-  // The CO7 envelope is the transcript plus its read-closure; measure the
-  // whole shape that would go on the wire.
-  const envelopeBytes = new TextEncoder().encode(JSON.stringify({ transcript, closure })).byteLength;
-  const warm = selection.scope === planningScope && selection.riders.length === 0;
-  const limit = warm ? WARM_ENVELOPE_BYTE_LIMIT : CROSS_SCOPE_ENVELOPE_BYTE_LIMIT;
-  if (envelopeBytes > limit) {
-    throw new Error(
-      `planner built an oversized ${warm ? "warm" : "cross-scope"} envelope: ${envelopeBytes} bytes > ${limit} (misplan bug — shrink the read closure, do not raise the ceiling)`
-    );
-  }
-
   return {
     submit: {
       kind: "woo.net.commit_submit.v1",
@@ -379,7 +344,6 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
       stamp
     },
     selection,
-    envelopeBytes,
     transcript,
     planCells: planInput.length,
     snapshotCells: planStore.size
@@ -485,70 +449,6 @@ function submitTranscript(
     ...(audit?.trace ? { trace: audit.trace } : {})
   };
   return { ...body, hash: cellVersion(body) };
-}
-
-/**
- * The read-closure cell set (CO7): the actor row, the session row, every
- * read-set cell and write preimage present in the view, closed over
- * lineage (each referenced object's `object_lineage` plus its transitive
- * parent chain). Cells absent from the view ship nothing — their
- * absence is already encoded in the transcript's "absent" read versions.
- * Receiver-known lineage keys (CO15: the catalog closure) are walked for
- * their parents but never shipped — that is how class chains stay off
- * the wire. `serializeTransfer` then asserts the closure (E_LINEAGE =
- * planner bug).
- */
-function readClosureCells(
-  view: CellStore,
-  transcript: EffectTranscript,
-  call: ShadowTurnCall,
-  receiverKnown: ReadonlySet<string>
-): Cell[] {
-  const keys = new Set<string>();
-  const objects = new Set<string>();
-  const add = (key: string | null, object?: string): void => {
-    if (object !== undefined) objects.add(object);
-    // Receiver-known definition cells (CO15) never ride the closure —
-    // the transfer declares them `assumes_known` instead. This covers
-    // catalog class lineage AND epoch-immutable verb bytecode; the
-    // transcript still records their read versions, so a stale epoch is
-    // caught by the submit's version/epoch checks, not by reshipping.
-    if (key !== null && view.has(key) && !receiverKnown.has(key)) keys.add(key);
-  };
-
-  for (const read of transcript.reads) add(netCellKeyFor(read.cell), read.cell.object);
-  for (const write of transcript.writes) add(netCellKeyFor(write.cell), write.cell.object);
-  for (const move of transcript.moves) add(cellKey("object_live", move.object), move.object);
-  for (const create of transcript.creates ?? []) {
-    // A create ships no preimage (the object does not exist yet) but its
-    // parent/destination must be resolvable at the receiver.
-    if (create.parent) objects.add(create.parent);
-    if (create.location) objects.add(create.location);
-  }
-  // CO7: the actor row and session rows ride in every envelope.
-  add(cellKey("object_live", call.actor), call.actor);
-  if (call.session) add(cellKey("session", call.session));
-
-  // Lineage closure: walk each referenced object's parent chain through
-  // the view. A parent missing from the view is caught by
-  // serializeTransfer's assert if any of its cells are present.
-  const pending = [...objects];
-  const walked = new Set<string>();
-  while (pending.length > 0) {
-    const object = pending.pop() as string;
-    if (walked.has(object)) continue;
-    walked.add(object);
-    const lineage = view.get(cellKey("object_lineage", object));
-    if (!lineage) continue;
-    // Receiver-known lineage never ships (CO15) but its parent chain is
-    // still walked: a shipped child may hang below a known ancestor whose
-    // OWN parent is not known and must therefore ride.
-    if (!receiverKnown.has(lineage.key)) keys.add(lineage.key);
-    const parent = (lineage.value as { parent?: unknown }).parent;
-    if (typeof parent === "string") pending.push(parent);
-  }
-
-  return [...keys].sort().map((key) => view.get(key) as Cell);
 }
 
 /**
@@ -659,8 +559,8 @@ function collectStrings(value: unknown, out: Set<string>): void {
  * objects; unrelated objects are never referenced, so the slice stays
  * independent of view size — the Phase-0 invariant). A lineage payload's
  * `parent`/`owner` are strings too, so each seeded object's class chain
- * closes transitively here — the read-closure walk and serializeTransfer's
- * dangle assert both depend on that. */
+ * closes transitively here — dispatch through inherited verbs depends on
+ * the whole chain being slice-resident. */
 function expandObjRefs(seed: Set<string>, view: CellStore): void {
   for (;;) {
     const strings = new Set<string>();
@@ -823,7 +723,7 @@ function sparseMissFromRecordedError(transcript: EffectTranscript, view: CellSto
  * lineage+live for unmaterialized subjects; the specific verb page for a
  * verb miss whose object IS materialized (dispatch found the object but
  * not the page — inherited verbs resolve through the class chain, which
- * is receiver-known catalog closure and already in view). */
+ * is already resident in the view). */
 function sparseMissingKeys(
   code: string,
   value: unknown,
