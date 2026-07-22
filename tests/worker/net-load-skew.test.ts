@@ -377,7 +377,10 @@ describe("load:net-skew — skewed-workload bounds (NC8)", () => {
     // Backlog: 40 near-due turns with NO planner-role subscriber — the
     // alarm parks them (rows retained). This is the pathological shape:
     // a scope whose scheduled family is saturated.
-    const due = Date.now() + 20;
+    // Keep every row future-dated while the 40 signed requests are
+    // serialized. A tiny wall-clock margin makes the later requests race
+    // the scheduler's strict `at_logical_time > now` admission boundary.
+    const due = Date.now() + 5_000;
     for (let i = 0; i < 40; i += 1) {
       await call(scopeDO, h.scopeEnv, "/schedule", {
         scope: h.roomScope,
@@ -385,7 +388,9 @@ describe("load:net-skew — skewed-workload bounds (NC8)", () => {
         turn: { id: `skew-sched-${i}`, at_logical_time: due, call: { actor: "#a", target: "#t", verb: "tick", args: [] } } satisfies ScheduledTurn
       });
     }
-    await new Promise((resolve) => setTimeout(resolve, 40));
+    // The fake alarm does not self-fire, so advance the host's observed
+    // clock explicitly instead of sleeping and depending on machine load.
+    vi.spyOn(Date, "now").mockReturnValue(due + 1);
     await scopeDO.alarm();
     await h.settle();
 
