@@ -524,7 +524,7 @@ This is deliberately stricter than the previous "remove unless they have non-cat
 - **Commit signature verification.** GitHub already does this server-side; the runtime can optionally check `gpg`-verified commits via the GitHub API. Deferred.
 - **Decentralized distribution** (IPFS, peer-to-peer). All taps are HTTPS GitHub URLs in v1.
 - **Catalog forking conventions.** Standard GitHub forks work; namespacing fork attribution and version compatibility hasn't been specced.
-- **Authoring → publish loop.** A wizard verb that *exports* the world's local objects into a manifest, ready to commit to a repo. Worth building once the install path is solid; not in v1.
+- **Authoring → publish loop.** A verb that *exports* the world's local objects into a manifest, ready to commit to a repo. Now drafted as its own spec: [export.md](export.md) (EX1–EX10).
 
 ---
 

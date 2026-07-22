@@ -6,6 +6,17 @@ decision". Direction set in review: unify the case object, and promote
 routing/collection — the "gravitational" dynamics of escalation — to a
 first-class design element with explicit split/unwind.*
 
+*Amended 2026-07-21: the mechanics of G3 (rollup) and G4 (queues) are
+now specified by the acts kernel
+(`2026-07-21-acts-projection-model.md`) and cross-room act routing
+(vision note §5.3, the v1.5 milestone). G1 as written below violates
+the kernel's one rule — the TTL'd correlation indexes are
+directly-written coordination state; the corrected design (router as
+an ingress space logging acts, index-as-projection, TTL via view-time
+filtering or sweep acts, case birth via a sequenced `:open` call) is
+in vision §5.3. The unified case model, accretion lifecycle, edge
+taxonomy, and open decisions here remain current.*
+
 ## Why the hybrid was wrong
 
 The `$case_file`/`$case_room` split reproduced, inside one system, exactly

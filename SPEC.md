@@ -111,7 +111,7 @@ Concrete Cloudflare mappings for a v1 deployment target: storage, routing, quota
 
 - [cloudflare.md](spec/reference/cloudflare.md) — host-class mapping, routing, hibernation, Analytics Engine metrics (R10.1), wrangler config incl. the net DO classes + gateway sharding, and deploy procedure (R1–R14)
 - [persistence.md](spec/reference/persistence.md) — per-object SQLite schema, caching (§14, §15)
-- [quotas.md](spec/reference/quotas.md) — QuotaAccountant DO (R5)
+- [quotas.md](spec/reference/quotas.md) — storage accounting as a projection of committed per-owner deltas; sharded by owner, no global enumeration; bounded per-owner reconciliation (R5, **draft**)
 
 ### Operations
 
@@ -139,6 +139,7 @@ Trust and actor-governance contracts for authentication, teams, capabilities, an
 Catalog authoring, installation, and migration behavior across worlds.
 
 - [catalogs.md](spec/discovery/catalogs.md) — GitHub-tap-then-install model; sequenced installs through `$catalog_registry`; per-catalog tool manifests; authority and ownership; migration contract (CT1–CT14)
+- [export.md](spec/discovery/export.md) — the authoring→publish loop: exporting an explicitly named set of owned in-world classes/features as a portable catalog bundle (manifest + README + provenance); closure validation, reference classification, redaction (EX1–EX10, **draft**)
 
 ### Tooling
 
@@ -160,6 +161,7 @@ Normative class designs for bundled-catalog content that ships with this repo. T
 
 - [persistent-conversation.md](spec/catalogs/persistent-conversation.md) — `$conversational` and `$persistent_conversational` as composable current-space chat features; `$chatroom` / `$persistent_chatroom` convenience classes; replay-derived `:history()` and public-only persistent transcripts (PC1–PC15)
 - [channels.md](spec/catalogs/channels.md) — `$channel` hierarchy (`$dm_channel`, `$group_channel`, `$public_channel`); deterministic-corename DM uniqueness; per-member `joined_seq`; one-way promotion (dm → group → public) with sequenced log preserved (CH1–CH14, **draft**)
+- [library.md](spec/catalogs/library.md) — `$library`: in-world discoverability for fertile classes and shareable features; registration, live browse, dangling-entry handling; export roots (LB1–LB8, **draft**)
 
 ### Deferred
 

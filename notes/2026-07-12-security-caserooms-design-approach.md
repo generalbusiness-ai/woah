@@ -5,6 +5,21 @@ task for a security-operations "case workroom" domain on woo — the domain
 model, the sequencing, and the pattern-language extraction — grounded in a
 capability survey of the current substrate and catalogs.*
 
+*Amended 2026-07-21: the mechanics layer is superseded by the acts
+kernel (`2026-07-21-acts-projection-model.md`) and its companion
+(`2026-07-21-acts-composition-vision.md`). Specifically: queues/rollup
+now run on acts + projections; the Phase 2/3 "zero core changes" claim
+is stale (the kernel closes two narrow generic read gaps — the
+already-specified `event_schema` builtin and the persisted timestamp
+on `$space:replay()` results); the Phase 3 slice
+narrows to **single-room scope for v1** (case + board + journal +
+adversarial lane), with router, queue projections, rollup, and cluster
+mechanics at the named v1.5 milestone (vision §5.3); the provenance
+strategy's E4/E5 obligations are seated in the v1 proof (kernel §2.5,
+gate 9); patterns 24–30 extend the seed list (vision §5.8). The domain
+model, archetypes, roles, gap dispositions, and anti-goals here remain
+current.*
+
 ## The problem, restated
 
 Security teams coordinate resolution work across tools that each get half the

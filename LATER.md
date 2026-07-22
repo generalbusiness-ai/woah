@@ -7,17 +7,9 @@ New items go at the top.  Move to the bottom when final.
 
 ## random stuff to do
 
-- pre-Net stack retirement, in order (see
-  `notes/2026-07-17-pre-net-stack-retirement-plan.md`)
-  - replace the classic-only `npm run dev` and `npm run mcp:stdio` compositions
-    with interactive Net hosts, make those the defaults, and retain any classic
-    command only as an explicitly named rollback tool until NC9
-  - classify and re-home transport tests before deleting v2 classes: preserve
-    shared `src/core`/World/VM coverage, port distinct persistence/session/
-    cross-scope/browser-local guarantees to Net, and delete only proven
-    duplicate classic assertions
+- DSL syntax: json-wrapped is terrible for editors
 
-- single audit/observability infrastructure for all world operations
+- "blob" type? backed by DO storage ofc
 
 - DO stuff
   - Constructor DDL on every cold start. CommitScopeDO executes 17 CREATE TABLE IF NOT EXISTS statements synchronously in its constructor (commit-scope-do.ts:219-263); NetScopeDO
@@ -236,3 +228,5 @@ Done:
 . docs rewrite for clarity
 . chat resize-bar stopped working
 . woah
+. pre-Net stack retirement
+. audit/observability infrastructure

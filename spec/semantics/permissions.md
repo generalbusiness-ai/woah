@@ -82,8 +82,8 @@ Each object owns durable state (its persistent storage footprint plus any forked
 | Storage bytes per owner | 100 MiB | Eventually consistent. |
 | Active parked tasks per owner | 10000 | At `FORK`/`SUSPEND` time, against owner's running counter. Real-time. |
 
-Storage accounting is **eventually consistent**: a periodic accounting job sums each owner's footprint and writes it back to a per-owner record, which `create()` and large `SET_PROP` calls consult. A burst write can briefly exceed quota before accounting catches up. Strict real-time accounting would require a central allocator and contradict the decentralized minting story ([objects.md §5.5](objects.md#55-id-allocation)).
+Storage accounting is **eventually consistent**: committed writes are charged as per-owner storage deltas delivered asynchronously to a per-owner record, which admission consults. Charging is generic over committed growth — any operation that enlarges durable state is charged, not just `create()` and large `SET_PROP`. A burst write can briefly exceed quota before deltas land and the cached standing refreshes. Strict real-time accounting would require a central allocator and contradict the decentralized minting story ([objects.md §5.5](objects.md#55-id-allocation)).
 
 Wizards override per-owner quotas with `set_quota(owner, kind, value)`. Quota changes are logged (deferred wizard audit, see [LATER.md](../../LATER.md)).
 
-The v1 implementation of accounting (a `QuotaAccountant` singleton DO running daily passes) is in [../reference/quotas.md](../reference/quotas.md).
+The v1 implementation of accounting (per-owner delta rows fed from effect transcripts, sharded by owner with no global enumeration) is in [../reference/quotas.md](../reference/quotas.md).
