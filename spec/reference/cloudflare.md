@@ -686,13 +686,21 @@ lifetime when its sequencer rebuilds from durable storage. `ms` also rides
 the authority-side service time. Drain passes additionally split their
 total: `rpc_ms` (double6) is the wall time of the delivery phase — RPC
 awaits plus per-row bookkeeping, so an upper bound on interleavable time,
-not a pure await span — and `sql_ms` (console event only) is the measured
-synchronous storage work: the direct submit-blocking signal. A latency
-episode is therefore attributable by joining the stall window against
-these series: a coincident `do_constructor`/`net_scope_hydrated` means
-eviction churn, a slow `closure_served` or high drain `sql_ms` means
-serving occupancy, and none of them means the stall is upstream of the
-authority. A `net_scope_drain_yield` event marks a drain giving way to an
+not a pure await span — and `sql_ms` (console event only) covers the
+synchronous storage segments. CLOCK-FREEZE CAVEAT (learned from the
+2026-07-22 drive): workerd freezes `Date.now()` within synchronous
+execution (Spectre mitigation; the clock advances only at await points),
+so on the DEPLOYED runtime any purely synchronous span — `sql_ms`, the
+fanout receive `ms`, a sync `closure_served` — structurally reads ZERO.
+These fields carry real values only on the Node test lanes. On workerd,
+synchronous occupancy must be inferred from its EFFECTS: wall time
+measured across awaits by the peer (turn `rpc_max_ms` vs the handler's
+own stamp), gateway lane `queue_ms`, and event counts/sizes (`rows` per
+receive). A latency episode is attributable by joining the stall window
+against these series: a coincident `do_constructor`/`net_scope_hydrated`
+means eviction churn, dense drain passes or large `rows` receives at the
+window mean serving occupancy, and none of them means the stall is
+upstream of the authority. A `net_scope_drain_yield` event marks a drain giving way to an
 in-flight submit (the CO2.7 submit-priority rule); `phase: "lane"` marks a
 yield inside a lane quantum rather than between route passes.
 `net_gateway_fanout_applied {scope, rows, applied, status, ms}` is the
