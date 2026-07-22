@@ -845,7 +845,26 @@ export class NetGatewayDO {
         const body = (await request.json()) as FanoutBody | { kind: "woo.net.fanout_batch.v1"; rows: FanoutBody[] };
         const rows = "rows" in body && Array.isArray(body.rows) ? body.rows : [body as FanoutBody];
         const applied: boolean[] = [];
-        for (const row of rows) applied.push(this.receiveFanout(row));
+        try {
+          for (const row of rows) applied.push(this.receiveFanout(row));
+        } catch (err) {
+          // Review P2 — one event per inbound request even on failure:
+          // emitting only from the success path made slow FAILED requests
+          // invisible, biasing the occupancy series toward survivors.
+          // `applied` counts the rows durably advanced before the throw
+          // (the sender retries the whole prefix; the seq gate no-ops
+          // them). status:"error" also exempts the event from sampling.
+          this.metric({
+            kind: "net_gateway_fanout_applied",
+            scope: rows[0]?.scope ?? "",
+            rows: rows.length,
+            applied: applied.filter(Boolean).length,
+            status: "error",
+            error: String(err),
+            ms: Date.now() - receiveStarted
+          });
+          throw err;
+        }
         // Receive-side occupancy (the uninstrumented segment the
         // 2026-07-22 bake attribution pointed at): ms spans mirror
         // writes, relation deltas, presence scans, and WS pushes for the
@@ -855,6 +874,7 @@ export class NetGatewayDO {
           scope: rows[0]?.scope ?? "",
           rows: rows.length,
           applied: applied.filter(Boolean).length,
+          status: "ok",
           ms: Date.now() - receiveStarted
         });
         return json({ applied: rows.length === 1 ? applied[0] : applied });

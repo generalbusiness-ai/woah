@@ -235,6 +235,31 @@ describe("lane-batched /net/fanout receive (2026-07-22 gateway occupancy)", () =
     for (const s of stamps) expect(typeof s.ms).toBe("number");
     gatewayState.close();
   });
+
+  it("a partially applied batch still stamps ONE receive event with status/error and the applied count", async () => {
+    const metricLines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+      metricLines.push(args.map(String).join(" "));
+    });
+    const gatewayState = netState("gateway-batch-partial");
+    const gatewayEnv: NetGatewayEnv = { WOO_INTERNAL_SECRET: SECRET };
+    const gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
+    const good = { scope: ROOM_SCOPE, seq: 1, delivery_seq: 1, cells: [], observations: [] };
+    // Row 2's null cell throws inside receiveFanout AFTER row 1 durably
+    // advanced — the survivorship-bias case the review reproduced.
+    const poison = { scope: ROOM_SCOPE, seq: 2, delivery_seq: 2, cells: [null], observations: [] };
+    await expect(
+      call(gateway, gatewayEnv, "/fanout", { kind: "woo.net.fanout_batch.v1", rows: [good, poison] })
+    ).rejects.toThrow();
+    const stamps = metricLines
+      .filter((line) => line.includes("net_gateway_fanout_applied"))
+      .map((line) => JSON.parse(line.slice(line.indexOf("{"))) as Record<string, unknown>);
+    expect(stamps).toHaveLength(1);
+    expect(stamps[0]).toMatchObject({ rows: 2, applied: 1, status: "error" });
+    expect(typeof stamps[0]!.ms).toBe("number");
+    expect(String(stamps[0]!.error).length).toBeGreaterThan(0);
+    gatewayState.close();
+  });
 });
 
 describe("CO13 relations over the DO shells", () => {

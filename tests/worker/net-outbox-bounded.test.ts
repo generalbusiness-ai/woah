@@ -431,6 +431,47 @@ describe("Phase 3 — bounded outbox drain", () => {
     scope.close();
   });
 
+  it("an old receiver that refuses the batch envelope still gets every row via the bare-row fallback (rollout compatibility)", async () => {
+    const metricLines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+      metricLines.push(args.map(String).join(" "));
+    });
+    // Pre-batch receiver: parses the body as ONE FanoutBody and refuses
+    // the envelope (no cells array at the top level), but accepts bare
+    // rows — exactly the old code a new caller reaches for
+    // seconds-to-minutes during a Cloudflare code update.
+    const received: unknown[] = [];
+    const oldReceiver = {
+      stub: {
+        fetch: async (request: Request) => {
+          const body = (await request.json()) as { rows?: unknown; cells?: unknown };
+          if (body.rows !== undefined || body.cells === undefined) {
+            return new Response("cannot read cells of undefined", { status: 500 });
+          }
+          received.push(body);
+          return new Response(JSON.stringify({ applied: true }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+      }
+    };
+    const scope = netState("bounded-old-receiver");
+    const env: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: () => oldReceiver.stub };
+    const scopeDO = new NetScopeDO(scope.state, env);
+    for (let seq = 1; seq <= 3; seq += 1) insertRow(scope.state, "gateway:old", seq);
+
+    await kick(scopeDO, env);
+    await scope.settle();
+
+    // Every row landed bare, in order, within ONE drain (no abandonment
+    // window): batch adoption never turns a deliverable row into an
+    // abandoned one.
+    expect(received.map((b) => (b as { seq: number }).seq)).toEqual([1, 2, 3]);
+    expect(pendingRows(scope.state)).toEqual([]);
+    const fallbacks = metricsOfKind(metricLines, "net_scope_fanout_batch_fallback");
+    expect(fallbacks).toHaveLength(1);
+    expect(fallbacks[0]!.rows).toBe(3);
+    scope.close();
+  });
+
   it("a row enqueued into a lane during the delivery await survives the prune and is delivered (at-least-once)", async () => {
     const gated = gatedStub();
     const scope = netState("bounded-concurrent-enqueue");
@@ -570,12 +611,21 @@ describe("Phase 3 — bounded outbox drain", () => {
     // quantum: cap rows in one request — shared fate on failure), exactly
     // once this drain; CO2.7 holds (nothing beyond the prefix delivered)
     // and the 76 unselected rows were never rewritten (attempts stay 0).
-    expect(down.received).toHaveLength(1);
-    expect(fanoutRows(down.received).map((b) => b.seq)).toEqual([1, 2, 3, 4]);
+    // A failed batch costs exactly ONE extra bare-row probe (the rollout
+    // fallback halting on its first failure) — two requests total.
+    expect(down.received).toHaveLength(2);
+    expect(fanoutRows([down.received[0]]).map((b) => b.seq)).toEqual([1, 2, 3, 4]); // the envelope
+    expect((down.received[1] as { seq: number }).seq).toBe(1); // the bare fallback head
     const stuck = pendingRows(scope.state).filter((row) => row.destination === "gateway:down");
     expect(stuck).toHaveLength(80);
     expect(stuck.filter((row) => row.attempts > 0)).toHaveLength(4);
     expect(stuck[0].attempts).toBe(1); // head, seq 1
+    // Review P2: batched failures carry the REAL rpc error on every failed
+    // row's metric — never "unknown" (the bare-row fallback rethrow path
+    // captures it for the whole prefix).
+    const failures = metricsOfKind(metricLines, "net_scope_outbox_delivery_failed");
+    expect(failures.length).toBeGreaterThanOrEqual(4);
+    for (const failure of failures) expect(String(failure.error)).toContain("500");
     // The drain terminated (this line being reached proves no fresh-row
     // spin) and armed the retry alarm at the HEAD's due-time: strictly
     // after the attempt, i.e. a real backoff window — never "now" derived
