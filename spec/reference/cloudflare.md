@@ -695,6 +695,11 @@ serving occupancy, and none of them means the stall is upstream of the
 authority. A `net_scope_drain_yield` event marks a drain giving way to an
 in-flight submit (the CO2.7 submit-priority rule); `phase: "lane"` marks a
 yield inside a lane quantum rather than between route passes.
+`net_gateway_fanout_applied {scope, rows, applied, ms}` is the RECEIVE-side
+twin: one event per inbound `/net/fanout` request (single row or lane
+batch), `ms` spanning mirror writes, relation deltas, presence scans, and
+WS pushes — the gateway-occupancy segment the 2026-07-22 bake attribution
+identified as the residual turn-tail driver; `rows` rides the count slot.
 
 `authority_slice_reconstructed` partitions the authority-slice cost that used to
 appear as opaque `/mcp` wall time. Its `reason` value is written to `blobs[15]`

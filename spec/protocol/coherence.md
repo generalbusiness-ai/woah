@@ -217,6 +217,11 @@ concurrently, while rows within each destination remain strictly serial in
 `delivery_seq` order (which also preserves their authority enqueue order).
 A slow or backing-off subscriber cannot add its
 delivery latency to healthy subscribers' lanes.
+A lane MAY deliver its due prefix as one batched request (the receiver
+applies rows serially in array order — a single request is a single event,
+so the ordering guarantee only strengthens); the batch outcome is
+prefix-atomic, and the receiver's per-scope seq gate makes any redelivered
+row a no-op, so retrying a failed batch whole is safe.
 
 Commits outrank delivery on the authority's thread: a drain invocation that
 finds a `/submit` executing on the same scope MUST yield between route

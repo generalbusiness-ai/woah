@@ -164,7 +164,8 @@ export class Outbox {
   async drain(
     now: number,
     deliver: (row: FanoutRow) => Promise<void>,
-    shouldYield?: () => boolean
+    shouldYield?: () => boolean,
+    deliverLane?: (destination: string, rows: FanoutRow[]) => Promise<void>
   ): Promise<DrainResult> {
     const lanes = new Map<string, FanoutRow[]>();
     for (const row of this.pending()) {
@@ -176,6 +177,51 @@ export class Outbox {
     const drainLane = async (lane: FanoutRow[]): Promise<DrainResult> => {
       const result: DrainResult = { delivered: [], failed: [], abandoned: [], skipped_backoff: [] };
       lane.sort((a, b) => a.body.scope.localeCompare(b.body.scope) || a.body.seq - b.body.seq);
+      // Batched lane delivery: ONE call carries the lane's deliverable
+      // prefix (halting at a backoff head or a yield exactly like the
+      // per-row loop — never skip-ahead, CO2.7). Order is preserved
+      // trivially — the prefix rides a single request and the receiver
+      // applies it serially. Outcome is prefix-atomic: success delivers
+      // every row; a throw counts one attempt against every row (a batch
+      // failure is destination-level — network, 5xx — and the receiver's
+      // per-scope seq gate makes redelivered rows no-op, so retrying the
+      // whole prefix is safe).
+      if (deliverLane) {
+        if (shouldYield?.()) {
+          yielded = true;
+          return result;
+        }
+        const prefix: FanoutRow[] = [];
+        for (const row of lane) {
+          if (row.last_attempt_at_ms !== null && now < row.last_attempt_at_ms + this.backoffMs(row.attempts, row.id)) {
+            result.skipped_backoff.push(row.id);
+            break; // preserve order: nothing later in this lane may jump the queue
+          }
+          prefix.push(row);
+        }
+        if (prefix.length === 0) return result;
+        for (const row of prefix) {
+          row.attempts += 1;
+          row.last_attempt_at_ms = now;
+        }
+        try {
+          await deliverLane(prefix[0]!.destination, prefix);
+          for (const row of prefix) {
+            row.status = "delivered";
+            result.delivered.push(row.id);
+          }
+        } catch {
+          for (const row of prefix) {
+            if (row.attempts >= this.maxAttempts) {
+              row.status = "abandoned";
+              result.abandoned.push(row.id);
+            } else {
+              result.failed.push(row.id);
+            }
+          }
+        }
+        return result;
+      }
       for (const row of lane) {
         if (shouldYield?.()) {
           yielded = true;

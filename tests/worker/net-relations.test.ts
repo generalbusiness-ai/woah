@@ -6,7 +6,7 @@
 // to its subscriber gateway, whose GET /net/relation serves the roster.
 // Local deltas ride the commit's own FanoutBody.relations. Fake-DO lane
 // with real per-instance SQLite, mirroring net-scope-fanout.test.ts.
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { FakeDurableObjectState } from "./fake-do";
 import { NetGatewayDO, type NetGatewayDurableState, type NetGatewayEnv } from "../../src/worker/net/gateway-do";
 import { NetScopeDO, type NetScopeDurableState, type NetScopeEnv } from "../../src/worker/net/scope-do";
@@ -185,6 +185,57 @@ function scopeRelationRows(state: NetScopeDurableState): Array<{ key: string }> 
 }
 
 type RelationRead = { relation: string; owner: string; members: Array<{ member: string; body?: unknown }> };
+
+describe("lane-batched /net/fanout receive (2026-07-22 gateway occupancy)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("applies batch rows serially with the seq gate and stamps net_gateway_fanout_applied", async () => {
+    const metricLines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+      metricLines.push(args.map(String).join(" "));
+    });
+    const gatewayState = netState("gateway-batch-receive");
+    const gatewayEnv: NetGatewayEnv = { WOO_INTERNAL_SECRET: SECRET };
+    const gateway = new NetGatewayDO(gatewayState.state, gatewayEnv);
+    const row = (seq: number) => ({
+      scope: ROOM_SCOPE,
+      seq,
+      delivery_seq: seq,
+      cells: [],
+      observations: []
+    });
+    // Batch of two: both advance the per-scope seq gate, in order.
+    const first = await call<{ applied: boolean[] }>(gateway, gatewayEnv, "/fanout", {
+      kind: "woo.net.fanout_batch.v1",
+      rows: [row(1), row(2)]
+    });
+    expect(first.applied).toEqual([true, true]);
+    // Redelivered batch: the seq gate no-ops every row (CO2.5) — the
+    // retry-whole-prefix contract the sender relies on.
+    const replay = await call<{ applied: boolean[] }>(gateway, gatewayEnv, "/fanout", {
+      kind: "woo.net.fanout_batch.v1",
+      rows: [row(1), row(2)]
+    });
+    expect(replay.applied).toEqual([false, false]);
+    // A bare single body keeps the pre-batch wire shape and reply.
+    const single = await call<{ applied: boolean }>(gateway, gatewayEnv, "/fanout", row(3));
+    expect(single.applied).toBe(true);
+    // Receive-side occupancy stamp: one event per request with the row
+    // count on it (batch, replay, single).
+    const stamps = metricLines
+      .filter((line) => line.includes("net_gateway_fanout_applied"))
+      .map((line) => JSON.parse(line.slice(line.indexOf("{"))) as { rows: number; applied: number; ms: number });
+    expect(stamps.map((s) => ({ rows: s.rows, applied: s.applied }))).toEqual([
+      { rows: 2, applied: 2 },
+      { rows: 2, applied: 0 },
+      { rows: 1, applied: 1 }
+    ]);
+    for (const s of stamps) expect(typeof s.ms).toBe("number");
+    gatewayState.close();
+  });
+});
 
 describe("CO13 relations over the DO shells", () => {
   it("a cross-scope move delivers /net/relate to the owner, which applies and refans to its subscriber gateway; redelivery no-ops", async () => {

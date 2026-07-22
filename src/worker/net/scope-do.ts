@@ -2510,7 +2510,25 @@ export class NetScopeDO {
           // a lane of slow deliveries pins the drain for rows × RPC-timeout
           // after a commit has arrived. Halted rows are untouched (pending,
           // no attempt) and the retry alarm resumes them.
-          () => this.submitsInFlight > 0
+          () => this.submitsInFlight > 0,
+          // Lane-batched /fanout (2026-07-22 bake finding: the tail lives in
+          // gateway /fanout receive processing, one request per row): the
+          // lane's deliverable prefix rides ONE request. The batch body is
+          // spliced from the stored row TEXTs — still zero parse/stringify.
+          // A single row keeps the bare-body wire shape. Rollout skew is
+          // self-healing: an old receiver rejects the batch envelope, the
+          // rows retry on lane backoff, and the post-rollout receiver
+          // accepts them.
+          route === "/fanout"
+            ? async (destination, batch) => {
+                if (batch.length === 1) {
+                  await this.host.rpc(destination, "/fanout", undefined, rawBodies.get(batch[0]!.id));
+                  return;
+                }
+                const rows = batch.map((row) => rawBodies.get(row.id)).join(",");
+                await this.host.rpc(destination, "/fanout", undefined, `{"kind":"woo.net.fanout_batch.v1","rows":[${rows}]}`);
+              }
+            : undefined
         );
         const rpcMs = Date.now() - rpcStarted;
         if (drained.yielded) {

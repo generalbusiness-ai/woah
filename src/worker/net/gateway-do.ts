@@ -834,8 +834,30 @@ export class NetGatewayDO {
     }
     try {
       if (request.method === "POST" && url.pathname === "/net/fanout") {
-        const body = (await request.json()) as FanoutBody;
-        return json({ applied: this.receiveFanout(body) });
+        // Single body or the lane batch envelope (one request per lane
+        // per drain pass — the 2026-07-22 receive-side batching). Rows
+        // apply serially in array order, which IS the lane's
+        // delivery_seq order (CO2.7): one request is one event, so
+        // cross-row ordering cannot even race. The per-scope seq gate
+        // makes any redelivered row a no-op, so a crash mid-batch costs
+        // one redelivery, never a double apply.
+        const receiveStarted = Date.now();
+        const body = (await request.json()) as FanoutBody | { kind: "woo.net.fanout_batch.v1"; rows: FanoutBody[] };
+        const rows = "rows" in body && Array.isArray(body.rows) ? body.rows : [body as FanoutBody];
+        const applied: boolean[] = [];
+        for (const row of rows) applied.push(this.receiveFanout(row));
+        // Receive-side occupancy (the uninstrumented segment the
+        // 2026-07-22 bake attribution pointed at): ms spans mirror
+        // writes, relation deltas, presence scans, and WS pushes for the
+        // whole request.
+        this.metric({
+          kind: "net_gateway_fanout_applied",
+          scope: rows[0]?.scope ?? "",
+          rows: rows.length,
+          applied: applied.filter(Boolean).length,
+          ms: Date.now() - receiveStarted
+        });
+        return json({ applied: rows.length === 1 ? applied[0] : applied });
       }
       if (request.method === "POST" && url.pathname === "/net/pull") {
         const body = (await request.json()) as { scope: string; destination: string; known?: string[] };

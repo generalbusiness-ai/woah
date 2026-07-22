@@ -144,10 +144,11 @@ function downStub(): { stub: NetStub; received: unknown[] } {
 /** Insert a pending /fanout row the way persistOutboxRow does (the tests
  * build backlogs directly — driving 100 committed turns through the
  * sequencer would test the sequencer, not the drain). */
-function insertRow(state: NetScopeDurableState, destination: string, seq: number): void {
+function insertRow(state: NetScopeDurableState, destination: string, seq: number, route = "/fanout"): void {
   const body = JSON.stringify({ scope: SCOPE, seq, cells: [], observations: [] });
   state.storage.sql.exec(
-    "INSERT INTO net_scope_outbox (route, id, destination, body, status, attempts, last_attempt_at_ms, scope, seq, next_attempt_at_ms) VALUES ('/fanout', ?, ?, ?, 'pending', 0, NULL, ?, ?, 0)",
+    "INSERT INTO net_scope_outbox (route, id, destination, body, status, attempts, last_attempt_at_ms, scope, seq, next_attempt_at_ms) VALUES (?, ?, ?, ?, 'pending', 0, NULL, ?, ?, 0)",
+    route,
     `${destination}/${SCOPE}/${seq}`,
     destination,
     body,
@@ -155,9 +156,19 @@ function insertRow(state: NetScopeDurableState, destination: string, seq: number
     seq
   );
   state.storage.sql.exec(
-    "INSERT OR IGNORE INTO net_scope_outbox_lane (route, destination) VALUES ('/fanout', ?)",
+    "INSERT OR IGNORE INTO net_scope_outbox_lane (route, destination) VALUES (?, ?)",
+    route,
     destination
   );
+}
+
+/** Flatten received /fanout wire bodies: a lane batch envelope carries its
+ * rows in delivery order; a bare body is one row. */
+function fanoutRows(received: unknown[]): Array<{ seq: number }> {
+  return received.flatMap((body) => {
+    const b = body as { rows?: Array<{ seq: number }> } & { seq: number };
+    return Array.isArray(b.rows) ? b.rows : [b];
+  });
 }
 
 function pendingRows(state: NetScopeDurableState): Array<{ destination: string; seq: number; attempts: number }> {
@@ -247,9 +258,12 @@ describe("Phase 3 — bounded outbox drain", () => {
     }
 
     // Everything delivered, in seq order, via multiple bounded passes.
+    // Each pass ships the lane's 4-row prefix as ONE batch request
+    // (2026-07-22 receive-side batching), so the request count is
+    // BACKLOG / 4 while the flattened rows preserve exact order.
     expect(pendingRows(scope.state)).toEqual([]);
-    expect(healthy.received).toHaveLength(BACKLOG);
-    expect((healthy.received as Array<{ seq: number }>).map((b) => b.seq)).toEqual(
+    expect(healthy.received).toHaveLength(BACKLOG / 4);
+    expect(fanoutRows(healthy.received).map((b) => b.seq)).toEqual(
       Array.from({ length: BACKLOG }, (_, i) => i + 1)
     );
     const passes = drainPassMetrics(metricLines);
@@ -380,6 +394,43 @@ describe("Phase 3 — bounded outbox drain", () => {
     scope.close();
   });
 
+  it("a multi-row lane delivers as ONE batch request with byte-faithful rows in delivery order", async () => {
+    const healthy = okStub();
+    const scope = netState("bounded-batch-wire");
+    const env: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: () => healthy.stub };
+    const scopeDO = new NetScopeDO(scope.state, env);
+    // Distinct payloads so byte fidelity is provable through the raw
+    // text splice (fields the drain itself never reads).
+    const bodies = [1, 2, 3].map((seq) => ({
+      scope: SCOPE,
+      seq,
+      cells: [],
+      observations: [{ type: "said", text: `batch ✓ ${seq}` }],
+      delivery_seq: seq
+    }));
+    for (const body of bodies) {
+      scope.state.storage.sql.exec(
+        "INSERT INTO net_scope_outbox (route, id, destination, body, status, attempts, last_attempt_at_ms, scope, seq, next_attempt_at_ms) VALUES ('/fanout', ?, ?, ?, 'pending', 0, NULL, ?, ?, 0)",
+        `gateway:mirror/${SCOPE}/${body.seq}`,
+        "gateway:mirror",
+        JSON.stringify(body),
+        SCOPE,
+        body.seq
+      );
+    }
+    scope.state.storage.sql.exec(
+      "INSERT OR IGNORE INTO net_scope_outbox_lane (route, destination) VALUES ('/fanout', ?)",
+      "gateway:mirror"
+    );
+    await kick(scopeDO, env);
+    await scope.settle();
+
+    expect(healthy.received).toHaveLength(1);
+    expect(healthy.received[0]).toEqual({ kind: "woo.net.fanout_batch.v1", rows: bodies });
+    expect(pendingRows(scope.state)).toEqual([]);
+    scope.close();
+  });
+
   it("a row enqueued into a lane during the delivery await survives the prune and is delivered (at-least-once)", async () => {
     const gated = gatedStub();
     const scope = netState("bounded-concurrent-enqueue");
@@ -414,7 +465,7 @@ describe("Phase 3 — bounded outbox drain", () => {
     scope.close();
   });
 
-  it("a submit arriving during a lane's delivery await halts the quantum between rows", async () => {
+  it("a submit arriving during a per-row lane's delivery await halts the quantum between rows (/relate keeps the row loop)", async () => {
     const metricLines: string[] = [];
     vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
       metricLines.push(args.map(String).join(" "));
@@ -423,7 +474,9 @@ describe("Phase 3 — bounded outbox drain", () => {
     const scope = netState("bounded-midlane-yield");
     const env: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET, NET_RESOLVE: () => gated.stub };
     const scopeDO = new NetScopeDO(scope.state, env);
-    for (let seq = 1; seq <= 3; seq += 1) insertRow(scope.state, "gateway:mirror", seq);
+    // /relate keeps the per-row delivery loop (only /fanout lane-batches),
+    // so the between-rows yield contract is proven here.
+    for (let seq = 1; seq <= 3; seq += 1) insertRow(scope.state, "scope:room-owner", seq, "/relate");
 
     // Row 1's delivery is in flight when the submit arrives. The lane must
     // finish that row (it was already attempted) and then stop — rows 2-3
@@ -467,7 +520,8 @@ describe("Phase 3 — bounded outbox drain", () => {
     const before = Date.now();
     await kick(scopeDO, env);
     await scope.settle();
-    expect(healthy.received).toHaveLength(4); // exactly the budget
+    // Exactly the budget: 4 rows, riding one lane-batch request.
+    expect(fanoutRows(healthy.received)).toHaveLength(4);
     expect(pendingRows(scope.state)).toHaveLength(BACKLOG - 4);
     // The continuation: the retry alarm armed at ~now (due work remains).
     const armed = scope.alarms.filter((at): at is number => at !== null);
@@ -482,7 +536,7 @@ describe("Phase 3 — bounded outbox drain", () => {
       await scope.settle();
     }
     expect(pendingRows(scope.state)).toEqual([]);
-    expect((healthy.received as Array<{ seq: number }>).map((b) => b.seq)).toEqual(
+    expect(fanoutRows(healthy.received).map((b) => b.seq)).toEqual(
       Array.from({ length: BACKLOG }, (_, i) => i + 1)
     );
   });
@@ -509,16 +563,18 @@ describe("Phase 3 — bounded outbox drain", () => {
     await kick(scopeDO, env);
     await scope.settle();
 
-    // Healthy lane delivered fully despite the stuck neighbor.
-    expect(healthy.received).toHaveLength(3);
-    // The stuck lane attempted ONLY its head (CO2.7: nothing may pass a
-    // failed head), exactly once this drain; the other 79 rows were
-    // never rewritten (attempts stay 0).
+    // Healthy lane delivered fully despite the stuck neighbor (one batch
+    // request carrying all three rows in order).
+    expect(fanoutRows(healthy.received).map((b) => b.seq)).toEqual([1, 2, 3]);
+    // The stuck lane attempted only its selected PREFIX (the lane-batch
+    // quantum: cap rows in one request — shared fate on failure), exactly
+    // once this drain; CO2.7 holds (nothing beyond the prefix delivered)
+    // and the 76 unselected rows were never rewritten (attempts stay 0).
     expect(down.received).toHaveLength(1);
-    expect((down.received[0] as { seq: number }).seq).toBe(1);
+    expect(fanoutRows(down.received).map((b) => b.seq)).toEqual([1, 2, 3, 4]);
     const stuck = pendingRows(scope.state).filter((row) => row.destination === "gateway:down");
     expect(stuck).toHaveLength(80);
-    expect(stuck.filter((row) => row.attempts > 0)).toHaveLength(1);
+    expect(stuck.filter((row) => row.attempts > 0)).toHaveLength(4);
     expect(stuck[0].attempts).toBe(1); // head, seq 1
     // The drain terminated (this line being reached proves no fresh-row
     // spin) and armed the retry alarm at the HEAD's due-time: strictly
