@@ -733,3 +733,36 @@ describe("outliner catalog: room_roster (presence aside)", () => {
     expect(left.observations.map((o) => o.type)).toContain("outliner_left");
   });
 });
+
+describe("outliner acts: watermark projection + tree_view", () => {
+  it("at_seq tracks acted structural changes, rebuilds, and gates tree_view", async () => {
+    const world = setupWorld();
+    const session = world.auth("guest:wm");
+    await expectResult(call(world, session.actor, "the_outline", "enter", []));
+    const a = await addItem(world, session.actor, "first");
+    await addItem(world, session.actor, "second");
+    await expectResult(call(world, session.actor, "the_outline", "hide", [a, true]));
+
+    // tree_view: substrate-authoritative items + the act watermark.
+    const tv = await expectResult(call(world, session.actor, "the_outline", "tree_view", []));
+    const view = tv.result as { items: unknown[]; at_seq: number };
+    const flat = await expectResult(call(world, session.actor, "the_outline", "list_items", []));
+    expect(view.items).toEqual(flat.result);
+    expect(view.at_seq).toBeGreaterThan(0);
+
+    // The watermark equals the last acted structural entry's seq, and the
+    // meta projection holds NO tree rows (no-mirror rule).
+    const meta = (world.getProp("the_outline", "projections") as string[])[0];
+    expect(world.getProp(meta, "at_seq")).toBe(view.at_seq);
+    expect(world.getProp(meta, "rows")).toEqual({});
+
+    // Rebuild reproduces the watermark from recorded acts alone.
+    world.createObject({ id: "wm2", name: "wm2", parent: "$outline_meta", owner: session.actor, location: "the_outline" });
+    for (let i = 0; i < 20; i++) {
+      const r = (await world.directCall(`wm-rb-${i}`, session.actor, "wm2", "rebuild_from", ["the_outline", 100])) as unknown as { op: string; result?: { done: boolean } };
+      if (r.op !== "result" || !r.result) throw new Error("rebuild failed");
+      if (r.result.done) break;
+    }
+    expect(world.getProp("wm2", "at_seq")).toBe(view.at_seq);
+  });
+});

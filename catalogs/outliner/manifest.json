@@ -173,6 +173,12 @@
             "leave"
           ],
           "perms": "r"
+        },
+        {
+          "name": "projections",
+          "type": "list",
+          "default": [],
+          "perms": ""
         }
       ],
       "verbs": [
@@ -556,7 +562,50 @@
             "args": []
           },
           "skip_presence_check": true,
-          "source": "verb :_ensure_acts() rx {\n  /* Lazy per-instance mount of the acts emission feature ($space\n     instances own-seed an empty features list; the class-level\n     attach_feature hook only serves the installer's static this-call\n     resolution). Writes the FT1 pair directly under catalog-author\n     authority instead of :add_feature, whose actor-permission gate\n     would refuse ordinary participants of a shared outliner \u2014 mounting\n     the emission surface is catalog policy, not an actor privilege.\n     Idempotent. */\n  for f in this.features { if (f == $acts) { return true; } }\n  this.features = this.features + [$acts];\n  this.features_version = this.features_version + 1;\n  return true;\n}"
+          "source": "verb :_ensure_acts() rx {\n  /* Lazy per-instance mount of the acts emission feature ($space\n     instances own-seed an empty features list; the class-level\n     attach_feature hook only serves the installer's static this-call\n     resolution). Writes the FT1 pair directly under catalog-author\n     authority instead of :add_feature, whose actor-permission gate\n     would refuse ordinary participants of a shared outliner \u2014 mounting\n     the emission surface is catalog policy, not an actor privilege.\n     Idempotent. */\n  if (length(this.projections) < 1) {\n    let meta = create($outline_meta, { owner: this.owner, name: \"outline_meta\", location: this });\n    this.projections = [meta];\n  }\n  for f in this.features { if (f == $acts) { return true; } }\n  this.features = this.features + [$acts];\n  this.features_version = this.features_version + 1;\n  return true;\n}"
+        },
+        {
+          "name": "tree_view",
+          "perms": "rxd",
+          "direct_callable": true,
+          "tool_exposed": true,
+          "arg_spec": {
+            "args": []
+          },
+          "skip_presence_check": true,
+          "source": "verb :tree_view() rxd {\n  /* The watermarked authoritative read for the client facade: the tree\n     from the substrate authority (list_items over __ordered_edge) plus\n     the act watermark. at_seq is 0 until the first structural act. */\n  let ws = 0;\n  if (length(this.projections) >= 1) { ws = this.projections[1].at_seq; }\n  return { \"items\": this:list_items(), \"at_seq\": ws };\n}"
+        }
+      ]
+    },
+    {
+      "local_name": "$outline_meta",
+      "parent": "$projection",
+      "description": "Watermark projection for an outliner (acts kernel): consumes the five structural acts and maintains only at_seq \u2014 the seq of the last acted structural change. It holds no tree rows: __ordered_edge is the substrate-authoritative structure and must not be mirrored. Hook-path flat echoes (enterfunc capture; foreign-authority detach) do not fold, so the watermark means exactly 'last structural act on this room's own log'.",
+      "properties": [
+        {
+          "name": "consumes",
+          "type": "list",
+          "default": [
+            "outline_item_added",
+            "outline_item_removed",
+            "outline_item_moved",
+            "outline_item_reordered",
+            "outline_item_hidden"
+          ],
+          "perms": ""
+        }
+      ],
+      "verbs": [
+        {
+          "name": "fold",
+          "perms": "rx",
+          "arg_spec": {
+            "args": [
+              "act"
+            ]
+          },
+          "skip_presence_check": true,
+          "source": "verb :fold(act) rx {\n  /* Watermark-only fold: no rows (the tree lives in __ordered_edge, the\n     substrate authority - mirroring it would recreate two-authorities).\n     Advancing at_seq from the injected envelope seq is the entire job;\n     rebuild_from reproduces it from recorded acts. */\n  this.at_seq = act[\"seq\"];\n}"
         }
       ]
     }
