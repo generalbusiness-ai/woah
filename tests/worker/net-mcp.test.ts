@@ -284,6 +284,7 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
     });
     expect(discoveredPage.result?.structuredContent?.result).toMatchObject({
       scope: "active",
+      active_scope: "the_chatroom",
       query: "squawk",
       limit: 1,
       cursor: null,

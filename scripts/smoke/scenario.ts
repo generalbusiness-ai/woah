@@ -573,24 +573,50 @@ export async function runSmokeWalkthrough(
 }
 
 /** Put one persistent smoke actor in the chatroom and establish the driver's
- * room cursor. The reachable-tool facade omits a space's `enter` verb when the
- * actor is already there, so that one named refusal means "confirm in-place"
- * via `look`; every other failure still escapes. */
+ * room cursor. API-key actors retain their physical location between runs, and
+ * the contextual MCP surface intentionally exposes only their current room.
+ * Read its explicit `active_scope`, then walk the demo graph home;
+ * this makes repeated and recovery runs state-independent without bypassing
+ * the same public movement verbs that clients use. */
 export async function ensureInChatroom(
   session: SmokeSession,
   signal?: AbortSignal
 ): Promise<void> {
-  try {
-    await session.call("the_chatroom", "enter", [], signal);
-    return;
-  } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err);
-    if (!detail.includes("tool is not available in this session context: the_chatroom:enter")) {
-      throw err;
-    }
+  const listed = await session.callTool(
+    "woo_list_reachable_tools",
+    { scope: "all", limit: 200 },
+    { signal }
+  );
+  const page = isRecord(listed) &&
+    isRecord(listed.result) &&
+    isRecord(listed.result.structuredContent) &&
+    isRecord(listed.result.structuredContent.result)
+    ? listed.result.structuredContent.result
+    : null;
+  if (!page || typeof page.active_scope !== "string") {
+    throw new Error(
+      `cannot establish ${session.label} current room from reachable tools; ` +
+      `active_scope=${JSON.stringify(page?.active_scope ?? null)}`
+    );
   }
-  await session.call("the_chatroom", "look", [], signal);
-  session.currentRoom = "the_chatroom";
+  session.currentRoom = page.active_scope;
+
+  for (let hop = 0; hop < 4 && session.currentRoom !== "the_chatroom"; hop += 1) {
+    const room = session.currentRoom;
+    const exit =
+      room === "the_taskboard" ? "out" :
+      room === "the_garden" ? "north" :
+      room === "the_deck" || room === "the_hot_tub" ? "west" :
+      room === "the_outline" || room === "the_pinboard" || room === "the_dubspace" ? "out" :
+      null;
+    if (!exit) {
+      throw new Error(`cannot route ${session.label} from ${room} to the_chatroom`);
+    }
+    await session.call(room, "go", [exit], signal);
+  }
+  if (session.currentRoom !== "the_chatroom") {
+    throw new Error(`failed to route ${session.label} to the_chatroom; at=${session.currentRoom}`);
+  }
 }
 
 async function walkSouthToTaskboard(session: SmokeSession, signal?: AbortSignal): Promise<void> {

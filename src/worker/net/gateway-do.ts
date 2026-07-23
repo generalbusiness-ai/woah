@@ -4157,6 +4157,7 @@ export class NetGatewayDO {
         const includeSchema = args.include_schema === true;
         return this.mcpResult(id, {
           scope: page.scope,
+          active_scope: page.activeScope,
           object: page.object,
           query: page.query,
           limit: page.limit,
@@ -4498,6 +4499,7 @@ export class NetGatewayDO {
    * scope vocabulary changes presentation only; it never grants reachability. */
   private mcpToolPage(actor: string, session: string, args: Record<string, unknown>): NetMcpToolPage {
     const scope = mcpToolScope(args.scope);
+    const activeScope = this.mcpActiveScope(actor, session);
     const object = typeof args.object === "string" && args.object ? args.object : null;
     const query = typeof args.query === "string" && args.query.trim() ? args.query.trim() : null;
     const limit = mcpLimit(args.limit, MCP_DISCOVERY_DEFAULT_PAGE, MCP_DISCOVERY_MAX_PAGE);
@@ -4509,11 +4511,10 @@ export class NetGatewayDO {
     if (scope === "here") {
       selected = new Set();
       commandObjects = new Set();
-      const active = this.mcpActiveScope(actor, session);
-      if (active) {
-        selected.add(active);
-        commandObjects.add(active);
-        for (const id of this.mcpContentsContext(active, actor)) {
+      if (activeScope) {
+        selected.add(activeScope);
+        commandObjects.add(activeScope);
+        for (const id of this.mcpContentsContext(activeScope, actor)) {
           selected.add(id);
           commandObjects.add(id);
         }
@@ -4525,8 +4526,7 @@ export class NetGatewayDO {
     } else if (scope === "space") {
       selected = new Set();
       commandObjects = new Set();
-      const active = this.mcpActiveScope(actor, session);
-      const target = object ?? active;
+      const target = object ?? activeScope;
       if (target && context.has(target)) {
         selected.add(target);
         commandObjects.add(target);
@@ -4549,6 +4549,7 @@ export class NetGatewayDO {
     const next = cursor + tools.length;
     return {
       scope,
+      activeScope,
       object,
       query,
       limit,
@@ -7410,6 +7411,7 @@ type NetMcpDynamicTool = NetMcpToolDraft & { name: string };
 
 type NetMcpToolPage = {
   scope: NetMcpToolScope;
+  activeScope: string | null;
   object: string | null;
   query: string | null;
   limit: number;

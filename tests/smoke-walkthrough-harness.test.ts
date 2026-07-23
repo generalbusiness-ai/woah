@@ -56,34 +56,63 @@ describe("smoke walkthrough harness", () => {
     })).toThrow("apikey:<id>:<secret>");
   });
 
-  it("treats an unavailable chatroom enter as an already-present actor", async () => {
+  it("routes a persistent taskboard actor back to the chatroom through public exits", async () => {
     const calls: string[] = [];
-    const session = {
+    const sessionStub: {
+      currentRoom: string | null;
+      label: string;
+      callTool(): Promise<unknown>;
+      call(object: string, verb: string, args: string[]): Promise<unknown>;
+    } = {
       currentRoom: null,
-      async call(object: string, verb: string): Promise<unknown> {
-        calls.push(`${object}:${verb}`);
-        if (verb === "enter") {
-          throw new Error("MCP tool error: tool is not available in this session context: the_chatroom:enter");
-        }
-        return { description: "The chatroom" };
+      label: "bob",
+      async callTool(): Promise<unknown> {
+        return {
+          result: {
+            structuredContent: {
+              result: {
+                active_scope: "the_taskboard",
+                tools: [
+                  { object: "the_taskboard", verb: "look" },
+                  { object: "the_taskboard", verb: "go" }
+                ]
+              }
+            }
+          }
+        };
+      },
+      async call(object: string, verb: string, args: string[]): Promise<unknown> {
+        calls.push(`${object}:${verb}:${args[0]}`);
+        const next =
+          object === "the_taskboard" ? "the_garden" :
+          object === "the_garden" ? "the_deck" :
+          "the_chatroom";
+        sessionStub.currentRoom = next;
+        return { room: next };
       }
-    } as unknown as SmokeSession;
+    };
+    const session = sessionStub as unknown as SmokeSession;
 
     await ensureInChatroom(session);
 
-    expect(calls).toEqual(["the_chatroom:enter", "the_chatroom:look"]);
+    expect(calls).toEqual([
+      "the_taskboard:go:out",
+      "the_garden:go:north",
+      "the_deck:go:west"
+    ]);
     expect(session.currentRoom).toBe("the_chatroom");
   });
 
-  it("does not hide unrelated chatroom-entry failures", async () => {
+  it("fails closed when the reachable surface does not identify one current room", async () => {
     const session = {
       currentRoom: null,
-      async call(): Promise<unknown> {
-        throw new Error("E_SCOPE_RETIRED");
+      label: "bob",
+      async callTool(): Promise<unknown> {
+        return { result: { structuredContent: { result: { tools: [] } } } };
       }
     } as unknown as SmokeSession;
 
-    await expect(ensureInChatroom(session)).rejects.toThrow("E_SCOPE_RETIRED");
+    await expect(ensureInChatroom(session)).rejects.toThrow("active_scope=null");
   });
 
   it("aborts the in-flight step body when the watchdog fires", async () => {

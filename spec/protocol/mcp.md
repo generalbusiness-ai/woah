@@ -71,6 +71,7 @@ tool exposure, or verb permissions.
 ```json
 {
   "scope": "active",
+  "active_scope": "the_chatroom",
   "object": null,
   "query": null,
   "limit": 64,
@@ -81,6 +82,10 @@ tool exposure, or verb permissions.
 }
 ```
 
+`active_scope` always names the authenticated session's current command focus
+(or `null` when it has none), independently of the requested presentation
+`scope`. A client can therefore interpret or navigate the returned descriptors
+without guessing focus from contextual objects that may include mounted spaces.
 `query` is a case-insensitive match over name, object, verb, aliases, and
 description. `include_schema:true` adds `input_schema` to descriptor summaries.
 Limits default to 64 and cap at 256.
