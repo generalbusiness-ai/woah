@@ -3661,15 +3661,23 @@ export class NetGatewayDO {
     const row = cell?.value as { activeScope?: string | null } | undefined;
     const anchorObject = this.clientAnchorObject(actor, row?.activeScope ?? null);
     const planningScope = await this.clientPlanningScope(anchorObject, actor);
-    // Phase 4: warm the TURN'S TARGET (and its anchor) at the planning
-    // scope. Under targeted cold-open the room's cells no longer arrive
-    // wholesale, and a client-turn target the view never materialized is
-    // exactly the case pull-on-miss cannot route (its owner is not
-    // conventionally derivable from the object id — the Phase-1 smoke
-    // blocker); naming it here pulls its chain from the scope that
-    // anchors it before planning starts.
+    const targetAuthorityScope = this.clientTargetAuthorityScope(target, anchorObject, actor, planningScope);
+    // Phase 4: warm the TURN'S TARGET at its own authority and the anchor
+    // at the planning scope. A room relation may contain a self-hosted
+    // fixture whose cells belong to a cluster scope; treating the room as
+    // the target's authority works only after another request happens to
+    // warm the fixture. The relation's install/fanout-owned member_scope
+    // is the cold routing fact. It grants no permission: normal verb,
+    // presence, read, and committing-scope checks still run below.
+    const targetWarmEntries =
+      targetAuthorityScope === planningScope
+        ? [{ scope: planningScope, objects: [target, anchorObject] }]
+        : [
+            { scope: targetAuthorityScope, objects: [target] },
+            { scope: planningScope, objects: [anchorObject] }
+          ];
     await this.warmScopes(
-      [{ scope: planningScope, objects: [target, anchorObject] }],
+      targetWarmEntries,
       "net_client_pull_miss_failed"
     );
     // `arg_spec.params` is compiler-owned metadata naming the positional
@@ -3698,12 +3706,12 @@ export class NetGatewayDO {
     // quite correctly avoids re-pulling the whole object).
     if (route === "direct" && page === null) {
       try {
-        await this.pullTargeted(planningScope, `scope:${planningScope}`, [target]);
+        await this.pullTargeted(targetAuthorityScope, `scope:${targetAuthorityScope}`, [target]);
         page = this.callVerbPage(this.ensureView(), validationCall);
       } catch (err) {
         this.metric({
           kind: "net_direct_metadata_pull_failed",
-          scope: planningScope,
+          scope: targetAuthorityScope,
           target,
           verb,
           status: "error",
@@ -3719,10 +3727,15 @@ export class NetGatewayDO {
       (Array.isArray(value) ? value : [value]).some((part) => typeof part === "string" && part.includes(":"))
     )) {
       try {
-        await this.pullTargeted(planningScope, `scope:${planningScope}`, [target]);
+        await this.pullTargeted(targetAuthorityScope, `scope:${targetAuthorityScope}`, [target]);
         page = this.callVerbPage(this.ensureView(), validationCall);
       } catch (err) {
-        this.metric({ kind: "net_client_arg_validation_pull_failed", scope: planningScope, status: "error", error: String(err) });
+        this.metric({
+          kind: "net_client_arg_validation_pull_failed",
+          scope: targetAuthorityScope,
+          status: "error",
+          error: String(err)
+        });
       }
     }
     // External direct dispatch is metadata-gated at the ingress boundary
@@ -3938,6 +3951,42 @@ export class NetGatewayDO {
     } catch {
       return `cluster:${actor}`;
     }
+  }
+
+  /**
+   * Resolve a cold client target through the bounded structural context the
+   * caller already has. `contents.member_scope` is derived by the authority
+   * classifier when the relation is written, so it is the only exact routing
+   * fact available before the target's lineage is materialized locally.
+   *
+   * This is deliberately not a global lookup and not an authorization rule:
+   * only the active anchor and the actor's inventory are searched, and the
+   * resulting scope merely selects which authority to pull before the normal
+   * planner and permission checks execute.
+   */
+  private clientTargetAuthorityScope(
+    target: string,
+    anchorObject: string,
+    actor: string,
+    planningScope: string
+  ): string {
+    for (const owner of new Set([anchorObject, actor])) {
+      const row = this.relationMembers("contents", owner).find((candidate) => candidate.member === target);
+      if (row?.member_scope) return row.member_scope;
+    }
+    const view = this.ensureView();
+    if (view.has(cellKey("object_lineage", target))) {
+      const classifier = classifierFromLineage(
+        (object) => (view.get(cellKey("object_lineage", object))?.value as AnchorLineage | undefined) ?? null
+      );
+      try {
+        return classifier.scopeOf(target);
+      } catch {
+        // An incomplete cached lineage chain is not a routing grant. The
+        // planning scope remains the conservative repair-loop fallback.
+      }
+    }
+    return planningScope;
   }
 
   // ---- /net-api/mcp: the MCP adapter (client-shell phase i) ---------------
