@@ -40,9 +40,9 @@
  *                           never fanout
  *       effect-free direct submits may also carry live audience hints.
  *                           After authority validation the scope relays their
- *                           observations to fanout-role gateway shards via
- *                           best-effort /net/live calls; no row or seq is
- *                           created.
+ *                           observations to fanout-role gateway shards from
+ *                           a fresh alarm event via best-effort /net/live
+ *                           calls; no durable row or authority seq is created.
  *       POST /net/adopt     {from_scope, seq, cells, removed_cells?,
  *                            prior_versions?} →
  *                           CA3 rider adoption as an OWNER-SEQUENCED
@@ -473,7 +473,8 @@ export class SqliteScopeStore implements ScopeStore {
 
 const SCOPE_ALARM_KEY = "scope";
 const OUTBOX_ALARM_KEY = "outbox";
-/** H2b: the session-reaper wake (a third key into the single storage
+const LIVE_ALARM_KEY = "live";
+/** H2b: the session-reaper wake (another key into the single storage
  * alarm — WorkerdHost keeps the earliest across keys). */
 const SESSION_ALARM_KEY = "session-reap";
 
@@ -510,6 +511,12 @@ const OUTBOX_ROWS_PER_LANE = 4;
  * which clamps to "now" while due work remains — resumes the drain on a
  * fresh invocation budget. */
 const OUTBOX_PASSES_PER_DRAIN = 1;
+/** Live-only delivery is deliberately memory-bounded and alarm-batched.
+ * Eight gateway shards make ordinary publishes ≤7 rows after origin
+ * suppression; these bounds absorb a burst without granting unbounded
+ * lifetime state or one alarm invocation unbounded subrequests. */
+const LIVE_DELIVERY_QUEUE_CAP = 1_024;
+const LIVE_DELIVERY_BATCH = 64;
 /** Debugging tail of abandoned rows kept after their divergence metric
  * fired; everything older is pruned (a dead subscriber must not grow
  * storage without bound). */
@@ -559,6 +566,13 @@ export class NetScopeDO {
    * gates the clear so scopes with no outbox history never touch the
    * storage alarm. Lost on eviction by design — see armOutboxRetryAlarm. */
   private outboxAlarmArmed = false;
+  /** Lossy direct-observation deliveries waiting for a FRESH alarm event.
+   * A /submit lineage must never call any gateway: excluding only its
+   * origin still forms a cycle when another gateway is concurrently
+   * submitting to this scope. This queue is intentionally in-memory
+   * because direct observations are live-only; eviction may drop them. */
+  private readonly pendingLiveDeliveries: Array<{ destination: string; body: LiveFanoutBody }> = [];
+  private liveAlarmArmed = false;
   /** In-memory mirror of the rider residue ledger (net_scope_rider_cache),
    * hydrated lazily and appended on insert — `owns` consults it per read
    * (CO14 session witness), so a per-call SQL scan would be a hot-path
@@ -1510,6 +1524,12 @@ export class NetScopeDO {
    * outbox retries.
    */
   async alarm(): Promise<void> {
+    // CO2.7's request-lineage break applies to lossy live fanout too.
+    // Clear this lifetime's key before draining; publishes that interleave
+    // while RPCs are awaited re-arm it for the remaining batch.
+    this.liveAlarmArmed = false;
+    this.host.setAlarm(LIVE_ALARM_KEY, null, async () => {});
+    await this.drainPendingLive();
     // Outbox liveness (fix 4a): a QUIET scope must still retry failed
     // deliveries — this alarm is the retry engine when no request ever
     // arrives to trigger drain-on-reactivation. The drain's own finally
@@ -2364,10 +2384,11 @@ export class NetScopeDO {
   }
 
   /** Publish one validated direct turn without converting it into authority.
-   * Subscriber count is bounded by gateway shard count (CA13.1.2), and every
-   * destination gets an independent deferred task so one slow shard cannot
-   * delay the caller or another shard. Failure is acceptable for this
-   * explicitly live-only carrier, but remains named in telemetry. */
+   * Subscriber count is bounded by gateway shard count (CA13.1.2). Deliveries
+   * cross an immediate alarm event before calling gateways: a waitUntil task
+   * inherits /submit's request lineage and can form scope↔gateway cycles under
+   * cross-shard concurrency. Failure or eviction loss is acceptable for this
+   * explicitly live-only carrier, but remains bounded and named. */
   private publishLive(
     scope: string,
     submit: CommitSubmit,
@@ -2397,21 +2418,50 @@ export class NetScopeDO {
       registered_subscribers: registered.length,
       observations: body.observations.length
     });
-    for (const { destination } of subscribers) {
-      this.host.defer(async () => {
-        try {
-          await this.host.rpc(destination, "/live", body);
-        } catch (err) {
-          this.metric({
-            kind: "net_scope_live_delivery_failed",
-            scope,
-            destination,
-            status: "error",
-            error: String(err)
-          });
-        }
+    const available = Math.max(0, LIVE_DELIVERY_QUEUE_CAP - this.pendingLiveDeliveries.length);
+    for (const { destination } of subscribers.slice(0, available)) {
+      this.pendingLiveDeliveries.push({ destination, body });
+    }
+    const dropped = Math.max(0, subscribers.length - available);
+    if (dropped > 0) {
+      this.metric({
+        kind: "net_scope_live_delivery_dropped",
+        scope,
+        status: "error",
+        reason: "queue_cap",
+        dropped,
+        queue_cap: LIVE_DELIVERY_QUEUE_CAP
       });
     }
+    if (this.pendingLiveDeliveries.length > 0) this.armLiveAlarm();
+  }
+
+  /** Drain one bounded live batch from a fresh alarm invocation. Unlike the
+   * durable outbox there is no retry: live observations are best effort, and
+   * retaining failures would quietly turn them into durable messages. */
+  private async drainPendingLive(): Promise<void> {
+    const batch = this.pendingLiveDeliveries.splice(0, LIVE_DELIVERY_BATCH);
+    const settled = await Promise.allSettled(
+      batch.map(({ destination, body }) => this.host.rpc(destination, "/live", body))
+    );
+    settled.forEach((result, index) => {
+      if (result.status === "fulfilled") return;
+      const delivery = batch[index];
+      this.metric({
+        kind: "net_scope_live_delivery_failed",
+        scope: delivery?.body.scope ?? "unknown",
+        destination: delivery?.destination ?? "unknown",
+        status: "error",
+        error: String(result.reason)
+      });
+    });
+    if (this.pendingLiveDeliveries.length > 0) this.armLiveAlarm();
+  }
+
+  private armLiveAlarm(): void {
+    if (this.liveAlarmArmed) return;
+    this.liveAlarmArmed = true;
+    this.host.setAlarm(LIVE_ALARM_KEY, this.host.now(), async () => {});
   }
 
   private persistOutboxRow(

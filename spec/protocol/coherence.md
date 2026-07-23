@@ -262,6 +262,16 @@ chain of submission, owner adoption, relation delivery, and fanout can exceed
 Cloudflare's recursive subrequest-depth limit even though each individual
 drain pass is row-bounded.
 
+Validated direct observations obey the same event break even though their
+delivery is live-only. A scope MUST NOT call a subscriber gateway from the
+`/submit` request lineage: suppressing only the origin gateway is insufficient
+when another subscriber is concurrently submitting to that scope. The scope
+queues live deliveries in bounded volatile memory and arms an immediate alarm;
+the fresh alarm event sends one bounded batch. Eviction, queue-cap overflow,
+and delivery failure may lose these observations—as their live contract
+permits—but cap drops and delivery failures MUST be named in telemetry. Live
+delivery never creates an authority sequence or durable outbox row.
+
 ### CO2.8 Durable continuations
 
 Parked tasks (VM `SUSPEND`/`FORK` with serialized frames) and scheduled

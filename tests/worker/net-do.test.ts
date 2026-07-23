@@ -159,6 +159,77 @@ describe("NetScopeDO over fake-DO storage", () => {
     scope.close();
   });
 
+  it("crosses an alarm event before a direct submit calls subscriber gateways", async () => {
+    const deliveries: Array<{ destination: string; path: string }> = [];
+    const envWithGateways: NetScopeEnv = {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_RESOLVE: (destination) => ({
+        fetch: async (request) => {
+          deliveries.push({ destination, path: new URL(request.url).pathname });
+          return new Response(JSON.stringify({ delivered: true }), {
+            headers: { "content-type": "application/json" }
+          });
+        }
+      })
+    };
+    const scope = makeScope("room-live", envWithGateways);
+    await call(scope.instance, envWithGateways, "/seed", {
+      scope: "room-live",
+      catalog_epoch: EPOCH,
+      cells: seedCells()
+    });
+    for (const destination of ["gateway:origin", "gateway:peer"]) {
+      await call(scope.instance, envWithGateways, "/subscribe", { destination });
+    }
+    const head = (await call<{ head: ScopeHead }>(scope.instance, envWithGateways, "/head")).head;
+    const { applyTranscript } = await import("../../src/net/transcript");
+    const { ScopeSequencer } = await import("../../src/net/scope");
+    const transcript = {
+      kind: "woo.effect_transcript.shadow.v1",
+      route: "direct",
+      scope: "room-live",
+      seq: 1,
+      call: { actor: "#actor", target: "#thing", verb: "look", args: [], body: undefined },
+      reads: [],
+      writes: [],
+      creates: [],
+      moves: [],
+      observations: [{ type: "looked", to: "#actor", text: "live view" }],
+      logicalInputs: [],
+      untrackedEffects: [],
+      complete: true,
+      incompleteReasons: [],
+      hash: "net-do-live-alarm"
+    };
+    const twin = new ScopeSequencer("room-live", EPOCH);
+    twin.seed(seedCells());
+    const submit = {
+      kind: "woo.net.commit_submit.v1",
+      scope: "room-live",
+      base: head,
+      idempotency_key: "live-alarm-1",
+      transcript,
+      post_state_version: applyTranscript(
+        twin.store,
+        transcript as never,
+        { scope_head: "x", catalog_epoch: EPOCH }
+      ).postStateVersion,
+      stamp: { scope_head: "x", catalog_epoch: EPOCH }
+    };
+
+    const reply = await call<CommitReply>(scope.instance, envWithGateways, "/submit", {
+      submit,
+      origin_gateway: "gateway:origin"
+    });
+    expect(reply.status).toBe("accepted");
+    expect(deliveries, "no gateway RPC may inherit /submit's lineage").toEqual([]);
+
+    await scope.instance.alarm();
+    expect(deliveries).toEqual([{ destination: "gateway:peer", path: "/net/live" }]);
+    expect((await call<{ head: ScopeHead }>(scope.instance, envWithGateways, "/head")).head).toEqual(head);
+    scope.close();
+  });
+
   it("cold restart over the same storage: head continuity + idempotent replay (CO2.5)", async () => {
     const first = makeScope("room-a", env);
     await call(first.instance, env, "/seed", { scope: "room-a", catalog_epoch: EPOCH, cells: seedCells() });
