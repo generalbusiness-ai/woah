@@ -168,6 +168,11 @@ needed.
   ship in their own catalogs.
 - The plug process itself — that's an external CF Worker (or any
   authenticated net client) deployed independently.
+- An ordinary programmer deployment factory. Catalog manifests currently
+  define block classes and operator/seed paths provision their self-hosted
+  instances. The proposed co-resident blueprint plus explicit
+  resource-gated `:deploy` boundary is detailed in
+  [`notes/2026-07-23-programmer-block-factory-deploy-plan.md`](../../notes/2026-07-23-programmer-block-factory-deploy-plan.md).
 - Ephemeral property tier (in-memory, skip-storage). Deferred until a
   workload genuinely needs it.
 

@@ -13,15 +13,14 @@ look
 ```
 
 Blocks appear in the room's contents alongside other objects. The
-room description usually includes a brief mention; `:describe()` on
-the block tells you everything else.
+room description usually includes a brief mention; `:look_self()` or
+the ordinary inspection surface provides the rest.
 
 ```
-woo_call("the_weather", "describe", [])
+woo_call("the_weather", "look_self", [])
 ```
 
-Returns the block's properties (data and config), readable verbs, and
-parent class. Identifying a block:
+Identifying a block:
 
 - Its parent chain includes `$block`.
 - It's anchored (can't be moved).
@@ -33,15 +32,12 @@ parent class. Identifying a block:
 Block data is just properties. Read them like any other property:
 
 ```
-woo_call("the_weather", "describe", [])
-# look at result.properties.current
+woo_call("the_weather", "get_data", ["current"])
 ```
 
-Or via REST:
-
-```
-GET /api/objects/the_weather/properties/current
-```
+External clients that need exact values use the Net cell-read surface
+documented in [writing-a-plug.md](writing-a-plug.md). There is no
+block-specific property REST API.
 
 The values are whatever the plug pushed. For a weather block, you
 might see:
@@ -49,8 +45,8 @@ might see:
 ```
 {
   "current": {temperature: 18, condition: "partly cloudy", ts: 1730000000000},
-  "forecast": [...hourly entries...],
-  "history":  [...hourly entries...],
+  "daily": [...daily entries...],
+  "timeseries": {time: [...], temperature: [...]},
   "last_pushed_at": 1730000000000,
   "place": "Mountain View, CA"
 }
@@ -58,9 +54,9 @@ might see:
 
 ## Freshness
 
-Whether the data is current is **derived**, not stored. The runtime
-checks `last_pushed_at` against the block's class-defined freshness
-window:
+The base block stores `last_pushed_at`; it does not impose one universal
+freshness policy. A concrete class or client derives freshness from that
+timestamp according to the source's expected update interval:
 
 | Block class | Typical window |
 |---|---|
@@ -68,14 +64,11 @@ window:
 | Ticker / sensor | 60 seconds |
 | Horoscope dispenser | (n/a — generates on demand) |
 
-If the data is stale, the block's `:describe()` may include a
-freshness flag, and rich UI clients show a "stale" indicator. The
-data is still there; it's just been a while.
-
-For a **persistent** plug (one that holds an open connection
-continuously), the indicator may also reflect whether the plug is
-currently attached. An attached-but-failing-to-fetch plug shows
-"plugged in, errors" rather than just "stale."
+If the data is stale, the concrete block's look result or rich UI may
+show a stale indicator. The stored value remains readable. Connection
+presence is not a substitute for freshness: a connected plug can have
+an unhealthy upstream source, and a scheduled plug is normally
+disconnected between successful pushes.
 
 ## Calling block verbs
 
@@ -125,40 +118,40 @@ observation:
 ```
 {
   "type": "block_data",
-  "source": "<block>",
+  "block": "<block>",
   "name": "<property-name>",
   "value": <the new value>,
-  "kind": "data" | "config",
   "ts": <ms>
 }
 ```
 
-The audience is the block's room (and any actor focused on the
-block). Other actors in the room see the data update live — a
-ticker block updates everyone watching it without anyone having to
-poll.
+The audience is the block's containing space. Connected actors may see
+the update immediately, but fanout is best-effort. Consumers recover
+after reconnect by reading current block state; `block_data` is not a
+replicated-state or complete-history contract.
 
-Sequenced observations (from a `$dispenser_block`'s `:order` /
-`:deliver` flow) ride the normal space log — they're durable,
-replayable, and indexed by seq.
+The production Net call is sequenced in its committing scope. Typed
+coordination flows such as a `$dispenser_block`'s order and delivery use
+their catalog's durable acts and projections; raw externally
+authoritative values remain block properties.
 
 ## Configuration changes
 
-If you own a block, you can write its config properties. The plug
-**listens** for config changes (it observes the block's room) and
-reacts:
+If you own a block, use the class's configuration verbs:
 
 ```
-woo_call("the_weather", "set_place", ["New York, NY"])
+woo_call("the_weather", "set_location", ["New York, NY", "America/New_York"])
 ```
 
 (The exact verb depends on the block. Some expose a single
 `:configure(map)`; some expose per-property setters; some have you
 write directly via the property-setter verb the block defines.)
 
-The plug sees a `block_data` observation with `kind: "config"`,
-notices the property changed, and adjusts. For the weather block,
-the next push will fetch New York instead of Mountain View.
+A scheduled plug re-reads the exact configuration cells it needs on
+each tick. A persistent plug may use `block_data` as an invalidation
+hint, but still re-reads authoritative cells before acting. For the
+weather block, the next tick fetches New York rather than the previous
+location.
 
 ## Permissions
 
@@ -171,10 +164,10 @@ the next push will fetch New York instead of Mountain View.
 | Call public verbs (`:ask`, `:order`) | Anyone, subject to the verb's perms. |
 | Recycle the block | Owner or wizard. |
 
-A non-owner trying to write a config property gets `E_PERM`. The
-substrate doesn't know this is a "block" — it's just normal
-property-write permission, with the property's owner being the block
-itself (which the plug authenticates as).
+A non-owner trying to write configuration gets `E_PERM`. The substrate
+doesn't know a special plug type: `$block:set_property[ies]` applies the
+class's `:is_writable_by_property` policy, distinguishing the owner from
+the block actor authenticated by the plug.
 
 ## When blocks misbehave
 
@@ -183,8 +176,8 @@ to changes), the troubleshooting order:
 
 1. Check freshness. `last_pushed_at` tells you when the plug last
    pushed. If it's been a long time, the plug is probably down.
-2. Check the block's room observations. Recent `block_data` events
-   tell you what the plug is doing.
+2. Check `last_error` and recent room observations for hints. Do not
+   assume the observation stream is a complete activity log.
 3. If the plug is yours, look at its logs. The plug speaks the
    normal woah wire format and gets normal woah error responses.
 4. If the plug isn't yours, contact whoever owns the block (it's in

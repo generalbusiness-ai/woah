@@ -10,25 +10,51 @@ This page covers what a plug needs to do. The two demo plugs
 [`horoscope`](../../catalogs/horoscope/)) are good reference
 implementations.
 
+## Where a plug can run
+
+A plug can run anywhere that can reach the Woo deployment:
+
+- a laptop during local development
+- a service or container on a private network
+- a VM or on-premises process supervisor
+- a scheduled job on another cloud
+- a Cloudflare Worker
+
+Cloudflare is used by the bundled production examples, not by the plug
+protocol. A scheduled plug needs outbound HTTPS to Woo and to its
+upstream systems; Woo does not need an inbound route to the plug. A
+persistent plug additionally needs outbound WebSocket access.
+
+If Woo itself is private, normal network concerns still apply: the plug
+needs a routable address, trusted TLS (or an explicitly development-only
+HTTP endpoint), and DNS or service discovery. The weather plug includes a
+[plain Node runner](../../catalogs/weather/plug/README.md#running-locally-without-cloudflare)
+that works against `npm run dev` or a reachable deployment.
+
 ## Connect
 
-Production plugs use the net client surface. Keep the block-bound apikey in
-the plug's secret store, mint a session with `POST /net-api/session` and
-`Authorization: Bearer apikey:<id>:<secret>`, then use that same credential
-plus the returned session for exact cell reads and `/net-api/turn` calls.
-Operational verbs do not need to be exposed as MCP tools.
+Plugs use the Net client surface in every deployment profile. Keep the
+block-bound apikey in the plug's secret store, mint a session with
+`POST /net-api/session` and
+`Authorization: Bearer apikey:<id>:<secret>`, then use that same
+credential plus the returned session for exact cell reads and
+`/net-api/turn` calls. Operational verbs do not need to be exposed as
+MCP tools.
 
 ## What apikey to use
 
-Each block has an associated **apikey** that authenticates as the
-block's actor (not as the block's *owner*). The apikey is created
-when the block is provisioned — typically the block's owner mints
-it once and configures the plug with it.
+Each plug uses an **apikey** that authenticates as the block's actor,
+not as the block's owner. After the block has been provisioned, its
+owner calls `:mint_apikey(label?)`. The returned secret is shown once;
+copy the complete `apikey:<id>:<secret>` token directly into the
+private runtime's secret store. The owner can list metadata and revoke
+the credential later without wizard assistance.
 
-Apikey provisioning is administrative; the spec is
+Apikey authentication is specified in
 [`../../spec/identity/auth.md §A3.5`](../../spec/identity/auth.md#a35-apikey-credentials).
-For a deployment, you'd typically have a bootstrapping script that
-generates the apikey and stores it in the plug's environment.
+Deployment automation may perform the owner-authorized mint and secret
+injection, but plaintext credentials must not be committed to a catalog,
+blueprint, source repository, process arguments, or Woo property.
 
 **Don't reuse apikeys across plugs.** A plug authenticates as the
 block; its blast radius is whatever the block's actor can do. If
@@ -51,15 +77,15 @@ sequenced net turn:
 ```
 
 (Or `set_properties({...})` to push multiple at once.) The block's
-class defines these verbs as plug-only — only the actor that owns
-the block (i.e., the plug) can write data properties.
+class defines these verbs as plug-only: the authenticated actor must be
+the block object itself. The external plug receives that identity from
+the block-bound apikey.
 
-Each `:set_property` call:
-
-1. Updates the property value.
-2. Updates `last_pushed_at`.
-3. Emits a `block_data` observation to the block's room and to
-   anyone focused on the block.
+Each `:set_property` call updates the named property and emits a
+best-effort `block_data` observation to the block's containing space.
+The plug must include `last_pushed_at` in the same
+`:set_properties({...})` batch when freshness changes; the base block
+does not synthesize that timestamp.
 
 An accepted response has `reply.status: "accepted"` and carries the verb's
 `result` and observations. A rejected response carries a named error.
@@ -126,10 +152,10 @@ Use a stable `idempotency_key` on every `/net-api/turn`. If you lose the
 connection mid-call, re-send with the same key; the committing scope returns
 the recorded result instead of executing the effect twice.
 
-For a scheduled push, **don't push the same data twice with the
-same `last_pushed_at`** — the timestamp is your truth-of-recency
-marker. Either pick a new timestamp on retry, or skip the retry
-entirely if the data didn't change.
+An uncertain retry must send the same semantic payload—including the same
+`last_pushed_at`—with the same idempotency key. A later polling cycle is a
+new operation: if the upstream data has not changed, skip it; if it has,
+use the upstream observation time and a new stable key for that update.
 
 ## Errors the plug should expect
 
@@ -167,14 +193,15 @@ while True:
     sleep_until_next_schedule()
 ```
 
-For a persistent plug, you'd add a receive loop processing `event`
-frames — `ask_request`, `order_placed`, config changes — and
-sending replies.
+For a persistent plug, add the Net WebSocket receive loop. Treat event
+frames as wakeups or invalidation hints: re-read authoritative cells or
+the durable queue before producing a side effect.
 
 For a real implementation, see
 [`../../catalogs/weather/`](../../catalogs/weather/) (scheduled CF
 Worker) and [`../../catalogs/horoscope/`](../../catalogs/horoscope/)
-(LLM-backed dispenser).
+(LLM-backed dispenser). The weather implementation deliberately shares
+its tick logic between its Worker entry point and its plain Node runner.
 
 ## Where this all comes from
 

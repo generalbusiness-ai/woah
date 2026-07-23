@@ -11,23 +11,27 @@ TypeScript, or another service runtime — running outside woah. It
 authenticates as the block's actor (via apikey), pushes data into the
 block's properties, and answers verb calls (`:ask`, `:order`, custom).
 
-This section describes the architecture, how to use blocks that
-exist, and how to write a plug for a new block.
+This section describes the architecture, how to use existing blocks,
+how block types are authored today, and how to run a plug on Cloudflare
+or private infrastructure.
 
 ## Pages
 
 - **[using-blocks.md](using-blocks.md)** — interacting with blocks
   that already exist: reading data, calling verbs, freshness.
+- **[writing-a-block.md](writing-a-block.md)** — defining and
+  provisioning a block type, including the present in-world authoring
+  limits.
 - **[writing-a-plug.md](writing-a-plug.md)** — the external connection
-  contract; building a plug for a new block.
+  contract and private/local deployment.
 
 ## Mental model
 
 ```
-   ╭───────╮     ws + apikey     ╭───────╮
-   │ plug  │ ◀────────────────▶ │ woah  │
-   │       │     pushes props   │ block │ ── seen by other actors
-   ╰───────╯     answers verbs  ╰───────╯       in its room
+   ╭───────╮   HTTPS Net + apikey   ╭───────╮
+   │ plug  │ ◀────────────────────▶ │ woah  │
+   │       │       calls verbs      │ block │ ── seen by other actors
+   ╰───────╯       reads cells      ╰───────╯       in its room
        │
        └── reaches outside (HTTP, DB, LLM, sensor, ...)
 ```
@@ -35,7 +39,10 @@ exist, and how to write a plug for a new block.
 The block is **the surface**. The plug is **the source of truth**.
 Other actors in the world don't talk to the plug; they talk to the
 block. The plug doesn't see other actors directly; it sees the block's
-verb queue and pushes property writes.
+queue or current cells and invokes block verbs. Scheduled plugs need only
+outbound HTTPS. A persistent plug can additionally hold the Net WebSocket
+observation feed, using it as an invalidation signal rather than as its
+authoritative state.
 
 This is a presentation/bridge layer over an outside system, not the
 system itself. The analogy is cube.js: the block is the published
@@ -49,14 +56,16 @@ one shape vocabulary.
 - **Anchored.** A block can't be moved. `:moveto` raises `E_PERM`
   except for wizards. Use it as fixed installation: a wall display,
   a piece of furniture, a vending machine.
-- **Own host per instance.** Each block runs in its own host (own
-  Durable Object in the production profile). Eviction, persistence,
-  and observation log are isolated. A chatty block doesn't slow down
-  its room.
-- **Live-only data writes.** Property pushes from the plug ride the
-  **live** observation route, not sequenced. They don't enter the
-  space log. This keeps high-frequency blocks (a ticker, a sensor)
-  from bloating logs.
+- **Own logical host per instance.** Each block is a self-hosted object.
+  The default global deployment maps that host to a Cloudflare Durable
+  Object; local and private runtimes may implement the same logical
+  boundary without Cloudflare. Eviction, persistence, and scheduling
+  are isolated from the containing room.
+- **Net-sequenced calls, current-state contract.** Production property
+  pushes use `/net-api/turn`. The call is sequenced in its committing
+  scope, but the base block promises current state rather than a complete
+  data-history API. Room fanout is best-effort; reconnecting consumers
+  recover by reading the block's current cells.
 - **Plug-authored data, owner-authored config.** Data properties are
   read-only to non-plug actors. Config properties (e.g., `place` on
   a weather block, `system_prompt` on a horoscope dispenser) are
@@ -72,10 +81,25 @@ block-internal state, take user input, or produce artifacts. That's
 how `$dispenser_block` (a `$block` subclass) implements the
 "order a horoscope, receive a `$note` in your inventory" pattern.
 
+There are currently two different authoring paths:
+
+- Bundled and third-party block types are classes in catalogs. An
+  operator installs the catalog, provisions the self-hosted instance,
+  and the block owner manages its plug credentials.
+- A normal programmer can author ordinary objects in-world, but cannot
+  yet complete the equivalent block-type-and-deploy workflow. In
+  particular, `$block` is not fertile, its tier lists are catalog data,
+  and self-host allocation and initial room placement need an explicit
+  deployment boundary. See [writing-a-block.md](writing-a-block.md) for
+  the current boundary and the proposed blueprint/factory direction.
+
 ## Where the design lives
 
 - [`../../notes/2026-05-05-block-and-plug.md`](../../notes/2026-05-05-block-and-plug.md)
-  — the full design discussion. Read this if you're going deeper.
+  — the original design discussion. Some transport examples there predate
+  the current Net API.
+- [`../../notes/2026-07-23-programmer-block-factory-deploy-plan.md`](../../notes/2026-07-23-programmer-block-factory-deploy-plan.md)
+  — detailed plan for programmer-owned blueprints and explicit deployment.
 - [`../../catalogs/block/`](../../catalogs/block/) — `$block` and
   `$dispenser_block` base classes.
 - [`../../catalogs/blocks-demo/`](../../catalogs/blocks-demo/) — the

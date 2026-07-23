@@ -83,4 +83,13 @@ unknown, or revoked.
 
 Concrete block classes set their own `writable_owner` (config knobs) and
 extend `writable_self` (data fields). Tier lists are inherited via the
-property-def chain. They are catalog data, not special substrate fields.
+property-def chain. They are catalog data, not special substrate fields:
+today these subclass values are declared in a catalog manifest and applied
+by the catalog installer.
+
+This is not yet an ordinary `@create` recipe. `$block` is non-fertile,
+self-hosted deployment needs an explicit resource-allocation and placement
+boundary, and a programmer cannot replace the inherited read-only tier
+lists on an ad-hoc child. The current supported authoring path and the
+planned programmer-owned blueprint/factory path are documented in
+[`docs/blocks-and-plugs/writing-a-block.md`](../../docs/blocks-and-plugs/writing-a-block.md).
