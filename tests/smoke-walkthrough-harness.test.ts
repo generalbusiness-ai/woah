@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { isTimeoutDetail, SmokeCascadeHalt, raceWithAbort } from "../scripts/smoke-walkthrough";
+import {
+  isTimeoutDetail,
+  smokeMcpTokens,
+  SmokeCascadeHalt,
+  raceWithAbort
+} from "../scripts/smoke-walkthrough";
 import { SmokeSession, type McpTransport } from "../scripts/smoke/session";
 
 describe("smoke walkthrough harness", () => {
@@ -33,6 +38,21 @@ describe("smoke walkthrough harness", () => {
 
     expect(session.actor).toBe("carried_alice");
     expect(methods).toEqual(["initialize", "notifications/initialized"]);
+  });
+
+  it("requires two explicit API keys for the deployed Net MCP walkthrough", () => {
+    expect(smokeMcpTokens({
+      WOO_SMOKE_ALICE_APIKEY: "apikey:alice:secret-a",
+      WOO_SMOKE_BOB_APIKEY: "apikey:bob:secret-b"
+    })).toEqual({
+      alice: "apikey:alice:secret-a",
+      bob: "apikey:bob:secret-b"
+    });
+    expect(() => smokeMcpTokens({})).toThrow("WOO_SMOKE_ALICE_APIKEY");
+    expect(() => smokeMcpTokens({
+      WOO_SMOKE_ALICE_APIKEY: "session:s_alice",
+      WOO_SMOKE_BOB_APIKEY: "apikey:bob:secret-b"
+    })).toThrow("apikey:<id>:<secret>");
   });
 
   it("aborts the in-flight step body when the watchdog fires", async () => {

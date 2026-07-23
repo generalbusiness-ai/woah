@@ -244,6 +244,8 @@ must include a vitest case before it lands.
 **Net coherence path** (spec/protocol/coherence.md, spec/operations/net-cutover.md):
 
 - `npm run install:net-dev` — seed + activate a net world on the workerd net lane.
+- `npm run install:net-canary` — seed + activate a deployed acceptance canary
+  with two environment-supplied, canary-only MCP API keys.
 - `npm run smoke:net-dev` / `npm run smoke:net-mcp` — Net protocol and shared MCP walkthroughs on workerd.
 - `npm run smoke:walkthrough` — shared cross-actor MCP walkthrough against the deployed worker.
 - `npm run load:net-dev` / `npm run load:net-skew` — concurrency + skewed-load drivers.
