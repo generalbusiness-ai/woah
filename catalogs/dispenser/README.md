@@ -1,79 +1,103 @@
 ---
 name: dispenser
-version: 0.2.3
+version: 1.0.0
 spec_version: v1
 license: MIT
-description: Dispenser block base class — a $block subclass that produces $dispensed_note artifacts in response to public :order requests. The plug supplies the note's listing name, markdown text, and optional one-line look-at description via :deliver(order_id, name, text, description).
+description: Acts-backed artifact dispenser with a bounded, rebuildable queue projection.
 keywords:
   - block
   - dispenser
   - queue
   - artifact
+  - acts
 ---
 
 # dispenser
 
-A `$dispenser_block` is a `$block` subclass for the case where the plug
-*produces a moving artifact* rather than just publishing data. The
-canonical example is a vending machine: the requester `:order`s
-something, the plug processes it outside woo, and a `$dispensed_note`
-arrives in the requester's inventory.
+`$dispenser_block` is the catalog base for asynchronous artifact producers.
+A requester orders work, an authenticated external plug performs it, and the
+block delivers a `$dispensed_note` to the requester.
 
-See [DESIGN.md](DESIGN.md) for the queue-and-deliver pattern and
-sequencing details.
+Dispenser v1 uses Acts for the durable coordination facts. The block is an
+anchored actor composer; its containing room owns the sequenced log; one
+`$dispenser_queue` projection owns queue membership, admission indexes,
+order-id allocation, and terminal receipts. Plugs call typed domain verbs
+through Net and cannot emit or fold Acts directly.
 
-The current v0.2 catalog stores the queue directly. Its next major migration
-keeps the same typed plug verbs but makes a `$dispenser_queue` acts
-projection the sole writer of pending rows. Plugs use those verbs through
-Net; they do not emit raw acts. See the design note for the migration
-contract and legacy-genesis gate.
+## Domain operations
 
-## Properties
-
-### Owner-writable (configuration)
-
-| Name | Default | Notes |
+| Verb | Caller | Result |
 |---|---|---|
-| `system_prompt` | `""` | Persona / configuration handed to the plug. Subclasses may extend the writable_owner list with their own knobs. |
-| `rate_limit_seconds` | `60` | Per-requester minimum interval between orders. |
-| `block_cooldown_seconds` | `5` | Block-wide minimum interval between any two orders, even from different requesters. |
-| `max_pending_orders` | `50` | Queue length cap. `0` means unbounded. |
-| `max_request_chars` | `200` | Per-request size cap. `0` means unbounded. |
+| `order(request)` | authenticated requester | Validates admission, allocates an empty artifact, records `dispenser.ordered`, and returns a ticket. |
+| `next_pending()` | block actor or wizard | Returns the oldest pending request without changing it. |
+| `prepare_artifact(order_id, name, text, description)` | block actor or wizard | Direct, one-shot fill of the order’s exact preallocated artifact; retry returns the same reference. |
+| `deliver(order_id, note)` | block actor or wizard | Moves that prepared artifact and records only its reference in `dispenser.delivered`. |
+| `cancel(order_id)` | requester, owner, block actor, or wizard | Records `dispenser.canceled`. Unauthorized callers receive the same `unknown` answer as an absent id. |
+| `status(order_id)` | authenticated caller | Returns queued or terminal state only to the requester and operators; otherwise `unknown`. |
 
-### Plug-writable (data)
+`order`, `deliver`, and `cancel` require a sequenced turn on
+`location(block)`. Direct and wrong-room mutations fail.
+`prepare_artifact` requires a direct turn: generated prose is an artifact
+write, not a room-log message. Order allocation, delivery movement, Acts, and
+every fold are fail-closed.
 
-| Name | Notes |
-|---|---|
-| `pending_orders` | Authoritative queue. Plug reads via `:next_pending()` and clears via `:deliver()`. |
-| `next_order_seq` | Monotonic id counter for `order_id` minting. |
-| `last_request_at` | Per-requester timestamp map for rate-limit enforcement. |
-| `last_order_at` | Block-wide timestamp for cooldown enforcement. |
+After the first Act, even an operator cannot move the block to another room:
+the queue is bound to that room log. A future relocation operation must
+transfer both authorities explicitly.
 
-## Verbs
+## Bounds
 
-| Verb | Caller | Notes |
-|---|---|---|
-| `:order(request)` | public | Checks request size, queue cap, block cooldown, and requester rate limit; appends to `pending_orders`, tells the requester it was accepted, returns `{order_id, queued, text, ts}`, and emits `order_placed`. Net calls are sequenced; legacy direct calls are live. |
-| `:deliver(order_id, name, text, description)` | block actor (plug) or wizard | Idempotent. Removes the entry, creates a `$dispensed_note` owned by the block with the supplied `name` (inventory listing label), markdown `text` (what `read` returns, capped at 262144 chars by `$note.set_text`), and optional `description` (the one-line cosmetic look-at flavour; per LambdaCore `$note`, this is what `look` shows — pass null/empty to leave it unset). `name` and `text` are required strings. Moves the note to the requester, tells them it arrived, and emits `delivered`. |
-| `:cancel(order_id)` | requester / owner / plug / wizard | Removes the entry, emits `canceled`. The plug (block-actor session, authenticated via apikey) can cancel its own pending orders so a poisoned queue head doesn't block delivery of every following order. |
-| `:next_pending()` | block actor (plug) or wizard | Returns the oldest queued entry, or `null`. It mutates nothing and emits no act; the Net plug path still runs it as a sequenced turn, while legacy direct polling is live. |
-| `:status(order_id)` | public | Returns `{state: "queued", ts}` or `{state: "unknown"}`. |
+Owner settings may lower, never remove, the catalog ceilings:
 
-## Output: `$dispensed_note`
+| Setting | Default | Hard ceiling |
+|---|---:|---:|
+| `max_pending_orders` | 50 | 50 rows |
+| `max_request_chars` | 200 | 200 characters |
+| `rate_limit_seconds` | 60 | `0` disables the requester interval |
+| `block_cooldown_seconds` | 5 | `0` disables the block interval |
 
-A `$note` subclass with `produced_by` (the producing block) and
-`produced_at` (epoch ms) back-references. The note arrives in the
-requester's inventory; a Net-backed delivery records the `delivered`
-observation in the room's sequenced turn for bystanders. Connected-client
-fanout and the requester's direct text are best-effort.
+`0` for either `max_*` selects its hard ceiling; it does not mean unbounded.
+The projection also caps requester-rate entries and terminal receipts at 50
+each and evicts them deterministically by oldest Act sequence, then key.
+Prepared artifact name, description, and body are capped at 256, 4,096, and
+262,144 characters respectively.
 
-Dispensed notes are ephemeral: dropping one into a `$space` recycles it
-and emits `note_dispersed` ("X drops Y, which disperses in a puff of
-smoke."). Hand-offs to other actors or containers move normally.
+Pending request text is the work input and remains inline within the 200
+character ceiling. `dispenser.ordered` includes the preallocated artifact
+reference. Generated prose crosses only `prepare_artifact`; the sequenced
+delivery message and Act carry `order_id` plus the note reference.
 
-## Subclassing
+## Retry contract
 
-Concrete dispensers (e.g. `$horoscope_block`) extend the writable_owner
-list with their own knobs and may override `:order` to validate
-domain-specific input. The base class handles queueing, flood caps,
-delivery, and back-reference plumbing.
+If the direct preparation reply is lost, a fresh-key retry returns the same
+one-shot artifact. The plug reuses `plug:deliver:<block>:<order>` as the Net
+idempotency key for the sequenced transition.
+A same-key retry returns the recorded acceptance and commits nothing; the
+gateway may omit the application result on that replay. A later fresh-key
+retry is resolved by the projection’s bounded receipt and returns the original
+note reference with `duplicate: true`. No retry can mint a second artifact
+while that receipt is retained.
+
+## Upgrade from v0
+
+`migration-v0-to-v1.json` renames the old direct queue fields to private legacy
+inputs. The first sequenced mutation atomically:
+
+1. records the preserved next-order counter as `dispenser.genesis`;
+2. allocates an empty artifact and records each pending row in stored order as
+   `dispenser.legacy_ordered`;
+3. folds the complete v1 projection; and
+4. clears the legacy inputs.
+
+Before that mutation, `next_pending` and `status` can still expose legacy work
+to its requester or the plug. Rate-limit history deliberately expires at
+cutover. A legacy queue above 50 rows or containing a request above 200
+characters refuses cutover with `E_QUOTA`; a wizard must repair that private
+legacy input before retrying. Nothing is truncated and no projection state is
+seeded behind `fold`.
+
+Dropping a `$dispensed_note` into a room recycles it and emits the live
+`note_dispersed` observation. Moving it to an actor or container works
+normally.
+
+See [DESIGN.md](DESIGN.md) for the authority and migration rationale.

@@ -362,7 +362,7 @@ describe("outliner v1 -> v2 migration", () => {
   });
 
   // ---- Boot-upgrade lane: installLocalCatalogs against the REAL bundled
-  // outliner (now v3.0.0). Local boot applies ONE migration for the whole
+  // outliner (now v3.0.1). Local boot applies ONE migration for the whole
   // installed→bundled jump, so aged worlds rely on composeMigrationChain
   // (src/core/local-catalogs.ts) chaining the per-major-edge files the guard
   // requires: v0→v1 (reparent + retire lifecycle verbs), v1→v2 (edge
@@ -417,7 +417,7 @@ describe("outliner v1 -> v2 migration", () => {
     assertRetiredVerbsRemoved(world);
     // The registry landed on the bundled version — the composed chain updated
     // it atomically with the data rewrites.
-    expect(installedOutlinerVersion(world)).toBe("3.0.0");
+    expect(installedOutlinerVersion(world)).toBe("3.0.1");
     // v3 delivered the acts-era surface.
     expect(world.ownVerbExact("$outliner", "tree_view")).not.toBeNull();
   }
@@ -514,7 +514,7 @@ describe("outliner v1 -> v2 migration", () => {
 
     // v2→v3 performs no data rewrites: the authored edge survives byte-for-byte.
     expect(world.propOrNull("bi_a", "__ordered_edge")).toEqual({ parent: null, rank: "V1" });
-    expect(installedOutlinerVersion(world)).toBe("3.0.0");
+    expect(installedOutlinerVersion(world)).toBe("3.0.1");
     expect(world.ownVerbExact("$outliner", "tree_view")).not.toBeNull();
   });
 });

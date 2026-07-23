@@ -77,6 +77,54 @@ async function callInDubspace(
   return world.call(requestId, sessionId, "the_dubspace", request);
 }
 
+/** Production-shaped Dispenser mutation: the anchored block composes its Act
+ * on the containing room's sequenced log. Direct calls deliberately fail
+ * ACT3, so catalog tests must exercise the same route as an authenticated
+ * Net plug/requester. */
+async function dispenserCall(
+  world: ReturnType<typeof createWorld>,
+  requestId: string,
+  actor: string,
+  block: string,
+  verb: "order" | "deliver" | "cancel",
+  args: unknown[]
+): Promise<DirectResultFrame | ErrorFrame> {
+  const session = Array.from(world.sessions.values()).find((candidate) => candidate.actor === actor);
+  if (!session) throw new Error(`missing session for dispenser actor ${actor}`);
+  const logSpace = world.object(block).location;
+  if (!logSpace) throw new Error(`dispenser ${block} is not anchored in a log space`);
+  const frame = await world.call(requestId, session.id, logSpace, { actor, target: block, verb, args: args as WooValue[] });
+  if (frame.op !== "applied") return frame as ErrorFrame;
+  const observations = frame.observations ?? [];
+  const error = observations.find((observation) => observation.type === "$error");
+  if (error) return { op: "error", error: error as unknown as ErrorFrame["error"] };
+  return { op: "result", result: frame.result ?? null, observations, audience: null };
+}
+
+/** Fill the room-anchored artifact allocated by :order without recording the
+ * generated prose in the room log, then deliver only its reference. */
+async function dispenserProduce(
+  world: ReturnType<typeof createWorld>,
+  requestId: string,
+  actor: string,
+  block: string,
+  orderId: string,
+  name: string,
+  text: string,
+  description: string | null = null
+): Promise<DirectResultFrame | ErrorFrame> {
+  const prepared = await world.directCall(`${requestId}-prepare`, actor, block, "prepare_artifact", [
+    orderId,
+    name,
+    text,
+    description
+  ]);
+  if (prepared.op !== "result") return prepared;
+  const note = (prepared.result as { note?: unknown }).note;
+  if (typeof note !== "string") throw new Error(`prepare_artifact returned no note: ${JSON.stringify(prepared)}`);
+  return dispenserCall(world, requestId, actor, block, "deliver", [orderId, note]);
+}
+
 function worldVerb(world: ReturnType<typeof createWorld>, object: string, name: string) {
   const verb = world.ownVerbExact(object, name);
   expect(verb, `${object}:${name} should exist`).toBeDefined();
@@ -3562,19 +3610,19 @@ describe("local catalogs", () => {
     const requester = requesterSess.actor;
     await world.directCall("read-repair-enter", requester, "the_chatroom", "enter", []);
 
-    const ordered = await world.directCall("read-repair-order", requester, blockId, "order", ["world of objects"]);
+    const ordered = await dispenserCall(world, "read-repair-order", requester, blockId, "order", ["world of objects"]);
     expect(ordered.op).toBe("result");
     if (ordered.op !== "result") return;
     const orderId = (ordered.result as { order_id: string }).order_id;
 
     const key = world.createApiKey("$wiz", blockId, "read-repair-plug");
     world.auth(`apikey:${key.id}:${key.secret}`);
-    const delivered = await world.directCall("read-repair-deliver", blockId, blockId, "deliver", [
+    const delivered = await dispenserProduce(world, "read-repair-deliver", blockId, blockId,
       orderId,
       "Horoscope: World Of Objects",
       "Today's reading: cosmic radiance.",
       "A horoscope reading the machine produced for \"world of objects\". Try `read` to see what it says."
-    ]);
+    );
     expect(delivered.op).toBe("result");
     if (delivered.op !== "result") return;
     const note = (delivered.result as { note: string }).note;
@@ -3939,21 +3987,32 @@ describe("local catalogs", () => {
       const requesterSess = world.auth("guest:disp-requester");
       const requester = requesterSess.actor;
 
-      // 1. Public :order returns a ticket synchronously, queues the entry,
-      //    and emits an order_placed observation.
-      const ordered = await world.directCall("disp-order", requester, blockId, "order", ["scorpio"]);
+      // 1. Public :order returns a ticket synchronously and records the
+      // concise authoritative Act. The request is bounded work input; actor,
+      // room, timestamp, and verb remain in the log envelope.
+      const ordered = await dispenserCall(world, "disp-order", requester, blockId, "order", ["scorpio"]);
       expect(ordered.op).toBe("result");
       if (ordered.op !== "result") return;
       const orderResult = ordered.result as { order_id: string; queued: boolean; text: string };
       expect(orderResult.queued).toBe(true);
       expect(orderResult.order_id).toMatch(/^ord_\d+$/);
       expect(orderResult.text).toContain("accepts your order");
-      const orderPlaced = ordered.observations.find((o) => o.type === "order_placed");
-      expect(orderPlaced).toMatchObject({ type: "order_placed", block: blockId, requester, request: "scorpio", text: expect.stringContaining("accepts your order") });
+      const orderPlaced = ordered.observations.find((o) => o.type === "dispenser.ordered");
+      expect(orderPlaced).toMatchObject({
+        type: "dispenser.ordered",
+        version: 1,
+        source: blockId,
+        payload: {
+          order_id: orderResult.order_id,
+          request: "scorpio",
+          artifact: expect.any(String)
+        }
+      });
       expect(ordered.observations).toEqual(expect.arrayContaining([
         expect.objectContaining({ type: "text", target: requester, text: expect.stringContaining("accepts your order") })
       ]));
-      expect((world.getProp(blockId, "pending_orders") as unknown[]).length).toBe(1);
+      const queue = (world.getProp(blockId, "projections") as string[])[0];
+      expect(Object.keys(world.getProp(queue, "rows") as Record<string, unknown>)).toEqual([orderResult.order_id]);
 
       // 2. Plug authenticates as the block actor and reads next_pending.
       const key = world.createApiKey("$wiz", blockId, "test-plug");
@@ -3968,12 +4027,12 @@ describe("local catalogs", () => {
       //    description (cosmetic look-at flavour) + body. Per LambdaCore
       //    $note, .description is what `look` shows; .text is what `read`
       //    returns.
-      const delivered = await world.directCall("disp-deliver", blockId, blockId, "deliver", [
+      const delivered = await dispenserProduce(world, "disp-deliver", blockId, blockId,
         orderResult.order_id,
         "Horoscope: Scorpio",
         "Today's horoscope: avoid llamas.",
         "A horoscope reading for scorpio."
-      ]);
+      );
       expect(delivered.op).toBe("result");
       if (delivered.op !== "result") return;
       const dRes = delivered.result as { delivered: boolean; note: string; text: string };
@@ -3984,28 +4043,48 @@ describe("local catalogs", () => {
       expect(world.getProp(dRes.note, "description")).toBe("A horoscope reading for scorpio.");
       expect(world.getProp(dRes.note, "text")).toBe("Today's horoscope: avoid llamas.");
       expect(world.getProp(dRes.note, "produced_by")).toBe(blockId);
+      expect(delivered.observations.some((observation) => observation.type === "note_edited")).toBe(false);
+      expect(JSON.stringify(delivered.observations)).not.toContain("Today's horoscope: avoid llamas.");
       expect(delivered.observations).toEqual(expect.arrayContaining([
         expect.objectContaining({ type: "text", target: requester, text: expect.stringContaining("delivers a note to your inventory") }),
-        expect.objectContaining({ type: "delivered", block: blockId, requester, note: dRes.note, text: expect.stringContaining("delivers a note to your inventory") })
+        expect.objectContaining({
+          type: "dispenser.delivered",
+          version: 1,
+          source: blockId,
+          payload: { order_id: orderResult.order_id, note: dRes.note }
+        })
       ]));
-      expect((world.getProp(blockId, "pending_orders") as unknown[]).length).toBe(0);
+      const deliveryEntry = world.replay(roomId, 1, 100).find(
+        (entry) => entry.message.verb === "deliver"
+      );
+      expect(deliveryEntry?.message.args).toEqual([orderResult.order_id, dRes.note]);
+      expect(JSON.stringify(deliveryEntry)).not.toContain("Today's horoscope: avoid llamas.");
+      expect(world.getProp(queue, "rows")).toEqual({});
 
-      // 4. Idempotent re-deliver returns delivered:false.
-      const redeliver = await world.directCall("disp-redeliver", blockId, blockId, "deliver", [orderResult.order_id, "Horoscope: Scorpio", "again"]);
+      // 4. Domain receipt survives a dropped reply: retry returns the original
+      // note and cannot mint another artifact.
+      const redeliver = await dispenserCall(world, "disp-redeliver", blockId, blockId, "deliver", [
+        orderResult.order_id,
+        dRes.note
+      ]);
       expect(redeliver.op).toBe("result");
       if (redeliver.op === "result") {
-        const r = redeliver.result as { delivered: boolean; reason: string };
-        expect(r.delivered).toBe(false);
-        expect(r.reason).toBe("unknown_or_already_delivered");
+        const r = redeliver.result as { delivered: boolean; duplicate: boolean; note: string };
+        expect(r).toMatchObject({ delivered: true, duplicate: true, note: dRes.note });
       }
 
       // 5. Stranger cannot deliver someone else's order.
       const strangerSess = world.auth("guest:disp-stranger");
-      const order2 = await world.directCall("disp-order-2", requester, blockId, "order", ["leo"]);
+      const order2 = await dispenserCall(world, "disp-order-2", requester, blockId, "order", ["leo"]);
       expect(order2.op).toBe("result");
       if (order2.op !== "result") return;
       const strangerOrderId = (order2.result as { order_id: string }).order_id;
-      const strangerDeliver = await world.directCall("stranger-deliver", strangerSess.actor, blockId, "deliver", [strangerOrderId, "Sneak", "haha"]);
+      const order2Act = order2.observations.find((observation) => observation.type === "dispenser.ordered");
+      const strangerArtifact = (order2Act as unknown as { payload: { artifact: string } }).payload.artifact;
+      const strangerDeliver = await dispenserCall(world, "stranger-deliver", strangerSess.actor, blockId, "deliver", [
+        strangerOrderId,
+        strangerArtifact
+      ]);
       expect(strangerDeliver.op).toBe("error");
       if (strangerDeliver.op === "error") expect(strangerDeliver.error.code).toBe("E_PERM");
 
@@ -4014,12 +4093,12 @@ describe("local catalogs", () => {
       //    poisoned order — e.g. one whose deliver verb keeps raising —
       //    would block every following order forever, since :next_pending
       //    only peeks.
-      const plugCancel = await world.directCall("plug-cancel", blockId, blockId, "cancel", [strangerOrderId]);
+      const plugCancel = await dispenserCall(world, "plug-cancel", blockId, blockId, "cancel", [strangerOrderId]);
       expect(plugCancel.op).toBe("result");
       if (plugCancel.op === "result") {
         expect(plugCancel.result).toMatchObject({ order_id: strangerOrderId, canceled: true });
       }
-      expect((world.getProp(blockId, "pending_orders") as unknown[]).length).toBe(0);
+      expect(world.getProp(queue, "rows")).toEqual({});
     });
 
     it("$dispenser_block keeps queue internals out of public get_data", async () => {
@@ -4028,21 +4107,23 @@ describe("local catalogs", () => {
       const owner = world.auth("guest:disp-private-owner").actor;
       const requester = world.auth("guest:disp-private-requester").actor;
       const stranger = world.auth("guest:disp-private-stranger").actor;
+      const roomId = "obj_test_disp_private_room";
+      world.createObject({ id: roomId, name: roomId, parent: "$space", owner: "$wiz", location: null });
       const blockId = "obj_test_disp_private";
-      world.createObject({ id: blockId, name: blockId, parent: "$dispenser_block", owner, location: "$nowhere" });
+      world.createObject({ id: blockId, name: blockId, parent: "$dispenser_block", owner, location: roomId });
       world.setProp(blockId, "rate_limit_seconds", 0);
       world.setProp(blockId, "block_cooldown_seconds", 0);
 
-      const ordered = await world.directCall("private-order", requester, blockId, "order", ["private prompt"]);
+      const ordered = await dispenserCall(world, "private-order", requester, blockId, "order", ["private prompt"]);
       expect(ordered.op).toBe("result");
 
-      const leaked = await world.directCall("private-leak", stranger, blockId, "get_data", ["pending_orders"]);
+      const leaked = await world.directCall("private-leak", stranger, blockId, "get_data", ["projections"]);
       expect(leaked.op).toBe("error");
       if (leaked.op === "error") expect(leaked.error.code).toBe("E_PERM");
 
-      const ownerRead = await world.directCall("private-owner-read", owner, blockId, "get_data", ["pending_orders"]);
+      const ownerRead = await world.directCall("private-owner-read", owner, blockId, "get_data", ["projections"]);
       expect(ownerRead.op).toBe("result");
-      if (ownerRead.op === "result") expect(ownerRead.result).toMatchObject([{ request: "private prompt", requester }]);
+      if (ownerRead.op === "result") expect(ownerRead.result).toHaveLength(1);
     });
 
     it("$dispenser_block:order rate-limits per requester", async () => {
@@ -4059,9 +4140,9 @@ describe("local catalogs", () => {
       world.setProp(blockId, "block_cooldown_seconds", 0);
       const requesterSess = world.auth("guest:disp-rate-requester");
       const requester = requesterSess.actor;
-      const first = await world.directCall("rate-1", requester, blockId, "order", ["aries"]);
+      const first = await dispenserCall(world, "rate-1", requester, blockId, "order", ["aries"]);
       expect(first.op).toBe("result");
-      const second = await world.directCall("rate-2", requester, blockId, "order", ["taurus"]);
+      const second = await dispenserCall(world, "rate-2", requester, blockId, "order", ["taurus"]);
       expect(second.op).toBe("error");
       if (second.op === "error") {
         expect(second.error.code).toBe("E_RATE_LIMIT");
@@ -4082,10 +4163,10 @@ describe("local catalogs", () => {
       // Default block_cooldown_seconds=5; first order primes last_order_at.
       const a = world.auth("guest:cool-a").actor;
       const b = world.auth("guest:cool-b").actor;
-      const first = await world.directCall("cool-1", a, blockId, "order", ["one"]);
+      const first = await dispenserCall(world, "cool-1", a, blockId, "order", ["one"]);
       expect(first.op).toBe("result");
       // Different actor inside the cooldown window must be rejected.
-      const second = await world.directCall("cool-2", b, blockId, "order", ["two"]);
+      const second = await dispenserCall(world, "cool-2", b, blockId, "order", ["two"]);
       expect(second.op).toBe("error");
       if (second.op === "error") {
         expect(second.error.code).toBe("E_RATE_LIMIT");
@@ -4107,15 +4188,15 @@ describe("local catalogs", () => {
       world.setProp(blockId, "max_pending_orders", 2);
 
       const requester = world.auth("guest:caps-req").actor;
-      const oversized = await world.directCall("caps-too-big", requester, blockId, "order", ["x".repeat(17)]);
+      const oversized = await dispenserCall(world, "caps-too-big", requester, blockId, "order", ["x".repeat(17)]);
       expect(oversized.op).toBe("error");
       if (oversized.op === "error") expect(oversized.error.code).toBe("E_INVARG");
       // Queue cap.
       for (let i = 0; i < 2; i++) {
-        const r = await world.directCall(`caps-${i}`, requester, blockId, "order", [`o${i}`]);
+        const r = await dispenserCall(world, `caps-${i}`, requester, blockId, "order", [`o${i}`]);
         expect(r.op).toBe("result");
       }
-      const overflow = await world.directCall("caps-overflow", requester, blockId, "order", ["nope"]);
+      const overflow = await dispenserCall(world, "caps-overflow", requester, blockId, "order", ["nope"]);
       expect(overflow.op).toBe("error");
       if (overflow.op === "error") expect(overflow.error.code).toBe("E_QUEUE_FULL");
     });
@@ -4125,16 +4206,18 @@ describe("local catalogs", () => {
       installLocalCatalogs(world, ["dispenser"]);
       const owner = world.auth("guest:disp-helper-owner").actor;
       const requester = world.auth("guest:disp-helper-requester").actor;
+      const roomId = "obj_test_disp_helpers_room";
+      world.createObject({ id: roomId, name: roomId, parent: "$space", owner: "$wiz", location: null });
       const blockId = "obj_test_disp_helpers";
-      world.createObject({ id: blockId, name: blockId, parent: "$dispenser_block", owner, location: null });
+      world.createObject({ id: blockId, name: blockId, parent: "$dispenser_block", owner, location: roomId });
 
-      expect(world.verbInfo("$dispenser_block", "check_order_limits").direct_callable).toBe(false);
-      expect(world.verbInfo("$dispenser_block", "enqueue_order").direct_callable).toBe(false);
+      expect(world.verbInfo("$dispenser_block", "_ensure_acts").direct_callable).toBe(false);
+      expect(world.verbInfo("$dispenser_block", "_queue").direct_callable).toBe(false);
 
-      const direct = await world.directCall("helper-direct-denied", requester, blockId, "enqueue_order", ["bypass"]);
+      const direct = await world.directCall("helper-direct-denied", requester, blockId, "_ensure_acts", []);
       expect(direct.op).toBe("error");
       if (direct.op === "error") expect(direct.error.code).toBe("E_DIRECT_DENIED");
-      expect(world.getProp(blockId, "pending_orders")).toEqual([]);
+      expect(world.getProp(blockId, "projections")).toEqual([]);
     });
 
     it("$dispensed_note disperses in a puff of smoke when dropped into a $space via chat:drop", async () => {
@@ -4153,18 +4236,18 @@ describe("local catalogs", () => {
       const entered = await world.directCall("puff-enter", requester, roomId, "enter", []);
       expect(entered.op).toBe("result");
 
-      const ordered = await world.directCall("puff-order", requester, blockId, "order", ["scorpio"]);
+      const ordered = await dispenserCall(world, "puff-order", requester, blockId, "order", ["scorpio"]);
       expect(ordered.op).toBe("result");
       if (ordered.op !== "result") return;
       const orderId = (ordered.result as { order_id: string }).order_id;
       const key = world.createApiKey("$wiz", blockId, "test-puff-plug");
       world.auth(`apikey:${key.id}:${key.secret}`);
-      const delivered = await world.directCall("puff-deliver", blockId, blockId, "deliver", [
+      const delivered = await dispenserProduce(world, "puff-deliver", blockId, blockId,
         orderId,
         "Horoscope: Scorpio",
         "Avoid llamas today.",
         "A small folded slip."
-      ]);
+      );
       expect(delivered.op).toBe("result");
       if (delivered.op !== "result") return;
       const noteId = (delivered.result as { note: string }).note;
@@ -4202,13 +4285,21 @@ describe("local catalogs", () => {
 
       const aliceSess = world.auth("guest:handoff-alice");
       const bobSess = world.auth("guest:handoff-bob");
-      const ordered = await world.directCall("handoff-order", aliceSess.actor, blockId, "order", ["leo"]);
+      const ordered = await dispenserCall(world, "handoff-order", aliceSess.actor, blockId, "order", ["leo"]);
       expect(ordered.op).toBe("result");
       if (ordered.op !== "result") return;
       const orderId = (ordered.result as { order_id: string }).order_id;
       const key = world.createApiKey("$wiz", blockId, "test-handoff-plug");
       world.auth(`apikey:${key.id}:${key.secret}`);
-      const delivered = await world.directCall("handoff-deliver", blockId, blockId, "deliver", [orderId, "Horoscope: Leo", "Roar.", null]);
+      const delivered = await dispenserProduce(
+        world,
+        "handoff-deliver",
+        blockId,
+        blockId,
+        orderId,
+        "Horoscope: Leo",
+        "Roar."
+      );
       expect(delivered.op).toBe("result");
       if (delivered.op !== "result") return;
       const noteId = (delivered.result as { note: string }).note;
@@ -4240,13 +4331,21 @@ describe("local catalogs", () => {
       world.setProp(blockId, "block_cooldown_seconds", 0);
 
       const aliceSess = world.auth("guest:lock-alice");
-      const ordered = await world.directCall("lock-order", aliceSess.actor, blockId, "order", ["aries"]);
+      const ordered = await dispenserCall(world, "lock-order", aliceSess.actor, blockId, "order", ["aries"]);
       expect(ordered.op).toBe("result");
       if (ordered.op !== "result") return;
       const orderId = (ordered.result as { order_id: string }).order_id;
       const key = world.createApiKey("$wiz", blockId, "test-lock-plug");
       world.auth(`apikey:${key.id}:${key.secret}`);
-      const delivered = await world.directCall("lock-deliver", blockId, blockId, "deliver", [orderId, "Horoscope: Aries", "Charge ahead.", null]);
+      const delivered = await dispenserProduce(
+        world,
+        "lock-deliver",
+        blockId,
+        blockId,
+        orderId,
+        "Horoscope: Aries",
+        "Charge ahead."
+      );
       expect(delivered.op).toBe("result");
       if (delivered.op !== "result") return;
       const noteId = (delivered.result as { note: string }).note;
@@ -4390,7 +4489,7 @@ describe("local catalogs", () => {
 
       const requesterSess = world.auth("guest:horo-requester");
       const requester = requesterSess.actor;
-      const ordered = await world.directCall("horo-order", requester, blockId, "order", ["scorpio"]);
+      const ordered = await dispenserCall(world, "horo-order", requester, blockId, "order", ["scorpio"]);
       expect(ordered.op).toBe("result");
       if (ordered.op !== "result") return;
       const orderId = (ordered.result as { order_id: string }).order_id;
@@ -4415,7 +4514,17 @@ describe("local catalogs", () => {
       expect(world.getProp(blockId, "writable_owner")).toEqual(["system_prompt", "rate_limit_seconds", "block_cooldown_seconds", "max_pending_orders", "max_request_chars"]);
 
       // Plug-as-block delivers; note arrives in requester inventory with back-references.
-      const delivered = await world.directCall("horo-deliver", blockId, blockId, "deliver", [orderId, "Horoscope: Scorpio", "Today the stars suggest sandwiches."]);
+      const plugKey = world.createApiKey("$wiz", blockId, "horoscope-test-plug");
+      world.auth(`apikey:${plugKey.id}:${plugKey.secret}`);
+      const delivered = await dispenserProduce(
+        world,
+        "horo-deliver",
+        blockId,
+        blockId,
+        orderId,
+        "Horoscope: Scorpio",
+        "Today the stars suggest sandwiches."
+      );
       expect(delivered.op).toBe("result");
       if (delivered.op !== "result") return;
       const noteId = (delivered.result as { note: string }).note;
@@ -4440,15 +4549,25 @@ describe("local catalogs", () => {
       world.setProp(blockId, "rate_limit_seconds", 0);
       world.setProp(blockId, "block_cooldown_seconds", 0);
 
-      const ordered = await world.directCall("horo-long-order", requester, blockId, "order", ["gemini"]);
+      const ordered = await dispenserCall(world, "horo-long-order", requester, blockId, "order", ["gemini"]);
       expect(ordered.op).toBe("result");
       if (ordered.op !== "result") return;
       const orderId = (ordered.result as { order_id: string }).order_id;
-      // v2 caps $note.text at 262144 chars in :set_text. The dispenser
-      // routes text through that verb, so an oversize body fails at the
-      // producer instead of leaking into the requester's inventory.
+      // v2 caps $note.text at 262144 chars. The dispenser's non-public
+      // one-shot constructor path applies the same cap without emitting a
+      // full-body note_edited observation.
       const huge = "Gemini ".repeat(180_000);
-      const delivered = await world.directCall("horo-long-deliver", blockId, blockId, "deliver", [orderId, "Horoscope: Gemini", huge]);
+      const plugKey = world.createApiKey("$wiz", blockId, "horoscope-long-test-plug");
+      world.auth(`apikey:${plugKey.id}:${plugKey.secret}`);
+      const delivered = await dispenserProduce(
+        world,
+        "horo-long-deliver",
+        blockId,
+        blockId,
+        orderId,
+        "Horoscope: Gemini",
+        huge
+      );
       expect(delivered.op).toBe("error");
       if (delivered.op === "error") expect(delivered.error.code).toBe("E_INVARG");
       // No note minted; inventory stays clean.

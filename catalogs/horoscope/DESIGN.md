@@ -1,66 +1,45 @@
-# horoscope — design notes
+# Horoscope design
 
-## Concept
+Horoscope is intentionally a thin `$dispenser_block` specialization. It proves
+the full queue → authenticated external work → artifact path with a real
+Cloudflare Worker and model, without adding horoscope knowledge to the
+substrate.
 
-The smallest viable demo of the `$dispenser_block` pattern: an
-LLM-driven vending machine. It exists to validate the queue → plug →
-delivery loop end-to-end with a real generative model and a real CF
-Worker, without any horoscope-specific machinery in the substrate.
-The class object is a fertile template: behavior and owner tools live on
-`$horoscope_block`, while deployed machines are ordinary non-fertile
-instances.
+The base Dispenser supplies:
 
-## Why this catalog is tiny
+- sequenced `order`, `deliver`, and `cancel` operations plus direct,
+  one-shot artifact preparation;
+- the bounded `$dispenser_queue` Acts projection;
+- authorization and dropped-reply receipts;
+- `$dispensed_note` creation and delivery; and
+- requester notifications.
 
-Everything about the dispenser pattern lives in `$dispenser_block`:
+Horoscope supplies only `system_prompt`, narrow owner configuration verbs, a
+health-oriented `look_self`, and the plug.
 
-- `:order` / `:deliver` / `:cancel` / `:next_pending` / `:status`
-- the persistent `pending_orders` queue
-- the per-requester rate limit
-- the `$dispensed_note` output type with back-references
-- requester text on accepted orders and delivered notes
+## External plug
 
-`$horoscope_block` only declares "this is the persona-driven LLM
-variant" — its only configuration is `system_prompt` (inherited) and
-the inherited dispenser limit knobs. Owners and wizards use narrow
-configuration verbs (`set_system_prompt`, `set_rate_limits`,
-`set_queue_limits`) rather than the raw generic `$block:set_property`
-surface. No `tone` property. No `house_style`. No follow-up URL. The
-plug picks the prompt-and-request shape, the queue lives on the block,
-and the note in your hand is how you know it's done.
+The Worker authenticates as the block actor, then:
 
-## Plug
+1. reads `system_prompt` through a short in-isolate cache;
+2. calls `next_pending()` through Net;
+3. sends the prompt and bounded request to
+   `@cf/meta/llama-3.2-1b-instruct`;
+4. derives the note’s listing name and look description;
+5. fills the preallocated note through direct `prepare_artifact(...)`; and
+6. calls sequenced `deliver(order_id, note)` with a stable key.
 
-`catalogs/horoscope/plug/` — a CF Worker that:
+This split is an authority boundary, not transport ceremony: generated prose
+belongs to the artifact and never appears in the durable room transcript.
 
-1. Authenticates as the block actor via `apikey:` (Worker secret).
-2. Polls / wakes via the directed `text` hint emitted by `:order`.
-3. Reads the next entry via live/read-only `:next_pending()`; the plug
-   caches `system_prompt` briefly so empty cron ticks do not cold-read the
-   block host every minute.
-4. Calls Workers AI: `@cf/meta/llama-3.2-1b-instruct` with
-   `messages: [{role: "system", content: block.system_prompt},
-                {role: "user",   content: order.request}]`.
-5. Calls `:deliver(order_id, name, text, description)` with the derived listing name (e.g. `"Horoscope: Scorpio"`), the model's reply as the note text, and a short cosmetic look-at description (e.g. `A horoscope reading the machine produced for "scorpio". Try \`read\` to see what it says.`). Per LambdaCore `$note`, the description is what `look` shows; the text is what `read` returns.
+Queue state is never exposed as a writable block property. `last_pushed_at` and
+`last_error` remain direct plug-writable diagnostics because they describe
+external service health, not work coordination.
 
-Failure modes set `last_error` via `:set_properties` so `:look` surfaces
-the trouble. Empty ticks throttle the `last_pushed_at` heartbeat; delivery
-and error ticks still write immediately.
+AI failures produce a bounded fallback note so one poisoned generation cannot
+stall the queue. Permanent delivery errors cancel the order; transient errors
+leave it pending for the next tick.
 
-## Model choice
-
-`@cf/meta/llama-3.2-1b-instruct` — smallest instruction-tuned text
-model on Workers AI (1B params). At ~300–400 output tokens per
-horoscope, one order costs roughly $0.0001 — negligible. If output
-quality feels under-cooked we can move to `llama-3.2-3b-instruct`
-without touching the catalog.
-
-## Out of scope for v0.1
-
-- Streaming output (the plug calls `:deliver` only with the full body).
-- Multi-turn conversation (each order is independent).
-- Source citations / structured output.
-- Charging or quotas (rate limit per requester is the only throttle).
-
-See [`notes/2026-05-05-block-and-plug.md`](../../notes/2026-05-05-block-and-plug.md)
-for the broader pattern.
+Streaming, multi-turn conversation, citations, charging, TTLs, and dead-letter
+states are outside this example. They should be added as explicit domain facts
+only when a real product policy requires them.

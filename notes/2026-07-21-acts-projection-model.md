@@ -23,14 +23,15 @@ seams (`event_schema` builtin; `ts` on `replay()`), the `acts` catalog
 refusals, fail-closed atomicity (a refused fold rolls back the minted
 artifact with the turn — verified), and the rebuild invariant. `npm
 test` green. Implementation findings folded into the sketches below:
-fold input carries the envelope seq (§2.4); `$space` instances own-seed
+fold input carries recorded envelope seq, actor, and composer source (§2.4);
+`$space` instances own-seed
 `features: []`, so the `$acts` feature mounts per instance at
 `:initialize` while a class-level attach satisfies the installer's
 static this-call resolution. RETARGET (user decision, same day): **Outliner replaces
 Tasks as the first real migration target** — user-ready, its net repair
 loop is the model's motivating bug, and the facade note already chose
 it as the client's first adopter; casework keeps the tasks-shaped
-proof. **Dispenser migrates next as the first plug-backed consumer;
+proof. **Dispenser is now the second consumer and first plug-backed proof;
 Tasks follows.** Split landed: `acts` is the generic
 kernel; `casework` is the temporary proof catalog. Outliner phase 1
 landed (validated guarded emission on the five structural verbs against
@@ -59,8 +60,18 @@ pages participate in normal local-or-attested read validation. A fresh
 Net planner, while real workerd proves the same durable page repair over
 SQLite/RPC (26/26). RESOLVED (2026-07-22): Outliner client adoption uses the
 generic semantic-view facade over `tree_view`; full structural parity, legacy
-genesis, stale-read rejection, and deletion accounting are pinned. Outstanding:
-the Dispenser and Tasks migrations and E4/E5 gate. Tier C's Outliner read/fanout
+genesis, stale-read rejection, and deletion accounting are pinned. RESOLVED
+(2026-07-23): Dispenser v1 uses an earned anchored-actor composer form: the
+block owns typed domain verbs while its containing room owns the sequenced log.
+One bounded projection owns queue membership, id allocation, admission
+indexes, and terminal receipts. Order preallocates a room-anchored artifact;
+the plug fills it directly, then sequenced delivery carries only its reference,
+so neither the Act nor the room message copies generated prose. The proof
+covers authenticated Net ingress, same-key dropped-reply
+dedupe plus fresh-key domain receipt recovery, fail-closed artifact rollback,
+SQLite v0 genesis, hard caps, and a fresh projection rebuilding rows, receipt,
+counter, and watermark through the sparse owner-attested Net replay path.
+Outstanding: the Tasks/Kanban migration and E4/E5 gate. Tier C's Outliner read/fanout
 lane is now concrete: real workerd/Net, 1,000 rows, eight principals, three Act
 invalidation waves; warm p50/p95 92/101 ms, 145,485–145,491-byte responses,
 32–36 ms mutation-to-all-seven-peer-push (276–278-byte Act frames), and
@@ -151,7 +162,7 @@ turns every other representation into a fold.
 ```
 { "type": "tasks.claimed",     // namespace.name
   "version": 1,                // schema version, immutable per version
-  "payload": { "task": #123, "holder": #45 } }
+  "payload": { "task": #123 } }
 ```
 
 The **envelope is the log entry**: room, seq, actor, timestamp, verb
@@ -196,14 +207,16 @@ is deliberately deferred until one real migration requires it.
 
 ```
 consumes: [act types]
-source_space  — non-public binding to the one composer/authority
+source_space  — non-public binding to the one composer
+log_space     — non-public binding to the one sequenced log
 :fold(act)    — deterministic given (projection state, act); sole writer
-                of ALL projection state; O(payload); no foreign reads;
+                of ALL projection state; scans only payload + declared
+                fixed caps; no foreign reads;
                 no wall clock; must update at_seq from act["seq"]
                 accepts only source_space, live or during rebuild
 :view(opts)   — the one authoritative bounded read
                 → { page, at_seq, has_more }
-:rebuild_from(space, from_seq)
+:rebuild_from(log_space, page_budget)
               — operator rebuild: re-folds recorded acts (skipping
                 failed entries), never re-executes verbs; owner/wizard
 rows          — keyed map prop; row_cap (v1 default 1000); overflow
@@ -300,11 +313,13 @@ verb :act(type, payload) r {
     raise { code: "E_INVARG", message: "unknown act type", value: type };
   }
   this:_validate_payload(d, payload);      /* flat shape check */
-  let act = { "type": type, "version": 1, "payload": payload };
-  /* Folds receive the act plus its envelope seq, injected here (live)
-     or by :rebuild_from (recorded). The observed act body stays free of
-     envelope fields — the log entry is the envelope. */
-  let fold_input = { "type": type, "version": 1, "payload": payload, "seq": seq };
+  let act = { "type": type, "version": 1, "payload": payload, "source": this };
+  /* Folds receive recorded envelope identity, injected identically live
+     and by :rebuild_from. The semantic body stays free of those fields. */
+  let fold_input = {
+    "type": type, "version": 1, "payload": payload,
+    "seq": seq, "actor": actor, "source": this
+  };
   for p in this.projections {
     if (!valid(p) || !isa(p, $projection) || p.source_space != this) {
       raise { code: "E_INVARG", message: "projection is not bound to emitting space" };
@@ -433,7 +448,7 @@ machinery; `case.digest`.
     "shape": { "task": "obj", "kind": "str", "labels": "list",
                "obligations": "list" } },
   { "on": "$case", "type": "tasks.claimed",
-    "shape": { "task": "obj", "holder": "obj" } },
+    "shape": { "task": "obj" } },
   { "on": "$case", "type": "tasks.passed",
     "shape": { "task": "obj", "obligation": "str" } },
   { "on": "$case", "type": "tasks.closed",
@@ -625,17 +640,19 @@ previously missed `note_writers_changed` path. The useful delta is eight
 bespoke lifecycle concepts removed and one shared controller added, not a
 claimed net-LoC reduction.
 
-1. **Migrate Dispenser.** Keep Net-authenticated `:order`, `:deliver`, and
-   `:cancel` as the public surface; emit fixed acts internally; replace the
-   directly-written queue and admission maps with `$dispenser_queue`; carry
-   the delivered note by reference; and prove dropped-reply idempotency,
+1. **Dispenser — implemented; release gate pending.** Net-authenticated
+   `:order`, direct `:prepare_artifact`, sequenced `:deliver`, and `:cancel`
+   form the typed surface; fixed Acts stay internal; `$dispenser_queue`
+   replaces the directly-written queue and admission maps; the
+   preallocated/delivered note travels by reference. Proof covers dropped-reply idempotency,
    legacy genesis, full-state rebuild, deterministic rotating-requester
-   eviction, an absolute queue cap, zero extra queue writers, and a net
-   deletion delta. The field disposition and non-goals are explicit in
-   [`catalogs/dispenser/DESIGN.md`](../catalogs/dispenser/DESIGN.md#acts-migration-next-major).
-2. **Migrate Tasks.** Retire the temporary casework proof through the full
-   field-disposition, parity-golden, client-kanban, and deletion-delta gates
-   in §5.
+   eviction, an absolute queue cap, and zero extra queue writers. The field
+   disposition and non-goals are explicit in
+   [`catalogs/dispenser/DESIGN.md`](../catalogs/dispenser/DESIGN.md).
+   Release it through a separate narrow canary and bake before Tasks.
+2. **Migrate Tasks after the Dispenser bake.** Retire the temporary casework
+   proof through the full field-disposition, parity-golden, client-kanban, and
+   deletion-delta gates in §5.
 3. **Close the remaining release gates.** Run the E4/E5 adversarial lane,
    cold-case measurement, and workerd Tier C budgets.
 

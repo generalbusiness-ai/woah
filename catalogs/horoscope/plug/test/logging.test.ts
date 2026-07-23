@@ -76,9 +76,11 @@ describe("runLoggedHoroscopeTick", () => {
       authReply,
       () => propertyReply("You are a mystical oracle."),
       () => callReply({ order_id: "ord_1", requester: "guest_5", request: "scorpio", ts: 1 }),
-      () => callReply({ ok: true, note: "note_1" }),
+      () => callReply({ prepared: true, note: "note_1" }),
+      () => callReply({ delivered: true, note: "note_1" }),
       () => callReply({ order_id: "ord_2", requester: "guest_6", request: "leo", ts: 2 }),
-      () => callReply({ ok: true, note: "note_2" }),
+      () => callReply({ prepared: true, note: "note_2" }),
+      () => callReply({ delivered: true, note: "note_2" }),
       () => callReply(null),
       () => callReply({ ok: true })
     ]);
@@ -124,7 +126,8 @@ describe("runLoggedHoroscopeTick", () => {
       authReply,
       () => propertyReply("p"),
       () => callReply({ order_id: "ord_1", requester: "guest_x", request: "x", ts: 1 }),
-      () => callReply({ ok: true }),
+      () => callReply({ prepared: true, note: "note_1" }),
+      () => callReply({ delivered: true, note: "note_1" }),
       () => callReply(null),
       () => callReply({ ok: true })
     ]);
@@ -158,6 +161,7 @@ describe("runLoggedHoroscopeTick", () => {
       authReply,
       () => propertyReply("p"),
       () => callReply({ order_id: "ord_1", requester: "g", request: "x", ts: 1 }),
+      () => callReply({ prepared: true, note: "note_1" }),
       () => ({ status: 400, body: { error: { code: "E_INVARG", message: "deliver requires a text string" } } }),
       () => callReply({ order_id: "ord_1", canceled: true }),
       () => callReply(null),
@@ -189,6 +193,7 @@ describe("runLoggedHoroscopeTick", () => {
       authReply,
       () => propertyReply("p"),
       () => callReply({ order_id: "ord_1", requester: "g", request: "x", ts: 1 }),
+      () => callReply({ prepared: true, note: "note_1" }),
       () => ({ status: 504, body: { error: { code: "E_GATEWAY", message: "upstream timed out" } } }),
       () => callReply({ ok: true })
     ]);

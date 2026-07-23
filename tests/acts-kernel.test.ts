@@ -154,6 +154,8 @@ describe("acts kernel proof: lifecycle on the board", () => {
     const acts = (j as { op: "result"; result: Array<Record<string, unknown>> }).result;
     expect(acts.map((a) => a.type)).toEqual(["tasks.opened", "tasks.claimed", "tasks.passed", "tasks.closed"]);
     for (const a of acts) expect(typeof a.ts).toBe("number");
+    expect(acts[1]).toMatchObject({ actor: w.actor, payload: { task } });
+    expect(Object.keys(acts[1].payload as Record<string, unknown>)).toEqual(["task"]);
   });
 });
 
@@ -246,6 +248,7 @@ describe("acts kernel proof: rebuild invariant (gate 1)", () => {
     // rebuild_from is incremental and bounded per call: loop until done.
     w.world.createObject({ id: "proof_board2", name: "board2", parent: "$task_board", owner: w.actor, location: "proof_case" });
     w.world.setProp("proof_board2", "source_space", "proof_case");
+    w.world.setProp("proof_board2", "log_space", "proof_case");
     await rebuildAll(w, "proof_board2");
 
     const live = await w.world.directCall("r-v1", w.actor, "proof_case", "board", [{}], { sessionId: w.session.id });
@@ -270,6 +273,7 @@ async function lanesCase(id: string) {
   const w = await proofCase();
   w.world.createObject({ id, name: "lanes", parent: "$kind_lanes", owner: w.actor, location: "proof_case" });
   w.world.setProp(id, "source_space", "proof_case");
+  w.world.setProp(id, "log_space", "proof_case");
   w.world.setProp("proof_case", "projections", [w.board, id]);
   return w;
 }
@@ -335,6 +339,7 @@ describe("acts kernel proof: second surface — kind lanes (tier B3)", () => {
     // A fresh projection, seeded empty, folded from the recorded log only.
     w.world.createObject({ id: "proof_lanes2", name: "lanes2", parent: "$kind_lanes", owner: w.actor, location: "proof_case" });
     w.world.setProp("proof_lanes2", "source_space", "proof_case");
+    w.world.setProp("proof_lanes2", "log_space", "proof_case");
     await rebuildAll(w, "proof_lanes2");
 
     const live = await lanesView(w, "proof_lanes");

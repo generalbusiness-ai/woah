@@ -156,7 +156,7 @@ the router's occurrence-ledger, gravity G1, is the pressure valve);
 rollup fan-in makes coordination centers the bottleneck (batching,
 `rollup` reserved for low-rate types, digest coalescing at
 satellites); a budget-exhausting fold fails the write, hence the
-O(payload) fold contract and measured act-rate ceilings (kernel gate
+payload-or-declared-cap fold contract and measured act-rate ceilings (kernel gate
 5). The mitigation backlog is the same backlog NC8 already owes —
 one instrumentation effort, not two.
 
@@ -297,18 +297,18 @@ Stated so the sequence is a decision, not drift:
 1. **Outliner** — landed as the first real consumer. Its structural
    relation remains substrate-authoritative; the acts projection supplies
    the completeness checkpoint without mirroring tree rows.
-2. **Dispenser** — next, and the first plug-backed consumer. The plug keeps
-   calling typed `:order`, `:deliver`, and `:cancel` verbs through Net; it
-   never emits raw acts. Those verbs record `dispenser.ordered`,
-   `dispenser.delivered`, and `dispenser.canceled`, while one pending
-   projection owns queue membership and deterministically bounded admission
-   indexes. `:next_pending` reads that projection; delivery carries the
-   produced note by reference and remains idempotent on `order_id`.
-   Approval and failure acts wait for a real policy transition rather than
-   being invented by the base class.
-3. **Tasks** — the temporary casework slice has proved the kernel; the real
-   migration now proves field disposition, client parity, and deletion
-   delta.
+2. **Dispenser** — landed as the first plug-backed consumer. Its typed Net
+   verbs emit from the anchored block onto the containing room log; the plug
+   never emits raw acts. One bounded projection owns pending membership,
+   order allocation, admission indexes, and terminal receipts. Delivery
+   preallocates a room-anchored note, the plug fills it directly, and the
+   sequenced transition records only that reference. SQLite v0 genesis, dropped-reply
+   idempotency, adversarial authority, fail-closed artifact rollback, and a
+   meaningful sparse-Net rebuild are covered. Approval and failure acts wait
+   for a real policy transition rather than being invented by the base class.
+3. **Tasks** — next. The temporary casework slice has proved the kernel; the
+   real migration must prove full field disposition, state-machine parity,
+   client Kanban conversion, E4/E5 approval safety, and deletion delta.
 4. **Workflows** — `workflows.md` predates acts: `:set_status` writes
    a status prop directly. It should emit `workflow.status_changed`
    acts (status becomes a fold target), which matters doubly because

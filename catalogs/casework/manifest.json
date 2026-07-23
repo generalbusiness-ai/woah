@@ -1,6 +1,6 @@
 {
   "name": "casework",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "spec_version": "v1",
   "description": "Proof-of-kernel catalog for acts (kernel note S3/S5): $case rooms whose task lifecycle is recorded as tasks.* acts and projected by $task_board (per-task rows, view-time joins) and $kind_lanes (per-kind counts with bounded auxiliary state). Temporary by design: the real tasks-catalog migration supersedes it, and these classes then retire.",
   "license": "MIT",
@@ -121,7 +121,7 @@
               "row_cap"
             ]
           },
-          "source": "verb :initialize(row_cap) rxd {\n  /* Seed-time setup: create the board projection co-anchored with the\n     case (same anchor cluster, so SL2 atomicity covers fold writes).\n     The $acts feature is attached per instance here ($space instances\n     own-seed an empty features list, so the class-level attach \u2014 which\n     exists to satisfy the installer's static this-call resolution \u2014\n     does not reach them). Owner/wizard only. */\n  if (actor != this.owner && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"case initialize is owner-only\" }; }\n  this:add_feature($acts);\n  let board = create($task_board, { owner: this.owner, name: \"board\", location: this });\n  board.source_space = this;\n  if (typeof(row_cap) == \"number\" && row_cap > 0) { board.row_cap = toint(row_cap); }\n  this.projections = [board];\n  return board;\n}",
+          "source": "verb :initialize(row_cap) rxd {\n  /* Seed-time setup: create the board projection co-anchored with the\n     case (same anchor cluster, so SL2 atomicity covers fold writes).\n     A case is both composer and log authority, so both bindings name it. */\n  if (actor != this.owner && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"case initialize is owner-only\" }; }\n  this:add_feature($acts);\n  let board = create($task_board, { owner: this.owner, name: \"board\", location: this });\n  board.source_space = this;\n  board.log_space = this;\n  if (typeof(row_cap) == \"number\" && row_cap > 0) { board.row_cap = toint(row_cap); }\n  this.projections = [board];\n  return board;\n}",
           "direct_callable": true,
           "skip_presence_check": true
         },
@@ -160,7 +160,7 @@
               "task"
             ]
           },
-          "source": "verb :claim(task) rxd {\n  /* The move IS the lease; the act records the coordination fact in the\n     same sequenced turn. Validated against the board row: a closed or\n     dropped task cannot be re-claimed even though close_task returned\n     it to the case physically (review finding 1, 2026-07-21).\n     Fail-closed: if the fold refuses, the move rolls back with it. */\n  let row = this:_board_row(task);\n  if (row == null || row[\"phase\"] != \"active\") { raise { code: \"E_TRANSITION\", message: \"task is not claimable\", value: task }; }\n  if (!valid(task) || location(task) != this) { raise { code: \"E_INVARG\", message: \"task not open here\", value: task }; }\n  moveto(task, actor);\n  this:act(\"tasks.claimed\", { \"task\": task, \"holder\": actor });\n  return task;\n}",
+          "source": "verb :claim(task) rxd {\n  /* The move IS the lease; the act records the coordination fact in the\n     same sequenced turn. The log envelope already identifies the actor,\n     so the payload carries only the task whose lease changed. Validated\n     against the board row: a closed or dropped task cannot be re-claimed\n     even though close_task returned it to the case physically (review\n     finding 1, 2026-07-21). Fail-closed: if the fold refuses, the move\n     rolls back with it. */\n  let row = this:_board_row(task);\n  if (row == null || row[\"phase\"] != \"active\") { raise { code: \"E_TRANSITION\", message: \"task is not claimable\", value: task }; }\n  if (!valid(task) || location(task) != this) { raise { code: \"E_INVARG\", message: \"task not open here\", value: task }; }\n  moveto(task, actor);\n  this:act(\"tasks.claimed\", { \"task\": task });\n  return task;\n}",
           "direct_callable": true,
           "tool_exposed": true
         },
@@ -247,8 +247,7 @@
       "on": "$case",
       "type": "tasks.claimed",
       "shape": {
-        "task": "obj",
-        "holder": "obj"
+        "task": "obj"
       }
     },
     {

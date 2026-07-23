@@ -11,25 +11,26 @@ import manifest4 from "../../catalogs/chat/manifest.json";
 import manifest5 from "../../catalogs/core/manifest.json";
 import manifest6 from "../../catalogs/demoworld/manifest.json";
 import manifest7 from "../../catalogs/dispenser/manifest.json";
-import manifest8 from "../../catalogs/dubspace/manifest.json";
-import migration9 from "../../catalogs/dubspace/migration-v0-to-v1.json";
-import manifest10 from "../../catalogs/help/manifest.json";
-import manifest11 from "../../catalogs/horoscope/manifest.json";
-import manifest12 from "../../catalogs/note/manifest.json";
-import migration13 from "../../catalogs/note/migration-v0-to-v1.json";
-import migration14 from "../../catalogs/note/migration-v1-to-v2.json";
-import manifest15 from "../../catalogs/outliner/manifest.json";
-import migration16 from "../../catalogs/outliner/migration-v0-to-v1.json";
-import migration17 from "../../catalogs/outliner/migration-v1-to-v2.json";
-import migration18 from "../../catalogs/outliner/migration-v2-to-v3.json";
-import manifest19 from "../../catalogs/perm/manifest.json";
-import manifest20 from "../../catalogs/pinboard/manifest.json";
-import migration21 from "../../catalogs/pinboard/migration-v0-to-v1.json";
-import manifest22 from "../../catalogs/prog/manifest.json";
-import manifest23 from "../../catalogs/tasks/manifest.json";
-import migration24 from "../../catalogs/tasks/migration-v0-to-v1.json";
-import manifest25 from "../../catalogs/weather/manifest.json";
-import migration26 from "../../catalogs/weather/migration-v0-to-v1.json";
+import migration8 from "../../catalogs/dispenser/migration-v0-to-v1.json";
+import manifest9 from "../../catalogs/dubspace/manifest.json";
+import migration10 from "../../catalogs/dubspace/migration-v0-to-v1.json";
+import manifest11 from "../../catalogs/help/manifest.json";
+import manifest12 from "../../catalogs/horoscope/manifest.json";
+import manifest13 from "../../catalogs/note/manifest.json";
+import migration14 from "../../catalogs/note/migration-v0-to-v1.json";
+import migration15 from "../../catalogs/note/migration-v1-to-v2.json";
+import manifest16 from "../../catalogs/outliner/manifest.json";
+import migration17 from "../../catalogs/outliner/migration-v0-to-v1.json";
+import migration18 from "../../catalogs/outliner/migration-v1-to-v2.json";
+import migration19 from "../../catalogs/outliner/migration-v2-to-v3.json";
+import manifest20 from "../../catalogs/perm/manifest.json";
+import manifest21 from "../../catalogs/pinboard/manifest.json";
+import migration22 from "../../catalogs/pinboard/migration-v0-to-v1.json";
+import manifest23 from "../../catalogs/prog/manifest.json";
+import manifest24 from "../../catalogs/tasks/manifest.json";
+import migration25 from "../../catalogs/tasks/migration-v0-to-v1.json";
+import manifest26 from "../../catalogs/weather/manifest.json";
+import migration27 from "../../catalogs/weather/migration-v0-to-v1.json";
 
 export type BundledCatalogEntry = {
   readonly path: string;
@@ -48,15 +49,15 @@ export const BUNDLED_CATALOGS: readonly BundledCatalogEntry[] = [
   { path: "catalogs/chat/manifest.json", manifest: manifest4 as unknown as CatalogManifest, migrations: [], migration_paths: [] },
   { path: "catalogs/core/manifest.json", manifest: manifest5 as unknown as CatalogManifest, migrations: [], migration_paths: [] },
   { path: "catalogs/demoworld/manifest.json", manifest: manifest6 as unknown as CatalogManifest, migrations: [], migration_paths: [] },
-  { path: "catalogs/dispenser/manifest.json", manifest: manifest7 as unknown as CatalogManifest, migrations: [], migration_paths: [] },
-  { path: "catalogs/dubspace/manifest.json", manifest: manifest8 as unknown as CatalogManifest, migrations: [migration9 as unknown as CatalogMigrationManifest], migration_paths: ["catalogs/dubspace/migration-v0-to-v1.json"] },
-  { path: "catalogs/help/manifest.json", manifest: manifest10 as unknown as CatalogManifest, migrations: [], migration_paths: [] },
-  { path: "catalogs/horoscope/manifest.json", manifest: manifest11 as unknown as CatalogManifest, migrations: [], migration_paths: [] },
-  { path: "catalogs/note/manifest.json", manifest: manifest12 as unknown as CatalogManifest, migrations: [migration13 as unknown as CatalogMigrationManifest, migration14 as unknown as CatalogMigrationManifest], migration_paths: ["catalogs/note/migration-v0-to-v1.json","catalogs/note/migration-v1-to-v2.json"] },
-  { path: "catalogs/outliner/manifest.json", manifest: manifest15 as unknown as CatalogManifest, migrations: [migration16 as unknown as CatalogMigrationManifest, migration17 as unknown as CatalogMigrationManifest, migration18 as unknown as CatalogMigrationManifest], migration_paths: ["catalogs/outliner/migration-v0-to-v1.json","catalogs/outliner/migration-v1-to-v2.json","catalogs/outliner/migration-v2-to-v3.json"] },
-  { path: "catalogs/perm/manifest.json", manifest: manifest19 as unknown as CatalogManifest, migrations: [], migration_paths: [] },
-  { path: "catalogs/pinboard/manifest.json", manifest: manifest20 as unknown as CatalogManifest, migrations: [migration21 as unknown as CatalogMigrationManifest], migration_paths: ["catalogs/pinboard/migration-v0-to-v1.json"] },
-  { path: "catalogs/prog/manifest.json", manifest: manifest22 as unknown as CatalogManifest, migrations: [], migration_paths: [] },
-  { path: "catalogs/tasks/manifest.json", manifest: manifest23 as unknown as CatalogManifest, migrations: [migration24 as unknown as CatalogMigrationManifest], migration_paths: ["catalogs/tasks/migration-v0-to-v1.json"] },
-  { path: "catalogs/weather/manifest.json", manifest: manifest25 as unknown as CatalogManifest, migrations: [migration26 as unknown as CatalogMigrationManifest], migration_paths: ["catalogs/weather/migration-v0-to-v1.json"] }
+  { path: "catalogs/dispenser/manifest.json", manifest: manifest7 as unknown as CatalogManifest, migrations: [migration8 as unknown as CatalogMigrationManifest], migration_paths: ["catalogs/dispenser/migration-v0-to-v1.json"] },
+  { path: "catalogs/dubspace/manifest.json", manifest: manifest9 as unknown as CatalogManifest, migrations: [migration10 as unknown as CatalogMigrationManifest], migration_paths: ["catalogs/dubspace/migration-v0-to-v1.json"] },
+  { path: "catalogs/help/manifest.json", manifest: manifest11 as unknown as CatalogManifest, migrations: [], migration_paths: [] },
+  { path: "catalogs/horoscope/manifest.json", manifest: manifest12 as unknown as CatalogManifest, migrations: [], migration_paths: [] },
+  { path: "catalogs/note/manifest.json", manifest: manifest13 as unknown as CatalogManifest, migrations: [migration14 as unknown as CatalogMigrationManifest, migration15 as unknown as CatalogMigrationManifest], migration_paths: ["catalogs/note/migration-v0-to-v1.json","catalogs/note/migration-v1-to-v2.json"] },
+  { path: "catalogs/outliner/manifest.json", manifest: manifest16 as unknown as CatalogManifest, migrations: [migration17 as unknown as CatalogMigrationManifest, migration18 as unknown as CatalogMigrationManifest, migration19 as unknown as CatalogMigrationManifest], migration_paths: ["catalogs/outliner/migration-v0-to-v1.json","catalogs/outliner/migration-v1-to-v2.json","catalogs/outliner/migration-v2-to-v3.json"] },
+  { path: "catalogs/perm/manifest.json", manifest: manifest20 as unknown as CatalogManifest, migrations: [], migration_paths: [] },
+  { path: "catalogs/pinboard/manifest.json", manifest: manifest21 as unknown as CatalogManifest, migrations: [migration22 as unknown as CatalogMigrationManifest], migration_paths: ["catalogs/pinboard/migration-v0-to-v1.json"] },
+  { path: "catalogs/prog/manifest.json", manifest: manifest23 as unknown as CatalogManifest, migrations: [], migration_paths: [] },
+  { path: "catalogs/tasks/manifest.json", manifest: manifest24 as unknown as CatalogManifest, migrations: [migration25 as unknown as CatalogMigrationManifest], migration_paths: ["catalogs/tasks/migration-v0-to-v1.json"] },
+  { path: "catalogs/weather/manifest.json", manifest: manifest26 as unknown as CatalogManifest, migrations: [migration27 as unknown as CatalogMigrationManifest], migration_paths: ["catalogs/weather/migration-v0-to-v1.json"] }
 ];

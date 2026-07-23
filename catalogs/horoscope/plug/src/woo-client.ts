@@ -68,14 +68,26 @@ export class WooClient {
     return cell.value.value;
   }
 
-  async directCall(target: string, verb: string, args: unknown[] = []): Promise<unknown> {
+  async directCall(
+    target: string,
+    verb: string,
+    args: unknown[] = [],
+    idempotencyKey?: string,
+    route: "direct" | "sequenced" = "sequenced"
+  ): Promise<unknown> {
     const session = this.requireSession();
     const body = await this.requestJson("POST", "/net-api/turn", {
       target,
       verb,
       args,
       session: session.session,
-      idempotency_key: `plug:${crypto.randomUUID()}`
+      route,
+      // A mutating plug operation may supply a stable domain-derived key.
+      // Net then returns the recorded acceptance after a dropped reply
+      // without committing twice. It may omit the application result on
+      // that replay; Dispenser's bounded receipt recovers the artifact on a
+      // later fresh-key domain retry.
+      idempotency_key: idempotencyKey ?? `plug:${crypto.randomUUID()}`
     });
     if ((body.reply as { status?: string } | undefined)?.status !== "accepted") {
       const error = body.error as { code?: string; message?: string; detail?: unknown } | undefined;
@@ -84,6 +96,21 @@ export class WooClient {
         String(error?.message ?? `${target}:${verb} was rejected`),
         409,
         error?.detail ?? error
+      );
+    }
+    // Net acceptance says the sequenced authority handled the turn; a
+    // catalog refusal is still returned separately as body.error. Treating
+    // that accepted transport as domain success would let the plug count a
+    // refused prepare/deliver and advance to the next queue row.
+    const domainError = body.error as
+      | { code?: string; message?: string; detail?: unknown; value?: unknown }
+      | undefined;
+    if (domainError) {
+      throw new WooError(
+        String(domainError.code ?? "E_DOMAIN"),
+        String(domainError.message ?? `${target}:${verb} refused`),
+        409,
+        domainError.detail ?? domainError.value ?? domainError
       );
     }
     return body.result;

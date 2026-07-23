@@ -1,6 +1,6 @@
 ---
 name: casework
-version: 0.1.0
+version: 0.1.1
 spec_version: v1
 license: MIT
 description: Proof-of-kernel catalog for acts - $case rooms whose task lifecycle is recorded as tasks.* acts, projected by $task_board (per-task rows, view-time joins) and $kind_lanes (per-kind counts with bounded auxiliary state). Temporary by design - the real tasks-catalog migration supersedes it.

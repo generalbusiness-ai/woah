@@ -281,7 +281,9 @@ more than one major behind matches no single file; boot then **composes** the
 adjacent per-major-edge migrations into one — a v1 world booting a v3 bundle
 runs v1→v2's steps then v2→v3's as a single composed migration (steps
 concatenated in edge order; §CT14.4 idempotency makes a composed re-run after
-partial failure safe). A major jump with no covering single file or chain —
+partial failure safe). A final edge ending at `vN.0.0` also covers later
+`vN.y.z` bundled targets: it supplies the major data rewrite while that same
+update installs the target patch definitions. A major jump with no covering single file or chain —
 or a version migration that fails — is reported as a boot event and **blocks
 that catalog**: every later boot repair phase (one-shot boot migrations and
 the drift schema sync) excludes it, so a warn-only boot leaves the catalog's

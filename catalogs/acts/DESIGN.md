@@ -25,7 +25,7 @@ from the log.
 | Class | Parent | Role |
 |---|---|---|
 | `$acts` (feature) | `$thing` | Internal, non-`x` emission primitive `:act(type, payload)` + `_validate_payload`. Both validate their caller; underscore naming and `direct_callable:false` alone are not privacy. Mounted per consumer instance ($space instances own-seed an empty `features` list; a consumer-catalog class-level attach satisfies the installer's static this-call resolution). |
-| `$projection` | `$thing` | `source_space` authority binding + `consumes` + internal `:fold` + `rows` + `:view`/`:view_row` + incremental idempotent `:rebuild_from`. `source_space` and projection state are perms-empty. `fold` has no public execute permission and accepts only its bound composer, including during source-mediated rebuild. |
+| `$projection` | `$thing` | `source_space` composer binding + `log_space` sequenced-log binding + `consumes` + internal `:fold` + `rows` + `:view`/`:view_row` + incremental idempotent `:rebuild_from`. Bindings and projection state are perms-empty. `fold` has no public execute permission and accepts only its composer, including during composer-mediated rebuild. |
 
 Domain classes, schemas, and concrete projections live in consuming
 catalogs — the proof set (`$case`, `$task_board`, `$kind_lanes`, the
@@ -34,20 +34,23 @@ tasks migration lands.
 
 ## Emission contract (enforced, tested)
 
-`:act` requires `seq >= 1 && space == this` (direct routes carry `seq == -1`)
-and `caller == this` (only room verbs emit). It also lacks `x`: the caller guard
-is the semantic authority boundary, while the permission bit prevents public
-sequenced ingress from reaching it. Every attached projection must be bound by
-`p.source_space == this`; each concrete fold accepts only that composer.
+`:act` requires `seq >= 1`, `caller == this`, and either `space == this` for a
+space composer or `space == location(this)` for a catalog-owned anchored actor.
+Direct routes carry `seq == -1`. It also lacks `x`: the caller guard is the
+semantic authority boundary, while the permission bit prevents public
+sequenced ingress from reaching it. Every attached projection must bind
+`p.source_space == this` and `p.log_space == space`; each concrete fold accepts
+only that composer.
 `rebuild_from` cannot supply a fold input: it asks the bound source's internal
 replay helper to derive inputs from recorded observations and call the fold.
 Payloads validate against
 `event_schema(this, type)` — the closed flat shape vocabulary (`obj`, `str`,
 `bool`, `int`, `float`, `num`, `list`, `map`, `null`, with `a|b` unions —
 earned by the outliner migration), every declared key required,
-undeclared keys refused; `str` refuses live object refs. Folds receive the act plus its envelope `seq`
-injected by the kernel (live) or by `:rebuild_from` (recorded); the observed
-act body stays free of envelope fields.
+undeclared keys refused; `str` refuses live object refs. Folds receive the Act
+plus recorded envelope `seq`, `actor`, and composer `source`, injected
+identically live and by `:rebuild_from`; the observed semantic body stays free
+of envelope fields.
 
 **Fail-closed**: any fold failure aborts the entire turn via the outer
 behavior savepoint — the entry commits as `applied_ok: false` carrying only
@@ -56,10 +59,11 @@ effects (including a minted artifact) roll back together. `E_QUOTA` at
 `row_cap` is the declared refuse-overflow policy.
 
 **Rebuild**: `fold(recorded acts) == rows`, exercised by
-`$projection:rebuild_from(space, from_seq)` — rebuild input is the recorded
-observations, never verb re-execution, so verb changes cannot invalidate a
-projection. The requested space must equal the immutable `source_space`
-binding. Failed entries contribute nothing.
+`$projection:rebuild_from(log_space, page_budget)` — rebuild input is the
+recorded observations after the projection's scanned watermark, never verb
+re-execution, so verb changes cannot invalidate a projection. The requested log
+must equal the immutable `log_space` binding. Failed entries contribute
+nothing.
 
 ## Core seams used
 
@@ -83,8 +87,11 @@ p95 initially; the authority-hardening rerun measured 100 ms, ~145.5 KiB
 responses, 48 ms mutation-to-seven-peer-push p95, and 940 ms
 invalidation-to-current p95. Direct semantic reads validate without advancing
 authority, and exact repeated read proofs are deduplicated on the submit wire.
-Next is Dispenser, the first plug-backed migration: its typed Net verbs emit acts internally and
-`$dispenser_queue` replaces the directly-written queue. Tasks follows with the
+Dispenser is now the second consumer and first plug-backed proof: typed Net
+verbs emit internally from an anchored actor, `$dispenser_queue` replaces the
+directly written queue, dropped replies have transport and bounded domain
+idempotency, SQLite v0 genesis is covered, and a fresh projection rebuilds all
+meaningful state through the sparse Net replay path. Tasks follows with the
 full field migration and parity golden (kernel note §5.3).
 Still open: client kanban adoption and the vision note's deferred actor emission,
 dynamic attach/genesis, routing, and practices.

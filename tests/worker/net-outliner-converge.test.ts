@@ -55,7 +55,9 @@ type TurnBody = {
   attempt: number;
   trace: AttemptTraceEntry[];
   envelopeBytes?: number;
+  replayed?: boolean;
   result?: unknown;
+  error?: { code?: string; message?: string; detail?: unknown };
   observations?: Array<Record<string, unknown>>;
 };
 
@@ -1048,6 +1050,7 @@ describe("outliner add over the net path converges", () => {
     const metaId = "meta_rebuild";
     world.createObject({ id: metaId, name: "rebuild meta", parent: "$outline_meta", owner: actor, location: theOutline, anchor: theOutline });
     world.setProp(metaId, "source_space", theOutline);
+    world.setProp(metaId, "log_space", theOutline);
 
     const { gateway, gatewayEnv, scopeDOs } = await mountNet(world, epoch);
     for (let i = 1; i <= 4; i += 1) {
@@ -1179,4 +1182,242 @@ describe("outliner add over the net path converges", () => {
     expect(orderingFetch).toBeGreaterThan(1);
   });
 
+});
+
+describe("Dispenser anchored-actor Acts over the Net path", () => {
+  it("orders and delivers through authenticated room sequencing, with dropped-reply replay", async () => {
+    const plan = await planNetInstall();
+    const world = plan.world;
+    const block = world.exportWorld().objects.find((object) => object.parent === "$horoscope_block");
+    if (!block) throw new Error("no $horoscope_block instance seeded");
+    const logSpace = world.object(block.id).location;
+    if (!logSpace) throw new Error("seeded horoscope block is not anchored");
+    // Saturate the shipped queue boundary below without cooldown noise.
+    world.setProp(block.id, "rate_limit_seconds", 0);
+    world.setProp(block.id, "block_cooldown_seconds", 0);
+    world.setProp(block.id, "max_pending_orders", 50);
+    world.setProp(block.id, "max_request_chars", 200);
+
+    // Requester and plug are distinct authenticated principals. Both mutate
+    // the block through the containing room's sequenced log; the block actor
+    // never receives a raw Act-emission surface.
+    const requester = world.auth("guest:net-dispenser-requester");
+    const placed = await world.directCall("net-dispenser-place", requester.actor, requester.actor, "moveto", [logSpace], {
+      sessionId: requester.id
+    });
+    expect(placed.op).toBe("result");
+    const key = world.createApiKey("$wiz", block.id, "net-dispenser-plug");
+    const plug = world.auth(`apikey:${key.id}:${key.secret}`);
+    // Keep a pristine, unattached projection in the room scope. Live Acts do
+    // not fold it; only the later Net rebuild may populate it.
+    const rebuiltQueue = world.createRuntimeObject("$dispenser_queue", block.id, logSpace, {
+      progr: "$wiz",
+      location: logSpace,
+      name: "net rebuilt dispenser queue"
+    });
+    world.setProp(rebuiltQueue, "source_space", block.id);
+    world.setProp(rebuiltQueue, "log_space", logSpace);
+
+    const { gateway, gatewayEnv, scopeDOs } = await mountNet(world, plan.epoch);
+    const planningScope = `room:${logSpace}`;
+    const turn = (
+      id: string,
+      session: { id: string; actor: string },
+      verb: string,
+      args: unknown[],
+      idempotencyKey = id,
+      route: "direct" | "sequenced" = "sequenced"
+    ) =>
+      call<TurnBody>(gateway, gatewayEnv, "/turn", {
+        call: {
+          kind: "woo.turn_call.shadow.v1",
+          id,
+          route,
+          scope: logSpace,
+          session: session.id,
+          actor: session.actor,
+          target: block.id,
+          verb,
+          args
+        },
+        planningScope,
+        catalog_epoch: plan.epoch,
+        idempotency_key: idempotencyKey
+      });
+
+    const ordered = await turn("net-dispenser-order", requester, "order", ["scorpio"]);
+    expect(ordered.reply.status, JSON.stringify(ordered.trace)).toBe("accepted");
+    expect(ordered.attempt).toBeLessThanOrEqual(3);
+    const orderId = (ordered.result as { order_id: string }).order_id;
+    expect(orderId).toBe("ord_1");
+    expect(ordered.observations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "dispenser.ordered",
+          source: block.id,
+          payload: {
+            order_id: orderId,
+            request: "scorpio",
+            artifact: expect.any(String)
+          }
+        })
+      ])
+    );
+    const artifact = (
+      ordered.observations?.find((observation) => observation.type === "dispenser.ordered") as
+        | { payload?: { artifact?: string } }
+        | undefined
+    )?.payload?.artifact;
+    expect(artifact).toBeTruthy();
+
+    const prepared = await turn(
+      "net-dispenser-prepare",
+      plug,
+      "prepare_artifact",
+      [orderId, "Horoscope: Scorpio", "One durable body.", "A test horoscope."],
+      "net-dispenser-prepare",
+      "direct"
+    );
+    expect(prepared.reply.status, JSON.stringify(prepared.trace)).toBe("accepted");
+    expect(prepared.result).toMatchObject({ prepared: true, duplicate: false, note: artifact });
+
+    const stableKey = `plug:deliver:${block.id}:${orderId}`;
+    const delivered = await turn(
+      "net-dispenser-deliver",
+      plug,
+      "deliver",
+      [orderId, artifact],
+      stableKey
+    );
+    expect(delivered.reply.status, JSON.stringify(delivered.trace)).toBe("accepted");
+    const note = (delivered.result as { note: string }).note;
+    expect(note).toBeTruthy();
+    expect(delivered.observations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "dispenser.delivered",
+          source: block.id,
+          payload: { order_id: orderId, note }
+        })
+      ])
+    );
+    expect(delivered.observations?.some((observation) => observation.type === "note_edited")).toBe(false);
+    expect(JSON.stringify(delivered.observations)).not.toContain("One durable body.");
+
+    // Generated prose crossed only the direct artifact-authority turn. The
+    // room's durable sequenced transcript therefore contains the bounded
+    // request and the artifact ref, but never the generated body.
+    const roomDO = scopeDOs.get(planningScope)!;
+    const replay = await call<{ entries: Array<{ seq: number; message: { verb: string; args: unknown[] } }> }>(
+      roomDO,
+      { WOO_INTERNAL_SECRET: SECRET },
+      "/replay-page",
+      { space: logSpace, from: 1, limit: 10 }
+    );
+    expect(replay.entries.map((entry) => entry.message.verb)).toEqual(["order", "deliver"]);
+    expect(replay.entries[1]?.message.args).toEqual([orderId, artifact]);
+    expect(JSON.stringify(replay.entries)).not.toContain("One durable body.");
+    const deliveryActSeq = replay.entries[1]!.seq;
+
+    // Simulate the plug losing the HTTP reply and retrying with the same
+    // transport key. The scope returns its recorded acceptance and the
+    // gateway marks it replayed, but deliberately omits the freshly planned
+    // verb result: it cannot prove that output was the one returned by the
+    // original execution. The unchanged head proves no second domain turn
+    // or note was created. A later fresh-key retry is handled by the bounded
+    // Dispenser receipt and returns the original artifact with duplicate:true.
+    const transportReplay = await turn(
+      "net-dispenser-deliver-retry-frame",
+      plug,
+      "deliver",
+      [orderId, artifact],
+      stableKey
+    );
+    expect(transportReplay.reply.status).toBe("accepted");
+    expect(transportReplay.replayed).toBe(true);
+    expect(transportReplay.result).toBeUndefined();
+    expect(transportReplay.reply.head).toEqual(delivered.reply.head);
+
+    const domainReplay = await turn(
+      "net-dispenser-deliver-domain-retry",
+      plug,
+      "deliver",
+      [orderId, artifact]
+    );
+    expect(domainReplay.reply.status).toBe("accepted");
+    expect(domainReplay.result).toMatchObject({ delivered: true, duplicate: true, note });
+
+    // Rebuild the unattached projection from the room's committed log through
+    // the sparse Net planner. This proves the anchored-actor composer/log
+    // split reconstructs meaningful state, not just a watermark.
+    const rebuilt = await call<TurnBody>(gateway, gatewayEnv, "/turn", {
+      call: {
+        kind: "woo.turn_call.shadow.v1",
+        id: "net-dispenser-rebuild",
+        route: "sequenced",
+        scope: logSpace,
+        session: plug.id,
+        actor: plug.actor,
+        target: rebuiltQueue,
+        verb: "rebuild_from",
+        args: [logSpace, 100]
+      },
+      planningScope,
+      catalog_epoch: plan.epoch,
+      idempotency_key: "net-dispenser-rebuild"
+    });
+    expect(rebuilt.reply.status, JSON.stringify(rebuilt.trace)).toBe("accepted");
+    expect(rebuilt.attempt, "rebuild must fetch its owner-attested replay page").toBeGreaterThan(1);
+    // A direct artifact write advances the scope authority head but does not
+    // consume a semantic log sequence. Projection watermarks use the latter.
+    expect(rebuilt.result).toMatchObject({ done: true, at_seq: deliveryActSeq });
+
+    const state = await call<{ cells: Array<{ key: string; value: { value: unknown } }> }>(
+      roomDO,
+      { WOO_INTERNAL_SECRET: SECRET },
+      "/closure",
+      {
+        keys: [
+          `property_cell:${rebuiltQueue}:rows`,
+          `property_cell:${rebuiltQueue}:receipts`,
+          `property_cell:${rebuiltQueue}:next_order_seq`,
+          `property_cell:${rebuiltQueue}:at_seq`
+        ],
+        known: []
+      }
+    );
+    const values = Object.fromEntries(state.cells.map((cell) => [cell.key, cell.value.value]));
+    expect(values[`property_cell:${rebuiltQueue}:rows`]).toEqual({});
+    expect(values[`property_cell:${rebuiltQueue}:receipts`]).toMatchObject({
+      [orderId]: { state: "delivered", order_id: orderId, requester: requester.actor, note }
+    });
+    expect(values[`property_cell:${rebuiltQueue}:next_order_seq`]).toBe(2);
+    expect(values[`property_cell:${rebuiltQueue}:at_seq`]).toBe(deliveryActSeq);
+
+    // The projection currently writes bounded maps as whole property cells.
+    // Exercise the complete shipped queue and terminal-receipt boundaries on
+    // the real Net planner so "bounded" also means every legal mutation fits
+    // the 64 KiB warm-envelope contract.
+    const pendingIds: string[] = [];
+    let maxEnvelopeBytes = 0;
+    const maxRequest = "x".repeat(200);
+    for (let i = 0; i < 50; i += 1) {
+      const saturated = await turn(`net-dispenser-saturate-${i}`, requester, "order", [maxRequest]);
+      expect(saturated.reply.status, JSON.stringify(saturated.trace)).toBe("accepted");
+      expect(saturated.envelopeBytes).toBeLessThan(64 * 1024);
+      maxEnvelopeBytes = Math.max(maxEnvelopeBytes, saturated.envelopeBytes ?? 0);
+      pendingIds.push((saturated.result as { order_id: string }).order_id);
+    }
+    const overflow = await turn("net-dispenser-saturate-overflow", requester, "order", [maxRequest]);
+    expect(overflow.reply.status).toBe("accepted");
+    expect(overflow.error, JSON.stringify(overflow)).toMatchObject({ code: "E_QUEUE_FULL" });
+
+    for (const pendingId of pendingIds) {
+      const canceled = await turn(`net-dispenser-cancel-${pendingId}`, requester, "cancel", [pendingId]);
+      expect(canceled.reply.status, JSON.stringify(canceled.trace)).toBe("accepted");
+      expect(canceled.envelopeBytes).toBeLessThan(64 * 1024);
+      maxEnvelopeBytes = Math.max(maxEnvelopeBytes, canceled.envelopeBytes ?? 0);
+    }
+    expect(maxEnvelopeBytes).toBeGreaterThan(0);
+  });
 });

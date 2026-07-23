@@ -1,9 +1,12 @@
 # Acts and projections
 
 > Status: **implemented kernel**. The `acts` catalog, schema validation,
-> fail-closed same-anchor folds, recorded-observation rebuild, and Outliner
-> relation checkpoint implement ACT1–ACT9. Dynamic attachment, fold replacement,
-> cross-space emission, and public actor emission are deferred.
+> fail-closed same-anchor folds, recorded-observation rebuild, Outliner’s
+> relation checkpoint, and Dispenser’s anchored-actor queue implement ACT1–ACT9.
+> Dynamic attachment, fold replacement,
+> cross-space emission, and public actor emission are deferred. A catalog-owned
+> anchored actor may compose facts on its containing space's log under ACT3;
+> this is not a public actor-emission surface.
 
 Acts are typed domain facts recorded on a room's sequenced log. Projections
 derive bounded coordination views from those facts in the same atomic turn.
@@ -11,12 +14,14 @@ This section governs the generic kernel and every catalog that adopts it.
 
 ## ACT1. Record and identity
 
-An Act body has exactly this outer shape:
+An Act has exactly three semantic fields:
 
 ```json
-{"type":"tasks.claimed","version":1,"payload":{"task":"task-1","holder":"actor-1"}}
+{"type":"tasks.claimed","version":1,"payload":{"task":"task-1"}}
 ```
 
+The generic observation carrier adds its standard `source` routing field,
+naming the composer. That field is not part of the Act body or payload schema.
 The containing [`SpaceLogEntry`](sequenced-log.md) is the Act's authority
 envelope: space, sequence, actor, timestamp, and invoked verb. Catalogs MUST NOT
 repeat those fields in the payload. An Act's durable identity is
@@ -43,9 +48,18 @@ The `$acts:act(type, payload)` primitive is internal catalog machinery. It MUST
 refuse unless all of these hold:
 
 1. the current turn is sequenced (`seq >= 1`);
-2. the current sequenced space is the receiver;
+2. the receiver is either the current sequenced space or an anchored actor
+   whose current location is that space;
 3. the caller is the receiver; and
 4. the receiver resolves a schema for `(type, version)` and the payload validates.
+
+The anchored-actor form exists for catalog authorities such as a Dispenser
+block: the block's typed domain verbs compose the fact, while the containing
+space remains the sequenced log authority. Moving the actor to another space
+changes the eligible log; an attached projection bound to the old log then
+refuses the turn. This is deliberately narrower than public actor emission:
+the primitive remains non-executable to callers, requires `caller ==
+receiver`, and accepts no caller-selected log.
 
 Internal machinery MUST NOT carry public execute permission. An underscore name
 and `direct_callable:false` are not authority boundaries: a sequenced external
@@ -61,23 +75,32 @@ state.
 
 ## ACT4. Projection contract
 
-A v1 projection is a trusted catalog object in the emitting room's anchor
-cluster. Its non-public, perms-empty `source_space` binds it to exactly one
-composer authority when created. The live fold path MUST reject a projection
-whose binding does not equal the emitting room. It declares consumed Act types,
-a row cap, projection-owned state, and these operations:
+A v1 projection is a trusted catalog object in the log space's anchor cluster.
+Its non-public, perms-empty `source_space` property binds it to exactly one
+composer authority when created. (`source_space` is the retained v1 property
+name; the value may be an anchored actor.) Its non-public `log_space` binds the
+sequenced log. For a space composer both bindings name the same object; for an
+anchored actor composer, `log_space == location(source_space)` at emission.
+The live fold path MUST reject a projection whose composer or log binding does
+not match the emission. It declares consumed Act types, a row cap,
+projection-owned state, and these operations:
 
 - `fold(act)` is deterministic from `(projection state, act)`, is the sole
-  writer of all projection-owned state, performs work bounded by the Act
-  payload, makes no foreign reads, uses no wall clock or randomness, and sets
-  `at_seq` from the injected `act["seq"]`; it has no public execute permission
-  and accepts only `caller == source_space`, live or during rebuild;
+  writer of all projection-owned state, performs no scan beyond the Act payload
+  and explicitly declared fixed caps, makes no foreign reads, uses no wall
+  clock or randomness, and sets `at_seq` from the injected `act["seq"]`.
+  Besides the semantic body, live emission and rebuild inject the same recorded
+  envelope metadata as `act["seq"]`, `act["actor"]`, and composer
+  `act["source"]`; catalogs MUST use those values instead of duplicating them
+  in payloads. The fold has no public execute permission and accepts only
+  `caller == source_space`, live or during rebuild;
 - `view(opts)` is the authoritative bounded read and returns a completeness
   watermark; and
-- `rebuild_from(space, from_seq)` incrementally folds recorded observations.
-  It is owner/wizard-gated, refuses unless `space == source_space`, and asks
-  that source to replay and call the fold. The projection cannot self-fold or
-  supply rebuild input.
+- `rebuild_from(log_space, page_budget)` incrementally folds recorded
+  observations after `max(at_seq, rebuild_scan_seq)`. It is
+  owner/wizard-gated, refuses unless the argument equals the bound `log_space`,
+  and asks the composer to replay that log and call the fold. The projection
+  cannot self-fold or supply rebuild input.
 
 Auxiliary fold state is permitted when later Acts omit context needed by the
 projection. Every auxiliary structure MUST have its own cap and safe retention
@@ -109,10 +132,11 @@ fold(successful recorded Acts in (seq, index) order)
 ```
 
 Rebuild folds recorded observations; it never re-executes verbs. It skips
-failed entries, injects the recorded envelope sequence, is incremental,
-idempotent, and bounded per call, and reports both consumed and scanned
-progress. Rebuild covers rows and every auxiliary fold structure. It does not
-reconstruct state that ACT7 assigns to another authority.
+failed entries, injects the recorded envelope sequence, actor, and composer
+source, is incremental, idempotent, and bounded per call, and reports both
+consumed and scanned progress. Rebuild covers rows and every auxiliary fold
+structure. It does not reconstruct state that ACT7 assigns to another
+authority.
 
 ## ACT7. One authority per fact
 
@@ -150,6 +174,19 @@ remove/eject reaches substrate recycle only after the acted detach, while raw
 operator recycle invokes the guarded lifecycle callback. Outliner's
 `enterfunc` and `exitfunc` likewise require `caller == object`; they may update
 only the explicitly excluded visit state and lifecycle observations.
+
+For Dispenser v1 specifically, the anchored `$dispenser_block` is the composer
+and its containing room is `log_space`. `$dispenser_queue` owns pending
+membership, the next-order counter, admission indexes, and bounded terminal
+receipts. `dispenser.ordered` preallocates and records one room-anchored
+artifact reference; its requester comes from the envelope actor, and the
+composer comes from carrier source. The authenticated plug may fill only that
+note through a direct, one-shot artifact-authority write; sequenced `deliver`
+carries only `order_id` and the reference. Generated prose therefore appears
+in neither the room transcript nor an Act. Plug heartbeat/configuration fields
+and the lazy Acts/genesis attachment marker are program state outside the queue
+fact set. A block outside a space cannot order, deliver, or cancel. Once
+genesis binds the queue, moving the block to a different log space is refused.
 
 ## ACT8. Watermarks and reads
 

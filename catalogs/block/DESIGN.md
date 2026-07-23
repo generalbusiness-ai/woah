@@ -100,7 +100,9 @@ verb emits its fixed act internally and the projection becomes the sole
 writer of derived rows. The plug never receives a raw `:act` surface.
 Machine-rate inputs should be reduced to bounded checkpoints before they
 become acts. The dispenser queue is the first plug-backed migration of this
-pattern.
+pattern: its order Act allocates an artifact reference, a direct
+object-authority call fills that artifact, and sequenced delivery records only
+the reference.
 
 ## Credential surface
 

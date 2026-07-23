@@ -132,6 +132,7 @@ function attachRefusingProjection(world: ReturnType<typeof createWorld>, code: s
     name: "refusing projection"
   });
   world.setProp(projection, "source_space", "the_outline");
+  world.setProp(projection, "log_space", "the_outline");
   const installed = installVerb(
     world,
     projection,
@@ -1042,6 +1043,7 @@ describe("outliner acts: watermark projection + tree_view", () => {
     // Rebuild reproduces the watermark from recorded acts alone.
     world.createObject({ id: "wm2", name: "wm2", parent: "$outline_meta", owner: session.actor, location: "the_outline" });
     world.setProp("wm2", "source_space", "the_outline");
+    world.setProp("wm2", "log_space", "the_outline");
     for (let i = 0; i < 20; i++) {
       const r = (await world.directCall(`wm-rb-${i}`, session.actor, "wm2", "rebuild_from", ["the_outline", 100])) as unknown as { op: string; result?: { done: boolean } };
       if (r.op !== "result" || !r.result) throw new Error("rebuild failed");
@@ -1064,6 +1066,32 @@ describe("outliner acts: watermark projection + tree_view", () => {
     const after = (await expectResult(call(world, session.actor, "the_outline", "tree_view", []))).result as { items: unknown[]; structure_at_seq: number };
     expect(after.structure_at_seq).toBe(before.structure_at_seq);
     expect(JSON.stringify(after.items)).toContain("body v2");
+  });
+
+  it("preserves and repairs an Acts 0.1 watermark projection with no log binding", async () => {
+    const world = setupWorld();
+    const session = world.auth("guest:wm-log-upgrade");
+    await expectResult(call(world, session.actor, "the_outline", "enter", []));
+    await addItem(world, session.actor, "before upgrade");
+    const meta = (world.getProp("the_outline", "projections") as string[])[0]!;
+    const before = world.getProp(meta, "at_seq") as number;
+
+    // Catalog patch 0.2 adds log_space. Existing projection instances see
+    // its inherited null default until the next composer mutation.
+    world.setProp(meta, "log_space", null);
+    const read = (await expectResult(call(
+      world,
+      session.actor,
+      "the_outline",
+      "tree_view",
+      []
+    ))).result as { structure_at_seq: number };
+    expect(read.structure_at_seq).toBe(before);
+
+    await addItem(world, session.actor, "after upgrade");
+    expect(world.getProp("the_outline", "projections")).toContain(meta);
+    expect(world.getProp(meta, "log_space")).toBe("the_outline");
+    expect(world.getProp(meta, "at_seq")).toBeGreaterThan(before);
   });
 
   it("_ensure_acts / tree_view reject a foreign projections entry and mint the real $outline_meta", async () => {

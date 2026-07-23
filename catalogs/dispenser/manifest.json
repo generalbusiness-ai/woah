@@ -1,10 +1,10 @@
 {
   "name": "dispenser",
-  "version": "0.2.3",
+  "version": "1.0.0",
   "spec_version": "v1",
-  "description": "Dispenser block base class — a $block subclass that produces $dispensed_note artifacts in response to public :order requests. The verb appends to a persistent queue, returns a ticket synchronously, and lets the plug drain the queue on its own cadence; :deliver(order_id, name, text, description) creates a note with the producer-supplied name (inventory listing label), markdown text (capped at 262144 characters; what `read` returns), and optional cosmetic description (one-line look-at flavour, may be omitted/empty), and moves it into the requester's inventory. Subclass for concrete dispenser kinds (horoscope, recipe-of-the-day, ...).",
+  "description": "Acts-backed dispenser blocks. Public typed verbs queue work, deliver an artifact, or cancel; the anchored block composes concise Acts on its containing room's sequenced log and one bounded $dispenser_queue projection owns pending membership, admission indexes, id allocation, and terminal receipts.",
   "license": "MIT",
-  "depends": ["@local:block", "@local:note"],
+  "depends": ["@local:acts", "@local:block", "@local:note"],
   "ui": {
     "abi": "woo-ui/v1",
     "modules": [
@@ -24,49 +24,76 @@
     {
       "local_name": "$dispensed_note",
       "parent": "$note",
-      "description": "A $note produced by a $dispenser_block. Carries back-references to the producing block and the production time so UIs can render a 'from: <block name>' chip and link back to the source. Dispensed notes are ephemeral: dropping one into a $space (room) recycles it and emits a `note_dispersed` observation — they are meant to be read in inventory, not posted on walls.",
+      "description": "A $note produced by a $dispenser_block. Content remains artifact-authoritative; the delivered Act carries only this note reference. Dropping one into a room recycles it after a note_dispersed live observation.",
       "properties": [
         { "name": "produced_by", "type": "obj", "default": null, "perms": "r" },
-        { "name": "produced_at", "type": "int", "default": 0, "perms": "r" }
+        { "name": "produced_at", "type": "int", "default": 0, "perms": "r" },
+        { "name": "order_id", "type": "str", "default": "", "perms": "r" }
       ],
       "verbs": [
         {
           "name": "moveto",
           "perms": "rx",
           "arg_spec": { "args": ["target"] },
-          "source": "verb :moveto(target) rx { if (target != null && isa(target, $space)) { let title = this.name; if (typeof(title) != \"string\" || !title) { title = \"the note\"; } let drop_text = title + \" disperses in a puff of smoke.\"; if (actor != null && isa(actor, $actor)) { drop_text = actor.name + \" drops \" + title + \", which disperses in a puff of smoke.\"; } observe_to_space(target, { type: \"note_dispersed\", source: target, room: target, note: this, actor: actor, text: drop_text, ts: now() }); recycle(this); return target; } moveto(this, target); return target; }"
+          "source": "verb :moveto(target) rx {\n  /* A preallocated artifact stays in the producing block until that block's\n     sequenced :deliver moves it. Knowing its ref is not a movement grant. */\n  if (location(this) == this.produced_by && caller != this.produced_by) { raise { code: \"E_PERM\", message: \"pending dispenser artifact is producer-controlled\", value: this }; }\n  if (target != null && isa(target, $space)) {\n    let title = this.name;\n    if (typeof(title) != \"string\" || !title) { title = \"the note\"; }\n    let drop_text = title + \" disperses in a puff of smoke.\";\n    if (actor != null && isa(actor, $actor)) { drop_text = actor.name + \" drops \" + title + \", which disperses in a puff of smoke.\"; }\n    observe_to_space(target, { type: \"note_dispersed\", source: target, room: target, note: this, actor: actor, text: drop_text, ts: now() });\n    recycle(this);\n    return target;\n  }\n  moveto(this, target);\n  return target;\n}"
         }
       ]
     },
     {
       "local_name": "$dispenser_block",
       "parent": "$block",
-      "description": "Base class for plug-driven artifact dispensers. Public :order(request) appends a record to pending_orders and returns {order_id, queued, text, ts}; the plug drains the queue and calls :deliver(order_id, name, text, description) to produce a $note in the requester's inventory. Name is the inventory label (e.g. 'Horoscope: Capricorn'), text is the payload that `read` returns (capped at 262144 characters by $note.set_text), description is an optional cosmetic one-liner shown by `look` (per LambdaCore $note convention; pass null/empty to leave it unset).\n\nGuest sessions can be minted without bound, so the per-requester rate limit (rate_limit_seconds) is not sufficient on its own — three additional caps prevent unbounded queues and AI-quota burn from anonymous floods: max_pending_orders (queue length), max_request_chars (per-request size), and block_cooldown_seconds (block-wide minimum between any two orders, regardless of requester). All four are owner-writable. Set rate_limit_seconds=0 / block_cooldown_seconds=0 to disable a tier; set max_* to 0 for unbounded.",
+      "description": "Plug-driven artifact dispenser. order/deliver/cancel are sequenced domain verbs; the block is an anchored Act composer and its containing room is the log authority. Queue state lives only in $dispenser_queue. After genesis the block cannot move to a different log space. Owner limits can lower, never remove, the Net-proven hard caps of 50 pending rows and 200 inline request characters.",
       "properties": [
         { "name": "system_prompt", "type": "str", "default": "", "perms": "r" },
         { "name": "rate_limit_seconds", "type": "int", "default": 60, "perms": "r" },
         { "name": "block_cooldown_seconds", "type": "int", "default": 5, "perms": "r" },
         { "name": "max_pending_orders", "type": "int", "default": 50, "perms": "r" },
         { "name": "max_request_chars", "type": "int", "default": 200, "perms": "r" },
-        { "name": "pending_orders", "type": "list", "default": [], "perms": "r" },
-        { "name": "next_order_seq", "type": "int", "default": 1, "perms": "r" },
-        { "name": "last_request_at", "type": "map", "default": {}, "perms": "r" },
-        { "name": "last_order_at", "type": "int", "default": 0, "perms": "r" },
+        { "name": "projections", "type": "list", "default": [], "perms": "" },
+        { "name": "acts_initialized", "type": "bool", "default": false, "perms": "" },
+        { "name": "legacy_pending_orders", "type": "list", "default": [], "perms": "" },
+        { "name": "legacy_next_order_seq", "type": "int", "default": 1, "perms": "" },
+        { "name": "legacy_last_request_at", "type": "map", "default": {}, "perms": "" },
+        { "name": "legacy_last_order_at", "type": "int", "default": 0, "perms": "" },
         { "name": "writable_owner", "type": "list<str>", "default": ["system_prompt", "rate_limit_seconds", "block_cooldown_seconds", "max_pending_orders", "max_request_chars"], "perms": "r" },
-        { "name": "writable_self", "type": "list<str>", "default": ["last_pushed_at", "last_error", "pending_orders", "next_order_seq", "last_request_at", "last_order_at"], "perms": "r" }
+        { "name": "writable_self", "type": "list<str>", "default": ["last_pushed_at", "last_error"], "perms": "r" }
       ],
       "verbs": [
         {
-          "name": "check_order_limits",
-          "perms": "rx",
-          "arg_spec": { "args": ["request"] },
-          "source": "verb :check_order_limits(request) rx { if (typeof(request) != \"string\" || !request) { raise { code: \"E_INVARG\", message: \"order requires a non-empty request string\", value: request }; } let max_chars = this.max_request_chars; if (typeof(max_chars) == \"number\" && max_chars > 0 && length(request) > max_chars) { raise { code: \"E_INVARG\", message: \"request exceeds max_request_chars\", value: { max: max_chars, got: length(request) } }; } let max_q = this.max_pending_orders; if (typeof(max_q) == \"number\" && max_q > 0 && length(this.pending_orders) >= max_q) { raise { code: \"E_QUEUE_FULL\", message: \"block has too many pending orders\", value: { max: max_q, current: length(this.pending_orders) } }; } let now_ms = now(); let cool_s = this.block_cooldown_seconds; let block_last = this.last_order_at; if (typeof(cool_s) == \"number\" && cool_s > 0 && typeof(block_last) == \"number\" && block_last > 0 && (now_ms - block_last) < (cool_s * 1000)) { let retry_block = cool_s - ((now_ms - block_last) / 1000); raise { code: \"E_RATE_LIMIT\", message: \"block-wide cooldown active\", value: { retry_in_seconds: retry_block, scope: \"block\", block_cooldown_seconds: cool_s } }; } let limit_s = this.rate_limit_seconds; if (typeof(limit_s) != \"number\") { limit_s = 60; } let last = this.last_request_at; let last_ts = 0; let key = to_string(actor); if (has(last, key)) { last_ts = last[key]; } if (limit_s > 0 && last_ts > 0 && (now_ms - last_ts) < (limit_s * 1000)) { let retry_actor = limit_s - ((now_ms - last_ts) / 1000); raise { code: \"E_RATE_LIMIT\", message: \"too many orders from this requester; try again later\", value: { retry_in_seconds: retry_actor, scope: \"requester\", rate_limit_seconds: limit_s } }; } return true; }"
+          "name": "_queue",
+          "perms": "r",
+          "arg_spec": { "args": [] },
+          "skip_presence_check": true,
+          "source": "verb :_queue() r {\n  if (caller != this) { raise { code: \"E_PERM\", message: \"queue lookup is dispenser-internal\" }; }\n  let here = location(this);\n  for p in this.projections {\n    let ok = false;\n    try { ok = valid(p) && isa(p, $dispenser_queue) && location(p) == here && p.source_space == this && p.log_space == here; } except err { ok = false; }\n    if (ok) { return p; }\n  }\n  return null;\n}"
         },
         {
-          "name": "enqueue_order",
+          "name": "_require_sequenced",
+          "perms": "r",
+          "arg_spec": { "args": [] },
+          "skip_presence_check": true,
+          "source": "verb :_require_sequenced() r {\n  if (caller != this) { raise { code: \"E_PERM\", message: \"sequencing guard is dispenser-internal\" }; }\n  let here = location(this);\n  if (seq < 1 || here == null || !isa(here, $space) || space != here) { raise { code: \"E_INVARG\", message: \"dispenser mutation requires its containing room's sequenced turn\", value: { block: this, log_space: space } }; }\n  return here;\n}"
+        },
+        {
+          "name": "moveto",
           "perms": "rx",
-          "arg_spec": { "args": ["request"] },
-          "source": "verb :enqueue_order(request) rx { let next_seq = this.next_order_seq; let order_id = \"ord_\" + to_string(next_seq); let now_ms = now(); this.next_order_seq = next_seq + 1; let entry = { order_id: order_id, requester: actor, request: request, ts: now_ms }; this.pending_orders = this.pending_orders + [entry]; let last = this.last_request_at; last[to_string(actor)] = now_ms; this.last_request_at = last; this.last_order_at = now_ms; return entry; }"
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": ["target"] },
+          "source": "verb :moveto(target) rx {\n  /* A projection is bound to one semantic log. Rehoming an initialized block\n     would strand that queue and make a fresh room appear to restart its ids;\n     a future migration must name and atomically transfer both authorities. */\n  if (this.acts_initialized && target != location(this)) { raise { code: \"E_INVARG\", message: \"initialized dispenser cannot move across log spaces\", value: { block: this, from: location(this), to: target } }; }\n  return pass(target);\n}"
+        },
+        {
+          "name": "_ensure_acts",
+          "perms": "r",
+          "arg_spec": { "args": [] },
+          "skip_presence_check": true,
+          "source": "verb :_ensure_acts() r {\n  if (caller != this) { raise { code: \"E_PERM\", message: \"acts mounting is dispenser-internal\" }; }\n  let here = this:_require_sequenced();\n  let queue = this:_queue();\n  let kept = [];\n  for p in this.projections {\n    let ok = false;\n    try { ok = valid(p) && isa(p, $projection) && location(p) == here && p.source_space == this && p.log_space == here; } except err { ok = false; }\n    if (ok) { kept = kept + [p]; }\n  }\n  if (queue == null) {\n    queue = create($dispenser_queue, { owner: this.owner, name: \"dispenser_queue\", location: here });\n    queue.source_space = this;\n    queue.log_space = here;\n    queue.row_cap = 50;\n    kept = kept + [queue];\n  }\n  this.projections = kept;\n  let mounted = false;\n  for f in this.features { if (f == $acts) { mounted = true; } }\n  if (!mounted) {\n    this.features = this.features + [$acts];\n    this.features_version = this.features_version + 1;\n  }\n  if (!this.acts_initialized) {\n    let next_seq = this.legacy_next_order_seq;\n    if (typeof(next_seq) != \"number\" || next_seq < 1) { next_seq = 1; }\n    if (length(this.legacy_pending_orders) > queue.row_cap) { raise { code: \"E_QUOTA\", message: \"legacy dispenser queue exceeds the v1 row cap\", value: { max: queue.row_cap, got: length(this.legacy_pending_orders) } }; }\n    this:act(\"dispenser.genesis\", { next_order_seq: floor(next_seq) });\n    for entry in this.legacy_pending_orders {\n      if (typeof(entry) != \"map\" || typeof(entry[\"order_id\"]) != \"string\" || !entry[\"order_id\"] || !valid(entry[\"requester\"]) || typeof(entry[\"request\"]) != \"string\") {\n        raise { code: \"E_INVARG\", message: \"invalid legacy dispenser queue row\", value: entry };\n      }\n      if (length(entry[\"request\"]) > 200) { raise { code: \"E_QUOTA\", message: \"legacy dispenser request exceeds the v1 inline cap\", value: { order_id: entry[\"order_id\"], max: 200, got: length(entry[\"request\"]) } }; }\n      let artifact = create($dispensed_note, { owner: this, name: \"pending delivery\", location: this });\n      artifact.produced_by = this;\n      artifact.order_id = entry[\"order_id\"];\n      this:act(\"dispenser.legacy_ordered\", { order_id: entry[\"order_id\"], requester: entry[\"requester\"], request: entry[\"request\"], artifact: artifact });\n    }\n    this.legacy_pending_orders = [];\n    this.legacy_last_request_at = {};\n    this.legacy_last_order_at = 0;\n    this.acts_initialized = true;\n  }\n  return queue;\n}"
+        },
+        {
+          "name": "_seq_ts",
+          "perms": "r",
+          "arg_spec": { "args": ["entry_seq"] },
+          "skip_presence_check": true,
+          "source": "verb :_seq_ts(entry_seq) r {\n  if (caller != this) { raise { code: \"E_PERM\", message: \"log timestamp lookup is dispenser-internal\" }; }\n  if (typeof(entry_seq) != \"number\" || entry_seq < 1) { return 0; }\n  let here = location(this);\n  for e in here:replay(entry_seq, 1) { if (e[\"seq\"] == entry_seq) { return e[\"ts\"]; } }\n  return 0;\n}"
         },
         {
           "name": "order",
@@ -74,8 +101,56 @@
           "direct_callable": true,
           "skip_presence_check": true,
           "tool_exposed": true,
-          "arg_spec": { "args": ["request"], "command": { "dobj": "this", "prep": "any", "iobj": "any", "args_from": ["dobj_prefix_rest"] } },
-          "source": "verb :order(request) rxd { this:check_order_limits(request); let entry = this:enqueue_order(request); let here = location(this); let text = this.name + \" accepts your order \" + entry[\"order_id\"] + \". Your note will arrive in your inventory when it is ready.\"; if (here != null && isa(here, $space)) { observe_to_space(here, { type: \"order_placed\", source: this, block: this, order_id: entry[\"order_id\"], requester: actor, request: request, text: text, ts: entry[\"ts\"] }); } tell(actor, text); try { tell(this, \"order:\" + entry[\"order_id\"]); } except err { } return { order_id: entry[\"order_id\"], queued: true, text: text, ts: entry[\"ts\"] }; }"
+          "arg_spec": { "args": ["request"], "command": { "dobj": "this", "prep": "any", "iobj": "any", "args_from": ["dobj_prefix_rest"], "persistence": "durable" } },
+          "source": "verb :order(request) rxd {\n  this:_require_sequenced();\n  if (typeof(request) != \"string\" || !request) { raise { code: \"E_INVARG\", message: \"order requires a non-empty request string\", value: request }; }\n  let max_chars = this.max_request_chars;\n  if (typeof(max_chars) != \"number\" || max_chars <= 0 || max_chars > 200) { max_chars = 200; }\n  if (length(request) > max_chars) { raise { code: \"E_INVARG\", message: \"request exceeds max_request_chars\", value: { max: max_chars, got: length(request) } }; }\n  let queue = this:_ensure_acts();\n  let state = queue:admission_state(actor);\n  let max_q = this.max_pending_orders;\n  if (typeof(max_q) != \"number\" || max_q <= 0 || max_q > queue.row_cap) { max_q = queue.row_cap; }\n  if (state[\"pending\"] >= max_q) { raise { code: \"E_QUEUE_FULL\", message: \"block has too many pending orders\", value: { max: max_q, current: state[\"pending\"] } }; }\n  let now_ms = now();\n  let cool_s = this.block_cooldown_seconds;\n  if (typeof(cool_s) == \"number\" && cool_s > 0 && state[\"last_order_seq\"] > 0) {\n    let last_block = this:_seq_ts(state[\"last_order_seq\"]);\n    if (last_block > 0 && (now_ms - last_block) < (cool_s * 1000)) { raise { code: \"E_RATE_LIMIT\", message: \"block-wide cooldown active\", value: { retry_in_seconds: cool_s - ((now_ms - last_block) / 1000), scope: \"block\", block_cooldown_seconds: cool_s } }; }\n  }\n  let limit_s = this.rate_limit_seconds;\n  if (typeof(limit_s) != \"number\") { limit_s = 60; }\n  if (limit_s > 0 && state[\"requester_last_seq\"] > 0) {\n    let last_actor = this:_seq_ts(state[\"requester_last_seq\"]);\n    if (last_actor > 0 && (now_ms - last_actor) < (limit_s * 1000)) { raise { code: \"E_RATE_LIMIT\", message: \"too many orders from this requester; try again later\", value: { retry_in_seconds: limit_s - ((now_ms - last_actor) / 1000), scope: \"requester\", rate_limit_seconds: limit_s } }; }\n  }\n  let order_id = \"ord_\" + to_string(state[\"next_order_seq\"]);\n  /* Preallocate the final artifact in this room-anchored turn. The plug later\n     fills it through a direct object-authority call, so delivery's sequenced\n     message and Act carry only refs, never generated prose. */\n  let artifact = create($dispensed_note, { owner: this, name: \"pending delivery\", location: this });\n  artifact.produced_by = this;\n  artifact.order_id = order_id;\n  this:act(\"dispenser.ordered\", { order_id: order_id, request: request, artifact: artifact });\n  let text = this.name + \" accepts your order \" + order_id + \". Your note will arrive in your inventory when it is ready.\";\n  tell(actor, text);\n  try { tell(this, \"order:\" + order_id); } except err { }\n  return { order_id: order_id, queued: true, text: text, ts: now_ms };\n}"
+        },
+        {
+          "name": "prepare_artifact",
+          "perms": "rx",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": ["order_id", "name", "text", "description"] },
+          "source": "verb :prepare_artifact(order_id, name, text, description) rx {\n  /* Generated prose belongs on the preallocated artifact, not in a room-log\n     message. This write is therefore direct-only; :deliver later records only\n     the artifact ref. A fresh-key retry returns the same prepared note. */\n  if (seq >= 1) { raise { code: \"E_INVARG\", message: \"artifact preparation must use a direct turn\" }; }\n  if (actor != this && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"only the block actor (plug) or wizard can prepare\", value: actor }; }\n  if (typeof(order_id) != \"string\" || !order_id) { raise { code: \"E_INVARG\", message: \"prepare_artifact requires order_id\", value: order_id }; }\n  let queue = this:_queue();\n  if (queue == null) { return { order_id: order_id, prepared: false, duplicate: false, reason: \"unknown\" }; }\n  let found = queue:lookup(order_id);\n  if (found[\"state\"] == \"delivered\") { return { order_id: order_id, prepared: true, duplicate: true, note: found[\"note\"] }; }\n  if (found[\"state\"] != \"queued\") { return { order_id: order_id, prepared: false, duplicate: found[\"state\"] == \"canceled\", reason: found[\"state\"] }; }\n  let note = found[\"artifact\"];\n  if (!valid(note) || !isa(note, $dispensed_note) || note.produced_by != this || note.order_id != order_id || location(note) != this) { raise { code: \"E_INVARG\", message: \"order has no valid preallocated artifact\", value: order_id }; }\n  if (note.produced_at > 0) { return { order_id: order_id, prepared: true, duplicate: true, note: note }; }\n  if (typeof(name) != \"string\" || !name || length(name) > 256) { raise { code: \"E_INVARG\", message: \"prepare_artifact requires a 1..256 character name\", value: name }; }\n  if (typeof(text) != \"string\") { raise { code: \"E_INVARG\", message: \"prepare_artifact requires a text string\", value: text }; }\n  if (description != null && (typeof(description) != \"string\" || length(description) > 4096)) { raise { code: \"E_INVARG\", message: \"prepare_artifact description must be null or at most 4096 characters\", value: description }; }\n  set_object_name(note, name);\n  if (typeof(description) == \"string\" && description) { note.description = description; }\n  note:_set_initial_text(text);\n  note.produced_at = now();\n  return { order_id: order_id, prepared: true, duplicate: false, note: note };\n}"
+        },
+        {
+          "name": "deliver",
+          "perms": "rx",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": ["order_id", "note"] },
+          "source": "verb :deliver(order_id, note) rx {\n  this:_require_sequenced();\n  if (actor != this && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"only the block actor (plug) or wizard can deliver\", value: actor }; }\n  if (typeof(order_id) != \"string\" || !order_id) { raise { code: \"E_INVARG\", message: \"deliver requires order_id\", value: order_id }; }\n  let queue = this:_ensure_acts();\n  let found = queue:lookup(order_id);\n  if (found[\"state\"] == \"delivered\") { return { order_id: order_id, delivered: true, duplicate: true, note: found[\"note\"], text: this.name + \" already delivered this order.\" }; }\n  if (found[\"state\"] == \"canceled\") { return { order_id: order_id, delivered: false, duplicate: true, reason: \"canceled\" }; }\n  if (found[\"state\"] != \"queued\") { return { order_id: order_id, delivered: false, duplicate: false, reason: \"unknown\" }; }\n  if (note != found[\"artifact\"] || !valid(note) || !isa(note, $dispensed_note) || note.produced_by != this || note.order_id != order_id || note.produced_at < 1 || location(note) != this) { raise { code: \"E_INVARG\", message: \"deliver requires this order's prepared artifact\", value: note }; }\n  let requester = found[\"requester\"];\n  let title = note.name;\n  moveto(note, requester);\n  this:act(\"dispenser.delivered\", { order_id: order_id, note: note });\n  let line = this.name + \" delivers a note to your inventory: \" + title;\n  tell(requester, line);\n  return { order_id: order_id, delivered: true, duplicate: false, note: note, text: line };\n}"
+        },
+        {
+          "name": "cancel",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "tool_exposed": true,
+          "arg_spec": { "args": ["order_id"], "command": { "persistence": "durable" } },
+          "source": "verb :cancel(order_id) rxd {\n  this:_require_sequenced();\n  if (typeof(order_id) != \"string\" || !order_id) { raise { code: \"E_INVARG\", message: \"cancel requires order_id\", value: order_id }; }\n  let queue = this:_ensure_acts();\n  let found = queue:lookup(order_id);\n  if (found[\"state\"] == \"unknown\") { return { order_id: order_id, canceled: false, duplicate: false, reason: \"unknown\" }; }\n  if (actor != found[\"requester\"] && actor != this.owner && actor != this && !has_flag(actor, \"wizard\")) { return { order_id: order_id, canceled: false, duplicate: false, reason: \"unknown\" }; }\n  if (found[\"state\"] == \"canceled\") { return { order_id: order_id, canceled: true, duplicate: true }; }\n  if (found[\"state\"] == \"delivered\") { return { order_id: order_id, canceled: false, duplicate: true, reason: \"delivered\" }; }\n  let artifact = found[\"artifact\"];\n  if (valid(artifact) && location(artifact) == this) { recycle(artifact); }\n  this:act(\"dispenser.canceled\", { order_id: order_id });\n  return { order_id: order_id, canceled: true, duplicate: false };\n}"
+        },
+        {
+          "name": "pending_count",
+          "perms": "r",
+          "arg_spec": { "args": [] },
+          "skip_presence_check": true,
+          "source": "verb :pending_count() r {\n  if (caller != this) { raise { code: \"E_PERM\", message: \"pending count is dispenser-internal\" }; }\n  if (!this.acts_initialized) { return length(this.legacy_pending_orders); }\n  let queue = this:_queue();\n  if (queue == null) { return 0; }\n  return queue:pending_count();\n}"
+        },
+        {
+          "name": "next_pending",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": [], "command": { "persistence": "live" } },
+          "source": "verb :next_pending() rxd {\n  if (actor != this && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"only the block actor (plug) or wizard can read pending orders\", value: actor }; }\n  if (!this.acts_initialized) { if (length(this.legacy_pending_orders) == 0) { return null; } return this.legacy_pending_orders[1]; }\n  let queue = this:_queue();\n  if (queue == null) { raise { code: \"E_INVARG\", message: \"initialized dispenser has no bound queue projection\" }; }\n  return queue:next_pending();\n}"
+        },
+        {
+          "name": "status",
+          "perms": "rxd",
+          "direct_callable": true,
+          "skip_presence_check": true,
+          "arg_spec": { "args": ["order_id"], "command": { "persistence": "live" } },
+          "source": "verb :status(order_id) rxd {\n  if (typeof(order_id) != \"string\" || !order_id) { raise { code: \"E_INVARG\", message: \"status requires order_id\", value: order_id }; }\n  if (!this.acts_initialized) {\n    for item in this.legacy_pending_orders { if (item[\"order_id\"] == order_id) { if (actor != item[\"requester\"] && actor != this && actor != this.owner && !has_flag(actor, \"wizard\")) { return { state: \"unknown\", order_id: order_id }; } return { state: \"queued\", order_id: order_id, ts: item[\"ts\"] }; } }\n    return { state: \"unknown\", order_id: order_id };\n  }\n  let queue = this:_queue();\n  if (queue == null) { return { state: \"unknown\", order_id: order_id }; }\n  let found = queue:lookup(order_id);\n  if (found[\"state\"] != \"unknown\" && actor != found[\"requester\"] && actor != this && actor != this.owner && !has_flag(actor, \"wizard\")) { return { state: \"unknown\", order_id: order_id }; }\n  return found;\n}"
         },
         {
           "name": "get_data",
@@ -84,90 +159,81 @@
           "skip_presence_check": true,
           "tool_exposed": true,
           "arg_spec": { "args": ["name"] },
-          "source": "verb :get_data(name) rxd { if (name in [\"pending_orders\", \"next_order_seq\", \"last_request_at\", \"last_order_at\"]) { if (actor != this && actor != this.owner && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"dispenser queue data is private to the owner and plug\", value: { property: name, actor: actor } }; } } return pass(name); }"
+          "source": "verb :get_data(name) rxd {\n  if (name in [\"projections\", \"acts_initialized\", \"legacy_pending_orders\", \"legacy_next_order_seq\", \"legacy_last_request_at\", \"legacy_last_order_at\"]) { if (actor != this && actor != this.owner && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"dispenser coordination data is private\", value: { property: name, actor: actor } }; } }\n  return pass(name);\n}"
+        }
+      ]
+    },
+    {
+      "local_name": "$dispenser_queue",
+      "parent": "$projection",
+      "description": "Bounded projection for one anchored dispenser composer. Sole writer of pending rows, id allocation, requester/block admission indexes, and terminal receipts. It stores artifact references, never delivered prose.",
+      "properties": [
+        { "name": "consumes", "type": "list", "default": ["dispenser.genesis", "dispenser.legacy_ordered", "dispenser.ordered", "dispenser.delivered", "dispenser.canceled"], "perms": "" },
+        { "name": "row_cap", "type": "int", "default": 50, "perms": "" },
+        { "name": "requester_cap", "type": "int", "default": 50, "perms": "" },
+        { "name": "receipt_cap", "type": "int", "default": 50, "perms": "" },
+        { "name": "next_order_seq", "type": "int", "default": 1, "perms": "" },
+        { "name": "next_queue_seq", "type": "int", "default": 1, "perms": "" },
+        { "name": "last_order_seq", "type": "int", "default": 0, "perms": "" },
+        { "name": "requester_index", "type": "map", "default": {}, "perms": "" },
+        { "name": "receipts", "type": "map", "default": {}, "perms": "" },
+        { "name": "genesis_seen", "type": "bool", "default": false, "perms": "" }
+      ],
+      "verbs": [
+        {
+          "name": "fold",
+          "perms": "r",
+          "arg_spec": { "args": ["act"] },
+          "skip_presence_check": true,
+          "source": "verb :fold(act) r {\n  if (caller != this.source_space) { raise { code: \"E_PERM\", message: \"projection fold is authority-internal\" }; }\n  if (act[\"source\"] != this.source_space) { return false; }\n  let ty = act[\"type\"];\n  let p = act[\"payload\"];\n  let rows = this.rows;\n  let requesters = this.requester_index;\n  let receipts = this.receipts;\n  if (ty == \"dispenser.genesis\") {\n    if (!this.genesis_seen) {\n      if (p[\"next_order_seq\"] < 1) { raise { code: \"E_INVARG\", message: \"invalid dispenser genesis counter\", value: p[\"next_order_seq\"] }; }\n      this.next_order_seq = p[\"next_order_seq\"];\n      this.genesis_seen = true;\n    }\n  } else if (ty == \"dispenser.legacy_ordered\" || ty == \"dispenser.ordered\") {\n    if (!this.genesis_seen) { raise { code: \"E_INVARG\", message: \"dispenser order before genesis\" }; }\n    let key = p[\"order_id\"];\n    if (key in rows || key in receipts) { raise { code: \"E_INVARG\", message: \"duplicate dispenser order id\", value: key }; }\n    if (length(rows) >= this.row_cap) { raise { code: \"E_QUOTA\", message: \"dispenser queue row cap\", value: this.row_cap }; }\n    let requester = act[\"actor\"];\n    if (ty == \"dispenser.legacy_ordered\") { requester = p[\"requester\"]; }\n    else {\n      let expected = \"ord_\" + to_string(this.next_order_seq);\n      if (key != expected) { raise { code: \"E_INVARG\", message: \"dispenser order id is not the projected next id\", value: { expected: expected, got: key } }; }\n      this.next_order_seq = this.next_order_seq + 1;\n      let requester_key = to_string(requester);\n      if (!(requester_key in requesters) && length(requesters) >= this.requester_cap) {\n        let evict = null;\n        let oldest = null;\n        for rk in keys(requesters) { let rs = requesters[rk]; if (oldest == null || rs < oldest || (rs == oldest && rk < evict)) { oldest = rs; evict = rk; } }\n        let kept_requesters = {};\n        for rk, rs in requesters { if (rk != evict) { kept_requesters[rk] = rs; } }\n        requesters = kept_requesters;\n      }\n      requesters[requester_key] = act[\"seq\"];\n      this.last_order_seq = act[\"seq\"];\n    }\n    rows[key] = { order_id: key, requester: requester, request: p[\"request\"], artifact: p[\"artifact\"], ordered_seq: act[\"seq\"], queue_seq: this.next_queue_seq };\n    this.next_queue_seq = this.next_queue_seq + 1;\n  } else if (ty == \"dispenser.delivered\" || ty == \"dispenser.canceled\") {\n    let terminal_key = p[\"order_id\"];\n    if (!(terminal_key in rows)) {\n      if (terminal_key in receipts) { this.at_seq = act[\"seq\"]; return true; }\n      raise { code: \"E_INVARG\", message: \"terminal dispenser act for unknown order\", value: terminal_key };\n    }\n    let row = rows[terminal_key];\n    if (ty == \"dispenser.delivered\" && p[\"note\"] != row[\"artifact\"]) { raise { code: \"E_INVARG\", message: \"delivered note is not the order artifact\", value: p[\"note\"] }; }\n    let kept_rows = {};\n    for ok, ov in rows { if (ok != terminal_key) { kept_rows[ok] = ov; } }\n    rows = kept_rows;\n    if (!(terminal_key in receipts) && length(receipts) >= this.receipt_cap) {\n      let receipt_evict = null;\n      let receipt_oldest = null;\n      for tk in keys(receipts) { let terminal_seq = receipts[tk][\"terminal_seq\"]; if (receipt_oldest == null || terminal_seq < receipt_oldest || (terminal_seq == receipt_oldest && tk < receipt_evict)) { receipt_oldest = terminal_seq; receipt_evict = tk; } }\n      let kept_receipts = {};\n      for tk, tv in receipts { if (tk != receipt_evict) { kept_receipts[tk] = tv; } }\n      receipts = kept_receipts;\n    }\n    if (ty == \"dispenser.delivered\") { receipts[terminal_key] = { state: \"delivered\", order_id: terminal_key, requester: row[\"requester\"], note: p[\"note\"], terminal_seq: act[\"seq\"] }; }\n    else { receipts[terminal_key] = { state: \"canceled\", order_id: terminal_key, requester: row[\"requester\"], terminal_seq: act[\"seq\"] }; }\n  }\n  this.rows = rows;\n  this.requester_index = requesters;\n  this.receipts = receipts;\n  this.at_seq = act[\"seq\"];\n  return true;\n}"
         },
         {
-          "name": "deliver",
-          "perms": "rx",
-          "direct_callable": true,
+          "name": "admission_state",
+          "perms": "r",
+          "arg_spec": { "args": ["requester"] },
           "skip_presence_check": true,
-          "arg_spec": { "args": ["order_id", "name", "text", "description"] },
-          "source": "verb :deliver(order_id, name, text, description) rx { if (typeof(order_id) != \"string\" || !order_id) { raise { code: \"E_INVARG\", message: \"deliver requires order_id\", value: order_id }; } if (typeof(name) != \"string\" || !name) { raise { code: \"E_INVARG\", message: \"deliver requires a non-empty name\", value: name }; } if (typeof(text) != \"string\") { raise { code: \"E_INVARG\", message: \"deliver requires a text string\", value: text }; } let is_self = actor == this; let is_wiz = has_flag(actor, \"wizard\"); if (!is_self && !is_wiz) { raise { code: \"E_PERM\", message: \"only the block actor (plug) or wizard can deliver\", value: actor }; } let queue = this.pending_orders; let entry = null; let next = []; for item in queue { if (item[\"order_id\"] == order_id && entry == null) { entry = item; } else { next = next + [item]; } } if (entry == null) { return { order_id: order_id, delivered: false, reason: \"unknown_or_already_delivered\" }; } this.pending_orders = next; let requester = entry[\"requester\"]; let note = create($dispensed_note, { owner: this, name: name }); if (typeof(description) == \"string\" && description) { note.description = description; } note:set_text(text); note.produced_by = this; note.produced_at = now(); moveto(note, requester); let line = this.name + \" delivers a note to your inventory: \" + name; tell(requester, line); let here = location(this); if (here != null && isa(here, $space)) { observe_to_space(here, { type: \"delivered\", source: this, block: this, order_id: order_id, note: note, requester: requester, text: line, ts: now() }); } return { order_id: order_id, delivered: true, note: note, text: line }; }"
+          "source": "verb :admission_state(requester) r {\n  if (caller != this.source_space) { raise { code: \"E_PERM\", message: \"admission state is dispenser-internal\" }; }\n  let last = 0;\n  let key = to_string(requester);\n  if (key in this.requester_index) { last = this.requester_index[key]; }\n  return { pending: length(this.rows), next_order_seq: this.next_order_seq, last_order_seq: this.last_order_seq, requester_last_seq: last, at_seq: this.at_seq };\n}"
         },
         {
-          "name": "cancel",
-          "perms": "rxd",
-          "direct_callable": true,
-          "skip_presence_check": true,
-          "tool_exposed": true,
+          "name": "lookup",
+          "perms": "r",
           "arg_spec": { "args": ["order_id"] },
-          "source": "verb :cancel(order_id) rxd { if (typeof(order_id) != \"string\" || !order_id) { raise { code: \"E_INVARG\", message: \"cancel requires order_id\", value: order_id }; } let queue = this.pending_orders; let entry = null; let next = []; for item in queue { if (item[\"order_id\"] == order_id && entry == null) { entry = item; } else { next = next + [item]; } } if (entry == null) { return { order_id: order_id, canceled: false, reason: \"not_pending\" }; } if (actor != entry[\"requester\"] && actor != this.owner && actor != this && !has_flag(actor, \"wizard\")) { raise { code: \"E_PERM\", message: \"only the requester, owner, plug, or wizard can cancel\", value: actor }; } this.pending_orders = next; let here = location(this); if (here != null && isa(here, $space)) { observe_to_space(here, { type: \"canceled\", source: this, block: this, order_id: order_id, requester: entry[\"requester\"], ts: now() }); } return { order_id: order_id, canceled: true }; }"
+          "skip_presence_check": true,
+          "source": "verb :lookup(order_id) r {\n  if (caller != this.source_space) { raise { code: \"E_PERM\", message: \"queue lookup is dispenser-internal\" }; }\n  if (order_id in this.rows) { let row = this.rows[order_id]; return { state: \"queued\", order_id: order_id, requester: row[\"requester\"], artifact: row[\"artifact\"], ordered_seq: row[\"ordered_seq\"] }; }\n  if (order_id in this.receipts) { return this.receipts[order_id]; }\n  return { state: \"unknown\", order_id: order_id };\n}"
         },
         {
           "name": "next_pending",
-          "perms": "rxd",
-          "direct_callable": true,
+          "perms": "r",
+          "arg_spec": { "args": [] },
           "skip_presence_check": true,
-          "arg_spec": { "args": [], "command": { "persistence": "live" } },
-          "source": "verb :next_pending() rxd { let is_self = actor == this; let is_wiz = has_flag(actor, \"wizard\"); if (!is_self && !is_wiz) { raise { code: \"E_PERM\", message: \"only the block actor (plug) or wizard can read pending orders\", value: actor }; } let queue = this.pending_orders; if (length(queue) == 0) { return null; } return queue[1]; }"
+          "source": "verb :next_pending() r {\n  if (caller != this.source_space) { raise { code: \"E_PERM\", message: \"queue read is dispenser-internal\" }; }\n  let found = null;\n  let best = null;\n  for k in keys(this.rows) { let row = this.rows[k]; if (best == null || row[\"queue_seq\"] < best) { best = row[\"queue_seq\"]; found = row; } }\n  if (found == null) { return null; }\n  let ts = 0;\n  for e in this.log_space:replay(found[\"ordered_seq\"], 1) { if (e[\"seq\"] == found[\"ordered_seq\"]) { ts = e[\"ts\"]; } }\n  return { order_id: found[\"order_id\"], requester: found[\"requester\"], request: found[\"request\"], ts: ts };\n}"
         },
         {
-          "name": "status",
-          "perms": "rxd",
-          "direct_callable": true,
+          "name": "pending_count",
+          "perms": "r",
+          "arg_spec": { "args": [] },
           "skip_presence_check": true,
-          "tool_exposed": true,
-          "arg_spec": { "args": ["order_id"] },
-          "source": "verb :status(order_id) rxd { let queue = this.pending_orders; for item in queue { if (item[\"order_id\"] == order_id) { return { state: \"queued\", order_id: order_id, ts: item[\"ts\"] }; } } return { state: \"unknown\", order_id: order_id }; }"
+          "source": "verb :pending_count() r {\n  if (caller != this.source_space) { raise { code: \"E_PERM\", message: \"queue count is dispenser-internal\" }; }\n  return length(this.rows);\n}"
+        },
+        {
+          "name": "view",
+          "perms": "r",
+          "arg_spec": { "args": ["opts"] },
+          "skip_presence_check": true,
+          "source": "verb :view(opts) r {\n  if (caller != this.source_space) { raise { code: \"E_PERM\", message: \"dispenser queue view is internal\" }; }\n  return { pending: length(this.rows), at_seq: this.at_seq, next_order_seq: this.next_order_seq };\n}"
         }
       ]
     }
   ],
   "schemas": [
-    {
-      "on": "$dispenser_block",
-      "type": "order_placed",
-      "shape": {
-        "block": "obj",
-        "order_id": "str",
-        "requester": "obj",
-        "request": "str",
-        "text": "str",
-        "ts": "int"
-      }
-    },
-    {
-      "on": "$dispenser_block",
-      "type": "delivered",
-      "shape": {
-        "block": "obj",
-        "order_id": "str",
-        "note": "obj",
-        "requester": "obj",
-        "text": "str",
-        "ts": "int"
-      }
-    },
-    {
-      "on": "$dispenser_block",
-      "type": "canceled",
-      "shape": {
-        "block": "obj",
-        "order_id": "str",
-        "requester": "obj",
-        "ts": "int"
-      }
-    },
-    {
-      "on": "$dispensed_note",
-      "type": "note_dispersed",
-      "shape": {
-        "note": "obj",
-        "actor": "obj",
-        "room": "obj",
-        "text": "str",
-        "ts": "int"
-      }
-    }
+    { "on": "$dispenser_block", "type": "dispenser.genesis", "shape": { "next_order_seq": "int" } },
+    { "on": "$dispenser_block", "type": "dispenser.legacy_ordered", "shape": { "order_id": "str", "requester": "obj", "request": "str", "artifact": "obj" } },
+    { "on": "$dispenser_block", "type": "dispenser.ordered", "shape": { "order_id": "str", "request": "str", "artifact": "obj" } },
+    { "on": "$dispenser_block", "type": "dispenser.delivered", "shape": { "order_id": "str", "note": "obj" } },
+    { "on": "$dispenser_block", "type": "dispenser.canceled", "shape": { "order_id": "str" } },
+    { "on": "$dispensed_note", "type": "note_dispersed", "shape": { "note": "obj", "actor": "obj", "room": "obj", "text": "str", "ts": "int" } }
+  ],
+  "seed_hooks": [
+    { "kind": "attach_feature", "consumer": "$dispenser_block", "feature": "$acts" }
   ]
 }

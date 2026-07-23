@@ -1527,8 +1527,12 @@ function pickMatchingMigration(
  * matches the cursor, advance the cursor to that migration's `to_version`
  * (wildcard minor/patch resolve to 0 — the next edge's `from_version` is a
  * major-wide pattern by the same convention), and stop when an edge's
- * `to_version` covers the target. The composed manifest concatenates the
- * steps in order; each step is idempotent by the migration contract
+ * `to_version` covers the target. A conventional edge ending at `N.0.0`
+ * also covers a later bundled `N.y.z`: the edge performs the major data
+ * rewrite and the same update installs the target patch definitions. The
+ * composed manifest broadens only that final edge to `N.x.x` so the ordinary
+ * migration validator can check the actual target. The composed manifest
+ * concatenates the steps in order; each step is idempotent by the migration contract
  * (spec/discovery/catalogs.md §CT14), so a chain re-run after partial failure
  * is safe. Returns null when no chain connects (caller decides how loudly to
  * complain). */
@@ -1549,14 +1553,16 @@ function composeMigrationChain(
     if (!next) return null;
     used.add(next);
     chain.push(next);
-    if (versionPatternMatches(next.to_version, toVersion)) {
+    if (migrationEdgeReachesTarget(next.to_version, toVersion)) {
       // Chain complete. spec_versions must agree for validateCatalogMigration
       // (it checks the composed value against the manifest); a mixed chain is
       // unmergeable, and the shape guards make it a build error anyway.
       if (chain.some((m) => m.spec_version !== chain[0].spec_version)) return null;
       return {
         from_version: chain[0].from_version,
-        to_version: next.to_version,
+        to_version: versionPatternMatches(next.to_version, toVersion)
+          ? next.to_version
+          : `${majorVersionOf(toVersion)}.x.x`,
         spec_version: chain[0].spec_version,
         steps: chain.flatMap((m) => m.steps)
       };
@@ -1564,6 +1570,17 @@ function composeMigrationChain(
     cursor = next.to_version.split(".").map((part) => (part === "x" ? "0" : part)).join(".");
   }
   return null;
+}
+
+/** A per-major migration normally lands on N.0.0. Later N.y.z bundles still
+ * need that same edge when upgrading from N-1: patch/minor schema drift does
+ * not require another data migration, but it must not make the major chain
+ * appear missing. Never let a future edge cover an older target. */
+function migrationEdgeReachesTarget(edgeToVersion: string, targetVersion: string): boolean {
+  if (versionPatternMatches(edgeToVersion, targetVersion)) return true;
+  if (edgeToVersion.includes("x")) return false;
+  return majorVersionOf(edgeToVersion) === majorVersionOf(targetVersion)
+    && !isVersionLessThan(targetVersion, edgeToVersion);
 }
 
 function majorVersionOf(version: string): number {

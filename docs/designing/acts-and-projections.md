@@ -42,7 +42,7 @@ Declare each act type and its payload shape in your manifest's
     "shape": { "task": "obj", "kind": "str", "labels": "list",
                "obligations": "list" } },
   { "on": "$case", "type": "tasks.claimed",
-    "shape": { "task": "obj", "holder": "obj" } },
+    "shape": { "task": "obj" } },
   { "on": "$case", "type": "tasks.closed",
     "shape": { "task": "obj", "outcome_code": "str" } }
 ]
@@ -75,7 +75,7 @@ verb :claim(task) rxd {
   if (row == null || row["phase"] != "active") { raise { code: "E_TRANSITION", message: "task is not claimable", value: task }; }
   if (!valid(task) || location(task) != this) { raise { code: "E_INVARG", message: "task not open here", value: task }; }
   moveto(task, actor);                 /* the move IS the lease */
-  this:act("tasks.claimed", { "task": task, "holder": actor });
+  this:act("tasks.claimed", { "task": task });
   return task;
 }
 ```
@@ -124,11 +124,15 @@ When creating the projection, bind it to its one composer immediately:
 ```
 let board = create($task_board, { owner: this.owner, name: "board", location: this });
 board.source_space = this;  /* trusted catalog write; create() ignores arbitrary fields */
+board.log_space = this;
 this.projections = [board];
 ```
 
-`source_space` is inherited from `$projection`, is not publicly writable, and
-must equal the emitting room. Never infer fold authority from location alone.
+Both bindings are inherited from `$projection` and are not publicly writable.
+`source_space` names the composer; `log_space` names the sequenced room. They
+are equal for a room composer. A catalog-owned anchored actor instead binds
+`source_space` to itself and `log_space` to its containing room. Never infer
+either authority from projection location alone.
 
 Write the fold (`$task_board:fold`, trimmed — the shipped fold also
 seeds `waits`/`links` and folds `tasks.passed` into obligations):
@@ -198,7 +202,8 @@ let next = board:view({ "limit": 50, "after": page["cursor"] });
 - Be the sole writer of `this.rows` — no other verb ever writes it.
 - Give `fold` no public `x` permission and accept only the bound
   `source_space`. Rebuild is source-mediated; never grant self-fold.
-- Do O(payload) work per fold — never scan the room or the world.
+- Scan only the payload and explicitly declared fixed-cap projection maps —
+  never the room, world, or an unbounded collection.
 - Raise `E_QUOTA` at `row_cap` — raising is the overflow policy.
 - End every fold with `this.at_seq = act["seq"]`.
 - Treat `at_seq` in view results as this projection's completeness
@@ -412,3 +417,7 @@ verb :tree_view() rxd {
 - [`../../catalogs/outliner/manifest.json`](../../catalogs/outliner/manifest.json)
   — guarded emission on real verbs, and the `$outline_meta` /
   `tree_view` relation checkpoint.
+- [`../../catalogs/dispenser/manifest.json`](../../catalogs/dispenser/manifest.json)
+  — anchored-actor composition, bounded queue/index/receipt state,
+  artifact-reference delivery, legacy genesis, and external-plug
+  idempotency.
