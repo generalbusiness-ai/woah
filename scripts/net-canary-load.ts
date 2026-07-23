@@ -166,7 +166,13 @@ async function runWhoCheck(base: string, guests: CanaryGuest[], run: string): Pr
     const { response, body } = await jsonFetch(`${base}/net-api/turn`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer session:${responder.session}` },
-      body: JSON.stringify({ target: responder.actor, verb: "who_all", args: [], idempotency_key: `${run}-who-${responder.actor}` })
+      body: JSON.stringify({
+        target: responder.actor,
+        verb: "who_all",
+        args: [],
+        route: "direct",
+        idempotency_key: `${run}-who-${responder.actor}`
+      })
     });
     const reply = body.reply as { status?: unknown } | undefined;
     const reachable = response.ok && reply?.status === "accepted";
@@ -283,6 +289,10 @@ async function main(): Promise<void> {
               target: room,
               verb,
               args: turnArgs,
+              // Both load verbs declare live persistence. Exercise their
+              // production route instead of manufacturing contention on the
+              // room's durable sequence allocator.
+              route: "direct",
               idempotency_key: `${run}-${round}-${index}`
             })
           });

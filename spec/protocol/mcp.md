@@ -192,8 +192,13 @@ must also pass the concrete runtime-object-id validator before it can consume
 turn planning or repair budget.
 
 Every accepted invocation enters the normal Net client-turn path with a fresh
-idempotency key. MCP does not choose a classic direct/sequenced route and does
-not run a private VM.
+idempotency key; MCP never runs a private VM. Routing comes from the descriptor's
+command contract: `persistence:"live"` selects `direct` (and therefore still
+requires `direct_callable:true` at ingress), while `persistence:"durable"`
+selects `sequenced`. A tool-exposed verb without either declaration defaults to
+`sequenced`. Thus chat reads and speech do not contend on a space log merely
+because they arrived over MCP, while durable domain operations retain their
+ordering boundary.
 
 Successful `tools/call` results use:
 

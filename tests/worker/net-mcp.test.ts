@@ -351,6 +351,15 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
 
     // Cross-actor: alice says; bob's woo_wait sees it (presence-routed
     // fanout → the MCP queue; both sessions born present in the room).
+    const roomAuthority = scopeDOs.get("room:the_chatroom") as NetScopeDO;
+    const roomHead = async (): Promise<number> => {
+      const response = await roomAuthority.fetch(
+        await signInternalRequest(scopeEnv, new Request("https://do/net/head"))
+      );
+      expect(response.ok).toBe(true);
+      return ((await response.json()) as { head: { seq: number } }).head.seq;
+    };
+    const headBeforeSay = await roomHead();
     const said = await call(aliceSession, "woo_call", { object: "the_chatroom", verb: "say", args: ["hello bob mcp-run"] });
     expect(said.result?.isError, JSON.stringify(said)).not.toBe(true);
     const ownTurnId = [...((gateway as any).recentClientTurns as Map<string, string>).keys()].at(-1);
@@ -362,6 +371,7 @@ describe("MCP adapter over /net-api (client-shell phase i)", () => {
       (obs: any) => obs?.type === "said" && typeof obs.text === "string" && obs.text.includes("hello bob mcp-run")
     );
     expect(match, JSON.stringify(observations).slice(0, 400)).toBeTruthy();
+    expect(await roomHead(), "MCP must preserve say's live route").toBe(headBeforeSay);
 
     // The session-local echo guard remains after the shared recent-turn LRU
     // is lost (cap/eviction). A delayed self fanout must not leak into wait.

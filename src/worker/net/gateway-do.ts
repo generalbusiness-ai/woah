@@ -4182,10 +4182,30 @@ export class NetGatewayDO {
         candidate.object === object && (candidate.verb === verb || candidate.aliases.includes(verb))
       );
       if (!tool) return this.mcpToolError(id, { code: "E_PERM", message: `tool is not available in this session context: ${object}:${verb}` });
-      return this.mcpInvokeTurn(id, actor, session, tool.object, tool.verb, Array.isArray(args.args) ? args.args : [], this.mcpTraceOf(request));
+      return this.mcpInvokeTurn(
+        id,
+        actor,
+        session,
+        tool.object,
+        tool.verb,
+        Array.isArray(args.args) ? args.args : [],
+        tool.route,
+        this.mcpTraceOf(request)
+      );
     }
     const dynamic = this.mcpContextTools(actor, session).find((tool) => tool.name === name);
-    if (dynamic) return this.mcpInvokeTurn(id, actor, session, dynamic.object, dynamic.verb, mcpNamedArgs(dynamic, args), this.mcpTraceOf(request));
+    if (dynamic) {
+      return this.mcpInvokeTurn(
+        id,
+        actor,
+        session,
+        dynamic.object,
+        dynamic.verb,
+        mcpNamedArgs(dynamic, args),
+        dynamic.route,
+        this.mcpTraceOf(request)
+      );
+    }
     return json({ jsonrpc: "2.0", id, error: { code: -32602, message: `unknown tool: ${name}` } }, 200);
   }
 
@@ -4230,6 +4250,7 @@ export class NetGatewayDO {
     object: string,
     verb: string,
     args: unknown[],
+    route: "direct" | "sequenced",
     trace?: TraceContext
   ): Promise<Response> {
     try {
@@ -4246,7 +4267,7 @@ export class NetGatewayDO {
       }
       const turnResponse = await this.clientTurn(
         actor,
-        { target: object, verb, args, session, idempotency_key: turnId },
+        { target: object, verb, args, route, session, idempotency_key: turnId },
         identity.epoch,
         // AU2 MCP carrier (threaded from mcpToolsCall, which holds the
         // request): an MCP agent framework that emits traceparent joins
@@ -4764,6 +4785,11 @@ export class NetGatewayDO {
           if (page.kind !== "bytecode") continue;
           const argSpec = mcpRecord(page.arg_spec);
           const command = mcpRecord(argSpec.command);
+          // The catalog's command contract is the one routing declaration
+          // shared by shell and MCP clients. Absence stays fail-safe:
+          // mutation tools commonly omit command metadata and must continue
+          // through the sequencer.
+          const route = command.persistence === "live" ? "direct" : "sequenced";
           const commandShaped = Object.keys(command).length > 0;
           const exposed = page.tool_exposed === true || (allowCommandShaped && commandShaped);
           if (!exposed) continue;
@@ -4778,6 +4804,7 @@ export class NetGatewayDO {
           out.push({
             object,
             verb,
+            route,
             aliases,
             description: paragraph ? `${paragraph}\n\nCall: ${callForm}` : `Call: ${callForm}`,
             inputSchema: input.schema,
@@ -7401,6 +7428,10 @@ type NetMcpToolScope = "active" | "here" | "object" | "space" | "all";
 type NetMcpToolDraft = {
   object: string;
   verb: string;
+  /** Transport route derived from catalog command persistence. This stays
+   * internal: clients invoke one capability; the gateway preserves its
+   * declared live/durable semantics. */
+  route: "direct" | "sequenced";
   aliases: string[];
   description: string;
   inputSchema: Record<string, unknown>;
