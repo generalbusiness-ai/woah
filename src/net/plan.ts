@@ -931,7 +931,13 @@ function sparseMissingKeys(
     call.actor ?? null
   ].filter((ref): ref is string => typeof ref === "string" && ref.length > 0);
   for (const ref of refs) {
-    if (!view.has(cellKey("object_lineage", ref))) {
+    // A tombstone is a complete terminal answer, not missing lineage.
+    // Re-requesting lineage after authority supplied the tombstone would turn
+    // an honest E_OBJNF into a non-convergent repair loop.
+    if (
+      !view.has(cellKey("object_lineage", ref)) &&
+      !view.has(cellKey("object_tombstone", ref))
+    ) {
       missing.add(cellKey("object_lineage", ref));
       missing.add(cellKey("object_live", ref));
     }

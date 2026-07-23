@@ -351,8 +351,14 @@ buried in VTN):
 - **Validation is post-state re-derivation, not re-execution.** The scope
   never re-runs verb bytecode; it re-applies recorded writes
   deterministically and constructs authoritative post-state from the
-  transcript's creates/writes/moves and sequenced-log outcome. The submit
-  carries no executor post-state.
+  transcript's creates/writes/moves/recycles and sequenced-log outcome. A
+  recycle replaces every authority cell owned by the object with one
+  `object_tombstone` cell in the same commit, grafts its lineage children to
+  its former parent, displaces its contained live objects to `$nowhere`, and
+  retracts the corresponding contents/ordering relations. The tombstone is
+  the durable distinction between "recycled" and "never existed"; retaining
+  an `object_lineage`, `object_live`, property, or verb cell beside it is an
+  invalid authority image. The submit carries no executor post-state.
 - **Doomed-round short-circuit** is permitted exactly as VTN8 bounds it:
   steps 1–9 are pre-state-only; a rejection they determine
   (`stale_head`, `scope_mismatch`, `permission_denied`, and
@@ -486,7 +492,20 @@ trace where repair rounds occurred.
 - **Lineage closure is part of the transfer type.** A page transfer that
   does not close over `object_lineage` does not serialize (`E_LINEAGE` is
   an assertion, not an operational error). Dangling parent references are
-  therefore unrepresentable, not merely gated to zero.
+  therefore unrepresentable, not merely gated to zero. An
+  `object_tombstone` is the terminal replacement for an object page, not a
+  live page, and therefore requires no lineage closure. A keyed request for
+  an absent object's lineage returns its tombstone when one exists, so a stale
+  gateway repairs to terminal `E_OBJNF` rather than retrying an unresolvable
+  missing lineage.
+- **Ordered fanout carries deletion as data.** For every touched authority
+  key absent from the accepted post-state, the same `FanoutBody` that carries
+  replacement cells carries the key in `removed_cells`. The receiver applies
+  installs and removals under one per-scope high-water transaction. Rider
+  adoption preserves the same distinction: owner scopes CAS and fan out both
+  replacement cells and removed keys. Dropping absent touched keys from
+  fanout is forbidden because it can certify a stale derived page at a newer
+  head.
 - **State transfer is verifiable cache-fill** (VTN0 claim 5, carried):
   content-addressed, receiver-authorization-filtered, installs into copy
   #2/#4 with `derived` provenance at a stated `source_head`. It never

@@ -672,6 +672,12 @@ export class ScopeSequencer {
         keys.push(key);
         catalogMutationKeys.set(write.cell.object, keys);
       }
+      for (const recycle of submit.transcript.recycles ?? []) {
+        if (!this.options.catalogMutationForbidden(recycle.object)) continue;
+        const keys = catalogMutationKeys.get(recycle.object) ?? [];
+        keys.push(cellKey("object_tombstone", recycle.object));
+        catalogMutationKeys.set(recycle.object, keys);
+      }
     }
     if (catalogMutationKeys.size > 0) {
       const objects = [...catalogMutationKeys.keys()].sort();
@@ -794,6 +800,34 @@ export class ScopeSequencer {
       return this.reject(submit, "read_version_mismatch", { ordering_conflicts: orderingConflicts });
     }
 
+    // A tombstone is terminal authority, not an absent object page. A stale
+    // gateway may still submit a write/create/move planned from old lineage;
+    // reject it as the lifecycle read conflict it is so the repair path pulls
+    // the tombstone and replans to E_OBJNF. Recycles themselves must execute
+    // at the object's owner and against a live lineage page.
+    const lifecycleObjects = new Set<string>();
+    for (const write of submit.transcript.writes) lifecycleObjects.add(write.cell.object);
+    for (const create of submit.transcript.creates ?? []) lifecycleObjects.add(create.object);
+    for (const move of submit.transcript.moves ?? []) lifecycleObjects.add(move.object);
+    for (const recycle of submit.transcript.recycles ?? []) lifecycleObjects.add(recycle.object);
+    for (const object of lifecycleObjects) {
+      if (!this.store.has(cellKey("object_tombstone", object))) continue;
+      return this.reject(submit, "read_version_mismatch", { tombstoned_object: object }, [
+        { kind: "lifecycle", object } as TranscriptCell
+      ]);
+    }
+    for (const recycle of submit.transcript.recycles ?? []) {
+      if (
+        (this.options.owns && !this.options.owns(recycle.object)) ||
+        !this.store.has(cellKey("object_lineage", recycle.object))
+      ) {
+        return this.reject(submit, "write_unauthorized", {
+          recycle: recycle.object,
+          reason: "recycle target is not a live object owned by this scope"
+        });
+      }
+    }
+
     // Step 7c (sequenced-log.md SL4): validate replay-page reads exactly
     // like ordering reads. An entry THIS scope owns re-derives its page
     // from the durable committed log — an append landing inside the window
@@ -850,7 +884,10 @@ export class ScopeSequencer {
     // engine's own has()-skip rule), so the loop converges instead of
     // silently overwriting an object the planner never saw.
     for (const create of submit.transcript.creates ?? []) {
-      if (this.store.get(cellKey("object_lineage", create.object)) !== undefined) {
+      if (
+        this.store.get(cellKey("object_lineage", create.object)) !== undefined ||
+        this.store.get(cellKey("object_tombstone", create.object)) !== undefined
+      ) {
         return this.reject(submit, "read_version_mismatch", { create_collision: create.object }, [
           // "lifecycle" is the transcript kind that keys object_lineage
           // (netCellKeyFor) — the refresh then pulls the existing
@@ -1020,11 +1057,13 @@ export class ScopeSequencer {
    *   read there is no stale read to launder (the design-C allowance).
    *   Conflicts never block the applied cells.
    * - A non-empty applied set is ONE owner commit: the head advances
-   *   once for the batch, the applied cells commit through the store
+   *   once for the batch, replacement cells and removals commit through
+   *   the store
    *   with the NEW head stamp (authoritative provenance — this IS an
    *   owner-ordered event, so observers and catch-up see a real
    *   owner-head advance with CO8-correct stamps), a tail entry is
-   *   appended, and the durable write-through covers cells + meta + tail
+   *   appended, and the durable write-through covers cells/removals +
+   *   meta + tail
    *   in one transaction exactly like submit's accept path.
    * - Adoption does NOT rerun ordinary CO4 validation: the writes were already
    *   validated at the committing scope against this owner's plan-time
@@ -1037,7 +1076,13 @@ export class ScopeSequencer {
    *   (NetScopeDO), which is why this method must be called exactly once
    *   per adoption fact.
    */
-  adopt(input: { from_scope: string; seq: number; cells: Cell[]; priors: Record<string, string> }): {
+  adopt(input: {
+    from_scope: string;
+    seq: number;
+    cells: Cell[];
+    removed?: string[];
+    priors: Record<string, string>;
+  }): {
     status: "applied" | "empty" | "rejected";
     head: ScopeHead;
     applied: string[];
@@ -1053,6 +1098,13 @@ export class ScopeSequencer {
         const keys = catalogMutationKeys.get(cell.object) ?? [];
         keys.push(cell.key);
         catalogMutationKeys.set(cell.object, keys);
+      }
+      for (const key of input.removed ?? []) {
+        const object = key.split(":")[1] ?? "";
+        if (!object || !this.options.catalogMutationForbidden(object)) continue;
+        const keys = catalogMutationKeys.get(object) ?? [];
+        keys.push(key);
+        catalogMutationKeys.set(object, keys);
       }
     }
     if (catalogMutationKeys.size > 0) {
@@ -1071,6 +1123,7 @@ export class ScopeSequencer {
     }
 
     const accepted: Cell[] = [];
+    const acceptedRemovals: string[] = [];
     const conflicts: Array<{ key: string; ours: string; theirs: string }> = [];
     for (const cell of input.cells) {
       const ours = this.store.get(cell.key)?.version ?? "absent";
@@ -1081,7 +1134,18 @@ export class ScopeSequencer {
       }
       accepted.push(cell);
     }
-    if (accepted.length === 0) {
+    for (const key of input.removed ?? []) {
+      const ours = this.store.get(key)?.version ?? "absent";
+      const prior = input.priors[key];
+      if (prior !== undefined && prior !== ours) {
+        conflicts.push({ key, ours, theirs: "absent" });
+        continue;
+      }
+      // Deleting an already-absent key is an idempotent no-op, not an owner
+      // event. The sender high-water still advances in the shell.
+      if (ours !== "absent") acceptedRemovals.push(key);
+    }
+    if (accepted.length === 0 && acceptedRemovals.length === 0) {
       // Nothing applied: the head does not advance (an all-conflict
       // adoption changes no owner state, so minting an owner event for
       // it would fan out a no-op), but the conflicts still surface for
@@ -1117,6 +1181,10 @@ export class ScopeSequencer {
       });
       appliedKeys.push(committed.key);
     }
+    for (const key of acceptedRemovals) {
+      this.store.delete(key);
+      appliedKeys.push(key);
+    }
     appliedKeys.sort();
     this.headState = nextHead;
     const tailEntry: TailEntry = {
@@ -1139,6 +1207,7 @@ export class ScopeSequencer {
         for (const key of appliedKeys) {
           const cell = this.store.get(key);
           if (cell) durable.writeCell(cell);
+          else durable.deleteCell(key);
         }
         durable.writeMeta(this.metaRow());
         durable.appendTail(tailEntry);

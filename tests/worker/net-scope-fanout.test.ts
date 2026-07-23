@@ -150,6 +150,44 @@ function rideAlongSubmit(base: ScopeHead): CommitSubmit {
   };
 }
 
+/** Same CA3 shape as rideAlongSubmit, but both final writes are removals.
+ * This is the regression for the once-upsert-only hot path: absence must
+ * survive the room fanout and the actor-owner adoption. */
+function deleteAlongSubmit(base: ScopeHead): CommitSubmit {
+  const transcript = {
+    kind: "woo.effect_transcript.shadow.v1",
+    route: "direct",
+    scope: ROOM_SCOPE,
+    seq: 1,
+    call: { actor: "#actor", target: "#room", verb: "forget", args: [], body: undefined },
+    reads: [],
+    writes: [
+      { cell: { kind: "prop", object: "#room", name: "visits" }, value: 0, op: "remove", writer: WRITER },
+      { cell: { kind: "prop", object: "#actor", name: "greeted" }, value: 0, op: "remove", writer: WRITER }
+    ],
+    creates: [],
+    moves: [],
+    observations: [],
+    logicalInputs: [],
+    untrackedEffects: [],
+    complete: true,
+    incompleteReasons: [],
+    hash: "net-fanout-delete-t1"
+  };
+  const twin = new ScopeSequencer(ROOM_SCOPE, EPOCH);
+  twin.seed(roomCells());
+  const derived = applyTranscript(twin.store, transcript as never, { scope_head: "x", catalog_epoch: EPOCH });
+  return {
+    kind: "woo.net.commit_submit.v1",
+    scope: ROOM_SCOPE,
+    base,
+    idempotency_key: "fanout-delete-turn-1",
+    transcript: transcript as never,
+    post_state_version: derived.postStateVersion,
+    stamp: { scope_head: "x", catalog_epoch: EPOCH }
+  };
+}
+
 function outboxRows(state: NetScopeDurableState): Array<{ route: string; status: string; attempts: number }> {
   return (
     state.storage.sql.exec("SELECT route, status, attempts FROM net_scope_outbox") as { toArray(): Array<{ route: string; status: string; attempts: number }> }
@@ -247,6 +285,71 @@ describe("NetScopeDO fanout + rider adoption over fake-DO", () => {
     expect(outboxRows(room.state)).toEqual([]);
     expect(clusterRecorder.calls.filter((c) => c.path === "/net/adopt")).toHaveLength(1);
     expect(gatewayRecorder.calls.filter((c) => c.path === "/net/fanout")).toHaveLength(1);
+
+    room.close();
+    cluster.close();
+    gatewayState.close();
+  });
+
+  it("carries absent touched keys through subscriber fanout and rider adoption", async () => {
+    const scopeEnvBase = { WOO_INTERNAL_SECRET: SECRET };
+    const cluster = netState(`scope-delete-${CLUSTER_SCOPE}`);
+    const clusterDO = new NetScopeDO(cluster.state, scopeEnvBase);
+    await call(clusterDO, scopeEnvBase, "/seed", {
+      scope: CLUSTER_SCOPE,
+      catalog_epoch: EPOCH,
+      cells: clusterCells()
+    });
+
+    const gatewayState = netState("gateway-fanout-delete");
+    const gatewayEnv: NetGatewayEnv = { WOO_INTERNAL_SECRET: SECRET };
+    const gatewayRecorder = recordingStub(new NetGatewayDO(gatewayState.state, gatewayEnv));
+    const clusterRecorder = recordingStub(clusterDO);
+    const room = netState(`scope-delete-${ROOM_SCOPE}`);
+    const roomEnv: NetScopeEnv = {
+      WOO_INTERNAL_SECRET: SECRET,
+      NET_RESOLVE: (destination) => {
+        if (destination === `scope:${CLUSTER_SCOPE}`) return clusterRecorder.stub;
+        if (destination === "gateway:delete") return gatewayRecorder.stub;
+        throw new Error(`unexpected destination ${destination}`);
+      }
+    };
+    const roomDO = new NetScopeDO(room.state, roomEnv);
+    await call(roomDO, roomEnv, "/seed", {
+      scope: ROOM_SCOPE,
+      catalog_epoch: EPOCH,
+      cells: roomCells()
+    });
+    await call(roomDO, roomEnv, "/subscribe", { destination: "gateway:delete" });
+
+    const base = (await call<{ head: ScopeHead }>(roomDO, roomEnv, "/head")).head;
+    const reply = await call<CommitReply>(roomDO, roomEnv, "/submit", {
+      submit: deleteAlongSubmit(base),
+      rider_destinations: {
+        [CLUSTER_SCOPE]: { destination: `scope:${CLUSTER_SCOPE}`, objects: ["#actor"] }
+      }
+    });
+    expect(reply.status).toBe("accepted");
+    await roomDO.alarm();
+    await room.settle();
+
+    const fanout = gatewayRecorder.calls.find((entry) => entry.path === "/net/fanout")?.body as {
+      removed_cells?: string[];
+    };
+    expect(fanout.removed_cells).toContain("property_cell:#room:visits");
+    const adoption = clusterRecorder.calls.find((entry) => entry.path === "/net/adopt")?.body as {
+      removed_cells?: string[];
+    };
+    expect(adoption.removed_cells, JSON.stringify(clusterRecorder.calls)).toEqual([
+      "property_cell:#actor:greeted"
+    ]);
+    const ownerCell = await call<{ cells: Array<{ key: string }> }>(
+      clusterDO,
+      scopeEnvBase,
+      "/closure",
+      { keys: ["property_cell:#actor:greeted"], known: ["object_lineage:#actor"] }
+    );
+    expect(ownerCell.cells).toEqual([]);
 
     room.close();
     cluster.close();

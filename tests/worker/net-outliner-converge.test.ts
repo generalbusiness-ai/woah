@@ -567,6 +567,42 @@ describe("outliner add over the net path converges", () => {
       roomDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { container: theOutline, parent: p }
     );
     expect(underP.rows.map((r) => r.child), "no orphaned edge to the recycled parent").not.toContain(c1);
+
+    // Lifecycle authority, not just the ordering projection: the accepted
+    // recycle replaces p's complete object page with a tombstone, and the
+    // gateway's next authoritative tree read cannot resurrect the stale row.
+    const pClosure = await call<{ cells: Array<{ key: string }> }>(
+      roomDO,
+      { WOO_INTERNAL_SECRET: SECRET },
+      "/closure",
+      { keys: [`object_lineage:${p}`], known: [] }
+    );
+    expect(pClosure.cells.map((cell) => cell.key)).toEqual([`object_tombstone:${p}`]);
+    const view = await verbTurn(gateway, gatewayEnv, ctx, "eject-p-view", "tree_view", []);
+    expect(view.reply.status, JSON.stringify(view.trace)).toBe("accepted");
+    expect((view.result as { items: Array<{ id: string }> }).items.map((item) => item.id)).not.toContain(p);
+
+    // Cold reconstruction at the exact post-delete heads: a new gateway has
+    // no warm omission/filtering state to hide a bad authority image. Full
+    // closures must contain the tombstone and no live p cells, and tree_view
+    // must agree with the warm gateway.
+    const coldGateway = new NetGatewayDO(netState("gateway-outliner-post-recycle"), gatewayEnv);
+    for (const scope of scopeDOs.keys()) {
+      await call(coldGateway, gatewayEnv, "/pull", {
+        scope,
+        destination: `scope:${scope}`
+      });
+    }
+    const coldView = await verbTurn(
+      coldGateway,
+      gatewayEnv,
+      ctx,
+      "eject-p-cold-view",
+      "tree_view",
+      []
+    );
+    expect(coldView.reply.status, JSON.stringify(coldView.trace)).toBe("accepted");
+    expect((coldView.result as { items: Array<{ id: string }> }).items.map((item) => item.id)).not.toContain(p);
   });
 
   it("cross-outliner moveto is refused before either scoped ordering changes", async () => {

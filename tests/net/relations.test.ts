@@ -118,6 +118,30 @@ describe("deriveRelationDeltas (CO13)", () => {
     expect(derived.local).toHaveLength(1);
   });
 
+  it("recycle retracts container, contained, and ordered-edge rows", () => {
+    const t = transcript({ recycles: [{ object: "#doomed" }] });
+    const derived = deriveRelationDeltas(
+      t,
+      {
+        projectionWrites: [],
+        recycledObjects: [{
+          object: "#doomed",
+          from: "room:hall",
+          displaced: ["#coin"],
+          hadOrderedEdge: true
+        }]
+      },
+      "room:hall"
+    );
+    expect(derived.local.map((delta) =>
+      `${delta.op}:${delta.row.relation}:${delta.row.owner}:${delta.row.member}`
+    ).sort()).toEqual([
+      "remove:contents:#doomed:#coin",
+      "remove:contents:room:hall:#doomed",
+      "remove:ordered_edge:room:hall:#doomed"
+    ]);
+  });
+
   it("session transitions derive presence deltas carrying the actor", () => {
     const t = transcript({ sessionScopeTransition: { session: "s1", actor: "#alice", from: "room:hall", to: "room:den" } });
     const derived = deriveRelationDeltas(t, NO_WRITES, "room:hall");

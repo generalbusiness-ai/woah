@@ -199,6 +199,62 @@ describe("applyTranscript (CO4 step 10)", () => {
     expect(result.touched).toEqual(["object_live:#bag"]);
   });
 
+  it("recycles atomically into one tombstone and re-derives RC3 graph changes", () => {
+    const pre = new CellStore("authority");
+    pre.commit({
+      kind: "object_lineage",
+      object: "#doomed",
+      value: { parent: "#base", owner: "#actor", name: "doomed", anchor: null, flags: {} },
+      stamp: STAMP
+    });
+    pre.commit({ kind: "object_live", object: "#doomed", value: { location: "#room" }, stamp: STAMP });
+    pre.commit({ kind: "property_cell", object: "#doomed", name: "note", value: { value: "secret" }, stamp: STAMP });
+    pre.commit({ kind: "property_cell", object: "#doomed", name: "__ordered_edge", value: { value: { parent: null, rank: "V" } }, stamp: STAMP });
+    pre.commit({ kind: "verb_bytecode", object: "#doomed", name: "run", value: { source: "return 1;" }, stamp: STAMP });
+    pre.commit({
+      kind: "object_lineage",
+      object: "#child",
+      value: { parent: "#doomed", owner: "#actor", name: "child", anchor: null, flags: {} },
+      stamp: STAMP
+    });
+    pre.commit({ kind: "object_live", object: "#child", value: { location: null }, stamp: STAMP });
+    pre.commit({
+      kind: "object_lineage",
+      object: "#contained",
+      value: { parent: "#base", owner: "#actor", name: "contained", anchor: null, flags: {} },
+      stamp: STAMP
+    });
+    pre.commit({ kind: "object_live", object: "#contained", value: { location: "#doomed" }, stamp: STAMP });
+
+    const result = applyTranscript(pre, baseTranscript({
+      recycles: [{ object: "#doomed" }]
+    }), STAMP);
+
+    expect(pre.has("object_lineage:#doomed")).toBe(true);
+    expect(result.post.cellsForObject("#doomed").map((cell) => cell.key)).toEqual([
+      "object_tombstone:#doomed"
+    ]);
+    expect(result.post.get("object_tombstone:#doomed")?.value).toEqual({ recycled: true });
+    expect(result.post.get("object_lineage:#child")?.value).toMatchObject({ parent: "#base" });
+    expect(result.post.get("object_live:#contained")?.value).toEqual({ location: "$nowhere" });
+    expect(result.recycledObjects).toEqual([{
+      object: "#doomed",
+      from: "#room",
+      displaced: ["#contained"],
+      hadOrderedEdge: true
+    }]);
+    expect(result.touched).toEqual(expect.arrayContaining([
+      "object_lineage:#doomed",
+      "object_live:#doomed",
+      "property_cell:#doomed:note",
+      "property_cell:#doomed:__ordered_edge",
+      "verb_bytecode:#doomed:run",
+      "object_tombstone:#doomed",
+      "object_lineage:#child",
+      "object_live:#contained"
+    ]));
+  });
+
   it("contents writes route to the projection applier, never authority (CA4/CO9)", () => {
     const result = applyTranscript(new CellStore("authority"), baseTranscript({
       writes: [{ cell: { kind: "contents", object: "#room" }, value: ["#actor"], op: "add" }]

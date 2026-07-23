@@ -134,6 +134,36 @@ describe("turn recorder", () => {
     ]));
   });
 
+  it("promotes a successful tombstone write to a typed recycle effect", async () => {
+    const world = createWorld();
+    const session = world.auth("guest:turn-recorder-recycle");
+    const actor = session.actor;
+    world.createObject({ id: "recycle_controller", name: "Controller", parent: "$thing", owner: actor });
+    world.createObject({ id: "recycle_target", name: "Target", parent: "$thing", owner: actor });
+    expect(installVerb(
+      world,
+      "recycle_controller",
+      "burn",
+      "verb :burn(obj) rxd { recycle(obj); return 1; }",
+      null
+    ).ok).toBe(true);
+    const recorder = new InMemoryTurnRecorder();
+    world.setTurnRecorder(recorder);
+
+    const result = await world.directCall("recycle-record", actor, "recycle_controller", "burn", ["recycle_target"]);
+
+    expect(result).toMatchObject({ op: "result", result: 1 });
+    const transcript = effectTranscriptFromRecordedTurn(recorder.turns[0]);
+    expect(transcript.recycles).toEqual([{ object: "recycle_target" }]);
+    expect(transcript.projectionWrites).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        table: "tombstones",
+        key: "recycle_target",
+        op: "upsert"
+      })
+    ]));
+  });
+
   it("records sequenced turns at the applied-call boundary", async () => {
     const world = createWorld();
     const session = world.auth("guest:turn-recorder-seq");

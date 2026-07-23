@@ -43,13 +43,15 @@
  *                           observations to fanout-role gateway shards via
  *                           best-effort /net/live calls; no row or seq is
  *                           created.
- *       POST /net/adopt     {from_scope, seq, cells, prior_versions?} →
+ *       POST /net/adopt     {from_scope, seq, cells, removed_cells?,
+ *                            prior_versions?} →
  *                           CA3 rider adoption as an OWNER-SEQUENCED
  *                           commit (CO2.3): per-cell prior-version CAS,
  *                           head advances once per applied batch, and
- *                           the adopted cells fan out to this scope's
- *                           own subscribers; idempotent by (from_scope,
- *                           seq). The catalog owner terminally acknowledges
+ *                           the adopted replacements and removals fan out
+ *                           to this scope's own subscribers; idempotent by
+ *                           (from_scope, seq). The catalog owner terminally
+ *                           acknowledges
  *                           but never installs marked definition riders
  *                           (CO15's authority enforcement).
  *       POST /net/relate    {from_scope, seq, deltas} → CO13 relation
@@ -196,6 +198,12 @@ type PlanScheduledOutboxBody = FanoutBody & { scheduled_turn: ScheduledTurn; cat
  * the fake expose toArray()). */
 function sqlRows<T>(cursor: unknown): T[] {
   return (cursor as { toArray(): T[] }).toArray();
+}
+
+/** `<kind>:<object>[:<name>]` → object. Runtime object ids reserve `:` as
+ * the cell-key delimiter (the same wire invariant gateway-do uses). */
+function objectOfCellKey(key: string): string {
+  return key.split(":")[1] ?? "";
 }
 
 /**
@@ -976,6 +984,7 @@ export class NetScopeDO {
           from_scope: string;
           seq: number;
           cells: Cell[];
+          removed_cells?: string[];
           prior_versions?: Record<string, string>;
           principal?: unknown;
           trace?: unknown;
@@ -1820,7 +1829,10 @@ export class NetScopeDO {
       // in a CA3 commit is a cache of the owner's fact; claiming
       // ownership of it would let this scope validate reads against a
       // stale copy — the ownsSessionCell helper excludes the ledger).
-      owns: (object) => seq.store.has(cellKey("object_lineage", object)) || this.ownsSessionCell(seq, object),
+      owns: (object) =>
+        seq.store.has(cellKey("object_lineage", object)) ||
+        seq.store.has(cellKey("object_tombstone", object)) ||
+        this.ownsSessionCell(seq, object),
       // CO13 relation-owner classification: the gateway's per-submit
       // relate_destinations hints (anchor topology is gateway knowledge —
       // the same rule as rider_destinations); an unhinted owner is local.
@@ -1883,6 +1895,17 @@ export class NetScopeDO {
     const wantAll = keys.length === 1 && keys[0] === "*";
     const cells = new Map<string, Cell>();
     const requested = wantAll ? [...store.keys()] : [...keys];
+    if (!wantAll) {
+      // A keyed repair asks for the lineage page the reader used to know.
+      // After recycle that key is absent by design; returning the terminal
+      // replacement distinguishes deletion from a transient miss.
+      for (const key of keys) {
+        if (!key.startsWith("object_lineage:") || store.has(key)) continue;
+        const object = key.slice("object_lineage:".length);
+        const tombstone = cellKey("object_tombstone", object);
+        if (store.has(tombstone)) requested.push(tombstone);
+      }
+    }
     // Objects mode: fixed-point over each object's PARENT chain (verb
     // pages and property defs up the class chain — inherited dispatch
     // resolves at the receiver without a per-cell miss→pull round each)
@@ -2112,7 +2135,8 @@ export class NetScopeDO {
    * (lineage-closed touched closure + the transcript's observations +
    * the commit's LOCAL relation deltas, so subscriber gateways learn
    * rosters push-fashion — CO13), a /net/adopt row per rider scope
-   * carrying only the cells anchored to it, and a /net/relate row per
+   * carrying only the replacement/removal keys anchored to it, and a
+   * /net/relate row per
    * foreign relation-owner scope carrying its deltas — the gateway's
    * rider_destinations/relate_destinations name those objects/scopes,
    * because anchor topology is gateway knowledge the sequencer never
@@ -2152,12 +2176,14 @@ export class NetScopeDO {
     );
     if (subscribers.length > 0) {
       const cells = this.fanoutCells(seq, reply.touched);
+      const removed = reply.touched.filter((key) => !seq.store.has(key));
       const base: FanoutBody = {
         scope: seq.scope,
         seq: reply.head.seq,
         head_hash: reply.head.hash,
         head_generation: reply.head.generation,
         cells,
+        ...(removed.length > 0 ? { removed_cells: removed } : {}),
         observations,
         // The raw idempotency key is trusted-internal only: receiving
         // gateways need it to identify the submitting session, while peers
@@ -2208,7 +2234,10 @@ export class NetScopeDO {
       const cells = reply.touched
         .map((key) => seq.store.get(key))
         .filter((cell): cell is Cell => cell !== undefined && objects.has(cell.object));
-      if (cells.length === 0) continue;
+      const removed = reply.touched.filter(
+        (key) => !seq.store.has(key) && objects.has(objectOfCellKey(key))
+      );
+      if (cells.length === 0 && removed.length === 0) continue;
       // The rider scope anchors these objects, so it definitionally holds
       // their lineage — declare receiver-known rather than reshipping
       // (serializeTransfer still asserts the closure is complete).
@@ -2225,10 +2254,15 @@ export class NetScopeDO {
         const prior = riderPriors.get(cell.key);
         if (prior !== undefined) priorVersions[cell.key] = prior;
       }
+      for (const key of removed) {
+        const prior = riderPriors.get(key);
+        if (prior !== undefined) priorVersions[key] = prior;
+      }
       const adoptBody: AdoptOutboxBody = {
         scope: seq.scope,
         seq: reply.head.seq,
         cells: transfer.cells,
+        ...(removed.length > 0 ? { removed_cells: removed } : {}),
         // Observations fan out to subscribers; adoption is cell-only.
         observations: [],
         prior_versions: priorVersions,
@@ -2248,6 +2282,10 @@ export class NetScopeDO {
         );
         this.riderCacheMemo?.add(cell.key);
       }
+      for (const key of removed) {
+        this.state.storage.sql.exec("DELETE FROM net_scope_rider_cache WHERE key = ?", key);
+        this.riderCacheMemo?.delete(key);
+      }
     }
   }
 
@@ -2256,8 +2294,10 @@ export class NetScopeDO {
    * in this scope's store rides along; lineage this scope does not hold
    * (foreign-anchored rider objects — the owner's concern, reached via
    * /net/adopt) is declared receiver-known rather than fabricated. A
-   * touched key absent from the store (deleted at this authority) ships
-   * nothing — FanoutBody carries installs only (applyFanout semantics).
+   * touched key absent from the store is carried separately in
+   * FanoutBody.removed_cells by the caller. Keeping installs and removals
+   * distinct lets one ordered body replace a whole live object page with a
+   * lineage-free tombstone.
    */
   private fanoutCells(seq: ScopeSequencer, touched: string[]): Cell[] {
     const cells = new Map<string, Cell>();
@@ -2652,6 +2692,9 @@ export class NetScopeDO {
                 from_scope: adoptBody.scope,
                 seq: adoptBody.seq,
                 cells: adoptBody.cells,
+                ...(adoptBody.removed_cells !== undefined
+                  ? { removed_cells: adoptBody.removed_cells }
+                  : {}),
                 // The pre-commit observations for the owner's CAS (fix 1).
                 ...(adoptBody.prior_versions !== undefined ? { prior_versions: adoptBody.prior_versions } : {}),
                 // AU3.2/AU2/AU1: attribution + citation ride to the owner
@@ -2951,6 +2994,7 @@ export class NetScopeDO {
     from_scope: string;
     seq: number;
     cells: Cell[];
+    removed_cells?: string[];
     prior_versions?: Record<string, string>;
     principal?: unknown;
     trace?: unknown;
@@ -2973,6 +3017,7 @@ export class NetScopeDO {
         from_scope: body.from_scope,
         seq: body.seq,
         cells: body.cells,
+        removed: body.removed_cells,
         priors: body.prior_versions ?? {}
       });
       if (result.status === "rejected") {
@@ -3013,12 +3058,14 @@ export class NetScopeDO {
         if (subscribers.length > 0) {
           // Shared payload: stringify once, splice delivery_seq per
           // subscriber (see withDeliverySeq).
+          const removed = result.applied.filter((key) => !seq.store.has(key));
           const adoptFanBody: FanoutBody = {
             scope: seq.scope,
             seq: result.head.seq,
             head_hash: result.head.hash,
             head_generation: result.head.generation,
             cells: this.fanoutCells(seq, result.applied),
+            ...(removed.length > 0 ? { removed_cells: removed } : {}),
             observations: []
           };
           const adoptFanText = JSON.stringify(adoptFanBody);
@@ -3045,7 +3092,10 @@ export class NetScopeDO {
             carriedCause && typeof carriedCause.scope === "string" && typeof carriedCause.seq === "number"
               ? { scope: carriedCause.scope, seq: carriedCause.seq }
               : { scope: body.from_scope, seq: body.seq },
-          subjects: [...new Set(body.cells.map((cell) => cell.object))].sort(),
+          subjects: [...new Set([
+            ...body.cells.map((cell) => cell.object),
+            ...(body.removed_cells ?? []).map(objectOfCellKey)
+          ])].sort(),
           now: this.host.now()
         });
         if (adoptionRecord !== null) {

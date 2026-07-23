@@ -177,6 +177,7 @@ export function serializedFromCells(
   opts: SerializedFromCellsOptions = {}
 ): SerializedWorld {
   const lineageByObject = new Map<string, LineagePayload>();
+  const tombstones = new Set<string>();
   const liveByObject = new Map<string, { location: string | null }>();
   const propsByObject = new Map<string, Map<string, PropertyCellPayload>>();
   const verbsByObject = new Map<string, VerbDef[]>();
@@ -186,6 +187,9 @@ export function serializedFromCells(
     switch (cell.kind) {
       case "object_lineage":
         lineageByObject.set(cell.object, cell.value as LineagePayload);
+        break;
+      case "object_tombstone":
+        tombstones.add(cell.object);
         break;
       case "object_live":
         liveByObject.set(cell.object, cell.value as { location: string | null });
@@ -213,6 +217,18 @@ export function serializedFromCells(
         // #1) — it never assembles into a planning world.
         throw new Error(`log cells do not bridge to a planning world: ${cell.object}`);
     }
+  }
+
+  const contradictory = [...tombstones].filter((object) =>
+    lineageByObject.has(object) ||
+    liveByObject.has(object) ||
+    propsByObject.has(object) ||
+    verbsByObject.has(object)
+  );
+  if (contradictory.length > 0) {
+    throw netError("E_LINEAGE", "tombstoned objects retain live object cells", {
+      objects: contradictory.sort()
+    });
   }
 
   // CA4 projections, recomputed from the authoritative cells at assembly:
@@ -292,7 +308,7 @@ export function serializedFromCells(
     logs: [],
     snapshots: [],
     parkedTasks: [],
-    tombstones: []
+    tombstones: [...tombstones].sort()
   };
 }
 

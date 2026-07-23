@@ -45,6 +45,16 @@ export type TranscriptMove = {
   writer?: RecordedWriteAuthority;
 };
 
+/** Irreversible object deletion. The host recorder already persists the
+ * matching tombstone projection write; this typed lifecycle effect promotes
+ * that same fact into the canonical transcript vocabulary (coherence CO3)
+ * so Net can re-derive deletion rather than treating tombstones as opaque
+ * host persistence. */
+export type TranscriptRecycle = {
+  object: ObjRef;
+  final_version?: string;
+};
+
 // A first-class session active-scope transition (CA8). Distinct from a physical
 // `TranscriptMove`: it is recorded whenever a session's active scope changes —
 // including a no-op physical enter (actor already in the room) — and it is the
@@ -95,6 +105,7 @@ export type EffectTranscript = {
   writes: TranscriptWrite[];
   creates: TranscriptCreate[];
   moves: TranscriptMove[];
+  recycles?: TranscriptRecycle[];
   // Net session active-scope transition for this turn (coalesced first.from →
   // last.to). Drives presence projections + session-row materialization. CA8.
   sessionScopeTransition?: TranscriptSessionScopeTransition;
@@ -139,6 +150,7 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
   const stateProbes: TranscriptCell[] = [];
   const creates: TranscriptCreate[] = [];
   const moves: TranscriptMove[] = [];
+  const recycles: TranscriptRecycle[] = [];
   let sessionScopeTransition: TranscriptSessionScopeTransition | undefined;
   const projectionWrites: RecordedProjectionWrite[] = [];
   const observations: Observation[] = [];
@@ -224,6 +236,9 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
         break;
       case "projection_write":
         projectionWrites.push(structuredClone(event.write) as RecordedProjectionWrite);
+        if (event.write.table === "tombstones" && event.write.op === "upsert") {
+          recycles.push({ object: event.write.key });
+        }
         break;
       case "observe":
         observations.push(event.observation);
@@ -288,6 +303,7 @@ export function effectTranscriptFromRecordedTurn(turn: RecordedTurn): EffectTran
     writes,
     creates,
     moves,
+    ...(turnFinishedOk && recycles.length > 0 ? { recycles } : {}),
     ...(sessionScopeTransition ? { sessionScopeTransition } : {}),
     ...(turnFinishedOk && projectionWrites.length > 0 ? { projectionWrites } : {}),
     observations,
