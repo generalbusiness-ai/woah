@@ -108,7 +108,13 @@ export function netInstallEpoch(catalogs: readonly string[] = DEFAULT_LOCAL_CATA
  */
 export async function planNetInstall(options: NetInstallOptions = {}): Promise<NetInstallPlan> {
   const catalogs = options.catalogs ?? DEFAULT_LOCAL_CATALOGS;
-  const world = createWorld();
+  // Start from the universal seed only. createWorld() installs the complete
+  // bundled catalog set by default, which would make the explicit `catalogs`
+  // option additive-only: excluded catalogs (and their durable seed objects)
+  // would already be present before installLocalCatalogs saw the requested
+  // composition. The Net install plan is the namespace's genesis image, so
+  // its catalog allow-list must be exact.
+  const world = createWorld({ catalogs: false });
   // Fail-closed catalog health: a fresh install that cannot bring every
   // catalog to a completed schema plan / version migration must ABORT
   // the plan — an inactive namespace is recoverable; a half-migrated
