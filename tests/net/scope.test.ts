@@ -110,7 +110,8 @@ describe("commit acceptance (CO4)", () => {
     // a dedicated operator op, never a seed.
     seq.operatorActivationWrite(null);
     expect(seq.store.get("property_cell:$system:net_active_epoch")?.value).toEqual({ value: null });
-    expect(seq.head()).toEqual(headAfterCommit);
+    expect(seq.head()).toMatchObject({ seq: headAfterCommit.seq, hash: headAfterCommit.hash });
+    expect(seq.head().generation).toBe((headAfterCommit.generation ?? 0) + 1);
   });
 
   it("preserves seeded relations when a legacy same-epoch re-seed omits the relation field", () => {
@@ -170,6 +171,46 @@ describe("commit acceptance (CO4)", () => {
     const replay2 = seq.submit(submit);
     expect(replay2.status === "accepted" && replay2.replayed).toBe(true);
     expect(replay2.head).toEqual(first.head);
+  });
+
+  it("validates pure direct reads without advancing or caching the authority head", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    seq.seed([{ kind: "property_cell", object: "#thing", name: "n", value: { value: "stable" } }]);
+    const cell = seq.store.get("property_cell:#thing:n");
+    const read = transcript({
+      route: "direct",
+      seq: -1,
+      reads: [{
+        cell: { kind: "prop", object: "#thing", name: "n" },
+        version: cell?.version,
+        value: "stable" as never
+      }]
+    });
+    const before = seq.head();
+    const first = seq.submit(submitFor(seq, read, "pure-read"));
+    const second = seq.submit(submitFor(seq, read, "pure-read"));
+
+    expect(first).toMatchObject({ status: "accepted", head: before, touched: [] });
+    expect(second).toMatchObject({ status: "accepted", head: before, touched: [] });
+    expect(first.status === "accepted" && first.replayed).toBeUndefined();
+    expect(second.status === "accepted" && second.replayed).toBeUndefined();
+    expect(seq.head()).toEqual(before);
+  });
+
+  it("refuses complete-head compaction across a head-stable activation generation", () => {
+    const seq = new ScopeSequencer(SCOPE, EPOCH);
+    const compacted = {
+      ...submitFor(seq, transcript({ route: "direct", seq: -1 }), "compacted-before-activation"),
+      owned_reads_compacted: true as const
+    };
+    const before = seq.head();
+    seq.operatorActivationWrite(null);
+    expect(seq.head()).toMatchObject({ seq: before.seq, hash: before.hash });
+    expect(seq.head().generation).toBe((before.generation ?? before.seq) + 1);
+
+    const reply = seq.submit(compacted);
+    expect(reply.status).toBe("rejected");
+    expect(reply.status === "rejected" && reply.reason).toBe("stale_head");
   });
 
   it("rebases independent turns from the same retained head", () => {

@@ -833,13 +833,13 @@ function openNetFeed(bearer: string, adopt: { session: string; actor: string } |
     });
 }
 
-async function netTurn(target: string, verb: string, args: unknown[], onResult?: (result: any) => void, onError?: (error: any) => void) {
+async function netTurn(target: string, verb: string, args: unknown[], onResult?: (result: any) => void, onError?: (error: any) => void, route: "direct" | "sequenced" = "sequenced") {
   if (!netFeed) {
     onError?.(new Error("net feed not connected"));
     return;
   }
   try {
-    const outcome = await netFeed.turn({ target, verb, args });
+    const outcome = await netFeed.turn({ target, verb, args, route });
     if (outcome.status !== "accepted" || outcome.error !== undefined) {
       onError?.(outcome.error ?? outcome.raw);
       return;
@@ -861,8 +861,8 @@ function netPlanAndExecuteCommand(space: string, text: string, onResult?: (resul
       return;
     }
     try {
-      const planned = await netFeed.turn({ target: space, verb: "command_plan", args: [text] });
-      const plan = planned.result as { target?: unknown; verb?: unknown; args?: unknown } | null;
+      const planned = await netFeed.turn({ target: space, verb: "command_plan", args: [text], route: "direct" });
+      const plan = planned.result as { target?: unknown; verb?: unknown; args?: unknown; route?: unknown } | null;
       if (planned.status !== "accepted" || !plan || typeof plan !== "object" || typeof plan.verb !== "string") {
         onError?.(planned.error ?? planned.raw);
         return;
@@ -872,7 +872,8 @@ function netPlanAndExecuteCommand(space: string, text: string, onResult?: (resul
         plan.verb,
         Array.isArray(plan.args) ? plan.args : [],
         onResult,
-        onError
+        onError,
+        plan.route === "sequenced" ? "sequenced" : "direct"
       );
     } catch (err) {
       onError?.(err);
@@ -3030,7 +3031,7 @@ function v2Turn(input: V2TurnInput): string {
   // no frame lifecycle to settle an optimistic entry against.
   if (netMode()) {
     const netId = input.id ?? crypto.randomUUID();
-    void netTurn(input.target || input.scope, input.verb, input.args ?? [], input.onResult, input.onError);
+    void netTurn(input.target || input.scope, input.verb, input.args ?? [], input.onResult, input.onError, input.route);
     return netId;
   }
   const id = input.id ?? crypto.randomUUID();
@@ -3131,7 +3132,7 @@ function callWithError(space: string, target: string, verb: string, args: unknow
       void netTurn(target || space, verb, args, resolve, (error: any) => {
         onError?.(error);
         reject(error);
-      });
+      }, "sequenced");
     });
   }
   const id = crypto.randomUUID();
@@ -3189,7 +3190,7 @@ function ensureSpacePresence(space: string, onReady: () => void, onError?: (erro
 
 function direct(target: string, verb: string, args: unknown[] = [], onResult?: (result: any) => void, onError?: (error: any) => void, options?: ProjectionCallOptions) {
   if (netMode()) {
-    void netTurn(target || activeChatRoom() || "", verb, args, onResult, onError);
+    void netTurn(target || activeChatRoom() || "", verb, args, onResult, onError, "direct");
     return null;
   }
   const persistence = verb === "enter" || verb === "leave" || verb === "out" ? "durable" : "live";

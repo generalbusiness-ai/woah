@@ -71,6 +71,7 @@ Language and runtime foundations: object/verb/value semantics and execution beha
 - [objects.md](spec/semantics/objects.md) — object model, identity, verb dispatch, properties (§4, §5, §9, §10)
 - [sequenced-log.md](spec/semantics/sequenced-log.md) — `$sequenced_log` primitive: atomic seq allocation, durable append-only log (SL1–SL10)
 - [space.md](spec/semantics/space.md) — `$space` (a `$sequenced_log` subclass): call lifecycle, failure rules, snapshots (S1–S10)
+- [acts.md](spec/semantics/acts.md) — typed domain Acts and same-turn projections: payload boundary, fail-closed folds, rebuild, relation checkpoints, watermarks, and conformance (ACT1–ACT9, **implemented kernel**)
 - [identity.md](spec/semantics/identity.md) — actor, session, auth lifecycle (I1–I8)
 - [bootstrap.md](spec/semantics/bootstrap.md) — seed object graph: universal classes plus bundled local-catalog bootstrapping (B1–B9)
 - [introspection.md](spec/semantics/introspection.md) — `:describe()` convention and discovery surface (N1–N6)

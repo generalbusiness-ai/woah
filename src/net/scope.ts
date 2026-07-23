@@ -51,6 +51,9 @@ export type ScopeHead = {
   seq: number;
   /** Rolling digest: hash(prev.hash, seq, transcript.hash). */
   hash: string;
+  /** Monotonic authority generation. Unlike `seq`, this also advances for
+   * head-stable seed and activation writes, closing ABA for complete reads. */
+  generation?: number;
 };
 
 export type OperatorDefinitionRepair = {
@@ -95,6 +98,9 @@ export type CommitSubmit = {
    * the scope re-derives and compares (CO4 step 10). */
   post_state_version: string;
   stamp: EpochStamp;
+  /** Same-scope reads were replaced by the exact complete base generation.
+   * Such a submit may not use retained-head rebasing. */
+  owned_reads_compacted?: true;
   /** CO2.3 rider integrity (rule 1): owner attestations for the
    * transcript's FOREIGN-anchored reads, keyed by owning scope. The
    * gateway fetches these at plan time (`POST /net/attest` — one async
@@ -282,7 +288,7 @@ export class ScopeSequencer {
     this.scope = scope;
     this.catalogEpoch = catalogEpoch;
     this.store = new CellStore("authority");
-    this.headState = { seq: 0, hash: cellVersion(["genesis", scope]) };
+    this.headState = { seq: 0, hash: cellVersion(["genesis", scope]), generation: 0 };
     this.options = { tailLimit: options.tailLimit ?? 256, ...options };
 
     // Hydrate from the durable store (cold start / post-eviction). The
@@ -314,7 +320,7 @@ export class ScopeSequencer {
             runtime_epoch: catalogEpoch
           });
         }
-        this.headState = meta.head;
+        this.headState = { ...meta.head, generation: meta.head.generation ?? meta.head.seq };
         this.attribution = meta.attribution ?? null;
       }
       for (const cell of durable.readCells()) this.store.install(cell);
@@ -404,6 +410,10 @@ export class ScopeSequencer {
       });
     }
     this.nextObjectCounter = null; // re-derive over the seeded store
+    this.headState = {
+      ...this.headState,
+      generation: (this.headState.generation ?? this.headState.seq) + 1
+    };
     // Same-epoch idempotent re-seed may re-stamp (same pipeline, same
     // value); an omitted field on a re-seed preserves the prior stamp
     // (legacy-caller posture, mirroring the relations rule below).
@@ -445,10 +455,14 @@ export class ScopeSequencer {
    * scope has committed turns (deactivation happens post-verification,
    * which is post-mint on the carried actor's cluster... and epoch
    * bumps at the CATALOG scope, whose head never advances by client
-   * turns). Durable like a seed write; the head is untouched (the cell's
-   * own content-address version is what consumers check).
+   * turns). Durable like a seed write; sequenced `(seq, hash)` stays stable
+   * while the mutation-complete authority generation advances.
    */
   operatorActivationWrite(activeEpoch: string | null): void {
+    this.headState = {
+      ...this.headState,
+      generation: (this.headState.generation ?? this.headState.seq) + 1
+    };
     const committed = this.store.commit({
       kind: "property_cell",
       object: "$system",
@@ -493,7 +507,8 @@ export class ScopeSequencer {
     const priorHead = this.headState;
     const nextHead: ScopeHead = {
       seq: priorHead.seq + 1,
-      hash: cellVersion([priorHead.hash, priorHead.seq + 1, marker])
+      hash: cellVersion([priorHead.hash, priorHead.seq + 1, marker]),
+      generation: (priorHead.generation ?? priorHead.seq) + 1
     };
     const nextStamp: EpochStamp = { scope_head: `${nextHead.seq}:${nextHead.hash}`, catalog_epoch: this.catalogEpoch };
     const committed = changed.map((cell) => this.store.commit({
@@ -672,7 +687,10 @@ export class ScopeSequencer {
     // versions and post-state are still validated below, so independent
     // concurrent turns serialize without retries while true conflicts do
     // not. Old tail rows lack hash proofs by design and fail closed.
-    if (!this.baseIsCurrentOrRetained(submit.base)) {
+    if (
+      (submit.owned_reads_compacted === true && !this.baseIsExactCurrent(submit.base)) ||
+      (submit.owned_reads_compacted !== true && !this.baseIsCurrentOrRetained(submit.base))
+    ) {
       return this.reject(submit, "stale_head", { base: submit.base, head: this.headState });
     }
 
@@ -852,7 +870,8 @@ export class ScopeSequencer {
     const priorHead = this.headState;
     const nextHead: ScopeHead = {
       seq: this.headState.seq + 1,
-      hash: cellVersion([this.headState.hash, this.headState.seq + 1, submit.transcript.hash])
+      hash: cellVersion([this.headState.hash, this.headState.seq + 1, submit.transcript.hash]),
+      generation: (this.headState.generation ?? this.headState.seq) + 1
     };
     const nextStamp: EpochStamp = { scope_head: `${nextHead.seq}:${nextHead.hash}`, catalog_epoch: this.catalogEpoch };
 
@@ -863,6 +882,30 @@ export class ScopeSequencer {
         derived: applied.postStateVersion,
         submitted: submit.post_state_version
       });
+    }
+
+    // A complete direct transcript with no durable or projection effects is
+    // an authority-validated read, not a commit. Returning it at the current
+    // head avoids turning V concurrent semantic-view refreshes into V writes
+    // that contend on an otherwise unchanged scope. Do not cache the reply:
+    // a transport retry may safely re-read newer authority, and the gateway
+    // owns the successful result (the scope never receives it on the wire).
+    const pureDirectRead =
+      submit.transcript.route === "direct" &&
+      applied.touched.length === 0 &&
+      applied.projectionWrites.length === 0 &&
+      (submit.transcript.projectionWrites?.length ?? 0) === 0 &&
+      submit.transcript.sessionScopeTransition === undefined &&
+      submit.transcript.untrackedEffects.length === 0;
+    if (pureDirectRead) {
+      return {
+        kind: "woo.net.commit_reply.v1",
+        status: "accepted",
+        scope: this.scope,
+        head: this.headState,
+        touched: [],
+        post_state_version: applied.postStateVersion
+      };
     }
 
     // Accept: adopt the applied clone as authority, advance head, record
@@ -1055,7 +1098,8 @@ export class ScopeSequencer {
     const priorHead = this.headState;
     const nextHead: ScopeHead = {
       seq: this.headState.seq + 1,
-      hash: cellVersion([this.headState.hash, this.headState.seq + 1, marker])
+      hash: cellVersion([this.headState.hash, this.headState.seq + 1, marker]),
+      generation: (this.headState.generation ?? this.headState.seq) + 1
     };
     const nextStamp: EpochStamp = { scope_head: `${nextHead.seq}:${nextHead.hash}`, catalog_epoch: this.catalogEpoch };
     const appliedKeys: string[] = [];
@@ -1301,7 +1345,8 @@ export class ScopeSequencer {
     const priorHead = this.headState;
     const nextHead: ScopeHead = {
       seq: this.headState.seq + 1,
-      hash: cellVersion([this.headState.hash, this.headState.seq + 1, marker])
+      hash: cellVersion([this.headState.hash, this.headState.seq + 1, marker]),
+      generation: (this.headState.generation ?? this.headState.seq) + 1
     };
     for (const key of deletedKeys) this.store.delete(key);
     this.headState = nextHead;
@@ -1410,7 +1455,8 @@ export class ScopeSequencer {
     const priorHead = this.headState;
     const nextHead: ScopeHead = {
       seq: this.headState.seq + 1,
-      hash: cellVersion([this.headState.hash, this.headState.seq + 1, marker])
+      hash: cellVersion([this.headState.hash, this.headState.seq + 1, marker]),
+      generation: (this.headState.generation ?? this.headState.seq) + 1
     };
     this.headState = nextHead;
     const tailEntry: TailEntry = {
@@ -1649,7 +1695,13 @@ export class ScopeSequencer {
    * after rollout. Missing optional fields on aged rows are intentionally
    * not inferred: unverifiable history takes the stale-head repair path. */
   private baseIsCurrentOrRetained(base: ScopeHead): boolean {
-    if (base.seq === this.headState.seq) return base.hash === this.headState.hash;
+    if (base.seq === this.headState.seq) {
+      return base.hash === this.headState.hash && (
+        base.generation === undefined ||
+        this.headState.generation === undefined ||
+        base.generation === this.headState.generation
+      );
+    }
     if (base.seq < 0 || base.seq > this.headState.seq) return false;
     for (let i = this.tail.length - 1; i >= 0; i -= 1) {
       const entry = this.tail[i];
@@ -1658,6 +1710,17 @@ export class ScopeSequencer {
       if (entry.seq < base.seq) break;
     }
     return false;
+  }
+
+  /** Exact generation equality is stronger than ordinary rolling-upgrade
+   * head compatibility: complete-read compaction depends on seed/activation
+   * mutations being visible even while `(seq, hash)` stays unchanged. */
+  private baseIsExactCurrent(base: ScopeHead): boolean {
+    return base.seq === this.headState.seq &&
+      base.hash === this.headState.hash &&
+      base.generation !== undefined &&
+      this.headState.generation !== undefined &&
+      base.generation === this.headState.generation;
   }
 
   private reject(submit: CommitSubmit, reason: RejectReason, detail: Record<string, unknown>, mismatched?: TranscriptCell[]): CommitReply {

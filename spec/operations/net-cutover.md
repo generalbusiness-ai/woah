@@ -53,7 +53,10 @@ FRESH ──seed──▶ INSTALLING(epoch) ──verify──▶ ACTIVE(epoch)
 refuses `E_SEED_COMMITTED` once a scope has committed turns (a
 same-epoch re-seed would silently reset authoritative state under an
 unchanged head), while activation legitimately changes around
-verification traffic.
+verification traffic. Seed and activation leave the sequenced `(seq, hash)`
+stable but each advances the mutation-complete authority `generation`; a
+complete-head cache therefore cannot mistake either operation for unchanged
+authority.
 
 Activation writes are CAS'd (`expected_active_epoch`): a replayed or
 reordered activation within the signature skew window is refused

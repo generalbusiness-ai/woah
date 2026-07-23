@@ -166,7 +166,7 @@ describe("NetFeed turn() over WS", () => {
     const socket = FakeSocket.instances[0];
     socket.open();
 
-    const turn = feed.turn({ target: "#bob", verb: "wave", args: [] });
+    const turn = feed.turn({ target: "#bob", verb: "wave", args: [], route: "direct" });
     await tick();
     // Echo overlay: the submitted INTENT is pending (not predicted cells
     // — the Phase-4 decision).
@@ -176,6 +176,7 @@ describe("NetFeed turn() over WS", () => {
     // idempotency key.
     expect(socket.sent).toHaveLength(1);
     const frame = socket.sent[0];
+    expect(frame.route).toBe("direct");
     expect(frame).toMatchObject({ type: "turn", target: "#bob", verb: "wave", args: [] });
     expect(frame.idempotency_key).toBe(frame.id);
 
@@ -308,7 +309,7 @@ describe("NetFeed turn() REST fallback", () => {
     const outcome = await feed.turn({ target: "#bob", verb: "wave", args: ["hi"] });
     expect(outcome.status).toBe("accepted");
     const turnCall = calls.find((call) => call.path === "/net-api/turn");
-    expect(turnCall?.body).toMatchObject({ target: "#bob", verb: "wave", args: ["hi"], session: "s_1" });
+    expect(turnCall?.body).toMatchObject({ target: "#bob", verb: "wave", args: ["hi"], route: "sequenced", session: "s_1" });
     expect(typeof (turnCall?.body as Record<string, unknown>).idempotency_key).toBe("string");
     expect(events).toHaveLength(1);
     expect(events[0].source).toBe("self");

@@ -87,7 +87,7 @@ import { planTurn, type PlanTurnInput, type PlanTurnResult } from "../../net/pla
 import { replayPageQueryKey, replayPageVersion, validReplayLogPage, validReplayPageQuery, type ReplayPageQuery } from "../../net/replay-pages";
 import type { ScopeClassifier } from "../../net/route";
 import { CATALOG_SCOPE, classifierFromLineage, isEpochImmutableDefinition, type AnchorLineage } from "../../net/topology";
-import { assertEnvelopeCeiling, submitEnvelopeBytes, type CommitReply, type CommitSubmit, type RejectReason, type ScheduledTurn, type ScopeHead } from "../../net/scope";
+import { assertEnvelopeCeiling, submitEnvelopeBytes, WARM_ENVELOPE_BYTE_LIMIT, type CommitReply, type CommitSubmit, type RejectReason, type ScheduledTurn, type ScopeHead } from "../../net/scope";
 import { netCellKeyFor, type EffectTranscript } from "../../net/transcript";
 import type { CellTransfer } from "../../net/cells";
 import { randomHex } from "../../core/source-hash";
@@ -216,31 +216,26 @@ function validReplayConflict(value: unknown): value is ReplayConflict {
  * non-convergence detection. */
 type AuthorityReadReceipt = { scope: string; head: ScopeHead; version: string };
 type AuthorityCellTransfer = CellTransfer & { scope?: unknown; head?: unknown };
-const HEAD_STABLE_ACTIVATION_KEY = cellKey("property_cell", "$system", "net_active_epoch");
-
 function validScopeHead(value: unknown): value is ScopeHead {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const candidate = value as { seq?: unknown; hash?: unknown };
+  const candidate = value as { seq?: unknown; hash?: unknown; generation?: unknown };
   return typeof candidate.seq === "number" && Number.isInteger(candidate.seq) && candidate.seq >= 0
-    && typeof candidate.hash === "string" && candidate.hash.length > 0;
+    && typeof candidate.hash === "string" && candidate.hash.length > 0
+    && typeof candidate.generation === "number" && Number.isInteger(candidate.generation) && candidate.generation >= 0;
 }
 
 function authorityReceiptIdentity(receipt: AuthorityReadReceipt): string {
-  return `${receipt.scope}\0${receipt.head.seq}\0${receipt.head.hash}\0${receipt.version}`;
+  return `${receipt.scope}\0${receipt.head.seq}\0${receipt.head.hash}\0${receipt.head.generation}\0${receipt.version}`;
 }
 
-/** ScopeHead is a sequenced-commit head, not a generation for every write.
- * Same-epoch seed can rewrite arbitrary cells/relations while seq=0, and the
- * dedicated activation operation can rewrite its one cell at any head. Those
- * paths are deliberately ineligible rather than pretending a stable receipt
- * proves stable authority. After seq>0 seed is refused, and every other
- * authoritative cell/ordering mutation advances the head. */
-function authorityCellReceiptEligible(key: string, head: ScopeHead): boolean {
-  return head.seq > 0 && key !== HEAD_STABLE_ACTIVATION_KEY;
+/** Generation is mutation-complete: commits, seed, and activation all advance
+ * it. A receipt with the new shape is therefore eligible even at seq zero. */
+function authorityCellReceiptEligible(_key: string, head: ScopeHead): boolean {
+  return head.generation !== undefined;
 }
 
 function authorityOrderingReceiptEligible(head: ScopeHead): boolean {
-  return head.seq > 0;
+  return head.generation !== undefined;
 }
 
 function validOrderedProjectionKey(value: unknown): value is OrderedProjectionKey {
@@ -695,6 +690,10 @@ export class NetGatewayDO {
   private readonly host: WorkerdHost;
   private view: CellStore | null = null;
   private readonly seen = new Map<string, number>();
+  /** Whole-scope derived copies, exact at one authority head. Ephemeral on
+   * purpose: hibernation merely makes the next large direct read re-pull a
+   * full closure; correctness never depends on retaining this optimization. */
+  private readonly completeHeads = new Map<string, ScopeHead>();
   /** Per-subscriber outbox continuity, distinct from authority `seen`.
    * A scope head may advance without emitting a row for this gateway. */
   private readonly deliverySeen = new Map<string, number>();
@@ -972,6 +971,7 @@ export class NetGatewayDO {
           // Fix 7: the seed IS the state at its head — stale pre-pull
           // fanout rows must no-op instead of regressing the view.
           this.advanceSeen(body.scope, seed.head.seq);
+          if (known.length === 0) this.completeHeads.set(body.scope, seed.head);
           return { ok: true, installed: seed.cells.length, head: seed.head, source: "kv" };
         }
         // Seed lags the live head: named, informational (CO6 E_SEED_LAG),
@@ -1009,8 +1009,9 @@ export class NetGatewayDO {
    * - planning E_MISSING_STATE (CO2.6 materialization miss) → fetch
    *   exactly the missing cell keys from their owning scopes, re-plan;
    * - stale_head → refetch the head; resubmit the SAME transcript only
-   *   when the base was the whole story (head actually moved AND the
-   *   scope reported no read mismatches) — otherwise re-plan;
+   *   when the base was the whole story, all cell proofs were retained,
+   *   and the scope reported no read mismatches. A complete-head-compacted
+   *   plan pulls the new complete generation and re-plans;
    * - read_version_mismatch → refresh exactly `mismatched_reads`
    *   (mapped through netCellKeyFor) and RE-PLAN: a transcript planned
    *   against stale reads is never resubmitted;
@@ -1322,9 +1323,9 @@ export class NetGatewayDO {
     // By-construction non-convergence detector: per turn, the authority
     // RECEIPT we last refreshed each mismatched key to. Eligible receipts
     // include the owner scope and sequenced head as well as content: using
-    // content alone misclassifies A -> B -> A contention. Seed-phase reads,
-    // activation-state reads, and owner-unknown probes produce no receipt
-    // because their apparent head is not a complete authority generation.
+    // content alone misclassifies A -> B -> A contention. The mutation-complete
+    // authority generation makes seed and activation receipts eligible too;
+    // owner-unknown probes still produce no receipt.
     const refreshedTo = new Map<string, string>();
     // Same detector for compact ordering reads. The key is
     // (authority scope, container, parent), because two container roots in one
@@ -1407,7 +1408,12 @@ export class NetGatewayDO {
         try {
           planningHead = await structure.rpc(() => this.scopeHead(this.destinationFor(request, request.planningScope)), { phase: "planning_head" });
           this.assertTurnEpoch(planningHead, request.catalog_epoch, request.planningScope, trace);
-          planned = await this.planOnce(request, view, classifier, planningHead.object_counter, planningRoomRoster, repairedObjects, planningOrderedChildren, planningOrderedNeighbors, planningReplayPages);
+          const complete = this.completeHeads.get(request.planningScope);
+          const compactOwnedReads = complete?.seq === planningHead.head.seq &&
+            complete.hash === planningHead.head.hash &&
+            complete.generation !== undefined &&
+            complete.generation === planningHead.head.generation;
+          planned = await this.planOnce(request, view, classifier, planningHead.object_counter, planningRoomRoster, repairedObjects, planningOrderedChildren, planningOrderedNeighbors, planningReplayPages, compactOwnedReads);
         } catch (err) {
           if (isNetError(err) && err.code === "E_MISSING_STATE") {
             // Ordered-children projection miss: fetch the named parent(s)'
@@ -1508,8 +1514,53 @@ export class NetGatewayDO {
             }
             const missing = Array.isArray(err.detail.missing) ? (err.detail.missing as string[]) : [];
             trace.push({ attempt, code: "E_MISSING_STATE", missing, elapsed_ms: elapsed() });
-            await this.tryRecovery(trace, () => this.refreshCells(request, classifier, view, missing, structure));
+            const receipts = await this.tryRecovery(trace, () => this.refreshCells(request, classifier, view, missing, structure));
             for (const key of missing) repairedObjects.add(objectOfCellKey(key));
+            if (receipts) {
+              const stuck = missing.flatMap((key) => {
+                const receipt = receipts.get(key);
+                if (!receipt) return [];
+                const identity = authorityReceiptIdentity(receipt);
+                if (refreshedTo.get(key) !== identity) {
+                  refreshedTo.set(key, identity);
+                  return [];
+                }
+                const object = objectOfCellKey(key);
+                const verbName = key.startsWith(`verb_bytecode:${object}:`)
+                  ? key.slice(`verb_bytecode:${object}:`.length)
+                  : null;
+                const dispatchChain: Array<{ object: string; parent: string | null; has_page: boolean }> = [];
+                if (verbName !== null) {
+                  let cursor: string | null = object;
+                  const seen = new Set<string>();
+                  while (cursor && !seen.has(cursor)) {
+                    seen.add(cursor);
+                    const lineage = view.get(cellKey("object_lineage", cursor))?.value as { parent?: unknown } | undefined;
+                    const parent = typeof lineage?.parent === "string" ? lineage.parent : null;
+                    dispatchChain.push({
+                      object: cursor,
+                      parent,
+                      has_page: view.has(cellKey("verb_bytecode", cursor, verbName))
+                    });
+                    cursor = parent;
+                  }
+                }
+                return [{
+                  key,
+                  authority_scope: receipt.scope,
+                  authority_head: receipt.head,
+                  authority_version: receipt.version,
+                  dispatch_chain: dispatchChain
+                }];
+              });
+              if (stuck.length > 0) {
+                throw nonconvergentRead(
+                  "a sparse planning miss cannot converge: authority returned the same cell state twice but the planner still requested it",
+                  trace,
+                  { stuck, scope: request.planningScope }
+                );
+              }
+            }
             continue;
           }
           // Terminal NetError codes and plain Errors (misplan bugs,
@@ -1591,7 +1642,38 @@ export class NetGatewayDO {
       // recorded writes, so no read state ships). The ceiling gate lives
       // on the same measurement: a breach is a plain misplan Error.
       const envelopeBytes = submitEnvelopeBytes(submitBody);
-      assertEnvelopeCeiling(envelopeBytes, targetScope === request.planningScope && planned.selection.riders.length === 0);
+      const warm = targetScope === request.planningScope && planned.selection.riders.length === 0;
+      // A large same-owner turn is the one valid reason to materialize a
+      // complete snapshot: on the next plan, the exact base-generation CAS
+      // replaces its thousands of same-scope per-cell reads. This also covers
+      // read verbs transported through a room's sequenced route. Never raise
+      // the CO15 ceiling.
+      if (
+        envelopeBytes > WARM_ENVELOPE_BYTE_LIMIT &&
+        warm &&
+        !planned.ownedReadsCompacted
+      ) {
+        await this.reseedFromScope(view, destination, [], structure);
+        continue;
+      }
+      if (envelopeBytes > WARM_ENVELOPE_BYTE_LIMIT && warm && planned.ownedReadsCompacted) {
+        const attestationCells = Object.values(submit.attestations ?? {})
+          .reduce((count, attestation) => count + attestation.cells.length, 0);
+        const readBuckets = new Map<string, number>();
+        for (const read of submit.transcript.reads) {
+          let owner = "unresolved";
+          try { owner = classifier.scopeOf(read.cell.object); } catch { /* diagnostic only */ }
+          const key = `${read.cell.kind}@${owner}`;
+          readBuckets.set(key, (readBuckets.get(key) ?? 0) + 1);
+        }
+        throw new Error(
+          `oversized compacted warm envelope: ${envelopeBytes} bytes; ` +
+          `wire_reads=${submit.transcript.reads.length} attestation_cells=${attestationCells} ` +
+          `transcript_bytes=${new TextEncoder().encode(JSON.stringify(submit.transcript)).byteLength} ` +
+          `read_buckets=${JSON.stringify(Object.fromEntries(readBuckets))}`
+        );
+      }
+      assertEnvelopeCeiling(envelopeBytes, warm);
       let reply: CommitReply;
       try {
         reply = (await structure.rpc(() => this.host.rpc(destination, "/submit", submitBody), { phase: "submit" })) as CommitReply;
@@ -1700,8 +1782,18 @@ export class NetGatewayDO {
           // path (recovery_error names it; a later round may converge).
           if (live !== undefined) this.assertTurnEpoch(live, request.catalog_epoch, targetScope, trace);
           const fresh = live?.head;
-          const headMoved = fresh !== undefined && (fresh.seq !== submit.base.seq || fresh.hash !== submit.base.hash);
-          if (fresh !== undefined && headMoved && !reply.mismatched_reads) {
+          const headMoved = fresh !== undefined && (
+            fresh.seq !== submit.base.seq ||
+            fresh.hash !== submit.base.hash ||
+            fresh.generation !== submit.base.generation
+          );
+          if (fresh !== undefined && headMoved && planned.ownedReadsCompacted) {
+            // The omitted owner reads were proven only by submit.base's exact
+            // generation. Replacing that base while retaining the computed
+            // writes would bless stale values (lost-update under contention).
+            // Pull the new complete authority generation, then re-execute.
+            await this.tryRecovery(trace, () => this.reseedFromScope(view, destination, [], structure));
+          } else if (fresh !== undefined && headMoved && !reply.mismatched_reads) {
             // The head moved and no reads were reported stale: the
             // transcript is still honest, resubmit it on the new base.
             resubmit = { planned, base: fresh };
@@ -2132,12 +2224,13 @@ export class NetGatewayDO {
   //     → authenticate, derive the actor's cluster scope (CO15 topology),
   //       session-open through the existing mint machinery, reply
   //       {session, actor, expires_at, scope}.
-  //   POST /net-api/turn {target, verb, args?, session, idempotency_key?}
+  //   POST /net-api/turn {target, verb, args?, route?, session, idempotency_key?}
   //     → REQUIRES a valid session (the CO14 Phase-4 rule: client-
   //       originated turns need sessions), validated from the session
-  //       cell in the gateway view; builds a route:"sequenced"
-  //       TurnRequest (the committing scope's authorize revalidates the
-  //       session — the gateway authenticates, scopes authorize) and runs
+  //       cell in the gateway view; defaults to sequenced, while an explicit
+  //       direct route requires direct_callable metadata. The committing
+  //       scope revalidates the session on either route (the gateway
+  //       authenticates, scopes authorize), then runs
   //       the normal /net/turn machinery; the reply is the TurnResult
   //       including item-1 result/observations.
   //   GET /net-api/relation?relation=&owner=   authenticated roster read
@@ -3407,9 +3500,9 @@ export class NetGatewayDO {
     audit?: { credential?: string; trace?: TraceContext }
   ): Promise<Response> {
     // CO14 Phase-4 rule: client-originated turns REQUIRE a session. The
-    // gateway refuses session-less turns up front (named), and the turn
-    // still runs route:"sequenced" so the committing scope's authorize
-    // revalidates the session end-to-end.
+    // gateway refuses session-less turns up front (named). Both direct and
+    // sequenced calls carry the session read, so the committing scope still
+    // revalidates it end-to-end.
     const session = typeof body.session === "string" && body.session.length > 0 ? body.session : null;
     if (!session) {
       return json(
@@ -3441,6 +3534,10 @@ export class NetGatewayDO {
     const verb = typeof body.verb === "string" ? body.verb : "";
     if (!target || !verb) {
       return json({ error: { code: "E_INVARG", message: "turn body requires target and verb" } }, 400);
+    }
+    const route = body.route === undefined ? "sequenced" : body.route;
+    if (route !== "direct" && route !== "sequenced") {
+      return json({ error: { code: "E_INVARG", message: "turn route must be direct or sequenced" } }, 400);
     }
     // Catalog-qualified names are manifest syntax, resolved by the catalog
     // installer before objects reach the runtime. Rejecting one here is also
@@ -3501,7 +3598,7 @@ export class NetGatewayDO {
     const validationCall = {
       kind: "woo.turn_call.shadow.v1",
       id: "validate",
-      route: "sequenced",
+      route,
       scope: anchorObject,
       session,
       actor,
@@ -3523,6 +3620,21 @@ export class NetGatewayDO {
       } catch (err) {
         this.metric({ kind: "net_client_arg_validation_pull_failed", scope: planningScope, status: "error", error: String(err) });
       }
+    }
+    // External direct dispatch is metadata-gated at the ingress boundary
+    // (core.md C12.2). Missing metadata fails closed: a sparse gateway must
+    // never turn an unresolved verb into permission to bypass sequencing.
+    if (route === "direct" && page?.direct_callable !== true) {
+      return json(
+        {
+          error: {
+            code: "E_DIRECT_DENIED",
+            message: `verb ${verb} is not externally direct-callable`,
+            detail: { target, verb }
+          }
+        },
+        403
+      );
     }
     const declaredArgs = page?.arg_spec && typeof page.arg_spec === "object" && !Array.isArray(page.arg_spec)
       ? (page.arg_spec as { params?: unknown }).params
@@ -3554,7 +3666,7 @@ export class NetGatewayDO {
     await this.warmDeclaredAuthorityPrefetch({
       kind: "woo.turn_call.shadow.v1",
       id: "prefetch",
-      route: "sequenced",
+      route,
       scope: anchorObject,
       session,
       actor,
@@ -3612,7 +3724,7 @@ export class NetGatewayDO {
       call: {
         kind: "woo.turn_call.shadow.v1",
         id: key,
-        route: "sequenced",
+        route,
         scope: anchorObject,
         session,
         actor,
@@ -6302,7 +6414,8 @@ export class NetGatewayDO {
     seedObjects?: ReadonlySet<string>,
     planningOrderedChildren?: readonly PlanningOrderedChildrenProjection[],
     planningOrderedNeighbors?: readonly PlanningOrderedNeighborsProjection[],
-    planningReplayPages?: readonly PlanningReplayPageProjection[]
+    planningReplayPages?: readonly PlanningReplayPageProjection[],
+    compactOwnedReads = false
   ): Promise<PlanTurnResult> {
     return planTurn({
       call: request.call,
@@ -6327,6 +6440,7 @@ export class NetGatewayDO {
       ...(planningOrderedChildren && planningOrderedChildren.length > 0 ? { planningOrderedChildren } : {}),
       ...(planningOrderedNeighbors && planningOrderedNeighbors.length > 0 ? { planningOrderedNeighbors } : {}),
       ...(planningReplayPages && planningReplayPages.length > 0 ? { planningReplayPages } : {}),
+      ...(compactOwnedReads ? { compactOwnedReads: { scope: request.planningScope } } : {}),
       // Creates over net (client-shell phase i): the planning-scope
       // authority's allocation floor, prefetched with its head, so a
       // planned create's id is fresh at the authority. A lane fixture's
@@ -6396,7 +6510,7 @@ export class NetGatewayDO {
       structure,
       () => this.host.rpc(destination, "/closure", { keys: touched, known: [] }),
       { mandatory: true, phase: "install_touched" }
-    )) as CellTransfer;
+    )) as CellTransfer & { scope?: string };
     const wanted = new Set(touched);
     this.discardViewOnThrow(() =>
       this.state.storage.transactionSync(() => {
@@ -6411,6 +6525,7 @@ export class NetGatewayDO {
         }
       })
     );
+    if (typeof transfer.scope === "string") this.completeHeads.delete(transfer.scope);
   }
 
   /** A session bearer is unusable unless its minting gateway can authenticate
@@ -6667,6 +6782,7 @@ export class NetGatewayDO {
         if (advanceSeen) this.advanceSeen(transfer.scope, transfer.head.seq);
       })
     );
+    if (advanceSeen) this.completeHeads.delete(transfer.scope);
   }
 
   private async reseedFromScope(
@@ -6714,6 +6830,7 @@ export class NetGatewayDO {
         this.advanceSeen(transfer.scope, transfer.head.seq);
       })
     );
+    if (known.length === 0) this.completeHeads.set(transfer.scope, transfer.head);
     return transfer;
   }
 
@@ -6761,6 +6878,7 @@ export class NetGatewayDO {
   /** CO2.5 receiver idempotency + copy-#2 persistence, one transaction. */
   private receiveFanout(body: FanoutBody): boolean {
     const view = this.ensureView();
+    const completeBefore = this.completeHeads.get(body.scope);
     // Delivery continuity is per subscriber lane, not per authority head:
     // an authority event can validly produce no row for this destination.
     // Unstamped bodies are accepted for rolling-upgrade compatibility.
@@ -6816,6 +6934,21 @@ export class NetGatewayDO {
     // excludes the leaver). The seq gate above makes the push
     // at-most-once per socket per turn: redeliveries never reach here.
     if (applied) {
+      if (
+        completeBefore &&
+        body.seq === completeBefore.seq + 1 &&
+        typeof body.head_hash === "string" &&
+        body.head_hash.length > 0 &&
+        typeof body.head_generation === "number"
+      ) {
+        this.completeHeads.set(body.scope, {
+          seq: body.seq,
+          hash: body.head_hash,
+          generation: body.head_generation
+        });
+      } else {
+        this.completeHeads.delete(body.scope);
+      }
       // Descriptor freshness follows the same committed/fanout-coherent view
       // as invocation. Run before observation delivery so a movement's new
       // presence row can notify its own session even when echo dedupe suppresses

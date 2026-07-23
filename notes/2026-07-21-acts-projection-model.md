@@ -1,7 +1,10 @@
 # Acts kernel: one record, many work surfaces
 
 *Origin: 2026-07-21; compacted after two review rounds the same day.
-Draft design note, not a spec. Defines the content model for "the work"
+Historical design note. The accepted contract is now normative in
+[`spec/semantics/acts.md`](../spec/semantics/acts.md). This note records the
+prototype reasoning and evidence; where wording differs, the spec governs.
+Defines the content model for "the work"
 in a room — schema-validated acts on the sequenced log, work surfaces
 derived as projections — as four contracts plus one thin vertical
 slice (Tasks on `$case`). Rationale, composition model, meta-process,
@@ -9,8 +12,7 @@ and deferred extensions live in the companion note
 [`2026-07-21-acts-composition-vision.md`](2026-07-21-acts-composition-vision.md).*
 
 *Builds on `2026-07-12-case-gravity-unified-model.md` (case = room) and
-`2026-07-12-security-caserooms-design-approach.md`. On acceptance the
-contracts promote into spec (likely `spec/coordination/acts.md`).*
+`2026-07-12-security-caserooms-design-approach.md`.*
 
 *Prototype status (2026-07-21, worktree branch `worktree-acts-kernel`):
 the kernel proof is BUILT and green on the in-memory lane — both core
@@ -58,8 +60,15 @@ Net planner, while real workerd proves the same durable page repair over
 SQLite/RPC (26/26). RESOLVED (2026-07-22): Outliner client adoption uses the
 generic semantic-view facade over `tree_view`; full structural parity, legacy
 genesis, stale-read rejection, and deletion accounting are pinned. Outstanding:
-the Dispenser and Tasks migrations, E4/E5 gate, and cold-case cost. The ordered
-queue is §7.1.*
+the Dispenser and Tasks migrations and E4/E5 gate. Tier C's Outliner read/fanout
+lane is now concrete: real workerd/Net, 1,000 rows, eight principals, three Act
+invalidation waves; warm p50/p95 92/101 ms, 145,485–145,491-byte responses,
+32–36 ms mutation-to-all-seven-peer-push (276–278-byte Act frames), and
+904–928 ms invalidation-to-current wall time (p95 928 ms), inside the declared
+1.5 s / 512 KiB / 5 s pilot budgets. Two generic Net corrections were required
+to make that claim honest: direct semantic reads validate without committing a
+new scope head, and byte-identical repeated cell reads collapse to one wire
+proof. The ordered queue is §7.1.*
 
 ---
 

@@ -224,7 +224,7 @@
               "limit"
             ]
           },
-          "source": "verb :journal(from_seq, limit) rxd {\n  /* Paged log read (S3): the log IS the journal \u2014 no materialized copy.\n     Returns act-typed observations with their envelope seq and ts. */\n  let entries = this:replay(from_seq, limit);\n  let out = [];\n  for e in entries {\n    for o in e[\"observations\"] {\n      if (typeof(o) == \"map\" && (\"type\" in o) && (\"payload\" in o) && (\"version\" in o)) {\n        out = out + [{ \"seq\": e[\"seq\"], \"ts\": e[\"ts\"], \"type\": o[\"type\"], \"payload\": o[\"payload\"] }];\n      }\n    }\n  }\n  return out;\n}",
+          "source": "verb :journal(from_seq, limit) rxd {\n  /* Paged log read (S3): the log IS the journal \u2014 no materialized copy.\n     Keep authority identity in the envelope; Act payloads stay concise. */\n  let entries = this:replay(from_seq, limit);\n  let out = [];\n  for e in entries {\n    for o in e[\"observations\"] {\n      if (typeof(o) == \"map\" && (\"type\" in o) && (\"payload\" in o) && (\"version\" in o)) {\n        out = out + [{ \"space\": this, \"seq\": e[\"seq\"], \"ts\": e[\"ts\"], \"actor\": e[\"message\"][\"actor\"], \"verb\": e[\"message\"][\"verb\"], \"type\": o[\"type\"], \"payload\": o[\"payload\"] }];\n      }\n    }\n  }\n  return out;\n}",
           "direct_callable": true,
           "skip_presence_check": true,
           "tool_exposed": true

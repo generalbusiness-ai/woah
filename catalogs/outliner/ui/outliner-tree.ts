@@ -330,7 +330,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
     writeOutlinerTextCache(this.woo?.actor, this.subject, map);
   }
 
-  applyObservation(observation: Record<string, unknown>): void {
+  applyObservation(observation: Record<string, unknown>, envelopeSpace = ""): void {
     // Keep this DOM-local reducer aligned with the projection reducer in
     // registerWooObservationHandlers; accepted frames use both paths.
     const type = String(observation.type ?? "");
@@ -350,7 +350,10 @@ export class WooOutlinerTreeElement extends HTMLElement {
       }
       return;
     }
-    const outlinerId = String(actField(observation, "outliner") ?? observation.source ?? "");
+    // Concise v3 Acts take their outliner from the committed carrier. The
+    // optional fallback keeps this DOM-local reducer usable for both framework
+    // delivery and legacy flat observations.
+    const outlinerId = String(actField(observation, "outliner") ?? observation.source ?? envelopeSpace);
     if (!this.subject || outlinerId !== this.subject) return;
     if (type === "outliner_entered" || type === "outliner_left") {
       this.applyPresenceObservation(type, observation);
@@ -360,7 +363,13 @@ export class WooOutlinerTreeElement extends HTMLElement {
     if (type === "outline_item_added") {
       const id = String(actField(observation, "item") ?? "");
       if (!id) return;
-      const text = actField(observation, "text");
+      // Structural Acts do not duplicate note prose or envelope identity.
+      // note_edited was reduced earlier in the same frame, so use projection
+      // state when the legacy flat event did not carry these fields.
+      const projected = this.woo?.observe(id);
+      const projectedText = projected?.props?.text;
+      const text = actField(observation, "text") ?? projectedText;
+      const owner = actField(observation, "actor") ?? projected?.owner;
       this.upsertItem({
         id,
         name: id,
@@ -368,7 +377,7 @@ export class WooOutlinerTreeElement extends HTMLElement {
         parent_id: outlinerParent(actField(observation, "parent_id")),
         index: outlinerIndex(actField(observation, "index"), this.model.items.length),
         hidden: false,
-        owner: String(actField(observation, "actor") ?? ""),
+        owner: typeof owner === "string" ? owner : "",
         writers: [],
         has_children: false
       });
@@ -1101,7 +1110,7 @@ export function registerWooViews(registry: WooViewRegistry): void {
     parse: normalizeOutlinerTreeView,
     invalidateOn: OUTLINER_TREE_INVALIDATIONS,
     affects: ({ observation, delivered, projection, subject }) => {
-      const outliner = String(actField(observation, "outliner") ?? observation.source ?? "");
+      const outliner = String(actField(observation, "outliner") ?? observation.source ?? delivered.space ?? "");
       if (outliner === subject) return true;
       const note = String(observation.note ?? "");
       return note !== "" && (delivered.space === subject || projection.observe(note)?.location === subject);
@@ -1138,22 +1147,22 @@ export function registerWooObservationHandlers(registry: ObservationRegistry): v
       // Keep these projection patches aligned with applyObservation above;
       // optimistic frames use only this path and accepted frames use both.
       const type = String(envelope.observation.type ?? "");
-      const outlinerId = String(actField(envelope.observation, "outliner") ?? envelope.observation.source ?? "");
+      const outlinerId = String(actField(envelope.observation, "outliner") ?? envelope.observation.source ?? envelope.delivered.space ?? "");
       if (type === "outline_item_added") {
         const id = String(actField(envelope.observation, "item") ?? "");
         if (id && outlinerId) {
           const actor = actField(envelope.observation, "actor");
           const text = actField(envelope.observation, "text");
-          draft.patchObject(id, {
+          const objectFields: Record<string, unknown> = {
             name: id,
-            owner: typeof actor === "string" ? actor : undefined,
             parent: "$outline_item",
             location: outlinerId
-          });
-          draft.patchObjectProps(id, {
-            text: typeof text === "string" ? text : "",
-            hidden: false
-          });
+          };
+          if (typeof actor === "string") objectFields.owner = actor;
+          draft.patchObject(id, objectFields);
+          const props: Record<string, unknown> = { hidden: false };
+          if (typeof text === "string") props.text = text;
+          draft.patchObjectProps(id, props);
           draft.patchCatalogState(id, "outliner_tree", {
             parent_id: outlinerParent(actField(envelope.observation, "parent_id")),
             index: outlinerIndex(actField(envelope.observation, "index"), 0)
@@ -1183,18 +1192,16 @@ export function registerWooObservationHandlers(registry: ObservationRegistry): v
       if (envelope.delivered.optimistic === true) return;
       if (!outlinerId) return;
       for (const el of document.querySelectorAll<WooOutlinerTreeElement>(`woo-outliner-tree`)) {
-        if (el.subject === outlinerId) el.applyObservation(envelope.observation);
+        if (el.subject === outlinerId) el.applyObservation(envelope.observation, outlinerId);
       }
     }
   });
 }
 
-// Dual-shape field read for the five structural events. v3 emits them as acts
-// ({type, version, payload: {...domain fields...}}) while pre-v3 deployed
-// definitions and the movement-hook echo paths (enterfunc capture; exitfunc
-// detach under a foreign authority) still emit flat fields on the observation
-// itself — both shapes stay live indefinitely, so every reducer read goes
-// through this helper. Contract: catalogs/outliner/migration-v2-to-v3.json.
+// Dual-shape field read for the five structural events. v3 emits concise Acts
+// ({type, version, payload: {...structural fields...}}); pre-v3 definitions emit
+// flat observations that also carry actor/outliner/text. Both remain readable
+// during rolling upgrades. Contract: catalogs/outliner/migration-v2-to-v3.json.
 function actField(observation: Record<string, unknown>, key: string): unknown {
   const payload = observation.payload;
   return payload !== null && typeof payload === "object" && key in payload
@@ -1326,17 +1333,22 @@ function orderedOutlinerItems(items: OutlinerItem[]): OutlinerItem[] {
   }
   for (const list of byParent.values()) list.sort((left, right) => left.index - right.index || left.id.localeCompare(right.id));
   const ordered: OutlinerItem[] = [];
+  const orderedIds = new Set<string>();
   const visit = (parent: string | null) => {
     const siblings = byParent.get(parent) ?? [];
     siblings.forEach((item, index) => {
       const children = byParent.get(item.id) ?? [];
       ordered.push({ ...item, index, has_children: children.length > 0 });
+      orderedIds.add(item.id);
       visit(item.id);
     });
   };
   visit(null);
   for (const item of items) {
-    if (!ordered.some((candidate) => candidate.id === item.id)) ordered.push({ ...item, has_children: false });
+    if (!orderedIds.has(item.id)) {
+      ordered.push({ ...item, has_children: false });
+      orderedIds.add(item.id);
+    }
   }
   return ordered;
 }

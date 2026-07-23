@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 import { installVerb } from "../../src/core/authoring";
 import { createWorld } from "../../src/core/bootstrap";
 import { cellsFromSerialized, storeCells } from "../../src/net/bridge";
-import { CellStore } from "../../src/net/cells";
+import { CellStore, cellVersion } from "../../src/net/cells";
 import { planTurn, type PlanTurnResult } from "../../src/net/plan";
 import type { ScopeClassifier } from "../../src/net/route";
 import { assertEnvelopeCeiling, ScopeSequencer, submitEnvelopeBytes, WARM_ENVELOPE_BYTE_LIMIT } from "../../src/net/scope";
@@ -54,11 +54,22 @@ function harness(tag: string) {
     null
   );
   expect(installed.ok).toBe(true);
+  expect(installVerb(
+    world,
+    "plan_box",
+    "read_twice",
+    `verb :read_twice() rxd {
+      let first = this.counter;
+      let second = this.counter;
+      return first + second;
+    }`,
+    null
+  ).ok).toBe(true);
 
   const seq = new ScopeSequencer(SCOPE, EPOCH);
   seq.seed(cellsFromSerialized(world.exportWorld()));
 
-  const call = (id: string): ShadowTurnCall => ({
+  const call = (id: string, verb = "bump"): ShadowTurnCall => ({
     kind: "woo.turn_call.shadow.v1",
     id,
     route: "direct",
@@ -66,7 +77,7 @@ function harness(tag: string) {
     session: session.id,
     actor,
     target: "plan_box",
-    verb: "bump",
+    verb,
     args: []
   });
   return { seq, call, actor, session };
@@ -114,6 +125,26 @@ describe("planTurn → submit → accept (CO4 happy path)", () => {
     expect(reply.post_state_version).toBe(plan.submit.post_state_version);
     // Authority holds the {value, def} payload the planner predicted.
     expect(seq.store.get("property_cell:plan_box:counter")?.value).toMatchObject({ value: 1 });
+  });
+
+  it("keeps successful results gateway-local and deduplicates exact wire-read proofs", async () => {
+    const { seq, call } = harness("wire-proof");
+    const plan = await planTurn({
+      call: call("wire-proof-1", "read_twice"),
+      view: derivedViewOf(seq.store),
+      planningScope: SCOPE,
+      classifier,
+      base: seq.head(),
+      idempotencyKey: "wire-proof-1",
+      stamp: seq.stamp()
+    });
+
+    expect(plan.transcript.result).toBe(0);
+    expect(plan.submit.transcript.result).toBeUndefined();
+    const fullIdentities = plan.transcript.reads.map((read) => cellVersion(read));
+    const wireIdentities = plan.submit.transcript.reads.map((read) => cellVersion(read));
+    expect(new Set(fullIdentities).size).toBeLessThan(fullIdentities.length);
+    expect(wireIdentities).toEqual([...new Set(fullIdentities)]);
   });
 });
 

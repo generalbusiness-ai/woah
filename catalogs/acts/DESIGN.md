@@ -1,8 +1,10 @@
 # acts — design
 
+Normative contract: [`spec/semantics/acts.md`](../../spec/semantics/acts.md).
+
 The acts-kernel proof: one authoritative record of coordination state per
 room (its sequenced log of schema-validated acts), with every work surface
-derived as a projection fold. Design note:
+derived as a projection fold. Historical design note:
 [notes/2026-07-21-acts-projection-model.md](../../notes/2026-07-21-acts-projection-model.md)
 (contracts §2, Tasks proof §5, gates §6); rationale and deferred extensions in
 [notes/2026-07-21-acts-composition-vision.md](../../notes/2026-07-21-acts-composition-vision.md).
@@ -64,11 +66,13 @@ v0.1.0 proved the kernel in memory; Outliner then proved a real
 relation-checkpoint consumer. Net replay is also closed: a fresh Outliner
 projection rebuilds from the room authority's durable log through a sparse
 planner, with page attestation and real-workerd SQLite/RPC repair covered.
-Next is the Outliner parity/deletion close, followed by Dispenser, the first
-plug-backed migration: its typed Net verbs emit acts internally and
+Outliner parity/deletion and the production-shaped scale gate are closed: at
+1,000 rows and eight independent viewers, workerd measured 101 ms warm-read
+p95, ~145.5 KiB responses, 36 ms mutation-to-seven-peer-push p95, and 928 ms
+invalidation-to-current p95. Direct semantic reads validate without advancing
+authority, and exact repeated read proofs are deduplicated on the submit wire.
+Next is Dispenser, the first plug-backed migration: its typed Net verbs emit acts internally and
 `$dispenser_queue` replaces the directly-written queue. Tasks follows with the
 full field migration and parity golden (kernel note §5.3).
-Still open: client kanban adoption, further Tier C measurement (first
-in-memory relative indicators exist — `scripts/bench-acts-kernel.ts`;
-workerd produces the budgets), and the vision note's deferred actor emission,
+Still open: client kanban adoption and the vision note's deferred actor emission,
 dynamic attach/genesis, routing, and practices.

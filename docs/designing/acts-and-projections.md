@@ -16,6 +16,8 @@ reads. You should already know how to write verbs
 ([programming-verbs.md](programming-verbs.md)) and package a catalog
 ([catalogs.md](catalogs.md)).
 
+The normative rules are [Acts and projections](../../spec/semantics/acts.md).
+
 ## Choosing a pattern
 
 | You want | Pattern | Shipped example |
@@ -84,15 +86,21 @@ verb :claim(task) rxd {
   refuses direct calls and `caller != this`).
 - Never emit from `enterfunc`/`exitfunc` or any movement/lifecycle hook
   (hook errors are swallowed, so a refused act is silently lost); a
-  hook that needs a trace uses plain `observe(...)`.
+  hook that needs a trace uses plain `observe(...)` and MUST NOT mutate a
+  relation adopted by the Act model. Route the transition through a normal
+  room domain verb or refuse it.
 - Let contained objects delegate to a room verb; never hand an object a
   general emission capability.
 - Carry only the domain fact in the payload — the log envelope already
-  has seq, actor, timestamp, and verb (no `"when"`, no duplicate `"who"`).
+  has space, seq, actor, timestamp, and verb (no duplicate outliner/room,
+  `"when"`, or `"who"`). Artifact name/text/description stay on the artifact.
 - Validate lifecycle transitions against fold state (`_board_row`),
   never against contents scans or location alone.
 - Write no recovery code — if `:act` or any fold raises, the whole turn
   rolls back, physical effects included (fail-closed).
+- If an operation destroys an object, emit and fold before calling a
+  non-vetoable lifecycle primitive such as `recycle()`. Never catch an inverse
+  operation that can reach `:act`.
 
 ## Pattern: tracked collection
 
@@ -330,8 +338,8 @@ verb :tree_view() rxd {
   replayable), guarded exactly like any other emission.
 - Return the watermark under a domain name (`structure_at_seq`); it
   advances only when a consumed structural act folds on this room's log.
-- Track non-acted changes (item text, writer grants, movement-hook
-  echoes) with a separate read-generation — the structural watermark
+- Track non-acted changes (item text and writer grants) with a separate
+  read-generation — the structural watermark
   does not cover them.
 - In browser UI, put that read-generation in the generic semantic-view facade,
   not in a component-owned hydrator. Outliner registers `outliner.tree`, reads

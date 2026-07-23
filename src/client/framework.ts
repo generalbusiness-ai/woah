@@ -984,7 +984,10 @@ export class WooViewStore {
       // Contexts are cheap and may be recreated by the shell. The cache identity
       // is principal/view/subject/args; use the latest transport capabilities.
       existing.woo = woo;
-      existing.inactiveAt = null;
+      // Merely looking up a facade does not make it active. Refresh the
+      // collection deadline for an unsubscribed entry; only subscribe() may
+      // clear it. Otherwise a view created but never mounted lives forever.
+      existing.inactiveAt = existing.listeners.size === 0 ? this.now() : null;
       return existing.facade;
     }
 
@@ -1004,7 +1007,10 @@ export class WooViewStore {
     entry.requestedRevision = 0;
     entry.generation = 0;
     entry.inFlight = null;
-    entry.inactiveAt = null;
+    // A newly-created facade may never be subscribed (conditional render,
+    // abandoned navigation). Start its inactivity clock immediately so the
+    // cache's eventual-collection guarantee covers that path too.
+    entry.inactiveAt = this.now();
     entry.facade = {
       getSnapshot: () => entry.snapshot,
       subscribe: (listener) => {

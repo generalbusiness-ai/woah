@@ -173,20 +173,20 @@ and a body that describes the motivation and any key implementaion details.
 
 **Smoke-test discipline**
 
-Cloudflare full smoke-test is *the most expensive* validation step. One
-cross-actor scenario (`scripts/smoke/scenario.ts`) runs on three lanes of
-increasing fidelity, all before a paid deploy:
+The deployed Cloudflare smoke is *the most expensive* validation step. The Net
+path uses these lanes in increasing fidelity:
 
-1. `npm run smoke:cf-local` — the in-process fake DO (`tests/worker/fake-do.ts`).
-   Fast, but collapses every Durable Object into one synchronous in-process
-   object sharing one world image: no cold start, RPC timeout, per-DO storage
-   isolation, or serialization boundary. Run by `npm test`.
-2. `npm run smoke:cf-dev` — **real workerd** via `wrangler dev`
+1. `npm test` / `npm run test:worker` — in-process fake DOs
+   (`tests/worker/fake-do.ts`). Fast, but they lack cold starts, real RPC
+   isolation, and serialization boundaries.
+2. `npm run smoke:net-dev` — **real workerd** via `wrangler dev`
    (`wrangler.smoke.toml`): real per-DO storage, cross-DO RPC, and host-seed
-   merge. Far higher fidelity; catches storage/RPC/merge regressions the fake
-   cannot. Run it before CF.
-3. `scripts/smoke-walkthrough.ts` — the deployed worker over MCP HTTP. The most
-   expensive lane.
+   merge. Run it before Cloudflare.
+3. `npm run smoke:net-mcp` (the deployed walkthrough) — MCP HTTP against the
+   deployed worker. This is the most expensive lane.
+
+The classic `smoke:cf-local` / `smoke:cf-dev` commands were retired with the
+classic stack; do not resurrect them.
 
 Fidelity is a ladder, not a guarantee: workerd-local still runs every DO in one
 process with fast reliable RPC, so cross-colo-latency / cold-owner-timeout

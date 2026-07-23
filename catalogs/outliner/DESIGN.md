@@ -8,14 +8,12 @@ schema-validated acts whose domain fields are enveloped under `payload`
 reducers migrate with dual-shape tolerance. This includes undo:
 `_restore_item` re-emits `outline_item_added` for the re-created row
 (at its ACTUAL clamped slot), so a restore advances the watermark like
-any other structural change. Two movement-hook paths
-stay explicitly OUTSIDE the act model until cross-space act routing
-exists: `enterfunc`'s capture echo and `exitfunc`→`_detach_item` when
-running under another space's authority (a guarded act there would be
-refused and swallowed by the hook contract, silently losing the fact) —
-those paths emit legacy flat observations, so a cross-outliner move
-yields an enveloped `added` on the destination and a flat `removed`
-from the source hook.*
+any other structural change. Act payloads carry only structural fields:
+actor/outliner identity stays in the log envelope and note prose stays on the
+item. Lifecycle hooks never write structure or emit Acts. Cross-outliner
+movement is refused until one routed operation can record both room
+authorities; raw substrate recycle is the named out-of-band destructive repair
+path and performs defensive cleanup with `emit:false`.*
 
 *The v3 projection is a **relation-checkpoint projection** (see
 [`docs/designing/acts-and-projections.md`](../../docs/designing/acts-and-projections.md)
@@ -28,8 +26,8 @@ acts reconstructs the checkpoint, not the tree. `$outliner:tree_view`
 joins `list_items()` with that checkpoint as `structure_at_seq` — a
 STRUCTURAL watermark only. It does not advance for content edits
 (`set_item_text` → `note_edited`, writer changes, item name edits)
-nor for the flat movement-hook echoes above; a facade caching rows
-keeps its own read-generation for those. Both `_ensure_acts` (mount)
+or raw administrative recycle; a facade caching rows keeps its own
+read-generation for content. Both `_ensure_acts` (mount)
 and `tree_view` (read) locate the meta through the validated
 `_acts_meta` lookup — live, `$outline_meta`-descended, co-located —
 never positional trust in `projections[1]`; `_ensure_acts` also prunes
@@ -40,8 +38,8 @@ act.*
 *The browser now consumes that read through the generic reactive semantic-view
 facade as `outliner.tree`. Thin projection still paints immediately, but only a
 validated `tree_view` result is `complete/current` and may replace the whole
-collection. Accepted structural acts, flat movement-hook echoes, `note_edited`,
-and `note_writers_changed` invalidate the view once per applied frame. The
+collection. Accepted structural acts, `note_edited`, and
+`note_writers_changed` invalidate the view once per applied frame. The
 facade owns principal-scoped sharing, stale-result rejection, and refresh
 failure state; the element retains only its UI-local optimistic overlay, roster
 watchdog, and principal-scoped text accelerator. Stale complete data is never
@@ -87,8 +85,9 @@ Like other `$space` surfaces, it carries an embedded chat panel.
 Items are first-class objects (objref-addressable), matching the
 `$pin < $note` / kanban-card pattern. This keeps content/permissions
 inherited from `$note` and lets chat verbs resolve item names through
-`$match:match_object`. Scale target is **thousands of items per
-outliner**; we'll profile and trim if/when a real workload exceeds that.
+`$match:match_object`. The measured whole-tree pilot envelope is 1,000 items
+and eight concurrent viewers; a larger supported envelope requires paging or
+an enforced cap plus a rerun of the production-shaped scale lane.
 
 **Items own their own placement.** An `$outline_item` knows where it
 sits — its parent pointer, its sibling-order key, and its hidden flag
@@ -111,7 +110,7 @@ $thing
   │                 .hidden            bool — per-item hidden flag
   │                 .portable          bool = false (overrides inherited $portable default)
   │                 :moveto override   rejects targets that aren't $outliner (or recycling)
-  │                 :recycle handler   defensive tree cleanup for direct recycle(item)
+  │                 :recycle handler   defensive cleanup for raw substrate recycle(item)
   └── $space
         └── $room                     (catalogs/chat)
               └── $outliner            (catalogs/outliner)
@@ -151,10 +150,9 @@ read, owner+wizard direct-write). Mutations route through verbs.
 
 Tree shape and sibling order are the sole responsibility of ONE authored cell
 per item — the child's `__ordered_edge` `{ parent, rank }`. Its authored cell
-stays at the item's immutable anchor. The current outliner owner combines its
-locally-anchored cells with owner-delivered `ordered_edge` relation rows for
-items moved in from another outliner, so cross-outliner roots remain complete
-without re-anchoring or global enumeration. This is the substrate ordered-edge index (stages 1-3 of
+stays at the item's immutable anchor. Cross-outliner movement is currently
+refused, so every tree edge remains under one outliner authority. This is the
+substrate ordered-edge index (stages 1-3 of
 `notes/2026-07-13-outliner-edge-index-v2.md`):
 
 - **Bounded reads.** Listing a parent's ordered children is an owner-computed
@@ -185,10 +183,10 @@ without re-anchoring or global enumeration. This is the substrate ordered-edge i
   come only from edges. `list_items` (the whole-tree read for the UI / look) is
   the one place that reads all edges — an inherently O(tree) READ, never on the
   hot mutation path.
-- **Defensive recycle cleanup.** Direct `recycle(item)` delegates to the
-  containing outliner's `_detach_item`, which re-homes the item's DIRECT
-  children (one edge rewrite each) to the item's former parent before the
-  substrate tombstones the item.
+- **Defensive recycle cleanup.** Normal `remove_item`/`eject_item` detach and
+  fold before the non-vetoable substrate recycle. Raw administrative
+  `recycle(item)` invokes the lifecycle safety net with `emit:false`, re-homing
+  direct children without pretending that out-of-band repair is a domain Act.
 - **Single-level undo / server-side focus** are unchanged from v1: `last_undo`
   is one inverse-op slot per actor; `focus_by_actor` is the default parent for
   chat `add`. Both are per-actor maps bounded by present actors — they do NOT
@@ -236,8 +234,8 @@ Adds these item-local verbs:
 
 | Verb | Perms | Purpose |
 |---|---|---|
-| `moveto(target)` (override) | core | Accepts only `$outliner` targets and `$nowhere` (recycling). Any other target — including an actor's inventory — raises `E_NOT_PORTABLE`. This is what makes the class not-carryable. Re-dispatches through the default move chain when the target is permitted, so `:acceptable` / `:exitfunc` / `:enterfunc` still run on the outliners. |
-| `recycle()` | core notification | Defensive cleanup for direct `recycle(item)`. If `location(this)` is an `$outliner`, calls `location(this):_detach_item(this, {emit: true, clear_item: true})` before substrate recycle bookkeeping tombstones the item. This is the same detach path used by `remove_item`, `eject_item`, and `exitfunc`; direct recycle does not get undo, but it must not leave children pointing at a tombstoned parent. |
+| `moveto(target)` (override) | core | Accepts the current `$outliner` and `$nowhere` (recycling). Non-outliner targets raise `E_NOT_PORTABLE`; a different outliner raises `E_CROSS_OUTLINER` until routed multi-space Acts exist. |
+| `recycle()` | core notification | Internal callback for raw substrate `recycle(item)`, an out-of-band destructive repair path. Ordinary dispatch is refused (`caller` must be the item, as supplied by `recycleChecked`). If the item still has an effective edge, calls `_detach_item(..., {emit:false})`; the handler never emits or folds because substrate recycle catches handler errors. Normal remove/eject detach and Act before calling recycle. |
 | `set_hidden(hidden)` | actor present in this item's outliner / item author / wizard | Pure property write. Sets `.hidden`. Validates. **Does not emit an observation and does not write the undo slot** — that's the composer's job. |
 
 **Observation and undo discipline.** `set_hidden` is a public,
@@ -260,20 +258,20 @@ directly; everything routes through the outliner surface.
 | room movement / `out` | inherited | Actors arrive through the substrate `moveto` chain, normally from browser tab activation or an exit. `out` is the inherited room command resolved through an exit whose destination is seeded by the world catalog. `$outliner` defines no public lifecycle verbs of its own. |
 | `list_items()` | anyone | Joined depth-first view: `[{id, name, text, parent_id, index, hidden, owner, writers, has_children}, …]`. Built by the generic `object_tree_rows` substrate helper: scan `contents(this)`, keep `$outline_item` descendants, group by each item's `__ordered_edge.parent`, sort each group by `rank`, and walk depth-first. `index` is the derived (rank-order) sibling index. Items the actor cannot read return `text: ""`. The helper exists because building this large joined view with repeated woocode list concatenation exceeds the VM memory model on thousand-item outlines. |
 | `acceptable(object)` | anyone | `isa(object, $outline_item) \|\| isa(object, $actor)`. |
-| `enterfunc(object)` | core | For actors: reset a non-root `focus_by_actor[actor]` to root, clear that actor's undo slot if present, and emit `outliner_entered` plus mounted-room activity. A first entry at implicit root does not materialize a `focus_by_actor` row, avoiding no-op shared-map conflicts between independent actors. For items: a FRESH item (from `create` in `add_item`/`_restore_item`) still has no edge here — the composer writes it right after create — so leave it. A CROSS-OUTLINER arrival (whose edge the source `:exitfunc` cleared) is re-homed as a root at the END of this outliner's explicitly scoped ordering (`ordered_children(null, this)` → `rank_between(last, null)`) and announced with `outline_item_added`, so no stale cross-outliner parent ref survives. |
-| `exitfunc(object)` | core | For actors: emit `outliner_left` plus mounted-room activity without mutating `focus_by_actor` or `last_undo`. Fresh-visit cleanup happens on the next `enterfunc`; keeping exit observation-only avoids shared-map conflicts on cross-scope movement commits. For items leaving this outliner by `moveto`, calls `_detach_item(object, {emit: true, clear_item: true})`. This re-homes direct children (one edge rewrite each) to the item's former parent, clears the moving item's edge so a destination outliner can place it as top-level, and emits `outline_item_removed`. Recycle does not call `exitfunc`; the item-level `:recycle` handler calls the same helper. |
+| `enterfunc(object)` | core | For actors: reset a non-root `focus_by_actor[actor]` to root, clear that actor's undo slot if present, and emit `outliner_entered` plus mounted-room activity. A first entry at implicit root does not materialize a map row. Fresh items arrive with no edge; the composer authors it after create. The hook never writes structure. |
+| `exitfunc(object)` | core | For actors: emit `outliner_left` plus mounted-room activity. Item exits are refused by `$outline_item:moveto`; the hook never writes structure. Normal remove/eject calls `_detach_item` explicitly before recycle. |
 | `add_item(text, parent_id?, index?)` | anyone present | Composite: read the insert slot's bounded `ordered_neighbors(p, {index}, this)` answer, `create($outline_item, {owner: actor, location: this})`, write ONE edge `{ parent: p, rank: rank_between(before, after) }`, then `set_text`. `parent_id` defaults to caller's focus (or `null` if focus is root). `index` chooses where among siblings; default is end. Emits `outline_item_added`. Sets caller's `last_undo` slot to `{verb: "remove_item", args: [new_item]}`. |
 | `set_item_text(item, text)` | item author / writers / wizard | Composite: capture old text for undo, call `item:set_text(text)`, and let inherited `$note:set_text` emit `note_edited`. The outliner does not re-emit text changes. Sets caller's `last_undo` slot to `{verb: "set_item_text", args: [item, old_text]}`. |
 | `move_item(item, new_parent_id, index?)` | anyone present | Re-parent and/or reorder. `new_parent_id == null` means root. Validates same-outliner and no-cycle (raises `E_CYCLE` if `new_parent_id` is `item` or a descendant). Reads the destination slot's bounded `ordered_neighbors` answer (a same-parent move gets old slot + destination neighbours from ONE query, excluding the moving item; a cross-parent move adds a child-slot query on the old parent), computes ONE fractional rank at the target `index`, and writes the item's single edge `{ new_parent, rank }` — the old-parent siblings keep their ranks (no renumber). Idempotent at current `(parent, index)`: no-op. Emits **exactly one** `outline_item_moved`. Sets caller's `last_undo` slot to `{verb: "move_item", args: [item, old_parent, old_index]}`. |
 | `reorder_item(item, index)` | anyone present | Intra-sibling reorder. Same as `move_item` with the current parent, but emits the distinct `outline_item_reordered` so UIs can animate intra-sibling motion separately. Idempotent. Sets caller's `last_undo` slot to `{verb: "reorder_item", args: [item, old_index]}`. |
 | `hide(item, hidden)` | anyone present | Sole user-facing surface for hidden-toggling. Calls `item:set_hidden(hidden)`, emits `outline_item_hidden`, and sets caller's `last_undo` slot to `{verb: "hide", args: [item, !hidden]}`. Idempotent. The UI checkbox and chat `hide` both route here, never to `item:set_hidden` directly. |
-| `_detach_item(item, opts?)` | internal | Shared cleanup helper. Reads the item's edge parent, re-homes its DIRECT children (one appended edge each) to that former parent, optionally clears the item's own edge (`{ parent: null, rank: "" }`), and optionally emits one `outline_item_removed`. Idempotent enough for recycle paths: if there are no direct children left, it only performs the remaining clear/emit work requested by `opts`. |
-| `remove_item(item)` | item owner / wizard | Controller path. Captures the full restorable state — see "Undo capture" below — then calls `recycle(item)`. `$outline_item:recycle` calls `_detach_item` before the item is tombstoned, so children are reparented on the same cleanup path used by direct recycle. Sets caller's `last_undo` slot to `{verb: "_restore_item", args: [<captured_state>]}` after recycle succeeds. The restored item from undo is a *new* objref. |
-| `eject_item(item)` | outliner owner / wizard | Curator path: bypasses author-only gate. Same recycle path as `remove_item`, except eject does *not* touch the ejecting curator's `last_undo` slot. |
+| `_detach_item(item, opts?)` | internal | Reads the item's edge parent, re-homes its DIRECT children, optionally clears the item edge, and—only in this outliner's sequenced turn—emits one concise `outline_item_removed` Act. Raw recycle passes `emit:false`. Fold errors are never caught. |
+| `remove_item(item)` | item owner / wizard | Captures restorable state, calls `_detach_item(..., {emit:true})` while fold errors can escape, then calls `recycle(item)`. On a fold refusal the outer savepoint restores edges, projections, and undo state before destruction. On success the recycle handler sees the cleared edge and no-ops. Stores the restore inverse. |
+| `eject_item(item)` | outliner owner / wizard | Curator path: the same fail-closed detach-before-recycle sequence, without writing an undo slot. |
 | `_restore_item(state)` | (internal; called only by undo) | Re-create an item from a captured state record. Creates with `{owner, name, description, location: this}`, writes ONE edge at the captured `index` under the captured parent (bounded `ordered_neighbors(parent, query, this)` slot answer; the index CLAMPS into range — restore is best-effort placement, never a range error), then restores `hidden`, `writers`, and text. Emits ONE `outline_item_added` act for the restored row, with the ACTUAL clamped slot as `index` — undo is a structural change and must advance the watermark, not leave `structure_at_seq` stale under a changed tree. Then each child captured in `state.children` is moved back under the restored item at its captured index via `move_item` (one `outline_item_moved` act each, after the added act). Sets caller's `last_undo` slot to `{verb: "remove_item", args: [new_item]}`. Returns the new item objref. |
-| `undo()` | actor | Read the actor's `last_undo` slot, clear it, dispatch the inverse op. Emits `outline_undone` with the consumed record. No-op (and no observation) if the slot is empty. |
+| `undo()` | actor | Read and clear the actor's undo slot, then dispatch the inverse without a recovery catch. Any inverse/fold failure escapes so the savepoint restores the slot and all state. Emits `outline_undone` only after success. No-op if empty. |
 | `focus_on(item?)` | actor | Set `focus_by_actor[actor] = item` (or `null` if no arg). Validates that `item` is in this outliner. Emits `outline_focus_changed` directed to the actor only. |
-| `tree_view()` | anyone | The watermarked authoritative read for the client facade: `{ items: <list_items()>, structure_at_seq: <meta.at_seq or 0> }`. `structure_at_seq` covers exactly the five acted structural events on this outliner's own log — NOT content edits and NOT the flat movement-hook echoes (see the v3 amendment above). 0 until the first structural act. |
+| `tree_view()` | anyone | The watermarked authoritative read for the client facade: `{ items: <list_items()>, structure_at_seq: <meta.at_seq or 0> }`. `structure_at_seq` covers exactly the five acted structural domain operations, not content edits or raw administrative recycle. 0 until the first structural Act. |
 | `_acts_meta()` | internal | Validated lookup for the watermark projection: the first live, `$outline_meta`-descended, co-located entry in `this.projections`, or `null`. Positional trust (`projections[1]`) would let any nonempty list pass; a stale ref that makes `isa()`/`location()` raise is skipped, never trusted. Used by both `_ensure_acts` and `tree_view`. |
 | `_ensure_acts()` | internal | Lazy per-instance mount of the acts surface: mints the `$outline_meta` when `_acts_meta()` finds none, prunes `projections` entries that are not live co-located `$projection` descendants (the kernel fold loop reads `.consumes` on every entry — one dead/foreign ref would refuse every later act), and attaches the `$acts` feature. Idempotent; called by every act-emitting composer. |
 
@@ -404,9 +402,9 @@ Edge cases:
 - If a captured child was itself recycled after the original remove,
   the restore skips that child silently. The remaining siblings still
   land back under the restored item.
-- If a captured child has since been moved elsewhere (different parent
-  or different outliner), the restore takes it back — last-writer-wins
-  applies, same rule as `move_item` undo.
+- If a captured child has since been moved to a different parent in the same
+  outliner, restore takes it back—last-writer-wins, like `move_item` undo.
+  Cross-outliner movement is refused.
 - `writers` snapshot uses captured objrefs; if a writer was recycled
   before undo, it's filtered out of the new writers list.
 
@@ -428,15 +426,19 @@ client by walking up the parent chain. The server flag stays only on
 the item the user clicked, which keeps the data minimal and makes
 "unhide just this node" trivially correct.
 
-## Observation shapes
+## Observation and Act shapes
 
-All carry the standard `source` (= the outliner), `actor`, `ts` envelope.
+Presence, focus, undo, and activity observations remain flat and carry their
+ordinary `source`, `actor`, and `ts` fields. The five structural facts are v3
+Acts: their committed log entry is the authority envelope (outliner/space,
+actor, timestamp, verb, seq), and `payload` contains only the structure below.
+Pre-v3 flat forms remain readable during rolling upgrades.
 
 | `type` | Additional fields |
 |---|---|
 | `outliner_entered` | `outliner: ObjRef`, `origin: ObjRef`, `text: str` |
 | `outliner_left` | `outliner: ObjRef`, `destination: ObjRef`, `text: str` |
-| `outline_item_added` | `item: ObjRef`, `parent_id: ObjRef \| null`, `index: int`, `text: str` |
+| `outline_item_added` | `item: ObjRef`, `parent_id: ObjRef \| null`, `index: int` |
 | `outline_item_removed` | `item: ObjRef`, `reparented_to: ObjRef \| null` |
 | `outline_item_moved` | `item: ObjRef`, `from_parent: ObjRef \| null`, `from_index: int`, `to_parent: ObjRef \| null`, `to_index: int` |
 | `outline_item_reordered` | `item: ObjRef`, `parent_id: ObjRef \| null`, `from_index: int`, `to_index: int` |
@@ -445,8 +447,8 @@ All carry the standard `source` (= the outliner), `actor`, `ts` envelope.
 | `outline_undone` | `inverse_op: {verb: str, args: list}` |
 | `outliner_activity` | `outliner: ObjRef`, `text: str` (umbrella for room-level summaries when `mount_room` is set) |
 
-Item text edits flow through the inherited `note_edited` observation;
-the outliner does not re-emit text changes.
+Item text edits flow through the inherited `note_edited` observation; the
+structural Act neither copies note text nor re-emits text changes.
 
 ## Errors
 
@@ -458,6 +460,7 @@ the outliner does not re-emit text changes.
 | `E_INVARG` | Bad arg (e.g. empty `add` text, chat `hide` with no dobj, `move_item` to a parent in a different outliner). |
 | `E_PERM` | Caller lacks permission for the verb (text edit, owner-gated remove). |
 | `E_NOT_PORTABLE` | `$outline_item:moveto` rejected a target that isn't an `$outliner` or `$nowhere`. |
+| `E_CROSS_OUTLINER` | Direct movement between outliners is refused until one routed operation can record both rooms' structural facts. |
 
 ## Permissions
 
@@ -473,13 +476,10 @@ Properties:
   `perms: "r"`. Verbs are the only mutators.
 
 Verbs:
-- **Cross-outliner moves via direct `moveto`**: item owner /
-  source-outliner owner / wizard. The `$outline_item:moveto`
-  override accepts `$outliner` targets type-wise, but only authorized
-  actors may complete the move; otherwise raises `E_PERM`. (The
-  composer `move_item` always rejects a target parent in a different
-  outliner with `E_INVARG` regardless of authority — it's a
-  same-outliner operation by design.)
+- **Cross-outliner moves**: refused with `E_CROSS_OUTLINER`. Movement hooks
+  cannot emit fail-closed Acts and one room's turn cannot currently record both
+  room authorities. A future routed domain operation may restore this feature;
+  direct `moveto` is not an authority bypass.
 - **Editing item text** (`set_item_text`, item-level `:set_text`):
   item owner / writers / wizard.
 - **Structural ops** (`add_item`, `move_item`, `reorder_item`, `hide`,
@@ -497,26 +497,40 @@ Verbs:
 - **Cannot be carried**: `$outline_item:moveto(target)` raises
   `E_NOT_PORTABLE` if `target` is not an `$outliner` (or `$nowhere` for
   recycling). Substrate `take`/`give`/`drop` cannot extract an item
-  from its outliner. Cross-outliner moves *are* permitted; ejected
-  items are recycled, not pocketed.
+  from its outliner. Cross-outliner moves are refused; ejected items are
+  recycled, not pocketed.
+
+## Acts authority boundary
+
+All normal structural operations—add, move, reorder, hide, remove/eject, and
+their undo inverses—run as sequenced `$outliner` domain verbs and emit exactly
+one or more structural Acts. Fold failures escape the operation; no recovery
+catch may convert them to success. Remove/eject call `_detach_item` before the
+non-vetoable substrate `recycle()` handler, so a refusing fold rolls back before
+destruction begins.
+
+`__ordered_edge` remains the single current-tree authority and `$outline_meta`
+checkpoints the last acted structural transition without mirroring rows.
+`focus_by_actor` and `last_undo` are visit-scoped interaction state, not shared
+work-surface facts, and therefore remain direct state. A wizard/raw substrate
+recycle is an explicitly out-of-band destructive repair operation: the recycle
+handler re-homes children defensively with `emit:false` because handler errors
+are caught by the substrate. It is not a normal domain path and does not claim
+an audit Act.
 
 ## Lifecycle
 
 ```
 outliner:add_item("Buy groceries")
-    create $outline_item with owner=actor, parent=null, position=<pastEnd>
+    create $outline_item with owner=actor in the outliner
+    write ONE edge {parent: null, rank: rank_between(last_rank, null)}
     item:set_text("Buy groceries")          # inherited note_edited observation
-    moveto(item, outliner)
-        $outline_item:moveto(outliner) — target is $outliner, allowed
-        outliner:acceptable(item) — true
-        outliner:enterfunc(item)
-            validate item.parent (null is fine)
-            emit outline_item_added {parent_id: null, index: <derived>}
+    act outline_item_added {item, parent_id: null, index: <derived>}
     set last_undo[actor] = {verb: "remove_item", args: [item]}
    ⋮
 outliner:add_item("milk", parent_id: groceries, index: 0)
     create $outline_item (room-anchored); write ONE edge {parent: groceries, rank: rank_between(null, first_rank)}
-    same enterfunc + observation flow
+    act outline_item_added {item, parent_id: groceries, index: 0}
     last_undo[actor] is now {verb: "remove_item", args: [milk]}  (previous slot overwritten)
    ⋮
 outliner:move_item(milk, dairy_aisle, null)   # drag-drop
@@ -537,20 +551,20 @@ outliner:undo()                               # actor clicks the button
     emit outline_undone {inverse_op: {...}}
     last_undo[actor] is now empty — clicking undo again is a no-op
    ⋮
-outliner:remove_item(milk)                    # cleanup comes from $outline_item:recycle, not :exitfunc
+outliner:remove_item(milk)
     capture full state for the inverse:
       {text, name, description, writers, owner, hidden,
        parent_id: groceries, index: <derived from rank order>,
        children: [{item: c1, index: 0}, {item: c2, index: 1}, ...]}
+    _detach_item(milk, {emit: true, clear_item: true})
+        read groceries' ordered_children (for the append tail)
+        for each direct child c of milk:
+            c.__ordered_edge = {parent: groceries, rank: rank_between(last, null)}   # append; ONE edge each
+        milk.__ordered_edge = {parent: null, rank: ""}
+        act outline_item_removed {item: milk, reparented_to: groceries}
+        # any fold refusal escapes and rolls this whole turn back
     recycle(milk)
-        substrate :recycle handler runs (if any)
-        $outline_item:recycle()
-            location(milk):_detach_item(milk, {emit: true, clear_item: true})
-                read groceries' ordered_children (for the append tail)
-                for each direct child c of milk:
-                    c.__ordered_edge = {parent: groceries, rank: rank_between(last, null)}   # append; ONE edge each
-                milk.__ordered_edge = {parent: null, rank: ""}   # clear the leaving item's edge
-                emit outline_item_removed {reparented_to: groceries}
+        $outline_item:recycle sees the cleared edge and no-ops
         recycleObjectLocal:
           - children of milk's *inheritance* are grafted up
           - milk.contents (none) is displaced; milk.location is left as-is
@@ -910,18 +924,21 @@ any of the three.
   targets with `E_NOT_PORTABLE`; `.portable == false` makes generic
   room `take` reject through the normal non-carryable path, and direct
   `moveto(item, actor)` still cannot pry an item out of its outliner
-- `remove_item` reparents an item's direct children to the item's
-  former parent through `$outline_item:recycle` / `_detach_item`, and
-  emits `outline_item_removed` exactly once. Explicitly assert the
+- `remove_item` reparents an item's direct children through an explicit
+  fail-closed `_detach_item` before recycle and emits `outline_item_removed`
+  exactly once. Explicitly assert the
   children remain valid after recycle (their `.parent` points at the
   former parent, not at a tombstoned objref).
-- direct `recycle(item)` from outside `remove_item` is also covered:
-  `$outline_item:recycle` must run `_detach_item`, so the tree invariants
-  still hold even without undo capture.
-- direct cross-outliner `moveto(item, other_outliner)` (where the item changes outliners)
-  drives `exitfunc` on the source outliner and `enterfunc` on the
-  destination; assert observation pair and orphan reparenting on
-  source side
+- raw substrate `recycle(item)` from outside `remove_item` is also covered:
+  `$outline_item:recycle` runs `_detach_item` with `emit:false`, so tree
+  invariants hold without pretending the administrative action is an Act;
+  ordinary dispatch to the callback by name refuses with `E_PERM` and leaves
+  the edge and structural watermark unchanged.
+- direct cross-outliner `moveto(item, other_outliner)` refuses with
+  `E_CROSS_OUTLINER` and leaves both trees unchanged.
+- adversarial second-projection fold refusals during remove and undo preserve
+  artifact/edge or hidden state, the undo slot, all projection watermarks, and
+  the successful Act set; the failed entry contains only `$error`.
 - chat verbs: `add` resolves against actor focus; `hide_command` requires
   an explicit dobj and receives it via `args_from: ["dobj_prefix"]`;
   `focus_command` focuses an explicit item; `focus_root_command` handles
@@ -960,6 +977,31 @@ tail `add_item` complete without exhausting VM memory. If latency becomes
 the hot path on large outliners, revisit the joined-view shape
 (incremental snapshots, paged listings, text-omitted skeletons with
 on-demand text fetch).
+
+### Whole-tree pilot envelope
+
+`tree_view` is deliberately a direct semantic read. Net preserves that route,
+validates the complete read transcript, and does not advance the room head when
+the transcript has no durable effects. Eight viewers therefore read one stable
+authority generation instead of manufacturing eight contending commits. The
+client builds a `Set` of returned item ids before ordering, so rendering is
+O(N), not the former O(N²) membership scan.
+
+`npm run bench:outliner-acts` is the production-shaped workerd gate: a real Net
+install, Durable Object SQLite/RPC boundaries, 1,000 items, eight independent
+principals/gateway sessions, and three `hide` Act invalidation waves. The
+2026-07-22 result was:
+
+- warm `tree_view`: p50 92 ms, p95 101 ms;
+- response: 145,485–145,491 bytes;
+- mutation-to-all-seven-peer-push: 32–36 ms, p95 36 ms, with 276–278-byte
+  Act push frames; and
+- eight-view invalidation-to-current wave: 904–928 ms, p95 928 ms.
+
+The acceptance budgets are 512 KiB per response, 1.5 s warm-read p95, and 5 s
+wave p95. This proves the stated 1,000-row/eight-view pilot envelope only. It is
+not an unbounded whole-tree claim; a larger product envelope requires paging or
+an enforced domain cap before its scale claim changes.
 
 ## What's not in
 

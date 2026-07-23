@@ -74,6 +74,11 @@ export type PlanTurnInput = {
    * deterministic given the counter). Turns that do not create run fine
    * at the bridge defaults. */
   counters?: SerializedFromCellsOptions;
+  /** The gateway has a COMPLETE copy of `scope` at the submit base head.
+   * When selection stays on that scope, the base-head CAS covers every
+   * same-scope read, so their per-cell entries may be omitted from the wire
+   * transcript. Foreign/session reads remain explicit and attested. */
+  compactOwnedReads?: { scope: string };
   /** Phase 1 (slice-based planning): when true, the planner runs the VM
    * against the turn's SEED SLICE (actor/session/target + their class
    * chain), slice-cloned per attempt from the live view's indexes and
@@ -137,6 +142,8 @@ export type PlanTurnResult = {
   selection: ScopeSelection;
   /** The submitted transcript (rewritten reads, commit-scope target). */
   transcript: EffectTranscript;
+  /** True when the submitted transcript used complete-head read compaction. */
+  ownedReadsCompacted: boolean;
   /** Phase 0 / CO10: the number of cells fed to `planningWorldFromCells`
    * — the planner's INPUT size, the thing that scales with view size on
    * the current (pre-slice) path and must stay ~read-set once planning is
@@ -371,6 +378,12 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
   // and a stale view is caught by the read-version check before
   // post-state ever disagrees.
   const applied = applyTranscript(CellStore.scratchAuthorityFrom(planStore), transcript, stamp);
+  const ownedReadsCompacted = input.compactOwnedReads?.scope === selection.scope;
+  const wireTranscript = compactTranscriptForSubmit(
+    transcript,
+    classifier,
+    ownedReadsCompacted ? selection.scope : null
+  );
 
   return {
     submit: {
@@ -378,15 +391,60 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
       scope: selection.scope,
       base,
       idempotency_key: idempotencyKey,
-      transcript,
+      transcript: wireTranscript,
       post_state_version: applied.postStateVersion,
-      stamp
+      stamp,
+      ...(ownedReadsCompacted ? { owned_reads_compacted: true as const } : {})
     },
     selection,
     transcript,
+    ownedReadsCompacted,
     planCells: planInput.length,
     snapshotCells: planStore.size
   };
+}
+
+/**
+ * The scope never executes bytecode and never consumes a successful return
+ * value or state-probe closure. Keep those on the gateway for the client
+ * response. When the gateway proves its whole owner copy is at the submit's
+ * base head, the scope's existing stale-head check validates every owned read
+ * as one generation; only foreign/session/allocation reads must still ride.
+ */
+function compactTranscriptForSubmit(
+  transcript: EffectTranscript,
+  classifier: ScopeClassifier,
+  compactScope: string | null
+): EffectTranscript {
+  const retainedReads = compactScope === null
+    ? transcript.reads
+    : transcript.reads.filter((read) => {
+        // Session authorization consumes the value, and sequenced allocation
+        // consumes both version and claimed logical value. Never compact them.
+        if (read.cell.kind === "session" || isSequencedAllocationCell(transcript, read.cell)) return true;
+        try {
+          return classifier.scopeOf(read.cell.object) !== compactScope;
+        } catch {
+          return true;
+        }
+      });
+  // A read is a proof of one exact cell value/version, not a record of how
+  // many times bytecode happened to consult that value. Repeated dispatches
+  // can read the same immutable catalog verb thousands of times while
+  // rendering one collection; keeping one byte-identical proof preserves
+  // validation and prevents execution shape from amplifying the wire proof.
+  // Distinct versions or values remain distinct and therefore still expose a
+  // mid-turn authority change to the sequencer.
+  const seenReads = new Set<string>();
+  const reads = retainedReads.filter((read) => {
+    const identity = cellVersion(read);
+    if (seenReads.has(identity)) return false;
+    seenReads.add(identity);
+    return true;
+  });
+  const { hash: _hash, result: _result, stateProbes: _stateProbes, ...rest } = transcript;
+  const body = { ...rest, reads };
+  return { ...body, hash: cellVersion(body) } as EffectTranscript;
 }
 
 /**

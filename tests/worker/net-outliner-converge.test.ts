@@ -61,12 +61,10 @@ type TurnBody = {
 
 /** Drive any verb over the gateway (eject/undo/list_items etc.).
  *
- * route:"sequenced" matches the production client contract: the gateway's
- * client-facing turn entry stamps every client call route:"sequenced"
- * (gateway-do clientApi), and the outliner's act-emitting composers REFUSE
- * a direct-route frame (seq == -1) since the v3 acts migration — a
- * route:"direct" turn here would exercise a path production traffic never
- * takes and fail on the act guard. */
+ * Structural Outliner mutations are sequenced in production; only semantic
+ * reads such as `tree_view` request the metadata-gated direct route. The
+ * act-emitting composers REFUSE a direct frame (seq == -1), so this helper
+ * deliberately exercises the mutation route. */
 function verbTurn(
   gateway: NetGatewayDO,
   gatewayEnv: NetGatewayEnv,
@@ -571,15 +569,13 @@ describe("outliner add over the net path converges", () => {
     expect(underP.rows.map((r) => r.child), "no orphaned edge to the recycled parent").not.toContain(c1);
   });
 
-  it("cross-outliner moveto repairs BOTH scoped root orderings and completes both hooks", async () => {
+  it("cross-outliner moveto is refused before either scoped ordering changes", async () => {
     const { world, theOutline, session, actor, epoch } = await outlinerWorld();
     const sourceScope = `room:${theOutline}`;
     const destination = "the_outline_2";
     const destinationScope = `room:${destination}`;
     world.createObject({ id: destination, name: "Outline 2", parent: "$outliner", owner: actor, location: "the_chatroom" });
 
-    // Give the destination a non-empty root ordering. If null-root caches alias
-    // by parent alone, enterfunc will append against the SOURCE roots instead.
     expect((await world.directCall("cross-enter-dest", actor, actor, "moveto", [destination], { sessionId: session.id })).op).toBe("result");
     const destinationRoots: string[] = [];
     for (const text of ["dest one", "dest two", "dest three"]) {
@@ -588,21 +584,9 @@ describe("outliner add over the net path converges", () => {
     }
     expect((await world.directCall("cross-enter-source", actor, actor, "moveto", [theOutline], { sessionId: session.id })).op).toBe("result");
 
-    // Move a nested item with one child. Source exitfunc must re-home the child
-    // under the former parent; destination enterfunc must append the item as a
-    // destination root. Both hooks read orderings during one moveto pipeline.
     const formerParent = ((await seqCall(world, "cross-parent", session.id, actor, theOutline, "add_item", ["parent", null, null])) as { result: string }).result;
     const moving = ((await seqCall(world, "cross-moving", session.id, actor, theOutline, "add_item", ["moving", formerParent, null])) as { result: string }).result;
     const child = ((await seqCall(world, "cross-child", session.id, actor, theOutline, "add_item", ["child", moving, null])) as { result: string }).result;
-    const destinationSession = world.auth("guest:cross-destination-writer");
-    expect((await world.directCall(
-      "cross-place-destination-writer",
-      destinationSession.actor,
-      destinationSession.actor,
-      "moveto",
-      [destination],
-      { sessionId: destinationSession.id }
-    )).op).toBe("result");
 
     const { gateway, gatewayEnv, scopeDOs } = await mountNet(world, epoch);
     const moved = await call<TurnBody>(gateway, gatewayEnv, "/turn", {
@@ -612,65 +596,36 @@ describe("outliner add over the net path converges", () => {
       },
       planningScope: sourceScope, catalog_epoch: epoch, idempotency_key: "cross-outliner-move"
     });
+    // A domain refusal is itself an accepted, failed sequenced entry. Crucially,
+    // neither lifecycle hook writes a relation or emits a counterfeit Act.
     expect(moved.reply.status, `attempts=${moved.attempt} trace=${JSON.stringify(moved.trace)}`).toBe("accepted");
-    expect(moved.attempt, "hook ordering misses must escape and trigger repair").toBeGreaterThan(1);
-    // Source-side removed: the exitfunc detach runs sequenced on the SOURCE
-    // outliner's own log, so it takes the guarded act branch (enveloped).
-    // Destination-side added: enterfunc runs under the source turn's
-    // authority (a foreign space), so it stays a legacy FLAT observation
-    // until cross-space act routing exists (see the v3 DESIGN amendment).
-    expect(moved.observations?.some(
-      (o) => o.type === "outline_item_removed" && (o.payload as { item?: unknown } | undefined)?.item === moving
-    )).toBe(true);
-    expect(moved.observations?.some((o) => o.type === "outline_item_added" && o.item === moving && o.outliner === destination)).toBe(true);
+    expect((moved.observations ?? []).filter((observation) =>
+      String((observation as { type?: unknown }).type ?? "").startsWith("outline_item_")
+    )).toEqual([]);
 
     const sourceDO = scopeDOs.get(sourceScope)!;
-    const formerParentRows = await call<{ rows: Array<{ child: string }> }>(
+    const sourceChildren = await call<{ rows: Array<{ child: string }> }>(
       sourceDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { container: theOutline, parent: formerParent }
     );
-    expect(formerParentRows.rows.map((row) => row.child)).toContain(child);
-    expect(formerParentRows.rows.map((row) => row.child)).not.toContain(moving);
+    expect(sourceChildren.rows.map((row) => row.child)).toContain(moving);
+    const movingChildren = await call<{ rows: Array<{ child: string }> }>(
+      sourceDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { container: theOutline, parent: moving }
+    );
+    expect(movingChildren.rows.map((row) => row.child)).toContain(child);
 
     const destinationDO = scopeDOs.get(destinationScope)!;
-    expect(destinationDO, `missing destination authority ${destinationScope}`).toBeTruthy();
     const destinationAfter = await call<{ rows: Array<{ child: string }> }>(
       destinationDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { container: destination, parent: null }
     );
-    expect(destinationAfter.rows.map((row) => row.child)).toEqual([...destinationRoots, moving]);
-
-    // The moved parent keeps its immutable SOURCE anchor, while these existing
-    // children are anchored at the DESTINATION. Ordering authority must follow
-    // the explicit container, not the non-root parent's anchor: otherwise the
-    // second insertion reads an empty source-side subset and rejects index 1.
-    const destinationCtx = {
-      theOutline: destination,
-      roomScope: destinationScope,
-      epoch,
-      session: destinationSession,
-      actor: destinationSession.actor
-    };
-    const nestedFirst = await verbTurn(
-      gateway, gatewayEnv, destinationCtx, "cross-nest-first", "move_item", [destinationRoots[0], moving, 0]
-    );
-    expect(nestedFirst.reply.status, JSON.stringify(nestedFirst.trace)).toBe("accepted");
-    const nestedSecond = await verbTurn(
-      gateway, gatewayEnv, destinationCtx, "cross-nest-second", "move_item", [destinationRoots[1], moving, 1]
-    );
-    expect(nestedSecond.reply.status, JSON.stringify(nestedSecond.trace)).toBe("accepted");
-    const nestedRows = await call<{ rows: Array<{ child: string }> }>(
-      destinationDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { container: destination, parent: moving }
-    );
-    expect(nestedRows.rows.map((row) => row.child)).toEqual(destinationRoots.slice(0, 2));
+    expect(destinationAfter.rows.map((row) => row.child)).toEqual(destinationRoots);
   });
 
   it("P1.2: net undo of remove_item re-homes captured children under the restored node (miss not swallowed)", async () => {
-    // undo -> _restore_item, whose child restore is
-    //   `try { this:move_item(kid, item, kid_idx, true) } except err {}`.
+    // undo -> _restore_item -> move_item for each captured child. The inverse
+    // deliberately has no recovery catch: a miss or fold failure must escape.
     // move_item reads ordered_children(kid's parent) + ordered_children(new
-    // item) — ABSENT in the sparse gateway plan. A catchable miss would be
-    // swallowed by the `except`, leaving the captured children at root instead
-    // of back under the restored node. The uncatchable miss must escape to the
-    // gateway repair so move_item actually runs.
+    // item) — ABSENT in the sparse gateway plan. The miss must escape to the
+    // gateway repair so move_item actually runs before the turn commits.
     const { world, theOutline, session, actor, epoch } = await outlinerWorld();
     const roomScope = `room:${theOutline}`;
     const ctx = { theOutline, roomScope, epoch, session, actor };
@@ -698,7 +653,7 @@ describe("outliner add over the net path converges", () => {
     expect(typeof restored).toBe("string");
 
     // Authority proof: the restored node's ordered children now include c1/c2 —
-    // move_item ran after repair (not swallowed, which would strand them at root).
+    // move_item ran after repair; an incomplete inverse cannot commit.
     const roomDO = scopeDOs.get(`room:${theOutline}`)!;
     const kids = await call<{ rows: Array<{ child: string }> }>(
       roomDO, { WOO_INTERNAL_SECRET: SECRET }, "/ordered-children", { container: theOutline, parent: restored }
@@ -956,7 +911,7 @@ describe("outliner add over the net path converges", () => {
   /** The casework journal verb verbatim (catalogs/casework §S3): the log IS
    * the journal. Installed on the outline instance pre-mount so the net
    * turn exercises the real catalog read shape. */
-  const JOURNAL_SOURCE = "verb :journal(from_seq, limit) rxd {\n  let entries = this:replay(from_seq, limit);\n  let out = [];\n  for e in entries {\n    for o in e[\"observations\"] {\n      if (typeof(o) == \"map\" && (\"type\" in o) && (\"payload\" in o) && (\"version\" in o)) {\n        out = out + [{ \"seq\": e[\"seq\"], \"ts\": e[\"ts\"], \"type\": o[\"type\"], \"payload\": o[\"payload\"] }];\n      }\n    }\n  }\n  return out;\n}";
+  const JOURNAL_SOURCE = "verb :journal(from_seq, limit) rxd {\n  let entries = this:replay(from_seq, limit);\n  let out = [];\n  for e in entries {\n    for o in e[\"observations\"] {\n      if (typeof(o) == \"map\" && (\"type\" in o) && (\"payload\" in o) && (\"version\" in o)) {\n        out = out + [{ \"space\": this, \"seq\": e[\"seq\"], \"ts\": e[\"ts\"], \"actor\": e[\"message\"][\"actor\"], \"verb\": e[\"message\"][\"verb\"], \"type\": o[\"type\"], \"payload\": o[\"payload\"] }];\n      }\n    }\n  }\n  return out;\n}";
 
   it("SL4: journal over the net path returns committed acts with semantic ids and authority ts", async () => {
     const { world, theOutline, session, actor, epoch } = await outlinerWorld();
@@ -982,16 +937,24 @@ describe("outliner add over the net path converges", () => {
     expect(journal.attempt, `journal attempts=${journal.attempt}`).toBeGreaterThan(1);
     expect(journal.attempt, `journal attempts=${journal.attempt}`).toBeLessThanOrEqual(3);
 
-    const rows = journal.result as Array<{ seq: number; ts: number; type: string; payload: Record<string, unknown> }>;
+    const rows = journal.result as Array<{
+      space: string; seq: number; ts: number; actor: string; verb: string;
+      type: string; payload: Record<string, unknown>;
+    }>;
     const added = rows.filter((row) => row.type === "outline_item_added");
     expect(added.length, `journal rows: ${JSON.stringify(rows)}`).toBe(3);
     // Envelope seq/ts: the three adds are this fresh scope's first
     // sequenced commits, and ts is the authority acceptance time (CO2.5).
     expect(added.map((row) => row.seq)).toEqual([1, 2, 3]);
     for (const row of added) expect(row.ts, `entry ts must be the authority acceptance time: ${JSON.stringify(row)}`).toBeGreaterThan(0);
-    // SEMANTIC identity: payloads name the space and items by their
-    // semantic ids, never the room:<id> authority address.
-    for (const row of added) expect(row.payload.outliner, JSON.stringify(row)).toBe(theOutline);
+    // Authority identity belongs to the journal envelope, never the payload.
+    for (const row of added) {
+      expect(row.space, JSON.stringify(row)).toBe(theOutline);
+      expect(row.actor, JSON.stringify(row)).toBe(actor);
+      expect(row.verb, JSON.stringify(row)).toBe("add_item");
+      expect(row.payload).not.toHaveProperty("outliner");
+      expect(row.payload).not.toHaveProperty("actor");
+    }
     expect(added.map((row) => row.payload.item)).toEqual(ids);
   });
 

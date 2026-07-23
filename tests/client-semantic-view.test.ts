@@ -157,6 +157,7 @@ describe("reactive semantic-view facade", () => {
     });
     const woo = context();
     const request = { view: "items", subject: "one" };
+    const neverSubscribed = ui.view("alice", woo, { view: "items", subject: "never-mounted" });
     const first = ui.view("alice", woo, request);
     const stop = first.subscribe(() => undefined);
     await flush();
@@ -166,6 +167,7 @@ describe("reactive semantic-view facade", () => {
     stop();
     ui.views.prune(Date.now() + 30_001);
     expect(ui.view("alice", woo, request)).not.toBe(first);
+    expect(ui.view("alice", woo, { view: "items", subject: "never-mounted" })).not.toBe(neverSubscribed);
   });
 
   it("controller handles late binding, disconnect, and reconnect without a duplicate complete read", async () => {

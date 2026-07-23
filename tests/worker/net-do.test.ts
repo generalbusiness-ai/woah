@@ -113,7 +113,7 @@ describe("NetScopeDO over fake-DO storage", () => {
     b.close();
   });
 
-  it("serializes concurrent independent submits from one retained base without repair", async () => {
+  it("keeps concurrent read-only direct submits at one stable authority head", async () => {
     const scope = makeScope("room-a", env);
     await call(scope.instance, env, "/seed", { scope: "room-a", catalog_epoch: EPOCH, cells: seedCells() });
     const head0 = (await call<{ head: ScopeHead }>(scope.instance, env, "/head")).head;
@@ -154,8 +154,8 @@ describe("NetScopeDO over fake-DO storage", () => {
       Array.from({ length: 12 }, (_, index) => call<CommitReply>(scope.instance, env, "/submit", makeSubmit(index)))
     );
     expect(replies.every((reply) => reply.status === "accepted")).toBe(true);
-    expect(new Set(replies.map((reply) => reply.head.seq)).size).toBe(12);
-    expect((await call<{ head: ScopeHead }>(scope.instance, env, "/head")).head.seq).toBe(12);
+    expect(new Set(replies.map((reply) => reply.head.seq))).toEqual(new Set([0]));
+    expect((await call<{ head: ScopeHead }>(scope.instance, env, "/head")).head.seq).toBe(0);
     scope.close();
   });
 

@@ -372,6 +372,22 @@ buried in VTN):
   at one hot scope to serialize without an unconditional re-execution loop.
   It does not weaken a true read/write conflict, which still rejects
   `read_version_mismatch`.
+- **Complete-head compaction is an exact-generation CAS, never a rebase.** A
+  gateway that holds the complete owner closure at the submit base may omit
+  ordinary same-owner reads. The scope accepts that compact proof only when
+  `(seq, hash, generation)` still equals current authority. `generation`
+  advances on every authoritative mutation, including seed and activation
+  writes that deliberately leave `(seq, hash)` unchanged. Session reads and
+  sequenced `next_seq` allocation reads remain explicit. A stale-head refusal
+  invalidates the compact proof: the gateway MUST pull the new complete
+  generation and replan, never attach the old computed transcript to a newer
+  base.
+- **A pure direct read validates but does not commit.** After steps 1–10, a
+  complete direct transcript with no authority writes, projection writes,
+  session transition, or untracked effects returns accepted at the current
+  head without advancing it or recording an idempotency reply. Repeating such
+  a request safely re-reads current authority; concurrent view readers do not
+  manufacture contending scope commits.
 
 If validation fails, no write from the transcript commits; the gateway
 repairs its planning state (per the reply's taxonomy code) and retries the
@@ -415,7 +431,7 @@ divergence. Tail metrics count by code.
 | `E_SEED_LAG` | KV seed behind scope head | informational; consumer proceeds via head-check |
 | `E_EPOCH_MISMATCH` | durable catalog epochs genuinely disagree: a seed against a scope seeded at another epoch, or a turn whose stamp still differs from the scope's durable epoch AFTER the CO8 reseed | terminal; catalog install/migration reconciles (operator concern), never a retry treadmill |
 | `E_SEED_COMMITTED` | a seed targets a scope that has already committed turns | terminal; recover into a fresh namespace rather than resetting authority under an unchanged head |
-| `E_NONCONVERGENT_READ` | an eligible recorded read cannot converge: after resolving the owner, the gateway refreshed a mismatched cell (or re-installed an ordering answer) to an authority receipt `(scope, head, content-version)` and re-planned, yet the re-plan still mismatched the exact same receipt — a planner/catalog-verb bug, not contention. Only post-seed (`head.seq > 0`) reads participate, and `$system.net_active_epoch` never participates; failed, owner-unresolved, seed-phase, and activation-state refreshes produce no receipt and cannot trigger this code. Within that eligible set every authoritative mutation advances the sequenced head, distinguishing legitimate content cycles such as A → B → A. | terminal and NAMED; surfaces the offending cell/ordering, authority receipt, and attempt trace instead of grinding to `E_BUDGET` |
+| `E_NONCONVERGENT_READ` | an eligible read or sparse-planning miss cannot converge: after resolving the owner, the gateway refreshed a cell (or re-installed an ordering/replay answer) to an authority receipt `(scope, seq, hash, generation, content-version)` and re-planned, yet the re-plan requested or mismatched the exact same receipt. This is a planner/catalog bug, not contention. Every authoritative mutation—including seed and activation—advances `generation`, so legitimate A → B → A cycles produce distinct receipts even when `(seq, hash, content-version)` returns to its prior values. Failed and owner-unresolved refreshes produce no receipt and cannot trigger this code. | terminal and NAMED; surfaces the offending cell/query, authority receipt, and attempt trace instead of grinding to `E_BUDGET` |
 | `E_INVARG` | a malformed internal request field (wrong type or shape) | terminal for this request; refused with the offending field named — never silently coerced into a different-but-valid request |
 | `E_SCOPE_RETIRED` | a submit, adopt, seed, or head read targets a scope past its retirement head (CO17) — its anchor root was recycled and the scope's storage reclaimed | terminal; a session repins to a live scope; an outbox sender treats it as terminal-acknowledge (advances high-water, installs nothing); a gateway seed path refuses to re-seed the tombstoned name at the same epoch |
 
@@ -433,7 +449,12 @@ trace where repair rounds occurred.
   against its own authority cells and foreign reads against their
   owners' attestations, then re-derives post-state by applying the
   recorded writes — it never re-executes bytecode, so a shipped read
-  closure would buy nothing. Nothing scope-wide, no authority slices,
+  closure would buy nothing. Successful results and planner-only state probes
+  remain gateway-local. Byte-identical reads are one authority proof on the
+  wire regardless of how many times bytecode consulted the cell; differing
+  value/version proofs remain distinct. A complete-head submit may additionally
+  compact same-owner reads under CO4's exact-generation rule. Nothing
+  scope-wide, no authority slices,
   no execution capsule, no alternate warm/slim modes. Byte ceilings are
   enforced on the **actual serialized submit body**, measured at the
   gateway immediately before the submit RPC (never on a modeled shape):
@@ -468,7 +489,11 @@ scope's durable epoch after a successful reseed — the condition is the
 terminal `E_EPOCH_MISMATCH` (CO6), surfaced with its attempt trace instead
 of grinding the repair budget; reconciliation is the catalog
 install/migration path's job. Idempotent re-seed at the SAME epoch remains
-a success. A present seed `relations` field is the complete initial relation
+a success before committed traffic and advances the authority `generation`;
+activation writes also advance `generation`. These head-stable operator paths
+are therefore visible to complete-head receipts and non-convergence detection
+even though their sequenced `(seq, hash)` is stable. A present seed `relations`
+field is the complete initial relation
 family (including an explicit empty array); omission by a legacy seed request
 preserves existing same-epoch relation rows. This generalizes the E1 discipline
 that landed for v2
@@ -811,12 +836,15 @@ One write path per fact (CO9), concretized:
   - `POST /net-api/session {ttl_ms?}` derives the actor's cluster from
     view lineage (CO15; convention pull `cluster:<actor>` on miss) and
     mints through `/net/session-open`'s machinery.
-  - `POST /net-api/turn {target, verb, args?, session, idempotency_key?}`
+  - `POST /net-api/turn {target, verb, args?, route?, session, idempotency_key?}`
     REQUIRES a session (`session_required` without one) and validates
     the named session cell — presence, expiry, and actor binding to the
-    AUTHENTICATED apikey actor — before planning; the turn then runs
-    route:`sequenced` so the committing scope's authorize revalidates
-    end-to-end (the gateway authenticates; scopes authorize). `target`
+    AUTHENTICATED apikey actor — before planning. Omitted `route` defaults to
+    `sequenced`. A requested `direct` route is allowed only when the resolved
+    verb declares `direct_callable:true`; unresolved metadata fails closed with
+    `E_DIRECT_DENIED`. Either route carries the session read so the committing
+    scope's authorize revalidates end-to-end (the gateway authenticates; scopes
+    authorize). `target`
     is a concrete runtime object id, not a catalog-manifest reference:
     installed-alias forms such as `tasks:the_taskboard` have already
     resolved to their concrete seed id before runtime. A concrete object
@@ -839,9 +867,9 @@ One write path per fact (CO9), concretized:
     `error`, and `observations` (the gateway holds the planned
     transcript; `error` matters because an errored verb still commits
     its complete transcript — without the field an accepted no-op is
-    indistinguishable from success). A replay detected by post-state
-    digest mismatch omits them and marks `replayed: true` (a fresh
-    accept always digest-matches its plan).
+    indistinguishable from success). A scope-confirmed replay of a durable
+    commit omits them and marks `replayed:true`; a pure direct read is not
+    cached and safely returns a newly validated result at the unchanged head.
   - `GET /net-api/relation` / `GET /net-api/cell` are the authenticated
     client reads over the CO13 roster mirror and the view cell probe. Session
     ids are bearer credentials: relation reads expose only actor-level

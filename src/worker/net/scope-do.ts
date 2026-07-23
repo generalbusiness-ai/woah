@@ -831,6 +831,8 @@ export class NetScopeDO {
           this.relateScopeHints.clear();
           this.catalogRiderObjects.clear();
         }
+        const freshAcceptance = reply.status === "accepted" && reply.replayed !== true;
+        const authorityAdvanced = freshAcceptance && reply.head.seq === headBefore + 1;
         // Never begin fanout in the gateway -> scope submit lineage. Even a
         // waitUntil task starts executing immediately; calling the submitting
         // gateway before this response leaves the scope creates a platform
@@ -857,7 +859,7 @@ export class NetScopeDO {
           base_lag: baseLag,
           // A cached idempotent reply can also carry an old base; only a
           // fresh acceptance represents authority-side rebasing.
-          rebased: reply.status === "accepted" && reply.replayed !== true && baseLag > 0,
+          rebased: authorityAdvanced && baseLag > 0,
           outbox_enqueued: this.outboxEnqueuedTotal - enqueuedBefore,
           ms: Date.now() - submitStarted
         });
@@ -874,7 +876,7 @@ export class NetScopeDO {
         if (spanTrace && spanSampled(spanTrace)) {
           const parsed = parseTraceparent(spanTrace.traceparent);
           if (parsed) {
-            const freshCommit = reply.status === "accepted" && reply.replayed !== true;
+            const freshCommit = authorityAdvanced;
             exportSpans(
               this.env,
               this.host,
@@ -1258,6 +1260,8 @@ export class NetScopeDO {
             const repairBody: FanoutBody = {
               scope: seq.scope,
               seq: result.head.seq,
+              head_hash: result.head.hash,
+              head_generation: result.head.generation,
               cells: [],
               observations: [],
               relations: applied
@@ -1332,6 +1336,8 @@ export class NetScopeDO {
             const defsBody: FanoutBody = {
               scope: seq.scope,
               seq: result.head.seq,
+              head_hash: result.head.hash,
+              head_generation: result.head.generation,
               cells: result.cells,
               removed_cells: result.removed,
               observations: []
@@ -1591,6 +1597,8 @@ export class NetScopeDO {
           const reapBody: FanoutBody = {
             scope: seq.scope,
             seq: reap.head.seq,
+            head_hash: reap.head.hash,
+            head_generation: reap.head.generation,
             cells: retiredCells,
             observations: [],
             relations: reap.localRemovals
@@ -2110,6 +2118,8 @@ export class NetScopeDO {
       const base: FanoutBody = {
         scope: seq.scope,
         seq: reply.head.seq,
+        head_hash: reply.head.hash,
+        head_generation: reply.head.generation,
         cells,
         observations,
         // The raw idempotency key is trusted-internal only: receiving
@@ -2918,6 +2928,8 @@ export class NetScopeDO {
           const adoptFanBody: FanoutBody = {
             scope: seq.scope,
             seq: result.head.seq,
+            head_hash: result.head.hash,
+            head_generation: result.head.generation,
             cells: this.fanoutCells(seq, result.applied),
             observations: []
           };
@@ -3019,6 +3031,8 @@ export class NetScopeDO {
         const refanBody: FanoutBody = {
           scope: seq.scope,
           seq: result.head.seq,
+          head_hash: result.head.hash,
+          head_generation: result.head.generation,
           cells: [],
           // Phase i: the room-addressed announcements that rode with
           // the presence delta refan under THIS scope's head seq, so

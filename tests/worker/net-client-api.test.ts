@@ -129,6 +129,13 @@ async function buildHarness() {
     "verb :probe_target(target) rxd { return target; }",
     null
   ).ok).toBe(true);
+  expect(installVerb(
+    world,
+    "capi_box",
+    "locked_probe",
+    "verb :locked_probe() rx { return 1; }",
+    null
+  ).ok).toBe(true);
   const placed = await world.directCall("capi-genesis-place", actor, actor, "moveto", ["capi_room"], { sessionId: session.id });
   expect(placed.op).toBe("result");
   world.ensureApiKey("$wiz", actor, KEY_ID, KEY_SECRET, "net-client-api-test");
@@ -416,6 +423,31 @@ describe("/net-api client surface (Phase 4 item 2, CO14)", () => {
     expect(turnBody.reply.status, JSON.stringify(turnBody.reply)).toBe("accepted");
     expect(turnBody.result).toBe(1);
     expect(turnBody.observations?.map((o) => o.type)).toContain("bumped");
+
+    // A metadata-authorized direct read keeps the route chosen by the
+    // external client and does not manufacture an authority commit. This is
+    // the semantic-view path: concurrent readers validate at one stable head.
+    const direct = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+      token,
+      body: {
+        target: "capi_box",
+        verb: "probe_target",
+        args: ["capi_box"],
+        route: "direct",
+        session: sid,
+        idempotency_key: "capi-direct-read"
+      }
+    });
+    expect(direct.status, JSON.stringify(direct.body)).toBe(200);
+    expect((direct.body as unknown as TurnBody).result).toBe("capi_box");
+    expect((direct.body as unknown as TurnBody).reply.head).toEqual(turnBody.reply.head);
+
+    const deniedDirect = await clientFetch(h.gateway, "POST", "/net-api/turn", {
+      token,
+      body: { target: "capi_box", verb: "locked_probe", route: "direct", session: sid }
+    });
+    expect(deniedDirect.status).toBe(403);
+    expect(deniedDirect.body.error).toMatchObject({ code: "E_DIRECT_DENIED" });
 
     // Client-supplied idempotency key replays per the item-1 contract:
     // the recorded reply comes back marked, without an invented result.

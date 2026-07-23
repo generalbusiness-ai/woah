@@ -336,26 +336,30 @@ describe("client UI framework projection", () => {
 
   it("folds an act-enveloped outliner live fanout identically to the flat shape", () => {
     // v3 emits the structural events as acts ({type, version, payload}); pre-v3
-    // definitions and the movement-hook echo paths still emit flat fields. Both
-    // shapes must land the same canonical projection
+    // definitions still emit flat fields. Both shapes must land the same
+    // canonical projection; concise v3 identity comes from the carrier and
+    // prose from the preceding note observation/artifact projection
     // (catalogs/outliner/migration-v2-to-v3.json).
     const ui = createWooClientFramework();
     ui.ingestSnapshot(v2SnapshotKey("the_outline", 0), [
       { id: "the_outline", name: "Outline", props: {} }
     ]);
 
-    ui.ingestLiveObservation({
+    ui.ingestDeliveredObservation({
+      type: "note_edited",
+      note: "outline_item_act",
+      text: "peer act row",
+      actor: "guest_2"
+    }, { route: "sequenced", space: "the_outline", seq: 1, receivedAt: Date.now() });
+    ui.ingestDeliveredObservation({
       type: "outline_item_added",
       version: 1,
       payload: {
-        outliner: "the_outline",
         item: "outline_item_act",
         parent_id: null,
-        index: 0,
-        text: "peer act row",
-        actor: "guest_2"
+        index: 0
       }
-    });
+    }, { route: "sequenced", space: "the_outline", seq: 1, receivedAt: Date.now() });
 
     expect(ui.observe("outline_item_act")).toMatchObject({
       parent: "$outline_item",
@@ -364,11 +368,11 @@ describe("client UI framework projection", () => {
       catalogState: { outliner_tree: { parent_id: null, index: 0 } }
     });
 
-    ui.ingestLiveObservation({
+    ui.ingestDeliveredObservation({
       type: "outline_item_hidden",
       version: 1,
-      payload: { outliner: "the_outline", item: "outline_item_act", hidden: true }
-    });
+      payload: { item: "outline_item_act", hidden: true }
+    }, { route: "sequenced", space: "the_outline", seq: 2, receivedAt: Date.now() });
     expect(ui.observe("outline_item_act")?.props).toMatchObject({ hidden: true });
   });
 

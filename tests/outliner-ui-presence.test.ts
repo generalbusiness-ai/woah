@@ -1025,8 +1025,8 @@ describe("outliner-tree presence aside", () => {
 
   // Dual-shape tolerance: v3 emits the five structural events as acts
   // ({type, version, payload: {...domain fields...}}) while pre-v3 deployed
-  // definitions and the movement-hook echo paths still emit flat fields on the
-  // observation itself. The same event sequence in either shape must reduce to
+  // definitions emit flat fields on the observation itself. The same event
+  // sequence in either shape must reduce to
   // the identical tree model (catalogs/outliner/migration-v2-to-v3.json).
   it("reduces act-enveloped structural events identically to flat ones", () => {
     type ObservingElement = WooOutlinerTreeElement & {
