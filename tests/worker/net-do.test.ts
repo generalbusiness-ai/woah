@@ -613,7 +613,7 @@ describe("NetScopeDO over fake-DO storage", () => {
 });
 
 describe("NetGatewayDO end-to-end over fake-DO", () => {
-  it("treats a full catalog pull as exact for definition pages missed while offline", async () => {
+  it("replaces every compactable catalog cell before certifying a full pull", async () => {
     const scopeEnv: NetScopeEnv = { WOO_INTERNAL_SECRET: SECRET };
     const catalog = makeScope("catalog-exact", scopeEnv);
     await call(catalog.instance, scopeEnv, "/seed", {
@@ -695,6 +695,15 @@ describe("NetGatewayDO end-to-end over fake-DO", () => {
           stamp: { scope_head: "1:stale", catalog_epoch: EPOCH }
         },
         {
+          key: "object_lineage:custom_room",
+          kind: "object_lineage",
+          object: "custom_room",
+          value: { parent: "$space", owner: "$wiz", name: "custom_room", anchor: null, flags: {} },
+          version: "room-lineage",
+          provenance: "authoritative",
+          stamp: { scope_head: "1:stale", catalog_epoch: EPOCH }
+        },
+        {
           key: roomVerbKey,
           kind: "verb_bytecode",
           object: "custom_room",
@@ -730,9 +739,17 @@ describe("NetGatewayDO end-to-end over fake-DO", () => {
     expect(pulled).toMatchObject({ source: "live", installed: 3 });
     expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", staleKey)).toHaveLength(0);
     expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", stalePropertyKey)).toHaveLength(0);
-    expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", ordinaryPropertyKey)).toHaveLength(1);
+    // Full-pull exactness is not definition-specific. This ordinary
+    // catalog-owned property would be eligible for complete-head read
+    // compaction too, so retaining it would certify a stale value.
+    expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", ordinaryPropertyKey)).toHaveLength(0);
     expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", roomVerbKey)).toHaveLength(1);
     expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", roomDefinitionKey)).toHaveLength(1);
+    expect(durableRows(
+      gatewayState.state,
+      "SELECT owner_scope FROM net_gateway_cell WHERE key = ?",
+      roomVerbKey
+    )).toEqual([{ owner_scope: "room:custom_room" }]);
     expect(durableRows(gatewayState.state,
       "SELECT body FROM net_gateway_cell WHERE key = 'verb_bytecode:$outliner:list_items'"
     )).toHaveLength(1);
@@ -742,7 +759,7 @@ describe("NetGatewayDO end-to-end over fake-DO", () => {
     await call(restarted, gatewayEnv, "/pull", { scope: CATALOG_SCOPE, destination: "scope:catalog" });
     expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", staleKey)).toHaveLength(0);
     expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", stalePropertyKey)).toHaveLength(0);
-    expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", ordinaryPropertyKey)).toHaveLength(1);
+    expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", ordinaryPropertyKey)).toHaveLength(0);
     expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", roomVerbKey)).toHaveLength(1);
     expect(durableRows(gatewayState.state, "SELECT body FROM net_gateway_cell WHERE key = ?", roomDefinitionKey)).toHaveLength(1);
     catalog.close();

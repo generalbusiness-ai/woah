@@ -1946,8 +1946,9 @@ export class NetScopeDO {
     // starve the mirror of every roster row the superseded fanout
     // carried. Phase 4: `withRelations` extends the same guarantee to a
     // TARGETED pull (the client cold-open backfill), so advancing the
-    // high-water on it is equally safe — the roster is coherent at the
-    // returned head, and un-pulled cells are absent, not stale. A plain
+    // high-water on it is equally safe — the returned relation family is
+    // complete and replaces that scope's mirror before the advance.
+    // Unrequested cells receive no completeness certificate. A plain
     // keyed closure (refreshCells repair) still skips them: it never
     // advances the high-water. Sorted for a deterministic transfer.
     const relations =

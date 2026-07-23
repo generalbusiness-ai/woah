@@ -747,11 +747,19 @@ export class NetGatewayDO {
     // Phase 5 durable-format stamp (mirrors net_scope_meta's row): the
     // gateway's one branch point for durable evolution + migration ledger.
     state.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_gateway_meta (id TEXT PRIMARY KEY, body TEXT NOT NULL)");
+    const gatewayVersionRow = sqlRows<{ body: string }>(
+      state.storage.sql.exec("SELECT body FROM net_gateway_meta WHERE id = 'schema_version'")
+    )[0];
+    const gatewayVersion = gatewayVersionRow === undefined
+      ? null
+      : (JSON.parse(gatewayVersionRow.body) as { v?: unknown }).v;
     state.storage.sql.exec(
-      "INSERT OR IGNORE INTO net_gateway_meta (id, body) VALUES ('schema_version', ?)",
-      JSON.stringify({ v: 1 })
+      "CREATE TABLE IF NOT EXISTS net_gateway_cell (key TEXT PRIMARY KEY, body TEXT NOT NULL, owner_scope TEXT)"
     );
-    state.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_gateway_cell (key TEXT PRIMARY KEY, body TEXT NOT NULL)");
+    const cellColumns = sqlRows<{ name: string }>(state.storage.sql.exec("PRAGMA table_info(net_gateway_cell)"));
+    if (!cellColumns.some((column) => column.name === "owner_scope")) {
+      state.storage.sql.exec("ALTER TABLE net_gateway_cell ADD COLUMN owner_scope TEXT");
+    }
     state.storage.sql.exec("CREATE TABLE IF NOT EXISTS net_gateway_scope (scope TEXT PRIMARY KEY, seen_seq INTEGER NOT NULL, delivery_seen_seq INTEGER NOT NULL DEFAULT 0)");
     const scopeColumns = sqlRows<{ name: string }>(state.storage.sql.exec("PRAGMA table_info(net_gateway_scope)"));
     if (!scopeColumns.some((column) => column.name === "delivery_seen_seq")) {
@@ -771,11 +779,9 @@ export class NetGatewayDO {
     // at write time — a fanout carries a SCOPE name (`room:ws_annex`) but the
     // relation owner is an OBJECT id (`ws_annex`), so the presence fanout
     // filters on `owner_scope` to stay O(occupants), never scanning every
-    // session_presence row and classifying each in JS. Additive-column
-    // migration for a table created before it (before-data everywhere today;
-    // idempotent). A legacy row's NULL owner_scope simply misses the indexed
-    // filter until the next fanout/pull rewrites it — the same self-heal a
-    // stale mirror row already has.
+    // session_presence row and classifying each in JS. The column addition is
+    // idempotent; schema v2 below then discards legacy unowned rows together
+    // with the high-waters that could suppress their reconstruction.
     const relationColumns = sqlRows<{ name: string }>(state.storage.sql.exec("PRAGMA table_info(net_gateway_relation)"));
     if (!relationColumns.some((column) => column.name === "owner_scope")) {
       state.storage.sql.exec("ALTER TABLE net_gateway_relation ADD COLUMN owner_scope TEXT");
@@ -798,6 +804,34 @@ export class NetGatewayDO {
     );
     state.storage.sql.exec(
       "CREATE INDEX IF NOT EXISTS net_gateway_relation_owner_member ON net_gateway_relation (relation, owner, member)"
+    );
+    // Gateway cache schema v2 materializes cell ownership for exact full-pull
+    // replacement. v1 rows cannot be classified safely in SQL, and retaining
+    // their high-water while discarding an unclassified row could suppress
+    // the fanout that repairs it. This is DERIVED cache state, so the one safe
+    // migration is to clear cells, relation mirrors, and both high-waters in
+    // one transaction; the next pull/fanout reconstructs them from authority.
+    // Fresh databases create the v2 table directly and skip the reset.
+    if (gatewayVersion === 1) {
+      state.storage.transactionSync(() => {
+        state.storage.sql.exec("DELETE FROM net_gateway_cell");
+        state.storage.sql.exec("DELETE FROM net_gateway_relation");
+        state.storage.sql.exec("DELETE FROM net_gateway_scope");
+        state.storage.sql.exec(
+          "UPDATE net_gateway_meta SET body = ? WHERE id = 'schema_version'",
+          JSON.stringify({ v: 2 })
+        );
+      });
+    } else if (gatewayVersion === null) {
+      state.storage.sql.exec(
+        "INSERT INTO net_gateway_meta (id, body) VALUES ('schema_version', ?)",
+        JSON.stringify({ v: 2 })
+      );
+    } else if (gatewayVersion !== 2) {
+      throw new Error(`unsupported net gateway cache schema version ${JSON.stringify(gatewayVersion)}`);
+    }
+    state.storage.sql.exec(
+      "CREATE INDEX IF NOT EXISTS net_gateway_cell_scope ON net_gateway_cell (owner_scope)"
     );
     // Selection pinning (fix 5c): idempotency_key → the scope the FIRST
     // submit for that key targeted. A re-plan (same key, refreshed view)
@@ -950,39 +984,37 @@ export class NetGatewayDO {
       if (raw !== null) {
         const seed = JSON.parse(raw) as SeedRecord;
         const live = (await this.host.rpc(body.destination, "/head")) as { head: ScopeHead };
-        if (live.head.seq === seed.head.seq && live.head.hash === seed.head.hash) {
+        // A current-format full seed includes the COMPLETE relation family.
+        // An aged seed without that field cannot safely advance the shared
+        // cell/relation high-water: fall through to the live full closure.
+        if (live.head.seq === seed.head.seq && live.head.hash === seed.head.hash && seed.relations !== undefined) {
           this.discardViewOnThrow(() =>
             this.state.storage.transactionSync(() => {
-              this.removeAbsentCatalogDefinitions(view, body.scope, seed.cells);
-              for (const cell of seed.cells) {
-                // Copy #3 provenance: these cells came through KV, not the
-                // authority — mark them honestly (planning treats derived
-                // and seed copies identically; the stamp is provenance).
-                view.install({ ...cell, provenance: "seed" });
-                this.persistCell(view, cell.key);
-              }
-              // CO13: relation rows ride the seed for the same reason they
-              // ride the live closure (see reseedFromScope's upsert note).
-              for (const row of seed.relations ?? []) {
-                this.applyRelationDelta({ op: "add", row });
-              }
+              // Copy #3 provenance: these cells came through KV, not the
+              // authority — mark them honestly (planning treats derived
+              // and seed copies identically; the stamp is provenance).
+              this.replaceScopeCells(view, body.scope, seed.cells, "seed");
+              this.replaceScopeRelations(body.scope, seed.relations ?? []);
+              // The exact replacement and its certificate advance are one
+              // durable action. A crash cannot preserve stale members under
+              // the new high-water.
+              this.advanceSeen(body.scope, seed.head.seq);
             })
           );
-          // Fix 7: the seed IS the state at its head — stale pre-pull
-          // fanout rows must no-op instead of regressing the view.
-          this.advanceSeen(body.scope, seed.head.seq);
-          if (known.length === 0) this.completeHeads.set(body.scope, seed.head);
+          this.completeHeads.set(body.scope, seed.head);
           return { ok: true, installed: seed.cells.length, head: seed.head, source: "kv" };
         }
         // Seed lags the live head: named, informational (CO6 E_SEED_LAG),
         // and self-healing — the live path below rewrites the seed.
-        this.metric({
-          kind: "net_seed_lag",
-          code: "E_SEED_LAG",
-          scope: body.scope,
-          seed_head: seed.head,
-          live_head: live.head
-        });
+        if (live.head.seq !== seed.head.seq || live.head.hash !== seed.head.hash) {
+          this.metric({
+            kind: "net_seed_lag",
+            code: "E_SEED_LAG",
+            scope: body.scope,
+            seed_head: seed.head,
+            live_head: live.head
+          });
+        }
       }
     }
 
@@ -2191,7 +2223,7 @@ export class NetGatewayDO {
     } catch (err) {
       installDegraded = true;
       this.metric({ kind: "net_session_open_install_degraded", scope: clusterScope, status: "error", error: String(err) });
-      this.installAcceptedSessionEcho(request.session, value, reply, request.catalog_epoch);
+      this.installAcceptedSessionEcho(request.session, value, reply, request.catalog_epoch, clusterScope);
     }
     return {
       reply,
@@ -2726,7 +2758,7 @@ export class NetGatewayDO {
             const view = this.ensureView();
             if (fresh) view.install(fresh);
             else view.delete(key);
-            this.persistCell(view, key);
+            this.persistCell(view, key, CATALOG_SCOPE);
           })
         );
         this.activationVerifiedAt = now;
@@ -3019,7 +3051,7 @@ export class NetGatewayDO {
           this.state.storage.transactionSync(() => {
             const view = this.ensureView();
             view.install(authoritative);
-            this.persistCell(view, key);
+            this.persistCell(view, key, CATALOG_SCOPE);
           })
         );
         this.guestResetDefinitionRetryAt = 0;
@@ -3051,7 +3083,7 @@ export class NetGatewayDO {
         this.state.storage.transactionSync(() => {
           const view = this.ensureView();
           view.install(fresh);
-          this.persistCell(view, key);
+          this.persistCell(view, key, CATALOG_SCOPE);
         })
       );
       this.guestResetDefinitionRetryAt = 0;
@@ -3271,7 +3303,7 @@ export class NetGatewayDO {
     } catch (err) {
       installDegraded = true;
       this.metric({ kind: "net_guest_provision_install_degraded", actor, status: "error", error: String(err) });
-      this.installAcceptedSessionEcho(session, planned.value, reply, epoch);
+      this.installAcceptedSessionEcho(session, planned.value, reply, epoch, planned.clusterScope);
     }
     await this.selfSubscribe(planned.clusterScope);
     await this.selfSubscribe(roomScope);
@@ -6514,11 +6546,12 @@ export class NetGatewayDO {
     const wanted = new Set(touched);
     this.discardViewOnThrow(() =>
       this.state.storage.transactionSync(() => {
-        for (const cell of transfer.cells) {
-          view.install(cell);
-          this.persistCell(view, cell.key);
-          wanted.delete(cell.key);
-        }
+        const installed = this.installTransferredCells(
+          view,
+          transfer.cells,
+          typeof transfer.scope === "string" ? transfer.scope : undefined
+        );
+        for (const key of installed) wanted.delete(key);
         for (const key of wanted) {
           view.delete(key);
           this.persistCell(view, key);
@@ -6537,7 +6570,8 @@ export class NetGatewayDO {
     session: string,
     value: unknown,
     reply: Extract<CommitReply, { status: "accepted" }>,
-    catalogEpoch: string
+    catalogEpoch: string,
+    clusterScope: string
   ): void {
     const view = this.ensureView();
     const cell = makeCell({
@@ -6552,7 +6586,7 @@ export class NetGatewayDO {
     });
     this.discardViewOnThrow(() => this.state.storage.transactionSync(() => {
       view.install(cell);
-      this.persistCell(view, cell.key);
+      this.persistCell(view, cell.key, clusterScope);
     }));
   }
 
@@ -6633,11 +6667,11 @@ export class NetGatewayDO {
       const wanted = new Set(want);
       this.discardViewOnThrow(() =>
         this.state.storage.transactionSync(() => {
-          for (const cell of transfer.cells) {
-            view.install(cell);
-            this.persistCell(view, cell.key);
-            wanted.delete(cell.key);
-          }
+          const sourceScope = typeof (transfer as AuthorityCellTransfer).scope === "string"
+            ? (transfer as AuthorityCellTransfer).scope as string
+            : undefined;
+          const installed = this.installTransferredCells(view, transfer.cells, sourceScope);
+          for (const key of installed) wanted.delete(key);
           for (const key of wanted) {
             view.delete(key);
             this.persistCell(view, key);
@@ -6690,10 +6724,10 @@ export class NetGatewayDO {
           if (transfer.cells.length === 0) continue;
           this.discardViewOnThrow(() =>
             this.state.storage.transactionSync(() => {
-              for (const cell of transfer.cells) {
-                view.install(cell);
-                this.persistCell(view, cell.key);
-              }
+              const sourceScope = typeof (transfer as AuthorityCellTransfer).scope === "string"
+                ? (transfer as AuthorityCellTransfer).scope as string
+                : undefined;
+              this.installTransferredCells(view, transfer.cells, sourceScope);
             })
           );
           // A nonempty convention probe only proves ownership when the
@@ -6730,11 +6764,11 @@ export class NetGatewayDO {
    * Phase 4 targeted warming: pull ONLY the named objects' cells (each
    * with its class chain, expanded at the authority) plus the scope's
    * relation rows, and advance the fanout high-water to the returned
-   * head. Advancing is safe for the same reason the full pull's fix-7
-   * advance is: the relation mirror is coherent at that head (the rows
-   * rode along), and a cell this pull did not carry is ABSENT from the
-   * view — absent is never stale; pull-on-miss and read-version checks
-   * own it. This is the client cold-open path: its cost tracks what the
+   * head. Advancing is safe because the returned relation family is
+   * complete and replaces that scope's mirror rows before the advance.
+   * Unrequested cells receive no completeness certificate; pull-on-miss
+   * and read-version checks own them. This is the client cold-open path:
+   * its cost tracks what the
    * session needs (objects' chains + roster), never the scope's size —
    * the Phase-0 `closure` invariant. Empty `objects` = roster-only
    * backfill (the selfSubscribe case).
@@ -6769,17 +6803,16 @@ export class NetGatewayDO {
     advanceSeen: boolean
   ): void {
     const view = this.ensureView();
+    if (advanceSeen && transfer.relations === undefined) {
+      throw new Error(`targeted closure for ${transfer.scope} omitted its complete relation family`);
+    }
     this.discardViewOnThrow(() =>
       this.state.storage.transactionSync(() => {
-        for (const cell of transfer.cells) {
-          this.invalidateRoomPresentationActor(cell);
-          view.install(cell);
-          this.persistCell(view, cell.key);
+        this.installTransferredCells(view, transfer.cells, transfer.scope, undefined, true);
+        if (advanceSeen) {
+          this.replaceScopeRelations(transfer.scope, transfer.relations ?? []);
+          this.advanceSeen(transfer.scope, transfer.head.seq);
         }
-        for (const row of transfer.relations ?? []) {
-          this.applyRelationDelta({ op: "add", row });
-        }
-        if (advanceSeen) this.advanceSeen(transfer.scope, transfer.head.seq);
       })
     );
     if (advanceSeen) this.completeHeads.delete(transfer.scope);
@@ -6800,33 +6833,19 @@ export class NetGatewayDO {
       catalog_epoch: string;
       relations?: RelationRow[];
     };
+    if (transfer.relations === undefined) {
+      throw new Error(`full closure for ${transfer.scope} omitted its complete relation family`);
+    }
     this.discardViewOnThrow(() =>
       this.state.storage.transactionSync(() => {
-        // `known` makes the transfer partial: absence then means "receiver
-        // already knows it", not authoritative deletion. Exact catalog
-        // cleanup is safe only for an unfiltered full closure.
-        if (known.length === 0) this.removeAbsentCatalogDefinitions(view, transfer.scope, transfer.cells);
-        for (const cell of transfer.cells) {
-          view.install(cell);
-          this.persistCell(view, cell.key);
-        }
-        // CO13: the full closure carries the scope's relation rows —
-        // upsert them into the mirror in the same transaction. Required
-        // for coherence with fix 7 below: advancing the high-water
-        // no-ops every earlier relation fanout/refan, so without this
-        // the mirror would silently lose the rows those deliveries
-        // carried. Upsert-only: a mirror row deleted at the authority
-        // while this gateway was unsubscribed lingers until a later
-        // remove delta (seq above the new high-water) heals it — a
-        // fresh shard's mirror is exact, which is the pull-on-miss case
-        // this exists for.
-        for (const row of transfer.relations ?? []) {
-          this.applyRelationDelta({ op: "add", row });
-        }
-        // Fix 7: the closure carries the scope's head — the view now IS
-        // the state at that head, so the fanout high-water advances with
-        // it (same transaction as the install). A stale pre-pull fanout
-        // row then no-ops by seq instead of regressing the fresh view.
+        // `keys: ["*"]` is exact for every cell this scope owns. `known`
+        // only relieves foreign lineage closure; it never filters the scope's
+        // own requested keys, so replacement remains required.
+        this.replaceScopeCells(view, transfer.scope, transfer.cells);
+        this.replaceScopeRelations(transfer.scope, transfer.relations ?? []);
+        // The closure image and its high-water advance are one durable
+        // replacement. A stale pre-pull fanout then no-ops without
+        // preserving any member deleted before this exact head.
         this.advanceSeen(transfer.scope, transfer.head.seq);
       })
     );
@@ -6834,27 +6853,111 @@ export class NetGatewayDO {
     return transfer;
   }
 
-  /** A full catalog closure is authoritative for the complete bootstrap
-   * definition set, not merely an upsert batch. Remove verb and property-
-   * catalog-scoped definition pages absent from that closure before installing
-   * it so an aged/offline gateway cannot resurrect a retired v1 definition
-   * after missing the ordered removal fanout. Runtime-authored definitions on
-   * ordinary objects are not members of the catalog image and retain their
-   * existing upsert posture. */
-  private removeAbsentCatalogDefinitions(view: CellStore, scope: string, cells: readonly Cell[]): void {
-    if (scope !== CATALOG_SCOPE) return;
-    const isDefinition = (cell: Cell): boolean => {
-      if (cell.kind === "verb_bytecode") return true;
-      if (cell.kind !== "property_cell" || !cell.value || typeof cell.value !== "object" || Array.isArray(cell.value)) {
-        return false;
+  /** One classifier over the already-installed transfer image. Building it
+   * after every cell is present lets a child that sorts before its anchor use
+   * the same closed lineage as planning, while the classifier's memo keeps the
+   * ownership materialization proportional to the transferred object graph. */
+  private viewClassifier(view: CellStore): ScopeClassifier {
+    return classifierFromLineage(
+      (object) => (view.get(cellKey("object_lineage", object))?.value as AnchorLineage | undefined) ?? null
+    );
+  }
+
+  /** Durable owner of one transferred cache cell.
+   *
+   * Normal object and session cells are classified from the transfer's closed
+   * lineage. Source-authoritative cells may use the responding scope as their
+   * fallback (logs have no lineage by definition). A derived rider may NOT use
+   * that fallback: falsely assigning a foreign stale row to the pulled scope
+   * could let a later pull of its real owner certify it. An unclassifiable
+   * derived rider returns null and is discarded as a repairable cache miss. */
+  private transferredCellOwnerScope(
+    cell: Cell,
+    sourceScope: string | undefined,
+    classifier: ScopeClassifier
+  ): string | null {
+    if (cell.kind === "log") {
+      if (sourceScope !== undefined) return sourceScope;
+      throw netError("E_LINEAGE", "transferred log cell has no source scope", { key: cell.key });
+    }
+    const sessionActor = cell.kind === "session"
+      ? (cell.value as { actor?: unknown } | null | undefined)?.actor
+      : undefined;
+    const object = cell.kind === "session"
+      ? (typeof sessionActor === "string" && sessionActor.length > 0 ? sessionActor : null)
+      : cell.object;
+    if (object !== null) {
+      try {
+        return classifier.scopeOf(object);
+      } catch {
+        if (cell.provenance !== "authoritative") return null;
       }
-      const def = (cell.value as { def?: unknown }).def;
-      return Boolean(def && typeof def === "object" && !Array.isArray(def));
-    };
-    const present = new Set(cells.filter(isDefinition).map((cell) => cell.key));
-    for (const key of [...view.keys()]) {
-      const local = view.get(key);
-      if (!local || !local.object.startsWith("$") || !isDefinition(local) || present.has(key)) continue;
+    }
+    if (cell.provenance === "authoritative" && sourceScope !== undefined) return sourceScope;
+    // A scope may carry foreign rider residue whose lineage lives only at its
+    // real owner. Without that lineage this gateway cannot assign an owner
+    // safely. The row is only a derived cache, so dropping it is conservative:
+    // a later read repairs from authority, while retaining it could eventually
+    // let the real owner's complete-head certificate bless a stale value.
+    return null;
+  }
+
+  /** Install and persist one closure/fanout cell family with a non-null,
+   * indexed owner scope. `installedProvenance` changes only the cache copy's
+   * provenance (KV seed); ownership still uses the wire cell so the source's
+   * authoritative marker remains available for the safe fallback above. */
+  private installTransferredCells(
+    view: CellStore,
+    cells: readonly Cell[],
+    sourceScope?: string,
+    installedProvenance?: Cell["provenance"],
+    invalidatePresentation = false
+  ): Set<string> {
+    for (const cell of cells) {
+      if (invalidatePresentation) this.invalidateRoomPresentationActor(cell);
+      view.install(installedProvenance === undefined ? cell : { ...cell, provenance: installedProvenance });
+    }
+    const classifier = this.viewClassifier(view);
+    const installed = new Set<string>();
+    for (const cell of cells) {
+      const ownerScope = this.transferredCellOwnerScope(cell, sourceScope, classifier);
+      if (ownerScope === null) {
+        view.delete(cell.key);
+        this.persistCell(view, cell.key);
+      } else {
+        this.persistCell(view, cell.key, ownerScope);
+        installed.add(cell.key);
+      }
+    }
+    return installed;
+  }
+
+  /** Install one unfiltered scope closure as an EXACT replacement.
+   *
+   * `completeHeads` lets the planner omit every ordinary read whose object
+   * the CO15 classifier assigns to this scope. Therefore the same ownership
+   * rule defines the negative half of the certificate: any locally held cell
+   * assigned to `scope` but absent from the transfer must be deleted before
+   * the certificate is installed. Session cells classify through the actor
+   * named in their value, matching CO14 partitioning; this also prevents an
+   * exact cluster pull from retaining an expired authentication row.
+   *
+   * `owner_scope` is materialized on every cache install, so the negative set
+   * is one indexed query over this scope's rows — never a gateway-wide scan.
+   * Full repair therefore stays O(scope image), the CO11 bound. */
+  private replaceScopeCells(
+    view: CellStore,
+    scope: string,
+    cells: readonly Cell[],
+    installedProvenance?: Cell["provenance"]
+  ): void {
+    const present = this.installTransferredCells(view, cells, scope, installedProvenance);
+    const owned = sqlRows<{ key: string }>(
+      this.state.storage.sql.exec("SELECT key FROM net_gateway_cell WHERE owner_scope = ?", scope)
+    );
+    for (const { key } of owned) {
+      if (present.has(key)) continue;
+      this.invalidateRoomPresentationActorKey(key);
       view.delete(key);
       this.persistCell(view, key);
     }
@@ -6901,9 +7004,16 @@ export class NetGatewayDO {
           this.deliverySeen.set(body.scope, body.delivery_seq);
         }
         if (advanced) {
+          const classifier = this.viewClassifier(view);
           for (const cell of body.cells) {
             this.invalidateRoomPresentationActor(cell);
-            this.persistCell(view, cell.key);
+            const ownerScope = this.transferredCellOwnerScope(cell, body.scope, classifier);
+            if (ownerScope === null) {
+              view.delete(cell.key);
+              this.persistCell(view, cell.key);
+            } else {
+              this.persistCell(view, cell.key, ownerScope);
+            }
           }
           for (const key of body.removed_cells ?? []) {
             this.invalidateRoomPresentationActorKey(key);
@@ -6914,7 +7024,7 @@ export class NetGatewayDO {
           // mirror never double-applies. applyFanout itself stays
           // cell-only (relation rows are not cells); the shell owns the
           // mirror table.
-          for (const delta of body.relations ?? []) this.applyRelationDelta(delta);
+          for (const delta of body.relations ?? []) this.applyRelationDelta(delta, body.scope);
         }
         // A pull may already have superseded this row's authority state,
         // but receiving it still advances outbox continuity. Persist both
@@ -6959,10 +7069,27 @@ export class NetGatewayDO {
     return applied;
   }
 
+  /** Replace exactly one scope's relation family before advancing its
+   * fanout high-water. `owner_scope` is materialized from the authoritative
+   * transfer source, so the indexed delete never enumerates other scopes.
+   * The v2 cache migration discarded pre-owner_scope rows and their matching
+   * high-waters, so there is no unindexed legacy residue to scan here. */
+  private replaceScopeRelations(scope: string, rows: readonly RelationRow[]): void {
+    const present = new Set(rows.map((row) => relationKey(row.relation, row.owner, row.member)));
+    const owned = sqlRows<{ key: string }>(
+      this.state.storage.sql.exec("SELECT key FROM net_gateway_relation WHERE owner_scope = ?", scope)
+    );
+    for (const { key } of owned) {
+      if (!present.has(key)) this.state.storage.sql.exec("DELETE FROM net_gateway_relation WHERE key = ?", key);
+    }
+    for (const row of rows) this.applyRelationDelta({ op: "add", row }, scope);
+  }
+
   /** One relation delta into the mirror table (add = upsert, remove =
    * delete; both idempotent, matching applyRelationDeltas' semantics at
-   * the owning scope). */
-  private applyRelationDelta(delta: RelationDelta): void {
+   * the owning scope). The fanout/closure source is the authoritative owner
+   * scope and is materialized on every row. */
+  private applyRelationDelta(delta: RelationDelta, sourceScope: string): void {
     const key = relationKey(delta.row.relation, delta.row.owner, delta.row.member);
     if (delta.op === "add") {
       this.state.storage.sql.exec(
@@ -6972,7 +7099,7 @@ export class NetGatewayDO {
         delta.row.owner,
         delta.row.member,
         delta.row.body !== undefined ? JSON.stringify(delta.row.body) : null,
-        this.ownerScopeFor(delta.row.owner),
+        sourceScope,
         delta.row.member_scope ?? null
       );
     } else {
@@ -7048,14 +7175,20 @@ export class NetGatewayDO {
     return view;
   }
 
-  /** Write-through for one view cell (installed or deleted). */
-  private persistCell(view: CellStore, key: string): void {
+  /** Write-through for one view cell (installed or deleted). Inserts require
+   * their materialized authority scope: exact full-pull replacement relies on
+   * this index and must never fall back to a gateway-wide classification scan. */
+  private persistCell(view: CellStore, key: string, ownerScope?: string): void {
     const cell = view.get(key);
     if (cell) {
+      if (ownerScope === undefined) {
+        throw netError("E_LINEAGE", "gateway cell insert omitted owner scope", { key });
+      }
       this.state.storage.sql.exec(
-        "INSERT INTO net_gateway_cell (key, body) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET body = excluded.body",
+        "INSERT INTO net_gateway_cell (key, body, owner_scope) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET body = excluded.body, owner_scope = excluded.owner_scope",
         key,
-        JSON.stringify(cell)
+        JSON.stringify(cell),
+        ownerScope
       );
     } else {
       this.state.storage.sql.exec("DELETE FROM net_gateway_cell WHERE key = ?", key);

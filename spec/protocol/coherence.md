@@ -374,8 +374,26 @@ buried in VTN):
   `read_version_mismatch`.
 - **Complete-head compaction is an exact-generation CAS, never a rebase.** A
   gateway that holds the complete owner closure at the submit base may omit
-  ordinary same-owner reads. The scope accepts that compact proof only when
-  `(seq, hash, generation)` still equals current authority. `generation`
+  ordinary same-owner reads. Installing that closure is replacement, not
+  upsert: in the same durable transaction, the gateway removes every locally
+  held cell classified to that scope but absent from the unfiltered transfer,
+  replaces the scope-owned relation family, and only then advances the fanout
+  high-water. The complete-head certificate is installed only after that
+  transaction succeeds. `known` can relieve foreign lineage closure but does
+  not filter the full request's scope-owned keys, so the receiver still
+  replaces the scope image; conservatively, only a full pull with no receiver
+  assumptions mints the certificate. Keyed and targeted closures are not
+  exact cell-membership images and never replace or certify unrequested
+  cells. Gateways materialize each installed cell's authority scope and index
+  exact replacement by that field, so repairing one scope never enumerates the
+  shard's other cached scopes. A transferred derived rider whose ownership
+  cannot be proven from closed lineage is discarded as a repairable cache
+  miss, never guessed into the responding scope. The gateway cache's v1→v2
+  migration clears derived cells, relation mirrors, and their high-waters
+  together before rebuilding them with materialized ownership; preserving a
+  high-water across that reset could suppress its repairing fanout. The scope
+  accepts a compact proof only when `(seq, hash, generation)` still equals
+  current authority. `generation`
   advances on every authoritative mutation, including seed and activation
   writes that deliberately leave `(seq, hash)` unchanged. Session reads and
   sequenced `next_seq` allocation reads remain explicit. A stale-head refusal
@@ -614,11 +632,13 @@ One write path per fact (CO9), concretized:
   definition kind on installed `$` objects at catalog authority. It advances
   the catalog head once, durably appends the tail event, and refans replacements
   plus removed cell keys under the same high-water. An unchanged replay is a
-  no-op. A later full catalog pull also removes local verb/property definition
-  pages on `$` catalog objects that are absent from the authoritative closure,
-  covering gateways that were offline for the fanout. Definition-shaped cells
-  authored at runtime on ordinary objects, as well as ordinary instance
-  property cells, are outside the catalog image and remain untouched.
+  no-op. A later full catalog pull performs the general exact-scope
+  replacement: every locally held catalog-owned cell absent from the
+  authoritative closure is removed, covering gateways that were offline for
+  any cell-removal fanout. Cells classified to another scope or
+  transferred as unclassifiable derived rider residue remain outside that
+  catalog image; the former stay untouched, and the latter are discarded as a
+  repairable cache miss.
   The operator script requires an explicit `$object:verb` or
   `prop:$object:name` allow-list, obtains replacements from the fresh local
   install plan, and permits drops only when a bundled migration declares the
@@ -731,20 +751,22 @@ One write path per fact (CO9), concretized:
 - **The gateway mirror** is fed by `FanoutBody.relations` (a commit's
   local deltas, or a `/net/relate` refan) under the same per-scope seq
   high-water that gates cells, plus one coherence companion: a closure
-  that advances the high-water carries the scope's relation rows,
-  upserted in the same transaction. That is the FULL closure
-  (`keys: ["*"]` — the repair/reseed state transfer) and, since the
+  that advances the high-water carries the scope's **complete** relation
+  family. The gateway transactionally removes that scope's old rows, installs
+  the returned rows, and only then advances the high-water. That is the FULL
+  closure (`keys: ["*"]` — the repair/reseed state transfer) and, since the
   ready-to-scale Phase 4, the TARGETED cold-open closure
   (`objects: [...], relations: true` — the named objects' class+anchor
   chains, their actors' session cells, and the roster; the client
   cold-open's cost tracks the session's need, never the scope's size).
   Required because a pull supersedes earlier fanout rows by seq —
   without the rows riding the closure, a pull would silently starve the
-  mirror of everything those deliveries carried; a targeted pull's
-  un-copied cells are ABSENT at the receiver, and absent is never stale
-  (pull-on-miss and read-version checks own them). Upsert-only: a row
-  deleted at the authority while the gateway was unsubscribed lingers
-  until a later remove delta heals it; a fresh shard's mirror is exact.
+  mirror of everything those deliveries carried. A targeted pull does not
+  certify or replace unrequested cells; pull-on-miss and read-version checks
+  own their freshness. Relation replacement is nevertheless required because
+  that targeted pull advances the same high-water: a row absent from its
+  complete relation family is deleted before a delayed removal at or below
+  that head can be suppressed.
   `GET /net/relation?relation=&owner=` is the client-read primitive for
   who/contents.
 - **Every gateway that warms the catalog subscribes to catalog fanout.**

@@ -301,7 +301,10 @@ describe("load:net-skew — skewed-workload bounds (NC8)", () => {
     // present sessions in the hot room plus 3x as many sessions mirrored
     // for OTHER scopes — the scan must stay O(room occupants).
     const gw = h.gateway as unknown as {
-      applyRelationDelta(delta: { op: "add"; row: { relation: string; owner: string; member: string; body?: unknown } }): void;
+      applyRelationDelta(
+        delta: { op: "add"; row: { relation: string; owner: string; member: string; body?: unknown } },
+        sourceScope: string
+      ): void;
     };
     for (let i = 0; i < OCCUPANTS; i += 1) {
       gw.applyRelationDelta({
@@ -312,7 +315,7 @@ describe("load:net-skew — skewed-workload bounds (NC8)", () => {
           member: `s_test_${i}`,
           body: { actor: h.guests[i % h.guests.length] }
         }
-      });
+      }, h.roomScope);
     }
     for (let i = 0; i < OCCUPANTS * 3; i += 1) {
       gw.applyRelationDelta({
@@ -323,7 +326,7 @@ describe("load:net-skew — skewed-workload bounds (NC8)", () => {
           member: `s_away_${i}`,
           body: { actor: "nobody" }
         }
-      });
+      }, "room:skew_annex");
     }
 
     // One turn in the hot room; its fanout returns to this gateway

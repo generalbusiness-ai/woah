@@ -326,7 +326,8 @@ describe("accepted session echo", () => {
         session: string,
         value: unknown,
         reply: Extract<CommitReply, { status: "accepted" }>,
-        epoch: string
+        epoch: string,
+        clusterScope: string
       ): void;
     };
     const session = "s_net-api-3_echo";
@@ -343,7 +344,7 @@ describe("accepted session echo", () => {
       head: { seq: 1, hash: "accepted-head" },
       touched: [`session:${session}`],
       post_state_version: "accepted-post"
-    }, EPOCH);
+    }, EPOCH, "cluster:echo_actor");
 
     // Reconstruct the gateway from SQLite: this proves the fallback is a
     // durable derived copy, not only an in-memory escape hatch.

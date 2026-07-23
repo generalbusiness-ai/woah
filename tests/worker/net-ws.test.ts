@@ -915,6 +915,10 @@ describe("observation push via session_presence (Phase 4 item 3 chunk 2)", () =>
     expect(peerAttempt?.replayed).not.toBe(true);
     expect(peerAttempt?.result).toBe(2);
 
+    // The peer turn queued its ordinary fanout. Drain it before closing the
+    // fake SQLite stores so the test cannot hide a post-assertion delivery
+    // failure behind waitUntil teardown.
+    await h.settle();
     h.close();
   });
 });
