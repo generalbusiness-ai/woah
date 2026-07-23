@@ -405,7 +405,10 @@ buried in VTN):
   session transition, or untracked effects returns accepted at the current
   head without advancing it or recording an idempotency reply. Repeating such
   a request safely re-reads current authority; concurrent view readers do not
-  manufacture contending scope commits.
+  manufacture contending scope commits. If that validated transcript emitted
+  live observations, the scope may relay them best-effort to its bounded
+  fanout-role gateway registry, but MUST NOT create a sequence, reply-cache
+  entry, outbox row, authority cell, relation row, or gateway high-water.
 
 If validation fails, no write from the transcript commits; the gateway
 repairs its planning state (per the reply's taxonomy code) and retries the
@@ -952,6 +955,19 @@ One write path per fact (CO9), concretized:
     Delivery is never durable: the per-scope seq gate drops
     redeliveries, dead sockets are skipped, and missed-observation
     catch-up is deliberately NOT promised in Phase 4.
+  - **Direct live observation delivery:** an accepted effect-free direct turn
+    uses the same CO13 presence mirror but a separate unsequenced carrier.
+    The validating scope sends `{type:"live_observations", scope, echo_id?,
+    observations}` best-effort to the bounded fanout-role gateway shard
+    registry; the origin gateway delivers its own slice only after the scope
+    replies, avoiding a gateway→scope→origin RPC cycle. The carrier has no
+    `seq`, never enters the durable outbox, never advances a gateway
+    high-water, and a disconnected recipient loses it. Presence-derived
+    audience enumerations are not completeness proofs: every destination
+    shard resolves `presence` mode against its own scope-indexed relation
+    slice. Explicit/private audiences retain actor/session filtering. The
+    submitting client gets the full observation on `turn_result`; the shared
+    echo digest suppresses a redundant live frame during rolling failure.
   - **Installed catalog read:** authenticated clients may read the bounded
     `$catalog_registry.installed_catalogs` value through `GET /net-api/catalogs`.
     The response exposes ledger records only, not the property cell definition

@@ -179,11 +179,12 @@ path uses these lanes in increasing fidelity:
 1. `npm test` / `npm run test:worker` — in-process fake DOs
    (`tests/worker/fake-do.ts`). Fast, but they lack cold starts, real RPC
    isolation, and serialization boundaries.
-2. `npm run smoke:net-dev` — **real workerd** via `wrangler dev`
+2. `npm run smoke:net-dev` and `npm run smoke:net-mcp` — **real workerd** via `wrangler dev`
    (`wrangler.smoke.toml`): real per-DO storage, cross-DO RPC, and host-seed
-   merge. Run it before Cloudflare.
-3. `npm run smoke:net-mcp` (the deployed walkthrough) — MCP HTTP against the
-   deployed worker. This is the most expensive lane.
+   merge. The latter drives the shared MCP walkthrough through `/net-api/mcp`.
+   Run both before Cloudflare.
+3. `npm run smoke:walkthrough` — MCP HTTP against the deployed worker. This is
+   the most expensive lane.
 
 The classic `smoke:cf-local` / `smoke:cf-dev` commands were retired with the
 classic stack; do not resurrect them.
@@ -231,6 +232,7 @@ must include a vitest case before it lands.
 - `npm run guard:object-names` enforces a subset of the naming rule.
 - `npm run guard:catalog-migrations` requires a `migration-v(N-1)-to-vN.json` for every bundled catalog at major version N.
 - `npm test` — fast guarded Vitest gate (runs `catalog:index` and all guards first).
+- `npm run test:acts` — guarded Acts release gate: kernel, Outliner behavior and migrations, movement, Net convergence, relation replacement, and gateway cache migration.
 - `npm run test:guards` — catalog index/check plus all local guard scripts.
 - `npm run test:files -- tests/name.test.ts` — targeted Vitest files for the code just changed.
 - `npm run test:worker` — slow Worker/Cloudflare-shape and MCP smoke Vitest lane.
@@ -242,7 +244,8 @@ must include a vitest case before it lands.
 **Net coherence path** (spec/protocol/coherence.md, spec/operations/net-cutover.md):
 
 - `npm run install:net-dev` — seed + activate a net world on the workerd net lane.
-- `npm run smoke:net-dev` / `npm run smoke:net-mcp` — net cross-actor smoke on workerd / deployed MCP.
+- `npm run smoke:net-dev` / `npm run smoke:net-mcp` — Net protocol and shared MCP walkthroughs on workerd.
+- `npm run smoke:walkthrough` — shared cross-actor MCP walkthrough against the deployed worker.
 - `npm run load:net-dev` / `npm run load:net-skew` — concurrency + skewed-load drivers.
 - `npm run load:net-canary` — the deployed acceptance-canary load driver.
 - `npm run metrics:net-ae` — read the Analytics Engine acceptance gate (global-weighted p99 + per-shard diagnostics; defaults to dataset `woo_v1_net_canary`).

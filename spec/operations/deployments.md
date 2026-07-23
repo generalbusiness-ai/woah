@@ -69,7 +69,10 @@ This section does **not** apply to in-memory or local SQLite modes. Those runtim
      `wrangler dev` ([`scripts/net-smoke-workerd.ts`](../../scripts/net-smoke-workerd.ts)):
      real per-DO storage, cross-DO RPC across `NetScopeDO`/`NetGatewayDO`, and
      host-seed merge. Catches storage/RPC/merge regressions before a real deploy.
-  2. `npm run smoke:net-mcp` / the deployed walkthrough
+  2. `npm run smoke:net-mcp` — the same shared scenario over `/net-api/mcp`
+     under real workerd
+     ([`scripts/net-mcp-walkthrough.ts`](../../scripts/net-mcp-walkthrough.ts)).
+  3. `npm run smoke:walkthrough` — the deployed walkthrough
      ([`scripts/smoke-walkthrough.ts`](../../scripts/smoke-walkthrough.ts)) over
      MCP HTTP against the deployed worker — the most expensive lane.
 

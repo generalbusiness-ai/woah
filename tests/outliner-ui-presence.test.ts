@@ -152,6 +152,52 @@ describe("outliner-tree presence aside", () => {
     expect(element.querySelector(".presence-list")?.textContent).toContain("Guest One");
   });
 
+  it("retries a cold tree_view after outliner presence becomes authoritative", async () => {
+    let treeReads = 0;
+    const directCall = vi.fn(async (_subject: string, verb: string) => {
+      if (verb === "room_roster") return [{ id: "guest_1", name: "Guest One", presence: "online" }];
+      if (verb !== "tree_view") return undefined;
+      treeReads += 1;
+      if (treeReads === 1) throw new Error("actor is not present yet");
+      return {
+        items: [{
+          id: "item_1",
+          name: "item_1",
+          text: "authoritative after enter",
+          parent_id: null,
+          index: 0,
+          hidden: false,
+          owner: "guest_1",
+          writers: [],
+          has_children: false
+        }],
+        structure_at_seq: 1
+      };
+    });
+    const element = document.createElement("woo-outliner-tree") as WooOutlinerTreeElement & {
+      showCompanion: boolean;
+      subject: string;
+    };
+    element.subject = "the_outline";
+    element.woo = ctx({}, {
+      refs: ["the_outline"],
+      projections: {
+        the_outline: { id: "the_outline", name: "Outline", props: {}, catalogState: {} }
+      },
+      directCall
+    });
+    document.body.append(element);
+    await flushPromises();
+    expect(treeReads).toBe(1);
+    expect(element.querySelector("[data-outliner-row]")).toBeNull();
+
+    element.showCompanion = true;
+    await flushPromises();
+
+    expect(treeReads).toBe(2);
+    expect(element.querySelector("[data-outliner-row]")?.textContent).toContain("authoritative after enter");
+  });
+
   it("shows the present actor and retries when the first roster read fails", async () => {
     const directCall = vi.fn(async (_subject: string, verb: string) => {
       if (verb === "room_roster") throw new Error("owner projection not ready");

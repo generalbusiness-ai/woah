@@ -223,8 +223,13 @@ export class WooOutlinerTreeElement extends HTMLElement {
     this.render();
     // The host flips this only after movement into the outliner has settled.
     // Hydrate then, not during the earlier cold projection mount, so the roster
-    // cannot be memoized as empty just before the actor enters.
-    if (next) this.requestRosterFromServer();
+    // cannot be memoized as empty just before the actor enters. The tree read
+    // has the same boundary: a cold pre-presence read can fail or observe an
+    // incomplete gateway image, so presence must advance its view generation.
+    if (next) {
+      this.tree.refresh();
+      this.requestRosterFromServer();
+    }
     else this.clearRosterRetry();
   }
 

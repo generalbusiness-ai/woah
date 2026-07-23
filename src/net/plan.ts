@@ -39,6 +39,7 @@ import type { Principal } from "./attribution";
 import { CellStore, cellKey, cellVersion, type Cell, type EpochStamp } from "./cells";
 import type { TraceContext } from "./trace";
 import { isNetError, netError, type NetError } from "./errors";
+import type { LiveAudience } from "./live";
 import type { OrderedNeighborsQuery, OrderedNeighborsRequest, OrderedProjectionKey } from "./ordered-edges";
 import { validReplayPageQuery, type ReplayPageQuery } from "./replay-pages";
 import { selectCommitScope, type ScopeClassifier, type ScopeSelection } from "./route";
@@ -156,6 +157,11 @@ export type PlanTurnResult = {
    * stay flat as the view grows — the load gate's blocker-#1 invariant.
    * On the default path it is the full `view.clone()`, O(view). */
   snapshotCells: number;
+  /** Non-authoritative routing hints computed by the direct-call runtime.
+   * They never enter the transcript/hash; a scope uses them only after it
+   * validates an effect-free direct turn, then discards them after live
+   * best-effort fanout. */
+  liveAudience?: LiveAudience;
 };
 
 export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
@@ -400,7 +406,22 @@ export async function planTurn(input: PlanTurnInput): Promise<PlanTurnResult> {
     transcript,
     ownedReadsCompacted,
     planCells: planInput.length,
-    snapshotCells: planStore.size
+    snapshotCells: planStore.size,
+    ...(call.route === "direct" && run.frame.op === "result"
+      ? {
+          liveAudience: {
+            ...(run.frame.audienceActors !== undefined ? { audienceActors: run.frame.audienceActors } : {}),
+            ...(run.frame.observationAudiences !== undefined ? { observationAudiences: run.frame.observationAudiences } : {}),
+            ...(run.frame.audienceSessions !== undefined ? { audienceSessions: run.frame.audienceSessions } : {}),
+            ...(run.frame.observationSessionAudiences !== undefined
+              ? { observationSessionAudiences: run.frame.observationSessionAudiences }
+              : {}),
+            ...(run.frame.observationAudienceModes !== undefined
+              ? { observationAudienceModes: run.frame.observationAudienceModes }
+              : {})
+          }
+        }
+      : {})
   };
 }
 

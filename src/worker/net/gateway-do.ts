@@ -11,6 +11,8 @@
  *       POST /net/fanout  FanoutBody → install cells, advance seen seq,
  *                         mirror relation deltas (CO13) under the same
  *                         high-water
+ *       POST /net/live    LiveFanoutBody → best-effort direct-observation
+ *                         delivery with no sequence or derived-state write
  *       GET  /net/relation ?relation=&owner= → the member rows of one
  *                         relation at one owner (the CO13 client-read
  *                         primitive for who/contents)
@@ -71,6 +73,7 @@ import { exportSpans, spanSampleRate } from "./span-export";
 import { adoptOrMintTraceContext, normalizeTraceContext, parseTraceparent, type TraceContext } from "../../net/trace";
 import { clampClientSessionTtl } from "../../net/client-session-policy";
 import { budgetExhausted, isNetError, netError, nonconvergentRead, NetError, type AttemptTraceEntry, type NetErrorCode } from "../../net/errors";
+import type { LiveFanoutBody } from "../../net/live";
 import { applyFanout, type FanoutBody } from "../../net/outbox";
 import { observationsForRelationOwners, relationKey, roomRosterRows, SESSION_PRESENCE_RELATION, type RelationDelta, type RelationRow, type RoomRosterRow } from "../../net/relations";
 import { mintSessionSubmit, sessionCellKey, validateSessionCell } from "../../net/sessions";
@@ -892,6 +895,11 @@ export class NetGatewayDO {
         const body = (await request.json()) as FanoutBody;
         return json({ applied: this.receiveFanout(body) });
       }
+      if (request.method === "POST" && url.pathname === "/net/live") {
+        const body = (await request.json()) as LiveFanoutBody;
+        this.pushLiveObservations(body);
+        return json({ delivered: true });
+      }
       if (request.method === "POST" && url.pathname === "/net/pull") {
         const body = (await request.json()) as { scope: string; destination: string; known?: string[] };
         return json(await this.pull(body));
@@ -1662,10 +1670,13 @@ export class NetGatewayDO {
       // itself is unchanged — both are HTTP-body siblings, not sequencer
       // input.
       const relateDestinations = this.relateDestinationsFor(request, classifier, planned, targetScope);
+      const originGateway = this.selfDestination();
       const submitBody = {
         submit,
         rider_destinations: this.riderDestinationsFor(request, classifier, planned),
-        relate_destinations: relateDestinations
+        relate_destinations: relateDestinations,
+        ...(planned.liveAudience !== undefined ? { live_audience: planned.liveAudience } : {}),
+        ...(originGateway ? { origin_gateway: originGateway } : {})
       };
       // CO7: envelope_bytes is the ACTUAL serialized submit RPC body —
       // transcript, attestations, and rider/relation routing metadata —
@@ -1772,6 +1783,24 @@ export class NetGatewayDO {
         // output. (`post_state_version` equality is the fallback for a
         // scope that predates the flag — belt and suspenders.)
         const replayed = reply.replayed === true || reply.post_state_version !== submit.post_state_version;
+        const pureDirect =
+          request.call.route === "direct" &&
+          reply.head.seq === submit.base.seq &&
+          reply.head.hash === submit.base.hash &&
+          reply.head.generation === submit.base.generation;
+        if (pureDirect && !replayed && planned.transcript.observations.length > 0) {
+          // The scope excludes this origin shard to avoid a
+          // gateway→scope→same-gateway RPC cycle. Deliver its local session
+          // slice here, after validation returned; other shards receive the
+          // scope's independent best-effort /net/live calls.
+          this.pushLiveObservations({
+            scope: reply.scope,
+            observations: planned.transcript.observations,
+            submitter_turn_id: request.idempotency_key,
+            echo_id: turnEchoId(request.idempotency_key),
+            ...(planned.liveAudience ?? {})
+          });
+        }
         return {
           reply,
           selection: planned.selection,
@@ -2823,6 +2852,14 @@ export class NetGatewayDO {
     return typeof name === "string" && name.length > 0 ? name : null;
   }
 
+  /** RPC name by which scopes reach this concrete gateway shard. The
+   * environment value is only a legacy/test override; production derives
+   * the destination from the named Durable Object id. */
+  private selfDestination(): string | undefined {
+    const shard = this.shardName();
+    return this.env.NET_GATEWAY_SELF ?? (shard ? `gateway:${shard}` : undefined);
+  }
+
   /**
    * POST /net-api/login {email, password, ttl_ms?} — the identity door's
    * human half (§8 "humans re-authenticate by password"). Verifies the
@@ -3639,6 +3676,28 @@ export class NetGatewayDO {
       args
     } as const;
     let page = this.callVerbPage(this.ensureView(), validationCall);
+    // A relation/room closure may have installed only the target's lineage
+    // stub. That is enough to route the object but not enough to authorize a
+    // direct call: missing metadata must still fail closed, while a cold but
+    // valid target gets one bounded owner pull before the decision. Without
+    // this step the first direct call to a previously listed room member is
+    // spuriously E_DIRECT_DENIED forever (warmScopes sees the lineage and
+    // quite correctly avoids re-pulling the whole object).
+    if (route === "direct" && page === null) {
+      try {
+        await this.pullTargeted(planningScope, `scope:${planningScope}`, [target]);
+        page = this.callVerbPage(this.ensureView(), validationCall);
+      } catch (err) {
+        this.metric({
+          kind: "net_direct_metadata_pull_failed",
+          scope: planningScope,
+          target,
+          verb,
+          status: "error",
+          error: String(err)
+        });
+      }
+    }
     // A targeted room backfill can materialize an object's lineage without
     // every definition page. Only suspicious colon-bearing inputs pay for a
     // forced object closure; ordinary turns retain the warm zero-RPC path.
@@ -4265,16 +4324,18 @@ export class NetGatewayDO {
     });
   }
 
-  /** Fanout-side feed (called from pushObservations, AFTER the same
-   * server-side submitter echo dedupe the sockets get). Bounded buffer: overflow
-   * drops oldest — at-most-once live delivery, the socket rule. */
-  private mcpEnqueue(session: string, observations: unknown[]): void {
+  /** Fanout-side feed (called after the same server-side submitter echo
+   * dedupe the sockets get). Returns whether an MCP carrier accepted the
+   * observations so no-socket telemetry does not mislabel MCP-only delivery.
+   * Bounded buffer: overflow drops oldest — at-most-once live delivery. */
+  private mcpEnqueue(session: string, observations: unknown[]): boolean {
     const queue = this.mcpQueues.get(session);
-    if (!queue || observations.length === 0) return;
+    if (!queue || observations.length === 0) return false;
     queue.buffer.push(...observations);
     if (queue.buffer.length > MCP_QUEUE_CAP) queue.buffer.splice(0, queue.buffer.length - MCP_QUEUE_CAP);
     const waiters = queue.waiters.splice(0, queue.waiters.length);
     for (const wake of waiters) wake();
+    return true;
   }
 
   /** Lazily reconstruct live MCP transport state after a DO eviction. A
@@ -4956,10 +5017,22 @@ export class NetGatewayDO {
    *   Phase 4.
    */
   private pushObservations(body: FanoutBody): void {
+    this.pushScopedObservations(body, false);
+  }
+
+  /** Direct observations have no authority sequence and never touch the
+   * gateway cache/high-water. They share only the local presence lookup and
+   * socket/MCP carriers with committed fanout. */
+  private pushLiveObservations(body: LiveFanoutBody): void {
+    this.pushScopedObservations(body, true);
+  }
+
+  private pushScopedObservations(body: FanoutBody | LiveFanoutBody, live: boolean): void {
     // No WS surface (structural fakes / MCP-only runtimes) still feeds
     // the MCP wait queues — delivery has two carriers, one audience.
     const getSockets = this.state.getWebSockets?.bind(this.state);
     if (!Array.isArray(body.observations) || body.observations.length === 0) return;
+    const liveBody = live ? body as LiveFanoutBody : null;
     // Phase 2: filter by the materialized owner_scope (indexed) so the scan
     // is O(occupants of body.scope), NOT O(all mirrored sessions). The
     // owner→scope classification happened once at write time (ownerScopeFor).
@@ -4987,6 +5060,7 @@ export class NetGatewayDO {
     // the "fanout cost as audience grows" dashboard series.
     let deliveredMembers = 0;
     let framesSent = 0;
+    let mcpSessions = 0;
     for (const row of rows) {
       if (
         body.submitter_turn_id !== undefined
@@ -5000,24 +5074,49 @@ export class NetGatewayDO {
         body.echo_id !== undefined
         && this.mcpQueues.get(row.member)?.ownEchoIds.has(body.echo_id)
       ) continue;
-      // v2 audience parity (client-shell phase i): a `to:`-directed
-      // observation (looked/who — private views) reaches ONLY the session
-      // whose actor it names; everything else is the room broadcast. The
-      // engine's full audience model stays server-side — this filter only
-      // honors the explicit direction the observation itself carries.
       const actor = actorOf.get(row.member) ?? null;
-      const visible = (body.observations as Array<Record<string, unknown>>).filter(
-        (obs) => typeof obs?.to !== "string" || obs.to === actor
-      );
+      const visible = (body.observations as Array<Record<string, unknown>>).filter((obs, index) => {
+        if (live) {
+          const mode = liveBody?.observationAudienceModes?.[index];
+          if (mode === "presence") {
+            // The indexed query already selected sessions present in this
+            // scope. Re-resolve the audience on every shard: the planning
+            // gateway's enumerated room snapshot is not globally complete.
+            return !(
+              (obs.type === "entered" || obs.type === "left" || obs.type === "taken" || obs.type === "dropped")
+              && typeof obs.actor === "string"
+              && obs.actor === actor
+            );
+          }
+          // Explicit recipients retain both forms. A session match is most
+          // precise; actor fallback is safe because rows are already limited
+          // to this scope, so another tab for that actor elsewhere is absent.
+          const sessionAudience = liveBody?.observationSessionAudiences?.[index] ?? liveBody?.audienceSessions;
+          const actorAudience = liveBody?.observationAudiences?.[index] ?? liveBody?.audienceActors;
+          if (mode === "explicit") {
+            if (Array.isArray(sessionAudience) && sessionAudience.includes(row.member)) return true;
+            if (Array.isArray(actorAudience)) return actor !== null && actorAudience.includes(actor);
+            return Array.isArray(sessionAudience) ? false : typeof obs?.to !== "string" || obs.to === actor;
+          }
+          // Compatibility for older live carriers that predate the mode
+          // vector: preserve their session-first filtering contract.
+          if (Array.isArray(sessionAudience)) return sessionAudience.includes(row.member);
+          if (Array.isArray(actorAudience)) return actor !== null && actorAudience.includes(actor);
+        }
+        // Rolling/committed fallback for older carriers: looked/who-style
+        // `to` observations stay private; ordinary observations broadcast to
+        // every session present in this scope.
+        return typeof obs?.to !== "string" || obs.to === actor;
+      });
       if (visible.length === 0) continue;
       deliveredMembers += 1;
       // MCP wait queues ride the SAME audience + submitter dedupe as the
       // sockets (client-shell phase i).
-      this.mcpEnqueue(row.member, visible);
+      if (this.mcpEnqueue(row.member, visible)) mcpSessions += 1;
       const frame = JSON.stringify({
-        type: "observations",
+        type: live ? "live_observations" : "observations",
         scope: body.scope,
-        seq: body.seq,
+        ...(!live && "seq" in body ? { seq: body.seq } : {}),
         // SECURITY: never expose submitter_turn_id here. It is the scope's
         // idempotent-reply replay credential. echo_id is a one-way digest.
         ...(body.echo_id !== undefined ? { echo_id: body.echo_id } : {}),
@@ -5035,12 +5134,47 @@ export class NetGatewayDO {
     this.metric({
       kind: "net_push",
       scope: body.scope,
-      seq: body.seq,
+      ...(!live && "seq" in body ? { seq: body.seq } : {}),
+      route: live ? "live" : "committed",
       audience: rows.length,
       delivered_members: deliveredMembers,
       frames: framesSent,
+      mcp_sessions: mcpSessions,
       observations: body.observations.length
     });
+    if (getSockets && deliveredMembers > 0 && framesSent === 0 && mcpSessions === 0) {
+      // An audience with no live carrier is the actionable failure shape,
+      // but scanning the whole shard registry on every healthy push would
+      // violate the occupant-bounded hot path. Pay this diagnostic only on
+      // the anomaly and report counts, never bearer session ids.
+      const sockets = getSockets();
+      const attachments = sockets
+        .map((socket) => this.socketAttachment(socket))
+        .filter((attachment): attachment is GatewaySocketAttachment => attachment !== null);
+      const attachedSessions = new Set(attachments.map((attachment) => attachment.session));
+      const liveSessionAudience = new Set([
+        ...(liveBody?.audienceSessions ?? []),
+        ...(liveBody?.observationSessionAudiences ?? []).flat()
+      ]);
+      const liveActorAudience = new Set([
+        ...(liveBody?.audienceActors ?? []),
+        ...(liveBody?.observationAudiences ?? []).flat()
+      ]);
+      this.metric({
+        kind: "net_push_socket_miss",
+        scope: body.scope,
+        route: live ? "live" : "committed",
+        presence_rows: rows.length,
+        delivered_members: deliveredMembers,
+        sockets: sockets.length,
+        attached_sessions: attachedSessions.size,
+        presence_socket_matches: rows.filter((row) => attachedSessions.has(row.member)).length,
+        live_session_audience: liveSessionAudience.size,
+        live_actor_audience: liveActorAudience.size,
+        attached_session_audience_matches: attachments.filter(({ session }) => liveSessionAudience.has(session)).length,
+        attached_actor_audience_matches: attachments.filter(({ actor }) => liveActorAudience.has(actor)).length
+      });
+    }
   }
 
   /**
@@ -5081,11 +5215,10 @@ export class NetGatewayDO {
    * before registration.
    */
   private async selfSubscribe(scope: string): Promise<void> {
-    const shard = this.shardName();
     // Explicit override wins for fake harnesses and legacy one-shard
     // deployments whose DurableObjectId test label is not its route name.
     // Multi-shard deployments omit it and use the actual idFromName name.
-    const self = this.env.NET_GATEWAY_SELF ?? (shard ? `gateway:${shard}` : undefined);
+    const self = this.selfDestination();
     if (!self || this.selfSubscribed.has(scope)) return;
     this.selfSubscribed.add(scope);
     try {

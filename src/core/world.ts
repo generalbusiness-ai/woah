@@ -9,6 +9,7 @@ import {
   isErrorValue,
   valuesEqual,
   type AppliedFrame,
+  type DirectLiveAudience,
   type DirectResultFrame,
   type ErrorFrame,
   type ErrorValue,
@@ -4573,7 +4574,7 @@ export class WooWorld {
     // Cross-host bridge stashes authoritative audience info on ctx; prefer it
     // over recomputing locally where the local subscriber/presence view for
     // self-hosted spaces is stale.
-    const crossHostAudience = (dispatchCtx as { crossHostAudience?: { audienceActors?: ObjRef[]; observationAudiences?: ObjRef[][]; audienceSessions?: string[]; observationSessionAudiences?: string[][] } }).crossHostAudience;
+    const crossHostAudience = (dispatchCtx as { crossHostAudience?: DirectLiveAudience }).crossHostAudience;
     const liveAudiences = crossHostAudience ?? await this.directLiveAudiences(options.audience, observations);
     this.recordMetric({ kind: "direct_call", target, verb: verbName, audience: options.audience, observations: observations.length, ms: Date.now() - options.startedAt, status: "ok" });
     return {
@@ -4585,7 +4586,8 @@ export class WooWorld {
       audienceActors: liveAudiences.audienceActors,
       observationAudiences: liveAudiences.observationAudiences,
       audienceSessions: liveAudiences.audienceSessions,
-      observationSessionAudiences: liveAudiences.observationSessionAudiences
+      observationSessionAudiences: liveAudiences.observationSessionAudiences,
+      observationAudienceModes: liveAudiences.observationAudienceModes
     };
   }
 
@@ -9860,16 +9862,18 @@ export class WooWorld {
   // Compute the per-observation audience for a direct call from this host's
   // authoritative subscribers/presence view. Public so cross-host RPC handlers
   // can compute audience at the source DO before forwarding to broadcast.
-  async computeDirectLiveAudiences(audience: ObjRef | null, observations: Observation[]): Promise<{ audienceActors?: ObjRef[]; observationAudiences?: ObjRef[][]; audienceSessions?: string[]; observationSessionAudiences?: string[][] }> {
+  async computeDirectLiveAudiences(audience: ObjRef | null, observations: Observation[]): Promise<DirectLiveAudience> {
     return await this.directLiveAudiences(audience, observations);
   }
 
-  private async directLiveAudiences(audience: ObjRef | null, observations: Observation[]): Promise<{ audienceActors?: ObjRef[]; observationAudiences?: ObjRef[][]; audienceSessions?: string[]; observationSessionAudiences?: string[][] }> {
+  private async directLiveAudiences(audience: ObjRef | null, observations: Observation[]): Promise<DirectLiveAudience> {
     const actors = new Set<ObjRef>();
     const sessions = new Set<string>();
     const observationAudiences: ObjRef[][] = [];
     const observationSessionAudiences: string[][] = [];
+    const observationAudienceModes: DirectLiveAudience["observationAudienceModes"] = [];
     for (const observation of observations) {
+      observationAudienceModes.push(this.observationHasExplicitAudience(observation) ? "explicit" : "presence");
       const present = this.observationAudienceActors(audience, observation) ?? [];
       const presentSessions = await this.observationAudienceSessions(audience, observation) ?? [];
       observationAudiences.push(present);
@@ -9882,8 +9886,20 @@ export class WooWorld {
       audienceActors: actors.size > 0 ? Array.from(actors) : undefined,
       observationAudiences: observations.length > 0 ? observationAudiences : undefined,
       audienceSessions: sessions.size > 0 ? Array.from(sessions) : undefined,
-      observationSessionAudiences: observations.length > 0 ? observationSessionAudiences : undefined
+      observationSessionAudiences: observations.length > 0 ? observationSessionAudiences : undefined,
+      observationAudienceModes: observations.length > 0 ? observationAudienceModes : undefined
     };
+  }
+
+  /** Whether an observation names recipients independently of the audience
+   * space. Presence-derived enumerations are incomplete on a sharded planner
+   * and must be re-resolved locally by each delivery gateway. */
+  private observationHasExplicitAudience(observation: Observation): boolean {
+    if (Array.isArray((observation as Record<string, unknown>)._audience_override)) return true;
+    if ((observation.type === "looked" || observation.type === "who") && typeof observation.to === "string") return true;
+    if (directedRecipients(observation).to !== null) return true;
+    if (typeof observation.target !== "string") return false;
+    return !this.objects.has(observation.target) || this.inheritsFrom(observation.target, "$actor");
   }
 
   private appliedFrameAudience(space: ObjRef, observations: Observation[]): { audienceSessions?: string[]; observationSessionAudiences?: string[][] } {

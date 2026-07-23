@@ -95,7 +95,8 @@ A direct-call result carries two optional fields alongside `observations`:
     audience_actors:        [actor, ...],     // union of all per-observation audiences
     observation_audiences:  [[actor, ...], ...], // one entry per observation, parallel array
     audience_sessions:     [session, ...],
-    observation_session_audiences: [[session, ...], ...]
+    observation_session_audiences: [[session, ...], ...],
+    observation_audience_modes: ["presence" | "explicit", ...]
   }
   ```
 
@@ -104,7 +105,14 @@ session-scoped transports filter by session first; this is what keeps two tabs
 for the same actor in different spaces from receiving each other's room events.
 If only actor fields are present, transports filter by actor. If absent, a
 transport falls back to the original presence-based filter ("push to anyone with
-presence in the audience space").
+presence in the audience space"). The optional parallel mode vector makes this
+safe under sharded planning: `presence` says the enumerated identities are only
+the emitting runtime's local snapshot, so each destination shard resolves the
+observation against its own sessions present in the audience space. `explicit`
+says the observation named recipients (for example `_audience_override`,
+`looked`, `who`, `told`, or `text`), so the enumerated actor/session hints are
+the filter. A relay MUST NOT treat a `presence` enumeration as globally
+complete; that would silently omit occupants on other gateway shards.
 
 **How the audience is computed.** For each observation:
 

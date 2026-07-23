@@ -669,6 +669,40 @@ describe("NetFeed reads + cache", () => {
     expect(reads()).toBe(2);
   });
 
+  it("delivers unsequenced live observations with seq:null and invalidates reads", async () => {
+    const members = [{ member: "s_2", body: { actor: "#bob" } }];
+    const { feed, calls } = feedWith({
+      ...SESSION_ROUTE,
+      "GET /net-api/relation": () => ({ body: { relation: "session_presence", owner: "the_hall", members } })
+    });
+    const events: NetFeedObservationEvent[] = [];
+    feed.onObservation((event) => events.push(event));
+    await feed.open();
+    const socket = FakeSocket.instances[0];
+    socket.open();
+
+    await feed.relation("session_presence", "the_hall");
+    await feed.relation("session_presence", "the_hall");
+    const reads = () => calls.filter((call) => call.path.startsWith("/net-api/relation")).length;
+    expect(reads()).toBe(1);
+
+    socket.frame({
+      type: "live_observations",
+      scope: "room:the_hall",
+      observations: [{ type: "said", actor: "#bob", text: "hi" }]
+    });
+    expect(events).toEqual([
+      {
+        source: "peer",
+        scope: "room:the_hall",
+        seq: null,
+        observation: { type: "said", actor: "#bob", text: "hi" }
+      }
+    ]);
+    await feed.relation("session_presence", "the_hall");
+    expect(reads()).toBe(2);
+  });
+
   it("caches cell reads and invalidates when our own turn settles", async () => {
     const { feed, calls } = feedWith(
       {

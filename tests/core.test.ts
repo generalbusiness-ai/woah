@@ -2059,6 +2059,7 @@ describe("woo core", () => {
     if (said.op === "result") {
       expect(said.audienceSessions).toEqual([primary.id]);
       expect(said.observationSessionAudiences).toEqual([[primary.id]]);
+      expect(said.observationAudienceModes).toEqual(["presence"]);
     }
   });
 
@@ -2194,6 +2195,7 @@ describe("woo core", () => {
     if (result.op === "result") {
       expect(result.audienceSessions).toEqual([primary.id]);
       expect(result.observationSessionAudiences).toEqual([[primary.id]]);
+      expect(result.observationAudienceModes).toEqual(["explicit"]);
     }
   });
 

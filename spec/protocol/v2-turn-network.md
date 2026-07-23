@@ -1893,7 +1893,10 @@ events, it MUST preserve the observation's private or directed audience in
 `_audience_override` are internal routing data: they MUST be translated into
 the live event audience and MUST NOT be emitted inside `LiveEvent.observation`.
 An event with an explicit `actors` or `sessions` audience is not also delivered
-to its `scope` unless `audience.scope` is explicitly present.
+to its `scope` unless `audience.scope` is explicitly present. Conversely, a
+presence-derived audience MUST use `audience.scope`; a planner's local
+actor/session enumeration is not globally complete, so each destination relay
+resolves that scope against its own presence slice.
 
 `coalesce` is a sender-chosen ASCII key with grammar:
 

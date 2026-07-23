@@ -398,10 +398,29 @@ export async function runSmokeWalkthrough(
     await drain(bob, cfg, ctx.signal);
     const text = `outline-${runId}`;
     await alice.call("the_outline", "add_item", [text], ctx.signal);
-    // v3 emits outline_item_added as an act ({type, version, payload}); pre-v3
-    // worlds emit flat fields. Match either shape
-    // (catalogs/outliner/migration-v2-to-v3.json).
-    await waitFor(bob, (obs) => obs.type === "outline_item_added" && (obs.payload?.text ?? obs.text) === text, waitMs, ctx.signal, cfg);
+    // v3 deliberately keeps prose on the $outline_item artifact. The Act is
+    // the concise structural fact that tells peers WHICH artifact changed;
+    // tree_view is the authoritative read that supplies its current content.
+    const added = await waitFor(
+      bob,
+      (obs) => obs.type === "outline_item_added",
+      waitMs,
+      ctx.signal,
+      cfg
+    );
+    const payload = added.payload;
+    if (added.version !== 1 || !isRecord(payload)) {
+      throw new Error(`expected v1 outline_item_added Act; got ${JSON.stringify(added).slice(0, 600)}`);
+    }
+    const payloadKeys = Object.keys(payload).sort();
+    const expectedKeys = ["index", "item", "parent_id"];
+    if (JSON.stringify(payloadKeys) !== JSON.stringify(expectedKeys) ||
+        typeof payload.item !== "string" ||
+        (payload.parent_id !== null && typeof payload.parent_id !== "string") ||
+        !Number.isSafeInteger(payload.index)) {
+      throw new Error(`expected concise outline_item_added payload; got ${JSON.stringify(payload).slice(0, 600)}`);
+    }
+    await waitForOutlinerArtifact(bob, payload.item, text, waitMs, ctx.signal);
   });
 
   // Taskboard navigation: chatroom -> southeast -> the_deck -> south toward
@@ -492,6 +511,54 @@ async function waitFor(
   }
   const suffix = seen.length ? `; saw ${seen.slice(-12).join("; ")}` : "; saw no observations";
   throw new Error(`timeout after ${totalTimeoutMs}ms waiting for matching observation${suffix}`);
+}
+
+// An Act proves that a structural mutation committed, but its concise payload
+// intentionally does not duplicate note prose. Follow the artifact reference
+// through the consumer's authoritative tree read; polling covers the bounded
+// interval in which live Act fanout can arrive just before the refreshed scope
+// image is visible at that gateway.
+async function waitForOutlinerArtifact(
+  session: SmokeSession,
+  item: string,
+  expectedText: string,
+  totalTimeoutMs: number,
+  signal?: AbortSignal
+): Promise<void> {
+  const startedAt = Date.now();
+  let lastView = "no tree_view result";
+  while (Date.now() - startedAt < totalTimeoutMs) {
+    throwIfAborted(signal);
+    const view = await session.call("the_outline", "tree_view", [], signal);
+    if (!isRecord(view) || !Array.isArray(view.items)) {
+      throw new Error(`tree_view returned an invalid authoritative shape: ${JSON.stringify(view).slice(0, 600)}`);
+    }
+    const row = view.items.find((candidate: unknown) => isRecord(candidate) && candidate.id === item);
+    if (isRecord(row) && row.text === expectedText) return;
+    lastView = JSON.stringify(view).slice(0, 1000);
+    const remaining = totalTimeoutMs - (Date.now() - startedAt);
+    if (remaining > 0) await abortableDelay(Math.min(100, remaining), signal);
+  }
+  throw new Error(
+    `timeout after ${totalTimeoutMs}ms waiting for tree_view artifact ${item} ` +
+    `with text ${JSON.stringify(expectedText)}; last view=${lastView}`
+  );
+}
+
+async function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0) return;
+  throwIfAborted(signal);
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason instanceof Error ? signal.reason : new Error("operation aborted"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {

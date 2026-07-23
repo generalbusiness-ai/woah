@@ -21,6 +21,7 @@ let base = "";
 let child: ChildProcess | null = null;
 let persistDir = "";
 let credentials: { alice: string; bob: string } = { alice: "", bob: "" };
+const workerdFanoutDiagnostics: string[] = [];
 const legacyRequests = new WeakMap<Page, string[]>();
 
 /** Record named Net turn failures carried over WebSocket. HTTP response
@@ -28,8 +29,8 @@ const legacyRequests = new WeakMap<Page, string[]>();
  * left a failed component mutation looking like a generic DOM timeout. */
 type TrackedNetFrame = { id: string; verb?: string; error?: unknown; payload: string };
 
-function trackNetTurns(page: Page): { sent: TrackedNetFrame[]; received: TrackedNetFrame[] } {
-  const turns = { sent: [] as TrackedNetFrame[], received: [] as TrackedNetFrame[] };
+function trackNetTurns(page: Page): { sent: TrackedNetFrame[]; received: TrackedNetFrame[]; live: string[] } {
+  const turns = { sent: [] as TrackedNetFrame[], received: [] as TrackedNetFrame[], live: [] as string[] };
   page.on("websocket", (socket) => {
     socket.on("framesent", ({ payload }) => {
       if (typeof payload !== "string") return;
@@ -46,6 +47,10 @@ function trackNetTurns(page: Page): { sent: TrackedNetFrame[]; received: Tracked
       if (typeof payload !== "string") return;
       try {
         const frame = JSON.parse(payload) as { type?: unknown; id?: unknown; error?: unknown };
+        if (frame.type === "live_observations") {
+          turns.live.push(payload);
+          return;
+        }
         if (frame.type !== "turn_result" || typeof frame.id !== "string") return;
         turns.received.push({ id: frame.id, error: frame.error, payload });
       } catch {
@@ -96,7 +101,17 @@ test.beforeAll(async () => {
   // WOO_NET_DEFAULT: the deployment-controlled transport default
   // (reviewer finding 4) — the bare-/ door test depends on it; the
   // explicit ?net=1 tests are unaffected by it.
-  child = startWorkerd(port, persistDir, { WOO_NET_DEFAULT: "1" }, { extraArgs: ["--assets", join(ROOT, "dist")] });
+  child = startWorkerd(port, persistDir, { WOO_NET_DEFAULT: "1" }, {
+    extraArgs: ["--assets", join(ROOT, "dist")],
+    // Keep the bounded authority-side evidence that explains a peer timeout.
+    // The default harness drains workerd output but intentionally stays quiet;
+    // without this capture a browser miss cannot distinguish fanout from UI.
+    onLine: (line) => {
+      if (!/"kind":"net_(push(?:_socket_miss)?|scope_outbox_drain_pass|scope_subscribed|self_subscribe_failed)"/.test(line)) return;
+      workerdFanoutDiagnostics.push(line);
+      if (workerdFanoutDiagnostics.length > 80) workerdFanoutDiagnostics.shift();
+    }
+  });
   await waitReady(base);
 
   // 3. Install the world + carried identity through the production
@@ -124,9 +139,10 @@ async function openSpa(page: Page, apiKey: string): Promise<void> {
     localStorage.setItem("woo:net:apikey", key);
   }, apiKey);
   await page.goto(`${base}/?net=1`);
-  // The chat input renders once the shell boots in net mode; sends
-  // unlock when the feed reports open.
-  await expect(page.locator("[data-chat-input]")).toBeVisible({ timeout: 30_000 });
+  // The shell renders before NetFeed is writable. Visibility alone allowed a
+  // test (and a fast user) to race session subscription; the enabled composer
+  // is the public readiness boundary.
+  await expect(page.locator("[data-chat-input]")).toBeEnabled({ timeout: 30_000 });
 }
 
 async function openGuestSpa(page: Page): Promise<void> {
@@ -134,7 +150,7 @@ async function openGuestSpa(page: Page): Promise<void> {
   await page.goto(`${base}/?net=1`);
   await expect(page.locator("[data-login-guest]")).toBeVisible({ timeout: 30_000 });
   await page.locator("[data-login-guest]").click();
-  await expect(page.locator("[data-chat-input]")).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator("[data-chat-input]")).toBeEnabled({ timeout: 30_000 });
 }
 
 test("the real SPA over the net path: alice's chat line reaches bob's browser", async ({ browser }) => {
@@ -143,6 +159,8 @@ test("the real SPA over the net path: alice's chat line reaches bob's browser", 
   const contextB = await browser.newContext();
   const alice = await contextA.newPage();
   const bob = await contextB.newPage();
+  const aliceFrames = trackNetTurns(alice);
+  const bobFrames = trackNetTurns(bob);
   await openSpa(alice, credentials.alice);
   await openSpa(bob, credentials.bob);
 
@@ -155,7 +173,16 @@ test("the real SPA over the net path: alice's chat line reaches bob's browser", 
   // Self view: the committed turn's own observations render her line.
   await expect(alice.locator(".chat-feed")).toContainText(text, { timeout: 20_000 });
   // Peer view: presence-routed WS push into bob's reducer-driven chat.
-  await expect(bob.locator(".chat-feed")).toContainText(text, { timeout: 20_000 });
+  try {
+    await expect(bob.locator(".chat-feed")).toContainText(text, { timeout: 20_000 });
+  } catch (error) {
+    throw new Error(
+      `${error instanceof Error ? error.message : String(error)}\n` +
+      `recent workerd fanout diagnostics:\n${workerdFanoutDiagnostics.slice(-20).join("\n") || "(none)"}`
+    );
+  }
+  expect(aliceFrames.live.filter((payload) => payload.includes(text))).toHaveLength(0);
+  expect(bobFrames.live.filter((payload) => payload.includes(text))).toHaveLength(1);
   expectNoLegacyRequests(alice, bob);
 
   await contextA.close();

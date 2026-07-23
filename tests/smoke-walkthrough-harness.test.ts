@@ -1,8 +1,40 @@
 import { describe, expect, it } from "vitest";
 
 import { isTimeoutDetail, SmokeCascadeHalt, raceWithAbort } from "../scripts/smoke-walkthrough";
+import { SmokeSession, type McpTransport } from "../scripts/smoke/session";
 
 describe("smoke walkthrough harness", () => {
+  it("uses the authenticated Net actor from initialize without probing removed native tools", async () => {
+    const methods: string[] = [];
+    const transport: McpTransport = async (request) => {
+      const body = request.body ? JSON.parse(String(request.body)) : {};
+      methods.push(body.method);
+      if (body.method === "initialize") {
+        return Response.json({
+          jsonrpc: "2.0",
+          id: 1,
+          result: {
+            protocolVersion: "2025-06-18",
+            instructions: "You are woo actor carried_alice. Dynamic tools follow your context."
+          }
+        }, { headers: { "mcp-session-id": "s_net-api-0_walkthrough" } });
+      }
+      if (body.method === "notifications/initialized") {
+        return new Response(null, { status: 202 });
+      }
+      throw new Error(`unexpected MCP method ${String(body.method)}`);
+    };
+
+    const session = await SmokeSession.open(transport, {
+      token: "apikey:key:secret",
+      label: "alice",
+      clientName: "smoke-session-test"
+    });
+
+    expect(session.actor).toBe("carried_alice");
+    expect(methods).toEqual(["initialize", "notifications/initialized"]);
+  });
+
   it("aborts the in-flight step body when the watchdog fires", async () => {
     let observedAbort = false;
     const startedAt = Date.now();

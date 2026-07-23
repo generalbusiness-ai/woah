@@ -341,7 +341,7 @@ const pendingCommands = new Map<string, { space: string; text: string; action?: 
 const pendingNetworkTurns = new Set<string>();
 const pendingToolEnters = new Set<string>();
 const pendingToolEnterTimers = new Map<string, number>();
-const pendingToolMoveRetryTimers = new Map<string, number>();
+const pendingToolEnterRetryTimers = new Map<string, number>();
 const pendingOverlaySnapshots = new Map<string, Promise<void>>();
 let scopedProjectionLocalRevision = 0;
 let connectInFlight: Promise<void> | null = null;
@@ -548,18 +548,18 @@ function clearPendingToolEnter(space: string) {
   const timer = pendingToolEnterTimers.get(space);
   if (timer !== undefined) window.clearTimeout(timer);
   pendingToolEnterTimers.delete(space);
-  const retryTimer = pendingToolMoveRetryTimers.get(space);
+  const retryTimer = pendingToolEnterRetryTimers.get(space);
   if (retryTimer !== undefined) window.clearTimeout(retryTimer);
-  pendingToolMoveRetryTimers.delete(space);
+  pendingToolEnterRetryTimers.delete(space);
 }
 
 function clearPendingToolEnters(options: { render?: boolean } = {}) {
-  if (pendingToolEnters.size === 0 && pendingToolEnterTimers.size === 0 && pendingToolMoveRetryTimers.size === 0) return;
+  if (pendingToolEnters.size === 0 && pendingToolEnterTimers.size === 0 && pendingToolEnterRetryTimers.size === 0) return;
   for (const timer of pendingToolEnterTimers.values()) window.clearTimeout(timer);
-  for (const timer of pendingToolMoveRetryTimers.values()) window.clearTimeout(timer);
+  for (const timer of pendingToolEnterRetryTimers.values()) window.clearTimeout(timer);
   pendingToolEnters.clear();
   pendingToolEnterTimers.clear();
-  pendingToolMoveRetryTimers.clear();
+  pendingToolEnterRetryTimers.clear();
   if (options.render) render();
 }
 
@@ -5978,15 +5978,15 @@ type RoomToolLifecycleOptions = {
 
 type ToolMoveOptions = Omit<RoomToolLifecycleOptions, "route">;
 
-function scheduleToolMoveRetry(options: ToolMoveOptions) {
+function scheduleToolEnterRetry(options: RoomToolLifecycleOptions, resume: () => void) {
   const { tab, space } = options;
   if (!space || !state.actor) return;
-  if (pendingToolMoveRetryTimers.has(space)) return;
+  if (pendingToolEnterRetryTimers.has(space)) return;
   beginPendingToolEnter(space);
   if (state.tab === tab) render();
   const startedAt = performance.now();
   const retry = () => {
-    pendingToolMoveRetryTimers.delete(space);
+    pendingToolEnterRetryTimers.delete(space);
     const isPresent = options.isPresent ?? (() => actorPresentInSpace(space));
     if (state.tab !== tab) {
       clearPendingToolEnter(space);
@@ -6005,12 +6005,12 @@ function scheduleToolMoveRetry(options: ToolMoveOptions) {
       return;
     }
     if (state.actor && options.canSend()) {
-      moveActorToToolSpace(options, { retrying: true });
+      resume();
       return;
     }
-    pendingToolMoveRetryTimers.set(space, window.setTimeout(retry, TOOL_ENTER_RETRY_DELAY_MS));
+    pendingToolEnterRetryTimers.set(space, window.setTimeout(retry, TOOL_ENTER_RETRY_DELAY_MS));
   };
-  pendingToolMoveRetryTimers.set(space, window.setTimeout(retry, TOOL_ENTER_RETRY_DELAY_MS));
+  pendingToolEnterRetryTimers.set(space, window.setTimeout(retry, TOOL_ENTER_RETRY_DELAY_MS));
 }
 
 function moveActorToToolSpace(options: ToolMoveOptions, retryOptions: { retrying?: boolean } = {}) {
@@ -6023,7 +6023,7 @@ function moveActorToToolSpace(options: ToolMoveOptions, retryOptions: { retrying
     return;
   }
   if (!canSend()) {
-    scheduleToolMoveRetry(options);
+    scheduleToolEnterRetry(options, () => moveActorToToolSpace(options, { retrying: true }));
     return;
   }
   if (!retryOptions.retrying && pendingToolEnters.has(space)) {
@@ -6062,18 +6062,26 @@ function moveActorToToolSpace(options: ToolMoveOptions, retryOptions: { retrying
   }
 }
 
-function enterRoomToolSpace(options: RoomToolLifecycleOptions) {
+function enterRoomToolSpace(options: RoomToolLifecycleOptions, retryOptions: { retrying?: boolean } = {}) {
   const { tab, space, canSend, route = "direct" } = options;
   // Room-like tool mutating verbs pass the substrate's presence gate on
   // $space, so the SPA must move the actor into the tool room before it exposes
   // the companion chat and mutation controls. Keep this shared so new tools do
   // not drift into bespoke chat/presence semantics.
-  if (!space || !canSend()) return;
-  if ((options.isPresent ?? (() => actorPresentInSpace(space)))() || pendingToolEnters.has(space)) {
+  if (!space || !state.actor) return;
+  if ((options.isPresent ?? (() => actorPresentInSpace(space)))()) {
     options.onAlreadyPresent?.();
     requestSpaceChatFocus(space);
     return;
   }
+  // The shell renders before Net's socket becomes writable. Preserve an early
+  // navigation click exactly as move-based tools do; silently dropping it
+  // leaves the workspace visible but never establishes its authority/presence.
+  if (!canSend()) {
+    scheduleToolEnterRetry(options, () => enterRoomToolSpace(options, { retrying: true }));
+    return;
+  }
+  if (!retryOptions.retrying && pendingToolEnters.has(space)) return;
   beginPendingToolEnter(space);
   if (state.tab === tab) render();
   const turnId = v2Turn({
@@ -6105,7 +6113,10 @@ function enterRoomToolSpace(options: RoomToolLifecycleOptions) {
 }
 
 function enterTasks() {
-  enterRoomToolSpace({ tab: "tasks", space: tasksSpace(), canSend: canSendV2Browser });
+  // $room:enter is a sequenced durable command. Sending it through Net's
+  // direct plane can return without committing the actor's presence, leaving
+  // the board mounted but its companion/presence authority unopened.
+  enterRoomToolSpace({ tab: "tasks", space: tasksSpace(), canSend: canSendV2Browser, route: "sequenced" });
 }
 
 function enterOutliner() {

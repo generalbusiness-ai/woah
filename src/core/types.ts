@@ -133,17 +133,26 @@ export function publicAppliedFrame(frame: AppliedFrame): AppliedFrame {
   return { ...frame, id: undefined, result: undefined };
 }
 
-export type DirectResultFrame = {
+export type ObservationAudienceMode = "presence" | "explicit";
+
+export type DirectLiveAudience = {
+  audienceActors?: ObjRef[];
+  observationAudiences?: ObjRef[][];
+  audienceSessions?: string[];
+  observationSessionAudiences?: string[][];
+  /** Presence-derived lists are local snapshots, not complete cross-shard
+   * enumerations. Relays use this parallel mode vector to resolve those
+   * observations against each destination shard's own presence slice. */
+  observationAudienceModes?: ObservationAudienceMode[];
+};
+
+export type DirectResultFrame = DirectLiveAudience & {
   op: "result";
   id?: string;
   command?: unknown;
   result: WooValue;
   observations: Observation[];
   audience: ObjRef | null;
-  audienceActors?: ObjRef[];
-  observationAudiences?: ObjRef[][];
-  audienceSessions?: string[];
-  observationSessionAudiences?: string[][];
 };
 
 export type LiveEventFrame = {

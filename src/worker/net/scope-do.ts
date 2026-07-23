@@ -38,6 +38,11 @@
  *                           planner gateway for scheduled-turn execution
  *                           (CO16) — it receives /net/plan-scheduled,
  *                           never fanout
+ *       effect-free direct submits may also carry live audience hints.
+ *                           After authority validation the scope relays their
+ *                           observations to fanout-role gateway shards via
+ *                           best-effort /net/live calls; no row or seq is
+ *                           created.
  *       POST /net/adopt     {from_scope, seq, cells, prior_versions?} →
  *                           CA3 rider adoption as an OWNER-SEQUENCED
  *                           commit (CO2.3): per-cell prior-version CAS,
@@ -90,6 +95,7 @@ import { exportSpans } from "./span-export";
 import type { Cell } from "../../net/cells";
 import { cellKey, lineageClosureKeys, serializeTransfer, type CellTransfer } from "../../net/cells";
 import { isNetError, netError } from "../../net/errors";
+import type { LiveAudience, LiveFanoutBody } from "../../net/live";
 import { Outbox, type FanoutBody, type FanoutRow } from "../../net/outbox";
 import { turnEchoId } from "../../net/turn-echo";
 import { ScopeSequencer, type CommitSubmit, type ScheduledTurn, type ScopeHead } from "../../net/scope";
@@ -770,10 +776,18 @@ export class NetScopeDO {
         // {submit, rider_destinations, relate_destinations} sibling shape.
         const raw = (await request.json()) as
           | CommitSubmit
-          | { submit: CommitSubmit; rider_destinations?: RiderDestinations; relate_destinations?: RelateDestinations };
+          | {
+              submit: CommitSubmit;
+              rider_destinations?: RiderDestinations;
+              relate_destinations?: RelateDestinations;
+              live_audience?: LiveAudience;
+              origin_gateway?: string;
+            };
         const submit = "submit" in raw ? raw.submit : raw;
         const riderDestinations = "submit" in raw ? (raw.rider_destinations ?? {}) : {};
         const relateDestinations = "submit" in raw ? (raw.relate_destinations ?? {}) : {};
+        const liveAudience = "submit" in raw ? raw.live_audience : undefined;
+        const originGateway = "submit" in raw ? raw.origin_gateway : undefined;
         // Hydrate from durable identity ONLY (no scope hint): a submit
         // naming another scope must reach the SEQUENCER's step-2 check
         // and reject with the NAMED terminal `scope_mismatch` — the
@@ -833,6 +847,18 @@ export class NetScopeDO {
         }
         const freshAcceptance = reply.status === "accepted" && reply.replayed !== true;
         const authorityAdvanced = freshAcceptance && reply.head.seq === headBefore + 1;
+        // A validated effect-free direct turn deliberately leaves authority at
+        // the same head. Its observations still need a carrier: publish them
+        // best-effort to the bounded gateway-shard registry, without creating
+        // a fake seq or durable outbox row.
+        if (
+          freshAcceptance &&
+          !authorityAdvanced &&
+          submit.transcript.route === "direct" &&
+          submit.transcript.observations.length > 0
+        ) {
+          this.publishLive(seq.scope, submit, liveAudience, originGateway);
+        }
         // Never begin fanout in the gateway -> scope submit lineage. Even a
         // waitUntil task starts executing immediately; calling the submitting
         // gateway before this response leaves the scope creates a platform
@@ -921,6 +947,16 @@ export class NetScopeDO {
           body.destination,
           role
         );
+        // Subscription loss presents as a healthy authority commit with no
+        // peer push. Name the bounded gateway-shard registration here so a
+        // workerd/deployed trace can distinguish missing subscription from a
+        // later outbox or socket-delivery failure.
+        this.metric({
+          kind: "net_scope_subscribed",
+          scope: this.store.readMeta()?.scope ?? "unseeded",
+          destination: body.destination,
+          role
+        });
         // A newly registered planner must pick up rows parked while no
         // planner existed (rearmAlarm deliberately never arms for
         // overdue rows): arm an immediate wake so the durable alarm()
@@ -2284,6 +2320,57 @@ export class NetScopeDO {
     for (const [destination, records] of byDestination) {
       const body: AuditOutboxBody = { scope, seq, cells: [], observations: [], audit_records: records };
       this.persistOutboxRow("/audit", destination, body, { idSuffix });
+    }
+  }
+
+  /** Publish one validated direct turn without converting it into authority.
+   * Subscriber count is bounded by gateway shard count (CA13.1.2), and every
+   * destination gets an independent deferred task so one slow shard cannot
+   * delay the caller or another shard. Failure is acceptable for this
+   * explicitly live-only carrier, but remains named in telemetry. */
+  private publishLive(
+    scope: string,
+    submit: CommitSubmit,
+    audience?: LiveAudience,
+    originGateway?: string
+  ): void {
+    const registered = sqlRows<{ destination: string }>(
+      this.state.storage.sql.exec(
+        "SELECT destination FROM net_scope_subscribers WHERE role = 'fanout' ORDER BY destination"
+      )
+    );
+    // The origin gateway is still awaiting this submit reply. Calling it from
+    // a waitUntil task starts immediately and creates a platform RPC cycle;
+    // the origin delivers its local slice after this response instead.
+    const subscribers = registered.filter(({ destination }) => destination !== originGateway);
+    const body: LiveFanoutBody = {
+      scope,
+      observations: submit.transcript.observations,
+      submitter_turn_id: submit.idempotency_key,
+      echo_id: turnEchoId(submit.idempotency_key),
+      ...(audience ?? {})
+    };
+    this.metric({
+      kind: "net_scope_live_publish",
+      scope,
+      subscribers: subscribers.length,
+      registered_subscribers: registered.length,
+      observations: body.observations.length
+    });
+    for (const { destination } of subscribers) {
+      this.host.defer(async () => {
+        try {
+          await this.host.rpc(destination, "/live", body);
+        } catch (err) {
+          this.metric({
+            kind: "net_scope_live_delivery_failed",
+            scope,
+            destination,
+            status: "error",
+            error: String(err)
+          });
+        }
+      });
     }
   }
 

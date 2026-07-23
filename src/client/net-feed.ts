@@ -38,6 +38,7 @@ import { turnEchoId } from "../net/turn-echo";
  *                           {type:"ping", id?}
  *     server→client frames: {type:"turn_result", id, status, ...TurnResult|{error}}
  *                           {type:"observations", scope, seq, echo_id?, observations}
+ *                           {type:"live_observations", scope, echo_id?, observations}
  *                           {type:"pong", id} / {type:"error", id?, error}
  *   Errors everywhere: {error:{code, message, detail?}} — surfaced here
  *   as NetFeedError.
@@ -46,7 +47,8 @@ import { turnEchoId } from "../net/turn-echo";
  *   - The submitting session receives its own turn's observations ON THE
  *     TURN REPLY (source:"self"); the gateway skips its sockets when the
  *     same turn's fanout arrives.
- *   - {type:"observations"} frames are peer traffic (source:"peer").
+ *   - {type:"observations"} frames are committed peer traffic
+ *     (source:"peer").
  *     Frames are per-scope ordered at the source (outbox FIFO lanes), so
  *     a frame at seq ≤ the scope's high-water is a redelivery — dropped.
  *   - Defensive self-echo guard: the gateway's echo dedupe is a bounded
@@ -158,7 +160,7 @@ export type NetFeedState = {
 
 /** One observation, as the feed emits it to subscribers.
  * source:"self" — from our own turn's reply (already committed);
- * source:"peer" — from a fanout {type:"observations"} frame. */
+ * source:"peer" — from a committed or live observation frame. */
 export type NetFeedObservationEvent = {
   source: "self" | "peer";
   /** The committing scope (reply.scope for self, frame.scope for peer). */
@@ -946,6 +948,10 @@ export class NetFeed {
     }
     if (frame.type === "observations") {
       this.handleObservationsFrame(frame);
+      return;
+    }
+    if (frame.type === "live_observations") {
+      this.handleLiveObservationsFrame(frame);
     }
   }
 
@@ -979,6 +985,25 @@ export class NetFeed {
     }
     this.readCache.clear();
     for (const observation of observations) this.emitObservation({ source: "peer", scope, seq, observation });
+  }
+
+  /** Live direct observations intentionally have no seq/high-water. They are
+   * lossy peer signals: dedupe only by the submitting turn's safe echo token,
+   * then deliver with seq:null so consumers cannot mistake them for authority. */
+  private handleLiveObservationsFrame(frame: Record<string, unknown>): void {
+    const scope = typeof frame.scope === "string" ? frame.scope : "";
+    if (!scope) return;
+    const echoId = typeof frame.echo_id === "string" && frame.echo_id ? frame.echo_id : null;
+    if (echoId && (this.settledEchoIds.has(echoId) || this.pendingEchoToTurn.has(echoId))) return;
+    const observations = Array.isArray(frame.observations)
+      ? (frame.observations.filter(
+          (item) => item && typeof item === "object" && !Array.isArray(item)
+        ) as Record<string, unknown>[])
+      : [];
+    this.readCache.clear();
+    for (const observation of observations) {
+      this.emitObservation({ source: "peer", scope, seq: null, observation });
+    }
   }
 
   // ---- Shared internals ----------------------------------------------------
