@@ -97,7 +97,12 @@ import { exportSpans } from "./span-export";
 import type { Cell } from "../../net/cells";
 import { cellKey, lineageClosureKeys, serializeTransfer, type CellTransfer } from "../../net/cells";
 import { isNetError, netError } from "../../net/errors";
-import type { LiveAudience, LiveFanoutBody } from "../../net/live";
+import {
+  LIVE_FANOUT_BATCH_CAP,
+  type LiveAudience,
+  type LiveFanoutBatchBody,
+  type LiveFanoutBody
+} from "../../net/live";
 import { Outbox, type FanoutBody, type FanoutRow } from "../../net/outbox";
 import { turnEchoId } from "../../net/turn-echo";
 import { ScopeSequencer, type CommitSubmit, type ScheduledTurn, type ScopeHead } from "../../net/scope";
@@ -516,7 +521,7 @@ const OUTBOX_PASSES_PER_DRAIN = 1;
  * suppression; these bounds absorb a burst without granting unbounded
  * lifetime state or one alarm invocation unbounded subrequests. */
 const LIVE_DELIVERY_QUEUE_CAP = 1_024;
-const LIVE_DELIVERY_BATCH = 64;
+const LIVE_DELIVERY_BATCH = LIVE_FANOUT_BATCH_CAP;
 /** Debugging tail of abandoned rows kept after their divergence metric
  * fired; everything older is pruned (a dead subscriber must not grow
  * storage without bound). */
@@ -2441,16 +2446,25 @@ export class NetScopeDO {
    * retaining failures would quietly turn them into durable messages. */
   private async drainPendingLive(): Promise<void> {
     const batch = this.pendingLiveDeliveries.splice(0, LIVE_DELIVERY_BATCH);
+    const byDestination = new Map<string, LiveFanoutBody[]>();
+    for (const { destination, body } of batch) {
+      const deliveries = byDestination.get(destination) ?? [];
+      deliveries.push(body);
+      byDestination.set(destination, deliveries);
+    }
+    const destinations = [...byDestination];
     const settled = await Promise.allSettled(
-      batch.map(({ destination, body }) => this.host.rpc(destination, "/live", body))
+      destinations.map(([destination, deliveries]) =>
+        this.host.rpc(destination, "/live", { deliveries } satisfies LiveFanoutBatchBody)
+      )
     );
     settled.forEach((result, index) => {
       if (result.status === "fulfilled") return;
-      const delivery = batch[index];
+      const delivery = destinations[index];
       this.metric({
         kind: "net_scope_live_delivery_failed",
-        scope: delivery?.body.scope ?? "unknown",
-        destination: delivery?.destination ?? "unknown",
+        scope: delivery?.[1][0]?.scope ?? "unknown",
+        destination: delivery?.[0] ?? "unknown",
         status: "error",
         error: String(result.reason)
       });

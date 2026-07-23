@@ -18,3 +18,12 @@ export type LiveFanoutBody = LiveAudience & {
   /** One-way client-safe correlation token. */
   echo_id?: string;
 };
+
+/** One fresh-event carrier may combine several independent live messages for
+ * the same gateway. The gateway still filters and emits each body separately;
+ * batching reduces cross-DO calls without inventing ordering or durability. */
+export type LiveFanoutBatchBody = {
+  deliveries: LiveFanoutBody[];
+};
+
+export const LIVE_FANOUT_BATCH_CAP = 64;

@@ -73,7 +73,7 @@ import { exportSpans, spanSampleRate } from "./span-export";
 import { adoptOrMintTraceContext, normalizeTraceContext, parseTraceparent, type TraceContext } from "../../net/trace";
 import { clampClientSessionTtl } from "../../net/client-session-policy";
 import { budgetExhausted, isNetError, netError, nonconvergentRead, NetError, type AttemptTraceEntry, type NetErrorCode } from "../../net/errors";
-import type { LiveFanoutBody } from "../../net/live";
+import { LIVE_FANOUT_BATCH_CAP, type LiveFanoutBatchBody, type LiveFanoutBody } from "../../net/live";
 import { applyFanout, type FanoutBody } from "../../net/outbox";
 import { observationsForRelationOwners, relationKey, roomRosterRows, SESSION_PRESENCE_RELATION, type RelationDelta, type RelationRow, type RoomRosterRow } from "../../net/relations";
 import { mintSessionSubmit, sessionCellKey, validateSessionCell } from "../../net/sessions";
@@ -896,9 +896,22 @@ export class NetGatewayDO {
         return json({ applied: this.receiveFanout(body) });
       }
       if (request.method === "POST" && url.pathname === "/net/live") {
-        const body = (await request.json()) as LiveFanoutBody;
-        this.pushLiveObservations(body);
-        return json({ delivered: true });
+        const body = (await request.json()) as LiveFanoutBody | LiveFanoutBatchBody;
+        const deliveries = "deliveries" in body ? body.deliveries : [body];
+        if (
+          !Array.isArray(deliveries)
+          || deliveries.length > LIVE_FANOUT_BATCH_CAP
+          || deliveries.some((delivery) =>
+            delivery === null
+            || typeof delivery !== "object"
+            || typeof delivery.scope !== "string"
+            || !Array.isArray(delivery.observations)
+          )
+        ) {
+          return json({ error: { code: "E_INVARG", message: "invalid live fanout batch" } }, 400);
+        }
+        for (const delivery of deliveries) this.pushLiveObservations(delivery);
+        return json({ delivered: deliveries.length });
       }
       if (request.method === "POST" && url.pathname === "/net/pull") {
         const body = (await request.json()) as { scope: string; destination: string; known?: string[] };
