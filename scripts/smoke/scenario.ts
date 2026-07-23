@@ -80,13 +80,13 @@ export async function runSmokeWalkthrough(
     log: options.log
   };
 
-  // Both guests start in the_chatroom on the demo world. `:enter` is
-  // defensively idempotent; an actor already there receives no observation.
+  // API-key actors persist between deployed runs. Establish the common start
+  // room whether this is their first run or they already occupy the chatroom.
   await step("enter:chatroom (alice)", async (ctx) => {
-    await pair.alice.call("the_chatroom", "enter", [], ctx.signal);
+    await ensureInChatroom(pair.alice, ctx.signal);
   });
   await step("enter:chatroom (bob)", async (ctx) => {
-    await pair.bob.call("the_chatroom", "enter", [], ctx.signal);
+    await ensureInChatroom(pair.bob, ctx.signal);
   });
   await drain(pair.alice, cfg);
   await drain(pair.bob, cfg);
@@ -570,6 +570,27 @@ export async function runSmokeWalkthrough(
       obs.source === "the_taskboard",
     waitMs, ctx.signal, cfg);
   });
+}
+
+/** Put one persistent smoke actor in the chatroom and establish the driver's
+ * room cursor. The reachable-tool facade omits a space's `enter` verb when the
+ * actor is already there, so that one named refusal means "confirm in-place"
+ * via `look`; every other failure still escapes. */
+export async function ensureInChatroom(
+  session: SmokeSession,
+  signal?: AbortSignal
+): Promise<void> {
+  try {
+    await session.call("the_chatroom", "enter", [], signal);
+    return;
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    if (!detail.includes("tool is not available in this session context: the_chatroom:enter")) {
+      throw err;
+    }
+  }
+  await session.call("the_chatroom", "look", [], signal);
+  session.currentRoom = "the_chatroom";
 }
 
 async function walkSouthToTaskboard(session: SmokeSession, signal?: AbortSignal): Promise<void> {

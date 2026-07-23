@@ -6,6 +6,7 @@ import {
   SmokeCascadeHalt,
   raceWithAbort
 } from "../scripts/smoke-walkthrough";
+import { ensureInChatroom } from "../scripts/smoke/scenario";
 import { SmokeSession, type McpTransport } from "../scripts/smoke/session";
 
 describe("smoke walkthrough harness", () => {
@@ -53,6 +54,36 @@ describe("smoke walkthrough harness", () => {
       WOO_SMOKE_ALICE_APIKEY: "session:s_alice",
       WOO_SMOKE_BOB_APIKEY: "apikey:bob:secret-b"
     })).toThrow("apikey:<id>:<secret>");
+  });
+
+  it("treats an unavailable chatroom enter as an already-present actor", async () => {
+    const calls: string[] = [];
+    const session = {
+      currentRoom: null,
+      async call(object: string, verb: string): Promise<unknown> {
+        calls.push(`${object}:${verb}`);
+        if (verb === "enter") {
+          throw new Error("MCP tool error: tool is not available in this session context: the_chatroom:enter");
+        }
+        return { description: "The chatroom" };
+      }
+    } as unknown as SmokeSession;
+
+    await ensureInChatroom(session);
+
+    expect(calls).toEqual(["the_chatroom:enter", "the_chatroom:look"]);
+    expect(session.currentRoom).toBe("the_chatroom");
+  });
+
+  it("does not hide unrelated chatroom-entry failures", async () => {
+    const session = {
+      currentRoom: null,
+      async call(): Promise<unknown> {
+        throw new Error("E_SCOPE_RETIRED");
+      }
+    } as unknown as SmokeSession;
+
+    await expect(ensureInChatroom(session)).rejects.toThrow("E_SCOPE_RETIRED");
   });
 
   it("aborts the in-flight step body when the watchdog fires", async () => {

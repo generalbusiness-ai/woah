@@ -24,7 +24,12 @@
 import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { httpTransport, SmokeSession } from "./smoke/session";
-import { runSmokeWalkthrough, type SmokeSessionPair, type StepContext } from "./smoke/scenario";
+import {
+  ensureInChatroom,
+  runSmokeWalkthrough,
+  type SmokeSessionPair,
+  type StepContext
+} from "./smoke/scenario";
 
 type StepResult = { name: string; ok: boolean; ms: number; detail?: string };
 type SessionPair = SmokeSessionPair & { generation: number };
@@ -157,8 +162,8 @@ async function closeSessionPair(pair: SessionPair | null): Promise<void> {
   await Promise.allSettled([pair.alice.close(), pair.bob.close()]);
 }
 
-// Replace both sessions after a failed step and re-enter the chatroom so the
-// next step starts from a known room. Mutates `pair` in place — the scenario
+// Replace both sessions after a failed step and re-establish the chatroom so
+// the next step starts from a known room. Mutates `pair` in place — the scenario
 // holds the same reference and reads the new sessions on its next step.
 async function resetSessionPair(pair: SessionPair, failedStep: string): Promise<void> {
   const nextGeneration = pair.generation + 1;
@@ -169,8 +174,8 @@ async function resetSessionPair(pair: SessionPair, failedStep: string): Promise<
   pair.bob = next.bob;
   pair.generation = nextGeneration;
   try {
-    await pair.alice.call("the_chatroom", "enter", []);
-    await pair.bob.call("the_chatroom", "enter", []);
+    await ensureInChatroom(pair.alice);
+    await ensureInChatroom(pair.bob);
   } catch (err) {
     await closeSessionPair(pair);
     throw err;
