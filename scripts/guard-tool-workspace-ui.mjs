@@ -15,6 +15,8 @@ const mainTsPath = join(root, "src/client/main.ts");
 const errors = [];
 let auditedFrames = 0;
 let auditedUiFiles = 0;
+const navigationTabs = new Map();
+const navigationAliases = new Map();
 const movementForbiddenVerbs = new Set(["enter", "leave", "out"]);
 const suppressedInheritedLifecycleTools = ["enter", "leave"];
 const forbiddenUiLifecyclePatterns = [
@@ -99,6 +101,22 @@ for (const dir of dirs) {
     if (!hasSharedMiniChat(frame)) {
       errors.push(`${where}: space-workspace tool frames must declare regions.chat with chat:chat.space-mini`);
     }
+    const navigation = frame?.navigation;
+    if (!navigation || typeof navigation.tab !== "string" || typeof navigation.label !== "string") {
+      errors.push(`${where}: bundled tool frames must declare navigation.tab and navigation.label`);
+    } else {
+      const priorTab = navigationTabs.get(navigation.tab);
+      if (priorTab) errors.push(`${where}: navigation tab ${JSON.stringify(navigation.tab)} is already declared by ${priorTab}`);
+      else navigationTabs.set(navigation.tab, where);
+      for (const alias of Array.isArray(navigation.aliases) ? navigation.aliases : []) {
+        const priorAlias = navigationAliases.get(alias);
+        if (priorAlias) errors.push(`${where}: navigation alias ${JSON.stringify(alias)} is already declared by ${priorAlias}`);
+        else navigationAliases.set(alias, where);
+      }
+      if (navigation.host_attribute !== undefined && !/^data-[a-z0-9-]+$/.test(navigation.host_attribute)) {
+        errors.push(`${where}: navigation.host_attribute must be one data-* attribute name`);
+      }
+    }
   }
 
   for (const cls of manifest.classes ?? []) {
@@ -155,7 +173,7 @@ if (mainTs) {
     "function renderGenericToolWorkspace",
     "function mountGenericToolComponent",
     "data-generic-tool-workspace",
-    "TOOL_TAB_DEFINITIONS"
+    "discoverBundledToolDefinitions"
   ];
   for (const marker of requiredHostMarkers) {
     if (!mainTs.includes(marker)) errors.push(`${rel(mainTsPath)}: missing generic tool host marker ${JSON.stringify(marker)}`);
@@ -168,6 +186,16 @@ if (mainTs) {
   ];
   for (const marker of legacyRenderBranches) {
     if (mainTs.includes(marker)) errors.push(`${rel(mainTsPath)}: catalog-specific workspace renderer ${JSON.stringify(marker)} must use the generic tool host`);
+  }
+  const manualDiscoveryMarkers = [
+    "const TOOL_TAB_DEFINITIONS: ToolTabDefinition[] = [",
+    "catalogs/dubspace/manifest.json",
+    "catalogs/pinboard/manifest.json",
+    "catalogs/tasks/manifest.json",
+    "catalogs/outliner/manifest.json"
+  ];
+  for (const marker of manualDiscoveryMarkers) {
+    if (mainTs.includes(marker)) errors.push(`${rel(mainTsPath)}: manual bundled-tool discovery marker ${JSON.stringify(marker)} must come from generated manifest metadata`);
   }
   const legacyLifecycleMarkers = [
     "woo-pinboard-enter",

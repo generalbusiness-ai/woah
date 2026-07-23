@@ -273,6 +273,9 @@ export type UiFrameDecl = {
    * the implementation; the shell supplies transport/projection capabilities
    * and applies the returned generic patches without learning catalog state. */
   hydration?: { module: string; id: string };
+  /** Optional app-shell discovery metadata. It names navigation presentation,
+   * never transport or mutation behavior. */
+  navigation?: { tab: string; label: string; aliases?: string[]; host_attribute?: string };
   regions: Record<string, UiNodeDecl[]>;
   state?: Record<string, unknown>;
 };
@@ -298,6 +301,10 @@ export type UiChatFormatterDecl = {
   types: string[];
 };
 
+export type UiWorldSnapshotAdapterDecl = {
+  module: string;
+};
+
 export type CatalogUiManifest = {
   abi: string;
   modules?: UiModuleDecl[];
@@ -305,6 +312,7 @@ export type CatalogUiManifest = {
   frames?: UiFrameDecl[];
   observation_handlers?: UiObservationHandlerDecl[];
   chat_formatters?: UiChatFormatterDecl[];
+  world_snapshot_adapters?: UiWorldSnapshotAdapterDecl[];
 };
 
 export type CatalogUiPackage = {
@@ -338,6 +346,7 @@ type ModuleExports = {
   registerWooChatFormatters?: (registry: ChatFormatterRegistry) => void;
   registerWooViewHydrations?: (registry: WooViewHydrationRegistry) => void;
   registerWooViews?: (registry: WooViewRegistry) => void;
+  registerWooWorldSnapshotAdapters?: (registry: WooWorldSnapshotAdapterRegistry) => void;
 };
 
 export type WooComponentRegistry = {
@@ -431,6 +440,15 @@ export type WooViewRegistry = {
   view<T>(definition: WooViewDefinition<T>): void;
 };
 
+/** Catalog-owned compatibility translation for legacy whole-world payloads.
+ * Adapters return generic projection patches, keeping historical catalog wire
+ * shapes out of the client substrate. */
+export type WooWorldSnapshotAdapter = (world: unknown) => ProjectionPatch[];
+
+export type WooWorldSnapshotAdapterRegistry = {
+  adapt(adapter: WooWorldSnapshotAdapter): void;
+};
+
 export type WooFrameContext = {
   id: string;
   subject: string;
@@ -491,6 +509,7 @@ export class CatalogUiRegistry {
   private loadedModules = new Set<string>();
   private viewHydrations = new Map<string, WooViewHydration>();
   private views = new Map<string, WooViewDefinition<unknown>>();
+  private worldSnapshotAdapters: WooWorldSnapshotAdapter[] = [];
 
   installCatalogUi(pkg: CatalogUiPackage): string[] {
     if (pkg.ui.abi !== "woo-ui/v1") return [`unsupported UI ABI for ${pkg.alias}: ${pkg.ui.abi}`];
@@ -611,6 +630,24 @@ export class CatalogUiRegistry {
       : undefined;
   }
 
+  worldSnapshotPatches(world: unknown): ProjectionPatch[] {
+    return this.worldSnapshotAdapters.flatMap((adapter) => adapter(world));
+  }
+
+  private assertWorldSnapshotAdapterDeclared(alias: string, moduleId: string, mod: ModuleExports): void {
+    if (!mod.registerWooWorldSnapshotAdapters) return;
+    const pkg = this.catalogs.get(alias);
+    const declared = (pkg?.ui.world_snapshot_adapters ?? []).some((entry) => entry.module === moduleId);
+    if (!declared) throw new Error(`world snapshot adapter is not declared for ${alias}:${moduleId}`);
+  }
+
+  private registerWorldSnapshotAdapters(mod: ModuleExports): void {
+    if (!mod.registerWooWorldSnapshotAdapters) return;
+    mod.registerWooWorldSnapshotAdapters({
+      adapt: (adapter) => this.worldSnapshotAdapters.push(adapter)
+    });
+  }
+
   async loadModule(
     alias: string,
     moduleId: string,
@@ -625,11 +662,13 @@ export class CatalogUiRegistry {
     if (!pkg) throw new Error(`unknown catalog UI alias: ${alias}`);
     if (!(pkg.ui.modules ?? []).some((module) => module.id === moduleId)) throw new Error(`unknown UI module ${moduleId} for ${alias}`);
     const mod = await importModule(url);
+    this.assertWorldSnapshotAdapterDeclared(alias, moduleId, mod);
     mod.registerWooComponents?.({ defineTag: (tag, ctor) => this.defineTag(alias, moduleId, tag, ctor) });
     mod.registerWooObservationHandlers?.(observations);
     mod.registerWooChatFormatters?.(chatFormatters);
     mod.registerWooViewHydrations?.({ define: (id, hydration) => this.defineViewHydration(alias, moduleId, id, hydration) });
     mod.registerWooViews?.({ view: (definition) => this.defineView(alias, definition) });
+    this.registerWorldSnapshotAdapters(mod);
     this.loadedModules.add(key);
   }
 
@@ -639,11 +678,13 @@ export class CatalogUiRegistry {
     const pkg = this.catalogs.get(alias);
     if (!pkg) throw new Error(`unknown catalog UI alias: ${alias}`);
     if (!(pkg.ui.modules ?? []).some((module) => module.id === moduleId)) throw new Error(`unknown UI module ${moduleId} for ${alias}`);
+    this.assertWorldSnapshotAdapterDeclared(alias, moduleId, mod);
     mod.registerWooComponents?.({ defineTag: (tag, ctor) => this.defineTag(alias, moduleId, tag, ctor) });
     mod.registerWooObservationHandlers?.(observations);
     mod.registerWooChatFormatters?.(chatFormatters);
     mod.registerWooViewHydrations?.({ define: (id, hydration) => this.defineViewHydration(alias, moduleId, id, hydration) });
     mod.registerWooViews?.({ view: (definition) => this.defineView(alias, definition) });
+    this.registerWorldSnapshotAdapters(mod);
     this.loadedModules.add(key);
   }
 
@@ -677,7 +718,7 @@ export class ClientProjection {
   private optimisticCalls = new Map<string, OptimisticCallRecord>();
   private subscribers = new Map<string, Set<ProjectionSubscriber>>();
 
-  ingestWorld(world: any) {
+  ingestWorld(world: any, catalogPatches: ProjectionPatch[] = []) {
     const changed = new Set(this.canonical.keys());
     this.scopedCanonical.clear();
     this.scopeOrder = [];
@@ -687,21 +728,11 @@ export class ClientProjection {
       this.canonical.set(id, normalizeObjectProjection(id, obj));
       changed.add(id);
     }
-    for (const [id, obj] of Object.entries(world?.dubspace ?? {})) {
-      this.upsertCanonicalObject(id, obj);
-      changed.add(id);
-    }
-    for (const note of Array.isArray(world?.pinboard?.notes) ? world.pinboard.notes : []) {
-      const id = String(note?.id ?? "");
-      if (!id) continue;
-      this.patchCanonical(id, {
-        fields: {
-          name: typeof note?.name === "string" ? note.name : undefined,
-          owner: typeof note?.owner === "string" ? note.owner : typeof note?.author === "string" ? note.author : undefined
-        },
-        catalogState: { pinboard_note: pinboardNoteState(note) }
-      });
-      changed.add(id);
+    for (const patch of catalogPatches) {
+      const subject = String(patch.subject ?? "");
+      if (!subject) continue;
+      this.patchCanonical(subject, patch);
+      changed.add(subject);
     }
     this.pruneExpired(Date.now(), changed);
     this.notify(changed);
@@ -1377,7 +1408,7 @@ export class WooClientFramework {
   }
 
   ingestWorld(world: any) {
-    this.projection.ingestWorld(world);
+    this.projection.ingestWorld(world, this.catalogUi.worldSnapshotPatches(world));
   }
 
   ingestAppliedFrame(frame: any) {
@@ -1808,31 +1839,6 @@ export function registerCoreObservationHandlers(registry: ObservationRegistry) {
       if (room) draft.patchObject(item, { location: room });
     }
   });
-  // `note_edited` / `note_writers_changed` update the underlying $note's
-  // canonical props so any surface (inventory, look-at, search) sees the new
-  // text/writers. Catalog overlays (pinboard_note, taskspace_task) that mirror
-  // these fields for fast component access are patched by the catalog's own
-  // observation handler — see catalogs/pinboard/ui and catalogs/taskspace/ui.
-  registry.observation({
-    types: ["note_edited"],
-    route: "sequenced",
-    reduce: (draft, envelope) => {
-      const note = String(envelope.observation.note ?? envelope.observation.pin ?? envelope.observation.id ?? "");
-      if (note) draft.patchObjectProps(note, { text: envelope.observation.text });
-    }
-  });
-  registry.observation({
-    types: ["note_writers_changed"],
-    route: "sequenced",
-    reduce: (draft, envelope) => {
-      const note = String(envelope.observation.note ?? envelope.observation.pin ?? envelope.observation.id ?? "");
-      if (!note) return;
-      const writers = Array.isArray(envelope.observation.writers)
-        ? envelope.observation.writers.filter((item) => typeof item === "string")
-        : [];
-      draft.patchObjectProps(note, { writers });
-    }
-  });
   registry.observation({
     types: ["property_changed"],
     route: "both",
@@ -2060,14 +2066,6 @@ function mergeClearList(left?: string[], right?: string[]): string[] | undefined
 
 function stripUndefined<T extends Record<string, unknown>>(value: T): T {
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as T;
-}
-
-function pinboardNoteState(note: any): Record<string, unknown> {
-  const fields: Record<string, unknown> = {};
-  for (const key of ["x", "y", "z", "w", "h", "text", "color", "author", "owner", "writers"]) {
-    if (note?.[key] !== undefined) fields[key] = note[key];
-  }
-  return fields;
 }
 
 function pruneLayers(layers: Map<string, ProjectionLayer>, now: number, changedSubjects: Set<string>): boolean {

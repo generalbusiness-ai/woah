@@ -40,6 +40,7 @@
         "subject": "$outliner",
         "view": "default",
         "layout": "space-workspace",
+        "navigation": { "tab": "outliner", "label": "Outliner", "aliases": ["outliner", "outline"], "host_attribute": "data-outliner-tree" },
         "regions": {
           "main": [
             {

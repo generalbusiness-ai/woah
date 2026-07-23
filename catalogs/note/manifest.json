@@ -18,6 +18,12 @@
         "module": "note-chat",
         "types": ["note_read"]
       }
+    ],
+    "observation_handlers": [
+      {
+        "module": "note-chat",
+        "types": ["note_edited", "note_writers_changed"]
+      }
     ]
   },
   "classes": [

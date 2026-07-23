@@ -370,6 +370,22 @@ registration order is install order, which matches manifest dependency
 order. Override semantics are intentionally not part of this contract;
 if a use case appears, an explicit priority field can be added later.
 
+`ui.world_snapshot_adapters[]` declares modules that translate retired
+catalog-specific fields from a legacy whole-world response into generic
+`ProjectionPatch[]`. A declared module may export:
+
+```ts
+export function registerWooWorldSnapshotAdapters(registry: {
+  adapt(adapter: (world: unknown) => ProjectionPatch[]): void;
+}): void;
+```
+
+The host runs registered adapters only while ingesting that compatibility
+response and applies their output with the response's canonical projection.
+Generic projection and transport code MUST NOT inspect catalog-specific
+snapshot fields. Registration from an undeclared module is an error. This is
+an aging compatibility seam, not a format for new snapshot producers.
+
 ---
 
 ## UCM7. UI modules
@@ -570,6 +586,12 @@ type UiFrame = {
   subject: ObjRefOrCatalogName;
   view?: string;
   layout: string;
+  navigation?: {
+    tab: string;
+    label: string;
+    aliases?: string[];
+    host_attribute?: string;
+  };
   state?: Record<string, unknown>;
   regions: Record<string, UiNode[]>;
 };
@@ -601,6 +623,14 @@ type UiNode = {
   when?: UiPredicate;
 };
 ```
+
+`navigation` is optional host presentation metadata. A shell MAY use it to
+discover a top-level destination from installed frames rather than maintaining
+a catalog-name table. `tab` is the stable shell key, `label` is display text,
+and `aliases` are accepted `view=` route hints. `host_attribute` preserves a
+stable test/automation hook on the mounted frame root; it carries no authority.
+Transport calls, entry semantics, and mutation behavior MUST NOT be encoded in
+this block.
 
 `ObjRefOrCatalogName` means either a concrete object reference or a catalog
 reference resolved by the catalog rules in

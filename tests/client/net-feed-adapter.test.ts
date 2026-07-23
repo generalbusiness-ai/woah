@@ -13,6 +13,8 @@ import {
   ObservationRegistry,
   registerCoreObservationHandlers
 } from "../../src/client/framework";
+import noteManifest from "../../catalogs/note/manifest.json";
+import * as noteUiModule from "../../catalogs/note/ui/note-chat";
 import { wireNetFeed } from "../../src/client/net-feed-adapter";
 import { NetFeed, type NetSocketLike } from "../../src/client/net-feed";
 
@@ -125,6 +127,8 @@ describe("wireNetFeed → registerCoreObservationHandlers reducers", () => {
     // drives through ingestAppliedFrame (core handlers only; the pinboard
     // catalog overlay handler is out of scope here).
     const v2 = createWooClientFramework();
+    v2.catalogUi.installCatalogUi({ alias: "note", catalog: "note", ui: (noteManifest as any).ui });
+    v2.catalogUi.registerModuleExports("note", "note-chat", noteUiModule, v2.observations, v2.chatFormatters);
     v2.ingestAppliedFrame({
       op: "applied",
       seq: 14,
@@ -137,6 +141,8 @@ describe("wireNetFeed → registerCoreObservationHandlers reducers", () => {
     // pinboard room's scope, wired straight into a full framework instance
     // — WooClientFramework IS a NetFeedReducerTarget, no shim.
     const ui = createWooClientFramework();
+    ui.catalogUi.installCatalogUi({ alias: "note", catalog: "note", ui: (noteManifest as any).ui });
+    ui.catalogUi.registerModuleExports("note", "note-chat", noteUiModule, ui.observations, ui.chatFormatters);
     const { socket } = await openWiredFeed(ui);
     peerFrame(socket, "room:the_pinboard", 14, [{ type: "note_edited", note: "note_1", text: "new\ntext" }]);
     expect(ui.observe("note_1")?.props.text).toBe(v2.observe("note_1")?.props.text);
