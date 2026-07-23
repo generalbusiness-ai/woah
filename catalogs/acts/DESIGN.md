@@ -24,8 +24,8 @@ from the log.
 
 | Class | Parent | Role |
 |---|---|---|
-| `$acts` (feature) | `$thing` | Internal emission primitive `:act(type, payload)` + `_validate_payload`. Mounted per consumer instance ($space instances own-seed an empty `features` list; a consumer-catalog class-level attach satisfies the installer's static this-call resolution). |
-| `$projection` | `$thing` | `consumes` + `:fold` + `rows` + `:view`/`:view_row` + incremental idempotent `:rebuild_from`. `rows`/`consumes`/`row_cap`/`at_seq`/`rebuild_scan_seq` are perms-empty: only catalog-author verbs write them. |
+| `$acts` (feature) | `$thing` | Internal, non-`x` emission primitive `:act(type, payload)` + `_validate_payload`. Both validate their caller; underscore naming and `direct_callable:false` alone are not privacy. Mounted per consumer instance ($space instances own-seed an empty `features` list; a consumer-catalog class-level attach satisfies the installer's static this-call resolution). |
+| `$projection` | `$thing` | `source_space` authority binding + `consumes` + internal `:fold` + `rows` + `:view`/`:view_row` + incremental idempotent `:rebuild_from`. `source_space` and projection state are perms-empty. `fold` has no public execute permission and accepts only its bound composer, including during source-mediated rebuild. |
 
 Domain classes, schemas, and concrete projections live in consuming
 catalogs — the proof set (`$case`, `$task_board`, `$kind_lanes`, the
@@ -35,7 +35,13 @@ tasks migration lands.
 ## Emission contract (enforced, tested)
 
 `:act` requires `seq >= 1 && space == this` (direct routes carry `seq == -1`)
-and `caller == this` (only room verbs emit). Payloads validate against
+and `caller == this` (only room verbs emit). It also lacks `x`: the caller guard
+is the semantic authority boundary, while the permission bit prevents public
+sequenced ingress from reaching it. Every attached projection must be bound by
+`p.source_space == this`; each concrete fold accepts only that composer.
+`rebuild_from` cannot supply a fold input: it asks the bound source's internal
+replay helper to derive inputs from recorded observations and call the fold.
+Payloads validate against
 `event_schema(this, type)` — the closed flat shape vocabulary (`obj`, `str`,
 `bool`, `int`, `float`, `num`, `list`, `map`, `null`, with `a|b` unions —
 earned by the outliner migration), every declared key required,
@@ -52,13 +58,18 @@ effects (including a minted artifact) roll back together. `E_QUOTA` at
 **Rebuild**: `fold(recorded acts) == rows`, exercised by
 `$projection:rebuild_from(space, from_seq)` — rebuild input is the recorded
 observations, never verb re-execution, so verb changes cannot invalidate a
-projection. Failed entries contribute nothing.
+projection. The requested space must equal the immutable `source_space`
+binding. Failed entries contribute nothing.
 
 ## Core seams used
 
-Exactly two generic read completions (see the kernel note §2.2/§2.3):
+The kernel itself uses two generic read completions (see the kernel note
+§2.2/§2.3):
 `event_schema(obj, type)` (introspection-spec'd builtin, now implemented) and
-the persisted `ts` on `$space:replay()` results.
+the persisted `ts` on `$space:replay()` results. Outliner's authority audit
+also forced one generic moveto correction: container hooks receive the moving
+object as `caller`, allowing catalog lifecycle guards to authenticate substrate
+dispatch. That is a third branch-level core change, not an Acts read seam.
 
 ## Proof status
 
@@ -68,7 +79,8 @@ projection rebuilds from the room authority's durable log through a sparse
 planner, with page attestation and real-workerd SQLite/RPC repair covered.
 Outliner parity/deletion and the production-shaped scale gate are closed: at
 1,000 rows and eight independent viewers, workerd measured 101 ms warm-read
-p95, ~145.5 KiB responses, 36 ms mutation-to-seven-peer-push p95, and 928 ms
+p95 initially; the authority-hardening rerun measured 100 ms, ~145.5 KiB
+responses, 48 ms mutation-to-seven-peer-push p95, and 940 ms
 invalidation-to-current p95. Direct semantic reads validate without advancing
 authority, and exact repeated read proofs are deduplicated on the submit wire.
 Next is Dispenser, the first plug-backed migration: its typed Net verbs emit acts internally and

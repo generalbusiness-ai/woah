@@ -6718,7 +6718,12 @@ export class WooWorld {
 
   private async invokeContainerHookSwallow(ctx: CallContext, target: ObjRef, name: "enterfunc" | "exitfunc", args: WooValue[]): Promise<void> {
     try {
-      await this.dispatch({ ...ctx, caller: ctx.thisObj, callerPerms: ctx.progr }, target, name, args);
+      // Container hooks are core-dispatched on behalf of the moving object.
+      // Give woocode that object as an unforgeable caller identity; inheriting
+      // the surrounding verb's receiver made public hook names impossible to
+      // guard consistently across room commands, object verbs, and actor moves.
+      const movingObject = assertObj(args[0]);
+      await this.dispatch({ ...ctx, caller: movingObject, callerPerms: ctx.progr }, target, name, args);
     } catch (err) {
       // Sparse-planning misses are control signals, not hook failures. They
       // must reach the gateway so it can fetch the missing owner projection

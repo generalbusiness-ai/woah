@@ -68,7 +68,15 @@ invalidation waves; warm p50/p95 92/101 ms, 145,485–145,491-byte responses,
 1.5 s / 512 KiB / 5 s pilot budgets. Two generic Net corrections were required
 to make that claim honest: direct semantic reads validate without committing a
 new scope head, and byte-identical repeated cell reads collapse to one wire
-proof. The ordered queue is §7.1.*
+proof. AUTHORITY CLOSURE (2026-07-22): `x`, underscore naming, and
+`direct_callable:false` are dispatch metadata, not privacy. Every internal Acts
+helper and adopted-fact writer is non-`x` and caller-guarded; every projection
+is bound to one `source_space`; authenticated participant and privileged-
+programmer regressions cover fold, capture, detach, hidden-state, and movement
+bypasses. The audit also required one generic moveto correction beyond the two
+planned read seams: container hooks now receive the moving object as `caller`,
+so executable lifecycle callbacks can authenticate substrate dispatch. This
+counts against the original core-change claim. The ordered queue is §7.1.*
 
 ---
 
@@ -188,9 +196,11 @@ is deliberately deferred until one real migration requires it.
 
 ```
 consumes: [act types]
+source_space  — non-public binding to the one composer/authority
 :fold(act)    — deterministic given (projection state, act); sole writer
                 of ALL projection state; O(payload); no foreign reads;
                 no wall clock; must update at_seq from act["seq"]
+                accepts only source_space, live or during rebuild
 :view(opts)   — the one authoritative bounded read
                 → { page, at_seq, has_more }
 :rebuild_from(space, from_seq)
@@ -237,10 +247,15 @@ Contract points sharpened by the prototype review (2026-07-21):
 **Same-anchor, trusted, bounded, fail-closed:**
 
 - *Same-anchor*: the projection lives in the case's anchor cluster, so
-  SL2 atomicity covers fold writes. Enforced at seed.
+  SL2 atomicity covers fold writes. Enforced at seed. Its non-public
+  `source_space` records the one composer; `:act` rejects an unbound or
+  foreign projection before folding.
 - *Trusted*: v1 projections come only from catalog seed. `rows`,
   `consumes`, `row_cap`, and the case's `projections` property use
-  `perms ""`; only catalog-author code can write them. There is no
+  `perms ""`; internal folds and helpers omit public `x` and validate
+  `caller` explicitly. Underscore naming and `direct_callable:false` do not
+  constrain the public sequenced route, and a wizard programmer can bypass
+  permission metadata, so neither substitutes for the guard. There is no
   dynamic attach surface; attach authority, genesis records, and
   blue-green fold replacement are deferred extensions.
 - *Fail-closed*: **any fold failure aborts the entire turn.** The
@@ -268,7 +283,7 @@ on a case, its effective surface is `$case:act`. v1 has no public
 emission surface (actor-namespace `emit_act` is deferred):
 
 ```
-verb :act(type, payload) rx {
+verb :act(type, payload) r {
   /* INTERNAL: not direct-callable, not a command, not tool-exposed.
      Frame-global guards (src/core/dsl-compiler.ts:122); direct routes
      carry seq == -1 (src/core/world.ts:4426), so seq >= 1 proves a
@@ -291,6 +306,9 @@ verb :act(type, payload) rx {
      envelope fields — the log entry is the envelope. */
   let fold_input = { "type": type, "version": 1, "payload": payload, "seq": seq };
   for p in this.projections {
+    if (!valid(p) || !isa(p, $projection) || p.source_space != this) {
+      raise { code: "E_INVARG", message: "projection is not bound to emitting space" };
+    }
     if (type in p.consumes) { p:fold(fold_input); }  /* no catch: fail-closed */
   }
   observe(act);                            /* recorded in this entry */
@@ -477,7 +495,10 @@ enforcement is what makes auxiliary-state eviction (§2.3) safe.
 Fold sketch (illustrative):
 
 ```
-verb :fold(act) rx {
+verb :fold(act) r {
+  if (caller != this.source_space) {
+    raise { code: "E_PERM", message: "projection fold is authority-internal" };
+  }
   let ty = act["type"]; let p = act["payload"];
   if (ty == "tasks.opened") {
     if (length(this.rows) >= this.row_cap) {
@@ -536,7 +557,9 @@ Parity tests:
 
 1. **Rebuild and write authority** — §5.3(2), per projection; direct
    writes to rows or projection configuration are refused even for the
-   owning actor.
+   owning actor. Every projection is bound to one `source_space`; live fold
+   accepts only that composer. Rebuild is source-mediated: the projection may
+   request recorded replay but cannot self-fold or supply fold input.
 2. **Core read seams**: `event_schema()` obeys class/feature precedence
    and returns a defensive copy of the installed shape; `replay()`
    includes the persisted `ts` without changing pagination.
@@ -546,6 +569,12 @@ Parity tests:
    leaves no act observation and no row. A direct refusal creates no
    log entry; a refusal reached through a sequenced call remains as a
    failed entry containing only its error outcome.
+   Authenticated sequenced calls to internal helpers, adopted-fact mutators,
+   and projection folds are also refused without changing artifact state,
+   projection state, sequence, or successful log entries. Repeat under a
+   wizard programmer that bypasses execute metadata to prove the explicit
+   caller guards, not `x`/underscore/direct-callable convention, carry the
+   authority.
 4. **Fail-closed atomicity**: a raising fold (E_QUOTA at row_cap; an
    induced error) aborts the whole turn — the failed call entry remains,
    but it records no act observation, writes no row, and applies **no
@@ -716,11 +745,13 @@ Recorded as stated budgets that set the v1.5 envelope:
 
 ### 8.4 Discipline and decision yield
 
-- **Core-change count.** The design claims exactly two generic read
-  seams (`event_schema`, `ts` on `replay()`). Success = no third core
-  change; any additional core edit is a *discovered seam*, documented
-  with its layering justification, and counts against the "small
-  generic completion" claim.
+- **Core-change count.** The design proposed exactly two generic read seams
+  (`event_schema`, `ts` on `replay()`). The prototype required both, then the
+  sequenced-ingress audit found one additional generic authority seam:
+  `enterfunc`/`exitfunc` inherited the initiating verb's receiver as `caller`,
+  so catalog hooks could not distinguish substrate dispatch from a named call.
+  Moveto now supplies the moving object. This third core change is documented
+  in `spec/semantics/moveto.md` and counts against the "exactly two" claim.
 - **Deferred decisions get evidence.** The prototype resolves §7.2(1)
   (where shape validation lives) from experience, and produces the
   measured cost curve for §7.2(2).

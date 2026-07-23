@@ -1011,6 +1011,7 @@ describe("outliner add over the net path converges", () => {
     // net path) can walk it to the live watermark.
     const metaId = "meta_rebuild";
     world.createObject({ id: metaId, name: "rebuild meta", parent: "$outline_meta", owner: actor, location: theOutline, anchor: theOutline });
+    world.setProp(metaId, "source_space", theOutline);
 
     const { gateway, gatewayEnv, scopeDOs } = await mountNet(world, epoch);
     for (let i = 1; i <= 4; i += 1) {

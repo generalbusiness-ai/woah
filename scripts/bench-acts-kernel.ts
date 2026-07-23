@@ -61,6 +61,7 @@ async function bench() {
     const projections = world.getProp("bench_case", "projections") as string[];
     if (lanes) {
       world.createObject({ id: "bench_lanes", name: "lanes", parent: "$kind_lanes", owner: actor, location: "bench_case" });
+      world.setProp("bench_lanes", "source_space", "bench_case");
       world.setProp("bench_case", "projections", [...projections, "bench_lanes"]);
     }
     await world.directCall("m", actor, actor, "moveto", ["bench_case"], { sessionId: session.id });

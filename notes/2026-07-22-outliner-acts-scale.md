@@ -19,19 +19,23 @@ The path includes Durable Object SQLite, cross-DO RPC, Net transcript
 validation, JSON serialization, the semantic-view response, and independent
 viewer fanout. It does not model cross-colo latency or claim an unbounded tree.
 
-## Result (2026-07-22)
+## Result (2026-07-22, authority-hardening rerun)
 
 | Measure | Result | Budget |
 |---|---:|---:|
-| Warm `tree_view` p50 | 92 ms | — |
-| Warm `tree_view` p95 | 101 ms | < 1,500 ms |
+| Warm `tree_view` p50 | 93 ms | — |
+| Warm `tree_view` p95 | 100 ms | < 1,500 ms |
 | Response bytes | 145,485–145,491 | < 524,288 |
-| Mutation → all 7 peer pushes p95 | 36 ms | — |
+| Mutation → all 7 peer pushes p95 | 48 ms | — |
 | Peer Act push bytes | 276–278 | — |
-| Eight-view invalidation → current p95 | 928 ms | < 5,000 ms |
+| Eight-view invalidation → current p95 | 940 ms | < 5,000 ms |
 
-All three peer-push times were 36, 35, and 32 ms; the complete
-invalidation-to-current waves were 928, 904, and 928 ms.
+All three peer-push times were 47, 48, and 34 ms; the complete
+invalidation-to-current waves were 940, 929, and 915 ms. This rerun includes
+the sequenced-ingress guards, source-bound/source-mediated projection rebuild,
+and substrate lifecycle-caller correction. The original pre-hardening run was
+92/101 ms warm p50/p95, 36 ms peer-push p95, and 928 ms complete-current p95;
+the authority closure remains comfortably inside the same pilot budgets.
 
 ## Findings forced by the lane
 

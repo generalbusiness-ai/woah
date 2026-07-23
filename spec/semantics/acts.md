@@ -47,6 +47,13 @@ refuse unless all of these hold:
 3. the caller is the receiver; and
 4. the receiver resolves a schema for `(type, version)` and the payload validates.
 
+Internal machinery MUST NOT carry public execute permission. An underscore name
+and `direct_callable:false` are not authority boundaries: a sequenced external
+call bypasses the direct-call gate and still executes any verb with `x`.
+Internal helpers therefore omit `x` and validate `caller` even when that seems
+redundant. The caller check protects privileged ingress and future internal
+callers; the permission bit prevents ordinary principals from entering at all.
+
 Contained objects delegate transitions to a room domain verb; they are not
 given a general Act-emission capability. Program configuration—schemas,
 features, and the projection list—is catalog state, not self-projected domain
@@ -55,16 +62,22 @@ state.
 ## ACT4. Projection contract
 
 A v1 projection is a trusted catalog object in the emitting room's anchor
-cluster. It declares consumed Act types, a row cap, projection-owned state, and
-these operations:
+cluster. Its non-public, perms-empty `source_space` binds it to exactly one
+composer authority when created. The live fold path MUST reject a projection
+whose binding does not equal the emitting room. It declares consumed Act types,
+a row cap, projection-owned state, and these operations:
 
 - `fold(act)` is deterministic from `(projection state, act)`, is the sole
   writer of all projection-owned state, performs work bounded by the Act
   payload, makes no foreign reads, uses no wall clock or randomness, and sets
-  `at_seq` from the injected `act["seq"]`;
+  `at_seq` from the injected `act["seq"]`; it has no public execute permission
+  and accepts only `caller == source_space`, live or during rebuild;
 - `view(opts)` is the authoritative bounded read and returns a completeness
   watermark; and
 - `rebuild_from(space, from_seq)` incrementally folds recorded observations.
+  It is owner/wizard-gated, refuses unless `space == source_space`, and asks
+  that source to replay and call the fold. The projection cannot self-fold or
+  supply rebuild input.
 
 Auxiliary fold state is permitted when later Acts omit context needed by the
 projection. Every auxiliary structure MUST have its own cap and safe retention
@@ -122,13 +135,21 @@ remain direct object state when it is not a shared work-surface fact. Raw
 operator lifecycle actions may also sit outside the domain log, but they MUST
 be documented as out-of-band, MUST NOT emit a misleading Act, and MUST NOT be a
 normal user path. A lifecycle hook MUST NOT silently provide an alternative
-writer for an adopted domain relation.
+writer for an adopted domain relation. When the substrate requires such a hook
+to remain executable, it MUST validate the substrate-provided moving-object
+caller before touching state or emitting; this is the narrow exception to
+ACT3's non-`x` rule for internal catalog machinery.
 
 For Outliner v3 specifically, `__ordered_edge` is the tree authority;
 `$outline_meta` checkpoints its five sequenced structural domain operations;
 `focus_by_actor` and `last_undo` are visit-scoped interaction state; raw
 substrate recycle is an out-of-band destructive repair path; and cross-outliner
 movement is refused until one routed operation can record both authorities.
+`$outline_item:moveto` is not public and has no `$nowhere` exception: successful
+remove/eject reaches substrate recycle only after the acted detach, while raw
+operator recycle invokes the guarded lifecycle callback. Outliner's
+`enterfunc` and `exitfunc` likewise require `caller == object`; they may update
+only the explicitly excluded visit state and lifecycle observations.
 
 ## ACT8. Watermarks and reads
 
@@ -162,6 +183,9 @@ An adopting catalog's tests MUST cover:
 4. exact payload keys, including absence of envelope identity and artifact
    prose;
 5. every normal domain path that changes an adopted fact, including undo;
-6. documented exclusions and refused lifecycle bypasses; and
+6. documented exclusions and refused lifecycle bypasses, including
+   authenticated sequenced calls to every internal helper and adopted-fact
+   mutator; the same calls under a privileged `progr` MUST prove the explicit
+   caller guards rather than only the missing `x` bit; and
 7. bounded read latency, response bytes, and concurrent-view fanout on the
    production-shaped runtime before a scalability claim is made.

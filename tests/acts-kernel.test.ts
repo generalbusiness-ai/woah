@@ -9,7 +9,7 @@
 // Later parts (same file, added with the acts catalog): emission authority,
 // fail-closed atomicity, rebuild invariant, board parity.
 import { describe, expect, it } from "vitest";
-import { installVerb } from "../src/core/authoring";
+import { installVerb, installVerbAs } from "../src/core/authoring";
 import { authedWorld, moveActorTo } from "./core-support";
 
 describe("event_schema builtin (core seam 1)", () => {
@@ -184,9 +184,12 @@ describe("acts kernel proof: emission authority (gate 3)", () => {
 
     // Unknown type and undeclared payload key, emitted from room verbs
     // (test-installed on the instance so caller == this holds).
-    expect(installVerb(w.world, "proof_case", "emit_bogus",
+    // These are catalog-authority probes, so install them under the same
+    // trusted programmer as the kernel. An object-owner-authored verb is not
+    // internal catalog machinery and cannot execute the non-public :act.
+    expect(installVerbAs(w.world, "$wiz", "proof_case", "emit_bogus",
       `verb :emit_bogus() rxd { return this:act("bogus.type", {}); }`, null).ok).toBe(true);
-    expect(installVerb(w.world, "proof_case", "emit_badkey",
+    expect(installVerbAs(w.world, "$wiz", "proof_case", "emit_badkey",
       `verb :emit_badkey() rxd { return this:act("tasks.released", { "task": this, "extra": 1 }); }`, null).ok).toBe(true);
     expectRefusedTurn(await seqCall(w, "emit_bogus", [], "t-bogus"), "E_INVARG");
     expectRefusedTurn(await seqCall(w, "emit_badkey", [], "t-badkey"), "E_INVARG");
@@ -242,6 +245,7 @@ describe("acts kernel proof: rebuild invariant (gate 1)", () => {
     // A fresh projection, seeded empty, folded from the recorded log only.
     // rebuild_from is incremental and bounded per call: loop until done.
     w.world.createObject({ id: "proof_board2", name: "board2", parent: "$task_board", owner: w.actor, location: "proof_case" });
+    w.world.setProp("proof_board2", "source_space", "proof_case");
     await rebuildAll(w, "proof_board2");
 
     const live = await w.world.directCall("r-v1", w.actor, "proof_case", "board", [{}], { sessionId: w.session.id });
@@ -265,6 +269,7 @@ async function lanesCase(id: string) {
   // projection co-anchored in the case (same anchor cluster, §2.3).
   const w = await proofCase();
   w.world.createObject({ id, name: "lanes", parent: "$kind_lanes", owner: w.actor, location: "proof_case" });
+  w.world.setProp(id, "source_space", "proof_case");
   w.world.setProp("proof_case", "projections", [w.board, id]);
   return w;
 }
@@ -329,6 +334,7 @@ describe("acts kernel proof: second surface — kind lanes (tier B3)", () => {
 
     // A fresh projection, seeded empty, folded from the recorded log only.
     w.world.createObject({ id: "proof_lanes2", name: "lanes2", parent: "$kind_lanes", owner: w.actor, location: "proof_case" });
+    w.world.setProp("proof_lanes2", "source_space", "proof_case");
     await rebuildAll(w, "proof_lanes2");
 
     const live = await lanesView(w, "proof_lanes");

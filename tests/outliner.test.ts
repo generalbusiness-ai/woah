@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { installVerb } from "../src/core/authoring";
+import { installVerb, installVerbAs } from "../src/core/authoring";
 import { createWorld } from "../src/core/bootstrap";
 import { installLocalCatalogs } from "../src/core/local-catalogs";
 
@@ -18,6 +18,26 @@ type CallResult =
 // through world.call with the actor's session; everything else stays direct.
 const SEQUENCED_VERBS = new Set(["add_item", "move_item", "reorder_item", "hide", "remove_item", "eject_item", "undo", "add", "hide_command", "recycle"]);
 
+async function sequencedCall(
+  world: ReturnType<typeof createWorld>,
+  actor: string,
+  space: string,
+  target: string,
+  verb: string,
+  args: unknown[],
+  reqId = `${verb}-${Math.random().toString(36).slice(2, 7)}`
+): Promise<CallResult> {
+  let sessionId: string | null = null;
+  for (const [id, s] of world.sessions) if (s.actor === actor) { sessionId = id; break; }
+  if (!sessionId) throw new Error(`no session for ${actor}`);
+  const f = await world.call(reqId, sessionId, space, { actor, target, verb, args: args as never[] });
+  if (f.op !== "applied") return f as unknown as CallResult;
+  const obs = ((f as { observations?: Array<Record<string, unknown>> }).observations ?? []);
+  const err = obs.find((o) => o && (o as { type?: unknown }).type === "$error");
+  if (err) return { op: "error", error: err as unknown as { code: string; message?: string; value?: unknown } };
+  return { op: "result", result: (f as { result: unknown }).result, observations: obs };
+}
+
 async function call(
   world: ReturnType<typeof createWorld>,
   actor: string,
@@ -27,20 +47,7 @@ async function call(
   reqId = `${verb}-${Math.random().toString(36).slice(2, 7)}`
 ): Promise<CallResult> {
   if (SEQUENCED_VERBS.has(verb)) {
-    let sessionId: string | null = null;
-    for (const [id, s] of world.sessions) if (s.actor === actor) { sessionId = id; break; }
-    if (sessionId) {
-      const f = await world.call(reqId, sessionId, target, { actor, target, verb, args: args as never[] });
-      if (f.op === "applied") {
-        const obs = ((f as { observations?: Array<Record<string, unknown>> }).observations ?? []);
-        // A refused turn commits as a failed entry whose only observation is
-        // the $error — map it back to the error shape assertions expect.
-        const err = obs.find((o) => o && (o as { type?: unknown }).type === "$error");
-        if (err) return { op: "error", error: err as unknown as { code: string; message?: string; value?: unknown } };
-        return { op: "result", result: (f as { result: unknown }).result, observations: obs };
-      }
-      return f as unknown as CallResult;
-    }
+    return sequencedCall(world, actor, target, target, verb, args, reqId);
   }
   return (await world.directCall(reqId, actor, target, verb, args as never[])) as CallResult;
 }
@@ -124,6 +131,7 @@ function attachRefusingProjection(world: ReturnType<typeof createWorld>, code: s
     location: "the_outline",
     name: "refusing projection"
   });
+  world.setProp(projection, "source_space", "the_outline");
   const installed = installVerb(
     world,
     projection,
@@ -157,6 +165,204 @@ describe("outliner catalog: seed + basic shape", () => {
     const world = setupWorld();
     // Default-property reads on a class with default `false` and no instance.
     expect(world.getProp("$outline_item", "portable")).toBe(false);
+  });
+});
+
+describe("outliner catalog: internal authority surface", () => {
+  async function sharedItem(label: string) {
+    const world = setupWorld();
+    const author = world.auth(`guest:${label}-author`);
+    const participant = world.auth(`guest:${label}-participant`);
+    await expectResult(call(world, author.actor, "the_outline", "enter", []));
+    await expectResult(call(world, participant.actor, "the_outline", "enter", []));
+    const item = await addItem(world, author.actor, `${label} private text`);
+    const projection = (world.getProp("the_outline", "projections") as string[])[0];
+    return { world, author, participant, item, projection };
+  }
+
+  it("refuses sequenced capture of another author's private undo state", async () => {
+    const { world, participant, item } = await sharedItem("capture");
+
+    const denied = await sequencedCall(world, participant.actor, "the_outline", "the_outline", "_capture_item", [item]);
+
+    expect(denied.op).toBe("error");
+    if (denied.op === "error") expect(denied.error.code).toBe("E_PERM");
+  });
+
+  it("refuses emit:false detach and preserves structure and watermark", async () => {
+    const { world, participant, item, projection } = await sharedItem("detach");
+    const edgeBefore = edgeOf(world, item);
+    const atSeqBefore = world.getProp(projection, "at_seq");
+
+    const denied = await sequencedCall(
+      world,
+      participant.actor,
+      "the_outline",
+      "the_outline",
+      "_detach_item",
+      [item, { emit: false, clear_item: true }]
+    );
+
+    expect(denied.op).toBe("error");
+    if (denied.op === "error") expect(denied.error.code).toBe("E_PERM");
+    expect(edgeOf(world, item)).toEqual(edgeBefore);
+    expect(world.getProp(projection, "at_seq")).toBe(atSeqBefore);
+  });
+
+  it("refuses public projection folds and preserves at_seq", async () => {
+    const { world, participant, item, projection } = await sharedItem("fold");
+    const atSeqBefore = world.getProp(projection, "at_seq");
+
+    const denied = await sequencedCall(
+      world,
+      participant.actor,
+      "the_outline",
+      projection,
+      "fold",
+      [{ type: "outline_item_hidden", version: 1, payload: { item, hidden: true }, seq: 999_999 }]
+    );
+
+    expect(denied.op).toBe("error");
+    if (denied.op === "error") expect(denied.error.code).toBe("E_PERM");
+    expect(world.getProp(projection, "at_seq")).toBe(atSeqBefore);
+  });
+
+  it("does not grant projections a self-fold capability for rebuild", async () => {
+    const { world, participant, item } = await sharedItem("self-fold");
+    const projection = "participant_projection";
+    world.createObject({
+      id: projection,
+      name: "participant projection",
+      parent: "$outline_meta",
+      owner: participant.actor,
+      location: "the_outline"
+    });
+    world.setProp(projection, "source_space", "the_outline");
+    // Install the wrapper as a wizard so the nested call bypasses `fold`'s
+    // missing x bit. The refusal must come from caller != source_space, not
+    // ordinary verb permissions.
+    expect(installVerbAs(
+      world,
+      "$wiz",
+      projection,
+      "forge_fold",
+      `verb :forge_fold(item) rxd {
+        return this:fold({
+          "type": "outline_item_hidden",
+          "version": 1,
+          "payload": { "item": item, "hidden": true },
+          "seq": 999999
+        });
+      }`,
+      null
+    ).ok).toBe(true);
+
+    const denied = await world.directCall(
+      "self-fold-forge",
+      "$wiz",
+      projection,
+      "forge_fold",
+      [item]
+    );
+
+    expect(denied.op).toBe("error");
+    if (denied.op === "error") expect(denied.error.code).toBe("E_PERM");
+    expect(world.getProp(projection, "at_seq")).toBe(0);
+  });
+
+  it("refuses item-level hidden writes outside the Act-producing domain verb", async () => {
+    const { world, participant, item, projection } = await sharedItem("hidden");
+    const atSeqBefore = world.getProp(projection, "at_seq");
+
+    const denied = await sequencedCall(world, participant.actor, "the_outline", item, "set_hidden", [true]);
+
+    expect(denied.op).toBe("error");
+    if (denied.op === "error") expect(denied.error.code).toBe("E_PERM");
+    expect(world.getProp(item, "hidden")).toBe(false);
+    expect(world.getProp(projection, "at_seq")).toBe(atSeqBefore);
+  });
+
+  it("refuses moveto($nowhere) outside remove/eject and preserves the tree", async () => {
+    const { world, participant, item, projection } = await sharedItem("nowhere");
+    const edgeBefore = edgeOf(world, item);
+    const atSeqBefore = world.getProp(projection, "at_seq");
+
+    const denied = await sequencedCall(world, participant.actor, "the_outline", item, "moveto", ["$nowhere"]);
+
+    expect(denied.op).toBe("error");
+    if (denied.op === "error") expect(denied.error.code).toBe("E_PERM");
+    expect(world.object(item).location).toBe("the_outline");
+    expect(edgeOf(world, item)).toEqual(edgeBefore);
+    expect(world.getProp(projection, "at_seq")).toBe(atSeqBefore);
+  });
+
+  it("caller guards refuse privileged ingress that bypasses execute permissions", async () => {
+    const world = setupWorld();
+    const wizard = world.createSessionForActor("$wiz", "bearer");
+    await expectResult(call(world, "$wiz", "the_outline", "enter", []));
+    const item = await addItem(world, "$wiz", "guarded");
+    const projection = (world.getProp("the_outline", "projections") as string[])[0];
+
+    // A wizard progr bypasses the `x` permission check, so these refusals
+    // exercise each verb's caller/authority guard itself. External ingress
+    // starts with caller == #-1; only a containing composer may proceed.
+    const attempts: Array<[string, string, unknown[]]> = [
+      ["the_outline", "_capture_item", [item]],
+      ["the_outline", "_detach_item", [item, { emit: false, clear_item: true }]],
+      ["the_outline", "_set_undo", ["$wiz", null]],
+      ["the_outline", "_restore_item", [{ text: "forged" }, false]],
+      ["the_outline", "_acts_meta", []],
+      ["the_outline", "_ensure_acts", []],
+      ["the_outline", "enterfunc", [item]],
+      ["the_outline", "exitfunc", [item]],
+      [item, "set_hidden", [true]],
+      [item, "moveto", ["$nowhere"]],
+      [item, "recycle", []],
+      [projection, "fold", [{ type: "outline_item_hidden", version: 1, payload: { item, hidden: true }, seq: 999_999 }]]
+    ];
+    for (const [target, verb, args] of attempts) {
+      const denied = await sequencedCall(world, "$wiz", "the_outline", target, verb, args, `guard-${verb}`);
+      expect(denied.op, verb).toBe("error");
+      if (denied.op === "error") expect(denied.error.code, verb).toBe("E_PERM");
+    }
+    expect(world.object(item).location).toBe("the_outline");
+    expect(world.getProp(item, "hidden")).toBe(false);
+  });
+
+  it("internal mutators have no public execute or direct capability", () => {
+    const world = setupWorld();
+    const internal: Array<[string, string]> = [
+      ["$outline_item", "moveto"],
+      ["$outline_item", "set_hidden"],
+      ["$outliner", "_detach_item"],
+      ["$outliner", "_set_undo"],
+      ["$outliner", "_restore_item"],
+      ["$outliner", "_capture_item"],
+      ["$outliner", "_acts_meta"],
+      ["$outliner", "_ensure_acts"],
+      ["$outline_meta", "fold"],
+      ["$projection", "fold"],
+      ["$projection", "view_row"],
+      ["$acts", "act"],
+      ["$acts", "_validate_payload"],
+      ["$acts", "_rebuild_projection"]
+    ];
+    for (const [target, verb] of internal) {
+      const info = world.verbInfo(target, verb);
+      expect(info.perms, `${target}:${verb}`).not.toContain("x");
+      expect(info.direct_callable, `${target}:${verb}`).toBe(false);
+    }
+    // The substrate lifecycle callback is the deliberate exception: it must
+    // be dispatchable by recycleChecked, and its caller == this guard is
+    // exercised above.
+    const lifecycle: Array<[string, string]> = [
+      ["$outline_item", "recycle"],
+      ["$outliner", "enterfunc"],
+      ["$outliner", "exitfunc"]
+    ];
+    for (const [target, verb] of lifecycle) {
+      expect(world.verbInfo(target, verb)).toMatchObject({ perms: "rx", direct_callable: false });
+    }
   });
 });
 
@@ -318,17 +524,20 @@ describe("outliner catalog: move / reorder / hide", () => {
 });
 
 describe("outliner catalog: not portable / defensive recycle", () => {
-  it("$outline_item:moveto rejects non-outliner targets with E_NOT_PORTABLE", async () => {
+  it("$outline_item:moveto is not an externally callable structural path", async () => {
     const world = setupWorld();
     const session = world.auth("guest:portless");
     await expectResult(call(world, session.actor, "the_outline", "enter", []));
     const a = await addItem(world, session.actor, "stay");
     const r = await call(world, session.actor, a, "moveto", [session.actor]);
     expect(r.op).toBe("error");
-    if (r.op === "error") expect(r.error.code).toBe("E_NOT_PORTABLE");
+    if (r.op === "error") expect(r.error.code).toBe("E_DIRECT_DENIED");
+    const sequenced = await sequencedCall(world, session.actor, "the_outline", a, "moveto", [session.actor]);
+    expect(sequenced.op).toBe("error");
+    if (sequenced.op === "error") expect(sequenced.error.code).toBe("E_PERM");
   });
 
-  it("refuses cross-outliner moveto until multi-space Acts can cover both authorities", async () => {
+  it("refuses cross-outliner movement at the execute boundary", async () => {
     const world = setupWorld();
     const session = world.auth("guest:xoutline");
     const actor = session.actor;
@@ -339,9 +548,9 @@ describe("outliner catalog: not portable / defensive recycle", () => {
     const b = await addItem(world, actor, "b", a); // b is a child of a
     const c = await addItem(world, actor, "c", b); // c is a child of b
     const before = edgeOf(world, b);
-    const r = await call(world, actor, b, "moveto", ["the_outline_2"]);
+    const r = await sequencedCall(world, actor, "the_outline", b, "moveto", ["the_outline_2"]);
     expect(r.op).toBe("error");
-    if (r.op === "error") expect(r.error.code).toBe("E_CROSS_OUTLINER");
+    if (r.op === "error") expect(r.error.code).toBe("E_PERM");
     // No lifecycle hook rewrites either tree behind its room's Act log.
     expect(world.object(b).location).toBe("the_outline");
     expect(edgeOf(world, b)).toEqual(before);
@@ -832,6 +1041,7 @@ describe("outliner acts: watermark projection + tree_view", () => {
 
     // Rebuild reproduces the watermark from recorded acts alone.
     world.createObject({ id: "wm2", name: "wm2", parent: "$outline_meta", owner: session.actor, location: "the_outline" });
+    world.setProp("wm2", "source_space", "the_outline");
     for (let i = 0; i < 20; i++) {
       const r = (await world.directCall(`wm-rb-${i}`, session.actor, "wm2", "rebuild_from", ["the_outline", 100])) as unknown as { op: string; result?: { done: boolean } };
       if (r.op !== "result" || !r.result) throw new Error("rebuild failed");

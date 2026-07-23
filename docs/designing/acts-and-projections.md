@@ -83,7 +83,9 @@ verb :claim(task) rxd {
 **Rules**
 
 - Emit only from the room's own verbs in sequenced turns (`:act`
-  refuses direct calls and `caller != this`).
+  has no public `x` permission and refuses `caller != this`). An underscore
+  name and `direct_callable:false` do not make a helper private: authenticated
+  callers can name any `x` verb through the sequenced route.
 - Never emit from `enterfunc`/`exitfunc` or any movement/lifecycle hook
   (hook errors are swallowed, so a refused act is silently lost); a
   hook that needs a trace uses plain `observe(...)` and MUST NOT mutate a
@@ -117,11 +119,25 @@ Declare the projection class and what it consumes:
                   "tasks.passed", "tasks.closed"] } ] }
 ```
 
+When creating the projection, bind it to its one composer immediately:
+
+```
+let board = create($task_board, { owner: this.owner, name: "board", location: this });
+board.source_space = this;  /* trusted catalog write; create() ignores arbitrary fields */
+this.projections = [board];
+```
+
+`source_space` is inherited from `$projection`, is not publicly writable, and
+must equal the emitting room. Never infer fold authority from location alone.
+
 Write the fold (`$task_board:fold`, trimmed — the shipped fold also
 seeds `waits`/`links` and folds `tasks.passed` into obligations):
 
 ```
-verb :fold(act) rx {
+verb :fold(act) r {
+  if (caller != this.source_space) {
+    raise { code: "E_PERM", message: "projection fold is authority-internal" };
+  }
   let ty = act["type"];
   let p = act["payload"];
   let rows = this.rows;
@@ -147,7 +163,8 @@ Join names and holders at view time by overriding `:view_row`
 (`$task_board:view_row`, trimmed):
 
 ```
-verb :view_row(key, row) rx {
+verb :view_row(key, row) r {
+  if (caller != this) { raise { code: "E_PERM", message: "projection row rendering is internal" }; }
   let t = row["task"];
   let name = null;
   let holder = null;
@@ -179,6 +196,8 @@ let next = board:view({ "limit": 50, "after": page["cursor"] });
 - Use `act["seq"]`, never `now()` and never the frame global `seq`
   (rebuild runs your fold outside a live turn).
 - Be the sole writer of `this.rows` — no other verb ever writes it.
+- Give `fold` no public `x` permission and accept only the bound
+  `source_space`. Rebuild is source-mediated; never grant self-fold.
 - Do O(payload) work per fold — never scan the room or the world.
 - Raise `E_QUOTA` at `row_cap` — raising is the overflow policy.
 - End every fold with `this.at_seq = act["seq"]`.
@@ -203,7 +222,10 @@ The fold (`$kind_lanes:fold`, trimmed — `tasks.claimed`/`tasks.released`
 move counts between lanes the same way):
 
 ```
-verb :fold(act) rx {
+verb :fold(act) r {
+  if (caller != this.source_space) {
+    raise { code: "E_PERM", message: "projection fold is authority-internal" };
+  }
   let ty = act["type"];
   let p = act["payload"];
   let key = to_string(p["task"]);
@@ -264,7 +286,10 @@ for one structure); publish only a watermark.
 The whole fold (`$outline_meta:fold`):
 
 ```
-verb :fold(act) rx {
+verb :fold(act) r {
+  if (caller != this.source_space) {
+    raise { code: "E_PERM", message: "projection fold is authority-internal" };
+  }
   this.at_seq = act["seq"];
 }
 ```
