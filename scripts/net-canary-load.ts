@@ -213,9 +213,10 @@ export async function mapWithConcurrency<T, R>(
  * Claim one deterministic guest across ambiguous transport failures.
  *
  * The claim_id is an idempotency bearer: every attempt must replay the exact
- * body. Retrying only HTTP 503s is insufficient because a lost reply rejects
- * `fetch` before any status exists—the precise dropped-reply case this lane is
- * meant to prove.
+ * body. A platform-lost internal connection can surface either as a rejected
+ * `fetch` or as a 500/502/503/504 edge response after the authority accepted
+ * the claim. Both are ambiguous dropped replies, so retry the same bearer;
+ * deterministic 4xx refusals remain immediate evidence.
  */
 export async function fetchCanaryGuestClaim(
   base: string,
@@ -231,7 +232,7 @@ export async function fetchCanaryGuestClaim(
         headers: { "content-type": "application/json" },
         body: JSON.stringify(claimBody)
       });
-      if (result.response.status !== 503 || attempt === 3) return result;
+      if (![500, 502, 503, 504].includes(result.response.status) || attempt === 3) return result;
     } catch (error) {
       if (attempt === 3) {
         throw new Error(`guest ${guestIndex} claim transport failed after ${attempt} attempts: ${String(error)}`, {

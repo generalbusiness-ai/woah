@@ -125,6 +125,26 @@ describe("deployed canary request deadline", () => {
     expect(fetcher).toHaveBeenCalledTimes(2);
     expect(fetcher.mock.calls[0]).toEqual(fetcher.mock.calls[1]);
   });
+
+  it("replays the same guest claim after a transient edge 5xx", async () => {
+    const claim = { ttl_ms: 60_000, claim_id: "stable-claim-edge-5xx" };
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce({
+        response: new Response("{}", { status: 500 }),
+        body: { error: { code: "E_INTERNAL", message: "Network connection lost." } },
+        ms: 1
+      })
+      .mockResolvedValueOnce({
+        response: new Response("{}", { status: 200 }),
+        body: { actor: "guest_net_retry_5xx", session: "s_retry_5xx" },
+        ms: 1
+      });
+
+    const result = await fetchCanaryGuestClaim("https://canary.invalid", claim, 18, fetcher, 0);
+    expect(result.body).toMatchObject({ actor: "guest_net_retry_5xx", session: "s_retry_5xx" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(fetcher.mock.calls[0]).toEqual(fetcher.mock.calls[1]);
+  });
 });
 
 describe("deployed canary concurrency bounds", () => {
