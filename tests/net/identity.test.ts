@@ -154,7 +154,7 @@ describe("identity import into a fresh install (item A + B)", () => {
     expect(world.object(account).anchor).toBe(human);
 
     // create_agent anchors the new agent to the same root.
-    const prov = (await world.directCall("prov", human, human, "create_agent", ["FamilyBot", "", true])) as {
+    const prov = (await world.directCall("prov", human, human, "create_agent", ["FamilyBot", "", true])) as unknown as {
       op: string; result: { actor_id: string };
     };
     const agent = prov.result.actor_id;

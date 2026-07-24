@@ -3802,8 +3802,10 @@ export class WooWorld {
         const next = Math.max(0, Number(this.propOrNull(account, "programmer_agent_count") ?? 0) + delta);
         this.setProp(account, "programmer_agent_count", next);
         // The caller (the human/wizard) is the acting principal; the agent is
-        // the subject (§8.10 audit attribution).
-        this.recordWizardAction(caller, auditAction, { target: actor, account, programmer });
+        // the subject (§8.10). Routed through the profile audit adapter so the
+        // Net transition writes no catalog $system cell (its audit is the
+        // commit record); local materializes into wizard_actions.
+        this.recordProvisioningAudit(caller, auditAction, { target: actor, account, programmer, transition: true });
       }
       // Surface reconciliation is unconditional so partial legacy state heals.
       // A repair without a flag transition is itself auditable.
@@ -3811,7 +3813,7 @@ export class WooWorld {
       this.reconcileProgrammerSurface(actor, programmer);
       const hasSurface = surface ? this.featureList(actor).includes(surface) : false;
       if (!transition && hadSurface !== hasSurface) {
-        this.recordWizardAction(caller, "programmer_surface_repaired", { target: actor, attached: hasSurface });
+        this.recordProvisioningAudit(caller, "programmer_surface_repaired", { target: actor, attached: hasSurface, transition: false });
       }
     }
 
@@ -9751,6 +9753,29 @@ export class WooWorld {
       entry.target = subject;
     }
     this.setProp("$system", "wizard_actions", [...actions, entry]);
+  }
+
+  private provisioningAuditSink: ((principal: ObjRef, action: string, details: Record<string, WooValue>) => void) | null = null;
+
+  /**
+   * Profile adapter for provisioning audit events (audit.md AU1). The default
+   * (in-memory and local SQLite) materializes into `$system.wizard_actions`.
+   * The Net planning profile installs a no-op sink because `$system` is
+   * catalog-scoped there — writing it would be a forbidden catalog mutation —
+   * and the canonical Net audit is the record minted from the committed
+   * transcript (the promote/demote turn's verb + write-set + principal). This
+   * is the seam that keeps provisioning logic free of `if (net)` branches.
+   */
+  setProvisioningAuditSink(sink: ((principal: ObjRef, action: string, details: Record<string, WooValue>) => void) | null): void {
+    this.provisioningAuditSink = sink;
+  }
+
+  private recordProvisioningAudit(principal: ObjRef, action: string, details: Record<string, WooValue>): void {
+    if (this.provisioningAuditSink) {
+      this.provisioningAuditSink(principal, action, details);
+      return;
+    }
+    this.recordWizardAction(principal, action, details);
   }
 
   /**
