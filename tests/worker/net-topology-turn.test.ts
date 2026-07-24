@@ -8,7 +8,8 @@
 //     convention (the DO namespace key IS the scope name);
 //   - foreign reads attest against their derived owners — the class
 //     chain against the CATALOG scope DO, the actor's cells against its
-//     CLUSTER scope DO (real /net/attest RPCs to both);
+//     CLUSTER scope DO (real /net/attest RPCs to both), while the room's
+//     exact session_presence checkpoint removes the session-only cluster RPC;
 //   - a rider write to the actor commits at the room and is adopted at
 //     the cluster (rider objects derived from the transcript, not from
 //     a request anchor map);
@@ -23,6 +24,7 @@ import { createWorld } from "../../src/core/bootstrap";
 import { cellsFromSerialized, type ShadowTurnCall } from "../../src/net/bridge";
 import { CATALOG_SCOPE, isEpochImmutableDefinition, partitionCells } from "../../src/net/topology";
 import type { AttemptTraceEntry } from "../../src/net/errors";
+import { SESSION_PRESENCE_RELATION } from "../../src/net/relations";
 import type { CommitReply, ScopeHead } from "../../src/net/scope";
 
 const SECRET = "net-topology-test-secret";
@@ -312,10 +314,26 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
         return instance;
       }
     };
+    const sessionValue = partitions.get(clusterScope)?.find(
+      (cell) => cell.kind === "session" && cell.object === session.id
+    )?.value;
+    expect(sessionValue).toBeTruthy();
     for (const scope of [roomScope, clusterScope, CATALOG_SCOPE]) {
       const st = netState(`scope-${scope}`);
       const instance = new NetScopeDO(st.state, scopeEnv);
-      await call(instance, scopeEnv, "/seed", { scope, catalog_epoch: EPOCH, cells: partitions.get(scope) ?? [] });
+      await call(instance, scopeEnv, "/seed", {
+        scope,
+        catalog_epoch: EPOCH,
+        cells: partitions.get(scope) ?? [],
+        relations: scope === roomScope
+          ? [{
+              relation: SESSION_PRESENCE_RELATION,
+              owner: "topo_room",
+              member: session.id,
+              body: { actor, session: sessionValue }
+            }]
+          : []
+      });
       doStates.set(scope, st);
       scopeDOs.set(scope, instance);
     }
@@ -389,7 +407,10 @@ describe("NetGatewayDO derived topology (CO15) over three scope DOs", () => {
     // their content-addressed versions. Even concurrent cold turns perform no
     // catalog I/O and therefore cannot join Cloudflare request lineages.
     expect(rpcLog.filter((entry) => entry === `scope:${CATALOG_SCOPE}/net/attest`)).toHaveLength(0);
-    expect(rpcLog.filter((entry) => entry === `scope:${clusterScope}/net/attest`)).toHaveLength(2);
+    // The only foreign mutable read is the session. The gateway and room
+    // carry the same owner-sequenced presence checkpoint, so neither turn
+    // needs a live actor-cluster RPC.
+    expect(rpcLog.filter((entry) => entry === `scope:${clusterScope}/net/attest`)).toHaveLength(0);
 
     // Runtime programmers may still edit user-owned noncatalog objects, but
     // installed catalog classes are epoch-immutable. This target has no child

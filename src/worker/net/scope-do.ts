@@ -95,7 +95,7 @@ import { mintSpanId, spanSampled } from "../../net/spans";
 import { normalizeTraceContext, parseTraceparent, type TraceContext } from "../../net/trace";
 import { exportSpans } from "./span-export";
 import type { Cell } from "../../net/cells";
-import { cellKey, lineageClosureKeys, serializeTransfer, type CellTransfer } from "../../net/cells";
+import { cellKey, cellVersion, lineageClosureKeys, serializeTransfer, type CellTransfer } from "../../net/cells";
 import { isNetError, netError } from "../../net/errors";
 import {
   LIVE_FANOUT_BATCH_CAP,
@@ -1826,6 +1826,28 @@ export class NetScopeDO {
         authorizeSessionSubmit(submit, {
           ownsSession: (id) => this.ownsSessionCell(seq, id),
           readSession: (id) => seq.store.get(cellKey("session", id)),
+          // A room's session_presence family is its owner-sequenced
+          // checkpoint of actor-cluster session transitions. The row carries
+          // the exact session value and is freshness-fenced on mint/move/close,
+          // so this scope can prove a present session read without calling the
+          // actor cluster again on every room turn.
+          readProjectedSession: (id) => {
+            if (!resolvedScope.startsWith("room:")) return undefined;
+            const room = resolvedScope.slice("room:".length);
+            const row = seq.relations().get(relationKey(SESSION_PRESENCE_RELATION, room, id));
+            const body = row?.body as { actor?: unknown; session?: unknown } | undefined;
+            const value = body?.session as { id?: unknown; actor?: unknown; activeScope?: unknown } | undefined;
+            if (
+              !value
+              || value.id !== id
+              || typeof value.actor !== "string"
+              || body?.actor !== value.actor
+              || value.activeScope !== room
+            ) {
+              return undefined;
+            }
+            return { value, version: cellVersion(value) };
+          },
           now: () => this.host.now(),
           // Identity-door exclusiveMint occupancy witness: this cluster's
           // session cells for the actor (the store index). No residue

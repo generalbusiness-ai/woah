@@ -34,13 +34,18 @@ const NOW = 1_000_000;
 /** A sequencer wired the way NetScopeDO wires it: authorize =
  * authorizeSessionSubmit over the sequencer's own store (the ownership
  * witness is "holds the cell" — no rider residue in these fixtures). */
-function sessionSequencer(scope: string, options: ScopeSequencerOptions = {}): ScopeSequencer {
+function sessionSequencer(
+  scope: string,
+  options: ScopeSequencerOptions = {},
+  readProjectedSession?: (id: string) => { value: unknown; version: string } | undefined
+): ScopeSequencer {
   const seq: ScopeSequencer = new ScopeSequencer(scope, EPOCH, {
     ...options,
     authorize: (submit) =>
       authorizeSessionSubmit(submit, {
         ownsSession: (id) => seq.store.has(sessionCellKey(id)),
         readSession: (id) => seq.store.get(sessionCellKey(id)),
+        ...(readProjectedSession ? { readProjectedSession } : {}),
         now: () => NOW
       })
   });
@@ -401,6 +406,95 @@ describe("authorizeSessionSubmit at the owning scope (CO4 step 1)", () => {
       submitFor(room, transcript, "sess-foreign-ok", attest(sessionCell?.version as string))
     );
     expect(accepted.status, JSON.stringify(accepted)).toBe("accepted");
+  });
+
+  it("a room-owned presence checkpoint proves its exact projected session read", () => {
+    const value = sessionRow({ activeScope: "r1" });
+    const projected = { value, version: cellVersion(value) };
+    const room = sessionSequencer(
+      "room:r1",
+      { owns: (object) => object === "#thing" || object === "#actor" },
+      (id) => id === "s1" ? projected : undefined
+    );
+    room.seed(thingCells);
+    const transcript = transcriptWith({
+      scope: room.scope,
+      session: "s1",
+      reads: [{ cell: { kind: "session", object: "s1" }, version: projected.version, value: projected.value as never }],
+      hash: "sess-projected-ok"
+    });
+    const accepted = room.submit(submitFor(room, transcript, "sess-projected-ok"));
+    expect(accepted.status, JSON.stringify(accepted)).toBe("accepted");
+  });
+
+  it("a changed room checkpoint is a retryable read mismatch, while expiry still refuses", () => {
+    const current = sessionRow({ activeScope: "r1" });
+    const projected = { value: current, version: cellVersion(current) };
+    const stale = sessionRow({ activeScope: "r1", started: NOW - 2_000 });
+    const staleRoom = sessionSequencer(
+      "room:r1",
+      { owns: (object) => object === "#thing" || object === "#actor" },
+      () => projected
+    );
+    staleRoom.seed(thingCells);
+    const staleTranscript = transcriptWith({
+      scope: staleRoom.scope,
+      session: "s1",
+      reads: [{ cell: { kind: "session", object: "s1" }, version: cellVersion(stale), value: stale as never }],
+      hash: "sess-projected-stale"
+    });
+    const mismatch = staleRoom.submit(submitFor(staleRoom, staleTranscript, "sess-projected-stale"));
+    expect(mismatch.status).toBe("rejected");
+    if (mismatch.status === "rejected") {
+      expect(mismatch.reason).toBe("read_version_mismatch");
+      expect(mismatch.retryable).toBe(true);
+    }
+
+    // When the gateway sees that its room mirror is not exact it carries the
+    // live owner proof. That proof must win over the lagging checkpoint or a
+    // degraded presence-fence would grind on a stale projection forever.
+    const ownerProofRoom = sessionSequencer(
+      "room:r1",
+      { owns: (object) => object === "#thing" || object === "#actor" },
+      () => ({ value: stale, version: cellVersion(stale) })
+    );
+    ownerProofRoom.seed(thingCells);
+    const currentTranscript = transcriptWith({
+      scope: ownerProofRoom.scope,
+      session: "s1",
+      reads: [{ cell: { kind: "session", object: "s1" }, version: projected.version, value: projected.value as never }],
+      hash: "sess-owner-proof-over-projection"
+    });
+    const ownerProof = {
+      "cluster:#actor": {
+        owner_head: { seq: 1, hash: "cluster-head" },
+        cells: [{ key: sessionCellKey("s1"), version: projected.version }]
+      }
+    };
+    const ownerAccepted = ownerProofRoom.submit(
+      submitFor(ownerProofRoom, currentTranscript, "sess-owner-proof-over-projection", ownerProof)
+    );
+    expect(ownerAccepted.status, JSON.stringify(ownerAccepted)).toBe("accepted");
+
+    const expired = sessionRow({ activeScope: "r1", expiresAt: NOW - 1 });
+    const expiredRoom = sessionSequencer(
+      "room:r1",
+      { owns: (object) => object === "#thing" || object === "#actor" },
+      () => ({ value: expired, version: cellVersion(expired) })
+    );
+    expiredRoom.seed(thingCells);
+    const expiredTranscript = transcriptWith({
+      scope: expiredRoom.scope,
+      session: "s1",
+      reads: [{ cell: { kind: "session", object: "s1" }, version: cellVersion(expired), value: expired as never }],
+      hash: "sess-projected-expired"
+    });
+    const refused = expiredRoom.submit(submitFor(expiredRoom, expiredTranscript, "sess-projected-expired"));
+    expect(refused.status).toBe("rejected");
+    if (refused.status === "rejected") {
+      expect(refused.reason).toBe("unauthorized");
+      expect(refused.detail).toMatchObject({ session_verdict: "expired", source: "room_presence_projection" });
+    }
   });
 });
 

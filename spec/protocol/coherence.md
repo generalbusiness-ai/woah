@@ -891,8 +891,25 @@ One write path per fact (CO9), concretized:
   authorize then validates semantically. An attested-but-different
   version is NOT an auth verdict: step 7 rejects it retryably
   (`read_version_mismatch`) so a stale view repairs instead of
-  terminal-failing. Ownership witness: the scope holds the cell AND it
-  is not CA3 rider residue. Sessions absent entirely → allowed only for
+  terminal-failing.
+
+  A room authority has one equivalent local proof: its owner-sequenced
+  `session_presence` checkpoint. The row is projected only from the
+  actor-cluster session transition, carries the exact session value, and
+  mint/move/close freshness-fence its add/remove at the room before
+  returning. When (and only when) that row is owned by the committing
+  room, names the submitted session, and its value says
+  `activeScope == room`, the scope MAY validate the session read against
+  the row's content version instead of demanding a live actor-cluster
+  attestation. It still validates actor binding and expiry locally. A
+  different projected version is the same retryable
+  `read_version_mismatch`; an absent row or a commit anywhere other than
+  that active room uses the ordinary CO2.3 owner attestation. Thus close
+  completion removes the proof before returning, and an overdue relation
+  cannot extend a session because expiry is checked from its value.
+
+  Ownership witness: the scope holds the cell AND it is not CA3 rider
+  residue. Sessions absent entirely → allowed only for
   direct-route turns (lane/tooling submits); a sequenced turn must name
   a session, and the Phase-4 client surface requires sessions on all
   client-originated turns (next bullet). Credential authentication

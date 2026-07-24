@@ -200,8 +200,10 @@ export type ScheduledTurn = {
 
 export type ScopeSequencerOptions = {
   /** Step 1: envelope/actor/session authority. Default accepts (in-process
-   * trust); Phase-3 hosts inject the real check. Throw NetError to refuse. */
-  authorize?: (submit: CommitSubmit) => void;
+   * trust); Phase-3 hosts inject the real check. Throw NetError to refuse.
+   * The returned versions are foreign reads proved by a projection this
+   * scope owns; step 7 compares them exactly like owner attestations. */
+  authorize?: (submit: CommitSubmit) => ReadonlyMap<string, string> | void;
   /** Step 9: per-write authority. Default requires each authority-cell
    * write to name its recording VM frame (`writer`), per CO3: never the
    * union of verb owners. */
@@ -566,8 +568,9 @@ export class ScopeSequencer {
     // so an unauthorized refusal names its verdict (expired / missing /
     // actor_mismatch / session_unattested / session_required) instead of
     // burying it in prose.
+    let locallyProvedReads: ReadonlyMap<string, string> = new Map();
     try {
-      this.options.authorize?.(submit);
+      locallyProvedReads = this.options.authorize?.(submit) ?? locallyProvedReads;
     } catch (err) {
       const structured =
         err && typeof err === "object" && "detail" in err && err.detail && typeof err.detail === "object"
@@ -728,11 +731,11 @@ export class ScopeSequencer {
       const key = netCellKeyFor(read.cell);
       if (key === null) continue; // contents reads are projection reads (CA4)
       if (this.options.owns && !this.options.owns(read.cell.object) && !createdHere.has(read.cell.object)) {
-        const attestedVersion = attested.get(key);
-        if (attestedVersion === undefined) {
-          // A rider read nobody attested is a protocol violation by the
-          // submitter (the gateway attests every foreign read at plan
-          // time), not a stale-view condition — terminal, named (the
+        const provedVersion = locallyProvedReads.get(key) ?? attested.get(key);
+        if (provedVersion === undefined) {
+          // A rider read with neither an owner attestation nor a local
+          // projection proof is a protocol violation by the submitter,
+          // not a stale-view condition — terminal, named (the
           // pre-amendment behavior silently skipped these reads, which
           // is the CO2.4 gap this closes; notes/2026-07-06-rider-read-
           // integrity.md).
@@ -741,7 +744,7 @@ export class ScopeSequencer {
         // Attested-vs-planned mismatch repairs exactly like an owned
         // stale read: the gateway refreshes the cell (from its owner,
         // via the anchors routing), re-attests, and re-plans.
-        if (attestedVersion !== String(read.version)) mismatched.set(key, read.cell);
+        if (provedVersion !== String(read.version)) mismatched.set(key, read.cell);
         continue;
       }
       const current = this.store.get(key)?.version ?? "absent";

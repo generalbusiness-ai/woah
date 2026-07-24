@@ -5748,6 +5748,32 @@ export class NetGatewayDO {
   }
 
   /**
+   * Read one exact mirrored relation row. Hot authorization paths must use
+   * this indexed `(relation, owner, member)` lookup instead of enumerating a
+   * room's whole relation family: room occupancy is unbounded in Big World.
+   */
+  private relationMember(
+    relation: string,
+    owner: string,
+    member: string
+  ): { member: string; member_scope?: string; body?: unknown } | undefined {
+    const row = sqlRows<{ member: string; member_scope: string | null; body: string | null }>(
+      this.state.storage.sql.exec(
+        "SELECT member, member_scope, body FROM net_gateway_relation WHERE relation = ? AND owner = ? AND member = ? LIMIT 1",
+        relation,
+        owner,
+        member
+      )
+    )[0];
+    if (!row) return undefined;
+    return {
+      member: row.member,
+      ...(row.member_scope !== null ? { member_scope: row.member_scope } : {}),
+      ...(row.body !== null ? { body: JSON.parse(row.body) as unknown } : {})
+    };
+  }
+
+  /**
    * SECURITY (session bearer-token leak, P0): the CLIENT-facing view of a
    * relation's members. A net session id IS the bearer credential
    * (`Authorization: Bearer session:<id>`), so it must NEVER reach any
@@ -6625,8 +6651,27 @@ export class NetGatewayDO {
       if (key === null) continue; // contents reads are projection reads (CA4)
       // CO14: session cells classify by the calling actor (sessions.ts
       // classification rule — session ids carry no lineage; their
-      // authority is the actor's cluster). The folded session read of a
-      // room-committed turn attests at the cluster like any rider read.
+      // authority is the actor's cluster). A committing room may instead
+      // prove the read from its owner-sequenced session_presence checkpoint.
+      // Skip the live cluster attestation only when this gateway already
+      // mirrors that exact checkpoint value; the room revalidates its current
+      // row, so a stale/missing mirror can never authorize a turn.
+      if (read.cell.kind === "session") {
+        const value = read.value as { actor?: unknown; activeScope?: unknown } | undefined;
+        const activeScope = typeof value?.activeScope === "string" ? value.activeScope : null;
+        const projected = activeScope === null
+          ? undefined
+          : this.relationMember(SESSION_PRESENCE_RELATION, activeScope, read.cell.object);
+        const projectedValue = (projected?.body as { session?: unknown } | undefined)?.session;
+        if (
+          activeScope !== null
+          && targetScope === `room:${activeScope}`
+          && projectedValue !== undefined
+          && cellVersion(projectedValue) === String(read.version)
+        ) {
+          continue;
+        }
+      }
       const owner =
         read.cell.kind === "session"
           ? classifier.scopeOf(planned.transcript.call.actor)
