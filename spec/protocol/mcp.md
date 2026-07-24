@@ -93,7 +93,12 @@ The supported scopes change presentation, never authority:
 | `here` | Active space and its direct contents. |
 | `object` | One named object, only if it is already in structural context. |
 | `space` | One contextual space (or the active space) and its direct contents. |
-| `all` | The complete structural context; it never enumerates the world. |
+
+There is deliberately no `all` scope. `active` already returns the complete
+structural context; a separate `all` had no distinct selection (it resolved to
+the same local closure) and wrongly implied a global tool enumeration, which
+Big-World forbids ([distribution.md](../semantics/distribution.md)). A request
+for `scope: "all"` is rejected.
 
 ### M2.2 Verb mapping
 

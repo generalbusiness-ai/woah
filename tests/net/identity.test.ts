@@ -78,6 +78,22 @@ describe("identity import into a fresh install (item A + B)", () => {
     expect([...plan.partitions.keys()]).toContain(`cluster:${actor}`);
   });
 
+  it("carries an actor's composed programmer surface (features) across the cutover", async () => {
+    const { world, actor } = oldWorld();
+    // Compose the programmer surface onto the carried actor.
+    world.setObjectFlags("$wiz", actor, { programmer: true });
+    expect(world.actorHasSurface(actor, "$programmer")).toBe(true);
+
+    const identity = exportIdentity(world.exportWorld());
+    const carried = identity.actors.find((entry) => entry.id === actor);
+    expect(carried?.props.features).toEqual(["$programmer"]);
+
+    const plan = await planNetInstall({ graft: (fresh) => importIdentity(fresh, identity) });
+    // The surface survives the graft: flag AND feature, not flag alone.
+    expect(plan.world.object(actor).flags.programmer).toBe(true);
+    expect(plan.world.actorHasSurface(actor, "$programmer")).toBe(true);
+  });
+
   it("multi-actor accounts keep their ORIGINAL primary_actor across the carry (reviewer finding 3)", async () => {
     // The reviewer's repro shape: the primary is z_human, but an agent
     // whose id sorts FIRST is also bound — a rebuild-from-first-sorted

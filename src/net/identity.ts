@@ -70,7 +70,13 @@ export function materializeCustomerAttributions(world: WooWorld): string[] {
  *   point — rebuilt-from-bindings guesses wrong for multi-actor
  *   accounts, so the original mapping carries (export filters it to
  *   exported actors; import verifies resolution). `actors` carries too,
- *   filtered the same way. */
+ *   filtered the same way;
+ * - `features` / `features_version`: an actor's composed authoring surface
+ *   is capability, not cosmetic room state. A programmer agent
+ *   (`$agent` + attached `$programmer` feature) that lost its features at
+ *   cutover would keep the `programmer` flag but silently drop the surface —
+ *   a flag-without-surface break. The feature refs are catalog classes that
+ *   reinstall fresh, so they resolve after the graft. */
 const IDENTITY_PROPS = [
   "name",
   "account",
@@ -82,7 +88,9 @@ const IDENTITY_PROPS = [
   "deactivated_at",
   "primary_actor",
   "actors",
-  "last_seen_at"
+  "last_seen_at",
+  "features",
+  "features_version"
 ] as const;
 
 export type IdentityActorExport = {
