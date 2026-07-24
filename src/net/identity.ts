@@ -101,6 +101,12 @@ export type IdentityActorExport = {
   parent: string;
   name: string;
   owner: string;
+  /** Authority anchor (an object field, not a prop): the actor that roots this
+   * object's authority scope. Carried so a co-located identity family (account
+   * + owned agents anchored to their human) reconstructs its single-cluster
+   * placement after the graft; without it they would rehome anchorless and
+   * split across catalog + per-agent clusters. Absent for an anchorless root. */
+  anchor?: string;
   /** Permission/deactivation flags verbatim (actorCanAuthenticate inputs). */
   flags: Record<string, unknown>;
   /** Present identity properties from the closed allow-list. */
@@ -217,6 +223,12 @@ export function exportIdentity(serialized: SerializedWorld): IdentityExport {
       parent: obj.parent,
       name: obj.name,
       owner: obj.owner,
+      // The authority anchor is object-lineage state, not a property, and it
+      // determines the carried object's Net scope (topology.ts scopeNameOf). An
+      // identity family co-located under a human authority root (account +
+      // owned agents anchored to the human) must keep that anchor across the
+      // carry, or it would re-diverge to catalog/self-cluster on import.
+      ...(obj.anchor ? { anchor: obj.anchor } : {}),
       flags: (obj.flags ?? {}) as Record<string, unknown>,
       props
     });
@@ -339,6 +351,10 @@ export async function importIdentity(
         parent: actor.parent,
         owner: actor.owner,
         flags: actor.flags as never,
+        // Anchor is set at creation and never patched (world.ts) — it must ride
+        // the create call, not a later setProp, to reconstruct the authority
+        // family's single-cluster placement. Verified below to resolve.
+        ...(actor.anchor ? { anchor: actor.anchor } : {}),
         ...(embodied && start !== null ? { location: start } : {})
       });
     } else {
@@ -450,6 +466,12 @@ export async function importIdentity(
     const primary = actor.props.primary_actor;
     if (typeof primary === "string" && primary.length > 0 && !liveChainReaches(world, primary, "$actor")) {
       dangling.push(`${actor.id}: primary_actor ${primary} is not a live $actor descendant`);
+    }
+    // A carried authority anchor must resolve to a live actor — a dangling
+    // anchor would misroute the object's Net scope (topology.ts scopeNameOf
+    // throws E_LINEAGE when the anchor walk leaves the lineage set), so abort.
+    if (typeof actor.anchor === "string" && actor.anchor.length > 0 && !liveChainReaches(world, actor.anchor, "$actor")) {
+      dangling.push(`${actor.id}: authority anchor ${actor.anchor} is not a live $actor descendant`);
     }
   }
   if (dangling.length > 0) {

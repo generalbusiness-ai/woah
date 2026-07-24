@@ -113,6 +113,35 @@ describe("identity import into a fresh install (item A + B)", () => {
     expect(plan.world.actorHasSurface(actor, "$programmer")).toBe(true);
   });
 
+  it("carries the authority anchor so a co-located identity family lands in one cluster", async () => {
+    const old = createWorld();
+    const human = old.auth("guest:auth-human").actor;
+    old.createObject({ id: "acct_auth", parent: "$account", owner: "$wiz", name: "auth" });
+    old.setProp("acct_auth", "email", "auth@example.com" as never);
+    old.setProp(human, "account", "acct_auth" as never);
+    old.ensureApiKey("$wiz", human, "auth-human-key", "auth-human-secret", "human");
+    const agent = old.createObject({ id: "agent_auth", parent: "$agent", owner: human, name: "agent" }).id;
+    old.ensureApiKey("$wiz", agent, "auth-agent-key", "auth-agent-secret", "agent");
+    // Anchor the account and the owned agent to the human authority root.
+    old.object("acct_auth").anchor = human;
+    old.object(agent).anchor = human;
+
+    const identity = exportIdentity(old.exportWorld());
+    // The anchor rides the export.
+    expect(identity.actors.find((a) => a.id === "acct_auth")?.anchor).toBe(human);
+    expect(identity.actors.find((a) => a.id === agent)?.anchor).toBe(human);
+
+    const plan = await planNetInstall({ graft: (fresh) => importIdentity(fresh, identity) });
+    // Human, account, and agent all partition into cluster:<human> — one
+    // authoritative scope, so a promote/demote turn touching agent + account can
+    // commit atomically without a catalog write.
+    const scopeOf = (id: string): string | undefined =>
+      [...plan.partitions.entries()].find(([, cells]) => cells.some((c) => c.object === id))?.[0];
+    expect(scopeOf(human)).toBe(`cluster:${human}`);
+    expect(scopeOf("acct_auth")).toBe(`cluster:${human}`);
+    expect(scopeOf(agent)).toBe(`cluster:${human}`);
+  });
+
   it("multi-actor accounts keep their ORIGINAL primary_actor across the carry (reviewer finding 3)", async () => {
     // The reviewer's repro shape: the primary is z_human, but an agent
     // whose id sorts FIRST is also bound — a rebuild-from-first-sorted
