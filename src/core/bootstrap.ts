@@ -1181,11 +1181,11 @@ function seedUniversal(world: WooWorld): void {
   seedProp(world, "$system", "default_programmer_grant_quota", 0);
   // Catalog classes whose command-shaped verbs are "obvious plumbing" and are
   // hidden from examine/command listings. Catalog data so the obvious-verb
-  // projection names no *catalog* class: each catalog appends its own via an
-  // append_unique set_property seed_hook (chat -> $room, prog -> $builder). The
-  // substrate base classes ($root, $player) are always dull and are unioned in
-  // by core (they are bootstrap seeds it may name); they are intentionally not
-  // stored here.
+  // projection names no catalog class: each catalog appends its own surface
+  // classes via an append_unique set_property seed_hook (the chat and prog
+  // catalogs each contribute theirs). The substrate base classes ($root,
+  // $player) are always dull and are unioned in by core (they are bootstrap
+  // seeds it may name); they are intentionally not stored here.
   define(world, "$system", "dull_command_definers", [], "list<obj>", "r");
   define(world, "$system", "help_dbs", [], "list<obj>", "r");
   define(world, "$root", "help", null, "obj|list<obj>|null", "r");
