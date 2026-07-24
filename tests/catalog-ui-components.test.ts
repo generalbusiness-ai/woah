@@ -10,6 +10,7 @@ import outlinerManifest from "../catalogs/outliner/manifest.json";
 import pinboardManifest from "../catalogs/pinboard/manifest.json";
 import tasksManifest from "../catalogs/tasks/manifest.json";
 import weatherManifest from "../catalogs/weather/manifest.json";
+import { WooSpaceChatPanelElement } from "../catalogs/chat/ui/chat-space";
 import { DUBSPACE_DRUM_VOICES, dubspaceControlDefinitions } from "../catalogs/dubspace/ui/model";
 import {
   CatalogUiRegistry,
@@ -1870,9 +1871,10 @@ describe("bundled catalog UI components", () => {
   it("preserves an existing task-space chat panel across rerenders", async () => {
     const { WooTasksKanbanElement } = await import("../catalogs/tasks/ui/kanban-board");
     defineOnce("woo-tasks-kanban", WooTasksKanbanElement);
-    if (!customElements.get("woo-space-chat-panel")) {
-      customElements.define("woo-space-chat-panel", class extends HTMLElement {});
-    }
+    // Register the production constructor. A placeholder permanently poisons
+    // jsdom's process-wide custom-element registry and makes later component
+    // tests order-dependent because custom elements cannot be redefined.
+    defineOnce("woo-space-chat-panel", WooSpaceChatPanelElement);
     const element = document.createElement("woo-tasks-kanban") as HTMLElement & { woo?: WooContext; data?: any; showCompanion?: boolean };
     document.body.appendChild(element);
     element.showCompanion = true;

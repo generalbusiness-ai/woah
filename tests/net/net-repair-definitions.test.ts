@@ -4,12 +4,13 @@ import { definitionRepairInputs } from "../../scripts/net-repair-definitions";
 describe("signed net definition repair inputs", () => {
   it("mines replacement definitions and retired removals from the bundled catalogs", async () => {
     const result = await definitionRepairInputs(
-      ["$outliner:list_items", "prop:$outline_item:__ordered_edge"],
+      ["$outliner:list_items", "prop:$outline_item:__ordered_edge", "prop:$actor:api_keys"],
       ["$outline_item:set_parent", "$outliner:_siblings_ordered", "prop:$outline_item:parent"]
     );
     expect(result.cells).toEqual([
       expect.objectContaining({ kind: "verb_bytecode", object: "$outliner", name: "list_items", value: expect.any(Object) }),
-      expect.objectContaining({ kind: "property_cell", object: "$outline_item", name: "__ordered_edge", value: expect.any(Object) })
+      expect.objectContaining({ kind: "property_cell", object: "$outline_item", name: "__ordered_edge", value: expect.any(Object) }),
+      expect.objectContaining({ kind: "property_cell", object: "$actor", name: "api_keys", value: expect.any(Object) })
     ]);
     expect(result.remove).toEqual([
       { kind: "verb_bytecode", object: "$outline_item", name: "set_parent" },

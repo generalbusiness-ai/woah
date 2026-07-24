@@ -3957,6 +3957,7 @@ describe("local catalogs", () => {
       const owner = ownerSess.actor;
       const blockId = "obj_test_block_mint";
       world.createObject({ id: blockId, name: blockId, parent: "$block", owner, location: "$nowhere" });
+      const legacyBefore = world.propOrNull("$system", "api_keys");
       // Owner mints.
       const minted = world.directCall("mint-key", owner, blockId, "mint_apikey", ["primary"]);
       // Note: directCall returns synchronously here because mint_apikey is a verb that calls a substrate native.
@@ -3966,6 +3967,11 @@ describe("local catalogs", () => {
         if (res.op !== "result") return;
         const key = res.result as { id: string; secret: string; actor: string };
         expect(key.actor).toBe(blockId);
+        expect(key.id).toMatch(/^n1_/);
+        expect(world.propOrNull("$system", "api_keys")).toEqual(legacyBefore);
+        expect(world.propOrNull(blockId, "api_keys")).toMatchObject({
+          [key.id]: expect.objectContaining({ actor: blockId, hash: expect.any(String), salt: expect.any(String) })
+        });
         const sess = world.auth(`apikey:${key.id}:${key.secret}`);
         expect(sess.actor).toBe(blockId);
       });

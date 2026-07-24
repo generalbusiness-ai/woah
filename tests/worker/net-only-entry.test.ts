@@ -3,6 +3,7 @@ import worker, { type NetOnlyEnv } from "../../src/worker/net-only-index";
 import { FakeDurableObjectState } from "./fake-do";
 import { NetScopeDO, type NetScopeDurableState } from "../../src/worker/net/scope-do";
 import { signInternalRequest } from "../../src/worker/internal-auth";
+import { routedApiKeyId } from "../../src/core/api-key-id";
 
 function netState(name: string): { state: NetScopeDurableState; close: () => void } {
   const fake = new FakeDurableObjectState(name);
@@ -35,6 +36,99 @@ function harness() {
 }
 
 describe("net-only Worker entry", () => {
+  it("serves the marketing root on the landing host, preserves protocol routes, and redirects human paths", async () => {
+    const { env, close } = harness();
+    const assetPaths: string[] = [];
+    env.ASSETS = {
+      fetch: async (request: Request) => {
+        assetPaths.push(new URL(request.url).pathname);
+        return new Response(`asset:${new URL(request.url).pathname}`);
+      }
+    } as unknown as Fetcher;
+    for (const path of ["/", "/index.html", "/landing", "/landing.html"]) {
+      const response = await worker.fetch(new Request(`https://woah.generalbusiness.ai${path}`), env);
+      expect(response.status, path).toBe(200);
+      expect(await response.text()).toBe("asset:/landing");
+    }
+    expect(assetPaths).toEqual(["/landing", "/landing", "/landing", "/landing"]);
+
+    const protocol = await worker.fetch(new Request("https://woah.generalbusiness.ai/healthz"), env);
+    expect(protocol.status).toBe(503);
+    expect(protocol.headers.get("location")).toBeNull();
+
+    const redirected = await worker.fetch(new Request("https://woah.generalbusiness.ai/docs/getting-started?q=1"), env);
+    expect(redirected.status).toBe(308);
+    expect(redirected.headers.get("location")).toBe("https://woah1.generalbusiness.ai/docs/getting-started?q=1");
+    close();
+  });
+
+  it("keeps credential ensure internal-signed and routes only the verifier to its authority", async () => {
+    const { env, close } = harness();
+    const scope = env.NET_RESOLVE!("scope:catalog");
+    const seed = new Request("https://do/net/seed", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        scope: "catalog",
+        catalog_epoch: "net-only-credential",
+        cells: [{ kind: "object_lineage", object: "$wiz", value: { parent: "$player", anchor: null } }],
+        relations: []
+      })
+    });
+    expect((await scope.fetch(await signInternalRequest(env, seed))).status).toBe(200);
+
+    const id = routedApiKeyId("$wiz", "$wiz", "33333333333333333333333333333333");
+    const body = {
+      authority_scope: "catalog",
+      actor: "$wiz",
+      id,
+      record: {
+        hash: "6".repeat(64),
+        salt: "7".repeat(32),
+        actor: "$wiz",
+        label: "operator",
+        created_at: 5
+      }
+    };
+    const unsigned = await worker.fetch(new Request("https://woo.test/net-operator/credentials/ensure", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
+    }), env);
+    expect(unsigned.status).toBe(401);
+
+    const signed = await signInternalRequest(env, new Request("https://woo.test/net-operator/credentials/ensure", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
+    }));
+    const ensured = await worker.fetch(signed, env);
+    expect(ensured.status, await ensured.clone().text()).toBe(200);
+    expect(await ensured.json()).toMatchObject({ ok: true, status: "applied", actor: "$wiz", id });
+
+    // Exact semantic replay is success without another head advance. JSON
+    // object insertion order is transport trivia, not a verifier collision.
+    const reorderedBody = {
+      authority_scope: body.authority_scope,
+      actor: body.actor,
+      id: body.id,
+      record: {
+        created_at: body.record.created_at,
+        label: body.record.label,
+        actor: body.record.actor,
+        salt: body.record.salt,
+        hash: body.record.hash
+      }
+    };
+    const replayed = await worker.fetch(await signInternalRequest(env, new Request("https://woo.test/net-operator/credentials/ensure", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(reorderedBody)
+    })), env);
+    expect(await replayed.json()).toMatchObject({ ok: true, status: "empty", actor: "$wiz", id });
+    close();
+  });
+
   it("retains the signed, world-state-free install readiness probe", async () => {
     const { env, close } = harness();
     const request = await signInternalRequest(env, new Request("https://woo.test/net-install/probe"));

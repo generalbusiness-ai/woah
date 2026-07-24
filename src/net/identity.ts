@@ -7,8 +7,9 @@
  * The cutover reinstalls the world from catalogs; the ONE thing carried
  * over is identity: the `$system.api_keys` map verbatim (salted hashes —
  * plugs and agents keep authenticating) and the reachable identity actor
- * graph with PRESERVED object ids (apikey records point at actor objects
- * by id; preserving ids means no ref rewriting anywhere). Bearer tokens
+ * graph, including agent-owner chains, with PRESERVED object ids (apikey
+ * records point at actor objects by id; preserving ids means no ref
+ * rewriting anywhere). Bearer tokens
  * are dropped by design (60-minute TTL; humans re-login by password).
  *
  * Export is a pure walk over a SerializedWorld (no live world needed —
@@ -88,7 +89,7 @@ const IDENTITY_PROPS = [
 export type IdentityActorExport = {
   /** Original object id — imports re-create with the SAME id. */
   id: string;
-  /** Parent CLASS id (e.g. "$agent", "$account"), resolved against the
+  /** Parent CLASS id (for example, the agent class or "$account"), resolved against the
    * freshly installed catalogs at import. */
   parent: string;
   name: string;
@@ -145,11 +146,12 @@ function propsOf(obj: SerializedObject): Map<string, unknown> {
 
 /**
  * Export the identity graph from a serialized v2 world image: the
- * api_keys map verbatim, every `$account` instance, and every `$actor`
+ * api_keys map verbatim, every `$account` instance, every acting-principal
  * descendant referenced by an apikey record or carrying an account
- * binding. Nothing else — inventories, locations, and world furniture
- * are deliberately not carried; imported actors rehome to the catalog
- * start location (§8).
+ * binding, and the transitive agent-owner chain needed to preserve that
+ * actor's authentication verdict. Nothing else — inventories, locations,
+ * and world furniture are deliberately not carried; imported actors
+ * rehome to the catalog start location (§8).
  */
 export function exportIdentity(serialized: SerializedWorld): IdentityExport {
   const objects = new Map<string, SerializedObject>(serialized.objects.map((obj) => [obj.id, obj]));
@@ -176,6 +178,21 @@ export function exportIdentity(serialized: SerializedWorld): IdentityExport {
     if (!chainReaches(objects, obj.id, "$actor") || obj.id === "$actor") continue;
     const account = propsOf(obj).get("account");
     if (typeof account === "string" && account.length > 0) wanted.add(obj.id);
+  }
+  // An agent's eligibility is recursive through object ownership. Carry the
+  // full actor-owner chain even when an owner has neither an API key nor an
+  // account binding of its own. Without this closure a same-id stock guest
+  // can be adopted at import with fresh flags/properties, silently
+  // reactivating every carried agent below a deactivated owner.
+  const pendingOwners = [...wanted];
+  while (pendingOwners.length > 0) {
+    const id = pendingOwners.pop()!;
+    const obj = objects.get(id);
+    if (!obj || !chainReaches(objects, id, "$agent")) continue;
+    const owner = objects.get(obj.owner);
+    if (!owner || !chainReaches(objects, owner.id, "$actor") || wanted.has(owner.id)) continue;
+    wanted.add(owner.id);
+    pendingOwners.push(owner.id);
   }
 
   const actors: IdentityActorExport[] = [];

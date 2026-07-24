@@ -56,7 +56,7 @@ Extending [identity.md §I3](../semantics/identity.md#i3-auth-guest-baseline):
 
 - **`session:<session_id>`** — unchanged from identity.md. A live-session resume token.
 
-- **`apikey:<id>:<secret>`** — long-lived programmatic credential for service/agent accounts. See A8.
+- **`apikey:<id>:<secret>`** — long-lived programmatic credential for service/agent accounts. The id is public routing metadata, not a secret; only the final secret component authenticates. See A8.
 
 - **`recovery:<token>`** — single-use, narrow-scope token from a recovery flow. Lands the user in a session that can change credentials and nothing else.
 
@@ -141,6 +141,35 @@ contract.
   For `$wiz`-owned infra agents (bundled plugs, deployment-bound
   identities) there is no `$account`; the key is bound to the agent
   directly and its lifecycle follows the deployment.
+- **Authority and lookup (implemented).** A newly minted key record lives in
+  the bound actor's own `api_keys` property, at that actor's immutable anchor
+  cluster. The record contains the salted secret hash and metadata; cleartext
+  never persists. Its id has the versioned self-routing form
+  `n1_<authority-root-hex>_<actor-hex>_<random-hex>`. The two encoded object
+  references are public routing hints, not credentials. They let any cold
+  gateway name the one bounded authority scope and actor without enumeration.
+  The committing scope derives an `api_key_lookup` relation row keyed by the
+  id from the actor property. Authentication asks that exact authority for
+  that one indexed row and its current mutation-complete head; it must not
+  trust an asynchronously updated gateway copy as the revocation fence. The
+  lookup never scans actors or becomes a second authority. Relation rebuild
+  from the actor property must reproduce the complete lookup family.
+- The historical `$system.api_keys` map is read-only compatibility for carried
+  keys. New issuance, rotation, revocation, and liveness metadata must not
+  write it. An old key remains usable until rotated or revoked through the
+  migration/operator path; importing an old identity image must never
+  overwrite a newer actor-owned record or resurrect a revocation.
+- Credential inspection is likewise bounded: an owner may list one actor's
+  redacted records, while the wizard-only global listing is a compatibility
+  view of the historical registry. Runtime code must not enumerate actor
+  authorities to synthesize a new global key list.
+- Owner issuance and revocation are ordinary actor-cluster turns and therefore
+  commit the key record, lookup projection, turn audit, and returned result
+  atomically. Deployment bootstrap may instead use the internal-signed
+  operator ensure route. Operator tooling generates and durably stores the id
+  and secret locally first; the route accepts only the derived salted verifier,
+  is idempotent for the exact same actor/id/verifier tuple, rejects collisions,
+  and never receives or returns the replayable secret.
 - API keys are scoped (`read-only`, `bot:<purpose>`, etc.).
 - Revocable independently of bearer tokens.
 - May have IP / origin restrictions.
@@ -151,7 +180,9 @@ kind-vs-capability split: class via `$agent`, authoring privilege via
 the `programmer` flag (subject to its own quota — see
 [provisioning.md AP6](provisioning.md#ap6-self-service-agent-provisioning-in-world)).
 
-Audit: API key issuance is logged; usage is logged at session-start (not per-call, to keep the volume bounded).
+Audit: API key issuance and revocation are authority commits; usage is logged
+at session-start (not per-call, to keep the volume bounded). Logs and metrics
+may carry the key id but must never carry the secret or full token.
 
 ---
 

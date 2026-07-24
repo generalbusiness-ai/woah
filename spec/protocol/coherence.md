@@ -932,11 +932,20 @@ One write path per fact (CO9), concretized:
   reads, metrics, tickets, and WebSocket upgrades return to that same DO.
   No internal signing rides this path — the gateway
   authenticates the client credential itself: `authorization: Bearer
-  apikey:<id>:<secret>` (or `x-woo-api-key`) verified against the
-  catalog identity cell `property_cell:$system:api_keys` (pull-on-miss
-  from the catalog scope), with core's exact salt/hash scheme
-  reimplemented in `src/worker/net/client-auth.ts` (never an engine
-  import); refusals are named 401 `E_NOSESSION` verdicts.
+  apikey:<id>:<secret>` (or `x-woo-api-key`). For an `n1_` id, the public
+  routing hint names the actor's immutable anchor scope and actor. The gateway
+  asks that authority for exactly one indexed `api_key_lookup` row and the
+  current mutation-complete head; it does not transfer the scope or trust an
+  asynchronously fanned-out copy as a revocation fence. The relation is a
+  cache: its one writer is transcript derivation at the actor authority, and
+  bounded relation rebuild must reproduce it from the actor-owned `api_keys`
+  cell. Historical ids fall back to the carried, read-only catalog identity
+  cell `property_cell:$system:api_keys`. Both paths use core's exact salt/hash
+  scheme reimplemented in `src/worker/net/client-auth.ts` (never an engine
+  import); refusals are named 401 `E_NOSESSION` verdicts. A session minted
+  from an API key stores only that public id and re-checks it on bearer-only
+  requests, so revocation also fences already-minted HTTP, MCP, and WebSocket
+  sessions without persisting the secret.
   **Rate limits (wire.md's inbound rule, applied per authenticated
   actor):** every `/net-api` operation — REST request or WS turn frame —
   draws from one token bucket of 50 ops/s sustained, burst 100; the

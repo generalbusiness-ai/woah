@@ -1185,7 +1185,12 @@ function seedUniversal(world: WooWorld): void {
   define(world, "$root", "help", null, "obj|list<obj>|null", "r");
   define(world, "$actor", "features", [], "list<obj>", "r");
   define(world, "$actor", "features_version", 0, "int", "r");
-  define(world, "$actor", "focus_list", [], "list<obj>", "r");
+  const actorClass = "$actor";
+  define(world, actorClass, "focus_list", [], "list<obj>", "r");
+  // A principal's long-lived programmatic credentials are authoritative in
+  // that principal's immutable anchor cluster. The empty permission string
+  // keeps raw hashes private; owner-facing verbs expose metadata only.
+  define(world, actorClass, "api_keys", {}, "map", "");
   define(world, "$player", "home", "$nowhere", "obj|null");
   define(world, "$account", "email", "", "str", "r");
   define(world, "$account", "email_verified_at", null, "int|null", "r");
@@ -1325,8 +1330,8 @@ function seedUniversal(world: WooWorld): void {
   native(world, "$system", "create_api_key", "create_api_key", "verb :create_api_key(actor, label?) rxd { /* native: wizard-only. Mint a long-lived apikey credential bound to the given actor (per auth.md A8). Returns {id, secret, actor, label, created_at}; the secret is shown ONCE — store it. Auth via POST /api/auth with token \"apikey:<id>:<secret>\" returns a fresh bearer session bound to the actor. Whoever holds the apikey gains that actor's authority. Audited. */ }", { directCallable: true, perms: "rxd", argSpec: { args: ["actor", "label?"] } });
   native(world, "$system", "create_api_key_for_owner", "create_api_key_for_owner", "verb :create_api_key_for_owner(actor, label?) rxd { /* native: callable by the owner of `actor` (wizard always allowed). Same return shape as :create_api_key but does not require wizard authority — it's the path catalog code (e.g. $block:mint_apikey) uses so a block's creator can mint a plug credential for their block without escalation. Audited. */ }", { directCallable: true, perms: "rxd", argSpec: { args: ["actor", "label?"] } });
   native(world, "$system", "revoke_api_key", "revoke_api_key", "verb :revoke_api_key(id) rxd { /* native: callable by wizard or by the owner of the apikey's bound actor. Marks api_keys[id].revoked_at so future authentications fail; in-memory sessions minted from this key are also closed. The record is kept (with revoked_at populated) for audit. Returns true on first revoke, false if already revoked or id unknown. Audited. */ }", { directCallable: true, perms: "rxd", argSpec: { args: ["id"] } });
-  native(world, "$system", "list_api_keys", "list_api_keys", "verb :list_api_keys() rxd { /* native: wizard-only. Returns [{id, actor, label, created_at, last_seen_at, revoked_at}] for inspection — secrets are NEVER readable post-mint. */ }", { directCallable: true, perms: "rxd", argSpec: { args: [] } });
-  native(world, "$system", "list_api_keys_for_owner", "list_api_keys_for_owner", "verb :list_api_keys_for_owner() rxd { /* native: returns api-key metadata for actors the caller owns. Wizard sees everything. Same shape as :list_api_keys. Useful so a block's owner can audit \"is my plug connected and which key is it using?\" without wizard authority. */ }", { directCallable: true, perms: "rxd", argSpec: { args: [] } });
+  native(world, "$system", "list_api_keys", "list_api_keys", "verb :list_api_keys() rxd { /* native: wizard-only compatibility view of the historical global registry. Returns redacted [{id, actor, label, created_at, last_seen_at, revoked_at}] records; actor-owned keys are intentionally not globally enumerable. */ }", { directCallable: true, perms: "rxd", argSpec: { args: [] } });
+  native(world, "$system", "list_api_keys_for_owner", "list_api_keys_for_owner", "verb :list_api_keys_for_owner() rxd { /* native: returns redacted api-key metadata for the bounded actor supplied by a catalog wrapper. A direct system call retains historical-registry compatibility; it never enumerates all actor authorities. */ }", { directCallable: true, perms: "rxd", argSpec: { args: [] } });
   native(world, "$system", "provision_actor", "provision_actor", "verb :provision_actor(class, owner, attrs?) rxd { /* native: wizard-only audited actor provisioning primitive. */ }", { directCallable: true, perms: "rxd", argSpec: { args: ["class", "owner", "attrs?"] } });
   native(world, "$system", "rotate_api_key", "rotate_api_key", "verb :rotate_api_key(actor, force?) rxd { /* native: mint a replacement API key for an agent actor. */ }", { directCallable: true, perms: "rxd", argSpec: { args: ["actor", "force?"] } });
   native(world, "$system", "deactivate_actor", "deactivate_actor", "verb :deactivate_actor(actor, reason?) rxd { /* native: deactivate an account-bound actor and reap relevant sessions. */ }", { directCallable: true, perms: "rxd", argSpec: { args: ["actor", "reason?"] } });

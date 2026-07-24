@@ -112,6 +112,10 @@ export type MintSessionInput = {
   activeScope?: string | null;
   /** Display identity for the compact room-roster projection. */
   actorName?: string;
+  /** Long-lived credential that authenticated this mint, when any. Keeping
+   * the public id in the session cell lets bearer-only transports (MCP and
+   * browser sessions) re-check revocation without retaining the secret. */
+  apikeyId?: string;
   /** Identity-door guest claim: stamp the transcript exclusiveMint so
    * the cluster sequencer refuses `actor_occupied` when another live
    * session binds the actor (two humans must never share one guest). */
@@ -184,6 +188,7 @@ export function mintSessionSubmit(input: MintSessionInput): MintSessionResult {
     started: input.now,
     expiresAt: input.closing ? input.now + 250 : input.now + input.ttl_ms,
     activeScope: input.closing ? null : (input.activeScope ?? null),
+    ...(!input.closing && input.apikeyId ? { apikeyId: input.apikeyId } : {}),
     ...(input.closing?.ephemeralActor
       ? {
           ephemeralActor: true,

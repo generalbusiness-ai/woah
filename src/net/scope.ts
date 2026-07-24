@@ -26,7 +26,18 @@
 import { CellStore, type Cell, type EpochStamp } from "./cells";
 import { netError } from "./errors";
 import { validateSessionCell } from "./sessions";
-import { applyRelationDeltas, deriveRelationDeltas, rebuildContentsRelation, relationKey, SESSION_PRESENCE_RELATION, type RelationDelta, type RelationRow } from "./relations";
+import {
+  ACTOR_API_KEYS_PROPERTY,
+  API_KEY_LOOKUP_RELATION,
+  applyRelationDeltas,
+  deriveRelationDeltas,
+  rebuildApiKeyLookupRelation,
+  rebuildContentsRelation,
+  relationKey,
+  SESSION_PRESENCE_RELATION,
+  type RelationDelta,
+  type RelationRow
+} from "./relations";
 import {
   ORDERED_EDGE_RELATION,
   orderedChildrenForContainer,
@@ -46,6 +57,7 @@ import { replayPageVersion, type ReplayLogEntry } from "./replay-pages";
 import type { ScopeMeta, ScopeStore, TailEntry } from "./scope-store";
 import { applyTranscript, isSequencedAllocationCell, netCellKeyFor, type EffectTranscript, type TranscriptCell } from "./transcript";
 import { cellKey, cellVersion } from "./cells";
+import { parseRoutedApiKeyId, routedApiKeyScope } from "../core/api-key-id";
 
 export type ScopeHead = {
   seq: number;
@@ -61,6 +73,13 @@ export type OperatorDefinitionRepair = {
   head: ScopeHead;
   cells: Cell[];
   removed: string[];
+};
+
+export type OperatorCredentialEnsure = {
+  status: "applied" | "empty";
+  head: ScopeHead;
+  cell: Cell;
+  relation: RelationRow;
 };
 
 /** CO7/CO10 envelope byte ceilings. Enforced by the gateway on the ACTUAL
@@ -545,6 +564,137 @@ export class ScopeSequencer {
     return { status: "applied", head: this.headState, cells: committed, removed };
   }
 
+  /** Internal-signed bootstrap of one actor-owned API-key verifier.
+   *
+   * The operator generates the id, secret, and salt locally and sends only the
+   * non-replayable verifier record here. Exact replay is empty success;
+   * disagreement at an existing id is a collision. The actor cell, lookup
+   * relation, head, and recovery tail advance in one durable transaction.
+   */
+  operatorEnsureCredential(
+    actor: string,
+    id: string,
+    record: Record<string, unknown>
+  ): OperatorCredentialEnsure {
+    const routed = parseRoutedApiKeyId(id);
+    const routedScope = routedApiKeyScope(id);
+    const recordKeys = Object.keys(record).sort();
+    const closedRecord =
+      recordKeys.length === 5 &&
+      recordKeys.every((key) => ["actor", "created_at", "hash", "label", "salt"].includes(key));
+    if (
+      !routed ||
+      routed.actor !== actor ||
+      routedScope !== this.scope ||
+      !closedRecord ||
+      record.actor !== actor ||
+      typeof record.hash !== "string" ||
+      !/^[0-9a-f]{64}$/.test(record.hash) ||
+      typeof record.salt !== "string" ||
+      !/^[0-9a-f]{32}$/.test(record.salt) ||
+      !Number.isSafeInteger(record.created_at) ||
+      Number(record.created_at) < 0 ||
+      (record.label !== null &&
+        (typeof record.label !== "string" || new TextEncoder().encode(record.label).byteLength > 256))
+    ) {
+      throw netError("E_INVARG", "credential ensure record or routing hint is invalid", {
+        actor,
+        id,
+        scope: this.scope
+      });
+    }
+    if (!this.store.has(cellKey("object_lineage", actor))) {
+      throw netError("E_MISSING_STATE", "credential actor is not authoritative at this scope", {
+        actor,
+        scope: this.scope
+      });
+    }
+    if (this.options.scopeOf && this.options.scopeOf(actor) !== this.scope) {
+      throw netError("E_INVARG", "credential actor belongs to a different authority scope", {
+        actor,
+        scope: this.scope,
+        actual: this.options.scopeOf(actor)
+      });
+    }
+
+    const key = cellKey("property_cell", actor, ACTOR_API_KEYS_PROPERTY);
+    const priorCell = this.store.get(key);
+    const priorPayload =
+      priorCell?.value && typeof priorCell.value === "object" && !Array.isArray(priorCell.value)
+        ? priorCell.value as { value?: unknown; def?: unknown }
+        : {};
+    const priorMap =
+      priorPayload.value && typeof priorPayload.value === "object" && !Array.isArray(priorPayload.value)
+        ? priorPayload.value as Record<string, unknown>
+        : {};
+    const existing = priorMap[id];
+    if (existing !== undefined && cellVersion(existing) !== cellVersion(record)) {
+      throw netError("E_INVARG", "credential id is already bound to a different verifier", {
+        actor,
+        id
+      });
+    }
+    const relation: RelationRow = {
+      relation: API_KEY_LOOKUP_RELATION,
+      owner: actor,
+      member: id,
+      body: record
+    };
+    const relationId = relationKey(relation.relation, relation.owner, relation.member);
+    if (
+      existing !== undefined &&
+      cellVersion(this.relationRows.get(relationId)) === cellVersion(relation)
+    ) {
+      if (!priorCell) throw netError("E_MISSING_STATE", "credential record exists without its authority cell", { actor, id });
+      return { status: "empty", head: this.headState, cell: priorCell, relation };
+    }
+
+    const marker = `operator_credential_ensure:${cellVersion({ actor, id, record })}`;
+    const priorHead = this.headState;
+    const nextHead: ScopeHead = {
+      seq: priorHead.seq + 1,
+      hash: cellVersion([priorHead.hash, priorHead.seq + 1, marker]),
+      generation: (priorHead.generation ?? priorHead.seq) + 1
+    };
+    const nextStamp: EpochStamp = {
+      scope_head: `${nextHead.seq}:${nextHead.hash}`,
+      catalog_epoch: this.catalogEpoch
+    };
+    const cell = this.store.commit({
+      kind: "property_cell",
+      object: actor,
+      name: ACTOR_API_KEYS_PROPERTY,
+      value: {
+        ...("def" in priorPayload ? { def: priorPayload.def } : {}),
+        value: { ...priorMap, [id]: record }
+      },
+      stamp: nextStamp
+    });
+    this.relationRows.set(relationId, relation);
+    this.headState = nextHead;
+    const tailEntry: TailEntry = {
+      seq: nextHead.seq,
+      transcript_hash: marker,
+      touched: [cell.key],
+      base_hash: priorHead.hash,
+      head_hash: nextHead.hash
+    };
+    this.tail.push(tailEntry);
+    if (this.tail.length > this.options.tailLimit) this.tail.splice(0, this.tail.length - this.options.tailLimit);
+
+    const durable = this.options.durable;
+    if (durable) {
+      durable.transaction(() => {
+        durable.writeCell(cell);
+        durable.writeRelation(relationId, relation);
+        durable.writeMeta(this.metaRow());
+        durable.appendTail(tailEntry);
+        durable.trimTail(this.options.tailLimit);
+      });
+    }
+    return { status: "applied", head: this.headState, cell, relation };
+  }
+
   /**
    * CO4 validation order. Steps 1–9 are pre-state-only; the doomed-round
    * short-circuit is honored implicitly by ordering (stale head / scope /
@@ -996,7 +1146,14 @@ export class ScopeSequencer {
     // single write path for contents/presence rows. Local rows apply here
     // (durably, in the same transaction below); foreign rows ride the
     // reply for the shell's /net/relate delivery.
-    const derived = deriveRelationDeltas(submit.transcript, applied, this.scope, this.options.scopeOf, applied.post);
+    const derived = deriveRelationDeltas(
+      submit.transcript,
+      applied,
+      this.scope,
+      this.options.scopeOf,
+      applied.post,
+      this.relationRows.values()
+    );
     const changedRelationKeys = applyRelationDeltas(this.relationRows, derived.local);
     this.syncOrderedRelationIndex(changedRelationKeys);
     const relationsForeign = [...derived.foreign.entries()].map(([scope, deltas]) => ({ scope, deltas }));
@@ -1598,8 +1755,9 @@ export class ScopeSequencer {
     return lo;
   }
 
-  /** CO13 bounded repair: recompute the locally knowable contents relation
-   * from authority live cells. Presence and ordered-edge rows are preserved:
+  /** CO13 bounded repair: recompute the locally knowable contents and
+   * actor-owned credential relations from authority cells. Presence and
+   * ordered-edge rows are preserved:
    * their defining cells may live at foreign immutable anchors, so they repair
    * only through their single transcript-derivation + `/net/relate` path.
    * Replaces contents rows in memory and durably.
@@ -1611,24 +1769,31 @@ export class ScopeSequencer {
    * scope's row family — the CO9 dual-write this module exists to
    * prevent. Single-scope contents rebuilds keep everything. */
   rebuildRelations(): void {
+    const cells = [...this.store.keys()].map((key) => this.store.get(key)).filter((c): c is Cell => Boolean(c));
     const rebuilt = rebuildContentsRelation(
-      [...this.store.keys()].map((key) => this.store.get(key)).filter((c): c is Cell => Boolean(c)),
+      cells,
       this.scope
     );
+    for (const [key, row] of rebuildApiKeyLookupRelation(cells)) rebuilt.set(key, row);
     if (this.options.scopeOf) {
       for (const [key, row] of [...rebuilt]) {
         if (this.options.scopeOf(row.owner) !== this.scope) rebuilt.delete(key);
       }
     }
     for (const [key, row] of [...this.relationRows]) {
-      if (row.relation === "contents" && !rebuilt.has(key)) this.relationRows.delete(key);
+      if (
+        (row.relation === "contents" || row.relation === API_KEY_LOOKUP_RELATION) &&
+        !rebuilt.has(key)
+      ) this.relationRows.delete(key);
     }
     for (const [key, row] of rebuilt) this.relationRows.set(key, row);
     const durable = this.options.durable;
     if (durable) {
       durable.transaction(() => {
         for (const row of durable.readRelations()) {
-          if (row.relation === "contents") durable.deleteRelation(relationKey(row.relation, row.owner, row.member));
+          if (row.relation === "contents" || row.relation === API_KEY_LOOKUP_RELATION) {
+            durable.deleteRelation(relationKey(row.relation, row.owner, row.member));
+          }
         }
         for (const [key, row] of rebuilt) durable.writeRelation(key, row);
       });

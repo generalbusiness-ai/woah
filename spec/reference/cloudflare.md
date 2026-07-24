@@ -1405,6 +1405,44 @@ distinct DO instances addressed by shard-hinted `idFromName`
 stably (sticky routing); anonymous claims spread by edge entropy; a
 `validShardHint` check blocks arbitrary DO naming.
 
+The production entry also exposes one internal-signed credential bootstrap
+operation: `POST /net-operator/credentials/ensure`. It accepts an actor,
+authority scope, versioned self-routing key id, and verifier record
+(`hash`, `salt`, actor, label, creation time)—never the replayable secret.
+The actor scope stores that record and derives the lookup relation. Exact
+replay is success, while disagreement at an existing id is a collision
+refusal. This is an operator recovery/provisioning surface, not a client API:
+the edge verifies `WOO_INTERNAL_SECRET`, strips the inbound signature, and
+freshly signs the authority hop. Secrets must not enter logs, metrics, command
+arguments, or repository files. Operator tooling generates the secret
+locally and writes the one-time full token to an owner-only (`0600`) file
+before sending the verifier or installing it as a Worker secret.
+
+For a Net world installed before `$actor.api_keys` existed, deploy the runtime
+and then run the explicit, idempotent bootstrap-definition migration before
+minting through block verbs:
+
+```bash
+npm run repair:net-definitions -- \
+  https://woah1.generalbusiness.ai \
+  'prop:$actor:api_keys'
+```
+
+The command requires the currently deployed `WOO_INTERNAL_SECRET`. A missing
+local copy is not recoverable from Cloudflare (Worker secret values are
+write-only); rotate that secret deliberately and store the replacement in the
+owner-only operations credential file before running signed repair/bootstrap
+commands.
+
+The two production custom domains deliberately have different root behavior:
+`woah.generalbusiness.ai` serves `/landing` for `GET`/`HEAD` of `/`,
+`/index.html`, `/landing`, and `/landing.html`, serves only the landing's
+declared static asset paths directly, and preserves protocol routes such as
+`/mcp` and `/net-api/*`. Other paths redirect with 308 to
+`woah1.generalbusiness.ai`, which is the world application host. This routing
+belongs in the Net-only entry; deleting the classic entry must not delete the
+public-site contract.
+
 Net turn-path `[vars]`:
 
 | Var | Default | Meaning |

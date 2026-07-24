@@ -75,7 +75,15 @@ import { clampClientSessionTtl } from "../../net/client-session-policy";
 import { budgetExhausted, isNetError, netError, nonconvergentRead, NetError, type AttemptTraceEntry, type NetErrorCode } from "../../net/errors";
 import { LIVE_FANOUT_BATCH_CAP, type LiveFanoutBatchBody, type LiveFanoutBody } from "../../net/live";
 import { applyFanout, type FanoutBody } from "../../net/outbox";
-import { observationsForRelationOwners, relationKey, roomRosterRows, SESSION_PRESENCE_RELATION, type RelationDelta, type RelationRow, type RoomRosterRow } from "../../net/relations";
+import {
+  observationsForRelationOwners,
+  relationKey,
+  roomRosterRows,
+  SESSION_PRESENCE_RELATION,
+  type RelationDelta,
+  type RelationRow,
+  type RoomRosterRow
+} from "../../net/relations";
 import { mintSessionSubmit, sessionCellKey, validateSessionCell } from "../../net/sessions";
 import { sessionIdWithShardHint, ticketIdWithShardHint } from "../../net/session-id";
 import {
@@ -94,6 +102,7 @@ import { assertEnvelopeCeiling, submitEnvelopeBytes, WARM_ENVELOPE_BYTE_LIMIT, t
 import { netCellKeyFor, type EffectTranscript } from "../../net/transcript";
 import type { CellTransfer } from "../../net/cells";
 import { randomHex } from "../../core/source-hash";
+import { parseRoutedApiKeyId, routedApiKeyScope } from "../../core/api-key-id";
 import {
   GUEST_RESET_NATIVE,
   guestResetVerbPageFor,
@@ -106,7 +115,16 @@ import type { ShadowTurnCall } from "../../core/shadow-turn-call";
 import { provisionGuestSubmit, type GuestTemplate } from "../../net/guest";
 import { verifyInternalRequest } from "../internal-auth";
 import { emitMetric, type AnalyticsMetric } from "../metrics-sink";
-import { ClientAuthError, MAX_EMAIL_BYTES, MAX_PASSWORD_BYTES, normalizeEmail, parseClientCredential, verifyApiKeyCredential, verifyPasswordCredential } from "./client-auth";
+import {
+  ClientAuthError,
+  MAX_EMAIL_BYTES,
+  MAX_PASSWORD_BYTES,
+  normalizeEmail,
+  parseClientCredential,
+  verifyApiKeyCredential,
+  verifyApiKeyRecord,
+  verifyPasswordCredential
+} from "./client-auth";
 import { TokenBucketLimiter } from "./rate-limit";
 import { resolveNetDestination, WorkerdHost, type NetBindingsEnv } from "./workerd-host";
 
@@ -339,6 +357,10 @@ type SessionOpenRequest = {
   issued_at_ms?: number;
   /** Session close (finding 12 — see MintSessionInput.closing). */
   closing?: { priorActiveScope: string | null; ephemeralActor?: boolean };
+  /** Public id of the API key that authenticated this mint. The secret never
+   * enters session state; bearer-only follow-up requests use this id to
+   * re-check the key's current authority record. */
+  apikey_id?: string;
 };
 
 /** /net/turn reply body. `trace` lists the failed rounds that preceded
@@ -2338,6 +2360,7 @@ export class NetGatewayDO {
       epoch: request.catalog_epoch,
       clusterScope,
       ...(request.active_scope !== undefined ? { activeScope: request.active_scope } : {}),
+      ...(request.apikey_id ? { apikeyId: request.apikey_id } : {}),
       ...(request.exclusive ? { exclusive: true } : {}),
       ...(stampGuestCustomerOf ? { stampGuestCustomerOf: true } : {}),
       ...(request.closing ? { closing: request.closing } : {})
@@ -2646,7 +2669,7 @@ export class NetGatewayDO {
         return await this.clientMcp(request);
       }
       if (request.method === "GET" && url.pathname === "/net-api/mcp") {
-        return this.clientMcpEvents(request);
+        return await this.clientMcpEvents(request);
       }
       if (request.method === "DELETE" && url.pathname === "/net-api/mcp") {
         return await this.clientMcpClose(request);
@@ -2709,10 +2732,10 @@ export class NetGatewayDO {
       let actor: string;
       let bearerSession: string | null = null;
       if (credential.kind === "session") {
-        actor = this.actorForSessionBearer(credential.session);
+        actor = await this.authorizedActorForSessionBearer(credential.session, identity.map);
         bearerSession = credential.session;
       } else {
-        actor = verifyApiKeyCredential(identity.map, credential).actor;
+        actor = (await this.verifyClientApiKey(identity.map, credential)).actor;
       }
 
       // H4: rate limiting runs AFTER authentication resolves the actor
@@ -2759,7 +2782,9 @@ export class NetGatewayDO {
           );
         }
         const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
-        return await this.clientSession(actor, body, identity.epoch);
+        return await this.clientSession(actor, body, identity.epoch, {
+          ...(credential.kind === "apikey" ? { apiKeyId: credential.id } : {})
+        });
       }
       if (request.method === "POST" && url.pathname === "/net-api/turn") {
         const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
@@ -2919,6 +2944,62 @@ export class NetGatewayDO {
     const map = payload && typeof payload === "object" ? payload.value : undefined;
     await this.assertNamespaceActive(cell.stamp.catalog_epoch);
     return { map, epoch: cell.stamp.catalog_epoch };
+  }
+
+  /** Resolve a new self-routing credential from the actor authority's derived
+   * lookup row. Authentication is an exact authority read on every presented
+   * long-lived key: fanout keeps ordinary gateway projections warm, but its
+   * delivery is asynchronous and therefore cannot be the revocation fence.
+   * The authority endpoint performs one indexed row lookup and returns the
+   * current mutation-complete head—no actor scan or whole-scope transfer.
+   * Historical ids retain the carried catalog-map compatibility path. */
+  private async verifyClientApiKey(
+    legacyMap: unknown,
+    credential: ReturnType<typeof parseClientCredential>
+  ): Promise<{ actor: string }> {
+    if (credential.kind !== "apikey") {
+      throw new ClientAuthError("credential is not an apikey", { reason: "unsupported_token_class" });
+    }
+    const routed = parseRoutedApiKeyId(credential.id);
+    if (!routed) return verifyApiKeyCredential(legacyMap, credential);
+    const scope = routedApiKeyScope(credential.id);
+    if (!scope) throw new ClientAuthError("apikey not found or revoked", { reason: "unknown_or_revoked" });
+    const answer = await this.routedApiKeyAuthorityRecord(scope, routed.actor, credential.id);
+    const verified = verifyApiKeyRecord(answer.record, credential);
+    if (verified.actor !== routed.actor) {
+      throw new ClientAuthError("apikey record is malformed", { reason: "malformed_record" });
+    }
+    return verified;
+  }
+
+  /** Exact O(1) verifier read and receipt-shape validation shared by initial
+   * API-key authentication and session-bearer revocation checks. */
+  private async routedApiKeyAuthorityRecord(
+    scope: string,
+    actor: string,
+    id: string
+  ): Promise<{ record: unknown }> {
+    const answer = (await this.host.rpc(`scope:${scope}`, "/credential-record", {
+      actor,
+      id
+    })) as {
+      scope?: unknown;
+      actor?: unknown;
+      id?: unknown;
+      head?: unknown;
+      record?: unknown;
+    };
+    if (
+      answer.scope !== scope ||
+      answer.actor !== actor ||
+      answer.id !== id ||
+      !validScopeHead(answer.head)
+    ) {
+      throw new ClientAuthError("apikey authority returned an invalid receipt", {
+        reason: "malformed_authority_receipt"
+      });
+    }
+    return { record: answer.record };
   }
 
   /** Reviewer finding 5: how stale a cached ACTIVE verdict may get
@@ -3638,8 +3719,11 @@ export class NetGatewayDO {
       const cell = this.ensureView().get(cellKey("property_cell", object, name))?.value as { value?: unknown } | undefined;
       return cell && "value" in cell ? cell.value : undefined;
     };
-    const lineage = (object: string): { parent?: string | null } | undefined =>
-      this.ensureView().get(cellKey("object_lineage", object))?.value as { parent?: string | null } | undefined;
+    const lineage = (object: string): { parent?: string | null; owner?: string } | undefined =>
+      this.ensureView().get(cellKey("object_lineage", object))?.value as {
+        parent?: string | null;
+        owner?: string;
+      } | undefined;
     const reachesClass = (object: string, cls: string): boolean => {
       let current: string | null | undefined = object;
       const guard = new Set<string>();
@@ -3669,9 +3753,12 @@ export class NetGatewayDO {
         refuse({ actor: current, account });
       }
       // $agent: recurse up the owner chain (core's rule) — a deactivated
-      // owner disqualifies its agents. $wiz-owned agents authenticate.
+      // owner disqualifies its agents. Ownership is object-lineage metadata,
+      // not a Woo property cell: reading property_cell:<agent>:owner made
+      // every real Net agent fail closed as "owner unresolved".
+      // $wiz-owned agents authenticate.
       if (reachesClass(current, "$agent")) {
-        const owner = prop(current, "owner");
+        const owner = lineage(current)?.owner;
         if (owner === "$wiz") return;
         if (typeof owner !== "string" || owner.length === 0) refuse({ actor: current, reason_detail: "agent_owner_unresolved" });
         await this.warmScopes(
@@ -3691,7 +3778,13 @@ export class NetGatewayDO {
     actor: string,
     body: Record<string, unknown>,
     epoch: string,
-    options: { exclusive?: boolean; session?: string; issuedAt?: number; ttlMs?: number } = {}
+    options: {
+      exclusive?: boolean;
+      session?: string;
+      issuedAt?: number;
+      ttlMs?: number;
+      apiKeyId?: string;
+    } = {}
   ): Promise<Response> {
     // The mint needs the actor's lineage (cluster-scope derivation) in
     // view; the CO15 `cluster:<actor>` convention names the pull
@@ -3726,6 +3819,7 @@ export class NetGatewayDO {
       ttl_ms: options.ttlMs ?? clampClientTtl(body.ttl_ms),
       catalog_epoch: epoch,
       active_scope: bornAt,
+      ...(options.apiKeyId ? { apikey_id: options.apiKeyId } : {}),
       ...(options.issuedAt !== undefined ? { issued_at_ms: options.issuedAt } : {}),
       ...(options.exclusive ? { exclusive: true } : {})
     });
@@ -4084,6 +4178,22 @@ export class NetGatewayDO {
     if (verdict !== "ok") {
       return json({ error: { code: "E_NOSESSION", message: `session ${verdict}`, detail: { session_verdict: verdict } } }, 401);
     }
+    try {
+      const identity = await this.catalogIdentity();
+      const boundActor = await this.authorizedActorForSessionBearer(session, identity.map);
+      if (boundActor !== actor) {
+        throw new ClientAuthError("authenticated actor does not match session", {
+          reason: "actor_mismatch"
+        });
+      }
+    } catch (error) {
+      return json({
+        error: {
+          code: "E_NOSESSION",
+          message: error instanceof Error ? error.message : String(error)
+        }
+      }, 401);
+    }
     const rawMetrics = Array.isArray(body.metrics) ? body.metrics : [];
     let accepted = 0;
     let sampled = Math.max(0, rawMetrics.length - MAX_NET_BROWSER_METRICS_BATCH);
@@ -4243,20 +4353,17 @@ export class NetGatewayDO {
    * permanent synchronous dependency. Standard clients reconnect after the
    * stream closes, while a not-yet-delivered hint remains pending in the
    * session state and is handed to exactly one later stream. */
-  private clientMcpEvents(request: Request): Response {
+  private async clientMcpEvents(request: Request): Promise<Response> {
     const accept = request.headers.get("accept") ?? "";
     if (!accept.toLowerCase().includes("text/event-stream")) {
       return json({ error: { code: "E_INVARG", message: "MCP GET requires Accept: text/event-stream" } }, 406);
     }
     const session = request.headers.get("mcp-session-id") ?? "";
-    const cell = this.ensureView().get(sessionCellKey(session));
-    const verdict = validateSessionCell(cell, this.host.now());
-    if (verdict !== "ok") {
-      return json({ error: { code: "E_NOSESSION", message: `session ${verdict}` } }, 404);
-    }
-    const actor = (cell?.value as { actor?: unknown }).actor;
-    if (typeof actor !== "string" || !actor) {
-      return json({ error: { code: "E_NOSESSION", message: "session actor is missing" } }, 404);
+    let actor: string;
+    try {
+      actor = await this.mcpSessionActor(session);
+    } catch (error) {
+      return json({ error: { code: "E_NOSESSION", message: error instanceof Error ? error.message : String(error) } }, 404);
     }
     this.enforceClientRate(actor, "/net-api/mcp");
     const state = this.mcpSessionState(session, actor, true);
@@ -4344,10 +4451,15 @@ export class NetGatewayDO {
     // (the only client credential the net surface has).
     const synthetic = new Headers({ "x-woo-api-key": token });
     const credential = parseClientCredential(synthetic, null);
+    if (credential.kind !== "apikey") {
+      throw new ClientAuthError("MCP initialize requires an apikey", {
+        reason: "unsupported_token_class"
+      });
+    }
     const identity = await this.catalogIdentity();
-    const { actor } = verifyApiKeyCredential(identity.map, credential);
+    const { actor } = await this.verifyClientApiKey(identity.map, credential);
     this.enforceClientRate(actor, "/net-api/session"); // the mint bucket (H4 amplifier rule)
-    const opened = await this.clientSession(actor, {}, identity.epoch);
+    const opened = await this.clientSession(actor, {}, identity.epoch, { apiKeyId: credential.id });
     const body = (await opened.json()) as { session?: string };
     if (!opened.ok || typeof body.session !== "string") {
       return json({ jsonrpc: "2.0", id, error: { code: -32000, message: `session mint failed: ${JSON.stringify(body)}` } }, 200);
@@ -4369,6 +4481,20 @@ export class NetGatewayDO {
     );
   }
 
+  /** MCP carries the Net session id after initialize and deliberately does
+   * not replay the long-lived API-key secret. Reuse session-bearer validation
+   * and fetch the legacy registry only for an aged, non-self-routing key. */
+  private async mcpSessionActor(session: string): Promise<string> {
+    const value = this.ensureView().get(sessionCellKey(session))?.value as {
+      apikeyId?: unknown;
+    } | undefined;
+    const id = typeof value?.apikeyId === "string" ? value.apikeyId : null;
+    const legacyMap = id && !parseRoutedApiKeyId(id)
+      ? (await this.catalogIdentity()).map
+      : undefined;
+    return await this.authorizedActorForSessionBearer(session, legacyMap);
+  }
+
   /** AU2: adopt the MCP request's traceparent for a tool-invoked turn. */
   private mcpTraceOf(request: Request): TraceContext {
     return adoptOrMintTraceContext(
@@ -4380,14 +4506,15 @@ export class NetGatewayDO {
 
   private async mcpToolsCall(request: Request, id: number | string, params: Record<string, unknown>): Promise<Response> {
     const session = request.headers.get("mcp-session-id") ?? "";
-    const cell = this.ensureView().get(sessionCellKey(session));
-    const verdict = validateSessionCell(cell, this.host.now());
-    if (verdict !== "ok") {
-      return json({ jsonrpc: "2.0", id, error: { code: -32000, message: `session ${verdict}` } }, 200);
-    }
-    const actor = (cell?.value as { actor?: unknown }).actor;
-    if (typeof actor !== "string" || !actor) {
-      return json({ jsonrpc: "2.0", id, error: { code: -32000, message: "session actor is missing" } }, 200);
+    let actor: string;
+    try {
+      actor = await this.mcpSessionActor(session);
+    } catch (error) {
+      return json({
+        jsonrpc: "2.0",
+        id,
+        error: { code: -32000, message: error instanceof Error ? error.message : String(error) }
+      }, 200);
     }
     this.mcpSessionState(session, actor, true);
     this.enforceClientRate(actor, "/net-api/mcp");
@@ -4470,14 +4597,15 @@ export class NetGatewayDO {
    * invocation cannot disagree about reachability. */
   private async mcpToolsList(request: Request, id: number | string, params: Record<string, unknown>): Promise<Response> {
     const session = request.headers.get("mcp-session-id") ?? "";
-    const cell = this.ensureView().get(sessionCellKey(session));
-    const verdict = validateSessionCell(cell, this.host.now());
-    if (verdict !== "ok") {
-      return json({ jsonrpc: "2.0", id, error: { code: -32000, message: `session ${verdict}` } }, 200);
-    }
-    const actor = (cell?.value as { actor?: string }).actor;
-    if (typeof actor !== "string" || !actor) {
-      return json({ jsonrpc: "2.0", id, error: { code: -32000, message: "session actor is missing" } }, 200);
+    let actor: string;
+    try {
+      actor = await this.mcpSessionActor(session);
+    } catch (error) {
+      return json({
+        jsonrpc: "2.0",
+        id,
+        error: { code: -32000, message: error instanceof Error ? error.message : String(error) }
+      }, 200);
     }
     this.mcpSessionState(session, actor, true);
     this.enforceClientRate(actor, "/net-api/mcp");
@@ -5158,6 +5286,22 @@ export class NetGatewayDO {
     if (verdict !== "ok") {
       return json({ error: { code: "E_NOSESSION", message: `session ${verdict}`, detail: { session_verdict: verdict } } }, 401);
     }
+    try {
+      const identity = await this.catalogIdentity();
+      const boundActor = await this.authorizedActorForSessionBearer(session, identity.map);
+      if (boundActor !== actor) {
+        throw new ClientAuthError("ticket actor does not match session", {
+          reason: "actor_mismatch"
+        });
+      }
+    } catch (error) {
+      return json({
+        error: {
+          code: "E_NOSESSION",
+          message: error instanceof Error ? error.message : String(error)
+        }
+      }, 401);
+    }
     const pair = new PairCtor();
     const server = pair[1] as WebSocket & { serializeAttachment?(value: unknown): void };
     // The attachment survives hibernation; webSocketMessage reads it back
@@ -5237,15 +5381,26 @@ export class NetGatewayDO {
         // session is ALWAYS the socket's own (attachment), so one
         // authenticated socket cannot submit on another session.
         const identity = await this.catalogIdentity();
+        const boundActor = await this.authorizedActorForSessionBearer(att.session, identity.map);
+        if (boundActor !== att.actor) {
+          throw new ClientAuthError("socket actor does not match session", {
+            reason: "actor_mismatch"
+          });
+        }
         const response = await this.clientTurn(att.actor, { ...frame, session: att.session }, identity.epoch);
         const payload = (await response.json()) as Record<string, unknown>;
         send({ type: "turn_result", ...(id !== undefined ? { id } : {}), status: response.status, ...payload });
       } catch (err) {
+        const auth = err instanceof ClientAuthError ? err : null;
         send({
           type: "turn_result",
           ...(id !== undefined ? { id } : {}),
-          status: 500,
-          error: { code: isNetError(err) ? err.code : "E_INTERNAL", message: String(err) }
+          status: auth?.status ?? 500,
+          error: {
+            code: auth?.code ?? (isNetError(err) ? err.code : "E_INTERNAL"),
+            message: auth?.message ?? String(err),
+            ...(auth ? { detail: auth.detail } : {})
+          }
         });
       }
       return;
@@ -5647,7 +5802,58 @@ export class NetGatewayDO {
     if (verdict !== "ok") {
       throw new ClientAuthError(`session ${verdict}`, { session_verdict: verdict, reason: "session_bearer_rejected" });
     }
-    return (cell?.value as { actor?: string }).actor as string;
+    return (cell?.value as { actor: string }).actor;
+  }
+
+  /** Keep the base session lookup synchronous: it is also the structural
+   * session primitive used by rehydration tests and callers that do not need
+   * network I/O. Transport authentication adds the key-revocation fence in
+   * this explicit asynchronous layer. */
+  private async authorizedActorForSessionBearer(session: string, legacyMap?: unknown): Promise<string> {
+    const actor = this.actorForSessionBearer(session);
+    const value = this.ensureView().get(sessionCellKey(session))?.value as { apikeyId?: unknown } | undefined;
+    if (typeof value?.apikeyId === "string" && value.apikeyId) {
+      await this.assertSessionApiKeyActive(value.apikeyId, actor, legacyMap);
+    }
+    return actor;
+  }
+
+  /** A session minted from a long-lived key remains subordinate to that key.
+   * Bearer-only transports retain only the public key id, so re-check the
+   * exact current verifier record (or the carried legacy map) without ever
+   * persisting or replaying the secret. */
+  private async assertSessionApiKeyActive(id: string, actor: string, legacyMap?: unknown): Promise<void> {
+    const routed = parseRoutedApiKeyId(id);
+    let record: unknown;
+    if (routed) {
+      const scope = routedApiKeyScope(id);
+      if (!scope || routed.actor !== actor) {
+        throw new ClientAuthError("session source apikey is invalid", {
+          reason: "session_apikey_mismatch"
+        });
+      }
+      record = (await this.routedApiKeyAuthorityRecord(scope, actor, id)).record;
+    } else {
+      const map = legacyMap && typeof legacyMap === "object" && !Array.isArray(legacyMap)
+        ? legacyMap as Record<string, unknown>
+        : {};
+      record = map[id];
+    }
+    const entry =
+      record && typeof record === "object" && !Array.isArray(record)
+        ? record as Record<string, unknown>
+        : null;
+    if (
+      !entry ||
+      entry.actor !== actor ||
+      typeof entry.hash !== "string" ||
+      typeof entry.salt !== "string" ||
+      entry.revoked_at != null
+    ) {
+      throw new ClientAuthError("session source apikey not found or revoked", {
+        reason: "session_apikey_revoked"
+      });
+    }
   }
 
   private callerPresenceScopes(session: string, caller: string): Set<string> {

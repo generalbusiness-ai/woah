@@ -554,7 +554,7 @@ describe("turn recorder", () => {
           handler: "create_api_key",
           transcript: "tracked",
           deterministic: true,
-          writes: expect.arrayContaining(["$system.api_keys", "$system.wizard_actions"])
+          writes: expect.arrayContaining(["target actor api_keys"])
         })
       })
     }));
@@ -593,7 +593,7 @@ describe("turn recorder", () => {
           transcript: "tracked",
           deterministic: true,
           reads: expect.arrayContaining(["target actor ownership"]),
-          writes: expect.arrayContaining(["$system.api_keys", "$system.wizard_actions"])
+          writes: expect.arrayContaining(["target actor api_keys"])
         })
       })
     }));

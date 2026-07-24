@@ -107,7 +107,16 @@ import { Outbox, type FanoutBody, type FanoutRow } from "../../net/outbox";
 import { turnEchoId } from "../../net/turn-echo";
 import { ScopeSequencer, type CommitSubmit, type ScheduledTurn, type ScopeHead } from "../../net/scope";
 import { authorizeSessionSubmit, validateSessionCell } from "../../net/sessions";
-import { observationsForRelationOwners, relationKey, roomRosterRows, SESSION_PRESENCE_RELATION, type RelationDelta, type RelationRow } from "../../net/relations";
+import {
+  API_KEY_LOOKUP_RELATION,
+  observationsForRelationOwners,
+  relationKey,
+  roomRosterRows,
+  SESSION_PRESENCE_RELATION,
+  type RelationDelta,
+  type RelationRow
+} from "../../net/relations";
+import { parseRoutedApiKeyId, routedApiKeyScope } from "../../core/api-key-id";
 import { orderedChildrenVersion, orderedNeighborsFromRows } from "../../net/ordered-edges";
 import { replayPageVersion, validReplayPageBounds, type ReplayLogEntry } from "../../net/replay-pages";
 import type { ScopeMeta, ScopeStore, TailEntry } from "../../net/scope-store";
@@ -1225,6 +1234,38 @@ export class NetScopeDO {
           version: replayPageVersion(entries)
         });
       }
+      if (request.method === "POST" && url.pathname === "/net/credential-record") {
+        // Authentication is an authority decision, not an eventually
+        // consistent fanout-cache decision. Serve exactly one indexed
+        // actor-owned verifier with the current mutation-complete head; this
+        // is O(1) and lets a committed revocation take effect on the next
+        // request without transferring the actor's whole cluster.
+        const body = (await request.json()) as { actor?: unknown; id?: unknown };
+        if (typeof body.actor !== "string" || !body.actor || typeof body.id !== "string" || !body.id) {
+          throw netError("E_INVARG", "credential-record requires actor and id");
+        }
+        const routed = parseRoutedApiKeyId(body.id);
+        const seq = this.ensureSequencer();
+        if (
+          !routed ||
+          routed.actor !== body.actor ||
+          routedApiKeyScope(body.id) !== seq.scope ||
+          !seq.store.has(cellKey("object_lineage", body.actor))
+        ) {
+          throw netError("E_INVARG", "credential-record is routed to the wrong authority", {
+            actor: body.actor,
+            scope: seq.scope
+          });
+        }
+        const row = seq.relations().get(relationKey(API_KEY_LOOKUP_RELATION, body.actor, body.id));
+        return json({
+          scope: seq.scope,
+          head: seq.head(),
+          actor: body.actor,
+          id: body.id,
+          record: row?.body ?? null
+        });
+      }
       if (request.method === "POST" && url.pathname === "/net/closure") {
         const body = (await request.json()) as {
           keys: string[];
@@ -1287,6 +1328,58 @@ export class NetScopeDO {
         // H2b: seeded session cells arm the reap wake too.
         if (body.cells.some((cell) => cell.kind === "session")) this.armSessionReapAlarm(seq);
         return json({ ok: true, scope: seq.scope, head: seq.head() });
+      }
+      if (request.method === "POST" && url.pathname === "/net/ensure-credential") {
+        const body = (await request.json()) as {
+          actor?: unknown;
+          id?: unknown;
+          record?: unknown;
+        };
+        if (
+          typeof body.actor !== "string" ||
+          typeof body.id !== "string" ||
+          !body.record ||
+          typeof body.record !== "object" ||
+          Array.isArray(body.record)
+        ) {
+          throw netError("E_INVARG", "credential ensure requires actor, id, and verifier record");
+        }
+        const seq = this.ensureSequencer();
+        const ensured = this.discardSeqOnThrow(() => this.store.transaction(() => {
+          const result = seq.operatorEnsureCredential(
+            body.actor as string,
+            body.id as string,
+            body.record as Record<string, unknown>
+          );
+          if (result.status === "applied") {
+            const subscribers = sqlRows<{ destination: string; delivery_seq: number }>(
+              this.state.storage.sql.exec("SELECT destination, delivery_seq FROM net_scope_subscribers WHERE role = 'fanout'")
+            );
+            const fanout: FanoutBody = {
+              scope: seq.scope,
+              seq: result.head.seq,
+              head_hash: result.head.hash,
+              head_generation: result.head.generation,
+              cells: [result.cell],
+              observations: [],
+              relations: [{ op: "add", row: result.relation }]
+            };
+            const text = JSON.stringify(fanout);
+            for (const { destination, delivery_seq } of subscribers) {
+              this.persistFanoutRow(destination, delivery_seq, fanout, text);
+            }
+          }
+          return result;
+        }));
+        this.armOutboxRetryAlarm();
+        return json({
+          ok: true,
+          scope: seq.scope,
+          status: ensured.status,
+          head: ensured.head,
+          actor: body.actor,
+          id: body.id
+        });
       }
       if (request.method === "POST" && url.pathname === "/net/repair-relations") {
         const body = (await request.json()) as { relations?: RelationRow[] };
