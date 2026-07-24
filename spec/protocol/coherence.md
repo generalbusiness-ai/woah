@@ -753,6 +753,12 @@ One write path per fact (CO9), concretized:
   post-accept closure fill installs the exact accepted session value as a
   durable derived echo stamped at the returned authority head. The transcript
   remains the only write path; unrelated touched cells stay repair-on-read.
+  Session close is likewise idempotent at the public retry boundary even
+  though success invalidates its own bearer: after authority accepts the close,
+  the session-routed gateway retains a bounded durable receipt and answers a
+  repeated `DELETE /net-api/session` before ordinary live-bearer validation.
+  The receipt is retry evidence only, never session authority; unknown session
+  ids still fail authentication, and pruning restores that normal refusal.
   Elastic guest sessions additionally carry an `ephemeralActor` lifecycle
   marker. When the last live session is gone, the actor-cluster alarm reaper
   advances one owner head, moves that actor's authoritative live cell to

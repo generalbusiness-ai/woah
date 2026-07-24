@@ -667,6 +667,11 @@ const RECENT_CLIENT_TURN_CAP = 512;
  * reply-cache bound (scope.ts REPLY_CACHE_CAP) so the pin never
  * outlives the reply it protects by more than the window. */
 const GATEWAY_PIN_LIMIT = 1024;
+/** A session bearer destroys its own credential when close commits. Keep a
+ * bounded gateway-local receipt so a lost close reply can still replay as
+ * success after the session cell is expired/reaped. Same bounded-idempotency
+ * posture as turn pins/replies; this is derived retry state, not authority. */
+const GATEWAY_SESSION_CLOSE_RECEIPT_LIMIT = 4096;
 /** Bounded per-isolate classification memo for offline room members. Losing an
  * entry costs one cold convention probe; lineage fanout invalidates it. */
 const ROOM_PRESENTATION_ACTOR_CACHE_CAP = 256;
@@ -858,6 +863,9 @@ export class NetGatewayDO {
     // TTL-reaped on every mint, and each ticket is deleted on use.
     state.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS net_gateway_ws_ticket (ticket TEXT PRIMARY KEY, session TEXT NOT NULL, actor TEXT NOT NULL, expires_at INTEGER NOT NULL)"
+    );
+    state.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS net_gateway_session_close_receipt (session TEXT PRIMARY KEY, actor TEXT NOT NULL)"
     );
     this.host = new WorkerdHost({
       resolve: (destination) => resolveNetDestination(this.env, destination),
@@ -2578,6 +2586,20 @@ export class NetGatewayDO {
 
       const credential = parseClientCredential(request.headers, null);
       auditCredential = credential.kind === "apikey" ? credential.id : `session:${credential.session}`;
+      // Close is the one route whose successful effect invalidates its own
+      // authentication credential. A response-lost retry therefore cannot
+      // pass ordinary bearer validation. The gateway that minted/routed the
+      // session retains a bounded durable receipt; consume it before the live
+      // bearer gate and return the original semantic success. Unknown random
+      // session ids still take the normal fail-closed auth path below.
+      if (request.method === "DELETE" && url.pathname === "/net-api/session" && credential.kind === "session") {
+        const closedActor = this.closedSessionActor(credential.session);
+        if (closedActor) {
+          auditActor = closedActor;
+          this.enforceClientRate(closedActor, url.pathname);
+          return json({ closed: true, already: "closed" });
+        }
+      }
       const identity = await this.catalogIdentity();
       // Two credential classes (client-auth.ts): the apikey resolves its
       // actor from the identity map; a session bearer (minted by login/
@@ -3474,6 +3496,7 @@ export class NetGatewayDO {
     if (verdict === "expired" || verdict === "missing") {
       // Already released (reaped, expired, or never here) — closing is
       // idempotent from the client's view.
+      this.recordSessionCloseReceipt(session, actor);
       return json({ closed: true, already: verdict });
     }
     if (verdict !== "ok") {
@@ -3491,6 +3514,10 @@ export class NetGatewayDO {
     if (opened.reply.status !== "accepted") {
       return json({ error: { code: "E_RETRY", message: "session close did not commit; retry", detail: opened.reply } }, 503);
     }
+    // Record only after authority accepted the close. It is gateway-local
+    // retry evidence, allowing the now-invalid bearer to repeat DELETE if the
+    // edge reply is lost; it is never consulted for ordinary authentication.
+    this.recordSessionCloseReceipt(session, actor);
     return json({
       closed: true,
       ...(opened.install_degraded ? { install_degraded: true } : {}),
@@ -6343,6 +6370,41 @@ export class NetGatewayDO {
       this.state.storage.sql.exec(
         "DELETE FROM net_gateway_pin WHERE rowid NOT IN (SELECT rowid FROM net_gateway_pin ORDER BY rowid DESC LIMIT ?)",
         GATEWAY_PIN_LIMIT
+      );
+    }
+  }
+
+  /** Actor bound to a successfully closed session, if its bounded retry
+   * receipt remains resident on this session-routed gateway. */
+  private closedSessionActor(session: string): string | null {
+    const rows = sqlRows<{ actor: string }>(
+      this.state.storage.sql.exec(
+        "SELECT actor FROM net_gateway_session_close_receipt WHERE session = ?",
+        session
+      )
+    );
+    return rows[0]?.actor ?? null;
+  }
+
+  /** Preserve semantic idempotency across the self-invalidating close edge.
+   *
+   * The session authority remains the only writer of session state. This row
+   * merely remembers an accepted outcome on the deterministic gateway route,
+   * just like a reply cache. Once pruned, an ancient replay returns the normal
+   * missing-bearer refusal; no authority fact is reconstructed from it. */
+  private recordSessionCloseReceipt(session: string, actor: string): void {
+    this.state.storage.sql.exec(
+      "INSERT INTO net_gateway_session_close_receipt (session, actor) VALUES (?, ?) ON CONFLICT(session) DO UPDATE SET actor = excluded.actor",
+      session,
+      actor
+    );
+    const count = sqlRows<{ n: number }>(
+      this.state.storage.sql.exec("SELECT COUNT(*) AS n FROM net_gateway_session_close_receipt")
+    )[0];
+    if (count && Number(count.n) > GATEWAY_SESSION_CLOSE_RECEIPT_LIMIT) {
+      this.state.storage.sql.exec(
+        "DELETE FROM net_gateway_session_close_receipt WHERE rowid NOT IN (SELECT rowid FROM net_gateway_session_close_receipt ORDER BY rowid DESC LIMIT ?)",
+        GATEWAY_SESSION_CLOSE_RECEIPT_LIMIT
       );
     }
   }

@@ -731,6 +731,12 @@ describe("the identity door (/net-api/login, /net-api/guest, session bearers)", 
     const closed = await h.api("DELETE", "/net-api/session", { token: `session:${session}` });
     expect(closed.status, JSON.stringify(closed.body)).toBe(200);
     expect(closed.body.closed).toBe(true);
+    // A close destroys its own bearer. The gateway receipt must therefore
+    // answer a response-lost replay before ordinary live-session auth, or the
+    // operation is not actually idempotent at its public boundary.
+    const closeReplay = await h.api("DELETE", "/net-api/session", { token: `session:${session}` });
+    expect(closeReplay.status, JSON.stringify(closeReplay.body)).toBe(200);
+    expect(closeReplay.body).toEqual({ closed: true, already: "closed" });
     await new Promise((resolve) => setTimeout(resolve, 300));
 
     // The first-in-pool-order seat is free again — the next claim gets it.
